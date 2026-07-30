@@ -213,6 +213,8 @@ The first trainable representation is:
 - One absolute left-gripper command.
 - Five relative joint deltas for the right arm.
 - One absolute right-gripper command.
+- A fixed 16-step future action horizon matching NVIDIA's N1.7 SO100
+  new-embodiment example.
 
 For each non-gripper joint:
 
@@ -339,8 +341,8 @@ Run 100 optimizer steps sequentially using the candidate list selected from
 physical VRAM:
 
 ```text
-40–63 GB  -> 1, 2, 4, 8
-64–95 GB  -> 4, 8, 16, 32
+40–63 GB  -> 8, 16, 32
+64–95 GB  -> 16, 32, 64
 96 GB+    -> 16, 32, 64
 ```
 
@@ -363,6 +365,10 @@ or misses the headroom gate, the tool tests smaller powers of two down to batch
 1. If batch 1 cannot leave 10% free, it aborts and reports that a larger GPU or
 a separately approved memory optimization is required. No long run begins
 until one batch passes.
+
+For the single-GPU, no-accumulation smoke tests, GR00T's `global_batch_size` is
+the physical per-device batch. The smoke report records gradient accumulation
+separately and rejects comparisons that change it.
 
 ### Stage 3: initial behavior-cloning run
 
