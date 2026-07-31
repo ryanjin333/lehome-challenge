@@ -96,6 +96,11 @@ For detailed instructions on teleoperation data collection and dataset processin
 
 We provide several training examples; the models and training framework are from LeRobot.
 
+For the isolated, reproducible NVIDIA GR00T N1.7 behavior-cloning path, see the
+[portable training runbook](docs/groot_n17_training.md). It covers trusted
+dataset conversion, private immutable artifact repositories, GPU-rental
+training, verified synchronization, shutdown safety, and fresh-machine restore.
+
 #### Quick Start
 
 Train using one of the pre-configured training files:

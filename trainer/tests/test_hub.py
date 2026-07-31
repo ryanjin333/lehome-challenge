@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from lehome_train.hub import (
     HubAccess,
+    HuggingFaceHubTransport,
     HubTransientError,
     download_files,
+    ensure_approved_private_repository,
     require_access,
     upload_files,
 )
@@ -66,6 +69,32 @@ class FakeTransport:
             }
         )
         return revision
+
+
+class FakeRepositoryTransport(FakeTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ensure_calls: list[dict[str, object]] = []
+
+    def ensure_private_repository(
+        self,
+        *,
+        repository: str,
+        repo_type: str,
+        token: str,
+        create: bool,
+        timeout_seconds: float,
+    ) -> HubAccess:
+        self.ensure_calls.append(
+            {
+                "repository": repository,
+                "repo_type": repo_type,
+                "token": token,
+                "create": create,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return HubAccess(can_read=True, can_write=True, private_repository=True)
 
 
 def test_upload_requires_process_token_and_passes_it_explicitly(tmp_path: Path) -> None:
@@ -206,3 +235,72 @@ def test_download_requires_and_preserves_an_explicit_immutable_revision(
             environ={"HF_TOKEN": "hf_download_process_token"},
         )
     assert len(transport.download_calls) == 1
+
+
+def test_approved_private_repository_creation_is_explicit_and_never_public() -> None:
+    transport = FakeRepositoryTransport()
+
+    ensure_approved_private_repository(
+        transport=transport,
+        repository="ryanjin333/lehome-groot-n17-data",
+        create=True,
+        environ={"HF_TOKEN": "hf_process_memory_only"},
+        timeout_seconds=12.0,
+    )
+
+    assert transport.ensure_calls == [
+        {
+            "repository": "ryanjin333/lehome-groot-n17-data",
+            "repo_type": "dataset",
+            "token": "hf_process_memory_only",
+            "create": True,
+            "timeout_seconds": 12.0,
+        }
+    ]
+    with pytest.raises(ValueError, match="approved"):
+        ensure_approved_private_repository(
+            transport=transport,
+            repository="owner/public-or-unapproved",
+            create=True,
+            environ={"HF_TOKEN": "hf_process_memory_only"},
+        )
+
+
+def test_real_transport_is_lazy_and_requires_finite_timeout() -> None:
+    transport = HuggingFaceHubTransport(timeout_seconds=15.0)
+
+    assert transport.timeout_seconds == 15.0
+    with pytest.raises(ValueError, match="finite positive"):
+        HuggingFaceHubTransport(timeout_seconds=float("inf"))
+
+
+def test_real_transport_configures_a_finite_default_for_every_http_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured: list[object] = []
+
+    class FakeSession:
+        def request(self, method: str, url: str, **kwargs: object) -> object:
+            return kwargs["timeout"]
+
+    fake_hub = SimpleNamespace(
+        configure_http_backend=lambda *, backend_factory: configured.append(
+            backend_factory
+        )
+    )
+
+    def fake_import(name: str) -> object:
+        if name == "huggingface_hub":
+            return fake_hub
+        if name == "requests":
+            return SimpleNamespace(Session=FakeSession)
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr("lehome_train.hub.importlib.import_module", fake_import)
+    transport = HuggingFaceHubTransport(timeout_seconds=17.0)
+
+    assert transport._library() is fake_hub
+    session = configured[0]()
+    assert session.request("GET", "https://example.invalid") == 17.0
+    assert session.request("GET", "https://example.invalid", timeout=None) == 17.0
+    assert session.request("GET", "https://example.invalid", timeout=3.0) == 3.0
