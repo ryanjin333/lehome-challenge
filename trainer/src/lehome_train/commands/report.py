@@ -10,15 +10,7 @@ from lehome_train.checkpoints import CheckpointDescriptor
 from lehome_train.commands.sync import SyncResult
 from lehome_train.io import atomic_write_json, canonical_json_sha256
 from lehome_train.models import ExperimentConfig, SmokeResult
-from lehome_train.report_evidence import (
-    CheckpointPruningReceipt,
-    canonical_timestamp,
-    load_checkpoint_pruning_receipt,
-    normalize_checkpoint_evidence,
-    parse_timestamp,
-    require_immutable_revision,
-    write_checkpoint_pruning_receipt,
-)
+from lehome_train import report_evidence
 from lehome_train.preflight import reject_secret_bearing_config
 
 
@@ -42,7 +34,8 @@ class TrainingReport:
     smoke_metrics: dict[str, object]
     checkpoints: tuple[dict[str, object], ...]
     sync_evidence: dict[str, object] | None
-    artifacts_disposable: bool
+    sync_snapshot_disposable: bool
+    shutdown_disposable: bool
     runtime_seconds: float
     provider_hourly_price: float
     cost: float
@@ -72,7 +65,8 @@ class TrainingReport:
             "sync_evidence": (
                 None if self.sync_evidence is None else dict(self.sync_evidence)
             ),
-            "artifacts_disposable": self.artifacts_disposable,
+            "sync_snapshot_disposable": self.sync_snapshot_disposable,
+            "shutdown_disposable": self.shutdown_disposable,
             "runtime_seconds": self.runtime_seconds,
             "provider_hourly_price": self.provider_hourly_price,
             "cost": self.cost,
@@ -87,7 +81,7 @@ def build_training_report(
     checkpoints: tuple[CheckpointDescriptor, ...],
     local_artifact_root: str | Path,
     sync_evidence: SyncResult | None,
-    pruning_receipts: tuple[CheckpointPruningReceipt, ...] = (),
+    pruning_receipts: tuple[report_evidence.CheckpointPruningReceipt, ...] = (),
     instance_started_at: str,
     generated_at: str,
     provider_hourly_price: float,
@@ -102,12 +96,14 @@ def build_training_report(
     if not artifact_root.is_dir() or artifact_root.is_symlink():
         raise ValueError("local artifact root must be an existing regular directory")
     reject_secret_bearing_config(experiment_config.to_dict())
-    require_immutable_revision(isaac_groot_revision, label="Isaac GR00T revision")
-    require_immutable_revision(
+    report_evidence.require_immutable_revision(
+        isaac_groot_revision, label="Isaac GR00T revision"
+    )
+    report_evidence.require_immutable_revision(
         experiment_config.model_revision,
         label="base model revision",
     )
-    require_immutable_revision(
+    report_evidence.require_immutable_revision(
         experiment_config.dataset_revision,
         label="immutable prepared dataset revision",
     )
@@ -116,8 +112,12 @@ def build_training_report(
     ) or provider_hourly_price < 0:
         raise ValueError("provider hourly price must be a finite nonnegative number")
 
-    started = parse_timestamp(instance_started_at, label="instance start time")
-    finished = parse_timestamp(generated_at, label="report generation time")
+    started = report_evidence.parse_timestamp(
+        instance_started_at, label="instance start time"
+    )
+    finished = report_evidence.parse_timestamp(
+        generated_at, label="report generation time"
+    )
     runtime_seconds = (finished - started).total_seconds()
     if runtime_seconds < 0:
         raise ValueError("report generation time precedes instance start time")
@@ -136,8 +136,8 @@ def build_training_report(
         != experiment_config.gradient_accumulation_steps
     ):
         raise ValueError("smoke gradient accumulation differs from resolved config")
-    checkpoint_records, sync_summary, artifacts_disposable = (
-        normalize_checkpoint_evidence(
+    checkpoint_records, sync_summary, sync_snapshot_disposable = (
+        report_evidence.normalize_checkpoint_evidence(
             checkpoints,
             experiment_id=smoke_result.experiment_id,
             config_sha256=config_sha256,
@@ -154,8 +154,8 @@ def build_training_report(
 
     report = TrainingReport(
         experiment_id=smoke_result.experiment_id,
-        generated_at=canonical_timestamp(finished),
-        instance_started_at=canonical_timestamp(started),
+        generated_at=report_evidence.canonical_timestamp(finished),
+        instance_started_at=report_evidence.canonical_timestamp(started),
         container_image_digest=experiment_config.container_digest,
         repository_commit=experiment_config.repository_commit,
         isaac_groot_revision=isaac_groot_revision,
@@ -169,7 +169,8 @@ def build_training_report(
         smoke_metrics=smoke_result.to_dict(),
         checkpoints=checkpoint_records,
         sync_evidence=sync_summary,
-        artifacts_disposable=artifacts_disposable,
+        sync_snapshot_disposable=sync_snapshot_disposable,
+        shutdown_disposable=False,
         runtime_seconds=runtime_seconds,
         provider_hourly_price=float(provider_hourly_price),
         cost=runtime_seconds / 3600.0 * float(provider_hourly_price),

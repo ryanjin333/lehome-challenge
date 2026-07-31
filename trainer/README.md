@@ -71,6 +71,9 @@ Final reports verify checkpoint bytes beneath the request's
 `local_artifact_root` and accept remote-verification claims only from the
 immutable sync-result artifact written by `sync`. Controller flags remain
 reported claims; they do not make an artifact verified or disposable.
+`sync_snapshot_disposable` describes only the sync evidence consumed while
+building the report, and `shutdown_disposable` is always `false`. Only the
+external result from the second, post-report sync can authorize shutdown.
 
 Run the focused report and synchronization checks with:
 

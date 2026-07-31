@@ -156,15 +156,50 @@ def _string(arguments: Mapping[str, object], key: str) -> str:
     return value
 
 
+def _has_symlink_component(path: Path) -> bool:
+    """Return whether any existing component aliases another filesystem path."""
+
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _require_external_sync_output(experiment_root: str, output: str) -> None:
+    """Keep sync evidence outside the mutable tree without path aliases."""
+
+    experiment_path = Path(experiment_root)
+    output_path = Path(output)
+    if (
+        ".." in experiment_path.parts
+        or ".." in output_path.parts
+        or _has_symlink_component(experiment_path)
+        or _has_symlink_component(output_path)
+    ):
+        raise ValueError(
+            "sync output must be outside experiment root without path aliases"
+        )
+    resolved_experiment = experiment_path.resolve(strict=False)
+    resolved_output = output_path.resolve(strict=False)
+    if (
+        resolved_output == resolved_experiment
+        or resolved_experiment in resolved_output.parents
+    ):
+        raise ValueError("sync output must be outside experiment root")
+
+
 def execute_report_request(path: str | os.PathLike[str]) -> dict[str, object]:
     """Run the fully local report command from a strict request envelope."""
 
     from lehome_train.commands.report import (
         build_training_report,
-        load_checkpoint_pruning_receipt,
         write_training_report,
     )
     from lehome_train.commands.sync import load_sync_result
+    from lehome_train.report_evidence import load_checkpoint_pruning_receipt
 
     fields = {
         "experiment_config",
@@ -224,9 +259,6 @@ def execute_report_request(path: str | os.PathLike[str]) -> dict[str, object]:
 def execute_sync_request(path: str | os.PathLike[str]) -> dict[str, object]:
     """Run real private-Hub synchronization from a strict request envelope."""
 
-    from lehome_train.commands.sync import sync_experiment, write_sync_result
-    from lehome_train.hub import HuggingFaceHubTransport
-
     fields = {
         "experiment_root",
         "experiment_id",
@@ -245,8 +277,15 @@ def execute_sync_request(path: str | os.PathLike[str]) -> dict[str, object]:
         raise ValueError("sync timeout_seconds must be a number")
     if type(attempts) is not int:
         raise ValueError("sync max_attempts must be an integer")
+    experiment_root = _string(arguments, "experiment_root")
+    output = _string(arguments, "output")
+    _require_external_sync_output(experiment_root, output)
+
+    from lehome_train.commands.sync import sync_experiment, write_sync_result
+    from lehome_train.hub import HuggingFaceHubTransport
+
     result = sync_experiment(
-        _string(arguments, "experiment_root"),
+        experiment_root,
         experiment_id=_string(arguments, "experiment_id"),
         experiment_config_sha256=_string(arguments, "experiment_config_sha256"),
         repository=_string(arguments, "repository"),
@@ -255,5 +294,5 @@ def execute_sync_request(path: str | os.PathLike[str]) -> dict[str, object]:
         staging_root=_string(arguments, "staging_root"),
         max_attempts=attempts,
     )
-    write_sync_result(_string(arguments, "output"), result)
+    write_sync_result(output, result)
     return result.to_dict()

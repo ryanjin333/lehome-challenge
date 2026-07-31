@@ -281,15 +281,22 @@ def test_report_request_wires_local_sync_and_pruning_evidence(
     report = SimpleNamespace(to_dict=lambda: {"status": "reported"})
     fake_report_module = SimpleNamespace(
         build_training_report=lambda **kwargs: calls.append(("build", kwargs)) or report,
-        load_checkpoint_pruning_receipt=lambda path: f"receipt:{path}",
         write_training_report=lambda path, value: calls.append(
             ("write", (path, value))
         ),
+    )
+    fake_report_evidence_module = SimpleNamespace(
+        load_checkpoint_pruning_receipt=lambda path: f"receipt:{path}"
     )
     fake_sync_module = SimpleNamespace(
         load_sync_result=lambda path: f"sync:{path}"
     )
     monkeypatch.setitem(sys.modules, "lehome_train.commands.report", fake_report_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "lehome_train.report_evidence",
+        fake_report_evidence_module,
+    )
     monkeypatch.setitem(sys.modules, "lehome_train.commands.sync", fake_sync_module)
     monkeypatch.setattr(
         runtime_module,
@@ -321,8 +328,10 @@ def test_sync_request_persists_result_evidence(
     import lehome_train.runtime as runtime_module
 
     request = tmp_path / "sync-request.json"
+    experiment = tmp_path / "experiment"
+    experiment.mkdir()
     arguments = {
-        "experiment_root": str(tmp_path / "experiment"),
+        "experiment_root": str(experiment),
         "experiment_id": "experiment-001",
         "experiment_config_sha256": "a" * 64,
         "repository": DEFAULT_SETTINGS.model_repo,
@@ -357,6 +366,65 @@ def test_sync_request_persists_result_evidence(
 
     assert observed == {"status": "synced"}
     assert calls[-1] == ("write", (arguments["output"], result))
+
+
+@pytest.mark.parametrize("output_kind", ["same", "nested", "symlink_escape"])
+def test_sync_request_rejects_output_inside_experiment_before_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_kind: str,
+) -> None:
+    import lehome_train.runtime as runtime_module
+
+    experiment = tmp_path / "experiment"
+    experiment.mkdir()
+    if output_kind == "same":
+        output = experiment
+    elif output_kind == "nested":
+        output = experiment / "reports" / "sync-result.json"
+    else:
+        external = tmp_path / "external"
+        external.mkdir()
+        link = experiment / "escape"
+        link.symlink_to(external, target_is_directory=True)
+        output = link / "sync-result.json"
+    request = tmp_path / f"sync-{output_kind}.json"
+    arguments = {
+        "experiment_root": str(experiment),
+        "experiment_id": "experiment-001",
+        "experiment_config_sha256": "a" * 64,
+        "repository": DEFAULT_SETTINGS.model_repo,
+        "revision": "experiment-001",
+        "staging_root": str(tmp_path / "staging"),
+        "timeout_seconds": 30,
+        "max_attempts": 5,
+        "output": str(output),
+    }
+    request.write_text(
+        json.dumps({"schema_version": 1, "command": "sync", "arguments": arguments}),
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "lehome_train.commands.sync",
+        SimpleNamespace(
+            sync_experiment=lambda *_args, **_kwargs: calls.append("sync"),
+            write_sync_result=lambda *_args: calls.append("write"),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "lehome_train.hub",
+        SimpleNamespace(
+            HuggingFaceHubTransport=lambda **_kwargs: calls.append("transport")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="outside experiment root"):
+        runtime_module.execute_sync_request(request)
+
+    assert calls == []
 
 
 def test_settings_use_exact_immutable_pins() -> None:

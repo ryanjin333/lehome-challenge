@@ -167,6 +167,11 @@ authoritative final flow is:
 4. sync once more to archive the final evidence-backed report, persisting the
    shutdown-gate sync result outside the experiment tree.
 
+Only the external result from step 4 authorizes shutdown. The report's
+`sync_snapshot_disposable` field describes the earlier snapshot used to build
+the report, while `shutdown_disposable` remains `false` because the report was
+written after that snapshot.
+
 All parsed report and pruning-receipt timestamps are serialized in canonical
 UTC `Z` form.
 
@@ -192,8 +197,9 @@ exact hash and size. A remote verified claim requires an exact path/hash/size
 match in a compatible immutable sync result; descriptor booleans alone never
 authorize disposal. A pruning claim remains `reported_only` unless a matching
 deletion receipt is tied to that remotely verified commit. The report also
-includes instance runtime, hourly price, calculated cost, and the authoritative
-sync-derived disposal state. Report generation repeats the central secret scan
+includes instance runtime, hourly price, calculated cost,
+`sync_snapshot_disposable` for its input sync evidence, and
+`shutdown_disposable: false`. Report generation repeats the central secret scan
 before writing JSON.
 
 `sync` generates `sync-manifest.json` from these closed artifact groups under
@@ -226,11 +232,13 @@ match.
 ## Shutdown gate
 
 Do not stop, delete, or release the rental merely because upload returned
-success. Inspect the final `sync-manifest.json` and sync status. The machine is
-disposable only when the sync result says `disposable: true` and every entry is
-`remotely_verified: true`. A missing, unreadable, or mismatched remote artifact
-keeps `disposable` false. Instance deletion remains an explicit provider
-operation; the trainer never deletes cloud instances.
+success. Inspect the external sync result produced by the second, post-report
+sync and its final `sync-manifest.json`. The machine is disposable only when
+that result says `disposable: true` and every entry is `remotely_verified:
+true`. Neither disposal field in the report authorizes shutdown. A missing,
+unreadable, or mismatched remote artifact keeps `disposable` false. Instance
+deletion remains an explicit provider operation; the trainer never deletes
+cloud instances.
 
 ## Fresh flywheel restore
 

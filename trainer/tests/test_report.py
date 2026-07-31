@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import lehome_train.commands.report as report_module
+import lehome_train.report_evidence as report_evidence
 from lehome_train.checkpoints import CheckpointDescriptor
 from lehome_train.commands.report import (
     build_training_report,
@@ -223,7 +224,9 @@ def test_report_contains_complete_exact_provenance_and_checkpoint_hashes(
         "sample_presentations",
         "schedule_sha256",
     }
-    assert payload["artifacts_disposable"] is True
+    assert payload["sync_snapshot_disposable"] is True
+    assert payload["shutdown_disposable"] is False
+    assert "artifacts_disposable" not in payload
     assert payload["sync_evidence"] == {
         "immutable_revision": "3" * 40,
         "remote_prefix": sync_evidence.manifest.remote_prefix,
@@ -347,7 +350,7 @@ def test_report_labels_controller_reported_pruning_without_receipt(
 def test_report_accepts_matching_pruning_receipt(tmp_path: Path) -> None:
     config = _config()
     pruned = replace(_checkpoint(config, 1_000), locally_verified=False)
-    receipt = report_module.CheckpointPruningReceipt(
+    receipt = report_evidence.CheckpointPruningReceipt(
         experiment_id="experiment-001",
         experiment_config_sha256=canonical_json_sha256(config),
         artifact=pruned.record.artifact,
@@ -492,7 +495,8 @@ def test_report_requires_bytes_for_local_claim_and_sync_for_remote_claim(
     assert evidence["locally_verified"] is False
     assert evidence["remotely_verified"] is False
     assert evidence["remote_evidence_level"] == "descriptor_reported_only"
-    assert report.to_dict()["artifacts_disposable"] is False
+    assert report.to_dict()["sync_snapshot_disposable"] is False
+    assert report.to_dict()["shutdown_disposable"] is False
 
 
 def test_report_rejects_local_checkpoint_byte_mismatch(tmp_path: Path) -> None:
@@ -547,7 +551,7 @@ def test_equivalent_timestamp_offsets_serialize_identically(tmp_path: Path) -> N
 
 def test_pruning_receipt_file_round_trip_is_strict_and_canonical(tmp_path: Path) -> None:
     config = _config()
-    receipt = report_module.CheckpointPruningReceipt(
+    receipt = report_evidence.CheckpointPruningReceipt(
         experiment_id="experiment-001",
         experiment_config_sha256=canonical_json_sha256(config),
         artifact=_checkpoint(config, 1_000).record.artifact,
@@ -556,8 +560,14 @@ def test_pruning_receipt_file_round_trip_is_strict_and_canonical(tmp_path: Path)
     )
     path = tmp_path / "receipt.json"
 
-    report_module.write_checkpoint_pruning_receipt(path, receipt)
-    loaded = report_module.load_checkpoint_pruning_receipt(path)
+    report_evidence.write_checkpoint_pruning_receipt(path, receipt)
+    loaded = report_evidence.load_checkpoint_pruning_receipt(path)
 
     assert loaded == receipt
     assert loaded.deleted_at == "2026-07-31T18:00:00Z"
+
+
+def test_report_module_does_not_reexport_pruning_receipt_helpers() -> None:
+    assert not hasattr(report_module, "CheckpointPruningReceipt")
+    assert not hasattr(report_module, "load_checkpoint_pruning_receipt")
+    assert not hasattr(report_module, "write_checkpoint_pruning_receipt")
