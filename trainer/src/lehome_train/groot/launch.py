@@ -1,0 +1,171 @@
+"""Secret-safe adapter for the pinned official GR00T N1.7 launcher."""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+import re
+import subprocess
+from typing import Callable, Mapping, Sequence
+
+from lehome_train.groot.config import FineTuneLaunchConfig
+from lehome_train.io import atomic_write_json
+
+
+_CUDA_VISIBLE_DEVICE = re.compile(r"(?:[0-9]+|GPU-[A-Za-z0-9-]+|MIG-[A-Za-z0-9-]+)")
+_IDENTITY_FILENAME = "lehome_launch.json"
+
+
+@dataclass(frozen=True, slots=True)
+class OfficialLaunch:
+    """A ready-to-run official command plus a secret-stripped environment."""
+
+    command: tuple[str, ...]
+    environment: dict[str, str]
+
+
+def _require_one_visible_gpu(value: str | None) -> str:
+    if not isinstance(value, str):
+        raise ValueError("exactly one visible GPU is required")
+    candidate = value.strip()
+    if not _CUDA_VISIBLE_DEVICE.fullmatch(candidate):
+        raise ValueError("exactly one visible GPU is required")
+    return candidate
+
+
+def _safe_environment(
+    environment: Mapping[str, str] | None,
+    *,
+    visible_devices: str,
+) -> dict[str, str]:
+    source = os.environ if environment is None else environment
+    cleaned = {
+        key: value
+        for key, value in source.items()
+        if key != "HF_TOKEN"
+    }
+    cleaned["CUDA_VISIBLE_DEVICES"] = visible_devices
+    return cleaned
+
+
+def build_launch(
+    config: FineTuneLaunchConfig,
+    *,
+    visible_devices: str | None,
+    environment: Mapping[str, str] | None,
+    official_checkout: str | os.PathLike[str],
+) -> OfficialLaunch:
+    """Build a single-GPU command for NVIDIA's pinned ``launch_finetune.py``.
+
+    This wrapper intentionally does not alter the upstream training loop.  The
+    model and dataset revisions are recorded in the immutable experiment
+    identity; their local snapshots are passed to the upstream path-only API.
+    """
+
+    visible_gpu = _require_one_visible_gpu(visible_devices)
+    entrypoint = Path(official_checkout) / "gr00t" / "experiment" / "launch_finetune.py"
+    command = (
+        "python",
+        str(entrypoint),
+        "--base-model-path",
+        config.base_model_path,
+        "--dataset-path",
+        config.dataset_path,
+        "--embodiment-tag",
+        "NEW_EMBODIMENT",
+        "--modality-config-path",
+        config.modality_config_path,
+        "--num-gpus",
+        "1",
+        "--output-dir",
+        config.output_dir,
+        "--experiment-name",
+        config.experiment_name,
+        "--global-batch-size",
+        str(config.global_batch_size),
+        "--gradient-accumulation-steps",
+        "1",
+        "--max-steps",
+        str(config.max_steps),
+        "--save-steps",
+        str(config.save_steps),
+        "--save-total-limit",
+        str(config.save_total_limit),
+        "--warmup-ratio",
+        str(float(config.warmup_ratio)),
+        "--learning-rate",
+        str(float(config.learning_rate)),
+        "--weight-decay",
+        str(float(config.weight_decay)),
+        "--dataloader-num-workers",
+        str(config.dataloader_num_workers),
+        "--no-tune-llm",
+        "--no-tune-visual",
+        "--tune-projector",
+        "--tune-diffusion-model",
+    )
+    return OfficialLaunch(
+        command=command,
+        environment=_safe_environment(environment, visible_devices=visible_gpu),
+    )
+
+
+def _existing_identity(output_dir: Path) -> dict[str, object] | None:
+    if not output_dir.exists():
+        return None
+    if not output_dir.is_dir():
+        raise ValueError("incompatible experiment output path is not a directory")
+    identity_path = output_dir / _IDENTITY_FILENAME
+    if not identity_path.exists():
+        if any(output_dir.iterdir()):
+            raise ValueError("incompatible experiment directory has no launch identity")
+        return None
+    try:
+        decoded = json.loads(identity_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("incompatible experiment launch identity") from error
+    if not isinstance(decoded, dict):
+        raise ValueError("incompatible experiment launch identity")
+    return decoded
+
+
+def _write_or_verify_identity(config: FineTuneLaunchConfig) -> None:
+    output_dir = Path(config.output_dir)
+    existing = _existing_identity(output_dir)
+    expected = config.identity()
+    if existing is not None:
+        if existing != expected:
+            raise ValueError("incompatible experiment directory")
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(output_dir / _IDENTITY_FILENAME, expected)
+
+
+Runner = Callable[..., subprocess.CompletedProcess[object]]
+
+
+def launch_finetune(
+    config: FineTuneLaunchConfig,
+    *,
+    visible_devices: str | None,
+    environment: Mapping[str, str] | None,
+    official_checkout: str | os.PathLike[str],
+    runner: Runner = subprocess.run,
+) -> subprocess.CompletedProcess[object]:
+    """Record compatible experiment identity and execute the upstream launcher.
+
+    The child receives no Hugging Face token.  Artifact transfers are separate
+    trusted operations; training only reads pre-downloaded, revision-verified
+    model and dataset snapshots.
+    """
+
+    launch = build_launch(
+        config,
+        visible_devices=visible_devices,
+        environment=environment,
+        official_checkout=official_checkout,
+    )
+    _write_or_verify_identity(config)
+    return runner(launch.command, env=launch.environment, check=True)
