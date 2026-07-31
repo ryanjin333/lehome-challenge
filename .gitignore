@@ -68,6 +68,8 @@ _build
 
 # Tests
 tests/
+!trainer/tests/
+!trainer/tests/*.py
 
 # Docker history
 .isaac-lab-docker-history

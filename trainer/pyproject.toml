@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lehome-train"
+version = "0.1.0"
+description = "Portable GR00T N1.7 training tools for LeHome"
+requires-python = "==3.10.18"
+dependencies = [
+    "typer==0.16.1",
+]
+
+[project.scripts]
+lehome-train = "lehome_train.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lehome_train"]
