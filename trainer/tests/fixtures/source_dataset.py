@@ -40,26 +40,48 @@ def _write_json(path: Path, value: object) -> None:
 
 
 @lru_cache(maxsize=None)
-def _fixture_video(frame_count: int, fps: int) -> Path:
+def _fixture_video(frame_counts: tuple[int, ...], fps: int) -> Path:
+    frame_count = sum(frame_counts)
+    counts_slug = "-".join(str(count) for count in frame_counts)
     path = (
         Path(tempfile.gettempdir())
-        / f"lehome-v3-fixture-{frame_count}-frames-{fps}-fps.mp4"
+        / f"lehome-v3-fixture-{counts_slug}-frames-{fps}-fps.mp4"
     )
-    subprocess.run(
+    colors = ("blue", "red", "green", "yellow")
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    for index, count in enumerate(frame_counts):
+        command.extend(
+            [
+                "-f",
+                "lavfi",
+                "-i",
+                (
+                    f"color=c={colors[index % len(colors)]}:"
+                    f"s=640x480:r={fps}:d={count / fps:.9f}"
+                ),
+            ]
+        )
+    if len(frame_counts) > 1:
+        inputs = "".join(f"[{index}:v]" for index in range(len(frame_counts)))
+        command.extend(
+            [
+                "-filter_complex",
+                f"{inputs}concat=n={len(frame_counts)}:v=1:a=0[outv]",
+                "-map",
+                "[outv]",
+            ]
+        )
+    command.extend(
         [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            f"color=c=blue:s=640x480:r={fps}",
             "-frames:v",
             str(frame_count),
             "-c:v",
             "libx264",
             "-g",
+            "30",
+            "-sc_threshold",
+            "0",
+            "-threads",
             "1",
             "-pix_fmt",
             "yuv420p",
@@ -67,7 +89,10 @@ def _fixture_video(frame_count: int, fps: int) -> Path:
             "+bitexact",
             "-y",
             str(path),
-        ],
+        ]
+    )
+    subprocess.run(
+        command,
         check=True,
         timeout=30,
     )
@@ -95,6 +120,80 @@ def count_video_frames(path: Path) -> int:
         timeout=30,
     )
     return int(completed.stdout.strip())
+
+
+def video_fps(path: Path) -> float:
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    numerator, denominator = completed.stdout.strip().split("/", maxsplit=1)
+    return int(numerator) / int(denominator)
+
+
+def count_video_keyframes(path: Path) -> int:
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-skip_frame",
+            "nokey",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "frame=key_frame",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return len(completed.stdout.splitlines())
+
+
+def first_frame_dominant_channel(path: Path) -> str:
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=1:1",
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    red, green, blue = completed.stdout
+    return max(("red", red), ("green", green), ("blue", blue), key=lambda item: item[1])[0]
 
 
 def make_source_dataset(
@@ -266,8 +365,10 @@ def make_source_dataset(
         path = dataset / "data" / "chunk-000" / f"file-{file_index:03d}.parquet"
         path.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(pa.concat_tables(tables), path, compression="zstd")
-        frame_count = sum(table.num_rows for table in tables)
-        source_video = _fixture_video(frame_count, int(fps))
+        source_video = _fixture_video(
+            tuple(table.num_rows for table in tables),
+            int(fps),
+        )
         for camera_key in CAMERA_KEYS:
             video_path = (
                 dataset

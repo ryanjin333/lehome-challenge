@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
 import math
 import os
 from pathlib import Path
@@ -178,11 +179,18 @@ def _extract_video_segment(
     destination: Path,
     *,
     start: float,
-    end: float,
+    expected_frame_count: int,
+    expected_fps: float,
 ) -> None:
     if not source.is_file() or source.suffix.lower() != ".mp4":
         raise ValueError(f"invalid source MP4 shard: {source}")
-    if not math.isfinite(start) or not math.isfinite(end) or start < 0 or start >= end:
+    if (
+        not math.isfinite(start)
+        or start < 0
+        or expected_frame_count <= 0
+        or not math.isfinite(expected_fps)
+        or expected_fps <= 0
+    ):
         raise ValueError("invalid v3 video timestamp slice")
     destination.parent.mkdir(parents=True, exist_ok=True)
     command = [
@@ -190,16 +198,29 @@ def _extract_video_segment(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-ss",
-        f"{start:.6f}",
         "-i",
         str(source),
-        "-t",
-        f"{end - start:.6f}",
-        "-c",
-        "copy",
-        "-avoid_negative_ts",
+        "-ss",
+        f"{start:.9f}",
+        "-frames:v",
+        str(expected_frame_count),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        f"{expected_fps:.12g}",
+        "-g",
+        "30",
+        "-threads",
         "1",
+        "-map_metadata",
+        "-1",
+        "-fflags",
+        "+bitexact",
         "-y",
         str(destination),
     ]
@@ -218,6 +239,69 @@ def _extract_video_segment(
     except subprocess.CalledProcessError as error:
         detail = error.stderr.strip() if error.stderr else "unknown ffmpeg error"
         raise RuntimeError(f"ffmpeg failed slicing {source}: {detail}") from error
+    _validate_output_video(
+        destination,
+        expected_frame_count=expected_frame_count,
+        expected_fps=expected_fps,
+    )
+
+
+def _validate_output_video(
+    path: Path,
+    *,
+    expected_frame_count: int,
+    expected_fps: float,
+) -> None:
+    """Fail closed unless ffprobe observes the exact intended temporal schema."""
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-count_frames",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=avg_frame_rate,nb_read_frames",
+        "-of",
+        "json",
+        str(path),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            timeout=60,
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(completed.stdout)
+        streams = payload.get("streams")
+        if not isinstance(streams, list) or len(streams) != 1:
+            raise ValueError("expected exactly one output video stream")
+        stream = streams[0]
+        frame_count = int(stream["nb_read_frames"])
+        numerator, denominator = stream["avg_frame_rate"].split("/", maxsplit=1)
+        fps = int(numerator) / int(denominator)
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        ZeroDivisionError,
+    ) as error:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(f"could not validate converted video: {path}") from error
+    if frame_count != expected_frame_count or abs(fps - expected_fps) > 1e-9:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(
+            "converted video temporal schema mismatch: "
+            f"expected {expected_frame_count} frames at {expected_fps} FPS, "
+            f"observed {frame_count} frames at {fps} FPS"
+        )
 
 
 def _write_episode_videos(
@@ -231,6 +315,7 @@ def _write_episode_videos(
     if not isinstance(source_pattern, str):
         raise ValueError("info video_path must be a string")
     chunks_size = int(info["chunks_size"])
+    fps = float(info["fps"])
     for camera_key in camera_keys:
         for record in sorted(records, key=lambda item: int(item["episode_index"])):
             episode_id = int(record["episode_index"])
@@ -252,7 +337,11 @@ def _write_episode_videos(
                 source_video,
                 destination,
                 start=float(record[f"videos/{camera_key}/from_timestamp"]),
-                end=float(record[f"videos/{camera_key}/to_timestamp"]),
+                expected_frame_count=(
+                    int(record["dataset_to_index"])
+                    - int(record["dataset_from_index"])
+                ),
+                expected_fps=fps,
             )
 
 
@@ -407,10 +496,6 @@ def convert_dataset(
         )
         atomic_write_json(temporary / "meta" / "modality.json", _modality_metadata())
         atomic_write_json(temporary / "meta" / "lehome_mapping.json", mapping)
-        source_stats = source / "meta" / "stats.json"
-        if source_stats.is_file():
-            shutil.copyfile(source_stats, temporary / "meta" / "stats.json")
-
         valid_window_counts = {
             str(record["episode_index"]): max(
                 0,
@@ -459,6 +544,10 @@ def convert_dataset(
             },
             "action_schema": mapping["action"],
             "fixed_language_instruction": FIXED_INSTRUCTION,
+            "statistics": {
+                "status": "pending_task_4_train_only",
+                "files": [],
+            },
             "future_actions": {
                 "horizon": ACTION_HORIZON,
                 "loader_allow_padding": False,

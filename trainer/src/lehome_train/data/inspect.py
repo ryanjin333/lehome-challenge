@@ -361,6 +361,8 @@ def _validate_video_shards(
                     or not math.isfinite(float(start))
                     or not math.isfinite(float(end))
                     or abs(float(start) - last_end) > 1e-6
+                    or abs(float(start) * fps - round(float(start) * fps)) > 1e-6
+                    or abs(float(end) * fps - round(float(end) * fps)) > 1e-6
                     or abs((float(end) - float(start)) - length / fps) > 1e-5
                 ):
                     errors.append(f"episode {episode_id} has invalid camera time slice")
