@@ -9,6 +9,8 @@ from lehome_train.constants import MODEL_REVISION
 
 
 ACTION_HORIZON = 16
+LR_SCHEDULER_TYPE = "cosine"
+DECAY_SEMANTICS = "cosine_remainder_after_warmup"
 _PINNED_REVISION = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -44,7 +46,6 @@ class FineTuneLaunchConfig:
     max_steps: int
     save_steps: int
     warmup_ratio: float
-    decay_ratio: float
     num_gpus: int = 1
     global_batch_size: int | None = None
     gradient_accumulation_steps: int = 1
@@ -105,10 +106,6 @@ class FineTuneLaunchConfig:
                 raise ValueError(f"{field_name} must be positive")
         if not isinstance(self.warmup_ratio, (float, int)) or not 0 < self.warmup_ratio < 1:
             raise ValueError("warmup_ratio must be a fraction strictly between zero and one")
-        if not isinstance(self.decay_ratio, (float, int)) or not 0 < self.decay_ratio < 1:
-            raise ValueError("decay_ratio must be a fraction strictly between zero and one")
-        if abs((float(self.warmup_ratio) + float(self.decay_ratio)) - 1.0) > 1e-9:
-            raise ValueError("decay_ratio must complete the post-warmup fractional schedule")
 
     def identity(self) -> dict[str, object]:
         """Return command-relevant provenance without secret environment data."""
@@ -126,11 +123,17 @@ class FineTuneLaunchConfig:
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "action_horizon": self.action_horizon,
             "warmup_ratio": float(self.warmup_ratio),
-            "decay_ratio": float(self.decay_ratio),
+            "lr_scheduler_type": LR_SCHEDULER_TYPE,
+            "decay_semantics": DECAY_SEMANTICS,
             "tune_llm": self.tune_llm,
             "tune_visual": self.tune_visual,
             "tune_projector": self.tune_projector,
             "tune_diffusion_model": self.tune_diffusion_model,
             "max_steps": self.max_steps,
             "save_steps": self.save_steps,
+            "save_total_limit": self.save_total_limit,
+            "learning_rate": float(self.learning_rate),
+            "weight_decay": float(self.weight_decay),
+            "dataloader_num_workers": self.dataloader_num_workers,
+            "num_gpus": self.num_gpus,
         }

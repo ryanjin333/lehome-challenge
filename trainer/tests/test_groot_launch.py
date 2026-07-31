@@ -8,6 +8,7 @@ import pytest
 from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.groot.launch import build_launch, launch_finetune
 from lehome_train.groot.metrics import parse_trainer_log_lines
+from lehome_train.constants import ISAAC_GROOT_REVISION
 
 
 REVISION = "a" * 40
@@ -26,21 +27,35 @@ def config(**overrides: object) -> FineTuneLaunchConfig:
         "max_steps": 12_000,
         "save_steps": 1_000,
         "warmup_ratio": 0.05,
-        "decay_ratio": 0.95,
     }
     values.update(overrides)
     return FineTuneLaunchConfig(**values)
 
 
-def test_build_launch_uses_only_pinned_official_entrypoint_and_redacts_token() -> None:
+@pytest.fixture
+def official_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    checkout = tmp_path / "isaac-groot"
+    entrypoint = checkout / "gr00t" / "experiment" / "launch_finetune.py"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("# official launcher fixture\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "lehome_train.groot.launch._checkout_head",
+        lambda _path: ISAAC_GROOT_REVISION,
+    )
+    return checkout
+
+
+def test_build_launch_uses_only_pinned_official_entrypoint_and_redacts_token(
+    official_checkout: Path,
+) -> None:
     launch = build_launch(
         config(),
         visible_devices="1",
         environment={"HF_TOKEN": "hf_abcdefghijklmnopqrstuvwxyz0123456789", "PATH": "/bin"},
-        official_checkout="/opt/isaac-groot",
+        official_checkout=official_checkout,
     )
 
-    assert launch.command[:2] == ("python", "/opt/isaac-groot/gr00t/experiment/launch_finetune.py")
+    assert launch.command[:2] == ("python", str(official_checkout / "gr00t" / "experiment" / "launch_finetune.py"))
     assert "--base-model-path" in launch.command
     assert "--base-model-revision" not in launch.command
     assert "--global-batch-size" in launch.command
@@ -57,17 +72,23 @@ def test_build_launch_uses_only_pinned_official_entrypoint_and_redacts_token() -
 
 
 @pytest.mark.parametrize("visible_devices", ["", "0,1", "0, 1", "NoDevFiles"])
-def test_build_launch_refuses_zero_or_multiple_visible_gpus(visible_devices: str) -> None:
+def test_build_launch_refuses_zero_or_multiple_visible_gpus(
+    visible_devices: str,
+    official_checkout: Path,
+) -> None:
     with pytest.raises(ValueError, match="visible GPU"):
         build_launch(
             config(),
             visible_devices=visible_devices,
             environment={},
-            official_checkout="/opt/isaac-groot",
+            official_checkout=official_checkout,
         )
 
 
-def test_launch_refuses_incompatible_existing_experiment_directory(tmp_path: Path) -> None:
+def test_launch_refuses_incompatible_existing_experiment_directory(
+    tmp_path: Path,
+    official_checkout: Path,
+) -> None:
     output = tmp_path / "experiment"
     output.mkdir()
     (output / "lehome_launch.json").write_text('{"dataset_revision":"' + ("b" * 40) + '"}', encoding="utf-8")
@@ -77,9 +98,48 @@ def test_launch_refuses_incompatible_existing_experiment_directory(tmp_path: Pat
             config(output_dir=str(output)),
             visible_devices="0",
             environment={},
-            official_checkout="/opt/isaac-groot",
+            official_checkout=official_checkout,
             runner=lambda *_args, **_kwargs: pytest.fail("runner must not execute"),
         )
+
+
+def test_launch_identity_rejects_behavior_changing_settings_before_runner(
+    tmp_path: Path,
+    official_checkout: Path,
+) -> None:
+    output = tmp_path / "experiment"
+    expected = config(output_dir=str(output))
+    output.mkdir()
+    (output / "lehome_launch.json").write_text(
+        __import__("json").dumps(expected.identity()), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="incompatible experiment"):
+        launch_finetune(
+            config(output_dir=str(output), learning_rate=2e-4),
+            visible_devices="0",
+            environment={},
+            official_checkout=official_checkout,
+            runner=lambda *_args, **_kwargs: pytest.fail("runner must not execute"),
+        )
+
+
+def test_build_launch_refuses_missing_or_wrong_pinned_official_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="official GR00T entrypoint"):
+        build_launch(
+            config(), visible_devices="0", environment={}, official_checkout=tmp_path / "missing"
+        )
+
+    checkout = tmp_path / "wrong-revision"
+    entrypoint = checkout / "gr00t" / "experiment" / "launch_finetune.py"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("# fixture\n", encoding="utf-8")
+    monkeypatch.setattr("lehome_train.groot.launch._checkout_head", lambda _path: "b" * 40)
+    with pytest.raises(ValueError, match="pinned Isaac-GR00T"):
+        build_launch(config(), visible_devices="0", environment={}, official_checkout=checkout)
 
 
 def test_parser_returns_finite_structured_loss_throughput_and_checkpoint_timing() -> None:
@@ -89,7 +149,8 @@ def test_parser_returns_finite_structured_loss_throughput_and_checkpoint_timing(
             "{'loss': 0.125, 'step': 12, 'steps_per_second': 3.5, 'samples_per_second': 224.0}",
             "Saving model checkpoint to /output/baseline/checkpoint-12",
             "{'loss': nan, 'step': 13}",
-        ]
+        ],
+        timestamps_seconds=[10.0, 11.0, 14.5, 15.0],
     )
 
     assert [record.kind for record in records] == ["loss", "loss", "checkpoint", "loss"]
@@ -98,5 +159,6 @@ def test_parser_returns_finite_structured_loss_throughput_and_checkpoint_timing(
     assert records[1].steps_per_second == 3.5
     assert records[1].samples_per_second == 224.0
     assert records[2].checkpoint_path == "/output/baseline/checkpoint-12"
+    assert records[2].recorded_at_seconds == 14.5
     assert records[3].finite_loss is False
     assert math.isnan(records[3].loss or 0.0)

@@ -22,7 +22,6 @@ def config(**overrides: object) -> FineTuneLaunchConfig:
         "max_steps": 12_000,
         "save_steps": 1_000,
         "warmup_ratio": 0.05,
-        "decay_ratio": 0.95,
     }
     values.update(overrides)
     return FineTuneLaunchConfig(**values)
@@ -40,6 +39,8 @@ def test_config_enforces_single_gpu_fixed_batch_horizon_and_freezing() -> None:
     assert resolved.tune_projector is True
     assert resolved.tune_diffusion_model is True
     assert resolved.base_model_revision == MODEL_REVISION
+    assert resolved.identity()["lr_scheduler_type"] == "cosine"
+    assert resolved.identity()["decay_semantics"] == "cosine_remainder_after_warmup"
 
 
 @pytest.mark.parametrize(
@@ -51,7 +52,6 @@ def test_config_enforces_single_gpu_fixed_batch_horizon_and_freezing() -> None:
         ("gradient_accumulation_steps", 2, "gradient accumulation"),
         ("action_horizon", 8, "action horizon"),
         ("warmup_ratio", 0.0, "warmup_ratio"),
-        ("decay_ratio", 0.50, "decay_ratio"),
         ("base_model_revision", "main", "pinned"),
         ("dataset_revision", "lehome-groot-n17-v1", "pinned"),
         ("tune_llm", True, "tune_llm"),

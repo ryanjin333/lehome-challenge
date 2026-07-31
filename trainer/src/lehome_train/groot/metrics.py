@@ -20,6 +20,7 @@ class TrainerMetric:
 
     kind: Literal["loss", "checkpoint", "throughput"]
     line_number: int
+    recorded_at_seconds: float | None = None
     loss: float | None = None
     finite_loss: bool | None = None
     optimizer_step: int | None = None
@@ -69,17 +70,29 @@ def _nan_aware_loss(line: str) -> float | None:
         return None
 
 
-def parse_trainer_log_lines(lines: Iterable[str]) -> tuple[TrainerMetric, ...]:
+def parse_trainer_log_lines(
+    lines: Iterable[str],
+    *,
+    timestamps_seconds: Iterable[float] | None = None,
+) -> tuple[TrainerMetric, ...]:
     """Extract official Trainer signals while deliberately discarding raw logs."""
 
+    source_lines = tuple(lines)
+    timestamps = None if timestamps_seconds is None else tuple(timestamps_seconds)
+    if timestamps is not None and len(timestamps) != len(source_lines):
+        raise ValueError("timestamps_seconds must align one-to-one with log lines")
     records: list[TrainerMetric] = []
-    for line_number, line in enumerate(lines, start=1):
+    for line_number, line in enumerate(source_lines, start=1):
+        recorded_at_seconds = None if timestamps is None else float(timestamps[line_number - 1])
+        if recorded_at_seconds is not None and not math.isfinite(recorded_at_seconds):
+            raise ValueError("timestamps_seconds must be finite")
         checkpoint = _CHECKPOINT.search(line)
         if checkpoint is not None:
             records.append(
                 TrainerMetric(
                     kind="checkpoint",
                     line_number=line_number,
+                    recorded_at_seconds=recorded_at_seconds,
                     checkpoint_path=checkpoint.group("path"),
                 )
             )
@@ -106,6 +119,7 @@ def parse_trainer_log_lines(lines: Iterable[str]) -> tuple[TrainerMetric, ...]:
                 TrainerMetric(
                     kind="loss",
                     line_number=line_number,
+                    recorded_at_seconds=recorded_at_seconds,
                     loss=loss,
                     finite_loss=math.isfinite(loss),
                     optimizer_step=int(step) if step is not None and step >= 0 else None,
@@ -118,6 +132,7 @@ def parse_trainer_log_lines(lines: Iterable[str]) -> tuple[TrainerMetric, ...]:
                 TrainerMetric(
                     kind="throughput",
                     line_number=line_number,
+                    recorded_at_seconds=recorded_at_seconds,
                     optimizer_step=int(step) if step is not None and step >= 0 else None,
                     steps_per_second=steps_per_second,
                     samples_per_second=samples_per_second,

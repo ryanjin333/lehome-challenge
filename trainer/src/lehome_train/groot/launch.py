@@ -10,6 +10,7 @@ import re
 import subprocess
 from typing import Callable, Mapping, Sequence
 
+from lehome_train.constants import ISAAC_GROOT_REVISION
 from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.io import atomic_write_json
 
@@ -50,6 +51,33 @@ def _safe_environment(
     return cleaned
 
 
+def _checkout_head(checkout: Path) -> str:
+    """Return a checkout's exact Git identity without exposing command output."""
+
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(checkout), "rev-parse", "HEAD"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise ValueError("official GR00T checkout is not a readable Git checkout") from error
+    if completed.returncode != 0:
+        raise ValueError("official GR00T checkout is not a readable Git checkout")
+    return completed.stdout.strip()
+
+
+def _official_entrypoint(official_checkout: str | os.PathLike[str]) -> Path:
+    checkout = Path(official_checkout)
+    entrypoint = checkout / "gr00t" / "experiment" / "launch_finetune.py"
+    if not entrypoint.is_file():
+        raise ValueError("official GR00T entrypoint is missing")
+    if _checkout_head(checkout) != ISAAC_GROOT_REVISION:
+        raise ValueError("official checkout is not pinned Isaac-GR00T revision")
+    return entrypoint
+
+
 def build_launch(
     config: FineTuneLaunchConfig,
     *,
@@ -65,7 +93,7 @@ def build_launch(
     """
 
     visible_gpu = _require_one_visible_gpu(visible_devices)
-    entrypoint = Path(official_checkout) / "gr00t" / "experiment" / "launch_finetune.py"
+    entrypoint = _official_entrypoint(official_checkout)
     command = (
         "python",
         str(entrypoint),
