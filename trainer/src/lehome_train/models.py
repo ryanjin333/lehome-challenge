@@ -141,6 +141,28 @@ def _require_nonempty(value: str, field_name: str) -> None:
         raise _field_error(field_name, "must not be empty")
 
 
+def validate_artifact_relative_path(
+    value: str,
+    field_name: str = "relative_path",
+) -> str:
+    """Validate one canonical POSIX experiment-relative artifact path."""
+
+    _require_nonempty(value, field_name)
+    if value.startswith("/"):
+        raise _field_error(field_name, "must be relative")
+    if "\\" in value or "\x00" in value:
+        raise _field_error(field_name, "must use canonical POSIX components")
+
+    components = value.split("/")
+    if any(component in ("", ".") for component in components):
+        raise _field_error(field_name, "must not contain path aliases")
+    if ".." in components:
+        raise _field_error(field_name, "must not traverse")
+    if any(component.startswith(".") for component in components):
+        raise _field_error(field_name, "must not contain dot components")
+    return value
+
+
 def _require_sha256(value: str, field_name: str) -> None:
     if not _SHA256_RE.fullmatch(value):
         raise _field_error(field_name, "must be a lowercase SHA-256 hex digest")
@@ -171,7 +193,7 @@ class ArtifactIdentity(StrictModel):
 
     def __post_init__(self) -> None:
         StrictModel.__post_init__(self)
-        _require_nonempty(self.relative_path, "relative_path")
+        validate_artifact_relative_path(self.relative_path)
         _require_sha256(self.sha256, "sha256")
         _require_nonnegative(self.byte_size, "byte_size")
 
@@ -428,6 +450,12 @@ class MemorizationResult(StrictModel):
                 "final_dimension_mse",
                 "must match initialized dimension count",
             )
+        for field_name in (
+            "initialized_dimension_mse",
+            "final_dimension_mse",
+        ):
+            for value in getattr(self, field_name):
+                _require_nonnegative_float(value, field_name)
         _require_nonnegative(self.sample_presentations, "sample_presentations")
         if self.promotable:
             raise _field_error("promotable", "memorization results are diagnostic")
@@ -449,7 +477,7 @@ class SyncEntry(StrictModel):
 
     def __post_init__(self) -> None:
         StrictModel.__post_init__(self)
-        _require_nonempty(self.relative_path, "relative_path")
+        validate_artifact_relative_path(self.relative_path)
         _require_sha256(self.sha256, "sha256")
         _require_nonnegative(self.byte_size, "byte_size")
 

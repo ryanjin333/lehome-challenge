@@ -13,7 +13,7 @@ import stat
 from pathlib import Path
 from typing import Final, Iterable, Pattern
 
-from lehome_train.models import SyncEntry
+from lehome_train.models import SyncEntry, validate_artifact_relative_path
 
 
 # Exact credential-store basenames, compared case-insensitively.  Keep this
@@ -91,19 +91,24 @@ def _rejected(category: str) -> ArtifactRejected:
     return ArtifactRejected(f"artifact rejected by upload policy: {category}")
 
 
-def _validate_relative_path(relative: Path) -> tuple[str, ...]:
-    if relative.is_absolute():
-        raise _rejected("absolute path")
-    parts = relative.parts
-    if not parts or parts == (".",):
-        raise _rejected("empty path")
-    if ".." in parts:
-        raise _rejected("path traversal")
+def _validated_artifact_path(value: object) -> str | None:
+    try:
+        raw_path = os.fspath(value)
+        if not isinstance(raw_path, str):
+            return None
+        return validate_artifact_relative_path(raw_path)
+    except (TypeError, ValueError):
+        return None
+
+
+def _validate_relative_path(value: object) -> tuple[str, ...]:
+    canonical = _validated_artifact_path(value)
+    if canonical is None:
+        raise _rejected("noncanonical relative path")
+    parts = tuple(canonical.split("/"))
 
     for part in parts:
         folded = part.casefold()
-        if part.startswith("."):
-            raise _rejected("dot path")
         if folded in DENIED_PATH_COMPONENTS:
             raise _rejected("cache path")
     basename = parts[-1].casefold()
@@ -219,9 +224,8 @@ def generate_upload_allowlist(
     entries: list[SyncEntry] = []
     seen: set[str] = set()
     for supplied in relative_paths:
-        relative = Path(supplied)
-        parts = _validate_relative_path(relative)
-        canonical = Path(*parts).as_posix()
+        parts = _validate_relative_path(supplied)
+        canonical = "/".join(parts)
         if canonical in seen:
             raise _rejected("duplicate path")
         seen.add(canonical)

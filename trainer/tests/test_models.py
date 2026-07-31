@@ -227,3 +227,65 @@ def test_models_reject_invalid_identity_or_measurement(
 
     with pytest.raises(ValueError, match=field):
         SourceInspection(**values)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "",
+        "/absolute/artifact.json",
+        "../outside.json",
+        "reports/../../outside.json",
+        ".hidden",
+        "reports/.private/result.json",
+        "reports/./result.json",
+        "reports//result.json",
+        "reports/result.json/",
+    ],
+)
+@pytest.mark.parametrize("model_type", [ArtifactIdentity, SyncEntry])
+def test_parsed_artifact_records_reject_noncanonical_relative_paths(
+    model_type: type[ArtifactIdentity] | type[SyncEntry],
+    relative_path: str,
+) -> None:
+    payload = {
+        "relative_path": relative_path,
+        "sha256": SHA_A,
+        "byte_size": 1,
+    }
+    if model_type is SyncEntry:
+        payload["remotely_verified"] = False
+
+    with pytest.raises(ValueError, match="relative_path"):
+        parse_json(model_type, payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "values"),
+    [
+        ("initialized_dimension_mse", (-0.01, 1.0)),
+        ("final_dimension_mse", (0.1, -0.01)),
+    ],
+)
+def test_memorization_result_rejects_negative_dimension_mse(
+    field: str,
+    values: tuple[float, ...],
+) -> None:
+    payload = MemorizationResult(
+        experiment_id="experiment-001",
+        experiment_config_sha256=SHA_A,
+        dataset_manifest_sha256=SHA_B,
+        episode_id="episode-0001",
+        initialized_normalized_mse=1.0,
+        final_normalized_mse=0.08,
+        initialized_dimension_mse=(1.0, 1.0),
+        final_dimension_mse=(0.08, 0.09),
+        sample_presentations=10_000,
+        offline_gate_passed=True,
+        promotable=False,
+        pending_gate="simulator_expert_replay",
+    ).to_dict()
+    payload[field] = list(values)
+
+    with pytest.raises(ValueError, match=field):
+        parse_json(MemorizationResult, payload)
