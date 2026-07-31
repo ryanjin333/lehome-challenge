@@ -67,9 +67,7 @@ _build
 # Teleop Recorded Dataset
 
 # Tests
-tests/
-!trainer/tests/
-!trainer/tests/*.py
+/tests/
 
 # Docker history
 .isaac-lab-docker-history

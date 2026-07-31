@@ -19,10 +19,14 @@ def test_cli_help() -> None:
     ["data", "prepare", "memorize", "smoke", "train", "report", "sync"],
 )
 def test_cli_registers_command_group(command: str) -> None:
-    result = CliRunner().invoke(app, [command, "--help"])
+    result = CliRunner().invoke(
+        app,
+        [command, "--help"],
+        prog_name="lehome-train",
+    )
 
     assert result.exit_code == 0
-    assert f"Usage: root {command}" in result.stdout
+    assert f"Usage: lehome-train {command}" in result.stdout
 
 
 def test_settings_use_exact_immutable_pins() -> None:
