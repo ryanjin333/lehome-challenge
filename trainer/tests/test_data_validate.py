@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from fixtures.source_dataset import make_source_dataset
@@ -155,4 +157,46 @@ def test_validation_requires_all_three_checked_camera_mappings(tmp_path: Path) -
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
     with pytest.raises(ValueError, match="video"):
+        validate_prepared_dataset(dataset)
+
+
+def test_validation_rejects_mutated_finite_converted_artifact(tmp_path: Path) -> None:
+    dataset = _prepared_dataset(tmp_path)
+    path = dataset / "data" / "chunk-000" / "episode_000003.parquet"
+    table = pq.read_table(path)
+    actions = table["action"].to_pylist()
+    actions[0][0] += 1.0
+    altered = table.set_column(
+        table.schema.get_field_index("action"),
+        "action",
+        pa.array(actions, type=table["action"].type),
+    )
+    pq.write_table(altered, path, compression="zstd")
+
+    with pytest.raises(ValueError, match="artifact hash"):
+        validate_prepared_dataset(dataset)
+
+
+def test_validation_rejects_mutated_recorded_statistics(tmp_path: Path) -> None:
+    dataset = _prepared_dataset(tmp_path)
+    path = dataset / "meta" / "stats.json"
+    stats = json.loads(path.read_text(encoding="utf-8"))
+    stats["action"]["mean"][0] += 1.0
+    path.write_text(json.dumps(stats), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="recorded statistics hash"):
+        validate_prepared_dataset(dataset)
+
+
+def test_validation_rejects_empty_or_reassigned_deterministic_holdout(
+    tmp_path: Path,
+) -> None:
+    dataset = _prepared_dataset(tmp_path)
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["train_episode_ids"].append(manifest["validation_episode_ids"][0])
+    manifest["validation_episode_ids"] = []
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="validation"):
         validate_prepared_dataset(dataset)
