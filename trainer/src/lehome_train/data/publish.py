@@ -263,6 +263,26 @@ def _required_staging_bytes(entries: tuple[SyncEntry, ...]) -> int:
     return payload_bytes + reserve_bytes
 
 
+def _require_staging_capacity(
+    staging_root: Path,
+    entries: tuple[SyncEntry, ...],
+    free_space_probe: Callable[[Path], int],
+    *,
+    phase: str,
+) -> None:
+    available_bytes = free_space_probe(staging_root)
+    if type(available_bytes) is not int or available_bytes < 0:
+        raise ValueError(
+            f"dataset {phase} staging free-space probe returned an invalid value"
+        )
+    required_bytes = _required_staging_bytes(entries)
+    if available_bytes < required_bytes:
+        raise ValueError(
+            f"dataset {phase} staging filesystem has insufficient space "
+            f"(requires {required_bytes} bytes, has {available_bytes} bytes)"
+        )
+
+
 def publish_prepared_dataset(
     dataset_path: str | os.PathLike[str],
     *,
@@ -305,15 +325,12 @@ def publish_prepared_dataset(
     )
     if not resolved_staging_root.is_dir() or resolved_staging_root.is_symlink():
         raise ValueError("dataset staging root must be an existing regular directory")
-    available_bytes = free_space_probe(resolved_staging_root)
-    if type(available_bytes) is not int or available_bytes < 0:
-        raise ValueError("dataset staging free-space probe returned an invalid value")
-    required_bytes = _required_staging_bytes(entries)
-    if available_bytes < required_bytes:
-        raise ValueError(
-            "dataset staging filesystem has insufficient space "
-            f"(requires {required_bytes} bytes, has {available_bytes} bytes)"
-        )
+    _require_staging_capacity(
+        resolved_staging_root,
+        entries,
+        free_space_probe,
+        phase="upload",
+    )
     staging = _stage_entries(
         dataset,
         entries,
@@ -329,22 +346,33 @@ def publish_prepared_dataset(
             environ=environ,
             max_attempts=max_attempts,
         )
-        readback = Path(tempfile.mkdtemp(prefix="lehome-dataset-readback-"))
-        try:
-            download_files(
-                transport=transport,
-                repository=repository,
-                revision=immutable_revision,
-                destination=readback,
-                relative_paths=tuple(entry.relative_path for entry in entries),
-                environ=environ,
-                max_attempts=max_attempts,
-            )
-            _verify_entries(readback, entries)
-        finally:
-            shutil.rmtree(readback, ignore_errors=True)
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(staging)
+    _require_staging_capacity(
+        resolved_staging_root,
+        entries,
+        free_space_probe,
+        phase="readback",
+    )
+    readback = Path(
+        tempfile.mkdtemp(
+            prefix="lehome-dataset-readback-",
+            dir=resolved_staging_root,
+        )
+    )
+    try:
+        download_files(
+            transport=transport,
+            repository=repository,
+            revision=immutable_revision,
+            destination=readback,
+            relative_paths=tuple(entry.relative_path for entry in entries),
+            environ=environ,
+            max_attempts=max_attempts,
+        )
+        _verify_entries(readback, entries)
+    finally:
+        shutil.rmtree(readback)
     return PublishedDataset(
         repository=repository,
         revision=immutable_revision,

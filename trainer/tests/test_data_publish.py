@@ -27,6 +27,8 @@ class FakeHubTransport:
         self.corrupt_download_path: str | None = None
         self.before_upload: Callable[[], None] | None = None
         self.upload_sources: list[Path] = []
+        self.download_destinations: list[Path] = []
+        self.upload_source_exists_at_download: list[bool] = []
         self.write_unexpected_file = False
         self.write_unexpected_symlink = False
 
@@ -62,6 +64,10 @@ class FakeHubTransport:
         token: str,
     ) -> str:
         self.download_revisions.append(revision)
+        self.download_destinations.append(destination)
+        self.upload_source_exists_at_download.append(
+            bool(self.upload_sources and self.upload_sources[-1].exists())
+        )
         for relative_path in relative_paths:
             target = destination / relative_path
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -235,6 +241,8 @@ def test_publish_uses_the_caller_selected_staging_root(tmp_path: Path) -> None:
     )
 
     assert transport.upload_sources[0].parent == staging_root
+    assert transport.upload_source_exists_at_download == [False]
+    assert transport.download_destinations[0].parent == staging_root
     assert not tuple(staging_root.iterdir())
 
 
@@ -271,6 +279,37 @@ def test_publish_refuses_staging_filesystem_with_insufficient_free_space(
     assert observed_roots == [staging_root]
     assert not tuple(staging_root.iterdir())
     assert transport.upload_sources == []
+
+
+def test_publish_rechecks_space_after_upload_before_creating_readback(
+    tmp_path: Path,
+) -> None:
+    dataset = _write_validated_dataset(tmp_path / "source")
+    staging_root = tmp_path / "phase-volume"
+    staging_root.mkdir()
+    observed_roots: list[Path] = []
+    transport = FakeHubTransport()
+
+    def phase_free_space(path: Path) -> int:
+        observed_roots.append(path)
+        return 10**12 if len(observed_roots) == 1 else 0
+
+    with pytest.raises(ValueError, match="readback.*space"):
+        publish_prepared_dataset(
+            dataset,
+            repository=DEFAULT_DATA_REPO,
+            revision="lehome-groot-n17-v1",
+            transport=transport,
+            environ={"HF_TOKEN": "hf_publish_process_token"},
+            staging_root=staging_root,
+            free_space_probe=phase_free_space,
+        )
+
+    assert observed_roots == [staging_root, staging_root]
+    assert len(transport.upload_sources) == 1
+    assert not transport.upload_sources[0].exists()
+    assert transport.download_destinations == []
+    assert not tuple(staging_root.iterdir())
 
 
 def test_publish_refuses_dirty_hashed_payloads(tmp_path: Path) -> None:
