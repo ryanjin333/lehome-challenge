@@ -25,14 +25,6 @@ class StopAtOptimizerStep:
             control.should_training_stop = True
         return control
 
-    def on_train_begin(
-        self, args: object, state: Any, control: Any, **_kwargs: object
-    ) -> Any:
-        if self.optimizer_step == 0:
-            control.should_training_stop = True
-        return control
-
-
 def _resume_value(output_dir: str | Path) -> bool:
     """Return true only when the official output has a valid trainer checkpoint."""
 
@@ -84,6 +76,12 @@ def main(argv: list[str] | None = None) -> None:
     original_train = Trainer.train
 
     def bounded_train(trainer: Any, *args: object, **kwargs: object) -> Any:
+        # The pinned upstream has already built the model/dataset and saved the
+        # processor before this call, and it calls save_model immediately after
+        # train returns. Entering Transformers' loop at a zero target can still
+        # complete optimizer step 1 before an on_train_begin stop is honored.
+        if stop_step == 0:
+            return None
         trainer.add_callback(StopAtOptimizerStep(stop_step))
         if kwargs.get("resume_from_checkpoint") is True:
             kwargs["resume_from_checkpoint"] = _resume_value(trainer.args.output_dir)

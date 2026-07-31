@@ -236,9 +236,12 @@ def launch_finetune_to_step(
     """Resume the pinned launcher but stop at one controller-owned boundary.
 
     The upstream run always calls ``Trainer.train(resume_from_checkpoint=True)``.
-    The image-owned wrapper adds only a stop callback; the official full-run
-    ``max_steps`` remains unchanged, so resumed chunks keep one optimizer and
-    warmup/cosine schedule instead of restarting it at each upload boundary.
+    For target zero, the image-owned wrapper returns before entering the
+    Transformers loop; upstream has already initialized the pipeline and saves
+    the model after the return. Positive targets add only a stop callback. The
+    official full-run ``max_steps`` remains unchanged, so resumed chunks keep
+    one optimizer and warmup/cosine schedule instead of restarting it at each
+    upload boundary.
     """
 
     if (
