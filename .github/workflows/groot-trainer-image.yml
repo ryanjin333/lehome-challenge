@@ -34,8 +34,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: "0.8.22"
           enable-cache: false
@@ -49,16 +49,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if git grep -nE \
+          scan_output=$(mktemp)
+          trap 'rm -f "$scan_output"' EXIT
+          set +e
+          git grep -nE \
             'hf_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{30,}' \
-            -- . ':(exclude)trainer/tests/**'; then
+            -- . ':(exclude)trainer/tests/**' >"$scan_output"
+          scanner_status=$?
+          set -e
+          if [[ "$scanner_status" -eq 0 ]]; then
             echo "tracked credential-like material found" >&2
             exit 1
           fi
+          if [[ "$scanner_status" -ne 1 ]]; then
+            echo "credential scanner failed with status $scanner_status" >&2
+            exit "$scanner_status"
+          fi
+          set +e
           large=$(find . -type f -size +25M \
             -not -path './.git/*' \
             -not -path './trainer/.venv/*' \
             -print -quit)
+          scanner_status=$?
+          set -e
+          if [[ "$scanner_status" -ne 0 ]]; then
+            echo "large-file scanner failed with status $scanner_status" >&2
+            exit "$scanner_status"
+          fi
           test -z "$large" || { echo "unexpected tracked-scale artifact: $large" >&2; exit 1; }
       - name: Validate shell helpers
         run: bash -n trainer/docker/entrypoint.sh trainer/scripts/build-image.sh trainer/scripts/verify-image.sh
@@ -76,21 +93,21 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
       image: ${{ env.IMAGE_REPOSITORY }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - id: metadata
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.IMAGE_REPOSITORY }}
           tags: |
             type=raw,value=${{ github.sha }}
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: trainer/Dockerfile
@@ -100,20 +117,26 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
             REPOSITORY_COMMIT=${{ github.sha }}
+      - name: Verify the published digest structurally on CPU
+        env:
+          OCI_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull "${IMAGE_REPOSITORY}@${OCI_DIGEST}"
+          trainer/scripts/verify-image.sh "${IMAGE_REPOSITORY}@${OCI_DIGEST}"
       - name: Resolve and validate pending release manifest
         env:
           OCI_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          lock_sha=$(sha256sum trainer/uv.lock | cut -d' ' -f1)
           PYTHONPATH=trainer/src python3 -m lehome_train.release_manifest \
             --repository-commit "${GITHUB_SHA}" \
-            --trainer-lock-sha256 "$lock_sha" \
+            --trainer-lock-path trainer/uv.lock \
             --oci-digest "$OCI_DIGEST" \
             --output release-manifest.json
           PYTHONPATH=trainer/src python3 -c \
             'from lehome_train.release_manifest import load_release_manifest; load_release_manifest("release-manifest.json")'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unreleased-image-manifest-${{ github.sha }}
           path: release-manifest.json
@@ -127,8 +150,8 @@ jobs:
       contents: read
       packages: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import re
 
 import pytest
 
@@ -14,9 +15,12 @@ from lehome_train.release_manifest import (
 
 ROOT = Path(__file__).resolve().parents[2]
 TRAINER = ROOT / "trainer"
-LOCK_SHA256 = "08cc37e719678d7d0347b45f617e1dccc6e8d6513da501237ef541982cadf6fa"
+LOCK_SHA256 = "67fcd520cd75f3b3b383fcc887f244c332af5c2a5548d384d71e0376697b2432"
 REPOSITORY_COMMIT = "7c150162faf3ec285960f59cc72a6e5643e9d711"
 OCI_DIGEST = "sha256:" + "a" * 64
+DATASET_REVISION = "b" * 40
+DATASET_MANIFEST_SHA256 = "c" * 64
+NORMALIZATION_SHA256 = "d" * 64
 
 
 def _accepted_payload() -> dict[str, object]:
@@ -37,6 +41,12 @@ def _accepted_payload() -> dict[str, object]:
         "base_model": {
             "repository": "nvidia/GR00T-N1.7-3B",
             "revision": MODEL_REVISION,
+        },
+        "dataset": {
+            "repository": "ryanjin333/lehome-groot-n17-data",
+            "revision": DATASET_REVISION,
+            "manifest_sha256": DATASET_MANIFEST_SHA256,
+            "normalization_sha256": NORMALIZATION_SHA256,
         },
         "trainer_lock_sha256": LOCK_SHA256,
         "repository_commit": REPOSITORY_COMMIT,
@@ -68,6 +78,9 @@ def test_accepted_manifest_records_every_immutable_identity() -> None:
     assert manifest.trainer_lock_sha256 == LOCK_SHA256
     assert manifest.repository_commit == REPOSITORY_COMMIT
     assert manifest.oci_digest == OCI_DIGEST
+    assert manifest.dataset_revision == DATASET_REVISION
+    assert manifest.dataset_manifest_sha256 == DATASET_MANIFEST_SHA256
+    assert manifest.normalization_sha256 == NORMALIZATION_SHA256
 
 
 @pytest.mark.parametrize(
@@ -80,6 +93,10 @@ def test_accepted_manifest_records_every_immutable_identity() -> None:
         (("repository_commit",), "main"),
         (("image", "tag"), "latest"),
         (("image", "digest"), "not-a-digest"),
+        (("dataset", "repository"), "somewhere/else"),
+        (("dataset", "revision"), "main"),
+        (("dataset", "manifest_sha256"), "not-a-hash"),
+        (("dataset", "normalization_sha256"), "not-a-hash"),
     ],
 )
 def test_manifest_rejects_changed_or_mutable_identities(
@@ -107,6 +124,14 @@ def test_manifest_rejects_unknown_and_duplicate_fields(tmp_path: Path) -> None:
         load_release_manifest(duplicate)
 
 
+def test_manifest_rejects_a_well_formed_hash_for_a_different_trainer_lock() -> None:
+    payload = _accepted_payload()
+    payload["trainer_lock_sha256"] = "f" * 64
+
+    with pytest.raises(ValueError, match="approved trainer lock"):
+        ReleaseManifest.from_dict(payload)
+
+
 def test_unreleased_example_has_pins_but_no_claimed_image_or_gpu_acceptance() -> None:
     manifest = load_release_manifest(TRAINER / "release-manifest.example.json")
 
@@ -117,6 +142,15 @@ def test_unreleased_example_has_pins_but_no_claimed_image_or_gpu_acceptance() ->
     assert manifest.trainer_lock_sha256 == LOCK_SHA256
     assert manifest.oci_digest is None
     assert manifest.gpu_acceptance_status == "pending"
+    assert manifest.payload["dataset"] == {
+        "repository": "ryanjin333/lehome-groot-n17-data",
+        "revision": None,
+        "manifest_sha256": None,
+        "normalization_sha256": None,
+    }
+    assert manifest.trainer_lock_sha256 == __import__("hashlib").sha256(
+        (TRAINER / "uv.lock").read_bytes()
+    ).hexdigest()
 
 
 def test_accepted_manifest_requires_real_digest_and_completed_pro6000_gate() -> None:
@@ -134,13 +168,43 @@ def test_accepted_manifest_requires_real_digest_and_completed_pro6000_gate() -> 
     with pytest.raises(ValueError, match="30 minutes"):
         ReleaseManifest.from_dict(payload)
 
+    payload = _accepted_payload()
+    payload["gpu_acceptance"]["image_pull_seconds"] = None  # type: ignore[index]
+    with pytest.raises(ValueError, match="pull timing"):
+        ReleaseManifest.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "javascript:alert(1)",
+        "http://github.com/example/actions/runs/1",
+        "https://user:secret@github.com/example/actions/runs/1",
+        "https://localhost/evidence",
+        "https://github.com/example/actions/runs/1?token=secret",
+        "https://github.com/example/actions/runs/1#token",
+    ],
+)
+def test_accepted_manifest_requires_safe_https_evidence_uri(uri: str) -> None:
+    payload = _accepted_payload()
+    payload["gpu_acceptance"]["evidence_uri"] = uri  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="evidence URI"):
+        ReleaseManifest.from_dict(payload)
+
 
 def test_image_contract_files_preserve_runtime_and_secret_boundaries() -> None:
     dockerfile = (TRAINER / "Dockerfile").read_text(encoding="utf-8")
     entrypoint = (TRAINER / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+    pyproject = (TRAINER / "pyproject.toml").read_text(encoding="utf-8")
 
     assert "nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04@" + CUDA_BASE_DIGEST in dockerfile
     assert "uv sync --frozen" in dockerfile
+    assert "uv export --frozen --no-dev --no-emit-project" in dockerfile
+    assert "uv pip check --python /opt/runtime/bin/python" in dockerfile
+    assert "git config --system --add safe.directory /opt/isaac-groot" in dockerfile
+    assert '"huggingface-hub==0.36.2"' in pyproject
+    assert '"click==8.1.8"' in pyproject
     assert ISAAC_GROOT_REVISION in dockerfile
     assert "USER trainer" in dockerfile
     assert "LEHOME_TRAIN_RUNTIME_FACTORY=lehome_train.groot.production_runtime:create" in dockerfile
@@ -151,6 +215,35 @@ def test_image_contract_files_preserve_runtime_and_secret_boundaries() -> None:
     assert "unset HF_TOKEN" in entrypoint
     for mount in ("/cache", "/prepared", "/output"):
         assert mount in entrypoint
+
+
+def test_trainer_lock_aligns_every_shared_runtime_package_with_upstream() -> None:
+    lock = (TRAINER / "uv.lock").read_text(encoding="utf-8")
+    versions = dict(
+        re.findall(r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"', lock)
+    )
+    expected = {
+        "certifi": "2026.2.25",
+        "charset-normalizer": "3.4.6",
+        "click": "8.1.8",
+        "filelock": "3.25.2",
+        "fsspec": "2025.3.0",
+        "hf-xet": "1.4.2",
+        "huggingface-hub": "0.36.2",
+        "idna": "3.11",
+        "markdown-it-py": "4.0.0",
+        "packaging": "26.0",
+        "pyarrow": "23.0.1",
+        "pygments": "2.19.2",
+        "requests": "2.32.5",
+        "rich": "14.3.3",
+        "tomli": "2.4.0",
+        "tqdm": "4.67.3",
+        "typing-extensions": "4.15.0",
+        "urllib3": "2.6.3",
+    }
+
+    assert {name: versions[name] for name in expected} == expected
 
 
 def test_workflow_never_embeds_a_pat_and_gpu_gate_is_explicit() -> None:
@@ -165,6 +258,31 @@ def test_workflow_never_embeds_a_pat_and_gpu_gate_is_explicit() -> None:
     assert "--gpu" in workflow
     assert "docker/metadata-action" in workflow
     assert "type=raw,value=${{ github.sha }}" in workflow
+    assert "verify-image.sh \"${IMAGE_REPOSITORY}@${OCI_DIGEST}\"" in workflow
+    assert "scanner_status=$?" in workflow
+    assert "scanner failed with status" in workflow
+
+
+def test_gpu_verifier_keeps_stdin_open_selects_gpu_zero_and_checks_sentinel() -> None:
+    verifier = (TRAINER / "scripts" / "verify-image.sh").read_text(encoding="utf-8")
+
+    assert '"${run[@]}" -i --gpus device=0' in verifier
+    assert "CUDA_VISIBLE_DEVICES=0" in verifier
+    assert "GPU_SENTINEL:optimizer-step-complete" in verifier
+    assert "grep -Fxq 'GPU_SENTINEL:optimizer-step-complete'" in verifier
+    assert "secret_status=$?" in verifier
+    assert '[[ "$secret_status" -eq 1 ]]' in verifier
+
+
+def test_docker_context_is_default_deny() -> None:
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+
+    assert dockerignore[0] == "**"
+    assert "!trainer/pyproject.toml" in dockerignore
+    assert "!trainer/uv.lock" in dockerignore
+    assert "!trainer/src/**" in dockerignore
+    assert "!trainer/config/**" in dockerignore
+    assert "!trainer/docker/entrypoint.sh" in dockerignore
 
 
 def test_image_verifier_makes_ephemeral_bind_mounts_writable_by_container_user() -> None:

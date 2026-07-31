@@ -62,9 +62,15 @@ run=(docker run --rm --platform linux/amd64
   test ! -e /IsaacLab
   test ! -e /models
   test ! -e /data
-  ! find /opt/trainer /opt/isaac-groot -type f -size +50M -print -quit | grep -q .
-  ! find /opt/trainer /opt/isaac-groot -type f \( -iname "*.safetensors" -o -iname "*.ckpt" -o -iname "*.parquet" -o -iname "*.mp4" \) -print -quit | grep -q .
-  ! grep -RIE "hf_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{30,}" /opt/trainer /opt/isaac-groot
+  large_file=$(find /opt/trainer /opt/isaac-groot -type f -size +50M -print -quit)
+  test -z "$large_file"
+  bundled_artifact=$(find /opt/trainer /opt/isaac-groot -type f \( -iname "*.safetensors" -o -iname "*.ckpt" -o -iname "*.parquet" -o -iname "*.mp4" \) -print -quit)
+  test -z "$bundled_artifact"
+  set +e
+  grep -RIE "hf_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{30,}" /opt/trainer /opt/isaac-groot >/dev/null
+  secret_status=$?
+  set -e
+  [[ "$secret_status" -eq 1 ]]
 '
 
 if [[ "$mode" == "gpu" ]]; then
@@ -72,7 +78,8 @@ if [[ "$mode" == "gpu" ]]; then
     echo "--gpu acceptance requires a Linux NVIDIA host" >&2
     exit 69
   fi
-  "${run[@]}" --gpus device=0 --entrypoint /opt/runtime/bin/python "$image_ref" - <<'PY'
+  gpu_output=$("${run[@]}" -i --gpus device=0 -e CUDA_VISIBLE_DEVICES=0 \
+    --entrypoint /opt/runtime/bin/python "$image_ref" - <<'PY'
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -87,8 +94,14 @@ loss = torch.nn.functional.mse_loss(model(features.to(device)), targets.to(devic
 assert torch.isfinite(loss)
 loss.backward()
 optimizer.step()
-print("GPU acceptance: one synthetic optimizer step completed")
+print("GPU_SENTINEL:optimizer-step-complete")
 PY
+  )
+  printf '%s\n' "$gpu_output"
+  if ! grep -Fxq 'GPU_SENTINEL:optimizer-step-complete' <<<"$gpu_output"; then
+    echo "GPU optimizer-step sentinel was not returned by the container" >&2
+    exit 1
+  fi
 fi
 
 echo "verified $image_ref ($mode structural gate)"

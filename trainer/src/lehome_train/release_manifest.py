@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 from typing import Mapping
+from urllib.parse import urlsplit
 
 from lehome_train.constants import (
     CUDA_BASE_DIGEST,
@@ -15,14 +16,16 @@ from lehome_train.constants import (
     MODEL_REVISION,
     PYTHON_VERSION,
 )
-from lehome_train.io import atomic_write_json
+from lehome_train.io import atomic_write_json, sha256_file
 
 
 CUDA_BASE_IMAGE = "nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04"
 ISAAC_GROOT_REPOSITORY = "https://github.com/NVIDIA/Isaac-GR00T.git"
 MODEL_REPOSITORY = "nvidia/GR00T-N1.7-3B"
 IMAGE_REPOSITORY = "ghcr.io/ryanjin333/lehome-groot-n17-trainer"
+DATASET_REPOSITORY = "ryanjin333/lehome-groot-n17-data"
 UV_VERSION = "0.8.22"
+TRAINER_LOCK_SHA256 = "67fcd520cd75f3b3b383fcc887f244c332af5c2a5548d384d71e0376697b2432"
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -89,6 +92,21 @@ class ReleaseManifest:
     def gpu_acceptance_status(self) -> str:
         return str(self.payload["gpu_acceptance"]["status"])  # type: ignore[index]
 
+    @property
+    def dataset_revision(self) -> str | None:
+        value = self.payload["dataset"]["revision"]  # type: ignore[index]
+        return None if value is None else str(value)
+
+    @property
+    def dataset_manifest_sha256(self) -> str | None:
+        value = self.payload["dataset"]["manifest_sha256"]  # type: ignore[index]
+        return None if value is None else str(value)
+
+    @property
+    def normalization_sha256(self) -> str | None:
+        value = self.payload["dataset"]["normalization_sha256"]  # type: ignore[index]
+        return None if value is None else str(value)
+
     def to_dict(self) -> dict[str, object]:
         return json.loads(json.dumps(self.payload, allow_nan=False))
 
@@ -105,6 +123,7 @@ class ReleaseManifest:
                 "uv_version",
                 "isaac_groot",
                 "base_model",
+                "dataset",
                 "trainer_lock_sha256",
                 "repository_commit",
                 "image",
@@ -132,10 +151,32 @@ class ReleaseManifest:
         if model["repository"] != MODEL_REPOSITORY or model["revision"] != MODEL_REVISION:
             raise ValueError("release manifest model identity differs from the approved revision")
 
+        dataset = _exact_keys(
+            root["dataset"],
+            {"repository", "revision", "manifest_sha256", "normalization_sha256"},
+            "dataset",
+        )
+        if dataset["repository"] != DATASET_REPOSITORY:
+            raise ValueError("release manifest dataset repository is unsupported")
+        dataset_identity = (
+            dataset["revision"],
+            dataset["manifest_sha256"],
+            dataset["normalization_sha256"],
+        )
+        if any(value is not None for value in dataset_identity):
+            if type(dataset["revision"]) is not str or not _SHA.fullmatch(dataset["revision"]):
+                raise ValueError("release manifest dataset revision is not immutable")
+            for key in ("manifest_sha256", "normalization_sha256"):
+                value = dataset[key]
+                if type(value) is not str or not _SHA256.fullmatch(value):
+                    raise ValueError(f"release manifest dataset {key} is invalid")
+
         lock_hash = _string(root["trainer_lock_sha256"], "trainer lock hash")
         repository_commit = _string(root["repository_commit"], "repository commit")
         if not _SHA256.fullmatch(lock_hash):
             raise ValueError("release manifest trainer lock hash is invalid")
+        if lock_hash != TRAINER_LOCK_SHA256:
+            raise ValueError("release manifest differs from the approved trainer lock")
         if not _SHA.fullmatch(repository_commit):
             raise ValueError("release manifest repository commit is not immutable")
 
@@ -171,7 +212,7 @@ class ReleaseManifest:
         first_step = _optional_number(
             acceptance["first_optimizer_step_seconds"], "first optimizer step time"
         )
-        _optional_number(acceptance["image_pull_seconds"], "image pull time")
+        image_pull = _optional_number(acceptance["image_pull_seconds"], "image pull time")
         batches = acceptance["batches_tested_sequentially"]
         if not isinstance(batches, list) or any(type(item) is not int for item in batches):
             raise ValueError("release manifest smoke batches must be an integer array")
@@ -181,11 +222,15 @@ class ReleaseManifest:
                 raise ValueError("accepted release manifest requires a final OCI digest")
             if acceptance_status != "passed":
                 raise ValueError("accepted release manifest requires passed GPU acceptance")
+            if any(value is None for value in dataset_identity):
+                raise ValueError("accepted release manifest requires immutable dataset evidence")
             hardware = _string(acceptance["hardware"], "GPU hardware")
             if "RTX PRO 6000" not in hardware:
                 raise ValueError("accepted release manifest requires fresh RTX PRO 6000 evidence")
             if network is None or network < 1.0:
                 raise ValueError("GPU acceptance requires at least 1 Gbps bandwidth")
+            if image_pull is None or image_pull <= 0:
+                raise ValueError("GPU acceptance requires measured image pull timing")
             if first_step is None or first_step > 1800:
                 raise ValueError("GPU acceptance must reach the first optimizer step in 30 minutes")
             if acceptance["memorization_passed"] is not True:
@@ -194,7 +239,19 @@ class ReleaseManifest:
                 raise ValueError("GPU acceptance requires sequential batches 16, 32, and 64")
             if acceptance["training_768k_started_or_resumed"] is not True:
                 raise ValueError("GPU acceptance requires starting or resuming the 768k run")
-            _string(acceptance["evidence_uri"], "GPU evidence URI")
+            evidence_uri = _string(acceptance["evidence_uri"], "GPU evidence URI")
+            parsed_evidence = urlsplit(evidence_uri)
+            if (
+                parsed_evidence.scheme != "https"
+                or parsed_evidence.hostname is None
+                or "." not in parsed_evidence.hostname
+                or parsed_evidence.username is not None
+                or parsed_evidence.password is not None
+                or parsed_evidence.query
+                or parsed_evidence.fragment
+                or not parsed_evidence.path.strip("/")
+            ):
+                raise ValueError("GPU evidence URI must be a safe absolute HTTPS URI")
         elif acceptance_status != "pending":
             raise ValueError("unreleased manifest cannot claim passed GPU acceptance")
         elif any(
@@ -239,7 +296,13 @@ def load_release_manifest(path: str | Path) -> ReleaseManifest:
 
 
 def pending_manifest(
-    *, repository_commit: str, trainer_lock_sha256: str, oci_digest: str | None
+    *,
+    repository_commit: str,
+    trainer_lock_sha256: str,
+    oci_digest: str | None,
+    dataset_revision: str | None = None,
+    dataset_manifest_sha256: str | None = None,
+    normalization_sha256: str | None = None,
 ) -> ReleaseManifest:
     return ReleaseManifest.from_dict(
         {
@@ -254,6 +317,12 @@ def pending_manifest(
                 "commit": ISAAC_GROOT_REVISION,
             },
             "base_model": {"repository": MODEL_REPOSITORY, "revision": MODEL_REVISION},
+            "dataset": {
+                "repository": DATASET_REPOSITORY,
+                "revision": dataset_revision,
+                "manifest_sha256": dataset_manifest_sha256,
+                "normalization_sha256": normalization_sha256,
+            },
             "trainer_lock_sha256": trainer_lock_sha256,
             "repository_commit": repository_commit,
             "image": {
@@ -279,14 +348,20 @@ def pending_manifest(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate a strict pending image manifest")
     parser.add_argument("--repository-commit", required=True)
-    parser.add_argument("--trainer-lock-sha256", required=True)
+    parser.add_argument("--trainer-lock-path", required=True)
     parser.add_argument("--oci-digest")
+    parser.add_argument("--dataset-revision")
+    parser.add_argument("--dataset-manifest-sha256")
+    parser.add_argument("--normalization-sha256")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     manifest = pending_manifest(
         repository_commit=args.repository_commit,
-        trainer_lock_sha256=args.trainer_lock_sha256,
+        trainer_lock_sha256=sha256_file(args.trainer_lock_path),
         oci_digest=args.oci_digest,
+        dataset_revision=args.dataset_revision,
+        dataset_manifest_sha256=args.dataset_manifest_sha256,
+        normalization_sha256=args.normalization_sha256,
     )
     atomic_write_json(args.output, manifest.to_dict())
 

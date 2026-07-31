@@ -119,6 +119,13 @@ locks, and Isaac-GR00T commit
 Git commit. A dirty checkout is rejected unless `ALLOW_DIRTY=1` is explicitly
 used for a non-release diagnostic build.
 
+The trainer lock is exported into the final GR00T virtual environment, with
+shared exact dependencies aligned to the upstream lock, and `uv pip check`
+rejects an incompatible composite runtime. The CUDA base and language/runtime
+inputs are immutable, but Ubuntu APT packages are not version-pinned to a
+snapshot repository. Consequently, separate builds are not claimed to be
+byte-identical; only the published OCI digest identifies a release candidate.
+
 Every container invocation must mount writable `/cache`, `/prepared`, and
 `/output` directories. The image runs as `trainer`, rejects `hf auth login` and
 `huggingface-cli login`, and removes `HF_TOKEN` before local conversion or
@@ -131,7 +138,7 @@ visible GPU and performs one real AdamW optimizer step over a synthetic
 `TensorDataset`:
 
 ```bash
-trainer/scripts/verify-image.sh --gpu <image>@sha256:<digest>
+CUDA_VISIBLE_DEVICES=0 trainer/scripts/verify-image.sh --gpu <image>@sha256:<digest>
 ```
 
 This one-step gate is not the fresh-machine release acceptance below.
@@ -147,7 +154,8 @@ On a fresh Linux x86_64 RTX PRO 6000 96 GB rental:
 
 1. Measure download bandwidth and require at least 1 Gbps. Record the result.
 2. Pull the exact `ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:<digest>`
-   and record pull duration. Never accept a tag as experiment identity.
+   and record a positive pull duration in seconds. Never accept a tag as
+   experiment identity.
 3. Mount fresh `/cache`, `/prepared`, and `/output` volumes, inject `HF_TOKEN`
    only into download/sync processes, and run `lehome-train prepare`.
 4. Measure from the start of the fresh-machine procedure to the first real
@@ -155,13 +163,20 @@ On a fresh Linux x86_64 RTX PRO 6000 96 GB rental:
 5. Complete the offline one-episode `memorize` gate.
 6. Run physical batches 16, 32, and 64 sequentially with 100 steps per config;
    retain the telemetry and any proven CUDA OOM evidence.
-7. Start, or resume only from a compatible verified checkpoint, the selected
-   768,000-sample-presentation training run.
+7. Start, or resume only from a checkpoint whose dataset, normalization,
+   configuration, schedule, and predecessor identity all verify, the selected
+   768,000-sample-presentation training run. This is a full-state
+   schedule/exposure resume, not a bit-exact sample-order resume: pinned GR00T
+   restores model, optimizer, scheduler, and RNG state but sets
+   `ignore_data_skip=True` and reseeds its dataset from the global step.
 8. Sync and hash-verify the checkpoint, redacted logs, configuration, and
-   report. Record the evidence URL, exact repository commit, lock hash, GR00T
-   commit, model revision, base digest, full OCI digest, timing, hardware,
-   memorization result, batch sequence, and 768k start/resume result in the
-   release manifest. Validate it with `load_release_manifest` before commit.
+   report. Record the safe absolute HTTPS evidence URL, exact repository
+   commit, actual `trainer/uv.lock` SHA-256, GR00T commit, model revision, base
+   digest, full OCI digest, timing, hardware, memorization result, batch
+   sequence, and 768k start/resume result in the release manifest. Also bind it
+   to the private dataset repository, its resolved 40-character Hub commit,
+   the prepared dataset manifest SHA-256, and the train-only normalization
+   artifact SHA-256. Validate it with `load_release_manifest` before commit.
 
 This macOS host can run the CPU structural checks and build an amd64 image with
 Docker emulation, but it cannot execute or claim the NVIDIA GPU acceptance.

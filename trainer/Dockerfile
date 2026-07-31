@@ -41,20 +41,26 @@ RUN git init . \
     && git checkout --detach FETCH_HEAD \
     && test "$(git rev-parse HEAD)" = "${ISAAC_GROOT_REVISION}" \
     && test -z "$(git status --porcelain=v1 --untracked-files=all)" \
-    && uv sync --frozen --no-dev --no-install-project --no-cache
+    && uv sync --frozen --no-dev --no-install-project --no-cache \
+    && git config --system --add safe.directory /opt/isaac-groot
 
-# Validate the trainer lock independently, then install the local package into
-# the exact same runtime as the pinned upstream checkout. Upstream's lock owns
-# the shared CUDA/PyTorch dependency graph.
+# Export the trainer's frozen dependency graph and reconcile it into the same
+# runtime as the pinned upstream checkout. Shared exact pins (Hub, PyArrow, and
+# Click) are aligned with upstream; pip check then rejects any incompatible
+# composite environment.
 WORKDIR /opt/trainer
 COPY trainer/pyproject.toml trainer/uv.lock ./
-RUN UV_PROJECT_ENVIRONMENT=/tmp/trainer-lock-check \
-      uv sync --frozen --no-dev --no-install-project --no-cache \
-    && rm -rf /tmp/trainer-lock-check
+RUN uv lock --check \
+    && uv export --frozen --no-dev --no-emit-project --no-hashes \
+      --output-file /tmp/trainer-requirements.txt \
+    && uv pip install --python /opt/runtime/bin/python \
+      --requirement /tmp/trainer-requirements.txt \
+    && rm -f /tmp/trainer-requirements.txt
 COPY trainer/src ./src
 COPY trainer/config ./config
 COPY trainer/docker/entrypoint.sh /usr/local/bin/lehome-entrypoint
 RUN uv pip install --python /opt/runtime/bin/python --no-deps /opt/trainer \
+    && uv pip check --python /opt/runtime/bin/python \
     && test "$(/opt/runtime/bin/python -c 'import platform; print(platform.python_version())')" = "${PYTHON_VERSION}" \
     && test "$(git -C /opt/isaac-groot rev-parse HEAD)" = "${ISAAC_GROOT_REVISION}" \
     && /opt/runtime/bin/lehome-train --help >/dev/null \

@@ -1,32 +1,13 @@
-# ignore .git related folders
-.git/
-.github/
-.gitignore
-# ignore docs
-docs/
-# copy in licenses folder to the container
-!docs/licenses/
-# ignore logs
-**/logs/
-**/runs/
-**/output/*
-**/outputs/*
-**/videos/*
-*.tmp
-# ignore docker
-docker/cluster/exports/
-docker/.container.cfg
-# ignore recordings
-recordings/
-# ignore Python build/cache state
-**/__pycache__/
-**/*.egg-info/
-trainer/.venv/
-trainer/.pytest_cache/
-trainer/**/*.pyc
-trainer/tests/
-trainer/release-manifest*.json
-# ignore isaac sim symlink
-_isaac_sim?
-# Docker history
-docker/.isaac-lab-docker-history
+**
+!trainer/
+trainer/**
+!trainer/Dockerfile
+!trainer/pyproject.toml
+!trainer/uv.lock
+!trainer/src/
+!trainer/src/**
+!trainer/config/
+!trainer/config/**
+!trainer/docker/
+trainer/docker/**
+!trainer/docker/entrypoint.sh

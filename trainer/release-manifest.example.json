@@ -7,6 +7,12 @@
     "digest": "sha256:61f6c08f2b59036cb935e56d1e31a6b64e3ae2c7ddb86d33fa0b044c7917b719",
     "image": "nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04"
   },
+  "dataset": {
+    "manifest_sha256": null,
+    "normalization_sha256": null,
+    "repository": "ryanjin333/lehome-groot-n17-data",
+    "revision": null
+  },
   "gpu_acceptance": {
     "batches_tested_sequentially": [],
     "evidence_uri": null,
@@ -32,6 +38,6 @@
   "repository_commit": "7c150162faf3ec285960f59cc72a6e5643e9d711",
   "schema_version": 1,
   "status": "unreleased",
-  "trainer_lock_sha256": "08cc37e719678d7d0347b45f617e1dccc6e8d6513da501237ef541982cadf6fa",
+  "trainer_lock_sha256": "67fcd520cd75f3b3b383fcc887f244c332af5c2a5548d384d71e0376697b2432",
   "uv_version": "0.8.22"
 }
