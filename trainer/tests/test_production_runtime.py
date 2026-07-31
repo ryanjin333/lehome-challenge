@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import lehome_train.groot.production_runtime as runtime_module
+from lehome_train.commands.sync import generate_sync_manifest
 from lehome_train.constants import MODEL_REVISION
 from lehome_train.data.normalization import normalization_identity
 from lehome_train.io import canonical_json_sha256, sha256_file
@@ -188,11 +189,14 @@ def test_prepare_composes_restart_safe_preflight_before_model_initialization(
     status = tmp_path / "output" / "status" / "prepare.json"
     observed: dict[str, object] = {}
 
+    experiment_root = tmp_path / "output" / "preflight" / "exp"
+
     def fake_prepare(**kwargs: object) -> SimpleNamespace:
         observed.update(kwargs)
         assert tuple(kwargs["stage_operations"]) == runtime_module.PREFLIGHT_STAGE_NAMES
+        experiment_root.mkdir(parents=True)
         return SimpleNamespace(
-            experiment=SimpleNamespace(experiment_id="exp", root=tmp_path / "output" / "exp"),
+            experiment=SimpleNamespace(experiment_id="exp", root=experiment_root),
             hardware=SimpleNamespace(
                 visible_device="0",
                 vram_bytes=96 * 1024**3,
@@ -233,6 +237,25 @@ def test_prepare_composes_restart_safe_preflight_before_model_initialization(
     assert observed["resolved_config"]["normalization_sha256"] == result[
         "normalization_sha256"
     ]
+    sync_root = tmp_path / "output" / "experiment"
+    assert json.loads((sync_root / "resolved-config.json").read_text()) == _experiment_payload(
+        batch=64
+    )
+    provenance = json.loads((sync_root / "provenance.json").read_text())
+    assert provenance["experiment_id"] == "experiment-001"
+    assert provenance["preflight_experiment_id"] == "exp"
+    assert provenance["repository_commit"] == COMMIT
+    assert provenance["container_digest"] == IMAGE_DIGEST
+    assert provenance["normalization_sha256"] == result["normalization_sha256"]
+    assert provenance["model_snapshot_manifest_sha256"] == sha256_file(model_manifest)
+    assert provenance["dataset_snapshot_manifest_sha256"] == sha256_file(dataset_manifest)
+    assert json.loads((sync_root / "logs" / "prepare.json").read_text()) == {
+        "schema_version": 1,
+        "event": "prepared",
+        "experiment_id": "experiment-001",
+        "preflight_experiment_id": "exp",
+        "normalization_sha256": result["normalization_sha256"],
+    }
 
 
 def test_smoke_uses_nvml_probe_and_canonical_controller_selection(
@@ -376,6 +399,60 @@ def test_train_delegates_all_budget_resume_storage_and_upload_policy(
     assert observed["resume_checkpoint"] is None
     assert observed["status_path"] == status_path
     assert returned["sample_presentations"] == 768_000
+    log_payload = json.loads(
+        (tmp_path / "output" / "experiment" / "logs" / "train.json").read_text()
+    )
+    assert log_payload == {
+        "schema_version": 1,
+        "event": "training_terminal",
+        "experiment_id": "experiment-001",
+        "experiment_config_sha256": canonical_json_sha256(experiment),
+        "normalization_sha256": normalization_identity(
+            tmp_path / "prepared" / "dataset"
+        ),
+        "status": "completed",
+        "sample_presentations": 768_000,
+    }
+
+
+def test_production_root_artifacts_satisfy_default_sync_allowlist(tmp_path: Path) -> None:
+    root = tmp_path / "experiment"
+    root.mkdir()
+    experiment = ExperimentConfig(**_experiment_payload(batch=64))
+    runtime_module._write_immutable_json_artifact(
+        root / "resolved-config.json", experiment.to_dict()
+    )
+    runtime_module._write_immutable_json_artifact(
+        root / "provenance.json",
+        {"schema_version": 1, "experiment_id": "experiment-001"},
+    )
+    runtime_module._write_safe_json_artifact(
+        root / "logs" / "prepare.json",
+        {"schema_version": 1, "event": "prepared"},
+    )
+    runtime_module._write_safe_json_artifact(
+        root / "logs" / "train.json",
+        {"schema_version": 1, "event": "training_terminal"},
+    )
+    (root / "reports").mkdir()
+    (root / "reports" / "training-result.json").write_text("{}", encoding="utf-8")
+    (root / "checkpoints").mkdir()
+    (root / "checkpoints" / "step-12000.tar.zst").write_bytes(b"checkpoint")
+
+    manifest = generate_sync_manifest(
+        root,
+        experiment_id="experiment-001",
+        experiment_config_sha256=canonical_json_sha256(experiment),
+    )
+
+    assert {entry.relative_path for entry in manifest.entries} == {
+        "checkpoints/step-12000.tar.zst",
+        "logs/prepare.json",
+        "logs/train.json",
+        "provenance.json",
+        "reports/training-result.json",
+        "resolved-config.json",
+    }
 
 
 def test_train_rejects_caller_normalization_mismatch_before_controller(

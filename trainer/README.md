@@ -90,6 +90,18 @@ paths must be below `/cache`, `/prepared`, or `/output`; the model and dataset
 must already be downloaded at their manifest-verified revisions. Unknown or
 missing keys fail closed. The runbook below gives complete request examples.
 
+`launch_config.output_dir` is the canonical experiment and sync root. A
+successful production `prepare` creates immutable `resolved-config.json` and
+`provenance.json` there, plus the secret-checked `logs/prepare.json`. Production
+`train` writes `logs/train.json` from its terminal controller result; it records
+only allowlisted identities, status, and exposure, never request data or the
+process token. Provenance keeps the operator-facing launch experiment name as
+`experiment_id` and labels the restart-safe content hash separately as
+`preflight_experiment_id`. The resolved config remains the exact
+`ExperimentConfig` JSON so
+the report command can parse it directly. The content-addressed child reported
+by `prepare` is internal preflight evidence, not the sync root.
+
 Every stage consumes a checked JSON request:
 
 ```bash

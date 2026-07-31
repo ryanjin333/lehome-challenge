@@ -27,7 +27,12 @@ from lehome_train.groot.production_adapters import (
     HubCheckpointUploader,
     probe_physical_vram_bytes,
 )
-from lehome_train.io import atomic_write_json, canonical_json_sha256, load_json
+from lehome_train.io import (
+    atomic_write_json,
+    canonical_json_bytes,
+    canonical_json_sha256,
+    load_json,
+)
 from lehome_train.models import ArtifactIdentity, ExperimentConfig, SmokeResult
 from lehome_train.preflight import HubPermission, HubTarget, PREFLIGHT_STAGE_NAMES
 from lehome_train.preflight import reject_secret_bearing_config
@@ -202,6 +207,40 @@ def _write_result(path: Path, value: object) -> dict[str, object]:
     reject_secret_bearing_config(detached)
     atomic_write_json(path, detached)
     return detached
+
+
+def _write_safe_json_artifact(path: Path, payload: Mapping[str, object]) -> None:
+    """Write one uploadable artifact after applying the central secret policy."""
+
+    detached = dict(payload)
+    reject_secret_bearing_config(detached)
+    if path.exists() and (not path.is_file() or path.is_symlink()):
+        raise ValueError("production artifact destination must be a regular file")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.parent.is_dir() or path.parent.is_symlink():
+        raise ValueError("production artifact parent must be a regular directory")
+    atomic_write_json(path, detached)
+
+
+def _write_immutable_json_artifact(path: Path, payload: Mapping[str, object]) -> None:
+    """Create or verify an immutable root artifact without silent replacement."""
+
+    detached = dict(payload)
+    reject_secret_bearing_config(detached)
+    if path.exists():
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("production artifact destination must be a regular file")
+        try:
+            existing = path.read_bytes()
+        except OSError:
+            raise ValueError("production artifact destination is unreadable") from None
+        if existing != canonical_json_bytes(detached):
+            raise ValueError("production artifact identity is incompatible")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.parent.is_dir() or path.parent.is_symlink():
+        raise ValueError("production artifact parent must be a regular directory")
+    atomic_write_json(path, detached)
 
 
 def _record_stage(root: Path, name: str, payload: Mapping[str, object]) -> tuple[ArtifactIdentity, ...]:
@@ -422,6 +461,40 @@ class ProductionRuntime:
             dataset_snapshot_root=config.dataset_path,
             dataset_snapshot_manifest=dataset_manifest,
         )
+        experiment_config_payload = experiment.to_dict()
+        provenance = {
+            "schema_version": 1,
+            "experiment_id": config.experiment_name,
+            "preflight_experiment_id": result.experiment.experiment_id,
+            "experiment_config_sha256": canonical_json_sha256(experiment),
+            "repository_commit": experiment.repository_commit,
+            "container_digest": experiment.container_digest,
+            "isaac_groot_revision": ISAAC_GROOT_REVISION,
+            "model_repository": experiment.model_repository,
+            "model_revision": experiment.model_revision,
+            "model_snapshot_manifest_sha256": sha256_file(model_manifest),
+            "dataset_repository": experiment.dataset_repository,
+            "dataset_revision": experiment.dataset_revision,
+            "dataset_manifest_sha256": experiment.dataset_manifest_sha256,
+            "dataset_snapshot_manifest_sha256": sha256_file(dataset_manifest),
+            "normalization_sha256": normalization_sha256,
+            "artifact_repository": artifact_repository,
+            "artifact_revision": artifact_revision,
+        }
+        _write_immutable_json_artifact(
+            output_root / "resolved-config.json", experiment_config_payload
+        )
+        _write_immutable_json_artifact(output_root / "provenance.json", provenance)
+        _write_safe_json_artifact(
+            output_root / "logs" / "prepare.json",
+            {
+                "schema_version": 1,
+                "event": "prepared",
+                "experiment_id": config.experiment_name,
+                "preflight_experiment_id": result.experiment.experiment_id,
+                "normalization_sha256": normalization_sha256,
+            },
+        )
         payload = {
             "schema_version": 1,
             "status": "prepared",
@@ -624,6 +697,18 @@ class ProductionRuntime:
             status_path=outputs["status_output"],
         )
         payload = _write_result(outputs["result_output"], result)
+        training_log = {
+            "schema_version": 1,
+            "event": "training_terminal",
+            "experiment_id": selected_smoke.experiment_id,
+            "experiment_config_sha256": canonical_json_sha256(experiment),
+            "normalization_sha256": normalization_sha256,
+            "status": payload.get("status"),
+            "sample_presentations": payload.get("sample_presentations"),
+        }
+        _write_safe_json_artifact(
+            Path(config.output_dir) / "logs" / "train.json", training_log
+        )
         return payload
 
 

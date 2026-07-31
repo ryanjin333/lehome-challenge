@@ -170,6 +170,17 @@ The command identity must match the filename/stage. Unknown envelope fields,
 duplicate JSON fields, non-finite values, and supported secret formats are
 rejected before the runtime factory is loaded. Run the stages with:
 
+The launch config's `output_dir` is the canonical experiment root used by
+`report` and `sync`. After `prepare`, it contains immutable
+`resolved-config.json` (the exact `ExperimentConfig`) and `provenance.json`, as
+well as secret-checked `logs/prepare.json`. After `train`, `logs/train.json`
+contains the terminal status and immutable config/normalization identities. It
+is generated from an explicit field allowlist and never captures the request,
+environment, or `HF_TOKEN`. The separate content-addressed path returned as
+`experiment_root` is retained only for restart-safe preflight stage evidence;
+its hash is labeled `preflight_experiment_id` in provenance, while
+`experiment_id` remains the launch config's operator-facing experiment name.
+
 ```bash
 lehome-train prepare --request /requests/prepare.json
 lehome-train memorize --request /requests/memorize.json
