@@ -125,6 +125,9 @@ The report request schema is fully implemented by this package:
     "checkpoint_descriptors": [
       "/output/experiment/checkpoints/step-12000.json"
     ],
+    "local_artifact_root": "/output/experiment",
+    "sync_result": "/output/evidence/checkpoint-sync-result.json",
+    "pruning_receipts": [],
     "instance_started_at": "2026-07-31T10:00:00Z",
     "generated_at": "2026-07-31T14:00:00Z",
     "provider_hourly_price": 1.25,
@@ -147,10 +150,25 @@ The sync request schema is also fully implemented:
     "revision": "<explicit-upload-branch>",
     "staging_root": "/output/staging",
     "timeout_seconds": 30,
-    "max_attempts": 5
+    "max_attempts": 5,
+    "output": "/output/evidence/checkpoint-sync-result.json"
   }
 }
 ```
+
+For a pre-sync report, set `sync_result` to `null`; descriptor remote flags are
+then recorded only as controller claims and never become verified facts. The
+authoritative final flow is:
+
+1. write a local-evidence report with `sync_result: null`;
+2. run sync and persist its result outside the mutable experiment tree;
+3. regenerate the report with that immutable sync-result path and any strict
+   pruning-receipt paths; and
+4. sync once more to archive the final evidence-backed report, persisting the
+   shutdown-gate sync result outside the experiment tree.
+
+All parsed report and pruning-receipt timestamps are serialized in canonical
+UTC `Z` form.
 
 `prepare` verifies one supported GPU, disk, immutable snapshots, local hashes,
 and private Hub read/write access. `memorize` is an offline diagnostic and stays
@@ -165,10 +183,18 @@ revision and manifest SHA-256, resolved training configuration and its hash,
 selected smoke metrics, and complete checkpoint provenance. Each checkpoint
 entry includes artifact path/hash/size, optimizer step, sample presentations,
 experiment/config/dataset hashes, normalization and schedule hashes, resumable
-state, local and remote verification flags, and whether it remains retained
-locally or was pruned after remote verification. The report also includes
-instance runtime, hourly price, and calculated cost. Report generation repeats
-the central secret scan before writing JSON.
+state, controller-reported claims, evidence-derived local and remote
+verification flags, and explicitly labeled retention evidence. Sample
+presentations must equal optimizer step times the resolved effective batch
+(`physical_batch_size * gradient_accumulation_steps`). A local verified claim
+requires opening the artifact beneath `local_artifact_root` and matching its
+exact hash and size. A remote verified claim requires an exact path/hash/size
+match in a compatible immutable sync result; descriptor booleans alone never
+authorize disposal. A pruning claim remains `reported_only` unless a matching
+deletion receipt is tied to that remotely verified commit. The report also
+includes instance runtime, hourly price, calculated cost, and the authoritative
+sync-derived disposal state. Report generation repeats the central secret scan
+before writing JSON.
 
 `sync` generates `sync-manifest.json` from these closed artifact groups under
 the experiment root:

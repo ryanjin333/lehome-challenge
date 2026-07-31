@@ -7,6 +7,7 @@ from typing import Callable
 import pytest
 
 import lehome_train.hub as hub_module
+import lehome_train.commands.sync as sync_module
 from lehome_train.commands.sync import generate_sync_manifest, sync_experiment
 from lehome_train.constants import DEFAULT_MODEL_REPO
 from lehome_train.io import canonical_json_sha256
@@ -324,6 +325,30 @@ def test_sync_fails_closed_when_immutable_tree_listing_fails(tmp_path: Path) -> 
     assert not any(entry.remotely_verified for entry in result.manifest.entries)
     assert transport.download_prefix is None
     assert list(staging_root.iterdir()) == []
+
+
+def test_sync_result_file_round_trip_preserves_immutable_evidence(
+    tmp_path: Path,
+) -> None:
+    _experiment(tmp_path)
+    staging_root = _staging_root(tmp_path)
+    result = sync_experiment(
+        tmp_path,
+        experiment_id="experiment-001",
+        experiment_config_sha256=CONFIG_SHA,
+        repository=DEFAULT_MODEL_REPO,
+        revision="experiment-001",
+        transport=FakeTransport(),
+        staging_root=staging_root,
+        environ={"HF_TOKEN": TOKEN},
+    )
+    path = tmp_path / "reports" / "sync-result.json"
+
+    sync_module.write_sync_result(path, result)
+    loaded = sync_module.load_sync_result(path)
+
+    assert loaded == result
+    assert loaded.immutable_revision == "b" * 40
 
 
 def test_sync_requires_caller_selected_capacity_checked_staging_root(

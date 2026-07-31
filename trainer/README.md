@@ -67,6 +67,11 @@ lehome-train report --request /requests/report.json
 lehome-train sync --request /requests/sync.json
 ```
 
+Final reports verify checkpoint bytes beneath the request's
+`local_artifact_root` and accept remote-verification claims only from the
+immutable sync-result artifact written by `sync`. Controller flags remain
+reported claims; they do not make an artifact verified or disposable.
+
 Run the focused report and synchronization checks with:
 
 ```bash

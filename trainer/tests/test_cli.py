@@ -253,6 +253,112 @@ def test_report_and_sync_commands_reach_default_request_adapters(
     assert calls == [("report", report_request), ("sync", sync_request)]
 
 
+def test_report_request_wires_local_sync_and_pruning_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lehome_train.runtime as runtime_module
+
+    request = tmp_path / "report-request.json"
+    arguments = {
+        "experiment_config": str(tmp_path / "config.json"),
+        "isaac_groot_revision": "a" * 40,
+        "smoke_result": str(tmp_path / "smoke.json"),
+        "checkpoint_descriptors": [str(tmp_path / "checkpoint.json")],
+        "local_artifact_root": str(tmp_path / "experiment"),
+        "sync_result": str(tmp_path / "sync-result.json"),
+        "pruning_receipts": [str(tmp_path / "pruning-receipt.json")],
+        "instance_started_at": "2026-07-31T10:00:00Z",
+        "generated_at": "2026-07-31T11:00:00Z",
+        "provider_hourly_price": 1.0,
+        "output": str(tmp_path / "report.json"),
+    }
+    request.write_text(
+        json.dumps({"schema_version": 1, "command": "report", "arguments": arguments}),
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, object]] = []
+    report = SimpleNamespace(to_dict=lambda: {"status": "reported"})
+    fake_report_module = SimpleNamespace(
+        build_training_report=lambda **kwargs: calls.append(("build", kwargs)) or report,
+        load_checkpoint_pruning_receipt=lambda path: f"receipt:{path}",
+        write_training_report=lambda path, value: calls.append(
+            ("write", (path, value))
+        ),
+    )
+    fake_sync_module = SimpleNamespace(
+        load_sync_result=lambda path: f"sync:{path}"
+    )
+    monkeypatch.setitem(sys.modules, "lehome_train.commands.report", fake_report_module)
+    monkeypatch.setitem(sys.modules, "lehome_train.commands.sync", fake_sync_module)
+    monkeypatch.setattr(
+        runtime_module,
+        "load_json",
+        lambda model, path: f"{model.__name__}:{path}",
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "load_checkpoint_descriptor",
+        lambda path: f"checkpoint:{path}",
+    )
+
+    result = runtime_module.execute_report_request(request)
+
+    assert result == {"status": "reported"}
+    built = calls[0][1]
+    assert built["local_artifact_root"] == arguments["local_artifact_root"]
+    assert built["sync_evidence"] == f"sync:{arguments['sync_result']}"
+    assert built["pruning_receipts"] == (
+        f"receipt:{arguments['pruning_receipts'][0]}",
+    )
+    assert calls[1] == ("write", (arguments["output"], report))
+
+
+def test_sync_request_persists_result_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lehome_train.runtime as runtime_module
+
+    request = tmp_path / "sync-request.json"
+    arguments = {
+        "experiment_root": str(tmp_path / "experiment"),
+        "experiment_id": "experiment-001",
+        "experiment_config_sha256": "a" * 64,
+        "repository": DEFAULT_SETTINGS.model_repo,
+        "revision": "experiment-001",
+        "staging_root": str(tmp_path / "staging"),
+        "timeout_seconds": 30,
+        "max_attempts": 5,
+        "output": str(tmp_path / "sync-result.json"),
+    }
+    request.write_text(
+        json.dumps({"schema_version": 1, "command": "sync", "arguments": arguments}),
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, object]] = []
+    result = SimpleNamespace(to_dict=lambda: {"status": "synced"})
+    fake_sync_module = SimpleNamespace(
+        sync_experiment=lambda *args, **kwargs: calls.append(
+            ("sync", (args, kwargs))
+        )
+        or result,
+        write_sync_result=lambda path, value: calls.append(
+            ("write", (path, value))
+        ),
+    )
+    fake_hub_module = SimpleNamespace(
+        HuggingFaceHubTransport=lambda **kwargs: ("transport", kwargs)
+    )
+    monkeypatch.setitem(sys.modules, "lehome_train.commands.sync", fake_sync_module)
+    monkeypatch.setitem(sys.modules, "lehome_train.hub", fake_hub_module)
+
+    observed = runtime_module.execute_sync_request(request)
+
+    assert observed == {"status": "synced"}
+    assert calls[-1] == ("write", (arguments["output"], result))
+
+
 def test_settings_use_exact_immutable_pins() -> None:
     settings = DEFAULT_SETTINGS
 

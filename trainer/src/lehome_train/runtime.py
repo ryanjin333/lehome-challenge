@@ -159,13 +159,21 @@ def _string(arguments: Mapping[str, object], key: str) -> str:
 def execute_report_request(path: str | os.PathLike[str]) -> dict[str, object]:
     """Run the fully local report command from a strict request envelope."""
 
-    from lehome_train.commands.report import build_training_report, write_training_report
+    from lehome_train.commands.report import (
+        build_training_report,
+        load_checkpoint_pruning_receipt,
+        write_training_report,
+    )
+    from lehome_train.commands.sync import load_sync_result
 
     fields = {
         "experiment_config",
         "isaac_groot_revision",
         "smoke_result",
         "checkpoint_descriptors",
+        "local_artifact_root",
+        "sync_result",
+        "pruning_receipts",
         "instance_started_at",
         "generated_at",
         "provider_hourly_price",
@@ -177,6 +185,16 @@ def execute_report_request(path: str | os.PathLike[str]) -> dict[str, object]:
         isinstance(item, str) and item for item in checkpoint_paths
     ):
         raise ValueError("report checkpoint_descriptors must be a non-empty string array")
+    receipt_paths = arguments["pruning_receipts"]
+    if not isinstance(receipt_paths, list) or not all(
+        isinstance(item, str) and item for item in receipt_paths
+    ):
+        raise ValueError("report pruning_receipts must be a string array")
+    sync_result_path = arguments["sync_result"]
+    if sync_result_path is not None and (
+        not isinstance(sync_result_path, str) or not sync_result_path
+    ):
+        raise ValueError("report sync_result must be a non-empty string or null")
     price = arguments["provider_hourly_price"]
     if type(price) not in (int, float):
         raise ValueError("report provider_hourly_price must be a number")
@@ -188,6 +206,13 @@ def execute_report_request(path: str | os.PathLike[str]) -> dict[str, object]:
         isaac_groot_revision=_string(arguments, "isaac_groot_revision"),
         smoke_result=load_json(SmokeResult, _string(arguments, "smoke_result")),
         checkpoints=tuple(load_checkpoint_descriptor(item) for item in checkpoint_paths),
+        local_artifact_root=_string(arguments, "local_artifact_root"),
+        sync_evidence=(
+            None if sync_result_path is None else load_sync_result(sync_result_path)
+        ),
+        pruning_receipts=tuple(
+            load_checkpoint_pruning_receipt(item) for item in receipt_paths
+        ),
         instance_started_at=_string(arguments, "instance_started_at"),
         generated_at=_string(arguments, "generated_at"),
         provider_hourly_price=float(price),
@@ -199,7 +224,7 @@ def execute_report_request(path: str | os.PathLike[str]) -> dict[str, object]:
 def execute_sync_request(path: str | os.PathLike[str]) -> dict[str, object]:
     """Run real private-Hub synchronization from a strict request envelope."""
 
-    from lehome_train.commands.sync import sync_experiment
+    from lehome_train.commands.sync import sync_experiment, write_sync_result
     from lehome_train.hub import HuggingFaceHubTransport
 
     fields = {
@@ -211,6 +236,7 @@ def execute_sync_request(path: str | os.PathLike[str]) -> dict[str, object]:
         "staging_root",
         "timeout_seconds",
         "max_attempts",
+        "output",
     }
     arguments = _request_arguments(path, command="sync", expected_fields=fields)
     timeout = arguments["timeout_seconds"]
@@ -229,4 +255,5 @@ def execute_sync_request(path: str | os.PathLike[str]) -> dict[str, object]:
         staging_root=_string(arguments, "staging_root"),
         max_attempts=attempts,
     )
+    write_sync_result(_string(arguments, "output"), result)
     return result.to_dict()

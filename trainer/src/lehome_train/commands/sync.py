@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 from typing import Callable, Iterable, Mapping
@@ -19,7 +21,7 @@ from lehome_train.hub import (
     upload_files,
 )
 from lehome_train.io import atomic_write_json, canonical_json_sha256
-from lehome_train.models import SyncEntry, SyncManifest
+from lehome_train.models import SyncEntry, SyncManifest, model_from_mapping
 from lehome_train.redaction import ArtifactRejected, generate_upload_allowlist
 
 
@@ -49,6 +51,58 @@ class SyncResult:
             "manifest": self.manifest.to_dict(),
             "disposable": self.disposable,
         }
+
+
+def write_sync_result(destination: str | os.PathLike[str], result: SyncResult) -> None:
+    """Atomically persist immutable sync evidence for final reporting."""
+
+    if not isinstance(result, SyncResult):
+        raise TypeError("result must be a SyncResult")
+    atomic_write_json(destination, result.to_dict())
+
+
+def load_sync_result(source: str | os.PathLike[str]) -> SyncResult:
+    """Load strict immutable sync evidence without trusting descriptor flags."""
+
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("sync result contains a duplicate field")
+            value[key] = item
+        return value
+
+    try:
+        decoded = json.loads(
+            Path(source).read_text(encoding="utf-8"),
+            object_pairs_hook=strict_object,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("sync result is unavailable or malformed") from None
+    if not isinstance(decoded, Mapping) or set(decoded) != {
+        "schema_version",
+        "repository",
+        "immutable_revision",
+        "manifest",
+        "disposable",
+    }:
+        raise ValueError("sync result has an incompatible schema")
+    if decoded["schema_version"] != 1 or not isinstance(decoded["manifest"], Mapping):
+        raise ValueError("sync result has an incompatible schema")
+    result = SyncResult(
+        repository=decoded["repository"],
+        immutable_revision=decoded["immutable_revision"],
+        manifest=model_from_mapping(SyncManifest, decoded["manifest"]),
+        disposable=decoded["disposable"],
+    )
+    if (
+        not isinstance(result.repository, str)
+        or not isinstance(result.immutable_revision, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", result.immutable_revision)
+        or type(result.disposable) is not bool
+    ):
+        raise ValueError("sync result contains invalid immutable evidence")
+    return result
 
 
 def _walk_group(root: Path, group: str) -> tuple[str, ...]:

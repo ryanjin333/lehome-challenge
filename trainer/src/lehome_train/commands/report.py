@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 import math
-import re
 from pathlib import Path
 
 from lehome_train.checkpoints import CheckpointDescriptor
+from lehome_train.commands.sync import SyncResult
 from lehome_train.io import atomic_write_json, canonical_json_sha256
 from lehome_train.models import ExperimentConfig, SmokeResult
+from lehome_train.report_evidence import (
+    CheckpointPruningReceipt,
+    canonical_timestamp,
+    load_checkpoint_pruning_receipt,
+    normalize_checkpoint_evidence,
+    parse_timestamp,
+    require_immutable_revision,
+    write_checkpoint_pruning_receipt,
+)
 from lehome_train.preflight import reject_secret_bearing_config
-
-
-_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +41,8 @@ class TrainingReport:
     resolved_training_config_sha256: str
     smoke_metrics: dict[str, object]
     checkpoints: tuple[dict[str, object], ...]
+    sync_evidence: dict[str, object] | None
+    artifacts_disposable: bool
     runtime_seconds: float
     provider_hourly_price: float
     cost: float
@@ -62,92 +69,14 @@ class TrainingReport:
             "resolved_training_config_sha256": self.resolved_training_config_sha256,
             "smoke_metrics": dict(self.smoke_metrics),
             "checkpoints": [dict(checkpoint) for checkpoint in self.checkpoints],
+            "sync_evidence": (
+                None if self.sync_evidence is None else dict(self.sync_evidence)
+            ),
+            "artifacts_disposable": self.artifacts_disposable,
             "runtime_seconds": self.runtime_seconds,
             "provider_hourly_price": self.provider_hourly_price,
             "cost": self.cost,
         }
-
-
-def _parse_timestamp(value: str, *, label: str) -> datetime:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{label} must be an explicit timezone-aware timestamp")
-    try:
-        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
-    except ValueError:
-        raise ValueError(f"{label} must be an explicit timezone-aware timestamp") from None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError(f"{label} must be an explicit timezone-aware timestamp")
-    return parsed
-
-
-def _require_immutable_revision(value: str, *, label: str) -> None:
-    if not isinstance(value, str) or not _COMMIT.fullmatch(value):
-        raise ValueError(f"{label} must be an immutable 40-character commit revision")
-
-
-def _validate_checkpoints(
-    checkpoints: tuple[CheckpointDescriptor, ...],
-    *,
-    experiment_id: str,
-    config_sha256: str,
-    dataset_manifest_sha256: str,
-    smoke_physical_batch_size: int,
-) -> tuple[dict[str, object], ...]:
-    if not checkpoints:
-        raise ValueError("training report requires at least one checkpoint")
-    normalized: list[dict[str, object]] = []
-    expected_normalization_sha256: str | None = None
-    expected_schedule_sha256: str | None = None
-    for checkpoint in checkpoints:
-        if not isinstance(checkpoint, CheckpointDescriptor):
-            raise TypeError("training report checkpoints must be CheckpointDescriptor values")
-        record = checkpoint.record
-        if record.experiment_id != experiment_id:
-            raise ValueError("checkpoint experiment identity differs from smoke result")
-        if record.experiment_config_sha256 != config_sha256:
-            raise ValueError("checkpoint experiment config identity is incompatible")
-        if record.dataset_manifest_sha256 != dataset_manifest_sha256:
-            raise ValueError("checkpoint prepared dataset identity is incompatible")
-        if expected_normalization_sha256 is None:
-            expected_normalization_sha256 = checkpoint.normalization_sha256
-        elif checkpoint.normalization_sha256 != expected_normalization_sha256:
-            raise ValueError("checkpoint normalization identities are incompatible")
-        if expected_schedule_sha256 is None:
-            expected_schedule_sha256 = checkpoint.schedule_sha256
-        elif checkpoint.schedule_sha256 != expected_schedule_sha256:
-            raise ValueError("checkpoint schedule identities are incompatible")
-        if record.sample_presentations != record.optimizer_step * smoke_physical_batch_size:
-            raise ValueError("checkpoint sample presentations are incompatible")
-        if not checkpoint.locally_verified and not record.remotely_verified:
-            raise ValueError("checkpoint has no verified retained artifact copy")
-        normalized.append(
-            {
-                "artifact": record.artifact.to_dict(),
-                "dataset_manifest_sha256": record.dataset_manifest_sha256,
-                "experiment_config_sha256": record.experiment_config_sha256,
-                "experiment_id": record.experiment_id,
-                "locally_verified": checkpoint.locally_verified,
-                "normalization_sha256": checkpoint.normalization_sha256,
-                "optimizer_step": record.optimizer_step,
-                "remotely_verified": record.remotely_verified,
-                "resumable": record.resumable,
-                "retention_state": (
-                    "retained_locally"
-                    if checkpoint.locally_verified
-                    else "pruned_after_remote_verification"
-                ),
-                "retained_locally": checkpoint.locally_verified,
-                "sample_presentations": record.sample_presentations,
-                "schedule_sha256": checkpoint.schedule_sha256,
-            }
-        )
-    paths = tuple(item["artifact"]["relative_path"] for item in normalized)
-    if len(paths) != len(set(paths)):
-        raise ValueError("training report checkpoint artifact paths must be unique")
-    optimizer_steps = tuple(item["optimizer_step"] for item in normalized)
-    if len(optimizer_steps) != len(set(optimizer_steps)):
-        raise ValueError("training report checkpoint optimizer steps must be unique")
-    return tuple(normalized)
 
 
 def build_training_report(
@@ -156,6 +85,9 @@ def build_training_report(
     isaac_groot_revision: str,
     smoke_result: SmokeResult,
     checkpoints: tuple[CheckpointDescriptor, ...],
+    local_artifact_root: str | Path,
+    sync_evidence: SyncResult | None,
+    pruning_receipts: tuple[CheckpointPruningReceipt, ...] = (),
     instance_started_at: str,
     generated_at: str,
     provider_hourly_price: float,
@@ -166,13 +98,16 @@ def build_training_report(
         raise TypeError("experiment_config must be an ExperimentConfig")
     if not isinstance(smoke_result, SmokeResult):
         raise TypeError("smoke_result must be a SmokeResult")
+    artifact_root = Path(local_artifact_root)
+    if not artifact_root.is_dir() or artifact_root.is_symlink():
+        raise ValueError("local artifact root must be an existing regular directory")
     reject_secret_bearing_config(experiment_config.to_dict())
-    _require_immutable_revision(isaac_groot_revision, label="Isaac GR00T revision")
-    _require_immutable_revision(
+    require_immutable_revision(isaac_groot_revision, label="Isaac GR00T revision")
+    require_immutable_revision(
         experiment_config.model_revision,
         label="base model revision",
     )
-    _require_immutable_revision(
+    require_immutable_revision(
         experiment_config.dataset_revision,
         label="immutable prepared dataset revision",
     )
@@ -181,8 +116,8 @@ def build_training_report(
     ) or provider_hourly_price < 0:
         raise ValueError("provider hourly price must be a finite nonnegative number")
 
-    started = _parse_timestamp(instance_started_at, label="instance start time")
-    finished = _parse_timestamp(generated_at, label="report generation time")
+    started = parse_timestamp(instance_started_at, label="instance start time")
+    finished = parse_timestamp(generated_at, label="report generation time")
     runtime_seconds = (finished - started).total_seconds()
     if runtime_seconds < 0:
         raise ValueError("report generation time precedes instance start time")
@@ -194,18 +129,33 @@ def build_training_report(
         raise ValueError("smoke prepared dataset identity is incompatible")
     if not smoke_result.stable or not smoke_result.finite_loss:
         raise ValueError("training report requires a stable finite smoke result")
-    checkpoint_records = _validate_checkpoints(
-        checkpoints,
-        experiment_id=smoke_result.experiment_id,
-        config_sha256=config_sha256,
-        dataset_manifest_sha256=experiment_config.dataset_manifest_sha256,
-        smoke_physical_batch_size=smoke_result.physical_batch_size,
+    if smoke_result.physical_batch_size != experiment_config.physical_batch_size:
+        raise ValueError("smoke physical batch differs from resolved config")
+    if (
+        smoke_result.gradient_accumulation_steps
+        != experiment_config.gradient_accumulation_steps
+    ):
+        raise ValueError("smoke gradient accumulation differs from resolved config")
+    checkpoint_records, sync_summary, artifacts_disposable = (
+        normalize_checkpoint_evidence(
+            checkpoints,
+            experiment_id=smoke_result.experiment_id,
+            config_sha256=config_sha256,
+            dataset_manifest_sha256=experiment_config.dataset_manifest_sha256,
+            effective_batch_size=(
+                experiment_config.physical_batch_size
+                * experiment_config.gradient_accumulation_steps
+            ),
+            local_artifact_root=artifact_root,
+            sync_evidence=sync_evidence,
+            pruning_receipts=pruning_receipts,
+        )
     )
 
     report = TrainingReport(
         experiment_id=smoke_result.experiment_id,
-        generated_at=generated_at,
-        instance_started_at=instance_started_at,
+        generated_at=canonical_timestamp(finished),
+        instance_started_at=canonical_timestamp(started),
         container_image_digest=experiment_config.container_digest,
         repository_commit=experiment_config.repository_commit,
         isaac_groot_revision=isaac_groot_revision,
@@ -218,6 +168,8 @@ def build_training_report(
         resolved_training_config_sha256=config_sha256,
         smoke_metrics=smoke_result.to_dict(),
         checkpoints=checkpoint_records,
+        sync_evidence=sync_summary,
+        artifacts_disposable=artifacts_disposable,
         runtime_seconds=runtime_seconds,
         provider_hourly_price=float(provider_hourly_price),
         cost=runtime_seconds / 3600.0 * float(provider_hourly_price),
