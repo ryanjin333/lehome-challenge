@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import math
+import os
+from pathlib import Path
 import re
 from time import monotonic
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
+
+from lehome_train.io import sha256_file
+from lehome_train.models import ArtifactIdentity, model_from_mapping, validate_artifact_relative_path
 
 
 GIBIBYTE = 1024**3
@@ -48,6 +54,38 @@ class PreflightStageResult:
 
     name: str
     duration_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotVerification:
+    """Revision plus verified local files from one immutable snapshot manifest."""
+
+    revision: str
+    manifest_sha256: str
+    artifacts: tuple[ArtifactIdentity, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HubTarget:
+    """One immutable private repository/revision required by this run."""
+
+    repository: str
+    revision: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.repository, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", self.repository):
+            raise ValueError("Hub target repository must be an explicit owner/name")
+        if not isinstance(self.revision, str) or not _REVISION.fullmatch(self.revision):
+            raise ValueError("Hub target revision must be a pinned 40-character revision")
+
+
+@dataclass(frozen=True, slots=True)
+class HubPermission:
+    """The permission contract required before paid checkpoints are created."""
+
+    can_upload: bool
+    can_readback: bool
+    private_repository: bool
 
 
 def _one_visible_gpu(value: str | None) -> str:
@@ -102,21 +140,87 @@ def verify_immutable_revision(
         raise ValueError(f"{label} revision does not match its immutable expected revision")
 
 
-def verify_hub_write_permission(
+def _safe_snapshot_artifact(snapshot_root: Path, artifact: ArtifactIdentity) -> None:
+    relative = validate_artifact_relative_path(artifact.relative_path)
+    candidate = snapshot_root / relative
+    try:
+        candidate.resolve().relative_to(snapshot_root.resolve())
+    except ValueError as error:
+        raise ValueError("snapshot artifact path escapes its root") from error
+    if not candidate.is_file() or candidate.is_symlink():
+        raise ValueError("snapshot artifact is not a regular file")
+    if candidate.stat().st_size != artifact.byte_size or sha256_file(candidate) != artifact.sha256:
+        raise ValueError("snapshot artifact hash or size mismatch")
+
+
+def verify_snapshot_manifest(
+    *,
+    snapshot_root: str | os.PathLike[str],
+    manifest_path: str | os.PathLike[str],
+    expected_revision: str,
+    label: str,
+) -> SnapshotVerification:
+    """Resolve a revision only from a local manifest with verified files."""
+
+    root = Path(snapshot_root)
+    manifest = Path(manifest_path)
+    if not root.is_dir() or root.is_symlink() or not manifest.is_file() or manifest.is_symlink():
+        raise ValueError(f"{label} snapshot manifest is unavailable")
+    try:
+        manifest.resolve().relative_to(root.resolve())
+        decoded = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} snapshot manifest is malformed") from None
+    if not isinstance(decoded, Mapping) or set(decoded) != {"revision", "artifacts"}:
+        raise ValueError(f"{label} snapshot manifest is malformed")
+    observed = decoded["revision"]
+    if not isinstance(observed, str):
+        raise ValueError(f"{label} snapshot manifest is malformed")
+    verify_immutable_revision(
+        expected_revision=expected_revision,
+        observed_revision=observed,
+        label=label,
+    )
+    encoded_artifacts = decoded["artifacts"]
+    if not isinstance(encoded_artifacts, list) or not encoded_artifacts:
+        raise ValueError(f"{label} snapshot manifest has no artifacts")
+    try:
+        artifacts = tuple(
+            model_from_mapping(ArtifactIdentity, item)
+            for item in encoded_artifacts
+            if isinstance(item, Mapping)
+        )
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} snapshot manifest artifacts are invalid") from None
+    if len(artifacts) != len(encoded_artifacts) or len({item.relative_path for item in artifacts}) != len(artifacts):
+        raise ValueError(f"{label} snapshot manifest artifacts are invalid")
+    for artifact in artifacts:
+        _safe_snapshot_artifact(root, artifact)
+    return SnapshotVerification(
+        revision=observed,
+        manifest_sha256=sha256_file(manifest),
+        artifacts=artifacts,
+    )
+
+
+def verify_hub_upload_readback_permission(
     *,
     token: str | None,
-    permission_check: Callable[[str], bool],
+    target: HubTarget,
+    permission_check: Callable[[str, str, str], HubPermission],
 ) -> None:
-    """Prove explicit credentials can upload without persisting or logging them."""
+    """Prove scoped private upload and readback access without recording a token."""
 
     if not isinstance(token, str) or not token.strip() or any(character.isspace() for character in token):
         raise ValueError("an explicit non-empty Hub token is required for upload permission")
     try:
-        allowed = permission_check(token)
-    except Exception as error:
-        raise ValueError("Hub write permission check failed") from error
-    if allowed is not True:
-        raise ValueError("Hub write permission is required before paid training")
+        permission = permission_check(token, target.repository, target.revision)
+    except Exception:
+        raise ValueError("Hub upload/readback permission check failed") from None
+    if not isinstance(permission, HubPermission):
+        raise ValueError("Hub upload/readback permission check returned an invalid contract")
+    if not (permission.can_upload and permission.can_readback and permission.private_repository):
+        raise ValueError("private Hub upload and readback permission is required before paid training")
 
 
 def reject_secret_bearing_config(value: object) -> None:

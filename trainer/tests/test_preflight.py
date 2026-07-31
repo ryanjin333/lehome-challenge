@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
@@ -8,11 +9,16 @@ from lehome_train.preflight import (
     MINIMUM_DISK_BYTES,
     MINIMUM_VRAM_BYTES,
     PreflightStage,
+    HubPermission,
+    HubTarget,
     check_hardware,
     run_timed_stages,
-    verify_hub_write_permission,
+    verify_hub_upload_readback_permission,
     verify_immutable_revision,
+    verify_snapshot_manifest,
 )
+from lehome_train.io import sha256_file
+from lehome_train.models import ArtifactIdentity
 
 
 def test_hardware_requires_one_visible_40gb_gpu_and_200gb_writable_disk() -> None:
@@ -46,7 +52,7 @@ def test_hardware_requires_one_visible_40gb_gpu_and_200gb_writable_disk() -> Non
         )
 
 
-def test_revision_and_hub_permission_are_explicit_and_secret_safe() -> None:
+def test_revision_snapshot_and_hub_permission_are_explicit_and_secret_safe(tmp_path: Path) -> None:
     revision = "a" * 40
     verify_immutable_revision(
         expected_revision=revision,
@@ -60,17 +66,45 @@ def test_revision_and_hub_permission_are_explicit_and_secret_safe() -> None:
             label="dataset",
         )
 
-    observed_tokens: list[str] = []
-    verify_hub_write_permission(
-        token="hf_secret_token_value",
-        permission_check=lambda token: observed_tokens.append(token) or True,
+    snapshot = tmp_path / "model"
+    snapshot.mkdir()
+    payload = snapshot / "weights.bin"
+    payload.write_bytes(b"model")
+    identity = ArtifactIdentity("weights.bin", sha256_file(payload), payload.stat().st_size)
+    manifest = snapshot / "snapshot.json"
+    manifest.write_text(
+        json.dumps({"revision": revision, "artifacts": [identity.to_dict()]}),
+        encoding="utf-8",
     )
-    assert observed_tokens == ["hf_secret_token_value"]
+    verified = verify_snapshot_manifest(
+        snapshot_root=snapshot,
+        manifest_path=manifest,
+        expected_revision=revision,
+        label="model",
+    )
+    assert verified.revision == revision
+    assert verified.manifest_sha256 == sha256_file(manifest)
+
+    observed_requests: list[tuple[str, str, str]] = []
+    verify_hub_upload_readback_permission(
+        token="hf_secret_token_value",
+        target=HubTarget("ryanjin333/lehome-groot-n17-models", revision),
+        permission_check=lambda token, repository, selected_revision: (
+            observed_requests.append((token, repository, selected_revision))
+            or HubPermission(can_upload=True, can_readback=True, private_repository=True)
+        ),
+    )
+    assert observed_requests == [
+        ("hf_secret_token_value", "ryanjin333/lehome-groot-n17-models", revision)
+    ]
 
     with pytest.raises(ValueError) as error:
-        verify_hub_write_permission(
+        verify_hub_upload_readback_permission(
             token="hf_secret_token_value",
-            permission_check=lambda _token: False,
+            target=HubTarget("ryanjin333/lehome-groot-n17-models", revision),
+            permission_check=lambda *_args: (_ for _ in ()).throw(
+                RuntimeError("hf_secret_token_value must not leak")
+            ),
         )
     assert "hf_secret_token_value" not in str(error.value)
 

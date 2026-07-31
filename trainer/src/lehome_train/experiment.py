@@ -12,12 +12,14 @@ from typing import Mapping, Sequence
 from lehome_train.io import atomic_write_json, canonical_json_sha256
 from lehome_train.models import ArtifactIdentity
 from lehome_train.preflight import PREFLIGHT_STAGE_NAMES, reject_secret_bearing_config
+from lehome_train.redaction import ArtifactRejected, generate_upload_allowlist
 
 
 _IDENTITY_FILENAME = "experiment.json"
 _STATUS_FILENAME = "status.json"
 _LOG_DIRECTORY = "logs"
 _LOG_FILENAME = "prepare.log"
+_STAGE_MANIFEST_DIRECTORY = "stage-manifests"
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +72,7 @@ def _default_status(experiment_id_value: str, identity_sha256: str) -> dict[str,
         "experiment_id": experiment_id_value,
         "identity_sha256": identity_sha256,
         "stages": {
-            name: {"state": "pending", "duration_seconds": None}
+            name: {"state": "pending", "duration_seconds": None, "error_code": None}
             for name in PREFLIGHT_STAGE_NAMES
         },
     }
@@ -88,17 +90,26 @@ def _validate_status(status: Mapping[str, object], experiment: Experiment) -> di
         raise ValueError("experiment status stage contract is incompatible")
     for stage in PREFLIGHT_STAGE_NAMES:
         record = stages[stage]
-        if not isinstance(record, dict) or set(record) != {"state", "duration_seconds"}:
+        if not isinstance(record, dict) or set(record) != {
+            "state", "duration_seconds", "error_code"
+        }:
             raise ValueError("experiment status stage record is incompatible")
-        if record["state"] not in {"pending", "complete"}:
+        if record["state"] not in {"pending", "complete", "failed"}:
             raise ValueError("experiment status stage record is incompatible")
         duration = record["duration_seconds"]
-        if record["state"] == "pending" and duration is not None:
+        error_code = record["error_code"]
+        if record["state"] == "pending" and (duration is not None or error_code is not None):
             raise ValueError("pending experiment stage must not have a duration")
-        if record["state"] == "complete" and (
+        if record["state"] in {"complete", "failed"} and (
             type(duration) not in (int, float) or not math.isfinite(float(duration)) or duration < 0
         ):
             raise ValueError("completed experiment stage duration is invalid")
+        if record["state"] == "complete" and error_code is not None:
+            raise ValueError("completed experiment stage must not have an error code")
+        if record["state"] == "failed" and error_code != "operation_failed":
+            raise ValueError("failed experiment stage must use the safe error code")
+        if record["state"] == "complete":
+            _verify_stage_manifest(experiment, stage)
     return dict(status)
 
 
@@ -114,6 +125,51 @@ def _append_log(experiment: Experiment, message: str) -> None:
 
 def _candidate_root(output_root: Path, base_id: str, counter: int) -> Path:
     return output_root / (base_id if counter == 0 else f"{base_id}-superseded-{counter:02d}")
+
+
+def _stage_manifest_path(experiment: Experiment, stage: str) -> Path:
+    return experiment.root / _STAGE_MANIFEST_DIRECTORY / f"{stage}.json"
+
+
+def _verify_stage_artifacts(experiment: Experiment, artifacts: Sequence[ArtifactIdentity]) -> None:
+    if not artifacts or len({artifact.relative_path for artifact in artifacts}) != len(artifacts):
+        raise ValueError("stage manifest must contain unique output artifacts")
+    try:
+        actual = generate_upload_allowlist(
+            experiment.root,
+            tuple(artifact.relative_path for artifact in artifacts),
+        )
+    except ArtifactRejected:
+        raise ValueError("stage output artifacts failed safe verification") from None
+    actual_by_path = {entry.relative_path: entry for entry in actual}
+    if set(actual_by_path) != {artifact.relative_path for artifact in artifacts}:
+        raise ValueError("stage output artifacts failed safe verification")
+    for artifact in artifacts:
+        entry = actual_by_path[artifact.relative_path]
+        if entry.sha256 != artifact.sha256 or entry.byte_size != artifact.byte_size:
+            raise ValueError("stage output artifact hash or size mismatch")
+
+
+def _verify_stage_manifest(experiment: Experiment, stage: str) -> tuple[ArtifactIdentity, ...]:
+    path = _stage_manifest_path(experiment, stage)
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("completed preflight stage has no output manifest")
+    manifest = _read_json_object(path, description="stage output manifest")
+    if set(manifest) != {"schema_version", "stage", "artifacts"} or manifest.get("schema_version") != 1:
+        raise ValueError("stage output manifest is incompatible")
+    if manifest.get("stage") != stage or not isinstance(manifest.get("artifacts"), list):
+        raise ValueError("stage output manifest is incompatible")
+    entries = manifest["artifacts"]
+    try:
+        artifacts = tuple(
+            ArtifactIdentity(**entry) for entry in entries if isinstance(entry, Mapping)
+        )
+    except (TypeError, ValueError):
+        raise ValueError("stage output manifest is incompatible") from None
+    if len(artifacts) != len(entries):
+        raise ValueError("stage output manifest is incompatible")
+    _verify_stage_artifacts(experiment, artifacts)
+    return artifacts
 
 
 def create_or_resume_experiment(
@@ -141,6 +197,7 @@ def create_or_resume_experiment(
         if not candidate.exists():
             candidate.mkdir()
             (candidate / _LOG_DIRECTORY).mkdir()
+            (candidate / _STAGE_MANIFEST_DIRECTORY).mkdir()
             experiment = Experiment(base_id, candidate, False)
             atomic_write_json(candidate / _IDENTITY_FILENAME, payload)
             atomic_write_json(candidate / _STATUS_FILENAME, _default_status(base_id, base_id))
@@ -171,6 +228,9 @@ def create_or_resume_experiment(
         log_directory = candidate / _LOG_DIRECTORY
         if not log_directory.is_dir() or log_directory.is_symlink():
             continue
+        stage_manifest_directory = candidate / _STAGE_MANIFEST_DIRECTORY
+        if not stage_manifest_directory.is_dir() or stage_manifest_directory.is_symlink():
+            continue
         _append_log(experiment, "prepare: resumed matching immutable experiment identity")
         return experiment
     raise RuntimeError("could not allocate a safe superseded experiment directory")
@@ -189,7 +249,7 @@ def pending_stages(experiment: Experiment) -> tuple[str, ...]:
     status = _load_status(experiment)
     stages = status["stages"]
     assert isinstance(stages, dict)
-    return tuple(name for name in PREFLIGHT_STAGE_NAMES if stages[name]["state"] == "pending")
+    return tuple(name for name in PREFLIGHT_STAGE_NAMES if stages[name]["state"] != "complete")
 
 
 def mark_stage_complete(
@@ -197,6 +257,7 @@ def mark_stage_complete(
     stage: str,
     *,
     duration_seconds: float,
+    artifacts: Sequence[ArtifactIdentity],
 ) -> None:
     """Atomically mark one canonical stage complete without mutating identity."""
 
@@ -212,6 +273,49 @@ def mark_stage_complete(
         raise ValueError("preflight stages must complete in canonical order")
     if stages[stage]["state"] == "complete":
         return
-    stages[stage] = {"state": "complete", "duration_seconds": float(duration_seconds)}
+    _verify_stage_artifacts(experiment, artifacts)
+    manifest_path = _stage_manifest_path(experiment, stage)
+    atomic_write_json(
+        manifest_path,
+        {
+            "schema_version": 1,
+            "stage": stage,
+            "artifacts": [artifact.to_dict() for artifact in sorted(artifacts, key=lambda item: item.relative_path)],
+        },
+    )
+    _verify_stage_manifest(experiment, stage)
+    stages[stage] = {
+        "state": "complete",
+        "duration_seconds": float(duration_seconds),
+        "error_code": None,
+    }
     atomic_write_json(experiment.root / _STATUS_FILENAME, status)
     _append_log(experiment, f"prepare: {stage} complete in {float(duration_seconds):.6f}s")
+
+
+def mark_stage_failed(
+    experiment: Experiment,
+    stage: str,
+    *,
+    duration_seconds: float,
+    error: Exception,
+) -> None:
+    """Persist a safe failure record before returning control to the caller."""
+
+    if stage not in PREFLIGHT_STAGE_NAMES:
+        raise ValueError("unknown preflight stage")
+    if type(duration_seconds) not in (int, float) or not math.isfinite(float(duration_seconds)) or duration_seconds < 0:
+        raise ValueError("preflight stage duration must be finite and nonnegative")
+    status = _load_status(experiment)
+    stages = status["stages"]
+    assert isinstance(stages, dict)
+    index = PREFLIGHT_STAGE_NAMES.index(stage)
+    if any(stages[name]["state"] != "complete" for name in PREFLIGHT_STAGE_NAMES[:index]):
+        raise ValueError("preflight stages must fail in canonical order")
+    stages[stage] = {
+        "state": "failed",
+        "duration_seconds": float(duration_seconds),
+        "error_code": "operation_failed",
+    }
+    atomic_write_json(experiment.root / _STATUS_FILENAME, status)
+    _append_log(experiment, f"prepare: {stage} failed safely after {float(duration_seconds):.6f}s")

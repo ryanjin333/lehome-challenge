@@ -11,15 +11,19 @@ from lehome_train.experiment import (
     Experiment,
     create_or_resume_experiment,
     mark_stage_complete,
+    mark_stage_failed,
     pending_stages,
 )
 from lehome_train.models import ArtifactIdentity
 from lehome_train.preflight import (
     HardwareReport,
+    HubPermission,
+    HubTarget,
     PREFLIGHT_STAGE_NAMES,
     check_hardware,
-    verify_hub_write_permission,
-    verify_immutable_revision,
+    reject_secret_bearing_config,
+    verify_hub_upload_readback_permission,
+    verify_snapshot_manifest,
 )
 
 
@@ -48,12 +52,13 @@ def prepare_training_environment(
     visible_vram_bytes: Sequence[int],
     writable_free_bytes: int,
     token: str | None,
-    hub_permission_check: Callable[[str], bool],
-    stage_operations: Mapping[str, Callable[[], None]],
-    expected_model_revision: str | None = None,
-    observed_model_revision: str | None = None,
-    expected_dataset_revision: str | None = None,
-    observed_dataset_revision: str | None = None,
+    hub_targets: Sequence[HubTarget],
+    hub_permission_check: Callable[[str, str, str], HubPermission],
+    stage_operations: Mapping[str, Callable[[Path], Sequence[ArtifactIdentity]]],
+    model_snapshot_root: str | Path,
+    model_snapshot_manifest: str | Path,
+    dataset_snapshot_root: str | Path,
+    dataset_snapshot_manifest: str | Path,
 ) -> PrepareResult:
     """Run only missing preparation stages after all no-cost gates pass.
 
@@ -64,6 +69,7 @@ def prepare_training_environment(
 
     if tuple(stage_operations) != PREFLIGHT_STAGE_NAMES:
         raise ValueError("prepare operations must use the complete canonical stage order")
+    reject_secret_bearing_config(dict(resolved_config))
     hardware = check_hardware(
         visible_devices=visible_devices,
         visible_vram_bytes=visible_vram_bytes,
@@ -71,35 +77,59 @@ def prepare_training_environment(
     )
     model_revision = _config_revision(resolved_config, "model_revision")
     dataset_revision = _config_revision(resolved_config, "dataset_revision")
-    verify_immutable_revision(
-        expected_revision=(
-            model_revision if expected_model_revision is None else expected_model_revision
-        ),
-        observed_revision=(
-            model_revision if observed_model_revision is None else observed_model_revision
-        ),
+    model_snapshot = verify_snapshot_manifest(
+        snapshot_root=model_snapshot_root,
+        manifest_path=model_snapshot_manifest,
+        expected_revision=model_revision,
         label="model",
     )
-    verify_immutable_revision(
-        expected_revision=(
-            dataset_revision if expected_dataset_revision is None else expected_dataset_revision
-        ),
-        observed_revision=(
-            dataset_revision if observed_dataset_revision is None else observed_dataset_revision
-        ),
+    dataset_snapshot = verify_snapshot_manifest(
+        snapshot_root=dataset_snapshot_root,
+        manifest_path=dataset_snapshot_manifest,
+        expected_revision=dataset_revision,
         label="dataset",
     )
-    verify_hub_write_permission(token=token, permission_check=hub_permission_check)
+    if not hub_targets:
+        raise ValueError("at least one configured private Hub target is required")
+    configured_targets = {
+        (_config_revision(resolved_config, "model_repository"), model_revision),
+        (_config_revision(resolved_config, "dataset_repository"), dataset_revision),
+    }
+    if any((target.repository, target.revision) not in configured_targets for target in hub_targets):
+        raise ValueError("Hub permission target must match a configured repository and revision")
+    for target in hub_targets:
+        verify_hub_upload_readback_permission(
+            token=token,
+            target=target,
+            permission_check=hub_permission_check,
+        )
+    identity_config = dict(resolved_config)
+    identity_config["model_snapshot_manifest_sha256"] = model_snapshot.manifest_sha256
+    identity_config["dataset_snapshot_manifest_sha256"] = dataset_snapshot.manifest_sha256
     experiment = create_or_resume_experiment(
         output_root,
-        resolved_config=resolved_config,
+        resolved_config=identity_config,
         artifacts=artifacts,
     )
     completed: list[str] = []
     for stage in pending_stages(experiment):
         started = monotonic()
-        stage_operations[stage]()
-        mark_stage_complete(experiment, stage, duration_seconds=monotonic() - started)
+        try:
+            artifacts_for_stage = tuple(stage_operations[stage](experiment.root))
+            mark_stage_complete(
+                experiment,
+                stage,
+                duration_seconds=monotonic() - started,
+                artifacts=artifacts_for_stage,
+            )
+        except Exception as error:
+            mark_stage_failed(
+                experiment,
+                stage,
+                duration_seconds=monotonic() - started,
+                error=error,
+            )
+            raise RuntimeError(f"preflight stage {stage} failed safely") from None
         completed.append(stage)
     return PrepareResult(
         experiment=experiment,
