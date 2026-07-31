@@ -11,6 +11,7 @@ import tempfile
 from typing import Any, Mapping
 
 from lehome_train.constants import DEFAULT_DATA_REPO
+from lehome_train.data.validate import REQUIRED_VALIDATION_ARTIFACTS
 from lehome_train.hub import (
     HubTransport,
     download_files,
@@ -22,12 +23,6 @@ from lehome_train.models import ArtifactIdentity, SyncEntry, model_from_mapping
 from lehome_train.redaction import generate_upload_allowlist
 
 
-_VALIDATION_ARTIFACTS = (
-    "meta/lehome_groot_modality.py",
-    "meta/relative_stats.json",
-    "meta/stats.json",
-    "meta/validation_report.json",
-)
 _CONTROL_PATHS = ("manifest.json", "meta/prepared_hashes.json")
 
 
@@ -93,7 +88,7 @@ def _recorded_validation_hashes(
     if prepared_hashes["schema_version"] != 1:
         raise ValueError("prepared validation hash allowlist has an invalid version")
     hashes = prepared_hashes["artifacts"]
-    if not isinstance(hashes, Mapping) or set(hashes) != set(_VALIDATION_ARTIFACTS):
+    if not isinstance(hashes, Mapping) or set(hashes) != set(REQUIRED_VALIDATION_ARTIFACTS):
         raise ValueError("prepared validation hash allowlist is incomplete")
     if not all(
         isinstance(value, str)
@@ -111,7 +106,7 @@ def _recorded_validation_hashes(
         raise ValueError("prepared dataset statistics allowlist is invalid")
     expected_statistics = {
         path: hashes[path]
-        for path in _VALIDATION_ARTIFACTS
+        for path in REQUIRED_VALIDATION_ARTIFACTS
         if path != "meta/validation_report.json"
     }
     recorded_statistics: dict[str, object] = {}
@@ -143,7 +138,7 @@ def _allowlisted_paths_from_control_files(dataset: Path) -> tuple[str, ...]:
         set(prepared_hashes) != {"schema_version", "artifacts"}
         or prepared_hashes.get("schema_version") != 1
         or not isinstance(hashes, Mapping)
-        or set(hashes) != set(_VALIDATION_ARTIFACTS)
+        or set(hashes) != set(REQUIRED_VALIDATION_ARTIFACTS)
     ):
         raise ValueError("prepared validation hash allowlist is incomplete")
     return tuple(
@@ -197,6 +192,48 @@ def _verify_entries(root: Path, entries: tuple[SyncEntry, ...]) -> None:
         raise ValueError("remote prepared dataset hash verification failed")
 
 
+def _verify_complete_tree(root: Path, relative_paths: tuple[str, ...]) -> None:
+    expected_files = set(relative_paths)
+    expected_directories = {
+        "/".join(parts[:index])
+        for relative_path in relative_paths
+        for parts in (relative_path.split("/"),)
+        for index in range(1, len(parts))
+    }
+    observed_files: set[str] = set()
+    pending = [(root, "")]
+    while pending:
+        directory, prefix = pending.pop()
+        for entry in os.scandir(directory):
+            relative = f"{prefix}/{entry.name}" if prefix else entry.name
+            if entry.is_symlink():
+                raise ValueError("remote prepared dataset contains an unexpected symlink")
+            if entry.is_dir(follow_symlinks=False):
+                if relative not in expected_directories:
+                    raise ValueError("remote prepared dataset contains an unexpected directory")
+                pending.append((Path(entry.path), relative))
+            elif entry.is_file(follow_symlinks=False):
+                observed_files.add(relative)
+            else:
+                raise ValueError("remote prepared dataset contains an unexpected path type")
+    if observed_files != expected_files:
+        raise ValueError("remote prepared dataset contains an unexpected file set")
+
+
+def _stage_entries(source: Path, entries: tuple[SyncEntry, ...]) -> Path:
+    staging = Path(tempfile.mkdtemp(prefix="lehome-dataset-upload-"))
+    try:
+        for entry in entries:
+            destination = staging / entry.relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / entry.relative_path, destination)
+        _verify_entries(staging, entries)
+        return staging
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
 def publish_prepared_dataset(
     dataset_path: str | os.PathLike[str],
     *,
@@ -214,40 +251,49 @@ def publish_prepared_dataset(
         raise ValueError("dataset publication revision must be explicit")
     dataset = Path(dataset_path)
     entries = _validated_entries(dataset)
-    require_access(
-        transport=transport,
-        repository=repository,
-        read=True,
-        write=True,
-        environ=environ,
+    manifest_sha256 = next(
+        entry.sha256
+        for entry in entries
+        if entry.relative_path == "manifest.json"
     )
-    immutable_revision = upload_files(
-        transport=transport,
-        repository=repository,
-        revision=revision,
-        source=dataset,
-        entries=entries,
-        environ=environ,
-        max_attempts=max_attempts,
-    )
-    readback = Path(tempfile.mkdtemp(prefix="lehome-dataset-readback-"))
+    staging = _stage_entries(dataset, entries)
     try:
-        download_files(
+        require_access(
             transport=transport,
             repository=repository,
-            revision=immutable_revision,
-            destination=readback,
-            relative_paths=tuple(entry.relative_path for entry in entries),
+            read=True,
+            write=True,
+            environ=environ,
+        )
+        immutable_revision = upload_files(
+            transport=transport,
+            repository=repository,
+            revision=revision,
+            source=staging,
+            entries=entries,
             environ=environ,
             max_attempts=max_attempts,
         )
-        _verify_entries(readback, entries)
+        readback = Path(tempfile.mkdtemp(prefix="lehome-dataset-readback-"))
+        try:
+            download_files(
+                transport=transport,
+                repository=repository,
+                revision=immutable_revision,
+                destination=readback,
+                relative_paths=tuple(entry.relative_path for entry in entries),
+                environ=environ,
+                max_attempts=max_attempts,
+            )
+            _verify_entries(readback, entries)
+        finally:
+            shutil.rmtree(readback, ignore_errors=True)
     finally:
-        shutil.rmtree(readback, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
     return PublishedDataset(
         repository=repository,
         revision=immutable_revision,
-        dataset_manifest_sha256=sha256_file(dataset / "manifest.json"),
+        dataset_manifest_sha256=manifest_sha256,
         entries=entries,
     )
 
@@ -318,6 +364,7 @@ def download_prepared_dataset(
         entries = _validated_entries(temporary)
         if tuple(entry.relative_path for entry in entries) != relative_paths:
             raise ValueError("remote prepared dataset allowlist verification failed")
+        _verify_complete_tree(temporary, relative_paths)
         os.replace(temporary, destination)
         return destination
     except BaseException:

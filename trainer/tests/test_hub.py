@@ -154,6 +154,29 @@ def test_upload_retries_only_to_the_explicit_limit_and_redacts_failures(
     assert token not in str(error.value)
 
 
+def test_retry_backoff_is_bounded_and_uses_the_injected_sleeper(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport()
+    transport.upload_failures = 2
+    observed_delays: list[float] = []
+
+    resolved = upload_files(
+        transport=transport,
+        repository="owner/private-data",
+        revision="prepared-v1",
+        source=tmp_path,
+        entries=(SyncEntry("payload.bin", "0" * 64, 0),),
+        environ={"HF_TOKEN": "hf_retry_process_token"},
+        max_attempts=3,
+        sleeper=observed_delays.append,
+    )
+
+    assert resolved == "a" * 40
+    assert observed_delays == [0.25, 0.5]
+    assert len(transport.upload_calls) == 3
+
+
 def test_download_requires_and_preserves_an_explicit_immutable_revision(
     tmp_path: Path,
 ) -> None:

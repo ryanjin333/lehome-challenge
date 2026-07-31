@@ -6,12 +6,15 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
-from typing import Mapping, Protocol
+from time import sleep
+from typing import Callable, Mapping, Protocol
 
 from lehome_train.models import SyncEntry, validate_artifact_relative_path
 
 
 _COMMIT_REVISION = re.compile(r"^[0-9a-f]{40}$")
+_INITIAL_RETRY_DELAY_SECONDS = 0.25
+_MAX_RETRY_DELAY_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +94,7 @@ def upload_files(
     entries: tuple[SyncEntry, ...],
     environ: Mapping[str, str] | None = None,
     max_attempts: int = 3,
+    sleeper: Callable[[float], None] = sleep,
 ) -> str:
     """Upload an explicit allowlist while passing the process token in memory."""
 
@@ -112,6 +116,12 @@ def upload_files(
                 raise RuntimeError(
                     f"Hub upload failed after {max_attempts} attempts"
                 ) from None
+            sleeper(
+                min(
+                    _INITIAL_RETRY_DELAY_SECONDS * (2 ** (attempt - 1)),
+                    _MAX_RETRY_DELAY_SECONDS,
+                )
+            )
         except Exception:
             raise RuntimeError("Hub upload failed") from None
     if not isinstance(resolved, str) or not _COMMIT_REVISION.fullmatch(resolved):
@@ -128,6 +138,7 @@ def download_files(
     relative_paths: tuple[str, ...],
     environ: Mapping[str, str] | None = None,
     max_attempts: int = 3,
+    sleeper: Callable[[float], None] = sleep,
 ) -> str:
     """Download explicit paths from one full immutable commit revision."""
 
@@ -155,6 +166,12 @@ def download_files(
                 raise RuntimeError(
                     f"Hub download failed after {max_attempts} attempts"
                 ) from None
+            sleeper(
+                min(
+                    _INITIAL_RETRY_DELAY_SECONDS * (2 ** (attempt - 1)),
+                    _MAX_RETRY_DELAY_SECONDS,
+                )
+            )
         except Exception:
             raise RuntimeError("Hub download failed") from None
     if observed != revision:

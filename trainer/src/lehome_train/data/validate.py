@@ -27,7 +27,7 @@ from lehome_train.models import validate_artifact_relative_path
 
 
 _STAT_NAMES = ("mean", "std", "min", "max", "q01", "q99")
-_REQUIRED_ARTIFACTS = (
+REQUIRED_VALIDATION_ARTIFACTS = (
     "meta/lehome_groot_modality.py",
     "meta/relative_stats.json",
     "meta/stats.json",
@@ -410,7 +410,7 @@ def validate_prepared_dataset(
         "schema_version": 1,
         "artifacts": {
             relative: sha256_file(dataset / relative)
-            for relative in _REQUIRED_ARTIFACTS
+            for relative in REQUIRED_VALIDATION_ARTIFACTS
         },
     }
     atomic_write_json(dataset / "meta" / "prepared_hashes.json", hashes)
