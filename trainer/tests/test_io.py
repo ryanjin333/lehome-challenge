@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import lehome_train.io as trainer_io
 from lehome_train.io import (
     atomic_write_json,
     canonical_json_bytes,
@@ -107,3 +108,52 @@ def test_atomic_write_failure_preserves_destination_and_cleans_temp(
 
     assert destination.read_bytes() == b'{"state":"old"}'
     assert list(tmp_path.glob(f".{destination.name}.*.tmp")) == []
+
+
+def test_atomic_write_reports_parent_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "status.json"
+
+    def fail_parent_fsync(parent: Path) -> None:
+        raise OSError("synthetic parent fsync failure")
+
+    monkeypatch.setattr("lehome_train.io._fsync_parent", fail_parent_fsync)
+
+    with pytest.raises(OSError, match="parent fsync failure"):
+        atomic_write_json(destination, {"state": "complete"})
+
+    assert destination.read_bytes() == b'{"state":"complete"}'
+
+
+def test_parent_directory_open_failure_is_not_suppressed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_open(path: Path, flags: int) -> int:
+        raise PermissionError("synthetic directory open failure")
+
+    monkeypatch.setattr(trainer_io.os, "open", fail_open)
+
+    with pytest.raises(PermissionError, match="directory open failure"):
+        trainer_io._fsync_parent(tmp_path)
+
+
+def test_parent_directory_fsync_failure_is_not_suppressed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = os.open(tmp_path, os.O_RDONLY)
+
+    monkeypatch.setattr(trainer_io.os, "open", lambda path, flags: descriptor)
+    monkeypatch.setattr(
+        trainer_io.os,
+        "fsync",
+        lambda opened_descriptor: (_ for _ in ()).throw(
+            OSError("synthetic directory fsync failure")
+        ),
+    )
+
+    with pytest.raises(OSError, match="directory fsync failure"):
+        trainer_io._fsync_parent(tmp_path)

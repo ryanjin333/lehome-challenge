@@ -131,16 +131,9 @@ def _fsync_parent(parent: Path) -> None:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
+    descriptor = os.open(parent, flags)
     try:
-        descriptor = os.open(parent, flags)
-    except OSError:
-        return
-    try:
-        try:
-            os.fsync(descriptor)
-        except OSError:
-            # Some filesystems/platforms do not support directory fsync.
-            pass
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
 

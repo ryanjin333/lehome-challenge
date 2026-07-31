@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import traceback
 from pathlib import Path
 
 import pytest
@@ -65,6 +67,63 @@ def test_upload_allowlist_rejects_symlinks_at_any_component(tmp_path: Path) -> N
         generate_upload_allowlist(root, ["linked-directory/secret.txt"])
     with pytest.raises(ArtifactRejected):
         generate_upload_allowlist(root, ["linked-file"])
+
+
+def test_upload_allowlist_rejects_symlink_swapped_at_final_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "experiment"
+    root.mkdir()
+    candidate = root / "result.json"
+    candidate.write_text('{"safe":true}', encoding="utf-8")
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"outside":true}', encoding="utf-8")
+    real_open = os.open
+    swapped = False
+
+    def swap_before_open(
+        path: str | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if path == candidate.name and dir_fd is not None and not swapped:
+            swapped = True
+            candidate.unlink()
+            candidate.symlink_to(outside)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr("lehome_train.redaction.os.open", swap_before_open)
+
+    with pytest.raises(ArtifactRejected):
+        generate_upload_allowlist(root, [candidate.name])
+
+    assert swapped is True
+
+
+def test_rejected_path_does_not_survive_in_exception_chain_or_traceback(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "experiment"
+    root.mkdir()
+    secret_name = "hf_" + ("A1" * 20)
+
+    with pytest.raises(ArtifactRejected) as caught:
+        generate_upload_allowlist(root, [secret_name])
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value),
+            caught.value,
+            caught.value.__traceback__,
+        )
+    )
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert secret_name not in rendered
 
 
 @pytest.mark.parametrize(

@@ -76,6 +76,7 @@ ACCESS_TOKEN_PATTERNS: Final[tuple[Pattern[str], ...]] = (
 
 _SCAN_CHUNK_SIZE: Final = 1024 * 1024
 _SCAN_OVERLAP: Final = 512
+_OPEN_SUPPORTS_DIR_FD: Final = os.open in os.supports_dir_fd
 
 
 class ArtifactRejected(ValueError):
@@ -113,40 +114,98 @@ def _validate_relative_path(relative: Path) -> tuple[str, ...]:
     return parts
 
 
-def _reject_symlink_components(root: Path, parts: tuple[str, ...]) -> Path:
-    if root.is_symlink():
-        raise _rejected("symlink")
-
-    candidate = root
-    for part in parts:
-        candidate = candidate / part
-        try:
-            metadata = candidate.lstat()
-        except OSError as error:
-            raise _rejected("unreadable path") from error
-        if stat.S_ISLNK(metadata.st_mode):
-            raise _rejected("symlink")
-    return candidate
+def _close_descriptor(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        # Read-only descriptor close errors do not affect the artifact decision.
+        pass
 
 
-def _inspect_content(path: Path) -> tuple[str, int, bool]:
+def _secure_descriptor_support_available() -> bool:
+    return (
+        hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_CLOEXEC")
+        and hasattr(os, "O_NOFOLLOW")
+        and _OPEN_SUPPORTS_DIR_FD
+    )
+
+
+def _open_regular_file_descriptor(
+    root: Path,
+    parts: tuple[str, ...],
+) -> tuple[int | None, os.stat_result | None, str | None]:
+    """Open a descendant without ever resolving a component by pathname twice."""
+
+    if not _secure_descriptor_support_available():
+        return None, None, "secure descriptor traversal unavailable"
+
+    common_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    directory_flags = common_flags | os.O_DIRECTORY
+    directory_descriptors: list[int] = []
+    file_descriptor: int | None = None
+    try:
+        root_descriptor = os.open(root, directory_flags)
+        directory_descriptors.append(root_descriptor)
+        parent_descriptor = root_descriptor
+        for component in parts[:-1]:
+            parent_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            directory_descriptors.append(parent_descriptor)
+        file_descriptor = os.open(
+            parts[-1],
+            common_flags,
+            dir_fd=parent_descriptor,
+        )
+        metadata = os.fstat(file_descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            _close_descriptor(file_descriptor)
+            return None, None, "non-regular file"
+        return file_descriptor, metadata, None
+    except (OSError, TypeError):
+        if file_descriptor is not None:
+            _close_descriptor(file_descriptor)
+        return None, None, "unreadable path"
+    finally:
+        for descriptor in reversed(directory_descriptors):
+            _close_descriptor(descriptor)
+
+
+def _inspect_content(
+    descriptor: int,
+    initial_metadata: os.stat_result,
+) -> tuple[tuple[str, int, bool] | None, str | None]:
     import hashlib
 
     digest = hashlib.sha256()
     byte_size = 0
     tail = ""
     try:
-        with path.open("rb") as stream:
-            while chunk := stream.read(_SCAN_CHUNK_SIZE):
-                byte_size += len(chunk)
-                digest.update(chunk)
-                text = tail + chunk.decode("utf-8", errors="ignore")
-                if any(pattern.search(text) for pattern in ACCESS_TOKEN_PATTERNS):
-                    return "", 0, True
-                tail = text[-_SCAN_OVERLAP:]
-    except OSError as error:
-        raise _rejected("unreadable content") from error
-    return digest.hexdigest(), byte_size, False
+        while chunk := os.read(descriptor, _SCAN_CHUNK_SIZE):
+            byte_size += len(chunk)
+            digest.update(chunk)
+            text = tail + chunk.decode("utf-8", errors="ignore")
+            if any(pattern.search(text) for pattern in ACCESS_TOKEN_PATTERNS):
+                return ("", 0, True), None
+            tail = text[-_SCAN_OVERLAP:]
+        final_metadata = os.fstat(descriptor)
+    except OSError:
+        return None, "unreadable content"
+
+    unchanged = (
+        initial_metadata.st_dev == final_metadata.st_dev
+        and initial_metadata.st_ino == final_metadata.st_ino
+        and initial_metadata.st_size == final_metadata.st_size
+        and initial_metadata.st_mtime_ns == final_metadata.st_mtime_ns
+        and initial_metadata.st_ctime_ns == final_metadata.st_ctime_ns
+        and byte_size == final_metadata.st_size
+    )
+    if not unchanged:
+        return None, "content changed during inspection"
+    return (digest.hexdigest(), byte_size, False), None
 
 
 def generate_upload_allowlist(
@@ -156,33 +215,26 @@ def generate_upload_allowlist(
     """Validate and identify explicit experiment-relative upload candidates."""
 
     root = Path(experiment_root)
-    if not root.is_dir() or root.is_symlink():
-        raise _rejected("invalid experiment root")
-    try:
-        resolved_root = root.resolve(strict=True)
-    except OSError as error:
-        raise _rejected("invalid experiment root") from error
 
     entries: list[SyncEntry] = []
     seen: set[str] = set()
     for supplied in relative_paths:
         relative = Path(supplied)
         parts = _validate_relative_path(relative)
-        candidate = _reject_symlink_components(root, parts)
-        try:
-            resolved_candidate = candidate.resolve(strict=True)
-            resolved_candidate.relative_to(resolved_root)
-            metadata = candidate.stat()
-        except (OSError, ValueError) as error:
-            raise _rejected("path outside experiment root") from error
-        if not stat.S_ISREG(metadata.st_mode):
-            raise _rejected("non-regular file")
-
         canonical = Path(*parts).as_posix()
         if canonical in seen:
             raise _rejected("duplicate path")
         seen.add(canonical)
-        sha256, byte_size, contains_token = _inspect_content(candidate)
+        descriptor, metadata, open_error = _open_regular_file_descriptor(root, parts)
+        if open_error is not None or descriptor is None or metadata is None:
+            raise _rejected(open_error or "unreadable path")
+        try:
+            inspection, inspection_error = _inspect_content(descriptor, metadata)
+        finally:
+            _close_descriptor(descriptor)
+        if inspection_error is not None or inspection is None:
+            raise _rejected(inspection_error or "unreadable content")
+        sha256, byte_size, contains_token = inspection
         if contains_token:
             raise _rejected("supported access token")
         entries.append(
