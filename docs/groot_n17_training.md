@@ -25,10 +25,30 @@ Inspect the organizer dataset, convert it deterministically, validate it, and
 only then publish its validated allowlist:
 
 ```bash
-lehome-train data inspect --source /data/four_types_merged
-lehome-train data convert --source /data/four_types_merged --output /prepared/lehome-groot-n17-v1
-lehome-train data validate --dataset /prepared/lehome-groot-n17-v1
-lehome-train data publish --dataset /prepared/lehome-groot-n17-v1 --repo ryanjin333/lehome-groot-n17-data --revision lehome-groot-n17-v1
+lehome-train data inspect \
+  --source /data/four_types_merged \
+  --output /prepared/source-inspection.json
+
+lehome-train data convert \
+  --source /data/four_types_merged \
+  --output /prepared/lehome-groot-n17-v1 \
+  --mapping /app/trainer/config/lehome_four_types_mapping.json \
+  --source-repository lehome/dataset_challenge_merged \
+  --source-revision <full-source-commit> \
+  --converter-commit <full-trainer-commit> \
+  --container-digest sha256:<64-hex-digest> \
+  --groot-root /opt/Isaac-GR00T
+
+lehome-train data validate \
+  --dataset /prepared/lehome-groot-n17-v1 \
+  --groot-root /opt/Isaac-GR00T
+
+HF_TOKEN='<write-scoped-token>' lehome-train data publish \
+  --dataset /prepared/lehome-groot-n17-v1 \
+  --repo ryanjin333/lehome-groot-n17-data \
+  --revision lehome-groot-n17-v1 \
+  --staging-root /prepared/staging \
+  --timeout-seconds 30
 ```
 
 Record the full 40-character Hub commit returned by publish and the SHA-256 of
@@ -62,15 +82,74 @@ manifest hash.
 Start from the accepted image by exact `sha256:` digest. Supply the repository
 commit, pinned Isaac-GR00T revision, base-model revision, dataset repository
 commit, dataset manifest hash, provider start time, and hourly price as resolved
-configuration. Then run:
+configuration. The accepted image sets `LEHOME_TRAIN_RUNTIME_FACTORY` to its
+production `module:factory`. On a development image, pass the same value via
+`--runtime-factory module:factory`; absence of a runtime factory is a hard,
+actionable failure.
+
+`prepare`, `memorize`, `smoke`, and `train` each accept a strict request envelope:
+
+```json
+{
+  "schema_version": 1,
+  "command": "prepare",
+  "arguments": {
+    "request_contract": "fields owned by the accepted Task 12 runtime adapter"
+  }
+}
+```
+
+The command identity must match the filename/stage. Unknown envelope fields,
+duplicate JSON fields, non-finite values, and supported secret formats are
+rejected before the runtime factory is loaded. Run the stages with:
 
 ```bash
-lehome-train prepare
-lehome-train memorize --episode-id <training-episode-id>
-lehome-train smoke --batches auto --steps 100
-lehome-train train --sample-presentations 768000
-lehome-train report
-lehome-train sync
+lehome-train prepare --request /requests/prepare.json
+lehome-train memorize --request /requests/memorize.json
+lehome-train smoke --request /requests/smoke.json
+lehome-train train --request /requests/train.json
+lehome-train report --request /requests/report.json
+lehome-train sync --request /requests/sync.json
+```
+
+The report request schema is fully implemented by this package:
+
+```json
+{
+  "schema_version": 1,
+  "command": "report",
+  "arguments": {
+    "experiment_config": "/output/experiment/resolved-config.json",
+    "isaac_groot_revision": "<full-isaac-groot-commit>",
+    "smoke_result": "/output/experiment/reports/smoke-result.json",
+    "checkpoint_descriptors": [
+      "/output/experiment/checkpoints/step-12000.json"
+    ],
+    "instance_started_at": "2026-07-31T10:00:00Z",
+    "generated_at": "2026-07-31T14:00:00Z",
+    "provider_hourly_price": 1.25,
+    "output": "/output/experiment/reports/training-report.json"
+  }
+}
+```
+
+The sync request schema is also fully implemented:
+
+```json
+{
+  "schema_version": 1,
+  "command": "sync",
+  "arguments": {
+    "experiment_root": "/output/experiment",
+    "experiment_id": "<experiment-id>",
+    "experiment_config_sha256": "<64-hex-config-hash>",
+    "repository": "ryanjin333/lehome-groot-n17-models",
+    "revision": "<explicit-upload-branch>",
+    "staging_root": "/output/staging",
+    "timeout_seconds": 30,
+    "max_attempts": 5
+  }
+}
 ```
 
 `prepare` verifies one supported GPU, disk, immutable snapshots, local hashes,
@@ -83,9 +162,13 @@ batch with at least 10% physical VRAM headroom. `train` processes exactly
 `report` records the exact image digest, trainer repository commit, Isaac-GR00T
 revision, base-model repository and revision, prepared-dataset repository
 revision and manifest SHA-256, resolved training configuration and its hash,
-selected smoke metrics, every checkpoint path/hash/size, instance runtime,
-hourly price, and calculated cost. Report generation repeats the central secret
-scan before writing JSON.
+selected smoke metrics, and complete checkpoint provenance. Each checkpoint
+entry includes artifact path/hash/size, optimizer step, sample presentations,
+experiment/config/dataset hashes, normalization and schedule hashes, resumable
+state, local and remote verification flags, and whether it remains retained
+locally or was pruned after remote verification. The report also includes
+instance runtime, hourly price, and calculated cost. Report generation repeats
+the central secret scan before writing JSON.
 
 `sync` generates `sync-manifest.json` from these closed artifact groups under
 the experiment root:
@@ -97,11 +180,16 @@ the experiment root:
 - JSON reports.
 
 Dotfiles, symlinks, paths outside the experiment, caches, environment files,
-credential-store filenames, and supported token formats are rejected. Sync
-uploads only the generated entries to the private model repository, resolves
-the upload to a full commit, downloads the same entries from that immutable
-commit, and recomputes every SHA-256 and byte size. An entry becomes
-`remotely_verified: true` only after this readback matches.
+credential-store filenames, and supported token formats are rejected. After
+access is verified, sync capacity-checks the caller-selected staging filesystem,
+byte-copies only the generated allowlist into a temporary immutable snapshot,
+and re-scans every staged byte for exact hashes and secrets. It uploads that
+snapshot, never the mutable experiment directory. It then cleans upload
+staging, capacity-checks the same filesystem for readback, downloads the full
+allowlist from the resolved commit, and rejects unexpected files, directories,
+or symlinks before recomputing every SHA-256 and byte size. Temporary upload and
+readback trees are always removed. An entry becomes `remotely_verified: true`
+only after this complete-tree readback matches.
 
 ## Shutdown gate
 

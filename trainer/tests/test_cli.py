@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 from typer.testing import CliRunner
 
@@ -27,6 +32,225 @@ def test_cli_registers_command_group(command: str) -> None:
 
     assert result.exit_code == 0
     assert f"Usage: lehome-train {command}" in result.stdout
+
+
+@pytest.mark.parametrize("subcommand", ["inspect", "convert", "validate", "publish"])
+def test_cli_registers_operational_data_subcommands(subcommand: str) -> None:
+    result = CliRunner().invoke(app, ["data", subcommand, "--help"])
+
+    assert result.exit_code == 0
+    assert f"Usage: root data {subcommand}" in result.stdout
+
+
+def test_data_commands_invoke_real_data_adapters(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    injected = {
+        "lehome_train.data.inspect": SimpleNamespace(
+            inspect_dataset=lambda source, *, output_path=None: calls.append(
+                ("inspect", (source, output_path))
+            )
+            or {"valid": True}
+        ),
+        "lehome_train.data.convert": SimpleNamespace(
+            convert_dataset=lambda source, output, **kwargs: calls.append(
+                ("convert", (source, output, kwargs))
+            )
+            or {"converted": True}
+        ),
+        "lehome_train.data.stats": SimpleNamespace(
+            write_train_statistics=lambda dataset, *, groot_root=None: calls.append(
+                ("stats", (dataset, groot_root))
+            )
+            or {"statistics": True}
+        ),
+        "lehome_train.data.validate": SimpleNamespace(
+            validate_prepared_dataset=lambda dataset, *, groot_root=None: calls.append(
+                ("validate", (dataset, groot_root))
+            )
+            or {"valid": True}
+        ),
+        "lehome_train.data.publish": SimpleNamespace(
+            publish_prepared_dataset=lambda dataset, **kwargs: calls.append(
+                ("publish", (dataset, kwargs))
+            )
+            or SimpleNamespace(
+                repository=kwargs["repository"],
+                revision="a" * 40,
+                dataset_manifest_sha256="b" * 64,
+                entries=(),
+            )
+        ),
+        "lehome_train.hub": SimpleNamespace(
+            HuggingFaceHubTransport=lambda **_kwargs: object()
+        ),
+    }
+    previous = {name: sys.modules.get(name) for name in injected}
+    sys.modules.update(injected)
+
+    try:
+        inspect_result = CliRunner().invoke(
+            app,
+            ["data", "inspect", "--source", str(tmp_path), "--output", str(tmp_path / "inspection.json")],
+        )
+        convert_result = CliRunner().invoke(
+            app,
+            [
+                "data",
+                "convert",
+                "--source",
+                str(tmp_path),
+                "--output",
+                str(tmp_path / "prepared"),
+                "--mapping",
+                str(tmp_path / "mapping.json"),
+                "--source-repository",
+                "owner/source",
+                "--source-revision",
+                "a" * 40,
+                "--converter-commit",
+                "b" * 40,
+                "--container-digest",
+                "sha256:" + "c" * 64,
+                "--groot-root",
+                str(tmp_path / "groot"),
+            ],
+        )
+        validate_result = CliRunner().invoke(
+            app,
+            ["data", "validate", "--dataset", str(tmp_path), "--groot-root", str(tmp_path / "groot")],
+        )
+        publish_result = CliRunner().invoke(
+            app,
+            [
+                "data",
+                "publish",
+                "--dataset",
+                str(tmp_path),
+                "--repo",
+                DEFAULT_SETTINGS.data_repo,
+                "--revision",
+                "prepared-v1",
+                "--staging-root",
+                str(tmp_path),
+            ],
+        )
+    finally:
+        for name, module in previous.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    assert all(
+        result.exit_code == 0
+        for result in (inspect_result, convert_result, validate_result, publish_result)
+    )
+    assert [name for name, _ in calls] == [
+        "inspect",
+        "convert",
+        "stats",
+        "validate",
+        "publish",
+    ]
+
+
+@pytest.mark.parametrize("command", ["prepare", "memorize", "smoke", "train"])
+def test_gpu_commands_dispatch_checked_request_to_runtime_factory(
+    command: str,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class Runtime:
+        def prepare(self, request: dict[str, object]) -> dict[str, object]:
+            calls.append(("prepare", request))
+            return {"status": "prepared"}
+
+        def memorize(self, request: dict[str, object]) -> dict[str, object]:
+            calls.append(("memorize", request))
+            return {"status": "memorized"}
+
+        def smoke(self, request: dict[str, object]) -> dict[str, object]:
+            calls.append(("smoke", request))
+            return {"status": "smoked"}
+
+        def train(self, request: dict[str, object]) -> dict[str, object]:
+            calls.append(("train", request))
+            return {"status": "trained"}
+
+    sys.modules["test_lehome_runtime"] = SimpleNamespace(create=lambda: Runtime())
+    request = tmp_path / f"{command}.json"
+    request.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "command": command,
+                "arguments": {"experiment_root": "/output/experiment"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        result = CliRunner().invoke(
+            app,
+            [
+                command,
+                "--request",
+                str(request),
+                "--runtime-factory",
+                "test_lehome_runtime:create",
+            ],
+        )
+    finally:
+        del sys.modules["test_lehome_runtime"]
+
+    assert result.exit_code == 0
+    assert calls == [(command, {"experiment_root": "/output/experiment"})]
+    assert '"status":' in result.stdout
+
+
+def test_gpu_command_fails_closed_without_runtime_factory(tmp_path: Path) -> None:
+    request = tmp_path / "prepare.json"
+    request.write_text(
+        json.dumps({"schema_version": 1, "command": "prepare", "arguments": {}}),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["prepare", "--request", str(request)])
+
+    assert result.exit_code != 0
+    assert "runtime factory" in result.output
+
+
+def test_report_and_sync_commands_reach_default_request_adapters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lehome_train.runtime as runtime_module
+
+    report_request = tmp_path / "report.json"
+    sync_request = tmp_path / "sync.json"
+    report_request.write_text("{}", encoding="utf-8")
+    sync_request.write_text("{}", encoding="utf-8")
+    calls: list[tuple[str, Path]] = []
+    monkeypatch.setattr(
+        runtime_module,
+        "execute_report_request",
+        lambda path: calls.append(("report", Path(path))) or {"status": "reported"},
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "execute_sync_request",
+        lambda path: calls.append(("sync", Path(path))) or {"status": "synced"},
+    )
+
+    report_result = CliRunner().invoke(app, ["report", "--request", str(report_request)])
+    sync_result = CliRunner().invoke(app, ["sync", "--request", str(sync_request)])
+
+    assert report_result.exit_code == sync_result.exit_code == 0
+    assert calls == [("report", report_request), ("sync", sync_request)]
 
 
 def test_settings_use_exact_immutable_pins() -> None:

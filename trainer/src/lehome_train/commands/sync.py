@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path
+import shutil
 import tempfile
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 from lehome_train.constants import DEFAULT_MODEL_REPO
 from lehome_train.hub import HubTransport, download_files, require_access, upload_files
@@ -18,6 +19,9 @@ from lehome_train.redaction import ArtifactRejected, generate_upload_allowlist
 _ROOT_ARTIFACTS = ("provenance.json", "resolved-config.json")
 _GROUPS = ("checkpoints", "logs", "reports")
 _MANIFEST_NAME = "sync-manifest.json"
+_MINIMUM_STAGING_RESERVE_BYTES = 64 * 1024**2
+_MAXIMUM_STAGING_RESERVE_BYTES = 1024**3
+_STAGING_RESERVE_FRACTION_DENOMINATOR = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +132,96 @@ def _verified_remote_entries(
     return tuple(verified)
 
 
+def _free_space_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def _required_staging_bytes(entries: tuple[SyncEntry, ...]) -> int:
+    payload_bytes = sum(entry.byte_size for entry in entries)
+    reserve_bytes = min(
+        _MAXIMUM_STAGING_RESERVE_BYTES,
+        max(
+            _MINIMUM_STAGING_RESERVE_BYTES,
+            payload_bytes // _STAGING_RESERVE_FRACTION_DENOMINATOR,
+        ),
+    )
+    return payload_bytes + reserve_bytes
+
+
+def _require_staging_capacity(
+    staging_root: Path,
+    entries: tuple[SyncEntry, ...],
+    free_space_probe: Callable[[Path], int],
+    *,
+    phase: str,
+) -> None:
+    available = free_space_probe(staging_root)
+    if type(available) is not int or available < 0:
+        raise ValueError(f"sync {phase} free-space probe returned an invalid value")
+    required = _required_staging_bytes(entries)
+    if available < required:
+        raise ValueError(
+            f"sync {phase} staging filesystem has insufficient space "
+            f"(requires {required} bytes, has {available} bytes)"
+        )
+
+
+def _complete_tree_matches(root: Path, entries: tuple[SyncEntry, ...]) -> bool:
+    expected_files = {entry.relative_path for entry in entries}
+    expected_directories = {
+        "/".join(parts[:index])
+        for relative_path in expected_files
+        for parts in (relative_path.split("/"),)
+        for index in range(1, len(parts))
+    }
+    observed_files: set[str] = set()
+    pending = [(root, "")]
+    try:
+        while pending:
+            directory, prefix = pending.pop()
+            for entry in os.scandir(directory):
+                relative = f"{prefix}/{entry.name}" if prefix else entry.name
+                if entry.is_symlink():
+                    return False
+                if entry.is_dir(follow_symlinks=False):
+                    if relative not in expected_directories:
+                        return False
+                    pending.append((Path(entry.path), relative))
+                elif entry.is_file(follow_symlinks=False):
+                    observed_files.add(relative)
+                else:
+                    return False
+    except OSError:
+        return False
+    return observed_files == expected_files
+
+
+def _stage_entries(
+    source: Path,
+    entries: tuple[SyncEntry, ...],
+    *,
+    staging_root: Path,
+) -> Path:
+    staging = Path(
+        tempfile.mkdtemp(prefix="lehome-model-upload-", dir=staging_root)
+    )
+    try:
+        for entry in entries:
+            destination = staging / entry.relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / entry.relative_path, destination)
+        observed = generate_upload_allowlist(
+            staging,
+            tuple(entry.relative_path for entry in entries),
+        )
+        if observed != entries or not _complete_tree_matches(staging, entries):
+            raise ValueError("staged sync artifact hashes changed during copy")
+        return staging
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
 def sync_experiment(
     experiment_root: str | os.PathLike[str],
     *,
@@ -136,8 +230,10 @@ def sync_experiment(
     repository: str,
     revision: str,
     transport: HubTransport,
+    staging_root: str | os.PathLike[str],
     environ: Mapping[str, str] | None = None,
     max_attempts: int = 5,
+    free_space_probe: Callable[[Path], int] = _free_space_bytes,
 ) -> SyncResult:
     """Upload generated artifacts and derive disposal only from hash readback."""
 
@@ -146,11 +242,9 @@ def sync_experiment(
     if not isinstance(revision, str) or not revision.strip():
         raise ValueError("model artifact upload revision must be explicit")
     root = Path(experiment_root)
-    manifest = generate_sync_manifest(
-        root,
-        experiment_id=experiment_id,
-        experiment_config_sha256=experiment_config_sha256,
-    )
+    resolved_staging_root = Path(staging_root)
+    if not resolved_staging_root.is_dir() or resolved_staging_root.is_symlink():
+        raise ValueError("sync staging root must be an existing regular directory")
     require_access(
         transport=transport,
         repository=repository,
@@ -158,17 +252,47 @@ def sync_experiment(
         write=True,
         environ=environ,
     )
-    immutable_revision = upload_files(
-        transport=transport,
-        repository=repository,
-        revision=revision,
-        source=root,
-        entries=manifest.entries,
-        environ=environ,
-        max_attempts=max_attempts,
+    manifest = generate_sync_manifest(
+        root,
+        experiment_id=experiment_id,
+        experiment_config_sha256=experiment_config_sha256,
     )
-    with tempfile.TemporaryDirectory(prefix="lehome-model-readback-") as temporary:
-        readback = Path(temporary)
+    _require_staging_capacity(
+        resolved_staging_root,
+        manifest.entries,
+        free_space_probe,
+        phase="upload",
+    )
+    staging = _stage_entries(
+        root,
+        manifest.entries,
+        staging_root=resolved_staging_root,
+    )
+    try:
+        immutable_revision = upload_files(
+            transport=transport,
+            repository=repository,
+            revision=revision,
+            source=staging,
+            entries=manifest.entries,
+            environ=environ,
+            max_attempts=max_attempts,
+        )
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    _require_staging_capacity(
+        resolved_staging_root,
+        manifest.entries,
+        free_space_probe,
+        phase="readback",
+    )
+    readback = Path(
+        tempfile.mkdtemp(
+            prefix="lehome-model-readback-",
+            dir=resolved_staging_root,
+        )
+    )
+    try:
         download_files(
             transport=transport,
             repository=repository,
@@ -178,7 +302,14 @@ def sync_experiment(
             environ=environ,
             max_attempts=max_attempts,
         )
-        verified_entries = _verified_remote_entries(readback, manifest.entries)
+        if _complete_tree_matches(readback, manifest.entries):
+            verified_entries = _verified_remote_entries(readback, manifest.entries)
+        else:
+            verified_entries = tuple(
+                replace(entry, remotely_verified=False) for entry in manifest.entries
+            )
+    finally:
+        shutil.rmtree(readback, ignore_errors=True)
 
     verified_manifest = SyncManifest(
         experiment_id=manifest.experiment_id,

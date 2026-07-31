@@ -10,7 +10,7 @@ from pathlib import Path
 
 from lehome_train.checkpoints import CheckpointDescriptor
 from lehome_train.io import atomic_write_json, canonical_json_sha256
-from lehome_train.models import ArtifactIdentity, ExperimentConfig, SmokeResult
+from lehome_train.models import ExperimentConfig, SmokeResult
 from lehome_train.preflight import reject_secret_bearing_config
 
 
@@ -35,7 +35,7 @@ class TrainingReport:
     resolved_training_config: dict[str, object]
     resolved_training_config_sha256: str
     smoke_metrics: dict[str, object]
-    checkpoint_artifacts: tuple[ArtifactIdentity, ...]
+    checkpoints: tuple[dict[str, object], ...]
     runtime_seconds: float
     provider_hourly_price: float
     cost: float
@@ -61,9 +61,7 @@ class TrainingReport:
             "resolved_training_config": dict(self.resolved_training_config),
             "resolved_training_config_sha256": self.resolved_training_config_sha256,
             "smoke_metrics": dict(self.smoke_metrics),
-            "checkpoint_artifacts": [
-                artifact.to_dict() for artifact in self.checkpoint_artifacts
-            ],
+            "checkpoints": [dict(checkpoint) for checkpoint in self.checkpoints],
             "runtime_seconds": self.runtime_seconds,
             "provider_hourly_price": self.provider_hourly_price,
             "cost": self.cost,
@@ -93,10 +91,13 @@ def _validate_checkpoints(
     experiment_id: str,
     config_sha256: str,
     dataset_manifest_sha256: str,
-) -> tuple[ArtifactIdentity, ...]:
+    smoke_physical_batch_size: int,
+) -> tuple[dict[str, object], ...]:
     if not checkpoints:
         raise ValueError("training report requires at least one checkpoint")
-    artifacts: list[ArtifactIdentity] = []
+    normalized: list[dict[str, object]] = []
+    expected_normalization_sha256: str | None = None
+    expected_schedule_sha256: str | None = None
     for checkpoint in checkpoints:
         if not isinstance(checkpoint, CheckpointDescriptor):
             raise TypeError("training report checkpoints must be CheckpointDescriptor values")
@@ -107,13 +108,46 @@ def _validate_checkpoints(
             raise ValueError("checkpoint experiment config identity is incompatible")
         if record.dataset_manifest_sha256 != dataset_manifest_sha256:
             raise ValueError("checkpoint prepared dataset identity is incompatible")
-        if not checkpoint.locally_verified:
-            raise ValueError("checkpoint artifact has not been locally hash verified")
-        artifacts.append(record.artifact)
-    paths = tuple(artifact.relative_path for artifact in artifacts)
+        if expected_normalization_sha256 is None:
+            expected_normalization_sha256 = checkpoint.normalization_sha256
+        elif checkpoint.normalization_sha256 != expected_normalization_sha256:
+            raise ValueError("checkpoint normalization identities are incompatible")
+        if expected_schedule_sha256 is None:
+            expected_schedule_sha256 = checkpoint.schedule_sha256
+        elif checkpoint.schedule_sha256 != expected_schedule_sha256:
+            raise ValueError("checkpoint schedule identities are incompatible")
+        if record.sample_presentations != record.optimizer_step * smoke_physical_batch_size:
+            raise ValueError("checkpoint sample presentations are incompatible")
+        if not checkpoint.locally_verified and not record.remotely_verified:
+            raise ValueError("checkpoint has no verified retained artifact copy")
+        normalized.append(
+            {
+                "artifact": record.artifact.to_dict(),
+                "dataset_manifest_sha256": record.dataset_manifest_sha256,
+                "experiment_config_sha256": record.experiment_config_sha256,
+                "experiment_id": record.experiment_id,
+                "locally_verified": checkpoint.locally_verified,
+                "normalization_sha256": checkpoint.normalization_sha256,
+                "optimizer_step": record.optimizer_step,
+                "remotely_verified": record.remotely_verified,
+                "resumable": record.resumable,
+                "retention_state": (
+                    "retained_locally"
+                    if checkpoint.locally_verified
+                    else "pruned_after_remote_verification"
+                ),
+                "retained_locally": checkpoint.locally_verified,
+                "sample_presentations": record.sample_presentations,
+                "schedule_sha256": checkpoint.schedule_sha256,
+            }
+        )
+    paths = tuple(item["artifact"]["relative_path"] for item in normalized)
     if len(paths) != len(set(paths)):
         raise ValueError("training report checkpoint artifact paths must be unique")
-    return tuple(artifacts)
+    optimizer_steps = tuple(item["optimizer_step"] for item in normalized)
+    if len(optimizer_steps) != len(set(optimizer_steps)):
+        raise ValueError("training report checkpoint optimizer steps must be unique")
+    return tuple(normalized)
 
 
 def build_training_report(
@@ -160,11 +194,12 @@ def build_training_report(
         raise ValueError("smoke prepared dataset identity is incompatible")
     if not smoke_result.stable or not smoke_result.finite_loss:
         raise ValueError("training report requires a stable finite smoke result")
-    artifacts = _validate_checkpoints(
+    checkpoint_records = _validate_checkpoints(
         checkpoints,
         experiment_id=smoke_result.experiment_id,
         config_sha256=config_sha256,
         dataset_manifest_sha256=experiment_config.dataset_manifest_sha256,
+        smoke_physical_batch_size=smoke_result.physical_batch_size,
     )
 
     report = TrainingReport(
@@ -182,7 +217,7 @@ def build_training_report(
         resolved_training_config=experiment_config.to_dict(),
         resolved_training_config_sha256=config_sha256,
         smoke_metrics=smoke_result.to_dict(),
-        checkpoint_artifacts=artifacts,
+        checkpoints=checkpoint_records,
         runtime_seconds=runtime_seconds,
         provider_hourly_price=float(provider_hourly_price),
         cost=runtime_seconds / 3600.0 * float(provider_hourly_price),

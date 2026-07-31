@@ -118,9 +118,39 @@ def test_report_contains_complete_exact_provenance_and_checkpoint_hashes() -> No
     assert payload["resolved_training_config"] == config.to_dict()
     assert payload["resolved_training_config_sha256"] == canonical_json_sha256(config)
     assert payload["smoke_metrics"] == smoke.to_dict()
-    assert payload["checkpoint_artifacts"] == [
-        checkpoint.record.artifact.to_dict() for checkpoint in checkpoints
+    assert payload["checkpoints"] == [
+        {
+            "artifact": checkpoint.record.artifact.to_dict(),
+            "dataset_manifest_sha256": checkpoint.record.dataset_manifest_sha256,
+            "experiment_config_sha256": checkpoint.record.experiment_config_sha256,
+            "experiment_id": checkpoint.record.experiment_id,
+            "locally_verified": checkpoint.locally_verified,
+            "normalization_sha256": checkpoint.normalization_sha256,
+            "optimizer_step": checkpoint.record.optimizer_step,
+            "remotely_verified": checkpoint.record.remotely_verified,
+            "resumable": checkpoint.record.resumable,
+            "retention_state": "retained_locally",
+            "retained_locally": checkpoint.locally_verified,
+            "sample_presentations": checkpoint.record.sample_presentations,
+            "schedule_sha256": checkpoint.schedule_sha256,
+        }
+        for checkpoint in checkpoints
     ]
+    assert set(payload["checkpoints"][0]) == {
+        "artifact",
+        "dataset_manifest_sha256",
+        "experiment_config_sha256",
+        "experiment_id",
+        "locally_verified",
+        "normalization_sha256",
+        "optimizer_step",
+        "remotely_verified",
+        "resumable",
+        "retention_state",
+        "retained_locally",
+        "sample_presentations",
+        "schedule_sha256",
+    }
     assert payload["runtime_seconds"] == 9_000.0
     assert payload["provider_hourly_price"] == 1.20
     assert payload["cost"] == pytest.approx(3.0)
@@ -160,6 +190,67 @@ def test_report_rejects_incomplete_or_incompatible_provenance() -> None:
             generated_at="2026-07-31T12:30:00Z",
             provider_hourly_price=1.20,
         )
+
+    with pytest.raises(ValueError, match="normalization"):
+        build_training_report(
+            experiment_config=config,
+            isaac_groot_revision=GROOT_REVISION,
+            smoke_result=smoke,
+            checkpoints=(
+                checkpoint,
+                replace(_checkpoint(config, 2_000), normalization_sha256="8" * 64),
+            ),
+            instance_started_at="2026-07-31T10:00:00Z",
+            generated_at="2026-07-31T12:30:00Z",
+            provider_hourly_price=1.20,
+        )
+
+    with pytest.raises(ValueError, match="schedule"):
+        build_training_report(
+            experiment_config=config,
+            isaac_groot_revision=GROOT_REVISION,
+            smoke_result=smoke,
+            checkpoints=(
+                checkpoint,
+                replace(
+                    _checkpoint(config, 2_000),
+                    record=replace(
+                        _checkpoint(config, 2_000).record,
+                        schedule_sha256="7" * 64,
+                    ),
+                    schedule_sha256="7" * 64,
+                ),
+            ),
+            instance_started_at="2026-07-31T10:00:00Z",
+            generated_at="2026-07-31T12:30:00Z",
+            provider_hourly_price=1.20,
+        )
+
+
+def test_report_preserves_pruned_checkpoint_retention_state() -> None:
+    config = _config()
+    pruned = replace(
+        _checkpoint(config, 1_000),
+        locally_verified=False,
+        record=replace(_checkpoint(config, 1_000).record, remotely_verified=True),
+    )
+
+    report = build_training_report(
+        experiment_config=config,
+        isaac_groot_revision=GROOT_REVISION,
+        smoke_result=_smoke(config),
+        checkpoints=(pruned,),
+        instance_started_at="2026-07-31T10:00:00Z",
+        generated_at="2026-07-31T12:30:00Z",
+        provider_hourly_price=1.20,
+    )
+
+    assert report.to_dict()["checkpoints"][0]["retained_locally"] is False
+    assert report.to_dict()["checkpoints"][0]["locally_verified"] is False
+    assert (
+        report.to_dict()["checkpoints"][0]["retention_state"]
+        == "pruned_after_remote_verification"
+    )
 
 
 def test_report_calculates_runtime_and_cost_and_redacts_no_secret(

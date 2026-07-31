@@ -46,8 +46,26 @@ PY
 Use `create=False` to verify existing repositories without creating them. Any
 unapproved repository or repository that is not private is rejected.
 
-The complete operator workflow, normalization contract, restore choices, and
-shutdown gate are in [the GR00T N1.7 training runbook](../docs/groot_n17_training.md).
+The complete operator workflow, request schemas, normalization contract,
+restore choices, and shutdown gate are in
+[the GR00T N1.7 training runbook](../docs/groot_n17_training.md).
+
+The accepted Task 12 image sets `LEHOME_TRAIN_RUNTIME_FACTORY=module:factory`.
+Outside that image, pass `--runtime-factory module:factory` explicitly. The
+factory must return the production adapter implementing `prepare`, `memorize`,
+`smoke`, and `train`; missing GPU/runtime wiring is a hard error, never a
+successful no-op.
+
+Every stage consumes a checked JSON request:
+
+```bash
+lehome-train prepare --request /requests/prepare.json
+lehome-train memorize --request /requests/memorize.json
+lehome-train smoke --request /requests/smoke.json
+lehome-train train --request /requests/train.json
+lehome-train report --request /requests/report.json
+lehome-train sync --request /requests/sync.json
+```
 
 Run the focused report and synchronization checks with:
 
@@ -55,6 +73,6 @@ Run the focused report and synchronization checks with:
 uv run pytest tests/test_report.py tests/test_sync.py -q
 ```
 
-These tests use an injected in-memory transport. Creating repositories or
-performing a real upload additionally requires a valid `HF_TOKEN`; no token is
-bundled in this checkout.
+These tests use injected runtimes and an in-memory transport. Creating
+repositories or performing a real upload additionally requires a valid
+`HF_TOKEN`; no token is bundled in this checkout.
