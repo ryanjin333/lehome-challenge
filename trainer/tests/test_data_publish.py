@@ -1,0 +1,285 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from lehome_train.constants import DEFAULT_DATA_REPO
+from lehome_train.data.publish import (
+    download_prepared_dataset,
+    publish_prepared_dataset,
+)
+from lehome_train.hub import HubAccess
+from lehome_train.io import atomic_write_json, canonical_json_sha256, sha256_file
+from lehome_train.models import SyncEntry
+
+
+class FakeHubTransport:
+    def __init__(self) -> None:
+        self.access = HubAccess(can_read=True, can_write=True)
+        self.commit = "a" * 40
+        self.remote: dict[str, bytes] = {}
+        self.uploaded_entries: tuple[SyncEntry, ...] = ()
+        self.download_revisions: list[str] = []
+        self.corrupt_download_path: str | None = None
+
+    def check_access(self, *, repository: str, token: str) -> HubAccess:
+        return self.access
+
+    def upload_files(
+        self,
+        *,
+        repository: str,
+        revision: str,
+        source: Path,
+        entries: tuple[SyncEntry, ...],
+        token: str,
+    ) -> str:
+        self.uploaded_entries = entries
+        self.remote = {
+            entry.relative_path: (source / entry.relative_path).read_bytes()
+            for entry in entries
+        }
+        return self.commit
+
+    def download_files(
+        self,
+        *,
+        repository: str,
+        revision: str,
+        destination: Path,
+        relative_paths: tuple[str, ...],
+        token: str,
+    ) -> str:
+        self.download_revisions.append(revision)
+        for relative_path in relative_paths:
+            target = destination / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(self.remote[relative_path])
+            if relative_path == self.corrupt_download_path:
+                target.write_bytes(b"remote mismatch")
+        return revision
+
+
+def _write_validated_dataset(root: Path) -> Path:
+    dataset = root / "prepared"
+    meta = dataset / "meta"
+    meta.mkdir(parents=True)
+    payload = dataset / "data" / "episode.bin"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"immutable episode")
+    (meta / "stats.json").write_bytes(b'{"stats":"train-only"}')
+    (meta / "relative_stats.json").write_bytes(b'{"stats":"relative"}')
+    (meta / "lehome_groot_modality.py").write_bytes(b"MODALITY = 'joint-space'\n")
+
+    output_artifacts = [
+        {
+            "relative_path": "data/episode.bin",
+            "sha256": sha256_file(payload),
+            "byte_size": payload.stat().st_size,
+        }
+    ]
+    manifest = {
+        "schema_version": 1,
+        "output_artifacts": output_artifacts,
+        "output_manifest_sha256": canonical_json_sha256(output_artifacts),
+        "statistics": {
+            "status": "computed_task_4_train_only",
+            "files": [
+                {
+                    "relative_path": relative,
+                    "sha256": sha256_file(dataset / relative),
+                }
+                for relative in (
+                    "meta/lehome_groot_modality.py",
+                    "meta/stats.json",
+                    "meta/relative_stats.json",
+                )
+            ],
+        },
+    }
+    atomic_write_json(dataset / "manifest.json", manifest)
+    atomic_write_json(
+        meta / "validation_report.json",
+        {
+            "schema_version": 1,
+            "valid": True,
+            "dataset_manifest_sha256": sha256_file(dataset / "manifest.json"),
+        },
+    )
+    required = (
+        "meta/lehome_groot_modality.py",
+        "meta/relative_stats.json",
+        "meta/stats.json",
+        "meta/validation_report.json",
+    )
+    atomic_write_json(
+        meta / "prepared_hashes.json",
+        {
+            "schema_version": 1,
+            "artifacts": {
+                relative: sha256_file(dataset / relative)
+                for relative in required
+            },
+        },
+    )
+    return dataset
+
+
+def test_publish_uses_only_the_validated_hash_allowlist_and_reads_back_commit(
+    tmp_path: Path,
+) -> None:
+    dataset = _write_validated_dataset(tmp_path)
+    (dataset / "unlisted-secret.txt").write_text("never upload me", encoding="utf-8")
+    transport = FakeHubTransport()
+
+    published = publish_prepared_dataset(
+        dataset,
+        repository=DEFAULT_DATA_REPO,
+        revision="lehome-groot-n17-v1",
+        transport=transport,
+        environ={"HF_TOKEN": "hf_publish_process_token"},
+    )
+
+    expected_paths = {
+        "data/episode.bin",
+        "manifest.json",
+        "meta/lehome_groot_modality.py",
+        "meta/prepared_hashes.json",
+        "meta/relative_stats.json",
+        "meta/stats.json",
+        "meta/validation_report.json",
+    }
+    assert {entry.relative_path for entry in transport.uploaded_entries} == expected_paths
+    assert set(transport.remote) == expected_paths
+    assert published.repository == DEFAULT_DATA_REPO
+    assert published.revision == transport.commit
+    assert published.dataset_manifest_sha256 == sha256_file(dataset / "manifest.json")
+    assert transport.download_revisions == [transport.commit]
+
+
+def test_publish_refuses_dirty_hashed_payloads(tmp_path: Path) -> None:
+    dataset = _write_validated_dataset(tmp_path)
+    (dataset / "data" / "episode.bin").write_bytes(b"changed after validation")
+    transport = FakeHubTransport()
+
+    with pytest.raises(ValueError, match="dirty"):
+        publish_prepared_dataset(
+            dataset,
+            repository=DEFAULT_DATA_REPO,
+            revision="lehome-groot-n17-v1",
+            transport=transport,
+            environ={"HF_TOKEN": "hf_publish_process_token"},
+        )
+
+    assert transport.uploaded_entries == ()
+
+
+def test_publish_refuses_unhashed_manifest_payloads(tmp_path: Path) -> None:
+    dataset = _write_validated_dataset(tmp_path)
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["output_artifacts"][0].pop("sha256")
+    manifest["output_manifest_sha256"] = canonical_json_sha256(
+        manifest["output_artifacts"]
+    )
+    atomic_write_json(manifest_path, manifest)
+    report_path = dataset / "meta" / "validation_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["dataset_manifest_sha256"] = sha256_file(manifest_path)
+    atomic_write_json(report_path, report)
+    hashes_path = dataset / "meta" / "prepared_hashes.json"
+    hashes = json.loads(hashes_path.read_text(encoding="utf-8"))
+    hashes["artifacts"]["meta/validation_report.json"] = sha256_file(report_path)
+    atomic_write_json(hashes_path, hashes)
+
+    with pytest.raises(ValueError, match="allowlist"):
+        publish_prepared_dataset(
+            dataset,
+            repository=DEFAULT_DATA_REPO,
+            revision="lehome-groot-n17-v1",
+            transport=FakeHubTransport(),
+            environ={"HF_TOKEN": "hf_publish_process_token"},
+        )
+
+
+def test_publish_fails_if_immutable_remote_readback_does_not_match(
+    tmp_path: Path,
+) -> None:
+    dataset = _write_validated_dataset(tmp_path)
+    transport = FakeHubTransport()
+    transport.corrupt_download_path = "data/episode.bin"
+
+    with pytest.raises(ValueError, match="remote.*hash"):
+        publish_prepared_dataset(
+            dataset,
+            repository=DEFAULT_DATA_REPO,
+            revision="lehome-groot-n17-v1",
+            transport=transport,
+            environ={"HF_TOKEN": "hf_publish_process_token"},
+        )
+
+    assert transport.download_revisions == [transport.commit]
+
+
+def test_download_verifies_explicit_revision_before_atomically_completing(
+    tmp_path: Path,
+) -> None:
+    source = _write_validated_dataset(tmp_path / "source")
+    transport = FakeHubTransport()
+    published = publish_prepared_dataset(
+        source,
+        repository=DEFAULT_DATA_REPO,
+        revision="lehome-groot-n17-v1",
+        transport=transport,
+        environ={"HF_TOKEN": "hf_publish_process_token"},
+    )
+    destination = tmp_path / "downloaded"
+
+    completed = download_prepared_dataset(
+        destination,
+        repository=DEFAULT_DATA_REPO,
+        revision=published.revision,
+        expected_manifest_sha256=published.dataset_manifest_sha256,
+        transport=transport,
+        environ={"HF_TOKEN": "hf_download_process_token"},
+    )
+
+    assert completed == destination
+    assert sha256_file(destination / "manifest.json") == published.dataset_manifest_sha256
+    assert {
+        path.relative_to(destination).as_posix()
+        for path in destination.rglob("*")
+        if path.is_file()
+    } == set(transport.remote)
+    assert all(revision == published.revision for revision in transport.download_revisions)
+
+
+def test_remote_hash_mismatch_leaves_dataset_incomplete_and_non_trainable(
+    tmp_path: Path,
+) -> None:
+    source = _write_validated_dataset(tmp_path / "source")
+    transport = FakeHubTransport()
+    published = publish_prepared_dataset(
+        source,
+        repository=DEFAULT_DATA_REPO,
+        revision="lehome-groot-n17-v1",
+        transport=transport,
+        environ={"HF_TOKEN": "hf_publish_process_token"},
+    )
+    transport.corrupt_download_path = "data/episode.bin"
+    destination = tmp_path / "downloaded"
+
+    with pytest.raises(ValueError, match="dirty|hash"):
+        download_prepared_dataset(
+            destination,
+            repository=DEFAULT_DATA_REPO,
+            revision=published.revision,
+            expected_manifest_sha256=published.dataset_manifest_sha256,
+            transport=transport,
+            environ={"HF_TOKEN": "hf_download_process_token"},
+        )
+
+    assert not destination.exists()
+    assert not tuple(tmp_path.glob(".downloaded.*.incomplete"))
