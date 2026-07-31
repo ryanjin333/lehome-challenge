@@ -212,6 +212,14 @@ def test_image_contract_files_preserve_runtime_and_secret_boundaries() -> None:
     pyproject = (TRAINER / "pyproject.toml").read_text(encoding="utf-8")
 
     assert "nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04@" + CUDA_BASE_DIGEST in dockerfile
+    assert "ARG UBUNTU_SNAPSHOT=20260701T000000Z" in dockerfile
+    assert (
+        "https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/"
+        in dockerfile
+    )
+    assert "Dir::Etc::sourcelist=/tmp/ubuntu-snapshot.list" in dockerfile
+    assert "Dir::Etc::sourceparts=-" in dockerfile
+    assert "Dir::State::lists=/tmp/apt-lists" in dockerfile
     assert "uv sync --frozen" in dockerfile
     assert "uv export --frozen --no-dev --no-emit-project" in dockerfile
     assert "uv pip check --python /opt/runtime/bin/python" in dockerfile

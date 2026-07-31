@@ -157,10 +157,12 @@ used for a non-release diagnostic build.
 
 The trainer lock is exported into the final GR00T virtual environment, with
 shared exact dependencies aligned to the upstream lock, and `uv pip check`
-rejects an incompatible composite runtime. The CUDA base and language/runtime
-inputs are immutable, but Ubuntu APT packages are not version-pinned to a
-snapshot repository. Consequently, separate builds are not claimed to be
-byte-identical; only the published OCI digest identifies a release candidate.
+rejects an incompatible composite runtime. Ubuntu packages are resolved only
+from Canonical's timestamped `20260701T000000Z` Jammy snapshot. The build gives
+APT a dedicated source list and disables all inherited source-part files, so
+the CUDA base image's floating NVIDIA repository cannot participate in package
+resolution. Separate builds are still not claimed to be byte-identical; only
+the published OCI digest identifies a release candidate.
 
 Every container invocation must mount writable `/cache`, `/prepared`, and
 `/output` directories. The image runs as `trainer`, rejects `hf auth login` and
