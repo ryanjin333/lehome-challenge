@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from lehome_train.constants import DEFAULT_DATA_REPO
 from lehome_train.data.validate import REQUIRED_VALIDATION_ARTIFACTS
@@ -24,6 +24,9 @@ from lehome_train.redaction import generate_upload_allowlist
 
 
 _CONTROL_PATHS = ("manifest.json", "meta/prepared_hashes.json")
+_MINIMUM_STAGING_RESERVE_BYTES = 64 * 1024**2
+_MAXIMUM_STAGING_RESERVE_BYTES = 1024**3
+_STAGING_RESERVE_FRACTION_DENOMINATOR = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,8 +223,18 @@ def _verify_complete_tree(root: Path, relative_paths: tuple[str, ...]) -> None:
         raise ValueError("remote prepared dataset contains an unexpected file set")
 
 
-def _stage_entries(source: Path, entries: tuple[SyncEntry, ...]) -> Path:
-    staging = Path(tempfile.mkdtemp(prefix="lehome-dataset-upload-"))
+def _stage_entries(
+    source: Path,
+    entries: tuple[SyncEntry, ...],
+    *,
+    staging_root: Path,
+) -> Path:
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix="lehome-dataset-upload-",
+            dir=staging_root,
+        )
+    )
     try:
         for entry in entries:
             destination = staging / entry.relative_path
@@ -234,6 +247,22 @@ def _stage_entries(source: Path, entries: tuple[SyncEntry, ...]) -> Path:
         raise
 
 
+def _free_space_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def _required_staging_bytes(entries: tuple[SyncEntry, ...]) -> int:
+    payload_bytes = sum(entry.byte_size for entry in entries)
+    reserve_bytes = min(
+        _MAXIMUM_STAGING_RESERVE_BYTES,
+        max(
+            _MINIMUM_STAGING_RESERVE_BYTES,
+            payload_bytes // _STAGING_RESERVE_FRACTION_DENOMINATOR,
+        ),
+    )
+    return payload_bytes + reserve_bytes
+
+
 def publish_prepared_dataset(
     dataset_path: str | os.PathLike[str],
     *,
@@ -242,8 +271,14 @@ def publish_prepared_dataset(
     transport: HubTransport,
     environ: Mapping[str, str] | None = None,
     max_attempts: int = 3,
+    staging_root: str | os.PathLike[str] | None = None,
+    free_space_probe: Callable[[Path], int] = _free_space_bytes,
 ) -> PublishedDataset:
-    """Publish one validated allowlist and verify it from the resolved commit."""
+    """Publish a verified snapshot staged beside the dataset by default.
+
+    ``staging_root`` can select another large filesystem. The existing directory
+    must have room for every allowlisted byte plus a bounded safety reserve.
+    """
 
     if repository != DEFAULT_DATA_REPO:
         raise ValueError(f"prepared datasets may only be published to {DEFAULT_DATA_REPO}")
@@ -256,15 +291,35 @@ def publish_prepared_dataset(
         for entry in entries
         if entry.relative_path == "manifest.json"
     )
-    staging = _stage_entries(dataset, entries)
-    try:
-        require_access(
-            transport=transport,
-            repository=repository,
-            read=True,
-            write=True,
-            environ=environ,
+    require_access(
+        transport=transport,
+        repository=repository,
+        read=True,
+        write=True,
+        environ=environ,
+    )
+    resolved_staging_root = (
+        dataset.parent
+        if staging_root is None
+        else Path(staging_root)
+    )
+    if not resolved_staging_root.is_dir() or resolved_staging_root.is_symlink():
+        raise ValueError("dataset staging root must be an existing regular directory")
+    available_bytes = free_space_probe(resolved_staging_root)
+    if type(available_bytes) is not int or available_bytes < 0:
+        raise ValueError("dataset staging free-space probe returned an invalid value")
+    required_bytes = _required_staging_bytes(entries)
+    if available_bytes < required_bytes:
+        raise ValueError(
+            "dataset staging filesystem has insufficient space "
+            f"(requires {required_bytes} bytes, has {available_bytes} bytes)"
         )
+    staging = _stage_entries(
+        dataset,
+        entries,
+        staging_root=resolved_staging_root,
+    )
+    try:
         immutable_revision = upload_files(
             transport=transport,
             repository=repository,

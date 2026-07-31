@@ -197,6 +197,82 @@ def test_publish_contract_includes_every_validator_required_artifact(
     assert set(REQUIRED_VALIDATION_ARTIFACTS) <= published_paths
 
 
+def test_publish_checks_permission_before_creating_a_staging_tree(
+    tmp_path: Path,
+) -> None:
+    dataset = _write_validated_dataset(tmp_path)
+    transport = FakeHubTransport()
+    transport.access = HubAccess(can_read=True, can_write=False)
+    staging_root = tmp_path / "must-not-be-created"
+
+    with pytest.raises(PermissionError, match="write"):
+        publish_prepared_dataset(
+            dataset,
+            repository=DEFAULT_DATA_REPO,
+            revision="lehome-groot-n17-v1",
+            transport=transport,
+            environ={"HF_TOKEN": "hf_publish_process_token"},
+            staging_root=staging_root,
+        )
+
+    assert not staging_root.exists()
+    assert transport.upload_sources == []
+
+
+def test_publish_uses_the_caller_selected_staging_root(tmp_path: Path) -> None:
+    dataset = _write_validated_dataset(tmp_path / "source")
+    staging_root = tmp_path / "large-volume"
+    staging_root.mkdir()
+    transport = FakeHubTransport()
+
+    publish_prepared_dataset(
+        dataset,
+        repository=DEFAULT_DATA_REPO,
+        revision="lehome-groot-n17-v1",
+        transport=transport,
+        environ={"HF_TOKEN": "hf_publish_process_token"},
+        staging_root=staging_root,
+    )
+
+    assert transport.upload_sources[0].parent == staging_root
+    assert not tuple(staging_root.iterdir())
+
+
+def test_publish_refuses_staging_filesystem_with_insufficient_free_space(
+    tmp_path: Path,
+) -> None:
+    dataset = _write_validated_dataset(tmp_path / "source")
+    staging_root = tmp_path / "small-volume"
+    staging_root.mkdir()
+    observed_roots: list[Path] = []
+    transport = FakeHubTransport()
+    payload_bytes = sum(
+        path.stat().st_size
+        for path in dataset.rglob("*")
+        if path.is_file()
+    )
+    required_bytes = payload_bytes + (64 * 1024**2)
+
+    with pytest.raises(ValueError, match="staging.*space") as error:
+        publish_prepared_dataset(
+            dataset,
+            repository=DEFAULT_DATA_REPO,
+            revision="lehome-groot-n17-v1",
+            transport=transport,
+            environ={"HF_TOKEN": "hf_publish_process_token"},
+            staging_root=staging_root,
+            free_space_probe=lambda path: (
+                observed_roots.append(path)
+                or required_bytes - 1
+            ),
+        )
+
+    assert f"requires {required_bytes} bytes" in str(error.value)
+    assert observed_roots == [staging_root]
+    assert not tuple(staging_root.iterdir())
+    assert transport.upload_sources == []
+
+
 def test_publish_refuses_dirty_hashed_payloads(tmp_path: Path) -> None:
     dataset = _write_validated_dataset(tmp_path)
     (dataset / "data" / "episode.bin").write_bytes(b"changed after validation")
@@ -283,6 +359,7 @@ def test_publish_uploads_a_stable_snapshot_if_original_changes_after_validation(
     )
 
     assert transport.upload_sources != [dataset]
+    assert transport.upload_sources[0].parent == dataset.parent
     assert transport.remote["data/episode.bin"] == b"immutable episode"
     assert sha256_file(dataset / "manifest.json") != original_manifest_sha256
     assert published.dataset_manifest_sha256 == original_manifest_sha256
