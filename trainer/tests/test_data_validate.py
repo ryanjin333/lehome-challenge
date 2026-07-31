@@ -145,3 +145,14 @@ def test_validation_rejects_comments_that_only_spoof_modality_substrings(
 
     with pytest.raises(ValueError, match="canonical"):
         validate_prepared_dataset(dataset)
+
+
+def test_validation_requires_all_three_checked_camera_mappings(tmp_path: Path) -> None:
+    dataset = _prepared_dataset(tmp_path)
+    metadata_path = dataset / "meta" / "modality.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["video"].pop("top_rgb")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="video"):
+        validate_prepared_dataset(dataset)

@@ -143,6 +143,26 @@ def _manifest_modality_sha256(manifest: Mapping[str, Any]) -> str:
 
 def _validate_modality_metadata(dataset: Path) -> None:
     metadata = read_json_object(dataset / "meta" / "modality.json")
+    expected_video = {"top_rgb", "left_rgb", "right_rgb"}
+    video = metadata.get("video")
+    if not isinstance(video, Mapping) or set(video) != expected_video:
+        raise ValueError("prepared modality metadata has invalid video mappings")
+    for key in sorted(expected_video):
+        value = video[key]
+        if not isinstance(value, Mapping) or value.get("original_key") != (
+            f"observation.images.{key}"
+        ):
+            raise ValueError("prepared modality metadata has invalid video source key")
+
+    annotation = metadata.get("annotation")
+    if not isinstance(annotation, Mapping) or set(annotation) != {
+        "human.task_description"
+    }:
+        raise ValueError("prepared modality metadata has invalid annotation mappings")
+    language = annotation["human.task_description"]
+    if not isinstance(language, Mapping) or language.get("original_key") != "task_index":
+        raise ValueError("prepared modality metadata has invalid annotation source key")
+
     expected_groups = {
         "left_arm": (0, 5),
         "left_gripper": (5, 6),
