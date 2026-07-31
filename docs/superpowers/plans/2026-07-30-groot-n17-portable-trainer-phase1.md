@@ -492,8 +492,7 @@ Create separate reviewed plans before implementing:
 1. Phase 2: GR00T-to-LeHome Isaac rollout adapter, simulator expert replay,
    fixed seen-development evaluation, checkpoint promotion, and one-time
    public-unseen audit.
-2. Phase 3: optional relative end-effector conversion/replay/pilot.
-3. Phase 4: model-independent success replay and targeted DAgger flywheel.
+2. Phase 3: model-independent success replay and targeted DAgger flywheel.
 
 Do not start these phases, DAgger, public-unseen training, or full-backbone
 fine-tuning as part of this plan.

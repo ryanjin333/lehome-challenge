@@ -69,7 +69,6 @@ This project includes:
   LeHome/Isaac Sim environment.
 - A simple model-independent data flywheel for later successful rollouts and
   corrected hard states.
-- A gated experimental relative end-effector representation.
 
 This project does not include:
 
@@ -82,6 +81,8 @@ This project does not include:
   hard-state mining in the first implementation.
 - Training on public-unseen evaluation garments.
 - Treating failed policy actions as behavior-cloning targets.
+- An end-effector action representation or an IK-based action adapter. The only
+  action path is relative arm-joint targets with absolute grippers.
 
 ## System Boundaries
 
@@ -277,33 +278,6 @@ and hash checks. Only `publish` needs write credentials, and it publishes
 exactly the validated manifest allowlist. The immutable dataset revision and
 manifest hash then become inputs to rental-machine `prepare`; conversion is not
 repeated on training rentals.
-
-## Optional Relative End-Effector Experiment
-
-Relative end-effector control is an experimental adapter, not the default
-training path. It is allowed to progress only after all of these checks pass:
-
-1. Convert expert joint trajectories to end-effector poses with forward
-   kinematics.
-2. Express consecutive poses as relative Cartesian and rotational deltas in one
-   documented coordinate frame.
-3. Convert those deltas back to joint targets through the same inverse
-   kinematics path that rollout will use.
-4. Replay a fixed canary set of 12 expert episodes, three from each garment
-   category. Across that set, require zero IK failures, zero joint-limit
-   violations, Cartesian reconstruction p95 at or below 5 mm, rotation
-   reconstruction p95 at or below 3 degrees, and joint-target reconstruction
-   p95 at or below 2 degrees. Each replay must retain at least 95% of the
-   expert's geometric score improvement from the identical initial state.
-5. Pass a one-episode memorization test and a short equal-sample pilot against
-   the relative-joint baseline.
-
-The first implementation does not full-train both representations. If the
-end-effector path passes replay validation, it receives at most a short
-successive-halving pilot at 2,000, 5,000, and 10,000 steps. It replaces the
-primary path only if it gains at least two successes on the 24-trial
-`seen-development` matrix and no garment category loses more than one success
-relative to the equal-sample relative-joint pilot.
 
 ## Training Workflow
 
