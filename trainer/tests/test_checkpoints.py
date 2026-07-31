@@ -23,6 +23,7 @@ from lehome_train.models import ArtifactIdentity, CheckpointRecord
 SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64
+SHA_D = "d" * 64
 
 
 def _checkpoint(
@@ -31,6 +32,8 @@ def _checkpoint(
     batch: int = 64,
     remotely_verified: bool = False,
     normalization_sha256: str = SHA_C,
+    schedule_sha256: str = SHA_D,
+    locally_verified: bool = True,
 ) -> CheckpointDescriptor:
     return CheckpointDescriptor(
         record=CheckpointRecord(
@@ -39,6 +42,7 @@ def _checkpoint(
             sample_presentations=step * batch,
             experiment_config_sha256=SHA_A,
             dataset_manifest_sha256=SHA_B,
+            schedule_sha256=schedule_sha256,
             artifact=ArtifactIdentity(
                 relative_path=f"checkpoints/step-{step}.tar.zst",
                 sha256=f"{step:064x}",
@@ -48,6 +52,8 @@ def _checkpoint(
             remotely_verified=remotely_verified,
         ),
         normalization_sha256=normalization_sha256,
+        schedule_sha256=schedule_sha256,
+        locally_verified=locally_verified,
     )
 
 
@@ -65,6 +71,7 @@ def test_checkpoint_descriptor_round_trips_and_is_resumable(tmp_path: Path) -> N
         experiment_config_sha256=SHA_A,
         dataset_manifest_sha256=SHA_B,
         normalization_sha256=SHA_C,
+        schedule_sha256=SHA_D,
         physical_batch_size=64,
         maximum_optimizer_step=12_000,
         checkpoint_interval_steps=1_000,
@@ -90,6 +97,16 @@ def test_checkpoint_descriptor_loader_rejects_type_drift_and_duplicate_fields(
     with pytest.raises(ValueError, match="malformed"):
         load_checkpoint_descriptor(manifest)
 
+    old = _checkpoint(1_000).to_dict()
+    old["schema_version"] = 1
+    old.pop("schedule_sha256")
+    old.pop("locally_verified")
+    assert isinstance(old["record"], dict)
+    old["record"].pop("schedule_sha256")
+    manifest.write_text(json.dumps(old), encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed|unsupported schema"):
+        load_checkpoint_descriptor(manifest)
+
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
@@ -97,6 +114,7 @@ def test_checkpoint_descriptor_loader_rejects_type_drift_and_duplicate_fields(
         ("dataset_manifest_sha256", SHA_C, "dataset manifest"),
         ("experiment_config_sha256", SHA_C, "experiment config"),
         ("normalization_sha256", SHA_B, "normalization"),
+        ("schedule_sha256", SHA_C, "schedule"),
     ],
 )
 def test_resume_rejects_incompatible_checkpoint_identity(
@@ -110,6 +128,7 @@ def test_resume_rejects_incompatible_checkpoint_identity(
         "experiment_config_sha256": SHA_A,
         "dataset_manifest_sha256": SHA_B,
         "normalization_sha256": SHA_C,
+        "schedule_sha256": SHA_D,
         "physical_batch_size": 64,
         "maximum_optimizer_step": 12_000,
         "checkpoint_interval_steps": 1_000,
@@ -140,6 +159,7 @@ def test_resume_requires_verified_resumable_boundary_checkpoint() -> None:
                 experiment_config_sha256=SHA_A,
                 dataset_manifest_sha256=SHA_B,
                 normalization_sha256=SHA_C,
+                schedule_sha256=SHA_D,
                 physical_batch_size=64,
                 maximum_optimizer_step=12_000,
                 checkpoint_interval_steps=1_000,
@@ -153,6 +173,16 @@ def test_pruning_preserves_latest_verified_resumable_checkpoint() -> None:
 
     assert prunable_checkpoints((first, protected, newest_unverified), keep_newest=1) == (
         first,
+    )
+
+    local_unverified = _checkpoint(
+        4_000,
+        remotely_verified=True,
+        locally_verified=False,
+    )
+    assert local_unverified not in prunable_checkpoints(
+        (first, protected, newest_unverified, local_unverified),
+        keep_newest=1,
     )
 
 

@@ -20,6 +20,7 @@ from lehome_train.models import (
     ExperimentConfig,
     SmokeResult,
 )
+from lehome_train.schedule import ExposureSchedule
 
 
 SHA_B = "b" * 64
@@ -70,10 +71,16 @@ def _receipt(
     *,
     finite: bool = True,
     schedule_sha256: str | None = None,
+    input_checkpoint_sha256: str | None | object = ...,
 ) -> TrainingChunkReceipt:
     return TrainingChunkReceipt(
         schedule_sha256=(
             request.schedule_sha256 if schedule_sha256 is None else schedule_sha256
+        ),
+        input_checkpoint_sha256=(
+            request.input_checkpoint_sha256
+            if input_checkpoint_sha256 is ...
+            else input_checkpoint_sha256
         ),
         start_optimizer_step=request.start_optimizer_step,
         end_optimizer_step=request.end_optimizer_step,
@@ -88,7 +95,12 @@ def _receipt(
 def _checkpointer(config: ExperimentConfig, *, byte_size: int = GIBIBYTE):
     config_sha = canonical_json_sha256(config)
 
-    def checkpoint(*, optimizer_step: int, sample_presentations: int) -> CheckpointDescriptor:
+    def checkpoint(
+        *,
+        optimizer_step: int,
+        sample_presentations: int,
+        schedule_sha256: str,
+    ) -> CheckpointDescriptor:
         return CheckpointDescriptor(
             record=CheckpointRecord(
                 experiment_id="experiment-001",
@@ -96,6 +108,7 @@ def _checkpointer(config: ExperimentConfig, *, byte_size: int = GIBIBYTE):
                 sample_presentations=sample_presentations,
                 experiment_config_sha256=config_sha,
                 dataset_manifest_sha256=SHA_B,
+                schedule_sha256=schedule_sha256,
                 artifact=ArtifactIdentity(
                     relative_path=f"checkpoints/step-{optimizer_step}.tar.zst",
                     sha256=f"{optimizer_step:064x}",
@@ -105,6 +118,8 @@ def _checkpointer(config: ExperimentConfig, *, byte_size: int = GIBIBYTE):
                 remotely_verified=False,
             ),
             normalization_sha256=SHA_C,
+            schedule_sha256=schedule_sha256,
+            locally_verified=True,
         )
 
     return checkpoint
@@ -122,7 +137,8 @@ def test_training_requires_selected_compatible_smoke_result() -> None:
             checkpointer=_checkpointer(config),
             uploader=lambda _checkpoint: True,
             disk_probe=lambda: 100 * GIBIBYTE,
-            complete_checkpoint_bytes=GIBIBYTE,
+            estimated_checkpoint_bytes=GIBIBYTE,
+            checkpoint_deleter=lambda _checkpoint: None,
         )
 
     with pytest.raises(ValueError, match="selected physical batch"):
@@ -134,7 +150,8 @@ def test_training_requires_selected_compatible_smoke_result() -> None:
             checkpointer=_checkpointer(config),
             uploader=lambda _checkpoint: True,
             disk_probe=lambda: 100 * GIBIBYTE,
-            complete_checkpoint_bytes=GIBIBYTE,
+            estimated_checkpoint_bytes=GIBIBYTE,
+            checkpoint_deleter=lambda _checkpoint: None,
         )
 
     low_headroom = replace(
@@ -150,7 +167,8 @@ def test_training_requires_selected_compatible_smoke_result() -> None:
             checkpointer=_checkpointer(config),
             uploader=lambda _checkpoint: True,
             disk_probe=lambda: 100 * GIBIBYTE,
-            complete_checkpoint_bytes=GIBIBYTE,
+            estimated_checkpoint_bytes=GIBIBYTE,
+            checkpoint_deleter=lambda _checkpoint: None,
         )
 
 
@@ -170,7 +188,8 @@ def test_training_runs_exact_exposure_and_twelve_checkpoint_boundaries() -> None
         checkpointer=_checkpointer(config),
         uploader=lambda _checkpoint: True,
         disk_probe=lambda: 100 * GIBIBYTE,
-        complete_checkpoint_bytes=GIBIBYTE,
+        estimated_checkpoint_bytes=GIBIBYTE,
+        checkpoint_deleter=lambda _checkpoint: None,
     )
 
     assert result.status == "completed"
@@ -178,6 +197,8 @@ def test_training_runs_exact_exposure_and_twelve_checkpoint_boundaries() -> None
     assert result.sample_presentations == 768_000
     assert len(calls) == len(result.checkpoints) == 12
     assert all(checkpoint.record.remotely_verified for checkpoint in result.checkpoints)
+    assert result.disposable is True
+    assert result.unverified_checkpoint_optimizer_steps == ()
     first = calls[0]
     assert first.start_optimizer_step == 0
     assert first.end_optimizer_step == 1_000
@@ -194,6 +215,10 @@ def test_training_runs_exact_exposure_and_twelve_checkpoint_boundaries() -> None
         first.peak_learning_rate * first.end_learning_rate_multiplier
     )
     assert len({request.schedule_sha256 for request in calls}) == 1
+    assert calls[0].input_checkpoint is None
+    for previous, request in zip(result.checkpoints, calls[1:]):
+        assert request.input_checkpoint.record.optimizer_step == previous.record.optimizer_step
+        assert request.input_checkpoint_sha256 == previous.record.artifact.sha256
 
 
 def test_training_aborts_immediately_on_non_finite_loss() -> None:
@@ -211,7 +236,8 @@ def test_training_aborts_immediately_on_non_finite_loss() -> None:
             ),
             uploader=lambda _checkpoint: True,
             disk_probe=lambda: 100 * GIBIBYTE,
-            complete_checkpoint_bytes=GIBIBYTE,
+            estimated_checkpoint_bytes=GIBIBYTE,
+            checkpoint_deleter=lambda _checkpoint: None,
         )
 
     assert checkpoint_calls == []
@@ -220,9 +246,17 @@ def test_training_aborts_immediately_on_non_finite_loss() -> None:
 def test_training_resumes_only_after_verified_compatible_checkpoint() -> None:
     config = _config()
     resume = replace(
-        _checkpointer(config)(optimizer_step=2_000, sample_presentations=128_000),
+        _checkpointer(config)(
+            optimizer_step=2_000,
+            sample_presentations=128_000,
+            schedule_sha256=ExposureSchedule(physical_batch_size=64).sha256,
+        ),
         record=replace(
-            _checkpointer(config)(optimizer_step=2_000, sample_presentations=128_000).record,
+            _checkpointer(config)(
+                optimizer_step=2_000,
+                sample_presentations=128_000,
+                schedule_sha256=ExposureSchedule(physical_batch_size=64).sha256,
+            ).record,
             remotely_verified=True,
         ),
     )
@@ -237,7 +271,8 @@ def test_training_resumes_only_after_verified_compatible_checkpoint() -> None:
         checkpointer=_checkpointer(config),
         uploader=lambda _checkpoint: True,
         disk_probe=lambda: 100 * GIBIBYTE,
-        complete_checkpoint_bytes=GIBIBYTE,
+        estimated_checkpoint_bytes=GIBIBYTE,
+        checkpoint_deleter=lambda _checkpoint: None,
     )
 
     first = requests[0]
@@ -248,7 +283,8 @@ def test_training_resumes_only_after_verified_compatible_checkpoint() -> None:
     assert first.start_learning_rate == pytest.approx(
         first.peak_learning_rate * first.start_learning_rate_multiplier
     )
-    assert first.resume_checkpoint == resume
+    assert first.input_checkpoint == resume
+    assert first.input_checkpoint_sha256 == resume.record.artifact.sha256
     assert result.final_optimizer_step == 12_000
     assert len(result.checkpoints) == 11
 
@@ -265,11 +301,37 @@ def test_training_rejects_runner_receipt_with_mismatched_schedule_identity() -> 
             checkpointer=_checkpointer(config),
             uploader=lambda _checkpoint: True,
             disk_probe=lambda: 100 * GIBIBYTE,
-            complete_checkpoint_bytes=GIBIBYTE,
+            estimated_checkpoint_bytes=GIBIBYTE,
+            checkpoint_deleter=lambda _checkpoint: None,
         )
 
 
-def test_failed_upload_pauses_before_boundary_when_disk_reserve_is_insufficient() -> None:
+def test_training_rejects_runner_receipt_with_mismatched_chunk_input() -> None:
+    config = _config()
+    calls = 0
+
+    def runner(request: TrainingChunkRequest) -> TrainingChunkReceipt:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _receipt(request)
+        return _receipt(request, input_checkpoint_sha256="f" * 64)
+
+    with pytest.raises(ValueError, match="input checkpoint identity"):
+        run_fixed_exposure_training(
+            experiment_config=config,
+            selected_smoke=_smoke(config),
+            normalization_sha256=SHA_C,
+            runner=runner,
+            checkpointer=_checkpointer(config),
+            uploader=lambda _checkpoint: True,
+            disk_probe=lambda: 100 * GIBIBYTE,
+            estimated_checkpoint_bytes=GIBIBYTE,
+            checkpoint_deleter=lambda _checkpoint: None,
+        )
+
+
+def test_first_boundary_pauses_before_training_when_disk_reserve_is_insufficient() -> None:
     config = _config()
     runner_calls: list[int] = []
 
@@ -286,13 +348,14 @@ def test_failed_upload_pauses_before_boundary_when_disk_reserve_is_insufficient(
         checkpointer=_checkpointer(config),
         uploader=lambda _checkpoint: False,
         disk_probe=lambda: 22 * GIBIBYTE - 1,
-        complete_checkpoint_bytes=GIBIBYTE,
+        estimated_checkpoint_bytes=GIBIBYTE,
+        checkpoint_deleter=lambda _checkpoint: None,
         upload_sleeper=lambda _delay: None,
     )
 
     assert result.status == "paused_disk_reserve"
-    assert runner_calls == [1_000]
-    assert result.failed_upload_optimizer_steps == (1_000,)
+    assert runner_calls == []
+    assert result.failed_upload_optimizer_steps == ()
 
 
 def test_disk_reserve_uses_largest_observed_complete_checkpoint() -> None:
@@ -312,12 +375,74 @@ def test_disk_reserve_uses_largest_observed_complete_checkpoint() -> None:
         checkpointer=_checkpointer(config, byte_size=5 * GIBIBYTE),
         uploader=lambda _checkpoint: False,
         disk_probe=lambda: 25 * GIBIBYTE,
-        complete_checkpoint_bytes=GIBIBYTE,
+        estimated_checkpoint_bytes=GIBIBYTE,
+        checkpoint_deleter=lambda _checkpoint: None,
         upload_sleeper=lambda _delay: None,
     )
 
     assert result.status == "paused_disk_reserve"
     assert runner_calls == [1_000]
+
+
+def test_terminal_upload_failure_is_not_completed_or_disposable() -> None:
+    config = _config()
+    deleted: list[CheckpointDescriptor] = []
+
+    result = run_fixed_exposure_training(
+        experiment_config=config,
+        selected_smoke=_smoke(config),
+        normalization_sha256=SHA_C,
+        runner=lambda request: _receipt(request),
+        checkpointer=_checkpointer(config),
+        uploader=lambda _checkpoint: False,
+        disk_probe=lambda: 100 * GIBIBYTE,
+        estimated_checkpoint_bytes=GIBIBYTE,
+        checkpoint_deleter=deleted.append,
+        upload_sleeper=lambda _delay: None,
+    )
+
+    assert result.final_optimizer_step == 12_000
+    assert result.status == "upload_failed"
+    assert result.disposable is False
+    assert result.unverified_checkpoint_optimizer_steps == tuple(
+        range(1_000, 12_001, 1_000)
+    )
+    assert deleted == []
+
+
+def test_pruning_deletes_only_superseded_locally_and_remotely_verified_artifacts() -> None:
+    config = _config()
+    deleted: list[CheckpointDescriptor] = []
+
+    def runner(request: TrainingChunkRequest) -> TrainingChunkReceipt:
+        sleep(0.01)
+        return _receipt(request)
+
+    result = run_fixed_exposure_training(
+        experiment_config=config,
+        selected_smoke=_smoke(config),
+        normalization_sha256=SHA_C,
+        runner=runner,
+        checkpointer=_checkpointer(config),
+        uploader=lambda _checkpoint: True,
+        disk_probe=lambda: 100 * GIBIBYTE,
+        estimated_checkpoint_bytes=GIBIBYTE,
+        checkpoint_deleter=deleted.append,
+        upload_sleeper=lambda _delay: None,
+    )
+
+    latest = result.checkpoints[-1]
+    assert deleted
+    assert latest not in deleted
+    assert all(item.locally_verified for item in deleted)
+    assert all(item.record.remotely_verified for item in deleted)
+    assert all(item.record.optimizer_step < latest.record.optimizer_step for item in deleted)
+    deleted_steps = {item.record.optimizer_step for item in deleted}
+    assert all(
+        not item.locally_verified
+        for item in result.checkpoints
+        if item.record.optimizer_step in deleted_steps
+    )
 
 
 def test_training_records_optional_provider_metadata_without_rental_actions(tmp_path: Path) -> None:
@@ -332,7 +457,8 @@ def test_training_records_optional_provider_metadata_without_rental_actions(tmp_
         checkpointer=_checkpointer(config),
         uploader=lambda _checkpoint: True,
         disk_probe=lambda: 100 * GIBIBYTE,
-        complete_checkpoint_bytes=GIBIBYTE,
+        estimated_checkpoint_bytes=GIBIBYTE,
+        checkpoint_deleter=lambda _checkpoint: None,
         provider_hourly_price=1.75,
         instance_start_time="2026-07-31T12:00:00Z",
         status_path=status_path,

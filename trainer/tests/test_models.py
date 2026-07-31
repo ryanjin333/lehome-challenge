@@ -155,6 +155,7 @@ def test_all_artifact_contracts_have_typed_identity_and_provenance() -> None:
         sample_presentations=16_000,
         experiment_config_sha256=SHA_A,
         dataset_manifest_sha256=SHA_B,
+        schedule_sha256=SHA_A,
         artifact=artifact,
         resumable=True,
         remotely_verified=False,
@@ -203,6 +204,7 @@ def test_all_artifact_contracts_have_typed_identity_and_provenance() -> None:
 
     assert config.action_horizon == 16
     assert checkpoint.artifact.sha256 == SHA_A
+    assert checkpoint.schedule_sha256 == SHA_A
     assert provenance.source_artifacts[0].sha256 == SHA_B
     assert smoke.dataset_manifest_sha256 == SHA_B
     assert smoke.failure_reason is None

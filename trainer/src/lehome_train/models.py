@@ -358,6 +358,7 @@ class CheckpointRecord(StrictModel):
     sample_presentations: int
     experiment_config_sha256: str
     dataset_manifest_sha256: str
+    schedule_sha256: str
     artifact: ArtifactIdentity
     resumable: bool
     remotely_verified: bool
@@ -369,6 +370,7 @@ class CheckpointRecord(StrictModel):
         _require_nonnegative(self.sample_presentations, "sample_presentations")
         _require_sha256(self.experiment_config_sha256, "experiment_config_sha256")
         _require_sha256(self.dataset_manifest_sha256, "dataset_manifest_sha256")
+        _require_sha256(self.schedule_sha256, "schedule_sha256")
 
 
 @dataclass(frozen=True, slots=True)

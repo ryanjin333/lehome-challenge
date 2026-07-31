@@ -20,7 +20,7 @@ MAX_UPLOAD_ATTEMPTS = 5
 _INITIAL_RETRY_DELAY_SECONDS = 0.25
 _MAX_RETRY_DELAY_SECONDS = 1.0
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_CHECKPOINT_SCHEMA_VERSION = 1
+_CHECKPOINT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +29,8 @@ class CheckpointDescriptor:
 
     record: CheckpointRecord
     normalization_sha256: str
+    schedule_sha256: str
+    locally_verified: bool
 
     def __post_init__(self) -> None:
         if not isinstance(self.record, CheckpointRecord):
@@ -38,11 +40,21 @@ class CheckpointDescriptor:
             or not _SHA256.fullmatch(self.normalization_sha256)
         ):
             raise ValueError("normalization SHA-256 is invalid")
+        if type(self.schedule_sha256) is not str or not _SHA256.fullmatch(
+            self.schedule_sha256
+        ):
+            raise ValueError("schedule SHA-256 is invalid")
+        if self.record.schedule_sha256 != self.schedule_sha256:
+            raise ValueError("checkpoint record and descriptor schedule identities differ")
+        if type(self.locally_verified) is not bool:
+            raise ValueError("locally verified flag must be boolean")
 
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": _CHECKPOINT_SCHEMA_VERSION,
             "normalization_sha256": self.normalization_sha256,
+            "schedule_sha256": self.schedule_sha256,
+            "locally_verified": self.locally_verified,
             "record": self.record.to_dict(),
         }
 
@@ -79,6 +91,8 @@ def load_checkpoint_descriptor(source: str | Path) -> CheckpointDescriptor:
     if not isinstance(decoded, dict) or set(decoded) != {
         "schema_version",
         "normalization_sha256",
+        "schedule_sha256",
+        "locally_verified",
         "record",
     }:
         raise ValueError("checkpoint descriptor is malformed")
@@ -89,6 +103,8 @@ def load_checkpoint_descriptor(source: str | Path) -> CheckpointDescriptor:
     return CheckpointDescriptor(
         record=model_from_mapping(CheckpointRecord, decoded["record"]),
         normalization_sha256=decoded["normalization_sha256"],
+        schedule_sha256=decoded["schedule_sha256"],
+        locally_verified=decoded["locally_verified"],
     )
 
 
@@ -99,6 +115,7 @@ def validate_checkpoint_identity(
     experiment_config_sha256: str,
     dataset_manifest_sha256: str,
     normalization_sha256: str,
+    schedule_sha256: str,
     physical_batch_size: int,
     maximum_optimizer_step: int,
     checkpoint_interval_steps: int,
@@ -117,6 +134,8 @@ def validate_checkpoint_identity(
         raise ValueError("checkpoint dataset manifest identity is incompatible")
     if checkpoint.normalization_sha256 != normalization_sha256:
         raise ValueError("checkpoint normalization identity is incompatible")
+    if checkpoint.schedule_sha256 != schedule_sha256:
+        raise ValueError("checkpoint schedule identity is incompatible")
     if type(physical_batch_size) is not int or physical_batch_size <= 0:
         raise ValueError("physical batch size must be a positive integer")
     if type(maximum_optimizer_step) is not int or maximum_optimizer_step <= 0:
@@ -125,6 +144,8 @@ def validate_checkpoint_identity(
         raise ValueError("checkpoint interval must be a positive integer")
     if not record.resumable:
         raise ValueError("checkpoint is not resumable")
+    if not checkpoint.locally_verified:
+        raise ValueError("checkpoint is not locally verified")
     if require_remote_verification and not record.remotely_verified:
         raise ValueError("checkpoint is not remotely verified")
     if record.optimizer_step > maximum_optimizer_step:
@@ -143,6 +164,7 @@ def require_compatible_checkpoint(
     experiment_config_sha256: str,
     dataset_manifest_sha256: str,
     normalization_sha256: str,
+    schedule_sha256: str,
     physical_batch_size: int,
     maximum_optimizer_step: int,
     checkpoint_interval_steps: int,
@@ -155,6 +177,7 @@ def require_compatible_checkpoint(
         experiment_config_sha256=experiment_config_sha256,
         dataset_manifest_sha256=dataset_manifest_sha256,
         normalization_sha256=normalization_sha256,
+        schedule_sha256=schedule_sha256,
         physical_batch_size=physical_batch_size,
         maximum_optimizer_step=maximum_optimizer_step,
         checkpoint_interval_steps=checkpoint_interval_steps,
@@ -192,7 +215,13 @@ def prunable_checkpoints(
     verified = latest_verified_resumable(ordered)
     if verified is not None:
         protected.add(verified)
-    return tuple(item for item in ordered if item not in protected)
+    return tuple(
+        item
+        for item in ordered
+        if item not in protected
+        and item.locally_verified
+        and item.record.remotely_verified
+    )
 
 
 def can_continue_without_upload(
@@ -207,6 +236,21 @@ def can_continue_without_upload(
         raise ValueError("complete checkpoint bytes must be a positive integer")
     return writable_free_bytes >= (
         2 * complete_checkpoint_bytes + MINIMUM_UNALLOCATED_DISK_BYTES
+    )
+
+
+def can_begin_checkpoint_chunk(
+    writable_free_bytes: int,
+    estimated_checkpoint_bytes: int,
+) -> bool:
+    """Reserve the imminent checkpoint, two more complete copies, and 20 GiB."""
+
+    if type(writable_free_bytes) is not int or writable_free_bytes < 0:
+        raise ValueError("writable free bytes must be a nonnegative integer")
+    if type(estimated_checkpoint_bytes) is not int or estimated_checkpoint_bytes <= 0:
+        raise ValueError("estimated checkpoint bytes must be a positive integer")
+    return writable_free_bytes >= (
+        3 * estimated_checkpoint_bytes + MINIMUM_UNALLOCATED_DISK_BYTES
     )
 
 

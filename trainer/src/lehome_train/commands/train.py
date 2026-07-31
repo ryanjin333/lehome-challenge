@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 import re
@@ -12,7 +12,8 @@ from lehome_train.batch_select import has_required_headroom
 from lehome_train.checkpoints import (
     AsyncCheckpointUploads,
     CheckpointDescriptor,
-    can_continue_without_upload,
+    can_begin_checkpoint_chunk,
+    prunable_checkpoints,
     require_compatible_checkpoint,
     validate_checkpoint_identity,
 )
@@ -51,7 +52,8 @@ class TrainingChunkRequest:
     end_learning_rate_multiplier: float
     start_learning_rate: float
     end_learning_rate: float
-    resume_checkpoint: CheckpointDescriptor | None
+    input_checkpoint: CheckpointDescriptor | None
+    input_checkpoint_sha256: str | None
 
     def __post_init__(self) -> None:
         if not _SHA256.fullmatch(self.schedule_sha256):
@@ -107,11 +109,21 @@ class TrainingChunkRequest:
             raise ValueError("start learning-rate multiplier is invalid")
         if not 0 <= self.end_learning_rate_multiplier <= 1:
             raise ValueError("end learning-rate multiplier is invalid")
-        if self.resume_checkpoint is not None and not isinstance(
-            self.resume_checkpoint,
+        if self.input_checkpoint is not None and not isinstance(
+            self.input_checkpoint,
             CheckpointDescriptor,
         ):
-            raise TypeError("resume checkpoint must be a CheckpointDescriptor")
+            raise TypeError("input checkpoint must be a CheckpointDescriptor")
+        if self.input_checkpoint is None:
+            if self.input_checkpoint_sha256 is not None:
+                raise ValueError("fresh chunk cannot name an input checkpoint")
+        else:
+            if not self.input_checkpoint.locally_verified:
+                raise ValueError("input checkpoint must be locally verified")
+            if self.input_checkpoint.schedule_sha256 != self.schedule_sha256:
+                raise ValueError("input checkpoint schedule identity is incompatible")
+            if self.input_checkpoint_sha256 != self.input_checkpoint.record.artifact.sha256:
+                raise ValueError("input checkpoint SHA-256 is incompatible")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +131,7 @@ class TrainingChunkReceipt:
     """Progress evidence returned by an injected persistent trainer."""
 
     schedule_sha256: str
+    input_checkpoint_sha256: str | None
     start_optimizer_step: int
     end_optimizer_step: int
     sample_presentations: int
@@ -128,6 +141,11 @@ class TrainingChunkReceipt:
     def __post_init__(self) -> None:
         if not _SHA256.fullmatch(self.schedule_sha256):
             raise ValueError("training receipt schedule SHA-256 is invalid")
+        if self.input_checkpoint_sha256 is not None and (
+            type(self.input_checkpoint_sha256) is not str
+            or not _SHA256.fullmatch(self.input_checkpoint_sha256)
+        ):
+            raise ValueError("training receipt input checkpoint SHA-256 is invalid")
         if type(self.start_optimizer_step) is not int or self.start_optimizer_step < 0:
             raise ValueError("training chunk start step must be nonnegative")
         if (
@@ -153,6 +171,7 @@ class Checkpointer(Protocol):
         *,
         optimizer_step: int,
         sample_presentations: int,
+        schedule_sha256: str,
     ) -> CheckpointDescriptor: ...
 
 
@@ -160,7 +179,7 @@ class Checkpointer(Protocol):
 class TrainingRunResult:
     """Machine-readable terminal state without any provider mutation handle."""
 
-    status: Literal["completed", "paused_disk_reserve"]
+    status: Literal["completed", "paused_disk_reserve", "upload_failed"]
     experiment_id: str
     experiment_config_sha256: str
     schedule_sha256: str
@@ -169,6 +188,8 @@ class TrainingRunResult:
     sample_presentations: int
     checkpoints: tuple[CheckpointDescriptor, ...]
     failed_upload_optimizer_steps: tuple[int, ...]
+    unverified_checkpoint_optimizer_steps: tuple[int, ...]
+    disposable: bool
     provider_hourly_price: float | None
     instance_start_time: str | None
 
@@ -184,6 +205,10 @@ class TrainingRunResult:
             "sample_presentations": self.sample_presentations,
             "checkpoints": [checkpoint.to_dict() for checkpoint in self.checkpoints],
             "failed_upload_optimizer_steps": list(self.failed_upload_optimizer_steps),
+            "unverified_checkpoint_optimizer_steps": list(
+                self.unverified_checkpoint_optimizer_steps
+            ),
+            "disposable": self.disposable,
             "provider_hourly_price": self.provider_hourly_price,
             "instance_start_time": self.instance_start_time,
         }
@@ -225,6 +250,8 @@ def _validate_chunk(
         raise TypeError("training runner must return TrainingChunkReceipt")
     if receipt.schedule_sha256 != request.schedule_sha256:
         raise ValueError("training runner receipt schedule identity is incompatible")
+    if receipt.input_checkpoint_sha256 != request.input_checkpoint_sha256:
+        raise ValueError("training runner receipt input checkpoint identity is incompatible")
     if receipt.start_optimizer_step != request.start_optimizer_step:
         raise ValueError("training chunk start step is not monotonic")
     if receipt.end_optimizer_step != request.end_optimizer_step:
@@ -246,7 +273,7 @@ def _chunk_request(
     *,
     start_optimizer_step: int,
     end_optimizer_step: int,
-    resume_checkpoint: CheckpointDescriptor | None,
+    input_checkpoint: CheckpointDescriptor | None,
 ) -> TrainingChunkRequest:
     start_multiplier = schedule.learning_rate_multiplier(start_optimizer_step)
     end_multiplier = schedule.learning_rate_multiplier(end_optimizer_step)
@@ -268,7 +295,12 @@ def _chunk_request(
         end_learning_rate_multiplier=end_multiplier,
         start_learning_rate=schedule.learning_rate(start_optimizer_step),
         end_learning_rate=schedule.learning_rate(end_optimizer_step),
-        resume_checkpoint=resume_checkpoint,
+        input_checkpoint=input_checkpoint,
+        input_checkpoint_sha256=(
+            None
+            if input_checkpoint is None
+            else input_checkpoint.record.artifact.sha256
+        ),
     )
 
 
@@ -280,7 +312,21 @@ def _replace_verified(
     for index, checkpoint in enumerate(checkpoints):
         replacement = by_step.get(checkpoint.record.optimizer_step)
         if replacement is not None:
-            checkpoints[index] = replacement
+            checkpoints[index] = replace(
+                replacement,
+                locally_verified=checkpoint.locally_verified,
+            )
+
+
+def _mark_local_artifact_deleted(
+    checkpoints: list[CheckpointDescriptor],
+    deleted: CheckpointDescriptor,
+) -> None:
+    for index, checkpoint in enumerate(checkpoints):
+        if checkpoint.record.artifact == deleted.record.artifact:
+            checkpoints[index] = replace(checkpoint, locally_verified=False)
+            return
+    raise ValueError("deleted checkpoint is absent from the run catalog")
 
 
 def _validate_provider_metadata(
@@ -308,7 +354,8 @@ def run_fixed_exposure_training(
     checkpointer: Checkpointer,
     uploader: Callable[[CheckpointDescriptor], bool],
     disk_probe: Callable[[], int],
-    complete_checkpoint_bytes: int,
+    estimated_checkpoint_bytes: int,
+    checkpoint_deleter: Callable[[CheckpointDescriptor], None],
     resume_checkpoint: CheckpointDescriptor | None = None,
     upload_sleeper: Callable[[float], None] | None = None,
     provider_hourly_price: float | None = None,
@@ -342,11 +389,12 @@ def run_fixed_exposure_training(
         experiment_config_sha256=config_sha256,
     )
     # Validate storage inputs before any paid training work begins.
-    can_continue_without_upload(0, complete_checkpoint_bytes)
+    can_begin_checkpoint_chunk(0, estimated_checkpoint_bytes)
 
     checkpoints: list[CheckpointDescriptor] = []
+    retained_checkpoints: list[CheckpointDescriptor] = []
     start_step = 0
-    first_resume = resume_checkpoint
+    chain_checkpoint = resume_checkpoint
     if resume_checkpoint is not None:
         require_compatible_checkpoint(
             resume_checkpoint,
@@ -354,39 +402,62 @@ def run_fixed_exposure_training(
             experiment_config_sha256=config_sha256,
             dataset_manifest_sha256=experiment_config.dataset_manifest_sha256,
             normalization_sha256=normalization_sha256,
+            schedule_sha256=schedule.sha256,
             physical_batch_size=experiment_config.physical_batch_size,
             maximum_optimizer_step=schedule.total_optimizer_steps,
             checkpoint_interval_steps=schedule.checkpoint_interval_steps,
         )
         checkpoints.append(resume_checkpoint)
+        retained_checkpoints.append(resume_checkpoint)
         start_step = resume_checkpoint.record.optimizer_step
 
-    status: Literal["completed", "paused_disk_reserve"] = "completed"
-    observed_checkpoint_bytes = complete_checkpoint_bytes
+    status: Literal["completed", "paused_disk_reserve", "upload_failed"] = "completed"
+    observed_checkpoint_bytes = estimated_checkpoint_bytes
     sleeper = upload_sleeper if upload_sleeper is not None else __import__("time").sleep
     with AsyncCheckpointUploads(uploader=uploader, sleeper=sleeper) as uploads:
         for boundary_step in schedule.checkpoint_steps:
             if boundary_step <= start_step:
                 continue
 
-            _replace_verified(checkpoints, uploads.poll())
-            if uploads.failed or uploads.has_pending:
-                writable_free_bytes = disk_probe()
-                if not can_continue_without_upload(
-                    writable_free_bytes,
-                    observed_checkpoint_bytes,
-                ):
-                    status = "paused_disk_reserve"
-                    break
+            verified = uploads.poll()
+            _replace_verified(checkpoints, verified)
+            _replace_verified(retained_checkpoints, verified)
+            if chain_checkpoint is not None:
+                chain_checkpoint = next(
+                    (
+                        item
+                        for item in retained_checkpoints
+                        if item.record.optimizer_step
+                        == chain_checkpoint.record.optimizer_step
+                    ),
+                    chain_checkpoint,
+                )
+
+            for checkpoint in prunable_checkpoints(
+                retained_checkpoints,
+                keep_newest=0,
+            ):
+                if checkpoint == chain_checkpoint:
+                    continue
+                checkpoint_deleter(checkpoint)
+                _mark_local_artifact_deleted(checkpoints, checkpoint)
+                retained_checkpoints.remove(checkpoint)
+
+            writable_free_bytes = disk_probe()
+            if not can_begin_checkpoint_chunk(
+                writable_free_bytes,
+                observed_checkpoint_bytes,
+            ):
+                status = "paused_disk_reserve"
+                break
 
             request = _chunk_request(
                 schedule,
                 start_optimizer_step=start_step,
                 end_optimizer_step=boundary_step,
-                resume_checkpoint=first_resume,
+                input_checkpoint=chain_checkpoint,
             )
             receipt = runner(request)
-            first_resume = None
             _validate_chunk(
                 receipt,
                 request=request,
@@ -395,6 +466,7 @@ def run_fixed_exposure_training(
             checkpoint = checkpointer(
                 optimizer_step=boundary_step,
                 sample_presentations=sample_presentations,
+                schedule_sha256=schedule.sha256,
             )
             validate_checkpoint_identity(
                 checkpoint,
@@ -402,23 +474,39 @@ def run_fixed_exposure_training(
                 experiment_config_sha256=config_sha256,
                 dataset_manifest_sha256=experiment_config.dataset_manifest_sha256,
                 normalization_sha256=normalization_sha256,
+                schedule_sha256=schedule.sha256,
                 physical_batch_size=experiment_config.physical_batch_size,
                 maximum_optimizer_step=schedule.total_optimizer_steps,
                 checkpoint_interval_steps=schedule.checkpoint_interval_steps,
                 require_remote_verification=False,
             )
             checkpoints.append(checkpoint)
+            retained_checkpoints.append(checkpoint)
             observed_checkpoint_bytes = max(
                 observed_checkpoint_bytes,
                 checkpoint.record.artifact.byte_size,
             )
             uploads.submit(checkpoint)
+            chain_checkpoint = checkpoint
             start_step = boundary_step
 
-        _replace_verified(checkpoints, uploads.finish())
+        verified = uploads.finish()
+        _replace_verified(checkpoints, verified)
+        _replace_verified(retained_checkpoints, verified)
         failed_upload_steps = tuple(
             sorted(item.record.optimizer_step for item in uploads.failed)
         )
+
+    unverified_steps = tuple(
+        sorted(
+            checkpoint.record.optimizer_step
+            for checkpoint in checkpoints
+            if not checkpoint.record.remotely_verified
+        )
+    )
+    if status == "completed" and unverified_steps:
+        status = "upload_failed"
+    disposable = status == "completed" and not unverified_steps
 
     result = TrainingRunResult(
         status=status,
@@ -430,6 +518,8 @@ def run_fixed_exposure_training(
         sample_presentations=start_step * experiment_config.physical_batch_size,
         checkpoints=tuple(checkpoints),
         failed_upload_optimizer_steps=failed_upload_steps,
+        unverified_checkpoint_optimizer_steps=unverified_steps,
+        disposable=disposable,
         provider_hourly_price=(
             None if provider_hourly_price is None else float(provider_hourly_price)
         ),
