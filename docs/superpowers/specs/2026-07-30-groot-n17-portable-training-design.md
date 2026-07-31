@@ -1,6 +1,6 @@
 # Portable GR00T N1.7 Training System Design
 
-**Status:** Approved design, awaiting written-spec review
+**Status:** Approved design
 **Date:** 2026-07-30
 
 ## Objective
@@ -207,7 +207,7 @@ guesses them.
 
 ### Primary action representation
 
-The first trainable representation is:
+The first trainable representation seen by the model is:
 
 - Five relative joint deltas for the left arm.
 - One absolute left-gripper command.
@@ -221,6 +221,12 @@ For each non-gripper joint:
 ```text
 relative_action[t] = target_joint_position[t] - current_joint_position[t]
 ```
+
+The prepared LeRobot dataset preserves the organizer's absolute joint targets.
+The pinned GR00T relative-action transform performs the subtraction above at
+load time and produces `relative_stats.json`. The converter must not store
+already-relative joints because that would make GR00T subtract the current state
+twice.
 
 The gripper stays absolute because its open/closed target has a stable physical
 meaning and matches NVIDIA's SO100 new-embodiment recipe.
