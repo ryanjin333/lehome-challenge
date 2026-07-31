@@ -185,6 +185,7 @@ def _canonical_frame_indices(
         isinstance(values, (str, bytes))
         or len(values) != frame_count
         or any(type(value) is not int for value in values)
+        or any(value < 0 for value in values)
     ):
         raise ValueError("frame indices must be canonical integers")
     normalized = tuple(values)
