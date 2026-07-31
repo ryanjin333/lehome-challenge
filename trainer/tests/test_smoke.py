@@ -4,7 +4,7 @@ from time import sleep
 
 import pytest
 
-from lehome_train.batch_select import GIBIBYTE
+from lehome_train.batch_select import GIBIBYTE, NoStableBatchError
 from lehome_train.commands.smoke import (
     SMOKE_OPTIMIZER_STEPS,
     SmokeAttemptReceipt,
@@ -475,6 +475,38 @@ def test_smoke_uses_canonical_batch_selector(monkeypatch: pytest.MonkeyPatch) ->
 
     assert selected == [(16, 32, 64)]
     assert report.selected_batch_size == 64
+
+
+def test_no_stable_batch_is_none_but_unrelated_value_error_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "lehome_train.commands.smoke.select_largest_stable_batch",
+        lambda _results: (_ for _ in ()).throw(NoStableBatchError("typed")),
+    )
+    report = run_smoke_tests(
+        base_config=_config(),
+        physical_vram_bytes=96 * GIBIBYTE,
+        experiment_config_sha256=SHA_A,
+        dataset_manifest_sha256=SHA_B,
+        runner=lambda config: _receipt(config.physical_batch_size),
+    )
+    assert report.selected_batch_size is None
+
+    monkeypatch.setattr(
+        "lehome_train.commands.smoke.select_largest_stable_batch",
+        lambda _results: (_ for _ in ()).throw(
+            ValueError("no stable batch text from unrelated validation")
+        ),
+    )
+    with pytest.raises(ValueError, match="unrelated validation"):
+        run_smoke_tests(
+            base_config=_config(),
+            physical_vram_bytes=96 * GIBIBYTE,
+            experiment_config_sha256=SHA_A,
+            dataset_manifest_sha256=SHA_B,
+            runner=lambda config: _receipt(config.physical_batch_size),
+        )
 
 
 def test_telemetry_samples_during_a_blocking_sequential_launch() -> None:

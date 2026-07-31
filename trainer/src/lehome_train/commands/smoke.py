@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Literal, Protocol
 
 from lehome_train.batch_select import (
+    NoStableBatchError,
     batch_candidates,
     fallback_candidates,
     has_required_headroom,
@@ -330,8 +331,6 @@ def run_smoke_tests(
         selected = select_largest_stable_batch(
             attempt.result for attempt in attempts
         )
-    except ValueError as error:
-        if "no stable batch" not in str(error):
-            raise
+    except NoStableBatchError:
         selected = None
     return SmokeReport(selected_batch_size=selected, attempts=tuple(attempts))

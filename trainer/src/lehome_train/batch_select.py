@@ -13,6 +13,10 @@ HIGH_VRAM_TIER_BYTES = 64 * GIBIBYTE
 REQUIRED_FREE_VRAM_PERCENT = 10
 
 
+class NoStableBatchError(ValueError):
+    """No comparable smoke attempt satisfies stability and headroom gates."""
+
+
 def batch_candidates(physical_vram_bytes: int) -> tuple[int, ...]:
     """Return the approved ascending candidate tier for one physical GPU."""
 
@@ -78,5 +82,7 @@ def select_largest_stable_batch(results: Iterable[SmokeResult]) -> int:
         and has_required_headroom(result)
     )
     if not comparable:
-        raise ValueError("no stable batch leaves at least 10% physical VRAM free")
+        raise NoStableBatchError(
+            "no stable batch leaves at least 10% physical VRAM free"
+        )
     return max(result.physical_batch_size for result in comparable)
