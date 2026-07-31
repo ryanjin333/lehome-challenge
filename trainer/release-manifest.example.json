@@ -1,0 +1,37 @@
+{
+  "base_model": {
+    "repository": "nvidia/GR00T-N1.7-3B",
+    "revision": "2fc962b973bccdd5d8ce4f67cc63b264d6886495"
+  },
+  "cuda_base": {
+    "digest": "sha256:61f6c08f2b59036cb935e56d1e31a6b64e3ae2c7ddb86d33fa0b044c7917b719",
+    "image": "nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04"
+  },
+  "gpu_acceptance": {
+    "batches_tested_sequentially": [],
+    "evidence_uri": null,
+    "first_optimizer_step_seconds": null,
+    "hardware": null,
+    "image_pull_seconds": null,
+    "memorization_passed": false,
+    "network_gbps": null,
+    "status": "pending",
+    "training_768k_started_or_resumed": false
+  },
+  "image": {
+    "digest": null,
+    "repository": "ghcr.io/ryanjin333/lehome-groot-n17-trainer",
+    "tag": "7c150162faf3ec285960f59cc72a6e5643e9d711"
+  },
+  "isaac_groot": {
+    "commit": "23ace64f17aa5015259b8609d371eb61a357c776",
+    "repository": "https://github.com/NVIDIA/Isaac-GR00T.git"
+  },
+  "platform": "linux/amd64",
+  "python_version": "3.10.18",
+  "repository_commit": "7c150162faf3ec285960f59cc72a6e5643e9d711",
+  "schema_version": 1,
+  "status": "unreleased",
+  "trainer_lock_sha256": "08cc37e719678d7d0347b45f617e1dccc6e8d6513da501237ef541982cadf6fa",
+  "uv_version": "0.8.22"
+}

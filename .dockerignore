@@ -18,9 +18,14 @@ docker/cluster/exports/
 docker/.container.cfg
 # ignore recordings
 recordings/
-# ignore __pycache__
+# ignore Python build/cache state
 **/__pycache__/
 **/*.egg-info/
+trainer/.venv/
+trainer/.pytest_cache/
+trainer/**/*.pyc
+trainer/tests/
+trainer/release-manifest*.json
 # ignore isaac sim symlink
 _isaac_sim?
 # Docker history

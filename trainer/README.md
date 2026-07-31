@@ -50,11 +50,25 @@ The complete operator workflow, request schemas, normalization contract,
 restore choices, and shutdown gate are in
 [the GR00T N1.7 training runbook](../docs/groot_n17_training.md).
 
-The accepted Task 12 image sets `LEHOME_TRAIN_RUNTIME_FACTORY=module:factory`.
+The accepted Task 12 image sets
+`LEHOME_TRAIN_RUNTIME_FACTORY=lehome_train.groot.production_runtime:create`.
 Outside that image, pass `--runtime-factory module:factory` explicitly. The
 factory must return the production adapter implementing `prepare`, `memorize`,
 `smoke`, and `train`; missing GPU/runtime wiring is a hard error, never a
 successful no-op.
+
+The production adapter takes explicit command-specific files. `prepare`,
+`memorize`, and `train` require exactly `launch_config` and `status_output` in
+their request `arguments`; `smoke` requires `launch_configs` and
+`status_output`. A launch config is the JSON form of
+`FineTuneLaunchConfig`. All referenced paths must be below `/cache`,
+`/prepared`, or `/output`; the model and dataset must already be downloaded at
+their manifest-verified revisions. `prepare` validates the pinned checkout,
+one-GPU visibility, inputs, and exact upstream command without starting a paid
+training process. The other commands execute the official pinned
+`gr00t/experiment/launch_finetune.py`; `memorize` additionally enforces batch 1
+and at most 10,000 steps, while `smoke` enforces sequential batch 16/32/64
+configs with exactly 100 optimizer steps each.
 
 Every stage consumes a checked JSON request:
 
@@ -88,3 +102,66 @@ repositories or performing a real upload additionally requires a valid
 Model sync stores each immutable artifact set beneath the manifest-recorded
 `experiments/{experiment_id}/{sync_manifest_sha256}/` prefix and verifies the
 complete target subtree at the resolved commit before permitting local cleanup.
+
+## Immutable image build and structural verification
+
+From a clean repository root:
+
+```bash
+trainer/scripts/build-image.sh
+trainer/scripts/verify-image.sh
+```
+
+The build uses only `linux/amd64`, the digest-pinned CUDA 12.8.1 base, Python
+3.10.18, uv 0.8.22 with a checked archive hash, the frozen trainer and upstream
+locks, and Isaac-GR00T commit
+`23ace64f17aa5015259b8609d371eb61a357c776`. The default tag is the full local
+Git commit. A dirty checkout is rejected unless `ALLOW_DIRTY=1` is explicitly
+used for a non-release diagnostic build.
+
+Every container invocation must mount writable `/cache`, `/prepared`, and
+`/output` directories. The image runs as `trainer`, rejects `hf auth login` and
+`huggingface-cli login`, and removes `HF_TOKEN` before local conversion or
+training. Only `lehome-train data publish` and `lehome-train sync` retain an
+explicit process token. Models, datasets, outputs, and temporary state therefore
+remain on those mounts rather than in the immutable image.
+
+On a Linux NVIDIA host, the additional structural gate verifies exactly one
+visible GPU and performs one real AdamW optimizer step over a synthetic
+`TensorDataset`:
+
+```bash
+trainer/scripts/verify-image.sh --gpu <image>@sha256:<digest>
+```
+
+This one-step gate is not the fresh-machine release acceptance below.
+
+## Fresh RTX PRO 6000 release acceptance
+
+`release-manifest.example.json` is deliberately `unreleased`: it has neither a
+claimed OCI digest nor GPU evidence. Do not use an image for paid training until
+the registry digest and the following evidence have been recorded in a strict
+manifest and that accepted manifest has been committed.
+
+On a fresh Linux x86_64 RTX PRO 6000 96 GB rental:
+
+1. Measure download bandwidth and require at least 1 Gbps. Record the result.
+2. Pull the exact `ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:<digest>`
+   and record pull duration. Never accept a tag as experiment identity.
+3. Mount fresh `/cache`, `/prepared`, and `/output` volumes, inject `HF_TOKEN`
+   only into download/sync processes, and run `lehome-train prepare`.
+4. Measure from the start of the fresh-machine procedure to the first real
+   GR00T optimizer step. It must be no more than 1,800 seconds.
+5. Complete the offline one-episode `memorize` gate.
+6. Run physical batches 16, 32, and 64 sequentially with 100 steps per config;
+   retain the telemetry and any proven CUDA OOM evidence.
+7. Start, or resume only from a compatible verified checkpoint, the selected
+   768,000-sample-presentation training run.
+8. Sync and hash-verify the checkpoint, redacted logs, configuration, and
+   report. Record the evidence URL, exact repository commit, lock hash, GR00T
+   commit, model revision, base digest, full OCI digest, timing, hardware,
+   memorization result, batch sequence, and 768k start/resume result in the
+   release manifest. Validate it with `load_release_manifest` before commit.
+
+This macOS host can run the CPU structural checks and build an amd64 image with
+Docker emulation, but it cannot execute or claim the NVIDIA GPU acceptance.
