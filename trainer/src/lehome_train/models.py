@@ -514,12 +514,24 @@ class SyncManifest(StrictModel):
 
     experiment_id: str
     experiment_config_sha256: str
+    remote_prefix: str
     entries: tuple[SyncEntry, ...]
 
     def __post_init__(self) -> None:
         StrictModel.__post_init__(self)
         _require_nonempty(self.experiment_id, "experiment_id")
         _require_sha256(self.experiment_config_sha256, "experiment_config_sha256")
+        validate_artifact_relative_path(self.remote_prefix, "remote_prefix")
+        prefix_parts = self.remote_prefix.split("/")
+        if (
+            len(prefix_parts) != 3
+            or prefix_parts[:2] != ["experiments", self.experiment_id]
+            or not _SHA256_RE.fullmatch(prefix_parts[2])
+        ):
+            raise _field_error(
+                "remote_prefix",
+                "must be experiments/{experiment_id}/{sync_manifest_sha256}",
+            )
         paths = tuple(entry.relative_path for entry in self.entries)
         if len(set(paths)) != len(paths):
             raise _field_error("entries", "relative paths must be unique")

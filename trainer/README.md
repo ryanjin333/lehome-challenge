@@ -76,3 +76,7 @@ uv run pytest tests/test_report.py tests/test_sync.py -q
 These tests use injected runtimes and an in-memory transport. Creating
 repositories or performing a real upload additionally requires a valid
 `HF_TOKEN`; no token is bundled in this checkout.
+
+Model sync stores each immutable artifact set beneath the manifest-recorded
+`experiments/{experiment_id}/{sync_manifest_sha256}/` prefix and verifies the
+complete target subtree at the resolved commit before permitting local cleanup.

@@ -193,6 +193,7 @@ def test_all_artifact_contracts_have_typed_identity_and_provenance() -> None:
     sync_manifest = SyncManifest(
         experiment_id=checkpoint.experiment_id,
         experiment_config_sha256=SHA_A,
+        remote_prefix="experiments/experiment-001/" + SHA_B,
         entries=(
             SyncEntry(
                 relative_path=artifact.relative_path,
@@ -217,6 +218,7 @@ def test_all_artifact_contracts_have_typed_identity_and_provenance() -> None:
     assert memorization.experiment_config_sha256 == SHA_A
     assert memorization.promotable is False
     assert sync_manifest.entries[0].relative_path == artifact.relative_path
+    assert sync_manifest.remote_prefix.endswith(SHA_B)
 
 
 @pytest.mark.parametrize(

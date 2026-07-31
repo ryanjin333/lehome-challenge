@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import lehome_train.hub as hub_module
 from lehome_train.hub import (
     HubAccess,
     HuggingFaceHubTransport,
@@ -23,6 +24,7 @@ class FakeTransport:
         self.upload_calls: list[dict[str, object]] = []
         self.upload_failures = 0
         self.download_calls: list[dict[str, object]] = []
+        self.list_calls: list[dict[str, object]] = []
 
     def check_access(self, *, repository: str, token: str) -> HubAccess:
         return self.access
@@ -69,6 +71,22 @@ class FakeTransport:
             }
         )
         return revision
+
+    def list_tree(
+        self,
+        *,
+        repository: str,
+        revision: str,
+        token: str,
+    ) -> tuple[hub_module.HubTreeEntry, ...]:
+        self.list_calls.append(
+            {
+                "repository": repository,
+                "revision": revision,
+                "token": token,
+            }
+        )
+        return (hub_module.HubTreeEntry("payload.bin", "file"),)
 
 
 class FakeRepositoryTransport(FakeTransport):
@@ -237,6 +255,35 @@ def test_download_requires_and_preserves_an_explicit_immutable_revision(
     assert len(transport.download_calls) == 1
 
 
+def test_tree_listing_requires_and_preserves_an_explicit_immutable_revision() -> None:
+    transport = FakeTransport()
+    revision = "c" * 40
+
+    observed = hub_module.list_repository_tree(
+        transport=transport,
+        repository="owner/private-data",
+        revision=revision,
+        environ={"HF_TOKEN": "hf_tree_process_token"},
+    )
+
+    assert observed == (hub_module.HubTreeEntry("payload.bin", "file"),)
+    assert transport.list_calls == [
+        {
+            "repository": "owner/private-data",
+            "revision": revision,
+            "token": "hf_tree_process_token",
+        }
+    ]
+    with pytest.raises(ValueError, match="immutable"):
+        hub_module.list_repository_tree(
+            transport=transport,
+            repository="owner/private-data",
+            revision="mutable-branch",
+            environ={"HF_TOKEN": "hf_tree_process_token"},
+        )
+    assert len(transport.list_calls) == 1
+
+
 def test_approved_private_repository_creation_is_explicit_and_never_public() -> None:
     transport = FakeRepositoryTransport()
 
@@ -304,3 +351,55 @@ def test_real_transport_configures_a_finite_default_for_every_http_request(
     assert session.request("GET", "https://example.invalid") == 17.0
     assert session.request("GET", "https://example.invalid", timeout=None) == 17.0
     assert session.request("GET", "https://example.invalid", timeout=3.0) == 3.0
+
+
+def test_real_transport_lists_complete_tree_at_explicit_commit_with_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revision = "d" * 40
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeApi:
+        def list_repo_tree(self, **kwargs: object) -> list[object]:
+            calls.append(("tree", kwargs))
+            return [
+                SimpleNamespace(path="experiments", tree_id="tree-root"),
+                SimpleNamespace(
+                    path="experiments/run/payload.bin",
+                    size=7,
+                    blob_id="blob",
+                ),
+            ]
+
+        def list_repo_files(self, **kwargs: object) -> list[str]:
+            calls.append(("files", kwargs))
+            return ["experiments/run/payload.bin"]
+
+    transport = HuggingFaceHubTransport(timeout_seconds=19.0)
+    monkeypatch.setattr(transport, "_api", lambda token: FakeApi())
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(sha=revision),
+    )
+
+    observed = transport.list_tree(
+        repository="ryanjin333/lehome-groot-n17-models",
+        revision=revision,
+        token="hf_explicit_tree_token",
+    )
+
+    assert observed == (
+        hub_module.HubTreeEntry("experiments", "directory"),
+        hub_module.HubTreeEntry("experiments/run/payload.bin", "file"),
+    )
+    expected_common = {
+        "repo_id": "ryanjin333/lehome-groot-n17-models",
+        "repo_type": "model",
+        "revision": revision,
+        "token": "hf_explicit_tree_token",
+    }
+    assert calls == [
+        ("tree", {**expected_common, "recursive": True, "expand": True}),
+        ("files", expected_common),
+    ]

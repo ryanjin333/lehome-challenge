@@ -10,8 +10,15 @@ import tempfile
 from typing import Callable, Iterable, Mapping
 
 from lehome_train.constants import DEFAULT_MODEL_REPO
-from lehome_train.hub import HubTransport, download_files, require_access, upload_files
-from lehome_train.io import atomic_write_json
+from lehome_train.hub import (
+    HubTransport,
+    HubTreeEntry,
+    download_files,
+    list_repository_tree,
+    require_access,
+    upload_files,
+)
+from lehome_train.io import atomic_write_json, canonical_json_sha256
 from lehome_train.models import SyncEntry, SyncManifest
 from lehome_train.redaction import ArtifactRejected, generate_upload_allowlist
 
@@ -22,6 +29,7 @@ _MANIFEST_NAME = "sync-manifest.json"
 _MINIMUM_STAGING_RESERVE_BYTES = 64 * 1024**2
 _MAXIMUM_STAGING_RESERVE_BYTES = 1024**3
 _STAGING_RESERVE_FRACTION_DENOMINATOR = 20
+_REMOTE_ROOT = "experiments"
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,9 +111,19 @@ def generate_sync_manifest(
         entries = generate_upload_allowlist(root, paths)
     except ArtifactRejected as error:
         raise ValueError(str(error)) from None
+    identity = {
+        "schema_version": 1,
+        "experiment_id": experiment_id,
+        "experiment_config_sha256": experiment_config_sha256,
+        "entries": [entry.to_dict() for entry in entries],
+    }
+    remote_prefix = (
+        f"{_REMOTE_ROOT}/{experiment_id}/{canonical_json_sha256(identity)}"
+    )
     manifest = SyncManifest(
         experiment_id=experiment_id,
         experiment_config_sha256=experiment_config_sha256,
+        remote_prefix=remote_prefix,
         entries=entries,
     )
     atomic_write_json(root / _MANIFEST_NAME, manifest.to_dict())
@@ -196,6 +214,39 @@ def _complete_tree_matches(root: Path, entries: tuple[SyncEntry, ...]) -> bool:
     return observed_files == expected_files
 
 
+def _remote_tree_matches(
+    tree: tuple[HubTreeEntry, ...],
+    *,
+    remote_prefix: str,
+    entries: tuple[SyncEntry, ...],
+) -> bool:
+    expected_files = {entry.relative_path for entry in entries}
+    expected_directories = {
+        "/".join(parts[:index])
+        for relative_path in expected_files
+        for parts in (relative_path.split("/"),)
+        for index in range(1, len(parts))
+    }
+    observed_files: set[str] = set()
+    prefix = remote_prefix + "/"
+    for entry in tree:
+        if entry.relative_path == remote_prefix:
+            if entry.entry_type != "directory":
+                return False
+            continue
+        if not entry.relative_path.startswith(prefix):
+            continue
+        relative_path = entry.relative_path[len(prefix) :]
+        if entry.entry_type == "file":
+            observed_files.add(relative_path)
+        elif entry.entry_type == "directory":
+            if relative_path not in expected_directories:
+                return False
+        else:
+            return False
+    return observed_files == expected_files
+
+
 def _stage_entries(
     source: Path,
     entries: tuple[SyncEntry, ...],
@@ -275,45 +326,70 @@ def sync_experiment(
             revision=revision,
             source=staging,
             entries=manifest.entries,
+            remote_prefix=manifest.remote_prefix,
             environ=environ,
             max_attempts=max_attempts,
         )
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    _require_staging_capacity(
-        resolved_staging_root,
-        manifest.entries,
-        free_space_probe,
-        phase="readback",
-    )
-    readback = Path(
-        tempfile.mkdtemp(
-            prefix="lehome-model-readback-",
-            dir=resolved_staging_root,
-        )
-    )
     try:
-        download_files(
+        remote_tree = list_repository_tree(
             transport=transport,
             repository=repository,
             revision=immutable_revision,
-            destination=readback,
-            relative_paths=tuple(entry.relative_path for entry in manifest.entries),
             environ=environ,
             max_attempts=max_attempts,
         )
-        if _complete_tree_matches(readback, manifest.entries):
-            verified_entries = _verified_remote_entries(readback, manifest.entries)
-        else:
-            verified_entries = tuple(
-                replace(entry, remotely_verified=False) for entry in manifest.entries
+    except (RuntimeError, ValueError):
+        remote_tree = ()
+    if not _remote_tree_matches(
+        remote_tree,
+        remote_prefix=manifest.remote_prefix,
+        entries=manifest.entries,
+    ):
+        verified_entries = tuple(
+            replace(entry, remotely_verified=False) for entry in manifest.entries
+        )
+    else:
+        _require_staging_capacity(
+            resolved_staging_root,
+            manifest.entries,
+            free_space_probe,
+            phase="readback",
+        )
+        readback = Path(
+            tempfile.mkdtemp(
+                prefix="lehome-model-readback-",
+                dir=resolved_staging_root,
             )
-    finally:
-        shutil.rmtree(readback, ignore_errors=True)
+        )
+        try:
+            download_files(
+                transport=transport,
+                repository=repository,
+                revision=immutable_revision,
+                destination=readback,
+                relative_paths=tuple(
+                    entry.relative_path for entry in manifest.entries
+                ),
+                remote_prefix=manifest.remote_prefix,
+                environ=environ,
+                max_attempts=max_attempts,
+            )
+            if _complete_tree_matches(readback, manifest.entries):
+                verified_entries = _verified_remote_entries(readback, manifest.entries)
+            else:
+                verified_entries = tuple(
+                    replace(entry, remotely_verified=False)
+                    for entry in manifest.entries
+                )
+        finally:
+            shutil.rmtree(readback, ignore_errors=True)
 
     verified_manifest = SyncManifest(
         experiment_id=manifest.experiment_id,
         experiment_config_sha256=manifest.experiment_config_sha256,
+        remote_prefix=manifest.remote_prefix,
         entries=verified_entries,
     )
     atomic_write_json(root / _MANIFEST_NAME, verified_manifest.to_dict())

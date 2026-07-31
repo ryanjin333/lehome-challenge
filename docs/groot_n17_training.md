@@ -184,12 +184,18 @@ credential-store filenames, and supported token formats are rejected. After
 access is verified, sync capacity-checks the caller-selected staging filesystem,
 byte-copies only the generated allowlist into a temporary immutable snapshot,
 and re-scans every staged byte for exact hashes and secrets. It uploads that
-snapshot, never the mutable experiment directory. It then cleans upload
-staging, capacity-checks the same filesystem for readback, downloads the full
-allowlist from the resolved commit, and rejects unexpected files, directories,
-or symlinks before recomputing every SHA-256 and byte size. Temporary upload and
-readback trees are always removed. An entry becomes `remotely_verified: true`
-only after this complete-tree readback matches.
+snapshot, never the mutable experiment directory, beneath the content-addressed
+prefix `experiments/{experiment_id}/{sync_manifest_sha256}/`; the generated
+manifest records the exact prefix so multiple experiments can coexist. After
+the upload resolves to a full commit, sync lists the complete immutable
+repository tree. Unrelated paths outside the prefix are allowed, but any extra
+file, unexpected directory, symlink-like entry, special entry, missing file, or
+listing failure inside the prefix fails the disposal gate. Sync then cleans
+upload staging, capacity-checks the same filesystem for readback, downloads the
+allowlist from the same prefix and commit, and recomputes every SHA-256 and byte
+size. Temporary upload and readback trees are always removed. An entry becomes
+`remotely_verified: true` only after both the remote tree and byte readback
+match.
 
 ## Shutdown gate
 

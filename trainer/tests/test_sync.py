@@ -6,8 +6,10 @@ from typing import Callable
 
 import pytest
 
+import lehome_train.hub as hub_module
 from lehome_train.commands.sync import generate_sync_manifest, sync_experiment
 from lehome_train.constants import DEFAULT_MODEL_REPO
+from lehome_train.io import canonical_json_sha256
 from lehome_train.models import SyncEntry
 
 
@@ -21,15 +23,21 @@ class FakeTransport:
         *,
         corrupt_path: str | None = None,
         before_upload: Callable[[], None] | None = None,
-        extra_remote_path: str | None = None,
-        symlink_remote_path: str | None = None,
+        extra_scope: str | None = None,
+        symlink_under_prefix: bool = False,
+        list_failure: bool = False,
     ) -> None:
         self.corrupt_path = corrupt_path
         self.before_upload = before_upload
-        self.extra_remote_path = extra_remote_path
-        self.symlink_remote_path = symlink_remote_path
+        self.extra_scope = extra_scope
+        self.symlink_under_prefix = symlink_under_prefix
+        self.list_failure = list_failure
         self.uploaded: dict[str, bytes] = {}
+        self.remote: dict[str, tuple[str, bytes]] = {}
         self.upload_source: Path | None = None
+        self.upload_prefix: str | None = None
+        self.download_prefix: str | None = None
+        self.list_revision: str | None = None
         self.upload_token: str | None = None
         self.download_token: str | None = None
 
@@ -47,15 +55,40 @@ class FakeTransport:
         source: Path,
         entries: tuple[SyncEntry, ...],
         token: str,
+        remote_prefix: str | None = None,
     ) -> str:
         self.upload_token = token
         self.upload_source = source
+        self.upload_prefix = remote_prefix
+        assert remote_prefix is not None
         if self.before_upload is not None:
             self.before_upload()
         self.uploaded = {
             entry.relative_path: (source / entry.relative_path).read_bytes()
             for entry in entries
         }
+        for relative_path, content in self.uploaded.items():
+            self.remote[f"{remote_prefix}/{relative_path}"] = ("file", content)
+        if self.corrupt_path is not None:
+            self.remote[f"{remote_prefix}/{self.corrupt_path}"] = (
+                "file",
+                b"remote mismatch",
+            )
+        if self.extra_scope == "inside":
+            self.remote[f"{remote_prefix}/reports/unexpected.json"] = (
+                "file",
+                b"unexpected remote artifact",
+            )
+        elif self.extra_scope == "outside":
+            self.remote["experiments/another-run/unrelated.bin"] = (
+                "file",
+                b"unrelated remote artifact",
+            )
+        if self.symlink_under_prefix:
+            self.remote[f"{remote_prefix}/reports/unexpected.json"] = (
+                "symlink",
+                b"reports/training-report.json",
+            )
         return "b" * 40
 
     def download_files(
@@ -66,23 +99,31 @@ class FakeTransport:
         destination: Path,
         relative_paths: tuple[str, ...],
         token: str,
+        remote_prefix: str | None = None,
     ) -> str:
         self.download_token = token
+        self.download_prefix = remote_prefix
+        assert remote_prefix is not None
         for relative_path in relative_paths:
             target = destination / relative_path
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(self.uploaded[relative_path])
-        if self.corrupt_path is not None:
-            (destination / self.corrupt_path).write_bytes(b"remote mismatch")
-        if self.extra_remote_path is not None:
-            extra = destination / self.extra_remote_path
-            extra.parent.mkdir(parents=True, exist_ok=True)
-            extra.write_bytes(b"unexpected remote artifact")
-        if self.symlink_remote_path is not None:
-            link = destination / self.symlink_remote_path
-            link.parent.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(destination / relative_paths[0])
+            target.write_bytes(self.remote[f"{remote_prefix}/{relative_path}"][1])
         return revision
+
+    def list_tree(
+        self,
+        *,
+        repository: str,
+        revision: str,
+        token: str,
+    ) -> tuple[hub_module.HubTreeEntry, ...]:
+        self.list_revision = revision
+        if self.list_failure:
+            raise OSError("remote listing unavailable")
+        return tuple(
+            hub_module.HubTreeEntry(path, entry_type)
+            for path, (entry_type, _content) in sorted(self.remote.items())
+        )
 
 
 def _experiment(root: Path) -> None:
@@ -123,6 +164,15 @@ def test_generated_sync_manifest_is_a_closed_complete_allowlist(tmp_path: Path) 
         "resolved-config.json",
     )
     assert all(not entry.remotely_verified for entry in manifest.entries)
+    manifest_identity = {
+        "schema_version": 1,
+        "experiment_id": "experiment-001",
+        "experiment_config_sha256": CONFIG_SHA,
+        "entries": [entry.to_dict() for entry in manifest.entries],
+    }
+    assert manifest.remote_prefix == (
+        "experiments/experiment-001/" + canonical_json_sha256(manifest_identity)
+    )
     assert (tmp_path / "sync-manifest.json").is_file()
 
 
@@ -149,6 +199,9 @@ def test_sync_marks_disposable_only_after_immutable_remote_hash_readback(
     assert all(entry.remotely_verified for entry in result.manifest.entries)
     assert transport.upload_token == TOKEN
     assert transport.download_token == TOKEN
+    assert transport.upload_prefix == result.manifest.remote_prefix
+    assert transport.download_prefix == result.manifest.remote_prefix
+    assert transport.list_revision == result.immutable_revision
     assert transport.upload_source != tmp_path
     assert list(staging_root.iterdir()) == []
     assert TOKEN not in (tmp_path / "sync-manifest.json").read_text(encoding="utf-8")
@@ -200,15 +253,15 @@ def test_sync_uploads_a_staged_snapshot_when_live_source_mutates(tmp_path: Path)
 
 
 @pytest.mark.parametrize("remote_kind", ["extra", "symlink"])
-def test_sync_rejects_unexpected_remote_tree_entries(
+def test_sync_rejects_unexpected_entries_already_present_under_remote_prefix(
     tmp_path: Path,
     remote_kind: str,
 ) -> None:
     _experiment(tmp_path)
     staging_root = _staging_root(tmp_path)
     transport = FakeTransport(
-        extra_remote_path="reports/unexpected.json" if remote_kind == "extra" else None,
-        symlink_remote_path="reports/unexpected.json" if remote_kind == "symlink" else None,
+        extra_scope="inside" if remote_kind == "extra" else None,
+        symlink_under_prefix=remote_kind == "symlink",
     )
 
     result = sync_experiment(
@@ -224,6 +277,52 @@ def test_sync_rejects_unexpected_remote_tree_entries(
 
     assert result.disposable is False
     assert not any(entry.remotely_verified for entry in result.manifest.entries)
+    assert list(staging_root.iterdir()) == []
+
+
+def test_sync_allows_unrelated_files_outside_content_addressed_prefix(
+    tmp_path: Path,
+) -> None:
+    _experiment(tmp_path)
+    staging_root = _staging_root(tmp_path)
+    transport = FakeTransport(extra_scope="outside")
+
+    result = sync_experiment(
+        tmp_path,
+        experiment_id="experiment-001",
+        experiment_config_sha256=CONFIG_SHA,
+        repository=DEFAULT_MODEL_REPO,
+        revision="experiment-001",
+        transport=transport,
+        staging_root=staging_root,
+        environ={"HF_TOKEN": TOKEN},
+    )
+
+    assert result.disposable is True
+    assert all(entry.remotely_verified for entry in result.manifest.entries)
+
+
+def test_sync_fails_closed_when_immutable_tree_listing_fails(tmp_path: Path) -> None:
+    _experiment(tmp_path)
+    staging_root = _staging_root(tmp_path)
+    transport = FakeTransport(list_failure=True)
+
+    result = sync_experiment(
+        tmp_path,
+        experiment_id="experiment-001",
+        experiment_config_sha256=CONFIG_SHA,
+        repository=DEFAULT_MODEL_REPO,
+        revision="experiment-001",
+        transport=transport,
+        staging_root=staging_root,
+        environ={"HF_TOKEN": TOKEN},
+        max_attempts=1,
+    )
+
+    assert result.immutable_revision == "b" * 40
+    assert result.disposable is False
+    assert not any(entry.remotely_verified for entry in result.manifest.entries)
+    assert transport.download_prefix is None
     assert list(staging_root.iterdir()) == []
 
 
