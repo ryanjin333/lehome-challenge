@@ -141,6 +141,55 @@ def test_prepare_rejects_secret_bearing_resolved_config_before_writing_output(tm
     assert not (tmp_path / "output").exists()
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"release_note": "contains hf_" + "a" * 34},
+        {"metadata": {"ordinary_description": "contains hf_" + "b" * 34}},
+    ],
+)
+def test_prepare_rejects_token_text_at_ordinary_nested_config_keys_before_output(
+    tmp_path: Path,
+    extra: dict[str, object],
+) -> None:
+    model_root, model_manifest = snapshot(tmp_path, "model", "b" * 40)
+    dataset_root, dataset_manifest = snapshot(tmp_path, "dataset", "a" * 40)
+    config = {
+        "dataset_revision": "a" * 40,
+        "model_revision": "b" * 40,
+        "dataset_repository": "ryanjin333/lehome-groot-n17-data",
+        "model_repository": "ryanjin333/lehome-groot-n17-models",
+    }
+    config.update(extra)
+    operations = {name: (lambda _root: ()) for name in (
+        "image_runtime_verification",
+        "network_measurement",
+        "model_download",
+        "dataset_download",
+        "schema_hash_validation",
+        "model_initialization",
+    )}
+
+    with pytest.raises(ValueError, match="secret"):
+        prepare_training_environment(
+            output_root=tmp_path / "output",
+            resolved_config=config,
+            artifacts=(ArtifactIdentity("meta/stats.json", "c" * 64, 1),),
+            visible_devices="0",
+            visible_vram_bytes=(MINIMUM_VRAM_BYTES,),
+            writable_free_bytes=MINIMUM_DISK_BYTES,
+            token="hf_explicit_but_not_persisted",
+            hub_targets=(HubTarget("ryanjin333/lehome-groot-n17-models", "b" * 40),),
+            hub_permission_check=lambda *_args: HubPermission(True, True, True),
+            stage_operations=operations,
+            model_snapshot_root=model_root,
+            model_snapshot_manifest=model_manifest,
+            dataset_snapshot_root=dataset_root,
+            dataset_snapshot_manifest=dataset_manifest,
+        )
+    assert not (tmp_path / "output").exists()
+
+
 def test_prepare_records_sanitized_failed_stage_before_raising(tmp_path: Path) -> None:
     model_root, model_manifest = snapshot(tmp_path, "model", "b" * 40)
     dataset_root, dataset_manifest = snapshot(tmp_path, "dataset", "a" * 40)

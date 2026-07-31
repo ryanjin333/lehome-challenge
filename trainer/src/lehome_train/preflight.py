@@ -13,6 +13,7 @@ from typing import Callable, Iterable, Mapping
 
 from lehome_train.io import sha256_file
 from lehome_train.models import ArtifactIdentity, model_from_mapping, validate_artifact_relative_path
+from lehome_train.redaction import ACCESS_TOKEN_PATTERNS
 
 
 GIBIBYTE = 1024**3
@@ -231,7 +232,10 @@ def reject_secret_bearing_config(value: object) -> None:
     one in a nested configuration object.
     """
 
-    if isinstance(value, dict):
+    if isinstance(value, str):
+        if any(pattern.search(value) for pattern in ACCESS_TOKEN_PATTERNS):
+            raise ValueError("resolved configuration must not contain a secret value")
+    elif isinstance(value, dict):
         for key, nested in value.items():
             if not isinstance(key, str):
                 continue
