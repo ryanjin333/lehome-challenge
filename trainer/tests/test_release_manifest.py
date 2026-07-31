@@ -1,6 +1,8 @@
+import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 
 import pytest
 
@@ -16,7 +18,7 @@ from lehome_train.release_manifest import (
 ROOT = Path(__file__).resolve().parents[2]
 TRAINER = ROOT / "trainer"
 LOCK_SHA256 = "67fcd520cd75f3b3b383fcc887f244c332af5c2a5548d384d71e0376697b2432"
-REPOSITORY_COMMIT = "7c150162faf3ec285960f59cc72a6e5643e9d711"
+REPOSITORY_COMMIT = "7d367df39a94917c6c1df6befe011eef1a0ce3ca"
 OCI_DIGEST = "sha256:" + "a" * 64
 DATASET_REVISION = "b" * 40
 DATASET_MANIFEST_SHA256 = "c" * 64
@@ -142,15 +144,24 @@ def test_unreleased_example_has_pins_but_no_claimed_image_or_gpu_acceptance() ->
     assert manifest.trainer_lock_sha256 == LOCK_SHA256
     assert manifest.oci_digest is None
     assert manifest.gpu_acceptance_status == "pending"
+    assert manifest.repository_commit == REPOSITORY_COMMIT
+    assert manifest.payload["image"]["tag"] == REPOSITORY_COMMIT  # type: ignore[index]
     assert manifest.payload["dataset"] == {
         "repository": "ryanjin333/lehome-groot-n17-data",
         "revision": None,
         "manifest_sha256": None,
         "normalization_sha256": None,
     }
-    assert manifest.trainer_lock_sha256 == __import__("hashlib").sha256(
+    assert manifest.trainer_lock_sha256 == hashlib.sha256(
         (TRAINER / "uv.lock").read_bytes()
     ).hexdigest()
+    committed_lock = subprocess.run(
+        ["git", "show", f"{manifest.repository_commit}:trainer/uv.lock"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert hashlib.sha256(committed_lock).hexdigest() == manifest.trainer_lock_sha256
 
 
 def test_accepted_manifest_requires_real_digest_and_completed_pro6000_gate() -> None:

@@ -27,7 +27,7 @@
   "image": {
     "digest": null,
     "repository": "ghcr.io/ryanjin333/lehome-groot-n17-trainer",
-    "tag": "7c150162faf3ec285960f59cc72a6e5643e9d711"
+    "tag": "7d367df39a94917c6c1df6befe011eef1a0ce3ca"
   },
   "isaac_groot": {
     "commit": "23ace64f17aa5015259b8609d371eb61a357c776",
@@ -35,7 +35,7 @@
   },
   "platform": "linux/amd64",
   "python_version": "3.10.18",
-  "repository_commit": "7c150162faf3ec285960f59cc72a6e5643e9d711",
+  "repository_commit": "7d367df39a94917c6c1df6befe011eef1a0ce3ca",
   "schema_version": 1,
   "status": "unreleased",
   "trainer_lock_sha256": "67fcd520cd75f3b3b383fcc887f244c332af5c2a5548d384d71e0376697b2432",
