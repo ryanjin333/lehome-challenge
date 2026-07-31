@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Mapping, Protocol
 
+from lehome_train.io import sha256_file
 from lehome_train.models import MemorizationResult
 from lehome_train.offline_eval import OfflineEvaluation, every_dimension_improved
 
@@ -18,6 +20,32 @@ _REQUIRED_CONSECUTIVE_EVALUATIONS = 2
 _MSE_RATIO_THRESHOLD = 0.1
 
 
+@dataclass(frozen=True, slots=True)
+class ChunkReceipt:
+    """Observed progress from one physical-batch-one training chunk."""
+
+    start_optimizer_step: int
+    end_optimizer_step: int
+    sample_presentations: int
+    physical_batch_size: int
+    finite_loss: bool
+
+    def __post_init__(self) -> None:
+        if type(self.start_optimizer_step) is not int or self.start_optimizer_step < 0:
+            raise ValueError("chunk start optimizer step must be nonnegative")
+        if (
+            type(self.end_optimizer_step) is not int
+            or self.end_optimizer_step < self.start_optimizer_step
+        ):
+            raise ValueError("chunk end optimizer step must not precede its start")
+        if type(self.sample_presentations) is not int or self.sample_presentations < 0:
+            raise ValueError("chunk sample presentations must be nonnegative")
+        if type(self.physical_batch_size) is not int or self.physical_batch_size <= 0:
+            raise ValueError("chunk physical batch size must be positive")
+        if type(self.finite_loss) is not bool:
+            raise ValueError("chunk finite loss flag must be boolean")
+
+
 class ChunkTrainer(Protocol):
     """Injected persistent trainer; production implementations may use GR00T."""
 
@@ -27,7 +55,7 @@ class ChunkTrainer(Protocol):
         episode_id: str,
         optimizer_steps: int,
         physical_batch_size: int,
-    ) -> None: ...
+    ) -> ChunkReceipt: ...
 
 
 class EpisodeEvaluator(Protocol):
@@ -45,6 +73,9 @@ class Checkpointer(Protocol):
     """Injected checkpoint operation for the disposable experiment."""
 
     def __call__(self, *, episode_id: str, sample_presentations: int) -> None: ...
+
+
+PreparedValidator = Callable[[Path], Mapping[str, object]]
 
 
 def _numeric_episode_id(value: str) -> int:
@@ -71,6 +102,7 @@ def _prepared_split(dataset: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
         or not train
         or not all(type(value) is str for value in train)
         or not isinstance(validation, list)
+        or not validation
         or not all(type(value) is str for value in validation)
     ):
         raise ValueError("prepared dataset manifest has an invalid episode split")
@@ -117,6 +149,62 @@ def _evaluate(
     return evaluation
 
 
+def _validate_prepared_provenance(
+    dataset: Path,
+    *,
+    expected_manifest_sha256: str,
+    prepared_validator: PreparedValidator | None,
+) -> None:
+    manifest_path = dataset / "manifest.json"
+    try:
+        initial_sha256 = sha256_file(manifest_path)
+    except OSError as error:
+        raise ValueError("prepared dataset manifest is unavailable") from error
+    if initial_sha256 != expected_manifest_sha256:
+        raise ValueError("prepared dataset manifest digest does not match experiment")
+
+    if prepared_validator is None:
+        from lehome_train.data.validate import validate_prepared_dataset
+
+        report = validate_prepared_dataset(dataset)
+    else:
+        report = prepared_validator(dataset)
+
+    if sha256_file(manifest_path) != initial_sha256:
+        raise ValueError("prepared dataset manifest changed during validation")
+    if (
+        not isinstance(report, Mapping)
+        or report.get("valid") is not True
+        or report.get("dataset_manifest_sha256") != initial_sha256
+        or type(report.get("train_episode_count")) is not int
+        or report["train_episode_count"] <= 0
+        or type(report.get("validation_episode_count")) is not int
+        or report["validation_episode_count"] <= 0
+    ):
+        raise ValueError("prepared dataset validation report is incompatible")
+
+
+def _validate_chunk_receipt(
+    receipt: object,
+    *,
+    expected_start_optimizer_step: int,
+) -> ChunkReceipt:
+    if not isinstance(receipt, ChunkReceipt):
+        raise TypeError("memorization trainer must return ChunkReceipt")
+    expected_end = expected_start_optimizer_step + EVALUATION_INTERVAL
+    if receipt.start_optimizer_step != expected_start_optimizer_step:
+        raise ValueError("chunk start optimizer step is not monotonic")
+    if receipt.end_optimizer_step != expected_end:
+        raise ValueError("chunk optimizer step delta must be exactly 500")
+    if receipt.sample_presentations != EVALUATION_INTERVAL:
+        raise ValueError("chunk sample presentations must be exactly 500")
+    if receipt.physical_batch_size != PHYSICAL_BATCH_SIZE:
+        raise ValueError("chunk physical batch size must be exactly 1")
+    if not receipt.finite_loss:
+        raise ValueError("chunk must report finite loss")
+    return receipt
+
+
 def run_memorization(
     *,
     dataset_path: str | Path,
@@ -127,6 +215,7 @@ def run_memorization(
     evaluator: EpisodeEvaluator,
     checkpointer: Checkpointer,
     requested_episode_id: str | None = None,
+    prepared_validator: PreparedValidator | None = None,
 ) -> MemorizationResult:
     """Run the non-extendable one-episode diagnostic and return its gate result.
 
@@ -136,8 +225,14 @@ def run_memorization(
     decisions independently of the CUDA runtime.
     """
 
+    dataset = Path(dataset_path)
+    _validate_prepared_provenance(
+        dataset,
+        expected_manifest_sha256=dataset_manifest_sha256,
+        prepared_validator=prepared_validator,
+    )
     episode_id = select_training_episode(
-        dataset_path,
+        dataset,
         requested_episode_id=requested_episode_id,
     )
     initialized = _evaluate(
@@ -148,15 +243,20 @@ def run_memorization(
     final = initialized
     consecutive_qualifying = 0
     sample_presentations = 0
+    optimizer_step = 0
     offline_gate_passed = False
 
     while sample_presentations < MAX_SAMPLE_PRESENTATIONS:
-        trainer(
-            episode_id=episode_id,
-            optimizer_steps=EVALUATION_INTERVAL,
-            physical_batch_size=PHYSICAL_BATCH_SIZE,
+        receipt = _validate_chunk_receipt(
+            trainer(
+                episode_id=episode_id,
+                optimizer_steps=EVALUATION_INTERVAL,
+                physical_batch_size=PHYSICAL_BATCH_SIZE,
+            ),
+            expected_start_optimizer_step=optimizer_step,
         )
-        sample_presentations += EVALUATION_INTERVAL
+        optimizer_step = receipt.end_optimizer_step
+        sample_presentations += receipt.sample_presentations
         if sample_presentations % CHECKPOINT_INTERVAL == 0:
             checkpointer(
                 episode_id=episode_id,

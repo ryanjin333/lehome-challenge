@@ -41,6 +41,10 @@ def test_normalized_mse_is_computed_per_dimension_and_across_the_episode() -> No
         ({"normalization_scale": (1.0, 0.0)}, "normalization"),
         ({"predicted_actions": ((1.0, 5.0), (2.0, 4.0))}, "range"),
         ({"prediction_frame_indices": (5, 7)}, "temporal"),
+        ({"prediction_frame_indices": (5, 5)}, "frame indices"),
+        ({"prediction_frame_indices": (6, 5)}, "frame indices"),
+        ({"prediction_frame_indices": (5.0, 6)}, "frame indices"),
+        ({"prediction_frame_indices": (True, 6)}, "frame indices"),
     ],
 )
 def test_offline_evaluation_fails_closed_on_invalid_replay(
@@ -77,3 +81,13 @@ def test_every_action_dimension_must_improve_strictly() -> None:
         initialized,
         OfflineEvaluation(0.01, (0.005, 0.015, 0.01), 4, 3),
     )
+
+
+def test_evaluation_rejects_aggregate_mse_that_contradicts_dimensions() -> None:
+    with pytest.raises(ValueError, match="aggregate"):
+        OfflineEvaluation(
+            normalized_mse=0.5,
+            dimension_mse=(0.1, 0.3),
+            frame_count=4,
+            action_dimension=2,
+        )

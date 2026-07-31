@@ -7,6 +7,9 @@ import math
 from typing import Sequence
 
 
+_AGGREGATE_MSE_TOLERANCE = 1e-12
+
+
 @dataclass(frozen=True, slots=True)
 class OfflineEvaluation:
     """Finite normalized action errors for one temporally aligned episode."""
@@ -40,6 +43,15 @@ class OfflineEvaluation:
                 raise ValueError("dimension MSE values must be finite and nonnegative")
             normalized_dimensions.append(float(value))
         object.__setattr__(self, "dimension_mse", tuple(normalized_dimensions))
+        aggregate = sum(normalized_dimensions) / self.action_dimension
+        if not math.isclose(
+            self.normalized_mse,
+            aggregate,
+            rel_tol=_AGGREGATE_MSE_TOLERANCE,
+            abs_tol=_AGGREGATE_MSE_TOLERANCE,
+        ):
+            raise ValueError("aggregate normalized MSE contradicts dimension MSE")
+        object.__setattr__(self, "normalized_mse", aggregate)
 
 
 def _finite_vector(
@@ -132,11 +144,15 @@ def evaluate_action_predictions(
     )
     if any(lower > upper for lower, upper in zip(minimum, maximum, strict=True)):
         raise ValueError("action range minimum exceeds maximum")
-    if (
-        len(prediction_frame_indices) != frame_count
-        or len(expert_frame_indices) != frame_count
-        or tuple(prediction_frame_indices) != tuple(expert_frame_indices)
-    ):
+    predicted_frames = _canonical_frame_indices(
+        prediction_frame_indices,
+        frame_count=frame_count,
+    )
+    expert_frames = _canonical_frame_indices(
+        expert_frame_indices,
+        frame_count=frame_count,
+    )
+    if predicted_frames != expert_frames:
         raise ValueError("prediction replay is not temporally aligned")
     for rows in (expert, predicted):
         if any(
@@ -158,6 +174,23 @@ def evaluate_action_predictions(
         frame_count=frame_count,
         action_dimension=action_dimension,
     )
+
+
+def _canonical_frame_indices(
+    values: Sequence[int],
+    *,
+    frame_count: int,
+) -> tuple[int, ...]:
+    if (
+        isinstance(values, (str, bytes))
+        or len(values) != frame_count
+        or any(type(value) is not int for value in values)
+    ):
+        raise ValueError("frame indices must be canonical integers")
+    normalized = tuple(values)
+    if any(current <= previous for previous, current in zip(normalized, normalized[1:])):
+        raise ValueError("frame indices must be strictly increasing and unique")
+    return normalized
 
 
 def every_dimension_improved(
