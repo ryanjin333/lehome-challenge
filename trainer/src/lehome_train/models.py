@@ -384,11 +384,11 @@ class SmokeResult(StrictModel):
     stable: bool
     finite_loss: bool
     physical_vram_bytes: int
-    peak_reserved_vram_bytes: int
-    minimum_steady_state_free_vram_bytes: int
+    peak_reserved_vram_bytes: Optional[int]
+    minimum_steady_state_free_vram_bytes: Optional[int]
     steady_steps_per_second: float
     samples_per_second: float
-    error_code: Optional[str]
+    failure_reason: Optional[Literal["cuda_oom", "non_finite_loss"]]
 
     def __post_init__(self) -> None:
         StrictModel.__post_init__(self)
@@ -402,14 +402,33 @@ class SmokeResult(StrictModel):
         )
         _require_positive(self.optimizer_steps, "optimizer_steps")
         _require_positive(self.physical_vram_bytes, "physical_vram_bytes")
-        _require_nonnegative(
-            self.peak_reserved_vram_bytes,
-            "peak_reserved_vram_bytes",
-        )
-        _require_nonnegative(
-            self.minimum_steady_state_free_vram_bytes,
-            "minimum_steady_state_free_vram_bytes",
-        )
+        if self.peak_reserved_vram_bytes is not None:
+            _require_nonnegative(
+                self.peak_reserved_vram_bytes,
+                "peak_reserved_vram_bytes",
+            )
+        if self.minimum_steady_state_free_vram_bytes is not None:
+            _require_nonnegative(
+                self.minimum_steady_state_free_vram_bytes,
+                "minimum_steady_state_free_vram_bytes",
+            )
+            if self.minimum_steady_state_free_vram_bytes > self.physical_vram_bytes:
+                raise _field_error(
+                    "minimum_steady_state_free_vram_bytes",
+                    "free VRAM must not exceed physical VRAM",
+                )
+        if self.stable and self.minimum_steady_state_free_vram_bytes is None:
+            raise _field_error(
+                "minimum_steady_state_free_vram_bytes",
+                "stable smoke result requires steady-state headroom",
+            )
+        if self.failure_reason is not None and self.stable:
+            raise _field_error("stable", "failed smoke result cannot be stable")
+        if (not self.finite_loss) != (self.failure_reason == "non_finite_loss"):
+            raise _field_error(
+                "failure_reason",
+                "non-finite loss and failure reason must agree",
+            )
         _require_nonnegative_float(
             self.steady_steps_per_second,
             "steady_steps_per_second",

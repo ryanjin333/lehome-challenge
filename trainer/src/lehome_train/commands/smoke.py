@@ -3,25 +3,85 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Callable, Protocol
+from typing import Callable, Literal, Protocol
 
 from lehome_train.batch_select import (
     batch_candidates,
     fallback_candidates,
     has_required_headroom,
+    select_largest_stable_batch,
 )
 from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.models import SmokeResult, StrictModel
 from lehome_train.telemetry import (
+    SampledOperationError,
     TelemetrySample,
     TelemetrySampler,
     TelemetrySummary,
     sample_operation,
+    summarize_failure_telemetry,
     summarize_telemetry,
 )
 
 
 SMOKE_OPTIMIZER_STEPS = 100
+FailureReason = Literal["cuda_oom", "non_finite_loss"]
+
+
+class SmokeRunnerFailure(RuntimeError):
+    """A typed runner failure that is safe to normalize into an attempt."""
+
+    def __init__(
+        self,
+        *,
+        failure_reason: Literal["cuda_oom"],
+        optimizer_steps: int = 0,
+        initialization_seconds: float = 0.0,
+        warmup_seconds: float = 0.0,
+        telemetry_samples: tuple[TelemetrySample, ...] = (),
+    ) -> None:
+        super().__init__(failure_reason)
+        if failure_reason != "cuda_oom":
+            raise ValueError("raised smoke runner failures must be proven CUDA OOM")
+        self.failure_reason = failure_reason
+        self.optimizer_steps = optimizer_steps
+        self.initialization_seconds = initialization_seconds
+        self.warmup_seconds = warmup_seconds
+        self.telemetry_samples = telemetry_samples
+
+    @classmethod
+    def cuda_oom(
+        cls,
+        *,
+        optimizer_steps: int = 0,
+        initialization_seconds: float = 0.0,
+        warmup_seconds: float = 0.0,
+        telemetry_samples: tuple[TelemetrySample, ...] = (),
+    ) -> "SmokeRunnerFailure":
+        return cls(
+            failure_reason="cuda_oom",
+            optimizer_steps=optimizer_steps,
+            initialization_seconds=initialization_seconds,
+            warmup_seconds=warmup_seconds,
+            telemetry_samples=telemetry_samples,
+        )
+
+    def to_receipt(
+        self,
+        *,
+        sampled_telemetry: tuple[TelemetrySample, ...] = (),
+    ) -> "SmokeAttemptReceipt":
+        return SmokeAttemptReceipt(
+            optimizer_steps=self.optimizer_steps,
+            gradient_accumulation_steps=1,
+            finite_loss=True,
+            initialization_seconds=self.initialization_seconds,
+            warmup_seconds=self.warmup_seconds,
+            steady_state_seconds=0.0,
+            steady_state_optimizer_steps=0,
+            telemetry_samples=self.telemetry_samples or sampled_telemetry,
+            failure_reason=self.failure_reason,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,8 +96,7 @@ class SmokeAttemptReceipt:
     steady_state_seconds: float
     steady_state_optimizer_steps: int
     telemetry_samples: tuple[TelemetrySample, ...]
-    error_code: str | None = None
-    memory_failure: bool = False
+    failure_reason: FailureReason | None = None
 
     def __post_init__(self) -> None:
         if type(self.optimizer_steps) is not int or self.optimizer_steps < 0:
@@ -54,14 +113,10 @@ class SmokeAttemptReceipt:
             isinstance(sample, TelemetrySample) for sample in self.telemetry_samples
         ):
             raise ValueError("smoke telemetry samples must be a tuple of TelemetrySample")
-        if self.error_code is not None and (
-            type(self.error_code) is not str or not self.error_code.strip()
-        ):
-            raise ValueError("smoke error code must be non-empty when present")
-        if type(self.memory_failure) is not bool:
-            raise ValueError("smoke memory failure flag must be boolean")
-        if self.memory_failure and self.error_code is None:
-            raise ValueError("proven memory failure requires an error code")
+        if self.failure_reason not in (None, "cuda_oom", "non_finite_loss"):
+            raise ValueError("smoke failure reason is unsupported")
+        if (not self.finite_loss) != (self.failure_reason == "non_finite_loss"):
+            raise ValueError("non-finite loss and smoke failure reason must agree")
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +126,6 @@ class SmokeAttempt(StrictModel):
     result: SmokeResult
     telemetry: TelemetrySummary
     completed_optimizer_steps: int
-    memory_failure: bool
 
     def __post_init__(self) -> None:
         StrictModel.__post_init__(self)
@@ -129,7 +183,10 @@ def _run_with_optional_sampler(
     sampler_factory: SamplerFactory | None,
 ) -> SmokeAttemptReceipt:
     if sampler_factory is None:
-        receipt = runner(config)
+        try:
+            receipt = runner(config)
+        except SmokeRunnerFailure as failure:
+            receipt = failure.to_receipt()
         if not isinstance(receipt, SmokeAttemptReceipt):
             raise TypeError("smoke runner must return SmokeAttemptReceipt")
         return receipt
@@ -138,10 +195,18 @@ def _run_with_optional_sampler(
     if not hasattr(sampler, "sample"):
         raise TypeError("smoke sampler factory must return a TelemetrySampler")
     try:
-        receipt, boundary_samples = sample_operation(
-            lambda: runner(config),
-            sampler=sampler,
-        )
+        try:
+            receipt, boundary_samples = sample_operation(
+                lambda: runner(config),
+                sampler=sampler,
+            )
+        except SampledOperationError as sampled_error:
+            if not isinstance(sampled_error.original_error, SmokeRunnerFailure):
+                raise sampled_error.original_error from sampled_error
+            receipt = sampled_error.original_error.to_receipt(
+                sampled_telemetry=sampled_error.samples,
+            )
+            boundary_samples = sampled_error.samples
     finally:
         close = getattr(sampler, "close", None)
         if callable(close):
@@ -163,27 +228,32 @@ def _validated_attempt(
 ) -> SmokeAttempt:
     if receipt.gradient_accumulation_steps != 1:
         raise ValueError("smoke gradient accumulation must remain exactly 1")
-    if receipt.optimizer_steps != SMOKE_OPTIMIZER_STEPS and not receipt.memory_failure:
+    if receipt.optimizer_steps != SMOKE_OPTIMIZER_STEPS and receipt.failure_reason is None:
         raise ValueError("successful smoke attempts must run exactly 100 optimizer steps")
     if not receipt.telemetry_samples:
         raise ValueError("every smoke attempt requires telemetry samples")
-    telemetry = summarize_telemetry(
-        receipt.telemetry_samples,
-        initialization_seconds=receipt.initialization_seconds,
-        warmup_seconds=receipt.warmup_seconds,
-        steady_state_seconds=receipt.steady_state_seconds,
-        steady_state_optimizer_steps=receipt.steady_state_optimizer_steps,
-        physical_batch_size=config.physical_batch_size,
-    )
-    error_code = receipt.error_code
-    if not receipt.finite_loss and error_code is None:
-        error_code = "non_finite_loss"
+    if receipt.failure_reason is None:
+        telemetry = summarize_telemetry(
+            receipt.telemetry_samples,
+            initialization_seconds=receipt.initialization_seconds,
+            warmup_seconds=receipt.warmup_seconds,
+            steady_state_seconds=receipt.steady_state_seconds,
+            steady_state_optimizer_steps=receipt.steady_state_optimizer_steps,
+            physical_batch_size=config.physical_batch_size,
+        )
+    else:
+        telemetry = summarize_failure_telemetry(
+            receipt.telemetry_samples,
+            initialization_seconds=receipt.initialization_seconds,
+            warmup_seconds=receipt.warmup_seconds,
+        )
+    if telemetry.physical_total_vram_bytes != physical_vram_bytes:
+        raise ValueError("NVML total does not match expected physical VRAM")
     stable = (
         receipt.optimizer_steps == SMOKE_OPTIMIZER_STEPS
         and receipt.gradient_accumulation_steps == 1
         and receipt.finite_loss
-        and error_code is None
-        and not receipt.memory_failure
+        and receipt.failure_reason is None
     )
     result = SmokeResult(
         experiment_id=config.experiment_name,
@@ -194,20 +264,19 @@ def _validated_attempt(
         optimizer_steps=SMOKE_OPTIMIZER_STEPS,
         stable=stable,
         finite_loss=receipt.finite_loss,
-        physical_vram_bytes=physical_vram_bytes,
+        physical_vram_bytes=telemetry.physical_total_vram_bytes,
         peak_reserved_vram_bytes=telemetry.peak_reserved_vram_bytes,
         minimum_steady_state_free_vram_bytes=(
             telemetry.minimum_steady_state_free_vram_bytes
         ),
         steady_steps_per_second=telemetry.steady_steps_per_second,
         samples_per_second=telemetry.samples_per_second,
-        error_code=error_code,
+        failure_reason=receipt.failure_reason,
     )
     return SmokeAttempt(
         result=result,
         telemetry=telemetry,
         completed_optimizer_steps=receipt.optimizer_steps,
-        memory_failure=receipt.memory_failure,
     )
 
 
@@ -240,8 +309,11 @@ def run_smoke_tests(
             dataset_manifest_sha256=dataset_manifest_sha256,
         )
         attempts.append(attempt)
-        headroom_failure = not has_required_headroom(attempt.result)
-        memory_boundary = attempt.memory_failure or headroom_failure
+        memory_failure = attempt.result.failure_reason == "cuda_oom"
+        headroom_failure = (
+            attempt.result.stable and not has_required_headroom(attempt.result)
+        )
+        memory_boundary = memory_failure or headroom_failure
 
         if fallback_mode:
             if attempt.result.stable and not memory_boundary:
@@ -255,13 +327,11 @@ def run_smoke_tests(
             break
 
     try:
-        selected = max(
-            attempt.result.physical_batch_size
-            for attempt in attempts
-            if attempt.result.stable
-            and attempt.result.finite_loss
-            and has_required_headroom(attempt.result)
+        selected = select_largest_stable_batch(
+            attempt.result for attempt in attempts
         )
-    except ValueError:
+    except ValueError as error:
+        if "no stable batch" not in str(error):
+            raise
         selected = None
     return SmokeReport(selected_batch_size=selected, attempts=tuple(attempts))

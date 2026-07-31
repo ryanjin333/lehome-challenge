@@ -173,7 +173,7 @@ def test_all_artifact_contracts_have_typed_identity_and_provenance() -> None:
         minimum_steady_state_free_vram_bytes=16_000_000_000,
         steady_steps_per_second=1.5,
         samples_per_second=24.0,
-        error_code=None,
+        failure_reason=None,
     )
     memorization = MemorizationResult(
         experiment_id=checkpoint.experiment_id,
@@ -205,7 +205,13 @@ def test_all_artifact_contracts_have_typed_identity_and_provenance() -> None:
     assert checkpoint.artifact.sha256 == SHA_A
     assert provenance.source_artifacts[0].sha256 == SHA_B
     assert smoke.dataset_manifest_sha256 == SHA_B
-    assert smoke.error_code is None
+    assert smoke.failure_reason is None
+    invalid_smoke = smoke.to_dict()
+    invalid_smoke["minimum_steady_state_free_vram_bytes"] = (
+        smoke.physical_vram_bytes + 1
+    )
+    with pytest.raises(ValueError, match="free VRAM.*physical"):
+        SmokeResult(**invalid_smoke)
     assert memorization.experiment_config_sha256 == SHA_A
     assert memorization.promotable is False
     assert sync_manifest.entries[0].relative_path == artifact.relative_path

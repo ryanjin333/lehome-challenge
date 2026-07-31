@@ -25,6 +25,8 @@ class TelemetrySample(StrictModel):
     power_watts: float | None
     temperature_celsius: float | None
     host_memory_bytes: int | None
+    physical_total_vram_bytes: int
+    device_identity: str | None
 
     def __post_init__(self) -> None:
         StrictModel.__post_init__(self)
@@ -49,6 +51,15 @@ class TelemetrySample(StrictModel):
                 raise ValueError(f"telemetry {name} must be nonnegative")
         if self.gpu_utilization_percent is not None and self.gpu_utilization_percent > 100:
             raise ValueError("telemetry GPU utilization must not exceed 100 percent")
+        if self.physical_total_vram_bytes <= 0:
+            raise ValueError("telemetry physical total VRAM must be positive")
+        if (
+            self.free_vram_bytes is not None
+            and self.free_vram_bytes > self.physical_total_vram_bytes
+        ):
+            raise ValueError("telemetry free VRAM must not exceed physical total VRAM")
+        if self.device_identity is not None and not self.device_identity.strip():
+            raise ValueError("telemetry device identity must be non-empty when present")
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,9 +69,11 @@ class TelemetrySummary(StrictModel):
     initialization_seconds: float
     warmup_seconds: float
     steady_state_seconds: float
-    peak_allocated_vram_bytes: int
-    peak_reserved_vram_bytes: int
-    minimum_steady_state_free_vram_bytes: int
+    physical_total_vram_bytes: int
+    device_identity: str | None
+    peak_allocated_vram_bytes: int | None
+    peak_reserved_vram_bytes: int | None
+    minimum_steady_state_free_vram_bytes: int | None
     peak_gpu_utilization_percent: float | None
     peak_power_watts: float | None
     peak_temperature_celsius: float | None
@@ -79,13 +92,22 @@ class TelemetrySummary(StrictModel):
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"telemetry {name} must be nonnegative")
+        if self.physical_total_vram_bytes <= 0:
+            raise ValueError("telemetry physical total VRAM must be positive")
         for name in (
             "peak_allocated_vram_bytes",
             "peak_reserved_vram_bytes",
             "minimum_steady_state_free_vram_bytes",
         ):
-            if getattr(self, name) < 0:
+            value = getattr(self, name)
+            if value is not None and value < 0:
                 raise ValueError(f"telemetry {name} must be nonnegative")
+        if (
+            self.minimum_steady_state_free_vram_bytes is not None
+            and self.minimum_steady_state_free_vram_bytes
+            > self.physical_total_vram_bytes
+        ):
+            raise ValueError("telemetry free VRAM must not exceed physical total VRAM")
 
 
 class TelemetrySampler(Protocol):
@@ -103,6 +125,44 @@ def _peak(samples: tuple[TelemetrySample, ...], name: str) -> int | float | None
     return max(values) if values else None
 
 
+def _sample_identity(
+    samples: tuple[TelemetrySample, ...],
+) -> tuple[int, str | None]:
+    totals = {sample.physical_total_vram_bytes for sample in samples}
+    if len(totals) != 1:
+        raise ValueError("telemetry physical total VRAM drift detected")
+    identities = {sample.device_identity for sample in samples}
+    if len(identities) != 1:
+        raise ValueError("telemetry device identity drift detected")
+    return next(iter(totals)), next(iter(identities))
+
+
+def _validate_common(
+    samples: tuple[TelemetrySample, ...],
+    *,
+    initialization_seconds: float,
+    warmup_seconds: float,
+) -> tuple[int, str | None]:
+    if not samples:
+        raise ValueError("at least one telemetry sample is required")
+    if any(
+        later.timestamp_seconds < earlier.timestamp_seconds
+        for earlier, later in zip(samples, samples[1:])
+    ):
+        raise ValueError("telemetry timestamps must be monotonic")
+    for name, value in (
+        ("initialization", initialization_seconds),
+        ("warmup", warmup_seconds),
+    ):
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(float(value))
+            or value < 0
+        ):
+            raise ValueError(f"{name} duration must be finite and nonnegative")
+    return _sample_identity(samples)
+
+
 def summarize_telemetry(
     samples: tuple[TelemetrySample, ...],
     *,
@@ -114,20 +174,17 @@ def summarize_telemetry(
 ) -> TelemetrySummary:
     """Aggregate raw samples without counting setup/warm-up as throughput."""
 
-    if not samples:
-        raise ValueError("at least one telemetry sample is required")
-    if any(
-        later.timestamp_seconds < earlier.timestamp_seconds
-        for earlier, later in zip(samples, samples[1:])
+    physical_total, device_identity = _validate_common(
+        samples,
+        initialization_seconds=initialization_seconds,
+        warmup_seconds=warmup_seconds,
+    )
+    if (
+        type(steady_state_seconds) not in (int, float)
+        or not math.isfinite(float(steady_state_seconds))
+        or steady_state_seconds < 0
     ):
-        raise ValueError("telemetry timestamps must be monotonic")
-    for name, value in (
-        ("initialization", initialization_seconds),
-        ("warmup", warmup_seconds),
-        ("steady-state", steady_state_seconds),
-    ):
-        if type(value) not in (int, float) or not math.isfinite(float(value)) or value < 0:
-            raise ValueError(f"{name} duration must be finite and nonnegative")
+        raise ValueError("steady-state duration must be finite and nonnegative")
     if type(steady_state_optimizer_steps) is not int or steady_state_optimizer_steps < 0:
         raise ValueError("steady-state optimizer steps must be nonnegative")
     if type(physical_batch_size) is not int or physical_batch_size <= 0:
@@ -144,10 +201,8 @@ def summarize_telemetry(
         if sample.timestamp_seconds >= steady_state_started_at
         and sample.free_vram_bytes is not None
     )
-    if allocated is None or reserved is None or not steady_state_free_values:
-        raise ValueError(
-            "allocated, reserved, and steady-state free VRAM telemetry are required"
-        )
+    if not steady_state_free_values:
+        raise ValueError("steady-state free VRAM telemetry is required")
     steps_per_second = (
         steady_state_optimizer_steps / float(steady_state_seconds)
         if steady_state_seconds > 0
@@ -157,8 +212,10 @@ def summarize_telemetry(
         initialization_seconds=float(initialization_seconds),
         warmup_seconds=float(warmup_seconds),
         steady_state_seconds=float(steady_state_seconds),
-        peak_allocated_vram_bytes=int(allocated),
-        peak_reserved_vram_bytes=int(reserved),
+        physical_total_vram_bytes=physical_total,
+        device_identity=device_identity,
+        peak_allocated_vram_bytes=_optional_int(allocated),
+        peak_reserved_vram_bytes=_optional_int(reserved),
         minimum_steady_state_free_vram_bytes=min(steady_state_free_values),
         peak_gpu_utilization_percent=_optional_float(_peak(samples, "gpu_utilization_percent")),
         peak_power_watts=_optional_float(_peak(samples, "power_watts")),
@@ -166,6 +223,45 @@ def summarize_telemetry(
         peak_host_memory_bytes=_optional_int(_peak(samples, "host_memory_bytes")),
         steady_steps_per_second=steps_per_second,
         samples_per_second=steps_per_second * physical_batch_size,
+    )
+
+
+def summarize_failure_telemetry(
+    samples: tuple[TelemetrySample, ...],
+    *,
+    initialization_seconds: float,
+    warmup_seconds: float,
+) -> TelemetrySummary:
+    """Record available diagnostics for a run that never proved steady state."""
+
+    physical_total, device_identity = _validate_common(
+        samples,
+        initialization_seconds=initialization_seconds,
+        warmup_seconds=warmup_seconds,
+    )
+    return TelemetrySummary(
+        initialization_seconds=float(initialization_seconds),
+        warmup_seconds=float(warmup_seconds),
+        steady_state_seconds=0.0,
+        physical_total_vram_bytes=physical_total,
+        device_identity=device_identity,
+        peak_allocated_vram_bytes=_optional_int(
+            _peak(samples, "allocated_vram_bytes")
+        ),
+        peak_reserved_vram_bytes=_optional_int(
+            _peak(samples, "reserved_vram_bytes")
+        ),
+        minimum_steady_state_free_vram_bytes=None,
+        peak_gpu_utilization_percent=_optional_float(
+            _peak(samples, "gpu_utilization_percent")
+        ),
+        peak_power_watts=_optional_float(_peak(samples, "power_watts")),
+        peak_temperature_celsius=_optional_float(
+            _peak(samples, "temperature_celsius")
+        ),
+        peak_host_memory_bytes=_optional_int(_peak(samples, "host_memory_bytes")),
+        steady_steps_per_second=0.0,
+        samples_per_second=0.0,
     )
 
 
@@ -232,6 +328,15 @@ class NvmlTelemetrySampler:
         if self._closed:
             raise RuntimeError("NVML telemetry sampler is closed")
         memory = self._pynvml.nvmlDeviceGetMemoryInfo(self._handle)
+        raw_identity = self._optional_nvml(
+            lambda: self._pynvml.nvmlDeviceGetUUID(self._handle)
+        )
+        if isinstance(raw_identity, bytes):
+            device_identity = raw_identity.decode("utf-8", errors="strict")
+        elif raw_identity is None:
+            device_identity = None
+        else:
+            device_identity = str(raw_identity)
         utilization = self._optional_nvml(
             lambda: self._pynvml.nvmlDeviceGetUtilizationRates(self._handle).gpu
         )
@@ -255,6 +360,8 @@ class NvmlTelemetrySampler:
             ),
             temperature_celsius=_optional_float(temperature),
             host_memory_bytes=_host_memory_bytes(),
+            physical_total_vram_bytes=int(memory.total),
+            device_identity=device_identity,
         )
 
     def close(self) -> None:
@@ -270,6 +377,19 @@ class NvmlTelemetrySampler:
 
 
 _Result = TypeVar("_Result")
+
+
+class SampledOperationError(RuntimeError):
+    """An operation failure plus telemetry safely captured before it failed."""
+
+    def __init__(
+        self,
+        original_error: BaseException,
+        samples: tuple[TelemetrySample, ...],
+    ) -> None:
+        super().__init__("sampled operation failed")
+        self.original_error = original_error
+        self.samples = samples
 
 
 def sample_operation(
@@ -304,12 +424,20 @@ def sample_operation(
 
     polling = Thread(target=poll, name="lehome-smoke-telemetry", daemon=True)
     polling.start()
+    operation_error: BaseException | None = None
     try:
         result = operation()
+    except BaseException as error:
+        operation_error = error
     finally:
         stopped.set()
         polling.join()
+    try:
+        samples.append(sampler.sample())
+    except BaseException as error:
+        sampling_errors.append(error)
+    if operation_error is not None:
+        raise SampledOperationError(operation_error, tuple(samples)) from operation_error
     if sampling_errors:
         raise RuntimeError("telemetry sampling failed during smoke launch") from sampling_errors[0]
-    samples.append(sampler.sample())
     return result, tuple(samples)

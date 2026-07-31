@@ -26,6 +26,7 @@ def _result(
     finite_loss: bool = True,
     accumulation: int = 1,
 ) -> SmokeResult:
+    result_stable = stable and finite_loss
     return SmokeResult(
         experiment_id=f"smoke-batch-{batch}",
         experiment_config_sha256=SHA_A,
@@ -33,14 +34,18 @@ def _result(
         physical_batch_size=batch,
         gradient_accumulation_steps=accumulation,
         optimizer_steps=100,
-        stable=stable,
+        stable=result_stable,
         finite_loss=finite_loss,
         physical_vram_bytes=total_gib * GIBIBYTE,
         peak_reserved_vram_bytes=int(reserved_gib * GIBIBYTE),
         minimum_steady_state_free_vram_bytes=int(minimum_free_gib * GIBIBYTE),
         steady_steps_per_second=1.0,
         samples_per_second=float(batch),
-        error_code=None if stable else "cuda_oom",
+        failure_reason=(
+            None
+            if result_stable
+            else ("non_finite_loss" if not finite_loss else "cuda_oom")
+        ),
     )
 
 
@@ -75,6 +80,18 @@ def test_first_candidate_fallback_uses_smaller_powers_of_two_without_duplicates(
 def test_headroom_gate_requires_at_least_ten_percent_physical_vram_free() -> None:
     assert has_required_headroom(_result(16, total_gib=40, minimum_free_gib=4)) is True
     assert has_required_headroom(_result(16, total_gib=40, minimum_free_gib=3.9999)) is False
+
+
+def test_headroom_gate_rejects_attempt_without_steady_state() -> None:
+    values = _result(16).to_dict()
+    values["minimum_steady_state_free_vram_bytes"] = None
+    values["stable"] = False
+    values["steady_steps_per_second"] = 0.0
+    values["samples_per_second"] = 0.0
+    values["failure_reason"] = "cuda_oom"
+    result = SmokeResult(**values)
+
+    assert has_required_headroom(result) is False
 
 
 def test_selection_uses_nvml_free_memory_not_allocator_reserved_memory() -> None:

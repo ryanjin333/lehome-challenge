@@ -8,6 +8,7 @@ from lehome_train.batch_select import GIBIBYTE
 from lehome_train.commands.smoke import (
     SMOKE_OPTIMIZER_STEPS,
     SmokeAttemptReceipt,
+    SmokeRunnerFailure,
     run_smoke_tests,
 )
 from lehome_train.constants import MODEL_REVISION
@@ -46,7 +47,18 @@ def _samples(
 ) -> tuple[TelemetrySample, ...]:
     observed_free_gib = total_gib - reserved_gib if free_gib is None else free_gib
     return (
-        TelemetrySample(0.0, 4 * GIBIBYTE, 5 * GIBIBYTE, (total_gib - 5) * GIBIBYTE, 20.0, 100.0, 45.0, 2 * GIBIBYTE),
+        TelemetrySample(
+            0.0,
+            4 * GIBIBYTE,
+            5 * GIBIBYTE,
+            (total_gib - 5) * GIBIBYTE,
+            20.0,
+            100.0,
+            45.0,
+            2 * GIBIBYTE,
+            total_gib * GIBIBYTE,
+            "GPU-test",
+        ),
         TelemetrySample(
             10.0,
             int((reserved_gib - 1) * GIBIBYTE),
@@ -56,6 +68,8 @@ def _samples(
             350.0,
             75.0,
             3 * GIBIBYTE,
+            total_gib * GIBIBYTE,
+            "GPU-test",
         ),
     )
 
@@ -68,21 +82,32 @@ def _receipt(
     optimizer_steps: int = 100,
     accumulation: int = 1,
     finite_loss: bool = True,
-    error_code: str | None = None,
-    memory_failure: bool = False,
+    failure_reason: str | None = None,
     free_gib: float | None = None,
+    telemetry_samples: tuple[TelemetrySample, ...] | None = None,
+    initialization_seconds: float = 3.0,
+    warmup_seconds: float = 2.0,
+    steady_state_seconds: float = 10.0,
 ) -> SmokeAttemptReceipt:
+    resolved_failure_reason = (
+        "non_finite_loss"
+        if not finite_loss and failure_reason is None
+        else failure_reason
+    )
     return SmokeAttemptReceipt(
         optimizer_steps=optimizer_steps,
         gradient_accumulation_steps=accumulation,
         finite_loss=finite_loss,
-        initialization_seconds=3.0,
-        warmup_seconds=2.0,
-        steady_state_seconds=10.0,
+        initialization_seconds=initialization_seconds,
+        warmup_seconds=warmup_seconds,
+        steady_state_seconds=steady_state_seconds,
         steady_state_optimizer_steps=min(80, optimizer_steps),
-        telemetry_samples=_samples(total_gib, reserved_gib, free_gib=free_gib),
-        error_code=error_code,
-        memory_failure=memory_failure,
+        telemetry_samples=(
+            _samples(total_gib, reserved_gib, free_gib=free_gib)
+            if telemetry_samples is None
+            else telemetry_samples
+        ),
+        failure_reason=resolved_failure_reason,
     )
 
 
@@ -121,8 +146,7 @@ def test_memory_failure_stops_larger_batches_and_preserves_complete_attempt_reco
                 32,
                 reserved_gib=95,
                 optimizer_steps=17,
-                error_code="cuda_oom",
-                memory_failure=True,
+                failure_reason="cuda_oom",
             )
         return _receipt(config.physical_batch_size, reserved_gib=70)
 
@@ -139,7 +163,7 @@ def test_memory_failure_stops_larger_batches_and_preserves_complete_attempt_reco
     assert len(report.attempts) == 2
     failed = report.attempts[-1]
     assert failed.result.stable is False
-    assert failed.result.error_code == "cuda_oom"
+    assert failed.result.failure_reason == "cuda_oom"
     assert failed.completed_optimizer_steps == 17
     assert failed.telemetry.peak_allocated_vram_bytes > 0
     assert failed.telemetry.peak_reserved_vram_bytes == 95 * GIBIBYTE
@@ -149,6 +173,42 @@ def test_memory_failure_stops_larger_batches_and_preserves_complete_attempt_reco
     assert failed.telemetry.peak_host_memory_bytes == 3 * GIBIBYTE
     assert failed.telemetry.initialization_seconds == 3.0
     assert failed.telemetry.warmup_seconds == 2.0
+
+
+def test_oom_before_steady_state_is_recorded_and_falls_back() -> None:
+    calls: list[int] = []
+    early_sample = _samples(96, 5)[0]
+
+    def runner(config: FineTuneLaunchConfig) -> SmokeAttemptReceipt:
+        batch = config.physical_batch_size
+        calls.append(batch)
+        if batch == 16:
+            return _receipt(
+                batch,
+                optimizer_steps=0,
+                failure_reason="cuda_oom",
+                telemetry_samples=(early_sample,),
+                initialization_seconds=20.0,
+                warmup_seconds=0.0,
+                steady_state_seconds=0.0,
+            )
+        return _receipt(batch, reserved_gib=70)
+
+    report = run_smoke_tests(
+        base_config=_config(),
+        physical_vram_bytes=96 * GIBIBYTE,
+        experiment_config_sha256=SHA_A,
+        dataset_manifest_sha256=SHA_B,
+        runner=runner,
+    )
+
+    assert calls == [16, 8]
+    assert report.selected_batch_size == 8
+    failure = report.attempts[0]
+    assert failure.result.failure_reason == "cuda_oom"
+    assert failure.result.minimum_steady_state_free_vram_bytes is None
+    assert failure.result.steady_steps_per_second == 0.0
+    assert failure.telemetry.peak_reserved_vram_bytes == 5 * GIBIBYTE
 
 
 def test_first_candidate_headroom_failure_falls_back_until_largest_smaller_passes() -> None:
@@ -233,7 +293,66 @@ def test_non_finite_loss_is_recorded_as_unstable_and_never_selected() -> None:
     assert report.selected_batch_size is None
     assert all(attempt.result.finite_loss is False for attempt in report.attempts)
     assert all(attempt.result.stable is False for attempt in report.attempts)
-    assert all(attempt.result.error_code == "non_finite_loss" for attempt in report.attempts)
+    assert all(
+        attempt.result.failure_reason == "non_finite_loss"
+        for attempt in report.attempts
+    )
+
+
+def test_typed_raised_oom_keeps_samples_and_unknown_exception_aborts() -> None:
+    calls: list[int] = []
+
+    class Sampler:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def sample(self) -> TelemetrySample:
+            self.calls += 1
+            return TelemetrySample(
+                float(self.calls - 1),
+                self.calls,
+                self.calls,
+                90 * GIBIBYTE,
+                1.0,
+                1.0,
+                1.0,
+                1,
+                96 * GIBIBYTE,
+                "GPU-test",
+            )
+
+    def runner(config: FineTuneLaunchConfig) -> SmokeAttemptReceipt:
+        batch = config.physical_batch_size
+        calls.append(batch)
+        if batch == 16:
+            raise SmokeRunnerFailure.cuda_oom(initialization_seconds=1.0)
+        return _receipt(batch)
+
+    report = run_smoke_tests(
+        base_config=_config(),
+        physical_vram_bytes=96 * GIBIBYTE,
+        experiment_config_sha256=SHA_A,
+        dataset_manifest_sha256=SHA_B,
+        runner=runner,
+        sampler_factory=Sampler,
+    )
+
+    assert calls == [16, 8]
+    assert report.selected_batch_size == 8
+    assert report.attempts[0].result.failure_reason == "cuda_oom"
+    assert report.attempts[0].telemetry.physical_total_vram_bytes == 96 * GIBIBYTE
+
+    with pytest.raises(RuntimeError, match="unknown runner failure"):
+        run_smoke_tests(
+            base_config=_config(),
+            physical_vram_bytes=96 * GIBIBYTE,
+            experiment_config_sha256=SHA_A,
+            dataset_manifest_sha256=SHA_B,
+            runner=lambda _config: (_ for _ in ()).throw(
+                RuntimeError("unknown runner failure")
+            ),
+            sampler_factory=Sampler,
+        )
 
 
 def test_telemetry_separates_warmup_from_steady_state_throughput() -> None:
@@ -255,8 +374,14 @@ def test_telemetry_separates_warmup_from_steady_state_throughput() -> None:
 
 def test_headroom_telemetry_excludes_initialization_and_warmup_samples() -> None:
     samples = (
-        TelemetrySample(0.0, 1, 2, 1 * GIBIBYTE, 1.0, 1.0, 1.0, 1),
-        TelemetrySample(10.0, 3, 4, 20 * GIBIBYTE, 1.0, 1.0, 1.0, 1),
+        TelemetrySample(
+            0.0, 1, 2, 1 * GIBIBYTE, 1.0, 1.0, 1.0, 1,
+            96 * GIBIBYTE, "GPU-test",
+        ),
+        TelemetrySample(
+            10.0, 3, 4, 20 * GIBIBYTE, 1.0, 1.0, 1.0, 1,
+            96 * GIBIBYTE, "GPU-test",
+        ),
     )
 
     summary = summarize_telemetry(
@@ -269,6 +394,87 @@ def test_headroom_telemetry_excludes_initialization_and_warmup_samples() -> None
     )
 
     assert summary.minimum_steady_state_free_vram_bytes == 20 * GIBIBYTE
+
+
+def test_telemetry_rejects_total_free_and_device_identity_drift() -> None:
+    with pytest.raises(ValueError, match="free VRAM.*total"):
+        TelemetrySample(
+            0.0, 1, 2, 97 * GIBIBYTE, 1.0, 1.0, 1.0, 1,
+            96 * GIBIBYTE, "GPU-test",
+        )
+
+    total_drift = (
+        TelemetrySample(
+            0.0, 1, 2, 40 * GIBIBYTE, 1.0, 1.0, 1.0, 1,
+            96 * GIBIBYTE, "GPU-test",
+        ),
+        TelemetrySample(
+            1.0, 1, 2, 40 * GIBIBYTE, 1.0, 1.0, 1.0, 1,
+            64 * GIBIBYTE, "GPU-test",
+        ),
+    )
+    with pytest.raises(ValueError, match="total.*drift"):
+        summarize_telemetry(
+            total_drift,
+            initialization_seconds=0.0,
+            warmup_seconds=0.0,
+            steady_state_seconds=1.0,
+            steady_state_optimizer_steps=1,
+            physical_batch_size=1,
+        )
+
+    device_drift = (
+        total_drift[0],
+        TelemetrySample(
+            1.0, 1, 2, 40 * GIBIBYTE, 1.0, 1.0, 1.0, 1,
+            96 * GIBIBYTE, "GPU-other",
+        ),
+    )
+    with pytest.raises(ValueError, match="device.*drift"):
+        summarize_telemetry(
+            device_drift,
+            initialization_seconds=0.0,
+            warmup_seconds=0.0,
+            steady_state_seconds=1.0,
+            steady_state_optimizer_steps=1,
+            physical_batch_size=1,
+        )
+
+
+def test_smoke_rejects_preflight_and_nvml_total_mismatch() -> None:
+    with pytest.raises(ValueError, match="expected physical VRAM"):
+        run_smoke_tests(
+            base_config=_config(),
+            physical_vram_bytes=96 * GIBIBYTE,
+            experiment_config_sha256=SHA_A,
+            dataset_manifest_sha256=SHA_B,
+            runner=lambda config: _receipt(
+                config.physical_batch_size,
+                total_gib=64,
+                reserved_gib=40,
+            ),
+        )
+
+
+def test_smoke_uses_canonical_batch_selector(monkeypatch: pytest.MonkeyPatch) -> None:
+    selected: list[tuple[int, ...]] = []
+
+    def selector(results: object) -> int:
+        batches = tuple(result.physical_batch_size for result in results)  # type: ignore[union-attr]
+        selected.append(batches)
+        return max(batches)
+
+    monkeypatch.setattr("lehome_train.commands.smoke.select_largest_stable_batch", selector)
+    report = run_smoke_tests(
+        base_config=_config(),
+        physical_vram_bytes=96 * GIBIBYTE,
+        experiment_config_sha256=SHA_A,
+        dataset_manifest_sha256=SHA_B,
+        runner=lambda config: _receipt(config.physical_batch_size),
+    )
+
+    assert selected == [(16, 32, 64)]
+    assert report.selected_batch_size == 64
 
 
 def test_telemetry_samples_during_a_blocking_sequential_launch() -> None:
@@ -287,6 +493,8 @@ def test_telemetry_samples_during_a_blocking_sequential_launch() -> None:
                 1.0,
                 1.0,
                 1,
+                96 * GIBIBYTE,
+                "GPU-test",
             )
 
     sampler = Sampler()
