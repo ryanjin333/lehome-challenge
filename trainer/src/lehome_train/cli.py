@@ -13,7 +13,9 @@ from lehome_train.io import canonical_json_bytes
 
 app = typer.Typer(help="LeHome GR00T N1.7 trainer.", no_args_is_help=True)
 data_app = typer.Typer(help="Dataset inspection and transfer commands.", no_args_is_help=True)
+model_app = typer.Typer(help="Pinned model hydration commands.", no_args_is_help=True)
 app.add_typer(data_app, name="data")
+app.add_typer(model_app, name="model")
 
 
 def _emit(value: object) -> None:
@@ -120,6 +122,99 @@ def data_publish(
     _fail_closed(operation)
 
 
+@data_app.command("retrieve")
+def data_retrieve(
+    destination: Path = typer.Option(..., "--destination"),
+    repository: str = typer.Option(..., "--repo"),
+    revision: str = typer.Option(..., "--revision"),
+    manifest_sha256: str = typer.Option(..., "--manifest-sha256"),
+    timeout_seconds: float = typer.Option(30.0, "--timeout-seconds"),
+    max_attempts: int = typer.Option(3, "--max-attempts"),
+    snapshot_manifest: Optional[Path] = typer.Option(None, "--snapshot-manifest"),
+) -> None:
+    """Hydrate one immutable prepared dataset after complete hash verification."""
+
+    def operation() -> object:
+        from lehome_train.data.publish import (
+            download_prepared_dataset,
+            write_prepared_snapshot_manifest,
+        )
+        from lehome_train.hub import HuggingFaceHubTransport
+
+        restored = download_prepared_dataset(
+            destination,
+            repository=repository,
+            revision=revision,
+            expected_manifest_sha256=manifest_sha256,
+            transport=HuggingFaceHubTransport(timeout_seconds=timeout_seconds),
+            max_attempts=max_attempts,
+        )
+        evidence = write_prepared_snapshot_manifest(
+            restored,
+            (
+                destination.parent / f"{destination.name}.snapshot.json"
+                if snapshot_manifest is None
+                else snapshot_manifest
+            ),
+            revision=revision,
+        )
+        return {
+            "schema_version": 1,
+            "status": "dataset_restored",
+            "destination": str(restored),
+            "repository": repository,
+            "revision": revision,
+            "dataset_manifest_sha256": manifest_sha256,
+            "snapshot_manifest": str(evidence),
+        }
+
+    _fail_closed(operation)
+
+
+@model_app.command("retrieve")
+def model_retrieve(
+    destination: Path = typer.Option(..., "--destination"),
+    repository: str = typer.Option("nvidia/GR00T-N1.7-3B", "--repo"),
+    revision: str = typer.Option(..., "--revision"),
+    staging_root: Path = typer.Option(..., "--staging-root"),
+    timeout_seconds: float = typer.Option(30.0, "--timeout-seconds"),
+) -> None:
+    """Hydrate the exact pinned complete base-model snapshot beneath /cache."""
+
+    def operation() -> object:
+        cache = Path("/cache")
+        for path, label in (
+            (destination, "model destination"),
+            (staging_root, "model staging root"),
+        ):
+            resolved = path.resolve(strict=False)
+            if resolved != cache and cache not in resolved.parents:
+                raise ValueError(f"{label} must stay beneath /cache")
+        from lehome_train.groot.model_snapshot import (
+            HuggingFaceModelSnapshotTransport,
+            download_base_model,
+        )
+
+        restored = download_base_model(
+            destination,
+            repository=repository,
+            revision=revision,
+            transport=HuggingFaceModelSnapshotTransport(
+                timeout_seconds=timeout_seconds
+            ),
+            staging_root=staging_root,
+        )
+        return {
+            "schema_version": 1,
+            "status": "model_restored",
+            "destination": str(restored),
+            "repository": repository,
+            "revision": revision,
+        }
+
+    _fail_closed(operation)
+
+
 def _gpu_command(command: str, request: Path, runtime_factory: Optional[str]) -> None:
     def operation() -> object:
         from lehome_train.runtime import dispatch_runtime_request
@@ -193,6 +288,41 @@ def sync(request: Path = typer.Option(..., "--request")) -> None:
         from lehome_train.runtime import execute_sync_request
 
         return execute_sync_request(request)
+
+    _fail_closed(operation)
+
+
+@app.command("restore")
+def restore(
+    sync_result: Path = typer.Option(..., "--sync-result"),
+    destination: Path = typer.Option(..., "--destination"),
+    staging_root: Path = typer.Option(..., "--staging-root"),
+    timeout_seconds: float = typer.Option(30.0, "--timeout-seconds"),
+    max_attempts: int = typer.Option(3, "--max-attempts"),
+) -> None:
+    """Hydrate one immutable experiment snapshot for compatible resume."""
+
+    def operation() -> object:
+        from lehome_train.commands.restore import restore_experiment_snapshot
+        from lehome_train.commands.sync import load_sync_result
+        from lehome_train.hub import HuggingFaceHubTransport
+
+        evidence = load_sync_result(sync_result)
+        restored = restore_experiment_snapshot(
+            destination,
+            sync_result=evidence,
+            transport=HuggingFaceHubTransport(timeout_seconds=timeout_seconds),
+            staging_root=staging_root,
+            max_attempts=max_attempts,
+        )
+        return {
+            "schema_version": 1,
+            "status": "experiment_restored",
+            "destination": str(restored),
+            "repository": evidence.repository,
+            "immutable_revision": evidence.immutable_revision,
+            "remote_prefix": evidence.manifest.remote_prefix,
+        }
 
     _fail_closed(operation)
 

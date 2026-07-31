@@ -7,7 +7,11 @@ import subprocess
 import pytest
 
 from lehome_train.groot.config import FineTuneLaunchConfig
-from lehome_train.groot.launch import build_launch, launch_finetune
+from lehome_train.groot.launch import (
+    build_launch,
+    launch_finetune,
+    launch_finetune_to_step,
+)
 from lehome_train.groot.metrics import parse_trainer_log_lines
 from lehome_train.constants import ISAAC_GROOT_REVISION
 
@@ -41,9 +45,12 @@ def official_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     entrypoint.write_text("# official launcher fixture\n", encoding="utf-8")
     monkeypatch.setattr(
         "lehome_train.groot.launch._checkout_head",
-        lambda _path: ISAAC_GROOT_REVISION,
+        lambda _path, _environment: ISAAC_GROOT_REVISION,
     )
-    monkeypatch.setattr("lehome_train.groot.launch._checkout_is_clean", lambda _path: True)
+    monkeypatch.setattr(
+        "lehome_train.groot.launch._checkout_is_clean",
+        lambda _path, _environment: True,
+    )
     return checkout
 
 
@@ -141,7 +148,10 @@ def test_build_launch_refuses_missing_or_wrong_pinned_official_checkout(
     entrypoint = checkout / "gr00t" / "experiment" / "launch_finetune.py"
     entrypoint.parent.mkdir(parents=True)
     entrypoint.write_text("# fixture\n", encoding="utf-8")
-    monkeypatch.setattr("lehome_train.groot.launch._checkout_head", lambda _path: "b" * 40)
+    monkeypatch.setattr(
+        "lehome_train.groot.launch._checkout_head",
+        lambda _path, _environment: "b" * 40,
+    )
     with pytest.raises(ValueError, match="pinned Isaac-GR00T"):
         build_launch(config(), visible_devices="0", environment={}, official_checkout=checkout)
 
@@ -164,7 +174,7 @@ def test_build_launch_refuses_altered_or_untracked_official_checkout(
         subprocess.run(arguments, check=True, capture_output=True, text=True)
     monkeypatch.setattr(
         "lehome_train.groot.launch._checkout_head",
-        lambda _path: ISAAC_GROOT_REVISION,
+        lambda _path, _environment: ISAAC_GROOT_REVISION,
     )
 
     build_launch(config(), visible_devices="0", environment={}, official_checkout=checkout)
@@ -184,6 +194,36 @@ def test_build_launch_refuses_altered_or_untracked_official_checkout(
         build_launch(config(), visible_devices="0", environment={}, official_checkout=checkout)
 
 
+def test_checkout_identity_subprocesses_receive_secret_stripped_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "checkout"
+    entrypoint = checkout / "gr00t" / "experiment" / "launch_finetune.py"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("# fixture\n", encoding="utf-8")
+    environments: list[dict[str, str]] = []
+
+    def fake_run(command: tuple[str, ...], **kwargs: object):
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        environments.append(environment)
+        if "rev-parse" in command:
+            return subprocess.CompletedProcess(command, 0, stdout=ISAAC_GROOT_REVISION + "\n")
+        return subprocess.CompletedProcess(command, 0, stdout="")
+
+    monkeypatch.setattr("lehome_train.groot.launch.subprocess.run", fake_run)
+    build_launch(
+        config(),
+        visible_devices="0",
+        environment={"HF_TOKEN": "hf_parent_only", "PATH": "/bin"},
+        official_checkout=checkout,
+    )
+
+    assert len(environments) == 2
+    assert all("HF_TOKEN" not in environment for environment in environments)
+    assert all(environment["CUDA_VISIBLE_DEVICES"] == "0" for environment in environments)
+
 def test_identity_is_written_to_effective_official_experiment_directory(
     tmp_path: Path,
     official_checkout: Path,
@@ -200,6 +240,61 @@ def test_identity_is_written_to_effective_official_experiment_directory(
     assert completed.returncode == 0
     assert not (output / "lehome_launch.json").exists()
     assert (output / "lehome-groot-baseline" / "lehome_launch.json").is_file()
+
+
+def test_chunk_launch_wraps_same_pinned_entrypoint_and_strips_token(
+    tmp_path: Path,
+    official_checkout: Path,
+) -> None:
+    output = tmp_path / "output-root"
+    calls: list[tuple[tuple[str, ...], dict[str, str], bool]] = []
+
+    def runner(
+        command: tuple[str, ...], *, env: dict[str, str], check: bool
+    ) -> subprocess.CompletedProcess[object]:
+        calls.append((command, env, check))
+        return subprocess.CompletedProcess(command, 0)
+
+    launch_finetune_to_step(
+        config(output_dir=str(output)),
+        stop_after_optimizer_step=1_000,
+        visible_devices="0",
+        environment={"HF_TOKEN": "must-not-reach-child", "PATH": "/bin"},
+        official_checkout=official_checkout,
+        runner=runner,
+    )
+
+    command, environment, checked = calls[0]
+    assert command[:5] == (
+        "python",
+        "-m",
+        "lehome_train.groot.chunk_launch",
+        "--stop-after-step",
+        "1000",
+    )
+    assert command[5] == "--"
+    assert command[6].endswith("gr00t/experiment/launch_finetune.py")
+    assert command[command.index("--max-steps") + 1] == "12000"
+    assert environment["CUDA_VISIBLE_DEVICES"] == "0"
+    assert "HF_TOKEN" not in environment
+    assert checked is True
+
+
+@pytest.mark.parametrize("stop", [-1, 12_001])
+def test_chunk_launch_rejects_invalid_stop_before_runner(
+    tmp_path: Path,
+    official_checkout: Path,
+    stop: int,
+) -> None:
+    with pytest.raises(ValueError, match="stop step"):
+        launch_finetune_to_step(
+            config(output_dir=str(tmp_path / "output")),
+            stop_after_optimizer_step=stop,
+            visible_devices="0",
+            environment={},
+            official_checkout=official_checkout,
+            runner=lambda *_args, **_kwargs: pytest.fail("runner must not execute"),
+        )
 
 
 def test_parser_returns_finite_structured_loss_throughput_and_checkpoint_timing() -> None:

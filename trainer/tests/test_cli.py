@@ -21,7 +21,17 @@ def test_cli_help() -> None:
 
 @pytest.mark.parametrize(
     "command",
-    ["data", "prepare", "memorize", "smoke", "train", "report", "sync"],
+    [
+        "data",
+        "model",
+        "prepare",
+        "memorize",
+        "smoke",
+        "train",
+        "report",
+        "sync",
+        "restore",
+    ],
 )
 def test_cli_registers_command_group(command: str) -> None:
     result = CliRunner().invoke(
@@ -34,7 +44,7 @@ def test_cli_registers_command_group(command: str) -> None:
     assert f"Usage: lehome-train {command}" in result.stdout
 
 
-@pytest.mark.parametrize("subcommand", ["inspect", "convert", "validate", "publish"])
+@pytest.mark.parametrize("subcommand", ["inspect", "convert", "validate", "publish", "retrieve"])
 def test_cli_registers_operational_data_subcommands(subcommand: str) -> None:
     result = CliRunner().invoke(app, ["data", subcommand, "--help"])
 
@@ -154,6 +164,130 @@ def test_data_commands_invoke_real_data_adapters(
         "validate",
         "publish",
     ]
+
+
+def test_image_native_retrieve_and_restore_dispatch_checked_transports(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    injected = {
+        "lehome_train.data.publish": SimpleNamespace(
+            download_prepared_dataset=lambda destination, **kwargs: calls.append(
+                ("retrieve", (destination, kwargs))
+            )
+            or destination,
+            write_prepared_snapshot_manifest=lambda dataset, destination, **kwargs: calls.append(
+                ("dataset-evidence", (dataset, destination, kwargs))
+            )
+            or destination,
+        ),
+        "lehome_train.commands.restore": SimpleNamespace(
+            restore_experiment_snapshot=lambda destination, **kwargs: calls.append(
+                ("restore", (destination, kwargs))
+            )
+            or destination
+        ),
+        "lehome_train.commands.sync": SimpleNamespace(
+            load_sync_result=lambda path: SimpleNamespace(
+                repository=DEFAULT_SETTINGS.model_repo,
+                immutable_revision="c" * 40,
+                manifest=SimpleNamespace(remote_prefix="experiments/example/" + "d" * 64),
+                source=path,
+            )
+        ),
+        "lehome_train.hub": SimpleNamespace(
+            HuggingFaceHubTransport=lambda **kwargs: ("transport", kwargs)
+        ),
+    }
+    previous = {name: sys.modules.get(name) for name in injected}
+    sys.modules.update(injected)
+    try:
+        retrieve = CliRunner().invoke(
+            app,
+            [
+                "data",
+                "retrieve",
+                "--destination",
+                str(tmp_path / "dataset"),
+                "--repo",
+                DEFAULT_SETTINGS.data_repo,
+                "--revision",
+                "a" * 40,
+                "--manifest-sha256",
+                "b" * 64,
+            ],
+        )
+        restore = CliRunner().invoke(
+            app,
+            [
+                "restore",
+                "--sync-result",
+                str(tmp_path / "sync-result.json"),
+                "--destination",
+                str(tmp_path / "experiment"),
+                "--staging-root",
+                str(tmp_path),
+            ],
+        )
+    finally:
+        for name, module in previous.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    assert retrieve.exit_code == 0
+    assert restore.exit_code == 0
+    assert [name for name, _value in calls] == [
+        "retrieve",
+        "dataset-evidence",
+        "restore",
+    ]
+    retrieve_kwargs = calls[0][1][1]
+    assert retrieve_kwargs["revision"] == "a" * 40
+    assert retrieve_kwargs["expected_manifest_sha256"] == "b" * 64
+
+
+def test_image_native_model_retrieve_is_pinned_beneath_cache() -> None:
+    calls: list[tuple[object, dict[str, object]]] = []
+    injected = {
+        "lehome_train.groot.model_snapshot": SimpleNamespace(
+            HuggingFaceModelSnapshotTransport=lambda **kwargs: (
+                "transport",
+                kwargs,
+            ),
+            download_base_model=lambda destination, **kwargs: calls.append(
+                (destination, kwargs)
+            )
+            or destination,
+        )
+    }
+    previous = {name: sys.modules.get(name) for name in injected}
+    sys.modules.update(injected)
+    try:
+        result = CliRunner().invoke(
+            app,
+            [
+                "model",
+                "retrieve",
+                "--destination",
+                "/cache/models/groot-n17",
+                "--revision",
+                DEFAULT_SETTINGS.model_revision,
+                "--staging-root",
+                "/cache/staging",
+            ],
+        )
+    finally:
+        for name, module in previous.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    assert result.exit_code == 0
+    assert calls[0][0] == Path("/cache/models/groot-n17")
+    assert calls[0][1]["revision"] == DEFAULT_SETTINGS.model_revision
 
 
 @pytest.mark.parametrize("command", ["prepare", "memorize", "smoke", "train"])

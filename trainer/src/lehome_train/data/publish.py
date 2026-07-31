@@ -453,3 +453,36 @@ def download_prepared_dataset(
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
+
+
+def write_prepared_snapshot_manifest(
+    dataset_path: str | os.PathLike[str],
+    destination_path: str | os.PathLike[str],
+    *,
+    revision: str,
+) -> Path:
+    """Write Task-6-compatible immutable evidence beside a retrieved dataset."""
+
+    if not isinstance(revision, str) or len(revision) != 40 or any(
+        character not in "0123456789abcdef" for character in revision
+    ):
+        raise ValueError("prepared snapshot revision must be an immutable commit")
+    dataset = Path(dataset_path)
+    entries = _validated_entries(dataset)
+    destination = Path(destination_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        destination,
+        {
+            "revision": revision,
+            "artifacts": [
+                {
+                    "relative_path": entry.relative_path,
+                    "sha256": entry.sha256,
+                    "byte_size": entry.byte_size,
+                }
+                for entry in entries
+            ],
+        },
+    )
+    return destination

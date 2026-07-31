@@ -92,9 +92,21 @@ def prepare_training_environment(
     if not hub_targets:
         raise ValueError("at least one configured private Hub target is required")
     configured_targets = {
-        (_config_revision(resolved_config, "model_repository"), model_revision),
         (_config_revision(resolved_config, "dataset_repository"), dataset_revision),
     }
+    artifact_repository = resolved_config.get("artifact_repository")
+    artifact_revision = resolved_config.get("artifact_revision")
+    if artifact_repository is not None or artifact_revision is not None:
+        configured_targets.add(
+            (
+                _config_revision(resolved_config, "artifact_repository"),
+                _config_revision(resolved_config, "artifact_revision"),
+            )
+        )
+    else:
+        configured_targets.add(
+            (_config_revision(resolved_config, "model_repository"), model_revision)
+        )
     if any((target.repository, target.revision) not in configured_targets for target in hub_targets):
         raise ValueError("Hub permission target must match a configured repository and revision")
     for target in hub_targets:
