@@ -232,7 +232,10 @@ def test_entrypoint_retains_token_only_for_controller_owned_remote_commands() ->
     entrypoint = (TRAINER / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
 
     assert 'case "${2:-}:${3:-}" in' in entrypoint
-    assert "train:*|restore:*|sync:*|data:publish|data:retrieve)" in entrypoint
+    assert (
+        "prepare:*|train:*|restore:*|sync:*|data:publish|data:retrieve|model:retrieve)"
+        in entrypoint
+    )
     assert "remote=true" in entrypoint
     assert "unset HF_TOKEN" in entrypoint
     assert "hf auth login" in entrypoint

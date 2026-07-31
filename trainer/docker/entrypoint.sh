@@ -31,7 +31,7 @@ fi
 
 remote=false
 case "${2:-}:${3:-}" in
-  train:*|restore:*|sync:*|data:publish|data:retrieve)
+  prepare:*|train:*|restore:*|sync:*|data:publish|data:retrieve|model:retrieve)
     remote=true
     ;;
 esac

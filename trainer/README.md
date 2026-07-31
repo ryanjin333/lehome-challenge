@@ -46,6 +46,17 @@ PY
 Use `create=False` to verify existing repositories without creating them. Any
 unapproved repository or repository that is not private is rejected.
 
+Hydrate the immutable base model on a fresh host only beneath `/cache`, using
+the exact approved revision and a caller-owned staging directory:
+
+```bash
+HF_TOKEN='<read-scoped-token>' lehome-train model retrieve \
+  --destination /cache/models/groot-n17 \
+  --repo nvidia/GR00T-N1.7-3B \
+  --revision 2fc962b973bccdd5d8ce4f67cc63b264d6886495 \
+  --staging-root /cache/staging
+```
+
 The complete operator workflow, request schemas, normalization contract,
 restore choices, and shutdown gate are in
 [the GR00T N1.7 training runbook](../docs/groot_n17_training.md).
@@ -130,11 +141,12 @@ byte-identical; only the published OCI digest identifies a release candidate.
 Every container invocation must mount writable `/cache`, `/prepared`, and
 `/output` directories. The image runs as `trainer`, rejects `hf auth login` and
 `huggingface-cli login`, and removes `HF_TOKEN` from every command except the
-controller-owned remote operations `train`, `restore`, `data retrieve`,
-`data publish`, and `sync`. Those controllers use only the explicit process
-token for Hub operations; the GR00T training subprocess independently strips
-it from its child environment. Models, datasets, outputs, and temporary state
-therefore remain on those mounts rather than in the immutable image.
+controller-owned remote operations `prepare`, `train`, `restore`,
+`data retrieve`, `data publish`, `model retrieve`, and `sync`. Those
+controllers use only the explicit process token for Hub operations; GR00T and
+Git subprocesses independently receive a scrubbed child environment. Models,
+datasets, outputs, and temporary state therefore remain on those mounts rather
+than in the immutable image.
 
 On a Linux NVIDIA host, the additional structural gate verifies exactly one
 visible GPU and performs one real AdamW optimizer step over a synthetic
@@ -160,8 +172,9 @@ On a fresh Linux x86_64 RTX PRO 6000 96 GB rental:
    and record a positive pull duration in seconds. Never accept a tag as
    experiment identity.
 3. Mount fresh `/cache`, `/prepared`, and `/output` volumes. Inject `HF_TOKEN`
-   only into the controller commands that retrieve data, train/upload,
-   restore, publish, or sync; run local `lehome-train prepare` without it.
+   only into the controller commands that retrieve data or the model, prepare,
+   train/upload, restore, publish, or sync. The controller uses it for remote
+   permission/readback checks while GR00T and Git children remain scrubbed.
 4. Measure from the start of the fresh-machine procedure to the first real
    GR00T optimizer step. It must be no more than 1,800 seconds.
 5. Complete the offline one-episode `memorize` gate.
