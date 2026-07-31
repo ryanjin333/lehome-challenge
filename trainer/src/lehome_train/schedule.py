@@ -9,6 +9,7 @@ import math
 TOTAL_SAMPLE_PRESENTATIONS = 768_000
 CHECKPOINT_SAMPLE_PRESENTATIONS = 64_000
 DEFAULT_WARMUP_FRACTION = 0.05
+DEFAULT_PEAK_LEARNING_RATE = 1e-4
 
 
 def _positive_integer(value: int, field_name: str) -> int:
@@ -110,9 +111,48 @@ class ExposureSchedule:
         interval = self.checkpoint_interval_steps
         return tuple(range(interval, self.total_optimizer_steps + 1, interval))
 
+    @property
+    def warmup_optimizer_steps(self) -> int:
+        raw_steps = self.total_optimizer_steps * float(self.warmup_fraction)
+        steps = round(raw_steps)
+        if not math.isclose(raw_steps, steps, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("warmup fraction must produce integral optimizer steps")
+        if not 0 < steps < self.total_optimizer_steps:
+            raise ValueError("warmup optimizer steps must be within the schedule")
+        return steps
+
+    def identity(self) -> dict[str, object]:
+        """Return every immutable input to the canonical LR schedule."""
+
+        return {
+            "schema_version": 1,
+            "physical_batch_size": self.physical_batch_size,
+            "sample_presentations": self.sample_presentations,
+            "total_optimizer_steps": self.total_optimizer_steps,
+            "checkpoint_sample_presentations": self.checkpoint_sample_presentations,
+            "checkpoint_interval_steps": self.checkpoint_interval_steps,
+            "warmup_fraction": float(self.warmup_fraction),
+            "warmup_optimizer_steps": self.warmup_optimizer_steps,
+            "scheduler_type": "cosine",
+            "decay_semantics": "cosine_remainder_after_warmup",
+            "base_learning_rate": 0.0,
+            "peak_learning_rate": DEFAULT_PEAK_LEARNING_RATE,
+        }
+
+    @property
+    def sha256(self) -> str:
+        from lehome_train.io import canonical_json_sha256
+
+        return canonical_json_sha256(self.identity())
+
     def learning_rate_multiplier(self, optimizer_step: int) -> float:
         return cosine_learning_rate_multiplier(
             optimizer_step,
             total_optimizer_steps=self.total_optimizer_steps,
             warmup_fraction=float(self.warmup_fraction),
+        )
+
+    def learning_rate(self, optimizer_step: int) -> float:
+        return DEFAULT_PEAK_LEARNING_RATE * self.learning_rate_multiplier(
+            optimizer_step
         )

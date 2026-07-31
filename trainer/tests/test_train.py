@@ -9,6 +9,7 @@ import pytest
 from lehome_train.checkpoints import GIBIBYTE, CheckpointDescriptor
 from lehome_train.commands.train import (
     NonFiniteTrainingLoss,
+    TrainingChunkRequest,
     TrainingChunkReceipt,
     run_fixed_exposure_training,
 )
@@ -64,12 +65,22 @@ def _smoke(config: ExperimentConfig) -> SmokeResult:
     )
 
 
-def _receipt(start: int, end: int, batch: int, *, finite: bool = True) -> TrainingChunkReceipt:
+def _receipt(
+    request: TrainingChunkRequest,
+    *,
+    finite: bool = True,
+    schedule_sha256: str | None = None,
+) -> TrainingChunkReceipt:
     return TrainingChunkReceipt(
-        start_optimizer_step=start,
-        end_optimizer_step=end,
-        sample_presentations=(end - start) * batch,
-        physical_batch_size=batch,
+        schedule_sha256=(
+            request.schedule_sha256 if schedule_sha256 is None else schedule_sha256
+        ),
+        start_optimizer_step=request.start_optimizer_step,
+        end_optimizer_step=request.end_optimizer_step,
+        sample_presentations=(
+            request.end_sample_presentations - request.start_sample_presentations
+        ),
+        physical_batch_size=request.physical_batch_size,
         finite_loss=finite,
     )
 
@@ -145,13 +156,11 @@ def test_training_requires_selected_compatible_smoke_result() -> None:
 
 def test_training_runs_exact_exposure_and_twelve_checkpoint_boundaries() -> None:
     config = _config(batch=64)
-    calls: list[tuple[int, int]] = []
+    calls: list[TrainingChunkRequest] = []
 
-    def runner(**request: object) -> TrainingChunkReceipt:
-        start = int(request["start_optimizer_step"])
-        end = int(request["end_optimizer_step"])
-        calls.append((start, end))
-        return _receipt(start, end, 64)
+    def runner(request: TrainingChunkRequest) -> TrainingChunkReceipt:
+        calls.append(request)
+        return _receipt(request)
 
     result = run_fixed_exposure_training(
         experiment_config=config,
@@ -169,6 +178,22 @@ def test_training_runs_exact_exposure_and_twelve_checkpoint_boundaries() -> None
     assert result.sample_presentations == 768_000
     assert len(calls) == len(result.checkpoints) == 12
     assert all(checkpoint.record.remotely_verified for checkpoint in result.checkpoints)
+    first = calls[0]
+    assert first.start_optimizer_step == 0
+    assert first.end_optimizer_step == 1_000
+    assert first.start_sample_presentations == 0
+    assert first.end_sample_presentations == 64_000
+    assert first.total_optimizer_steps == 12_000
+    assert first.warmup_optimizer_steps == 600
+    assert first.base_learning_rate == 0.0
+    assert first.peak_learning_rate == pytest.approx(1e-4)
+    assert first.start_learning_rate_multiplier == 0.0
+    assert first.end_learning_rate_multiplier < 1.0
+    assert first.start_learning_rate == 0.0
+    assert first.end_learning_rate == pytest.approx(
+        first.peak_learning_rate * first.end_learning_rate_multiplier
+    )
+    assert len({request.schedule_sha256 for request in calls}) == 1
 
 
 def test_training_aborts_immediately_on_non_finite_loss() -> None:
@@ -180,12 +205,7 @@ def test_training_aborts_immediately_on_non_finite_loss() -> None:
             experiment_config=config,
             selected_smoke=_smoke(config),
             normalization_sha256=SHA_C,
-            runner=lambda **request: _receipt(
-                int(request["start_optimizer_step"]),
-                int(request["end_optimizer_step"]),
-                64,
-                finite=False,
-            ),
+            runner=lambda request: _receipt(request, finite=False),
             checkpointer=lambda **values: checkpoint_calls.append(
                 int(values["optimizer_step"])
             ),
@@ -206,40 +226,57 @@ def test_training_resumes_only_after_verified_compatible_checkpoint() -> None:
             remotely_verified=True,
         ),
     )
-    starts: list[int] = []
+    requests: list[TrainingChunkRequest] = []
 
     result = run_fixed_exposure_training(
         experiment_config=config,
         selected_smoke=_smoke(config),
         normalization_sha256=SHA_C,
         resume_checkpoint=resume,
-        runner=lambda **request: starts.append(int(request["start_optimizer_step"]))
-        or _receipt(
-            int(request["start_optimizer_step"]),
-            int(request["end_optimizer_step"]),
-            64,
-        ),
+        runner=lambda request: requests.append(request) or _receipt(request),
         checkpointer=_checkpointer(config),
         uploader=lambda _checkpoint: True,
         disk_probe=lambda: 100 * GIBIBYTE,
         complete_checkpoint_bytes=GIBIBYTE,
     )
 
-    assert starts[0] == 2_000
+    first = requests[0]
+    assert first.start_optimizer_step == 2_000
+    assert first.start_sample_presentations == 128_000
+    assert first.start_learning_rate_multiplier > 0.0
+    assert first.start_learning_rate_multiplier < 1.0
+    assert first.start_learning_rate == pytest.approx(
+        first.peak_learning_rate * first.start_learning_rate_multiplier
+    )
+    assert first.resume_checkpoint == resume
     assert result.final_optimizer_step == 12_000
     assert len(result.checkpoints) == 11
+
+
+def test_training_rejects_runner_receipt_with_mismatched_schedule_identity() -> None:
+    config = _config()
+
+    with pytest.raises(ValueError, match="schedule identity"):
+        run_fixed_exposure_training(
+            experiment_config=config,
+            selected_smoke=_smoke(config),
+            normalization_sha256=SHA_C,
+            runner=lambda request: _receipt(request, schedule_sha256="f" * 64),
+            checkpointer=_checkpointer(config),
+            uploader=lambda _checkpoint: True,
+            disk_probe=lambda: 100 * GIBIBYTE,
+            complete_checkpoint_bytes=GIBIBYTE,
+        )
 
 
 def test_failed_upload_pauses_before_boundary_when_disk_reserve_is_insufficient() -> None:
     config = _config()
     runner_calls: list[int] = []
 
-    def runner(**request: object) -> TrainingChunkReceipt:
+    def runner(request: TrainingChunkRequest) -> TrainingChunkReceipt:
         sleep(0.01)
-        start = int(request["start_optimizer_step"])
-        end = int(request["end_optimizer_step"])
-        runner_calls.append(end)
-        return _receipt(start, end, 64)
+        runner_calls.append(request.end_optimizer_step)
+        return _receipt(request)
 
     result = run_fixed_exposure_training(
         experiment_config=config,
@@ -262,12 +299,10 @@ def test_disk_reserve_uses_largest_observed_complete_checkpoint() -> None:
     config = _config()
     runner_calls: list[int] = []
 
-    def runner(**request: object) -> TrainingChunkReceipt:
+    def runner(request: TrainingChunkRequest) -> TrainingChunkReceipt:
         sleep(0.01)
-        start = int(request["start_optimizer_step"])
-        end = int(request["end_optimizer_step"])
-        runner_calls.append(end)
-        return _receipt(start, end, 64)
+        runner_calls.append(request.end_optimizer_step)
+        return _receipt(request)
 
     result = run_fixed_exposure_training(
         experiment_config=config,
@@ -293,11 +328,7 @@ def test_training_records_optional_provider_metadata_without_rental_actions(tmp_
         experiment_config=config,
         selected_smoke=_smoke(config),
         normalization_sha256=SHA_C,
-        runner=lambda **request: _receipt(
-            int(request["start_optimizer_step"]),
-            int(request["end_optimizer_step"]),
-            64,
-        ),
+        runner=lambda request: _receipt(request),
         checkpointer=_checkpointer(config),
         uploader=lambda _checkpoint: True,
         disk_probe=lambda: 100 * GIBIBYTE,

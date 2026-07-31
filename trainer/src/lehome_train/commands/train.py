@@ -18,7 +18,11 @@ from lehome_train.checkpoints import (
 )
 from lehome_train.io import atomic_write_json, canonical_json_sha256
 from lehome_train.models import ExperimentConfig, SmokeResult
-from lehome_train.schedule import ExposureSchedule, TOTAL_SAMPLE_PRESENTATIONS
+from lehome_train.schedule import (
+    DEFAULT_PEAK_LEARNING_RATE,
+    ExposureSchedule,
+    TOTAL_SAMPLE_PRESENTATIONS,
+)
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -29,9 +33,92 @@ class NonFiniteTrainingLoss(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class TrainingChunkRequest:
+    """Immutable canonical schedule slice supplied to the training adapter."""
+
+    schedule_sha256: str
+    start_optimizer_step: int
+    end_optimizer_step: int
+    start_sample_presentations: int
+    end_sample_presentations: int
+    total_optimizer_steps: int
+    physical_batch_size: int
+    warmup_optimizer_steps: int
+    warmup_fraction: float
+    base_learning_rate: float
+    peak_learning_rate: float
+    start_learning_rate_multiplier: float
+    end_learning_rate_multiplier: float
+    start_learning_rate: float
+    end_learning_rate: float
+    resume_checkpoint: CheckpointDescriptor | None
+
+    def __post_init__(self) -> None:
+        if not _SHA256.fullmatch(self.schedule_sha256):
+            raise ValueError("training schedule SHA-256 is invalid")
+        for field_name in (
+            "start_optimizer_step",
+            "start_sample_presentations",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{field_name} must be nonnegative")
+        for field_name in (
+            "end_optimizer_step",
+            "end_sample_presentations",
+            "total_optimizer_steps",
+            "physical_batch_size",
+            "warmup_optimizer_steps",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{field_name} must be positive")
+        if self.end_optimizer_step <= self.start_optimizer_step:
+            raise ValueError("training chunk end step must follow its start")
+        if self.end_optimizer_step > self.total_optimizer_steps:
+            raise ValueError("training chunk exceeds the canonical schedule")
+        if self.end_sample_presentations <= self.start_sample_presentations:
+            raise ValueError("training chunk end presentations must follow its start")
+        if self.start_sample_presentations != (
+            self.start_optimizer_step * self.physical_batch_size
+        ) or self.end_sample_presentations != (
+            self.end_optimizer_step * self.physical_batch_size
+        ):
+            raise ValueError("training chunk presentations do not match its step range")
+        if not 0 < self.warmup_optimizer_steps < self.total_optimizer_steps:
+            raise ValueError("warmup optimizer steps must be within the schedule")
+        for field_name in (
+            "warmup_fraction",
+            "base_learning_rate",
+            "peak_learning_rate",
+            "start_learning_rate_multiplier",
+            "end_learning_rate_multiplier",
+            "start_learning_rate",
+            "end_learning_rate",
+        ):
+            value = getattr(self, field_name)
+            if type(value) not in (int, float) or not math.isfinite(float(value)):
+                raise ValueError(f"{field_name} must be finite")
+        if not 0 < self.warmup_fraction < 1:
+            raise ValueError("warmup fraction must be strictly between zero and one")
+        if self.base_learning_rate != 0.0 or self.peak_learning_rate <= 0:
+            raise ValueError("training learning-rate bounds are invalid")
+        if not 0 <= self.start_learning_rate_multiplier <= 1:
+            raise ValueError("start learning-rate multiplier is invalid")
+        if not 0 <= self.end_learning_rate_multiplier <= 1:
+            raise ValueError("end learning-rate multiplier is invalid")
+        if self.resume_checkpoint is not None and not isinstance(
+            self.resume_checkpoint,
+            CheckpointDescriptor,
+        ):
+            raise TypeError("resume checkpoint must be a CheckpointDescriptor")
+
+
+@dataclass(frozen=True, slots=True)
 class TrainingChunkReceipt:
     """Progress evidence returned by an injected persistent trainer."""
 
+    schedule_sha256: str
     start_optimizer_step: int
     end_optimizer_step: int
     sample_presentations: int
@@ -39,6 +126,8 @@ class TrainingChunkReceipt:
     finite_loss: bool
 
     def __post_init__(self) -> None:
+        if not _SHA256.fullmatch(self.schedule_sha256):
+            raise ValueError("training receipt schedule SHA-256 is invalid")
         if type(self.start_optimizer_step) is not int or self.start_optimizer_step < 0:
             raise ValueError("training chunk start step must be nonnegative")
         if (
@@ -55,14 +144,7 @@ class TrainingChunkReceipt:
 
 
 class TrainingRunner(Protocol):
-    def __call__(
-        self,
-        *,
-        start_optimizer_step: int,
-        end_optimizer_step: int,
-        physical_batch_size: int,
-        resume_checkpoint: CheckpointDescriptor | None,
-    ) -> TrainingChunkReceipt: ...
+    def __call__(self, request: TrainingChunkRequest) -> TrainingChunkReceipt: ...
 
 
 class Checkpointer(Protocol):
@@ -81,6 +163,7 @@ class TrainingRunResult:
     status: Literal["completed", "paused_disk_reserve"]
     experiment_id: str
     experiment_config_sha256: str
+    schedule_sha256: str
     physical_batch_size: int
     final_optimizer_step: int
     sample_presentations: int
@@ -95,6 +178,7 @@ class TrainingRunResult:
             "status": self.status,
             "experiment_id": self.experiment_id,
             "experiment_config_sha256": self.experiment_config_sha256,
+            "schedule_sha256": self.schedule_sha256,
             "physical_batch_size": self.physical_batch_size,
             "final_optimizer_step": self.final_optimizer_step,
             "sample_presentations": self.sample_presentations,
@@ -135,24 +219,57 @@ def _validate_selected_smoke(
 def _validate_chunk(
     receipt: object,
     *,
-    start_optimizer_step: int,
-    end_optimizer_step: int,
-    physical_batch_size: int,
+    request: TrainingChunkRequest,
 ) -> TrainingChunkReceipt:
     if not isinstance(receipt, TrainingChunkReceipt):
         raise TypeError("training runner must return TrainingChunkReceipt")
-    if receipt.start_optimizer_step != start_optimizer_step:
+    if receipt.schedule_sha256 != request.schedule_sha256:
+        raise ValueError("training runner receipt schedule identity is incompatible")
+    if receipt.start_optimizer_step != request.start_optimizer_step:
         raise ValueError("training chunk start step is not monotonic")
-    if receipt.end_optimizer_step != end_optimizer_step:
+    if receipt.end_optimizer_step != request.end_optimizer_step:
         raise ValueError("training chunk did not reach the checkpoint boundary")
-    if receipt.physical_batch_size != physical_batch_size:
+    if receipt.physical_batch_size != request.physical_batch_size:
         raise ValueError("training chunk changed the selected physical batch")
-    expected_presentations = (end_optimizer_step - start_optimizer_step) * physical_batch_size
+    expected_presentations = (
+        request.end_sample_presentations - request.start_sample_presentations
+    )
     if receipt.sample_presentations != expected_presentations:
         raise ValueError("training chunk presentation count is incompatible")
     if not receipt.finite_loss:
         raise NonFiniteTrainingLoss("training aborted immediately after non-finite loss")
     return receipt
+
+
+def _chunk_request(
+    schedule: ExposureSchedule,
+    *,
+    start_optimizer_step: int,
+    end_optimizer_step: int,
+    resume_checkpoint: CheckpointDescriptor | None,
+) -> TrainingChunkRequest:
+    start_multiplier = schedule.learning_rate_multiplier(start_optimizer_step)
+    end_multiplier = schedule.learning_rate_multiplier(end_optimizer_step)
+    return TrainingChunkRequest(
+        schedule_sha256=schedule.sha256,
+        start_optimizer_step=start_optimizer_step,
+        end_optimizer_step=end_optimizer_step,
+        start_sample_presentations=(
+            start_optimizer_step * schedule.physical_batch_size
+        ),
+        end_sample_presentations=end_optimizer_step * schedule.physical_batch_size,
+        total_optimizer_steps=schedule.total_optimizer_steps,
+        physical_batch_size=schedule.physical_batch_size,
+        warmup_optimizer_steps=schedule.warmup_optimizer_steps,
+        warmup_fraction=float(schedule.warmup_fraction),
+        base_learning_rate=0.0,
+        peak_learning_rate=DEFAULT_PEAK_LEARNING_RATE,
+        start_learning_rate_multiplier=start_multiplier,
+        end_learning_rate_multiplier=end_multiplier,
+        start_learning_rate=schedule.learning_rate(start_optimizer_step),
+        end_learning_rate=schedule.learning_rate(end_optimizer_step),
+        resume_checkpoint=resume_checkpoint,
+    )
 
 
 def _replace_verified(
@@ -262,18 +379,17 @@ def run_fixed_exposure_training(
                     status = "paused_disk_reserve"
                     break
 
-            receipt = runner(
+            request = _chunk_request(
+                schedule,
                 start_optimizer_step=start_step,
                 end_optimizer_step=boundary_step,
-                physical_batch_size=experiment_config.physical_batch_size,
                 resume_checkpoint=first_resume,
             )
+            receipt = runner(request)
             first_resume = None
             _validate_chunk(
                 receipt,
-                start_optimizer_step=start_step,
-                end_optimizer_step=boundary_step,
-                physical_batch_size=experiment_config.physical_batch_size,
+                request=request,
             )
             sample_presentations = boundary_step * experiment_config.physical_batch_size
             checkpoint = checkpointer(
@@ -308,6 +424,7 @@ def run_fixed_exposure_training(
         status=status,
         experiment_id=smoke.experiment_id,
         experiment_config_sha256=config_sha256,
+        schedule_sha256=schedule.sha256,
         physical_batch_size=experiment_config.physical_batch_size,
         final_optimizer_step=start_step,
         sample_presentations=start_step * experiment_config.physical_batch_size,
