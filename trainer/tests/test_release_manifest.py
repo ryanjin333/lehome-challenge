@@ -167,6 +167,12 @@ def test_workflow_never_embeds_a_pat_and_gpu_gate_is_explicit() -> None:
     assert "type=raw,value=${{ github.sha }}" in workflow
 
 
+def test_image_verifier_makes_ephemeral_bind_mounts_writable_by_container_user() -> None:
+    verifier = (TRAINER / "scripts" / "verify-image.sh").read_text(encoding="utf-8")
+
+    assert 'chmod 0777 "$mount_root/cache" "$mount_root/prepared" "$mount_root/output"' in verifier
+
+
 def test_production_runtime_factory_is_not_a_successful_noop() -> None:
     from lehome_train.groot.production_runtime import create
 

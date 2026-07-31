@@ -44,6 +44,7 @@ fi
 mount_root=$(mktemp -d)
 trap 'rm -rf "$mount_root"' EXIT
 mkdir -p "$mount_root/cache" "$mount_root/prepared" "$mount_root/output"
+chmod 0777 "$mount_root/cache" "$mount_root/prepared" "$mount_root/output"
 run=(docker run --rm --platform linux/amd64
   -v "$mount_root/cache:/cache"
   -v "$mount_root/prepared:/prepared"
