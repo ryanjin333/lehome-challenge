@@ -196,23 +196,35 @@ def test_disk_reserve_holds_two_more_complete_checkpoints_plus_twenty_gib() -> N
 
 def test_upload_retries_exactly_five_times_with_bounded_delays() -> None:
     attempts: list[int] = []
+    timeouts: list[float] = []
     delays: list[float] = []
+
+    def unavailable(
+        _checkpoint: CheckpointDescriptor,
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        attempts.append(1)
+        timeouts.append(timeout_seconds)
+        return False
 
     uploaded = retry_checkpoint_upload(
         _checkpoint(1_000),
-        uploader=lambda _checkpoint: attempts.append(1) or False,
+        uploader=unavailable,
+        attempt_timeout_seconds=0.25,
         sleeper=delays.append,
     )
 
     assert uploaded is False
     assert len(attempts) == 5
+    assert timeouts == [0.25] * 5
     assert len(delays) == 4
     assert max(delays) <= 1.0
 
 
 def test_async_upload_marks_only_verified_successes() -> None:
     with AsyncCheckpointUploads(
-        uploader=lambda _checkpoint: True,
+        uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds > 0,
         sleeper=lambda _delay: None,
     ) as uploads:
         uploads.submit(_checkpoint(1_000))

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 
 import pytest
 
@@ -135,7 +135,7 @@ def test_training_requires_selected_compatible_smoke_result() -> None:
             normalization_sha256=SHA_C,
             runner=lambda **_kwargs: pytest.fail("runner must not start"),
             checkpointer=_checkpointer(config),
-            uploader=lambda _checkpoint: True,
+            uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds > 0,
             disk_probe=lambda: 100 * GIBIBYTE,
             estimated_checkpoint_bytes=GIBIBYTE,
             checkpoint_deleter=lambda _checkpoint: None,
@@ -148,7 +148,7 @@ def test_training_requires_selected_compatible_smoke_result() -> None:
             normalization_sha256=SHA_C,
             runner=lambda **_kwargs: pytest.fail("runner must not start"),
             checkpointer=_checkpointer(config),
-            uploader=lambda _checkpoint: True,
+            uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds > 0,
             disk_probe=lambda: 100 * GIBIBYTE,
             estimated_checkpoint_bytes=GIBIBYTE,
             checkpoint_deleter=lambda _checkpoint: None,
@@ -165,7 +165,7 @@ def test_training_requires_selected_compatible_smoke_result() -> None:
             normalization_sha256=SHA_C,
             runner=lambda **_kwargs: pytest.fail("runner must not start"),
             checkpointer=_checkpointer(config),
-            uploader=lambda _checkpoint: True,
+            uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds > 0,
             disk_probe=lambda: 100 * GIBIBYTE,
             estimated_checkpoint_bytes=GIBIBYTE,
             checkpoint_deleter=lambda _checkpoint: None,
@@ -186,7 +186,7 @@ def test_training_runs_exact_exposure_and_twelve_checkpoint_boundaries() -> None
         normalization_sha256=SHA_C,
         runner=runner,
         checkpointer=_checkpointer(config),
-        uploader=lambda _checkpoint: True,
+        uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds > 0,
         disk_probe=lambda: 100 * GIBIBYTE,
         estimated_checkpoint_bytes=GIBIBYTE,
         checkpoint_deleter=lambda _checkpoint: None,
@@ -234,7 +234,7 @@ def test_training_aborts_immediately_on_non_finite_loss() -> None:
             checkpointer=lambda **values: checkpoint_calls.append(
                 int(values["optimizer_step"])
             ),
-            uploader=lambda _checkpoint: True,
+            uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds > 0,
             disk_probe=lambda: 100 * GIBIBYTE,
             estimated_checkpoint_bytes=GIBIBYTE,
             checkpoint_deleter=lambda _checkpoint: None,
@@ -269,7 +269,7 @@ def test_training_resumes_only_after_verified_compatible_checkpoint() -> None:
         resume_checkpoint=resume,
         runner=lambda request: requests.append(request) or _receipt(request),
         checkpointer=_checkpointer(config),
-        uploader=lambda _checkpoint: True,
+        uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds > 0,
         disk_probe=lambda: 100 * GIBIBYTE,
         estimated_checkpoint_bytes=GIBIBYTE,
         checkpoint_deleter=lambda _checkpoint: None,
@@ -299,7 +299,7 @@ def test_training_rejects_runner_receipt_with_mismatched_schedule_identity() -> 
             normalization_sha256=SHA_C,
             runner=lambda request: _receipt(request, schedule_sha256="f" * 64),
             checkpointer=_checkpointer(config),
-            uploader=lambda _checkpoint: True,
+            uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds > 0,
             disk_probe=lambda: 100 * GIBIBYTE,
             estimated_checkpoint_bytes=GIBIBYTE,
             checkpoint_deleter=lambda _checkpoint: None,
@@ -324,7 +324,7 @@ def test_training_rejects_runner_receipt_with_mismatched_chunk_input() -> None:
             normalization_sha256=SHA_C,
             runner=runner,
             checkpointer=_checkpointer(config),
-            uploader=lambda _checkpoint: True,
+            uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds > 0,
             disk_probe=lambda: 100 * GIBIBYTE,
             estimated_checkpoint_bytes=GIBIBYTE,
             checkpoint_deleter=lambda _checkpoint: None,
@@ -346,7 +346,7 @@ def test_first_boundary_pauses_before_training_when_disk_reserve_is_insufficient
         normalization_sha256=SHA_C,
         runner=runner,
         checkpointer=_checkpointer(config),
-        uploader=lambda _checkpoint: False,
+        uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds < 0,
         disk_probe=lambda: 22 * GIBIBYTE - 1,
         estimated_checkpoint_bytes=GIBIBYTE,
         checkpoint_deleter=lambda _checkpoint: None,
@@ -373,7 +373,7 @@ def test_disk_reserve_uses_largest_observed_complete_checkpoint() -> None:
         normalization_sha256=SHA_C,
         runner=runner,
         checkpointer=_checkpointer(config, byte_size=5 * GIBIBYTE),
-        uploader=lambda _checkpoint: False,
+        uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds < 0,
         disk_probe=lambda: 25 * GIBIBYTE,
         estimated_checkpoint_bytes=GIBIBYTE,
         checkpoint_deleter=lambda _checkpoint: None,
@@ -394,7 +394,7 @@ def test_terminal_upload_failure_is_not_completed_or_disposable() -> None:
         normalization_sha256=SHA_C,
         runner=lambda request: _receipt(request),
         checkpointer=_checkpointer(config),
-        uploader=lambda _checkpoint: False,
+        uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds < 0,
         disk_probe=lambda: 100 * GIBIBYTE,
         estimated_checkpoint_bytes=GIBIBYTE,
         checkpoint_deleter=deleted.append,
@@ -424,7 +424,7 @@ def test_pruning_deletes_only_superseded_locally_and_remotely_verified_artifacts
         normalization_sha256=SHA_C,
         runner=runner,
         checkpointer=_checkpointer(config),
-        uploader=lambda _checkpoint: True,
+        uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds > 0,
         disk_probe=lambda: 100 * GIBIBYTE,
         estimated_checkpoint_bytes=GIBIBYTE,
         checkpoint_deleter=deleted.append,
@@ -437,6 +437,9 @@ def test_pruning_deletes_only_superseded_locally_and_remotely_verified_artifacts
     assert all(item.locally_verified for item in deleted)
     assert all(item.record.remotely_verified for item in deleted)
     assert all(item.record.optimizer_step < latest.record.optimizer_step for item in deleted)
+    assert {item.record.optimizer_step for item in deleted} == set(
+        range(1_000, 12_000, 1_000)
+    )
     deleted_steps = {item.record.optimizer_step for item in deleted}
     assert all(
         not item.locally_verified
@@ -455,7 +458,7 @@ def test_training_records_optional_provider_metadata_without_rental_actions(tmp_
         normalization_sha256=SHA_C,
         runner=lambda request: _receipt(request),
         checkpointer=_checkpointer(config),
-        uploader=lambda _checkpoint: True,
+        uploader=lambda _checkpoint, *, timeout_seconds: timeout_seconds > 0,
         disk_probe=lambda: 100 * GIBIBYTE,
         estimated_checkpoint_bytes=GIBIBYTE,
         checkpoint_deleter=lambda _checkpoint: None,
@@ -467,3 +470,40 @@ def test_training_records_optional_provider_metadata_without_rental_actions(tmp_
     assert result.provider_hourly_price == 1.75
     assert result.instance_start_time == "2026-07-31T12:00:00Z"
     assert '"provider_hourly_price":1.75' in status_path.read_text(encoding="utf-8")
+
+
+def test_hung_upload_returns_boundedly_and_never_becomes_verified_later() -> None:
+    config = _config()
+
+    def ignores_timeout(
+        _checkpoint: CheckpointDescriptor,
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        assert timeout_seconds == pytest.approx(0.005)
+        sleep(0.1)
+        return True
+
+    started = monotonic()
+    result = run_fixed_exposure_training(
+        experiment_config=config,
+        selected_smoke=_smoke(config),
+        normalization_sha256=SHA_C,
+        runner=lambda request: _receipt(request),
+        checkpointer=_checkpointer(config),
+        uploader=ignores_timeout,
+        disk_probe=lambda: 100 * GIBIBYTE,
+        estimated_checkpoint_bytes=GIBIBYTE,
+        checkpoint_deleter=lambda _checkpoint: None,
+        upload_attempt_timeout_seconds=0.005,
+        upload_max_attempts=1,
+        upload_sleeper=lambda _delay: None,
+    )
+    elapsed = monotonic() - started
+
+    assert elapsed < 0.3
+    assert result.status == "upload_failed"
+    assert result.disposable is False
+    assert all(not item.record.remotely_verified for item in result.checkpoints)
+    sleep(0.11)
+    assert all(not item.record.remotely_verified for item in result.checkpoints)

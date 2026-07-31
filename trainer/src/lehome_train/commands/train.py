@@ -12,6 +12,8 @@ from lehome_train.batch_select import has_required_headroom
 from lehome_train.checkpoints import (
     AsyncCheckpointUploads,
     CheckpointDescriptor,
+    CheckpointUploader,
+    MAX_UPLOAD_ATTEMPTS,
     can_begin_checkpoint_chunk,
     prunable_checkpoints,
     require_compatible_checkpoint,
@@ -329,6 +331,21 @@ def _mark_local_artifact_deleted(
     raise ValueError("deleted checkpoint is absent from the run catalog")
 
 
+def _prune_retained_checkpoints(
+    *,
+    checkpoints: list[CheckpointDescriptor],
+    retained_checkpoints: list[CheckpointDescriptor],
+    protected_checkpoint: CheckpointDescriptor | None,
+    checkpoint_deleter: Callable[[CheckpointDescriptor], None],
+) -> None:
+    for checkpoint in prunable_checkpoints(retained_checkpoints, keep_newest=0):
+        if checkpoint == protected_checkpoint:
+            continue
+        checkpoint_deleter(checkpoint)
+        _mark_local_artifact_deleted(checkpoints, checkpoint)
+        retained_checkpoints.remove(checkpoint)
+
+
 def _validate_provider_metadata(
     provider_hourly_price: float | None,
     instance_start_time: str | None,
@@ -352,11 +369,13 @@ def run_fixed_exposure_training(
     normalization_sha256: str,
     runner: TrainingRunner,
     checkpointer: Checkpointer,
-    uploader: Callable[[CheckpointDescriptor], bool],
+    uploader: CheckpointUploader,
     disk_probe: Callable[[], int],
     estimated_checkpoint_bytes: int,
     checkpoint_deleter: Callable[[CheckpointDescriptor], None],
     resume_checkpoint: CheckpointDescriptor | None = None,
+    upload_attempt_timeout_seconds: float = 30.0,
+    upload_max_attempts: int = MAX_UPLOAD_ATTEMPTS,
     upload_sleeper: Callable[[float], None] | None = None,
     provider_hourly_price: float | None = None,
     instance_start_time: str | None = None,
@@ -414,7 +433,12 @@ def run_fixed_exposure_training(
     status: Literal["completed", "paused_disk_reserve", "upload_failed"] = "completed"
     observed_checkpoint_bytes = estimated_checkpoint_bytes
     sleeper = upload_sleeper if upload_sleeper is not None else __import__("time").sleep
-    with AsyncCheckpointUploads(uploader=uploader, sleeper=sleeper) as uploads:
+    with AsyncCheckpointUploads(
+        uploader=uploader,
+        attempt_timeout_seconds=upload_attempt_timeout_seconds,
+        max_attempts=upload_max_attempts,
+        sleeper=sleeper,
+    ) as uploads:
         for boundary_step in schedule.checkpoint_steps:
             if boundary_step <= start_step:
                 continue
@@ -433,15 +457,12 @@ def run_fixed_exposure_training(
                     chain_checkpoint,
                 )
 
-            for checkpoint in prunable_checkpoints(
-                retained_checkpoints,
-                keep_newest=0,
-            ):
-                if checkpoint == chain_checkpoint:
-                    continue
-                checkpoint_deleter(checkpoint)
-                _mark_local_artifact_deleted(checkpoints, checkpoint)
-                retained_checkpoints.remove(checkpoint)
+            _prune_retained_checkpoints(
+                checkpoints=checkpoints,
+                retained_checkpoints=retained_checkpoints,
+                protected_checkpoint=chain_checkpoint,
+                checkpoint_deleter=checkpoint_deleter,
+            )
 
             writable_free_bytes = disk_probe()
             if not can_begin_checkpoint_chunk(
@@ -493,6 +514,12 @@ def run_fixed_exposure_training(
         verified = uploads.finish()
         _replace_verified(checkpoints, verified)
         _replace_verified(retained_checkpoints, verified)
+        _prune_retained_checkpoints(
+            checkpoints=checkpoints,
+            retained_checkpoints=retained_checkpoints,
+            protected_checkpoint=chain_checkpoint,
+            checkpoint_deleter=checkpoint_deleter,
+        )
         failed_upload_steps = tuple(
             sorted(item.record.optimizer_step for item in uploads.failed)
         )

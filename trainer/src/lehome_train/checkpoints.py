@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
 import json
+import math
 import re
 from pathlib import Path
-from time import sleep
-from typing import Callable, Iterable, Mapping
+from queue import Queue
+from threading import Thread
+from time import monotonic, sleep
+from typing import Callable, Iterable, Mapping, Protocol
 
 from lehome_train.io import atomic_write_json
 from lehome_train.models import CheckpointRecord, model_from_mapping
@@ -254,7 +257,33 @@ def can_begin_checkpoint_chunk(
     )
 
 
-CheckpointUploader = Callable[[CheckpointDescriptor], bool]
+class CheckpointUploader(Protocol):
+    """Transport that must enforce the supplied timeout on each attempt."""
+
+    def __call__(
+        self,
+        checkpoint: CheckpointDescriptor,
+        *,
+        timeout_seconds: float,
+    ) -> bool: ...
+
+
+def _retry_delays(max_attempts: int) -> tuple[float, ...]:
+    return tuple(
+        min(
+            _INITIAL_RETRY_DELAY_SECONDS * (2**attempt),
+            _MAX_RETRY_DELAY_SECONDS,
+        )
+        for attempt in range(max_attempts - 1)
+    )
+
+
+def _upload_deadline_budget(
+    *,
+    max_attempts: int,
+    attempt_timeout_seconds: float,
+) -> float:
+    return max_attempts * attempt_timeout_seconds + sum(_retry_delays(max_attempts))
 
 
 def retry_checkpoint_upload(
@@ -262,6 +291,7 @@ def retry_checkpoint_upload(
     *,
     uploader: CheckpointUploader,
     max_attempts: int = MAX_UPLOAD_ATTEMPTS,
+    attempt_timeout_seconds: float = 30.0,
     sleeper: Callable[[float], None] = sleep,
 ) -> bool:
     """Attempt one verified upload at most five times with bounded backoff."""
@@ -270,9 +300,19 @@ def retry_checkpoint_upload(
         raise TypeError("checkpoint must be a CheckpointDescriptor")
     if type(max_attempts) is not int or not 1 <= max_attempts <= MAX_UPLOAD_ATTEMPTS:
         raise ValueError("max_attempts must be between one and five")
+    if (
+        type(attempt_timeout_seconds) not in (int, float)
+        or not math.isfinite(float(attempt_timeout_seconds))
+        or attempt_timeout_seconds <= 0
+    ):
+        raise ValueError("attempt timeout seconds must be finite and positive")
+    delays = _retry_delays(max_attempts)
     for attempt in range(max_attempts):
         try:
-            uploaded = uploader(checkpoint)
+            uploaded = uploader(
+                checkpoint,
+                timeout_seconds=float(attempt_timeout_seconds),
+            )
         except Exception:
             uploaded = False
         if type(uploaded) is not bool:
@@ -280,12 +320,7 @@ def retry_checkpoint_upload(
         if uploaded:
             return True
         if attempt + 1 < max_attempts:
-            sleeper(
-                min(
-                    _INITIAL_RETRY_DELAY_SECONDS * (2**attempt),
-                    _MAX_RETRY_DELAY_SECONDS,
-                )
-            )
+            sleeper(delays[attempt])
     return False
 
 
@@ -296,16 +331,67 @@ class AsyncCheckpointUploads:
         self,
         *,
         uploader: CheckpointUploader,
+        attempt_timeout_seconds: float = 30.0,
+        max_attempts: int = MAX_UPLOAD_ATTEMPTS,
         sleeper: Callable[[float], None] = sleep,
     ) -> None:
+        if type(max_attempts) is not int or not 1 <= max_attempts <= MAX_UPLOAD_ATTEMPTS:
+            raise ValueError("max_attempts must be between one and five")
+        if (
+            type(attempt_timeout_seconds) not in (int, float)
+            or not math.isfinite(float(attempt_timeout_seconds))
+            or attempt_timeout_seconds <= 0
+        ):
+            raise ValueError("attempt timeout seconds must be finite and positive")
         self._uploader = uploader
+        self._attempt_timeout_seconds = float(attempt_timeout_seconds)
+        self._max_attempts = max_attempts
+        self._deadline_budget = _upload_deadline_budget(
+            max_attempts=max_attempts,
+            attempt_timeout_seconds=attempt_timeout_seconds,
+        )
+        if not math.isfinite(self._deadline_budget) or self._deadline_budget <= 0:
+            raise ValueError("upload deadline budget must be finite and positive")
         self._sleeper = sleeper
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="checkpoint-upload")
         self._pending: dict[Future[bool], CheckpointDescriptor] = {}
         self._completed: list[CheckpointDescriptor] = []
         self._failed: list[CheckpointDescriptor] = []
         self._submitted_steps: set[int] = set()
         self._closed = False
+        self._deadline_expired = False
+        self._work_queue: Queue[
+            tuple[Future[bool], CheckpointDescriptor] | None
+        ] = Queue()
+        self._worker = Thread(
+            target=self._run_worker,
+            name="checkpoint-upload",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _run_worker(self) -> None:
+        while True:
+            work = self._work_queue.get()
+            try:
+                if work is None:
+                    return
+                future, checkpoint = work
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    uploaded = retry_checkpoint_upload(
+                        checkpoint,
+                        uploader=self._uploader,
+                        max_attempts=self._max_attempts,
+                        attempt_timeout_seconds=self._attempt_timeout_seconds,
+                        sleeper=self._sleeper,
+                    )
+                except BaseException as error:
+                    future.set_exception(error)
+                else:
+                    future.set_result(uploaded)
+            finally:
+                self._work_queue.task_done()
 
     @property
     def failed(self) -> tuple[CheckpointDescriptor, ...]:
@@ -322,13 +408,9 @@ class AsyncCheckpointUploads:
         if step in self._submitted_steps:
             raise ValueError("checkpoint upload was already submitted")
         self._submitted_steps.add(step)
-        future = self._executor.submit(
-            retry_checkpoint_upload,
-            checkpoint,
-            uploader=self._uploader,
-            sleeper=self._sleeper,
-        )
+        future: Future[bool] = Future()
         self._pending[future] = checkpoint
+        self._work_queue.put((future, checkpoint))
 
     def poll(self) -> tuple[CheckpointDescriptor, ...]:
         """Harvest completed work without waiting for active uploads."""
@@ -352,8 +434,19 @@ class AsyncCheckpointUploads:
     def finish(self) -> tuple[CheckpointDescriptor, ...]:
         """Wait for bounded workers and return every verified descriptor."""
 
-        for future in tuple(self._pending):
-            future.result()
+        pending = tuple(self._pending)
+        deadline = monotonic() + self._deadline_budget * len(pending)
+        for future in pending:
+            remaining = deadline - monotonic()
+            try:
+                future.result(timeout=max(0.0, remaining))
+            except FutureTimeoutError:
+                self._deadline_expired = True
+                for pending_future, checkpoint in tuple(self._pending.items()):
+                    pending_future.cancel()
+                    self._failed.append(checkpoint)
+                    del self._pending[pending_future]
+                break
         self.poll()
         return tuple(self._completed)
 
@@ -364,7 +457,9 @@ class AsyncCheckpointUploads:
             self.finish()
         finally:
             self._closed = True
-            self._executor.shutdown(wait=True, cancel_futures=False)
+            self._work_queue.put(None)
+            if not self._deadline_expired:
+                self._worker.join()
 
     def __enter__(self) -> "AsyncCheckpointUploads":
         return self
