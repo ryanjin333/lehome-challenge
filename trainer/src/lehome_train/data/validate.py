@@ -12,7 +12,11 @@ from typing import Any, Mapping
 
 from lehome_train.data.inspect import read_json_object
 from lehome_train.data.stats import _data_path, _reject_openpi_statistics
-from lehome_train.groot.modality import modality_contract
+from lehome_train.groot.modality import (
+    modality_contract,
+    runtime_modality_config_source,
+    validate_runtime_modality_config,
+)
 from lehome_train.io import atomic_write_json, canonical_json_sha256, sha256_file
 
 
@@ -116,20 +120,57 @@ def _validate_offline_split(dataset: Path, train: list[str], validation: list[st
         _data_path(dataset, episode_id)
 
 
-def _validate_modality(dataset: Path) -> None:
+def _manifest_modality_sha256(manifest: Mapping[str, Any]) -> str:
+    statistics = manifest.get("statistics")
+    if not isinstance(statistics, Mapping):
+        raise ValueError("prepared manifest has no train-only statistics record")
+    files = statistics.get("files")
+    if not isinstance(files, list):
+        raise ValueError("prepared manifest statistics files are invalid")
+    matches = [
+        item
+        for item in files
+        if isinstance(item, Mapping)
+        and item.get("relative_path") == "meta/lehome_groot_modality.py"
+    ]
+    if len(matches) != 1 or not isinstance(matches[0].get("sha256"), str):
+        raise ValueError("prepared manifest lacks the modality configuration hash")
+    digest = matches[0]["sha256"]
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("prepared manifest modality configuration hash is invalid")
+    return digest
+
+
+def _validate_modality_metadata(dataset: Path) -> None:
+    metadata = read_json_object(dataset / "meta" / "modality.json")
+    expected_groups = {
+        "left_arm": (0, 5),
+        "left_gripper": (5, 6),
+        "right_arm": (6, 11),
+        "right_gripper": (11, 12),
+    }
+    for modality in ("state", "action"):
+        groups = metadata.get(modality)
+        if not isinstance(groups, Mapping) or set(groups) != set(expected_groups):
+            raise ValueError(f"prepared modality metadata has invalid {modality} groups")
+        for group, (start, end) in expected_groups.items():
+            value = groups[group]
+            if not isinstance(value, Mapping) or value.get("start") != start or value.get("end") != end:
+                raise ValueError(f"prepared modality metadata has invalid {modality} dimensions")
+            if value.get("original_key") != ("observation.state" if modality == "state" else "action"):
+                raise ValueError(f"prepared modality metadata has invalid {modality} source key")
+
+
+def _validate_modality(dataset: Path, manifest: Mapping[str, Any]) -> None:
     path = dataset / "meta" / "lehome_groot_modality.py"
     if not path.is_file():
         raise ValueError("prepared GR00T modality configuration is missing")
     source = path.read_text(encoding="utf-8")
-    required = (
-        '"top_rgb", "left_rgb", "right_rgb"',
-        '"left_arm", "left_gripper", "right_arm", "right_gripper"',
-        "list(range(16))",
-        "ActionRepresentation.RELATIVE",
-        "ActionRepresentation.ABSOLUTE",
-    )
-    if any(fragment not in source for fragment in required):
-        raise ValueError("prepared GR00T modality configuration differs from the contract")
+    if source != runtime_modality_config_source():
+        raise ValueError("prepared GR00T modality configuration is not canonical")
+    if sha256_file(path) != _manifest_modality_sha256(manifest):
+        raise ValueError("prepared GR00T modality configuration hash differs from manifest")
+    _validate_modality_metadata(dataset)
     contract = modality_contract()
     if contract["state"]["dimension"] != 12 or contract["action"]["dimension"] != 12:
         raise AssertionError("internal modality contract is not 12D")
@@ -156,6 +197,7 @@ def _run_pinned_loader(dataset: Path, groot_root: Path) -> None:
     from gr00t.data.embodiment_tags import EmbodimentTag
 
     config = MODALITY_CONFIGS[EmbodimentTag.NEW_EMBODIMENT.value]
+    validate_runtime_modality_config(config)
     loader = LeRobotEpisodeLoader(dataset, config)
     episode = loader[0]
     sample = extract_step_data(
@@ -178,7 +220,7 @@ def validate_prepared_dataset(
     train, validation = _validate_manifest(manifest)
     _validate_offline_split(dataset, train, validation)
     _validate_statistics(dataset)
-    _validate_modality(dataset)
+    _validate_modality(dataset, manifest)
     resolved_root = groot_root or os.environ.get("LEHOME_GROOT_ROOT")
     loader_integration = "not_run_no_pinned_runtime"
     if resolved_root:

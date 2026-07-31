@@ -12,6 +12,7 @@ from lehome_train.data.validate import validate_prepared_dataset
 from lehome_train.groot.modality import (
     ACTION_HORIZON,
     modality_contract,
+    runtime_modality_config_source,
     write_runtime_modality_config,
 )
 
@@ -79,6 +80,16 @@ def test_validation_writes_hashed_report_and_keeps_split_offline(tmp_path: Path)
     }
     persisted = json.loads((dataset / "meta" / "validation_report.json").read_text(encoding="utf-8"))
     assert persisted == report
+    manifest = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
+    config_record = next(
+        item
+        for item in manifest["statistics"]["files"]
+        if item["relative_path"] == "meta/lehome_groot_modality.py"
+    )
+    assert config_record["sha256"]
+    assert (dataset / "meta" / "lehome_groot_modality.py").read_text(
+        encoding="utf-8"
+    ) == runtime_modality_config_source()
 
 
 def test_validation_fails_on_missing_relative_stats_or_split_leakage(tmp_path: Path) -> None:
@@ -106,4 +117,31 @@ def test_validation_requires_the_offline_validation_episode_to_exist(tmp_path: P
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="exactly match offline split"):
+        validate_prepared_dataset(dataset)
+
+
+def test_validation_rejects_comments_that_only_spoof_modality_substrings(
+    tmp_path: Path,
+) -> None:
+    dataset = _prepared_dataset(tmp_path)
+    path = dataset / "meta" / "lehome_groot_modality.py"
+    path.write_text(
+        "# \"top_rgb\", \"left_rgb\", \"right_rgb\"\n"
+        "# \"left_arm\", \"left_gripper\", \"right_arm\", \"right_gripper\"\n"
+        "# list(range(16))\n"
+        "# ActionRepresentation.RELATIVE\n"
+        "# ActionRepresentation.ABSOLUTE\n",
+        encoding="utf-8",
+    )
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    config_record = next(
+        item
+        for item in manifest["statistics"]["files"]
+        if item["relative_path"] == "meta/lehome_groot_modality.py"
+    )
+    config_record["sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="canonical"):
         validate_prepared_dataset(dataset)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import tempfile
+from typing import Any, Mapping
 
 from lehome_train.data.mapping import ACTION_HORIZON, FIXED_INSTRUCTION
 
@@ -86,6 +87,58 @@ if EmbodimentTag.NEW_EMBODIMENT.value in MODALITY_CONFIGS:
 else:
     register_modality_config(lehome_so101_config, embodiment_tag=EmbodimentTag.NEW_EMBODIMENT)
 """
+
+
+def _enum_value(value: object) -> str:
+    """Normalize GR00T enum values without importing GR00T in fixture tests."""
+
+    raw = getattr(value, "value", value)
+    if not isinstance(raw, str):
+        raise ValueError("runtime GR00T modality enum has an invalid value")
+    return raw
+
+
+def _runtime_field(config: object, field_name: str) -> object:
+    try:
+        return getattr(config, field_name)
+    except AttributeError as error:
+        raise ValueError(f"runtime GR00T modality has no {field_name}") from error
+
+
+def validate_runtime_modality_config(config: Mapping[str, Any]) -> None:
+    """Fail closed unless a registered GR00T config is exactly our contract."""
+
+    if set(config) != {"video", "state", "action", "language"}:
+        raise ValueError("runtime GR00T modality must have exactly four modalities")
+    expected_groups = ["left_arm", "left_gripper", "right_arm", "right_gripper"]
+    expected = {
+        "video": ([0], ["top_rgb", "left_rgb", "right_rgb"]),
+        "state": ([0], expected_groups),
+        "action": (list(range(ACTION_HORIZON)), expected_groups),
+        "language": ([0], ["annotation.human.task_description"]),
+    }
+    for name, (delta_indices, modality_keys) in expected.items():
+        actual = config[name]
+        if _runtime_field(actual, "delta_indices") != delta_indices:
+            raise ValueError(f"runtime GR00T {name} delta indices differ from contract")
+        if _runtime_field(actual, "modality_keys") != modality_keys:
+            raise ValueError(f"runtime GR00T {name} keys differ from contract")
+    action_configs = _runtime_field(config["action"], "action_configs")
+    if not isinstance(action_configs, list) or len(action_configs) != 4:
+        raise ValueError("runtime GR00T action config must contain four joint groups")
+    expected_representations = ["relative", "absolute", "relative", "absolute"]
+    expected_dimensions = [5, 1, 5, 1]
+    for index, (action_config, representation, dimension) in enumerate(
+        zip(action_configs, expected_representations, expected_dimensions, strict=True)
+    ):
+        if _enum_value(_runtime_field(action_config, "rep")) != representation:
+            raise ValueError(f"runtime GR00T action group {index} has wrong representation")
+        if _enum_value(_runtime_field(action_config, "type")) != "non_eef":
+            raise ValueError(f"runtime GR00T action group {index} is not joint space")
+        if _enum_value(_runtime_field(action_config, "format")) != "default":
+            raise ValueError(f"runtime GR00T action group {index} has wrong format")
+        if dimension <= 0:
+            raise AssertionError("internal action group dimension is invalid")
 
 
 def write_runtime_modality_config(destination: str | Path) -> Path:
