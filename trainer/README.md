@@ -44,7 +44,13 @@ PY
 ```
 
 Use `create=False` to verify existing repositories without creating them. Any
-unapproved repository or repository that is not private is rejected.
+unapproved repository or repository that is not private is rejected. When Hub
+repository metadata omits its optional permission field, the access check uses
+the authenticated token's `whoami` account and access-token role as capability
+evidence: only an explicit `write` role whose account matches the approved
+personal repository namespace passes the write gate. Missing, mismatched,
+read-only, or malformed capability metadata fails closed, and the token is
+neither cached nor included in an error.
 
 Hydrate the immutable base model on a fresh host only beneath `/cache`, using
 the exact approved revision and a caller-owned staging directory:

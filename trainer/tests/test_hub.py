@@ -179,7 +179,7 @@ def test_permission_failures_are_fail_closed_and_redacted(
     assert token not in str(error.value)
 
 
-def test_hub_private_repo_without_permission_metadata_does_not_imply_write(
+def test_hub_private_repo_without_permission_metadata_requires_token_write_role(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     transport = HuggingFaceHubTransport()
@@ -188,6 +188,16 @@ def test_hub_private_repo_without_permission_metadata_does_not_imply_write(
         "_repo_info",
         lambda **_kwargs: SimpleNamespace(private=True),
     )
+    monkeypatch.setattr(
+        transport,
+        "_api",
+        lambda _token: SimpleNamespace(
+            whoami=lambda **_kwargs: {
+                "name": "RyanJin333",
+                "auth": {"accessToken": {"role": "write"}}
+            }
+        ),
+    )
 
     access = transport.check_access(
         repository="ryanjin333/lehome-groot-n17-models",
@@ -195,8 +205,93 @@ def test_hub_private_repo_without_permission_metadata_does_not_imply_write(
     )
 
     assert access.can_read is True
-    assert access.can_write is False
+    assert access.can_write is True
     assert access.private_repository is True
+
+
+@pytest.mark.parametrize(
+    ("identity", "expected_write"),
+    [
+        (
+            {
+                "name": "ryanjin333",
+                "auth": {"accessToken": {"role": "write"}},
+            },
+            True,
+        ),
+        (
+            {
+                "name": "someone-else",
+                "auth": {"accessToken": {"role": "write"}},
+            },
+            False,
+        ),
+        ({"auth": {"accessToken": {"role": "write"}}}, False),
+        (
+            {
+                "name": "ryanjin333",
+                "auth": {"accessToken": {"role": "read"}},
+            },
+            False,
+        ),
+        ({}, False),
+        ({"auth": None}, False),
+        ({"auth": {"accessToken": "malformed"}}, False),
+        ({"auth": {"accessToken": {"role": ["write"]}}}, False),
+    ],
+)
+def test_hub_token_capability_is_explicit_and_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    identity: object,
+    expected_write: bool,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(private=True),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_api",
+        lambda _token: SimpleNamespace(whoami=lambda **_kwargs: identity),
+    )
+
+    access = transport.check_access(
+        repository="ryanjin333/lehome-groot-n17-models",
+        token="hf_explicit_capability_probe",
+    )
+
+    assert access.can_read is True
+    assert access.can_write is expected_write
+
+
+def test_hub_token_capability_failure_is_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    token = "hf_sensitive_capability_token"
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(private=True),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_api",
+        lambda _token: SimpleNamespace(
+            whoami=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError(token))
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="access check failed") as error:
+        transport.check_access(
+            repository="ryanjin333/lehome-groot-n17-models",
+            token=token,
+        )
+
+    assert token not in str(error.value)
+    assert error.value.__cause__ is None
 
 
 def test_upload_retries_only_to_the_explicit_limit_and_redacts_failures(

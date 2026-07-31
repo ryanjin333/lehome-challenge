@@ -173,14 +173,35 @@ class HuggingFaceHubTransport:
             raise PermissionError("private Hub repository access check failed") from None
         private = getattr(info, "private", None) is True
         permissions = getattr(info, "permissions", None)
-        can_write = False
-        if isinstance(permissions, Mapping):
-            can_write = permissions.get("write") is True
+        repository_write: bool | None = None
+        if isinstance(permissions, Mapping) and "write" in permissions:
+            repository_write = permissions.get("write") is True
         elif isinstance(permissions, str):
-            can_write = permissions.casefold() in {"write", "admin"}
+            repository_write = permissions.casefold() in {"write", "admin"}
+        if repository_write is None:
+            try:
+                identity = self._api(token).whoami(token=token)
+            except Exception:
+                raise PermissionError("private Hub repository access check failed") from None
+            token_write = False
+            if isinstance(identity, Mapping):
+                account_name = identity.get("name")
+                auth = identity.get("auth")
+                if isinstance(auth, Mapping):
+                    access_token = auth.get("accessToken")
+                    if isinstance(access_token, Mapping):
+                        role = access_token.get("role")
+                        repository_owner = repository.partition("/")[0]
+                        token_write = (
+                            isinstance(account_name, str)
+                            and account_name.casefold() == repository_owner.casefold()
+                            and isinstance(role, str)
+                            and role.casefold() == "write"
+                        )
+            repository_write = token_write
         return HubAccess(
             can_read=private,
-            can_write=can_write,
+            can_write=private and repository_write,
             private_repository=private,
         )
 
