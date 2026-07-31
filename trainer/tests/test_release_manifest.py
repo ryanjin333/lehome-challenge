@@ -217,6 +217,17 @@ def test_image_contract_files_preserve_runtime_and_secret_boundaries() -> None:
         assert mount in entrypoint
 
 
+def test_entrypoint_retains_token_only_for_controller_owned_remote_commands() -> None:
+    entrypoint = (TRAINER / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+
+    assert 'case "${2:-}:${3:-}" in' in entrypoint
+    assert "train:*|restore:*|sync:*|data:publish|data:retrieve)" in entrypoint
+    assert "remote=true" in entrypoint
+    assert "unset HF_TOKEN" in entrypoint
+    assert "hf auth login" in entrypoint
+    assert "huggingface-cli login" in entrypoint
+
+
 def test_trainer_lock_aligns_every_shared_runtime_package_with_upstream() -> None:
     lock = (TRAINER / "uv.lock").read_text(encoding="utf-8")
     versions = dict(

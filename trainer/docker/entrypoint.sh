@@ -30,11 +30,11 @@ if [[ "$1" != "lehome-train" ]]; then
 fi
 
 remote=false
-if [[ "${2:-}" == "sync" ]]; then
-  remote=true
-elif [[ "${2:-}" == "data" && "${3:-}" == "publish" ]]; then
-  remote=true
-fi
+case "${2:-}:${3:-}" in
+  train:*|restore:*|sync:*|data:publish|data:retrieve)
+    remote=true
+    ;;
+esac
 
 if [[ "$remote" == true ]]; then
   if [[ -z "${HF_TOKEN:-}" ]]; then

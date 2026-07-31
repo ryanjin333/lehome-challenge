@@ -77,6 +77,7 @@ lehome-train prepare --request /requests/prepare.json
 lehome-train memorize --request /requests/memorize.json
 lehome-train smoke --request /requests/smoke.json
 lehome-train train --request /requests/train.json
+lehome-train restore --request /requests/restore.json
 lehome-train report --request /requests/report.json
 lehome-train sync --request /requests/sync.json
 ```
@@ -128,10 +129,12 @@ byte-identical; only the published OCI digest identifies a release candidate.
 
 Every container invocation must mount writable `/cache`, `/prepared`, and
 `/output` directories. The image runs as `trainer`, rejects `hf auth login` and
-`huggingface-cli login`, and removes `HF_TOKEN` before local conversion or
-training. Only `lehome-train data publish` and `lehome-train sync` retain an
-explicit process token. Models, datasets, outputs, and temporary state therefore
-remain on those mounts rather than in the immutable image.
+`huggingface-cli login`, and removes `HF_TOKEN` from every command except the
+controller-owned remote operations `train`, `restore`, `data retrieve`,
+`data publish`, and `sync`. Those controllers use only the explicit process
+token for Hub operations; the GR00T training subprocess independently strips
+it from its child environment. Models, datasets, outputs, and temporary state
+therefore remain on those mounts rather than in the immutable image.
 
 On a Linux NVIDIA host, the additional structural gate verifies exactly one
 visible GPU and performs one real AdamW optimizer step over a synthetic
@@ -156,8 +159,9 @@ On a fresh Linux x86_64 RTX PRO 6000 96 GB rental:
 2. Pull the exact `ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:<digest>`
    and record a positive pull duration in seconds. Never accept a tag as
    experiment identity.
-3. Mount fresh `/cache`, `/prepared`, and `/output` volumes, inject `HF_TOKEN`
-   only into download/sync processes, and run `lehome-train prepare`.
+3. Mount fresh `/cache`, `/prepared`, and `/output` volumes. Inject `HF_TOKEN`
+   only into the controller commands that retrieve data, train/upload,
+   restore, publish, or sync; run local `lehome-train prepare` without it.
 4. Measure from the start of the fresh-machine procedure to the first real
    GR00T optimizer step. It must be no more than 1,800 seconds.
 5. Complete the offline one-episode `memorize` gate.
