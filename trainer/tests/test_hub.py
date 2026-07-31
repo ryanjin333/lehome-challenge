@@ -179,6 +179,26 @@ def test_permission_failures_are_fail_closed_and_redacted(
     assert token not in str(error.value)
 
 
+def test_hub_private_repo_without_permission_metadata_does_not_imply_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(private=True),
+    )
+
+    access = transport.check_access(
+        repository="ryanjin333/lehome-groot-n17-models",
+        token="hf_explicit_permission_probe",
+    )
+
+    assert access.can_read is True
+    assert access.can_write is False
+    assert access.private_repository is True
+
+
 def test_upload_retries_only_to_the_explicit_limit_and_redacts_failures(
     tmp_path: Path,
 ) -> None:

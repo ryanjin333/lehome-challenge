@@ -87,14 +87,81 @@ production `module:factory`. On a development image, pass the same value via
 `--runtime-factory module:factory`; absence of a runtime factory is a hard,
 actionable failure.
 
-`prepare`, `memorize`, `smoke`, and `train` each accept a strict request envelope:
+`prepare`, `memorize`, `smoke`, and `train` each accept a strict request
+envelope. These are the complete argument schemas; placeholders must be
+replaced, but no key may be added or omitted.
+
+Prepare:
 
 ```json
 {
   "schema_version": 1,
   "command": "prepare",
   "arguments": {
-    "request_contract": "fields owned by the accepted Task 12 runtime adapter"
+    "launch_config": "/output/requests/baseline-launch.json",
+    "experiment_config": "/output/requests/baseline-experiment.json",
+    "model_snapshot_manifest": "/cache/models/groot-n17/lehome_model_snapshot.json",
+    "dataset_snapshot_manifest": "/prepared/lehome-groot-n17-v1/lehome_dataset_snapshot.json",
+    "network_measurement": "/output/evidence/network.json",
+    "artifact_repository": "ryanjin333/lehome-groot-n17-models",
+    "artifact_revision": "<full-existing-artifact-repository-commit>",
+    "status_output": "/output/evidence/prepare-status.json"
+  }
+}
+```
+
+Memorize (use dedicated batch-1 launch and experiment configs):
+
+```json
+{
+  "schema_version": 1,
+  "command": "memorize",
+  "arguments": {
+    "launch_config": "/output/requests/memorize-launch.json",
+    "experiment_config": "/output/requests/memorize-experiment.json",
+    "dataset_manifest_sha256": "<64-hex-prepared-dataset-manifest-hash>",
+    "requested_episode_id": null,
+    "result_output": "/output/experiment/reports/memorize-result.json",
+    "status_output": "/output/evidence/memorize-status.json"
+  }
+}
+```
+
+Smoke:
+
+```json
+{
+  "schema_version": 1,
+  "command": "smoke",
+  "arguments": {
+    "launch_config": "/output/requests/baseline-launch.json",
+    "experiment_config": "/output/requests/baseline-experiment.json",
+    "report_output": "/output/experiment/reports/smoke-report.json",
+    "selected_result_output": "/output/experiment/reports/smoke-result.json",
+    "status_output": "/output/evidence/smoke-status.json"
+  }
+}
+```
+
+Train (`resume_checkpoint` is either `null` or a strict descriptor path):
+
+```json
+{
+  "schema_version": 1,
+  "command": "train",
+  "arguments": {
+    "launch_config": "/output/requests/baseline-launch.json",
+    "experiment_config": "/output/requests/baseline-experiment.json",
+    "selected_smoke_result": "/output/experiment/reports/smoke-result.json",
+    "normalization_sha256": "<64-hex-normalization-identity>",
+    "estimated_checkpoint_bytes": 10737418240,
+    "checkpoint_repository": "ryanjin333/lehome-groot-n17-models",
+    "checkpoint_revision": "<explicit-upload-branch>",
+    "resume_checkpoint": null,
+    "provider_hourly_price": 1.25,
+    "instance_start_time": "2026-07-31T10:00:00Z",
+    "result_output": "/output/experiment/reports/training-result.json",
+    "status_output": "/output/evidence/training-status.json"
   }
 }
 ```
@@ -110,6 +177,18 @@ lehome-train smoke --request /requests/smoke.json
 lehome-train train --request /requests/train.json
 lehome-train report --request /requests/report.json
 lehome-train sync --request /requests/sync.json
+```
+
+Restore is intentionally not a request-envelope command. On a fresh machine,
+hydrate an exact externally persisted sync result with:
+
+```bash
+lehome-train restore \
+  --sync-result /output/evidence/final-sync-result.json \
+  --destination /output/restored-experiment \
+  --staging-root /output/restore-staging \
+  --timeout-seconds 30 \
+  --max-attempts 3
 ```
 
 The report request schema is fully implemented by this package:
@@ -177,7 +256,8 @@ UTC `Z` form.
 
 `prepare` verifies one supported GPU, disk, immutable snapshots, local hashes,
 and private Hub read/write access. `memorize` is an offline diagnostic and stays
-non-promotable until the simulator expert-replay gate passes. `smoke` tests
+The memorization result remains non-promotable until the simulator
+expert-replay gate passes. `smoke` tests
 physical batches sequentially at accumulation 1 and selects the largest stable
 batch with at least 10% physical VRAM headroom. `train` processes exactly
 768,000 sample presentations and retains a verified resumable checkpoint.

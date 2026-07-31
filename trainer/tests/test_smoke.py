@@ -128,6 +128,12 @@ def test_smoke_launches_tier_candidates_sequentially_with_fixed_contract() -> No
     )
 
     assert [config.physical_batch_size for config in calls] == [16, 32, 64]
+    assert {attempt.result.experiment_id for attempt in report.attempts} == {"smoke"}
+    assert [attempt.attempt_experiment_id for attempt in report.attempts] == [
+        "smoke-batch-16",
+        "smoke-batch-32",
+        "smoke-batch-64",
+    ]
     assert all(config.max_steps == SMOKE_OPTIMIZER_STEPS == 100 for config in calls)
     assert all(config.global_batch_size == config.physical_batch_size for config in calls)
     assert all(config.gradient_accumulation_steps == 1 for config in calls)

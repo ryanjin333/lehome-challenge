@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tarfile
 
 import pytest
 
 import lehome_train.groot.production_adapters as adapters
+from lehome_train.checkpoints import CheckpointDescriptor
 from lehome_train.commands.train import TrainingChunkRequest
 from lehome_train.constants import MODEL_REVISION
 from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.io import canonical_json_sha256, sha256_file
-from lehome_train.models import ExperimentConfig
+from lehome_train.models import ArtifactIdentity, CheckpointRecord, ExperimentConfig
 from lehome_train.offline_eval import OfflineEvaluation
 from lehome_train.schedule import ExposureSchedule
 
@@ -111,6 +113,155 @@ def _request(schedule: ExposureSchedule, start: int, end: int) -> TrainingChunkR
         input_checkpoint=None,
         input_checkpoint_sha256=None,
     )
+
+
+def _resume_descriptor(
+    config: FineTuneLaunchConfig,
+    experiment: ExperimentConfig,
+    schedule: ExposureSchedule,
+    archive: Path,
+    step: int,
+    *,
+    experiment_id: str = "experiment-001",
+) -> CheckpointDescriptor:
+    return CheckpointDescriptor(
+        record=CheckpointRecord(
+            experiment_id=experiment_id,
+            optimizer_step=step,
+            sample_presentations=step * schedule.physical_batch_size,
+            experiment_config_sha256=canonical_json_sha256(experiment),
+            dataset_manifest_sha256=experiment.dataset_manifest_sha256,
+            schedule_sha256=schedule.sha256,
+            artifact=ArtifactIdentity(
+                archive.relative_to(config.output_dir).as_posix(),
+                sha256_file(archive),
+                archive.stat().st_size,
+            ),
+            resumable=True,
+            remotely_verified=True,
+        ),
+        normalization_sha256=NORMALIZATION_SHA256,
+        schedule_sha256=schedule.sha256,
+        locally_verified=True,
+    )
+
+
+def test_resume_archive_is_verified_in_staging_then_atomically_exposed(
+    tmp_path: Path,
+) -> None:
+    schedule = ExposureSchedule(physical_batch_size=64)
+    config = _config(
+        tmp_path,
+        batch=64,
+        max_steps=schedule.total_optimizer_steps,
+        save_steps=schedule.checkpoint_interval_steps,
+    )
+    step = schedule.checkpoint_interval_steps
+    source = tmp_path / "source" / config.experiment_name / f"checkpoint-{step}"
+    source.mkdir(parents=True)
+    (source / "trainer_state.json").write_text(
+        json.dumps({"global_step": step, "log_history": [{"step": step, "loss": 0.5}]}),
+        encoding="utf-8",
+    )
+    (source / "weights.bin").write_bytes(b"weights")
+    archive = Path(config.output_dir) / "checkpoints" / f"step-{step}.tar"
+    archive.parent.mkdir()
+    with tarfile.open(archive, "w") as bundle:
+        bundle.add(
+            source,
+            arcname=f"{config.experiment_name}/checkpoint-{step}",
+        )
+    experiment = _experiment(64)
+
+    adapters.GrootTrainingSession(
+        config=config,
+        experiment_config=experiment,
+        normalization_sha256=NORMALIZATION_SHA256,
+        resume_checkpoint=_resume_descriptor(config, experiment, schedule, archive, step),
+    )
+
+    restored = Path(config.output_dir) / config.experiment_name / f"checkpoint-{step}"
+    assert (restored / "trainer_state.json").is_file()
+    assert not list(restored.parent.glob(".*.incomplete-*"))
+
+
+def test_incompatible_resume_descriptor_is_rejected_before_archive_extraction(
+    tmp_path: Path,
+) -> None:
+    schedule = ExposureSchedule(physical_batch_size=64)
+    config = _config(
+        tmp_path,
+        batch=64,
+        max_steps=schedule.total_optimizer_steps,
+        save_steps=schedule.checkpoint_interval_steps,
+    )
+    step = schedule.checkpoint_interval_steps
+    archive = Path(config.output_dir) / "checkpoints" / f"step-{step}.tar"
+    archive.parent.mkdir()
+    with tarfile.open(archive, "w") as bundle:
+        payload = tmp_path / "payload"
+        payload.write_bytes(b"untrusted")
+        bundle.add(payload, arcname=f"{config.experiment_name}/checkpoint-{step}/weights.bin")
+    experiment = _experiment(64)
+
+    with pytest.raises(ValueError, match="experiment identity"):
+        adapters.GrootTrainingSession(
+            config=config,
+            experiment_config=experiment,
+            normalization_sha256=NORMALIZATION_SHA256,
+            resume_checkpoint=_resume_descriptor(
+                config,
+                experiment,
+                schedule,
+                archive,
+                step,
+                experiment_id="wrong-experiment",
+            ),
+        )
+
+    assert not (Path(config.output_dir) / config.experiment_name / f"checkpoint-{step}").exists()
+
+
+def test_resume_archive_rejects_preexisting_symlink_destination_without_escape(
+    tmp_path: Path,
+) -> None:
+    schedule = ExposureSchedule(physical_batch_size=64)
+    config = _config(
+        tmp_path,
+        batch=64,
+        max_steps=schedule.total_optimizer_steps,
+        save_steps=schedule.checkpoint_interval_steps,
+    )
+    step = schedule.checkpoint_interval_steps
+    source = tmp_path / "source" / config.experiment_name / f"checkpoint-{step}"
+    source.mkdir(parents=True)
+    (source / "trainer_state.json").write_text(
+        json.dumps({"global_step": step, "log_history": [{"step": step, "loss": 0.5}]}),
+        encoding="utf-8",
+    )
+    archive = Path(config.output_dir) / "checkpoints" / f"step-{step}.tar"
+    archive.parent.mkdir()
+    with tarfile.open(archive, "w") as bundle:
+        bundle.add(
+            source,
+            arcname=f"{config.experiment_name}/checkpoint-{step}",
+        )
+    experiment = _experiment(64)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    run_root = Path(config.output_dir) / config.experiment_name
+    run_root.mkdir()
+    (run_root / f"checkpoint-{step}").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="destination already exists"):
+        adapters.GrootTrainingSession(
+            config=config,
+            experiment_config=experiment,
+            normalization_sha256=NORMALIZATION_SHA256,
+            resume_checkpoint=_resume_descriptor(config, experiment, schedule, archive, step),
+        )
+
+    assert list(outside.iterdir()) == []
 
 
 def test_training_session_runs_pinned_boundary_and_packages_verified_archive(

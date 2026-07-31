@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
-from lehome_train.groot.chunk_launch import StopAtOptimizerStep
+from lehome_train.groot.chunk_launch import StopAtOptimizerStep, _resume_value
 
 
 def test_stop_callback_stops_only_at_requested_global_step() -> None:
@@ -41,3 +42,17 @@ def test_zero_step_callback_stops_before_any_optimizer_step() -> None:
     )
 
     assert returned.should_training_stop is True
+
+
+def test_fresh_run_disables_upstream_unconditional_resume(tmp_path) -> None:
+    assert _resume_value(tmp_path) is False
+
+
+def test_existing_checkpoint_preserves_real_resume(tmp_path) -> None:
+    checkpoint = tmp_path / "checkpoint-1000"
+    checkpoint.mkdir()
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps({"global_step": 1000}), encoding="utf-8"
+    )
+
+    assert _resume_value(tmp_path) is True

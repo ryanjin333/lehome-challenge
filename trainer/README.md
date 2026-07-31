@@ -68,18 +68,27 @@ factory must return the production adapter implementing `prepare`, `memorize`,
 `smoke`, and `train`; missing GPU/runtime wiring is a hard error, never a
 successful no-op.
 
-The production adapter takes explicit command-specific files. `prepare`,
-`memorize`, and `train` require exactly `launch_config` and `status_output` in
-their request `arguments`; `smoke` requires `launch_configs` and
-`status_output`. A launch config is the JSON form of
-`FineTuneLaunchConfig`. All referenced paths must be below `/cache`,
-`/prepared`, or `/output`; the model and dataset must already be downloaded at
-their manifest-verified revisions. `prepare` validates the pinned checkout,
-one-GPU visibility, inputs, and exact upstream command without starting a paid
-training process. The other commands execute the official pinned
-`gr00t/experiment/launch_finetune.py`; `memorize` additionally enforces batch 1
-and at most 10,000 steps, while `smoke` enforces sequential batch 16/32/64
-configs with exactly 100 optimizer steps each.
+The production adapter uses closed command-specific schemas. The exact
+`arguments` keys are:
+
+- `prepare`: `launch_config`, `experiment_config`, `model_snapshot_manifest`,
+  `dataset_snapshot_manifest`, `network_measurement`, `artifact_repository`,
+  `artifact_revision`, and `status_output`;
+- `memorize`: `launch_config`, `experiment_config`,
+  `dataset_manifest_sha256`, `requested_episode_id`, `result_output`, and
+  `status_output`;
+- `smoke`: `launch_config`, `experiment_config`, `report_output`,
+  `selected_result_output`, and `status_output`; and
+- `train`: `launch_config`, `experiment_config`, `selected_smoke_result`,
+  `normalization_sha256`, `estimated_checkpoint_bytes`,
+  `checkpoint_repository`, `checkpoint_revision`, `resume_checkpoint`,
+  `provider_hourly_price`, `instance_start_time`, `result_output`, and
+  `status_output`.
+
+A launch config is the JSON form of `FineTuneLaunchConfig`. All referenced
+paths must be below `/cache`, `/prepared`, or `/output`; the model and dataset
+must already be downloaded at their manifest-verified revisions. Unknown or
+missing keys fail closed. The runbook below gives complete request examples.
 
 Every stage consumes a checked JSON request:
 
@@ -88,7 +97,10 @@ lehome-train prepare --request /requests/prepare.json
 lehome-train memorize --request /requests/memorize.json
 lehome-train smoke --request /requests/smoke.json
 lehome-train train --request /requests/train.json
-lehome-train restore --request /requests/restore.json
+lehome-train restore \
+  --sync-result /output/evidence/final-sync-result.json \
+  --destination /output/restored-experiment \
+  --staging-root /output/restore-staging
 lehome-train report --request /requests/report.json
 lehome-train sync --request /requests/sync.json
 ```

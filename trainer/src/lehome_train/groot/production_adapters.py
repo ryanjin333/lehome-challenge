@@ -6,7 +6,7 @@ from dataclasses import replace
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import tarfile
@@ -16,6 +16,7 @@ from typing import Mapping
 
 from lehome_train.checkpoints import (
     CheckpointDescriptor,
+    require_compatible_checkpoint,
     write_checkpoint_descriptor,
 )
 from lehome_train.commands.memorize import ChunkReceipt
@@ -39,6 +40,7 @@ from lehome_train.models import (
     SyncEntry,
 )
 from lehome_train.offline_eval import OfflineEvaluation, evaluate_action_predictions
+from lehome_train.schedule import ExposureSchedule
 
 
 def probe_physical_vram_bytes() -> int:
@@ -97,6 +99,13 @@ def _verified_checkpoint_state(
     optimizer_step: int,
 ) -> Mapping[str, object]:
     checkpoint = _checkpoint_path(config, optimizer_step)
+    return _verified_checkpoint_state_at(checkpoint, optimizer_step)
+
+
+def _verified_checkpoint_state_at(
+    checkpoint: Path,
+    optimizer_step: int,
+) -> Mapping[str, object]:
     state_path = checkpoint / "trainer_state.json"
     if not checkpoint.is_dir() or checkpoint.is_symlink() or not state_path.is_file():
         raise ValueError("GR00T checkpoint boundary has no trainer-state evidence")
@@ -520,23 +529,83 @@ def _restore_checkpoint_archive(
     *,
     output_root: Path,
     expected_member_root: str,
+    optimizer_step: int,
 ) -> None:
+    expected = PurePosixPath(expected_member_root)
+    expected_parts = expected.parts
+    if (
+        not expected_parts
+        or expected.is_absolute()
+        or any(part in {"", ".", ".."} for part in expected_parts)
+    ):
+        raise ValueError("resume checkpoint archive expected root is unsafe")
+    destination = output_root.joinpath(*expected_parts)
+    parent = destination.parent
+    if not output_root.is_dir() or output_root.is_symlink():
+        raise ValueError("resume checkpoint destination parent is unsafe")
+    if not parent.exists():
+        parent.mkdir(parents=False)
+    if not parent.is_dir() or parent.is_symlink():
+        raise ValueError("resume checkpoint destination parent is unsafe")
+    if destination.exists() or destination.is_symlink():
+        raise ValueError("resume checkpoint destination already exists")
+
     with tarfile.open(archive_path, "r") as archive:
         members = archive.getmembers()
         if not members:
             raise ValueError("resume checkpoint archive is empty")
+        seen: set[tuple[str, ...]] = set()
+        has_root = False
         for member in members:
-            path = Path(member.name)
+            path = PurePosixPath(member.name)
+            raw_parts = member.name.split("/")
             if (
                 path.is_absolute()
-                or ".." in path.parts
+                or any(part in {"", ".", ".."} for part in raw_parts)
                 or member.issym()
                 or member.islnk()
                 or not (member.isdir() or member.isfile())
-                or path.parts[:1] != (expected_member_root,)
+                or path.parts[: len(expected_parts)] != expected_parts
+                or path.parts in seen
             ):
                 raise ValueError("resume checkpoint archive has an unsafe member")
-        archive.extractall(output_root, members=members)
+            seen.add(path.parts)
+            if path.parts == expected_parts:
+                if not member.isdir():
+                    raise ValueError("resume checkpoint archive root is not a directory")
+                has_root = True
+        if not has_root:
+            raise ValueError("resume checkpoint archive is missing its expected root")
+
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=f".{destination.name}.",
+                suffix=".incomplete",
+                dir=parent,
+            )
+        )
+        try:
+            for member in members:
+                parts = PurePosixPath(member.name).parts[len(expected_parts) :]
+                if not parts:
+                    continue
+                target = staging.joinpath(*parts)
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=False)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise ValueError("resume checkpoint file payload is unavailable")
+                with source, target.open("xb") as stream:
+                    shutil.copyfileobj(source, stream)
+                if target.stat().st_size != member.size:
+                    raise ValueError("resume checkpoint file size changed during extraction")
+            _verified_checkpoint_state_at(staging, optimizer_step)
+            os.replace(staging, destination)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
 
 
 class GrootTrainingSession:
@@ -555,6 +624,21 @@ class GrootTrainingSession:
         self.normalization_sha256 = normalization_sha256
         self._progress = 0 if resume_checkpoint is None else resume_checkpoint.record.optimizer_step
         if resume_checkpoint is not None:
+            schedule = ExposureSchedule(
+                physical_batch_size=experiment_config.physical_batch_size,
+                sample_presentations=experiment_config.sample_presentations,
+            )
+            require_compatible_checkpoint(
+                resume_checkpoint,
+                experiment_id=config.experiment_name,
+                experiment_config_sha256=canonical_json_sha256(experiment_config),
+                dataset_manifest_sha256=experiment_config.dataset_manifest_sha256,
+                normalization_sha256=normalization_sha256,
+                schedule_sha256=schedule.sha256,
+                physical_batch_size=experiment_config.physical_batch_size,
+                maximum_optimizer_step=schedule.total_optimizer_steps,
+                checkpoint_interval_steps=schedule.checkpoint_interval_steps,
+            )
             artifact = Path(config.output_dir) / resume_checkpoint.record.artifact.relative_path
             if (
                 not artifact.is_file()
@@ -563,12 +647,17 @@ class GrootTrainingSession:
             ):
                 raise ValueError("resume checkpoint archive failed local verification")
             expected = f"{config.experiment_name}/checkpoint-{self._progress}"
-            if not _checkpoint_path(config, self._progress).is_dir():
+            checkpoint_path = _checkpoint_path(config, self._progress)
+            if checkpoint_path.is_symlink():
+                raise ValueError("resume checkpoint destination already exists")
+            if not checkpoint_path.is_dir():
                 _restore_checkpoint_archive(
                     artifact,
                     output_root=Path(config.output_dir),
                     expected_member_root=expected,
+                    optimizer_step=self._progress,
                 )
+            _verified_checkpoint_state(config, self._progress)
 
     def run_chunk(self, request: TrainingChunkRequest) -> TrainingChunkReceipt:
         if request.start_optimizer_step != self._progress:

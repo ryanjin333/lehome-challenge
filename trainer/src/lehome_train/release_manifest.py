@@ -80,8 +80,9 @@ class ReleaseManifest:
         return str(self.payload["trainer_lock_sha256"])
 
     @property
-    def repository_commit(self) -> str:
-        return str(self.payload["repository_commit"])
+    def repository_commit(self) -> str | None:
+        value = self.payload["repository_commit"]
+        return None if value is None else str(value)
 
     @property
     def oci_digest(self) -> str | None:
@@ -172,18 +173,20 @@ class ReleaseManifest:
                     raise ValueError(f"release manifest dataset {key} is invalid")
 
         lock_hash = _string(root["trainer_lock_sha256"], "trainer lock hash")
-        repository_commit = _string(root["repository_commit"], "repository commit")
+        repository_commit = root["repository_commit"]
         if not _SHA256.fullmatch(lock_hash):
             raise ValueError("release manifest trainer lock hash is invalid")
         if lock_hash != TRAINER_LOCK_SHA256:
             raise ValueError("release manifest differs from the approved trainer lock")
-        if not _SHA.fullmatch(repository_commit):
+        if repository_commit is not None and (
+            type(repository_commit) is not str or not _SHA.fullmatch(repository_commit)
+        ):
             raise ValueError("release manifest repository commit is not immutable")
 
         image = _exact_keys(root["image"], {"repository", "tag", "digest"}, "image")
         if image["repository"] != IMAGE_REPOSITORY:
             raise ValueError("release manifest image repository is unsupported")
-        tag = _string(image["tag"], "image tag")
+        tag = image["tag"]
         if tag != repository_commit:
             raise ValueError("release manifest image tag must equal the repository commit")
         digest = image["digest"]
@@ -218,6 +221,8 @@ class ReleaseManifest:
             raise ValueError("release manifest smoke batches must be an integer array")
 
         if status == "accepted":
+            if repository_commit is None:
+                raise ValueError("accepted release manifest requires an immutable repository commit")
             if digest is None:
                 raise ValueError("accepted release manifest requires a final OCI digest")
             if acceptance_status != "passed":

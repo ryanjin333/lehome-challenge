@@ -152,7 +152,7 @@ def data_retrieve(
         evidence = write_prepared_snapshot_manifest(
             restored,
             (
-                destination.parent / f"{destination.name}.snapshot.json"
+                destination / "lehome_dataset_snapshot.json"
                 if snapshot_manifest is None
                 else snapshot_manifest
             ),

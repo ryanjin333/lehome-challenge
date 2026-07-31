@@ -4,10 +4,15 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 mode=cpu
-if [[ "${1:-}" == "--gpu" ]]; then
-  mode=gpu
+expected_release_mode=release
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --gpu) mode=gpu ;;
+    --diagnostic) expected_release_mode=diagnostic-dirty ;;
+    *) echo "unsupported verifier option: $1" >&2; exit 64 ;;
+  esac
   shift
-fi
+done
 
 repository_commit=$(git -C "$repo_root" rev-parse HEAD)
 image_ref=${1:-${IMAGE_REPOSITORY:-lehome-groot-n17-trainer}:$repository_commit}
@@ -18,6 +23,12 @@ expected_model=2fc962b973bccdd5d8ce4f67cc63b264d6886495
 actual_user=$(docker image inspect --format '{{.Config.User}}' "$image_ref")
 if [[ "$actual_user" != "trainer" ]]; then
   echo "image must run as the named non-root trainer user, found: $actual_user" >&2
+  exit 1
+fi
+
+actual_release_mode=$(docker image inspect --format '{{index .Config.Labels "io.lehome.release-mode"}}' "$image_ref")
+if [[ "$actual_release_mode" != "$expected_release_mode" ]]; then
+  echo "image release mode is $actual_release_mode; expected $expected_release_mode" >&2
   exit 1
 fi
 

@@ -246,6 +246,8 @@ def test_image_native_retrieve_and_restore_dispatch_checked_transports(
     retrieve_kwargs = calls[0][1][1]
     assert retrieve_kwargs["revision"] == "a" * 40
     assert retrieve_kwargs["expected_manifest_sha256"] == "b" * 64
+    dataset_evidence = calls[1][1]
+    assert dataset_evidence[1] == tmp_path / "dataset" / "lehome_dataset_snapshot.json"
 
 
 def test_image_native_model_retrieve_is_pinned_beneath_cache() -> None:

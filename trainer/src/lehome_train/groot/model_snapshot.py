@@ -25,12 +25,18 @@ class ModelSnapshotFile:
 
     def __post_init__(self) -> None:
         path = PurePosixPath(self.relative_path)
+        components = self.relative_path.split("/")
         if (
             not self.relative_path
             or path.is_absolute()
             or ".." in path.parts
             or "\\" in self.relative_path
             or self.relative_path == MODEL_SNAPSHOT_MANIFEST
+            or any(component in {"", "."} for component in components)
+            or (
+                self.relative_path != ".gitattributes"
+                and any(component.startswith(".") for component in components)
+            )
         ):
             raise ValueError("model snapshot contains an unsafe path")
         if type(self.byte_size) is not int or self.byte_size < 0:

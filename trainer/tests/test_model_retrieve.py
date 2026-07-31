@@ -15,6 +15,7 @@ from lehome_train.groot.model_snapshot import (
 class FakeModelTransport:
     def __init__(self) -> None:
         self.remote = {
+            ".gitattributes": b"*.safetensors filter=lfs diff=lfs merge=lfs -text\n",
             "config.json": b"{}",
             "processor/config.json": b"{}",
             "weights/model.safetensors": b"weights",
@@ -68,6 +69,16 @@ def test_base_model_retrieve_exposes_exact_complete_pinned_snapshot(tmp_path: Pa
         for path in destination.rglob("*")
         if path.is_file() and path.name != "lehome_model_snapshot.json"
     } == set(transport.remote)
+
+    from lehome_train.preflight import verify_snapshot_manifest
+
+    verified = verify_snapshot_manifest(
+        snapshot_root=destination,
+        manifest_path=destination / "lehome_model_snapshot.json",
+        expected_revision=MODEL_REVISION,
+        label="model",
+    )
+    assert {item.relative_path for item in verified.artifacts} == set(transport.remote)
 
 
 @pytest.mark.parametrize(
@@ -123,3 +134,11 @@ def test_base_model_retrieve_rejects_incomplete_snapshot_without_destination(
         )
 
     assert not destination.exists()
+
+
+@pytest.mark.parametrize("path", ["nested/.gitattributes", ".cache/file", "a//b"])
+def test_model_snapshot_allows_only_the_required_root_hub_dotfile(path: str) -> None:
+    with pytest.raises(ValueError, match="unsafe path"):
+        ModelSnapshotFile(path, 1)
+
+    assert ModelSnapshotFile(".gitattributes", 1).relative_path == ".gitattributes"

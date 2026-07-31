@@ -124,12 +124,15 @@ class SmokeAttemptReceipt:
 class SmokeAttempt(StrictModel):
     """Complete machine-readable record for one sequential launch."""
 
+    attempt_experiment_id: str
     result: SmokeResult
     telemetry: TelemetrySummary
     completed_optimizer_steps: int
 
     def __post_init__(self) -> None:
         StrictModel.__post_init__(self)
+        if not self.attempt_experiment_id:
+            raise ValueError("smoke attempt experiment identity must be non-empty")
         if self.completed_optimizer_steps < 0:
             raise ValueError("completed smoke optimizer steps must be nonnegative")
         if self.completed_optimizer_steps > self.result.optimizer_steps:
@@ -226,6 +229,7 @@ def _validated_attempt(
     physical_vram_bytes: int,
     experiment_config_sha256: str,
     dataset_manifest_sha256: str,
+    experiment_id: str,
 ) -> SmokeAttempt:
     if receipt.gradient_accumulation_steps != 1:
         raise ValueError("smoke gradient accumulation must remain exactly 1")
@@ -257,7 +261,7 @@ def _validated_attempt(
         and receipt.failure_reason is None
     )
     result = SmokeResult(
-        experiment_id=config.experiment_name,
+        experiment_id=experiment_id,
         experiment_config_sha256=experiment_config_sha256,
         dataset_manifest_sha256=dataset_manifest_sha256,
         physical_batch_size=config.physical_batch_size,
@@ -275,6 +279,7 @@ def _validated_attempt(
         failure_reason=receipt.failure_reason,
     )
     return SmokeAttempt(
+        attempt_experiment_id=config.experiment_name,
         result=result,
         telemetry=telemetry,
         completed_optimizer_steps=receipt.optimizer_steps,
@@ -308,6 +313,7 @@ def run_smoke_tests(
             physical_vram_bytes=physical_vram_bytes,
             experiment_config_sha256=experiment_config_sha256,
             dataset_manifest_sha256=dataset_manifest_sha256,
+            experiment_id=base_config.experiment_name,
         )
         attempts.append(attempt)
         memory_failure = attempt.result.failure_reason == "cuda_oom"

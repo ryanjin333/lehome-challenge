@@ -107,6 +107,9 @@ def _validate_relative_path(value: object) -> tuple[str, ...]:
         raise _rejected("noncanonical relative path")
     parts = tuple(canonical.split("/"))
 
+    if any(part.startswith(".") for part in parts):
+        raise _rejected("dot path")
+
     for part in parts:
         folded = part.casefold()
         if folded in DENIED_PATH_COMPONENTS:

@@ -114,7 +114,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
+          labels: |
+            ${{ steps.metadata.outputs.labels }}
+            io.lehome.release-mode=release
           build-args: |
             REPOSITORY_COMMIT=${{ github.sha }}
       - name: Verify the published digest structurally on CPU

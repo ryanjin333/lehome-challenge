@@ -12,7 +12,7 @@ from time import monotonic
 from typing import Callable, Iterable, Mapping
 
 from lehome_train.io import sha256_file
-from lehome_train.models import ArtifactIdentity, model_from_mapping, validate_artifact_relative_path
+from lehome_train.models import ArtifactIdentity, validate_artifact_relative_path
 from lehome_train.redaction import ACCESS_TOKEN_PATTERNS
 
 
@@ -58,12 +58,31 @@ class PreflightStageResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SnapshotArtifactIdentity:
+    """A hashed snapshot file, including the Hub's root `.gitattributes`."""
+
+    relative_path: str
+    sha256: str
+    byte_size: int
+
+    def __post_init__(self) -> None:
+        if type(self.relative_path) is not str:
+            raise ValueError("snapshot artifact path is invalid")
+        if self.relative_path != ".gitattributes":
+            validate_artifact_relative_path(self.relative_path)
+        if type(self.sha256) is not str or not re.fullmatch(r"[0-9a-f]{64}", self.sha256):
+            raise ValueError("snapshot artifact SHA-256 is invalid")
+        if type(self.byte_size) is not int or self.byte_size < 0:
+            raise ValueError("snapshot artifact byte size is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class SnapshotVerification:
     """Revision plus verified local files from one immutable snapshot manifest."""
 
     revision: str
     manifest_sha256: str
-    artifacts: tuple[ArtifactIdentity, ...]
+    artifacts: tuple[SnapshotArtifactIdentity, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,8 +160,10 @@ def verify_immutable_revision(
         raise ValueError(f"{label} revision does not match its immutable expected revision")
 
 
-def _safe_snapshot_artifact(snapshot_root: Path, artifact: ArtifactIdentity) -> None:
-    relative = validate_artifact_relative_path(artifact.relative_path)
+def _safe_snapshot_artifact(
+    snapshot_root: Path, artifact: SnapshotArtifactIdentity
+) -> None:
+    relative = artifact.relative_path
     candidate = snapshot_root / relative
     try:
         candidate.resolve().relative_to(snapshot_root.resolve())
@@ -152,6 +173,24 @@ def _safe_snapshot_artifact(snapshot_root: Path, artifact: ArtifactIdentity) -> 
         raise ValueError("snapshot artifact is not a regular file")
     if candidate.stat().st_size != artifact.byte_size or sha256_file(candidate) != artifact.sha256:
         raise ValueError("snapshot artifact hash or size mismatch")
+
+
+def _snapshot_files(snapshot_root: Path) -> set[str]:
+    observed: set[str] = set()
+    pending = [snapshot_root]
+    while pending:
+        directory = pending.pop()
+        for entry in os.scandir(directory):
+            path = Path(entry.path)
+            if entry.is_symlink():
+                raise ValueError("snapshot contains a symlink")
+            if entry.is_dir(follow_symlinks=False):
+                pending.append(path)
+            elif entry.is_file(follow_symlinks=False):
+                observed.add(path.relative_to(snapshot_root).as_posix())
+            else:
+                raise ValueError("snapshot contains a special path")
+    return observed
 
 
 def verify_snapshot_manifest(
@@ -187,9 +226,14 @@ def verify_snapshot_manifest(
         raise ValueError(f"{label} snapshot manifest has no artifacts")
     try:
         artifacts = tuple(
-            model_from_mapping(ArtifactIdentity, item)
+            SnapshotArtifactIdentity(
+                relative_path=item["relative_path"],
+                sha256=item["sha256"],
+                byte_size=item["byte_size"],
+            )
             for item in encoded_artifacts
             if isinstance(item, Mapping)
+            and set(item) == {"relative_path", "sha256", "byte_size"}
         )
     except (TypeError, ValueError):
         raise ValueError(f"{label} snapshot manifest artifacts are invalid") from None
@@ -197,6 +241,10 @@ def verify_snapshot_manifest(
         raise ValueError(f"{label} snapshot manifest artifacts are invalid")
     for artifact in artifacts:
         _safe_snapshot_artifact(root, artifact)
+    expected_files = {artifact.relative_path for artifact in artifacts}
+    expected_files.add(manifest.relative_to(root).as_posix())
+    if _snapshot_files(root) != expected_files:
+        raise ValueError(f"{label} snapshot contains unverified files")
     return SnapshotVerification(
         revision=observed,
         manifest_sha256=sha256_file(manifest),

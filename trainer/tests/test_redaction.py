@@ -130,6 +130,7 @@ def test_rejected_path_does_not_survive_in_exception_chain_or_traceback(
     "candidate",
     [
         ".hidden",
+        ".gitattributes",
         "reports/.private/result.json",
         "cache/model.bin",
         "__pycache__/module.pyc",

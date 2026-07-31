@@ -178,10 +178,6 @@ class HuggingFaceHubTransport:
             can_write = permissions.get("write") is True
         elif isinstance(permissions, str):
             can_write = permissions.casefold() in {"write", "admin"}
-        else:
-            # Some Hub server versions omit permissions for authorized owners.
-            # Actual writes remain fail-closed at upload time.
-            can_write = private
         return HubAccess(
             can_read=private,
             can_write=can_write,

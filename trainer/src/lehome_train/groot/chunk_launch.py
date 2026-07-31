@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 import runpy
 import sys
 from typing import Any
@@ -31,6 +33,32 @@ class StopAtOptimizerStep:
         return control
 
 
+def _resume_value(output_dir: str | Path) -> bool:
+    """Return true only when the official output has a valid trainer checkpoint."""
+
+    root = Path(output_dir)
+    if not root.exists():
+        return False
+    candidates: list[tuple[int, Path]] = []
+    for path in root.glob("checkpoint-*"):
+        suffix = path.name.removeprefix("checkpoint-")
+        if suffix.isdigit():
+            candidates.append((int(suffix), path))
+    if not candidates:
+        return False
+    step, checkpoint = max(candidates)
+    state_path = checkpoint / "trainer_state.json"
+    if checkpoint.is_symlink() or not checkpoint.is_dir() or state_path.is_symlink():
+        raise ValueError("latest GR00T checkpoint is not a regular directory")
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("latest GR00T checkpoint has invalid trainer state") from None
+    if not isinstance(state, dict) or state.get("global_step") != step:
+        raise ValueError("latest GR00T checkpoint trainer state does not match its step")
+    return True
+
+
 def _arguments(argv: list[str] | None) -> tuple[int, str, list[str]]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--stop-after-step", type=int, required=True)
@@ -57,6 +85,8 @@ def main(argv: list[str] | None = None) -> None:
 
     def bounded_train(trainer: Any, *args: object, **kwargs: object) -> Any:
         trainer.add_callback(StopAtOptimizerStep(stop_step))
+        if kwargs.get("resume_from_checkpoint") is True:
+            kwargs["resume_from_checkpoint"] = _resume_value(trainer.args.output_dir)
         return original_train(trainer, *args, **kwargs)
 
     Trainer.train = bounded_train

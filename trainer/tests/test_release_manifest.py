@@ -2,7 +2,6 @@ import hashlib
 import json
 from pathlib import Path
 import re
-import subprocess
 
 import pytest
 
@@ -144,8 +143,8 @@ def test_unreleased_example_has_pins_but_no_claimed_image_or_gpu_acceptance() ->
     assert manifest.trainer_lock_sha256 == LOCK_SHA256
     assert manifest.oci_digest is None
     assert manifest.gpu_acceptance_status == "pending"
-    assert manifest.repository_commit == REPOSITORY_COMMIT
-    assert manifest.payload["image"]["tag"] == REPOSITORY_COMMIT  # type: ignore[index]
+    assert manifest.repository_commit is None
+    assert manifest.payload["image"]["tag"] is None  # type: ignore[index]
     assert manifest.payload["dataset"] == {
         "repository": "ryanjin333/lehome-groot-n17-data",
         "revision": None,
@@ -155,13 +154,16 @@ def test_unreleased_example_has_pins_but_no_claimed_image_or_gpu_acceptance() ->
     assert manifest.trainer_lock_sha256 == hashlib.sha256(
         (TRAINER / "uv.lock").read_bytes()
     ).hexdigest()
-    committed_lock = subprocess.run(
-        ["git", "show", f"{manifest.repository_commit}:trainer/uv.lock"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-    ).stdout
-    assert hashlib.sha256(committed_lock).hexdigest() == manifest.trainer_lock_sha256
+
+
+def test_dirty_build_is_labeled_and_tagged_diagnostic_and_release_verifier_rejects_it() -> None:
+    builder = (TRAINER / "scripts" / "build-image.sh").read_text(encoding="utf-8")
+    verifier = (TRAINER / "scripts" / "verify-image.sh").read_text(encoding="utf-8")
+
+    assert "-dirty-diagnostic" in builder
+    assert 'io.lehome.release-mode=${release_mode}' in builder
+    assert 'expected_release_mode=release' in verifier
+    assert 'io.lehome.release-mode' in verifier
 
 
 def test_accepted_manifest_requires_real_digest_and_completed_pro6000_gate() -> None:

@@ -10,22 +10,29 @@ if [[ ! "$repository_commit" =~ ^[0-9a-f]{40}$ ]]; then
   echo "unable to resolve an immutable repository commit" >&2
   exit 65
 fi
-if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" && "${ALLOW_DIRTY:-0}" != "1" ]]; then
+dirty_status=$(git status --porcelain=v1 --untracked-files=all)
+if [[ -n "$dirty_status" && "${ALLOW_DIRTY:-0}" != "1" ]]; then
   echo "refusing to label a dirty checkout with immutable commit $repository_commit" >&2
   echo "commit the intended image inputs first, or set ALLOW_DIRTY=1 for a non-release diagnostic build" >&2
   exit 65
 fi
 
 image_repository=${IMAGE_REPOSITORY:-lehome-groot-n17-trainer}
-image_ref="${image_repository}:${repository_commit}"
+release_mode=release
+image_tag=$repository_commit
+if [[ -n "$dirty_status" ]]; then
+  release_mode=diagnostic-dirty
+  image_tag="${repository_commit}-dirty-diagnostic"
+fi
+image_ref="${image_repository}:${image_tag}"
 
 docker buildx build \
   --platform linux/amd64 \
   --load \
   --build-arg "REPOSITORY_COMMIT=${repository_commit}" \
+  --label "io.lehome.release-mode=${release_mode}" \
   --tag "$image_ref" \
   -f trainer/Dockerfile \
   .
 
 printf '%s\n' "$image_ref"
-

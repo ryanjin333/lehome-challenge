@@ -85,6 +85,16 @@ def test_revision_snapshot_and_hub_permission_are_explicit_and_secret_safe(tmp_p
     assert verified.revision == revision
     assert verified.manifest_sha256 == sha256_file(manifest)
 
+    (snapshot / "unverified.bin").write_bytes(b"extra")
+    with pytest.raises(ValueError, match="unverified files"):
+        verify_snapshot_manifest(
+            snapshot_root=snapshot,
+            manifest_path=manifest,
+            expected_revision=revision,
+            label="model",
+        )
+    (snapshot / "unverified.bin").unlink()
+
     observed_requests: list[tuple[str, str, str]] = []
     verify_hub_upload_readback_permission(
         token="hf_secret_token_value",
