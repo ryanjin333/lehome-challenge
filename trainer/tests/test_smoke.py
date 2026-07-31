@@ -48,7 +48,7 @@ def _samples(
     return (
         TelemetrySample(0.0, 4 * GIBIBYTE, 5 * GIBIBYTE, (total_gib - 5) * GIBIBYTE, 20.0, 100.0, 45.0, 2 * GIBIBYTE),
         TelemetrySample(
-            1.0,
+            10.0,
             int((reserved_gib - 1) * GIBIBYTE),
             int(reserved_gib * GIBIBYTE),
             int(observed_free_gib * GIBIBYTE),
@@ -251,6 +251,24 @@ def test_telemetry_separates_warmup_from_steady_state_throughput() -> None:
     assert summary.steady_state_seconds == 20.0
     assert summary.steady_steps_per_second == 2.5
     assert summary.samples_per_second == 40.0
+
+
+def test_headroom_telemetry_excludes_initialization_and_warmup_samples() -> None:
+    samples = (
+        TelemetrySample(0.0, 1, 2, 1 * GIBIBYTE, 1.0, 1.0, 1.0, 1),
+        TelemetrySample(10.0, 3, 4, 20 * GIBIBYTE, 1.0, 1.0, 1.0, 1),
+    )
+
+    summary = summarize_telemetry(
+        samples,
+        initialization_seconds=4.0,
+        warmup_seconds=6.0,
+        steady_state_seconds=10.0,
+        steady_state_optimizer_steps=50,
+        physical_batch_size=16,
+    )
+
+    assert summary.minimum_steady_state_free_vram_bytes == 20 * GIBIBYTE
 
 
 def test_telemetry_samples_during_a_blocking_sequential_launch() -> None:

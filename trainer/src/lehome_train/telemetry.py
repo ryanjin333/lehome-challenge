@@ -60,7 +60,7 @@ class TelemetrySummary(StrictModel):
     steady_state_seconds: float
     peak_allocated_vram_bytes: int
     peak_reserved_vram_bytes: int
-    minimum_free_vram_bytes: int
+    minimum_steady_state_free_vram_bytes: int
     peak_gpu_utilization_percent: float | None
     peak_power_watts: float | None
     peak_temperature_celsius: float | None
@@ -82,7 +82,7 @@ class TelemetrySummary(StrictModel):
         for name in (
             "peak_allocated_vram_bytes",
             "peak_reserved_vram_bytes",
-            "minimum_free_vram_bytes",
+            "minimum_steady_state_free_vram_bytes",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"telemetry {name} must be nonnegative")
@@ -137,13 +137,17 @@ def summarize_telemetry(
 
     allocated = _peak(samples, "allocated_vram_bytes")
     reserved = _peak(samples, "reserved_vram_bytes")
-    free_values = tuple(
+    steady_state_started_at = float(initialization_seconds) + float(warmup_seconds)
+    steady_state_free_values = tuple(
         sample.free_vram_bytes
         for sample in samples
-        if sample.free_vram_bytes is not None
+        if sample.timestamp_seconds >= steady_state_started_at
+        and sample.free_vram_bytes is not None
     )
-    if allocated is None or reserved is None or not free_values:
-        raise ValueError("allocated, reserved, and free VRAM telemetry are required")
+    if allocated is None or reserved is None or not steady_state_free_values:
+        raise ValueError(
+            "allocated, reserved, and steady-state free VRAM telemetry are required"
+        )
     steps_per_second = (
         steady_state_optimizer_steps / float(steady_state_seconds)
         if steady_state_seconds > 0
@@ -155,7 +159,7 @@ def summarize_telemetry(
         steady_state_seconds=float(steady_state_seconds),
         peak_allocated_vram_bytes=int(allocated),
         peak_reserved_vram_bytes=int(reserved),
-        minimum_free_vram_bytes=min(free_values),
+        minimum_steady_state_free_vram_bytes=min(steady_state_free_values),
         peak_gpu_utilization_percent=_optional_float(_peak(samples, "gpu_utilization_percent")),
         peak_power_watts=_optional_float(_peak(samples, "power_watts")),
         peak_temperature_celsius=_optional_float(_peak(samples, "temperature_celsius")),

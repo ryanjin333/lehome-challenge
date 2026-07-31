@@ -170,6 +170,7 @@ def test_all_artifact_contracts_have_typed_identity_and_provenance() -> None:
         finite_loss=True,
         physical_vram_bytes=96_000_000_000,
         peak_reserved_vram_bytes=80_000_000_000,
+        minimum_steady_state_free_vram_bytes=16_000_000_000,
         steady_steps_per_second=1.5,
         samples_per_second=24.0,
         error_code=None,

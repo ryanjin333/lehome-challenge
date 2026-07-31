@@ -385,6 +385,7 @@ class SmokeResult(StrictModel):
     finite_loss: bool
     physical_vram_bytes: int
     peak_reserved_vram_bytes: int
+    minimum_steady_state_free_vram_bytes: int
     steady_steps_per_second: float
     samples_per_second: float
     error_code: Optional[str]
@@ -404,6 +405,10 @@ class SmokeResult(StrictModel):
         _require_nonnegative(
             self.peak_reserved_vram_bytes,
             "peak_reserved_vram_bytes",
+        )
+        _require_nonnegative(
+            self.minimum_steady_state_free_vram_bytes,
+            "minimum_steady_state_free_vram_bytes",
         )
         _require_nonnegative_float(
             self.steady_steps_per_second,

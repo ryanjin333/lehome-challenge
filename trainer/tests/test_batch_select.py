@@ -21,6 +21,7 @@ def _result(
     *,
     total_gib: int = 96,
     reserved_gib: float = 80,
+    minimum_free_gib: float = 16,
     stable: bool = True,
     finite_loss: bool = True,
     accumulation: int = 1,
@@ -36,6 +37,7 @@ def _result(
         finite_loss=finite_loss,
         physical_vram_bytes=total_gib * GIBIBYTE,
         peak_reserved_vram_bytes=int(reserved_gib * GIBIBYTE),
+        minimum_steady_state_free_vram_bytes=int(minimum_free_gib * GIBIBYTE),
         steady_steps_per_second=1.0,
         samples_per_second=float(batch),
         error_code=None if stable else "cuda_oom",
@@ -71,15 +73,37 @@ def test_first_candidate_fallback_uses_smaller_powers_of_two_without_duplicates(
 
 
 def test_headroom_gate_requires_at_least_ten_percent_physical_vram_free() -> None:
-    assert has_required_headroom(_result(16, total_gib=40, reserved_gib=36)) is True
-    assert has_required_headroom(_result(16, total_gib=40, reserved_gib=36.0001)) is False
+    assert has_required_headroom(_result(16, total_gib=40, minimum_free_gib=4)) is True
+    assert has_required_headroom(_result(16, total_gib=40, minimum_free_gib=3.9999)) is False
+
+
+def test_selection_uses_nvml_free_memory_not_allocator_reserved_memory() -> None:
+    allocator_looks_safe_but_physical_free_is_low = _result(
+        32,
+        reserved_gib=70,
+        minimum_free_gib=5,
+    )
+    allocator_peak_is_high_but_steady_physical_free_passes = _result(
+        16,
+        reserved_gib=92,
+        minimum_free_gib=10,
+    )
+
+    assert has_required_headroom(allocator_looks_safe_but_physical_free_is_low) is False
+    assert has_required_headroom(allocator_peak_is_high_but_steady_physical_free_passes) is True
+    assert select_largest_stable_batch(
+        (
+            allocator_peak_is_high_but_steady_physical_free_passes,
+            allocator_looks_safe_but_physical_free_is_low,
+        )
+    ) == 16
 
 
 def test_selection_returns_largest_stable_finite_fixed_accumulation_batch() -> None:
     results = (
-        _result(16, reserved_gib=70),
-        _result(32, reserved_gib=82),
-        _result(64, reserved_gib=90),
+        _result(16, reserved_gib=70, minimum_free_gib=26),
+        _result(32, reserved_gib=82, minimum_free_gib=14),
+        _result(64, reserved_gib=90, minimum_free_gib=6),
     )
 
     assert select_largest_stable_batch(results) == 32

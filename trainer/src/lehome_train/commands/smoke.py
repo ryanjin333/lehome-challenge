@@ -8,7 +8,6 @@ from typing import Callable, Protocol
 from lehome_train.batch_select import (
     batch_candidates,
     fallback_candidates,
-    has_required_free_vram,
     has_required_headroom,
 )
 from lehome_train.groot.config import FineTuneLaunchConfig
@@ -197,6 +196,9 @@ def _validated_attempt(
         finite_loss=receipt.finite_loss,
         physical_vram_bytes=physical_vram_bytes,
         peak_reserved_vram_bytes=telemetry.peak_reserved_vram_bytes,
+        minimum_steady_state_free_vram_bytes=(
+            telemetry.minimum_steady_state_free_vram_bytes
+        ),
         steady_steps_per_second=telemetry.steady_steps_per_second,
         samples_per_second=telemetry.samples_per_second,
         error_code=error_code,
@@ -238,10 +240,7 @@ def run_smoke_tests(
             dataset_manifest_sha256=dataset_manifest_sha256,
         )
         attempts.append(attempt)
-        headroom_failure = not has_required_free_vram(
-            physical_vram_bytes,
-            attempt.telemetry.minimum_free_vram_bytes,
-        )
+        headroom_failure = not has_required_headroom(attempt.result)
         memory_boundary = attempt.memory_failure or headroom_failure
 
         if fallback_mode:
@@ -262,10 +261,6 @@ def run_smoke_tests(
             if attempt.result.stable
             and attempt.result.finite_loss
             and has_required_headroom(attempt.result)
-            and has_required_free_vram(
-                physical_vram_bytes,
-                attempt.telemetry.minimum_free_vram_bytes,
-            )
         )
     except ValueError:
         selected = None

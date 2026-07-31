@@ -38,8 +38,10 @@ def has_required_headroom(result: SmokeResult) -> bool:
 
     if not isinstance(result, SmokeResult):
         raise TypeError("headroom requires a SmokeResult")
-    free_bytes = result.physical_vram_bytes - result.peak_reserved_vram_bytes
-    return has_required_free_vram(result.physical_vram_bytes, free_bytes)
+    return has_required_free_vram(
+        result.physical_vram_bytes,
+        result.minimum_steady_state_free_vram_bytes,
+    )
 
 
 def has_required_free_vram(
