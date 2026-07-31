@@ -68,6 +68,21 @@ def _checkout_head(checkout: Path) -> str:
     return completed.stdout.strip()
 
 
+def _checkout_is_clean(checkout: Path) -> bool:
+    """Return whether the checkout has no staged, modified, or untracked code."""
+
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0 and not completed.stdout
+
+
 def _official_entrypoint(official_checkout: str | os.PathLike[str]) -> Path:
     checkout = Path(official_checkout)
     entrypoint = checkout / "gr00t" / "experiment" / "launch_finetune.py"
@@ -75,6 +90,8 @@ def _official_entrypoint(official_checkout: str | os.PathLike[str]) -> Path:
         raise ValueError("official GR00T entrypoint is missing")
     if _checkout_head(checkout) != ISAAC_GROOT_REVISION:
         raise ValueError("official checkout is not pinned Isaac-GR00T revision")
+    if not _checkout_is_clean(checkout):
+        raise ValueError("official GR00T checkout is not clean")
     return entrypoint
 
 
@@ -160,7 +177,9 @@ def _existing_identity(output_dir: Path) -> dict[str, object] | None:
 
 
 def _write_or_verify_identity(config: FineTuneLaunchConfig) -> None:
-    output_dir = Path(config.output_dir)
+    # The pinned upstream launcher nests named runs below output_dir.  The
+    # identity must live beside checkpoints, not merely beside their parent.
+    output_dir = Path(config.output_dir) / config.experiment_name
     existing = _existing_identity(output_dir)
     expected = config.identity()
     if existing is not None:

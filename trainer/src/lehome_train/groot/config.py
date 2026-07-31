@@ -68,6 +68,12 @@ class FineTuneLaunchConfig:
             "experiment_name",
         ):
             _require_nonempty(getattr(self, field_name), field_name)
+        if (
+            self.experiment_name in {".", ".."}
+            or "/" in self.experiment_name
+            or "\\" in self.experiment_name
+        ):
+            raise ValueError("experiment_name must be one safe path component")
         _require_pinned_revision(self.base_model_revision, "base_model_revision")
         _require_pinned_revision(self.dataset_revision, "dataset_revision")
         if self.base_model_revision != MODEL_REVISION:

@@ -52,6 +52,8 @@ def test_config_enforces_single_gpu_fixed_batch_horizon_and_freezing() -> None:
         ("gradient_accumulation_steps", 2, "gradient accumulation"),
         ("action_horizon", 8, "action horizon"),
         ("warmup_ratio", 0.0, "warmup_ratio"),
+        ("experiment_name", "../outside", "experiment_name"),
+        ("experiment_name", "/outside", "experiment_name"),
         ("base_model_revision", "main", "pinned"),
         ("dataset_revision", "lehome-groot-n17-v1", "pinned"),
         ("tune_llm", True, "tune_llm"),

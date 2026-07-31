@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -42,6 +43,7 @@ def official_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "lehome_train.groot.launch._checkout_head",
         lambda _path: ISAAC_GROOT_REVISION,
     )
+    monkeypatch.setattr("lehome_train.groot.launch._checkout_is_clean", lambda _path: True)
     return checkout
 
 
@@ -90,8 +92,9 @@ def test_launch_refuses_incompatible_existing_experiment_directory(
     official_checkout: Path,
 ) -> None:
     output = tmp_path / "experiment"
-    output.mkdir()
-    (output / "lehome_launch.json").write_text('{"dataset_revision":"' + ("b" * 40) + '"}', encoding="utf-8")
+    effective = output / "lehome-groot-baseline"
+    effective.mkdir(parents=True)
+    (effective / "lehome_launch.json").write_text('{"dataset_revision":"' + ("b" * 40) + '"}', encoding="utf-8")
 
     with pytest.raises(ValueError, match="incompatible experiment"):
         launch_finetune(
@@ -109,8 +112,9 @@ def test_launch_identity_rejects_behavior_changing_settings_before_runner(
 ) -> None:
     output = tmp_path / "experiment"
     expected = config(output_dir=str(output))
-    output.mkdir()
-    (output / "lehome_launch.json").write_text(
+    effective = output / expected.experiment_name
+    effective.mkdir(parents=True)
+    (effective / "lehome_launch.json").write_text(
         __import__("json").dumps(expected.identity()), encoding="utf-8"
     )
 
@@ -140,6 +144,62 @@ def test_build_launch_refuses_missing_or_wrong_pinned_official_checkout(
     monkeypatch.setattr("lehome_train.groot.launch._checkout_head", lambda _path: "b" * 40)
     with pytest.raises(ValueError, match="pinned Isaac-GR00T"):
         build_launch(config(), visible_devices="0", environment={}, official_checkout=checkout)
+
+
+def test_build_launch_refuses_altered_or_untracked_official_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "real-git-checkout"
+    entrypoint = checkout / "gr00t" / "experiment" / "launch_finetune.py"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("# committed launcher\n", encoding="utf-8")
+    for arguments in (
+        ("git", "init", str(checkout)),
+        ("git", "-C", str(checkout), "config", "user.email", "test@example.invalid"),
+        ("git", "-C", str(checkout), "config", "user.name", "Test"),
+        ("git", "-C", str(checkout), "add", "."),
+        ("git", "-C", str(checkout), "commit", "-m", "fixture"),
+    ):
+        subprocess.run(arguments, check=True, capture_output=True, text=True)
+    monkeypatch.setattr(
+        "lehome_train.groot.launch._checkout_head",
+        lambda _path: ISAAC_GROOT_REVISION,
+    )
+
+    build_launch(config(), visible_devices="0", environment={}, official_checkout=checkout)
+    entrypoint.write_text("# altered launcher\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="official GR00T checkout is not clean"):
+        build_launch(config(), visible_devices="0", environment={}, official_checkout=checkout)
+
+    subprocess.run(
+        ("git", "-C", str(checkout), "checkout", "--", "gr00t/experiment/launch_finetune.py"),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (checkout / "untracked.py").write_text("# untracked\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="official GR00T checkout is not clean"):
+        build_launch(config(), visible_devices="0", environment={}, official_checkout=checkout)
+
+
+def test_identity_is_written_to_effective_official_experiment_directory(
+    tmp_path: Path,
+    official_checkout: Path,
+) -> None:
+    output = tmp_path / "output-root"
+    completed = launch_finetune(
+        config(output_dir=str(output)),
+        visible_devices="0",
+        environment={},
+        official_checkout=official_checkout,
+        runner=lambda *_args, **_kwargs: __import__("subprocess").CompletedProcess([], 0),
+    )
+
+    assert completed.returncode == 0
+    assert not (output / "lehome_launch.json").exists()
+    assert (output / "lehome-groot-baseline" / "lehome_launch.json").is_file()
 
 
 def test_parser_returns_finite_structured_loss_throughput_and_checkpoint_timing() -> None:
