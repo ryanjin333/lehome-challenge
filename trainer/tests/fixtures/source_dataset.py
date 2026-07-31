@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 from typing import Callable
 
 import pyarrow as pa
@@ -33,6 +37,64 @@ def _write_json(path: Path, value: object) -> None:
         json.dumps(value, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
     )
+
+
+@lru_cache(maxsize=None)
+def _fixture_video(frame_count: int, fps: int) -> Path:
+    path = (
+        Path(tempfile.gettempdir())
+        / f"lehome-v3-fixture-{frame_count}-frames-{fps}-fps.mp4"
+    )
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=blue:s=640x480:r={fps}",
+            "-frames:v",
+            str(frame_count),
+            "-c:v",
+            "libx264",
+            "-g",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+            "-fflags",
+            "+bitexact",
+            "-y",
+            str(path),
+        ],
+        check=True,
+        timeout=30,
+    )
+    return path
+
+
+def count_video_frames(path: Path) -> int:
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return int(completed.stdout.strip())
 
 
 def make_source_dataset(
@@ -72,45 +134,67 @@ def make_source_dataset(
                 "video.width": 640,
                 "video.channels": 3,
                 "video.fps": fps,
-                "video.codec": "fixture",
-                "video.pix_fmt": "rgb24",
+                "video.codec": "h264",
+                "video.pix_fmt": "yuv420p",
                 "video.is_depth_map": False,
                 "has_audio": False,
             },
         }
     info: dict[str, object] = {
-        "codebase_version": "v2.1",
+        "codebase_version": "v3.0",
         "robot_type": "dual_so101_follower",
         "total_episodes": len(episode_ids),
         "total_frames": len(episode_ids) * frames_per_episode,
         "total_tasks": 1,
-        "total_videos": len(episode_ids) * len(CAMERA_KEYS),
+        "total_videos": (
+            len({index // 2 for index in range(len(episode_ids))})
+            * len(CAMERA_KEYS)
+        ),
         "total_chunks": 1,
         "chunks_size": 1000,
+        "data_files_size_in_mb": 100,
+        "video_files_size_in_mb": 200,
         "fps": fps,
         "splits": {"train": f"0:{len(episode_ids)}"},
-        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": (
-            "videos/chunk-{episode_chunk:03d}/{video_key}/"
-            "episode_{episode_index:06d}.mp4"
+            "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
         ),
         "features": features,
     }
     if mutate_info is not None:
         mutate_info(info)
     _write_json(dataset / "meta" / "info.json", info)
+    statistic = {
+        name: [0.0] * 12
+        for name in ("mean", "std", "min", "max", "q01", "q99")
+    }
     _write_json(
-        dataset / "meta" / "modality.json",
-        {"source": "organizer fixture"},
+        dataset / "meta" / "stats.json",
+        {
+            "observation.state": statistic,
+            "action": statistic,
+        },
     )
-    (dataset / "meta" / "tasks.jsonl").write_text(
-        '{"task":"organizer task","task_index":0}\n',
-        encoding="utf-8",
+    pq.write_table(
+        pa.table(
+            {
+                "task": pa.array(["organizer task"], type=pa.string()),
+                "task_index": pa.array([0], type=pa.int64()),
+            }
+        ),
+        dataset / "meta" / "tasks.parquet",
     )
 
-    episode_lines: list[str] = []
+    # Two consolidated v3 shards: the first contains two episodes, the second one.
+    file_assignments = tuple(index // 2 for index in range(len(episode_ids)))
     global_index = 0
-    for episode_id in episode_ids:
+    file_tables: dict[int, list[pa.Table]] = {
+        file_index: [] for file_index in set(file_assignments)
+    }
+    episode_records: list[dict[str, object]] = []
+    file_local_offsets = {file_index: 0 for file_index in file_tables}
+    for episode_id, file_index in zip(episode_ids, file_assignments, strict=True):
         rows: dict[str, list[object]] = {
             "observation.state": [],
             "action": [],
@@ -120,17 +204,20 @@ def make_source_dataset(
             "index": [],
             "task_index": [],
         }
+        dataset_from_index = global_index
         for frame_index in range(frames_per_episode):
-            state = [
-                float(episode_id * 100 + frame_index * 10 + dimension)
-                for dimension in range(12)
-            ]
-            action = [
-                float(episode_id * 1000 + frame_index * 10 + dimension)
-                for dimension in range(12)
-            ]
-            rows["observation.state"].append(state)
-            rows["action"].append(action)
+            rows["observation.state"].append(
+                [
+                    float(episode_id * 100 + frame_index * 10 + dimension)
+                    for dimension in range(12)
+                ]
+            )
+            rows["action"].append(
+                [
+                    float(episode_id * 1000 + frame_index * 10 + dimension)
+                    for dimension in range(12)
+                ]
+            )
             rows["timestamp"].append(frame_index / fps)
             rows["frame_index"].append(frame_index)
             rows["episode_index"].append(episode_id)
@@ -139,52 +226,60 @@ def make_source_dataset(
             global_index += 1
         if mutate_rows is not None:
             mutate_rows(episode_id, rows)
-        table = pa.table(
-            {
-                "observation.state": pa.array(
-                    rows["observation.state"], type=pa.list_(pa.float32(), 12)
-                ),
-                "action": pa.array(rows["action"], type=pa.list_(pa.float32(), 12)),
-                "timestamp": pa.array(rows["timestamp"], type=pa.float32()),
-                "frame_index": pa.array(rows["frame_index"], type=pa.int64()),
-                "episode_index": pa.array(rows["episode_index"], type=pa.int64()),
-                "index": pa.array(rows["index"], type=pa.int64()),
-                "task_index": pa.array(rows["task_index"], type=pa.int64()),
-            }
+        file_tables[file_index].append(
+            pa.table(
+                {
+                    "observation.state": pa.array(
+                        rows["observation.state"], type=pa.list_(pa.float32(), 12)
+                    ),
+                    "action": pa.array(
+                        rows["action"], type=pa.list_(pa.float32(), 12)
+                    ),
+                    "timestamp": pa.array(rows["timestamp"], type=pa.float32()),
+                    "frame_index": pa.array(rows["frame_index"], type=pa.int64()),
+                    "episode_index": pa.array(rows["episode_index"], type=pa.int64()),
+                    "index": pa.array(rows["index"], type=pa.int64()),
+                    "task_index": pa.array(rows["task_index"], type=pa.int64()),
+                }
+            )
         )
-        parquet_path = (
-            dataset / "data" / "chunk-000" / f"episode_{episode_id:06d}.parquet"
-        )
-        parquet_path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(table, parquet_path, compression="zstd")
+        local_start = file_local_offsets[file_index]
+        local_end = local_start + frames_per_episode
+        file_local_offsets[file_index] = local_end
+        record: dict[str, object] = {
+            "episode_index": episode_id,
+            "tasks": ["organizer task"],
+            "length": frames_per_episode,
+            "dataset_from_index": dataset_from_index,
+            "dataset_to_index": global_index,
+            "data/chunk_index": 0,
+            "data/file_index": file_index,
+        }
+        for camera_key in CAMERA_KEYS:
+            record[f"videos/{camera_key}/chunk_index"] = 0
+            record[f"videos/{camera_key}/file_index"] = file_index
+            record[f"videos/{camera_key}/from_timestamp"] = local_start / fps
+            record[f"videos/{camera_key}/to_timestamp"] = local_end / fps
+        episode_records.append(record)
+
+    for file_index, tables in file_tables.items():
+        path = dataset / "data" / "chunk-000" / f"file-{file_index:03d}.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.concat_tables(tables), path, compression="zstd")
+        frame_count = sum(table.num_rows for table in tables)
+        source_video = _fixture_video(frame_count, int(fps))
         for camera_key in CAMERA_KEYS:
             video_path = (
                 dataset
                 / "videos"
-                / "chunk-000"
                 / camera_key
-                / f"episode_{episode_id:06d}.mp4"
+                / "chunk-000"
+                / f"file-{file_index:03d}.mp4"
             )
             video_path.parent.mkdir(parents=True, exist_ok=True)
-            video_path.write_bytes(
-                b"safe-fixture-rgb-stream:"
-                + camera_key.encode()
-                + b":"
-                + str(episode_id).encode()
-            )
-        episode_lines.append(
-            json.dumps(
-                {
-                    "episode_index": episode_id,
-                    "tasks": ["organizer task"],
-                    "length": frames_per_episode,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        )
-    (dataset / "meta" / "episodes.jsonl").write_text(
-        "\n".join(episode_lines) + "\n",
-        encoding="utf-8",
-    )
+            shutil.copyfile(source_video, video_path)
+
+    episodes_path = dataset / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    episodes_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pylist(episode_records), episodes_path, compression="zstd")
     return dataset

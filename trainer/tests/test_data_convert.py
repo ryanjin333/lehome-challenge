@@ -7,7 +7,12 @@ from pathlib import Path
 import pyarrow.parquet as pq
 import pytest
 
-from fixtures.source_dataset import CAMERA_KEYS, JOINT_NAMES, make_source_dataset
+from fixtures.source_dataset import (
+    CAMERA_KEYS,
+    JOINT_NAMES,
+    count_video_frames,
+    make_source_dataset,
+)
 from lehome_train.data.convert import convert_dataset
 from lehome_train.data.split import split_episode_ids
 
@@ -16,6 +21,22 @@ MAPPING_PATH = (
     Path(__file__).parents[1] / "config" / "lehome_four_types_mapping.json"
 )
 CONVERTER_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+SOURCE_REVISION = "89abcdef0123456789abcdef0123456789abcdef"
+CONTAINER_DIGEST = "sha256:" + ("a" * 64)
+SOURCE_REPOSITORY = "ryanjin333/four_types_merged"
+
+
+def _convert(source: Path, destination: Path, **kwargs):
+    return convert_dataset(
+        source,
+        destination,
+        mapping_path=MAPPING_PATH,
+        source_repository=SOURCE_REPOSITORY,
+        source_revision=SOURCE_REVISION,
+        converter_commit=CONVERTER_COMMIT,
+        converter_container_digest=CONTAINER_DIGEST,
+        **kwargs,
+    )
 
 
 def test_episode_split_is_stable_seeded_and_never_splits_frames() -> None:
@@ -35,7 +56,10 @@ def test_conversion_requires_checked_mapping(tmp_path: Path) -> None:
             source,
             tmp_path / "output",
             mapping_path=None,
+            source_repository=SOURCE_REPOSITORY,
+            source_revision=SOURCE_REVISION,
             converter_commit=CONVERTER_COMMIT,
+            converter_container_digest=CONTAINER_DIGEST,
         )
 
 
@@ -44,14 +68,12 @@ def test_conversion_preserves_absolute_actions_and_builds_groot_layout(
 ) -> None:
     source = make_source_dataset(tmp_path)
     source_action = pq.read_table(
-        source / "data" / "chunk-000" / "episode_000003.parquet"
-    )["action"].to_pylist()
+        source / "data" / "chunk-000" / "file-000.parquet"
+    )["action"].slice(18, 18).to_pylist()
 
-    manifest = convert_dataset(
+    manifest = _convert(
         source,
         tmp_path / "output",
-        mapping_path=MAPPING_PATH,
-        converter_commit=CONVERTER_COMMIT,
         split_seed=17,
         validation_fraction=1 / 3,
     )
@@ -64,7 +86,31 @@ def test_conversion_preserves_absolute_actions_and_builds_groot_layout(
     assert converted["episode_index"].to_pylist() == [3] * 18
     assert converted["frame_index"].to_pylist() == list(range(18))
     assert converted["task_index"].to_pylist() == [0] * 18
-    assert "eef" not in json.dumps(manifest).lower()
+    assert count_video_frames(
+        output
+        / "videos"
+        / "chunk-000"
+        / "observation.images.top_rgb"
+        / "episode_000003.mp4"
+    ) == 18
+    output_info = json.loads(
+        (output / "meta" / "info.json").read_text(encoding="utf-8")
+    )
+    assert output_info["codebase_version"] == "v2.1"
+    assert output_info["data_path"] == (
+        "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+    )
+    assert "data_files_size_in_mb" not in output_info
+    assert "video_files_size_in_mb" not in output_info
+    assert "eef" not in json.dumps(
+        {
+            "action_schema": manifest["action_schema"],
+            "state_schema": manifest["state_schema"],
+        }
+    ).lower()
+    assert manifest["source_repository"] == SOURCE_REPOSITORY
+    assert manifest["source_revision"] == SOURCE_REVISION
+    assert manifest["converter_container_digest"] == CONTAINER_DIGEST
     assert manifest["action_schema"]["storage"] == "absolute"
     assert manifest["action_schema"]["dimension"] == 12
     assert manifest["action_schema"]["names"] == JOINT_NAMES
@@ -102,18 +148,14 @@ def test_conversion_is_deterministic_and_does_not_mutate_source(tmp_path: Path) 
         b"".join(path.read_bytes() for path in sorted(source.rglob("*")) if path.is_file())
     ).hexdigest()
 
-    first = convert_dataset(
+    first = _convert(
         source,
         tmp_path / "first",
-        mapping_path=MAPPING_PATH,
-        converter_commit=CONVERTER_COMMIT,
         split_seed=5,
     )
-    second = convert_dataset(
+    second = _convert(
         source,
         tmp_path / "second",
-        mapping_path=MAPPING_PATH,
-        converter_commit=CONVERTER_COMMIT,
         split_seed=5,
     )
 
@@ -139,7 +181,10 @@ def test_conversion_fails_closed_on_drift_or_incompatible_destination(
             source,
             tmp_path / "output",
             mapping_path=MAPPING_PATH,
+            source_repository=SOURCE_REPOSITORY,
+            source_revision=SOURCE_REVISION,
             converter_commit=CONVERTER_COMMIT,
+            converter_container_digest=CONTAINER_DIGEST,
         )
 
     valid_source = make_source_dataset(tmp_path / "valid")
@@ -147,11 +192,9 @@ def test_conversion_fails_closed_on_drift_or_incompatible_destination(
     destination.mkdir()
     (destination / "manifest.json").write_text('{"incompatible":true}', encoding="utf-8")
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
-        convert_dataset(
+        _convert(
             valid_source,
             destination,
-            mapping_path=MAPPING_PATH,
-            converter_commit=CONVERTER_COMMIT,
         )
 
 
@@ -159,11 +202,37 @@ def test_conversion_refuses_to_write_inside_source_dataset(tmp_path: Path) -> No
     source = make_source_dataset(tmp_path)
 
     with pytest.raises(ValueError, match="inside the source dataset"):
-        convert_dataset(
+        _convert(
             source,
             source / "prepared",
-            mapping_path=MAPPING_PATH,
-            converter_commit=CONVERTER_COMMIT,
         )
 
     assert not (source / "prepared").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("source_repository", "", "source_repository"),
+        ("source_revision", "main", "source_revision"),
+        ("converter_container_digest", "sha256:latest", "container digest"),
+    ],
+)
+def test_conversion_requires_immutable_provenance_inputs(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    source = make_source_dataset(tmp_path)
+    arguments = {
+        "mapping_path": MAPPING_PATH,
+        "source_repository": SOURCE_REPOSITORY,
+        "source_revision": SOURCE_REVISION,
+        "converter_commit": CONVERTER_COMMIT,
+        "converter_container_digest": CONTAINER_DIGEST,
+    }
+    arguments[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        convert_dataset(source, tmp_path / "output", **arguments)

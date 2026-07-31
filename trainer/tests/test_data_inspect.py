@@ -16,6 +16,7 @@ def test_inspection_reports_observed_schema_and_proposed_mapping(tmp_path: Path)
     report = inspect_dataset(source, output_path=report_path)
 
     assert report["valid"] is True
+    assert report["source_format"] == "lerobot_v3_sharded"
     assert report["dataset_name"] == "four_types_merged"
     assert report["episode_ids"] == ["3", "7", "11"]
     assert report["frame_count"] == 54
@@ -27,6 +28,12 @@ def test_inspection_reports_observed_schema_and_proposed_mapping(tmp_path: Path)
     )
     assert report["observed_schema"]["cameras"][0]["shape"] == [480, 640, 3]
     assert json.loads(report_path.read_text(encoding="utf-8")) == report
+    assert (
+        source / "data" / "chunk-000" / "file-000.parquet"
+    ).is_file()
+    assert (
+        source / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    ).is_file()
 
 
 @pytest.mark.parametrize(
