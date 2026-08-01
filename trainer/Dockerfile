@@ -87,6 +87,7 @@ RUN uv pip install --python /opt/runtime/bin/python --no-deps /opt/trainer \
     && useradd --uid 10001 --gid trainer --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin trainer \
     && install -d -o trainer -g trainer -m 0750 /opt/isaac-groot/.git/lfs/tmp \
     && install -d -o trainer -g trainer -m 0750 /cache /prepared /output \
+    && install -d -o trainer -g trainer -m 0750 /cache/tmp \
     && chmod 0755 /usr/local/bin/lehome-entrypoint
 
 ENV PATH=/opt/runtime/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin \
