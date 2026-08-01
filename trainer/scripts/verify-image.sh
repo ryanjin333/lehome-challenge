@@ -53,9 +53,22 @@ if docker image inspect --format '{{json .Config.Env}}' "$image_ref" \
 fi
 
 mount_root=$(mktemp -d)
-trap 'rm -rf "$mount_root"' EXIT
 mkdir -p "$mount_root/cache" "$mount_root/prepared" "$mount_root/output"
 chmod 0777 "$mount_root/cache" "$mount_root/prepared" "$mount_root/output"
+
+cleanup_mount_root() {
+  local status=$?
+  docker run --rm --platform linux/amd64 --user 0:0 \
+    -v "$mount_root/cache:/cache" \
+    -v "$mount_root/prepared:/prepared" \
+    -v "$mount_root/output:/output" \
+    --entrypoint /bin/chmod "$image_ref" \
+    -R a+rwX /cache /prepared /output >/dev/null 2>&1 || true
+  rm -rf "$mount_root" || true
+  return "$status"
+}
+trap cleanup_mount_root EXIT
+
 run=(docker run --rm --platform linux/amd64
   -v "$mount_root/cache:/cache"
   -v "$mount_root/prepared:/prepared"

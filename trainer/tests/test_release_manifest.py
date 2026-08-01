@@ -350,6 +350,25 @@ def test_image_verifier_makes_ephemeral_bind_mounts_writable_by_container_user()
     assert 'chmod 0777 "$mount_root/cache" "$mount_root/prepared" "$mount_root/output"' in verifier
 
 
+def test_image_grants_trainer_only_the_git_lfs_scratch_directory() -> None:
+    dockerfile = (TRAINER / "Dockerfile").read_text(encoding="utf-8")
+
+    assert (
+        "install -d -o trainer -g trainer -m 0750 "
+        "/opt/isaac-groot/.git/lfs/tmp"
+    ) in dockerfile
+
+
+def test_image_verifier_restores_bind_mount_permissions_before_cleanup() -> None:
+    verifier = (TRAINER / "scripts" / "verify-image.sh").read_text(encoding="utf-8")
+
+    assert "cleanup_mount_root()" in verifier
+    assert 'trap cleanup_mount_root EXIT' in verifier
+    assert '--user 0:0' in verifier
+    assert '--entrypoint /bin/chmod "$image_ref"' in verifier
+    assert '-R a+rwX /cache /prepared /output' in verifier
+
+
 def test_production_runtime_factory_is_not_a_successful_noop() -> None:
     from lehome_train.groot.production_runtime import create
 
