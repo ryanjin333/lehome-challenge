@@ -50,7 +50,7 @@ WORKDIR /opt/isaac-groot
 RUN git init . \
     && git remote add origin https://github.com/NVIDIA/Isaac-GR00T.git \
     && git fetch --depth=1 origin "${ISAAC_GROOT_REVISION}" \
-    && git checkout --detach FETCH_HEAD \
+    && GIT_LFS_SKIP_SMUDGE=1 git checkout --detach FETCH_HEAD \
     && test "$(git rev-parse HEAD)" = "${ISAAC_GROOT_REVISION}" \
     && test -z "$(git status --porcelain=v1 --untracked-files=all)" \
     && uv sync --frozen --no-dev --no-install-project --no-cache \
