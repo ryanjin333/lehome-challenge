@@ -252,6 +252,19 @@ def test_entrypoint_retains_token_only_for_controller_owned_remote_commands() ->
     assert "huggingface-cli login" in entrypoint
 
 
+def test_image_final_user_supports_vast_ssh_overlay() -> None:
+    dockerfile = (TRAINER / "Dockerfile").read_text(encoding="utf-8")
+    verifier = (TRAINER / "scripts" / "verify-image.sh").read_text(encoding="utf-8")
+
+    assert "--create-home --home-dir /home/trainer --shell /bin/bash trainer" in dockerfile
+    assert "HOME=/home/trainer" in dockerfile
+    assert "HOME=/nonexistent" not in dockerfile
+    assert 'test "$HOME" = /home/trainer' in verifier
+    assert 'test -w "$HOME"' in verifier
+    assert 'test -w "$HOME/.bashrc"' in verifier
+    assert 'printf "\\n" >> "$HOME/.bashrc"' in verifier
+
+
 def test_trainer_lock_aligns_every_shared_runtime_package_with_upstream() -> None:
     lock = (TRAINER / "uv.lock").read_text(encoding="utf-8")
     versions = dict(

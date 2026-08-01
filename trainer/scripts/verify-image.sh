@@ -59,6 +59,12 @@ docker run --rm --platform linux/amd64 --entrypoint /bin/bash "$image_ref" -euo 
   probe=$(mktemp)
   [[ "$probe" == /cache/tmp/* ]]
   rm -f "$probe"
+  test "$HOME" = /home/trainer
+  test -d "$HOME"
+  test -w "$HOME"
+  test -w "$HOME/.bashrc"
+  test "$(getent passwd "$(id -un)" | cut -d: -f6-7)" = "/home/trainer:/bin/bash"
+  printf "\n" >> "$HOME/.bashrc"
 '
 
 mount_root=$(mktemp -d)
