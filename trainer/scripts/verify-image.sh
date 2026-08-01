@@ -52,16 +52,16 @@ if docker image inspect --format '{{json .Config.Env}}' "$image_ref" \
   exit 1
 fi
 
-docker run --rm --platform linux/amd64 --entrypoint /bin/bash "" -euo pipefail -c '
-  test "" = /cache/tmp
-  test -d ""
-  test -w ""
-  probe=20 20 12 61 79 80 81 333 33 98 100 204 250 395 398 101 400 701mktemp)
-  [[ "" == /cache/tmp/* ]]
-  rm -f ""
+docker run --rm --platform linux/amd64 --entrypoint /bin/bash "$image_ref" -euo pipefail -c '
+  test "$TMPDIR" = /cache/tmp
+  test -d "$TMPDIR"
+  test -w "$TMPDIR"
+  probe=$(mktemp)
+  [[ "$probe" == /cache/tmp/* ]]
+  rm -f "$probe"
 '
 
-mount_root=20 20 12 61 79 80 81 333 33 98 100 204 250 395 398 101 400 701mktemp -d)
+mount_root=$(mktemp -d)
 mkdir -p "$mount_root/cache" "$mount_root/prepared" "$mount_root/output"
 chmod 0777 "$mount_root/cache" "$mount_root/prepared" "$mount_root/output"
 
