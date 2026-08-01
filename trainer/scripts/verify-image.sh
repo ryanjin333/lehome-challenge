@@ -102,7 +102,7 @@ if [[ "$mode" == "gpu" ]]; then
     echo "--gpu acceptance requires a Linux NVIDIA host" >&2
     exit 69
   fi
-  gpu_output=$("${run[@]}" -i --user 10001:10001 --gpus device=0 -e CUDA_VISIBLE_DEVICES=0 \
+  gpu_output=$("${run[@]}" -i --gpus device=0 --user 10001:10001 -e CUDA_VISIBLE_DEVICES=0 \
     --entrypoint /opt/runtime/bin/python "$image_ref" - <<'PY'
 import torch
 from torch.utils.data import DataLoader, TensorDataset

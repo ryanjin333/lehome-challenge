@@ -227,7 +227,10 @@ def test_image_contract_files_preserve_runtime_and_secret_boundaries() -> None:
     assert '"huggingface-hub==0.36.2"' in pyproject
     assert '"click==8.1.8"' in pyproject
     assert ISAAC_GROOT_REVISION in dockerfile
-    assert "USER trainer" in dockerfile
+    assert "USER root" in dockerfile
+    assert "--reuid=10001" in entrypoint
+    assert "--regid=10001" in entrypoint
+    assert '--no-new-privs' in entrypoint
     assert "LEHOME_TRAIN_RUNTIME_FACTORY=lehome_train.groot.production_runtime:create" in dockerfile
     for forbidden in ("Isaac Sim", "IsaacLab", "HF_TOKEN="):
         assert forbidden not in dockerfile
