@@ -298,6 +298,30 @@ def test_workflow_never_embeds_a_pat_and_gpu_gate_is_explicit() -> None:
     assert "scanner failed with status" in workflow
 
 
+def test_cpu_safe_workflow_disables_ansi_help_output() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "groot-trainer-image.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'NO_COLOR: "1"' in workflow
+
+
+def test_cpu_safe_workflow_installs_ffmpeg_for_converter_tests() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "groot-trainer-image.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "apt-get install -y --no-install-recommends ffmpeg" in workflow
+
+
+def test_cpu_safe_workflow_excludes_linux_image_acceptance() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "groot-trainer-image.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "--ignore=tests/test_groot_runtime_gate.py" in workflow
+
+
 def test_gpu_verifier_keeps_stdin_open_selects_gpu_zero_and_checks_sentinel() -> None:
     verifier = (TRAINER / "scripts" / "verify-image.sh").read_text(encoding="utf-8")
 

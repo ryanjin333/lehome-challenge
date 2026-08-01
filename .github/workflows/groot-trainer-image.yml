@@ -33,17 +33,23 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: read
+    env:
+      NO_COLOR: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: "0.8.22"
           enable-cache: false
+      - name: Install CPU converter system dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Verify frozen trainer lock and CPU suite
         working-directory: trainer
         run: |
           uv sync --frozen
-          uv run pytest tests -q
+          uv run pytest tests --ignore=tests/test_groot_runtime_gate.py -q
           uv lock --check
       - name: Reject tracked secrets and large artifacts
         shell: bash
