@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
@@ -316,6 +317,7 @@ def _write_episode_videos(
         raise ValueError("info video_path must be a string")
     chunks_size = int(info["chunks_size"])
     fps = float(info["fps"])
+    jobs: list[tuple[Path, Path, float, int, float]] = []
     for camera_key in camera_keys:
         for record in sorted(records, key=lambda item: int(item["episode_index"])):
             episode_id = int(record["episode_index"])
@@ -333,16 +335,29 @@ def _write_episode_videos(
                 chunks_size=chunks_size,
                 video_key=camera_key,
             )
-            _extract_video_segment(
-                source_video,
-                destination,
-                start=float(record[f"videos/{camera_key}/from_timestamp"]),
-                expected_frame_count=(
+            jobs.append(
+                (
+                    source_video,
+                    destination,
+                    float(record[f"videos/{camera_key}/from_timestamp"]),
                     int(record["dataset_to_index"])
-                    - int(record["dataset_from_index"])
+                    - int(record["dataset_from_index"]),
+                    fps,
                 ),
-                expected_fps=fps,
             )
+
+    def run(job: tuple[Path, Path, float, int, float]) -> None:
+        source_video, destination, start, frame_count, expected_fps = job
+        _extract_video_segment(
+            source_video,
+            destination,
+            start=start,
+            expected_frame_count=frame_count,
+            expected_fps=expected_fps,
+        )
+
+    with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as executor:
+        tuple(executor.map(run, jobs))
 
 
 def _v2_info(

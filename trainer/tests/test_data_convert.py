@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import threading
+import time
 
 import pyarrow.parquet as pq
 import pytest
@@ -233,6 +235,72 @@ def test_conversion_validates_every_episode_camera_video(
     _convert(source, tmp_path / "output")
 
     assert len(validated) == 3 * len(CAMERA_KEYS)
+
+
+def test_video_slices_run_concurrently_without_changing_the_job_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = 0
+    maximum_active = 0
+    calls: list[tuple[Path, Path, float, int, float]] = []
+    lock = threading.Lock()
+
+    def track_extract(
+        source: Path,
+        destination: Path,
+        *,
+        start: float,
+        expected_frame_count: int,
+        expected_fps: float,
+    ) -> None:
+        nonlocal active, maximum_active
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.05)
+        with lock:
+            calls.append(
+                (
+                    source,
+                    destination,
+                    start,
+                    expected_frame_count,
+                    expected_fps,
+                )
+            )
+            active -= 1
+
+    monkeypatch.setattr(converter, "_extract_video_segment", track_extract)
+    converter._write_episode_videos(
+        tmp_path / "source",
+        tmp_path / "output",
+        {
+            "video_path": (
+                "videos/{video_key}/chunk-{chunk_index:03d}/"
+                "file-{file_index:03d}.mp4"
+            ),
+            "chunks_size": 1000,
+            "fps": 30,
+        },
+        [
+            {
+                "episode_index": episode_id,
+                "dataset_from_index": episode_id * 20,
+                "dataset_to_index": episode_id * 20 + 20,
+                "videos/observation.images.top_rgb/chunk_index": 0,
+                "videos/observation.images.top_rgb/file_index": 0,
+                "videos/observation.images.top_rgb/from_timestamp": episode_id,
+            }
+            for episode_id in range(4)
+        ],
+        ["observation.images.top_rgb"],
+    )
+
+    assert maximum_active >= 2
+    assert len(calls) == 4
+    assert {call[3] for call in calls} == {20}
+    assert {call[4] for call in calls} == {30.0}
 
 
 def test_conversion_fails_closed_on_drift_or_incompatible_destination(
