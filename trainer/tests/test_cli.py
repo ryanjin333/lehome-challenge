@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from click.utils import strip_ansi
 from typer.testing import CliRunner
 
 from lehome_train.cli import app
@@ -38,18 +39,19 @@ def test_cli_registers_command_group(command: str) -> None:
         app,
         [command, "--help"],
         prog_name="lehome-train",
+        color=True,
     )
 
     assert result.exit_code == 0
-    assert f"Usage: lehome-train {command}" in result.stdout
+    assert f"Usage: lehome-train {command}" in strip_ansi(result.stdout)
 
 
 @pytest.mark.parametrize("subcommand", ["inspect", "convert", "validate", "publish", "retrieve"])
 def test_cli_registers_operational_data_subcommands(subcommand: str) -> None:
-    result = CliRunner().invoke(app, ["data", subcommand, "--help"])
+    result = CliRunner().invoke(app, ["data", subcommand, "--help"], color=True)
 
     assert result.exit_code == 0
-    assert f"Usage: root data {subcommand}" in result.stdout
+    assert f"Usage: root data {subcommand}" in strip_ansi(result.stdout)
 
 
 def test_data_commands_invoke_real_data_adapters(
