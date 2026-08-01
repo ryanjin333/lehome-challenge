@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+drop_privileges=()
+if [[ "$(id -u)" -eq 0 ]]; then
+  drop_privileges=(
+    /usr/bin/setpriv
+    --reuid=10001
+    --regid=10001
+    --init-groups
+    --no-new-privs
+  )
+fi
+
 case " $* " in
   *" hf auth login "*|*" huggingface-cli login "*)
     echo "interactive Hugging Face login is forbidden; pass HF_TOKEN only to a remote command" >&2
@@ -14,13 +25,18 @@ for path in /cache /prepared /output; do
     exit 64
   fi
   probe="$path/.lehome-write-test-$$"
-  if ! (umask 077 && : >"$probe" && rm -f "$probe"); then
+  if ! "${drop_privileges[@]}" /bin/bash -euo pipefail -c '
+    umask 077
+    : >"$1"
+    rm -f "$1"
+  ' _ "$probe"; then
     echo "$path must be writable by the non-root trainer user" >&2
     exit 73
   fi
 done
 
-mkdir -p /cache/tmp /cache/xdg /cache/torch /cache/huggingface/hub /output/wandb
+"${drop_privileges[@]}" mkdir -p \
+  /cache/tmp /cache/xdg /cache/torch /cache/huggingface/hub /output/wandb
 
 if [[ $# -eq 0 ]]; then
   set -- --help
@@ -45,4 +61,4 @@ else
   unset HF_TOKEN
 fi
 
-exec "$@"
+exec "${drop_privileges[@]}" "$@"

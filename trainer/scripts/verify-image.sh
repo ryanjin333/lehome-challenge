@@ -21,8 +21,8 @@ expected_groot=23ace64f17aa5015259b8609d371eb61a357c776
 expected_model=2fc962b973bccdd5d8ce4f67cc63b264d6886495
 
 actual_user=$(docker image inspect --format '{{.Config.User}}' "$image_ref")
-if [[ "$actual_user" != "trainer" ]]; then
-  echo "image must run as the named non-root trainer user, found: $actual_user" >&2
+if [[ "$actual_user" != "root" ]]; then
+  echo "image must remain root so Vast can derive its SSH layer, found: $actual_user" >&2
   exit 1
 fi
 
@@ -75,7 +75,7 @@ run=(docker run --rm --platform linux/amd64
   -v "$mount_root/output:/output")
 
 "${run[@]}" "$image_ref" --help >/dev/null
-"${run[@]}" --entrypoint /bin/bash "$image_ref" -euo pipefail -c '
+"${run[@]}" --user 10001:10001 --entrypoint /bin/bash "$image_ref" -euo pipefail -c '
   test "$(id -u)" -ne 0
   test "$(python -c '\''import platform; print(platform.python_version())'\'')" = 3.10.18
   python -c '\''import gr00t, lehome_train, torch'\''
@@ -102,7 +102,7 @@ if [[ "$mode" == "gpu" ]]; then
     echo "--gpu acceptance requires a Linux NVIDIA host" >&2
     exit 69
   fi
-  gpu_output=$("${run[@]}" -i --gpus device=0 -e CUDA_VISIBLE_DEVICES=0 \
+  gpu_output=$("${run[@]}" -i --user 10001:10001 --gpus device=0 -e CUDA_VISIBLE_DEVICES=0 \
     --entrypoint /opt/runtime/bin/python "$image_ref" - <<'PY'
 import torch
 from torch.utils.data import DataLoader, TensorDataset

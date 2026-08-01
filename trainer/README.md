@@ -171,7 +171,9 @@ resolution. Separate builds are still not claimed to be byte-identical; only
 the published OCI digest identifies a release candidate.
 
 Every container invocation must mount writable `/cache`, `/prepared`, and
-`/output` directories. The image runs as `trainer`, rejects `hf auth login` and
+`/output` directories. The image remains root only long enough for providers
+such as Vast to derive their managed SSH layer; its entrypoint drops every
+trainer command to the unprivileged `trainer` account. It rejects `hf auth login` and
 `huggingface-cli login`, and removes `HF_TOKEN` from every command except the
 controller-owned remote operations `prepare`, `train`, `restore`,
 `data retrieve`, `data publish`, `model retrieve`, and `sync`. Those
