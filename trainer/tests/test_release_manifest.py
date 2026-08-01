@@ -370,16 +370,18 @@ def test_image_verifier_restores_bind_mount_permissions_before_cleanup() -> None
     assert '-R a+rwX /cache /prepared /output' in verifier
 
 
-def test_image_verifier_allows_only_pointer_stubs_for_upstream_lfs_demo_files() -> None:
+def test_image_prunes_upstream_artifacts_and_verifier_requires_none() -> None:
+    dockerfile = (TRAINER / "Dockerfile").read_text(encoding="utf-8")
     verifier = (TRAINER / "scripts" / "verify-image.sh").read_text(encoding="utf-8")
 
-    assert "version https://git-lfs.github.com/spec/v1" in verifier
-    assert 'wc -c < "$candidate"' in verifier
+    assert "git ls-files -z" in dockerfile
+    assert "git update-index --skip-worktree" in dockerfile
+    assert "xargs -0 rm -f --" in dockerfile
     assert 'find /opt/trainer /opt/isaac-groot -type f' in verifier
     assert '-iname "*.gif"' in verifier
     assert '-iname "*.whl"' in verifier
-    assert '-print0' in verifier
-    assert 'test -z "$bundled_artifact"' not in verifier
+    assert 'test -z "$bundled_artifact"' in verifier
+    assert "version https://git-lfs.github.com/spec/v1" not in verifier
 
 
 def test_production_runtime_factory_is_not_a_successful_noop() -> None:

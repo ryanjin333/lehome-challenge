@@ -51,6 +51,13 @@ RUN git init . \
     && git remote add origin https://github.com/NVIDIA/Isaac-GR00T.git \
     && git fetch --depth=1 origin "${ISAAC_GROOT_REVISION}" \
     && GIT_LFS_SKIP_SMUDGE=1 git checkout --detach FETCH_HEAD \
+    && git ls-files -z -- '*.safetensors' '*.ckpt' '*.parquet' '*.mp4' '*.gif' '*.whl' \
+      > /tmp/isaac-groot-artifacts \
+    && if [[ -s /tmp/isaac-groot-artifacts ]]; then \
+      xargs -0 git update-index --skip-worktree -- < /tmp/isaac-groot-artifacts; \
+      xargs -0 rm -f -- < /tmp/isaac-groot-artifacts; \
+    fi \
+    && rm -f /tmp/isaac-groot-artifacts \
     && test "$(git rev-parse HEAD)" = "${ISAAC_GROOT_REVISION}" \
     && test -z "$(git status --porcelain=v1 --untracked-files=all)" \
     && uv sync --frozen --no-dev --no-install-project --no-cache \

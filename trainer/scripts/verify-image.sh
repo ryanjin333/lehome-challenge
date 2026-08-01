@@ -88,13 +88,8 @@ run=(docker run --rm --platform linux/amd64
   test ! -e /data
   large_file=$(find /opt/trainer /opt/isaac-groot -type f -size +50M -print -quit)
   test -z "$large_file"
-  while IFS= read -r -d "" candidate; do
-    if [[ "$(wc -c < "$candidate")" -gt 1024 ]] \
-      || [[ "$(head -n 1 "$candidate")" != "version https://git-lfs.github.com/spec/v1" ]]; then
-      echo "image contains a hydrated model or dataset artifact: $candidate" >&2
-      exit 1
-    fi
-  done < <(find /opt/trainer /opt/isaac-groot -type f \( -iname "*.safetensors" -o -iname "*.ckpt" -o -iname "*.parquet" -o -iname "*.mp4" -o -iname "*.gif" -o -iname "*.whl" \) -print0)
+  bundled_artifact=$(find /opt/trainer /opt/isaac-groot -type f \( -iname "*.safetensors" -o -iname "*.ckpt" -o -iname "*.parquet" -o -iname "*.mp4" -o -iname "*.gif" -o -iname "*.whl" \) -print -quit)
+  test -z "$bundled_artifact"
   set +e
   grep -RIE "hf_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{30,}" /opt/trainer /opt/isaac-groot >/dev/null
   secret_status=$?
