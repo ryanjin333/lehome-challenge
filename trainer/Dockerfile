@@ -106,8 +106,11 @@ ENV PATH=/opt/runtime/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin \
     PYTHONUNBUFFERED=1
 
 # Vast derives its managed SSH layer from the published image before runtime
-# Docker options such as `--user root` apply.  Keep the derivation user root;
+# Docker options such as `--user root` apply. Its injected Dockerfile also
+# assumes Docker's default /bin/sh shell semantics, so do not leak the strict
+# Bash build shell into the published image. Keep the derivation user root;
 # the entrypoint drops every trainer command to UID/GID 10001.
+SHELL ["/bin/sh", "-c"]
 USER root
 WORKDIR /output
 ENTRYPOINT ["/usr/local/bin/lehome-entrypoint"]

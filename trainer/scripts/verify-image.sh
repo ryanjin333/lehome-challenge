@@ -26,6 +26,12 @@ if [[ "$actual_user" != "root" ]]; then
   exit 1
 fi
 
+actual_shell=$(docker image inspect --format '{{json .Config.Shell}}' "$image_ref")
+if [[ "$actual_shell" != '["/bin/sh","-c"]' ]]; then
+  echo "image must expose Docker's default shell for Vast SSH derivation, found: $actual_shell" >&2
+  exit 1
+fi
+
 actual_release_mode=$(docker image inspect --format '{{index .Config.Labels "io.lehome.release-mode"}}' "$image_ref")
 if [[ "$actual_release_mode" != "$expected_release_mode" ]]; then
   echo "image release mode is $actual_release_mode; expected $expected_release_mode" >&2
