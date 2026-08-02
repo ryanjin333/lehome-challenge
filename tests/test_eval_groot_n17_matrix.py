@@ -9,6 +9,7 @@ from scripts.eval_groot_n17_matrix import (
     MatrixValidationError,
     load_matrix,
     parse_episode_metric,
+    validate_asset_matrix,
     validate_run_path,
 )
 
@@ -75,3 +76,35 @@ def test_validate_run_path_rejects_paths_outside_run_root(tmp_path: Path) -> Non
     assert validate_run_path(root, root / "trial-000") == root / "trial-000"
     with pytest.raises(MatrixValidationError, match="run root"):
         validate_run_path(root, tmp_path / "outside")
+
+
+def test_validate_asset_matrix_uses_official_first_two_seen_ids(tmp_path: Path) -> None:
+    release = tmp_path / "Release"
+    for prefix in ("Top_Long", "Top_Short", "Pant_Long", "Pant_Short"):
+        category = release / prefix
+        category.mkdir(parents=True)
+        (category / f"{prefix}.txt").write_text(
+            "\n".join(
+                [
+                    f"{prefix}_Unseen_0",
+                    f"{prefix}_Seen_1",
+                    f"{prefix}_Seen_0",
+                    f"{prefix}_Seen_2",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    trials = load_matrix(Path("configs/eval_groot_n17_seen_dev.json"))
+    validate_asset_matrix(tmp_path, trials)
+
+    broken = list(trials)
+    broken[0] = broken[0].__class__(
+        broken[0].trial_id,
+        broken[0].category,
+        "Top_Long_Seen_2",
+        broken[0].seed,
+    )
+    with pytest.raises(MatrixValidationError, match="first-two"):
+        validate_asset_matrix(tmp_path, broken)

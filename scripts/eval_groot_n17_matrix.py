@@ -178,6 +178,48 @@ def matrix_sha256(path: Path) -> str:
     return sha256_file(path)
 
 
+def _official_seen_ids(asset_base: Path, category: str) -> tuple[str, ...]:
+    prefix = _CATEGORY_PREFIX[category]
+    list_path = asset_base / "Release" / prefix / f"{prefix}.txt"
+    try:
+        names = tuple(
+            line.strip()
+            for line in list_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    except (OSError, UnicodeError) as error:
+        raise MatrixValidationError(
+            f"official garment list is unavailable: {list_path}"
+        ) from error
+    if len(set(names)) != len(names):
+        raise MatrixValidationError(f"official garment list contains duplicates: {list_path}")
+    seen = tuple(
+        sorted(
+            name
+            for name in names
+            if re.fullmatch(rf"{re.escape(prefix)}_Seen_[0-9]+", name)
+        )
+    )
+    if len(seen) < 2:
+        raise MatrixValidationError(
+            f"official garment list has fewer than two seen IDs: {list_path}"
+        )
+    return seen
+
+
+def validate_asset_matrix(asset_base: Path, trials: Sequence[Trial]) -> None:
+    """Require the matrix to use the first two official seen IDs per category."""
+
+    for category in _CATEGORIES:
+        expected = set(_official_seen_ids(asset_base, category)[:2])
+        observed = {trial.garment_name for trial in trials if trial.category == category}
+        if observed != expected:
+            raise MatrixValidationError(
+                f"matrix garments for {category} do not match official first-two seen IDs: "
+                f"expected {sorted(expected)}, observed {sorted(observed)}"
+            )
+
+
 def _make_config_overlay(source_base: Path, trial_root: Path, garment_name: str) -> Path:
     source_release = (source_base / "Release").resolve()
     if not source_release.is_dir():
@@ -226,6 +268,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, object]:
     output_root = args.output_root.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     matrix_digest = matrix_sha256(matrix_path)
+    validate_asset_matrix(args.asset_base_path, trials)
     if not args.policy_path.exists():
         raise MatrixValidationError(f"policy path is missing: {args.policy_path}")
     if args.max_steps <= 0:
@@ -336,6 +379,7 @@ __all__ = [
     "matrix_sha256",
     "parse_episode_metric",
     "run_matrix",
+    "validate_asset_matrix",
     "validate_matrix",
     "validate_run_path",
 ]
