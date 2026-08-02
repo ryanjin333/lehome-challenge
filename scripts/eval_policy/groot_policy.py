@@ -25,6 +25,7 @@ _STATE_GROUPS = (
     ("right_gripper", slice(11, 12)),
 )
 _ACTION_GROUPS = tuple(name for name, _ in _STATE_GROUPS)
+_ACTION_KEYS = tuple(f"action.{name}" for name in _ACTION_GROUPS)
 
 
 def _as_frame(value: Any, *, key: str) -> np.ndarray:
@@ -80,19 +81,24 @@ def flatten_groot_action(action: Mapping[str, Any]) -> np.ndarray:
     """Take the first predicted action step in the checked 12-D joint order."""
 
     parts: list[np.ndarray] = []
-    for key in _ACTION_GROUPS:
-        if key not in action:
+    for group, key in zip(_ACTION_GROUPS, _ACTION_KEYS, strict=True):
+        # ``parse_action_gr00t`` and ``Gr00tPolicy.get_action`` expose the
+        # public action namespace as ``action.<group>``.  Accepting the bare
+        # group as a compatibility fallback keeps this boundary usable with
+        # older pinned GR00T builds, while still preferring the checked API.
+        actual_key = key if key in action else group
+        if actual_key not in action:
             raise ValueError(f"GR00T action is missing {key}")
-        values = np.asarray(action[key])
+        values = np.asarray(action[actual_key])
         if values.ndim != 3 or values.shape[0] != 1 or values.shape[1] < 1:
             raise ValueError(
-                f"GR00T action {key} must have shape (1,T,D), got {values.shape}"
+                f"GR00T action {actual_key} must have shape (1,T,D), got {values.shape}"
             )
         part = np.asarray(values[0, 0], dtype=np.float32).reshape(-1)
-        expected = 5 if key.endswith("_arm") else 1
+        expected = 5 if group.endswith("_arm") else 1
         if part.size != expected:
             raise ValueError(
-                f"GR00T action {key} must have dimension {expected}, got {part.size}"
+                f"GR00T action {actual_key} must have dimension {expected}, got {part.size}"
             )
         parts.append(part)
     result = np.concatenate(parts).astype(np.float32, copy=False)
