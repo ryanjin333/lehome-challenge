@@ -27,3 +27,18 @@ def test_vast_ssh_privilege_separation_account_exists() -> None:
 
     assert "useradd --system --user-group --home-dir /run/sshd" in dockerfile
     assert "install -d -o sshd -g sshd -m 0755 /run/sshd" in dockerfile
+
+
+def test_vast_ssh_host_keys_are_generated_per_instance() -> None:
+    dockerfile = (REPOSITORY_ROOT / "trainer" / "Dockerfile").read_text(encoding="utf-8")
+    wrapper_path = REPOSITORY_ROOT / "trainer" / "docker" / "sshd-wrapper.sh"
+
+    assert wrapper_path.is_file()
+    wrapper = wrapper_path.read_text(encoding="utf-8")
+
+    assert "openssh-server" in dockerfile
+    assert "dpkg-divert --local --rename --add /usr/sbin/sshd" in dockerfile
+    assert "rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub" in dockerfile
+    assert "/workspace/.cache/lehome-ssh-hostkeys" in wrapper
+    assert "ssh-keygen -q -t" in wrapper
+    assert "-m 0600" in wrapper

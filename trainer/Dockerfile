@@ -22,6 +22,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_HTTP_TIMEOUT=300 \
     CUDA_HOME=/usr/local/cuda
 
+COPY --chmod=0755 trainer/docker/sshd-wrapper.sh /usr/local/sbin/lehome-sshd-wrapper
+
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     printf '%s\n' \
       "deb [check-valid-until=no signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/ jammy main universe" \
@@ -36,7 +38,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     ) \
     && apt-get "${apt_options[@]}" update \
     && apt-get "${apt_options[@]}" install -y --no-install-recommends \
-      build-essential ca-certificates curl ffmpeg git git-lfs libaio-dev libegl1 util-linux \
+      build-essential ca-certificates curl ffmpeg git git-lfs libaio-dev libegl1 openssh-server util-linux \
+    && dpkg-divert --local --rename --add /usr/sbin/sshd \
+    && ln -s /usr/local/sbin/lehome-sshd-wrapper /usr/sbin/sshd \
+    && bash -n /usr/local/sbin/lehome-sshd-wrapper \
+    && /usr/sbin/sshd -t \
+    && rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub \
     && curl -fsSLo /tmp/uv.tar.gz \
       "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
     && echo "${UV_SHA256}  /tmp/uv.tar.gz" | sha256sum --check --strict \

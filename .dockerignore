@@ -11,3 +11,4 @@ trainer/**
 !trainer/docker/
 trainer/docker/**
 !trainer/docker/entrypoint.sh
+!trainer/docker/sshd-wrapper.sh

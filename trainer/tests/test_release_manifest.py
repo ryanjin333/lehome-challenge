@@ -345,6 +345,7 @@ def test_docker_context_is_default_deny() -> None:
     assert "!trainer/src/**" in dockerignore
     assert "!trainer/config/**" in dockerignore
     assert "!trainer/docker/entrypoint.sh" in dockerignore
+    assert "!trainer/docker/sshd-wrapper.sh" in dockerignore
 
 
 def test_image_verifier_makes_ephemeral_bind_mounts_writable_by_container_user() -> None:
