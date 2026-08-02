@@ -26,7 +26,7 @@ def test_vast_ssh_privilege_separation_account_exists() -> None:
     dockerfile = (REPOSITORY_ROOT / "trainer" / "Dockerfile").read_text(encoding="utf-8")
 
     assert "useradd --system --user-group --home-dir /run/sshd" in dockerfile
-    assert "install -d -o sshd -g sshd -m 0755 /run/sshd" in dockerfile
+    assert "install -d -o root -g root -m 0755 /run/sshd" in dockerfile
 
 
 def test_vast_ssh_host_keys_are_generated_per_instance() -> None:
