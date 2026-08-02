@@ -1,0 +1,28 @@
+{
+  "name": "b1k-2026-groot-rgb-full",
+  "repo_id": "behavior-1k/2026-challenge-demos",
+  "revision": "main",
+  "expected_tasks": 100,
+  "demonstrations_per_task": 200,
+  "expected_demonstrations": 20000,
+  "task_chunks": {
+    "first": 0,
+    "last": 99
+  },
+  "required_globs": [
+    "annotations/**",
+    "data/**",
+    "meta/**",
+    "videos/observation.rgb.zed_link_camera_0/**",
+    "videos/observation.rgb.left_realsense_link_camera_0/**",
+    "videos/observation.rgb.right_realsense_link_camera_0/**"
+  ],
+  "video_streams": [
+    "observation.rgb.zed_link_camera_0",
+    "observation.rgb.left_realsense_link_camera_0",
+    "observation.rgb.right_realsense_link_camera_0"
+  ],
+  "exclude_globs": [
+    "videos/observation.depth_linear.*/**"
+  ]
+}

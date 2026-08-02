@@ -30,8 +30,8 @@
     "tag": null
   },
   "isaac_groot": {
-    "commit": "23ace64f17aa5015259b8609d371eb61a357c776",
-    "repository": "https://github.com/NVIDIA/Isaac-GR00T.git"
+    "commit": "ace36d935b376fbf25cd56371e23877b95407c40",
+    "repository": "https://github.com/wensi-ai/Isaac-GR00T.git"
   },
   "platform": "linux/amd64",
   "python_version": "3.10.18",

@@ -1,0 +1,18 @@
+{
+  "instance_type": "docker-container",
+  "image": "ghcr.io/ryanjin333/lehome-groot-n17-trainer:044f82b0069e413fbc749de1dbbf18d554e392ca",
+  "gpu_model": "RTX PRO 6000 Blackwell Server Edition 96GB",
+  "recommended_gpu_count": 1,
+  "supported_gpu_counts": [1, 2],
+  "minimum_gpu_vram_gb_each": 96,
+  "minimum_disk_capacity_gb": 2000,
+  "minimum_free_disk_at_bootstrap_gb": 1500,
+  "minimum_disk_bandwidth_mb_s": 4000,
+  "minimum_ram_gb": 128,
+  "minimum_cpu_cores": 24,
+  "minimum_download_mbps": 1000,
+  "preferred_download_mbps": 2000,
+  "minimum_upload_mbps": 500,
+  "direct_ssh": true,
+  "verified_datacenter": true
+}

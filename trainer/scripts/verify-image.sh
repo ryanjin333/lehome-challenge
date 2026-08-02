@@ -17,7 +17,7 @@ done
 repository_commit=$(git -C "$repo_root" rev-parse HEAD)
 image_ref=${1:-${IMAGE_REPOSITORY:-lehome-groot-n17-trainer}:$repository_commit}
 expected_base=sha256:61f6c08f2b59036cb935e56d1e31a6b64e3ae2c7ddb86d33fa0b044c7917b719
-expected_groot=23ace64f17aa5015259b8609d371eb61a357c776
+expected_groot=ace36d935b376fbf25cd56371e23877b95407c40
 expected_model=2fc962b973bccdd5d8ce4f67cc63b264d6886495
 
 actual_user=$(docker image inspect --format '{{.Config.User}}' "$image_ref")
@@ -35,6 +35,8 @@ fi
 for pair in \
   "io.lehome.cuda-base-digest=$expected_base" \
   "io.lehome.isaac-groot-revision=$expected_groot" \
+  "io.lehome.isaac-groot-source=https://github.com/wensi-ai/Isaac-GR00T.git" \
+  "io.lehome.b1k-ready=true" \
   "io.lehome.model-revision=$expected_model" \
   "org.opencontainers.image.revision=$repository_commit"; do
   key=${pair%%=*}
@@ -94,8 +96,13 @@ run=(docker run --rm --platform linux/amd64
   test "$(id -u)" -ne 0
   test "$(python -c '\''import platform; print(platform.python_version())'\'')" = 3.10.18
   python -c '\''import gr00t, lehome_train, torch'\''
-  test "$(git -C /opt/isaac-groot rev-parse HEAD)" = 23ace64f17aa5015259b8609d371eb61a357c776
+  test "$(git -C /opt/isaac-groot rev-parse HEAD)" = ace36d935b376fbf25cd56371e23877b95407c40
   test -z "$(git -C /opt/isaac-groot status --porcelain=v1 --untracked-files=all)"
+  test -f /opt/isaac-groot/scripts/b1k/train_b1k.py
+  test -f /opt/isaac-groot/scripts/b1k/deploy_modality.py
+  test -f /opt/isaac-groot/examples/b1k/r1pro.py
+  test -x /opt/b1k-launch-kit/bin/run_disposable_training.sh
+  bash -n /opt/b1k-launch-kit/bin/*.sh
   lehome-train --help >/dev/null
   test ! -e /isaac-sim
   test ! -e /IsaacLab

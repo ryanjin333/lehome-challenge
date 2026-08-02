@@ -8,6 +8,8 @@ trainer/**
 !trainer/src/**
 !trainer/config/
 !trainer/config/**
+!trainer/b1k_launch_kit/
+!trainer/b1k_launch_kit/**
 !trainer/docker/
 trainer/docker/**
 !trainer/docker/entrypoint.sh

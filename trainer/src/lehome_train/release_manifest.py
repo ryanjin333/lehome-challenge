@@ -20,7 +20,7 @@ from lehome_train.io import atomic_write_json, sha256_file
 
 
 CUDA_BASE_IMAGE = "nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04"
-ISAAC_GROOT_REPOSITORY = "https://github.com/NVIDIA/Isaac-GR00T.git"
+ISAAC_GROOT_REPOSITORY = "https://github.com/wensi-ai/Isaac-GR00T.git"
 MODEL_REPOSITORY = "nvidia/GR00T-N1.7-3B"
 IMAGE_REPOSITORY = "ghcr.io/ryanjin333/lehome-groot-n17-trainer"
 DATASET_REPOSITORY = "ryanjin333/lehome-groot-n17-data"

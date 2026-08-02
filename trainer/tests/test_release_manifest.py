@@ -36,7 +36,7 @@ def _accepted_payload() -> dict[str, object]:
         "python_version": "3.10.18",
         "uv_version": "0.8.22",
         "isaac_groot": {
-            "repository": "https://github.com/NVIDIA/Isaac-GR00T.git",
+            "repository": "https://github.com/wensi-ai/Isaac-GR00T.git",
             "commit": ISAAC_GROOT_REVISION,
         },
         "base_model": {

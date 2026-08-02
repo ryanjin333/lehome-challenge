@@ -157,7 +157,7 @@ trainer/scripts/verify-image.sh
 The build uses only `linux/amd64`, the digest-pinned CUDA 12.8.1 base, Python
 3.10.18, uv 0.8.22 with a checked archive hash, the frozen trainer and upstream
 locks, and Isaac-GR00T commit
-`23ace64f17aa5015259b8609d371eb61a357c776`. The default tag is the full local
+`ace36d935b376fbf25cd56371e23877b95407c40` from the BEHAVIOR fork. The default tag is the full local
 Git commit. A dirty checkout is rejected unless `ALLOW_DIRTY=1` is explicitly
 used for a non-release diagnostic build.
 

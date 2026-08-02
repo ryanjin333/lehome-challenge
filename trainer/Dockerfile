@@ -5,13 +5,15 @@ ARG UV_VERSION=0.8.22
 ARG UV_SHA256=741ff1f5742c5a4a25d2f829e8395355e43f7a5ae2ebc6368e9ae2df0efb69cf
 ARG PYTHON_VERSION=3.10.18
 ARG UBUNTU_SNAPSHOT=20260701T000000Z
-ARG ISAAC_GROOT_REVISION=23ace64f17aa5015259b8609d371eb61a357c776
+ARG ISAAC_GROOT_REVISION=ace36d935b376fbf25cd56371e23877b95407c40
 ARG REPOSITORY_COMMIT
 
 LABEL org.opencontainers.image.source="https://github.com/lehome-official/lehome-challenge" \
       org.opencontainers.image.revision="${REPOSITORY_COMMIT}" \
       io.lehome.cuda-base-digest="sha256:61f6c08f2b59036cb935e56d1e31a6b64e3ae2c7ddb86d33fa0b044c7917b719" \
       io.lehome.isaac-groot-revision="${ISAAC_GROOT_REVISION}" \
+      io.lehome.isaac-groot-source="https://github.com/wensi-ai/Isaac-GR00T.git" \
+      io.lehome.b1k-ready="true" \
       io.lehome.model-revision="2fc962b973bccdd5d8ce4f67cc63b264d6886495"
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
@@ -36,7 +38,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     ) \
     && apt-get "${apt_options[@]}" update \
     && apt-get "${apt_options[@]}" install -y --no-install-recommends \
-      build-essential ca-certificates curl ffmpeg git git-lfs libaio-dev libegl1 util-linux \
+      build-essential ca-certificates curl ffmpeg git git-lfs libaio-dev libegl1 \
+      rclone tmux util-linux zstd \
     && curl -fsSLo /tmp/uv.tar.gz \
       "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
     && echo "${UV_SHA256}  /tmp/uv.tar.gz" | sha256sum --check --strict \
@@ -48,7 +51,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 WORKDIR /opt/isaac-groot
 RUN git init . \
-    && git remote add origin https://github.com/NVIDIA/Isaac-GR00T.git \
+    && git remote add origin https://github.com/wensi-ai/Isaac-GR00T.git \
     && git fetch --depth=1 origin "${ISAAC_GROOT_REVISION}" \
     && GIT_LFS_SKIP_SMUDGE=1 git checkout --detach FETCH_HEAD \
     && git ls-files -z -- '*.safetensors' '*.ckpt' '*.parquet' '*.mp4' '*.gif' '*.whl' \
@@ -78,10 +81,16 @@ RUN uv lock --check \
 COPY trainer/src ./src
 COPY trainer/config ./config
 COPY trainer/docker/entrypoint.sh /usr/local/bin/lehome-entrypoint
+COPY trainer/b1k_launch_kit /opt/b1k-launch-kit
 RUN uv pip install --python /opt/runtime/bin/python --no-deps /opt/trainer \
     && uv pip check --python /opt/runtime/bin/python \
     && test "$(/opt/runtime/bin/python -c 'import platform; print(platform.python_version())')" = "${PYTHON_VERSION}" \
     && test "$(git -C /opt/isaac-groot rev-parse HEAD)" = "${ISAAC_GROOT_REVISION}" \
+    && test -f /opt/isaac-groot/scripts/b1k/train_b1k.py \
+    && test -f /opt/isaac-groot/scripts/b1k/deploy_modality.py \
+    && test -f /opt/isaac-groot/examples/b1k/r1pro.py \
+    && test -x /opt/b1k-launch-kit/bin/run_disposable_training.sh \
+    && bash -n /opt/b1k-launch-kit/bin/*.sh \
     && /opt/runtime/bin/lehome-train --help >/dev/null \
     && groupadd --gid 10001 trainer \
     && useradd --uid 10001 --gid trainer --create-home --home-dir /home/trainer --shell /bin/bash trainer \
@@ -96,6 +105,10 @@ ENV PATH=/opt/runtime/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin \
     VIRTUAL_ENV=/opt/runtime \
     PYTHONPATH=/opt/isaac-groot \
     LEHOME_GROOT_ROOT=/opt/isaac-groot \
+    GROOT_DIR=/opt/isaac-groot \
+    GROOT_PYTHON=/opt/runtime/bin/python \
+    B1K_PREBUILT_IMAGE=1 \
+    B1K_KIT_DIR=/opt/b1k-launch-kit \
     LEHOME_TRAIN_RUNTIME_FACTORY=lehome_train.groot.production_runtime:create \
     HF_HOME=/cache/huggingface \
     HF_HUB_CACHE=/cache/huggingface/hub \

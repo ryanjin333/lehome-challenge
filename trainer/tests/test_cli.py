@@ -573,7 +573,7 @@ def test_settings_use_exact_immutable_pins() -> None:
         settings.cuda_base_digest
         == "sha256:61f6c08f2b59036cb935e56d1e31a6b64e3ae2c7ddb86d33fa0b044c7917b719"
     )
-    assert settings.isaac_groot_revision == "23ace64f17aa5015259b8609d371eb61a357c776"
+    assert settings.isaac_groot_revision == "ace36d935b376fbf25cd56371e23877b95407c40"
     assert settings.model_revision == "2fc962b973bccdd5d8ce4f67cc63b264d6886495"
     assert settings.data_repo == "ryanjin333/lehome-groot-n17-data"
     assert settings.model_repo == "ryanjin333/lehome-groot-n17-models"
