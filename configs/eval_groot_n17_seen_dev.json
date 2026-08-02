@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "name": "seen-development-v1",
+  "categories": [
+    "top_long",
+    "top_short",
+    "pant_long",
+    "pant_short"
+  ],
+  "seeds": [42, 43, 44],
+  "trials": [
+    {"trial_id": "top-long-seen-0-seed-42", "category": "top_long", "garment_name": "Top_Long_Seen_0", "seed": 42},
+    {"trial_id": "top-long-seen-0-seed-43", "category": "top_long", "garment_name": "Top_Long_Seen_0", "seed": 43},
+    {"trial_id": "top-long-seen-0-seed-44", "category": "top_long", "garment_name": "Top_Long_Seen_0", "seed": 44},
+    {"trial_id": "top-long-seen-1-seed-42", "category": "top_long", "garment_name": "Top_Long_Seen_1", "seed": 42},
+    {"trial_id": "top-long-seen-1-seed-43", "category": "top_long", "garment_name": "Top_Long_Seen_1", "seed": 43},
+    {"trial_id": "top-long-seen-1-seed-44", "category": "top_long", "garment_name": "Top_Long_Seen_1", "seed": 44},
+    {"trial_id": "top-short-seen-0-seed-42", "category": "top_short", "garment_name": "Top_Short_Seen_0", "seed": 42},
+    {"trial_id": "top-short-seen-0-seed-43", "category": "top_short", "garment_name": "Top_Short_Seen_0", "seed": 43},
+    {"trial_id": "top-short-seen-0-seed-44", "category": "top_short", "garment_name": "Top_Short_Seen_0", "seed": 44},
+    {"trial_id": "top-short-seen-1-seed-42", "category": "top_short", "garment_name": "Top_Short_Seen_1", "seed": 42},
+    {"trial_id": "top-short-seen-1-seed-43", "category": "top_short", "garment_name": "Top_Short_Seen_1", "seed": 43},
+    {"trial_id": "top-short-seen-1-seed-44", "category": "top_short", "garment_name": "Top_Short_Seen_1", "seed": 44},
+    {"trial_id": "pant-long-seen-0-seed-42", "category": "pant_long", "garment_name": "Pant_Long_Seen_0", "seed": 42},
+    {"trial_id": "pant-long-seen-0-seed-43", "category": "pant_long", "garment_name": "Pant_Long_Seen_0", "seed": 43},
+    {"trial_id": "pant-long-seen-0-seed-44", "category": "pant_long", "garment_name": "Pant_Long_Seen_0", "seed": 44},
+    {"trial_id": "pant-long-seen-1-seed-42", "category": "pant_long", "garment_name": "Pant_Long_Seen_1", "seed": 42},
+    {"trial_id": "pant-long-seen-1-seed-43", "category": "pant_long", "garment_name": "Pant_Long_Seen_1", "seed": 43},
+    {"trial_id": "pant-long-seen-1-seed-44", "category": "pant_long", "garment_name": "Pant_Long_Seen_1", "seed": 44},
+    {"trial_id": "pant-short-seen-0-seed-42", "category": "pant_short", "garment_name": "Pant_Short_Seen_0", "seed": 42},
+    {"trial_id": "pant-short-seen-0-seed-43", "category": "pant_short", "garment_name": "Pant_Short_Seen_0", "seed": 43},
+    {"trial_id": "pant-short-seen-0-seed-44", "category": "pant_short", "garment_name": "Pant_Short_Seen_0", "seed": 44},
+    {"trial_id": "pant-short-seen-1-seed-42", "category": "pant_short", "garment_name": "Pant_Short_Seen_1", "seed": 42},
+    {"trial_id": "pant-short-seen-1-seed-43", "category": "pant_short", "garment_name": "Pant_Short_Seen_1", "seed": 43},
+    {"trial_id": "pant-short-seen-1-seed-44", "category": "pant_short", "garment_name": "Pant_Short_Seen_1", "seed": 44}
+  ]
+}
