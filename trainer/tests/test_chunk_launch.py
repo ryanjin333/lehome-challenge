@@ -34,6 +34,17 @@ def test_stop_callback_stops_only_at_requested_global_step() -> None:
     assert returned.should_log is True
 
 
+def test_stop_callback_accepts_transformers_train_begin_hook() -> None:
+    callback = StopAtOptimizerStep(1_000)
+    control = SimpleNamespace()
+
+    assert callback.on_train_begin(
+        args=object(),
+        state=SimpleNamespace(),
+        control=control,
+    ) is control
+
+
 def test_fresh_run_disables_upstream_unconditional_resume(tmp_path) -> None:
     assert _resume_value(tmp_path) is False
 

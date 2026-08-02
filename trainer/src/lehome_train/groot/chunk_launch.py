@@ -18,6 +18,13 @@ class StopAtOptimizerStep:
             raise ValueError("stop optimizer step must be nonnegative")
         self.optimizer_step = optimizer_step
 
+    def on_train_begin(
+        self, args: object, state: Any, control: Any, **_kwargs: object
+    ) -> Any:
+        """Satisfy the current Transformers callback lifecycle contract."""
+
+        return control
+
     def on_step_end(self, args: object, state: Any, control: Any, **_kwargs: object) -> Any:
         if state.global_step >= self.optimizer_step:
             control.should_log = True
