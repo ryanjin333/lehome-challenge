@@ -18,7 +18,7 @@ from lehome_train.hub import (
     require_access,
     upload_files,
 )
-from lehome_train.io import canonical_json_sha256, sha256_file
+from lehome_train.io import atomic_write_json, canonical_json_sha256, sha256_file
 from lehome_train.models import ArtifactIdentity, SyncEntry, model_from_mapping
 from lehome_train.redaction import generate_upload_allowlist
 
