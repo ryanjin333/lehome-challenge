@@ -28,6 +28,7 @@ _STATE_GROUPS = (
 _ACTION_GROUPS = tuple(name for name, _ in _STATE_GROUPS)
 _ACTION_KEYS = tuple(f"action.{name}" for name in _ACTION_GROUPS)
 _ACTION_DIMENSION = 12
+_ACTION_HORIZON = 16
 
 
 def _as_frame(value: Any, *, key: str) -> np.ndarray:
@@ -119,6 +120,10 @@ def flatten_groot_action_chunk(action: Mapping[str, Any]) -> np.ndarray:
                 f"GR00T action {actual_key} must have dimension {expected}, got {values.shape[1]}"
             )
         parts.append(values)
+    if horizon != _ACTION_HORIZON:
+        raise ValueError(
+            f"GR00T action horizon must be {_ACTION_HORIZON}, got {horizon}"
+        )
     result = np.concatenate(parts, axis=1).astype(np.float32, copy=False)
     if result.shape[1] != _ACTION_DIMENSION or not np.isfinite(result).all():
         raise ValueError("GR00T action chunk is not finite 12-D joint data")

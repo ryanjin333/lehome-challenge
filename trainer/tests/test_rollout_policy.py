@@ -28,15 +28,15 @@ def _chunk(batch: int, horizon: int, dimension: int, start: float) -> np.ndarray
 def test_flatten_groot_action_chunk_preserves_all_horizon_steps_and_group_order():
     module = _load_policy_module()
     action = {
-        "action.left_arm": _chunk(1, 2, 5, 0),
-        "action.left_gripper": _chunk(1, 2, 1, 10),
-        "action.right_arm": _chunk(1, 2, 5, 20),
-        "action.right_gripper": _chunk(1, 2, 1, 30),
+        "action.left_arm": _chunk(1, 16, 5, 0),
+        "action.left_gripper": _chunk(1, 16, 1, 10),
+        "action.right_arm": _chunk(1, 16, 5, 20),
+        "action.right_gripper": _chunk(1, 16, 1, 30),
     }
 
     flattened = module.flatten_groot_action_chunk(action)
 
-    assert flattened.shape == (2, 12)
+    assert flattened.shape == (16, 12)
     np.testing.assert_array_equal(
         flattened[0],
         np.array([0, 1, 2, 3, 4, 10, 20, 21, 22, 23, 24, 30], dtype=np.float32),
@@ -61,3 +61,20 @@ def test_action_chunk_queue_returns_each_step_then_refills():
     queue.extend(chunk)
     queue.clear()
     assert queue.pop() is None
+
+
+def test_flatten_groot_action_chunk_rejects_non_contract_horizon():
+    module = _load_policy_module()
+    action = {
+        "action.left_arm": _chunk(1, 2, 5, 0),
+        "action.left_gripper": _chunk(1, 2, 1, 10),
+        "action.right_arm": _chunk(1, 2, 5, 20),
+        "action.right_gripper": _chunk(1, 2, 1, 30),
+    }
+
+    try:
+        module.flatten_groot_action_chunk(action)
+    except ValueError as error:
+        assert "horizon" in str(error)
+    else:
+        raise AssertionError("a non-16-step action chunk must be rejected")
