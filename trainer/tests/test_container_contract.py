@@ -29,6 +29,17 @@ def test_vast_ssh_privilege_separation_account_exists() -> None:
     assert "install -d -o root -g root -m 0755 /run/sshd" in dockerfile
 
 
+def test_vast_ssh_derivation_has_a_build_time_tmpdir() -> None:
+    dockerfile = (REPOSITORY_ROOT / "trainer" / "Dockerfile").read_text(encoding="utf-8")
+
+    cache_directories = "install -d -o trainer -g trainer -m 0750 /cache /prepared /output"
+    temporary_directory = "install -d -o root -g root -m 1777 /cache/tmp"
+
+    assert temporary_directory in dockerfile
+    assert dockerfile.index(temporary_directory) < dockerfile.index("TMPDIR=/cache/tmp")
+    assert dockerfile.index(cache_directories) < dockerfile.index(temporary_directory)
+
+
 def test_vast_ssh_host_keys_are_generated_per_instance() -> None:
     dockerfile = (REPOSITORY_ROOT / "trainer" / "Dockerfile").read_text(encoding="utf-8")
     wrapper_path = REPOSITORY_ROOT / "trainer" / "docker" / "sshd-wrapper.sh"
