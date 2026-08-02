@@ -292,6 +292,15 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     elif args.policy_type == "docker":
         # Docker policy connects to an external container
         policy_kwargs["docker_url"] = args.docker_url
+    elif args.policy_type == "groot":
+        if not args.policy_path:
+            raise ValueError("--policy_path is required for groot policy type")
+        policy_kwargs.update(
+            {
+                "model_path": args.policy_path,
+                "task_description": args.task_description,
+            }
+        )
     else:
         # For custom policies, pass policy_path as model_path if provided
         if args.policy_path:

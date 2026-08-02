@@ -12,6 +12,7 @@ from .registry import PolicyRegistry
 from .lerobot_policy import LeRobotPolicy
 from .example_participant_policy import CustomPolicy
 from .docker_policy import DockerPolicy
+from .groot_policy import GrootPolicy
 
 __all__ = [
     "BasePolicy",
@@ -19,4 +20,5 @@ __all__ = [
     "LeRobotPolicy",
     "CustomPolicy",
     "DockerPolicy",
+    "GrootPolicy",
 ]
