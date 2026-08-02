@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -9,7 +10,12 @@ import pytest
 
 from fixtures.source_dataset import make_source_dataset
 from lehome_train.data.convert import convert_dataset
-from lehome_train.data.stats import compute_reference_statistics, write_train_statistics
+from lehome_train.data.stats import (
+    _data_path,
+    _train_only_runtime_view,
+    compute_reference_statistics,
+    write_train_statistics,
+)
 
 
 MAPPING_PATH = Path(__file__).parents[1] / "config" / "lehome_four_types_mapping.json"
@@ -72,6 +78,29 @@ def test_statistics_use_only_train_episodes_and_write_finite_12d_values(
         saved = json.loads((dataset / "meta" / name).read_text(encoding="utf-8"))
         assert saved
     assert not (dataset / "meta" / "norm_stats.json").exists()
+
+
+def test_train_only_runtime_view_keeps_selected_episode_files_confined(
+    tmp_path: Path,
+) -> None:
+    dataset, manifest = _prepared_dataset(tmp_path)
+    train_ids = tuple(manifest["train_episode_ids"])
+
+    view = _train_only_runtime_view(dataset, train_ids)
+    try:
+        episode_records = [
+            json.loads(line)
+            for line in (view / "meta" / "episodes.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert [str(record["episode_index"]) for record in episode_records] == list(train_ids)
+        for episode_id in train_ids:
+            path = _data_path(view, episode_id)
+            assert path.resolve().is_relative_to(view.resolve())
+            assert not path.is_symlink()
+    finally:
+        shutil.rmtree(view)
 
 
 def test_statistics_refuse_openpi_normalization_artifacts(tmp_path: Path) -> None:

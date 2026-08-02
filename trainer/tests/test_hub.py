@@ -209,6 +209,88 @@ def test_hub_private_repo_without_permission_metadata_requires_token_write_role(
     assert access.private_repository is True
 
 
+def test_hub_fine_grained_owner_scope_grants_repo_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(private=True),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_api",
+        lambda _token: SimpleNamespace(
+            whoami=lambda **_kwargs: {
+                "name": "RyanJin333",
+                "auth": {
+                    "accessToken": {
+                        "role": "fineGrained",
+                        "fineGrained": {
+                            "scoped": [
+                                {
+                                    "entity": {"type": "user", "name": "ryanjin333"},
+                                    "permissions": ["repo.content.read", "repo.write"],
+                                }
+                            ]
+                        },
+                    }
+                },
+            }
+        ),
+    )
+
+    access = transport.check_access(
+        repository="ryanjin333/lehome-groot-n17-models",
+        token="hf_fine_grained_permission_probe",
+    )
+
+    assert access.can_read is True
+    assert access.can_write is True
+
+
+def test_hub_fine_grained_scope_for_another_owner_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(private=True),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_api",
+        lambda _token: SimpleNamespace(
+            whoami=lambda **_kwargs: {
+                "name": "RyanJin333",
+                "auth": {
+                    "accessToken": {
+                        "role": "fineGrained",
+                        "fineGrained": {
+                            "scoped": [
+                                {
+                                    "entity": {"type": "user", "name": "someone-else"},
+                                    "permissions": ["repo.write"],
+                                }
+                            ]
+                        },
+                    }
+                },
+            }
+        ),
+    )
+
+    access = transport.check_access(
+        repository="ryanjin333/lehome-groot-n17-models",
+        token="hf_fine_grained_permission_probe",
+    )
+
+    assert access.can_read is True
+    assert access.can_write is False
+
+
 @pytest.mark.parametrize(
     ("identity", "expected_write"),
     [
@@ -339,6 +421,38 @@ def test_retry_backoff_is_bounded_and_uses_the_injected_sleeper(
     assert len(transport.upload_calls) == 3
 
 
+def test_real_transport_recovers_branch_head_after_post_commit_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    revision = "d" * 40
+    monkeypatch.setattr(
+        transport,
+        "_api",
+        lambda _token: SimpleNamespace(
+            upload_folder=lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("post-commit response failed")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(sha=revision),
+    )
+
+    resolved = transport.upload_files(
+        repository="ryanjin333/lehome-groot-n17-data",
+        revision="lehome-groot-n17-v1",
+        source=tmp_path,
+        entries=(SyncEntry("manifest.json", "0" * 64, 0),),
+        token="hf_post_commit_recovery_probe",
+    )
+
+    assert resolved == revision
+
+
 def test_download_requires_and_preserves_an_explicit_immutable_revision(
     tmp_path: Path,
 ) -> None:
@@ -368,6 +482,45 @@ def test_download_requires_and_preserves_an_explicit_immutable_revision(
             environ={"HF_TOKEN": "hf_download_process_token"},
         )
     assert len(transport.download_calls) == 1
+
+
+def test_real_transport_downloads_an_allowlist_with_bounded_workers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    revision = "e" * 40
+    files = tuple(f"data/episode_{index:06d}.bin" for index in range(32))
+
+    class FakeLibrary:
+        @staticmethod
+        def hf_hub_download(**kwargs: object) -> str:
+            filename = str(kwargs["filename"])
+            cached = Path(str(kwargs["cache_dir"])) / filename
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(filename.encode("utf-8"))
+            return str(cached)
+
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(sha=revision),
+    )
+    monkeypatch.setattr(transport, "_library", lambda: FakeLibrary())
+
+    resolved = transport.download_files(
+        repository="ryanjin333/lehome-groot-n17-data",
+        revision=revision,
+        destination=tmp_path / "readback",
+        relative_paths=files,
+        token="hf_parallel_readback_probe",
+    )
+
+    assert resolved == revision
+    assert {
+        str(path.relative_to(tmp_path / "readback"))
+        for path in (tmp_path / "readback").rglob("*.bin")
+    } == set(files)
 
 
 def test_tree_listing_requires_and_preserves_an_explicit_immutable_revision() -> None:

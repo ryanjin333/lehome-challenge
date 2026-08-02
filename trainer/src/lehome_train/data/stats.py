@@ -17,13 +17,18 @@ import pyarrow.parquet as pq
 
 from lehome_train.data.inspect import read_json_object
 from lehome_train.groot.modality import write_runtime_modality_config
-from lehome_train.io import atomic_write_json, sha256_file
+from lehome_train.io import atomic_write_json, canonical_json_bytes, sha256_file
 
 
 _STAT_NAMES = ("mean", "std", "min", "max", "q01", "q99")
 _VECTOR_KEYS = ("observation.state", "action")
 _RELATIVE_GROUPS = (("left_arm", 0, 5), ("right_arm", 6, 11))
 _ACTION_HORIZON = 16
+
+
+def _write_json_lines(path: Path, values: Iterable[Mapping[str, object]]) -> None:
+    payload = b"".join(canonical_json_bytes(value) + b"\n" for value in values)
+    path.write_bytes(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,12 +252,14 @@ def _train_only_runtime_view(dataset: Path, train_ids: tuple[str, ...]) -> Path:
         ]
         if len(episodes) != len(train_ids):
             raise ValueError("prepared episodes metadata does not match training split")
-        atomic_write_json(meta / "episodes.jsonl", episodes)
+        _write_json_lines(meta / "episodes.jsonl", episodes)
         shutil.copy2(dataset / "meta" / "tasks.jsonl", meta / "tasks.jsonl")
         shutil.copy2(dataset / "meta" / "modality.json", meta / "modality.json")
         for episode_id in train_ids:
             path = _data_path(dataset, episode_id)
-            _link(path, view / path.relative_to(dataset))
+            destination = view / path.relative_to(dataset)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
         _link(dataset / "videos", view / "videos")
         return view
     except BaseException:

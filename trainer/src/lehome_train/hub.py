@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import importlib
 import math
@@ -20,6 +21,7 @@ from lehome_train.models import SyncEntry, validate_artifact_relative_path
 _COMMIT_REVISION = re.compile(r"^[0-9a-f]{40}$")
 _INITIAL_RETRY_DELAY_SECONDS = 0.25
 _MAX_RETRY_DELAY_SECONDS = 1.0
+_MAX_PARALLEL_DOWNLOADS = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +144,44 @@ class HuggingFaceHubTransport:
             raise ValueError("Hub transport repository is not approved") from None
 
     @staticmethod
+    def _fine_grained_repository_write(
+        access_token: Mapping[str, object],
+        repository: str,
+    ) -> bool:
+        fine_grained = access_token.get("fineGrained")
+        if not isinstance(fine_grained, Mapping):
+            return False
+        scopes = fine_grained.get("scoped")
+        if not isinstance(scopes, list):
+            return False
+        owner = repository.partition("/")[0].casefold()
+        repository_name = repository.casefold()
+        for scope in scopes:
+            if not isinstance(scope, Mapping):
+                continue
+            permissions = scope.get("permissions")
+            entity = scope.get("entity")
+            if (
+                not isinstance(permissions, list)
+                or "repo.write" not in permissions
+                or not isinstance(entity, Mapping)
+            ):
+                continue
+            entity_type = entity.get("type")
+            entity_name = entity.get("name")
+            if not isinstance(entity_type, str) or not isinstance(entity_name, str):
+                continue
+            normalized_type = entity_type.casefold()
+            normalized_name = entity_name.casefold()
+            if normalized_type in {"user", "organization", "org"}:
+                if normalized_name == owner:
+                    return True
+            elif normalized_type in {"dataset", "model"}:
+                if normalized_name in {repository_name, repository_name.partition("/")[2]}:
+                    return True
+        return False
+
+    @staticmethod
     def _revision(value: object) -> str:
         revision = getattr(value, "oid", None) or getattr(value, "sha", None)
         if isinstance(revision, str) and _COMMIT_REVISION.fullmatch(revision):
@@ -198,6 +238,11 @@ class HuggingFaceHubTransport:
                             and isinstance(role, str)
                             and role.casefold() == "write"
                         )
+                        if isinstance(role, str) and role.casefold() == "finegrained":
+                            token_write = self._fine_grained_repository_write(
+                                access_token,
+                                repository,
+                            )
             repository_write = token_write
         return HubAccess(
             can_read=private,
@@ -261,9 +306,22 @@ class HuggingFaceHubTransport:
             upload_arguments["path_in_repo"] = remote_prefix
         try:
             result = api.upload_folder(**upload_arguments)
-        except (ConnectionError, TimeoutError):
-            raise HubTransientError("Hub upload timed out") from None
-        return self._revision(result)
+            return self._revision(result)
+        except Exception as error:
+            # A large-folder commit can become durable before the client loses
+            # the final response. Resolve the branch head and let the caller's
+            # immutable full readback decide whether the upload is complete.
+            try:
+                recovered = self._repo_info(
+                    repository=repository,
+                    revision=revision,
+                    token=token,
+                )
+                return self._revision(recovered)
+            except Exception:
+                if isinstance(error, (ConnectionError, TimeoutError)):
+                    raise HubTransientError("Hub upload timed out") from None
+                raise error
 
     def download_files(
         self,
@@ -284,7 +342,7 @@ class HuggingFaceHubTransport:
         library = self._library()
         destination.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="lehome-hf-cache-") as cache:
-            for relative_path in relative_paths:
+            def download_one(relative_path: str) -> None:
                 remote_path = (
                     relative_path
                     if remote_prefix is None
@@ -305,6 +363,10 @@ class HuggingFaceHubTransport:
                 target = destination / relative_path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(downloaded, target)
+            with ThreadPoolExecutor(
+                max_workers=min(_MAX_PARALLEL_DOWNLOADS, len(relative_paths))
+            ) as executor:
+                tuple(executor.map(download_one, relative_paths))
         final = self._repo_info(repository=repository, revision=revision, token=token)
         if self._revision(final) != revision:
             raise ValueError("Hub readback revision changed during download")

@@ -10,7 +10,7 @@ import pytest
 from fixtures.source_dataset import make_source_dataset
 from lehome_train.data.convert import convert_dataset
 from lehome_train.data.stats import write_train_statistics
-from lehome_train.data.validate import validate_prepared_dataset
+from lehome_train.data.validate import _compare_statistics, validate_prepared_dataset
 from lehome_train.groot.modality import (
     ACTION_HORIZON,
     modality_contract,
@@ -23,6 +23,15 @@ MAPPING_PATH = Path(__file__).parents[1] / "config" / "lehome_four_types_mapping
 CONVERTER_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 SOURCE_REVISION = "89abcdef0123456789abcdef0123456789abcdef"
 CONTAINER_DIGEST = "sha256:" + ("a" * 64)
+
+
+def test_statistics_comparison_accepts_pinned_float32_accumulation_drift() -> None:
+    _compare_statistics([0.5784710391752136], [0.5782300233840942], "stats")
+
+
+def test_statistics_comparison_rejects_material_drift() -> None:
+    with pytest.raises(ValueError, match="verified training split"):
+        _compare_statistics([0.5784710391752136], [0.577], "stats")
 
 
 def _prepared_dataset(tmp_path: Path) -> Path:
