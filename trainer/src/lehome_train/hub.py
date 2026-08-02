@@ -22,6 +22,18 @@ _INITIAL_RETRY_DELAY_SECONDS = 0.25
 _MAX_RETRY_DELAY_SECONDS = 1.0
 
 
+def _validate_repository_tree_path(value: str) -> None:
+    """Accept safe Hub paths, including repository metadata dotfiles."""
+
+    if not isinstance(value, str) or not value or value.startswith("/"):
+        raise ValueError("Hub tree path must be a nonempty relative path")
+    if "\\" in value or "\x00" in value:
+        raise ValueError("Hub tree path must use canonical POSIX components")
+    components = value.split("/")
+    if any(component in {"", ".", ".."} for component in components):
+        raise ValueError("Hub tree path contains an unsafe component")
+
+
 @dataclass(frozen=True, slots=True)
 class HubAccess:
     """Read and write permissions reported by a Hub transport."""
@@ -39,7 +51,7 @@ class HubTreeEntry:
     entry_type: Literal["file", "directory", "symlink", "special"]
 
     def __post_init__(self) -> None:
-        validate_artifact_relative_path(self.relative_path)
+        _validate_repository_tree_path(self.relative_path)
         if self.entry_type not in {"file", "directory", "symlink", "special"}:
             raise ValueError("Hub tree entry has an unsupported path type")
 
@@ -198,6 +210,23 @@ class HuggingFaceHubTransport:
                             and isinstance(role, str)
                             and role.casefold() == "write"
                         )
+                        fine_grained = access_token.get("fineGrained")
+                        if (
+                            not token_write
+                            and isinstance(role, str)
+                            and role.casefold() == "finegrained"
+                            and isinstance(fine_grained, Mapping)
+                        ):
+                            scoped = fine_grained.get("scoped")
+                            if isinstance(scoped, list):
+                                token_write = any(
+                                    isinstance(scope, Mapping)
+                                    and isinstance(scope.get("entity"), Mapping)
+                                    and isinstance(scope.get("permissions"), list)
+                                    and scope["entity"].get("name") == repository_owner
+                                    and "repo.write" in scope["permissions"]
+                                    for scope in scoped
+                                )
             repository_write = token_write
         return HubAccess(
             can_read=private,

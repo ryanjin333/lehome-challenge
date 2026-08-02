@@ -209,6 +209,54 @@ def test_hub_private_repo_without_permission_metadata_requires_token_write_role(
     assert access.private_repository is True
 
 
+def test_hub_private_repo_accepts_owner_scoped_fine_grained_write_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(private=True),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_api",
+        lambda _token: SimpleNamespace(
+            whoami=lambda **_kwargs: {
+                "name": "ryanjin333",
+                "auth": {
+                    "accessToken": {
+                        "role": "fineGrained",
+                        "fineGrained": {
+                            "scoped": [
+                                {
+                                    "entity": {
+                                        "name": "ryanjin333",
+                                        "type": "user",
+                                    },
+                                    "permissions": [
+                                        "repo.content.read",
+                                        "repo.write",
+                                    ],
+                                }
+                            ]
+                        },
+                    }
+                },
+            }
+        ),
+    )
+
+    access = transport.check_access(
+        repository="ryanjin333/lehome-groot-n17-models",
+        token="hf_fine_grained_permission_probe",
+    )
+
+    assert access.can_read is True
+    assert access.can_write is True
+    assert access.private_repository is True
+
+
 @pytest.mark.parametrize(
     ("identity", "expected_write"),
     [
@@ -480,6 +528,11 @@ def test_real_transport_lists_complete_tree_at_explicit_commit_with_token(
             return [
                 SimpleNamespace(path="experiments", tree_id="tree-root"),
                 SimpleNamespace(
+                    path=".gitattributes",
+                    size=24,
+                    blob_id="attributes-blob",
+                ),
+                SimpleNamespace(
                     path="experiments/run/payload.bin",
                     size=7,
                     blob_id="blob",
@@ -488,7 +541,7 @@ def test_real_transport_lists_complete_tree_at_explicit_commit_with_token(
 
         def list_repo_files(self, **kwargs: object) -> list[str]:
             calls.append(("files", kwargs))
-            return ["experiments/run/payload.bin"]
+            return [".gitattributes", "experiments/run/payload.bin"]
 
     transport = HuggingFaceHubTransport(timeout_seconds=19.0)
     monkeypatch.setattr(transport, "_api", lambda token: FakeApi())
@@ -506,6 +559,7 @@ def test_real_transport_lists_complete_tree_at_explicit_commit_with_token(
 
     assert observed == (
         hub_module.HubTreeEntry("experiments", "directory"),
+        hub_module.HubTreeEntry(".gitattributes", "file"),
         hub_module.HubTreeEntry("experiments/run/payload.bin", "file"),
     )
     expected_common = {
