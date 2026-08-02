@@ -61,4 +61,4 @@ else
   unset HF_TOKEN
 fi
 
-exec "${drop_privileges[@]}" "$@"
+exec "${drop_privileges[@]}" /usr/bin/env HOME=/nonexistent "$@"

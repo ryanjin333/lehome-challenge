@@ -101,7 +101,7 @@ ENV PATH=/opt/runtime/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin \
     TORCH_HOME=/cache/torch \
     WANDB_DIR=/output/wandb \
     TMPDIR=/cache/tmp \
-    HOME=/nonexistent \
+    HOME=/root \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 

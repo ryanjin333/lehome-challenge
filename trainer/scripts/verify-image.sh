@@ -32,6 +32,13 @@ if [[ "$actual_shell" != '["/bin/bash","-c"]' ]]; then
   exit 1
 fi
 
+actual_home=$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image_ref" \
+  | sed -n 's/^HOME=//p')
+if [[ "$actual_home" != /root ]]; then
+  echo "image root HOME must be /root for Vast SSH derivation, found: $actual_home" >&2
+  exit 1
+fi
+
 actual_release_mode=$(docker image inspect --format '{{index .Config.Labels "io.lehome.release-mode"}}' "$image_ref")
 if [[ "$actual_release_mode" != "$expected_release_mode" ]]; then
   echo "image release mode is $actual_release_mode; expected $expected_release_mode" >&2
@@ -81,6 +88,9 @@ run=(docker run --rm --platform linux/amd64
   -v "$mount_root/output:/output")
 
 "${run[@]}" "$image_ref" --help >/dev/null
+"${run[@]}" --entrypoint /bin/grep "$image_ref" -Fq \
+  'exec "${drop_privileges[@]}" /usr/bin/env HOME=/nonexistent "$@"' \
+  /usr/local/bin/lehome-entrypoint
 "${run[@]}" --user 10001:10001 --entrypoint /bin/bash "$image_ref" -euo pipefail -c '
   test "$(id -u)" -ne 0
   test "$(python -c '\''import platform; print(platform.python_version())'\'')" = 3.10.18
