@@ -8,6 +8,7 @@ module is the only conversion boundary between those two contracts.
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Any, Mapping
 
 import numpy as np
@@ -26,6 +27,7 @@ _STATE_GROUPS = (
 )
 _ACTION_GROUPS = tuple(name for name, _ in _STATE_GROUPS)
 _ACTION_KEYS = tuple(f"action.{name}" for name in _ACTION_GROUPS)
+_ACTION_DIMENSION = 12
 
 
 def _as_frame(value: Any, *, key: str) -> np.ndarray:
@@ -77,10 +79,17 @@ def build_groot_observation(
     }
 
 
-def flatten_groot_action(action: Mapping[str, Any]) -> np.ndarray:
-    """Take the first predicted action step in the checked 12-D joint order."""
+def flatten_groot_action_chunk(action: Mapping[str, Any]) -> np.ndarray:
+    """Flatten a GR00T action chunk to ``(horizon, 12)`` joint order.
+
+    ``Gr00tPolicy.get_action`` returns one batch of denormalized, absolute
+    actions with shape ``(1, T, D)`` for each modality group.  The LeHome
+    environment consumes one 12-D target per simulator step, so the batch
+    dimension is removed while the complete action horizon is retained.
+    """
 
     parts: list[np.ndarray] = []
+    horizon: int | None = None
     for group, key in zip(_ACTION_GROUPS, _ACTION_KEYS, strict=True):
         # ``parse_action_gr00t`` and ``Gr00tPolicy.get_action`` expose the
         # public action namespace as ``action.<group>``.  Accepting the bare
@@ -89,22 +98,60 @@ def flatten_groot_action(action: Mapping[str, Any]) -> np.ndarray:
         actual_key = key if key in action else group
         if actual_key not in action:
             raise ValueError(f"GR00T action is missing {key}")
-        values = np.asarray(action[actual_key])
-        if values.ndim != 3 or values.shape[0] != 1 or values.shape[1] < 1:
+        values = np.asarray(action[actual_key], dtype=np.float32)
+        if values.ndim == 3:
+            if values.shape[0] != 1:
+                raise ValueError(
+                    f"GR00T action {actual_key} must have batch size 1, got {values.shape}"
+                )
+            values = values[0]
+        if values.ndim != 2 or values.shape[0] < 1:
             raise ValueError(
-                f"GR00T action {actual_key} must have shape (1,T,D), got {values.shape}"
+                f"GR00T action {actual_key} must have shape (1,T,D) or (T,D), got {values.shape}"
             )
-        part = np.asarray(values[0, 0], dtype=np.float32).reshape(-1)
+        if horizon is None:
+            horizon = values.shape[0]
+        elif values.shape[0] != horizon:
+            raise ValueError("GR00T action groups have different horizons")
         expected = 5 if group.endswith("_arm") else 1
-        if part.size != expected:
+        if values.shape[1] != expected:
             raise ValueError(
-                f"GR00T action {actual_key} must have dimension {expected}, got {part.size}"
+                f"GR00T action {actual_key} must have dimension {expected}, got {values.shape[1]}"
             )
-        parts.append(part)
-    result = np.concatenate(parts).astype(np.float32, copy=False)
-    if result.shape != (12,) or not np.isfinite(result).all():
-        raise ValueError("GR00T action is not a finite 12-D vector")
+        parts.append(values)
+    result = np.concatenate(parts, axis=1).astype(np.float32, copy=False)
+    if result.shape[1] != _ACTION_DIMENSION or not np.isfinite(result).all():
+        raise ValueError("GR00T action chunk is not finite 12-D joint data")
     return result
+
+
+def flatten_groot_action(action: Mapping[str, Any]) -> np.ndarray:
+    """Take the first predicted action step in the checked 12-D joint order."""
+
+    return flatten_groot_action_chunk(action)[0]
+
+
+class ActionChunkQueue:
+    """Small FIFO for consuming GR00T's action horizon between inferences."""
+
+    def __init__(self) -> None:
+        self._pending: deque[np.ndarray] = deque()
+
+    def extend(self, chunk: np.ndarray) -> None:
+        values = np.asarray(chunk, dtype=np.float32)
+        if values.ndim != 2 or values.shape[1] != _ACTION_DIMENSION:
+            raise ValueError(
+                f"action chunk must have shape (T,{_ACTION_DIMENSION}), got {values.shape}"
+            )
+        if not np.isfinite(values).all():
+            raise ValueError("action chunk contains a non-finite value")
+        self._pending.extend(np.array(row, dtype=np.float32, copy=True) for row in values)
+
+    def pop(self) -> np.ndarray | None:
+        return self._pending.popleft() if self._pending else None
+
+    def clear(self) -> None:
+        self._pending.clear()
 
 
 @PolicyRegistry.register("groot")
@@ -138,18 +185,27 @@ class GrootPolicy(BasePolicy):
             device=runtime_device,
             strict=True,
         )
+        self._action_queue = ActionChunkQueue()
 
     def reset(self) -> None:
+        self._action_queue.clear()
         self._policy.reset()
 
     def select_action(self, observation: Mapping[str, Any]) -> np.ndarray:
+        queued_action = self._action_queue.pop()
+        if queued_action is not None:
+            return queued_action
         groot_observation = build_groot_observation(observation)
         action, _ = self._policy.get_action(groot_observation)
-        return flatten_groot_action(action)
+        action_chunk = flatten_groot_action_chunk(action)
+        self._action_queue.extend(action_chunk[1:])
+        return action_chunk[0]
 
 
 __all__ = [
     "GrootPolicy",
+    "ActionChunkQueue",
     "build_groot_observation",
+    "flatten_groot_action_chunk",
     "flatten_groot_action",
 ]
