@@ -9,8 +9,14 @@ import runpy
 import sys
 from typing import Any
 
+try:
+    from transformers import TrainerCallback
+except ImportError:  # Host-side request validation does not install CUDA deps.
+    class TrainerCallback:  # type: ignore[no-redef]
+        pass
 
-class StopAtOptimizerStep:
+
+class StopAtOptimizerStep(TrainerCallback):
     """Transformers callback that stops after a completed global optimizer step."""
 
     def __init__(self, optimizer_step: int) -> None:
