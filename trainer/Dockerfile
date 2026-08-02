@@ -83,6 +83,10 @@ RUN uv pip install --python /opt/runtime/bin/python --no-deps /opt/trainer \
     && test "$(/opt/runtime/bin/python -c 'import platform; print(platform.python_version())')" = "${PYTHON_VERSION}" \
     && test "$(git -C /opt/isaac-groot rev-parse HEAD)" = "${ISAAC_GROOT_REVISION}" \
     && /opt/runtime/bin/lehome-train --help >/dev/null \
+    && if ! id -u sshd >/dev/null 2>&1; then \
+      useradd --system --user-group --home-dir /run/sshd --no-create-home --shell /usr/sbin/nologin sshd; \
+    fi \
+    && install -d -o sshd -g sshd -m 0755 /run/sshd \
     && groupadd --gid 10001 trainer \
     && useradd --uid 10001 --gid trainer --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin trainer \
     && install -d -o trainer -g trainer -m 0750 /opt/isaac-groot/.git/lfs/tmp \

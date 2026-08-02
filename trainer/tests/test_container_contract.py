@@ -20,3 +20,10 @@ def test_vast_ssh_base_stays_root_while_entrypoint_drops_to_trainer() -> None:
     assert "--reuid=10001" in entrypoint
     assert "--regid=10001" in entrypoint
     assert 'exec "${drop_privileges[@]}" /usr/bin/env HOME=/nonexistent "$@"' in entrypoint
+
+
+def test_vast_ssh_privilege_separation_account_exists() -> None:
+    dockerfile = (REPOSITORY_ROOT / "trainer" / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "useradd --system --user-group --home-dir /run/sshd" in dockerfile
+    assert "install -d -o sshd -g sshd -m 0755 /run/sshd" in dockerfile
