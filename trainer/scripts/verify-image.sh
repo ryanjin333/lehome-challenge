@@ -27,8 +27,8 @@ if [[ "$actual_user" != "root" ]]; then
 fi
 
 actual_shell=$(docker image inspect --format '{{json .Config.Shell}}' "$image_ref")
-if [[ "$actual_shell" != '["/bin/sh","-c"]' ]]; then
-  echo "image must expose Docker's default shell for Vast SSH derivation, found: $actual_shell" >&2
+if [[ "$actual_shell" != '["/bin/bash","-c"]' ]]; then
+  echo "image must expose non-strict Bash for Vast SSH derivation, found: $actual_shell" >&2
   exit 1
 fi
 
