@@ -314,7 +314,12 @@ def run_matrix(args: argparse.Namespace) -> dict[str, object]:
         if args.save_video:
             command.append("--save_video")
         if args.dry_run:
-            record = {"trial": trial.to_dict(), "command": command, "status": "dry_run"}
+            record = {
+                "trial": trial.to_dict(),
+                "matrix_sha256": matrix_digest,
+                "command": command,
+                "status": "dry_run",
+            }
             (trial_root / "trial.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
             records.append(record)
             continue
@@ -330,6 +335,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, object]:
         log_path.write_text(completed.stdout, encoding="utf-8")
         record: dict[str, object] = {
             "trial": trial.to_dict(),
+            "matrix_sha256": matrix_digest,
             "command": command,
             "returncode": completed.returncode,
             "log": {"relative_path": log_path.relative_to(output_root).as_posix(), "sha256": sha256_file(log_path)},
