@@ -1,0 +1,16 @@
+[project]
+name = "lehome-bridge"
+version = "0.1.0"
+description = "Authenticated macOS SO101 leader bridge"
+requires-python = ">=3.11"
+dependencies = ["pyserial>=3.5"]
+
+[project.scripts]
+lehome-bridge = "lehome_bridge.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
