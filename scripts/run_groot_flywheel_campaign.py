@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -79,7 +80,7 @@ def _run_one_worker(args: argparse.Namespace, *, worker_id: int, trial: Trial) -
         except subprocess.TimeoutExpired:
             process.terminate()
             try:
-                process.wait(timeout=30)
+                process.wait(timeout=args.terminate_grace_seconds)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
@@ -95,6 +96,13 @@ def _validate_sweep(values: str) -> tuple[int, ...]:
     if not requested or requested != legal[: len(requested)]:
         raise ValueError("capacity sweep order must be 1,2,4,6, then 8 only if eligible")
     return requested
+
+
+def _positive_finite_seconds(value: str) -> float:
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than zero")
+    return seconds
 
 
 def _resource_margins() -> tuple[float, float, float]:
@@ -139,7 +147,7 @@ def _run_worker_group(args: argparse.Namespace, assignments: Sequence[tuple[int,
         except subprocess.TimeoutExpired:
             process.terminate()
             try:
-                process.wait(timeout=30)
+                process.wait(timeout=args.terminate_grace_seconds)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
@@ -178,6 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trials-per-worker", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--worker-timeout-seconds", type=float, default=1800.0)
+    parser.add_argument("--terminate-grace-seconds", type=_positive_finite_seconds, default=5.0)
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -185,8 +194,13 @@ def build_parser() -> argparse.ArgumentParser:
 def run_campaign(args: argparse.Namespace) -> dict[str, object]:
     from scripts.eval_groot_n17_matrix import load_matrix
 
-    if args.trials_per_worker <= 0 or args.worker_timeout_seconds <= 0:
-        raise ValueError("worker counts and timeout must be positive")
+    if (
+        args.trials_per_worker <= 0
+        or args.worker_timeout_seconds <= 0
+        or not math.isfinite(args.terminate_grace_seconds)
+        or args.terminate_grace_seconds <= 0
+    ):
+        raise ValueError("worker counts and timeouts must be finite and positive")
     trials = tuple(load_matrix(args.matrix))
     args.output_root.mkdir(parents=True, exist_ok=True)
     state = CampaignState(args.output_root, tuple(trial.trial_id for trial in trials))
