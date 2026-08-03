@@ -25,7 +25,7 @@ def test_campaign_forwards_run_provenance_and_matrix_trial_identity(tmp_path) ->
         policy_path=tmp_path / "policy", policy_revision_file=tmp_path / "revision.txt",
         policy_repo="org/policy", policy_step=12000, code_revision="a" * 40,
         asset_revision="b" * 40, simulator_version="isaac-5.1", policy_artifact_sha256="c" * 64,
-        image_identity="sha256:immutable", output_root=tmp_path, max_steps=600,
+        image_identity="sha256:immutable", output_root=tmp_path, max_steps=600, strategy="mild",
     )
     trial = Trial("pant_long", "Pant_Long_Seen_0", "seen", 42)
     command = _trial_command(args, trial)
@@ -39,6 +39,7 @@ def test_campaign_forwards_run_provenance_and_matrix_trial_identity(tmp_path) ->
     assert values["--code-revision"] == "a" * 40
     assert values["--asset-revision"] == "b" * 40
     assert values["--policy-artifact-sha256"] == "c" * 64
+    assert values["--strategy"] == "mild"
 
 
 def test_campaign_missing_provenance_rejects_before_worker_launch(monkeypatch, tmp_path) -> None:

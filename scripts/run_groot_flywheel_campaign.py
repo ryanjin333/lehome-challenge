@@ -53,18 +53,24 @@ def _trial_command(args: argparse.Namespace, trial: Trial) -> list[str]:
         "--category", trial.category, "--release-stage", trial.release_stage,
         "--policy-artifact-sha256", args.policy_artifact_sha256, "--image-identity", args.image_identity,
         "--seed", str(trial.seed), "--episode-id", trial.trial_id, "--output-root", str(args.output_root),
+        "--strategy", args.strategy,
         "--max-steps", str(args.max_steps), "--headless",
     ]
+
+
+def _attempt_log_path(worker_root: Path, trial_id: str) -> Path:
+    attempt = 1
+    while True:
+        path = worker_root / f"{trial_id}.attempt-{attempt:03d}.log"
+        if not path.exists() and not path.is_symlink():
+            return path
+        attempt += 1
 
 
 def _run_one_worker(args: argparse.Namespace, *, worker_id: int, trial: Trial) -> int:
     worker_root = args.output_root / "workers" / f"worker-{worker_id:02d}"
     heartbeat = worker_root / "heartbeat.json"
-    attempt = 1
-    log_path = worker_root / f"{trial.trial_id}.attempt-{attempt:03d}.log"
-    while log_path.exists():
-        attempt += 1
-        log_path = worker_root / f"{trial.trial_id}.attempt-{attempt:03d}.log"
+    log_path = _attempt_log_path(worker_root, trial.trial_id)
     _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="started")
     with log_path.open("x", encoding="utf-8") as log:
         process = subprocess.Popen(_trial_command(args, trial), stdout=log, stderr=subprocess.STDOUT)
@@ -122,7 +128,7 @@ def _run_worker_group(args: argparse.Namespace, assignments: Sequence[tuple[int,
     for worker_id, trial in assignments:
         worker_root = args.output_root / "workers" / f"worker-{worker_id:02d}"
         heartbeat = worker_root / "heartbeat.json"
-        log_path = worker_root / f"{trial.trial_id}.log"
+        log_path = _attempt_log_path(worker_root, trial.trial_id)
         _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="started")
         log = log_path.open("x", encoding="utf-8")
         processes.append((worker_id, trial, subprocess.Popen(_trial_command(args, trial), stdout=log, stderr=subprocess.STDOUT), heartbeat, log))
@@ -168,6 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-artifact-sha256", required=True)
     parser.add_argument("--image-identity", required=True)
     parser.add_argument("--capacity-sweep")
+    parser.add_argument("--strategy", choices=("canonical", "mild", "strong"), default="canonical")
     parser.add_argument("--trials-per-worker", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--worker-timeout-seconds", type=float, default=1800.0)
