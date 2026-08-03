@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -88,43 +87,36 @@ def _vector(value: object, *, label: str) -> list[float]:
     return result
 
 
-def _eligible_windows(rows: tuple[dict[str, object], ...]) -> tuple[list[dict[str, object]], Counter[str]]:
-    rejected: Counter[str] = Counter()
-    for row in rows:
-        source = row.get("action_source")
-        if source not in {"policy", "expert", "hold"}:
-            raise ValueError("raw annotation has an invalid action source")
-        _vector(row.get("state"), label="raw state")
-        _vector(row.get("action"), label="raw action")
-        if source != "expert":
-            rejected[str(source)] += 1
-    selected: list[dict[str, object]] = []
-    for index, observation in enumerate(rows):
-        if observation["action_source"] != "expert":
-            continue
-        window = rows[index:index + ACTION_HORIZON]
-        if len(window) != ACTION_HORIZON:
-            rejected["short_tail"] += 1
-            continue
-        first_segment = observation.get("segment")
-        valid = True
-        for offset, candidate in enumerate(window):
-            if (candidate.get("action_source") != "expert" or candidate.get("segment") != first_segment
-                    or candidate.get("step") != observation.get("step", index) + offset):
-                valid = False
-                break
-            age = candidate.get("expert_sample_age_ms")
-            if type(age) not in (int, float) or not 0 <= float(age) < float("inf"):
-                rejected["stale_expert"] += 1
-                valid = False
-                break
-        if not valid:
-            continue
-        selected.append({"state": _vector(observation["state"], label="state"),
-                         "action": _vector(observation["action"], label="action"),
-                         "step": int(observation.get("step", index)),
-                         "future_actions": [_vector(item["action"], label="future action") for item in window]})
-    return selected, rejected
+def _eligible_windows(rows: tuple[dict[str, object], ...]) -> tuple[list[dict[str, object]], dict[str, int]]:
+    """Adapt annotations once, then defer selection/reporting to core flywheel code."""
+    from lehome.flywheel.export import build_selection_report, select_expert_windows
+    from lehome.flywheel.models import ActionSource, EpisodeFrame
+
+    frames: list[EpisodeFrame] = []
+    by_step: dict[int, dict[str, object]] = {}
+    for index, row in enumerate(rows):
+        try:
+            step = row.get("step", index)
+            if type(step) is not int:
+                raise ValueError
+            frame = EpisodeFrame(step=step, monotonic_ns=int(row["monotonic_ns"]), wall_time_ns=int(row["wall_time_ns"]),
+                                 state=tuple(_vector(row.get("state"), label="raw state")),
+                                 action=tuple(_vector(row.get("action"), label="raw action")),
+                                 action_source=ActionSource(row["action_source"]), reward=float(row["reward"]),
+                                 success=bool(row["success"]), segment=int(row["segment"]),
+                                 policy_request_id=row.get("policy_request_id"), policy_chunk_offset=row.get("policy_chunk_offset"),
+                                 expert_sequence=row.get("expert_sequence"), expert_sample_age_ms=row.get("expert_sample_age_ms"))
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"raw annotation {index + 1} violates the shared frame contract") from None
+        frames.append(frame)
+        by_step[step] = row
+    windows = select_expert_windows(frames, horizon=ACTION_HORIZON, accepted_success=True)
+    report = build_selection_report(frames, horizon=ACTION_HORIZON, accepted_success=True)
+    selected = [{"state": _vector(by_step[window.observation_step]["state"], label="state"),
+                 "action": _vector(by_step[window.observation_step]["action"], label="action"),
+                 "step": window.observation_step, "future_actions": [list(action) for action in window.future_actions]}
+                for window in windows]
+    return selected, report.as_dict()
 
 
 def _write_lines(path: Path, values: list[dict[str, object]]) -> None:
