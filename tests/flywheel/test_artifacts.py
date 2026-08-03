@@ -48,6 +48,16 @@ def test_finalize_rejects_path_traversal_symlinks_and_duplicate_ids(tmp_path: Pa
         EpisodeArtifactWriter(tmp_path, "episode-004")
 
 
+def test_annotation_append_refuses_a_symlink_target(tmp_path: Path) -> None:
+    writer = EpisodeArtifactWriter(tmp_path, "episode-symlink")
+    target = tmp_path / "outside.jsonl"
+    (writer.staging / "annotations.jsonl").symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        writer.append_annotation({"step": 0})
+    assert not target.exists()
+
+
 def test_verify_rejects_unlisted_files_bad_hash_and_duplicate_manifest_entries(tmp_path: Path) -> None:
     writer = EpisodeArtifactWriter(tmp_path, "episode-005")
     writer.append_annotation({"step": 0})

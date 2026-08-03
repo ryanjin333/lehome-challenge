@@ -139,6 +139,8 @@ class EpisodeArtifactWriter:
         if self._finalized:
             raise ValueError("episode has already been finalized")
         path = self.staging / "annotations.jsonl"
+        if path.is_symlink():
+            raise ValueError("episode artifacts must not contain symlinks")
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
             handle.flush()
