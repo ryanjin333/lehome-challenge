@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import stat
+from dataclasses import dataclass
 
+import numpy as np
 import pytest
 
-from scripts.collect_groot_dagger import build_parser, create_session_secret, prepare_session, validate_args
+from lehome.flywheel.bridge_receiver import ExpertCommand
+from lehome.flywheel.isaac_recorder import MixedSourceRecorder
+from lehome.flywheel.models import EpisodeIdentity
+from lehome.flywheel.quality import QualityThresholds
+from scripts.collect_groot_dagger import ScheduledControlSource, build_parser, collect_episode, create_session_secret, prepare_session, validate_args
 
 
 def arguments(*values: str):
@@ -34,9 +40,175 @@ def test_interactive_collection_requires_known_calibration_hashes() -> None:
         validate_args(arguments("--interactive"))
 
 
+def test_interactive_validation_rejects_before_any_isaac_launcher_import() -> None:
+    with pytest.raises(ValueError, match="pinned policy revision"):
+        validate_args(arguments("--interactive", "--left-calibration-sha256", "a" * 64, "--right-calibration-sha256", "b" * 64))
+
+
 def test_practice_session_has_no_export_and_secret_is_mode_0600(tmp_path) -> None:
     args = arguments("--run-root", str(tmp_path / "practice"))
     session = prepare_session(args, secret_path=tmp_path / "bridge-session.secret")
     assert session.controller.mode == "practice"
     assert not (args.run_root / "exports").exists()
     assert stat.S_IMODE((tmp_path / "bridge-session.secret").stat().st_mode) == 0o600
+
+
+def identity(name: str) -> EpisodeIdentity:
+    return EpisodeIdentity(name, "repo", "a" * 40, 1, "b" * 40, "c" * 40, "isaac", "Pant_Long_Seen_0", "pant_long", "seen", 1, "fold the garment", "canonical")
+
+
+def thresholds() -> QualityThresholds:
+    return QualityThresholds("a" * 40, "b" * 64, 1000.0, 1000.0, 10.0, 2000.0, 2000.0, 20.0, 0, 0)
+
+
+def observation() -> dict[str, np.ndarray]:
+    return {
+        "observation.state": np.zeros(12, dtype=np.float32),
+        "observation.images.top_rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+        "observation.images.left_rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+        "observation.images.right_rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+    }
+
+
+class FakeEnv:
+    step_dt_s = 1.0 / 30.0
+
+    def __init__(self, *, success_at: int = 2) -> None:
+        self.success_at = success_at
+        self.actions: list[tuple[float, ...]] = []
+        self.reset_calls = 0
+
+    def reset(self):
+        self.reset_calls += 1
+        return observation()
+
+    def step(self, action):
+        copied = tuple(float(value) for value in action)
+        self.actions.append(copied)
+        return observation(), 1.0, len(self.actions) >= self.success_at
+
+    def is_action_safe(self, action) -> bool:
+        return True
+
+    def flywheel_capture_state(self):
+        return {
+            "robot_position": np.zeros(12), "robot_velocity": np.zeros(12),
+            "cloth_position": np.zeros((1, 3)), "cloth_velocity": np.zeros((1, 3)),
+            "rng_state": {"seed": 1}, "garment_name": "Pant_Long_Seen_0",
+        }
+
+
+@dataclass
+class PolicyAction:
+    value: np.ndarray
+    request_id: str
+    chunk_offset: int
+
+
+class FakePolicy:
+    def __init__(self) -> None:
+        self.cleared = False
+
+    def select_action_with_provenance(self, observation):
+        return PolicyAction(np.full(12, 0.25, dtype=np.float32), "request", 0)
+
+    def clear_queued_actions(self) -> None:
+        self.cleared = True
+
+
+class FakeReceiver:
+    def __init__(self, *, eligible: bool = True) -> None:
+        self.eligible = eligible
+        self.last_safe_command = (0.0,) * 12
+        self.jitter_ms = 0.0
+
+    def current(self):
+        return ExpertCommand((0.0,) * 12, self.eligible, None if self.eligible else "stale_sample", 7, 1.0)
+
+
+def recorder(tmp_path, name: str, mode: str, monkeypatch) -> MixedSourceRecorder:
+    value = MixedSourceRecorder(tmp_path, identity=identity(name), mode=mode, horizon=1)
+    def encode(root, *, fps=30):
+        directory = root / "videos"; directory.mkdir(exist_ok=True)
+        for camera in ("top_rgb", "left_rgb", "right_rgb"):
+            (directory / f"{camera}.mp4").write_bytes(b"video")
+        return ("top_rgb.mp4", "left_rgb.mp4", "right_rgb.mp4")
+    monkeypatch.setattr(value.video_sink, "encode", encode)
+    return value
+
+
+def session(tmp_path, mode: str):
+    value = prepare_session(arguments("--mode", mode, "--run-root", str(tmp_path)), secret_path=tmp_path / f"{mode}.secret")
+    value.quality_thresholds = thresholds()
+    value.bridge_server.receiver = FakeReceiver()
+    return value
+
+
+def test_collect_episode_practice_creates_no_exports_for_repeated_attempts(tmp_path, monkeypatch) -> None:
+    for index in range(10):
+        root = tmp_path / f"practice-{index}"
+        result = collect_episode(session(root, "practice"), FakeEnv(), FakePolicy(), ScheduledControlSource(["space"]), recorder(root, f"practice-{index}", "practice", monkeypatch), thresholds(), max_steps=2)
+        assert result.episode["bc_target_count"] == 0
+        assert not (root / "exports").exists()
+
+
+def test_collect_episode_full_expert_exports_exact_applied_expert_actions(tmp_path, monkeypatch) -> None:
+    value = session(tmp_path, "expert")
+    env, policy = FakeEnv(success_at=1), FakePolicy()
+    result = collect_episode(value, env, policy, ScheduledControlSource(["space", None, "a"]), recorder(tmp_path, "expert", "expert", monkeypatch), thresholds(), max_steps=3)
+    assert result.episode["bc_target_count"] > 0
+    assert all(annotation["action_source"] == "expert" for annotation in result.annotations)
+    assert all(tuple(annotation["action"]) == action for annotation, action in zip(result.annotations, env.actions))
+    assert (tmp_path / "exports" / "expert" / "selection-report.json").is_file()
+
+
+def test_collect_episode_dagger_exports_only_post_takeover_and_clears_policy(tmp_path, monkeypatch) -> None:
+    value = session(tmp_path, "dagger")
+    env, policy = FakeEnv(success_at=2), FakePolicy()
+    result = collect_episode(value, env, policy, ScheduledControlSource(["space", "space", "a"]), recorder(tmp_path, "dagger", "dagger", monkeypatch), thresholds(), max_steps=3)
+    assert result.annotations[0]["action_source"] == "policy"
+    assert all(annotation["action_source"] == "expert" for annotation in result.annotations[1:])
+    assert [tuple(annotation["action"]) for annotation in result.annotations] == env.actions
+    assert policy.cleared is True
+    assert [window.observation_step for window in result.expert_windows] == [1, 2]
+    assert (tmp_path / "exports" / "dagger" / "expert-windows.json").is_file()
+
+
+def test_collect_episode_hold_or_discard_stays_diagnostic_without_export(tmp_path, monkeypatch) -> None:
+    value = session(tmp_path, "expert")
+    value.bridge_server.receiver = FakeReceiver(eligible=False)
+    result = collect_episode(value, FakeEnv(), FakePolicy(), ScheduledControlSource(["space", "d"]), recorder(tmp_path, "hold", "expert", monkeypatch), thresholds(), max_steps=2)
+    assert result.episode["bc_target_count"] == 0
+    assert not (tmp_path / "exports").exists()
+
+
+def test_collect_episode_reset_resets_task_and_stays_diagnostic(tmp_path, monkeypatch) -> None:
+    value, env = session(tmp_path, "expert"), FakeEnv()
+    result = collect_episode(
+        value,
+        env,
+        FakePolicy(),
+        ScheduledControlSource(["space", "r"]),
+        recorder(tmp_path, "reset", "expert", monkeypatch),
+        thresholds(),
+        max_steps=3,
+    )
+    assert env.reset_calls == 2
+    assert result.episode["bc_target_count"] == 0
+    assert not (tmp_path / "exports").exists()
+
+
+def test_collect_episode_without_metric_thresholds_stays_diagnostic(tmp_path, monkeypatch) -> None:
+    value = session(tmp_path, "expert")
+    result = collect_episode(
+        value,
+        FakeEnv(success_at=1),
+        FakePolicy(),
+        ScheduledControlSource(["space", None, "a"]),
+        recorder(tmp_path, "ungraded", "expert", monkeypatch),
+        None,
+        max_steps=3,
+    )
+    assert result.episode["bc_target_count"] == 0
+    assert result.episode["quality_grade"] == "C"
+    assert not (tmp_path / "exports").exists()

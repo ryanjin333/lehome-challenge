@@ -40,8 +40,9 @@ official success), `d` (discard), `r` (reset), and `escape` (safe exit). A
 manual accept cannot turn an official failure, stale/disconnected bridge, or
 safety rejection into a training example.
 
-The remote collector requires these explicit conditions before it enables
-training output:
+The remote collector requires these explicit conditions before it enables an
+interactive expert or DAgger loop. Validation completes before importing Isaac
+or constructing an app launcher; a failed command has not started a simulator.
 
 ```bash
 python scripts/collect_groot_dagger.py \
@@ -51,6 +52,18 @@ python scripts/collect_groot_dagger.py \
   --organizer-dataset-sha256 <64-lowercase-hex-sha256> \
   --left-calibration-sha256 <64-lowercase-hex-sha256> \
   --right-calibration-sha256 <64-lowercase-hex-sha256> \
+  --policy-path /secure/pinned-groot-checkpoint \
+  --policy-revision <40-lowercase-hex-revision> \
+  --policy-repo <policy-repository> \
+  --policy-step <non-negative-step> \
+  --policy-artifact-sha256 <64-lowercase-hex-sha256> \
+  --image-identity <immutable-image-identity> \
+  --code-revision <40-lowercase-hex-revision> \
+  --asset-revision <40-lowercase-hex-revision> \
+  --simulator-version <simulator-version> \
+  --episode-id <unique-episode-id> \
+  --garment <organizer-garment-name> \
+  --category pant_long --release-stage seen \
   --interactive
 ```
 
@@ -58,6 +71,24 @@ The threshold file must be generated from organizer expert statistics and pin
 the organizer dataset revision, dataset SHA-256, statistics SHA-256, sample
 count, quantiles, and all hard/clean limits. This repository intentionally does
 not supply guessed values.
+
+Once the command prints its loopback forwarding instruction, press `space` to
+start policy control (DAgger) or expert control (full expert). For DAgger,
+press `space` again only after the receiver reports a fresh, synchronized 12D
+command; this clears queued policy actions, records a takeover snapshot, and
+makes each following applied action expert-labelled. Press `a` only after the
+task's official success signal; otherwise press `d` or `escape`. Terminal input
+is read in the background, so sampling never waits for a prompt. `r` resets the
+task but finalizes the partial attempt as diagnostic-only; begin the next
+immutable episode with a fresh invocation and episode ID.
+
+Every attempt writes immutable raw episode evidence. Only an accepted,
+quality-A/B non-practice attempt with reset/takeover/terminal snapshots, three
+nonempty encoded camera videos, measured motion/jitter metrics, and eligible
+post-takeover expert windows receives an atomic `exports/<episode-id>/` receipt.
+That receipt contains `selection-report.json`, `expert-windows.json`, and its
+own SHA-256 manifest. Holds, bridge faults, missing metric evidence, discarded
+attempts, policy-only prefixes, and practice attempts remain diagnostic-only.
 
 ## Bridge operation
 

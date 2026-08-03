@@ -5,17 +5,23 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 import json
+import math
 import os
 from pathlib import Path
 import secrets
 import stat
 import re
 import threading
-from typing import Any
+from typing import Any, Iterable, Protocol
+from uuid import uuid4
 
+from lehome.flywheel.artifacts import atomic_write_json, build_sha256_manifest, verify_episode
 from lehome.flywheel.bridge_receiver import BridgeReceiver, LoopbackBridgeServer
 from lehome.flywheel.intervention import InterventionController
-from lehome.flywheel.quality import QualityThresholds, load_quality_thresholds
+from lehome.flywheel.isaac_recorder import MixedSourceRecorder, RecordedEpisode
+from lehome.flywheel.models import ActionSource, EpisodeOutcome, QualityGrade, RejectionReason
+from lehome.flywheel.quality import AttemptStats, QualityResult, QualityThresholds, grade_attempt, load_quality_thresholds
+from lehome.flywheel.snapshots import capture_snapshot
 
 
 CONTROLS = {
@@ -45,6 +51,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--organizer-dataset-sha256")
     parser.add_argument("--left-calibration-sha256")
     parser.add_argument("--right-calibration-sha256")
+    parser.add_argument("--policy-path", type=Path)
+    parser.add_argument("--policy-revision")
+    parser.add_argument("--policy-revision-file", type=Path)
+    parser.add_argument("--policy-repo")
+    parser.add_argument("--policy-step", type=int)
+    parser.add_argument("--policy-artifact-sha256")
+    parser.add_argument("--image-identity")
+    parser.add_argument("--code-revision")
+    parser.add_argument("--asset-revision")
+    parser.add_argument("--simulator-version")
+    parser.add_argument("--episode-id")
+    parser.add_argument("--garment")
+    parser.add_argument("--category", choices=("top_long", "top_short", "pant_long", "pant_short"))
+    parser.add_argument("--release-stage", choices=("seen", "public_unseen"))
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--strategy", choices=("canonical", "mild", "strong"), default="canonical")
+    parser.add_argument("--task", default="LeHome-BiSO101-Direct-Garment-v2")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--interactive", action="store_true")
     return parser
 
@@ -61,6 +86,23 @@ def validate_args(args: argparse.Namespace) -> QualityThresholds | None:
         raise ValueError("collector calibration hashes must be paired lowercase SHA-256 values")
     if args.interactive and not all(calibration_hashes):
         raise ValueError("interactive collection requires both expected calibration hashes")
+    if args.interactive:
+        from scripts.run_groot_flywheel_trial import build_identity, read_pinned_revision
+
+        revision = args.policy_revision
+        if args.policy_revision_file is not None:
+            if revision is not None:
+                raise ValueError("provide one policy revision source")
+            revision = read_pinned_revision(args.policy_revision_file)
+        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("interactive collection requires a pinned policy revision")
+        if args.policy_path is None or not args.policy_path.is_dir():
+            raise ValueError("interactive collection requires an existing policy path")
+        if args.max_steps <= 0 or args.seed < 0:
+            raise ValueError("interactive collection requires non-negative seed and positive max-steps")
+        args.collection_identity = build_identity(args, revision)
+        if args.mode in {"expert", "dagger"} and not args.enable_training_output:
+            raise ValueError("interactive expert or dagger collection requires training output")
     if args.enable_training_output and args.mode not in {"expert", "dagger"}:
         raise ValueError("training output requires expert or dagger mode")
     if not args.enable_training_output:
@@ -142,6 +184,280 @@ class CollectorSession:
         self.bridge_server.close()
 
 
+class ControlSource(Protocol):
+    def poll(self) -> str | None: ...
+    def metrics(self) -> dict[str, int]: ...
+
+
+class ScheduledControlSource:
+    """Deterministic nonblocking control queue used by tests and dry orchestration."""
+
+    def __init__(self, controls: Iterable[str]) -> None:
+        self._controls = list(controls)
+        self._hesitations = 0
+        self._corrections = 0
+
+    def poll(self) -> str | None:
+        return self._controls.pop(0) if self._controls else None
+
+    def metrics(self) -> dict[str, int]:
+        return {"hesitations": self._hesitations, "corrections": self._corrections}
+
+
+def _observation(env: object, reset_result: object | None = None) -> dict[str, object]:
+    if isinstance(reset_result, dict):
+        return reset_result
+    getter = getattr(env, "_get_observations", None)
+    if callable(getter):
+        return getter()
+    getter = getattr(env, "observation", None)
+    if callable(getter):
+        return getter()
+    raise ValueError("collection environment must provide an observation mapping")
+
+
+def _step(env: object, action: tuple[float, ...]) -> tuple[dict[str, object], float, bool]:
+    result = getattr(env, "step")(action)
+    if isinstance(result, tuple) and len(result) == 3:
+        observation, reward, success = result
+        return _observation(env, observation), float(reward), bool(success)
+    if isinstance(result, tuple) and len(result) == 5:
+        observation, reward, terminated, truncated, info = result
+        success = bool(info.get("official_success", terminated)) if isinstance(info, dict) else bool(terminated)
+        return _observation(env, observation), float(reward), success
+    reward = getattr(env, "reward", None)
+    success = getattr(env, "official_success", None)
+    if reward is None or success is None:
+        raise ValueError("collection environment step must return reward and official success")
+    return _observation(env), float(reward), bool(success)
+
+
+def _policy_action(policy: object, observation: dict[str, object]) -> tuple[tuple[float, ...], str, int]:
+    select = getattr(policy, "select_action_with_provenance", None)
+    if not callable(select):
+        raise ValueError("DAgger policy control requires provenance-bearing policy actions")
+    selected = select(observation)
+    value, request_id, chunk_offset = getattr(selected, "value", None), getattr(selected, "request_id", None), getattr(selected, "chunk_offset", None)
+    if not isinstance(request_id, str) or not request_id or not isinstance(chunk_offset, int) or chunk_offset < 0:
+        raise ValueError("policy action provenance is invalid")
+    action = tuple(float(item) for item in value)
+    if len(action) != 12 or not all(math.isfinite(item) for item in action):
+        raise ValueError("policy action must be finite 12D")
+    return action, request_id, chunk_offset
+
+
+def _clear_policy_queue(policy: object) -> None:
+    for name in ("clear_queued_actions", "clear_action_queue", "reset"):
+        clear = getattr(policy, name, None)
+        if callable(clear):
+            clear()
+            return
+    raise ValueError("DAgger takeover requires a policy queue clear operation")
+
+
+def _percentile(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)]
+
+
+def _attempt_quality(
+    *,
+    thresholds: QualityThresholds | None,
+    official_success: bool,
+    actions: list[tuple[float, ...]],
+    step_dt_s: float | None,
+    jitter_samples: list[float],
+    stale_samples: int,
+    disconnected: bool,
+    holds: int,
+    unsafe_commands: int,
+    control_source: ControlSource,
+    manual_discarded: bool,
+) -> QualityResult:
+    metrics = control_source.metrics()
+    if thresholds is None or not isinstance(step_dt_s, (int, float)) or not math.isfinite(step_dt_s) or step_dt_s <= 0:
+        return QualityResult("C", ("metric_evidence_unavailable",), 0.0)
+    velocities = [max(abs(current - previous) for current, previous in zip(action, prior)) / step_dt_s for prior, action in zip(actions, actions[1:])]
+    accelerations = [abs(current - previous) / step_dt_s for previous, current in zip(velocities, velocities[1:])]
+    velocity_p95, acceleration_p95, jitter_p95 = _percentile(velocities), _percentile(accelerations), _percentile(jitter_samples)
+    if velocity_p95 is None or acceleration_p95 is None or jitter_p95 is None:
+        return QualityResult("C", ("metric_evidence_unavailable",), 0.0)
+    if not all(isinstance(metrics.get(name), int) and metrics[name] >= 0 for name in ("hesitations", "corrections")):
+        return QualityResult("C", ("metric_evidence_unavailable",), 0.0)
+    return grade_attempt(
+        AttemptStats(
+            official_success=official_success,
+            hesitations=metrics["hesitations"] + holds,
+            corrections=metrics["corrections"],
+            stale_samples=stale_samples,
+            unsafe_commands=unsafe_commands,
+            disconnected=disconnected,
+            manual_discarded=manual_discarded,
+            velocity_p95=velocity_p95,
+            acceleration_p95=acceleration_p95,
+            jitter_p95=jitter_p95,
+        ),
+        thresholds,
+    )
+
+
+def _rejection_reasons(quality: QualityResult, *, held: bool, discarded: bool) -> tuple[RejectionReason, ...]:
+    mapped = {
+        "stale_samples": RejectionReason.STALE_EXPERT,
+        "disconnected": RejectionReason.DISCONNECTED,
+        "unsafe_commands": RejectionReason.UNSAFE,
+        "operator_discarded": RejectionReason.OPERATOR_DISCARDED,
+        "metric_evidence_unavailable": RejectionReason.MISSING,
+    }
+    reasons = [mapped[reason] for reason in quality.reasons if reason in mapped]
+    if held:
+        reasons.append(RejectionReason.HOLD)
+    if discarded:
+        reasons.append(RejectionReason.OPERATOR_DISCARDED)
+    if not reasons:
+        reasons.append(RejectionReason.FAILED_EPISODE)
+    return tuple(dict.fromkeys(reasons))
+
+
+def _write_export_receipt(run_root: Path, result: RecordedEpisode) -> None:
+    """Atomically publish selection-only evidence after verifying immutable raw data."""
+    verify_episode(result.path)
+    destination = run_root / "exports" / result.path.name
+    if destination.exists() or destination.is_symlink():
+        raise ValueError("refusing to overwrite an existing DAgger export receipt")
+    staging = run_root / ".pending-exports" / f"{result.path.name}-{uuid4().hex}"
+    staging.mkdir(parents=True)
+    try:
+        atomic_write_json(staging / "selection-report.json", result.selection_report.as_dict() if result.selection_report else {})
+        atomic_write_json(
+            staging / "expert-windows.json",
+            {"windows": [{"observation_step": window.observation_step, "future_actions": [list(action) for action in window.future_actions]} for window in result.expert_windows]},
+        )
+        atomic_write_json(staging / "SHA256SUMS.json", build_sha256_manifest(staging))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging.replace(destination)
+    except BaseException:
+        if staging.exists():
+            import shutil
+            shutil.rmtree(staging)
+        raise
+
+
+def collect_episode(
+    session: CollectorSession,
+    env: object,
+    policy: object,
+    control_source: ControlSource,
+    recorder: MixedSourceRecorder,
+    thresholds: QualityThresholds | None,
+    max_steps: int,
+) -> RecordedEpisode:
+    """Collect one real/fake episode through the same source and evidence gates."""
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    reset = getattr(env, "reset", None)
+    if not callable(reset):
+        raise ValueError("collection environment must provide reset")
+    observation = _observation(env, reset())
+    recorder.record_snapshot("reset", capture_snapshot(env, randomization={"strategy": "collection"}))
+    official_success = False
+    accept_requested = False
+    discarded = False
+    held = stale_samples = unsafe_commands = 0
+    disconnected = False
+    actions: list[tuple[float, ...]] = []
+    jitter_samples: list[float] = []
+    last_safe = tuple(float(value) for value in getattr(session.bridge_server.receiver, "last_safe_command", (0.0,) * 12))
+    # A successful export needs measured task timing, not an assumed control rate.
+    step_dt_s = getattr(env, "step_dt_s", None)
+    for _ in range(max_steps):
+        control = control_source.poll()
+        if control is not None:
+            session.record_control(control)
+            if control in {"d", "escape"}:
+                discarded = True
+                break
+            if control == "r":
+                # Preserve the partial attempt as diagnostic-only, then return
+                # the real task to reset before ending this immutable episode.
+                discarded = True
+                _observation(env, reset())
+                break
+            if control == "a" and official_success:
+                accept_requested = True
+            if control == "space":
+                if session.controller.state == "ready":
+                    (session.controller.start_policy if session.controller.mode == "dagger" else session.controller.start_expert)()
+                elif session.controller.state == "policy":
+                    session.controller.request_takeover()
+                    command = session.bridge_server.receiver.current()
+                    if command.eligible:
+                        session.controller.accept_expert(
+                            current_robot=tuple(float(value) for value in observation["observation.state"]),
+                            leader_command=command.command,
+                        )
+                        _clear_policy_queue(policy)
+                        recorder.record_snapshot("takeover", capture_snapshot(env, randomization={"strategy": "collection"}))
+        source = ActionSource.HOLD
+        provenance: dict[str, object] = {}
+        if session.controller.state == "policy":
+            action, request_id, chunk_offset = _policy_action(policy, observation)
+            source = ActionSource.POLICY
+            provenance = {"policy_request_id": request_id, "policy_chunk_offset": chunk_offset}
+        elif session.controller.state == "expert":
+            command = session.bridge_server.receiver.current()
+            if command.eligible:
+                action = tuple(float(value) for value in command.command)
+                last_safe = action
+                source = ActionSource.EXPERT
+                provenance = {"expert_sequence": command.sequence, "expert_sample_age_ms": command.sample_age_ms}
+                jitter_samples.append(float(getattr(session.bridge_server.receiver, "jitter_ms", 0.0)))
+            else:
+                action = last_safe
+                held += 1
+                stale_samples += int(command.reason == "stale_sample")
+                disconnected = disconnected or command.reason == "disconnected"
+        else:
+            action = last_safe
+            held += 1
+        safety = getattr(env, "is_action_safe", None)
+        if not callable(safety) or not bool(safety(action)):
+            unsafe_commands += 1
+        next_observation, reward, step_success = _step(env, action)
+        official_success = official_success or step_success
+        recorder.record_step(
+            observation, action, reward=reward, success=official_success, action_source=source,
+            segment=session.controller.segment, **provenance,
+        )
+        actions.append(action)
+        observation = next_observation
+    recorder.record_snapshot("terminal", capture_snapshot(env, randomization={"strategy": "collection"}))
+    quality = _attempt_quality(
+        thresholds=thresholds, official_success=official_success, actions=actions, step_dt_s=step_dt_s,
+        jitter_samples=jitter_samples, stale_samples=stale_samples, disconnected=disconnected,
+        holds=held, unsafe_commands=unsafe_commands, control_source=control_source, manual_discarded=discarded,
+    )
+    accepted = False
+    if accept_requested and official_success and quality.trainable and not held and not discarded and session.controller.state == "expert":
+        accepted = session.controller.accept(quality)
+    elif session.controller.state in {"policy", "takeover_pending", "expert"}:
+        session.controller.discard()
+    reasons = _rejection_reasons(quality, held=bool(held), discarded=discarded)
+    outcome = EpisodeOutcome(
+        "success" if official_success and not discarded else "discarded" if discarded else "timeout",
+        accepted,
+        QualityGrade(quality.grade),
+        () if accepted else reasons,
+        "accept" if accepted else "discard",
+    )
+    result = recorder.finish(outcome=outcome, controls=session.controls)
+    if accepted and session.controller.mode != "practice" and result.episode["trainable"] and result.expert_windows:
+        _write_export_receipt(recorder.writer.run_root, result)
+    return result
+
+
 def _write_session_manifest(root: Path, session: CollectorSession, args: argparse.Namespace) -> None:
     root.mkdir(parents=True, exist_ok=True)
     manifest = root / "session-manifest.json"
@@ -155,6 +471,23 @@ def _write_session_manifest(root: Path, session: CollectorSession, args: argpars
         "controls": CONTROLS,
         "session_nonce": session.session_nonce,
     }
+    identity = getattr(args, "collection_identity", None)
+    if identity is not None:
+        document["identity"] = {
+            "episode_id": identity.episode_id,
+            "policy_repo": identity.policy_repo,
+            "policy_revision": identity.policy_revision,
+            "policy_step": identity.policy_step,
+            "code_revision": identity.code_revision,
+            "asset_revision": identity.asset_revision,
+            "simulator_version": identity.simulator_version,
+            "garment_name": identity.garment_name,
+            "category": identity.category,
+            "release_stage": identity.release_stage,
+            "seed": identity.seed,
+            "instruction": identity.instruction,
+            "strategy": identity.strategy,
+        }
     if session.quality_thresholds is not None:
         document["quality_threshold_dataset"] = {
             "revision": session.quality_thresholds.dataset_revision,
@@ -210,6 +543,105 @@ def run_interactive(session: CollectorSession) -> None:  # pragma: no cover - op
         # an unvalidated command by itself.
 
 
+class BackgroundStdinControlSource(ScheduledControlSource):
+    """Nonblocking stdin reader; collection sampling never waits on terminal input."""
+
+    def __init__(self) -> None:  # pragma: no cover - operator path
+        super().__init__(())
+        import queue
+
+        self._queue: queue.SimpleQueue[str] = queue.SimpleQueue()
+
+        def read_controls() -> None:
+            while True:
+                try:
+                    control = input().strip().lower()
+                except EOFError:
+                    return
+                if control in CONTROLS:
+                    self._queue.put(control)
+                    if control == "escape":
+                        return
+
+        threading.Thread(target=read_controls, name="lehome-dagger-controls", daemon=True).start()
+
+    def poll(self) -> str | None:  # pragma: no cover - operator path
+        try:
+            return self._queue.get_nowait()
+        except Exception:
+            return None
+
+
+def _run_production_collection(args: argparse.Namespace, session: CollectorSession) -> RecordedEpisode:  # pragma: no cover - requires Isaac/GR00T
+    """Launch Isaac and GR00T only after strict argument validation completed."""
+    from isaaclab.app import AppLauncher
+    from scripts.eval_policy import PolicyRegistry
+    import scripts.eval_policy.groot_policy  # noqa: F401
+    from scripts.run_groot_flywheel_trial import _production_env
+    from scripts.utils import common
+
+    launch_parser = argparse.ArgumentParser(add_help=False)
+    AppLauncher.add_app_launcher_args(launch_parser)
+    launch_args, _ = launch_parser.parse_known_args([])
+    app = common.launch_app_from_args(launch_args)
+    env = None
+    try:
+        env = _production_env(args)
+        policy = PolicyRegistry.create("groot", model_path=str(args.policy_path), device=args.device, task_description="fold the garment on the table")
+        policy.reset()
+
+        class IsaacCollectionEnvironment:
+            """Narrow tuple-action seam over the registered Isaac task."""
+
+            # This task's registered control cadence is part of its task contract.
+            step_dt_s = 1.0 / 30.0
+
+            def reset(self):
+                env.reset()
+                return env._get_observations()
+
+            def step(self, action: tuple[float, ...]):
+                import torch
+
+                env.step(torch.tensor(action, dtype=torch.float32, device=args.device).unsqueeze(0))
+                reward = env._get_rewards()
+                success = env._get_success()
+                return env._get_observations(), float(reward.item() if hasattr(reward, "item") else reward), bool(success.item() if hasattr(success, "item") else success)
+
+            def flywheel_capture_state(self):
+                capture = getattr(env, "flywheel_capture_state", None)
+                if callable(capture):
+                    return capture()
+                # Match capture_snapshot's strict fallback surface. Missing state
+                # remains an error: a collector may not invent reset evidence.
+                return {
+                    name: getattr(env, name)
+                    for name in ("robot_position", "robot_velocity", "cloth_position", "cloth_velocity", "rng_state", "garment_name")
+                }
+
+            def is_action_safe(self, action: tuple[float, ...]) -> bool:
+                from lehome.assets.robots.lerobot import SO101_FOLLOWER_USD_JOINT_LIMLITS
+
+                limits = tuple(SO101_FOLLOWER_USD_JOINT_LIMLITS.values())
+                return all(
+                    math.isfinite(value) and math.radians(lower) <= value <= math.radians(upper)
+                    for arm in (action[:6], action[6:])
+                    for value, (lower, upper) in zip(arm, limits)
+                )
+
+        recorder = MixedSourceRecorder(
+            args.run_root,
+            identity=args.collection_identity,
+            mode=args.mode,
+            provenance={"policy_artifact_sha256": args.policy_artifact_sha256, "image_identity": args.image_identity},
+        )
+        return collect_episode(session, IsaacCollectionEnvironment(), policy, BackgroundStdinControlSource(), recorder, session.quality_thresholds, args.max_steps)
+    finally:
+        if env is not None and hasattr(env, "close"):
+            env.close()
+        common.close_app(app)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     session = prepare_session(args)
@@ -217,7 +649,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.interactive:
         session.start_listener()
         try:
-            run_interactive(session)
+            result = _run_production_collection(args, session)
+            print(json.dumps({"episode_id": result.path.name, "bc_target_count": result.episode["bc_target_count"], "trainable": result.episode["trainable"]}, sort_keys=True))
         finally:
             session.close_listener()
     return 0
