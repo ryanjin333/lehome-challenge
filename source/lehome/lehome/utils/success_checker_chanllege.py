@@ -6,6 +6,10 @@ from lehome.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+class InvalidCheckpointMetadataError(ValueError):
+    """Raised when released garment metadata references nonexistent mesh vertices."""
+
+
 def step_interval(interval=50):
     """Factory function: creates a customizable step interval decorator"""
 
@@ -51,6 +55,17 @@ def get_object_particle_position(particle_object, index_list):
         except Exception as e2:
             logger.error(f"Error in get_object_particle_position: {e2}")
             return
+
+    mesh_point_count = len(transformed_mesh_points)
+    invalid_indices = [
+        int(index) for index in index_list if index < 0 or index >= mesh_point_count
+    ]
+    if invalid_indices:
+        raise InvalidCheckpointMetadataError(
+            "garment checkpoint metadata references nonexistent mesh vertices: "
+            f"invalid_indices={invalid_indices}, mesh_point_count={mesh_point_count}"
+        )
+
     positions = (transformed_mesh_points[index_list] * 100).tolist()
     return positions
 
@@ -196,7 +211,18 @@ def success_checker_garment_fold(particle_object, garment_type: str):
     raw_success_distance = particle_object.success_distance  # list[int]
     current_scale = float(particle_object.init_scale[0])
     success_distance = [d * current_scale for d in raw_success_distance]
-    p = get_object_particle_position(particle_object, check_point_indices)
+    try:
+        p = get_object_particle_position(particle_object, check_point_indices)
+    except InvalidCheckpointMetadataError as error:
+        logger.error(f"Invalid garment checkpoint metadata: {error}")
+        return {
+            "success": False,
+            "garment_type": garment_type,
+            "thresholds": success_distance,
+            "details": {},
+            "metadata_valid": False,
+            "metadata_error": str(error),
+        }
 
     if garment_type == "top-long-sleeve" or garment_type == "top-short-sleeve":
         success, details = check_top_sleeve(p, success_distance)
@@ -212,6 +238,7 @@ def success_checker_garment_fold(particle_object, garment_type: str):
         "garment_type": garment_type,
         "thresholds": success_distance,
         "details": details,
+        "metadata_valid": True,
     }
 
     return result
