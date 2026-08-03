@@ -10,6 +10,7 @@ import sys
 from typing import Sequence
 
 import numpy as np
+from lehome.flywheel.artifacts import atomic_write_json
 
 
 _PINNED = re.compile(r"^[0-9a-f]{40}$")
@@ -192,12 +193,12 @@ def _manifest_path(args: argparse.Namespace, revision: str) -> Path:
     }
     if args.episode_id:
         payload["episode_id"] = args.episode_id
-    content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    content = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_file() or path.read_text(encoding="utf-8") != content:
             raise ValueError("refusing to overwrite differing flywheel manifest")
         return path
-    path.write_text(content, encoding="utf-8")
+    atomic_write_json(path, payload)
     return path
 
 

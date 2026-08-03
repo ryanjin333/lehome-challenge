@@ -4,8 +4,10 @@ import pytest
 
 import numpy as np
 
+import argparse
+
 from scripts.run_groot_flywheel_trial import (
-    build_parser, read_pinned_revision, run_randomization_acceptance,
+    _manifest_path, build_parser, read_pinned_revision, run_randomization_acceptance,
     run_snapshot_acceptance, validate_args,
 )
 
@@ -56,3 +58,13 @@ def test_acceptance_modes_write_real_orchestrated_reports(tmp_path) -> None:
     assert run_randomization_acceptance(args, env_factory=lambda _: FakeEnv(), image_writer=lambda path, frame: writes.append(path)) == 0
     assert len(writes) == 9
     assert (tmp_path / "randomization-receipts.json").is_file()
+
+
+def test_manifest_creation_is_atomic_and_immutable(tmp_path) -> None:
+    args = argparse.Namespace(output_root=tmp_path, policy_path=tmp_path, episode_id="episode-1", policy_repo="org/policy", policy_step=1, code_revision="b" * 40, asset_revision="c" * 40, simulator_version="isaac", garment="Pant_Long_Seen_0", category="pant_long", release_stage="seen", seed=1, strategy="canonical", policy_artifact_sha256="d" * 64, image_identity="sha256:image")
+    path = _manifest_path(args, "a" * 40)
+    assert _manifest_path(args, "a" * 40) == path
+    args.seed = 2
+    with pytest.raises(ValueError, match="overwrite"):
+        _manifest_path(args, "a" * 40)
+    assert not list(tmp_path.glob(".*.tmp"))
