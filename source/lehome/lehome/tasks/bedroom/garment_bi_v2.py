@@ -802,6 +802,7 @@ class GarmentEnv(DirectRLEnv):
             "robot_base_translation_m": tuple(float(value) for value in base_delta),
             "table_texture_id": int(values["table_texture_id"]),
             "table_texture_path": str(table_input.Get().path),
+            "table_shader_input": table_input.GetBaseName(),
             "garment_display_color": read_color,
         }
         if (
@@ -813,6 +814,8 @@ class GarmentEnv(DirectRLEnv):
             or not np.allclose(receipt["garment_display_color"], values["garment_display_color"], atol=1e-5)
         ):
             raise RuntimeError("flywheel randomization readback does not match sampled values")
+        from lehome.flywheel.randomization import validate_material_receipt
+        validate_material_receipt(values, receipt)
         self._flywheel_randomization_receipt = receipt
         return receipt
 

@@ -45,4 +45,18 @@ def sample_randomization(strategy: str, *, seed: int) -> RandomizationRecord:
     return RandomizationRecord(strategy, values)
 
 
+def validate_material_receipt(sampled: dict[str, object], receipt: dict[str, object]) -> None:
+    """Fail closed unless USD asset/color readback proves sampled material values."""
+    if not receipt.get("table_texture_path"):
+        raise RuntimeError("flywheel table texture asset is missing")
+    if receipt.get("table_shader_input") is None:
+        raise RuntimeError("flywheel table shader input is missing")
+    if receipt.get("garment_display_color") is None:
+        raise RuntimeError("flywheel garment displayColor is missing")
+    if receipt.get("table_texture_id") != sampled.get("table_texture_id"):
+        raise RuntimeError("flywheel table shader readback mismatch")
+    if tuple(receipt["garment_display_color"]) != tuple(sampled.get("garment_display_color", ())):
+        raise RuntimeError("flywheel garment displayColor readback mismatch")
+
+
 __all__ = ["BOUNDS", "RandomizationBounds", "sample_randomization"]
