@@ -9,7 +9,9 @@ module is the only conversion boundary between those two contracts.
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 from typing import Any, Mapping
+from uuid import uuid4
 
 import numpy as np
 
@@ -140,9 +142,9 @@ class ActionChunkQueue:
     """Small FIFO for consuming GR00T's action horizon between inferences."""
 
     def __init__(self) -> None:
-        self._pending: deque[np.ndarray] = deque()
+        self._pending: deque[QueuedAction] = deque()
 
-    def extend(self, chunk: np.ndarray) -> None:
+    def extend(self, chunk: np.ndarray, *, request_id: str = "legacy") -> None:
         values = np.asarray(chunk, dtype=np.float32)
         if values.ndim != 2 or values.shape[1] != _ACTION_DIMENSION:
             raise ValueError(
@@ -150,13 +152,35 @@ class ActionChunkQueue:
             )
         if not np.isfinite(values).all():
             raise ValueError("action chunk contains a non-finite value")
-        self._pending.extend(np.array(row, dtype=np.float32, copy=True) for row in values)
+        if not request_id:
+            raise ValueError("action request ID must be non-empty")
+        self._pending.extend(
+            QueuedAction(np.array(row, dtype=np.float32, copy=True), request_id, offset)
+            for offset, row in enumerate(values)
+        )
 
     def pop(self) -> np.ndarray | None:
+        queued = self.pop_with_provenance()
+        return None if queued is None else queued.value
+
+    def pop_with_provenance(self) -> "QueuedAction | None":
         return self._pending.popleft() if self._pending else None
+
+    def pop_with_provenance_required(self) -> "QueuedAction":
+        queued = self.pop_with_provenance()
+        if queued is None:
+            raise RuntimeError("action queue unexpectedly emptied")
+        return queued
 
     def clear(self) -> None:
         self._pending.clear()
+
+
+@dataclass(frozen=True, slots=True)
+class QueuedAction:
+    value: np.ndarray
+    request_id: str
+    chunk_offset: int
 
 
 @PolicyRegistry.register("groot")
@@ -197,19 +221,24 @@ class GrootPolicy(BasePolicy):
         self._policy.reset()
 
     def select_action(self, observation: Mapping[str, Any]) -> np.ndarray:
-        queued_action = self._action_queue.pop()
+        return self.select_action_with_provenance(observation).value
+
+    def select_action_with_provenance(self, observation: Mapping[str, Any]) -> QueuedAction:
+        queued_action = self._action_queue.pop_with_provenance()
         if queued_action is not None:
             return queued_action
+        request_id = uuid4().hex
         groot_observation = build_groot_observation(observation)
         action, _ = self._policy.get_action(groot_observation)
         action_chunk = flatten_groot_action_chunk(action)
-        self._action_queue.extend(action_chunk[1:])
-        return action_chunk[0]
+        self._action_queue.extend(action_chunk, request_id=request_id)
+        return self._action_queue.pop_with_provenance_required()
 
 
 __all__ = [
     "GrootPolicy",
     "ActionChunkQueue",
+    "QueuedAction",
     "build_groot_observation",
     "flatten_groot_action_chunk",
     "flatten_groot_action",

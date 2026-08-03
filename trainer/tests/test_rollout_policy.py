@@ -63,6 +63,16 @@ def test_action_chunk_queue_returns_each_step_then_refills():
     assert queue.pop() is None
 
 
+def test_action_queue_reports_request_and_offset():
+    module = _load_policy_module()
+    queue = module.ActionChunkQueue()
+    queue.extend(np.zeros((16, 12), dtype=np.float32), request_id="req-7")
+
+    item = queue.pop_with_provenance()
+
+    assert item.request_id == "req-7"
+    assert item.chunk_offset == 0
+
 def test_flatten_groot_action_chunk_rejects_non_contract_horizon():
     module = _load_policy_module()
     action = {

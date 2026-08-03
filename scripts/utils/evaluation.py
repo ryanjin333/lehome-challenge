@@ -1,5 +1,6 @@
 import os
 import argparse
+import json
 import gymnasium as gym
 import torch
 import numpy as np
@@ -28,6 +29,23 @@ from .common import stabilize_garment_after_reset
 from lehome.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _load_flywheel_manifest(path_value: str | None) -> dict[str, object] | None:
+    """Load the opt-in recorder contract without changing legacy evaluation."""
+    if path_value is None:
+        return None
+    path = Path(path_value)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("flywheel manifest must be a regular file")
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError("flywheel manifest must be valid JSON") from error
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("policy_revision"), str):
+        raise ValueError("flywheel manifest requires a policy_revision")
+    manifest["_path"] = path
+    return manifest
 
 
 def run_evaluation_loop(
@@ -98,6 +116,7 @@ def run_evaluation_loop(
         json_path = eval_dataset.root / "meta" / "garment_info.json"
 
     all_episode_metrics = []
+    flywheel_manifest = _load_flywheel_manifest(getattr(args, "flywheel_manifest", None))
     logger.info(f"Starting evaluation: {args.num_episodes} episodes")
     rate_limiter = RateLimiter(args.step_hz)
 
@@ -123,6 +142,16 @@ def run_evaluation_loop(
         extra_steps = 0
         success_flag = False
         success = torch.tensor(False)
+        recorder = None
+        terminal_reason = "horizon"
+        if flywheel_manifest is not None:
+            from lehome.flywheel.isaac_recorder import AutonomousRecorder
+
+            recorder = AutonomousRecorder(
+                Path(flywheel_manifest["_path"]).parent,
+                policy_revision=flywheel_manifest["policy_revision"],
+                episode_id=flywheel_manifest.get("episode_id"),
+            )
 
         for st in range(args.max_steps):
             if rate_limiter:
@@ -130,7 +159,14 @@ def run_evaluation_loop(
 
             # 3. Policy Inference (The core abstraction)
             # Input: Numpy Dict -> Output: Numpy Array
-            action_np = policy.select_action(observation_dict)
+            if recorder is None:
+                action_np = policy.select_action(observation_dict)
+                action_provenance = None
+            else:
+                if not hasattr(policy, "select_action_with_provenance"):
+                    raise ValueError("flywheel recording requires policy action provenance")
+                action_provenance = policy.select_action_with_provenance(observation_dict)
+                action_np = action_provenance.value
 
             # 4. Prepare Action for Environment (Tensor)
             # Convert numpy action to tensor for Isaac Lab
@@ -176,6 +212,16 @@ def run_evaluation_loop(
             if not success_flag:
                 episode_length += 1
 
+            if recorder is not None:
+                recorder.record_step(
+                    observation_dict,
+                    action.detach().cpu().numpy().squeeze(0),
+                    reward=reward,
+                    success=bool(success_flag),
+                    request_id=action_provenance.request_id,
+                    chunk_offset=action_provenance.chunk_offset,
+                )
+
             # Update Observation
             observation_dict = env._get_observations()
 
@@ -197,10 +243,14 @@ def run_evaluation_loop(
             if success_flag:
                 extra_steps -= 1
                 if extra_steps <= 0:
+                    terminal_reason = "success"
                     break
 
         # --- End of Episode Handling ---
         is_success = success.item() if success_flag else False
+
+        if recorder is not None:
+            recorder.finish(reason=terminal_reason, accepted_success=bool(is_success))
 
         # Save Datasets
         if args.save_datasets:
