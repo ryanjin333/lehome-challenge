@@ -15,6 +15,8 @@ def valid_handshake() -> Handshake:
         right_serial="right",
         left_calibration_sha256="a" * 64,
         right_calibration_sha256="b" * 64,
+        left_motor_limits=((0.0, 1.0),) * 6,
+        right_motor_limits=((0.0, 1.0),) * 6,
         hz=30,
     )
 
@@ -56,3 +58,12 @@ def test_loopback_server_refuses_public_bind() -> None:
         LoopbackBridgeServer(secret=b"x" * 32, session_nonce="nonce", host="0.0.0.0")
     server = LoopbackBridgeServer(secret=b"x" * 32, session_nonce="nonce")
     assert server.host == "127.0.0.1"
+
+
+def test_receiver_rejects_a_handshake_with_unexpected_motor_limits() -> None:
+    receiver = BridgeReceiver(
+        converter=lambda values: values,
+        expected_motor_limits=(((0.0, 2.0),) * 6, ((0.0, 1.0),) * 6),
+    )
+    with pytest.raises(ValueError, match="motor limits"):
+        receiver.accept_handshake(valid_handshake())

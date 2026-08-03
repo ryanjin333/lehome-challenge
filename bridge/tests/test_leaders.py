@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from lehome_bridge.client import read_secret_file
+from lehome_bridge.client import BridgeConnection, read_secret_file
 from lehome_bridge.leaders import JOINTS, DualLeaderReader
+from lehome_bridge.protocol import MessageVerifier
 
 
 class FakeBus:
@@ -55,6 +56,8 @@ def test_dual_reader_returns_left_then_right_joint_order(tmp_path: Path) -> None
     assert sample.positions == (0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15)
     assert sample.left_serial == "L1"
     assert sample.right_serial == "R1"
+    assert reader.left_motor_limits == ((-1000.0, 1000.0),) * 6
+    assert reader.right_motor_limits == ((-1000.0, 1000.0),) * 6
     assert left.reads == right.reads == 1
 
 
@@ -86,3 +89,27 @@ def test_secret_file_must_be_private_and_at_least_32_bytes(tmp_path: Path) -> No
     secret.chmod(0o644)
     with pytest.raises(ValueError, match="0600"):
         read_secret_file(secret)
+
+
+def test_connection_sends_exact_calibration_derived_motor_limits(tmp_path: Path) -> None:
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.frames: list[bytes] = []
+
+        def sendall(self, data: bytes) -> None:
+            self.frames.append(data)
+
+        def close(self) -> None:
+            pass
+
+    reader = DualLeaderReader(
+        FakeBus(serial="left", positions={name: 0 for name in JOINTS}),
+        FakeBus(serial="right", positions={name: 0 for name in JOINTS}),
+        left_calibration=calibration(tmp_path, "left"),
+        right_calibration=calibration(tmp_path, "right"),
+    )
+    socket = FakeSocket()
+    BridgeConnection(reader, secret=b"x" * 32, session_nonce="n", sock=socket).connect()
+    handshake = MessageVerifier(secret=b"x" * 32, expected_nonce="n").verify(socket.frames[0])
+    assert handshake.left_motor_limits == reader.left_motor_limits
+    assert handshake.right_motor_limits == reader.right_motor_limits

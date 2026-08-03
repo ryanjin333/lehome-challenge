@@ -80,6 +80,8 @@ class BridgeConnection:
                 right_serial=self.reader.right_bus.serial_identity,
                 left_calibration_sha256=self.reader.left_calibration.sha256,
                 right_calibration_sha256=self.reader.right_calibration.sha256,
+                left_motor_limits=self.reader.left_motor_limits,
+                right_motor_limits=self.reader.right_motor_limits,
                 hz=self.hz,
             )
         )

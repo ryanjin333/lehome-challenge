@@ -30,6 +30,21 @@ def _sha256(value: str, name: str) -> str:
     return value
 
 
+def _motor_limits(values: Iterable[Iterable[object]], name: str) -> tuple[tuple[float, float], ...]:
+    pairs = tuple(tuple(pair) for pair in values)
+    if len(pairs) != 6:
+        raise ValueError(f"{name} motor limits must contain six ordered (min,max) pairs")
+    limits: list[tuple[float, float]] = []
+    for pair in pairs:
+        if len(pair) != 2 or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in pair):
+            raise ValueError(f"{name} motor limits must contain finite (min,max) pairs")
+        lower, upper = float(pair[0]), float(pair[1])
+        if lower >= upper:
+            raise ValueError(f"{name} motor limits require min < max")
+        limits.append((lower, upper))
+    return tuple(limits)
+
+
 @dataclass(frozen=True, slots=True)
 class BridgeMessage:
     """A protocol-v1 handshake or leader sample; the secret is never a field."""
@@ -43,6 +58,8 @@ class BridgeMessage:
     right_serial: str | None = None
     left_calibration_sha256: str | None = None
     right_calibration_sha256: str | None = None
+    left_motor_limits: tuple[tuple[float, float], ...] | None = None
+    right_motor_limits: tuple[tuple[float, float], ...] | None = None
     hz: int | None = None
     protocol_version: int = PROTOCOL_VERSION
 
@@ -65,6 +82,10 @@ class BridgeMessage:
                 raise ValueError("leader serial identities must be distinct")
             _sha256(self.left_calibration_sha256 or "", "left calibration hash")
             _sha256(self.right_calibration_sha256 or "", "right calibration hash")
+            if self.left_motor_limits is None or self.right_motor_limits is None:
+                raise ValueError("handshake motor limits are required")
+            object.__setattr__(self, "left_motor_limits", _motor_limits(self.left_motor_limits, "left"))
+            object.__setattr__(self, "right_motor_limits", _motor_limits(self.right_motor_limits, "right"))
             if not isinstance(self.hz, int) or self.hz <= 0:
                 raise ValueError("handshake hz must be a positive integer")
             if self.positions is not None or self.monotonic_ns is not None:
@@ -77,8 +98,8 @@ class BridgeMessage:
             if self.positions is None:
                 raise ValueError("sample positions are required")
             object.__setattr__(self, "positions", _finite_12(self.positions))
-            if any(value is not None for value in (self.left_serial, self.right_serial, self.left_calibration_sha256, self.right_calibration_sha256, self.hz)):
-                raise ValueError("sample must not repeat handshake identity")
+            if any(value is not None for value in (self.left_serial, self.right_serial, self.left_calibration_sha256, self.right_calibration_sha256, self.left_motor_limits, self.right_motor_limits, self.hz)):
+                raise ValueError("sample must not repeat handshake identity or motor limits")
 
     @classmethod
     def handshake(
@@ -90,6 +111,8 @@ class BridgeMessage:
         right_serial: str,
         left_calibration_sha256: str,
         right_calibration_sha256: str,
+        left_motor_limits: Iterable[Iterable[object]],
+        right_motor_limits: Iterable[Iterable[object]],
         hz: int,
     ) -> "BridgeMessage":
         return cls(
@@ -100,6 +123,8 @@ class BridgeMessage:
             right_serial=right_serial,
             left_calibration_sha256=left_calibration_sha256,
             right_calibration_sha256=right_calibration_sha256,
+            left_motor_limits=_motor_limits(left_motor_limits, "left"),
+            right_motor_limits=_motor_limits(right_motor_limits, "right"),
             hz=hz,
         )
 
@@ -127,8 +152,10 @@ class BridgeMessage:
                 hz=self.hz,
                 left_calibration_sha256=self.left_calibration_sha256,
                 left_serial=self.left_serial,
+                left_motor_limits=[list(pair) for pair in self.left_motor_limits or ()],
                 right_calibration_sha256=self.right_calibration_sha256,
                 right_serial=self.right_serial,
+                right_motor_limits=[list(pair) for pair in self.right_motor_limits or ()],
             )
         else:
             result.update(monotonic_ns=self.monotonic_ns, positions=list(self.positions or ()))
@@ -148,7 +175,7 @@ class BridgeMessage:
         if decoded["protocol_version"] != PROTOCOL_VERSION:
             raise ValueError("unsupported bridge protocol version")
         if decoded["kind"] == "handshake":
-            expected = required | {"left_serial", "right_serial", "left_calibration_sha256", "right_calibration_sha256", "hz"}
+            expected = required | {"left_serial", "right_serial", "left_calibration_sha256", "right_calibration_sha256", "left_motor_limits", "right_motor_limits", "hz"}
             if set(decoded) != expected:
                 raise ValueError("invalid handshake fields")
             return cls(**decoded)

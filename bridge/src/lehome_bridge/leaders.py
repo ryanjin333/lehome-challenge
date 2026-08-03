@@ -32,6 +32,7 @@ class LeaderBus(Protocol):
 class CalibrationIdentity:
     path: Path
     sha256: str
+    motor_limits: tuple[tuple[float, float], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +62,8 @@ def _load_calibration(path: Path) -> CalibrationIdentity:
             raise ValueError("leader calibration range is invalid")
     with path.open("rb") as calibration_file:
         digest = hashlib.file_digest(calibration_file, "sha256").hexdigest()
-    return CalibrationIdentity(path=path, sha256=digest)
+    motor_limits = tuple((float(parsed[joint]["range_min"]), float(parsed[joint]["range_max"])) for joint in JOINTS)
+    return CalibrationIdentity(path=path, sha256=digest, motor_limits=motor_limits)
 
 
 def _finite_positions(values: tuple[object, ...]) -> tuple[float, ...]:
@@ -87,6 +89,8 @@ class DualLeaderReader:
         self.right_bus = right_bus
         self.left_calibration = _load_calibration(Path(left_calibration))
         self.right_calibration = _load_calibration(Path(right_calibration))
+        self.left_motor_limits = self.left_calibration.motor_limits
+        self.right_motor_limits = self.right_calibration.motor_limits
 
     def read(self) -> LeaderSample:
         left = self.left_bus.sync_read("Present_Position")

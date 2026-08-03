@@ -21,6 +21,21 @@ def _finite_12(values: Iterable[object], *, field: str) -> tuple[float, ...]:
     return tuple(float(value) for value in result)
 
 
+def _motor_limits(values: Iterable[Iterable[object]], *, field: str) -> tuple[tuple[float, float], ...]:
+    pairs = tuple(tuple(pair) for pair in values)
+    if len(pairs) != 6:
+        raise ValueError(f"{field} must contain six ordered (min,max) pairs")
+    result: list[tuple[float, float]] = []
+    for pair in pairs:
+        if len(pair) != 2 or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in pair):
+            raise ValueError(f"{field} must contain finite (min,max) pairs")
+        lower, upper = float(pair[0]), float(pair[1])
+        if lower >= upper:
+            raise ValueError(f"{field} requires min < max")
+        result.append((lower, upper))
+    return tuple(result)
+
+
 @dataclass(frozen=True, slots=True)
 class Handshake:
     session_nonce: str
@@ -29,6 +44,8 @@ class Handshake:
     right_serial: str
     left_calibration_sha256: str
     right_calibration_sha256: str
+    left_motor_limits: tuple[tuple[float, float], ...]
+    right_motor_limits: tuple[tuple[float, float], ...]
     hz: int
 
     def __post_init__(self) -> None:
@@ -41,6 +58,8 @@ class Handshake:
         for value in (self.left_calibration_sha256, self.right_calibration_sha256):
             if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
                 raise ValueError("bridge handshake calibration hash is invalid")
+        object.__setattr__(self, "left_motor_limits", _motor_limits(self.left_motor_limits, field="left motor limits"))
+        object.__setattr__(self, "right_motor_limits", _motor_limits(self.right_motor_limits, field="right motor limits"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +118,7 @@ class BridgeReceiver:
         max_jitter_ms: float = 30.0,
         converter: Callable[[tuple[float, ...]], Iterable[object]] | None = None,
         expected_calibrations: tuple[str, str] | None = None,
+        expected_motor_limits: tuple[Iterable[Iterable[object]], Iterable[Iterable[object]]] | None = None,
     ) -> None:
         if not math.isfinite(max_age_ms) or max_age_ms <= 0:
             raise ValueError("max_age_ms must be positive and finite")
@@ -108,6 +128,14 @@ class BridgeReceiver:
         self.max_jitter_ms = max_jitter_ms
         self.converter = converter or _canonical_so101_converter
         self.expected_calibrations = expected_calibrations
+        self.expected_motor_limits = (
+            None
+            if expected_motor_limits is None
+            else (
+                _motor_limits(expected_motor_limits[0], field="expected left motor limits"),
+                _motor_limits(expected_motor_limits[1], field="expected right motor limits"),
+            )
+        )
         self.handshake: Handshake | None = None
         self.last_sample: RecordedExpertSample | None = None
         self.last_safe_command: tuple[float, ...] = (0.0,) * 12
@@ -124,6 +152,11 @@ class BridgeReceiver:
             handshake.right_calibration_sha256,
         ) != self.expected_calibrations:
             raise ValueError("bridge calibration is incompatible with this collection session")
+        if self.expected_motor_limits is not None and (
+            handshake.left_motor_limits,
+            handshake.right_motor_limits,
+        ) != self.expected_motor_limits:
+            raise ValueError("bridge motor limits are incompatible with this collection session")
         self.handshake = handshake
         self.disconnected = False
 
@@ -278,6 +311,8 @@ class LoopbackBridgeServer:
                             message.right_serial,
                             message.left_calibration_sha256,
                             message.right_calibration_sha256,
+                            message.left_motor_limits,
+                            message.right_motor_limits,
                             message.hz,
                         )
                     )
