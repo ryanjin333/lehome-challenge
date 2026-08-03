@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+try:  # Python 3.11 provides the canonical implementation.
+    from enum import StrEnum
+except ImportError:  # pragma: no cover - exercised by the trainer's Python 3.10 runtime.
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        """Minimal 3.10 compatibility equivalent of :class:`enum.StrEnum`."""
+
+        def __str__(self) -> str:
+            return str(self.value)
 import math
 import re
 from types import MappingProxyType
