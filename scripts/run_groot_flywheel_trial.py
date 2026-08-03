@@ -57,6 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> str:
+    if args.snapshot_roundtrip_only and args.render_randomization_sheet:
+        raise ValueError("acceptance modes are mutually exclusive")
     acceptance_mode = args.snapshot_roundtrip_only or args.render_randomization_sheet
     revision = args.policy_revision
     if args.policy_revision_file is not None:
@@ -154,7 +156,8 @@ def run_randomization_acceptance(args: argparse.Namespace, *, env_factory=_produ
             env.reset()
             record = sample_randomization(strategy, seed=args.seed + index)
             receipt = env.apply_flywheel_randomization(record)
-            if any(receipt.get(key) != value for key, value in record.values.items()): raise RuntimeError(f"{strategy} randomization readback mismatch")
+            from lehome.flywheel.randomization import validate_randomization_receipt
+            validate_randomization_receipt(dict(record.values), dict(receipt))
             env.render()
             images = _images(env)
             paths = []

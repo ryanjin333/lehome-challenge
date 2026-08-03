@@ -138,8 +138,8 @@ def run_evaluation_loop(
             strategy = flywheel_manifest.get("strategy", "canonical")
             sampled = sample_randomization(strategy, seed=flywheel_manifest.get("seed", args.seed))
             randomization_receipt = env.apply_flywheel_randomization(sampled)
-            if dict(randomization_receipt) != dict(sampled.values):
-                raise RuntimeError("flywheel randomization readback mismatch")
+            from lehome.flywheel.randomization import validate_randomization_receipt
+            validate_randomization_receipt(dict(sampled.values), dict(randomization_receipt))
             identity = EpisodeIdentity(**flywheel_manifest["identity"])
             recorder = AutonomousRecorder(
                 Path(flywheel_manifest["_path"]).parent,

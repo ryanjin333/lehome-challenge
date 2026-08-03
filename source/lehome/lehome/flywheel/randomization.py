@@ -59,4 +59,20 @@ def validate_material_receipt(sampled: dict[str, object], receipt: dict[str, obj
         raise RuntimeError("flywheel garment displayColor readback mismatch")
 
 
+def validate_randomization_receipt(sampled: dict[str, object], receipt: dict[str, object]) -> None:
+    """Require every sampled value and only the defined USD proof metadata."""
+    extras = {"table_texture_path", "table_shader_input"}
+    if set(receipt) - set(sampled) - extras or set(sampled) - set(receipt):
+        raise RuntimeError("flywheel randomization receipt fields do not match sample")
+    for key, expected in sampled.items():
+        actual = receipt[key]
+        if isinstance(expected, (tuple, list)):
+            if not np.allclose(actual, expected, atol=1e-5): raise RuntimeError("flywheel randomization readback mismatch")
+        elif isinstance(expected, float):
+            if not np.isclose(actual, expected, atol=1e-5): raise RuntimeError("flywheel randomization readback mismatch")
+        elif actual != expected: raise RuntimeError("flywheel randomization readback mismatch")
+    if sampled:
+        validate_material_receipt(sampled, receipt)
+
+
 __all__ = ["BOUNDS", "RandomizationBounds", "sample_randomization"]

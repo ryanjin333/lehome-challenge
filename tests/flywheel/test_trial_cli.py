@@ -40,7 +40,10 @@ class FakeEnv:
         self.cloth_velocity = np.asarray(snapshot.cloth_velocity, dtype=np.float32)
         self.rng_state = snapshot.rng_state
     def _get_observations(self): return {f"observation.images.{name}": np.zeros((4, 4, 3), dtype=np.uint8) for name in ("top_rgb", "left_rgb", "right_rgb")}
-    def apply_flywheel_randomization(self, record): return dict(record.values)
+    def apply_flywheel_randomization(self, record):
+        receipt = dict(record.values)
+        if receipt: receipt.update(table_texture_path="/assets/table.png", table_shader_input="file")
+        return receipt
     def close(self): pass
 
 
