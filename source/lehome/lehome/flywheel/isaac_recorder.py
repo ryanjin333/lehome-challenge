@@ -83,6 +83,8 @@ class AutonomousRecorder:
         self.policy_revision = policy_revision
         if identity is not None and identity.policy_revision != policy_revision:
             raise ValueError("recorder identity policy revision does not match")
+        if identity is not None and identity.episode_id != self.writer.episode_id:
+            raise ValueError("recorder identity episode ID does not match writer")
         self.identity = identity
         self.video_sink = _VideoSink()
         self.step = 0
@@ -153,6 +155,7 @@ class AutonomousRecorder:
         }
         if self.identity is not None:
             episode["identity"] = {
+                "episode_id": self.identity.episode_id,
                 "policy_repo": self.identity.policy_repo, "policy_revision": self.identity.policy_revision,
                 "policy_step": self.identity.policy_step, "code_revision": self.identity.code_revision,
                 "asset_revision": self.identity.asset_revision, "simulator_version": self.identity.simulator_version,

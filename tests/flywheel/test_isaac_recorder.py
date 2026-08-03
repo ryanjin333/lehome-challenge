@@ -6,6 +6,7 @@ import numpy as np
 
 from lehome.flywheel.isaac_recorder import AutonomousRecorder
 from lehome.flywheel.snapshots import Snapshot
+from lehome.flywheel.models import EpisodeIdentity
 
 
 def observation() -> dict[str, np.ndarray]:
@@ -39,3 +40,10 @@ def test_recorder_checksum_covers_reset_and_terminal_snapshots(tmp_path) -> None
     final = recorder.finish(reason="horizon", accepted_success=False)
     manifest = json.loads((final.path / "SHA256SUMS.json").read_text(encoding="utf-8"))
     assert "snapshots/reset.json" in manifest and "snapshots/terminal.json" in manifest
+
+
+def test_recorder_rejects_identity_with_a_different_episode_id(tmp_path) -> None:
+    identity = EpisodeIdentity("other", "repo", "a" * 40, 1, "b" * 40, "c" * 40, "isaac", "Pant_Long_Seen_0", "pant_long", "seen", 1, "fold the garment on the table", "canonical")
+    import pytest
+    with pytest.raises(ValueError, match="episode ID"):
+        AutonomousRecorder(tmp_path, policy_revision="a" * 40, episode_id="episode", identity=identity)

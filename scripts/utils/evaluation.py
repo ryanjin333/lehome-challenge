@@ -131,6 +131,7 @@ def run_evaluation_loop(
         randomization_receipt = {}
         if flywheel_manifest is not None:
             from lehome.flywheel.isaac_recorder import AutonomousRecorder
+            from lehome.flywheel.models import EpisodeIdentity
             from lehome.flywheel.randomization import sample_randomization
             from lehome.flywheel.snapshots import capture_snapshot
 
@@ -139,10 +140,12 @@ def run_evaluation_loop(
             randomization_receipt = env.apply_flywheel_randomization(sampled)
             if dict(randomization_receipt) != dict(sampled.values):
                 raise RuntimeError("flywheel randomization readback mismatch")
+            identity = EpisodeIdentity(**flywheel_manifest["identity"])
             recorder = AutonomousRecorder(
                 Path(flywheel_manifest["_path"]).parent,
                 policy_revision=flywheel_manifest["policy_revision"],
                 episode_id=flywheel_manifest.get("episode_id"),
+                identity=identity,
             )
             reset_snapshot = capture_snapshot(env, randomization={"strategy": strategy, "sampled": dict(sampled.values), "receipt": dict(randomization_receipt)})
             recorder.record_snapshot("reset", reset_snapshot)

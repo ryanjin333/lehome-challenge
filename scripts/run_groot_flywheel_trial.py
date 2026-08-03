@@ -13,6 +13,7 @@ import numpy as np
 
 
 _PINNED = re.compile(r"^[0-9a-f]{40}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def read_pinned_revision(path: Path) -> str:
@@ -34,6 +35,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episode-id")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--strategy", choices=("canonical", "mild", "strong"), default="canonical")
+    parser.add_argument("--policy-repo")
+    parser.add_argument("--policy-step", type=int)
+    parser.add_argument("--code-revision")
+    parser.add_argument("--asset-revision")
+    parser.add_argument("--simulator-version")
+    parser.add_argument("--category", choices=("top_long", "top_short", "pant_long", "pant_short"))
+    parser.add_argument("--release-stage", choices=("seen", "public_unseen"))
+    parser.add_argument("--policy-artifact-sha256")
+    parser.add_argument("--image-identity")
     parser.add_argument("--output-root", type=Path, default=Path("outputs/flywheel"))
     parser.add_argument("--task", default="LeHome-BiSO101-Direct-Garment-v2")
     parser.add_argument("--max-steps", type=int, default=600)
@@ -65,7 +75,19 @@ def validate_args(args: argparse.Namespace) -> str:
         raise ValueError("seed must be non-negative and max-steps must be positive")
     if any(strategy not in {"canonical", "mild", "strong"} for strategy in args.strategies):
         raise ValueError("unsupported randomization strategy")
+    if not acceptance_mode:
+        build_identity(args, revision)
     return revision or ""
+
+
+def build_identity(args: argparse.Namespace, revision: str):
+    from lehome.flywheel.models import EpisodeIdentity
+    values = (args.episode_id, args.policy_repo, args.policy_step, args.code_revision, args.asset_revision, args.simulator_version, args.garment, args.category, args.release_stage, args.policy_artifact_sha256, args.image_identity)
+    if any(value is None or value == "" for value in values):
+        raise ValueError("normal flywheel trials require complete immutable provenance")
+    if not _SHA256.fullmatch(args.policy_artifact_sha256):
+        raise ValueError("policy artifact SHA-256 must be a 64-character lowercase digest")
+    return EpisodeIdentity(args.episode_id, args.policy_repo, revision, args.policy_step, args.code_revision, args.asset_revision, args.simulator_version, args.garment, args.category, args.release_stage, args.seed, "fold the garment on the table", args.strategy)
 
 
 def _production_env(args: argparse.Namespace):
@@ -153,6 +175,7 @@ def _manifest_path(args: argparse.Namespace, revision: str) -> Path:
     args.output_root.mkdir(parents=True, exist_ok=True)
     suffix = f"-{args.episode_id}" if args.episode_id else ""
     path = args.output_root / f"flywheel-manifest{suffix}.json"
+    identity = build_identity(args, revision)
     payload = {
         "schema_version": 1,
         "policy_revision": revision,
@@ -160,6 +183,9 @@ def _manifest_path(args: argparse.Namespace, revision: str) -> Path:
         "seed": args.seed,
         "garment": args.garment,
         "strategy": args.strategy,
+        "identity": {"episode_id": identity.episode_id, "policy_repo": identity.policy_repo, "policy_revision": identity.policy_revision, "policy_step": identity.policy_step, "code_revision": identity.code_revision, "asset_revision": identity.asset_revision, "simulator_version": identity.simulator_version, "garment_name": identity.garment_name, "category": identity.category, "release_stage": identity.release_stage, "seed": identity.seed, "instruction": identity.instruction, "strategy": identity.strategy},
+        "policy_artifact_sha256": args.policy_artifact_sha256,
+        "image_identity": args.image_identity,
     }
     if args.episode_id:
         payload["episode_id"] = args.episode_id
