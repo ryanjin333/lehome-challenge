@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Mapping
 
 from lehome_train.constants import MODEL_REVISION
+from lehome_train.flywheel.augmentation import (
+    augmentation_profile as resolve_augmentation_profile,
+    validated_augmentation_receipt,
+)
 
 
 ACTION_HORIZON = 16
@@ -58,6 +63,8 @@ class FineTuneLaunchConfig:
     weight_decay: float = 1e-5
     dataloader_num_workers: int = 4
     save_total_limit: int = 5
+    augmentation_profile: str = "none"
+    augmentation_receipt: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -112,6 +119,14 @@ class FineTuneLaunchConfig:
                 raise ValueError(f"{field_name} must be positive")
         if not isinstance(self.warmup_ratio, (float, int)) or not 0 < self.warmup_ratio < 1:
             raise ValueError("warmup_ratio must be a fraction strictly between zero and one")
+        profile = resolve_augmentation_profile(
+            self.augmentation_profile, receipt=self.augmentation_receipt
+        )
+        canonical_receipt = validated_augmentation_receipt(
+            profile.name, self.augmentation_receipt
+        )
+        object.__setattr__(self, "augmentation_profile", profile.name)
+        object.__setattr__(self, "augmentation_receipt", canonical_receipt)
 
     def identity(self) -> dict[str, object]:
         """Return command-relevant provenance without secret environment data."""
@@ -142,4 +157,9 @@ class FineTuneLaunchConfig:
             "weight_decay": float(self.weight_decay),
             "dataloader_num_workers": self.dataloader_num_workers,
             "num_gpus": self.num_gpus,
+            "augmentation_profile": self.augmentation_profile,
+            "augmentation_profile_sha256": resolve_augmentation_profile(
+                self.augmentation_profile, receipt=self.augmentation_receipt
+            ).sha256,
+            "augmentation_receipt": self.augmentation_receipt,
         }

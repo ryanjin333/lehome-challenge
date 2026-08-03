@@ -3,7 +3,9 @@ from __future__ import annotations
 import pytest
 
 from lehome_train.constants import MODEL_REVISION
+from lehome_train.flywheel.augmentation import augmentation_profile
 from lehome_train.groot.config import FineTuneLaunchConfig
+from lehome_train.io import canonical_json_sha256
 
 
 REVISION = "a" * 40
@@ -27,6 +29,25 @@ def config(**overrides: object) -> FineTuneLaunchConfig:
     return FineTuneLaunchConfig(**values)
 
 
+def canonical_holdout_receipt() -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "schema_version": 1,
+        "canonical_holdout_id": "lehome-canonical-holdout-v1",
+        "dataset_revision": "a" * 40,
+        "policy_revision": "b" * 40,
+        "evaluation_manifest_sha256": "c" * 64,
+        "mild_profile_sha256": augmentation_profile("mild").sha256,
+        "metric_name": "success_rate",
+        "metric_direction": "higher_is_better",
+        "baseline_metric": 0.80,
+        "candidate_metric": 0.79,
+        "max_allowed_regression": 0.02,
+        "non_regression_passed": True,
+    }
+    receipt["receipt_sha256"] = canonical_json_sha256(receipt)
+    return receipt
+
+
 def test_config_enforces_single_gpu_fixed_batch_horizon_and_freezing() -> None:
     resolved = config()
 
@@ -41,6 +62,36 @@ def test_config_enforces_single_gpu_fixed_batch_horizon_and_freezing() -> None:
     assert resolved.base_model_revision == MODEL_REVISION
     assert resolved.identity()["lr_scheduler_type"] == "cosine"
     assert resolved.identity()["decay_semantics"] == "cosine_remainder_after_warmup"
+    assert resolved.identity()["augmentation_profile"] == "none"
+    assert resolved.identity()["augmentation_profile_sha256"] == augmentation_profile("none").sha256
+
+
+def test_config_records_augmentation_profile_hash_and_strict_gate_receipt() -> None:
+    reference = config(
+        augmentation_profile="nvidia_reference",
+        augmentation_receipt=canonical_holdout_receipt(),
+    )
+
+    assert reference.identity()["augmentation_profile"] == "nvidia_reference"
+    assert reference.identity()["augmentation_profile_sha256"] == augmentation_profile(
+        "nvidia_reference", receipt=canonical_holdout_receipt()
+    ).sha256
+    assert reference.identity()["augmentation_receipt"] == canonical_holdout_receipt()
+
+
+def test_config_identity_changes_when_augmentation_profile_changes() -> None:
+    assert config().identity() != config(augmentation_profile="mild").identity()
+
+
+def test_config_rejects_nvidia_reference_without_a_valid_receipt() -> None:
+    with pytest.raises(ValueError, match="canonical-holdout receipt"):
+        config(augmentation_profile="nvidia_reference")
+
+    with pytest.raises(ValueError, match="secret"):
+        config(
+            augmentation_profile="nvidia_reference",
+            augmentation_receipt={**canonical_holdout_receipt(), "token": "nope"},
+        )
 
 
 @pytest.mark.parametrize(

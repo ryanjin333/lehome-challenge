@@ -80,6 +80,63 @@ def test_build_launch_uses_only_pinned_official_entrypoint_and_redacts_token(
     assert "hf_" not in " ".join(launch.command)
 
 
+def test_build_launch_passes_color_jitter_as_eight_official_cli_tokens(
+    official_checkout: Path,
+) -> None:
+    launch = build_launch(
+        config(augmentation_profile="mild"),
+        visible_devices="0",
+        environment={},
+        official_checkout=official_checkout,
+    )
+
+    index = launch.command.index("--color-jitter-params")
+    assert launch.command[index + 1 : index + 9] == (
+        "brightness",
+        "0.2",
+        "contrast",
+        "0.2",
+        "saturation",
+        "0.2",
+        "hue",
+        "0.05",
+    )
+    assert len(launch.command[index + 1 : index + 9]) == 8
+
+
+def test_build_launch_keeps_none_augmentation_absent(
+    official_checkout: Path,
+) -> None:
+    launch = build_launch(
+        config(), visible_devices="0", environment={}, official_checkout=official_checkout
+    )
+    assert "--color-jitter-params" not in launch.command
+
+
+def test_launch_identity_rejects_augmentation_hash_drift(
+    tmp_path: Path,
+    official_checkout: Path,
+) -> None:
+    output = tmp_path / "experiment"
+    expected = config(output_dir=str(output), augmentation_profile="mild")
+    effective = output / expected.experiment_name
+    effective.mkdir(parents=True)
+    identity = expected.identity()
+    identity["augmentation_profile_sha256"] = "0" * 64
+    (effective / "lehome_launch.json").write_text(
+        __import__("json").dumps(identity), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="incompatible experiment"):
+        launch_finetune(
+            expected,
+            visible_devices="0",
+            environment={},
+            official_checkout=official_checkout,
+            runner=lambda *_args, **_kwargs: pytest.fail("runner must not execute"),
+        )
+
+
 @pytest.mark.parametrize("visible_devices", ["", "0,1", "0, 1", "NoDevFiles"])
 def test_build_launch_refuses_zero_or_multiple_visible_gpus(
     visible_devices: str,
@@ -240,6 +297,26 @@ def test_identity_is_written_to_effective_official_experiment_directory(
     assert completed.returncode == 0
     assert not (output / "lehome_launch.json").exists()
     assert (output / "lehome-groot-baseline" / "lehome_launch.json").is_file()
+
+
+def test_launch_identity_never_persists_parent_environment_secrets(
+    tmp_path: Path,
+    official_checkout: Path,
+) -> None:
+    output = tmp_path / "output-root"
+    launch_finetune(
+        config(output_dir=str(output)),
+        visible_devices="0",
+        environment={"HF_TOKEN": "hf_must_not_be_persisted", "PATH": "/bin"},
+        official_checkout=official_checkout,
+        runner=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0),
+    )
+
+    persisted = (output / "lehome-groot-baseline" / "lehome_launch.json").read_text(
+        encoding="utf-8"
+    )
+    assert "HF_TOKEN" not in persisted
+    assert "hf_must_not_be_persisted" not in persisted
 
 
 def test_chunk_launch_wraps_same_pinned_entrypoint_and_strips_token(

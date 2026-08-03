@@ -11,6 +11,7 @@ import subprocess
 from typing import Callable, Mapping, Sequence
 
 from lehome_train.constants import ISAAC_GROOT_REVISION
+from lehome_train.flywheel.augmentation import augmentation_profile, color_jitter_cli
 from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.io import atomic_write_json
 
@@ -156,6 +157,11 @@ def build_launch(
         "--no-tune-visual",
         "--tune-projector",
         "--tune-diffusion-model",
+        *color_jitter_cli(
+            augmentation_profile(
+                config.augmentation_profile, receipt=config.augmentation_receipt
+            )
+        ),
     )
     return OfficialLaunch(
         command=command,
