@@ -149,6 +149,7 @@ class GarmentEnv(DirectRLEnv):
 
         self.texture_cfg = self.particle_config.objects.get("texture_randomization", {})
         self.light_cfg = self.particle_config.objects.get("light_randomization", {})
+        self.flywheel_randomization_cfg = self.particle_config.objects.get("flywheel_randomization", {})
         logger.debug(
             f"[GarmentEnv] Loaded texture_cfg: {bool(self.texture_cfg)}, light_cfg: {bool(self.light_cfg)}"
         )
@@ -705,6 +706,83 @@ class GarmentEnv(DirectRLEnv):
             )
         )
         self._flywheel_randomization_receipt = dict(snapshot.randomization)
+
+    def apply_flywheel_randomization(self, randomization) -> dict[str, object]:
+        """Apply opt-in rollout perturbations and return values read back from Isaac.
+
+        This method is intentionally fail-closed: a caller must not write a
+        randomized manifest when any configured simulator property cannot be
+        applied and observed again.
+        """
+        values = dict(randomization.values if hasattr(randomization, "values") else randomization)
+        if not values:
+            self._flywheel_randomization_receipt = {}
+            return {}
+        expected = {
+            "light_intensity_scale",
+            "camera_translation_m",
+            "garment_yaw_deg",
+            "robot_base_translation_m",
+        }
+        if set(values) != expected:
+            raise ValueError("flywheel randomization receipt has unsupported fields")
+        if self.object is None:
+            raise RuntimeError("cannot randomize an uninitialized garment")
+        camera_delta = np.asarray(values["camera_translation_m"], dtype=np.float32)
+        base_delta = np.asarray(values["robot_base_translation_m"], dtype=np.float32)
+        if camera_delta.shape != (3,) or base_delta.shape != (3,):
+            raise ValueError("flywheel translation randomization must be 3-D")
+        stage = self.scene.stage
+        light_path = self.flywheel_randomization_cfg.get("light_prim_path", "/World/Light")
+        light = stage.GetPrimAtPath(light_path)
+        if not light.IsValid():
+            raise RuntimeError(f"flywheel light prim is missing: {light_path}")
+        intensity_attr = light.GetAttribute("inputs:intensity")
+        base_intensity = intensity_attr.Get()
+        if base_intensity is None:
+            raise RuntimeError("flywheel light intensity is unreadable")
+        intensity_attr.Set(float(base_intensity) * float(values["light_intensity_scale"]))
+
+        for camera in (self.top_camera, self.left_camera, self.right_camera):
+            if not hasattr(camera, "set_world_poses") or not hasattr(camera.data, "pos_w"):
+                raise RuntimeError("Isaac camera does not expose restorable world pose")
+            positions = camera.data.pos_w + torch.tensor(camera_delta, device=self.device).unsqueeze(0)
+            camera.set_world_poses(positions, camera.data.quat_w)
+            actual = camera.data.pos_w.detach().cpu().numpy()[0]
+            if not np.allclose(actual, positions.detach().cpu().numpy()[0], atol=1e-5):
+                raise RuntimeError("Isaac camera pose readback did not match requested randomization")
+
+        pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
+        pose[5] += float(values["garment_yaw_deg"])
+        self.object.set_all_pose({"Garment": pose})
+        if not np.isclose(float(self.object.reset_pose[5]), float(pose[5]), atol=1e-5):
+            raise RuntimeError("garment yaw readback did not match requested randomization")
+
+        for arm in (self.left_arm, self.right_arm):
+            if not hasattr(arm, "write_root_pose_to_sim") or not hasattr(arm.data, "root_pos_w"):
+                raise RuntimeError("Isaac robot base does not expose restorable world pose")
+            position = arm.data.root_pos_w + torch.tensor(base_delta, device=self.device).unsqueeze(0)
+            root_pose = torch.cat((position, arm.data.root_quat_w), dim=-1)
+            arm.write_root_pose_to_sim(root_pose)
+            actual = arm.data.root_pos_w.detach().cpu().numpy()[0]
+            if not np.allclose(actual, position.detach().cpu().numpy()[0], atol=1e-5):
+                raise RuntimeError("robot base pose readback did not match requested randomization")
+
+        receipt = {
+            "light_intensity_scale": float(intensity_attr.Get()) / float(base_intensity),
+            "camera_translation_m": tuple(float(value) for value in camera_delta),
+            "garment_yaw_deg": float(self.object.reset_pose[5] - (pose[5] - float(values["garment_yaw_deg"]))),
+            "robot_base_translation_m": tuple(float(value) for value in base_delta),
+        }
+        if (
+            not np.isclose(receipt["light_intensity_scale"], values["light_intensity_scale"], atol=1e-5)
+            or not np.allclose(receipt["camera_translation_m"], values["camera_translation_m"], atol=1e-5)
+            or not np.isclose(receipt["garment_yaw_deg"], values["garment_yaw_deg"], atol=1e-5)
+            or not np.allclose(receipt["robot_base_translation_m"], values["robot_base_translation_m"], atol=1e-5)
+        ):
+            raise RuntimeError("flywheel randomization readback does not match sampled values")
+        self._flywheel_randomization_receipt = receipt
+        return receipt
 
     def switch_garment(self, garment_name: str, garment_version: str = None):
         """Switch to a different garment without recreating the environment.

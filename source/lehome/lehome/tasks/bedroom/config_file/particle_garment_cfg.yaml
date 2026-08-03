@@ -68,3 +68,8 @@ objects:
     prim_path: "/World/Light"
     intensity_range: [3500, 5000]
     color_range: [0.0, 0.2]
+
+  # Flywheel collection is explicitly opt-in; normal challenge reset stays canonical.
+  flywheel_randomization:
+    enable: False
+    light_prim_path: "/World/Light"
