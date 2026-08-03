@@ -7,13 +7,15 @@ import math
 from pathlib import Path
 import subprocess
 import time
-from typing import Mapping
+from typing import Iterable, Mapping
 from uuid import uuid4
 
 import numpy as np
 
 from .artifacts import EpisodeArtifactWriter, atomic_write_json
-from .models import ActionSource, EpisodeFrame, EpisodeIdentity
+from .export import ExpertWindow, SelectionReport, build_selection_report, select_expert_windows
+from .models import ActionSource, EpisodeFrame, EpisodeIdentity, EpisodeOutcome, QualityGrade
+from .snapshots import Snapshot
 
 
 _CAMERAS = ("top_rgb", "left_rgb", "right_rgb")
@@ -71,36 +73,82 @@ class RecordedEpisode:
     path: Path
     episode: dict[str, object]
     annotations: tuple[dict[str, object], ...]
+    expert_windows: tuple[ExpertWindow, ...] = ()
+    selection_report: SelectionReport | None = None
 
 
-class AutonomousRecorder:
-    """Record exactly the actions handed to one Isaac environment's ``step``."""
+def _validate_provenance(provenance: Mapping[str, object] | None) -> dict[str, object]:
+    result = dict(provenance or {})
+    digest = result.get("policy_artifact_sha256")
+    image = result.get("image_identity")
+    if result and (not isinstance(digest, str) or len(digest) != 64 or not isinstance(image, str) or not image):
+        raise ValueError("recorder provenance requires artifact SHA-256 and image identity")
+    if any("secret" in key.lower() or "token" in key.lower() or "env" in key.lower() for key in result):
+        raise ValueError("recorder provenance must not contain secrets or raw environment")
+    return result
 
-    def __init__(self, run_root: Path, *, policy_revision: str, episode_id: str | None = None, identity: EpisodeIdentity | None = None, provenance: Mapping[str, object] | None = None) -> None:
+
+def _identity_payload(identity: EpisodeIdentity) -> dict[str, object]:
+    return {
+        "episode_id": identity.episode_id,
+        "policy_repo": identity.policy_repo, "policy_revision": identity.policy_revision,
+        "policy_step": identity.policy_step, "code_revision": identity.code_revision,
+        "asset_revision": identity.asset_revision, "simulator_version": identity.simulator_version,
+        "garment_name": identity.garment_name, "category": identity.category,
+        "release_stage": identity.release_stage, "seed": identity.seed,
+        "instruction": identity.instruction, "strategy": identity.strategy,
+    }
+
+
+class MixedSourceRecorder:
+    """Atomic raw recorder for policy, expert, and hold action-source segments."""
+
+    def __init__(
+        self,
+        run_root: Path,
+        *,
+        identity: EpisodeIdentity | None = None,
+        policy_revision: str | None = None,
+        episode_id: str | None = None,
+        provenance: Mapping[str, object] | None = None,
+        mode: str,
+        horizon: int = 16,
+        max_expert_sample_age_ms: float | None = None,
+        require_identity: bool = True,
+    ) -> None:
+        if mode not in {"autonomous", "practice", "expert", "dagger"}:
+            raise ValueError("recorder mode is unsupported")
+        if require_identity and identity is None:
+            raise ValueError("mixed-source recorder requires a validated episode identity")
+        policy_revision = identity.policy_revision if identity is not None else policy_revision
+        if policy_revision is None:
+            raise ValueError("policy_revision is required")
         if len(policy_revision) != 40 or any(char not in "0123456789abcdef" for char in policy_revision):
             raise ValueError("policy_revision must be a pinned 40-character revision")
-        self.writer = EpisodeArtifactWriter(run_root, episode_id or f"episode-{uuid4().hex}")
+        if not isinstance(horizon, int) or horizon <= 0:
+            raise ValueError("expert selection horizon must be positive")
+        if max_expert_sample_age_ms is not None and (
+            not isinstance(max_expert_sample_age_ms, (int, float)) or max_expert_sample_age_ms < 0
+        ):
+            raise ValueError("maximum expert sample age must be non-negative")
+        self.writer = EpisodeArtifactWriter(run_root, episode_id or (identity.episode_id if identity is not None else f"episode-{uuid4().hex}"))
         self.policy_revision = policy_revision
+        self.mode = mode
+        self.horizon = horizon
+        self.max_expert_sample_age_ms = max_expert_sample_age_ms
         if identity is not None and identity.policy_revision != policy_revision:
             raise ValueError("recorder identity policy revision does not match")
         if identity is not None and identity.episode_id != self.writer.episode_id:
             raise ValueError("recorder identity episode ID does not match writer")
         self.identity = identity
-        self.provenance = dict(provenance or {})
-        digest = self.provenance.get("policy_artifact_sha256")
-        image = self.provenance.get("image_identity")
-        if self.provenance and (not isinstance(digest, str) or len(digest) != 64 or not isinstance(image, str) or not image):
-            raise ValueError("recorder provenance requires artifact SHA-256 and image identity")
-        if any("secret" in key.lower() or "token" in key.lower() or "env" in key.lower() for key in self.provenance):
-            raise ValueError("recorder provenance must not contain secrets or raw environment")
+        self.provenance = _validate_provenance(provenance)
         self.video_sink = _VideoSink()
         self.step = 0
         self._annotations: list[dict[str, object]] = []
+        self._frames: list[EpisodeFrame] = []
+        self._snapshots: set[str] = set()
+        self._expert_started = False
         self._finished = False
-
-    @classmethod
-    def for_test(cls, run_root: Path, *, policy_revision: str) -> "AutonomousRecorder":
-        return cls(run_root, policy_revision=policy_revision, episode_id="episode-test")
 
     def record_step(
         self,
@@ -109,13 +157,35 @@ class AutonomousRecorder:
         *,
         reward: float,
         success: bool,
-        request_id: str,
-        chunk_offset: int,
+        action_source: ActionSource,
+        segment: int,
+        policy_request_id: str | None = None,
+        policy_chunk_offset: int | None = None,
+        expert_sequence: int | None = None,
+        expert_sample_age_ms: float | None = None,
     ) -> None:
         if self._finished:
             raise ValueError("recorder has already finished")
-        if not request_id or not isinstance(chunk_offset, int) or chunk_offset < 0:
-            raise ValueError("policy request provenance is invalid")
+        if not isinstance(action_source, ActionSource):
+            raise ValueError("action_source must be an ActionSource")
+        if action_source is ActionSource.POLICY:
+            if not policy_request_id or not isinstance(policy_chunk_offset, int) or policy_chunk_offset < 0:
+                raise ValueError("policy source requires request ID and chunk offset")
+            if expert_sequence is not None or expert_sample_age_ms is not None:
+                raise ValueError("policy source forbids expert provenance")
+            if self.mode == "dagger" and self._expert_started:
+                raise ValueError("DAgger policy source cannot resume after expert takeover")
+        elif action_source is ActionSource.EXPERT:
+            if not isinstance(expert_sequence, int) or expert_sequence < 0 or not isinstance(expert_sample_age_ms, (int, float)) or expert_sample_age_ms < 0 or not math.isfinite(expert_sample_age_ms):
+                raise ValueError("expert source requires sequence and finite sample age")
+            if policy_request_id is not None or policy_chunk_offset is not None:
+                raise ValueError("expert source forbids policy provenance")
+            if self.mode == "dagger" and "takeover" not in self._snapshots:
+                raise ValueError("DAgger expert source requires a takeover snapshot")
+            self._expert_started = True
+        else:
+            if any(value is not None for value in (policy_request_id, policy_chunk_offset, expert_sequence, expert_sample_age_ms)):
+                raise ValueError("hold source forbids policy and expert provenance")
         if not isinstance(reward, (int, float)) or not math.isfinite(reward):
             raise ValueError("reward must be finite")
         frame = EpisodeFrame(
@@ -124,61 +194,130 @@ class AutonomousRecorder:
             wall_time_ns=time.time_ns(),
             state=finite_vector(observation["observation.state"], size=12, name="state"),
             action=finite_vector(action, size=12, name="action"),
-            action_source=ActionSource.POLICY,
+            action_source=action_source,
             reward=float(reward),
             success=bool(success),
-            segment=0,
-            policy_request_id=request_id,
-            policy_chunk_offset=chunk_offset,
+            segment=segment,
+            policy_request_id=policy_request_id,
+            policy_chunk_offset=policy_chunk_offset,
+            expert_sequence=expert_sequence,
+            expert_sample_age_ms=float(expert_sample_age_ms) if expert_sample_age_ms is not None else None,
         )
+        if frame.step != len(self._frames):
+            raise ValueError("recorder frame step continuity is invalid")
         annotation = asdict(frame)
         annotation["action_source"] = frame.action_source.value
         self.writer.append_annotation(annotation)
         self._annotations.append(annotation)
+        self._frames.append(frame)
         self.video_sink.append(observation)
         self.step += 1
 
-    def record_snapshot(self, name: str, snapshot) -> None:
-        if self._finished or name not in {"reset", "terminal"}:
-            raise ValueError("snapshot name must be reset or terminal before finalization")
+    def record_snapshot(self, name: str, snapshot: Snapshot) -> None:
+        if self._finished or name not in {"reset", "takeover", "terminal"}:
+            raise ValueError("snapshot name must be reset, takeover, or terminal before finalization")
+        if not isinstance(snapshot, Snapshot):
+            raise ValueError("recorder snapshots must use the validated Snapshot schema")
         payload = snapshot.to_dict()
         directory = self.writer.staging / "snapshots"
         directory.mkdir(exist_ok=True)
         atomic_write_json(directory / f"{name}.json", payload)
+        self._snapshots.add(name)
 
-    def finish(self, *, reason: str, accepted_success: bool) -> RecordedEpisode:
+    def _encode_videos(self) -> tuple[str, ...]:
+        if any(self.video_sink.count(camera) != self.step for camera in _CAMERAS):
+            raise ValueError("video frame count does not match annotation count")
+        return self.video_sink.encode(self.writer.staging)
+
+    def _base_episode(self) -> dict[str, object]:
+        episode: dict[str, object] = {"policy_revision": self.policy_revision}
+        if self.identity is not None:
+            episode["identity"] = _identity_payload(self.identity)
+        if self.provenance:
+            episode["provenance"] = self.provenance
+        return episode
+
+    def finish(self, *, outcome: EpisodeOutcome, controls: Iterable[str]) -> RecordedEpisode:
+        """Finalize raw evidence and expose only in-memory eligible expert windows."""
+        if self._finished:
+            raise ValueError("recorder has already finished")
+        if not isinstance(outcome, EpisodeOutcome):
+            raise ValueError("recorder finish requires a validated EpisodeOutcome")
+        controls = tuple(controls)
+        if not all(isinstance(control, str) and control for control in controls):
+            raise ValueError("recorder controls must be non-empty strings")
+        self._finished = True
+        diagnostic_reasons: list[str] = []
+        candidate = outcome.accepted and outcome.outcome == "success" and outcome.quality_grade in {QualityGrade.A, QualityGrade.B} and not outcome.rejection_reasons and self.mode != "practice"
+        if not candidate:
+            diagnostic_reasons.append("outcome_not_trainable")
+        if candidate:
+            for required in ("reset", "terminal"):
+                if required not in self._snapshots:
+                    diagnostic_reasons.append(f"missing_{required}_snapshot")
+            if self.mode == "dagger" and "takeover" not in self._snapshots:
+                diagnostic_reasons.append("missing_takeover_snapshot")
+        required_videos: tuple[str, ...] = ()
+        if candidate and not diagnostic_reasons:
+            try:
+                required_videos = self._encode_videos()
+            except Exception as error:
+                diagnostic_reasons.append("video_encoding_failed")
+                recorder_error = str(error)
+            else:
+                recorder_error = None
+        else:
+            recorder_error = None
+        trainable = candidate and not diagnostic_reasons
+        windows = select_expert_windows(
+            self._frames,
+            horizon=self.horizon,
+            accepted_success=trainable,
+            max_expert_sample_age_ms=self.max_expert_sample_age_ms,
+        )
+        report = build_selection_report(
+            self._frames,
+            horizon=self.horizon,
+            accepted_success=trainable,
+            max_expert_sample_age_ms=self.max_expert_sample_age_ms,
+        )
+        episode = self._base_episode() | {
+            "mode": self.mode,
+            "outcome": outcome.outcome,
+            "accepted_success": trainable,
+            "quality_grade": outcome.quality_grade.value,
+            "rejection_reasons": [reason.value for reason in outcome.rejection_reasons],
+            "operator_disposition": outcome.operator_disposition,
+            "controls": list(controls),
+            "trainable": trainable,
+            "bc_target_count": len(windows),
+            "selection_report": report.as_dict(),
+        }
+        if diagnostic_reasons:
+            episode["diagnostic"] = True
+            episode["diagnostic_reasons"] = diagnostic_reasons
+        if recorder_error is not None:
+            episode["recorder_error"] = recorder_error
+        path = self.writer.finalize(episode, required_videos=required_videos)
+        return RecordedEpisode(path=path, episode=episode | {"episode_id": path.name}, annotations=tuple(self._annotations), expert_windows=windows, selection_report=report)
+
+    def finish_autonomous(self, *, reason: str, accepted_success: bool) -> RecordedEpisode:
+        """Compatibility finalizer preserving autonomous diagnostic semantics."""
         if self._finished:
             raise ValueError("recorder has already finished")
         if not reason:
             raise ValueError("terminal reason is required")
         self._finished = True
-        episode: dict[str, object] = {
-            "policy_revision": self.policy_revision,
+        episode = self._base_episode() | {
             "terminal_reason": reason,
             "accepted_success": bool(accepted_success),
             "outcome": "success" if accepted_success else "timeout",
-            # Autonomous policy data is diagnostic evidence, never an initial BC target.
             "bc_target_count": 0,
         }
-        if self.identity is not None:
-            episode["identity"] = {
-                "episode_id": self.identity.episode_id,
-                "policy_repo": self.identity.policy_repo, "policy_revision": self.identity.policy_revision,
-                "policy_step": self.identity.policy_step, "code_revision": self.identity.code_revision,
-                "asset_revision": self.identity.asset_revision, "simulator_version": self.identity.simulator_version,
-                "garment_name": self.identity.garment_name, "category": self.identity.category,
-                "release_stage": self.identity.release_stage, "seed": self.identity.seed,
-                "instruction": self.identity.instruction, "strategy": self.identity.strategy,
-            }
-        if self.provenance:
-            episode["provenance"] = self.provenance
         required_videos: tuple[str, ...] = ()
         try:
-            if any(self.video_sink.count(camera) != self.step for camera in _CAMERAS):
-                raise ValueError("video frame count does not match annotation count")
-            required_videos = self.video_sink.encode(self.writer.staging)
+            required_videos = self._encode_videos()
         except Exception as error:
-            # Preserve a terminal diagnostic episode even when a local encoder fails.
             episode["outcome"] = "error"
             episode["accepted_success"] = False
             episode["recorder_error"] = str(error)
@@ -186,4 +325,46 @@ class AutonomousRecorder:
         return RecordedEpisode(path=path, episode=episode | {"episode_id": path.name}, annotations=tuple(self._annotations))
 
 
-__all__ = ["AutonomousRecorder", "RecordedEpisode", "finite_vector"]
+class AutonomousRecorder:
+    """Compatibility facade delegating atomic capture to :class:`MixedSourceRecorder`."""
+
+    def __init__(self, run_root: Path, *, policy_revision: str, episode_id: str | None = None, identity: EpisodeIdentity | None = None, provenance: Mapping[str, object] | None = None) -> None:
+        self._recorder = MixedSourceRecorder(
+            run_root,
+            policy_revision=policy_revision,
+            episode_id=episode_id,
+            identity=identity,
+            provenance=provenance,
+            mode="autonomous",
+            require_identity=False,
+        )
+        self.writer = self._recorder.writer
+        self.policy_revision = self._recorder.policy_revision
+        self.identity = self._recorder.identity
+        self.provenance = self._recorder.provenance
+        self.video_sink = self._recorder.video_sink
+
+    @property
+    def step(self) -> int:
+        return self._recorder.step
+
+    @classmethod
+    def for_test(cls, run_root: Path, *, policy_revision: str) -> "AutonomousRecorder":
+        return cls(run_root, policy_revision=policy_revision, episode_id="episode-test")
+
+    def record_step(self, observation: Mapping[str, object], action: object, *, reward: float, success: bool, request_id: str, chunk_offset: int) -> None:
+        self._recorder.record_step(
+            observation, action, reward=reward, success=success, action_source=ActionSource.POLICY,
+            segment=0, policy_request_id=request_id, policy_chunk_offset=chunk_offset,
+        )
+
+    def record_snapshot(self, name: str, snapshot: Snapshot) -> None:
+        if name not in {"reset", "terminal"}:
+            raise ValueError("snapshot name must be reset or terminal before finalization")
+        self._recorder.record_snapshot(name, snapshot)
+
+    def finish(self, *, reason: str, accepted_success: bool) -> RecordedEpisode:
+        return self._recorder.finish_autonomous(reason=reason, accepted_success=accepted_success)
+
+
+__all__ = ["AutonomousRecorder", "MixedSourceRecorder", "RecordedEpisode", "finite_vector"]
