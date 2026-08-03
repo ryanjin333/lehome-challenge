@@ -56,7 +56,11 @@ def _trial_command(args: argparse.Namespace, trial: Trial) -> list[str]:
 def _run_one_worker(args: argparse.Namespace, *, worker_id: int, trial: Trial) -> int:
     worker_root = args.output_root / "workers" / f"worker-{worker_id:02d}"
     heartbeat = worker_root / "heartbeat.json"
-    log_path = worker_root / f"{trial.trial_id}.log"
+    attempt = 1
+    log_path = worker_root / f"{trial.trial_id}.attempt-{attempt:03d}.log"
+    while log_path.exists():
+        attempt += 1
+        log_path = worker_root / f"{trial.trial_id}.attempt-{attempt:03d}.log"
     _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="started")
     with log_path.open("x", encoding="utf-8") as log:
         process = subprocess.Popen(_trial_command(args, trial), stdout=log, stderr=subprocess.STDOUT)
@@ -186,7 +190,7 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
         "workers": records,
         "completed_after": [trial_id for trial_id in state.trial_ids if trial_id not in pending_trial_ids(state)],
     }
-    if args.capacity_sweep:
+    if args.capacity_sweep and not args.dry_run:
         counts = _validate_sweep(args.capacity_sweep)
         samples: list[CapacitySample] = []
         capacity_records: list[dict[str, object]] = []
@@ -210,6 +214,8 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
                 break
         decision = choose_worker_count(samples)
         report["capacity"] = {"requested": list(counts), "samples": capacity_records, "accepted_workers": decision.accepted_workers, "rejected": decision.rejected}
+    elif args.capacity_sweep:
+        report["capacity"] = {"requested": list(_validate_sweep(args.capacity_sweep)), "status": "dry_run_no_processes"}
     (args.output_root / "capacity-report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report
 

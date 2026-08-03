@@ -9,6 +9,8 @@ import re
 import sys
 from typing import Sequence
 
+import numpy as np
+
 
 _PINNED = re.compile(r"^[0-9a-f]{40}$")
 
@@ -24,7 +26,7 @@ def read_pinned_revision(path: Path) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--policy-path", type=Path, required=True)
+    parser.add_argument("--policy-path", type=Path)
     parser.add_argument("--policy-revision")
     parser.add_argument("--policy-revision-file", type=Path)
     parser.add_argument("--matrix", type=Path)
@@ -44,14 +46,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> str:
+    acceptance_mode = args.snapshot_roundtrip_only or args.render_randomization_sheet
     revision = args.policy_revision
     if args.policy_revision_file is not None:
         if revision is not None:
             raise ValueError("provide one policy revision source")
         revision = read_pinned_revision(args.policy_revision_file)
-    if not isinstance(revision, str) or not _PINNED.fullmatch(revision):
+    if not acceptance_mode and (not isinstance(revision, str) or not _PINNED.fullmatch(revision)):
         raise ValueError("policy revision must be pinned to a 40-character SHA")
-    if not args.policy_path.exists() or not args.policy_path.is_dir():
+    if not acceptance_mode and (args.policy_path is None or not args.policy_path.exists() or not args.policy_path.is_dir()):
         raise ValueError("policy path must be an existing directory")
     if args.matrix is not None and (args.matrix.is_symlink() or not args.matrix.is_file()):
         raise ValueError("matrix must be an existing regular file")
@@ -61,7 +64,88 @@ def validate_args(args: argparse.Namespace) -> str:
         raise ValueError("seed must be non-negative and max-steps must be positive")
     if any(strategy not in {"canonical", "mild", "strong"} for strategy in args.strategies):
         raise ValueError("unsupported randomization strategy")
-    return revision
+    return revision or ""
+
+
+def _production_env(args: argparse.Namespace):
+    """Construct the normal registered Isaac task lazily, only after AppLauncher."""
+    import gymnasium as gym
+    from isaaclab_tasks.utils import parse_env_cfg
+    import lehome.tasks.bedroom  # noqa: F401
+    cfg = parse_env_cfg(args.task, device=args.device)
+    cfg.sim.use_fabric = False
+    cfg.use_random_seed = False
+    cfg.seed = args.seed
+    cfg.garment_name = args.garment or cfg.garment_name
+    cfg.garment_version = "Release"
+    env = gym.make(args.task, cfg=cfg).unwrapped
+    env.initialize_obs()
+    env.reset()
+    return env
+
+
+def _images(env) -> dict[str, np.ndarray]:
+    observations = env._get_observations()
+    return {key.rsplit(".", 1)[-1]: np.asarray(observations[f"observation.images.{key.rsplit('.', 1)[-1]}"]) for key in ("top_rgb", "left_rgb", "right_rgb")}
+
+
+def _write_report(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def run_snapshot_acceptance(args: argparse.Namespace, *, env_factory=_production_env) -> int:
+    from lehome.flywheel.snapshots import capture_snapshot, restore_snapshot
+    report: dict[str, object] = {"garment": args.garment, "seed": args.seed, "tolerance": 1e-5, "passed": False}
+    args.output_root.mkdir(parents=True, exist_ok=True)
+    env = None
+    try:
+        env = env_factory(args)
+        before = _images(env)
+        snapshot = capture_snapshot(env, randomization={"strategy": "canonical"})
+        env.reset()
+        restore_snapshot(env, snapshot)
+        env.render()
+        after = _images(env)
+        difference = max(float(np.max(np.abs(before[name].astype(float) - after[name].astype(float)))) for name in before)
+        report.update({"camera_difference": difference, "restore_coverage": ["robot", "cloth", "rng", "garment", "randomization"], "passed": difference <= report["tolerance"]})
+    except Exception as error:
+        report["simulation_error"] = str(error)
+    finally:
+        if env is not None and hasattr(env, "close"): env.close()
+        _write_report(args.output_root / "snapshot-acceptance.json", report)
+    return 0 if report["passed"] else 1
+
+
+def run_randomization_acceptance(args: argparse.Namespace, *, env_factory=_production_env, image_writer=None) -> int:
+    from lehome.flywheel.randomization import sample_randomization
+    if image_writer is None:
+        def image_writer(path, frame):
+            import cv2
+            if not cv2.imwrite(str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)): raise RuntimeError(f"failed to write {path}")
+    args.output_root.mkdir(parents=True, exist_ok=True)
+    report: dict[str, object] = {"seed": args.seed, "strategies": [], "passed": False}
+    env = None
+    try:
+        env = env_factory(args)
+        for index, strategy in enumerate(args.strategies):
+            env.reset()
+            record = sample_randomization(strategy, seed=args.seed + index)
+            receipt = env.apply_flywheel_randomization(record)
+            if dict(receipt) != dict(record.values): raise RuntimeError(f"{strategy} randomization readback mismatch")
+            env.render()
+            images = _images(env)
+            paths = []
+            for camera, frame in images.items():
+                path = args.output_root / f"randomization-{strategy}-{camera}.png"
+                image_writer(path, frame); paths.append(path.name)
+            report["strategies"].append({"strategy": strategy, "sampled": dict(record.values), "receipt": dict(receipt), "images": paths})
+        report["passed"] = len(report["strategies"]) * 3 == 9
+    except Exception as error:
+        report["simulation_error"] = str(error)
+    finally:
+        if env is not None and hasattr(env, "close"): env.close()
+        _write_report(args.output_root / "randomization-receipts.json", report)
+    return 0 if report["passed"] else 1
 
 
 def _manifest_path(args: argparse.Namespace, revision: str) -> Path:
@@ -83,9 +167,18 @@ def _manifest_path(args: argparse.Namespace, revision: str) -> Path:
 
 def run_trial(args: argparse.Namespace) -> int:
     revision = validate_args(args)
-    manifest = _manifest_path(args, revision)
     if args.snapshot_roundtrip_only or args.render_randomization_sheet:
-        raise RuntimeError("Isaac acceptance modes require the accepted Linux Isaac runtime")
+        # These modes use the same launched Isaac process as normal evaluation.
+        from isaaclab.app import AppLauncher
+        from scripts.utils import common
+        parser = argparse.ArgumentParser(add_help=False); AppLauncher.add_app_launcher_args(parser)
+        launch_args, _ = parser.parse_known_args([])
+        app = common.launch_app_from_args(launch_args)
+        try:
+            return run_snapshot_acceptance(args) if args.snapshot_roundtrip_only else run_randomization_acceptance(args)
+        finally:
+            common.close_app(app)
+    manifest = _manifest_path(args, revision)
     command = [
         "--policy_type", "groot", "--policy_path", str(args.policy_path),
         "--garment_type", "custom", "--num_episodes", "1", "--max_steps", str(args.max_steps),
