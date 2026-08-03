@@ -13,6 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from lehome_train.data.convert import LEGACY_DATA_PATH, LEGACY_VIDEO_PATH, _validate_output_video
+from lehome_train.data.inspect import artifact_identities
 from lehome_train.data.mapping import FIXED_INSTRUCTION, JOINT_NAMES
 from lehome_train.io import atomic_write_json, canonical_json_bytes, canonical_json_sha256
 from lehome_train.io import sha256_file
@@ -113,10 +114,15 @@ def _eligible_windows(rows: tuple[dict[str, object], ...]) -> tuple[list[dict[st
         by_step[step] = row
     windows = select_expert_windows(frames, horizon=ACTION_HORIZON, accepted_success=True)
     report = build_selection_report(frames, horizon=ACTION_HORIZON, accepted_success=True)
-    selected = [{"state": _vector(by_step[window.observation_step]["state"], label="state"),
-                 "action": _vector(by_step[window.observation_step]["action"], label="action"),
-                 "step": window.observation_step, "future_actions": [list(action) for action in window.future_actions]}
-                for window in windows]
+    selected = [
+        {
+            "step": window.observation_step,
+            "source_steps": list(range(window.observation_step, window.observation_step + ACTION_HORIZON)),
+            "states": [_vector(by_step[step]["state"], label="state") for step in range(window.observation_step, window.observation_step + ACTION_HORIZON)],
+            "actions": [list(action) for action in window.future_actions],
+        }
+        for window in windows
+    ]
     return selected, report.as_dict()
 
 
@@ -166,26 +172,29 @@ def materialize_episode(raw_root: str | Path, output_root: str | Path) -> Materi
         raise ValueError("accepted episode contains no complete expert windows")
     output.mkdir(parents=True)
     try:
-        data_path = output / LEGACY_DATA_PATH.format(episode_chunk=0, episode_index=0)
-        data_path.parent.mkdir(parents=True)
-        pq.write_table(pa.table({"observation.state": pa.array([item["state"] for item in selected], type=pa.list_(pa.float32(), 12)),
-                                 "action": pa.array([item["action"] for item in selected], type=pa.list_(pa.float32(), 12)),
-                                 "timestamp": pa.array([index / 30 for index in range(len(selected))], type=pa.float32()),
-                                 "frame_index": pa.array(range(len(selected)), type=pa.int64()),
-                                 "episode_index": pa.array([0] * len(selected), type=pa.int64()),
-                                 "index": pa.array(range(len(selected)), type=pa.int64()),
-                                 "task_index": pa.array([0] * len(selected), type=pa.int64())}), data_path, compression="zstd")
-        steps = [item["step"] for item in selected]
-        for camera in CAMERA_KEYS:
-            _copy_selected_video(raw_root / "videos" / f"{camera}.mp4", output / LEGACY_VIDEO_PATH.format(episode_chunk=0, episode_index=0, video_key=camera), steps=steps)
+        global_index = 0
+        for episode_index, item in enumerate(selected):
+            data_path = output / LEGACY_DATA_PATH.format(episode_chunk=0, episode_index=episode_index)
+            data_path.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(pa.table({"observation.state": pa.array(item["states"], type=pa.list_(pa.float32(), 12)),
+                                     "action": pa.array(item["actions"], type=pa.list_(pa.float32(), 12)),
+                                     "timestamp": pa.array([index / 30 for index in range(ACTION_HORIZON)], type=pa.float32()),
+                                     "frame_index": pa.array(range(ACTION_HORIZON), type=pa.int64()),
+                                     "episode_index": pa.array([episode_index] * ACTION_HORIZON, type=pa.int64()),
+                                     "index": pa.array(range(global_index, global_index + ACTION_HORIZON), type=pa.int64()),
+                                     "task_index": pa.array([0] * ACTION_HORIZON, type=pa.int64())}), data_path, compression="zstd")
+            for camera in CAMERA_KEYS:
+                _copy_selected_video(raw_root / "videos" / f"{camera}.mp4", output / LEGACY_VIDEO_PATH.format(episode_chunk=0, episode_index=episode_index, video_key=camera), steps=item["source_steps"])
+            global_index += ACTION_HORIZON
         meta = output / "meta"
         meta.mkdir()
-        atomic_write_json(meta / "info.json", {"codebase_version": "v2.1", "robot_type": "dual_so101_follower", "total_episodes": 1, "total_frames": len(selected), "total_tasks": 1, "total_videos": 3, "total_chunks": 1, "chunks_size": 1000, "fps": 30, "data_path": LEGACY_DATA_PATH, "video_path": LEGACY_VIDEO_PATH, "features": {}})
-        _write_lines(meta / "episodes.jsonl", [{"episode_index": 0, "length": len(selected), "task_index": 0}])
-        _write_lines(meta / "episodes_stats.jsonl", [{"episode_index": 0, "stats": {}}])
+        atomic_write_json(meta / "info.json", {"codebase_version": "v2.1", "robot_type": "dual_so101_follower", "total_episodes": len(selected), "total_frames": global_index, "total_tasks": 1, "total_videos": len(selected) * 3, "total_chunks": 1, "chunks_size": 1000, "fps": 30, "data_path": LEGACY_DATA_PATH, "video_path": LEGACY_VIDEO_PATH, "features": {}})
+        _write_lines(meta / "episodes.jsonl", [{"episode_index": index, "length": ACTION_HORIZON, "task_index": 0} for index in range(len(selected))])
+        _write_lines(meta / "episodes_stats.jsonl", [{"episode_index": index, "stats": {}} for index in range(len(selected))])
         _write_lines(meta / "tasks.jsonl", [{"task_index": 0, "task": FIXED_INSTRUCTION}])
-        atomic_write_json(meta / "materialization-provenance.json", {"raw_episode_id": raw["episode_id"], "raw_manifest_sha256": sha256_file(raw_root / "SHA256SUMS.json"), "quality_grade": raw["quality_grade"], "raw_identity": dict(identity), "raw_manifest_verified": True, "selection_horizon": ACTION_HORIZON, "selected_steps": steps})
-        manifest = {"schema_version": 1, "output_format": "groot_lerobot_v2.1_per_episode", "source_format": "flywheel_raw_terminal_artifact", "fps": 30, "episode_count": 1, "frame_count": len(selected), "train_episode_ids": ["0"], "validation_episode_ids": [], "fixed_language_instruction": FIXED_INSTRUCTION, "camera_schema": [{"source_key": f"observation.images.{camera}", "dtype": "video", "shape": [480, 640, 3]} for camera in CAMERA_KEYS], "state_schema": {"source_key": "observation.state", "dimension": 12, "names": list(JOINT_NAMES)}, "action_schema": {"source_key": "action", "dimension": 12, "names": list(JOINT_NAMES), "storage": "absolute"}, "future_actions": {"horizon": ACTION_HORIZON, "loader_allow_padding": False, "materialized_windows": True, "tail_convention": "drop_incomplete_windows", "valid_window_counts": {"0": len(selected)}}, "statistics": {"status": "pending_final_mixed_train_only", "files": []}}
+        atomic_write_json(meta / "materialization-provenance.json", {"raw_episode_id": raw["episode_id"], "raw_manifest_sha256": sha256_file(raw_root / "SHA256SUMS.json"), "quality_grade": raw["quality_grade"], "raw_identity": dict(identity), "raw_manifest_verified": True, "accepted_success": raw["accepted_success"], "trainable": raw["trainable"], "outcome": raw["outcome"], "selection_horizon": ACTION_HORIZON, "rejected_by_reason": rejected, "selected_frame_ranges": [{"raw_episode_id": raw["episode_id"], "frame_start": item["source_steps"][0], "frame_stop": item["source_steps"][-1] + 1, "action_source": "expert"} for item in selected]})
+        output_artifacts = artifact_identities(output)
+        manifest = {"schema_version": 1, "output_format": "groot_lerobot_v2.1_per_episode", "source_format": "flywheel_raw_terminal_artifact", "fps": 30, "episode_count": len(selected), "frame_count": global_index, "train_episode_ids": [str(index) for index in range(len(selected))], "validation_episode_ids": [], "fixed_language_instruction": FIXED_INSTRUCTION, "camera_schema": [{"source_key": f"observation.images.{camera}", "dtype": "video", "shape": [480, 640, 3]} for camera in CAMERA_KEYS], "state_schema": {"source_key": "observation.state", "dimension": 12, "names": list(JOINT_NAMES)}, "action_schema": {"source_key": "action", "dimension": 12, "names": list(JOINT_NAMES), "storage": "absolute"}, "future_actions": {"horizon": ACTION_HORIZON, "loader_allow_padding": False, "materialized_windows": True, "tail_convention": "one_complete_raw_window_per_episode", "valid_window_counts": {str(index): 1 for index in range(len(selected))}}, "output_artifacts": output_artifacts, "output_manifest_sha256": canonical_json_sha256(output_artifacts), "statistics": {"status": "pending_final_mixed_train_only", "files": []}}
         atomic_write_json(output / "manifest.json", manifest)
         digest = canonical_json_sha256(manifest)
         report = MaterializationReport(str(raw["episode_id"]), len(selected), dict(rejected), digest)

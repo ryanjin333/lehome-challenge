@@ -1,20 +1,178 @@
 from __future__ import annotations
+
 import json
-from dataclasses import replace
 from pathlib import Path
+import subprocess
+from collections import Counter
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
-from lehome_train.flywheel.mix import build_mix_plan, verify_mix_plan
-def _dataset(path:Path, *, frames:int, flywheel:bool=False, grade:str="A", holdout:bool=False)->Path:
-    (path/"meta").mkdir(parents=True)
-    (path/"manifest.json").write_text(json.dumps({"output_format":"groot_lerobot_v2.1_per_episode","frame_count":frames,"train_episode_ids":["0"],"source_revision":"a"*40}),encoding="utf-8")
-    if flywheel: (path/"meta"/"materialization-provenance.json").write_text(json.dumps({"raw_manifest_verified":True,"raw_manifest_sha256":"b"*64,"quality_grade":grade,"raw_identity":{"release_stage":"public_unseen" if holdout else "seen"}}),encoding="utf-8")
-    return path
-def test_mix_targets_seventy_thirty_by_training_frames_and_freezes_cycles(tmp_path:Path)->None:
-    plan=build_mix_plan(_dataset(tmp_path/"organizer",frames=700),_dataset(tmp_path/"new",frames=300,flywheel=True),seed=20260803)
-    assert (plan.organizer_training_frames,plan.flywheel_training_frames)==(700,300)
-    assert plan.source_weights=={"organizer":.7,"flywheel":.3}; assert len(plan.organizer_episode_ids)==700; assert len(plan.flywheel_episode_ids)==300
-    assert plan.grade_weights=={"A":1.0,"B":.5}; verify_mix_plan(plan)
-    with pytest.raises(ValueError,match="hash"): verify_mix_plan(replace(plan,sha256="0"*64))
-@pytest.mark.parametrize(("grade","holdout","message"),[("A",True,"holdout"),("C",False,"grade")])
-def test_mix_rejects_holdout_and_ineligible_grade(tmp_path:Path,grade:str,holdout:bool,message:str)->None:
-    with pytest.raises(ValueError,match=message): build_mix_plan(_dataset(tmp_path/"org",frames=10),_dataset(tmp_path/"bad",frames=10,flywheel=True,grade=grade,holdout=holdout),seed=1)
+
+from lehome_train.data.convert import LEGACY_DATA_PATH, LEGACY_VIDEO_PATH, _modality_metadata, _validate_output_video
+from lehome_train.data.inspect import artifact_identities
+from lehome_train.data.validate import validate_prepared_dataset
+from lehome_train.flywheel.mix import (
+    ACTION_HORIZON,
+    build_mix_plan,
+    materialize_mixed_snapshot,
+    validate_mix_plan_payload,
+)
+from lehome_train.io import atomic_write_json, canonical_json_sha256
+from test_flywheel_materialize import _raw_episode
+
+
+REVISION = "a" * 40
+
+
+def _video(path: Path, *, frames: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(("ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=2x2:r=30", "-frames:v", str(frames), "-pix_fmt", "yuv420p", str(path)), check=True)
+
+
+def _prepared_source(root: Path, *, kind: str, grade: str | None = None, episodes: int = 2, release_stage: str = "seen", accepted_success: bool = True, action_source: str = "expert") -> Path:
+    """Small real prepared-v2 fixture with parquet and all required MP4 streams."""
+
+    for episode in range(episodes):
+        base = episode * ACTION_HORIZON
+        path = root / LEGACY_DATA_PATH.format(episode_chunk=0, episode_index=episode)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({
+            "observation.state": pa.array([[float(base + frame)] * 12 for frame in range(ACTION_HORIZON)], type=pa.list_(pa.float32(), 12)),
+            "action": pa.array([[float(base + frame + 1)] * 12 for frame in range(ACTION_HORIZON)], type=pa.list_(pa.float32(), 12)),
+            "timestamp": pa.array([frame / 30 for frame in range(ACTION_HORIZON)], type=pa.float32()),
+            "frame_index": pa.array(range(ACTION_HORIZON), type=pa.int64()),
+            "episode_index": pa.array([episode] * ACTION_HORIZON, type=pa.int64()),
+            "index": pa.array(range(base, base + ACTION_HORIZON), type=pa.int64()),
+            "task_index": pa.array([0] * ACTION_HORIZON, type=pa.int64()),
+        }), path, compression="zstd")
+        for camera in ("top_rgb", "left_rgb", "right_rgb"):
+            _video(root / LEGACY_VIDEO_PATH.format(episode_chunk=0, episode_index=episode, video_key=camera), frames=ACTION_HORIZON)
+    meta = root / "meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(meta / "info.json", {
+        "codebase_version": "v2.1", "robot_type": "dual_so101_follower", "total_episodes": episodes,
+        "total_frames": episodes * ACTION_HORIZON, "total_tasks": 1, "total_videos": episodes * 3,
+        "total_chunks": 1, "chunks_size": 1000, "fps": 30, "data_path": LEGACY_DATA_PATH,
+        "video_path": LEGACY_VIDEO_PATH, "features": {},
+    })
+    (meta / "episodes.jsonl").write_text("".join(json.dumps({"episode_index": episode, "length": ACTION_HORIZON, "task_index": 0}) + "\n" for episode in range(episodes)), encoding="utf-8")
+    (meta / "episodes_stats.jsonl").write_text("".join(json.dumps({"episode_index": episode, "stats": {}}) + "\n" for episode in range(episodes)), encoding="utf-8")
+    (meta / "tasks.jsonl").write_text('{"task":"fold the garment on the table","task_index":0}\n', encoding="utf-8")
+    atomic_write_json(meta / "modality.json", _modality_metadata())
+    if kind == "flywheel":
+        assert grade is not None
+        atomic_write_json(meta / "materialization-provenance.json", {
+            "raw_episode_id": f"raw-{grade}", "raw_manifest_sha256": ("b" if grade == "A" else "c") * 64,
+            "raw_manifest_verified": True, "quality_grade": grade, "selection_horizon": ACTION_HORIZON,
+            "raw_identity": {"release_stage": release_stage, "instruction": "fold the garment on the table", "code_revision": REVISION},
+            "accepted_success": accepted_success, "trainable": accepted_success, "outcome": "success" if accepted_success else "timeout",
+            "rejected_by_reason": {"policy": 1, "hold": 1, "short_tail": 0},
+            "selected_frame_ranges": [{"raw_episode_id": f"raw-{grade}", "frame_start": episode * ACTION_HORIZON, "frame_stop": (episode + 1) * ACTION_HORIZON, "action_source": action_source} for episode in range(episodes)],
+        })
+    artifacts = artifact_identities(root)
+    manifest = {
+        "schema_version": 1, "output_format": "groot_lerobot_v2.1_per_episode", "source_revision": REVISION,
+        "output_artifacts": artifacts, "output_manifest_sha256": canonical_json_sha256(artifacts),
+        "frame_count": episodes * ACTION_HORIZON, "episode_count": episodes, "fps": 30,
+        "train_episode_ids": [str(episode) for episode in range(episodes)], "validation_episode_ids": [],
+        "fixed_language_instruction": "fold the garment on the table",
+        "future_actions": {"horizon": ACTION_HORIZON, "loader_allow_padding": False},
+    }
+    atomic_write_json(root / "manifest.json", manifest)
+    return root
+
+
+def test_mix_materializes_real_ranges_with_exact_train_ratio_and_valid_stats(tmp_path: Path) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    grade_a = _prepared_source(tmp_path / "grade-a", kind="flywheel", grade="A", episodes=1)
+    grade_b = _prepared_source(tmp_path / "grade-b", kind="flywheel", grade="B", episodes=1)
+
+    plan = build_mix_plan(organizer, [grade_a, grade_b], seed=20260803)
+    assert build_mix_plan(organizer, [grade_a, grade_b], seed=20260803).to_dict() == plan.to_dict()
+    result = materialize_mixed_snapshot(plan, organizer, [grade_a, grade_b], tmp_path / "mixed")
+
+    assert result["validation"]["valid"] is True
+    assert plan.organizer_training_frames * 3 == plan.flywheel_training_frames * 7
+    assert plan.grade_weights == {"A": 1.0, "B": 0.5}
+    assert {item.quality_grade for item in plan.selections if item.source_kind == "flywheel"} == {"A", "B"}
+    assert Counter(item.quality_grade for item in plan.selections if item.split == "train" and item.source_kind == "flywheel") == {"A": 2, "B": 1}
+    assert all(item.frame_stop - item.frame_start == ACTION_HORIZON for item in plan.selections)
+    assert all(len(item.source_frame_ids) == ACTION_HORIZON for item in plan.selections)
+    mixed = tmp_path / "mixed"
+    manifest = json.loads((mixed / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["flywheel_mix_plan"]["sha256"] == plan.sha256
+    assert json.loads((mixed / "meta" / "mix-selection.json").read_text(encoding="utf-8"))["sha256"] == plan.sha256
+    assert manifest["train_episode_ids"]
+    assert manifest["validation_episode_ids"]
+    first = pq.read_table(mixed / LEGACY_DATA_PATH.format(episode_chunk=0, episode_index=0))
+    assert first["frame_index"].to_pylist() == list(range(ACTION_HORIZON))
+    assert first["episode_index"].to_pylist() == [0] * ACTION_HORIZON
+    assert first["index"].to_pylist() == list(range(ACTION_HORIZON))
+    all_indices = [
+        index
+        for episode_id in range(manifest["episode_count"])
+        for index in pq.read_table(mixed / LEGACY_DATA_PATH.format(episode_chunk=0, episode_index=episode_id))["index"].to_pylist()
+    ]
+    assert all_indices == list(range(manifest["frame_count"]))
+    for camera in ("top_rgb", "left_rgb", "right_rgb"):
+        _validate_output_video(mixed / LEGACY_VIDEO_PATH.format(episode_chunk=0, episode_index=0, video_key=camera), expected_frame_count=ACTION_HORIZON, expected_fps=30)
+    manifest["flywheel_mix_plan"]["selected_frame_ranges"][0]["source_frame_ids"][0] = "tampered"
+    (mixed / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="hash"):
+        validate_prepared_dataset(mixed)
+
+
+def test_mix_rejects_tampered_plan_and_source_without_leaving_output(tmp_path: Path) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=7)
+    payload = plan.to_dict()
+    payload["selected_frame_ranges"][0]["source_frame_ids"][0] = "tampered"
+    with pytest.raises(ValueError, match="hash"):
+        validate_mix_plan_payload(payload)
+    parquet = flywheel / LEGACY_DATA_PATH.format(episode_chunk=0, episode_index=0)
+    table = pq.read_table(parquet)
+    pq.write_table(table.set_column(table.schema.get_field_index("action"), "action", pa.array([[999.0] * 12] * ACTION_HORIZON, type=table["action"].type)), parquet, compression="zstd")
+    destination = tmp_path / "must-not-exist"
+    with pytest.raises(ValueError, match="artifact hash"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    ("grade", "release_stage", "accepted_success", "action_source", "message"),
+    [
+        ("C", "seen", True, "expert", "grade"),
+        ("A", "public_unseen", True, "expert", "holdout"),
+        ("A", "seen", False, "expert", "failed"),
+        ("A", "seen", True, "hold", "non-expert"),
+    ],
+)
+def test_mix_rejects_ineligible_flywheel_contracts(tmp_path: Path, grade: str, release_stage: str, accepted_success: bool, action_source: str, message: str) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "bad", kind="flywheel", grade=grade, episodes=1, release_stage=release_stage, accepted_success=accepted_success, action_source=action_source)
+
+    with pytest.raises(ValueError, match=message):
+        build_mix_plan(organizer, flywheel, seed=1)
+
+
+def test_mix_consumes_the_real_task_1_materialized_contract(tmp_path: Path) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    raw_a = _raw_episode(tmp_path / "raw-a", grade="A")
+    raw_b = _raw_episode(tmp_path / "raw-b", grade="B")
+    from lehome_train.flywheel.materialize import materialize_episode
+
+    grade_a = tmp_path / "task1-a"
+    grade_b = tmp_path / "task1-b"
+    materialize_episode(raw_a, grade_a)
+    materialize_episode(raw_b, grade_b)
+
+    plan = build_mix_plan(organizer, [grade_a, grade_b], seed=13)
+    result = materialize_mixed_snapshot(plan, organizer, [grade_a, grade_b], tmp_path / "mixed")
+
+    assert result["validation"]["valid"] is True
+    assert set(plan.raw_manifest_hashes) == {
+        json.loads((grade_a / "meta" / "materialization-provenance.json").read_text(encoding="utf-8"))["raw_manifest_sha256"],
+        json.loads((grade_b / "meta" / "materialization-provenance.json").read_text(encoding="utf-8"))["raw_manifest_sha256"],
+    }

@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 
 from lehome_train.data.inspect import read_json_object
 from lehome_train.groot.modality import write_runtime_modality_config
-from lehome_train.io import atomic_write_json, canonical_json_bytes, canonical_json_sha256, sha256_file
+from lehome_train.io import atomic_write_json, canonical_json_bytes, sha256_file
 
 
 _STAT_NAMES = ("mean", "std", "min", "max", "q01", "q99")
@@ -63,10 +63,12 @@ def _require_frozen_flywheel_mix(manifest: Mapping[str, Any]) -> None:
         return
     if not isinstance(plan, Mapping):
         raise ValueError("flywheel mix plan is malformed")
-    recorded = plan.get("sha256")
-    body = {key: value for key, value in plan.items() if key != "sha256"}
-    if not isinstance(recorded, str) or canonical_json_sha256(body) != recorded:
-        raise ValueError("flywheel mix plan hash is invalid")
+    # This runs before any Parquet statistics are read.  A digest alone is not
+    # enough: the plan must also name complete 16-frame ranges, have an exact
+    # post-split 70/30 train mix, and retain a nonempty offline holdout.
+    from lehome_train.flywheel.mix import validate_mix_plan_payload
+
+    validate_mix_plan_payload(plan)
 
 
 def _train_ids(manifest: Mapping[str, Any]) -> tuple[str, ...]:

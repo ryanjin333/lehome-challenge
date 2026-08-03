@@ -30,7 +30,7 @@ def _raw_episode(root: Path, *, grade: str = "A", holdout: bool = False) -> Path
     return writer.finalize({
         "mode": "dagger", "outcome": "success", "accepted_success": True, "trainable": True,
         "quality_grade": grade, "rejection_reasons": [],
-        "identity": {"release_stage": "public_unseen" if holdout else "seen", "instruction": "fold the garment on the table", "policy_revision": "a" * 40},
+        "identity": {"release_stage": "public_unseen" if holdout else "seen", "instruction": "fold the garment on the table", "policy_revision": "a" * 40, "code_revision": "b" * 40},
     }, required_videos=("top_rgb.mp4", "left_rgb.mp4", "right_rgb.mp4"))
 
 
@@ -42,6 +42,10 @@ def test_materializer_verifies_real_artifact_and_writes_canonical_v2_layout(tmp_
     payload = json.loads((tmp_path / "out" / "manifest.json").read_text(encoding="utf-8"))
     assert payload["output_format"] == "groot_lerobot_v2.1_per_episode"
     assert payload["state_schema"]["dimension"] == payload["action_schema"]["dimension"] == 12
+    assert payload["frame_count"] == 16
+    assert payload["future_actions"]["tail_convention"] == "one_complete_raw_window_per_episode"
+    provenance = json.loads((tmp_path / "out" / "meta" / "materialization-provenance.json").read_text(encoding="utf-8"))
+    assert provenance["selected_frame_ranges"] == [{"raw_episode_id": "episode-1", "frame_start": 4, "frame_stop": 20, "action_source": "expert"}]
     assert (tmp_path / "out" / "data" / "chunk-000" / "episode_000000.parquet").is_file()
     assert (tmp_path / "out" / "videos" / "chunk-000" / "top_rgb" / "episode_000000.mp4").is_file()
 

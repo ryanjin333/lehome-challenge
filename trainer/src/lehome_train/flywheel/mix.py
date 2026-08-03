@@ -1,52 +1,626 @@
-"""Freeze audited 70/30 prepared-dataset inputs before statistics."""
+"""Deterministically freeze and materialize safe flywheel training mixtures.
+
+The unit of selection is a concrete contiguous 16-frame source range.  This is
+deliberately more restrictive than selecting episode IDs: a v2 loader may form
+an action horizon only inside one emitted range, never across a filtered raw
+segment or an oversampling boundary.
+"""
+
 from __future__ import annotations
+
 from dataclasses import dataclass
-import json, math, random
+import json
+import math
 from pathlib import Path
-from typing import Mapping
-from lehome_train.io import canonical_json_sha256, sha256_file
+import random
+import shutil
+import tempfile
+from typing import Any, Iterable, Mapping, Sequence
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from lehome_train.data.convert import (
+    LEGACY_DATA_PATH,
+    LEGACY_VIDEO_PATH,
+    _modality_metadata,
+)
+from lehome_train.data.mapping import ACTION_HORIZON, FIXED_INSTRUCTION, JOINT_NAMES
+from lehome_train.data.inspect import artifact_identities
+from lehome_train.data.split import split_episode_ids
+from lehome_train.io import atomic_write_json, canonical_json_bytes, canonical_json_sha256, sha256_file
+
 
 GRADE_WEIGHTS = {"A": 1.0, "B": 0.5}
+SOURCE_WEIGHTS = {"organizer": 0.7, "flywheel": 0.3}
+_SPLIT_FRACTION = 0.1
+_CAMERAS = ("top_rgb", "left_rgb", "right_rgb")
+
+
+@dataclass(frozen=True, slots=True)
+class FrameSelection:
+    """One physically copyable source range and its frozen output identity."""
+
+    source_kind: str
+    source_manifest_sha256: str
+    source_episode_id: str
+    frame_start: int
+    frame_stop: int
+    source_frame_ids: tuple[str, ...]
+    destination_episode_id: str
+    split: str
+    quality_grade: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "source_kind": self.source_kind,
+            "source_manifest_sha256": self.source_manifest_sha256,
+            "source_episode_id": self.source_episode_id,
+            "frame_start": self.frame_start,
+            "frame_stop": self.frame_stop,
+            "source_frame_ids": list(self.source_frame_ids),
+            "destination_episode_id": self.destination_episode_id,
+            "split": self.split,
+        }
+        if self.quality_grade is not None:
+            result["quality_grade"] = self.quality_grade
+        return result
+
 
 @dataclass(frozen=True, slots=True)
 class MixPlan:
-    seed: int; organizer_training_frames: int; flywheel_training_frames: int
-    source_weights: dict[str, float]; grade_weights: dict[str, float]
-    organizer_episode_ids: tuple[str, ...]; flywheel_episode_ids: tuple[str, ...]
-    source_revisions: dict[str, str]; raw_manifest_hashes: tuple[str, ...]; sha256: str
-    def body(self): return {"schema_version":1,"seed":self.seed,"organizer_training_frames":self.organizer_training_frames,"flywheel_training_frames":self.flywheel_training_frames,"source_weights":self.source_weights,"grade_weights":self.grade_weights,"organizer_episode_ids":list(self.organizer_episode_ids),"flywheel_episode_ids":list(self.flywheel_episode_ids),"source_revisions":self.source_revisions,"raw_manifest_hashes":list(self.raw_manifest_hashes)}
-    def to_dict(self): return self.body() | {"sha256":self.sha256}
+    seed: int
+    split_seed: int
+    validation_fraction: float
+    organizer_training_frames: int
+    flywheel_training_frames: int
+    source_weights: dict[str, float]
+    grade_weights: dict[str, float]
+    selections: tuple[FrameSelection, ...]
+    source_revisions: dict[str, str]
+    raw_manifest_hashes: tuple[str, ...]
+    rejected_by_reason: dict[str, int]
+    sha256: str
 
-def _read(path: Path) -> dict[str, object]:
-    try: value=json.loads(path.read_text(encoding="utf-8"))
-    except (OSError,json.JSONDecodeError): raise ValueError(f"mix metadata unavailable: {path}") from None
-    if not isinstance(value,dict): raise ValueError("mix metadata must be an object")
+    @property
+    def organizer_episode_ids(self) -> tuple[str, ...]:
+        return tuple(
+            item.source_episode_id
+            for item in self.selections
+            if item.split == "train" and item.source_kind == "organizer"
+        )
+
+    @property
+    def flywheel_episode_ids(self) -> tuple[str, ...]:
+        return tuple(
+            item.source_episode_id
+            for item in self.selections
+            if item.split == "train" and item.source_kind == "flywheel"
+        )
+
+    def body(self) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "seed": self.seed,
+            "split_seed": self.split_seed,
+            "validation_fraction": self.validation_fraction,
+            "organizer_training_frames": self.organizer_training_frames,
+            "flywheel_training_frames": self.flywheel_training_frames,
+            "source_weights": dict(sorted(self.source_weights.items())),
+            "grade_weights": dict(sorted(self.grade_weights.items())),
+            "selected_frame_ranges": [item.to_dict() for item in self.selections],
+            "source_revisions": dict(sorted(self.source_revisions.items())),
+            "raw_manifest_hashes": list(self.raw_manifest_hashes),
+            "rejected_by_reason": dict(sorted(self.rejected_by_reason.items())),
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        return self.body() | {"sha256": self.sha256}
+
+
+@dataclass(frozen=True, slots=True)
+class _Chunk:
+    source_kind: str
+    source_root: Path
+    source_manifest_sha256: str
+    source_revision: str
+    episode_id: str
+    start: int
+    stop: int
+    frame_ids: tuple[str, ...]
+    quality_grade: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSource:
+    root: Path
+    kind: str
+    manifest: Mapping[str, Any]
+    manifest_sha256: str
+    source_revision: str
+    quality_grade: str | None
+    raw_manifest_sha256: str | None
+    rejection_counts: Mapping[str, int]
+
+
+def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("mix JSON contains duplicate fields")
+        result[key] = value
+    return result
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_strict_object)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"mix metadata unavailable: {path}") from error
+    if not isinstance(value, dict):
+        raise ValueError("mix metadata must be an object")
     return value
-def _ids(manifest: Mapping[str,object]) -> list[str]:
-    ids=manifest.get("train_episode_ids")
-    if not isinstance(ids,list) or not ids or not all(isinstance(i,str) for i in ids): raise ValueError("mix input has no train episodes")
-    return sorted(ids)
-def _frames(manifest: Mapping[str,object]) -> int:
-    frames=manifest.get("frame_count")
-    if type(frames) is not int or frames<=0: raise ValueError("mix input frame count is invalid")
-    return frames
-def _cycle(ids:list[str], count:int, rng:random.Random)->tuple[str,...]:
-    ordered=list(ids); rng.shuffle(ordered); return tuple(ordered[index%len(ordered)] for index in range(count))
 
-def build_mix_plan(organizer: str|Path, flywheel: str|Path, *, seed:int, organizer_fraction:float=.70)->MixPlan:
-    if type(seed) is not int or organizer_fraction != .70: raise ValueError("mix requires organizer fraction 0.70")
-    org_root, fly_root=Path(organizer),Path(flywheel); org=_read(org_root/"manifest.json"); fly=_read(fly_root/"manifest.json")
-    if org.get("output_format")!="groot_lerobot_v2.1_per_episode" or fly.get("output_format")!="groot_lerobot_v2.1_per_episode": raise ValueError("mix inputs must be canonical prepared datasets")
-    prov=_read(fly_root/"meta"/"materialization-provenance.json")
-    if prov.get("raw_manifest_verified") is not True: raise ValueError("raw artifact was not checksum verified")
-    if prov.get("quality_grade") not in GRADE_WEIGHTS: raise ValueError("flywheel grade must be A or B")
-    identity=prov.get("raw_identity")
-    if not isinstance(identity,Mapping) or identity.get("release_stage")=="public_unseen": raise ValueError("evaluation holdout cannot enter mix")
-    raw_hash=prov.get("raw_manifest_sha256")
-    if not isinstance(raw_hash,str) or len(raw_hash)!=64: raise ValueError("raw manifest hash is invalid")
-    total=max(_frames(org),math.ceil(_frames(fly)/.30)); org_count=round(total*.70); fly_count=total-org_count; rng=random.Random(seed)
-    source_revisions={"organizer":str(org.get("source_revision",sha256_file(org_root/"manifest.json"))),"flywheel":sha256_file(fly_root/"manifest.json")}
-    body={"schema_version":1,"seed":seed,"organizer_training_frames":org_count,"flywheel_training_frames":fly_count,"source_weights":{"organizer":.7,"flywheel":.3},"grade_weights":GRADE_WEIGHTS,"organizer_episode_ids":list(_cycle(_ids(org),org_count,rng)),"flywheel_episode_ids":list(_cycle(_ids(fly),fly_count,rng)),"source_revisions":source_revisions,"raw_manifest_hashes":[raw_hash]}
-    return MixPlan(seed,org_count,fly_count,{"organizer":.7,"flywheel":.3},dict(GRADE_WEIGHTS),tuple(body["organizer_episode_ids"]),tuple(body["flywheel_episode_ids"]),source_revisions,(raw_hash,),canonical_json_sha256(body))
-def verify_mix_plan(plan:MixPlan)->None:
-    if canonical_json_sha256(plan.body())!=plan.sha256: raise ValueError("frozen mix plan hash is invalid")
+
+def _sha256(value: object, label: str) -> str:
+    if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError(f"{label} must be a lowercase SHA-256")
+    return value
+
+
+def _revision(value: object, label: str) -> str:
+    if not isinstance(value, str) or len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError(f"{label} must be an immutable revision")
+    return value
+
+
+def _verify_artifacts(root: Path, manifest: Mapping[str, Any]) -> None:
+    artifacts = manifest.get("output_artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ValueError("prepared mix source has no output artifact manifest")
+    if manifest.get("output_manifest_sha256") != canonical_json_sha256(artifacts):
+        raise ValueError("prepared mix source output manifest hash is invalid")
+    seen: set[str] = set()
+    for item in artifacts:
+        if not isinstance(item, Mapping) or set(item) != {"relative_path", "sha256", "byte_size"}:
+            raise ValueError("prepared mix source artifact schema is invalid")
+        relative = item["relative_path"]
+        digest = item["sha256"]
+        size = item["byte_size"]
+        if not isinstance(relative, str) or not relative or relative.startswith("/") or ".." in Path(relative).parts:
+            raise ValueError("prepared mix source artifact path is invalid")
+        _sha256(digest, "prepared mix source artifact hash")
+        if type(size) is not int or size < 0:
+            raise ValueError("prepared mix source artifact size is invalid")
+        path = root / relative
+        if relative in seen or path.is_symlink() or not path.is_file():
+            raise ValueError("prepared mix source artifact is missing or duplicated")
+        if path.stat().st_size != size or sha256_file(path) != digest:
+            raise ValueError("prepared mix source artifact hash mismatch")
+        seen.add(relative)
+
+
+def _materialized_provenance(root: Path) -> tuple[str, str, Mapping[str, int]]:
+    provenance = _read_json(root / "meta" / "materialization-provenance.json")
+    if provenance.get("raw_manifest_verified") is not True:
+        raise ValueError("flywheel source raw artifact was not checksum verified")
+    if provenance.get("quality_grade") not in GRADE_WEIGHTS:
+        raise ValueError("flywheel source grade must be A or B")
+    if provenance.get("accepted_success") is not True or provenance.get("trainable") is not True or provenance.get("outcome") != "success":
+        raise ValueError("failed flywheel source cannot enter mix")
+    identity = provenance.get("raw_identity")
+    if not isinstance(identity, Mapping):
+        raise ValueError("flywheel source has no raw identity")
+    if identity.get("release_stage") == "public_unseen":
+        raise ValueError("evaluation holdout cannot enter mix")
+    if identity.get("instruction") != FIXED_INSTRUCTION:
+        raise ValueError("flywheel source has an incompatible task instruction")
+    if provenance.get("selection_horizon") != ACTION_HORIZON:
+        raise ValueError("flywheel source action horizon is incompatible")
+    ranges = provenance.get("selected_frame_ranges")
+    if not isinstance(ranges, list) or not ranges:
+        raise ValueError("flywheel source lacks immutable expert frame ranges")
+    for item in ranges:
+        if not isinstance(item, Mapping) or item.get("action_source") != "expert":
+            raise ValueError("flywheel source contains non-expert targets")
+    raw_hash = _sha256(provenance.get("raw_manifest_sha256"), "raw manifest hash")
+    revision = _revision(identity.get("code_revision"), "flywheel code revision")
+    counts = provenance.get("rejected_by_reason")
+    if not isinstance(counts, Mapping) or any(type(value) is not int or value < 0 for value in counts.values()):
+        raise ValueError("flywheel source rejection counts are invalid")
+    return raw_hash, revision, counts  # type: ignore[return-value]
+
+
+def _prepared_source(root_value: str | Path, *, kind: str) -> _PreparedSource:
+    root = Path(root_value)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("prepared mix source must be a real directory")
+    manifest = _read_json(root / "manifest.json")
+    if manifest.get("output_format") != "groot_lerobot_v2.1_per_episode":
+        raise ValueError("mix inputs must be canonical prepared-v2 datasets")
+    if manifest.get("fixed_language_instruction") != FIXED_INSTRUCTION:
+        raise ValueError("prepared mix source has an incompatible instruction")
+    if manifest.get("future_actions", {}).get("horizon") != ACTION_HORIZON:
+        raise ValueError("prepared mix source has an incompatible action horizon")
+    _verify_artifacts(root, manifest)
+    manifest_sha = sha256_file(root / "manifest.json")
+    if kind == "organizer":
+        return _PreparedSource(
+            root=root,
+            kind=kind,
+            manifest=manifest,
+            manifest_sha256=manifest_sha,
+            source_revision=_revision(manifest.get("source_revision"), "organizer source revision"),
+            quality_grade=None,
+            raw_manifest_sha256=None,
+            rejection_counts={},
+        )
+    raw_hash, revision, counts = _materialized_provenance(root)
+    return _PreparedSource(
+        root=root,
+        kind=kind,
+        manifest=manifest,
+        manifest_sha256=manifest_sha,
+        source_revision=revision,
+        quality_grade=str(_read_json(root / "meta" / "materialization-provenance.json")["quality_grade"]),
+        raw_manifest_sha256=raw_hash,
+        rejection_counts=counts,
+    )
+
+
+def _source_chunks(source: _PreparedSource) -> list[_Chunk]:
+    ids = source.manifest.get("train_episode_ids")
+    if not isinstance(ids, list) or not ids or not all(isinstance(value, str) for value in ids):
+        raise ValueError("prepared mix source has no train episodes")
+    if len(set(ids)) != len(ids):
+        raise ValueError("prepared mix source train episodes are duplicated")
+    info = _read_json(source.root / "meta" / "info.json")
+    pattern, chunks_size = info.get("data_path"), info.get("chunks_size")
+    if not isinstance(pattern, str) or type(chunks_size) is not int or chunks_size <= 0:
+        raise ValueError("prepared mix source has invalid v2 metadata")
+    chunks: list[_Chunk] = []
+    for episode_id in sorted(ids, key=int):
+        numeric = int(episode_id)
+        path = source.root / pattern.format(episode_chunk=numeric // chunks_size, episode_index=numeric)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("prepared mix source is missing selected parquet")
+        table = pq.read_table(path, columns=["observation.state", "action", "frame_index", "episode_index", "index"])
+        if table.num_rows < ACTION_HORIZON:
+            continue
+        states, actions = table["observation.state"].to_pylist(), table["action"].to_pylist()
+        frames = table["frame_index"].to_pylist()
+        episodes = table["episode_index"].to_pylist()
+        global_ids = table["index"].to_pylist()
+        if any(len(value) != 12 for value in states + actions):
+            raise ValueError("prepared mix source has non-12D vectors")
+        if frames != list(range(table.num_rows)) or episodes != [numeric] * table.num_rows:
+            raise ValueError("prepared mix source does not have canonical frame boundaries")
+        if len(set(global_ids)) != len(global_ids):
+            raise ValueError("prepared mix source has duplicate global frame IDs")
+        for start in range(0, table.num_rows - ACTION_HORIZON + 1, ACTION_HORIZON):
+            stop = start + ACTION_HORIZON
+            chunks.append(
+                _Chunk(
+                    source_kind=source.kind,
+                    source_root=source.root,
+                    source_manifest_sha256=source.manifest_sha256,
+                    source_revision=source.source_revision,
+                    episode_id=episode_id,
+                    start=start,
+                    stop=stop,
+                    frame_ids=tuple(str(value) for value in global_ids[start:stop]),
+                    quality_grade=source.quality_grade,
+                )
+            )
+    if not chunks:
+        raise ValueError("prepared mix source has no complete action-horizon ranges")
+    return chunks
+
+
+def _cycle(items: Sequence[_Chunk], count: int, *, seed: int) -> list[_Chunk]:
+    ordered = list(items)
+    random.Random(seed).shuffle(ordered)
+    return [ordered[index % len(ordered)] for index in range(count)]
+
+
+def _weighted_flywheel_cycle(items: Sequence[_Chunk], count: int, *, seed: int) -> list[_Chunk]:
+    weighted: list[_Chunk] = []
+    for item in items:
+        weighted.extend([item] * (2 if item.quality_grade == "A" else 1))
+    return _cycle(weighted, count, seed=seed)
+
+
+def _total_with_exact_train_slots(train_slots: int, *, split_seed: int) -> tuple[int, set[str]]:
+    total = train_slots
+    while True:
+        split = split_episode_ids(
+            tuple(str(index) for index in range(total)),
+            seed=split_seed,
+            validation_fraction=_SPLIT_FRACTION,
+        )
+        if len(split.train) == train_slots and split.validation:
+            return total, set(split.train)
+        total += 1
+
+
+def _plan_from_payload(payload: Mapping[str, Any]) -> MixPlan:
+    if set(payload) != {
+        "schema_version", "seed", "split_seed", "validation_fraction",
+        "organizer_training_frames", "flywheel_training_frames", "source_weights",
+        "grade_weights", "selected_frame_ranges", "source_revisions", "raw_manifest_hashes",
+        "rejected_by_reason", "sha256",
+    }:
+        raise ValueError("flywheel mix plan schema is invalid")
+    if payload["schema_version"] != 2 or type(payload["seed"]) is not int or type(payload["split_seed"]) is not int:
+        raise ValueError("flywheel mix plan identity is invalid")
+    if payload["validation_fraction"] != _SPLIT_FRACTION:
+        raise ValueError("flywheel mix plan validation fraction is invalid")
+    if payload["source_weights"] != SOURCE_WEIGHTS or payload["grade_weights"] != GRADE_WEIGHTS:
+        raise ValueError("flywheel mix plan weights are invalid")
+    selections_value = payload["selected_frame_ranges"]
+    if not isinstance(selections_value, list) or not selections_value:
+        raise ValueError("flywheel mix plan has no selected frame ranges")
+    selections: list[FrameSelection] = []
+    destinations: set[str] = set()
+    for item in selections_value:
+        if not isinstance(item, Mapping):
+            raise ValueError("flywheel mix plan range is invalid")
+        required = {"source_kind", "source_manifest_sha256", "source_episode_id", "frame_start", "frame_stop", "source_frame_ids", "destination_episode_id", "split"}
+        if set(item) not in (required, required | {"quality_grade"}):
+            raise ValueError("flywheel mix plan range schema is invalid")
+        if item.get("source_kind") not in SOURCE_WEIGHTS or item.get("split") not in {"train", "validation"}:
+            raise ValueError("flywheel mix plan range role is invalid")
+        start, stop = item.get("frame_start"), item.get("frame_stop")
+        frame_ids = item.get("source_frame_ids")
+        destination = item.get("destination_episode_id")
+        if type(start) is not int or type(stop) is not int or stop - start != ACTION_HORIZON or not isinstance(frame_ids, list) or len(frame_ids) != ACTION_HORIZON or not all(isinstance(value, str) for value in frame_ids) or not isinstance(destination, str) or destination in destinations:
+            raise ValueError("flywheel mix plan range is not an action-horizon boundary")
+        grade = item.get("quality_grade")
+        if item["source_kind"] == "flywheel" and grade not in GRADE_WEIGHTS:
+            raise ValueError("flywheel mix plan range has an invalid grade")
+        if item["source_kind"] == "organizer" and grade is not None:
+            raise ValueError("organizer mix range must not have a grade")
+        destinations.add(destination)
+        selections.append(FrameSelection(str(item["source_kind"]), _sha256(item["source_manifest_sha256"], "mix source manifest hash"), str(item["source_episode_id"]), start, stop, tuple(frame_ids), destination, str(item["split"]), str(grade) if grade is not None else None))
+    source_revisions = payload["source_revisions"]
+    raw_hashes = payload["raw_manifest_hashes"]
+    rejected = payload["rejected_by_reason"]
+    if not isinstance(source_revisions, Mapping) or not all(
+        isinstance(key, str) for key in source_revisions
+    ):
+        raise ValueError("flywheel mix plan source revisions are invalid")
+    for value in source_revisions.values():
+        _revision(value, "mix source revision")
+    if not isinstance(raw_hashes, list):
+        raise ValueError("flywheel mix plan raw manifest hashes are invalid")
+    for value in raw_hashes:
+        _sha256(value, "mix raw manifest hash")
+    if not isinstance(rejected, Mapping) or any(not isinstance(key, str) or type(value) is not int or value < 0 for key, value in rejected.items()):
+        raise ValueError("flywheel mix plan rejection counts are invalid")
+    plan = MixPlan(
+        seed=payload["seed"], split_seed=payload["split_seed"], validation_fraction=payload["validation_fraction"],
+        organizer_training_frames=payload["organizer_training_frames"], flywheel_training_frames=payload["flywheel_training_frames"],
+        source_weights=dict(payload["source_weights"]), grade_weights=dict(payload["grade_weights"]),
+        selections=tuple(selections), source_revisions=dict(source_revisions), raw_manifest_hashes=tuple(raw_hashes),
+        rejected_by_reason=dict(rejected), sha256=_sha256(payload["sha256"], "mix plan hash"),
+    )
+    if any(type(value) is not int or value < 0 for value in (plan.organizer_training_frames, plan.flywheel_training_frames)):
+        raise ValueError("flywheel mix plan training frame counts are invalid")
+    return plan
+
+
+def validate_mix_plan_payload(payload: Mapping[str, Any]) -> MixPlan:
+    """Decode and authenticate a JSON plan before any statistics are read."""
+
+    plan = _plan_from_payload(payload)
+    verify_mix_plan(plan)
+    train = [item for item in plan.selections if item.split == "train"]
+    validation = [item for item in plan.selections if item.split == "validation"]
+    if not train or not validation:
+        raise ValueError("flywheel mix plan must preserve train and validation ranges")
+    organizer = sum(ACTION_HORIZON for item in train if item.source_kind == "organizer")
+    flywheel = sum(ACTION_HORIZON for item in train if item.source_kind == "flywheel")
+    if (organizer, flywheel) != (plan.organizer_training_frames, plan.flywheel_training_frames):
+        raise ValueError("flywheel mix plan training frame counts differ from selections")
+    if organizer * 3 != flywheel * 7:
+        raise ValueError("flywheel mix plan is not an exact 70/30 training-frame mixture")
+    return plan
+
+
+def build_mix_plan(
+    organizer: str | Path,
+    flywheel: str | Path | Sequence[str | Path],
+    *,
+    seed: int,
+    organizer_fraction: float = 0.70,
+    split_seed: int | None = None,
+) -> MixPlan:
+    """Freeze copyable source ranges with exact post-split 70/30 train frames."""
+
+    if type(seed) is not int or organizer_fraction != SOURCE_WEIGHTS["organizer"]:
+        raise ValueError("mix requires organizer fraction 0.70")
+    if split_seed is None:
+        split_seed = seed
+    if type(split_seed) is not int:
+        raise ValueError("mix split seed must be an integer")
+    flywheel_roots = [flywheel] if isinstance(flywheel, (str, Path)) else list(flywheel)
+    if not flywheel_roots:
+        raise ValueError("mix requires at least one flywheel materialized-v2 source")
+    organizer_source = _prepared_source(organizer, kind="organizer")
+    flywheel_sources = [_prepared_source(root, kind="flywheel") for root in flywheel_roots]
+    if len({source.manifest_sha256 for source in flywheel_sources}) != len(flywheel_sources):
+        raise ValueError("mix flywheel sources must have distinct immutable manifests")
+    organizer_chunks = _source_chunks(organizer_source)
+    flywheel_chunks = [chunk for source in flywheel_sources for chunk in _source_chunks(source)]
+    required_slots = max(
+        math.ceil(len(organizer_chunks) / SOURCE_WEIGHTS["organizer"]),
+        math.ceil(len(flywheel_chunks) / SOURCE_WEIGHTS["flywheel"]),
+    )
+    train_slots = math.ceil(required_slots / 10) * 10
+    organizer_slots = train_slots * 7 // 10
+    flywheel_slots = train_slots - organizer_slots
+    total_slots, train_ids = _total_with_exact_train_slots(train_slots, split_seed=split_seed)
+    train_organizer = iter(_cycle(organizer_chunks, organizer_slots, seed=seed))
+    train_flywheel = iter(_weighted_flywheel_cycle(flywheel_chunks, flywheel_slots, seed=seed ^ 0x5A17))
+    validation = iter(_cycle(organizer_chunks + flywheel_chunks, total_slots - train_slots, seed=seed ^ 0xA55A))
+    selections: list[FrameSelection] = []
+    for index in range(total_slots):
+        destination = str(index)
+        if destination in train_ids:
+            # Stable alternation means neither source order nor filesystem order
+            # biases the train split; the terminal counts remain exact.
+            train_position = sum(item.split == "train" for item in selections)
+            chunk = next(train_organizer) if train_position * 3 % 10 < 7 else next(train_flywheel)
+            split = "train"
+        else:
+            chunk, split = next(validation), "validation"
+        selections.append(FrameSelection(chunk.source_kind, chunk.source_manifest_sha256, chunk.episode_id, chunk.start, chunk.stop, chunk.frame_ids, destination, split, chunk.quality_grade))
+    source_revisions = {
+        f"{source.kind}:{source.manifest_sha256}": source.source_revision
+        for source in (organizer_source, *flywheel_sources)
+    }
+    raw_hashes = tuple(sorted(source.raw_manifest_sha256 for source in flywheel_sources if source.raw_manifest_sha256 is not None))
+    rejected: dict[str, int] = {}
+    for source in flywheel_sources:
+        for reason, count in source.rejection_counts.items():
+            rejected[reason] = rejected.get(reason, 0) + count
+    provisional = MixPlan(seed, split_seed, _SPLIT_FRACTION, organizer_slots * ACTION_HORIZON, flywheel_slots * ACTION_HORIZON, dict(SOURCE_WEIGHTS), dict(GRADE_WEIGHTS), tuple(selections), source_revisions, raw_hashes, rejected, "")
+    plan = MixPlan(
+        seed, split_seed, _SPLIT_FRACTION, organizer_slots * ACTION_HORIZON,
+        flywheel_slots * ACTION_HORIZON, dict(SOURCE_WEIGHTS), dict(GRADE_WEIGHTS),
+        tuple(selections), source_revisions, raw_hashes, rejected,
+        canonical_json_sha256(provisional.body()),
+    )
+    validate_mix_plan_payload(plan.to_dict())
+    return plan
+
+
+def verify_mix_plan(plan: MixPlan) -> None:
+    if canonical_json_sha256(plan.body()) != plan.sha256:
+        raise ValueError("frozen mix plan hash is invalid")
+
+
+def _copy_selected_video(source: Path, destination: Path, *, start: int, stop: int) -> None:
+    from lehome_train.flywheel.materialize import _copy_selected_video as copy_video
+
+    copy_video(source, destination, steps=list(range(start, stop)))
+
+
+def _source_by_hash(sources: Iterable[_PreparedSource]) -> dict[str, _PreparedSource]:
+    ordered = tuple(sources)
+    result = {source.manifest_sha256: source for source in ordered}
+    if len(result) != len(ordered):
+        raise ValueError("mix sources have duplicate immutable manifest hashes")
+    return result
+
+
+def _write_lines(path: Path, rows: Iterable[Mapping[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"".join(canonical_json_bytes(row) + b"\n" for row in rows))
+
+
+def materialize_mixed_snapshot(
+    plan: MixPlan,
+    organizer: str | Path,
+    flywheel: str | Path | Sequence[str | Path],
+    destination: str | Path,
+) -> dict[str, object]:
+    """Atomically copy a frozen plan into one canonical prepared-v2 snapshot."""
+
+    verify_mix_plan(plan)
+    validate_mix_plan_payload(plan.to_dict())
+    destination = Path(destination)
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError("refusing to overwrite mixed snapshot destination")
+    flywheel_roots = [flywheel] if isinstance(flywheel, (str, Path)) else list(flywheel)
+    organizer_source = _prepared_source(organizer, kind="organizer")
+    flywheel_sources = [_prepared_source(root, kind="flywheel") for root in flywheel_roots]
+    sources = _source_by_hash((organizer_source, *flywheel_sources))
+    expected_revisions = {
+        f"{source.kind}:{source.manifest_sha256}": source.source_revision
+        for source in (organizer_source, *flywheel_sources)
+    }
+    if plan.source_revisions != expected_revisions:
+        raise ValueError("mix plan source revisions no longer match materialized inputs")
+    for selection in plan.selections:
+        source = sources.get(selection.source_manifest_sha256)
+        if source is None or source.kind != selection.source_kind:
+            raise ValueError("mix plan references an unavailable source manifest")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent))
+    try:
+        global_index = 0
+        episode_rows: list[dict[str, object]] = []
+        for selection in sorted(plan.selections, key=lambda item: int(item.destination_episode_id)):
+            source = sources[selection.source_manifest_sha256]
+            source_info = _read_json(source.root / "meta" / "info.json")
+            source_pattern = source_info["data_path"]
+            source_chunk_size = source_info["chunks_size"]
+            numeric_source = int(selection.source_episode_id)
+            source_data = source.root / str(source_pattern).format(episode_chunk=numeric_source // int(source_chunk_size), episode_index=numeric_source)
+            table = pq.read_table(source_data).slice(selection.frame_start, ACTION_HORIZON)
+            if table.num_rows != ACTION_HORIZON or tuple(str(value) for value in table["index"].to_pylist()) != selection.source_frame_ids:
+                raise ValueError("mix source range changed after plan freeze")
+            numeric_destination = int(selection.destination_episode_id)
+            output_data = temporary / LEGACY_DATA_PATH.format(episode_chunk=numeric_destination // 1000, episode_index=numeric_destination)
+            output_data.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(pa.table({
+                "observation.state": table["observation.state"],
+                "action": table["action"],
+                "timestamp": pa.array([index / 30 for index in range(ACTION_HORIZON)], type=pa.float32()),
+                "frame_index": pa.array(range(ACTION_HORIZON), type=pa.int64()),
+                "episode_index": pa.array([numeric_destination] * ACTION_HORIZON, type=pa.int64()),
+                "index": pa.array(range(global_index, global_index + ACTION_HORIZON), type=pa.int64()),
+                "task_index": pa.array([0] * ACTION_HORIZON, type=pa.int64()),
+            }), output_data, compression="zstd")
+            for camera in _CAMERAS:
+                source_video = source.root / LEGACY_VIDEO_PATH.format(episode_chunk=numeric_source // int(source_chunk_size), episode_index=numeric_source, video_key=camera)
+                output_video = temporary / LEGACY_VIDEO_PATH.format(episode_chunk=numeric_destination // 1000, episode_index=numeric_destination, video_key=camera)
+                _copy_selected_video(source_video, output_video, start=selection.frame_start, stop=selection.frame_stop)
+            episode_rows.append({"episode_index": numeric_destination, "length": ACTION_HORIZON, "task_index": 0, "tasks": [FIXED_INSTRUCTION]})
+            global_index += ACTION_HORIZON
+        meta = temporary / "meta"
+        meta.mkdir(parents=True, exist_ok=True)
+        info = {
+            "codebase_version": "v2.1", "robot_type": "dual_so101_follower", "total_episodes": len(episode_rows),
+            "total_frames": global_index, "total_tasks": 1, "total_videos": len(episode_rows) * len(_CAMERAS),
+            "total_chunks": math.ceil(len(episode_rows) / 1000), "chunks_size": 1000, "fps": 30,
+            "data_path": LEGACY_DATA_PATH, "video_path": LEGACY_VIDEO_PATH,
+            "features": {camera: {"dtype": "video", "shape": [480, 640, 3], "info": {"video.fps": 30}} for camera in _CAMERAS},
+        }
+        atomic_write_json(meta / "info.json", info)
+        _write_lines(meta / "episodes.jsonl", episode_rows)
+        _write_lines(meta / "episodes_stats.jsonl", ({"episode_index": row["episode_index"], "stats": {}} for row in episode_rows))
+        _write_lines(meta / "tasks.jsonl", [{"task_index": 0, "task": FIXED_INSTRUCTION}])
+        atomic_write_json(meta / "modality.json", _modality_metadata())
+        atomic_write_json(meta / "mix-selection.json", plan.to_dict())
+        split = split_episode_ids(tuple(str(row["episode_index"]) for row in episode_rows), seed=plan.split_seed, validation_fraction=plan.validation_fraction)
+        planned_train = tuple(item.destination_episode_id for item in plan.selections if item.split == "train")
+        planned_validation = tuple(item.destination_episode_id for item in plan.selections if item.split == "validation")
+        if split.train != planned_train or split.validation != planned_validation:
+            raise ValueError("mix plan split assignments differ from deterministic split")
+        output_artifacts = artifact_identities(temporary)
+        manifest: dict[str, object] = {
+            "schema_version": 2, "source_format": "prepared-v2-frame-range-mix", "output_format": "groot_lerobot_v2.1_per_episode",
+            "source_revisions": plan.source_revisions, "raw_manifest_hashes": list(plan.raw_manifest_hashes),
+            "output_artifacts": output_artifacts, "output_manifest_sha256": canonical_json_sha256(output_artifacts),
+            "fps": 30, "frame_count": global_index, "episode_count": len(episode_rows), "split_seed": plan.split_seed,
+            "validation_fraction": plan.validation_fraction, "train_episode_ids": list(split.train), "validation_episode_ids": list(split.validation),
+            "camera_schema": [{"source_key": f"observation.images.{camera}", "dtype": "video", "shape": [480, 640, 3]} for camera in _CAMERAS],
+            "state_schema": {"source_key": "observation.state", "dimension": 12, "names": list(JOINT_NAMES)},
+            "action_schema": {"source_key": "action", "dimension": 12, "names": list(JOINT_NAMES), "storage": "absolute"},
+            "fixed_language_instruction": FIXED_INSTRUCTION,
+            "future_actions": {"horizon": ACTION_HORIZON, "loader_allow_padding": False, "materialized_windows": True, "tail_convention": "one_complete_source_range_per_episode", "valid_window_counts": {str(row["episode_index"]): 1 for row in episode_rows}},
+            "flywheel_mix_plan": plan.to_dict(), "statistics": {"status": "pending_final_mixed_train_only", "files": []},
+        }
+        atomic_write_json(temporary / "manifest.json", manifest)
+        from lehome_train.data.stats import write_train_statistics
+        from lehome_train.data.validate import validate_prepared_dataset
+
+        statistics = write_train_statistics(temporary)
+        validation = validate_prepared_dataset(temporary)
+        temporary.replace(destination)
+        return {"path": str(destination), "mix_plan_sha256": plan.sha256, "statistics": statistics, "validation": validation}
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
