@@ -14,7 +14,7 @@ def test_failures_rank_by_category_gap_stall_and_progress() -> None:
     assert [item.episode_id for item in ranked] == ["pant", "shirt"]
     assert ranked[0].priority_reasons == ("category_gap", "low_progress", "stalled", "restorable")
     assert ranked[0].official_success is False
-    assert ranked[0].official_return == 0.1
+    assert ranked[0].official_return is None
     assert ranked[0].diagnostics["max_progress"] == 0.1
 
 
@@ -26,3 +26,12 @@ def test_ranking_is_deterministic_and_rejects_missing_official_category_metric()
     assert [item.episode_id for item in rank_failures(failures, category_success={"pant_long": 0.0})] == ["a", "b"]
     with pytest.raises(ValueError, match="category_success"):
         rank_failures(failures, category_success={})
+
+
+def test_ranking_preserves_an_explicit_official_return_without_diagnostic_substitution() -> None:
+    evidence = FailureEvidence("episode", "pant_long", False, 0.2, 0, 100, False, official_return=-4.5)
+
+    ranked = rank_failures((evidence,), category_success={"pant_long": 0.5})
+
+    assert ranked[0].official_return == -4.5
+    assert ranked[0].diagnostics["max_progress"] == 0.2

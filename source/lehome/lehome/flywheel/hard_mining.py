@@ -34,9 +34,9 @@ class FailureEvidence:
             raise ValueError("official_return must be finite")
 
     @property
-    def preserved_official_return(self) -> float:
-        """Support the initial compact evidence schema without synthesizing rewards."""
-        return self.max_progress if self.official_return is None else self.official_return
+    def preserved_official_return(self) -> float | None:
+        """Return the recorder's official reward exactly as supplied."""
+        return self.official_return
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +44,7 @@ class RankedFailure:
     episode_id: str
     category: str
     official_success: bool
-    official_return: float
+    official_return: float | None
     score: float
     priority_reasons: tuple[str, ...]
     diagnostics: Mapping[str, float | int | bool]
