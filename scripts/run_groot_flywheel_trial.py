@@ -154,7 +154,7 @@ def run_randomization_acceptance(args: argparse.Namespace, *, env_factory=_produ
             env.reset()
             record = sample_randomization(strategy, seed=args.seed + index)
             receipt = env.apply_flywheel_randomization(record)
-            if dict(receipt) != dict(record.values): raise RuntimeError(f"{strategy} randomization readback mismatch")
+            if any(receipt.get(key) != value for key, value in record.values.items()): raise RuntimeError(f"{strategy} randomization readback mismatch")
             env.render()
             images = _images(env)
             paths = []

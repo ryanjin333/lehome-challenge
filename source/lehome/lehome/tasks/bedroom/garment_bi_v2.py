@@ -723,16 +723,43 @@ class GarmentEnv(DirectRLEnv):
             "camera_translation_m",
             "garment_yaw_deg",
             "robot_base_translation_m",
+            "table_texture_id",
+            "garment_display_color",
         }
         if set(values) != expected:
             raise ValueError("flywheel randomization receipt has unsupported fields")
         if self.object is None:
             raise RuntimeError("cannot randomize an uninitialized garment")
+        stage = self.scene.stage
+        texture_folder = self.texture_cfg.get("folder", "")
+        if not os.path.isabs(texture_folder):
+            texture_folder = os.path.join(os.getcwd(), texture_folder)
+        texture_path = os.path.join(texture_folder, f"{int(values['table_texture_id'])}.png")
+        if not os.path.isfile(texture_path):
+            raise RuntimeError("flywheel table texture asset is missing")
+        table_prim = stage.GetPrimAtPath(self.texture_cfg.get("prim_path", ""))
+        if not table_prim.IsValid():
+            raise RuntimeError("flywheel table shader prim is missing")
+        table_shader = UsdShade.Shader(table_prim)
+        table_input = table_shader.GetInput("file") or table_shader.GetInput("diffuse_texture")
+        if not table_input:
+            raise RuntimeError("flywheel table shader input is missing")
+        table_input.Set(Sdf.AssetPath(texture_path))
+        if str(table_input.Get().path) != texture_path:
+            raise RuntimeError("flywheel table shader readback mismatch")
+        mesh = stage.GetPrimAtPath(self.object.mesh_prim_path)
+        color_attr = mesh.GetAttribute("primvars:displayColor")
+        color = tuple(float(value) for value in values["garment_display_color"])
+        if not mesh.IsValid() or not color_attr.IsValid():
+            raise RuntimeError("flywheel garment displayColor is missing")
+        color_attr.Set([color])
+        read_color = tuple(float(value) for value in color_attr.Get()[0])
+        if not np.allclose(read_color, color, atol=1e-6):
+            raise RuntimeError("flywheel garment displayColor readback mismatch")
         camera_delta = np.asarray(values["camera_translation_m"], dtype=np.float32)
         base_delta = np.asarray(values["robot_base_translation_m"], dtype=np.float32)
         if camera_delta.shape != (3,) or base_delta.shape != (3,):
             raise ValueError("flywheel translation randomization must be 3-D")
-        stage = self.scene.stage
         light_path = self.flywheel_randomization_cfg.get("light_prim_path", "/World/Light")
         light = stage.GetPrimAtPath(light_path)
         if not light.IsValid():
@@ -773,12 +800,17 @@ class GarmentEnv(DirectRLEnv):
             "camera_translation_m": tuple(float(value) for value in camera_delta),
             "garment_yaw_deg": float(self.object.reset_pose[5] - (pose[5] - float(values["garment_yaw_deg"]))),
             "robot_base_translation_m": tuple(float(value) for value in base_delta),
+            "table_texture_id": int(values["table_texture_id"]),
+            "table_texture_path": str(table_input.Get().path),
+            "garment_display_color": read_color,
         }
         if (
             not np.isclose(receipt["light_intensity_scale"], values["light_intensity_scale"], atol=1e-5)
             or not np.allclose(receipt["camera_translation_m"], values["camera_translation_m"], atol=1e-5)
             or not np.isclose(receipt["garment_yaw_deg"], values["garment_yaw_deg"], atol=1e-5)
             or not np.allclose(receipt["robot_base_translation_m"], values["robot_base_translation_m"], atol=1e-5)
+            or receipt["table_texture_id"] != values["table_texture_id"]
+            or not np.allclose(receipt["garment_display_color"], values["garment_display_color"], atol=1e-5)
         ):
             raise RuntimeError("flywheel randomization readback does not match sampled values")
         self._flywheel_randomization_receipt = receipt

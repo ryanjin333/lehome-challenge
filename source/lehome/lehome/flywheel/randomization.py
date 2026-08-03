@@ -39,6 +39,8 @@ def sample_randomization(strategy: str, *, seed: int) -> RandomizationRecord:
         "camera_translation_m": tuple(float(value) for value in rng.uniform(-bounds.camera_m, bounds.camera_m, 3)),
         "garment_yaw_deg": float(rng.uniform(-bounds.garment_yaw_deg, bounds.garment_yaw_deg)),
         "robot_base_translation_m": tuple(float(value) for value in rng.uniform(-bounds.base_m, bounds.base_m, 3)),
+        "table_texture_id": int(rng.integers(1, 101)),
+        "garment_display_color": tuple(float(value) for value in rng.uniform(0.65, 1.0, 3)),
     }
     return RandomizationRecord(strategy, values)
 
