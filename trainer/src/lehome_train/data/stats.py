@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 
 from lehome_train.data.inspect import read_json_object
 from lehome_train.groot.modality import write_runtime_modality_config
-from lehome_train.io import atomic_write_json, canonical_json_bytes, sha256_file
+from lehome_train.io import atomic_write_json, canonical_json_bytes, canonical_json_sha256, sha256_file
 
 
 _STAT_NAMES = ("mean", "std", "min", "max", "q01", "q99")
@@ -54,6 +54,19 @@ def _load_manifest(dataset: Path) -> dict[str, Any]:
     if manifest.get("output_format") != "groot_lerobot_v2.1_per_episode":
         raise ValueError("prepared dataset has an unsupported output format")
     return manifest
+
+
+def _require_frozen_flywheel_mix(manifest: Mapping[str, Any]) -> None:
+    """Reject a final flywheel snapshot unless its selection plan is immutable."""
+    plan = manifest.get("flywheel_mix_plan")
+    if plan is None:
+        return
+    if not isinstance(plan, Mapping):
+        raise ValueError("flywheel mix plan is malformed")
+    recorded = plan.get("sha256")
+    body = {key: value for key, value in plan.items() if key != "sha256"}
+    if not isinstance(recorded, str) or canonical_json_sha256(body) != recorded:
+        raise ValueError("flywheel mix plan hash is invalid")
 
 
 def _train_ids(manifest: Mapping[str, Any]) -> tuple[str, ...]:
@@ -197,6 +210,7 @@ def compute_reference_statistics(dataset_path: str | Path) -> StatisticsBundle:
     dataset = Path(dataset_path)
     _reject_openpi_statistics(dataset)
     manifest = _load_manifest(dataset)
+    _require_frozen_flywheel_mix(manifest)
     train_ids = _train_ids(manifest)
     episodes = [_episode_values(dataset, episode_id) for episode_id in train_ids]
     states = [row for episode, _ in episodes for row in episode]

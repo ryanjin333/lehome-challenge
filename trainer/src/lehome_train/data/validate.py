@@ -396,6 +396,8 @@ def validate_prepared_dataset(
     dataset = Path(dataset_path)
     _reject_openpi_statistics(dataset)
     manifest = read_json_object(dataset / "manifest.json")
+    from lehome_train.data.stats import _require_frozen_flywheel_mix
+    _require_frozen_flywheel_mix(manifest)
     train, validation = _validate_manifest(manifest)
     _validate_offline_split(dataset, manifest, train, validation)
     _validate_statistics(dataset)

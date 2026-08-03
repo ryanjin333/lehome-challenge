@@ -15,6 +15,7 @@ import pyarrow.parquet as pq
 from lehome_train.data.convert import LEGACY_DATA_PATH, LEGACY_VIDEO_PATH, _validate_output_video
 from lehome_train.data.mapping import FIXED_INSTRUCTION, JOINT_NAMES
 from lehome_train.io import atomic_write_json, canonical_json_bytes, canonical_json_sha256
+from lehome_train.io import sha256_file
 
 
 ACTION_HORIZON = 16
@@ -183,7 +184,7 @@ def materialize_episode(raw_root: str | Path, output_root: str | Path) -> Materi
         _write_lines(meta / "episodes.jsonl", [{"episode_index": 0, "length": len(selected), "task_index": 0}])
         _write_lines(meta / "episodes_stats.jsonl", [{"episode_index": 0, "stats": {}}])
         _write_lines(meta / "tasks.jsonl", [{"task_index": 0, "task": FIXED_INSTRUCTION}])
-        atomic_write_json(meta / "materialization-provenance.json", {"raw_episode_id": raw["episode_id"], "raw_identity": dict(identity), "raw_manifest_verified": True, "selection_horizon": ACTION_HORIZON, "selected_steps": steps})
+        atomic_write_json(meta / "materialization-provenance.json", {"raw_episode_id": raw["episode_id"], "raw_manifest_sha256": sha256_file(raw_root / "SHA256SUMS.json"), "quality_grade": raw["quality_grade"], "raw_identity": dict(identity), "raw_manifest_verified": True, "selection_horizon": ACTION_HORIZON, "selected_steps": steps})
         manifest = {"schema_version": 1, "output_format": "groot_lerobot_v2.1_per_episode", "source_format": "flywheel_raw_terminal_artifact", "fps": 30, "episode_count": 1, "frame_count": len(selected), "train_episode_ids": ["0"], "validation_episode_ids": [], "fixed_language_instruction": FIXED_INSTRUCTION, "camera_schema": [{"source_key": f"observation.images.{camera}", "dtype": "video", "shape": [480, 640, 3]} for camera in CAMERA_KEYS], "state_schema": {"source_key": "observation.state", "dimension": 12, "names": list(JOINT_NAMES)}, "action_schema": {"source_key": "action", "dimension": 12, "names": list(JOINT_NAMES), "storage": "absolute"}, "future_actions": {"horizon": ACTION_HORIZON, "loader_allow_padding": False, "materialized_windows": True, "tail_convention": "drop_incomplete_windows", "valid_window_counts": {"0": len(selected)}}, "statistics": {"status": "pending_final_mixed_train_only", "files": []}}
         atomic_write_json(output / "manifest.json", manifest)
         digest = canonical_json_sha256(manifest)
