@@ -123,6 +123,59 @@ def test_mix_materializes_real_ranges_with_exact_train_ratio_and_valid_stats(tmp
         validate_prepared_dataset(mixed)
 
 
+def test_mix_reserves_validation_source_ranges_before_training_oversampling(tmp_path: Path) -> None:
+    """A held-out frame range must never be recycled by train oversampling."""
+
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
+    grade_a = _prepared_source(tmp_path / "grade-a", kind="flywheel", grade="A", episodes=1)
+    grade_b = _prepared_source(tmp_path / "grade-b", kind="flywheel", grade="B", episodes=1)
+
+    # This exact small pool previously selected organizer episode 1 for both
+    # validation and repeated training slots.
+    plan = build_mix_plan(organizer, [grade_a, grade_b], seed=1)
+    train_source_frames = {
+        (item.source_manifest_sha256, item.source_episode_id, frame_id)
+        for item in plan.selections
+        if item.split == "train"
+        for frame_id in item.source_frame_ids
+    }
+    validation_source_frames = {
+        (item.source_manifest_sha256, item.source_episode_id, frame_id)
+        for item in plan.selections
+        if item.split == "validation"
+        for frame_id in item.source_frame_ids
+    }
+
+    assert train_source_frames.isdisjoint(validation_source_frames)
+    # The reduced source pools still support deterministic oversampling.
+    assert len([item for item in plan.selections if item.split == "train" and item.source_kind == "organizer"]) == 7
+    assert len([item for item in plan.selections if item.split == "train" and item.source_kind == "flywheel"]) == 3
+
+
+def test_mix_rejects_hash_valid_plan_with_cross_split_source_frame_leakage(tmp_path: Path) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
+    grade_a = _prepared_source(tmp_path / "grade-a", kind="flywheel", grade="A", episodes=1)
+    grade_b = _prepared_source(tmp_path / "grade-b", kind="flywheel", grade="B", episodes=1)
+    payload = build_mix_plan(organizer, [grade_a, grade_b], seed=1).to_dict()
+    train_range = next(item for item in payload["selected_frame_ranges"] if item["split"] == "train")
+    validation_range = next(item for item in payload["selected_frame_ranges"] if item["split"] == "validation")
+    validation_range.update({key: value for key, value in train_range.items() if key not in {"destination_episode_id", "split"}})
+    payload["sha256"] = canonical_json_sha256({key: value for key, value in payload.items() if key != "sha256"})
+
+    with pytest.raises(ValueError, match="source frames overlap"):
+        validate_mix_plan_payload(payload)
+
+
+def test_mix_rejects_a_pool_that_cannot_supply_disjoint_validation_ranges(tmp_path: Path) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=1)
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A", episodes=1)
+
+    # Training needs both source kinds for 70/30, so holding out either lone
+    # range would make the prior behavior leak it back through oversampling.
+    with pytest.raises(ValueError, match="too few disjoint source ranges"):
+        build_mix_plan(organizer, flywheel, seed=1)
+
+
 def test_mix_rejects_tampered_plan_and_source_without_leaving_output(tmp_path: Path) -> None:
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
     flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")

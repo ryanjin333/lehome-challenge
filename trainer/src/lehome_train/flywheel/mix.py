@@ -330,6 +330,54 @@ def _weighted_flywheel_cycle(items: Sequence[_Chunk], count: int, *, seed: int) 
     return _cycle(weighted, count, seed=seed)
 
 
+def _source_frame_keys(item: _Chunk | FrameSelection) -> set[tuple[str, str, str]]:
+    """Return the immutable identity of every selected source frame."""
+
+    if isinstance(item, _Chunk):
+        episode_id, frame_ids = item.episode_id, item.frame_ids
+    else:
+        episode_id, frame_ids = item.source_episode_id, item.source_frame_ids
+    return {
+        (item.source_manifest_sha256, episode_id, frame_id)
+        for frame_id in frame_ids
+    }
+
+
+def _reserve_validation_chunks(items: Sequence[_Chunk], count: int, *, seed: int) -> list[_Chunk]:
+    """Pick distinct held-out ranges while leaving each train source usable."""
+
+    if count <= 0:
+        return []
+    remaining_by_kind = {kind: sum(item.source_kind == kind for item in items) for kind in SOURCE_WEIGHTS}
+    ordered = list(items)
+    random.Random(seed).shuffle(ordered)
+    reserved: list[_Chunk] = []
+    for item in ordered:
+        # Both source kinds are required by the frozen 70/30 training contract.
+        # Do not consume the last range of either kind for validation: training
+        # can legitimately repeat the remaining range, but never a held-out one.
+        if remaining_by_kind[item.source_kind] <= 1:
+            continue
+        reserved.append(item)
+        remaining_by_kind[item.source_kind] -= 1
+        if len(reserved) == count:
+            return reserved
+    raise ValueError("mix has too few disjoint source ranges for validation and training")
+
+
+def _require_cross_split_source_frame_disjointness(selections: Sequence[FrameSelection]) -> None:
+    """Reject plans whose train and validation source frames intersect."""
+
+    source_frames = {"train": set(), "validation": set()}
+    for item in selections:
+        item_frames = _source_frame_keys(item)
+        if len(item_frames) != ACTION_HORIZON:
+            raise ValueError("flywheel mix plan source range has duplicate frame IDs")
+        source_frames[item.split].update(item_frames)
+    if source_frames["train"] & source_frames["validation"]:
+        raise ValueError("flywheel mix plan train and validation source frames overlap")
+
+
 def _total_with_exact_train_slots(train_slots: int, *, split_seed: int) -> tuple[int, set[str]]:
     total = train_slots
     while True:
@@ -424,6 +472,7 @@ def validate_mix_plan_payload(payload: Mapping[str, Any]) -> MixPlan:
         raise ValueError("flywheel mix plan training frame counts differ from selections")
     if organizer * 3 != flywheel * 7:
         raise ValueError("flywheel mix plan is not an exact 70/30 training-frame mixture")
+    _require_cross_split_source_frame_disjointness(plan.selections)
     return plan
 
 
@@ -460,9 +509,27 @@ def build_mix_plan(
     organizer_slots = train_slots * 7 // 10
     flywheel_slots = train_slots - organizer_slots
     total_slots, train_ids = _total_with_exact_train_slots(train_slots, split_seed=split_seed)
-    train_organizer = iter(_cycle(organizer_chunks, organizer_slots, seed=seed))
-    train_flywheel = iter(_weighted_flywheel_cycle(flywheel_chunks, flywheel_slots, seed=seed ^ 0x5A17))
-    validation = iter(_cycle(organizer_chunks + flywheel_chunks, total_slots - train_slots, seed=seed ^ 0xA55A))
+    validation_chunks = _reserve_validation_chunks(
+        organizer_chunks + flywheel_chunks,
+        total_slots - train_slots,
+        seed=seed ^ 0xA55A,
+    )
+    reserved_source_frames = {
+        frame
+        for item in validation_chunks
+        for frame in _source_frame_keys(item)
+    }
+    training_organizer_chunks = [
+        item for item in organizer_chunks
+        if _source_frame_keys(item).isdisjoint(reserved_source_frames)
+    ]
+    training_flywheel_chunks = [
+        item for item in flywheel_chunks
+        if _source_frame_keys(item).isdisjoint(reserved_source_frames)
+    ]
+    train_organizer = iter(_cycle(training_organizer_chunks, organizer_slots, seed=seed))
+    train_flywheel = iter(_weighted_flywheel_cycle(training_flywheel_chunks, flywheel_slots, seed=seed ^ 0x5A17))
+    validation = iter(validation_chunks)
     selections: list[FrameSelection] = []
     for index in range(total_slots):
         destination = str(index)
