@@ -629,6 +629,83 @@ class GarmentEnv(DirectRLEnv):
     def set_all_pose(self, pose):
         self.object.set_all_pose(pose)
 
+    def flywheel_capture_state(self) -> dict[str, object]:
+        """Return the complete mutable simulator state needed for hard replay."""
+        if self.object is None or not hasattr(self.object, "_cloth_prim_view"):
+            raise RuntimeError("cannot snapshot an uninitialized garment")
+        cloth = self.object._cloth_prim_view
+        if not hasattr(cloth, "get_world_positions") or not hasattr(cloth, "get_velocities"):
+            raise RuntimeError("Isaac cloth view does not expose restorable position and velocity")
+
+        def _numpy(value):
+            return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+
+        positions = _numpy(cloth.get_world_positions())
+        velocities = _numpy(cloth.get_velocities())
+        if positions.ndim == 3:
+            positions = positions[0]
+        if velocities.ndim == 3:
+            velocities = velocities[0]
+        rng_name, rng_keys, rng_pos, rng_gauss, rng_cached = self.garment_rng.get_state()
+        return {
+            "robot_position": np.concatenate(
+                (_numpy(self.left_arm.data.joint_pos)[0], _numpy(self.right_arm.data.joint_pos)[0])
+            ),
+            "robot_velocity": np.concatenate(
+                (_numpy(self.left_arm.data.joint_vel)[0], _numpy(self.right_arm.data.joint_vel)[0])
+            ),
+            "cloth_position": positions,
+            "cloth_velocity": velocities,
+            "rng_state": {
+                "kind": "numpy.RandomState",
+                "name": rng_name,
+                "keys": [int(value) for value in rng_keys.tolist()],
+                "position": int(rng_pos),
+                "has_gauss": int(rng_gauss),
+                "cached_gaussian": float(rng_cached),
+            },
+            "garment_name": self.cfg.garment_name,
+        }
+
+    def flywheel_restore_state(self, snapshot) -> None:
+        """Restore a validated flywheel snapshot without touching reset/reward logic."""
+        if self.object is None or not hasattr(self.object, "_cloth_prim_view"):
+            raise RuntimeError("cannot restore an uninitialized garment")
+        if snapshot.garment_name != self.cfg.garment_name:
+            raise ValueError("snapshot garment does not match the active environment")
+        cloth = self.object._cloth_prim_view
+        required = ("set_world_positions", "set_velocities")
+        if any(not hasattr(cloth, method) for method in required):
+            raise RuntimeError("Isaac cloth view does not expose restorable position and velocity")
+        device = self.device
+        robot_position = torch.tensor(snapshot.robot_position, dtype=torch.float32, device=device).unsqueeze(0)
+        robot_velocity = torch.tensor(snapshot.robot_velocity, dtype=torch.float32, device=device).unsqueeze(0)
+        self.left_arm.write_joint_position_to_sim(robot_position[:, :6])
+        self.right_arm.write_joint_position_to_sim(robot_position[:, 6:])
+        if not hasattr(self.left_arm, "write_joint_velocity_to_sim") or not hasattr(self.right_arm, "write_joint_velocity_to_sim"):
+            raise RuntimeError("Isaac articulation does not expose restorable joint velocity")
+        self.left_arm.write_joint_velocity_to_sim(robot_velocity[:, :6])
+        self.right_arm.write_joint_velocity_to_sim(robot_velocity[:, 6:])
+        cloth.set_world_positions(
+            torch.tensor(snapshot.cloth_position, dtype=torch.float32, device=device).unsqueeze(0)
+        )
+        cloth.set_velocities(
+            torch.tensor(snapshot.cloth_velocity, dtype=torch.float32, device=device).unsqueeze(0)
+        )
+        rng_state = snapshot.rng_state
+        if rng_state.get("kind") != "numpy.RandomState":
+            raise ValueError("unsupported flywheel RNG snapshot")
+        self.garment_rng.set_state(
+            (
+                str(rng_state["name"]),
+                np.asarray(rng_state["keys"], dtype=np.uint32),
+                int(rng_state["position"]),
+                int(rng_state["has_gauss"]),
+                float(rng_state["cached_gaussian"]),
+            )
+        )
+        self._flywheel_randomization_receipt = dict(snapshot.randomization)
+
     def switch_garment(self, garment_name: str, garment_version: str = None):
         """Switch to a different garment without recreating the environment.
 
