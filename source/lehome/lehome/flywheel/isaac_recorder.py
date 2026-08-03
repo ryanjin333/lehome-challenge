@@ -12,8 +12,8 @@ from uuid import uuid4
 
 import numpy as np
 
-from .artifacts import EpisodeArtifactWriter
-from .models import ActionSource, EpisodeFrame
+from .artifacts import EpisodeArtifactWriter, atomic_write_json
+from .models import ActionSource, EpisodeFrame, EpisodeIdentity
 
 
 _CAMERAS = ("top_rgb", "left_rgb", "right_rgb")
@@ -76,11 +76,14 @@ class RecordedEpisode:
 class AutonomousRecorder:
     """Record exactly the actions handed to one Isaac environment's ``step``."""
 
-    def __init__(self, run_root: Path, *, policy_revision: str, episode_id: str | None = None) -> None:
+    def __init__(self, run_root: Path, *, policy_revision: str, episode_id: str | None = None, identity: EpisodeIdentity | None = None) -> None:
         if len(policy_revision) != 40 or any(char not in "0123456789abcdef" for char in policy_revision):
             raise ValueError("policy_revision must be a pinned 40-character revision")
         self.writer = EpisodeArtifactWriter(run_root, episode_id or f"episode-{uuid4().hex}")
         self.policy_revision = policy_revision
+        if identity is not None and identity.policy_revision != policy_revision:
+            raise ValueError("recorder identity policy revision does not match")
+        self.identity = identity
         self.video_sink = _VideoSink()
         self.step = 0
         self._annotations: list[dict[str, object]] = []
@@ -126,6 +129,14 @@ class AutonomousRecorder:
         self.video_sink.append(observation)
         self.step += 1
 
+    def record_snapshot(self, name: str, snapshot) -> None:
+        if self._finished or name not in {"reset", "terminal"}:
+            raise ValueError("snapshot name must be reset or terminal before finalization")
+        payload = snapshot.to_dict()
+        directory = self.writer.staging / "snapshots"
+        directory.mkdir(exist_ok=True)
+        atomic_write_json(directory / f"{name}.json", payload)
+
     def finish(self, *, reason: str, accepted_success: bool) -> RecordedEpisode:
         if self._finished:
             raise ValueError("recorder has already finished")
@@ -140,6 +151,15 @@ class AutonomousRecorder:
             # Autonomous policy data is diagnostic evidence, never an initial BC target.
             "bc_target_count": 0,
         }
+        if self.identity is not None:
+            episode["identity"] = {
+                "policy_repo": self.identity.policy_repo, "policy_revision": self.identity.policy_revision,
+                "policy_step": self.identity.policy_step, "code_revision": self.identity.code_revision,
+                "asset_revision": self.identity.asset_revision, "simulator_version": self.identity.simulator_version,
+                "garment_name": self.identity.garment_name, "category": self.identity.category,
+                "release_stage": self.identity.release_stage, "seed": self.identity.seed,
+                "instruction": self.identity.instruction, "strategy": self.identity.strategy,
+            }
         required_videos: tuple[str, ...] = ()
         try:
             if any(self.video_sink.count(camera) != self.step for camera in _CAMERAS):

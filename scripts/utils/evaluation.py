@@ -126,6 +126,27 @@ def run_evaluation_loop(
         policy.reset()
         stabilize_garment_after_reset(env, args)
 
+        recorder = None
+        reset_snapshot = None
+        randomization_receipt = {}
+        if flywheel_manifest is not None:
+            from lehome.flywheel.isaac_recorder import AutonomousRecorder
+            from lehome.flywheel.randomization import sample_randomization
+            from lehome.flywheel.snapshots import capture_snapshot
+
+            strategy = flywheel_manifest.get("strategy", "canonical")
+            sampled = sample_randomization(strategy, seed=flywheel_manifest.get("seed", args.seed))
+            randomization_receipt = env.apply_flywheel_randomization(sampled)
+            if dict(randomization_receipt) != dict(sampled.values):
+                raise RuntimeError("flywheel randomization readback mismatch")
+            recorder = AutonomousRecorder(
+                Path(flywheel_manifest["_path"]).parent,
+                policy_revision=flywheel_manifest["policy_revision"],
+                episode_id=flywheel_manifest.get("episode_id"),
+            )
+            reset_snapshot = capture_snapshot(env, randomization={"strategy": strategy, "sampled": dict(sampled.values), "receipt": dict(randomization_receipt)})
+            recorder.record_snapshot("reset", reset_snapshot)
+
         # 2. Initial Observation (Numpy)
         object_initial_pose = env.get_all_pose() if args.save_datasets else None
         observation_dict = env._get_observations()
@@ -142,16 +163,7 @@ def run_evaluation_loop(
         extra_steps = 0
         success_flag = False
         success = torch.tensor(False)
-        recorder = None
         terminal_reason = "horizon"
-        if flywheel_manifest is not None:
-            from lehome.flywheel.isaac_recorder import AutonomousRecorder
-
-            recorder = AutonomousRecorder(
-                Path(flywheel_manifest["_path"]).parent,
-                policy_revision=flywheel_manifest["policy_revision"],
-                episode_id=flywheel_manifest.get("episode_id"),
-            )
 
         for st in range(args.max_steps):
             if rate_limiter:
@@ -250,6 +262,8 @@ def run_evaluation_loop(
         is_success = success.item() if success_flag else False
 
         if recorder is not None:
+            from lehome.flywheel.snapshots import capture_snapshot
+            recorder.record_snapshot("terminal", capture_snapshot(env, randomization={"receipt": dict(randomization_receipt)}))
             recorder.finish(reason=terminal_reason, accepted_success=bool(is_success))
 
         # Save Datasets

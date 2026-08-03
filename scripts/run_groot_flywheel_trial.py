@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--garment")
     parser.add_argument("--episode-id")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--strategy", choices=("canonical", "mild", "strong"), default="canonical")
     parser.add_argument("--output-root", type=Path, default=Path("outputs/flywheel"))
     parser.add_argument("--task", default="LeHome-BiSO101-Direct-Garment-v2")
     parser.add_argument("--max-steps", type=int, default=600)
@@ -158,6 +159,7 @@ def _manifest_path(args: argparse.Namespace, revision: str) -> Path:
         "policy_path": str(args.policy_path.resolve()),
         "seed": args.seed,
         "garment": args.garment,
+        "strategy": args.strategy,
     }
     if args.episode_id:
         payload["episode_id"] = args.episode_id
