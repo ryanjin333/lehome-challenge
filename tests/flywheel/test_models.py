@@ -59,6 +59,21 @@ def test_frame_rejects_nonfinite_or_wrong_dimension_actions() -> None:
             success=False,
             segment=1,
         )
+
+
+def test_frame_rejects_mutable_vector_values() -> None:
+    with pytest.raises(ValueError, match="tuples"):
+        EpisodeFrame(
+            step=0,
+            monotonic_ns=1,
+            wall_time_ns=2,
+            state=[0.0] * 12,  # type: ignore[arg-type]
+            action=(0.0,) * 12,
+            action_source=ActionSource.EXPERT,
+            reward=0.0,
+            success=False,
+            segment=1,
+        )
     with pytest.raises(ValueError, match="12 finite"):
         EpisodeFrame(
             step=0,

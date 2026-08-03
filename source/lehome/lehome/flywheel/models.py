@@ -97,6 +97,8 @@ class EpisodeFrame:
     expert_sample_age_ms: float | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.state, tuple) or not isinstance(self.action, tuple):
+            raise ValueError("state and action must be immutable tuples")
         if len(self.state) != 12 or len(self.action) != 12:
             raise ValueError("state and action must contain 12 finite values")
         try:
