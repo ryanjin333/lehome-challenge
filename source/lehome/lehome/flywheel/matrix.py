@@ -80,6 +80,20 @@ def matrix_sha256(matrix: PublicMatrix) -> str:
     return hashlib.sha256(canonical_matrix_json(matrix).encode("utf-8")).hexdigest()
 
 
+def load_public_matrix(path: Path) -> PublicMatrix:
+    """Load only the byte-for-byte canonical public matrix contract."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"canonical public matrix is missing: {path}")
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValueError(f"cannot read canonical public matrix: {path}") from error
+    matrix = build_public_matrix()
+    if contents != canonical_matrix_json(matrix):
+        raise ValueError(f"matrix does not match the committed canonical public contract: {path}")
+    return matrix
+
+
 def _read_release_names(path: Path) -> frozenset[str]:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"required release asset list is missing: {path}")

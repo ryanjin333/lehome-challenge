@@ -15,7 +15,7 @@ from typing import Sequence
 
 from lehome.flywheel.artifacts import verify_episode
 from lehome.flywheel.capacity import CapacitySample, choose_worker_count
-from lehome.flywheel.matrix import Trial
+from lehome.flywheel.matrix import Trial, load_public_matrix, matrix_sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +130,7 @@ def _resource_margins() -> tuple[float, float, float]:
 
 
 def _run_worker_group(args: argparse.Namespace, assignments: Sequence[tuple[int, Trial]]) -> tuple[float, int, int]:
-    """Start independent one-environment workers, then wait with finite bounds."""
+    """Start workers together and apply one launch-relative deadline to all."""
     started = time.monotonic()
     processes: list[tuple[int, Trial, subprocess.Popen[str], Path, object]] = []
     for worker_id, trial in assignments:
@@ -140,21 +140,53 @@ def _run_worker_group(args: argparse.Namespace, assignments: Sequence[tuple[int,
         _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="started")
         log = log_path.open("x", encoding="utf-8")
         processes.append((worker_id, trial, subprocess.Popen(_trial_command(args, trial), stdout=log, stderr=subprocess.STDOUT), heartbeat, log))
+    returncodes: dict[int, int] = {}
+    pending = list(processes)
+    deadline = started + args.worker_timeout_seconds
+    while pending and time.monotonic() < deadline:
+        still_pending: list[tuple[int, Trial, subprocess.Popen[str], Path, object]] = []
+        for worker_id, trial, process, heartbeat, log in pending:
+            returncode = process.poll()
+            if returncode is None:
+                still_pending.append((worker_id, trial, process, heartbeat, log))
+                continue
+            returncodes[worker_id] = returncode
+            _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="terminal")
+        pending = still_pending
+        if pending:
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+    if pending:
+        for worker_id, trial, process, heartbeat, log in pending:
+            process.terminate()
+            _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="timeout")
+        grace_deadline = time.monotonic() + args.terminate_grace_seconds
+        while pending and time.monotonic() < grace_deadline:
+            still_pending = []
+            for worker_id, trial, process, heartbeat, log in pending:
+                if process.poll() is None:
+                    still_pending.append((worker_id, trial, process, heartbeat, log))
+            pending = still_pending
+            if pending:
+                time.sleep(min(0.1, max(0.0, grace_deadline - time.monotonic())))
+        for worker_id, trial, process, heartbeat, log in pending:
+            process.kill()
+        reap_deadline = time.monotonic() + args.terminate_grace_seconds
+        while pending and time.monotonic() < reap_deadline:
+            still_pending = []
+            for worker_id, trial, process, heartbeat, log in pending:
+                if process.poll() is None:
+                    still_pending.append((worker_id, trial, process, heartbeat, log))
+            pending = still_pending
+            if pending:
+                time.sleep(min(0.1, max(0.0, reap_deadline - time.monotonic())))
+        for worker_id, trial, process, heartbeat, log in processes:
+            if worker_id not in returncodes:
+                returncodes[worker_id] = 124
+
     completed = failed = 0
     for worker_id, trial, process, heartbeat, log in processes:
-        try:
-            returncode = process.wait(timeout=args.worker_timeout_seconds)
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            try:
-                process.wait(timeout=args.terminate_grace_seconds)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-            returncode = 124
-            _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="timeout")
-        else:
-            _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="terminal")
+        returncode = returncodes[worker_id]
         log.close()
         try:
             verify_episode(args.output_root / "raw" / trial.trial_id)
@@ -170,7 +202,7 @@ def _run_worker_group(args: argparse.Namespace, assignments: Sequence[tuple[int,
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--matrix", type=Path, required=True)
+    parser.add_argument("--matrix", type=Path, required=True, help="committed canonical public 280-trial JSON")
     parser.add_argument("--policy-path", type=Path, required=True)
     parser.add_argument("--policy-revision-file", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
@@ -185,23 +217,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strategy", choices=("canonical", "mild", "strong"), default="canonical")
     parser.add_argument("--trials-per-worker", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=600)
-    parser.add_argument("--worker-timeout-seconds", type=float, default=1800.0)
+    parser.add_argument("--worker-timeout-seconds", type=_positive_finite_seconds, default=1800.0)
     parser.add_argument("--terminate-grace-seconds", type=_positive_finite_seconds, default=5.0)
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
 def run_campaign(args: argparse.Namespace) -> dict[str, object]:
-    from scripts.eval_groot_n17_matrix import load_matrix
-
     if (
         args.trials_per_worker <= 0
         or args.worker_timeout_seconds <= 0
+        or not math.isfinite(args.worker_timeout_seconds)
         or not math.isfinite(args.terminate_grace_seconds)
         or args.terminate_grace_seconds <= 0
     ):
         raise ValueError("worker counts and timeouts must be finite and positive")
-    trials = tuple(load_matrix(args.matrix))
+    matrix = load_public_matrix(args.matrix)
+    trials = matrix.trials
     args.output_root.mkdir(parents=True, exist_ok=True)
     state = CampaignState(args.output_root, tuple(trial.trial_id for trial in trials))
     by_id = {trial.trial_id: trial for trial in trials}
@@ -218,6 +250,12 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
 
     report: dict[str, object] = {
         "schema_version": 1,
+        "matrix": {
+            "schema_version": matrix.schema_version,
+            "sha256": matrix_sha256(matrix),
+            "trial_count": len(trials),
+            "training_holdouts": list(matrix.training_holdouts),
+        },
         "pending_before": list(pending),
         "workers": records,
         "completed_after": [trial_id for trial_id in state.trial_ids if trial_id not in pending_trial_ids(state)],

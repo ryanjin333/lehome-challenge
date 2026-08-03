@@ -412,8 +412,24 @@ Expected: PASS.
 
 Remote acceptance sequence on one already-approved host:
 
+The named matrix is checked byte-for-byte against the 280-trial public contract
+in `lehome.flywheel.matrix` before the campaign launches any worker.
+
 ```bash
-uv run python -m scripts.run_groot_flywheel_campaign --matrix configs/eval_groot_n17_public_280.json --policy-path /workspace/policies/step-12000 --policy-revision-file /workspace/policies/step-12000/revision.txt --output-root /workspace/rollouts/capacity --capacity-sweep 1,2,4,6,8 --trials-per-worker 1
+uv run python -m scripts.run_groot_flywheel_campaign \\
+  --matrix configs/eval_groot_n17_public_280.json \\
+  --policy-path /workspace/policies/step-12000 \\
+  --policy-revision-file /workspace/policies/step-12000/revision.txt \\
+  --policy-repo org/groot-policy \\
+  --policy-step 12000 \\
+  --code-revision "$(git rev-parse HEAD)" \\
+  --asset-revision <40-character-release-assets-commit> \\
+  --simulator-version isaac-sim-5.1 \\
+  --policy-artifact-sha256 "$(sha256sum /workspace/policies/step-12000/model.safetensors | awk '{print $1}')" \\
+  --image-identity <immutable-container-image-digest> \\
+  --output-root /workspace/rollouts/capacity \\
+  --capacity-sweep 1,2,4,6,8 \\
+  --trials-per-worker 1
 ```
 
 Expected: `capacity-report.json` names the accepted count, every tested process reaches a terminal trial, videos are nonempty, and the host keeps at least 20% RAM and 15% VRAM free. Do not launch the 280-trial campaign until this file passes validation.

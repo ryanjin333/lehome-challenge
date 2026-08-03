@@ -33,8 +33,9 @@ class CapacitySample:
         return tuple(reasons)
 
     @property
-    def per_worker_rate(self) -> float:
-        return self.completed_trials / self.workers / self.elapsed_seconds
+    def aggregate_rate(self) -> float:
+        """Completed trials per second across the whole worker group."""
+        return self.completed_trials / self.elapsed_seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,13 +59,15 @@ def choose_worker_count(samples: Sequence[CapacitySample], *, minimum_gain: floa
             rejected[8] = ("six_workers_not_accepted",)
             break
         reasons = list(sample.rejection_reasons(minimum_ram=0.20, minimum_vram=0.15))
-        if prior_rate is not None and sample.per_worker_rate / prior_rate - 1.0 < minimum_gain:
+        if prior_rate is not None and sample.aggregate_rate / prior_rate - 1.0 < minimum_gain:
             reasons.append("throughput_gain")
         if reasons:
             rejected[sample.workers] = tuple(dict.fromkeys(reasons))
+            if sample.workers == 1:
+                accepted = 0
             break
         accepted = sample.workers
-        prior_rate = sample.per_worker_rate
+        prior_rate = sample.aggregate_rate
     return CapacityDecision(accepted, rejected)
 
 
