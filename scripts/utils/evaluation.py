@@ -146,6 +146,7 @@ def run_evaluation_loop(
                 policy_revision=flywheel_manifest["policy_revision"],
                 episode_id=flywheel_manifest.get("episode_id"),
                 identity=identity,
+                provenance={"policy_artifact_sha256": flywheel_manifest["policy_artifact_sha256"], "image_identity": flywheel_manifest["image_identity"], "strategy_sampled": dict(sampled.values), "strategy_receipt": dict(randomization_receipt)},
             )
             reset_snapshot = capture_snapshot(env, randomization={"strategy": strategy, "sampled": dict(sampled.values), "receipt": dict(randomization_receipt)})
             recorder.record_snapshot("reset", reset_snapshot)

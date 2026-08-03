@@ -192,7 +192,12 @@ def _manifest_path(args: argparse.Namespace, revision: str) -> Path:
     }
     if args.episode_id:
         payload["episode_id"] = args.episode_id
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file() or path.read_text(encoding="utf-8") != content:
+            raise ValueError("refusing to overwrite differing flywheel manifest")
+        return path
+    path.write_text(content, encoding="utf-8")
     return path
 
 

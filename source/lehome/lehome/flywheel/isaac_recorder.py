@@ -76,7 +76,7 @@ class RecordedEpisode:
 class AutonomousRecorder:
     """Record exactly the actions handed to one Isaac environment's ``step``."""
 
-    def __init__(self, run_root: Path, *, policy_revision: str, episode_id: str | None = None, identity: EpisodeIdentity | None = None) -> None:
+    def __init__(self, run_root: Path, *, policy_revision: str, episode_id: str | None = None, identity: EpisodeIdentity | None = None, provenance: Mapping[str, object] | None = None) -> None:
         if len(policy_revision) != 40 or any(char not in "0123456789abcdef" for char in policy_revision):
             raise ValueError("policy_revision must be a pinned 40-character revision")
         self.writer = EpisodeArtifactWriter(run_root, episode_id or f"episode-{uuid4().hex}")
@@ -86,6 +86,13 @@ class AutonomousRecorder:
         if identity is not None and identity.episode_id != self.writer.episode_id:
             raise ValueError("recorder identity episode ID does not match writer")
         self.identity = identity
+        self.provenance = dict(provenance or {})
+        digest = self.provenance.get("policy_artifact_sha256")
+        image = self.provenance.get("image_identity")
+        if self.provenance and (not isinstance(digest, str) or len(digest) != 64 or not isinstance(image, str) or not image):
+            raise ValueError("recorder provenance requires artifact SHA-256 and image identity")
+        if any("secret" in key.lower() or "token" in key.lower() or "env" in key.lower() for key in self.provenance):
+            raise ValueError("recorder provenance must not contain secrets or raw environment")
         self.video_sink = _VideoSink()
         self.step = 0
         self._annotations: list[dict[str, object]] = []
@@ -163,6 +170,8 @@ class AutonomousRecorder:
                 "release_stage": self.identity.release_stage, "seed": self.identity.seed,
                 "instruction": self.identity.instruction, "strategy": self.identity.strategy,
             }
+        if self.provenance:
+            episode["provenance"] = self.provenance
         required_videos: tuple[str, ...] = ()
         try:
             if any(self.video_sink.count(camera) != self.step for camera in _CAMERAS):
