@@ -172,14 +172,14 @@ def _run_worker_group(args: argparse.Namespace, assignments: Sequence[tuple[int,
         for worker_id, trial, process, heartbeat, log in pending:
             process.kill()
         reap_deadline = time.monotonic() + args.terminate_grace_seconds
-        while pending and time.monotonic() < reap_deadline:
-            still_pending = []
-            for worker_id, trial, process, heartbeat, log in pending:
-                if process.poll() is None:
-                    still_pending.append((worker_id, trial, process, heartbeat, log))
-            pending = still_pending
-            if pending:
-                time.sleep(min(0.1, max(0.0, reap_deadline - time.monotonic())))
+        for worker_id, trial, process, heartbeat, log in pending:
+            remaining = reap_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"worker {worker_id} did not exit after SIGKILL")
+            try:
+                process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(f"worker {worker_id} did not exit after SIGKILL") from error
         for worker_id, trial, process, heartbeat, log in processes:
             if worker_id not in returncodes:
                 returncodes[worker_id] = 124

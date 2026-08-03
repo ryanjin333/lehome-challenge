@@ -115,10 +115,11 @@ def _worker_args(tmp_path, *, worker_timeout_seconds: float = 2.0, terminate_gra
 class _TimeoutThenKillProcess:
     def __init__(self, events: list[tuple[str, float | None]]) -> None:
         self.events = events
+        self.killed = False
 
     def wait(self, timeout=None):
         self.events.append(("wait", timeout))
-        if timeout is None:
+        if self.killed or timeout is None:
             return 0
         raise subprocess.TimeoutExpired("trial", timeout)
 
@@ -131,6 +132,7 @@ class _TimeoutThenKillProcess:
 
     def kill(self) -> None:
         self.events.append(("kill", None))
+        self.killed = True
 
 
 class _SuccessfulProcess:
@@ -185,6 +187,7 @@ def test_worker_group_launches_immediately_and_uses_configured_shutdown_grace(mo
     assert events[:2] == [("launch", None), ("launch", None)]
     assert events.count(("terminate", None)) == 2
     assert events.count(("kill", None)) == 2
+    assert events.count(("wait", 0.25)) == 2
 
 
 def test_worker_group_uses_one_launch_relative_deadline(monkeypatch, tmp_path) -> None:
