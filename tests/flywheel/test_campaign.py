@@ -177,6 +177,28 @@ class _LaunchCleanupProcess:
         return 0
 
 
+class _GracefulAfterTerminateProcess:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.terminated = False
+
+    def poll(self):
+        self.events.append("poll")
+        return 0 if self.terminated else None
+
+    def terminate(self) -> None:
+        self.events.append("terminate")
+        self.terminated = True
+
+    def kill(self) -> None:
+        raise AssertionError("gracefully terminated worker must not be killed")
+
+    def wait(self, timeout=None):
+        self.events.append("wait")
+        assert self.terminated
+        return 0
+
+
 def _group_trials(count: int) -> tuple[tuple[int, Trial], ...]:
     return tuple(
         (index, Trial("pant_long", f"Pant_Long_Seen_{index}", "seen", 41 + index))
@@ -218,6 +240,28 @@ def test_worker_group_cleans_up_started_workers_when_later_log_open_fails(monkey
     ]
     assert [timeout for event, _, timeout in events if event == "wait"] == [0.25]
     assert all(log.closed for log in opened)
+
+
+def test_worker_group_reaps_a_partial_launch_worker_that_exits_after_terminate(monkeypatch, tmp_path) -> None:
+    events: list[str] = []
+    clock = [0.0]
+    launch_count = 0
+
+    def launch(*args, **kwargs):
+        nonlocal launch_count
+        launch_count += 1
+        if launch_count == 2:
+            raise OSError("popen failure")
+        return _GracefulAfterTerminateProcess(events)
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.time.sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.subprocess.Popen", launch)
+
+    with pytest.raises(OSError, match="popen failure"):
+        _run_worker_group(_worker_args(tmp_path), _group_trials(2))
+
+    assert events == ["poll", "terminate", "poll", "wait"]
 
 
 def test_worker_group_cleans_up_and_closes_every_log_when_later_popen_fails(monkeypatch, tmp_path) -> None:

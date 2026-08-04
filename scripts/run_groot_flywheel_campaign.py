@@ -135,6 +135,7 @@ def _cleanup_partially_launched_workers(
 ) -> list[BaseException]:
     """Bound a best-effort shutdown without hiding the launch failure that caused it."""
     errors: list[BaseException] = []
+    to_reap = list(processes)
     pending: list[tuple[int, Trial, subprocess.Popen[str], Path, object]] = []
     for record in processes:
         worker_id, trial, process, heartbeat, log = record
@@ -177,11 +178,8 @@ def _cleanup_partially_launched_workers(
             errors.append(RuntimeError(f"worker {worker_id} could not be killed during launch cleanup: {error}"))
 
     reap_deadline = time.monotonic() + args.terminate_grace_seconds
-    for worker_id, trial, process, heartbeat, log in pending:
-        remaining = reap_deadline - time.monotonic()
-        if remaining <= 0:
-            errors.append(RuntimeError(f"worker {worker_id} was not reaped after launch cleanup"))
-            continue
+    for worker_id, trial, process, heartbeat, log in to_reap:
+        remaining = max(0.0, reap_deadline - time.monotonic())
         try:
             process.wait(timeout=remaining)
         except BaseException as error:
