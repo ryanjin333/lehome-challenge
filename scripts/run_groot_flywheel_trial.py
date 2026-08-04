@@ -20,6 +20,7 @@ from lehome.flywheel.artifacts import atomic_write_json
 _PINNED = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OCI_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SHARD_NAME = re.compile(r"^model-([0-9]{5})-of-([0-9]{5})\.safetensors$")
 _RUNTIME_ASSET_DIRECTORIES = ("objects", "robots", "scenes", "textures")
 
 
@@ -88,6 +89,68 @@ def _sha256_regular_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def policy_artifact_sha256(policy_path: Path) -> str:
+    """Hash the exact monolithic or indexed safetensors weights a policy loads."""
+    root = Path(policy_path)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("policy checkpoint root must be a materialized directory")
+    monolithic = root / "model.safetensors"
+    index = root / "model.safetensors.index.json"
+    monolithic_present = monolithic.exists() or monolithic.is_symlink()
+    index_present = index.exists() or index.is_symlink()
+    if monolithic_present:
+        if index_present:
+            raise ValueError("policy checkpoint has ambiguous monolithic and indexed weights")
+        if any(_SHARD_NAME.fullmatch(path.name) for path in root.iterdir()):
+            raise ValueError("policy checkpoint has ambiguous monolithic and sharded weights")
+        return _sha256_regular_file(monolithic)
+    if index.is_symlink() or not index.is_file():
+        raise ValueError("policy checkpoint index is invalid")
+    try:
+        payload = json.loads(index.read_text(encoding="utf-8"))
+        weight_map = payload["weight_map"]
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise TypeError
+        shard_names = sorted(set(weight_map.values()))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise ValueError("policy checkpoint index is invalid") from error
+    parsed_names: list[tuple[int, int]] = []
+    for name in shard_names:
+        if not isinstance(name, str):
+            raise ValueError("policy checkpoint index has an invalid shard name")
+        match = _SHARD_NAME.fullmatch(name)
+        if match is None or Path(name).name != name:
+            raise ValueError("policy checkpoint index has an unsafe shard name")
+        parsed_names.append((int(match.group(1)), int(match.group(2))))
+    totals = {total for _, total in parsed_names}
+    if len(totals) != 1:
+        raise ValueError("policy checkpoint index has inconsistent shard totals")
+    total = totals.pop()
+    if total <= 0 or len(shard_names) != total or {number for number, _ in parsed_names} != set(range(1, total + 1)):
+        raise ValueError("policy checkpoint index has an incomplete shard set")
+    discovered = {
+        path.name
+        for path in root.iterdir()
+        if _SHARD_NAME.fullmatch(path.name)
+    }
+    referenced = set(shard_names)
+    if discovered - referenced:
+        raise ValueError("policy checkpoint contains unreferenced weight shards")
+    if referenced - discovered:
+        raise ValueError("policy checkpoint index references missing weight shards")
+    files = (index.name, *shard_names)
+    manifest = {
+        "schema_version": 1,
+        "files": [
+            {"path": name, "sha256": _sha256_regular_file(root / name)}
+            for name in files
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def _live_code_identity(args: argparse.Namespace) -> str:
     """Require the executed checkout, not a caller-supplied label, to be immutable."""
     root = _code_checkout_root().resolve()
@@ -108,12 +171,11 @@ def _live_code_identity(args: argparse.Namespace) -> str:
 
 
 def _live_policy_identity(args: argparse.Namespace) -> tuple[str, str]:
-    """Hash the exact checkpoint file named by the documented rollout command."""
+    """Hash the exact checkpoint weights named by the documented rollout command."""
     if args.policy_revision_file is None:
         raise ValueError("live policy identity requires a pinned revision file")
     revision = read_pinned_revision(args.policy_revision_file)
-    artifact = args.policy_path / "model.safetensors"
-    return revision, _sha256_regular_file(artifact)
+    return revision, policy_artifact_sha256(args.policy_path)
 
 
 def _runtime_container_image_identity() -> str:

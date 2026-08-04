@@ -462,7 +462,7 @@ docker run --rm --gpus '"device=0,1,2,3,4,5,6,7"' \
   --asset-revision bea65fd960ad5a1bb3bd3fa77164b28001c08ef9 \
   --release-assets-root /workspace/lehome-release-assets/objects/Challenge_Garment/Release \
   --simulator-version 5.1.0.0 \
-  --policy-artifact-sha256 "$(sha256sum /workspace/policies/step-12000/model.safetensors | awk '{print $1}')" \
+  --policy-artifact-sha256 "$(uv run python -c 'from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; print(policy_artifact_sha256(Path("/workspace/policies/step-12000")))')" \
   --image-identity "$IMAGE_IDENTITY" \
   --output-root /workspace/rollouts/capacity \
   --capacity-sweep 1,2,4,6,8 \

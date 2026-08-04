@@ -5,7 +5,9 @@ import pytest
 import numpy as np
 
 import argparse
+import hashlib
 import importlib
+import json
 from pathlib import Path
 import sys
 import types
@@ -16,6 +18,146 @@ from scripts.run_groot_flywheel_trial import (
     _live_runtime_identity, _manifest_path, _scene_state_matches, build_parser, read_pinned_revision, run_randomization_acceptance,
     run_snapshot_acceptance, run_trial, validate_args, _validate_live_runtime_identity,
 )
+
+
+def test_policy_artifact_sha256_hashes_the_index_and_every_referenced_shard(tmp_path) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    shards = {
+        "model-00001-of-00002.safetensors": b"first shard",
+        "model-00002-of-00002.safetensors": b"second shard",
+    }
+    index = {
+        "metadata": {"total_size": sum(len(payload) for payload in shards.values())},
+        "weight_map": {
+            "model.layer.0": "model-00001-of-00002.safetensors",
+            "model.layer.1": "model-00002-of-00002.safetensors",
+        },
+    }
+    (policy / "model.safetensors.index.json").write_text(
+        json.dumps(index, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    for name, payload in shards.items():
+        (policy / name).write_bytes(payload)
+    files = ("model.safetensors.index.json", *sorted(shards))
+    manifest = {
+        "files": [
+            {
+                "path": name,
+                "sha256": hashlib.sha256((policy / name).read_bytes()).hexdigest(),
+            }
+            for name in files
+        ],
+        "schema_version": 1,
+    }
+    expected = hashlib.sha256(
+        json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    assert trial_module.policy_artifact_sha256(policy) == expected
+    (policy / "model-00002-of-00002.safetensors").write_bytes(b"changed second shard")
+    assert trial_module.policy_artifact_sha256(policy) != expected
+
+
+@pytest.mark.parametrize(
+    "shard_names",
+    (
+        ("weights.safetensors",),
+        ("../model-00001-of-00001.safetensors",),
+        (
+            "model-00001-of-00003.safetensors",
+            "model-00003-of-00003.safetensors",
+        ),
+    ),
+)
+def test_policy_artifact_sha256_rejects_unsafe_or_incomplete_shard_sets(
+    tmp_path,
+    shard_names,
+) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    (policy / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {},
+                "weight_map": {
+                    f"model.layer.{index}": name
+                    for index, name in enumerate(shard_names)
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    for name in shard_names:
+        if Path(name).name == name:
+            (policy / name).write_bytes(b"shard")
+
+    with pytest.raises(ValueError, match="shard|index"):
+        trial_module.policy_artifact_sha256(policy)
+
+
+def test_policy_artifact_sha256_rejects_unreferenced_or_ambiguous_weights(tmp_path) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    (policy / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {},
+                "weight_map": {"model.layer": "model-00001-of-00001.safetensors"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (policy / "model-00001-of-00001.safetensors").write_bytes(b"referenced")
+    (policy / "model-00002-of-00002.safetensors").write_bytes(b"unreferenced")
+
+    with pytest.raises(ValueError, match="unreferenced"):
+        trial_module.policy_artifact_sha256(policy)
+
+    (policy / "model-00002-of-00002.safetensors").unlink()
+    (policy / "model.safetensors").write_bytes(b"monolithic")
+    with pytest.raises(ValueError, match="ambiguous"):
+        trial_module.policy_artifact_sha256(policy)
+
+
+def test_policy_artifact_sha256_rejects_monolithic_weights_with_loose_canonical_shard(tmp_path) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    (policy / "model.safetensors").write_bytes(b"monolithic")
+    (policy / "model-00001-of-00001.safetensors").write_bytes(b"loose shard")
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        trial_module.policy_artifact_sha256(policy)
+
+
+def test_policy_artifact_sha256_rejects_monolithic_weights_with_dangling_index(tmp_path) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    (policy / "model.safetensors").write_bytes(b"monolithic")
+    (policy / "model.safetensors.index.json").symlink_to("missing-index.json")
+
+    with pytest.raises(ValueError, match="ambiguous|invalid"):
+        trial_module.policy_artifact_sha256(policy)
+
+
+def test_policy_artifact_sha256_rejects_indexed_weights_with_dangling_monolithic(tmp_path) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    (policy / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {},
+                "weight_map": {"model.layer": "model-00001-of-00001.safetensors"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (policy / "model-00001-of-00001.safetensors").write_bytes(b"shard")
+    (policy / "model.safetensors").symlink_to("missing-model.safetensors")
+
+    with pytest.raises(ValueError, match="ambiguous|invalid"):
+        trial_module.policy_artifact_sha256(policy)
 
 
 def test_live_execution_identity_rejects_mismatched_code_policy_or_container(tmp_path, monkeypatch) -> None:
