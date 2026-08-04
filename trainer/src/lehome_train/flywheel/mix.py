@@ -47,6 +47,11 @@ class FrameSelection:
     frame_start: int
     frame_stop: int
     source_frame_ids: tuple[str, ...]
+    raw_manifest_sha256: str
+    raw_episode_id: str
+    raw_frame_start: int
+    raw_frame_stop: int
+    raw_frame_ids: tuple[str, ...]
     destination_episode_id: str
     split: str
     quality_grade: str | None = None
@@ -59,6 +64,11 @@ class FrameSelection:
             "frame_start": self.frame_start,
             "frame_stop": self.frame_stop,
             "source_frame_ids": list(self.source_frame_ids),
+            "raw_manifest_sha256": self.raw_manifest_sha256,
+            "raw_episode_id": self.raw_episode_id,
+            "raw_frame_start": self.raw_frame_start,
+            "raw_frame_stop": self.raw_frame_stop,
+            "raw_frame_ids": list(self.raw_frame_ids),
             "destination_episode_id": self.destination_episode_id,
             "split": self.split,
         }
@@ -100,7 +110,7 @@ class MixPlan:
 
     def body(self) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "seed": self.seed,
             "split_seed": self.split_seed,
             "validation_fraction": self.validation_fraction,
@@ -128,6 +138,11 @@ class _Chunk:
     start: int
     stop: int
     frame_ids: tuple[str, ...]
+    raw_manifest_sha256: str
+    raw_episode_id: str
+    raw_frame_start: int
+    raw_frame_stop: int
+    raw_frame_ids: tuple[str, ...]
     quality_grade: str | None
 
 
@@ -140,6 +155,7 @@ class _PreparedSource:
     source_revision: str
     quality_grade: str | None
     raw_manifest_sha256: str | None
+    raw_lineage_by_episode: Mapping[str, tuple[str, int, int, tuple[str, ...]]]
     rejection_counts: Mapping[str, int]
 
 
@@ -200,7 +216,11 @@ def _verify_artifacts(root: Path, manifest: Mapping[str, Any]) -> None:
         seen.add(relative)
 
 
-def _materialized_provenance(root: Path) -> tuple[str, str, Mapping[str, int]]:
+def _materialized_provenance(
+    root: Path,
+    *,
+    materialized_episode_ids: Sequence[str],
+) -> tuple[str, str, Mapping[str, int], Mapping[str, tuple[str, int, int, tuple[str, ...]]]]:
     provenance = _read_json(root / "meta" / "materialization-provenance.json")
     if provenance.get("raw_manifest_verified") is not True:
         raise ValueError("flywheel source raw artifact was not checksum verified")
@@ -220,15 +240,28 @@ def _materialized_provenance(root: Path) -> tuple[str, str, Mapping[str, int]]:
     ranges = provenance.get("selected_frame_ranges")
     if not isinstance(ranges, list) or not ranges:
         raise ValueError("flywheel source lacks immutable expert frame ranges")
-    for item in ranges:
+    if len(ranges) != len(materialized_episode_ids):
+        raise ValueError("flywheel provenance must map one raw range to every materialized episode")
+    raw_hash = _sha256(provenance.get("raw_manifest_sha256"), "raw manifest hash")
+    lineage_by_episode: dict[str, tuple[str, int, int, tuple[str, ...]]] = {}
+    for episode_id, item in zip(sorted(materialized_episode_ids, key=int), ranges, strict=True):
         if not isinstance(item, Mapping) or item.get("action_source") != "expert":
             raise ValueError("flywheel source contains non-expert targets")
-    raw_hash = _sha256(provenance.get("raw_manifest_sha256"), "raw manifest hash")
+        raw_episode_id = item.get("raw_episode_id")
+        start, stop = item.get("frame_start"), item.get("frame_stop")
+        if not isinstance(raw_episode_id, str) or not raw_episode_id or type(start) is not int or type(stop) is not int or start < 0 or stop - start != ACTION_HORIZON:
+            raise ValueError("flywheel provenance range must be an integer action-horizon raw range")
+        lineage_by_episode[episode_id] = (
+            raw_episode_id,
+            start,
+            stop,
+            tuple(str(frame_id) for frame_id in range(start, stop)),
+        )
     revision = _revision(identity.get("code_revision"), "flywheel code revision")
     counts = provenance.get("rejected_by_reason")
     if not isinstance(counts, Mapping) or any(type(value) is not int or value < 0 for value in counts.values()):
         raise ValueError("flywheel source rejection counts are invalid")
-    return raw_hash, revision, counts  # type: ignore[return-value]
+    return raw_hash, revision, counts, lineage_by_episode  # type: ignore[return-value]
 
 
 def _prepared_source(root_value: str | Path, *, kind: str) -> _PreparedSource:
@@ -244,6 +277,9 @@ def _prepared_source(root_value: str | Path, *, kind: str) -> _PreparedSource:
         raise ValueError("prepared mix source has an incompatible action horizon")
     _verify_artifacts(root, manifest)
     manifest_sha = sha256_file(root / "manifest.json")
+    episode_ids = manifest.get("train_episode_ids")
+    if not isinstance(episode_ids, list) or not episode_ids or not all(isinstance(value, str) for value in episode_ids) or len(set(episode_ids)) != len(episode_ids):
+        raise ValueError("prepared mix source has no unique train episodes")
     if kind == "organizer":
         return _PreparedSource(
             root=root,
@@ -253,9 +289,10 @@ def _prepared_source(root_value: str | Path, *, kind: str) -> _PreparedSource:
             source_revision=_revision(manifest.get("source_revision"), "organizer source revision"),
             quality_grade=None,
             raw_manifest_sha256=None,
+            raw_lineage_by_episode={},
             rejection_counts={},
         )
-    raw_hash, revision, counts = _materialized_provenance(root)
+    raw_hash, revision, counts, lineage_by_episode = _materialized_provenance(root, materialized_episode_ids=episode_ids)
     return _PreparedSource(
         root=root,
         kind=kind,
@@ -264,6 +301,7 @@ def _prepared_source(root_value: str | Path, *, kind: str) -> _PreparedSource:
         source_revision=revision,
         quality_grade=str(_read_json(root / "meta" / "materialization-provenance.json")["quality_grade"]),
         raw_manifest_sha256=raw_hash,
+        raw_lineage_by_episode=lineage_by_episode,
         rejection_counts=counts,
     )
 
@@ -299,6 +337,20 @@ def _source_chunks(source: _PreparedSource) -> list[_Chunk]:
             raise ValueError("prepared mix source has duplicate global frame IDs")
         for start in range(0, table.num_rows - ACTION_HORIZON + 1, ACTION_HORIZON):
             stop = start + ACTION_HORIZON
+            if source.kind == "organizer":
+                raw_manifest_sha256 = source.manifest_sha256
+                raw_episode_id = episode_id
+                raw_frame_start = frames[start]
+                raw_frame_stop = frames[stop - 1] + 1
+                raw_frame_ids = tuple(str(value) for value in frames[start:stop])
+            else:
+                try:
+                    raw_episode_id, raw_frame_start, raw_frame_stop, raw_frame_ids = source.raw_lineage_by_episode[episode_id]
+                except KeyError:
+                    raise ValueError("flywheel provenance is missing a materialized episode lineage") from None
+                raw_manifest_sha256 = source.raw_manifest_sha256
+                if raw_manifest_sha256 is None:
+                    raise ValueError("flywheel source is missing raw manifest lineage")
             chunks.append(
                 _Chunk(
                     source_kind=source.kind,
@@ -309,6 +361,11 @@ def _source_chunks(source: _PreparedSource) -> list[_Chunk]:
                     start=start,
                     stop=stop,
                     frame_ids=tuple(str(value) for value in global_ids[start:stop]),
+                    raw_manifest_sha256=raw_manifest_sha256,
+                    raw_episode_id=raw_episode_id,
+                    raw_frame_start=raw_frame_start,
+                    raw_frame_stop=raw_frame_stop,
+                    raw_frame_ids=raw_frame_ids,
                     quality_grade=source.quality_grade,
                 )
             )
@@ -343,26 +400,54 @@ def _source_frame_keys(item: _Chunk | FrameSelection) -> set[tuple[str, str, str
     }
 
 
+def _raw_episode_key(item: _Chunk | FrameSelection) -> tuple[str, str]:
+    return item.raw_manifest_sha256, item.raw_episode_id
+
+
+def _raw_frame_keys(item: _Chunk | FrameSelection) -> set[tuple[str, str, str]]:
+    return {
+        (item.raw_manifest_sha256, item.raw_episode_id, frame_id)
+        for frame_id in item.raw_frame_ids
+    }
+
+
 def _reserve_validation_chunks(items: Sequence[_Chunk], count: int, *, seed: int) -> list[_Chunk]:
-    """Pick distinct held-out ranges while leaving each train source usable."""
+    """Reserve whole immutable lineage episodes while leaving both kinds trainable."""
 
     if count <= 0:
         return []
-    remaining_by_kind = {kind: sum(item.source_kind == kind for item in items) for kind in SOURCE_WEIGHTS}
-    ordered = list(items)
-    random.Random(seed).shuffle(ordered)
-    reserved: list[_Chunk] = []
-    for item in ordered:
-        # Both source kinds are required by the frozen 70/30 training contract.
-        # Do not consume the last range of either kind for validation: training
-        # can legitimately repeat the remaining range, but never a held-out one.
-        if remaining_by_kind[item.source_kind] <= 1:
-            continue
-        reserved.append(item)
-        remaining_by_kind[item.source_kind] -= 1
-        if len(reserved) == count:
-            return reserved
-    raise ValueError("mix has too few disjoint source ranges for validation and training")
+    grouped: dict[tuple[str, str], list[_Chunk]] = {}
+    for item in items:
+        grouped.setdefault(_raw_episode_key(item), []).append(item)
+    groups = list(grouped.values())
+    if any(len({item.source_kind for item in group}) != 1 for group in groups):
+        raise ValueError("one immutable lineage episode cannot span organizer and flywheel sources")
+    groups_by_kind = {kind: sum(group[0].source_kind == kind for group in groups) for kind in SOURCE_WEIGHTS}
+    if any(groups_by_kind[kind] < 1 for kind in SOURCE_WEIGHTS):
+        raise ValueError("mix has no lineage episode for a required training kind")
+    random.Random(seed).shuffle(groups)
+    # Dynamic programming picks an exact validation-slot total without consuming
+    # the final lineage episode of either required training kind.  A range group
+    # is indivisible: all overlapping Task-1 windows inherit one split.
+    states: dict[tuple[int, int, int], tuple[int, ...]] = {(0, 0, 0): ()}
+    for index, group in enumerate(groups):
+        kind = group[0].source_kind
+        size = len(group)
+        for (frames, organizer_groups, flywheel_groups), selected in tuple(states.items()):
+            selected_by_kind = organizer_groups if kind == "organizer" else flywheel_groups
+            if frames + size > count or selected_by_kind >= groups_by_kind[kind] - 1:
+                continue
+            next_key = (
+                frames + size,
+                organizer_groups + (kind == "organizer"),
+                flywheel_groups + (kind == "flywheel"),
+            )
+            if next_key not in states:
+                states[next_key] = selected + (index,)
+    matches = [selected for (frames, _, _), selected in states.items() if frames == count]
+    if not matches:
+        raise ValueError("mix has too few distinct lineage episodes for an unsplit validation holdout")
+    return [item for index in matches[0] for item in groups[index]]
 
 
 def _require_cross_split_source_frame_disjointness(selections: Sequence[FrameSelection]) -> None:
@@ -376,6 +461,23 @@ def _require_cross_split_source_frame_disjointness(selections: Sequence[FrameSel
         source_frames[item.split].update(item_frames)
     if source_frames["train"] & source_frames["validation"]:
         raise ValueError("flywheel mix plan train and validation source frames overlap")
+
+
+def _require_cross_split_raw_lineage_isolation(selections: Sequence[FrameSelection]) -> None:
+    """Reject plans that split a raw episode or reuse one raw frame across splits."""
+
+    raw_frames = {"train": set(), "validation": set()}
+    raw_episodes = {"train": set(), "validation": set()}
+    for item in selections:
+        item_frames = _raw_frame_keys(item)
+        if len(item_frames) != ACTION_HORIZON:
+            raise ValueError("flywheel mix plan raw lineage range has duplicate frame IDs")
+        raw_frames[item.split].update(item_frames)
+        raw_episodes[item.split].add(_raw_episode_key(item))
+    if raw_frames["train"] & raw_frames["validation"]:
+        raise ValueError("flywheel mix plan train and validation raw frames overlap")
+    if raw_episodes["train"] & raw_episodes["validation"]:
+        raise ValueError("flywheel mix plan splits one immutable raw lineage episode across train and validation")
 
 
 def _total_with_exact_train_slots(train_slots: int, *, split_seed: int) -> tuple[int, set[str]]:
@@ -399,7 +501,7 @@ def _plan_from_payload(payload: Mapping[str, Any]) -> MixPlan:
         "rejected_by_reason", "sha256",
     }:
         raise ValueError("flywheel mix plan schema is invalid")
-    if payload["schema_version"] != 2 or type(payload["seed"]) is not int or type(payload["split_seed"]) is not int:
+    if payload["schema_version"] != 3 or type(payload["seed"]) is not int or type(payload["split_seed"]) is not int:
         raise ValueError("flywheel mix plan identity is invalid")
     if payload["validation_fraction"] != _SPLIT_FRACTION:
         raise ValueError("flywheel mix plan validation fraction is invalid")
@@ -413,23 +515,38 @@ def _plan_from_payload(payload: Mapping[str, Any]) -> MixPlan:
     for item in selections_value:
         if not isinstance(item, Mapping):
             raise ValueError("flywheel mix plan range is invalid")
-        required = {"source_kind", "source_manifest_sha256", "source_episode_id", "frame_start", "frame_stop", "source_frame_ids", "destination_episode_id", "split"}
+        required = {
+            "source_kind", "source_manifest_sha256", "source_episode_id", "frame_start", "frame_stop", "source_frame_ids",
+            "raw_manifest_sha256", "raw_episode_id", "raw_frame_start", "raw_frame_stop", "raw_frame_ids",
+            "destination_episode_id", "split",
+        }
         if set(item) not in (required, required | {"quality_grade"}):
             raise ValueError("flywheel mix plan range schema is invalid")
         if item.get("source_kind") not in SOURCE_WEIGHTS or item.get("split") not in {"train", "validation"}:
             raise ValueError("flywheel mix plan range role is invalid")
         start, stop = item.get("frame_start"), item.get("frame_stop")
         frame_ids = item.get("source_frame_ids")
+        raw_start, raw_stop = item.get("raw_frame_start"), item.get("raw_frame_stop")
+        raw_frame_ids = item.get("raw_frame_ids")
         destination = item.get("destination_episode_id")
         if type(start) is not int or type(stop) is not int or stop - start != ACTION_HORIZON or not isinstance(frame_ids, list) or len(frame_ids) != ACTION_HORIZON or not all(isinstance(value, str) for value in frame_ids) or not isinstance(destination, str) or destination in destinations:
             raise ValueError("flywheel mix plan range is not an action-horizon boundary")
+        if type(raw_start) is not int or type(raw_stop) is not int or raw_start < 0 or raw_stop - raw_start != ACTION_HORIZON or not isinstance(raw_frame_ids, list) or raw_frame_ids != [str(frame_id) for frame_id in range(raw_start, raw_stop)]:
+            raise ValueError("flywheel mix plan raw lineage is not an action-horizon boundary")
+        raw_episode_id = item.get("raw_episode_id")
+        if not isinstance(raw_episode_id, str) or not raw_episode_id:
+            raise ValueError("flywheel mix plan raw lineage episode is invalid")
         grade = item.get("quality_grade")
         if item["source_kind"] == "flywheel" and grade not in GRADE_WEIGHTS:
             raise ValueError("flywheel mix plan range has an invalid grade")
         if item["source_kind"] == "organizer" and grade is not None:
             raise ValueError("organizer mix range must not have a grade")
         destinations.add(destination)
-        selections.append(FrameSelection(str(item["source_kind"]), _sha256(item["source_manifest_sha256"], "mix source manifest hash"), str(item["source_episode_id"]), start, stop, tuple(frame_ids), destination, str(item["split"]), str(grade) if grade is not None else None))
+        selections.append(FrameSelection(
+            str(item["source_kind"]), _sha256(item["source_manifest_sha256"], "mix source manifest hash"), str(item["source_episode_id"]),
+            start, stop, tuple(frame_ids), _sha256(item["raw_manifest_sha256"], "mix raw manifest hash"), raw_episode_id,
+            raw_start, raw_stop, tuple(raw_frame_ids), destination, str(item["split"]), str(grade) if grade is not None else None,
+        ))
     source_revisions = payload["source_revisions"]
     raw_hashes = payload["raw_manifest_hashes"]
     rejected = payload["rejected_by_reason"]
@@ -473,6 +590,7 @@ def validate_mix_plan_payload(payload: Mapping[str, Any]) -> MixPlan:
     if organizer * 3 != flywheel * 7:
         raise ValueError("flywheel mix plan is not an exact 70/30 training-frame mixture")
     _require_cross_split_source_frame_disjointness(plan.selections)
+    _require_cross_split_raw_lineage_isolation(plan.selections)
     return plan
 
 
@@ -514,18 +632,14 @@ def build_mix_plan(
         total_slots - train_slots,
         seed=seed ^ 0xA55A,
     )
-    reserved_source_frames = {
-        frame
-        for item in validation_chunks
-        for frame in _source_frame_keys(item)
-    }
+    reserved_raw_episodes = {_raw_episode_key(item) for item in validation_chunks}
     training_organizer_chunks = [
         item for item in organizer_chunks
-        if _source_frame_keys(item).isdisjoint(reserved_source_frames)
+        if _raw_episode_key(item) not in reserved_raw_episodes
     ]
     training_flywheel_chunks = [
         item for item in flywheel_chunks
-        if _source_frame_keys(item).isdisjoint(reserved_source_frames)
+        if _raw_episode_key(item) not in reserved_raw_episodes
     ]
     train_organizer = iter(_cycle(training_organizer_chunks, organizer_slots, seed=seed))
     train_flywheel = iter(_weighted_flywheel_cycle(training_flywheel_chunks, flywheel_slots, seed=seed ^ 0x5A17))
@@ -541,7 +655,11 @@ def build_mix_plan(
             split = "train"
         else:
             chunk, split = next(validation), "validation"
-        selections.append(FrameSelection(chunk.source_kind, chunk.source_manifest_sha256, chunk.episode_id, chunk.start, chunk.stop, chunk.frame_ids, destination, split, chunk.quality_grade))
+        selections.append(FrameSelection(
+            chunk.source_kind, chunk.source_manifest_sha256, chunk.episode_id, chunk.start, chunk.stop, chunk.frame_ids,
+            chunk.raw_manifest_sha256, chunk.raw_episode_id, chunk.raw_frame_start, chunk.raw_frame_stop, chunk.raw_frame_ids,
+            destination, split, chunk.quality_grade,
+        ))
     source_revisions = {
         f"{source.kind}:{source.manifest_sha256}": source.source_revision
         for source in (organizer_source, *flywheel_sources)
@@ -579,6 +697,22 @@ def _source_by_hash(sources: Iterable[_PreparedSource]) -> dict[str, _PreparedSo
     if len(result) != len(ordered):
         raise ValueError("mix sources have duplicate immutable manifest hashes")
     return result
+
+
+def _expected_raw_lineage(
+    source: _PreparedSource,
+    selection: FrameSelection,
+) -> tuple[str, str, int, int, tuple[str, ...]]:
+    if source.kind == "organizer":
+        start, stop = selection.frame_start, selection.frame_stop
+        return source.manifest_sha256, selection.source_episode_id, start, stop, tuple(str(frame_id) for frame_id in range(start, stop))
+    try:
+        raw_episode_id, start, stop, frame_ids = source.raw_lineage_by_episode[selection.source_episode_id]
+    except KeyError:
+        raise ValueError("mix source provenance is missing the planned materialized episode") from None
+    if source.raw_manifest_sha256 is None:
+        raise ValueError("mix source provenance is missing the planned raw manifest")
+    return source.raw_manifest_sha256, raw_episode_id, start, stop, frame_ids
 
 
 def _write_lines(path: Path, rows: Iterable[Mapping[str, object]]) -> None:
@@ -620,6 +754,8 @@ def materialize_mixed_snapshot(
         episode_rows: list[dict[str, object]] = []
         for selection in sorted(plan.selections, key=lambda item: int(item.destination_episode_id)):
             source = sources[selection.source_manifest_sha256]
+            if (selection.raw_manifest_sha256, selection.raw_episode_id, selection.raw_frame_start, selection.raw_frame_stop, selection.raw_frame_ids) != _expected_raw_lineage(source, selection):
+                raise ValueError("mix plan raw lineage no longer matches materialized inputs")
             source_info = _read_json(source.root / "meta" / "info.json")
             source_pattern = source_info["data_path"]
             source_chunk_size = source_info["chunks_size"]

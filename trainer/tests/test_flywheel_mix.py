@@ -166,13 +166,30 @@ def test_mix_rejects_hash_valid_plan_with_cross_split_source_frame_leakage(tmp_p
         validate_mix_plan_payload(payload)
 
 
+def test_mix_rejects_hash_valid_plan_that_splits_raw_lineage_with_new_local_ids(tmp_path: Path) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
+    grade_a = _prepared_source(tmp_path / "grade-a", kind="flywheel", grade="A", episodes=1)
+    grade_b = _prepared_source(tmp_path / "grade-b", kind="flywheel", grade="B", episodes=1)
+    payload = build_mix_plan(organizer, [grade_a, grade_b], seed=1).to_dict()
+    train_range = next(item for item in payload["selected_frame_ranges"] if item["split"] == "train")
+    validation_range = next(item for item in payload["selected_frame_ranges"] if item["split"] == "validation")
+    validation_range.update({
+        key: train_range[key]
+        for key in ("raw_manifest_sha256", "raw_episode_id", "raw_frame_start", "raw_frame_stop", "raw_frame_ids")
+    })
+    payload["sha256"] = canonical_json_sha256({key: value for key, value in payload.items() if key != "sha256"})
+
+    with pytest.raises(ValueError, match="raw frames overlap"):
+        validate_mix_plan_payload(payload)
+
+
 def test_mix_rejects_a_pool_that_cannot_supply_disjoint_validation_ranges(tmp_path: Path) -> None:
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=1)
     flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A", episodes=1)
 
     # Training needs both source kinds for 70/30, so holding out either lone
     # range would make the prior behavior leak it back through oversampling.
-    with pytest.raises(ValueError, match="too few disjoint source ranges"):
+    with pytest.raises(ValueError, match="too few distinct lineage episodes"):
         build_mix_plan(organizer, flywheel, seed=1)
 
 
@@ -229,3 +246,29 @@ def test_mix_consumes_the_real_task_1_materialized_contract(tmp_path: Path) -> N
         json.loads((grade_a / "meta" / "materialization-provenance.json").read_text(encoding="utf-8"))["raw_manifest_sha256"],
         json.loads((grade_b / "meta" / "materialization-provenance.json").read_text(encoding="utf-8"))["raw_manifest_sha256"],
     }
+
+
+def test_mix_keeps_overlapping_real_materializer_windows_in_one_split(tmp_path: Path) -> None:
+    """Adjacent Task-1 windows share raw frames even though local IDs differ."""
+
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
+    from lehome_train.flywheel.materialize import materialize_episode
+
+    materialized: list[Path] = []
+    for grade in ("A", "B"):
+        output = tmp_path / f"task1-{grade.lower()}"
+        materialize_episode(_raw_episode(tmp_path / f"raw-{grade.lower()}", grade=grade, frames=21), output)
+        materialized.append(output)
+
+    first_ranges = json.loads((materialized[0] / "meta" / "materialization-provenance.json").read_text(encoding="utf-8"))["selected_frame_ranges"]
+    assert [(item["frame_start"], item["frame_stop"]) for item in first_ranges] == [(4, 20), (5, 21)]
+
+    plan = build_mix_plan(organizer, materialized, seed=1)
+    splits_by_raw_episode: dict[tuple[str, str], set[str]] = {}
+    for item in plan.selections:
+        if item.source_kind != "flywheel":
+            continue
+        key = (item.raw_manifest_sha256, item.raw_episode_id)
+        splits_by_raw_episode.setdefault(key, set()).add(item.split)
+
+    assert all(len(splits) == 1 for splits in splits_by_raw_episode.values())

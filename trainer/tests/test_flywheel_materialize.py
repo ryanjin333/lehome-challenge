@@ -15,9 +15,9 @@ def _video(path: Path, frames: int = 20) -> None:
     subprocess.run(("ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=2x2:r=30", "-frames:v", str(frames), "-pix_fmt", "yuv420p", str(path)), check=True)
 
 
-def _raw_episode(root: Path, *, grade: str = "A", holdout: bool = False) -> Path:
+def _raw_episode(root: Path, *, grade: str = "A", holdout: bool = False, frames: int = 20) -> Path:
     writer = EpisodeArtifactWriter(root, "episode-1")
-    for index in range(20):
+    for index in range(frames):
         writer.append_annotation({
             "step": index, "monotonic_ns": index, "wall_time_ns": index,
             "action_source": "policy" if index < 4 else "expert", "segment": 0 if index < 4 else 1,
@@ -26,7 +26,7 @@ def _raw_episode(root: Path, *, grade: str = "A", holdout: bool = False) -> Path
             "expert_sample_age_ms": 1.0 if index >= 4 else None,
         })
     for camera in ("top_rgb", "left_rgb", "right_rgb"):
-        _video(writer.staging / "videos" / f"{camera}.mp4")
+        _video(writer.staging / "videos" / f"{camera}.mp4", frames=frames)
     return writer.finalize({
         "mode": "dagger", "outcome": "success", "accepted_success": True, "trainable": True,
         "quality_grade": grade, "rejection_reasons": [],
