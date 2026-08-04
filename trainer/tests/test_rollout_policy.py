@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 import sys
 import types
 
@@ -11,7 +12,7 @@ def _load_policy_module():
     """Load the adapter without importing Isaac/LeRobot dependencies."""
 
     package = types.ModuleType("scripts.eval_policy")
-    package.__path__ = ["scripts/eval_policy"]
+    package.__path__ = [str(Path(__file__).resolve().parents[2] / "scripts" / "eval_policy")]
     sys.modules.setdefault("scripts", types.ModuleType("scripts"))
     sys.modules["scripts.eval_policy"] = package
     for name in ("scripts.eval_policy.base_policy", "scripts.eval_policy.registry"):
@@ -23,6 +24,12 @@ def _load_policy_module():
 def _chunk(batch: int, horizon: int, dimension: int, start: float) -> np.ndarray:
     values = np.arange(batch * horizon * dimension, dtype=np.float32) + start
     return values.reshape(batch, horizon, dimension)
+
+
+def test_policy_loader_uses_the_repository_adapter_path():
+    module = _load_policy_module()
+
+    assert Path(module.__file__).resolve().parent == Path(__file__).resolve().parents[2] / "scripts" / "eval_policy"
 
 
 def test_flatten_groot_action_chunk_preserves_all_horizon_steps_and_group_order():

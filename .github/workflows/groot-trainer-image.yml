@@ -49,7 +49,8 @@ jobs:
         working-directory: trainer
         run: |
           uv sync --frozen
-          uv run pytest tests --ignore=tests/test_groot_runtime_gate.py -q
+          PYTHONPATH=../source/lehome:.. uv run --frozen --with numpy==1.26.0 \
+            pytest tests --ignore=tests/test_groot_runtime_gate.py -q
           uv lock --check
       - name: Reject tracked secrets and large artifacts
         shell: bash
