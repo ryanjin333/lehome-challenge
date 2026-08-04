@@ -24,7 +24,6 @@ from lehome.utils.record import (
     get_next_experiment_path_with_gap,
     append_episode_initial_pose,
 )
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from .common import stabilize_garment_after_reset
 from lehome.utils.logger import get_logger
 
@@ -103,6 +102,10 @@ def run_evaluation_loop(
     json_path = None
     episode_index = 0
     if args.save_datasets:
+        # Dataset recording is optional for rollout evaluation.  Keep LeRobot
+        # out of the import path unless this branch is explicitly requested.
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
         features = None
         if args.dataset_root and Path(args.dataset_root).exists():
             source_dataset = LeRobotDataset(repo_id="collected_dataset", root=Path(args.dataset_root))

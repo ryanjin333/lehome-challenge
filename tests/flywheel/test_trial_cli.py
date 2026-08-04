@@ -1014,3 +1014,73 @@ def test_policy_server_child_unblocks_sigterm_before_runtime_load(tmp_path) -> N
         if process.poll() is None:
             process.kill()
             process.wait(timeout=3)
+
+
+def _clear_utils_modules(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in tuple(sys.modules):
+        if name == "scripts.utils" or name.startswith("scripts.utils."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+
+def test_utils_common_import_does_not_load_dataset_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_utils_modules(monkeypatch)
+    common = types.ModuleType("scripts.utils.common")
+    common.launch_app = lambda *_args, **_kwargs: None
+    common.launch_app_from_args = lambda *_args, **_kwargs: None
+    common.close_app = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "scripts.utils.common", common)
+    monkeypatch.setitem(sys.modules, "pyarrow", None)
+    monkeypatch.setitem(sys.modules, "lerobot", None)
+
+    namespace: dict[str, object] = {}
+    exec("from scripts.utils import common", namespace)
+
+    assert namespace["common"].__name__ == "scripts.utils.common"
+    assert "scripts.utils.dataset_inspection" not in sys.modules
+    assert "scripts.utils.dataset_processing" not in sys.modules
+    with pytest.raises(ModuleNotFoundError, match="pyarrow"):
+        importlib.import_module("scripts.utils").inspect
+
+
+def test_evaluation_only_imports_lerobot_when_saving_datasets(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_utils_modules(monkeypatch)
+    common = types.ModuleType("scripts.utils.common")
+    common.launch_app = lambda *_args, **_kwargs: None
+    common.launch_app_from_args = lambda *_args, **_kwargs: None
+    common.close_app = lambda *_args, **_kwargs: None
+    common.stabilize_garment_after_reset = lambda *_args, **_kwargs: None
+    modules = {
+        "scripts.utils.common": common,
+        "gymnasium": types.ModuleType("gymnasium"),
+        "torch": types.ModuleType("torch"),
+        "numpy": types.ModuleType("numpy"),
+        "isaaclab": types.ModuleType("isaaclab"),
+        "isaaclab.envs": types.ModuleType("isaaclab.envs"),
+        "isaaclab_tasks": types.ModuleType("isaaclab_tasks"),
+        "isaaclab_tasks.utils": types.ModuleType("isaaclab_tasks.utils"),
+        "scripts.eval_policy": types.ModuleType("scripts.eval_policy"),
+        "scripts.eval_policy.base_policy": types.ModuleType("scripts.eval_policy.base_policy"),
+        "scripts.utils.eval_utils": types.ModuleType("scripts.utils.eval_utils"),
+        "lehome.utils.record": types.ModuleType("lehome.utils.record"),
+        "lehome.utils.logger": types.ModuleType("lehome.utils.logger"),
+        "lerobot": None,
+    }
+    modules["isaaclab.envs"].DirectRLEnv = object
+    modules["isaaclab_tasks.utils"].parse_env_cfg = lambda *_args, **_kwargs: None
+    modules["scripts.eval_policy"].PolicyRegistry = object
+    modules["scripts.eval_policy.base_policy"].BasePolicy = object
+    modules["scripts.utils.eval_utils"].convert_ee_pose_to_joints = lambda *_args, **_kwargs: None
+    modules["scripts.utils.eval_utils"].save_videos_from_observations = lambda *_args, **_kwargs: None
+    modules["scripts.utils.eval_utils"].calculate_and_print_metrics = lambda *_args, **_kwargs: None
+    modules["lehome.utils.record"].RateLimiter = object
+    modules["lehome.utils.record"].get_next_experiment_path_with_gap = lambda *_args, **_kwargs: None
+    modules["lehome.utils.record"].append_episode_initial_pose = lambda *_args, **_kwargs: None
+    modules["lehome.utils.logger"].get_logger = lambda *_args, **_kwargs: types.SimpleNamespace(info=lambda *_args: None)
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    evaluation = importlib.import_module("scripts.utils.evaluation")
+
+    assert "lerobot.datasets.lerobot_dataset" not in sys.modules
+    with pytest.raises(ModuleNotFoundError, match="lerobot"):
+        evaluation.run_evaluation_loop(None, None, types.SimpleNamespace(save_datasets=True))
