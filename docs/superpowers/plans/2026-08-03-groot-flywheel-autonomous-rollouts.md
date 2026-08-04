@@ -15,7 +15,7 @@
 - Create `source/lehome/lehome/flywheel/isaac_recorder.py`: per-step autonomous episode recorder.
 - Create `source/lehome/lehome/flywheel/snapshots.py`: robot, cloth, RNG, and environment state capture/restore.
 - Create `source/lehome/lehome/flywheel/randomization.py`: deterministic canonical/mild/strong parameter sampling.
-- Create `source/lehome/lehome/flywheel/capacity.py`: finite 1/2/4/6/8 acceptance decisions.
+- Create `source/lehome/lehome/flywheel/capacity.py`: finite 1/2/4 acceptance decisions for the four-GPU rollout host.
 - Create `scripts/run_groot_flywheel_trial.py`: one-trial process boundary.
 - Create `scripts/run_groot_flywheel_campaign.py`: resumable supervisor.
 - Modify `scripts/utils/evaluation.py`: opt-in recorder hooks and terminal reasons.
@@ -402,7 +402,7 @@ def choose_worker_count(samples: Sequence[CapacitySample], *, minimum_gain: floa
     return CapacityDecision(accepted, rejected)
 ```
 
-The supervisor uses explicit worker IDs, per-worker logs and heartbeat files, never shell globs for cleanup, verifies completed episode hashes before resume, and terminates a worker only after a finite timeout. Sweep order is exactly `1,2,4,6`, then `8` only if 6 passes. It never rents or destroys instances.
+The supervisor uses explicit worker IDs, per-worker logs and heartbeat files, never shell globs for cleanup, verifies completed episode hashes before resume, and terminates a worker only after a finite timeout. This four-GPU acceptance sweep is exactly `1,2,4`; it never rents or destroys instances.
 
 - [ ] **Step 4: Run local orchestration tests and the paid-host acceptance gate**
 
@@ -441,15 +441,19 @@ test "$(realpath Assets/objects/Challenge_Garment/Release)" = \
 ```
 
 ```bash
-# Provision a separate Isaac Sim 5.1 rollout image/template before running this
-# command.  The GR00T trainer image intentionally excludes Isaac Sim and must
-# not be used for capacity or rollout execution. Resolve this exact digest from
-# Docker Engine before the container starts; do not hand-type runtime identity.
+# Provision a custom Isaac Sim 5.1 rollout image containing the pinned GR00T
+# Python 3.10 server environment. A thin Vast template may select that image,
+# GPUs, and mounts, but cannot repair an incompatible host NVIDIA driver from
+# inside Docker; verify host-driver compatibility before the container starts.
+# The GR00T trainer image intentionally excludes Isaac Sim and must not be used
+# for capacity or rollout execution. Resolve this exact digest from Docker
+# Engine before the container starts; do not hand-type runtime identity.
 IMAGE_REF='YOUR_ISAAC_5_1_ROLLOUT_IMAGE@sha256:<64-lowercase-hex-digest>'
 IMAGE_IDENTITY="$(docker image inspect "$IMAGE_REF" --format '{{index .RepoDigests 0}}' | sed 's/.*@//')"
 test "$IMAGE_IDENTITY" = "${IMAGE_REF##*@}"
-# The 1/2/4/6/8 sweep assigns one isolated visible GPU to each worker.
-docker run --rm --gpus '"device=0,1,2,3,4,5,6,7"' \
+# The 1/2/4 sweep records physical GPUs. Isaac receives cuda:N directly; only
+# the per-trial GR00T policy-server child gets CUDA visibility narrowed.
+docker run --rm --gpus '"device=0,1,2,3"' \
   -e LEHOME_FLYWHEEL_IMAGE_IDENTITY="$IMAGE_IDENTITY" \
   "$IMAGE_REF" \
   uv run python -m scripts.run_groot_flywheel_campaign \
@@ -464,8 +468,11 @@ docker run --rm --gpus '"device=0,1,2,3,4,5,6,7"' \
   --simulator-version 5.1.0.0 \
   --policy-artifact-sha256 "$(uv run python -c 'from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; print(policy_artifact_sha256(Path("/workspace/policies/step-12000")))')" \
   --image-identity "$IMAGE_IDENTITY" \
+  --groot-root /workspace/Isaac-GR00T \
+  --groot-revision '<40-lowercase-hex-pinned-revision>' \
+  --groot-python /workspace/groot-venv/bin/python \
   --output-root /workspace/rollouts/capacity \
-  --capacity-sweep 1,2,4,6,8 \
+  --capacity-sweep 1,2,4 \
   --trials-per-worker 1
 ```
 

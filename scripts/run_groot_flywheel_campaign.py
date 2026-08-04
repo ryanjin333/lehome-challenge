@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import socket
 import stat
 import subprocess
 import sys
@@ -228,8 +229,15 @@ def _write_heartbeat(path: Path, *, worker_id: int, trial_id: str, state: str) -
     )
 
 
-def _trial_command(args: argparse.Namespace, trial: Trial, *, device: str | None = None) -> list[str]:
-    return [
+def _trial_command(
+    args: argparse.Namespace,
+    trial: Trial,
+    *,
+    device: str | None = None,
+    policy_server_port: int | None = None,
+    policy_server_log: Path | None = None,
+) -> list[str]:
+    command = [
         sys.executable, "-m", "scripts.run_groot_flywheel_trial", "--policy-path", str(args.policy_path),
         "--policy-revision-file", str(args.policy_revision_file), "--garment", trial.garment_name,
         "--policy-repo", args.policy_repo, "--policy-step", str(args.policy_step), "--code-revision", args.code_revision,
@@ -239,27 +247,74 @@ def _trial_command(args: argparse.Namespace, trial: Trial, *, device: str | None
         "--policy-artifact-sha256", args.policy_artifact_sha256, "--image-identity", args.image_identity,
         "--seed", str(trial.seed), "--episode-id", trial.trial_id, "--output-root", str(args.output_root),
         "--strategy", args.strategy,
-        "--max-steps", str(args.max_steps), "--device", device or getattr(args, "device", "cuda"), "--headless",
+        "--max-steps", str(args.max_steps), "--device", device or getattr(args, "device", "cuda"),
     ]
+    if (policy_server_port is None) != (policy_server_log is None):
+        raise ValueError("policy server port and log must be assigned together")
+    if policy_server_port is not None:
+        command.extend((
+            "--groot-root", str(args.groot_root), "--groot-revision", args.groot_revision,
+            "--groot-python", str(args.groot_python), "--policy-server-port", str(policy_server_port),
+            "--policy-server-readiness-timeout", str(args.policy_server_readiness_timeout),
+            "--policy-server-request-timeout", str(args.policy_server_request_timeout),
+            "--policy-server-termination-grace", str(args.policy_server_termination_grace),
+            "--policy-server-log", str(policy_server_log),
+        ))
+    command.append("--headless")
+    return command
+
+
+def _attempt_log_paths(worker_root: Path, trial_id: str) -> tuple[Path, Path]:
+    attempt = 1
+    while True:
+        worker_log = worker_root / f"{trial_id}.attempt-{attempt:03d}.log"
+        policy_server_log = worker_root / f"{trial_id}.attempt-{attempt:03d}.policy-server.log"
+        if all(not path.exists() and not path.is_symlink() for path in (worker_log, policy_server_log)):
+            return worker_log, policy_server_log
+        attempt += 1
 
 
 def _attempt_log_path(worker_root: Path, trial_id: str) -> Path:
-    attempt = 1
-    while True:
-        path = worker_root / f"{trial_id}.attempt-{attempt:03d}.log"
-        if not path.exists() and not path.is_symlink():
-            return path
-        attempt += 1
+    """Return the normal worker log while reserving its paired server-log suffix."""
+    return _attempt_log_paths(worker_root, trial_id)[0]
+
+
+def _allocate_loopback_port() -> int:
+    """Reserve a candidate loopback port long enough to prevent in-wave collisions.
+
+    The trial rechecks the candidate immediately before binding the policy server,
+    because a released ephemeral port cannot be held across an exec boundary.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+def _allocate_loopback_ports(workers: int) -> tuple[int, ...]:
+    if workers <= 0:
+        raise ValueError("worker count must be positive")
+    ports: set[int] = set()
+    max_attempts = workers * 16
+    while len(ports) != workers and max_attempts:
+        ports.add(_allocate_loopback_port())
+        max_attempts -= 1
+    if len(ports) != workers:
+        raise ValueError("could not allocate unique loopback policy-server ports")
+    return tuple(sorted(ports))
 
 
 def _run_one_worker(args: argparse.Namespace, *, worker_id: int, trial: Trial) -> int:
     worker_root = args.output_root / "workers" / f"worker-{worker_id:02d}"
     heartbeat = worker_root / "heartbeat.json"
-    log_path = _attempt_log_path(worker_root, trial.trial_id)
+    log_path, policy_server_log = _attempt_log_paths(worker_root, trial.trial_id)
+    policy_server_port = _allocate_loopback_ports(1)[0]
     _prepare_retry_attempt(args.output_root, trial.trial_id)
     _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="started")
     with log_path.open("x", encoding="utf-8") as log:
-        process = subprocess.Popen(_trial_command(args, trial), stdout=log, stderr=subprocess.STDOUT, env=_worker_environment(args, None))
+        process = subprocess.Popen(
+            _trial_command(args, trial, policy_server_port=policy_server_port, policy_server_log=policy_server_log),
+            stdout=log, stderr=subprocess.STDOUT, env=_worker_environment(args, _cuda_device_index(args.device)),
+        )
         try:
             returncode = process.wait(timeout=args.worker_timeout_seconds)
         except subprocess.TimeoutExpired:
@@ -276,11 +331,9 @@ def _run_one_worker(args: argparse.Namespace, *, worker_id: int, trial: Trial) -
 
 
 def _validate_sweep(values: str) -> tuple[int, ...]:
-    requested = tuple(int(value) for value in values.split(",") if value)
-    legal = (1, 2, 4, 6, 8)
-    if not requested or requested != legal[: len(requested)]:
-        raise ValueError("capacity sweep order must be 1,2,4,6, then 8 only if eligible")
-    return requested
+    if values != "1,2,4":
+        raise ValueError("four-GPU capacity sweep must be exactly 1,2,4")
+    return (1, 2, 4)
 
 
 def _positive_finite_seconds(value: str) -> float:
@@ -297,8 +350,8 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _resource_margins() -> tuple[float, float, float]:
-    """Read current host/GPU free margins; unknown telemetry fails closed."""
+def _resource_margins(gpu_indices: Sequence[int] | None = None) -> tuple[float, float, float]:
+    """Read host and assigned-GPU free margins; unknown telemetry fails closed."""
     host_margin = 0.0
     try:
         entries = dict(
@@ -311,14 +364,25 @@ def _resource_margins() -> tuple[float, float, float]:
         pass
     try:
         completed = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=index,memory.free,memory.total", "--format=csv,noheader,nounits"],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
             timeout=5.0,
         )
-        margins = [int(free) / int(total) for line in completed.stdout.splitlines() for free, total in [line.split(",")]]
+        observed = {
+            int(index): (int(free), int(total))
+            for line in completed.stdout.splitlines()
+            for index, free, total in [line.split(",")]
+        }
+        assigned = tuple(gpu_indices) if gpu_indices is not None else tuple(observed)
+        if len(set(assigned)) != len(assigned) or any(index not in observed for index in assigned):
+            raise ValueError("assigned GPU telemetry is unavailable")
+        margins = [observed[index][0] / observed[index][1] for index in assigned]
         vram_margin = min(margins) if completed.returncode == 0 and margins else 0.0
     except (OSError, ValueError, ZeroDivisionError, subprocess.TimeoutExpired):
         vram_margin = 0.0
+    # Kept as a compatibility return slot for callers still unpacking three
+    # values. Campaign decisions consume this once as combined Isaac+policy
+    # usage, never as independent renderer and inference evidence.
     return host_margin, vram_margin, vram_margin
 
 
@@ -377,10 +441,12 @@ def _worker_environment(
 ) -> dict[str, str]:
     environment = os.environ.copy()
     environment.pop("LEHOME_FLYWHEEL_POLICY_TELEMETRY_PATH", None)
+    environment.pop("CUDA_VISIBLE_DEVICES", None)
+    environment.pop("LEHOME_FLYWHEEL_WORKER_GPU", None)
     if gpu_index is not None:
-        # Isaac rendering and the colocated policy both see exactly one GPU,
-        # remapped to cuda:0 inside the worker process.
-        environment["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        # The trial receives a physical cuda:N and clears visibility itself
+        # before Isaac launches. Only its isolated GR00T-server child narrows
+        # CUDA_VISIBLE_DEVICES to this recorded physical GPU.
         environment["LEHOME_FLYWHEEL_WORKER_GPU"] = str(gpu_index)
     if policy_telemetry_path is not None:
         environment["LEHOME_FLYWHEEL_POLICY_TELEMETRY_PATH"] = str(policy_telemetry_path)
@@ -613,13 +679,12 @@ def _trial_has_first_progress(output_root: Path, trial_id: str) -> bool:
     return False
 
 
-def _capacity_telemetry() -> dict[str, object]:
-    """Take one bounded host/GPU sample; unknown fields remain explicit nulls."""
-    host_margin, inference_margin, render_margin = _resource_margins()
+def _capacity_telemetry(gpu_indices: Sequence[int] | None = None) -> dict[str, object]:
+    """Take one bounded host/assigned-GPU sample; unknown fields stay explicit."""
+    host_margin, combined_vram_margin, _ = _resource_margins(gpu_indices)
     sample: dict[str, object] = {
         "host_ram_margin": host_margin,
-        "inference_vram_margin": inference_margin,
-        "render_vram_margin": render_margin,
+        "combined_vram_margin": combined_vram_margin,
         "peak_host_ram_bytes": None,
         "peak_vram_bytes": None,
         "cpu_utilization": None,
@@ -642,13 +707,19 @@ def _capacity_telemetry() -> dict[str, object]:
         pass
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=index,memory.free,memory.total", "--format=csv,noheader,nounits"],
             check=False, capture_output=True, text=True, timeout=5.0,
         )
-        usage = [int(total) - int(free) for line in result.stdout.splitlines() for free, total in [line.split(",")]]
+        observed = {
+            int(index): (int(free), int(total))
+            for line in result.stdout.splitlines()
+            for index, free, total in [line.split(",")]
+        }
+        assigned = tuple(gpu_indices) if gpu_indices is not None else tuple(observed)
+        usage = [observed[index][1] - observed[index][0] for index in assigned]
         if result.returncode == 0 and usage:
             sample["peak_vram_bytes"] = max(usage) * 1024 * 1024
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+    except (KeyError, OSError, ValueError, subprocess.TimeoutExpired):
         pass
     return sample
 
@@ -668,11 +739,12 @@ def _cpu_counters() -> tuple[int, int] | None:
 class _CapacityTelemetrySampler:
     """Associate each /proc/stat delta with an execution-time telemetry sample."""
 
-    def __init__(self) -> None:
+    def __init__(self, gpu_indices: Sequence[int] | None = None) -> None:
         self._previous_cpu = _cpu_counters()
+        self._gpu_indices = tuple(gpu_indices) if gpu_indices is not None else None
 
     def sample(self) -> dict[str, object]:
-        sample = _capacity_telemetry()
+        sample = _capacity_telemetry(self._gpu_indices)
         current_cpu = _cpu_counters()
         if self._previous_cpu is not None and current_cpu is not None:
             total_delta = current_cpu[0] - self._previous_cpu[0]
@@ -795,15 +867,16 @@ def _run_worker_group(
     if gpu_indices is not None and len(gpu_indices) != len(assignments):
         raise ValueError("worker GPU assignment does not match the launched worker group")
     telemetry_samples: list[dict[str, object]] = []
-    telemetry_sampler = _CapacityTelemetrySampler() if collect_telemetry else None
+    telemetry_sampler = _CapacityTelemetrySampler(gpu_indices) if collect_telemetry else None
     policy_telemetry_paths: dict[int, _ProvisionedPolicyTelemetry] = {}
     first_progress: dict[int, float] = {}
     launch_log: object | None = None
+    policy_server_ports = _allocate_loopback_ports(len(assignments))
     try:
         for index, (worker_id, trial) in enumerate(assignments):
             worker_root = args.output_root / "workers" / f"worker-{worker_id:02d}"
             heartbeat = worker_root / "heartbeat.json"
-            log_path = _attempt_log_path(worker_root, trial.trial_id)
+            log_path, policy_server_log = _attempt_log_paths(worker_root, trial.trial_id)
             _prepare_retry_attempt(args.output_root, trial.trial_id)
             _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="started")
             launch_log = log_path.open("x", encoding="utf-8")
@@ -813,8 +886,15 @@ def _run_worker_group(
                 if collect_telemetry
                 else None
             )
+            policy_server_port = policy_server_ports[index]
             process = subprocess.Popen(
-                _trial_command(args, trial, device="cuda:0" if physical_gpu is not None else getattr(args, "device", "cuda")), stdout=launch_log, stderr=subprocess.STDOUT,
+                _trial_command(
+                    args,
+                    trial,
+                    device=f"cuda:{physical_gpu}" if physical_gpu is not None else getattr(args, "device", "cuda:0"),
+                    policy_server_port=policy_server_port,
+                    policy_server_log=policy_server_log,
+                ), stdout=launch_log, stderr=subprocess.STDOUT,
                 env=_worker_environment(
                     args,
                     physical_gpu,
@@ -934,7 +1014,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-identity", required=True)
     parser.add_argument("--capacity-sweep")
     parser.add_argument("--strategy", choices=("canonical", "mild", "strong"), default="canonical")
-    parser.add_argument("--device", default="cuda", help="Isaac/policy device forwarded to every trial")
+    parser.add_argument("--device", default="cuda:0", help="physical Isaac GPU forwarded to every trial")
+    parser.add_argument("--groot-root", type=Path, help="pinned materialized GR00T checkout for policy-server children")
+    parser.add_argument("--groot-revision", help="pinned GR00T checkout revision for policy-server children")
+    parser.add_argument("--groot-python", type=Path, help="Python 3.10 interpreter in the pinned GR00T environment")
+    parser.add_argument("--policy-server-readiness-timeout", type=_positive_finite_seconds, default=30.0)
+    parser.add_argument("--policy-server-request-timeout", type=_positive_finite_seconds, default=2.5)
+    parser.add_argument("--policy-server-termination-grace", type=_positive_finite_seconds, default=5.0)
     parser.add_argument("--trials-per-worker", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--worker-timeout-seconds", type=_positive_finite_seconds, default=1800.0)
@@ -959,6 +1045,15 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("worker counts and timeouts must be finite and positive")
     matrix = load_public_matrix(args.matrix)
     trials = matrix.trials
+    if not args.dry_run:
+        required_server_values = (args.groot_root, args.groot_revision, args.groot_python)
+        if any(value is None for value in required_server_values):
+            raise ValueError("campaign execution requires pinned GR00T policy-server arguments")
+        if not re.fullmatch(r"[0-9a-f]{40}", args.groot_revision):
+            raise ValueError("GR00T revision must be a pinned 40-character SHA")
+        device_index = _cuda_device_index(args.device)
+        if device_index is None or args.device != f"cuda:{device_index}":
+            raise ValueError("campaign execution requires --device cuda:<physical GPU>")
     args.output_root.mkdir(parents=True, exist_ok=True)
     state = CampaignState(args.output_root, tuple(trial.trial_id for trial in trials))
     by_id = {trial.trial_id: trial for trial in trials}
@@ -974,7 +1069,7 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
         records = [{"trial_id": trial_id, "command": _trial_command(args, by_id[trial_id])} for trial_id in pending]
 
     if args.capacity_sweep and not args.dry_run:
-        # A sweep is made exclusively of the documented 1/2/4/6(/8) waves.
+        # A four-GPU sweep is made exclusively of documented 1/2/4 waves.
         # Do not consume a hidden sequential pilot before its 1-worker wave.
         capacity_pending = list(pending)
     elif args.dry_run:
@@ -1004,18 +1099,6 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
         samples: list[CapacitySample] = []
         capacity_records: list[dict[str, object]] = []
         for count in counts:
-            decision_before = (
-                choose_worker_count(
-                    samples,
-                    max_inference_latency_seconds=args.max_inference_latency_seconds,
-                    max_inference_queue_depth=args.max_inference_queue_depth,
-                )
-                if samples
-                else None
-            )
-            if count == 8 and (decision_before is None or decision_before.accepted_workers != 6):
-                capacity_records.append({"workers": count, "status": "skipped", "reason": "six_workers_not_accepted"})
-                break
             assignments = tuple((index + 1, by_id[trial_id]) for index, trial_id in enumerate(capacity_pending[:count]))
             if len(assignments) != count:
                 capacity_records.append({"workers": count, "status": "skipped", "reason": "insufficient_pending_trials"})
@@ -1040,8 +1123,10 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
                 _, _, _, first_progress, telemetry_samples, worker_failures = result
             if telemetry_samples:
                 ram_margin = min(float(item["host_ram_margin"]) for item in telemetry_samples)
-                inference_margin = min(float(item["inference_vram_margin"]) for item in telemetry_samples)
-                render_margin = min(float(item["render_vram_margin"]) for item in telemetry_samples)
+                combined_vram_margin = min(
+                    float(item["combined_vram_margin"] if "combined_vram_margin" in item else item["inference_vram_margin"])
+                    for item in telemetry_samples
+                )
                 peak_ram = max((item["peak_host_ram_bytes"] for item in telemetry_samples if item["peak_host_ram_bytes"] is not None), default=None)
                 peak_vram = max((item["peak_vram_bytes"] for item in telemetry_samples if item["peak_vram_bytes"] is not None), default=None)
                 max_run_queue = max((item["run_queue"] for item in telemetry_samples if item["run_queue"] is not None), default=None)
@@ -1060,7 +1145,7 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
                     record["failure_class"] for record in policy_evidence_records
                 )
             else:
-                ram_margin, inference_margin, render_margin = _resource_margins()
+                ram_margin, combined_vram_margin, _ = _resource_margins(gpu_indices)
                 peak_ram = peak_vram = max_run_queue = max_cpu_utilization = max_inference_latency = max_inference_queue_depth = None
                 policy_evidence_records = ({"worker_id": worker_id, "failure_class": "policy_telemetry_missing"} for worker_id, _ in assignments)
                 policy_evidence_records = tuple(policy_evidence_records)
@@ -1092,7 +1177,9 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
                     classes.append(failure_class)
             worker_failures = tuple(attributed_worker_failures.values())
             sample = CapacitySample(
-                count, elapsed, completed, failed, inference_margin, render_margin, ram_margin,
+                # Isaac and the colocated GR00T service share each assigned GPU;
+                # use their observed headroom once, not as two fake resources.
+                count, elapsed, completed, failed, combined_vram_margin, 1.0, ram_margin,
                 first_progress_workers=len(first_progress) if first_progress or telemetry_samples else None,
                 stale_ipc_count=sum(
                     1
@@ -1118,8 +1205,8 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
                 "workers": count, "trial_ids": [trial.trial_id for _, trial in assignments], "gpu_indices": list(gpu_indices),
                 "elapsed_seconds": elapsed, "completed_trials": completed, "failed_trials": failed,
                 "first_progress_seconds": {str(worker): seconds for worker, seconds in first_progress.items()},
-                "host_ram_margin": ram_margin, "inference_vram_margin": inference_margin,
-                "render_vram_margin": render_margin, "peak_host_ram_bytes": peak_ram,
+                "host_ram_margin": ram_margin, "combined_vram_margin": combined_vram_margin,
+                "peak_host_ram_bytes": peak_ram,
                 "peak_vram_bytes": peak_vram, "max_cpu_utilization": max_cpu_utilization, "max_run_queue": max_run_queue,
                 "inference_latency_seconds": max_inference_latency,
                 "inference_queue_depth": max_inference_queue_depth,

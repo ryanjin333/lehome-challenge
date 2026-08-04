@@ -15,11 +15,14 @@ from scripts.run_groot_flywheel_campaign import (
     CampaignState,
     _failure_classes,
     _PolicyTelemetrySampler,
+    _attempt_log_paths,
     _prepare_policy_telemetry_path,
     _prepare_retry_attempt,
     _run_one_worker,
     _run_worker_group,
+    _resource_margins,
     _trial_command,
+    _validate_sweep,
     _worker_gpu_indices,
     _worker_environment,
     build_parser,
@@ -356,12 +359,111 @@ def test_campaign_parser_exposes_device_and_forwards_it_to_trial_workers(tmp_pat
     assert "--device" in _trial_command(args, build_public_matrix().trials[0])
 
 
-def test_isolated_worker_remaps_its_single_visible_gpu_to_cuda_zero(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "value",
+    ("", "1", "1,2", "2,1,4", "1,2,4,6", "1,2,4,", "1,,2,4", " 1,2,4", "1,2,4 "),
+)
+def test_capacity_sweep_requires_exact_four_gpu_acceptance_gate(value: str) -> None:
+    with pytest.raises(ValueError):
+        _validate_sweep(value)
+
+
+def test_capacity_sweep_accepts_the_full_four_gpu_gate() -> None:
+    assert _validate_sweep("1,2,4") == (1, 2, 4)
+
+
+def test_campaign_forwards_pinned_policy_server_boundary_to_each_trial(tmp_path) -> None:
+    args = build_parser().parse_args([
+        "--matrix", str(Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"),
+        "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"),
+        "--simulator-version", "isaac-5.1", "--policy-artifact-sha256", "c" * 64,
+        "--image-identity", "sha256:image", "--groot-root", "/workspace/Isaac-GR00T",
+        "--groot-revision", "d" * 40, "--groot-python", "/workspace/groot-venv/bin/python",
+        "--policy-server-readiness-timeout", "30", "--policy-server-request-timeout", "2.5",
+        "--policy-server-termination-grace", "4", "--dry-run",
+    ])
+
+    command = _trial_command(args, build_public_matrix().trials[0], policy_server_port=5501, policy_server_log=tmp_path / "server.log")
+    values = dict(zip(command[3::2], command[4::2], strict=False))
+
+    assert values["--groot-root"] == "/workspace/Isaac-GR00T"
+    assert values["--groot-revision"] == "d" * 40
+    assert values["--groot-python"] == "/workspace/groot-venv/bin/python"
+    assert values["--policy-server-port"] == "5501"
+    assert values["--policy-server-readiness-timeout"] == "30.0"
+    assert values["--policy-server-request-timeout"] == "2.5"
+    assert values["--policy-server-termination-grace"] == "4.0"
+    assert values["--policy-server-log"] == str(tmp_path / "server.log")
+
+
+def test_isolated_worker_forwards_its_physical_gpu_without_cuda_visibility_remapping(tmp_path, monkeypatch) -> None:
     args = _worker_args(tmp_path)
     args.device = "cuda:4"
-    command = _trial_command(args, Trial("pant_long", "Pant_Long_Seen_0", "seen", 42), device="cuda:0")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+    command = _trial_command(args, Trial("pant_long", "Pant_Long_Seen_0", "seen", 42), device="cuda:4")
+    environment = _worker_environment(args, 4)
 
-    assert command[command.index("--device") + 1] == "cuda:0"
+    assert command[command.index("--device") + 1] == "cuda:4"
+    assert "CUDA_VISIBLE_DEVICES" not in environment
+    assert environment["LEHOME_FLYWHEEL_WORKER_GPU"] == "4"
+
+
+def test_vram_margin_uses_only_the_assigned_gpu(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.subprocess.run",
+        lambda *_args, **_kwargs: argparse.Namespace(
+            returncode=0,
+            stdout="0, 900, 1000\n1, 100, 1000\n2, 250, 1000\n",
+        ),
+    )
+
+    _, combined_margin, legacy_margin = _resource_margins((2,))
+
+    assert combined_margin == pytest.approx(0.25)
+    assert legacy_margin == pytest.approx(0.25)
+
+
+def test_worker_group_assigns_unique_policy_servers_and_attempt_logs(monkeypatch, tmp_path) -> None:
+    args = _worker_args(tmp_path)
+    args.device = "cuda:2"
+    allocated_ports = iter((5511, 5512))
+    launches = []
+
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._allocate_loopback_port",
+        lambda: next(allocated_ports),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.subprocess.Popen",
+        lambda command, **kwargs: (launches.append((command, kwargs)), _SuccessfulProcess([]))[1],
+    )
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda *_args: True)
+
+    _run_worker_group(args, _group_trials(2), gpu_indices=(2, 3))
+
+    commands = [dict(zip(command[3::2], command[4::2], strict=False)) for command, _ in launches]
+    assert [command["--device"] for command in commands] == ["cuda:2", "cuda:3"]
+    assert [command["--policy-server-port"] for command in commands] == ["5511", "5512"]
+    server_logs = [Path(command["--policy-server-log"]) for command in commands]
+    assert len(set(server_logs)) == 2
+    assert all(log.name.endswith(".policy-server.log") for log in server_logs)
+    assert all("CUDA_VISIBLE_DEVICES" not in kwargs["env"] for _, kwargs in launches)
+
+
+def test_retry_uses_a_fresh_paired_policy_server_log(tmp_path) -> None:
+    worker_root = tmp_path / "workers" / "worker-01"
+    worker_root.mkdir(parents=True)
+    worker_log, server_log = _attempt_log_paths(worker_root, "trial-001")
+    worker_log.write_text("first worker attempt\n", encoding="utf-8")
+    server_log.write_text("first server attempt\n", encoding="utf-8")
+
+    retry_worker_log, retry_server_log = _attempt_log_paths(worker_root, "trial-001")
+
+    assert retry_worker_log.name == "trial-001.attempt-002.log"
+    assert retry_server_log.name == "trial-001.attempt-002.policy-server.log"
 
 
 def test_capacity_sweep_accounts_only_for_exact_nonduplicated_wave_trials(monkeypatch, tmp_path) -> None:
@@ -370,25 +472,30 @@ def test_capacity_sweep_accounts_only_for_exact_nonduplicated_wave_trials(monkey
     monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_one_worker", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sequential trial launched")))
     monkeypatch.setattr(
         "scripts.run_groot_flywheel_campaign._run_worker_group",
-        lambda _args, assignments, **_kwargs: (1.0, len(assignments), 0, {worker: 0.1 for worker, _ in assignments}, [{"host_ram_margin": 1.0, "inference_vram_margin": 1.0, "render_vram_margin": 1.0, "peak_host_ram_bytes": 1, "peak_vram_bytes": 1, "cpu_utilization": 0.1, "run_queue": 1, "inference_latency_seconds": 0.1, "inference_queue_depth": 0}], ()),
+        lambda _args, assignments, **_kwargs: (1.0, len(assignments), 0, {worker: 0.1 for worker, _ in assignments}, [{"host_ram_margin": 1.0, "combined_vram_margin": 1.0, "peak_host_ram_bytes": 1, "peak_vram_bytes": 1, "cpu_utilization": 0.1, "run_queue": 1, "inference_latency_seconds": 0.1, "inference_queue_depth": 0}], ()),
     )
-    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._resource_margins", lambda: (1.0, 1.0, 1.0))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._resource_margins", lambda *_args: (1.0, 1.0, 1.0))
     monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
     args = build_parser().parse_args([
         "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
         "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
         "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
         "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
-        "--capacity-sweep", "1,2,4,6", "--trials-per-worker", "1",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"),
+        "--capacity-sweep", "1,2,4", "--trials-per-worker", "1",
     ])
 
     report = run_campaign(args)
 
-    expected = [trial.trial_id for trial in build_public_matrix().trials[:13]]
+    expected = [trial.trial_id for trial in build_public_matrix().trials[:7]]
     assert report["episode_accounting"]["sequential_trial_ids"] == []
-    assert report["episode_accounting"]["capacity_wave_trial_ids"] == [expected[:1], expected[1:3], expected[3:7], expected[7:13]]
-    assert report["episode_accounting"]["attempt_count"] == 13
+    assert report["episode_accounting"]["capacity_wave_trial_ids"] == [expected[:1], expected[1:3], expected[3:7]]
+    assert report["episode_accounting"]["attempt_count"] == 7
     assert report["episode_accounting"]["attempted_unique_trial_ids"] == sorted(expected)
+    assert report["capacity"]["samples"][0]["combined_vram_margin"] == 1.0
+    assert "inference_vram_margin" not in report["capacity"]["samples"][0]
+    assert "render_vram_margin" not in report["capacity"]["samples"][0]
 
 
 def test_cpu_capacity_assignment_represents_one_cpu_worker_explicitly(tmp_path) -> None:
@@ -552,7 +659,9 @@ def test_campaign_retains_multi_worker_policy_failure_records_counts_and_rejecti
         "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
         "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
         "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
-        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--capacity-sweep", "1,2",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--capacity-sweep", "1,2,4",
     ])
 
     report = run_campaign(args)
@@ -572,6 +681,8 @@ def test_campaign_retains_multi_worker_policy_failure_records_counts_and_rejecti
     ]
     assert second_wave["failure_counts"] == {"policy_telemetry_malformed": 1, "policy_telemetry_missing": 1}
     assert report["capacity"]["rejected"][2] == ("policy_telemetry_malformed", "policy_telemetry_missing")
+    assert report["capacity"]["requested"] == [1, 2, 4]
+    assert len(report["capacity"]["samples"]) == 2
     assert decision.rejected[2] == ("policy_telemetry_malformed", "policy_telemetry_missing")
 
 
@@ -645,19 +756,23 @@ def test_capacity_sweep_uses_post_sweep_completion_scan_for_completed_after(monk
     monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", pending_for_phase)
     monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_one_worker", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sequential trial launched")))
     monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", lambda *_args, **_kwargs: (1.0, 1, 0, {1: 0.1}, [{"host_ram_margin": 1.0, "inference_vram_margin": 1.0, "render_vram_margin": 1.0, "peak_host_ram_bytes": 1, "peak_vram_bytes": 1, "cpu_utilization": 0.1, "run_queue": 1, "inference_latency_seconds": 0.1, "inference_queue_depth": 0}], ()))
-    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._resource_margins", lambda: (1.0, 1.0, 1.0))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._resource_margins", lambda *_args: (1.0, 1.0, 1.0))
     monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda *_args, **_kwargs: (0,))
     args = build_parser().parse_args([
         "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
         "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
         "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
-        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--capacity-sweep", "1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--capacity-sweep", "1,2,4",
     ])
 
     report = run_campaign(args)
 
     assert len(pending_results) == 2
     assert report["completed_after"] == [build_public_matrix().trials[0].trial_id]
+    assert report["capacity"]["requested"] == [1, 2, 4]
+    assert len(report["capacity"]["samples"]) == 2
 
 
 def test_campaign_rejects_a_noncanonical_matrix_before_worker_launch(monkeypatch, tmp_path) -> None:
@@ -695,6 +810,13 @@ def _worker_args(tmp_path, *, worker_timeout_seconds: float = 2.0, terminate_gra
         image_identity="sha256:immutable",
         max_steps=600,
         strategy="canonical",
+        device="cuda:0",
+        groot_root=tmp_path / "Isaac-GR00T",
+        groot_revision="d" * 40,
+        groot_python=tmp_path / "groot-venv" / "bin" / "python",
+        policy_server_readiness_timeout=30.0,
+        policy_server_request_timeout=2.5,
+        policy_server_termination_grace=4.0,
     )
 
 
