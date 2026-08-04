@@ -239,12 +239,13 @@ class BridgeReceiver:
         self.disconnected = True
         self.requires_resync = True
 
-    def resync(self) -> None:
+    def resync(self, *, now_ns: int | None = None) -> None:
         """Explicit operator action after a fresh healthy sample has arrived."""
-        if self.disconnected or self.last_sample is None:
-            raise ValueError("cannot resync a disconnected or empty bridge")
-        if not self._rtt_healthy:
+        command = self.current(now_ns=now_ns)
+        if command.reason == "rtt_exceeded":
             raise ValueError("cannot resync until a fresh RTT measurement is healthy")
+        if command.reason != "resync_required":
+            raise ValueError("cannot resync unless current bridge state is resync_required")
         self.requires_resync = False
         self.jitter_ms = 0.0
         self.arrival_jitter_ms = 0.0
@@ -297,13 +298,18 @@ class LoopbackBridgeServer:
         self.port = port
         self.receiver = receiver or BridgeReceiver()
         self._listener: socket.socket | None = None
+        self._client: socket.socket | None = None
         self._client_active = False
         self._cancel = threading.Event()
+        self._state_lock = threading.Lock()
         self.failure: str | None = None
 
     def start(self) -> None:
-        if self._listener is not None:
-            raise RuntimeError("bridge server is already listening")
+        with self._state_lock:
+            if self._listener is not None:
+                raise RuntimeError("bridge server is already listening")
+            if self._cancel.is_set():
+                raise RuntimeError("bridge server was already cancelled")
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         # A Mac may connect only after its operator has completed the SSH
@@ -312,13 +318,32 @@ class LoopbackBridgeServer:
         listener.settimeout(0.1)
         listener.bind((LOOPBACK_HOST, self.port))
         listener.listen(1)
-        self._listener = listener
+        with self._state_lock:
+            if self._cancel.is_set():
+                listener.close()
+                raise RuntimeError("bridge server was cancelled while starting")
+            self._listener = listener
 
     def close(self) -> None:
         self._cancel.set()
-        if self._listener is not None:
-            self._listener.close()
+        with self._state_lock:
+            listener, client = self._listener, self._client
             self._listener = None
+            self._client = None
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        if client is not None:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except (AttributeError, OSError):
+                pass
+            try:
+                client.close()
+            except OSError:
+                pass
         self.receiver.close_connection()
 
     @staticmethod
@@ -341,13 +366,18 @@ class LoopbackBridgeServer:
         return MessageVerifier(secret=self.secret, expected_nonce=self.session_nonce)
 
     def serve_one_client(self) -> None:
-        if self._listener is None:
-            raise RuntimeError("bridge server has not been started")
-        if self._client_active:
-            raise RuntimeError("bridge server accepts exactly one client")
+        with self._state_lock:
+            listener = self._listener
+            if listener is None:
+                if self._cancel.is_set():
+                    return
+                raise RuntimeError("bridge server has not been started")
+            if self._client_active:
+                raise RuntimeError("bridge server accepts exactly one client")
+            self._client_active = True
         while not self._cancel.is_set():
             try:
-                client, _ = self._listener.accept()
+                client, _ = listener.accept()
                 break
             except socket.timeout:
                 continue
@@ -359,11 +389,26 @@ class LoopbackBridgeServer:
                 raise
         else:
             return
-        self._client_active = True
-        verifier = self._verifier()
+        with self._state_lock:
+            if self._cancel.is_set():
+                cancelled = True
+            else:
+                self._client = client
+                cancelled = False
+        if cancelled:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except (AttributeError, OSError):
+                pass
+            try:
+                client.close()
+            except OSError:
+                pass
+            return
         try:
+            verifier = self._verifier()
             client.settimeout(1.0)
-            while True:
+            while not self._cancel.is_set():
                 size = struct.unpack("!I", self._read_exact(client, 4))[0]
                 if size > _MAX_FRAME_BYTES:
                     raise ValueError("bridge frame exceeds the 64 KiB maximum")
@@ -406,8 +451,16 @@ class LoopbackBridgeServer:
                         )
                     )
         except (ConnectionError, OSError, ValueError):
+            if self._cancel.is_set():
+                return
             self.failure = "bridge_transport_failed"
             self.receiver.close_connection()
             raise
         finally:
-            client.close()
+            try:
+                client.close()
+            except OSError:
+                pass
+            with self._state_lock:
+                if self._client is client:
+                    self._client = None

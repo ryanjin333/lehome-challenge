@@ -213,6 +213,24 @@ class FakeReceiver:
         return ExpertCommand((0.0,) * 12, self.eligible, None if self.eligible else "stale_sample", 7, 1.0)
 
 
+class ResyncRequiredReceiver:
+    def __init__(self) -> None:
+        self.last_safe_command = (0.0,) * 12
+        self.jitter_ms = 0.0
+        self.resync_calls = 0
+        self._resynced = False
+
+    def current(self):
+        if self._resynced:
+            return ExpertCommand((0.0,) * 12, True, None, 7, 1.0)
+        return ExpertCommand((0.0,) * 12, False, "resync_required", 7, 1.0)
+
+    def resync(self) -> None:
+        assert self.current().reason == "resync_required"
+        self.resync_calls += 1
+        self._resynced = True
+
+
 def recorder(tmp_path, name: str, mode: str, monkeypatch) -> MixedSourceRecorder:
     value = MixedSourceRecorder(tmp_path, identity=identity(name), mode=mode, horizon=1)
     def encode(root, *, fps=30):
@@ -259,6 +277,30 @@ def test_collect_episode_dagger_exports_only_post_takeover_and_clears_policy(tmp
     assert policy.cleared is True
     assert [window.observation_step for window in result.expert_windows] == [1, 2]
     assert (tmp_path / "exports" / "dagger" / "expert-windows.json").is_file()
+
+
+def test_collect_episode_dagger_requires_a_later_space_to_resync_before_takeover(tmp_path, monkeypatch) -> None:
+    value = session(tmp_path, "dagger")
+    receiver = ResyncRequiredReceiver()
+    value.bridge_server.receiver = receiver
+    env, policy = FakeEnv(success_at=2), FakePolicy()
+
+    result = collect_episode(
+        value,
+        env,
+        policy,
+        ScheduledControlSource(["space", "space", "a"]),
+        recorder(tmp_path, "dagger-resync", "dagger", monkeypatch),
+        thresholds(),
+        max_steps=3,
+    )
+
+    assert receiver.resync_calls == 1
+    assert result.annotations[0]["action_source"] == "policy"
+    assert all(annotation["action_source"] == "expert" for annotation in result.annotations[1:])
+    assert policy.cleared is True
+    assert [window.observation_step for window in result.expert_windows] == [1, 2]
+    assert (tmp_path / "exports" / "dagger-resync" / "selection-report.json").is_file()
 
 
 def test_collect_episode_hold_or_discard_stays_diagnostic_without_export(tmp_path, monkeypatch) -> None:

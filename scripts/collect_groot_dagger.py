@@ -350,6 +350,21 @@ def _clear_policy_queue(policy: object) -> None:
     raise ValueError("DAgger takeover requires a policy queue clear operation")
 
 
+def _operator_resync(receiver: object):
+    """Apply an explicit ``space`` resync only after the receiver's safe gate."""
+    current = getattr(receiver, "current", None)
+    if not callable(current):
+        raise ValueError("bridge receiver does not report bridge health")
+    command = current()
+    if command.reason == "resync_required":
+        resync = getattr(receiver, "resync", None)
+        if not callable(resync):
+            raise ValueError("bridge receiver does not support explicit resynchronization")
+        resync()
+        return current()
+    return command
+
+
 def _percentile(values: list[float]) -> float | None:
     if not values:
         return None
@@ -488,9 +503,10 @@ def collect_episode(
             if control == "space":
                 if session.controller.state == "ready":
                     (session.controller.start_policy if session.controller.mode == "dagger" else session.controller.start_expert)()
-                elif session.controller.state == "policy":
-                    session.controller.request_takeover()
-                    command = session.bridge_server.receiver.current()
+                elif session.controller.state in {"policy", "takeover_pending"}:
+                    if session.controller.state == "policy":
+                        session.controller.request_takeover()
+                    command = _operator_resync(session.bridge_server.receiver)
                     if command.eligible:
                         session.controller.accept_expert(
                             current_robot=tuple(float(value) for value in observation["observation.state"]),
@@ -498,6 +514,8 @@ def collect_episode(
                         )
                         _clear_policy_queue(policy)
                         recorder.record_snapshot("takeover", capture_snapshot(env, randomization={"strategy": "collection"}))
+                elif session.controller.state == "expert":
+                    _operator_resync(session.bridge_server.receiver)
         source = ActionSource.HOLD
         provenance: dict[str, object] = {}
         if session.controller.state == "policy":

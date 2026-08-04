@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import struct
 import threading
 import time
 from types import SimpleNamespace
@@ -49,8 +50,19 @@ def test_receiver_holds_after_stale_sample_and_requires_explicit_resync() -> Non
     receiver.accept_sample(valid_sample(2), received_monotonic_ns=1_101_000_000)
     receiver.accept_sample(valid_sample(3), received_monotonic_ns=1_134_333_333)
     assert receiver.current(now_ns=1_135_000_000).reason == "resync_required"
-    receiver.resync()
+    receiver.resync(now_ns=1_135_000_000)
     assert receiver.current(now_ns=1_135_000_000).eligible is True
+
+
+def test_receiver_resync_requires_the_current_resync_required_gate() -> None:
+    receiver = BridgeReceiver(converter=lambda values: values)
+    receiver.accept_handshake(valid_handshake())
+    now = time.monotonic_ns()
+    receiver.accept_sample(valid_sample(1), received_monotonic_ns=now)
+
+    assert receiver.current(now_ns=now).eligible is True
+    with pytest.raises(ValueError, match="resync_required"):
+        receiver.resync()
 
 
 def test_receiver_rejects_jitter_disconnect_and_bad_session_sequence() -> None:
@@ -180,7 +192,7 @@ def test_receiver_requires_a_fresh_client_measured_rtt_before_expert_control() -
     assert receiver.current(now_ns=1_034_000_000).reason == "rtt_exceeded"
 
     with pytest.raises(ValueError, match="RTT"):
-        receiver.resync()
+        receiver.resync(now_ns=1_034_000_000)
     assert receiver.requires_resync is True
 
 
@@ -219,3 +231,85 @@ def test_loopback_bridge_keeps_leader_sample_sequence_contiguous_across_rtt_prob
         server.close()
 
     assert [sample.sequence for sample in receiver.records] == [1, 2]
+
+
+def test_loopback_server_close_stops_an_accepted_healthy_client_promptly() -> None:
+    receiver = BridgeReceiver(max_jitter_ms=1_000.0, converter=lambda values: values)
+    server = LoopbackBridgeServer(secret=b"x" * 32, session_nonce="nonce", receiver=receiver)
+
+    handshake = SimpleNamespace(
+        kind="handshake", session_nonce="nonce", sequence=0, left_serial="left", right_serial="right",
+        left_calibration_sha256="a" * 64, right_calibration_sha256="b" * 64,
+        left_motor_limits=((0.0, 1.0),) * 6, right_motor_limits=((0.0, 1.0),) * 6, hz=30,
+    )
+    sample = SimpleNamespace(
+        kind="sample", session_nonce="nonce", sample_sequence=1, monotonic_ns=1,
+        positions=(0.0,) * 12, raw_positions=(0.5,) * 12, rtt_ns=1_000_000, rtt_age_ns=0,
+    )
+
+    class Verifier:
+        def __init__(self) -> None:
+            self.messages = [handshake, sample]
+
+        def verify(self, _wire: bytes):
+            return self.messages.pop(0)
+
+    class Client:
+        def __init__(self) -> None:
+            self.wire = bytearray(struct.pack("!I", 1) + b"a" + struct.pack("!I", 1) + b"b")
+            self.waiting = threading.Event()
+            self.closed = threading.Event()
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def recv(self, size: int) -> bytes:
+            if self.wire:
+                value = bytes(self.wire[:size])
+                del self.wire[:size]
+                return value
+            self.waiting.set()
+            self.closed.wait(timeout=1.0)
+            return b""
+
+        def shutdown(self, _how: int) -> None:
+            self.closed.set()
+
+        def close(self) -> None:
+            self.closed.set()
+
+    class Listener:
+        def __init__(self, client: Client) -> None:
+            self.client = client
+
+        def accept(self):
+            return self.client, ("127.0.0.1", 12345)
+
+        def close(self) -> None:
+            pass
+
+    client = Client()
+    server._listener = Listener(client)
+    server._verifier = lambda: Verifier()
+
+    def serve() -> None:
+        try:
+            server.serve_one_client()
+        except ConnectionError:
+            pass
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        assert client.waiting.wait(timeout=1.0)
+        assert receiver.current().eligible is True
+        server.close()
+        thread.join(timeout=0.2)
+        assert thread.is_alive() is False
+    finally:
+        client.close()
+        server.close()
+        thread.join(timeout=1.0)
+
+    assert receiver.current().reason == "disconnected"
+    assert server.failure is None

@@ -79,9 +79,13 @@ Once the command prints its loopback forwarding instruction, press `space` to
 start policy control (DAgger) or expert control (full expert). For DAgger,
 press `space` again only after the receiver reports a fresh, synchronized 12D
 command; this clears queued policy actions, records a takeover snapshot, and
-makes each following applied action expert-labelled. Press `a` only after the
-task's official success signal; otherwise press `d` or `escape`. Terminal input
-is read in the background, so sampling never waits for a prompt. `r` resets the
+makes each following applied action expert-labelled. If a transient fault has
+recovered to the explicit `resync_required` state, press `space` again to
+resynchronize and then resume expert control or complete the DAgger takeover.
+This is never automatic: `disconnected`, `stale_sample`, `rtt_exceeded`,
+`jitter_exceeded`, and `no_sample` remain held. Press `a` only after the task's
+official success signal; otherwise press `d` or `escape`. Terminal input is
+read in the background, so sampling never waits for a prompt. `r` resets the
 task but finalizes the partial attempt as diagnostic-only; begin the next
 immutable episode with a fresh invocation and episode ID.
 
