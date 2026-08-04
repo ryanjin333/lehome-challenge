@@ -400,6 +400,12 @@ def setup_eval_parser() -> argparse.ArgumentParser:
         help="Type of garments to evaluate.",
     )
     parser.add_argument(
+        "--garment_name",
+        type=str,
+        default=None,
+        help="Name of the manifest-assigned garment to evaluate.",
+    )
+    parser.add_argument(
         "--garment_cfg_base_path",
         type=str,
         default="Assets/objects/Challenge_Garment",

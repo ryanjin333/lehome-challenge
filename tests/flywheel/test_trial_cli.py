@@ -569,6 +569,20 @@ def test_normal_trial_pins_one_assigned_garment_and_rejects_episode_id_reuse(tmp
         run_trial(conflicting)
 
 
+def test_real_evaluation_parser_accepts_trial_garment_name_without_abbreviation() -> None:
+    parser_path = Path(__file__).parents[2] / "scripts" / "utils" / "parser.py"
+    spec = importlib.util.spec_from_file_location("real_evaluation_parser", parser_path)
+    assert spec is not None and spec.loader is not None
+    parser_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(parser_module)
+
+    parsed = parser_module.setup_eval_parser().parse_args(
+        ["--garment_name", "Top_Long_Seen_0"]
+    )
+
+    assert parsed.garment_name == "Top_Long_Seen_0"
+
+
 def test_parallel_flywheel_trial_commands_never_target_shared_legacy_videos(tmp_path, capsys) -> None:
     policy = tmp_path / "policy"
     policy.mkdir()
