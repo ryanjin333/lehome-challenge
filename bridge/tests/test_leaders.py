@@ -263,3 +263,55 @@ def test_near_80ms_rtt_refresh_does_not_block_30hz_samples(tmp_path: Path, monke
     sample_times = [timestamp for kind, timestamp in socket.frames if kind == "sample"]
     assert len(sample_times) == 4
     assert max(later - earlier for earlier, later in zip(sample_times, sample_times[1:])) < 60_000_000
+
+
+def test_stream_skips_missed_deadlines_after_an_overrunning_sample(monkeypatch) -> None:
+    class FakeClock:
+        def __init__(self) -> None:
+            self.now = 0
+            self.sleeps: list[float] = []
+
+        def sleep(self, seconds: float) -> None:
+            self.sleeps.append(seconds)
+            self.now += int(seconds * 1_000_000_000)
+
+    class OverrunningReader:
+        def __init__(self, clock: FakeClock) -> None:
+            self.clock = clock
+            self.start_times: list[int] = []
+
+        def read(self):
+            self.start_times.append(self.clock.now)
+            if len(self.start_times) == 1:
+                self.clock.now += 50_000_000
+            return object()
+
+    class FakeConnection:
+        _rtt_measured_monotonic_ns = 0
+
+        def __init__(self, clock: FakeClock) -> None:
+            self.clock = clock
+            self.stop_requested = False
+            self.sent = 0
+
+        def _current_rtt(self) -> tuple[int, int]:
+            return 0, self.clock.now
+
+        def start_rtt_refresh(self) -> None:
+            raise AssertionError("fresh RTT must not refresh")
+
+        def send_sample(self, _sample: object) -> None:
+            self.sent += 1
+            if self.sent == 2:
+                self.stop_requested = True
+
+    clock = FakeClock()
+    reader = OverrunningReader(clock)
+    connection = FakeConnection(clock)
+    monkeypatch.setattr("lehome_bridge.client.time.monotonic_ns", lambda: clock.now)
+    monkeypatch.setattr("lehome_bridge.client.time.sleep", clock.sleep)
+
+    stream(reader, connection, hz=30)
+
+    assert reader.start_times[1] - reader.start_times[0] >= 1_000_000_000 // 30
+    assert clock.sleeps[0] == pytest.approx(1 / 60)

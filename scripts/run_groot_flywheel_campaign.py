@@ -158,7 +158,11 @@ def _prepare_retry_attempt(output_root: Path, trial_id: str) -> None:
         try:
             for parent_name in (".pending", "raw"):
                 parent_fd = _open_campaign_directory(root_fd, parent_name, create=True)
-                details = _open_trial_directory(parent_fd, trial_id)
+                try:
+                    details = _open_trial_directory(parent_fd, trial_id)
+                except BaseException:
+                    os.close(parent_fd)
+                    raise
                 if details is not None:
                     parent_fds.append((parent_name.removeprefix("."), parent_fd, details))
                 else:
@@ -512,6 +516,13 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
     else:
         records = [{"trial_id": trial_id, "command": _trial_command(args, by_id[trial_id])} for trial_id in pending]
 
+    if args.capacity_sweep and not args.dry_run:
+        capacity_pending = list(pending_trial_ids(state))
+    elif args.dry_run:
+        pending_after = pending
+    else:
+        pending_after = pending_trial_ids(state)
+
     report: dict[str, object] = {
         "schema_version": 1,
         "matrix": {
@@ -522,13 +533,12 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
         },
         "pending_before": list(pending),
         "workers": records,
-        "completed_after": [trial_id for trial_id in state.trial_ids if trial_id not in pending_trial_ids(state)],
+        "completed_after": [],
     }
     if args.capacity_sweep and not args.dry_run:
         counts = _validate_sweep(args.capacity_sweep)
         samples: list[CapacitySample] = []
         capacity_records: list[dict[str, object]] = []
-        capacity_pending = list(pending_trial_ids(state))
         for count in counts:
             decision_before = choose_worker_count(samples) if samples else None
             if count == 8 and (decision_before is None or decision_before.accepted_workers != 6):
@@ -548,8 +558,11 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
                 break
         decision = choose_worker_count(samples)
         report["capacity"] = {"requested": list(counts), "samples": capacity_records, "accepted_workers": decision.accepted_workers, "rejected": decision.rejected}
+        pending_after = pending_trial_ids(state)
     elif args.capacity_sweep:
         report["capacity"] = {"requested": list(_validate_sweep(args.capacity_sweep)), "status": "dry_run_no_processes"}
+    pending_after_set = set(pending_after)
+    report["completed_after"] = [trial_id for trial_id in state.trial_ids if trial_id not in pending_after_set]
     (args.output_root / "capacity-report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report
 

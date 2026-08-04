@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -141,6 +142,84 @@ def test_retry_preparation_rejects_symlinked_campaign_parents(tmp_path, parent) 
     assert not list(external.iterdir())
 
 
+def test_retry_preparation_closes_parent_and_lock_after_unsafe_leaf(monkeypatch, tmp_path) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    pending = tmp_path / ".pending"
+    pending.mkdir()
+    (pending / "trial-001").symlink_to(external, target_is_directory=True)
+    opened: dict[int, str] = {}
+    closed: list[str] = []
+    real_open, real_close = os.open, os.close
+
+    def track_open(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        name = os.fspath(path)
+        if name in {".campaign.lock", ".pending"}:
+            opened[fd] = name
+        return fd
+
+    def track_close(fd):
+        name = opened.pop(fd, None)
+        if name is not None:
+            closed.append(name)
+        return real_close(fd)
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.os.open", track_open)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.os.close", track_close)
+
+    with pytest.raises(ValueError, match="trial path is unsafe"):
+        _prepare_retry_attempt(tmp_path, "trial-001")
+
+    assert opened == {}
+    assert ".pending" in closed
+    assert closed.count(".campaign.lock") == 1
+
+
+def test_retry_preparation_closes_parent_fds_and_lock_after_second_move_error(monkeypatch, tmp_path) -> None:
+    for parent in (".pending", "raw"):
+        (tmp_path / parent / "trial-001").mkdir(parents=True)
+    opened: dict[int, str] = {}
+    closed: list[str] = []
+    real_open, real_close, real_rename = os.open, os.close, os.rename
+
+    def track_open(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        name = os.fspath(path)
+        if name in {".campaign.lock", ".pending", "raw"}:
+            opened[fd] = name
+        return fd
+
+    def track_close(fd):
+        name = opened.pop(fd, None)
+        if name is not None:
+            closed.append(name)
+        return real_close(fd)
+
+    moves = 0
+
+    def fail_second_move(*args, **kwargs):
+        nonlocal moves
+        moves += 1
+        if moves == 2:
+            raise OSError("second move failed")
+        return real_rename(*args, **kwargs)
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.os.open", track_open)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.os.close", track_close)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.os.rename", fail_second_move)
+
+    with pytest.raises(ValueError, match="output storage is unsafe") as error:
+        _prepare_retry_attempt(tmp_path, "trial-001")
+
+    assert str(error.value.__cause__) == "second move failed"
+    assert moves == 2
+    assert opened == {}
+    assert ".pending" in closed
+    assert "raw" in closed
+    assert closed.count(".campaign.lock") == 1
+
+
 def test_repeated_retry_preparation_retains_distinct_quarantined_attempts(tmp_path) -> None:
     for _ in range(2):
         failed = EpisodeArtifactWriter(tmp_path, "trial-001")
@@ -277,6 +356,55 @@ def test_campaign_uses_the_committed_public_280_trial_matrix(tmp_path) -> None:
     assert len(report["pending_before"]) == 280
     assert report["pending_before"][0] == "top-long-seen-0-seed-101"
     assert report["matrix"]["sha256"] == matrix_sha256(build_public_matrix())
+
+
+def test_campaign_dry_run_scans_completion_once_for_the_280_trial_report(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    calls: list[CampaignState] = []
+
+    def pending_once(state: CampaignState) -> tuple[str, ...]:
+        calls.append(state)
+        return state.trial_ids
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", pending_once)
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--dry-run",
+    ])
+
+    report = run_campaign(args)
+
+    assert len(calls) == 1
+    assert report["completed_after"] == []
+
+
+def test_capacity_sweep_uses_post_sweep_completion_scan_for_completed_after(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    pending_results: list[tuple[str, ...]] = []
+
+    def pending_for_phase(state: CampaignState) -> tuple[str, ...]:
+        index = len(pending_results)
+        result = state.trial_ids[index + 2 :]
+        pending_results.append(result)
+        return result
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", pending_for_phase)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_one_worker", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", lambda *_args, **_kwargs: (1.0, 1, 0))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._resource_margins", lambda: (1.0, 1.0, 1.0))
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--capacity-sweep", "1",
+    ])
+
+    report = run_campaign(args)
+
+    assert len(pending_results) == 3
+    assert report["completed_after"] == [trial.trial_id for trial in build_public_matrix().trials[:4]]
 
 
 def test_campaign_rejects_a_noncanonical_matrix_before_worker_launch(monkeypatch, tmp_path) -> None:

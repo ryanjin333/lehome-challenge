@@ -306,4 +306,8 @@ def stream(reader: DualLeaderReader, connection: BridgeConnection, *, hz: int = 
             connection.start_rtt_refresh()
         connection.send_sample(reader.read())
         deadline += period_ns
+        completed_at = time.monotonic_ns()
+        if completed_at > deadline:
+            missed_periods = (completed_at - deadline) // period_ns + 1
+            deadline += missed_periods * period_ns
         sleep_until_monotonic_ns(deadline)
