@@ -38,6 +38,6 @@
   "repository_commit": null,
   "schema_version": 1,
   "status": "unreleased",
-  "trainer_lock_sha256": "67fcd520cd75f3b3b383fcc887f244c332af5c2a5548d384d71e0376697b2432",
+  "trainer_lock_sha256": "5df7702213f15d7116e6889cf9cf24d7c9983ca920c22f6852e68c5413b57964",
   "uv_version": "0.8.22"
 }

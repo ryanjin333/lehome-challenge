@@ -16,7 +16,7 @@ from lehome_train.release_manifest import (
 
 ROOT = Path(__file__).resolve().parents[2]
 TRAINER = ROOT / "trainer"
-LOCK_SHA256 = "67fcd520cd75f3b3b383fcc887f244c332af5c2a5548d384d71e0376697b2432"
+LOCK_SHA256 = "5df7702213f15d7116e6889cf9cf24d7c9983ca920c22f6852e68c5413b57964"
 REPOSITORY_COMMIT = "7d367df39a94917c6c1df6befe011eef1a0ce3ca"
 OCI_DIGEST = "sha256:" + "a" * 64
 DATASET_REVISION = "b" * 40
@@ -330,6 +330,7 @@ def test_gpu_verifier_keeps_stdin_open_selects_gpu_zero_and_checks_sentinel() ->
 
     assert '"${run[@]}" -i --gpus device=0' in verifier
     assert "CUDA_VISIBLE_DEVICES=0" in verifier
+    assert "import gr00t, lehome_train, pynvml, torch" in verifier
     assert "GPU_SENTINEL:optimizer-step-complete" in verifier
     assert "grep -Fxq 'GPU_SENTINEL:optimizer-step-complete'" in verifier
     assert "secret_status=$?" in verifier

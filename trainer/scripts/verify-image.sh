@@ -94,7 +94,7 @@ run=(docker run --rm --platform linux/amd64
 "${run[@]}" --user 10001:10001 --entrypoint /bin/bash "$image_ref" -euo pipefail -c '
   test "$(id -u)" -ne 0
   test "$(python -c '\''import platform; print(platform.python_version())'\'')" = 3.10.18
-  python -c '\''import gr00t, lehome_train, torch'\''
+  python -c '\''import gr00t, lehome_train, pynvml, torch'\''
   test "$(git -C /opt/isaac-groot rev-parse HEAD)" = 23ace64f17aa5015259b8609d371eb61a357c776
   test -z "$(git -C /opt/isaac-groot status --porcelain=v1 --untracked-files=all)"
   lehome-train --help >/dev/null
