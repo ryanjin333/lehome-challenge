@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import subprocess
+import threading
 import pytest
 
 from lehome.flywheel.artifacts import EpisodeArtifactWriter
@@ -115,6 +116,81 @@ def test_retry_preparation_rejects_parent_path_without_moving_any_output(tmp_pat
     assert not (tmp_path / "quarantine").exists()
 
 
+def test_symlinked_raw_parent_never_counts_external_complete_episode_or_mutates_it(tmp_path) -> None:
+    external = tmp_path / "external"
+    state = campaign_state_with_completed_trial(external, "trial-001")
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "raw").symlink_to(external / "raw", target_is_directory=True)
+
+    with pytest.raises(ValueError, match="raw root is unsafe"):
+        pending_trial_ids(CampaignState(output_root=output, trial_ids=("trial-001",)))
+
+    assert (external / "raw" / "trial-001").is_dir()
+
+
+@pytest.mark.parametrize("parent", (".pending", "raw", "quarantine"))
+def test_retry_preparation_rejects_symlinked_campaign_parents(tmp_path, parent) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    (tmp_path / parent).symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="unsafe"):
+        _prepare_retry_attempt(tmp_path, "trial-001")
+
+    assert not list(external.iterdir())
+
+
+def test_repeated_retry_preparation_retains_distinct_quarantined_attempts(tmp_path) -> None:
+    for _ in range(2):
+        failed = EpisodeArtifactWriter(tmp_path, "trial-001")
+        failed.append_annotation({"step": 0, "action_source": "policy"})
+        _prepare_retry_attempt(tmp_path, "trial-001")
+
+    attempts = sorted((tmp_path / "quarantine").glob("trial-001.attempt-*"))
+    assert len(attempts) == 2
+    assert all((attempt / "pending" / "annotations.jsonl").is_file() for attempt in attempts)
+
+
+def test_concurrent_retry_preparation_retains_one_attempt_without_collision_or_overwrite(tmp_path) -> None:
+    failed = EpisodeArtifactWriter(tmp_path, "trial-001")
+    failed.append_annotation({"step": 0, "action_source": "policy"})
+    failures: list[BaseException] = []
+    start = threading.Barrier(2)
+
+    def prepare() -> None:
+        try:
+            start.wait()
+            _prepare_retry_attempt(tmp_path, "trial-001")
+        except BaseException as error:
+            failures.append(error)
+
+    threads = [threading.Thread(target=prepare) for _ in range(2)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+
+    assert failures == []
+    attempts = list((tmp_path / "quarantine").glob("trial-001.attempt-*"))
+    assert len(attempts) == 1
+    assert (attempts[0] / "pending" / "annotations.jsonl").is_file()
+
+
+def test_retry_preparation_fails_closed_on_an_unsafe_attempt_destination(tmp_path) -> None:
+    failed = EpisodeArtifactWriter(tmp_path, "trial-001")
+    failed.append_annotation({"step": 0, "action_source": "policy"})
+    external = tmp_path / "external"
+    external.mkdir()
+    quarantine = tmp_path / "quarantine"
+    quarantine.mkdir()
+    (quarantine / "trial-001.attempt-001").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="attempt path is unsafe"):
+        _prepare_retry_attempt(tmp_path, "trial-001")
+
+    assert (tmp_path / ".pending" / "trial-001").is_dir()
+    assert not list(external.iterdir())
+
+
 def test_parallel_retry_quarantines_invalid_raw_before_worker_reuses_the_trial_id(monkeypatch, tmp_path) -> None:
     trial = Trial("pant_long", "Pant_Long_Seen_0", "seen", 42)
     invalid = EpisodeArtifactWriter(tmp_path, trial.trial_id)
@@ -147,7 +223,7 @@ def test_worker_group_does_not_count_an_encoder_error_as_completed(monkeypatch, 
         "scripts.run_groot_flywheel_campaign.subprocess.Popen",
         lambda *args, **kwargs: _SuccessfulProcess([]),
     )
-    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda _path: False)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda *_args: False)
 
     _, completed, failed = _run_worker_group(
         _worker_args(tmp_path), ((1, Trial("pant_long", "Pant_Long_Seen_0", "seen", 42)),)
@@ -452,7 +528,7 @@ def test_worker_group_launches_immediately_and_uses_configured_shutdown_grace(mo
         "scripts.run_groot_flywheel_campaign.subprocess.Popen",
         lambda *args, **kwargs: (events.append(("launch", None)), _TimeoutThenKillProcess(events))[1],
     )
-    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda _path: False)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda *_args: False)
     first_trial = Trial("pant_long", "Pant_Long_Seen_0", "seen", 42)
     second_trial = Trial("pant_long", "Pant_Long_Seen_1", "seen", 43)
 
@@ -476,7 +552,7 @@ def test_worker_group_uses_one_launch_relative_deadline(monkeypatch, tmp_path) -
         "scripts.run_groot_flywheel_campaign.subprocess.Popen",
         lambda *args, **kwargs: (events.append(("launch", None)), _TimeoutThenKillProcess(events))[1],
     )
-    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda _path: False)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda *_args: False)
     trials = (
         (1, Trial("pant_long", "Pant_Long_Seen_0", "seen", 42)),
         (2, Trial("pant_long", "Pant_Long_Seen_1", "seen", 43)),

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import json
 import math
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import time
@@ -25,23 +28,7 @@ class CampaignState:
     trial_ids: tuple[str, ...]
 
 
-def is_completed_trial(episode_dir: Path) -> bool:
-    """Accept only terminal, non-error artifacts with canonical video evidence."""
-    try:
-        episode, manifest = verify_episode_manifest(episode_dir)
-    except ValueError:
-        return False
-    if not isinstance(episode.get("terminal_reason"), str) or not episode["terminal_reason"]:
-        return False
-    if episode.get("outcome") == "error" or episode.get("recorder_error"):
-        return False
-    expected_videos = {f"videos/{filename}" for filename in CANONICAL_VIDEO_FILENAMES}
-    manifest_videos = {path for path in manifest if path.startswith("videos/")}
-    return manifest_videos == expected_videos and all(manifest[path]["size"] > 0 for path in expected_videos)
-
-
-def _prepare_retry_attempt(output_root: Path, trial_id: str) -> None:
-    """Atomically quarantine an invalid prior attempt before retrying its ID."""
+def _validate_trial_id(trial_id: str) -> None:
     if (
         not isinstance(trial_id, str)
         or trial_id in {"", ".", ".."}
@@ -51,44 +38,171 @@ def _prepare_retry_attempt(output_root: Path, trial_id: str) -> None:
         or Path(trial_id).name != trial_id
     ):
         raise ValueError("trial ID must be a non-empty path-safe identifier")
+
+
+def _open_campaign_directory(parent_fd: int, name: str, *, create: bool) -> int | None:
+    """Open one trusted campaign child directory without following a symlink."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        details = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if not create:
+            return None
+        os.mkdir(name, dir_fd=parent_fd)
+        details = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+        raise ValueError(f"campaign {name} root is unsafe")
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
+    except OSError as error:
+        raise ValueError(f"campaign {name} root is unsafe") from error
+
+
+def _open_controller_lock(root_fd: int) -> int:
+    """Create the fixed lock once, then open it no-follow for every controller."""
+    flags = os.O_RDWR | os.O_NOFOLLOW
+    while True:
+        try:
+            return os.open(".campaign.lock", flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=root_fd)
+        except FileExistsError:
+            try:
+                return os.open(".campaign.lock", flags, dir_fd=root_fd)
+            except FileNotFoundError:
+                # Another controller won creation but has not made the entry
+                # observable yet; retry rather than accepting an unchecked path.
+                continue
+
+
+@contextmanager
+def _locked_campaign_storage(output_root: Path):
+    """Serialize cooperating controllers and expose a no-follow output-root FD."""
+    if not hasattr(os, "O_NOFOLLOW") or os.name != "posix":
+        raise ValueError("campaign retry storage requires POSIX no-follow support")
     root = Path(output_root)
     if root.is_symlink():
         raise ValueError("campaign output root must not be a symlink")
     root.mkdir(parents=True, exist_ok=True)
-    if not root.is_dir():
+    if root.is_symlink() or not root.is_dir():
         raise ValueError("campaign output root must be a directory")
-    raw = root / "raw" / trial_id
-    if is_completed_trial(raw):
-        return
-    sources: list[tuple[str, Path]] = []
-    for name in (".pending", "raw"):
-        parent = root / name
-        if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
-            raise ValueError(f"campaign {name} root is unsafe")
-        source = parent / trial_id
-        if source.is_symlink() or (source.exists() and not source.is_dir()):
-            raise ValueError(f"campaign {name} trial path is unsafe")
-        if source.exists():
-            sources.append((name.removeprefix("."), source))
-    if not sources:
-        return
-    quarantine_root = root / "quarantine"
-    if quarantine_root.is_symlink() or (quarantine_root.exists() and not quarantine_root.is_dir()):
-        raise ValueError("campaign quarantine root is unsafe")
-    quarantine_root.mkdir(exist_ok=True)
-    attempt = 1
-    while True:
-        quarantine = quarantine_root / f"{trial_id}.attempt-{attempt:03d}"
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    lock_fd = -1
+    try:
+        lock_fd = _open_controller_lock(root_fd)
+        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            raise ValueError("campaign controller lock is unsafe")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield root, root_fd
+    except OSError as error:
+        raise ValueError("campaign output storage is unsafe") from error
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(root_fd)
+
+
+def _open_trial_directory(parent_fd: int, trial_id: str) -> os.stat_result | None:
+    try:
+        details = os.stat(trial_id, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+        raise ValueError("campaign trial path is unsafe")
+    return details
+
+
+def _is_completed_locked(root: Path, root_fd: int, trial_id: str) -> bool:
+    for name in (".pending", "quarantine"):
+        parent_fd = _open_campaign_directory(root_fd, name, create=False)
+        if parent_fd is not None:
+            os.close(parent_fd)
+    raw_fd = _open_campaign_directory(root_fd, "raw", create=False)
+    if raw_fd is None:
+        return False
+    try:
+        before = _open_trial_directory(raw_fd, trial_id)
+        if before is None:
+            return False
+        episode_dir = root / "raw" / trial_id
         try:
-            quarantine.mkdir()
-        except FileExistsError:
-            if quarantine.is_symlink() or not quarantine.is_dir():
-                raise ValueError("campaign quarantine attempt path is unsafe")
-            attempt += 1
-            continue
-        break
-    for name, source in sources:
-        source.rename(quarantine / name)
+            episode, manifest = verify_episode_manifest(episode_dir)
+        except ValueError:
+            return False
+        after = _open_trial_directory(raw_fd, trial_id)
+        if after is None or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise ValueError("campaign raw trial changed during verification")
+    finally:
+        os.close(raw_fd)
+    if not isinstance(episode.get("terminal_reason"), str) or not episode["terminal_reason"]:
+        return False
+    if episode.get("outcome") == "error" or episode.get("recorder_error"):
+        return False
+    expected_videos = {f"videos/{filename}" for filename in CANONICAL_VIDEO_FILENAMES}
+    manifest_videos = {path for path in manifest if path.startswith("videos/")}
+    return manifest_videos == expected_videos and all(manifest[path]["size"] > 0 for path in expected_videos)
+
+
+def is_completed_trial(output_root: Path, trial_id: str) -> bool:
+    """Accept only terminal, non-error artifacts with canonical video evidence."""
+    _validate_trial_id(trial_id)
+    with _locked_campaign_storage(output_root) as (root, root_fd):
+        return _is_completed_locked(root, root_fd, trial_id)
+
+
+def _prepare_retry_attempt(output_root: Path, trial_id: str) -> None:
+    """Atomically quarantine an invalid prior attempt before retrying its ID."""
+    _validate_trial_id(trial_id)
+    with _locked_campaign_storage(output_root) as (root, root_fd):
+        if _is_completed_locked(root, root_fd, trial_id):
+            return
+        parent_fds: list[tuple[str, int, os.stat_result]] = []
+        try:
+            for parent_name in (".pending", "raw"):
+                parent_fd = _open_campaign_directory(root_fd, parent_name, create=True)
+                details = _open_trial_directory(parent_fd, trial_id)
+                if details is not None:
+                    parent_fds.append((parent_name.removeprefix("."), parent_fd, details))
+                else:
+                    os.close(parent_fd)
+            quarantine_fd = _open_campaign_directory(root_fd, "quarantine", create=True)
+            if not parent_fds:
+                os.close(quarantine_fd)
+                return
+            try:
+                attempt = 1
+                while True:
+                    attempt_name = f"{trial_id}.attempt-{attempt:03d}"
+                    try:
+                        os.mkdir(attempt_name, dir_fd=quarantine_fd)
+                    except FileExistsError:
+                        existing = os.stat(attempt_name, dir_fd=quarantine_fd, follow_symlinks=False)
+                        if stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode):
+                            raise ValueError("campaign quarantine attempt path is unsafe")
+                        attempt += 1
+                        continue
+                    attempt_fd = _open_campaign_directory(quarantine_fd, attempt_name, create=False)
+                    break
+                try:
+                    for name, parent_fd, before in parent_fds:
+                        current = _open_trial_directory(parent_fd, trial_id)
+                        if current is None or (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino):
+                            raise ValueError("campaign trial changed during retry preparation")
+                        try:
+                            os.stat(name, dir_fd=attempt_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            raise ValueError("campaign quarantine destination collision")
+                        os.rename(trial_id, name, src_dir_fd=parent_fd, dst_dir_fd=attempt_fd)
+                        moved = os.stat(name, dir_fd=attempt_fd, follow_symlinks=False)
+                        if stat.S_ISLNK(moved.st_mode) or (moved.st_dev, moved.st_ino) != (before.st_dev, before.st_ino):
+                            raise ValueError("campaign trial changed during quarantine")
+                finally:
+                    os.close(attempt_fd)
+            finally:
+                os.close(quarantine_fd)
+        finally:
+            for _, parent_fd, _ in parent_fds:
+                os.close(parent_fd)
 
 
 def pending_trial_ids(state: CampaignState) -> tuple[str, ...]:
@@ -96,7 +210,7 @@ def pending_trial_ids(state: CampaignState) -> tuple[str, ...]:
     return tuple(
         trial_id
         for trial_id in state.trial_ids
-        if not is_completed_trial(state.output_root / "raw" / trial_id)
+        if not is_completed_trial(state.output_root, trial_id)
     )
 
 
@@ -342,7 +456,7 @@ def _run_worker_group(args: argparse.Namespace, assignments: Sequence[tuple[int,
     for worker_id, trial, process, heartbeat, log in processes:
         returncode = returncodes[worker_id]
         log.close()
-        if returncode == 0 and is_completed_trial(args.output_root / "raw" / trial.trial_id):
+        if returncode == 0 and is_completed_trial(args.output_root, trial.trial_id):
             completed += 1
         else:
             failed += 1
