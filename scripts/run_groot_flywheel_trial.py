@@ -17,6 +17,21 @@ _PINNED = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
+def _scene_state_matches(expected: object, observed: object) -> bool:
+    """Compare JSON scene receipts while accepting float32 Isaac readback noise."""
+    if isinstance(expected, dict) and isinstance(observed, dict):
+        return set(expected) == set(observed) and all(
+            _scene_state_matches(expected[key], observed[key]) for key in expected
+        )
+    if isinstance(expected, list) and isinstance(observed, list):
+        return len(expected) == len(observed) and all(
+            _scene_state_matches(left, right) for left, right in zip(expected, observed, strict=True)
+        )
+    if isinstance(expected, (int, float)) and isinstance(observed, (int, float)):
+        return bool(np.isclose(expected, observed, atol=1e-5))
+    return expected == observed
+
+
 def read_pinned_revision(path: Path) -> str:
     if path.is_symlink() or not path.is_file():
         raise ValueError("policy revision file must be a regular file")
@@ -72,8 +87,8 @@ def validate_args(args: argparse.Namespace) -> str:
         raise ValueError("policy path must be an existing directory")
     if args.matrix is not None and (args.matrix.is_symlink() or not args.matrix.is_file()):
         raise ValueError("matrix must be an existing regular file")
-    if not args.snapshot_roundtrip_only and not args.render_randomization_sheet and not args.garment:
-        raise ValueError("--garment is required for a one-trial invocation")
+    if not args.garment:
+        raise ValueError("--garment is required for trial and simulator acceptance invocations")
     if args.seed < 0 or args.max_steps <= 0:
         raise ValueError("seed must be non-negative and max-steps must be positive")
     if any(strategy not in {"canonical", "mild", "strong"} for strategy in args.strategies):
@@ -133,7 +148,9 @@ def run_snapshot_acceptance(args: argparse.Namespace, *, env_factory=_production
         env.render()
         after = _images(env)
         difference = max(float(np.max(np.abs(before[name].astype(float) - after[name].astype(float)))) for name in before)
-        report.update({"camera_difference": difference, "restore_coverage": ["robot", "cloth", "rng", "garment", "randomization"], "passed": difference <= report["tolerance"]})
+        restored = capture_snapshot(env, randomization={"strategy": "canonical"})
+        scene_state_match = _scene_state_matches(snapshot.scene_state, restored.scene_state)
+        report.update({"camera_difference": difference, "scene_state_match": scene_state_match, "restore_coverage": ["robot", "cloth", "rng", "garment", "randomization", "camera", "robot_root", "light", "material"], "passed": difference <= report["tolerance"] and scene_state_match})
     except Exception as error:
         report["simulation_error"] = str(error)
     finally:
@@ -150,27 +167,31 @@ def run_randomization_acceptance(args: argparse.Namespace, *, env_factory=_produ
             if not cv2.imwrite(str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)): raise RuntimeError(f"failed to write {path}")
     args.output_root.mkdir(parents=True, exist_ok=True)
     report: dict[str, object] = {"seed": args.seed, "strategies": [], "passed": False}
-    env = None
     try:
-        env = env_factory(args)
         for index, strategy in enumerate(args.strategies):
-            env.reset()
-            record = sample_randomization(strategy, seed=args.seed + index)
-            receipt = env.apply_flywheel_randomization(record)
-            from lehome.flywheel.randomization import validate_randomization_receipt
-            validate_randomization_receipt(dict(record.values), dict(receipt))
-            env.render()
-            images = _images(env)
-            paths = []
-            for camera, frame in images.items():
-                path = args.output_root / f"randomization-{strategy}-{camera}.png"
-                image_writer(path, frame); paths.append(path.name)
-            report["strategies"].append({"strategy": strategy, "sampled": dict(record.values), "receipt": dict(receipt), "images": paths})
-        report["passed"] = len(report["strategies"]) * 3 == 9
+            # A new environment per strategy prevents perturbations from one
+            # acceptance row becoming the baseline of the next row.
+            env = env_factory(args)
+            try:
+                env.reset()
+                record = sample_randomization(strategy, seed=args.seed + index)
+                receipt = env.apply_flywheel_randomization(record)
+                from lehome.flywheel.randomization import validate_randomization_receipt
+                validate_randomization_receipt(dict(record.values), dict(receipt))
+                env.render()
+                images = _images(env)
+                paths = []
+                for camera, frame in images.items():
+                    path = args.output_root / f"randomization-{strategy}-{camera}.png"
+                    image_writer(path, frame); paths.append(path.name)
+                report["strategies"].append({"strategy": strategy, "sampled": dict(record.values), "receipt": dict(receipt), "images": paths})
+            finally:
+                if hasattr(env, "close"):
+                    env.close()
+        report["passed"] = len(report["strategies"]) * 3 == len(args.strategies) * 3
     except Exception as error:
         report["simulation_error"] = str(error)
     finally:
-        if env is not None and hasattr(env, "close"): env.close()
         _write_report(args.output_root / "randomization-receipts.json", report)
     return 0 if report["passed"] else 1
 
@@ -219,6 +240,7 @@ def run_trial(args: argparse.Namespace) -> int:
     command = [
         "--policy_type", "groot", "--policy_path", str(args.policy_path),
         "--garment_type", "custom", "--num_episodes", "1", "--max_steps", str(args.max_steps),
+        "--garment_name", args.garment,
         "--seed", str(args.seed), "--task", args.task, "--device", args.device,
         "--save_video", "--video_dir", str(args.output_root / "videos"),
     ]

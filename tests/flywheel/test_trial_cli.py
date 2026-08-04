@@ -5,10 +5,14 @@ import pytest
 import numpy as np
 
 import argparse
+import importlib
+from pathlib import Path
+import sys
+import types
 
 from scripts.run_groot_flywheel_trial import (
-    _manifest_path, build_parser, read_pinned_revision, run_randomization_acceptance,
-    run_snapshot_acceptance, validate_args,
+    _manifest_path, _scene_state_matches, build_parser, read_pinned_revision, run_randomization_acceptance,
+    run_snapshot_acceptance, run_trial, validate_args,
 )
 
 
@@ -23,6 +27,12 @@ def test_trial_cli_reads_revision_from_a_regular_file(tmp_path) -> None:
     revision = tmp_path / "revision.txt"
     revision.write_text("a" * 40 + "\n", encoding="utf-8")
     assert read_pinned_revision(revision) == "a" * 40
+
+
+def test_simulator_acceptance_requires_an_explicit_release_garment() -> None:
+    args = build_parser().parse_args(["--render-randomization-sheet"])
+    with pytest.raises(ValueError, match="--garment"):
+        validate_args(args)
 
 
 class FakeEnv:
@@ -49,15 +59,101 @@ class FakeEnv:
     def close(self): pass
 
 
+class IndependentRandomizationEnv(FakeEnv):
+    def __init__(self) -> None:
+        self.garment_name = "Pant_Long_Seen_0"
+        self.robot_position = np.arange(12, dtype=np.float32)
+        self.robot_velocity = np.zeros(12, dtype=np.float32)
+        self.cloth_position = np.arange(30, dtype=np.float32).reshape(10, 3)
+        self.cloth_velocity = np.ones((10, 3), dtype=np.float32)
+        self.rng_state = {"seed": 42}
+        self.baseline_light = 100.0
+        self.light = self.baseline_light
+
+    def apply_flywheel_randomization(self, record):
+        receipt = super().apply_flywheel_randomization(record)
+        if receipt:
+            # A reused environment would expose compounded light state here.
+            self.light *= receipt["light_intensity_scale"]
+            receipt["light_intensity_scale"] = self.light / self.baseline_light
+        return receipt
+
+
+class VisualSnapshotEnv(FakeEnv):
+    def __init__(self) -> None:
+        self.garment_name = "Pant_Long_Seen_0"
+        self.robot_position = np.arange(12, dtype=np.float32)
+        self.robot_velocity = np.zeros(12, dtype=np.float32)
+        self.cloth_position = np.arange(30, dtype=np.float32).reshape(10, 3)
+        self.cloth_velocity = np.ones((10, 3), dtype=np.float32)
+        self.rng_state = {"seed": 42}
+        self.scene_state = {"camera_world_poses": [{"position": [1.0, 2.0, 3.0], "orientation": [1.0, 0.0, 0.0, 0.0]}] * 3, "robot_root_poses": [{"position": [4.0, 5.0, 6.0], "orientation": [0.0, 1.0, 0.0, 0.0]}] * 2, "light_intensity": 120.0, "light_color": [0.75, 0.75, 0.75], "table_texture_path": "/assets/1.png", "table_shader_input": "file", "garment_display_color": [[0.8, 0.7, 0.6]], "garment_reset_pose": [0.0] * 6}
+
+    def reset(self):
+        self.robot_position[:] = -1
+        self.scene_state = {"light_intensity": 0.0}
+
+    def flywheel_capture_state(self):
+        state = super().flywheel_capture_state()
+        state["scene_state"] = self.scene_state
+        return state
+
+    def flywheel_restore_state(self, snapshot):
+        super().flywheel_restore_state(snapshot)
+        self.scene_state = snapshot.scene_state
+
+    def _get_observations(self):
+        value = int(self.scene_state.get("light_intensity", 0.0))
+        return {f"observation.images.{name}": np.full((4, 4, 3), value, dtype=np.uint8) for name in ("top_rgb", "left_rgb", "right_rgb")}
+
+
 def test_acceptance_modes_write_real_orchestrated_reports(tmp_path) -> None:
     args = build_parser().parse_args(["--snapshot-roundtrip-only", "--garment", "Pant_Long_Seen_0", "--output-root", str(tmp_path)])
     assert run_snapshot_acceptance(args, env_factory=lambda _: FakeEnv()) == 0
     assert (tmp_path / "snapshot-acceptance.json").is_file()
-    args = build_parser().parse_args(["--render-randomization-sheet", "--output-root", str(tmp_path), "--strategies", "canonical", "mild", "strong"])
+    args = build_parser().parse_args(["--render-randomization-sheet", "--garment", "Pant_Long_Seen_0", "--output-root", str(tmp_path), "--strategies", "canonical", "mild", "strong"])
     writes = []
     assert run_randomization_acceptance(args, env_factory=lambda _: FakeEnv(), image_writer=lambda path, frame: writes.append(path)) == 0
     assert len(writes) == 9
     assert (tmp_path / "randomization-receipts.json").is_file()
+
+
+def test_snapshot_acceptance_verifies_scene_state_and_render_round_trip(tmp_path) -> None:
+    args = build_parser().parse_args(["--snapshot-roundtrip-only", "--garment", "Pant_Long_Seen_0", "--output-root", str(tmp_path)])
+    assert run_snapshot_acceptance(args, env_factory=lambda _: VisualSnapshotEnv()) == 0
+    report = __import__("json").loads((tmp_path / "snapshot-acceptance.json").read_text())
+    assert report["scene_state_match"] is True
+    assert {"camera", "robot_root", "light", "material"}.issubset(report["restore_coverage"])
+
+
+def test_scene_state_comparison_allows_float32_rounding_but_not_asset_identity_changes() -> None:
+    expected = {"light_intensity": 1200.0, "table_texture_path": "/assets/1.png"}
+    assert _scene_state_matches(expected, {"light_intensity": 1200.00001, "table_texture_path": "/assets/1.png"})
+    assert not _scene_state_matches(expected, {"light_intensity": 1200.0, "table_texture_path": "/assets/2.png"})
+
+
+def test_randomization_acceptance_uses_an_independent_canonical_baseline_per_strategy(tmp_path) -> None:
+    args = build_parser().parse_args([
+        "--render-randomization-sheet", "--garment", "Pant_Long_Seen_0", "--output-root", str(tmp_path),
+        "--strategies", "canonical", "mild", "strong",
+    ])
+    environments: list[IndependentRandomizationEnv] = []
+
+    def factory(_):
+        environment = IndependentRandomizationEnv()
+        environments.append(environment)
+        return environment
+
+    assert run_randomization_acceptance(args, env_factory=factory, image_writer=lambda *_: None) == 0
+    assert len(environments) == 3
+    report = __import__("json").loads((tmp_path / "randomization-receipts.json").read_text())
+    for entry in report["strategies"]:
+        if not entry["sampled"]:
+            assert entry["receipt"] == {}
+            continue
+        assert entry["receipt"].get("light_intensity_scale") == pytest.approx(
+            entry["sampled"]["light_intensity_scale"]
+        )
 
 
 def test_manifest_creation_is_atomic_and_immutable(tmp_path) -> None:
@@ -68,3 +164,140 @@ def test_manifest_creation_is_atomic_and_immutable(tmp_path) -> None:
     with pytest.raises(ValueError, match="overwrite"):
         _manifest_path(args, "a" * 40)
     assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_normal_trial_pins_one_assigned_garment_and_rejects_episode_id_reuse(tmp_path, capsys) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    base = [
+        "--policy-path", str(policy), "--policy-revision", "a" * 40,
+        "--episode-id", "only-once", "--policy-repo", "org/policy", "--policy-step", "1",
+        "--code-revision", "b" * 40, "--asset-revision", "c" * 40,
+        "--simulator-version", "isaac", "--category", "pant_long", "--release-stage", "seen",
+        "--policy-artifact-sha256", "d" * 64, "--image-identity", "sha256:image",
+        "--output-root", str(tmp_path / "run"), "--dry-run",
+    ]
+    first = build_parser().parse_args([*base, "--garment", "Pant_Long_Seen_0"])
+    assert run_trial(first) == 0
+    launched = __import__("json").loads(capsys.readouterr().out)
+    command = launched["command"]
+    assert command[command.index("--garment_name") + 1] == "Pant_Long_Seen_0"
+    assert command.count("--num_episodes") == 1
+    assert command[command.index("--num_episodes") + 1] == "1"
+
+    conflicting = build_parser().parse_args([*base, "--garment", "Pant_Long_Seen_1"])
+    with pytest.raises(ValueError, match="overwrite"):
+        run_trial(conflicting)
+
+
+def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(monkeypatch, tmp_path) -> None:
+    policy = tmp_path / "policy"; policy.mkdir()
+    launched: list[tuple[str, str, int]] = []
+
+    class AppLauncher:
+        @staticmethod
+        def add_app_launcher_args(_parser): pass
+
+    def setup_eval_parser():
+        parser = argparse.ArgumentParser(add_help=False)
+        for name in ("policy_type", "policy_path", "garment_type", "max_steps", "seed", "task", "device", "video_dir", "garment_name"):
+            parser.add_argument(f"--{name}")
+        parser.add_argument("--num_episodes", type=int)
+        parser.add_argument("--save_video", action="store_true")
+        parser.add_argument("--headless", action="store_true")
+        return parser
+
+    def evaluate(args, _app):
+        manifest = __import__("json").loads(Path(args.flywheel_manifest).read_text())
+        identity = manifest["identity"]
+        assert args.num_episodes == 1
+        assert args.garment_name == identity["garment_name"] == manifest["garment"]
+        launched.append((args.garment_name, identity["episode_id"], args.num_episodes))
+
+    utils = types.ModuleType("scripts.utils"); utils.__path__ = []
+    common = types.ModuleType("scripts.utils.common")
+    common.launch_app_from_args = lambda _args: object()
+    common.close_app = lambda _app: None
+    parser_module = types.ModuleType("scripts.utils.parser"); parser_module.setup_eval_parser = setup_eval_parser
+    evaluation_module = types.ModuleType("scripts.utils.evaluation"); evaluation_module.eval = evaluate
+    app_module = types.ModuleType("isaaclab.app"); app_module.AppLauncher = AppLauncher
+    isaaclab = types.ModuleType("isaaclab"); isaaclab.__path__ = []
+    lehome_tasks = types.ModuleType("lehome.tasks"); lehome_tasks.__path__ = []
+    bedroom = types.ModuleType("lehome.tasks.bedroom")
+    for name, module in {
+        "scripts.utils": utils, "scripts.utils.common": common, "scripts.utils.parser": parser_module,
+        "scripts.utils.evaluation": evaluation_module, "isaaclab": isaaclab, "isaaclab.app": app_module,
+        "lehome.tasks": lehome_tasks, "lehome.tasks.bedroom": bedroom,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    args = build_parser().parse_args([
+        "--policy-path", str(policy), "--policy-revision", "a" * 40, "--garment", "Pant_Long_Seen_0",
+        "--episode-id", "isolated-worker", "--policy-repo", "org/policy", "--policy-step", "1",
+        "--code-revision", "b" * 40, "--asset-revision", "c" * 40, "--simulator-version", "isaac",
+        "--category", "pant_long", "--release-stage", "seen", "--policy-artifact-sha256", "d" * 64,
+        "--image-identity", "sha256:image", "--output-root", str(tmp_path / "run"),
+    ])
+    assert run_trial(args) == 0
+    assert launched == [("Pant_Long_Seen_0", "isolated-worker", 1)]
+
+
+def test_real_evaluation_rejects_manifest_environment_garment_mismatch_before_recording(monkeypatch, tmp_path) -> None:
+    """Load evaluation with inert Isaac dependencies; its preflight must fail first."""
+    manifest = {
+        "policy_revision": "a" * 40,
+        "episode_id": "worker-1",
+        "garment": "Pant_Long_Seen_0",
+        "seed": 42,
+        "identity": {"episode_id": "worker-1", "policy_repo": "repo", "policy_revision": "a" * 40,
+                     "policy_step": 1, "code_revision": "b" * 40, "asset_revision": "c" * 40,
+                     "simulator_version": "isaac", "garment_name": "Pant_Long_Seen_0", "category": "pant_long",
+                     "release_stage": "seen", "seed": 42, "instruction": "fold the garment on the table", "strategy": "canonical"},
+    }
+    path = tmp_path / "manifest.json"; path.write_text(__import__("json").dumps(manifest))
+    package = types.ModuleType("scripts.utils"); package.__path__ = [str(Path(__file__).parents[2] / "scripts" / "utils")]
+    modules = {
+        "scripts.utils": package,
+        "gymnasium": types.ModuleType("gymnasium"),
+        "torch": types.ModuleType("torch"),
+        "isaaclab": types.ModuleType("isaaclab"),
+        "isaaclab.envs": types.ModuleType("isaaclab.envs"),
+        "isaaclab_tasks": types.ModuleType("isaaclab_tasks"),
+        "isaaclab_tasks.utils": types.ModuleType("isaaclab_tasks.utils"),
+        "scripts.eval_policy": types.ModuleType("scripts.eval_policy"),
+        "scripts.eval_policy.base_policy": types.ModuleType("scripts.eval_policy.base_policy"),
+        "scripts.utils.eval_utils": types.ModuleType("scripts.utils.eval_utils"),
+        "lehome.utils.record": types.ModuleType("lehome.utils.record"),
+        "lerobot": types.ModuleType("lerobot"),
+        "lerobot.datasets": types.ModuleType("lerobot.datasets"),
+        "lerobot.datasets.lerobot_dataset": types.ModuleType("lerobot.datasets.lerobot_dataset"),
+        "scripts.utils.common": types.ModuleType("scripts.utils.common"),
+        "lehome.utils.logger": types.ModuleType("lehome.utils.logger"),
+    }
+    modules["isaaclab.envs"].DirectRLEnv = object
+    modules["isaaclab_tasks.utils"].parse_env_cfg = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must fail before environment creation"))
+    modules["scripts.eval_policy"].PolicyRegistry = object
+    modules["scripts.eval_policy.base_policy"].BasePolicy = object
+    modules["scripts.utils.eval_utils"].convert_ee_pose_to_joints = lambda *_: None
+    modules["scripts.utils.eval_utils"].save_videos_from_observations = lambda *_: None
+    modules["scripts.utils.eval_utils"].calculate_and_print_metrics = lambda *_: None
+    modules["lehome.utils.record"].RateLimiter = object
+    modules["lehome.utils.record"].get_next_experiment_path_with_gap = lambda *_: None
+    modules["lehome.utils.record"].append_episode_initial_pose = lambda *_: None
+    modules["lerobot.datasets.lerobot_dataset"].LeRobotDataset = object
+    modules["scripts.utils.common"].stabilize_garment_after_reset = lambda *_: None
+    modules["lehome.utils.logger"].get_logger = lambda *_: types.SimpleNamespace(info=lambda *_: None)
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.delitem(sys.modules, "scripts.utils.evaluation", raising=False)
+    evaluation = importlib.import_module("scripts.utils.evaluation")
+    args = argparse.Namespace(flywheel_manifest=str(path), num_episodes=1, garment_name="Pant_Long_Seen_1")
+    with pytest.raises(ValueError, match="requested garment"):
+        evaluation.eval(args, object())
+    identity = evaluation._flywheel_identity(manifest)
+    wrong_loaded_object = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(garment_name="Pant_Long_Seen_0", garment_version="Release"),
+        object=types.SimpleNamespace(prim_name="Pant_Long_Seen_1"),
+    )
+    with pytest.raises(ValueError, match="active environment garment"):
+        evaluation._validate_active_flywheel_garment(wrong_loaded_object, identity)

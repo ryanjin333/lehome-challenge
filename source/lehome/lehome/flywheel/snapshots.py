@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 from typing import Any, Mapping, Protocol
@@ -48,6 +48,9 @@ class Snapshot:
     rng_state: dict[str, object]
     garment_name: str
     randomization: dict[str, object]
+    # Exact USD/camera/root properties mutated by flywheel randomization.
+    # Optional for pre-randomization snapshots produced by older callers.
+    scene_state: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -77,6 +80,7 @@ class Snapshot:
             "rng_state": _json_round_trip(self.rng_state),
             "garment_name": self.garment_name,
             "randomization": _json_round_trip(self.randomization),
+            "scene_state": _json_round_trip(self.scene_state),
         }
 
 
@@ -105,6 +109,7 @@ def capture_snapshot(adapter: SnapshotAdapter | object, *, randomization: Mappin
         rng_state=_json_round_trip(state["rng_state"]),
         garment_name=str(state["garment_name"]),
         randomization=_json_round_trip(dict(randomization)),
+        scene_state=_json_round_trip(state.get("scene_state", {})),
     )
 
 
@@ -121,6 +126,8 @@ def restore_snapshot(adapter: SnapshotAdapter | object, snapshot: Snapshot) -> N
     adapter.cloth_position = np.asarray(snapshot.cloth_position, dtype=np.float32)
     adapter.cloth_velocity = np.asarray(snapshot.cloth_velocity, dtype=np.float32)
     adapter.rng_state = _json_round_trip(snapshot.rng_state)
+    if snapshot.scene_state:
+        adapter.scene_state = _json_round_trip(snapshot.scene_state)
 
 
 __all__ = ["Snapshot", "SnapshotAdapter", "capture_snapshot", "restore_snapshot"]

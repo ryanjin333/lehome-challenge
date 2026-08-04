@@ -48,6 +48,43 @@ def _load_flywheel_manifest(path_value: str | None) -> dict[str, object] | None:
     return manifest
 
 
+def _flywheel_identity(manifest: dict[str, object] | None):
+    """Validate the immutable assignment that a dedicated flywheel worker owns."""
+    if manifest is None:
+        return None
+    from lehome.flywheel.models import EpisodeIdentity
+
+    raw_identity = manifest.get("identity")
+    if not isinstance(raw_identity, dict):
+        raise ValueError("flywheel manifest requires an immutable identity")
+    try:
+        identity = EpisodeIdentity(**raw_identity)
+    except (TypeError, ValueError) as error:
+        raise ValueError("flywheel manifest has an invalid immutable identity") from error
+    if manifest.get("episode_id") != identity.episode_id:
+        raise ValueError("flywheel manifest episode ID does not match immutable identity")
+    if manifest.get("garment") != identity.garment_name:
+        raise ValueError("flywheel manifest garment does not match immutable identity")
+    if manifest.get("seed") != identity.seed:
+        raise ValueError("flywheel manifest seed does not match immutable identity")
+    return identity
+
+
+def _validate_active_flywheel_garment(env: DirectRLEnv, identity) -> None:
+    """Fail before recording if the created Isaac environment differs from its manifest."""
+    active_cfg = getattr(env, "cfg", None)
+    active_name = getattr(active_cfg, "garment_name", None)
+    active_version = getattr(active_cfg, "garment_version", None)
+    active_object = getattr(env, "object", None)
+    active_object_name = getattr(active_object, "prim_name", None)
+    if (
+        active_name != identity.garment_name
+        or active_version != "Release"
+        or active_object_name != identity.garment_name
+    ):
+        raise ValueError("active environment garment does not match immutable flywheel identity")
+
+
 def run_evaluation_loop(
     env: DirectRLEnv,
     policy: BasePolicy,
@@ -117,6 +154,11 @@ def run_evaluation_loop(
 
     all_episode_metrics = []
     flywheel_manifest = _load_flywheel_manifest(getattr(args, "flywheel_manifest", None))
+    flywheel_identity = _flywheel_identity(flywheel_manifest)
+    if flywheel_identity is not None:
+        _validate_active_flywheel_garment(env, flywheel_identity)
+        if garment_name != flywheel_identity.garment_name:
+            raise ValueError("evaluation garment does not match immutable flywheel identity")
     logger.info(f"Starting evaluation: {args.num_episodes} episodes")
     rate_limiter = RateLimiter(args.step_hz)
 
@@ -140,7 +182,9 @@ def run_evaluation_loop(
             randomization_receipt = env.apply_flywheel_randomization(sampled)
             from lehome.flywheel.randomization import validate_randomization_receipt
             validate_randomization_receipt(dict(sampled.values), dict(randomization_receipt))
-            identity = EpisodeIdentity(**flywheel_manifest["identity"])
+            identity = flywheel_identity
+            if identity is None:  # pragma: no cover - guarded above, keeps type flow explicit.
+                raise RuntimeError("missing flywheel identity")
             recorder = AutonomousRecorder(
                 Path(flywheel_manifest["_path"]).parent,
                 policy_revision=flywheel_manifest["policy_revision"],
@@ -308,6 +352,16 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     """
     Main entry point for evaluation logic.
     """
+    # One flywheel worker owns exactly one manifest garment.  Resolve this before
+    # allocating policy/Isaac resources so a mismatched invocation cannot record.
+    flywheel_manifest = _load_flywheel_manifest(getattr(args, "flywheel_manifest", None))
+    flywheel_identity = _flywheel_identity(flywheel_manifest)
+    if flywheel_identity is not None:
+        if args.num_episodes != 1:
+            raise ValueError("flywheel workers must run exactly one episode")
+        if args.garment_name != flywheel_identity.garment_name:
+            raise ValueError("requested garment does not match immutable flywheel identity")
+
     # 1. Environment Configuration
     env_cfg = parse_env_cfg(args.task, device=args.device)
     env_cfg.sim.use_fabric = False
@@ -402,8 +456,12 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     # Only loads from 'Release' directory based on garment_type
     eval_list = []  # List of (name, stage)
 
+    # The manifest is authoritative.  Legacy custom mode remains list-driven
+    # only when the caller did not opt into a flywheel recording contract.
+    if flywheel_identity is not None:
+        eval_list.append((flywheel_identity.garment_name, "Release"))
     # Evaluate a specific category based on garment_type
-    if args.garment_type == "custom":
+    elif args.garment_type == "custom":
         # For 'custom' type, we load from the root Release_test_list.txt
         eval_list_path = os.path.join(
             args.garment_cfg_base_path, "Release", "Release_test_list.txt"
@@ -422,17 +480,18 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
             args.garment_cfg_base_path, "Release", file_prefix, f"{file_prefix}.txt"
         )
 
-    logger.info(
-        f"Loading evaluation list for category '{args.garment_type}' from: {eval_list_path}"
-    )
+    if flywheel_identity is None:
+        logger.info(
+            f"Loading evaluation list for category '{args.garment_type}' from: {eval_list_path}"
+        )
 
-    if not os.path.exists(eval_list_path):
-        raise FileNotFoundError(f"Evaluation list not found: {eval_list_path}")
+        if not os.path.exists(eval_list_path):
+            raise FileNotFoundError(f"Evaluation list not found: {eval_list_path}")
 
-    with open(eval_list_path, "r") as f:
-        names = [line.strip() for line in f.readlines() if line.strip()]
-        for name in names:
-            eval_list.append((name, "Release"))
+        with open(eval_list_path, "r") as f:
+            names = [line.strip() for line in f.readlines() if line.strip()]
+            for name in names:
+                eval_list.append((name, "Release"))
 
     logger.info(f"Loaded {len(eval_list)} garments for category: {args.garment_type}")
 
@@ -450,6 +509,8 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     env_cfg.garment_version = first_stage
     env = gym.make(args.task, cfg=env_cfg).unwrapped
     env.initialize_obs()
+    if flywheel_identity is not None:
+        _validate_active_flywheel_garment(env, flywheel_identity)
 
     try:
         for garment_idx, (garment_name, garment_stage) in enumerate(eval_list):

@@ -261,7 +261,7 @@ Run locally: `uv run --offline pytest tests/flywheel/test_randomization.py tests
 
 Expected: PASS.
 
-Run remotely: `uv run python -m scripts.run_groot_flywheel_trial --render-randomization-sheet --strategies canonical mild strong --seed 123 --output-root /workspace/acceptance/randomization`
+Run remotely: `uv run python -m scripts.run_groot_flywheel_trial --render-randomization-sheet --garment Pant_Long_Seen_0 --strategies canonical mild strong --seed 123 --output-root /workspace/acceptance/randomization`
 
 Expected: nine labeled images plus `randomization-receipts.json`; visually reject occluded grippers, invisible garments, and camera framing outside the canonical workspace.
 

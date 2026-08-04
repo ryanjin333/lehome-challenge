@@ -630,6 +630,121 @@ class GarmentEnv(DirectRLEnv):
     def set_all_pose(self, pose):
         self.object.set_all_pose(pose)
 
+    def _flywheel_capture_scene_state(self) -> dict[str, object]:
+        """Capture every USD/sensor property mutated by flywheel randomization."""
+        if self.object is None:
+            raise RuntimeError("cannot capture flywheel scene state without a garment")
+        stage = self.scene.stage
+        table_prim = stage.GetPrimAtPath(self.texture_cfg.get("prim_path", ""))
+        table_shader = UsdShade.Shader(table_prim)
+        table_input = table_shader.GetInput("file") or table_shader.GetInput("diffuse_texture")
+        mesh = stage.GetPrimAtPath(self.object.mesh_prim_path)
+        color_attr = mesh.GetAttribute("primvars:displayColor") if mesh.IsValid() else None
+        light = stage.GetPrimAtPath(self.flywheel_randomization_cfg.get("light_prim_path", "/World/Light"))
+        intensity_attr = light.GetAttribute("inputs:intensity") if light.IsValid() else None
+        color_light_attr = light.GetAttribute("inputs:color") if light.IsValid() else None
+        if not table_prim.IsValid() or not table_input or color_attr is None or not color_attr.IsValid():
+            raise RuntimeError("flywheel scene state requires table shader and garment displayColor")
+        if intensity_attr is None or not intensity_attr.IsValid() or color_light_attr is None or not color_light_attr.IsValid():
+            raise RuntimeError("flywheel scene state requires readable light intensity and color")
+        table_value = table_input.Get()
+        table_path = str(getattr(table_value, "path", table_value))
+        display_color = color_attr.Get()
+        light_color = color_light_attr.Get()
+        if intensity_attr.Get() is None or display_color is None or light_color is None:
+            raise RuntimeError("flywheel scene state has unreadable USD attributes")
+
+        def tensor_row(value) -> list[float]:
+            array = value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+            return [float(item) for item in np.asarray(array)[0]]
+
+        cameras = []
+        for camera in (self.top_camera, self.left_camera, self.right_camera):
+            if not hasattr(camera, "set_world_poses") or not hasattr(camera.data, "pos_w") or not hasattr(camera.data, "quat_w"):
+                raise RuntimeError("Isaac camera does not expose restorable world pose")
+            cameras.append({"position": tensor_row(camera.data.pos_w), "orientation": tensor_row(camera.data.quat_w)})
+        roots = []
+        for arm in (self.left_arm, self.right_arm):
+            if not hasattr(arm, "write_root_pose_to_sim") or not hasattr(arm.data, "root_pos_w") or not hasattr(arm.data, "root_quat_w"):
+                raise RuntimeError("Isaac robot base does not expose restorable world pose")
+            roots.append({"position": tensor_row(arm.data.root_pos_w), "orientation": tensor_row(arm.data.root_quat_w)})
+        return {
+            "camera_world_poses": cameras,
+            "robot_root_poses": roots,
+            "light_intensity": float(intensity_attr.Get()),
+            "light_color": [float(value) for value in light_color],
+            "table_texture_path": table_path,
+            "table_shader_input": table_input.GetBaseName(),
+            "garment_display_color": [[float(value) for value in color] for color in display_color],
+            "garment_reset_pose": [float(value) for value in self.object.get_all_pose()["Garment"]],
+        }
+
+    def _flywheel_restore_scene_state(self, scene_state: dict[str, object]) -> None:
+        """Restore the exact scene payload captured by :meth:`_flywheel_capture_scene_state`."""
+        required = {"camera_world_poses", "robot_root_poses", "light_intensity", "light_color", "table_texture_path", "table_shader_input", "garment_display_color", "garment_reset_pose"}
+        if set(scene_state) != required:
+            raise ValueError("flywheel scene snapshot does not cover every randomized property")
+        cameras = scene_state["camera_world_poses"]
+        roots = scene_state["robot_root_poses"]
+        if not isinstance(cameras, list) or len(cameras) != 3 or not isinstance(roots, list) or len(roots) != 2:
+            raise ValueError("flywheel scene snapshot has invalid camera or robot root coverage")
+        for camera, pose in zip((self.top_camera, self.left_camera, self.right_camera), cameras, strict=True):
+            if not isinstance(pose, dict):
+                raise ValueError("flywheel camera snapshot pose is invalid")
+            position = torch.tensor(pose["position"], dtype=torch.float32, device=self.device).unsqueeze(0)
+            orientation = torch.tensor(pose["orientation"], dtype=torch.float32, device=self.device).unsqueeze(0)
+            camera.set_world_poses(position, orientation)
+        for arm, pose in zip((self.left_arm, self.right_arm), roots, strict=True):
+            if not isinstance(pose, dict):
+                raise ValueError("flywheel robot root snapshot pose is invalid")
+            position = torch.tensor(pose["position"], dtype=torch.float32, device=self.device).unsqueeze(0)
+            orientation = torch.tensor(pose["orientation"], dtype=torch.float32, device=self.device).unsqueeze(0)
+            arm.write_root_pose_to_sim(torch.cat((position, orientation), dim=-1))
+        stage = self.scene.stage
+        light = stage.GetPrimAtPath(self.flywheel_randomization_cfg.get("light_prim_path", "/World/Light"))
+        table_prim = stage.GetPrimAtPath(self.texture_cfg.get("prim_path", ""))
+        table_input = UsdShade.Shader(table_prim).GetInput("file") or UsdShade.Shader(table_prim).GetInput("diffuse_texture")
+        mesh = stage.GetPrimAtPath(self.object.mesh_prim_path)
+        intensity_attr = light.GetAttribute("inputs:intensity") if light.IsValid() else None
+        color_light_attr = light.GetAttribute("inputs:color") if light.IsValid() else None
+        color_attr = mesh.GetAttribute("primvars:displayColor") if mesh.IsValid() else None
+        if not table_input or intensity_attr is None or color_light_attr is None or color_attr is None:
+            raise RuntimeError("flywheel scene snapshot restore cannot access USD attributes")
+        table_input.Set(Sdf.AssetPath(str(scene_state["table_texture_path"])))
+        intensity_attr.Set(float(scene_state["light_intensity"]))
+        color_light_attr.Set(tuple(float(value) for value in scene_state["light_color"]))
+        color_attr.Set([tuple(float(value) for value in color) for color in scene_state["garment_display_color"]])
+        self.object.set_all_pose({"Garment": np.asarray(scene_state["garment_reset_pose"], dtype=np.float32)})
+        observed = self._flywheel_capture_scene_state()
+        if not self._flywheel_scene_state_matches(observed, scene_state):
+            raise RuntimeError("flywheel scene snapshot readback mismatch")
+
+    @staticmethod
+    def _flywheel_scene_state_matches(observed: dict[str, object], expected: dict[str, object]) -> bool:
+        """Compare USD identifiers exactly and float32 Isaac values with a tolerance."""
+        if set(observed) != set(expected):
+            return False
+        if observed["table_texture_path"] != expected["table_texture_path"] or observed["table_shader_input"] != expected["table_shader_input"]:
+            return False
+        try:
+            if not np.isclose(float(observed["light_intensity"]), float(expected["light_intensity"]), atol=1e-5):
+                return False
+            for field in ("light_color", "garment_display_color", "garment_reset_pose"):
+                if not np.allclose(observed[field], expected[field], atol=1e-5):
+                    return False
+            for field in ("camera_world_poses", "robot_root_poses"):
+                actual_poses, expected_poses = observed[field], expected[field]
+                if not isinstance(actual_poses, list) or not isinstance(expected_poses, list) or len(actual_poses) != len(expected_poses):
+                    return False
+                for actual, target in zip(actual_poses, expected_poses, strict=True):
+                    if not isinstance(actual, dict) or not isinstance(target, dict):
+                        return False
+                    if not np.allclose(actual["position"], target["position"], atol=1e-5) or not np.allclose(actual["orientation"], target["orientation"], atol=1e-5):
+                        return False
+        except (KeyError, TypeError, ValueError):
+            return False
+        return True
+
     def flywheel_capture_state(self) -> dict[str, object]:
         """Return the complete mutable simulator state needed for hard replay."""
         if self.object is None or not hasattr(self.object, "_cloth_prim_view"):
@@ -666,6 +781,7 @@ class GarmentEnv(DirectRLEnv):
                 "cached_gaussian": float(rng_cached),
             },
             "garment_name": self.cfg.garment_name,
+            "scene_state": self._flywheel_capture_scene_state(),
         }
 
     def flywheel_restore_state(self, snapshot) -> None:
@@ -705,6 +821,10 @@ class GarmentEnv(DirectRLEnv):
                 float(rng_state["cached_gaussian"]),
             )
         )
+        if snapshot.scene_state:
+            self._flywheel_restore_scene_state(snapshot.scene_state)
+            if snapshot.randomization.get("strategy") == "canonical":
+                self._flywheel_randomization_baseline = dict(snapshot.scene_state)
         self._flywheel_randomization_receipt = dict(snapshot.randomization)
 
     def apply_flywheel_randomization(self, randomization) -> dict[str, object]:
@@ -715,6 +835,13 @@ class GarmentEnv(DirectRLEnv):
         applied and observed again.
         """
         values = dict(randomization.values if hasattr(randomization, "values") else randomization)
+        baseline = getattr(self, "_flywheel_randomization_baseline", None)
+        if baseline is None:
+            baseline = self._flywheel_capture_scene_state()
+            self._flywheel_randomization_baseline = baseline
+        # Every strategy starts from the same exact scene, including canonical
+        # after a prior randomized use of this environment.
+        self._flywheel_restore_scene_state(baseline)
         if not values:
             self._flywheel_randomization_receipt = {}
             return {}
