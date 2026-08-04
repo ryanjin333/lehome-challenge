@@ -221,6 +221,21 @@ class FakeEnv:
         }
 
 
+class FakeClock:
+    """Deterministic monotonic-clock seam for collector cadence tests."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, duration_s: float) -> None:
+        self.sleeps.append(duration_s)
+        self.now += duration_s
+
+
 @dataclass
 class PolicyAction:
     value: np.ndarray
@@ -291,6 +306,141 @@ def test_collect_episode_practice_creates_no_exports_for_repeated_attempts(tmp_p
         result = collect_episode(session(root, "practice"), FakeEnv(), FakePolicy(), ScheduledControlSource(["space"]), recorder(root, f"practice-{index}", "practice", monkeypatch), thresholds(), max_steps=2)
         assert result.episode["bc_target_count"] == 0
         assert not (root / "exports").exists()
+
+
+def test_collect_episode_waits_for_delayed_initial_space_without_recording_ready_holds(tmp_path, monkeypatch) -> None:
+    value = session(tmp_path, "dagger")
+    env, clock = FakeEnv(success_at=1), FakeClock()
+
+    result = collect_episode(
+        value,
+        env,
+        FakePolicy(),
+        ScheduledControlSource([None, None, "space"]),
+        recorder(tmp_path, "delayed-start", "dagger", monkeypatch),
+        thresholds(),
+        max_steps=1,
+        clock=clock.monotonic,
+        sleep=clock.sleep,
+        ready_poll_interval_s=0.01,
+    )
+
+    assert env.actions == [tuple(np.full(12, 0.25, dtype=np.float32))]
+    assert [annotation["action_source"] for annotation in result.annotations] == ["policy"]
+    assert clock.sleeps == [0.01, 0.01]
+
+
+def test_collect_episode_accepts_reset_while_ready_without_stepping(tmp_path, monkeypatch) -> None:
+    value = session(tmp_path, "dagger")
+    env, clock = FakeEnv(), FakeClock()
+
+    result = collect_episode(
+        value,
+        env,
+        FakePolicy(),
+        ScheduledControlSource([None, "r", "space"]),
+        recorder(tmp_path, "ready-reset", "dagger", monkeypatch),
+        thresholds(),
+        max_steps=1,
+        clock=clock.monotonic,
+        sleep=clock.sleep,
+        ready_poll_interval_s=0.01,
+    )
+
+    assert env.actions == [tuple(np.full(12, 0.25, dtype=np.float32))]
+    assert [annotation["action_source"] for annotation in result.annotations] == ["policy"]
+    assert env.reset_calls == 2
+    assert clock.sleeps == [0.01]
+
+
+def test_collect_episode_accepts_discard_while_ready_without_stepping(tmp_path, monkeypatch) -> None:
+    value = session(tmp_path, "dagger")
+    env, clock = FakeEnv(), FakeClock()
+
+    result = collect_episode(
+        value,
+        env,
+        FakePolicy(),
+        ScheduledControlSource([None, "d"]),
+        recorder(tmp_path, "ready-discard", "dagger", monkeypatch),
+        thresholds(),
+        max_steps=1,
+        clock=clock.monotonic,
+        sleep=clock.sleep,
+        ready_poll_interval_s=0.01,
+    )
+
+    assert env.actions == []
+    assert result.annotations == ()
+    assert result.episode["trainable"] is False
+    assert clock.sleeps == [0.01]
+
+
+def test_collect_episode_paces_applied_actions_at_the_environment_deadline(tmp_path, monkeypatch) -> None:
+    value = session(tmp_path, "dagger")
+    env, clock = FakeEnv(success_at=99), FakeClock()
+
+    collect_episode(
+        value,
+        env,
+        FakePolicy(),
+        ScheduledControlSource(["space"]),
+        recorder(tmp_path, "paced", "dagger", monkeypatch),
+        thresholds(),
+        max_steps=3,
+        clock=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert len(env.actions) == 3
+    assert clock.sleeps == [env.step_dt_s, env.step_dt_s]
+
+
+def test_collect_episode_skips_missed_deadlines_after_an_overrunning_step(tmp_path, monkeypatch) -> None:
+    class OverrunningEnv(FakeEnv):
+        def __init__(self, clock: FakeClock) -> None:
+            super().__init__(success_at=99)
+            self.clock = clock
+            self.action_start_times: list[float] = []
+
+        def step(self, action):
+            self.action_start_times.append(self.clock.now)
+            self.clock.now += self.step_dt_s * 1.5
+            return super().step(action)
+
+    value, clock = session(tmp_path, "dagger"), FakeClock()
+    env = OverrunningEnv(clock)
+
+    collect_episode(
+        value,
+        env,
+        FakePolicy(),
+        ScheduledControlSource(["space"]),
+        recorder(tmp_path, "overrun", "dagger", monkeypatch),
+        thresholds(),
+        max_steps=2,
+        clock=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert env.action_start_times[1] - env.action_start_times[0] >= env.step_dt_s
+    assert clock.sleeps == [pytest.approx(env.step_dt_s / 2.0)]
+
+
+def test_collect_episode_rejects_an_invalid_environment_step_duration(tmp_path, monkeypatch) -> None:
+    class InvalidStepDurationEnv(FakeEnv):
+        step_dt_s = 0.0
+
+    with pytest.raises(ValueError, match="step_dt_s"):
+        collect_episode(
+            session(tmp_path, "dagger"),
+            InvalidStepDurationEnv(),
+            FakePolicy(),
+            ScheduledControlSource(["space"]),
+            recorder(tmp_path, "invalid-step-duration", "dagger", monkeypatch),
+            thresholds(),
+            max_steps=1,
+        )
 
 
 def test_collect_episode_full_expert_exports_exact_applied_expert_actions(tmp_path, monkeypatch) -> None:

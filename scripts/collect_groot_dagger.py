@@ -13,7 +13,7 @@ import stat
 import re
 import threading
 import time
-from typing import Any, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 from uuid import uuid4
 
 from lehome.flywheel.artifacts import atomic_write_json, build_sha256_manifest, verify_episode
@@ -418,6 +418,21 @@ def _attempt_quality(
     )
 
 
+def _collection_step_dt_s(env: object) -> float:
+    """Return the task-declared control cadence or fail before recording."""
+    value = getattr(env, "step_dt_s", None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError("collection environment step_dt_s must be a positive finite number")
+    return float(value)
+
+
+def _prepare_zero_step_diagnostic(recorder: MixedSourceRecorder) -> None:
+    """Keep an unstarted, discarded attempt immutable without inventing a frame."""
+    annotations = recorder.writer.staging / "annotations.jsonl"
+    if not annotations.exists():
+        annotations.touch(exist_ok=False)
+
+
 def _rejection_reasons(quality: QualityResult, *, held: bool, discarded: bool) -> tuple[RejectionReason, ...]:
     mapped = {
         "stale_samples": RejectionReason.STALE_EXPERT,
@@ -468,15 +483,27 @@ def collect_episode(
     recorder: MixedSourceRecorder,
     thresholds: QualityThresholds | None,
     max_steps: int,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    ready_poll_interval_s: float = 0.01,
 ) -> RecordedEpisode:
     """Collect one real/fake episode through the same source and evidence gates."""
     if max_steps <= 0:
         raise ValueError("max_steps must be positive")
+    if (
+        isinstance(ready_poll_interval_s, bool)
+        or not isinstance(ready_poll_interval_s, (int, float))
+        or not math.isfinite(ready_poll_interval_s)
+        or ready_poll_interval_s <= 0
+    ):
+        raise ValueError("ready polling interval must be a positive finite number")
     reset = getattr(env, "reset", None)
     if not callable(reset):
         raise ValueError("collection environment must provide reset")
+    # The collector may not invent a control rate: the registered task owns it.
+    step_dt_s = _collection_step_dt_s(env)
     observation = _observation(env, reset())
-    recorder.record_snapshot("reset", capture_snapshot(env, randomization={"strategy": "collection"}))
     official_success = False
     accept_requested = False
     discarded = False
@@ -486,9 +513,10 @@ def collect_episode(
     actions: list[tuple[float, ...]] = []
     jitter_samples: list[float] = []
     last_safe = tuple(float(value) for value in getattr(session.bridge_server.receiver, "last_safe_command", (0.0,) * 12))
-    # A successful export needs measured task timing, not an assumed control rate.
-    step_dt_s = getattr(env, "step_dt_s", None)
-    for _ in range(max_steps):
+    next_step_deadline: float | None = None
+    reset_snapshot_recorded = False
+    steps_applied = 0
+    while steps_applied < max_steps:
         control = control_source.poll()
         if control is not None:
             session.record_control(control)
@@ -498,14 +526,21 @@ def collect_episode(
             if control == "r":
                 # Preserve the partial attempt as diagnostic-only, then return
                 # the real task to reset before ending this immutable episode.
+                observation = _observation(env, reset())
+                if session.controller.state == "ready":
+                    # No attempt has begun yet. Continue waiting for the
+                    # operator rather than manufacturing a HOLD frame merely
+                    # to make a reset control finalizable.
+                    continue
                 discarded = True
-                _observation(env, reset())
                 break
             if control == "a" and official_success:
                 accept_requested = True
             if control == "space":
                 if session.controller.state == "ready":
                     (session.controller.start_policy if session.controller.mode == "dagger" else session.controller.start_expert)()
+                    recorder.record_snapshot("reset", capture_snapshot(env, randomization={"strategy": "collection"}))
+                    reset_snapshot_recorded = True
                 elif session.controller.state in {"policy", "takeover_pending"}:
                     if session.controller.state == "policy":
                         session.controller.request_takeover()
@@ -519,6 +554,25 @@ def collect_episode(
                         recorder.record_snapshot("takeover", capture_snapshot(env, randomization={"strategy": "collection"}))
                 elif session.controller.state == "expert":
                     _operator_resync(session.bridge_server.receiver)
+        if session.controller.state == "ready":
+            # Before the operator explicitly starts, leave the real task
+            # untouched. Polling in short intervals preserves cancel/reset
+            # responsiveness without consuming an episode step or writing a
+            # synthetic HOLD frame.
+            sleep(float(ready_poll_interval_s))
+            continue
+        if not reset_snapshot_recorded:
+            raise RuntimeError("collection started without a reset snapshot")
+        now = clock()
+        if not math.isfinite(now):
+            raise ValueError("collection clock must return a finite monotonic time")
+        if next_step_deadline is None:
+            # The first applied action is allowed immediately after ``space``.
+            next_step_deadline = now
+        else:
+            remaining = next_step_deadline - now
+            if remaining > 0:
+                sleep(remaining)
         source = ActionSource.HOLD
         provenance: dict[str, object] = {}
         if session.controller.state == "policy":
@@ -559,6 +613,18 @@ def collect_episode(
             )
             break
         next_observation, reward, step_success = _step(env, action)
+        steps_applied += 1
+        # Advance from the prior deadline, rather than the end of this step,
+        # so normal scheduling does not accumulate timing drift. If a step
+        # overran one or more periods, skip those missed deadlines instead of
+        # issuing a catch-up burst faster than the task's declared cadence.
+        next_step_deadline += step_dt_s
+        completed_at = clock()
+        if not math.isfinite(completed_at):
+            raise ValueError("collection clock must return a finite monotonic time")
+        if completed_at > next_step_deadline:
+            missed_periods = math.floor((completed_at - next_step_deadline) / step_dt_s) + 1
+            next_step_deadline += missed_periods * step_dt_s
         official_success = official_success or step_success
         recorder.record_step(
             observation, action, reward=reward, success=official_success, action_source=source,
@@ -567,6 +633,8 @@ def collect_episode(
         actions.append(action)
         observation = next_observation
     recorder.record_snapshot("terminal", capture_snapshot(env, randomization={"strategy": "collection"}))
+    if steps_applied == 0:
+        _prepare_zero_step_diagnostic(recorder)
     quality = _attempt_quality(
         thresholds=thresholds, official_success=official_success, actions=actions, step_dt_s=step_dt_s,
         jitter_samples=jitter_samples, stale_samples=stale_samples, disconnected=disconnected,
