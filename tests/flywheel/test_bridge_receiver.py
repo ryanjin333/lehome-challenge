@@ -9,6 +9,7 @@ import pytest
 
 from lehome.flywheel.bridge_receiver import BridgeReceiver, Handshake, LeaderSampleFrame, LoopbackBridgeServer
 from lehome_bridge.client import BridgeConnection
+from lehome_bridge.protocol import BridgeMessage, encode_message
 from lehome_bridge.leaders import LeaderSample
 
 
@@ -33,7 +34,7 @@ def valid_sample(
     rtt_ns: int = 1_000_000,
     rtt_age_ns: int = 0,
 ) -> LeaderSampleFrame:
-    return LeaderSampleFrame("nonce", sequence, sequence * 33_333_333 if timestamp is None else timestamp, (0.0,) * 12, rtt_ns, rtt_age_ns)
+    return LeaderSampleFrame("nonce", sequence, sequence * 33_333_333 if timestamp is None else timestamp, (0.0,) * 12, (0.5,) * 12, rtt_ns, rtt_age_ns)
 
 
 def test_receiver_holds_after_stale_sample_and_requires_explicit_resync() -> None:
@@ -71,6 +72,58 @@ def test_loopback_server_refuses_public_bind() -> None:
     assert server.host == "127.0.0.1"
 
 
+def test_loopback_server_keeps_accepting_after_a_delayed_connection() -> None:
+    class DelayedListener:
+        def __init__(self, client) -> None:
+            self.client = client
+            self.calls = 0
+
+        def accept(self):
+            self.calls += 1
+            if self.calls == 1:
+                # Model the old three-second listener timeout.  The server must
+                # still accept the first Mac connection after this delay.
+                time.sleep(3.05)
+                raise socket.timeout()
+            return self.client, ("127.0.0.1", 12345)
+
+        def close(self) -> None:
+            pass
+
+    class Client:
+        def __init__(self, wire: bytes) -> None:
+            self.wire = bytearray(wire)
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def recv(self, size: int) -> bytes:
+            if not self.wire:
+                return b""
+            value = bytes(self.wire[:size])
+            del self.wire[:size]
+            return value
+
+        def close(self) -> None:
+            pass
+
+    secret = b"x" * 32
+    handshake = BridgeMessage.handshake(
+        session_nonce="nonce", sequence=0, left_serial="left", right_serial="right",
+        left_calibration_sha256="a" * 64, right_calibration_sha256="b" * 64,
+        left_motor_limits=((0.0, 1.0),) * 6, right_motor_limits=((0.0, 1.0),) * 6, hz=30,
+    )
+    receiver = BridgeReceiver(converter=lambda values: values)
+    server = LoopbackBridgeServer(secret=secret, session_nonce="nonce", receiver=receiver)
+    server._listener = DelayedListener(Client(encode_message(handshake, secret=secret)))
+
+    with pytest.raises(ConnectionError):
+        server.serve_one_client()
+
+    assert server._listener.calls == 2
+    assert receiver.handshake is not None
+
+
 def test_receiver_rejects_a_handshake_with_unexpected_motor_limits() -> None:
     receiver = BridgeReceiver(
         converter=lambda values: values,
@@ -87,7 +140,7 @@ def test_receiver_rejects_raw_positions_outside_the_accepted_leader_limits() -> 
 
     with pytest.raises(ValueError, match="raw leader position"):
         receiver.accept_sample(
-            LeaderSampleFrame("nonce", 1, 100, (1.01,) + (0.0,) * 11, 1_000_000, 0),
+            LeaderSampleFrame("nonce", 1, 100, (0.0,) * 12, (1.01,) + (0.0,) * 11, 1_000_000, 0),
             received_monotonic_ns=1_000_000_000,
         )
 
@@ -157,9 +210,9 @@ def test_loopback_bridge_keeps_leader_sample_sequence_contiguous_across_rtt_prob
     try:
         connection.connect()
         connection.refresh_rtt()
-        connection.send_sample(LeaderSample(time.monotonic_ns(), (0.0,) * 12, "left", "right"))
+        connection.send_sample(LeaderSample(time.monotonic_ns(), (0.0,) * 12, (0.5,) * 12, "left", "right"))
         connection.refresh_rtt()
-        connection.send_sample(LeaderSample(time.monotonic_ns(), (0.0,) * 12, "left", "right"))
+        connection.send_sample(LeaderSample(time.monotonic_ns(), (0.0,) * 12, (0.5,) * 12, "left", "right"))
     finally:
         connection.close()
         thread.join(timeout=2.0)

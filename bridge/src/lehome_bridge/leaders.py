@@ -25,7 +25,7 @@ _CALIBRATION_FIELDS = frozenset({"id", "drive_mode", "homing_offset", "range_min
 class LeaderBus(Protocol):
     serial_identity: str
 
-    def sync_read(self, register: str) -> dict[str, float]: ...
+    def sync_read(self, register: str, *, normalize: bool = True) -> dict[str, float]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,12 +33,14 @@ class CalibrationIdentity:
     path: Path
     sha256: str
     motor_limits: tuple[tuple[float, float], ...]
+    drive_modes: tuple[bool, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class LeaderSample:
     monotonic_ns: int
     positions: tuple[float, ...]
+    raw_positions: tuple[float, ...]
     left_serial: str
     right_serial: str
 
@@ -63,13 +65,31 @@ def _load_calibration(path: Path) -> CalibrationIdentity:
     with path.open("rb") as calibration_file:
         digest = hashlib.file_digest(calibration_file, "sha256").hexdigest()
     motor_limits = tuple((float(parsed[joint]["range_min"]), float(parsed[joint]["range_max"])) for joint in JOINTS)
-    return CalibrationIdentity(path=path, sha256=digest, motor_limits=motor_limits)
+    drive_modes = tuple(bool(parsed[joint]["drive_mode"]) for joint in JOINTS)
+    return CalibrationIdentity(path=path, sha256=digest, motor_limits=motor_limits, drive_modes=drive_modes)
 
 
 def _finite_positions(values: tuple[object, ...]) -> tuple[float, ...]:
     if len(values) != 12 or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in values):
         raise ValueError("leader read must contain 12 finite positions")
     return tuple(float(value) for value in values)
+
+
+def _normalize_raw_positions(raw_positions: tuple[float, ...], calibration: CalibrationIdentity) -> tuple[float, ...]:
+    """Match ``MotorsBus._normalize`` from one verified raw encoder snapshot."""
+    normalized: list[float] = []
+    for index, (value, (lower, upper), drive_mode) in enumerate(
+        zip(raw_positions, calibration.motor_limits, calibration.drive_modes)
+    ):
+        if value < lower or value > upper:
+            raise ValueError("raw leader position is outside its calibration motor limits")
+        if index == len(JOINTS) - 1:
+            result = ((value - lower) / (upper - lower)) * 100.0
+            normalized.append(100.0 - result if drive_mode else result)
+        else:
+            result = (((value - lower) / (upper - lower)) * 200.0) - 100.0
+            normalized.append(-result if drive_mode else result)
+    return tuple(normalized)
 
 
 class DualLeaderReader:
@@ -93,15 +113,19 @@ class DualLeaderReader:
         self.right_motor_limits = self.right_calibration.motor_limits
 
     def read(self) -> LeaderSample:
-        left = self.left_bus.sync_read("Present_Position")
-        right = self.right_bus.sync_read("Present_Position")
+        # Do not take a separate normalized read: calibration limits and the
+        # signed command must describe the same physical instant.
+        left = self.left_bus.sync_read("Present_Position", normalize=False)
+        right = self.right_bus.sync_read("Present_Position", normalize=False)
         try:
-            values = tuple(left[name] for name in JOINTS) + tuple(right[name] for name in JOINTS)
+            raw_values = _finite_positions(tuple(left[name] for name in JOINTS) + tuple(right[name] for name in JOINTS))
         except (KeyError, TypeError) as error:
             raise ValueError("leader bus did not return the required SO101 joints") from error
         return LeaderSample(
             monotonic_ns=time.monotonic_ns(),
-            positions=_finite_positions(values),
+            positions=_normalize_raw_positions(raw_values[:6], self.left_calibration)
+            + _normalize_raw_positions(raw_values[6:], self.right_calibration),
+            raw_positions=raw_values,
             left_serial=self.left_bus.serial_identity,
             right_serial=self.right_bus.serial_identity,
         )

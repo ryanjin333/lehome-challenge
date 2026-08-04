@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .client import BridgeConnection, DEFAULT_HOST, DEFAULT_PORT, read_secret_file, stream
+from .client import BridgeConnection, DEFAULT_HOST, DEFAULT_PORT, read_secret_file_with_identity, remove_secret_file, stream
 from .leaders import DualLeaderReader, open_feetech_bus
 
 
@@ -43,34 +43,39 @@ def main(argv: list[str] | None = None) -> int:
     validate_args(args)
     # No serial transport is imported or opened until argument validation and
     # private-secret validation both succeed.
-    secret = read_secret_file(default_secret_path())
-    left = open_feetech_bus(port=args.left_port, calibration_path=args.left_calibration)
-    right = open_feetech_bus(port=args.right_port, calibration_path=args.right_calibration)
-    reader = DualLeaderReader(
-        left,
-        right,
-        left_calibration=args.left_calibration,
-        right_calibration=args.right_calibration,
-    )
-    connection = BridgeConnection(
-        reader,
-        secret=secret,
-        session_nonce=args.session_nonce,
-        host=args.host,
-        port=args.port,
-        hz=args.hz,
-    )
+    secret_path = default_secret_path()
+    secret, secret_identity = read_secret_file_with_identity(secret_path)
+    left = right = connection = None
     try:
+        left = open_feetech_bus(port=args.left_port, calibration_path=args.left_calibration)
+        right = open_feetech_bus(port=args.right_port, calibration_path=args.right_calibration)
+        reader = DualLeaderReader(
+            left,
+            right,
+            left_calibration=args.left_calibration,
+            right_calibration=args.right_calibration,
+        )
+        connection = BridgeConnection(
+            reader,
+            secret=secret,
+            session_nonce=args.session_nonce,
+            host=args.host,
+            port=args.port,
+            hz=args.hz,
+        )
         connection.connect()
         stream(reader, connection, hz=args.hz)
     except KeyboardInterrupt:
-        connection.request_stop()
+        if connection is not None:
+            connection.request_stop()
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
         for bus in (left, right):
             disconnect = getattr(bus, "disconnect", None)
             if callable(disconnect):
                 disconnect()
+        remove_secret_file(secret_path, identity=secret_identity)
     return 0
 
 

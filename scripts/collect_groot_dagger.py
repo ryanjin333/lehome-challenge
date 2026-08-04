@@ -12,6 +12,7 @@ import secrets
 import stat
 import re
 import threading
+import time
 from typing import Any, Iterable, Protocol
 from uuid import uuid4
 
@@ -121,22 +122,40 @@ def validate_args(args: argparse.Namespace) -> QualityThresholds | None:
 def create_session_secret(path: Path) -> bytes:
     """Create a one-session secret atomically with owner-only permissions."""
     secret_path = Path(path)
-    secret_path.parent.mkdir(parents=True, exist_ok=True)
+    secret_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    parent = secret_path.parent.stat()
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or stat.S_IMODE(parent.st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeError("bridge session secret parent must be owner-private")
     try:
         descriptor = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError as error:
         raise ValueError("refusing to reuse an existing bridge session secret") from error
+    created = os.fstat(descriptor)
+    identity = (created.st_dev, created.st_ino)
     secret = secrets.token_bytes(32)
     try:
         with os.fdopen(descriptor, "wb") as output:
             output.write(secret)
             output.flush()
             os.fsync(output.fileno())
-    except BaseException:
-        secret_path.unlink(missing_ok=True)
+    except BaseException as error:
+        try:
+            remove_session_secret(secret_path, identity=identity)
+        except RuntimeError as cleanup_error:
+            raise cleanup_error from error
         raise
-    if stat.S_IMODE(secret_path.stat().st_mode) != 0o600:
-        secret_path.unlink(missing_ok=True)
+    try:
+        if stat.S_IMODE(secret_path.stat().st_mode) != 0o600:
+            raise RuntimeError("failed to create a mode-0600 bridge session secret")
+    except BaseException as error:
+        try:
+            remove_session_secret(secret_path, identity=identity)
+        except RuntimeError as cleanup_error:
+            raise cleanup_error from error
         raise RuntimeError("failed to create a mode-0600 bridge session secret")
     return secret
 
@@ -191,6 +210,7 @@ class CollectorSession:
     secret_identity: tuple[int, int]
     controls: list[str] = field(default_factory=list)
     _secret_removed: bool = field(default=False, init=False, repr=False)
+    _listener_thread: threading.Thread | None = field(default=None, init=False, repr=False)
 
     def record_control(self, control: str) -> None:
         if control not in CONTROLS:
@@ -221,15 +241,42 @@ class CollectorSession:
 
         thread = threading.Thread(target=serve, name="lehome-bridge-receiver", daemon=True)
         thread.start()
+        self._listener_thread = thread
         return thread
 
+    def wait_for_bridge_ready(self, *, poll_interval_s: float = 0.05) -> None:
+        """Do not start a paid Isaac episode until a healthy bridge is live.
+
+        Listener acceptance intentionally has no short startup deadline.  This
+        wait is instead cancelled by ``close_listener``/Ctrl-C and fails
+        visibly on a transport error, preventing a whole episode of silent
+        ``no_sample`` holds while the operator finishes the SSH tunnel.
+        """
+        if poll_interval_s <= 0:
+            raise ValueError("bridge readiness polling interval must be positive")
+        while True:
+            if self.bridge_server.failure is not None:
+                raise RuntimeError("bridge listener failed before collection became ready")
+            command = self.bridge_server.receiver.current()
+            if self.bridge_server.receiver.handshake is not None and command.eligible:
+                return
+            if self.bridge_server._cancel.is_set():
+                raise RuntimeError("bridge listener was cancelled before collection became ready")
+            time.sleep(poll_interval_s)
+
     def close_listener(self) -> None:
+        shutdown_timeout = False
         try:
             self.bridge_server.close()
+            if self._listener_thread is not None:
+                self._listener_thread.join(timeout=1.0)
+                shutdown_timeout = self._listener_thread.is_alive()
         finally:
             if not self._secret_removed:
                 remove_session_secret(self.secret_path, identity=self.secret_identity)
                 self._secret_removed = True
+        if shutdown_timeout:
+            raise RuntimeError("bridge listener did not stop after bounded cancellation")
 
 
 class ControlSource(Protocol):
@@ -722,6 +769,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ssh_forward": ssh_forward_command(args.listen_port), **session.status()}, sort_keys=True))
         if args.interactive:
             session.start_listener()
+            session.wait_for_bridge_ready()
             result = _run_production_collection(args, session)
             print(json.dumps({"episode_id": result.path.name, "bc_target_count": result.episode["bc_target_count"], "trainable": result.episode["trainable"]}, sort_keys=True))
         return 0

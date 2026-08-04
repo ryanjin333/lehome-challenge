@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import math
 import socket
 import struct
+import threading
 import time
 from typing import Callable, Iterable, Protocol
 
@@ -68,6 +69,7 @@ class LeaderSampleFrame:
     sequence: int
     sent_monotonic_ns: int
     positions: tuple[float, ...]
+    raw_positions: tuple[float, ...]
     rtt_ns: int
     rtt_age_ns: int
 
@@ -80,7 +82,8 @@ class LeaderSampleFrame:
             raise ValueError("bridge sample RTT is invalid")
         if not isinstance(self.rtt_age_ns, int) or self.rtt_age_ns < 0:
             raise ValueError("bridge sample RTT age is invalid")
-        object.__setattr__(self, "positions", _finite_12(self.positions, field="bridge sample positions"))
+        object.__setattr__(self, "positions", _finite_12(self.positions, field="bridge normalized positions"))
+        object.__setattr__(self, "raw_positions", _finite_12(self.raw_positions, field="bridge raw positions"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +92,7 @@ class RecordedExpertSample:
     sent_monotonic_ns: int
     received_monotonic_ns: int
     raw_positions: tuple[float, ...]
+    normalized_positions: tuple[float, ...]
     converted_command: tuple[float, ...]
     jitter_ms: float
 
@@ -194,7 +198,7 @@ class BridgeReceiver:
         if not isinstance(received, int) or received < 0:
             raise ValueError("received monotonic timestamp is invalid")
         raw_limits = self.handshake.left_motor_limits + self.handshake.right_motor_limits
-        if any(value < lower or value > upper for value, (lower, upper) in zip(sample.positions, raw_limits)):
+        if any(value < lower or value > upper for value, (lower, upper) in zip(sample.raw_positions, raw_limits)):
             self.requires_resync = True
             raise ValueError("raw leader position is outside the handshake-advertised motor limits")
         self.rtt_ms = sample.rtt_ns / 1_000_000
@@ -220,7 +224,8 @@ class BridgeReceiver:
             sequence=sample.sequence,
             sent_monotonic_ns=sample.sent_monotonic_ns,
             received_monotonic_ns=received,
-            raw_positions=sample.positions,
+            raw_positions=sample.raw_positions,
+            normalized_positions=sample.positions,
             converted_command=converted,
             jitter_ms=self.jitter_ms,
         )
@@ -293,18 +298,24 @@ class LoopbackBridgeServer:
         self.receiver = receiver or BridgeReceiver()
         self._listener: socket.socket | None = None
         self._client_active = False
+        self._cancel = threading.Event()
+        self.failure: str | None = None
 
     def start(self) -> None:
         if self._listener is not None:
             raise RuntimeError("bridge server is already listening")
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.settimeout(3.0)
+        # A Mac may connect only after its operator has completed the SSH
+        # tunnel.  Poll solely for explicit cancellation; there is no startup
+        # timeout that can silently kill the only accept thread.
+        listener.settimeout(0.1)
         listener.bind((LOOPBACK_HOST, self.port))
         listener.listen(1)
         self._listener = listener
 
     def close(self) -> None:
+        self._cancel.set()
         if self._listener is not None:
             self._listener.close()
             self._listener = None
@@ -334,7 +345,20 @@ class LoopbackBridgeServer:
             raise RuntimeError("bridge server has not been started")
         if self._client_active:
             raise RuntimeError("bridge server accepts exactly one client")
-        client, _ = self._listener.accept()
+        while not self._cancel.is_set():
+            try:
+                client, _ = self._listener.accept()
+                break
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._cancel.is_set():
+                    return
+                self.failure = "listener_accept_failed"
+                self.receiver.close_connection()
+                raise
+        else:
+            return
         self._client_active = True
         verifier = self._verifier()
         try:
@@ -376,11 +400,13 @@ class LoopbackBridgeServer:
                             message.sample_sequence,
                             message.monotonic_ns,
                             message.positions,
+                            message.raw_positions,
                             message.rtt_ns,
                             message.rtt_age_ns,
                         )
                     )
         except (ConnectionError, OSError, ValueError):
+            self.failure = "bridge_transport_failed"
             self.receiver.close_connection()
             raise
         finally:

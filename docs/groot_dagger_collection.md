@@ -15,8 +15,9 @@ open a public teleoperation port or attach the leaders to the remote host.
    owner-only session secret and a manifest which contains the nonce but never
    the secret or its path. Copy the secret through an already authenticated
    secure channel into the Mac bridge's fixed private state location while the
-   session is active. The collector overwrites and removes only the secret it
-   created when the session exits; do not reuse it. Do not put secret contents
+   session is active. The collector overwrites and removes only the same inode
+   it created when the session exits; a stale, symlinked, or replaced path is a
+   fail-closed cleanup fault and is never removed. Do not reuse it. Do not put secret contents
    or a secret-file path in command arguments, logs, manifests, screenshots, or
    tickets.
 4. Use the printed forwarding template after replacing its host placeholder:
@@ -107,16 +108,35 @@ lehome-bridge \
   --session-nonce <remote-session-nonce>
 ```
 
-The version-2 bridge sends a canonical-JSON/HMAC-SHA256 handshake, nonce-bound
-ping/ack probes, and strictly sequenced 30 Hz 12D samples. The RTT is measured
+When that Mac bridge exits—whether streaming ends normally or with an error—it
+overwrites and removes only the exact mode-0600 secret inode it opened. If that
+path was replaced, it refuses cleanup and preserves the replacement rather than
+deleting an unrelated file; resolve that fail-closed error before another run.
+The fixed secret parent directory must be owned by the bridge user and not
+group- or world-writable; that owner-private directory is required for the
+final name unlink safety boundary.
+
+The version-3 bridge sends a canonical-JSON/HMAC-SHA256 handshake, nonce-bound
+ping/ack probes, and strictly sequenced 30 Hz 12D samples. Each signed sample
+contains both the exact raw encoder counts and the deterministic calibration-
+normalized values derived from that same one physical read. Handshake motor
+limits therefore apply to raw counts before any conversion. The RTT is measured
 only on the Mac clock; arrival cadence and sender-clock deltas are separate
 buffering/jitter checks, never one-way latency inferred from unrelated clocks.
-Each sample must carry a fresh in-limit RTT measurement and lie within the
-motor limits advertised by its handshake before conversion. It neither accepts
+The first RTT is measured before sampling begins and later probes run separately
+from the 30 Hz sampler, so a healthy 30--80 ms tunnel RTT cannot manufacture a
+cadence fault. Each sample must carry a fresh in-limit RTT measurement and lie
+within the raw motor limits advertised by its handshake before conversion. It neither accepts
 nor prints a secret-file option. Install the standalone `lehome-bridge` package
 on the receiver host (or expose `bridge/src` beside `source/lehome`) before
 connecting; the receiver imports its wire verifier only when a bridge client
 connects.
+
+The remote listener continues accepting until the session is explicitly closed;
+it does not abandon the first Mac connection after a short setup timeout. The
+collector waits for an authenticated handshake and a first healthy sample before
+launching the Isaac episode. A listener transport failure or cancellation is
+visible and aborts collection rather than consuming an episode on holds.
 
 The remote receiver holds the last safe command on any authentication, replay,
 out-of-order, disconnect, stale-age, RTT, buffering, jitter, or raw-limit

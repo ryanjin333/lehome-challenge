@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import stat
 from dataclasses import dataclass
+import threading
+import time
 
 import numpy as np
 import pytest
 
-from lehome.flywheel.bridge_receiver import ExpertCommand
+from lehome.flywheel.bridge_receiver import ExpertCommand, Handshake, LeaderSampleFrame
 from lehome.flywheel.isaac_recorder import MixedSourceRecorder
 from lehome.flywheel.models import EpisodeIdentity
 from lehome.flywheel.quality import QualityThresholds
-from scripts.collect_groot_dagger import ScheduledControlSource, build_parser, collect_episode, create_session_secret, main, prepare_session, validate_args
+from scripts.collect_groot_dagger import ScheduledControlSource, build_parser, collect_episode, main, prepare_session, validate_args
 
 
 def arguments(*values: str):
@@ -88,12 +90,54 @@ def test_prepare_session_removes_its_secret_when_manifest_creation_fails(tmp_pat
     assert not secret_path.exists()
 
 
+def test_prepare_session_never_removes_a_replaced_secret_on_the_error_exit(tmp_path, monkeypatch) -> None:
+    secret_path = tmp_path / "bridge-session.secret"
+
+    def fail_after_replacement(*_args, **_kwargs) -> None:
+        secret_path.unlink()
+        secret_path.write_bytes(b"unrelated")
+        secret_path.chmod(0o600)
+        raise ValueError("manifest failed after replacement")
+
+    monkeypatch.setattr("scripts.collect_groot_dagger._write_session_manifest", fail_after_replacement)
+
+    with pytest.raises(RuntimeError, match="not created by this session"):
+        prepare_session(arguments("--run-root", str(tmp_path / "practice")), secret_path=secret_path)
+
+    assert secret_path.read_bytes() == b"unrelated"
+
+
 def test_noninteractive_main_always_removes_its_one_session_secret(tmp_path, monkeypatch) -> None:
     secret_path = tmp_path / "bridge-session.secret"
     monkeypatch.setattr("scripts.collect_groot_dagger.default_secret_path", lambda: secret_path)
 
     assert main(["--run-root", str(tmp_path / "practice")]) == 0
     assert not secret_path.exists()
+
+
+def test_collection_waits_for_an_authenticated_healthy_bridge_before_starting(tmp_path) -> None:
+    value = prepare_session(arguments("--run-root", str(tmp_path / "practice")), secret_path=tmp_path / "bridge-session.secret")
+    receiver = value.bridge_server.receiver
+    receiver.converter = lambda values: values
+
+    def connect_after_setup_delay() -> None:
+        time.sleep(0.05)
+        receiver.accept_handshake(
+            Handshake("nonce", 0, "left", "right", "a" * 64, "b" * 64, ((0.0, 4095.0),) * 6, ((0.0, 4095.0),) * 6, 30)
+        )
+        receiver.accept_sample(
+            LeaderSampleFrame("nonce", 1, 1, (0.0,) * 12, (2048.0,) * 12, 1_000_000, 0)
+        )
+
+    worker = threading.Thread(target=connect_after_setup_delay)
+    worker.start()
+    try:
+        value.wait_for_bridge_ready(poll_interval_s=0.005)
+    finally:
+        worker.join(timeout=1.0)
+        value.close_listener()
+
+    assert receiver.current().eligible is False  # close is fail-closed after readiness
 
 
 def identity(name: str) -> EpisodeIdentity:

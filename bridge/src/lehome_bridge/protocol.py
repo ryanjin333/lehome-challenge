@@ -11,7 +11,7 @@ import struct
 from typing import Any, Iterable, Mapping
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_FRAME_BYTES = 64 * 1024
 SIGNATURE_BYTES = hashlib.sha256().digest_size
 _SHA256_HEX_LENGTH = 64
@@ -22,6 +22,15 @@ def _finite_12(values: Iterable[object]) -> tuple[float, ...]:
     if len(sample) != 12 or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in sample):
         raise ValueError("positions must be finite 12D values")
     return tuple(float(value) for value in sample)
+
+
+def _normalized_12(values: Iterable[object]) -> tuple[float, ...]:
+    sample = _finite_12(values)
+    for index, value in enumerate(sample):
+        lower = 0.0 if index % 6 == 5 else -100.0
+        if value < lower or value > 100.0:
+            raise ValueError("normalized positions must be within SO101 normalization limits")
+    return sample
 
 
 def _sha256(value: str, name: str) -> str:
@@ -54,6 +63,7 @@ class BridgeMessage:
     sequence: int
     monotonic_ns: int | None = None
     positions: tuple[float, ...] | None = None
+    raw_positions: tuple[float, ...] | None = None
     rtt_ns: int | None = None
     rtt_age_ns: int | None = None
     sample_sequence: int | None = None
@@ -92,14 +102,14 @@ class BridgeMessage:
             object.__setattr__(self, "right_motor_limits", _motor_limits(self.right_motor_limits, "right"))
             if not isinstance(self.hz, int) or self.hz <= 0:
                 raise ValueError("handshake hz must be a positive integer")
-            if any(value is not None for value in (self.positions, self.monotonic_ns, self.rtt_ns, self.rtt_age_ns, self.sample_sequence, self.probe_nonce)):
+            if any(value is not None for value in (self.positions, self.raw_positions, self.monotonic_ns, self.rtt_ns, self.rtt_age_ns, self.sample_sequence, self.probe_nonce)):
                 raise ValueError("handshake must not include a sample")
         elif self.kind == "sample":
             if self.sequence == 0:
                 raise ValueError("sample sequence must follow the handshake")
             if not isinstance(self.monotonic_ns, int) or self.monotonic_ns < 0:
                 raise ValueError("sample monotonic_ns must be a non-negative integer")
-            if self.positions is None:
+            if self.positions is None or self.raw_positions is None:
                 raise ValueError("sample positions are required")
             if not isinstance(self.rtt_ns, int) or self.rtt_ns <= 0:
                 raise ValueError("sample requires a positive client-measured rtt_ns")
@@ -107,13 +117,14 @@ class BridgeMessage:
                 raise ValueError("sample requires a non-negative rtt_age_ns")
             if not isinstance(self.sample_sequence, int) or self.sample_sequence <= 0:
                 raise ValueError("sample requires a positive leader sample sequence")
-            object.__setattr__(self, "positions", _finite_12(self.positions))
+            object.__setattr__(self, "positions", _normalized_12(self.positions))
+            object.__setattr__(self, "raw_positions", _finite_12(self.raw_positions))
             if any(value is not None for value in (self.left_serial, self.right_serial, self.left_calibration_sha256, self.right_calibration_sha256, self.left_motor_limits, self.right_motor_limits, self.hz, self.probe_nonce)):
                 raise ValueError("sample must not repeat handshake identity or motor limits")
         else:
             if self.sequence == 0 or not isinstance(self.probe_nonce, str) or not self.probe_nonce:
                 raise ValueError("probe messages require a positive sequence and nonce")
-            if any(value is not None for value in (self.monotonic_ns, self.positions, self.rtt_ns, self.rtt_age_ns, self.sample_sequence, self.left_serial, self.right_serial, self.left_calibration_sha256, self.right_calibration_sha256, self.left_motor_limits, self.right_motor_limits, self.hz)):
+            if any(value is not None for value in (self.monotonic_ns, self.positions, self.raw_positions, self.rtt_ns, self.rtt_age_ns, self.sample_sequence, self.left_serial, self.right_serial, self.left_calibration_sha256, self.right_calibration_sha256, self.left_motor_limits, self.right_motor_limits, self.hz)):
                 raise ValueError("probe messages must contain only their nonce")
 
     @classmethod
@@ -145,14 +156,15 @@ class BridgeMessage:
 
     @classmethod
     def sample(
-        cls, session_nonce: str, sequence: int, monotonic_ns: int, positions: Iterable[object], *, sample_sequence: int, rtt_ns: int, rtt_age_ns: int
+        cls, session_nonce: str, sequence: int, monotonic_ns: int, positions: Iterable[object], *, raw_positions: Iterable[object], sample_sequence: int, rtt_ns: int, rtt_age_ns: int
     ) -> "BridgeMessage":
         return cls(
             kind="sample",
             session_nonce=session_nonce,
             sequence=sequence,
             monotonic_ns=monotonic_ns,
-            positions=_finite_12(positions),
+            positions=_normalized_12(positions),
+            raw_positions=_finite_12(raw_positions),
             sample_sequence=sample_sequence,
             rtt_ns=rtt_ns,
             rtt_age_ns=rtt_age_ns,
@@ -184,7 +196,7 @@ class BridgeMessage:
                 right_motor_limits=[list(pair) for pair in self.right_motor_limits or ()],
             )
         elif self.kind == "sample":
-            result.update(monotonic_ns=self.monotonic_ns, positions=list(self.positions or ()), sample_sequence=self.sample_sequence, rtt_ns=self.rtt_ns, rtt_age_ns=self.rtt_age_ns)
+            result.update(monotonic_ns=self.monotonic_ns, positions=list(self.positions or ()), raw_positions=list(self.raw_positions or ()), sample_sequence=self.sample_sequence, rtt_ns=self.rtt_ns, rtt_age_ns=self.rtt_age_ns)
         else:
             result.update(probe_nonce=self.probe_nonce)
         return result
@@ -208,10 +220,10 @@ class BridgeMessage:
                 raise ValueError("invalid handshake fields")
             return cls(**decoded)
         if decoded["kind"] == "sample":
-            expected = required | {"monotonic_ns", "positions", "sample_sequence", "rtt_ns", "rtt_age_ns"}
+            expected = required | {"monotonic_ns", "positions", "raw_positions", "sample_sequence", "rtt_ns", "rtt_age_ns"}
             if set(decoded) != expected:
                 raise ValueError("invalid sample fields")
-            return cls.sample(decoded["session_nonce"], decoded["sequence"], decoded["monotonic_ns"], decoded["positions"], sample_sequence=decoded["sample_sequence"], rtt_ns=decoded["rtt_ns"], rtt_age_ns=decoded["rtt_age_ns"])
+            return cls.sample(decoded["session_nonce"], decoded["sequence"], decoded["monotonic_ns"], decoded["positions"], raw_positions=decoded["raw_positions"], sample_sequence=decoded["sample_sequence"], rtt_ns=decoded["rtt_ns"], rtt_age_ns=decoded["rtt_age_ns"])
         if decoded["kind"] in {"ping", "ack"}:
             expected = required | {"probe_nonce"}
             if set(decoded) != expected:
