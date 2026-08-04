@@ -36,7 +36,7 @@ def test_signed_message_round_trip_and_replay_rejection() -> None:
 
 def test_tampered_message_fails_authentication() -> None:
     wire = bytearray(
-        encode_message(BridgeMessage.sample("n", 1, 10, [0.0] * 12), secret=b"k" * 32)
+        encode_message(BridgeMessage.sample("n", 1, 10, [0.0] * 12, sample_sequence=1, rtt_ns=1, rtt_age_ns=0), secret=b"k" * 32)
     )
     wire[-1] ^= 1
     with pytest.raises(ValueError, match="authentication"):
@@ -57,17 +57,17 @@ def test_protocol_rejects_bad_identity_nonfinite_samples_and_oversize_frames() -
             hz=30,
         )
     with pytest.raises(ValueError, match="finite 12D"):
-        BridgeMessage.sample("n", 1, 10, [float("nan")] * 12)
+        BridgeMessage.sample("n", 1, 10, [float("nan")] * 12, sample_sequence=1, rtt_ns=1, rtt_age_ns=0)
     with pytest.raises(ValueError, match="maximum"):
         MessageVerifier(secret=b"k" * 32, expected_nonce="n").verify(
             struct.pack("!I", 65_537) + b"x" * 65_537
         )
 
 
-def test_signed_sample_rejects_a_non_v1_protocol_declaration() -> None:
-    sample = BridgeMessage.sample("n", 1, 10, [0.0] * 12)
+def test_signed_sample_rejects_a_stale_protocol_declaration() -> None:
+    sample = BridgeMessage.sample("n", 1, 10, [0.0] * 12, sample_sequence=1, rtt_ns=1, rtt_age_ns=0)
     payload = sample.to_dict()
-    payload["protocol_version"] = 2
+    payload["protocol_version"] = 1
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     with pytest.raises(ValueError, match="unsupported"):
         BridgeMessage.from_json(canonical)
@@ -85,6 +85,9 @@ def test_handshake_round_trips_ordered_motor_limits_and_samples_cannot_repeat_th
             sequence=1,
             monotonic_ns=1,
             positions=(0.0,) * 12,
+            sample_sequence=1,
+            rtt_ns=1,
+            rtt_age_ns=0,
             left_motor_limits=LIMITS,
         )
     with pytest.raises(ValueError, match="motor limits"):
@@ -99,6 +102,14 @@ def test_handshake_round_trips_ordered_motor_limits_and_samples_cannot_repeat_th
             right_motor_limits=LIMITS,
             hz=30,
         )
+
+
+def test_ping_ack_echoes_the_probe_nonce_for_client_clock_rtt_measurement() -> None:
+    ping = BridgeMessage.ping("nonce-1", 1, "probe-1")
+    ack = BridgeMessage.ack("nonce-1", 1, "probe-1")
+
+    assert BridgeMessage.from_json(message_to_payload(ping)) == ping
+    assert BridgeMessage.from_json(message_to_payload(ack)) == ack
 
 
 def message_to_payload(message: BridgeMessage) -> bytes:

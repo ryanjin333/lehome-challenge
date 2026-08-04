@@ -7,7 +7,7 @@ import pytest
 
 from lehome_bridge.client import BridgeConnection, read_secret_file
 from lehome_bridge.leaders import JOINTS, DualLeaderReader
-from lehome_bridge.protocol import MessageVerifier
+from lehome_bridge.protocol import BridgeMessage, MessageVerifier, encode_message
 
 
 class FakeBus:
@@ -113,3 +113,46 @@ def test_connection_sends_exact_calibration_derived_motor_limits(tmp_path: Path)
     handshake = MessageVerifier(secret=b"x" * 32, expected_nonce="n").verify(socket.frames[0])
     assert handshake.left_motor_limits == reader.left_motor_limits
     assert handshake.right_motor_limits == reader.right_motor_limits
+
+
+def test_connection_attaches_a_nonce_bound_client_clock_rtt_to_samples(tmp_path: Path, monkeypatch) -> None:
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.frames: list[bytes] = []
+            self.response = bytearray(
+                encode_message(BridgeMessage.ack("n", 1, "probe"), secret=b"x" * 32)
+            )
+
+        def sendall(self, data: bytes) -> None:
+            self.frames.append(data)
+
+        def recv(self, size: int) -> bytes:
+            chunk = bytes(self.response[:size])
+            del self.response[:size]
+            return chunk
+
+        def close(self) -> None:
+            pass
+
+    reader = DualLeaderReader(
+        FakeBus(serial="left", positions={name: 0 for name in JOINTS}),
+        FakeBus(serial="right", positions={name: 0 for name in JOINTS}),
+        left_calibration=calibration(tmp_path, "left"),
+        right_calibration=calibration(tmp_path, "right"),
+    )
+    ticks = iter((1_000, 1_250, 1_300, 1_350))
+    monkeypatch.setattr("lehome_bridge.client.token_urlsafe", lambda _: "probe")
+    monkeypatch.setattr("lehome_bridge.client.time.monotonic_ns", lambda: next(ticks))
+    socket = FakeSocket()
+    connection = BridgeConnection(reader, secret=b"x" * 32, session_nonce="n", sock=socket)
+
+    connection.connect()
+    assert connection.refresh_rtt() == 250
+    connection.send_sample(reader.read())
+
+    verifier = MessageVerifier(secret=b"x" * 32, expected_nonce="n")
+    assert verifier.verify(socket.frames[0]).kind == "handshake"
+    assert verifier.verify(socket.frames[1]).kind == "ping"
+    sample = verifier.verify(socket.frames[2])
+    assert sample.rtt_ns == 250
+    assert sample.rtt_age_ns == 100

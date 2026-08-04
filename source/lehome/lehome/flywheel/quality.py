@@ -97,7 +97,10 @@ class AttemptStats:
 
     def safety_rejections(self, thresholds: QualityThresholds) -> tuple[str, ...]:
         reasons: list[str] = []
-        if self.unsafe_commands > thresholds.allowed_unsafe_commands:
+        # A command rejected by the environment safety boundary is never a
+        # trainable example.  Keep the legacy threshold in the manifest for
+        # compatibility/auditability, but it cannot relax this exclusion.
+        if self.unsafe_commands:
             reasons.append("unsafe_commands")
         if self.velocity_p95 > thresholds.max_velocity_p95:
             reasons.append("velocity_exceeded")

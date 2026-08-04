@@ -10,7 +10,7 @@ from lehome.flywheel.bridge_receiver import ExpertCommand
 from lehome.flywheel.isaac_recorder import MixedSourceRecorder
 from lehome.flywheel.models import EpisodeIdentity
 from lehome.flywheel.quality import QualityThresholds
-from scripts.collect_groot_dagger import ScheduledControlSource, build_parser, collect_episode, create_session_secret, prepare_session, validate_args
+from scripts.collect_groot_dagger import ScheduledControlSource, build_parser, collect_episode, create_session_secret, main, prepare_session, validate_args
 
 
 def arguments(*values: str):
@@ -51,6 +51,49 @@ def test_practice_session_has_no_export_and_secret_is_mode_0600(tmp_path) -> Non
     assert session.controller.mode == "practice"
     assert not (args.run_root / "exports").exists()
     assert stat.S_IMODE((tmp_path / "bridge-session.secret").stat().st_mode) == 0o600
+
+
+def test_session_cleanup_removes_only_its_owned_secret(tmp_path) -> None:
+    secret_path = tmp_path / "bridge-session.secret"
+    session = prepare_session(arguments("--run-root", str(tmp_path / "practice")), secret_path=secret_path)
+
+    session.close_listener()
+    session.close_listener()
+
+    assert not secret_path.exists()
+
+
+def test_session_cleanup_refuses_to_delete_a_replaced_secret_path(tmp_path) -> None:
+    secret_path = tmp_path / "bridge-session.secret"
+    session = prepare_session(arguments("--run-root", str(tmp_path / "practice")), secret_path=secret_path)
+    secret_path.unlink()
+    secret_path.write_bytes(b"unrelated")
+    secret_path.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="not created by this session"):
+        session.close_listener()
+
+    assert secret_path.read_bytes() == b"unrelated"
+
+
+def test_prepare_session_removes_its_secret_when_manifest_creation_fails(tmp_path) -> None:
+    root = tmp_path / "existing"
+    root.mkdir()
+    (root / "session-manifest.json").write_text("{}", encoding="utf-8")
+    secret_path = tmp_path / "bridge-session.secret"
+
+    with pytest.raises(ValueError, match="manifest"):
+        prepare_session(arguments("--run-root", str(root)), secret_path=secret_path)
+
+    assert not secret_path.exists()
+
+
+def test_noninteractive_main_always_removes_its_one_session_secret(tmp_path, monkeypatch) -> None:
+    secret_path = tmp_path / "bridge-session.secret"
+    monkeypatch.setattr("scripts.collect_groot_dagger.default_secret_path", lambda: secret_path)
+
+    assert main(["--run-root", str(tmp_path / "practice")]) == 0
+    assert not secret_path.exists()
 
 
 def identity(name: str) -> EpisodeIdentity:
@@ -179,6 +222,29 @@ def test_collect_episode_hold_or_discard_stays_diagnostic_without_export(tmp_pat
     value.bridge_server.receiver = FakeReceiver(eligible=False)
     result = collect_episode(value, FakeEnv(), FakePolicy(), ScheduledControlSource(["space", "d"]), recorder(tmp_path, "hold", "expert", monkeypatch), thresholds(), max_steps=2)
     assert result.episode["bc_target_count"] == 0
+    assert not (tmp_path / "exports").exists()
+
+
+def test_collect_episode_never_steps_an_unsafe_action_or_exports_it(tmp_path, monkeypatch) -> None:
+    class UnsafeEnv(FakeEnv):
+        def is_action_safe(self, action) -> bool:
+            return False
+
+    value = session(tmp_path, "expert")
+    env = UnsafeEnv(success_at=1)
+    result = collect_episode(
+        value,
+        env,
+        FakePolicy(),
+        ScheduledControlSource(["space", "a"]),
+        recorder(tmp_path, "unsafe", "expert", monkeypatch),
+        thresholds(),
+        max_steps=3,
+    )
+
+    assert env.actions == []
+    assert result.episode["trainable"] is False
+    assert "unsafe" in result.episode["rejection_reasons"]
     assert not (tmp_path / "exports").exists()
 
 

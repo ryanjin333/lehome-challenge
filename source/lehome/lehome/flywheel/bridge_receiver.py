@@ -68,12 +68,18 @@ class LeaderSampleFrame:
     sequence: int
     sent_monotonic_ns: int
     positions: tuple[float, ...]
+    rtt_ns: int
+    rtt_age_ns: int
 
     def __post_init__(self) -> None:
         if not self.session_nonce or not isinstance(self.sequence, int) or self.sequence <= 0:
             raise ValueError("bridge sample sequence is invalid")
         if not isinstance(self.sent_monotonic_ns, int) or self.sent_monotonic_ns < 0:
             raise ValueError("bridge sample timestamp is invalid")
+        if not isinstance(self.rtt_ns, int) or self.rtt_ns <= 0:
+            raise ValueError("bridge sample RTT is invalid")
+        if not isinstance(self.rtt_age_ns, int) or self.rtt_age_ns < 0:
+            raise ValueError("bridge sample RTT age is invalid")
         object.__setattr__(self, "positions", _finite_12(self.positions, field="bridge sample positions"))
 
 
@@ -116,6 +122,8 @@ class BridgeReceiver:
         *,
         max_age_ms: float = 80.0,
         max_jitter_ms: float = 30.0,
+        max_rtt_ms: float = 80.0,
+        max_rtt_age_ms: float = 1_000.0,
         converter: Callable[[tuple[float, ...]], Iterable[object]] | None = None,
         expected_calibrations: tuple[str, str] | None = None,
         expected_motor_limits: tuple[Iterable[Iterable[object]], Iterable[Iterable[object]]] | None = None,
@@ -124,8 +132,14 @@ class BridgeReceiver:
             raise ValueError("max_age_ms must be positive and finite")
         if not math.isfinite(max_jitter_ms) or max_jitter_ms < 0:
             raise ValueError("max_jitter_ms must be non-negative and finite")
+        if not math.isfinite(max_rtt_ms) or max_rtt_ms <= 0:
+            raise ValueError("max_rtt_ms must be positive and finite")
+        if not math.isfinite(max_rtt_age_ms) or max_rtt_age_ms < 0:
+            raise ValueError("max_rtt_age_ms must be non-negative and finite")
         self.max_age_ms = max_age_ms
         self.max_jitter_ms = max_jitter_ms
+        self.max_rtt_ms = max_rtt_ms
+        self.max_rtt_age_ms = max_rtt_age_ms
         self.converter = converter or _canonical_so101_converter
         self.expected_calibrations = expected_calibrations
         self.expected_motor_limits = (
@@ -143,6 +157,11 @@ class BridgeReceiver:
         self.requires_resync = False
         self.disconnected = False
         self.jitter_ms = 0.0
+        self.arrival_jitter_ms = 0.0
+        self.sender_sync_jitter_ms = 0.0
+        self.rtt_ms: float | None = None
+        self.rtt_age_ms: float | None = None
+        self._rtt_healthy = False
 
     def accept_handshake(self, handshake: Handshake) -> None:
         if self.handshake is not None:
@@ -174,9 +193,26 @@ class BridgeReceiver:
         received = time.monotonic_ns() if received_monotonic_ns is None else received_monotonic_ns
         if not isinstance(received, int) or received < 0:
             raise ValueError("received monotonic timestamp is invalid")
+        raw_limits = self.handshake.left_motor_limits + self.handshake.right_motor_limits
+        if any(value < lower or value > upper for value, (lower, upper) in zip(sample.positions, raw_limits)):
+            self.requires_resync = True
+            raise ValueError("raw leader position is outside the handshake-advertised motor limits")
+        self.rtt_ms = sample.rtt_ns / 1_000_000
+        self.rtt_age_ms = sample.rtt_age_ns / 1_000_000
+        self._rtt_healthy = self.rtt_ms <= self.max_rtt_ms and self.rtt_age_ms <= self.max_rtt_age_ms
+        if not self._rtt_healthy:
+            self.requires_resync = True
         if self.last_sample is not None:
             expected_period_ns = int(1_000_000_000 / self.handshake.hz)
-            self.jitter_ms = abs((received - self.last_sample.received_monotonic_ns) - expected_period_ns) / 1_000_000
+            received_period_ns = received - self.last_sample.received_monotonic_ns
+            sender_period_ns = sample.sent_monotonic_ns - self.last_sample.sent_monotonic_ns
+            # The two hosts' monotonic clock origins are unrelated.  Only
+            # durations measured on each individual host are comparable.
+            self.arrival_jitter_ms = abs(received_period_ns - expected_period_ns) / 1_000_000
+            self.sender_sync_jitter_ms = abs(received_period_ns - sender_period_ns) / 1_000_000
+            self.jitter_ms = max(self.arrival_jitter_ms, self.sender_sync_jitter_ms)
+            if sender_period_ns <= 0:
+                self.jitter_ms = self.max_jitter_ms + 1.0
             if self.jitter_ms > self.max_jitter_ms:
                 self.requires_resync = True
         converted = _finite_12(self.converter(sample.positions), field="converted expert command")
@@ -202,8 +238,12 @@ class BridgeReceiver:
         """Explicit operator action after a fresh healthy sample has arrived."""
         if self.disconnected or self.last_sample is None:
             raise ValueError("cannot resync a disconnected or empty bridge")
+        if not self._rtt_healthy:
+            raise ValueError("cannot resync until a fresh RTT measurement is healthy")
         self.requires_resync = False
         self.jitter_ms = 0.0
+        self.arrival_jitter_ms = 0.0
+        self.sender_sync_jitter_ms = 0.0
         self.last_safe_command = self.last_sample.converted_command
 
     def current(self, *, now_ns: int | None = None) -> ExpertCommand:
@@ -216,6 +256,8 @@ class BridgeReceiver:
         if age_ms > self.max_age_ms:
             self.requires_resync = True
             return ExpertCommand(self.last_safe_command, False, "stale_sample", self.last_sample.sequence, age_ms)
+        if not self._rtt_healthy:
+            return ExpertCommand(self.last_safe_command, False, "rtt_exceeded", self.last_sample.sequence, age_ms)
         if self.jitter_ms > self.max_jitter_ms:
             self.requires_resync = True
             return ExpertCommand(self.last_safe_command, False, "jitter_exceeded", self.last_sample.sequence, age_ms)
@@ -316,13 +358,26 @@ class LoopbackBridgeServer:
                             message.hz,
                         )
                     )
+                elif message.kind == "ping":
+                    try:
+                        from lehome_bridge.protocol import BridgeMessage, encode_message
+                    except ImportError as error:  # pragma: no cover - deployment packaging guard
+                        raise RuntimeError("install lehome-bridge on the receiver host") from error
+                    client.sendall(
+                        encode_message(
+                            BridgeMessage.ack(message.session_nonce, message.sequence, message.probe_nonce),
+                            secret=self.secret,
+                        )
+                    )
                 else:
                     self.receiver.accept_sample(
                         LeaderSampleFrame(
                             message.session_nonce,
-                            message.sequence,
+                            message.sample_sequence,
                             message.monotonic_ns,
                             message.positions,
+                            message.rtt_ns,
+                            message.rtt_age_ns,
                         )
                     )
         except (ConnectionError, OSError, ValueError):

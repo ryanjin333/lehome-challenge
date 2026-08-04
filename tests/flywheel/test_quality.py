@@ -44,6 +44,30 @@ def test_quality_grades_clean_recovery_and_rejected_attempts(tmp_path: Path) -> 
     assert grade_attempt(AttemptStats(official_success=False), values).trainable is False
 
 
+def test_any_unsafe_command_is_a_non_overridable_training_rejection(tmp_path: Path) -> None:
+    values = load_quality_thresholds(
+        manifest(tmp_path / "quality-thresholds.json"),
+        expected_dataset_revision="a" * 40,
+        expected_dataset_sha256="b" * 64,
+    )
+    permissive = values.__class__(
+        values.dataset_revision,
+        values.dataset_sha256,
+        values.clean_velocity_p95,
+        values.clean_acceleration_p95,
+        values.clean_jitter_p95,
+        values.max_velocity_p95,
+        values.max_acceleration_p95,
+        values.max_jitter_p95,
+        values.allowed_stale_samples,
+        100,
+    )
+
+    result = grade_attempt(AttemptStats(official_success=True, unsafe_commands=1), permissive)
+    assert result.grade == "C"
+    assert result.reasons == ("unsafe_commands",)
+
+
 def test_quality_manifest_requires_pinned_dataset_and_statistical_derivation(tmp_path: Path) -> None:
     path = manifest(tmp_path / "quality-thresholds.json")
     document = json.loads(path.read_text(encoding="utf-8"))

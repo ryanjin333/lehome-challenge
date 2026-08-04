@@ -14,9 +14,11 @@ open a public teleoperation port or attach the leaders to the remote host.
 3. Create the remote session with the default practice mode. It creates a fresh
    owner-only session secret and a manifest which contains the nonce but never
    the secret or its path. Copy the secret through an already authenticated
-   secure channel into the Mac bridge's fixed private state location. Do not put
-   secret contents or a secret-file path in command arguments, logs, manifests,
-   screenshots, or tickets.
+   secure channel into the Mac bridge's fixed private state location while the
+   session is active. The collector overwrites and removes only the secret it
+   created when the session exits; do not reuse it. Do not put secret contents
+   or a secret-file path in command arguments, logs, manifests, screenshots, or
+   tickets.
 4. Use the printed forwarding template after replacing its host placeholder:
 
    ```bash
@@ -105,16 +107,24 @@ lehome-bridge \
   --session-nonce <remote-session-nonce>
 ```
 
-The bridge sends a canonical-JSON/HMAC-SHA256 handshake followed by strictly
-sequenced 30 Hz 12D samples. It neither accepts nor prints a secret-file option.
-Install the standalone `lehome-bridge` package on the receiver host (or expose
-`bridge/src` beside `source/lehome`) before connecting; the receiver imports its
-wire verifier only when a bridge client connects.
+The version-2 bridge sends a canonical-JSON/HMAC-SHA256 handshake, nonce-bound
+ping/ack probes, and strictly sequenced 30 Hz 12D samples. The RTT is measured
+only on the Mac clock; arrival cadence and sender-clock deltas are separate
+buffering/jitter checks, never one-way latency inferred from unrelated clocks.
+Each sample must carry a fresh in-limit RTT measurement and lie within the
+motor limits advertised by its handshake before conversion. It neither accepts
+nor prints a secret-file option. Install the standalone `lehome-bridge` package
+on the receiver host (or expose `bridge/src` beside `source/lehome`) before
+connecting; the receiver imports its wire verifier only when a bridge client
+connects.
 
 The remote receiver holds the last safe command on any authentication, replay,
-out-of-order, disconnect, stale-age, or jitter failure. It records both raw
-leader values and converted follower commands. After a fault, wait for a fresh
-stable cadence, then explicitly resynchronize; never continue through a hold.
+out-of-order, disconnect, stale-age, RTT, buffering, jitter, or raw-limit
+failure. It records both valid raw leader values and converted follower commands.
+After a fault, wait for fresh stable RTT and cadence, then explicitly
+resynchronize; never continue through a hold. An unsafe command is never sent
+to the environment and makes the entire attempt diagnostic-only regardless of
+the configured quality threshold.
 
 ## Physical acceptance evidence (not yet satisfied by local tests)
 

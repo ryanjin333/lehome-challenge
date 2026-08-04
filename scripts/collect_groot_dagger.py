@@ -141,13 +141,56 @@ def create_session_secret(path: Path) -> bytes:
     return secret
 
 
+def _secret_identity(path: Path) -> tuple[int, int]:
+    status = path.lstat()
+    if not stat.S_ISREG(status.st_mode) or stat.S_IMODE(status.st_mode) != 0o600:
+        raise RuntimeError("bridge session secret is no longer a private regular file")
+    return status.st_dev, status.st_ino
+
+
+def remove_session_secret(path: Path, *, identity: tuple[int, int]) -> None:
+    """Best-effort overwrite then unlink, without removing a replaced path."""
+    secret_path = Path(path)
+    try:
+        status = secret_path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or stat.S_IMODE(status.st_mode) != 0o600
+        or (status.st_dev, status.st_ino) != identity
+    ):
+        raise RuntimeError("refusing to remove a bridge secret path not created by this session")
+    descriptor = os.open(secret_path, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != identity:
+            raise RuntimeError("refusing to overwrite a replaced bridge secret")
+        remaining = opened.st_size
+        while remaining:
+            written = os.write(descriptor, b"\0" * min(remaining, 64 * 1024))
+            if written <= 0:
+                raise RuntimeError("failed to overwrite the bridge session secret")
+            remaining -= written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    final_status = secret_path.lstat()
+    if (final_status.st_dev, final_status.st_ino) != identity:
+        raise RuntimeError("refusing to remove a replaced bridge secret")
+    secret_path.unlink()
+
+
 @dataclass(slots=True)
 class CollectorSession:
     controller: InterventionController
     session_nonce: str
     quality_thresholds: QualityThresholds | None
     bridge_server: LoopbackBridgeServer
+    secret_path: Path
+    secret_identity: tuple[int, int]
     controls: list[str] = field(default_factory=list)
+    _secret_removed: bool = field(default=False, init=False, repr=False)
 
     def record_control(self, control: str) -> None:
         if control not in CONTROLS:
@@ -181,7 +224,12 @@ class CollectorSession:
         return thread
 
     def close_listener(self) -> None:
-        self.bridge_server.close()
+        try:
+            self.bridge_server.close()
+        finally:
+            if not self._secret_removed:
+                remove_session_secret(self.secret_path, identity=self.secret_identity)
+                self._secret_removed = True
 
 
 class ControlSource(Protocol):
@@ -277,6 +325,8 @@ def _attempt_quality(
     manual_discarded: bool,
 ) -> QualityResult:
     metrics = control_source.metrics()
+    if unsafe_commands:
+        return QualityResult("C", ("unsafe_commands",), 0.0)
     if thresholds is None or not isinstance(step_dt_s, (int, float)) or not math.isfinite(step_dt_s) or step_dt_s <= 0:
         return QualityResult("C", ("metric_evidence_unavailable",), 0.0)
     velocities = [max(abs(current - previous) for current, previous in zip(action, prior)) / step_dt_s for prior, action in zip(actions, actions[1:])]
@@ -367,6 +417,7 @@ def collect_episode(
     discarded = False
     held = stale_samples = unsafe_commands = 0
     disconnected = False
+    unsafe = False
     actions: list[tuple[float, ...]] = []
     jitter_samples: list[float] = []
     last_safe = tuple(float(value) for value in getattr(session.bridge_server.receiver, "last_safe_command", (0.0,) * 12))
@@ -425,6 +476,20 @@ def collect_episode(
         safety = getattr(env, "is_action_safe", None)
         if not callable(safety) or not bool(safety(action)):
             unsafe_commands += 1
+            unsafe = True
+            # Never invoke env.step with an action that failed the real task's
+            # safety boundary.  Preserve a diagnostic hold frame so the
+            # immutable artifact remains structurally valid, but exclude the
+            # rejected command from both BC targets and applied-action data.
+            recorder.record_step(
+                observation,
+                last_safe,
+                reward=0.0,
+                success=official_success,
+                action_source=ActionSource.HOLD,
+                segment=session.controller.segment,
+            )
+            break
         next_observation, reward, step_success = _step(env, action)
         official_success = official_success or step_success
         recorder.record_step(
@@ -446,7 +511,7 @@ def collect_episode(
         session.controller.discard()
     reasons = _rejection_reasons(quality, held=bool(held), discarded=discarded)
     outcome = EpisodeOutcome(
-        "success" if official_success and not discarded else "discarded" if discarded else "timeout",
+        "unsafe" if unsafe else "success" if official_success and not discarded else "discarded" if discarded else "timeout",
         accepted,
         QualityGrade(quality.grade),
         () if accepted else reasons,
@@ -500,25 +565,33 @@ def _write_session_manifest(root: Path, session: CollectorSession, args: argpars
 
 def prepare_session(args: argparse.Namespace, *, secret_path: Path | None = None) -> CollectorSession:
     thresholds = validate_args(args)
-    secret = create_session_secret(default_secret_path() if secret_path is None else secret_path)
+    created_secret_path = default_secret_path() if secret_path is None else Path(secret_path)
+    secret = create_session_secret(created_secret_path)
+    secret_identity = _secret_identity(created_secret_path)
     expected_calibrations = None
     if args.left_calibration_sha256 is not None:
         expected_calibrations = (args.left_calibration_sha256, args.right_calibration_sha256)
     receiver = BridgeReceiver(expected_calibrations=expected_calibrations)
     session_nonce = secrets.token_urlsafe(24)
-    session = CollectorSession(
-        controller=InterventionController(mode=args.mode),
-        session_nonce=session_nonce,
-        quality_thresholds=thresholds,
-        bridge_server=LoopbackBridgeServer(
-            secret=secret,
+    try:
+        session = CollectorSession(
+            controller=InterventionController(mode=args.mode),
             session_nonce=session_nonce,
-            port=args.listen_port,
-            receiver=receiver,
-        ),
-    )
-    _write_session_manifest(args.run_root, session, args)
-    return session
+            quality_thresholds=thresholds,
+            bridge_server=LoopbackBridgeServer(
+                secret=secret,
+                session_nonce=session_nonce,
+                port=args.listen_port,
+                receiver=receiver,
+            ),
+            secret_path=created_secret_path,
+            secret_identity=secret_identity,
+        )
+        _write_session_manifest(args.run_root, session, args)
+        return session
+    except BaseException:
+        remove_session_secret(created_secret_path, identity=secret_identity)
+        raise
 
 
 def ssh_forward_command(port: int) -> str:
@@ -645,15 +718,15 @@ def _run_production_collection(args: argparse.Namespace, session: CollectorSessi
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     session = prepare_session(args)
-    print(json.dumps({"ssh_forward": ssh_forward_command(args.listen_port), **session.status()}, sort_keys=True))
-    if args.interactive:
-        session.start_listener()
-        try:
+    try:
+        print(json.dumps({"ssh_forward": ssh_forward_command(args.listen_port), **session.status()}, sort_keys=True))
+        if args.interactive:
+            session.start_listener()
             result = _run_production_collection(args, session)
             print(json.dumps({"episode_id": result.path.name, "bc_target_count": result.episode["bc_target_count"], "trainable": result.episode["trainable"]}, sort_keys=True))
-        finally:
-            session.close_listener()
-    return 0
+        return 0
+    finally:
+        session.close_listener()
 
 
 if __name__ == "__main__":  # pragma: no cover

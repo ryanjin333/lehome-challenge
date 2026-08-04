@@ -11,7 +11,7 @@ import struct
 from typing import Any, Iterable, Mapping
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_FRAME_BYTES = 64 * 1024
 SIGNATURE_BYTES = hashlib.sha256().digest_size
 _SHA256_HEX_LENGTH = 64
@@ -47,13 +47,17 @@ def _motor_limits(values: Iterable[Iterable[object]], name: str) -> tuple[tuple[
 
 @dataclass(frozen=True, slots=True)
 class BridgeMessage:
-    """A protocol-v1 handshake or leader sample; the secret is never a field."""
+    """Authenticated session messages; the secret is never a field."""
 
     kind: str
     session_nonce: str
     sequence: int
     monotonic_ns: int | None = None
     positions: tuple[float, ...] | None = None
+    rtt_ns: int | None = None
+    rtt_age_ns: int | None = None
+    sample_sequence: int | None = None
+    probe_nonce: str | None = None
     left_serial: str | None = None
     right_serial: str | None = None
     left_calibration_sha256: str | None = None
@@ -66,7 +70,7 @@ class BridgeMessage:
     def __post_init__(self) -> None:
         if self.protocol_version != PROTOCOL_VERSION:
             raise ValueError("unsupported bridge protocol version")
-        if self.kind not in {"handshake", "sample"}:
+        if self.kind not in {"handshake", "sample", "ping", "ack"}:
             raise ValueError("unsupported bridge message kind")
         if not isinstance(self.session_nonce, str) or not self.session_nonce:
             raise ValueError("bridge session nonce is required")
@@ -88,18 +92,29 @@ class BridgeMessage:
             object.__setattr__(self, "right_motor_limits", _motor_limits(self.right_motor_limits, "right"))
             if not isinstance(self.hz, int) or self.hz <= 0:
                 raise ValueError("handshake hz must be a positive integer")
-            if self.positions is not None or self.monotonic_ns is not None:
+            if any(value is not None for value in (self.positions, self.monotonic_ns, self.rtt_ns, self.rtt_age_ns, self.sample_sequence, self.probe_nonce)):
                 raise ValueError("handshake must not include a sample")
-        else:
+        elif self.kind == "sample":
             if self.sequence == 0:
                 raise ValueError("sample sequence must follow the handshake")
             if not isinstance(self.monotonic_ns, int) or self.monotonic_ns < 0:
                 raise ValueError("sample monotonic_ns must be a non-negative integer")
             if self.positions is None:
                 raise ValueError("sample positions are required")
+            if not isinstance(self.rtt_ns, int) or self.rtt_ns <= 0:
+                raise ValueError("sample requires a positive client-measured rtt_ns")
+            if not isinstance(self.rtt_age_ns, int) or self.rtt_age_ns < 0:
+                raise ValueError("sample requires a non-negative rtt_age_ns")
+            if not isinstance(self.sample_sequence, int) or self.sample_sequence <= 0:
+                raise ValueError("sample requires a positive leader sample sequence")
             object.__setattr__(self, "positions", _finite_12(self.positions))
-            if any(value is not None for value in (self.left_serial, self.right_serial, self.left_calibration_sha256, self.right_calibration_sha256, self.left_motor_limits, self.right_motor_limits, self.hz)):
+            if any(value is not None for value in (self.left_serial, self.right_serial, self.left_calibration_sha256, self.right_calibration_sha256, self.left_motor_limits, self.right_motor_limits, self.hz, self.probe_nonce)):
                 raise ValueError("sample must not repeat handshake identity or motor limits")
+        else:
+            if self.sequence == 0 or not isinstance(self.probe_nonce, str) or not self.probe_nonce:
+                raise ValueError("probe messages require a positive sequence and nonce")
+            if any(value is not None for value in (self.monotonic_ns, self.positions, self.rtt_ns, self.rtt_age_ns, self.sample_sequence, self.left_serial, self.right_serial, self.left_calibration_sha256, self.right_calibration_sha256, self.left_motor_limits, self.right_motor_limits, self.hz)):
+                raise ValueError("probe messages must contain only their nonce")
 
     @classmethod
     def handshake(
@@ -130,7 +145,7 @@ class BridgeMessage:
 
     @classmethod
     def sample(
-        cls, session_nonce: str, sequence: int, monotonic_ns: int, positions: Iterable[object]
+        cls, session_nonce: str, sequence: int, monotonic_ns: int, positions: Iterable[object], *, sample_sequence: int, rtt_ns: int, rtt_age_ns: int
     ) -> "BridgeMessage":
         return cls(
             kind="sample",
@@ -138,7 +153,18 @@ class BridgeMessage:
             sequence=sequence,
             monotonic_ns=monotonic_ns,
             positions=_finite_12(positions),
+            sample_sequence=sample_sequence,
+            rtt_ns=rtt_ns,
+            rtt_age_ns=rtt_age_ns,
         )
+
+    @classmethod
+    def ping(cls, session_nonce: str, sequence: int, probe_nonce: str) -> "BridgeMessage":
+        return cls(kind="ping", session_nonce=session_nonce, sequence=sequence, probe_nonce=probe_nonce)
+
+    @classmethod
+    def ack(cls, session_nonce: str, sequence: int, probe_nonce: str) -> "BridgeMessage":
+        return cls(kind="ack", session_nonce=session_nonce, sequence=sequence, probe_nonce=probe_nonce)
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -157,8 +183,10 @@ class BridgeMessage:
                 right_serial=self.right_serial,
                 right_motor_limits=[list(pair) for pair in self.right_motor_limits or ()],
             )
+        elif self.kind == "sample":
+            result.update(monotonic_ns=self.monotonic_ns, positions=list(self.positions or ()), sample_sequence=self.sample_sequence, rtt_ns=self.rtt_ns, rtt_age_ns=self.rtt_age_ns)
         else:
-            result.update(monotonic_ns=self.monotonic_ns, positions=list(self.positions or ()))
+            result.update(probe_nonce=self.probe_nonce)
         return result
 
     @classmethod
@@ -180,10 +208,15 @@ class BridgeMessage:
                 raise ValueError("invalid handshake fields")
             return cls(**decoded)
         if decoded["kind"] == "sample":
-            expected = required | {"monotonic_ns", "positions"}
+            expected = required | {"monotonic_ns", "positions", "sample_sequence", "rtt_ns", "rtt_age_ns"}
             if set(decoded) != expected:
                 raise ValueError("invalid sample fields")
-            return cls.sample(decoded["session_nonce"], decoded["sequence"], decoded["monotonic_ns"], decoded["positions"])
+            return cls.sample(decoded["session_nonce"], decoded["sequence"], decoded["monotonic_ns"], decoded["positions"], sample_sequence=decoded["sample_sequence"], rtt_ns=decoded["rtt_ns"], rtt_age_ns=decoded["rtt_age_ns"])
+        if decoded["kind"] in {"ping", "ack"}:
+            expected = required | {"probe_nonce"}
+            if set(decoded) != expected:
+                raise ValueError("invalid probe fields")
+            return cls(kind=decoded["kind"], session_nonce=decoded["session_nonce"], sequence=decoded["sequence"], probe_nonce=decoded["probe_nonce"])
         raise ValueError("unsupported bridge message kind")
 
 
@@ -218,6 +251,16 @@ def split_frame(wire: bytes) -> tuple[bytes, bytes]:
     return wire[4 : 4 + SIGNATURE_BYTES], wire[4 + SIGNATURE_BYTES :]
 
 
+def decode_message(wire: bytes, *, secret: bytes) -> BridgeMessage:
+    """Authenticate one frame without applying a direction-specific sequence rule."""
+    _check_secret(secret)
+    signature, payload = split_frame(wire)
+    expected = hmac.digest(secret, payload, "sha256")
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError("bridge message authentication failed")
+    return BridgeMessage.from_json(payload)
+
+
 class MessageVerifier:
     """Authenticates a single bridge session and enforces strict sequencing."""
 
@@ -230,18 +273,14 @@ class MessageVerifier:
         self.next_sequence = 0
 
     def verify(self, wire: bytes) -> BridgeMessage:
-        signature, payload = split_frame(wire)
-        expected = hmac.digest(self.secret, payload, "sha256")
-        if not hmac.compare_digest(signature, expected):
-            raise ValueError("bridge message authentication failed")
-        message = BridgeMessage.from_json(payload)
+        message = decode_message(wire, secret=self.secret)
         if message.session_nonce != self.expected_nonce:
             raise ValueError("bridge session nonce mismatch")
         if message.sequence != self.next_sequence:
             raise ValueError("bridge sequence is stale, duplicate, or reordered")
         if self.next_sequence == 0 and message.kind != "handshake":
             raise ValueError("bridge handshake is required before samples")
-        if self.next_sequence > 0 and message.kind != "sample":
-            raise ValueError("bridge handshake may occur only once")
+        if self.next_sequence > 0 and message.kind not in {"sample", "ping"}:
+            raise ValueError("bridge client may send only samples or probes after the handshake")
         self.next_sequence += 1
         return message

@@ -6,14 +6,16 @@ from pathlib import Path
 import socket
 import stat
 import time
+from secrets import token_urlsafe
 from typing import Protocol
 
 from .leaders import DualLeaderReader, LeaderSample
-from .protocol import BridgeMessage, encode_message
+from .protocol import BridgeMessage, decode_message, encode_message
 
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18080
+RTT_REFRESH_INTERVAL_NS = 1_000_000_000
 
 
 def read_secret_file(path: Path) -> bytes:
@@ -30,6 +32,7 @@ def read_secret_file(path: Path) -> bytes:
 
 class _Socket(Protocol):
     def sendall(self, data: bytes) -> None: ...
+    def recv(self, size: int) -> bytes: ...
     def close(self) -> None: ...
 
 
@@ -59,7 +62,10 @@ class BridgeConnection:
         self.hz = hz
         self.sock = sock
         self.sequence = 0
+        self.sample_sequence = 1
         self.stop_requested = False
+        self._last_rtt_ns: int | None = None
+        self._rtt_measured_monotonic_ns: int | None = None
 
     def connect(self) -> None:
         if self.sock is None:
@@ -87,11 +93,64 @@ class BridgeConnection:
         )
         self.sequence = 1
 
+    def _read_exact(self, size: int) -> bytes:
+        if self.sock is None:
+            raise RuntimeError("bridge connection is not open")
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            chunk = self.sock.recv(remaining)
+            if not chunk:
+                raise ConnectionError("bridge receiver disconnected during RTT probe")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def refresh_rtt(self) -> int:
+        """Measure a nonce-bound RTT entirely on the client monotonic clock."""
+        if self.sequence == 0:
+            raise RuntimeError("bridge handshake must be sent before RTT probes")
+        probe_nonce = token_urlsafe(24)
+        sequence = self.sequence
+        started = time.monotonic_ns()
+        self._send(BridgeMessage.ping(self.session_nonce, sequence, probe_nonce))
+        self.sequence += 1
+        size = int.from_bytes(self._read_exact(4), "big")
+        if size > 64 * 1024:
+            raise ValueError("bridge RTT acknowledgement exceeds the maximum frame size")
+        body = self._read_exact(size)
+        acknowledgement = decode_message(size.to_bytes(4, "big") + body, secret=self.secret)
+        finished = time.monotonic_ns()
+        if (
+            acknowledgement.kind != "ack"
+            or acknowledgement.session_nonce != self.session_nonce
+            or acknowledgement.sequence != sequence
+            or acknowledgement.probe_nonce != probe_nonce
+        ):
+            raise ValueError("bridge RTT acknowledgement does not match the probe")
+        self._last_rtt_ns = finished - started
+        self._rtt_measured_monotonic_ns = finished
+        return self._last_rtt_ns
+
     def send_sample(self, sample: LeaderSample) -> None:
         if self.sequence == 0:
             raise RuntimeError("bridge handshake must be sent before samples")
-        self._send(BridgeMessage.sample(self.session_nonce, self.sequence, sample.monotonic_ns, sample.positions))
+        if self._last_rtt_ns is None or self._rtt_measured_monotonic_ns is None:
+            raise RuntimeError("bridge RTT must be measured before samples")
+        rtt_age_ns = time.monotonic_ns() - self._rtt_measured_monotonic_ns
+        self._send(
+            BridgeMessage.sample(
+                self.session_nonce,
+                self.sequence,
+                sample.monotonic_ns,
+                sample.positions,
+                sample_sequence=self.sample_sequence,
+                rtt_ns=self._last_rtt_ns,
+                rtt_age_ns=rtt_age_ns,
+            )
+        )
         self.sequence += 1
+        self.sample_sequence += 1
 
     def request_stop(self) -> None:
         self.stop_requested = True
@@ -115,6 +174,8 @@ def stream(reader: DualLeaderReader, connection: BridgeConnection, *, hz: int = 
     period_ns = int(1_000_000_000 / hz)
     deadline = time.monotonic_ns()
     while not connection.stop_requested:
+        if connection._rtt_measured_monotonic_ns is None or time.monotonic_ns() - connection._rtt_measured_monotonic_ns >= RTT_REFRESH_INTERVAL_NS:
+            connection.refresh_rtt()
         connection.send_sample(reader.read())
         deadline += period_ns
         sleep_until_monotonic_ns(deadline)
