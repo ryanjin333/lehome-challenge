@@ -308,7 +308,6 @@ def run_trial(
         "--garment_type", "custom", "--num_episodes", "1", "--max_steps", str(args.max_steps),
         "--garment_name", args.garment,
         "--seed", str(args.seed), "--task", args.task, "--device", args.device,
-        "--save_video", "--video_dir", str(args.output_root / "videos"),
     ]
     if args.headless:
         command.append("--headless")

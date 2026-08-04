@@ -258,10 +258,47 @@ def test_normal_trial_pins_one_assigned_garment_and_rejects_episode_id_reuse(tmp
     assert command[command.index("--garment_name") + 1] == "Pant_Long_Seen_0"
     assert command.count("--num_episodes") == 1
     assert command[command.index("--num_episodes") + 1] == "1"
+    # Per-episode immutable evidence is activated by the flywheel manifest;
+    # requesting generic evaluator video here would make every worker target
+    # the shared output_root/videos/{success,failure}/episode0_* paths.
+    assert "--save_video" not in command
+    assert "--video_dir" not in command
 
     conflicting = build_parser().parse_args([*base, "--garment", "Pant_Long_Seen_1"])
     with pytest.raises(ValueError, match="overwrite"):
         run_trial(conflicting)
+
+
+def test_parallel_flywheel_trial_commands_never_target_shared_legacy_videos(tmp_path, capsys) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    output_root = tmp_path / "run"
+    commands = []
+    manifests = []
+    for episode_id in ("parallel-worker-a", "parallel-worker-b"):
+        args = build_parser().parse_args([
+            "--policy-path", str(policy), "--policy-revision", "a" * 40,
+            "--episode-id", episode_id, "--policy-repo", "org/policy", "--policy-step", "1",
+            "--code-revision", "b" * 40, "--asset-revision", "c" * 40,
+            "--simulator-version", "isaac", "--garment", "Pant_Long_Seen_0",
+            "--category", "pant_long", "--release-stage", "seen",
+            "--policy-artifact-sha256", "d" * 64, "--image-identity", "sha256:image",
+            "--output-root", str(output_root), "--dry-run",
+        ])
+        assert run_trial(args) == 0
+        launched = __import__("json").loads(capsys.readouterr().out)
+        commands.append(launched["command"])
+        manifests.append(Path(launched["manifest"]))
+
+    # The manifest is what activates AutonomousRecorder's immutable raw/<id>/videos
+    # evidence; neither parallel worker may request generic episode0_* videos.
+    assert manifests == [
+        output_root / "flywheel-manifest-parallel-worker-a.json",
+        output_root / "flywheel-manifest-parallel-worker-b.json",
+    ]
+    assert all("--save_video" not in command for command in commands)
+    assert all("--video_dir" not in command for command in commands)
+    assert all(str(output_root / "videos") not in command for command in commands)
 
 
 def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(monkeypatch, tmp_path) -> None:
@@ -286,6 +323,8 @@ def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(
         identity = manifest["identity"]
         assert args.num_episodes == 1
         assert args.garment_name == identity["garment_name"] == manifest["garment"]
+        assert args.save_video is False
+        assert args.video_dir is None
         launched.append((args.garment_name, identity["episode_id"], args.num_episodes))
 
     utils = types.ModuleType("scripts.utils"); utils.__path__ = []
