@@ -237,6 +237,9 @@ class CollectorSession:
             except (ConnectionError, OSError, RuntimeError, ValueError):
                 # The receiver retains the fail-closed disconnect state. Do not
                 # print transport details that could reveal operator context.
+                if not self.bridge_server._cancel.is_set() and self.bridge_server.failure is None:
+                    self.bridge_server.failure = "bridge_listener_failed"
+                    self.bridge_server.receiver.close_connection()
                 return
 
         thread = threading.Thread(target=serve, name="lehome-bridge-receiver", daemon=True)

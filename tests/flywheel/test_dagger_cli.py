@@ -140,6 +140,42 @@ def test_collection_waits_for_an_authenticated_healthy_bridge_before_starting(tm
     assert receiver.current().eligible is False  # close is fail-closed after readiness
 
 
+def test_listener_runtime_failure_unblocks_bridge_readiness(tmp_path, monkeypatch) -> None:
+    value = prepare_session(arguments("--run-root", str(tmp_path / "practice")), secret_path=tmp_path / "bridge-session.secret")
+    serve_started = threading.Event()
+    readiness_done = threading.Event()
+    readiness_errors: list[BaseException] = []
+
+    def fail_runtime() -> None:
+        serve_started.set()
+        raise RuntimeError("unavailable verifier")
+
+    def wait_for_ready() -> None:
+        try:
+            value.wait_for_bridge_ready(poll_interval_s=0.001)
+        except BaseException as error:
+            readiness_errors.append(error)
+        finally:
+            readiness_done.set()
+
+    monkeypatch.setattr(value.bridge_server, "start", lambda: None)
+    monkeypatch.setattr(value.bridge_server, "serve_one_client", fail_runtime)
+    assert value.bridge_server.failure is None
+    value.start_listener()
+    waiter = threading.Thread(target=wait_for_ready)
+    waiter.start()
+    try:
+        assert serve_started.wait(timeout=1.0)
+        assert readiness_done.wait(timeout=0.2)
+        assert value.bridge_server.failure == "bridge_listener_failed"
+        assert len(readiness_errors) == 1
+        assert isinstance(readiness_errors[0], RuntimeError)
+        assert str(readiness_errors[0]) == "bridge listener failed before collection became ready"
+    finally:
+        value.close_listener()
+        waiter.join(timeout=1.0)
+
+
 def identity(name: str) -> EpisodeIdentity:
     return EpisodeIdentity(name, "repo", "a" * 40, 1, "b" * 40, "c" * 40, "isaac", "Pant_Long_Seen_0", "pant_long", "seen", 1, "fold the garment", "canonical")
 
