@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import importlib
 import json
+import pickle
 from pathlib import Path
 import sys
 import types
 
 import numpy as np
+import pytest
 
 
 def _load_policy_module():
@@ -151,3 +153,155 @@ def test_flatten_groot_action_chunk_rejects_non_contract_horizon():
         assert "horizon" in str(error)
     else:
         raise AssertionError("a non-16-step action chunk must be rejected")
+
+
+def _install_wire_fakes(monkeypatch):
+    """Provide msgpack/zmq fakes without requiring the Isaac runtime."""
+
+    msgpack = types.ModuleType("msgpack")
+    def packb(value, default=None, **_kwargs):
+        def visit(item):
+            if isinstance(item, dict):
+                return {key: visit(value) for key, value in item.items()}
+            if isinstance(item, list):
+                return [visit(entry) for entry in item]
+            if isinstance(item, np.ndarray):
+                return default(item)
+            return item
+        return pickle.dumps(visit(value))
+    msgpack.packb = packb
+    def unpackb(value, object_hook=None, **_kwargs):
+        def visit(item):
+            if isinstance(item, dict):
+                item = {key: visit(value) for key, value in item.items()}
+                return object_hook(item) if object_hook else item
+            if isinstance(item, list):
+                return [visit(entry) for entry in item]
+            return item
+        return visit(pickle.loads(value))
+    msgpack.unpackb = unpackb
+    zmq = types.ModuleType("zmq")
+    zmq.REQ = 1
+    zmq.LINGER = 2
+    zmq.SNDTIMEO = 3
+    zmq.RCVTIMEO = 4
+    zmq.Again = TimeoutError
+    monkeypatch.setitem(sys.modules, "msgpack", msgpack)
+    monkeypatch.setitem(sys.modules, "zmq", zmq)
+
+
+def test_policy_server_wire_round_trip_encodes_numpy_as_npy_without_pickle(monkeypatch):
+    _install_wire_fakes(monkeypatch)
+    module = _load_policy_module()
+    observation = {"state": np.arange(12, dtype=np.float32)}
+
+    packed = module.pack_policy_server_message(observation)
+    encoded = pickle.loads(packed)
+    assert encoded["state"]["__ndarray_class__"] is True
+    assert isinstance(encoded["state"]["as_npy"], bytes)
+
+    decoded = module.unpack_policy_server_message(packed)
+    assert decoded["state"].dtype == np.float32
+    np.testing.assert_array_equal(decoded["state"], observation["state"])
+
+
+def test_policy_server_client_recreates_req_socket_after_timeout_before_retry(monkeypatch):
+    _install_wire_fakes(monkeypatch)
+    module = _load_policy_module()
+
+    class Socket:
+        def __init__(self, outcome):
+            self.outcome = outcome
+            self.closed = False
+            self.connected = []
+
+        def setsockopt(self, *_args): pass
+        def connect(self, endpoint): self.connected.append(endpoint)
+        def send(self, _payload):
+            if self.outcome == "timeout":
+                raise TimeoutError("timed out")
+        def recv(self): return module.pack_policy_server_message({"status": "ok", "message": "Server is running"})
+        def close(self, *_args): self.closed = True
+
+    sockets = [Socket("timeout"), Socket("ok")]
+    client = module.PolicyServerClient(
+        "tcp://127.0.0.1:5000", "token", 1.0,
+        socket_factory=lambda: sockets.pop(0),
+    )
+    assert client.ping() is None
+    assert sockets == []
+
+
+def test_policy_server_client_sends_official_action_and_reset_envelopes(monkeypatch):
+    _install_wire_fakes(monkeypatch)
+    module = _load_policy_module()
+
+    class Socket:
+        def __init__(self): self.sent = []
+        def setsockopt(self, *_args): pass
+        def connect(self, _endpoint): pass
+        def send(self, payload): self.sent.append(module.unpack_policy_server_message(payload))
+        def recv(self): return module.pack_policy_server_message({})
+        def close(self, *_args, **_kwargs): pass
+
+    socket = Socket()
+    client = module.PolicyServerClient("tcp://127.0.0.1:5000", "bound-token", 1.0, socket_factory=lambda: socket)
+    client.reset()
+    assert socket.sent == [{"endpoint": "reset", "data": {"options": None}, "api_token": "bound-token"}]
+
+
+def test_server_policy_validates_reset_and_action_response_contract(monkeypatch):
+    _install_wire_fakes(monkeypatch)
+    module = _load_policy_module()
+
+    action = {
+        "action.left_arm": _chunk(1, 16, 5, 0),
+        "action.left_gripper": _chunk(1, 16, 1, 10),
+        "action.right_arm": _chunk(1, 16, 5, 20),
+        "action.right_gripper": _chunk(1, 16, 1, 30),
+    }
+
+    class Client:
+        def reset(self):
+            assert self.request("reset", {"options": None}) == {}
+
+        def get_action(self, data):
+            response = self.request("get_action", data)
+            assert isinstance(response, list) and len(response) == 2
+            return response[0], response[1]
+
+        def request(self, endpoint, data):
+            if endpoint == "reset":
+                assert data == {"options": None}
+            else:
+                assert endpoint == "get_action"
+                assert isinstance(data, dict)
+            return {} if endpoint == "reset" else [action, {"server": "ok"}]
+
+    policy = module.GrootServerPolicy.__new__(module.GrootServerPolicy)
+    policy._client = Client()
+    policy._action_queue = module.ActionChunkQueue()
+    policy.reset()
+    returned = policy.select_action_with_provenance({
+        "observation.state": np.zeros(12, dtype=np.float32),
+        **{f"observation.images.{camera}": np.zeros((2, 2, 3), dtype=np.uint8) for camera in ("top_rgb", "left_rgb", "right_rgb")},
+    })
+    assert returned.value.shape == (12,)
+    assert returned.chunk_offset == 0
+
+    malformed = dict(action)
+    malformed["action.left_arm"] = malformed["action.left_arm"].astype(np.float64)
+    with pytest.raises(ValueError, match="dtype or shape"):
+        module.validate_policy_server_action_chunk(malformed)
+    malformed = dict(action)
+    malformed["action.unexpected"] = np.zeros((1, 16, 1), dtype=np.float32)
+    with pytest.raises(ValueError, match="exactly"):
+        module.validate_policy_server_action_chunk(malformed)
+
+    policy._client = types.SimpleNamespace(get_action=lambda *_args: (_ for _ in ()).throw(RuntimeError("policy server error: invalid token")))
+    policy._action_queue.clear()
+    with pytest.raises(RuntimeError, match="server error"):
+        policy.select_action_with_provenance({
+            "observation.state": np.zeros(12, dtype=np.float32),
+            **{f"observation.images.{camera}": np.zeros((2, 2, 3), dtype=np.uint8) for camera in ("top_rgb", "left_rgb", "right_rgb")},
+        })

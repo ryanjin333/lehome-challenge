@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,151 @@ _ACTION_GROUPS = tuple(name for name, _ in _STATE_GROUPS)
 _ACTION_KEYS = tuple(f"action.{name}" for name in _ACTION_GROUPS)
 _ACTION_DIMENSION = 12
 _ACTION_HORIZON = 16
+_NDARRAY_MARKER = "__ndarray_class__"
+
+
+def _msgpack():
+    """Import the pinned wire dependency only for the server-backed policy."""
+
+    try:
+        import msgpack
+    except ImportError as error:
+        raise RuntimeError("groot_server requires pinned msgpack and pyzmq") from error
+    return msgpack
+
+
+def _encode_policy_server_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        stream = BytesIO()
+        np.save(stream, value, allow_pickle=False)
+        return {_NDARRAY_MARKER: True, "as_npy": stream.getvalue()}
+    raise TypeError(f"cannot encode {type(value)!r} for GR00T policy server")
+
+
+def _decode_policy_server_value(value: Any) -> Any:
+    if not isinstance(value, dict) or value.get(_NDARRAY_MARKER) is not True:
+        return value
+    if set(value) != {_NDARRAY_MARKER, "as_npy"} or not isinstance(value["as_npy"], bytes):
+        raise ValueError("policy server ndarray envelope is malformed")
+    try:
+        decoded = np.load(BytesIO(value["as_npy"]), allow_pickle=False)
+    except (OSError, ValueError) as error:
+        raise ValueError("policy server ndarray payload is invalid") from error
+    if not isinstance(decoded, np.ndarray) or decoded.dtype.hasobject:
+        raise ValueError("policy server ndarray payload is unsafe")
+    return decoded
+
+
+def pack_policy_server_message(value: Any) -> bytes:
+    """Match NVIDIA's PolicyServer msgpack/``.npy`` ndarray wire format."""
+
+    return _msgpack().packb(value, default=_encode_policy_server_value, use_bin_type=True)
+
+
+def unpack_policy_server_message(value: bytes) -> Any:
+    """Decode a PolicyServer message without allowing object deserialization."""
+
+    try:
+        return _msgpack().unpackb(value, raw=False, object_hook=_decode_policy_server_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("policy server response is not valid msgpack") from error
+
+
+class PolicyServerClient:
+    """Finite-timeout, REQ-safe client for NVIDIA's loopback PolicyServer."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        api_token: str,
+        timeout_seconds: float,
+        *,
+        socket_factory: Any | None = None,
+    ) -> None:
+        if not endpoint.startswith("tcp://127.0.0.1:"):
+            raise ValueError("policy server endpoint must use loopback TCP")
+        if not api_token:
+            raise ValueError("policy server API token is required")
+        if timeout_seconds <= 0:
+            raise ValueError("policy server request timeout must be positive")
+        self._endpoint = endpoint
+        self._api_token = api_token
+        self._timeout_milliseconds = max(1, round(timeout_seconds * 1000))
+        self._socket_factory = socket_factory or self._default_socket_factory
+        self._socket: Any | None = None
+
+    def _default_socket_factory(self) -> Any:
+        try:
+            import zmq
+        except ImportError as error:
+            raise RuntimeError("groot_server requires pinned msgpack and pyzmq") from error
+        return zmq.Context.instance().socket(zmq.REQ)
+
+    def _new_socket(self) -> Any:
+        try:
+            import zmq
+        except ImportError as error:
+            raise RuntimeError("groot_server requires pinned msgpack and pyzmq") from error
+        socket = self._socket_factory()
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.SNDTIMEO, self._timeout_milliseconds)
+        socket.setsockopt(zmq.RCVTIMEO, self._timeout_milliseconds)
+        socket.connect(self._endpoint)
+        self._socket = socket
+        return socket
+
+    def _discard_socket(self) -> None:
+        socket, self._socket = self._socket, None
+        if socket is not None:
+            try:
+                socket.close(linger=0)
+            except TypeError:  # narrow compatibility for minimal test doubles
+                socket.close()
+
+    def close(self) -> None:
+        self._discard_socket()
+
+    def request(self, endpoint: str, data: Any) -> Any:
+        """Retry once only after destroying the poisoned REQ socket."""
+
+        if not endpoint or not isinstance(endpoint, str):
+            raise ValueError("policy server endpoint name is required")
+        message = {"endpoint": endpoint, "data": data, "api_token": self._api_token}
+        for attempt in range(2):
+            socket = self._socket or self._new_socket()
+            try:
+                socket.send(pack_policy_server_message(message))
+                response = unpack_policy_server_message(socket.recv())
+                if isinstance(response, dict) and "error" in response:
+                    if set(response) != {"error"} or not isinstance(response["error"], str):
+                        raise ValueError("policy server error envelope is malformed")
+                    raise RuntimeError(f"policy server error: {response['error']}")
+                return response
+            except RuntimeError:
+                self._discard_socket()
+                raise
+            except Exception as error:
+                self._discard_socket()
+                if attempt:
+                    raise RuntimeError("policy server request failed after socket reset") from error
+        raise AssertionError("unreachable")
+
+    def ping(self) -> None:
+        if self.request("ping", {}) != {"status": "ok", "message": "Server is running"}:
+            raise ValueError("policy server ping response is invalid")
+
+    def reset(self) -> None:
+        if self.request("reset", {"options": None}) != {}:
+            raise ValueError("policy server reset response is invalid")
+
+    def get_action(self, observation: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        response = self.request("get_action", {"observation": observation, "options": None})
+        if not isinstance(response, list) or len(response) != 2:
+            raise ValueError("policy server action response must be [action, info]")
+        action, info = response
+        if not isinstance(action, Mapping) or not isinstance(info, Mapping):
+            raise ValueError("policy server action response has invalid members")
+        return action, info
 
 
 def _as_frame(value: Any, *, key: str) -> np.ndarray:
@@ -141,6 +287,21 @@ def flatten_groot_action(action: Mapping[str, Any]) -> np.ndarray:
     """Take the first predicted action step in the checked 12-D joint order."""
 
     return flatten_groot_action_chunk(action)[0]
+
+
+def validate_policy_server_action_chunk(action: Mapping[str, Any]) -> np.ndarray:
+    """Reject server responses that drift from the exact GR00T action wire contract."""
+
+    if set(action) != set(_ACTION_KEYS):
+        raise ValueError("policy server action keys must exactly match the GR00T contract")
+    for group, key in zip(_ACTION_GROUPS, _ACTION_KEYS, strict=True):
+        values = action.get(key)
+        expected_dimension = 5 if group.endswith("_arm") else 1
+        if not isinstance(values, np.ndarray):
+            raise ValueError(f"policy server action {key} must be an ndarray")
+        if values.dtype != np.float32 or values.shape != (1, _ACTION_HORIZON, expected_dimension):
+            raise ValueError(f"policy server action {key} has invalid dtype or shape")
+    return flatten_groot_action_chunk(action)
 
 
 class ActionChunkQueue:
@@ -281,11 +442,67 @@ class GrootPolicy(BasePolicy):
         return self._action_queue.pop_with_provenance_required()
 
 
+@PolicyRegistry.register("groot_server")
+class GrootServerPolicy(BasePolicy):
+    """GR00T policy adapter whose incompatible runtime remains out of Isaac."""
+
+    def __init__(
+        self,
+        *,
+        policy_server_endpoint: str,
+        policy_server_token_env: str,
+        policy_server_request_timeout: float,
+        task_description: str = _INSTRUCTION,
+        **_: Any,
+    ) -> None:
+        super().__init__()
+        if task_description != _INSTRUCTION:
+            raise ValueError("task_description differs from the checked GR00T contract")
+        if not policy_server_token_env:
+            raise ValueError("policy server token environment variable is required")
+        token = os.environ.get(policy_server_token_env, "")
+        self._client = PolicyServerClient(
+            policy_server_endpoint,
+            token,
+            policy_server_request_timeout,
+        )
+        self._action_queue = ActionChunkQueue()
+
+    def reset(self) -> None:
+        self._action_queue.clear()
+        self._client.reset()
+
+    def select_action(self, observation: Mapping[str, Any]) -> np.ndarray:
+        return self.select_action_with_provenance(observation).value
+
+    def select_action_with_provenance(self, observation: Mapping[str, Any]) -> QueuedAction:
+        queued_action = self._action_queue.pop_with_provenance()
+        if queued_action is not None:
+            return queued_action
+        request_id = uuid4().hex
+        inference_started = perf_counter_ns()
+        action, _info = self._client.get_action(build_groot_observation(observation))
+        inference_finished = perf_counter_ns()
+        action_chunk = validate_policy_server_action_chunk(action)
+        self._action_queue.extend(action_chunk, request_id=request_id)
+        _append_policy_telemetry(
+            request_id=request_id,
+            latency_seconds=(inference_finished - inference_started) / 1_000_000_000,
+            queue_depth_after_enqueue=self._action_queue.pending_count,
+        )
+        return self._action_queue.pop_with_provenance_required()
+
+
 __all__ = [
     "GrootPolicy",
+    "GrootServerPolicy",
+    "PolicyServerClient",
     "ActionChunkQueue",
     "QueuedAction",
     "build_groot_observation",
     "flatten_groot_action_chunk",
     "flatten_groot_action",
+    "validate_policy_server_action_chunk",
+    "pack_policy_server_message",
+    "unpack_policy_server_message",
 ]

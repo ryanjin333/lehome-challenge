@@ -423,6 +423,23 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
                 "task_description": args.task_description,
             }
         )
+    elif args.policy_type == "groot_server":
+        if not args.policy_path:
+            raise ValueError("--policy_path is required for groot_server policy type")
+        endpoint = getattr(args, "policy_server_endpoint", None)
+        token_env = getattr(args, "policy_server_token_env", None)
+        request_timeout = getattr(args, "policy_server_request_timeout", None)
+        if not endpoint or not token_env or request_timeout is None:
+            raise ValueError("groot_server requires the dedicated policy-server trial boundary")
+        policy_kwargs.update(
+            {
+                "model_path": args.policy_path,
+                "policy_server_endpoint": endpoint,
+                "policy_server_token_env": token_env,
+                "policy_server_request_timeout": request_timeout,
+                "task_description": args.task_description,
+            }
+        )
     else:
         # For custom policies, pass policy_path as model_path if provided
         if args.policy_path:

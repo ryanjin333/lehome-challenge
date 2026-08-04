@@ -7,6 +7,7 @@ requires-python = ">=3.11,<3.12"
 dependencies = [
     "isaacsim[all,extscache]==5.1.0",
     "lerobot==0.4.3",
+    "msgpack==1.1.0",
     "num2words>=0.5.14",
     "open3d>=0.19.0",
     "pinocchio>=0.4.3",
@@ -14,6 +15,7 @@ dependencies = [
     "torchvision==0.22.0",
     "transformers>=4.57.6",
     "transforms3d>=0.4.2",
+    "pyzmq==27.0.1",
 ]
 [tool.uv]
 required-environments = [
@@ -35,4 +37,3 @@ url = "https://pypi.org/simple"
 [[tool.uv.index]]
 name = "pytorch"
 url = "https://download.pytorch.org/whl/cu128"
-

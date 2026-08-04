@@ -9,8 +9,13 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
+import signal
+import socket
+from stat import S_ISREG
 import subprocess
 import sys
+import time
 from typing import Callable, Sequence
 
 import numpy as np
@@ -22,6 +27,275 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OCI_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SHARD_NAME = re.compile(r"^model-([0-9]{5})-of-([0-9]{5})\.safetensors$")
 _RUNTIME_ASSET_DIRECTORIES = ("objects", "robots", "scenes", "textures")
+_POLICY_SERVER_TOKEN_ENV = "LEHOME_GROOT_POLICY_API_TOKEN"
+_PYTHON310 = re.compile(r"^Python (3\.10\.[0-9]+)$")
+_ISAAC_PHYSICAL_CUDA_DEVICE = re.compile(r"^cuda:([0-9]+)$")
+
+
+def _checked_run(command: Sequence[str], *, runner: Callable[..., object]) -> object:
+    try:
+        return runner(tuple(command), check=False, capture_output=True, text=True)
+    except OSError as error:
+        raise ValueError("policy server runtime command could not be executed") from error
+
+
+def validate_policy_server_runtime(
+    args: argparse.Namespace,
+    *,
+    runner: Callable[..., object] = subprocess.run,
+) -> dict[str, str]:
+    """Prove that the child interpreter imports only the declared GR00T checkout."""
+
+    root = Path(args.groot_root)
+    interpreter = Path(args.groot_python)
+    if root.is_symlink() or not root.is_dir() or not (root / "gr00t").is_dir():
+        raise ValueError("GR00T root must be a materialized Git checkout")
+    if interpreter.is_symlink() or not interpreter.exists() or not S_ISREG(interpreter.stat().st_mode) or not os.access(interpreter, os.X_OK):
+        raise ValueError("GR00T Python interpreter must be a regular executable")
+    top = _checked_run(("git", "-C", str(root), "rev-parse", "--show-toplevel"), runner=runner)
+    head = _checked_run(("git", "-C", str(root), "rev-parse", "HEAD"), runner=runner)
+    status = _checked_run(("git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"), runner=runner)
+    if (
+        getattr(top, "returncode", 1) != 0
+        or Path(getattr(top, "stdout", "").strip()).resolve() != root.resolve()
+        or getattr(head, "returncode", 1) != 0
+        or getattr(head, "stdout", "").strip() != args.groot_revision
+        or getattr(status, "returncode", 1) != 0
+        or getattr(status, "stdout", "")
+    ):
+        raise ValueError("GR00T root must be a clean materialized Git checkout at the declared revision")
+    version = _checked_run((str(interpreter), "--version"), runner=runner)
+    version_match = _PYTHON310.fullmatch(getattr(version, "stdout", "").strip())
+    if getattr(version, "returncode", 1) != 0 or version_match is None:
+        raise ValueError("GR00T interpreter must report Python 3.10")
+    imported = _checked_run(
+        (str(interpreter), "-c", "import gr00t; print(gr00t.__file__)"),
+        runner=runner,
+    )
+    try:
+        imported_path = Path(getattr(imported, "stdout", "").strip()).resolve()
+        from_declared_checkout = imported_path.is_relative_to(root.resolve())
+    except (OSError, ValueError):
+        from_declared_checkout = False
+    if getattr(imported, "returncode", 1) != 0 or not from_declared_checkout:
+        raise ValueError("GR00T interpreter does not import gr00t from the declared checkout")
+    return {
+        "groot_revision": args.groot_revision,
+        "python_version": version_match.group(1),
+        "python_path": str(interpreter),
+    }
+
+
+def _require_free_loopback_port(port: int) -> None:
+    if not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("policy server port must be in 1..65535")
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError as error:
+        raise ValueError("policy server loopback port is already in use") from error
+    finally:
+        probe.close()
+
+
+def _physical_gpu_from_device(device: str) -> str:
+    match = _ISAAC_PHYSICAL_CUDA_DEVICE.fullmatch(device)
+    if match is None:
+        raise ValueError("production policy-server trials require --device cuda:<physical GPU>")
+    return match.group(1)
+
+
+class ParentCudaVisibility:
+    """Keep CUDA visibility out of Isaac while restoring the caller's environment."""
+
+    def __init__(self) -> None:
+        self._previous = os.environ.get("CUDA_VISIBLE_DEVICES")
+        self._had_previous = "CUDA_VISIBLE_DEVICES" in os.environ
+
+    def clear(self) -> None:
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+    def restore(self) -> None:
+        if self._had_previous:
+            if self._previous is None:  # pragma: no cover - defensive for unusual mappings.
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = self._previous
+        else:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+
+class ParentPolicyToken:
+    """Scope the child token around local ``groot_server`` policy construction."""
+
+    def __init__(self, variable: str, token: str) -> None:
+        self._variable = variable
+        self._token = token
+        self._previous = os.environ.get(variable)
+        self._had_previous = variable in os.environ
+
+    def install(self) -> None:
+        os.environ[self._variable] = self._token
+
+    def restore(self) -> None:
+        if self._had_previous:
+            if self._previous is None:  # pragma: no cover - defensive for unusual mappings.
+                os.environ.pop(self._variable, None)
+            else:
+                os.environ[self._variable] = self._previous
+        else:
+            os.environ.pop(self._variable, None)
+
+
+def build_policy_server_command(args: argparse.Namespace) -> list[str]:
+    """Build the token-free child command recorded in the immutable receipt."""
+
+    return [
+        str(args.groot_python), str(Path(__file__).with_name("run_groot_policy_server.py")),
+        "--model-path", str(args.policy_path), "--host", "127.0.0.1",
+        "--port", str(args.policy_server_port), "--api-token-env", _POLICY_SERVER_TOKEN_ENV,
+    ]
+
+
+def write_policy_server_receipt(
+    args: argparse.Namespace,
+    *,
+    groot_revision: str,
+    python_version: str,
+    command: Sequence[str],
+) -> Path:
+    """Persist the launch boundary before Isaac can allocate the GPU."""
+
+    args.output_root.mkdir(parents=True, exist_ok=True)
+    suffix = f"-{args.episode_id}" if args.episode_id else ""
+    path = args.output_root / f"policy-server-receipt{suffix}.json"
+    payload = {
+        "schema_version": 1,
+        "groot_revision": groot_revision,
+        "python_version": python_version,
+        "python_path": str(args.groot_python),
+        "host": "127.0.0.1",
+        "port": args.policy_server_port,
+        "command": list(command),
+        "request_timeout_seconds": args.policy_server_request_timeout,
+        "readiness_timeout_seconds": args.policy_server_readiness_timeout,
+        "checkpoint_revision": getattr(args, "policy_revision", None),
+        "checkpoint_digest": args.policy_artifact_sha256,
+        "code_revision": args.code_revision,
+        "image_identity": args.image_identity,
+    }
+    content = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file() or path.read_text(encoding="utf-8") != content:
+            raise ValueError("refusing to overwrite differing policy server receipt")
+        return path
+    atomic_write_json(path, payload)
+    return path
+
+
+class PolicyServerSupervisor:
+    """Own the server process group and restore host signal handling on exit."""
+
+    def __init__(self, process: object, *, termination_grace: float, killpg=os.killpg) -> None:
+        self.process = process
+        self.termination_grace = termination_grace
+        self._killpg = killpg
+        self._closed = False
+        self._previous_handlers: dict[int, object] = {}
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.process.poll() is not None:
+            self.process.wait(timeout=0)
+            return
+        self._killpg(self.process.pid, signal.SIGTERM)
+        try:
+            self.process.wait(timeout=self.termination_grace)
+            return
+        except subprocess.TimeoutExpired:
+            self._killpg(self.process.pid, signal.SIGKILL)
+        self.process.wait(timeout=self.termination_grace)
+
+    def _signal_handler(self, signum: int, _frame: object) -> None:
+        self.close()
+        self.restore_signal_handlers()
+        raise SystemExit(128 + signum)
+
+    def install_signal_handlers(self) -> None:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            self._previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, self._signal_handler)
+
+    def restore_signal_handlers(self) -> None:
+        for signum, handler in self._previous_handlers.items():
+            signal.signal(signum, handler)
+        self._previous_handlers.clear()
+
+
+def _spawn_policy_server(
+    args: argparse.Namespace,
+    *,
+    token: str,
+    command: Sequence[str],
+    physical_gpu: str,
+) -> PolicyServerSupervisor:
+    log_path = Path(args.policy_server_log)
+    if log_path.is_symlink() or log_path.exists():
+        raise ValueError("policy server log must be a new exclusive regular file")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(log_path, flags, 0o600)
+    child_environment = dict(os.environ)
+    child_environment[_POLICY_SERVER_TOKEN_ENV] = token
+    child_environment["CUDA_VISIBLE_DEVICES"] = physical_gpu
+    try:
+        process = subprocess.Popen(
+            list(command), stdin=subprocess.DEVNULL, stdout=fd, stderr=subprocess.STDOUT,
+            env=child_environment, start_new_session=True, close_fds=True,
+        )
+    finally:
+        os.close(fd)
+    return PolicyServerSupervisor(process, termination_grace=args.policy_server_termination_grace)
+
+
+def _await_policy_server_ready(
+    supervisor: PolicyServerSupervisor,
+    *,
+    port: int,
+    token: str,
+    readiness_timeout: float,
+    request_timeout: float,
+    client_factory: Callable[..., object] | None = None,
+) -> None:
+    deadline = time.monotonic() + readiness_timeout
+    delay = 0.05
+    while True:
+        if supervisor.process.poll() is not None:
+            raise RuntimeError("GR00T policy server exited before readiness")
+        if client_factory is None:
+            from scripts.eval_policy.groot_policy import PolicyServerClient
+            factory = PolicyServerClient
+        else:
+            factory = client_factory
+        client = factory(f"tcp://127.0.0.1:{port}", token, request_timeout)
+        try:
+            client.ping()
+            if supervisor.process.poll() is None:
+                return
+        except Exception:
+            pass
+        finally:
+            if hasattr(client, "close"):
+                client.close()
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError("GR00T policy server did not pass token-bound readiness")
+        time.sleep(min(delay, max(0.0, deadline - now)))
+        delay = min(delay * 2, 0.5)
 
 
 def _code_checkout_root() -> Path:
@@ -227,6 +501,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--release-stage", choices=("seen", "public_unseen"))
     parser.add_argument("--policy-artifact-sha256")
     parser.add_argument("--image-identity")
+    parser.add_argument("--groot-root", type=Path)
+    parser.add_argument("--groot-revision")
+    parser.add_argument("--groot-python", type=Path)
+    parser.add_argument("--policy-server-port", type=int)
+    parser.add_argument("--policy-server-readiness-timeout", type=float)
+    parser.add_argument("--policy-server-request-timeout", type=float)
+    parser.add_argument("--policy-server-termination-grace", type=float)
+    parser.add_argument("--policy-server-log", type=Path)
     parser.add_argument(
         "--release-assets-root",
         type=Path,
@@ -268,6 +550,23 @@ def validate_args(args: argparse.Namespace) -> str:
         build_identity(args, revision)
         if not args.dry_run:
             _validate_declared_production_provenance(args)
+            required_server_values = (
+                args.groot_root, args.groot_revision, args.groot_python,
+                args.policy_server_port, args.policy_server_readiness_timeout,
+                args.policy_server_request_timeout, args.policy_server_termination_grace,
+                args.policy_server_log,
+            )
+            if any(value is None for value in required_server_values):
+                raise ValueError("production flywheel trials require pinned GR00T policy server arguments")
+            if not _PINNED.fullmatch(args.groot_revision):
+                raise ValueError("GR00T revision must be a pinned 40-character SHA")
+            if (
+                args.policy_server_readiness_timeout <= 0
+                or args.policy_server_request_timeout <= 0
+                or args.policy_server_termination_grace <= 0
+            ):
+                raise ValueError("policy server timeouts and termination grace must be positive")
+            _physical_gpu_from_device(args.device)
     return revision or ""
 
 
@@ -519,7 +818,7 @@ def run_trial(
         finally:
             common.close_app(app)
     command = [
-        "--policy_type", "groot", "--policy_path", str(args.policy_path),
+        "--policy_type", "groot_server", "--policy_path", str(args.policy_path),
         "--garment_type", "custom", "--num_episodes", "1", "--max_steps", str(args.max_steps),
         "--garment_name", args.garment,
         "--seed", str(args.seed), "--task", args.task, "--device", args.device,
@@ -536,14 +835,65 @@ def run_trial(
     from scripts.utils import common
     from scripts.utils.parser import setup_eval_parser
 
-    parser = setup_eval_parser()
-    AppLauncher.add_app_launcher_args(parser)
-    evaluation_args = parser.parse_args(command)
     # Code, checkpoint, and OCI identity are available before Isaac allocates
     # GPU resources, so reject a mislabeled invocation before simulator startup.
     execution_identity_validator(args)
-    simulation_app = common.launch_app_from_args(evaluation_args)
+    server_runtime = validate_policy_server_runtime(args)
+    _require_free_loopback_port(args.policy_server_port)
+    server_command = build_policy_server_command(args)
+    write_policy_server_receipt(
+        args,
+        groot_revision=server_runtime["groot_revision"],
+        python_version=server_runtime["python_version"],
+        command=server_command,
+    )
+    # The token crosses exactly one boundary: this parent's private environment
+    # into the child; it is never an argv component, receipt field, or log line.
+    api_token = secrets.token_urlsafe(48)
+    physical_gpu = _physical_gpu_from_device(args.device)
+    blocked_signals = {signal.SIGINT, signal.SIGTERM}
+    previous_signal_mask = None
+    if hasattr(signal, "pthread_sigmask"):
+        previous_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+    supervisor = None
     try:
+        supervisor = _spawn_policy_server(
+            args, token=api_token, command=server_command, physical_gpu=physical_gpu,
+        )
+        supervisor.install_signal_handlers()
+    except BaseException:
+        if supervisor is not None:
+            try:
+                supervisor.close()
+            finally:
+                supervisor.restore_signal_handlers()
+        raise
+    finally:
+        if previous_signal_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+    if supervisor is None:  # pragma: no cover - defensive for unusual process factories.
+        raise RuntimeError("GR00T policy server supervisor was not created")
+    simulation_app = None
+    cuda_visibility = ParentCudaVisibility()
+    parent_policy_token = ParentPolicyToken(_POLICY_SERVER_TOKEN_ENV, api_token)
+    try:
+        _await_policy_server_ready(
+            supervisor,
+            port=args.policy_server_port,
+            token=api_token,
+            readiness_timeout=args.policy_server_readiness_timeout,
+            request_timeout=args.policy_server_request_timeout,
+        )
+        parent_policy_token.install()
+        parser = setup_eval_parser()
+        AppLauncher.add_app_launcher_args(parser)
+        evaluation_args = parser.parse_args(command)
+        evaluation_args.policy_server_endpoint = f"tcp://127.0.0.1:{args.policy_server_port}"
+        evaluation_args.policy_server_token_env = _POLICY_SERVER_TOKEN_ENV
+        evaluation_args.policy_server_request_timeout = args.policy_server_request_timeout
+        evaluation_args.multi_gpu = False
+        cuda_visibility.clear()
+        simulation_app = common.launch_app_from_args(evaluation_args)
         _validate_live_runtime_identity(
             args,
             simulation_app,
@@ -556,7 +906,18 @@ def run_trial(
 
         evaluate(evaluation_args, simulation_app)
     finally:
-        common.close_app(simulation_app)
+        try:
+            if simulation_app is not None:
+                common.close_app(simulation_app)
+        finally:
+            try:
+                parent_policy_token.restore()
+            finally:
+                cuda_visibility.restore()
+                try:
+                    supervisor.close()
+                finally:
+                    supervisor.restore_signal_handlers()
     return 0
 
 

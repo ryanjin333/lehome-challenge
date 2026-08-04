@@ -8,7 +8,10 @@ import argparse
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
 import types
 
@@ -648,7 +651,20 @@ def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(
         "--release-assets-root", str(tmp_path / "asset-checkout" / "Release"),
         "--category", "pant_long", "--release-stage", "seen", "--policy-artifact-sha256", "d" * 64,
         "--image-identity", "sha256:" + "e" * 64, "--output-root", str(tmp_path / "run"),
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "f" * 40,
+        "--groot-python", str(tmp_path / "python3.10"), "--policy-server-port", "5511",
+        "--policy-server-readiness-timeout", "1", "--policy-server-request-timeout", "1",
+        "--policy-server-termination-grace", "1", "--policy-server-log", str(tmp_path / "server.log"),
+        "--device", "cuda:0",
     ])
+    monkeypatch.setattr(trial_module, "validate_policy_server_runtime", lambda _args: {"groot_revision": "f" * 40, "python_version": "3.10.18", "python_path": "python"})
+    monkeypatch.setattr(trial_module, "_require_free_loopback_port", lambda _port: None)
+    monkeypatch.setattr(trial_module, "_await_policy_server_ready", lambda *_args, **_kwargs: None)
+    class Supervisor:
+        def install_signal_handlers(self): pass
+        def close(self): pass
+        def restore_signal_handlers(self): pass
+    monkeypatch.setattr(trial_module, "_spawn_policy_server", lambda *_args, **_kwargs: Supervisor())
     with pytest.raises(ValueError, match="simulator version"):
         run_trial(
             args,
@@ -724,3 +740,244 @@ def test_real_evaluation_rejects_manifest_environment_garment_mismatch_before_re
     )
     with pytest.raises(ValueError, match="active environment garment"):
         evaluation._validate_active_flywheel_garment(wrong_loaded_object, identity)
+
+
+def test_policy_server_command_and_receipt_omit_the_api_token(tmp_path) -> None:
+    args = argparse.Namespace(
+        groot_python=tmp_path / "python3.10",
+        policy_path=tmp_path / "policy",
+        policy_server_port=5511,
+        policy_server_request_timeout=2.5,
+        policy_server_readiness_timeout=30.0,
+        code_revision="a" * 40,
+        policy_artifact_sha256="b" * 64,
+        image_identity="sha256:" + "c" * 64,
+        output_root=tmp_path,
+        episode_id="server-boundary",
+    )
+    token = "token-" + "x" * 48
+    command = trial_module.build_policy_server_command(args)
+    assert token not in " ".join(command)
+    assert "--api-token-env" in command
+    receipt = trial_module.write_policy_server_receipt(
+        args,
+        groot_revision="d" * 40,
+        python_version="3.10.18",
+        command=command,
+    )
+    content = receipt.read_text(encoding="utf-8")
+    assert token not in content
+    assert json.loads(content)["host"] == "127.0.0.1"
+
+
+def test_policy_server_runtime_validation_requires_clean_checkout_and_python310(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "Isaac-GR00T"
+    package = root / "gr00t"
+    package.mkdir(parents=True)
+    interpreter = tmp_path / "python3.10"
+    interpreter.write_text("#!/bin/sh\n", encoding="utf-8")
+    interpreter.chmod(0o755)
+    args = argparse.Namespace(groot_root=root, groot_revision="a" * 40, groot_python=interpreter)
+
+    def runner(command, **_kwargs):
+        if command[-1] == "--show-toplevel":
+            return types.SimpleNamespace(returncode=0, stdout=str(root) + "\n")
+        if command[-1] == "HEAD":
+            return types.SimpleNamespace(returncode=0, stdout="a" * 40 + "\n")
+        if command[-1] == "--untracked-files=all":
+            return types.SimpleNamespace(returncode=0, stdout="")
+        if command[-1] == "--version":
+            return types.SimpleNamespace(returncode=0, stdout="Python 3.10.18\n")
+        return types.SimpleNamespace(returncode=0, stdout=str(package / "__init__.py") + "\n")
+
+    runtime = trial_module.validate_policy_server_runtime(args, runner=runner)
+    assert runtime == {"groot_revision": "a" * 40, "python_version": "3.10.18", "python_path": str(interpreter)}
+
+    def dirty_runner(command, **kwargs):
+        result = runner(command, **kwargs)
+        if command[-1] == "--untracked-files=all":
+            return types.SimpleNamespace(returncode=0, stdout="M gr00t/policy.py\n")
+        return result
+    with pytest.raises(ValueError, match="clean"):
+        trial_module.validate_policy_server_runtime(args, runner=dirty_runner)
+
+
+def test_policy_server_supervisor_reaps_after_term_then_kill_and_signal(monkeypatch) -> None:
+    events = []
+
+    class Process:
+        pid = 4242
+        def poll(self): return None
+        def wait(self, timeout):
+            events.append(("wait", timeout))
+            if len([event for event in events if event[0] == "wait"]) == 1:
+                raise subprocess.TimeoutExpired("server", timeout)
+            return 0
+
+    process = Process()
+    supervisor = trial_module.PolicyServerSupervisor(
+        process, termination_grace=0.1,
+        killpg=lambda pid, sig: events.append((pid, sig)),
+    )
+    supervisor.install_signal_handlers()
+    with pytest.raises(SystemExit, match="143"):
+        supervisor._signal_handler(signal.SIGTERM, None)
+    supervisor.restore_signal_handlers()
+    assert events == [
+        (4242, signal.SIGTERM), ("wait", 0.1),
+        (4242, signal.SIGKILL), ("wait", 0.1),
+    ]
+
+
+def test_policy_server_child_isolated_to_physical_gpu_and_parent_visibility_restores(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    class Process:
+        pid = 7
+        def poll(self): return 0
+        def wait(self, timeout): return 0
+
+    def popen(_command, **kwargs):
+        captured.update(kwargs)
+        return Process()
+
+    args = argparse.Namespace(
+        policy_server_log=tmp_path / "server.log",
+        policy_server_termination_grace=1.0,
+    )
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+    monkeypatch.setattr(trial_module.subprocess, "Popen", popen)
+    supervisor = trial_module._spawn_policy_server(
+        args, token="x" * 48, command=["python", "server.py"], physical_gpu="2",
+    )
+    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "2"
+    assert captured["env"]["LEHOME_GROOT_POLICY_API_TOKEN"] == "x" * 48
+    assert "x" * 48 not in args.policy_server_log.read_text(encoding="utf-8")
+    parent = trial_module.ParentCudaVisibility()
+    parent.clear()
+    assert "CUDA_VISIBLE_DEVICES" not in os.environ
+    parent.restore()
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    supervisor.close()
+
+
+def test_readiness_rejects_early_child_exit_and_binds_the_generated_token() -> None:
+    class Exited:
+        def poll(self): return 17
+    with pytest.raises(RuntimeError, match="exited before readiness"):
+        trial_module._await_policy_server_ready(
+            types.SimpleNamespace(process=Exited()), port=5511, token="bound-token",
+            readiness_timeout=1, request_timeout=1,
+        )
+
+    class Alive:
+        def poll(self): return None
+    received = []
+    class Client:
+        def __init__(self, endpoint, token, timeout): received.append((endpoint, token, timeout))
+        def ping(self): pass
+        def close(self): pass
+    trial_module._await_policy_server_ready(
+        types.SimpleNamespace(process=Alive()), port=5511, token="bound-token",
+        readiness_timeout=1, request_timeout=2.5, client_factory=Client,
+    )
+    assert received == [("tcp://127.0.0.1:5511", "bound-token", 2.5)]
+
+
+def test_scoped_parent_token_reaches_the_real_groot_server_evaluation_construction(monkeypatch, tmp_path) -> None:
+    token_env = "LEHOME_GROOT_POLICY_API_TOKEN"
+    token = "token-" + "z" * 48
+    received = {}
+    package = types.ModuleType("scripts.utils")
+    package.__path__ = [str(Path(__file__).resolve().parents[2] / "scripts" / "utils")]
+
+    class Registry:
+        @staticmethod
+        def is_registered(name): return name == "groot_server"
+        @staticmethod
+        def list_policies(): return ["groot_server"]
+        @staticmethod
+        def create(name, **kwargs):
+            received.update({"name": name, "token": os.environ[kwargs["policy_server_token_env"]], "kwargs": kwargs})
+            return object()
+
+    class Environment:
+        def initialize_obs(self): pass
+        def close(self): pass
+
+    modules = {
+        "scripts.utils": package,
+        "gymnasium": types.SimpleNamespace(make=lambda *_args, **_kwargs: types.SimpleNamespace(unwrapped=Environment())),
+        "torch": types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: True)),
+        "isaaclab": types.ModuleType("isaaclab"),
+        "isaaclab.envs": types.ModuleType("isaaclab.envs"),
+        "isaaclab_tasks": types.ModuleType("isaaclab_tasks"),
+        "isaaclab_tasks.utils": types.ModuleType("isaaclab_tasks.utils"),
+        "scripts.eval_policy": types.ModuleType("scripts.eval_policy"),
+        "scripts.eval_policy.base_policy": types.ModuleType("scripts.eval_policy.base_policy"),
+        "scripts.utils.eval_utils": types.ModuleType("scripts.utils.eval_utils"),
+        "lehome.utils.record": types.ModuleType("lehome.utils.record"),
+        "lerobot": types.ModuleType("lerobot"),
+        "lerobot.datasets": types.ModuleType("lerobot.datasets"),
+        "lerobot.datasets.lerobot_dataset": types.ModuleType("lerobot.datasets.lerobot_dataset"),
+        "scripts.utils.common": types.ModuleType("scripts.utils.common"),
+        "lehome.utils.logger": types.ModuleType("lehome.utils.logger"),
+    }
+    modules["isaaclab.envs"].DirectRLEnv = object
+    modules["isaaclab_tasks.utils"].parse_env_cfg = lambda *_args, **_kwargs: types.SimpleNamespace(sim=types.SimpleNamespace(), garment_cfg_base_path=None, particle_cfg_path=None)
+    modules["scripts.eval_policy"].PolicyRegistry = Registry
+    modules["scripts.eval_policy.base_policy"].BasePolicy = object
+    modules["scripts.utils.eval_utils"].convert_ee_pose_to_joints = lambda *_args: None
+    modules["scripts.utils.eval_utils"].save_videos_from_observations = lambda *_args: None
+    modules["scripts.utils.eval_utils"].calculate_and_print_metrics = lambda *_args: None
+    modules["lehome.utils.record"].RateLimiter = object
+    modules["lehome.utils.record"].get_next_experiment_path_with_gap = lambda *_args: None
+    modules["lehome.utils.record"].append_episode_initial_pose = lambda *_args: None
+    modules["lerobot.datasets.lerobot_dataset"].LeRobotDataset = object
+    modules["scripts.utils.common"].stabilize_garment_after_reset = lambda *_args: None
+    modules["lehome.utils.logger"].get_logger = lambda *_args: types.SimpleNamespace(info=lambda *_args: None)
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.delitem(sys.modules, "scripts.utils.evaluation", raising=False)
+    evaluation = importlib.import_module("scripts.utils.evaluation")
+    monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **_kwargs: [])
+    release = tmp_path / "Release"; release.mkdir()
+    (release / "Release_test_list.txt").write_text("Top_Long_Seen_0\n", encoding="utf-8")
+    args = argparse.Namespace(
+        flywheel_manifest=None, task="LeHome-BiSO101", device="cuda:0", use_random_seed=False,
+        seed=1, garment_cfg_base_path=str(tmp_path), particle_cfg_path="particles", policy_type="groot_server",
+        policy_path="/checkpoint", policy_server_endpoint="tcp://127.0.0.1:5511",
+        policy_server_token_env=token_env, policy_server_request_timeout=1.0,
+        task_description="fold the garment on the table", use_ee_pose=False, garment_type="custom",
+    )
+    monkeypatch.setenv(token_env, "prior-token")
+    scoped = trial_module.ParentPolicyToken(token_env, token)
+    scoped.install()
+    try:
+        evaluation.eval(args, object())
+    finally:
+        scoped.restore()
+    assert received["name"] == "groot_server"
+    assert received["token"] == token
+    assert os.environ[token_env] == "prior-token"
+
+
+def test_policy_server_child_unblocks_sigterm_before_runtime_load(tmp_path) -> None:
+    program = (
+        "import signal, time; "
+        "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM}); "
+        "from scripts.run_groot_policy_server import unblock_termination_signals; "
+        "unblock_termination_signals(); print('ready', flush=True); time.sleep(30)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", program], cwd=Path(__file__).resolve().parents[2],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        assert process.stdout.readline().strip() == "ready"
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=3) == -signal.SIGTERM
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=3)
