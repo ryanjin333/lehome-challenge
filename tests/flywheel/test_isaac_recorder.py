@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from lehome.flywheel.isaac_recorder import AutonomousRecorder, MixedSourceRecorder
+from lehome.flywheel.isaac_recorder import AutonomousRecorder, CANONICAL_VIDEO_FILENAMES, MixedSourceRecorder
 from lehome.flywheel.snapshots import Snapshot
 from lehome.flywheel.models import ActionSource, EpisodeIdentity, EpisodeOutcome, QualityGrade, RejectionReason
 
@@ -119,6 +119,36 @@ def test_mixed_recorder_encoder_failure_forces_diagnostic_zero_targets(tmp_path,
     assert result.episode["trainable"] is False
     assert result.episode["bc_target_count"] == 0
     assert "video_encoding_failed" in result.episode["diagnostic_reasons"]
+
+
+def test_autonomous_encoder_failure_fails_finalization_without_publishing_a_video_less_artifact(tmp_path, monkeypatch) -> None:
+    recorder = AutonomousRecorder.for_test(tmp_path, policy_revision="a" * 40)
+    recorder.record_step(observation(), np.ones(12), reward=1.0, success=True, request_id="r1", chunk_offset=0)
+    monkeypatch.setattr(recorder.video_sink, "encode", lambda root, fps=30: (_ for _ in ()).throw(RuntimeError("encoder failed")))
+
+    with pytest.raises(RuntimeError, match="encoder failed"):
+        recorder.finish(reason="success", accepted_success=True)
+
+    assert recorder.writer.staging.is_dir()
+    assert not (tmp_path / "raw" / "episode-test").exists()
+
+
+def test_autonomous_timeout_publishes_every_canonical_video_for_campaign_completion(tmp_path, monkeypatch) -> None:
+    recorder = AutonomousRecorder.for_test(tmp_path, policy_revision="a" * 40)
+    recorder.record_step(observation(), np.ones(12), reward=0.0, success=False, request_id="r1", chunk_offset=0)
+
+    def encode(root, *, fps=30):
+        videos = root / "videos"
+        videos.mkdir()
+        for filename in CANONICAL_VIDEO_FILENAMES:
+            (videos / filename).write_bytes(b"video")
+        return CANONICAL_VIDEO_FILENAMES
+
+    monkeypatch.setattr(recorder.video_sink, "encode", encode)
+    result = recorder.finish(reason="horizon", accepted_success=False)
+
+    assert result.episode["outcome"] == "timeout"
+    assert all((result.path / "videos" / filename).is_file() for filename in CANONICAL_VIDEO_FILENAMES)
 
 
 def test_mixed_recorder_transport_rejection_cannot_be_trainable(tmp_path, monkeypatch) -> None:

@@ -76,9 +76,10 @@ and keep its Release tree clean:
 
 ```bash
 ASSET_REV=bea65fd960ad5a1bb3bd3fa77164b28001c08ef9
-git clone https://huggingface.co/datasets/lehome/asset_challenge /workspace/lehome-release-assets
+git lfs version
+git lfs install
+git clone --no-checkout https://huggingface.co/datasets/lehome/asset_challenge /workspace/lehome-release-assets
 cd /workspace/lehome-release-assets
-git lfs install --local
 git checkout --detach "$ASSET_REV"
 git lfs pull
 test "$(git rev-parse HEAD)" = "$ASSET_REV"

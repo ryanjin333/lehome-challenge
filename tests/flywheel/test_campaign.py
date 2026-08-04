@@ -6,6 +6,7 @@ import subprocess
 import pytest
 
 from lehome.flywheel.artifacts import EpisodeArtifactWriter
+from lehome.flywheel.isaac_recorder import CANONICAL_VIDEO_FILENAMES
 from lehome.flywheel.matrix import Trial, build_public_matrix, matrix_sha256
 from scripts.run_groot_flywheel_campaign import (
     CampaignState,
@@ -21,13 +22,66 @@ from scripts.run_groot_flywheel_campaign import (
 def campaign_state_with_completed_trial(tmp_path, trial_id: str) -> CampaignState:
     writer = EpisodeArtifactWriter(tmp_path, trial_id)
     writer.append_annotation({"step": 0, "action_source": "policy"})
-    writer.finalize({"terminal_reason": "horizon", "outcome": "timeout"})
+    videos = writer.staging / "videos"
+    videos.mkdir()
+    for filename in CANONICAL_VIDEO_FILENAMES:
+        (videos / filename).write_bytes(b"video")
+    writer.finalize(
+        {"terminal_reason": "horizon", "outcome": "timeout"},
+        required_videos=CANONICAL_VIDEO_FILENAMES,
+    )
     return CampaignState(output_root=tmp_path, trial_ids=(trial_id, "trial-002"))
 
 
 def test_campaign_resume_skips_checksum_verified_trials(tmp_path) -> None:
     state = campaign_state_with_completed_trial(tmp_path, "trial-001")
     assert pending_trial_ids(state) == ("trial-002",)
+
+
+def test_campaign_resume_retries_an_encoder_error_even_when_generic_artifact_hashes_verify(tmp_path) -> None:
+    writer = EpisodeArtifactWriter(tmp_path, "trial-001")
+    writer.append_annotation({"step": 0, "action_source": "policy"})
+    videos = writer.staging / "videos"
+    videos.mkdir()
+    for filename in CANONICAL_VIDEO_FILENAMES:
+        (videos / filename).write_bytes(b"video")
+    writer.finalize(
+        {"terminal_reason": "success", "outcome": "error", "recorder_error": "encoder failed"},
+        required_videos=CANONICAL_VIDEO_FILENAMES,
+    )
+    state = CampaignState(output_root=tmp_path, trial_ids=("trial-001",))
+
+    assert pending_trial_ids(state) == ("trial-001",)
+
+
+def test_campaign_resume_retries_a_terminal_artifact_missing_one_canonical_video(tmp_path) -> None:
+    writer = EpisodeArtifactWriter(tmp_path, "trial-001")
+    writer.append_annotation({"step": 0, "action_source": "policy"})
+    videos = writer.staging / "videos"
+    videos.mkdir()
+    for filename in CANONICAL_VIDEO_FILENAMES[:-1]:
+        (videos / filename).write_bytes(b"video")
+    writer.finalize(
+        {"terminal_reason": "horizon", "outcome": "timeout"},
+        required_videos=CANONICAL_VIDEO_FILENAMES[:-1],
+    )
+    state = CampaignState(output_root=tmp_path, trial_ids=("trial-001",))
+
+    assert pending_trial_ids(state) == ("trial-001",)
+
+
+def test_worker_group_does_not_count_an_encoder_error_as_completed(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.subprocess.Popen",
+        lambda *args, **kwargs: _SuccessfulProcess([]),
+    )
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda _path: False)
+
+    _, completed, failed = _run_worker_group(
+        _worker_args(tmp_path), ((1, Trial("pant_long", "Pant_Long_Seen_0", "seen", 42)),)
+    )
+
+    assert (completed, failed) == (0, 1)
 
 
 def test_campaign_forwards_run_provenance_and_matrix_trial_identity(tmp_path) -> None:

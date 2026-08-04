@@ -15,6 +15,7 @@ from typing import Sequence
 
 from lehome.flywheel.artifacts import verify_episode
 from lehome.flywheel.capacity import CapacitySample, choose_worker_count
+from lehome.flywheel.isaac_recorder import CANONICAL_VIDEO_FILENAMES
 from lehome.flywheel.matrix import Trial, load_public_matrix, matrix_sha256
 
 
@@ -24,17 +25,30 @@ class CampaignState:
     trial_ids: tuple[str, ...]
 
 
+def is_completed_trial(episode_dir: Path) -> bool:
+    """Accept only terminal, non-error artifacts with canonical video evidence."""
+    try:
+        episode = verify_episode(episode_dir)
+    except ValueError:
+        return False
+    if not isinstance(episode.get("terminal_reason"), str) or not episode["terminal_reason"]:
+        return False
+    if episode.get("outcome") == "error" or episode.get("recorder_error"):
+        return False
+    for filename in CANONICAL_VIDEO_FILENAMES:
+        video = episode_dir / "videos" / filename
+        if video.is_symlink() or not video.is_file() or video.stat().st_size <= 0:
+            return False
+    return True
+
+
 def pending_trial_ids(state: CampaignState) -> tuple[str, ...]:
-    """Resume only after a terminal episode and every checksum verify again."""
-    pending: list[str] = []
-    for trial_id in state.trial_ids:
-        try:
-            episode = verify_episode(state.output_root / "raw" / trial_id)
-            if not isinstance(episode.get("terminal_reason"), str) or not episode["terminal_reason"]:
-                raise ValueError("terminal reason is missing")
-        except ValueError:
-            pending.append(trial_id)
-    return tuple(pending)
+    """Resume unless the terminal artifact passes the canonical completion predicate."""
+    return tuple(
+        trial_id
+        for trial_id in state.trial_ids
+        if not is_completed_trial(state.output_root / "raw" / trial_id)
+    )
 
 
 def _write_heartbeat(path: Path, *, worker_id: int, trial_id: str, state: str) -> None:
@@ -277,12 +291,7 @@ def _run_worker_group(args: argparse.Namespace, assignments: Sequence[tuple[int,
     for worker_id, trial, process, heartbeat, log in processes:
         returncode = returncodes[worker_id]
         log.close()
-        try:
-            verify_episode(args.output_root / "raw" / trial.trial_id)
-            verified = True
-        except ValueError:
-            verified = False
-        if returncode == 0 and verified:
+        if returncode == 0 and is_completed_trial(args.output_root / "raw" / trial.trial_id):
             completed += 1
         else:
             failed += 1

@@ -18,7 +18,8 @@ from .models import ActionSource, EpisodeFrame, EpisodeIdentity, EpisodeOutcome,
 from .snapshots import Snapshot
 
 
-_CAMERAS = ("top_rgb", "left_rgb", "right_rgb")
+CANONICAL_CAMERA_NAMES = ("top_rgb", "left_rgb", "right_rgb")
+CANONICAL_VIDEO_FILENAMES = tuple(f"{camera}.mp4" for camera in CANONICAL_CAMERA_NAMES)
 
 
 def finite_vector(value: object, *, size: int, name: str) -> tuple[float, ...]:
@@ -30,10 +31,10 @@ def finite_vector(value: object, *, size: int, name: str) -> tuple[float, ...]:
 
 class _VideoSink:
     def __init__(self) -> None:
-        self._frames: dict[str, list[np.ndarray]] = {camera: [] for camera in _CAMERAS}
+        self._frames: dict[str, list[np.ndarray]] = {camera: [] for camera in CANONICAL_CAMERA_NAMES}
 
     def append(self, observation: Mapping[str, object]) -> None:
-        for camera in _CAMERAS:
+        for camera in CANONICAL_CAMERA_NAMES:
             key = f"observation.images.{camera}"
             frame = np.asarray(observation[key])
             if frame.ndim != 3 or frame.shape[-1] != 3 or frame.dtype != np.uint8:
@@ -45,7 +46,7 @@ class _VideoSink:
 
     def encode(self, root: Path, *, fps: int = 30) -> tuple[str, ...]:
         encoded: list[str] = []
-        for camera in _CAMERAS:
+        for camera in CANONICAL_CAMERA_NAMES:
             frames = self._frames[camera]
             if not frames:
                 raise ValueError(f"{camera} has no video frames")
@@ -225,9 +226,12 @@ class MixedSourceRecorder:
         self._snapshots.add(name)
 
     def _encode_videos(self) -> tuple[str, ...]:
-        if any(self.video_sink.count(camera) != self.step for camera in _CAMERAS):
+        if any(self.video_sink.count(camera) != self.step for camera in CANONICAL_CAMERA_NAMES):
             raise ValueError("video frame count does not match annotation count")
-        return self.video_sink.encode(self.writer.staging)
+        encoded = self.video_sink.encode(self.writer.staging)
+        if encoded != CANONICAL_VIDEO_FILENAMES:
+            raise ValueError("encoder did not produce every canonical autonomous video")
+        return CANONICAL_VIDEO_FILENAMES
 
     def _base_episode(self) -> dict[str, object]:
         episode: dict[str, object] = {"policy_revision": self.policy_revision}
@@ -314,13 +318,7 @@ class MixedSourceRecorder:
             "outcome": "success" if accepted_success else "timeout",
             "bc_target_count": 0,
         }
-        required_videos: tuple[str, ...] = ()
-        try:
-            required_videos = self._encode_videos()
-        except Exception as error:
-            episode["outcome"] = "error"
-            episode["accepted_success"] = False
-            episode["recorder_error"] = str(error)
+        required_videos = self._encode_videos()
         path = self.writer.finalize(episode, required_videos=required_videos)
         return RecordedEpisode(path=path, episode=episode | {"episode_id": path.name}, annotations=tuple(self._annotations))
 
@@ -367,4 +365,11 @@ class AutonomousRecorder:
         return self._recorder.finish_autonomous(reason=reason, accepted_success=accepted_success)
 
 
-__all__ = ["AutonomousRecorder", "MixedSourceRecorder", "RecordedEpisode", "finite_vector"]
+__all__ = [
+    "AutonomousRecorder",
+    "CANONICAL_CAMERA_NAMES",
+    "CANONICAL_VIDEO_FILENAMES",
+    "MixedSourceRecorder",
+    "RecordedEpisode",
+    "finite_vector",
+]
