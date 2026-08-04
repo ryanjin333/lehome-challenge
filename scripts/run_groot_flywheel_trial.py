@@ -18,6 +18,38 @@ from lehome.flywheel.artifacts import atomic_write_json
 _PINNED = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OCI_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_RUNTIME_ASSET_DIRECTORIES = ("objects", "robots", "scenes", "textures")
+
+
+def _code_checkout_root() -> Path:
+    """Return the source checkout containing this production entry point."""
+    return Path(__file__).resolve().parents[1]
+
+
+def _runtime_assets_root() -> Path:
+    """Return the conventional relative asset root used by the Isaac task."""
+    return Path.cwd() / "Assets"
+
+
+def _verify_runtime_asset_mount(checkout_root: Path, release_assets_root: Path) -> None:
+    """Require Isaac's legacy relative paths to resolve into the verified bundle."""
+    runtime_assets = _runtime_assets_root()
+    for name in _RUNTIME_ASSET_DIRECTORIES:
+        mounted = runtime_assets / name
+        expected = (checkout_root / name).resolve()
+        if not mounted.is_symlink() or not expected.is_dir() or mounted.resolve() != expected:
+            raise ValueError("Isaac runtime assets must be symlinked from the dedicated asset checkout")
+    if (runtime_assets / "objects" / "Challenge_Garment" / "Release").resolve() != release_assets_root:
+        raise ValueError("Isaac runtime garment root does not match the verified Release assets")
+
+
+def _validate_declared_production_provenance(args: argparse.Namespace) -> None:
+    """Reject mutable identities before an Isaac process can consume them."""
+    image_identity = getattr(args, "image_identity", "")
+    if not isinstance(image_identity, str) or not _OCI_DIGEST.fullmatch(image_identity):
+        raise ValueError("production flywheel trials require an OCI SHA-256 image digest")
+    if getattr(args, "release_assets_root", None) is None:
+        raise ValueError("production flywheel trials require --release-assets-root from a dedicated asset checkout")
 
 
 def _scene_state_matches(expected: object, observed: object) -> bool:
@@ -66,7 +98,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--release-assets-root",
         type=Path,
-        default=Path("Assets/objects/Challenge_Garment/Release"),
     )
     parser.add_argument("--output-root", type=Path, default=Path("outputs/flywheel"))
     parser.add_argument("--task", default="LeHome-BiSO101-Direct-Garment-v2")
@@ -103,8 +134,8 @@ def validate_args(args: argparse.Namespace) -> str:
         raise ValueError("unsupported randomization strategy")
     if not acceptance_mode:
         build_identity(args, revision)
-        if not args.dry_run and not _OCI_DIGEST.fullmatch(args.image_identity):
-            raise ValueError("production flywheel trials require an OCI SHA-256 image digest")
+        if not args.dry_run:
+            _validate_declared_production_provenance(args)
     return revision or ""
 
 
@@ -125,9 +156,17 @@ def _live_runtime_identity(args: argparse.Namespace, _simulation_app: object) ->
         simulator_version = package_version("isaacsim")
     except PackageNotFoundError as error:
         raise ValueError("launched runtime does not expose Isaac Sim version evidence") from error
-    assets_root = args.release_assets_root
-    if assets_root.is_symlink() or not assets_root.is_dir():
+    requested_assets_root = Path(args.release_assets_root)
+    if requested_assets_root.is_symlink():
         raise ValueError("launched runtime Release assets are not a real directory")
+    assets_root = requested_assets_root.resolve()
+    if assets_root.name != "Release" or not assets_root.is_dir():
+        raise ValueError("launched runtime Release assets are not a real directory")
+    code_checkout = _code_checkout_root().resolve()
+    if assets_root.is_relative_to(code_checkout):
+        raise ValueError("launched runtime Release assets must come from a dedicated asset checkout, not the parent code checkout")
+    if Path.cwd().resolve() != code_checkout:
+        raise ValueError("production flywheel trials must launch from the code checkout root so Isaac uses verified asset links")
     try:
         checkout = subprocess.run(
             ("git", "-C", str(assets_root), "rev-parse", "--show-toplevel"),
@@ -137,15 +176,34 @@ def _live_runtime_identity(args: argparse.Namespace, _simulation_app: object) ->
         )
         if checkout.returncode != 0 or not checkout.stdout.strip():
             raise ValueError("launched runtime Release assets are not in a readable clean Git checkout")
-        checkout_root = checkout.stdout.strip()
+        checkout_root = Path(checkout.stdout.strip()).resolve()
+        if checkout_root == code_checkout or checkout_root.is_relative_to(code_checkout):
+            raise ValueError("launched runtime Release assets must come from a dedicated asset checkout, not the parent code checkout")
+        try:
+            release_path = assets_root.relative_to(checkout_root)
+        except ValueError as error:
+            raise ValueError("launched runtime Release assets are outside their discovered Git checkout") from error
         revision = subprocess.run(
-            ("git", "-C", checkout_root, "rev-parse", "HEAD"),
+            ("git", "-C", str(checkout_root), "rev-parse", "HEAD"),
             check=False,
             capture_output=True,
             text=True,
         )
+        _verify_runtime_asset_mount(checkout_root, assets_root)
         status = subprocess.run(
-            ("git", "-C", checkout_root, "status", "--porcelain=v1", "--untracked-files=all"),
+            ("git", "-C", str(checkout_root), "status", "--porcelain=v1", "--untracked-files=all"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        tracked = subprocess.run(
+            ("git", "-C", str(checkout_root), "ls-files", "-z"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        lfs = subprocess.run(
+            ("git", "-C", str(checkout_root), "lfs", "ls-files", "--long"),
             check=False,
             capture_output=True,
             text=True,
@@ -153,8 +211,31 @@ def _live_runtime_identity(args: argparse.Namespace, _simulation_app: object) ->
     except OSError as error:
         raise ValueError("launched runtime Release assets are not in a readable clean Git checkout") from error
     asset_revision = revision.stdout.strip()
-    if revision.returncode != 0 or not _PINNED.fullmatch(asset_revision) or status.returncode != 0 or status.stdout:
+    tracked_paths = tuple(path for path in tracked.stdout.split("\0") if path)
+    if not any(path == str(release_path) or path.startswith(str(release_path) + "/") for path in tracked_paths):
+        raise ValueError("launched runtime Release assets are not tracked in their dedicated checkout")
+    if (
+        revision.returncode != 0
+        or not _PINNED.fullmatch(asset_revision)
+        or status.returncode != 0
+        or status.stdout
+        or tracked.returncode != 0
+        or not tracked_paths
+    ):
         raise ValueError("launched runtime Release assets are not in a readable clean Git checkout")
+    for tracked_path in tracked_paths:
+        candidate = checkout_root / tracked_path
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ValueError("launched runtime Release assets are not fully materialized")
+        with candidate.open("rb") as handle:
+            if handle.read(64).startswith(b"version https://git-lfs.github.com/spec/v1"):
+                raise ValueError("launched runtime Release assets contain an unmaterialized Git LFS pointer")
+    if lfs.returncode != 0:
+        raise ValueError("launched runtime Release assets cannot establish Git LFS integrity")
+    for line in lfs.stdout.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) != 3 or not _SHA256.fullmatch(fields[0]) or fields[1] != "*":
+            raise ValueError("launched runtime Release assets contain unmaterialized Git LFS content")
     return simulator_version, asset_revision
 
 
@@ -164,6 +245,7 @@ def _validate_live_runtime_identity(
     *,
     runtime_identity_reader: Callable[[argparse.Namespace, object], tuple[str, str]],
 ) -> None:
+    _validate_declared_production_provenance(args)
     simulator_version, asset_revision = runtime_identity_reader(args, simulation_app)
     if simulator_version != args.simulator_version:
         raise ValueError("declared simulator version does not match the launched runtime")

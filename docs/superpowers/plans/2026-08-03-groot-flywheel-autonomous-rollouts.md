@@ -415,20 +415,45 @@ Remote acceptance sequence on one already-approved host:
 The named matrix is checked byte-for-byte against the 280-trial public contract
 in `lehome.flywheel.matrix` before the campaign launches any worker.
 
+Prepare release assets in a separate pinned Git/LFS checkout. Do not use the
+ignored `Assets/` directory in the code checkout, and do not substitute `hf download`
+for Git revision evidence. The checkout must remain clean for the complete Release
+tree while trials run.
+
 ```bash
-uv run python -m scripts.run_groot_flywheel_campaign \\
-  --matrix configs/eval_groot_n17_public_280.json \\
-  --policy-path /workspace/policies/step-12000 \\
-  --policy-revision-file /workspace/policies/step-12000/revision.txt \\
-  --policy-repo org/groot-policy \\
-  --policy-step 12000 \\
-  --code-revision "$(git rev-parse HEAD)" \\
-  --asset-revision <40-character-release-assets-commit> \\
-  --simulator-version isaac-sim-5.1 \\
-  --policy-artifact-sha256 "$(sha256sum /workspace/policies/step-12000/model.safetensors | awk '{print $1}')" \\
-  --image-identity <immutable-container-image-digest> \\
-  --output-root /workspace/rollouts/capacity \\
-  --capacity-sweep 1,2,4,6,8 \\
+ASSET_REV=bea65fd960ad5a1bb3bd3fa77164b28001c08ef9
+git clone https://huggingface.co/datasets/lehome/asset_challenge /workspace/lehome-release-assets
+cd /workspace/lehome-release-assets
+git lfs install --local
+git checkout --detach "$ASSET_REV"
+git lfs pull
+test "$(git rev-parse HEAD)" = "$ASSET_REV"
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+cd /workspace/lehome-groot-trainer
+for asset_dir in objects robots scenes textures; do
+  test ! -e "Assets/$asset_dir" && test ! -L "Assets/$asset_dir"
+  ln -s "/workspace/lehome-release-assets/$asset_dir" "Assets/$asset_dir"
+done
+test "$(realpath Assets/objects/Challenge_Garment/Release)" = \
+  "$(realpath /workspace/lehome-release-assets/objects/Challenge_Garment/Release)"
+```
+
+```bash
+uv run python -m scripts.run_groot_flywheel_campaign \
+  --matrix configs/eval_groot_n17_public_280.json \
+  --policy-path /workspace/policies/step-12000 \
+  --policy-revision-file /workspace/policies/step-12000/revision.txt \
+  --policy-repo org/groot-policy \
+  --policy-step 12000 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --asset-revision bea65fd960ad5a1bb3bd3fa77164b28001c08ef9 \
+  --release-assets-root /workspace/lehome-release-assets/objects/Challenge_Garment/Release \
+  --simulator-version 5.1.0.0 \
+  --policy-artifact-sha256 "$(sha256sum /workspace/policies/step-12000/model.safetensors | awk '{print $1}')" \
+  --image-identity sha256:<64-lowercase-hex-digest> \
+  --output-root /workspace/rollouts/capacity \
+  --capacity-sweep 1,2,4,6,8 \
   --trials-per-worker 1
 ```
 

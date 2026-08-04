@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import stat
 from dataclasses import dataclass
 import threading
@@ -12,6 +13,7 @@ from lehome.flywheel.bridge_receiver import ExpertCommand, Handshake, LeaderSamp
 from lehome.flywheel.isaac_recorder import MixedSourceRecorder
 from lehome.flywheel.models import EpisodeIdentity
 from lehome.flywheel.quality import QualityThresholds
+import scripts.collect_groot_dagger as dagger_module
 from scripts.collect_groot_dagger import ScheduledControlSource, build_parser, collect_episode, main, prepare_session, validate_args
 
 
@@ -113,6 +115,42 @@ def test_noninteractive_main_always_removes_its_one_session_secret(tmp_path, mon
 
     assert main(["--run-root", str(tmp_path / "practice")]) == 0
     assert not secret_path.exists()
+
+
+def test_production_collection_rejects_identity_after_app_launch_before_environment_or_recorder(monkeypatch, tmp_path) -> None:
+    events: list[str] = []
+    app_module = type("AppModule", (), {})()
+
+    class AppLauncher:
+        @staticmethod
+        def add_app_launcher_args(_parser) -> None:
+            return None
+
+    app_module.AppLauncher = AppLauncher
+    common = type("Common", (), {
+        "launch_app_from_args": staticmethod(lambda _args: events.append("launch") or object()),
+        "close_app": staticmethod(lambda _app: events.append("close")),
+    })()
+    eval_policy = type("PolicyRegistryModule", (), {"PolicyRegistry": object})()
+    groot_policy = type("GrootPolicyModule", (), {})()
+    import types
+    import scripts.run_groot_flywheel_trial as trial_module
+
+    utils = types.ModuleType("scripts.utils")
+    utils.__path__ = []
+    monkeypatch.setitem(__import__("sys").modules, "isaaclab", types.ModuleType("isaaclab"))
+    monkeypatch.setitem(__import__("sys").modules, "isaaclab.app", app_module)
+    monkeypatch.setitem(__import__("sys").modules, "scripts.eval_policy", eval_policy)
+    monkeypatch.setitem(__import__("sys").modules, "scripts.eval_policy.groot_policy", groot_policy)
+    monkeypatch.setitem(__import__("sys").modules, "scripts.utils", utils)
+    monkeypatch.setitem(__import__("sys").modules, "scripts.utils.common", common)
+    monkeypatch.setattr(trial_module, "_production_env", lambda _args: (_ for _ in ()).throw(AssertionError("environment constructed")))
+    monkeypatch.setattr(trial_module, "_validate_live_runtime_identity", lambda *_args, **_kwargs: (events.append("gate"), (_ for _ in ()).throw(ValueError("identity mismatch")))[1])
+
+    with pytest.raises(ValueError, match="identity mismatch"):
+        dagger_module._run_production_collection(argparse.Namespace(), object())
+
+    assert events == ["launch", "gate", "close"]
 
 
 def test_collection_waits_for_an_authenticated_healthy_bridge_before_starting(tmp_path) -> None:

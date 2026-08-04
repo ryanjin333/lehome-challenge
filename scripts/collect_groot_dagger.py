@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-identity")
     parser.add_argument("--code-revision")
     parser.add_argument("--asset-revision")
+    parser.add_argument("--release-assets-root", type=Path)
     parser.add_argument("--simulator-version")
     parser.add_argument("--episode-id")
     parser.add_argument("--garment")
@@ -88,7 +89,11 @@ def validate_args(args: argparse.Namespace) -> QualityThresholds | None:
     if args.interactive and not all(calibration_hashes):
         raise ValueError("interactive collection requires both expected calibration hashes")
     if args.interactive:
-        from scripts.run_groot_flywheel_trial import build_identity, read_pinned_revision
+        from scripts.run_groot_flywheel_trial import (
+            _validate_declared_production_provenance,
+            build_identity,
+            read_pinned_revision,
+        )
 
         revision = args.policy_revision
         if args.policy_revision_file is not None:
@@ -102,6 +107,7 @@ def validate_args(args: argparse.Namespace) -> QualityThresholds | None:
         if args.max_steps <= 0 or args.seed < 0:
             raise ValueError("interactive collection requires non-negative seed and positive max-steps")
         args.collection_identity = build_identity(args, revision)
+        _validate_declared_production_provenance(args)
         if args.mode in {"expert", "dagger"} and not args.enable_training_output:
             raise ValueError("interactive expert or dagger collection requires training output")
     if args.enable_training_output and args.mode not in {"expert", "dagger"}:
@@ -786,7 +792,7 @@ def _run_production_collection(args: argparse.Namespace, session: CollectorSessi
     from isaaclab.app import AppLauncher
     from scripts.eval_policy import PolicyRegistry
     import scripts.eval_policy.groot_policy  # noqa: F401
-    from scripts.run_groot_flywheel_trial import _production_env
+    from scripts.run_groot_flywheel_trial import _production_env, _validate_live_runtime_identity
     from scripts.utils import common
 
     launch_parser = argparse.ArgumentParser(add_help=False)
@@ -795,6 +801,7 @@ def _run_production_collection(args: argparse.Namespace, session: CollectorSessi
     app = common.launch_app_from_args(launch_args)
     env = None
     try:
+        _validate_live_runtime_identity(args, app)
         env = _production_env(args)
         policy = PolicyRegistry.create("groot", model_path=str(args.policy_path), device=args.device, task_description="fold the garment on the table")
         policy.reset()

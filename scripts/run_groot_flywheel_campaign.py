@@ -51,6 +51,7 @@ def _trial_command(args: argparse.Namespace, trial: Trial) -> list[str]:
         "--policy-revision-file", str(args.policy_revision_file), "--garment", trial.garment_name,
         "--policy-repo", args.policy_repo, "--policy-step", str(args.policy_step), "--code-revision", args.code_revision,
         "--asset-revision", args.asset_revision, "--simulator-version", args.simulator_version,
+        "--release-assets-root", str(args.release_assets_root),
         "--category", trial.category, "--release-stage", trial.release_stage,
         "--policy-artifact-sha256", args.policy_artifact_sha256, "--image-identity", args.image_identity,
         "--seed", str(trial.seed), "--episode-id", trial.trial_id, "--output-root", str(args.output_root),
@@ -298,6 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-step", type=int, required=True)
     parser.add_argument("--code-revision", required=True)
     parser.add_argument("--asset-revision", required=True)
+    parser.add_argument("--release-assets-root", type=Path, required=True)
     parser.add_argument("--simulator-version", required=True)
     parser.add_argument("--policy-artifact-sha256", required=True)
     parser.add_argument("--image-identity", required=True)

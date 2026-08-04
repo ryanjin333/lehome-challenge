@@ -12,6 +12,7 @@ import types
 
 import scripts.run_groot_flywheel_trial as trial_module
 from scripts.run_groot_flywheel_trial import (
+    _verify_runtime_asset_mount,
     _live_runtime_identity, _manifest_path, _scene_state_matches, build_parser, read_pinned_revision, run_randomization_acceptance,
     run_snapshot_acceptance, run_trial, validate_args, _validate_live_runtime_identity,
 )
@@ -41,28 +42,112 @@ def test_production_trial_rejects_a_non_digest_image_identity(tmp_path) -> None:
 
 
 def test_live_runtime_identity_reads_installed_simulator_and_clean_assets_checkout(monkeypatch, tmp_path) -> None:
-    assets = tmp_path / "Assets" / "objects" / "Challenge_Garment" / "Release"
+    checkout = tmp_path / "assets-checkout"
+    assets = checkout / "Release"
     assets.mkdir(parents=True)
+    (assets / "garment.usd").write_bytes(b"materialized")
     args = argparse.Namespace(release_assets_root=assets)
     commands: list[tuple[str, ...]] = []
 
     def git_run(command, **_kwargs):
         commands.append(command)
         if command[-1] == "--show-toplevel":
-            return types.SimpleNamespace(returncode=0, stdout="/runtime/assets-checkout\n")
+            return types.SimpleNamespace(returncode=0, stdout=str(checkout) + "\n")
         if command[-1] == "HEAD":
             return types.SimpleNamespace(returncode=0, stdout=("c" * 40) + "\n")
+        if command[3:5] == ("ls-files", "-z"):
+            return types.SimpleNamespace(returncode=0, stdout="Release/garment.usd\0")
+        if command[3:5] == ("lfs", "ls-files"):
+            return types.SimpleNamespace(returncode=0, stdout=("f" * 64) + " * Release/garment.usd\n")
         return types.SimpleNamespace(returncode=0, stdout="")
 
     monkeypatch.setattr(trial_module, "package_version", lambda package: "5.1.0.0")
+    monkeypatch.setattr(trial_module, "_code_checkout_root", Path.cwd)
     monkeypatch.setattr(trial_module.subprocess, "run", git_run)
+    monkeypatch.setattr(trial_module, "_verify_runtime_asset_mount", lambda *_args: None)
 
     assert _live_runtime_identity(args, object()) == ("5.1.0.0", "c" * 40)
     assert commands == [
         ("git", "-C", str(assets), "rev-parse", "--show-toplevel"),
-        ("git", "-C", "/runtime/assets-checkout", "rev-parse", "HEAD"),
-        ("git", "-C", "/runtime/assets-checkout", "status", "--porcelain=v1", "--untracked-files=all"),
+        ("git", "-C", str(checkout), "rev-parse", "HEAD"),
+        ("git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"),
+        ("git", "-C", str(checkout), "ls-files", "-z"),
+        ("git", "-C", str(checkout), "lfs", "ls-files", "--long"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("git_responses", "message"),
+    [
+        ({"HEAD": "d" * 40}, "asset revision"),
+        ({"status": "?? Release/untracked.usd\n"}, "clean Git checkout"),
+        ({"lfs": ("f" * 64) + " - Release/garment.usd\n"}, "Git LFS"),
+        ({"lfs_returncode": 1}, "Git LFS"),
+    ],
+)
+def test_live_runtime_identity_rejects_unpinned_dirty_or_unmaterialized_assets(monkeypatch, tmp_path, git_responses, message) -> None:
+    checkout = tmp_path / "assets-checkout"
+    assets = checkout / "Release"
+    assets.mkdir(parents=True)
+    (assets / "garment.usd").write_bytes(b"materialized")
+    args = argparse.Namespace(
+        release_assets_root=assets,
+        asset_revision="c" * 40,
+        image_identity="sha256:" + "a" * 64,
+        simulator_version="5.1.0.0",
+    )
+
+    def git_run(command, **_kwargs):
+        if command[-1] == "--show-toplevel":
+            return types.SimpleNamespace(returncode=0, stdout=str(checkout) + "\n")
+        if command[-1] == "HEAD":
+            return types.SimpleNamespace(returncode=0, stdout=git_responses.get("HEAD", "c" * 40) + "\n")
+        if command[3:5] == ("status", "--porcelain=v1"):
+            return types.SimpleNamespace(returncode=0, stdout=git_responses.get("status", ""))
+        if command[3:5] == ("ls-files", "-z"):
+            return types.SimpleNamespace(returncode=0, stdout="Release/garment.usd\0")
+        if command[3:5] == ("lfs", "ls-files"):
+            return types.SimpleNamespace(
+                returncode=git_responses.get("lfs_returncode", 0),
+                stdout=git_responses.get("lfs", ("f" * 64) + " * Release/garment.usd\n"),
+            )
+        raise AssertionError(command)
+
+    monkeypatch.setattr(trial_module, "package_version", lambda _package: "5.1.0.0")
+    monkeypatch.setattr(trial_module, "_code_checkout_root", Path.cwd)
+    monkeypatch.setattr(trial_module.subprocess, "run", git_run)
+    monkeypatch.setattr(trial_module, "_verify_runtime_asset_mount", lambda *_args: None)
+
+    with pytest.raises(ValueError, match=message):
+        _validate_live_runtime_identity(args, object(), runtime_identity_reader=_live_runtime_identity)
+
+
+def test_live_runtime_identity_rejects_the_parent_code_checkout(monkeypatch, tmp_path) -> None:
+    assets = tmp_path / "Assets" / "objects" / "Challenge_Garment" / "Release"
+    assets.mkdir(parents=True)
+    monkeypatch.setattr(trial_module, "_code_checkout_root", lambda: tmp_path)
+    monkeypatch.setattr(trial_module, "package_version", lambda _package: "5.1.0.0")
+
+    with pytest.raises(ValueError, match="dedicated asset checkout"):
+        _live_runtime_identity(argparse.Namespace(release_assets_root=assets), object())
+
+
+def test_runtime_asset_mount_requires_every_legacy_loader_path_to_resolve_to_the_verified_checkout(monkeypatch, tmp_path) -> None:
+    checkout = tmp_path / "assets-checkout"
+    runtime_assets = tmp_path / "code-checkout" / "Assets"
+    for name in ("objects", "robots", "scenes", "textures"):
+        (checkout / name).mkdir(parents=True, exist_ok=True)
+        runtime_assets.mkdir(parents=True, exist_ok=True)
+        (runtime_assets / name).symlink_to(checkout / name, target_is_directory=True)
+    release = checkout / "objects" / "Challenge_Garment" / "Release"
+    release.mkdir(parents=True)
+    monkeypatch.setattr(trial_module, "_runtime_assets_root", lambda: runtime_assets)
+
+    _verify_runtime_asset_mount(checkout, release)
+    (runtime_assets / "textures").unlink()
+    (runtime_assets / "textures").mkdir()
+    with pytest.raises(ValueError, match="symlinked"):
+        _verify_runtime_asset_mount(checkout, release)
 
 
 @pytest.mark.parametrize(
@@ -84,7 +169,7 @@ def test_production_trial_rejects_live_runtime_identity_mismatch(
         "--policy-path", str(policy), "--policy-revision", "a" * 40,
         "--episode-id", "identity-check", "--policy-repo", "org/policy", "--policy-step", "1",
         "--code-revision", "b" * 40, "--asset-revision", "c" * 40,
-        "--simulator-version", "isaac-sim-5.1", "--garment", "Pant_Long_Seen_0",
+        "--simulator-version", "isaac-sim-5.1", "--release-assets-root", str(tmp_path / "asset-checkout" / "Release"), "--garment", "Pant_Long_Seen_0",
         "--category", "pant_long", "--release-stage", "seen", "--policy-artifact-sha256", "d" * 64,
         "--image-identity", "sha256:" + "e" * 64,
     ])
@@ -348,6 +433,7 @@ def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(
         "--policy-path", str(policy), "--policy-revision", "a" * 40, "--garment", "Pant_Long_Seen_0",
         "--episode-id", "isolated-worker", "--policy-repo", "org/policy", "--policy-step", "1",
         "--code-revision", "b" * 40, "--asset-revision", "c" * 40, "--simulator-version", "isaac",
+        "--release-assets-root", str(tmp_path / "asset-checkout" / "Release"),
         "--category", "pant_long", "--release-stage", "seen", "--policy-artifact-sha256", "d" * 64,
         "--image-identity", "sha256:" + "e" * 64, "--output-root", str(tmp_path / "run"),
     ])

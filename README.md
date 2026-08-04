@@ -75,6 +75,11 @@ Download the required simulation assets (scenes, objects, robots) from HuggingFa
 hf download lehome/asset_challenge --repo-type dataset --local-dir Assets
 ```
 
+This convenient ignored `Assets/` layout is appropriate for ordinary simulation
+use. Production flywheel and physical DAgger runs intentionally reject it:
+they require the separate pinned Git/LFS Release-assets checkout documented in
+the flywheel rollout runbook.
+
 #### Download Example Dataset
 
 We provide demonstrations for four types of garments. Download from HuggingFace:

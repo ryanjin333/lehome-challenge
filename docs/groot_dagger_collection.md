@@ -60,14 +60,37 @@ python scripts/collect_groot_dagger.py \
   --policy-repo <policy-repository> \
   --policy-step <non-negative-step> \
   --policy-artifact-sha256 <64-lowercase-hex-sha256> \
-  --image-identity <immutable-image-identity> \
+  --image-identity sha256:<64-lowercase-hex-digest> \
   --code-revision <40-lowercase-hex-revision> \
-  --asset-revision <40-lowercase-hex-revision> \
-  --simulator-version <simulator-version> \
+  --asset-revision bea65fd960ad5a1bb3bd3fa77164b28001c08ef9 \
+  --release-assets-root /workspace/lehome-release-assets/objects/Challenge_Garment/Release \
+  --simulator-version 5.1.0.0 \
   --episode-id <unique-episode-id> \
   --garment <organizer-garment-name> \
   --category pant_long --release-stage seen \
   --interactive
+```
+
+Before the command, create the dedicated asset checkout outside this code checkout
+and keep its Release tree clean:
+
+```bash
+ASSET_REV=bea65fd960ad5a1bb3bd3fa77164b28001c08ef9
+git clone https://huggingface.co/datasets/lehome/asset_challenge /workspace/lehome-release-assets
+cd /workspace/lehome-release-assets
+git lfs install --local
+git checkout --detach "$ASSET_REV"
+git lfs pull
+test "$(git rev-parse HEAD)" = "$ASSET_REV"
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+cd /workspace/lehome-groot-trainer
+for asset_dir in objects robots scenes textures; do
+  test ! -e "Assets/$asset_dir" && test ! -L "Assets/$asset_dir"
+  ln -s "/workspace/lehome-release-assets/$asset_dir" "Assets/$asset_dir"
+done
+test "$(realpath Assets/objects/Challenge_Garment/Release)" = \
+  "$(realpath /workspace/lehome-release-assets/objects/Challenge_Garment/Release)"
 ```
 
 The threshold file must be generated from organizer expert statistics and pin

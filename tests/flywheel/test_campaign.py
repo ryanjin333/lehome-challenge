@@ -35,7 +35,8 @@ def test_campaign_forwards_run_provenance_and_matrix_trial_identity(tmp_path) ->
         policy_path=tmp_path / "policy", policy_revision_file=tmp_path / "revision.txt",
         policy_repo="org/policy", policy_step=12000, code_revision="a" * 40,
         asset_revision="b" * 40, simulator_version="isaac-5.1", policy_artifact_sha256="c" * 64,
-        image_identity="sha256:immutable", output_root=tmp_path, max_steps=600, strategy="mild",
+        image_identity="sha256:immutable", release_assets_root=tmp_path / "asset-checkout" / "Release",
+        output_root=tmp_path, max_steps=600, strategy="mild",
     )
     trial = Trial("pant_long", "Pant_Long_Seen_0", "seen", 42)
     command = _trial_command(args, trial)
@@ -48,6 +49,7 @@ def test_campaign_forwards_run_provenance_and_matrix_trial_identity(tmp_path) ->
     assert values["--policy-repo"] == "org/policy"
     assert values["--code-revision"] == "a" * 40
     assert values["--asset-revision"] == "b" * 40
+    assert values["--release-assets-root"] == str(tmp_path / "asset-checkout" / "Release")
     assert values["--policy-artifact-sha256"] == "c" * 64
     assert values["--strategy"] == "mild"
 
@@ -64,7 +66,7 @@ def test_campaign_uses_the_committed_public_280_trial_matrix(tmp_path) -> None:
     args = build_parser().parse_args([
         "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
         "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
-        "--asset-revision", "b" * 40, "--simulator-version", "isaac-5.1",
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
         "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--dry-run",
     ])
 
@@ -81,7 +83,7 @@ def test_campaign_rejects_a_noncanonical_matrix_before_worker_launch(monkeypatch
     args = build_parser().parse_args([
         "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision",
         "--output-root", str(tmp_path / "output"), "--policy-repo", "org/policy", "--policy-step", "1",
-        "--code-revision", "a" * 40, "--asset-revision", "b" * 40, "--simulator-version", "isaac-5.1",
+        "--code-revision", "a" * 40, "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
         "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image",
     ])
     monkeypatch.setattr(
@@ -104,6 +106,7 @@ def _worker_args(tmp_path, *, worker_timeout_seconds: float = 2.0, terminate_gra
         policy_step=12000,
         code_revision="a" * 40,
         asset_revision="b" * 40,
+        release_assets_root=tmp_path / "asset-checkout" / "objects" / "Challenge_Garment" / "Release",
         simulator_version="isaac-5.1",
         policy_artifact_sha256="c" * 64,
         image_identity="sha256:immutable",
@@ -376,7 +379,7 @@ def test_terminate_grace_seconds_must_be_finite_and_positive(value: str) -> None
     arguments = [
         "--matrix", "matrix.json", "--policy-path", "policy", "--policy-revision-file", "revision",
         "--output-root", "output", "--policy-repo", "org/policy", "--policy-step", "1",
-        "--code-revision", "a", "--asset-revision", "b", "--simulator-version", "isaac-5.1",
+        "--code-revision", "a", "--asset-revision", "b", "--release-assets-root", "assets/Release", "--simulator-version", "isaac-5.1",
         "--policy-artifact-sha256", "c", "--image-identity", "sha256:image",
     ]
     assert build_parser().parse_args(arguments).terminate_grace_seconds == 5.0
@@ -389,7 +392,7 @@ def test_worker_timeout_seconds_must_be_finite_and_positive(value: str) -> None:
     arguments = [
         "--matrix", "matrix.json", "--policy-path", "policy", "--policy-revision-file", "revision",
         "--output-root", "output", "--policy-repo", "org/policy", "--policy-step", "1",
-        "--code-revision", "a", "--asset-revision", "b", "--simulator-version", "isaac-5.1",
+        "--code-revision", "a", "--asset-revision", "b", "--release-assets-root", "assets/Release", "--simulator-version", "isaac-5.1",
         "--policy-artifact-sha256", "c", "--image-identity", "sha256:image",
     ]
     with pytest.raises(SystemExit):
