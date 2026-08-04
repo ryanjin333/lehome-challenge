@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 import sys
 import types
@@ -65,6 +66,20 @@ def test_action_chunk_queue_returns_each_step_then_refills():
     np.testing.assert_array_equal(queue.pop(), chunk[1])
     assert queue.pop() is None
 
+
+def test_action_chunk_queue_reports_pending_actions():
+    module = _load_policy_module()
+    queue = module.ActionChunkQueue()
+    chunk = np.arange(24, dtype=np.float32).reshape(2, 12)
+
+    assert queue.pending_count == 0
+    queue.extend(chunk)
+    assert queue.pending_count == 2
+    queue.pop()
+    assert queue.pending_count == 1
+    queue.clear()
+    assert queue.pending_count == 0
+
     queue.extend(chunk)
     queue.clear()
     assert queue.pop() is None
@@ -79,6 +94,47 @@ def test_action_queue_reports_request_and_offset():
 
     assert item.request_id == "req-7"
     assert item.chunk_offset == 0
+
+
+def test_policy_records_only_cache_miss_inference_latency_and_queue_depth(monkeypatch, tmp_path):
+    module = _load_policy_module()
+    telemetry_path = tmp_path / "policy-telemetry.jsonl"
+    telemetry_path.touch()
+    monkeypatch.setenv("LEHOME_FLYWHEEL_POLICY_TELEMETRY_PATH", str(telemetry_path))
+    ticks = iter((1_000_000_000, 1_250_000_000))
+    monkeypatch.setattr(module, "perf_counter_ns", lambda: next(ticks))
+
+    class FakeOfficialPolicy:
+        calls = 0
+
+        def get_action(self, _observation):
+            self.calls += 1
+            return {
+                "action.left_arm": _chunk(1, 16, 5, 0),
+                "action.left_gripper": _chunk(1, 16, 1, 10),
+                "action.right_arm": _chunk(1, 16, 5, 20),
+                "action.right_gripper": _chunk(1, 16, 1, 30),
+            }, None
+
+    policy = module.GrootPolicy.__new__(module.GrootPolicy)
+    policy._policy = FakeOfficialPolicy()
+    policy._action_queue = module.ActionChunkQueue()
+    observation = {
+        "observation.state": np.zeros(12, dtype=np.float32),
+        **{f"observation.images.{camera}": np.zeros((2, 2, 3), dtype=np.uint8) for camera in ("top_rgb", "left_rgb", "right_rgb")},
+    }
+
+    first = policy.select_action_with_provenance(observation)
+    second = policy.select_action_with_provenance(observation)
+
+    records = [json.loads(line) for line in telemetry_path.read_text(encoding="utf-8").splitlines()]
+    assert first.request_id == second.request_id
+    assert policy._policy.calls == 1
+    assert records == [{
+        "request_id": first.request_id,
+        "latency_seconds": 0.25,
+        "queue_depth_after_enqueue": 16,
+    }]
 
 def test_flatten_groot_action_chunk_rejects_non_contract_horizon():
     module = _load_policy_module()

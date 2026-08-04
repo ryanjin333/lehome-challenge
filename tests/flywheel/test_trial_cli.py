@@ -18,6 +18,76 @@ from scripts.run_groot_flywheel_trial import (
 )
 
 
+def test_live_execution_identity_rejects_mismatched_code_policy_or_container(tmp_path, monkeypatch) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    (policy / "model.safetensors").write_bytes(b"policy")
+    revision = tmp_path / "revision.txt"
+    revision.write_text("a" * 40 + "\n", encoding="utf-8")
+    args = build_parser().parse_args([
+        "--policy-path", str(policy), "--policy-revision-file", str(revision), "--garment", "Pant_Long_Seen_0",
+        "--episode-id", "identity", "--policy-repo", "org/policy", "--policy-step", "1",
+        "--code-revision", "b" * 40, "--asset-revision", "c" * 40, "--simulator-version", "isaac",
+        "--category", "pant_long", "--release-stage", "seen", "--policy-artifact-sha256", "d" * 64,
+        "--image-identity", "sha256:" + "e" * 64,
+    ])
+
+    with pytest.raises(ValueError, match="code revision"):
+        trial_module._validate_live_execution_identity(
+            args,
+            code_identity_reader=lambda _args: "f" * 40,
+            policy_identity_reader=lambda _args: ("a" * 40, "d" * 64),
+            image_identity_reader=lambda: "sha256:" + "e" * 64,
+        )
+    with pytest.raises(ValueError, match="policy revision"):
+        trial_module._validate_live_execution_identity(
+            args,
+            code_identity_reader=lambda _args: "b" * 40,
+            policy_identity_reader=lambda _args: ("f" * 40, "d" * 64),
+            image_identity_reader=lambda: "sha256:" + "e" * 64,
+        )
+    with pytest.raises(ValueError, match="container image"):
+        trial_module._validate_live_execution_identity(
+            args,
+            code_identity_reader=lambda _args: "b" * 40,
+            policy_identity_reader=lambda _args: ("a" * 40, "d" * 64),
+            image_identity_reader=lambda: "sha256:" + "f" * 64,
+        )
+
+
+def test_runtime_image_identity_requires_a_separately_injected_oci_digest(monkeypatch) -> None:
+    monkeypatch.delenv("LEHOME_FLYWHEEL_IMAGE_IDENTITY", raising=False)
+    with pytest.raises(ValueError, match="unavailable"):
+        trial_module._runtime_container_image_identity()
+
+    expected = "sha256:" + "e" * 64
+    monkeypatch.setenv("LEHOME_FLYWHEEL_IMAGE_IDENTITY", expected)
+    assert trial_module._runtime_container_image_identity() == expected
+
+
+def test_acceptance_launch_forwards_headless_to_isaac_app(monkeypatch, tmp_path) -> None:
+    launched: list[bool] = []
+
+    class AppLauncher:
+        @staticmethod
+        def add_app_launcher_args(parser):
+            parser.add_argument("--headless", action="store_true")
+
+    utils = types.ModuleType("scripts.utils"); utils.__path__ = []
+    common = types.ModuleType("scripts.utils.common")
+    common.launch_app_from_args = lambda args: launched.append(args.headless) or object()
+    common.close_app = lambda _app: None
+    app_module = types.ModuleType("isaaclab.app"); app_module.AppLauncher = AppLauncher
+    isaaclab = types.ModuleType("isaaclab"); isaaclab.__path__ = []
+    for name, module in {"scripts.utils": utils, "scripts.utils.common": common, "isaaclab": isaaclab, "isaaclab.app": app_module}.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(trial_module, "run_snapshot_acceptance", lambda _args: 0)
+    args = build_parser().parse_args(["--snapshot-roundtrip-only", "--garment", "Pant_Long_Seen_0", "--headless", "--output-root", str(tmp_path)])
+
+    assert run_trial(args) == 0
+    assert launched == [True]
+
+
 def test_trial_cli_requires_pinned_policy_and_existing_matrix(tmp_path) -> None:
     parser = build_parser()
     args = parser.parse_args(["--policy-path", str(tmp_path / "missing"), "--policy-revision", "main"])
@@ -441,12 +511,14 @@ def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(
         run_trial(
             args,
             runtime_identity_reader=lambda _args, _app: ("wrong-runtime", "c" * 40),
+            execution_identity_validator=lambda _args: None,
         )
     assert launched == []
     assert not (tmp_path / "run" / "flywheel-manifest-isolated-worker.json").exists()
     assert run_trial(
         args,
         runtime_identity_reader=lambda _args, _app: ("isaac", "c" * 40),
+        execution_identity_validator=lambda _args: None,
     ) == 0
     assert launched == [("Pant_Long_Seen_0", "isolated-worker", 1)]
 

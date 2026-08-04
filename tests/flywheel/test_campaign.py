@@ -8,14 +8,20 @@ import threading
 import pytest
 
 from lehome.flywheel.artifacts import EpisodeArtifactWriter
+from lehome.flywheel.capacity import CapacitySample, choose_worker_count
 from lehome.flywheel.isaac_recorder import CANONICAL_VIDEO_FILENAMES
 from lehome.flywheel.matrix import Trial, build_public_matrix, matrix_sha256
 from scripts.run_groot_flywheel_campaign import (
     CampaignState,
+    _failure_classes,
+    _PolicyTelemetrySampler,
+    _prepare_policy_telemetry_path,
     _prepare_retry_attempt,
     _run_one_worker,
     _run_worker_group,
     _trial_command,
+    _worker_gpu_indices,
+    _worker_environment,
     build_parser,
     pending_trial_ids,
     run_campaign,
@@ -317,7 +323,7 @@ def test_campaign_forwards_run_provenance_and_matrix_trial_identity(tmp_path) ->
         policy_repo="org/policy", policy_step=12000, code_revision="a" * 40,
         asset_revision="b" * 40, simulator_version="isaac-5.1", policy_artifact_sha256="c" * 64,
         image_identity="sha256:immutable", release_assets_root=tmp_path / "asset-checkout" / "Release",
-        output_root=tmp_path, max_steps=600, strategy="mild",
+        output_root=tmp_path, max_steps=600, strategy="mild", device="cuda:3",
     )
     trial = Trial("pant_long", "Pant_Long_Seen_0", "seen", 42)
     command = _trial_command(args, trial)
@@ -333,6 +339,251 @@ def test_campaign_forwards_run_provenance_and_matrix_trial_identity(tmp_path) ->
     assert values["--release-assets-root"] == str(tmp_path / "asset-checkout" / "Release")
     assert values["--policy-artifact-sha256"] == "c" * 64
     assert values["--strategy"] == "mild"
+    assert values["--device"] == "cuda:3"
+
+
+def test_campaign_parser_exposes_device_and_forwards_it_to_trial_workers(tmp_path) -> None:
+    args = build_parser().parse_args([
+        "--matrix", str(Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"),
+        "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"),
+        "--simulator-version", "isaac-5.1", "--policy-artifact-sha256", "c" * 64,
+        "--image-identity", "sha256:image", "--device", "cuda:2", "--dry-run",
+    ])
+
+    assert args.device == "cuda:2"
+    assert "--device" in _trial_command(args, build_public_matrix().trials[0])
+
+
+def test_isolated_worker_remaps_its_single_visible_gpu_to_cuda_zero(tmp_path) -> None:
+    args = _worker_args(tmp_path)
+    args.device = "cuda:4"
+    command = _trial_command(args, Trial("pant_long", "Pant_Long_Seen_0", "seen", 42), device="cuda:0")
+
+    assert command[command.index("--device") + 1] == "cuda:0"
+
+
+def test_capacity_sweep_accounts_only_for_exact_nonduplicated_wave_trials(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda state: state.trial_ids)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_one_worker", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sequential trial launched")))
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._run_worker_group",
+        lambda _args, assignments, **_kwargs: (1.0, len(assignments), 0, {worker: 0.1 for worker, _ in assignments}, [{"host_ram_margin": 1.0, "inference_vram_margin": 1.0, "render_vram_margin": 1.0, "peak_host_ram_bytes": 1, "peak_vram_bytes": 1, "cpu_utilization": 0.1, "run_queue": 1, "inference_latency_seconds": 0.1, "inference_queue_depth": 0}], ()),
+    )
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._resource_margins", lambda: (1.0, 1.0, 1.0))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--capacity-sweep", "1,2,4,6", "--trials-per-worker", "1",
+    ])
+
+    report = run_campaign(args)
+
+    expected = [trial.trial_id for trial in build_public_matrix().trials[:13]]
+    assert report["episode_accounting"]["sequential_trial_ids"] == []
+    assert report["episode_accounting"]["capacity_wave_trial_ids"] == [expected[:1], expected[1:3], expected[3:7], expected[7:13]]
+    assert report["episode_accounting"]["attempt_count"] == 13
+    assert report["episode_accounting"]["attempted_unique_trial_ids"] == sorted(expected)
+
+
+def test_cpu_capacity_assignment_represents_one_cpu_worker_explicitly(tmp_path) -> None:
+    args = _worker_args(tmp_path)
+    args.device = "cpu"
+
+    assert _worker_gpu_indices(args, 1) == (None,)
+
+
+def test_policy_telemetry_sampler_accepts_worker_attributed_evidence(tmp_path) -> None:
+    telemetry_path = _prepare_policy_telemetry_path(tmp_path, worker_id=1)
+    telemetry_path.write_text(
+        '{"latency_seconds":0.2,"queue_depth_after_enqueue":16,"request_id":"abc"}\n',
+        encoding="utf-8",
+    )
+
+    sample = _PolicyTelemetrySampler({1: telemetry_path}, wave_started_ns=0).sample(final=True)
+
+    assert sample == {
+        "inference_latency_seconds": 0.2,
+        "inference_queue_depth": 16,
+        "policy_evidence_failures": (),
+        "policy_evidence_records": (),
+    }
+
+
+def test_policy_telemetry_sampler_consumes_each_appended_record_once(tmp_path) -> None:
+    telemetry_path = _prepare_policy_telemetry_path(tmp_path, worker_id=1)
+    telemetry_path.write_text(
+        '{"latency_seconds":0.2,"queue_depth_after_enqueue":2,"request_id":"first"}\n',
+        encoding="utf-8",
+    )
+    sampler = _PolicyTelemetrySampler({1: telemetry_path}, wave_started_ns=0)
+
+    sampler.sample()
+    sampler.sample()
+    with telemetry_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"latency_seconds":0.3,"queue_depth_after_enqueue":3,"request_id":"second"}\n')
+    sample = sampler.sample(final=True)
+
+    assert sampler._latencies == [0.2, 0.3]
+    assert sampler._queue_depths == [2, 3]
+    assert sample["inference_latency_seconds"] == 0.3
+    assert sample["inference_queue_depth"] == 3
+
+
+@pytest.mark.parametrize(
+    ("payload", "started_ns", "expected"),
+    (
+        ("", 0, "policy_telemetry_missing"),
+        ("not-json\n", 0, "policy_telemetry_malformed"),
+        ('{"latency_seconds":0.2,"queue_depth_after_enqueue":1,"request_id":"abc"}\n', 2, "policy_telemetry_stale"),
+    ),
+)
+def test_policy_telemetry_sampler_fails_closed_on_missing_malformed_or_stale_evidence(tmp_path, payload, started_ns, expected) -> None:
+    telemetry_path = _prepare_policy_telemetry_path(tmp_path, worker_id=1)
+    telemetry_path.write_text(payload, encoding="utf-8")
+    if started_ns:
+        os.utime(telemetry_path, ns=(1, 1))
+
+    sample = _PolicyTelemetrySampler({1: telemetry_path}, wave_started_ns=started_ns).sample(final=True)
+
+    assert sample["policy_evidence_failures"] == (expected,)
+    assert sample["inference_latency_seconds"] is None
+    assert sample["inference_queue_depth"] is None
+
+
+def test_policy_telemetry_sampler_rejects_a_path_attributed_to_the_wrong_worker(tmp_path) -> None:
+    telemetry_path = _prepare_policy_telemetry_path(tmp_path, worker_id=2)
+    telemetry_path.write_text(
+        '{"latency_seconds":0.2,"queue_depth_after_enqueue":1,"request_id":"abc"}\n',
+        encoding="utf-8",
+    )
+
+    sample = _PolicyTelemetrySampler({1: telemetry_path}, wave_started_ns=0).sample(final=True)
+
+    assert sample["policy_evidence_failures"] == ("policy_telemetry_wrong_worker",)
+
+
+def test_policy_telemetry_paths_are_unique_regular_files_beneath_the_assigned_worker_root(tmp_path) -> None:
+    first = _prepare_policy_telemetry_path(tmp_path, worker_id=1)
+    second = _prepare_policy_telemetry_path(tmp_path, worker_id=1)
+
+    assert first != second
+    assert first.parent == tmp_path / "workers" / "worker-01"
+    assert first.stat().st_mode & 0o170000 == 0o100000
+
+
+def test_policy_telemetry_path_rejects_a_symlinked_workers_root(tmp_path) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    (tmp_path / "workers").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="unsafe"):
+        _prepare_policy_telemetry_path(tmp_path, worker_id=1)
+
+    assert not list(external.iterdir())
+
+
+def test_policy_telemetry_sampler_rejects_replacement_before_its_first_read(tmp_path) -> None:
+    provisioned = _prepare_policy_telemetry_path(tmp_path, worker_id=1)
+    path = provisioned.path
+    path.unlink()
+    path.write_text(
+        '{"latency_seconds":0.2,"queue_depth_after_enqueue":1,"request_id":"replacement"}\n',
+        encoding="utf-8",
+    )
+
+    sample = _PolicyTelemetrySampler({1: provisioned}, wave_started_ns=0).sample(final=True)
+
+    assert sample["policy_evidence_records"] == (
+        {"worker_id": 1, "failure_class": "policy_telemetry_unsafe_path"},
+    )
+
+
+def test_worker_environment_removes_an_inherited_policy_telemetry_path(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("LEHOME_FLYWHEEL_POLICY_TELEMETRY_PATH", "/untrusted/inherited.jsonl")
+
+    environment = _worker_environment(_worker_args(tmp_path), None)
+
+    assert "LEHOME_FLYWHEEL_POLICY_TELEMETRY_PATH" not in environment
+
+
+def test_campaign_retains_multi_worker_policy_failure_records_counts_and_rejection(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda state: state.trial_ids)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+
+    def sample_for(assignments, policy_records=()):
+        return (
+            1.0,
+            len(assignments),
+            0,
+            {worker_id: 0.1 for worker_id, _ in assignments},
+            [{
+                "host_ram_margin": 1.0,
+                "inference_vram_margin": 1.0,
+                "render_vram_margin": 1.0,
+                "peak_host_ram_bytes": 1,
+                "peak_vram_bytes": 1,
+                "cpu_utilization": 0.1,
+                "run_queue": 1,
+                "inference_latency_seconds": 0.1,
+                "inference_queue_depth": 0,
+                "policy_evidence_failures": tuple(record["failure_class"] for record in policy_records),
+                "policy_evidence_records": policy_records,
+            }],
+            (),
+        )
+
+    def run_group(_args, assignments, **_kwargs):
+        if len(assignments) == 1:
+            return sample_for(assignments)
+        return sample_for(assignments, (
+            {"worker_id": 1, "failure_class": "policy_telemetry_malformed"},
+            {"worker_id": 2, "failure_class": "policy_telemetry_missing"},
+        ))
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--capacity-sweep", "1,2",
+    ])
+
+    report = run_campaign(args)
+    second_wave = report["capacity"]["samples"][1]
+    decision = choose_worker_count((
+        CapacitySample(1, 1.0, 1, 0, 1.0, 1.0, cpu_utilization=0.1, run_queue=1, inference_latency_seconds=0.1, inference_queue_depth=0),
+        CapacitySample(2, 1.0, 2, 0, 1.0, 1.0, cpu_utilization=0.1, run_queue=1, inference_latency_seconds=0.1, inference_queue_depth=0, policy_evidence_failures=("policy_telemetry_malformed", "policy_telemetry_missing")),
+    ))
+
+    assert second_wave["policy_evidence_records"] == [
+        {"worker_id": 1, "failure_class": "policy_telemetry_malformed"},
+        {"worker_id": 2, "failure_class": "policy_telemetry_missing"},
+    ]
+    assert second_wave["worker_failures"] == [
+        {"worker_id": 1, "trial_id": build_public_matrix().trials[1].trial_id, "classes": ["policy_telemetry_malformed"]},
+        {"worker_id": 2, "trial_id": build_public_matrix().trials[2].trial_id, "classes": ["policy_telemetry_missing"]},
+    ]
+    assert second_wave["failure_counts"] == {"policy_telemetry_malformed": 1, "policy_telemetry_missing": 1}
+    assert report["capacity"]["rejected"][2] == ("policy_telemetry_malformed", "policy_telemetry_missing")
+    assert decision.rejected[2] == ("policy_telemetry_malformed", "policy_telemetry_missing")
+
+
+def test_failure_classification_ignores_benign_subsystem_mentions_and_requires_an_error_line(tmp_path) -> None:
+    log_path = tmp_path / "worker.log"
+    log_path.write_text("policy loaded with CUDA and Vulkan support\n", encoding="utf-8")
+
+    assert _failure_classes(log_path, returncode=0, progressed=True) == ()
+
+    log_path.write_text("INFO: policy loaded\nERROR: CUDA context initialization failed\n", encoding="utf-8")
+
+    assert _failure_classes(log_path, returncode=1, progressed=True) == ("nonzero_exit", "cuda")
 
 
 def test_campaign_missing_provenance_rejects_before_worker_launch(monkeypatch, tmp_path) -> None:
@@ -378,6 +629,8 @@ def test_campaign_dry_run_scans_completion_once_for_the_280_trial_report(monkeyp
 
     assert len(calls) == 1
     assert report["completed_after"] == []
+    assert report["episode_accounting"]["attempt_count"] == 0
+    assert report["episode_accounting"]["sequential_trial_ids"] == []
 
 
 def test_capacity_sweep_uses_post_sweep_completion_scan_for_completed_after(monkeypatch, tmp_path) -> None:
@@ -385,15 +638,15 @@ def test_capacity_sweep_uses_post_sweep_completion_scan_for_completed_after(monk
     pending_results: list[tuple[str, ...]] = []
 
     def pending_for_phase(state: CampaignState) -> tuple[str, ...]:
-        index = len(pending_results)
-        result = state.trial_ids[index + 2 :]
+        result = state.trial_ids if not pending_results else state.trial_ids[1:]
         pending_results.append(result)
         return result
 
     monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", pending_for_phase)
-    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_one_worker", lambda *_args, **_kwargs: 0)
-    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", lambda *_args, **_kwargs: (1.0, 1, 0))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_one_worker", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sequential trial launched")))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", lambda *_args, **_kwargs: (1.0, 1, 0, {1: 0.1}, [{"host_ram_margin": 1.0, "inference_vram_margin": 1.0, "render_vram_margin": 1.0, "peak_host_ram_bytes": 1, "peak_vram_bytes": 1, "cpu_utilization": 0.1, "run_queue": 1, "inference_latency_seconds": 0.1, "inference_queue_depth": 0}], ()))
     monkeypatch.setattr("scripts.run_groot_flywheel_campaign._resource_margins", lambda: (1.0, 1.0, 1.0))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda *_args, **_kwargs: (0,))
     args = build_parser().parse_args([
         "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
         "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
@@ -403,8 +656,8 @@ def test_capacity_sweep_uses_post_sweep_completion_scan_for_completed_after(monk
 
     report = run_campaign(args)
 
-    assert len(pending_results) == 3
-    assert report["completed_after"] == [trial.trial_id for trial in build_public_matrix().trials[:4]]
+    assert len(pending_results) == 2
+    assert report["completed_after"] == [build_public_matrix().trials[0].trial_id]
 
 
 def test_campaign_rejects_a_noncanonical_matrix_before_worker_launch(monkeypatch, tmp_path) -> None:

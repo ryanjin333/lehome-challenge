@@ -10,6 +10,11 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+from stat import S_ISREG
+from time import perf_counter_ns
 from typing import Any, Mapping
 from uuid import uuid4
 
@@ -172,6 +177,10 @@ class ActionChunkQueue:
             raise RuntimeError("action queue unexpectedly emptied")
         return queued
 
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
     def clear(self) -> None:
         self._pending.clear()
 
@@ -181,6 +190,36 @@ class QueuedAction:
     value: np.ndarray
     request_id: str
     chunk_offset: int
+
+
+def _append_policy_telemetry(*, request_id: str, latency_seconds: float, queue_depth_after_enqueue: int) -> None:
+    """Append one strict record to the campaign-provisioned telemetry file."""
+    raw_path = os.environ.get("LEHOME_FLYWHEEL_POLICY_TELEMETRY_PATH")
+    if not raw_path:
+        return
+    path = Path(raw_path)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise RuntimeError("policy telemetry path is unsafe or unavailable") from error
+    try:
+        if not S_ISREG(os.fstat(fd).st_mode):
+            raise RuntimeError("policy telemetry path is not a regular file")
+        payload = json.dumps(
+            {
+                "request_id": request_id,
+                "latency_seconds": latency_seconds,
+                "queue_depth_after_enqueue": queue_depth_after_enqueue,
+            },
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        written = os.write(fd, payload)
+        if written != len(payload):
+            raise RuntimeError("policy telemetry record was not fully written")
+    finally:
+        os.close(fd)
 
 
 @PolicyRegistry.register("groot")
@@ -229,9 +268,16 @@ class GrootPolicy(BasePolicy):
             return queued_action
         request_id = uuid4().hex
         groot_observation = build_groot_observation(observation)
+        inference_started = perf_counter_ns()
         action, _ = self._policy.get_action(groot_observation)
+        inference_finished = perf_counter_ns()
         action_chunk = flatten_groot_action_chunk(action)
         self._action_queue.extend(action_chunk, request_id=request_id)
+        _append_policy_telemetry(
+            request_id=request_id,
+            latency_seconds=(inference_finished - inference_started) / 1_000_000_000,
+            queue_depth_after_enqueue=self._action_queue.pending_count,
+        )
         return self._action_queue.pop_with_provenance_required()
 
 

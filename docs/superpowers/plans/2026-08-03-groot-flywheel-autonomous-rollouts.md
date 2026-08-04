@@ -441,7 +441,18 @@ test "$(realpath Assets/objects/Challenge_Garment/Release)" = \
 ```
 
 ```bash
-uv run python -m scripts.run_groot_flywheel_campaign \
+# Provision a separate Isaac Sim 5.1 rollout image/template before running this
+# command.  The GR00T trainer image intentionally excludes Isaac Sim and must
+# not be used for capacity or rollout execution. Resolve this exact digest from
+# Docker Engine before the container starts; do not hand-type runtime identity.
+IMAGE_REF='YOUR_ISAAC_5_1_ROLLOUT_IMAGE@sha256:<64-lowercase-hex-digest>'
+IMAGE_IDENTITY="$(docker image inspect "$IMAGE_REF" --format '{{index .RepoDigests 0}}' | sed 's/.*@//')"
+test "$IMAGE_IDENTITY" = "${IMAGE_REF##*@}"
+# The 1/2/4/6/8 sweep assigns one isolated visible GPU to each worker.
+docker run --rm --gpus '"device=0,1,2,3,4,5,6,7"' \
+  -e LEHOME_FLYWHEEL_IMAGE_IDENTITY="$IMAGE_IDENTITY" \
+  "$IMAGE_REF" \
+  uv run python -m scripts.run_groot_flywheel_campaign \
   --matrix configs/eval_groot_n17_public_280.json \
   --policy-path /workspace/policies/step-12000 \
   --policy-revision-file /workspace/policies/step-12000/revision.txt \
@@ -452,7 +463,7 @@ uv run python -m scripts.run_groot_flywheel_campaign \
   --release-assets-root /workspace/lehome-release-assets/objects/Challenge_Garment/Release \
   --simulator-version 5.1.0.0 \
   --policy-artifact-sha256 "$(sha256sum /workspace/policies/step-12000/model.safetensors | awk '{print $1}')" \
-  --image-identity sha256:<64-lowercase-hex-digest> \
+  --image-identity "$IMAGE_IDENTITY" \
   --output-root /workspace/rollouts/capacity \
   --capacity-sweep 1,2,4,6,8 \
   --trials-per-worker 1

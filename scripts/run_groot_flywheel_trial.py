@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from importlib.metadata import PackageNotFoundError, version as package_version
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -74,6 +76,74 @@ def read_pinned_revision(path: Path) -> str:
     if not _PINNED.fullmatch(revision):
         raise ValueError("policy revision must be a pinned 40-character SHA")
     return revision
+
+
+def _sha256_regular_file(path: Path) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("policy artifact must be a materialized regular file")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _live_code_identity(args: argparse.Namespace) -> str:
+    """Require the executed checkout, not a caller-supplied label, to be immutable."""
+    root = _code_checkout_root().resolve()
+    try:
+        revision = subprocess.run(
+            ("git", "-C", str(root), "rev-parse", "HEAD"), check=False, capture_output=True, text=True,
+        )
+        status = subprocess.run(
+            ("git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"),
+            check=False, capture_output=True, text=True,
+        )
+    except OSError as error:
+        raise ValueError("executed code checkout is not readable Git evidence") from error
+    identity = revision.stdout.strip()
+    if revision.returncode != 0 or not _PINNED.fullmatch(identity) or status.returncode != 0 or status.stdout:
+        raise ValueError("executed code checkout must be a clean pinned Git revision")
+    return identity
+
+
+def _live_policy_identity(args: argparse.Namespace) -> tuple[str, str]:
+    """Hash the exact checkpoint file named by the documented rollout command."""
+    if args.policy_revision_file is None:
+        raise ValueError("live policy identity requires a pinned revision file")
+    revision = read_pinned_revision(args.policy_revision_file)
+    artifact = args.policy_path / "model.safetensors"
+    return revision, _sha256_regular_file(artifact)
+
+
+def _runtime_container_image_identity() -> str:
+    """Read the orchestrator-injected immutable OCI digest from this container."""
+    identity = os.environ.get("LEHOME_FLYWHEEL_IMAGE_IDENTITY", "")
+    if not _OCI_DIGEST.fullmatch(identity):
+        raise ValueError("launched container image identity is unavailable or not an OCI SHA-256 digest")
+    return identity
+
+
+def _validate_live_execution_identity(
+    args: argparse.Namespace,
+    *,
+    code_identity_reader: Callable[[argparse.Namespace], str] = _live_code_identity,
+    policy_identity_reader: Callable[[argparse.Namespace], tuple[str, str]] = _live_policy_identity,
+    image_identity_reader: Callable[[], str] = _runtime_container_image_identity,
+) -> None:
+    """Fail before Isaac starts unless every recorded execution identity is live."""
+    code_revision = code_identity_reader(args)
+    policy_revision, policy_digest = policy_identity_reader(args)
+    image_identity = image_identity_reader()
+    if code_revision != args.code_revision:
+        raise ValueError("declared code revision does not match the executed checkout")
+    expected_revision = read_pinned_revision(args.policy_revision_file) if args.policy_revision_file is not None else args.policy_revision
+    if policy_revision != expected_revision:
+        raise ValueError("declared policy revision does not match the mounted policy")
+    if policy_digest != args.policy_artifact_sha256:
+        raise ValueError("declared policy artifact SHA-256 does not match the mounted policy")
+    if image_identity != args.image_identity:
+        raise ValueError("declared container image identity does not match the launched container")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -372,6 +442,7 @@ def run_trial(
     args: argparse.Namespace,
     *,
     runtime_identity_reader: Callable[[argparse.Namespace, object], tuple[str, str]] = _live_runtime_identity,
+    execution_identity_validator: Callable[[argparse.Namespace], None] = _validate_live_execution_identity,
 ) -> int:
     revision = validate_args(args)
     if args.snapshot_roundtrip_only or args.render_randomization_sheet:
@@ -379,7 +450,7 @@ def run_trial(
         from isaaclab.app import AppLauncher
         from scripts.utils import common
         parser = argparse.ArgumentParser(add_help=False); AppLauncher.add_app_launcher_args(parser)
-        launch_args, _ = parser.parse_known_args([])
+        launch_args, _ = parser.parse_known_args(["--headless"] if args.headless else [])
         app = common.launch_app_from_args(launch_args)
         try:
             return run_snapshot_acceptance(args) if args.snapshot_roundtrip_only else run_randomization_acceptance(args)
@@ -406,6 +477,9 @@ def run_trial(
     parser = setup_eval_parser()
     AppLauncher.add_app_launcher_args(parser)
     evaluation_args = parser.parse_args(command)
+    # Code, checkpoint, and OCI identity are available before Isaac allocates
+    # GPU resources, so reject a mislabeled invocation before simulator startup.
+    execution_identity_validator(args)
     simulation_app = common.launch_app_from_args(evaluation_args)
     try:
         _validate_live_runtime_identity(
