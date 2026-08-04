@@ -792,7 +792,7 @@ def _run_production_collection(args: argparse.Namespace, session: CollectorSessi
     from isaaclab.app import AppLauncher
     from scripts.eval_policy import PolicyRegistry
     import scripts.eval_policy.groot_policy  # noqa: F401
-    from scripts.run_groot_flywheel_trial import _production_env, _validate_live_runtime_identity
+    from scripts.run_groot_flywheel_trial import _live_runtime_identity, _production_env, _validate_live_runtime_identity
     from scripts.utils import common
 
     launch_parser = argparse.ArgumentParser(add_help=False)
@@ -801,7 +801,7 @@ def _run_production_collection(args: argparse.Namespace, session: CollectorSessi
     app = common.launch_app_from_args(launch_args)
     env = None
     try:
-        _validate_live_runtime_identity(args, app)
+        _validate_live_runtime_identity(args, app, runtime_identity_reader=_live_runtime_identity)
         env = _production_env(args)
         policy = PolicyRegistry.create("groot", model_path=str(args.policy_path), device=args.device, task_description="fold the garment on the table")
         policy.reset()

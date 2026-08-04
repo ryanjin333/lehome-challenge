@@ -144,13 +144,26 @@ def test_production_collection_rejects_identity_after_app_launch_before_environm
     monkeypatch.setitem(__import__("sys").modules, "scripts.eval_policy.groot_policy", groot_policy)
     monkeypatch.setitem(__import__("sys").modules, "scripts.utils", utils)
     monkeypatch.setitem(__import__("sys").modules, "scripts.utils.common", common)
+    args = argparse.Namespace(
+        image_identity="sha256:" + "a" * 64,
+        release_assets_root=tmp_path / "assets" / "Release",
+        simulator_version="isaac-5.1",
+        asset_revision="b" * 40,
+    )
+
+    def mismatched_runtime_identity(received_args, received_app):
+        assert received_args is args
+        assert received_app is not None
+        events.append("identity")
+        return "isaac-5.2", args.asset_revision
+
     monkeypatch.setattr(trial_module, "_production_env", lambda _args: (_ for _ in ()).throw(AssertionError("environment constructed")))
-    monkeypatch.setattr(trial_module, "_validate_live_runtime_identity", lambda *_args, **_kwargs: (events.append("gate"), (_ for _ in ()).throw(ValueError("identity mismatch")))[1])
+    monkeypatch.setattr(trial_module, "_live_runtime_identity", mismatched_runtime_identity)
 
-    with pytest.raises(ValueError, match="identity mismatch"):
-        dagger_module._run_production_collection(argparse.Namespace(), object())
+    with pytest.raises(ValueError, match="declared simulator version does not match"):
+        dagger_module._run_production_collection(args, object())
 
-    assert events == ["launch", "gate", "close"]
+    assert events == ["launch", "identity", "close"]
 
 
 def test_collection_waits_for_an_authenticated_healthy_bridge_before_starting(tmp_path) -> None:
