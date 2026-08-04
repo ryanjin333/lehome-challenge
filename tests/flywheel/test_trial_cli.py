@@ -229,7 +229,7 @@ def test_acceptance_launch_forwards_headless_to_isaac_app(monkeypatch, tmp_path)
     monkeypatch.setattr(trial_module, "run_snapshot_acceptance", lambda _args: 0)
     args = build_parser().parse_args(["--snapshot-roundtrip-only", "--garment", "Pant_Long_Seen_0", "--headless", "--output-root", str(tmp_path)])
 
-    assert run_trial(args) == 0
+    assert run_trial(args, runtime_preflight=lambda: None) == 0
     assert launched == [True]
 
 
@@ -670,6 +670,7 @@ def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(
             args,
             runtime_identity_reader=lambda _args, _app: ("wrong-runtime", "c" * 40),
             execution_identity_validator=lambda _args: None,
+            runtime_preflight=lambda: None,
         )
     assert launched == []
     assert not (tmp_path / "run" / "flywheel-manifest-isolated-worker.json").exists()
@@ -677,8 +678,40 @@ def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(
         args,
         runtime_identity_reader=lambda _args, _app: ("isaac", "c" * 40),
         execution_identity_validator=lambda _args: None,
+        runtime_preflight=lambda: None,
     ) == 0
     assert launched == [("Pant_Long_Seen_0", "isolated-worker", 1)]
+
+
+def test_production_trial_checks_host_before_policy_server_app_launcher_or_output(tmp_path) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    output_root = tmp_path / "output"
+    args = build_parser().parse_args([
+        "--policy-path", str(policy), "--policy-revision", "a" * 40,
+        "--garment", "Pant_Long_Seen_0", "--episode-id", "preflight-order",
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "b" * 40,
+        "--asset-revision", "c" * 40, "--simulator-version", "5.1.0.0",
+        "--category", "pant_long", "--release-stage", "seen", "--policy-artifact-sha256", "d" * 64,
+        "--image-identity", "sha256:" + "e" * 64, "--output-root", str(output_root),
+        "--release-assets-root", str(tmp_path / "assets" / "Release"),
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "f" * 40,
+        "--groot-python", str(tmp_path / "python3.10"), "--policy-server-port", "5511",
+        "--policy-server-readiness-timeout", "1", "--policy-server-request-timeout", "1",
+        "--policy-server-termination-grace", "1", "--policy-server-log", str(tmp_path / "server.log"),
+        "--device", "cuda:0",
+    ])
+    events: list[str] = []
+
+    def preflight() -> None:
+        events.append("preflight")
+        raise ValueError("incompatible host")
+
+    with pytest.raises(ValueError, match="incompatible host"):
+        run_trial(args, runtime_preflight=preflight)
+
+    assert events == ["preflight"]
+    assert not output_root.exists()
 
 
 def test_real_evaluation_rejects_manifest_environment_garment_mismatch_before_recording(monkeypatch, tmp_path) -> None:

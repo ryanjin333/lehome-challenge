@@ -46,6 +46,11 @@ safety rejection into a training example.
 The remote collector requires these explicit conditions before it enables an
 interactive expert or DAgger loop. Validation completes before importing Isaac
 or constructing an app launcher; a failed command has not started a simulator.
+On a paid remote host it also runs the Isaac Sim 5.1 runtime gate before
+creating the session secret or run directory. Use `python scripts/check_isaac_runtime.py`
+as the normalized image/template startup action; it requires Linux `x86_64`
+and a reviewed R580 NVIDIA driver (`>=580.65.06`, `<590.0.0`). Do not use an
+R590/595 host for collection, even if it otherwise reports CUDA support.
 
 ```bash
 python scripts/collect_groot_dagger.py \

@@ -161,9 +161,42 @@ def test_production_collection_rejects_identity_after_app_launch_before_environm
     monkeypatch.setattr(trial_module, "_live_runtime_identity", mismatched_runtime_identity)
 
     with pytest.raises(ValueError, match="declared simulator version does not match"):
-        dagger_module._run_production_collection(args, object())
+        dagger_module._run_production_collection(args, object(), runtime_preflight=lambda: None)
 
     assert events == ["launch", "identity", "close"]
+
+
+def test_interactive_dagger_checks_host_before_session_output_creation(monkeypatch) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(dagger_module, "validate_args", lambda _args: None)
+    monkeypatch.setattr(
+        dagger_module,
+        "require_isaac_sim_5_1_runtime",
+        lambda: events.append("preflight") or (_ for _ in ()).throw(ValueError("incompatible host")),
+    )
+    monkeypatch.setattr(
+        dagger_module,
+        "prepare_session",
+        lambda _args: (_ for _ in ()).throw(AssertionError("session output created")),
+    )
+
+    with pytest.raises(ValueError, match="incompatible host"):
+        main(["--interactive"])
+
+    assert events == ["preflight"]
+
+
+def test_direct_dagger_collection_checks_host_before_isaac_import(monkeypatch) -> None:
+    events: list[str] = []
+
+    def preflight() -> None:
+        events.append("preflight")
+        raise ValueError("incompatible host")
+
+    with pytest.raises(ValueError, match="incompatible host"):
+        dagger_module._run_production_collection(object(), object(), runtime_preflight=preflight)
+
+    assert events == ["preflight"]
 
 
 def test_collection_waits_for_an_authenticated_healthy_bridge_before_starting(tmp_path) -> None:

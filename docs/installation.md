@@ -8,6 +8,22 @@ This guide provides step-by-step instructions for manually installing the LeHome
 - [uv](https://github.com/astral-sh/uv) package manager
 - GPU driver and CUDA supporting IsaacSim5.1.0.
 
+### Isaac Sim 5.1 rollout-host gate
+
+Before downloading a policy or starting Isaac on a paid rollout host, run:
+
+```bash
+python scripts/check_isaac_runtime.py
+```
+
+It prints a deterministic JSON receipt and exits nonzero unless the host is
+Linux `x86_64` with a consistent NVIDIA R580 driver at least `580.65.06` and
+below `590.0.0`. This is intentionally narrower than “a newer driver”: R590,
+including `595.71.05`, is not reviewed for this Isaac Sim 5.1 rollout runtime.
+Switch hosts rather than trying to upgrade or downgrade the injected Vast
+driver from inside an unprivileged container. Make this command the first
+startup action in the normalized image/template, before model downloads.
+
 ## Installation Steps
 
 ### 1. Clone the Repository

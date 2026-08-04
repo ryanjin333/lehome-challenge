@@ -20,6 +20,7 @@ from typing import Callable, Sequence
 
 import numpy as np
 from lehome.flywheel.artifacts import atomic_write_json
+from lehome.flywheel.runtime_preflight import require_isaac_sim_5_1_runtime
 
 
 _PINNED = re.compile(r"^[0-9a-f]{40}$")
@@ -804,8 +805,14 @@ def run_trial(
     *,
     runtime_identity_reader: Callable[[argparse.Namespace, object], tuple[str, str]] = _live_runtime_identity,
     execution_identity_validator: Callable[[argparse.Namespace], None] = _validate_live_execution_identity,
+    runtime_preflight: Callable[[], object] | None = None,
 ) -> int:
     revision = validate_args(args)
+    # Do this before all Isaac imports, policy-server construction, and output
+    # receipts.  A non-dry-run host with an unreviewed driver must not consume
+    # model hydration time or leave a partial rollout directory behind.
+    if not args.dry_run:
+        (runtime_preflight or require_isaac_sim_5_1_runtime)()
     if args.snapshot_roundtrip_only or args.render_randomization_sheet:
         # These modes use the same launched Isaac process as normal evaluation.
         from isaaclab.app import AppLauncher

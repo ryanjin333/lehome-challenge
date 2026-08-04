@@ -22,6 +22,7 @@ from lehome.flywheel.intervention import InterventionController
 from lehome.flywheel.isaac_recorder import MixedSourceRecorder, RecordedEpisode
 from lehome.flywheel.models import ActionSource, EpisodeOutcome, QualityGrade, RejectionReason
 from lehome.flywheel.quality import AttemptStats, QualityResult, QualityThresholds, grade_attempt, load_quality_thresholds
+from lehome.flywheel.runtime_preflight import require_isaac_sim_5_1_runtime
 from lehome.flywheel.snapshots import capture_snapshot
 
 
@@ -787,8 +788,14 @@ class BackgroundStdinControlSource(ScheduledControlSource):
             return None
 
 
-def _run_production_collection(args: argparse.Namespace, session: CollectorSession) -> RecordedEpisode:  # pragma: no cover - requires Isaac/GR00T
+def _run_production_collection(
+    args: argparse.Namespace,
+    session: CollectorSession,
+    *,
+    runtime_preflight: Callable[[], object] | None = None,
+) -> RecordedEpisode:  # pragma: no cover - requires Isaac/GR00T
     """Launch Isaac and GR00T only after strict argument validation completed."""
+    (runtime_preflight or require_isaac_sim_5_1_runtime)()
     from isaaclab.app import AppLauncher
     from scripts.eval_policy import PolicyRegistry
     import scripts.eval_policy.groot_policy  # noqa: F401
@@ -860,13 +867,21 @@ def _run_production_collection(args: argparse.Namespace, session: CollectorSessi
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.interactive:
+        # Validate before this host gate so malformed input cannot disguise the
+        # actual command boundary, then reject an incompatible paid host before
+        # session-secret or output creation.
+        validate_args(args)
+        require_isaac_sim_5_1_runtime()
     session = prepare_session(args)
     try:
         print(json.dumps({"ssh_forward": ssh_forward_command(args.listen_port), **session.status()}, sort_keys=True))
         if args.interactive:
             session.start_listener()
             session.wait_for_bridge_ready()
-            result = _run_production_collection(args, session)
+            # main completed the pre-output host gate above; keep the helper's
+            # default guard for direct callers and avoid a second probe here.
+            result = _run_production_collection(args, session, runtime_preflight=lambda: None)
             print(json.dumps({"episode_id": result.path.name, "bc_target_count": result.episode["bc_target_count"], "trainable": result.episode["trainable"]}, sort_keys=True))
         return 0
     finally:

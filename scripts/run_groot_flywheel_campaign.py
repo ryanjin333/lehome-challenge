@@ -16,13 +16,14 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 from uuid import uuid4
 
 from lehome.flywheel.artifacts import verify_episode_manifest
 from lehome.flywheel.capacity import CapacityDecision, CapacitySample, choose_worker_count
 from lehome.flywheel.isaac_recorder import CANONICAL_VIDEO_FILENAMES
 from lehome.flywheel.matrix import Trial, load_public_matrix, matrix_sha256
+from lehome.flywheel.runtime_preflight import require_isaac_sim_5_1_runtime
 
 
 @dataclass(frozen=True, slots=True)
@@ -1031,7 +1032,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_campaign(args: argparse.Namespace) -> dict[str, object]:
+def run_campaign(
+    args: argparse.Namespace,
+    *,
+    runtime_preflight: Callable[[], object] | None = None,
+) -> dict[str, object]:
     if (
         args.trials_per_worker <= 0
         or args.worker_timeout_seconds <= 0
@@ -1043,6 +1048,10 @@ def run_campaign(args: argparse.Namespace) -> dict[str, object]:
         or args.max_inference_queue_depth <= 0
     ):
         raise ValueError("worker counts and timeouts must be finite and positive")
+    # One host decision applies to every campaign child.  It deliberately runs
+    # before matrix/output processing, subprocess creation, or policy hydration.
+    if not args.dry_run:
+        (runtime_preflight or require_isaac_sim_5_1_runtime)()
     matrix = load_public_matrix(args.matrix)
     trials = matrix.trials
     if not args.dry_run:

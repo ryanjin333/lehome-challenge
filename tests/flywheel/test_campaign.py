@@ -31,6 +31,14 @@ from scripts.run_groot_flywheel_campaign import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _keep_unit_campaigns_host_independent(monkeypatch):
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.require_isaac_sim_5_1_runtime",
+        lambda: None,
+    )
+
+
 def campaign_state_with_completed_trial(tmp_path, trial_id: str) -> CampaignState:
     writer = EpisodeArtifactWriter(tmp_path, trial_id)
     writer.append_annotation({"step": 0, "action_source": "policy"})
@@ -791,6 +799,49 @@ def test_campaign_rejects_a_noncanonical_matrix_before_worker_launch(monkeypatch
 
     with pytest.raises(ValueError, match="canonical public contract"):
         run_campaign(args)
+
+
+def test_dry_run_skips_the_runtime_preflight_even_when_injected_gate_would_fail(tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision",
+        "--output-root", str(tmp_path / "output"), "--policy-repo", "org/policy", "--policy-step", "1",
+        "--code-revision", "a" * 40, "--asset-revision", "b" * 40,
+        "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "5.1.0.0",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:" + "d" * 64,
+        "--dry-run",
+    ])
+
+    report = run_campaign(
+        args,
+        runtime_preflight=lambda: (_ for _ in ()).throw(AssertionError("dry-run preflight called")),
+    )
+
+    assert report["pending_before"]
+
+
+def test_production_campaign_checks_host_before_matrix_or_output_creation(tmp_path) -> None:
+    output_root = tmp_path / "output"
+    args = build_parser().parse_args([
+        "--matrix", str(tmp_path / "would-not-be-read.json"), "--policy-path", "policy",
+        "--policy-revision-file", "revision", "--output-root", str(output_root),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"),
+        "--simulator-version", "5.1.0.0", "--policy-artifact-sha256", "c" * 64,
+        "--image-identity", "sha256:" + "d" * 64, "--groot-root", str(tmp_path / "Isaac-GR00T"),
+        "--groot-revision", "e" * 40, "--groot-python", str(tmp_path / "python3.10"),
+    ])
+    events: list[str] = []
+
+    def preflight() -> None:
+        events.append("preflight")
+        raise ValueError("incompatible host")
+
+    with pytest.raises(ValueError, match="incompatible host"):
+        run_campaign(args, runtime_preflight=preflight)
+
+    assert events == ["preflight"]
+    assert not output_root.exists()
 
 
 def _worker_args(tmp_path, *, worker_timeout_seconds: float = 2.0, terminate_grace_seconds: float = 0.25) -> argparse.Namespace:
