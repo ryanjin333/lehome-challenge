@@ -10,9 +10,10 @@ from pathlib import Path
 import sys
 import types
 
+import scripts.run_groot_flywheel_trial as trial_module
 from scripts.run_groot_flywheel_trial import (
-    _manifest_path, _scene_state_matches, build_parser, read_pinned_revision, run_randomization_acceptance,
-    run_snapshot_acceptance, run_trial, validate_args,
+    _live_runtime_identity, _manifest_path, _scene_state_matches, build_parser, read_pinned_revision, run_randomization_acceptance,
+    run_snapshot_acceptance, run_trial, validate_args, _validate_live_runtime_identity,
 )
 
 
@@ -21,6 +22,79 @@ def test_trial_cli_requires_pinned_policy_and_existing_matrix(tmp_path) -> None:
     args = parser.parse_args(["--policy-path", str(tmp_path / "missing"), "--policy-revision", "main"])
     with pytest.raises(ValueError, match="pinned"):
         validate_args(args)
+
+
+def test_production_trial_rejects_a_non_digest_image_identity(tmp_path) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    args = build_parser().parse_args([
+        "--policy-path", str(policy), "--policy-revision", "a" * 40,
+        "--episode-id", "identity-check", "--policy-repo", "org/policy", "--policy-step", "1",
+        "--code-revision", "b" * 40, "--asset-revision", "c" * 40,
+        "--simulator-version", "isaac-sim-5.1", "--garment", "Pant_Long_Seen_0",
+        "--category", "pant_long", "--release-stage", "seen", "--policy-artifact-sha256", "d" * 64,
+        "--image-identity", "sha256:image",
+    ])
+
+    with pytest.raises(ValueError, match="OCI SHA-256"):
+        validate_args(args)
+
+
+def test_live_runtime_identity_reads_installed_simulator_and_clean_assets_checkout(monkeypatch, tmp_path) -> None:
+    assets = tmp_path / "Assets" / "objects" / "Challenge_Garment" / "Release"
+    assets.mkdir(parents=True)
+    args = argparse.Namespace(release_assets_root=assets)
+    commands: list[tuple[str, ...]] = []
+
+    def git_run(command, **_kwargs):
+        commands.append(command)
+        if command[-1] == "--show-toplevel":
+            return types.SimpleNamespace(returncode=0, stdout="/runtime/assets-checkout\n")
+        if command[-1] == "HEAD":
+            return types.SimpleNamespace(returncode=0, stdout=("c" * 40) + "\n")
+        return types.SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(trial_module, "package_version", lambda package: "5.1.0.0")
+    monkeypatch.setattr(trial_module.subprocess, "run", git_run)
+
+    assert _live_runtime_identity(args, object()) == ("5.1.0.0", "c" * 40)
+    assert commands == [
+        ("git", "-C", str(assets), "rev-parse", "--show-toplevel"),
+        ("git", "-C", "/runtime/assets-checkout", "rev-parse", "HEAD"),
+        ("git", "-C", "/runtime/assets-checkout", "status", "--porcelain=v1", "--untracked-files=all"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("observed_simulator", "observed_assets", "message"),
+    [
+        ("isaac-sim-5.0", "c" * 40, "simulator version"),
+        ("isaac-sim-5.1", "e" * 40, "asset revision"),
+    ],
+)
+def test_production_trial_rejects_live_runtime_identity_mismatch(
+    tmp_path,
+    observed_simulator: str,
+    observed_assets: str,
+    message: str,
+) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    args = build_parser().parse_args([
+        "--policy-path", str(policy), "--policy-revision", "a" * 40,
+        "--episode-id", "identity-check", "--policy-repo", "org/policy", "--policy-step", "1",
+        "--code-revision", "b" * 40, "--asset-revision", "c" * 40,
+        "--simulator-version", "isaac-sim-5.1", "--garment", "Pant_Long_Seen_0",
+        "--category", "pant_long", "--release-stage", "seen", "--policy-artifact-sha256", "d" * 64,
+        "--image-identity", "sha256:" + "e" * 64,
+    ])
+
+    with pytest.raises(ValueError, match=message):
+        _validate_live_runtime_identity(
+            args,
+            object(),
+            runtime_identity_reader=lambda _args, _app: (observed_simulator, observed_assets),
+        )
 
 
 def test_trial_cli_reads_revision_from_a_regular_file(tmp_path) -> None:
@@ -236,9 +310,19 @@ def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(
         "--episode-id", "isolated-worker", "--policy-repo", "org/policy", "--policy-step", "1",
         "--code-revision", "b" * 40, "--asset-revision", "c" * 40, "--simulator-version", "isaac",
         "--category", "pant_long", "--release-stage", "seen", "--policy-artifact-sha256", "d" * 64,
-        "--image-identity", "sha256:image", "--output-root", str(tmp_path / "run"),
+        "--image-identity", "sha256:" + "e" * 64, "--output-root", str(tmp_path / "run"),
     ])
-    assert run_trial(args) == 0
+    with pytest.raises(ValueError, match="simulator version"):
+        run_trial(
+            args,
+            runtime_identity_reader=lambda _args, _app: ("wrong-runtime", "c" * 40),
+        )
+    assert launched == []
+    assert not (tmp_path / "run" / "flywheel-manifest-isolated-worker.json").exists()
+    assert run_trial(
+        args,
+        runtime_identity_reader=lambda _args, _app: ("isaac", "c" * 40),
+    ) == 0
     assert launched == [("Pant_Long_Seen_0", "isolated-worker", 1)]
 
 

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+from importlib.metadata import PackageNotFoundError, version as package_version
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 from lehome.flywheel.artifacts import atomic_write_json
@@ -15,6 +17,7 @@ from lehome.flywheel.artifacts import atomic_write_json
 
 _PINNED = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_OCI_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def _scene_state_matches(expected: object, observed: object) -> bool:
@@ -60,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--release-stage", choices=("seen", "public_unseen"))
     parser.add_argument("--policy-artifact-sha256")
     parser.add_argument("--image-identity")
+    parser.add_argument(
+        "--release-assets-root",
+        type=Path,
+        default=Path("Assets/objects/Challenge_Garment/Release"),
+    )
     parser.add_argument("--output-root", type=Path, default=Path("outputs/flywheel"))
     parser.add_argument("--task", default="LeHome-BiSO101-Direct-Garment-v2")
     parser.add_argument("--max-steps", type=int, default=600)
@@ -95,6 +103,8 @@ def validate_args(args: argparse.Namespace) -> str:
         raise ValueError("unsupported randomization strategy")
     if not acceptance_mode:
         build_identity(args, revision)
+        if not args.dry_run and not _OCI_DIGEST.fullmatch(args.image_identity):
+            raise ValueError("production flywheel trials require an OCI SHA-256 image digest")
     return revision or ""
 
 
@@ -106,6 +116,59 @@ def build_identity(args: argparse.Namespace, revision: str):
     if not _SHA256.fullmatch(args.policy_artifact_sha256):
         raise ValueError("policy artifact SHA-256 must be a 64-character lowercase digest")
     return EpisodeIdentity(args.episode_id, args.policy_repo, revision, args.policy_step, args.code_revision, args.asset_revision, args.simulator_version, args.garment, args.category, args.release_stage, args.seed, "fold the garment on the table", args.strategy)
+
+
+def _live_runtime_identity(args: argparse.Namespace, _simulation_app: object) -> tuple[str, str]:
+    """Read simulator and Release-assets identity from the launched runtime."""
+
+    try:
+        simulator_version = package_version("isaacsim")
+    except PackageNotFoundError as error:
+        raise ValueError("launched runtime does not expose Isaac Sim version evidence") from error
+    assets_root = args.release_assets_root
+    if assets_root.is_symlink() or not assets_root.is_dir():
+        raise ValueError("launched runtime Release assets are not a real directory")
+    try:
+        checkout = subprocess.run(
+            ("git", "-C", str(assets_root), "rev-parse", "--show-toplevel"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if checkout.returncode != 0 or not checkout.stdout.strip():
+            raise ValueError("launched runtime Release assets are not in a readable clean Git checkout")
+        checkout_root = checkout.stdout.strip()
+        revision = subprocess.run(
+            ("git", "-C", checkout_root, "rev-parse", "HEAD"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        status = subprocess.run(
+            ("git", "-C", checkout_root, "status", "--porcelain=v1", "--untracked-files=all"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise ValueError("launched runtime Release assets are not in a readable clean Git checkout") from error
+    asset_revision = revision.stdout.strip()
+    if revision.returncode != 0 or not _PINNED.fullmatch(asset_revision) or status.returncode != 0 or status.stdout:
+        raise ValueError("launched runtime Release assets are not in a readable clean Git checkout")
+    return simulator_version, asset_revision
+
+
+def _validate_live_runtime_identity(
+    args: argparse.Namespace,
+    simulation_app: object,
+    *,
+    runtime_identity_reader: Callable[[argparse.Namespace, object], tuple[str, str]],
+) -> None:
+    simulator_version, asset_revision = runtime_identity_reader(args, simulation_app)
+    if simulator_version != args.simulator_version:
+        raise ValueError("declared simulator version does not match the launched runtime")
+    if asset_revision != args.asset_revision:
+        raise ValueError("declared asset revision does not match the launched Release assets")
 
 
 def _production_env(args: argparse.Namespace):
@@ -223,7 +286,11 @@ def _manifest_path(args: argparse.Namespace, revision: str) -> Path:
     return path
 
 
-def run_trial(args: argparse.Namespace) -> int:
+def run_trial(
+    args: argparse.Namespace,
+    *,
+    runtime_identity_reader: Callable[[argparse.Namespace, object], tuple[str, str]] = _live_runtime_identity,
+) -> int:
     revision = validate_args(args)
     if args.snapshot_roundtrip_only or args.render_randomization_sheet:
         # These modes use the same launched Isaac process as normal evaluation.
@@ -236,7 +303,6 @@ def run_trial(args: argparse.Namespace) -> int:
             return run_snapshot_acceptance(args) if args.snapshot_roundtrip_only else run_randomization_acceptance(args)
         finally:
             common.close_app(app)
-    manifest = _manifest_path(args, revision)
     command = [
         "--policy_type", "groot", "--policy_path", str(args.policy_path),
         "--garment_type", "custom", "--num_episodes", "1", "--max_steps", str(args.max_steps),
@@ -247,6 +313,7 @@ def run_trial(args: argparse.Namespace) -> int:
     if args.headless:
         command.append("--headless")
     if args.dry_run:
+        manifest = _manifest_path(args, revision)
         print(json.dumps({"command": command, "manifest": str(manifest)}, sort_keys=True))
         return 0
     # Keep the legacy parser untouched: inject this opt-in attribute only in
@@ -258,9 +325,15 @@ def run_trial(args: argparse.Namespace) -> int:
     parser = setup_eval_parser()
     AppLauncher.add_app_launcher_args(parser)
     evaluation_args = parser.parse_args(command)
-    evaluation_args.flywheel_manifest = str(manifest)
     simulation_app = common.launch_app_from_args(evaluation_args)
     try:
+        _validate_live_runtime_identity(
+            args,
+            simulation_app,
+            runtime_identity_reader=runtime_identity_reader,
+        )
+        manifest = _manifest_path(args, revision)
+        evaluation_args.flywheel_manifest = str(manifest)
         import lehome.tasks.bedroom  # noqa: F401
         from scripts.utils.evaluation import eval as evaluate
 
