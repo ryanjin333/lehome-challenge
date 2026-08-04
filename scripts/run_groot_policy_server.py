@@ -48,10 +48,9 @@ def run(args: argparse.Namespace) -> int:
         device="cuda:0",
         strict=True,
     )
-    # ``run`` is the official PolicyServer serving loop.  Its context manager
-    # closes the REP socket and context even if NVIDIA's loop exits with error.
-    with PolicyServer(policy, host=args.host, port=args.port, api_token=api_token) as server:
-        server.run()
+    # The pinned NVIDIA PolicyServer exposes construction and ``run()`` only.
+    server = PolicyServer(policy, host=args.host, port=args.port, api_token=api_token)
+    server.run()
     return 0
 
 
