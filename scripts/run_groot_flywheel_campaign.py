@@ -129,17 +129,107 @@ def _resource_margins() -> tuple[float, float, float]:
     return host_margin, vram_margin, vram_margin
 
 
+def _cleanup_partially_launched_workers(
+    args: argparse.Namespace,
+    processes: Sequence[tuple[int, Trial, subprocess.Popen[str], Path, object]],
+) -> list[BaseException]:
+    """Bound a best-effort shutdown without hiding the launch failure that caused it."""
+    errors: list[BaseException] = []
+    pending: list[tuple[int, Trial, subprocess.Popen[str], Path, object]] = []
+    for record in processes:
+        worker_id, trial, process, heartbeat, log = record
+        try:
+            if process.poll() is None:
+                pending.append(record)
+        except BaseException as error:
+            errors.append(RuntimeError(f"worker {worker_id} could not be polled during launch cleanup: {error}"))
+            pending.append(record)
+
+    for worker_id, trial, process, heartbeat, log in pending:
+        try:
+            process.terminate()
+        except BaseException as error:
+            errors.append(RuntimeError(f"worker {worker_id} could not be terminated during launch cleanup: {error}"))
+        try:
+            _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="timeout")
+        except BaseException as error:
+            errors.append(RuntimeError(f"worker {worker_id} heartbeat cleanup failed: {error}"))
+
+    terminate_deadline = time.monotonic() + args.terminate_grace_seconds
+    while pending and time.monotonic() < terminate_deadline:
+        still_pending = []
+        for record in pending:
+            worker_id, trial, process, heartbeat, log = record
+            try:
+                if process.poll() is None:
+                    still_pending.append(record)
+            except BaseException as error:
+                errors.append(RuntimeError(f"worker {worker_id} could not be polled during launch cleanup: {error}"))
+                still_pending.append(record)
+        pending = still_pending
+        if pending:
+            time.sleep(min(0.1, max(0.0, terminate_deadline - time.monotonic())))
+
+    for worker_id, trial, process, heartbeat, log in pending:
+        try:
+            process.kill()
+        except BaseException as error:
+            errors.append(RuntimeError(f"worker {worker_id} could not be killed during launch cleanup: {error}"))
+
+    reap_deadline = time.monotonic() + args.terminate_grace_seconds
+    for worker_id, trial, process, heartbeat, log in pending:
+        remaining = reap_deadline - time.monotonic()
+        if remaining <= 0:
+            errors.append(RuntimeError(f"worker {worker_id} was not reaped after launch cleanup"))
+            continue
+        try:
+            process.wait(timeout=remaining)
+        except BaseException as error:
+            errors.append(RuntimeError(f"worker {worker_id} could not be reaped during launch cleanup: {error}"))
+
+    for worker_id, trial, process, heartbeat, log in processes:
+        try:
+            log.close()
+        except BaseException as error:
+            errors.append(RuntimeError(f"worker {worker_id} log could not be closed during launch cleanup: {error}"))
+    return errors
+
+
+def _report_launch_cleanup_failures(launch_error: BaseException, cleanup_errors: Sequence[BaseException]) -> None:
+    """Keep the launch exception primary while making cleanup faults observable on Python 3.10+."""
+    if not cleanup_errors:
+        return
+    detail = "; ".join(str(error) for error in cleanup_errors)
+    if hasattr(launch_error, "add_note"):
+        launch_error.add_note(f"Additional launch cleanup failures: {detail}")
+    else:
+        print(f"Additional launch cleanup failures: {detail}", file=sys.stderr)
+
+
 def _run_worker_group(args: argparse.Namespace, assignments: Sequence[tuple[int, Trial]]) -> tuple[float, int, int]:
     """Start workers together and apply one launch-relative deadline to all."""
     started = time.monotonic()
     processes: list[tuple[int, Trial, subprocess.Popen[str], Path, object]] = []
-    for worker_id, trial in assignments:
-        worker_root = args.output_root / "workers" / f"worker-{worker_id:02d}"
-        heartbeat = worker_root / "heartbeat.json"
-        log_path = _attempt_log_path(worker_root, trial.trial_id)
-        _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="started")
-        log = log_path.open("x", encoding="utf-8")
-        processes.append((worker_id, trial, subprocess.Popen(_trial_command(args, trial), stdout=log, stderr=subprocess.STDOUT), heartbeat, log))
+    launch_log: object | None = None
+    try:
+        for worker_id, trial in assignments:
+            worker_root = args.output_root / "workers" / f"worker-{worker_id:02d}"
+            heartbeat = worker_root / "heartbeat.json"
+            log_path = _attempt_log_path(worker_root, trial.trial_id)
+            _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="started")
+            launch_log = log_path.open("x", encoding="utf-8")
+            process = subprocess.Popen(_trial_command(args, trial), stdout=launch_log, stderr=subprocess.STDOUT)
+            processes.append((worker_id, trial, process, heartbeat, launch_log))
+            launch_log = None
+    except BaseException as launch_error:
+        cleanup_errors = _cleanup_partially_launched_workers(args, processes)
+        if launch_log is not None:
+            try:
+                launch_log.close()
+            except BaseException as error:
+                cleanup_errors.append(RuntimeError(f"unlaunched worker log could not be closed during launch cleanup: {error}"))
+        _report_launch_cleanup_failures(launch_error, cleanup_errors)
+        raise
     returncodes: dict[int, int] = {}
     pending = list(processes)
     deadline = started + args.worker_timeout_seconds

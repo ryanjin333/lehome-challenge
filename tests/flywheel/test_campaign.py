@@ -154,6 +154,107 @@ class _SuccessfulProcess:
         raise AssertionError("successful worker must not kill")
 
 
+class _LaunchCleanupProcess:
+    def __init__(self, worker_id: int, events: list[tuple[str, int, float | None]]) -> None:
+        self.worker_id = worker_id
+        self.events = events
+        self.killed = False
+
+    def poll(self):
+        self.events.append(("poll", self.worker_id, None))
+        return 0 if self.killed else None
+
+    def terminate(self) -> None:
+        self.events.append(("terminate", self.worker_id, None))
+
+    def kill(self) -> None:
+        self.events.append(("kill", self.worker_id, None))
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.events.append(("wait", self.worker_id, timeout))
+        assert self.killed
+        return 0
+
+
+def _group_trials(count: int) -> tuple[tuple[int, Trial], ...]:
+    return tuple(
+        (index, Trial("pant_long", f"Pant_Long_Seen_{index}", "seen", 41 + index))
+        for index in range(1, count + 1)
+    )
+
+
+def test_worker_group_cleans_up_started_workers_when_later_log_open_fails(monkeypatch, tmp_path) -> None:
+    events: list[tuple[str, int, float | None]] = []
+    opened = []
+    real_open = Path.open
+    clock = [0.0]
+    open_count = 0
+
+    def open_log(path, *args, **kwargs):
+        if (args and args[0] == "x") or kwargs.get("mode") == "x":
+            nonlocal open_count
+            open_count += 1
+            if open_count == 2:
+                raise OSError("log open failure")
+        log = real_open(path, *args, **kwargs)
+        if (args and args[0] == "x") or kwargs.get("mode") == "x":
+            opened.append(log)
+        return log
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.Path.open", open_log)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.time.sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.subprocess.Popen",
+        lambda *args, **kwargs: _LaunchCleanupProcess(1, events),
+    )
+
+    with pytest.raises(OSError, match="log open failure"):
+        _run_worker_group(_worker_args(tmp_path), _group_trials(2))
+
+    assert [(event, worker) for event, worker, _ in events if event in {"terminate", "kill"}] == [
+        ("terminate", 1), ("kill", 1),
+    ]
+    assert [timeout for event, _, timeout in events if event == "wait"] == [0.25]
+    assert all(log.closed for log in opened)
+
+
+def test_worker_group_cleans_up_and_closes_every_log_when_later_popen_fails(monkeypatch, tmp_path) -> None:
+    events: list[tuple[str, int, float | None]] = []
+    opened = []
+    real_open = Path.open
+    clock = [0.0]
+    launch_count = 0
+
+    def open_log(path, *args, **kwargs):
+        log = real_open(path, *args, **kwargs)
+        opened.append(log)
+        return log
+
+    def launch(*args, **kwargs):
+        nonlocal launch_count
+        launch_count += 1
+        if launch_count == 3:
+            raise OSError("popen failure")
+        return _LaunchCleanupProcess(launch_count, events)
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.Path.open", open_log)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.time.sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.subprocess.Popen", launch)
+
+    with pytest.raises(OSError, match="popen failure"):
+        _run_worker_group(_worker_args(tmp_path), _group_trials(3))
+
+    assert [(event, worker) for event, worker, _ in events if event in {"terminate", "kill"}] == [
+        ("terminate", 1), ("terminate", 2), ("kill", 1), ("kill", 2),
+    ]
+    assert [timeout for event, _, timeout in events if event == "wait"] == [0.25, 0.25]
+    assert clock[0] == pytest.approx(0.25)
+    assert all(log.closed for log in opened)
+
+
 def test_single_worker_uses_configured_shutdown_grace_only_after_main_timeout(monkeypatch, tmp_path) -> None:
     events: list[tuple[str, float | None]] = []
     monkeypatch.setattr(
