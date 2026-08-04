@@ -13,7 +13,7 @@ import sys
 import time
 from typing import Sequence
 
-from lehome.flywheel.artifacts import verify_episode
+from lehome.flywheel.artifacts import verify_episode_manifest
 from lehome.flywheel.capacity import CapacitySample, choose_worker_count
 from lehome.flywheel.isaac_recorder import CANONICAL_VIDEO_FILENAMES
 from lehome.flywheel.matrix import Trial, load_public_matrix, matrix_sha256
@@ -28,18 +28,67 @@ class CampaignState:
 def is_completed_trial(episode_dir: Path) -> bool:
     """Accept only terminal, non-error artifacts with canonical video evidence."""
     try:
-        episode = verify_episode(episode_dir)
+        episode, manifest = verify_episode_manifest(episode_dir)
     except ValueError:
         return False
     if not isinstance(episode.get("terminal_reason"), str) or not episode["terminal_reason"]:
         return False
     if episode.get("outcome") == "error" or episode.get("recorder_error"):
         return False
-    for filename in CANONICAL_VIDEO_FILENAMES:
-        video = episode_dir / "videos" / filename
-        if video.is_symlink() or not video.is_file() or video.stat().st_size <= 0:
-            return False
-    return True
+    expected_videos = {f"videos/{filename}" for filename in CANONICAL_VIDEO_FILENAMES}
+    manifest_videos = {path for path in manifest if path.startswith("videos/")}
+    return manifest_videos == expected_videos and all(manifest[path]["size"] > 0 for path in expected_videos)
+
+
+def _prepare_retry_attempt(output_root: Path, trial_id: str) -> None:
+    """Atomically quarantine an invalid prior attempt before retrying its ID."""
+    if (
+        not isinstance(trial_id, str)
+        or trial_id in {"", ".", ".."}
+        or "/" in trial_id
+        or "\\" in trial_id
+        or Path(trial_id).is_absolute()
+        or Path(trial_id).name != trial_id
+    ):
+        raise ValueError("trial ID must be a non-empty path-safe identifier")
+    root = Path(output_root)
+    if root.is_symlink():
+        raise ValueError("campaign output root must not be a symlink")
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir():
+        raise ValueError("campaign output root must be a directory")
+    raw = root / "raw" / trial_id
+    if is_completed_trial(raw):
+        return
+    sources: list[tuple[str, Path]] = []
+    for name in (".pending", "raw"):
+        parent = root / name
+        if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+            raise ValueError(f"campaign {name} root is unsafe")
+        source = parent / trial_id
+        if source.is_symlink() or (source.exists() and not source.is_dir()):
+            raise ValueError(f"campaign {name} trial path is unsafe")
+        if source.exists():
+            sources.append((name.removeprefix("."), source))
+    if not sources:
+        return
+    quarantine_root = root / "quarantine"
+    if quarantine_root.is_symlink() or (quarantine_root.exists() and not quarantine_root.is_dir()):
+        raise ValueError("campaign quarantine root is unsafe")
+    quarantine_root.mkdir(exist_ok=True)
+    attempt = 1
+    while True:
+        quarantine = quarantine_root / f"{trial_id}.attempt-{attempt:03d}"
+        try:
+            quarantine.mkdir()
+        except FileExistsError:
+            if quarantine.is_symlink() or not quarantine.is_dir():
+                raise ValueError("campaign quarantine attempt path is unsafe")
+            attempt += 1
+            continue
+        break
+    for name, source in sources:
+        source.rename(quarantine / name)
 
 
 def pending_trial_ids(state: CampaignState) -> tuple[str, ...]:
@@ -87,6 +136,7 @@ def _run_one_worker(args: argparse.Namespace, *, worker_id: int, trial: Trial) -
     worker_root = args.output_root / "workers" / f"worker-{worker_id:02d}"
     heartbeat = worker_root / "heartbeat.json"
     log_path = _attempt_log_path(worker_root, trial.trial_id)
+    _prepare_retry_attempt(args.output_root, trial.trial_id)
     _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="started")
     with log_path.open("x", encoding="utf-8") as log:
         process = subprocess.Popen(_trial_command(args, trial), stdout=log, stderr=subprocess.STDOUT)
@@ -229,6 +279,7 @@ def _run_worker_group(args: argparse.Namespace, assignments: Sequence[tuple[int,
             worker_root = args.output_root / "workers" / f"worker-{worker_id:02d}"
             heartbeat = worker_root / "heartbeat.json"
             log_path = _attempt_log_path(worker_root, trial.trial_id)
+            _prepare_retry_attempt(args.output_root, trial.trial_id)
             _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="started")
             launch_log = log_path.open("x", encoding="utf-8")
             process = subprocess.Popen(_trial_command(args, trial), stdout=launch_log, stderr=subprocess.STDOUT)

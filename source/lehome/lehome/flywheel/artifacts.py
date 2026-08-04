@@ -183,8 +183,8 @@ class EpisodeArtifactWriter:
         return destination
 
 
-def verify_episode(episode_dir: Path) -> dict[str, object]:
-    """Fail closed unless every regular file is manifest-listed and checksummed."""
+def verify_episode_manifest(episode_dir: Path) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+    """Verify an episode and return its metadata with the verified manifest."""
     if episode_dir.is_symlink() or not episode_dir.is_dir():
         raise ValueError("episode artifact root must be a real directory")
     manifest = _load_manifest(episode_dir / MANIFEST_NAME)
@@ -216,4 +216,9 @@ def verify_episode(episode_dir: Path) -> dict[str, object]:
         raise ValueError("episode metadata is invalid") from error
     if not isinstance(episode, dict) or episode.get("episode_id") != episode_dir.name:
         raise ValueError("episode metadata ID does not match artifact ID")
-    return episode
+    return episode, manifest
+
+
+def verify_episode(episode_dir: Path) -> dict[str, object]:
+    """Fail closed unless every regular file is manifest-listed and checksummed."""
+    return verify_episode_manifest(episode_dir)[0]

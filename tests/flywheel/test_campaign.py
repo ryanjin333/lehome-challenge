@@ -10,6 +10,7 @@ from lehome.flywheel.isaac_recorder import CANONICAL_VIDEO_FILENAMES
 from lehome.flywheel.matrix import Trial, build_public_matrix, matrix_sha256
 from scripts.run_groot_flywheel_campaign import (
     CampaignState,
+    _prepare_retry_attempt,
     _run_one_worker,
     _run_worker_group,
     _trial_command,
@@ -68,6 +69,77 @@ def test_campaign_resume_retries_a_terminal_artifact_missing_one_canonical_video
     state = CampaignState(output_root=tmp_path, trial_ids=("trial-001",))
 
     assert pending_trial_ids(state) == ("trial-001",)
+
+
+def test_campaign_resume_retries_an_artifact_with_an_extra_manifest_listed_video(tmp_path) -> None:
+    writer = EpisodeArtifactWriter(tmp_path, "trial-001")
+    writer.append_annotation({"step": 0, "action_source": "policy"})
+    videos = writer.staging / "videos"
+    videos.mkdir()
+    for filename in (*CANONICAL_VIDEO_FILENAMES, "debug.mp4"):
+        (videos / filename).write_bytes(b"video")
+    writer.finalize(
+        {"terminal_reason": "horizon", "outcome": "timeout"},
+        required_videos=(*CANONICAL_VIDEO_FILENAMES, "debug.mp4"),
+    )
+
+    assert pending_trial_ids(CampaignState(output_root=tmp_path, trial_ids=("trial-001",))) == ("trial-001",)
+
+
+def test_sequential_retry_quarantines_failed_staging_before_reusing_the_trial_id(monkeypatch, tmp_path) -> None:
+    trial = Trial("pant_long", "Pant_Long_Seen_0", "seen", 42)
+    failed = EpisodeArtifactWriter(tmp_path, trial.trial_id)
+    failed.append_annotation({"step": 0, "action_source": "policy"})
+
+    def launch(*_args, **_kwargs):
+        replacement = EpisodeArtifactWriter(tmp_path, trial.trial_id)
+        replacement.append_annotation({"step": 0, "action_source": "policy"})
+        replacement.finalize({"terminal_reason": "horizon", "outcome": "timeout"})
+        return _SuccessfulProcess([])
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.subprocess.Popen", launch)
+    assert _run_one_worker(_worker_args(tmp_path), worker_id=1, trial=trial) == 0
+
+    assert (tmp_path / "raw" / trial.trial_id).is_dir()
+    assert list((tmp_path / "quarantine").glob(f"{trial.trial_id}.attempt-*/pending"))
+
+
+def test_retry_preparation_rejects_parent_path_without_moving_any_output(tmp_path) -> None:
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel.write_text("preserve", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="path-safe"):
+        _prepare_retry_attempt(tmp_path, "..")
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
+    assert not (tmp_path / "quarantine").exists()
+
+
+def test_parallel_retry_quarantines_invalid_raw_before_worker_reuses_the_trial_id(monkeypatch, tmp_path) -> None:
+    trial = Trial("pant_long", "Pant_Long_Seen_0", "seen", 42)
+    invalid = EpisodeArtifactWriter(tmp_path, trial.trial_id)
+    invalid.append_annotation({"step": 0, "action_source": "policy"})
+    invalid.finalize({"terminal_reason": "horizon", "outcome": "error"})
+    events: list[tuple[str, float | None]] = []
+
+    def launch(*_args, **_kwargs):
+        replacement = EpisodeArtifactWriter(tmp_path, trial.trial_id)
+        replacement.append_annotation({"step": 0, "action_source": "policy"})
+        videos = replacement.staging / "videos"
+        videos.mkdir()
+        for filename in CANONICAL_VIDEO_FILENAMES:
+            (videos / filename).write_bytes(b"video")
+        replacement.finalize(
+            {"terminal_reason": "horizon", "outcome": "timeout"},
+            required_videos=CANONICAL_VIDEO_FILENAMES,
+        )
+        return _SuccessfulProcess(events)
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.subprocess.Popen", launch)
+    _, completed, failed = _run_worker_group(_worker_args(tmp_path), ((1, trial),))
+
+    assert (completed, failed) == (1, 0)
+    assert list((tmp_path / "quarantine").glob(f"{trial.trial_id}.attempt-*/raw"))
 
 
 def test_worker_group_does_not_count_an_encoder_error_as_completed(monkeypatch, tmp_path) -> None:
@@ -380,7 +452,7 @@ def test_worker_group_launches_immediately_and_uses_configured_shutdown_grace(mo
         "scripts.run_groot_flywheel_campaign.subprocess.Popen",
         lambda *args, **kwargs: (events.append(("launch", None)), _TimeoutThenKillProcess(events))[1],
     )
-    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.verify_episode", lambda path: {"terminal_reason": "horizon"})
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda _path: False)
     first_trial = Trial("pant_long", "Pant_Long_Seen_0", "seen", 42)
     second_trial = Trial("pant_long", "Pant_Long_Seen_1", "seen", 43)
 
@@ -404,7 +476,7 @@ def test_worker_group_uses_one_launch_relative_deadline(monkeypatch, tmp_path) -
         "scripts.run_groot_flywheel_campaign.subprocess.Popen",
         lambda *args, **kwargs: (events.append(("launch", None)), _TimeoutThenKillProcess(events))[1],
     )
-    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.verify_episode", lambda path: {"terminal_reason": "horizon"})
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda _path: False)
     trials = (
         (1, Trial("pant_long", "Pant_Long_Seen_0", "seen", 42)),
         (2, Trial("pant_long", "Pant_Long_Seen_1", "seen", 43)),
