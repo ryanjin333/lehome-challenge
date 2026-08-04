@@ -33,6 +33,16 @@ _PYTHON310 = re.compile(r"^Python (3\.10\.[0-9]+)$")
 _ISAAC_PHYSICAL_CUDA_DEVICE = re.compile(r"^cuda:([0-9]+)$")
 
 
+def _add_app_launcher_args(parser: argparse.ArgumentParser, app_launcher: object) -> None:
+    """Prevent AppLauncher from parsing this wrapper's command-line arguments."""
+    original_argv = sys.argv
+    try:
+        sys.argv = [original_argv[0] if original_argv else ""]
+        app_launcher.add_app_launcher_args(parser)
+    finally:
+        sys.argv = original_argv
+
+
 def _checked_run(command: Sequence[str], *, runner: Callable[..., object]) -> object:
     try:
         return runner(tuple(command), check=False, capture_output=True, text=True)
@@ -817,7 +827,8 @@ def run_trial(
         # These modes use the same launched Isaac process as normal evaluation.
         from isaaclab.app import AppLauncher
         from scripts.utils import common
-        parser = argparse.ArgumentParser(add_help=False); AppLauncher.add_app_launcher_args(parser)
+        parser = argparse.ArgumentParser(add_help=False)
+        _add_app_launcher_args(parser, AppLauncher)
         launch_args, _ = parser.parse_known_args(["--headless"] if args.headless else [])
         app = common.launch_app_from_args(launch_args)
         try:
@@ -893,7 +904,7 @@ def run_trial(
         )
         parent_policy_token.install()
         parser = setup_eval_parser()
-        AppLauncher.add_app_launcher_args(parser)
+        _add_app_launcher_args(parser, AppLauncher)
         evaluation_args = parser.parse_args(command)
         evaluation_args.policy_server_endpoint = f"tcp://127.0.0.1:{args.policy_server_port}"
         evaluation_args.policy_server_token_env = _POLICY_SERVER_TOKEN_ENV

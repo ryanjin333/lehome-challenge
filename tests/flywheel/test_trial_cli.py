@@ -210,12 +210,46 @@ def test_runtime_image_identity_requires_a_separately_injected_oci_digest(monkey
     assert trial_module._runtime_container_image_identity() == expected
 
 
+def test_app_launcher_argument_registration_isolated_from_wrapper_argv(monkeypatch) -> None:
+    original_argv = ["trial.py", "--garment", "Top_Long_Seen_0"]
+    monkeypatch.setattr(sys, "argv", original_argv)
+    observed: list[list[str]] = []
+
+    class AppLauncher:
+        @staticmethod
+        def add_app_launcher_args(_parser) -> None:
+            observed.append(list(sys.argv))
+
+    trial_module._add_app_launcher_args(argparse.ArgumentParser(), AppLauncher)
+
+    assert observed == [["trial.py"]]
+    assert sys.argv is original_argv
+
+
+def test_app_launcher_argument_registration_restores_argv_after_error(monkeypatch) -> None:
+    original_argv = ["trial.py", "--garment", "Top_Long_Seen_0"]
+    monkeypatch.setattr(sys, "argv", original_argv)
+
+    class AppLauncher:
+        @staticmethod
+        def add_app_launcher_args(_parser) -> None:
+            assert sys.argv == ["trial.py"]
+            raise RuntimeError("registration failed")
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        trial_module._add_app_launcher_args(argparse.ArgumentParser(), AppLauncher)
+
+    assert sys.argv is original_argv
+
+
 def test_acceptance_launch_forwards_headless_to_isaac_app(monkeypatch, tmp_path) -> None:
     launched: list[bool] = []
+    observed_argv: list[list[str]] = []
 
     class AppLauncher:
         @staticmethod
         def add_app_launcher_args(parser):
+            observed_argv.append(list(sys.argv))
             parser.add_argument("--headless", action="store_true")
 
     utils = types.ModuleType("scripts.utils"); utils.__path__ = []
@@ -228,9 +262,13 @@ def test_acceptance_launch_forwards_headless_to_isaac_app(monkeypatch, tmp_path)
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(trial_module, "run_snapshot_acceptance", lambda _args: 0)
     args = build_parser().parse_args(["--snapshot-roundtrip-only", "--garment", "Pant_Long_Seen_0", "--headless", "--output-root", str(tmp_path)])
+    original_argv = ["trial.py", "--garment", "Pant_Long_Seen_0"]
+    monkeypatch.setattr(sys, "argv", original_argv)
 
     assert run_trial(args, runtime_preflight=lambda: None) == 0
     assert launched == [True]
+    assert observed_argv == [["trial.py"]]
+    assert sys.argv is original_argv
 
 
 def test_trial_cli_requires_pinned_policy_and_existing_matrix(tmp_path) -> None:
@@ -618,10 +656,12 @@ def test_parallel_flywheel_trial_commands_never_target_shared_legacy_videos(tmp_
 def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(monkeypatch, tmp_path) -> None:
     policy = tmp_path / "policy"; policy.mkdir()
     launched: list[tuple[str, str, int]] = []
+    app_launcher_argv: list[list[str]] = []
 
     class AppLauncher:
         @staticmethod
-        def add_app_launcher_args(_parser): pass
+        def add_app_launcher_args(_parser):
+            app_launcher_argv.append(list(sys.argv))
 
     def setup_eval_parser():
         parser = argparse.ArgumentParser(add_help=False)
@@ -679,6 +719,8 @@ def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(
         def close(self): pass
         def restore_signal_handlers(self): pass
     monkeypatch.setattr(trial_module, "_spawn_policy_server", lambda *_args, **_kwargs: Supervisor())
+    original_argv = ["trial.py", "--garment", "Pant_Long_Seen_0"]
+    monkeypatch.setattr(sys, "argv", original_argv)
     with pytest.raises(ValueError, match="simulator version"):
         run_trial(
             args,
@@ -695,6 +737,8 @@ def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(
         runtime_preflight=lambda: None,
     ) == 0
     assert launched == [("Pant_Long_Seen_0", "isolated-worker", 1)]
+    assert app_launcher_argv == [["trial.py"], ["trial.py"]]
+    assert sys.argv is original_argv
 
 
 def test_production_trial_checks_host_before_policy_server_app_launcher_or_output(tmp_path) -> None:
