@@ -13,7 +13,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE_TAG="${IMAGE_TAG:-ryanjin333/lehome-rollout:latest}"
+IMAGE_TAG="${IMAGE_TAG:-ghcr.io/ryanjin333/lehome-rollout:latest}"
 BASE_IMAGE="${BASE_IMAGE:-lehome-challenge:latest}"
 PLATFORM="linux/amd64"
 PUSH="${PUSH:-0}"
@@ -49,7 +49,11 @@ log "built ${IMAGE_TAG}"
 docker image inspect "${IMAGE_TAG}" --format 'size: {{.Size}} bytes'
 
 if [[ "${PUSH}" == "1" ]]; then
-  if [[ -n "${REGISTRY_HOST:-}" && -n "${REGISTRY_USER:-}" && -n "${REGISTRY_TOKEN:-}" ]]; then
+  if [[ -n "${REGISTRY_HOST:-}" ]]; then
+    if [[ -z "${REGISTRY_USER:-}" || -z "${REGISTRY_TOKEN:-}" ]]; then
+      echo "PUSH=1 requires REGISTRY_USER and REGISTRY_TOKEN for authenticated push to ${REGISTRY_HOST}" >&2
+      exit 1
+    fi
     log "logging in to ${REGISTRY_HOST}"
     printf '%s' "${REGISTRY_TOKEN}" | docker login "${REGISTRY_HOST}" -u "${REGISTRY_USER}" --password-stdin
   fi

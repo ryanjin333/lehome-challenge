@@ -18,7 +18,7 @@ LABEL org.opencontainers.image.title="lehome-groot-rollout" \
       org.opencontainers.image.description="LeHome Challenge rollout worker: Isaac Sim evaluator + GR00T N1.7 BC policy server" \
       io.lehome.isaac-groot-revision="${ISAAC_GROOT_REVISION}"
 
-SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+SHELL ["/bin/sh", "-ec"]
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_PYTHON_INSTALL_DIR=/opt/python \
     UV_PROJECT_ENVIRONMENT=/opt/gr00t-runtime \
@@ -50,7 +50,7 @@ RUN git init . \
     && GIT_LFS_SKIP_SMUDGE=1 git checkout --detach FETCH_HEAD \
     && git ls-files -z -- '*.safetensors' '*.ckpt' '*.parquet' '*.mp4' '*.gif' '*.whl' \
       > /tmp/isaac-groot-artifacts \
-    && if [[ -s /tmp/isaac-groot-artifacts ]]; then \
+    && if [ -s /tmp/isaac-groot-artifacts ]; then \
       xargs -0 git update-index --skip-worktree -- < /tmp/isaac-groot-artifacts; \
       xargs -0 rm -f -- < /tmp/isaac-groot-artifacts; \
     fi \
@@ -64,8 +64,7 @@ RUN git init . \
 # Rollout runtime files.
 COPY --chmod=0755 groot_policy_server.py /opt/lehome-rollout/groot_policy_server.py
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/lehome-rollout-entrypoint
-RUN bash -n /usr/local/bin/lehome-rollout-entrypoint \
-    && /opt/gr00t-runtime/bin/python -m py_compile /opt/lehome-rollout/groot_policy_server.py \
+RUN /opt/gr00t-runtime/bin/python -m py_compile /opt/lehome-rollout/groot_policy_server.py \
     && mkdir -p /workspace/rollout /cache/models/nvidia
 
 ENV LEHOME_ROOT=/opt/lehome-challenge \

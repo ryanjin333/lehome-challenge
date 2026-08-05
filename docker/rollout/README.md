@@ -41,10 +41,28 @@ expects — the simulator side stays unmodified upstream code.
 # Downloads the official image tarball from HF on first run (~tens of GB).
 # linux/amd64: on Apple Silicon this builds under qemu (slow) — prefer an
 # x86_64 Linux host or a disposable Vast instance for the real build.
-IMAGE_TAG=ryanjin333/lehome-rollout:latest ./build.sh
+IMAGE_TAG=ghcr.io/ryanjin333/lehome-rollout:latest ./build.sh
 
 # Push somewhere Vast can pull (Docker Hub / GHCR):
-docker push ryanjin333/lehome-rollout:latest
+docker push ghcr.io/ryanjin333/lehome-rollout:latest
+```
+
+To push with the local build script, you need:
+
+```
+PUSH=1 \
+  REGISTRY_HOST=ghcr.io \
+  REGISTRY_USER=ryanjin333 \
+  REGISTRY_TOKEN=<your-personal-ghcr-token> \
+  IMAGE_TAG=ghcr.io/ryanjin333/lehome-rollout:latest \
+  ./build.sh
+```
+
+Token scope requirements for `ghcr.io`:
+- `read:packages`
+- `write:packages`
+
+If you use `REGISTRY_HOST=ghcr.io`, the image tag must be `ghcr.io/ryanjin333/...` and the token must be valid for that namespace.
 ```
 
 The BC checkpoint is NOT baked into the image — it hydrates at container
@@ -57,7 +75,9 @@ template can pin any run by revision.
    `image_name` in `vast-template.json` accordingly (digest pin preferred).
 2. Create the template from `vast-template.json` (Vast UI → Templates →
    create from JSON, or `vast` CLI).
-3. Add `HF_TOKEN` as the instance's environment variable/secret at rent time
+3. Add `REGISTRY_TOKEN` as the builder instance variable/secret when creating
+   `vast-build-template.json`-driven instances, and `HF_TOKEN` as rollout runtime
+   variable when renting rollout instances.
    (read scope on `ryanjin333/lehome-groot-n17-policy` is enough). Never bake
    the token into the image.
 4. Rent a GPU that passes the rollout gates: 1x RTX A6000 / L40S / RTX 4090 /

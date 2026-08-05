@@ -1,12 +1,12 @@
 {
-  "image_name": "docker:27-dind",
+  "image_name": "nvidia/cuda:12.4.0-runtime-ubuntu22.04",
   "label": "lehome-rollout-builder",
-  "disk": 300,
+  "disk": 200,
   "runtype": "ssh/index",
-  "on-start": "apk add --no-cache bash git curl >/var/log/build-prep.log 2>&1; (docker-entrypoint.sh dockerd >>/var/log/dockerd.log 2>&1 &); for i in $(seq 1 90); do docker info >/dev/null 2>&1 && break; sleep 2; done; docker info >/dev/null 2>&1 || { echo 'dockerd failed to start' >&2; exit 1; }; git clone --depth 1 --branch ${BUILD_BRANCH:-ryanjin333/vast-rollout} https://github.com/ryanjin333/lehome-challenge.git /tmp/src && cd /tmp/src/docker/rollout && IMAGE_TAG=${IMAGE_TAG:-ryanjin333/lehome-rollout:latest} PUSH=1 ./build.sh 2>&1 | tee /var/log/image-build.log; echo 'BUILD DONE (rc='$?') — safe to destroy this instance once the push completed'",
+  "on-start": "apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git docker.io && rm -rf /var/lib/apt/lists/* && service docker start && for i in $(seq 1 90); do docker info >/dev/null 2>&1 && break; sleep 2; done; docker info >/dev/null 2>&1 || { echo 'dockerd failed to start' >&2; exit 1; }; git clone --depth 1 --branch ${BUILD_BRANCH:-ryanjin333/vast-rollout} https://github.com/ryanjin333/lehome-challenge.git /tmp/src && cd /tmp/src/docker/rollout && IMAGE_TAG=${IMAGE_TAG:-ghcr.io/ryanjin333/lehome-rollout:latest} PUSH=1 REGISTRY_HOST=${REGISTRY_HOST:-ghcr.io} REGISTRY_USER=${REGISTRY_USER:-ryanjin333} REGISTRY_TOKEN=${REGISTRY_TOKEN} ./build.sh 2>&1 | tee /var/log/image-build.log && echo 'BUILD_DONE: image build and push finished' || echo 'BUILD_FAILED: image build or push failed'",
   "env": {
     "BUILD_BRANCH": "ryanjin333/vast-rollout",
-    "IMAGE_TAG": "ryanjin333/lehome-rollout:latest",
+    "IMAGE_TAG": "ghcr.io/ryanjin333/lehome-rollout:latest",
     "REGISTRY_HOST": "ghcr.io",
     "REGISTRY_USER": "ryanjin333"
   },

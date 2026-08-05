@@ -1,7 +1,7 @@
 {
-  "image_name": "ryanjin333/lehome-rollout:latest",
+  "image_name": "ghcr.io/ryanjin333/lehome-rollout:latest",
   "label": "lehome-groot-rollout",
-  "disk": 300,
+  "disk": 200,
   "runtype": "ssh/index",
   "on-start": "/usr/local/bin/lehome-rollout-entrypoint rollout",
   "env": {
