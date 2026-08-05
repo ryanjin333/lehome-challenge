@@ -1,0 +1,28 @@
+{
+  "image_name": "ryanjin333/lehome-rollout:latest",
+  "label": "lehome-groot-rollout",
+  "disk": 300,
+  "runtype": "ssh/index",
+  "on-start": "/usr/local/bin/lehome-rollout-entrypoint rollout",
+  "env": {
+    "POLICY_REPO": "ryanjin333/lehome-groot-n17-models",
+    "POLICY_REVISION": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
+    "POLICY_INCLUDE": "policies/step-12000/*",
+    "POLICY_MODEL_SUBDIR": "policies/step-12000",
+    "BACKBONE_REPO": "nvidia/Cosmos-Reason2-2B",
+    "BACKBONE_LOCAL_PATH": "/cache/models/nvidia/Cosmos-Reason2-2B",
+    "GROOT_ACTION_HORIZON": "40",
+    "GARMENT_TYPES": "top_long top_short pant_long pant_short",
+    "NUM_EPISODES": "5",
+    "MAX_STEPS": "600",
+    "SAVE_VIDEO": "1",
+    "ROLLOUT_ROOT": "/workspace/rollout",
+    "HF_HOME": "/workspace/hf-cache",
+    "HF_HUB_CACHE": "/workspace/hf-cache/hub",
+    "GROOT_POLICY_DEVICE": "cuda:0"
+  },
+  "extra": {
+    "--ipc": "host",
+    "--shm-size": "16g"
+  }
+}
