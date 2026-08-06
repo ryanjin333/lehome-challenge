@@ -1,16 +1,16 @@
 {
   "image_name": "nvidia/cuda:12.4.0-runtime-ubuntu22.04",
   "label": "lehome-rollout-builder",
-  "disk": 200,
+  "disk": 250,
   "runtype": "ssh/index",
-  "on-start": "apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git docker.io pigz python3-pip && rm -rf /var/lib/apt/lists/* ; (service docker start 2>/dev/null || true); if ! docker info >/dev/null 2>&1; then (dockerd >>/var/log/dockerd.log 2>&1 &); fi; for i in $(seq 1 90); do docker info >/dev/null 2>&1 && break; sleep 2; done; docker info >/dev/null 2>&1 || { echo 'dockerd failed to start' >&2; exit 1; }; git clone --depth 1 --branch ${BUILD_BRANCH:-ryanjin333/vast-template-sync} https://github.com/ryanjin333/lehome-challenge.git /tmp/src && cd /tmp/src/docker/rollout && IMAGE_TAG=${IMAGE_TAG:-ghcr.io/ryanjin333/lehome-rollout:latest} PUSH=1 REGISTRY_HOST=${REGISTRY_HOST:-ghcr.io} REGISTRY_USER=${REGISTRY_USER:-ryanjin333} REGISTRY_TOKEN=${REGISTRY_TOKEN} ./build.sh 2>&1 | tee /var/log/image-build.log && echo 'BUILD_DONE: image build and push finished' || echo 'BUILD_FAILED: image build or push failed'; if docker image inspect ${IMAGE_TAG:-ghcr.io/ryanjin333/lehome-rollout:latest} >/dev/null 2>&1; then docker save ${IMAGE_TAG:-ghcr.io/ryanjin333/lehome-rollout:latest} | pigz -p 8 > /workspace/lehome-rollout.tar.gz && pip3 install -q 'huggingface_hub[cli,hf_transfer]' && HF_HUB_ENABLE_HF_TRANSFER=1 HF_TOKEN=${HF_TOKEN} hf upload --repo-type dataset ryanjin333/lehome-rollout-image /workspace/lehome-rollout.tar.gz lehome-rollout.tar.gz && echo 'HF_UPLOAD_DONE: tarball uploaded to HF' || echo 'HF_UPLOAD_FAILED'; fi",
+  "on-start": "#!/usr/bin/env bash\nset -euxo pipefail\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y --no-install-recommends ca-certificates curl git docker.io pigz python3-pip python3-venv\nrm -rf /var/lib/apt/lists/*\nmkdir -p /etc/docker /workspace /var/log\ncat >/etc/docker/daemon.json <<'JSON'\n{\"storage-driver\":\"overlay2\",\"iptables\":false,\"ip6tables\":false,\"bridge\":\"none\"}\nJSON\n(dockerd --iptables=false --ip6tables=false --bridge=none >>/var/log/dockerd.log 2>&1 &)\nfor i in $(seq 1 90); do docker info >/dev/null 2>&1 && break; sleep 2; done\ndocker info >/dev/null 2>&1 || { echo 'dockerd failed' >&2; tail -n 200 /var/log/dockerd.log >&2; exit 1; }\n# Prefer env, fall back to process environment injection from Vast\n: \"${HF_TOKEN:?HF_TOKEN required}\"\nBUILD_BRANCH=\"${BUILD_BRANCH:-ryanjin333/vast-template-sync}\"\nIMAGE_TAG=\"${IMAGE_TAG:-ghcr.io/ryanjin333/lehome-rollout:latest}\"\nrm -rf /tmp/src\ngit clone --depth 1 --branch \"$BUILD_BRANCH\" https://github.com/ryanjin333/lehome-challenge.git /tmp/src\ncd /tmp/src/docker/rollout\n# DinD: host network is more reliable for HF downloads during build\nsed -i 's|--platform \"${PLATFORM}\" \\\\|--platform \"${PLATFORM}\" --network host \\\\|' build.sh || true\nIMAGE_TAG=\"$IMAGE_TAG\" PUSH=0 ./build.sh 2>&1 | tee /var/log/image-build.log\ndocker image inspect \"$IMAGE_TAG\" >/dev/null 2>&1 || { echo BUILD_FAILED; exit 1; }\necho BUILD_DONE\ndocker save \"$IMAGE_TAG\" | pigz -p \"$(nproc)\" > /workspace/lehome-rollout.tar.gz\necho \"SAVE_DONE $(du -h /workspace/lehome-rollout.tar.gz | cut -f1)\"\npip3 install -q 'huggingface_hub[cli,hf_transfer]'\nHF_HUB_ENABLE_HF_TRANSFER=1 HF_TOKEN=\"$HF_TOKEN\" hf upload --repo-type dataset ryanjin333/lehome-rollout-image /workspace/lehome-rollout.tar.gz lehome-rollout.tar.gz\necho HF_UPLOAD_DONE\necho \"ALL_DONE $(date -u)\"\n",
   "env": {
     "BUILD_BRANCH": "ryanjin333/vast-template-sync",
     "IMAGE_TAG": "ghcr.io/ryanjin333/lehome-rollout:latest",
-    "REGISTRY_HOST": "ghcr.io",
-    "REGISTRY_USER": "ryanjin333"
+    "HF_HUB_ENABLE_HF_TRANSFER": "1"
   },
   "extra": {
-    "--privileged": true
+    "--privileged": true,
+    "--ipc": "host"
   }
 }

@@ -1,10 +1,11 @@
 {
-  "image_name": "ghcr.io/ryanjin333/lehome-rollout:latest",
-  "label": "lehome-groot-rollout",
-  "disk": 200,
+  "image_name": "nvidia/cuda:12.4.0-runtime-ubuntu22.04",
+  "label": "lehome-groot-rollout-hf",
+  "disk": 300,
   "runtype": "ssh/index",
-  "on-start": "/usr/local/bin/lehome-rollout-entrypoint rollout",
+  "on-start": "#!/usr/bin/env bash\nset -euxo pipefail\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y --no-install-recommends ca-certificates curl docker.io pigz python3-pip\nrm -rf /var/lib/apt/lists/*\nmkdir -p /etc/docker /workspace /var/log\ncat >/etc/docker/daemon.json <<'JSON'\n{\"storage-driver\":\"overlay2\",\"iptables\":false,\"ip6tables\":false,\"bridge\":\"none\"}\nJSON\n(dockerd --iptables=false --ip6tables=false --bridge=none >>/var/log/dockerd.log 2>&1 &)\nfor i in $(seq 1 90); do docker info >/dev/null 2>&1 && break; sleep 2; done\ndocker info >/dev/null 2>&1 || { echo dockerd_failed; tail -n 200 /var/log/dockerd.log; exit 1; }\n: \"${HF_TOKEN:?HF_TOKEN required}\"\nIMAGE_TAG=\"${IMAGE_TAG:-ghcr.io/ryanjin333/lehome-rollout:latest}\"\nTARBALL=/workspace/lehome-rollout.tar.gz\nif ! docker image inspect \"$IMAGE_TAG\" >/dev/null 2>&1; then\n  if [[ ! -s \"$TARBALL\" ]]; then\n    pip3 install -q 'huggingface_hub[cli,hf_transfer]'\n    HF_HUB_ENABLE_HF_TRANSFER=1 HF_TOKEN=\"$HF_TOKEN\" hf download ryanjin333/lehome-rollout-image lehome-rollout.tar.gz --repo-type dataset --local-dir /workspace\n  fi\n  pigz -dc \"$TARBALL\" | docker load\nfi\ndocker image inspect \"$IMAGE_TAG\" >/dev/null 2>&1 || { echo IMAGE_LOAD_FAILED; docker images; exit 1; }\necho IMAGE_READY\ndocker run --rm --gpus all --privileged --network host --ipc=host --shm-size=16g \\\n  -v /workspace:/workspace \\\n  -e HF_TOKEN -e POLICY_REPO -e POLICY_REVISION -e POLICY_INCLUDE -e POLICY_MODEL_SUBDIR \\\n  -e BACKBONE_REPO -e BACKBONE_LOCAL_PATH -e GROOT_ACTION_HORIZON -e GARMENT_TYPES \\\n  -e NUM_EPISODES -e MAX_STEPS -e SAVE_VIDEO -e ROLLOUT_ROOT -e HF_HOME -e HF_HUB_CACHE \\\n  -e GROOT_POLICY_DEVICE -e PUSH_REPO \\\n  \"$IMAGE_TAG\" rollout\necho ROLLOUT_DONE\n",
   "env": {
+    "IMAGE_TAG": "ghcr.io/ryanjin333/lehome-rollout:latest",
     "POLICY_REPO": "ryanjin333/lehome-groot-n17-models",
     "POLICY_REVISION": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
     "POLICY_INCLUDE": "policies/step-12000/*",
@@ -19,9 +20,11 @@
     "ROLLOUT_ROOT": "/workspace/rollout",
     "HF_HOME": "/workspace/hf-cache",
     "HF_HUB_CACHE": "/workspace/hf-cache/hub",
-    "GROOT_POLICY_DEVICE": "cuda:0"
+    "GROOT_POLICY_DEVICE": "cuda:0",
+    "HF_HUB_ENABLE_HF_TRANSFER": "1"
   },
   "extra": {
+    "--privileged": true,
     "--ipc": "host",
     "--shm-size": "16g"
   }
