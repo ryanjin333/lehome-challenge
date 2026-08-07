@@ -18,6 +18,7 @@ cd lehome
 uv sync --python 3.11
 cd third_party && git clone --depth 1 https://github.com/lehome-official/IsaacLab.git && cd ..
 source .venv/bin/activate
+export TERM=xterm
 ./third_party/IsaacLab/isaaclab.sh -i none
 uv pip install -e ./source/lehome
 
