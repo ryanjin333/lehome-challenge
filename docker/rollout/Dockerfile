@@ -56,7 +56,7 @@ RUN git init . \
     fi \
     && rm -f /tmp/isaac-groot-artifacts \
     && test "$(git rev-parse HEAD)" = "${ISAAC_GROOT_REVISION}" \
-    && uv sync --frozen --no-dev --no-install-project --no-cache \
+    && uv sync --frozen --no-dev --no-cache \
     && uv pip install --python /opt/gr00t-runtime/bin/python --no-cache-dir msgpack pyzmq \
     && git config --system --add safe.directory /opt/isaac-groot \
     && test "$(git -C /opt/isaac-groot rev-parse HEAD)" = "${ISAAC_GROOT_REVISION}"

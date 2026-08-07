@@ -28,7 +28,7 @@ git init -q .
 git remote add origin https://github.com/NVIDIA/Isaac-GR00T.git
 git fetch --depth 1 origin 23ace64f17aa5015259b8609d371eb61a357c776
 GIT_LFS_SKIP_SMUDGE=1 git checkout --detach FETCH_HEAD
-uv sync --frozen --no-dev --no-install-project --no-cache --python 3.10
+uv sync --frozen --no-dev --no-cache --python 3.10
 uv pip install --python /opt/gr00t-runtime/bin/python --no-cache-dir msgpack pyzmq
 
 cd /workspace/lehome
