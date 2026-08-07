@@ -11,6 +11,7 @@ export __GLX_VENDOR_LIBRARY_NAME=nvidia
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
+mkdir -p /workspace /opt/gr00t-src
 cd /workspace || exit 1
 git clone --depth 1 --branch ryanjin333/vast-template-sync https://github.com/ryanjin333/lehome-challenge.git lehome
 cd lehome
