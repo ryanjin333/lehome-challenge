@@ -144,6 +144,7 @@ await_policy_server() {
 import sys
 import time
 import urllib.request
+import os
 
 timeout_seconds = int(sys.argv[1])
 port = int(sys.argv[2])
@@ -154,9 +155,8 @@ request_body = b"{}"
 
 while time.monotonic() < deadline:
     try:
-        with open(f"/proc/{server_pid}") as handle:
-            handle.read()
-    except OSError:
+        os.kill(server_pid, 0)
+    except ProcessLookupError:
         raise SystemExit("policy server process exited before becoming ready")
     try:
         request = urllib.request.Request(
