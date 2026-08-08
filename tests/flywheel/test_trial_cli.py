@@ -27,7 +27,7 @@ def test_evaluation_system_exit_is_not_reported_as_a_success() -> None:
     def exit_during_evaluation(_args, _app) -> None:
         raise SystemExit(0)
 
-    with pytest.raises(RuntimeError, match="Isaac evaluation exited before completion") as caught:
+    with pytest.raises(RuntimeError, match="Isaac live phase exited before completion") as caught:
         trial_module._run_evaluation_or_raise(exit_during_evaluation, object(), object())
 
     assert isinstance(caught.value.__cause__, SystemExit)
@@ -42,6 +42,14 @@ def test_evaluation_exception_is_reported_before_kit_shutdown(capsys) -> None:
         trial_module._run_evaluation_or_raise(fail_during_evaluation, object(), object())
 
     assert "unreadable garment displayColor" in capsys.readouterr().err
+
+
+def test_pre_evaluation_exception_is_reported_before_kit_shutdown(capsys) -> None:
+    with pytest.raises(RuntimeError, match="asset checkout is dirty"):
+        with trial_module._visible_kit_exception_boundary():
+            raise RuntimeError("asset checkout is dirty")
+
+    assert "asset checkout is dirty" in capsys.readouterr().err
 
 
 def test_policy_artifact_sha256_hashes_the_index_and_every_referenced_shard(tmp_path) -> None:

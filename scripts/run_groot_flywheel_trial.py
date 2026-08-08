@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 from importlib.metadata import PackageNotFoundError, version as package_version
 import json
@@ -705,18 +706,15 @@ def _live_runtime_identity(args: argparse.Namespace, _simulation_app: object) ->
     return simulator_version, asset_revision
 
 
-def _run_evaluation_or_raise(
-    evaluate: Callable[[argparse.Namespace, object], None],
-    args: argparse.Namespace,
-    simulation_app: object,
-) -> None:
-    """Keep an internal Kit exit from masquerading as a successful trial."""
+@contextmanager
+def _visible_kit_exception_boundary():
+    """Emit live-phase failures before SimulationApp.close can terminate Kit."""
     try:
-        evaluate(args, simulation_app)
+        yield
     except SystemExit as error:
         traceback.print_exc()
         raise RuntimeError(
-            f"Isaac evaluation exited before completion (code={error.code!r})"
+            f"Isaac live phase exited before completion (code={error.code!r})"
         ) from error
     except BaseException:
         # SimulationApp.close() can terminate Kit before Python prints an
@@ -724,6 +722,16 @@ def _run_evaluation_or_raise(
         # the scheduler log retains the actual evaluation failure.
         traceback.print_exc()
         raise
+
+
+def _run_evaluation_or_raise(
+    evaluate: Callable[[argparse.Namespace, object], None],
+    args: argparse.Namespace,
+    simulation_app: object,
+) -> None:
+    """Keep an internal Kit exit from masquerading as a successful trial."""
+    with _visible_kit_exception_boundary():
+        evaluate(args, simulation_app)
 
 
 def _validate_live_runtime_identity(
@@ -941,34 +949,35 @@ def run_trial(
     cuda_visibility = ParentCudaVisibility()
     parent_policy_token = ParentPolicyToken(_POLICY_SERVER_TOKEN_ENV, api_token)
     try:
-        _await_policy_server_ready(
-            supervisor,
-            port=args.policy_server_port,
-            token=api_token,
-            readiness_timeout=args.policy_server_readiness_timeout,
-            request_timeout=args.policy_server_request_timeout,
-        )
-        parent_policy_token.install()
-        parser = setup_eval_parser()
-        _add_app_launcher_args(parser, AppLauncher)
-        evaluation_args = parser.parse_args(command)
-        evaluation_args.policy_server_endpoint = f"tcp://127.0.0.1:{args.policy_server_port}"
-        evaluation_args.policy_server_token_env = _POLICY_SERVER_TOKEN_ENV
-        evaluation_args.policy_server_request_timeout = args.policy_server_request_timeout
-        evaluation_args.multi_gpu = False
-        cuda_visibility.clear()
-        simulation_app = common.launch_app_from_args(evaluation_args)
-        _validate_live_runtime_identity(
-            args,
-            simulation_app,
-            runtime_identity_reader=runtime_identity_reader,
-        )
-        manifest = _manifest_path(args, revision)
-        evaluation_args.flywheel_manifest = str(manifest)
-        import lehome.tasks.bedroom  # noqa: F401
-        from scripts.utils.evaluation import eval as evaluate
+        with _visible_kit_exception_boundary():
+            _await_policy_server_ready(
+                supervisor,
+                port=args.policy_server_port,
+                token=api_token,
+                readiness_timeout=args.policy_server_readiness_timeout,
+                request_timeout=args.policy_server_request_timeout,
+            )
+            parent_policy_token.install()
+            parser = setup_eval_parser()
+            _add_app_launcher_args(parser, AppLauncher)
+            evaluation_args = parser.parse_args(command)
+            evaluation_args.policy_server_endpoint = f"tcp://127.0.0.1:{args.policy_server_port}"
+            evaluation_args.policy_server_token_env = _POLICY_SERVER_TOKEN_ENV
+            evaluation_args.policy_server_request_timeout = args.policy_server_request_timeout
+            evaluation_args.multi_gpu = False
+            cuda_visibility.clear()
+            simulation_app = common.launch_app_from_args(evaluation_args)
+            _validate_live_runtime_identity(
+                args,
+                simulation_app,
+                runtime_identity_reader=runtime_identity_reader,
+            )
+            manifest = _manifest_path(args, revision)
+            evaluation_args.flywheel_manifest = str(manifest)
+            import lehome.tasks.bedroom  # noqa: F401
+            from scripts.utils.evaluation import eval as evaluate
 
-        _run_evaluation_or_raise(evaluate, evaluation_args, simulation_app)
+            evaluate(evaluation_args, simulation_app)
     finally:
         try:
             if simulation_app is not None:
