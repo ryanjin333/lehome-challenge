@@ -649,9 +649,11 @@ class GarmentEnv(DirectRLEnv):
             raise RuntimeError("flywheel scene state requires readable light intensity and color")
         table_value = table_input.Get()
         table_path = str(getattr(table_value, "path", table_value))
-        display_color = color_attr.Get()
+        from lehome.flywheel.randomization import read_or_author_garment_display_color
+
+        display_color = read_or_author_garment_display_color(color_attr)
         light_color = color_light_attr.Get()
-        if intensity_attr.Get() is None or display_color is None or light_color is None:
+        if intensity_attr.Get() is None or light_color is None:
             raise RuntimeError("flywheel scene state has unreadable USD attributes")
 
         def tensor_row(value) -> list[float]:
@@ -675,7 +677,7 @@ class GarmentEnv(DirectRLEnv):
             "light_color": [float(value) for value in light_color],
             "table_texture_path": table_path,
             "table_shader_input": table_input.GetBaseName(),
-            "garment_display_color": [[float(value) for value in color] for color in display_color],
+            "garment_display_color": display_color,
             "garment_reset_pose": [float(value) for value in self.object.get_all_pose()["Garment"]],
         }
 

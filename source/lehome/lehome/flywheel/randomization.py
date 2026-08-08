@@ -23,6 +23,30 @@ BOUNDS = {
 }
 
 
+def read_or_author_garment_display_color(attribute) -> list[list[float]]:
+    """Return a restorable color, authoring USD's conventional white fallback.
+
+    Challenge garment meshes may declare ``primvars:displayColor`` without an
+    authored value.  USD then returns ``None``, which is not snapshot-able.
+    Author the neutral white fallback once so canonical and randomized trials
+    share a deterministic, readable baseline.
+    """
+    if attribute is None or not attribute.IsValid():
+        raise RuntimeError("flywheel garment displayColor is missing")
+    value = attribute.Get()
+    if value is None:
+        if not attribute.Set([(1.0, 1.0, 1.0)]):
+            raise RuntimeError("flywheel garment displayColor cannot be authored")
+        value = attribute.Get()
+    try:
+        normalized = [[float(channel) for channel in color] for color in value]
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("flywheel garment displayColor is unreadable") from error
+    if not normalized or any(len(color) != 3 for color in normalized):
+        raise RuntimeError("flywheel garment displayColor is unreadable")
+    return normalized
+
+
 def sample_randomization(strategy: str, *, seed: int) -> RandomizationRecord:
     """Sample a reproducible record; canonical evaluation deliberately has no values."""
     if not isinstance(seed, int) or seed < 0:
@@ -75,4 +99,9 @@ def validate_randomization_receipt(sampled: dict[str, object], receipt: dict[str
         validate_material_receipt(sampled, receipt)
 
 
-__all__ = ["BOUNDS", "RandomizationBounds", "sample_randomization"]
+__all__ = [
+    "BOUNDS",
+    "RandomizationBounds",
+    "read_or_author_garment_display_color",
+    "sample_randomization",
+]

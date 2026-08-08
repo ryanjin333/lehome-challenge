@@ -34,6 +34,16 @@ def test_evaluation_system_exit_is_not_reported_as_a_success() -> None:
     assert caught.value.__cause__.code == 0
 
 
+def test_evaluation_exception_is_reported_before_kit_shutdown(capsys) -> None:
+    def fail_during_evaluation(_args, _app) -> None:
+        raise RuntimeError("unreadable garment displayColor")
+
+    with pytest.raises(RuntimeError, match="unreadable garment displayColor"):
+        trial_module._run_evaluation_or_raise(fail_during_evaluation, object(), object())
+
+    assert "unreadable garment displayColor" in capsys.readouterr().err
+
+
 def test_policy_artifact_sha256_hashes_the_index_and_every_referenced_shard(tmp_path) -> None:
     policy = tmp_path / "policy"
     policy.mkdir()

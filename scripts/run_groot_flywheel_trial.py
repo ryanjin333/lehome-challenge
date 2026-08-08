@@ -16,6 +16,7 @@ from stat import S_ISREG
 import subprocess
 import sys
 import time
+import traceback
 from typing import Callable, Sequence
 
 import numpy as np
@@ -713,9 +714,16 @@ def _run_evaluation_or_raise(
     try:
         evaluate(args, simulation_app)
     except SystemExit as error:
+        traceback.print_exc()
         raise RuntimeError(
             f"Isaac evaluation exited before completion (code={error.code!r})"
         ) from error
+    except BaseException:
+        # SimulationApp.close() can terminate Kit before Python prints an
+        # active exception.  Emit it while the interpreter is still alive so
+        # the scheduler log retains the actual evaluation failure.
+        traceback.print_exc()
+        raise
 
 
 def _validate_live_runtime_identity(

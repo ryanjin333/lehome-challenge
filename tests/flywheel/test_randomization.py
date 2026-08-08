@@ -2,7 +2,30 @@ from __future__ import annotations
 
 import pytest
 
-from lehome.flywheel.randomization import sample_randomization, validate_material_receipt
+from lehome.flywheel.randomization import (
+    read_or_author_garment_display_color,
+    sample_randomization,
+    validate_material_receipt,
+)
+
+
+class FakeUsdAttribute:
+    def __init__(self, value=None, *, valid=True, writable=True) -> None:
+        self.value = value
+        self.valid = valid
+        self.writable = writable
+
+    def IsValid(self):
+        return self.valid
+
+    def Get(self):
+        return self.value
+
+    def Set(self, value):
+        if not self.writable:
+            return False
+        self.value = value
+        return True
 
 
 def test_canonical_changes_nothing_and_mild_is_reproducible() -> None:
@@ -14,6 +37,26 @@ def test_canonical_changes_nothing_and_mild_is_reproducible() -> None:
     assert first == second
     assert 0.85 <= first.values["light_intensity_scale"] <= 1.15
     assert abs(first.values["camera_translation_m"][0]) <= 0.01
+
+
+def test_missing_garment_display_color_is_authored_to_a_deterministic_baseline() -> None:
+    attribute = FakeUsdAttribute()
+
+    assert read_or_author_garment_display_color(attribute) == [[1.0, 1.0, 1.0]]
+    assert attribute.value == [(1.0, 1.0, 1.0)]
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    (
+        FakeUsdAttribute(valid=False),
+        FakeUsdAttribute(writable=False),
+        FakeUsdAttribute([]),
+    ),
+)
+def test_garment_display_color_baseline_fails_closed_when_not_readable(attribute) -> None:
+    with pytest.raises(RuntimeError, match="displayColor"):
+        read_or_author_garment_display_color(attribute)
 
 
 def test_strong_stays_inside_physical_bounds() -> None:
