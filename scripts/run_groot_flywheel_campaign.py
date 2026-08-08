@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -62,15 +63,15 @@ def _open_campaign_directory(parent_fd: int, name: str, *, create: bool) -> int 
         raise ValueError(f"campaign {name} root is unsafe") from error
 
 
-def _open_controller_lock(root_fd: int) -> int:
+def _open_controller_lock(root_fd: int, name: str = ".campaign.lock") -> int:
     """Create the fixed lock once, then open it no-follow for every controller."""
     flags = os.O_RDWR | os.O_NOFOLLOW
     while True:
         try:
-            return os.open(".campaign.lock", flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=root_fd)
+            return os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=root_fd)
         except FileExistsError:
             try:
-                return os.open(".campaign.lock", flags, dir_fd=root_fd)
+                return os.open(name, flags, dir_fd=root_fd)
             except FileNotFoundError:
                 # Another controller won creation but has not made the entry
                 # observable yet; retry rather than accepting an unchecked path.
@@ -102,6 +103,73 @@ def _locked_campaign_storage(output_root: Path):
         if lock_fd >= 0:
             os.close(lock_fd)
         os.close(root_fd)
+
+
+@contextmanager
+def _campaign_supervisor_lease(output_root: Path):
+    """Reject a second campaign controller before it can schedule any trials."""
+    lease_fd = -1
+    with _locked_campaign_storage(output_root) as (root, root_fd):
+        lease_fd = _open_controller_lock(root_fd, ".campaign-supervisor.lock")
+        if not stat.S_ISREG(os.fstat(lease_fd).st_mode):
+            os.close(lease_fd)
+            raise ValueError("campaign supervisor lock is unsafe")
+        try:
+            fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            os.close(lease_fd)
+            raise ValueError("campaign supervisor is already active") from error
+    try:
+        yield root
+    finally:
+        if lease_fd >= 0:
+            fcntl.flock(lease_fd, fcntl.LOCK_UN)
+            os.close(lease_fd)
+
+
+def _write_json_atomically(path: Path, value: object) -> None:
+    payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    fd = -1
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                raise OSError("could not write campaign checkpoint")
+            remaining = remaining[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _write_invocation_checkpoint(output_root: Path, invocation_id: str, checkpoint: dict[str, object]) -> None:
+    if not re.fullmatch(r"[0-9a-f]{32}", invocation_id):
+        raise ValueError("campaign invocation ID is invalid")
+    with _locked_campaign_storage(output_root) as (root, root_fd):
+        ledger_fd = _open_campaign_directory(root_fd, "campaign-ledger", create=False)
+        ledger_created = ledger_fd is None
+        if ledger_fd is None:
+            ledger_fd = _open_campaign_directory(root_fd, "campaign-ledger", create=True)
+        assert ledger_fd is not None
+        os.close(ledger_fd)
+        if ledger_created:
+            os.fsync(root_fd)
+        _write_json_atomically(root / "campaign-ledger" / f"{invocation_id}.json", checkpoint)
 
 
 def _open_trial_directory(parent_fd: int, trial_id: str) -> os.stat_result | None:
@@ -304,6 +372,83 @@ def _allocate_loopback_ports(workers: int) -> tuple[int, ...]:
     return tuple(sorted(ports))
 
 
+def _worker_process_group_alive(process: object) -> bool:
+    """Return whether the scheduler-owned process group still exists.
+
+    Scheduler-launched trial parents are session leaders, so their PID is a
+    unique process-group ID.  A parent can exit before its policy-server child;
+    probing the group rather than the parent is what catches that orphan.
+    """
+    pid = getattr(process, "pid", None)
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return getattr(process, "poll")() is None
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _signal_worker_process_group(process: object, signum: int) -> None:
+    """Signal only one scheduler-created trial group, never the supervisor."""
+    pid = getattr(process, "pid", None)
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        # Test doubles and legacy injected processes have no stable group ID.
+        # Production Popen instances always take the group-safe branch below.
+        if signum == signal.SIGTERM:
+            getattr(process, "terminate")()
+            return
+        if signum == signal.SIGKILL:
+            getattr(process, "kill")()
+            return
+        raise ValueError("unsupported worker process-group signal")
+    try:
+        os.killpg(pid, signum)
+    except ProcessLookupError:
+        # The group was already reaped between polling and signalling.
+        pass
+
+
+def _await_worker_process_group_clearance(process: object, *, grace_seconds: float) -> None:
+    """Fail closed unless the known worker process group disappears on time."""
+    deadline = time.monotonic() + grace_seconds
+    while _worker_process_group_alive(process) and time.monotonic() < deadline:
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    if _worker_process_group_alive(process):
+        pid = getattr(process, "pid", "unknown")
+        raise RuntimeError(f"worker process group {pid} survived SIGKILL")
+
+
+def _shutdown_worker_process_group(process: object, *, grace_seconds: float) -> None:
+    """Terminate, kill if needed, and reap a trial process-tree boundary."""
+    pid = getattr(process, "pid", None)
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        _signal_worker_process_group(process, signal.SIGTERM)
+        try:
+            getattr(process, "wait")(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            _signal_worker_process_group(process, signal.SIGKILL)
+            getattr(process, "wait")()
+        return
+    if not _worker_process_group_alive(process):
+        getattr(process, "wait")(timeout=grace_seconds)
+        return
+    _signal_worker_process_group(process, signal.SIGTERM)
+    deadline = time.monotonic() + grace_seconds
+    while _worker_process_group_alive(process) and time.monotonic() < deadline:
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    if _worker_process_group_alive(process):
+        _signal_worker_process_group(process, signal.SIGKILL)
+        _await_worker_process_group_clearance(process, grace_seconds=grace_seconds)
+    # Reap the direct child even when a descendant caused the group to survive.
+    try:
+        getattr(process, "wait")(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        _signal_worker_process_group(process, signal.SIGKILL)
+        _await_worker_process_group_clearance(process, grace_seconds=grace_seconds)
+        getattr(process, "wait")()
+
+
 def _run_one_worker(args: argparse.Namespace, *, worker_id: int, trial: Trial) -> int:
     worker_root = args.output_root / "workers" / f"worker-{worker_id:02d}"
     heartbeat = worker_root / "heartbeat.json"
@@ -315,18 +460,28 @@ def _run_one_worker(args: argparse.Namespace, *, worker_id: int, trial: Trial) -
         process = subprocess.Popen(
             _trial_command(args, trial, policy_server_port=policy_server_port, policy_server_log=policy_server_log),
             stdout=log, stderr=subprocess.STDOUT, env=_worker_environment(args, _cuda_device_index(args.device)),
+            start_new_session=True,
         )
         try:
             returncode = process.wait(timeout=args.worker_timeout_seconds)
         except subprocess.TimeoutExpired:
-            process.terminate()
-            try:
-                process.wait(timeout=args.terminate_grace_seconds)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            _shutdown_worker_process_group(process, grace_seconds=args.terminate_grace_seconds)
             _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="timeout")
             return 124
+        except BaseException as worker_error:
+            cleanup_errors: list[BaseException] = []
+            try:
+                _shutdown_worker_process_group(process, grace_seconds=args.terminate_grace_seconds)
+            except BaseException as error:
+                cleanup_errors.append(error)
+            try:
+                _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="interrupted")
+            except BaseException as error:
+                cleanup_errors.append(error)
+            _report_launch_cleanup_failures(worker_error, cleanup_errors)
+            raise
+    if isinstance(getattr(process, "pid", None), int) and not isinstance(getattr(process, "pid", None), bool):
+        _shutdown_worker_process_group(process, grace_seconds=args.terminate_grace_seconds)
     _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="terminal")
     return returncode
 
@@ -348,6 +503,13 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def _authorized_production_worker_count(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 4:
+        raise argparse.ArgumentTypeError("production workers must be between 1 and 4")
     return parsed
 
 
@@ -775,7 +937,7 @@ def _cleanup_partially_launched_workers(
 
     for worker_id, trial, process, heartbeat, log, log_path in pending:
         try:
-            process.terminate()
+            _signal_worker_process_group(process, signal.SIGTERM)
         except BaseException as error:
             errors.append(RuntimeError(f"worker {worker_id} could not be terminated during launch cleanup: {error}"))
         try:
@@ -798,11 +960,29 @@ def _cleanup_partially_launched_workers(
         if pending:
             time.sleep(min(0.1, max(0.0, terminate_deadline - time.monotonic())))
 
-    for worker_id, trial, process, heartbeat, log, log_path in pending:
+    # A parent can acknowledge SIGTERM while a detached descendant remains.
+    # Check the scheduler-owned group, rather than only the direct parent,
+    # before releasing this wave's GPU allocation.
+    groups_still_alive = [
+        record for record in to_reap
+        if isinstance(getattr(record[2], "pid", None), int)
+        and not isinstance(getattr(record[2], "pid", None), bool)
+        and _worker_process_group_alive(record[2])
+    ]
+    kill_records = [
+        *groups_still_alive,
+        *(record for record in pending if not isinstance(getattr(record[2], "pid", None), int)),
+    ]
+    for worker_id, trial, process, heartbeat, log, log_path in kill_records:
         try:
-            process.kill()
+            _signal_worker_process_group(process, signal.SIGKILL)
         except BaseException as error:
             errors.append(RuntimeError(f"worker {worker_id} could not be killed during launch cleanup: {error}"))
+    for worker_id, trial, process, heartbeat, log, log_path in groups_still_alive:
+        try:
+            _await_worker_process_group_clearance(process, grace_seconds=args.terminate_grace_seconds)
+        except BaseException as error:
+            errors.append(RuntimeError(f"worker {worker_id} process group did not clear during launch cleanup: {error}"))
 
     reap_deadline = time.monotonic() + args.terminate_grace_seconds
     for worker_id, trial, process, heartbeat, log, log_path in to_reap:
@@ -829,6 +1009,52 @@ def _report_launch_cleanup_failures(launch_error: BaseException, cleanup_errors:
         launch_error.add_note(f"Additional launch cleanup failures: {detail}")
     else:
         print(f"Additional launch cleanup failures: {detail}", file=sys.stderr)
+
+
+def _attach_launch_accounting(
+    error: BaseException,
+    assignments: Sequence[tuple[int, Trial]],
+    processes: Sequence[tuple[int, Trial, subprocess.Popen[str], Path, object, Path]],
+) -> None:
+    """Preserve exactly which trial Popen calls succeeded before a launch fault."""
+    scheduled = tuple(trial.trial_id for _, trial in assignments)
+    launched = tuple(trial.trial_id for _, trial, *_ in processes)
+    try:
+        setattr(error, "scheduled_trial_ids", scheduled)
+        setattr(error, "launched_trial_ids", launched)
+    except (AttributeError, TypeError):
+        # Built-in exception subclasses normally permit attributes.  If an
+        # unusual BaseException does not, its original identity stays primary.
+        if hasattr(error, "add_note"):
+            error.add_note(
+                f"Launch accounting: scheduled={list(scheduled)!r}; launched={list(launched)!r}"
+            )
+
+
+def _launch_accounting_from_error(
+    error: BaseException,
+    scheduled_trial_ids: Sequence[str],
+) -> tuple[list[str], list[str]]:
+    """Read validated partial-launch metadata without trusting injected errors."""
+    scheduled = list(scheduled_trial_ids)
+    launched_value = getattr(error, "launched_trial_ids", None)
+    scheduled_value = getattr(error, "scheduled_trial_ids", None)
+    if (
+        isinstance(scheduled_value, (tuple, list))
+        and all(isinstance(trial_id, str) for trial_id in scheduled_value)
+        and list(scheduled_value) == scheduled
+    ):
+        scheduled = list(scheduled_value)
+    if (
+        isinstance(launched_value, (tuple, list))
+        and all(isinstance(trial_id, str) for trial_id in launched_value)
+        and len(set(launched_value)) == len(launched_value)
+        and set(launched_value).issubset(scheduled)
+    ):
+        return scheduled, list(launched_value)
+    # Older/injected worker-group implementations cannot report partial
+    # progress.  Conservatively preserve the historical all-launched contract.
+    return scheduled, list(scheduled)
 
 
 def _failure_classes(log_path: Path, *, returncode: int, progressed: bool) -> tuple[str, ...]:
@@ -867,13 +1093,14 @@ def _run_worker_group(
     processes: list[tuple[int, Trial, subprocess.Popen[str], Path, object, Path]] = []
     if gpu_indices is not None and len(gpu_indices) != len(assignments):
         raise ValueError("worker GPU assignment does not match the launched worker group")
-    telemetry_samples: list[dict[str, object]] = []
     telemetry_sampler = _CapacityTelemetrySampler(gpu_indices) if collect_telemetry else None
     policy_telemetry_paths: dict[int, _ProvisionedPolicyTelemetry] = {}
     first_progress: dict[int, float] = {}
     launch_log: object | None = None
-    policy_server_ports = _allocate_loopback_ports(len(assignments))
     try:
+        # Reserve every per-worker port inside the accounting boundary: a
+        # collision here means no trial Popen succeeded, not a full wave.
+        policy_server_ports = _allocate_loopback_ports(len(assignments))
         for index, (worker_id, trial) in enumerate(assignments):
             worker_root = args.output_root / "workers" / f"worker-{worker_id:02d}"
             heartbeat = worker_root / "heartbeat.json"
@@ -901,12 +1128,14 @@ def _run_worker_group(
                     physical_gpu,
                     policy_telemetry_path=(policy_telemetry_path.path if policy_telemetry_path else None),
                 ),
+                start_new_session=True,
             )
             if policy_telemetry_path is not None:
                 policy_telemetry_paths[worker_id] = policy_telemetry_path
             processes.append((worker_id, trial, process, heartbeat, launch_log, log_path))
             launch_log = None
     except BaseException as launch_error:
+        _attach_launch_accounting(launch_error, assignments, processes)
         cleanup_errors = _cleanup_partially_launched_workers(args, processes)
         if launch_log is not None:
             try:
@@ -915,7 +1144,35 @@ def _run_worker_group(
                 cleanup_errors.append(RuntimeError(f"unlaunched worker log could not be closed during launch cleanup: {error}"))
         _report_launch_cleanup_failures(launch_error, cleanup_errors)
         raise
+    try:
+        return _monitor_worker_group(
+            args,
+            processes,
+            started=started,
+            wave_started_ns=wave_started_ns,
+            collect_telemetry=collect_telemetry,
+            telemetry_sampler=telemetry_sampler,
+            policy_telemetry_paths=policy_telemetry_paths,
+        )
+    except BaseException as worker_error:
+        cleanup_errors = _cleanup_partially_launched_workers(args, processes)
+        _report_launch_cleanup_failures(worker_error, cleanup_errors)
+        raise
+
+
+def _monitor_worker_group(
+    args: argparse.Namespace,
+    processes,
+    *,
+    started: float,
+    wave_started_ns: int,
+    collect_telemetry: bool,
+    telemetry_sampler: _CapacityTelemetrySampler | None,
+    policy_telemetry_paths: dict[int, _ProvisionedPolicyTelemetry],
+):
     returncodes: dict[int, int] = {}
+    telemetry_samples: list[dict[str, object]] = []
+    first_progress: dict[int, float] = {}
     pending = list(processes)
     policy_telemetry_sampler = (
         _PolicyTelemetrySampler(policy_telemetry_paths, wave_started_ns=wave_started_ns)
@@ -948,7 +1205,7 @@ def _run_worker_group(
 
     if pending:
         for worker_id, trial, process, heartbeat, log, log_path in pending:
-            process.terminate()
+            _signal_worker_process_group(process, signal.SIGTERM)
             _write_heartbeat(heartbeat, worker_id=worker_id, trial_id=trial.trial_id, state="timeout")
         grace_deadline = time.monotonic() + args.terminate_grace_seconds
         while pending and time.monotonic() < grace_deadline:
@@ -959,8 +1216,24 @@ def _run_worker_group(
             pending = still_pending
             if pending:
                 time.sleep(min(0.1, max(0.0, grace_deadline - time.monotonic())))
-        for worker_id, trial, process, heartbeat, log, log_path in pending:
-            process.kill()
+        # Do not treat a reaped trial parent as proof that its policy-server
+        # descendant is gone.  Its PID remains the known group ID.
+        groups_still_alive = [
+            record for record in processes
+            if isinstance(getattr(record[2], "pid", None), int)
+            and not isinstance(getattr(record[2], "pid", None), bool)
+            and _worker_process_group_alive(record[2])
+        ]
+        # Legacy injected process doubles have no group ID, so retain the
+        # direct-parent pending list for that compatibility seam.
+        kill_records = [
+            *groups_still_alive,
+            *(record for record in pending if not isinstance(getattr(record[2], "pid", None), int)),
+        ]
+        for worker_id, trial, process, heartbeat, log, log_path in kill_records:
+            _signal_worker_process_group(process, signal.SIGKILL)
+        for worker_id, trial, process, heartbeat, log, log_path in groups_still_alive:
+            _await_worker_process_group_clearance(process, grace_seconds=args.terminate_grace_seconds)
         reap_deadline = time.monotonic() + args.terminate_grace_seconds
         for worker_id, trial, process, heartbeat, log, log_path in pending:
             remaining = reap_deadline - time.monotonic()
@@ -981,7 +1254,12 @@ def _run_worker_group(
         if worker_id not in first_progress and _trial_has_first_progress(args.output_root, trial.trial_id):
             first_progress[worker_id] = time.monotonic() - started
         log.close()
-        if returncode == 0 and is_completed_trial(args.output_root, trial.trial_id):
+        complete = returncode == 0 and is_completed_trial(args.output_root, trial.trial_id)
+        if isinstance(getattr(process, "pid", None), int) and not isinstance(getattr(process, "pid", None), bool):
+            # Successful artifacts do not prove that the policy server obeyed
+            # trial teardown.  Verify the group is gone before the next wave.
+            _shutdown_worker_process_group(process, grace_seconds=args.terminate_grace_seconds)
+        if complete:
             completed += 1
         else:
             failed += 1
@@ -1001,6 +1279,7 @@ def _run_worker_group(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
     parser.add_argument("--matrix", type=Path, required=True, help="committed canonical public 280-trial JSON")
     parser.add_argument("--policy-path", type=Path, required=True)
     parser.add_argument("--policy-revision-file", type=Path, required=True)
@@ -1013,7 +1292,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--simulator-version", required=True)
     parser.add_argument("--policy-artifact-sha256", required=True)
     parser.add_argument("--image-identity", required=True)
-    parser.add_argument("--capacity-sweep")
+    mode.add_argument("--capacity-sweep")
     parser.add_argument("--strategy", choices=("canonical", "mild", "strong"), default="canonical")
     parser.add_argument("--device", default="cuda:0", help="physical Isaac GPU forwarded to every trial")
     parser.add_argument("--groot-root", type=Path, help="pinned materialized GR00T checkout for policy-server children")
@@ -1023,6 +1302,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-server-request-timeout", type=_positive_finite_seconds, default=2.5)
     parser.add_argument("--policy-server-termination-grace", type=_positive_finite_seconds, default=5.0)
     parser.add_argument("--trials-per-worker", type=int, default=1)
+    mode.add_argument(
+        "--workers",
+        type=_authorized_production_worker_count,
+        help="run every pending trial in finite waves of this many isolated GPU workers",
+    )
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--worker-timeout-seconds", type=_positive_finite_seconds, default=1800.0)
     parser.add_argument("--terminate-grace-seconds", type=_positive_finite_seconds, default=5.0)
@@ -1037,6 +1321,7 @@ def run_campaign(
     *,
     runtime_preflight: Callable[[], object] | None = None,
 ) -> dict[str, object]:
+    workers = getattr(args, "workers", None)
     if (
         args.trials_per_worker <= 0
         or args.worker_timeout_seconds <= 0
@@ -1046,14 +1331,14 @@ def run_campaign(
         or not math.isfinite(args.max_inference_latency_seconds)
         or args.max_inference_latency_seconds <= 0
         or args.max_inference_queue_depth <= 0
+        or (workers is not None and (not isinstance(workers, int) or isinstance(workers, bool) or not 1 <= workers <= 4))
     ):
-        raise ValueError("worker counts and timeouts must be finite and positive")
+        raise ValueError("worker counts and timeouts must be finite and positive; production workers must be between 1 and 4")
     # One host decision applies to every campaign child.  It deliberately runs
     # before matrix/output processing, subprocess creation, or policy hydration.
     if not args.dry_run:
         (runtime_preflight or require_isaac_sim_5_1_runtime)()
     matrix = load_public_matrix(args.matrix)
-    trials = matrix.trials
     if not args.dry_run:
         required_server_values = (args.groot_root, args.groot_revision, args.groot_python)
         if any(value is None for value in required_server_values):
@@ -1063,17 +1348,145 @@ def run_campaign(
         device_index = _cuda_device_index(args.device)
         if device_index is None or args.device != f"cuda:{device_index}":
             raise ValueError("campaign execution requires --device cuda:<physical GPU>")
+    with _campaign_supervisor_lease(args.output_root):
+        return _run_campaign_under_supervisor(args, matrix)
+
+
+def _run_campaign_under_supervisor(
+    args: argparse.Namespace,
+    matrix,
+) -> dict[str, object]:
+    trials = matrix.trials
     args.output_root.mkdir(parents=True, exist_ok=True)
     state = CampaignState(args.output_root, tuple(trial.trial_id for trial in trials))
     by_id = {trial.trial_id: trial for trial in trials}
     pending = pending_trial_ids(state)
     records: list[dict[str, object]] = []
+    production_failure: str | None = None
+    sequential_failure: str | None = None
+    invocation_id = uuid4().hex
+    checkpoint: dict[str, object] = {
+        "schema_version": 1,
+        "invocation_id": invocation_id,
+        "mode": "capacity_sweep" if args.capacity_sweep else "production" if args.workers is not None else "sequential",
+        "status": "running",
+        "pending_before": list(pending),
+        "waves": [],
+    }
+    _write_invocation_checkpoint(args.output_root, invocation_id, checkpoint)
     if not args.dry_run and not args.capacity_sweep:
-        for worker_id, trial_id in enumerate(pending, start=1):
-            if (worker_id - 1) >= args.trials_per_worker:
-                break
-            returncode = _run_one_worker(args, worker_id=worker_id, trial=by_id[trial_id])
-            records.append({"worker_id": worker_id, "trial_id": trial_id, "returncode": returncode, "mode": "sequential"})
+        if args.workers is not None:
+            if pending:
+                gpu_indices = _worker_gpu_indices(args, args.workers)
+                for wave_number, offset in enumerate(range(0, len(pending), args.workers), start=1):
+                    wave_trial_ids = pending[offset:offset + args.workers]
+                    assignments = tuple(
+                        (worker_id, by_id[trial_id])
+                        for worker_id, trial_id in enumerate(wave_trial_ids, start=1)
+                    )
+                    wave_gpu_indices = gpu_indices[:len(assignments)]
+                    checkpoint_wave = {
+                        "mode": "production",
+                        "wave": wave_number,
+                        "workers": len(assignments),
+                        "trial_ids": list(wave_trial_ids),
+                        "scheduled_trial_ids": list(wave_trial_ids),
+                        "launched_trial_ids": [],
+                        "gpu_indices": list(wave_gpu_indices),
+                        "status": "started",
+                    }
+                    checkpoint["waves"].append(checkpoint_wave)
+                    _write_invocation_checkpoint(args.output_root, invocation_id, checkpoint)
+                    try:
+                        elapsed, completed, failed = _run_worker_group(
+                            args,
+                            assignments,
+                            gpu_indices=wave_gpu_indices,
+                        )
+                    except BaseException as error:
+                        scheduled_trial_ids, launched_trial_ids = _launch_accounting_from_error(
+                            error, wave_trial_ids,
+                        )
+                        if not isinstance(error, Exception):
+                            checkpoint_wave.update({
+                                "status": "interrupted", "detail": str(error),
+                                "scheduled_trial_ids": scheduled_trial_ids,
+                                "launched_trial_ids": launched_trial_ids,
+                            })
+                            checkpoint.update({"status": "interrupted", "error_type": type(error).__name__})
+                            _write_invocation_checkpoint(args.output_root, invocation_id, checkpoint)
+                            raise
+                        checkpoint_wave.update({
+                            "status": "failed", "detail": str(error),
+                            "scheduled_trial_ids": scheduled_trial_ids,
+                            "launched_trial_ids": launched_trial_ids,
+                        })
+                        _write_invocation_checkpoint(args.output_root, invocation_id, checkpoint)
+                        records.append({
+                            "mode": "production",
+                            "wave": wave_number,
+                            "workers": len(assignments),
+                            "trial_ids": list(wave_trial_ids),
+                            "scheduled_trial_ids": scheduled_trial_ids,
+                            "launched_trial_ids": launched_trial_ids,
+                            "gpu_indices": list(wave_gpu_indices),
+                            "status": "launch_error",
+                            "detail": str(error),
+                        })
+                        production_failure = f"production wave {wave_number} failed: {error}"
+                        break
+                    checkpoint_wave.update({
+                        "status": "terminal",
+                        "launched_trial_ids": list(wave_trial_ids),
+                        "elapsed_seconds": elapsed,
+                        "completed_trials": completed,
+                        "failed_trials": failed,
+                    })
+                    _write_invocation_checkpoint(args.output_root, invocation_id, checkpoint)
+                    records.append({
+                        "mode": "production",
+                        "wave": wave_number,
+                        "workers": len(assignments),
+                        "trial_ids": list(wave_trial_ids),
+                        "scheduled_trial_ids": list(wave_trial_ids),
+                        "launched_trial_ids": list(wave_trial_ids),
+                        "gpu_indices": list(wave_gpu_indices),
+                        "elapsed_seconds": elapsed,
+                        "completed_trials": completed,
+                        "failed_trials": failed,
+                    })
+                    if completed != len(assignments) or failed:
+                        production_failure = (
+                            f"production wave {wave_number} failed: "
+                            f"completed={completed}, failed={failed}, expected={len(assignments)}"
+                        )
+                        break
+        else:
+            for worker_id, trial_id in enumerate(pending, start=1):
+                if (worker_id - 1) >= args.trials_per_worker:
+                    break
+                checkpoint_wave = {
+                    "mode": "sequential",
+                    "worker_id": worker_id,
+                    "trial_ids": [trial_id],
+                    "status": "started",
+                }
+                checkpoint["waves"].append(checkpoint_wave)
+                _write_invocation_checkpoint(args.output_root, invocation_id, checkpoint)
+                try:
+                    returncode = _run_one_worker(args, worker_id=worker_id, trial=by_id[trial_id])
+                except BaseException as error:
+                    checkpoint_wave.update({"status": "interrupted", "detail": str(error)})
+                    checkpoint.update({"status": "interrupted", "error_type": type(error).__name__})
+                    _write_invocation_checkpoint(args.output_root, invocation_id, checkpoint)
+                    raise
+                complete = returncode == 0 and is_completed_trial(args.output_root, trial_id)
+                checkpoint_wave.update({"status": "terminal" if complete else "failed", "returncode": returncode})
+                _write_invocation_checkpoint(args.output_root, invocation_id, checkpoint)
+                records.append({"worker_id": worker_id, "trial_id": trial_id, "returncode": returncode, "mode": "sequential"})
+                if not complete:
+                    sequential_failure = f"sequential worker {worker_id} failed: returncode={returncode}"
+                    break
     else:
         records = [{"trial_id": trial_id, "command": _trial_command(args, by_id[trial_id])} for trial_id in pending]
 
@@ -1085,6 +1498,16 @@ def run_campaign(
         pending_after = pending
     else:
         pending_after = pending_trial_ids(state)
+    if (
+        args.workers is not None
+        and not args.dry_run
+        and not args.capacity_sweep
+        and production_failure is None
+        and pending_after
+    ):
+        production_failure = (
+            f"production terminal-incomplete trials remain after finite waves: {len(pending_after)}"
+        )
 
     report: dict[str, object] = {
         "schema_version": 1,
@@ -1103,6 +1526,12 @@ def run_campaign(
             "capacity_report": str(args.output_root / "capacity-report.json"),
         },
     }
+    if args.workers is not None and not args.dry_run and not args.capacity_sweep:
+        report["production"] = {
+            "workers": args.workers,
+            "status": "failed" if production_failure else "completed",
+            "waves": len(records),
+        }
     if args.capacity_sweep and not args.dry_run:
         counts = _validate_sweep(args.capacity_sweep)
         samples: list[CapacitySample] = []
@@ -1124,7 +1553,34 @@ def run_campaign(
                 })
                 break
             capacity_pending = capacity_pending[count:]
-            result = _run_worker_group(args, assignments, gpu_indices=gpu_indices, collect_telemetry=True)
+            checkpoint_wave = {
+                "mode": "capacity_sweep",
+                "workers": count,
+                "trial_ids": [trial.trial_id for _, trial in assignments],
+                "scheduled_trial_ids": [trial.trial_id for _, trial in assignments],
+                "launched_trial_ids": [],
+                "gpu_indices": list(gpu_indices),
+                "status": "started",
+            }
+            checkpoint["waves"].append(checkpoint_wave)
+            _write_invocation_checkpoint(args.output_root, invocation_id, checkpoint)
+            try:
+                result = _run_worker_group(args, assignments, gpu_indices=gpu_indices, collect_telemetry=True)
+            except BaseException as error:
+                checkpoint_status = "failed" if isinstance(error, Exception) else "interrupted"
+                scheduled_trial_ids, launched_trial_ids = _launch_accounting_from_error(
+                    error,
+                    [trial.trial_id for _, trial in assignments],
+                )
+                checkpoint_wave.update({
+                    "status": checkpoint_status,
+                    "detail": str(error),
+                    "scheduled_trial_ids": scheduled_trial_ids,
+                    "launched_trial_ids": launched_trial_ids,
+                })
+                checkpoint.update({"status": checkpoint_status, "error_type": type(error).__name__})
+                _write_invocation_checkpoint(args.output_root, invocation_id, checkpoint)
+                raise
             elapsed, completed, failed = result[:3]
             if len(result) == 3:
                 first_progress, telemetry_samples, worker_failures = {}, [], ()
@@ -1212,6 +1668,8 @@ def run_campaign(
                     failure_counts[failure_class] = failure_counts.get(failure_class, 0) + 1
             capacity_records.append({
                 "workers": count, "trial_ids": [trial.trial_id for _, trial in assignments], "gpu_indices": list(gpu_indices),
+                "scheduled_trial_ids": [trial.trial_id for _, trial in assignments],
+                "launched_trial_ids": [trial.trial_id for _, trial in assignments],
                 "elapsed_seconds": elapsed, "completed_trials": completed, "failed_trials": failed,
                 "first_progress_seconds": {str(worker): seconds for worker, seconds in first_progress.items()},
                 "host_ram_margin": ram_margin, "combined_vram_margin": combined_vram_margin,
@@ -1224,6 +1682,14 @@ def run_campaign(
                 "worker_failures": list(worker_failures),
                 "failure_counts": failure_counts,
             })
+            checkpoint_wave.update({
+                "status": "terminal",
+                "launched_trial_ids": [trial.trial_id for _, trial in assignments],
+                "elapsed_seconds": elapsed,
+                "completed_trials": completed,
+                "failed_trials": failed,
+            })
+            _write_invocation_checkpoint(args.output_root, invocation_id, checkpoint)
             if choose_worker_count(
                 samples,
                 max_inference_latency_seconds=args.max_inference_latency_seconds,
@@ -1253,7 +1719,7 @@ def run_campaign(
     capacity = report.get("capacity", {})
     capacity_samples = capacity.get("samples", []) if isinstance(capacity, dict) else []
     wave_trial_ids = [
-        record["trial_ids"]
+        record.get("launched_trial_ids", record["trial_ids"])
         for record in capacity_samples
         if isinstance(record, dict) and "trial_ids" in record and record.get("status") != "skipped"
     ]
@@ -1261,16 +1727,29 @@ def run_campaign(
         record["trial_id"] for record in records
         if record.get("mode") == "sequential" and "trial_id" in record
     ]
+    production_wave_trial_ids = [
+        record.get("launched_trial_ids", record["trial_ids"]) for record in records
+        if record.get("mode") == "production" and "trial_ids" in record
+    ]
     attempted = set(sequential_trial_ids)
     for wave in wave_trial_ids:
+        attempted.update(wave)
+    for wave in production_wave_trial_ids:
         attempted.update(wave)
     report["episode_accounting"] = {
         "sequential_trial_ids": sequential_trial_ids,
         "capacity_wave_trial_ids": wave_trial_ids,
-        "attempt_count": len(sequential_trial_ids) + sum(len(wave) for wave in wave_trial_ids),
+        "production_wave_trial_ids": production_wave_trial_ids,
+        "attempt_count": len(sequential_trial_ids) + sum(len(wave) for wave in wave_trial_ids) + sum(len(wave) for wave in production_wave_trial_ids),
         "attempted_unique_trial_ids": sorted(attempted),
     }
-    (args.output_root / "capacity-report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    campaign_failure = production_failure or sequential_failure
+    checkpoint["status"] = "failed" if campaign_failure else "completed"
+    checkpoint["completed_after"] = report["completed_after"]
+    _write_invocation_checkpoint(args.output_root, invocation_id, checkpoint)
+    _write_json_atomically(args.output_root / "capacity-report.json", report)
+    if campaign_failure:
+        raise RuntimeError(campaign_failure)
     return report
 
 
@@ -1281,6 +1760,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as error:
         print(f"campaign validation error: {error}", file=sys.stderr)
         return 2
+    except RuntimeError as error:
+        print(f"campaign execution error: {error}", file=sys.stderr)
+        return 1
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 

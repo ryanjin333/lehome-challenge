@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import threading
 import pytest
@@ -25,7 +27,9 @@ from scripts.run_groot_flywheel_campaign import (
     _validate_sweep,
     _worker_gpu_indices,
     _worker_environment,
+    _write_invocation_checkpoint,
     build_parser,
+    main,
     pending_trial_ids,
     run_campaign,
 )
@@ -56,6 +60,56 @@ def campaign_state_with_completed_trial(tmp_path, trial_id: str) -> CampaignStat
 def test_campaign_resume_skips_checksum_verified_trials(tmp_path) -> None:
     state = campaign_state_with_completed_trial(tmp_path, "trial-001")
     assert pending_trial_ids(state) == ("trial-002",)
+
+
+def test_campaign_rejects_a_second_production_controller(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    trial_ids = tuple(trial.trial_id for trial in build_public_matrix().trials[:1])
+    started = threading.Event()
+    release = threading.Event()
+    results: list[BaseException] = []
+    scans = 0
+
+    def pending_for_phase(_state: CampaignState) -> tuple[str, ...]:
+        nonlocal scans
+        scans += 1
+        return trial_ids if scans == 1 else ()
+
+    def run_group(_args, assignments, **_kwargs):
+        started.set()
+        assert release.wait(timeout=2.0)
+        return 1.0, len(assignments), 0
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", pending_for_phase)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "1",
+    ])
+
+    def controller_target() -> None:
+        try:
+            run_campaign(args)
+        except BaseException as error:
+            results.append(error)
+
+    controller = threading.Thread(target=controller_target)
+    controller.start()
+    try:
+        assert started.wait(timeout=2.0)
+        with pytest.raises(ValueError, match="supervisor is already active"):
+            run_campaign(args)
+    finally:
+        release.set()
+        controller.join(timeout=2.0)
+
+    assert not controller.is_alive()
+    assert results == []
 
 
 def test_campaign_resume_retries_an_encoder_error_even_when_generic_artifact_hashes_verify(tmp_path) -> None:
@@ -121,6 +175,55 @@ def test_sequential_retry_quarantines_failed_staging_before_reusing_the_trial_id
 
     assert (tmp_path / "raw" / trial.trial_id).is_dir()
     assert list((tmp_path / "quarantine").glob(f"{trial.trial_id}.attempt-*/pending"))
+
+
+def test_sequential_worker_reaps_child_when_wait_is_interrupted(monkeypatch, tmp_path) -> None:
+    events: list[tuple[str, float | None]] = []
+
+    class InterruptingProcess:
+        def __init__(self) -> None:
+            self.terminated = False
+            self.killed = False
+
+        def wait(self, timeout=None):
+            events.append(("wait", timeout))
+            if self.killed:
+                return 0
+            if self.terminated:
+                raise subprocess.TimeoutExpired("trial", timeout)
+            raise KeyboardInterrupt()
+
+        def terminate(self) -> None:
+            events.append(("terminate", None))
+            self.terminated = True
+
+        def kill(self) -> None:
+            events.append(("kill", None))
+            self.killed = True
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.subprocess.Popen", lambda *_args, **_kwargs: InterruptingProcess())
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_one_worker(_worker_args(tmp_path), worker_id=1, trial=Trial("pant_long", "Pant_Long_Seen_0", "seen", 42))
+
+    assert events == [("wait", 2.0), ("terminate", None), ("wait", 0.25), ("kill", None), ("wait", None)]
+
+
+def test_first_ledger_creation_fsyncs_the_campaign_root(monkeypatch, tmp_path) -> None:
+    root_inode = tmp_path.stat().st_ino
+    root_fsyncs: list[int] = []
+    real_fsync = os.fsync
+
+    def fsync(fd: int) -> None:
+        if os.fstat(fd).st_ino == root_inode:
+            root_fsyncs.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.os.fsync", fsync)
+
+    _write_invocation_checkpoint(tmp_path, "a" * 32, {"schema_version": 1})
+
+    assert root_fsyncs
 
 
 def test_retry_preparation_rejects_parent_path_without_moving_any_output(tmp_path) -> None:
@@ -367,6 +470,62 @@ def test_campaign_parser_exposes_device_and_forwards_it_to_trial_workers(tmp_pat
     assert "--device" in _trial_command(args, build_public_matrix().trials[0])
 
 
+def test_campaign_parser_rejects_conflicting_or_unapproved_production_worker_counts(tmp_path) -> None:
+    base = [
+        "--matrix", str(Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"),
+        "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"),
+        "--simulator-version", "isaac-5.1", "--policy-artifact-sha256", "c" * 64,
+        "--image-identity", "sha256:image",
+    ]
+
+    with pytest.raises(SystemExit, match="2"):
+        build_parser().parse_args([*base, "--workers", "5"])
+    with pytest.raises(SystemExit, match="2"):
+        build_parser().parse_args([*base, "--workers", "1", "--capacity-sweep", "1,2,4"])
+
+
+def test_campaign_execution_rejects_programmatic_worker_oversubscription_before_gpu_inventory(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "4",
+    ])
+    args.workers = 5
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._worker_gpu_indices",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("GPU inventory requested")),
+    )
+
+    with pytest.raises(ValueError, match="between 1 and 4"):
+        run_campaign(args)
+
+
+def test_campaign_execution_rejects_boolean_worker_count_before_gpu_inventory(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "1",
+    ])
+    args.workers = True
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._worker_gpu_indices",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("GPU inventory requested")),
+    )
+
+    with pytest.raises(ValueError, match="between 1 and 4"):
+        run_campaign(args)
+
+
 @pytest.mark.parametrize(
     "value",
     ("", "1", "1,2", "2,1,4", "1,2,4,6", "1,2,4,", "1,,2,4", " 1,2,4", "1,2,4 "),
@@ -504,6 +663,451 @@ def test_capacity_sweep_accounts_only_for_exact_nonduplicated_wave_trials(monkey
     assert report["capacity"]["samples"][0]["combined_vram_margin"] == 1.0
     assert "inference_vram_margin" not in report["capacity"]["samples"][0]
     assert "render_vram_margin" not in report["capacity"]["samples"][0]
+    checkpoints = list((tmp_path / "campaign-ledger").glob("*.json"))
+    assert len(checkpoints) == 1
+    checkpoint = json.loads(checkpoints[0].read_text(encoding="utf-8"))
+    assert checkpoint["mode"] == "capacity_sweep"
+    assert [wave["status"] for wave in checkpoint["waves"]] == ["terminal", "terminal", "terminal"]
+
+
+def test_capacity_sweep_persists_partial_launch_accounting_before_reraising(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+
+    def run_group(_args, assignments, **_kwargs):
+        error = OSError("second capacity launch failed")
+        error.scheduled_trial_ids = tuple(trial.trial_id for _, trial in assignments)
+        error.launched_trial_ids = ()
+        raise error
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--capacity-sweep", "1,2,4",
+    ])
+
+    with pytest.raises(OSError, match="second capacity launch failed"):
+        run_campaign(args)
+
+    checkpoint = json.loads(next((tmp_path / "campaign-ledger").glob("*.json")).read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "failed"
+    assert checkpoint["waves"][0]["scheduled_trial_ids"] == [build_public_matrix().trials[0].trial_id]
+    assert checkpoint["waves"][0]["launched_trial_ids"] == []
+
+
+def test_capacity_sweep_persists_zero_launches_when_port_allocation_fails(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._allocate_loopback_ports",
+        lambda _workers: (_ for _ in ()).throw(OSError("loopback allocation failed")),
+    )
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.subprocess.Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("trial must not launch")),
+    )
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--capacity-sweep", "1,2,4",
+    ])
+
+    with pytest.raises(OSError, match="loopback allocation failed"):
+        run_campaign(args)
+
+    checkpoint = json.loads(next((tmp_path / "campaign-ledger").glob("*.json")).read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "failed"
+    assert checkpoint["waves"][0]["launched_trial_ids"] == []
+
+
+def test_campaign_workers_runs_all_pending_trials_in_finite_gpu_waves(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    trial_ids = tuple(trial.trial_id for trial in build_public_matrix().trials[:7])
+    scans: list[tuple[str, ...]] = []
+    launches: list[tuple[tuple[int, ...], tuple[int | None, ...]]] = []
+
+    def pending_for_phase(_state: CampaignState) -> tuple[str, ...]:
+        scans.append(trial_ids)
+        return trial_ids if len(scans) == 1 else ()
+
+    def run_group(_args, assignments, *, gpu_indices=None, **_kwargs):
+        launches.append((
+            tuple(trial.seed for _, trial in assignments),
+            tuple(gpu_indices),
+        ))
+        return 1.0, len(assignments), 0
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", pending_for_phase)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._worker_gpu_indices",
+        lambda _args, count: tuple(range(count)),
+    )
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "4",
+    ])
+
+    report = run_campaign(args)
+
+    expected_seeds = [trial.seed for trial in build_public_matrix().trials[:7]]
+    assert launches == [(tuple(expected_seeds[:4]), (0, 1, 2, 3)), (tuple(expected_seeds[4:]), (0, 1, 2))]
+    assert report["production"] == {"workers": 4, "status": "completed", "waves": 2}
+    assert report["episode_accounting"]["production_wave_trial_ids"] == [list(trial_ids[:4]), list(trial_ids[4:])]
+    assert report["episode_accounting"]["attempted_unique_trial_ids"] == sorted(trial_ids)
+
+
+def test_sequential_campaign_fails_closed_on_a_nonzero_worker(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    trial_ids = tuple(trial.trial_id for trial in build_public_matrix().trials[:1])
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda _state: trial_ids)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_one_worker", lambda *_args, **_kwargs: 1)
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"),
+    ])
+
+    with pytest.raises(RuntimeError, match="sequential worker 1 failed"):
+        run_campaign(args)
+
+    report = json.loads((tmp_path / "capacity-report.json").read_text(encoding="utf-8"))
+    assert report["workers"] == [{"mode": "sequential", "returncode": 1, "trial_id": trial_ids[0], "worker_id": 1}]
+    checkpoint = json.loads(next((tmp_path / "campaign-ledger").glob("*.json")).read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "failed"
+
+
+def test_sequential_campaign_fails_closed_on_an_incomplete_zero_exit(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    trial_ids = tuple(trial.trial_id for trial in build_public_matrix().trials[:1])
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda _state: trial_ids)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_one_worker", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda *_args: False)
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"),
+    ])
+
+    with pytest.raises(RuntimeError, match="sequential worker 1 failed: returncode=0"):
+        run_campaign(args)
+
+
+def test_sequential_campaign_marks_checkpoint_interrupted_before_reraising(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    trial_ids = tuple(trial.trial_id for trial in build_public_matrix().trials[:1])
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda _state: trial_ids)
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._run_one_worker",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"),
+    ])
+
+    with pytest.raises(KeyboardInterrupt):
+        run_campaign(args)
+
+    checkpoint = json.loads(next((tmp_path / "campaign-ledger").glob("*.json")).read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "interrupted"
+    assert checkpoint["waves"][-1]["status"] == "interrupted"
+
+
+def test_campaign_workers_empty_resume_does_not_inventory_gpus(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda _state: ())
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._worker_gpu_indices",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("GPU inventory requested")),
+    )
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "4",
+    ])
+
+    report = run_campaign(args)
+
+    assert report["production"] == {"workers": 4, "status": "completed", "waves": 0}
+    assert report["completed_after"] == [trial.trial_id for trial in build_public_matrix().trials]
+
+
+def test_campaign_writes_atomic_production_checkpoints_before_and_after_each_wave(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    trial_ids = tuple(trial.trial_id for trial in build_public_matrix().trials[:1])
+    pending_scans = 0
+    replacements: list[tuple[str, str]] = []
+    real_replace = os.replace
+
+    def pending_for_phase(_state: CampaignState) -> tuple[str, ...]:
+        nonlocal pending_scans
+        pending_scans += 1
+        return trial_ids if pending_scans == 1 else ()
+
+    def run_group(_args, assignments, **_kwargs):
+        files = list((tmp_path / "campaign-ledger").glob("*.json"))
+        assert len(files) == 1
+        checkpoint = json.loads(files[0].read_text(encoding="utf-8"))
+        assert checkpoint["status"] == "running"
+        assert checkpoint["waves"][-1]["status"] == "started"
+        assert checkpoint["waves"][-1]["trial_ids"] == list(trial_ids)
+        return 1.0, len(assignments), 0
+
+    def replace(source, destination, *args, **kwargs):
+        replacements.append((os.fspath(source), os.fspath(destination)))
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", pending_for_phase)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.os.replace", replace)
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "1",
+    ])
+
+    run_campaign(args)
+
+    files = list((tmp_path / "campaign-ledger").glob("*.json"))
+    assert len(files) == 1
+    checkpoint = json.loads(files[0].read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "completed"
+    assert checkpoint["waves"][-1]["status"] == "terminal"
+    assert replacements
+    assert not list((tmp_path / "campaign-ledger").glob("*.tmp"))
+
+
+def test_campaign_checkpoint_marks_an_interrupted_wave_before_reraising(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    trial_ids = tuple(trial.trial_id for trial in build_public_matrix().trials[:1])
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda _state: trial_ids)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._run_worker_group",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "1",
+    ])
+
+    with pytest.raises(KeyboardInterrupt):
+        run_campaign(args)
+
+    checkpoint = json.loads(next((tmp_path / "campaign-ledger").glob("*.json")).read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "interrupted"
+    assert checkpoint["waves"][-1]["status"] == "interrupted"
+
+
+def test_campaign_ledger_preserves_prior_capacity_invocations(tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    base = [
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--dry-run",
+    ]
+
+    run_campaign(build_parser().parse_args([*base, "--capacity-sweep", "1,2,4"]))
+    run_campaign(build_parser().parse_args(base))
+
+    checkpoints = [json.loads(path.read_text(encoding="utf-8")) for path in (tmp_path / "campaign-ledger").glob("*.json")]
+    assert len(checkpoints) == 2
+    assert {checkpoint["mode"] for checkpoint in checkpoints} == {"capacity_sweep", "sequential"}
+    assert all(checkpoint["status"] == "completed" for checkpoint in checkpoints)
+
+
+def test_campaign_workers_stops_after_a_failed_wave_without_retrying(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    trial_ids = tuple(trial.trial_id for trial in build_public_matrix().trials[:7])
+    launches: list[tuple[str, ...]] = []
+
+    def run_group(_args, assignments, **_kwargs):
+        launches.append(tuple(trial.trial_id for _, trial in assignments))
+        return 1.0, len(assignments) - 1, 1
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda _state: trial_ids)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._worker_gpu_indices",
+        lambda _args, count: tuple(range(count)),
+    )
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "4",
+    ])
+
+    with pytest.raises(RuntimeError, match="production wave 1 failed"):
+        run_campaign(args)
+
+    assert launches == [trial_ids[:4]]
+    report = json.loads((tmp_path / "capacity-report.json").read_text(encoding="utf-8"))
+    assert report["production"] == {"workers": 4, "status": "failed", "waves": 1}
+    assert report["workers"][0]["failed_trials"] == 1
+
+
+def test_campaign_workers_reports_a_group_launch_error_without_starting_another_wave(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    trial_ids = tuple(trial.trial_id for trial in build_public_matrix().trials[:7])
+    launches: list[tuple[str, ...]] = []
+
+    def run_group(_args, assignments, **_kwargs):
+        launches.append(tuple(trial.trial_id for _, trial in assignments))
+        error = OSError("policy server launch failed")
+        error.scheduled_trial_ids = tuple(trial.trial_id for _, trial in assignments)
+        error.launched_trial_ids = (assignments[0][1].trial_id,)
+        raise error
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda _state: trial_ids)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._worker_gpu_indices",
+        lambda _args, count: tuple(range(count)),
+    )
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "4",
+    ])
+
+    with pytest.raises(RuntimeError, match="production wave 1 failed: policy server launch failed"):
+        run_campaign(args)
+
+    assert launches == [trial_ids[:4]]
+    report = json.loads((tmp_path / "capacity-report.json").read_text(encoding="utf-8"))
+    assert report["production"] == {"workers": 4, "status": "failed", "waves": 1}
+    assert report["workers"][0]["status"] == "launch_error"
+    assert report["workers"][0]["scheduled_trial_ids"] == list(trial_ids[:4])
+    assert report["workers"][0]["launched_trial_ids"] == [trial_ids[0]]
+    assert report["episode_accounting"] == {
+        "sequential_trial_ids": [],
+        "capacity_wave_trial_ids": [],
+        "production_wave_trial_ids": [[trial_ids[0]]],
+        "attempt_count": 1,
+        "attempted_unique_trial_ids": [trial_ids[0]],
+    }
+    ledger = json.loads(next((tmp_path / "campaign-ledger").glob("*.json")).read_text(encoding="utf-8"))
+    assert ledger["waves"][0]["scheduled_trial_ids"] == list(trial_ids[:4])
+    assert ledger["waves"][0]["launched_trial_ids"] == [trial_ids[0]]
+
+
+def test_campaign_workers_persists_zero_launches_when_port_allocation_fails(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    trial_ids = tuple(trial.trial_id for trial in build_public_matrix().trials[:4])
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda _state: trial_ids)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._allocate_loopback_ports",
+        lambda _workers: (_ for _ in ()).throw(OSError("loopback allocation failed")),
+    )
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.subprocess.Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("trial must not launch")),
+    )
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "4",
+    ])
+
+    with pytest.raises(RuntimeError, match="production wave 1 failed: loopback allocation failed"):
+        run_campaign(args)
+
+    report = json.loads((tmp_path / "capacity-report.json").read_text(encoding="utf-8"))
+    assert report["workers"][0]["scheduled_trial_ids"] == list(trial_ids)
+    assert report["workers"][0]["launched_trial_ids"] == []
+    assert report["episode_accounting"]["attempt_count"] == 0
+    assert report["episode_accounting"]["attempted_unique_trial_ids"] == []
+    ledger = json.loads(next((tmp_path / "campaign-ledger").glob("*.json")).read_text(encoding="utf-8"))
+    assert ledger["waves"][0]["launched_trial_ids"] == []
+
+
+def test_campaign_workers_fails_if_a_successful_wave_leaves_pending_artifacts(monkeypatch, tmp_path) -> None:
+    matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    trial_ids = tuple(trial.trial_id for trial in build_public_matrix().trials[:4])
+    launches: list[tuple[str, ...]] = []
+
+    def run_group(_args, assignments, **_kwargs):
+        launches.append(tuple(trial.trial_id for _, trial in assignments))
+        return 1.0, len(assignments), 0
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda _state: trial_ids)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._worker_gpu_indices",
+        lambda _args, count: tuple(range(count)),
+    )
+    args = build_parser().parse_args([
+        "--matrix", str(matrix_path), "--policy-path", "policy", "--policy-revision-file", "revision", "--output-root", str(tmp_path),
+        "--policy-repo", "org/policy", "--policy-step", "1", "--code-revision", "a" * 40,
+        "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"), "--simulator-version", "isaac-5.1",
+        "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image", "--device", "cuda:0",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "4",
+    ])
+
+    with pytest.raises(RuntimeError, match="terminal-incomplete trials remain"):
+        run_campaign(args)
+
+    assert launches == [trial_ids]
+    report = json.loads((tmp_path / "capacity-report.json").read_text(encoding="utf-8"))
+    assert report["production"] == {"workers": 4, "status": "failed", "waves": 1}
+
+
+def test_campaign_main_returns_nonzero_for_a_reported_production_failure(monkeypatch, capsys) -> None:
+    parser = argparse.ArgumentParser()
+    parser.parse_args = lambda _argv: argparse.Namespace()
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.build_parser", lambda: parser)
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.run_campaign",
+        lambda _args: (_ for _ in ()).throw(RuntimeError("production wave 1 failed")),
+    )
+
+    assert main([]) == 1
+    assert "campaign execution error: production wave 1 failed" in capsys.readouterr().err
 
 
 def test_cpu_capacity_assignment_represents_one_cpu_worker_explicitly(tmp_path) -> None:
@@ -511,6 +1115,14 @@ def test_cpu_capacity_assignment_represents_one_cpu_worker_explicitly(tmp_path) 
     args.device = "cpu"
 
     assert _worker_gpu_indices(args, 1) == (None,)
+
+
+def test_production_worker_gpu_assignment_rejects_oversubscription(monkeypatch, tmp_path) -> None:
+    args = _worker_args(tmp_path)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._visible_gpu_indices", lambda: (0, 1))
+
+    with pytest.raises(ValueError, match="unsupported GPU oversubscription"):
+        _worker_gpu_indices(args, 3)
 
 
 def test_policy_telemetry_sampler_accepts_worker_attributed_evidence(tmp_path) -> None:
@@ -1023,6 +1635,146 @@ def test_worker_group_reaps_a_partial_launch_worker_that_exits_after_terminate(m
     assert events == ["poll", "terminate", "poll", "wait"]
 
 
+def test_worker_group_records_only_popen_successes_when_a_later_launch_fails(monkeypatch, tmp_path) -> None:
+    launched = []
+    assignments = _group_trials(2)
+
+    def launch(*_args, **_kwargs):
+        if launched:
+            raise OSError("second Popen failed")
+        launched.append(True)
+        return _GracefulAfterTerminateProcess([])
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.subprocess.Popen", launch)
+
+    with pytest.raises(OSError, match="second Popen failed") as raised:
+        _run_worker_group(_worker_args(tmp_path), assignments)
+
+    assert raised.value.scheduled_trial_ids == tuple(trial.trial_id for _, trial in assignments)
+    assert raised.value.launched_trial_ids == (assignments[0][1].trial_id,)
+
+
+def test_worker_group_kills_a_policy_server_descendant_after_its_trial_parent_exits(monkeypatch, tmp_path) -> None:
+    signals: list[tuple[int, int]] = []
+    launches = []
+    clock = [0.0]
+    policy_server_alive = True
+    waits = []
+
+    class ParentExitedWhilePolicyServerLives:
+        pid = 5151
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return 0
+
+    def popen(*_args, **kwargs):
+        launches.append(kwargs)
+        return ParentExitedWhilePolicyServerLives()
+
+    def killpg(process_group: int, signum: int) -> None:
+        nonlocal policy_server_alive
+        signals.append((process_group, signum))
+        if signum == 0:
+            if not policy_server_alive:
+                raise ProcessLookupError
+        elif signum == signal.SIGKILL:
+            policy_server_alive = False
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.subprocess.Popen", popen)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.os.killpg", killpg)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.time.sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda *_args: True)
+
+    _, completed, failed = _run_worker_group(_worker_args(tmp_path), _group_trials(1))
+
+    assert (completed, failed) == (1, 0)
+    assert launches[0]["start_new_session"] is True
+    assert (5151, signal.SIGTERM) in signals
+    assert (5151, signal.SIGKILL) in signals
+    assert policy_server_alive is False
+    assert waits == [0.25]
+
+
+def test_sequential_worker_kills_a_policy_server_descendant_after_nonzero_wait(monkeypatch, tmp_path) -> None:
+    signals: list[tuple[int, int]] = []
+    clock = [0.0]
+    policy_server_alive = True
+
+    class ParentExitedWhilePolicyServerLives:
+        pid = 6161
+
+        def wait(self, timeout=None):
+            return 17
+
+        def poll(self):
+            return 17
+
+    def killpg(process_group: int, signum: int) -> None:
+        nonlocal policy_server_alive
+        signals.append((process_group, signum))
+        if signum == 0:
+            if not policy_server_alive:
+                raise ProcessLookupError
+        elif signum == signal.SIGKILL:
+            policy_server_alive = False
+
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.subprocess.Popen",
+        lambda *_args, **_kwargs: ParentExitedWhilePolicyServerLives(),
+    )
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.os.killpg", killpg)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.time.sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+
+    assert _run_one_worker(_worker_args(tmp_path), worker_id=1, trial=_group_trials(1)[0][1]) == 17
+    assert (6161, signal.SIGTERM) in signals
+    assert (6161, signal.SIGKILL) in signals
+    assert policy_server_alive is False
+
+
+def test_worker_group_fails_closed_when_a_policy_server_group_survives_sigkill(monkeypatch, tmp_path) -> None:
+    clock = [0.0]
+
+    class ParentExitedWhilePolicyServerLives:
+        pid = 7171
+
+        def poll(self):
+            return 17
+
+        def wait(self, timeout=None):
+            return 17
+
+    def killpg(_process_group: int, signum: int) -> None:
+        if signum not in {0, signal.SIGTERM, signal.SIGKILL}:
+            raise AssertionError("unexpected signal")
+
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.subprocess.Popen",
+        lambda *_args, **_kwargs: ParentExitedWhilePolicyServerLives(),
+    )
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.os.killpg", killpg)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign.time.sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.is_completed_trial", lambda *_args: False)
+
+    with pytest.raises(RuntimeError, match="worker process group 7171 survived SIGKILL"):
+        _run_worker_group(_worker_args(tmp_path), _group_trials(1))
+
+
 def test_worker_group_cleans_up_and_closes_every_log_when_later_popen_fails(monkeypatch, tmp_path) -> None:
     events: list[tuple[str, int, float | None]] = []
     opened = []
@@ -1056,6 +1808,26 @@ def test_worker_group_cleans_up_and_closes_every_log_when_later_popen_fails(monk
     assert [timeout for event, _, timeout in events if event == "wait"] == [0.25, 0.25]
     assert clock[0] == pytest.approx(0.25)
     assert all(log.closed for log in opened)
+
+
+def test_worker_group_reaps_all_siblings_when_polling_is_interrupted(monkeypatch, tmp_path) -> None:
+    events: list[tuple[str, int, float | None]] = []
+    processes = iter((_LaunchCleanupProcess(1, events), _LaunchCleanupProcess(2, events)))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.subprocess.Popen", lambda *_args, **_kwargs: next(processes))
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._trial_has_first_progress",
+        lambda *_args: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_worker_group(_worker_args(tmp_path), _group_trials(2))
+
+    assert [(event, worker) for event, worker, _ in events if event in {"terminate", "kill"}] == [
+        ("terminate", 1), ("terminate", 2), ("kill", 1), ("kill", 2),
+    ]
+    assert [(event, worker) for event, worker, _ in events if event == "wait"] == [
+        ("wait", 1), ("wait", 2),
+    ]
 
 
 def test_single_worker_uses_configured_shutdown_grace_only_after_main_timeout(monkeypatch, tmp_path) -> None:

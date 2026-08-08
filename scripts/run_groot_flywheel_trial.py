@@ -205,12 +205,20 @@ def write_policy_server_receipt(
 
 
 class PolicyServerSupervisor:
-    """Own the server process group and restore host signal handling on exit."""
+    """Own the server lifetime and restore host signal handling on exit."""
 
-    def __init__(self, process: object, *, termination_grace: float, killpg=os.killpg) -> None:
+    def __init__(
+        self,
+        process: object,
+        *,
+        termination_grace: float,
+        killpg=os.killpg,
+        owns_process_group: bool = True,
+    ) -> None:
         self.process = process
         self.termination_grace = termination_grace
         self._killpg = killpg
+        self._owns_process_group = owns_process_group
         self._closed = False
         self._previous_handlers: dict[int, object] = {}
 
@@ -221,13 +229,23 @@ class PolicyServerSupervisor:
         if self.process.poll() is not None:
             self.process.wait(timeout=0)
             return
-        self._killpg(self.process.pid, signal.SIGTERM)
+        self._terminate(signal.SIGTERM)
         try:
             self.process.wait(timeout=self.termination_grace)
             return
         except subprocess.TimeoutExpired:
-            self._killpg(self.process.pid, signal.SIGKILL)
+            self._terminate(signal.SIGKILL)
         self.process.wait(timeout=self.termination_grace)
+
+    def _terminate(self, signum: int) -> None:
+        if self._owns_process_group:
+            self._killpg(self.process.pid, signum)
+        elif signum == signal.SIGTERM:
+            self.process.terminate()
+        elif signum == signal.SIGKILL:
+            self.process.kill()
+        else:  # pragma: no cover - close only uses TERM and KILL.
+            raise ValueError("unsupported policy-server signal")
 
     def _signal_handler(self, signum: int, _frame: object) -> None:
         self.close()
@@ -266,11 +284,15 @@ def _spawn_policy_server(
     try:
         process = subprocess.Popen(
             list(command), stdin=subprocess.DEVNULL, stdout=fd, stderr=subprocess.STDOUT,
-            env=child_environment, start_new_session=True, close_fds=True,
+            env=child_environment, start_new_session=False, close_fds=True,
         )
     finally:
         os.close(fd)
-    return PolicyServerSupervisor(process, termination_grace=args.policy_server_termination_grace)
+    return PolicyServerSupervisor(
+        process,
+        termination_grace=args.policy_server_termination_grace,
+        owns_process_group=False,
+    )
 
 
 def _await_policy_server_ready(

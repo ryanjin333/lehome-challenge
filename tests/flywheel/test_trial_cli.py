@@ -920,6 +920,32 @@ def test_policy_server_supervisor_reaps_after_term_then_kill_and_signal(monkeypa
     ]
 
 
+def test_policy_server_supervisor_reaps_an_inherited_group_server_without_signalling_the_trial(monkeypatch) -> None:
+    events = []
+
+    class Process:
+        pid = 4243
+        def poll(self): return None
+        def terminate(self): events.append("terminate")
+        def kill(self): events.append("kill")
+        def wait(self, timeout):
+            events.append(("wait", timeout))
+            if len([event for event in events if isinstance(event, tuple)]) == 1:
+                raise subprocess.TimeoutExpired("server", timeout)
+            return 0
+
+    supervisor = trial_module.PolicyServerSupervisor(
+        Process(),
+        termination_grace=0.1,
+        owns_process_group=False,
+        killpg=lambda *_args: (_ for _ in ()).throw(AssertionError("trial group must not be signalled")),
+    )
+
+    supervisor.close()
+
+    assert events == ["terminate", ("wait", 0.1), "kill", ("wait", 0.1)]
+
+
 def test_policy_server_child_isolated_to_physical_gpu_and_parent_visibility_restores(monkeypatch, tmp_path) -> None:
     captured = {}
 
@@ -941,6 +967,7 @@ def test_policy_server_child_isolated_to_physical_gpu_and_parent_visibility_rest
     supervisor = trial_module._spawn_policy_server(
         args, token="x" * 48, command=["python", "server.py"], physical_gpu="2",
     )
+    assert captured["start_new_session"] is False
     assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "2"
     assert captured["env"]["LEHOME_GROOT_POLICY_API_TOKEN"] == "x" * 48
     assert "x" * 48 not in args.policy_server_log.read_text(encoding="utf-8")
