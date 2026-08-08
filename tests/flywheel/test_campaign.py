@@ -351,6 +351,23 @@ def test_repeated_retry_preparation_retains_distinct_quarantined_attempts(tmp_pa
     assert all((attempt / "pending" / "annotations.jsonl").is_file() for attempt in attempts)
 
 
+def test_retry_preparation_quarantines_per_trial_receipts_without_episode_staging(tmp_path) -> None:
+    trial_id = "trial-001"
+    receipt = tmp_path / f"policy-server-receipt-{trial_id}.json"
+    manifest = tmp_path / f"flywheel-manifest-{trial_id}.json"
+    receipt.write_text('{"port": 40001}\n', encoding="utf-8")
+    manifest.write_text('{"episode_id": "trial-001"}\n', encoding="utf-8")
+
+    _prepare_retry_attempt(tmp_path, trial_id)
+
+    attempts = list((tmp_path / "quarantine").glob(f"{trial_id}.attempt-*"))
+    assert len(attempts) == 1
+    assert (attempts[0] / receipt.name).read_text(encoding="utf-8") == '{"port": 40001}\n'
+    assert (attempts[0] / manifest.name).read_text(encoding="utf-8") == '{"episode_id": "trial-001"}\n'
+    assert not receipt.exists()
+    assert not manifest.exists()
+
+
 def test_concurrent_retry_preparation_retains_one_attempt_without_collision_or_overwrite(tmp_path) -> None:
     failed = EpisodeArtifactWriter(tmp_path, "trial-001")
     failed.append_annotation({"step": 0, "action_source": "policy"})

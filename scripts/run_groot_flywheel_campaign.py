@@ -226,6 +226,18 @@ def _prepare_retry_attempt(output_root: Path, trial_id: str) -> None:
     with _locked_campaign_storage(output_root) as (root, root_fd):
         if _is_completed_locked(root, root_fd, trial_id):
             return
+        root_artifacts: list[tuple[str, os.stat_result]] = []
+        for name in (
+            f"policy-server-receipt-{trial_id}.json",
+            f"flywheel-manifest-{trial_id}.json",
+        ):
+            try:
+                details = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+                raise ValueError("campaign retry receipt is unsafe")
+            root_artifacts.append((name, details))
         parent_fds: list[tuple[str, int, os.stat_result]] = []
         try:
             for parent_name in (".pending", "raw"):
@@ -240,7 +252,7 @@ def _prepare_retry_attempt(output_root: Path, trial_id: str) -> None:
                 else:
                     os.close(parent_fd)
             quarantine_fd = _open_campaign_directory(root_fd, "quarantine", create=True)
-            if not parent_fds:
+            if not parent_fds and not root_artifacts:
                 os.close(quarantine_fd)
                 return
             try:
@@ -272,6 +284,24 @@ def _prepare_retry_attempt(output_root: Path, trial_id: str) -> None:
                         moved = os.stat(name, dir_fd=attempt_fd, follow_symlinks=False)
                         if stat.S_ISLNK(moved.st_mode) or (moved.st_dev, moved.st_ino) != (before.st_dev, before.st_ino):
                             raise ValueError("campaign trial changed during quarantine")
+                    for name, before in root_artifacts:
+                        current = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                        if (
+                            stat.S_ISLNK(current.st_mode)
+                            or not stat.S_ISREG(current.st_mode)
+                            or (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino)
+                        ):
+                            raise ValueError("campaign retry receipt changed during retry preparation")
+                        try:
+                            os.stat(name, dir_fd=attempt_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            raise ValueError("campaign quarantine destination collision")
+                        os.rename(name, name, src_dir_fd=root_fd, dst_dir_fd=attempt_fd)
+                        moved = os.stat(name, dir_fd=attempt_fd, follow_symlinks=False)
+                        if stat.S_ISLNK(moved.st_mode) or (moved.st_dev, moved.st_ino) != (before.st_dev, before.st_ino):
+                            raise ValueError("campaign retry receipt changed during quarantine")
                 finally:
                     os.close(attempt_fd)
             finally:
