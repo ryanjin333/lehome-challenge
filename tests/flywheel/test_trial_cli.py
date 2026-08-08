@@ -854,11 +854,14 @@ def test_policy_server_command_and_receipt_omit_the_api_token(tmp_path) -> None:
         args,
         groot_revision="d" * 40,
         python_version="3.10.18",
+        checkpoint_revision="e" * 40,
         command=command,
     )
     content = receipt.read_text(encoding="utf-8")
     assert token not in content
-    assert json.loads(content)["host"] == "127.0.0.1"
+    payload = json.loads(content)
+    assert payload["host"] == "127.0.0.1"
+    assert payload["checkpoint_revision"] == "e" * 40
 
 
 def test_policy_server_runtime_validation_requires_clean_checkout_and_python310(monkeypatch, tmp_path) -> None:

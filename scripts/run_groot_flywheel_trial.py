@@ -173,6 +173,7 @@ def write_policy_server_receipt(
     *,
     groot_revision: str,
     python_version: str,
+    checkpoint_revision: str,
     command: Sequence[str],
 ) -> Path:
     """Persist the launch boundary before Isaac can allocate the GPU."""
@@ -190,7 +191,7 @@ def write_policy_server_receipt(
         "command": list(command),
         "request_timeout_seconds": args.policy_server_request_timeout,
         "readiness_timeout_seconds": args.policy_server_readiness_timeout,
-        "checkpoint_revision": getattr(args, "policy_revision", None),
+        "checkpoint_revision": checkpoint_revision,
         "checkpoint_digest": args.policy_artifact_sha256,
         "code_revision": args.code_revision,
         "image_identity": args.image_identity,
@@ -885,6 +886,7 @@ def run_trial(
         args,
         groot_revision=server_runtime["groot_revision"],
         python_version=server_runtime["python_version"],
+        checkpoint_revision=revision,
         command=server_command,
     )
     # The token crosses exactly one boundary: this parent's private environment
