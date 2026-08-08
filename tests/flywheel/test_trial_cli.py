@@ -23,6 +23,17 @@ from scripts.run_groot_flywheel_trial import (
 )
 
 
+def test_evaluation_system_exit_is_not_reported_as_a_success() -> None:
+    def exit_during_evaluation(_args, _app) -> None:
+        raise SystemExit(0)
+
+    with pytest.raises(RuntimeError, match="Isaac evaluation exited before completion") as caught:
+        trial_module._run_evaluation_or_raise(exit_during_evaluation, object(), object())
+
+    assert isinstance(caught.value.__cause__, SystemExit)
+    assert caught.value.__cause__.code == 0
+
+
 def test_policy_artifact_sha256_hashes_the_index_and_every_referenced_shard(tmp_path) -> None:
     policy = tmp_path / "policy"
     policy.mkdir()

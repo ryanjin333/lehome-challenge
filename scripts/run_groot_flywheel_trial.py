@@ -704,6 +704,20 @@ def _live_runtime_identity(args: argparse.Namespace, _simulation_app: object) ->
     return simulator_version, asset_revision
 
 
+def _run_evaluation_or_raise(
+    evaluate: Callable[[argparse.Namespace, object], None],
+    args: argparse.Namespace,
+    simulation_app: object,
+) -> None:
+    """Keep an internal Kit exit from masquerading as a successful trial."""
+    try:
+        evaluate(args, simulation_app)
+    except SystemExit as error:
+        raise RuntimeError(
+            f"Isaac evaluation exited before completion (code={error.code!r})"
+        ) from error
+
+
 def _validate_live_runtime_identity(
     args: argparse.Namespace,
     simulation_app: object,
@@ -946,7 +960,7 @@ def run_trial(
         import lehome.tasks.bedroom  # noqa: F401
         from scripts.utils.evaluation import eval as evaluate
 
-        evaluate(evaluation_args, simulation_app)
+        _run_evaluation_or_raise(evaluate, evaluation_args, simulation_app)
     finally:
         try:
             if simulation_app is not None:
