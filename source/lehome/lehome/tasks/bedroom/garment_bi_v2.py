@@ -24,6 +24,7 @@ from lehome.assets.scenes.bedroom import MARBLE_BEDROOM_USD_PATH
 from lehome.devices.action_process import preprocess_device_action
 from lehome.assets.object.Garment import GarmentObject
 from lehome.tasks.bedroom.challenge_garment_loader import ChallengeGarmentLoader
+from lehome.flywheel.isaac_camera import read_camera_world_pose, write_camera_world_pose
 import logging
 from lehome.utils.logger import get_logger
 
@@ -662,9 +663,8 @@ class GarmentEnv(DirectRLEnv):
 
         cameras = []
         for camera in (self.top_camera, self.left_camera, self.right_camera):
-            if not hasattr(camera, "set_world_poses") or not hasattr(camera.data, "pos_w") or not hasattr(camera.data, "quat_w"):
-                raise RuntimeError("Isaac camera does not expose restorable world pose")
-            cameras.append({"position": tensor_row(camera.data.pos_w), "orientation": tensor_row(camera.data.quat_w)})
+            positions, orientations = read_camera_world_pose(camera)
+            cameras.append({"position": tensor_row(positions), "orientation": tensor_row(orientations)})
         roots = []
         for arm in (self.left_arm, self.right_arm):
             if not hasattr(arm, "write_root_pose_to_sim") or not hasattr(arm.data, "root_pos_w") or not hasattr(arm.data, "root_quat_w"):
@@ -695,7 +695,7 @@ class GarmentEnv(DirectRLEnv):
                 raise ValueError("flywheel camera snapshot pose is invalid")
             position = torch.tensor(pose["position"], dtype=torch.float32, device=self.device).unsqueeze(0)
             orientation = torch.tensor(pose["orientation"], dtype=torch.float32, device=self.device).unsqueeze(0)
-            camera.set_world_poses(position, orientation)
+            write_camera_world_pose(camera, position, orientation)
         for arm, pose in zip((self.left_arm, self.right_arm), roots, strict=True):
             if not isinstance(pose, dict):
                 raise ValueError("flywheel robot root snapshot pose is invalid")
@@ -900,13 +900,9 @@ class GarmentEnv(DirectRLEnv):
         intensity_attr.Set(float(base_intensity) * float(values["light_intensity_scale"]))
 
         for camera in (self.top_camera, self.left_camera, self.right_camera):
-            if not hasattr(camera, "set_world_poses") or not hasattr(camera.data, "pos_w"):
-                raise RuntimeError("Isaac camera does not expose restorable world pose")
-            positions = camera.data.pos_w + torch.tensor(camera_delta, device=self.device).unsqueeze(0)
-            camera.set_world_poses(positions, camera.data.quat_w)
-            actual = camera.data.pos_w.detach().cpu().numpy()[0]
-            if not np.allclose(actual, positions.detach().cpu().numpy()[0], atol=1e-5):
-                raise RuntimeError("Isaac camera pose readback did not match requested randomization")
+            current_positions, current_orientations = read_camera_world_pose(camera)
+            positions = current_positions + torch.tensor(camera_delta, device=self.device).unsqueeze(0)
+            write_camera_world_pose(camera, positions, current_orientations)
 
         pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
         pose[5] += float(values["garment_yaw_deg"])
