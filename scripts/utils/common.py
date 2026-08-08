@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 from typing import TYPE_CHECKING
 import numpy as np
 import torch
@@ -71,6 +72,16 @@ def launch_app_from_args(args: argparse.Namespace) -> SimulationApp:
     Returns:
         SimulationApp instance.
     """
+    if getattr(args, "headless", False):
+        # The vendored AppLauncher currently resolves every default branch to
+        # the GUI experience.  Camera observations need the purpose-built
+        # offscreen profile on machines without an X server.
+        args.enable_cameras = True
+        if not getattr(args, "experience", ""):
+            args.experience = str(
+                Path(__file__).resolve().parents[2]
+                / "third_party/IsaacLab/apps/isaaclab.python.headless.rendering.kit"
+            )
     args.kit_args = (
         "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error "
         "--/plugins/carb.tasking.plugin/threadCount=32 "

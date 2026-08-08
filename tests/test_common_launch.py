@@ -42,3 +42,7 @@ def test_launch_app_caps_renderer_to_one_gpu(monkeypatch):
     assert result is simulation_app
     assert launches == [vars(args)]
     assert "--/renderer/multiGpu/maxGpuCount=1" in args.kit_args
+    assert args.enable_cameras is True
+    assert args.experience.endswith(
+        "third_party/IsaacLab/apps/isaaclab.python.headless.rendering.kit"
+    )
