@@ -292,15 +292,19 @@ def flatten_groot_action(action: Mapping[str, Any]) -> np.ndarray:
 def validate_policy_server_action_chunk(action: Mapping[str, Any]) -> np.ndarray:
     """Reject server responses that drift from the exact GR00T action wire contract."""
 
-    if set(action) != set(_ACTION_KEYS):
+    # ``run_groot_policy_server`` binds NVIDIA's raw ``Gr00tPolicy`` directly,
+    # which returns bare modality keys.  Only ``Gr00tSimPolicyWrapper`` adds
+    # the ``action.`` prefix, and that wrapper expects a different observation
+    # contract than the nested request sent by this client.
+    if set(action) != set(_ACTION_GROUPS):
         raise ValueError("policy server action keys must exactly match the GR00T contract")
-    for group, key in zip(_ACTION_GROUPS, _ACTION_KEYS, strict=True):
-        values = action.get(key)
+    for group in _ACTION_GROUPS:
+        values = action.get(group)
         expected_dimension = 5 if group.endswith("_arm") else 1
         if not isinstance(values, np.ndarray):
-            raise ValueError(f"policy server action {key} must be an ndarray")
+            raise ValueError(f"policy server action {group} must be an ndarray")
         if values.dtype != np.float32 or values.shape != (1, _ACTION_HORIZON, expected_dimension):
-            raise ValueError(f"policy server action {key} has invalid dtype or shape")
+            raise ValueError(f"policy server action {group} has invalid dtype or shape")
     return flatten_groot_action_chunk(action)
 
 
