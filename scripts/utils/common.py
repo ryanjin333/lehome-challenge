@@ -75,7 +75,8 @@ def launch_app_from_args(args: argparse.Namespace) -> SimulationApp:
         "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error "
         "--/plugins/carb.tasking.plugin/threadCount=32 "
         "--/persistent/physics/numThreads=32 "
-        "--/plugins/omni.tbb.globalcontrol/maxThreadCount=32"
+        "--/plugins/omni.tbb.globalcontrol/maxThreadCount=32 "
+        "--/renderer/multiGpu/maxGpuCount=1"
     )
     app_launcher = AppLauncher(vars(args))
     simulation_app = app_launcher.app
