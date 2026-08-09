@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,12 +15,102 @@ from b1k_deploy.smoke import SmokeTemplatePublicationReceipt
 
 WORKSPACE = Path(__file__).resolve().parents[2]
 
+
+def training_release(reference: str) -> DockerImageRelease:
+    digest = reference.rsplit("@", 1)[1]
+    return DockerImageRelease("training", "docker.io/ryanjin333/behavior1k-groot-n17", "trainer-" + "a" * 40, "a" * 40, digest, reference)
+
+
+def rollout_release(reference: str) -> DockerImageRelease:
+    digest = reference.rsplit("@", 1)[1]
+    return DockerImageRelease("rollout", "docker.io/ryanjin333/behavior1k-groot-n17", "rollout-" + "a" * 40, "a" * 40, digest, reference)
+
+
+def release_receipts() -> dict[str, DockerImageRelease]:
+    return {
+        "training_release": training_release("docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64),
+        "rollout_release": rollout_release("docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64),
+    }
+
+
+def test_unified_repository_requires_explicit_role_receipts(tmp_path: Path) -> None:
+    runner = VastRunner()
+    client = _client(tmp_path, runner)
+    identity = tmp_path / "id"
+    identity.write_text("private", encoding="utf-8")
+    identity.chmod(0o600)
+
+    with pytest.raises(ProductionSmokeError, match="release receipt"):
+        SshSmokeRemote(
+            vast=client,
+            identity_file=identity,
+            known_hosts=tmp_path / "campaign" / "known_hosts",
+            training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+            rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+            hub_verifier=object(),
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"repository": "docker.io/ryanjin333/not-the-b1k-repository"},
+        {"digest": "sha256:" + "c" * 64},
+        {"tag": "trainer-" + "b" * 40},
+        {"source_commit": "b" * 40},
+    ),
+)
+def test_unified_repository_rejects_partial_training_release_identity(tmp_path: Path, changes: dict[str, str]) -> None:
+    runner = VastRunner()
+    client = _client(tmp_path, runner)
+    identity = tmp_path / "id"
+    identity.write_text("private", encoding="utf-8")
+    identity.chmod(0o600)
+    receipts = release_receipts()
+    receipts["training_release"] = replace(receipts["training_release"], **changes)
+
+    with pytest.raises(ProductionSmokeError, match="release receipt"):
+        SshSmokeRemote(
+            vast=client,
+            identity_file=identity,
+            known_hosts=tmp_path / "campaign" / "known_hosts",
+            training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+            rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+            **receipts,
+            hub_verifier=object(),
+        )
+
+
+def test_unified_repository_rejects_cross_source_role_pair(tmp_path: Path) -> None:
+    runner = VastRunner()
+    client = _client(tmp_path, runner)
+    identity = tmp_path / "id"
+    identity.write_text("private", encoding="utf-8")
+    identity.chmod(0o600)
+    receipts = release_receipts()
+    receipts["rollout_release"] = replace(
+        receipts["rollout_release"],
+        tag="rollout-" + "b" * 40,
+        source_commit="b" * 40,
+    )
+
+    with pytest.raises(ProductionSmokeError, match="source commit"):
+        SshSmokeRemote(
+            vast=client,
+            identity_file=identity,
+            known_hosts=tmp_path / "campaign" / "known_hosts",
+            training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+            rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+            **receipts,
+            hub_verifier=object(),
+        )
+
 class VastRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[str, ...], float]] = []
         self.instances: list[dict[str, object]] = []
         self.template = load_canonical_template("training", source_root=WORKSPACE)
-        self.template["image"] = "docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64
+        self.template["image"] = "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64
         self.template["env"] = self.template["env"].replace("CONTAINER_DIGEST=sha256:" + "0" * 64, "CONTAINER_DIGEST=sha256:" + "a" * 64)
 
     def run(self, arguments, *, stdin, env, timeout):
@@ -71,7 +162,7 @@ def test_selects_the_cheapest_verified_compatible_one_gpu_offer_and_binds_provid
 def test_rollout_create_uses_environment_smoke_mode_without_an_incomplete_runtime_argument(tmp_path: Path) -> None:
     runner = VastRunner(); client = _client(tmp_path, runner)
     runner.template = load_canonical_template("rollout", source_root=WORKSPACE)
-    runner.template["image"] = "docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:" + "b" * 64
+    runner.template["image"] = "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64
     runner.template["env"] = runner.template["env"].replace("CONTAINER_DIGEST=sha256:" + "0" * 64, "CONTAINER_DIGEST=sha256:" + "b" * 64)
     client.select_offer("rollout-smoke")
     assert "gpu_ram>=24" in runner.calls[0][0][3]
@@ -112,8 +203,9 @@ def test_ssh_requires_private_identity_and_uses_strict_campaign_known_hosts(tmp_
         def bootstrap_probe(self, *args, **kwargs): raise AssertionError("not a runtime contract")
     remote = SshSmokeRemote(
         vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
-        training_image="docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64,
-        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:" + "b" * 64,
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(),
         hub_verifier=Hub(), runner=ssh_run,
     )
     remote._endpoints["222"] = __import__("b1k_deploy.production_smoke", fromlist=["VastInstanceEndpoint"]).VastInstanceEndpoint("222", "203.0.113.9", 2222)
@@ -126,12 +218,12 @@ def test_ssh_requires_private_identity_and_uses_strict_campaign_known_hosts(tmp_
 
     identity.chmod(0o644)
     with pytest.raises(ProductionSmokeError, match="private"):
-        SshSmokeRemote(vast=client, identity_file=identity, known_hosts=tmp_path / "bad", training_image="docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64, rollout_image="docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:" + "b" * 64, hub_verifier=Hub(), runner=ssh_run)
+        SshSmokeRemote(vast=client, identity_file=identity, known_hosts=tmp_path / "bad", training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64, rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64, **release_receipts(), hub_verifier=Hub(), runner=ssh_run)
 
 
 def test_image_local_commands_do_not_assume_a_nested_docker_daemon_or_fabricate_simulator_evidence() -> None:
-    training = _training_command("docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64, "b1k-bootstrap-" + "a" * 32 + "-smoke-model")
-    rollout = _rollout_command("docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:" + "b" * 64, "b1k-bootstrap-" + "b" * 32 + "-success-fixture", "b1k-bootstrap-" + "b" * 32 + "-failure-fixture")
+    training = _training_command("docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64, "b1k-bootstrap-" + "a" * 32 + "-smoke-model")
+    rollout = _rollout_command("docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64, "b1k-bootstrap-" + "b" * 32 + "-success-fixture", "b1k-bootstrap-" + "b" * 32 + "-failure-fixture")
 
     assert training[0] == "/opt/runtime/bin/python"
     assert "docker" not in training
@@ -158,8 +250,9 @@ def test_runtime_transport_uses_only_role_specific_sanitized_environment(
 
     remote = SshSmokeRemote(
         vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
-        training_image="docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64,
-        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:" + "b" * 64,
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(),
         hub_verifier=Hub(), runner=lambda *_args, **_kwargs: None,
     )
     captured: list[tuple[str, ...]] = []
@@ -197,8 +290,9 @@ def test_lost_training_runtime_evidence_reconciles_its_exact_image_probe(
 
     remote = SshSmokeRemote(
         vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
-        training_image="docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64,
-        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:" + "b" * 64,
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(),
         hub_verifier=Hub(), runner=lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(remote, "_runtime_json", lambda *_args: (_ for _ in ()).throw(ProductionSmokeError("runtime evidence lost")))
@@ -224,8 +318,9 @@ def test_lost_rollout_runtime_evidence_reconciles_both_probes_and_preserves_prim
 
     remote = SshSmokeRemote(
         vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
-        training_image="docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64,
-        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:" + "b" * 64,
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(),
         hub_verifier=Hub(), runner=lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(remote, "_runtime_json", lambda *_args: (_ for _ in ()).throw(ProductionSmokeError("runtime evidence lost")))
@@ -255,8 +350,9 @@ def test_training_missing_post_execution_probe_evidence_reconciles_and_preserves
 
     remote = SshSmokeRemote(
         vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
-        training_image="docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64,
-        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:" + "b" * 64,
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(),
         hub_verifier=Hub(), runner=lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(remote, "_runtime_json", lambda *_args: {
@@ -285,8 +381,9 @@ def test_rollout_missing_post_execution_probe_evidence_reconciles_both_exact_key
 
     remote = SshSmokeRemote(
         vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
-        training_image="docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64,
-        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:" + "b" * 64,
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(),
         hub_verifier=Hub(), runner=lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(remote, "_runtime_json", lambda *_args: {
@@ -309,8 +406,8 @@ def test_ephemeral_template_creation_retries_exact_name_readback_after_an_empty_
 ) -> None:
     runner = VastRunner(); client = _client(tmp_path, runner)
     production_payload = dict(runner.template)
-    production = SmokeTemplatePublicationReceipt("123", DockerImageRelease("docker.io/ryanjin333/behavior1k-groot-n17-trainer", "sha256:" + "a" * 64, runner.template["image"]), canonical_payload_hash(production_payload))
-    name = "behavior1k-groot-n17-trainer-smoke-" + "c" * 32
+    production = SmokeTemplatePublicationReceipt("123", training_release(runner.template["image"]), canonical_payload_hash(production_payload))
+    name = "b1k-training-smoke-" + "c" * 32
     rows = [[], [{"id": 456, "name": name}]]
     created_payload: dict[str, object] = {}
 
@@ -355,8 +452,8 @@ def test_ephemeral_template_create_id_with_failed_readback_is_destroyed_and_prov
 ) -> None:
     runner = VastRunner(); client = _client(tmp_path, runner)
     production_payload = dict(runner.template)
-    production = SmokeTemplatePublicationReceipt("123", DockerImageRelease("docker.io/ryanjin333/behavior1k-groot-n17-trainer", "sha256:" + "a" * 64, runner.template["image"]), canonical_payload_hash(production_payload))
-    name = "behavior1k-groot-n17-trainer-smoke-" + "d" * 32
+    production = SmokeTemplatePublicationReceipt("123", training_release(runner.template["image"]), canonical_payload_hash(production_payload))
+    name = "b1k-training-smoke-" + "d" * 32
     commands: list[tuple[str, ...]] = []
     queries: list[str] = []
 
@@ -386,8 +483,8 @@ def test_ephemeral_template_create_error_reconciles_exact_name_and_preserves_pri
 ) -> None:
     runner = VastRunner(); client = _client(tmp_path, runner)
     production_payload = dict(runner.template)
-    production = SmokeTemplatePublicationReceipt("123", DockerImageRelease("docker.io/ryanjin333/behavior1k-groot-n17-trainer", "sha256:" + "a" * 64, runner.template["image"]), canonical_payload_hash(production_payload))
-    name = "behavior1k-groot-n17-trainer-smoke-" + "e" * 32
+    production = SmokeTemplatePublicationReceipt("123", training_release(runner.template["image"]), canonical_payload_hash(production_payload))
+    name = "b1k-training-smoke-" + "e" * 32
     commands: list[tuple[str, ...]] = []
     queries: list[str] = []
 
@@ -418,8 +515,8 @@ def test_ephemeral_template_create_id_is_cleaned_when_name_reconciliation_fails(
 ) -> None:
     runner = VastRunner(); client = _client(tmp_path, runner)
     production_payload = dict(runner.template)
-    production = SmokeTemplatePublicationReceipt("123", DockerImageRelease("docker.io/ryanjin333/behavior1k-groot-n17-trainer", "sha256:" + "a" * 64, runner.template["image"]), canonical_payload_hash(production_payload))
-    name = "behavior1k-groot-n17-trainer-smoke-" + "f" * 32
+    production = SmokeTemplatePublicationReceipt("123", training_release(runner.template["image"]), canonical_payload_hash(production_payload))
+    name = "b1k-training-smoke-" + "f" * 32
     commands: list[tuple[str, ...]] = []
     name_reads = 0
 
@@ -463,8 +560,9 @@ def test_rollout_contract_reconciles_both_exact_fixtures_when_the_first_verifica
 
     remote = SshSmokeRemote(
         vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
-        training_image="docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64,
-        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:" + "b" * 64,
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(),
         hub_verifier=Hub(), runner=lambda *_args, **_kwargs: None,
     )
     payload = {

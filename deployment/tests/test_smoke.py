@@ -105,9 +105,12 @@ def offer(rate="0.40"):
 
 
 def image(purpose="training-smoke"):
-    repository = "docker.io/ryanjin333/behavior1k-groot-n17-trainer" if purpose == "training-smoke" else "docker.io/ryanjin333/behavior1k-groot-n17-rollout"
+    repository = "docker.io/ryanjin333/behavior1k-groot-n17"
     digest = "sha256:" + ("a" if purpose == "training-smoke" else "b") * 64
-    return DockerImageRelease(repository, digest, f"{repository}@{digest}")
+    role = "training" if purpose == "training-smoke" else "rollout"
+    source_commit = "a" * 40
+    tag = f"trainer-{source_commit}" if role == "training" else f"rollout-{source_commit}"
+    return DockerImageRelease(role, repository, tag, source_commit, digest, f"{repository}@{digest}")
 
 
 def destinations():
@@ -291,6 +294,29 @@ def test_wrong_image_reference_or_forged_destination_readiness_is_rejected_befor
     forged = SmokeReadinessReceipt(candidate.template.image_release, ReleaseDestinations(HubRepository("not-the-private-model", "model"), CheckpointBucket(), HubRepository("ryanjin333/behavior1k-groot-n17-rollouts", "dataset")), "preflight-release-ready")
     with pytest.raises(SmokeError, match="destination"):
         smoke.run(replace(plan(), destination_readiness=forged))
+    assert vast.created == []
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"tag": "trainer-" + "b" * 40},
+        {"source_commit": "b" * 40},
+    ),
+)
+def test_noncanonical_tag_or_source_receipt_is_rejected_before_rent(tmp_path, changes):
+    candidate = plan()
+    forged_release = replace(candidate.template.image_release, **changes)
+    forged = replace(
+        candidate,
+        template=replace(candidate.template, image_release=forged_release),
+        destination_readiness=replace(candidate.destination_readiness, image_release=forged_release),
+    )
+    smoke, _ledger, vast = controller(tmp_path)
+
+    with pytest.raises(SmokeError, match="image release"):
+        smoke.run(forged)
+
     assert vast.created == []
 
 

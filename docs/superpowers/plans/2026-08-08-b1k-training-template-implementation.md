@@ -99,7 +99,7 @@ HF_CHECKPOINT_BUCKET = "ryanjin333/behavior1k-groot-n17-checkpoints"
 - Modify: `.github/workflows/groot-trainer-image.yml`
 - Create: `trainer/vast-template.example.json`
 
-- [ ] Add failing tests requiring `docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:<64hex>`, a private template, `AUTO_DESTROY=0`, one-to-four GPU portability, at least 2 TB disk, no credential values, and the B1K-only Hub targets.
+- [ ] Add failing tests requiring `docker.io/ryanjin333/behavior1k-groot-n17@sha256:<64hex>` with the training role label, a private template, `AUTO_DESTROY=0`, one-to-four GPU portability, at least 2 TB disk, no credential values, and the B1K-only Hub targets.
 - [ ] Add workflow assertions for Docker Hub login via `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`, multi-stage build, immutable digest output, and no GHCR publication.
 - [ ] Run `uv run pytest trainer/tests/b1k/test_template.py -q` and confirm the existing GHCR/one-to-two-GPU contract fails.
 - [ ] Update the template renderer and image verifier to accept only the canonical Docker Hub repository plus digest and to keep registry authentication outside template JSON.

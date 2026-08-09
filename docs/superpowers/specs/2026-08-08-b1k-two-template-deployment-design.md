@@ -46,8 +46,8 @@ The B1K resources are new and campaign-specific:
 
 | Purpose | Resource |
 | --- | --- |
-| Training OCI | `docker.io/ryanjin333/behavior1k-groot-n17-trainer` |
-| Rollout OCI | `docker.io/ryanjin333/behavior1k-groot-n17-rollout` |
+| Training OCI | `docker.io/ryanjin333/behavior1k-groot-n17:trainer-<source-commit>` |
+| Rollout OCI | `docker.io/ryanjin333/behavior1k-groot-n17:rollout-<source-commit>` |
 | Final policies | `ryanjin333/behavior1k-groot-n17-models` (private model repo) |
 | Rolling checkpoints | `ryanjin333/behavior1k-groot-n17-checkpoints` (private bucket) |
 | Rollout episodes | `ryanjin333/behavior1k-groot-n17-rollouts` (private dataset repo) |
@@ -57,7 +57,8 @@ from B1K configuration defaults and tests. Runtime configuration may override a
 repository only when the override is validated as B1K-specific; a LeHome prefix
 is rejected fail-closed.
 
-Docker Hub repositories are private. Vast receives registry pull credentials
+The shared Docker Hub repository is private; role-prefixed immutable tags and
+independent OCI labels keep training and rollout identities distinct. Vast receives registry pull credentials
 through its account-level secret mechanism; credentials are never included in
 the image, template payload, command line, logs, or repository.
 
@@ -242,8 +243,8 @@ success/failure release readback, secret scanning, template rendering, cost
 accounting, and exact-ID cleanup.
 
 OCI acceptance requires both linux/amd64 images to build, pass image-level
-verification, publish to the two private Docker Hub repositories, and resolve
-to recorded immutable digests. Vast acceptance requires both private templates
+verification, publish under role-prefixed immutable tags in the shared private
+Docker Hub repository, and resolve to recorded immutable digests. Vast acceptance requires both private templates
 to read back exactly with those digests and no secret material.
 
 Runtime acceptance requires successful paid training and rollout smoke receipts

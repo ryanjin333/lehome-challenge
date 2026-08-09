@@ -171,12 +171,22 @@ def _smoke_campaign(args: argparse.Namespace) -> int:
         raise PublicationError("--execute requires B1K_CHECKPOINT_BUCKET_HELPER for the exact private bucket pre-rent probe")
     hub.bootstrap_checkpoint_bucket_probe(CheckpointBucketHelperClient(helper, str(_required_private_file(os.environ, "B1K_HF_TOKEN_FILE"))), destinations.checkpoint_bucket)
     vast = VastCliSmokeClient(vastai_executable=settings.vastai_executable, api_key_file=settings.vast_api_key_file)
-    remote = SshSmokeRemote(vast=vast, identity_file=identity, known_hosts=args.known_hosts.absolute(), training_image=args.training_image, rollout_image=args.rollout_image, hub_verifier=hub)
+    releases = {item.purpose: item for item in publication.images}
+    remote = SshSmokeRemote(
+        vast=vast,
+        identity_file=identity,
+        known_hosts=args.known_hosts.absolute(),
+        training_image=args.training_image,
+        rollout_image=args.rollout_image,
+        training_release=releases["training"],
+        rollout_release=releases["rollout"],
+        hub_verifier=hub,
+    )
     controller = SmokeController(CappedVastController(RentalLedger(args.ledger), VastAdapter(vast)), remote)
     timeouts = SmokeTimeouts(ssh_timeout_seconds=900, runtime_timeout_seconds=1800, contract_timeout_seconds=1800, disappearance_timeout_seconds=300)
     result: dict[str, object] = {"dry_run": False, "runs": [], "ephemeral_templates": {}}
     for role, purpose in (("training", "training-smoke"), ("rollout", "rollout-smoke")):
-        image = _image_release(bindings[role]["image"])
+        image = releases[role]
         production_template = SmokeTemplatePublicationReceipt(bindings[role]["template_id"], image, bindings[role]["payload_hash"])
         name = vast.new_ephemeral_smoke_template_name(role)
         result["ephemeral_templates"][role] = {"name": name, "status": "intent-recorded"}
@@ -225,27 +235,19 @@ def _smoke_campaign(args: argparse.Namespace) -> int:
 
 def _validate_smoke_bindings(bindings: Mapping[str, Mapping[str, str]]) -> None:
     for role, row in bindings.items():
-        expected = "trainer" if role == "training" else "rollout"
-        if not re.fullmatch(rf"docker\.io/ryanjin333/behavior1k-groot-n17-{expected}@sha256:[0-9a-f]{{64}}", row["image"]):
+        if not re.fullmatch(r"docker\.io/ryanjin333/behavior1k-groot-n17@sha256:[0-9a-f]{64}", row["image"]):
             raise PublicationError("smoke image must be an exact published digest")
         if not re.fullmatch(r"[1-9][0-9]*", row["template_id"]) or not re.fullmatch(r"[0-9a-f]{64}", row["payload_hash"]):
             raise PublicationError("smoke must use exact publication template IDs and payload hashes")
 
 
 def _verify_smoke_bindings_against_publication(bindings: Mapping[str, Mapping[str, str]], publication: object) -> None:
-    images = {"training": "docker.io/ryanjin333/behavior1k-groot-n17-trainer", "rollout": "docker.io/ryanjin333/behavior1k-groot-n17-rollout"}
-    for role, repository in images.items():
-        image = next((item for item in publication.images if item.repository == repository), None)
+    for role in ("training", "rollout"):
+        image = next((item for item in publication.images if item.purpose == role), None)
         template = next((item for item in publication.templates if item.purpose == role), None)
         bound = bindings[role]
         if image is None or template is None or template.template_id is None or image.reference != bound["image"] or template.template_id != bound["template_id"] or template.payload_hash != bound["payload_hash"] or template.image_reference != image.reference:
             raise PublicationError("raw smoke binding does not exactly match the complete publication receipt")
-
-
-def _image_release(reference: str):
-    from .dockerhub import DockerImageRelease
-    repository, digest = reference.split("@", 1)
-    return DockerImageRelease(repository, digest, reference)
 
 
 def _smoke_receipt(receipt: object) -> dict[str, object]:

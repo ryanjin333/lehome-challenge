@@ -11,8 +11,8 @@ from lehome_train.b1k.template import render_vast_template
 from lehome_train.b1k.training import approved_launch_plans
 
 
-_IMAGE = "docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64
-_FIXTURE_IMAGE = "docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "0" * 64
+_IMAGE = "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64
+_FIXTURE_IMAGE = "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "0" * 64
 _CYCLE_ID = "b1k-cycle-001"
 
 
@@ -26,7 +26,7 @@ def test_template_is_a_private_b1k_only_docker_hub_payload_for_one_to_four_gpus(
     payload = render_vast_template(image=_IMAGE, run_id="b1k-run-001", cycle_id=_CYCLE_ID)
 
     assert payload == render_vast_template(image=_IMAGE, run_id="b1k-run-001", cycle_id=_CYCLE_ID)
-    assert payload["name"] == "behavior1k-groot-n17-trainer"
+    assert payload["name"] == "b1k-training"
     assert payload["image"] == _IMAGE
     assert payload["private"] is True
     assert payload["recommended_disk_space"] >= 2048
@@ -78,8 +78,8 @@ def test_template_rejects_an_unsafe_cycle_id(cycle_id: str) -> None:
 @pytest.mark.parametrize(
     "image",
     (
-        "ghcr.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64,
-        "docker.io/ryanjin333/behavior1k-groot-n17-trainer:latest",
+        "ghcr.io/ryanjin333/b1k-training@sha256:" + "a" * 64,
+        "docker.io/ryanjin333/behavior1k-groot-n17:latest",
         "docker.io/ryanjin333/other@sha256:" + "a" * 64,
     ),
 )
@@ -107,7 +107,7 @@ def test_image_contract_has_no_registry_or_simulator_drift() -> None:
     verifier = (root / "trainer/scripts/verify-image.sh").read_text(encoding="utf-8")
     dockerfile = (root / "trainer/Dockerfile").read_text(encoding="utf-8")
 
-    assert "docker.io/ryanjin333/behavior1k-groot-n17-trainer" in workflow
+    assert "docker.io/ryanjin333/behavior1k-groot-n17" in workflow
     assert "secrets.DOCKERHUB_USERNAME" in workflow
     assert "secrets.DOCKERHUB_TOKEN" in workflow
     assert "ghcr.io" not in workflow.lower()
@@ -115,6 +115,6 @@ def test_image_contract_has_no_registry_or_simulator_drift() -> None:
     assert "target: training-runtime" in workflow
     assert "FROM nvidia/cuda" in dockerfile and " AS training-build" in dockerfile
     assert "FROM training-build AS training-runtime" in dockerfile
-    assert "docker\\.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" in verifier
+    assert "docker\\.io/ryanjin333/behavior1k-groot-n17@sha256:" in verifier
     for asset in ("/isaac-sim", "/IsaacLab", "/OmniGibson"):
         assert f"test ! -e {asset}" in verifier

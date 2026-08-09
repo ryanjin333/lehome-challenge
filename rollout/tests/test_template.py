@@ -18,7 +18,7 @@ def test_template_renders_private_headless_campaign_with_explicit_gpu_bounds() -
     template = json.loads(rendered)
 
     assert template["private"] is True
-    assert template["image"] == f"docker.io/ryanjin333/behavior1k-groot-n17-rollout@{_DIGEST}"
+    assert template["image"] == f"docker.io/ryanjin333/behavior1k-groot-n17@{_DIGEST}"
     assert template["recommended_disk_space"] >= 2048
     assert template["runtype"] == "ssh"
     assert template["ssh_direct"] is True

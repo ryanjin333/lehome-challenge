@@ -23,10 +23,8 @@ from .dockerhub import DockerHubReleaseVerifier, DockerImageRelease
 _SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _SECRET_KEY_RE = re.compile(r"(?:token|password|secret|credential|api[_-]?key|authorization)", re.IGNORECASE)
 _CREDENTIAL_VALUE_RE = re.compile(r"(?:\bhf_[A-Za-z0-9_-]{20,}\b|\b(?:dckr_pat|docker_pat)_[A-Za-z0-9_-]{16,}\b|\bBearer\s+\S+)", re.IGNORECASE)
-_REPOSITORIES = {
-    "training": "docker.io/ryanjin333/behavior1k-groot-n17-trainer",
-    "rollout": "docker.io/ryanjin333/behavior1k-groot-n17-rollout",
-}
+_REPOSITORY = "docker.io/ryanjin333/behavior1k-groot-n17"
+_PURPOSES = ("training", "rollout")
 _ZERO_DIGEST = "sha256:" + "0" * 64
 _NOFOLLOW = os.O_NOFOLLOW
 
@@ -81,6 +79,7 @@ class ImagePublicationPlan:
 
 @dataclass(frozen=True)
 class PlannedImageRelease:
+    purpose: Literal["training", "rollout"]
     repository: str
     tag: str
 
@@ -332,11 +331,11 @@ class CampaignPublisher:
         images: ImagePublicationPlan,
     ) -> None:
         for purpose, tag in (("training", images.training_tag), ("rollout", images.rollout_tag)):
-            expected = next((item for item in releases if item.repository == _REPOSITORIES[purpose]), None)
+            expected = next((item for item in releases if item.purpose == purpose and item.tag == tag), None)
             if expected is None:
                 continue
             actual = _call("private registry digest readback", self._adapters.verifier.verify_private_image, expected.repository, tag)
-            if actual != expected or not _valid_image_release(actual, expected.repository):
+            if actual != expected or not _valid_image_release(actual, purpose, images.source_commit, tag):
                 raise PublicationError("campaign receipt registry readback drifted")
 
     def _verify_persisted_template_state(
@@ -363,17 +362,17 @@ class CampaignPublisher:
 
 def publish_images(plan: ImagePublicationPlan, builder: ImageBuilder, verifier: DockerHubReleaseVerifier, *, execute: bool, existing: tuple[DockerImageRelease, ...] = (), on_verified: Callable[[tuple[DockerImageRelease, ...]], None] | None = None) -> ImagePublicationReceipt:
     validate_image_plan(plan)
-    candidates = tuple(PlannedImageRelease(repository, tag) for repository, tag in ((_REPOSITORIES["training"], plan.training_tag), (_REPOSITORIES["rollout"], plan.rollout_tag)))
+    candidates = tuple(PlannedImageRelease(purpose, _REPOSITORY, tag) for purpose, tag in (("training", plan.training_tag), ("rollout", plan.rollout_tag)))
     if not execute:
         return ImagePublicationReceipt(plan.source_commit, True, candidates)
     releases: list[DockerImageRelease] = list(existing)
     for candidate in candidates:
-        if any(item.repository == candidate.repository for item in releases):
+        if any(item.purpose == candidate.purpose and item.tag == candidate.tag for item in releases):
             continue
         try:
             _call("image build and push", builder.build_and_push, candidate.repository, candidate.tag, plan.source_commit)
             release = _call("private registry digest readback", verifier.verify_private_image, candidate.repository, candidate.tag)
-            if not _valid_image_release(release, candidate.repository):
+            if not _valid_image_release(release, candidate.purpose, plan.source_commit, candidate.tag):
                 raise PublicationError("private registry digest readback is invalid")
         except PublicationError:
             raise PublicationPartialError(tuple(releases)) from None
@@ -418,7 +417,7 @@ def canonical_payload_hash(payload: Mapping[str, Any]) -> str:
 def campaign_preplan_hash(images: ImagePublicationPlan, templates: tuple[TemplateSchemaPlan, TemplateSchemaPlan]) -> str:
     """Hash source, tags, and immutable schemas before any remote operation."""
     validate_image_plan(images)
-    if len(templates) != 2 or {template.purpose for template in templates} != set(_REPOSITORIES):
+    if len(templates) != 2 or {template.purpose for template in templates} != set(_PURPOSES):
         raise PublicationError("campaign requires exactly one training and one rollout template plan")
     schemas: list[dict[str, str]] = []
     for template in sorted(templates, key=lambda item: item.purpose):
@@ -467,7 +466,7 @@ campaign_plan_hash = campaign_preplan_hash
 
 
 def load_canonical_template(purpose: Literal["training", "rollout"], *, source_root: Path) -> dict[str, Any]:
-    if purpose not in _REPOSITORIES:
+    if purpose not in _PURPOSES:
         raise PublicationError("template purpose is invalid")
     workspace = _validate_template_source_root(source_root)
     path = workspace / ("trainer" if purpose == "training" else "rollout") / "vast-template.example.json"
@@ -519,9 +518,8 @@ def load_publication_adapters(
 def _validate_source_and_tags(plan: ImagePublicationPlan) -> None:
     if not isinstance(plan, ImagePublicationPlan) or not _SOURCE_COMMIT_RE.fullmatch(plan.source_commit):
         raise PublicationError("source commit must be one exact 40-character lowercase revision")
-    for tag in (plan.training_tag, plan.rollout_tag):
-        if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", tag):
-            raise PublicationError("image release tags are invalid")
+    if plan.training_tag != f"trainer-{plan.source_commit}" or plan.rollout_tag != f"rollout-{plan.source_commit}" or plan.training_tag == plan.rollout_tag:
+        raise PublicationError("image release tags must be distinct canonical role-prefixed source revisions")
 
 
 def validate_image_plan(plan: ImagePublicationPlan) -> None:
@@ -540,18 +538,19 @@ def _validate_template_plan(plan: TemplatePublicationPlan) -> None:
     if not isinstance(plan, TemplatePublicationPlan):
         raise PublicationError("template publication plan is invalid")
     _validate_template_schema(TemplateSchemaPlan(plan.source_commit, plan.purpose, plan.template, plan.source_root))
-    if not _valid_image_release(plan.image, _REPOSITORIES[plan.purpose]):
+    expected_tag = f"trainer-{plan.source_commit}" if plan.purpose == "training" else f"rollout-{plan.source_commit}"
+    if not _valid_image_release(plan.image, plan.purpose, plan.source_commit, expected_tag):
         raise PublicationError("template requires the purpose-specific private digest-qualified image")
 
 
 def _validate_template_schema(plan: TemplateSchemaPlan) -> None:
-    if not isinstance(plan, TemplateSchemaPlan) or plan.purpose not in _REPOSITORIES or not _SOURCE_COMMIT_RE.fullmatch(plan.source_commit):
+    if not isinstance(plan, TemplateSchemaPlan) or plan.purpose not in _PURPOSES or not _SOURCE_COMMIT_RE.fullmatch(plan.source_commit):
         raise PublicationError("template publication plan is invalid")
     if not isinstance(plan.template, Mapping):
         raise PublicationError("template payload must be an object")
     _reject_secrets(plan.template)
     template_image = plan.template.get("image")
-    if template_image not in {"${IMAGE_REFERENCE}", f"{_REPOSITORIES[plan.purpose]}@{_ZERO_DIGEST}"}:
+    if template_image not in {"${IMAGE_REFERENCE}", f"{_REPOSITORY}@{_ZERO_DIGEST}"}:
         raise PublicationError("template image must be the exact IMAGE_REFERENCE or canonical zero-digest placeholder")
     if plan.template.get("private") is not True:
         raise PublicationError("template payload must explicitly request a private template")
@@ -615,13 +614,14 @@ def _freeze_template_plans(
 ) -> tuple[TemplatePublicationPlan, TemplatePublicationPlan]:
     if len(releases) != 2:
         raise PublicationError("campaign requires both verified image readbacks before templates can be frozen")
-    by_repository = {release.repository: release for release in releases}
+    by_purpose = {release.purpose: release for release in releases}
     frozen: list[TemplatePublicationPlan] = []
     schemas_by_purpose = {schema.purpose: schema for schema in schemas}
     for purpose in ("training", "rollout"):
         schema = schemas_by_purpose[purpose]
-        release = by_repository.get(_REPOSITORIES[schema.purpose])
-        if release is None or not _valid_image_release(release, _REPOSITORIES[schema.purpose]):
+        tag = images.training_tag if purpose == "training" else images.rollout_tag
+        release = by_purpose.get(schema.purpose)
+        if release is None or not _valid_image_release(release, schema.purpose, images.source_commit, tag):
             raise PublicationError("campaign image receipt does not match template purpose")
         frozen.append(TemplatePublicationPlan(images.source_commit, schema.purpose, release, schema.template, schema.source_root))
     return frozen[0], frozen[1]
@@ -702,11 +702,11 @@ def _is_token_file_key(key: str) -> bool:
     return key.upper().endswith(("_TOKEN_FILE", "_TOKEN_PATH", "_CREDENTIAL_FILE"))
 
 
-def _valid_image_release(release: object, repository: str) -> bool:
-    if not isinstance(release, DockerImageRelease) or release.repository != repository:
+def _valid_image_release(release: object, purpose: str, source_commit: str, tag: str) -> bool:
+    if not isinstance(release, DockerImageRelease) or release.repository != _REPOSITORY or release.purpose != purpose or release.source_commit != source_commit or release.tag != tag:
         return False
     try:
-        return DockerHubReleaseVerifier.require_digest_reference(release.reference) == release.reference and release.reference == f"{release.repository}@{release.digest}"
+        return DockerHubReleaseVerifier.require_digest_reference(release.reference) == release.reference and release.reference == f"{release.repository}@{release.digest}" and DockerHubReleaseVerifier.image_identity(release.tag) == (purpose, source_commit)
     except ValueError:
         return False
 
@@ -726,14 +726,14 @@ def _validate_campaign_receipt(receipt: CampaignPublicationReceipt) -> None:
         raise PublicationError("campaign receipt preflight identity is invalid")
     if receipt.final_plan_hash is not None and (not isinstance(receipt.final_plan_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", receipt.final_plan_hash)):
         raise PublicationError("campaign receipt final identity is invalid")
-    expected_repositories = (_REPOSITORIES["training"], _REPOSITORIES["rollout"])
-    if len(receipt.images) > 2 or tuple(item.repository for item in receipt.images) != expected_repositories[: len(receipt.images)]:
+    if len(receipt.images) > 2 or tuple(item.purpose for item in receipt.images) != _PURPOSES[: len(receipt.images)]:
         raise PublicationError("campaign receipt images are not the canonical verified prefix")
-    image_by_repository: dict[str, DockerImageRelease] = {}
+    image_by_purpose: dict[str, DockerImageRelease] = {}
     for image in receipt.images:
-        if not _valid_image_release(image, image.repository):
+        expected_tag = f"trainer-{receipt.source_commit}" if image.purpose == "training" else f"rollout-{receipt.source_commit}"
+        if not _valid_image_release(image, image.purpose, receipt.source_commit, expected_tag) or image.purpose in image_by_purpose:
             raise PublicationError("campaign receipt images are invalid")
-        image_by_repository[image.repository] = image
+        image_by_purpose[image.purpose] = image
     templates_by_purpose: dict[str, TemplatePublicationReceipt] = {}
     expected_purposes = ("training", "rollout")
     if len(receipt.templates) > 2 or tuple(item.purpose for item in receipt.templates) != expected_purposes[: len(receipt.templates)]:
@@ -741,7 +741,7 @@ def _validate_campaign_receipt(receipt: CampaignPublicationReceipt) -> None:
     for template in receipt.templates:
         if (
             template.purpose in templates_by_purpose
-            or template.purpose not in _REPOSITORIES
+            or template.purpose not in _PURPOSES
             or template.source_commit != receipt.source_commit
             or template.dry_run
             or not isinstance(template.name, str)
@@ -751,7 +751,7 @@ def _validate_campaign_receipt(receipt: CampaignPublicationReceipt) -> None:
             or not re.fullmatch(r"[0-9a-f]{64}", template.payload_hash)
         ):
             raise PublicationError("campaign receipt templates are invalid")
-        image = image_by_repository.get(_REPOSITORIES[template.purpose])
+        image = image_by_purpose.get(template.purpose)
         if image is None or template.image_reference != image.reference:
             raise PublicationError("campaign receipt does not bind templates to verified images")
         templates_by_purpose[template.purpose] = template
@@ -784,7 +784,7 @@ def _validate_campaign_receipt_matches_preplan(
             raise PublicationError("partial campaign receipt cannot have a final identity")
         expected_hashes = {}
     for template in receipt.templates:
-        image = next(item for item in receipt.images if item.repository == _REPOSITORIES[template.purpose])
+        image = next(item for item in receipt.images if item.purpose == template.purpose)
         if template.image_reference != image.reference or template.payload_hash != expected_hashes[template.purpose]:
             raise PublicationError("campaign receipt template does not match the campaign identity")
 

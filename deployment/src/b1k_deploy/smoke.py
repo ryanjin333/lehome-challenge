@@ -16,11 +16,30 @@ from .vast import CappedVastController, PROTECTED_INSTANCE_IDS
 
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$")
+_SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_IMAGE_REPOSITORY = "docker.io/ryanjin333/behavior1k-groot-n17"
 _RUN_ID_RE = re.compile(r"^b1k-smoke-([0-9a-f]{32})$")
 _PAYLOAD_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _MIN_DISK_GB = 100
 _MIN_RAM_GB = 16
 _MIN_NETWORK_MBPS = 100
+
+
+def _canonical_image_release_identity(release: object, expected_purpose: str) -> bool:
+    if not isinstance(release, DockerImageRelease) or expected_purpose not in {"training", "rollout"}:
+        return False
+    prefix = "trainer" if expected_purpose == "training" else "rollout"
+    return (
+        release.purpose == expected_purpose
+        and release.repository == _IMAGE_REPOSITORY
+        and isinstance(release.source_commit, str)
+        and _SOURCE_COMMIT_RE.fullmatch(release.source_commit) is not None
+        and release.tag == f"{prefix}-{release.source_commit}"
+        and isinstance(release.digest, str)
+        and _IMAGE_DIGEST_RE.fullmatch(release.digest) is not None
+        and release.reference == f"{release.repository}@{release.digest}"
+    )
 
 
 def _runtime_operation_id(run_id: str, classification: str) -> str:
@@ -373,10 +392,8 @@ class SmokeController:
         if not isinstance(plan.template.template_id, str) or not plan.template.template_id or not isinstance(plan.template.image_release, DockerImageRelease) or not isinstance(plan.template.payload_hash, str) or not _PAYLOAD_HASH_RE.fullmatch(plan.template.payload_hash):
             raise SmokeError("smoke plan requires one typed template and image release")
         release = plan.template.image_release
-        if release.reference != f"{release.repository}@{release.digest}" or not re.fullmatch(r"sha256:[0-9a-f]{64}", release.digest):
-            raise SmokeError("smoke plan requires one canonical digest-qualified image release")
-        expected_repository = "docker.io/ryanjin333/behavior1k-groot-n17-trainer" if plan.purpose == "training-smoke" else "docker.io/ryanjin333/behavior1k-groot-n17-rollout"
-        if release.repository != expected_repository:
+        expected_purpose = "training" if plan.purpose == "training-smoke" else "rollout"
+        if not _canonical_image_release_identity(release, expected_purpose):
             raise SmokeError("smoke image release does not match the selected template purpose")
         if not isinstance(plan.offer.offer_id, str) or not plan.offer.offer_id or not isinstance(plan.offer.gpu_name, str) or not plan.offer.gpu_name:
             raise SmokeError("smoke offer selection receipt is invalid")

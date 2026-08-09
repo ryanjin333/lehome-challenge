@@ -9,6 +9,7 @@ import pytest
 
 import b1k_deploy.cli as cli
 from b1k_deploy.cli import main
+from b1k_deploy.dockerhub import DockerImageRelease
 from b1k_deploy.production_smoke import ProductionSmokeError
 from b1k_deploy.smoke import SmokeTemplatePublicationReceipt
 
@@ -16,8 +17,8 @@ from b1k_deploy.smoke import SmokeTemplatePublicationReceipt
 def test_smoke_campaign_is_dry_run_by_default_and_does_not_load_provider_settings(tmp_path: Path, capsys) -> None:
     result = main([
         "smoke-campaign",
-        "--training-image", "docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64,
-        "--rollout-image", "docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:" + "b" * 64,
+        "--training-image", "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        "--rollout-image", "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
         "--training-template-id", "123", "--rollout-template-id", "456",
         "--training-template-payload-sha256", "c" * 64, "--rollout-template-payload-sha256", "d" * 64,
         "--ledger", str(tmp_path / "ledger.jsonl"), "--receipt", str(tmp_path / "receipt.json"), "--known-hosts", str(tmp_path / "known_hosts"),
@@ -33,8 +34,8 @@ def test_smoke_campaign_is_dry_run_by_default_and_does_not_load_provider_setting
 
 def _execute_smoke_args(tmp_path: Path) -> argparse.Namespace:
     return argparse.Namespace(
-        training_image="docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64,
-        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:" + "b" * 64,
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
         training_template_id="123", rollout_template_id="456",
         training_template_payload_sha256="c" * 64, rollout_template_payload_sha256="d" * 64,
         ledger=tmp_path / "ledger.jsonl", receipt=tmp_path / "receipt.json",
@@ -58,7 +59,9 @@ def _stub_execute_dependencies(
     writes: list[dict[str, object]] = []
     monkeypatch.setenv("B1K_VAST_PRIVATE_PULL_READY", "verified")
     monkeypatch.setenv("B1K_CHECKPOINT_BUCKET_HELPER", "/tmp/b1k-helper")
-    monkeypatch.setattr(cli, "AtomicCampaignReceiptStore", lambda _path: SimpleNamespace(read=lambda: SimpleNamespace(status="complete", images=(1, 2), templates=(1, 2))))
+    training = DockerImageRelease("training", "docker.io/ryanjin333/behavior1k-groot-n17", "trainer-" + "a" * 40, "a" * 40, "sha256:" + "a" * 64, "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64)
+    rollout = DockerImageRelease("rollout", "docker.io/ryanjin333/behavior1k-groot-n17", "rollout-" + "a" * 40, "a" * 40, "sha256:" + "b" * 64, "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64)
+    monkeypatch.setattr(cli, "AtomicCampaignReceiptStore", lambda _path: SimpleNamespace(read=lambda: SimpleNamespace(status="complete", images=(training, rollout), templates=(1, 2))))
     monkeypatch.setattr(cli, "_verify_smoke_bindings_against_publication", lambda *_args: None)
     monkeypatch.setattr(cli, "_write_receipt", lambda _path, payload: writes.append(dict(payload)))
     monkeypatch.setattr(production.ConfiguredPublicationSettings, "from_environment", lambda: SimpleNamespace(vastai_executable=tmp_path / "vastai", vast_api_key_file=tmp_path / "vast-key"))

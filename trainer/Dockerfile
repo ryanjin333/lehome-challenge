@@ -10,6 +10,7 @@ ARG REPOSITORY_COMMIT
 
 LABEL org.opencontainers.image.source="https://github.com/lehome-official/lehome-challenge" \
       org.opencontainers.image.revision="${REPOSITORY_COMMIT}" \
+      io.lehome.image-role="training" \
       io.lehome.cuda-base-digest="sha256:61f6c08f2b59036cb935e56d1e31a6b64e3ae2c7ddb86d33fa0b044c7917b719" \
       io.lehome.isaac-groot-revision="${ISAAC_GROOT_REVISION}" \
       io.lehome.model-revision="2fc962b973bccdd5d8ce4f67cc63b264d6886495"

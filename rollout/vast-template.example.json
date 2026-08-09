@@ -35,9 +35,9 @@
       "eq": true
     }
   },
-  "image": "docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "image": "docker.io/ryanjin333/behavior1k-groot-n17@sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "jup_direct": false,
-  "name": "behavior1k-groot-n17-rollout",
+  "name": "b1k-rollout",
   "onstart": "",
   "private": true,
   "recommended_disk_space": 2048,

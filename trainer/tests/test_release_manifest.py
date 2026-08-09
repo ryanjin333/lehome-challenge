@@ -65,7 +65,7 @@ def _accepted_payload() -> dict[str, object]:
         "repository_commit": REPOSITORY_COMMIT,
         "image": {
             "repository": BEHAVIOR_1K_TRAINER_IMAGE_REPOSITORY,
-            "tag": REPOSITORY_COMMIT,
+            "tag": f"trainer-{REPOSITORY_COMMIT}",
             "digest": OCI_DIGEST,
         },
         "gpu_acceptance": {
@@ -331,7 +331,7 @@ def test_training_readmes_name_the_current_image_verifier_and_gpu_bounds() -> No
     assert gpu_gate.group("command") == (
         "REPOSITORY_COMMIT=<40-lowercase-source-commit> \\\n"
         "  CUDA_VISIBLE_DEVICES=0 trainer/scripts/verify-image.sh --gpu \\\n"
-        "  docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:<64-lowercase-hex>"
+        "  docker.io/ryanjin333/behavior1k-groot-n17@sha256:<64-lowercase-hex>"
     )
     assert "REPOSITORY_COMMIT=<40-character-source-commit>" in trainer_readme
     assert "ace36d935b376fbf25cd56371e23877b95407c40" in trainer_readme
@@ -400,7 +400,7 @@ def test_workflow_never_embeds_a_pat_and_gpu_gate_is_explicit() -> None:
         encoding="utf-8"
     )
 
-    assert "IMAGE_REPOSITORY: docker.io/ryanjin333/behavior1k-groot-n17-trainer" in workflow
+    assert "IMAGE_REPOSITORY: docker.io/ryanjin333/behavior1k-groot-n17" in workflow
     assert "secrets.DOCKERHUB_USERNAME" in workflow
     assert "secrets.DOCKERHUB_TOKEN" in workflow
     assert "packages: write" not in workflow
@@ -410,7 +410,8 @@ def test_workflow_never_embeds_a_pat_and_gpu_gate_is_explicit() -> None:
     assert "self-hosted" in workflow
     assert "--gpu" in workflow
     assert "docker/metadata-action" in workflow
-    assert "type=raw,value=${{ github.sha }}" in workflow
+    assert "type=raw,value=trainer-${{ github.sha }}" in workflow
+    assert "type=raw,value=rollout-${{ github.sha }}" in workflow
     assert "verify-image.sh \"${IMAGE_REPOSITORY}@${OCI_DIGEST}\"" in workflow
     assert "digest: ${{ steps.build.outputs.digest }}" in workflow
     assert "scanner_status=$?" in workflow

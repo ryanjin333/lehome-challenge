@@ -33,13 +33,14 @@ from .smoke import (
     SmokeOfferSelectionReceipt,
     TrainingRuntimeEvidence,
     SmokeTemplatePublicationReceipt,
+    _canonical_image_release_identity,
 )
 from .vast import PROTECTED_INSTANCE_IDS, ProviderNotCreated
 
 
 _ID_RE = re.compile(r"^[1-9][0-9]*$")
 _LABEL_RE = re.compile(r"^b1k-smoke-[0-9a-f]{32}$")
-_DIGEST_IMAGE_RE = re.compile(r"^docker\.io/ryanjin333/behavior1k-groot-n17-(?:trainer|rollout)@sha256:[0-9a-f]{64}$")
+_DIGEST_IMAGE_RE = re.compile(r"^docker\.io/ryanjin333/behavior1k-groot-n17@sha256:[0-9a-f]{64}$")
 _HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\d{1,3}(?:\.\d{1,3}){3})$")
 _MAX_TOOL_TIMEOUT = 55
 _TEMPLATE_CREATE_RESULT_RE = re.compile(r"^New Template: ([1-9][0-9]*)$")
@@ -187,7 +188,7 @@ class VastCliSmokeClient:
         if purpose not in {"training", "rollout"}:
             raise ProductionSmokeError("ephemeral smoke template purpose is invalid")
         stem = "trainer" if purpose == "training" else "rollout"
-        return f"behavior1k-groot-n17-{stem}-smoke-{uuid.uuid4().hex}"
+        return f"b1k-{'training' if purpose == 'training' else 'rollout'}-smoke-{uuid.uuid4().hex}"
 
     def create_ephemeral_smoke_template(self, purpose: str, production: SmokeTemplatePublicationReceipt, *, name: str) -> SmokeTemplatePublicationReceipt:
         """Create one separately named low-resource smoke template from readback.
@@ -196,7 +197,7 @@ class VastCliSmokeClient:
         relaxation is confined to this ephemeral template and never mutates
         the production payload or its receipt.
         """
-        if purpose not in {"training", "rollout"} or production.template_id is None or not re.fullmatch(rf"behavior1k-groot-n17-{'trainer' if purpose == 'training' else 'rollout'}-smoke-[0-9a-f]{{32}}", name):
+        if purpose not in {"training", "rollout"} or production.template_id is None or not re.fullmatch(rf"b1k-{'training' if purpose == 'training' else 'rollout'}-smoke-[0-9a-f]{{32}}", name):
             raise ProductionSmokeError("production template receipt is invalid")
         self.attest_template_binding(template_id=production.template_id, image_reference=production.image_release.reference, payload_hash=production.payload_hash)
         payload = dict(self._template_readback(production.template_id))
@@ -261,7 +262,7 @@ class VastCliSmokeClient:
         template_id = _exact_id(template.template_id)
         row = self._template_readback(template_id)
         name = row.get("name")
-        if not isinstance(name, str) or not re.fullmatch(r"behavior1k-groot-n17-(?:trainer|rollout)-smoke-[0-9a-f]{32}", name):
+        if not isinstance(name, str) or not re.fullmatch(r"b1k-(?:training|rollout)-smoke-[0-9a-f]{32}", name):
             raise ProductionSmokeError("only an exact ephemeral smoke template may be deleted")
         if canonical_payload_hash(row) != template.payload_hash or row.get("image") != template.image_release.reference:
             raise ProductionSmokeError("ephemeral smoke template receipt drifted before deletion")
@@ -414,6 +415,8 @@ class SshSmokeRemote:
         known_hosts: Path,
         training_image: str,
         rollout_image: str,
+        training_release: DockerImageRelease | None = None,
+        rollout_release: DockerImageRelease | None = None,
         hub_verifier: HuggingFaceReleaseVerifier,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         clock: Callable[[], float] = time.monotonic,
@@ -422,11 +425,18 @@ class SshSmokeRemote:
         self._vast = vast
         self._identity = _private_identity(identity_file)
         self._known_hosts = _campaign_known_hosts(known_hosts)
-        if not _DIGEST_IMAGE_RE.fullmatch(training_image) or "trainer@" not in training_image:
+        if not _DIGEST_IMAGE_RE.fullmatch(training_image):
             raise ProductionSmokeError("training smoke image must be one canonical trainer digest")
-        if not _DIGEST_IMAGE_RE.fullmatch(rollout_image) or "rollout@" not in rollout_image:
+        if not _DIGEST_IMAGE_RE.fullmatch(rollout_image):
             raise ProductionSmokeError("rollout smoke image must be one canonical rollout digest")
+        if not _canonical_image_release_identity(training_release, "training") or training_release.reference != training_image:
+            raise ProductionSmokeError("training smoke release receipt is invalid")
+        if not _canonical_image_release_identity(rollout_release, "rollout") or rollout_release.reference != rollout_image:
+            raise ProductionSmokeError("rollout smoke release receipt is invalid")
+        if training_release.source_commit != rollout_release.source_commit:
+            raise ProductionSmokeError("training and rollout smoke releases must share one source commit")
         self._training_image, self._rollout_image = training_image, rollout_image
+        self._training_release, self._rollout_release = training_release, rollout_release
         self._hub = hub_verifier
         self._runner, self._clock, self._sleep = runner, clock, sleep
         self._endpoints: dict[str, VastInstanceEndpoint] = {}
@@ -455,7 +465,7 @@ class SshSmokeRemote:
             _require_fields(payload, {"runtime_uid", "token_file_uid", "token_file_mode", "gpu_count", "optimizer_steps", "lifecycle_preflight", "container_digest", "checkpoint_bucket_probe"})
             artifact = RuntimeArtifactReceipt.from_hub_probe(run_id, "smoke-model", self._remote_probe("model", "smoke-model", run_id, payload))
             return TrainingRuntimeEvidence(
-                _image_release(self._training_image),
+                self._training_release,
                 runtime_uid=_positive_int(payload["runtime_uid"], "runtime uid"),
                 token_file_uid=_positive_int(payload["token_file_uid"], "token uid"),
                 token_file_mode=_mode(payload["token_file_mode"]),
@@ -493,7 +503,7 @@ class SshSmokeRemote:
                 raise primary_failure
             fixtures = tuple(fixture_receipts)
             return RolloutRuntimeEvidence(
-                _image_release(self._rollout_image), _positive_int(payload["gpu_count"], "gpu count"),
+                self._rollout_release, _positive_int(payload["gpu_count"], "gpu count"),
                 _exact_string(payload["eula_environment"], "OMNI_KIT_ACCEPT_EULA=YES"),
                 _exact_string(payload["warp_runtime"], "bundled-compatible"),
                 _positive_int(payload["headless_loads"], "headless loads"), _positive_int(payload["resets"], "resets"), "ok",
@@ -662,12 +672,6 @@ def _training_command(image: str, prefix: str) -> tuple[str, ...]:
 def _rollout_command(image: str, success_prefix: str, failure_prefix: str) -> tuple[str, ...]:
     del image
     return ("/opt/conda/envs/behavior/bin/python", "-m", "b1k_rollout.cli", "smoke-runtime", "--success-prefix", success_prefix, "--failure-prefix", failure_prefix)
-
-
-def _image_release(reference: str):
-    from .dockerhub import DockerImageRelease
-    repository, digest = reference.split("@", 1)
-    return DockerImageRelease(repository, digest, reference)
 
 
 def _exact_id(value: object) -> str:

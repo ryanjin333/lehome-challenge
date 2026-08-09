@@ -59,7 +59,7 @@ def test_rollout_entrypoint_fails_closed_before_campaign_execution() -> None:
 def test_image_verifier_accepts_only_immutable_rollout_digests() -> None:
     verifier = _read("scripts/verify-image.sh")
 
-    assert "behavior1k-groot-n17-rollout@sha256" in verifier
+    assert "behavior1k-groot-n17@sha256" in verifier
     assert "docker image inspect" in verifier
     assert "io.lehome.behavior-parent-digest" in verifier
     assert "b1k_rollout.cli healthcheck" in verifier

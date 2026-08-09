@@ -50,7 +50,7 @@ def render_vast_template(*, image: str, run_id: str, cycle_id: str, schema_fixtu
         f"-e EXPERIMENT_NAME={run_id}",
     ))
     return {
-        "name": "behavior1k-groot-n17-trainer",
+        "name": "b1k-training",
         "image": image,
         "env": "--user root --ipc=host --shm-size=64g --ulimit memlock=-1 --ulimit stack=67108864 " + docker_env,
         "onstart": "bash /opt/b1k-launchkit/onstart.sh",

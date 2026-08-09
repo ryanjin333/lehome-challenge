@@ -12,6 +12,7 @@ ARG REPOSITORY_COMMIT
 
 LABEL org.opencontainers.image.source="https://github.com/ryanjin333/lehome-challenge" \
       org.opencontainers.image.revision="${REPOSITORY_COMMIT}" \
+      io.lehome.image-role="rollout" \
       io.lehome.behavior-revision="${BEHAVIOR_REVISION}" \
       io.lehome.isaac-groot-revision="${GROOT_REVISION}" \
       io.lehome.behavior-parent-digest="${BEHAVIOR_PARENT_DIGEST}"

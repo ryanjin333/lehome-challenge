@@ -18,8 +18,12 @@ from b1k_deploy.dockerhub import (
 )
 
 
-TRAINER_REPOSITORY = "docker.io/ryanjin333/behavior1k-groot-n17-trainer"
-ROLLOUT_REPOSITORY = "docker.io/ryanjin333/behavior1k-groot-n17-rollout"
+REPOSITORY = "docker.io/ryanjin333/behavior1k-groot-n17"
+TRAINER_REPOSITORY = REPOSITORY
+ROLLOUT_REPOSITORY = REPOSITORY
+SOURCE_COMMIT = "a" * 40
+TRAINER_TAG = f"trainer-{SOURCE_COMMIT}"
+ROLLOUT_TAG = f"rollout-{SOURCE_COMMIT}"
 _DOCKER_TEST_TOKEN = "dckr_pat_" + "abcdefghijklmnopqrstuvwxyz0123456789"
 _HF_TEST_TOKEN = "hf_" + "abcdefghijklmnopqrstuvwxyz0123456789"
 
@@ -30,6 +34,7 @@ class FakeDockerRegistry:
         self.digest = digest or "sha256:" + "a" * 64
         self.calls: list[tuple[object, ...]] = []
         self.fail_pull = False
+        self.tag = TRAINER_TAG
 
     def repository_info(self, repository: str, token: str):
         self.calls.append(("repository_info", repository, token))
@@ -37,13 +42,15 @@ class FakeDockerRegistry:
 
     def registry_manifest(self, repository: str, tag: str, token: str):
         self.calls.append(("registry_manifest", repository, tag, token))
+        self.tag = tag
         return {"digest": self.digest}
 
     def authenticated_pull(self, reference: str, token: str):
         self.calls.append(("authenticated_pull", reference, token))
         if self.fail_pull:
-            raise RuntimeError(f"docker login failed with token {token}")
-        return {"digest": self.digest}
+            raise RuntimeError("docker login failed")
+        role = "training" if self.tag.startswith("trainer-") else "rollout"
+        return {"digest": self.digest, "labels": {"io.lehome.image-role": role, "org.opencontainers.image.revision": self.tag.split("-", 1)[1]}}
 
 
 def credential_store(name: str) -> str:
@@ -55,7 +62,7 @@ def test_private_registry_digest_and_authenticated_pull_are_required():
     registry = FakeDockerRegistry()
     verifier = DockerHubReleaseVerifier(registry, TokenSource.from_credential_store("dockerhub", credential_store))
 
-    release = verifier.verify_private_image(TRAINER_REPOSITORY, "release-123")
+    release = verifier.verify_private_image(TRAINER_REPOSITORY, TRAINER_TAG)
 
     assert release.reference == TRAINER_REPOSITORY + "@sha256:" + "a" * 64
     assert release.digest == "sha256:" + "a" * 64
@@ -65,20 +72,20 @@ def test_private_registry_digest_and_authenticated_pull_are_required():
         _DOCKER_TEST_TOKEN,
     )
     assert [call[1] for call in registry.calls[:2]] == [
-        "ryanjin333/behavior1k-groot-n17-trainer",
-        "ryanjin333/behavior1k-groot-n17-trainer",
+        "ryanjin333/behavior1k-groot-n17",
+        "ryanjin333/behavior1k-groot-n17",
     ]
 
 
 @pytest.mark.parametrize(
     "repository, tag",
     [
-        (TRAINER_REPOSITORY + ":latest", "release-123"),
-        ("https://user:password@docker.io/ryanjin333/behavior1k-groot-n17-trainer", "release-123"),
+        (TRAINER_REPOSITORY + ":latest", TRAINER_TAG),
+        ("https://user:password@docker.io/ryanjin333/behavior1k-groot-n17", TRAINER_TAG),
         (TRAINER_REPOSITORY, ""),
         (TRAINER_REPOSITORY, "latest@sha256:" + "a" * 64),
-        ("ryanjin333/behavior1k-groot-n17-trainer", "release-123"),
-        ("docker.io/ryanjin333/lehome-groot-n17", "release-123"),
+        ("ryanjin333/behavior1k-groot-n17", TRAINER_TAG),
+        ("docker.io/ryanjin333/lehome-groot-n17", TRAINER_TAG),
     ],
 )
 def test_tag_only_and_credential_bearing_image_inputs_are_rejected_before_registry_calls(repository, tag):
@@ -95,13 +102,13 @@ def test_public_repositories_and_non_registry_digests_are_rejected_before_pull()
     public = FakeDockerRegistry(private=False)
     verifier = DockerHubReleaseVerifier(public, TokenSource.from_credential_store("dockerhub", credential_store))
     with pytest.raises(DockerReleaseError, match="private"):
-        verifier.verify_private_image(TRAINER_REPOSITORY, "release-123")
-    assert public.calls == [("repository_info", "ryanjin333/behavior1k-groot-n17-trainer", ("dckr_pat_" + "abcdefghijklmnopqrstuvwxyz0123456789"))]
+        verifier.verify_private_image(TRAINER_REPOSITORY, TRAINER_TAG)
+    assert public.calls == [("repository_info", "ryanjin333/behavior1k-groot-n17", ("dckr_pat_" + "abcdefghijklmnopqrstuvwxyz0123456789"))]
 
     local = FakeDockerRegistry(digest="local-build-sha256")
     verifier = DockerHubReleaseVerifier(local, TokenSource.from_credential_store("dockerhub", credential_store))
     with pytest.raises(DockerReleaseError, match="registry-reported"):
-        verifier.verify_private_image(TRAINER_REPOSITORY, "release-123")
+        verifier.verify_private_image(TRAINER_REPOSITORY, TRAINER_TAG)
     assert [call[0] for call in local.calls] == ["repository_info", "registry_manifest"]
 
 
@@ -111,7 +118,7 @@ def test_authenticated_pull_must_report_the_registry_digest_and_redacts_errors()
     verifier = DockerHubReleaseVerifier(registry, TokenSource.from_credential_store("dockerhub", credential_store))
 
     with pytest.raises(DockerReleaseError) as error:
-        verifier.verify_private_image(TRAINER_REPOSITORY, "release-123")
+        verifier.verify_private_image(TRAINER_REPOSITORY, TRAINER_TAG)
 
     assert ("dckr_pat_" + "abcdefghijklmnopqrstuvwxyz0123456789") not in str(error.value)
     assert "docker login failed" not in str(error.value)
@@ -145,7 +152,7 @@ def test_injected_docker_domain_and_other_callback_errors_are_operation_only():
         DomainFailure(), TokenSource.from_credential_store("dockerhub", credential_store)
     )
     with pytest.raises(DockerReleaseError) as domain_error:
-        verifier.verify_private_image(TRAINER_REPOSITORY, "release-123")
+        verifier.verify_private_image(TRAINER_REPOSITORY, TRAINER_TAG)
     assert str(domain_error.value) == "repository lookup failed"
     assert arbitrary_secret not in str(domain_error.value)
     assert provider_message not in str(domain_error.value)
@@ -158,7 +165,7 @@ def test_injected_docker_domain_and_other_callback_errors_are_operation_only():
         OtherFailure(), TokenSource.from_credential_store("dockerhub", credential_store)
     )
     with pytest.raises(DockerReleaseError) as callback_error:
-        verifier.verify_private_image(TRAINER_REPOSITORY, "release-123")
+        verifier.verify_private_image(TRAINER_REPOSITORY, TRAINER_TAG)
     assert str(callback_error.value) == "authenticated pull failed"
     assert arbitrary_secret not in str(callback_error.value)
     assert provider_message not in str(callback_error.value)
@@ -172,7 +179,7 @@ def test_digest_qualified_template_references_are_required():
         DockerHubReleaseVerifier.require_digest_reference(TRAINER_REPOSITORY + ":release-123")
     with pytest.raises(DockerReleaseError):
         DockerHubReleaseVerifier.require_digest_reference(
-            "ryanjin333/behavior1k-groot-n17-trainer@sha256:" + "a" * 64
+            "ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64
         )
     with pytest.raises(DockerReleaseError):
         DockerHubReleaseVerifier.require_digest_reference(
@@ -184,7 +191,7 @@ def test_only_the_two_pinned_docker_repositories_can_be_released():
     registry = FakeDockerRegistry()
     verifier = DockerHubReleaseVerifier(registry, TokenSource.from_credential_store("dockerhub", credential_store))
 
-    rollout = verifier.verify_private_image(ROLLOUT_REPOSITORY, "release-123")
+    rollout = verifier.verify_private_image(ROLLOUT_REPOSITORY, ROLLOUT_TAG)
 
     assert rollout.reference.startswith(ROLLOUT_REPOSITORY + "@sha256:")
 
@@ -247,6 +254,8 @@ def test_concrete_docker_client_uses_current_hub_bearer_api_and_ephemeral_cli_co
 
         def run(self, arguments, *, stdin, env, timeout):
             self.calls.append((arguments, stdin, env, timeout))
+            if arguments[1:3] == ("image", "inspect"):
+                return CommandResult(0, '{"io.lehome.image-role":"training","org.opencontainers.image.revision":"' + SOURCE_COMMIT + '"}', "")
             return CommandResult(0, "", "")
 
     transport = Transport()
@@ -263,28 +272,28 @@ def test_concrete_docker_client_uses_current_hub_bearer_api_and_ephemeral_cli_co
     client = DockerHubClient("ryanjin333", transport=transport, runner=runner, docker_executable="/usr/local/bin/docker", context_resolver=resolve_context, timeout_seconds=11, pull_timeout_seconds=17)
     token = _DOCKER_TEST_TOKEN
 
-    assert client.repository_info("ryanjin333/behavior1k-groot-n17-trainer", token) == {"is_private": True}
-    manifest = client.registry_manifest("ryanjin333/behavior1k-groot-n17-trainer", "release-123", token)
+    assert client.repository_info("ryanjin333/behavior1k-groot-n17", token) == {"is_private": True}
+    manifest = client.registry_manifest("ryanjin333/behavior1k-groot-n17", TRAINER_TAG, token)
     assert manifest["digest"] == "sha256:" + "b" * 64
     assert client.authenticated_pull(TRAINER_REPOSITORY + "@sha256:" + "b" * 64, token)["digest"] == "sha256:" + "b" * 64
 
     assert transport.calls[0][0:2] == ("POST", "https://hub.docker.com/v2/auth/token")
     expected_auth_body = ('{"identifier":"ryanjin333","secret":"' + token + '"}').encode()
     assert transport.calls[0][4] == expected_auth_body
-    assert transport.calls[1][1].endswith("/v2/namespaces/ryanjin333/repositories/behavior1k-groot-n17-trainer")
+    assert transport.calls[1][1].endswith("/v2/namespaces/ryanjin333/repositories/behavior1k-groot-n17")
     assert transport.calls[1][2] == {"Authorization": "Bearer hub-token"}
     assert transport.calls[2][1].startswith("https://auth.docker.io/token?")
-    assert transport.calls[3][1].endswith("/v2/ryanjin333/behavior1k-groot-n17-trainer/manifests/release-123")
-    assert runner.calls[0][0] == ("/usr/local/bin/docker", "login", "--username", "ryanjin333", "--password-stdin", "docker.io")
-    assert runner.calls[0][1] == token
-    assert runner.calls[1][0] == ("/usr/local/bin/docker", "pull", TRAINER_REPOSITORY + "@sha256:" + "b" * 64)
+    assert transport.calls[3][1].endswith(f"/v2/ryanjin333/behavior1k-groot-n17/manifests/{TRAINER_TAG}")
+    assert [call[0][1] for call in runner.calls] == ["pull", "image"]
+    assert all(call[1] is None for call in runner.calls)
+    assert runner.calls[0][0] == ("/usr/local/bin/docker", "pull", TRAINER_REPOSITORY + "@sha256:" + "b" * 64)
+    assert runner.calls[1][0][:4] == ("/usr/local/bin/docker", "image", "inspect", "--format")
     assert runner.calls[0][2]["DOCKER_CONFIG"] == runner.calls[1][2]["DOCKER_CONFIG"]
     assert runner.calls[0][2]["PATH"] == "/usr/local/bin:/usr/bin"
     assert runner.calls[0][2]["DOCKER_HOST"] == "unix:///Users/user/.docker/run/docker.sock"
     assert "DOCKER_CONTEXT" not in runner.calls[0][2]
     assert context_calls == [("desktop-linux", {"PATH": "/usr/local/bin:/usr/bin", "DOCKER_HOST": "unix:///Users/user/.docker/run/docker.sock", "DOCKER_CONTEXT": "desktop-linux"})]
-    assert runner.calls[0][3] == 17
-    assert runner.calls[1][3] == 17
+    assert runner.calls[0][3] == runner.calls[1][3] == 17
 
 
 def test_concrete_docker_client_rejects_failed_transport_or_cli_without_output_leakage():
@@ -297,7 +306,7 @@ def test_concrete_docker_client_rejects_failed_transport_or_cli_without_output_l
 
     client = DockerHubClient("ryanjin333", transport=FailedTransport(), runner=None, docker_executable="/usr/bin/docker")
     with pytest.raises(DockerReleaseError) as error:
-        client.repository_info("ryanjin333/behavior1k-groot-n17-trainer", "token")
+        client.repository_info("ryanjin333/behavior1k-groot-n17", "token")
     assert str(error.value) == "Docker Hub repository lookup failed"
 
 
@@ -319,6 +328,37 @@ def test_ephemeral_docker_environment_preserves_linux_endpoint_semantics_without
     }
 
 
+def test_authenticated_pull_uses_one_private_inline_auth_config_without_a_login_subprocess(monkeypatch):
+    class Runner:
+        def __init__(self):
+            self.calls = []
+            self.configs = []
+
+        def run(self, arguments, *, stdin, env, timeout):
+            config = __import__("pathlib").Path(env["DOCKER_CONFIG"]) / "config.json"
+            self.calls.append((arguments, stdin, dict(env), timeout))
+            self.configs.append((config.read_text(encoding="utf-8"), config.stat().st_mode & 0o777))
+            if arguments[1:3] == ("image", "inspect"):
+                return CommandResult(0, '{"io.lehome.image-role":"training","org.opencontainers.image.revision":"' + SOURCE_COMMIT + '"}', "")
+            return CommandResult(0, "", "")
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    runner = Runner()
+    client = DockerHubClient("ryanjin333", runner=runner, docker_executable="/usr/bin/docker")
+
+    result = client.authenticated_pull(TRAINER_REPOSITORY + "@sha256:" + "a" * 64, _DOCKER_TEST_TOKEN)
+
+    assert [call[0][1] for call in runner.calls] == ["pull", "image"]
+    assert all(call[1] is None for call in runner.calls)
+    assert runner.calls[0][2]["DOCKER_CONFIG"] == runner.calls[1][2]["DOCKER_CONFIG"]
+    assert all(mode == 0o600 and _DOCKER_TEST_TOKEN not in str(call) for (_contents, mode), call in zip(runner.configs, runner.calls))
+    assert all(
+        '"auths":{"https://index.docker.io/v1/":{"auth":' in contents
+        for contents, _mode in runner.configs
+    )
+    assert _DOCKER_TEST_TOKEN not in str(result)
+
+
 def test_authenticated_pull_on_linux_default_endpoint_never_resolves_or_preserves_a_context(monkeypatch):
     class Runner:
         def __init__(self):
@@ -326,6 +366,8 @@ def test_authenticated_pull_on_linux_default_endpoint_never_resolves_or_preserve
 
         def run(self, arguments, *, stdin, env, timeout):
             self.calls.append((arguments, stdin, env, timeout))
+            if arguments[1:3] == ("image", "inspect"):
+                return CommandResult(0, '{"io.lehome.image-role":"training","org.opencontainers.image.revision":"' + SOURCE_COMMIT + '"}', "")
             return CommandResult(0, "", "")
 
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
@@ -354,6 +396,8 @@ def test_desktop_context_inspection_uses_the_original_config_before_ephemeral_lo
             self.calls.append((arguments, stdin, env, timeout))
             if arguments[1:3] == ("context", "inspect"):
                 return CommandResult(0, "unix:///Users/user/.docker/run/docker.sock\n", ("diagnostic with dckr_pat_" + "abcdefghijklmnopqrstuvwxyz0123456789"))
+            if arguments[1:3] == ("image", "inspect"):
+                return CommandResult(0, '{"io.lehome.image-role":"training","org.opencontainers.image.revision":"' + SOURCE_COMMIT + '"}', "")
             return CommandResult(0, "", "")
 
     monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
@@ -364,13 +408,13 @@ def test_desktop_context_inspection_uses_the_original_config_before_ephemeral_lo
 
     client.authenticated_pull(TRAINER_REPOSITORY + "@sha256:" + "a" * 64, ("dckr_pat_" + "abcdefghijklmnopqrstuvwxyz0123456789"))
 
-    inspect, login = runner.calls[:2]
+    inspect, pull = runner.calls[:2]
     assert inspect[0] == ("/usr/local/bin/docker", "context", "inspect", "desktop-linux", "--format", "{{.Endpoints.docker.Host}}")
     assert inspect[1] is None
     assert inspect[2] == {"PATH": "/usr/local/bin:/usr/bin", "DOCKER_CONFIG": "/Users/user/.docker", "DOCKER_CONTEXT": "desktop-linux"}
     assert inspect[3] == 11
-    assert login[2]["DOCKER_HOST"] == "unix:///Users/user/.docker/run/docker.sock"
-    assert "DOCKER_CONTEXT" not in login[2]
+    assert pull[2]["DOCKER_HOST"] == "unix:///Users/user/.docker/run/docker.sock"
+    assert "DOCKER_CONTEXT" not in pull[2]
 
 
 def test_token_file_walk_requires_exact_0600_owned_regular_file_and_rejects_symlink_component(tmp_path):

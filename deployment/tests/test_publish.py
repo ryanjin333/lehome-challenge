@@ -32,11 +32,15 @@ from b1k_deploy.publish import (
 )
 
 WORKSPACE = Path(__file__).resolve().parents[2]
+SOURCE_COMMIT = "a" * 40
+TRAINING_TAG = f"trainer-{SOURCE_COMMIT}"
+ROLLOUT_TAG = f"rollout-{SOURCE_COMMIT}"
 
-def release(purpose: str) -> DockerImageRelease:
-    repository = "docker.io/ryanjin333/behavior1k-groot-n17-trainer" if purpose == "training" else "docker.io/ryanjin333/behavior1k-groot-n17-rollout"
+def release(purpose: str, source_commit: str = "a" * 40) -> DockerImageRelease:
+    repository = "docker.io/ryanjin333/behavior1k-groot-n17"
     digest = "sha256:" + ("a" if purpose == "training" else "b") * 64
-    return DockerImageRelease(repository, digest, f"{repository}@{digest}")
+    tag = f"trainer-{source_commit}" if purpose == "training" else f"rollout-{source_commit}"
+    return DockerImageRelease(purpose, repository, tag, source_commit, digest, f"{repository}@{digest}")
 
 
 def payload(purpose="training", *, model_commit="c" * 40, checkpoint_artifact_sha256="d" * 64, gpu_ids=(0,)) -> dict[str, object]:
@@ -70,7 +74,7 @@ class FakeVerifier:
 
     def verify_private_image(self, repository, tag):
         self.calls.append((repository, tag))
-        return release("training" if repository.endswith("trainer") else "rollout")
+        return release("training" if tag.startswith("trainer-") else "rollout", tag.split("-", 1)[1])
 
 
 class PassingReleaseContext:
@@ -111,7 +115,7 @@ class FailOnVerifierCall(FakeVerifier):
         self.calls.append((repository, tag))
         if len(self.calls) == self.call_number:
             raise RuntimeError("simulated registry readback failure")
-        return release("training" if repository.endswith("trainer") else "rollout")
+        return release("training" if tag.startswith("trainer-") else "rollout", tag.split("-", 1)[1])
 
 
 class MalformedVerifierOnCall(FakeVerifier):
@@ -123,7 +127,7 @@ class MalformedVerifierOnCall(FakeVerifier):
         self.calls.append((repository, tag))
         if len(self.calls) == self.call_number:
             return object()
-        return release("training" if repository.endswith("trainer") else "rollout")
+        return release("training" if tag.startswith("trainer-") else "rollout", tag.split("-", 1)[1])
 
 
 class FailTemplateCreate(FakeTemplates):
@@ -163,7 +167,7 @@ class FailTemplateReadbackOnce(FakeTemplates):
 
 
 def campaign_plans():
-    images = ImagePublicationPlan("a" * 40, "release-1", "release-1")
+    images = ImagePublicationPlan("a" * 40, "trainer-" + "a" * 40, "rollout-" + "a" * 40)
     templates = (
         TemplateSchemaPlan(images.source_commit, "training", payload("training")),
         TemplateSchemaPlan(images.source_commit, "rollout", payload("rollout")),
@@ -195,29 +199,45 @@ class FailFinalReceiptStore(AtomicCampaignReceiptStore):
 
 def test_dry_run_image_publication_is_plan_only_and_never_calls_builder_or_registry():
     builder, verifier = FakeBuilder(), FakeVerifier()
-    receipt = publish_images(ImagePublicationPlan("a" * 40, "release-1", "release-1"), builder, verifier, execute=False)
+    receipt = publish_images(ImagePublicationPlan(SOURCE_COMMIT, TRAINING_TAG, ROLLOUT_TAG), builder, verifier, execute=False)
 
     assert receipt.dry_run is True
     assert builder.calls == []
     assert verifier.calls == []
-    assert {item.repository for item in receipt.images} == {
-        "docker.io/ryanjin333/behavior1k-groot-n17-trainer",
-        "docker.io/ryanjin333/behavior1k-groot-n17-rollout",
-    }
+    assert {item.repository for item in receipt.images} == {"docker.io/ryanjin333/behavior1k-groot-n17"}
+
+
+def test_shared_repository_image_releases_remain_distinct_by_purpose_and_canonical_tag():
+    source_commit = "a" * 40
+    plan = ImagePublicationPlan(source_commit, f"trainer-{source_commit}", f"rollout-{source_commit}")
+    builder, verifier = FakeBuilder(), FakeVerifier()
+
+    receipt = publish_images(plan, builder, verifier, execute=True)
+
+    assert [item.repository for item in receipt.images] == [
+        "docker.io/ryanjin333/behavior1k-groot-n17",
+        "docker.io/ryanjin333/behavior1k-groot-n17",
+    ]
+    assert [item.purpose for item in receipt.images] == ["training", "rollout"]
+    assert [item.tag for item in receipt.images] == [plan.training_tag, plan.rollout_tag]
+    assert builder.calls == [
+        ("docker.io/ryanjin333/behavior1k-groot-n17", plan.training_tag, source_commit),
+        ("docker.io/ryanjin333/behavior1k-groot-n17", plan.rollout_tag, source_commit),
+    ]
 
 
 def test_execute_builds_exact_repositories_then_requires_private_digest_readback():
     builder, verifier = FakeBuilder(), FakeVerifier()
-    receipt = publish_images(ImagePublicationPlan("a" * 40, "release-1", "release-1"), builder, verifier, execute=True)
+    receipt = publish_images(ImagePublicationPlan(SOURCE_COMMIT, TRAINING_TAG, ROLLOUT_TAG), builder, verifier, execute=True)
 
     assert receipt.dry_run is False
     assert builder.calls == [
-        ("docker.io/ryanjin333/behavior1k-groot-n17-trainer", "release-1", "a" * 40),
-        ("docker.io/ryanjin333/behavior1k-groot-n17-rollout", "release-1", "a" * 40),
+        ("docker.io/ryanjin333/behavior1k-groot-n17", TRAINING_TAG, SOURCE_COMMIT),
+        ("docker.io/ryanjin333/behavior1k-groot-n17", ROLLOUT_TAG, SOURCE_COMMIT),
     ]
     assert verifier.calls == [
-        ("docker.io/ryanjin333/behavior1k-groot-n17-trainer", "release-1"),
-        ("docker.io/ryanjin333/behavior1k-groot-n17-rollout", "release-1"),
+        ("docker.io/ryanjin333/behavior1k-groot-n17", TRAINING_TAG),
+        ("docker.io/ryanjin333/behavior1k-groot-n17", ROLLOUT_TAG),
     ]
     assert all(item.reference.endswith(item.digest) for item in receipt.images)
 
@@ -300,7 +320,7 @@ def test_loads_only_an_injected_trusted_adapter_name_without_constructing_live_c
     builder, verifier, templates = FakeBuilder(), FakeVerifier(), FakeTemplates()
 
     adapters = load_publication_adapters("test", workspace=WORKSPACE, factories={"test": lambda: PublicationAdapters(builder, verifier, templates)})
-    receipt = publish_images(ImagePublicationPlan("a" * 40, "release-1", "release-1"), adapters.builder, adapters.verifier, execute=True)
+    receipt = publish_images(ImagePublicationPlan(SOURCE_COMMIT, TRAINING_TAG, ROLLOUT_TAG), adapters.builder, adapters.verifier, execute=True)
 
     assert receipt.dry_run is False
     assert len(builder.calls) == 2
@@ -329,7 +349,7 @@ def test_wheel_installed_cli_plans_templates_from_the_explicit_source_root(tmp_p
         [
             str(virtualenv / "bin" / "b1k-deploy"), "publish-campaign",
             "--source-root", str(WORKSPACE), "--source-commit", "a" * 40,
-            "--training-tag", "wheel-check", "--rollout-tag", "wheel-check",
+            "--training-tag", TRAINING_TAG, "--rollout-tag", ROLLOUT_TAG,
             "--model-commit", "b" * 40, "--checkpoint-artifact-sha256", "c" * 64,
             "--gpu-ids", "0", "--receipt", str(tmp_path / "plan.json"),
         ],
@@ -344,7 +364,7 @@ def test_cli_execute_uses_campaign_receipt_and_only_an_injected_trusted_adapter(
 
     assert main(
         [
-            "publish-campaign", "--source-commit", "a" * 40, "--training-tag", "release-1", "--rollout-tag", "release-1", *rollout_cli_arguments(),
+            "publish-campaign", "--source-commit", SOURCE_COMMIT, "--training-tag", TRAINING_TAG, "--rollout-tag", ROLLOUT_TAG, *rollout_cli_arguments(),
             "--receipt", str(tmp_path / "receipt.json"), "--execute", "--adapter", "test",
         ],
         adapter_factories={"test": lambda: PublicationAdapters(builder, verifier, templates)},
@@ -358,7 +378,7 @@ def test_cli_execute_uses_campaign_receipt_and_only_an_injected_trusted_adapter(
 
 def test_cli_campaign_is_dry_run_by_default_and_rejects_execute_without_a_trusted_adapter(tmp_path, capsys):
     arguments = [
-        "publish-campaign", "--source-commit", "a" * 40, "--training-tag", "release-1", "--rollout-tag", "release-1", *rollout_cli_arguments(),
+        "publish-campaign", "--source-commit", SOURCE_COMMIT, "--training-tag", TRAINING_TAG, "--rollout-tag", ROLLOUT_TAG, *rollout_cli_arguments(),
         "--receipt", str(tmp_path / "receipt.json"),
     ]
     assert main(arguments) == 0
@@ -373,7 +393,7 @@ def test_cli_campaign_is_dry_run_by_default_and_rejects_execute_without_a_truste
 
     with pytest.raises(SystemExit):
         main([
-            "publish-campaign", "--source-commit", "a" * 40, "--training-tag", "release-1", "--rollout-tag", "release-1",
+            "publish-campaign", "--source-commit", SOURCE_COMMIT, "--training-tag", TRAINING_TAG, "--rollout-tag", ROLLOUT_TAG,
             "--receipt", str(tmp_path / "missing-rollout-inputs.json"),
         ])
 
@@ -392,7 +412,7 @@ def test_cli_requires_and_renders_nonfixture_rollout_inputs_before_any_vast_oper
     builder, verifier, templates = FakeBuilder(), FakeVerifier(), FakeTemplates()
     assert main(
         [
-            "publish-campaign", "--source-commit", "a" * 40, "--training-tag", "release-1", "--rollout-tag", "release-1",
+            "publish-campaign", "--source-commit", SOURCE_COMMIT, "--training-tag", TRAINING_TAG, "--rollout-tag", ROLLOUT_TAG,
             *rollout_cli_arguments(), "--receipt", str(tmp_path / "receipt.json"), "--execute", "--adapter", "test",
         ],
         adapter_factories={"test": lambda: PublicationAdapters(builder, verifier, templates)},
@@ -431,7 +451,7 @@ def test_campaign_failure_after_first_verified_image_persists_only_the_verified_
     receipt = AtomicCampaignReceiptStore(tmp_path / "receipt.json").read()
     assert receipt is not None
     assert receipt.status == "ambiguous"
-    assert [item.repository for item in receipt.images] == ["docker.io/ryanjin333/behavior1k-groot-n17-trainer"]
+    assert [item.purpose for item in receipt.images] == ["training"]
     assert receipt.templates == ()
     assert len(adapters.builder.calls) == 2
 
@@ -445,7 +465,7 @@ def test_campaign_malformed_second_verifier_readback_preserves_the_first_verifie
 
     receipt = AtomicCampaignReceiptStore(tmp_path / "receipt.json").read()
     assert receipt is not None
-    assert [item.repository for item in receipt.images] == ["docker.io/ryanjin333/behavior1k-groot-n17-trainer"]
+    assert [item.purpose for item in receipt.images] == ["training"]
 
 
 def test_campaign_invalid_template_pair_is_rejected_before_any_remote_adapter_is_called(tmp_path):
@@ -471,10 +491,12 @@ def test_campaign_rejects_template_source_identity_that_diverges_from_the_image_
 
 def test_campaign_preflight_identity_changes_for_tags_and_schema_before_a_digest_exists():
     images, templates = campaign_plans()
-    changed_tags = ImagePublicationPlan(images.source_commit, "release-2", images.rollout_tag)
+    changed_source = "b" * 40
+    changed_tags = ImagePublicationPlan(changed_source, f"trainer-{changed_source}", f"rollout-{changed_source}")
+    changed_source_templates = tuple(TemplateSchemaPlan(changed_source, item.purpose, item.template, item.source_root) for item in templates)
     changed_templates = (templates[0], TemplateSchemaPlan(images.source_commit, "rollout", payload("rollout", model_commit="e" * 40)))
 
-    assert campaign_preplan_hash(images, templates) != campaign_preplan_hash(changed_tags, templates)
+    assert campaign_preplan_hash(images, templates) != campaign_preplan_hash(changed_tags, changed_source_templates)
     assert campaign_preplan_hash(images, templates) != campaign_preplan_hash(images, changed_templates)
 
 
@@ -497,10 +519,12 @@ def test_campaign_retry_does_not_reuse_a_partial_receipt_for_different_image_tag
     with pytest.raises(PublicationPartialError):
         publisher.publish(images, templates)
     verifier.call_number = 99
-    changed_tags = ImagePublicationPlan(images.source_commit, "release-2", images.rollout_tag)
-    publisher.publish(changed_tags, templates)
+    changed_source = "b" * 40
+    changed_tags = ImagePublicationPlan(changed_source, f"trainer-{changed_source}", f"rollout-{changed_source}")
+    changed_templates = tuple(TemplateSchemaPlan(changed_source, item.purpose, item.template, item.source_root) for item in templates)
+    publisher.publish(changed_tags, changed_templates)
 
-    assert [call[0] for call in builder.calls].count("docker.io/ryanjin333/behavior1k-groot-n17-trainer") == 2
+    assert [call[0] for call in builder.calls].count("docker.io/ryanjin333/behavior1k-groot-n17") == 4
 
 
 def test_campaign_retry_reuses_verified_first_image_and_completes_atomically(tmp_path):
@@ -516,13 +540,9 @@ def test_campaign_retry_reuses_verified_first_image_and_completes_atomically(tmp
     stored = AtomicCampaignReceiptStore(tmp_path / "receipt.json").read()
 
     assert completed.status == stored.status == "complete"
-    assert {item.repository for item in completed.images} == {
-        "docker.io/ryanjin333/behavior1k-groot-n17-trainer",
-        "docker.io/ryanjin333/behavior1k-groot-n17-rollout",
-    }
+    assert {item.purpose for item in completed.images} == {"training", "rollout"}
     assert {item.purpose for item in completed.templates} == {"training", "rollout"}
-    assert [call[0] for call in builder.calls].count("docker.io/ryanjin333/behavior1k-groot-n17-trainer") == 1
-    assert [call[0] for call in builder.calls].count("docker.io/ryanjin333/behavior1k-groot-n17-rollout") == 2
+    assert [call[0] for call in builder.calls].count("docker.io/ryanjin333/behavior1k-groot-n17") == 3
     assert adapters.templates.created and len(adapters.templates.created) == 2
 
 
@@ -532,10 +552,10 @@ def test_partial_receipt_drift_is_rejected_before_retry_can_rebuild_or_publish_t
             self.calls.append((repository, tag))
             if len(self.calls) == 2:
                 raise RuntimeError("simulated interrupted rollout verification")
-            if len(self.calls) > 2 and repository.endswith("trainer"):
+            if len(self.calls) > 2 and tag.startswith("trainer-"):
                 changed = "sha256:" + "c" * 64
-                return DockerImageRelease(repository, changed, f"{repository}@{changed}")
-            return release("training" if repository.endswith("trainer") else "rollout")
+                return DockerImageRelease("training", repository, f"trainer-{'a' * 40}", "a" * 40, changed, f"{repository}@{changed}")
+            return release("training" if tag.startswith("trainer-") else "rollout", tag.split("-", 1)[1])
 
     images, schemas = campaign_plans()
     builder, verifier, client = FakeBuilder(), PartialDriftVerifier(), FakeTemplates()
@@ -788,7 +808,7 @@ def test_matching_complete_receipt_rejects_registry_digest_drift_without_rebuild
             if self.drift:
                 expected = release("training" if repository.endswith("trainer") else "rollout")
                 changed = "sha256:" + "c" * 64
-                return DockerImageRelease(expected.repository, changed, f"{expected.repository}@{changed}")
+                return DockerImageRelease(expected.purpose, expected.repository, expected.tag, expected.source_commit, changed, f"{expected.repository}@{changed}")
             return super().verify_private_image(repository, tag)
 
     images, schemas = campaign_plans()
@@ -810,7 +830,7 @@ def test_cli_invalid_plan_is_rejected_before_any_trusted_adapter_factory_is_call
     with pytest.raises(SystemExit):
         main(
             [
-                "publish-campaign", "--source-commit", "NOT-A-COMMIT", "--training-tag", "release-1", "--rollout-tag", "release-1", *rollout_cli_arguments(),
+                "publish-campaign", "--source-commit", "NOT-A-COMMIT", "--training-tag", TRAINING_TAG, "--rollout-tag", ROLLOUT_TAG, *rollout_cli_arguments(),
                 "--receipt", str(tmp_path / "receipt.json"), "--execute", "--adapter", "test",
             ],
             adapter_factories={"test": lambda: called.append(True)},
@@ -822,7 +842,7 @@ def test_cli_invalid_plan_is_rejected_before_any_trusted_adapter_factory_is_call
 def test_cli_rejects_arbitrary_adapter_names_without_evaluating_them(tmp_path):
     called = []
     arguments = [
-        "publish-campaign", "--source-commit", "a" * 40, "--training-tag", "release-1", "--rollout-tag", "release-1", *rollout_cli_arguments(),
+        "publish-campaign", "--source-commit", SOURCE_COMMIT, "--training-tag", TRAINING_TAG, "--rollout-tag", ROLLOUT_TAG, *rollout_cli_arguments(),
         "--receipt", str(tmp_path / "receipt.json"), "--execute", "--adapter", "not-an-import:factory",
     ]
 
@@ -832,7 +852,7 @@ def test_cli_rejects_arbitrary_adapter_names_without_evaluating_them(tmp_path):
     assert called == []
 
 
-def test_fixed_buildx_builder_uses_private_stdin_login_and_exact_amd64_release_arguments(tmp_path):
+def test_fixed_buildx_builder_uses_private_inline_auth_and_exact_amd64_release_arguments(tmp_path):
     from b1k_deploy.production import DockerBuildxImageBuilder, buildx_release_command
 
     token_file = tmp_path / "docker-token"
@@ -845,9 +865,12 @@ def test_fixed_buildx_builder_uses_private_stdin_login_and_exact_amd64_release_a
     class Runner:
         def __init__(self):
             self.calls = []
+            self.configs = []
 
         def run(self, arguments, *, stdin, env, timeout):
             self.calls.append((arguments, stdin, dict(env), timeout))
+            config = Path(env["DOCKER_CONFIG"]) / "config.json"
+            self.configs.append((config.read_text(encoding="utf-8"), config.stat().st_mode & 0o777))
             return CommandResult(0, "", "")
 
     runner = Runner()
@@ -859,22 +882,24 @@ def test_fixed_buildx_builder_uses_private_stdin_login_and_exact_amd64_release_a
         runner=runner,
         release_context=PassingReleaseContext(),
     )
-    builder.build_and_push(release("training").repository, "release-1", "a" * 40)
+    builder.build_and_push(release("training").repository, TRAINING_TAG, SOURCE_COMMIT)
 
-    login, build = runner.calls
-    assert login[0] == (str(docker_executable), "login", "--username", "ryanjin333", "--password-stdin", "docker.io")
-    assert login[1] == "token-never-in-arguments"
+    [build] = runner.calls
+    assert build[1] is None
     assert "token-never-in-arguments" not in build[0]
+    assert runner.configs == [(runner.configs[0][0], 0o600)]
+    assert '"auths":{"https://index.docker.io/v1/":{"auth":' in runner.configs[0][0]
+    assert "token-never-in-arguments" not in str(build)
     assert build[0] == buildx_release_command(
         docker_executable,
         Path(__file__).resolve().parents[2],
         release("training").repository,
-        "release-1",
+        TRAINING_TAG,
         "a" * 40,
     )
     assert ("--target", "training-runtime") in zip(build[0], build[0][1:])
     assert ("--label", "io.lehome.release-mode=release") in zip(build[0], build[0][1:])
-    assert login[3] == build[3] == 1800.0
+    assert build[3] == 1800.0
 
 
 def test_fixed_buildx_builder_rejects_workspace_head_mismatch_before_docker_login_or_build(tmp_path):
@@ -906,7 +931,7 @@ def test_fixed_buildx_builder_rejects_workspace_head_mismatch_before_docker_logi
         workspace=Path(__file__).resolve().parents[2], runner=runner, release_context=GitReleaseContext(git),
     )
     with pytest.raises(PublicationError, match="does not match workspace HEAD"):
-        builder.build_and_push(release("training").repository, "release-1", "a" * 40)
+        builder.build_and_push(release("training").repository, TRAINING_TAG, SOURCE_COMMIT)
 
     assert runner.calls == []
     assert len(git_calls) == 1 and git_calls[0][-2:] == ("rev-parse", "HEAD")
@@ -938,7 +963,7 @@ def test_fixed_buildx_builder_rejects_tracked_or_untracked_release_context_befor
         release_context=GitReleaseContext(lambda arguments: next(outputs)),
     )
     with pytest.raises(PublicationError, match="tracked or untracked changes"):
-        builder.build_and_push(release("training").repository, "release-1", "a" * 40)
+        builder.build_and_push(release("training").repository, TRAINING_TAG, SOURCE_COMMIT)
 
     assert runner.calls == []
 

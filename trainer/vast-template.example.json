@@ -15,9 +15,9 @@
     "rentable": {"eq": true},
     "verified": {"eq": true}
   },
-  "image": "docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "image": "docker.io/ryanjin333/behavior1k-groot-n17@sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "jup_direct": false,
-  "name": "behavior1k-groot-n17-trainer",
+  "name": "b1k-training",
   "onstart": "bash /opt/b1k-launchkit/onstart.sh",
   "private": true,
   "recommended_disk_space": 2048,

@@ -92,7 +92,7 @@ uv run --project deployment pytest deployment/tests -q
 
 - [ ] Build both images locally or on a non-rented authenticated builder, run both image verifiers, and confirm registry credentials are available without printing them.
 - [ ] Create or verify the three private HF repositories and perform exact-prefix upload/read/delete probes.
-- [ ] Confirm the two Docker Hub repositories are private, push both images, pull each by registry digest, and record the digests.
+- [ ] Confirm the shared Docker Hub repository is private, push both role-prefixed image tags, pull each by registry digest, and record the digests.
 - [ ] Publish the two private Vast templates from the digest-qualified payloads and fetch them back to verify payload hashes.
 - [ ] Confirm the currently active LeHome campaign instance and every unrelated Vast instance ID are outside the smoke ledger and cleanup target set.
 - [ ] Do not rent if any preceding checkbox fails.

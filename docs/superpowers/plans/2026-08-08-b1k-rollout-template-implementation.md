@@ -146,9 +146,9 @@ python -m omnigibson.eval.eval --task-name <task> --robot-config /behavior-src/O
 - Create: `rollout/vast-template.example.json`
 - Modify: `.github/workflows/groot-trainer-image.yml`
 
-- [ ] Write failing tests requiring `docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:<64hex>`, private visibility, `AUTO_DESTROY=0`, one-to-four GPUs, at least 2 TB disk, account-level token-file consumption, and no registry/HF credential values.
+- [ ] Write failing tests requiring `docker.io/ryanjin333/behavior1k-groot-n17@sha256:<64hex>` with the rollout role label, private visibility, `AUTO_DESTROY=0`, one-to-four GPUs, at least 2 TB disk, account-level token-file consumption, and no registry/HF credential values.
 - [ ] Require the template to expose SSH only for observability and to start headless without Jupyter, noVNC, desktop, or GUI ports.
-- [ ] Extend the image workflow to build and push trainer and rollout as separate Docker Hub repositories and emit both immutable digests.
+- [ ] Extend the image workflow to build and push trainer and rollout as separate role-prefixed tags in the shared private Docker Hub repository and emit both immutable digests.
 - [ ] Render the schema fixture, run all rollout tests, inspect the generated JSON, and scan for credentials.
 - [ ] Commit with `git commit -m "feat(b1k): define Docker Hub rollout template"`.
 

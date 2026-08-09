@@ -48,7 +48,7 @@
   },
   "image": {
     "digest": null,
-    "repository": "docker.io/ryanjin333/behavior1k-groot-n17-trainer",
+    "repository": "docker.io/ryanjin333/behavior1k-groot-n17",
     "tag": null
   },
   "isaac_groot": {

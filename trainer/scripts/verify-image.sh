@@ -18,7 +18,7 @@ if ! [[ "$repository_commit" =~ ^[0-9a-f]{40}$ ]]; then
   exit 64
 fi
 image_ref=${1:-}
-if ! [[ "$image_ref" =~ ^docker\.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:[0-9a-f]{64}$ ]]; then
+if ! [[ "$image_ref" =~ ^docker\.io/ryanjin333/behavior1k-groot-n17@sha256:[0-9a-f]{64}$ ]]; then
   echo "image must be the canonical Docker Hub digest reference" >&2
   exit 64
 fi
@@ -42,6 +42,7 @@ for pair in \
   "io.lehome.cuda-base-digest=$expected_base" \
   "io.lehome.isaac-groot-revision=$expected_groot" \
   "io.lehome.model-revision=$expected_model" \
+  "io.lehome.image-role=training" \
   "org.opencontainers.image.revision=$repository_commit"; do
   key=${pair%%=*}
   expected=${pair#*=}

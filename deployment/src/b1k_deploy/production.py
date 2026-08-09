@@ -24,10 +24,7 @@ from .dockerhub import (
 from .publish import PublicationAdapters, PublicationError
 
 
-_REPOSITORIES = {
-    "training": "docker.io/ryanjin333/behavior1k-groot-n17-trainer",
-    "rollout": "docker.io/ryanjin333/behavior1k-groot-n17-rollout",
-}
+_REPOSITORY = "docker.io/ryanjin333/behavior1k-groot-n17"
 _SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -136,7 +133,7 @@ class DockerBuildxImageBuilder:
         self._timeout = timeout_seconds
 
     def build_and_push(self, repository: str, tag: str, source_commit: str) -> None:
-        purpose = _purpose_for_repository(repository)
+        purpose = _purpose_for_image(repository, tag, source_commit)
         if not _TAG_RE.fullmatch(tag) or not _SOURCE_COMMIT_RE.fullmatch(source_commit):
             raise PublicationError("Docker image build inputs are invalid")
         self._release_context.verify(self._workspace, source_commit)
@@ -144,12 +141,7 @@ class DockerBuildxImageBuilder:
         with tempfile.TemporaryDirectory(prefix="b1k-buildx-config-") as config:
             os.chmod(config, 0o700)
             environment = DockerHubClient._docker_environment(config)
-            self._run(
-                (str(self._docker_executable), "login", "--username", self._username, "--password-stdin", "docker.io"),
-                token,
-                environment,
-                "Docker login",
-            )
+            DockerHubClient._write_ephemeral_auth_config(config, self._username, token)
             self._run(
                 buildx_release_command(self._docker_executable, self._workspace, repository, tag, source_commit),
                 None,
@@ -226,7 +218,7 @@ class VastCliTemplateClient:
             raise PublicationError("Vast template payload is invalid") from None
         if not isinstance(onstart, str):
             raise PublicationError("Vast template payload is invalid")
-        if image.startswith(_REPOSITORIES["rollout"] + "@sha256:"):
+        if image.startswith(_REPOSITORY + "@sha256:") and "b1k-rollout-" in name:
             if onstart != "":
                 raise PublicationError("Vast rollout template must use the canonical empty onstart")
         elif not onstart:
@@ -287,8 +279,8 @@ def buildx_release_command(
     source_commit: str,
 ) -> tuple[str, ...]:
     """The sole canonical local/CI release-build argument contract."""
-    purpose = _purpose_for_repository(repository)
-    if not _TAG_RE.fullmatch(tag) or not _SOURCE_COMMIT_RE.fullmatch(source_commit):
+    purpose = _purpose_for_image(repository, tag, source_commit)
+    if not _SOURCE_COMMIT_RE.fullmatch(source_commit):
         raise PublicationError("Docker image build inputs are invalid")
     dockerfile = workspace / ("trainer" if purpose == "training" else "rollout") / "Dockerfile"
     if not dockerfile.is_file():
@@ -299,15 +291,19 @@ def buildx_release_command(
         "--target", target,
         "--build-arg", f"REPOSITORY_COMMIT={source_commit}",
         "--label", "io.lehome.release-mode=release",
+        "--label", f"io.lehome.image-role={purpose}",
         "--tag", f"{repository}:{tag}", "--file", str(dockerfile), str(workspace),
     )
 
 
-def _purpose_for_repository(repository: str) -> str:
-    for purpose, expected in _REPOSITORIES.items():
-        if repository == expected:
-            return purpose
-    raise PublicationError("Docker repository is not an approved B1K release target")
+def _purpose_for_image(repository: str, tag: str, source_commit: str) -> str:
+    if repository != _REPOSITORY or not _SOURCE_COMMIT_RE.fullmatch(source_commit):
+        raise PublicationError("Docker repository is not the approved B1K release target")
+    if tag == f"trainer-{source_commit}":
+        return "training"
+    if tag == f"rollout-{source_commit}":
+        return "rollout"
+    raise PublicationError("Docker tag must be the canonical purpose-prefixed source revision")
 
 
 def _required_executable(values: Mapping[str, str], name: str) -> Path:

@@ -19,14 +19,10 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
-_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+_TAG_RE = re.compile(r"^(trainer|rollout)-([0-9a-f]{40})$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-_ALLOWED_REPOSITORIES = frozenset(
-    {
-        "docker.io/ryanjin333/behavior1k-groot-n17-trainer",
-        "docker.io/ryanjin333/behavior1k-groot-n17-rollout",
-    }
-)
+_REPOSITORY = "docker.io/ryanjin333/behavior1k-groot-n17"
+_DOCKER_HUB_AUTH_KEY = "https://index.docker.io/v1/"
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(?:[A-Z][A-Z0-9_]*_)?(?:TOKEN|API_KEY|PASSWORD|SECRET|CREDENTIAL)\s*=\s*[^\s,'\"]+"),
     re.compile(r"(?i)\bBearer\s+[^\s,'\"]+"),
@@ -306,9 +302,54 @@ class DockerHubClient:
             if "DOCKER_CONTEXT" in environment:
                 environment["DOCKER_HOST"] = self._resolve_context_endpoint(environment["DOCKER_CONTEXT"])
                 environment.pop("DOCKER_CONTEXT", None)
-            self._run((self._docker_executable, "login", "--username", self._username, "--password-stdin", "docker.io"), token, environment)
+            self._write_ephemeral_auth_config(config, self._username, token)
             self._run((self._docker_executable, "pull", reference), None, environment)
-        return {"digest": digest}
+            labels = self._inspect_labels(reference, environment)
+        return {"digest": digest, "labels": labels}
+
+    @staticmethod
+    def _write_ephemeral_auth_config(config: str, username: str, token: str) -> None:
+        encoded = base64.b64encode(f"{username}:{token}".encode("utf-8")).decode("ascii")
+        path = Path(config) / "config.json"
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                payload = json.dumps(
+                    {"auths": {_DOCKER_HUB_AUTH_KEY: {"auth": encoded}}},
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                written = 0
+                while written < len(payload):
+                    count = os.write(descriptor, payload[written:])
+                    if count <= 0:
+                        raise OSError("ephemeral Docker auth write made no progress")
+                    written += count
+                os.fsync(descriptor)
+                os.fchmod(descriptor, 0o600)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            raise DockerReleaseError("ephemeral Docker authentication configuration failed") from None
+
+    def _inspect_labels(self, reference: str, environment: Mapping[str, str]) -> Mapping[str, str]:
+        try:
+            result = self._runner.run(
+                (self._docker_executable, "image", "inspect", "--format", "{{json .Config.Labels}}", reference),
+                stdin=None,
+                env=environment,
+                timeout=self._pull_timeout,
+            )
+        except Exception:
+            raise DockerReleaseError("Docker image label inspection failed") from None
+        if not isinstance(result, CommandResult) or result.returncode != 0 or len(result.stdout.encode("utf-8")) > 16_384:
+            raise DockerReleaseError("Docker image label inspection failed")
+        try:
+            labels = json.loads(result.stdout)
+        except (TypeError, ValueError):
+            raise DockerReleaseError("Docker image label inspection failed") from None
+        if not isinstance(labels, Mapping) or not all(isinstance(key, str) and isinstance(value, str) for key, value in labels.items()):
+            raise DockerReleaseError("Docker image label inspection failed")
+        return dict(labels)
 
     def _hub_access_token(self, token: str) -> str:
         response = self._request(
@@ -385,7 +426,10 @@ class DockerHubClient:
 
 @dataclass(frozen=True)
 class DockerImageRelease:
+    purpose: str
     repository: str
+    tag: str
+    source_commit: str
     digest: str
     reference: str
 
@@ -399,7 +443,7 @@ class DockerHubReleaseVerifier:
 
     def verify_private_image(self, repository: str, tag: str) -> DockerImageRelease:
         self._validate_repository(repository)
-        self._validate_tag(tag)
+        purpose, source_commit = self.image_identity(tag)
         registry_repository = repository.removeprefix("docker.io/")
         token = self._credentials.resolve()
         info = self._call("repository lookup", token, self._registry.repository_info, registry_repository, token)
@@ -411,7 +455,10 @@ class DockerHubReleaseVerifier:
         pull = self._call("authenticated pull", token, self._registry.authenticated_pull, reference, token)
         if not isinstance(pull, Mapping) or pull.get("digest") != digest:
             raise DockerReleaseError("authenticated pull did not verify the registry-reported digest")
-        return DockerImageRelease(repository, digest, reference)
+        labels = pull.get("labels")
+        if not isinstance(labels, Mapping) or labels.get("io.lehome.image-role") != purpose or labels.get("org.opencontainers.image.revision") != source_commit:
+            raise DockerReleaseError("authenticated pull image labels do not match the canonical tag identity")
+        return DockerImageRelease(purpose, repository, tag, source_commit, digest, reference)
 
     @staticmethod
     def require_digest_reference(reference: str) -> str:
@@ -425,13 +472,21 @@ class DockerHubReleaseVerifier:
 
     @staticmethod
     def _validate_repository(repository: str) -> None:
-        if repository not in _ALLOWED_REPOSITORIES:
-            raise DockerReleaseError("repository must be one of the two exact docker.io B1K release repositories")
+        if repository != _REPOSITORY:
+            raise DockerReleaseError("repository must be the exact private docker.io B1K release repository")
 
     @staticmethod
     def _validate_tag(tag: str) -> None:
-        if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag) or "@" in tag:
-            raise DockerReleaseError("tag must be an exact non-digest registry tag")
+        DockerHubReleaseVerifier.image_identity(tag)
+
+    @staticmethod
+    def image_identity(tag: str) -> tuple[str, str]:
+        if not isinstance(tag, str) or "@" in tag:
+            raise DockerReleaseError("tag must be one exact canonical role-prefixed source revision")
+        match = _TAG_RE.fullmatch(tag)
+        if match is None:
+            raise DockerReleaseError("tag must be one exact canonical role-prefixed source revision")
+        return ("training" if match.group(1) == "trainer" else "rollout", match.group(2))
 
     @staticmethod
     def _registry_digest(manifest: object) -> str:

@@ -9,7 +9,7 @@ from b1k_rollout.identity import BEHAVIOR_REVISION, DATASET_REPO, GROOT_REVISION
 from b1k_rollout.task_manifest import CANONICAL_MANIFEST_SHA256
 
 
-ROLLOUT_IMAGE_REPOSITORY = "docker.io/ryanjin333/behavior1k-groot-n17-rollout"
+ROLLOUT_IMAGE_REPOSITORY = "docker.io/ryanjin333/behavior1k-groot-n17"
 CAMPAIGN_ID = "b1k-r1pro-public-test-100x10"
 _FORBIDDEN = ("novnc", "x11", "xfce", "jupyter", "desktop", "hf_token=", "password=")
 
@@ -143,7 +143,7 @@ def _template(image_digest: str, model_commit: str, checkpoint_artifact_sha256: 
         },
         "image": f"{ROLLOUT_IMAGE_REPOSITORY}@{image_digest}",
         "jup_direct": False,
-        "name": "behavior1k-groot-n17-rollout",
+        "name": "b1k-rollout",
         "onstart": "",
         "private": True,
         "recommended_disk_space": 2048,

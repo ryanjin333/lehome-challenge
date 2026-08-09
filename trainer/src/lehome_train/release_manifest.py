@@ -206,8 +206,8 @@ class ReleaseManifest:
         if image["repository"] != IMAGE_REPOSITORY:
             raise ValueError("release manifest image repository is unsupported")
         tag = image["tag"]
-        if tag != repository_commit:
-            raise ValueError("release manifest image tag must equal the repository commit")
+        if tag != (None if repository_commit is None else f"trainer-{repository_commit}"):
+            raise ValueError("release manifest image tag must be the canonical trainer source revision")
         digest = image["digest"]
         if digest is not None and (type(digest) is not str or not _DIGEST.fullmatch(digest)):
             raise ValueError("release manifest OCI digest is invalid")
@@ -405,7 +405,7 @@ def pending_manifest(
             "repository_commit": repository_commit,
             "image": {
                 "repository": IMAGE_REPOSITORY,
-                "tag": repository_commit,
+                "tag": f"trainer-{repository_commit}",
                 "digest": oci_digest,
             },
             "gpu_acceptance": {

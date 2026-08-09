@@ -2,7 +2,7 @@
 set -euo pipefail
 
 image_ref=${1:-}
-if ! [[ "$image_ref" =~ ^docker\.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:[0-9a-f]{64}$ ]]; then
+if ! [[ "$image_ref" =~ ^docker\.io/ryanjin333/behavior1k-groot-n17@sha256:[0-9a-f]{64}$ ]]; then
   echo "image must be the canonical Docker Hub rollout digest reference" >&2
   exit 64
 fi
@@ -17,9 +17,13 @@ if [[ "$parent_digest" != "sha256:b789b8d8efefda509b37404a676523d6cee81e28605582
   echo "image has an unexpected immutable BEHAVIOR parent digest label" >&2
   exit 1
 fi
-for label in io.lehome.behavior-revision io.lehome.isaac-groot-revision org.opencontainers.image.revision; do
+for label in io.lehome.behavior-revision io.lehome.isaac-groot-revision org.opencontainers.image.revision io.lehome.image-role; do
   value=$(docker image inspect --format "{{index .Config.Labels \"$label\"}}" "$image_ref")
-  if ! [[ "$value" =~ ^[0-9a-f]{40}$ ]]; then
+  if [[ "$label" == io.lehome.image-role && "$value" != rollout ]]; then
+    echo "image label $label must identify the rollout purpose" >&2
+    exit 1
+  fi
+  if [[ "$label" != io.lehome.image-role && ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
     echo "image label $label must be an immutable source revision" >&2
     exit 1
   fi

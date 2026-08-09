@@ -30,8 +30,7 @@ on:
         default: false
 
 env:
-  IMAGE_REPOSITORY: docker.io/ryanjin333/behavior1k-groot-n17-trainer
-  ROLLOUT_IMAGE_REPOSITORY: docker.io/ryanjin333/behavior1k-groot-n17-rollout
+  IMAGE_REPOSITORY: docker.io/ryanjin333/behavior1k-groot-n17
 
 jobs:
   cpu-safe:
@@ -65,8 +64,8 @@ jobs:
           uv run --project deployment --frozen --no-editable b1k-deploy publish-campaign \
             --source-root "$GITHUB_WORKSPACE" \
             --source-commit "${GITHUB_SHA}" \
-            --training-tag "ci-template-check" \
-            --rollout-tag "ci-template-check" \
+            --training-tag "trainer-${GITHUB_SHA}" \
+            --rollout-tag "rollout-${GITHUB_SHA}" \
             --model-commit "${GITHUB_SHA}" \
             --checkpoint-artifact-sha256 "$(printf '1%.0s' {1..64})" \
             --gpu-ids 0 \
@@ -136,7 +135,7 @@ jobs:
         with:
           images: ${{ env.IMAGE_REPOSITORY }}
           tags: |
-            type=raw,value=${{ github.sha }}
+            type=raw,value=trainer-${{ github.sha }}
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -213,7 +212,7 @@ jobs:
       contents: read
     outputs:
       digest: ${{ steps.build.outputs.digest }}
-      image: ${{ env.ROLLOUT_IMAGE_REPOSITORY }}
+      image: ${{ env.IMAGE_REPOSITORY }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -225,9 +224,9 @@ jobs:
       - id: metadata
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: ${{ env.ROLLOUT_IMAGE_REPOSITORY }}
+          images: ${{ env.IMAGE_REPOSITORY }}
           tags: |
-            type=raw,value=${{ github.sha }}
+            type=raw,value=rollout-${{ github.sha }}
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -249,5 +248,5 @@ jobs:
           OCI_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          docker pull "${ROLLOUT_IMAGE_REPOSITORY}@${OCI_DIGEST}"
-          rollout/scripts/verify-image.sh "${ROLLOUT_IMAGE_REPOSITORY}@${OCI_DIGEST}"
+          docker pull "${IMAGE_REPOSITORY}@${OCI_DIGEST}"
+          rollout/scripts/verify-image.sh "${IMAGE_REPOSITORY}@${OCI_DIGEST}"
