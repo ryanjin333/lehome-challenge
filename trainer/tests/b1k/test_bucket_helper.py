@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -116,3 +117,98 @@ def test_helper_list_filters_bucket_folders_before_reading_file_fields(monkeypat
     output = StringIO(); monkeypatch.setattr(sys, "stdout", output)
     module.main()
     assert json.loads(output.getvalue())["result"]["files"] == [{"path": "verified/a", "size": 3, "xet_hash": None, "type": "file"}]
+
+
+def test_helper_accepts_the_orchestrator_explicit_private_token_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    fake = FakeHub()
+    module.hub = fake
+    token_file = tmp_path / "hf.token"
+    token_file.write_text("local-private-token", encoding="utf-8")
+    token_file.chmod(0o600)
+    monkeypatch.setenv("B1K_HF_TOKEN_FILE", str(token_file))
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO(json.dumps({"version": 1, "operation": "info", "payload": {"bucket_id": "owner/checkpoints"}})),
+    )
+    output = StringIO()
+    monkeypatch.setattr(sys, "stdout", output)
+
+    module.main()
+
+    assert json.loads(output.getvalue()) == {"ok": True, "result": {"private": True}}
+    assert fake.calls[0][2]["token"] == "local-private-token"
+
+
+@pytest.mark.parametrize(
+    "unsafe_kind",
+    ["relative", "permissive", "symlink", "ancestor_symlink", "nonregular", "oversized"],
+)
+def test_helper_rejects_unsafe_explicit_token_files_before_hub_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe_kind: str
+) -> None:
+    module = _module()
+    fake = FakeHub()
+    module.hub = fake
+    private_file = tmp_path / "private.token"
+    private_file.write_text("private-token", encoding="utf-8")
+    private_file.chmod(0o600)
+    token_file = private_file
+    if unsafe_kind == "relative":
+        token_value = "relative.token"
+    elif unsafe_kind == "permissive":
+        private_file.chmod(0o640)
+        token_value = str(private_file)
+    elif unsafe_kind == "symlink":
+        token_file = tmp_path / "linked.token"
+        token_file.symlink_to(private_file)
+        token_value = str(token_file)
+    elif unsafe_kind == "ancestor_symlink":
+        real_directory = tmp_path / "real"
+        real_directory.mkdir()
+        nested_file = real_directory / "nested.token"
+        nested_file.write_text("private-token", encoding="utf-8")
+        nested_file.chmod(0o600)
+        linked_directory = tmp_path / "linked-directory"
+        linked_directory.symlink_to(real_directory, target_is_directory=True)
+        token_value = str(linked_directory / nested_file.name)
+    elif unsafe_kind == "nonregular":
+        token_file = tmp_path / "token.fifo"
+        os.mkfifo(token_file, mode=0o600)
+        token_value = str(token_file)
+    else:
+        private_file.write_bytes(b"x" * (module.MAX_TOKEN_BYTES + 1))
+        token_value = str(private_file)
+    monkeypatch.setenv("B1K_HF_TOKEN_FILE", token_value)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO(json.dumps({"version": 1, "operation": "info", "payload": {"bucket_id": "owner/checkpoints"}})),
+    )
+    output = StringIO()
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with pytest.raises(SystemExit):
+        module.main()
+
+    assert json.loads(output.getvalue()) == {"ok": False, "error": "operation_failed"}
+    assert fake.calls == []
+
+
+def test_private_token_reader_rejects_oversized_file_across_short_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    token_file = tmp_path / "oversized.token"
+    token_file.write_bytes(b"x" * (module.MAX_TOKEN_BYTES + 1))
+    token_file.chmod(0o600)
+    real_read = os.read
+    monkeypatch.setattr(module.os, "read", lambda descriptor, count: real_read(descriptor, min(count, 17)))
+
+    with pytest.raises(ValueError, match="invalid token file"):
+        module.read_private_token_file(str(token_file))
