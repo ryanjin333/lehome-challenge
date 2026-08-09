@@ -209,7 +209,8 @@ class VastCliSmokeClient:
         filters["cpu_cores_effective"] = {"gte": 4 if purpose == "training" else 8}
         filters.pop("gpu_name", None)
         payload["extra_filters"] = filters
-        command = self._template_create_command(payload)
+        docker_login_repo = self._template_registry_repo(production.template_id)
+        command = self._template_create_command(payload, docker_login_repo=docker_login_repo)
         created_ids: set[str] = set()
         create_error: Exception | None = None
         try:
@@ -242,6 +243,8 @@ class VastCliSmokeClient:
                     payload_hash = canonical_payload_hash(readback)
                     if readback != payload or readback.get("image") != production.image_release.reference:
                         raise ProductionSmokeError("ephemeral smoke template readback drifted")
+                    if self._template_registry_repo(template_id) != docker_login_repo:
+                        raise ProductionSmokeError("ephemeral smoke template private registry reference drifted")
                 except Exception as error:
                     primary_error = ProductionSmokeError("ephemeral smoke template readback failed")
                     primary_error.__cause__ = error
@@ -312,12 +315,20 @@ class VastCliSmokeClient:
         if cleanup_error is not None:
             raise cleanup_error
 
-    def _template_create_command(self, payload: Mapping[str, Any]) -> tuple[str, ...]:
+    def _template_registry_repo(self, template_id: str) -> str:
+        expected = _exact_id(template_id)
+        rows = self._rows((str(self._vastai), "--raw", "search", "templates", f"id=={expected}"))
+        matches = [row for row in rows if _exact_id(row.get("id")) == expected]
+        if len(matches) != 1 or matches[0].get("docker_login_repo") != "docker.io":
+            raise ProductionSmokeError("exact Vast template lacks the approved private registry reference")
+        return "docker.io"
+
+    def _template_create_command(self, payload: Mapping[str, Any], *, docker_login_repo: str) -> tuple[str, ...]:
         from .production import _search_query
         required = ("name", "image", "env", "onstart", "recommended_disk_space", "extra_filters")
-        if any(key not in payload for key in required) or payload.get("private") is not True or payload.get("runtype") != "ssh" or payload.get("use_ssh") is not True or payload.get("ssh_direct") is not True or payload.get("jup_direct") is not False:
+        if docker_login_repo != "docker.io" or any(key not in payload for key in required) or payload.get("private") is not True or payload.get("runtype") != "ssh" or payload.get("use_ssh") is not True or payload.get("ssh_direct") is not True or payload.get("jup_direct") is not False:
             raise ProductionSmokeError("ephemeral smoke template payload is invalid")
-        return (str(self._vastai), "--raw", "create", "template", "--name", str(payload["name"]), "--image", str(payload["image"]), "--env", str(payload["env"]), "--ssh", "--direct", "--onstart-cmd", str(payload["onstart"]), "--search_params", _search_query(payload["extra_filters"]), "--no-default", "--disk_space", str(payload["recommended_disk_space"]))
+        return (str(self._vastai), "--raw", "create", "template", "--name", str(payload["name"]), "--image", str(payload["image"]), "--login", docker_login_repo, "--env", str(payload["env"]), "--ssh", "--direct", "--onstart-cmd", str(payload["onstart"]), "--search_params", _search_query(payload["extra_filters"]), "--no-default", "--disk_space", str(payload["recommended_disk_space"]))
 
     def find_instance_by_idempotency_key(self, key: str, *, timeout_seconds: int) -> str | None:
         self._tool_timeout(timeout_seconds)

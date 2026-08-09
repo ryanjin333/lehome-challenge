@@ -412,7 +412,9 @@ def test_ephemeral_template_creation_retries_exact_name_readback_after_an_empty_
     created_payload: dict[str, object] = {}
 
     monkeypatch.setattr(client, "attest_template_binding", lambda **_kwargs: "provider")
-    def create_command(payload: dict[str, object]) -> tuple[str, ...]:
+    monkeypatch.setattr(client, "_template_registry_repo", lambda _template_id: "docker.io")
+    def create_command(payload: dict[str, object], *, docker_login_repo: str) -> tuple[str, ...]:
+        assert docker_login_repo == "docker.io"
         created_payload.update(payload)
         return ("create",)
     monkeypatch.setattr(client, "_template_create_command", create_command)
@@ -423,6 +425,75 @@ def test_ephemeral_template_creation_retries_exact_name_readback_after_an_empty_
     receipt = client.create_ephemeral_smoke_template("training", production, name=name)
 
     assert receipt.template_id == "456"
+
+
+def test_ephemeral_template_propagates_only_the_registered_private_registry_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = VastRunner()
+    client = _client(tmp_path, runner)
+    production_payload = dict(runner.template)
+    production = SmokeTemplatePublicationReceipt(
+        "123", training_release(runner.template["image"]), canonical_payload_hash(production_payload)
+    )
+    name = "b1k-training-smoke-" + "a" * 32
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(client, "attest_template_binding", lambda **_kwargs: "provider")
+    monkeypatch.setattr(client, "_template_registry_repo", lambda _template_id: "docker.io")
+
+    def create_command(payload: dict[str, object], *, docker_login_repo: str) -> tuple[str, ...]:
+        captured["payload"] = payload
+        captured["docker_login_repo"] = docker_login_repo
+        return ("create",)
+
+    monkeypatch.setattr(client, "_template_create_command", create_command)
+    monkeypatch.setattr(client, "_create_template_id", lambda _command: "456")
+    created_payload: dict[str, object] = {}
+    monkeypatch.setattr(
+        client,
+        "_template_readback",
+        lambda template_id: production_payload if template_id == "123" else created_payload,
+    )
+
+    def rows(_arguments: tuple[str, ...], timeout_seconds: int | None = None) -> list[dict[str, object]]:
+        created_payload.update(captured["payload"])
+        return [{"id": 456, "name": name}]
+
+    monkeypatch.setattr(client, "_rows", rows)
+
+    receipt = client.create_ephemeral_smoke_template("training", production, name=name)
+
+    assert receipt.template_id == "456"
+    assert captured["docker_login_repo"] == "docker.io"
+    assert "docker_login_repo" not in captured["payload"]
+
+
+def test_private_registry_reference_is_read_back_and_passed_without_credentials(tmp_path: Path) -> None:
+    runner = VastRunner()
+    runner.template["docker_login_repo"] = "docker.io"
+    client = _client(tmp_path, runner)
+
+    assert client._template_registry_repo("123") == "docker.io"
+    command = client._template_create_command(
+        load_canonical_template("training", source_root=WORKSPACE),
+        docker_login_repo="docker.io",
+    )
+
+    assert ("--login", "docker.io") in zip(command, command[1:])
+    assert not any("dckr_pat" in item.casefold() or "private-token" in item.casefold() for item in command)
+
+
+@pytest.mark.parametrize("registry_reference", [None, "hub.docker.com", "docker.io private-token"])
+def test_private_registry_reference_rejects_missing_or_unapproved_values(
+    tmp_path: Path, registry_reference: str | None
+) -> None:
+    runner = VastRunner()
+    runner.template["docker_login_repo"] = registry_reference
+    client = _client(tmp_path, runner)
+
+    with pytest.raises(ProductionSmokeError, match="approved private registry reference"):
+        client._template_registry_repo("123")
 
 
 @pytest.mark.parametrize(
@@ -458,7 +529,8 @@ def test_ephemeral_template_create_id_with_failed_readback_is_destroyed_and_prov
     queries: list[str] = []
 
     monkeypatch.setattr(client, "attest_template_binding", lambda **_kwargs: "provider")
-    monkeypatch.setattr(client, "_template_create_command", lambda _payload: ("create",))
+    monkeypatch.setattr(client, "_template_registry_repo", lambda _template_id: "docker.io")
+    monkeypatch.setattr(client, "_template_create_command", lambda _payload, *, docker_login_repo: ("create",))
     def json_call(command: tuple[str, ...], _timeout: int) -> object:
         commands.append(command)
         return {}
@@ -489,7 +561,8 @@ def test_ephemeral_template_create_error_reconciles_exact_name_and_preserves_pri
     queries: list[str] = []
 
     monkeypatch.setattr(client, "attest_template_binding", lambda **_kwargs: "provider")
-    monkeypatch.setattr(client, "_template_create_command", lambda _payload: ("create",))
+    monkeypatch.setattr(client, "_template_registry_repo", lambda _template_id: "docker.io")
+    monkeypatch.setattr(client, "_template_create_command", lambda _payload, *, docker_login_repo: ("create",))
     def json_call(command: tuple[str, ...], _timeout: int) -> object:
         commands.append(command)
         return {}
@@ -521,7 +594,8 @@ def test_ephemeral_template_create_id_is_cleaned_when_name_reconciliation_fails(
     name_reads = 0
 
     monkeypatch.setattr(client, "attest_template_binding", lambda **_kwargs: "provider")
-    monkeypatch.setattr(client, "_template_create_command", lambda _payload: ("create",))
+    monkeypatch.setattr(client, "_template_registry_repo", lambda _template_id: "docker.io")
+    monkeypatch.setattr(client, "_template_create_command", lambda _payload, *, docker_login_repo: ("create",))
     def json_call(command: tuple[str, ...], _timeout: int) -> object:
         commands.append(command)
         return {}
