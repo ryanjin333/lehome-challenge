@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+import b1k_rollout.controller as controller_module
 from b1k_rollout.contracts import RolloutContract
 from b1k_rollout.controller import (
     CheckpointReceipt,
@@ -403,8 +404,16 @@ class MemoryHub:
 
 
 def test_controller_assigns_one_policy_and_one_evaluator_worker_per_gpu(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Protocol fakes must not inherit the host's Linux /proc behavior."""
+
+    original_is_dir = Path.is_dir
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda path: True if path == Path("/proc") else original_is_dir(path),
+    )
     contract = _contract()
     checkpoint = CheckpointReceipt(contract.model_commit, contract.checkpoint_artifact_sha256, tmp_path / "checkpoint")
     launcher = FakeLauncher()
@@ -510,8 +519,8 @@ def test_controller_rechecks_launched_child_after_a_positive_health_response(tmp
         controller.start_policy_servers()
 
 
-def test_controller_rejects_an_occupied_port_before_launch_and_a_listener_race_after_health(
-    tmp_path: Path,
+def test_controller_enforces_port_and_listener_ownership_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     contract = _contract()
     checkpoint = CheckpointReceipt(contract.model_commit, contract.checkpoint_artifact_sha256, tmp_path / "checkpoint")
@@ -563,6 +572,31 @@ def test_controller_rejects_an_occupied_port_before_launch_and_a_listener_race_a
     )
     owned.start_policy_servers()
     owned.close()
+
+    monkeypatch.setattr(controller_module, "_linux_listener_pid", lambda _host, _port: None)
+    process = FakeProcess(pid=10_000)
+    launcher = SubprocessGroupLauncher()
+    monkeypatch.setattr(launcher, "start", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(
+        launcher,
+        "terminate_group",
+        lambda controlled, **_kwargs: setattr(controlled, "terminated", True),
+    )
+    controller = RolloutController(
+        contract=contract,
+        task_manifest=load_task_manifest(ROLLOUT / "task-manifest.json"),
+        checkpoint_source=FakeCheckpointSource(checkpoint),
+        checkpoint_dir=checkpoint.local_path,
+        workspace=tmp_path / "campaign-production-unavailable",
+        gpu_ids=(0,),
+        launcher=launcher,
+        health_probe=lambda _url, _timeout: True,
+    )
+
+    with pytest.raises(ControllerError, match="listener ownership is unavailable"):
+        controller.start_policy_servers()
+
+    assert process.terminated is True
 
 
 def test_controller_refuses_publication_until_every_canonical_episode_is_closed_or_quarantined(

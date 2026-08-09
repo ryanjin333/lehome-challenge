@@ -387,8 +387,10 @@ class RolloutController:
             if isinstance(launcher, SubprocessGroupLauncher)
             else lambda _host, _port: True
         )
-        self._listener_pid = listener_pid or (
-            _linux_listener_pid if isinstance(launcher, SubprocessGroupLauncher) else lambda _host, _port: None
+        self._listener_pid = (
+            listener_pid
+            if listener_pid is not None
+            else _linux_listener_pid if isinstance(launcher, SubprocessGroupLauncher) else None
         )
         self.worker_assignments = tuple(
             WorkerAssignment(worker_id=f"gpu-{gpu}", gpu_id=gpu, port=_FIRST_POLICY_PORT + ordinal)
@@ -757,15 +759,16 @@ class RolloutController:
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
     def _verify_policy_listener(self, worker: WorkerAssignment, process: ManagedProcess) -> None:
-        """On Linux, require the ready listener to be in our launched process group."""
+        """When enabled, require the ready listener to be in our launched process group."""
 
         if self._checkpoint is None or self._checkpoint.model_commit != self.contract.model_commit:
             raise ControllerError("policy server checkpoint is not bound to the frozen contract")
-        owner = self._listener_pid(_POLICY_HOST, worker.port)
-        if owner is None:
-            if Path("/proc").is_dir():
-                raise ControllerError(f"policy server {worker.worker_id} listener ownership is unavailable")
+        listener_pid = self._listener_pid
+        if listener_pid is None:
             return
+        owner = listener_pid(_POLICY_HOST, worker.port)
+        if owner is None:
+            raise ControllerError(f"policy server {worker.worker_id} listener ownership is unavailable")
         try:
             same_group = owner == process.pid or os.getpgid(owner) == process.pid
         except OSError as error:
