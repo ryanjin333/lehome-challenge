@@ -32,6 +32,7 @@ def test_rollout_image_is_pinned_headless_and_secret_free() -> None:
     assert "uv sync --frozen --no-dev" in dockerfile
     assert "--no-install-project" not in dockerfile
     assert "GROOT_PYTHON=/opt/isaac-groot/.venv/bin/python" in dockerfile
+    assert dockerfile.index("rm -rf /behavior-src /opt/isaac-groot") < dockerfile.index("git init /behavior-src")
     for forbidden in ("novnc", "x11vnc", "xfce", "jupyter", "HF_TOKEN="):
         assert forbidden not in dockerfile.casefold()
     assert not re.search(r"hf_[A-Za-z0-9]{30,}", dockerfile)

@@ -36,6 +36,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git git-lfs python3-pip util-linux \
     && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /behavior-src /opt/isaac-groot \
     && git init /behavior-src \
     && git -C /behavior-src remote add origin https://github.com/StanfordVL/BEHAVIOR-1K.git \
     && git -C /behavior-src fetch --depth=1 origin "${BEHAVIOR_REVISION}" \
