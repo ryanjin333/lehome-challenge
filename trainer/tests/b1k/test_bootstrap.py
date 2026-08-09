@@ -88,7 +88,7 @@ def test_bootstrap_downloads_metadata_before_selection_then_full_rgb_snapshot(tm
     payload = b"metadata"
 
     def snapshot(_repo: str, _revision: str, local: Path, patterns: tuple[str, ...], _token: str) -> None:
-        calls.append(("snapshot", (local, tuple(patterns))))
+        calls.append(("snapshot", (local.resolve(), tuple(patterns))))
         local.mkdir(parents=True, exist_ok=True); (local / "meta").mkdir(exist_ok=True)
         (local / "meta/info.json").write_bytes(payload)
 
@@ -439,9 +439,10 @@ class _BootstrapHub:
     def create_bucket(self, *_args: object, **_kwargs: object) -> object: pytest.fail("existing bucket must not be recreated")
 
     def snapshot_download(self, repository: str, *, revision: str, local_dir: Path, allow_patterns: tuple[str, ...] | None, token: str) -> object:
-        self.events.append(("snapshot", repository, revision, local_dir, allow_patterns, token))
+        resolved_local_dir = local_dir.resolve()
+        self.events.append(("snapshot", repository, revision, resolved_local_dir, allow_patterns, token))
         local_dir.mkdir(parents=True, exist_ok=True)
-        self._snapshot_roots[repository] = local_dir
+        self._snapshot_roots[repository] = resolved_local_dir
         if repository == BEHAVIOR_1K_DATASET_REPOSITORY and allow_patterns == dataset_snapshot_patterns()[1]:
             assert self.model_submissions.wait(timeout=2), "both model snapshots must be submitted before full data work completes"
         elif repository in {BASE_MODEL_REPOSITORY, COSMOS_REPOSITORY}:
