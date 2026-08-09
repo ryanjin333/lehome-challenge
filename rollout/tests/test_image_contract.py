@@ -78,6 +78,10 @@ def test_image_verifier_accepts_only_immutable_rollout_digests() -> None:
     assert "/opt/conda/envs/behavior/bin/python -m b1k_rollout.cli" in verifier
 
 
+def test_image_verifier_is_executable_by_ci() -> None:
+    assert (ROLLOUT / "scripts/verify-image.sh").stat().st_mode & 0o111
+
+
 def test_ci_secret_scan_excludes_only_known_synthetic_fixture_files() -> None:
     workflow = (ROLLOUT.parent / ".github/workflows/groot-trainer-image.yml").read_text(encoding="utf-8")
 
