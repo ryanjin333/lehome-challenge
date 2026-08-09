@@ -66,7 +66,7 @@ COPY rollout/entrypoint.sh /usr/local/bin/b1k-rollout-entrypoint
 RUN /opt/conda/envs/behavior/bin/python -m pip install --no-cache-dir . \
     && cd /opt/isaac-groot && uv sync --frozen --no-dev \
     && /opt/isaac-groot/.venv/bin/python -c 'import gr00t' \
-    && python3 -c 'import b1k_rollout.policy_server' \
+    && "$BEHAVIOR_PYTHON" -c 'import b1k_rollout.policy_server' \
     && test -f /behavior-src/OmniGibson/omnigibson/eval/r1pro.yaml \
     && test -f /opt/isaac-groot/examples/b1k/r1pro.py \
     && test -f /opt/isaac-groot/examples/b1k/r1pro.json \

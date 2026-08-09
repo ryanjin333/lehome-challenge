@@ -32,6 +32,8 @@ def test_rollout_image_is_pinned_headless_and_secret_free() -> None:
     assert "uv sync --frozen --no-dev" in dockerfile
     assert "--no-install-project" not in dockerfile
     assert "GROOT_PYTHON=/opt/isaac-groot/.venv/bin/python" in dockerfile
+    assert '"$BEHAVIOR_PYTHON" -c \'import b1k_rollout.policy_server\'' in dockerfile
+    assert "python3 -c 'import b1k_rollout.policy_server'" not in dockerfile
     assert dockerfile.index("WORKDIR /\n") < dockerfile.index(
         "rm -rf /behavior-src /opt/isaac-groot"
     )
