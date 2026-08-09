@@ -31,6 +31,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# The parent image currently inherits /opt/isaac-groot as its working
+# directory. Move away before replacing that checkout so child processes can
+# always resolve their current directory.
+WORKDIR /
+
 # The official pinned BEHAVIOR source is the simulator/evaluator authority;
 # only serving dependencies are added here, never trainer lifecycle packages.
 RUN apt-get update \
