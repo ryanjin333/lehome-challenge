@@ -29,6 +29,7 @@ image_ref="${image_repository}:${image_tag}"
 docker buildx build \
   --platform linux/amd64 \
   --load \
+  --target training-runtime \
   --build-arg "REPOSITORY_COMMIT=${repository_commit}" \
   --label "io.lehome.release-mode=${release_mode}" \
   --tag "$image_ref" \

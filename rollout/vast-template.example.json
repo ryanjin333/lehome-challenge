@@ -1,0 +1,47 @@
+{
+  "env": "--ipc=host --shm-size=64g --ulimit memlock=-1 --ulimit stack=67108864 -e AUTO_DESTROY=0 -e B1K_ACCEPT_DATASET_TOS=YES -e CONTAINER_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000 -e RUN_ID=b1k-r1pro-100x10 -e CYCLE_ID=cycle-001 -e CAMPAIGN_ID=b1k-r1pro-public-test-100x10 -e EVALUATOR_MODE=public_test -e BEHAVIOR_REVISION=26f2c7ef7b9cf96bd0414f81e1e751e493762779 -e GROOT_REVISION=ace36d935b376fbf25cd56371e23877b95407c40 -e TASK_MANIFEST_SHA256=7ab5ee6ef1c5e48b421f4dac6ef45537f081b78feba0735ae1c805f529462d92 -e EPISODES_PER_TASK=10 -e GPU_IDS=0 -e B1K_HF_TOKEN_FILE=/workspace/.cache/huggingface/token -e HF_MODEL_REPO=ryanjin333/behavior1k-groot-n17-models -e HF_DATASET_REPO=ryanjin333/behavior1k-groot-n17-rollouts -e MODEL_COMMIT=0000000000000000000000000000000000000000 -e CHECKPOINT_ARTIFACT_SHA256=0000000000000000000000000000000000000000000000000000000000000000",
+  "extra_filters": {
+    "cpu_cores_effective": {
+      "gte": 24
+    },
+    "cpu_ram": {
+      "gte": 128000
+    },
+    "datacenter": {
+      "eq": true
+    },
+    "direct_port_count": {
+      "gte": 1
+    },
+    "disk_bw": {
+      "gte": 4000
+    },
+    "gpu_ram": {
+      "gte": 20000
+    },
+    "inet_down": {
+      "gte": 1000
+    },
+    "inet_up": {
+      "gte": 500
+    },
+    "num_gpus": {
+      "eq": 1
+    },
+    "rentable": {
+      "eq": true
+    },
+    "verified": {
+      "eq": true
+    }
+  },
+  "image": "docker.io/ryanjin333/behavior1k-groot-n17-rollout@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "jup_direct": false,
+  "name": "behavior1k-groot-n17-rollout",
+  "onstart": "",
+  "private": true,
+  "recommended_disk_space": 2048,
+  "runtype": "ssh",
+  "ssh_direct": true,
+  "use_ssh": true
+}

@@ -11,19 +11,27 @@ from typing import Mapping
 from urllib.parse import urlsplit
 
 from lehome_train.constants import (
+    BEHAVIOR_1K_DATASET_REPOSITORY,
+    BEHAVIOR_1K_DATASET_REVISION,
+    BEHAVIOR_1K_TRAINER_IMAGE_REPOSITORY,
+    COSMOS_REPOSITORY,
+    COSMOS_REVISION,
     CUDA_BASE_DIGEST,
+    ISAAC_GROOT_REPOSITORY as _ISAAC_GROOT_REPOSITORY,
     ISAAC_GROOT_REVISION,
     MODEL_REVISION,
     PYTHON_VERSION,
 )
-from lehome_train.io import atomic_write_json, sha256_file
+from lehome_train.io import atomic_write_json, canonical_json_sha256, sha256_file
+from lehome_train.b1k.training import SUPPORTED_GPU_COUNTS, approved_launch_plans
+from lehome_train.b1k.launch import build_b1k_command
 
 
 CUDA_BASE_IMAGE = "nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04"
-ISAAC_GROOT_REPOSITORY = "https://github.com/NVIDIA/Isaac-GR00T.git"
+ISAAC_GROOT_REPOSITORY = _ISAAC_GROOT_REPOSITORY
 MODEL_REPOSITORY = "nvidia/GR00T-N1.7-3B"
-IMAGE_REPOSITORY = "ghcr.io/ryanjin333/lehome-groot-n17-trainer"
-DATASET_REPOSITORY = "ryanjin333/lehome-groot-n17-data"
+IMAGE_REPOSITORY = BEHAVIOR_1K_TRAINER_IMAGE_REPOSITORY
+DATASET_REPOSITORY = BEHAVIOR_1K_DATASET_REPOSITORY
 UV_VERSION = "0.8.22"
 TRAINER_LOCK_SHA256 = "67fcd520cd75f3b3b383fcc887f244c332af5c2a5548d384d71e0376697b2432"
 _SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -124,6 +132,7 @@ class ReleaseManifest:
                 "uv_version",
                 "isaac_groot",
                 "base_model",
+                "cosmos",
                 "dataset",
                 "trainer_lock_sha256",
                 "repository_commit",
@@ -132,7 +141,7 @@ class ReleaseManifest:
             },
             "root",
         )
-        if type(root["schema_version"]) is not int or root["schema_version"] != 1:
+        if type(root["schema_version"]) is not int or root["schema_version"] != 2:
             raise ValueError("release manifest schema version is unsupported")
         status = _string(root["status"], "status")
         if status not in {"unreleased", "accepted"}:
@@ -151,6 +160,9 @@ class ReleaseManifest:
         model = _exact_keys(root["base_model"], {"repository", "revision"}, "base_model")
         if model["repository"] != MODEL_REPOSITORY or model["revision"] != MODEL_REVISION:
             raise ValueError("release manifest model identity differs from the approved revision")
+        cosmos = _exact_keys(root["cosmos"], {"repository", "revision"}, "cosmos")
+        if cosmos["repository"] != COSMOS_REPOSITORY or cosmos["revision"] != COSMOS_REVISION:
+            raise ValueError("release manifest Cosmos identity differs from the approved revision")
 
         dataset = _exact_keys(
             root["dataset"],
@@ -164,13 +176,20 @@ class ReleaseManifest:
             dataset["manifest_sha256"],
             dataset["normalization_sha256"],
         )
-        if any(value is not None for value in dataset_identity):
+        has_dataset_artifact_identity = any(
+            value is not None for value in dataset_identity[1:]
+        )
+        if has_dataset_artifact_identity:
             if type(dataset["revision"]) is not str or not _SHA.fullmatch(dataset["revision"]):
                 raise ValueError("release manifest dataset revision is not immutable")
+            if dataset["revision"] != BEHAVIOR_1K_DATASET_REVISION:
+                raise ValueError("release manifest dataset revision differs from the approved B1K commit")
             for key in ("manifest_sha256", "normalization_sha256"):
                 value = dataset[key]
                 if type(value) is not str or not _SHA256.fullmatch(value):
                     raise ValueError(f"release manifest dataset {key} is invalid")
+        elif dataset["revision"] not in {None, BEHAVIOR_1K_DATASET_REVISION}:
+            raise ValueError("release manifest dataset revision differs from the approved B1K commit")
 
         lock_hash = _string(root["trainer_lock_sha256"], "trainer lock hash")
         repository_commit = root["repository_commit"]
@@ -197,13 +216,31 @@ class ReleaseManifest:
             root["gpu_acceptance"],
             {
                 "status",
-                "hardware",
-                "network_gbps",
-                "image_pull_seconds",
-                "first_optimizer_step_seconds",
-                "memorization_passed",
-                "batches_tested_sequentially",
-                "training_768k_started_or_resumed",
+                "run_id",
+                "world_size",
+                "launch_plan_id",
+                "effective_global_batch_size",
+                "physical_batch_size",
+                "global_batch_size",
+                "gradient_accumulation_steps",
+                "task_manifest_sha256",
+                "modality_sha256",
+                "stats_sha256",
+                "base_model_revision",
+                "cosmos_revision",
+                "learning_rate",
+                "warmup_ratio",
+                "launch_arguments_sha256",
+                "launch_arguments",
+                "hardware_model",
+                "hardware_count",
+                "vram_gib",
+                "cuda_optimizer_step_passed",
+                "checkpoint_roundtrip_passed",
+                "resume_passed",
+                "tiny_overfit_passed",
+                "finite_loss",
+                "acceptance_seconds",
                 "evidence_uri",
             },
             "gpu_acceptance",
@@ -211,15 +248,6 @@ class ReleaseManifest:
         acceptance_status = _string(acceptance["status"], "GPU acceptance status")
         if acceptance_status not in {"pending", "passed"}:
             raise ValueError("release manifest GPU acceptance status is unsupported")
-        network = _optional_number(acceptance["network_gbps"], "network bandwidth")
-        first_step = _optional_number(
-            acceptance["first_optimizer_step_seconds"], "first optimizer step time"
-        )
-        image_pull = _optional_number(acceptance["image_pull_seconds"], "image pull time")
-        batches = acceptance["batches_tested_sequentially"]
-        if not isinstance(batches, list) or any(type(item) is not int for item in batches):
-            raise ValueError("release manifest smoke batches must be an integer array")
-
         if status == "accepted":
             if repository_commit is None:
                 raise ValueError("accepted release manifest requires an immutable repository commit")
@@ -229,21 +257,47 @@ class ReleaseManifest:
                 raise ValueError("accepted release manifest requires passed GPU acceptance")
             if any(value is None for value in dataset_identity):
                 raise ValueError("accepted release manifest requires immutable dataset evidence")
-            hardware = _string(acceptance["hardware"], "GPU hardware")
-            if "RTX PRO 6000" not in hardware:
-                raise ValueError("accepted release manifest requires fresh RTX PRO 6000 evidence")
-            if network is None or network < 1.0:
-                raise ValueError("GPU acceptance requires at least 1 Gbps bandwidth")
-            if image_pull is None or image_pull <= 0:
-                raise ValueError("GPU acceptance requires measured image pull timing")
-            if first_step is None or first_step > 1800:
-                raise ValueError("GPU acceptance must reach the first optimizer step in 30 minutes")
-            if acceptance["memorization_passed"] is not True:
-                raise ValueError("GPU acceptance requires one-episode memorization")
-            if batches != [16, 32, 64]:
-                raise ValueError("GPU acceptance requires sequential batches 16, 32, and 64")
-            if acceptance["training_768k_started_or_resumed"] is not True:
-                raise ValueError("GPU acceptance requires starting or resuming the 768k run")
+            world_size = acceptance["world_size"]
+            if type(world_size) is not int or world_size not in SUPPORTED_GPU_COUNTS:
+                raise ValueError("GPU acceptance world size must be one to four")
+            plans = approved_launch_plans(num_gpus=world_size)
+            plan = next((item for item in plans if item.identity == acceptance["launch_plan_id"]), None)
+            if plan is None:
+                raise ValueError("GPU acceptance launch plan is not approved")
+            if acceptance["effective_global_batch_size"] != plan.effective_global_batch_size:
+                raise ValueError("GPU acceptance effective batch differs from the launch plan")
+            if (acceptance["physical_batch_size"], acceptance["global_batch_size"], acceptance["gradient_accumulation_steps"]) != (plan.physical_batch_size, plan.global_batch_size, plan.gradient_accumulation_steps):
+                raise ValueError("GPU acceptance optimizer fields differ from the launch plan")
+            if acceptance["task_manifest_sha256"] != dataset["manifest_sha256"]:
+                raise ValueError("GPU acceptance manifest identity differs from the dataset")
+            if acceptance["stats_sha256"] != dataset["normalization_sha256"]:
+                raise ValueError("GPU acceptance stats identity differs from the dataset")
+            if acceptance["modality_sha256"] != "ca3a2e406472650bee9439ed81a3f4a1531b6fe689cdc1b348d0f260a208e641":
+                raise ValueError("GPU acceptance modality fingerprint differs from R1Pro")
+            if acceptance["base_model_revision"] != MODEL_REVISION:
+                raise ValueError("GPU acceptance base model revision differs from the pin")
+            if acceptance["cosmos_revision"] != COSMOS_REVISION:
+                raise ValueError("GPU acceptance Cosmos revision differs from the pin")
+            if acceptance["learning_rate"] != 1e-4 or acceptance["warmup_ratio"] != 0.05:
+                raise ValueError("GPU acceptance learning schedule differs from the launch contract")
+            if type(acceptance["launch_arguments_sha256"]) is not str or not _SHA256.fullmatch(acceptance["launch_arguments_sha256"]):
+                raise ValueError("GPU acceptance launch arguments hash is invalid")
+            run_id = acceptance["run_id"]
+            if type(run_id) is not str or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", run_id):
+                raise ValueError("GPU acceptance run_id is unsafe")
+            expected_command = build_b1k_command(
+                plan, checkout="/opt/isaac-groot", dataset_path="/workspace/data/b1k",
+                base_model_path="/workspace/models/groot", output_dir=f"/workspace/outputs/{run_id}",
+                experiment_name=run_id, resume_from_checkpoint=False,
+            )
+            if acceptance["launch_arguments"] != list(expected_command) or canonical_json_sha256(expected_command) != acceptance["launch_arguments_sha256"]:
+                raise ValueError("GPU acceptance launch arguments differ from their hash")
+            if acceptance["hardware_model"] not in {"NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"} or type(acceptance["hardware_count"]) is not int or acceptance["hardware_count"] != world_size or acceptance["vram_gib"] != 96:
+                raise ValueError("GPU acceptance hardware evidence is invalid")
+            if any(acceptance[key] is not True for key in ("cuda_optimizer_step_passed", "checkpoint_roundtrip_passed", "resume_passed", "tiny_overfit_passed", "finite_loss")):
+                raise ValueError("GPU acceptance required checks must pass")
+            if type(acceptance["acceptance_seconds"]) not in (int, float) or acceptance["acceptance_seconds"] <= 0 or acceptance["acceptance_seconds"] > 1800:
+                raise ValueError("GPU acceptance timing must be positive and bounded")
             evidence_uri = _string(acceptance["evidence_uri"], "GPU evidence URI")
             parsed_evidence = urlsplit(evidence_uri)
             if (
@@ -261,13 +315,31 @@ class ReleaseManifest:
             raise ValueError("unreleased manifest cannot claim passed GPU acceptance")
         elif any(
             (
-                acceptance["hardware"] is not None,
-                network is not None,
-                acceptance["image_pull_seconds"] is not None,
-                first_step is not None,
-                acceptance["memorization_passed"] is not False,
-                batches != [],
-                acceptance["training_768k_started_or_resumed"] is not False,
+                acceptance["world_size"] is not None,
+                acceptance["run_id"] is not None,
+                acceptance["launch_plan_id"] is not None,
+                acceptance["effective_global_batch_size"] is not None,
+                acceptance["physical_batch_size"] is not None,
+                acceptance["global_batch_size"] is not None,
+                acceptance["gradient_accumulation_steps"] is not None,
+                acceptance["task_manifest_sha256"] is not None,
+                acceptance["modality_sha256"] is not None,
+                acceptance["stats_sha256"] is not None,
+                acceptance["base_model_revision"] is not None,
+                acceptance["cosmos_revision"] is not None,
+                acceptance["learning_rate"] is not None,
+                acceptance["warmup_ratio"] is not None,
+                acceptance["launch_arguments_sha256"] is not None,
+                acceptance["launch_arguments"] is not None,
+                acceptance["hardware_model"] is not None,
+                acceptance["hardware_count"] is not None,
+                acceptance["vram_gib"] is not None,
+                acceptance["cuda_optimizer_step_passed"] is not None,
+                acceptance["checkpoint_roundtrip_passed"] is not None,
+                acceptance["resume_passed"] is not None,
+                acceptance["tiny_overfit_passed"] is not None,
+                acceptance["finite_loss"] is not None,
+                acceptance["acceptance_seconds"] is not None,
                 acceptance["evidence_uri"] is not None,
             )
         ):
@@ -305,13 +377,13 @@ def pending_manifest(
     repository_commit: str,
     trainer_lock_sha256: str,
     oci_digest: str | None,
-    dataset_revision: str | None = None,
+    dataset_revision: str | None = BEHAVIOR_1K_DATASET_REVISION,
     dataset_manifest_sha256: str | None = None,
     normalization_sha256: str | None = None,
 ) -> ReleaseManifest:
     return ReleaseManifest.from_dict(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "unreleased",
             "platform": "linux/amd64",
             "cuda_base": {"image": CUDA_BASE_IMAGE, "digest": CUDA_BASE_DIGEST},
@@ -322,6 +394,7 @@ def pending_manifest(
                 "commit": ISAAC_GROOT_REVISION,
             },
             "base_model": {"repository": MODEL_REPOSITORY, "revision": MODEL_REVISION},
+            "cosmos": {"repository": COSMOS_REPOSITORY, "revision": COSMOS_REVISION},
             "dataset": {
                 "repository": DATASET_REPOSITORY,
                 "revision": dataset_revision,
@@ -337,13 +410,31 @@ def pending_manifest(
             },
             "gpu_acceptance": {
                 "status": "pending",
-                "hardware": None,
-                "network_gbps": None,
-                "image_pull_seconds": None,
-                "first_optimizer_step_seconds": None,
-                "memorization_passed": False,
-                "batches_tested_sequentially": [],
-                "training_768k_started_or_resumed": False,
+                "run_id": None,
+                "world_size": None,
+                "launch_plan_id": None,
+                "effective_global_batch_size": None,
+                "physical_batch_size": None,
+                "global_batch_size": None,
+                "gradient_accumulation_steps": None,
+                "task_manifest_sha256": None,
+                "modality_sha256": None,
+                "stats_sha256": None,
+                "base_model_revision": None,
+                "cosmos_revision": None,
+                "learning_rate": None,
+                "warmup_ratio": None,
+                "launch_arguments_sha256": None,
+                "launch_arguments": None,
+                "hardware_model": None,
+                "hardware_count": None,
+                "vram_gib": None,
+                "cuda_optimizer_step_passed": None,
+                "checkpoint_roundtrip_passed": None,
+                "resume_passed": None,
+                "tiny_overfit_passed": None,
+                "finite_loss": None,
+                "acceptance_seconds": None,
                 "evidence_uri": None,
             },
         }
@@ -355,7 +446,7 @@ def main() -> None:
     parser.add_argument("--repository-commit", required=True)
     parser.add_argument("--trainer-lock-path", required=True)
     parser.add_argument("--oci-digest")
-    parser.add_argument("--dataset-revision")
+    parser.add_argument("--dataset-revision", default=BEHAVIOR_1K_DATASET_REVISION)
     parser.add_argument("--dataset-manifest-sha256")
     parser.add_argument("--normalization-sha256")
     parser.add_argument("--output", required=True)

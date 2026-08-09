@@ -151,13 +151,15 @@ From a clean repository root:
 
 ```bash
 trainer/scripts/build-image.sh
-trainer/scripts/verify-image.sh
+REPOSITORY_COMMIT=<40-character-source-commit> \
+  trainer/scripts/verify-image.sh \
+  docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:<digest>
 ```
 
 The build uses only `linux/amd64`, the digest-pinned CUDA 12.8.1 base, Python
 3.10.18, uv 0.8.22 with a checked archive hash, the frozen trainer and upstream
 locks, and Isaac-GR00T commit
-`23ace64f17aa5015259b8609d371eb61a357c776`. The default tag is the full local
+`ace36d935b376fbf25cd56371e23877b95407c40`. The default tag is the full local
 Git commit. A dirty checkout is rejected unless `ALLOW_DIRTY=1` is explicitly
 used for a non-release diagnostic build.
 
@@ -185,7 +187,9 @@ visible GPU and performs one real AdamW optimizer step over a synthetic
 `TensorDataset`:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 trainer/scripts/verify-image.sh --gpu <image>@sha256:<digest>
+REPOSITORY_COMMIT=<40-lowercase-source-commit> \
+  CUDA_VISIBLE_DEVICES=0 trainer/scripts/verify-image.sh --gpu \
+  docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:<64-lowercase-hex>
 ```
 
 This one-step gate is not the fresh-machine release acceptance below.
@@ -200,7 +204,7 @@ manifest and that accepted manifest has been committed.
 On a fresh Linux x86_64 RTX PRO 6000 96 GB rental:
 
 1. Measure download bandwidth and require at least 1 Gbps. Record the result.
-2. Pull the exact `ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:<digest>`
+2. Pull the exact `docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:<digest>`
    and record a positive pull duration in seconds. Never accept a tag as
    experiment identity.
 3. Mount fresh `/cache`, `/prepared`, and `/output` volumes. Inject `HF_TOKEN`

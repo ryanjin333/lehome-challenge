@@ -1,0 +1,9 @@
+[project]
+name = "b1k-bucket-helper"
+version = "0.1.0"
+requires-python = "==3.10.18"
+dependencies = ["huggingface-hub==1.24.0"]
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"

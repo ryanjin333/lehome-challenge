@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1.7
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04@sha256:61f6c08f2b59036cb935e56d1e31a6b64e3ae2c7ddb86d33fa0b044c7917b719
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04@sha256:61f6c08f2b59036cb935e56d1e31a6b64e3ae2c7ddb86d33fa0b044c7917b719 AS training-build
 
 ARG UV_VERSION=0.8.22
 ARG UV_SHA256=741ff1f5742c5a4a25d2f829e8395355e43f7a5ae2ebc6368e9ae2df0efb69cf
 ARG PYTHON_VERSION=3.10.18
 ARG UBUNTU_SNAPSHOT=20260701T000000Z
-ARG ISAAC_GROOT_REVISION=23ace64f17aa5015259b8609d371eb61a357c776
+ARG ISAAC_GROOT_REVISION=ace36d935b376fbf25cd56371e23877b95407c40
 ARG REPOSITORY_COMMIT
 
 LABEL org.opencontainers.image.source="https://github.com/lehome-official/lehome-challenge" \
@@ -48,7 +48,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 WORKDIR /opt/isaac-groot
 RUN git init . \
-    && git remote add origin https://github.com/NVIDIA/Isaac-GR00T.git \
+    && git remote add origin https://github.com/wensi-ai/Isaac-GR00T.git \
     && git fetch --depth=1 origin "${ISAAC_GROOT_REVISION}" \
     && GIT_LFS_SKIP_SMUDGE=1 git checkout --detach FETCH_HEAD \
     && git ls-files -z -- '*.safetensors' '*.ckpt' '*.parquet' '*.mp4' '*.gif' '*.whl' \
@@ -60,6 +60,11 @@ RUN git init . \
     && rm -f /tmp/isaac-groot-artifacts \
     && test "$(git rev-parse HEAD)" = "${ISAAC_GROOT_REVISION}" \
     && test -z "$(git status --porcelain=v1 --untracked-files=all)" \
+    && test -f scripts/b1k/train_b1k.py \
+    && test -f scripts/b1k/deploy_modality.py \
+    && test -f examples/b1k/r1pro.py \
+    && test -f examples/b1k/r1pro.json \
+    && test -f gr00t/data/dataset/lerobot_episode_loader.py \
     && uv sync --frozen --no-dev --no-install-project --no-cache \
     && git config --system --add safe.directory /opt/isaac-groot
 
@@ -77,17 +82,36 @@ RUN uv lock --check \
     && rm -f /tmp/trainer-requirements.txt
 COPY trainer/src ./src
 COPY trainer/config ./config
+COPY trainer/scripts/verify-b1k-cli.py /usr/local/bin/verify-b1k-cli
+COPY trainer/b1k_launchkit/onstart.sh /opt/b1k-launchkit/onstart.sh
+COPY trainer/b1k_launchkit/token_bootstrap.py /opt/b1k-launchkit/token_bootstrap.py
+COPY trainer/b1k_launchkit/training_smoke.py /opt/b1k-launchkit/training_smoke.py
+COPY trainer/b1k_launchkit/bucket_helper/pyproject.toml trainer/b1k_launchkit/bucket_helper/uv.lock /opt/b1k-bucket-helper-src/
+COPY trainer/b1k_launchkit/bucket_helper/b1k-bucket-helper /opt/b1k-bucket-helper-src/b1k-bucket-helper
 COPY trainer/docker/entrypoint.sh /usr/local/bin/lehome-entrypoint
 RUN uv pip install --python /opt/runtime/bin/python --no-deps /opt/trainer \
     && uv pip check --python /opt/runtime/bin/python \
     && test "$(/opt/runtime/bin/python -c 'import platform; print(platform.python_version())')" = "${PYTHON_VERSION}" \
     && test "$(git -C /opt/isaac-groot rev-parse HEAD)" = "${ISAAC_GROOT_REVISION}" \
     && /opt/runtime/bin/lehome-train --help >/dev/null \
+    && chmod 0755 /usr/local/bin/verify-b1k-cli \
+    && cd /opt/b1k-bucket-helper-src \
+    && UV_PROJECT_ENVIRONMENT=/opt/b1k-bucket-helper uv sync --frozen --no-dev --no-install-project --python /opt/runtime/bin/python \
+    && install -D -m 0755 /opt/b1k-bucket-helper-src/b1k-bucket-helper /opt/b1k-bucket-helper/libexec/b1k-bucket-helper \
+    && printf '%s\n' '#!/bin/sh' 'exec /opt/b1k-bucket-helper/bin/python /opt/b1k-bucket-helper/libexec/b1k-bucket-helper "$@"' > /opt/b1k-bucket-helper/bin/b1k-bucket-helper \
+    && chmod 0755 /opt/b1k-bucket-helper/bin/b1k-bucket-helper \
     && groupadd --gid 10001 trainer \
-    && useradd --uid 10001 --gid trainer --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin trainer \
+    && useradd --uid 10001 --gid trainer --create-home --home-dir /home/trainer --shell /bin/bash trainer \
+    && install -o trainer -g trainer -m 0640 /dev/null /home/trainer/.bashrc \
+    && chmod 0750 /home/trainer \
     && install -d -o trainer -g trainer -m 0750 /opt/isaac-groot/.git/lfs/tmp \
     && install -d -o trainer -g trainer -m 0750 /cache /prepared /output \
+    && install -d -o trainer -g trainer -m 0750 /cache/tmp \
+    && install -d -o trainer -g trainer -m 0750 /workspace/data/b1k /workspace/models/groot-upstream /workspace/models/cosmos /workspace/models/groot /workspace/checkpoints /workspace/logs /workspace/final /workspace/outputs \
+    && chmod 0755 /opt/b1k-launchkit/onstart.sh /opt/b1k-launchkit/token_bootstrap.py /opt/b1k-launchkit/training_smoke.py \
     && chmod 0755 /usr/local/bin/lehome-entrypoint
+
+FROM training-build AS training-runtime
 
 ENV PATH=/opt/runtime/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin \
     VIRTUAL_ENV=/opt/runtime \
@@ -101,7 +125,7 @@ ENV PATH=/opt/runtime/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin \
     TORCH_HOME=/cache/torch \
     WANDB_DIR=/output/wandb \
     TMPDIR=/cache/tmp \
-    HOME=/nonexistent \
+    HOME=/home/trainer \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 

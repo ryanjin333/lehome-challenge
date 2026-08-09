@@ -7,36 +7,58 @@
     "digest": "sha256:61f6c08f2b59036cb935e56d1e31a6b64e3ae2c7ddb86d33fa0b044c7917b719",
     "image": "nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04"
   },
+  "cosmos": {
+    "repository": "nvidia/Cosmos-Reason2-2B",
+    "revision": "9ce19a195e423419c349abfc86fd07178b230561"
+  },
   "dataset": {
     "manifest_sha256": null,
     "normalization_sha256": null,
-    "repository": "ryanjin333/lehome-groot-n17-data",
-    "revision": null
+    "repository": "behavior-1k/2026-challenge-demos",
+    "revision": "4f50b44796641a4d526a19d9aeadc8aa51e2f2c2"
   },
   "gpu_acceptance": {
-    "batches_tested_sequentially": [],
     "evidence_uri": null,
-    "first_optimizer_step_seconds": null,
-    "hardware": null,
-    "image_pull_seconds": null,
-    "memorization_passed": false,
-    "network_gbps": null,
-    "status": "pending",
-    "training_768k_started_or_resumed": false
+    "run_id": null,
+    "world_size": null,
+    "launch_plan_id": null,
+    "effective_global_batch_size": null,
+    "physical_batch_size": null,
+    "global_batch_size": null,
+    "gradient_accumulation_steps": null,
+    "task_manifest_sha256": null,
+    "modality_sha256": null,
+    "stats_sha256": null,
+    "base_model_revision": null,
+    "cosmos_revision": null,
+    "learning_rate": null,
+    "warmup_ratio": null,
+    "launch_arguments_sha256": null,
+    "launch_arguments": null,
+    "hardware_model": null,
+    "hardware_count": null,
+    "vram_gib": null,
+    "cuda_optimizer_step_passed": null,
+    "checkpoint_roundtrip_passed": null,
+    "resume_passed": null,
+    "tiny_overfit_passed": null,
+    "finite_loss": null,
+    "acceptance_seconds": null,
+    "status": "pending"
   },
   "image": {
     "digest": null,
-    "repository": "ghcr.io/ryanjin333/lehome-groot-n17-trainer",
+    "repository": "docker.io/ryanjin333/behavior1k-groot-n17-trainer",
     "tag": null
   },
   "isaac_groot": {
-    "commit": "23ace64f17aa5015259b8609d371eb61a357c776",
-    "repository": "https://github.com/NVIDIA/Isaac-GR00T.git"
+    "commit": "ace36d935b376fbf25cd56371e23877b95407c40",
+    "repository": "https://github.com/wensi-ai/Isaac-GR00T.git"
   },
   "platform": "linux/amd64",
   "python_version": "3.10.18",
   "repository_commit": null,
-  "schema_version": 1,
+  "schema_version": 2,
   "status": "unreleased",
   "trainer_lock_sha256": "67fcd520cd75f3b3b383fcc887f244c332af5c2a5548d384d71e0376697b2432",
   "uv_version": "0.8.22"

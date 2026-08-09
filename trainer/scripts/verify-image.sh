@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-repo_root=$(cd -- "$script_dir/../.." && pwd)
 mode=cpu
 expected_release_mode=release
 while [[ "${1:-}" == --* ]]; do
@@ -14,10 +12,18 @@ while [[ "${1:-}" == --* ]]; do
   shift
 done
 
-repository_commit=$(git -C "$repo_root" rev-parse HEAD)
-image_ref=${1:-${IMAGE_REPOSITORY:-lehome-groot-n17-trainer}:$repository_commit}
+repository_commit=${REPOSITORY_COMMIT:?REPOSITORY_COMMIT must be the immutable source revision}
+if ! [[ "$repository_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "REPOSITORY_COMMIT must be a lowercase source revision" >&2
+  exit 64
+fi
+image_ref=${1:-}
+if ! [[ "$image_ref" =~ ^docker\.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:[0-9a-f]{64}$ ]]; then
+  echo "image must be the canonical Docker Hub digest reference" >&2
+  exit 64
+fi
 expected_base=sha256:61f6c08f2b59036cb935e56d1e31a6b64e3ae2c7ddb86d33fa0b044c7917b719
-expected_groot=23ace64f17aa5015259b8609d371eb61a357c776
+expected_groot=ace36d935b376fbf25cd56371e23877b95407c40
 expected_model=2fc962b973bccdd5d8ce4f67cc63b264d6886495
 
 actual_user=$(docker image inspect --format '{{.Config.User}}' "$image_ref")
@@ -52,6 +58,21 @@ if docker image inspect --format '{{json .Config.Env}}' "$image_ref" \
   exit 1
 fi
 
+docker run --rm --platform linux/amd64 --entrypoint /bin/bash "$image_ref" -euo pipefail -c '
+  test "$TMPDIR" = /cache/tmp
+  test -d "$TMPDIR"
+  test -w "$TMPDIR"
+  probe=$(mktemp)
+  [[ "$probe" == /cache/tmp/* ]]
+  rm -f "$probe"
+  test "$HOME" = /home/trainer
+  test -d "$HOME"
+  test -w "$HOME"
+  test -w "$HOME/.bashrc"
+  test "$(getent passwd "$(id -un)" | cut -d: -f6-7)" = "/home/trainer:/bin/bash"
+  printf "\n" >> "$HOME/.bashrc"
+'
+
 mount_root=$(mktemp -d)
 mkdir -p "$mount_root/cache" "$mount_root/prepared" "$mount_root/output"
 chmod 0777 "$mount_root/cache" "$mount_root/prepared" "$mount_root/output"
@@ -79,11 +100,24 @@ run=(docker run --rm --platform linux/amd64
   test "$(id -u)" -ne 0
   test "$(python -c '\''import platform; print(platform.python_version())'\'')" = 3.10.18
   python -c '\''import gr00t, lehome_train, torch'\''
-  test "$(git -C /opt/isaac-groot rev-parse HEAD)" = 23ace64f17aa5015259b8609d371eb61a357c776
+  test "$(/opt/runtime/bin/python -c '\''import huggingface_hub; print(huggingface_hub.__version__)'\'')" = 0.36.2
+  test "$(/opt/b1k-bucket-helper/bin/python -c '\''import platform; print(platform.python_version())'\'')" = 3.10.18
+  test "$(/opt/b1k-bucket-helper/bin/python -c '\''import huggingface_hub; print(huggingface_hub.__version__)'\'')" = 1.24.0
+  test -x /opt/b1k-bucket-helper/bin/b1k-bucket-helper
+  grep -Fxq "exec /opt/b1k-bucket-helper/bin/python /opt/b1k-bucket-helper/libexec/b1k-bucket-helper \"\$@\"" /opt/b1k-bucket-helper/bin/b1k-bucket-helper
+  test "$(git -C /opt/isaac-groot rev-parse HEAD)" = ace36d935b376fbf25cd56371e23877b95407c40
   test -z "$(git -C /opt/isaac-groot status --porcelain=v1 --untracked-files=all)"
+  test -f /opt/isaac-groot/scripts/b1k/train_b1k.py
+  test -f /opt/isaac-groot/scripts/b1k/deploy_modality.py
+  test -f /opt/isaac-groot/examples/b1k/r1pro.py
+  test -f /opt/isaac-groot/examples/b1k/r1pro.json
+  test -f /opt/isaac-groot/gr00t/data/dataset/lerobot_episode_loader.py
+  /opt/runtime/bin/python /opt/isaac-groot/scripts/b1k/train_b1k.py --help >/dev/null
+  /usr/local/bin/verify-b1k-cli
   lehome-train --help >/dev/null
   test ! -e /isaac-sim
   test ! -e /IsaacLab
+  test ! -e /OmniGibson
   test ! -e /models
   test ! -e /data
   large_file=$(find /opt/trainer /opt/isaac-groot -type f -size +50M -print -quit)
