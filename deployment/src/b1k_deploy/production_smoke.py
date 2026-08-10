@@ -7,6 +7,7 @@ destroy target, and only reconciles a create by its exact run label.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -54,6 +55,8 @@ _REGISTRY_TOKEN_RE = re.compile(r"^[^\s'\"\\]{8,8192}$")
 _HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\d{1,3}(?:\.\d{1,3}){3})$")
 _MAX_TOOL_TIMEOUT = 55
 _TEMPLATE_CREATE_RESULT_RE = re.compile(r"^New Template: ([1-9][0-9]*)$")
+_MAX_TEMPLATE_CREATE_RESULT_BYTES = 65536
+_MAX_TEMPLATE_DELETE_RESULT_BYTES = 4096
 _TEMPLATE_RECONCILIATION_ATTEMPTS = 3
 _VAST_CREATE_URL = "https://console.vast.ai/api/v0/asks/{offer_id}/"
 
@@ -341,7 +344,7 @@ class VastCliSmokeClient:
             raise ProductionSmokeError("only an exact ephemeral smoke template may be deleted")
         if canonical_payload_hash(row) != template.payload_hash or row.get("image") != template.image_release.reference:
             raise ProductionSmokeError("ephemeral smoke template receipt drifted before deletion")
-        self._json((str(self._vastai), "--raw", "destroy", "template", template_id), self._timeout)
+        self._delete_template(template_id)
         matches = [item for item in self._rows((str(self._vastai), "--raw", "search", "templates", f"id=={template_id}")) if _exact_id(item.get("id")) == template_id]
         if matches:
             raise ProductionSmokeError("ephemeral smoke template absence was not verified")
@@ -369,9 +372,7 @@ class VastCliSmokeClient:
 
         exact_ids = tuple(sorted(_exact_id(template_id) for template_id in template_ids))
         for template_id in exact_ids:
-            attempt(lambda template_id=template_id: self._json(
-                (str(self._vastai), "--raw", "destroy", "template", template_id), self._timeout
-            ))
+            attempt(lambda template_id=template_id: self._delete_template(template_id))
         for template_id in exact_ids:
             def prove_id_absent(template_id: str = template_id) -> None:
                 rows = self._rows((str(self._vastai), "--raw", "search", "templates", f"id=={template_id}"))
@@ -386,6 +387,33 @@ class VastCliSmokeClient:
         attempt(prove_name_absent)
         if cleanup_error is not None:
             raise cleanup_error
+
+    def _delete_template(self, template_id: str) -> None:
+        """Delete one exact template without assuming Vast's text output is JSON."""
+        exact = _exact_id(template_id)
+        arguments = (str(self._vastai), "--raw", "delete", "template", "--template-id", exact)
+        try:
+            result = self._runner.run(arguments, stdin=None, env=_vast_environment(), timeout=self._timeout)
+        except Exception:
+            raise ProductionSmokeError("Vast template deletion failed") from None
+        if (
+            not isinstance(result, CommandResult)
+            or result.returncode != 0
+            or not isinstance(result.stdout, str)
+            or not isinstance(result.stderr, str)
+            or bool(result.stderr.strip())
+        ):
+            raise ProductionSmokeError("Vast template deletion failed")
+        line = result.stdout[:-1] if result.stdout.endswith("\n") else result.stdout
+        if line.endswith("\r"):
+            line = line[:-1]
+        if (
+            not line
+            or "\n" in line
+            or len(line.encode("utf-8")) > _MAX_TEMPLATE_DELETE_RESULT_BYTES
+            or line.casefold().startswith(("error", "the response is not valid json"))
+        ):
+            raise ProductionSmokeError("Vast template deletion failed")
 
     def _template_registry_repo(self, template_id: str) -> str:
         expected = _exact_id(template_id)
@@ -472,9 +500,18 @@ class VastCliSmokeClient:
         if line.endswith("\r"):
             line = line[:-1]
         match = _TEMPLATE_CREATE_RESULT_RE.fullmatch(line)
-        if match is None:
+        if match is not None:
+            return _exact_id(match.group(1))
+        prefix = "New Template: "
+        if not line.startswith(prefix) or len(line.encode("utf-8")) > _MAX_TEMPLATE_CREATE_RESULT_BYTES:
             raise ProductionSmokeError("Vast template creation returned no exact template ID")
-        return _exact_id(match.group(1))
+        try:
+            payload = ast.literal_eval(line.removeprefix(prefix))
+        except (MemoryError, RecursionError, SyntaxError, ValueError):
+            raise ProductionSmokeError("Vast template creation returned no exact template ID") from None
+        if not isinstance(payload, Mapping):
+            raise ProductionSmokeError("Vast template creation returned no exact template ID")
+        return _exact_id(payload.get("id"))
 
     @staticmethod
     def _tool_timeout(timeout_seconds: int) -> int:

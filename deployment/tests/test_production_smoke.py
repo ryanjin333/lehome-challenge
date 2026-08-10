@@ -130,6 +130,8 @@ class VastRunner:
             payload = self.instances
         elif arguments[2:4] == ("destroy", "instance"):
             payload = {"success": True}
+        elif arguments[2:4] == ("delete", "template"):
+            return CommandResult(0, "Template deleted successfully\n", "")
         else:
             raise AssertionError(arguments)
         return CommandResult(0, json.dumps(payload), "")
@@ -543,6 +545,7 @@ def test_private_registry_reference_rejects_missing_or_unapproved_values(
     ("stdout", "expected"),
     [
         ("New Template: 456\n", "456"),
+        ("New Template: {'name': 'b1k-training-smoke', 'id': 456}\n", "456"),
         ("{\"id\":456}\n", None),
         ("new Template: 456\n", None),
         ("New Template: 456\nextra\n", None),
@@ -559,6 +562,45 @@ def test_template_create_parser_accepts_only_the_documented_anchored_raw_line(
             client._create_template_id(("create", "template"))
     else:
         assert client._create_template_id(("create", "template")) == expected
+
+
+def test_destroy_ephemeral_template_uses_current_exact_vast_delete_syntax(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+    payload = {
+        **runner.template,
+        "name": "b1k-training-smoke-" + "c" * 32,
+    }
+    receipt = SmokeTemplatePublicationReceipt(
+        "456", training_release(payload["image"]), canonical_payload_hash(payload)
+    )
+    monkeypatch.setattr(client, "_template_readback", lambda _template_id: payload)
+    monkeypatch.setattr(client, "_rows", lambda *_args, **_kwargs: [])
+
+    client.destroy_ephemeral_smoke_template(receipt)
+
+    assert runner.calls == [
+        ((str(tmp_path / "vastai"), "--raw", "delete", "template", "--template-id", "456"), 30)
+    ]
+
+
+@pytest.mark.parametrize(
+    "result",
+    (
+        CommandResult(0, "Error: provider refused deletion\n", ""),
+        CommandResult(0, "Template deleted successfully\n", "provider warning\n"),
+        CommandResult(0, "", ""),
+    ),
+)
+def test_template_delete_rejects_vast_zero_exit_errors_and_missing_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, result: CommandResult
+) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+    monkeypatch.setattr(runner, "run", lambda *_args, **_kwargs: result)
+
+    with pytest.raises(ProductionSmokeError, match="template deletion failed"):
+        client._delete_template("456")
 
 
 def test_ephemeral_template_create_id_with_failed_readback_is_destroyed_and_proven_absent(
@@ -588,7 +630,10 @@ def test_ephemeral_template_create_id_with_failed_readback_is_destroyed_and_prov
     with pytest.raises(ProductionSmokeError, match="readback failed"):
         client.create_ephemeral_smoke_template("training", production, name=name)
 
-    assert any(command[-1] == "456" for command in commands if command[:4] == (str(tmp_path / "vastai"), "--raw", "destroy", "template"))
+    assert any(
+        call == (str(tmp_path / "vastai"), "--raw", "delete", "template", "--template-id", "456")
+        for call, _timeout in runner.calls
+    )
     assert f"id==456" in queries
     assert f"name=={name}" in queries
 
@@ -621,7 +666,10 @@ def test_ephemeral_template_create_error_reconciles_exact_name_and_preserves_pri
     with pytest.raises(ProductionSmokeError, match="create response lost"):
         client.create_ephemeral_smoke_template("training", production, name=name)
 
-    assert any(command[-1] == "456" for command in commands if command[:4] == (str(tmp_path / "vastai"), "--raw", "destroy", "template"))
+    assert any(
+        call == (str(tmp_path / "vastai"), "--raw", "delete", "template", "--template-id", "456")
+        for call, _timeout in runner.calls
+    )
     assert f"id==456" in queries
     assert f"name=={name}" in queries
 
@@ -657,7 +705,10 @@ def test_ephemeral_template_create_id_is_cleaned_when_name_reconciliation_fails(
     with pytest.raises(ProductionSmokeError, match="provider name readback lost"):
         client.create_ephemeral_smoke_template("training", production, name=name)
 
-    assert any(command[-1] == "456" for command in commands if command[:4] == (str(tmp_path / "vastai"), "--raw", "destroy", "template"))
+    assert any(
+        call == (str(tmp_path / "vastai"), "--raw", "delete", "template", "--template-id", "456")
+        for call, _timeout in runner.calls
+    )
     assert name_reads > 1
 
 
