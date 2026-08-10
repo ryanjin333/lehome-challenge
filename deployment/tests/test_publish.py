@@ -909,7 +909,7 @@ def test_fixed_buildx_builder_uses_private_inline_auth_and_exact_amd64_release_a
     )
     assert ("--target", "training-runtime") in zip(build[0], build[0][1:])
     assert ("--label", "io.lehome.release-mode=release") in zip(build[0], build[0][1:])
-    assert build[3] == 1800.0
+    assert build[3] == 7200.0
 
 
 def test_buildx_plugin_discovery_derives_the_homebrew_prefix_from_the_resolved_docker_executable(tmp_path):

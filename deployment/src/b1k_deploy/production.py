@@ -30,7 +30,7 @@ _SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _TEMPLATE_ID_RE = re.compile(r"^[1-9][0-9]*$")
-_BUILD_TIMEOUT_SECONDS = 1800.0
+_BUILD_TIMEOUT_SECONDS = 7200.0
 _VAST_TIMEOUT_SECONDS = 30.0
 _TEMPLATE_FIELDS = frozenset({"env", "extra_filters", "image", "jup_direct", "name", "onstart", "private", "recommended_disk_space", "runtype", "ssh_direct", "use_ssh"})
 # Search responses include these provider-owned fields.  They never describe a
