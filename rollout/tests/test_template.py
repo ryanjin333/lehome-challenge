@@ -23,6 +23,7 @@ def test_template_renders_private_headless_campaign_with_explicit_gpu_bounds() -
     assert template["runtype"] == "ssh"
     assert template["ssh_direct"] is True
     assert template["jup_direct"] is False
+    assert template["onstart"] == "bash /usr/local/bin/b1k-rollout-entrypoint"
     assert template["extra_filters"]["num_gpus"] == {"eq": 1}
     assert "AUTO_DESTROY=0" in template["env"]
     assert "B1K_ACCEPT_DATASET_TOS=YES" in template["env"]
@@ -58,3 +59,12 @@ def test_production_template_rejects_zero_checkpoint_identity_and_mismatched_gpu
     rendered["extra_filters"]["num_gpus"] = {"eq": 1}
     with pytest.raises(ValueError, match="GPU offer"):
         validate_vast_template(rendered)
+
+
+def test_template_rejects_missing_or_noncanonical_rollout_onstart() -> None:
+    rendered = json.loads(render_vast_template(image_digest=_DIGEST, model_commit="b" * 40, checkpoint_artifact_sha256="c" * 64, gpu_ids=(0,)))
+
+    for onstart in ("", "/usr/local/bin/b1k-rollout-entrypoint", "bash /tmp/rollout-entrypoint"):
+        candidate = {**rendered, "onstart": onstart}
+        with pytest.raises(ValueError, match="canonical rollout onstart"):
+            validate_vast_template(candidate)

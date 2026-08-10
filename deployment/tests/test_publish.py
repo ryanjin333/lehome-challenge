@@ -1054,7 +1054,7 @@ def test_fixed_vast_client_uses_raw_bounded_commands_and_template_readback_witho
     assert all(call[1] is None and call[3] == 30.0 for call in runner.calls)
 
 
-def test_fixed_vast_client_permits_only_the_canonical_empty_rollout_onstart(tmp_path):
+def test_fixed_vast_client_permits_only_the_canonical_rollout_onstart(tmp_path):
     from b1k_deploy.production import VastCliTemplateClient
 
     vastai_executable = tmp_path / "vastai"
@@ -1073,13 +1073,14 @@ def test_fixed_vast_client_permits_only_the_canonical_empty_rollout_onstart(tmp_
     rollout_templates = FakeTemplates()
     TemplatePublisher(rollout_templates).publish(rollout_plan, execute=True)
     rollout_command = client._create_command(rollout_templates.created[0])
-    assert ("--onstart-cmd", "") in zip(rollout_command, rollout_command[1:])
+    assert ("--onstart-cmd", "bash /usr/local/bin/b1k-rollout-entrypoint") in zip(rollout_command, rollout_command[1:])
     assert "B1K_ACCEPT_DATASET_TOS=YES" in rollout_templates.created[0]["env"]
 
     with pytest.raises(PublicationError, match="training template"):
         client._create_command({**payload("training"), "onstart": ""})
-    with pytest.raises(PublicationError, match="rollout template"):
-        client._create_command({**rollout_templates.created[0], "onstart": "rollout command"})
+    for onstart in ("", "/usr/local/bin/b1k-rollout-entrypoint", "rollout command"):
+        with pytest.raises(PublicationError, match="rollout template"):
+            client._create_command({**rollout_templates.created[0], "onstart": onstart})
 
 
 def test_vast_cli_filter_renderer_rejects_noncanonical_raw_ram_units() -> None:

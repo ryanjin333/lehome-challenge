@@ -10,6 +10,7 @@ from b1k_rollout.task_manifest import CANONICAL_MANIFEST_SHA256
 
 
 ROLLOUT_IMAGE_REPOSITORY = "docker.io/ryanjin333/behavior1k-groot-n17"
+ROLLOUT_ONSTART = "bash /usr/local/bin/b1k-rollout-entrypoint"
 CAMPAIGN_ID = "b1k-r1pro-public-test-100x10"
 _FORBIDDEN = ("novnc", "x11", "xfce", "jupyter", "desktop", "hf_token=", "password=")
 
@@ -68,6 +69,8 @@ def validate_vast_template(value: Mapping[str, object]) -> None:
         raise ValueError("template must expose direct SSH only for observability")
     if template["jup_direct"] is not False:
         raise ValueError("template must not expose Jupyter")
+    if template["onstart"] != ROLLOUT_ONSTART:
+        raise ValueError("template must use the canonical rollout onstart")
     filters = template["extra_filters"]
     if not isinstance(filters, Mapping) or not isinstance(filters.get("num_gpus"), Mapping):
         raise ValueError("template must select an explicit GPU count")
@@ -144,7 +147,7 @@ def _template(image_digest: str, model_commit: str, checkpoint_artifact_sha256: 
         "image": f"{ROLLOUT_IMAGE_REPOSITORY}@{image_digest}",
         "jup_direct": False,
         "name": "b1k-rollout",
-        "onstart": "",
+        "onstart": ROLLOUT_ONSTART,
         "private": True,
         "recommended_disk_space": 2048,
         "runtype": "ssh",

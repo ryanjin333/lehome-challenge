@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from b1k_rollout.template import ROLLOUT_ONSTART
+
 from .dockerhub import (
     CommandResult,
     DockerCommandRunner,
@@ -264,8 +266,8 @@ class VastCliTemplateClient:
         if not isinstance(onstart, str):
             raise PublicationError("Vast template payload is invalid")
         if image.startswith(_REPOSITORY + "@sha256:") and "b1k-rollout-" in name:
-            if onstart != "":
-                raise PublicationError("Vast rollout template must use the canonical empty onstart")
+            if onstart != ROLLOUT_ONSTART:
+                raise PublicationError("Vast rollout template must use the canonical rollout onstart")
         elif not onstart:
             raise PublicationError("Vast training template must use a nonempty onstart")
         if template.get("private") is not True or template.get("runtype") != "ssh" or template.get("use_ssh") is not True or template.get("ssh_direct") is not True or template.get("jup_direct") is not False or not isinstance(disk_space, int) or isinstance(disk_space, bool) or disk_space <= 0 or not isinstance(filters, Mapping):
