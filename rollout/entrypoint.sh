@@ -26,9 +26,14 @@ if [[ "$(id -u)" == 0 ]]; then
   fi
   install -d -o 10001 -g 10001 -m 0700 \
     /workspace /workspace/campaign /workspace/checkpoint-source \
-    /workspace/omnigibson-data /workspace/smoke-canary
+    /workspace/omnigibson-data /workspace/smoke-canary \
+    /workspace/campaign/.cache/numba /workspace/campaign/.cache/triton \
+    /workspace/campaign/.cache/matplotlib
   printf '%s' "$HF_TOKEN" | "$BEHAVIOR_PYTHON" -m b1k_rollout.token_bootstrap
   unset HF_TOKEN
+  export NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba
+  export TRITON_CACHE_DIR=/workspace/campaign/.cache/triton
+  export MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib
   exec setpriv --reuid=10001 --regid=10001 --init-groups "$0" "$@"
 fi
 if [[ ! -f "${B1K_HF_TOKEN_FILE:-}" || -L "${B1K_HF_TOKEN_FILE:-}" ]]; then

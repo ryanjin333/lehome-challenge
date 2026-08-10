@@ -62,11 +62,16 @@ def test_rollout_entrypoint_fails_closed_before_campaign_execution() -> None:
     assert (
         "install -d -o 10001 -g 10001 -m 0700 \\\n"
         "    /workspace /workspace/campaign /workspace/checkpoint-source \\\n"
-        "    /workspace/omnigibson-data /workspace/smoke-canary"
+        "    /workspace/omnigibson-data /workspace/smoke-canary \\\n"
+        "    /workspace/campaign/.cache/numba /workspace/campaign/.cache/triton \\\n"
+        "    /workspace/campaign/.cache/matplotlib"
     ) in entrypoint
+    root_branch = entrypoint.split('if [[ ! -f "${B1K_HF_TOKEN_FILE:-}"', 1)[0]
+    assert "export NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba" in root_branch
+    assert "export TRITON_CACHE_DIR=/workspace/campaign/.cache/triton" in root_branch
+    assert "export MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib" in root_branch
     assert ": > /workspace/smoke-canary/rollout-ready" in entrypoint
     assert ": > /workspace/.b1k-rollout-smoke-ready" not in entrypoint
-    root_branch = entrypoint.split('if [[ ! -f "${B1K_HF_TOKEN_FILE:-}"', 1)[0]
     assert "/workspace/.cache /workspace/.cache/huggingface" not in root_branch
     assert '"$BEHAVIOR_PYTHON" -m b1k_rollout.cli assets-bootstrap' not in root_branch
     assert entrypoint.index("assets-bootstrap") > entrypoint.index("unset HF_TOKEN")

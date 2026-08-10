@@ -1076,7 +1076,11 @@ def test_fixed_vast_client_permits_only_the_canonical_rollout_onstart(tmp_path):
     assert (
         "--onstart-cmd",
         "install -d -o 10001 -g 10001 -m 0700 /workspace /workspace/campaign /workspace/checkpoint-source "
-        "/workspace/omnigibson-data /workspace/smoke-canary && "
+        "/workspace/omnigibson-data /workspace/smoke-canary /workspace/campaign/.cache/numba "
+        "/workspace/campaign/.cache/triton /workspace/campaign/.cache/matplotlib && "
+        "export NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba "
+        "TRITON_CACHE_DIR=/workspace/campaign/.cache/triton "
+        "MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib && "
         "bash /usr/local/bin/b1k-rollout-entrypoint",
     ) in zip(rollout_command, rollout_command[1:])
     assert "B1K_ACCEPT_DATASET_TOS=YES" in rollout_templates.created[0]["env"]
