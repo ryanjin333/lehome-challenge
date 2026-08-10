@@ -17,7 +17,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -814,7 +814,10 @@ def _label(value: object) -> str:
 def _rate(value: object) -> Decimal:
     try: result = Decimal(str(value))
     except (InvalidOperation, ValueError): raise ProductionSmokeError("Vast offer rate is invalid") from None
-    if not result.is_finite() or result <= 0 or result.as_tuple().exponent < -6: raise ProductionSmokeError("Vast offer rate is invalid")
+    if not result.is_finite() or result <= 0: raise ProductionSmokeError("Vast offer rate is invalid")
+    if result.as_tuple().exponent < -6:
+        try: result = result.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
+        except InvalidOperation: raise ProductionSmokeError("Vast offer rate is invalid") from None
     return result
 
 

@@ -104,6 +104,10 @@ def offer(rate="0.40"):
     return SmokeOfferSelectionReceipt("90210", rate, "RTX 4090", SmokeCompatibility(True, True, 200, 64, 1000, 15, "cheapest-compatible-verified"))
 
 
+def test_offer_ledger_snapshot_preserves_six_decimal_provider_rate() -> None:
+    assert offer(Decimal("0.077778")).ledger_offer()["hourly_rate_usd"] == "0.077778"
+
+
 def image(purpose="training-smoke"):
     repository = "docker.io/ryanjin333/behavior1k-groot-n17"
     digest = "sha256:" + ("a" if purpose == "training-smoke" else "b") * 64

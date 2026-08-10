@@ -144,9 +144,10 @@ class SmokeOfferSelectionReceipt:
     compatibility: SmokeCompatibility
 
     def ledger_offer(self) -> dict[str, Any]:
+        rate = format(self.hourly_rate_usd, "f") if isinstance(self.hourly_rate_usd, Decimal) else self.hourly_rate_usd
         return {
             "offer_id": self.offer_id,
-            "hourly_rate_usd": self.hourly_rate_usd,
+            "hourly_rate_usd": rate,
             "verified": self.compatibility.verified_datacenter,
             "gpu_name": self.gpu_name,
         }
