@@ -127,9 +127,9 @@ class VastCliSmokeClient:
             raise ProductionSmokeError("smoke purpose is invalid")
         # Smoke contracts deliberately use bounded canary preflight, never the
         # production 15k-step hardware gate.  These are role-specific image
-        # floors: CUDA GR00T canary (12 GB/100 GB) and headless Isaac rollout
-        # (24 GB/300 GB).
-        minimum_vram_gb = 24
+        # floors: a real GR00T optimizer step needs at least 48 GB, while the
+        # headless Isaac rollout canary needs 24 GB.
+        minimum_vram_gb = 48 if purpose == "training-smoke" else 24
         minimum_vram_mib = minimum_vram_gb * 1024
         requested_disk = 100 if purpose == "training-smoke" else 300
         # Vast CLI 1.5.2 returns cpu_ram in MiB, duration in seconds, float

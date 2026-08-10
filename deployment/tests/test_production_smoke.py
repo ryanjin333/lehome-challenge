@@ -123,8 +123,9 @@ class VastRunner:
         self.calls.append((sanitized, timeout))
         if arguments[1:3] == ("search", "offers"):
             payload = [
-                {"id": 11, "dph_total": 0.40, "gpu_name": "slow", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 24576, "driver_version": "550.54.14", "disk_space": 100.9, "cpu_ram": 32768, "inet_down": 1000.9, "duration": 3600.0},
-                {"id": 12, "dph_total": 0.07777777777777778, "gpu_name": "fast", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 24576, "driver_version": "550.54.14", "disk_space": 200.9, "cpu_ram": 65536, "inet_down": 1000.9, "duration": 3600.0},
+                {"id": 10, "dph_total": 0.01, "gpu_name": "too-small", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 24576, "driver_version": "550.54.14", "disk_space": 200.9, "cpu_ram": 65536, "inet_down": 1000.9, "duration": 3600.0},
+                {"id": 11, "dph_total": 0.40, "gpu_name": "slow", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 49152, "driver_version": "550.54.14", "disk_space": 100.9, "cpu_ram": 32768, "inet_down": 1000.9, "duration": 3600.0},
+                {"id": 12, "dph_total": 0.07777777777777778, "gpu_name": "fast", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 49152, "driver_version": "550.54.14", "disk_space": 200.9, "cpu_ram": 65536, "inet_down": 1000.9, "duration": 3600.0},
             ]
         elif arguments[2:4] == ("search", "templates"):
             payload = [{**self.template, "id": 123, "hash_id": "canonical_template_hash"}]
@@ -172,7 +173,7 @@ def test_selects_the_cheapest_verified_compatible_one_gpu_offer_and_binds_provid
 
     assert offer.offer_id == "12"
     assert offer.hourly_rate_usd == Decimal("0.077778")
-    assert "gpu_ram>=24" in runner.calls[0][0][3]
+    assert "gpu_ram>=48" in runner.calls[0][0][3]
     assert "gpu_ram>=12288" not in runner.calls[0][0][3]
     assert offer.compatibility.ram_gb == 64
     assert offer.compatibility.maximum_duration_minutes == 60
