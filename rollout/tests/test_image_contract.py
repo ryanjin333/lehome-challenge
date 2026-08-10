@@ -30,6 +30,8 @@ def test_rollout_image_is_pinned_headless_and_secret_free() -> None:
     assert "USER rollout" not in dockerfile
     assert "setpriv --reuid=10001 --regid=10001" in _read("entrypoint.sh")
     assert "uv sync --frozen --no-dev" in dockerfile
+    assert "UV_HTTP_TIMEOUT=600" in dockerfile
+    assert dockerfile.index("UV_HTTP_TIMEOUT=600") < dockerfile.index("uv sync --frozen --no-dev")
     assert "--no-install-project" not in dockerfile
     assert "GROOT_PYTHON=/opt/isaac-groot/.venv/bin/python" in dockerfile
     assert '"$BEHAVIOR_PYTHON" -c \'import b1k_rollout.policy_server\'' in dockerfile

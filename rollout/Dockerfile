@@ -27,6 +27,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     B1K_HF_TOKEN_FILE=/workspace/.cache/huggingface/token \
     BEHAVIOR_PYTHON=/opt/conda/envs/behavior/bin/python \
     GROOT_PYTHON=/opt/isaac-groot/.venv/bin/python \
+    UV_HTTP_TIMEOUT=600 \
     HOME=/home/rollout \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
