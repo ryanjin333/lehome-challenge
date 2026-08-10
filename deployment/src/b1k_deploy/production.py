@@ -404,7 +404,23 @@ def _project_template_readback(row: Mapping[str, Any]) -> dict[str, Any]:
             raise PublicationError("Vast template filters readback is invalid") from None
     if not isinstance(filters, Mapping):
         raise PublicationError("Vast template filters readback is invalid")
-    projected["extra_filters"] = dict(filters)
+    normalized_filters: dict[str, dict[str, Any]] = {}
+    for field, constraints in filters.items():
+        if not isinstance(field, str) or not isinstance(constraints, Mapping):
+            raise PublicationError("Vast template filters readback is invalid")
+        normalized_constraints: dict[str, Any] = {}
+        for operator, value in constraints.items():
+            if isinstance(value, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", value):
+                value = int(value)
+            elif isinstance(value, float) and value.is_integer():
+                value = int(value)
+            normalized_constraints[operator] = value
+        normalized_filters[field] = normalized_constraints
+    try:
+        _search_query(normalized_filters)
+    except PublicationError:
+        raise PublicationError("Vast template filters readback is invalid") from None
+    projected["extra_filters"] = normalized_filters
     disk = projected["recommended_disk_space"]
     if isinstance(disk, float) and disk.is_integer():
         disk = int(disk)

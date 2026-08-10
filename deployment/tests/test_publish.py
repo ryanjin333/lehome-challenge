@@ -1133,6 +1133,40 @@ def test_fixed_vast_client_accepts_current_vast_provider_only_readback_fields(tm
     assert client.get_template("101") == rendered_payload
 
 
+def test_fixed_vast_client_normalizes_current_vast_filter_readback_types(tmp_path):
+    from b1k_deploy.production import VastCliTemplateClient
+
+    vastai_executable = tmp_path / "vastai"
+    vastai_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    vastai_executable.chmod(0o700)
+    api_key_file = tmp_path / "vast_api_key"
+    api_key_file.write_text("not-in-arguments", encoding="utf-8")
+    api_key_file.chmod(0o600)
+    plan = TemplatePublicationPlan("a" * 40, "training", release("training"), payload())
+    rendered_templates = FakeTemplates()
+    TemplatePublisher(rendered_templates).publish(plan, execute=True)
+    rendered_payload = rendered_templates.created[0]
+    provider_filters = json.loads(json.dumps(rendered_payload["extra_filters"]))
+    for field, constraints in provider_filters.items():
+        for operator, value in constraints.items():
+            if isinstance(value, int) and not isinstance(value, bool):
+                constraints[operator] = float(value) if field in {"cpu_ram", "gpu_ram"} else str(value)
+    provider_row = {
+        **rendered_payload,
+        "id": 101,
+        "docker_login_repo": "docker.io",
+        "extra_filters": json.dumps(provider_filters),
+    }
+
+    class Runner:
+        def run(self, arguments, *, stdin, env, timeout):
+            return CommandResult(0, json.dumps([provider_row]), "")
+
+    client = VastCliTemplateClient(vastai_executable=vastai_executable, api_key_file=api_key_file, runner=Runner())
+
+    assert client.get_template("101") == rendered_payload
+
+
 def test_fixed_vast_client_rejects_template_without_private_pull_repo(tmp_path):
     from b1k_deploy.production import VastCliTemplateClient
 
