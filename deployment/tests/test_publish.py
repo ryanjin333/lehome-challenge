@@ -990,7 +990,7 @@ def test_fixed_vast_client_uses_raw_bounded_commands_and_template_readback_witho
         "created_at": 1234567890,
         "count_created": 7,
         "default_tag": False,
-        "docker_login_repo": "provider-owned",
+        "docker_login_repo": "docker.io",
         "recommended": True,
         "recent_create_date": "provider-owned",
         "tag": "provider-owned",
@@ -1014,6 +1014,7 @@ def test_fixed_vast_client_uses_raw_bounded_commands_and_template_readback_witho
     assert search[0][:4] == (str(vastai_executable), "--raw", "search", "templates")
     assert create[0][:4] == (str(vastai_executable), "--raw", "create", "template")
     assert "--ssh" in create[0] and "--direct" in create[0] and "--no-default" in create[0]
+    assert ("--login", "docker.io") in zip(create[0], create[0][1:])
     search_params = create[0][create[0].index("--search_params") + 1]
     assert "cpu_ram >= 128" in search_params
     assert "gpu_ram >= 96" in search_params
@@ -1078,10 +1079,83 @@ def test_fixed_vast_client_rejects_unknown_readback_fields_instead_of_hashing_pr
 
     class Runner:
         def run(self, arguments, *, stdin, env, timeout):
-            return CommandResult(0, json.dumps([{**rendered_payload, "id": 101, "unclassified_provider_value": "drift"}]), "")
+            return CommandResult(0, json.dumps([{**rendered_payload, "id": 101, "docker_login_repo": "docker.io", "unclassified_provider_value": "drift"}]), "")
 
     client = VastCliTemplateClient(vastai_executable=vastai_executable, api_key_file=api_key_file, runner=Runner())
     with pytest.raises(PublicationError, match="unknown"):
+        client.get_template("101")
+
+
+def test_fixed_vast_client_accepts_current_vast_provider_only_readback_fields(tmp_path):
+    from b1k_deploy.production import VastCliTemplateClient
+
+    vastai_executable = tmp_path / "vastai"
+    vastai_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    vastai_executable.chmod(0o700)
+    api_key_file = tmp_path / "vast_api_key"
+    api_key_file.write_text("not-in-arguments", encoding="utf-8")
+    api_key_file.chmod(0o600)
+    plan = TemplatePublicationPlan("a" * 40, "training", release("training"), payload())
+    rendered_templates = FakeTemplates()
+    TemplatePublisher(rendered_templates).publish(plan, execute=True)
+    rendered_payload = rendered_templates.created[0]
+    provider_metadata = {
+        "id": 101,
+        "args_str": None,
+        "autoscaler": False,
+        "cached": False,
+        "command": None,
+        "created_from": None,
+        "created_from_id": None,
+        "deleted_at": None,
+        "desc_count": 0,
+        "docker_login_pass": None,
+        "docker_login_repo": "docker.io",
+        "docker_login_user": None,
+        "jupyter_tested": None,
+        "jupyterlab_tested": None,
+        "lang_utf8": None,
+        "max_cuda": None,
+        "min_cuda": None,
+        "python_utf8": None,
+        "readme_hash": None,
+        "sort_order": None,
+        "vm": False,
+        "volume_info": None,
+    }
+
+    class Runner:
+        def run(self, arguments, *, stdin, env, timeout):
+            return CommandResult(0, json.dumps([{**rendered_payload, **provider_metadata}]), "")
+
+    client = VastCliTemplateClient(vastai_executable=vastai_executable, api_key_file=api_key_file, runner=Runner())
+
+    assert client.get_template("101") == rendered_payload
+
+
+def test_fixed_vast_client_rejects_template_without_private_pull_repo(tmp_path):
+    from b1k_deploy.production import VastCliTemplateClient
+
+    vastai_executable = tmp_path / "vastai"
+    vastai_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    vastai_executable.chmod(0o700)
+    api_key_file = tmp_path / "vast_api_key"
+    api_key_file.write_text("not-in-arguments", encoding="utf-8")
+    api_key_file.chmod(0o600)
+    plan = TemplatePublicationPlan("a" * 40, "training", release("training"), payload())
+    rendered_templates = FakeTemplates()
+    TemplatePublisher(rendered_templates).publish(plan, execute=True)
+    rendered_payload = rendered_templates.created[0]
+    provider_row = {**rendered_payload, "id": 101, "docker_login_repo": None}
+
+    class Runner:
+        def run(self, arguments, *, stdin, env, timeout):
+            return CommandResult(0, json.dumps([provider_row]), "")
+
+    client = VastCliTemplateClient(vastai_executable=vastai_executable, api_key_file=api_key_file, runner=Runner())
+
+    assert client.find_private_template(rendered_payload["name"], rendered_payload["image"]) is None
+    with pytest.raises(PublicationError, match="private pull"):
         client.get_template("101")
 
 

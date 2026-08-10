@@ -25,6 +25,7 @@ from .publish import PublicationAdapters, PublicationError
 
 
 _REPOSITORY = "docker.io/ryanjin333/behavior1k-groot-n17"
+_DOCKER_LOGIN_REPOSITORY = "docker.io"
 _SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -36,9 +37,13 @@ _TEMPLATE_FIELDS = frozenset({"env", "extra_filters", "image", "jup_direct", "na
 # configurable template value, so excluding them keeps receipt hashes stable.
 _VAST_PROVIDER_METADATA = frozenset({
     "id", "hash_id", "creator_id", "created_at", "count_created", "default_tag",
-    "docker_login_repo", "recommended", "recent_create_date", "tag", "image_tag",
-    "href", "repo", "jupyter_dir", "readme", "readme_visible", "desc",
-    "use_jupyter_lab", "date_created", "date_updated", "status",
+    "docker_login_repo", "docker_login_user", "docker_login_pass", "recommended",
+    "recent_create_date", "tag", "image_tag", "href", "repo", "jupyter_dir",
+    "readme", "readme_hash", "readme_visible", "desc", "desc_count",
+    "use_jupyter_lab", "date_created", "date_updated", "status", "args_str",
+    "autoscaler", "cached", "command", "created_from", "created_from_id",
+    "deleted_at", "jupyter_tested", "jupyterlab_tested", "lang_utf8", "max_cuda",
+    "min_cuda", "python_utf8", "sort_order", "vm", "volume_info",
 })
 
 
@@ -197,6 +202,8 @@ class VastCliTemplateClient:
         matches = [template for template in self._search(f"id=={expected}") if _template_id(template.get("id")) == expected]
         if len(matches) != 1:
             raise PublicationError("Vast template readback is missing or ambiguous")
+        if matches[0].get("docker_login_repo") != _DOCKER_LOGIN_REPOSITORY:
+            raise PublicationError("Vast template private pull repository is missing")
         return _project_template_readback(matches[0])
 
     def _search(self, query: str) -> list[Mapping[str, Any]]:
@@ -228,6 +235,7 @@ class VastCliTemplateClient:
         return (
             str(self._vastai_executable), "--raw", "create", "template",
             "--name", name, "--image", image, "--env", environment,
+            "--login", _DOCKER_LOGIN_REPOSITORY,
             "--ssh", "--direct", "--onstart-cmd", onstart,
             "--search_params", _search_query(filters), "--no-default",
             "--disk_space", str(disk_space),
@@ -374,7 +382,12 @@ def _template_id(value: object) -> str:
 
 
 def _is_private_template(template: Mapping[str, Any], name: str, image_reference: str) -> bool:
-    return template.get("name") == name and template.get("image") == image_reference and template.get("private") is True
+    return (
+        template.get("name") == name
+        and template.get("image") == image_reference
+        and template.get("private") is True
+        and template.get("docker_login_repo") == _DOCKER_LOGIN_REPOSITORY
+    )
 
 
 def _project_template_readback(row: Mapping[str, Any]) -> dict[str, Any]:
