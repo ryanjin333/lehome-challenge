@@ -24,7 +24,9 @@ if [[ "$(id -u)" == 0 ]]; then
     echo "B1K_HF_TOKEN_FILE must use the production token path" >&2
     exit 64
   fi
-  install -d -o 10001 -g 10001 -m 0700 /workspace/smoke-canary
+  install -d -o 10001 -g 10001 -m 0700 \
+    /workspace /workspace/campaign /workspace/checkpoint-source \
+    /workspace/omnigibson-data /workspace/smoke-canary
   printf '%s' "$HF_TOKEN" | "$BEHAVIOR_PYTHON" -m b1k_rollout.token_bootstrap
   unset HF_TOKEN
   exec setpriv --reuid=10001 --regid=10001 --init-groups "$0" "$@"

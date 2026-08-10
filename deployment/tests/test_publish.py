@@ -1073,12 +1073,17 @@ def test_fixed_vast_client_permits_only_the_canonical_rollout_onstart(tmp_path):
     rollout_templates = FakeTemplates()
     TemplatePublisher(rollout_templates).publish(rollout_plan, execute=True)
     rollout_command = client._create_command(rollout_templates.created[0])
-    assert ("--onstart-cmd", "bash /usr/local/bin/b1k-rollout-entrypoint") in zip(rollout_command, rollout_command[1:])
+    assert (
+        "--onstart-cmd",
+        "install -d -o 10001 -g 10001 -m 0700 /workspace /workspace/campaign /workspace/checkpoint-source "
+        "/workspace/omnigibson-data /workspace/smoke-canary && "
+        "bash /usr/local/bin/b1k-rollout-entrypoint",
+    ) in zip(rollout_command, rollout_command[1:])
     assert "B1K_ACCEPT_DATASET_TOS=YES" in rollout_templates.created[0]["env"]
 
     with pytest.raises(PublicationError, match="training template"):
         client._create_command({**payload("training"), "onstart": ""})
-    for onstart in ("", "/usr/local/bin/b1k-rollout-entrypoint", "rollout command"):
+    for onstart in ("", "bash /usr/local/bin/b1k-rollout-entrypoint", "rollout command"):
         with pytest.raises(PublicationError, match="rollout template"):
             client._create_command({**rollout_templates.created[0], "onstart": onstart})
 

@@ -10,7 +10,11 @@ from b1k_rollout.task_manifest import CANONICAL_MANIFEST_SHA256
 
 
 ROLLOUT_IMAGE_REPOSITORY = "docker.io/ryanjin333/behavior1k-groot-n17"
-ROLLOUT_ONSTART = "bash /usr/local/bin/b1k-rollout-entrypoint"
+ROLLOUT_ONSTART = (
+    "install -d -o 10001 -g 10001 -m 0700 /workspace /workspace/campaign /workspace/checkpoint-source "
+    "/workspace/omnigibson-data /workspace/smoke-canary && "
+    "bash /usr/local/bin/b1k-rollout-entrypoint"
+)
 CAMPAIGN_ID = "b1k-r1pro-public-test-100x10"
 _FORBIDDEN = ("novnc", "x11", "xfce", "jupyter", "desktop", "hf_token=", "password=")
 
