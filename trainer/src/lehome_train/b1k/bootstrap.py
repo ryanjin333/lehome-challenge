@@ -450,6 +450,7 @@ class BootstrapResult:
             "TRANSFORMERS_OFFLINE": "1",
             "WANDB_MODE": "offline",
             "WANDB_DIR": "/workspace/logs/wandb",
+            "TRITON_CACHE_DIR": "/workspace/.cache/triton",
         }
 
 

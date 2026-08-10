@@ -75,6 +75,7 @@ def test_training_subprocess_environment_keeps_token_file_and_adds_upstream_pyth
     assert environment["B1K_HF_TOKEN_FILE"] == "/workspace/.cache/huggingface/token"
     assert environment["PYTHONPATH"] == "/opt/isaac-groot"
     assert environment["WANDB_DIR"] == "/workspace/logs/wandb"
+    assert environment["TRITON_CACHE_DIR"] == "/workspace/.cache/triton"
     assert "HF_TOKEN" not in environment
 
 
