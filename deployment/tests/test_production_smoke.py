@@ -14,6 +14,7 @@ from b1k_deploy.dockerhub import CommandResult, DockerImageRelease, HttpResponse
 from b1k_deploy.production_smoke import ProductionSmokeError, SshSmokeRemote, VastCliSmokeClient, VastInstanceEndpoint, _rollout_command, _training_command
 from b1k_deploy.publish import canonical_payload_hash, load_canonical_template
 from b1k_deploy.smoke import SmokeTemplatePublicationReceipt
+from b1k_deploy.vast import ProviderCreatedButSetupFailed
 
 WORKSPACE = Path(__file__).resolve().parents[2]
 
@@ -158,6 +159,8 @@ class VastRunner:
             payload = self.instances
         elif arguments[1:3] == ("destroy", "instance"):
             return CommandResult(0, f"destroying instance {arguments[3]}.\n", "")
+        elif arguments[1:3] == ("attach", "ssh"):
+            return CommandResult(0, "{'success': True}\n", "")
         elif arguments[2:4] == ("delete", "template"):
             return CommandResult(0, "Template deleted successfully\n", "")
         else:
@@ -178,11 +181,15 @@ def _client(tmp_path: Path, runner: VastRunner) -> VastCliSmokeClient:
     executable = tmp_path / "vastai"; executable.write_text("#!", encoding="utf-8"); executable.chmod(0o700)
     key = tmp_path / "vast_api_key"; key.write_text(runner.api_key + "\n", encoding="utf-8"); key.chmod(0o600)
     token = tmp_path / "docker.token"; token.write_text(runner.registry_token + "\n", encoding="utf-8"); token.chmod(0o600)
+    ssh_public_key = tmp_path / "vast_quest.pub"
+    ssh_public_key.write_text("ssh-ed25519 " + "A" * 68 + " test-key\n", encoding="utf-8")
+    ssh_public_key.chmod(0o644)
     return VastCliSmokeClient(
         vastai_executable=executable,
         api_key_file=key,
         registry_username="ryanjin333",
         registry_token_file=token,
+        ssh_public_key_file=ssh_public_key,
         create_transport=runner,
         runner=runner,
     )
@@ -203,6 +210,16 @@ def test_selects_the_cheapest_verified_compatible_one_gpu_offer_and_binds_provid
     assert offer.compatibility.ram_gb == 64
     assert offer.compatibility.maximum_duration_minutes == 60
     assert instance_id == "9876543"
+    assert runner.calls[-1] == (
+        (
+            str(tmp_path / "vastai"),
+            "attach",
+            "ssh",
+            "9876543",
+            str(tmp_path / "vast_quest.pub"),
+        ),
+        30,
+    )
     assert not any(call[0][2:4] == ("create", "instance") for call in runner.calls)
     method, url, headers, payload, timeout = runner.http_calls[-1]
     assert (method, url, timeout) == ("PUT", "https://console.vast.ai/api/v0/asks/12/", 30)
@@ -227,6 +244,60 @@ def test_rollout_create_uses_environment_smoke_mode_without_an_incomplete_runtim
     assert payload.get("args") is None
     assert payload["env"] == {}
     assert payload["disk"] == 300
+
+
+def test_create_rejects_zero_exit_ssh_attachment_without_explicit_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = VastRunner()
+    runner.template["env"] += " -e B1K_TRAINING_SMOKE_RUNTIME=1"
+    client = _client(tmp_path, runner)
+    original_run = runner.run
+
+    def run(arguments, **kwargs):
+        if arguments[1:3] == ("attach", "ssh"):
+            return CommandResult(0, "{'success': False}\n", "")
+        return original_run(arguments, **kwargs)
+
+    monkeypatch.setattr(runner, "run", run)
+
+    with pytest.raises(ProviderCreatedButSetupFailed) as error:
+        client.create_instance(
+            {
+                "offer_id": "12", "template_id": "123",
+                "idempotency_key": "b1k-smoke-" + "f" * 32,
+                "hourly_rate_usd": "0.20", "disk_gb": 100,
+                "purpose": "training-smoke",
+                "image_reference": runner.template["image"],
+                "payload_hash": canonical_payload_hash(runner.template),
+            },
+            timeout_seconds=30,
+        )
+
+    assert error.value.instance_id == "9876543"
+    assert isinstance(error.value.__cause__, ProductionSmokeError)
+
+
+def test_client_rejects_a_symlinked_ssh_public_key(tmp_path: Path) -> None:
+    runner = VastRunner()
+    public_key = tmp_path / "real.pub"
+    public_key.write_text("ssh-ed25519 " + "A" * 68 + " test-key\n", encoding="utf-8")
+    linked_key = tmp_path / "linked.pub"
+    linked_key.symlink_to(public_key)
+    executable = tmp_path / "vastai"; executable.write_text("#!", encoding="utf-8"); executable.chmod(0o700)
+    key = tmp_path / "vast_api_key"; key.write_text(runner.api_key + "\n", encoding="utf-8"); key.chmod(0o600)
+    token = tmp_path / "docker.token"; token.write_text(runner.registry_token + "\n", encoding="utf-8"); token.chmod(0o600)
+
+    with pytest.raises(ProductionSmokeError, match="public key file is invalid"):
+        VastCliSmokeClient(
+            vastai_executable=executable,
+            api_key_file=key,
+            registry_username="ryanjin333",
+            registry_token_file=token,
+            ssh_public_key_file=linked_key,
+            create_transport=runner,
+            runner=runner,
+        )
 
 
 def test_create_rejects_a_production_template_without_the_purpose_smoke_flag(tmp_path: Path) -> None:

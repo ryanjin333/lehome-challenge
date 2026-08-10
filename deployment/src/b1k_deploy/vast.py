@@ -26,8 +26,26 @@ class VastCreateFailed(LedgerError):
     """A deterministic create failure released its reservation."""
 
 
+class VastPostCreateSetupFailed(LedgerError):
+    """A known paid instance was recorded after its required setup failed."""
+
+
 class ProviderNotCreated(Exception):
     """Provider guarantees this request created no remote instance."""
+
+
+class ProviderCreatedButSetupFailed(Exception):
+    """Provider returned an exact instance ID before local post-create setup failed."""
+
+    def __init__(self, instance_id: str) -> None:
+        if (
+            not isinstance(instance_id, str)
+            or _EXACT_INSTANCE_ID_RE.fullmatch(instance_id) is None
+            or instance_id in PROTECTED_INSTANCE_IDS
+        ):
+            raise ValueError("post-create failure requires one safe exact instance ID")
+        self.instance_id = instance_id
+        super().__init__("provider instance post-create setup failed")
 
 
 class VastClient(Protocol):
@@ -113,6 +131,15 @@ class CappedVastController:
         except ProviderNotCreated as error:
             self.ledger.release_reservation(run_id, "deterministic-create-failure")
             raise VastCreateFailed("Vast create failed before an ambiguous response") from error
+        except ProviderCreatedButSetupFailed as error:
+            self._record_instance(
+                run_id,
+                error.instance_id,
+                reconcile_timeout_seconds=reconcile_timeout_seconds,
+            )
+            raise VastPostCreateSetupFailed(
+                "Vast post-create setup failed after the exact instance was recorded"
+            ) from error
         except Exception as error:
             instance_id = self.vast.reconcile_instance(run_id, timeout_seconds=reconcile_timeout_seconds)
             if instance_id is None:
@@ -121,14 +148,34 @@ class CappedVastController:
             instance_id = self.vast.reconcile_instance(run_id, timeout_seconds=reconcile_timeout_seconds)
             if instance_id is None:
                 raise VastCreateAmbiguous("Vast create is ambiguous; reservation remains until reconciliation")
+        instance_id = self._record_instance(
+            run_id,
+            instance_id,
+            reconcile_timeout_seconds=reconcile_timeout_seconds,
+        )
+        return instance_id
+
+    def _record_instance(
+        self,
+        run_id: str,
+        instance_id: str,
+        *,
+        reconcile_timeout_seconds: int,
+    ) -> str:
         try:
             self.ledger.record_instance(run_id, instance_id)
         except Exception as append_error:
-            recovered_id = self.vast.reconcile_instance(run_id, timeout_seconds=reconcile_timeout_seconds)
+            recovered_id = self.vast.reconcile_instance(
+                run_id, timeout_seconds=reconcile_timeout_seconds
+            )
             if recovered_id is None:
-                raise VastCreateAmbiguous("instance ID is ambiguous; reservation remains until reconciliation") from append_error
+                raise VastCreateAmbiguous(
+                    "instance ID is ambiguous; reservation remains until reconciliation"
+                ) from append_error
             if recovered_id != instance_id:
-                raise VastCreateAmbiguous("reconciliation ID differs from create response") from append_error
+                raise VastCreateAmbiguous(
+                    "reconciliation ID differs from create response"
+                ) from append_error
             self.ledger.record_instance(run_id, recovered_id)
             instance_id = recovered_id
         return instance_id

@@ -24,7 +24,7 @@ from b1k_deploy.smoke import (
     SmokeTemplatePublicationReceipt,
     TrainingRuntimeEvidence,
 )
-from b1k_deploy.vast import CappedVastController, VastAdapter
+from b1k_deploy.vast import CappedVastController, ProviderCreatedButSetupFailed, VastAdapter
 
 
 class RecordingVast:
@@ -275,6 +275,27 @@ def test_interrupt_after_provider_create_before_ledger_id_reconciles_only_author
     assert vast.live_instance_ids == {"47198086", "9123457"}
     assert "47198086" not in vast.destroyed
     assert "9123457" not in vast.destroyed
+
+
+def test_post_create_ssh_setup_failure_destroys_the_exact_known_instance(tmp_path):
+    class SetupFailedVast(RecordingVast):
+        def create_instance(self, request, *, timeout_seconds):
+            self.created.append(request)
+            self.live_instance_ids.add(self.instance_id)
+            raise ProviderCreatedButSetupFailed(self.instance_id)
+
+        def find_instance_by_idempotency_key(self, key, *, timeout_seconds):
+            raise AssertionError("known instance ID must not depend on reconciliation")
+
+    smoke, ledger, vast = controller(tmp_path, FakeRemote(), SetupFailedVast())
+
+    with pytest.raises(SmokeRunFailed) as error:
+        smoke.run(plan("rollout-smoke"))
+
+    assert ledger.recorded_instance_id(error.value.receipt.run_id) == "9123456"
+    assert error.value.receipt.instance_id == "9123456"
+    assert vast.destroyed == ["9123456"]
+    assert vast.live_instance_ids == set()
 
 
 def test_untyped_runtime_evidence_is_rejected_after_rent_with_exact_cleanup(tmp_path):

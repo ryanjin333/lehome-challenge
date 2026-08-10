@@ -182,6 +182,7 @@ def _smoke_campaign(args: argparse.Namespace) -> int:
         api_key_file=settings.vast_api_key_file,
         registry_username=settings.docker_username,
         registry_token_file=settings.docker_token_file,
+        ssh_public_key_file=identity.with_name(identity.name + ".pub"),
     )
     releases = {item.purpose: item for item in publication.images}
     remote = SshSmokeRemote(

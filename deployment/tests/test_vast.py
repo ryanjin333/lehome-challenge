@@ -9,6 +9,8 @@ from b1k_deploy.vast import (
     VastCreateAmbiguous,
     VastCreateFailed,
     ProviderNotCreated,
+    ProviderCreatedButSetupFailed,
+    VastPostCreateSetupFailed,
 )
 
 
@@ -138,6 +140,32 @@ def test_only_provider_not_created_releases_the_reservation(tmp_path):
     with pytest.raises(VastCreateFailed):
         controller.rent(run_id=run_id, purpose="training-smoke", offer=offer(), projected_spend_usd="1.00", request={"offer_id": "90210"})
     assert ledger.reserved_spend_usd() == 0
+
+
+def test_post_create_setup_failure_records_the_known_instance_before_raising(tmp_path):
+    class SetupFailedVast(RecordingVast):
+        def create_instance(self, request, *, timeout_seconds):
+            self.created.append(request)
+            raise ProviderCreatedButSetupFailed(self.instance_id)
+
+        def find_instance_by_idempotency_key(self, key, *, timeout_seconds):
+            raise AssertionError("known instance ID must not depend on reconciliation")
+
+    ledger = RentalLedger(tmp_path / "cost-ledger.jsonl")
+    remote = SetupFailedVast()
+    controller = CappedVastController(ledger, VastAdapter(remote))
+    run_id = ledger.new_smoke_run_id()
+
+    with pytest.raises(VastPostCreateSetupFailed, match="post-create setup failed"):
+        controller.rent(
+            run_id=run_id,
+            purpose="rollout-smoke",
+            offer=offer(),
+            projected_spend_usd="0.80",
+            request={"offer_id": "90210", "template_id": "123"},
+        )
+
+    assert ledger.recorded_instance_id(run_id) == "9123456"
 
 
 def test_reconcile_pending_recovers_a_restart_without_a_second_create(tmp_path):

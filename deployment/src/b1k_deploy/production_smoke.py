@@ -45,7 +45,7 @@ from .smoke import (
     SmokeTemplatePublicationReceipt,
     _canonical_image_release_identity,
 )
-from .vast import PROTECTED_INSTANCE_IDS, ProviderNotCreated
+from .vast import PROTECTED_INSTANCE_IDS, ProviderCreatedButSetupFailed, ProviderNotCreated
 
 
 _ID_RE = re.compile(r"^[1-9][0-9]*$")
@@ -53,6 +53,10 @@ _LABEL_RE = re.compile(r"^b1k-smoke-[0-9a-f]{32}$")
 _DIGEST_IMAGE_RE = re.compile(r"^docker\.io/ryanjin333/behavior1k-groot-n17@sha256:[0-9a-f]{64}$")
 _REGISTRY_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _REGISTRY_TOKEN_RE = re.compile(r"^[^\s'\"\\]{8,8192}$")
+_SSH_PUBLIC_KEY_RE = re.compile(
+    r"^(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)) "
+    r"[A-Za-z0-9+/]+={0,3}(?: [^\r\n]{1,256})?$"
+)
 _HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\d{1,3}(?:\.\d{1,3}){3})$")
 _MAX_TOOL_TIMEOUT = 55
 
@@ -102,6 +106,7 @@ class VastCliSmokeClient:
         api_key_file: Path,
         registry_username: str,
         registry_token_file: Path,
+        ssh_public_key_file: Path,
         create_transport: HttpTransport | None = None,
         runner: DockerCommandRunner | None = None,
         timeout_seconds: int = 30,
@@ -116,6 +121,7 @@ class VastCliSmokeClient:
         self._registry_token = TokenSource.from_token_file(
             _validated_private_file(registry_token_file, "Docker registry token file")
         )
+        self._ssh_public_key = _public_ssh_identity(ssh_public_key_file)
         if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 0 < timeout_seconds <= _MAX_TOOL_TIMEOUT:
             raise ProductionSmokeError("Vast CLI timeout is invalid")
         self._runner = runner or SubprocessDockerRunner()
@@ -291,7 +297,49 @@ class VastCliSmokeClient:
             # A timeout or malformed success could have created a billable VM;
             # the controller must reconcile by the exact label.
             raise ProductionSmokeError("Vast create has no exact instance ID")
-        return _non_protected_id(instance_id)
+        exact_instance_id = _non_protected_id(instance_id)
+        try:
+            self._attach_ssh_key(exact_instance_id, timeout_seconds=timeout_seconds)
+        except Exception as error:
+            raise ProviderCreatedButSetupFailed(exact_instance_id) from error
+        return exact_instance_id
+
+    def _attach_ssh_key(self, instance_id: str, *, timeout_seconds: int) -> None:
+        """Attach the exact local public key after Vast returns a contract ID."""
+        exact = _non_protected_id(instance_id)
+        arguments = (
+            str(self._vastai),
+            "attach",
+            "ssh",
+            exact,
+            str(self._ssh_public_key),
+        )
+        try:
+            result = self._runner.run(
+                arguments,
+                stdin=None,
+                env=_vast_environment(),
+                timeout=timeout_seconds,
+            )
+        except Exception:
+            raise ProductionSmokeError("Vast SSH key attachment failed") from None
+        if (
+            not isinstance(result, CommandResult)
+            or result.returncode != 0
+            or not isinstance(result.stdout, str)
+            or not isinstance(result.stderr, str)
+            or bool(result.stderr.strip())
+        ):
+            raise ProductionSmokeError("Vast SSH key attachment failed")
+        line = result.stdout[:-1] if result.stdout.endswith("\n") else result.stdout
+        if line.endswith("\r"):
+            line = line[:-1]
+        try:
+            payload = ast.literal_eval(line)
+        except (MemoryError, RecursionError, SyntaxError, ValueError):
+            raise ProductionSmokeError("Vast SSH key attachment failed") from None
+        if not isinstance(payload, Mapping) or payload.get("success") is not True:
+            raise ProductionSmokeError("Vast SSH key attachment failed")
 
     @staticmethod
     def new_ephemeral_smoke_template_name(purpose: str) -> str:
@@ -980,6 +1028,23 @@ def _private_identity(path: Path) -> Path:
         metadata = path.lstat()
     except OSError: raise ProductionSmokeError("SSH identity file is unavailable") from None
     if not path.is_absolute() or path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077: raise ProductionSmokeError("SSH identity file must be a current-user private regular file")
+    return path
+def _public_ssh_identity(path: Path) -> Path:
+    try:
+        metadata = path.lstat()
+        value = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise ProductionSmokeError("SSH public key file is unavailable") from None
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or bool(metadata.st_mode & 0o022)
+        or len(value.encode("utf-8")) > 16384
+        or _SSH_PUBLIC_KEY_RE.fullmatch(value.rstrip("\n")) is None
+    ):
+        raise ProductionSmokeError("SSH public key file is invalid")
     return path
 def _campaign_known_hosts(path: Path) -> Path:
     if not path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts[1:]): raise ProductionSmokeError("campaign known_hosts path is invalid")
