@@ -78,6 +78,14 @@ def test_image_verifier_accepts_only_immutable_rollout_digests() -> None:
     assert "/opt/conda/envs/behavior/bin/python -m b1k_rollout.cli" in verifier
 
 
+def test_image_verifier_does_not_treat_generated_third_party_environments_as_release_source() -> None:
+    verifier = _read("scripts/verify-image.sh")
+
+    assert "--exclude-dir=.venv" in verifier
+    assert "--exclude-dir=.git" in verifier
+    assert "/opt/rollout /behavior-src /opt/isaac-groot" in verifier
+
+
 def test_image_verifier_is_executable_by_ci() -> None:
     assert (ROLLOUT / "scripts/verify-image.sh").stat().st_mode & 0o111
 

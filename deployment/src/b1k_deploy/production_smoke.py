@@ -20,7 +20,15 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
 
-from .dockerhub import CommandResult, DockerCommandRunner, SubprocessDockerRunner
+from .dockerhub import (
+    CommandResult,
+    CredentialSourceError,
+    DockerCommandRunner,
+    HttpTransport,
+    SubprocessDockerRunner,
+    TokenSource,
+    UrllibTransport,
+)
 from .huggingface import HubProbeReceipt, HubRepository, HuggingFaceReleaseVerifier
 from .production import _validate_executable_path, _validated_private_file, _vast_environment
 from .publish import canonical_payload_hash
@@ -41,10 +49,13 @@ from .vast import PROTECTED_INSTANCE_IDS, ProviderNotCreated
 _ID_RE = re.compile(r"^[1-9][0-9]*$")
 _LABEL_RE = re.compile(r"^b1k-smoke-[0-9a-f]{32}$")
 _DIGEST_IMAGE_RE = re.compile(r"^docker\.io/ryanjin333/behavior1k-groot-n17@sha256:[0-9a-f]{64}$")
+_REGISTRY_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_REGISTRY_TOKEN_RE = re.compile(r"^[^\s'\"\\]{8,8192}$")
 _HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\d{1,3}(?:\.\d{1,3}){3})$")
 _MAX_TOOL_TIMEOUT = 55
 _TEMPLATE_CREATE_RESULT_RE = re.compile(r"^New Template: ([1-9][0-9]*)$")
 _TEMPLATE_RECONCILIATION_ATTEMPTS = 3
+_VAST_CREATE_URL = "https://console.vast.ai/api/v0/asks/{offer_id}/"
 
 
 class ProductionSmokeError(SmokeError):
@@ -67,14 +78,26 @@ class VastCliSmokeClient:
         *,
         vastai_executable: str | Path,
         api_key_file: Path,
+        registry_username: str,
+        registry_token_file: Path,
+        create_transport: HttpTransport | None = None,
         runner: DockerCommandRunner | None = None,
         timeout_seconds: int = 30,
     ) -> None:
         self._vastai = _validate_executable_path(Path(vastai_executable), "Vast CLI executable")
-        _validated_private_file(api_key_file, "Vast API key file")
+        self._vast_api_key = TokenSource.from_token_file(
+            _validated_private_file(api_key_file, "Vast API key file")
+        )
+        if not _REGISTRY_USERNAME_RE.fullmatch(registry_username):
+            raise ProductionSmokeError("Docker registry username is invalid")
+        self._registry_username = registry_username
+        self._registry_token = TokenSource.from_token_file(
+            _validated_private_file(registry_token_file, "Docker registry token file")
+        )
         if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) or not 0 < timeout_seconds <= _MAX_TOOL_TIMEOUT:
             raise ProductionSmokeError("Vast CLI timeout is invalid")
         self._runner = runner or SubprocessDockerRunner()
+        self._create_transport = create_transport or UrllibTransport()
         self._timeout = timeout_seconds
 
     def select_offer(self, purpose: str) -> SmokeOfferSelectionReceipt:
@@ -164,14 +187,63 @@ class VastCliSmokeClient:
         if not isinstance(image_reference, str) or not isinstance(payload_hash, str):
             raise ProductionSmokeError("create request lacks a publication-bound template identity")
         template_hash = self.attest_template_binding(template_id=template_id, image_reference=image_reference, payload_hash=payload_hash)
-        command = [str(self._vastai), "--raw", "create", "instance", offer_id, "--template_hash", template_hash, "--disk", str(disk), "--label", label, "--bid_price", format(bid, "f"), "--cancel-unavail"]
+        try:
+            registry_token = self._registry_token.resolve()
+        except CredentialSourceError:
+            raise ProductionSmokeError("Docker registry credential is unavailable") from None
+        if not _REGISTRY_TOKEN_RE.fullmatch(registry_token):
+            raise ProductionSmokeError("Docker registry token is invalid")
         # Vast treats --args as the image command.  Passing only
         # "smoke-runtime" bypasses the required rollout prefixes, so smoke
         # mode is selected through template environment and the normal
         # entrypoint remains alive for direct SSH contracts.
-        environment = "B1K_TRAINING_SMOKE_RUNTIME=1" if purpose == "training-smoke" else "B1K_ROLLOUT_SMOKE_RUNTIME=1"
-        command.extend(("--env", f"-e {environment}"))
-        result = self._json(tuple(command), timeout_seconds)
+        environment = "B1K_TRAINING_SMOKE_RUNTIME" if purpose == "training-smoke" else "B1K_ROLLOUT_SMOKE_RUNTIME"
+        try:
+            api_key = self._vast_api_key.resolve()
+        except CredentialSourceError:
+            raise ProductionSmokeError("Vast API credential is unavailable") from None
+        if not _REGISTRY_TOKEN_RE.fullmatch(api_key):
+            raise ProductionSmokeError("Vast API credential is invalid")
+        payload = {
+            "client_id": "me",
+            "image": None,
+            "env": {environment: "1"},
+            "price": float(bid),
+            "disk": disk,
+            "label": label,
+            "extra": None,
+            "onstart": None,
+            "image_login": f"-u {self._registry_username} -p {registry_token} docker.io",
+            "python_utf8": False,
+            "lang_utf8": False,
+            "use_jupyter_lab": False,
+            "jupyter_dir": None,
+            "force": False,
+            "cancel_unavail": True,
+            "template_hash_id": template_hash,
+            "user": None,
+        }
+        try:
+            response = self._create_transport.request(
+                "PUT",
+                _VAST_CREATE_URL.format(offer_id=offer_id),
+                {
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "b1k-deploy/1",
+                },
+                timeout=timeout_seconds,
+                body=json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            )
+        except Exception:
+            raise ProductionSmokeError("Vast create request failed ambiguously") from None
+        if not 200 <= response.status < 300:
+            raise ProductionSmokeError("Vast create request failed ambiguously")
+        try:
+            result = json.loads(response.body)
+        except (TypeError, ValueError):
+            raise ProductionSmokeError("Vast create returned invalid JSON") from None
         if not isinstance(result, Mapping):
             raise ProductionSmokeError("Vast create returned invalid raw JSON")
         if result.get("success") is False:

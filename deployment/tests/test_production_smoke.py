@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from b1k_deploy.dockerhub import CommandResult, DockerImageRelease
+from b1k_deploy.dockerhub import CommandResult, DockerImageRelease, HttpResponse
 from b1k_deploy.production_smoke import ProductionSmokeError, SshSmokeRemote, VastCliSmokeClient, _rollout_command, _training_command
 from b1k_deploy.publish import canonical_payload_hash, load_canonical_template
 from b1k_deploy.smoke import SmokeTemplatePublicationReceipt
@@ -108,13 +108,17 @@ def test_unified_repository_rejects_cross_source_role_pair(tmp_path: Path) -> No
 class VastRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[str, ...], float]] = []
+        self.http_calls: list[tuple[str, str, dict[str, str], dict[str, object], float]] = []
+        self.registry_token = "not-a-real-docker-token"
+        self.api_key = "not-a-real-key"
         self.instances: list[dict[str, object]] = []
         self.template = load_canonical_template("training", source_root=WORKSPACE)
         self.template["image"] = "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64
         self.template["env"] = self.template["env"].replace("CONTAINER_DIGEST=sha256:" + "0" * 64, "CONTAINER_DIGEST=sha256:" + "a" * 64)
 
     def run(self, arguments, *, stdin, env, timeout):
-        self.calls.append((arguments, timeout))
+        sanitized = tuple(argument.replace(self.registry_token, "[REDACTED]") for argument in arguments)
+        self.calls.append((sanitized, timeout))
         if arguments[1:3] == ("search", "offers"):
             payload = [
                 {"id": 11, "dph_total": 0.40, "gpu_name": "slow", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 24576, "driver_version": "550.54.14", "disk_space": 100.9, "cpu_ram": 32768, "inet_down": 1000.9, "duration": 3600.0},
@@ -122,8 +126,6 @@ class VastRunner:
             ]
         elif arguments[2:4] == ("search", "templates"):
             payload = [{**self.template, "id": 123, "hash_id": "canonical_template_hash"}]
-        elif arguments[2:4] == ("create", "instance"):
-            payload = {"success": True, "new_contract": 9876543}
         elif arguments[2:4] == ("show", "instances"):
             payload = self.instances
         elif arguments[2:4] == ("destroy", "instance"):
@@ -132,11 +134,28 @@ class VastRunner:
             raise AssertionError(arguments)
         return CommandResult(0, json.dumps(payload), "")
 
+    def request(self, method, url, headers, *, timeout, body=None):
+        payload = json.loads(body.decode("utf-8"))
+        sanitized_headers = dict(headers)
+        sanitized_headers["Authorization"] = "Bearer [REDACTED]"
+        sanitized_payload = dict(payload)
+        sanitized_payload["image_login"] = "-u ryanjin333 -p [REDACTED] docker.io"
+        self.http_calls.append((method, url, sanitized_headers, sanitized_payload, timeout))
+        return HttpResponse(200, {}, json.dumps({"success": True, "new_contract": 9876543}).encode("utf-8"))
+
 
 def _client(tmp_path: Path, runner: VastRunner) -> VastCliSmokeClient:
     executable = tmp_path / "vastai"; executable.write_text("#!", encoding="utf-8"); executable.chmod(0o700)
-    key = tmp_path / "vast_api_key"; key.write_text("not-a-real-key\n", encoding="utf-8"); key.chmod(0o600)
-    return VastCliSmokeClient(vastai_executable=executable, api_key_file=key, runner=runner)
+    key = tmp_path / "vast_api_key"; key.write_text(runner.api_key + "\n", encoding="utf-8"); key.chmod(0o600)
+    token = tmp_path / "docker.token"; token.write_text(runner.registry_token + "\n", encoding="utf-8"); token.chmod(0o600)
+    return VastCliSmokeClient(
+        vastai_executable=executable,
+        api_key_file=key,
+        registry_username="ryanjin333",
+        registry_token_file=token,
+        create_transport=runner,
+        runner=runner,
+    )
 
 
 def test_selects_the_cheapest_verified_compatible_one_gpu_offer_and_binds_provider_template_hash(tmp_path: Path) -> None:
@@ -152,11 +171,13 @@ def test_selects_the_cheapest_verified_compatible_one_gpu_offer_and_binds_provid
     assert offer.compatibility.ram_gb == 64
     assert offer.compatibility.maximum_duration_minutes == 60
     assert instance_id == "9876543"
-    create = runner.calls[-1][0]
-    assert create == (
-        str(tmp_path / "vastai"), "--raw", "create", "instance", "12", "--template_hash", "canonical_template_hash",
-        "--disk", "100", "--label", "b1k-smoke-" + "a" * 32, "--bid_price", "0.2", "--cancel-unavail", "--env", "-e B1K_TRAINING_SMOKE_RUNTIME=1",
-    )
+    assert not any(call[0][2:4] == ("create", "instance") for call in runner.calls)
+    method, url, headers, payload, timeout = runner.http_calls[-1]
+    assert (method, url, timeout) == ("PUT", "https://console.vast.ai/api/v0/asks/12/", 30)
+    assert headers["Authorization"] == "Bearer [REDACTED]"
+    assert payload["template_hash_id"] == "canonical_template_hash"
+    assert payload["image_login"] == "-u ryanjin333 -p [REDACTED] docker.io"
+    assert payload["env"] == {"B1K_TRAINING_SMOKE_RUNTIME": "1"}
 
 
 def test_rollout_create_uses_environment_smoke_mode_without_an_incomplete_runtime_argument(tmp_path: Path) -> None:
@@ -167,10 +188,32 @@ def test_rollout_create_uses_environment_smoke_mode_without_an_incomplete_runtim
     client.select_offer("rollout-smoke")
     assert "gpu_ram>=24" in runner.calls[0][0][3]
     client.create_instance({"offer_id": "12", "template_id": "123", "idempotency_key": "b1k-smoke-" + "c" * 32, "hourly_rate_usd": "0.20", "disk_gb": 300, "purpose": "rollout-smoke", "image_reference": runner.template["image"], "payload_hash": canonical_payload_hash(runner.template)}, timeout_seconds=30)
-    create = runner.calls[-1][0]
-    assert "--args" not in create
-    assert create[-2:] == ("--env", "-e B1K_ROLLOUT_SMOKE_RUNTIME=1")
-    assert ("--disk", "300") in zip(create, create[1:])
+    payload = runner.http_calls[-1][3]
+    assert payload.get("args") is None
+    assert payload["env"] == {"B1K_ROLLOUT_SMOKE_RUNTIME": "1"}
+    assert payload["disk"] == 300
+
+
+def test_private_pull_credential_failure_is_typed_and_never_reaches_vast_create(tmp_path: Path) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+    (tmp_path / "docker.token").chmod(0o644)
+
+    with pytest.raises(ProductionSmokeError, match="credential"):
+        client.create_instance(
+            {
+                "offer_id": "12",
+                "template_id": "123",
+                "idempotency_key": "b1k-smoke-" + "d" * 32,
+                "hourly_rate_usd": "0.20",
+                "disk_gb": 100,
+                "purpose": "training-smoke",
+                "image_reference": runner.template["image"],
+                "payload_hash": canonical_payload_hash(runner.template),
+            },
+            timeout_seconds=30,
+        )
+
+    assert not any(call[0][2:4] == ("create", "instance") for call in runner.calls)
 
 
 @pytest.mark.parametrize("target", ["47198086", "*", "b1k-smoke-" + "a" * 32, "12;destroy instance 47198086"])

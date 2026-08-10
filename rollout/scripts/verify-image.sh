@@ -51,7 +51,12 @@ docker run --rm --platform linux/amd64 --entrypoint /bin/bash "$image_ref" -euo 
   /opt/conda/envs/behavior/bin/python -c "import b1k_rollout.cli; import b1k_rollout.policy_server"
   /opt/conda/envs/behavior/bin/python -m b1k_rollout.cli --help >/dev/null
   set +e
-  grep -RIE "hf_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{30,}" /opt/rollout /behavior-src /opt/isaac-groot >/dev/null
+  # Scan the shipped release sources, but not generated dependency or Git
+  # metadata trees. Third-party test utilities can contain synthetic token
+  # fixtures that are not release credentials and are not executable inputs.
+  grep -RIE --exclude-dir=.git --exclude-dir=.venv \
+    "hf_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{30,}" \
+    /opt/rollout /behavior-src /opt/isaac-groot >/dev/null
   secret_status=$?
   set -e
   [[ "$secret_status" -eq 1 ]]

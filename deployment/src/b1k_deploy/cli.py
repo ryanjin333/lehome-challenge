@@ -170,7 +170,12 @@ def _smoke_campaign(args: argparse.Namespace) -> int:
     if not isinstance(helper, str) or not helper.startswith("/"):
         raise PublicationError("--execute requires B1K_CHECKPOINT_BUCKET_HELPER for the exact private bucket pre-rent probe")
     hub.bootstrap_checkpoint_bucket_probe(CheckpointBucketHelperClient(helper, str(_required_private_file(os.environ, "B1K_HF_TOKEN_FILE"))), destinations.checkpoint_bucket)
-    vast = VastCliSmokeClient(vastai_executable=settings.vastai_executable, api_key_file=settings.vast_api_key_file)
+    vast = VastCliSmokeClient(
+        vastai_executable=settings.vastai_executable,
+        api_key_file=settings.vast_api_key_file,
+        registry_username=settings.docker_username,
+        registry_token_file=settings.docker_token_file,
+    )
     releases = {item.purpose: item for item in publication.images}
     remote = SshSmokeRemote(
         vast=vast,

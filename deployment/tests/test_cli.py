@@ -64,7 +64,16 @@ def _stub_execute_dependencies(
     monkeypatch.setattr(cli, "AtomicCampaignReceiptStore", lambda _path: SimpleNamespace(read=lambda: SimpleNamespace(status="complete", images=(training, rollout), templates=(1, 2))))
     monkeypatch.setattr(cli, "_verify_smoke_bindings_against_publication", lambda *_args: None)
     monkeypatch.setattr(cli, "_write_receipt", lambda _path, payload: writes.append(dict(payload)))
-    monkeypatch.setattr(production.ConfiguredPublicationSettings, "from_environment", lambda: SimpleNamespace(vastai_executable=tmp_path / "vastai", vast_api_key_file=tmp_path / "vast-key"))
+    monkeypatch.setattr(
+        production.ConfiguredPublicationSettings,
+        "from_environment",
+        lambda: SimpleNamespace(
+            vastai_executable=tmp_path / "vastai",
+            vast_api_key_file=tmp_path / "vast-key",
+            docker_username="ryanjin333",
+            docker_token_file=tmp_path / "docker-token",
+        ),
+    )
     monkeypatch.setattr(production, "_required_private_file", lambda *_args: tmp_path / "token")
     monkeypatch.setattr(dockerhub, "TokenSource", SimpleNamespace(from_token_file=lambda _path: object()))
 
