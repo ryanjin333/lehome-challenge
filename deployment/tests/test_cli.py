@@ -150,3 +150,24 @@ def test_execute_smoke_campaign_preserves_typed_runtime_failure_and_chains_templ
     assert isinstance(error.value.__cause__, ProductionSmokeError)
     assert str(error.value.__cause__) == "template cleanup failed"
     assert writes[-1]["template_cleanup_failure"] is True
+
+
+def test_execute_smoke_campaign_allows_large_images_thirty_minutes_to_reach_ssh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import b1k_deploy.smoke as smoke
+
+    runtime_error = ProductionSmokeError("stop after timeout capture")
+    _stub_execute_dependencies(tmp_path, monkeypatch, runtime_error=runtime_error)
+    observed: dict[str, int] = {}
+
+    def capture_timeouts(**values: int) -> object:
+        observed.update(values)
+        return object()
+
+    monkeypatch.setattr(smoke, "SmokeTimeouts", capture_timeouts)
+
+    with pytest.raises(ProductionSmokeError, match="stop after timeout capture"):
+        cli._smoke_campaign(_execute_smoke_args(tmp_path))
+
+    assert observed["ssh_timeout_seconds"] == 1800

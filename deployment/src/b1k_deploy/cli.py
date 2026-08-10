@@ -195,7 +195,7 @@ def _smoke_campaign(args: argparse.Namespace) -> int:
         hub_verifier=hub,
     )
     controller = SmokeController(CappedVastController(RentalLedger(args.ledger), VastAdapter(vast)), remote)
-    timeouts = SmokeTimeouts(ssh_timeout_seconds=900, runtime_timeout_seconds=1800, contract_timeout_seconds=1800, disappearance_timeout_seconds=300)
+    timeouts = SmokeTimeouts(ssh_timeout_seconds=1800, runtime_timeout_seconds=1800, contract_timeout_seconds=1800, disappearance_timeout_seconds=300)
     result: dict[str, object] = {"dry_run": False, "runs": [], "ephemeral_templates": {}}
     for role, purpose in (("training", "training-smoke"), ("rollout", "rollout-smoke")):
         image = releases[role]
