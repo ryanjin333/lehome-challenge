@@ -286,7 +286,7 @@ def test_concrete_docker_client_uses_current_hub_bearer_api_and_ephemeral_cli_co
     assert transport.calls[3][1].endswith(f"/v2/ryanjin333/behavior1k-groot-n17/manifests/{TRAINER_TAG}")
     assert [call[0][1] for call in runner.calls] == ["pull", "image"]
     assert all(call[1] is None for call in runner.calls)
-    assert runner.calls[0][0] == ("/usr/local/bin/docker", "pull", TRAINER_REPOSITORY + "@sha256:" + "b" * 64)
+    assert runner.calls[0][0] == ("/usr/local/bin/docker", "pull", "--platform", "linux/amd64", TRAINER_REPOSITORY + "@sha256:" + "b" * 64)
     assert runner.calls[1][0][:4] == ("/usr/local/bin/docker", "image", "inspect", "--format")
     assert runner.calls[0][2]["DOCKER_CONFIG"] == runner.calls[1][2]["DOCKER_CONFIG"]
     assert runner.calls[0][2]["PATH"] == "/usr/local/bin:/usr/bin"
@@ -335,8 +335,10 @@ def test_authenticated_pull_uses_one_private_inline_auth_config_without_a_login_
             self.configs = []
 
         def run(self, arguments, *, stdin, env, timeout):
-            config = __import__("pathlib").Path(env["DOCKER_CONFIG"]) / "config.json"
             self.calls.append((arguments, stdin, dict(env), timeout))
+            if arguments[1:3] == ("context", "show"):
+                return CommandResult(0, "default\n", "")
+            config = __import__("pathlib").Path(env["DOCKER_CONFIG"]) / "config.json"
             self.configs.append((config.read_text(encoding="utf-8"), config.stat().st_mode & 0o777))
             if arguments[1:3] == ("image", "inspect"):
                 return CommandResult(0, '{"io.lehome.image-role":"training","org.opencontainers.image.revision":"' + SOURCE_COMMIT + '"}', "")
@@ -348,10 +350,10 @@ def test_authenticated_pull_uses_one_private_inline_auth_config_without_a_login_
 
     result = client.authenticated_pull(TRAINER_REPOSITORY + "@sha256:" + "a" * 64, _DOCKER_TEST_TOKEN)
 
-    assert [call[0][1] for call in runner.calls] == ["pull", "image"]
+    assert [call[0][1] for call in runner.calls] == ["context", "pull", "image"]
     assert all(call[1] is None for call in runner.calls)
-    assert runner.calls[0][2]["DOCKER_CONFIG"] == runner.calls[1][2]["DOCKER_CONFIG"]
-    assert all(mode == 0o600 and _DOCKER_TEST_TOKEN not in str(call) for (_contents, mode), call in zip(runner.configs, runner.calls))
+    assert runner.calls[1][2]["DOCKER_CONFIG"] == runner.calls[2][2]["DOCKER_CONFIG"]
+    assert all(mode == 0o600 and _DOCKER_TEST_TOKEN not in str(call) for (_contents, mode), call in zip(runner.configs, runner.calls[1:]))
     assert all(
         '"auths":{"https://index.docker.io/v1/":{"auth":' in contents
         for contents, _mode in runner.configs
@@ -413,6 +415,38 @@ def test_desktop_context_inspection_uses_the_original_config_before_ephemeral_lo
     assert inspect[1] is None
     assert inspect[2] == {"PATH": "/usr/local/bin:/usr/bin", "DOCKER_CONFIG": "/Users/user/.docker", "DOCKER_CONTEXT": "desktop-linux"}
     assert inspect[3] == 11
+    assert pull[2]["DOCKER_HOST"] == "unix:///Users/user/.docker/run/docker.sock"
+    assert "DOCKER_CONTEXT" not in pull[2]
+
+
+def test_authenticated_pull_resolves_current_nondefault_context_when_environment_is_unset(monkeypatch):
+    class Runner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, arguments, *, stdin, env, timeout):
+            self.calls.append((arguments, stdin, dict(env), timeout))
+            if arguments[1:3] == ("context", "show"):
+                return CommandResult(0, "desktop-linux\n", "")
+            if arguments[1:3] == ("context", "inspect"):
+                return CommandResult(0, "unix:///Users/user/.docker/run/docker.sock\n", "")
+            if arguments[1:3] == ("image", "inspect"):
+                return CommandResult(0, '{"io.lehome.image-role":"training","org.opencontainers.image.revision":"' + SOURCE_COMMIT + '"}', "")
+            return CommandResult(0, "", "")
+
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+    monkeypatch.setenv("DOCKER_CONFIG", "/Users/user/.docker")
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    runner = Runner()
+    client = DockerHubClient("ryanjin333", runner=runner, docker_executable="/usr/local/bin/docker", timeout_seconds=11)
+
+    client.authenticated_pull(TRAINER_REPOSITORY + "@sha256:" + "a" * 64, ("dckr_pat_" + "abcdefghijklmnopqrstuvwxyz0123456789"))
+
+    show, inspect, pull = runner.calls[:3]
+    assert show[0] == ("/usr/local/bin/docker", "context", "show")
+    assert show[2] == {"PATH": "/usr/local/bin:/usr/bin", "DOCKER_CONFIG": "/Users/user/.docker"}
+    assert inspect[0] == ("/usr/local/bin/docker", "context", "inspect", "desktop-linux", "--format", "{{.Endpoints.docker.Host}}")
     assert pull[2]["DOCKER_HOST"] == "unix:///Users/user/.docker/run/docker.sock"
     assert "DOCKER_CONTEXT" not in pull[2]
 

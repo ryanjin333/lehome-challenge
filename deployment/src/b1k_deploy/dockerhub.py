@@ -302,8 +302,12 @@ class DockerHubClient:
             if "DOCKER_CONTEXT" in environment:
                 environment["DOCKER_HOST"] = self._resolve_context_endpoint(environment["DOCKER_CONTEXT"])
                 environment.pop("DOCKER_CONTEXT", None)
+            elif "DOCKER_HOST" not in environment:
+                context = self._current_context()
+                if context != "default":
+                    environment["DOCKER_HOST"] = self._resolve_context_endpoint(context)
             self._write_ephemeral_auth_config(config, self._username, token)
-            self._run((self._docker_executable, "pull", reference), None, environment)
+            self._run((self._docker_executable, "pull", "--platform", "linux/amd64", reference), None, environment)
             labels = self._inspect_labels(reference, environment)
         return {"digest": digest, "labels": labels}
 
@@ -395,6 +399,21 @@ class DockerHubClient:
         if not isinstance(endpoint, str) or not endpoint or endpoint != endpoint.strip():
             raise DockerReleaseError("Docker context resolution failed")
         return endpoint
+
+    def _current_context(self) -> str:
+        try:
+            result = self._runner.run(
+                (self._docker_executable, "context", "show"),
+                stdin=None,
+                env=self._original_context_environment(),
+                timeout=self._timeout,
+            )
+            context = result.stdout.strip() if isinstance(result, CommandResult) and result.returncode == 0 else ""
+        except Exception:
+            raise DockerReleaseError("Docker context resolution failed") from None
+        if not context or len(context) > 128 or any(char.isspace() for char in context):
+            raise DockerReleaseError("Docker context resolution failed")
+        return context
 
     def _basic_headers(self, token: str) -> Mapping[str, str]:
         encoded = base64.b64encode(f"{self._username}:{token}".encode("utf-8")).decode("ascii")
