@@ -444,7 +444,24 @@ class VastCliSmokeClient:
         self._tool_timeout(timeout_seconds)
         exact = _non_protected_id(instance_id)
         # No query, label, or discovery is ever accepted here.
-        self._json((str(self._vastai), "--raw", "destroy", "instance", exact), timeout_seconds)
+        arguments = (str(self._vastai), "destroy", "instance", exact, "--yes")
+        try:
+            result = self._runner.run(arguments, stdin=None, env=_vast_environment(), timeout=timeout_seconds)
+        except Exception:
+            raise ProductionSmokeError("Vast instance destruction failed") from None
+        if (
+            not isinstance(result, CommandResult)
+            or result.returncode != 0
+            or not isinstance(result.stdout, str)
+            or not isinstance(result.stderr, str)
+            or bool(result.stderr.strip())
+        ):
+            raise ProductionSmokeError("Vast instance destruction failed")
+        line = result.stdout[:-1] if result.stdout.endswith("\n") else result.stdout
+        if line.endswith("\r"):
+            line = line[:-1]
+        if line != f"destroying instance {exact}.":
+            raise ProductionSmokeError("Vast instance destruction failed")
 
     def list_instance_ids(self, *, timeout_seconds: float) -> tuple[str, ...]:
         # Listing is read-only: a protected existing instance may be visible but

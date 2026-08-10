@@ -129,8 +129,8 @@ class VastRunner:
             payload = [{**self.template, "id": 123, "hash_id": "canonical_template_hash"}]
         elif arguments[2:4] == ("show", "instances"):
             payload = self.instances
-        elif arguments[2:4] == ("destroy", "instance"):
-            payload = {"success": True}
+        elif arguments[1:3] == ("destroy", "instance"):
+            return CommandResult(0, f"destroying instance {arguments[3]}.\n", "")
         elif arguments[2:4] == ("delete", "template"):
             return CommandResult(0, "Template deleted successfully\n", "")
         else:
@@ -226,6 +226,28 @@ def test_destroy_rejects_any_non_exact_or_protected_target_without_running_cli(t
     with pytest.raises(ProductionSmokeError):
         client.destroy_instance(target, timeout_seconds=30)
     assert runner.calls == []
+
+
+def test_destroy_instance_uses_current_noninteractive_vast_syntax_and_exact_success(
+    tmp_path: Path,
+) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+
+    client.destroy_instance("456", timeout_seconds=30)
+
+    assert runner.calls == [
+        ((str(tmp_path / "vastai"), "destroy", "instance", "456", "--yes"), 30)
+    ]
+
+
+def test_destroy_instance_rejects_vast_zero_exit_abort_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+    monkeypatch.setattr(runner, "run", lambda *_args, **_kwargs: CommandResult(0, "Aborted.\n", ""))
+
+    with pytest.raises(ProductionSmokeError, match="instance destruction failed"):
+        client.destroy_instance("456", timeout_seconds=30)
 
 
 def test_reconciliation_requires_one_exact_label_match_and_endpoint_is_exact_id_bound(tmp_path: Path) -> None:
