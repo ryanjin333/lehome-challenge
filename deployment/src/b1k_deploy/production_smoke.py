@@ -618,6 +618,39 @@ class SshSmokeRemote:
         self._runner, self._clock, self._sleep = runner, clock, sleep
         self._endpoints: dict[str, VastInstanceEndpoint] = {}
 
+    @classmethod
+    def for_rollout(
+        cls,
+        *,
+        vast: VastCliSmokeClient,
+        identity_file: Path,
+        known_hosts: Path,
+        rollout_image: str,
+        rollout_release: DockerImageRelease | None,
+        hub_verifier: HuggingFaceReleaseVerifier,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> "SshSmokeRemote":
+        """Create a release-bound transport for an independently published rollout."""
+
+        if not _DIGEST_IMAGE_RE.fullmatch(rollout_image):
+            raise ProductionSmokeError("rollout smoke image must be one canonical rollout digest")
+        if not _canonical_image_release_identity(rollout_release, "rollout") or rollout_release.reference != rollout_image:
+            raise ProductionSmokeError("rollout smoke release receipt is invalid")
+        remote = cls.__new__(cls)
+        remote._vast = vast
+        remote._identity = _private_identity(identity_file)
+        remote._known_hosts = _campaign_known_hosts(known_hosts)
+        remote._training_image = None
+        remote._rollout_image = rollout_image
+        remote._training_release = None
+        remote._rollout_release = rollout_release
+        remote._hub = hub_verifier
+        remote._runner, remote._clock, remote._sleep = runner, clock, sleep
+        remote._endpoints = {}
+        return remote
+
     def wait_for_ssh(self, instance_id: str, timeout_seconds: int, poll_interval_seconds: int) -> str:
         endpoint = self._wait_endpoint(instance_id, timeout_seconds, poll_interval_seconds, require_ssh=True)
         return f"ssh://{endpoint.host}:{endpoint.port}"
@@ -625,6 +658,8 @@ class SshSmokeRemote:
     def wait_for_runtime(self, instance_id: str, purpose: str, timeout_seconds: int, poll_interval_seconds: int) -> str:
         if purpose not in {"training-smoke", "rollout-smoke"}:
             raise ProductionSmokeError("runtime purpose is invalid")
+        if purpose == "training-smoke" and self._training_image is None:
+            raise ProductionSmokeError("training smoke remote is unavailable")
         exact = _non_protected_id(instance_id)
         deadline = self._deadline(timeout_seconds)
         if exact not in self._endpoints:
@@ -647,6 +682,8 @@ class SshSmokeRemote:
         raise ProductionSmokeError("runtime readiness timed out") from last_error
 
     def run_training_contract(self, run_id: str, instance_id: str, timeout_seconds: int) -> TrainingRuntimeEvidence:
+        if self._training_image is None or self._training_release is None:
+            raise ProductionSmokeError("training smoke remote is unavailable")
         _label(run_id)
         try:
             payload = self._runtime_json(instance_id, _training_command(self._training_image, f"b1k-bootstrap-{_run_hex(run_id)}-smoke-model"), timeout_seconds, self._training_image)

@@ -107,6 +107,31 @@ def test_unified_repository_rejects_cross_source_role_pair(tmp_path: Path) -> No
             hub_verifier=object(),
         )
 
+
+def test_rollout_only_remote_accepts_one_independently_verified_release(tmp_path: Path) -> None:
+    runner = VastRunner()
+    client = _client(tmp_path, runner)
+    identity = tmp_path / "id"
+    identity.write_text("private", encoding="utf-8")
+    identity.chmod(0o600)
+    release = replace(
+        rollout_release("docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64),
+        tag="rollout-" + "b" * 40,
+        source_commit="b" * 40,
+    )
+
+    remote = SshSmokeRemote.for_rollout(
+        vast=client,
+        identity_file=identity,
+        known_hosts=tmp_path / "campaign" / "known_hosts",
+        rollout_image=release.reference,
+        rollout_release=release,
+        hub_verifier=object(),
+    )
+
+    with pytest.raises(ProductionSmokeError, match="training smoke remote is unavailable"):
+        remote.run_training_contract("b1k-smoke-" + "1" * 32, "123", 1)
+
 class VastRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[str, ...], float]] = []
