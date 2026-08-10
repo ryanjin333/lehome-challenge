@@ -147,6 +147,12 @@ class DockerBuildxImageBuilder:
             os.chmod(config, 0o700)
             environment = DockerHubClient._docker_environment(config)
             DockerHubClient._write_ephemeral_auth_config(config, self._username, token)
+            plugin = _discover_buildx_plugin(self._docker_executable)
+            if plugin is not None:
+                plugin_directory = Path(config) / "cli-plugins"
+                plugin_directory.mkdir(mode=0o700)
+                plugin_directory.chmod(0o700)
+                (plugin_directory / "docker-buildx").symlink_to(plugin)
             self._run(
                 buildx_release_command(self._docker_executable, self._workspace, repository, tag, source_commit),
                 None,
@@ -161,6 +167,38 @@ class DockerBuildxImageBuilder:
             raise PublicationError(f"{operation} failed") from None
         if not isinstance(result, CommandResult) or result.returncode != 0:
             raise PublicationError(f"{operation} failed")
+
+
+def _discover_buildx_plugin(docker_executable: Path) -> Path | None:
+    candidates = [
+        docker_executable.parent.parent / "cli-plugins" / "docker-buildx",
+        Path("/usr/local/lib/docker/cli-plugins/docker-buildx"),
+        Path("/usr/local/libexec/docker/cli-plugins/docker-buildx"),
+        Path("/usr/lib/docker/cli-plugins/docker-buildx"),
+        Path("/usr/libexec/docker/cli-plugins/docker-buildx"),
+    ]
+    homebrew_cellar = next((parent for parent in docker_executable.parents if parent.name == "Cellar"), None)
+    if homebrew_cellar is not None:
+        candidates.extend(
+            (
+                homebrew_cellar.parent / "lib" / "docker" / "cli-plugins" / "docker-buildx",
+                homebrew_cellar.parent / "libexec" / "docker" / "cli-plugins" / "docker-buildx",
+            )
+        )
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+            metadata = resolved.stat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_mode & 0o111
+            and not metadata.st_mode & 0o022
+            and metadata.st_uid in {0, os.getuid()}
+        ):
+            return resolved
+    return None
 
 
 class VastCliTemplateClient:

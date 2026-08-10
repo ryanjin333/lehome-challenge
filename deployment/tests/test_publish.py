@@ -858,9 +858,15 @@ def test_fixed_buildx_builder_uses_private_inline_auth_and_exact_amd64_release_a
     token_file = tmp_path / "docker-token"
     token_file.write_text("token-never-in-arguments", encoding="utf-8")
     token_file.chmod(0o600)
-    docker_executable = tmp_path / "docker"
+    resources = tmp_path / "Resources"
+    docker_executable = resources / "bin" / "docker"
+    docker_executable.parent.mkdir(parents=True)
     docker_executable.write_text("#!/bin/sh\n", encoding="utf-8")
     docker_executable.chmod(0o700)
+    buildx_plugin = resources / "cli-plugins" / "docker-buildx"
+    buildx_plugin.parent.mkdir()
+    buildx_plugin.write_text("#!/bin/sh\n", encoding="utf-8")
+    buildx_plugin.chmod(0o700)
 
     class Runner:
         def __init__(self):
@@ -871,6 +877,10 @@ def test_fixed_buildx_builder_uses_private_inline_auth_and_exact_amd64_release_a
             self.calls.append((arguments, stdin, dict(env), timeout))
             config = Path(env["DOCKER_CONFIG"]) / "config.json"
             self.configs.append((config.read_text(encoding="utf-8"), config.stat().st_mode & 0o777))
+            linked_plugin = config.parent / "cli-plugins" / "docker-buildx"
+            assert linked_plugin.is_symlink()
+            assert linked_plugin.resolve(strict=True) == buildx_plugin
+            assert linked_plugin.parent.stat().st_mode & 0o777 == 0o700
             return CommandResult(0, "", "")
 
     runner = Runner()
@@ -900,6 +910,22 @@ def test_fixed_buildx_builder_uses_private_inline_auth_and_exact_amd64_release_a
     assert ("--target", "training-runtime") in zip(build[0], build[0][1:])
     assert ("--label", "io.lehome.release-mode=release") in zip(build[0], build[0][1:])
     assert build[3] == 1800.0
+
+
+def test_buildx_plugin_discovery_derives_the_homebrew_prefix_from_the_resolved_docker_executable(tmp_path):
+    from b1k_deploy.production import _discover_buildx_plugin
+
+    prefix = tmp_path / "homebrew"
+    docker_executable = prefix / "Cellar" / "docker" / "29.0.1" / "bin" / "docker"
+    docker_executable.parent.mkdir(parents=True)
+    docker_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    docker_executable.chmod(0o700)
+    buildx_plugin = prefix / "lib" / "docker" / "cli-plugins" / "docker-buildx"
+    buildx_plugin.parent.mkdir(parents=True)
+    buildx_plugin.write_text("#!/bin/sh\n", encoding="utf-8")
+    buildx_plugin.chmod(0o700)
+
+    assert _discover_buildx_plugin(docker_executable) == buildx_plugin.resolve(strict=True)
 
 
 def test_fixed_buildx_builder_rejects_workspace_head_mismatch_before_docker_login_or_build(tmp_path):
