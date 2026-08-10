@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from lehome.flywheel.isaac_recorder import AutonomousRecorder, CANONICAL_VIDEO_FILENAMES, MixedSourceRecorder
-from lehome.flywheel.snapshots import Snapshot
+from lehome.flywheel.snapshots import Snapshot, canonical_reset_hash
 from lehome.flywheel.models import ActionSource, EpisodeIdentity, EpisodeOutcome, QualityGrade, RejectionReason
 
 
@@ -187,6 +187,29 @@ def test_recorder_checksum_covers_reset_and_terminal_snapshots(tmp_path) -> None
     final = recorder.finish(reason="horizon", accepted_success=False)
     manifest = json.loads((final.path / "SHA256SUMS.json").read_text(encoding="utf-8"))
     assert "snapshots/reset.json" in manifest and "snapshots/terminal.json" in manifest
+    assert final.episode["reset_hash"] == canonical_reset_hash(snapshot)
+
+
+def test_autonomous_recorder_persists_simulator_contact_evidence(tmp_path, monkeypatch) -> None:
+    recorder = AutonomousRecorder.for_test(tmp_path, policy_revision="a" * 40)
+    recorder.record_step(observation(), np.ones(12), reward=0.0, success=False, request_id="r", chunk_offset=0)
+    monkeypatch.setattr(recorder.video_sink, "encode", lambda root, fps=30: _encode_videos(root))
+
+    final = recorder.finish(
+        reason="horizon",
+        accepted_success=False,
+        visible_contact={"observed": True, "source": "simulator_particle_to_gripper_distance", "minimum_distance_m": 0.012},
+    )
+
+    assert final.episode["visible_contact"]["observed"] is True
+
+
+def _encode_videos(root) -> tuple[str, ...]:
+    videos = root / "videos"
+    videos.mkdir(exist_ok=True)
+    for filename in CANONICAL_VIDEO_FILENAMES:
+        (videos / filename).write_bytes(b"video")
+    return CANONICAL_VIDEO_FILENAMES
 
 
 def test_recorder_rejects_identity_with_a_different_episode_id(tmp_path) -> None:

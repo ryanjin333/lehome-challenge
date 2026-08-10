@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from threading import Event, Thread
 from typing import Callable, Literal, Protocol
 
 from lehome_train.batch_select import (
@@ -98,6 +99,7 @@ class SmokeAttemptReceipt:
     steady_state_optimizer_steps: int
     telemetry_samples: tuple[TelemetrySample, ...]
     failure_reason: FailureReason | None = None
+    per_device_telemetry_samples: tuple[tuple[TelemetrySample, ...], ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.optimizer_steps) is not int or self.optimizer_steps < 0:
@@ -114,6 +116,13 @@ class SmokeAttemptReceipt:
             isinstance(sample, TelemetrySample) for sample in self.telemetry_samples
         ):
             raise ValueError("smoke telemetry samples must be a tuple of TelemetrySample")
+        if not isinstance(self.per_device_telemetry_samples, tuple) or not all(
+            isinstance(samples, tuple)
+            and samples
+            and all(isinstance(sample, TelemetrySample) for sample in samples)
+            for samples in self.per_device_telemetry_samples
+        ):
+            raise ValueError("per-device smoke telemetry must contain non-empty sample tuples")
         if self.failure_reason not in (None, "cuda_oom", "non_finite_loss"):
             raise ValueError("smoke failure reason is unsupported")
         if (not self.finite_loss) != (self.failure_reason == "non_finite_loss"):
@@ -128,6 +137,7 @@ class SmokeAttempt(StrictModel):
     result: SmokeResult
     telemetry: TelemetrySummary
     completed_optimizer_steps: int
+    per_device_telemetry: tuple[TelemetrySummary, ...] = ()
 
     def __post_init__(self) -> None:
         StrictModel.__post_init__(self)
@@ -168,9 +178,24 @@ class SmokeRunner(Protocol):
 SamplerFactory = Callable[[], TelemetrySampler]
 
 
+class MultiDeviceTelemetrySampler(Protocol):
+    def sample_all(self) -> tuple[TelemetrySample, ...]: ...
+
+    def close(self) -> None: ...
+
+
 def _attempt_config(base: FineTuneLaunchConfig, batch_size: int) -> FineTuneLaunchConfig:
     """Change only batch identity and the fixed smoke step budget."""
 
+    if base.num_gpus == 4:
+        if batch_size != 1:
+            raise ValueError("four-GPU smoke profile requires per-device batch 1")
+        return replace(
+            base,
+            experiment_name=f"{base.experiment_name}-distributed-smoke",
+            max_steps=SMOKE_OPTIMIZER_STEPS,
+            save_steps=SMOKE_OPTIMIZER_STEPS,
+        )
     return replace(
         base,
         experiment_name=f"{base.experiment_name}-batch-{batch_size}",
@@ -198,6 +223,8 @@ def _run_with_optional_sampler(
     sampler = sampler_factory()
     if not hasattr(sampler, "sample"):
         raise TypeError("smoke sampler factory must return a TelemetrySampler")
+    if hasattr(sampler, "sample_all"):
+        return _run_with_multi_device_sampler(runner, config, sampler)
     try:
         try:
             receipt, boundary_samples = sample_operation(
@@ -222,6 +249,60 @@ def _run_with_optional_sampler(
     return replace(receipt, telemetry_samples=boundary_samples)
 
 
+def _run_with_multi_device_sampler(
+    runner: SmokeRunner,
+    config: FineTuneLaunchConfig,
+    sampler: MultiDeviceTelemetrySampler,
+) -> SmokeAttemptReceipt:
+    """Capture aligned evidence for every distributed device during the run."""
+
+    first = sampler.sample_all()
+    samples = [[sample] for sample in first]
+    stopped = Event()
+    errors: list[BaseException] = []
+
+    def poll() -> None:
+        while not stopped.wait(0.1):
+            try:
+                observed = sampler.sample_all()
+                if len(observed) != len(samples):
+                    raise ValueError("distributed telemetry device count drifted")
+                for destination, sample in zip(samples, observed):
+                    destination.append(sample)
+            except BaseException as error:
+                errors.append(error)
+                stopped.set()
+
+    polling = Thread(target=poll, name="lehome-distributed-smoke-telemetry", daemon=True)
+    polling.start()
+    try:
+        receipt = runner(config)
+    except SmokeRunnerFailure as failure:
+        receipt = failure.to_receipt()
+    finally:
+        stopped.set()
+        polling.join()
+        try:
+            final = sampler.sample_all()
+            if len(final) != len(samples):
+                raise ValueError("distributed telemetry device count drifted")
+            for destination, sample in zip(samples, final):
+                destination.append(sample)
+        except BaseException as error:
+            errors.append(error)
+        sampler.close()
+    if errors:
+        raise RuntimeError("distributed telemetry sampling failed during smoke launch") from errors[0]
+    if not isinstance(receipt, SmokeAttemptReceipt):
+        raise TypeError("smoke runner must return SmokeAttemptReceipt")
+    evidence = tuple(tuple(device_samples) for device_samples in samples)
+    return replace(
+        receipt,
+        telemetry_samples=receipt.telemetry_samples or evidence[0],
+        per_device_telemetry_samples=evidence,
+    )
+
+
 def _validated_attempt(
     *,
     config: FineTuneLaunchConfig,
@@ -237,6 +318,8 @@ def _validated_attempt(
         raise ValueError("successful smoke attempts must run exactly 100 optimizer steps")
     if not receipt.telemetry_samples:
         raise ValueError("every smoke attempt requires telemetry samples")
+    if config.num_gpus == 4 and len(receipt.per_device_telemetry_samples) != 4:
+        raise ValueError("four-GPU smoke requires telemetry evidence from every device")
     if receipt.failure_reason is None:
         telemetry = summarize_telemetry(
             receipt.telemetry_samples,
@@ -244,7 +327,7 @@ def _validated_attempt(
             warmup_seconds=receipt.warmup_seconds,
             steady_state_seconds=receipt.steady_state_seconds,
             steady_state_optimizer_steps=receipt.steady_state_optimizer_steps,
-            physical_batch_size=config.physical_batch_size,
+            physical_batch_size=config.global_batch_size,
         )
     else:
         telemetry = summarize_failure_telemetry(
@@ -254,17 +337,55 @@ def _validated_attempt(
         )
     if telemetry.physical_total_vram_bytes != physical_vram_bytes:
         raise ValueError("NVML total does not match expected physical VRAM")
+    per_device_telemetry: tuple[TelemetrySummary, ...] = ()
+    if receipt.per_device_telemetry_samples:
+        summarizer = (
+            summarize_failure_telemetry
+            if receipt.failure_reason is not None
+            else summarize_telemetry
+        )
+        summaries: list[TelemetrySummary] = []
+        for samples in receipt.per_device_telemetry_samples:
+            if receipt.failure_reason is None:
+                summaries.append(
+                    summarizer(
+                        samples,
+                        initialization_seconds=receipt.initialization_seconds,
+                        warmup_seconds=receipt.warmup_seconds,
+                        steady_state_seconds=receipt.steady_state_seconds,
+                        steady_state_optimizer_steps=receipt.steady_state_optimizer_steps,
+                        physical_batch_size=config.global_batch_size,
+                    )
+                )
+            else:
+                summaries.append(
+                    summarizer(
+                        samples,
+                        initialization_seconds=receipt.initialization_seconds,
+                        warmup_seconds=receipt.warmup_seconds,
+                    )
+                )
+        per_device_telemetry = tuple(summaries)
+        if min(item.physical_total_vram_bytes for item in per_device_telemetry) != physical_vram_bytes:
+            raise ValueError("per-device NVML totals do not match the limiting visible GPU")
+    distributed_headroom = all(
+        item.minimum_steady_state_free_vram_bytes is not None
+        and item.minimum_steady_state_free_vram_bytes * 100
+        >= item.physical_total_vram_bytes * 10
+        for item in per_device_telemetry
+    )
     stable = (
         receipt.optimizer_steps == SMOKE_OPTIMIZER_STEPS
         and receipt.gradient_accumulation_steps == 1
         and receipt.finite_loss
         and receipt.failure_reason is None
+        and (config.num_gpus != 4 or distributed_headroom)
     )
     result = SmokeResult(
         experiment_id=experiment_id,
         experiment_config_sha256=experiment_config_sha256,
         dataset_manifest_sha256=dataset_manifest_sha256,
-        physical_batch_size=config.physical_batch_size,
+        physical_batch_size=config.global_batch_size,
         gradient_accumulation_steps=receipt.gradient_accumulation_steps,
         optimizer_steps=SMOKE_OPTIMIZER_STEPS,
         stable=stable,
@@ -283,6 +404,7 @@ def _validated_attempt(
         result=result,
         telemetry=telemetry,
         completed_optimizer_steps=receipt.optimizer_steps,
+        per_device_telemetry=per_device_telemetry,
     )
 
 
@@ -297,7 +419,7 @@ def run_smoke_tests(
 ) -> SmokeReport:
     """Run all approved candidates synchronously and stop at memory boundaries."""
 
-    primary = batch_candidates(physical_vram_bytes)
+    primary = (1,) if base_config.num_gpus == 4 else batch_candidates(physical_vram_bytes)
     first_candidate = primary[0]
     pending = list(primary)
     fallback_mode = False

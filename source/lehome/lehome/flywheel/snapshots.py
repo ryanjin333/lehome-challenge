@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 from typing import Any, Mapping, Protocol
@@ -113,6 +114,14 @@ def capture_snapshot(adapter: SnapshotAdapter | object, *, randomization: Mappin
     )
 
 
+def canonical_reset_hash(snapshot: Snapshot) -> str:
+    """Hash the complete reset state after simulator readback in one stable form."""
+    if not isinstance(snapshot, Snapshot):
+        raise ValueError("reset hash requires a validated Snapshot")
+    payload = json.dumps(snapshot.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def restore_snapshot(adapter: SnapshotAdapter | object, snapshot: Snapshot) -> None:
     """Restore exactly the state groups captured by :func:`capture_snapshot`."""
     if not isinstance(snapshot, Snapshot):
@@ -130,4 +139,4 @@ def restore_snapshot(adapter: SnapshotAdapter | object, snapshot: Snapshot) -> N
         adapter.scene_state = _json_round_trip(snapshot.scene_state)
 
 
-__all__ = ["Snapshot", "SnapshotAdapter", "capture_snapshot", "restore_snapshot"]
+__all__ = ["Snapshot", "SnapshotAdapter", "canonical_reset_hash", "capture_snapshot", "restore_snapshot"]

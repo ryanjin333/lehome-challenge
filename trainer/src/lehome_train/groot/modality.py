@@ -18,8 +18,16 @@ _GROUPS = (
 )
 
 
-def modality_contract() -> dict[str, object]:
+def _action_horizon(value: int) -> int:
+    if type(value) is not int or value not in {16, 40}:
+        raise ValueError("action horizon must be 16 or 40")
+    return value
+
+
+def modality_contract(*, action_horizon: int = ACTION_HORIZON) -> dict[str, object]:
     """Return a detached, serializable exact LeHome GR00T contract."""
+
+    action_horizon = _action_horizon(action_horizon)
 
     groups = [
         {"key": key, "dimension": dimension, "representation": representation}
@@ -37,7 +45,7 @@ def modality_contract() -> dict[str, object]:
             "dimension": 12,
         },
         "action": {
-            "delta_indices": list(range(ACTION_HORIZON)),
+            "delta_indices": list(range(action_horizon)),
             "modality_keys": [item["key"] for item in groups],
             "dimension": 12,
             "groups": groups,
@@ -50,7 +58,7 @@ def modality_contract() -> dict[str, object]:
     }
 
 
-def runtime_modality_config_source() -> str:
+def runtime_modality_config_source(*, action_horizon: int = ACTION_HORIZON) -> str:
     """Return a self-contained config consumed by pinned Isaac-GR00T.
 
     The prepared dataset stores absolute 12D targets.  The two arm groups are
@@ -58,7 +66,8 @@ def runtime_modality_config_source() -> str:
     both grippers remain absolute.
     """
 
-    return """from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS, register_modality_config
+    action_horizon = _action_horizon(action_horizon)
+    source = """from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS, register_modality_config
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import ActionConfig, ActionFormat, ActionRepresentation, ActionType, ModalityConfig
 
@@ -87,6 +96,7 @@ if EmbodimentTag.NEW_EMBODIMENT.value in MODALITY_CONFIGS:
 else:
     register_modality_config(lehome_so101_config, embodiment_tag=EmbodimentTag.NEW_EMBODIMENT)
 """
+    return source.replace("delta_indices=list(range(16))", f"delta_indices=list(range({action_horizon}))")
 
 
 def _enum_value(value: object) -> str:
@@ -105,16 +115,19 @@ def _runtime_field(config: object, field_name: str) -> object:
         raise ValueError(f"runtime GR00T modality has no {field_name}") from error
 
 
-def validate_runtime_modality_config(config: Mapping[str, Any]) -> None:
+def validate_runtime_modality_config(
+    config: Mapping[str, Any], *, action_horizon: int = ACTION_HORIZON
+) -> None:
     """Fail closed unless a registered GR00T config is exactly our contract."""
 
     if set(config) != {"video", "state", "action", "language"}:
         raise ValueError("runtime GR00T modality must have exactly four modalities")
+    action_horizon = _action_horizon(action_horizon)
     expected_groups = ["left_arm", "left_gripper", "right_arm", "right_gripper"]
     expected = {
         "video": ([0], ["top_rgb", "left_rgb", "right_rgb"]),
         "state": ([0], expected_groups),
-        "action": (list(range(ACTION_HORIZON)), expected_groups),
+        "action": (list(range(action_horizon)), expected_groups),
         "language": ([0], ["annotation.human.task_description"]),
     }
     for name, (delta_indices, modality_keys) in expected.items():
@@ -141,7 +154,9 @@ def validate_runtime_modality_config(config: Mapping[str, Any]) -> None:
             raise AssertionError("internal action group dimension is invalid")
 
 
-def write_runtime_modality_config(destination: str | Path) -> Path:
+def write_runtime_modality_config(
+    destination: str | Path, *, action_horizon: int = ACTION_HORIZON
+) -> Path:
     """Atomically write the exact custom-embodiment Python configuration."""
 
     path = Path(destination)
@@ -153,7 +168,7 @@ def write_runtime_modality_config(destination: str | Path) -> Path:
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(runtime_modality_config_source())
+            stream.write(runtime_modality_config_source(action_horizon=action_horizon))
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)

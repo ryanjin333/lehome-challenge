@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import tarfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -78,7 +79,12 @@ def _experiment(batch: int) -> ExperimentConfig:
 
 
 def _write_checkpoint(config: FineTuneLaunchConfig, step: int) -> Path:
-    checkpoint = Path(config.output_dir) / config.experiment_name / f"checkpoint-{step}"
+    run_root = Path(config.output_dir) / config.experiment_name
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "lehome_launch.json").write_text(
+        json.dumps(config.identity()), encoding="utf-8"
+    )
+    checkpoint = run_root / f"checkpoint-{step}"
     checkpoint.mkdir(parents=True, exist_ok=True)
     (checkpoint / "weights.bin").write_bytes(f"weights-{step}".encode())
     (checkpoint / "trainer_state.json").write_text(
@@ -91,6 +97,66 @@ def _write_checkpoint(config: FineTuneLaunchConfig, step: int) -> Path:
         encoding="utf-8",
     )
     return checkpoint
+
+
+def _write_zero2_shards(checkpoint: Path) -> None:
+    shard_root = checkpoint / f"global_step{checkpoint.name.removeprefix('checkpoint-')}"
+    shard_root.mkdir()
+    (shard_root / "mp_rank_00_model_states.pt").write_bytes(b"model")
+    for rank in range(4):
+        (
+            shard_root / f"bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt"
+        ).write_bytes(b"optimizer")
+
+
+def test_visible_gpu_mapping_honors_reordered_numeric_and_uuid_cuda_devices() -> None:
+    numeric = adapters.resolve_visible_gpu_devices(
+        "3,1,0,2", expected_gpu_count=4
+    )
+    assert [device.cuda_device_index for device in numeric] == [0, 1, 2, 3]
+    assert [device.nvml_device_index for device in numeric] == [3, 1, 0, 2]
+
+    uuid = adapters.resolve_visible_gpu_devices(
+        "GPU-c,GPU-a,GPU-d,GPU-b",
+        expected_gpu_count=4,
+        uuid_indices={"GPU-a": 0, "GPU-b": 1, "GPU-c": 2, "GPU-d": 3},
+    )
+    assert [device.nvml_device_index for device in uuid] == [2, 0, 3, 1]
+
+    with pytest.raises(ValueError, match="MIG"):
+        adapters.resolve_visible_gpu_devices("MIG-one,1,2,3", expected_gpu_count=4)
+
+
+def test_nvml_probe_uses_resolved_physical_indices_not_cuda_logical_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, int | None]] = []
+
+    class FakeSampler:
+        def __init__(self, *, device_index: int, nvml_device_index: int | None = None) -> None:
+            calls.append((device_index, nvml_device_index))
+            self.nvml_device_index = nvml_device_index
+
+        def __enter__(self) -> "FakeSampler":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def sample(self) -> SimpleNamespace:
+            assert self.nvml_device_index is not None
+            return SimpleNamespace(
+                physical_total_vram_bytes=(self.nvml_device_index + 20) * 1024**3,
+                free_vram_bytes=3 * 1024**3,
+            )
+
+    monkeypatch.setattr(adapters, "NvmlTelemetrySampler", FakeSampler)
+    observed = adapters.probe_visible_gpu_memory(
+        expected_gpu_count=4, visible_devices="3,1,0,2"
+    )
+
+    assert calls == [(0, 3), (1, 1), (2, 0), (3, 2)]
+    assert [item.total_bytes // 1024**3 for item in observed] == [23, 21, 20, 22]
 
 
 def _request(schedule: ExposureSchedule, start: int, end: int) -> TrainingChunkRequest:
@@ -157,20 +223,17 @@ def test_resume_archive_is_verified_in_staging_then_atomically_exposed(
         save_steps=schedule.checkpoint_interval_steps,
     )
     step = schedule.checkpoint_interval_steps
-    source = tmp_path / "source" / config.experiment_name / f"checkpoint-{step}"
-    source.mkdir(parents=True)
-    (source / "trainer_state.json").write_text(
-        json.dumps({"global_step": step, "log_history": [{"step": step, "loss": 0.5}]}),
-        encoding="utf-8",
+    source_root = tmp_path / "source" / config.experiment_name
+    source_config = __import__("dataclasses").replace(
+        config, output_dir=str(tmp_path / "source")
     )
-    (source / "weights.bin").write_bytes(b"weights")
+    source = _write_checkpoint(source_config, step)
+    (source_root / "lehome_launch.json").write_text(
+        json.dumps(config.identity()), encoding="utf-8"
+    )
     archive = Path(config.output_dir) / "checkpoints" / f"step-{step}.tar"
     archive.parent.mkdir()
-    with tarfile.open(archive, "w") as bundle:
-        bundle.add(
-            source,
-            arcname=f"{config.experiment_name}/checkpoint-{step}",
-        )
+    adapters._tar_checkpoint(source, archive, source_root, config.experiment_name)
     experiment = _experiment(64)
 
     adapters.GrootTrainingSession(
@@ -313,6 +376,55 @@ def test_training_session_runs_pinned_boundary_and_packages_verified_archive(
     assert descriptor.record.remotely_verified is False
 
 
+def test_checkpoint_archive_restores_launch_identity_then_runs_next_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    schedule = ExposureSchedule(
+        physical_batch_size=1, checkpoint_sample_presentations=100
+    )
+    config = _config(tmp_path, batch=1, max_steps=200, save_steps=100)
+    _write_checkpoint(config, 100)
+    session = adapters.GrootTrainingSession(
+        config=config,
+        experiment_config=_experiment(1),
+        normalization_sha256=NORMALIZATION_SHA256,
+        resume_checkpoint=None,
+    )
+    session._progress = 100
+    descriptor = session.package_checkpoint(
+        optimizer_step=100,
+        sample_presentations=100,
+        schedule_sha256=schedule.sha256,
+    )
+    descriptor = __import__("dataclasses").replace(
+        descriptor,
+        record=__import__("dataclasses").replace(
+            descriptor.record, remotely_verified=True
+        ),
+    )
+    __import__("shutil").rmtree(Path(config.output_dir) / config.experiment_name)
+
+    resumed = adapters.GrootTrainingSession(
+        config=config,
+        experiment_config=_experiment(1),
+        normalization_sha256=NORMALIZATION_SHA256,
+        resume_checkpoint=descriptor,
+    )
+    launched: list[int] = []
+
+    def fake_launch(_config: FineTuneLaunchConfig, **kwargs: object) -> None:
+        launched.append(kwargs["stop_after_optimizer_step"])
+        _write_checkpoint(config, 200)
+
+    monkeypatch.setattr(adapters, "launch_finetune_to_step", fake_launch)
+    receipt = resumed.run_chunk(_request(schedule, 100, 200))
+
+    assert (Path(config.output_dir) / config.experiment_name / "lehome_launch.json").is_file()
+    assert launched == [200]
+    assert receipt.start_optimizer_step == 100
+    assert receipt.end_optimizer_step == 200
+
+
 def test_training_session_rejects_nonfinite_or_unproven_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -361,6 +473,38 @@ def test_checkpoint_state_requires_loss_from_current_boundary(
         adapters._verified_checkpoint_state(
             config, schedule.checkpoint_interval_steps
         )
+
+
+def test_four_gpu_checkpoint_requires_every_zero2_model_and_optimizer_shard(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, batch=1, max_steps=100, save_steps=100)
+    config = __import__("dataclasses").replace(
+        config, num_gpus=4, global_batch_size=4
+    )
+    checkpoint = _write_checkpoint(config, 100)
+    _write_zero2_shards(checkpoint)
+    adapters._verified_checkpoint_state(config, 100)
+
+    shard_root = checkpoint / "global_step100"
+    (shard_root / "bf16_zero_pp_rank_3_mp_rank_00_optim_states.pt").unlink()
+    with pytest.raises(ValueError, match="shard layout"):
+        adapters._verified_checkpoint_state(config, 100)
+    (shard_root / "bf16_zero_pp_rank_3_mp_rank_00_optim_states.pt").write_bytes(
+        b"optimizer"
+    )
+    (shard_root / "bf16_zero_pp_rank_4_mp_rank_00_optim_states.pt").write_bytes(
+        b"extra"
+    )
+    with pytest.raises(ValueError, match="shard layout"):
+        adapters._verified_checkpoint_state(config, 100)
+    (shard_root / "bf16_zero_pp_rank_4_mp_rank_00_optim_states.pt").unlink()
+    (shard_root / "mp_rank_00_model_states.pt").unlink()
+    (shard_root / "mp_rank_00_model_states.pt").symlink_to(
+        shard_root / "bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt"
+    )
+    with pytest.raises(ValueError, match="regular files"):
+        adapters._verified_checkpoint_state(config, 100)
 
 
 def test_memorization_initializes_without_steps_then_evaluates_exact_episode(

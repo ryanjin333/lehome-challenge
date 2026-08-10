@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from lehome.flywheel.snapshots import Snapshot, capture_snapshot, restore_snapshot
+from lehome.flywheel.snapshots import Snapshot, canonical_reset_hash, capture_snapshot, restore_snapshot
 
 
 class FakeAdapter:
@@ -92,3 +92,13 @@ def test_snapshot_round_trip_restores_mutated_scene_state() -> None:
         "garment_display_color": [[0.8, 0.7, 0.6]],
         "garment_reset_pose": [0.0] * 6,
     }
+
+
+def test_canonical_reset_hash_is_stable_and_changes_with_the_reset_state() -> None:
+    env = FakeAdapter()
+    first = capture_snapshot(env, randomization={"strategy": "canonical"})
+    assert canonical_reset_hash(first) == canonical_reset_hash(first)
+
+    env.cloth_position[0, 0] += 0.01
+    changed = capture_snapshot(env, randomization={"strategy": "canonical"})
+    assert canonical_reset_hash(changed) != canonical_reset_hash(first)

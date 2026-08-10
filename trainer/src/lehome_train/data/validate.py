@@ -43,7 +43,15 @@ def _finite_vector(value: object, size: int, label: str) -> None:
             raise ValueError(f"{label} must contain only finite numbers")
 
 
-def _validate_statistics(dataset: Path) -> None:
+def _action_horizon(manifest: Mapping[str, Any]) -> int:
+    future = manifest.get("future_actions")
+    horizon = future.get("horizon") if isinstance(future, Mapping) else None
+    if type(horizon) is not int or horizon not in {16, 40}:
+        raise ValueError("prepared future actions must have horizon 16 or 40")
+    return horizon
+
+
+def _validate_statistics(dataset: Path, *, action_horizon: int) -> None:
     stats = read_json_object(dataset / "meta" / "stats.json")
     if set(stats) != {"observation.state", "action"}:
         raise ValueError("stats.json must contain exactly 12D state and action statistics")
@@ -66,8 +74,10 @@ def _validate_statistics(dataset: Path) -> None:
             raise ValueError(f"relative_stats.json {group} has an incomplete statistics schema")
         for stat in _STAT_NAMES:
             rows = value[stat]
-            if not isinstance(rows, list) or len(rows) != 16:
-                raise ValueError(f"relative_stats.json {group}.{stat} must have 16 horizons")
+            if not isinstance(rows, list) or len(rows) != action_horizon:
+                raise ValueError(
+                    f"relative_stats.json {group}.{stat} must have {action_horizon} horizons"
+                )
             for index, row in enumerate(rows):
                 _finite_vector(row, 5, f"relative_stats.json {group}.{stat}[{index}]")
 
@@ -84,8 +94,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> tuple[list[str], list[str
     if state_schema.get("dimension") != 12:
         raise ValueError("prepared state must be 12D")
     future = manifest.get("future_actions")
-    if not isinstance(future, Mapping) or future.get("horizon") != 16:
-        raise ValueError("prepared future actions must have horizon 16")
+    _action_horizon(manifest)
     if future.get("loader_allow_padding") is not False:
         raise ValueError("prepared loader must not pad action windows")
     train = manifest.get("train_episode_ids")
@@ -345,17 +354,20 @@ def _validate_modality(dataset: Path, manifest: Mapping[str, Any]) -> None:
     if not path.is_file():
         raise ValueError("prepared GR00T modality configuration is missing")
     source = path.read_text(encoding="utf-8")
-    if source != runtime_modality_config_source():
+    action_horizon = _action_horizon(manifest)
+    if source != runtime_modality_config_source(action_horizon=action_horizon):
         raise ValueError("prepared GR00T modality configuration is not canonical")
     if sha256_file(path) != _manifest_modality_sha256(manifest):
         raise ValueError("prepared GR00T modality configuration hash differs from manifest")
     _validate_modality_metadata(dataset)
-    contract = modality_contract()
+    contract = modality_contract(action_horizon=action_horizon)
     if contract["state"]["dimension"] != 12 or contract["action"]["dimension"] != 12:
         raise AssertionError("internal modality contract is not 12D")
 
 
-def _run_pinned_loader(dataset: Path, groot_root: Path) -> None:
+def _run_pinned_loader(
+    dataset: Path, groot_root: Path, *, action_horizon: int
+) -> None:
     """Consume one joint-space VLA sample via the pinned GR00T loader."""
 
     if not (groot_root / "gr00t" / "data" / "dataset" / "lerobot_episode_loader.py").is_file():
@@ -376,7 +388,7 @@ def _run_pinned_loader(dataset: Path, groot_root: Path) -> None:
     from gr00t.data.embodiment_tags import EmbodimentTag
 
     config = MODALITY_CONFIGS[EmbodimentTag.NEW_EMBODIMENT.value]
-    validate_runtime_modality_config(config)
+    validate_runtime_modality_config(config, action_horizon=action_horizon)
     loader = LeRobotEpisodeLoader(dataset, config)
     episode = loader[0]
     sample = extract_step_data(
@@ -398,16 +410,19 @@ def validate_prepared_dataset(
     manifest = read_json_object(dataset / "manifest.json")
     from lehome_train.data.stats import _require_frozen_flywheel_mix
     _require_frozen_flywheel_mix(manifest)
+    action_horizon = _action_horizon(manifest)
     train, validation = _validate_manifest(manifest)
     _validate_offline_split(dataset, manifest, train, validation)
-    _validate_statistics(dataset)
+    _validate_statistics(dataset, action_horizon=action_horizon)
     _validate_modality(dataset, manifest)
     _verify_recorded_artifacts(dataset, manifest)
     _validate_statistics_match_train_split(dataset)
     resolved_root = groot_root or os.environ.get("LEHOME_GROOT_ROOT")
     loader_integration = "not_run_no_pinned_runtime"
     if resolved_root:
-        _run_pinned_loader(dataset, Path(resolved_root))
+        _run_pinned_loader(
+            dataset, Path(resolved_root), action_horizon=action_horizon
+        )
         loader_integration = "pinned_loader_one_batch"
     report = {
         "schema_version": 1,
@@ -417,7 +432,9 @@ def validate_prepared_dataset(
         "validation_episode_count": len(validation),
         "trainer_validation_split": "offline_only",
         "loader_integration": loader_integration,
-        "modality_contract_sha256": canonical_json_sha256(modality_contract()),
+        "modality_contract_sha256": canonical_json_sha256(
+            modality_contract(action_horizon=action_horizon)
+        ),
     }
     report_path = dataset / "meta" / "validation_report.json"
     atomic_write_json(report_path, report)

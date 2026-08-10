@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import json
 import math
 import os
@@ -12,7 +12,7 @@ import subprocess
 import tarfile
 import tempfile
 from time import monotonic
-from typing import Mapping
+from typing import Callable, Mapping
 
 from lehome_train.checkpoints import (
     CheckpointDescriptor,
@@ -41,15 +41,144 @@ from lehome_train.models import (
 )
 from lehome_train.offline_eval import OfflineEvaluation, evaluate_action_predictions
 from lehome_train.schedule import ExposureSchedule
+from lehome_train.telemetry import NvmlTelemetrySampler
+
+
+@dataclass(frozen=True, slots=True)
+class VisibleGpuMemory:
+    """One independently observed visible GPU memory state."""
+
+    total_bytes: int
+    free_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class VisibleGpuDevice:
+    """One CUDA logical device resolved to its physical NVML device."""
+
+    cuda_visible_device: str
+    cuda_device_index: int
+    nvml_device_index: int
+
+
+def _nvml_uuid_indices() -> dict[str, int]:
+    """Resolve physical NVML UUIDs without trusting CUDA's logical order."""
+
+    try:
+        import pynvml  # type: ignore[import-not-found]
+    except ImportError:
+        raise RuntimeError("NVML is required to resolve CUDA GPU UUIDs") from None
+    pynvml.nvmlInit()
+    try:
+        result: dict[str, int] = {}
+        for index in range(pynvml.nvmlDeviceGetCount()):
+            raw_uuid = pynvml.nvmlDeviceGetUUID(pynvml.nvmlDeviceGetHandleByIndex(index))
+            uuid = raw_uuid.decode("utf-8") if isinstance(raw_uuid, bytes) else str(raw_uuid)
+            result[uuid] = index
+        return result
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def resolve_visible_gpu_devices(
+    visible_devices: str | None,
+    *,
+    expected_gpu_count: int,
+    uuid_indices: Mapping[str, int] | None = None,
+) -> tuple[VisibleGpuDevice, ...]:
+    """Resolve CUDA_VISIBLE_DEVICES in order; MIG is rejected fail-closed."""
+
+    if expected_gpu_count not in {1, 4}:
+        raise ValueError("GPU mapping requires exactly one or four visible GPUs")
+    if not isinstance(visible_devices, str):
+        raise ValueError("CUDA_VISIBLE_DEVICES must explicitly name every GPU")
+    tokens = tuple(token.strip() for token in visible_devices.split(","))
+    if len(tokens) != expected_gpu_count or not all(tokens) or len(set(tokens)) != len(tokens):
+        raise ValueError("CUDA_VISIBLE_DEVICES does not match the configured GPU count")
+    resolved_uuids = None if uuid_indices is None else dict(uuid_indices)
+    mapped: list[VisibleGpuDevice] = []
+    for logical_index, token in enumerate(tokens):
+        if token.isdecimal():
+            physical_index = int(token)
+        elif token.startswith("GPU-"):
+            if resolved_uuids is None:
+                resolved_uuids = _nvml_uuid_indices()
+            physical_index = resolved_uuids.get(token, -1)
+        elif token.startswith("MIG-"):
+            raise ValueError("MIG CUDA_VISIBLE_DEVICES is unsupported for distributed VRAM proof")
+        else:
+            raise ValueError("CUDA_VISIBLE_DEVICES contains an unsupported GPU identity")
+        if physical_index < 0:
+            raise ValueError("CUDA-visible GPU UUID is not present in NVML")
+        mapped.append(
+            VisibleGpuDevice(
+                cuda_visible_device=token,
+                cuda_device_index=logical_index,
+                nvml_device_index=physical_index,
+            )
+        )
+    if len({device.nvml_device_index for device in mapped}) != len(mapped):
+        raise ValueError("CUDA-visible GPUs resolve to duplicate NVML devices")
+    return tuple(mapped)
+
+
+class MultiGpuTelemetrySampler:
+    """Sample every mapped visible GPU without aggregating its memory facts."""
+
+    def __init__(self, *, visible_devices: str | None, expected_gpu_count: int) -> None:
+        self.devices = resolve_visible_gpu_devices(
+            visible_devices, expected_gpu_count=expected_gpu_count
+        )
+        self._samplers = tuple(
+            NvmlTelemetrySampler(
+                device_index=device.cuda_device_index,
+                nvml_device_index=device.nvml_device_index,
+            )
+            for device in self.devices
+        )
+
+    def sample_all(self):
+        return tuple(sampler.sample() for sampler in self._samplers)
+
+    def sample(self):
+        return self.sample_all()[0]
+
+    def close(self) -> None:
+        for sampler in self._samplers:
+            sampler.close()
+
+
+def probe_visible_gpu_memory(
+    *, expected_gpu_count: int, visible_devices: str | None = None
+) -> tuple[VisibleGpuMemory, ...]:
+    """Probe every CUDA-visible device separately; never aggregate VRAM."""
+
+    mapped = resolve_visible_gpu_devices(
+        os.environ.get("CUDA_VISIBLE_DEVICES") if visible_devices is None else visible_devices,
+        expected_gpu_count=expected_gpu_count,
+    )
+    observed: list[VisibleGpuMemory] = []
+    for device in mapped:
+        with NvmlTelemetrySampler(
+            device_index=device.cuda_device_index,
+            nvml_device_index=device.nvml_device_index,
+        ) as sampler:
+            sample = sampler.sample()
+        if sample.free_vram_bytes is None:
+            raise ValueError("NVML did not report visible GPU free memory")
+        observed.append(
+            VisibleGpuMemory(
+                total_bytes=sample.physical_total_vram_bytes,
+                free_bytes=sample.free_vram_bytes,
+            )
+        )
+    return tuple(observed)
 
 
 def probe_physical_vram_bytes() -> int:
-    """Read total memory from NVML without accepting a configured claim."""
+    """Read one GPU's total memory for the legacy single-GPU smoke path."""
 
-    from lehome_train.telemetry import NvmlTelemetrySampler
-
-    with NvmlTelemetrySampler() as sampler:
-        return sampler.sample().physical_total_vram_bytes
+    return probe_visible_gpu_memory(expected_gpu_count=1)[0].total_bytes
 
 
 def _run_root(config: FineTuneLaunchConfig) -> Path:
@@ -70,6 +199,20 @@ def _checkpoint_steps(config: FineTuneLaunchConfig) -> tuple[int, ...]:
         if path.is_dir() and not path.is_symlink() and suffix.isdigit():
             steps.append(int(suffix))
     return tuple(sorted(steps))
+
+
+def _session_schedule(
+    config: FineTuneLaunchConfig, experiment_config: ExperimentConfig
+) -> ExposureSchedule:
+    """Bind resume validation to the launch's global presentation boundary."""
+
+    return ExposureSchedule(
+        physical_batch_size=experiment_config.physical_batch_size,
+        sample_presentations=experiment_config.sample_presentations,
+        checkpoint_sample_presentations=(
+            config.save_steps * experiment_config.physical_batch_size
+        ),
+    )
 
 
 def _preflight_segment(
@@ -99,12 +242,16 @@ def _verified_checkpoint_state(
     optimizer_step: int,
 ) -> Mapping[str, object]:
     checkpoint = _checkpoint_path(config, optimizer_step)
-    return _verified_checkpoint_state_at(checkpoint, optimizer_step)
+    return _verified_checkpoint_state_at(
+        checkpoint, optimizer_step, num_gpus=config.num_gpus
+    )
 
 
 def _verified_checkpoint_state_at(
     checkpoint: Path,
     optimizer_step: int,
+    *,
+    num_gpus: int = 1,
 ) -> Mapping[str, object]:
     state_path = checkpoint / "trainer_state.json"
     if not checkpoint.is_dir() or checkpoint.is_symlink() or not state_path.is_file():
@@ -131,7 +278,26 @@ def _verified_checkpoint_state_at(
         raise ValueError("GR00T checkpoint boundary does not prove finite loss")
     if not any(entry.get("step") == optimizer_step for entry in loss_entries):
         raise ValueError("GR00T checkpoint boundary has no current loss evidence")
+    if num_gpus == 4:
+        _verify_zero2_shards(checkpoint, optimizer_step)
     return state
+
+
+def _verify_zero2_shards(checkpoint: Path, optimizer_step: int) -> None:
+    """Require the exact DeepSpeed 0.17.6 ZeRO-2 BF16 DP checkpoint layout."""
+
+    shard_root = checkpoint / f"global_step{optimizer_step}"
+    expected = {
+        "mp_rank_00_model_states.pt",
+        *(f"bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt" for rank in range(4)),
+    }
+    if not shard_root.is_dir() or shard_root.is_symlink():
+        raise ValueError("ZeRO-2 checkpoint has no regular global-step shard directory")
+    observed = {entry.name for entry in shard_root.iterdir()}
+    if observed != expected:
+        raise ValueError("ZeRO-2 checkpoint shard layout is incomplete or incompatible")
+    if any(not entry.is_file() or entry.is_symlink() for entry in shard_root.iterdir()):
+        raise ValueError("ZeRO-2 checkpoint shards must be regular files")
 
 
 def _launch_kwargs() -> dict[str, object]:
@@ -498,17 +664,26 @@ class GrootSmokeRunner:
         )
 
 
-def _tar_checkpoint(source: Path, destination: Path, arcname: str) -> None:
+def _tar_checkpoint(
+    source: Path,
+    destination: Path,
+    run_root: Path,
+    arcname: str,
+) -> None:
     if not source.is_dir() or source.is_symlink():
         raise ValueError("GR00T checkpoint source is unavailable")
+    identity = run_root / "lehome_launch.json"
+    if not identity.is_file() or identity.is_symlink():
+        raise ValueError("GR00T run launch identity is unavailable for resume")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.incomplete")
     try:
         with tarfile.open(temporary, "w") as archive:
-            for path in (source, *sorted(source.rglob("*"))):
+            archive_paths = (run_root, identity, source, *sorted(source.rglob("*")))
+            for path in archive_paths:
                 if path.is_symlink() or (not path.is_dir() and not path.is_file()):
                     raise ValueError("GR00T checkpoint contains an unsupported path")
-                relative = Path(arcname) / path.relative_to(source)
+                relative = Path(arcname) / path.relative_to(run_root)
                 info = archive.gettarinfo(str(path), arcname=relative.as_posix())
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""
@@ -530,6 +705,8 @@ def _restore_checkpoint_archive(
     output_root: Path,
     expected_member_root: str,
     optimizer_step: int,
+    expected_identity: Mapping[str, object],
+    num_gpus: int,
 ) -> None:
     expected = PurePosixPath(expected_member_root)
     expected_parts = expected.parts
@@ -601,7 +778,16 @@ def _restore_checkpoint_archive(
                     shutil.copyfileobj(source, stream)
                 if target.stat().st_size != member.size:
                     raise ValueError("resume checkpoint file size changed during extraction")
-            _verified_checkpoint_state_at(staging, optimizer_step)
+            identity_path = staging / "lehome_launch.json"
+            try:
+                identity = json.loads(identity_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                raise ValueError("resume checkpoint archive has invalid launch identity") from None
+            if identity != expected_identity:
+                raise ValueError("resume checkpoint archive launch identity is incompatible")
+            _verified_checkpoint_state_at(
+                staging / f"checkpoint-{optimizer_step}", optimizer_step, num_gpus=num_gpus
+            )
             os.replace(staging, destination)
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
@@ -624,10 +810,7 @@ class GrootTrainingSession:
         self.normalization_sha256 = normalization_sha256
         self._progress = 0 if resume_checkpoint is None else resume_checkpoint.record.optimizer_step
         if resume_checkpoint is not None:
-            schedule = ExposureSchedule(
-                physical_batch_size=experiment_config.physical_batch_size,
-                sample_presentations=experiment_config.sample_presentations,
-            )
+            schedule = _session_schedule(config, experiment_config)
             require_compatible_checkpoint(
                 resume_checkpoint,
                 experiment_id=config.experiment_name,
@@ -646,16 +829,19 @@ class GrootTrainingSession:
                 or sha256_file(artifact) != resume_checkpoint.record.artifact.sha256
             ):
                 raise ValueError("resume checkpoint archive failed local verification")
-            expected = f"{config.experiment_name}/checkpoint-{self._progress}"
+            expected = config.experiment_name
+            run_root = _run_root(config)
             checkpoint_path = _checkpoint_path(config, self._progress)
-            if checkpoint_path.is_symlink():
+            if checkpoint_path.is_symlink() or run_root.is_symlink():
                 raise ValueError("resume checkpoint destination already exists")
-            if not checkpoint_path.is_dir():
+            if not run_root.is_dir():
                 _restore_checkpoint_archive(
                     artifact,
                     output_root=Path(config.output_dir),
                     expected_member_root=expected,
                     optimizer_step=self._progress,
+                    expected_identity=config.identity(),
+                    num_gpus=config.num_gpus,
                 )
             _verified_checkpoint_state(config, self._progress)
 
@@ -698,7 +884,8 @@ class GrootTrainingSession:
         _tar_checkpoint(
             source,
             artifact_path,
-            f"{self.config.experiment_name}/checkpoint-{optimizer_step}",
+            _run_root(self.config),
+            self.config.experiment_name,
         )
         descriptor = CheckpointDescriptor(
             record=CheckpointRecord(

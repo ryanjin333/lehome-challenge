@@ -15,7 +15,7 @@ import numpy as np
 from .artifacts import EpisodeArtifactWriter, atomic_write_json
 from .export import ExpertWindow, SelectionReport, build_selection_report, select_expert_windows
 from .models import ActionSource, EpisodeFrame, EpisodeIdentity, EpisodeOutcome, QualityGrade
-from .snapshots import Snapshot
+from .snapshots import Snapshot, canonical_reset_hash
 
 
 CANONICAL_CAMERA_NAMES = ("top_rgb", "left_rgb", "right_rgb")
@@ -89,6 +89,22 @@ def _validate_provenance(provenance: Mapping[str, object] | None) -> dict[str, o
     return result
 
 
+def _validate_visible_contact(value: Mapping[str, object]) -> dict[str, object]:
+    """Require recorded simulator geometry evidence, never inferred arm motion."""
+    contact = dict(value)
+    if set(contact) != {"observed", "source", "minimum_distance_m"}:
+        raise ValueError("visible contact evidence has unsupported fields")
+    if not isinstance(contact["observed"], bool):
+        raise ValueError("visible contact observed flag must be boolean")
+    if contact["source"] != "simulator_particle_to_gripper_distance":
+        raise ValueError("visible contact must use simulator particle-to-gripper evidence")
+    distance = contact["minimum_distance_m"]
+    if not isinstance(distance, (int, float)) or not math.isfinite(distance) or distance < 0:
+        raise ValueError("visible contact minimum distance must be finite and non-negative")
+    contact["minimum_distance_m"] = float(distance)
+    return contact
+
+
 def _identity_payload(identity: EpisodeIdentity) -> dict[str, object]:
     return {
         "episode_id": identity.episode_id,
@@ -148,6 +164,7 @@ class MixedSourceRecorder:
         self._annotations: list[dict[str, object]] = []
         self._frames: list[EpisodeFrame] = []
         self._snapshots: set[str] = set()
+        self._reset_hash: str | None = None
         self._expert_started = False
         self._finished = False
 
@@ -224,6 +241,8 @@ class MixedSourceRecorder:
         directory.mkdir(exist_ok=True)
         atomic_write_json(directory / f"{name}.json", payload)
         self._snapshots.add(name)
+        if name == "reset":
+            self._reset_hash = canonical_reset_hash(snapshot)
 
     def _encode_videos(self) -> tuple[str, ...]:
         if any(self.video_sink.count(camera) != self.step for camera in CANONICAL_CAMERA_NAMES):
@@ -239,6 +258,8 @@ class MixedSourceRecorder:
             episode["identity"] = _identity_payload(self.identity)
         if self.provenance:
             episode["provenance"] = self.provenance
+        if self._reset_hash is not None:
+            episode["reset_hash"] = self._reset_hash
         return episode
 
     def finish(self, *, outcome: EpisodeOutcome, controls: Iterable[str]) -> RecordedEpisode:
@@ -305,7 +326,13 @@ class MixedSourceRecorder:
         path = self.writer.finalize(episode, required_videos=required_videos)
         return RecordedEpisode(path=path, episode=episode | {"episode_id": path.name}, annotations=tuple(self._annotations), expert_windows=windows, selection_report=report)
 
-    def finish_autonomous(self, *, reason: str, accepted_success: bool) -> RecordedEpisode:
+    def finish_autonomous(
+        self,
+        *,
+        reason: str,
+        accepted_success: bool,
+        visible_contact: Mapping[str, object] | None = None,
+    ) -> RecordedEpisode:
         """Compatibility finalizer preserving autonomous diagnostic semantics."""
         if self._finished:
             raise ValueError("recorder has already finished")
@@ -318,6 +345,8 @@ class MixedSourceRecorder:
             "outcome": "success" if accepted_success else "timeout",
             "bc_target_count": 0,
         }
+        if visible_contact is not None:
+            episode["visible_contact"] = _validate_visible_contact(visible_contact)
         required_videos = self._encode_videos()
         path = self.writer.finalize(episode, required_videos=required_videos)
         return RecordedEpisode(path=path, episode=episode | {"episode_id": path.name}, annotations=tuple(self._annotations))
@@ -361,8 +390,18 @@ class AutonomousRecorder:
             raise ValueError("snapshot name must be reset or terminal before finalization")
         self._recorder.record_snapshot(name, snapshot)
 
-    def finish(self, *, reason: str, accepted_success: bool) -> RecordedEpisode:
-        return self._recorder.finish_autonomous(reason=reason, accepted_success=accepted_success)
+    def finish(
+        self,
+        *,
+        reason: str,
+        accepted_success: bool,
+        visible_contact: Mapping[str, object] | None = None,
+    ) -> RecordedEpisode:
+        return self._recorder.finish_autonomous(
+            reason=reason,
+            accepted_success=accepted_success,
+            visible_contact=visible_contact,
+        )
 
 
 __all__ = [

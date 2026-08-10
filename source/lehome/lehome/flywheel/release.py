@@ -133,6 +133,8 @@ class ReleasePlan:
     matrix: PublicMatrix
     episodes: tuple[PlannedEpisode, ...]
     provenance: CampaignProvenance
+    # Kept for publisher API compatibility; this is the maximum permitted
+    # annotation count, not an exact per-episode requirement.
     expected_steps: int
 
     @property
@@ -184,9 +186,14 @@ def build_release_plan(
     *,
     expected_steps: int = 600,
 ) -> ReleasePlan:
-    """Require one terminal, checksum-valid episode for every matrix trial."""
+    """Require one terminal, checksum-valid episode for every matrix trial.
+
+    ``expected_steps`` is the campaign's maximum step budget.  Episodes at
+    the budget are valid regardless of terminal outcome; early episodes must
+    be accepted successes with the canonical success terminal metadata.
+    """
     if type(expected_steps) is not int or expected_steps <= 0:
-        raise ValueError("expected annotation count must be positive")
+        raise ValueError("maximum annotation count must be positive")
     root = Path(run_root)
     raw = root / "raw"
     if root.is_symlink() or not root.is_dir() or raw.is_symlink() or not raw.is_dir():
@@ -272,8 +279,15 @@ def _validate_episode_release_contract(
         policy_artifact_sha256=provenance.get("policy_artifact_sha256"),
         image_identity=provenance.get("image_identity"),
     )
-    if _annotation_count(source / "annotations.jsonl") != expected_steps:
-        raise ValueError("episode annotation count does not match release contract")
+    annotation_count = _annotation_count(source / "annotations.jsonl")
+    if annotation_count == 0 or annotation_count > expected_steps:
+        raise ValueError("episode annotation count violates the maximum-step release contract")
+    if annotation_count < expected_steps and not (
+        metadata.get("accepted_success") is True
+        and metadata.get("outcome") == "success"
+        and metadata.get("terminal_reason") == "success"
+    ):
+        raise ValueError("early episode annotation count requires an accepted success terminal")
     return candidate
 
 

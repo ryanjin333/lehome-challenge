@@ -12,6 +12,7 @@ from fixtures.source_dataset import make_source_dataset
 from lehome_train.data.convert import convert_dataset
 from lehome_train.data.stats import (
     _data_path,
+    _relative_statistics,
     _train_only_runtime_view,
     compute_reference_statistics,
     write_train_statistics,
@@ -22,6 +23,16 @@ MAPPING_PATH = Path(__file__).parents[1] / "config" / "lehome_four_types_mapping
 CONVERTER_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 SOURCE_REVISION = "89abcdef0123456789abcdef0123456789abcdef"
 CONTAINER_DIGEST = "sha256:" + ("a" * 64)
+
+
+def test_relative_statistics_support_step_12000_horizon_40() -> None:
+    states = [[float(frame)] * 12 for frame in range(45)]
+    actions = [[float(frame + 1)] * 12 for frame in range(45)]
+
+    relative = _relative_statistics([(states, actions)], action_horizon=40)
+
+    assert len(relative["left_arm"]["mean"]) == 40
+    assert len(relative["right_arm"]["mean"]) == 40
 
 
 def _prepared_dataset(tmp_path: Path) -> tuple[Path, dict[str, object]]:

@@ -56,6 +56,14 @@ def _load_manifest(dataset: Path) -> dict[str, Any]:
     return manifest
 
 
+def _manifest_action_horizon(manifest: Mapping[str, Any]) -> int:
+    future = manifest.get("future_actions")
+    horizon = future.get("horizon") if isinstance(future, Mapping) else None
+    if type(horizon) is not int or horizon not in {16, 40}:
+        raise ValueError("prepared dataset action horizon must be 16 or 40")
+    return horizon
+
+
 def _require_frozen_flywheel_mix(manifest: Mapping[str, Any]) -> None:
     """Reject a final flywheel snapshot unless its selection plan is immutable."""
     plan = manifest.get("flywheel_mix_plan")
@@ -182,15 +190,19 @@ def _vector_statistics(values: Iterable[list[float]], dimension: int) -> dict[st
 
 def _relative_statistics(
     episodes: Iterable[tuple[list[list[float]], list[list[float]]]],
+    *,
+    action_horizon: int = _ACTION_HORIZON,
 ) -> dict[str, dict[str, list[list[float]]]]:
+    if type(action_horizon) is not int or action_horizon not in {16, 40}:
+        raise ValueError("statistics action horizon must be 16 or 40")
     by_group = {
-        name: [[] for _ in range(_ACTION_HORIZON)]
+        name: [[] for _ in range(action_horizon)]
         for name, _, _ in _RELATIVE_GROUPS
     }
     for states, actions in episodes:
-        for start in range(max(0, len(actions) - _ACTION_HORIZON + 1)):
+        for start in range(max(0, len(actions) - action_horizon + 1)):
             current = states[start]
-            for offset in range(_ACTION_HORIZON):
+            for offset in range(action_horizon):
                 target = actions[start + offset]
                 for name, begin, end in _RELATIVE_GROUPS:
                     by_group[name][offset].append(
@@ -214,6 +226,7 @@ def compute_reference_statistics(dataset_path: str | Path) -> StatisticsBundle:
     manifest = _load_manifest(dataset)
     _require_frozen_flywheel_mix(manifest)
     train_ids = _train_ids(manifest)
+    action_horizon = _manifest_action_horizon(manifest)
     episodes = [_episode_values(dataset, episode_id) for episode_id in train_ids]
     states = [row for episode, _ in episodes for row in episode]
     actions = [row for _, episode in episodes for row in episode]
@@ -222,7 +235,7 @@ def compute_reference_statistics(dataset_path: str | Path) -> StatisticsBundle:
             "observation.state": _vector_statistics(states, 12),
             "action": _vector_statistics(actions, 12),
         },
-        relative_stats=_relative_statistics(episodes),
+        relative_stats=_relative_statistics(episodes, action_horizon=action_horizon),
     )
 
 
@@ -312,10 +325,14 @@ def _register_runtime_modality(path: Path) -> None:
 def _compute_pinned_statistics(dataset: Path, groot_root: Path) -> StatisticsBundle:
     """Run the pinned GR00T statistics APIs against a train-only temporary view."""
 
-    train_ids = _train_ids(_load_manifest(dataset))
+    manifest = _load_manifest(dataset)
+    train_ids = _train_ids(manifest)
+    action_horizon = _manifest_action_horizon(manifest)
     view = _train_only_runtime_view(dataset, train_ids)
     try:
-        modality_path = write_runtime_modality_config(view / "meta" / "lehome_modality.py")
+        modality_path = write_runtime_modality_config(
+            view / "meta" / "lehome_modality.py", action_horizon=action_horizon
+        )
         stats_api = _import_pinned_stats(groot_root)
         _register_runtime_modality(modality_path)
         parquet_paths = [_data_path(view, episode_id) for episode_id in train_ids]
@@ -364,7 +381,10 @@ def write_train_statistics(
     meta = dataset / "meta"
     if not meta.is_dir():
         raise FileNotFoundError("prepared dataset meta directory does not exist")
-    modality_path = write_runtime_modality_config(meta / "lehome_groot_modality.py")
+    modality_path = write_runtime_modality_config(
+        meta / "lehome_groot_modality.py",
+        action_horizon=_manifest_action_horizon(manifest),
+    )
     stats_path = meta / "stats.json"
     relative_path = meta / "relative_stats.json"
     atomic_write_json(stats_path, bundle.stats)

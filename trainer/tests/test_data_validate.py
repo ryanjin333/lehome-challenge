@@ -10,7 +10,11 @@ import pytest
 from fixtures.source_dataset import make_source_dataset
 from lehome_train.data.convert import convert_dataset
 from lehome_train.data.stats import write_train_statistics
-from lehome_train.data.validate import _compare_statistics, validate_prepared_dataset
+from lehome_train.data.validate import (
+    _compare_statistics,
+    _validate_manifest,
+    validate_prepared_dataset,
+)
 from lehome_train.groot.modality import (
     ACTION_HORIZON,
     modality_contract,
@@ -70,6 +74,28 @@ def test_modality_contract_is_joint_space_12d_with_relative_arms_and_absolute_gr
     ]
     assert [item["dimension"] for item in contract["action"]["groups"]] == [5, 1, 5, 1]
     assert contract["language"]["instruction"] == "fold the garment on the table"
+
+
+def test_runtime_modality_contract_supports_step_12000_horizon_40(tmp_path: Path) -> None:
+    path = write_runtime_modality_config(
+        tmp_path / "lehome_groot_modality.py", action_horizon=40
+    )
+
+    assert "delta_indices=list(range(40))" in path.read_text(encoding="utf-8")
+    assert modality_contract(action_horizon=40)["action"]["delta_indices"] == list(range(40))
+
+
+def test_manifest_validator_accepts_step_12000_horizon_40() -> None:
+    manifest = {
+        "fixed_language_instruction": "fold the garment on the table",
+        "action_schema": {"storage": "absolute", "dimension": 12},
+        "state_schema": {"dimension": 12},
+        "future_actions": {"horizon": 40, "loader_allow_padding": False},
+        "train_episode_ids": ["0"],
+        "validation_episode_ids": ["1"],
+    }
+
+    assert _validate_manifest(manifest) == (["0"], ["1"])
 
 
 def test_validation_writes_hashed_report_and_keeps_split_offline(tmp_path: Path) -> None:

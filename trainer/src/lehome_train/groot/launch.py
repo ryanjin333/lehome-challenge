@@ -8,11 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import subprocess
+import sys
 from typing import Callable, Mapping, Sequence
 
 from lehome_train.constants import ISAAC_GROOT_REVISION
 from lehome_train.flywheel.augmentation import augmentation_profile, color_jitter_cli
 from lehome_train.groot.config import FineTuneLaunchConfig
+from lehome_train.groot.checkpoint_identity import policy_artifact_sha256
 from lehome_train.io import atomic_write_json
 
 
@@ -28,13 +30,19 @@ class OfficialLaunch:
     environment: dict[str, str]
 
 
-def _require_one_visible_gpu(value: str | None) -> str:
+def _require_visible_gpus(value: str | None, *, expected_count: int) -> str:
     if not isinstance(value, str):
+        raise ValueError(f"exactly {expected_count} visible GPU{'s' if expected_count != 1 else ''} are required")
+    candidates = tuple(candidate.strip() for candidate in value.split(","))
+    if (
+        len(candidates) != expected_count
+        or any(not _CUDA_VISIBLE_DEVICE.fullmatch(candidate) for candidate in candidates)
+        or len(set(candidates)) != len(candidates)
+    ):
+        if expected_count == 4:
+            raise ValueError("exactly four visible GPUs are required")
         raise ValueError("exactly one visible GPU is required")
-    candidate = value.strip()
-    if not _CUDA_VISIBLE_DEVICE.fullmatch(candidate):
-        raise ValueError("exactly one visible GPU is required")
-    return candidate
+    return ",".join(candidates)
 
 
 def _safe_environment(
@@ -108,18 +116,23 @@ def build_launch(
     environment: Mapping[str, str] | None,
     official_checkout: str | os.PathLike[str],
 ) -> OfficialLaunch:
-    """Build a single-GPU command for NVIDIA's pinned ``launch_finetune.py``.
+    """Build a one- or four-GPU command for NVIDIA's pinned ``launch_finetune.py``.
 
     This wrapper intentionally does not alter the upstream training loop.  The
     model and dataset revisions are recorded in the immutable experiment
     identity; their local snapshots are passed to the upstream path-only API.
     """
 
-    visible_gpu = _require_one_visible_gpu(visible_devices)
-    safe_environment = _safe_environment(environment, visible_devices=visible_gpu)
+    if config.parent_checkpoint_artifact_sha256 is not None and (
+        policy_artifact_sha256(config.base_model_path)
+        != config.parent_checkpoint_artifact_sha256
+    ):
+        raise ValueError("parent checkpoint artifact digest mismatch")
+    visible_gpus = _require_visible_gpus(visible_devices, expected_count=config.num_gpus)
+    safe_environment = _safe_environment(environment, visible_devices=visible_gpus)
     entrypoint = _official_entrypoint(official_checkout, safe_environment)
     command = (
-        "python",
+        sys.executable,
         str(entrypoint),
         "--base-model-path",
         config.base_model_path,
@@ -130,7 +143,7 @@ def build_launch(
         "--modality-config-path",
         config.modality_config_path,
         "--num-gpus",
-        "1",
+        str(config.num_gpus),
         "--output-dir",
         config.output_dir,
         "--experiment-name",
@@ -227,7 +240,40 @@ def launch_finetune(
         official_checkout=official_checkout,
     )
     _write_or_verify_identity(config)
-    return runner(launch.command, env=launch.environment, check=True)
+    if config.num_gpus == 1:
+        return runner(launch.command, env=launch.environment, check=True)
+    return runner(
+        _distributed_chunk_command(config, stop_after_optimizer_step=config.max_steps, launch=launch),
+        env=launch.environment,
+        check=True,
+    )
+
+
+def _distributed_chunk_command(
+    config: FineTuneLaunchConfig,
+    *,
+    stop_after_optimizer_step: int,
+    launch: OfficialLaunch,
+) -> tuple[str, ...]:
+    """Run the resume patch in every DDP rank with the current interpreter."""
+
+    chunk_arguments = (
+        "-m",
+        "lehome_train.groot.chunk_launch",
+        "--stop-after-step",
+        str(stop_after_optimizer_step),
+        "--",
+        *launch.command[1:],
+    )
+    if config.num_gpus == 1:
+        return (sys.executable, *chunk_arguments)
+    return (
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        f"--nproc_per_node={config.num_gpus}",
+        *chunk_arguments,
+    )
 
 
 def launch_finetune_to_step(
@@ -263,13 +309,9 @@ def launch_finetune_to_step(
         official_checkout=official_checkout,
     )
     _write_or_verify_identity(config)
-    wrapped = (
-        "python",
-        "-m",
-        "lehome_train.groot.chunk_launch",
-        "--stop-after-step",
-        str(stop_after_optimizer_step),
-        "--",
-        *launch.command[1:],
+    wrapped = _distributed_chunk_command(
+        config,
+        stop_after_optimizer_step=stop_after_optimizer_step,
+        launch=launch,
     )
     return runner(wrapped, env=launch.environment, check=True)

@@ -747,23 +747,86 @@ class GarmentEnv(DirectRLEnv):
             return False
         return True
 
+    @staticmethod
+    def _flywheel_local_cloth_arrays(positions, velocities) -> tuple[np.ndarray, np.ndarray]:
+        """Validate the CPU USD cloth representation before snapshotting or writing it."""
+        try:
+            local_positions = np.asarray(positions, dtype=np.float32)
+            local_velocities = np.asarray(velocities, dtype=np.float32)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("CPU garment USD cloth state is not numeric") from error
+        if (
+            local_positions.ndim != 2
+            or local_velocities.ndim != 2
+            or local_positions.shape[1:] != (3,)
+            or local_velocities.shape[1:] != (3,)
+            or local_positions.shape[0] != local_velocities.shape[0]
+        ):
+            raise RuntimeError("CPU garment USD cloth positions and velocities must be aligned Nx3 arrays")
+        if not np.isfinite(local_positions).all() or not np.isfinite(local_velocities).all():
+            raise RuntimeError("CPU garment USD cloth positions and velocities must be finite")
+        return local_positions.copy(), local_velocities.copy()
+
+    def _flywheel_cpu_cloth_attributes(self):
+        prim = getattr(self.object, "_prim", None)
+        get_attribute = getattr(prim, "GetAttribute", None)
+        if not callable(get_attribute):
+            raise RuntimeError("CPU garment does not expose a USD prim for cloth state")
+        positions_attr = get_attribute("points")
+        velocities_attr = get_attribute("velocities")
+        if positions_attr is None or velocities_attr is None:
+            raise RuntimeError("CPU garment USD prim is missing points or velocities")
+        if not callable(getattr(positions_attr, "Get", None)) or not callable(getattr(velocities_attr, "Get", None)):
+            raise RuntimeError("CPU garment USD points or velocities are unreadable")
+        return positions_attr, velocities_attr
+
+    def _flywheel_cpu_cloth_state(self) -> tuple[np.ndarray, np.ndarray]:
+        positions_attr, velocities_attr = self._flywheel_cpu_cloth_attributes()
+        positions = positions_attr.Get()
+        velocities = velocities_attr.Get()
+        if positions is None or velocities is None:
+            raise RuntimeError("CPU garment USD points or velocities are unset")
+        return self._flywheel_local_cloth_arrays(positions, velocities)
+
+    @staticmethod
+    def _flywheel_usd_vec3f_array(values: np.ndarray):
+        """Use USD's native vector array when available, with a test-only plain-sequence fallback."""
+        try:
+            from pxr import Gf, Vt
+        except ImportError:
+            return values.tolist()
+        return Vt.Vec3fArray([Gf.Vec3f(*map(float, row)) for row in values])
+
+    def _flywheel_cloth_backend(self) -> str:
+        device = str(self.device).lower()
+        if device == "cpu":
+            return "usd"
+        if device == "cuda" or (device.startswith("cuda:") and device[5:].isdigit()):
+            return "tensor"
+        raise RuntimeError(f"flywheel cloth state does not support device {self.device!r}")
+
     def flywheel_capture_state(self) -> dict[str, object]:
         """Return the complete mutable simulator state needed for hard replay."""
-        if self.object is None or not hasattr(self.object, "_cloth_prim_view"):
+        if self.object is None:
             raise RuntimeError("cannot snapshot an uninitialized garment")
-        cloth = self.object._cloth_prim_view
-        if not hasattr(cloth, "get_world_positions") or not hasattr(cloth, "get_velocities"):
-            raise RuntimeError("Isaac cloth view does not expose restorable position and velocity")
 
         def _numpy(value):
             return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
 
-        positions = _numpy(cloth.get_world_positions())
-        velocities = _numpy(cloth.get_velocities())
-        if positions.ndim == 3:
-            positions = positions[0]
-        if velocities.ndim == 3:
-            velocities = velocities[0]
+        if self._flywheel_cloth_backend() == "usd":
+            positions, velocities = self._flywheel_cpu_cloth_state()
+        else:
+            if not hasattr(self.object, "_cloth_prim_view"):
+                raise RuntimeError("cannot snapshot an uninitialized garment")
+            cloth = self.object._cloth_prim_view
+            if not hasattr(cloth, "get_world_positions") or not hasattr(cloth, "get_velocities"):
+                raise RuntimeError("Isaac cloth view does not expose restorable position and velocity")
+            positions = _numpy(cloth.get_world_positions())
+            velocities = _numpy(cloth.get_velocities())
+            if positions.ndim == 3:
+                positions = positions[0]
+            if velocities.ndim == 3:
+                velocities = velocities[0]
         rng_name, rng_keys, rng_pos, rng_gauss, rng_cached = self.garment_rng.get_state()
         return {
             "robot_position": np.concatenate(
@@ -786,47 +849,107 @@ class GarmentEnv(DirectRLEnv):
             "scene_state": self._flywheel_capture_scene_state(),
         }
 
+    def flywheel_visible_garment_contact(self) -> dict[str, object]:
+        """Read actual Isaac particle and gripper geometry for rollout contact evidence."""
+        if self.object is None:
+            raise RuntimeError("cannot read visible contact without an initialized garment")
+
+        def _numpy(value):
+            return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+
+        if self._flywheel_cloth_backend() == "tensor":
+            if not hasattr(self.object, "_cloth_prim_view"):
+                raise RuntimeError("Isaac cloth view is unavailable for CUDA contact evidence")
+            cloth = self.object._cloth_prim_view
+            if not hasattr(cloth, "get_world_positions"):
+                raise RuntimeError("Isaac cloth view does not expose particle positions for contact evidence")
+            particle_positions = _numpy(cloth.get_world_positions())
+            if particle_positions.ndim == 3: particle_positions = particle_positions[0]
+        else:
+            particle_positions = np.asarray(self.object.get_current_mesh_points()[0])
+        gripper_positions = []
+        for arm in (self.left_arm, self.right_arm):
+            names = getattr(arm, "body_names", None)
+            positions = getattr(arm.data, "body_pos_w", None)
+            if not isinstance(names, (list, tuple)) or positions is None:
+                raise RuntimeError("Isaac robot does not expose gripper body positions for contact evidence")
+            matches = [index for index, name in enumerate(names) if "gripper" in str(name).lower()]
+            if not matches:
+                raise RuntimeError("Isaac robot does not expose a gripper body for contact evidence")
+            body_positions = _numpy(positions)
+            if body_positions.ndim != 3 or body_positions.shape[0] != 1:
+                raise RuntimeError("Isaac gripper body positions have an unsupported shape")
+            gripper_positions.extend(body_positions[0, index] for index in matches)
+        from lehome.flywheel.contact import visible_contact_from_simulator_geometry
+
+        return visible_contact_from_simulator_geometry(particle_positions, np.asarray(gripper_positions))
+
     def flywheel_restore_state(self, snapshot) -> None:
         """Restore a validated flywheel snapshot without touching reset/reward logic."""
-        if self.object is None or not hasattr(self.object, "_cloth_prim_view"):
+        if self.object is None:
             raise RuntimeError("cannot restore an uninitialized garment")
         if snapshot.garment_name != self.cfg.garment_name:
             raise ValueError("snapshot garment does not match the active environment")
-        cloth = self.object._cloth_prim_view
-        required = ("set_world_positions", "set_velocities")
-        if any(not hasattr(cloth, method) for method in required):
-            raise RuntimeError("Isaac cloth view does not expose restorable position and velocity")
-        device = self.device
-        robot_position = torch.tensor(snapshot.robot_position, dtype=torch.float32, device=device).unsqueeze(0)
-        robot_velocity = torch.tensor(snapshot.robot_velocity, dtype=torch.float32, device=device).unsqueeze(0)
-        self.left_arm.write_joint_position_to_sim(robot_position[:, :6])
-        self.right_arm.write_joint_position_to_sim(robot_position[:, 6:])
-        if not hasattr(self.left_arm, "write_joint_velocity_to_sim") or not hasattr(self.right_arm, "write_joint_velocity_to_sim"):
-            raise RuntimeError("Isaac articulation does not expose restorable joint velocity")
-        self.left_arm.write_joint_velocity_to_sim(robot_velocity[:, :6])
-        self.right_arm.write_joint_velocity_to_sim(robot_velocity[:, 6:])
-        cloth.set_world_positions(
-            torch.tensor(snapshot.cloth_position, dtype=torch.float32, device=device).unsqueeze(0)
-        )
-        cloth.set_velocities(
-            torch.tensor(snapshot.cloth_velocity, dtype=torch.float32, device=device).unsqueeze(0)
-        )
+        cloth_backend = self._flywheel_cloth_backend()
+        if cloth_backend == "usd":
+            positions_attr, velocities_attr = self._flywheel_cpu_cloth_attributes()
+            if not callable(getattr(positions_attr, "Set", None)) or not callable(getattr(velocities_attr, "Set", None)):
+                raise RuntimeError("CPU garment USD points or velocities are not writable")
+            cloth_position, cloth_velocity = self._flywheel_local_cloth_arrays(
+                snapshot.cloth_position, snapshot.cloth_velocity
+            )
+        else:
+            if not hasattr(self.object, "_cloth_prim_view"):
+                raise RuntimeError("cannot restore an uninitialized garment")
+            cloth = self.object._cloth_prim_view
+            required = ("set_world_positions", "set_velocities")
+            if any(not hasattr(cloth, method) for method in required):
+                raise RuntimeError("Isaac cloth view does not expose restorable position and velocity")
         rng_state = snapshot.rng_state
         if rng_state.get("kind") != "numpy.RandomState":
             raise ValueError("unsupported flywheel RNG snapshot")
-        self.garment_rng.set_state(
-            (
+        try:
+            restored_rng_state = (
                 str(rng_state["name"]),
                 np.asarray(rng_state["keys"], dtype=np.uint32),
                 int(rng_state["position"]),
                 int(rng_state["has_gauss"]),
                 float(rng_state["cached_gaussian"]),
             )
-        )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("unsupported flywheel RNG snapshot") from error
+        if not hasattr(self.left_arm, "write_joint_position_to_sim") or not hasattr(self.right_arm, "write_joint_position_to_sim"):
+            raise RuntimeError("Isaac articulation does not expose restorable joint position")
+        if not hasattr(self.left_arm, "write_joint_velocity_to_sim") or not hasattr(self.right_arm, "write_joint_velocity_to_sim"):
+            raise RuntimeError("Isaac articulation does not expose restorable joint velocity")
+        device = self.device
+        robot_position = torch.tensor(snapshot.robot_position, dtype=torch.float32, device=device).unsqueeze(0)
+        robot_velocity = torch.tensor(snapshot.robot_velocity, dtype=torch.float32, device=device).unsqueeze(0)
+        self.left_arm.write_joint_position_to_sim(robot_position[:, :6])
+        self.right_arm.write_joint_position_to_sim(robot_position[:, 6:])
+        self.left_arm.write_joint_velocity_to_sim(robot_velocity[:, :6])
+        self.right_arm.write_joint_velocity_to_sim(robot_velocity[:, 6:])
+        self.garment_rng.set_state(restored_rng_state)
         if snapshot.scene_state:
             self._flywheel_restore_scene_state(snapshot.scene_state)
             if snapshot.randomization.get("strategy") == "canonical":
                 self._flywheel_randomization_baseline = dict(snapshot.scene_state)
+        # Scene restoration calls GarmentObject.set_all_pose(), which overwrites
+        # USD particle points.  Apply the snapshot cloth last for both backends.
+        if cloth_backend == "usd":
+            if positions_attr.Set(self._flywheel_usd_vec3f_array(cloth_position)) is False:
+                raise RuntimeError("CPU garment USD points write failed")
+            if velocities_attr.Set(self._flywheel_usd_vec3f_array(cloth_velocity)) is False:
+                raise RuntimeError("CPU garment USD velocities write failed")
+            observed_position, observed_velocity = self._flywheel_cpu_cloth_state()
+            if not (
+                np.allclose(observed_position, cloth_position, rtol=0.0, atol=1e-6)
+                and np.allclose(observed_velocity, cloth_velocity, rtol=0.0, atol=1e-6)
+            ):
+                raise RuntimeError("CPU garment USD cloth write readback mismatch")
+        else:
+            cloth.set_world_positions(torch.tensor(snapshot.cloth_position, dtype=torch.float32, device=device).unsqueeze(0))
+            cloth.set_velocities(torch.tensor(snapshot.cloth_velocity, dtype=torch.float32, device=device).unsqueeze(0))
         self._flywheel_randomization_receipt = dict(snapshot.randomization)
 
     def apply_flywheel_randomization(self, randomization) -> dict[str, object]:
@@ -837,16 +960,18 @@ class GarmentEnv(DirectRLEnv):
         applied and observed again.
         """
         values = dict(randomization.values if hasattr(randomization, "values") else randomization)
+        # Canonical is a control, not a randomization strategy.  In particular,
+        # do not restore a captured scene here: evaluation calls this after the
+        # garment has settled, and scene restoration resets the cloth pose.
+        if not values:
+            self._flywheel_randomization_receipt = {}
+            return {}
         baseline = getattr(self, "_flywheel_randomization_baseline", None)
         if baseline is None:
             baseline = self._flywheel_capture_scene_state()
             self._flywheel_randomization_baseline = baseline
-        # Every strategy starts from the same exact scene, including canonical
-        # after a prior randomized use of this environment.
+        # Every non-canonical strategy starts from the same exact scene.
         self._flywheel_restore_scene_state(baseline)
-        if not values:
-            self._flywheel_randomization_receipt = {}
-            return {}
         expected = {
             "light_intensity_scale",
             "camera_translation_m",

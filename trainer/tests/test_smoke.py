@@ -142,6 +142,97 @@ def test_smoke_launches_tier_candidates_sequentially_with_fixed_contract() -> No
     assert [attempt.result.physical_batch_size for attempt in report.attempts] == [16, 32, 64]
 
 
+def test_four_gpu_smoke_runs_only_the_100_step_per_device_one_profile() -> None:
+    calls: list[FineTuneLaunchConfig] = []
+
+    def runner(config: FineTuneLaunchConfig) -> SmokeAttemptReceipt:
+        calls.append(config)
+        return __import__("dataclasses").replace(
+            _receipt(1, total_gib=24, reserved_gib=20),
+            per_device_telemetry_samples=tuple(
+                _samples(24, 20) for _ in range(4)
+            ),
+        )
+
+    report = run_smoke_tests(
+        base_config=_config(
+            physical_batch_size=1,
+            global_batch_size=4,
+            num_gpus=4,
+        ),
+        physical_vram_bytes=24 * GIBIBYTE,
+        experiment_config_sha256=SHA_A,
+        dataset_manifest_sha256=SHA_B,
+        runner=runner,
+    )
+
+    assert len(calls) == 1
+    assert calls[0].physical_batch_size == 1
+    assert calls[0].global_batch_size == 4
+    assert calls[0].gradient_accumulation_steps == 1
+    assert calls[0].max_steps == SMOKE_OPTIMIZER_STEPS == 100
+    assert report.selected_batch_size == 4
+    assert report.attempts[0].result.physical_batch_size == 4
+
+
+def test_four_gpu_smoke_requires_headroom_evidence_from_every_visible_device() -> None:
+    class MultiSampler:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.closed = False
+
+        def sample(self) -> TelemetrySample:
+            return self.sample_all()[0]
+
+        def sample_all(self) -> tuple[TelemetrySample, ...]:
+            timestamp = float(self.calls * 10)
+            self.calls += 1
+            return tuple(
+                TelemetrySample(
+                    timestamp,
+                    4 * GIBIBYTE,
+                    20 * GIBIBYTE,
+                    free * GIBIBYTE,
+                    80.0,
+                    300.0,
+                    70.0,
+                    2 * GIBIBYTE,
+                    24 * GIBIBYTE,
+                    f"GPU-{index}",
+                )
+                for index, free in enumerate((3, 3, 3, 2))
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    sampler = MultiSampler()
+
+    def runner(_config: FineTuneLaunchConfig) -> SmokeAttemptReceipt:
+        return __import__("dataclasses").replace(
+            _receipt(1, total_gib=24, reserved_gib=20), telemetry_samples=()
+        )
+
+    report = run_smoke_tests(
+        base_config=_config(
+            physical_batch_size=1,
+            global_batch_size=4,
+            num_gpus=4,
+        ),
+        physical_vram_bytes=24 * GIBIBYTE,
+        experiment_config_sha256=SHA_A,
+        dataset_manifest_sha256=SHA_B,
+        runner=runner,
+        sampler_factory=lambda: sampler,
+    )
+
+    assert sampler.closed is True
+    assert report.selected_batch_size is None
+    assert report.attempts[0].result.stable is False
+    assert len(report.attempts[0].per_device_telemetry) == 4
+    assert report.attempts[0].per_device_telemetry[-1].minimum_steady_state_free_vram_bytes == 2 * GIBIBYTE
+
+
 def test_memory_failure_stops_larger_batches_and_preserves_complete_attempt_record() -> None:
     calls: list[int] = []
 

@@ -9,6 +9,8 @@ from lehome_train.io import canonical_json_sha256
 
 
 REVISION = "a" * 40
+PARENT_REVISION = "b" * 40
+PARENT_DIGEST = "c" * 64
 
 
 def config(**overrides: object) -> FineTuneLaunchConfig:
@@ -64,6 +66,63 @@ def test_config_enforces_single_gpu_fixed_batch_horizon_and_freezing() -> None:
     assert resolved.identity()["decay_semantics"] == "cosine_remainder_after_warmup"
     assert resolved.identity()["augmentation_profile"] == "none"
     assert resolved.identity()["augmentation_profile_sha256"] == augmentation_profile("none").sha256
+
+
+def test_config_records_four_gpu_global_batch_math_and_presentations() -> None:
+    distributed = config(
+        physical_batch_size=1,
+        num_gpus=4,
+        global_batch_size=4,
+    )
+
+    assert distributed.num_gpus == 4
+    assert distributed.physical_batch_size == 1
+    assert distributed.gradient_accumulation_steps == 1
+    assert distributed.global_batch_size == 4
+    assert distributed.sample_presentations_for_optimizer_steps(100) == 400
+    assert distributed.identity()["global_batch_size"] == 4
+
+
+def test_rft_config_binds_step_12000_parent_and_40_action_horizon() -> None:
+    resolved = config(
+        base_model_path="/cache/models/lehome/policies/step-12000",
+        action_horizon=40,
+        max_steps=2_000,
+        save_steps=1_000,
+        parent_checkpoint_repository="ryanjin333/lehome-groot-n17-models",
+        parent_checkpoint_revision=PARENT_REVISION,
+        parent_checkpoint_subpath="policies/step-12000",
+        parent_checkpoint_artifact_sha256=PARENT_DIGEST,
+    )
+
+    assert resolved.action_horizon == 40
+    assert resolved.max_steps == 2_000
+    assert resolved.save_steps == 1_000
+    assert resolved.identity()["parent_checkpoint_artifact_sha256"] == PARENT_DIGEST
+
+
+def test_40_action_horizon_requires_complete_parent_checkpoint_identity() -> None:
+    with pytest.raises(ValueError, match="parent checkpoint"):
+        config(action_horizon=40)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("global_batch_size", 1),
+        ("global_batch_size", 8),
+        ("physical_batch_size", 2),
+    ],
+)
+def test_four_gpu_config_refuses_incompatible_batch_math(field: str, value: int) -> None:
+    values = {
+        "physical_batch_size": 1,
+        "num_gpus": 4,
+        "global_batch_size": 4,
+    }
+    values[field] = value
+    with pytest.raises(ValueError, match="global batch|per-device batch"):
+        config(**values)
 
 
 def test_config_records_augmentation_profile_hash_and_strict_gate_receipt() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import random
 import signal
 import sys
 
@@ -22,7 +23,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", required=True)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--api-token-env", required=True)
+    parser.add_argument("--device", choices=("cpu", "cuda:0"), required=True)
+    parser.add_argument("--seed", type=int, required=True)
     return parser
+
+
+def seed_policy_runtime(seed: int) -> None:
+    """Bind GR00T diffusion noise to the attributable rollout seed."""
+
+    if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**32:
+        raise ValueError("policy seed must be in 0..2^32-1")
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -42,10 +60,11 @@ def run(args: argparse.Namespace) -> int:
         from gr00t.policy.server_client import PolicyServer
     except ImportError as error:
         raise RuntimeError("pinned NVIDIA GR00T PolicyServer is unavailable") from error
+    seed_policy_runtime(args.seed)
     policy = Gr00tPolicy(
         embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
         model_path=str(args.model_path),
-        device="cuda:0",
+        device=args.device,
         strict=True,
     )
     # The pinned NVIDIA PolicyServer exposes construction and ``run()`` only.

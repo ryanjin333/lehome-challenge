@@ -193,7 +193,7 @@ def run_evaluation_loop(
                 policy_revision=flywheel_manifest["policy_revision"],
                 episode_id=flywheel_manifest.get("episode_id"),
                 identity=identity,
-                provenance={"policy_artifact_sha256": flywheel_manifest["policy_artifact_sha256"], "image_identity": flywheel_manifest["image_identity"], "strategy_sampled": dict(sampled.values), "strategy_receipt": dict(randomization_receipt)},
+                provenance={"policy_artifact_sha256": flywheel_manifest["policy_artifact_sha256"], "image_identity": flywheel_manifest["image_identity"], "execution_mode": flywheel_manifest["execution_mode"], "execution_backend": flywheel_manifest["execution_backend"], "simulator_device": flywheel_manifest["simulator_device"], "policy_device": flywheel_manifest.get("policy_device"), "parity_stage": flywheel_manifest.get("parity_stage"), "strategy_sampled": dict(sampled.values), "strategy_receipt": dict(randomization_receipt)},
             )
             reset_snapshot = capture_snapshot(env, randomization={"strategy": strategy, "sampled": dict(sampled.values), "receipt": dict(randomization_receipt)})
             recorder.record_snapshot("reset", reset_snapshot)
@@ -215,6 +215,7 @@ def run_evaluation_loop(
         success_flag = False
         success = torch.tensor(False)
         terminal_reason = "horizon"
+        visible_contact = None
 
         for st in range(args.max_steps):
             if rate_limiter:
@@ -254,6 +255,12 @@ def run_evaluation_loop(
 
             # 6. Step Environment
             env.step(action)
+            if recorder is not None:
+                current_contact = env.flywheel_visible_garment_contact()
+                if visible_contact is None or current_contact["minimum_distance_m"] < visible_contact["minimum_distance_m"]:
+                    visible_contact = current_contact
+                elif current_contact["observed"]:
+                    visible_contact = current_contact
 
             # Check success first
             if not success_flag:
@@ -315,7 +322,13 @@ def run_evaluation_loop(
         if recorder is not None:
             from lehome.flywheel.snapshots import capture_snapshot
             recorder.record_snapshot("terminal", capture_snapshot(env, randomization={"receipt": dict(randomization_receipt)}))
-            recorder.finish(reason=terminal_reason, accepted_success=bool(is_success))
+            if visible_contact is None:
+                raise RuntimeError("flywheel trial did not record simulator robot-garment contact evidence")
+            recorder.finish(
+                reason=terminal_reason,
+                accepted_success=bool(is_success),
+                visible_contact=visible_contact,
+            )
 
         # Save Datasets
         if args.save_datasets:
@@ -373,6 +386,7 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     else:
         env_cfg.use_random_seed = False
         env_cfg.seed = args.seed
+        env_cfg.random_seed = args.seed
         # Propagate seed to sim config if structure exists
         if hasattr(env_cfg, "sim") and hasattr(env_cfg.sim, "seed"):
             env_cfg.sim.seed = args.seed
@@ -392,7 +406,7 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
             f"Available policies: {', '.join(available_policies)}"
         )
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = args.device if args.policy_type == "groot" else ("cuda" if torch.cuda.is_available() else "cpu")
     is_bimanual = "Bi" in args.task or "bi" in args.task.lower()
 
     # Create policy instance from registry with appropriate arguments

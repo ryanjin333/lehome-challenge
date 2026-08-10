@@ -1,5 +1,5 @@
 import argparse
-from pathlib import Path
+import os
 from typing import TYPE_CHECKING
 import numpy as np
 import torch
@@ -73,15 +73,10 @@ def launch_app_from_args(args: argparse.Namespace) -> SimulationApp:
         SimulationApp instance.
     """
     if getattr(args, "headless", False):
-        # The vendored AppLauncher currently resolves every default branch to
-        # the GUI experience.  Camera observations need the purpose-built
-        # offscreen profile on machines without an X server.
+        # Enable camera observations without replacing AppLauncher's canonical
+        # isaaclab.python.kit experience.  The reduced headless-rendering
+        # profile does not advance this task's CPU cloth simulation.
         args.enable_cameras = True
-        if not getattr(args, "experience", ""):
-            args.experience = str(
-                Path(__file__).resolve().parents[2]
-                / "third_party/IsaacLab/apps/isaaclab.python.headless.rendering.kit"
-            )
     args.kit_args = (
         "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error "
         "--/plugins/carb.tasking.plugin/threadCount=32 "
@@ -89,7 +84,16 @@ def launch_app_from_args(args: argparse.Namespace) -> SimulationApp:
         "--/plugins/omni.tbb.globalcontrol/maxThreadCount=32 "
         "--/renderer/multiGpu/maxGpuCount=1"
     )
-    app_launcher = AppLauncher(vars(args))
+    launcher_args = vars(args).copy()
+    renderer_gpu = os.environ.get("LEHOME_FLYWHEEL_WORKER_GPU")
+    if getattr(args, "device", None) == "cpu" and renderer_gpu is not None:
+        if not renderer_gpu.isdecimal():
+            raise ValueError("LEHOME_FLYWHEEL_WORKER_GPU must be a physical GPU index")
+        # AppLauncher derives both activeGpu and physicsGpu from `device` even
+        # when the task physics remains on CPU.  Override only its private copy;
+        # evaluation still receives args.device == "cpu".
+        launcher_args["device"] = f"cuda:{renderer_gpu}"
+    app_launcher = AppLauncher(launcher_args)
     simulation_app = app_launcher.app
     return simulation_app
 

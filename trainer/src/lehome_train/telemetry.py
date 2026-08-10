@@ -296,9 +296,19 @@ def _host_memory_bytes() -> int | None:
 class NvmlTelemetrySampler:
     """NVML/PyTorch sampler whose GPU dependencies load only on construction."""
 
-    def __init__(self, *, device_index: int = 0, clock: Callable[[], float] = monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        device_index: int = 0,
+        nvml_device_index: int | None = None,
+        clock: Callable[[], float] = monotonic,
+    ) -> None:
         if type(device_index) is not int or device_index < 0:
             raise ValueError("NVML device index must be nonnegative")
+        if nvml_device_index is not None and (
+            type(nvml_device_index) is not int or nvml_device_index < 0
+        ):
+            raise ValueError("NVML physical device index must be nonnegative")
         try:
             import pynvml  # type: ignore[import-not-found]
             import torch  # type: ignore[import-not-found]
@@ -306,7 +316,9 @@ class NvmlTelemetrySampler:
             raise RuntimeError("NVML telemetry requires pynvml and torch") from error
         pynvml.nvmlInit()
         try:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+            handle = pynvml.nvmlDeviceGetHandleByIndex(
+                device_index if nvml_device_index is None else nvml_device_index
+            )
         except BaseException:
             pynvml.nvmlShutdown()
             raise

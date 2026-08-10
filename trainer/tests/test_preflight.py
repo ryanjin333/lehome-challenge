@@ -38,6 +38,41 @@ def test_hardware_requires_one_visible_40gb_gpu_and_200gb_writable_disk() -> Non
             visible_vram_bytes=(MINIMUM_VRAM_BYTES - 1,),
             writable_free_bytes=MINIMUM_DISK_BYTES,
         )
+
+
+def test_hardware_records_and_checks_each_four_3090_devices_independently() -> None:
+    gib = 1024**3
+    report = check_hardware(
+        visible_devices="0,1,2,3",
+        visible_vram_bytes=(24 * gib, 24 * gib, 24 * gib, 24 * gib),
+        visible_free_vram_bytes=(3 * gib, 3 * gib, 3 * gib, 3 * gib),
+        writable_free_bytes=MINIMUM_DISK_BYTES,
+        expected_gpu_count=4,
+        minimum_vram_bytes=24 * gib,
+    )
+
+    assert report.visible_devices == ("0", "1", "2", "3")
+    assert report.per_device_vram_bytes == (24 * gib, 24 * gib, 24 * gib, 24 * gib)
+    assert report.per_device_free_vram_bytes == (3 * gib, 3 * gib, 3 * gib, 3 * gib)
+
+    with pytest.raises(ValueError, match="per-device VRAM"):
+        check_hardware(
+            visible_devices="0,1,2,3",
+            visible_vram_bytes=(24 * gib, 24 * gib, 24 * gib, 23 * gib),
+            visible_free_vram_bytes=(3 * gib, 3 * gib, 3 * gib, 3 * gib),
+            writable_free_bytes=MINIMUM_DISK_BYTES,
+            expected_gpu_count=4,
+            minimum_vram_bytes=24 * gib,
+        )
+    with pytest.raises(ValueError, match="headroom"):
+        check_hardware(
+            visible_devices="0,1,2,3",
+            visible_vram_bytes=(24 * gib, 24 * gib, 24 * gib, 24 * gib),
+            visible_free_vram_bytes=(3 * gib, 3 * gib, 3 * gib, 2 * gib - 1),
+            writable_free_bytes=MINIMUM_DISK_BYTES,
+            expected_gpu_count=4,
+            minimum_vram_bytes=24 * gib,
+        )
     with pytest.raises(ValueError, match="exactly one visible GPU"):
         check_hardware(
             visible_devices="0,1",

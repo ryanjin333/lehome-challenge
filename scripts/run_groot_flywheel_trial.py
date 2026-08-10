@@ -114,7 +114,7 @@ def _require_free_loopback_port(port: int) -> None:
 def _physical_gpu_from_device(device: str) -> str:
     match = _ISAAC_PHYSICAL_CUDA_DEVICE.fullmatch(device)
     if match is None:
-        raise ValueError("production policy-server trials require --device cuda:<physical GPU>")
+        raise ValueError("policy-server device must be cuda:<physical GPU>")
     return match.group(1)
 
 
@@ -127,6 +127,12 @@ class ParentCudaVisibility:
 
     def clear(self) -> None:
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+    def select(self, physical_gpu: str) -> None:
+        """Expose one physical GPU to a CPU Isaac renderer without remapping the server."""
+        if not physical_gpu.isdigit():
+            raise ValueError("physical GPU identifier must be a decimal index")
+        os.environ["CUDA_VISIBLE_DEVICES"] = physical_gpu
 
     def restore(self) -> None:
         if self._had_previous:
@@ -167,6 +173,8 @@ def build_policy_server_command(args: argparse.Namespace) -> list[str]:
         str(args.groot_python), str(Path(__file__).with_name("run_groot_policy_server.py")),
         "--model-path", str(args.policy_path), "--host", "127.0.0.1",
         "--port", str(args.policy_server_port), "--api-token-env", _POLICY_SERVER_TOKEN_ENV,
+        "--device", "cuda:0",
+        "--seed", str(args.seed),
     ]
 
 
@@ -185,6 +193,10 @@ def write_policy_server_receipt(
     path = args.output_root / f"policy-server-receipt{suffix}.json"
     payload = {
         "schema_version": 1,
+        "episode_id": getattr(args, "episode_id", None),
+        "parity_stage": getattr(args, "parity_stage", None),
+        "backend": "policy_server",
+        "model_path": str(args.policy_path),
         "groot_revision": groot_revision,
         "python_version": python_version,
         "python_path": str(args.groot_python),
@@ -197,6 +209,9 @@ def write_policy_server_receipt(
         "checkpoint_digest": args.policy_artifact_sha256,
         "code_revision": args.code_revision,
         "image_identity": args.image_identity,
+        "simulator_device": getattr(args, "device", "cuda:0"),
+        "policy_device": getattr(args, "policy_device", None),
+        "policy_seed": args.seed,
     }
     content = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
     if path.exists() or path.is_symlink():
@@ -271,7 +286,7 @@ def _spawn_policy_server(
     *,
     token: str,
     command: Sequence[str],
-    physical_gpu: str,
+    physical_gpu: str | None,
 ) -> PolicyServerSupervisor:
     log_path = Path(args.policy_server_log)
     if log_path.is_symlink() or log_path.exists():
@@ -283,7 +298,10 @@ def _spawn_policy_server(
     fd = os.open(log_path, flags, 0o600)
     child_environment = dict(os.environ)
     child_environment[_POLICY_SERVER_TOKEN_ENV] = token
-    child_environment["CUDA_VISIBLE_DEVICES"] = physical_gpu
+    if physical_gpu is None:
+        child_environment.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        child_environment["CUDA_VISIBLE_DEVICES"] = physical_gpu
     try:
         process = subprocess.Popen(
             list(command), stdin=subprocess.DEVNULL, stdout=fd, stderr=subprocess.STDOUT,
@@ -553,6 +571,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", default="LeHome-BiSO101-Direct-Garment-v2")
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--policy-device", default="cuda:0", help="physical CUDA device reserved for the GR00T policy server")
+    parser.add_argument("--execution-mode", choices=("direct", "policy_server"), default="policy_server")
+    parser.add_argument("--parity-stage", choices=("direct_cpu", "server_cpu", "server_cuda"))
+    parser.add_argument("--historical-control-config", type=Path)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--snapshot-roundtrip-only", action="store_true")
     parser.add_argument("--render-randomization-sheet", action="store_true")
@@ -578,6 +600,10 @@ def validate_args(args: argparse.Namespace) -> str:
         raise ValueError("matrix must be an existing regular file")
     if not args.garment:
         raise ValueError("--garment is required for trial and simulator acceptance invocations")
+    if args.historical_control_config is not None:
+        release_list = args.historical_control_config / "Release" / "Release_test_list.txt"
+        if args.historical_control_config.is_symlink() or not args.historical_control_config.is_dir() or release_list.is_symlink() or not release_list.is_file() or release_list.read_text(encoding="utf-8").strip() != args.garment:
+            raise ValueError("historical control config must be a frozen matching garment config")
     if args.seed < 0 or args.max_steps <= 0:
         raise ValueError("seed must be non-negative and max-steps must be positive")
     if any(strategy not in {"canonical", "mild", "strong"} for strategy in args.strategies):
@@ -586,23 +612,28 @@ def validate_args(args: argparse.Namespace) -> str:
         build_identity(args, revision)
         if not args.dry_run:
             _validate_declared_production_provenance(args)
-            required_server_values = (
-                args.groot_root, args.groot_revision, args.groot_python,
-                args.policy_server_port, args.policy_server_readiness_timeout,
-                args.policy_server_request_timeout, args.policy_server_termination_grace,
-                args.policy_server_log,
-            )
-            if any(value is None for value in required_server_values):
-                raise ValueError("production flywheel trials require pinned GR00T policy server arguments")
-            if not _PINNED.fullmatch(args.groot_revision):
-                raise ValueError("GR00T revision must be a pinned 40-character SHA")
-            if (
-                args.policy_server_readiness_timeout <= 0
-                or args.policy_server_request_timeout <= 0
-                or args.policy_server_termination_grace <= 0
-            ):
-                raise ValueError("policy server timeouts and termination grace must be positive")
-            _physical_gpu_from_device(args.device)
+            if args.execution_mode == "policy_server":
+                required_server_values = (
+                    args.groot_root, args.groot_revision, args.groot_python,
+                    args.policy_server_port, args.policy_server_readiness_timeout,
+                    args.policy_server_request_timeout, args.policy_server_termination_grace,
+                    args.policy_server_log,
+                )
+                if any(value is None for value in required_server_values):
+                    raise ValueError("policy-server flywheel trials require pinned GR00T policy server arguments")
+                if not _PINNED.fullmatch(args.groot_revision):
+                    raise ValueError("GR00T revision must be a pinned 40-character SHA")
+                if (
+                    args.policy_server_readiness_timeout <= 0
+                    or args.policy_server_request_timeout <= 0
+                    or args.policy_server_termination_grace <= 0
+                ):
+                    raise ValueError("policy server timeouts and termination grace must be positive")
+                if args.device != "cpu":
+                    _physical_gpu_from_device(args.device)
+                _physical_gpu_from_device(args.policy_device or "")
+            elif args.parity_stage == "direct_cpu" and args.device == "cpu":
+                raise ValueError("direct_cpu is unsupported: Isaac Python 3.11 cannot directly load pinned GR00T Python 3.10 without PYTHONPATH mixing")
     return revision or ""
 
 
@@ -841,6 +872,13 @@ def _manifest_path(args: argparse.Namespace, revision: str) -> Path:
     suffix = f"-{args.episode_id}" if args.episode_id else ""
     path = args.output_root / f"flywheel-manifest{suffix}.json"
     identity = build_identity(args, revision)
+    # Unit-level callers predate the rollout-provenance fields.  Default them
+    # conservatively so old manifest reads remain compatible while every CLI
+    # invocation records its explicit execution provenance.
+    execution_mode = getattr(args, "execution_mode", "policy_server")
+    simulator_device = getattr(args, "device", "cuda:0")
+    policy_device = getattr(args, "policy_device", None)
+    parity_stage = getattr(args, "parity_stage", None)
     payload = {
         "schema_version": 1,
         "policy_revision": revision,
@@ -851,6 +889,11 @@ def _manifest_path(args: argparse.Namespace, revision: str) -> Path:
         "identity": {"episode_id": identity.episode_id, "policy_repo": identity.policy_repo, "policy_revision": identity.policy_revision, "policy_step": identity.policy_step, "code_revision": identity.code_revision, "asset_revision": identity.asset_revision, "simulator_version": identity.simulator_version, "garment_name": identity.garment_name, "category": identity.category, "release_stage": identity.release_stage, "seed": identity.seed, "instruction": identity.instruction, "strategy": identity.strategy},
         "policy_artifact_sha256": args.policy_artifact_sha256,
         "image_identity": args.image_identity,
+        "execution_mode": execution_mode,
+        "execution_backend": "direct" if execution_mode == "direct" else "policy_server",
+        "simulator_device": simulator_device,
+        "policy_device": policy_device,
+        "parity_stage": parity_stage,
     }
     if args.episode_id:
         payload["episode_id"] = args.episode_id
@@ -889,16 +932,44 @@ def run_trial(
         finally:
             common.close_app(app)
     command = [
-        "--policy_type", "groot_server", "--policy_path", str(args.policy_path),
+        "--policy_type", "groot" if args.execution_mode == "direct" else "groot_server", "--policy_path", str(args.policy_path),
         "--garment_type", "custom", "--num_episodes", "1", "--max_steps", str(args.max_steps),
         "--garment_name", args.garment,
         "--seed", str(args.seed), "--task", args.task, "--device", args.device,
     ]
+    if args.historical_control_config is not None:
+        command.extend(("--garment_cfg_base_path", str(args.historical_control_config)))
     if args.headless:
         command.append("--headless")
     if args.dry_run:
         manifest = _manifest_path(args, revision)
         print(json.dumps({"command": command, "manifest": str(manifest)}, sort_keys=True))
+        return 0
+    if args.execution_mode == "direct":
+        from isaaclab.app import AppLauncher
+        from scripts.utils import common
+        from scripts.utils.parser import setup_eval_parser
+
+        execution_identity_validator(args)
+        parser = setup_eval_parser()
+        _add_app_launcher_args(parser, AppLauncher)
+        evaluation_args = parser.parse_args(command)
+        evaluation_args.multi_gpu = False
+        simulation_app = common.launch_app_from_args(evaluation_args)
+        try:
+            _validate_live_runtime_identity(
+                args,
+                simulation_app,
+                runtime_identity_reader=runtime_identity_reader,
+            )
+            manifest = _manifest_path(args, revision)
+            evaluation_args.flywheel_manifest = str(manifest)
+            import lehome.tasks.bedroom  # noqa: F401
+            from scripts.utils.evaluation import eval as evaluate
+
+            evaluate(evaluation_args, simulation_app)
+        finally:
+            common.close_app(simulation_app)
         return 0
     # Keep the legacy parser untouched: inject this opt-in attribute only in
     # this dedicated process, after it has parsed the normal evaluation args.
@@ -922,7 +993,7 @@ def run_trial(
     # The token crosses exactly one boundary: this parent's private environment
     # into the child; it is never an argv component, receipt field, or log line.
     api_token = secrets.token_urlsafe(48)
-    physical_gpu = _physical_gpu_from_device(args.device)
+    physical_gpu = _physical_gpu_from_device(args.policy_device)
     blocked_signals = {signal.SIGINT, signal.SIGTERM}
     previous_signal_mask = None
     if hasattr(signal, "pthread_sigmask"):
@@ -965,6 +1036,9 @@ def run_trial(
             evaluation_args.policy_server_token_env = _POLICY_SERVER_TOKEN_ENV
             evaluation_args.policy_server_request_timeout = args.policy_server_request_timeout
             evaluation_args.multi_gpu = False
+            # Isaac's Vulkan renderer and CUDA interop must enumerate the same
+            # physical GPU set.  Renderer affinity is passed independently via
+            # LEHOME_FLYWHEEL_WORKER_GPU and resolved by launch_app_from_args.
             cuda_visibility.clear()
             simulation_app = common.launch_app_from_args(evaluation_args)
             _validate_live_runtime_identity(
@@ -979,18 +1053,28 @@ def run_trial(
 
             evaluate(evaluation_args, simulation_app)
     finally:
-        try:
-            if simulation_app is not None:
-                common.close_app(simulation_app)
-        finally:
+        primary_exception = sys.exc_info()[1]
+        cleanup_error = None
+        cleanup_actions = (
+            parent_policy_token.restore,
+            cuda_visibility.restore,
+            supervisor.close,
+            supervisor.restore_signal_handlers,
+            (lambda: common.close_app(simulation_app)) if simulation_app is not None else None,
+        )
+        for cleanup in cleanup_actions:
+            if cleanup is None:
+                continue
             try:
-                parent_policy_token.restore()
-            finally:
-                cuda_visibility.restore()
-                try:
-                    supervisor.close()
-                finally:
-                    supervisor.restore_signal_handlers()
+                cleanup()
+            except BaseException:
+                if primary_exception is not None:
+                    traceback.print_exc()
+                elif cleanup_error is None:
+                    cleanup_error = sys.exc_info()
+        if cleanup_error is not None:
+            error_type, error, error_traceback = cleanup_error
+            raise error.with_traceback(error_traceback)
     return 0
 
 

@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 from lehome.flywheel.artifacts import EpisodeArtifactWriter
-from lehome_train.flywheel.materialize import materialize_episode
+from lehome_train.flywheel.materialize import materialize_episode, materialize_rft_episode
 
 
 def _video(path: Path, frames: int = 20) -> None:
@@ -32,6 +32,58 @@ def _raw_episode(root: Path, *, grade: str = "A", holdout: bool = False, frames:
         "quality_grade": grade, "rejection_reasons": [],
         "identity": {"release_stage": "public_unseen" if holdout else "seen", "instruction": "fold the garment on the table", "policy_revision": "a" * 40, "code_revision": "b" * 40},
     }, required_videos=("top_rgb.mp4", "left_rgb.mp4", "right_rgb.mp4"))
+
+
+def _raw_rft_episode(
+    root: Path,
+    *,
+    episode_id: str = "episode-rft-1",
+    holdout: bool = False,
+    accepted_success: bool = True,
+    outcome: str = "success",
+    terminal_reason: str = "success",
+    frames: int = 45,
+    production_schema: bool = True,
+) -> Path:
+    writer = EpisodeArtifactWriter(root, episode_id)
+    for index in range(frames):
+        writer.append_annotation({
+            "step": index, "monotonic_ns": index, "wall_time_ns": index,
+            "action_source": "policy", "segment": 0,
+            "state": [float(index)] * 12, "action": [float(index + 1)] * 12,
+            "reward": 1.0, "success": accepted_success,
+            "policy_request_id": f"request-{index // 40}",
+            "policy_chunk_offset": index % 40,
+        })
+    for camera in ("top_rgb", "left_rgb", "right_rgb"):
+        _video(writer.staging / "videos" / f"{camera}.mp4", frames=frames)
+    episode = {
+        "outcome": outcome,
+        "accepted_success": accepted_success, "terminal_reason": terminal_reason,
+        "bc_target_count": 0,
+        "provenance": {
+            "execution_backend": "policy_server",
+            "execution_mode": "policy_server",
+            "parity_stage": "server_cpu",
+            "policy_artifact_sha256": "c" * 64,
+            "policy_device": "cuda:0",
+            "simulator_device": "cpu",
+        },
+        "identity": {
+            "release_stage": "public_unseen" if holdout else "seen",
+            "instruction": "fold the garment on the table",
+            "policy_revision": "a" * 40,
+            "code_revision": "b" * 40,
+        },
+    }
+    if not production_schema:
+        episode["mode"] = "autonomous"
+        episode.pop("bc_target_count")
+        episode.pop("provenance")
+    return writer.finalize(
+        episode,
+        required_videos=("top_rgb.mp4", "left_rgb.mp4", "right_rgb.mp4"),
+    )
 
 
 def test_materializer_verifies_real_artifact_and_writes_canonical_v2_layout(tmp_path: Path) -> None:
@@ -61,3 +113,43 @@ def test_materializer_rejects_tampered_or_unlisted_raw_artifact(tmp_path: Path) 
     (raw / "surprise.txt").write_text("unlisted", encoding="utf-8")
     with pytest.raises(ValueError, match="unlisted"):
         materialize_episode(raw, tmp_path / "out")
+
+
+def test_rft_materializer_accepts_only_verified_seen_policy_successes(tmp_path: Path) -> None:
+    report = materialize_rft_episode(_raw_rft_episode(tmp_path), tmp_path / "out")
+
+    assert report.selected_observations == 6
+    manifest = json.loads((tmp_path / "out" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["episode_count"] == 1
+    assert manifest["frame_count"] == 45
+    assert manifest["future_actions"] == {
+        "horizon": 40,
+        "loader_allow_padding": False,
+        "materialized_windows": False,
+        "tail_convention": "drop_incomplete_windows",
+        "valid_window_counts": {"0": 6},
+    }
+    provenance = json.loads(
+        (tmp_path / "out" / "meta" / "materialization-provenance.json").read_text(encoding="utf-8")
+    )
+    assert provenance["training_method"] == "rejection_finetuning"
+    assert provenance["selected_frame_ranges"] == [{
+        "raw_episode_id": "episode-rft-1",
+        "frame_start": 0,
+        "frame_stop": 45,
+        "action_source": "policy",
+    }]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"holdout": True}, "holdout"),
+        ({"accepted_success": False, "outcome": "failure", "terminal_reason": "timeout"}, "accepted autonomous success"),
+    ],
+)
+def test_rft_materializer_rejects_holdout_and_failures(
+    tmp_path: Path, kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        materialize_rft_episode(_raw_rft_episode(tmp_path, **kwargs), tmp_path / "out")

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import math
+import hashlib
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -64,7 +66,10 @@ def test_build_launch_uses_only_pinned_official_entrypoint_and_redacts_token(
         official_checkout=official_checkout,
     )
 
-    assert launch.command[:2] == ("python", str(official_checkout / "gr00t" / "experiment" / "launch_finetune.py"))
+    assert launch.command[:2] == (
+        sys.executable,
+        str(official_checkout / "gr00t" / "experiment" / "launch_finetune.py"),
+    )
     assert "--base-model-path" in launch.command
     assert "--base-model-revision" not in launch.command
     assert "--global-batch-size" in launch.command
@@ -78,6 +83,47 @@ def test_build_launch_uses_only_pinned_official_entrypoint_and_redacts_token(
     assert launch.environment["CUDA_VISIBLE_DEVICES"] == "1"
     assert "HF_TOKEN" not in launch.environment
     assert "hf_" not in " ".join(launch.command)
+
+
+def test_build_launch_verifies_step_12000_parent_weights(
+    tmp_path: Path, official_checkout: Path
+) -> None:
+    checkpoint = tmp_path / "step-12000"
+    checkpoint.mkdir()
+    weights = checkpoint / "model.safetensors"
+    weights.write_bytes(b"verified-step-12000")
+    digest = hashlib.sha256(weights.read_bytes()).hexdigest()
+    parent = config(
+        base_model_path=str(checkpoint),
+        action_horizon=40,
+        parent_checkpoint_repository="ryanjin333/lehome-groot-n17-models",
+        parent_checkpoint_revision="b" * 40,
+        parent_checkpoint_subpath="policies/step-12000",
+        parent_checkpoint_artifact_sha256=digest,
+    )
+
+    launch = build_launch(
+        parent,
+        visible_devices="0",
+        environment={},
+        official_checkout=official_checkout,
+    )
+
+    assert launch.command[launch.command.index("--base-model-path") + 1] == str(checkpoint)
+    with pytest.raises(ValueError, match="artifact digest"):
+        build_launch(
+            config(
+                base_model_path=str(checkpoint),
+                action_horizon=40,
+                parent_checkpoint_repository="ryanjin333/lehome-groot-n17-models",
+                parent_checkpoint_revision="b" * 40,
+                parent_checkpoint_subpath="policies/step-12000",
+                parent_checkpoint_artifact_sha256="c" * 64,
+            ),
+            visible_devices="0",
+            environment={},
+            official_checkout=official_checkout,
+        )
 
 
 def test_build_launch_passes_color_jitter_as_eight_official_cli_tokens(
@@ -343,7 +389,7 @@ def test_chunk_launch_wraps_same_pinned_entrypoint_and_strips_token(
 
     command, environment, checked = calls[0]
     assert command[:5] == (
-        "python",
+        sys.executable,
         "-m",
         "lehome_train.groot.chunk_launch",
         "--stop-after-step",
@@ -355,6 +401,94 @@ def test_chunk_launch_wraps_same_pinned_entrypoint_and_strips_token(
     assert environment["CUDA_VISIBLE_DEVICES"] == "0"
     assert "HF_TOKEN" not in environment
     assert checked is True
+
+
+def test_four_gpu_chunk_launch_uses_torchrun_current_interpreter_and_all_visible_devices(
+    tmp_path: Path,
+    official_checkout: Path,
+) -> None:
+    calls: list[tuple[tuple[str, ...], dict[str, str], bool]] = []
+
+    def runner(
+        command: tuple[str, ...], *, env: dict[str, str], check: bool
+    ) -> subprocess.CompletedProcess[object]:
+        calls.append((command, env, check))
+        return subprocess.CompletedProcess(command, 0)
+
+    launch_finetune_to_step(
+        config(
+            output_dir=str(tmp_path / "output"),
+            physical_batch_size=1,
+            global_batch_size=4,
+            num_gpus=4,
+        ),
+        stop_after_optimizer_step=100,
+        visible_devices="0,1,2,3",
+        environment={"HF_TOKEN": "must-not-reach-child", "PATH": "/bin"},
+        official_checkout=official_checkout,
+        runner=runner,
+    )
+
+    command, environment, checked = calls[0]
+    assert command[:7] == (
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nproc_per_node=4",
+        "-m",
+        "lehome_train.groot.chunk_launch",
+        "--stop-after-step",
+    )
+    assert command[7] == "100"
+    assert command[8] == "--"
+    assert command[command.index("--num-gpus") + 1] == "4"
+    assert command[command.index("--global-batch-size") + 1] == "4"
+    assert environment["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    assert "HF_TOKEN" not in environment
+    assert checked is True
+
+
+@pytest.mark.parametrize("visible_devices", ["0", "0,1,2", "0,1,2,3,4", "0,1,2,2"])
+def test_four_gpu_launch_refuses_rank_device_count_mismatch_before_runner(
+    visible_devices: str,
+    official_checkout: Path,
+) -> None:
+    with pytest.raises(ValueError, match="exactly four visible GPUs"):
+        build_launch(
+            config(physical_batch_size=1, global_batch_size=4, num_gpus=4),
+            visible_devices=visible_devices,
+            environment={},
+            official_checkout=official_checkout,
+        )
+
+
+def test_four_gpu_launch_identity_is_not_resume_compatible_with_single_gpu(
+    tmp_path: Path,
+    official_checkout: Path,
+) -> None:
+    output = tmp_path / "output"
+    launch_finetune(
+        config(output_dir=str(output)),
+        visible_devices="0",
+        environment={},
+        official_checkout=official_checkout,
+        runner=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0),
+    )
+
+    with pytest.raises(ValueError, match="incompatible experiment"):
+        launch_finetune_to_step(
+            config(
+                output_dir=str(output),
+                physical_batch_size=1,
+                global_batch_size=4,
+                num_gpus=4,
+            ),
+            stop_after_optimizer_step=100,
+            visible_devices="0,1,2,3",
+            environment={},
+            official_checkout=official_checkout,
+            runner=lambda *_args, **_kwargs: pytest.fail("runner must not execute"),
+        )
 
 
 @pytest.mark.parametrize("stop", [-1, 12_001])

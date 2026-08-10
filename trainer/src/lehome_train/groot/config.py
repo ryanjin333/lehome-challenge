@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Mapping
 
 from lehome_train.constants import MODEL_REVISION
@@ -17,6 +18,7 @@ ACTION_HORIZON = 16
 LR_SCHEDULER_TYPE = "cosine"
 DECAY_SEMANTICS = "cosine_remainder_after_warmup"
 _PINNED_REVISION = re.compile(r"^[0-9a-f]{40}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _require_nonempty(value: str, field_name: str) -> None:
@@ -65,6 +67,10 @@ class FineTuneLaunchConfig:
     save_total_limit: int = 5
     augmentation_profile: str = "none"
     augmentation_receipt: Mapping[str, object] | None = None
+    parent_checkpoint_repository: str | None = None
+    parent_checkpoint_revision: str | None = None
+    parent_checkpoint_subpath: str | None = None
+    parent_checkpoint_artifact_sha256: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -85,22 +91,66 @@ class FineTuneLaunchConfig:
         _require_pinned_revision(self.dataset_revision, "dataset_revision")
         if self.base_model_revision != MODEL_REVISION:
             raise ValueError("base_model_revision must equal the pinned GR00T N1.7 revision")
-        if self.num_gpus != 1:
-            raise ValueError("exactly one GPU is required")
+        if self.num_gpus not in {1, 4}:
+            raise ValueError("exactly one GPU or the explicit four-GPU profile is required")
         if not isinstance(self.physical_batch_size, int) or self.physical_batch_size <= 0:
             raise ValueError("physical_batch_size must be positive")
         resolved_global_batch = (
-            self.physical_batch_size
+            self.physical_batch_size * self.num_gpus * self.gradient_accumulation_steps
             if self.global_batch_size is None
             else self.global_batch_size
         )
-        if resolved_global_batch != self.physical_batch_size:
-            raise ValueError("global batch must equal physical batch")
-        object.__setattr__(self, "global_batch_size", resolved_global_batch)
         if self.gradient_accumulation_steps != 1:
             raise ValueError("gradient accumulation must be exactly 1")
-        if self.action_horizon != ACTION_HORIZON:
-            raise ValueError("action horizon must be exactly 16")
+        expected_global_batch = (
+            self.physical_batch_size * self.num_gpus * self.gradient_accumulation_steps
+        )
+        if resolved_global_batch != expected_global_batch:
+            raise ValueError(
+                "global batch must equal physical batch per-device times world size times gradient accumulation"
+            )
+        if self.num_gpus == 4 and self.physical_batch_size != 1:
+            raise ValueError("four-GPU profile requires per-device batch 1")
+        object.__setattr__(self, "global_batch_size", resolved_global_batch)
+        parent_fields = (
+            self.parent_checkpoint_repository,
+            self.parent_checkpoint_revision,
+            self.parent_checkpoint_subpath,
+            self.parent_checkpoint_artifact_sha256,
+        )
+        has_parent = any(value is not None for value in parent_fields)
+        if has_parent and not all(value is not None for value in parent_fields):
+            raise ValueError("parent checkpoint identity must be complete")
+        if has_parent:
+            assert self.parent_checkpoint_repository is not None
+            assert self.parent_checkpoint_revision is not None
+            assert self.parent_checkpoint_subpath is not None
+            assert self.parent_checkpoint_artifact_sha256 is not None
+            if (
+                not self.parent_checkpoint_repository
+                or any(character.isspace() for character in self.parent_checkpoint_repository)
+            ):
+                raise ValueError("parent checkpoint repository is invalid")
+            _require_pinned_revision(
+                self.parent_checkpoint_revision, "parent checkpoint revision"
+            )
+            subpath = PurePosixPath(self.parent_checkpoint_subpath)
+            if (
+                subpath.is_absolute()
+                or ".." in subpath.parts
+                or "." in subpath.parts
+                or not self.parent_checkpoint_subpath
+                or "\\" in self.parent_checkpoint_subpath
+            ):
+                raise ValueError("parent checkpoint subpath is invalid")
+            if not _SHA256.fullmatch(self.parent_checkpoint_artifact_sha256):
+                raise ValueError("parent checkpoint artifact SHA-256 is invalid")
+            if not Path(self.base_model_path).is_absolute():
+                raise ValueError("parent checkpoint base_model_path must be absolute")
+            if self.action_horizon != 40:
+                raise ValueError("parent checkpoint action horizon must be exactly 40")
+        elif self.action_horizon != ACTION_HORIZON:
+            raise ValueError("action horizon must be exactly 16 without a parent checkpoint")
         if not self.tune_projector:
             raise ValueError("tune_projector must be true")
         if not self.tune_diffusion_model:
@@ -162,4 +212,16 @@ class FineTuneLaunchConfig:
                 self.augmentation_profile, receipt=self.augmentation_receipt
             ).sha256,
             "augmentation_receipt": self.augmentation_receipt,
+            "parent_checkpoint_repository": self.parent_checkpoint_repository,
+            "parent_checkpoint_revision": self.parent_checkpoint_revision,
+            "parent_checkpoint_subpath": self.parent_checkpoint_subpath,
+            "parent_checkpoint_artifact_sha256": self.parent_checkpoint_artifact_sha256,
         }
+
+    def sample_presentations_for_optimizer_steps(self, optimizer_steps: int) -> int:
+        """Return global samples consumed by a whole-number optimizer-step count."""
+
+        if type(optimizer_steps) is not int or optimizer_steps < 0:
+            raise ValueError("optimizer steps must be nonnegative")
+        assert self.global_batch_size is not None
+        return optimizer_steps * self.global_batch_size

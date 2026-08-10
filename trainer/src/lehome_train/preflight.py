@@ -39,6 +39,9 @@ class HardwareReport:
     visible_device: str
     vram_bytes: int
     writable_free_bytes: int
+    visible_devices: tuple[str, ...] = ()
+    per_device_vram_bytes: tuple[int, ...] = ()
+    per_device_free_vram_bytes: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,39 +111,70 @@ class HubPermission:
     private_repository: bool
 
 
-def _one_visible_gpu(value: str | None) -> str:
+def _visible_gpus(value: str | None, *, expected_count: int) -> tuple[str, ...]:
     if not isinstance(value, str):
         raise ValueError("exactly one visible GPU is required")
-    candidate = value.strip()
-    if not _VISIBLE_GPU.fullmatch(candidate):
+    candidates = tuple(candidate.strip() for candidate in value.split(","))
+    if (
+        len(candidates) != expected_count
+        or any(not _VISIBLE_GPU.fullmatch(candidate) for candidate in candidates)
+        or len(set(candidates)) != len(candidates)
+    ):
+        if expected_count == 4:
+            raise ValueError("exactly four visible GPUs are required")
         raise ValueError("exactly one visible GPU is required")
-    return candidate
+    return candidates
 
 
 def check_hardware(
     *,
     visible_devices: str | None,
     visible_vram_bytes: Iterable[int],
+    visible_free_vram_bytes: Iterable[int] | None = None,
     writable_free_bytes: int,
+    expected_gpu_count: int = 1,
+    minimum_vram_bytes: int = MINIMUM_VRAM_BYTES,
 ) -> HardwareReport:
-    """Reject insufficient, multi-GPU, or non-writable paid environments.
+    """Reject insufficient or mismatched paid environments per visible GPU.
 
     The caller obtains GPU facts from NVML at runtime; keeping this function
     dependency-free lets its safety rules run in CPU-only tests as well.
     """
 
-    device = _one_visible_gpu(visible_devices)
+    if expected_gpu_count not in {1, 4}:
+        raise ValueError("hardware gate requires exactly one or four GPUs")
+    if type(minimum_vram_bytes) is not int or minimum_vram_bytes <= 0:
+        raise ValueError("per-device VRAM minimum must be positive")
+    devices = _visible_gpus(visible_devices, expected_count=expected_gpu_count)
     memories = tuple(visible_vram_bytes)
-    if len(memories) != 1 or type(memories[0]) is not int or memories[0] < 0:
-        raise ValueError("exactly one visible GPU is required")
-    if memories[0] < MINIMUM_VRAM_BYTES:
-        raise ValueError("at least 40 GiB VRAM is required")
+    if len(memories) != expected_gpu_count or any(
+        type(memory) is not int or memory < 0 for memory in memories
+    ):
+        raise ValueError("visible GPU memory probe does not match visible devices")
+    if any(memory < minimum_vram_bytes for memory in memories):
+        if expected_gpu_count == 1 and minimum_vram_bytes == MINIMUM_VRAM_BYTES:
+            raise ValueError("at least 40 GiB VRAM is required")
+        raise ValueError("every visible GPU must satisfy the per-device VRAM minimum")
+    free_memories = (
+        memories if visible_free_vram_bytes is None else tuple(visible_free_vram_bytes)
+    )
+    if len(free_memories) != expected_gpu_count or any(
+        type(memory) is not int or memory < 0 for memory in free_memories
+    ):
+        raise ValueError("visible GPU free-memory probe does not match visible devices")
+    if any(free > total for free, total in zip(free_memories, memories)):
+        raise ValueError("visible GPU free memory exceeds its per-device total")
+    if any(free * 100 < total * 10 for free, total in zip(free_memories, memories)):
+        raise ValueError("every visible GPU must retain at least 10 percent headroom")
     if type(writable_free_bytes) is not int or writable_free_bytes < MINIMUM_DISK_BYTES:
         raise ValueError("at least 200 GiB writable disk is required")
     return HardwareReport(
-        visible_device=device,
+        visible_device=devices[0] if len(devices) == 1 else ",".join(devices),
         vram_bytes=memories[0],
         writable_free_bytes=writable_free_bytes,
+        visible_devices=devices,
+        per_device_vram_bytes=memories,
+        per_device_free_vram_bytes=free_memories,
     )
 
 

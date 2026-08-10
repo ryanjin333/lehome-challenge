@@ -25,7 +25,9 @@ from lehome_train.groot.production_adapters import (
     GrootSmokeRunner,
     GrootTrainingSession,
     HubCheckpointUploader,
+    MultiGpuTelemetrySampler,
     probe_physical_vram_bytes,
+    probe_visible_gpu_memory,
 )
 from lehome_train.io import (
     atomic_write_json,
@@ -165,16 +167,21 @@ def _positive_integer(value: object, label: str) -> int:
     return value
 
 
-def _visible_device() -> str:
+def _visible_device(expected_gpu_count: int = 1) -> str:
     value = os.environ.get("CUDA_VISIBLE_DEVICES")
     if not value:
+        raise ValueError("CUDA_VISIBLE_DEVICES must identify visible GPUs")
+    devices = tuple(device.strip() for device in value.split(","))
+    if len(devices) != expected_gpu_count or not all(devices) or len(set(devices)) != len(devices):
+        if expected_gpu_count == 4:
+            raise ValueError("CUDA_VISIBLE_DEVICES must identify exactly four GPUs")
         raise ValueError("CUDA_VISIBLE_DEVICES must identify exactly one GPU")
     try:
         import torch
     except ImportError:
         raise RuntimeError("the pinned PyTorch runtime is unavailable") from None
-    if torch.cuda.device_count() != 1:
-        raise ValueError("exactly one CUDA GPU must be visible")
+    if torch.cuda.device_count() != expected_gpu_count:
+        raise ValueError("visible CUDA GPU count does not match launch configuration")
     return value
 
 
@@ -337,8 +344,20 @@ class ProductionRuntime:
         ):
             raise ValueError("prepare artifact destination identity is incompatible")
         normalization_sha256 = normalization_identity(config.dataset_path)
-        visible_device = _visible_device()
-        physical_vram = probe_physical_vram_bytes()
+        visible_device = _visible_device(config.num_gpus)
+        if config.num_gpus == 1:
+            physical_vram = probe_physical_vram_bytes()
+            visible_vram = (physical_vram,)
+            visible_free_vram = (physical_vram,)
+        else:
+            probes = probe_visible_gpu_memory(
+                expected_gpu_count=config.num_gpus, visible_devices=visible_device
+            )
+            visible_vram = tuple(probe.total_bytes for probe in probes)
+            visible_free_vram = tuple(probe.free_bytes for probe in probes)
+            # This value is used only by the single-record smoke schema.  It is
+            # deliberately the weakest individual device, never an aggregate.
+            physical_vram = min(visible_vram)
         output_root = Path(config.output_dir)
         output_root.mkdir(parents=True, exist_ok=True)
         token = os.environ.get("HF_TOKEN")
@@ -447,8 +466,11 @@ class ProductionRuntime:
             resolved_config=resolved_config,
             artifacts=identity_artifacts,
             visible_devices=visible_device,
-            visible_vram_bytes=(physical_vram,),
+            visible_vram_bytes=visible_vram,
+            visible_free_vram_bytes=visible_free_vram,
             writable_free_bytes=shutil.disk_usage(output_root).free,
+            expected_gpu_count=config.num_gpus,
+            minimum_vram_bytes=(24 * 1024**3 if config.num_gpus == 4 else 40 * 1024**3),
             token=token,
             hub_targets=(
                 HubTarget(experiment.dataset_repository, experiment.dataset_revision),
@@ -506,6 +528,15 @@ class ProductionRuntime:
             "hardware": {
                 "visible_device": result.hardware.visible_device,
                 "vram_bytes": result.hardware.vram_bytes,
+                "visible_devices": list(
+                    getattr(result.hardware, "visible_devices", (result.hardware.visible_device,))
+                ),
+                "per_device_vram_bytes": list(
+                    getattr(result.hardware, "per_device_vram_bytes", (result.hardware.vram_bytes,))
+                ),
+                "per_device_free_vram_bytes": list(
+                    getattr(result.hardware, "per_device_free_vram_bytes", ())
+                ),
                 "writable_free_bytes": result.hardware.writable_free_bytes,
             },
         }
@@ -571,13 +602,30 @@ class ProductionRuntime:
         experiment = _load_experiment(request["experiment_config"])
         config_sha256 = canonical_json_sha256(experiment)
         runner = GrootSmokeRunner()
+        if config.num_gpus == 1:
+            smoke_vram_bytes = probe_physical_vram_bytes()
+        else:
+            visible_devices = _visible_device(config.num_gpus)
+            probes = probe_visible_gpu_memory(
+                expected_gpu_count=config.num_gpus, visible_devices=visible_devices
+            )
+            # The smoke record models one device.  Its threshold is gated by
+            # the smallest separately observed GPU, never the host aggregate.
+            smoke_vram_bytes = min(probe.total_bytes for probe in probes)
         report = run_smoke_tests(
             base_config=config,
-            physical_vram_bytes=probe_physical_vram_bytes(),
+            physical_vram_bytes=smoke_vram_bytes,
             experiment_config_sha256=config_sha256,
             dataset_manifest_sha256=experiment.dataset_manifest_sha256,
             runner=runner,
-            sampler_factory=NvmlTelemetrySampler,
+            sampler_factory=(
+                NvmlTelemetrySampler
+                if config.num_gpus == 1
+                else lambda: MultiGpuTelemetrySampler(
+                    visible_devices=visible_devices,
+                    expected_gpu_count=config.num_gpus,
+                )
+            ),
         )
         report_payload = _write_result(outputs["report_output"], report)
         selected = next(
@@ -657,8 +705,8 @@ class ProductionRuntime:
         )
         if experiment.sample_presentations != TOTAL_SAMPLE_PRESENTATIONS:
             raise ValueError("train requires exactly 768000 sample presentations")
-        if config.physical_batch_size != experiment.physical_batch_size:
-            raise ValueError("train launch and experiment physical batches differ")
+        if config.global_batch_size != experiment.physical_batch_size:
+            raise ValueError("train launch global batch and experiment presentation batch differ")
         expected_steps = optimizer_steps_for_presentations(
             TOTAL_SAMPLE_PRESENTATIONS,
             experiment.physical_batch_size,

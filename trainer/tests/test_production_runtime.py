@@ -206,7 +206,7 @@ def test_prepare_composes_restart_safe_preflight_before_model_initialization(
         )
 
     monkeypatch.setattr(runtime_module, "prepare_training_environment", fake_prepare)
-    monkeypatch.setattr(runtime_module, "_visible_device", lambda: "0")
+    monkeypatch.setattr(runtime_module, "_visible_device", lambda *_args: "0")
     monkeypatch.setattr(runtime_module, "probe_physical_vram_bytes", lambda: 96 * 1024**3)
     monkeypatch.setattr(
         runtime_module,

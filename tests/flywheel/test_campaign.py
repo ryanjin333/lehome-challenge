@@ -6,8 +6,10 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import threading
 import pytest
+import scripts.run_groot_flywheel_trial as trial_module
 
 from lehome.flywheel.artifacts import EpisodeArtifactWriter
 from lehome.flywheel.capacity import CapacitySample, choose_worker_count
@@ -21,6 +23,9 @@ from scripts.run_groot_flywheel_campaign import (
     _prepare_policy_telemetry_path,
     _prepare_retry_attempt,
     _run_one_worker,
+    _run_campaign_under_supervisor,
+    _run_scale_cpu_canary,
+    _scale_cpu_runtime_paths,
     _run_worker_group,
     _resource_margins,
     _trial_command,
@@ -28,11 +33,35 @@ from scripts.run_groot_flywheel_campaign import (
     _worker_gpu_indices,
     _worker_environment,
     _write_invocation_checkpoint,
+    _write_json_atomically,
+    _episode_gate_evidence,
+    _read_parity_receipt,
+    _require_cpu_scale_authorization,
+    _cpu_scale_live_invocation,
+    _may_emit_parity_receipt,
+    _validate_cuda_abort_evidence,
+    _validate_scale_cpu_production_output,
+    _validate_server_cpu_evidence,
+    _validate_legacy_cpu_reference,
+    _require_scale_parity,
+    _sha256_file,
+    _validate_legacy_shared_policy_receipt,
+    _attempted_gate_evidence,
+    _campaign_supervisor_lease,
+    _top40_evaluation_invocation,
+    _top40_evaluation_metrics,
+    _top40_final_bindings,
+    _abort_after_first_completed_cohort,
+    _verify_or_write_top40_evaluation_invocation,
+    _validate_top40_evaluation_output,
+    build_legacy_cpu_reference_receipt,
     build_parser,
     main,
     pending_trial_ids,
     run_campaign,
+    selected_trials,
 )
+from lehome.flywheel.parity import EpisodeGateEvidence, HISTORICAL_CONTROL_IDS, assess_reset_diversity, historical_control_trials
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +70,19 @@ def _keep_unit_campaigns_host_independent(monkeypatch):
         "scripts.run_groot_flywheel_campaign.require_isaac_sim_5_1_runtime",
         lambda: None,
     )
+    def fake_scale_paths(args):
+        root = Path(args.trial_runtime_root).resolve()
+        return root, (
+            root, root / "source" / "lehome",
+            root / "third_party" / "IsaacLab" / "source" / "isaaclab",
+            root / "third_party" / "IsaacLab" / "source" / "isaaclab_assets",
+            root / "third_party" / "IsaacLab" / "source" / "isaaclab_tasks",
+            root / "third_party" / "IsaacLab" / "source" / "isaaclab_mimic",
+            root / "third_party" / "IsaacLab" / "source" / "isaaclab_rl",
+            Path("/opt/isaacsim/python"),
+            Path(getattr(args, "groot_root", "/opt/isaac-groot")).resolve(),
+        )
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._scale_cpu_runtime_paths", fake_scale_paths)
 
 
 def campaign_state_with_completed_trial(tmp_path, trial_id: str) -> CampaignState:
@@ -57,9 +99,1545 @@ def campaign_state_with_completed_trial(tmp_path, trial_id: str) -> CampaignStat
     return CampaignState(output_root=tmp_path, trial_ids=(trial_id, "trial-002"))
 
 
+def test_scale_cpu_runtime_paths_accepts_isaac_kit_python_layout(monkeypatch, tmp_path) -> None:
+    runtime_root = tmp_path / "trial-runtime"
+    for relative_path in (
+        "source/lehome",
+        "third_party/IsaacLab/source/isaaclab",
+        "third_party/IsaacLab/source/isaaclab_assets",
+        "third_party/IsaacLab/source/isaaclab_tasks",
+        "third_party/IsaacLab/source/isaaclab_mimic",
+        "third_party/IsaacLab/source/isaaclab_rl",
+    ):
+        (runtime_root / relative_path).mkdir(parents=True)
+
+    isaacsim_root = tmp_path / "isaac-sim"
+    kit_python = isaacsim_root / "kit" / "python"
+    kit_interpreter = kit_python / "bin" / "python3.11"
+    kit_interpreter.parent.mkdir(parents=True)
+    kit_interpreter.write_text("#!/bin/sh\n")
+    kit_interpreter.chmod(0o755)
+    groot_python = tmp_path / "workspace" / "lehome-venv" / "bin" / "python"
+    groot_python.parent.mkdir(parents=True)
+    groot_python.symlink_to(kit_interpreter)
+    groot_root = tmp_path / "isaac-groot"
+    groot_root.mkdir()
+    assert not (isaacsim_root / "python").exists()
+    assert groot_python.resolve() == kit_interpreter
+
+    monkeypatch.setenv("ISAACSIM_PATH", str(isaacsim_root))
+    resolved_root, trusted_paths = _scale_cpu_runtime_paths(
+        argparse.Namespace(trial_runtime_root=runtime_root, groot_root=groot_root)
+    )
+
+    assert resolved_root == runtime_root.resolve()
+    assert trusted_paths[-2:] == (kit_python.resolve(), groot_root.resolve())
+
+
+@pytest.mark.parametrize(
+    ("groot_root_kind", "message"),
+    (("missing", "trusted runtime import roots are incomplete"), ("file", "trusted runtime import roots are incomplete"),
+     ("symlink", "trusted runtime import roots are incomplete"), ("undeclared", "requires a declared GR00T checkout")),
+)
+def test_scale_cpu_runtime_paths_rejects_missing_or_unsafe_groot_checkout(monkeypatch, tmp_path, groot_root_kind, message) -> None:
+    runtime_root = tmp_path / "trial-runtime"
+    for relative_path in (
+        "source/lehome",
+        "third_party/IsaacLab/source/isaaclab",
+        "third_party/IsaacLab/source/isaaclab_assets",
+        "third_party/IsaacLab/source/isaaclab_tasks",
+        "third_party/IsaacLab/source/isaaclab_mimic",
+        "third_party/IsaacLab/source/isaaclab_rl",
+    ):
+        (runtime_root / relative_path).mkdir(parents=True)
+    isaacsim_root = tmp_path / "isaac-sim"
+    (isaacsim_root / "kit" / "python").mkdir(parents=True)
+    groot_root = tmp_path / "isaac-groot"
+    if groot_root_kind == "file":
+        groot_root.write_text("not a checkout", encoding="utf-8")
+    elif groot_root_kind == "symlink":
+        real_groot_root = tmp_path / "real-isaac-groot"
+        real_groot_root.mkdir()
+        groot_root.symlink_to(real_groot_root)
+
+    monkeypatch.setenv("ISAACSIM_PATH", str(isaacsim_root))
+
+    args = argparse.Namespace(trial_runtime_root=runtime_root)
+    if groot_root_kind != "undeclared":
+        args.groot_root = groot_root
+    with pytest.raises(ValueError, match=message):
+        _scale_cpu_runtime_paths(args)
+
+
+def _run_supervisor_only(args):
+    """Exercise scheduler mechanics without bypassing public scale admission tests."""
+    return _run_campaign_under_supervisor(args, build_public_matrix())
+
+
 def test_campaign_resume_skips_checksum_verified_trials(tmp_path) -> None:
     state = campaign_state_with_completed_trial(tmp_path, "trial-001")
     assert pending_trial_ids(state) == ("trial-002",)
+
+
+def test_campaign_reads_success_contact_and_reset_evidence_only_from_verified_artifacts(tmp_path) -> None:
+    writer = EpisodeArtifactWriter(tmp_path, "trial-001")
+    writer.append_annotation({"step": 0, "action_source": "policy"})
+    videos = writer.staging / "videos"
+    videos.mkdir()
+    for filename in CANONICAL_VIDEO_FILENAMES:
+        (videos / filename).write_bytes(b"video")
+    writer.finalize(
+        {
+            "terminal_reason": "success",
+            "outcome": "success",
+            "accepted_success": True,
+            "reset_hash": "a" * 64,
+            "visible_contact": {
+                "observed": True,
+                "source": "simulator_particle_to_gripper_distance",
+                "minimum_distance_m": 0.01,
+            },
+        },
+        required_videos=CANONICAL_VIDEO_FILENAMES,
+    )
+
+    assert _episode_gate_evidence(tmp_path, "trial-001").official_success is True
+    assert _episode_gate_evidence(tmp_path, "trial-001").visible_contact is True
+
+
+def test_campaign_abort_evidence_counts_terminal_attempts_without_artifacts_as_zero_evidence(tmp_path) -> None:
+    evidence = _attempted_gate_evidence(tmp_path, tuple(f"trial-{index:03d}" for index in range(12)))
+
+    assert len(evidence) == 12
+    assert all(not item.official_success and not item.visible_contact and item.reset_hash is None for item in evidence)
+
+
+def test_campaign_control_mode_selects_exact_historical_twelve_without_mutating_public_matrix(tmp_path) -> None:
+    args = build_parser().parse_args([
+        "--matrix", "configs/eval_groot_n17_public_280.json", "--policy-path", "policy", "--policy-revision-file", "revision",
+        "--output-root", str(tmp_path), "--policy-repo", "org/policy", "--policy-step", "12000",
+        "--code-revision", "a" * 40, "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"),
+        "--simulator-version", "isaac-5.1", "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image",
+        "--historical-control", "--parity-stage", "direct_cpu", "--dry-run",
+    ])
+
+    assert len(selected_trials(args, build_public_matrix())) == 12
+
+
+def test_public_unseen_tops_selects_the_exact_canonical_top_forty_in_source_order() -> None:
+    matrix = build_public_matrix()
+    args = argparse.Namespace(historical_control=False, public_unseen_tops=True)
+
+    trials = selected_trials(args, matrix)
+
+    assert [trial.trial_id for trial in trials] == [
+        trial.trial_id
+        for trial in matrix.trials
+        if trial.release_stage == "public_unseen" and trial.category in {"top_long", "top_short"}
+    ]
+    assert len(trials) == 40
+    assert {category: sum(trial.category == category for trial in trials) for category in ("top_long", "top_short")} == {
+        "top_long": 20,
+        "top_short": 20,
+    }
+    assert len(matrix.trials) == 280
+
+
+def test_campaign_parser_rejects_public_unseen_tops_with_historical_control(tmp_path) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([
+            "--matrix", "configs/eval_groot_n17_public_280.json", "--policy-path", "policy", "--policy-revision-file", "revision",
+            "--output-root", str(tmp_path), "--policy-repo", "org/policy", "--policy-step", "12000",
+            "--code-revision", "a" * 40, "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"),
+            "--simulator-version", "isaac-5.1", "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image",
+            "--historical-control", "--public-unseen-tops", "--dry-run",
+        ])
+
+
+def test_public_unseen_tops_rejects_the_historical_control_worker_alias(tmp_path) -> None:
+    args = build_parser().parse_args([
+        "--matrix", "configs/eval_groot_n17_public_280.json", "--policy-path", "policy", "--policy-revision-file", "revision",
+        "--output-root", str(tmp_path), "--policy-repo", "org/policy", "--policy-step", "12000",
+        "--code-revision", "a" * 40, "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"),
+        "--simulator-version", "isaac-5.1", "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image",
+        "--public-unseen-tops", "--historical-control-workers", "4", "--execution-mode", "policy_server", "--device", "cpu", "--dry-run",
+    ])
+
+    with pytest.raises(ValueError, match="cannot use --historical-control-workers"):
+        run_campaign(args)
+
+
+def test_public_unseen_tops_dry_run_is_a_diagnostic_evaluation_report_not_a_scale_release(tmp_path) -> None:
+    args = build_parser().parse_args([
+        "--matrix", "configs/eval_groot_n17_public_280.json", "--policy-path", "policy", "--policy-revision-file", "revision",
+        "--output-root", str(tmp_path), "--policy-repo", "org/policy", "--policy-step", "12000",
+        "--code-revision", "a" * 40, "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"),
+        "--simulator-version", "isaac-5.1", "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image",
+        "--public-unseen-tops", "--workers", "4", "--execution-mode", "policy_server", "--device", "cpu", "--dry-run",
+    ])
+
+    report = run_campaign(args)
+
+    assert report["selection"] == {
+        "kind": "public_unseen_tops_evaluation",
+        "classification": "diagnostic_evaluation_only_not_training_or_production_release",
+        "rft_data_eligible": False,
+        "trial_count": 40,
+        "trial_ids": [trial.trial_id for trial in selected_trials(args, build_public_matrix())],
+        "category_counts": {"top_long": 20, "top_short": 20},
+        "parity_stage": None,
+    }
+
+
+def test_top40_evaluation_invocation_rejects_programmatic_historical_control_collision(tmp_path) -> None:
+    args = _worker_args(tmp_path)
+    args.historical_control = True
+    args.public_unseen_tops = True
+    args.workers = 4
+    args.execution_mode = "policy_server"
+    args.device = "cpu"
+    args.policy_device = "cuda:0"
+    args.parity_stage = None
+    args.matrix = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    args.trials_per_worker = 1
+    args.max_inference_latency_seconds = 0.5
+    args.max_inference_queue_depth = 16
+    args.early_abort_completed_trials = 12
+    args.minimum_reset_uniqueness_ratio = 1.0
+    args.historical_control_workers = None
+    args.capacity_sweep = None
+    args.dry_run = False
+    args.max_steps = 600
+    args.policy_revision_file.write_text("f" * 40, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cannot combine --historical-control and --public-unseen-tops"):
+        _top40_evaluation_invocation(args, build_public_matrix(), selected_trials(args, build_public_matrix()))
+
+
+def test_top40_evaluation_resume_rejects_a_foreign_raw_trial_before_launch(tmp_path) -> None:
+    args = _worker_args(tmp_path)
+    args.historical_control = False
+    args.public_unseen_tops = True
+    (tmp_path / "raw" / "foreign-trial").mkdir(parents=True)
+    trials = tuple(
+        trial for trial in build_public_matrix().trials
+        if trial.release_stage == "public_unseen" and trial.category in {"top_long", "top_short"}
+    )
+
+    with pytest.raises(ValueError, match="extra or foreign trial artifact"):
+        _validate_top40_evaluation_output(
+            args, CampaignState(tmp_path, tuple(trial.trial_id for trial in trials)), {}, trials,
+        )
+
+
+def test_top40_evaluation_metrics_are_derived_per_category_from_verified_evidence(monkeypatch, tmp_path) -> None:
+    trials = tuple(
+        trial for trial in build_public_matrix().trials
+        if trial.release_stage == "public_unseen" and trial.category in {"top_long", "top_short"}
+    )
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._episode_gate_evidence",
+        lambda _root, trial_id: EpisodeGateEvidence(
+            official_success=trial_id.endswith("seed-601"), visible_contact=not trial_id.endswith("seed-653"), reset_hash="a" * 64,
+        ),
+    )
+
+    metrics = _top40_evaluation_metrics(tmp_path, trials)
+
+    assert metrics == {
+        "episodes": 40, "official_successes": 4, "success_rate": 0.1, "visible_contact_count": 36,
+        "per_category": {
+            "top_long": {"episodes": 20, "official_successes": 2, "success_rate": 0.1, "visible_contact_count": 18},
+            "top_short": {"episodes": 20, "official_successes": 2, "success_rate": 0.1, "visible_contact_count": 18},
+        },
+    }
+
+
+@pytest.mark.parametrize("field", ("policy_revision", "policy_artifact_sha256"))
+def test_top40_resume_rejects_a_foreign_invocation_before_worker_scheduling(monkeypatch, tmp_path, field) -> None:
+    args = _worker_args(tmp_path)
+    args.trials_per_worker = 1
+    args.max_inference_latency_seconds = 0.5
+    args.max_inference_queue_depth = 16
+    args.early_abort_completed_trials = 12
+    args.minimum_reset_uniqueness_ratio = 1.0
+    args.historical_control_workers = None
+    args.capacity_sweep = None
+    args.dry_run = False
+    args.matrix = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
+    args.historical_control = False
+    args.public_unseen_tops = True
+    args.workers = 4
+    args.execution_mode = "policy_server"
+    args.device = "cpu"
+    args.policy_device = "cuda:0"
+    args.parity_stage = None
+    args.policy_revision_file.write_text("f" * 40, encoding="utf-8")
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._live_groot_identity", lambda _args: {
+        "groot_root": "/groot", "groot_revision": "d" * 40, "groot_python": "/groot/python",
+        "groot_python_sha256": "e" * 64, "groot_python_version": "3.10.18",
+    })
+    trials = tuple(trial for trial in build_public_matrix().trials if trial.release_stage == "public_unseen" and trial.category in {"top_long", "top_short"})
+    invocation = _top40_evaluation_invocation(args, build_public_matrix(), trials)
+    foreign = dict(invocation)
+    foreign[field] = "0" * (40 if field == "policy_revision" else 64)
+    _write_json_atomically(tmp_path / "checkpoint-evaluation-invocation.json", foreign)
+    scheduled = []
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_campaign_under_supervisor", lambda *_args, **_kwargs: scheduled.append(True))
+
+    with pytest.raises(ValueError, match="does not match this resume identity"):
+        run_campaign(args)
+    assert scheduled == []
+
+
+def _top40_trials() -> tuple[Trial, ...]:
+    return tuple(trial for trial in build_public_matrix().trials if trial.release_stage == "public_unseen" and trial.category in {"top_long", "top_short"})
+
+
+def test_top40_mixed_completed_episode_and_receipt_provenance_rejects_before_launch(monkeypatch, tmp_path) -> None:
+    trials = _top40_trials()
+    args = _worker_args(tmp_path)
+    args.historical_control = False
+    args.public_unseen_tops = True
+    trial = trials[0]
+    writer = EpisodeArtifactWriter(tmp_path, trial.trial_id)
+    writer.append_annotation({"step": 0})
+    videos = writer.staging / "videos"; videos.mkdir()
+    for name in CANONICAL_VIDEO_FILENAMES: (videos / name).write_bytes(b"v")
+    writer.finalize({"terminal_reason": "horizon", "outcome": "success", "accepted_success": True, "identity": {"episode_id": trial.trial_id}, "provenance": {}}, required_videos=CANONICAL_VIDEO_FILENAMES)
+    (tmp_path / f"policy-server-receipt-{trial.trial_id}.json").write_text(json.dumps({"episode_id": trial.trial_id, "checkpoint_revision": "foreign"}), encoding="utf-8")
+    invocation = {"policy_device_pool": ["cuda:0"], "policy_repo": "org/policy", "policy_revision": "f" * 40, "policy_step": 12000, "code_revision": "a" * 40, "asset_revision": "b" * 40, "simulator_version": "isaac-5.1", "strategy": "canonical", "simulator_device": "cpu", "policy_artifact_sha256": "c" * 64, "image_identity": "sha256:immutable", "groot_revision": "d" * 40, "groot_python": "/python", "groot_python_version": "3.10.18"}
+    with pytest.raises(ValueError, match="episode identity"):
+        _validate_top40_evaluation_output(args, CampaignState(tmp_path, tuple(item.trial_id for item in trials)), invocation, trials)
+
+
+def test_top40_clean_close_binds_exactly_forty_manifests_receipts_and_metrics(monkeypatch, tmp_path) -> None:
+    trials = _top40_trials(); state = CampaignState(tmp_path, tuple(trial.trial_id for trial in trials))
+    for trial in trials:
+        episode = tmp_path / "raw" / trial.trial_id; episode.mkdir(parents=True)
+        (episode / "SHA256SUMS.json").write_text("{}", encoding="utf-8")
+        (tmp_path / f"policy-server-receipt-{trial.trial_id}.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._episode_gate_evidence", lambda _root, trial_id: EpisodeGateEvidence(trial_id.endswith("601"), True, "a" * 64))
+    close = _top40_final_bindings(tmp_path, state, {"policy_revision": "f" * 40}, trials)
+    assert len(close["episode_manifests"]) == len(close["policy_server_receipts"]) == 40
+    assert close["metrics"]["episodes"] == 40 and close["metrics"]["official_successes"] == 4
+
+
+def test_top40_first_cohort_zero_success_and_contact_aborts(monkeypatch, tmp_path) -> None:
+    args = argparse.Namespace(output_root=tmp_path, early_abort_completed_trials=12)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._attempted_gate_evidence", lambda *_args: [EpisodeGateEvidence(False, False, None)] * 12)
+    receipt = _abort_after_first_completed_cohort(args, trial_ids=tuple(f"trial-{index}" for index in range(12)), invocation_id="a" * 32)
+    assert receipt is not None and receipt["reason"]
+
+
+def test_top40_duplicate_reset_hashes_fail_completed_campaign_diversity() -> None:
+    evidence = [EpisodeGateEvidence(True, True, "a" * 64) for _ in range(40)]
+    diversity = assess_reset_diversity(evidence, minimum_ratio=1.0)
+    assert diversity.passed is False and diversity.unique_hashes == 1
+
+
+def test_historical_direct_cpu_workers_are_exactly_four() -> None:
+    action = next(action for action in build_parser()._actions if "--historical-control-workers" in action.option_strings)
+
+    assert action.type("4") == 4
+    with pytest.raises(argparse.ArgumentTypeError, match="exactly 4"):
+        action.type("6")
+
+
+def test_non_dry_direct_cpu_is_rejected_before_preflight_or_output(tmp_path) -> None:
+    args = build_parser().parse_args([
+        "--matrix", "configs/eval_groot_n17_public_280.json", "--policy-path", "policy", "--policy-revision-file", "revision",
+        "--output-root", str(tmp_path), "--policy-repo", "org/policy", "--policy-step", "12000",
+        "--code-revision", "a" * 40, "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "Release"),
+        "--simulator-version", "isaac-5.1", "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image",
+        "--historical-control", "--parity-stage", "direct_cpu", "--execution-mode", "direct", "--device", "cpu",
+        "--historical-control-workers", "4",
+    ])
+    called = []
+    with pytest.raises(ValueError, match="direct_cpu is unsupported before campaign launch"):
+        run_campaign(args, runtime_preflight=lambda: called.append(True))
+    assert called == []
+    assert not (tmp_path / "capacity-report.json").exists()
+    assert not (tmp_path / "campaign-ledger").exists()
+
+
+def test_canonical_public_campaign_rejects_missing_scale_stage_before_launch(tmp_path) -> None:
+    args = build_parser().parse_args([
+        "--matrix", "configs/eval_groot_n17_public_280.json", "--policy-path", "policy", "--policy-revision-file", "revision",
+        "--output-root", str(tmp_path), "--policy-repo", "org/policy", "--policy-step", "12000",
+        "--code-revision", "a" * 40, "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"),
+        "--simulator-version", "isaac-5.1", "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "1",
+    ])
+
+    with pytest.raises(ValueError, match="canonical public 280 execution requires --parity-stage scale"):
+        run_campaign(args)
+
+
+def test_scale_refuses_to_relax_the_280_reset_diversity_requirement(tmp_path) -> None:
+    args = build_parser().parse_args([
+        "--matrix", "configs/eval_groot_n17_public_280.json", "--policy-path", "policy", "--policy-revision-file", "revision",
+        "--output-root", str(tmp_path), "--policy-repo", "org/policy", "--policy-step", "12000",
+        "--code-revision", "a" * 40, "--asset-revision", "b" * 40, "--release-assets-root", str(tmp_path / "assets" / "Release"),
+        "--simulator-version", "isaac-5.1", "--policy-artifact-sha256", "c" * 64, "--image-identity", "sha256:image",
+        "--groot-root", str(tmp_path / "Isaac-GR00T"), "--groot-revision", "d" * 40,
+        "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "1",
+        "--parity-stage", "scale", "--minimum-reset-uniqueness-ratio", "0.99",
+    ])
+
+    with pytest.raises(ValueError, match="100% distinct canonical reset hashes"):
+        run_campaign(args)
+
+
+def _write_server_receipt_artifacts(root: Path, *, stage: str, successes: int = 10) -> Path:
+    policy_receipts = []
+    for index, trial_id in enumerate(HISTORICAL_CONTROL_IDS):
+        writer = EpisodeArtifactWriter(root, trial_id)
+        writer.append_annotation({"step": 0, "action_source": "policy_server"})
+        videos = writer.staging / "videos"
+        videos.mkdir()
+        for filename in CANONICAL_VIDEO_FILENAMES:
+            (videos / filename).write_bytes(b"video")
+        writer.finalize(
+            {
+                "terminal_reason": "horizon",
+                "outcome": "success" if index < successes else "timeout",
+                "accepted_success": index < successes,
+                "visible_contact": {"observed": True, "source": "simulator_particle_to_gripper_distance", "minimum_distance_m": 0.01},
+                "reset_hash": f"{index + 1:064x}",
+                "identity": {
+                    "policy_repo": "org/policy", "policy_revision": "a" * 40, "policy_step": 1,
+                    "code_revision": "b" * 40, "asset_revision": "e" * 40,
+                    "simulator_version": "isaac-5.1", "strategy": "canonical", "seed": 42,
+                },
+                "provenance": {
+                    "policy_artifact_sha256": "c" * 64,
+                    "image_identity": "sha256:image",
+                    "execution_mode": "policy_server",
+                    "execution_backend": "policy_server",
+                    "simulator_device": "cpu" if stage == "server_cpu" else "cuda:0",
+                    "policy_device": "cuda:0",
+                    "parity_stage": stage,
+                },
+            },
+            required_videos=CANONICAL_VIDEO_FILENAMES,
+        )
+        receipt_args = argparse.Namespace(
+            output_root=root, episode_id=trial_id, parity_stage=stage, policy_path=Path("/checkpoint"),
+            groot_python=Path("/venv/bin/python"), policy_server_port=5511, policy_server_request_timeout=1.0,
+            policy_server_readiness_timeout=1.0, policy_artifact_sha256="c" * 64, code_revision="b" * 40,
+            image_identity="sha256:image", device="cpu" if stage == "server_cpu" else "cuda:0", policy_device="cuda:0",
+            seed=42,
+        )
+        policy_receipt = trial_module.write_policy_server_receipt(
+            receipt_args, groot_revision="d" * 40, python_version="3.10.18", checkpoint_revision="a" * 40,
+            command=trial_module.build_policy_server_command(receipt_args),
+        )
+        policy_receipts.append({
+            "trial_id": trial_id,
+            "path": policy_receipt.name,
+            "sha256": _sha256_file(policy_receipt),
+        })
+    receipt = root / "receipt.json"
+    receipt.write_text(json.dumps({
+        "schema_version": 1,
+        "parity_stage": stage,
+        "trial_count": 12,
+        "trial_ids": list(HISTORICAL_CONTROL_IDS),
+        "official_successes": successes,
+        "backend": "policy_server_cpu" if stage == "server_cpu" else "policy_server_cuda",
+        "artifact_root": str(root),
+        "policy_server_receipts": policy_receipts,
+    }), encoding="utf-8")
+    return receipt
+
+
+def _write_cuda_abort_fixture(root: Path, *, contacts: int = 6) -> Path:
+    _write_server_receipt_artifacts(root, stage="server_cuda", successes=0)
+    for index, trial_id in enumerate(HISTORICAL_CONTROL_IDS):
+        if index < contacts:
+            continue
+        episode_path = root / "raw" / trial_id / "episode.json"
+        episode = json.loads(episode_path.read_text(encoding="utf-8"))
+        episode["visible_contact"]["observed"] = False
+        episode_path.write_text(json.dumps(episode), encoding="utf-8")
+        manifest_path = episode_path.with_name("SHA256SUMS.json")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["episode.json"]["sha256"] = _sha256_file(episode_path)
+        manifest["episode.json"]["size"] = episode_path.stat().st_size
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    invocation_id = "f" * 32
+    receipt = {
+        "status": "aborted", "reason": "zero_official_successes", "completed_trials": 12,
+        "trial_ids": list(HISTORICAL_CONTROL_IDS), "official_successes": 0,
+        "visible_robot_garment_contacts": contacts, "invocation_id": invocation_id,
+    }
+    path = root / "campaign-abort-receipt-test.json"
+    path.write_text(json.dumps(receipt), encoding="utf-8")
+    bound_receipt = {**receipt, "receipt_path": str(path)}
+    waves = []
+    for index in range(0, 12, 4):
+        ids = list(HISTORICAL_CONTROL_IDS[index:index + 4])
+        wave = {"mode": "production", "status": "terminal", "trial_ids": ids,
+                "scheduled_trial_ids": ids, "launched_trial_ids": ids,
+                "completed_trials": 4, "failed_trials": 0}
+        if index == 8:
+            wave["abort_receipt"] = bound_receipt
+        waves.append(wave)
+    ledger = {"schema_version": 1, "invocation_id": invocation_id, "status": "failed", "mode": "production",
+              "pending_before": list(HISTORICAL_CONTROL_IDS), "completed_after": list(HISTORICAL_CONTROL_IDS),
+              "abort_receipt": bound_receipt, "waves": waves}
+    (root / "campaign-ledger").mkdir()
+    (root / "campaign-ledger" / f"{invocation_id}.json").write_text(json.dumps(ledger), encoding="utf-8")
+    return path
+
+
+def test_cuda_abort_evidence_accepts_the_production_receipt_path_binding_schema(tmp_path) -> None:
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort")
+    expected = _cpu_scale_live_invocation(
+        _cpu_scale_args(tmp_path, legacy=cuda_abort, server_cpu=cuda_abort, cuda_abort=cuda_abort),
+        build_public_matrix(),
+    )
+    receipt = json.loads(cuda_abort.read_text(encoding="utf-8"))
+    ledger = json.loads((cuda_abort.parent / "campaign-ledger" / f"{'f' * 32}.json").read_text(encoding="utf-8"))
+
+    assert "receipt_path" not in receipt
+    assert ledger["abort_receipt"]["receipt_path"] == str(cuda_abort)
+    assert ledger["waves"][-1]["abort_receipt"]["receipt_path"] == str(cuda_abort)
+    assert _validate_cuda_abort_evidence(cuda_abort, expected)["official_successes"] == 0
+
+
+def test_cuda_abort_evidence_rejects_a_receipt_path_in_the_on_disk_receipt(tmp_path) -> None:
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort")
+    expected = _cpu_scale_live_invocation(
+        _cpu_scale_args(tmp_path, legacy=cuda_abort, server_cpu=cuda_abort, cuda_abort=cuda_abort),
+        build_public_matrix(),
+    )
+    receipt = json.loads(cuda_abort.read_text(encoding="utf-8"))
+    receipt["receipt_path"] = str(cuda_abort)
+    cuda_abort.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="on-disk receipt must not contain a receipt path binding"):
+        _validate_cuda_abort_evidence(cuda_abort, expected)
+
+
+@pytest.mark.parametrize("location", ("ledger", "terminal_wave"))
+@pytest.mark.parametrize("tampering", ("missing", "wrong"))
+def test_cuda_abort_evidence_rejects_missing_or_tampered_receipt_path_binding(tmp_path, location, tampering) -> None:
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort")
+    expected = _cpu_scale_live_invocation(
+        _cpu_scale_args(tmp_path, legacy=cuda_abort, server_cpu=cuda_abort, cuda_abort=cuda_abort),
+        build_public_matrix(),
+    )
+    ledger_path = cuda_abort.parent / "campaign-ledger" / f"{'f' * 32}.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    bound_receipt = ledger["abort_receipt"] if location == "ledger" else ledger["waves"][-1]["abort_receipt"]
+    if tampering == "missing":
+        del bound_receipt["receipt_path"]
+    else:
+        bound_receipt["receipt_path"] = str(cuda_abort.with_name("wrong-receipt.json"))
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="receipt path does not bind the on-disk receipt"):
+        _validate_cuda_abort_evidence(cuda_abort, expected)
+
+
+def test_new_server_receipt_rejects_artifacts_from_a_foreign_stage(tmp_path) -> None:
+    receipt = _write_server_receipt_artifacts(tmp_path, stage="server_cuda")
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload.update({"parity_stage": "server_cpu", "backend": "policy_server_cpu"})
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact backend or stage is foreign"):
+        _read_parity_receipt(receipt)
+
+
+def test_new_server_receipt_rejects_a_forged_claimed_success_total(tmp_path) -> None:
+    receipt = _write_server_receipt_artifacts(tmp_path, stage="server_cpu")
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["official_successes"] = 12
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="claimed successes do not match terminal artifacts"):
+        _read_parity_receipt(receipt)
+
+
+def test_new_server_receipt_rejects_policy_server_device_binding_mismatch(tmp_path) -> None:
+    receipt = _write_server_receipt_artifacts(tmp_path, stage="server_cpu")
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    binding = payload["policy_server_receipts"][0]
+    policy_receipt = tmp_path / binding["path"]
+    policy_payload = json.loads(policy_receipt.read_text(encoding="utf-8"))
+    policy_payload["policy_device"] = "cuda:1"
+    policy_receipt.write_text(json.dumps(policy_payload), encoding="utf-8")
+    binding["sha256"] = _sha256_file(policy_receipt)
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="device binding mismatches terminal provenance"):
+        _read_parity_receipt(receipt)
+
+
+def test_server_cuda_receipt_rejects_noncanonical_simulator_device_after_rehash(tmp_path) -> None:
+    receipt = _write_server_receipt_artifacts(tmp_path, stage="server_cuda")
+    trial_id = HISTORICAL_CONTROL_IDS[0]
+    episode_path = tmp_path / "raw" / trial_id / "episode.json"
+    episode = json.loads(episode_path.read_text(encoding="utf-8"))
+    episode["provenance"]["simulator_device"] = "cuda:bogus"
+    episode_path.write_text(json.dumps(episode), encoding="utf-8")
+    manifest_path = tmp_path / "raw" / trial_id / "SHA256SUMS.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["episode.json"]["sha256"] = _sha256_file(episode_path)
+    manifest["episode.json"]["size"] = episode_path.stat().st_size
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact device does not match its stage"):
+        _read_parity_receipt(receipt)
+
+
+def test_new_server_receipt_rejects_minimal_policy_server_receipt(tmp_path) -> None:
+    receipt = _write_server_receipt_artifacts(tmp_path, stage="server_cpu")
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    binding = payload["policy_server_receipts"][0]
+    path = tmp_path / binding["path"]
+    path.write_text(json.dumps({"simulator_device": "cpu", "policy_device": "cuda:0"}), encoding="utf-8")
+    binding["sha256"] = _sha256_file(path)
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="device binding mismatches terminal provenance"):
+        _read_parity_receipt(receipt)
+
+
+def _write_sha256sums(root: Path) -> Path:
+    files = sorted(path for path in root.rglob("*") if path.is_file() and path.name != "SHA256SUMS")
+    sums = root / "SHA256SUMS"
+    sums.write_text("".join(f"{_sha256_file(path)}  ./{path.relative_to(root)}\n" for path in files), encoding="utf-8")
+    return sums
+
+
+def _write_legacy_receipt_bundle(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    (archive / "archived-output.txt").write_text("archived rollout", encoding="utf-8")
+    report = archive / "rollout-report.json"
+    report.write_text(json.dumps({"trials": [{"trial": {"trial_id": trial_id}} for trial_id in HISTORICAL_CONTROL_IDS]}), encoding="utf-8")
+    archive_sums = _write_sha256sums(archive)
+
+    controls = tmp_path / "controls"
+    for trial in historical_control_trials():
+        release = controls / trial.trial_id / "garment-config" / "Release"
+        release.mkdir(parents=True)
+        (release / "Release_test_list.txt").write_text(trial.garment_name, encoding="utf-8")
+    control_sums = _write_sha256sums(controls)
+
+    reproduction = tmp_path / "reproduction"
+    reproduction.mkdir()
+    source_sha256 = {
+        "run-lehome-24-shared.sh": "bbf8fee87d7efc4e09b08874e3265175fd7a4c9ea9494be8ac7e8301fd4d7f92",
+        "eval_groot_n17_matrix_parallel.py": "e26d63536a6eef53fe6d0de8a22ee683616aa1b5ba4aa4dc968d4eb13a37f89a",
+        "groot_policy.py": "cee2d9f78711e867ef4e4867ee615abdbfe5584e3385c3b601adfe90f25d78bf",
+        "serve_groot_policy.py": "b8aa5f81e651e1db18f4189e55121e0eca67ca7613a58db361ae88753a8cb3e4",
+    }
+    binding = {
+        "source_sha256": source_sha256,
+        "archive_sha256sums_sha256": _sha256_file(archive_sums),
+        "archive_rollout_report_sha256": _sha256_file(report),
+        "historical_control_sha256sums_sha256": _sha256_file(control_sums),
+    }
+    records = []
+    for index, trial_id in enumerate(HISTORICAL_CONTROL_IDS):
+        trial_dir = reproduction / trial_id
+        trial_dir.mkdir()
+        terminal = trial_dir / "terminal.json"
+        terminal.write_text(json.dumps({
+            "trial_id": trial_id, "terminal": True, "backend": "legacy_shared_policy_server",
+            "environment_device": "cpu", "outcome": "success" if index < 9 else "timeout",
+            "accepted_success": index < 9, "integrity_binding": binding,
+        }), encoding="utf-8")
+        manifest = trial_dir / "manifest.json"
+        manifest.write_text(json.dumps({"episode_id": trial_id}), encoding="utf-8")
+        log = trial_dir / "terminal.log"
+        log.write_text("terminal evidence\n", encoding="utf-8")
+        records.append({
+            "trial_id": trial_id,
+            "terminal_record_path": str(terminal.relative_to(reproduction)), "terminal_record_sha256": _sha256_file(terminal),
+            "manifest_path": str(manifest.relative_to(reproduction)), "manifest_sha256": _sha256_file(manifest),
+            "log_path": str(log.relative_to(reproduction)), "log_sha256": _sha256_file(log),
+        })
+    receipt_payload: dict[str, object] = {
+        "schema_version": 1, "parity_stage": "legacy_server_cpu", "trial_count": 12, "official_successes": 9,
+        "backend": "legacy_shared_policy_server", "source_sha256": source_sha256,
+        "archive_root": str(archive), "archive_sha256sums_sha256": _sha256_file(archive_sums),
+        "archive_rollout_report_sha256": _sha256_file(report), "historical_control_root": str(controls),
+        "historical_control_sha256sums_sha256": _sha256_file(control_sums), "reproduction_root": str(reproduction),
+        "terminal_records": records,
+        "identity": {
+            "policy_repo": "org/policy", "policy_step": 1, "policy_revision": "a" * 40,
+            "code_revision": "b" * 40, "asset_revision": "e" * 40,
+            "simulator_version": "isaac-5.1", "policy_artifact_sha256": "c" * 64,
+            "image_identity": "sha256:image", "strategy": "canonical",
+        },
+        "reproduction": {"backend": "legacy_shared_policy_server", "environment_device": "cpu", "reference_isaac_workers": 6,
+                           "reference_policy_servers": 2, "actual_isaac_workers": 2, "actual_policy_servers": 2,
+                           "gpu_count": 4, "concurrency_non_parity": True},
+    }
+    receipt = tmp_path / "legacy-receipt.json"
+    receipt.write_text(json.dumps(receipt_payload), encoding="utf-8")
+    return receipt, receipt_payload
+
+
+def test_legacy_receipt_rejects_terminal_forgery_after_rehashing_the_terminal_record(tmp_path) -> None:
+    receipt, payload = _write_legacy_receipt_bundle(tmp_path)
+    assert _validate_legacy_shared_policy_receipt(receipt)["official_successes"] == 9
+
+    reproduction = Path(str(payload["reproduction_root"]))
+    record = payload["terminal_records"][0]
+    terminal = reproduction / str(record["terminal_record_path"])
+    terminal_payload = json.loads(terminal.read_text(encoding="utf-8"))
+    terminal_payload["integrity_binding"]["archive_rollout_report_sha256"] = "0" * 64
+    terminal.write_text(json.dumps(terminal_payload), encoding="utf-8")
+    record["terminal_record_sha256"] = _sha256_file(terminal)
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not bound to source/archive/frozen-config identities"):
+        _validate_legacy_shared_policy_receipt(receipt)
+
+
+def test_legacy_receipt_rejects_a_forged_claimed_success_total(tmp_path) -> None:
+    receipt, payload = _write_legacy_receipt_bundle(tmp_path)
+    payload["official_successes"] = 12
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="claimed successes do not match reproduction terminals"):
+        _validate_legacy_shared_policy_receipt(receipt)
+
+
+def test_legacy_receipt_rejects_duplicate_terminal_records_that_inflate_successes(tmp_path) -> None:
+    receipt, payload = _write_legacy_receipt_bundle(tmp_path)
+    records = payload["terminal_records"]
+    payload["terminal_records"] = [*records, records[0]]
+    payload["official_successes"] = 11
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly twelve terminal artifact records"):
+        _validate_legacy_shared_policy_receipt(receipt)
+
+
+def test_scale_rejects_a_bare_legacy_claim_before_it_can_enter_the_ladder(tmp_path) -> None:
+    receipt = tmp_path / "bare-legacy.json"
+    receipt.write_text(json.dumps({
+        "schema_version": 1,
+        "parity_stage": "legacy_server_cpu",
+        "trial_count": 12,
+        "official_successes": 12,
+        "backend": "legacy_shared_policy_server",
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="shared-policy launcher and adapter hashes"):
+        _require_scale_parity([receipt])
+
+
+def _cpu_scale_args(tmp_path: Path, *, legacy: Path, server_cpu: Path, cuda_abort: Path) -> argparse.Namespace:
+    revision = tmp_path / "policy-revision.txt"
+    revision.write_text("a" * 40, encoding="utf-8")
+    return argparse.Namespace(
+        output_root=tmp_path / "production", policy_revision_file=revision,
+        policy_repo="org/policy", policy_step=1, code_revision="b" * 40,
+        asset_revision="e" * 40, simulator_version="isaac-5.1",
+        policy_artifact_sha256="c" * 64, image_identity="sha256:image",
+        strategy="canonical", groot_revision="d" * 40,
+        groot_python=Path("/venv/bin/python"), device="cpu", execution_mode="policy_server",
+        policy_device="cuda:0", workers=4, minimum_reset_uniqueness_ratio=1.0,
+        cpu_scale_decision="authorize_cpu_simulator_policy_server_scale_v1",
+        legacy_server_cpu_receipt=legacy, server_cpu_receipt=server_cpu,
+        cuda_abort_receipt=cuda_abort,
+    )
+
+
+def _scale_cpu_scheduler_args(tmp_path: Path) -> argparse.Namespace:
+    args = _worker_args(tmp_path)
+    args.parity_stage = "scale_cpu"
+    args.workers = 4
+    args.dry_run = False
+    args.capacity_sweep = None
+    args.historical_control = False
+    args.trials_per_worker = 1
+    args.early_abort_completed_trials = 12
+    args.minimum_reset_uniqueness_ratio = 1.0
+    return args
+
+
+def _write_scale_cpu_terminal(
+    root: Path, trial: Trial, *, success: bool = True, contact: bool = True,
+) -> None:
+    writer = EpisodeArtifactWriter(root, trial.trial_id)
+    writer.append_annotation({"step": 0, "action_source": "policy"})
+    videos = writer.staging / "videos"
+    videos.mkdir()
+    for filename in CANONICAL_VIDEO_FILENAMES:
+        (videos / filename).write_bytes(b"video")
+    writer.finalize({
+        "terminal_reason": "horizon",
+        "outcome": "success" if success else "timeout",
+        "accepted_success": success,
+        "visible_contact": {
+            "observed": contact,
+            "source": "simulator_particle_to_gripper_distance",
+            "minimum_distance_m": 0.01,
+        },
+        "reset_hash": f"{abs(hash(trial.trial_id)) % (1 << 256):064x}",
+    }, required_videos=CANONICAL_VIDEO_FILENAMES)
+    (root / f"policy-server-receipt-{trial.trial_id}.json").write_text(
+        json.dumps({"schema_version": 1, "episode_id": trial.trial_id, "backend": "policy_server"}), encoding="utf-8",
+    )
+
+
+def _scale_cpu_state(tmp_path: Path) -> tuple[CampaignState, dict[str, Trial]]:
+    trials = build_public_matrix().trials
+    state = CampaignState(tmp_path, tuple(trial.trial_id for trial in trials))
+    return state, {trial.trial_id: trial for trial in trials}
+
+
+def test_scale_cpu_resume_validates_materialized_output_with_the_loaded_matrix(monkeypatch, tmp_path) -> None:
+    args = _scale_cpu_scheduler_args(tmp_path)
+    args.policy_device = "cuda:0"
+    args.policy_revision_file.write_text("e" * 40, encoding="utf-8")
+    matrix = build_public_matrix()
+    invocation = {
+        "policy_repo": args.policy_repo,
+        "policy_revision": "e" * 40,
+        "policy_step": args.policy_step,
+        "code_revision": args.code_revision,
+        "asset_revision": args.asset_revision,
+        "simulator_version": args.simulator_version,
+        "strategy": args.strategy,
+        "policy_device": args.policy_device,
+        "policy_artifact_sha256": args.policy_artifact_sha256,
+        "image_identity": args.image_identity,
+        "groot_revision": args.groot_revision,
+        "groot_python": str(args.groot_python),
+        "groot_python_version": "3.10.18",
+    }
+
+    def write_terminal(trial: Trial, reset_number: int, policy_device: str) -> None:
+        writer = EpisodeArtifactWriter(tmp_path, trial.trial_id)
+        writer.append_annotation({"step": 0, "action_source": "policy_server"})
+        videos = writer.staging / "videos"
+        videos.mkdir()
+        for filename in CANONICAL_VIDEO_FILENAMES:
+            (videos / filename).write_bytes(b"video")
+        writer.finalize({
+            "terminal_reason": "horizon", "outcome": "success", "accepted_success": True,
+            "visible_contact": {"observed": True, "source": "simulator_particle_to_gripper_distance", "minimum_distance_m": 0.01},
+            "reset_hash": f"{reset_number:064x}",
+            "identity": {
+                "episode_id": trial.trial_id, "policy_repo": invocation["policy_repo"],
+                "policy_revision": invocation["policy_revision"], "policy_step": invocation["policy_step"],
+                "code_revision": invocation["code_revision"], "asset_revision": invocation["asset_revision"],
+                "simulator_version": invocation["simulator_version"], "garment_name": trial.garment_name,
+                "category": trial.category, "release_stage": trial.release_stage, "seed": trial.seed,
+                "instruction": "fold the garment on the table", "strategy": invocation["strategy"],
+            },
+            "provenance": {
+                "execution_mode": "policy_server", "execution_backend": "policy_server", "parity_stage": "server_cpu",
+                "simulator_device": "cpu", "policy_device": policy_device,
+                "policy_artifact_sha256": invocation["policy_artifact_sha256"], "image_identity": invocation["image_identity"],
+            },
+        }, required_videos=CANONICAL_VIDEO_FILENAMES)
+        (tmp_path / f"policy-server-receipt-{trial.trial_id}.json").write_text(json.dumps({
+            "schema_version": 1, "episode_id": trial.trial_id, "parity_stage": "server_cpu",
+            "backend": "policy_server", "checkpoint_revision": invocation["policy_revision"],
+            "checkpoint_digest": invocation["policy_artifact_sha256"], "code_revision": invocation["code_revision"],
+            "image_identity": invocation["image_identity"], "groot_revision": invocation["groot_revision"],
+            "python_path": invocation["groot_python"], "python_version": invocation["groot_python_version"],
+            "policy_seed": trial.seed, "simulator_device": "cpu", "policy_device": policy_device,
+        }), encoding="utf-8")
+
+    for reset_number, trial in enumerate(matrix.trials[:-1], start=1):
+        write_terminal(trial, reset_number, f"cuda:{(reset_number - 1) % 4}")
+    resumed: list[str] = []
+
+    def run_group(_args, assignments, **_kwargs):
+        resumed.extend(trial.trial_id for _, trial in assignments)
+        write_terminal(assignments[0][1], len(matrix.trials), "cuda:3")
+        return 1.0, 1, 0
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+
+    report = _run_campaign_under_supervisor(args, matrix, cpu_scale_authorization={"invocation": invocation})
+
+    assert resumed == [matrix.trials[-1].trial_id]
+    assert report["completed_after"] == [trial.trial_id for trial in matrix.trials]
+
+    trial = matrix.trials[-1]
+    receipt_path = tmp_path / f"policy-server-receipt-{trial.trial_id}.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["policy_device"] = "cuda:0"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    state = CampaignState(tmp_path, tuple(item.trial_id for item in matrix.trials))
+    with pytest.raises(ValueError, match="policy-server receipt policy device does not match its episode"):
+        _validate_scale_cpu_production_output(args, state, matrix, {"invocation": invocation})
+
+    receipt["policy_device"] = "cuda:4"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    episode_path = tmp_path / "raw" / trial.trial_id / "episode.json"
+    episode = json.loads(episode_path.read_text(encoding="utf-8"))
+    episode["provenance"]["policy_device"] = "cuda:4"
+    episode_path.write_text(json.dumps(episode), encoding="utf-8")
+    manifest_path = episode_path.with_name("SHA256SUMS.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["episode.json"]["sha256"] = _sha256_file(episode_path)
+    manifest["episode.json"]["size"] = episode_path.stat().st_size
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="policy device is not in the authorized scale_cpu worker set"):
+        _validate_scale_cpu_production_output(args, state, matrix, {"invocation": invocation})
+
+
+def test_scale_cpu_fresh_scheduler_finishes_first_twelve_before_trial_thirteen(monkeypatch, tmp_path) -> None:
+    state, by_id = _scale_cpu_state(tmp_path)
+    canary = state.trial_ids[:12]
+    thirteenth = state.trial_ids[12]
+    launches: list[tuple[tuple[str, ...], tuple[int | None, ...]]] = []
+
+    def run_group(_args, assignments, *, gpu_indices=None, **_kwargs):
+        ids = tuple(trial.trial_id for _, trial in assignments)
+        launches.append((ids, tuple(gpu_indices or ())))
+        for _, trial in assignments:
+            _write_scale_cpu_terminal(tmp_path, trial)
+        return 1.0, len(assignments), 0
+
+    pending_scans = iter((state.trial_ids, (thirteenth,), ()))
+    def pending_only_thirteen(_state):
+        return next(pending_scans, ())
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", pending_only_thirteen)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+    with pytest.raises(RuntimeError, match="reset diversity gate failed"):
+        _run_campaign_under_supervisor(_scale_cpu_scheduler_args(tmp_path), build_public_matrix())
+
+    assert [ids for ids, _ in launches[:3]] == [canary[:4], canary[4:8], canary[8:12]]
+    assert launches[3][0] == (thirteenth,)
+    assert all(thirteenth not in ids for ids, _ in launches[:3])
+    assert [gpus for _, gpus in launches[:3]] == [(0, 1, 2, 3)] * 3
+    receipt = json.loads((tmp_path / "cpu-scale-canary-receipt.json").read_text(encoding="utf-8"))
+    assert receipt["decision"] == "pass"
+    assert receipt["canary_trial_ids"] == list(canary)
+
+
+def test_scale_cpu_resume_launches_only_two_missing_canaries_before_trial_thirteen(monkeypatch, tmp_path) -> None:
+    state, by_id = _scale_cpu_state(tmp_path)
+    canary = state.trial_ids[:12]
+    thirteenth = state.trial_ids[12]
+    for trial_id in canary[:10]:
+        _write_scale_cpu_terminal(tmp_path, by_id[trial_id])
+    launches: list[tuple[tuple[str, ...], tuple[int | None, ...]]] = []
+
+    def run_group(_args, assignments, *, gpu_indices=None, **_kwargs):
+        ids = tuple(trial.trial_id for _, trial in assignments)
+        launches.append((ids, tuple(gpu_indices or ())))
+        for _, trial in assignments:
+            _write_scale_cpu_terminal(tmp_path, trial)
+        return 1.0, len(assignments), 0
+
+    pending_scans = iter((state.trial_ids, (thirteenth,), ()))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda _state: next(pending_scans, ()))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+    with pytest.raises(RuntimeError, match="reset diversity gate failed"):
+        _run_campaign_under_supervisor(_scale_cpu_scheduler_args(tmp_path), build_public_matrix())
+
+    assert launches[0] == (canary[10:12], (0, 1))
+    assert launches[1][0] == (thirteenth,)
+    assert thirteenth not in launches[0][0]
+
+
+def test_scale_cpu_preexisting_zero_success_canary_aborts_before_popen(monkeypatch, tmp_path) -> None:
+    state, by_id = _scale_cpu_state(tmp_path)
+    for trial_id in state.trial_ids[:12]:
+        _write_scale_cpu_terminal(tmp_path, by_id[trial_id], success=False, contact=True)
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._run_worker_group",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("canary must not relaunch")),
+    )
+
+    with pytest.raises(RuntimeError, match="zero success"):
+        _run_scale_cpu_canary(_scale_cpu_scheduler_args(tmp_path), state=state, by_id=by_id, authorization=None)
+
+    assert json.loads((tmp_path / "cpu-scale-canary-receipt.json").read_text(encoding="utf-8"))["decision"] == "abort"
+
+
+def test_scale_cpu_preexisting_valid_canary_permits_trial_thirteen(monkeypatch, tmp_path) -> None:
+    state, by_id = _scale_cpu_state(tmp_path)
+    canary = state.trial_ids[:12]
+    thirteenth = state.trial_ids[12]
+    for trial_id in canary:
+        _write_scale_cpu_terminal(tmp_path, by_id[trial_id])
+    launches: list[tuple[str, ...]] = []
+
+    def run_group(_args, assignments, **_kwargs):
+        launches.append(tuple(trial.trial_id for _, trial in assignments))
+        for _, trial in assignments:
+            _write_scale_cpu_terminal(tmp_path, trial)
+        return 1.0, len(assignments), 0
+
+    pending_scans = iter((state.trial_ids, (thirteenth,), ()))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda _state: next(pending_scans, ()))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+    with pytest.raises(RuntimeError, match="reset diversity gate failed"):
+        _run_campaign_under_supervisor(_scale_cpu_scheduler_args(tmp_path), build_public_matrix())
+
+    assert launches == [(thirteenth,)]
+
+
+def test_scale_cpu_interrupted_canary_ledger_fails_closed(monkeypatch, tmp_path) -> None:
+    state, by_id = _scale_cpu_state(tmp_path)
+    trial_id = state.trial_ids[0]
+    ledger_root = tmp_path / "campaign-ledger"
+    ledger_root.mkdir()
+    (ledger_root / f"{'f' * 32}.json").write_text(json.dumps({
+        "schema_version": 1, "mode": "production", "waves": [{
+            "trial_ids": [trial_id], "scheduled_trial_ids": [trial_id], "launched_trial_ids": [], "status": "started",
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._run_worker_group",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ambiguous attempt must not launch")),
+    )
+
+    with pytest.raises(ValueError, match="interrupted or ambiguous"):
+        _run_scale_cpu_canary(_scale_cpu_scheduler_args(tmp_path), state=state, by_id=by_id, authorization=None)
+
+
+def test_scale_cpu_terminal_ledger_failure_counts_as_a_nonretryable_canary_attempt(tmp_path) -> None:
+    state, by_id = _scale_cpu_state(tmp_path)
+    canary = state.trial_ids[:12]
+    for trial_id in canary[1:]:
+        _write_scale_cpu_terminal(tmp_path, by_id[trial_id])
+    ledger_root = tmp_path / "campaign-ledger"
+    ledger_root.mkdir()
+    (ledger_root / f"{'a' * 32}.json").write_text(json.dumps({
+        "schema_version": 1, "mode": "production", "waves": [{
+            "wave": 1, "trial_ids": list(canary), "scheduled_trial_ids": list(canary), "launched_trial_ids": list(canary),
+            "completed_trials": 11, "failed_trials": 1, "status": "terminal",
+        }],
+    }), encoding="utf-8")
+
+    _run_scale_cpu_canary(_scale_cpu_scheduler_args(tmp_path), state=state, by_id=by_id, authorization=None)
+
+    receipt = json.loads((tmp_path / "cpu-scale-canary-receipt.json").read_text(encoding="utf-8"))
+    assert receipt["decision"] == "pass"
+    assert receipt["attempt_evidence"][0]["source"] == "terminal_ledger_without_valid_artifact"
+    assert receipt["attempt_evidence"][0]["official_success"] is False
+
+
+def test_scale_cpu_passing_canary_retries_a_frozen_terminal_failure_during_final_close(monkeypatch, tmp_path) -> None:
+    state, by_id = _scale_cpu_state(tmp_path)
+    canary = state.trial_ids[:12]
+    for trial_id in canary[1:]:
+        _write_scale_cpu_terminal(tmp_path, by_id[trial_id])
+    ledger_root = tmp_path / "campaign-ledger"
+    ledger_root.mkdir()
+    (ledger_root / f"{'b' * 32}.json").write_text(json.dumps({
+        "schema_version": 1, "mode": "production", "waves": [{
+            "wave": 1, "trial_ids": list(canary), "scheduled_trial_ids": list(canary), "launched_trial_ids": list(canary),
+            "completed_trials": 11, "failed_trials": 1, "status": "terminal",
+        }],
+    }), encoding="utf-8")
+    args = _scale_cpu_scheduler_args(tmp_path)
+    _run_scale_cpu_canary(args, state=state, by_id=by_id, authorization=None)
+    launches: list[tuple[str, ...]] = []
+
+    def run_group(_args, assignments, **_kwargs):
+        launches.append(tuple(trial.trial_id for _, trial in assignments))
+        for _, trial in assignments:
+            _write_scale_cpu_terminal(tmp_path, trial)
+        return 1.0, len(assignments), 0
+
+    pending_scans = iter(((canary[0],), (canary[0],), ()))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign.pending_trial_ids", lambda _state: next(pending_scans, ()))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._run_worker_group", run_group)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._worker_gpu_indices", lambda _args, count: tuple(range(count)))
+    with pytest.raises(RuntimeError, match="reset diversity gate failed"):
+        _run_campaign_under_supervisor(args, build_public_matrix())
+
+    assert launches == [(canary[0],)]
+    receipt = json.loads((tmp_path / "cpu-scale-canary-receipt.json").read_text(encoding="utf-8"))
+    assert receipt["attempt_evidence"][0]["official_success"] is False
+
+
+def test_scale_cpu_stale_canary_receipt_rejects_before_later_work(tmp_path) -> None:
+    state, by_id = _scale_cpu_state(tmp_path)
+    for trial_id in state.trial_ids[:12]:
+        _write_scale_cpu_terminal(tmp_path, by_id[trial_id])
+    args = _scale_cpu_scheduler_args(tmp_path)
+    _run_scale_cpu_canary(args, state=state, by_id=by_id, authorization=None)
+    receipt_path = tmp_path / "cpu-scale-canary-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["authorization_sha256"] = "stale"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="canary receipt is stale"):
+        _run_scale_cpu_canary(args, state=state, by_id=by_id, authorization=None)
+
+
+def test_scale_cpu_canary_resume_requires_exact_all_twelve_ledger_bindings(monkeypatch, tmp_path) -> None:
+    state, by_id = _scale_cpu_state(tmp_path)
+    canary = state.trial_ids[:12]
+    for trial_id in canary:
+        _write_scale_cpu_terminal(tmp_path, by_id[trial_id])
+    ledger_root = tmp_path / "campaign-ledger"
+    ledger_root.mkdir()
+    ledger_path = ledger_root / f"{'c' * 32}.json"
+    ledger_path.write_text(json.dumps({
+        "schema_version": 1, "mode": "production", "waves": [{
+            "wave": 1, "trial_ids": list(canary), "scheduled_trial_ids": list(canary),
+            "launched_trial_ids": list(canary), "completed_trials": 12, "failed_trials": 0, "status": "terminal",
+        }],
+    }), encoding="utf-8")
+    args = _scale_cpu_scheduler_args(tmp_path)
+
+    _run_scale_cpu_canary(args, state=state, by_id=by_id, authorization=None)
+
+    receipt_path = tmp_path / "cpu-scale-canary-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert set(receipt["canary_ledger_bindings"]) == set(canary)
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._run_worker_group",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("validated canary must not relaunch")),
+    )
+    _run_scale_cpu_canary(args, state=state, by_id=by_id, authorization=None)
+
+    receipt["canary_ledger_bindings"].pop(canary[0])
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="extra or missing ledger bindings"):
+        _run_scale_cpu_canary(args, state=state, by_id=by_id, authorization=None)
+
+    receipt["canary_ledger_bindings"][canary[0]] = {
+        "path": str(ledger_path), "sha256": _sha256_file(ledger_path),
+    }
+    receipt["canary_ledger_bindings"]["extra-trial"] = {
+        "path": str(ledger_path), "sha256": _sha256_file(ledger_path),
+    }
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="extra or missing ledger bindings"):
+        _run_scale_cpu_canary(args, state=state, by_id=by_id, authorization=None)
+
+
+def test_cpu_scale_authorization_binds_verified_evidence_and_rejects_stale_runtime(tmp_path) -> None:
+    legacy, _ = _write_legacy_receipt_bundle(tmp_path / "legacy")
+    server_cpu = _write_server_receipt_artifacts(tmp_path / "server-cpu", stage="server_cpu")
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort")
+    args = _cpu_scale_args(tmp_path, legacy=legacy, server_cpu=server_cpu, cuda_abort=cuda_abort)
+
+    authorization = _require_cpu_scale_authorization(args, build_public_matrix())
+
+    assert authorization["invocation"]["device"] == "cpu"
+    assert (args.output_root / "cpu-scale-authorization.json").is_file()
+    args.image_identity = "sha256:stale"
+    with pytest.raises(ValueError, match="server_cpu receipt identity does not match"):
+        _require_cpu_scale_authorization(args, build_public_matrix())
+
+
+def test_cpu_scale_authorization_binds_named_isaac_and_groot_import_roots(tmp_path, monkeypatch) -> None:
+    legacy, _ = _write_legacy_receipt_bundle(tmp_path / "legacy")
+    server_cpu = _write_server_receipt_artifacts(tmp_path / "server-cpu", stage="server_cpu")
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort")
+    args = _cpu_scale_args(tmp_path, legacy=legacy, server_cpu=server_cpu, cuda_abort=cuda_abort)
+    runtime_root = tmp_path / "trial-runtime"
+    for relative_path in (
+        "source/lehome",
+        "third_party/IsaacLab/source/isaaclab",
+        "third_party/IsaacLab/source/isaaclab_assets",
+        "third_party/IsaacLab/source/isaaclab_tasks",
+        "third_party/IsaacLab/source/isaaclab_mimic",
+        "third_party/IsaacLab/source/isaaclab_rl",
+    ):
+        (runtime_root / relative_path).mkdir(parents=True)
+    isaacsim_root = tmp_path / "isaac-sim"
+    kit_python = isaacsim_root / "kit" / "python"
+    kit_python.mkdir(parents=True)
+    groot_root = tmp_path / "isaac-groot"
+    groot_root.mkdir()
+    args.trial_runtime_root = runtime_root
+    args.groot_root = groot_root
+    args.policy_path = tmp_path / "policy"
+    args.release_assets_root = tmp_path / "assets"
+    args.matrix = tmp_path / "matrix.json"
+
+    def clean_checkout(path, *, label):
+        revisions = {"trial runtime root": "b" * 40, "release assets root": "e" * 40}
+        return Path(path).resolve(), revisions[label]
+
+    monkeypatch.setenv("ISAACSIM_PATH", str(isaacsim_root))
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._clean_git_revision", clean_checkout)
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._live_groot_identity",
+        lambda _args: {"groot_root": str(groot_root.resolve()), "groot_revision": "d" * 40,
+                       "groot_python": "/venv/bin/python", "groot_python_sha256": "1" * 64,
+                       "groot_python_version": "3.10.18"},
+    )
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._controller_identity",
+        lambda: {"controller_root": "/controller", "controller_revision": "1" * 40,
+                 "controller_campaign_sha256": "2" * 64, "controller_parity_sha256": "3" * 64},
+    )
+    monkeypatch.setattr(trial_module, "policy_artifact_sha256", lambda _path: "c" * 64)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._scale_cpu_runtime_paths", _scale_cpu_runtime_paths)
+
+    authorization = _require_cpu_scale_authorization(args, build_public_matrix())
+    invocation = authorization["invocation"]
+
+    assert invocation["isaacsim_python_path"] == str(kit_python.resolve())
+    assert invocation["groot_root"] == str(groot_root.resolve())
+    assert invocation["trusted_groot_root"] == str(groot_root.resolve())
+    assert invocation["trusted_pythonpath"][-2:] == [str(kit_python.resolve()), str(groot_root.resolve())]
+
+
+def test_cpu_scale_authorization_is_production_only(tmp_path) -> None:
+    legacy, _ = _write_legacy_receipt_bundle(tmp_path / "legacy")
+    server_cpu = _write_server_receipt_artifacts(tmp_path / "server-cpu", stage="server_cpu")
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort")
+    args = _cpu_scale_args(tmp_path, legacy=legacy, server_cpu=server_cpu, cuda_abort=cuda_abort)
+    args.dry_run = True
+
+    with pytest.raises(ValueError, match="production-only"):
+        _require_cpu_scale_authorization(args, build_public_matrix())
+
+
+@pytest.mark.parametrize(("attribute", "value", "message"), (
+    ("asset_revision", "f" * 40, "server_cpu receipt identity does not match"),
+    ("code_revision", "f" * 40, "server_cpu receipt identity does not match"),
+))
+def test_cpu_scale_authorization_rejects_stale_code_or_asset_identity(tmp_path, attribute, value, message) -> None:
+    legacy, _ = _write_legacy_receipt_bundle(tmp_path / "legacy")
+    server_cpu = _write_server_receipt_artifacts(tmp_path / "server-cpu", stage="server_cpu")
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort")
+    args = _cpu_scale_args(tmp_path, legacy=legacy, server_cpu=server_cpu, cuda_abort=cuda_abort)
+    setattr(args, attribute, value)
+
+    with pytest.raises(ValueError, match=message):
+        _require_cpu_scale_authorization(args, build_public_matrix())
+
+
+def test_cpu_scale_authorization_rejects_stale_pinned_python_receipt_identity(tmp_path) -> None:
+    legacy, _ = _write_legacy_receipt_bundle(tmp_path / "legacy")
+    server_cpu = _write_server_receipt_artifacts(tmp_path / "server-cpu", stage="server_cpu")
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort")
+    args = _cpu_scale_args(tmp_path, legacy=legacy, server_cpu=server_cpu, cuda_abort=cuda_abort)
+    args.trial_runtime_root = tmp_path / "runtime"
+    args.policy_path = tmp_path / "policy"
+    args.release_assets_root = tmp_path / "assets"
+    args.matrix = tmp_path / "matrix.json"
+
+    def clean_checkout(path, *, label):
+        revisions = {"trial runtime root": "b" * 40, "release assets root": "e" * 40}
+        return Path(path).resolve(), revisions[label]
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr("scripts.run_groot_flywheel_campaign._clean_git_revision", clean_checkout)
+        monkeypatch.setattr(
+            "scripts.run_groot_flywheel_campaign._live_groot_identity",
+            lambda _args: {"groot_root": "/opt/isaac-groot", "groot_revision": "d" * 40,
+                           "groot_python": "/different/python", "groot_python_sha256": "1" * 64,
+                           "groot_python_version": "3.10.18"},
+        )
+        monkeypatch.setattr(
+            "scripts.run_groot_flywheel_campaign._controller_identity",
+            lambda: {"controller_root": "/controller", "controller_revision": "1" * 40,
+                     "controller_campaign_sha256": "2" * 64, "controller_parity_sha256": "3" * 64},
+        )
+        monkeypatch.setattr(trial_module, "policy_artifact_sha256", lambda _path: "c" * 64)
+        with pytest.raises(ValueError, match="server_cpu receipt Python path does not match"):
+            _require_cpu_scale_authorization(args, build_public_matrix())
+    finally:
+        monkeypatch.undo()
+
+
+@pytest.mark.parametrize("stale_field", ("policy_path", "worker_timeout_seconds", "controller_campaign_sha256"))
+def test_cpu_scale_authorization_resume_rejects_stale_bound_invocation_or_controller(tmp_path, monkeypatch, stale_field) -> None:
+    legacy, _ = _write_legacy_receipt_bundle(tmp_path / "legacy")
+    server_cpu = _write_server_receipt_artifacts(tmp_path / "server-cpu", stage="server_cpu")
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort")
+    args = _cpu_scale_args(tmp_path, legacy=legacy, server_cpu=server_cpu, cuda_abort=cuda_abort)
+    args.trial_runtime_root = tmp_path / "runtime"
+    args.policy_path = tmp_path / "policy"
+    args.release_assets_root = tmp_path / "assets"
+    args.matrix = tmp_path / "matrix.json"
+    args.worker_timeout_seconds = 90.0
+    controller = {"controller_root": "/controller", "controller_revision": "1" * 40,
+                  "controller_campaign_sha256": "2" * 64, "controller_parity_sha256": "3" * 64}
+
+    def clean_checkout(path, *, label):
+        revisions = {"trial runtime root": "b" * 40, "release assets root": "e" * 40}
+        return Path(path).resolve(), revisions[label]
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._clean_git_revision", clean_checkout)
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._live_groot_identity",
+        lambda _args: {"groot_root": "/opt/isaac-groot", "groot_revision": "d" * 40,
+                       "groot_python": "/venv/bin/python", "groot_python_sha256": "1" * 64,
+                       "groot_python_version": "3.10.18"},
+    )
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._controller_identity", lambda: dict(controller))
+    monkeypatch.setattr(trial_module, "policy_artifact_sha256", lambda _path: "c" * 64)
+
+    authorization = _require_cpu_scale_authorization(args, build_public_matrix())
+    assert authorization == _require_cpu_scale_authorization(args, build_public_matrix())
+    if stale_field == "policy_path":
+        args.policy_path = tmp_path / "policy-stale"
+    elif stale_field == "worker_timeout_seconds":
+        args.worker_timeout_seconds = 91.0
+    else:
+        controller["controller_campaign_sha256"] = "4" * 64
+    with pytest.raises(ValueError, match="does not exactly match"):
+        _require_cpu_scale_authorization(args, build_public_matrix())
+
+
+def test_cpu_scale_authorization_rejects_policy_digest_changed_since_authorization(tmp_path, monkeypatch) -> None:
+    legacy, _ = _write_legacy_receipt_bundle(tmp_path / "legacy")
+    server_cpu = _write_server_receipt_artifacts(tmp_path / "server-cpu", stage="server_cpu")
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort")
+    args = _cpu_scale_args(tmp_path, legacy=legacy, server_cpu=server_cpu, cuda_abort=cuda_abort)
+    args.trial_runtime_root = tmp_path / "runtime"
+    args.policy_path = tmp_path / "policy"
+    args.release_assets_root = tmp_path / "assets"
+    args.matrix = tmp_path / "matrix.json"
+
+    def clean_checkout(path, *, label):
+        revisions = {"trial runtime root": "b" * 40, "release assets root": "e" * 40}
+        return Path(path).resolve(), revisions[label]
+
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._clean_git_revision", clean_checkout)
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._live_groot_identity",
+        lambda _args: {"groot_root": "/opt/isaac-groot", "groot_revision": "d" * 40,
+                       "groot_python": "/venv/bin/python", "groot_python_sha256": "1" * 64,
+                       "groot_python_version": "3.10.18"},
+    )
+    monkeypatch.setattr(
+        "scripts.run_groot_flywheel_campaign._controller_identity",
+        lambda: {"controller_root": "/controller", "controller_revision": "1" * 40,
+                 "controller_campaign_sha256": "2" * 64, "controller_parity_sha256": "3" * 64},
+    )
+    monkeypatch.setattr(trial_module, "policy_artifact_sha256", lambda _path: "0" * 64)
+
+    with pytest.raises(ValueError, match="policy checkpoint digest"):
+        _require_cpu_scale_authorization(args, build_public_matrix())
+
+
+def test_cpu_scale_authorization_rejects_forged_cuda_abort_contact_total(tmp_path) -> None:
+    legacy, _ = _write_legacy_receipt_bundle(tmp_path / "legacy")
+    server_cpu = _write_server_receipt_artifacts(tmp_path / "server-cpu", stage="server_cpu")
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort", contacts=6)
+    payload = json.loads(cuda_abort.read_text(encoding="utf-8")); payload["visible_robot_garment_contacts"] = 11
+    cuda_abort.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ledger payload does not match"):
+        _require_cpu_scale_authorization(
+            _cpu_scale_args(tmp_path, legacy=legacy, server_cpu=server_cpu, cuda_abort=cuda_abort),
+            build_public_matrix(),
+        )
+
+
+@pytest.mark.parametrize("mutation, message", (
+    ("missing_ledger", "campaign ledger must be a regular file"),
+    ("wrong_invocation", "campaign ledger must be a regular file"),
+    ("reordered_wave", "waves do not cover"),
+    ("abort_mismatch", "ledger payload does not match"),
+))
+def test_cpu_scale_authorization_rejects_forged_cuda_supervisor_ledger(tmp_path, mutation, message) -> None:
+    legacy, _ = _write_legacy_receipt_bundle(tmp_path / "legacy")
+    server_cpu = _write_server_receipt_artifacts(tmp_path / "server-cpu", stage="server_cpu")
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort")
+    ledger_path = cuda_abort.parent / "campaign-ledger" / f"{'f' * 32}.json"
+    if mutation == "missing_ledger":
+        ledger_path.unlink()
+    elif mutation == "wrong_invocation":
+        receipt = json.loads(cuda_abort.read_text(encoding="utf-8")); receipt["invocation_id"] = "e" * 32
+        cuda_abort.write_text(json.dumps(receipt), encoding="utf-8")
+    else:
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        if mutation == "reordered_wave":
+            ledger["waves"][0]["trial_ids"] = list(reversed(ledger["waves"][0]["trial_ids"]))
+            ledger["waves"][0]["scheduled_trial_ids"] = ledger["waves"][0]["trial_ids"]
+            ledger["waves"][0]["launched_trial_ids"] = ledger["waves"][0]["trial_ids"]
+        else:
+            ledger["abort_receipt"]["visible_robot_garment_contacts"] = 5
+        ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        _require_cpu_scale_authorization(
+            _cpu_scale_args(tmp_path, legacy=legacy, server_cpu=server_cpu, cuda_abort=cuda_abort), build_public_matrix(),
+        )
+
+
+def test_cuda_abort_bundle_hash_changes_for_a_rechecksummed_consulted_artifact(tmp_path) -> None:
+    cuda_abort = _write_cuda_abort_fixture(tmp_path / "cuda-abort")
+    args = argparse.Namespace(policy_revision_file=(tmp_path / "revision"), policy_repo="org/policy", policy_step=1,
+        code_revision="b" * 40, asset_revision="e" * 40, simulator_version="isaac-5.1", policy_artifact_sha256="c" * 64,
+        image_identity="sha256:image", strategy="canonical", device="cpu", execution_mode="policy_server", workers=4,
+        policy_device="cuda:0", groot_revision="d" * 40, groot_python=Path("/venv/bin/python"))
+    args.policy_revision_file.write_text("a" * 40, encoding="utf-8")
+    expected = _cpu_scale_live_invocation(args, build_public_matrix())
+    before = _validate_cuda_abort_evidence(cuda_abort, expected)["bundle_sha256"]
+    trial_id = HISTORICAL_CONTROL_IDS[0]
+    artifact = cuda_abort.parent / "raw" / trial_id / "annotations.jsonl"
+    artifact.write_text(artifact.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    manifest_path = artifact.with_name("SHA256SUMS.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["annotations.jsonl"]["sha256"] = _sha256_file(artifact)
+    manifest["annotations.jsonl"]["size"] = artifact.stat().st_size
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert _validate_cuda_abort_evidence(cuda_abort, expected)["bundle_sha256"] != before
+
+
+def test_server_cpu_bundle_hash_changes_for_a_rechecksummed_consulted_artifact(tmp_path) -> None:
+    receipt = _write_server_receipt_artifacts(tmp_path / "server-cpu", stage="server_cpu")
+    args = _cpu_scale_args(tmp_path, legacy=receipt, server_cpu=receipt, cuda_abort=receipt)
+    expected = _cpu_scale_live_invocation(args, build_public_matrix())
+    before = _validate_server_cpu_evidence(receipt, expected)["_bundle_sha256"]
+    trial_id = HISTORICAL_CONTROL_IDS[0]
+    artifact = receipt.parent / "raw" / trial_id / "annotations.jsonl"
+    artifact.write_text(artifact.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    manifest_path = artifact.with_name("SHA256SUMS.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["annotations.jsonl"]["sha256"] = _sha256_file(artifact)
+    manifest["annotations.jsonl"]["size"] = artifact.stat().st_size
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert _validate_server_cpu_evidence(receipt, expected)["_bundle_sha256"] != before
+
+
+def test_server_cuda_under_ten_never_emits_a_parity_receipt_even_at_abort_threshold_24() -> None:
+    assert not _may_emit_parity_receipt("server_cuda", 0)
+    assert not _may_emit_parity_receipt("server_cuda", 9)
+    assert _may_emit_parity_receipt("server_cuda", 10)
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "message"),
+    (
+        ("device", "cuda:0", "--device cpu"),
+        ("workers", 3, "exactly --workers 4"),
+        ("execution_mode", "direct", "--execution-mode policy_server"),
+    ),
+)
+def test_cpu_scale_authorization_rejects_a_non_cpu_four_worker_policy_server_invocation(tmp_path, attribute, value, message) -> None:
+    legacy, _ = _write_legacy_receipt_bundle(tmp_path / "legacy")
+    server_cpu = _write_server_receipt_artifacts(tmp_path / "server-cpu", stage="server_cpu")
+    cuda_root = tmp_path / "cuda-abort"
+    _write_server_receipt_artifacts(cuda_root, stage="server_cuda", successes=0)
+    cuda_abort = cuda_root / "campaign-abort-receipt-test.json"
+    cuda_abort.write_text(json.dumps({
+        "status": "aborted", "reason": "zero_official_successes", "completed_trials": 12,
+        "trial_ids": list(HISTORICAL_CONTROL_IDS), "official_successes": 0,
+        "visible_robot_garment_contacts": 12,
+    }), encoding="utf-8")
+    args = _cpu_scale_args(tmp_path, legacy=legacy, server_cpu=server_cpu, cuda_abort=cuda_abort)
+    setattr(args, attribute, value)
+
+    with pytest.raises(ValueError, match=message):
+        _require_cpu_scale_authorization(args, build_public_matrix())
+
+
+def test_cpu_scale_authorization_rejects_rehashed_duplicate_server_cpu_resets(tmp_path) -> None:
+    legacy, _ = _write_legacy_receipt_bundle(tmp_path / "legacy")
+    server_cpu = _write_server_receipt_artifacts(tmp_path / "server-cpu", stage="server_cpu")
+    receipt_root = server_cpu.parent
+    episode_path = receipt_root / "raw" / HISTORICAL_CONTROL_IDS[-1] / "episode.json"
+    episode = json.loads(episode_path.read_text(encoding="utf-8"))
+    episode["reset_hash"] = f"{1:064x}"
+    episode_path.write_text(json.dumps(episode), encoding="utf-8")
+    manifest_path = episode_path.with_name("SHA256SUMS.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["episode.json"]["sha256"] = _sha256_file(episode_path)
+    manifest["episode.json"]["size"] = episode_path.stat().st_size
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    cuda_root = tmp_path / "cuda-abort"
+    _write_server_receipt_artifacts(cuda_root, stage="server_cuda", successes=0)
+    cuda_abort = cuda_root / "campaign-abort-receipt-test.json"
+    cuda_abort.write_text(json.dumps({
+        "status": "aborted", "reason": "zero_official_successes", "completed_trials": 12,
+        "trial_ids": list(HISTORICAL_CONTROL_IDS), "official_successes": 0,
+        "visible_robot_garment_contacts": 12,
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unique_resets_not_12_of_12"):
+        _require_cpu_scale_authorization(
+            _cpu_scale_args(tmp_path, legacy=legacy, server_cpu=server_cpu, cuda_abort=cuda_abort),
+            build_public_matrix(),
+        )
+
+
+def test_legacy_cpu_reference_builder_derives_a_checksummed_9_of_12_without_simulation(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "legacy-existing"
+    for index, trial_id in enumerate(HISTORICAL_CONTROL_IDS):
+        trial = root / trial_id
+        trial.mkdir(parents=True)
+        (trial / "trial.json").write_text(
+            json.dumps({"metric": {"success": index < 9}, "trial": {"trial_id": trial_id, "category": "top_long", "garment_name": "x", "seed": 42}, "environment_device": "cpu", "command": ["--device", "cpu", "--seed", "42", "--policy_path", "/workspace/checkpoints/runtime-step-12000-local-processor-v2"]}), encoding="utf-8",
+        )
+    _write_sha256sums(root)
+    source = tmp_path / "legacy-source"
+    source.mkdir()
+    source_hashes = {}
+    for name in ("run-lehome-24-shared.sh", "eval_groot_n17_matrix_parallel.py", "groot_policy.py", "serve_groot_policy.py"):
+        path = source / name; path.write_text(name, encoding="utf-8"); source_hashes[name] = _sha256_file(path)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._LEGACY_SHARED_POLICY_HASHES", source_hashes)
+    archive = tmp_path / "archive"
+    controls = archive
+    for trial in historical_control_trials():
+        release = controls / trial.trial_id / "garment-config" / "Release"
+        release.mkdir(parents=True); (release / "Release_test_list.txt").write_text(trial.garment_name, encoding="utf-8")
+    (archive / "rollout-report.json").write_text(json.dumps({"trials": [{"trial": {"trial_id": trial_id}} for trial_id in HISTORICAL_CONTROL_IDS]}), encoding="utf-8")
+    _write_sha256sums(archive)
+    receipt = build_legacy_cpu_reference_receipt(root, tmp_path / "legacy-reference.json", source_root=source, archive_root=archive)
+
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["reference_kind"] == "checksummed_trial_json_reproduction"
+    assert payload["historical_runtime_identity_status"] == "not_recorded"
+    assert payload["official_successes"] == 9
+    assert payload["source_sha256"] == source_hashes
+    assert payload["bundle_sha256"]
+
+
+@pytest.mark.parametrize("mutation", ("source", "archive_sums", "report", "controls", "reproduction", "live_source"))
+def test_simple_legacy_reference_rejects_every_bound_evidence_mutation(tmp_path, monkeypatch, mutation) -> None:
+    root = tmp_path / "repro"
+    for index, trial_id in enumerate(HISTORICAL_CONTROL_IDS):
+        path = root / trial_id; path.mkdir(parents=True)
+        (path / "trial.json").write_text(json.dumps({"metric": {"success": index < 9}, "trial": {"trial_id": trial_id, "category": "top_long", "garment_name": "x", "seed": 42}, "environment_device": "cpu", "command": ["--device", "cpu", "--seed", "42", "--policy_path", "/workspace/checkpoints/runtime-step-12000-local-processor-v2"]}), encoding="utf-8")
+    _write_sha256sums(root)
+    source = tmp_path / "source"; source.mkdir()
+    hashes = {}
+    for name in ("run-lehome-24-shared.sh", "eval_groot_n17_matrix_parallel.py", "groot_policy.py", "serve_groot_policy.py"):
+        path = source / name; path.write_text(name, encoding="utf-8"); hashes[name] = _sha256_file(path)
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._LEGACY_SHARED_POLICY_HASHES", hashes)
+    archive = tmp_path / "archive"; controls = archive
+    for trial in historical_control_trials():
+        release = controls / trial.trial_id / "garment-config" / "Release"; release.mkdir(parents=True)
+        (release / "Release_test_list.txt").write_text(trial.garment_name, encoding="utf-8")
+    report = archive / "rollout-report.json"
+    report.write_text(json.dumps({"trials": [{"trial": {"trial_id": item}} for item in HISTORICAL_CONTROL_IDS]}), encoding="utf-8")
+    _write_sha256sums(archive)
+    receipt = build_legacy_cpu_reference_receipt(root, tmp_path / "receipt.json", source_root=source, archive_root=archive)
+    if mutation == "source":
+        (source / "groot_policy.py").write_text("mutated", encoding="utf-8")
+    elif mutation == "archive_sums":
+        (archive / "SHA256SUMS").write_text("bad", encoding="utf-8")
+    elif mutation == "report":
+        report.write_text("{}", encoding="utf-8")
+    elif mutation == "controls":
+        (controls / HISTORICAL_CONTROL_IDS[0] / "garment-config" / "Release" / "Release_test_list.txt").write_text("wrong", encoding="utf-8")
+    elif mutation == "reproduction":
+        (root / HISTORICAL_CONTROL_IDS[0] / "trial.json").write_text("{}", encoding="utf-8")
+    expected = {"legacy_source_root": str((tmp_path / "other-source") if mutation == "live_source" else source)}
+    with pytest.raises(ValueError):
+        _validate_legacy_cpu_reference(receipt, expected)
 
 
 def test_campaign_rejects_a_second_production_controller(monkeypatch, tmp_path) -> None:
@@ -94,7 +1672,8 @@ def test_campaign_rejects_a_second_production_controller(monkeypatch, tmp_path) 
 
     def controller_target() -> None:
         try:
-            run_campaign(args)
+            with _campaign_supervisor_lease(args.output_root):
+                _run_supervisor_only(args)
         except BaseException as error:
             results.append(error)
 
@@ -103,7 +1682,8 @@ def test_campaign_rejects_a_second_production_controller(monkeypatch, tmp_path) 
     try:
         assert started.wait(timeout=2.0)
         with pytest.raises(ValueError, match="supervisor is already active"):
-            run_campaign(args)
+            with _campaign_supervisor_lease(args.output_root):
+                pass
     finally:
         release.set()
         controller.join(timeout=2.0)
@@ -594,6 +2174,40 @@ def test_isolated_worker_forwards_its_physical_gpu_without_cuda_visibility_remap
     assert environment["LEHOME_FLYWHEEL_WORKER_GPU"] == "4"
 
 
+def test_scale_cpu_worker_resolves_trial_modules_only_from_the_pinned_runtime_root(tmp_path) -> None:
+    args = _worker_args(tmp_path)
+    args.parity_stage = "scale_cpu"
+    args.trial_runtime_root = tmp_path / "fcf-runtime"
+    args.device = "cpu"
+
+    command = _trial_command(args, build_public_matrix().trials[0])
+    environment = _worker_environment(args, 0)
+
+    assert command[0] == sys.executable
+    assert command[1] == str(args.trial_runtime_root / "scripts" / "run_groot_flywheel_trial.py")
+    assert command[command.index("--parity-stage") + 1] == "server_cpu"
+    assert environment["PYTHONPATH"] == os.pathsep.join((
+        str(args.trial_runtime_root.resolve()), str(args.trial_runtime_root.resolve() / "source" / "lehome"),
+        str(args.trial_runtime_root.resolve() / "third_party" / "IsaacLab" / "source" / "isaaclab"),
+        str(args.trial_runtime_root.resolve() / "third_party" / "IsaacLab" / "source" / "isaaclab_assets"),
+        str(args.trial_runtime_root.resolve() / "third_party" / "IsaacLab" / "source" / "isaaclab_tasks"),
+        str(args.trial_runtime_root.resolve() / "third_party" / "IsaacLab" / "source" / "isaaclab_mimic"),
+        str(args.trial_runtime_root.resolve() / "third_party" / "IsaacLab" / "source" / "isaaclab_rl"), "/opt/isaacsim/python",
+        str(args.groot_root.resolve()),
+    ))
+
+
+def test_cpu_worker_forwards_renderer_gpu_without_hiding_vulkan_devices(tmp_path, monkeypatch) -> None:
+    args = _worker_args(tmp_path)
+    args.device = "cpu"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+
+    environment = _worker_environment(args, 2)
+
+    assert "CUDA_VISIBLE_DEVICES" not in environment
+    assert environment["LEHOME_FLYWHEEL_WORKER_GPU"] == "2"
+
+
 def test_vram_margin_uses_only_the_assigned_gpu(monkeypatch) -> None:
     monkeypatch.setattr(
         "scripts.run_groot_flywheel_campaign.subprocess.run",
@@ -776,7 +2390,7 @@ def test_campaign_workers_runs_all_pending_trials_in_finite_gpu_waves(monkeypatc
         "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "4",
     ])
 
-    report = run_campaign(args)
+    report = _run_supervisor_only(args)
 
     expected_seeds = [trial.seed for trial in build_public_matrix().trials[:7]]
     assert launches == [(tuple(expected_seeds[:4]), (0, 1, 2, 3)), (tuple(expected_seeds[4:]), (0, 1, 2))]
@@ -800,7 +2414,7 @@ def test_sequential_campaign_fails_closed_on_a_nonzero_worker(monkeypatch, tmp_p
     ])
 
     with pytest.raises(RuntimeError, match="sequential worker 1 failed"):
-        run_campaign(args)
+        _run_supervisor_only(args)
 
     report = json.loads((tmp_path / "capacity-report.json").read_text(encoding="utf-8"))
     assert report["workers"] == [{"mode": "sequential", "returncode": 1, "trial_id": trial_ids[0], "worker_id": 1}]
@@ -824,7 +2438,7 @@ def test_sequential_campaign_fails_closed_on_an_incomplete_zero_exit(monkeypatch
     ])
 
     with pytest.raises(RuntimeError, match="sequential worker 1 failed: returncode=0"):
-        run_campaign(args)
+        _run_supervisor_only(args)
 
 
 def test_sequential_campaign_marks_checkpoint_interrupted_before_reraising(monkeypatch, tmp_path) -> None:
@@ -845,7 +2459,7 @@ def test_sequential_campaign_marks_checkpoint_interrupted_before_reraising(monke
     ])
 
     with pytest.raises(KeyboardInterrupt):
-        run_campaign(args)
+        _run_supervisor_only(args)
 
     checkpoint = json.loads(next((tmp_path / "campaign-ledger").glob("*.json")).read_text(encoding="utf-8"))
     assert checkpoint["status"] == "interrupted"
@@ -868,7 +2482,7 @@ def test_campaign_workers_empty_resume_does_not_inventory_gpus(monkeypatch, tmp_
         "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "4",
     ])
 
-    report = run_campaign(args)
+    report = _run_supervisor_only(args)
 
     assert report["production"] == {"workers": 4, "status": "completed", "waves": 0}
     assert report["completed_after"] == [trial.trial_id for trial in build_public_matrix().trials]
@@ -912,7 +2526,7 @@ def test_campaign_writes_atomic_production_checkpoints_before_and_after_each_wav
         "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "1",
     ])
 
-    run_campaign(args)
+    _run_supervisor_only(args)
 
     files = list((tmp_path / "campaign-ledger").glob("*.json"))
     assert len(files) == 1
@@ -942,7 +2556,7 @@ def test_campaign_checkpoint_marks_an_interrupted_wave_before_reraising(monkeypa
     ])
 
     with pytest.raises(KeyboardInterrupt):
-        run_campaign(args)
+        _run_supervisor_only(args)
 
     checkpoint = json.loads(next((tmp_path / "campaign-ledger").glob("*.json")).read_text(encoding="utf-8"))
     assert checkpoint["status"] == "interrupted"
@@ -967,7 +2581,7 @@ def test_campaign_ledger_preserves_prior_capacity_invocations(tmp_path) -> None:
     assert all(checkpoint["status"] == "completed" for checkpoint in checkpoints)
 
 
-def test_campaign_workers_stops_after_a_failed_wave_without_retrying(monkeypatch, tmp_path) -> None:
+def test_campaign_workers_continues_terminal_failures_until_the_finite_cohort_is_accounted(monkeypatch, tmp_path) -> None:
     matrix_path = Path(__file__).parents[2] / "configs" / "eval_groot_n17_public_280.json"
     trial_ids = tuple(trial.trial_id for trial in build_public_matrix().trials[:7])
     launches: list[tuple[str, ...]] = []
@@ -991,12 +2605,12 @@ def test_campaign_workers_stops_after_a_failed_wave_without_retrying(monkeypatch
         "--groot-python", str(tmp_path / "groot-venv" / "bin" / "python"), "--workers", "4",
     ])
 
-    with pytest.raises(RuntimeError, match="production wave 1 failed"):
-        run_campaign(args)
+    with pytest.raises(RuntimeError, match="terminal-incomplete trials remain"):
+        _run_supervisor_only(args)
 
-    assert launches == [trial_ids[:4]]
+    assert launches == [trial_ids[:4], trial_ids[4:]]
     report = json.loads((tmp_path / "capacity-report.json").read_text(encoding="utf-8"))
-    assert report["production"] == {"workers": 4, "status": "failed", "waves": 1}
+    assert report["production"] == {"workers": 4, "status": "failed", "waves": 2}
     assert report["workers"][0]["failed_trials"] == 1
 
 
@@ -1028,7 +2642,7 @@ def test_campaign_workers_reports_a_group_launch_error_without_starting_another_
     ])
 
     with pytest.raises(RuntimeError, match="production wave 1 failed: policy server launch failed"):
-        run_campaign(args)
+        _run_supervisor_only(args)
 
     assert launches == [trial_ids[:4]]
     report = json.loads((tmp_path / "capacity-report.json").read_text(encoding="utf-8"))
@@ -1071,7 +2685,7 @@ def test_campaign_workers_persists_zero_launches_when_port_allocation_fails(monk
     ])
 
     with pytest.raises(RuntimeError, match="production wave 1 failed: loopback allocation failed"):
-        run_campaign(args)
+        _run_supervisor_only(args)
 
     report = json.loads((tmp_path / "capacity-report.json").read_text(encoding="utf-8"))
     assert report["workers"][0]["scheduled_trial_ids"] == list(trial_ids)
@@ -1107,7 +2721,7 @@ def test_campaign_workers_fails_if_a_successful_wave_leaves_pending_artifacts(mo
     ])
 
     with pytest.raises(RuntimeError, match="terminal-incomplete trials remain"):
-        run_campaign(args)
+        _run_supervisor_only(args)
 
     assert launches == [trial_ids]
     report = json.loads((tmp_path / "capacity-report.json").read_text(encoding="utf-8"))
@@ -1127,11 +2741,13 @@ def test_campaign_main_returns_nonzero_for_a_reported_production_failure(monkeyp
     assert "campaign execution error: production wave 1 failed" in capsys.readouterr().err
 
 
-def test_cpu_capacity_assignment_represents_one_cpu_worker_explicitly(tmp_path) -> None:
+def test_cpu_simulator_still_assigns_a_physical_gpu_to_the_policy_server(monkeypatch, tmp_path) -> None:
     args = _worker_args(tmp_path)
     args.device = "cpu"
+    args.policy_device = "cuda:2"
+    monkeypatch.setattr("scripts.run_groot_flywheel_campaign._visible_gpu_indices", lambda: (0, 1, 2, 3))
 
-    assert _worker_gpu_indices(args, 1) == (None,)
+    assert _worker_gpu_indices(args, 1) == (2,)
 
 
 def test_production_worker_gpu_assignment_rejects_oversubscription(monkeypatch, tmp_path) -> None:

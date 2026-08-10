@@ -770,6 +770,102 @@ def test_normal_trial_runs_one_manifest_garment_through_the_evaluation_boundary(
     assert sys.argv is original_argv
 
 
+def test_evaluation_failure_stops_policy_server_before_closing_kit(monkeypatch, tmp_path) -> None:
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    events: list[str] = []
+
+    class AppLauncher:
+        @staticmethod
+        def add_app_launcher_args(_parser):
+            pass
+
+    def setup_eval_parser():
+        parser = argparse.ArgumentParser(add_help=False)
+        for name in (
+            "policy_type", "policy_path", "garment_type", "max_steps", "seed",
+            "task", "device", "garment_name",
+        ):
+            parser.add_argument(f"--{name}")
+        parser.add_argument("--num_episodes", type=int)
+        parser.add_argument("--headless", action="store_true")
+        return parser
+
+    def evaluation_failure(_args, _app):
+        raise RuntimeError("evaluation exploded")
+
+    utils = types.ModuleType("scripts.utils")
+    utils.__path__ = []
+    common = types.ModuleType("scripts.utils.common")
+    common.launch_app_from_args = lambda _args: object()
+    common.close_app = lambda _app: events.append("close_app")
+    parser_module = types.ModuleType("scripts.utils.parser")
+    parser_module.setup_eval_parser = setup_eval_parser
+    evaluation_module = types.ModuleType("scripts.utils.evaluation")
+    evaluation_module.eval = evaluation_failure
+    app_module = types.ModuleType("isaaclab.app")
+    app_module.AppLauncher = AppLauncher
+    isaaclab = types.ModuleType("isaaclab")
+    isaaclab.__path__ = []
+    lehome_tasks = types.ModuleType("lehome.tasks")
+    lehome_tasks.__path__ = []
+    bedroom = types.ModuleType("lehome.tasks.bedroom")
+    for name, module in {
+        "scripts.utils": utils,
+        "scripts.utils.common": common,
+        "scripts.utils.parser": parser_module,
+        "scripts.utils.evaluation": evaluation_module,
+        "isaaclab": isaaclab,
+        "isaaclab.app": app_module,
+        "lehome.tasks": lehome_tasks,
+        "lehome.tasks.bedroom": bedroom,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    class Supervisor:
+        def install_signal_handlers(self):
+            pass
+
+        def close(self):
+            events.append("supervisor.close")
+
+        def restore_signal_handlers(self):
+            pass
+
+    args = build_parser().parse_args([
+        "--policy-path", str(policy), "--policy-revision", "a" * 40,
+        "--garment", "Pant_Long_Seen_0", "--episode-id", "close-order",
+        "--policy-repo", "org/policy", "--policy-step", "1",
+        "--code-revision", "b" * 40, "--asset-revision", "c" * 40,
+        "--simulator-version", "isaac", "--release-assets-root", str(tmp_path / "Release"),
+        "--category", "pant_long", "--release-stage", "seen",
+        "--policy-artifact-sha256", "d" * 64, "--image-identity", "sha256:" + "e" * 64,
+        "--output-root", str(tmp_path / "run"), "--groot-root", str(tmp_path / "Isaac-GR00T"),
+        "--groot-revision", "f" * 40, "--groot-python", str(tmp_path / "python3.10"),
+        "--policy-server-port", "5511", "--policy-server-readiness-timeout", "1",
+        "--policy-server-request-timeout", "1", "--policy-server-termination-grace", "1",
+        "--policy-server-log", str(tmp_path / "server.log"), "--device", "cuda:0",
+    ])
+    monkeypatch.setattr(
+        trial_module,
+        "validate_policy_server_runtime",
+        lambda _args: {"groot_revision": "f" * 40, "python_version": "3.10.18", "python_path": "python"},
+    )
+    monkeypatch.setattr(trial_module, "_require_free_loopback_port", lambda _port: None)
+    monkeypatch.setattr(trial_module, "_await_policy_server_ready", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(trial_module, "_spawn_policy_server", lambda *_args, **_kwargs: Supervisor())
+
+    with pytest.raises(RuntimeError, match="evaluation exploded"):
+        run_trial(
+            args,
+            runtime_identity_reader=lambda _args, _app: ("isaac", "c" * 40),
+            execution_identity_validator=lambda _args: None,
+            runtime_preflight=lambda: None,
+        )
+
+    assert events.index("supervisor.close") < events.index("close_app")
+
+
 def test_production_trial_checks_host_before_policy_server_app_launcher_or_output(tmp_path) -> None:
     policy = tmp_path / "policy"
     policy.mkdir()
@@ -874,6 +970,7 @@ def test_policy_server_command_and_receipt_omit_the_api_token(tmp_path) -> None:
         image_identity="sha256:" + "c" * 64,
         output_root=tmp_path,
         episode_id="server-boundary",
+        seed=42,
     )
     token = "token-" + "x" * 48
     command = trial_module.build_policy_server_command(args)
@@ -891,6 +988,8 @@ def test_policy_server_command_and_receipt_omit_the_api_token(tmp_path) -> None:
     payload = json.loads(content)
     assert payload["host"] == "127.0.0.1"
     assert payload["checkpoint_revision"] == "e" * 40
+    assert payload["policy_seed"] == 42
+    assert command[-2:] == ["--seed", "42"]
 
 
 def test_policy_server_runtime_validation_requires_clean_checkout_and_python310(monkeypatch, tmp_path) -> None:
@@ -1006,6 +1105,11 @@ def test_policy_server_child_isolated_to_physical_gpu_and_parent_visibility_rest
     parent = trial_module.ParentCudaVisibility()
     parent.clear()
     assert "CUDA_VISIBLE_DEVICES" not in os.environ
+    parent.restore()
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    parent = trial_module.ParentCudaVisibility()
+    parent.select("2")
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "2"
     parent.restore()
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
     supervisor.close()
