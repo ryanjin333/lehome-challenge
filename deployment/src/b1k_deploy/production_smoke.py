@@ -585,15 +585,26 @@ class SshSmokeRemote:
     def wait_for_runtime(self, instance_id: str, purpose: str, timeout_seconds: int, poll_interval_seconds: int) -> str:
         if purpose not in {"training-smoke", "rollout-smoke"}:
             raise ProductionSmokeError("runtime purpose is invalid")
-        self._wait_endpoint(instance_id, timeout_seconds, poll_interval_seconds, require_ssh=True)
+        exact = _non_protected_id(instance_id)
+        deadline = self._deadline(timeout_seconds)
+        if exact not in self._endpoints:
+            self._wait_endpoint(exact, timeout_seconds, poll_interval_seconds, require_ssh=True)
         # Vast direct SSH enters the template container itself.  Probe the
         # already-running image process directly; a nested Docker daemon/socket
         # is neither assumed nor required.
         marker = "/workspace/.b1k-training-smoke-ready" if purpose == "training-smoke" else "/workspace/.b1k-rollout-smoke-ready"
         image = self._training_image if purpose == "training-smoke" else self._rollout_image
         digest = image.rsplit("@", 1)[1]
-        self._ssh(instance_id, ("/bin/sh", "-c", f"test -O {marker} && test \"$(stat -c '%a' {marker})\" = 600 && test \"$CONTAINER_DIGEST\" = {digest}"), min(timeout_seconds, _MAX_TOOL_TIMEOUT))
-        return "ready"
+        command = ("/bin/sh", "-c", f"test -O {marker} && test \"$(stat -c '%a' {marker})\" = 600 && test \"$CONTAINER_DIGEST\" = {digest}")
+        last_error: Exception | None = None
+        while self._remaining(deadline) > 0:
+            try:
+                self._ssh(exact, command, min(_MAX_TOOL_TIMEOUT, max(1, int(self._remaining(deadline)))))
+                return "ready"
+            except Exception as error:
+                last_error = error
+                self._sleep(min(float(poll_interval_seconds), self._remaining(deadline)))
+        raise ProductionSmokeError("runtime readiness timed out") from last_error
 
     def run_training_contract(self, run_id: str, instance_id: str, timeout_seconds: int) -> TrainingRuntimeEvidence:
         _label(run_id)

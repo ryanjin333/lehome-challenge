@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from b1k_deploy.dockerhub import CommandResult, DockerImageRelease, HttpResponse
-from b1k_deploy.production_smoke import ProductionSmokeError, SshSmokeRemote, VastCliSmokeClient, _rollout_command, _training_command
+from b1k_deploy.production_smoke import ProductionSmokeError, SshSmokeRemote, VastCliSmokeClient, VastInstanceEndpoint, _rollout_command, _training_command
 from b1k_deploy.publish import canonical_payload_hash, load_canonical_template
 from b1k_deploy.smoke import SmokeTemplatePublicationReceipt
 
@@ -288,6 +288,145 @@ def test_ssh_requires_private_identity_and_uses_strict_campaign_known_hosts(tmp_
     identity.chmod(0o644)
     with pytest.raises(ProductionSmokeError, match="private"):
         SshSmokeRemote(vast=client, identity_file=identity, known_hosts=tmp_path / "bad", training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64, rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64, **release_receipts(), hub_verifier=Hub(), runner=ssh_run)
+
+
+def test_runtime_readiness_retries_a_transient_missing_marker_until_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+    identity = tmp_path / "id"; identity.write_text("private", encoding="utf-8"); identity.chmod(0o600)
+    now = [0.0]
+
+    class Hub:
+        def verify_remote_probe(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("not a runtime contract")
+
+    remote = SshSmokeRemote(
+        vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(), hub_verifier=Hub(), runner=lambda *_args, **_kwargs: None,
+        clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+    attempts: list[tuple[str, ...]] = []
+    monkeypatch.setattr(remote, "_wait_endpoint", lambda *_args, **_kwargs: object())
+
+    def ssh(_instance_id: str, command: tuple[str, ...], _timeout_seconds: int) -> object:
+        attempts.append(command)
+        if len(attempts) == 1:
+            raise ProductionSmokeError("marker is not ready")
+        return object()
+
+    monkeypatch.setattr(remote, "_ssh", ssh)
+
+    assert remote.wait_for_runtime("9876543", "training-smoke", 20, 5) == "ready"
+    assert len(attempts) == 2
+    assert now[0] == 5.0
+
+
+def test_runtime_marker_uses_the_full_runtime_budget_without_rechecking_ssh_ready_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+    identity = tmp_path / "id"; identity.write_text("private", encoding="utf-8"); identity.chmod(0o600)
+    now = [0.0]
+
+    class Hub:
+        def verify_remote_probe(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("not a runtime contract")
+
+    remote = SshSmokeRemote(
+        vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(), hub_verifier=Hub(), runner=lambda *_args, **_kwargs: None,
+        clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+    attempts: list[int] = []
+    remote._endpoints["9876543"] = VastInstanceEndpoint("9876543", "203.0.113.9", 2222)
+    monkeypatch.setattr(
+        remote, "_wait_endpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("SSH was already proven ready")),
+    )
+
+    def slow_marker(_instance_id: str, _command: tuple[str, ...], timeout: int) -> object:
+        attempts.append(timeout)
+        if now[0] < 60.0:
+            raise ProductionSmokeError("marker is not ready")
+        return object()
+
+    monkeypatch.setattr(remote, "_ssh", slow_marker)
+
+    assert remote.wait_for_runtime("9876543", "training-smoke", 120, 5) == "ready"
+    assert now[0] == 60.0
+    assert all(0 < timeout <= 55 for timeout in attempts)
+
+
+def test_runtime_readiness_seeds_strict_host_key_for_an_uncached_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+    identity = tmp_path / "id"; identity.write_text("private", encoding="utf-8"); identity.chmod(0o600)
+
+    class Hub:
+        def verify_remote_probe(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("not a runtime contract")
+
+    remote = SshSmokeRemote(
+        vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(), hub_verifier=Hub(), runner=lambda *_args, **_kwargs: None,
+    )
+    setup_calls: list[str] = []
+    marker_calls: list[tuple[str, ...]] = []
+
+    def seed(instance_id: str, *_args: object, **_kwargs: object) -> VastInstanceEndpoint:
+        setup_calls.append(instance_id)
+        endpoint = VastInstanceEndpoint(instance_id, "203.0.113.9", 2222)
+        remote._endpoints[instance_id] = endpoint
+        return endpoint
+
+    monkeypatch.setattr(remote, "_wait_endpoint", seed)
+    monkeypatch.setattr(remote, "_ssh", lambda _instance_id, command, _timeout: marker_calls.append(command))
+
+    assert remote.wait_for_runtime("9876543", "training-smoke", 20, 5) == "ready"
+    assert setup_calls == ["9876543"]
+    assert len(marker_calls) == 1
+
+
+def test_uncached_runtime_setup_and_marker_share_one_overall_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+    identity = tmp_path / "id"; identity.write_text("private", encoding="utf-8"); identity.chmod(0o600)
+    now = [0.0]
+
+    class Hub:
+        def verify_remote_probe(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("not a runtime contract")
+
+    remote = SshSmokeRemote(
+        vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(), hub_verifier=Hub(), runner=lambda *_args, **_kwargs: None,
+        clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+    marker_calls: list[tuple[str, ...]] = []
+
+    def consume_deadline(instance_id: str, *_args: object, **_kwargs: object) -> VastInstanceEndpoint:
+        now[0] += 20.0
+        endpoint = VastInstanceEndpoint(instance_id, "203.0.113.9", 2222)
+        remote._endpoints[instance_id] = endpoint
+        return endpoint
+
+    monkeypatch.setattr(remote, "_wait_endpoint", consume_deadline)
+    monkeypatch.setattr(remote, "_ssh", lambda _instance_id, command, _timeout: marker_calls.append(command))
+
+    with pytest.raises(ProductionSmokeError, match="runtime readiness timed out"):
+        remote.wait_for_runtime("9876543", "training-smoke", 20, 5)
+    assert marker_calls == []
 
 
 def test_image_local_commands_do_not_assume_a_nested_docker_daemon_or_fabricate_simulator_evidence() -> None:
