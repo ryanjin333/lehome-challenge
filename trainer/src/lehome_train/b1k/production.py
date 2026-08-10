@@ -192,6 +192,8 @@ class _Runtime:
         environment.update(self.bootstrap_result.offline_environment())
         if environment.get("WANDB_MODE") != "offline":
             raise ValueError("B1K launch requires WANDB_MODE=offline")
+        if environment.get("WANDB_DIR") != "/workspace/logs/wandb":
+            raise ValueError("B1K launch requires WANDB_DIR=/workspace/logs/wandb")
         return build_b1k_launch(
             plan,
             visible_devices=self.values.get("CUDA_VISIBLE_DEVICES"),

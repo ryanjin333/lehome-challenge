@@ -79,6 +79,8 @@ def test_onstart_exports_the_production_adapter_without_exposing_the_token() -> 
     assert script.index("B1K_TRAINING_SMOKE_RUNTIME") < script.index("exec setpriv")
     assert ": > /workspace/smoke-canary/training-ready" in script
     assert ": > /workspace/.b1k-training-smoke-ready" not in script
+    assert "WANDB_DIR=/workspace/logs/wandb" in script
+    assert script.index("WANDB_DIR=/workspace/logs/wandb") < script.index("exec setpriv")
 
 
 def test_deploy_modality_passes_the_pinned_root_as_the_positional_argument(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -105,7 +107,7 @@ def test_runtime_store_hash_is_identical_for_clean_and_resume_launches(monkeypat
         values={"RUN_ID": "b1k-run-001"},
         hub=SimpleNamespace(),
         world_size=1,
-        bootstrap_result=SimpleNamespace(dataset=tmp_path / "dataset", derived_model=tmp_path / "model", offline_environment=lambda: {"WANDB_MODE": "offline"}),
+        bootstrap_result=SimpleNamespace(dataset=tmp_path / "dataset", derived_model=tmp_path / "model", offline_environment=lambda: {"WANDB_MODE": "offline", "WANDB_DIR": "/workspace/logs/wandb"}),
     )
     plan = approved_launch_plans(num_gpus=1)[0]
     hashes: list[str] = []
@@ -134,7 +136,7 @@ def test_runtime_launch_uses_bootstrap_offline_environment_and_the_pinned_nested
         bootstrap_result=SimpleNamespace(
             dataset=tmp_path / "dataset",
             derived_model=tmp_path / "model",
-            offline_environment=lambda: {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "WANDB_MODE": "offline"},
+            offline_environment=lambda: {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "WANDB_MODE": "offline", "WANDB_DIR": "/workspace/logs/wandb"},
         ),
     )
     observed: dict[str, object] = {}
@@ -146,9 +148,27 @@ def test_runtime_launch_uses_bootstrap_offline_environment_and_the_pinned_nested
     runtime._launch(approved_launch_plans(num_gpus=1)[0], resume=False)
 
     assert observed["environment"]["WANDB_MODE"] == "offline"
+    assert observed["environment"]["WANDB_DIR"] == "/workspace/logs/wandb"
     assert observed["environment"]["HF_HUB_OFFLINE"] == "1"
     assert observed["output_dir"] == str(output)
     assert runtime._training_output() == output / "b1k-run-001"
+
+
+def test_runtime_launch_rejects_a_non_workspace_wandb_directory(tmp_path: Path) -> None:
+    runtime = production._Runtime(
+        paths=SimpleNamespace(output=tmp_path / "output"),
+        values={"RUN_ID": "b1k-run-001", "CUDA_VISIBLE_DEVICES": "0"},
+        hub=SimpleNamespace(),
+        world_size=1,
+        bootstrap_result=SimpleNamespace(
+            dataset=tmp_path / "dataset",
+            derived_model=tmp_path / "model",
+            offline_environment=lambda: {"WANDB_MODE": "offline", "WANDB_DIR": "/root/wandb"},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="WANDB_DIR"):
+        runtime._launch(approved_launch_plans(num_gpus=1)[0], resume=False)
 
 
 def test_step_zero_oom_fallback_records_the_lower_plan_in_final_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -170,7 +190,7 @@ def test_step_zero_oom_fallback_records_the_lower_plan_in_final_evidence(monkeyp
         values={"RUN_ID": "b1k-run-001", "CYCLE_ID": "cycle-001", "CONTAINER_DIGEST": "sha256:" + "e" * 64, "RESUME_POLICY": "never"},
         hub=SimpleNamespace(),
         world_size=1,
-        bootstrap_result=SimpleNamespace(dataset=dataset, derived_model=tmp_path / "model", selection_manifest=selection, materialized_manifest=materialized, modality_sha256="ca3a2e406472650bee9439ed81a3f4a1531b6fe689cdc1b348d0f260a208e641", stats_sha256="d" * 64, model_derivation=derivation, offline_environment=lambda: {"WANDB_MODE": "offline"}),
+        bootstrap_result=SimpleNamespace(dataset=dataset, derived_model=tmp_path / "model", selection_manifest=selection, materialized_manifest=materialized, modality_sha256="ca3a2e406472650bee9439ed81a3f4a1531b6fe689cdc1b348d0f260a208e641", stats_sha256="d" * 64, model_derivation=derivation, offline_environment=lambda: {"WANDB_MODE": "offline", "WANDB_DIR": "/workspace/logs/wandb"}),
         receipt_paths=[],
     )
     plans = approved_launch_plans(num_gpus=1); captured: dict[str, object] = {}; retention_calls: list[tuple[int, ...]] = []
@@ -234,7 +254,7 @@ def test_runtime_resume_discovers_a_lower_batch_plan_restores_into_output_and_re
         values={"RUN_ID": "b1k-run-001"},
         hub=SimpleNamespace(),
         world_size=1,
-        bootstrap_result=SimpleNamespace(dataset=tmp_path / "dataset", derived_model=tmp_path / "model", offline_environment=lambda: {"WANDB_MODE": "offline"}),
+        bootstrap_result=SimpleNamespace(dataset=tmp_path / "dataset", derived_model=tmp_path / "model", offline_environment=lambda: {"WANDB_MODE": "offline", "WANDB_DIR": "/workspace/logs/wandb"}),
         receipt_paths=[],
     )
     plans = approved_launch_plans(num_gpus=1)
@@ -282,7 +302,7 @@ def test_runtime_resume_fails_closed_when_the_remote_namespace_is_ambiguous_or_c
         values={"RUN_ID": "b1k-run-001"},
         hub=SimpleNamespace(),
         world_size=1,
-        bootstrap_result=SimpleNamespace(dataset=tmp_path / "dataset", derived_model=tmp_path / "model", offline_environment=lambda: {"WANDB_MODE": "offline"}),
+        bootstrap_result=SimpleNamespace(dataset=tmp_path / "dataset", derived_model=tmp_path / "model", offline_environment=lambda: {"WANDB_MODE": "offline", "WANDB_DIR": "/workspace/logs/wandb"}),
         receipt_paths=[],
     )
     def build(_plan: object, **kwargs: object) -> B1KLaunch:

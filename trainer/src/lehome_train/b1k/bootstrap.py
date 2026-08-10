@@ -444,7 +444,13 @@ class BootstrapResult:
     stats_sha256: str
     model_derivation: Path
 
-    def offline_environment(self) -> dict[str, str]: return {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "WANDB_MODE": "offline"}
+    def offline_environment(self) -> dict[str, str]:
+        return {
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "WANDB_MODE": "offline",
+            "WANDB_DIR": "/workspace/logs/wandb",
+        }
 
 
 def _private(info: object) -> bool: return bool(getattr(info, "private", False) if not isinstance(info, dict) else info.get("private"))

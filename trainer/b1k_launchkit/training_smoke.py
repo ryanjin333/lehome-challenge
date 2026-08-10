@@ -168,6 +168,7 @@ def _training_environment(token_file: Path) -> dict[str, str]:
     environment.setdefault("HF_HOME", "/workspace/.cache/huggingface")
     environment.setdefault("HF_HUB_CACHE", "/workspace/.cache/huggingface/hub")
     environment["WANDB_MODE"] = "offline"
+    environment["WANDB_DIR"] = "/workspace/logs/wandb"
     return environment
 
 

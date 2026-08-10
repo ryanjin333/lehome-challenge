@@ -533,7 +533,7 @@ def test_bootstrap_remote_full_contract_is_ordered_concurrent_pinned_and_secret_
     }
     assert json.loads(result.selection_manifest.read_text()) == {"selected": ["episode-1"]}
     assert json.loads(result.materialized_manifest.read_text()) == {"materialized": ["episode-1"]}
-    assert result.offline_environment() == {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "WANDB_MODE": "offline"}
+    assert result.offline_environment() == {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "WANDB_MODE": "offline", "WANDB_DIR": "/workspace/logs/wandb"}
     assert (paths.derived_model / "weights.safetensors").read_bytes() == b"weights"
     assert json.loads((paths.derived_model / "config.json").read_text())["model_name"] == "/workspace/models/cosmos"
     serialized = "\n".join(path.read_text() for path in paths.output.glob("*.json"))
