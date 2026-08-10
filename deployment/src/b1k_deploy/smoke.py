@@ -24,6 +24,19 @@ _PAYLOAD_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _MIN_DISK_GB = 100
 _MIN_RAM_GB = 16
 _MIN_NETWORK_MBPS = 100
+_REMOTE_FAILURE_CODES = frozenset({
+    "remote-access-denied",
+    "remote-assertion-failed",
+    "remote-command-failed",
+    "remote-cuda-out-of-memory",
+    "remote-disk-full",
+    "remote-file-missing",
+    "remote-python-module-missing",
+    "remote-runtime-error",
+    "remote-subprocess-failed",
+    "remote-timeout",
+    "remote-value-error",
+})
 
 
 def _canonical_image_release_identity(release: object, expected_purpose: str) -> bool:
@@ -596,14 +609,19 @@ class SmokeController:
     def _call(operation: str, callback: Any, *args: object) -> Any:
         try:
             return callback(*args)
-        except Exception:
-            raise SmokeError(f"{operation} failed") from None
+        except Exception as error:
+            diagnostic = next((code for code in _REMOTE_FAILURE_CODES if code in str(error)), None)
+            suffix = f": {diagnostic}" if diagnostic is not None else ""
+            raise SmokeError(f"{operation} failed{suffix}") from None
 
     @staticmethod
     def _failure_code(error: BaseException) -> str:
         if isinstance(error, KeyboardInterrupt):
             return "interrupted"
         if isinstance(error, SmokeError):
+            diagnostic = next((code for code in _REMOTE_FAILURE_CODES if code in str(error)), None)
+            if diagnostic is not None:
+                return diagnostic
             return "runtime-contract-failed" if "runtime" in str(error) else "rental-or-readiness-failed"
         return "rental-or-readiness-failed"
 

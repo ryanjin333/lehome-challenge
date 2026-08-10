@@ -525,6 +525,41 @@ def test_runtime_transport_uses_only_role_specific_sanitized_environment(
     assert "OMNIGIBSON_DATA_PATH=/workspace/omnigibson-data" in rollout
 
 
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    (
+        ("RuntimeError: CUDA out of memory. Tried to allocate 1 GiB\n", "remote-cuda-out-of-memory"),
+        ("huggingface_hub.errors.GatedRepoError: 403 Forbidden\n", "remote-access-denied"),
+        ("subprocess.CalledProcessError: command returned non-zero exit status 1\n", "remote-subprocess-failed"),
+        ("arbitrary provider detail custom-secret-must-not-leak\n", "remote-command-failed"),
+    ),
+)
+def test_failed_ssh_reports_only_an_allowlisted_diagnostic_category(
+    tmp_path: Path, stderr: str, expected: str
+) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+    identity = tmp_path / "id"; identity.write_text("private", encoding="utf-8"); identity.chmod(0o600)
+
+    class Hub:
+        pass
+
+    remote = SshSmokeRemote(
+        vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(), hub_verifier=Hub(),
+        runner=lambda *_args, **_kwargs: type(
+            "Completed", (), {"returncode": 1, "stdout": "", "stderr": stderr}
+        )(),
+    )
+    remote._endpoints["9876543"] = VastInstanceEndpoint("9876543", "203.0.113.9", 2222)
+
+    with pytest.raises(ProductionSmokeError, match=expected) as error:
+        remote._ssh("9876543", ("false",), 20)
+
+    assert "custom-secret-must-not-leak" not in str(error.value)
+
+
 def test_lost_training_runtime_evidence_reconciles_its_exact_image_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

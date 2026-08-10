@@ -55,6 +55,24 @@ _REGISTRY_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _REGISTRY_TOKEN_RE = re.compile(r"^[^\s'\"\\]{8,8192}$")
 _HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\d{1,3}(?:\.\d{1,3}){3})$")
 _MAX_TOOL_TIMEOUT = 55
+
+
+def _remote_failure_category(stdout: object, stderr: object) -> str:
+    """Map untrusted remote output to one fixed, secret-free diagnostic code."""
+    output = f"{stdout}\n{stderr}".lower()
+    categories = (
+        (("cuda out of memory", "torch.outofmemoryerror"), "remote-cuda-out-of-memory"),
+        (("gatedrepoerror", "401 unauthorized", "403 forbidden", "access denied"), "remote-access-denied"),
+        (("no space left on device",), "remote-disk-full"),
+        (("modulenotfounderror",), "remote-python-module-missing"),
+        (("filenotfounderror",), "remote-file-missing"),
+        (("timeoutexpired", "timed out"), "remote-timeout"),
+        (("calledprocesserror",), "remote-subprocess-failed"),
+        (("valueerror",), "remote-value-error"),
+        (("runtimeerror",), "remote-runtime-error"),
+        (("assertionerror",), "remote-assertion-failed"),
+    )
+    return next((category for needles, category in categories if any(needle in output for needle in needles)), "remote-command-failed")
 _TEMPLATE_CREATE_RESULT_RE = re.compile(r"^New Template: ([1-9][0-9]*)$")
 _MAX_TEMPLATE_CREATE_RESULT_BYTES = 65536
 _MAX_TEMPLATE_DELETE_RESULT_BYTES = 4096
@@ -750,7 +768,8 @@ class SshSmokeRemote:
         )
         completed = self._run(command, timeout=timeout_seconds)
         if completed.returncode != 0:
-            raise ProductionSmokeError("SSH command failed")
+            category = _remote_failure_category(completed.stdout, completed.stderr)
+            raise ProductionSmokeError(f"SSH command failed: {category}")
         return completed
 
     def _runtime_json(self, instance_id: str, remote: tuple[str, ...], timeout_seconds: int, image: str) -> Mapping[str, Any]:

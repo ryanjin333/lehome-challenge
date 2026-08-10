@@ -422,6 +422,35 @@ def test_runtime_ready_is_durably_recorded_before_contract_validation_fails(tmp_
     assert error.value.receipt.failure.state == SmokeState.RUNTIME_READY
 
 
+def test_runtime_failure_preserves_only_an_allowlisted_remote_diagnostic_code(tmp_path):
+    remote = FakeRemote()
+    remote.training_factory = lambda _run_id: (_ for _ in ()).throw(
+        SmokeError("SSH command failed: remote-cuda-out-of-memory")
+    )
+    smoke, ledger, _vast = controller(tmp_path, remote)
+
+    with pytest.raises(SmokeRunFailed) as error:
+        smoke.run(plan())
+
+    assert error.value.receipt.failure.code == "remote-cuda-out-of-memory"
+    failed = [row for row in ledger.records() if row.get("lifecycle") == "failed"]
+    assert failed[-1]["evidence"]["status"] == "remote-cuda-out-of-memory"
+
+
+def test_runtime_failure_drops_non_allowlisted_remote_error_text(tmp_path):
+    remote = FakeRemote()
+    remote.training_factory = lambda _run_id: (_ for _ in ()).throw(
+        SmokeError("SSH command failed: custom-secret-must-not-leak")
+    )
+    smoke, _ledger, _vast = controller(tmp_path, remote)
+
+    with pytest.raises(SmokeRunFailed) as error:
+        smoke.run(plan())
+
+    assert error.value.receipt.failure.code == "runtime-contract-failed"
+    assert "custom-secret-must-not-leak" not in str(error.value)
+
+
 @pytest.mark.parametrize("boundary", ["destroy", "list", "ssh-gone"])
 def test_cleanup_boundary_interrupt_is_deferred_until_exact_cleanup_receipt_is_persisted(tmp_path, boundary):
     class InterruptVast(RecordingVast):
