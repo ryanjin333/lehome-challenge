@@ -9,6 +9,15 @@ template IDs, payload hashes, a private SSH identity, a campaign-local
 Face token file. It runs training before rollout, preserves the USD 5.00 ledger
 cap, and destroys only the recorded exact instance ID in `finally`.
 
+The pre-rental checkpoint-bucket probe also requires
+`B1K_CHECKPOINT_BUCKET_HELPER` and an absolute `B1K_CHECKPOINT_PROBE_ROOT`.
+The helper wrapper must bind that host directory to `/workspace/checkpoints`
+inside the helper container and run the helper as the same numeric UID as the
+deployment process. The deployment process stages private `0600` probe files
+below a private `.b1k-release-probes` directory, gives the helper only the
+corresponding `/workspace/checkpoints/...` paths, verifies readback, and
+deletes its unique remote probe key before any GPU is rented.
+
 The current Vast template UI configuration must independently prove private
 Docker pull authentication before execution. Set
 `B1K_VAST_PRIVATE_PULL_READY=verified` only after that provider-side proof has

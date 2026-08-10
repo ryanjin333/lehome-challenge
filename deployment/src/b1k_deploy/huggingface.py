@@ -180,6 +180,17 @@ class WorkspaceCheckpointProbeFiles:
     _logical_root = "/workspace/checkpoints"
     _staging_directory = ".b1k-release-probes"
 
+    def __init__(self, *, root: Path | None = None) -> None:
+        candidate = Path(root) if root is not None else self._root
+        if not candidate.is_absolute():
+            raise HubProbeError("checkpoint probe local staging failed")
+        try:
+            self._root = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise HubProbeError("checkpoint probe local staging failed") from None
+        if any(part in {"", ".", ".."} for part in self._root.parts[1:]):
+            raise HubProbeError("checkpoint probe local staging failed")
+
     def write_bytes(self, path: str, content: bytes) -> None:
         if not isinstance(content, bytes):
             raise HubProbeError("checkpoint probe local staging failed")
@@ -244,9 +255,8 @@ class WorkspaceCheckpointProbeFiles:
             self._close(descriptor)
             self._close(parent)
 
-    @classmethod
-    def _target(cls, value: str) -> Path:
-        return cls._root / cls._staging_directory / cls._name(value)
+    def _target(self, value: str) -> Path:
+        return self._root / self._staging_directory / self._name(value)
 
     @classmethod
     def _name(cls, value: str) -> str:
@@ -258,51 +268,53 @@ class WorkspaceCheckpointProbeFiles:
             raise HubProbeError("checkpoint probe local path is invalid")
         return name
 
-    @classmethod
-    def _staging_descriptor(cls, *, create: bool) -> int | None:
-        root = cls._root_descriptor()
+    def _staging_descriptor(self, *, create: bool) -> int | None:
+        root = self._root_descriptor()
         try:
             flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
             try:
-                staging = os.open(cls._staging_directory, flags, dir_fd=root)
+                staging = os.open(self._staging_directory, flags, dir_fd=root)
             except FileNotFoundError:
                 if not create:
                     return None
                 try:
-                    os.mkdir(cls._staging_directory, 0o700, dir_fd=root)
+                    os.mkdir(self._staging_directory, 0o700, dir_fd=root)
                 except FileExistsError:
                     pass
-                staging = os.open(cls._staging_directory, flags, dir_fd=root)
+                staging = os.open(self._staging_directory, flags, dir_fd=root)
             metadata = os.fstat(staging)
             if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
-                cls._close(staging)
+                self._close(staging)
                 raise OSError("invalid probe staging directory")
             return staging
         except OSError:
             raise HubProbeError("checkpoint probe local staging failed") from None
         finally:
-            cls._close(root)
+            self._close(root)
 
-    @classmethod
-    def _root_descriptor(cls) -> int:
-        if not cls._root.is_absolute() or any(part in {"", ".", ".."} for part in cls._root.parts[1:]):
+    def _root_descriptor(self) -> int:
+        if not self._root.is_absolute() or any(part in {"", ".", ".."} for part in self._root.parts[1:]):
             raise HubProbeError("checkpoint probe local staging failed")
         descriptor: int | None = None
         try:
             descriptor = os.open(os.sep, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
-            for component in cls._root.parts[1:]:
+            for component in self._root.parts[1:]:
                 child = os.open(
                     component,
                     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
                     dir_fd=descriptor,
                 )
-                cls._close(descriptor)
+                self._close(descriptor)
                 descriptor = child
                 if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
                     raise OSError("checkpoint root is not a directory")
+            metadata = os.fstat(descriptor)
+            mode = stat.S_IMODE(metadata.st_mode)
+            if metadata.st_uid != os.getuid() or mode & 0o700 != 0o700 or mode & 0o022:
+                raise OSError("checkpoint root is not private")
             return descriptor
         except OSError:
-            cls._close(descriptor)
+            self._close(descriptor)
             raise HubProbeError("checkpoint probe local staging failed") from None
 
     @staticmethod
@@ -556,8 +568,8 @@ class HuggingFaceReleaseVerifier:
 
         operation = self.begin_checkpoint_bucket_probe(bucket, operation_id=operation_id)
         state = self._checkpoint_operations[operation.operation_id]
-        local_files = files or WorkspaceCheckpointProbeFiles()
         self._verify_private_checkpoint_bucket(checkpoint_client, bucket)
+        local_files = files or WorkspaceCheckpointProbeFiles()
         if state.receipt is not None:
             return state.receipt
         if state.deleted:

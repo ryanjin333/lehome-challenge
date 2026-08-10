@@ -59,6 +59,9 @@ def _stub_execute_dependencies(
     writes: list[dict[str, object]] = []
     monkeypatch.setenv("B1K_VAST_PRIVATE_PULL_READY", "verified")
     monkeypatch.setenv("B1K_CHECKPOINT_BUCKET_HELPER", "/tmp/b1k-helper")
+    checkpoint_probe_root = tmp_path / "checkpoint-probe"
+    checkpoint_probe_root.mkdir(mode=0o700)
+    monkeypatch.setenv("B1K_CHECKPOINT_PROBE_ROOT", str(checkpoint_probe_root))
     training = DockerImageRelease("training", "docker.io/ryanjin333/behavior1k-groot-n17", "trainer-" + "a" * 40, "a" * 40, "sha256:" + "a" * 64, "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64)
     rollout = DockerImageRelease("rollout", "docker.io/ryanjin333/behavior1k-groot-n17", "rollout-" + "a" * 40, "a" * 40, "sha256:" + "b" * 64, "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64)
     monkeypatch.setattr(cli, "AtomicCampaignReceiptStore", lambda _path: SimpleNamespace(read=lambda: SimpleNamespace(status="complete", images=(training, rollout), templates=(1, 2))))
@@ -80,7 +83,8 @@ def _stub_execute_dependencies(
     class Hub:
         def __init__(self, *_args: object) -> None: pass
         def verify_private_repositories(self, *_args: object) -> None: pass
-        def bootstrap_checkpoint_bucket_probe(self, *_args: object) -> None: pass
+        def bootstrap_checkpoint_bucket_probe(self, *_args: object, **kwargs: object) -> None:
+            assert kwargs["files"]._root == checkpoint_probe_root
 
     class Vast:
         def new_ephemeral_smoke_template_name(self, role: str) -> str:

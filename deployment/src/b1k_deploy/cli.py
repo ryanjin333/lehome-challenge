@@ -154,7 +154,7 @@ def _smoke_campaign(args: argparse.Namespace) -> int:
         raise PublicationError("publication receipt is incomplete or unsafe")
     _verify_smoke_bindings_against_publication(bindings, publication)
     from .dockerhub import TokenSource
-    from .huggingface import CheckpointBucket, CheckpointBucketHelperClient, HubRepository, HuggingFaceHubClient, HuggingFaceReleaseVerifier, ReleaseDestinations
+    from .huggingface import CheckpointBucket, CheckpointBucketHelperClient, HubRepository, HuggingFaceHubClient, HuggingFaceReleaseVerifier, ReleaseDestinations, WorkspaceCheckpointProbeFiles
     from .ledger import RentalLedger
     from .production import ConfiguredPublicationSettings, _required_private_file
     from .production_smoke import SshSmokeRemote, VastCliSmokeClient
@@ -169,7 +169,14 @@ def _smoke_campaign(args: argparse.Namespace) -> int:
     helper = os.environ.get("B1K_CHECKPOINT_BUCKET_HELPER")
     if not isinstance(helper, str) or not helper.startswith("/"):
         raise PublicationError("--execute requires B1K_CHECKPOINT_BUCKET_HELPER for the exact private bucket pre-rent probe")
-    hub.bootstrap_checkpoint_bucket_probe(CheckpointBucketHelperClient(helper, str(_required_private_file(os.environ, "B1K_HF_TOKEN_FILE"))), destinations.checkpoint_bucket)
+    checkpoint_probe_root = os.environ.get("B1K_CHECKPOINT_PROBE_ROOT")
+    if not isinstance(checkpoint_probe_root, str) or not Path(checkpoint_probe_root).is_absolute():
+        raise PublicationError("--execute requires an absolute B1K_CHECKPOINT_PROBE_ROOT for local bucket staging")
+    hub.bootstrap_checkpoint_bucket_probe(
+        CheckpointBucketHelperClient(helper, str(_required_private_file(os.environ, "B1K_HF_TOKEN_FILE"))),
+        destinations.checkpoint_bucket,
+        files=WorkspaceCheckpointProbeFiles(root=Path(checkpoint_probe_root)),
+    )
     vast = VastCliSmokeClient(
         vastai_executable=settings.vastai_executable,
         api_key_file=settings.vast_api_key_file,

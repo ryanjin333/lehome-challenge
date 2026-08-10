@@ -660,6 +660,60 @@ def test_workspace_checkpoint_probe_files_reject_a_symlinked_staging_parent_with
     assert not (outside / f"{operation_id}.upload.json").exists()
 
 
+def test_workspace_checkpoint_probe_files_map_logical_container_paths_to_a_configured_host_root(tmp_path):
+    checkpoint_root = tmp_path / "checkpoint-probe"
+    checkpoint_root.mkdir(mode=0o700)
+    files = WorkspaceCheckpointProbeFiles(root=checkpoint_root)
+    operation_id = "4" * 32
+    logical = f"/workspace/checkpoints/.b1k-release-probes/{operation_id}.upload.json"
+
+    files.write_bytes(logical, b"probe bytes")
+
+    physical = checkpoint_root / ".b1k-release-probes" / f"{operation_id}.upload.json"
+    assert physical.read_bytes() == b"probe bytes"
+    assert files.read_bytes(logical) == b"probe bytes"
+    files.remove(logical)
+    assert not physical.exists()
+
+
+def test_workspace_checkpoint_probe_files_accept_an_owner_controlled_0750_root(tmp_path):
+    checkpoint_root = tmp_path / "checkpoint-probe"
+    checkpoint_root.mkdir(mode=0o750)
+    checkpoint_root.chmod(0o750)
+    files = WorkspaceCheckpointProbeFiles(root=checkpoint_root)
+    logical = f"/workspace/checkpoints/.b1k-release-probes/{'5' * 32}.upload.json"
+
+    files.write_bytes(logical, b"probe bytes")
+
+    assert files.read_bytes(logical) == b"probe bytes"
+
+
+def test_workspace_checkpoint_probe_files_canonicalize_a_symlinked_root_spelling(tmp_path):
+    checkpoint_root = tmp_path / "checkpoint-probe"
+    checkpoint_root.mkdir(mode=0o700)
+    alias = tmp_path / "checkpoint-alias"
+    alias.symlink_to(checkpoint_root, target_is_directory=True)
+    files = WorkspaceCheckpointProbeFiles(root=alias)
+    logical = f"/workspace/checkpoints/.b1k-release-probes/{'7' * 32}.upload.json"
+
+    files.write_bytes(logical, b"probe bytes")
+
+    assert files._root == checkpoint_root.resolve(strict=True)
+    assert files.read_bytes(logical) == b"probe bytes"
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o707])
+def test_workspace_checkpoint_probe_files_reject_a_group_or_world_writable_root(tmp_path, mode):
+    checkpoint_root = tmp_path / "checkpoint-probe"
+    checkpoint_root.mkdir(mode=0o700)
+    checkpoint_root.chmod(mode)
+    files = WorkspaceCheckpointProbeFiles(root=checkpoint_root)
+    logical = f"/workspace/checkpoints/.b1k-release-probes/{'6' * 32}.upload.json"
+
+    with pytest.raises(HubProbeError, match="local staging"):
+        files.write_bytes(logical, b"probe bytes")
+
+
 def test_checkpoint_probe_retry_after_remote_deletion_retries_local_cleanup_before_issuing_a_receipt():
     class ProbeFiles:
         def __init__(self):
