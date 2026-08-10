@@ -157,7 +157,14 @@ class VastCliSmokeClient:
         except Exception:
             raise ProductionSmokeError("exact Vast template readback is incomplete") from None
 
-    def attest_template_binding(self, *, template_id: str, image_reference: str, payload_hash: str) -> str:
+    def attest_template_binding(
+        self,
+        *,
+        template_id: str,
+        image_reference: str,
+        payload_hash: str,
+        required_smoke_environment: str | None = None,
+    ) -> str:
         """Bind the exact provider template to a durable canonical receipt."""
         if not _DIGEST_IMAGE_RE.fullmatch(image_reference) or not re.fullmatch(r"[0-9a-f]{64}", payload_hash):
             raise ProductionSmokeError("template binding is invalid")
@@ -168,6 +175,11 @@ class VastCliSmokeClient:
         environment = readback.get("env")
         if not isinstance(environment, str) or f"CONTAINER_DIGEST={digest}" not in environment:
             raise ProductionSmokeError("exact Vast template does not bind the container digest")
+        if required_smoke_environment is not None:
+            if required_smoke_environment not in {"B1K_TRAINING_SMOKE_RUNTIME", "B1K_ROLLOUT_SMOKE_RUNTIME"} or re.search(
+                rf"(?:^| )-e {re.escape(required_smoke_environment)}=1(?: |$)", environment
+            ) is None:
+                raise ProductionSmokeError("exact Vast template lacks the required smoke-mode environment")
         provider_hash = self._rows((str(self._vastai), "--raw", "search", "templates", f"id=={_exact_id(template_id)}"))[0].get("hash_id")
         if not isinstance(provider_hash, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", provider_hash):
             raise ProductionSmokeError("exact Vast template readback lacks one provider template hash")
@@ -189,18 +201,19 @@ class VastCliSmokeClient:
         payload_hash = request.get("payload_hash")
         if not isinstance(image_reference, str) or not isinstance(payload_hash, str):
             raise ProductionSmokeError("create request lacks a publication-bound template identity")
-        template_hash = self.attest_template_binding(template_id=template_id, image_reference=image_reference, payload_hash=payload_hash)
+        required_environment = "B1K_TRAINING_SMOKE_RUNTIME" if purpose == "training-smoke" else "B1K_ROLLOUT_SMOKE_RUNTIME"
+        template_hash = self.attest_template_binding(
+            template_id=template_id,
+            image_reference=image_reference,
+            payload_hash=payload_hash,
+            required_smoke_environment=required_environment,
+        )
         try:
             registry_token = self._registry_token.resolve()
         except CredentialSourceError:
             raise ProductionSmokeError("Docker registry credential is unavailable") from None
         if not _REGISTRY_TOKEN_RE.fullmatch(registry_token):
             raise ProductionSmokeError("Docker registry token is invalid")
-        # Vast treats --args as the image command.  Passing only
-        # "smoke-runtime" bypasses the required rollout prefixes, so smoke
-        # mode is selected through template environment and the normal
-        # entrypoint remains alive for direct SSH contracts.
-        environment = "B1K_TRAINING_SMOKE_RUNTIME" if purpose == "training-smoke" else "B1K_ROLLOUT_SMOKE_RUNTIME"
         try:
             api_key = self._vast_api_key.resolve()
         except CredentialSourceError:
@@ -210,7 +223,10 @@ class VastCliSmokeClient:
         payload = {
             "client_id": "me",
             "image": None,
-            "env": {environment: "1"},
+            # Any per-instance env replaces the template's complete Docker
+            # options on Vast.  The ephemeral smoke template already carries
+            # its smoke-mode flag, so preserve that template verbatim here.
+            "env": {},
             "price": float(bid),
             "disk": disk,
             "label": label,
@@ -276,6 +292,11 @@ class VastCliSmokeClient:
             raise ProductionSmokeError("production template receipt is invalid")
         self.attest_template_binding(template_id=production.template_id, image_reference=production.image_release.reference, payload_hash=production.payload_hash)
         payload = dict(self._template_readback(production.template_id))
+        environment = "B1K_TRAINING_SMOKE_RUNTIME" if purpose == "training" else "B1K_ROLLOUT_SMOKE_RUNTIME"
+        template_env = payload.get("env")
+        if not isinstance(template_env, str) or f"-e {environment}=" in template_env:
+            raise ProductionSmokeError("production template environment cannot be specialized for smoke")
+        payload["env"] = f"{template_env} -e {environment}=1"
         filters = dict(payload["extra_filters"])
         payload["name"] = name
         payload["recommended_disk_space"] = 100 if purpose == "training" else 300

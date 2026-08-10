@@ -163,6 +163,7 @@ def _client(tmp_path: Path, runner: VastRunner) -> VastCliSmokeClient:
 
 def test_selects_the_cheapest_verified_compatible_one_gpu_offer_and_binds_provider_template_hash(tmp_path: Path) -> None:
     runner = VastRunner()
+    runner.template["env"] += " -e B1K_TRAINING_SMOKE_RUNTIME=1"
     client = _client(tmp_path, runner)
 
     offer = client.select_offer("training-smoke")
@@ -181,7 +182,9 @@ def test_selects_the_cheapest_verified_compatible_one_gpu_offer_and_binds_provid
     assert headers["Authorization"] == "Bearer [REDACTED]"
     assert payload["template_hash_id"] == "canonical_template_hash"
     assert payload["image_login"] == "-u ryanjin333 -p [REDACTED] docker.io"
-    assert payload["env"] == {"B1K_TRAINING_SMOKE_RUNTIME": "1"}
+    # The separately-created smoke template owns the smoke-mode flag.  Sending
+    # any per-instance env here replaces Vast's template Docker options.
+    assert payload["env"] == {}
 
 
 def test_rollout_create_uses_environment_smoke_mode_without_an_incomplete_runtime_argument(tmp_path: Path) -> None:
@@ -189,17 +192,34 @@ def test_rollout_create_uses_environment_smoke_mode_without_an_incomplete_runtim
     runner.template = load_canonical_template("rollout", source_root=WORKSPACE)
     runner.template["image"] = "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64
     runner.template["env"] = runner.template["env"].replace("CONTAINER_DIGEST=sha256:" + "0" * 64, "CONTAINER_DIGEST=sha256:" + "b" * 64)
+    runner.template["env"] += " -e B1K_ROLLOUT_SMOKE_RUNTIME=1"
     client.select_offer("rollout-smoke")
     assert "gpu_ram>=24" in runner.calls[0][0][3]
     client.create_instance({"offer_id": "12", "template_id": "123", "idempotency_key": "b1k-smoke-" + "c" * 32, "hourly_rate_usd": "0.20", "disk_gb": 300, "purpose": "rollout-smoke", "image_reference": runner.template["image"], "payload_hash": canonical_payload_hash(runner.template)}, timeout_seconds=30)
     payload = runner.http_calls[-1][3]
     assert payload.get("args") is None
-    assert payload["env"] == {"B1K_ROLLOUT_SMOKE_RUNTIME": "1"}
+    assert payload["env"] == {}
     assert payload["disk"] == 300
 
 
-def test_private_pull_credential_failure_is_typed_and_never_reaches_vast_create(tmp_path: Path) -> None:
+def test_create_rejects_a_production_template_without_the_purpose_smoke_flag(tmp_path: Path) -> None:
     runner = VastRunner(); client = _client(tmp_path, runner)
+
+    with pytest.raises(ProductionSmokeError, match="smoke-mode environment"):
+        client.create_instance(
+            {"offer_id": "12", "template_id": "123", "idempotency_key": "b1k-smoke-" + "e" * 32,
+             "hourly_rate_usd": "0.20", "disk_gb": 100, "purpose": "training-smoke",
+             "image_reference": runner.template["image"], "payload_hash": canonical_payload_hash(runner.template)},
+            timeout_seconds=30,
+        )
+
+    assert runner.http_calls == []
+
+
+def test_private_pull_credential_failure_is_typed_and_never_reaches_vast_create(tmp_path: Path) -> None:
+    runner = VastRunner()
+    runner.template["env"] += " -e B1K_TRAINING_SMOKE_RUNTIME=1"
+    client = _client(tmp_path, runner)
     (tmp_path / "docker.token").chmod(0o644)
 
     with pytest.raises(ProductionSmokeError, match="credential"):
@@ -633,6 +653,8 @@ def test_ephemeral_template_creation_retries_exact_name_readback_after_an_empty_
     receipt = client.create_ephemeral_smoke_template("training", production, name=name)
 
     assert receipt.template_id == "456"
+    assert "CONTAINER_DIGEST=sha256:" + "a" * 64 in created_payload["env"]
+    assert "-e B1K_TRAINING_SMOKE_RUNTIME=1" in created_payload["env"]
 
 
 def test_ephemeral_template_propagates_only_the_registered_private_registry_reference(
