@@ -616,7 +616,7 @@ class SshSmokeRemote:
         marker = "/workspace/smoke-canary/training-ready" if purpose == "training-smoke" else "/workspace/smoke-canary/rollout-ready"
         image = self._training_image if purpose == "training-smoke" else self._rollout_image
         digest = image.rsplit("@", 1)[1]
-        command = ("/bin/sh", "-c", f"test \"$(stat -c '%u' {marker})\" = 10001 && test \"$(stat -c '%a' {marker})\" = 600 && test \"$CONTAINER_DIGEST\" = {digest}")
+        command = ("/bin/sh", "-c", f"test \"$(stat -c '%u' {marker})\" = 10001 && test \"$(stat -c '%a' {marker})\" = 600 && /usr/bin/grep -zFxq 'CONTAINER_DIGEST={digest}' /proc/1/environ")
         last_error: Exception | None = None
         while self._remaining(deadline) > 0:
             try:
