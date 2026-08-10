@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
 from dataclasses import replace
 from decimal import Decimal
@@ -304,6 +305,12 @@ def test_ssh_requires_private_identity_and_uses_strict_campaign_known_hosts(tmp_
     assert "GlobalKnownHostsFile=/dev/null" in command
     assert "-i" in command and str(identity) in command
     assert identity.read_text(encoding="utf-8") not in command
+
+    remote_command = ("/bin/sh", "-c", "printf '%s' 'hello world'")
+    remote._ssh("222", remote_command, 10)
+    command = calls[-1]
+    assert command[-2] == "--"
+    assert command[-1] == shlex.join(remote_command)
 
     identity.chmod(0o644)
     with pytest.raises(ProductionSmokeError, match="private"):

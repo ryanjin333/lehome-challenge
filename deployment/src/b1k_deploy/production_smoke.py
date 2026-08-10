@@ -11,6 +11,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import time
@@ -745,7 +746,7 @@ class SshSmokeRemote:
         command = (
             "ssh", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
             "-o", f"UserKnownHostsFile={self._known_hosts}", "-o", "GlobalKnownHostsFile=/dev/null", "-o", f"ConnectTimeout={min(timeout_seconds, 20)}",
-            "-i", str(self._identity), "-p", str(endpoint.port), f"{endpoint.username}@{endpoint.host}", "--", *remote,
+            "-i", str(self._identity), "-p", str(endpoint.port), f"{endpoint.username}@{endpoint.host}", "--", shlex.join(remote),
         )
         completed = self._run(command, timeout=timeout_seconds)
         if completed.returncode != 0:
