@@ -342,6 +342,10 @@ def test_runtime_readiness_retries_a_transient_missing_marker_until_the_deadline
     assert remote.wait_for_runtime("9876543", "training-smoke", 20, 5) == "ready"
     assert len(attempts) == 2
     assert now[0] == 5.0
+    assert "/workspace/smoke-canary/training-ready" in attempts[-1][-1]
+
+    assert remote.wait_for_runtime("9876543", "rollout-smoke", 20, 5) == "ready"
+    assert "/workspace/smoke-canary/rollout-ready" in attempts[-1][-1]
 
 
 def test_runtime_marker_uses_the_full_runtime_budget_without_rechecking_ssh_ready_endpoint(

@@ -57,6 +57,9 @@ def test_rollout_entrypoint_fails_closed_before_campaign_execution() -> None:
     assert "unset HF_TOKEN" in entrypoint
     assert "B1K_ROLLOUT_VERIFY_PRIVILEGE_DROP" in entrypoint
     assert "-m b1k_rollout.cli assets-bootstrap" in entrypoint
+    assert "install -d -o 10001 -g 10001 -m 0700 /workspace/smoke-canary" in entrypoint
+    assert ": > /workspace/smoke-canary/rollout-ready" in entrypoint
+    assert ": > /workspace/.b1k-rollout-smoke-ready" not in entrypoint
     root_branch = entrypoint.split('if [[ ! -f "${B1K_HF_TOKEN_FILE:-}"', 1)[0]
     assert '"$BEHAVIOR_PYTHON" -m b1k_rollout.cli assets-bootstrap' not in root_branch
     assert entrypoint.index("assets-bootstrap") > entrypoint.index("unset HF_TOKEN")

@@ -16,7 +16,7 @@ export B1K_HF_TOKEN_FILE=/workspace/.cache/huggingface/token
 export B1K_LIFECYCLE_ADAPTER=lehome_train.b1k.production:build_production_controller
 
 if [[ "${B1K_TRAINING_SMOKE_RUNTIME:-0}" == "1" ]]; then
-  exec setpriv --reuid=10001 --regid=10001 --init-groups /bin/bash -c 'umask 077; : > /workspace/.b1k-training-smoke-ready; exec /bin/sleep infinity'
+  exec setpriv --reuid=10001 --regid=10001 --init-groups /bin/bash -c 'umask 077; : > /workspace/smoke-canary/training-ready; exec /bin/sleep infinity'
 fi
 
 exec setpriv --reuid=10001 --regid=10001 --init-groups \

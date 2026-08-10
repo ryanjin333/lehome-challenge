@@ -77,6 +77,8 @@ def test_onstart_exports_the_production_adapter_without_exposing_the_token() -> 
     assert "mktemp /workspace/.cache/huggingface" not in script
     assert "B1K_TRAINING_SMOKE_RUNTIME" in script
     assert script.index("B1K_TRAINING_SMOKE_RUNTIME") < script.index("exec setpriv")
+    assert ": > /workspace/smoke-canary/training-ready" in script
+    assert ": > /workspace/.b1k-training-smoke-ready" not in script
 
 
 def test_deploy_modality_passes_the_pinned_root_as_the_positional_argument(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

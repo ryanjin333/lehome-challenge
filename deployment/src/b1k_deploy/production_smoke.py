@@ -613,7 +613,7 @@ class SshSmokeRemote:
         # Vast direct SSH enters the template container itself.  Probe the
         # already-running image process directly; a nested Docker daemon/socket
         # is neither assumed nor required.
-        marker = "/workspace/.b1k-training-smoke-ready" if purpose == "training-smoke" else "/workspace/.b1k-rollout-smoke-ready"
+        marker = "/workspace/smoke-canary/training-ready" if purpose == "training-smoke" else "/workspace/smoke-canary/rollout-ready"
         image = self._training_image if purpose == "training-smoke" else self._rollout_image
         digest = image.rsplit("@", 1)[1]
         command = ("/bin/sh", "-c", f"test -O {marker} && test \"$(stat -c '%a' {marker})\" = 600 && test \"$CONTAINER_DIGEST\" = {digest}")

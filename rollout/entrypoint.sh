@@ -24,6 +24,7 @@ if [[ "$(id -u)" == 0 ]]; then
     echo "B1K_HF_TOKEN_FILE must use the production token path" >&2
     exit 64
   fi
+  install -d -o 10001 -g 10001 -m 0700 /workspace/smoke-canary
   printf '%s' "$HF_TOKEN" | "$BEHAVIOR_PYTHON" -m b1k_rollout.token_bootstrap
   unset HF_TOKEN
   exec setpriv --reuid=10001 --regid=10001 --init-groups "$0" "$@"
@@ -44,7 +45,7 @@ unset HF_TOKEN
 "${BEHAVIOR_PYTHON:-/opt/conda/envs/behavior/bin/python}" -m b1k_rollout.cli assets-bootstrap
 if [[ "${B1K_ROLLOUT_SMOKE_RUNTIME:-0}" == "1" ]]; then
   umask 077
-  : > /workspace/.b1k-rollout-smoke-ready
+  : > /workspace/smoke-canary/rollout-ready
   exec /bin/sleep infinity
 fi
 if [[ "${1:-}" == "smoke-runtime" ]]; then
