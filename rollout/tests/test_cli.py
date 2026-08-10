@@ -208,11 +208,18 @@ def test_safe_archive_extraction_rejects_tampering_and_unsafe_members(tmp_path: 
     with zipfile.ZipFile(archive, "w") as writer:
         writer.writestr("asset/VERSION", "3.8.2\n")
     expected = cli._file_sha256(archive)
-    cli._verify_archive_sha256(archive, expected=expected)
+    assert cli._verify_archive_sha256(archive, expected=expected) == archive.resolve()
+    snapshot = tmp_path / "snapshot.zip"
+    snapshot.symlink_to(archive)
+    assert cli._verify_archive_sha256(snapshot, expected=expected) == archive.resolve()
     cli._safe_extract_zip(archive, destination=tmp_path / "extracted")
     archive.write_bytes(b"tampered")
     with pytest.raises(CliError, match="SHA-256"):
-        cli._verify_archive_sha256(archive, expected=expected)
+        cli._verify_archive_sha256(snapshot, expected=expected)
+    snapshot.unlink()
+    snapshot.symlink_to(tmp_path / "missing.zip")
+    with pytest.raises(CliError, match="SHA-256"):
+        cli._verify_archive_sha256(snapshot, expected=expected)
 
     unsafe = tmp_path / "unsafe.zip"
     with zipfile.ZipFile(unsafe, "w") as writer:

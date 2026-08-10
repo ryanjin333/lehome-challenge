@@ -392,7 +392,7 @@ def _install_pinned_asset(data_path: Path, *, archive: PinnedAssetArchive, token
     if target.is_dir() and _receipt_is_valid(receipt, archive):
         return
     downloaded = _download_pinned_archive(archive, token_file=token_file)
-    _verify_archive_sha256(downloaded, expected=archive.sha256)
+    downloaded = _verify_archive_sha256(downloaded, expected=archive.sha256)
     staging_parent = data_path / ".b1k-asset-staging"
     staging_parent.mkdir(mode=0o700, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f"{archive.directory}.", dir=staging_parent))
@@ -442,9 +442,17 @@ def _read_token_file(path: Path) -> str:
     return value
 
 
-def _verify_archive_sha256(path: Path, *, expected: str) -> None:
-    if not path.is_file() or path.is_symlink() or _file_sha256(path) != expected:
+def _verify_archive_sha256(path: Path, *, expected: str) -> Path:
+    """Resolve one Hub snapshot link and return the pinned regular blob."""
+
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.lstat()
+    except OSError as error:
+        raise CliError("pinned asset archive SHA-256 mismatch") from error
+    if not stat.S_ISREG(metadata.st_mode) or resolved.is_symlink() or _file_sha256(resolved) != expected:
         raise CliError("pinned asset archive SHA-256 mismatch")
+    return resolved
 
 
 def _safe_extract_zip(archive: Path, *, destination: Path) -> None:
