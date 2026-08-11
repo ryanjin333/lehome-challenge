@@ -78,9 +78,10 @@ RUN /opt/conda/envs/behavior/bin/python -m pip install --no-cache-dir . \
     && test -f /opt/isaac-groot/gr00t/eval/eval_b1k_wrapper.py \
     && groupadd --gid 10001 rollout \
     && useradd --uid 10001 --gid rollout --create-home --home-dir /home/rollout --shell /bin/bash rollout \
-    && test -n "${EXP_PATH:-}" \
-    && install -o rollout -g rollout -m 0644 /behavior-src/OmniGibson/omnigibson/omnigibson_5_1_0.kit "${EXP_PATH}/omnigibson_5_1_0.kit" \
-    && install -o rollout -g rollout -m 0644 /behavior-src/OmniGibson/docs/assets/OmniGibson_logo.png "${EXP_PATH}/OmniGibson_logo.png" \
+    && isaacsim_apps_path="$("$BEHAVIOR_PYTHON" -c 'import importlib.util, pathlib; spec = importlib.util.find_spec("isaacsim"); assert spec is not None and spec.submodule_search_locations; print(pathlib.Path(next(iter(spec.submodule_search_locations))) / "apps")')" \
+    && test -d "$isaacsim_apps_path" \
+    && install -o rollout -g rollout -m 0644 /behavior-src/OmniGibson/omnigibson/omnigibson_5_1_0.kit "$isaacsim_apps_path/omnigibson_5_1_0.kit" \
+    && install -o rollout -g rollout -m 0644 /behavior-src/OmniGibson/docs/assets/OmniGibson_logo.png "$isaacsim_apps_path/OmniGibson_logo.png" \
     && install -d -o rollout -g rollout -m 0700 /workspace /workspace/campaign /workspace/checkpoint-source /workspace/omnigibson-data /workspace/.cache/huggingface \
     && chmod 0755 /usr/local/bin/b1k-rollout-entrypoint
 
