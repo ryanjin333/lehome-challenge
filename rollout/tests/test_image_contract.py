@@ -47,6 +47,23 @@ def test_rollout_image_is_pinned_headless_and_secret_free() -> None:
     assert not re.search(r"hf_[A-Za-z0-9]{30,}", dockerfile)
 
 
+def test_rollout_image_prepares_only_omnigibson_runtime_copy_targets_for_unprivileged_launch() -> None:
+    dockerfile = _read("Dockerfile")
+
+    assert "test -n \"${EXP_PATH:-}\"" in dockerfile
+    assert (
+        "install -o rollout -g rollout -m 0644 "
+        "/behavior-src/OmniGibson/omnigibson/omnigibson_5_1_0.kit "
+        '"${EXP_PATH}/omnigibson_5_1_0.kit"'
+    ) in dockerfile
+    assert (
+        "install -o rollout -g rollout -m 0644 "
+        "/behavior-src/OmniGibson/docs/assets/OmniGibson_logo.png "
+        '"${EXP_PATH}/OmniGibson_logo.png"'
+    ) in dockerfile
+    assert 'chown -R rollout:rollout "${EXP_PATH}"' not in dockerfile
+
+
 def test_rollout_entrypoint_fails_closed_before_campaign_execution() -> None:
     entrypoint = _read("entrypoint.sh")
 
