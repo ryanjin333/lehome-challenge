@@ -28,13 +28,15 @@ if [[ "$(id -u)" == 0 ]]; then
     /workspace /workspace/campaign /workspace/checkpoint-source \
     /workspace/omnigibson-data /workspace/smoke-canary \
     /workspace/campaign/.cache/numba /workspace/campaign/.cache/triton \
-    /workspace/campaign/.cache/matplotlib /workspace/campaign/.cache/omnigibson
+    /workspace/campaign/.cache/matplotlib /workspace/campaign/.cache/omnigibson \
+    /workspace/campaign/.cache/warp
   printf '%s' "$HF_TOKEN" | "$BEHAVIOR_PYTHON" -m b1k_rollout.token_bootstrap
   unset HF_TOKEN
   export OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson
   export NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba
   export TRITON_CACHE_DIR=/workspace/campaign/.cache/triton
   export MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib
+  export WARP_CACHE_PATH=/workspace/campaign/.cache/warp
   exec setpriv --reuid=10001 --regid=10001 --init-groups "$0" "$@"
 fi
 if [[ ! -f "${B1K_HF_TOKEN_FILE:-}" || -L "${B1K_HF_TOKEN_FILE:-}" ]]; then
@@ -66,6 +68,9 @@ if [[ "${B1K_ROLLOUT_VERIFY_PRIVILEGE_DROP:-}" == "1" ]]; then
   test "$OMNIGIBSON_APPDATA_PATH" = /workspace/campaign/.cache/omnigibson
   test -d "$OMNIGIBSON_APPDATA_PATH"
   test -O "$OMNIGIBSON_APPDATA_PATH"
+  test "$WARP_CACHE_PATH" = /workspace/campaign/.cache/warp
+  test -d "$WARP_CACHE_PATH"
+  test -O "$WARP_CACHE_PATH"
   test -z "${HF_TOKEN+x}"
   exit 0
 fi

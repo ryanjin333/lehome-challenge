@@ -634,6 +634,7 @@ def test_runtime_transport_uses_only_role_specific_sanitized_environment(
     assert "NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba" in rollout
     assert "TRITON_CACHE_DIR=/workspace/campaign/.cache/triton" in rollout
     assert "MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib" in rollout
+    assert "WARP_CACHE_PATH=/workspace/campaign/.cache/warp" in rollout
 
 
 @pytest.mark.parametrize(

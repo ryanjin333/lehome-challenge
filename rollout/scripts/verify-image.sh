@@ -44,6 +44,7 @@ docker run --rm --platform linux/amd64 --entrypoint /bin/bash "$image_ref" -euo 
   test "$OMNI_KIT_ACCEPT_EULA" = YES
   test "$HEADLESS" = 1
   test "$OMNIGIBSON_APPDATA_PATH" = /workspace/campaign/.cache/omnigibson
+  test "$WARP_CACHE_PATH" = /workspace/campaign/.cache/warp
   test -f /behavior-src/OmniGibson/omnigibson/eval/r1pro.yaml
   test -f /opt/isaac-groot/scripts/b1k/serve_b1k.py
   test -f /opt/isaac-groot/gr00t/policy/websocket_b1k_server.py

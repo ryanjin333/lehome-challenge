@@ -65,6 +65,7 @@ _RUNTIME_ENVIRONMENT = frozenset(
         "OMNIGIBSON_APPDATA_PATH",
         "OMNIGIBSON_DATA_PATH",
         "TRITON_CACHE_DIR",
+        "WARP_CACHE_PATH",
         "VK_DRIVER_FILES",
     )
 )

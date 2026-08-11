@@ -890,6 +890,7 @@ class SshSmokeRemote:
             "NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba",
             "TRITON_CACHE_DIR=/workspace/campaign/.cache/triton",
             "MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib",
+            "WARP_CACHE_PATH=/workspace/campaign/.cache/warp",
         ) if image == self._rollout_image else ()
         return (
             "setpriv", "--reuid=10001", "--regid=10001", "--init-groups", "env", "-i",
