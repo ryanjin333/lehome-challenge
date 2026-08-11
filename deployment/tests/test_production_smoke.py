@@ -149,9 +149,9 @@ class VastRunner:
         self.calls.append((sanitized, timeout))
         if arguments[1:3] == ("search", "offers"):
             payload = [
-                {"id": 10, "dph_total": 0.01, "gpu_name": "too-small", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 24576, "driver_version": "550.54.14", "disk_space": 200.9, "cpu_ram": 65536, "inet_down": 1000.9, "duration": 3600.0},
-                {"id": 11, "dph_total": 0.40, "gpu_name": "slow", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 49152, "driver_version": "550.54.14", "disk_space": 100.9, "cpu_ram": 32768, "inet_down": 1000.9, "duration": 3600.0},
-                {"id": 12, "dph_total": 0.07777777777777778, "gpu_name": "fast", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 49152, "driver_version": "550.54.14", "disk_space": 200.9, "cpu_ram": 65536, "inet_down": 1000.9, "duration": 3600.0},
+                {"id": 10, "dph_base": 0.005, "dph_total": 0.01, "gpu_name": "too-small", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 24576, "driver_version": "550.54.14", "disk_space": 200.9, "cpu_ram": 65536, "inet_down": 1000.9, "duration": 3600.0},
+                {"id": 11, "dph_base": 0.35, "dph_total": 0.40, "gpu_name": "slow", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 49152, "driver_version": "550.54.14", "disk_space": 100.9, "cpu_ram": 32768, "inet_down": 1000.9, "duration": 3600.0},
+                {"id": 12, "dph_base": 0.04, "dph_total": 0.07777777777777778, "gpu_name": "fast", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 49152, "driver_version": "550.54.14", "disk_space": 200.9, "cpu_ram": 65536, "inet_down": 1000.9, "duration": 3600.0},
             ]
         elif arguments[2:4] == ("search", "templates"):
             payload = [{**self.template, "id": 123, "hash_id": "canonical_template_hash"}]
@@ -201,10 +201,11 @@ def test_selects_the_cheapest_verified_compatible_one_gpu_offer_and_binds_provid
     client = _client(tmp_path, runner)
 
     offer = client.select_offer("training-smoke")
-    instance_id = client.create_instance({"offer_id": offer.offer_id, "template_id": "123", "idempotency_key": "b1k-smoke-" + "a" * 32, "hourly_rate_usd": offer.hourly_rate_usd, "disk_gb": 100, "purpose": "training-smoke", "image_reference": runner.template["image"], "payload_hash": canonical_payload_hash(runner.template)}, timeout_seconds=30)
+    instance_id = client.create_instance({"offer_id": offer.offer_id, "template_id": "123", "idempotency_key": "b1k-smoke-" + "a" * 32, "hourly_rate_usd": offer.hourly_rate_usd, "gpu_bid_usd": offer.gpu_bid_usd, "disk_gb": 100, "purpose": "training-smoke", "image_reference": runner.template["image"], "payload_hash": canonical_payload_hash(runner.template)}, timeout_seconds=30)
 
     assert offer.offer_id == "12"
     assert offer.hourly_rate_usd == Decimal("0.077778")
+    assert offer.gpu_bid_usd == Decimal("0.040000")
     assert "gpu_ram>=48" in runner.calls[0][0][3]
     assert "gpu_ram>=12288" not in runner.calls[0][0][3]
     assert offer.compatibility.ram_gb == 64
@@ -226,6 +227,7 @@ def test_selects_the_cheapest_verified_compatible_one_gpu_offer_and_binds_provid
     assert headers["Authorization"] == "Bearer [REDACTED]"
     assert payload["template_hash_id"] == "canonical_template_hash"
     assert payload["image_login"] == "-u ryanjin333 -p [REDACTED] docker.io"
+    assert payload["price"] == 0.04
     # The separately-created smoke template owns the smoke-mode flag.  Sending
     # any per-instance env here replaces Vast's template Docker options.
     assert payload["env"] == {}
@@ -239,7 +241,7 @@ def test_rollout_create_uses_environment_smoke_mode_without_an_incomplete_runtim
     runner.template["env"] += " -e B1K_ROLLOUT_SMOKE_RUNTIME=1"
     client.select_offer("rollout-smoke")
     assert "gpu_ram>=24" in runner.calls[0][0][3]
-    client.create_instance({"offer_id": "12", "template_id": "123", "idempotency_key": "b1k-smoke-" + "c" * 32, "hourly_rate_usd": "0.20", "disk_gb": 300, "purpose": "rollout-smoke", "image_reference": runner.template["image"], "payload_hash": canonical_payload_hash(runner.template)}, timeout_seconds=30)
+    client.create_instance({"offer_id": "12", "template_id": "123", "idempotency_key": "b1k-smoke-" + "c" * 32, "hourly_rate_usd": "0.20", "gpu_bid_usd": "0.10", "disk_gb": 300, "purpose": "rollout-smoke", "image_reference": runner.template["image"], "payload_hash": canonical_payload_hash(runner.template)}, timeout_seconds=30)
     payload = runner.http_calls[-1][3]
     assert payload.get("args") is None
     assert payload["env"] == {}
@@ -266,7 +268,7 @@ def test_create_rejects_zero_exit_ssh_attachment_without_explicit_success(
             {
                 "offer_id": "12", "template_id": "123",
                 "idempotency_key": "b1k-smoke-" + "f" * 32,
-                "hourly_rate_usd": "0.20", "disk_gb": 100,
+                "hourly_rate_usd": "0.20", "gpu_bid_usd": "0.10", "disk_gb": 100,
                 "purpose": "training-smoke",
                 "image_reference": runner.template["image"],
                 "payload_hash": canonical_payload_hash(runner.template),
@@ -306,7 +308,7 @@ def test_create_rejects_a_production_template_without_the_purpose_smoke_flag(tmp
     with pytest.raises(ProductionSmokeError, match="smoke-mode environment"):
         client.create_instance(
             {"offer_id": "12", "template_id": "123", "idempotency_key": "b1k-smoke-" + "e" * 32,
-             "hourly_rate_usd": "0.20", "disk_gb": 100, "purpose": "training-smoke",
+             "hourly_rate_usd": "0.20", "gpu_bid_usd": "0.10", "disk_gb": 100, "purpose": "training-smoke",
              "image_reference": runner.template["image"], "payload_hash": canonical_payload_hash(runner.template)},
             timeout_seconds=30,
         )
@@ -327,6 +329,7 @@ def test_private_pull_credential_failure_is_typed_and_never_reaches_vast_create(
                 "template_id": "123",
                 "idempotency_key": "b1k-smoke-" + "d" * 32,
                 "hourly_rate_usd": "0.20",
+                "gpu_bid_usd": "0.10",
                 "disk_gb": 100,
                 "purpose": "training-smoke",
                 "image_reference": runner.template["image"],

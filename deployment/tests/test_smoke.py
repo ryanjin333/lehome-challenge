@@ -100,8 +100,8 @@ class FakeMonotonicClock:
         return self.now
 
 
-def offer(rate="0.40"):
-    return SmokeOfferSelectionReceipt("90210", rate, "RTX 4090", SmokeCompatibility(True, True, 200, 64, 1000, 15, "cheapest-compatible-verified"))
+def offer(rate="0.40", gpu_bid="0.20"):
+    return SmokeOfferSelectionReceipt("90210", rate, "RTX 4090", SmokeCompatibility(True, True, 200, 64, 1000, 15, "cheapest-compatible-verified"), gpu_bid)
 
 
 def test_offer_ledger_snapshot_preserves_six_decimal_provider_rate() -> None:
@@ -178,6 +178,9 @@ def test_training_smoke_final_receipt_uses_current_runtime_artifact_not_prerent_
     assert receipt.artifacts[0].artifact.upload_commit == "1" * 40
     assert receipt.projected_spend_usd == Decimal("0.05")
     assert list(ledger.records())[0]["projected_spend_usd"] == "0.05"
+    assert list(ledger.records())[0]["offer"]["hourly_rate_usd"] == "0.40"
+    assert vast.created[0]["hourly_rate_usd"] == "0.40"
+    assert vast.created[0]["gpu_bid_usd"] == "0.20"
     assert vast.destroyed == ["9123456"]
     assert vast.destroy_timeouts == [30]
 
@@ -214,6 +217,18 @@ def test_rejects_any_caller_cost_declaration_that_understates_or_mismatches_the_
     smoke, ledger, vast = controller(tmp_path)
 
     with pytest.raises(SmokeError, match="derived"):
+        smoke.run(candidate)
+
+    assert list(ledger.records()) == []
+    assert vast.created == []
+
+
+@pytest.mark.parametrize("gpu_bid", ("not-a-rate", "0", "0.400001", "0.2000001"))
+def test_rejects_invalid_gpu_bid_before_reserving_budget(tmp_path, gpu_bid):
+    candidate = replace(plan(), offer=offer("0.40", gpu_bid))
+    smoke, ledger, vast = controller(tmp_path)
+
+    with pytest.raises(SmokeError, match="GPU bid"):
         smoke.run(candidate)
 
     assert list(ledger.records()) == []

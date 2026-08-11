@@ -150,7 +150,7 @@ class VastCliSmokeClient:
         # the stricter raw-MiB threshold before accepting a receipt.
         query = f"num_gpus=1 cpu_arch=amd64 gpu_ram>={minimum_vram_gb} compute_cap>=750 cuda_max_good>=12 rentable=True"
         rows = self._rows((str(self._vastai), "search", "offers", query, "-i", "--storage", str(requested_disk), "--order", "dph_total", "--raw"))
-        candidates: list[tuple[Decimal, Mapping[str, Any], SmokeCompatibility]] = []
+        candidates: list[tuple[Decimal, Decimal, Mapping[str, Any], SmokeCompatibility]] = []
         for row in rows:
             try:
                 compatibility = SmokeCompatibility(
@@ -163,16 +163,17 @@ class VastCliSmokeClient:
                     selection="cheapest-compatible-verified",
                 )
                 compatibility.validate()
-                rate = _rate(row.get("dph_total", row.get("dph_base")))
-                if rate <= 0 or _exact_id(row.get("id")) in PROTECTED_INSTANCE_IDS:
+                rate = _rate(row.get("dph_total"))
+                gpu_bid = _rate(row.get("dph_base"))
+                if rate <= 0 or gpu_bid <= 0 or gpu_bid > rate or _exact_id(row.get("id")) in PROTECTED_INSTANCE_IDS:
                     continue
             except (ProductionSmokeError, SmokeError):
                 continue
-            candidates.append((rate, row, compatibility))
+            candidates.append((rate, gpu_bid, row, compatibility))
         if not candidates:
             raise ProductionSmokeError("no compatible verified one-GPU Vast offer is available")
-        rate, row, compatibility = min(candidates, key=lambda item: (item[0], _exact_id(item[1].get("id"))))
-        return SmokeOfferSelectionReceipt(_exact_id(row.get("id")), rate, _string(row, "gpu_name", fallback="gpu"), compatibility)
+        rate, gpu_bid, row, compatibility = min(candidates, key=lambda item: (item[0], _exact_id(item[2].get("id"))))
+        return SmokeOfferSelectionReceipt(_exact_id(row.get("id")), rate, _string(row, "gpu_name", fallback="gpu"), compatibility, gpu_bid)
 
     def _template_readback(self, template_id: str) -> Mapping[str, Any]:
         exact = _exact_id(template_id)
@@ -224,7 +225,10 @@ class VastCliSmokeClient:
         if purpose not in {"training-smoke", "rollout-smoke"}:
             raise ProductionSmokeError("smoke create purpose is invalid")
         disk = _positive_int(request.get("disk_gb", 100 if purpose == "training-smoke" else 300), "disk")
-        bid = _rate(request.get("hourly_rate_usd"))
+        all_in_rate = _rate(request.get("hourly_rate_usd"))
+        bid = _rate(request.get("gpu_bid_usd"))
+        if bid > all_in_rate:
+            raise ProductionSmokeError("GPU bid cannot exceed the all-in offer rate")
         image_reference = request.get("image_reference")
         payload_hash = request.get("payload_hash")
         if not isinstance(image_reference, str) or not isinstance(payload_hash, str):

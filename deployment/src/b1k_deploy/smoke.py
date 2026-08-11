@@ -158,6 +158,7 @@ class SmokeOfferSelectionReceipt:
     hourly_rate_usd: Decimal | str | int | float
     gpu_name: str
     compatibility: SmokeCompatibility
+    gpu_bid_usd: Decimal | str | int | float
 
     def ledger_offer(self) -> dict[str, Any]:
         rate = format(self.hourly_rate_usd, "f") if isinstance(self.hourly_rate_usd, Decimal) else self.hourly_rate_usd
@@ -342,7 +343,7 @@ class SmokeController:
                 purpose=plan.purpose,
                 offer=plan.offer.ledger_offer(),
                 projected_spend_usd=projected,
-                request={"offer_id": plan.offer.offer_id, "template_id": plan.template.template_id, "image_reference": plan.template.image_release.reference, "payload_hash": plan.template.payload_hash, "purpose": plan.purpose, "disk_gb": 100 if plan.purpose == "training-smoke" else 300, "hourly_rate_usd": plan.offer.hourly_rate_usd},
+                request={"offer_id": plan.offer.offer_id, "template_id": plan.template.template_id, "image_reference": plan.template.image_release.reference, "payload_hash": plan.template.payload_hash, "purpose": plan.purpose, "disk_gb": 100 if plan.purpose == "training-smoke" else 300, "hourly_rate_usd": plan.offer.hourly_rate_usd, "gpu_bid_usd": plan.offer.gpu_bid_usd},
                 create_timeout_seconds=limits.create_timeout_seconds,
                 reconcile_timeout_seconds=limits.reconcile_timeout_seconds,
             )
@@ -419,9 +420,20 @@ class SmokeController:
             raise SmokeError("smoke total worst-case duration exceeds the selected offer duration")
         SmokeController._validate_destination_readiness(release, plan.destination_readiness)
         projected = SmokeController._derive_projected_spend(plan.offer.ledger_offer(), limits.worst_case_seconds())
+        SmokeController._validate_gpu_bid(plan.offer.gpu_bid_usd, plan.offer.hourly_rate_usd)
         if plan.declared_projected_spend_usd is not None and SmokeController._money(plan.declared_projected_spend_usd) != projected:
             raise SmokeError("caller-declared projected spend must equal the internally derived worst-case cost")
         return projected
+
+    @staticmethod
+    def _validate_gpu_bid(gpu_bid: Decimal | str | int | float, hourly_rate: Decimal | str | int | float) -> None:
+        try:
+            bid = Decimal(str(gpu_bid))
+            all_in_rate = Decimal(str(hourly_rate))
+        except (InvalidOperation, ValueError):
+            raise SmokeError("GPU bid is invalid") from None
+        if not bid.is_finite() or bid <= 0 or bid.as_tuple().exponent < -6 or bid > all_in_rate:
+            raise SmokeError("GPU bid is invalid")
 
     @staticmethod
     def _validate_destination_readiness(image_release: DockerImageRelease, readiness: SmokeReadinessReceipt) -> None:
