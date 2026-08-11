@@ -172,13 +172,7 @@ class DockerBuildxImageBuilder:
 
 
 def _discover_buildx_plugin(docker_executable: Path) -> Path | None:
-    candidates = [
-        docker_executable.parent.parent / "cli-plugins" / "docker-buildx",
-        Path("/usr/local/lib/docker/cli-plugins/docker-buildx"),
-        Path("/usr/local/libexec/docker/cli-plugins/docker-buildx"),
-        Path("/usr/lib/docker/cli-plugins/docker-buildx"),
-        Path("/usr/libexec/docker/cli-plugins/docker-buildx"),
-    ]
+    candidates = [docker_executable.parent.parent / "cli-plugins" / "docker-buildx"]
     homebrew_cellar = next((parent for parent in docker_executable.parents if parent.name == "Cellar"), None)
     if homebrew_cellar is not None:
         candidates.extend(
@@ -187,6 +181,14 @@ def _discover_buildx_plugin(docker_executable: Path) -> Path | None:
                 homebrew_cellar.parent / "libexec" / "docker" / "cli-plugins" / "docker-buildx",
             )
         )
+    candidates.extend(
+        (
+            Path("/usr/local/lib/docker/cli-plugins/docker-buildx"),
+            Path("/usr/local/libexec/docker/cli-plugins/docker-buildx"),
+            Path("/usr/lib/docker/cli-plugins/docker-buildx"),
+            Path("/usr/libexec/docker/cli-plugins/docker-buildx"),
+        )
+    )
     for candidate in candidates:
         try:
             resolved = candidate.resolve(strict=True)
