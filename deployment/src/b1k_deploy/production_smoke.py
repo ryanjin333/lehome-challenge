@@ -875,6 +875,9 @@ class SshSmokeRemote:
         simulator_environment = (
             "OMNI_KIT_ACCEPT_EULA=YES",
             "OMNIGIBSON_DATA_PATH=/workspace/omnigibson-data",
+            "NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba",
+            "TRITON_CACHE_DIR=/workspace/campaign/.cache/triton",
+            "MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib",
         ) if image == self._rollout_image else ()
         return (
             "setpriv", "--reuid=10001", "--regid=10001", "--init-groups", "env", "-i",

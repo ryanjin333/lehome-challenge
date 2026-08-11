@@ -618,8 +618,14 @@ def test_runtime_transport_uses_only_role_specific_sanitized_environment(
         assert "MUST_NOT_LEAK=ambient-secret" not in command
     assert "OMNI_KIT_ACCEPT_EULA=YES" not in training
     assert "OMNIGIBSON_DATA_PATH=/workspace/omnigibson-data" not in training
+    assert "NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba" not in training
+    assert "TRITON_CACHE_DIR=/workspace/campaign/.cache/triton" not in training
+    assert "MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib" not in training
     assert "OMNI_KIT_ACCEPT_EULA=YES" in rollout
     assert "OMNIGIBSON_DATA_PATH=/workspace/omnigibson-data" in rollout
+    assert "NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba" in rollout
+    assert "TRITON_CACHE_DIR=/workspace/campaign/.cache/triton" in rollout
+    assert "MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib" in rollout
 
 
 @pytest.mark.parametrize(
