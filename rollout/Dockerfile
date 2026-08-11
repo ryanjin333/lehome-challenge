@@ -81,7 +81,7 @@ RUN /opt/conda/envs/behavior/bin/python -m pip install --no-cache-dir . \
     && isaacsim_apps_path="$("$BEHAVIOR_PYTHON" -c 'import importlib.util, pathlib; spec = importlib.util.find_spec("isaacsim"); assert spec is not None and spec.submodule_search_locations; print(pathlib.Path(next(iter(spec.submodule_search_locations))) / "apps")')" \
     && test -d "$isaacsim_apps_path" \
     && install -o rollout -g rollout -m 0644 /behavior-src/OmniGibson/omnigibson/omnigibson_5_1_0.kit "$isaacsim_apps_path/omnigibson_5_1_0.kit" \
-    && install -o rollout -g rollout -m 0644 /behavior-src/OmniGibson/docs/assets/OmniGibson_logo.png "$isaacsim_apps_path/OmniGibson_logo.png" \
+    && install -o rollout -g rollout -m 0644 /behavior-src/docs/assets/OmniGibson_logo.png "$isaacsim_apps_path/OmniGibson_logo.png" \
     && install -d -o rollout -g rollout -m 0700 /workspace /workspace/campaign /workspace/checkpoint-source /workspace/omnigibson-data /workspace/.cache/huggingface \
     && chmod 0755 /usr/local/bin/b1k-rollout-entrypoint
 

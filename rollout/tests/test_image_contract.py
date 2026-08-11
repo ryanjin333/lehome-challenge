@@ -61,7 +61,7 @@ def test_rollout_image_prepares_only_omnigibson_runtime_copy_targets_for_unprivi
     ) in dockerfile
     assert (
         "install -o rollout -g rollout -m 0644 "
-        "/behavior-src/OmniGibson/docs/assets/OmniGibson_logo.png "
+        "/behavior-src/docs/assets/OmniGibson_logo.png "
         '"$isaacsim_apps_path/OmniGibson_logo.png"'
     ) in dockerfile
     assert 'chown -R rollout:rollout "$isaacsim_apps_path"' not in dockerfile
