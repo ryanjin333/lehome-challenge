@@ -24,6 +24,7 @@ def test_rollout_image_is_pinned_headless_and_secret_free() -> None:
     assert 'io.lehome.behavior-parent-digest="${BEHAVIOR_PARENT_DIGEST}"' in dockerfile
     assert "OMNI_KIT_ACCEPT_EULA=YES" in dockerfile
     assert "OMNIGIBSON_DATA_PATH=/workspace/omnigibson-data" in dockerfile
+    assert "OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson" in dockerfile
     assert "HEADLESS=1" in dockerfile
     assert "HEALTHCHECK" in dockerfile and "/opt/conda/envs/behavior/bin/python -m b1k_rollout.cli healthcheck" in dockerfile
     assert "--start-period=45m" in dockerfile
@@ -64,9 +65,10 @@ def test_rollout_entrypoint_fails_closed_before_campaign_execution() -> None:
         "    /workspace /workspace/campaign /workspace/checkpoint-source \\\n"
         "    /workspace/omnigibson-data /workspace/smoke-canary \\\n"
         "    /workspace/campaign/.cache/numba /workspace/campaign/.cache/triton \\\n"
-        "    /workspace/campaign/.cache/matplotlib"
+        "    /workspace/campaign/.cache/matplotlib /workspace/campaign/.cache/omnigibson"
     ) in entrypoint
     root_branch = entrypoint.split('if [[ ! -f "${B1K_HF_TOKEN_FILE:-}"', 1)[0]
+    assert "export OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson" in root_branch
     assert "export NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba" in root_branch
     assert "export TRITON_CACHE_DIR=/workspace/campaign/.cache/triton" in root_branch
     assert "export MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib" in root_branch
@@ -75,6 +77,8 @@ def test_rollout_entrypoint_fails_closed_before_campaign_execution() -> None:
     assert "/workspace/.cache /workspace/.cache/huggingface" not in root_branch
     assert '"$BEHAVIOR_PYTHON" -m b1k_rollout.cli assets-bootstrap' not in root_branch
     assert entrypoint.index("assets-bootstrap") > entrypoint.index("unset HF_TOKEN")
+    assert 'test -d "$OMNIGIBSON_APPDATA_PATH"' in entrypoint
+    assert 'test -O "$OMNIGIBSON_APPDATA_PATH"' in entrypoint
 
 
 def test_image_verifier_accepts_only_immutable_rollout_digests() -> None:
@@ -91,6 +95,7 @@ def test_image_verifier_accepts_only_immutable_rollout_digests() -> None:
     assert "B1K_ROLLOUT_VERIFY_PRIVILEGE_DROP=1" in verifier
     assert "B1K_HF_TOKEN_FILE=/workspace/.cache/huggingface/token" in verifier
     assert "/opt/conda/envs/behavior/bin/python -m b1k_rollout.cli" in verifier
+    assert 'test "$OMNIGIBSON_APPDATA_PATH" = /workspace/campaign/.cache/omnigibson' in verifier
 
 
 def test_image_verifier_does_not_treat_generated_third_party_environments_as_release_source() -> None:

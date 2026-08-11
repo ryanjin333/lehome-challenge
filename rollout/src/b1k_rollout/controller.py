@@ -57,8 +57,15 @@ _RUNTIME_ENVIRONMENT = frozenset(
         "LC_ALL",
         "CUDA_HOME",
         "GROOT_PYTHON",
+        "HEADLESS",
+        "MPLCONFIGDIR",
+        "NVIDIA_DRIVER_CAPABILITIES",
+        "NUMBA_CACHE_DIR",
         "OMNI_KIT_ACCEPT_EULA",
+        "OMNIGIBSON_APPDATA_PATH",
         "OMNIGIBSON_DATA_PATH",
+        "TRITON_CACHE_DIR",
+        "VK_DRIVER_FILES",
     )
 )
 _LAUNCH_ENVIRONMENT = frozenset(("CUDA_VISIBLE_DEVICES",))

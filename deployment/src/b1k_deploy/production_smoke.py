@@ -66,6 +66,9 @@ def _remote_failure_category(stdout: object, stderr: object) -> str:
     output = f"{stdout}\n{stderr}".lower()
     categories = (
         (("cuda out of memory", "torch.outofmemoryerror"), "remote-cuda-out-of-memory"),
+        (("segmentation fault", "core dumped"), "remote-segmentation-fault"),
+        (("failed to create vulkan instance", "vulkan initialization failed"), "remote-vulkan-unavailable"),
+        (("importerror", "cannot open shared object file"), "remote-library-load-failed"),
         (("gatedrepoerror", "401 unauthorized", "403 forbidden", "access denied"), "remote-access-denied"),
         (("no space left on device",), "remote-disk-full"),
         (("modulenotfounderror",), "remote-python-module-missing"),
@@ -875,6 +878,11 @@ class SshSmokeRemote:
         simulator_environment = (
             "OMNI_KIT_ACCEPT_EULA=YES",
             "OMNIGIBSON_DATA_PATH=/workspace/omnigibson-data",
+            "OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson",
+            "HEADLESS=1",
+            "NVIDIA_VISIBLE_DEVICES=all",
+            "NVIDIA_DRIVER_CAPABILITIES=all",
+            "VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json",
             "NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba",
             "TRITON_CACHE_DIR=/workspace/campaign/.cache/triton",
             "MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib",

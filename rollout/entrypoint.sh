@@ -28,9 +28,10 @@ if [[ "$(id -u)" == 0 ]]; then
     /workspace /workspace/campaign /workspace/checkpoint-source \
     /workspace/omnigibson-data /workspace/smoke-canary \
     /workspace/campaign/.cache/numba /workspace/campaign/.cache/triton \
-    /workspace/campaign/.cache/matplotlib
+    /workspace/campaign/.cache/matplotlib /workspace/campaign/.cache/omnigibson
   printf '%s' "$HF_TOKEN" | "$BEHAVIOR_PYTHON" -m b1k_rollout.token_bootstrap
   unset HF_TOKEN
+  export OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson
   export NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba
   export TRITON_CACHE_DIR=/workspace/campaign/.cache/triton
   export MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib
@@ -62,6 +63,9 @@ if [[ "${B1K_ROLLOUT_VERIFY_PRIVILEGE_DROP:-}" == "1" ]]; then
   test "$(id -u)" = 10001
   test "$(id -g)" = 10001
   test -O "$B1K_HF_TOKEN_FILE"
+  test "$OMNIGIBSON_APPDATA_PATH" = /workspace/campaign/.cache/omnigibson
+  test -d "$OMNIGIBSON_APPDATA_PATH"
+  test -O "$OMNIGIBSON_APPDATA_PATH"
   test -z "${HF_TOKEN+x}"
   exit 0
 fi

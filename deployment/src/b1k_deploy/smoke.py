@@ -31,11 +31,14 @@ _REMOTE_FAILURE_CODES = frozenset({
     "remote-cuda-out-of-memory",
     "remote-disk-full",
     "remote-file-missing",
+    "remote-library-load-failed",
     "remote-python-module-missing",
     "remote-runtime-error",
+    "remote-segmentation-fault",
     "remote-subprocess-failed",
     "remote-timeout",
     "remote-value-error",
+    "remote-vulkan-unavailable",
 })
 
 

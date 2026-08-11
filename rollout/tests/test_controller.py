@@ -193,6 +193,13 @@ def test_subprocess_launcher_keeps_required_simulator_runtime_environment_but_st
     data_path.mkdir()
     monkeypatch.setenv("OMNI_KIT_ACCEPT_EULA", "YES")
     monkeypatch.setenv("OMNIGIBSON_DATA_PATH", str(data_path))
+    monkeypatch.setenv("OMNIGIBSON_APPDATA_PATH", "/workspace/campaign/.cache/omnigibson")
+    monkeypatch.setenv("NUMBA_CACHE_DIR", "/workspace/campaign/.cache/numba")
+    monkeypatch.setenv("TRITON_CACHE_DIR", "/workspace/campaign/.cache/triton")
+    monkeypatch.setenv("MPLCONFIGDIR", "/workspace/campaign/.cache/matplotlib")
+    monkeypatch.setenv("HEADLESS", "1")
+    monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
+    monkeypatch.setenv("VK_DRIVER_FILES", "/etc/vulkan/icd.d/nvidia_icd.json")
     monkeypatch.setenv("B1K_HF_TOKEN", "must-not-reach-child")
     output = tmp_path / "environment.json"
     process = launcher.start(
@@ -208,6 +215,13 @@ def test_subprocess_launcher_keeps_required_simulator_runtime_environment_but_st
     child_environment = json.loads(output.read_text(encoding="utf-8"))
     assert child_environment["OMNI_KIT_ACCEPT_EULA"] == "YES"
     assert child_environment["OMNIGIBSON_DATA_PATH"] == str(data_path)
+    assert child_environment["OMNIGIBSON_APPDATA_PATH"] == "/workspace/campaign/.cache/omnigibson"
+    assert child_environment["NUMBA_CACHE_DIR"] == "/workspace/campaign/.cache/numba"
+    assert child_environment["TRITON_CACHE_DIR"] == "/workspace/campaign/.cache/triton"
+    assert child_environment["MPLCONFIGDIR"] == "/workspace/campaign/.cache/matplotlib"
+    assert child_environment["HEADLESS"] == "1"
+    assert child_environment["NVIDIA_DRIVER_CAPABILITIES"] == "all"
+    assert child_environment["VK_DRIVER_FILES"] == "/etc/vulkan/icd.d/nvidia_icd.json"
     assert child_environment["CUDA_VISIBLE_DEVICES"] == "3"
     assert "PATH" in child_environment
     assert "B1K_HF_TOKEN" not in child_environment

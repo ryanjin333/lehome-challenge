@@ -21,6 +21,7 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive \
     OMNI_KIT_ACCEPT_EULA=YES \
     OMNIGIBSON_DATA_PATH=/workspace/omnigibson-data \
+    OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson \
     HEADLESS=1 \
     HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
     HF_HOME=/workspace/.cache/huggingface \

@@ -26,8 +26,10 @@ def test_template_renders_private_headless_campaign_with_explicit_gpu_bounds() -
     assert template["onstart"] == (
         "install -d -o 10001 -g 10001 -m 0700 /workspace /workspace/campaign /workspace/checkpoint-source "
         "/workspace/omnigibson-data /workspace/smoke-canary /workspace/campaign/.cache/numba "
-        "/workspace/campaign/.cache/triton /workspace/campaign/.cache/matplotlib && "
-        "export NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba "
+        "/workspace/campaign/.cache/triton /workspace/campaign/.cache/matplotlib "
+        "/workspace/campaign/.cache/omnigibson && "
+        "export OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson "
+        "NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba "
         "TRITON_CACHE_DIR=/workspace/campaign/.cache/triton "
         "MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib && "
         "bash /usr/local/bin/b1k-rollout-entrypoint"

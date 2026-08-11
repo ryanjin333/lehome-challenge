@@ -623,6 +623,11 @@ def test_runtime_transport_uses_only_role_specific_sanitized_environment(
     assert "MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib" not in training
     assert "OMNI_KIT_ACCEPT_EULA=YES" in rollout
     assert "OMNIGIBSON_DATA_PATH=/workspace/omnigibson-data" in rollout
+    assert "OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson" in rollout
+    assert "HEADLESS=1" in rollout
+    assert "NVIDIA_VISIBLE_DEVICES=all" in rollout
+    assert "NVIDIA_DRIVER_CAPABILITIES=all" in rollout
+    assert "VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json" in rollout
     assert "NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba" in rollout
     assert "TRITON_CACHE_DIR=/workspace/campaign/.cache/triton" in rollout
     assert "MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib" in rollout
@@ -632,6 +637,9 @@ def test_runtime_transport_uses_only_role_specific_sanitized_environment(
     ("stderr", "expected"),
     (
         ("RuntimeError: CUDA out of memory. Tried to allocate 1 GiB\n", "remote-cuda-out-of-memory"),
+        ("Segmentation fault (core dumped)\n", "remote-segmentation-fault"),
+        ("RuntimeError: Failed to create Vulkan instance\n", "remote-vulkan-unavailable"),
+        ("ImportError: libcuda.so.1: cannot open shared object file\n", "remote-library-load-failed"),
         ("huggingface_hub.errors.GatedRepoError: 403 Forbidden\n", "remote-access-denied"),
         ("subprocess.CalledProcessError: command returned non-zero exit status 1\n", "remote-subprocess-failed"),
         ("arbitrary provider detail custom-secret-must-not-leak\n", "remote-command-failed"),
