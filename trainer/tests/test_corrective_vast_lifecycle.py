@@ -366,13 +366,15 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     script = next(command[-1] for command in calls if command[0] == "ssh" and command[-3:-1] == ("sh", "-lc"))
     assert LIFECYCLE.APPROVED_GROOT_ROOT in script
     assert "HF_ENDPOINT=https://hf-mirror.com" in script and "ryanjin333/lehome-groot-n17-models" in script
-    assert "Cosmos-Reason2-2B" not in script
+    assert "Qwen/Qwen3-VL-2B-Instruct" in script and LIFECYCLE.APPROVED_QWEN_REVISION in script
+    assert "/cache/models/nvidia/Cosmos-Reason2-2B" in script and "/code/nvidia/Cosmos-Reason2-2B" in script
+    assert all(digest in script for digest in LIFECYCLE.APPROVED_QWEN_FILES.values())
     assert "policy_artifact_sha256" in script and "/opt/lehome-challenge/.venv/bin/hf download" in script
     assert "/code/source/lehome:/workspace/corrective/canary-000000/code" in script
     assert "/code/Assets/objects/Challenge_Garment/Release" in script
     assert "/code/code/Assets" not in script
     assert "Assets/$d" in script and "LEHOME_FLYWHEEL_WORKER_GPU=0" in script
-    assert "PYTHONPATH=/workspace/corrective/canary-000000/code/source/lehome:/workspace/corrective/canary-000000/code LEHOME_FLYWHEEL_WORKER_GPU=0" in script
+    assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/canary-000000/code/source/lehome:/workspace/corrective/canary-000000/code LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "if [ -e /workspace/lehome-release-assets ]" in script
     assert "if [ -e /workspace/corrective/canary-000000/code ]" in script
     assert "hf download lehome/asset_challenge --repo-type dataset --revision" in script
@@ -581,5 +583,6 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "/code/Assets/objects/Challenge_Garment/Release" in script
     assert "/code/code/Assets" not in script
     assert all(f"LEHOME_FLYWHEEL_WORKER_GPU={slot}" in script for slot in range(4))
-    assert "PYTHONPATH=/workspace/corrective/wave-000000/code/source/lehome:/workspace/corrective/wave-000000/code LEHOME_FLYWHEEL_WORKER_GPU=0" in script
+    assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/wave-000000/code/source/lehome:/workspace/corrective/wave-000000/code LEHOME_FLYWHEEL_WORKER_GPU=0" in script
+    assert "Qwen/Qwen3-VL-2B-Instruct" in script and all(digest in script for digest in LIFECYCLE.APPROVED_QWEN_FILES.values())
     assert any(command[0] == "scp" and command[-2].endswith("/code/campaign/.") for command in calls)

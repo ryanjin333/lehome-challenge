@@ -40,6 +40,15 @@ APPROVED_GROOT_NATIVE_PYTHON_SHA256 = "ee22b22d759f77275c82503976968bc3193f577a4
 APPROVED_GROOT_PYTHON_SHA256 = "760c0ad783861ad329821442e0d1385bd915d1bdaef87646c331bbf035d3c389"
 APPROVED_ASSET_REVISION = "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9"
 APPROVED_HF_ENDPOINTS = frozenset({"https://hf-mirror.com", "https://huggingface.co"})
+APPROVED_QWEN_REPOSITORY = "Qwen/Qwen3-VL-2B-Instruct"
+APPROVED_QWEN_REVISION = "89644892e4d85e24eaac8bacfd4f463576704203"
+APPROVED_QWEN_ROOT = "/cache/models/nvidia/Cosmos-Reason2-2B"
+APPROVED_QWEN_FILES = {
+    "model.safetensors": "7de1838c87a5349b016c26a1c3f7d2bc400a3d485f95ef39a7059ffd734977a0",
+    "config.json": "bec4b3d446efa05807365c9e1cec03ac590836879d02f3a6da879971154bdd3b",
+    "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    "tokenizer.json": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+}
 # Vast's offer filter takes memory in GiB, whereas the raw offer/readback
 # payload reports ``cpu_ram`` in MiB.  Keep those units explicit at the edge.
 OFFER_QUERY = "gpu_name=RTX_3090 num_gpus=4 reliability>=0.95 cpu_cores_effective>=64 cpu_ram>=128 disk_space>=300 duration>=1"
@@ -60,6 +69,22 @@ def _remote_hf_endpoint() -> str:
 
 def _hf_download(command: str) -> str:
     return "HF_ENDPOINT=" + shlex.quote(_remote_hf_endpoint()) + " " + command
+
+
+def _qwen_base_setup(checkout: str) -> list[str]:
+    """Hydrate and pin the open base expected by step12000's absolute path."""
+    download = _hf_download(
+        "/opt/lehome-challenge/.venv/bin/hf download " + APPROVED_QWEN_REPOSITORY
+        + " --revision " + shlex.quote(APPROVED_QWEN_REVISION)
+        + " --include 'model.safetensors' --include 'config.json' --include 'preprocessor_config.json' --include 'tokenizer.json' --local-dir "
+        + shlex.quote(APPROVED_QWEN_ROOT)
+    )
+    checks = [
+        "test -f " + shlex.quote(APPROVED_QWEN_ROOT + "/" + name)
+        + " && test \"$(sha256sum " + shlex.quote(APPROVED_QWEN_ROOT + "/" + name) + " | cut -d' ' -f1)\" = " + shlex.quote(digest)
+        for name, digest in APPROVED_QWEN_FILES.items()
+    ]
+    return [download, *checks, "mkdir -p " + shlex.quote(checkout + "/nvidia"), "ln -sfn " + shlex.quote(APPROVED_QWEN_ROOT) + " " + shlex.quote(checkout + "/nvidia/Cosmos-Reason2-2B")]
 
 
 def _groot_wrapper_setup() -> list[str]:
@@ -294,13 +319,14 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
     checkout_setup = "if [ -e " + shlex.quote(checkout) + " ]; then test -d " + shlex.quote(checkout + "/.git") + " && test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision) + " && git -C " + shlex.quote(checkout) + " diff --quiet; else git clone --no-checkout " + shlex.quote(remote_bundle) + " " + shlex.quote(checkout) + " && git -C " + shlex.quote(checkout) + " checkout --detach " + shlex.quote(revision) + "; fi"
     setup = ["set -eu", "test -x /opt/lehome-challenge/.venv/bin/python", *_groot_wrapper_setup(), "test \"$(git -C " + shlex.quote(APPROVED_GROOT_ROOT) + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_GROOT_REVISION), "chmod 600 " + shlex.quote(remote_token), "export HF_TOKEN=\"$(cat " + shlex.quote(remote_token) + ")\"", checkout_setup, "test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision), "git -C " + shlex.quote(checkout) + " diff --quiet", _hf_download("/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root)), "printf '%s\\n' " + shlex.quote(policy_revision) + " > " + shlex.quote(policy_root + "/revision.txt"), "PYTHONPATH=" + shlex.quote(controller_pythonpath) + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; assert policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "'")]
     setup.extend(_asset_checkout_setup(checkout))
+    setup.extend(_qwen_base_setup(checkout))
     script_lines = ["set -eu", "trap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT", *setup[1:], f"mkdir -p {shlex.quote(output_root)}", f"cd {shlex.quote(checkout)}", "pids='' "]
     for attempt in remote_attempts:
         command = " ".join(shlex.quote(token) for token in attempt["command"])
         slot = int(attempt["worker_slot"])
         log = shlex.quote(f"{output_root}/worker-{slot}.log")
         status_file = shlex.quote(f"{output_root}/worker-{slot}.returncode")
-        script_lines.append(f"( PYTHONPATH={shlex.quote(controller_pythonpath)} LEHOME_FLYWHEEL_WORKER_GPU={slot} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
+        script_lines.append(f"( HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH={shlex.quote(controller_pythonpath)} LEHOME_FLYWHEEL_WORKER_GPU={slot} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
     script_lines.extend(("for pid in $pids; do wait \"$pid\" || true; done", f"python3 -c {shlex.quote(_terminal_writer_program(output_root, {'attempts': remote_attempts}))}", "exit 0"))
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", "\n".join(script_lines)))
     # Always sync the exact campaign output; a failed remote launch is evidence
@@ -389,9 +415,10 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
         "PYTHONPATH=" + shlex.quote(remote_dir + "/code/source/lehome:" + remote_dir + "/code") + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; import sys; sys.exit(0 if policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "' else 1)"),
     ]
     runtime.extend(_asset_checkout_setup(remote_dir + "/code"))
+    runtime.extend(_qwen_base_setup(remote_dir + "/code"))
     command = " ".join(shlex.quote(item) for item in rewritten)
     controller_pythonpath = remote_dir + "/code/source/lehome:" + remote_dir + "/code"
-    script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nPYTHONPATH=" + shlex.quote(controller_pythonpath) + " LEHOME_FLYWHEEL_WORKER_GPU=0 " + command + " )\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
+    script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nHF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=" + shlex.quote(controller_pythonpath) + " LEHOME_FLYWHEEL_WORKER_GPU=0 " + command + " )\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", script))
     sync = lifecycle_root / f"canary-{value['wave_index']:06d}-sync"
     # The corrective controller consumes raw episodes and policy receipts from
