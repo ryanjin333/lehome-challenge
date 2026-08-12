@@ -36,7 +36,7 @@ _STATE_GROUPS = (
 _ACTION_GROUPS = tuple(name for name, _ in _STATE_GROUPS)
 _ACTION_KEYS = tuple(f"action.{name}" for name in _ACTION_GROUPS)
 _ACTION_DIMENSION = 12
-_ACTION_HORIZON = 40
+_ACTION_HORIZON = 16
 _NDARRAY_MARKER = "__ndarray_class__"
 
 

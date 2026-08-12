@@ -18,6 +18,9 @@ def validate_policy_server_action_chunk():
     package = types.ModuleType("scripts.eval_policy")
     package.__path__ = [str(Path(__file__).parents[2] / "scripts" / "eval_policy")]
     monkeypatch.setitem(sys.modules, "scripts.eval_policy", package)
+    registry = importlib.import_module("scripts.eval_policy.registry")
+    registry.PolicyRegistry._registry.pop("groot", None)
+    registry.PolicyRegistry._registry.pop("groot_server", None)
     monkeypatch.delitem(sys.modules, "scripts.eval_policy.groot_policy", raising=False)
     module = importlib.import_module("scripts.eval_policy.groot_policy")
     try:
@@ -47,7 +50,7 @@ def test_policy_runtime_seed_covers_python_numpy_and_every_visible_cuda_device(m
     assert events == [("python", 42), ("numpy", 42), ("torch", 42), ("cuda", 42)]
 
 
-def test_policy_server_action_chunk_requires_the_checkpoint_40_step_horizon(
+def test_policy_server_action_chunk_requires_the_pinned_16_step_horizon(
     validate_policy_server_action_chunk,
 ) -> None:
     dimensions = {
@@ -57,17 +60,17 @@ def test_policy_server_action_chunk_requires_the_checkpoint_40_step_horizon(
         "right_gripper": 1,
     }
     action = {
-        group: np.zeros((1, 40, dimension), dtype=np.float32)
+        group: np.zeros((1, 16, dimension), dtype=np.float32)
         for group, dimension in dimensions.items()
     }
 
     chunk = validate_policy_server_action_chunk(action)
 
-    assert chunk.shape == (40, 12)
+    assert chunk.shape == (16, 12)
     with pytest.raises(ValueError, match="dtype or shape"):
         validate_policy_server_action_chunk(
             {
-                group: np.zeros((1, 16, dimension), dtype=np.float32)
+                group: np.zeros((1, 40, dimension), dtype=np.float32)
                 for group, dimension in dimensions.items()
             }
         )

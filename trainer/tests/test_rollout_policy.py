@@ -38,15 +38,15 @@ def test_policy_loader_uses_the_repository_adapter_path():
 def test_flatten_groot_action_chunk_preserves_all_horizon_steps_and_group_order():
     module = _load_policy_module()
     action = {
-        "left_arm": _chunk(1, 40, 5, 0),
-        "left_gripper": _chunk(1, 40, 1, 10),
-        "right_arm": _chunk(1, 40, 5, 20),
-        "right_gripper": _chunk(1, 40, 1, 30),
+        "left_arm": _chunk(1, 16, 5, 0),
+        "left_gripper": _chunk(1, 16, 1, 10),
+        "right_arm": _chunk(1, 16, 5, 20),
+        "right_gripper": _chunk(1, 16, 1, 30),
     }
 
     flattened = module.flatten_groot_action_chunk(action)
 
-    assert flattened.shape == (40, 12)
+    assert flattened.shape == (16, 12)
     np.testing.assert_array_equal(
         flattened[0],
         np.array([0, 1, 2, 3, 4, 10, 20, 21, 22, 23, 24, 30], dtype=np.float32),
@@ -112,10 +112,10 @@ def test_policy_records_only_cache_miss_inference_latency_and_queue_depth(monkey
         def get_action(self, _observation):
             self.calls += 1
             return {
-                "action.left_arm": _chunk(1, 40, 5, 0),
-                "action.left_gripper": _chunk(1, 40, 1, 10),
-                "action.right_arm": _chunk(1, 40, 5, 20),
-                "action.right_gripper": _chunk(1, 40, 1, 30),
+                "action.left_arm": _chunk(1, 16, 5, 0),
+                "action.left_gripper": _chunk(1, 16, 1, 10),
+                "action.right_arm": _chunk(1, 16, 5, 20),
+                "action.right_gripper": _chunk(1, 16, 1, 30),
             }, None
 
     policy = module.GrootPolicy.__new__(module.GrootPolicy)
@@ -135,7 +135,7 @@ def test_policy_records_only_cache_miss_inference_latency_and_queue_depth(monkey
     assert records == [{
         "request_id": first.request_id,
         "latency_seconds": 0.25,
-        "queue_depth_after_enqueue": 40,
+        "queue_depth_after_enqueue": 16,
     }]
 
 def test_flatten_groot_action_chunk_rejects_non_contract_horizon():
@@ -152,7 +152,7 @@ def test_flatten_groot_action_chunk_rejects_non_contract_horizon():
     except ValueError as error:
         assert "horizon" in str(error)
     else:
-        raise AssertionError("a non-40-step action chunk must be rejected")
+        raise AssertionError("a non-16-step action chunk must be rejected")
 
 
 def _install_wire_fakes(monkeypatch):
@@ -255,10 +255,10 @@ def test_server_policy_validates_reset_and_action_response_contract(monkeypatch)
     module = _load_policy_module()
 
     action = {
-        "left_arm": _chunk(1, 40, 5, 0),
-        "left_gripper": _chunk(1, 40, 1, 10),
-        "right_arm": _chunk(1, 40, 5, 20),
-        "right_gripper": _chunk(1, 40, 1, 30),
+        "left_arm": _chunk(1, 16, 5, 0),
+        "left_gripper": _chunk(1, 16, 1, 10),
+        "right_arm": _chunk(1, 16, 5, 20),
+        "right_gripper": _chunk(1, 16, 1, 30),
     }
 
     class Client:
@@ -294,7 +294,7 @@ def test_server_policy_validates_reset_and_action_response_contract(monkeypatch)
     with pytest.raises(ValueError, match="dtype or shape"):
         module.validate_policy_server_action_chunk(malformed)
     malformed = dict(action)
-    malformed["action.unexpected"] = np.zeros((1, 40, 1), dtype=np.float32)
+    malformed["action.unexpected"] = np.zeros((1, 16, 1), dtype=np.float32)
     with pytest.raises(ValueError, match="exactly"):
         module.validate_policy_server_action_chunk(malformed)
 
