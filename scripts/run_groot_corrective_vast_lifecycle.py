@@ -28,7 +28,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 # immutable digest is deliberately supplied by the signed baseline rather than
 # guessed from the mutable :latest template tag.
 APPROVED_IMAGE_REPOSITORY = "ghcr.io/ryanjin333/lehome-rollout"
-APPROVED_IMAGE_DIGEST = "sha256:293c4f258f3742a7234699d706fb7088d0da8a764957bc79b244d830561abc12"
+APPROVED_IMAGE_DIGEST = "sha256:25870f001eb0ab356222dbfd15352c42666f566adb41732bcdfd7a12d104f50d"
 APPROVED_GROOT_ROOT = "/opt/isaac-groot"
 APPROVED_GROOT_REVISION = "23ace64f17aa5015259b8609d371eb61a357c776"
 APPROVED_GROOT_PYTHON = "/opt/gr00t-runtime/bin/python-validated-wrapper"
