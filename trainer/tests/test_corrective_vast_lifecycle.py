@@ -90,6 +90,20 @@ def test_capture_offer_evidence_binds_live_offer_and_account_snapshot(tmp_path: 
     assert "cpu_ram>=128" in LIFECYCLE.OFFER_QUERY and "cpu_cores_effective>=64" in LIFECYCLE.OFFER_QUERY
 
 
+def test_capture_offer_evidence_projects_provider_rows_without_secrets(tmp_path: Path) -> None:
+    sentinel = "do-not-persist-provider-token"
+    evidence = LIFECYCLE.capture_offer_evidence(
+        offers=[{"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": .7, "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.65.06", "is_bid": False, "jupyter_token": sentinel, "unknown_secret": sentinel}],
+        instances=[{"id": 9, "dph_total": .2, "jupyter_token": sentinel}],
+        volumes=[{"id": 2, "storage_total_cost": .01, "unknown_secret": sentinel}],
+        output=tmp_path / "provider.json", now_unix=100, ttl_seconds=60,
+    )
+    raw = (tmp_path / evidence["source_snapshot_path"]).read_text(encoding="utf-8")
+    snapshot = json.loads(raw)
+    assert sentinel not in raw and "jupyter_token" not in raw and "unknown_secret" not in raw
+    assert snapshot["offers"] == [{"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": .7, "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.65.06", "is_bid": False}]
+
+
 def test_capture_retained_instance_evidence_uses_only_live_instance_and_volume_facts(tmp_path: Path) -> None:
     instance = {
         "id": 47559739, "ssh_host": "host", "ssh_port": 22, "actual_status": "running",
@@ -422,6 +436,7 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     bundle = tmp_path / "code.bundle"; bundle.write_bytes(b"git bundle")
     token = tmp_path / "token"; token.write_text("secret")
     result = LIFECYCLE.remote_launch_canary(canary, instance, lifecycle_root=tmp_path / "life", runner=runner, bundle=bundle, token_file=token)
+    remote_dir = "/workspace/corrective/canary-000000-" + __import__("hashlib").sha256(canary.read_bytes()).hexdigest()[:12]
     assert result["kind"] == "corrective_canary_abort"
     assert Path(result["synced_evidence_root"]).is_dir()
     script = next(command[-1] for command in calls if command[0] == "ssh" and command[-3:-1] == ("sh", "-lc"))
@@ -433,39 +448,39 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     assert "unsafe git exclude" in script and "/nvidia/Cosmos-Reason2-2B" in script
     assert "unexpected git exclude content" in script
     assert "status --porcelain --untracked-files=all" in script
-    assert "readlink -f /workspace/corrective/canary-000000/code/nvidia/Cosmos-Reason2-2B" in script
+    assert f"readlink -f {remote_dir}/code/nvidia/Cosmos-Reason2-2B" in script
     assert "policy_artifact_sha256" in script and "/opt/lehome-challenge/.venv/bin/hf download" in script
-    assert "/code/source/lehome:/workspace/corrective/canary-000000/code" in script
+    assert f"/code/source/lehome:{remote_dir}/code" in script
     assert "/code/Assets/objects/Challenge_Garment/Release" in script
     assert "/code/code/Assets" not in script
     assert "Assets/$d" in script and "LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "LEHOME_FLYWHEEL_IMAGE_IDENTITY=" + LIFECYCLE.APPROVED_IMAGE_DIGEST in script
     assert "image identity preflight" in script
-    assert "cd /workspace/corrective/canary-000000/code && HF_HUB_OFFLINE=1" in script
-    assert "/workspace/corrective/canary-000000/campaign" in script
-    assert "/workspace/corrective/canary-000000/code/campaign" not in script
+    assert f"cd {remote_dir}/code && HF_HUB_OFFLINE=1" in script
+    assert f"{remote_dir}/campaign" in script
+    assert f"{remote_dir}/code/campaign" not in script
     assert "msgpack-1.1.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" in script
     assert "5e1da8f11a3dd397f0a32c76165cf0c4eb95b31013a94f6ecc0b280c05c91b59" in script
     assert "pyzmq-27.0.1-cp311-cp311-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl" in script
     assert "c512824360ea7490390566ce00bee880e19b526b312b25cc0bc30a0fe95cb67f" in script
-    assert "mkdir -p /workspace/corrective/canary-000000/controller-wire" in script
+    assert f"mkdir -p {remote_dir}/controller-wire" in script
     assert 'assert msgpack.__version__ == "1.1.0"' in script and 'assert zmq.__version__ == "27.0.1"' in script
     assert "zipfile.ZipFile(wheel).extractall(target)" in script and "pip install" not in script
-    assert "PYTHONPATH=/workspace/corrective/canary-000000/controller-wire:/workspace/corrective/canary-000000/code/source/lehome" in script
-    assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/canary-000000/controller-wire:/workspace/corrective/canary-000000/code/source/lehome:/workspace/corrective/canary-000000/code${PYTHONPATH:+:$PYTHONPATH} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
+    assert f"PYTHONPATH={remote_dir}/controller-wire:{remote_dir}/code/source/lehome" in script
+    assert f"HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH={remote_dir}/controller-wire:{remote_dir}/code/source/lehome:{remote_dir}/code${{PYTHONPATH:+:$PYTHONPATH}} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "importlib.util" in script and "isaaclab" in script and "lehome" in script and "import isaaclab_tasks" not in script
     assert "if [ -e /workspace/lehome-release-assets ]" in script
-    assert "if [ -e /workspace/corrective/canary-000000/code ]" in script
+    assert f"if [ -e {remote_dir}/code ]" in script
     assert "hf download lehome/asset_challenge --repo-type dataset --revision" in script
     assert "lfs install --local" in script and "sha256sum /workspace/lehome-release-assets/\"$path\"" in script
     assert "< <(" not in script and "/.git/lehome-lfs-manifest" in script
     assert "add --renormalize -- objects robots scenes textures" in script
     assert "diff --cached --quiet" in script
     assert "lfs ls-files --long" in script and "diff --quiet" in script
-    assert "trap 'rm -f /workspace/corrective/canary-000000/hf.token; unset HF_TOKEN' EXIT" in script
-    scp_sources = [command[-2] for command in calls if command[0] == "scp" and "canary-000000" in command[-2]]
-    assert any(source.endswith("/canary-000000/campaign/.") for source in scp_sources)
-    assert not any(source.endswith("/canary-000000/.") for source in scp_sources)
+    assert f"trap 'rm -f {remote_dir}/hf.token; unset HF_TOKEN' EXIT" in script
+    scp_sources = [command[-2] for command in calls if command[0] == "scp" and remote_dir in command[-2]]
+    assert any(source.endswith("/campaign/.") for source in scp_sources)
+    assert not any(source == f"{remote_dir}/." for source in scp_sources)
 
 
 def test_remote_hf_endpoint_is_approved_and_mirror_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -564,7 +579,7 @@ def test_campaign_sync_failure_returns_one_stable_publishable_abort_root(tmp_pat
     token = tmp_path / "token"; token.write_text("secret")
 
     def runner(command: tuple[str, ...]):
-        if command[0] == "scp" and command[-2].endswith("/canary-000000/campaign/."):
+        if command[0] == "scp" and "/canary-000000-" in command[-2] and command[-2].endswith("/campaign/."):
             return type("Result", (), {"returncode": 1, "stdout": ""})()
         if command[0] == "scp" and command[-2].endswith("/canary.returncode"):
             Path(command[-1]).parent.mkdir(parents=True, exist_ok=True)
@@ -588,7 +603,7 @@ def test_canary_failure_ingests_diagnostic_log_and_redacts_staged_token(tmp_path
     token = tmp_path / "token"; token.write_text("super-secret-token")
 
     def runner(command: tuple[str, ...]):
-        if command[0] == "scp" and command[-2].endswith("/canary-000000/campaign/."):
+        if command[0] == "scp" and "/canary-000000-" in command[-2] and command[-2].endswith("/campaign/."):
             return type("Result", (), {"returncode": 1, "stdout": ""})()
         if command[0] == "scp" and command[-2].endswith("/canary.returncode"):
             Path(command[-1]).parent.mkdir(parents=True, exist_ok=True); Path(command[-1]).write_text("1\n")
@@ -613,7 +628,7 @@ def test_rc0_failed_canary_emits_publishable_non_training_abort(tmp_path: Path) 
     life = tmp_path / "life"; sync = life / "canary-000000-sync"
 
     def runner(command: tuple[str, ...]):
-        if command[0] == "scp" and command[-2].endswith("/canary-000000/campaign/."):
+        if command[0] == "scp" and "/canary-000000-" in command[-2] and command[-2].endswith("/campaign/."):
             _failed_canary_sync(sync, attempt, baseline)
         if command[0] == "scp" and command[-2].endswith("/canary.log"):
             Path(command[-1]).write_text("terminal failure diagnostics\n")
@@ -636,7 +651,7 @@ def test_rc0_canary_without_canonical_raw_returns_publishable_abort(tmp_path: Pa
     life = tmp_path / "life"; sync = life / "canary-000000-sync"
 
     def runner(command: tuple[str, ...]):
-        if command[0] == "scp" and command[-2].endswith("/canary-000000/campaign/."):
+        if command[0] == "scp" and "/canary-000000-" in command[-2] and command[-2].endswith("/campaign/."):
             _write(sync / ".pending" / "attempt-0" / "snapshots" / "reset.json", {"episode_id": "attempt-0"})
         if command[0] == "scp" and command[-2].endswith("/canary.returncode"):
             Path(command[-1]).write_text("0\n")
@@ -745,7 +760,7 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
         _write(sync / "remote-terminal.json", {"schema_version": 1, "kind": "corrective_remote_terminal", "workers": workers})
     def runner(command):
         calls.append(command)
-        if command[0] == "scp" and command[-2].endswith("/wave-000000/campaign/."):
+        if command[0] == "scp" and "/wave-000000-" in command[-2] and command[-2].endswith("/campaign/."):
             materialize_sync()
         return type("Result", (), {"returncode": 0, "stdout": ""})()
     instance = {"kind": "corrective_vast_instance", "instance_id": 9, "host": "host", "port": 22, "wave_index": 0}
@@ -755,7 +770,8 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "git clone --no-checkout" in script and "ryanjin333/lehome-groot-n17-models" in script
     assert "asset_challenge" in script
     assert "if [ -e /workspace/lehome-release-assets ]" in script
-    assert "if [ -e /workspace/corrective/wave-000000/code ]" in script
+    remote_dir = "/workspace/corrective/wave-000000-" + hashlib.sha256(manifest.read_bytes()).hexdigest()[:12]
+    assert f"if [ -e {remote_dir}/code ]" in script
     assert "hf download lehome/asset_challenge --repo-type dataset --revision" in script
     assert "lfs install --local" in script and "sha256sum /workspace/lehome-release-assets/\"$path\"" in script
     assert "< <(" not in script and "/.git/lehome-lfs-manifest" in script
@@ -763,28 +779,28 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "diff --cached --quiet" in script
     assert "lfs ls-files --long" in script and "diff --quiet" in script
     assert LIFECYCLE.APPROVED_GROOT_ROOT in script and "/opt/lehome-challenge/.venv/bin/python" in script
-    assert "/code/source/lehome:/workspace/corrective/wave-000000/code" in script
+    assert f"/code/source/lehome:{remote_dir}/code" in script
     assert "/code/Assets/objects/Challenge_Garment/Release" in script
     assert "/code/code/Assets" not in script
     assert all(f"LEHOME_FLYWHEEL_WORKER_GPU={slot}" in script for slot in range(4))
     assert script.count("LEHOME_FLYWHEEL_IMAGE_IDENTITY=" + LIFECYCLE.APPROVED_IMAGE_DIGEST) >= 5
     assert "image identity preflight" in script
-    assert script.count("cd /workspace/corrective/wave-000000/code && HF_HUB_OFFLINE=1") == 4
-    assert "/workspace/corrective/wave-000000/campaign" in script
-    assert "/workspace/corrective/wave-000000/code/campaign" not in script
+    assert script.count(f"cd {remote_dir}/code && HF_HUB_OFFLINE=1") == 4
+    assert f"{remote_dir}/campaign" in script
+    assert f"{remote_dir}/code/campaign" not in script
     assert "msgpack-1.1.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" in script
     assert "5e1da8f11a3dd397f0a32c76165cf0c4eb95b31013a94f6ecc0b280c05c91b59" in script
     assert "pyzmq-27.0.1-cp311-cp311-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl" in script
     assert "c512824360ea7490390566ce00bee880e19b526b312b25cc0bc30a0fe95cb67f" in script
-    assert "mkdir -p /workspace/corrective/wave-000000/controller-wire" in script
+    assert f"mkdir -p {remote_dir}/controller-wire" in script
     assert 'assert msgpack.__version__ == "1.1.0"' in script and 'assert zmq.__version__ == "27.0.1"' in script
     assert "zipfile.ZipFile(wheel).extractall(target)" in script and "pip install" not in script
-    assert "PYTHONPATH=/workspace/corrective/wave-000000/controller-wire:/workspace/corrective/wave-000000/code/source/lehome" in script
-    assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/wave-000000/controller-wire:/workspace/corrective/wave-000000/code/source/lehome:/workspace/corrective/wave-000000/code${PYTHONPATH:+:$PYTHONPATH} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
+    assert f"PYTHONPATH={remote_dir}/controller-wire:{remote_dir}/code/source/lehome" in script
+    assert f"HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH={remote_dir}/controller-wire:{remote_dir}/code/source/lehome:{remote_dir}/code${{PYTHONPATH:+:$PYTHONPATH}} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "importlib.util" in script and "isaaclab" in script and "lehome" in script and "import isaaclab_tasks" not in script
     assert "Qwen/Qwen3-VL-2B-Instruct" in script and all(digest in script for digest in LIFECYCLE.APPROVED_QWEN_FILES.values())
     assert "unsafe git exclude" in script and "/nvidia/Cosmos-Reason2-2B" in script
     assert "unexpected git exclude content" in script
     assert "status --porcelain --untracked-files=all" in script
-    assert "readlink -f /workspace/corrective/wave-000000/code/nvidia/Cosmos-Reason2-2B" in script
-    assert any(command[0] == "scp" and command[-2].endswith("/wave-000000/campaign/.") for command in calls)
+    assert f"readlink -f {remote_dir}/code/nvidia/Cosmos-Reason2-2B" in script
+    assert any(command[0] == "scp" and "/wave-000000-" in command[-2] and command[-2].endswith("/campaign/.") for command in calls)

@@ -225,6 +225,18 @@ def _write_new(path: Path, value: Mapping[str, object]) -> dict[str, object]:
     return dict(value)
 
 
+_PROVIDER_SNAPSHOT_FIELDS = {
+    "offer": ("id", "is_bid", "gpu_name", "num_gpus", "cpu_cores_effective", "cpu_ram", "driver_version", "dph_total"),
+    "instance": ("id", "actual_status", "is_bid", "gpu_name", "num_gpus", "cpu_cores_effective", "cpu_ram", "driver_version", "dph_total", "ssh_host", "ssh_port"),
+    "volume": ("id", "storage_total_cost"),
+}
+
+
+def _provider_snapshot_row(row: Mapping[str, object], kind: str) -> dict[str, object]:
+    """Persist only the provider facts used by corrective evidence validation."""
+    return {field: row[field] for field in _PROVIDER_SNAPSHOT_FIELDS[kind] if field in row}
+
+
 def capture_offer_evidence(*, offers: Sequence[Mapping[str, object]], instances: Sequence[Mapping[str, object]], output: Path, now_unix: int, ttl_seconds: int, preferred_offer_id: int | None = None, volumes: Sequence[Mapping[str, object]] = (), retained_instance_id: int | None = None, prior_provider_evidence: Mapping[str, object] | None = None, prior_instance_receipt: Mapping[str, object] | None = None) -> dict[str, object]:
     """Bind a live external provider snapshot, without creating an instance."""
     if type(now_unix) is not int or type(ttl_seconds) is not int or ttl_seconds <= 0:
@@ -264,7 +276,12 @@ def capture_offer_evidence(*, offers: Sequence[Mapping[str, object]], instances:
         acceptable.sort(key=lambda offer: (float(offer["dph_total"]), int(offer["id"])))
         offer = next((item for item in acceptable if item["id"] == preferred_offer_id), acceptable[0])
         account_total = existing_spend + hourly(offer)
-    snapshot = {"offers": list(offers), "instances": list(instances), "volumes": list(volumes), "captured_at_unix": now_unix}
+    snapshot = {
+        "offers": [_provider_snapshot_row(row, "offer") for row in offers],
+        "instances": [_provider_snapshot_row(row, "instance") for row in instances],
+        "volumes": [_provider_snapshot_row(row, "volume") for row in volumes],
+        "captured_at_unix": now_unix,
+    }
     source_path = output.with_name(output.stem + "-source.json")
     _write_new(source_path, snapshot)
     evidence = {"schema_version": 1, "kind": "external_provider_offer_evidence", "evidence_id": _canonical_hash(snapshot), "queried_at_unix": now_unix, "expires_at_unix": now_unix + ttl_seconds, "source_snapshot_path": source_path.name, "source_snapshot_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(), "source_response_sha256": _canonical_hash(snapshot), "rental_kind": "on-demand", "instance_hourly_cost_usd": hourly(offer), "account_hourly_total_usd": account_total, "offer_id": offer["id"], "gpu_name": "RTX 3090", "num_gpus": 4}
@@ -459,6 +476,7 @@ def _cleanup_new_instance(instance_id: int, runner: Callable[[tuple[str, ...]], 
 
 def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, object], *, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object], code_bundle: Path, token_file: Path) -> dict[str, object]:
     """Launch four workers from the same image-native Git-bundle boundary as canary."""
+    lifecycle_root.mkdir(parents=True, exist_ok=True)
     manifest = _read_manifest(manifest_path)
     lease_wave = instance_receipt.get("lease_wave_index", instance_receipt.get("wave_index"))
     if instance_receipt.get("kind") != "corrective_vast_instance" or type(lease_wave) is not int or lease_wave < 0 or lease_wave > manifest["wave_index"] or not isinstance(instance_receipt.get("host"), str) or type(instance_receipt.get("port")) is not int:
@@ -470,7 +488,8 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
         raise ValueError("full wave baseline does not match proven image-native runtime")
     image_identity = _approved_image_identity(baseline, context="full wave")
     remote = f"root@{instance_receipt['host']}"; port = str(instance_receipt["port"])
-    remote_dir = f"/workspace/corrective/wave-{manifest['wave_index']:06d}"
+    manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    remote_dir = f"/workspace/corrective/wave-{manifest['wave_index']:06d}-{manifest_hash[:12]}"
     checkout = f"{remote_dir}/code"; output_root = f"{remote_dir}/campaign"
     remote_bundle, remote_token = f"{remote_dir}/code.bundle", f"{remote_dir}/hf.token"
     digest = hashlib.sha256(code_bundle.read_bytes()).hexdigest()
@@ -519,12 +538,12 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
     sync_result = runner(("scp", "-r", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", port, f"{remote}:{output_root}/.", str(sync_root)))
     completed = getattr(result, "returncode", 0)
     if getattr(sync_result, "returncode", 0) not in (0, None) or completed not in (0, None):
-        _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-remote.json", {"schema_version": 1, "kind": "corrective_vast_remote_launch", "wave_index": manifest["wave_index"], "instance_id": instance_receipt["instance_id"], "status": "remote_transport_failure", "transport_returncode": completed, "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(), "bundle_sha256": digest})
+        _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-remote.json", {"schema_version": 1, "kind": "corrective_vast_remote_launch", "wave_index": manifest["wave_index"], "instance_id": instance_receipt["instance_id"], "status": "remote_transport_failure", "transport_returncode": completed, "manifest_sha256": manifest_hash, "bundle_sha256": digest})
         raise RuntimeError("remote launch transport failed; synchronized terminal receipt retained for diagnosis")
     receipt = _validate_remote_terminal(sync_root, {**manifest, "attempts": remote_attempts})
     for attempt in remote_attempts:
         _validate_canary_policy_receipt(sync_root / f"policy-server-receipt-{attempt['attempt_id']}.json", attempt, baseline, attempt["command"])
-    return _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-remote.json", {"schema_version": 1, "kind": "corrective_vast_remote_launch", "wave_index": manifest["wave_index"], "instance_id": instance_receipt["instance_id"], "status": "remote_terminal", "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(), "bundle_sha256": digest, "worker_returncodes": receipt["worker_returncodes"], "remote_terminal_sha256": receipt["remote_terminal_sha256"]})
+    return _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-remote.json", {"schema_version": 1, "kind": "corrective_vast_remote_launch", "wave_index": manifest["wave_index"], "instance_id": instance_receipt["instance_id"], "status": "remote_terminal", "manifest_sha256": manifest_hash, "bundle_sha256": digest, "worker_returncodes": receipt["worker_returncodes"], "remote_terminal_sha256": receipt["remote_terminal_sha256"]})
 
 
 def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, object], *, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object], bundle: Path, token_file: Path | None) -> dict[str, object]:
@@ -533,6 +552,7 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     The token path is validated remotely and never interpolated into commands,
     logs, receipts, or manifests; an unavailable provisioned secret fails closed.
     """
+    lifecycle_root.mkdir(parents=True, exist_ok=True)
     value = _read_json_object(canary_manifest, "canary manifest")
     if value.get("kind") != "corrective_rft_canary" or value.get("episode_count") != 1 or not isinstance(value.get("attempt"), dict):
         raise ValueError("canary manifest must bind exactly one episode")
@@ -562,12 +582,12 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     if not isinstance(policy_revision, str) or not re.fullmatch(r"[0-9a-f]{40}", policy_revision) or not isinstance(policy_digest, str) or _SHA256.fullmatch(policy_digest) is None:
         raise ValueError("canary baseline lacks the immutable private policy revision and digest")
     remote = f"root@{instance_receipt['host']}"; port = str(instance_receipt["port"])
-    remote_dir = f"/workspace/corrective/canary-{value['wave_index']:06d}"
+    manifest_hash = hashlib.sha256(canary_manifest.read_bytes()).hexdigest()
+    remote_dir = f"/workspace/corrective/canary-{value['wave_index']:06d}-{manifest_hash[:12]}"
     remote_bundle = remote_dir + "/code.bundle"
     remote_token = remote_dir + "/hf.token"
     remote_campaign = remote_dir + "/campaign"
     bundle_hash = hashlib.sha256(bundle.read_bytes()).hexdigest()
-    manifest_hash = hashlib.sha256(canary_manifest.read_bytes()).hexdigest()
     stage_result: object | None = None
     try:
         stage_result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "mkdir", "-p", remote_dir))
