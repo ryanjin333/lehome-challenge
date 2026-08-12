@@ -390,6 +390,22 @@ def test_reconciliation_requires_one_exact_label_match_and_endpoint_is_exact_id_
     assert (endpoint.instance_id, endpoint.host, endpoint.port) == ("222", "203.0.113.9", 2222)
 
 
+def test_endpoint_prefers_vast_direct_ssh_mapping_over_proxy(tmp_path: Path) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+    runner.instances = [{
+        "id": 223,
+        "public_ipaddr": "203.0.113.10",
+        "ports": {"22/tcp": [{"HostIp": "0.0.0.0", "HostPort": "13948"}]},
+        "ssh_host": "ssh6.vast.ai",
+        "ssh_port": 16274,
+        "ssh_user": "root",
+    }]
+
+    endpoint = client.endpoint("223", timeout_seconds=30)
+
+    assert (endpoint.host, endpoint.port) == ("203.0.113.10", 13948)
+
+
 def test_ssh_requires_private_identity_and_uses_strict_campaign_known_hosts(tmp_path: Path) -> None:
     runner = VastRunner(); client = _client(tmp_path, runner)
     identity = tmp_path / "id"; identity.write_text("private", encoding="utf-8"); identity.chmod(0o600)

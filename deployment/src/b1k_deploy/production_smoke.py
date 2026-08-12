@@ -596,8 +596,25 @@ class VastCliSmokeClient:
         if len(matches) != 1:
             raise ProductionSmokeError("exact Vast instance readback is missing or ambiguous")
         row = matches[0]
-        host = row.get("ssh_host") or row.get("public_ipaddr") or row.get("public_ip")
-        port = row.get("ssh_port") or row.get("port")
+        direct_ports = row.get("ports")
+        ssh_mappings = direct_ports.get("22/tcp") if isinstance(direct_ports, Mapping) else None
+        direct_port: int | None = None
+        if isinstance(ssh_mappings, list):
+            for mapping in ssh_mappings:
+                if isinstance(mapping, Mapping):
+                    value = mapping.get("HostPort")
+                    if isinstance(value, str) and value.isdigit():
+                        direct_port = int(value)
+                        break
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        direct_port = value
+                        break
+        direct_host = row.get("public_ipaddr") or row.get("public_ip")
+        if isinstance(direct_host, str) and direct_port is not None:
+            host, port = direct_host, direct_port
+        else:
+            host = row.get("ssh_host") or direct_host
+            port = row.get("ssh_port") or row.get("port")
         username = row.get("ssh_user") or "root"
         if not isinstance(host, str) or not _HOST_RE.fullmatch(host) or not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535 or username != "root":
             raise ProductionSmokeError("exact Vast instance readback lacks a safe SSH endpoint")
