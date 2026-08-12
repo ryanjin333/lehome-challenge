@@ -198,6 +198,24 @@ def test_rollout_requires_current_run_typed_eula_warp_and_both_runtime_fixture_r
     assert vast.destroyed == ["9123456"]
 
 
+def test_rollout_accepts_one_executed_nonterminal_evaluator_step(tmp_path):
+    remote = FakeRemote()
+    candidate = plan("rollout-smoke")
+    remote.rollout_factory = lambda run_id: replace(
+        rollout_evidence(candidate, run_id), evaluator_outcome="advanced"
+    )
+    smoke, _ledger, vast = controller(tmp_path, remote)
+
+    receipt = smoke.run(candidate)
+
+    assert receipt.states[-3:] == (
+        SmokeState.READBACK_VERIFIED,
+        SmokeState.DESTROYED,
+        SmokeState.DISAPPEARANCE_VERIFIED,
+    )
+    assert vast.destroyed == ["9123456"]
+
+
 def test_prerent_readiness_receipt_cannot_be_substituted_for_a_runtime_artifact_receipt(tmp_path):
     remote = FakeRemote()
     candidate = plan()
