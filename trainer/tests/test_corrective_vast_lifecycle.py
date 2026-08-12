@@ -37,7 +37,7 @@ def _canary_instance() -> dict[str, object]:
 def _manifest(tmp_path: Path) -> Path:
     path = tmp_path / "wave.json"
     baseline = {
-        "rollout_image": "ghcr.io/ryanjin333/lehome-rollout@" + LIFECYCLE.APPROVED_IMAGE_DIGEST, "image_identity": LIFECYCLE.APPROVED_IMAGE_DIGEST,
+        "rollout_image": LIFECYCLE.APPROVED_IMAGE_REPOSITORY + "@" + LIFECYCLE.APPROVED_IMAGE_DIGEST, "image_identity": LIFECYCLE.APPROVED_IMAGE_DIGEST,
         "policy_path": "/local/policy", "policy_revision_file": "/local/revision.json",
         "release_assets_root": "/local/assets", "groot_root": "/local/groot",
         "groot_python": "/local/groot/python", "controller_python": "/local/isaac/python",
@@ -410,7 +410,7 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     import hashlib
     campaign = tmp_path / "campaign"
     baseline = {
-        "rollout_image": "ghcr.io/ryanjin333/lehome-rollout@" + LIFECYCLE.APPROVED_IMAGE_DIGEST,
+        "rollout_image": LIFECYCLE.APPROVED_IMAGE_REPOSITORY + "@" + LIFECYCLE.APPROVED_IMAGE_DIGEST,
         "image_identity": LIFECYCLE.APPROVED_IMAGE_DIGEST, "controller_python": "/opt/lehome-challenge/.venv/bin/python",
         "groot_root": LIFECYCLE.APPROVED_GROOT_ROOT, "groot_revision": LIFECYCLE.APPROVED_GROOT_REVISION,
         "groot_python": LIFECYCLE.APPROVED_GROOT_PYTHON, "code_revision": "c" * 40,

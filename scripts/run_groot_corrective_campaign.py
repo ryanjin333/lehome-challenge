@@ -34,7 +34,8 @@ from lehome_train.flywheel.corrective import (
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-APPROVED_IMAGE_DIGEST = "sha256:25870f001eb0ab356222dbfd15352c42666f566adb41732bcdfd7a12d104f50d"
+APPROVED_IMAGE_REPOSITORY = "docker.io/ryanjin333/lehome-rollout"
+APPROVED_IMAGE_DIGEST = "sha256:293c4f258f3742a7234699d706fb7088d0da8a764957bc79b244d830561abc12"
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _CATEGORIES = tuple(CATEGORY_PREFIX)
 _BASELINE_KEYS = frozenset({
@@ -96,7 +97,7 @@ def _baseline(path: Path) -> dict[str, object]:
     if not _SHA256.fullmatch(str(baseline["image_identity"])[7:]) or not str(baseline["image_identity"]).startswith("sha256:"):
         raise ValueError("corrective baseline image identity is invalid")
     rollout_repository, separator, rollout_digest = str(baseline["rollout_image"]).partition("@")
-    if rollout_repository != "ghcr.io/ryanjin333/lehome-rollout" or separator != "@" or rollout_digest != APPROVED_IMAGE_DIGEST:
+    if rollout_repository != APPROVED_IMAGE_REPOSITORY or separator != "@" or rollout_digest != APPROVED_IMAGE_DIGEST:
         raise ValueError("corrective baseline rollout image must be a pinned approved repository digest")
     if rollout_digest != baseline["image_identity"]:
         raise ValueError("corrective rollout image digest must equal the OCI image identity")

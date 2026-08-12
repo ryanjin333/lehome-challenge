@@ -35,7 +35,7 @@ def _hash(value: object) -> str:
 
 
 def _baseline() -> dict[str, object]:
-    return {"schema_version": 1, "kind": "corrective_rft_baseline", "parent_checkpoint_repository": APPROVED_PARENT_REPOSITORY, "parent_checkpoint_revision": APPROVED_PARENT_REVISION, "parent_checkpoint_artifact_sha256": APPROVED_PARENT_ARTIFACT_SHA256, "parent_checkpoint_step": 12000, "code_revision": "c" * 40, "asset_revision": "a" * 40, "image_identity": CAMPAIGN.APPROVED_IMAGE_DIGEST, "rollout_image": "ghcr.io/ryanjin333/lehome-rollout@" + CAMPAIGN.APPROVED_IMAGE_DIGEST, "controller_python": "/isaac/python", "simulator_version": "5.1.0.0", "policy_path": "/model/step-12000", "policy_revision_file": "/model/revision", "release_assets_root": "/assets", "groot_root": "/groot", "groot_revision": "b" * 40, "groot_python": "/venv/bin/python"}
+    return {"schema_version": 1, "kind": "corrective_rft_baseline", "parent_checkpoint_repository": APPROVED_PARENT_REPOSITORY, "parent_checkpoint_revision": APPROVED_PARENT_REVISION, "parent_checkpoint_artifact_sha256": APPROVED_PARENT_ARTIFACT_SHA256, "parent_checkpoint_step": 12000, "code_revision": "c" * 40, "asset_revision": "a" * 40, "image_identity": CAMPAIGN.APPROVED_IMAGE_DIGEST, "rollout_image": CAMPAIGN.APPROVED_IMAGE_REPOSITORY + "@" + CAMPAIGN.APPROVED_IMAGE_DIGEST, "controller_python": "/isaac/python", "simulator_version": "5.1.0.0", "policy_path": "/model/step-12000", "policy_revision_file": "/model/revision", "release_assets_root": "/assets", "groot_root": "/groot", "groot_revision": "b" * 40, "groot_python": "/venv/bin/python"}
 
 
 def _provider(*, evidence_id: str = "evidence-1", expiry: int = 2_000_000_000, cost: float = 1.75) -> dict[str, object]:
