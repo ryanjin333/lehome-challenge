@@ -20,6 +20,7 @@ import tarfile
 import shutil
 import time
 import shlex
+import uuid
 from typing import Callable, Mapping, Sequence
 
 
@@ -31,8 +32,12 @@ APPROVED_IMAGE_REPOSITORY = "docker.io/ryanjin333/lehome-rollout"
 APPROVED_IMAGE_DIGEST = "sha256:293c4f258f3742a7234699d706fb7088d0da8a764957bc79b244d830561abc12"
 APPROVED_GROOT_ROOT = "/opt/isaac-groot"
 APPROVED_GROOT_REVISION = "23ace64f17aa5015259b8609d371eb61a357c776"
+# The image's historic /opt/gr00t-runtime/bin/python is a broken build-time
+# symlink.  Recreate this immutable wrapper at the receipt-bound path instead.
 APPROVED_GROOT_PYTHON = "/opt/gr00t-runtime/bin/python-validated-wrapper"
-APPROVED_GROOT_PYTHON_SHA256 = "98ed80358003be983ba91d215c02e7436b26050e02922b5f4917c3fec4d8e72d"
+APPROVED_GROOT_NATIVE_PYTHON = "/opt/python/cpython-3.10.18-linux-x86_64-gnu/bin/python3.10"
+APPROVED_GROOT_NATIVE_PYTHON_SHA256 = "ee22b22d759f77275c82503976968bc3193f577a4a039d0540bdb95e1b54bf1e"
+APPROVED_GROOT_PYTHON_SHA256 = "760c0ad783861ad329821442e0d1385bd915d1bdaef87646c331bbf035d3c389"
 APPROVED_ASSET_REVISION = "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9"
 # Vast's offer filter takes memory in GiB, whereas the raw offer/readback
 # payload reports ``cpu_ram`` in MiB.  Keep those units explicit at the edge.
@@ -42,6 +47,20 @@ VAST_SSH_IDENTITY = os.environ.get("LEHOME_VAST_SSH_IDENTITY", str(Path.home() /
 
 def _canonical_hash(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _groot_wrapper_setup() -> list[str]:
+    """Materialize the exact receipt-bound wrapper around the native interpreter."""
+    wrapper = "#!/bin/sh\nPYTHONPATH=/opt/gr00t-runtime/lib/python3.10/site-packages:/opt/isaac-groot${PYTHONPATH:+:$PYTHONPATH}\nexport PYTHONPATH\nexec /opt/python/cpython-3.10.18-linux-x86_64-gnu/bin/python3.10 \"$@\"\n"
+    return [
+        "test -x " + shlex.quote(APPROVED_GROOT_NATIVE_PYTHON),
+        "test \"$(sha256sum " + shlex.quote(APPROVED_GROOT_NATIVE_PYTHON) + " | cut -d' ' -f1)\" = " + shlex.quote(APPROVED_GROOT_NATIVE_PYTHON_SHA256),
+        "mkdir -p " + shlex.quote(str(Path(APPROVED_GROOT_PYTHON).parent)),
+        "printf '%s' " + shlex.quote(wrapper) + " > " + shlex.quote(APPROVED_GROOT_PYTHON),
+        "chmod 755 " + shlex.quote(APPROVED_GROOT_PYTHON),
+        "test \"$(sha256sum " + shlex.quote(APPROVED_GROOT_PYTHON) + " | cut -d' ' -f1)\" = " + shlex.quote(APPROVED_GROOT_PYTHON_SHA256),
+        shlex.quote(APPROVED_GROOT_PYTHON) + " -c " + shlex.quote("import groot; assert groot.__file__.startswith('/opt/isaac-groot')"),
+    ]
 
 
 def _write_new(path: Path, value: Mapping[str, object]) -> dict[str, object]:
@@ -214,7 +233,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
         {**attempt, "command": _remote_command(attempt["command"], baseline, mapping, checkout, local_output_root)}
         for attempt in manifest["attempts"]
     ]
-    setup = ["set -eu", "test -x /opt/lehome-challenge/.venv/bin/python", "test -x " + shlex.quote(APPROVED_GROOT_PYTHON), "test \"$(git -C " + shlex.quote(APPROVED_GROOT_ROOT) + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_GROOT_REVISION), "test \"$(sha256sum " + shlex.quote(APPROVED_GROOT_PYTHON) + " | cut -d' ' -f1)\" = " + shlex.quote(APPROVED_GROOT_PYTHON_SHA256), "chmod 600 " + shlex.quote(remote_token), "export HF_TOKEN=\"$(cat " + shlex.quote(remote_token) + ")\"", "git clone --no-checkout " + shlex.quote(remote_bundle) + " " + shlex.quote(checkout), "git -C " + shlex.quote(checkout) + " checkout --detach " + shlex.quote(str(baseline["code_revision"])), "git -C " + shlex.quote(checkout) + " diff --quiet", "/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root), "printf '%s\\n' " + shlex.quote(policy_revision) + " > " + shlex.quote(policy_root + "/revision.txt"), "PYTHONPATH=" + shlex.quote(checkout) + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; assert policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "'")]
+    setup = ["set -eu", "test -x /opt/lehome-challenge/.venv/bin/python", *_groot_wrapper_setup(), "test \"$(git -C " + shlex.quote(APPROVED_GROOT_ROOT) + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_GROOT_REVISION), "chmod 600 " + shlex.quote(remote_token), "export HF_TOKEN=\"$(cat " + shlex.quote(remote_token) + ")\"", "git clone --no-checkout " + shlex.quote(remote_bundle) + " " + shlex.quote(checkout), "git -C " + shlex.quote(checkout) + " checkout --detach " + shlex.quote(str(baseline["code_revision"])), "git -C " + shlex.quote(checkout) + " diff --quiet", "/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root), "printf '%s\\n' " + shlex.quote(policy_revision) + " > " + shlex.quote(policy_root + "/revision.txt"), "PYTHONPATH=" + shlex.quote(checkout) + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; assert policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "'")]
     setup.extend(_asset_checkout_setup(checkout))
     script_lines = ["set -eu", "trap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT", *setup[1:], f"mkdir -p {shlex.quote(output_root)}", f"cd {shlex.quote(checkout)}", "pids='' "]
     for attempt in remote_attempts:
@@ -296,10 +315,8 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     mapping = {"policy_path": "image:" + policy_path, "policy_revision_file": "image:" + policy_root + "/revision.txt", "release_assets_root": "code/Assets/objects/Challenge_Garment/Release", "groot_root": "image:" + APPROVED_GROOT_ROOT, "groot_python": "image:" + APPROVED_GROOT_PYTHON, "controller_python": "image:/opt/lehome-challenge/.venv/bin/python", "output_root": "campaign", "trial_script": "scripts/run_groot_flywheel_trial.py"}
     rewritten = _remote_command(attempt["command"], baseline, mapping, remote_dir + "/code", local_output)
     runtime = [
-        "test -x " + shlex.quote(APPROVED_GROOT_PYTHON),
+        *_groot_wrapper_setup(),
         "test \"$(git -C " + shlex.quote(APPROVED_GROOT_ROOT) + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_GROOT_REVISION),
-        "test \"$(sha256sum " + shlex.quote(APPROVED_GROOT_PYTHON) + " | cut -d' ' -f1)\" = " + shlex.quote(APPROVED_GROOT_PYTHON_SHA256),
-        shlex.quote(APPROVED_GROOT_PYTHON) + " -c " + shlex.quote("import groot; assert groot.__file__.startswith('/opt/isaac-groot')"),
         "test \"$(sha256sum " + shlex.quote(remote_bundle) + " | cut -d' ' -f1)\" = " + shlex.quote(bundle_hash),
         "chmod 600 " + shlex.quote(remote_token),
         "export HF_TOKEN=\"$(cat " + shlex.quote(remote_token) + ")\"",
@@ -362,12 +379,13 @@ def _asset_checkout_setup(checkout: str) -> list[str]:
 
 
 def _write_early_abort(root: Path, wave_index: int, attempt_id: str, instance_id: int, reason: str, *, canary_manifest_sha256: str, staged_bundle_sha256: str, transport_returncode: object) -> dict[str, object]:
-    evidence = root / f"canary-{wave_index:06d}-early-abort"
+    retry = uuid.uuid4().hex
+    evidence = root / f"canary-{wave_index:06d}-early-abort-{retry}"
     _write_new(evidence / "setup.json", {"schema_version": 1, "kind": "corrective_canary_setup_abort", "attempt_id": attempt_id, "instance_id": instance_id, "reason": reason, "transport_returncode": transport_returncode})
     _write_new(evidence / "transport.json", {"schema_version": 1, "transport_returncode": transport_returncode, "phase": "staging"})
     _write_new(evidence / "canary.returncode", {"status": "unavailable", "reason": "remote command was not started"})
     evidence_hash = _evidence_root_sha256(evidence)
-    return _write_new(root / f"canary-{wave_index:06d}-abort.json", {"schema_version": 1, "kind": "corrective_canary_abort", "attempt_id": attempt_id, "instance_id": instance_id, "canary_manifest_sha256": canary_manifest_sha256, "staged_bundle_sha256": staged_bundle_sha256, "transport_returncode": transport_returncode, "non_training_admitted": False, "early_setup_failure": True, "abort_evidence_root": str(evidence), "synced_evidence_root": str(evidence), "synced_evidence_sha256": evidence_hash, "abort_evidence_sha256": evidence_hash})
+    return _write_new(root / f"canary-{wave_index:06d}-abort-{retry}.json", {"schema_version": 1, "kind": "corrective_canary_abort", "attempt_id": attempt_id, "instance_id": instance_id, "canary_manifest_sha256": canary_manifest_sha256, "staged_bundle_sha256": staged_bundle_sha256, "transport_returncode": transport_returncode, "non_training_admitted": False, "early_setup_failure": True, "retry_id": retry, "abort_evidence_root": str(evidence), "synced_evidence_root": str(evidence), "synced_evidence_sha256": evidence_hash, "abort_evidence_sha256": evidence_hash})
 
 
 def _copy_regular_tree(source: Path, destination: Path) -> None:
@@ -391,7 +409,8 @@ def _evidence_root_sha256(root: Path) -> str:
 
 
 def _write_remote_abort(root: Path, wave_index: int, *, attempt_id: str, base_receipt: Mapping[str, object], sync_root: Path, returncode_copy: Path, setup: str, sync_returncode: object, returncode_sync_returncode: object) -> dict[str, object]:
-    evidence = root / f"canary-{wave_index:06d}-abort-evidence"
+    retry = uuid.uuid4().hex
+    evidence = root / f"canary-{wave_index:06d}-abort-evidence-{retry}"
     _write_new(evidence / "setup.json", {"schema_version": 1, "kind": "corrective_canary_setup_abort", "attempt_id": attempt_id, "reason": setup})
     _write_new(evidence / "transport.json", {"schema_version": 1, "transport_returncode": base_receipt["transport_returncode"], "campaign_sync_returncode": sync_returncode, "returncode_sync_returncode": returncode_sync_returncode})
     if returncode_copy.is_file() and not returncode_copy.is_symlink():
@@ -400,7 +419,7 @@ def _write_remote_abort(root: Path, wave_index: int, *, attempt_id: str, base_re
         _write_new(evidence / "canary.returncode", {"status": "unavailable", "reason": "returncode synchronization failed"})
     _copy_regular_tree(sync_root, evidence / "campaign")
     evidence_hash = _evidence_root_sha256(evidence)
-    return _write_new(root / f"canary-{wave_index:06d}-abort.json", {**base_receipt, "kind": "corrective_canary_abort", "non_training_admitted": False, "sync_returncode": sync_returncode, "returncode_sync_returncode": returncode_sync_returncode, "abort_evidence_root": str(evidence), "synced_evidence_root": str(evidence), "synced_evidence_sha256": evidence_hash})
+    return _write_new(root / f"canary-{wave_index:06d}-abort-{retry}.json", {**base_receipt, "kind": "corrective_canary_abort", "non_training_admitted": False, "retry_id": retry, "sync_returncode": sync_returncode, "returncode_sync_returncode": returncode_sync_returncode, "abort_evidence_root": str(evidence), "synced_evidence_root": str(evidence), "synced_evidence_sha256": evidence_hash})
 
 
 def _materialize_canary_attempt_receipt(canary_manifest: Path, sync_root: Path, output: Path) -> dict[str, object]:
