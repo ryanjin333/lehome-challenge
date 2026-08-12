@@ -36,6 +36,9 @@ def _canary_instance() -> dict[str, object]:
 
 def test_qwen_checkout_link_exclusion_allows_only_the_known_recoverable_link() -> None:
     commands = "\n".join(LIFECYCLE._qwen_base_setup("/workspace/checkouts/reviewed"))
+    download = LIFECYCLE._qwen_base_setup("/workspace/checkouts/reviewed")[0]
+    assert download.count(" --include ") == 1
+    assert "--include model.safetensors config.json preprocessor_config.json tokenizer.json --local-dir" in download
     assert "checkout has unexpected changes" in commands
     assert "unexpected git exclude content" in commands
     assert "exclude.parent.is_symlink()" in commands

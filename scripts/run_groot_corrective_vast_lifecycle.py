@@ -121,7 +121,7 @@ def _qwen_base_setup(checkout: str) -> list[str]:
     download = _hf_download(
         "/opt/lehome-challenge/.venv/bin/hf download " + APPROVED_QWEN_REPOSITORY
         + " --revision " + shlex.quote(APPROVED_QWEN_REVISION)
-        + " --include 'model.safetensors' --include 'config.json' --include 'preprocessor_config.json' --include 'tokenizer.json' --local-dir "
+        + " --include model.safetensors config.json preprocessor_config.json tokenizer.json --local-dir "
         + shlex.quote(APPROVED_QWEN_ROOT)
     )
     checks = [
