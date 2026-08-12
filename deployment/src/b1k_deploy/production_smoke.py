@@ -883,6 +883,7 @@ class SshSmokeRemote:
             "OMNI_KIT_ACCEPT_EULA=YES",
             "OMNIGIBSON_DATA_PATH=/workspace/omnigibson-data",
             "OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson",
+            "OMNIGIBSON_HEADLESS=1",
             "HEADLESS=1",
             "NVIDIA_VISIBLE_DEVICES=all",
             "NVIDIA_DRIVER_CAPABILITIES=all",

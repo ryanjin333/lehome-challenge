@@ -194,6 +194,7 @@ def test_subprocess_launcher_keeps_required_simulator_runtime_environment_but_st
     monkeypatch.setenv("OMNI_KIT_ACCEPT_EULA", "YES")
     monkeypatch.setenv("OMNIGIBSON_DATA_PATH", str(data_path))
     monkeypatch.setenv("OMNIGIBSON_APPDATA_PATH", "/workspace/campaign/.cache/omnigibson")
+    monkeypatch.setenv("OMNIGIBSON_HEADLESS", "1")
     monkeypatch.setenv("NUMBA_CACHE_DIR", "/workspace/campaign/.cache/numba")
     monkeypatch.setenv("TRITON_CACHE_DIR", "/workspace/campaign/.cache/triton")
     monkeypatch.setenv("WARP_CACHE_PATH", "/workspace/campaign/.cache/warp")
@@ -217,6 +218,7 @@ def test_subprocess_launcher_keeps_required_simulator_runtime_environment_but_st
     assert child_environment["OMNI_KIT_ACCEPT_EULA"] == "YES"
     assert child_environment["OMNIGIBSON_DATA_PATH"] == str(data_path)
     assert child_environment["OMNIGIBSON_APPDATA_PATH"] == "/workspace/campaign/.cache/omnigibson"
+    assert child_environment["OMNIGIBSON_HEADLESS"] == "1"
     assert child_environment["NUMBA_CACHE_DIR"] == "/workspace/campaign/.cache/numba"
     assert child_environment["TRITON_CACHE_DIR"] == "/workspace/campaign/.cache/triton"
     assert child_environment["WARP_CACHE_PATH"] == "/workspace/campaign/.cache/warp"

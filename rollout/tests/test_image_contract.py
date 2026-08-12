@@ -26,7 +26,7 @@ def test_rollout_image_is_pinned_headless_and_secret_free() -> None:
     assert "OMNIGIBSON_DATA_PATH=/workspace/omnigibson-data" in dockerfile
     assert "OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson" in dockerfile
     assert "WARP_CACHE_PATH=/workspace/campaign/.cache/warp" in dockerfile
-    assert "HEADLESS=1" in dockerfile
+    assert "OMNIGIBSON_HEADLESS=1" in dockerfile
     assert "HEALTHCHECK" in dockerfile and "/opt/conda/envs/behavior/bin/python -m b1k_rollout.cli healthcheck" in dockerfile
     assert "--start-period=45m" in dockerfile
     assert "USER rollout" not in dockerfile
@@ -119,6 +119,7 @@ def test_image_verifier_accepts_only_immutable_rollout_digests() -> None:
     assert "B1K_HF_TOKEN_FILE=/workspace/.cache/huggingface/token" in verifier
     assert "/opt/conda/envs/behavior/bin/python -m b1k_rollout.cli" in verifier
     assert 'test "$OMNIGIBSON_APPDATA_PATH" = /workspace/campaign/.cache/omnigibson' in verifier
+    assert 'test "$OMNIGIBSON_HEADLESS" = 1' in verifier
     assert 'test "$WARP_CACHE_PATH" = /workspace/campaign/.cache/warp' in verifier
 
 

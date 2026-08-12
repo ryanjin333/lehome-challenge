@@ -23,6 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     OMNIGIBSON_DATA_PATH=/workspace/omnigibson-data \
     OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson \
     WARP_CACHE_PATH=/workspace/campaign/.cache/warp \
+    OMNIGIBSON_HEADLESS=1 \
     HEADLESS=1 \
     HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
     HF_HOME=/workspace/.cache/huggingface \

@@ -627,7 +627,7 @@ def test_runtime_transport_uses_only_role_specific_sanitized_environment(
     assert "OMNI_KIT_ACCEPT_EULA=YES" in rollout
     assert "OMNIGIBSON_DATA_PATH=/workspace/omnigibson-data" in rollout
     assert "OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson" in rollout
-    assert "HEADLESS=1" in rollout
+    assert "OMNIGIBSON_HEADLESS=1" in rollout
     assert "NVIDIA_VISIBLE_DEVICES=all" in rollout
     assert "NVIDIA_DRIVER_CAPABILITIES=all" in rollout
     assert "VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json" in rollout
