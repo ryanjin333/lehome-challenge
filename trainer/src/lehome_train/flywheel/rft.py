@@ -17,6 +17,11 @@ from lehome_train.data.convert import LEGACY_DATA_PATH, LEGACY_VIDEO_PATH, _moda
 from lehome_train.data.inspect import artifact_identities
 from lehome_train.data.mapping import FIXED_INSTRUCTION, JOINT_NAMES
 from lehome_train.data.split import split_episode_ids
+from lehome_train.flywheel.corrective import (
+    CorrectiveSelectionBundle,
+    TARGET_UNIQUE_SUCCESSES,
+    verify_corrective_selection_bundle,
+)
 from lehome_train.flywheel.materialize import (
     CAMERA_KEYS,
     RFT_ACTION_HORIZON,
@@ -85,6 +90,56 @@ def _require_identity(
         raise ValueError("RFT release ID must be a SHA-256")
 
 
+def materialize_verified_corrective_rft_snapshot(
+    bundle: CorrectiveSelectionBundle,
+    destination: str | Path,
+    *,
+    source_repository: str,
+    source_revision: str,
+    release_id: str,
+    split_seed: int,
+    validation_fraction: float,
+) -> dict[str, object]:
+    """Materialize exactly the pre-bound 150 corrective artifacts before hashing."""
+    bound = verify_corrective_selection_bundle(bundle)
+    if len(bound) != TARGET_UNIQUE_SUCCESSES:
+        raise ValueError("corrective materialization requires exactly 150 selected artifacts")
+    campaign_receipt = bundle.campaign_receipt
+    roots = tuple(Path(item.root) for item in bound)
+    for binding, root in zip(bound, roots, strict=True):
+        raw = _verify_raw(root)
+        if raw.get("episode_id") != binding.episode_id:
+            raise ValueError("corrective bound episode identity is stale")
+        identity = raw.get("identity")
+        if not isinstance(identity, Mapping) or identity.get("release_stage") != "seen":
+            raise ValueError("corrective bound episode is not seen-only")
+        actual_manifest = __import__("hashlib").sha256((root / "SHA256SUMS.json").read_bytes()).hexdigest()
+        if actual_manifest != binding.episode_manifest_sha256:
+            raise ValueError("corrective bound episode manifest is stale or mismatched")
+    corrective_metadata = {
+        "admission_required": True,
+        "campaign_receipt_sha256": campaign_receipt["receipt_sha256"],
+        "attempt_count": campaign_receipt["attempt_count"],
+        "selected_bindings": [
+            {"attempt_id": item.attempt_id, "episode_id": item.episode_id, "episode_manifest_sha256": item.episode_manifest_sha256}
+            for item in bound
+        ],
+    }
+    result = materialize_rft_snapshot(
+        roots,
+        destination,
+        source_repository=source_repository,
+        source_revision=source_revision,
+        release_id=release_id,
+        split_seed=split_seed,
+        validation_fraction=validation_fraction,
+        corrective_campaign=corrective_metadata,
+    )
+    if result.get("episode_count") != TARGET_UNIQUE_SUCCESSES:
+        raise ValueError("corrective materialization did not produce exactly 150 episodes")
+    return {**result, "corrective_campaign": corrective_metadata}
+
+
 def materialize_rft_snapshot(
     raw_episode_roots: Iterable[str | Path],
     destination: str | Path,
@@ -94,6 +149,7 @@ def materialize_rft_snapshot(
     release_id: str,
     split_seed: int,
     validation_fraction: float,
+    corrective_campaign: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Select seen autonomous successes and build one efficient 40-step dataset."""
 
@@ -234,7 +290,7 @@ def materialize_rft_snapshot(
         ))
         _write_lines(meta / "tasks.jsonl", [{"task_index": 0, "task": FIXED_INSTRUCTION}])
         atomic_write_json(meta / "modality.json", _modality_metadata())
-        atomic_write_json(meta / "rft-selection.json", {
+        selection_metadata: dict[str, object] = {
             "schema_version": 1,
             "source_repository": source_repository,
             "source_revision": source_revision,
@@ -243,7 +299,10 @@ def materialize_rft_snapshot(
             "excluded_public_unseen": excluded_public_unseen,
             "excluded_failed": excluded_failed,
             "episodes": selected,
-        })
+        }
+        if corrective_campaign is not None:
+            selection_metadata["corrective_campaign"] = dict(corrective_campaign)
+        atomic_write_json(meta / "rft-selection.json", selection_metadata)
         output_artifacts = artifact_identities(temporary)
         manifest: dict[str, object] = {
             "schema_version": 1,

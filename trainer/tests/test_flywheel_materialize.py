@@ -44,6 +44,7 @@ def _raw_rft_episode(
     terminal_reason: str = "success",
     frames: int = 45,
     production_schema: bool = True,
+    category: str = "top_long",
 ) -> Path:
     writer = EpisodeArtifactWriter(root, episode_id)
     for index in range(frames):
@@ -70,6 +71,7 @@ def _raw_rft_episode(
             "simulator_device": "cpu",
         },
         "identity": {
+            "category": category,
             "release_stage": "public_unseen" if holdout else "seen",
             "instruction": "fold the garment on the table",
             "policy_revision": "a" * 40,
