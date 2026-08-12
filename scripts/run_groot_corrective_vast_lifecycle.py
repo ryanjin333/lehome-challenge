@@ -211,7 +211,8 @@ def _cleanup_new_instance(instance_id: int, runner: Callable[[tuple[str, ...]], 
 def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, object], *, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object], code_bundle: Path, token_file: Path) -> dict[str, object]:
     """Launch four workers from the same image-native Git-bundle boundary as canary."""
     manifest = _read_manifest(manifest_path)
-    if instance_receipt.get("kind") != "corrective_vast_instance" or instance_receipt.get("wave_index") != manifest["wave_index"] or not isinstance(instance_receipt.get("host"), str) or type(instance_receipt.get("port")) is not int:
+    lease_wave = instance_receipt.get("lease_wave_index", instance_receipt.get("wave_index"))
+    if instance_receipt.get("kind") != "corrective_vast_instance" or type(lease_wave) is not int or lease_wave < 0 or lease_wave > manifest["wave_index"] or not isinstance(instance_receipt.get("host"), str) or type(instance_receipt.get("port")) is not int:
         raise ValueError("instance lifecycle receipt is not bound to corrective wave")
     if code_bundle.is_symlink() or not code_bundle.is_file() or token_file.is_symlink() or not token_file.is_file():
         raise ValueError("full wave requires a code Git bundle and securely provisioned token file")
@@ -233,10 +234,18 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
     policy_root = "/workspace/checkpoints/lehome-groot-n17-models-" + policy_revision
     policy_path = policy_root + "/policies/step-12000"
     mapping = {"policy_path": "image:" + policy_path, "policy_revision_file": "image:" + policy_root + "/revision.txt", "release_assets_root": "Assets/objects/Challenge_Garment/Release", "groot_root": "image:" + APPROVED_GROOT_ROOT, "groot_python": "image:" + APPROVED_GROOT_PYTHON, "controller_python": "image:/opt/lehome-challenge/.venv/bin/python", "output_root": "campaign", "trial_script": "scripts/run_groot_flywheel_trial.py"}
+    campaign_root = manifest_path.parent.parent if manifest_path.parent.name == "waves" else manifest_path.parent
+    terminal_attempt_ids = {
+        str(item["attempt_id"])
+        for item in manifest["attempts"]
+        if (campaign_root / "raw" / str(item["attempt_id"]) / "SHA256SUMS.json").is_file()
+    }
     remote_attempts = [
         {**attempt, "command": _remote_command(attempt["command"], baseline, mapping, checkout, local_output_root)}
-        for attempt in manifest["attempts"]
+        for attempt in manifest["attempts"] if str(attempt["attempt_id"]) not in terminal_attempt_ids
     ]
+    if not remote_attempts:
+        raise ValueError("corrective wave has no unverified attempts to launch")
     controller_pythonpath = checkout + "/source/lehome:" + checkout
     revision = str(baseline["code_revision"])
     checkout_setup = "if [ -e " + shlex.quote(checkout) + " ]; then test -d " + shlex.quote(checkout + "/.git") + " && test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision) + " && git -C " + shlex.quote(checkout) + " diff --quiet; else git clone --no-checkout " + shlex.quote(remote_bundle) + " " + shlex.quote(checkout) + " && git -C " + shlex.quote(checkout) + " checkout --detach " + shlex.quote(revision) + "; fi"
@@ -260,7 +269,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
     if getattr(sync_result, "returncode", 0) not in (0, None) or completed not in (0, None):
         _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-remote.json", {"schema_version": 1, "kind": "corrective_vast_remote_launch", "wave_index": manifest["wave_index"], "instance_id": instance_receipt["instance_id"], "status": "remote_transport_failure", "transport_returncode": completed, "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(), "bundle_sha256": digest})
         raise RuntimeError("remote launch transport failed; synchronized terminal receipt retained for diagnosis")
-    receipt = _validate_remote_terminal(sync_root, manifest)
+    receipt = _validate_remote_terminal(sync_root, {**manifest, "attempts": remote_attempts})
     for attempt in remote_attempts:
         _validate_canary_policy_receipt(sync_root / f"policy-server-receipt-{attempt['attempt_id']}.json", attempt, baseline, attempt["command"])
     return _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-remote.json", {"schema_version": 1, "kind": "corrective_vast_remote_launch", "wave_index": manifest["wave_index"], "instance_id": instance_receipt["instance_id"], "status": "remote_terminal", "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(), "bundle_sha256": digest, "worker_returncodes": receipt["worker_returncodes"], "remote_terminal_sha256": receipt["remote_terminal_sha256"]})

@@ -120,6 +120,32 @@ def test_remote_stage_launch_and_destroy_require_live_receipts(tmp_path: Path) -
         LIFECYCLE.destroy_after_publication(99, disposal, tmp_path / "missing.json", runner=runner)
 
 
+def test_full_wave_skips_canary_attempt_already_ingested_into_campaign(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    canary_raw = tmp_path / "raw" / "attempt-0"
+    canary_raw.mkdir(parents=True)
+    (canary_raw / "SHA256SUMS.json").write_text("verified\n")
+    payload = json.loads(manifest.read_text())
+    baseline = payload["baseline"]
+    previous = dict(baseline)
+    baseline.update(_image_native_baseline())
+    replacements = {previous[name]: baseline[name] for name in ("policy_path", "policy_revision_file", "release_assets_root", "groot_root", "groot_python", "controller_python")}
+    for attempt in payload["attempts"]:
+        attempt["command"] = [replacements.get(token, token) for token in attempt["command"]]
+    _write(manifest, payload)
+    bundle = _bundle(tmp_path)
+    token = tmp_path / "token"; token.write_text("secret")
+    invoked = []
+    def runner(command):
+        invoked.append(command)
+        return type("Result", (), {"returncode": 1 if command and command[0] == "scp" and "campaign" in str(command[-2]) else 0, "stdout": ""})()
+    with pytest.raises(RuntimeError, match="transport"):
+        LIFECYCLE.remote_launch_wave(manifest, _canary_instance(), lifecycle_root=tmp_path / "life", runner=runner, code_bundle=bundle, token_file=token)
+    remote_script = next(item[-1] for item in invoked if item and item[0] == "ssh" and "-lc" in item)
+    assert "attempt-0" not in remote_script
+    assert all(f"attempt-{slot}" in remote_script for slot in (1, 2, 3))
+
+
 def test_capture_rejects_bid_and_stale_spend_and_deterministically_prefers_manifest_offer(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="4xRTX3090"):
         LIFECYCLE.capture_offer_evidence(offers=[{"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 1.0, "is_bid": True}], instances=[], output=tmp_path / "bid.json", now_unix=1, ttl_seconds=30)

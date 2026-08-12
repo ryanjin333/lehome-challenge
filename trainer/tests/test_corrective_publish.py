@@ -232,6 +232,24 @@ def _release_with_instances(tmp_path: Path):
     return build_corrective_release_publication_bundle(publication, receipts), snapshot
 
 
+def test_release_allows_one_verified_lease_to_collect_multiple_waves(tmp_path: Path) -> None:
+    from lehome_train.flywheel.publish import build_corrective_release_publication_bundle
+
+    publication, _snapshot = _publication_input(tmp_path)
+    receipts = {}
+    shared_instance_id = 4242
+    for wave_index, wave in publication.wave_evidence.items():
+        path = tmp_path / "shared-instance" / f"wave-{wave_index:06d}.json"
+        _write_json(path, {
+            "schema_version": 1, "kind": "corrective_vast_instance", "instance_id": shared_instance_id,
+            "wave_index": wave_index, "lease_wave_index": 0, "host": "private.example", "port": 22,
+            "provider_evidence_sha256": canonical_json_sha256(wave.provider_evidence),
+        })
+        receipts[wave_index] = path
+    bundle = build_corrective_release_publication_bundle(publication, receipts)
+    assert set(bundle.instance_ids.values()) == {shared_instance_id}
+
+
 def _write_json(path: Path, value: object) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(canonical_json_bytes(value))

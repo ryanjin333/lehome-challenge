@@ -312,8 +312,6 @@ def build_corrective_release_publication_bundle(
         ):
             raise ValueError("corrective release instance provenance is stale or cross-bound")
         paths[wave_index], hashes[wave_index], ids[wave_index] = str(path), digest, receipt["instance_id"]
-    if len(set(ids.values())) != len(ids):
-        raise ValueError("corrective release waves must have distinct instance identities")
     body = _release_provenance_body(corrective, paths, hashes, ids)
     return CorrectiveReleasePublicationBundle(
         corrective, paths, hashes, ids, canonical_json_sha256(body),
