@@ -71,6 +71,17 @@ def _hf_download(command: str) -> str:
     return "HF_ENDPOINT=" + shlex.quote(_remote_hf_endpoint()) + " " + command
 
 
+def _controller_pythonpath(checkout: str) -> str:
+    """Prefix reviewed controller code without replacing image-native Isaac paths."""
+    return "PYTHONPATH=" + shlex.quote(checkout + "/source/lehome:" + checkout) + "${PYTHONPATH:+:$PYTHONPATH}"
+
+
+def _controller_import_preflight(checkout: str) -> str:
+    # isaaclab_tasks imports Warp before AppLauncher has initialized bundled
+    # simulator dependencies, so only inspect module discoverability here.
+    return _controller_pythonpath(checkout) + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("import importlib.util; assert importlib.util.find_spec('isaaclab'); assert importlib.util.find_spec('lehome')")
+
+
 def _qwen_base_setup(checkout: str) -> list[str]:
     """Hydrate and pin the open base expected by step12000's absolute path."""
     download = _hf_download(
@@ -317,7 +328,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
     controller_pythonpath = checkout + "/source/lehome:" + checkout
     revision = str(baseline["code_revision"])
     checkout_setup = "if [ -e " + shlex.quote(checkout) + " ]; then test -d " + shlex.quote(checkout + "/.git") + " && test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision) + " && git -C " + shlex.quote(checkout) + " diff --quiet; else git clone --no-checkout " + shlex.quote(remote_bundle) + " " + shlex.quote(checkout) + " && git -C " + shlex.quote(checkout) + " checkout --detach " + shlex.quote(revision) + "; fi"
-    setup = ["set -eu", "test -x /opt/lehome-challenge/.venv/bin/python", *_groot_wrapper_setup(), "test \"$(git -C " + shlex.quote(APPROVED_GROOT_ROOT) + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_GROOT_REVISION), "chmod 600 " + shlex.quote(remote_token), "export HF_TOKEN=\"$(cat " + shlex.quote(remote_token) + ")\"", checkout_setup, "test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision), "git -C " + shlex.quote(checkout) + " diff --quiet", _hf_download("/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root)), "printf '%s\\n' " + shlex.quote(policy_revision) + " > " + shlex.quote(policy_root + "/revision.txt"), "PYTHONPATH=" + shlex.quote(controller_pythonpath) + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; assert policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "'")]
+    setup = ["set -eu", "test -x /opt/lehome-challenge/.venv/bin/python", *_groot_wrapper_setup(), "test \"$(git -C " + shlex.quote(APPROVED_GROOT_ROOT) + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_GROOT_REVISION), "chmod 600 " + shlex.quote(remote_token), "export HF_TOKEN=\"$(cat " + shlex.quote(remote_token) + ")\"", checkout_setup, "test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision), "git -C " + shlex.quote(checkout) + " diff --quiet", _controller_import_preflight(checkout), _hf_download("/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root)), "printf '%s\\n' " + shlex.quote(policy_revision) + " > " + shlex.quote(policy_root + "/revision.txt"), _controller_pythonpath(checkout) + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; assert policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "'")]
     setup.extend(_asset_checkout_setup(checkout))
     setup.extend(_qwen_base_setup(checkout))
     script_lines = ["set -eu", "trap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT", *setup[1:], f"mkdir -p {shlex.quote(output_root)}", f"cd {shlex.quote(checkout)}", "pids='' "]
@@ -326,7 +337,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
         slot = int(attempt["worker_slot"])
         log = shlex.quote(f"{output_root}/worker-{slot}.log")
         status_file = shlex.quote(f"{output_root}/worker-{slot}.returncode")
-        script_lines.append(f"( HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH={shlex.quote(controller_pythonpath)} LEHOME_FLYWHEEL_WORKER_GPU={slot} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
+        script_lines.append(f"( HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 {_controller_pythonpath(checkout)} LEHOME_FLYWHEEL_WORKER_GPU={slot} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
     script_lines.extend(("for pid in $pids; do wait \"$pid\" || true; done", f"python3 -c {shlex.quote(_terminal_writer_program(output_root, {'attempts': remote_attempts}))}", "exit 0"))
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", "\n".join(script_lines)))
     # Always sync the exact campaign output; a failed remote launch is evidence
@@ -412,14 +423,15 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
         "mkdir -p " + shlex.quote(policy_path),
         _hf_download("/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root)),
         "printf '%s\\n' " + shlex.quote(policy_revision) + " > " + shlex.quote(policy_root + "/revision.txt"),
-        "PYTHONPATH=" + shlex.quote(remote_dir + "/code/source/lehome:" + remote_dir + "/code") + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; import sys; sys.exit(0 if policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "' else 1)"),
+        _controller_import_preflight(remote_dir + "/code"),
+        _controller_pythonpath(remote_dir + "/code") + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; import sys; sys.exit(0 if policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "' else 1)"),
     ]
     runtime.extend(_asset_checkout_setup(remote_dir + "/code"))
     runtime.extend(_qwen_base_setup(remote_dir + "/code"))
     command = " ".join(shlex.quote(item) for item in rewritten)
     controller_pythonpath = remote_dir + "/code/source/lehome:" + remote_dir + "/code"
     remote_log = remote_dir + "/canary.log"
-    script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nHF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=" + shlex.quote(controller_pythonpath) + " LEHOME_FLYWHEEL_WORKER_GPU=0 " + command + " ) > " + shlex.quote(remote_log) + " 2>&1\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
+    script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nHF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 " + _controller_pythonpath(remote_dir + "/code") + " LEHOME_FLYWHEEL_WORKER_GPU=0 " + command + " ) > " + shlex.quote(remote_log) + " 2>&1\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", script))
     sync = lifecycle_root / f"canary-{value['wave_index']:06d}-sync"
     # The corrective controller consumes raw episodes and policy receipts from
