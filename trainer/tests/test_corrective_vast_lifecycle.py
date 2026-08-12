@@ -397,7 +397,15 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     assert "cd /workspace/corrective/canary-000000/code && HF_HUB_OFFLINE=1" in script
     assert "/workspace/corrective/canary-000000/campaign" in script
     assert "/workspace/corrective/canary-000000/code/campaign" not in script
-    assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/canary-000000/code/source/lehome:/workspace/corrective/canary-000000/code${PYTHONPATH:+:$PYTHONPATH} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
+    assert "msgpack-1.1.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" in script
+    assert "5e1da8f11a3dd397f0a32c76165cf0c4eb95b31013a94f6ecc0b280c05c91b59" in script
+    assert "pyzmq-27.0.1-cp311-cp311-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl" in script
+    assert "c512824360ea7490390566ce00bee880e19b526b312b25cc0bc30a0fe95cb67f" in script
+    assert "mkdir -p /workspace/corrective/canary-000000/controller-wire" in script
+    assert 'assert msgpack.__version__ == "1.1.0"' in script and 'assert zmq.__version__ == "27.0.1"' in script
+    assert "zipfile.ZipFile(wheel).extractall(target)" in script and "pip install" not in script
+    assert "PYTHONPATH=/workspace/corrective/canary-000000/controller-wire:/workspace/corrective/canary-000000/code/source/lehome" in script
+    assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/canary-000000/controller-wire:/workspace/corrective/canary-000000/code/source/lehome:/workspace/corrective/canary-000000/code${PYTHONPATH:+:$PYTHONPATH} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "importlib.util" in script and "isaaclab" in script and "lehome" in script and "import isaaclab_tasks" not in script
     assert "if [ -e /workspace/lehome-release-assets ]" in script
     assert "if [ -e /workspace/corrective/canary-000000/code ]" in script
@@ -638,7 +646,15 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert script.count("cd /workspace/corrective/wave-000000/code && HF_HUB_OFFLINE=1") == 4
     assert "/workspace/corrective/wave-000000/campaign" in script
     assert "/workspace/corrective/wave-000000/code/campaign" not in script
-    assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/wave-000000/code/source/lehome:/workspace/corrective/wave-000000/code${PYTHONPATH:+:$PYTHONPATH} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
+    assert "msgpack-1.1.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" in script
+    assert "5e1da8f11a3dd397f0a32c76165cf0c4eb95b31013a94f6ecc0b280c05c91b59" in script
+    assert "pyzmq-27.0.1-cp311-cp311-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl" in script
+    assert "c512824360ea7490390566ce00bee880e19b526b312b25cc0bc30a0fe95cb67f" in script
+    assert "mkdir -p /workspace/corrective/wave-000000/controller-wire" in script
+    assert 'assert msgpack.__version__ == "1.1.0"' in script and 'assert zmq.__version__ == "27.0.1"' in script
+    assert "zipfile.ZipFile(wheel).extractall(target)" in script and "pip install" not in script
+    assert "PYTHONPATH=/workspace/corrective/wave-000000/controller-wire:/workspace/corrective/wave-000000/code/source/lehome" in script
+    assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/wave-000000/controller-wire:/workspace/corrective/wave-000000/code/source/lehome:/workspace/corrective/wave-000000/code${PYTHONPATH:+:$PYTHONPATH} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "importlib.util" in script and "isaaclab" in script and "lehome" in script and "import isaaclab_tasks" not in script
     assert "Qwen/Qwen3-VL-2B-Instruct" in script and all(digest in script for digest in LIFECYCLE.APPROVED_QWEN_FILES.values())
     assert "unsafe git exclude" in script and "/nvidia/Cosmos-Reason2-2B" in script
