@@ -224,24 +224,45 @@ def _write_new(path: Path, value: Mapping[str, object]) -> dict[str, object]:
     return dict(value)
 
 
-def capture_offer_evidence(*, offers: Sequence[Mapping[str, object]], instances: Sequence[Mapping[str, object]], output: Path, now_unix: int, ttl_seconds: int, preferred_offer_id: int | None = None, volumes: Sequence[Mapping[str, object]] = ()) -> dict[str, object]:
+def capture_offer_evidence(*, offers: Sequence[Mapping[str, object]], instances: Sequence[Mapping[str, object]], output: Path, now_unix: int, ttl_seconds: int, preferred_offer_id: int | None = None, volumes: Sequence[Mapping[str, object]] = (), retained_instance_id: int | None = None, prior_provider_evidence: Mapping[str, object] | None = None, prior_instance_receipt: Mapping[str, object] | None = None) -> dict[str, object]:
     """Bind a live external provider snapshot, without creating an instance."""
     if type(now_unix) is not int or type(ttl_seconds) is not int or ttl_seconds <= 0:
         raise ValueError("provider evidence time window is invalid")
-    matching = [offer for offer in offers if offer.get("is_bid") is False and offer.get("gpu_name") == "RTX 3090" and offer.get("num_gpus") == 4 and type(offer.get("id")) is int and type(offer.get("dph_total")) in (int, float) and _effective_cores(offer) >= 64 and _memory_mib(offer) >= 128_000 and _is_approved_r580(offer.get("driver_version"))]
-    if not matching:
-        raise ValueError("live provider offers contain no on-demand 4xRTX3090 choice")
     def hourly(item: Mapping[str, object]) -> float:
         # Vast's dph_total already includes the instance disk charge.  Only
         # detached retained volumes need to be added separately below.
         return float(item.get("dph_total", math.inf))
     existing_spend = sum(hourly(item) for item in instances) + sum(float(item.get("storage_total_cost", 0)) for item in volumes)
-    acceptable = [item for item in matching if math.isfinite(existing_spend + hourly(item)) and hourly(item) > 0 and existing_spend + hourly(item) <= 2.0]
-    if not acceptable:
-        raise ValueError("live provider account spend exceeds shared $2/hr cap")
-    acceptable.sort(key=lambda offer: (float(offer["dph_total"]), int(offer["id"])))
-    offer = next((item for item in acceptable if item["id"] == preferred_offer_id), acceptable[0])
-    account_total = existing_spend + hourly(offer)
+    if retained_instance_id is not None:
+        if type(retained_instance_id) is not int or retained_instance_id <= 0 or prior_provider_evidence is None or prior_instance_receipt is None:
+            raise ValueError("retained instance evidence requires a prior evidence and instance receipt")
+        retained = next((item for item in instances if item.get("id") == retained_instance_id), None)
+        if retained is None:
+            raise ValueError("retained instance is not found in live provider rows")
+        prior_hash = _canonical_hash(prior_provider_evidence)
+        offer_id = prior_provider_evidence.get("offer_id")
+        prior_price = prior_provider_evidence.get("instance_hourly_cost_usd")
+        if prior_provider_evidence.get("kind") != "external_provider_offer_evidence" or type(offer_id) is not int or not isinstance(prior_price, (int, float)) or not math.isfinite(float(prior_price)) or float(prior_price) <= 0:
+            raise ValueError("retained instance prior evidence lacks a stable offer identity")
+        if prior_instance_receipt.get("kind") != "corrective_vast_instance" or prior_instance_receipt.get("instance_id") != retained_instance_id or prior_instance_receipt.get("provider_evidence_sha256") != prior_hash:
+            raise ValueError("retained instance receipt is not bound to prior provider evidence")
+        compatible = (retained.get("actual_status") == "running" and retained.get("is_bid") is False and retained.get("gpu_name") == "RTX 3090" and retained.get("num_gpus") == 4 and _effective_cores(retained) >= 64 and _memory_mib(retained) >= 128_000 and _is_approved_r580(retained.get("driver_version")) and hourly(retained) > 0 and math.isclose(hourly(retained), float(prior_price), rel_tol=0.0, abs_tol=1e-9) and retained.get("ssh_host") == prior_instance_receipt.get("host") and retained.get("ssh_port", 22) == prior_instance_receipt.get("port"))
+        if not compatible:
+            raise ValueError("retained instance live row is incompatible with its prior receipt")
+        if not math.isfinite(existing_spend) or existing_spend > 2.0:
+            raise ValueError("live provider account spend exceeds shared $2/hr cap")
+        offer = {"id": offer_id, "dph_total": float(prior_price)}
+        account_total = existing_spend
+    else:
+        matching = [offer for offer in offers if offer.get("is_bid") is False and offer.get("gpu_name") == "RTX 3090" and offer.get("num_gpus") == 4 and type(offer.get("id")) is int and type(offer.get("dph_total")) in (int, float) and _effective_cores(offer) >= 64 and _memory_mib(offer) >= 128_000 and _is_approved_r580(offer.get("driver_version"))]
+        if not matching:
+            raise ValueError("live provider offers contain no on-demand 4xRTX3090 choice")
+        acceptable = [item for item in matching if math.isfinite(existing_spend + hourly(item)) and hourly(item) > 0 and existing_spend + hourly(item) <= 2.0]
+        if not acceptable:
+            raise ValueError("live provider account spend exceeds shared $2/hr cap")
+        acceptable.sort(key=lambda offer: (float(offer["dph_total"]), int(offer["id"])))
+        offer = next((item for item in acceptable if item["id"] == preferred_offer_id), acceptable[0])
+        account_total = existing_spend + hourly(offer)
     snapshot = {"offers": list(offers), "instances": list(instances), "volumes": list(volumes), "captured_at_unix": now_unix}
     source_path = output.with_name(output.stem + "-source.json")
     _write_new(source_path, snapshot)
@@ -377,6 +398,52 @@ def renew_retained_lease(manifest_path: Path, prior_receipt_path: Path, *, lifec
         "prior_instance_receipt_sha256": hashlib.sha256(prior_receipt_path.read_bytes()).hexdigest(),
     }
     return _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-instance.json", receipt)
+
+
+def adopt_retained_lease(manifest_path: Path, prior_receipt_path: Path, prior_provider_evidence_path: Path, fresh_provider_evidence_path: Path, *, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object]) -> dict[str, object]:
+    """Bind a fresh campaign's wave zero to one independently proven lease."""
+    manifest = _read_manifest(manifest_path)
+    if manifest["wave_index"] != 0:
+        raise ValueError("retained lease adoption is only for a fresh wave zero")
+    prior = _read_json_object(prior_receipt_path, "prior retained instance receipt")
+    prior_evidence = _read_json_object(prior_provider_evidence_path, "prior provider evidence")
+    fresh_evidence = _read_json_object(fresh_provider_evidence_path, "fresh retained provider evidence")
+    if manifest.get("provider_evidence") != fresh_evidence:
+        raise ValueError("fresh campaign manifest does not bind the supplied provider evidence")
+    provider = manifest["provider"]
+    if any(provider.get(key) != fresh_evidence.get(key) for key in ("rental_kind", "instance_hourly_cost_usd", "account_hourly_total_usd", "offer_id", "gpu_name", "num_gpus")):
+        raise ValueError("fresh campaign provider facts do not match retained lease evidence")
+    instance_id = prior.get("instance_id")
+    if prior.get("kind") != "corrective_vast_instance" or type(instance_id) is not int or instance_id <= 0 or prior.get("provider_evidence_sha256") != _canonical_hash(prior_evidence):
+        raise ValueError("prior retained lease is not bound to provider evidence")
+    readback = _run_raw(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+    instances = _run_raw(runner, ("vastai", "--raw", "show", "instances"))
+    volumes = _run_raw(runner, ("vastai", "--raw", "show", "volumes"))
+    if not isinstance(readback, dict) or not isinstance(instances, list) or not isinstance(volumes, list):
+        raise ValueError("retained Vast lease readback is invalid")
+    captured_at = fresh_evidence.get("queried_at_unix")
+    expires_at = fresh_evidence.get("expires_at_unix")
+    if type(captured_at) is not int or type(expires_at) is not int or expires_at < time.time_ns() // 1_000_000_000:
+        raise ValueError("fresh retained provider evidence is expired")
+    def hourly(item: Mapping[str, object]) -> float:
+        return float(item.get("dph_total", math.inf))
+    live_total = sum(hourly(item) for item in instances) + sum(float(item.get("storage_total_cost", 0)) for item in volumes)
+    compatible = (readback.get("actual_status") == "running" and readback.get("is_bid") is False and readback.get("gpu_name") == "RTX 3090" and readback.get("num_gpus") == 4 and _effective_cores(readback) >= 64 and _memory_mib(readback) >= 128_000 and _is_approved_r580(readback.get("driver_version")) and hourly(readback) > 0 and math.isclose(hourly(readback), float(prior_evidence.get("instance_hourly_cost_usd", math.inf)), rel_tol=0.0, abs_tol=1e-9) and readback.get("ssh_host") == prior.get("host") and readback.get("ssh_port", 22) == prior.get("port"))
+    if not compatible or not math.isfinite(live_total) or live_total > 2.0 or fresh_evidence.get("account_hourly_total_usd") != live_total:
+        raise ValueError("fresh retained provider evidence no longer matches live account facts")
+    receipt = {
+        "schema_version": 1, "kind": "corrective_vast_instance", "instance_id": instance_id,
+        "host": readback.get("ssh_host"), "port": readback.get("ssh_port", 22),
+        "provider_response_sha256": _canonical_hash(readback),
+        "provider_evidence_sha256": _canonical_hash(fresh_evidence), "wave_index": 0,
+        "lease_wave_index": prior.get("lease_wave_index", prior.get("wave_index")),
+        "prior_instance_receipt_sha256": hashlib.sha256(prior_receipt_path.read_bytes()).hexdigest(),
+        "prior_provider_evidence_sha256": hashlib.sha256(prior_provider_evidence_path.read_bytes()).hexdigest(),
+        "fresh_provider_evidence_sha256": hashlib.sha256(fresh_provider_evidence_path.read_bytes()).hexdigest(),
+    }
+    if not isinstance(receipt["host"], str) or not receipt["host"] or type(receipt["port"]) is not int:
+        raise ValueError("retained Vast lease readback lacks SSH endpoint")
+    return _write_new(lifecycle_root / "wave-000000-instance.json", receipt)
 
 
 def _cleanup_new_instance(instance_id: int, runner: Callable[[tuple[str, ...]], object]) -> None:
@@ -990,6 +1057,9 @@ def build_parser() -> argparse.ArgumentParser:
     evidence.add_argument("--lifecycle-root", type=Path, required=True)
     evidence.add_argument("--wave-index", type=int, required=True)
     evidence.add_argument("--preferred-offer-id", type=int)
+    evidence.add_argument("--retained-instance-id", type=int)
+    evidence.add_argument("--prior-provider-evidence", type=Path)
+    evidence.add_argument("--prior-instance-receipt", type=Path)
     evidence.add_argument("--execute", action="store_true")
     for name in ("rent", "remote-launch"):
         item = actions.add_parser(name)
@@ -1002,6 +1072,13 @@ def build_parser() -> argparse.ArgumentParser:
     renew.add_argument("--prior-instance-receipt", type=Path, required=True)
     renew.add_argument("--lifecycle-root", type=Path, required=True)
     renew.add_argument("--execute", action="store_true")
+    adopt = actions.add_parser("adopt-retained-lease")
+    adopt.add_argument("--manifest", type=Path, required=True)
+    adopt.add_argument("--prior-instance-receipt", type=Path, required=True)
+    adopt.add_argument("--prior-provider-evidence", type=Path, required=True)
+    adopt.add_argument("--fresh-provider-evidence", type=Path, required=True)
+    adopt.add_argument("--lifecycle-root", type=Path, required=True)
+    adopt.add_argument("--execute", action="store_true")
     remote = actions.choices["remote-launch"]
     remote.add_argument("--instance-receipt", type=Path, required=True)
     remote.add_argument("--code-git-bundle", type=Path, required=True)
@@ -1051,8 +1128,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.action == "capture-evidence":
         instances = _run_raw(_subprocess_runner, ("vastai", "--raw", "show", "instances"))
         volumes = _run_raw(_subprocess_runner, ("vastai", "--raw", "show", "volumes"))
-        offers = _run_raw(_subprocess_runner, ("vastai", "--raw", "search", "offers", OFFER_QUERY, "--on-demand", "--storage", "300"))
-        result = capture_offer_evidence(offers=offers, instances=instances, volumes=volumes, output=args.lifecycle_root / f"wave-{args.wave_index:06d}-provider.json", now_unix=__import__("time").time_ns() // 1_000_000_000, ttl_seconds=300, preferred_offer_id=args.preferred_offer_id)
+        if args.retained_instance_id is not None:
+            if args.preferred_offer_id is not None or args.prior_provider_evidence is None or args.prior_instance_receipt is None:
+                raise ValueError("retained evidence requires prior evidence/receipt and no offer selector")
+            offers: object = []
+            prior_evidence = _read_json_object(args.prior_provider_evidence, "prior provider evidence")
+            prior_receipt = _read_json_object(args.prior_instance_receipt, "prior instance receipt")
+        else:
+            if args.prior_provider_evidence is not None or args.prior_instance_receipt is not None:
+                raise ValueError("prior evidence options require a retained instance ID")
+            offers = _run_raw(_subprocess_runner, ("vastai", "--raw", "search", "offers", OFFER_QUERY, "--on-demand", "--storage", "300"))
+            prior_evidence = prior_receipt = None
+        if not isinstance(instances, list) or not isinstance(volumes, list) or not isinstance(offers, list):
+            raise ValueError("vastai raw evidence response is invalid")
+        result = capture_offer_evidence(offers=offers, instances=instances, volumes=volumes, output=args.lifecycle_root / f"wave-{args.wave_index:06d}-provider.json", now_unix=__import__("time").time_ns() // 1_000_000_000, ttl_seconds=300, preferred_offer_id=args.preferred_offer_id, retained_instance_id=args.retained_instance_id, prior_provider_evidence=prior_evidence, prior_instance_receipt=prior_receipt)
     elif args.action == "build-bundle":
         result = build_approved_bundle(args.manifest, checkout=args.checkout, output=args.output)
     elif args.action == "build-code-bundle":
@@ -1061,6 +1150,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = rent_wave(args.manifest, lifecycle_root=args.lifecycle_root, runner=_subprocess_runner, now_unix=__import__("time").time_ns() // 1_000_000_000)
     elif args.action == "renew-lease":
         result = renew_retained_lease(args.manifest, args.prior_instance_receipt, lifecycle_root=args.lifecycle_root, runner=_subprocess_runner)
+    elif args.action == "adopt-retained-lease":
+        result = adopt_retained_lease(args.manifest, args.prior_instance_receipt, args.prior_provider_evidence, args.fresh_provider_evidence, lifecycle_root=args.lifecycle_root, runner=_subprocess_runner)
     elif args.action == "remote-launch":
         instance = json.loads(args.instance_receipt.read_text(encoding="utf-8"))
         result = remote_launch_wave(args.manifest, instance, lifecycle_root=args.lifecycle_root, runner=_nonraising_subprocess_runner, code_bundle=args.code_git_bundle, token_file=args.token_file)

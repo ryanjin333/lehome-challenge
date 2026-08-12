@@ -89,6 +89,50 @@ def test_capture_offer_evidence_binds_live_offer_and_account_snapshot(tmp_path: 
     assert "cpu_ram>=128" in LIFECYCLE.OFFER_QUERY and "cpu_cores_effective>=64" in LIFECYCLE.OFFER_QUERY
 
 
+def test_capture_retained_instance_evidence_uses_only_live_instance_and_volume_facts(tmp_path: Path) -> None:
+    instance = {
+        "id": 47559739, "ssh_host": "host", "ssh_port": 22, "actual_status": "running",
+        "is_bid": False, "gpu_name": "RTX 3090", "num_gpus": 4,
+        "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.65.06", "dph_total": 0.7,
+    }
+    prior_evidence = {"schema_version": 1, "kind": "external_provider_offer_evidence", "offer_id": 40705900, "instance_hourly_cost_usd": 0.7}
+    prior_receipt = {"kind": "corrective_vast_instance", "instance_id": 47559739, "host": "host", "port": 22, "provider_evidence_sha256": LIFECYCLE._canonical_hash(prior_evidence)}
+    evidence = LIFECYCLE.capture_offer_evidence(
+        offers=[], instances=[instance], volumes=[{"id": 4, "storage_total_cost": 0.0001}],
+        retained_instance_id=47559739, prior_provider_evidence=prior_evidence, prior_instance_receipt=prior_receipt,
+        output=tmp_path / "retained.json", now_unix=100, ttl_seconds=60,
+    )
+    snapshot = json.loads((tmp_path / evidence["source_snapshot_path"]).read_text())
+    assert evidence["offer_id"] == 40705900 and evidence["instance_hourly_cost_usd"] == 0.7
+    assert evidence["account_hourly_total_usd"] == pytest.approx(0.7001)
+    assert snapshot["offers"] == [] and snapshot["instances"] == [instance]
+
+
+@pytest.mark.parametrize("instance, error", [
+    ({"id": 47559739, "ssh_host": "host", "ssh_port": 22, "actual_status": "stopped", "is_bid": False, "gpu_name": "RTX 3090", "num_gpus": 4, "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.65.06", "dph_total": .7}, "incompatible"),
+    ({"id": 47559739, "ssh_host": "host", "ssh_port": 22, "actual_status": "running", "is_bid": False, "gpu_name": "RTX 3090", "num_gpus": 4, "cpu_cores_effective": 63, "cpu_ram": 131072, "driver_version": "580.65.06", "dph_total": .7}, "incompatible"),
+])
+def test_capture_retained_instance_evidence_rejects_invalid_live_row(tmp_path: Path, instance: dict[str, object], error: str) -> None:
+    prior_evidence = {"schema_version": 1, "kind": "external_provider_offer_evidence", "offer_id": 7, "instance_hourly_cost_usd": .7}
+    prior_receipt = {"kind": "corrective_vast_instance", "instance_id": 47559739, "host": "host", "port": 22, "provider_evidence_sha256": LIFECYCLE._canonical_hash(prior_evidence)}
+    with pytest.raises(ValueError, match=error):
+        LIFECYCLE.capture_offer_evidence(
+            offers=[], instances=[instance], retained_instance_id=47559739,
+            prior_provider_evidence=prior_evidence, prior_instance_receipt=prior_receipt,
+            output=tmp_path / "retained.json", now_unix=100, ttl_seconds=60,
+        )
+
+
+def test_capture_retained_instance_evidence_rejects_missing_id_and_shared_cap(tmp_path: Path) -> None:
+    healthy = {"id": 47559739, "ssh_host": "host", "ssh_port": 22, "actual_status": "running", "is_bid": False, "gpu_name": "RTX 3090", "num_gpus": 4, "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.65.06", "dph_total": .7}
+    prior_evidence = {"schema_version": 1, "kind": "external_provider_offer_evidence", "offer_id": 7, "instance_hourly_cost_usd": .7}
+    prior_receipt = {"kind": "corrective_vast_instance", "instance_id": 47559739, "host": "host", "port": 22, "provider_evidence_sha256": LIFECYCLE._canonical_hash(prior_evidence)}
+    with pytest.raises(ValueError, match="not found"):
+        LIFECYCLE.capture_offer_evidence(offers=[], instances=[healthy], retained_instance_id=99, prior_provider_evidence=prior_evidence, prior_instance_receipt=prior_receipt, output=tmp_path / "missing.json", now_unix=100, ttl_seconds=60)
+    with pytest.raises(ValueError, match="shared \$2/hr cap"):
+        LIFECYCLE.capture_offer_evidence(offers=[], instances=[healthy, {**healthy, "id": 2, "dph_total": 1.4}], retained_instance_id=47559739, prior_provider_evidence=prior_evidence, prior_instance_receipt=prior_receipt, output=tmp_path / "cap.json", now_unix=100, ttl_seconds=60)
+
+
 def test_cli_query_and_rent_readback_rejects_spoofed_or_mismatched_instance(tmp_path: Path) -> None:
     commands = []
     destroyed = [False]
@@ -435,6 +479,41 @@ def test_remote_hf_endpoint_is_approved_and_mirror_default(monkeypatch: pytest.M
 def test_canary_cli_actions_are_exposed() -> None:
     actions = LIFECYCLE.build_parser()._subparsers._group_actions[0].choices
     assert {"canary-launch", "canary-destroy", "build-bundle", "build-code-bundle", "ingest"} <= set(actions)
+
+
+def test_adopt_retained_lease_cli_passes_fresh_provider_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    captured: dict[str, object] = {}
+
+    def adopt(manifest, prior_receipt, prior_evidence, fresh_evidence, *, lifecycle_root, runner):
+        captured.update({
+            "manifest": manifest,
+            "prior_receipt": prior_receipt,
+            "prior_evidence": prior_evidence,
+            "fresh_evidence": fresh_evidence,
+            "lifecycle_root": lifecycle_root,
+        })
+        return {"kind": "corrective_vast_instance"}
+
+    monkeypatch.setattr(LIFECYCLE, "adopt_retained_lease", adopt)
+    manifest = tmp_path / "wave.json"
+    prior_receipt = tmp_path / "prior-instance.json"
+    prior_evidence = tmp_path / "prior-provider.json"
+    fresh_evidence = tmp_path / "fresh-provider.json"
+    assert LIFECYCLE.main((
+        "adopt-retained-lease", "--execute", "--manifest", str(manifest),
+        "--prior-instance-receipt", str(prior_receipt),
+        "--prior-provider-evidence", str(prior_evidence),
+        "--fresh-provider-evidence", str(fresh_evidence),
+        "--lifecycle-root", str(tmp_path / "lifecycle"),
+    )) == 0
+    assert captured == {
+        "manifest": manifest, "prior_receipt": prior_receipt,
+        "prior_evidence": prior_evidence, "fresh_evidence": fresh_evidence,
+        "lifecycle_root": tmp_path / "lifecycle",
+    }
+    assert json.loads(capsys.readouterr().out) == {"kind": "corrective_vast_instance"}
 
 
 def test_canary_early_staging_failure_writes_nonempty_abort_evidence(tmp_path: Path) -> None:
