@@ -237,6 +237,21 @@ def test_terminal_validator_accepts_exact_three_slot_resume(tmp_path: Path, monk
     assert set(LIFECYCLE._validate_remote_terminal(sync, {"attempts": attempts})["worker_returncodes"]) == {"1", "2", "3"}
 
 
+def test_terminal_timeout_is_bound_to_worker_log_and_not_admissible(tmp_path: Path) -> None:
+    output = tmp_path / "campaign"
+    (output / "worker-1.returncode").parent.mkdir(parents=True)
+    (output / "worker-1.returncode").write_text("124\n", encoding="utf-8")
+    (output / "worker-1.log").write_text("policy call exceeded wall limit\n", encoding="utf-8")
+    attempt = {"worker_slot": 1, "attempt_id": "attempt-1"}
+    subprocess.run((sys.executable, "-c", LIFECYCLE._terminal_writer_program(str(output), {"attempts": [attempt]})), check=True)
+    terminal = json.loads((output / "remote-terminal.json").read_text(encoding="utf-8"))
+    worker = terminal["workers"][0]
+    assert worker["timed_out"] is True and worker["raw_receipt_path"] is None
+    assert worker["failure_evidence_path"] == "worker-1.log" and len(worker["failure_evidence_sha256"]) == 64
+    with pytest.raises(ValueError, match="nonzero"):
+        LIFECYCLE._validate_remote_terminal(output, {"attempts": [attempt]})
+
+
 def test_renew_retained_lease_binds_later_wave_and_fresh_provider(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     value = json.loads(manifest.read_text())
@@ -783,9 +798,10 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "/code/Assets/objects/Challenge_Garment/Release" in script
     assert "/code/code/Assets" not in script
     assert all(f"LEHOME_FLYWHEEL_WORKER_GPU={slot}" in script for slot in range(4))
+    assert f"timeout --signal=TERM --kill-after=15s {LIFECYCLE.WORKER_WALL_TIMEOUT_SECONDS}s" in script
     assert script.count("LEHOME_FLYWHEEL_IMAGE_IDENTITY=" + LIFECYCLE.APPROVED_IMAGE_DIGEST) >= 5
     assert "image identity preflight" in script
-    assert script.count(f"cd {remote_dir}/code && HF_HUB_OFFLINE=1") == 4
+    assert script.count(f"cd {remote_dir}/code && timeout --signal=TERM --kill-after=15s {LIFECYCLE.WORKER_WALL_TIMEOUT_SECONDS}s env HF_HUB_OFFLINE=1") == 4
     assert f"{remote_dir}/campaign" in script
     assert f"{remote_dir}/code/campaign" not in script
     assert "msgpack-1.1.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" in script

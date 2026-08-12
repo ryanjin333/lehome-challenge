@@ -26,6 +26,7 @@ from typing import Callable, Mapping, Sequence
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+WORKER_WALL_TIMEOUT_SECONDS = 900
 # GHCR is the immutable mirror of the verified Docker Hub image. Both manifests
 # have config digest d36b7a84... and the same ordered 35 layer digest/size pairs;
 # the registry-specific manifest serialization alone changes the top digest.
@@ -528,7 +529,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
         slot = int(attempt["worker_slot"])
         log = shlex.quote(f"{output_root}/worker-{slot}.log")
         status_file = shlex.quote(f"{output_root}/worker-{slot}.returncode")
-        script_lines.append(f"( cd {shlex.quote(checkout)} && HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 {_controller_pythonpath(checkout, wire_target=wire_target)} LEHOME_FLYWHEEL_WORKER_GPU={slot} LEHOME_FLYWHEEL_IMAGE_IDENTITY={shlex.quote(image_identity)} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
+        script_lines.append(f"( cd {shlex.quote(checkout)} && timeout --signal=TERM --kill-after=15s {WORKER_WALL_TIMEOUT_SECONDS}s env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 {_controller_pythonpath(checkout, wire_target=wire_target)} LEHOME_FLYWHEEL_WORKER_GPU={slot} LEHOME_FLYWHEEL_IMAGE_IDENTITY={shlex.quote(image_identity)} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
     script_lines.extend(("for pid in $pids; do wait \"$pid\" || true; done", f"python3 -c {shlex.quote(_terminal_writer_program(output_root, {'attempts': remote_attempts}))}", "exit 0"))
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", "\n".join(script_lines)))
     # Always sync the exact campaign output; a failed remote launch is evidence
@@ -964,8 +965,8 @@ def _terminal_writer_program(output_root: str, manifest: Mapping[str, object]) -
     # JSON is embedded as a quoted Python literal, never interpreted by a shell.
     workers = [{"worker_slot": int(item["worker_slot"]), "attempt_id": str(item["attempt_id"])} for item in manifest["attempts"]]
     return ("import hashlib,json,pathlib;root=pathlib.Path(" + repr(output_root) + ");workers=[];"
-            "\nfor item in " + repr(workers) + ":\n slot=item['worker_slot']; p=root/f'worker-{slot}.returncode'; raw=root/'raw'/item['attempt_id']/'SHA256SUMS.json';"
-            "\n if not p.is_file(): raise SystemExit(2)\n rc=int(p.read_text().strip()); h=hashlib.sha256(raw.read_bytes()).hexdigest() if raw.is_file() else None; workers.append({'worker_slot':slot,'attempt_id':item['attempt_id'],'returncode':rc,'raw_receipt_path':str(raw.relative_to(root)),'raw_receipt_sha256':h})"
+            "\nfor item in " + repr(workers) + ":\n slot=item['worker_slot']; p=root/f'worker-{slot}.returncode'; raw=root/'raw'/item['attempt_id']/'SHA256SUMS.json'; log=root/f'worker-{slot}.log';"
+            "\n if not p.is_file(): raise SystemExit(2)\n rc=int(p.read_text().strip()); timed_out=rc==124; h=hashlib.sha256(raw.read_bytes()).hexdigest() if raw.is_file() else None; failure_hash=hashlib.sha256(log.read_bytes()).hexdigest() if rc and log.is_file() else None; workers.append({'worker_slot':slot,'attempt_id':item['attempt_id'],'returncode':rc,'timed_out':timed_out,'raw_receipt_path':str(raw.relative_to(root)) if raw.is_file() else None,'raw_receipt_sha256':h,'failure_evidence_path':str(log.relative_to(root)) if failure_hash else None,'failure_evidence_sha256':failure_hash})"
             "\nvalue={'schema_version':1,'kind':'corrective_remote_terminal','workers':workers};(root/'remote-terminal.json').write_text(json.dumps(value,sort_keys=True)+'\\n')")
 
 
@@ -986,7 +987,16 @@ def _validate_remote_terminal(sync_root: Path, manifest: Mapping[str, object]) -
         if not isinstance(worker, dict) or type(worker.get("returncode")) is not int:
             raise ValueError("remote terminal worker return code is invalid")
         slot = str(worker["worker_slot"]); returncodes[slot] = worker["returncode"]
-    if any(returncode != 0 for returncode in returncodes.values()):
+    failed = [worker for worker in workers if worker["returncode"] != 0]
+    for worker in failed:
+        evidence_path = worker.get("failure_evidence_path")
+        evidence_hash = worker.get("failure_evidence_sha256")
+        if not isinstance(evidence_path, str) or Path(evidence_path).is_absolute() or any(part in {"", ".", ".."} for part in Path(evidence_path).parts):
+            raise ValueError("remote terminal failed worker lacks safe failure evidence")
+        evidence = sync_root.joinpath(*Path(evidence_path).parts)
+        if evidence.is_symlink() or not evidence.is_file() or not isinstance(evidence_hash, str) or _SHA256.fullmatch(evidence_hash) is None or hashlib.sha256(evidence.read_bytes()).hexdigest() != evidence_hash:
+            raise ValueError("remote terminal failed worker evidence is missing or mismatched")
+    if failed:
         raise ValueError("remote terminal records a nonzero worker return code")
     for worker in workers:
         if worker.get("attempt_id") != expected_ids[int(worker["worker_slot"])]:
