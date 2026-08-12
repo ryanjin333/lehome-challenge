@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tarfile
@@ -129,7 +130,7 @@ def test_capture_retained_instance_evidence_rejects_missing_id_and_shared_cap(tm
     prior_receipt = {"kind": "corrective_vast_instance", "instance_id": 47559739, "host": "host", "port": 22, "provider_evidence_sha256": LIFECYCLE._canonical_hash(prior_evidence)}
     with pytest.raises(ValueError, match="not found"):
         LIFECYCLE.capture_offer_evidence(offers=[], instances=[healthy], retained_instance_id=99, prior_provider_evidence=prior_evidence, prior_instance_receipt=prior_receipt, output=tmp_path / "missing.json", now_unix=100, ttl_seconds=60)
-    with pytest.raises(ValueError, match="shared \$2/hr cap"):
+    with pytest.raises(ValueError, match=r"shared \$2/hr cap"):
         LIFECYCLE.capture_offer_evidence(offers=[], instances=[healthy, {**healthy, "id": 2, "dph_total": 1.4}], retained_instance_id=47559739, prior_provider_evidence=prior_evidence, prior_instance_receipt=prior_receipt, output=tmp_path / "cap.json", now_unix=100, ttl_seconds=60)
 
 
@@ -677,21 +678,36 @@ def _failed_canary_sync(sync: Path, attempt: dict[str, object], baseline: dict[s
     _write(sync / "policy-server-receipt-attempt-0.json", {"episode_id": "attempt-0", "backend": "policy_server", "checkpoint_revision": baseline["parent_checkpoint_revision"], "checkpoint_digest": baseline["parent_checkpoint_artifact_sha256"], "code_revision": baseline["code_revision"], "image_identity": baseline["image_identity"], "policy_device": "cuda:0", "parity_stage": "server_cpu", "simulator_device": "cpu", "groot_revision": baseline["groot_revision"], "python_path": baseline["groot_python"], "policy_seed": attempt["seed"], "port": 9100, "command": ["--model-path", policy]})
 
 
-def test_build_code_bundle_requires_a_clean_exact_commit(tmp_path: Path) -> None:
+def test_build_code_bundle_is_clonable_and_excludes_unrelated_branch_history(tmp_path: Path) -> None:
     checkout = tmp_path / "checkout"; checkout.mkdir()
     subprocess.run(("git", "init"), cwd=checkout, check=True, capture_output=True)
     subprocess.run(("git", "config", "user.email", "test@example.invalid"), cwd=checkout, check=True)
     subprocess.run(("git", "config", "user.name", "Test"), cwd=checkout, check=True)
     (checkout / "tracked.txt").write_text("ok")
     subprocess.run(("git", "add", "tracked.txt"), cwd=checkout, check=True); subprocess.run(("git", "commit", "-m", "test"), cwd=checkout, check=True, capture_output=True)
+    base_revision = subprocess.run(("git", "rev-parse", "HEAD"), cwd=checkout, check=True, capture_output=True, text=True).stdout.strip()
+    base_bundle = tmp_path / "base.bundle"
+    subprocess.run(("git", "bundle", "create", str(base_bundle), "HEAD"), cwd=checkout, check=True, capture_output=True)
+    (checkout / "tracked.txt").write_text("requested")
+    subprocess.run(("git", "commit", "-am", "requested"), cwd=checkout, check=True, capture_output=True)
     revision = subprocess.run(("git", "rev-parse", "HEAD"), cwd=checkout, check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(("git", "branch", "unrelated", base_revision), cwd=checkout, check=True, capture_output=True)
+    subprocess.run(("git", "checkout", "unrelated"), cwd=checkout, check=True, capture_output=True)
+    (checkout / "unrelated.bin").write_bytes(os.urandom(1_000_000))
+    subprocess.run(("git", "add", "unrelated.bin"), cwd=checkout, check=True); subprocess.run(("git", "commit", "-m", "unrelated"), cwd=checkout, check=True, capture_output=True)
+    subprocess.run(("git", "checkout", "-"), cwd=checkout, check=True, capture_output=True)
     bundle = tmp_path / "code.bundle"
-    receipt = LIFECYCLE.build_code_bundle(checkout=checkout, revision=revision, output=bundle)
+    receipt = LIFECYCLE.build_code_bundle(checkout=checkout, revision=revision, output=bundle, base_bundle=base_bundle)
     assert receipt["revision"] == revision
+    assert bundle.stat().st_size < 100_000
     subprocess.run(("git", "bundle", "verify", str(bundle)), cwd=checkout, check=True, capture_output=True)
+    clone = tmp_path / "clone"
+    subprocess.run(("git", "clone", "--no-checkout", str(bundle), str(clone)), check=True, capture_output=True)
+    subprocess.run(("git", "checkout", revision), cwd=clone, check=True, capture_output=True)
+    assert subprocess.run(("git", "rev-parse", "HEAD"), cwd=clone, check=True, capture_output=True, text=True).stdout.strip() == revision
     (checkout / "dirty.txt").write_text("no")
     with pytest.raises(ValueError, match="clean"):
-        LIFECYCLE.build_code_bundle(checkout=checkout, revision=revision, output=tmp_path / "dirty.bundle")
+        LIFECYCLE.build_code_bundle(checkout=checkout, revision=revision, output=tmp_path / "dirty.bundle", base_bundle=base_bundle)
 
 
 def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidence(tmp_path: Path) -> None:

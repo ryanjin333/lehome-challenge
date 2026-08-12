@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import shutil
+import tempfile
 import time
 import shlex
 import uuid
@@ -882,9 +883,12 @@ def build_approved_bundle(manifest_path: Path, *, checkout: Path, output: Path) 
     return receipt
 
 
-def build_code_bundle(*, checkout: Path, revision: str, output: Path) -> dict[str, object]:
-    """Create a credential-free Git bundle only from an exact committed checkout."""
-    if checkout.is_symlink() or not checkout.is_dir() or output.exists() or output.is_symlink() or not re.fullmatch(r"[0-9a-f]{40}", revision):
+def build_code_bundle(*, checkout: Path, revision: str, output: Path, base_bundle: Path) -> dict[str, object]:
+    """Create one complete, credential-free bundle from a reviewed compact base."""
+    lock = output.with_name(output.name + ".lock")
+    if (checkout.is_symlink() or not checkout.is_dir() or output.exists() or output.is_symlink()
+            or lock.exists() or lock.is_symlink() or base_bundle.is_symlink() or not base_bundle.is_file()
+            or not re.fullmatch(r"[0-9a-f]{40}", revision)):
         raise ValueError("code bundle inputs are invalid")
     def run(args: tuple[str, ...]) -> str:
         completed = subprocess.run(args, cwd=checkout, check=False, capture_output=True, text=True)
@@ -893,8 +897,29 @@ def build_code_bundle(*, checkout: Path, revision: str, output: Path) -> dict[st
         return completed.stdout.strip()
     if run(("git", "rev-parse", "HEAD")) != revision or run(("git", "status", "--porcelain")):
         raise ValueError("code checkout is not the requested clean revision")
-    subprocess.run(("git", "bundle", "create", str(output), "--all"), cwd=checkout, check=True, capture_output=True, text=True)
-    return {"schema_version": 1, "kind": "corrective_code_git_bundle", "revision": revision, "bundle_sha256": hashlib.sha256(output.read_bytes()).hexdigest()}
+    created_lock = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="corrective-code-bundle-") as temporary:
+            materialized = Path(temporary) / "checkout"
+            subprocess.run(("git", "bundle", "verify", str(base_bundle)), cwd=checkout, check=True, capture_output=True, text=True)
+            subprocess.run(("git", "clone", "--no-checkout", str(base_bundle), str(materialized)), check=True, capture_output=True, text=True)
+            subprocess.run(("git", "fetch", "--no-tags", "--no-write-fetch-head", str(checkout), f"{revision}:refs/heads/release"), cwd=materialized, check=True, capture_output=True, text=True)
+            if subprocess.run(("git", "rev-parse", "refs/heads/release"), cwd=materialized, check=True, capture_output=True, text=True).stdout.strip() != revision:
+                raise ValueError("code bundle materialization did not preserve requested revision")
+            subprocess.run(("git", "bundle", "create", str(lock), "refs/heads/release"), cwd=materialized, check=True, capture_output=True, text=True)
+            created_lock = True
+            subprocess.run(("git", "bundle", "verify", str(lock)), cwd=materialized, check=True, capture_output=True, text=True)
+            clone = Path(temporary) / "verify"
+            subprocess.run(("git", "clone", "--no-checkout", str(lock), str(clone)), check=True, capture_output=True, text=True)
+            subprocess.run(("git", "checkout", revision), cwd=clone, check=True, capture_output=True, text=True)
+            if subprocess.run(("git", "rev-parse", "HEAD"), cwd=clone, check=True, capture_output=True, text=True).stdout.strip() != revision:
+                raise ValueError("code bundle clone did not preserve requested revision")
+        os.replace(lock, output)
+        created_lock = False
+    finally:
+        if created_lock and lock.exists():
+            lock.unlink()
+    return {"schema_version": 1, "kind": "corrective_code_git_bundle", "revision": revision, "base_bundle_sha256": hashlib.sha256(base_bundle.read_bytes()).hexdigest(), "bundle_sha256": hashlib.sha256(output.read_bytes()).hexdigest()}
 
 
 def _add_safe_tar(archive: tarfile.TarFile, source: Path, arcname: str) -> None:
@@ -1092,6 +1117,7 @@ def build_parser() -> argparse.ArgumentParser:
     code_bundle = actions.add_parser("build-code-bundle")
     code_bundle.add_argument("--checkout", type=Path, required=True)
     code_bundle.add_argument("--revision", required=True)
+    code_bundle.add_argument("--base-bundle", type=Path, required=True)
     code_bundle.add_argument("--output", type=Path, required=True)
     code_bundle.add_argument("--execute", action="store_true")
     canary = actions.add_parser("canary-launch")
@@ -1145,7 +1171,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.action == "build-bundle":
         result = build_approved_bundle(args.manifest, checkout=args.checkout, output=args.output)
     elif args.action == "build-code-bundle":
-        result = build_code_bundle(checkout=args.checkout, revision=args.revision, output=args.output)
+        result = build_code_bundle(checkout=args.checkout, revision=args.revision, output=args.output, base_bundle=args.base_bundle)
     elif args.action == "rent":
         result = rent_wave(args.manifest, lifecycle_root=args.lifecycle_root, runner=_subprocess_runner, now_unix=__import__("time").time_ns() // 1_000_000_000)
     elif args.action == "renew-lease":
