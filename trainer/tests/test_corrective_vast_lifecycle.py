@@ -248,8 +248,33 @@ def test_terminal_timeout_is_bound_to_worker_log_and_not_admissible(tmp_path: Pa
     worker = terminal["workers"][0]
     assert worker["timed_out"] is True and worker["raw_receipt_path"] is None
     assert worker["failure_evidence_path"] == "worker-1.log" and len(worker["failure_evidence_sha256"]) == 64
-    with pytest.raises(ValueError, match="nonzero"):
-        LIFECYCLE._validate_remote_terminal(output, {"attempts": [attempt]})
+    validated = LIFECYCLE._validate_remote_terminal(output, {"attempts": [attempt]})
+    assert validated["successful_attempt_ids"] == []
+    assert validated["worker_aborts"][0]["timed_out"] is True
+
+
+def test_terminal_preserves_mixed_worker_abort_and_selectively_ingests_successes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = tmp_path / "sync"
+    attempts = [{"worker_slot": slot, "attempt_id": f"attempt-{slot}"} for slot in range(3)]
+    workers = []
+    for slot in (0, 2):
+        raw = sync / "raw" / f"attempt-{slot}" / "SHA256SUMS.json"
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_text("verified\n", encoding="utf-8")
+        workers.append({"worker_slot": slot, "attempt_id": f"attempt-{slot}", "returncode": 0, "raw_receipt_path": f"raw/attempt-{slot}/SHA256SUMS.json", "raw_receipt_sha256": __import__("hashlib").sha256(raw.read_bytes()).hexdigest()})
+        _write(sync / f"policy-server-receipt-attempt-{slot}.json", {"ok": slot})
+    log = sync / "worker-1.log"; log.write_text("wall timeout\n", encoding="utf-8")
+    workers.append({"worker_slot": 1, "attempt_id": "attempt-1", "returncode": 124, "timed_out": True, "raw_receipt_path": None, "raw_receipt_sha256": None, "failure_evidence_path": "worker-1.log", "failure_evidence_sha256": __import__("hashlib").sha256(log.read_bytes()).hexdigest()})
+    _write(sync / "remote-terminal.json", {"schema_version": 1, "kind": "corrective_remote_terminal", "workers": workers})
+    monkeypatch.setattr(LIFECYCLE, "_verify_canonical_episode", lambda *_args: None)
+    terminal = LIFECYCLE._validate_remote_terminal(sync, {"attempts": attempts})
+    assert terminal["successful_attempt_ids"] == ["attempt-0", "attempt-2"]
+    assert terminal["worker_aborts"] == [{"worker_slot": 1, "attempt_id": "attempt-1", "returncode": 124, "timed_out": True, "failure_evidence_path": "worker-1.log", "failure_evidence_sha256": __import__("hashlib").sha256(log.read_bytes()).hexdigest()}]
+    admitted = LIFECYCLE.ingest_synced_campaign(sync, tmp_path / "campaign", attempt_ids=("attempt-0", "attempt-2"))
+    assert admitted["attempt_ids"] == ["attempt-0", "attempt-2"]
+    assert not (tmp_path / "campaign" / "raw" / "attempt-1").exists()
 
 
 def test_renew_retained_lease_binds_later_wave_and_fresh_provider(tmp_path: Path) -> None:
@@ -759,7 +784,7 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     _write(manifest, {"schema_version": 1, "kind": "corrective_rft_wave", "wave_index": 0, "baseline": baseline, "provider": {"rental_kind": "on-demand", "instance_hourly_cost_usd": .7, "account_hourly_total_usd": 1.5, "offer_id": 7, "gpu_name": "RTX 3090", "num_gpus": 4}, "attempts": attempts})
     code_bundle = tmp_path / "code.bundle"; code_bundle.write_bytes(b"bundle")
     token = tmp_path / "token"; token.write_text("secret")
-    life = tmp_path / "life"; sync = life / "synced-wave-000000"
+    life = tmp_path / "life"; sync = life / "synced-wave-000000-retry-000"
     calls = []
     def materialize_sync() -> None:
         workers = []
@@ -785,7 +810,7 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "git clone --no-checkout" in script and "ryanjin333/lehome-groot-n17-models" in script
     assert "asset_challenge" in script
     assert "if [ -e /workspace/lehome-release-assets ]" in script
-    remote_dir = "/workspace/corrective/wave-000000-" + hashlib.sha256(manifest.read_bytes()).hexdigest()[:12]
+    remote_dir = "/workspace/corrective/wave-000000-" + hashlib.sha256(manifest.read_bytes()).hexdigest()[:12] + "-retry-000"
     assert f"if [ -e {remote_dir}/code ]" in script
     assert "hf download lehome/asset_challenge --repo-type dataset --revision" in script
     assert "lfs install --local" in script and "sha256sum /workspace/lehome-release-assets/\"$path\"" in script
@@ -798,10 +823,11 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "/code/Assets/objects/Challenge_Garment/Release" in script
     assert "/code/code/Assets" not in script
     assert all(f"LEHOME_FLYWHEEL_WORKER_GPU={slot}" in script for slot in range(4))
-    assert f"timeout --signal=TERM --kill-after=15s {LIFECYCLE.WORKER_WALL_TIMEOUT_SECONDS}s" in script
+    assert f"timeout --signal=TERM --kill-after=20s {LIFECYCLE.WORKER_WALL_TIMEOUT_SECONDS}s setsid sh -c" in script
+    assert "kill -TERM -- -$$" in script and "kill -KILL -- -$$" in script
     assert script.count("LEHOME_FLYWHEEL_IMAGE_IDENTITY=" + LIFECYCLE.APPROVED_IMAGE_DIGEST) >= 5
     assert "image identity preflight" in script
-    assert script.count(f"cd {remote_dir}/code && timeout --signal=TERM --kill-after=15s {LIFECYCLE.WORKER_WALL_TIMEOUT_SECONDS}s env HF_HUB_OFFLINE=1") == 4
+    assert script.count(f"cd {remote_dir}/code && timeout --signal=TERM --kill-after=20s {LIFECYCLE.WORKER_WALL_TIMEOUT_SECONDS}s setsid sh -c") == 4
     assert f"{remote_dir}/campaign" in script
     assert f"{remote_dir}/code/campaign" not in script
     assert "msgpack-1.1.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" in script
@@ -820,3 +846,49 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "status --porcelain --untracked-files=all" in script
     assert f"readlink -f {remote_dir}/code/nvidia/Cosmos-Reason2-2B" in script
     assert any(command[0] == "scp" and "/wave-000000-" in command[-2] and command[-2].endswith("/campaign/.") for command in calls)
+
+
+def test_full_wave_retry_uses_new_remote_namespace_and_only_unresolved_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(LIFECYCLE, "_verify_canonical_episode", lambda *_args: None)
+    manifest = _manifest(tmp_path)
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value["baseline"].update(_image_native_baseline())
+    baseline = value["baseline"]
+    for attempt in value["attempts"]:
+        command = attempt["command"]
+        command[command.index("--policy-path") + 1] = baseline["policy_path"]
+        command[command.index("--policy-revision-file") + 1] = baseline["policy_revision_file"]
+        command[command.index("--release-assets-root") + 1] = baseline["release_assets_root"]
+        command[command.index("--groot-root") + 1] = baseline["groot_root"]
+        command[command.index("--groot-python") + 1] = baseline["groot_python"]
+        command[0] = baseline["controller_python"]
+    _write(manifest, value)
+    campaign = tmp_path / "raw"
+    for slot in (0, 2, 3):
+        (campaign / f"attempt-{slot}").mkdir(parents=True)
+        (campaign / f"attempt-{slot}" / "SHA256SUMS.json").write_text("verified\n", encoding="utf-8")
+    life = tmp_path / "life"
+    manifest_hash = __import__("hashlib").sha256(manifest.read_bytes()).hexdigest()
+    _write(life / "wave-000000-remote-000.json", {"manifest_sha256": manifest_hash})
+    stale = life / "synced-wave-000000-retry-000" / ".pending" / "attempt-1"
+    stale.mkdir(parents=True); (stale / "sentinel").write_text("preserve")
+    bundle = tmp_path / "code.bundle"; bundle.write_bytes(b"bundle")
+    token = tmp_path / "token"; token.write_text("secret")
+    calls = []
+    def runner(command):
+        calls.append(command)
+        if command[0] == "scp" and command[-2].endswith("/campaign/."):
+            sync = life / "synced-wave-000000-retry-001"
+            raw = sync / "raw" / "attempt-1" / "SHA256SUMS.json"; raw.parent.mkdir(parents=True, exist_ok=True); raw.write_text("verified\n")
+            _write(sync / "remote-terminal.json", {"schema_version": 1, "kind": "corrective_remote_terminal", "workers": [{"worker_slot": 1, "attempt_id": "attempt-1", "returncode": 0, "raw_receipt_path": "raw/attempt-1/SHA256SUMS.json", "raw_receipt_sha256": __import__("hashlib").sha256(raw.read_bytes()).hexdigest()}]})
+            attempt = value["attempts"][1]
+            _write(sync / "policy-server-receipt-attempt-1.json", {"episode_id": "attempt-1", "backend": "policy_server", "checkpoint_revision": baseline["parent_checkpoint_revision"], "checkpoint_digest": baseline["parent_checkpoint_artifact_sha256"], "code_revision": baseline["code_revision"], "image_identity": baseline["image_identity"], "policy_device": "cuda:1", "parity_stage": "server_cpu", "simulator_device": "cpu", "groot_revision": baseline["groot_revision"], "python_path": baseline["groot_python"], "policy_seed": attempt.get("seed"), "port": 9101, "command": ["--model-path", "/workspace/checkpoints/lehome-groot-n17-models-" + baseline["parent_checkpoint_revision"] + "/policies/step-12000"]})
+        return type("Result", (), {"returncode": 0, "stdout": ""})()
+    receipt = LIFECYCLE.remote_launch_wave(manifest, _canary_instance(), lifecycle_root=life, runner=runner, code_bundle=bundle, token_file=token)
+    script = next(command[-1] for command in calls if command[0] == "ssh" and command[-3:-1] == ("sh", "-lc"))
+    assert "retry-001" in script and "attempt-1" in script
+    assert all(f"attempt-{slot}" not in script for slot in (0, 2, 3))
+    assert receipt["status"] == "remote_terminal" and receipt["successful_attempt_ids"] == ["attempt-1"]
+    assert (stale / "sentinel").read_text() == "preserve"

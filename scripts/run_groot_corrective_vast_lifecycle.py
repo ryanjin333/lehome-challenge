@@ -475,6 +475,24 @@ def _cleanup_new_instance(instance_id: int, runner: Callable[[tuple[str, ...]], 
         raise RuntimeError("newly-created Vast instance cleanup did not verify absence")
 
 
+def _launch_retry_index(lifecycle_root: Path, *, wave_index: int, manifest_sha256: str) -> int:
+    """Allocate an append-only local retry number for one immutable manifest."""
+    prefix = f"wave-{wave_index:06d}-remote-"
+    retries: set[int] = set()
+    for receipt_path in lifecycle_root.glob(prefix + "*.json"):
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            continue
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(receipt, dict) and receipt.get("manifest_sha256") == manifest_sha256:
+            matched = re.fullmatch(re.escape(prefix) + r"([0-9]{3})\.json", receipt_path.name)
+            if matched is not None:
+                retries.add(int(matched.group(1)))
+    return max(retries, default=-1) + 1
+
+
 def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, object], *, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object], code_bundle: Path, token_file: Path) -> dict[str, object]:
     """Launch four workers from the same image-native Git-bundle boundary as canary."""
     lifecycle_root.mkdir(parents=True, exist_ok=True)
@@ -490,7 +508,8 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
     image_identity = _approved_image_identity(baseline, context="full wave")
     remote = f"root@{instance_receipt['host']}"; port = str(instance_receipt["port"])
     manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    remote_dir = f"/workspace/corrective/wave-{manifest['wave_index']:06d}-{manifest_hash[:12]}"
+    retry_index = _launch_retry_index(lifecycle_root, wave_index=manifest["wave_index"], manifest_sha256=manifest_hash)
+    remote_dir = f"/workspace/corrective/wave-{manifest['wave_index']:06d}-{manifest_hash[:12]}-retry-{retry_index:03d}"
     checkout = f"{remote_dir}/code"; output_root = f"{remote_dir}/campaign"
     remote_bundle, remote_token = f"{remote_dir}/code.bundle", f"{remote_dir}/hf.token"
     digest = hashlib.sha256(code_bundle.read_bytes()).hexdigest()
@@ -529,22 +548,28 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
         slot = int(attempt["worker_slot"])
         log = shlex.quote(f"{output_root}/worker-{slot}.log")
         status_file = shlex.quote(f"{output_root}/worker-{slot}.returncode")
-        script_lines.append(f"( cd {shlex.quote(checkout)} && timeout --signal=TERM --kill-after=15s {WORKER_WALL_TIMEOUT_SECONDS}s env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 {_controller_pythonpath(checkout, wire_target=wire_target)} LEHOME_FLYWHEEL_WORKER_GPU={slot} LEHOME_FLYWHEEL_IMAGE_IDENTITY={shlex.quote(image_identity)} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
+        timeout_marker = shlex.quote(f"{output_root}/worker-{slot}.timeout")
+        worker = ("trap 'trap \"\" TERM; printf timeout >" + timeout_marker + "; kill -TERM -- -$$; sleep 15; kill -KILL -- -$$' TERM; "
+                  f"env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 {_controller_pythonpath(checkout, wire_target=wire_target)} LEHOME_FLYWHEEL_WORKER_GPU={slot} LEHOME_FLYWHEEL_IMAGE_IDENTITY={shlex.quote(image_identity)} {command} >{log} 2>&1 & child=$!; wait \"$child\"")
+        script_lines.append(f"( cd {shlex.quote(checkout)} && timeout --signal=TERM --kill-after=20s {WORKER_WALL_TIMEOUT_SECONDS}s setsid sh -c {shlex.quote(worker)}; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
     script_lines.extend(("for pid in $pids; do wait \"$pid\" || true; done", f"python3 -c {shlex.quote(_terminal_writer_program(output_root, {'attempts': remote_attempts}))}", "exit 0"))
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", "\n".join(script_lines)))
     # Always sync the exact campaign output; a failed remote launch is evidence
     # for diagnosis, not a reason to destroy a paid instance automatically.
-    sync_root = lifecycle_root / f"synced-wave-{manifest['wave_index']:06d}"
+    sync_root = lifecycle_root / f"synced-wave-{manifest['wave_index']:06d}-retry-{retry_index:03d}"
     sync_root.parent.mkdir(parents=True, exist_ok=True)
     sync_result = runner(("scp", "-r", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", port, f"{remote}:{output_root}/.", str(sync_root)))
     completed = getattr(result, "returncode", 0)
     if getattr(sync_result, "returncode", 0) not in (0, None) or completed not in (0, None):
-        _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-remote.json", {"schema_version": 1, "kind": "corrective_vast_remote_launch", "wave_index": manifest["wave_index"], "instance_id": instance_receipt["instance_id"], "status": "remote_transport_failure", "transport_returncode": completed, "manifest_sha256": manifest_hash, "bundle_sha256": digest})
+        _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-remote-{retry_index:03d}.json", {"schema_version": 1, "kind": "corrective_vast_remote_launch", "wave_index": manifest["wave_index"], "instance_id": instance_receipt["instance_id"], "status": "remote_transport_failure", "transport_returncode": completed, "manifest_sha256": manifest_hash, "bundle_sha256": digest, "retry_index": retry_index, "sync_root": str(sync_root)})
         raise RuntimeError("remote launch transport failed; synchronized terminal receipt retained for diagnosis")
     receipt = _validate_remote_terminal(sync_root, {**manifest, "attempts": remote_attempts})
     for attempt in remote_attempts:
+        if attempt["attempt_id"] not in receipt["successful_attempt_ids"]:
+            continue
         _validate_canary_policy_receipt(sync_root / f"policy-server-receipt-{attempt['attempt_id']}.json", attempt, baseline, attempt["command"])
-    return _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-remote.json", {"schema_version": 1, "kind": "corrective_vast_remote_launch", "wave_index": manifest["wave_index"], "instance_id": instance_receipt["instance_id"], "status": "remote_terminal", "manifest_sha256": manifest_hash, "bundle_sha256": digest, "worker_returncodes": receipt["worker_returncodes"], "remote_terminal_sha256": receipt["remote_terminal_sha256"]})
+    status = "remote_terminal" if not receipt["worker_aborts"] else "remote_partial"
+    return _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-remote-{retry_index:03d}.json", {"schema_version": 1, "kind": "corrective_vast_remote_launch", "wave_index": manifest["wave_index"], "instance_id": instance_receipt["instance_id"], "status": status, "manifest_sha256": manifest_hash, "bundle_sha256": digest, "retry_index": retry_index, "sync_root": str(sync_root), "worker_returncodes": receipt["worker_returncodes"], "successful_attempt_ids": receipt["successful_attempt_ids"], "worker_aborts": receipt["worker_aborts"], "remote_terminal_sha256": receipt["remote_terminal_sha256"]})
 
 
 def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, object], *, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object], bundle: Path, token_file: Path | None) -> dict[str, object]:
@@ -965,8 +990,8 @@ def _terminal_writer_program(output_root: str, manifest: Mapping[str, object]) -
     # JSON is embedded as a quoted Python literal, never interpreted by a shell.
     workers = [{"worker_slot": int(item["worker_slot"]), "attempt_id": str(item["attempt_id"])} for item in manifest["attempts"]]
     return ("import hashlib,json,pathlib;root=pathlib.Path(" + repr(output_root) + ");workers=[];"
-            "\nfor item in " + repr(workers) + ":\n slot=item['worker_slot']; p=root/f'worker-{slot}.returncode'; raw=root/'raw'/item['attempt_id']/'SHA256SUMS.json'; log=root/f'worker-{slot}.log';"
-            "\n if not p.is_file(): raise SystemExit(2)\n rc=int(p.read_text().strip()); timed_out=rc==124; h=hashlib.sha256(raw.read_bytes()).hexdigest() if raw.is_file() else None; failure_hash=hashlib.sha256(log.read_bytes()).hexdigest() if rc and log.is_file() else None; workers.append({'worker_slot':slot,'attempt_id':item['attempt_id'],'returncode':rc,'timed_out':timed_out,'raw_receipt_path':str(raw.relative_to(root)) if raw.is_file() else None,'raw_receipt_sha256':h,'failure_evidence_path':str(log.relative_to(root)) if failure_hash else None,'failure_evidence_sha256':failure_hash})"
+            "\nfor item in " + repr(workers) + ":\n slot=item['worker_slot']; p=root/f'worker-{slot}.returncode'; raw=root/'raw'/item['attempt_id']/'SHA256SUMS.json'; log=root/f'worker-{slot}.log'; marker=root/f'worker-{slot}.timeout';"
+            "\n if not p.is_file(): raise SystemExit(2)\n rc=int(p.read_text().strip()); timed_out=rc==124 or marker.is_file(); h=hashlib.sha256(raw.read_bytes()).hexdigest() if raw.is_file() else None; failure_hash=hashlib.sha256(log.read_bytes()).hexdigest() if rc and log.is_file() else None; workers.append({'worker_slot':slot,'attempt_id':item['attempt_id'],'returncode':rc,'timed_out':timed_out,'raw_receipt_path':str(raw.relative_to(root)) if raw.is_file() else None,'raw_receipt_sha256':h,'failure_evidence_path':str(log.relative_to(root)) if failure_hash else None,'failure_evidence_sha256':failure_hash})"
             "\nvalue={'schema_version':1,'kind':'corrective_remote_terminal','workers':workers};(root/'remote-terminal.json').write_text(json.dumps(value,sort_keys=True)+'\\n')")
 
 
@@ -988,6 +1013,7 @@ def _validate_remote_terminal(sync_root: Path, manifest: Mapping[str, object]) -
             raise ValueError("remote terminal worker return code is invalid")
         slot = str(worker["worker_slot"]); returncodes[slot] = worker["returncode"]
     failed = [worker for worker in workers if worker["returncode"] != 0]
+    worker_aborts: list[dict[str, object]] = []
     for worker in failed:
         evidence_path = worker.get("failure_evidence_path")
         evidence_hash = worker.get("failure_evidence_sha256")
@@ -996,9 +1022,15 @@ def _validate_remote_terminal(sync_root: Path, manifest: Mapping[str, object]) -
         evidence = sync_root.joinpath(*Path(evidence_path).parts)
         if evidence.is_symlink() or not evidence.is_file() or not isinstance(evidence_hash, str) or _SHA256.fullmatch(evidence_hash) is None or hashlib.sha256(evidence.read_bytes()).hexdigest() != evidence_hash:
             raise ValueError("remote terminal failed worker evidence is missing or mismatched")
-    if failed:
-        raise ValueError("remote terminal records a nonzero worker return code")
+        worker_aborts.append({
+            "worker_slot": worker["worker_slot"], "attempt_id": worker["attempt_id"],
+            "returncode": worker["returncode"], "timed_out": worker.get("timed_out") is True,
+            "failure_evidence_path": evidence_path, "failure_evidence_sha256": evidence_hash,
+        })
+    successful_attempt_ids: list[str] = []
     for worker in workers:
+        if worker["returncode"] != 0:
+            continue
         if worker.get("attempt_id") != expected_ids[int(worker["worker_slot"])]:
             raise ValueError("remote terminal attempt identity does not match manifest")
         raw_path = worker.get("raw_receipt_path")
@@ -1009,7 +1041,13 @@ def _validate_remote_terminal(sync_root: Path, manifest: Mapping[str, object]) -
         if raw.is_symlink() or not raw.is_file() or not isinstance(expected, str) or _SHA256.fullmatch(expected) is None or hashlib.sha256(raw.read_bytes()).hexdigest() != expected:
             raise ValueError("remote terminal raw receipt is missing or mismatched")
         _verify_canonical_episode(raw.parent, expected_ids[int(worker["worker_slot"])])
-    return {"worker_returncodes": returncodes, "remote_terminal_sha256": hashlib.sha256(terminal.read_bytes()).hexdigest()}
+        successful_attempt_ids.append(expected_ids[int(worker["worker_slot"])])
+    return {
+        "worker_returncodes": returncodes,
+        "successful_attempt_ids": successful_attempt_ids,
+        "worker_aborts": worker_aborts,
+        "remote_terminal_sha256": hashlib.sha256(terminal.read_bytes()).hexdigest(),
+    }
 
 
 def _verify_canonical_episode(episode_dir: Path, expected_episode_id: str) -> None:
