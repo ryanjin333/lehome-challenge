@@ -199,9 +199,9 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
     checkout = f"{remote_dir}/code"; output_root = f"{checkout}/campaign"
     remote_bundle, remote_token = f"{remote_dir}/code.bundle", f"{remote_dir}/hf.token"
     digest = hashlib.sha256(code_bundle.read_bytes()).hexdigest()
-    _require_completed(runner(("ssh", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-p", port, remote, "mkdir", "-p", remote_dir)), "full-wave staging directory")
-    _require_completed(runner(("scp", "-P", port, str(code_bundle), f"{remote}:{remote_bundle}")), "full-wave code bundle staging")
-    _require_completed(runner(("scp", "-P", port, str(token_file), f"{remote}:{remote_token}")), "full-wave token staging")
+    _require_completed(runner(("ssh", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "mkdir", "-p", remote_dir)), "full-wave staging directory")
+    _require_completed(runner(("scp", "-o", "StrictHostKeyChecking=accept-new", "-P", port, str(code_bundle), f"{remote}:{remote_bundle}")), "full-wave code bundle staging")
+    _require_completed(runner(("scp", "-o", "StrictHostKeyChecking=accept-new", "-P", port, str(token_file), f"{remote}:{remote_token}")), "full-wave token staging")
     local_output_root = _manifest_output_root(manifest["attempts"])
     policy_revision, policy_digest = baseline.get("parent_checkpoint_revision"), baseline.get("parent_checkpoint_artifact_sha256")
     if not isinstance(policy_revision, str) or not re.fullmatch(r"[0-9a-f]{40}", policy_revision) or not isinstance(policy_digest, str) or _SHA256.fullmatch(policy_digest) is None:
@@ -223,12 +223,12 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
         status_file = shlex.quote(f"{output_root}/worker-{slot}.returncode")
         script_lines.append(f"( LEHOME_FLYWHEEL_WORKER_GPU={slot} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
     script_lines.extend(("for pid in $pids; do wait \"$pid\" || true; done", f"python3 -c {shlex.quote(_terminal_writer_program(output_root, {'attempts': remote_attempts}))}", "exit 0"))
-    result = runner(("ssh", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-p", port, remote, "sh", "-lc", "\n".join(script_lines)))
+    result = runner(("ssh", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", "\n".join(script_lines)))
     # Always sync the exact campaign output; a failed remote launch is evidence
     # for diagnosis, not a reason to destroy a paid instance automatically.
     sync_root = lifecycle_root / f"synced-wave-{manifest['wave_index']:06d}"
     sync_root.parent.mkdir(parents=True, exist_ok=True)
-    sync_result = runner(("scp", "-r", "-P", port, f"{remote}:{output_root}/.", str(sync_root)))
+    sync_result = runner(("scp", "-r", "-o", "StrictHostKeyChecking=accept-new", "-P", port, f"{remote}:{output_root}/.", str(sync_root)))
     completed = getattr(result, "returncode", 0)
     if getattr(sync_result, "returncode", 0) not in (0, None) or completed not in (0, None):
         _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-remote.json", {"schema_version": 1, "kind": "corrective_vast_remote_launch", "wave_index": manifest["wave_index"], "instance_id": instance_receipt["instance_id"], "status": "remote_transport_failure", "transport_returncode": completed, "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(), "bundle_sha256": digest})
@@ -281,11 +281,11 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     manifest_hash = hashlib.sha256(canary_manifest.read_bytes()).hexdigest()
     stage_result: object | None = None
     try:
-        stage_result = runner(("ssh", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-p", port, remote, "mkdir", "-p", remote_dir))
+        stage_result = runner(("ssh", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "mkdir", "-p", remote_dir))
         _require_completed(stage_result, "canary remote staging directory")
-        stage_result = runner(("scp", "-P", port, str(bundle), f"{remote}:{remote_bundle}"))
+        stage_result = runner(("scp", "-o", "StrictHostKeyChecking=accept-new", "-P", port, str(bundle), f"{remote}:{remote_bundle}"))
         _require_completed(stage_result, "canary code-bundle staging")
-        stage_result = runner(("scp", "-P", port, str(token_file), f"{remote}:{remote_token}"))
+        stage_result = runner(("scp", "-o", "StrictHostKeyChecking=accept-new", "-P", port, str(token_file), f"{remote}:{remote_token}"))
         _require_completed(stage_result, "canary token staging")
     except RuntimeError as error:
         return _write_early_abort(lifecycle_root, int(value["wave_index"]), str(attempt["attempt_id"]), int(instance_receipt["instance_id"]), str(error), canary_manifest_sha256=manifest_hash, staged_bundle_sha256=bundle_hash, transport_returncode=getattr(stage_result, "returncode", None))
@@ -317,13 +317,13 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     runtime.extend(_asset_checkout_setup(remote_dir + "/code"))
     command = " ".join(shlex.quote(item) for item in rewritten)
     script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nLEHOME_FLYWHEEL_WORKER_GPU=0 " + command + " )\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
-    result = runner(("ssh", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-p", port, remote, "sh", "-lc", script))
+    result = runner(("ssh", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", script))
     sync = lifecycle_root / f"canary-{value['wave_index']:06d}-sync"
     # The corrective controller consumes raw episodes and policy receipts from
     # this campaign root; never copy the code checkout into its evidence tree.
-    sync_result = runner(("scp", "-r", "-P", port, f"{remote}:{remote_campaign}/.", str(sync)))
+    sync_result = runner(("scp", "-r", "-o", "StrictHostKeyChecking=accept-new", "-P", port, f"{remote}:{remote_campaign}/.", str(sync)))
     returncode_copy = lifecycle_root / f"canary-{value['wave_index']:06d}-returncode.tmp"
-    log_result = runner(("scp", "-P", port, f"{remote}:{remote_dir}/canary.returncode", str(returncode_copy)))
+    log_result = runner(("scp", "-o", "StrictHostKeyChecking=accept-new", "-P", port, f"{remote}:{remote_dir}/canary.returncode", str(returncode_copy)))
     completed = getattr(result, "returncode", 0)
     hashes = {path.relative_to(sync).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(sync.rglob("*")) if path.is_file() and not path.is_symlink()} if sync.is_dir() else {}
     base_receipt = {"schema_version": 1, "attempt_id": attempt["attempt_id"], "instance_id": instance_receipt["instance_id"], "transport_returncode": completed, "canary_manifest_sha256": manifest_hash, "staged_bundle_sha256": bundle_hash, "synced_evidence_sha256": _canonical_hash(hashes)}
