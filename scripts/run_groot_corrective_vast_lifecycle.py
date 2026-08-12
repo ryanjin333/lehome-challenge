@@ -589,7 +589,13 @@ def _asset_checkout_setup(checkout: str) -> list[str]:
         "while read -r oid marker path; do test \"$(sha256sum " + shlex.quote(assets) + "/\"$path\" | cut -d' ' -f1)\" = \"$oid\"; done < " + shlex.quote(lfs_manifest),
         "test -z \"$(" + git + " lfs ls-files --long | awk '$2 != \"*\" {print}')\"",
         "! grep -RIl '^version https://git-lfs.github.com/spec/v1$' " + shlex.quote(assets + "/objects") + " " + shlex.quote(assets + "/robots") + " " + shlex.quote(assets + "/scenes") + " " + shlex.quote(assets + "/textures"),
+        # HF hydration can leave only clean-filter/index metadata marked .M.
+        # Normalize the exact four tracked roots after OID verification; the
+        # empty staged and worktree diffs prove this did not alter content.
+        git + " add --renormalize -- objects robots scenes textures",
+        git + " diff --cached --quiet",
         git + " diff --quiet",
+        "test -z \"$(" + git + " status --porcelain --untracked-files=all)\"",
         "mkdir -p " + shlex.quote(checkout + "/Assets"),
         "for d in objects robots scenes textures; do ln -sfn " + shlex.quote(assets) + "/$d " + shlex.quote(checkout + "/Assets") + "/$d; done",
     ]
