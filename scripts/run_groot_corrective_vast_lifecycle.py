@@ -244,7 +244,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
         slot = int(attempt["worker_slot"])
         log = shlex.quote(f"{output_root}/worker-{slot}.log")
         status_file = shlex.quote(f"{output_root}/worker-{slot}.returncode")
-        script_lines.append(f"( LEHOME_FLYWHEEL_WORKER_GPU={slot} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
+        script_lines.append(f"( PYTHONPATH={shlex.quote(controller_pythonpath)} LEHOME_FLYWHEEL_WORKER_GPU={slot} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
     script_lines.extend(("for pid in $pids; do wait \"$pid\" || true; done", f"python3 -c {shlex.quote(_terminal_writer_program(output_root, {'attempts': remote_attempts}))}", "exit 0"))
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", "\n".join(script_lines)))
     # Always sync the exact campaign output; a failed remote launch is evidence
@@ -336,7 +336,8 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     ]
     runtime.extend(_asset_checkout_setup(remote_dir + "/code"))
     command = " ".join(shlex.quote(item) for item in rewritten)
-    script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nLEHOME_FLYWHEEL_WORKER_GPU=0 " + command + " )\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
+    controller_pythonpath = remote_dir + "/code/source/lehome:" + remote_dir + "/code"
+    script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nPYTHONPATH=" + shlex.quote(controller_pythonpath) + " LEHOME_FLYWHEEL_WORKER_GPU=0 " + command + " )\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", script))
     sync = lifecycle_root / f"canary-{value['wave_index']:06d}-sync"
     # The corrective controller consumes raw episodes and policy receipts from
