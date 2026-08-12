@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from b1k_deploy.dockerhub import CommandResult, DockerImageRelease, HttpResponse
+from b1k_deploy.huggingface import HubProbeReceipt
 from b1k_deploy.production_smoke import ProductionSmokeError, SshSmokeRemote, VastCliSmokeClient, VastInstanceEndpoint, _rollout_command, _training_command
 from b1k_deploy.publish import canonical_payload_hash, load_canonical_template
 from b1k_deploy.smoke import SmokeTemplatePublicationReceipt
@@ -1159,3 +1160,36 @@ def test_rollout_contract_reconciles_both_exact_fixtures_when_the_first_verifica
     assert calls == ["success-fixture", "failure-fixture"]
     assert isinstance(error.value.__cause__, ProductionSmokeError)
     assert str(error.value.__cause__) == "second fixture cleanup failed"
+
+
+def test_rollout_contract_accepts_one_executed_nonterminal_evaluator_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+    identity = tmp_path / "id"; identity.write_text("private", encoding="utf-8"); identity.chmod(0o600)
+
+    class Hub:
+        def verify_remote_probe(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("the test replaces the remote-probe boundary")
+
+    remote = SshSmokeRemote(
+        vast=client, identity_file=identity, known_hosts=tmp_path / "campaign" / "known_hosts",
+        training_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "a" * 64,
+        rollout_image="docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64,
+        **release_receipts(), hub_verifier=Hub(), runner=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(remote, "_runtime_json", lambda *_args: {
+        "gpu_count": 1, "eula_environment": "OMNI_KIT_ACCEPT_EULA=YES", "warp_runtime": "bundled-compatible",
+        "headless_loads": 1, "resets": 2, "rgb_observation_count": 3, "action_mapping_count": 1,
+        "evaluator_outcome": "advanced", "container_digest": "sha256:" + "b" * 64,
+        "remote_probe_upload_commits": {"success-fixture": "1" * 40, "failure-fixture": "2" * 40},
+    })
+    def probe(_role: str, classification: str, run_id: str, _payload: object) -> HubProbeReceipt:
+        prefix = f"b1k-bootstrap-{run_id.removeprefix('b1k-smoke-')}-{classification}"
+        return HubProbeReceipt("dataset", "ryanjin333/behavior1k-groot-n17-rollouts", "dataset", prefix,
+                               f"{prefix}/probe.json", "3" * 40, "4" * 40)
+    monkeypatch.setattr(remote, "_remote_probe", probe)
+
+    evidence = remote.run_rollout_contract("b1k-smoke-" + "e" * 32, "9876543", 60)
+
+    assert evidence.evaluator_outcome == "advanced"

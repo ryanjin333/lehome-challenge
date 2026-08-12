@@ -831,7 +831,7 @@ class SshSmokeRemote:
                 _exact_string(payload["warp_runtime"], "bundled-compatible"),
                 _positive_int(payload["headless_loads"], "headless loads"), _positive_int(payload["resets"], "resets"), "ok",
                 _positive_int(payload["rgb_observation_count"], "RGB observations"), _positive_int(payload["action_mapping_count"], "action mappings"),
-                _exact_one_of(payload["evaluator_outcome"], {"terminal", "quarantined"}), fixtures,
+                _exact_one_of(payload["evaluator_outcome"], {"terminal", "advanced"}), fixtures,
             )
         except Exception as runtime_failure:
             self._raise_after_runtime_reconciliation("dataset", run_id, ("success-fixture", "failure-fixture"), runtime_failure)

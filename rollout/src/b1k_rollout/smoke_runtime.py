@@ -56,8 +56,7 @@ def main(argv: list[str] | None = None) -> int:
         action_count = _action_dimension(evaluator.robot_action)
         if action_count < 1:
             raise RuntimeError("official local policy produced no mapped robot action")
-        if not (terminated or truncated):
-            raise RuntimeError("one-step official evaluator did not terminate or truncate")
+        evaluator_outcome = _evaluator_outcome(terminated, truncated)
 
     import warp
     try:
@@ -73,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps({
         "gpu_count": _cuda_count(), "eula_environment": "OMNI_KIT_ACCEPT_EULA=YES", "warp_runtime": "bundled-compatible",
         "headless_loads": 1, "resets": 2, "rgb_observation_count": rgb_count, "action_mapping_count": action_count,
-        "evaluator_outcome": "terminal" if terminated or truncated else "quarantined", "remote_probe_upload_commits": commits,
+        "evaluator_outcome": evaluator_outcome, "remote_probe_upload_commits": commits,
         "infrastructure_smoke": True, "container_digest": os.environ.get("CONTAINER_DIGEST", ""),
     }, sort_keys=True, separators=(",", ":")))
     return 0
@@ -101,6 +100,12 @@ def _action_dimension(action: object) -> int:
     if isinstance(action, dict):
         return sum(_action_dimension(value) for value in action.values())
     return 0
+
+
+def _evaluator_outcome(terminated: object, truncated: object) -> str:
+    if not isinstance(terminated, bool) or not isinstance(truncated, bool):
+        raise RuntimeError("official evaluator returned an invalid step outcome")
+    return "terminal" if terminated or truncated else "advanced"
 
 
 def _cuda_count() -> int:
