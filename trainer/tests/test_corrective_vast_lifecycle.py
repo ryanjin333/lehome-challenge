@@ -282,6 +282,7 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     assert LIFECYCLE.APPROVED_GROOT_ROOT in script and "lfs pull" in script
     assert "ryanjin333/lehome-groot-n17-models" in script and "Cosmos-Reason2-2B" in script
     assert "policy_artifact_sha256" in script and "/opt/lehome-challenge/.venv/bin/hf download" in script
+    assert "/code/source/lehome:/workspace/corrective/canary-000000/code" in script
     assert "Assets/$d" in script and "LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "if [ -e /workspace/lehome-release-assets ]" in script
     assert "lfs ls-files --long" in script and "diff --quiet" in script
@@ -469,5 +470,6 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "if [ -e /workspace/lehome-release-assets ]" in script
     assert "lfs ls-files --long" in script and "diff --quiet" in script
     assert LIFECYCLE.APPROVED_GROOT_ROOT in script and "/opt/lehome-challenge/.venv/bin/python" in script
+    assert "/code/source/lehome:/workspace/corrective/wave-000000/code" in script
     assert all(f"LEHOME_FLYWHEEL_WORKER_GPU={slot}" in script for slot in range(4))
     assert any(command[0] == "scp" and command[-2].endswith("/code/campaign/.") for command in calls)
