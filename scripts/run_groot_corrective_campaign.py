@@ -153,7 +153,10 @@ def _load_manifests(root: Path, baseline: Mapping[str, object]) -> list[dict[str
     waves_dir = root / "waves"
     if waves_dir.is_symlink():
         raise ValueError("corrective waves directory is unsafe")
-    paths = sorted(waves_dir.glob("wave-*.json")) if waves_dir.exists() else []
+    paths = sorted(
+        path for path in waves_dir.iterdir()
+        if path.is_file() and re.fullmatch(r"wave-[0-9]{6}\.json", path.name)
+    ) if waves_dir.exists() else []
     manifests: list[dict[str, object]] = []
     for expected_index, path in enumerate(paths):
         manifest = _read_json(path, label="corrective wave manifest")
@@ -212,7 +215,9 @@ def _attempt_from_id(attempt_id: str) -> tuple[int, int]:
 
 
 def _attempt_category(root: Path, attempt_id: str) -> str:
-    for manifest_path in (root / "waves").glob("wave-*.json"):
+    for manifest_path in (root / "waves").iterdir():
+        if not manifest_path.is_file() or re.fullmatch(r"wave-[0-9]{6}\.json", manifest_path.name) is None:
+            continue
         manifest = _read_json(manifest_path, label="corrective wave manifest")
         for attempt in _manifest_attempts(manifest):
             if attempt.get("attempt_id") == attempt_id and isinstance(attempt.get("category"), str):

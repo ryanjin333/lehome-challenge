@@ -130,6 +130,22 @@ def test_resume_closes_verified_wave_with_fresh_evidence_and_strict_receipts(tmp
     assert result["closed_wave_count"] == 1 and len(list((root / "receipts").glob("*.json"))) == 4
 
 
+def test_resume_ignores_canary_sidecar_and_schedules_next_canonical_wave(tmp_path: Path) -> None:
+    root, baseline, provider, base, _ = _setup(tmp_path)
+    first = CAMPAIGN.run_corrective_campaign(_args(root, baseline, provider))
+    wave_path = Path(first["launch_manifest"])
+    wave = json.loads(wave_path.read_text(encoding="utf-8"))
+    for attempt in wave["attempts"]:
+        _complete(root, attempt, base)
+    canary_path = root / "waves" / "wave-000000-canary.json"
+    canary = CAMPAIGN.build_corrective_canary_manifest(wave_path, output=canary_path)
+    _provider_file(provider, _provider(evidence_id="evidence-2"))
+    result = CAMPAIGN.run_corrective_campaign(_args(root, baseline, provider))
+    assert result["status"] == "wave_scheduled"
+    assert Path(result["launch_manifest"]).name == "wave-000001.json"
+    assert json.loads(canary_path.read_text(encoding="utf-8")) == canary
+
+
 @pytest.mark.parametrize("broken, message", [("terminal", "missing terminal"), ("policy", "provider receipt")])
 def test_resume_quarantines_missing_terminal_and_provider_mismatch(tmp_path: Path, broken: str, message: str) -> None:
     root, baseline, provider, base, _ = _setup(tmp_path); first = CAMPAIGN.run_corrective_campaign(_args(root, baseline, provider)); attempts = json.loads(Path(first["launch_manifest"]).read_text())["attempts"]
