@@ -155,8 +155,8 @@ def _run_raw(runner: Callable[[tuple[str, ...]], object], command: tuple[str, ..
         raise ValueError("vastai raw response is invalid") from error
 
 
-def _wait_for_running_instance(instance_id: int, *, runner: Callable[[tuple[str, ...]], object], polls: int = 12, sleep: Callable[[float], None] = time.sleep) -> dict[str, object]:
-    """Bounded readback: a created contract is not launchable until SSH is live."""
+def _wait_for_running_instance(instance_id: int, *, runner: Callable[[tuple[str, ...]], object], polls: int = 360, sleep: Callable[[float], None] = time.sleep) -> dict[str, object]:
+    """Allow the approved large image up to 30 minutes to become SSH-ready."""
     for _ in range(polls):
         readback = _run_raw(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
         if isinstance(readback, dict) and readback.get("id") == instance_id and readback.get("actual_status") == "running" and isinstance(readback.get("ssh_host"), str) and readback.get("ssh_host") and type(readback.get("ssh_port", 22)) is int:

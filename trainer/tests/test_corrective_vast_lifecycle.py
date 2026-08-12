@@ -181,6 +181,18 @@ def test_rent_readback_failure_destroys_only_created_instance(tmp_path: Path) ->
     assert ("vastai", "destroy", "instance", "99", "--yes") in calls
 
 
+def test_instance_readiness_window_is_bounded_at_thirty_minutes() -> None:
+    calls = 0
+    sleeps: list[float] = []
+    def runner(_command):
+        nonlocal calls
+        calls += 1
+        return "{}"
+    with pytest.raises(ValueError, match="SSH-ready"):
+        LIFECYCLE._wait_for_running_instance(99, runner=runner, sleep=sleeps.append)
+    assert calls == 360 and sleeps == [5.0] * 360
+
+
 def test_remote_bundle_extracts_checkout_and_rewrites_every_local_runtime_path(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     bundle = _bundle(tmp_path)
