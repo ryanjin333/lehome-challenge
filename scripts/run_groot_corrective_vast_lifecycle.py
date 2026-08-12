@@ -49,6 +49,19 @@ APPROVED_QWEN_FILES = {
     "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
     "tokenizer.json": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
 }
+# A freshly cloned Git repository carries these comments in .git/info/exclude.
+# Do not inherit arbitrary local exclusions: they could conceal checkout changes
+# from the trial's clean-tree gate.  The one additional pattern is deliberately
+# anchored to the compatibility symlink below (not its parent directory).
+_GIT_INFO_EXCLUDE_DEFAULT = (
+    "# git ls-files --others --exclude-from=.git/info/exclude\n"
+    "# Lines that start with '#' are comments.\n"
+    "# For a project mostly in C, the following would be a good set of\n"
+    "# exclude patterns (uncomment them if you want to use them):\n"
+    "# *.[oa]\n"
+    "# *~\n"
+)
+_QWEN_CHECKOUT_LINK = "nvidia/Cosmos-Reason2-2B"
 # Vast's offer filter takes memory in GiB, whereas the raw offer/readback
 # payload reports ``cpu_ram`` in MiB.  Keep those units explicit at the edge.
 OFFER_QUERY = "gpu_name=RTX_3090 num_gpus=4 reliability>=0.95 cpu_cores_effective>=64 cpu_ram>=128 disk_space>=300 duration>=1"
@@ -95,7 +108,40 @@ def _qwen_base_setup(checkout: str) -> list[str]:
         + " && test \"$(sha256sum " + shlex.quote(APPROVED_QWEN_ROOT + "/" + name) + " | cut -d' ' -f1)\" = " + shlex.quote(digest)
         for name, digest in APPROVED_QWEN_FILES.items()
     ]
-    return [download, *checks, "mkdir -p " + shlex.quote(checkout + "/nvidia"), "ln -sfn " + shlex.quote(APPROVED_QWEN_ROOT) + " " + shlex.quote(checkout + "/nvidia/Cosmos-Reason2-2B")]
+    checkout_link = checkout + "/" + _QWEN_CHECKOUT_LINK
+    # Keep the trial's required `cwd == checkout` clean.  This validates all
+    # visible untracked content before installing the only permitted exclusion.
+    # A prior interrupted setup may already have created the *exact* link; that
+    # is the sole recoverable dirty state, and all other untracked paths fail.
+    exclude_program = "\n".join(
+        [
+            "from pathlib import Path",
+            "import subprocess",
+            f"checkout = Path({checkout!r})",
+            f"target = checkout / {_QWEN_CHECKOUT_LINK!r}",
+            "exclude = checkout / '.git' / 'info' / 'exclude'",
+            f"default = {_GIT_INFO_EXCLUDE_DEFAULT!r}",
+            "expected = default + '/nvidia/Cosmos-Reason2-2B\\n'",
+            "if not (checkout / '.git').is_dir(): raise SystemExit('missing git checkout')",
+            "if exclude.parent.is_symlink() or exclude.is_symlink() or (exclude.exists() and not exclude.is_file()): raise SystemExit('unsafe git exclude')",
+            "if exclude.exists() and exclude.read_text(encoding='utf-8') not in ('', default, expected): raise SystemExit('unexpected git exclude content')",
+            "status = subprocess.run(['git', '-C', str(checkout), 'status', '--porcelain', '--untracked-files=all'], check=True, text=True, capture_output=True).stdout",
+            "if status not in ('', '?? nvidia/Cosmos-Reason2-2B\\n'): raise SystemExit('checkout has unexpected changes')",
+            "if (target.exists() or target.is_symlink()) and (not target.is_symlink() or target.resolve() != Path('/cache/models/nvidia/Cosmos-Reason2-2B')): raise SystemExit('unexpected compatibility link')",
+            "if status and not target.is_symlink(): raise SystemExit('missing compatibility link')",
+            "exclude.parent.mkdir(mode=0o700, exist_ok=True)",
+            "exclude.write_text(expected, encoding='utf-8')",
+        ]
+    )
+    link_setup = [
+        "/opt/lehome-challenge/.venv/bin/python -c " + shlex.quote(exclude_program),
+        "mkdir -p " + shlex.quote(checkout + "/nvidia"),
+        "if [ -e " + shlex.quote(checkout_link) + " ] || [ -L " + shlex.quote(checkout_link) + " ]; then test -L " + shlex.quote(checkout_link) + "; else ln -s " + shlex.quote(APPROVED_QWEN_ROOT) + " " + shlex.quote(checkout_link) + "; fi",
+        "test -L " + shlex.quote(checkout_link),
+        "test \"$(readlink -f " + shlex.quote(checkout_link) + ")\" = " + shlex.quote(APPROVED_QWEN_ROOT),
+        "test -z \"$(git -C " + shlex.quote(checkout) + " status --porcelain --untracked-files=all)\"",
+    ]
+    return [download, *checks, *link_setup]
 
 
 def _groot_wrapper_setup() -> list[str]:

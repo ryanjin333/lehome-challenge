@@ -34,6 +34,17 @@ def _canary_instance() -> dict[str, object]:
             "provider_response_sha256": "c" * 64, "provider_evidence_sha256": "d" * 64}
 
 
+def test_qwen_checkout_link_exclusion_allows_only_the_known_recoverable_link() -> None:
+    commands = "\n".join(LIFECYCLE._qwen_base_setup("/workspace/checkouts/reviewed"))
+    assert "checkout has unexpected changes" in commands
+    assert "unexpected git exclude content" in commands
+    assert "exclude.parent.is_symlink()" in commands
+    assert "expected = default +" in commands and "/nvidia/Cosmos-Reason2-2B" in commands
+    assert "ln -s /cache/models/nvidia/Cosmos-Reason2-2B" in commands
+    assert "readlink -f /workspace/checkouts/reviewed/nvidia/Cosmos-Reason2-2B" in commands
+    assert "git -C /workspace/checkouts/reviewed status --porcelain --untracked-files=all" in commands
+
+
 def _manifest(tmp_path: Path) -> Path:
     path = tmp_path / "wave.json"
     baseline = {
@@ -369,6 +380,10 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     assert "Qwen/Qwen3-VL-2B-Instruct" in script and LIFECYCLE.APPROVED_QWEN_REVISION in script
     assert "/cache/models/nvidia/Cosmos-Reason2-2B" in script and "/code/nvidia/Cosmos-Reason2-2B" in script
     assert all(digest in script for digest in LIFECYCLE.APPROVED_QWEN_FILES.values())
+    assert "unsafe git exclude" in script and "/nvidia/Cosmos-Reason2-2B" in script
+    assert "unexpected git exclude content" in script
+    assert "status --porcelain --untracked-files=all" in script
+    assert "readlink -f /workspace/corrective/canary-000000/code/nvidia/Cosmos-Reason2-2B" in script
     assert "policy_artifact_sha256" in script and "/opt/lehome-challenge/.venv/bin/hf download" in script
     assert "/code/source/lehome:/workspace/corrective/canary-000000/code" in script
     assert "/code/Assets/objects/Challenge_Garment/Release" in script
@@ -613,4 +628,8 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/wave-000000/code/source/lehome:/workspace/corrective/wave-000000/code${PYTHONPATH:+:$PYTHONPATH} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "importlib.util" in script and "isaaclab" in script and "lehome" in script and "import isaaclab_tasks" not in script
     assert "Qwen/Qwen3-VL-2B-Instruct" in script and all(digest in script for digest in LIFECYCLE.APPROVED_QWEN_FILES.values())
+    assert "unsafe git exclude" in script and "/nvidia/Cosmos-Reason2-2B" in script
+    assert "unexpected git exclude content" in script
+    assert "status --porcelain --untracked-files=all" in script
+    assert "readlink -f /workspace/corrective/wave-000000/code/nvidia/Cosmos-Reason2-2B" in script
     assert any(command[0] == "scp" and command[-2].endswith("/code/campaign/.") for command in calls)
