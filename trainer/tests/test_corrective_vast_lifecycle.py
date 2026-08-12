@@ -321,6 +321,7 @@ def test_canary_retry_writes_append_only_abort_evidence_and_materializes_wrapper
     assert LIFECYCLE.APPROVED_GROOT_NATIVE_PYTHON in wrapper
     assert LIFECYCLE.APPROVED_GROOT_PYTHON_SHA256 in wrapper
     assert "PYTHONPATH=/opt/gr00t-runtime/lib/python3.10/site-packages:/opt/isaac-groot" in wrapper
+    assert "import gr00t" in wrapper and "import groot" not in wrapper
 
 
 def test_canary_rejects_unbound_or_wrong_wave_instance_before_staging(tmp_path: Path) -> None:

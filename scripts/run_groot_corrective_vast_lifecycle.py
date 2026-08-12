@@ -59,7 +59,7 @@ def _groot_wrapper_setup() -> list[str]:
         "printf '%s' " + shlex.quote(wrapper) + " > " + shlex.quote(APPROVED_GROOT_PYTHON),
         "chmod 755 " + shlex.quote(APPROVED_GROOT_PYTHON),
         "test \"$(sha256sum " + shlex.quote(APPROVED_GROOT_PYTHON) + " | cut -d' ' -f1)\" = " + shlex.quote(APPROVED_GROOT_PYTHON_SHA256),
-        shlex.quote(APPROVED_GROOT_PYTHON) + " -c " + shlex.quote("import groot; assert groot.__file__.startswith('/opt/isaac-groot')"),
+        shlex.quote(APPROVED_GROOT_PYTHON) + " -c " + shlex.quote("import gr00t; assert gr00t.__file__.startswith('/opt/isaac-groot')"),
     ]
 
 
