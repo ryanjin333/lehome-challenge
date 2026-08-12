@@ -365,7 +365,8 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     assert Path(result["synced_evidence_root"]).is_dir()
     script = next(command[-1] for command in calls if command[0] == "ssh" and command[-3:-1] == ("sh", "-lc"))
     assert LIFECYCLE.APPROVED_GROOT_ROOT in script
-    assert "ryanjin333/lehome-groot-n17-models" in script and "Cosmos-Reason2-2B" in script
+    assert "HF_ENDPOINT=https://hf-mirror.com" in script and "ryanjin333/lehome-groot-n17-models" in script
+    assert "Cosmos-Reason2-2B" not in script
     assert "policy_artifact_sha256" in script and "/opt/lehome-challenge/.venv/bin/hf download" in script
     assert "/code/source/lehome:/workspace/corrective/canary-000000/code" in script
     assert "/code/Assets/objects/Challenge_Garment/Release" in script
@@ -382,6 +383,15 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     scp_sources = [command[-2] for command in calls if command[0] == "scp" and "canary-000000" in command[-2]]
     assert any(source.endswith("/code/campaign/.") for source in scp_sources)
     assert not any(source.endswith("/canary-000000/.") for source in scp_sources)
+
+
+def test_remote_hf_endpoint_is_approved_and_mirror_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert LIFECYCLE._remote_hf_endpoint() == "https://hf-mirror.com"
+    monkeypatch.setenv("LEHOME_FLYWHEEL_HF_ENDPOINT", "https://huggingface.co")
+    assert LIFECYCLE._remote_hf_endpoint() == "https://huggingface.co"
+    monkeypatch.setenv("LEHOME_FLYWHEEL_HF_ENDPOINT", "https://untrusted.invalid")
+    with pytest.raises(ValueError, match="endpoint"):
+        LIFECYCLE._remote_hf_endpoint()
 
 
 def test_canary_cli_actions_are_exposed() -> None:

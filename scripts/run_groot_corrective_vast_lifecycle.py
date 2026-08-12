@@ -39,6 +39,7 @@ APPROVED_GROOT_NATIVE_PYTHON = "/opt/python/cpython-3.10.18-linux-x86_64-gnu/bin
 APPROVED_GROOT_NATIVE_PYTHON_SHA256 = "ee22b22d759f77275c82503976968bc3193f577a4a039d0540bdb95e1b54bf1e"
 APPROVED_GROOT_PYTHON_SHA256 = "760c0ad783861ad329821442e0d1385bd915d1bdaef87646c331bbf035d3c389"
 APPROVED_ASSET_REVISION = "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9"
+APPROVED_HF_ENDPOINTS = frozenset({"https://hf-mirror.com", "https://huggingface.co"})
 # Vast's offer filter takes memory in GiB, whereas the raw offer/readback
 # payload reports ``cpu_ram`` in MiB.  Keep those units explicit at the edge.
 OFFER_QUERY = "gpu_name=RTX_3090 num_gpus=4 reliability>=0.95 cpu_cores_effective>=64 cpu_ram>=128 disk_space>=300 duration>=1"
@@ -47,6 +48,18 @@ VAST_SSH_IDENTITY = os.environ.get("LEHOME_VAST_SSH_IDENTITY", str(Path.home() /
 
 def _canonical_hash(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _remote_hf_endpoint() -> str:
+    """Use the China-reachable mirror by default, never accept an arbitrary host."""
+    endpoint = os.environ.get("LEHOME_FLYWHEEL_HF_ENDPOINT", "https://hf-mirror.com")
+    if endpoint not in APPROVED_HF_ENDPOINTS:
+        raise ValueError("corrective HF endpoint is not approved")
+    return endpoint
+
+
+def _hf_download(command: str) -> str:
+    return "HF_ENDPOINT=" + shlex.quote(_remote_hf_endpoint()) + " " + command
 
 
 def _groot_wrapper_setup() -> list[str]:
@@ -279,7 +292,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
     controller_pythonpath = checkout + "/source/lehome:" + checkout
     revision = str(baseline["code_revision"])
     checkout_setup = "if [ -e " + shlex.quote(checkout) + " ]; then test -d " + shlex.quote(checkout + "/.git") + " && test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision) + " && git -C " + shlex.quote(checkout) + " diff --quiet; else git clone --no-checkout " + shlex.quote(remote_bundle) + " " + shlex.quote(checkout) + " && git -C " + shlex.quote(checkout) + " checkout --detach " + shlex.quote(revision) + "; fi"
-    setup = ["set -eu", "test -x /opt/lehome-challenge/.venv/bin/python", *_groot_wrapper_setup(), "test \"$(git -C " + shlex.quote(APPROVED_GROOT_ROOT) + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_GROOT_REVISION), "chmod 600 " + shlex.quote(remote_token), "export HF_TOKEN=\"$(cat " + shlex.quote(remote_token) + ")\"", checkout_setup, "test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision), "git -C " + shlex.quote(checkout) + " diff --quiet", "/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root), "printf '%s\\n' " + shlex.quote(policy_revision) + " > " + shlex.quote(policy_root + "/revision.txt"), "PYTHONPATH=" + shlex.quote(controller_pythonpath) + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; assert policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "'")]
+    setup = ["set -eu", "test -x /opt/lehome-challenge/.venv/bin/python", *_groot_wrapper_setup(), "test \"$(git -C " + shlex.quote(APPROVED_GROOT_ROOT) + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_GROOT_REVISION), "chmod 600 " + shlex.quote(remote_token), "export HF_TOKEN=\"$(cat " + shlex.quote(remote_token) + ")\"", checkout_setup, "test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision), "git -C " + shlex.quote(checkout) + " diff --quiet", _hf_download("/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root)), "printf '%s\\n' " + shlex.quote(policy_revision) + " > " + shlex.quote(policy_root + "/revision.txt"), "PYTHONPATH=" + shlex.quote(controller_pythonpath) + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; assert policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "'")]
     setup.extend(_asset_checkout_setup(checkout))
     script_lines = ["set -eu", "trap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT", *setup[1:], f"mkdir -p {shlex.quote(output_root)}", f"cd {shlex.quote(checkout)}", "pids='' "]
     for attempt in remote_attempts:
@@ -371,11 +384,9 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
         "test \"$(git -C " + shlex.quote(remote_dir + "/code") + " rev-parse HEAD)\" = " + shlex.quote(str(value["baseline"].get("code_revision", ""))),
         "git -C " + shlex.quote(remote_dir + "/code") + " diff --quiet",
         "mkdir -p " + shlex.quote(policy_path),
-        "/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root),
+        _hf_download("/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root)),
         "printf '%s\\n' " + shlex.quote(policy_revision) + " > " + shlex.quote(policy_root + "/revision.txt"),
         "PYTHONPATH=" + shlex.quote(remote_dir + "/code/source/lehome:" + remote_dir + "/code") + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; import sys; sys.exit(0 if policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "' else 1)"),
-        "if [ ! -d /cache/models/nvidia/Cosmos-Reason2-2B ]; then /opt/lehome-challenge/.venv/bin/hf download nvidia/Cosmos-Reason2-2B --local-dir /cache/models/nvidia/Cosmos-Reason2-2B; fi",
-        "test -d /cache/models/nvidia/Cosmos-Reason2-2B",
     ]
     runtime.extend(_asset_checkout_setup(remote_dir + "/code"))
     command = " ".join(shlex.quote(item) for item in rewritten)
@@ -418,7 +429,7 @@ def _asset_checkout_setup(checkout: str) -> list[str]:
         "if [ -e " + shlex.quote(assets) + " ]; then test -d " + shlex.quote(assets + "/.git") + " && test \"$(" + git + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_ASSET_REVISION) + " && " + git + " diff --quiet; else git clone --no-checkout https://huggingface.co/datasets/lehome/asset_challenge " + shlex.quote(assets) + " && " + git + " checkout --detach " + shlex.quote(APPROVED_ASSET_REVISION) + "; fi",
         # Git-LFS does not install its filter in the pinned image, so hydrate
         # the exact dataset revision with HF and then validate every LFS OID.
-        "/opt/lehome-challenge/.venv/bin/hf download lehome/asset_challenge --repo-type dataset --revision " + shlex.quote(APPROVED_ASSET_REVISION) + " --local-dir " + shlex.quote(assets),
+        _hf_download("/opt/lehome-challenge/.venv/bin/hf download lehome/asset_challenge --repo-type dataset --revision " + shlex.quote(APPROVED_ASSET_REVISION) + " --local-dir " + shlex.quote(assets)),
         git + " lfs install --local",
         git + " lfs ls-files --long > " + shlex.quote(lfs_manifest),
         "while read -r oid marker path; do test \"$(sha256sum " + shlex.quote(assets) + "/\"$path\" | cut -d' ' -f1)\" = \"$oid\"; done < " + shlex.quote(lfs_manifest),
