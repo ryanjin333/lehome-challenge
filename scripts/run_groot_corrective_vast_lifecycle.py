@@ -228,7 +228,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
         raise ValueError("full wave lacks immutable private policy binding")
     policy_root = "/workspace/checkpoints/lehome-groot-n17-models-" + policy_revision
     policy_path = policy_root + "/policies/step-12000"
-    mapping = {"policy_path": "image:" + policy_path, "policy_revision_file": "image:" + policy_root + "/revision.txt", "release_assets_root": "code/Assets/objects/Challenge_Garment/Release", "groot_root": "image:" + APPROVED_GROOT_ROOT, "groot_python": "image:" + APPROVED_GROOT_PYTHON, "controller_python": "image:/opt/lehome-challenge/.venv/bin/python", "output_root": "campaign", "trial_script": "scripts/run_groot_flywheel_trial.py"}
+    mapping = {"policy_path": "image:" + policy_path, "policy_revision_file": "image:" + policy_root + "/revision.txt", "release_assets_root": "Assets/objects/Challenge_Garment/Release", "groot_root": "image:" + APPROVED_GROOT_ROOT, "groot_python": "image:" + APPROVED_GROOT_PYTHON, "controller_python": "image:/opt/lehome-challenge/.venv/bin/python", "output_root": "campaign", "trial_script": "scripts/run_groot_flywheel_trial.py"}
     remote_attempts = [
         {**attempt, "command": _remote_command(attempt["command"], baseline, mapping, checkout, local_output_root)}
         for attempt in manifest["attempts"]
@@ -315,7 +315,7 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     local_output = _manifest_output_root([attempt] * 4)
     policy_root = "/workspace/checkpoints/lehome-groot-n17-models-" + policy_revision
     policy_path = policy_root + "/policies/step-12000"
-    mapping = {"policy_path": "image:" + policy_path, "policy_revision_file": "image:" + policy_root + "/revision.txt", "release_assets_root": "code/Assets/objects/Challenge_Garment/Release", "groot_root": "image:" + APPROVED_GROOT_ROOT, "groot_python": "image:" + APPROVED_GROOT_PYTHON, "controller_python": "image:/opt/lehome-challenge/.venv/bin/python", "output_root": "campaign", "trial_script": "scripts/run_groot_flywheel_trial.py"}
+    mapping = {"policy_path": "image:" + policy_path, "policy_revision_file": "image:" + policy_root + "/revision.txt", "release_assets_root": "Assets/objects/Challenge_Garment/Release", "groot_root": "image:" + APPROVED_GROOT_ROOT, "groot_python": "image:" + APPROVED_GROOT_PYTHON, "controller_python": "image:/opt/lehome-challenge/.venv/bin/python", "output_root": "campaign", "trial_script": "scripts/run_groot_flywheel_trial.py"}
     rewritten = _remote_command(attempt["command"], baseline, mapping, remote_dir + "/code", local_output)
     runtime = [
         *_groot_wrapper_setup(),
