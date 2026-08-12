@@ -795,9 +795,23 @@ def _stage_release(
 
 def _tree_matches(tree: Iterable[HubTreeEntry], prefix: str, entries: tuple[SyncEntry, ...]) -> bool:
     expected = {f"{prefix}/{item.relative_path}" for item in entries}
+    expected_directories = {
+        f"{prefix}/" + "/".join(parts[:index])
+        for item in entries
+        for parts in (item.relative_path.split("/"),)
+        for index in range(1, len(parts))
+    }
     observed: set[str] = set()
     for entry in tree:
+        if entry.relative_path == prefix:
+            if entry.entry_type != "directory":
+                return False
+            continue
         if not entry.relative_path.startswith(prefix + "/"):
+            continue
+        if entry.entry_type == "directory":
+            if entry.relative_path not in expected_directories:
+                return False
             continue
         if entry.entry_type != "file" or entry.relative_path not in expected:
             return False

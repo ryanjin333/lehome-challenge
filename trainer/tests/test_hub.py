@@ -671,3 +671,11 @@ def test_real_transport_lists_complete_tree_at_explicit_commit_with_token(
         ("tree", {**expected_common, "recursive": True, "expand": True}),
         ("files", expected_common),
     ]
+
+
+def test_hub_tree_entry_allows_repository_dotfiles_but_rejects_aliases() -> None:
+    assert hub_module.HubTreeEntry(".gitattributes", "file").relative_path == ".gitattributes"
+    assert hub_module.HubTreeEntry("nested/.metadata", "file").relative_path == "nested/.metadata"
+    for unsafe in ("./payload", "nested/../payload", "/payload", "nested//payload"):
+        with pytest.raises(ValueError, match="canonical and relative"):
+            hub_module.HubTreeEntry(unsafe, "file")

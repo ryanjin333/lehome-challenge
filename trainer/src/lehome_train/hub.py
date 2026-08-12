@@ -41,7 +41,18 @@ class HubTreeEntry:
     entry_type: Literal["file", "directory", "symlink", "special"]
 
     def __post_init__(self) -> None:
-        validate_artifact_relative_path(self.relative_path)
+        # Repository listings legitimately contain control files such as
+        # ``.gitattributes``.  They are not publication artifacts, so retain
+        # the traversal/alias protections without applying the stricter rule
+        # that rejects every dot-prefixed component.
+        if (
+            not self.relative_path
+            or self.relative_path.startswith("/")
+            or "\\" in self.relative_path
+            or "\x00" in self.relative_path
+            or any(component in {"", ".", ".."} for component in self.relative_path.split("/"))
+        ):
+            raise ValueError("Hub tree entry path is not canonical and relative")
         if self.entry_type not in {"file", "directory", "symlink", "special"}:
             raise ValueError("Hub tree entry has an unsupported path type")
 

@@ -41,7 +41,7 @@ APPROVED_GROOT_PYTHON_SHA256 = "760c0ad783861ad329821442e0d1385bd915d1bdaef87646
 APPROVED_ASSET_REVISION = "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9"
 # Vast's offer filter takes memory in GiB, whereas the raw offer/readback
 # payload reports ``cpu_ram`` in MiB.  Keep those units explicit at the edge.
-OFFER_QUERY = "gpu_name=RTX_3090 num_gpus=4 reliability>=0.95 cpu_cores>=64 cpu_ram>=128 disk_space>=300 duration>=1"
+OFFER_QUERY = "gpu_name=RTX_3090 num_gpus=4 reliability>=0.95 cpu_cores_effective>=64 cpu_ram>=128 disk_space>=300 duration>=1"
 VAST_SSH_IDENTITY = os.environ.get("LEHOME_VAST_SSH_IDENTITY", str(Path.home() / ".ssh" / "vast_quest"))
 
 
@@ -78,7 +78,7 @@ def capture_offer_evidence(*, offers: Sequence[Mapping[str, object]], instances:
     """Bind a live external provider snapshot, without creating an instance."""
     if type(now_unix) is not int or type(ttl_seconds) is not int or ttl_seconds <= 0:
         raise ValueError("provider evidence time window is invalid")
-    matching = [offer for offer in offers if offer.get("is_bid") is False and offer.get("gpu_name") == "RTX 3090" and offer.get("num_gpus") == 4 and type(offer.get("id")) is int and type(offer.get("dph_total")) in (int, float) and _effective_cores(offer) >= 64 and _memory_mib(offer) >= 128_000 and (offer.get("driver_version") is None or _driver_at_least_550(offer.get("driver_version")))]
+    matching = [offer for offer in offers if offer.get("is_bid") is False and offer.get("gpu_name") == "RTX 3090" and offer.get("num_gpus") == 4 and type(offer.get("id")) is int and type(offer.get("dph_total")) in (int, float) and _effective_cores(offer) >= 64 and _memory_mib(offer) >= 128_000 and _is_approved_r580(offer.get("driver_version"))]
     if not matching:
         raise ValueError("live provider offers contain no on-demand 4xRTX3090 choice")
     def hourly(item: Mapping[str, object]) -> float:
@@ -116,9 +116,15 @@ def _read_manifest(path: Path) -> dict[str, object]:
     return value
 
 
-def _driver_at_least_550(value: object) -> bool:
-    try: return int(str(value).split(".", 1)[0]) >= 550
-    except (TypeError, ValueError): return False
+def _is_approved_r580(value: object) -> bool:
+    """Only accept a complete R580 build in the audited compatibility window."""
+    if not isinstance(value, str):
+        return False
+    matched = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?", value)
+    if matched is None:
+        return False
+    version = tuple(int(item or 0) for item in matched.groups())
+    return (580, 65, 6) <= version < (590, 0, 0)
 
 
 def _number(value: object) -> float:
@@ -130,15 +136,13 @@ def _number(value: object) -> float:
 
 
 def _effective_cores(value: Mapping[str, object]) -> float:
-    """Prefer Vast's effective allocation, retaining old raw snapshots safely."""
-    return _number(value.get("cpu_cores_effective", value.get("cpu_cores", 0)))
+    """Vast raw offer/readback field; missing capacity is inadmissible."""
+    return _number(value.get("cpu_cores_effective"))
 
 
 def _memory_mib(value: Mapping[str, object]) -> float:
-    """Prefer actual Vast MiB fields; legacy fixtures advertise GiB."""
-    if "cpu_ram" in value:
-        return _number(value["cpu_ram"])
-    return _number(value.get("ram", value.get("ram_gb", 0))) * 1024
+    """Vast raw offer/readback memory is MiB; missing capacity is inadmissible."""
+    return _number(value.get("cpu_ram"))
 
 
 def _run_raw(runner: Callable[[tuple[str, ...]], object], command: tuple[str, ...]) -> object:
@@ -185,7 +189,7 @@ def rent_wave(manifest_path: Path, *, lifecycle_root: Path, runner: Callable[[tu
     except BaseException:
         _cleanup_new_instance(instance_id, runner)
         raise
-    if not isinstance(readback, dict) or readback.get("id") != instance_id or readback.get("is_bid") is not False or readback.get("gpu_name") != "RTX 3090" or readback.get("num_gpus") != 4 or _effective_cores(readback) < 64 or _memory_mib(readback) < 128_000 or not _driver_at_least_550(readback.get("driver_version")) or float(readback.get("dph_total", math.inf)) != evidence["instance_hourly_cost_usd"]:
+    if not isinstance(readback, dict) or readback.get("id") != instance_id or readback.get("is_bid") is not False or readback.get("gpu_name") != "RTX 3090" or readback.get("num_gpus") != 4 or _effective_cores(readback) < 64 or _memory_mib(readback) < 128_000 or not _is_approved_r580(readback.get("driver_version")) or float(readback.get("dph_total", math.inf)) != evidence["instance_hourly_cost_usd"]:
         _cleanup_new_instance(instance_id, runner)
         raise ValueError("vastai instance readback does not match approved offer")
     receipt = {"schema_version": 1, "kind": "corrective_vast_instance", "instance_id": instance_id, "host": readback.get("ssh_host"), "port": readback.get("ssh_port", 22), "provider_response_sha256": _canonical_hash(readback), "provider_evidence_sha256": _canonical_hash(evidence), "wave_index": manifest["wave_index"]}
@@ -195,7 +199,7 @@ def rent_wave(manifest_path: Path, *, lifecycle_root: Path, runner: Callable[[tu
 
 
 def _cleanup_new_instance(instance_id: int, runner: Callable[[tuple[str, ...]], object]) -> None:
-    runner(("vastai", "destroy", "instance", str(instance_id)))
+    runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
     try:
         absent = _run_raw(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
     except (ValueError, RuntimeError):
@@ -394,7 +398,9 @@ def _write_early_abort(root: Path, wave_index: int, attempt_id: str, instance_id
     _write_new(evidence / "transport.json", {"schema_version": 1, "transport_returncode": transport_returncode, "phase": "staging"})
     _write_new(evidence / "canary.returncode", {"status": "unavailable", "reason": "remote command was not started"})
     evidence_hash = _evidence_root_sha256(evidence)
-    return _write_new(root / f"canary-{wave_index:06d}-abort-{retry}.json", {"schema_version": 1, "kind": "corrective_canary_abort", "attempt_id": attempt_id, "instance_id": instance_id, "canary_manifest_sha256": canary_manifest_sha256, "staged_bundle_sha256": staged_bundle_sha256, "transport_returncode": transport_returncode, "non_training_admitted": False, "early_setup_failure": True, "retry_id": retry, "abort_evidence_root": str(evidence), "synced_evidence_root": str(evidence), "synced_evidence_sha256": evidence_hash, "abort_evidence_sha256": evidence_hash})
+    receipt_path = root / f"canary-{wave_index:06d}-abort-{retry}.json"
+    receipt = _write_new(receipt_path, {"schema_version": 1, "kind": "corrective_canary_abort", "attempt_id": attempt_id, "instance_id": instance_id, "canary_manifest_sha256": canary_manifest_sha256, "staged_bundle_sha256": staged_bundle_sha256, "transport_returncode": transport_returncode, "non_training_admitted": False, "early_setup_failure": True, "retry_id": retry, "abort_evidence_root": str(evidence), "synced_evidence_root": str(evidence), "synced_evidence_sha256": evidence_hash, "abort_evidence_sha256": evidence_hash})
+    return {**receipt, "abort_receipt_path": str(receipt_path), "publisher_synced_evidence_root": str(evidence)}
 
 
 def _copy_regular_tree(source: Path, destination: Path) -> None:
@@ -428,7 +434,9 @@ def _write_remote_abort(root: Path, wave_index: int, *, attempt_id: str, base_re
         _write_new(evidence / "canary.returncode", {"status": "unavailable", "reason": "returncode synchronization failed"})
     _copy_regular_tree(sync_root, evidence / "campaign")
     evidence_hash = _evidence_root_sha256(evidence)
-    return _write_new(root / f"canary-{wave_index:06d}-abort-{retry}.json", {**base_receipt, "kind": "corrective_canary_abort", "non_training_admitted": False, "retry_id": retry, "sync_returncode": sync_returncode, "returncode_sync_returncode": returncode_sync_returncode, "abort_evidence_root": str(evidence), "synced_evidence_root": str(evidence), "synced_evidence_sha256": evidence_hash})
+    receipt_path = root / f"canary-{wave_index:06d}-abort-{retry}.json"
+    receipt = _write_new(receipt_path, {**base_receipt, "kind": "corrective_canary_abort", "non_training_admitted": False, "retry_id": retry, "sync_returncode": sync_returncode, "returncode_sync_returncode": returncode_sync_returncode, "abort_evidence_root": str(evidence), "synced_evidence_root": str(evidence), "synced_evidence_sha256": evidence_hash})
+    return {**receipt, "abort_receipt_path": str(receipt_path), "publisher_synced_evidence_root": str(evidence)}
 
 
 def _materialize_canary_attempt_receipt(canary_manifest: Path, sync_root: Path, output: Path) -> dict[str, object]:
@@ -708,7 +716,7 @@ def destroy_after_publication(instance_id: int, publication_receipt: Path, lifec
         raise ValueError("publisher disposal receipt lacks immutable HF proof")
     if not isinstance(lifecycle, dict) or lifecycle.get("kind") != "corrective_vast_instance" or lifecycle.get("instance_id") != instance_id:
         raise ValueError("lifecycle receipt is not bound to instance")
-    runner(("vastai", "destroy", "instance", str(instance_id)))
+    runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
     absent = _run_raw(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
     if absent not in (None, {}, []):
         raise ValueError("vastai destroy readback still finds instance")

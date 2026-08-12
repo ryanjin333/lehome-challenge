@@ -63,14 +63,14 @@ def _bundle(tmp_path: Path) -> Path:
 
 def test_capture_offer_evidence_binds_live_offer_and_account_snapshot(tmp_path: Path) -> None:
     evidence = LIFECYCLE.capture_offer_evidence(
-        offers=[{"id": 8, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 1.1, "cpu_cores_effective": 64, "cpu_ram": 131072, "is_bid": False}, {"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 1.0, "cpu_cores_effective": 64, "cpu_ram": 131072, "is_bid": False}],
+        offers=[{"id": 8, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 1.1, "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.65.06", "is_bid": False}, {"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 1.0, "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.65.06", "is_bid": False}],
         instances=[{"id": 99, "dph_total": 0.5}], output=tmp_path / "offer.json", now_unix=100, ttl_seconds=60,
     )
     assert evidence["account_hourly_total_usd"] == 1.5
     assert evidence["expires_at_unix"] == 160
     assert (tmp_path / evidence["source_snapshot_path"]).is_file()
     assert evidence["offer_id"] == 7
-    assert "cpu_ram>=128" in LIFECYCLE.OFFER_QUERY
+    assert "cpu_ram>=128" in LIFECYCLE.OFFER_QUERY and "cpu_cores_effective>=64" in LIFECYCLE.OFFER_QUERY
 
 
 def test_cli_query_and_rent_readback_rejects_spoofed_or_mismatched_instance(tmp_path: Path) -> None:
@@ -83,13 +83,13 @@ def test_cli_query_and_rent_readback_rejects_spoofed_or_mismatched_instance(tmp_
         if command[:4] == ("vastai", "--raw", "show", "volumes"):
             return "[]"
         if command[:4] == ("vastai", "--raw", "search", "offers"):
-            return '[{"id":8,"gpu_name":"RTX 3090","num_gpus":4,"dph_total":1.1,"cpu_cores_effective":64,"cpu_ram":131072,"is_bid":false},{"id":7,"gpu_name":"RTX 3090","num_gpus":4,"dph_total":1.0,"cpu_cores_effective":64,"cpu_ram":131072,"is_bid":false}]'
+            return '[{"id":8,"gpu_name":"RTX 3090","num_gpus":4,"dph_total":1.1,"cpu_cores_effective":64,"cpu_ram":131072,"driver_version":"580.65.06","is_bid":false},{"id":7,"gpu_name":"RTX 3090","num_gpus":4,"dph_total":1.0,"cpu_cores_effective":64,"cpu_ram":131072,"driver_version":"580.65.06","is_bid":false}]'
         if command[:4] == ("vastai", "--raw", "create", "instance"):
             return '{"new_contract":99}'
         if command[:4] == ("vastai", "--raw", "show", "instance") and destroyed[0]:
             return "{}"
         if command[:4] == ("vastai", "--raw", "show", "instance"):
-            return '{"id":99,"actual_status":"running","ssh_host":"host","ssh_port":22,"gpu_name":"A100","num_gpus":4,"cpu_cores_effective":64,"cpu_ram":131072,"driver_version":"550.54","dph_total":1.0,"is_bid":false}'
+            return '{"id":99,"actual_status":"running","ssh_host":"host","ssh_port":22,"gpu_name":"A100","num_gpus":4,"cpu_cores_effective":64,"cpu_ram":131072,"driver_version":"580.65.06","dph_total":1.0,"is_bid":false}'
         if command[:3] == ("vastai", "destroy", "instance"):
             destroyed[0] = True
             return ""
@@ -123,13 +123,13 @@ def test_remote_stage_launch_and_destroy_require_live_receipts(tmp_path: Path) -
 def test_capture_rejects_bid_and_stale_spend_and_deterministically_prefers_manifest_offer(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="4xRTX3090"):
         LIFECYCLE.capture_offer_evidence(offers=[{"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 1.0, "is_bid": True}], instances=[], output=tmp_path / "bid.json", now_unix=1, ttl_seconds=30)
-    evidence = LIFECYCLE.capture_offer_evidence(offers=[{"id": 9, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 0.9, "cpu_cores": 64, "ram": 128, "is_bid": False}, {"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 1.0, "cpu_cores": 64, "ram": 128, "is_bid": False}], instances=[], output=tmp_path / "preferred.json", now_unix=1, ttl_seconds=30, preferred_offer_id=7)
+    evidence = LIFECYCLE.capture_offer_evidence(offers=[{"id": 9, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 0.9, "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.65.06", "is_bid": False}, {"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 1.0, "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.65.06", "is_bid": False}], instances=[], output=tmp_path / "preferred.json", now_unix=1, ttl_seconds=30, preferred_offer_id=7)
     assert evidence["offer_id"] == 7
 
 
 def test_preferred_over_cap_falls_back_to_compatible_under_cap(tmp_path: Path) -> None:
     evidence = LIFECYCLE.capture_offer_evidence(
-        offers=[{"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 1.8, "cpu_cores": 64, "ram": 128, "is_bid": False}, {"id": 8, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 0.8, "cpu_cores": 64, "ram": 128, "is_bid": False}],
+        offers=[{"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 1.8, "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.65.06", "is_bid": False}, {"id": 8, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 0.8, "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.65.06", "is_bid": False}],
         instances=[{"dph_total": 0.5}], output=tmp_path / "fallback.json", now_unix=1, ttl_seconds=30, preferred_offer_id=7,
     )
     assert evidence["offer_id"] == 8
@@ -141,6 +141,23 @@ def test_capture_rejects_actual_vast_capacity_below_four_worker_floor(tmp_path: 
             offers=[{"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 0.7, "cpu_cores_effective": 63, "cpu_ram": 131072, "is_bid": False}],
             instances=[], output=tmp_path / "cores.json", now_unix=1, ttl_seconds=30,
         )
+
+
+@pytest.mark.parametrize("driver", [None, "580.65.05", "590.0.0", "550.54"])
+def test_capture_rejects_missing_or_out_of_window_r580_driver(tmp_path: Path, driver: str | None) -> None:
+    offer = {"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": .7, "cpu_cores_effective": 64, "cpu_ram": 131072, "is_bid": False}
+    if driver is not None:
+        offer["driver_version"] = driver
+    with pytest.raises(ValueError, match="4xRTX3090"):
+        LIFECYCLE.capture_offer_evidence(offers=[offer], instances=[], output=tmp_path / "driver.json", now_unix=1, ttl_seconds=30)
+
+
+def test_capture_accepts_two_component_r580_provider_version(tmp_path: Path) -> None:
+    evidence = LIFECYCLE.capture_offer_evidence(
+        offers=[{"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": .7, "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.142", "is_bid": False}],
+        instances=[], output=tmp_path / "driver.json", now_unix=1, ttl_seconds=30,
+    )
+    assert evidence["offer_id"] == 7
     with pytest.raises(ValueError, match="4xRTX3090"):
         LIFECYCLE.capture_offer_evidence(
             offers=[{"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 0.7, "cpu_cores_effective": 64, "cpu_ram": 127999, "is_bid": False}],
@@ -154,14 +171,14 @@ def test_rent_readback_failure_destroys_only_created_instance(tmp_path: Path) ->
         calls.append(command)
         if command[:4] == ("vastai", "--raw", "show", "instances"): return "[]"
         if command[:4] == ("vastai", "--raw", "show", "volumes"): return "[]"
-        if command[:4] == ("vastai", "--raw", "search", "offers"): return '[{"id":7,"gpu_name":"RTX 3090","num_gpus":4,"dph_total":1.0,"cpu_cores":64,"ram":128,"is_bid":false}]'
+        if command[:4] == ("vastai", "--raw", "search", "offers"): return '[{"id":7,"gpu_name":"RTX 3090","num_gpus":4,"dph_total":1.0,"cpu_cores_effective":64,"cpu_ram":131072,"driver_version":"580.65.06","is_bid":false}]'
         if command[:4] == ("vastai", "--raw", "create", "instance"): return '{"new_contract":99}'
         if command[:4] == ("vastai", "--raw", "show", "instance"): return '{}'
         if command[:3] == ("vastai", "destroy", "instance"): return ""
         raise AssertionError(command)
     with pytest.raises(ValueError, match="SSH-ready"):
         LIFECYCLE.rent_wave(_manifest(tmp_path), lifecycle_root=tmp_path / "life", runner=runner, now_unix=100, sleep=lambda _: None)
-    assert ("vastai", "destroy", "instance", "99") in calls
+    assert ("vastai", "destroy", "instance", "99", "--yes") in calls
 
 
 def test_remote_bundle_extracts_checkout_and_rewrites_every_local_runtime_path(tmp_path: Path) -> None:
@@ -254,7 +271,7 @@ def test_canary_disposal_accepts_publisher_receipt_schema(tmp_path: Path) -> Non
         calls.append(command)
         return "{}"
     assert LIFECYCLE.destroy_after_canary_publication(9, publication, lifecycle, canary_attempt_id="attempt-0", runner=runner)
-    assert calls[0] == ("vastai", "destroy", "instance", "9")
+    assert calls[0] == ("vastai", "destroy", "instance", "9", "--yes")
 
 
 def test_canary_disposal_rejects_publication_for_another_instance(tmp_path: Path) -> None:
@@ -361,6 +378,7 @@ def test_campaign_sync_failure_returns_one_stable_publishable_abort_root(tmp_pat
     result = LIFECYCLE.remote_launch_canary(canary, _canary_instance(), lifecycle_root=tmp_path / "life", runner=runner, bundle=bundle, token_file=token)
     evidence = Path(result["synced_evidence_root"])
     assert result["kind"] == "corrective_canary_abort" and result["abort_evidence_root"] == str(evidence)
+    assert Path(result["abort_receipt_path"]).is_file() and result["publisher_synced_evidence_root"] == str(evidence)
     assert (evidence / "setup.json").is_file() and (evidence / "transport.json").is_file() and (evidence / "canary.returncode").read_text() == "1\n"
     assert result["synced_evidence_sha256"] == LIFECYCLE._evidence_root_sha256(evidence)
 

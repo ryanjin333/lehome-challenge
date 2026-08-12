@@ -29,6 +29,8 @@ from lehome_train.flywheel.publish import (
 )
 from lehome_train.hub import HubAccess, HubTreeEntry
 from lehome_train.io import canonical_json_bytes, canonical_json_sha256, sha256_file
+from lehome_train.models import SyncEntry
+from lehome_train.flywheel import publish as publish_module
 from lehome_train.flywheel import publish_canary as canary_cli
 
 
@@ -83,6 +85,20 @@ class FakeTransport:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(self.remote[f"{remote_prefix}/{relative_path}"])
         return revision
+
+
+def test_corrective_tree_match_accepts_expected_remote_directories() -> None:
+    entries = (
+        SyncEntry("root.json", "a" * 64, 2),
+        SyncEntry("nested/payload.json", "b" * 64, 2),
+    )
+    tree = (
+        HubTreeEntry("release", "directory"),
+        HubTreeEntry("release/root.json", "file"),
+        HubTreeEntry("release/nested", "directory"),
+        HubTreeEntry("release/nested/payload.json", "file"),
+    )
+    assert publish_module._tree_matches(tree, "release", entries)
 
 
 def _attempt(index: int, category: str) -> dict[str, object]:
