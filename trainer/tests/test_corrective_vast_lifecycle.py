@@ -38,8 +38,9 @@ def test_qwen_checkout_link_exclusion_allows_only_the_known_recoverable_link() -
     commands = "\n".join(LIFECYCLE._qwen_base_setup("/workspace/checkouts/reviewed"))
     download = LIFECYCLE._qwen_base_setup("/workspace/checkouts/reviewed")[0]
     assert download.count(" --include ") == 1
-    assert "--include model.safetensors config.json preprocessor_config.json tokenizer.json tokenizer_config.json --local-dir" in download
+    assert "--include model.safetensors config.json preprocessor_config.json tokenizer.json tokenizer_config.json chat_template.json --local-dir" in download
     assert LIFECYCLE.APPROVED_QWEN_FILES["tokenizer_config.json"] == "c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399"
+    assert LIFECYCLE.APPROVED_QWEN_FILES["chat_template.json"] == "6f8a6a55027e3da5160105556cda5dd69f6423f1c32645f6730d32de7773d0c4"
     assert "checkout has unexpected changes" in commands
     assert "unexpected git exclude content" in commands
     assert "exclude.parent.is_symlink()" in commands

@@ -49,6 +49,7 @@ APPROVED_QWEN_FILES = {
     "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
     "tokenizer.json": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
     "tokenizer_config.json": "c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399",
+    "chat_template.json": "6f8a6a55027e3da5160105556cda5dd69f6423f1c32645f6730d32de7773d0c4",
 }
 APPROVED_CONTROLLER_WIRE_WHEELS = (
     (
@@ -154,7 +155,7 @@ def _qwen_base_setup(checkout: str) -> list[str]:
     download = _hf_download(
         "/opt/lehome-challenge/.venv/bin/hf download " + APPROVED_QWEN_REPOSITORY
         + " --revision " + shlex.quote(APPROVED_QWEN_REVISION)
-        + " --include model.safetensors config.json preprocessor_config.json tokenizer.json tokenizer_config.json --local-dir "
+        + " --include model.safetensors config.json preprocessor_config.json tokenizer.json tokenizer_config.json chat_template.json --local-dir "
         + shlex.quote(APPROVED_QWEN_ROOT)
     )
     checks = [
