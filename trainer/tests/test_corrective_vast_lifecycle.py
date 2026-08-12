@@ -279,12 +279,14 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     assert result["kind"] == "corrective_canary_abort"
     assert Path(result["synced_evidence_root"]).is_dir()
     script = next(command[-1] for command in calls if command[0] == "ssh" and command[-3:-1] == ("sh", "-lc"))
-    assert LIFECYCLE.APPROVED_GROOT_ROOT in script and "lfs pull" in script
+    assert LIFECYCLE.APPROVED_GROOT_ROOT in script
     assert "ryanjin333/lehome-groot-n17-models" in script and "Cosmos-Reason2-2B" in script
     assert "policy_artifact_sha256" in script and "/opt/lehome-challenge/.venv/bin/hf download" in script
     assert "/code/source/lehome:/workspace/corrective/canary-000000/code" in script
     assert "Assets/$d" in script and "LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "if [ -e /workspace/lehome-release-assets ]" in script
+    assert "hf download lehome/asset_challenge --repo-type dataset --revision" in script
+    assert "lfs install --local" in script and "sha256sum /workspace/lehome-release-assets/\"$path\"" in script
     assert "lfs ls-files --long" in script and "diff --quiet" in script
     assert "trap 'rm -f /workspace/corrective/canary-000000/hf.token; unset HF_TOKEN' EXIT" in script
     scp_sources = [command[-2] for command in calls if command[0] == "scp" and "canary-000000" in command[-2]]
@@ -466,8 +468,10 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     script = next(command[-1] for command in calls if command[0] == "ssh" and command[-3:-1] == ("sh", "-lc"))
     assert receipt["status"] == "remote_terminal"
     assert "git clone --no-checkout" in script and "ryanjin333/lehome-groot-n17-models" in script
-    assert "asset_challenge" in script and "lfs pull" in script
+    assert "asset_challenge" in script
     assert "if [ -e /workspace/lehome-release-assets ]" in script
+    assert "hf download lehome/asset_challenge --repo-type dataset --revision" in script
+    assert "lfs install --local" in script and "sha256sum /workspace/lehome-release-assets/\"$path\"" in script
     assert "lfs ls-files --long" in script and "diff --quiet" in script
     assert LIFECYCLE.APPROVED_GROOT_ROOT in script and "/opt/lehome-challenge/.venv/bin/python" in script
     assert "/code/source/lehome:/workspace/corrective/wave-000000/code" in script
