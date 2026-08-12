@@ -149,9 +149,9 @@ class VastRunner:
         self.calls.append((sanitized, timeout))
         if arguments[1:3] == ("search", "offers"):
             payload = [
-                {"id": 10, "dph_base": 0.005, "dph_total": 0.01, "gpu_name": "too-small", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 24576, "driver_version": "550.54.14", "disk_space": 200.9, "cpu_ram": 65536, "inet_down": 1000.9, "duration": 3600.0},
-                {"id": 11, "dph_base": 0.35, "dph_total": 0.40, "gpu_name": "slow", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 49152, "driver_version": "550.54.14", "disk_space": 100.9, "cpu_ram": 32768, "inet_down": 1000.9, "duration": 3600.0},
-                {"id": 12, "dph_base": 0.04, "dph_total": 0.07777777777777778, "gpu_name": "fast", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 49152, "driver_version": "550.54.14", "disk_space": 200.9, "cpu_ram": 65536, "inet_down": 1000.9, "duration": 3600.0},
+                {"id": 10, "dph_base": 0.005, "dph_total": 0.01, "gpu_name": "too-small", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 24576, "driver_version": "550.54.14", "disk_space": 200.9, "cpu_ram": 65536, "cpu_cores_effective": 16, "inet_down": 1000.9, "duration": 3600.0},
+                {"id": 11, "dph_base": 0.35, "dph_total": 0.40, "gpu_name": "slow", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 49152, "driver_version": "550.54.14", "disk_space": 100.9, "cpu_ram": 32768, "cpu_cores_effective": 8, "inet_down": 1000.9, "duration": 3600.0},
+                {"id": 12, "dph_base": 0.04, "dph_total": 0.07777777777777778, "gpu_name": "fast", "verification": "verified", "vericode": 1, "num_gpus": 1, "cpu_arch": "amd64", "cuda_max_good": 12.4, "compute_cap": 800, "gpu_ram": 49152, "driver_version": "550.54.14", "disk_space": 300.9, "cpu_ram": 128000, "cpu_cores_effective": 24, "disk_bw": 4000, "inet_down": 1000.9, "inet_up": 500, "direct_port_count": 1, "duration": 3600.0},
             ]
         elif arguments[2:4] == ("search", "templates"):
             payload = [{**self.template, "id": 123, "hash_id": "canonical_template_hash"}]
@@ -207,8 +207,10 @@ def test_selects_the_cheapest_verified_compatible_one_gpu_offer_and_binds_provid
     assert offer.hourly_rate_usd == Decimal("0.077778")
     assert offer.gpu_bid_usd == Decimal("0.040000")
     assert "gpu_ram>=48" in runner.calls[0][0][3]
+    assert "-d" in runner.calls[0][0]
+    assert "-i" not in runner.calls[0][0]
     assert "gpu_ram>=12288" not in runner.calls[0][0][3]
-    assert offer.compatibility.ram_gb == 64
+    assert offer.compatibility.ram_gb == 128
     assert offer.compatibility.maximum_duration_minutes == 60
     assert instance_id == "9876543"
     assert runner.calls[-1] == (
@@ -227,7 +229,7 @@ def test_selects_the_cheapest_verified_compatible_one_gpu_offer_and_binds_provid
     assert headers["Authorization"] == "Bearer [REDACTED]"
     assert payload["template_hash_id"] == "canonical_template_hash"
     assert payload["image_login"] == "-u ryanjin333 -p [REDACTED] docker.io"
-    assert payload["price"] == 0.04
+    assert payload["price"] is None
     # The separately-created smoke template owns the smoke-mode flag.  Sending
     # any per-instance env here replaces Vast's template Docker options.
     assert payload["env"] == {}
@@ -239,8 +241,16 @@ def test_rollout_create_uses_environment_smoke_mode_without_an_incomplete_runtim
     runner.template["image"] = "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64
     runner.template["env"] = runner.template["env"].replace("CONTAINER_DIGEST=sha256:" + "0" * 64, "CONTAINER_DIGEST=sha256:" + "b" * 64)
     runner.template["env"] += " -e B1K_ROLLOUT_SMOKE_RUNTIME=1"
-    client.select_offer("rollout-smoke")
+    offer = client.select_offer("rollout-smoke")
+    assert offer.offer_id == "12"
     assert "gpu_ram>=24" in runner.calls[0][0][3]
+    assert "cpu_ram>=128" in runner.calls[0][0][3]
+    assert "cpu_cores_effective>=24" in runner.calls[0][0][3]
+    assert "disk_bw>=4000" in runner.calls[0][0][3]
+    assert "inet_down>=1000" in runner.calls[0][0][3]
+    assert "inet_up>=500" in runner.calls[0][0][3]
+    assert "direct_port_count>=1" in runner.calls[0][0][3]
+    assert "datacenter=True" in runner.calls[0][0][3]
     client.create_instance({"offer_id": "12", "template_id": "123", "idempotency_key": "b1k-smoke-" + "c" * 32, "hourly_rate_usd": "0.20", "gpu_bid_usd": "0.10", "disk_gb": 300, "purpose": "rollout-smoke", "image_reference": runner.template["image"], "payload_hash": canonical_payload_hash(runner.template)}, timeout_seconds=30)
     payload = runner.http_calls[-1][3]
     assert payload.get("args") is None
@@ -825,6 +835,29 @@ def test_ephemeral_template_creation_retries_exact_name_readback_after_an_empty_
     assert receipt.template_id == "456"
     assert "CONTAINER_DIGEST=sha256:" + "a" * 64 in created_payload["env"]
     assert "-e B1K_TRAINING_SMOKE_RUNTIME=1" in created_payload["env"]
+
+
+def test_rollout_smoke_template_preserves_the_production_cpu_and_ram_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = VastRunner(); client = _client(tmp_path, runner)
+    runner.template = load_canonical_template("rollout", source_root=WORKSPACE)
+    runner.template["image"] = "docker.io/ryanjin333/behavior1k-groot-n17@sha256:" + "b" * 64
+    runner.template["env"] = runner.template["env"].replace("CONTAINER_DIGEST=sha256:" + "0" * 64, "CONTAINER_DIGEST=sha256:" + "b" * 64)
+    production_payload = dict(runner.template)
+    production = SmokeTemplatePublicationReceipt("123", rollout_release(runner.template["image"]), canonical_payload_hash(production_payload))
+    created_payload: dict[str, object] = {}
+    monkeypatch.setattr(client, "attest_template_binding", lambda **_kwargs: "provider")
+    monkeypatch.setattr(client, "_template_registry_repo", lambda _template_id: "docker.io")
+    monkeypatch.setattr(client, "_template_create_command", lambda payload, **_kwargs: created_payload.update(payload) or ("create",))
+    monkeypatch.setattr(client, "_create_template_id", lambda _command: "456")
+    monkeypatch.setattr(client, "_template_readback", lambda template_id: production_payload if template_id == "123" else created_payload)
+    monkeypatch.setattr(client, "_rows", lambda _arguments, timeout_seconds=None: [{"id": 456, "name": "b1k-rollout-smoke-" + "d" * 32}])
+
+    client.create_ephemeral_smoke_template("rollout", production, name="b1k-rollout-smoke-" + "d" * 32)
+
+    assert created_payload["extra_filters"]["cpu_ram"] == {"gte": 128000}
+    assert created_payload["extra_filters"]["cpu_cores_effective"] == {"gte": 24}
 
 
 def test_ephemeral_template_propagates_only_the_registered_private_registry_reference(

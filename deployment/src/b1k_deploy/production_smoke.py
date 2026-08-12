@@ -140,6 +140,10 @@ class VastCliSmokeClient:
         # headless Isaac rollout canary needs 24 GB.
         minimum_vram_gb = 48 if purpose == "training-smoke" else 24
         minimum_vram_mib = minimum_vram_gb * 1024
+        # Vast expresses CPU RAM with decimal MB in both offer rows and
+        # template filters (128 GB == 128000), unlike GPU VRAM's MiB units.
+        minimum_ram_mb = 16000 if purpose == "training-smoke" else 128000
+        minimum_cpu_cores = 4 if purpose == "training-smoke" else 24
         requested_disk = 100 if purpose == "training-smoke" else 300
         # Vast CLI 1.5.2 returns cpu_ram in MiB, duration in seconds, float
         # disk_space, `verification`/`vericode`, cuda_max_good, and dph_total.
@@ -148,8 +152,14 @@ class VastCliSmokeClient:
         # CLI query values are expressed in GB (the client multiplies them by
         # 1000), while raw offer rows report MiB.  Query in GB, then enforce
         # the stricter raw-MiB threshold before accepting a receipt.
-        query = f"num_gpus=1 cpu_arch=amd64 gpu_ram>={minimum_vram_gb} compute_cap>=750 cuda_max_good>=12 rentable=True"
-        rows = self._rows((str(self._vastai), "search", "offers", query, "-i", "--storage", str(requested_disk), "--order", "dph_total", "--raw"))
+        rollout_floor = (
+            " cpu_ram>=128 cpu_cores_effective>=24 disk_bw>=4000"
+            " inet_down>=1000 inet_up>=500 direct_port_count>=1"
+            " verified=True datacenter=True"
+            if purpose == "rollout-smoke" else ""
+        )
+        query = f"num_gpus=1 cpu_arch=amd64 gpu_ram>={minimum_vram_gb} compute_cap>=750 cuda_max_good>=12 rentable=True{rollout_floor}"
+        rows = self._rows((str(self._vastai), "search", "offers", query, "-d", "--storage", str(requested_disk), "--order", "dph_total", "--raw"))
         candidates: list[tuple[Decimal, Decimal, Mapping[str, Any], SmokeCompatibility]] = []
         for row in rows:
             try:
@@ -157,7 +167,7 @@ class VastCliSmokeClient:
                     verified_datacenter=_verified_datacenter(row),
                     gpu_compatible=_gpu_compatible(row, minimum_vram_mib),
                     disk_gb=_floor_units(row, "disk_space", 1),
-                    ram_gb=_floor_units(row, "cpu_ram", 1024),
+                    ram_gb=_floor_units(row, "cpu_ram", 1000),
                     network_mbps=_floor_units(row, "inet_down", 1),
                     maximum_duration_minutes=_floor_units(row, "duration", 60),
                     selection="cheapest-compatible-verified",
@@ -165,7 +175,21 @@ class VastCliSmokeClient:
                 compatibility.validate()
                 rate = _rate(row.get("dph_total"))
                 gpu_bid = _rate(row.get("dph_base"))
-                if rate <= 0 or gpu_bid <= 0 or gpu_bid > rate or _exact_id(row.get("id")) in PROTECTED_INSTANCE_IDS:
+                if (
+                    rate <= 0
+                    or gpu_bid <= 0
+                    or gpu_bid > rate
+                    or _floor_units(row, "cpu_ram", 1) < minimum_ram_mb
+                    or _floor_units(row, "cpu_cores_effective", 1) < minimum_cpu_cores
+                    or (purpose == "rollout-smoke" and (
+                        _floor_units(row, "disk_bw", 1) < 4000
+                        or _floor_units(row, "inet_down", 1) < 1000
+                        or _floor_units(row, "inet_up", 1) < 500
+                        or _floor_units(row, "direct_port_count", 1) < 1
+                        or compatibility.maximum_duration_minutes < 60
+                    ))
+                    or _exact_id(row.get("id")) in PROTECTED_INSTANCE_IDS
+                ):
                     continue
             except (ProductionSmokeError, SmokeError):
                 continue
@@ -259,7 +283,9 @@ class VastCliSmokeClient:
             # options on Vast.  The ephemeral smoke template already carries
             # its smoke-mode flag, so preserve that template verbatim here.
             "env": {},
-            "price": float(bid),
+            # A null price is Vast's on-demand contract. Supplying a price
+            # creates an interruptible bid contract even for the same offer.
+            "price": None,
             "disk": disk,
             "label": label,
             "extra": None,
@@ -375,8 +401,8 @@ class VastCliSmokeClient:
         payload["name"] = name
         payload["recommended_disk_space"] = 100 if purpose == "training" else 300
         filters["gpu_ram"] = {"gte": 12000 if purpose == "training" else 24000}
-        filters["cpu_ram"] = {"gte": 16000 if purpose == "training" else 32000}
-        filters["cpu_cores_effective"] = {"gte": 4 if purpose == "training" else 8}
+        filters["cpu_ram"] = {"gte": 16000 if purpose == "training" else 128000}
+        filters["cpu_cores_effective"] = {"gte": 4 if purpose == "training" else 24}
         filters.pop("gpu_name", None)
         payload["extra_filters"] = filters
         docker_login_repo = self._template_registry_repo(production.template_id)
