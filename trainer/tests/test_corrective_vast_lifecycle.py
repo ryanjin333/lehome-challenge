@@ -285,6 +285,7 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     assert "/code/source/lehome:/workspace/corrective/canary-000000/code" in script
     assert "Assets/$d" in script and "LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "if [ -e /workspace/lehome-release-assets ]" in script
+    assert "if [ -e /workspace/corrective/canary-000000/code ]" in script
     assert "hf download lehome/asset_challenge --repo-type dataset --revision" in script
     assert "lfs install --local" in script and "sha256sum /workspace/lehome-release-assets/\"$path\"" in script
     assert "lfs ls-files --long" in script and "diff --quiet" in script
@@ -470,6 +471,7 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "git clone --no-checkout" in script and "ryanjin333/lehome-groot-n17-models" in script
     assert "asset_challenge" in script
     assert "if [ -e /workspace/lehome-release-assets ]" in script
+    assert "if [ -e /workspace/corrective/wave-000000/code ]" in script
     assert "hf download lehome/asset_challenge --repo-type dataset --revision" in script
     assert "lfs install --local" in script and "sha256sum /workspace/lehome-release-assets/\"$path\"" in script
     assert "lfs ls-files --long" in script and "diff --quiet" in script
