@@ -146,6 +146,36 @@ def test_full_wave_skips_canary_attempt_already_ingested_into_campaign(tmp_path:
     assert all(f"attempt-{slot}" in remote_script for slot in (1, 2, 3))
 
 
+def test_terminal_validator_accepts_exact_three_slot_resume(tmp_path: Path, monkeypatch) -> None:
+    sync = tmp_path / "sync"
+    workers = []
+    attempts = []
+    for slot in (1, 2, 3):
+        attempt_id = f"attempt-{slot}"
+        raw = sync / "raw" / attempt_id / "SHA256SUMS.json"
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_text("verified\n")
+        workers.append({"worker_slot": slot, "attempt_id": attempt_id, "returncode": 0, "raw_receipt_path": f"raw/{attempt_id}/SHA256SUMS.json", "raw_receipt_sha256": __import__("hashlib").sha256(raw.read_bytes()).hexdigest()})
+        attempts.append({"worker_slot": slot, "attempt_id": attempt_id})
+    _write(sync / "remote-terminal.json", {"schema_version": 1, "kind": "corrective_remote_terminal", "workers": workers})
+    monkeypatch.setattr(LIFECYCLE, "_verify_canonical_episode", lambda *_args: None)
+    assert set(LIFECYCLE._validate_remote_terminal(sync, {"attempts": attempts})["worker_returncodes"]) == {"1", "2", "3"}
+
+
+def test_renew_retained_lease_binds_later_wave_and_fresh_provider(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    value = json.loads(manifest.read_text())
+    value["wave_index"] = 1
+    value["provider_evidence"] = {"schema_version": 1, "kind": "external_provider_offer_evidence", "evidence_id": "fresh-wave-1"}
+    _write(manifest, value)
+    prior = tmp_path / "wave-0-instance.json"
+    _write(prior, {"schema_version": 1, "kind": "corrective_vast_instance", "instance_id": 99, "host": "host", "port": 22, "wave_index": 0})
+    readback = {"id": 99, "actual_status": "running", "is_bid": False, "gpu_name": "RTX 3090", "num_gpus": 4, "cpu_cores_effective": 64, "cpu_ram": 131072, "driver_version": "580.142", "ssh_host": "host", "ssh_port": 22}
+    receipt = LIFECYCLE.renew_retained_lease(manifest, prior, lifecycle_root=tmp_path / "life", runner=lambda _command: json.dumps(readback))
+    assert receipt["instance_id"] == 99 and receipt["wave_index"] == 1 and receipt["lease_wave_index"] == 0
+    assert receipt["provider_evidence_sha256"] == LIFECYCLE._canonical_hash(value["provider_evidence"])
+
+
 def test_capture_rejects_bid_and_stale_spend_and_deterministically_prefers_manifest_offer(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="4xRTX3090"):
         LIFECYCLE.capture_offer_evidence(offers=[{"id": 7, "gpu_name": "RTX 3090", "num_gpus": 4, "dph_total": 1.0, "is_bid": True}], instances=[], output=tmp_path / "bid.json", now_unix=1, ttl_seconds=30)

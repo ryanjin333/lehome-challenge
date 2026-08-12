@@ -198,6 +198,36 @@ def rent_wave(manifest_path: Path, *, lifecycle_root: Path, runner: Callable[[tu
     return _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-instance.json", receipt)
 
 
+def renew_retained_lease(manifest_path: Path, prior_receipt_path: Path, *, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object]) -> dict[str, object]:
+    """Bind a later wave to the same still-running collector with fresh evidence."""
+    manifest = _read_manifest(manifest_path)
+    prior = _read_json_object(prior_receipt_path, "retained lease receipt")
+    evidence = manifest.get("provider_evidence")
+    instance_id = prior.get("instance_id")
+    if prior.get("kind") != "corrective_vast_instance" or type(instance_id) is not int or instance_id <= 0 or not isinstance(evidence, dict):
+        raise ValueError("retained lease receipt or provider evidence is invalid")
+    readback = _run_raw(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+    if (
+        not isinstance(readback, dict) or readback.get("id") != instance_id
+        or readback.get("actual_status") != "running" or readback.get("is_bid") is not False
+        or readback.get("gpu_name") != "RTX 3090" or readback.get("num_gpus") != 4
+        or _effective_cores(readback) < 64 or _memory_mib(readback) < 128_000
+        or not _is_approved_r580(readback.get("driver_version"))
+        or readback.get("ssh_host") != prior.get("host") or readback.get("ssh_port", 22) != prior.get("port")
+    ):
+        raise ValueError("retained Vast lease live readback is incompatible")
+    receipt = {
+        "schema_version": 1, "kind": "corrective_vast_instance", "instance_id": instance_id,
+        "host": prior["host"], "port": prior["port"],
+        "provider_response_sha256": _canonical_hash(readback),
+        "provider_evidence_sha256": _canonical_hash(evidence),
+        "wave_index": manifest["wave_index"],
+        "lease_wave_index": prior.get("lease_wave_index", prior.get("wave_index")),
+        "prior_instance_receipt_sha256": hashlib.sha256(prior_receipt_path.read_bytes()).hexdigest(),
+    }
+    return _write_new(lifecycle_root / f"wave-{manifest['wave_index']:06d}-instance.json", receipt)
+
+
 def _cleanup_new_instance(instance_id: int, runner: Callable[[tuple[str, ...]], object]) -> None:
     runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
     try:
@@ -634,8 +664,9 @@ def _validate_remote_terminal(sync_root: Path, manifest: Mapping[str, object]) -
     except json.JSONDecodeError as error:
         raise ValueError("remote terminal receipt is invalid") from error
     workers = value.get("workers") if isinstance(value, dict) and value.get("schema_version") == 1 and value.get("kind") == "corrective_remote_terminal" else None
-    if not isinstance(workers, list) or {item.get("worker_slot") for item in workers if isinstance(item, dict)} != {0, 1, 2, 3} or len(workers) != 4:
-        raise ValueError("remote terminal receipt does not bind four worker slots")
+    expected_ids = {int(item["worker_slot"]): str(item["attempt_id"]) for item in manifest["attempts"]}
+    if not expected_ids or not set(expected_ids) <= {0, 1, 2, 3} or not isinstance(workers, list) or {item.get("worker_slot") for item in workers if isinstance(item, dict)} != set(expected_ids) or len(workers) != len(expected_ids):
+        raise ValueError("remote terminal receipt does not bind scheduled worker slots")
     returncodes: dict[str, int] = {}
     for worker in workers:
         if not isinstance(worker, dict) or type(worker.get("returncode")) is not int:
@@ -643,7 +674,6 @@ def _validate_remote_terminal(sync_root: Path, manifest: Mapping[str, object]) -
         slot = str(worker["worker_slot"]); returncodes[slot] = worker["returncode"]
     if any(returncode != 0 for returncode in returncodes.values()):
         raise ValueError("remote terminal records a nonzero worker return code")
-    expected_ids = {int(item["worker_slot"]): str(item["attempt_id"]) for item in manifest["attempts"]}
     for worker in workers:
         if worker.get("attempt_id") != expected_ids[int(worker["worker_slot"])]:
             raise ValueError("remote terminal attempt identity does not match manifest")
@@ -765,6 +795,11 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--lifecycle-root", type=Path, required=True)
     rent = actions.choices["rent"]
     rent.add_argument("--execute", action="store_true")
+    renew = actions.add_parser("renew-lease")
+    renew.add_argument("--manifest", type=Path, required=True)
+    renew.add_argument("--prior-instance-receipt", type=Path, required=True)
+    renew.add_argument("--lifecycle-root", type=Path, required=True)
+    renew.add_argument("--execute", action="store_true")
     remote = actions.choices["remote-launch"]
     remote.add_argument("--instance-receipt", type=Path, required=True)
     remote.add_argument("--code-git-bundle", type=Path, required=True)
@@ -822,6 +857,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = build_code_bundle(checkout=args.checkout, revision=args.revision, output=args.output)
     elif args.action == "rent":
         result = rent_wave(args.manifest, lifecycle_root=args.lifecycle_root, runner=_subprocess_runner, now_unix=__import__("time").time_ns() // 1_000_000_000)
+    elif args.action == "renew-lease":
+        result = renew_retained_lease(args.manifest, args.prior_instance_receipt, lifecycle_root=args.lifecycle_root, runner=_subprocess_runner)
     elif args.action == "remote-launch":
         instance = json.loads(args.instance_receipt.read_text(encoding="utf-8"))
         result = remote_launch_wave(args.manifest, instance, lifecycle_root=args.lifecycle_root, runner=_nonraising_subprocess_runner, code_bundle=args.code_git_bundle, token_file=args.token_file)
