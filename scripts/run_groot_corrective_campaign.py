@@ -34,8 +34,8 @@ from lehome_train.flywheel.corrective import (
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-APPROVED_IMAGE_REPOSITORY = "docker.io/ryanjin333/lehome-rollout"
-APPROVED_IMAGE_DIGEST = "sha256:293c4f258f3742a7234699d706fb7088d0da8a764957bc79b244d830561abc12"
+APPROVED_IMAGE_REPOSITORY = "ghcr.io/ryanjin333/lehome-rollout"
+APPROVED_IMAGE_DIGEST = "sha256:25870f001eb0ab356222dbfd15352c42666f566adb41732bcdfd7a12d104f50d"
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _CATEGORIES = tuple(CATEGORY_PREFIX)
 _BASELINE_KEYS = frozenset({

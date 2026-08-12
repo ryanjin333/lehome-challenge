@@ -25,11 +25,11 @@ from typing import Callable, Mapping, Sequence
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-# The verified template lineage is docker.io/ryanjin333/lehome-rollout.  The
-# immutable digest is deliberately supplied by the signed baseline rather than
-# guessed from the mutable :latest template tag.
-APPROVED_IMAGE_REPOSITORY = "docker.io/ryanjin333/lehome-rollout"
-APPROVED_IMAGE_DIGEST = "sha256:293c4f258f3742a7234699d706fb7088d0da8a764957bc79b244d830561abc12"
+# GHCR is the immutable mirror of the verified Docker Hub image. Both manifests
+# have config digest d36b7a84... and the same ordered 35 layer digest/size pairs;
+# the registry-specific manifest serialization alone changes the top digest.
+APPROVED_IMAGE_REPOSITORY = "ghcr.io/ryanjin333/lehome-rollout"
+APPROVED_IMAGE_DIGEST = "sha256:25870f001eb0ab356222dbfd15352c42666f566adb41732bcdfd7a12d104f50d"
 APPROVED_GROOT_ROOT = "/opt/isaac-groot"
 APPROVED_GROOT_REVISION = "23ace64f17aa5015259b8609d371eb61a357c776"
 # The image's historic /opt/gr00t-runtime/bin/python is a broken build-time
