@@ -19,6 +19,27 @@ fi
 if [[ "${B1K_ACCEPT_DATASET_TOS:-}" != "YES" ]]; then echo "B1K_ACCEPT_DATASET_TOS must be YES" >&2; exit 64; fi
 : "${OMNIGIBSON_DATA_PATH:?OMNIGIBSON_DATA_PATH is required}"
 if [[ "$(id -u)" == 0 ]]; then
+  # Vast injects the account SSH key before this entrypoint runs. Some hosts
+  # preserve unsafe source ownership/modes, which makes sshd reject the key.
+  # Repair only the canonical root key path, without following symlinks,
+  # before the workload drops privileges to the rollout user.
+  if [[ -L /root/.ssh ]]; then
+    echo "/root/.ssh must not be a symlink" >&2
+    exit 64
+  fi
+  if [[ -d /root/.ssh ]]; then
+    chown root:root /root /root/.ssh
+    chmod go-w /root
+    chmod 0700 /root/.ssh
+    if [[ -L /root/.ssh/authorized_keys ]]; then
+      echo "/root/.ssh/authorized_keys must not be a symlink" >&2
+      exit 64
+    fi
+    if [[ -f /root/.ssh/authorized_keys && ! -L /root/.ssh/authorized_keys ]]; then
+      chown root:root /root/.ssh/authorized_keys
+      chmod 0600 /root/.ssh/authorized_keys
+    fi
+  fi
   : "${HF_TOKEN:?HF_TOKEN is required only for root bootstrap}"
   if [[ "${B1K_HF_TOKEN_FILE:-}" != "/workspace/.cache/huggingface/token" ]]; then
     echo "B1K_HF_TOKEN_FILE must use the production token path" >&2

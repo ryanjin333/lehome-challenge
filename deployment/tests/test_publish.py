@@ -11,7 +11,7 @@ import pytest
 
 from b1k_deploy.cli import main
 from b1k_deploy.dockerhub import CommandResult, DockerImageRelease
-from b1k_rollout.template import render_vast_template
+from b1k_rollout.template import ROLLOUT_ONSTART, render_vast_template
 from b1k_deploy.publish import (
     AtomicCampaignReceiptStore,
     CampaignPublicationReceipt,
@@ -1073,19 +1073,7 @@ def test_fixed_vast_client_permits_only_the_canonical_rollout_onstart(tmp_path):
     rollout_templates = FakeTemplates()
     TemplatePublisher(rollout_templates).publish(rollout_plan, execute=True)
     rollout_command = client._create_command(rollout_templates.created[0])
-    assert (
-        "--onstart-cmd",
-        "install -d -o 10001 -g 10001 -m 0700 /workspace /workspace/campaign /workspace/checkpoint-source "
-        "/workspace/omnigibson-data /workspace/smoke-canary /workspace/campaign/.cache/numba "
-        "/workspace/campaign/.cache/triton /workspace/campaign/.cache/matplotlib "
-        "/workspace/campaign/.cache/omnigibson /workspace/campaign/.cache/warp && "
-        "export OMNIGIBSON_APPDATA_PATH=/workspace/campaign/.cache/omnigibson "
-        "NUMBA_CACHE_DIR=/workspace/campaign/.cache/numba "
-        "TRITON_CACHE_DIR=/workspace/campaign/.cache/triton "
-        "MPLCONFIGDIR=/workspace/campaign/.cache/matplotlib "
-        "WARP_CACHE_PATH=/workspace/campaign/.cache/warp && "
-        "bash /usr/local/bin/b1k-rollout-entrypoint",
-    ) in zip(rollout_command, rollout_command[1:])
+    assert ("--onstart-cmd", ROLLOUT_ONSTART) in zip(rollout_command, rollout_command[1:])
     assert "B1K_ACCEPT_DATASET_TOS=YES" in rollout_templates.created[0]["env"]
 
     with pytest.raises(PublicationError, match="training template"):

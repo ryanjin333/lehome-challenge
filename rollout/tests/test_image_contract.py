@@ -104,6 +104,18 @@ def test_rollout_entrypoint_fails_closed_before_campaign_execution() -> None:
     assert 'test -O "$OMNIGIBSON_APPDATA_PATH"' in entrypoint
 
 
+def test_rollout_entrypoint_repairs_vast_root_ssh_permissions_before_privilege_drop() -> None:
+    entrypoint = _read("entrypoint.sh")
+    root_branch = entrypoint.split('exec setpriv --reuid=10001 --regid=10001', 1)[0]
+
+    assert 'if [[ -f /root/.ssh/authorized_keys && ! -L /root/.ssh/authorized_keys ]]' in root_branch
+    assert 'chown root:root /root /root/.ssh' in root_branch
+    assert 'chmod go-w /root' in root_branch
+    assert 'chown root:root /root/.ssh/authorized_keys' in root_branch
+    assert 'chmod 0700 /root/.ssh' in root_branch
+    assert 'chmod 0600 /root/.ssh/authorized_keys' in root_branch
+
+
 def test_image_verifier_accepts_only_immutable_rollout_digests() -> None:
     verifier = _read("scripts/verify-image.sh")
 
