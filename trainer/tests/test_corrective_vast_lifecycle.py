@@ -308,6 +308,21 @@ def test_canary_early_staging_failure_writes_nonempty_abort_evidence(tmp_path: P
     assert result["transport_returncode"] == 1 and len(result["canary_manifest_sha256"]) == len(result["staged_bundle_sha256"]) == 64
 
 
+def test_canary_retry_writes_append_only_abort_evidence_and_materializes_wrapper(tmp_path: Path) -> None:
+    canary = tmp_path / "canary.json"
+    _write(canary, {"schema_version": 1, "kind": "corrective_rft_canary", "wave_index": 0, "episode_count": 1, "baseline": _image_native_baseline(), "provider": {}, "attempt": _canary_attempt(tmp_path, seed=11)})
+    bundle = tmp_path / "code.bundle"; bundle.write_bytes(b"bundle")
+    token = tmp_path / "token"; token.write_text("secret")
+    runner = lambda _: type("Result", (), {"returncode": 1, "stdout": ""})()
+    first = LIFECYCLE.remote_launch_canary(canary, _canary_instance(), lifecycle_root=tmp_path / "life", runner=runner, bundle=bundle, token_file=token)
+    second = LIFECYCLE.remote_launch_canary(canary, _canary_instance(), lifecycle_root=tmp_path / "life", runner=runner, bundle=bundle, token_file=token)
+    assert first["retry_id"] != second["retry_id"] and first["abort_evidence_root"] != second["abort_evidence_root"]
+    wrapper = "\n".join(LIFECYCLE._groot_wrapper_setup())
+    assert LIFECYCLE.APPROVED_GROOT_NATIVE_PYTHON in wrapper
+    assert LIFECYCLE.APPROVED_GROOT_PYTHON_SHA256 in wrapper
+    assert "PYTHONPATH=/opt/gr00t-runtime/lib/python3.10/site-packages:/opt/isaac-groot" in wrapper
+
+
 def test_canary_rejects_unbound_or_wrong_wave_instance_before_staging(tmp_path: Path) -> None:
     canary = tmp_path / "canary.json"
     _write(canary, {"schema_version": 1, "kind": "corrective_rft_canary", "wave_index": 0, "episode_count": 1, "baseline": _image_native_baseline(), "provider": {}, "attempt": _canary_attempt(tmp_path, seed=11)})
