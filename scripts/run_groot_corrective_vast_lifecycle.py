@@ -62,7 +62,9 @@ def capture_offer_evidence(*, offers: Sequence[Mapping[str, object]], instances:
     if not matching:
         raise ValueError("live provider offers contain no on-demand 4xRTX3090 choice")
     def hourly(item: Mapping[str, object]) -> float:
-        return float(item.get("dph_total", math.inf)) + float(item.get("storage_cost", item.get("storage_cost_per_hour", 0)))
+        # Vast's dph_total already includes the instance disk charge.  Only
+        # detached retained volumes need to be added separately below.
+        return float(item.get("dph_total", math.inf))
     existing_spend = sum(hourly(item) for item in instances) + sum(float(item.get("storage_total_cost", 0)) for item in volumes)
     acceptable = [item for item in matching if math.isfinite(existing_spend + hourly(item)) and hourly(item) > 0 and existing_spend + hourly(item) <= 2.0]
     if not acceptable:
