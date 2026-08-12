@@ -369,7 +369,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
     image_identity = _approved_image_identity(baseline, context="full wave")
     remote = f"root@{instance_receipt['host']}"; port = str(instance_receipt["port"])
     remote_dir = f"/workspace/corrective/wave-{manifest['wave_index']:06d}"
-    checkout = f"{remote_dir}/code"; output_root = f"{checkout}/campaign"
+    checkout = f"{remote_dir}/code"; output_root = f"{remote_dir}/campaign"
     remote_bundle, remote_token = f"{remote_dir}/code.bundle", f"{remote_dir}/hf.token"
     digest = hashlib.sha256(code_bundle.read_bytes()).hexdigest()
     _require_completed(runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "mkdir", "-p", remote_dir)), "full-wave staging directory")
@@ -389,7 +389,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
         if (campaign_root / "raw" / str(item["attempt_id"]) / "SHA256SUMS.json").is_file()
     }
     remote_attempts = [
-        {**attempt, "command": _remote_command(attempt["command"], baseline, mapping, checkout, local_output_root)}
+        {**attempt, "command": _remote_command(attempt["command"], baseline, mapping, checkout, output_root, local_output_root)}
         for attempt in manifest["attempts"] if str(attempt["attempt_id"]) not in terminal_attempt_ids
     ]
     if not remote_attempts:
@@ -400,13 +400,13 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
     setup = ["set -eu", "test -x /opt/lehome-challenge/.venv/bin/python", _image_identity_preflight(image_identity), *_groot_wrapper_setup(), "test \"$(git -C " + shlex.quote(APPROVED_GROOT_ROOT) + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_GROOT_REVISION), "chmod 600 " + shlex.quote(remote_token), "export HF_TOKEN=\"$(cat " + shlex.quote(remote_token) + ")\"", checkout_setup, "test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision), "git -C " + shlex.quote(checkout) + " diff --quiet", _controller_import_preflight(checkout), _hf_download("/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root)), "printf '%s\\n' " + shlex.quote(policy_revision) + " > " + shlex.quote(policy_root + "/revision.txt"), _controller_pythonpath(checkout) + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; assert policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "'")]
     setup.extend(_asset_checkout_setup(checkout))
     setup.extend(_qwen_base_setup(checkout))
-    script_lines = ["set -eu", "trap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT", *setup[1:], f"mkdir -p {shlex.quote(output_root)}", f"cd {shlex.quote(checkout)}", "pids='' "]
+    script_lines = ["set -eu", "trap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT", *setup[1:], f"mkdir -p {shlex.quote(output_root)}", "pids='' "]
     for attempt in remote_attempts:
         command = " ".join(shlex.quote(token) for token in attempt["command"])
         slot = int(attempt["worker_slot"])
         log = shlex.quote(f"{output_root}/worker-{slot}.log")
         status_file = shlex.quote(f"{output_root}/worker-{slot}.returncode")
-        script_lines.append(f"( HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 {_controller_pythonpath(checkout)} LEHOME_FLYWHEEL_WORKER_GPU={slot} LEHOME_FLYWHEEL_IMAGE_IDENTITY={shlex.quote(image_identity)} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
+        script_lines.append(f"( cd {shlex.quote(checkout)} && HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 {_controller_pythonpath(checkout)} LEHOME_FLYWHEEL_WORKER_GPU={slot} LEHOME_FLYWHEEL_IMAGE_IDENTITY={shlex.quote(image_identity)} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
     script_lines.extend(("for pid in $pids; do wait \"$pid\" || true; done", f"python3 -c {shlex.quote(_terminal_writer_program(output_root, {'attempts': remote_attempts}))}", "exit 0"))
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", "\n".join(script_lines)))
     # Always sync the exact campaign output; a failed remote launch is evidence
@@ -462,7 +462,7 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     remote_dir = f"/workspace/corrective/canary-{value['wave_index']:06d}"
     remote_bundle = remote_dir + "/code.bundle"
     remote_token = remote_dir + "/hf.token"
-    remote_campaign = remote_dir + "/code/campaign"
+    remote_campaign = remote_dir + "/campaign"
     bundle_hash = hashlib.sha256(bundle.read_bytes()).hexdigest()
     manifest_hash = hashlib.sha256(canary_manifest.read_bytes()).hexdigest()
     stage_result: object | None = None
@@ -479,7 +479,7 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     policy_root = "/workspace/checkpoints/lehome-groot-n17-models-" + policy_revision
     policy_path = policy_root + "/policies/step-12000"
     mapping = {"policy_path": "image:" + policy_path, "policy_revision_file": "image:" + policy_root + "/revision.txt", "release_assets_root": "Assets/objects/Challenge_Garment/Release", "groot_root": "image:" + APPROVED_GROOT_ROOT, "groot_python": "image:" + APPROVED_GROOT_PYTHON, "controller_python": "image:/opt/lehome-challenge/.venv/bin/python", "output_root": "campaign", "trial_script": "scripts/run_groot_flywheel_trial.py"}
-    rewritten = _remote_command(attempt["command"], baseline, mapping, remote_dir + "/code", local_output)
+    rewritten = _remote_command(attempt["command"], baseline, mapping, remote_dir + "/code", remote_campaign, local_output)
     runtime = [
         _image_identity_preflight(image_identity),
         *_groot_wrapper_setup(),
@@ -502,7 +502,7 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     command = " ".join(shlex.quote(item) for item in rewritten)
     controller_pythonpath = remote_dir + "/code/source/lehome:" + remote_dir + "/code"
     remote_log = remote_dir + "/canary.log"
-    script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nHF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 " + _controller_pythonpath(remote_dir + "/code") + " LEHOME_FLYWHEEL_WORKER_GPU=0 LEHOME_FLYWHEEL_IMAGE_IDENTITY=" + shlex.quote(image_identity) + " " + command + " ) > " + shlex.quote(remote_log) + " 2>&1\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
+    script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nmkdir -p " + shlex.quote(remote_campaign) + "\ncd " + shlex.quote(remote_dir + "/code") + " && HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 " + _controller_pythonpath(remote_dir + "/code") + " LEHOME_FLYWHEEL_WORKER_GPU=0 LEHOME_FLYWHEEL_IMAGE_IDENTITY=" + shlex.quote(image_identity) + " " + command + " ) > " + shlex.quote(remote_log) + " 2>&1\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", script))
     sync = lifecycle_root / f"canary-{value['wave_index']:06d}-sync"
     # The corrective controller consumes raw episodes and policy receipts from
@@ -712,7 +712,7 @@ def _manifest_output_root(attempts: object) -> str:
     return roots.pop()
 
 
-def _remote_command(command: object, baseline: object, mapping: Mapping[str, str], checkout: str, local_output_root: str) -> list[str]:
+def _remote_command(command: object, baseline: object, mapping: Mapping[str, str], checkout: str, remote_output_root: str, local_output_root: str) -> list[str]:
     if not isinstance(command, list) or not all(isinstance(item, str) for item in command) or not isinstance(baseline, dict):
         raise ValueError("remote worker command is invalid")
     replacements = {str(baseline[key]): (mapping[key].removeprefix("image:") if mapping[key].startswith("image:") else f"{checkout}/{mapping[key]}") for key in ("policy_path", "policy_revision_file", "release_assets_root", "groot_root", "groot_python", "controller_python")}
@@ -723,9 +723,9 @@ def _remote_command(command: object, baseline: object, mapping: Mapping[str, str
         elif token == "scripts/run_groot_flywheel_trial.py":
             rewritten.append(f"{checkout}/{mapping['trial_script']}")
         elif token.startswith(local_output_root + "/"):
-            rewritten.append(f"{checkout}/{mapping['output_root']}/{token.removeprefix(local_output_root + '/')}")
+            rewritten.append(f"{remote_output_root}/{token.removeprefix(local_output_root + '/')}")
         elif token == local_output_root:
-            rewritten.append(f"{checkout}/{mapping['output_root']}")
+            rewritten.append(remote_output_root)
         elif Path(token).is_absolute():
             raise ValueError("remote worker command retains an unmapped local path")
         else:

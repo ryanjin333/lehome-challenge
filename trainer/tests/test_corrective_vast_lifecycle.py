@@ -304,9 +304,9 @@ def test_remote_rewrite_accepts_actual_campaign_wave_manifest_without_baseline_o
     wave = CAMPAIGN._wave_manifest(tmp_path / "campaign", wave_index=0, categories=("top_long", "top_short", "pant_long", "pant_short"), baseline=baseline, provider={"rental_kind": "on-demand"}, provider_evidence={})
     root = LIFECYCLE._manifest_output_root(wave["attempts"])
     assert root == str(tmp_path / "campaign")
-    rewritten = LIFECYCLE._remote_command(wave["attempts"][0]["command"], baseline, {"policy_path": "policy", "policy_revision_file": "revision", "release_assets_root": "assets", "groot_root": "groot", "groot_python": "python", "controller_python": "isaac/python", "output_root": "campaign", "trial_script": "scripts/run_groot_flywheel_trial.py"}, "/remote/checkout", root)
+    rewritten = LIFECYCLE._remote_command(wave["attempts"][0]["command"], baseline, {"policy_path": "policy", "policy_revision_file": "revision", "release_assets_root": "assets", "groot_root": "groot", "groot_python": "python", "controller_python": "isaac/python", "output_root": "campaign", "trial_script": "scripts/run_groot_flywheel_trial.py"}, "/remote/checkout", "/remote/campaign", root)
     assert str(tmp_path / "campaign") not in rewritten
-    assert any(token.startswith("/remote/checkout/campaign/workers") for token in rewritten)
+    assert any(token.startswith("/remote/campaign/workers") for token in rewritten)
 
 
 def test_free_bundle_builder_creates_safe_tar_and_rejects_missing_source(tmp_path: Path) -> None:
@@ -394,6 +394,9 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     assert "Assets/$d" in script and "LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "LEHOME_FLYWHEEL_IMAGE_IDENTITY=" + LIFECYCLE.APPROVED_IMAGE_DIGEST in script
     assert "image identity preflight" in script
+    assert "cd /workspace/corrective/canary-000000/code && HF_HUB_OFFLINE=1" in script
+    assert "/workspace/corrective/canary-000000/campaign" in script
+    assert "/workspace/corrective/canary-000000/code/campaign" not in script
     assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/canary-000000/code/source/lehome:/workspace/corrective/canary-000000/code${PYTHONPATH:+:$PYTHONPATH} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "importlib.util" in script and "isaaclab" in script and "lehome" in script and "import isaaclab_tasks" not in script
     assert "if [ -e /workspace/lehome-release-assets ]" in script
@@ -404,7 +407,7 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     assert "lfs ls-files --long" in script and "diff --quiet" in script
     assert "trap 'rm -f /workspace/corrective/canary-000000/hf.token; unset HF_TOKEN' EXIT" in script
     scp_sources = [command[-2] for command in calls if command[0] == "scp" and "canary-000000" in command[-2]]
-    assert any(source.endswith("/code/campaign/.") for source in scp_sources)
+    assert any(source.endswith("/canary-000000/campaign/.") for source in scp_sources)
     assert not any(source.endswith("/canary-000000/.") for source in scp_sources)
 
 
@@ -469,7 +472,7 @@ def test_campaign_sync_failure_returns_one_stable_publishable_abort_root(tmp_pat
     token = tmp_path / "token"; token.write_text("secret")
 
     def runner(command: tuple[str, ...]):
-        if command[0] == "scp" and command[-2].endswith("/code/campaign/."):
+        if command[0] == "scp" and command[-2].endswith("/canary-000000/campaign/."):
             return type("Result", (), {"returncode": 1, "stdout": ""})()
         if command[0] == "scp" and command[-2].endswith("/canary.returncode"):
             Path(command[-1]).parent.mkdir(parents=True, exist_ok=True)
@@ -493,7 +496,7 @@ def test_canary_failure_ingests_diagnostic_log_and_redacts_staged_token(tmp_path
     token = tmp_path / "token"; token.write_text("super-secret-token")
 
     def runner(command: tuple[str, ...]):
-        if command[0] == "scp" and command[-2].endswith("/code/campaign/."):
+        if command[0] == "scp" and command[-2].endswith("/canary-000000/campaign/."):
             return type("Result", (), {"returncode": 1, "stdout": ""})()
         if command[0] == "scp" and command[-2].endswith("/canary.returncode"):
             Path(command[-1]).parent.mkdir(parents=True, exist_ok=True); Path(command[-1]).write_text("1\n")
@@ -518,7 +521,7 @@ def test_rc0_failed_canary_emits_publishable_non_training_abort(tmp_path: Path) 
     life = tmp_path / "life"; sync = life / "canary-000000-sync"
 
     def runner(command: tuple[str, ...]):
-        if command[0] == "scp" and command[-2].endswith("/code/campaign/."):
+        if command[0] == "scp" and command[-2].endswith("/canary-000000/campaign/."):
             _failed_canary_sync(sync, attempt, baseline)
         if command[0] == "scp" and command[-2].endswith("/canary.log"):
             Path(command[-1]).write_text("terminal failure diagnostics\n")
@@ -610,7 +613,7 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
         _write(sync / "remote-terminal.json", {"schema_version": 1, "kind": "corrective_remote_terminal", "workers": workers})
     def runner(command):
         calls.append(command)
-        if command[0] == "scp" and command[-2].endswith("/code/campaign/."):
+        if command[0] == "scp" and command[-2].endswith("/wave-000000/campaign/."):
             materialize_sync()
         return type("Result", (), {"returncode": 0, "stdout": ""})()
     instance = {"kind": "corrective_vast_instance", "instance_id": 9, "host": "host", "port": 22, "wave_index": 0}
@@ -632,6 +635,9 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert all(f"LEHOME_FLYWHEEL_WORKER_GPU={slot}" in script for slot in range(4))
     assert script.count("LEHOME_FLYWHEEL_IMAGE_IDENTITY=" + LIFECYCLE.APPROVED_IMAGE_DIGEST) >= 5
     assert "image identity preflight" in script
+    assert script.count("cd /workspace/corrective/wave-000000/code && HF_HUB_OFFLINE=1") == 4
+    assert "/workspace/corrective/wave-000000/campaign" in script
+    assert "/workspace/corrective/wave-000000/code/campaign" not in script
     assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/wave-000000/code/source/lehome:/workspace/corrective/wave-000000/code${PYTHONPATH:+:$PYTHONPATH} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "importlib.util" in script and "isaaclab" in script and "lehome" in script and "import isaaclab_tasks" not in script
     assert "Qwen/Qwen3-VL-2B-Instruct" in script and all(digest in script for digest in LIFECYCLE.APPROVED_QWEN_FILES.values())
@@ -639,4 +645,4 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "unexpected git exclude content" in script
     assert "status --porcelain --untracked-files=all" in script
     assert "readlink -f /workspace/corrective/wave-000000/code/nvidia/Cosmos-Reason2-2B" in script
-    assert any(command[0] == "scp" and command[-2].endswith("/code/campaign/.") for command in calls)
+    assert any(command[0] == "scp" and command[-2].endswith("/wave-000000/campaign/.") for command in calls)
