@@ -369,13 +369,15 @@ def _asset_checkout_setup(checkout: str) -> list[str]:
     """Reuse only a fully verified asset checkout; never silently repin it."""
     assets = "/workspace/lehome-release-assets"
     git = "git -C " + shlex.quote(assets)
+    lfs_manifest = assets + "/.git/lehome-lfs-manifest"
     return [
         "if [ -e " + shlex.quote(assets) + " ]; then test -d " + shlex.quote(assets + "/.git") + " && test \"$(" + git + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_ASSET_REVISION) + " && " + git + " diff --quiet; else git clone --no-checkout https://huggingface.co/datasets/lehome/asset_challenge " + shlex.quote(assets) + " && " + git + " checkout --detach " + shlex.quote(APPROVED_ASSET_REVISION) + "; fi",
         # Git-LFS does not install its filter in the pinned image, so hydrate
         # the exact dataset revision with HF and then validate every LFS OID.
         "/opt/lehome-challenge/.venv/bin/hf download lehome/asset_challenge --repo-type dataset --revision " + shlex.quote(APPROVED_ASSET_REVISION) + " --local-dir " + shlex.quote(assets),
         git + " lfs install --local",
-        "while read -r oid marker path; do test \"$(sha256sum " + shlex.quote(assets) + "/\"$path\" | cut -d' ' -f1)\" = \"$oid\"; done < <(" + git + " lfs ls-files --long)",
+        git + " lfs ls-files --long > " + shlex.quote(lfs_manifest),
+        "while read -r oid marker path; do test \"$(sha256sum " + shlex.quote(assets) + "/\"$path\" | cut -d' ' -f1)\" = \"$oid\"; done < " + shlex.quote(lfs_manifest),
         "test -z \"$(" + git + " lfs ls-files --long | awk '$2 != \"*\" {print}')\"",
         "! grep -RIl '^version https://git-lfs.github.com/spec/v1$' " + shlex.quote(assets + "/objects") + " " + shlex.quote(assets + "/robots") + " " + shlex.quote(assets + "/scenes") + " " + shlex.quote(assets + "/textures"),
         git + " diff --quiet",

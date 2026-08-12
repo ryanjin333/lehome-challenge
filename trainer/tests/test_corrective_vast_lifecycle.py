@@ -288,6 +288,7 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     assert "if [ -e /workspace/corrective/canary-000000/code ]" in script
     assert "hf download lehome/asset_challenge --repo-type dataset --revision" in script
     assert "lfs install --local" in script and "sha256sum /workspace/lehome-release-assets/\"$path\"" in script
+    assert "< <(" not in script and "/.git/lehome-lfs-manifest" in script
     assert "lfs ls-files --long" in script and "diff --quiet" in script
     assert "trap 'rm -f /workspace/corrective/canary-000000/hf.token; unset HF_TOKEN' EXIT" in script
     scp_sources = [command[-2] for command in calls if command[0] == "scp" and "canary-000000" in command[-2]]
@@ -474,6 +475,7 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "if [ -e /workspace/corrective/wave-000000/code ]" in script
     assert "hf download lehome/asset_challenge --repo-type dataset --revision" in script
     assert "lfs install --local" in script and "sha256sum /workspace/lehome-release-assets/\"$path\"" in script
+    assert "< <(" not in script and "/.git/lehome-lfs-manifest" in script
     assert "lfs ls-files --long" in script and "diff --quiet" in script
     assert LIFECYCLE.APPROVED_GROOT_ROOT in script and "/opt/lehome-challenge/.venv/bin/python" in script
     assert "/code/source/lehome:/workspace/corrective/wave-000000/code" in script
