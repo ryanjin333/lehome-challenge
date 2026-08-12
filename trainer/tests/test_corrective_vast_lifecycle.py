@@ -363,7 +363,7 @@ def test_canary_disposal_rejects_publication_for_another_instance(tmp_path: Path
 
 def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_path: Path) -> None:
     canary = tmp_path / "canary.json"
-    _write(canary, {"schema_version": 1, "kind": "corrective_rft_canary", "wave_index": 0, "episode_count": 1, "baseline": {"code_revision": "c" * 40, "parent_checkpoint_revision": "a" * 40, "parent_checkpoint_artifact_sha256": "b" * 64, "controller_python": "/opt/lehome-challenge/.venv/bin/python", "groot_root": LIFECYCLE.APPROVED_GROOT_ROOT, "groot_revision": LIFECYCLE.APPROVED_GROOT_REVISION, "groot_python": LIFECYCLE.APPROVED_GROOT_PYTHON, "policy_path": "/local/policy", "policy_revision_file": "/local/revision", "release_assets_root": "/local/assets", "image_identity": "sha256:" + "a" * 64}, "provider": {}, "attempt": {"attempt_id": "attempt-0", "worker_slot": 0, "command": ["/opt/lehome-challenge/.venv/bin/python", "scripts/run_groot_flywheel_trial.py", "--policy-path", "/local/policy", "--policy-revision-file", "/local/revision", "--release-assets-root", "/local/assets", "--groot-root", LIFECYCLE.APPROVED_GROOT_ROOT, "--groot-python", LIFECYCLE.APPROVED_GROOT_PYTHON, "--output-root", str(tmp_path / "output")]}})
+    _write(canary, {"schema_version": 1, "kind": "corrective_rft_canary", "wave_index": 0, "episode_count": 1, "baseline": {"code_revision": "c" * 40, "parent_checkpoint_revision": "a" * 40, "parent_checkpoint_artifact_sha256": "b" * 64, "controller_python": "/opt/lehome-challenge/.venv/bin/python", "groot_root": LIFECYCLE.APPROVED_GROOT_ROOT, "groot_revision": LIFECYCLE.APPROVED_GROOT_REVISION, "groot_python": LIFECYCLE.APPROVED_GROOT_PYTHON, "policy_path": "/local/policy", "policy_revision_file": "/local/revision", "release_assets_root": "/local/assets", "image_identity": LIFECYCLE.APPROVED_IMAGE_DIGEST}, "provider": {}, "attempt": {"attempt_id": "attempt-0", "worker_slot": 0, "command": ["/opt/lehome-challenge/.venv/bin/python", "scripts/run_groot_flywheel_trial.py", "--policy-path", "/local/policy", "--policy-revision-file", "/local/revision", "--release-assets-root", "/local/assets", "--groot-root", LIFECYCLE.APPROVED_GROOT_ROOT, "--groot-python", LIFECYCLE.APPROVED_GROOT_PYTHON, "--output-root", str(tmp_path / "output")]}})
     instance = _canary_instance()
     calls = []
     def runner(command):
@@ -389,6 +389,8 @@ def test_literal_canary_cli_preflights_image_native_runtime_and_syncs_abort(tmp_
     assert "/code/Assets/objects/Challenge_Garment/Release" in script
     assert "/code/code/Assets" not in script
     assert "Assets/$d" in script and "LEHOME_FLYWHEEL_WORKER_GPU=0" in script
+    assert "LEHOME_FLYWHEEL_IMAGE_IDENTITY=" + LIFECYCLE.APPROVED_IMAGE_DIGEST in script
+    assert "image identity preflight" in script
     assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/canary-000000/code/source/lehome:/workspace/corrective/canary-000000/code${PYTHONPATH:+:$PYTHONPATH} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "importlib.util" in script and "isaaclab" in script and "lehome" in script and "import isaaclab_tasks" not in script
     assert "if [ -e /workspace/lehome-release-assets ]" in script
@@ -625,6 +627,8 @@ def test_full_wave_image_native_interface_succeeds_with_canonical_synced_evidenc
     assert "/code/Assets/objects/Challenge_Garment/Release" in script
     assert "/code/code/Assets" not in script
     assert all(f"LEHOME_FLYWHEEL_WORKER_GPU={slot}" in script for slot in range(4))
+    assert script.count("LEHOME_FLYWHEEL_IMAGE_IDENTITY=" + LIFECYCLE.APPROVED_IMAGE_DIGEST) >= 5
+    assert "image identity preflight" in script
     assert "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=/workspace/corrective/wave-000000/code/source/lehome:/workspace/corrective/wave-000000/code${PYTHONPATH:+:$PYTHONPATH} LEHOME_FLYWHEEL_WORKER_GPU=0" in script
     assert "importlib.util" in script and "isaaclab" in script and "lehome" in script and "import isaaclab_tasks" not in script
     assert "Qwen/Qwen3-VL-2B-Instruct" in script and all(digest in script for digest in LIFECYCLE.APPROVED_QWEN_FILES.values())

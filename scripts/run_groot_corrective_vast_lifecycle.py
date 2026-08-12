@@ -95,6 +95,27 @@ def _controller_import_preflight(checkout: str) -> str:
     return _controller_pythonpath(checkout) + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("import importlib.util; assert importlib.util.find_spec('isaaclab'); assert importlib.util.find_spec('lehome')")
 
 
+def _approved_image_identity(baseline: Mapping[str, object], *, context: str) -> str:
+    """Return the receipt-bound OCI digest accepted by this rollout image."""
+    image_identity = baseline.get("image_identity")
+    if image_identity != APPROVED_IMAGE_DIGEST:
+        raise ValueError(f"{context} baseline image identity is not the approved digest")
+    return str(image_identity)
+
+
+def _image_identity_preflight(image_identity: str) -> str:
+    """Check the value supplied to workers without trusting inherited SSH env."""
+    return (
+        "LEHOME_FLYWHEEL_IMAGE_IDENTITY=" + shlex.quote(image_identity)
+        + " /bin/sh -c "
+        + shlex.quote(
+            "test \"${LEHOME_FLYWHEEL_IMAGE_IDENTITY-}\" = "
+            + shlex.quote(image_identity)
+            + " || { echo 'image identity preflight failed' >&2; exit 1; }"
+        )
+    )
+
+
 def _qwen_base_setup(checkout: str) -> list[str]:
     """Hydrate and pin the open base expected by step12000's absolute path."""
     download = _hf_download(
@@ -205,6 +226,7 @@ def _read_manifest(path: Path) -> dict[str, object]:
     repository, separator, digest = baseline["rollout_image"].partition("@")
     if repository != APPROVED_IMAGE_REPOSITORY or separator != "@" or digest != APPROVED_IMAGE_DIGEST:
         raise ValueError("corrective baseline rollout image must be pinned to the approved repository digest")
+    _approved_image_identity(baseline, context="corrective wave")
     provider = value.get("provider")
     if not isinstance(provider, dict) or provider.get("rental_kind") != "on-demand" or provider.get("gpu_name") != "RTX 3090" or provider.get("num_gpus") != 4 or float(provider.get("account_hourly_total_usd", math.inf)) > 2.0:
         raise ValueError("corrective wave provider facts violate 4x3090 shared cap")
@@ -344,6 +366,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
     baseline = manifest["baseline"]
     if baseline.get("controller_python") != "/opt/lehome-challenge/.venv/bin/python" or baseline.get("groot_root") != APPROVED_GROOT_ROOT or baseline.get("groot_revision") != APPROVED_GROOT_REVISION or baseline.get("groot_python") != APPROVED_GROOT_PYTHON:
         raise ValueError("full wave baseline does not match proven image-native runtime")
+    image_identity = _approved_image_identity(baseline, context="full wave")
     remote = f"root@{instance_receipt['host']}"; port = str(instance_receipt["port"])
     remote_dir = f"/workspace/corrective/wave-{manifest['wave_index']:06d}"
     checkout = f"{remote_dir}/code"; output_root = f"{checkout}/campaign"
@@ -374,7 +397,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
     controller_pythonpath = checkout + "/source/lehome:" + checkout
     revision = str(baseline["code_revision"])
     checkout_setup = "if [ -e " + shlex.quote(checkout) + " ]; then test -d " + shlex.quote(checkout + "/.git") + " && test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision) + " && git -C " + shlex.quote(checkout) + " diff --quiet; else git clone --no-checkout " + shlex.quote(remote_bundle) + " " + shlex.quote(checkout) + " && git -C " + shlex.quote(checkout) + " checkout --detach " + shlex.quote(revision) + "; fi"
-    setup = ["set -eu", "test -x /opt/lehome-challenge/.venv/bin/python", *_groot_wrapper_setup(), "test \"$(git -C " + shlex.quote(APPROVED_GROOT_ROOT) + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_GROOT_REVISION), "chmod 600 " + shlex.quote(remote_token), "export HF_TOKEN=\"$(cat " + shlex.quote(remote_token) + ")\"", checkout_setup, "test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision), "git -C " + shlex.quote(checkout) + " diff --quiet", _controller_import_preflight(checkout), _hf_download("/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root)), "printf '%s\\n' " + shlex.quote(policy_revision) + " > " + shlex.quote(policy_root + "/revision.txt"), _controller_pythonpath(checkout) + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; assert policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "'")]
+    setup = ["set -eu", "test -x /opt/lehome-challenge/.venv/bin/python", _image_identity_preflight(image_identity), *_groot_wrapper_setup(), "test \"$(git -C " + shlex.quote(APPROVED_GROOT_ROOT) + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_GROOT_REVISION), "chmod 600 " + shlex.quote(remote_token), "export HF_TOKEN=\"$(cat " + shlex.quote(remote_token) + ")\"", checkout_setup, "test \"$(git -C " + shlex.quote(checkout) + " rev-parse HEAD)\" = " + shlex.quote(revision), "git -C " + shlex.quote(checkout) + " diff --quiet", _controller_import_preflight(checkout), _hf_download("/opt/lehome-challenge/.venv/bin/hf download ryanjin333/lehome-groot-n17-models --revision " + shlex.quote(policy_revision) + " --include 'policies/step-12000/*' --local-dir " + shlex.quote(policy_root)), "printf '%s\\n' " + shlex.quote(policy_revision) + " > " + shlex.quote(policy_root + "/revision.txt"), _controller_pythonpath(checkout) + " /opt/lehome-challenge/.venv/bin/python -c " + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; assert policy_artifact_sha256(Path('" + policy_path + "')) == '" + policy_digest + "'")]
     setup.extend(_asset_checkout_setup(checkout))
     setup.extend(_qwen_base_setup(checkout))
     script_lines = ["set -eu", "trap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT", *setup[1:], f"mkdir -p {shlex.quote(output_root)}", f"cd {shlex.quote(checkout)}", "pids='' "]
@@ -383,7 +406,7 @@ def remote_launch_wave(manifest_path: Path, instance_receipt: Mapping[str, objec
         slot = int(attempt["worker_slot"])
         log = shlex.quote(f"{output_root}/worker-{slot}.log")
         status_file = shlex.quote(f"{output_root}/worker-{slot}.returncode")
-        script_lines.append(f"( HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 {_controller_pythonpath(checkout)} LEHOME_FLYWHEEL_WORKER_GPU={slot} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
+        script_lines.append(f"( HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 {_controller_pythonpath(checkout)} LEHOME_FLYWHEEL_WORKER_GPU={slot} LEHOME_FLYWHEEL_IMAGE_IDENTITY={shlex.quote(image_identity)} {command} >{log} 2>&1; rc=$?; printf '%s\\n' \"$rc\" >{status_file}; exit 0 ) & pids=\"$pids $!\"")
     script_lines.extend(("for pid in $pids; do wait \"$pid\" || true; done", f"python3 -c {shlex.quote(_terminal_writer_program(output_root, {'attempts': remote_attempts}))}", "exit 0"))
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", "\n".join(script_lines)))
     # Always sync the exact campaign output; a failed remote launch is evidence
@@ -430,6 +453,7 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     baseline = value.get("baseline")
     if not isinstance(baseline, dict) or baseline.get("controller_python") != "/opt/lehome-challenge/.venv/bin/python" or baseline.get("groot_root") != APPROVED_GROOT_ROOT or baseline.get("groot_revision") != APPROVED_GROOT_REVISION or baseline.get("groot_python") != APPROVED_GROOT_PYTHON:
         raise ValueError("canary baseline does not match the proven image-native runtime")
+    image_identity = _approved_image_identity(baseline, context="canary")
     policy_revision = baseline.get("parent_checkpoint_revision")
     policy_digest = baseline.get("parent_checkpoint_artifact_sha256")
     if not isinstance(policy_revision, str) or not re.fullmatch(r"[0-9a-f]{40}", policy_revision) or not isinstance(policy_digest, str) or _SHA256.fullmatch(policy_digest) is None:
@@ -457,6 +481,7 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     mapping = {"policy_path": "image:" + policy_path, "policy_revision_file": "image:" + policy_root + "/revision.txt", "release_assets_root": "Assets/objects/Challenge_Garment/Release", "groot_root": "image:" + APPROVED_GROOT_ROOT, "groot_python": "image:" + APPROVED_GROOT_PYTHON, "controller_python": "image:/opt/lehome-challenge/.venv/bin/python", "output_root": "campaign", "trial_script": "scripts/run_groot_flywheel_trial.py"}
     rewritten = _remote_command(attempt["command"], baseline, mapping, remote_dir + "/code", local_output)
     runtime = [
+        _image_identity_preflight(image_identity),
         *_groot_wrapper_setup(),
         "test \"$(git -C " + shlex.quote(APPROVED_GROOT_ROOT) + " rev-parse HEAD)\" = " + shlex.quote(APPROVED_GROOT_REVISION),
         "test \"$(sha256sum " + shlex.quote(remote_bundle) + " | cut -d' ' -f1)\" = " + shlex.quote(bundle_hash),
@@ -477,7 +502,7 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     command = " ".join(shlex.quote(item) for item in rewritten)
     controller_pythonpath = remote_dir + "/code/source/lehome:" + remote_dir + "/code"
     remote_log = remote_dir + "/canary.log"
-    script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nHF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 " + _controller_pythonpath(remote_dir + "/code") + " LEHOME_FLYWHEEL_WORKER_GPU=0 " + command + " ) > " + shlex.quote(remote_log) + " 2>&1\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
+    script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nHF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 " + _controller_pythonpath(remote_dir + "/code") + " LEHOME_FLYWHEEL_WORKER_GPU=0 LEHOME_FLYWHEEL_IMAGE_IDENTITY=" + shlex.quote(image_identity) + " " + command + " ) > " + shlex.quote(remote_log) + " 2>&1\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", script))
     sync = lifecycle_root / f"canary-{value['wave_index']:06d}-sync"
     # The corrective controller consumes raw episodes and policy receipts from
