@@ -25,13 +25,24 @@ from lehome_train.flywheel import rft
 from lehome_train.flywheel.rft import materialize_verified_corrective_rft_snapshot
 
 
-def test_corrective_next_wave_categories_are_deficit_aware_across_all_floors() -> None:
-    # Live corrective counts after 16 attempts: long categories have no
-    # successes, while pant-short is materially ahead.  The next full wave
-    # must still lead with the short deficits but advance every floor once.
+def test_corrective_next_wave_categories_are_effort_aware_with_bounded_starvation() -> None:
+    # Live corrective counts: TL 13/7, TS 19/9, PL 13/2, PS 19/17.  The
+    # smoothed effort estimate must give the hard pant-long category two slots
+    # without permanently excluding any unresolved category.
     assert __import__("lehome_train.flywheel.corrective", fromlist=["_next_wave_categories"])._next_wave_categories({
-        "top_long": 0, "top_short": 2, "pant_long": 0, "pant_short": 7,
-    }) == ("top_short", "pant_short", "top_long", "pant_long")
+        "top_long": 7, "top_short": 9, "pant_long": 2, "pant_short": 17,
+    }, {
+        "top_long": 13, "top_short": 19, "pant_long": 13, "pant_short": 19,
+    }) == ("pant_long", "top_short", "pant_long", "top_long")
+
+    allocator = __import__("lehome_train.flywheel.corrective", fromlist=["_next_wave_categories"])
+    # Two full waves scheduled elsewhere make pant-short's lower count stale;
+    # it is reserved one slot even though its immediate effort is lower.
+    bounded = allocator._next_wave_categories(
+        {"top_long": 29, "top_short": 44, "pant_long": 29, "pant_short": 44},
+        {"top_long": 56, "top_short": 56, "pant_long": 56, "pant_short": 40},
+    )
+    assert "pant_short" in bounded and len(bounded) == 4
 
 
 def test_corrective_campaign_requires_distinct_seen_success_floors_and_prioritizes_short_garments() -> None:

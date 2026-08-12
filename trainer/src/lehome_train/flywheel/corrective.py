@@ -15,6 +15,7 @@ from lehome_train.io import canonical_json_bytes, sha256_file
 
 _CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
 _SHORT_CATEGORIES = ("top_short", "pant_short")
+_STARVATION_ATTEMPT_GAP = 8
 ON_DEMAND_RENTAL = "on-demand"
 MAX_ATTEMPTS = 400
 TARGET_UNIQUE_SUCCESSES = 150
@@ -261,8 +262,10 @@ def _validate_attempts(attempts: Iterable[Mapping[str, object]]) -> tuple[dict[s
     return validated
 
 
-def _priority_categories(successes: Mapping[str, int]) -> tuple[str, ...]:
-    return _deficit_order(successes, CATEGORY_SUCCESS_FLOORS)
+def _priority_categories(
+    successes: Mapping[str, int], attempts: Mapping[str, int] | None = None,
+) -> tuple[str, ...]:
+    return _effort_order(successes, attempts or {category: 0 for category in _CATEGORIES}, CATEGORY_SUCCESS_FLOORS)
 
 
 def _deficit_order(successes: Mapping[str, int], floors: Mapping[str, int]) -> tuple[str, ...]:
@@ -278,19 +281,63 @@ def _deficit_order(successes: Mapping[str, int], floors: Mapping[str, int]) -> t
     ))
 
 
-def _next_wave_categories(successes: Mapping[str, int]) -> tuple[str, ...]:
-    """Fill four slots from the largest remaining floor deficits before repeating."""
-    priority = _priority_categories(successes)
+def _effort_order(
+    successes: Mapping[str, int], attempts: Mapping[str, int], floors: Mapping[str, int],
+) -> tuple[str, ...]:
+    """Rank by Laplace-smoothed estimated attempts remaining to each floor."""
+    missing = [category for category in _CATEGORIES if successes[category] < floors[category]]
+    return tuple(sorted(
+        missing,
+        key=lambda category: (
+            -((floors[category] - successes[category]) * (attempts[category] + 2) / (successes[category] + 1)),
+            0 if category in _SHORT_CATEGORIES else 1,
+            _CATEGORIES.index(category),
+        ),
+    ))
+
+
+def _next_wave_categories(
+    successes: Mapping[str, int], attempts: Mapping[str, int] | None = None,
+) -> tuple[str, ...]:
+    """Allocate four slots by smoothed remaining work with a two-wave starvation bound."""
+    attempts = attempts or {category: 0 for category in _CATEGORIES}
+    priority = _priority_categories(successes, attempts)
     if not priority:
         return ()
-    return tuple(priority[index] if index < len(priority) else priority[index % len(priority)] for index in range(4))
+    most_attempted = max(attempts[category] for category in priority)
+    reserved = [
+        category for category in priority
+        if most_attempted - attempts[category] >= _STARVATION_ATTEMPT_GAP
+    ]
+    slots = reserved[:4]
+    effort = {
+        category: (CATEGORY_SUCCESS_FLOORS[category] - successes[category])
+        * (attempts[category] + 2) / (successes[category] + 1)
+        for category in priority
+    }
+    while len(slots) < 4:
+        candidates = [category for category in priority if slots.count(category) < 2]
+        if not candidates:
+            candidates = list(priority)
+        selected = max(
+            candidates,
+            key=lambda category: (
+                effort[category] / (slots.count(category) + 1),
+                1 if category in _SHORT_CATEGORIES else 0,
+                -_CATEGORIES.index(category),
+            ),
+        )
+        slots.append(selected)
+    return tuple(slots)
 
 
 def build_corrective_campaign_receipt(attempts: Iterable[Mapping[str, object]]) -> dict[str, object]:
     """Derive a complete campaign receipt only from terminal attempt receipts."""
     validated = _validate_attempts(attempts)
     successes = {category: 0 for category in _CATEGORIES}
+    category_attempts = {category: 0 for category in _CATEGORIES}
     for item in validated:
+        category_attempts[str(item["category"])] += 1
         if item["accepted_success"]:
             successes[str(item["category"])] += 1
     body = {
@@ -301,7 +348,7 @@ def build_corrective_campaign_receipt(attempts: Iterable[Mapping[str, object]]) 
         "attempt_receipts": [dict(item) for item in validated],
         "attempt_receipt_sha256s": [_canonical_sha256(item) for item in validated],
         "success_counts": successes,
-        "next_wave_categories": list(_next_wave_categories(successes)),
+        "next_wave_categories": list(_next_wave_categories(successes, category_attempts)),
         "parent_identity": {
             key: validated[0][key]
             for key in (
@@ -726,6 +773,7 @@ def assess_corrective_campaign(
         rental_kind=rental_kind,
     )
     successes = {category: 0 for category in _CATEGORIES}
+    category_attempts = {category: 0 for category in _CATEGORIES}
     seen_success_ids: set[str] = set()
     for supplied in episodes:
         if isinstance(supplied, Mapping):
@@ -750,6 +798,7 @@ def assess_corrective_campaign(
             raise ValueError("corrective episode identity is invalid")
         if not isinstance(episode.accepted_success, bool):
             raise ValueError("corrective episode success evidence is invalid")
+        category_attempts[episode.category] += 1
         if not episode.accepted_success:
             continue
         if episode.episode_id in seen_success_ids:
@@ -762,7 +811,7 @@ def assess_corrective_campaign(
         for category, count in successes.items()
         if count < policy.floor_for(category)
     }
-    priority = _deficit_order(successes, policy.category_success_floors)
+    priority = _effort_order(successes, category_attempts, policy.category_success_floors)
     complete = not missing and len(seen_success_ids) == policy.unique_success_floor
     return CorrectiveCampaignReport(
         category_successes=successes,
