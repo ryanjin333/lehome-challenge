@@ -25,6 +25,15 @@ from lehome_train.flywheel import rft
 from lehome_train.flywheel.rft import materialize_verified_corrective_rft_snapshot
 
 
+def test_corrective_next_wave_categories_are_deficit_aware_across_all_floors() -> None:
+    # Live corrective counts after 16 attempts: long categories have no
+    # successes, while pant-short is materially ahead.  The next full wave
+    # must still lead with the short deficits but advance every floor once.
+    assert __import__("lehome_train.flywheel.corrective", fromlist=["_next_wave_categories"])._next_wave_categories({
+        "top_long": 0, "top_short": 2, "pant_long": 0, "pant_short": 7,
+    }) == ("top_short", "pant_short", "top_long", "pant_long")
+
+
 def test_corrective_campaign_requires_distinct_seen_success_floors_and_prioritizes_short_garments() -> None:
     policy = CorrectiveCampaignPolicy(
         max_attempts=24,
@@ -197,7 +206,7 @@ def test_corrective_ledger_derives_attempt_count_and_requires_four_worker_waves(
 
     assert receipt["attempt_count"] == 4
     assert receipt["next_wave_categories"] == [
-        "top_short", "pant_short", "top_short", "pant_short"
+        "top_short", "pant_short", "top_long", "pant_long"
     ]
     broken = [_attempt("0001", "top_short", 0)]
     with pytest.raises(ValueError, match="four-worker"):

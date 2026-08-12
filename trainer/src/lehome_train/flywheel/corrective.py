@@ -262,17 +262,28 @@ def _validate_attempts(attempts: Iterable[Mapping[str, object]]) -> tuple[dict[s
 
 
 def _priority_categories(successes: Mapping[str, int]) -> tuple[str, ...]:
-    missing = {category for category in _CATEGORIES if successes[category] < CATEGORY_SUCCESS_FLOORS[category]}
-    priority = tuple(category for category in _SHORT_CATEGORIES if category in missing)
-    return priority or tuple(category for category in _CATEGORIES if category in missing)
+    return _deficit_order(successes, CATEGORY_SUCCESS_FLOORS)
+
+
+def _deficit_order(successes: Mapping[str, int], floors: Mapping[str, int]) -> tuple[str, ...]:
+    """Rank missing floors by deficit, preserving short-garment preference on ties."""
+    missing = [category for category in _CATEGORIES if successes[category] < floors[category]]
+    return tuple(sorted(
+        missing,
+        key=lambda category: (
+            -(floors[category] - successes[category]),
+            0 if category in _SHORT_CATEGORIES else 1,
+            _CATEGORIES.index(category),
+        ),
+    ))
 
 
 def _next_wave_categories(successes: Mapping[str, int]) -> tuple[str, ...]:
-    """Fill all four worker slots, alternating the remaining priority buckets."""
+    """Fill four slots from the largest remaining floor deficits before repeating."""
     priority = _priority_categories(successes)
     if not priority:
         return ()
-    return tuple(priority[index % len(priority)] for index in range(4))
+    return tuple(priority[index] if index < len(priority) else priority[index % len(priority)] for index in range(4))
 
 
 def build_corrective_campaign_receipt(attempts: Iterable[Mapping[str, object]]) -> dict[str, object]:
@@ -751,9 +762,7 @@ def assess_corrective_campaign(
         for category, count in successes.items()
         if count < policy.floor_for(category)
     }
-    priority = tuple(category for category in _SHORT_CATEGORIES if category in missing)
-    if not priority:
-        priority = tuple(category for category in _CATEGORIES if category in missing)
+    priority = _deficit_order(successes, policy.category_success_floors)
     complete = not missing and len(seen_success_ids) == policy.unique_success_floor
     return CorrectiveCampaignReport(
         category_successes=successes,
