@@ -463,6 +463,30 @@ def test_campaign_sync_failure_returns_one_stable_publishable_abort_root(tmp_pat
     assert result["synced_evidence_sha256"] == LIFECYCLE._evidence_root_sha256(evidence)
 
 
+def test_canary_failure_ingests_diagnostic_log_and_redacts_staged_token(tmp_path: Path) -> None:
+    baseline = _image_native_baseline()
+    attempt = _canary_attempt(tmp_path, seed=11)
+    canary = tmp_path / "canary.json"
+    _write(canary, {"schema_version": 1, "kind": "corrective_rft_canary", "wave_index": 0, "episode_count": 1, "baseline": baseline, "provider": {}, "attempt": attempt})
+    bundle = tmp_path / "code.bundle"; bundle.write_bytes(b"bundle")
+    token = tmp_path / "token"; token.write_text("super-secret-token")
+
+    def runner(command: tuple[str, ...]):
+        if command[0] == "scp" and command[-2].endswith("/code/campaign/."):
+            return type("Result", (), {"returncode": 1, "stdout": ""})()
+        if command[0] == "scp" and command[-2].endswith("/canary.returncode"):
+            Path(command[-1]).parent.mkdir(parents=True, exist_ok=True); Path(command[-1]).write_text("1\n")
+        if command[0] == "scp" and command[-2].endswith("/canary.log"):
+            Path(command[-1]).parent.mkdir(parents=True, exist_ok=True); Path(command[-1]).write_text("policy preflight failed; super-secret-token was not accepted\n")
+        return type("Result", (), {"returncode": 0, "stdout": ""})()
+
+    result = LIFECYCLE.remote_launch_canary(canary, _canary_instance(), lifecycle_root=tmp_path / "life", runner=runner, bundle=bundle, token_file=token)
+    log = Path(result["publisher_synced_evidence_root"]) / "canary.log"
+    assert result["kind"] == "corrective_canary_abort" and log.is_file()
+    assert "policy preflight failed" in log.read_text() and "super-secret-token" not in log.read_text()
+    assert "REDACTED_HF_TOKEN" in log.read_text()
+
+
 def test_rc0_failed_canary_emits_publishable_non_training_abort(tmp_path: Path) -> None:
     baseline = _image_native_baseline()
     attempt = _canary_attempt(tmp_path, seed=11)
@@ -475,6 +499,8 @@ def test_rc0_failed_canary_emits_publishable_non_training_abort(tmp_path: Path) 
     def runner(command: tuple[str, ...]):
         if command[0] == "scp" and command[-2].endswith("/code/campaign/."):
             _failed_canary_sync(sync, attempt, baseline)
+        if command[0] == "scp" and command[-2].endswith("/canary.log"):
+            Path(command[-1]).write_text("terminal failure diagnostics\n")
         return type("Result", (), {"returncode": 0, "stdout": ""})()
 
     result = LIFECYCLE.remote_launch_canary(canary, _canary_instance(), lifecycle_root=life, runner=runner, bundle=bundle, token_file=token)

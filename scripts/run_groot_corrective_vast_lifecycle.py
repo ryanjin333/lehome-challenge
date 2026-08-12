@@ -418,7 +418,8 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     runtime.extend(_qwen_base_setup(remote_dir + "/code"))
     command = " ".join(shlex.quote(item) for item in rewritten)
     controller_pythonpath = remote_dir + "/code/source/lehome:" + remote_dir + "/code"
-    script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nHF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=" + shlex.quote(controller_pythonpath) + " LEHOME_FLYWHEEL_WORKER_GPU=0 " + command + " )\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
+    remote_log = remote_dir + "/canary.log"
+    script = "set +e\n( set -eu\ntrap 'rm -f " + shlex.quote(remote_token) + "; unset HF_TOKEN' EXIT\n" + "\n".join(runtime) + "\nHF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=" + shlex.quote(controller_pythonpath) + " LEHOME_FLYWHEEL_WORKER_GPU=0 " + command + " ) > " + shlex.quote(remote_log) + " 2>&1\nrc=$?\nprintf '%s\\n' \"$rc\" > " + shlex.quote(remote_dir + "/canary.returncode") + "\nexit $rc"
     result = runner(("ssh", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote, "sh", "-lc", script))
     sync = lifecycle_root / f"canary-{value['wave_index']:06d}-sync"
     # The corrective controller consumes raw episodes and policy receipts from
@@ -426,13 +427,22 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     sync_result = runner(("scp", "-r", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", port, f"{remote}:{remote_campaign}/.", str(sync)))
     returncode_copy = lifecycle_root / f"canary-{value['wave_index']:06d}-returncode.tmp"
     log_result = runner(("scp", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", port, f"{remote}:{remote_dir}/canary.returncode", str(returncode_copy)))
+    diagnostic_copy = lifecycle_root / f"canary-{value['wave_index']:06d}-diagnostic.tmp"
+    diagnostic_result = runner(("scp", "-i", VAST_SSH_IDENTITY, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", port, f"{remote}:{remote_log}", str(diagnostic_copy)))
     completed = getattr(result, "returncode", 0)
+    base_receipt = {"schema_version": 1, "attempt_id": attempt["attempt_id"], "instance_id": instance_receipt["instance_id"], "transport_returncode": completed, "canary_manifest_sha256": manifest_hash, "staged_bundle_sha256": bundle_hash}
+    if getattr(sync_result, "returncode", 0) not in (0, None) or getattr(log_result, "returncode", 0) not in (0, None) or getattr(diagnostic_result, "returncode", 0) not in (0, None):
+        return _write_remote_abort(lifecycle_root, int(value["wave_index"]), attempt_id=str(attempt["attempt_id"]), base_receipt=base_receipt, sync_root=sync, returncode_copy=returncode_copy, diagnostic_copy=diagnostic_copy, token_file=token_file, setup="campaign, returncode, or diagnostic synchronization failed", sync_returncode=getattr(sync_result, "returncode", None), returncode_sync_returncode=getattr(log_result, "returncode", None))
+    try:
+        token_detected = _ingest_canary_diagnostic(diagnostic_copy, sync / "canary.log", token_file)
+    except ValueError as error:
+        return _write_remote_abort(lifecycle_root, int(value["wave_index"]), attempt_id=str(attempt["attempt_id"]), base_receipt=base_receipt, sync_root=sync, returncode_copy=returncode_copy, diagnostic_copy=None, token_file=token_file, setup=f"diagnostic log rejected: {error}", sync_returncode=getattr(sync_result, "returncode", None), returncode_sync_returncode=getattr(log_result, "returncode", None))
     hashes = {path.relative_to(sync).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(sync.rglob("*")) if path.is_file() and not path.is_symlink()} if sync.is_dir() else {}
-    base_receipt = {"schema_version": 1, "attempt_id": attempt["attempt_id"], "instance_id": instance_receipt["instance_id"], "transport_returncode": completed, "canary_manifest_sha256": manifest_hash, "staged_bundle_sha256": bundle_hash, "synced_evidence_sha256": _canonical_hash(hashes)}
-    if getattr(sync_result, "returncode", 0) not in (0, None) or getattr(log_result, "returncode", 0) not in (0, None):
-        return _write_remote_abort(lifecycle_root, int(value["wave_index"]), attempt_id=str(attempt["attempt_id"]), base_receipt=base_receipt, sync_root=sync, returncode_copy=returncode_copy, setup="campaign or returncode synchronization failed", sync_returncode=getattr(sync_result, "returncode", None), returncode_sync_returncode=getattr(log_result, "returncode", None))
+    base_receipt = {**base_receipt, "synced_evidence_sha256": _canonical_hash(hashes)}
+    if token_detected:
+        return _write_remote_abort(lifecycle_root, int(value["wave_index"]), attempt_id=str(attempt["attempt_id"]), base_receipt=base_receipt, sync_root=sync, returncode_copy=returncode_copy, diagnostic_copy=None, token_file=token_file, setup="diagnostic log contained staged token and was redacted", sync_returncode=getattr(sync_result, "returncode", None), returncode_sync_returncode=getattr(log_result, "returncode", None))
     if completed not in (0, None):
-        return _write_remote_abort(lifecycle_root, int(value["wave_index"]), attempt_id=str(attempt["attempt_id"]), base_receipt=base_receipt, sync_root=sync, returncode_copy=returncode_copy, setup="remote canary command failed", sync_returncode=getattr(sync_result, "returncode", None), returncode_sync_returncode=getattr(log_result, "returncode", None))
+        return _write_remote_abort(lifecycle_root, int(value["wave_index"]), attempt_id=str(attempt["attempt_id"]), base_receipt=base_receipt, sync_root=sync, returncode_copy=returncode_copy, diagnostic_copy=None, token_file=token_file, setup="remote canary command failed", sync_returncode=getattr(sync_result, "returncode", None), returncode_sync_returncode=getattr(log_result, "returncode", None))
     raw = sync / "raw" / str(attempt["attempt_id"])
     _verify_canonical_episode(raw, str(attempt["attempt_id"]))
     policy_receipt = sync / f"policy-server-receipt-{attempt['attempt_id']}.json"
@@ -500,7 +510,25 @@ def _evidence_root_sha256(root: Path) -> str:
     return _canonical_hash(hashes)
 
 
-def _write_remote_abort(root: Path, wave_index: int, *, attempt_id: str, base_receipt: Mapping[str, object], sync_root: Path, returncode_copy: Path, setup: str, sync_returncode: object, returncode_sync_returncode: object) -> dict[str, object]:
+def _ingest_canary_diagnostic(source: Path, destination: Path, token_file: Path) -> bool:
+    """Safely retain useful remote diagnostics without ever retaining a token."""
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("remote diagnostic log is unavailable or non-regular")
+    token = token_file.read_bytes()
+    if not token:
+        raise ValueError("local staged token is empty")
+    payload = source.read_bytes()
+    detected = token in payload
+    if detected:
+        payload = payload.replace(token, b"[REDACTED_HF_TOKEN]")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink():
+        raise ValueError("local diagnostic destination is unsafe")
+    destination.write_bytes(payload)
+    return detected
+
+
+def _write_remote_abort(root: Path, wave_index: int, *, attempt_id: str, base_receipt: Mapping[str, object], sync_root: Path, returncode_copy: Path, diagnostic_copy: Path | None, token_file: Path, setup: str, sync_returncode: object, returncode_sync_returncode: object) -> dict[str, object]:
     retry = uuid.uuid4().hex
     evidence = root / f"canary-{wave_index:06d}-abort-evidence-{retry}"
     _write_new(evidence / "setup.json", {"schema_version": 1, "kind": "corrective_canary_setup_abort", "attempt_id": attempt_id, "reason": setup})
@@ -510,6 +538,15 @@ def _write_remote_abort(root: Path, wave_index: int, *, attempt_id: str, base_re
     else:
         _write_new(evidence / "canary.returncode", {"status": "unavailable", "reason": "returncode synchronization failed"})
     _copy_regular_tree(sync_root, evidence / "campaign")
+    if diagnostic_copy is not None:
+        try:
+            _ingest_canary_diagnostic(diagnostic_copy, evidence / "canary.log", token_file)
+        except ValueError:
+            _write_new(evidence / "canary.log", {"status": "unavailable", "reason": "diagnostic log rejected"})
+    elif (sync_root / "canary.log").is_file() and not (sync_root / "canary.log").is_symlink():
+        shutil.copy2(sync_root / "canary.log", evidence / "canary.log")
+    else:
+        _write_new(evidence / "canary.log", {"status": "unavailable", "reason": "diagnostic log synchronization failed"})
     evidence_hash = _evidence_root_sha256(evidence)
     receipt_path = root / f"canary-{wave_index:06d}-abort-{retry}.json"
     receipt = _write_new(receipt_path, {**base_receipt, "kind": "corrective_canary_abort", "non_training_admitted": False, "retry_id": retry, "sync_returncode": sync_returncode, "returncode_sync_returncode": returncode_sync_returncode, "abort_evidence_root": str(evidence), "synced_evidence_root": str(evidence), "synced_evidence_sha256": evidence_hash})
