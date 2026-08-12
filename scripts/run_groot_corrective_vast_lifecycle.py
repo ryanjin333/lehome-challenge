@@ -48,6 +48,7 @@ APPROVED_QWEN_FILES = {
     "config.json": "bec4b3d446efa05807365c9e1cec03ac590836879d02f3a6da879971154bdd3b",
     "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
     "tokenizer.json": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+    "tokenizer_config.json": "c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399",
 }
 APPROVED_CONTROLLER_WIRE_WHEELS = (
     (
@@ -153,7 +154,7 @@ def _qwen_base_setup(checkout: str) -> list[str]:
     download = _hf_download(
         "/opt/lehome-challenge/.venv/bin/hf download " + APPROVED_QWEN_REPOSITORY
         + " --revision " + shlex.quote(APPROVED_QWEN_REVISION)
-        + " --include model.safetensors config.json preprocessor_config.json tokenizer.json --local-dir "
+        + " --include model.safetensors config.json preprocessor_config.json tokenizer.json tokenizer_config.json --local-dir "
         + shlex.quote(APPROVED_QWEN_ROOT)
     )
     checks = [
@@ -561,6 +562,8 @@ def remote_launch_canary(canary_manifest: Path, instance_receipt: Mapping[str, o
     if completed not in (0, None):
         return _write_remote_abort(lifecycle_root, int(value["wave_index"]), attempt_id=str(attempt["attempt_id"]), base_receipt=base_receipt, sync_root=sync, returncode_copy=returncode_copy, diagnostic_copy=None, token_file=token_file, setup="remote canary command failed", sync_returncode=getattr(sync_result, "returncode", None), returncode_sync_returncode=getattr(log_result, "returncode", None))
     raw = sync / "raw" / str(attempt["attempt_id"])
+    if raw.is_symlink() or not raw.is_dir():
+        return _write_remote_abort(lifecycle_root, int(value["wave_index"]), attempt_id=str(attempt["attempt_id"]), base_receipt=base_receipt, sync_root=sync, returncode_copy=returncode_copy, diagnostic_copy=None, token_file=token_file, setup="canonical raw episode is missing after rc0 remote canary", sync_returncode=getattr(sync_result, "returncode", None), returncode_sync_returncode=getattr(log_result, "returncode", None))
     _verify_canonical_episode(raw, str(attempt["attempt_id"]))
     policy_receipt = sync / f"policy-server-receipt-{attempt['attempt_id']}.json"
     _validate_canary_policy_receipt(policy_receipt, attempt, baseline, rewritten)

@@ -38,7 +38,8 @@ def test_qwen_checkout_link_exclusion_allows_only_the_known_recoverable_link() -
     commands = "\n".join(LIFECYCLE._qwen_base_setup("/workspace/checkouts/reviewed"))
     download = LIFECYCLE._qwen_base_setup("/workspace/checkouts/reviewed")[0]
     assert download.count(" --include ") == 1
-    assert "--include model.safetensors config.json preprocessor_config.json tokenizer.json --local-dir" in download
+    assert "--include model.safetensors config.json preprocessor_config.json tokenizer.json tokenizer_config.json --local-dir" in download
+    assert LIFECYCLE.APPROVED_QWEN_FILES["tokenizer_config.json"] == "c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399"
     assert "checkout has unexpected changes" in commands
     assert "unexpected git exclude content" in commands
     assert "exclude.parent.is_symlink()" in commands
@@ -542,6 +543,31 @@ def test_rc0_failed_canary_emits_publishable_non_training_abort(tmp_path: Path) 
     assert result["schema_version"] == 1 and result["non_training_admitted"] is False
     assert result["transport_returncode"] == 0 and result["attempt_id"] == "attempt-0" and result["instance_id"] == 9
     assert all(len(result[key]) == 64 for key in ("canary_manifest_sha256", "staged_bundle_sha256", "synced_evidence_sha256", "raw_manifest_sha256", "policy_receipt_sha256"))
+
+
+def test_rc0_canary_without_canonical_raw_returns_publishable_abort(tmp_path: Path) -> None:
+    baseline = _image_native_baseline()
+    attempt = _canary_attempt(tmp_path, seed=11)
+    canary = tmp_path / "canary.json"
+    _write(canary, {"schema_version": 1, "kind": "corrective_rft_canary", "wave_index": 0, "episode_count": 1, "baseline": baseline, "provider": {}, "attempt": attempt})
+    bundle = tmp_path / "code.bundle"; bundle.write_bytes(b"bundle")
+    token = tmp_path / "token"; token.write_text("secret")
+    life = tmp_path / "life"; sync = life / "canary-000000-sync"
+
+    def runner(command: tuple[str, ...]):
+        if command[0] == "scp" and command[-2].endswith("/canary-000000/campaign/."):
+            _write(sync / ".pending" / "attempt-0" / "snapshots" / "reset.json", {"episode_id": "attempt-0"})
+        if command[0] == "scp" and command[-2].endswith("/canary.returncode"):
+            Path(command[-1]).write_text("0\n")
+        if command[0] == "scp" and command[-2].endswith("/canary.log"):
+            Path(command[-1]).write_text("policy exception before canonical episode\n")
+        return type("Result", (), {"returncode": 0, "stdout": ""})()
+
+    result = LIFECYCLE.remote_launch_canary(canary, _canary_instance(), lifecycle_root=life, runner=runner, bundle=bundle, token_file=token)
+    assert result["kind"] == "corrective_canary_abort" and result["non_training_admitted"] is False
+    assert result["transport_returncode"] == 0 and result["attempt_id"] == "attempt-0"
+    assert "canonical raw episode is missing" in (Path(result["abort_evidence_root"]) / "setup.json").read_text()
+    assert not (life / "canary-000000-attempt-receipt.json").exists()
 
 
 def _image_native_baseline() -> dict[str, object]:
