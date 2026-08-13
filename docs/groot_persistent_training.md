@@ -41,6 +41,12 @@ the exact image digest, CUDA/Torch CUDA, compute capability, a finite optimizer
 step, and NVML telemetry. A newer Blackwell driver is accepted only by that
 training capability gate; rollout driver policy is separate.
 
+The rent request must name an accepted trainer OCI digest. A historical image
+is not implicitly accepted: it still needs this training capability smoke.
+Stage uses strict port-bound SSH/SCP, transfers the complete sealed generation,
+receipt, clean code bundle, parent artifact, config/modality, and token file,
+then SHA-256-reads every remote file before a later tune/train action.
+
 Measure loader workers at batch 64, then measure batches 64/96/128. Record all
 outcomes and stop increasing batch after OOM. Production remains one GPU,
 physical/global batch 64, one 2,000-step official process, saving at 1,000 and
