@@ -150,6 +150,10 @@ def _publication_input(tmp_path: Path):
         root.mkdir(parents=True)
         (root / "episode.json").write_bytes(canonical_json_bytes({
             "episode_id": attempt["episode_id"],
+            "accepted_success": True,
+            "outcome": "success",
+            "terminal_reason": "success",
+            "mode": "autonomous",
             "identity": {"release_stage": "seen"},
         }))
         (root / "annotations.jsonl").write_bytes(b"{}\n")
