@@ -201,10 +201,12 @@ def _publication_input(tmp_path: Path):
     selected = select_corrective_successes(attempts)
     (snapshot / "manifest.json").write_bytes(canonical_json_bytes({
         "schema_version": 1, "source_format": "verified_flywheel_rft_release",
+        "future_actions": {"horizon": 16},
         "corrective_campaign": {"campaign_receipt_sha256": selection.campaign_receipt["receipt_sha256"]},
     }))
     (snapshot / "meta" / "rft-selection.json").write_bytes(canonical_json_bytes({
         "schema_version": 1,
+        "action_horizon": 16,
         "corrective_campaign": {
             "campaign_receipt_sha256": selection.campaign_receipt["receipt_sha256"],
             "selected_bindings": [
@@ -214,6 +216,30 @@ def _publication_input(tmp_path: Path):
         },
     }))
     return publication, snapshot
+
+
+@pytest.mark.parametrize(
+    ("path", "field", "value"),
+    [
+        ("manifest.json", "future_actions", None),
+        ("manifest.json", "future_actions", {"horizon": 40}),
+        ("meta/rft-selection.json", "action_horizon", None),
+        ("meta/rft-selection.json", "action_horizon", 40),
+    ],
+)
+def test_corrective_snapshot_requires_matching_16_step_horizons(
+    tmp_path: Path, path: str, field: str, value: object
+) -> None:
+    publication, snapshot = _publication_input(tmp_path)
+    current = json.loads((snapshot / path).read_text(encoding="utf-8"))
+    if value is None:
+        current.pop(field)
+    else:
+        current[field] = value
+    (snapshot / path).write_bytes(canonical_json_bytes(current))
+
+    with pytest.raises(ValueError, match="action horizon must be exactly 16"):
+        publish_module._require_snapshot(publication, snapshot)
 
 
 def _release_with_instances(tmp_path: Path):

@@ -137,7 +137,8 @@ def test_smoke_launches_tier_candidates_sequentially_with_fixed_contract() -> No
     assert all(config.max_steps == SMOKE_OPTIMIZER_STEPS == 100 for config in calls)
     assert all(config.global_batch_size == config.physical_batch_size for config in calls)
     assert all(config.gradient_accumulation_steps == 1 for config in calls)
-    assert all(config.action_horizon == 16 for config in calls)
+    assert all(config.model_action_chunk_capacity == 40 for config in calls)
+    assert all(config.training_action_horizon == 16 for config in calls)
     assert report.selected_batch_size == 64
     assert [attempt.result.physical_batch_size for attempt in report.attempts] == [16, 32, 64]
 

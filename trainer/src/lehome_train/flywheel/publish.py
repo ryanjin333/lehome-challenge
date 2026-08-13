@@ -682,6 +682,12 @@ def _require_snapshot(bundle: CorrectivePublicationBundle, snapshot: Path) -> tu
         raise ValueError("corrective materialized snapshot lacks required control files")
     manifest = _read_json(snapshot / "manifest.json")
     selection = _read_json(snapshot / "meta" / "rft-selection.json")
+    future_actions = manifest.get("future_actions")
+    manifest_horizon = (
+        future_actions.get("horizon") if isinstance(future_actions, Mapping) else None
+    )
+    if manifest_horizon != 16 or selection.get("action_horizon") != 16:
+        raise ValueError("corrective materialized snapshot action horizon must be exactly 16")
     campaign = selection.get("corrective_campaign")
     if (
         manifest.get("source_format") != "verified_flywheel_rft_release"

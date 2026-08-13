@@ -95,7 +95,6 @@ def test_build_launch_verifies_step_12000_parent_weights(
     digest = hashlib.sha256(weights.read_bytes()).hexdigest()
     parent = config(
         base_model_path=str(checkpoint),
-        action_horizon=40,
         parent_checkpoint_repository="ryanjin333/lehome-groot-n17-models",
         parent_checkpoint_revision="b" * 40,
         parent_checkpoint_subpath="policies/step-12000",
@@ -114,7 +113,6 @@ def test_build_launch_verifies_step_12000_parent_weights(
         build_launch(
             config(
                 base_model_path=str(checkpoint),
-                action_horizon=40,
                 parent_checkpoint_repository="ryanjin333/lehome-groot-n17-models",
                 parent_checkpoint_revision="b" * 40,
                 parent_checkpoint_subpath="policies/step-12000",

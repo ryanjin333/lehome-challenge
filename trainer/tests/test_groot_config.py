@@ -50,13 +50,14 @@ def canonical_holdout_receipt() -> dict[str, object]:
     return receipt
 
 
-def test_config_enforces_single_gpu_fixed_batch_horizon_and_freezing() -> None:
+def test_config_separates_40_step_model_capacity_from_16_step_training_target() -> None:
     resolved = config()
 
     assert resolved.num_gpus == 1
     assert resolved.global_batch_size == 64
     assert resolved.gradient_accumulation_steps == 1
-    assert resolved.action_horizon == 16
+    assert resolved.model_action_chunk_capacity == 40
+    assert resolved.training_action_horizon == 16
     assert resolved.tune_llm is False
     assert resolved.tune_visual is False
     assert resolved.tune_projector is True
@@ -83,10 +84,9 @@ def test_config_records_four_gpu_global_batch_math_and_presentations() -> None:
     assert distributed.identity()["global_batch_size"] == 4
 
 
-def test_rft_config_binds_step_12000_parent_and_40_action_horizon() -> None:
+def test_rft_config_binds_step_12000_parent_capacity_to_a_16_step_training_target() -> None:
     resolved = config(
         base_model_path="/cache/models/lehome/policies/step-12000",
-        action_horizon=40,
         max_steps=2_000,
         save_steps=1_000,
         parent_checkpoint_repository="ryanjin333/lehome-groot-n17-models",
@@ -95,15 +95,26 @@ def test_rft_config_binds_step_12000_parent_and_40_action_horizon() -> None:
         parent_checkpoint_artifact_sha256=PARENT_DIGEST,
     )
 
-    assert resolved.action_horizon == 40
+    assert resolved.model_action_chunk_capacity == 40
+    assert resolved.training_action_horizon == 16
     assert resolved.max_steps == 2_000
     assert resolved.save_steps == 1_000
     assert resolved.identity()["parent_checkpoint_artifact_sha256"] == PARENT_DIGEST
 
 
-def test_40_action_horizon_requires_complete_parent_checkpoint_identity() -> None:
-    with pytest.raises(ValueError, match="parent checkpoint"):
-        config(action_horizon=40)
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("model_action_chunk_capacity", 16, "model action chunk capacity"),
+        ("training_action_horizon", 40, "training action horizon"),
+        ("training_action_horizon", 8, "training action horizon"),
+    ],
+)
+def test_config_refuses_dual_or_noncanonical_horizon_contracts(
+    field: str, value: int, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        config(**{field: value})
 
 
 @pytest.mark.parametrize(
@@ -160,7 +171,6 @@ def test_config_rejects_nvidia_reference_without_a_valid_receipt() -> None:
         ("num_gpus", 2, "exactly one GPU"),
         ("global_batch_size", 32, "physical batch"),
         ("gradient_accumulation_steps", 2, "gradient accumulation"),
-        ("action_horizon", 8, "action horizon"),
         ("warmup_ratio", 0.0, "warmup_ratio"),
         ("experiment_name", "../outside", "experiment_name"),
         ("experiment_name", "/outside", "experiment_name"),

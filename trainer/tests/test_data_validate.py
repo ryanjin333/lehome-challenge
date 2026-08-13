@@ -11,6 +11,7 @@ from fixtures.source_dataset import make_source_dataset
 from lehome_train.data.convert import convert_dataset
 from lehome_train.data.stats import write_train_statistics
 from lehome_train.data.validate import (
+    _action_horizon,
     _compare_statistics,
     _validate_manifest,
     validate_prepared_dataset,
@@ -85,7 +86,7 @@ def test_runtime_modality_contract_supports_step_12000_horizon_40(tmp_path: Path
     assert modality_contract(action_horizon=40)["action"]["delta_indices"] == list(range(40))
 
 
-def test_manifest_validator_accepts_step_12000_horizon_40() -> None:
+def test_manifest_validator_preserves_legacy_step_12000_horizon_40() -> None:
     manifest = {
         "fixed_language_instruction": "fold the garment on the table",
         "action_schema": {"storage": "absolute", "dimension": 12},
@@ -96,6 +97,16 @@ def test_manifest_validator_accepts_step_12000_horizon_40() -> None:
     }
 
     assert _validate_manifest(manifest) == (["0"], ["1"])
+
+
+def test_manifest_validator_rejects_40_step_corrective_rft_target() -> None:
+    manifest = {
+        "source_format": "verified_flywheel_rft_release",
+        "future_actions": {"horizon": 40},
+    }
+
+    with pytest.raises(ValueError, match="corrective RFT.*exactly 16"):
+        _action_horizon(manifest)
 
 
 def test_validation_writes_hashed_report_and_keeps_split_offline(tmp_path: Path) -> None:

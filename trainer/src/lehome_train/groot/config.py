@@ -56,7 +56,8 @@ class FineTuneLaunchConfig:
     num_gpus: int = 1
     global_batch_size: int | None = None
     gradient_accumulation_steps: int = 1
-    action_horizon: int = ACTION_HORIZON
+    model_action_chunk_capacity: int = 40
+    training_action_horizon: int = ACTION_HORIZON
     tune_llm: bool = False
     tune_visual: bool = False
     tune_projector: bool = True
@@ -112,6 +113,10 @@ class FineTuneLaunchConfig:
         if self.num_gpus == 4 and self.physical_batch_size != 1:
             raise ValueError("four-GPU profile requires per-device batch 1")
         object.__setattr__(self, "global_batch_size", resolved_global_batch)
+        if self.model_action_chunk_capacity != 40:
+            raise ValueError("model action chunk capacity must be exactly 40")
+        if self.training_action_horizon != ACTION_HORIZON:
+            raise ValueError("training action horizon must be exactly 16")
         parent_fields = (
             self.parent_checkpoint_repository,
             self.parent_checkpoint_revision,
@@ -147,10 +152,6 @@ class FineTuneLaunchConfig:
                 raise ValueError("parent checkpoint artifact SHA-256 is invalid")
             if not Path(self.base_model_path).is_absolute():
                 raise ValueError("parent checkpoint base_model_path must be absolute")
-            if self.action_horizon != 40:
-                raise ValueError("parent checkpoint action horizon must be exactly 40")
-        elif self.action_horizon != ACTION_HORIZON:
-            raise ValueError("action horizon must be exactly 16 without a parent checkpoint")
         if not self.tune_projector:
             raise ValueError("tune_projector must be true")
         if not self.tune_diffusion_model:
@@ -192,7 +193,8 @@ class FineTuneLaunchConfig:
             "physical_batch_size": self.physical_batch_size,
             "global_batch_size": self.global_batch_size,
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
-            "action_horizon": self.action_horizon,
+            "model_action_chunk_capacity": self.model_action_chunk_capacity,
+            "training_action_horizon": self.training_action_horizon,
             "warmup_ratio": float(self.warmup_ratio),
             "lr_scheduler_type": LR_SCHEDULER_TYPE,
             "decay_semantics": DECAY_SEMANTICS,

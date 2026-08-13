@@ -59,6 +59,8 @@ def _load_manifest(dataset: Path) -> dict[str, Any]:
 def _manifest_action_horizon(manifest: Mapping[str, Any]) -> int:
     future = manifest.get("future_actions")
     horizon = future.get("horizon") if isinstance(future, Mapping) else None
+    if manifest.get("source_format") == "verified_flywheel_rft_release" and horizon != 16:
+        raise ValueError("corrective RFT future actions must have horizon exactly 16")
     if type(horizon) is not int or horizon not in {16, 40}:
         raise ValueError("prepared dataset action horizon must be 16 or 40")
     return horizon
