@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 from typing import Iterable, Mapping
 
+from lehome.flywheel.artifacts import verify_episode_manifest
+from lehome_train.flywheel.materialize import _is_autonomous_policy_success
 from lehome_train.io import canonical_json_bytes, sha256_file
 
 
@@ -367,9 +369,11 @@ def build_corrective_campaign_receipt(attempts: Iterable[Mapping[str, object]]) 
     return {**body, "receipt_sha256": _canonical_sha256(body)}
 
 
-def select_corrective_successes(attempts: Iterable[Mapping[str, object]]) -> tuple[dict[str, object], ...]:
-    """Deterministically select exactly 150 successful, independently reset states."""
-    validated = _validate_attempts(attempts)
+def _select_corrective_successes(
+    validated: Iterable[Mapping[str, object]],
+) -> tuple[dict[str, object], ...]:
+    """Select exact category floors from already-validated eligible receipts."""
+    validated = tuple(dict(item) for item in validated)
     successes = [item for item in validated if item["accepted_success"]]
     if len(successes) < TARGET_UNIQUE_SUCCESSES:
         raise ValueError("corrective campaign has fewer than 150 accepted successes")
@@ -395,6 +399,65 @@ def select_corrective_successes(attempts: Iterable[Mapping[str, object]]) -> tup
     if len(flat) != TARGET_UNIQUE_SUCCESSES:
         raise ValueError("corrective selection must contain exactly 150 successes")
     return flat
+
+
+def select_corrective_successes(attempts: Iterable[Mapping[str, object]]) -> tuple[dict[str, object], ...]:
+    """Deterministically select exactly 150 successful, independently reset states."""
+    return _select_corrective_successes(_validate_attempts(attempts))
+
+
+def _is_verified_trainable_corrective_artifact(
+    attempt: Mapping[str, object], artifact: Mapping[str, object],
+) -> bool:
+    """Verify a raw artifact and admit only the canonical autonomous RFT subset."""
+    attempt_id = attempt.get("attempt_id")
+    episode_id = attempt.get("episode_id")
+    if not isinstance(attempt_id, str) or not isinstance(episode_id, str):
+        raise ValueError("corrective selected attempt identity is invalid")
+    if artifact.get("episode_id") != episode_id or artifact.get("release_stage") != "seen":
+        raise ValueError("corrective verified episode identity does not match its attempt")
+    root, manifest = artifact.get("root"), artifact.get("episode_manifest_sha256")
+    if not isinstance(root, str) or not root or _SHA256.fullmatch(str(manifest)) is None:
+        raise ValueError("corrective verified episode artifact binding is invalid")
+    raw_root = Path(root)
+    try:
+        actual_manifest = sha256_file(raw_root / "SHA256SUMS.json")
+    except OSError:
+        raise ValueError("corrective verified episode manifest is stale or unavailable") from None
+    if actual_manifest != manifest:
+        raise ValueError("corrective verified episode manifest is stale or unavailable")
+    try:
+        episode, _ = verify_episode_manifest(raw_root)
+    except ValueError:
+        raise ValueError("corrective raw episode manifest verification failed") from None
+    if episode.get("episode_id") != episode_id:
+        raise ValueError("corrective verified episode identity does not match its attempt")
+    identity = episode.get("identity")
+    if not isinstance(identity, Mapping):
+        return False
+    if identity.get("release_stage") == "public_unseen":
+        return False
+    if identity.get("release_stage") != "seen":
+        return False
+    return _is_autonomous_policy_success(episode)
+
+
+def _eligible_corrective_successes(
+    validated_attempts: Iterable[Mapping[str, object]],
+    verified_episodes: Mapping[str, Mapping[str, object]],
+) -> tuple[dict[str, object], ...]:
+    """Retain receipt successes only when their raw episode passes canonical admission."""
+    eligible: list[dict[str, object]] = []
+    for attempt in validated_attempts:
+        if not attempt["accepted_success"]:
+            continue
+        attempt_id = str(attempt["attempt_id"])
+        artifact = verified_episodes.get(attempt_id)
+        if not isinstance(artifact, Mapping):
+            continue
+        if _is_verified_trainable_corrective_artifact(attempt, artifact):
+            eligible.append(dict(attempt))
+    return tuple(eligible)
 
 
 def bind_corrective_episode_artifacts(
@@ -455,7 +518,8 @@ def build_corrective_selection_bundle(
 
     frozen_attempts = tuple(attempts)
     receipt = build_corrective_campaign_receipt(frozen_attempts)
-    selected = select_corrective_successes(frozen_attempts)
+    eligible = _eligible_corrective_successes(_validate_attempts(frozen_attempts), verified_episodes)
+    selected = _select_corrective_successes(eligible)
     bindings = bind_corrective_episode_artifacts(selected, verified_episodes)
     body = _selection_body(receipt, bindings, selected)
     return CorrectiveSelectionBundle(receipt, bindings, tuple(dict(item) for item in selected), _canonical_sha256(body))

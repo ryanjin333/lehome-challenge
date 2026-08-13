@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from lehome.flywheel.artifacts import build_sha256_manifest
 from lehome_train.flywheel.corrective import (
     APPROVED_PARENT_ARTIFACT_SHA256,
     APPROVED_PARENT_REPOSITORY,
@@ -205,6 +206,33 @@ def _attempt(
     }
 
 
+def _verified_trainable_artifacts(tmp_path, selected):
+    artifacts: dict[str, dict[str, object]] = {}
+    for item in selected:
+        root = tmp_path / str(item["episode_id"])
+        root.mkdir()
+        (root / "episode.json").write_text(json.dumps({
+            "episode_id": item["episode_id"],
+            "accepted_success": True,
+            "outcome": "success",
+            "terminal_reason": "success",
+            "mode": "autonomous",
+            "identity": {"release_stage": "seen"},
+        }), encoding="utf-8")
+        (root / "SHA256SUMS.json").write_text(json.dumps(
+            build_sha256_manifest(root), sort_keys=True, separators=(",", ":")
+        ), encoding="utf-8")
+        artifacts[str(item["attempt_id"])] = {
+            "episode_id": item["episode_id"],
+            "release_stage": "seen",
+            "root": str(root),
+            "episode_manifest_sha256": __import__("hashlib").sha256(
+                (root / "SHA256SUMS.json").read_bytes()
+            ).hexdigest(),
+        }
+    return artifacts
+
+
 def test_corrective_ledger_derives_attempt_count_and_requires_four_worker_waves() -> None:
     receipt = build_corrective_campaign_receipt(
         [
@@ -283,7 +311,61 @@ def test_corrective_selection_uses_distinct_state_fingerprints_and_exact_floors(
         select_corrective_successes(duplicate)
 
 
-def test_typed_corrective_chain_binds_selected_artifacts_and_rejects_stale_manifest() -> None:
+def test_corrective_selection_excludes_verified_horizon_episodes_before_exact_floors(
+    tmp_path,
+) -> None:
+    """Receipt-successes are insufficient when the verified raw terminal is not success."""
+    attempts = []
+    for index, category in enumerate([
+        *("top_long",) * 30,
+        *("top_short",) * 47,
+        *("pant_long",) * 30,
+        *("pant_short",) * 45,
+    ]):
+        attempt = _attempt(f"{index:04d}", category, index % 4)
+        attempt["wave_index"] = index // 4
+        attempt["reset_sha256"] = f"{index:064x}"
+        attempt["randomization_sha256"] = f"{index + 200:064x}"
+        attempt["hard_state_sha256"] = f"{index + 400:064x}"
+        attempts.append(attempt)
+
+    horizon_attempt_ids = {"0030", "0031"}
+    artifacts: dict[str, dict[str, object]] = {}
+    for attempt in attempts:
+        root = tmp_path / str(attempt["episode_id"])
+        root.mkdir()
+        terminal_reason = "horizon" if attempt["attempt_id"] in horizon_attempt_ids else "success"
+        (root / "episode.json").write_text(json.dumps({
+            "episode_id": attempt["episode_id"],
+            "accepted_success": True,
+            "outcome": "success",
+            "terminal_reason": terminal_reason,
+            "mode": "autonomous",
+            "identity": {"release_stage": "seen"},
+        }), encoding="utf-8")
+        (root / "SHA256SUMS.json").write_text(json.dumps(
+            build_sha256_manifest(root), sort_keys=True, separators=(",", ":")
+        ), encoding="utf-8")
+        artifacts[str(attempt["attempt_id"])] = {
+            "episode_id": attempt["episode_id"],
+            "release_stage": "seen",
+            "root": str(root),
+            "episode_manifest_sha256": __import__("hashlib").sha256(
+                (root / "SHA256SUMS.json").read_bytes()
+            ).hexdigest(),
+        }
+
+    bundle = build_corrective_selection_bundle(attempts, artifacts)
+
+    assert len(bundle.bindings) == 150
+    assert {item.attempt_id for item in bundle.bindings}.isdisjoint(horizon_attempt_ids)
+    assert {
+        category: sum(item["category"] == category for item in bundle.selected_attempt_receipts)
+        for category in CATEGORY_SUCCESS_FLOORS
+    } == CATEGORY_SUCCESS_FLOORS
+
+
+def test_typed_corrective_chain_binds_selected_artifacts_and_rejects_stale_manifest(tmp_path) -> None:
     attempts = []
     categories = [
         *("top_long",) * 30,
@@ -300,15 +382,7 @@ def test_typed_corrective_chain_binds_selected_artifacts_and_rejects_stale_manif
         attempt["hard_state_sha256"] = f"{index + 400:064x}"
         attempts.append(attempt)
     selected = select_corrective_successes(attempts)
-    artifacts = {
-        item["attempt_id"]: {
-            "episode_id": item["episode_id"],
-            "release_stage": "seen",
-            "root": f"/verified/{item['attempt_id']}",
-            "episode_manifest_sha256": f"{index:064x}",
-        }
-        for index, item in enumerate(selected)
-    }
+    artifacts = _verified_trainable_artifacts(tmp_path, selected)
 
     bundle = build_corrective_selection_bundle(attempts, artifacts)
     bindings = verify_corrective_selection_bundle(bundle)
@@ -327,7 +401,7 @@ def test_typed_corrective_chain_binds_selected_artifacts_and_rejects_stale_manif
         bind_corrective_episode_artifacts(selected, stale)
 
 
-def test_selection_bundle_rejects_a_forged_binding_even_when_its_hash_is_recomputed() -> None:
+def test_selection_bundle_rejects_a_forged_binding_even_when_its_hash_is_recomputed(tmp_path) -> None:
     attempts = []
     for index, category in enumerate([
         *("top_long",) * 30, *("top_short",) * 45,
@@ -340,13 +414,7 @@ def test_selection_bundle_rejects_a_forged_binding_even_when_its_hash_is_recompu
         attempt["hard_state_sha256"] = f"{index + 400:064x}"
         attempts.append(attempt)
     selected = select_corrective_successes(attempts)
-    artifacts = {
-        item["attempt_id"]: {
-            "episode_id": item["episode_id"], "release_stage": "seen",
-            "root": f"/verified/{item['attempt_id']}", "episode_manifest_sha256": f"{index:064x}",
-        }
-        for index, item in enumerate(selected)
-    }
+    artifacts = _verified_trainable_artifacts(tmp_path, selected)
     bundle = build_corrective_selection_bundle(attempts, artifacts)
     forged_bindings = (
         replace(bundle.bindings[0], episode_id="forged-episode"), *bundle.bindings[1:]
@@ -407,21 +475,8 @@ def test_verified_corrective_materialization_hands_exact_bindings_to_pre_hash_sn
         attempt["hard_state_sha256"] = f"{index + 400:064x}"
         attempts.append(attempt)
     selected = select_corrective_successes(attempts)
-    artifacts: dict[str, dict[str, object]] = {}
-    episode_by_root: dict[str, str] = {}
-    for index, item in enumerate(selected):
-        root = tmp_path / item["attempt_id"]
-        root.mkdir()
-        payload = f"manifest-{index}".encode("utf-8")
-        (root / "SHA256SUMS.json").write_bytes(payload)
-        digest = __import__("hashlib").sha256(payload).hexdigest()
-        artifacts[item["attempt_id"]] = {
-            "episode_id": item["episode_id"],
-            "release_stage": "seen",
-            "root": str(root),
-            "episode_manifest_sha256": digest,
-        }
-        episode_by_root[str(root)] = str(item["episode_id"])
+    artifacts = _verified_trainable_artifacts(tmp_path, selected)
+    episode_by_root = {item["root"]: str(item["episode_id"]) for item in artifacts.values()}
     bundle = build_corrective_selection_bundle(attempts, artifacts)
     received: dict[str, object] = {}
     monkeypatch.setattr(
@@ -482,16 +537,7 @@ def test_verified_corrective_materialization_rejects_a_final_snapshot_with_not_1
         attempt["randomization_sha256"] = f"{index + 200:064x}"
         attempt["hard_state_sha256"] = f"{index + 400:064x}"
         attempts.append(attempt)
-    artifacts = {}
-    for index, item in enumerate(select_corrective_successes(attempts)):
-        root = tmp_path / item["attempt_id"]
-        root.mkdir()
-        payload = f"manifest-{index}".encode("utf-8")
-        (root / "SHA256SUMS.json").write_bytes(payload)
-        artifacts[item["attempt_id"]] = {
-            "episode_id": item["episode_id"], "release_stage": "seen", "root": str(root),
-            "episode_manifest_sha256": __import__("hashlib").sha256(payload).hexdigest(),
-        }
+    artifacts = _verified_trainable_artifacts(tmp_path, select_corrective_successes(attempts))
     bundle = build_corrective_selection_bundle(attempts, artifacts)
     episode_by_root = {item.root: item.episode_id for item in bundle.bindings}
     monkeypatch.setattr(
