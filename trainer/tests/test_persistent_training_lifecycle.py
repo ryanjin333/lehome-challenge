@@ -31,19 +31,22 @@ def test_destroy_requires_two_immutable_checkpoints_bound_to_instance(tmp_path: 
         LIFECYCLE.destroy(instance_id=7, training_receipt=receipt)
 
 
-def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: Path) -> None:
+def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     commands: list[tuple[str, ...]] = []
     def runner(command: tuple[str, ...]) -> str:
         commands.append(command)
         if command[:4] == ("vastai", "--raw", "search", "offers"):
-            return '[{"id":7,"gpu_name":"RTX PRO 6000","num_gpus":1,"gpu_ram":96,"dph_total":0.7,"is_bid":true}]'
+            return '[{"id":7,"gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"min_bid":0.5,"is_bid":false,"driver_version":"595.71.05","untrusted_token":"never-persist"}]'
         if command[:4] == ("vastai", "--raw", "show", "instances"): return "[]"
         if command[:4] == ("vastai", "--raw", "show", "volumes"): return "[]"
         if command[:4] == ("vastai", "--raw", "create", "instance"): return '{"new_contract":9}'
-        if command[:4] == ("vastai", "--raw", "show", "instance"): return '{"id":9,"gpu_name":"RTX PRO 6000","num_gpus":1,"ssh_host":"host","ssh_port":22}'
+        if command[:4] == ("vastai", "--raw", "show", "instance"): return '{"id":9,"gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"ssh_host":"host","ssh_port":22,"driver_version":"595.71.05"}'
         if command[:3] == ("vastai", "destroy", "instance"): return ""
         raise AssertionError(command)
-    evidence = LIFECYCLE.capture_offers(runner=runner)
+    monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
+    evidence = LIFECYCLE.capture_offers(runner=runner, now_unix=100)
+    assert evidence["offer"]["gpu_name"] == "RTX PRO 6000 WS"
+    assert "untrusted_token" not in evidence["offer"]
     instance = LIFECYCLE.rent(evidence=evidence, runner=runner)
     assert instance["instance_id"] == 9
     with pytest.raises(ValueError, match="destroy absence"):

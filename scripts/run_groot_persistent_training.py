@@ -18,7 +18,8 @@ from typing import Callable, Mapping
 
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
 CORRECTIVE_SOURCE = {"revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c", "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35"}
-OFFER_QUERY = "gpu_name=RTX_PRO_6000 gpu_ram>=96 num_gpus=1 reliability>=0.95"
+OFFER_QUERY = "(gpu_name=RTX_PRO_6000_WS gpu_name=RTX_PRO_6000_S) gpu_ram>=96000 num_gpus=1 reliability>=0.95"
+TRAINER_IMAGE = "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:" + "a" * 64
 Runner = Callable[[tuple[str, ...]], str]
 
 
@@ -42,23 +43,36 @@ def _json(runner: Runner, command: tuple[str, ...]) -> object:
     except json.JSONDecodeError as error: raise ValueError("provider response is invalid JSON") from error
 
 
-def capture_offers(*, runner: Runner) -> dict[str, object]:
+def _offer_gpu(row: Mapping[str, object]) -> bool:
+    return row.get("gpu_name") in {"RTX PRO 6000 WS", "RTX PRO 6000 S"} and float(row.get("gpu_ram", 0)) >= 96000
+
+
+def _project(row: Mapping[str, object], fields: tuple[str, ...]) -> dict[str, object]:
+    return {field: row[field] for field in fields if field in row}
+
+
+def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: int = 300) -> dict[str, object]:
     offers = _json(runner, ("vastai", "--raw", "search", "offers", OFFER_QUERY, "--interruptible"))
     instances = _json(runner, ("vastai", "--raw", "show", "instances"))
     volumes = _json(runner, ("vastai", "--raw", "show", "volumes"))
     if not all(isinstance(value, list) for value in (offers, instances, volumes)): raise ValueError("provider listing is invalid")
-    eligible = [row for row in offers if isinstance(row, Mapping) and row.get("gpu_name") == "RTX PRO 6000" and row.get("num_gpus") == 1 and float(row.get("gpu_ram", 0)) >= 96 and row.get("is_bid") is True and float(row.get("dph_total", 99)) < 1]
+    eligible = [row for row in offers if isinstance(row, Mapping) and _offer_gpu(row) and row.get("num_gpus") == 1 and float(row.get("dph_total", 99)) < 1]
     if not eligible: raise ValueError("no interruptible RTX PRO 6000 96GB offer under $1/hr")
     offer = min(eligible, key=lambda row: float(row["dph_total"]))
     total = sum(float(row.get("dph_total", 0)) for row in instances if isinstance(row, Mapping)) + sum(float(row.get("storage_total_cost", 0)) for row in volumes if isinstance(row, Mapping)) + float(offer["dph_total"])
     if total > 2: raise ValueError("account-wide instance and storage total exceeds $2/hr")
-    return {"schema_version": 1, "kind": "persistent_training_offer", "offer": dict(offer), "account_hourly_total_usd": total, "captured_at_unix": int(time.time())}
+    captured = int(time.time()) if now_unix is None else now_unix
+    safe_offer = _project(offer, ("id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "min_bid", "driver_version", "is_bid", "image"))
+    return {"schema_version": 1, "kind": "persistent_training_offer", "offer": safe_offer, "account_hourly_total_usd": total, "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds, "search_mode": "interruptible"}
 
 
 def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12) -> dict[str, object]:
     offer = evidence.get("offer")
     if not isinstance(offer, Mapping) or type(offer.get("id")) is not int: raise ValueError("offer evidence is invalid")
-    created = _json(runner, ("vastai", "--raw", "create", "instance", str(offer["id"]), "--ssh", "--direct", "--cancel-unavail"))
+    if evidence.get("search_mode") != "interruptible" or type(evidence.get("expires_at_unix")) is not int or evidence["expires_at_unix"] < int(time.time()): raise ValueError("offer evidence is expired or not interruptible")
+    bid = offer.get("min_bid", offer.get("dph_total"))
+    if type(bid) not in (int, float) or float(bid) >= 1: raise ValueError("offer bid price is invalid")
+    created = _json(runner, ("vastai", "--raw", "create", "instance", str(offer["id"]), "--image", TRAINER_IMAGE, "--disk", "300", "--bid_price", str(bid), "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + TRAINER_IMAGE))
     if not isinstance(created, Mapping) or type(created.get("new_contract")) is not int: raise ValueError("provider did not return an instance ID")
     instance_id = created["new_contract"]
     live: object = {}
@@ -68,7 +82,7 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
             break
     else:
         runner(("vastai", "destroy", "instance", str(instance_id), "--yes")); raise ValueError("instance readiness poll timed out")
-    if not isinstance(live, Mapping) or live.get("id") != instance_id or live.get("gpu_name") != "RTX PRO 6000" or live.get("num_gpus") != 1:
+    if not isinstance(live, Mapping) or live.get("id") != instance_id or not _offer_gpu(live) or live.get("num_gpus") != 1 or not live.get("ssh_host") or type(live.get("ssh_port")) is not int or float(live.get("dph_total", 99)) >= 1:
         runner(("vastai", "destroy", "instance", str(instance_id), "--yes")); raise ValueError("instance readback does not match accepted offer")
     return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _hash(live)}
 
