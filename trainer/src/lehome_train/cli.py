@@ -29,6 +29,23 @@ def _fail_closed(operation) -> None:
         raise click.ClickException(str(error)) from None
 
 
+@app.command("validate-training-capability")
+def validate_training_capability(
+    image_digest: str = typer.Option(..., "--image-digest"),
+    one_step: bool = typer.Option(False, "--one-step"),
+) -> None:
+    """Run the bounded one-step Blackwell training capability probe."""
+    if not one_step:
+        raise typer.BadParameter("--one-step is required for the bounded capability probe")
+
+    def operation() -> object:
+        from lehome_train.release_manifest import capture_training_capability
+
+        return capture_training_capability(image_digest=image_digest)
+
+    _fail_closed(operation)
+
+
 @data_app.command("inspect")
 def data_inspect(
     source: Path = typer.Option(..., "--source"),

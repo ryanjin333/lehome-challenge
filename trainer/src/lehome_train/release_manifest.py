@@ -6,6 +6,7 @@ import argparse
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
 import re
 from typing import Mapping
@@ -78,6 +79,56 @@ def validate_training_capability(value: object) -> Mapping[str, object]:
     if not isinstance(nvml, Mapping) or type(nvml.get("utilization_percent")) not in (int, float):
         raise ValueError("training capability requires NVML telemetry")
     return capability
+
+
+def capture_training_capability(*, image_digest: str) -> dict[str, object]:
+    """Produce the one-step, NVML-backed Blackwell capability receipt.
+
+    This is intentionally a training-image entrypoint rather than a rollout
+    policy check. It has no Hub or provider dependency and returns no secrets.
+    """
+    if not _DIGEST.fullmatch(image_digest):
+        raise ValueError("training image digest is invalid")
+    try:
+        import torch
+        import pynvml
+    except ImportError:
+        raise RuntimeError("training capability requires PyTorch and NVML") from None
+    if not torch.cuda.is_available():
+        raise RuntimeError("training capability requires CUDA")
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        utilization = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+        raw_driver = pynvml.nvmlSystemGetDriverVersion()
+        driver = raw_driver.decode("ascii") if isinstance(raw_driver, bytes) else str(raw_driver)
+        parameter = torch.ones((1,), device="cuda", requires_grad=True)
+        optimizer = torch.optim.SGD([parameter], lr=1e-4)
+        optimizer.zero_grad()
+        loss = (parameter * parameter).mean()
+        loss.backward()
+        optimizer.step()
+        version = getattr(torch, "version", None)
+        cuda_runtime = getattr(version, "cuda", None) or "unknown"
+        major, minor = torch.cuda.get_device_capability(0)
+        receipt = {
+            "hardware": str(torch.cuda.get_device_name(0)),
+            "driver_version": driver,
+            "image_digest": image_digest,
+            "cuda_runtime": str(cuda_runtime),
+            "torch_cuda": str(cuda_runtime),
+            "compute_capability": f"{major}.{minor}",
+            "optimizer_step": {"passed": True, "loss": float(loss.item())},
+            "nvml": {"utilization_percent": float(utilization)},
+        }
+    except Exception:
+        raise RuntimeError("training capability probe failed") from None
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+    return dict(validate_training_capability(receipt))
 
 
 @dataclass(frozen=True, slots=True)

@@ -29,6 +29,8 @@ def test_cli_help() -> None:
         "memorize",
         "smoke",
         "train",
+        "continuous-train",
+        "validate-training-capability",
         "report",
         "sync",
         "restore",

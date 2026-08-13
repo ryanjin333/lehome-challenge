@@ -167,7 +167,11 @@ def bootstrap_canary(*, evidence: Mapping[str, object], runner: Runner) -> dict[
     if evidence.get("trainer_image") != BOOTSTRAP_TRAINER_IMAGE:
         raise ValueError("bootstrap canary requires the historical structurally pinned trainer image")
     instance = rent(evidence=evidence, runner=runner, require_capability=False)
-    command = (*_ssh_prefix(instance), "set -eu; timeout 600 lehome-train validate-training-capability --one-step")
+    command = (
+        *_ssh_prefix(instance),
+        "set -eu; timeout 600 lehome-train validate-training-capability --one-step --image-digest "
+        + BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    )
     try:
         capability = json.loads(runner(command))
     except json.JSONDecodeError as error:

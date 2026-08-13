@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import sys
 
 import pytest
 
@@ -13,6 +14,36 @@ from lehome_train.release_manifest import (
     load_release_manifest,
     validate_training_capability,
 )
+import lehome_train.release_manifest as release_manifest
+
+
+def test_capture_training_capability_runs_one_optimizer_step_and_validates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTensor:
+        def __init__(self, value: float = 1.0) -> None: self.value = value
+        def __mul__(self, _other: object): return self
+        def square(self): return self
+        def mean(self): return self
+        def backward(self): return None
+        def item(self): return self.value
+    class FakeOptim:
+        def zero_grad(self): return None
+        def step(self): return None
+    fake_torch = type("Torch", (), {
+        "cuda": type("Cuda", (), {"is_available": staticmethod(lambda: True), "get_device_name": staticmethod(lambda _index: "NVIDIA RTX PRO 6000 Blackwell"), "get_device_capability": staticmethod(lambda _index: (12, 0))}),
+        "ones": staticmethod(lambda *_args, **_kwargs: FakeTensor()),
+        "optim": type("Optim", (), {"SGD": staticmethod(lambda *_args, **_kwargs: FakeOptim())}),
+        "__version__": "2.8.0+cu128",
+    })
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "pynvml", type("Nvml", (), {"nvmlInit": staticmethod(lambda: None), "nvmlDeviceGetHandleByIndex": staticmethod(lambda _index: object()), "nvmlDeviceGetUtilizationRates": staticmethod(lambda _handle: type("U", (), {"gpu": 90})()), "nvmlSystemGetDriverVersion": staticmethod(lambda: b"595.71.05"), "nvmlShutdown": staticmethod(lambda: None)}))
+
+    receipt = release_manifest.capture_training_capability(image_digest="sha256:" + "a" * 64)
+
+    assert receipt["optimizer_step"]["passed"] is True
+    assert receipt["nvml"]["utilization_percent"] == 90
+    release_manifest.validate_training_capability(receipt)
 
 
 ROOT = Path(__file__).resolve().parents[2]
