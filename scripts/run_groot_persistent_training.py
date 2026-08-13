@@ -22,7 +22,7 @@ from lehome_train.hub import HubTransport, HuggingFaceHubTransport
 from lehome_train.release_manifest import validate_training_capability
 
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
-CORRECTIVE_SOURCE = {"revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c", "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35"}
+CORRECTIVE_SOURCE = {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c", "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35"}
 PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3", "subpath": "policies/step-12000", "artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"}
 # Vast's raw expression grammar does not support a portable OR form for two
 # exact SKU strings.  Query only stable numeric facts, then enforce the narrow
@@ -59,6 +59,23 @@ def _read_private_token(path_value: str | None) -> str:
     if not token or any(character.isspace() for character in token):
         raise ValueError("token file is invalid")
     return token
+
+
+def _verify_prepare_evidence(receipt: Mapping[str, object]) -> None:
+    """Bind free preparation to local source/release evidence, not strings."""
+    organizer = receipt.get("organizer_source")
+    corrective = receipt.get("corrective_source")
+    if not isinstance(organizer, Mapping) or any(
+        organizer.get(key) != value for key, value in ORGANIZER_SOURCE.items()
+    ):
+        raise ValueError("prepare organizer evidence is not the pinned repository/subdir/manifest")
+    if not isinstance(corrective, Mapping) or any(
+        corrective.get(key) != value for key, value in CORRECTIVE_SOURCE.items()
+    ):
+        raise ValueError("prepare corrective release evidence is not the pinned repository/revision/prefix")
+    release_id = corrective.get("release_id")
+    if not isinstance(release_id, str) or re.fullmatch(r"[0-9a-f]{64}", release_id) is None:
+        raise ValueError("prepare corrective release evidence lacks an immutable local release ID")
 
 
 def _run(command: tuple[str, ...]) -> str:
@@ -486,7 +503,16 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
     if destination_root.exists() or destination_root.is_symlink():
         raise ValueError("materialize destination must not already exist")
     plan = build_mix_plan(organizer_root, corrective_roots, seed=seed)
-    materialize_mixed_snapshot(plan, organizer_root, corrective_roots, destination_root)
+    organizer_evidence = request.get("organizer_source_evidence")
+    corrective_evidence = request.get("corrective_source_evidence")
+    if not isinstance(organizer_evidence, Mapping) or not isinstance(corrective_evidence, Mapping):
+        raise ValueError("materialize requires verified organizer and corrective release evidence")
+    evidence = {"organizer_source": dict(organizer_evidence), "corrective_source": dict(corrective_evidence)}
+    _verify_prepare_evidence(evidence)
+    materialize_mixed_snapshot(
+        plan, organizer_root, corrective_roots, destination_root,
+        persistent_source_evidence=evidence,
+    )
     sealed = verify_generation(destination_root)
     if sealed["organizer_training_frames"] * 3 != sealed["rft_training_frames"] * 7:
         raise ValueError("materialized generation is not exact 70/30")
@@ -513,16 +539,10 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
         from lehome_train.flywheel.mix import verify_generation
         sealed = verify_generation(root)
         if sealed.get("organizer_training_frames", 0) * 3 != sealed.get("rft_training_frames", -1) * 7: raise ValueError("prepare generation is not exact 70/30")
-        revisions = sealed.get("source_revisions")
-        if not isinstance(revisions, Mapping):
-            raise ValueError("prepare sealed generation has no source revisions")
-        observed_revisions = set(revisions.values())
-        if ORGANIZER_SOURCE["revision"] not in observed_revisions:
-            raise ValueError("prepare organizer source revision is not pinned in sealed generation")
-        # The corrective Hub prefix is a source contract outside the materialized
-        # dataset, but the exact immutable revision must still be represented.
-        if CORRECTIVE_SOURCE["revision"] not in observed_revisions:
-            raise ValueError("prepare corrective source revision is not pinned in sealed generation")
+        evidence = sealed.get("persistent_source_evidence")
+        if not isinstance(evidence, Mapping):
+            raise ValueError("prepare sealed generation lacks source/release evidence")
+        _verify_prepare_evidence(evidence)
         return {"paid_action": False, "action": "prepare", "organizer_source": ORGANIZER_SOURCE, "corrective_source": CORRECTIVE_SOURCE, "request": request}
     if not args.execute: return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
     if args.action == "capture-offers": return capture_offers(runner=runner)

@@ -814,7 +814,7 @@ def _generation_receipt(root: Path) -> dict[str, object]:
     statistics = manifest.get("statistics")
     if not isinstance(statistics, Mapping) or not isinstance(statistics.get("files"), list):
         raise ValueError("sealed generation statistics are invalid")
-    return {
+    receipt: dict[str, object] = {
         "schema_version": 1,
         "sealed": True,
         "source_revisions": dict(sorted(plan.source_revisions.items())),
@@ -827,6 +827,12 @@ def _generation_receipt(root: Path) -> dict[str, object]:
         "output_manifest_sha256": manifest.get("output_manifest_sha256"),
         "statistics_sha256": canonical_json_sha256(statistics),
     }
+    source_evidence = manifest.get("persistent_source_evidence")
+    if source_evidence is not None:
+        if not isinstance(source_evidence, Mapping):
+            raise ValueError("sealed generation persistent source evidence is invalid")
+        receipt["persistent_source_evidence"] = dict(source_evidence)
+    return receipt
 
 
 def load_generation_receipt(root_value: str | Path) -> dict[str, object]:
@@ -871,6 +877,8 @@ def materialize_mixed_snapshot(
     organizer: str | Path,
     flywheel: str | Path | Sequence[str | Path],
     destination: str | Path,
+    *,
+    persistent_source_evidence: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Atomically copy a frozen plan into one canonical prepared-v2 snapshot."""
 
@@ -962,6 +970,10 @@ def materialize_mixed_snapshot(
             "future_actions": {"horizon": ACTION_HORIZON, "loader_allow_padding": False, "materialized_windows": True, "tail_convention": "one_complete_source_range_per_episode", "valid_window_counts": {str(row["episode_index"]): 1 for row in episode_rows}},
             "flywheel_mix_plan": plan.to_dict(), "statistics": {"status": "pending_final_mixed_train_only", "files": []},
         }
+        if persistent_source_evidence is not None:
+            if not isinstance(persistent_source_evidence, Mapping):
+                raise ValueError("persistent source evidence must be an object")
+            manifest["persistent_source_evidence"] = dict(persistent_source_evidence)
         atomic_write_json(temporary / "manifest.json", manifest)
         from lehome_train.data.stats import write_train_statistics
         from lehome_train.data.validate import validate_prepared_dataset

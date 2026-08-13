@@ -242,6 +242,8 @@ def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None
         "corrective_roots": [str(corrective_a), str(corrective_b)],
         "destination": str(destination),
         "seed": 20260812,
+        "organizer_source_evidence": LIFECYCLE.ORGANIZER_SOURCE,
+        "corrective_source_evidence": LIFECYCLE.CORRECTIVE_SOURCE | {"release_id": "b" * 64},
     }))
 
     report = LIFECYCLE.main_for_test(["materialize", "--request", str(request)])
@@ -257,8 +259,23 @@ def test_prepare_requires_exact_pinned_sources_in_the_sealed_receipt(tmp_path: P
     corrective_a = _prepared_source(tmp_path / "corrective-a", kind="flywheel", grade="A", episodes=1)
     corrective_b = _prepared_source(tmp_path / "corrective-b", kind="flywheel", grade="B", episodes=1)
     root = tmp_path / "generation"
-    LIFECYCLE._materialize({"organizer_root": str(organizer), "corrective_roots": [str(corrective_a), str(corrective_b)], "destination": str(root), "seed": 1})
+    LIFECYCLE._materialize({"organizer_root": str(organizer), "corrective_roots": [str(corrective_a), str(corrective_b)], "destination": str(root), "seed": 1, "organizer_source_evidence": LIFECYCLE.ORGANIZER_SOURCE, "corrective_source_evidence": LIFECYCLE.CORRECTIVE_SOURCE | {"release_id": "b" * 64}})
     request = tmp_path / "prepare.json"
     request.write_text(json.dumps({"generation_root": str(root)}), encoding="utf-8")
-    with pytest.raises(ValueError, match="organizer source"):
-        LIFECYCLE.main_for_test(["prepare", "--request", str(request)])
+    assert LIFECYCLE.main_for_test(["prepare", "--request", str(request)])["paid_action"] is False
+
+
+def test_prepare_requires_local_organizer_and_corrective_release_evidence(
+    tmp_path: Path,
+) -> None:
+    receipt = {
+        "schema_version": 1, "sealed": True,
+        "source_revisions": {
+            "organizer:x": LIFECYCLE.ORGANIZER_SOURCE["revision"],
+            "flywheel:y": LIFECYCLE.CORRECTIVE_SOURCE["revision"],
+        },
+        "organizer_source": LIFECYCLE.ORGANIZER_SOURCE | {"manifest_sha256": "a" * 64},
+        "corrective_source": LIFECYCLE.CORRECTIVE_SOURCE | {"repository": "ryanjin333/lehome-groot-n17-data", "release_id": "b" * 64},
+    }
+    with pytest.raises(ValueError, match="organizer evidence"):
+        LIFECYCLE._verify_prepare_evidence(receipt)
