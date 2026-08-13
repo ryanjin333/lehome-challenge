@@ -44,7 +44,7 @@ def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: 
         if command[:3] == ("vastai", "destroy", "instance"): return ""
         raise AssertionError(command)
     monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
-    evidence = LIFECYCLE.capture_offers(runner=runner, now_unix=100)
+    evidence = LIFECYCLE.capture_offers(runner=runner, now_unix=100) | {"trainer_image": "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:" + "a" * 64}
     assert evidence["offer"]["gpu_name"] == "RTX PRO 6000 WS"
     assert "untrusted_token" not in evidence["offer"]
     instance = LIFECYCLE.rent(evidence=evidence, runner=runner)

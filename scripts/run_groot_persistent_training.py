@@ -19,7 +19,7 @@ from typing import Callable, Mapping
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
 CORRECTIVE_SOURCE = {"revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c", "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35"}
 OFFER_QUERY = "(gpu_name=RTX_PRO_6000_WS gpu_name=RTX_PRO_6000_S) gpu_ram>=96000 num_gpus=1 reliability>=0.95"
-TRAINER_IMAGE = "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:" + "a" * 64
+_DIGEST_PREFIX = "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:"
 Runner = Callable[[tuple[str, ...]], str]
 
 
@@ -51,6 +51,12 @@ def _project(row: Mapping[str, object], fields: tuple[str, ...]) -> dict[str, ob
     return {field: row[field] for field in fields if field in row}
 
 
+def _trainer_image(value: object) -> str:
+    if not isinstance(value, str) or not value.startswith(_DIGEST_PREFIX) or len(value) != len(_DIGEST_PREFIX) + 64 or any(char not in "0123456789abcdef" for char in value[-64:]):
+        raise ValueError("request must provide an accepted trainer OCI digest")
+    return value
+
+
 def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: int = 300) -> dict[str, object]:
     offers = _json(runner, ("vastai", "--raw", "search", "offers", OFFER_QUERY, "--interruptible"))
     instances = _json(runner, ("vastai", "--raw", "show", "instances"))
@@ -70,9 +76,10 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
     offer = evidence.get("offer")
     if not isinstance(offer, Mapping) or type(offer.get("id")) is not int: raise ValueError("offer evidence is invalid")
     if evidence.get("search_mode") != "interruptible" or type(evidence.get("expires_at_unix")) is not int or evidence["expires_at_unix"] < int(time.time()): raise ValueError("offer evidence is expired or not interruptible")
+    image = _trainer_image(evidence.get("trainer_image"))
     bid = offer.get("min_bid", offer.get("dph_total"))
     if type(bid) not in (int, float) or float(bid) >= 1: raise ValueError("offer bid price is invalid")
-    created = _json(runner, ("vastai", "--raw", "create", "instance", str(offer["id"]), "--image", TRAINER_IMAGE, "--disk", "300", "--bid_price", str(bid), "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + TRAINER_IMAGE))
+    created = _json(runner, ("vastai", "--raw", "create", "instance", str(offer["id"]), "--image", image, "--disk", "300", "--bid_price", str(bid), "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + image))
     if not isinstance(created, Mapping) or type(created.get("new_contract")) is not int: raise ValueError("provider did not return an instance ID")
     instance_id = created["new_contract"]
     live: object = {}
@@ -84,7 +91,30 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
         runner(("vastai", "destroy", "instance", str(instance_id), "--yes")); raise ValueError("instance readiness poll timed out")
     if not isinstance(live, Mapping) or live.get("id") != instance_id or not _offer_gpu(live) or live.get("num_gpus") != 1 or not live.get("ssh_host") or type(live.get("ssh_port")) is not int or float(live.get("dph_total", 99)) >= 1:
         runner(("vastai", "destroy", "instance", str(instance_id), "--yes")); raise ValueError("instance readback does not match accepted offer")
-    return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _hash(live)}
+    return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "trainer_image": image, "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _hash(live)}
+
+
+def _ssh_prefix(instance: Mapping[str, object]) -> tuple[str, ...]:
+    host, port = instance.get("host"), instance.get("port")
+    if not isinstance(host, str) or not host or type(port) is not int or port <= 0: raise ValueError("instance SSH receipt is invalid")
+    return ("ssh", "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port), "root@" + host)
+
+
+def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
+    _stage_command(request)
+    remote_dir = "/tmp/lehome-stage"
+    runner((*_ssh_prefix(instance), "mkdir -p " + remote_dir))
+    pairs = (("code_bundle", "code.bundle"), ("generation_receipt", "generation.generation.json"), ("parent_checkpoint", "parent.tar"), ("launch_config", "launch.json"), ("modality_config", "modality.py"), ("token_file", "token"))
+    receipts = []
+    for field, remote_name in pairs:
+        source = Path(str(request[field]))
+        if source.is_symlink() or not source.is_file(): raise ValueError("stage input must be a regular file")
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        runner(("scp", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(source), "root@" + str(instance["host"]) + ":" + remote_dir + "/" + remote_name))
+        observed = runner((*_ssh_prefix(instance), "sha256sum " + remote_dir + "/" + remote_name)).strip().split()
+        if not observed or observed[0] != digest: raise ValueError("remote staged hash readback failed")
+        receipts.append({"name": remote_name, "sha256": digest})
+    return {"paid_action": True, "action": "stage", "instance_id": instance["instance_id"], "transfers": receipts}
 
 
 def _stage_command(request: Mapping[str, object]) -> str:
@@ -104,14 +134,14 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
     if action == "resume" and request.get("generation_sha256") != request.get("resume_generation_sha256") or action == "resume" and request.get("config_sha256") != request.get("resume_config_sha256"):
         raise ValueError("resume requires exact generation/config identity")
     if action == "stage":
-        command = _stage_command(request)
+        return stage(instance=instance, request=request, runner=runner)
     elif action in {"tune", "train", "status", "resume"}:
         if action == "resume" and request.get("generation_sha256") != request.get("resume_generation_sha256") or action == "resume" and request.get("config_sha256") != request.get("resume_config_sha256"):
             raise ValueError("resume requires exact generation/config identity")
         command = "set -eu; lehome-train " + ("continuous-train" if action in {"train", "resume"} else action) + " --request /tmp/lehome-stage/continuous.json"
     else:
         raise ValueError("unsupported remote lifecycle action")
-    runner(("ssh", "-o", "ClearAllForwardings=yes", f"root@{instance.get('host')}", command))
+    runner((*_ssh_prefix(instance), command))
     return {"paid_action": True, "action": action, "instance_id": instance_id}
 
 
@@ -134,10 +164,8 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
             root = Path(generation)
             receipt = root.with_name(root.name + ".generation.json")
             if not root.is_dir() or root.is_symlink() or not receipt.is_file() or receipt.is_symlink(): raise ValueError("prepare requires a local sealed generation")
-            try:
-                sealed = json.loads(receipt.read_text())
-            except (OSError, json.JSONDecodeError): raise ValueError("prepare generation receipt is invalid") from None
-            if not isinstance(sealed, Mapping) or sealed.get("sealed") is not True: raise ValueError("prepare requires a sealed generation")
+            from lehome_train.flywheel.mix import verify_generation
+            verify_generation(root)
         return {"paid_action": False, "action": "prepare", "organizer_source": ORGANIZER_SOURCE, "corrective_source": CORRECTIVE_SOURCE, "request": request}
     if not args.execute: return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
     if args.action == "capture-offers": return capture_offers(runner=runner)

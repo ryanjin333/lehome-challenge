@@ -74,8 +74,10 @@ def run_continuous_supervisor(
         finally:
             finished.set()
 
-    threading.Thread(target=train, daemon=True).start()
+    training_thread = threading.Thread(target=train, daemon=False)
+    training_thread.start()
     submitted: dict[int, object] = {}
+    finished_polls = 0
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="checkpoint-publisher") as executor:
         while not finished.is_set() or len(submitted) < 2:
             for step in (1000, 2000):
@@ -95,7 +97,9 @@ def run_continuous_supervisor(
                 raise launch_error[0]
             if wait is None:
                 if finished.is_set():
-                    break
+                    finished_polls += 1
+                    if len(submitted) == 2 or finished_polls >= 20:
+                        break
                 threading.Event().wait(0.1)
             else:
                 wait()
@@ -110,4 +114,5 @@ def run_continuous_supervisor(
                 immutable.append(receipt)
     if launch_error:
         raise launch_error[0]
+    training_thread.join()
     return tuple(immutable)
