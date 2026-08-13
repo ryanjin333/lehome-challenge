@@ -42,6 +42,10 @@ def _run(command: tuple[str, ...]) -> str:
     return completed.stdout
 
 
+def _bounded_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 def _json(runner: Runner, command: tuple[str, ...]) -> object:
     try: return json.loads(runner(command))
     except json.JSONDecodeError as error: raise ValueError("provider response is invalid JSON") from error
@@ -87,7 +91,7 @@ def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: 
     return {"schema_version": 1, "kind": "persistent_training_offer", "offer": safe_offer, "account_hourly_total_usd": total, "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds, "search_mode": "interruptible"}
 
 
-def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12) -> dict[str, object]:
+def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep) -> dict[str, object]:
     offer = evidence.get("offer")
     if not isinstance(offer, Mapping) or type(offer.get("id")) is not int: raise ValueError("offer evidence is invalid")
     if evidence.get("search_mode") != "interruptible" or type(evidence.get("expires_at_unix")) is not int or evidence["expires_at_unix"] < int(time.time()): raise ValueError("offer evidence is expired or not interruptible")
@@ -106,8 +110,12 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
         live = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
         if isinstance(live, Mapping) and live.get("actual_status", "running") == "running" and live.get("ssh_host"):
             break
+        sleep(5.0)
     else:
-        runner(("vastai", "destroy", "instance", str(instance_id), "--yes")); raise ValueError("instance readiness poll timed out")
+        runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+        absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+        if absent not in ({}, None): raise ValueError("post-create cleanup absence readback failed")
+        raise ValueError("instance readiness poll timed out")
     if not isinstance(live, Mapping) or live.get("id") != instance_id or not _offer_gpu(live) or live.get("num_gpus") != 1 or not live.get("ssh_host") or type(live.get("ssh_port")) is not int or float(live.get("dph_total", 99)) >= 1:
         runner(("vastai", "destroy", "instance", str(instance_id), "--yes")); raise ValueError("instance readback does not match accepted offer")
     return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "trainer_image": image, "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _hash(live)}
@@ -207,12 +215,13 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "prepare":
         generation = request.get("generation_root")
-        if isinstance(generation, str):
-            root = Path(generation)
-            receipt = root.with_name(root.name + ".generation.json")
-            if not root.is_dir() or root.is_symlink() or not receipt.is_file() or receipt.is_symlink(): raise ValueError("prepare requires a local sealed generation")
-            from lehome_train.flywheel.mix import verify_generation
-            verify_generation(root)
+        if not isinstance(generation, str): raise ValueError("prepare requires generation_root")
+        root = Path(generation)
+        receipt = root.with_name(root.name + ".generation.json")
+        if not root.is_dir() or root.is_symlink() or not receipt.is_file() or receipt.is_symlink(): raise ValueError("prepare requires a local sealed generation")
+        from lehome_train.flywheel.mix import verify_generation
+        sealed = verify_generation(root)
+        if sealed.get("organizer_training_frames", 0) * 3 != sealed.get("rft_training_frames", -1) * 7: raise ValueError("prepare generation is not exact 70/30")
         return {"paid_action": False, "action": "prepare", "organizer_source": ORGANIZER_SOURCE, "corrective_source": CORRECTIVE_SOURCE, "request": request}
     if not args.execute: return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
     if args.action == "capture-offers": return capture_offers(runner=runner)

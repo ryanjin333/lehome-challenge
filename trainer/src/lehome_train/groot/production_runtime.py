@@ -29,6 +29,7 @@ from lehome_train.groot.production_adapters import (
     MultiGpuTelemetrySampler,
     probe_physical_vram_bytes,
     probe_visible_gpu_memory,
+    _launch_kwargs,
 )
 from lehome_train.io import (
     atomic_write_json,

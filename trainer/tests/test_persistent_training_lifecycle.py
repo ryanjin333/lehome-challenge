@@ -21,7 +21,7 @@ class FailRunner:
 def test_dry_run_never_calls_provider(tmp_path: Path) -> None:
     request = tmp_path / "request.json"
     request.write_text('{"generation_sha256":"' + "a" * 64 + '","config_sha256":"' + "b" * 64 + '"}')
-    report = LIFECYCLE.main_for_test(["prepare", "--request", str(request)], runner=FailRunner())
+    report = LIFECYCLE.main_for_test(["status", "--request", str(request)], runner=FailRunner())
     assert report["paid_action"] is False
 
 

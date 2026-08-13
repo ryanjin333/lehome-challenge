@@ -32,3 +32,10 @@ def test_supervisor_reads_completed_checkpoints_not_caller_steps(tmp_path: Path)
             (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": step, "log_history": [{"step": step, "loss": 0.2}]}))
     assert [item["optimizer_step"] for item in run_continuous_supervisor(run_root=tmp_path, launch=launch, package=lambda item: item, publish=lambda item: seen.append(item.optimizer_step) or True)] == [1000, 2000]
     assert seen == [1000, 2000]
+
+
+def test_supervisor_returns_published_checkpoint_after_interrupt(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint-1000"; checkpoint.mkdir()
+    (checkpoint / "weights.bin").write_bytes(b"weights")
+    (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 1000, "log_history": [{"step": 1000, "loss": 0.2}]}))
+    assert [item["optimizer_step"] for item in run_continuous_supervisor(run_root=tmp_path, launch=lambda: (_ for _ in ()).throw(KeyboardInterrupt()), package=lambda item: item, publish=lambda item: {"optimizer_step": item.optimizer_step, "readback_verified": True})] == [1000]

@@ -43,7 +43,10 @@ def snapshot_checkpoint(checkpoint: str | Path, *, optimizer_step: int) -> Compl
         raise ValueError("complete checkpoint is required before packaging") from error
     destination = source.parent / f".{source.name}.snapshot-{optimizer_step}"
     if destination.exists():
-        raise ValueError("checkpoint snapshot destination already exists")
+        # A resumed observer may encounter its prior immutable copy.  Accept it
+        # only when it remains a completed checkpoint of the same boundary.
+        _verified_checkpoint_state_at(destination, optimizer_step)
+        return CompletedCheckpoint(optimizer_step, _tree_sha256(destination), destination, int(time()))
     shutil.copytree(source, destination, symlinks=False, copy_function=shutil.copy2)
     digest = _tree_sha256(destination)
     return CompletedCheckpoint(optimizer_step, digest, destination, int(time()))
@@ -93,8 +96,10 @@ def run_continuous_supervisor(
                         # again; never package an incomplete boundary.
                         continue
                     submitted[step] = executor.submit(lambda item=snapshot: publish(package(item)))
-            if launch_error:
-                raise launch_error[0]
+            # Preserve already published checkpoints on interruption; the
+            # terminal caller converts this into an authenticated resume state.
+            if launch_error and finished.is_set():
+                break
             if wait is None:
                 if finished.is_set():
                     finished_polls += 1
