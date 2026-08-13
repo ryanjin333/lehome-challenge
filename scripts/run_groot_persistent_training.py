@@ -81,6 +81,10 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
     if not isinstance(offer, Mapping) or type(offer.get("id")) is not int: raise ValueError("offer evidence is invalid")
     if evidence.get("search_mode") != "interruptible" or type(evidence.get("expires_at_unix")) is not int or evidence["expires_at_unix"] < int(time.time()): raise ValueError("offer evidence is expired or not interruptible")
     image = _trainer_image(evidence.get("trainer_image"))
+    capability = evidence.get("training_capability")
+    image_digest = image.rpartition("@")[2]
+    if not isinstance(capability, Mapping) or capability.get("image_digest") != image_digest or not isinstance(capability.get("optimizer_step"), Mapping) or capability["optimizer_step"].get("passed") is not True or not isinstance(capability.get("nvml"), Mapping):
+        raise ValueError("rent requires a matching accepted training capability receipt")
     bid = offer.get("min_bid", offer.get("dph_total"))
     if type(bid) not in (int, float) or float(bid) >= 1: raise ValueError("offer bid price is invalid")
     created = _json(runner, ("vastai", "--raw", "create", "instance", str(offer["id"]), "--image", image, "--disk", "300", "--bid_price", str(bid), "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + image))

@@ -44,10 +44,18 @@ def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: 
         if command[:3] == ("vastai", "destroy", "instance"): return ""
         raise AssertionError(command)
     monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
-    evidence = LIFECYCLE.capture_offers(runner=runner, now_unix=100) | {"trainer_image": "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:" + "a" * 64}
+    image = "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:" + "a" * 64
+    evidence = LIFECYCLE.capture_offers(runner=runner, now_unix=100) | {"trainer_image": image, "training_capability": {"image_digest": image.rpartition("@")[2], "optimizer_step": {"passed": True}, "nvml": {"utilization_percent": 80}}}
     assert evidence["offer"]["gpu_name"] == "RTX PRO 6000 WS"
     assert "untrusted_token" not in evidence["offer"]
     instance = LIFECYCLE.rent(evidence=evidence, runner=runner)
     assert instance["instance_id"] == 9
     with pytest.raises(ValueError, match="destroy absence"):
         LIFECYCLE.destroy(instance_id=9, training_receipt={"kind": "continuous_corrective_training_terminal", "instance_id": 9, "immutable_checkpoint_steps": [1000, 2000], "immutable_checkpoint_publications": [{"optimizer_step": 1000, "immutable_revision": "a" * 40, "readback_verified": True}, {"optimizer_step": 2000, "immutable_revision": "b" * 40, "readback_verified": True}]}, runner=runner)
+
+
+def test_rent_requires_capability_receipt_for_exact_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
+    evidence = {"offer": {"id": 7, "min_bid": .5}, "search_mode": "interruptible", "expires_at_unix": 101, "trainer_image": "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:" + "a" * 64}
+    with pytest.raises(ValueError, match="capability"):
+        LIFECYCLE.rent(evidence=evidence, runner=lambda _: "{}")
