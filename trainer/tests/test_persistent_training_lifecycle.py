@@ -188,7 +188,7 @@ def test_stage_requires_code_bundle_receipt_to_match_bundle(tmp_path: Path) -> N
 
 
 def test_bootstrap_canary_uses_only_historical_image_and_binds_instance_receipt(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     commands: list[tuple[str, ...]] = []
 
@@ -198,13 +198,23 @@ def test_bootstrap_canary_uses_only_historical_image_and_binds_instance_receipt(
             return '{"new_contract":9}'
         if command[:4] == ("vastai", "--raw", "show", "instance"):
             return '{"id":9,"gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"ssh_host":"host","ssh_port":22}'
+        if command[0] == "scp":
+            return ""
+        if command[0] == "ssh" and "sha256sum" in command[-1]:
+            return hashlib.sha256(bundle_path.read_bytes()).hexdigest() + "  code.bundle\n"
         if command[0] == "ssh":
             return json.dumps({"hardware": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "driver_version": "595.71.05", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .2}, "nvml": {"utilization_percent": 80}})
         raise AssertionError(command)
 
     monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
+    import tarfile
+    bundle_path = tmp_path / "code.bundle"
+    with tarfile.open(bundle_path, "w") as archive:
+        info = tarfile.TarInfo("trainer/src/lehome_train/__init__.py"); info.size = 0; archive.addfile(info)
+    receipt_path = tmp_path / "code.bundle.sha256"
+    receipt_path.write_text(hashlib.sha256(bundle_path.read_bytes()).hexdigest() + "  code.bundle\n", encoding="utf-8")
     receipt = LIFECYCLE.bootstrap_canary(
-        evidence={"offer": {"id": 7, "min_bid": .5}, "search_mode": "interruptible", "expires_at_unix": 101, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE},
+        evidence={"offer": {"id": 7, "min_bid": .5}, "search_mode": "interruptible", "expires_at_unix": 101, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "code_bundle": str(bundle_path), "code_bundle_sha256_file": str(receipt_path)},
         runner=runner,
     )
 
@@ -224,6 +234,35 @@ def test_promote_canary_recovers_only_the_bound_instance_receipt() -> None:
         "training_capability": {"hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05", "image_digest": image.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .1}, "nvml": {"utilization_percent": 80}},
     }
     assert LIFECYCLE.promote_canary(capability_receipt=receipt)["instance_id"] == 9
+
+
+def test_bootstrap_canary_stages_current_code_and_cleans_up_after_probe_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "code.bundle"
+    import tarfile
+    with tarfile.open(bundle, "w") as archive:
+        info = tarfile.TarInfo("trainer/src/lehome_train/__init__.py"); info.size = 0; archive.addfile(info)
+    digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    receipt = tmp_path / "code.bundle.sha256"
+    receipt.write_text(digest + "  code.bundle\n", encoding="utf-8")
+    commands: list[tuple[str, ...]] = []
+    destroyed = False
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal destroyed
+        commands.append(command)
+        if command[:4] == ("vastai", "--raw", "create", "instance"): return '{"new_contract":9}'
+        if command[:4] == ("vastai", "--raw", "show", "instance"): return "{}" if destroyed else '{"id":9,"gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"ssh_host":"host","ssh_port":22}'
+        if command[:3] == ("vastai", "destroy", "instance"):
+            destroyed = True
+            return ""
+        if command[0] == "scp": return ""
+        if command[0] == "ssh": raise RuntimeError("probe failed")
+        raise AssertionError(command)
+    monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
+    with pytest.raises(RuntimeError, match="probe failed"):
+        LIFECYCLE.bootstrap_canary(evidence={"offer": {"id": 7, "min_bid": .5}, "search_mode": "interruptible", "expires_at_unix": 101, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "code_bundle": str(bundle), "code_bundle_sha256_file": str(receipt)}, runner=runner)
+    assert any(command[:3] == ("vastai", "destroy", "instance") for command in commands)
 
 
 def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None:

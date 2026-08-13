@@ -185,20 +185,41 @@ def bootstrap_canary(*, evidence: Mapping[str, object], runner: Runner) -> dict[
     if evidence.get("trainer_image") != BOOTSTRAP_TRAINER_IMAGE:
         raise ValueError("bootstrap canary requires the historical structurally pinned trainer image")
     instance = rent(evidence=evidence, runner=runner, require_capability=False)
-    command = (
-        *_ssh_prefix(instance),
-        "set -eu; timeout 600 lehome-train validate-training-capability --one-step --image-digest "
-        + BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
-    )
     try:
+        bundle = evidence.get("code_bundle")
+        bundle_receipt = evidence.get("code_bundle_sha256_file")
+        if not isinstance(bundle, str) or not isinstance(bundle_receipt, str):
+            raise ValueError("bootstrap canary requires a clean current code bundle and receipt")
+        bundle_path = Path(bundle)
+        _verify_code_bundle_receipt(bundle_path, Path(bundle_receipt))
+        _safe_archive(bundle_path, "bootstrap code bundle")
+        remote = "/tmp/lehome-bootstrap"
+        runner((*_ssh_prefix(instance), "set -eu; mkdir -p " + remote + " /prepared/bootstrap-code"))
+        runner(("scp", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(bundle_path), "root@" + str(instance["host"]) + ":" + remote + "/code.bundle"))
+        observed = runner((*_ssh_prefix(instance), "sha256sum " + remote + "/code.bundle")).strip().split()
+        expected = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+        if not observed or observed[0] != expected:
+            raise ValueError("bootstrap code bundle remote hash readback failed")
+        command = (
+            *_ssh_prefix(instance),
+            "set -eu; tar --no-same-owner --no-same-permissions -xf " + remote
+            + "/code.bundle -C /prepared/bootstrap-code; timeout 600 env -u HF_TOKEN "
+            + "PYTHONPATH=/prepared/bootstrap-code/source/lehome:/prepared/bootstrap-code/trainer/src "
+            + "python -m lehome_train.cli validate-training-capability --one-step --image-digest "
+            + BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+        )
         capability = json.loads(runner(command))
-    except json.JSONDecodeError as error:
-        raise ValueError("bootstrap canary did not emit a capability receipt") from error
-    if not isinstance(capability, Mapping):
-        raise ValueError("bootstrap canary did not emit a capability receipt")
-    if capability.get("image_digest") != BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]:
-        raise ValueError("bootstrap capability image does not bind to rented image")
-    validated = dict(validate_training_capability(capability))
+        if not isinstance(capability, Mapping):
+            raise ValueError("bootstrap canary did not emit a capability receipt")
+        if capability.get("image_digest") != BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]:
+            raise ValueError("bootstrap capability image does not bind to rented image")
+        validated = dict(validate_training_capability(capability))
+    except BaseException:
+        runner(("vastai", "destroy", "instance", str(instance["instance_id"]), "--yes"))
+        absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance["instance_id"])))
+        if absent not in ({}, None):
+            raise ValueError("bootstrap cleanup absence readback failed")
+        raise
     return {
         "schema_version": 1,
         "kind": "persistent_training_capability",
