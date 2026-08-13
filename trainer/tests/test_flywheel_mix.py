@@ -177,6 +177,34 @@ def test_mix_parallel_video_materialization_is_bounded_and_deterministic(
     assert load_generation_receipt(single_root) == load_generation_receipt(parallel_root)
 
 
+def test_mix_real_ffmpeg_video_materialization_is_identical_across_worker_counts(
+    tmp_path: Path,
+) -> None:
+    """Real libx264 slices must retain the sealed output identity."""
+
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    grade_a = _prepared_source(tmp_path / "grade-a", kind="flywheel", grade="A", episodes=1)
+    grade_b = _prepared_source(tmp_path / "grade-b", kind="flywheel", grade="B", episodes=1)
+    plan = build_mix_plan(organizer, [grade_a, grade_b], seed=20260813)
+
+    single = materialize_mixed_snapshot(
+        plan, organizer, [grade_a, grade_b], tmp_path / "single", video_workers=1,
+    )
+    parallel = materialize_mixed_snapshot(
+        plan, organizer, [grade_a, grade_b], tmp_path / "parallel", video_workers=2,
+    )
+
+    single_root = Path(single["path"])
+    parallel_root = Path(parallel["path"])
+    assert artifact_identities(single_root, exclude={"manifest.json"}) == artifact_identities(
+        parallel_root, exclude={"manifest.json"},
+    )
+    assert json.loads((single_root / "manifest.json").read_text(encoding="utf-8")) == json.loads(
+        (parallel_root / "manifest.json").read_text(encoding="utf-8"),
+    )
+    assert load_generation_receipt(single_root) == load_generation_receipt(parallel_root)
+
+
 @pytest.mark.parametrize("video_workers", (0, 1.5, 9))
 def test_mix_rejects_invalid_video_worker_caps(tmp_path: Path, video_workers: object) -> None:
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
@@ -208,6 +236,32 @@ def test_mix_video_failure_cleans_temporary_tree_without_generation_receipt(
     assert not destination.exists()
     assert not destination.with_name(destination.name + ".generation.json").exists()
     assert not list(tmp_path.glob(".failed.*.tmp"))
+
+
+def test_mix_receipt_failure_removes_just_promoted_destination_and_partial_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    destination = tmp_path / "receipt-failed"
+    receipt = destination.with_name(destination.name + ".generation.json")
+    original_atomic_write_json = atomic_write_json
+
+    def fail_receipt_write(path: Path, value: object) -> None:
+        if path == receipt:
+            path.write_text("partial receipt", encoding="utf-8")
+            raise RuntimeError("synthetic receipt write failure")
+        original_atomic_write_json(path, value)
+
+    monkeypatch.setattr("lehome_train.flywheel.mix.atomic_write_json", fail_receipt_write)
+
+    with pytest.raises(RuntimeError, match="synthetic receipt write failure"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination)
+
+    assert not destination.exists()
+    assert not receipt.exists()
+    assert not list(tmp_path.glob(".receipt-failed.*.tmp"))
 
 
 def test_generation_receipt_binds_exact_70_30_mix_and_artifacts(tmp_path: Path) -> None:

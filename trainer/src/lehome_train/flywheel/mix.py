@@ -987,6 +987,7 @@ def materialize_mixed_snapshot(
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent))
     video_slicer = _BoundedVideoSlicer(video_workers)
+    promoted = False
     try:
         global_index = 0
         episode_rows: list[dict[str, object]] = []
@@ -1075,9 +1076,13 @@ def materialize_mixed_snapshot(
         final_manifest["output_manifest_sha256"] = canonical_json_sha256(final_artifacts)
         atomic_write_json(temporary / "manifest.json", final_manifest)
         temporary.replace(destination)
+        promoted = True
         atomic_write_json(_generation_receipt_path(destination), _generation_receipt(destination))
         return {"path": str(destination), "mix_plan_sha256": plan.sha256, "statistics": statistics, "validation": validation}
     except BaseException:
         video_slicer.cancel()
         shutil.rmtree(temporary, ignore_errors=True)
+        if promoted:
+            shutil.rmtree(destination, ignore_errors=True)
+            _generation_receipt_path(destination).unlink(missing_ok=True)
         raise
