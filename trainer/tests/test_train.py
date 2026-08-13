@@ -12,6 +12,7 @@ from lehome_train.commands.train import (
     TrainingChunkRequest,
     TrainingChunkReceipt,
     run_fixed_exposure_training,
+    run_continuous_training,
 )
 from lehome_train.io import canonical_json_sha256
 from lehome_train.models import (
@@ -27,6 +28,16 @@ SHA_B = "b" * 64
 SHA_C = "c" * 64
 COMMIT = "d" * 40
 DIGEST = f"sha256:{'e' * 64}"
+
+
+def test_continuous_training_requires_sealed_generation(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="sealed generation"):
+        run_continuous_training(
+            generation_root=tmp_path / "unsealed",
+            parent_checkpoint_sha256="a" * 64,
+            launch=lambda: None,
+            immutable_checkpoint_steps=lambda: (1000, 2000),
+        )
 
 
 def _config(batch: int = 64) -> ExperimentConfig:

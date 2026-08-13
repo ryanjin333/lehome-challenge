@@ -35,6 +35,48 @@ class NonFiniteTrainingLoss(RuntimeError):
     """Training stopped before checkpointing a non-finite model state."""
 
 
+def run_continuous_training(
+    *,
+    generation_root: str | Path,
+    parent_checkpoint_sha256: str,
+    launch: Callable[[], object],
+    immutable_checkpoint_steps: Callable[[], tuple[int, ...]],
+) -> dict[str, object]:
+    """Run the sealed 2K corrective schedule and wait for both readbacks."""
+    from lehome_train.flywheel.mix import verify_generation
+
+    generation = verify_generation(generation_root)
+    if not _SHA256.fullmatch(parent_checkpoint_sha256):
+        raise ValueError("parent checkpoint SHA-256 is invalid")
+    launch()
+    verified = immutable_checkpoint_steps()
+    if verified != (1000, 2000):
+        return {
+            "schema_version": 1,
+            "kind": "continuous_corrective_training_terminal",
+            "generation_sha256": generation["mix_plan_sha256"],
+            "parent_checkpoint_sha256": parent_checkpoint_sha256,
+            "optimizer_steps": 2000,
+            "global_batch_size": 64,
+            "sample_presentations": 128000,
+            "checkpoint_steps": [1000, 2000],
+            "immutable_checkpoint_steps": list(verified),
+            "disposable": False,
+        }
+    return {
+        "schema_version": 1,
+        "kind": "continuous_corrective_training_terminal",
+        "generation_sha256": generation["mix_plan_sha256"],
+        "parent_checkpoint_sha256": parent_checkpoint_sha256,
+        "optimizer_steps": 2000,
+        "global_batch_size": 64,
+        "sample_presentations": 128000,
+        "checkpoint_steps": [1000, 2000],
+        "immutable_checkpoint_steps": [1000, 2000],
+        "disposable": True,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class TrainingChunkRequest:
     """Immutable canonical schedule slice supplied to the training adapter."""

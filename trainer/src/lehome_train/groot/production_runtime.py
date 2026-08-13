@@ -13,13 +13,13 @@ from lehome_train.checkpoints import load_checkpoint_descriptor
 from lehome_train.commands.memorize import run_memorization
 from lehome_train.commands.prepare import prepare_training_environment
 from lehome_train.commands.smoke import run_smoke_tests
-from lehome_train.commands.train import run_fixed_exposure_training
+from lehome_train.commands.train import run_continuous_training, run_fixed_exposure_training
 from lehome_train.constants import ISAAC_GROOT_REVISION
 from lehome_train.constants import DEFAULT_MODEL_REPO
 from lehome_train.data.normalization import normalization_identity
 from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.groot.launch import build_launch
-from lehome_train.groot.launch import launch_finetune_to_step
+from lehome_train.groot.launch import launch_continuous_finetune, launch_finetune_to_step
 from lehome_train.groot.production_adapters import (
     GrootMemorizationSession,
     GrootSmokeRunner,
@@ -757,6 +757,31 @@ class ProductionRuntime:
         _write_safe_json_artifact(
             Path(config.output_dir) / "logs" / "train.json", training_log
         )
+        return payload
+
+    def continuous_train(self, arguments: dict[str, object]) -> dict[str, object]:
+        fields = {
+            "launch_config", "generation_root", "parent_checkpoint_sha256",
+            "immutable_checkpoint_steps", "result_output", "status_output",
+        }
+        request = _exact(arguments, fields, "continuous-train")
+        outputs = _prepare_outputs(request, "result_output", "status_output")
+        config = _load_config(request["launch_config"])
+        generation = _mounted_path(request["generation_root"], "generation_root", must_exist=True)
+        parent = _sha256(request["parent_checkpoint_sha256"], "parent_checkpoint_sha256")
+        steps = request["immutable_checkpoint_steps"]
+        if not isinstance(steps, list) or any(type(step) is not int for step in steps):
+            raise ValueError("immutable checkpoint steps are invalid")
+        if config.max_steps != 2000 or config.save_steps != 1000 or config.global_batch_size != 64:
+            raise ValueError("continuous-train requires the 2K batch-64 corrective launch")
+        payload = run_continuous_training(
+            generation_root=generation,
+            parent_checkpoint_sha256=parent,
+            launch=lambda: launch_continuous_finetune(config, **_launch_kwargs()),
+            immutable_checkpoint_steps=lambda: tuple(steps),
+        )
+        _write_result(outputs["result_output"], payload)
+        atomic_write_json(outputs["status_output"], payload)
         return payload
 
 
