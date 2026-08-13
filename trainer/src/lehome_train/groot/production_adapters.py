@@ -1000,6 +1000,11 @@ class HubCheckpointUploader:
     def __call__(
         self, checkpoint: CheckpointDescriptor, *, timeout_seconds: float
     ) -> bool:
+        return self.publish_receipt(checkpoint, timeout_seconds=timeout_seconds)["readback_verified"] is True
+
+    def publish_receipt(
+        self, checkpoint: CheckpointDescriptor, *, timeout_seconds: float
+    ) -> dict[str, object]:
         if self.artifact_root is None:
             raise ValueError("checkpoint uploader has no artifact root")
         artifact = self.artifact_root / checkpoint.record.artifact.relative_path
@@ -1048,10 +1053,16 @@ class HubCheckpointUploader:
                 max_attempts=1,
             )
             observed = readback / entry.relative_path
-            return (
+            verified = (
                 observed.is_file()
                 and observed.stat().st_size == entry.byte_size
                 and sha256_file(observed) == entry.sha256
             )
+            return {
+                "optimizer_step": checkpoint.record.optimizer_step,
+                "immutable_revision": immutable_revision,
+                "artifact_sha256": entry.sha256,
+                "readback_verified": verified,
+            }
         finally:
             shutil.rmtree(readback, ignore_errors=True)

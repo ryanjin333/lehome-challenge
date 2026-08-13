@@ -56,7 +56,7 @@ def run_continuous_supervisor(
     package: Callable[[CompletedCheckpoint], object],
     publish: Callable[[object], bool],
     wait: Callable[[], None] | None = None,
-) -> tuple[int, ...]:
+) -> tuple[dict[str, object], ...]:
     """Launch once, observe official save completion, publish in one worker.
 
     The launch thread never receives publisher credentials.  Publication uses
@@ -99,7 +99,15 @@ def run_continuous_supervisor(
                 threading.Event().wait(0.1)
             else:
                 wait()
-        immutable = tuple(step for step in (1000, 2000) if step in submitted and submitted[step].result() is True)
+        immutable: list[dict[str, object]] = []
+        for step in (1000, 2000):
+            if step not in submitted:
+                continue
+            receipt = submitted[step].result()
+            if receipt is True:
+                immutable.append({"optimizer_step": step, "readback_verified": True})
+            elif isinstance(receipt, dict) and receipt.get("readback_verified") is True and receipt.get("optimizer_step") == step:
+                immutable.append(receipt)
     if launch_error:
         raise launch_error[0]
-    return immutable
+    return tuple(immutable)

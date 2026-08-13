@@ -43,6 +43,7 @@ from lehome_train.schedule import (
     CHECKPOINT_SAMPLE_PRESENTATIONS,
     TOTAL_SAMPLE_PRESENTATIONS,
     optimizer_steps_for_presentations,
+    ExposureSchedule,
 )
 from lehome_train.telemetry import NvmlTelemetrySampler
 from lehome_train.hub import HuggingFaceHubTransport
@@ -784,18 +785,21 @@ class ProductionRuntime:
             raise ValueError("continuous-train requires the 2K batch-64 corrective launch")
         session = GrootTrainingSession(config=config, experiment_config=experiment, normalization_sha256=normalization, resume_checkpoint=None)
         uploader = HubCheckpointUploader(repository=repository, revision=revision, experiment_id=config.experiment_name, artifact_root=config.output_dir)
-        verified = run_continuous_supervisor(
+        schedule = ExposureSchedule(physical_batch_size=64, sample_presentations=128_000, checkpoint_sample_presentations=64_000)
+        publications = run_continuous_supervisor(
             run_root=Path(config.output_dir) / config.experiment_name,
             launch=lambda: launch_continuous_finetune(config, **_launch_kwargs()),
-            package=lambda completed: session.package_checkpoint_snapshot(completed.snapshot_root, optimizer_step=completed.optimizer_step, sample_presentations=completed.optimizer_step * 64, schedule_sha256="0" * 64),
-            publish=lambda checkpoint: uploader(checkpoint, timeout_seconds=30.0),
+            package=lambda completed: session.package_checkpoint_snapshot(completed.snapshot_root, optimizer_step=completed.optimizer_step, sample_presentations=completed.optimizer_step * 64, schedule_sha256=schedule.sha256),
+            publish=lambda checkpoint: uploader.publish_receipt(checkpoint, timeout_seconds=30.0),
         )
+        verified = tuple(item["optimizer_step"] for item in publications)
         payload = run_continuous_training(
             generation_root=generation,
             parent_checkpoint_sha256=parent,
             launch=lambda: None,
             immutable_checkpoint_steps=lambda: verified,
         )
+        payload["immutable_checkpoint_publications"] = list(publications)
         _write_result(outputs["result_output"], payload)
         atomic_write_json(outputs["status_output"], payload)
         return payload
