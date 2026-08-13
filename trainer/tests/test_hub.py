@@ -524,6 +524,34 @@ def test_real_transport_downloads_an_allowlist_with_bounded_workers(
     } == set(files)
 
 
+def test_real_transport_reuses_destination_for_snapshot_resume(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    revision = "e" * 40
+    destination = tmp_path / "readback"
+    calls: list[Path] = []
+
+    class FakeLibrary:
+        @staticmethod
+        def snapshot_download(**kwargs: object) -> str:
+            local = Path(str(kwargs["local_dir"]))
+            calls.append(local)
+            target = local / str(kwargs["allow_patterns"][0])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"payload")
+            return str(local)
+
+    monkeypatch.setattr(transport, "_repo_info", lambda **_kwargs: SimpleNamespace(sha=revision))
+    monkeypatch.setattr(transport, "_library", lambda: FakeLibrary())
+    transport.download_files(
+        repository="ryanjin333/lehome-groot-n17-data", revision=revision,
+        destination=destination, relative_paths=("data/episode.bin",), token="hf_resume_probe",
+    )
+
+    assert calls == [destination]
+
+
 def test_tree_listing_requires_and_preserves_an_explicit_immutable_revision() -> None:
     transport = FakeTransport()
     revision = "c" * 40

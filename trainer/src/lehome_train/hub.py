@@ -352,29 +352,30 @@ class HuggingFaceHubTransport:
             raise ValueError("Hub readback resolved a different immutable revision")
         library = self._library()
         destination.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="lehome-hf-cache-") as cache:
-            remote_paths = tuple(
-                relative_path if remote_prefix is None else f"{remote_prefix}/{relative_path}"
-                for relative_path in relative_paths
+        remote_paths = tuple(
+            relative_path if remote_prefix is None else f"{remote_prefix}/{relative_path}"
+            for relative_path in relative_paths
+        )
+        try:
+            library.snapshot_download(
+                repo_id=repository,
+                repo_type=self._repo_type(repository),
+                revision=revision,
+                allow_patterns=list(remote_paths),
+                token=token,
+                local_dir=destination,
+                etag_timeout=self.timeout_seconds,
             )
-            snapshot_root = Path(cache) / "snapshot"
-            try:
-                library.snapshot_download(
-                    repo_id=repository,
-                    repo_type=self._repo_type(repository),
-                    revision=revision,
-                    allow_patterns=list(remote_paths),
-                    token=token,
-                    local_dir=snapshot_root,
-                    etag_timeout=self.timeout_seconds,
-                )
-            except (ConnectionError, TimeoutError):
-                raise HubTransientError("Hub download timed out") from None
+        except (ConnectionError, TimeoutError):
+            raise HubTransientError("Hub download timed out") from None
+        if remote_prefix is not None:
             for relative_path, remote_path in zip(relative_paths, remote_paths, strict=True):
-                downloaded = snapshot_root / remote_path
+                downloaded = destination / remote_path
                 target = destination / relative_path
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(downloaded, target)
+                if downloaded != target:
+                    shutil.copyfile(downloaded, target)
+            shutil.rmtree(destination / remote_prefix.split("/", 1)[0])
         final = self._repo_info(repository=repository, revision=revision, token=token)
         if self._revision(final) != revision:
             raise ValueError("Hub readback revision changed during download")
