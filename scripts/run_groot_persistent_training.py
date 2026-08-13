@@ -13,6 +13,7 @@ import json
 import math
 from pathlib import Path
 import subprocess
+import tarfile
 import time
 from typing import Callable, Mapping
 
@@ -171,6 +172,44 @@ def _ssh_prefix(instance: Mapping[str, object]) -> tuple[str, ...]:
     return ("ssh", "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port), "root@" + host)
 
 
+def _safe_archive(path: Path, label: str) -> None:
+    """Reject traversal, links, and special files before any remote extraction."""
+    try:
+        with tarfile.open(path, "r:*") as archive:
+            members = archive.getmembers()
+    except (tarfile.TarError, OSError):
+        raise ValueError(f"{label} is not a readable regular archive") from None
+    if not members:
+        raise ValueError(f"{label} is empty")
+    for member in members:
+        parts = Path(member.name).parts
+        if (
+            not member.name
+            or member.name.startswith("/")
+            or ".." in parts
+            or member.issym()
+            or member.islnk()
+            or not (member.isfile() or member.isdir())
+        ):
+            raise ValueError(f"{label} has an unsafe archive member")
+
+
+def _stage_setup_command() -> str:
+    """Static remote setup: extraction is constrained to the three mounts."""
+    return (
+        "set -eu; "
+        "mkdir -p /prepared /prepared/code /cache /cache/parent /output; "
+        "rm -rf /prepared/generation; "
+        "mv /tmp/lehome-stage/generation /prepared/generation; "
+        "tar --no-same-owner --no-same-permissions -xf /tmp/lehome-stage/code.bundle -C /prepared/code; "
+        "tar --no-same-owner --no-same-permissions -xf /tmp/lehome-stage/parent.tar -C /cache/parent; "
+        "test \"$(sha256sum /tmp/lehome-stage/parent.tar | cut -d' ' -f1)\" = "
+        + PARENT_CHECKPOINT["artifact_sha256"]
+        + "; chmod 600 /tmp/lehome-stage/token; "
+        "test ! -L /prepared/generation; test ! -L /cache/parent; test ! -L /prepared/code"
+    )
+
+
 def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     _stage_command(request)
     remote_dir = "/tmp/lehome-stage"
@@ -201,8 +240,9 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
     if receipt_payload.get("sealed") is not True: raise ValueError("staged generation receipt is not sealed")
     code_digest = next(item["sha256"] for item in receipts if item["name"] == "code.bundle")
     if request.get("code_bundle_sha256") != code_digest: raise ValueError("staged code bundle hash differs from request")
-    setup = "set -eu; mkdir -p /prepared /cache /output /tmp/lehome-stage/code; tar -xf /tmp/lehome-stage/code.bundle -C /tmp/lehome-stage/code; tar -tf /tmp/lehome-stage/parent.tar >/dev/null; test \"$(sha256sum /tmp/lehome-stage/parent.tar | cut -d' ' -f1)\" = " + PARENT_CHECKPOINT["artifact_sha256"] + "; chmod 600 /tmp/lehome-stage/token"
-    runner((*_ssh_prefix(instance), setup))
+    _safe_archive(Path(str(request["code_bundle"])), "code bundle")
+    _safe_archive(Path(str(request["parent_checkpoint"])), "parent checkpoint")
+    runner((*_ssh_prefix(instance), _stage_setup_command()))
     return {"paid_action": True, "action": "stage", "instance_id": instance["instance_id"], "generation_tree_sha256": generation_tree, "code_bundle_sha256": code_digest, "transfers": receipts}
 
 
@@ -218,6 +258,26 @@ def _stage_command(request: Mapping[str, object]) -> str:
     return "stage-validated"
 
 
+def _require_instance_capability(instance: Mapping[str, object], request: Mapping[str, object]) -> None:
+    """Promote a bootstrap result only when its identity is this live receipt."""
+    capability = request.get("capability_receipt")
+    if not isinstance(capability, Mapping):
+        raise ValueError("full training requires an instance-bound capability receipt")
+    if (
+        capability.get("kind") != "persistent_training_capability"
+        or capability.get("instance_id") != instance.get("instance_id")
+        or capability.get("trainer_image") != instance.get("trainer_image")
+        or capability.get("provider_response_sha256") != instance.get("provider_response_sha256")
+    ):
+        raise ValueError("capability receipt is not bound to this instance")
+    training_capability = capability.get("training_capability")
+    if not isinstance(training_capability, Mapping):
+        raise ValueError("capability receipt is malformed")
+    if training_capability.get("image_digest") != str(instance.get("trainer_image", "")).rpartition("@")[2]:
+        raise ValueError("capability receipt image is incompatible")
+    validate_training_capability(training_capability)
+
+
 def remote_action(*, action: str, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     instance_id = instance.get("instance_id")
     if type(instance_id) is not int: raise ValueError("instance receipt is invalid")
@@ -226,13 +286,22 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
     if action == "stage":
         return stage(instance=instance, request=request, runner=runner)
     elif action in {"tune", "train", "status", "resume"}:
+        if action in {"tune", "train", "resume"}:
+            _require_instance_capability(instance, request)
         if action == "resume" and request.get("generation_sha256") != request.get("resume_generation_sha256") or action == "resume" and request.get("config_sha256") != request.get("resume_config_sha256"):
             raise ValueError("resume requires exact generation/config identity")
+        terminal_path = request.get("terminal_path", "/output/persistent-training/terminal.json")
+        if action == "status" and (
+            type(terminal_path) is not str
+            or not terminal_path.startswith("/output/")
+            or ".." in Path(terminal_path).parts
+        ):
+            raise ValueError("status terminal path must be beneath /output")
         commands = {
             "tune": "lehome-train smoke --request /tmp/lehome-stage/tune.json",
             "train": "env -u HF_TOKEN lehome-train continuous-train --request /tmp/lehome-stage/continuous.json",
             "resume": "env -u HF_TOKEN lehome-train continuous-train --request /tmp/lehome-stage/resume.json",
-            "status": "test -f /tmp/lehome-stage/terminal.json && cat /tmp/lehome-stage/terminal.json",
+            "status": "test -f " + str(terminal_path) + " && cat " + str(terminal_path),
         }
         command = "set -eu; " + commands[action]
     else:

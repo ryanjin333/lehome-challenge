@@ -80,6 +80,48 @@ def test_status_parses_authenticated_terminal() -> None:
     assert result["terminal"] == terminal
 
 
+def test_train_requires_capability_receipt_bound_to_its_instance() -> None:
+    instance = {"instance_id": 7, "host": "host", "port": 22, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "provider_response_sha256": "a" * 64}
+    request = {
+        "generation_sha256": "b" * 64,
+        "config_sha256": "c" * 64,
+        "capability_receipt": {
+            "kind": "persistent_training_capability",
+            "instance_id": 8,
+            "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+            "provider_response_sha256": "a" * 64,
+            "training_capability": {"hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .2}, "nvml": {"utilization_percent": 90}},
+        },
+    }
+    with pytest.raises(ValueError, match="capability receipt"):
+        LIFECYCLE.remote_action(action="train", instance=instance, request=request, runner=FailRunner())
+
+
+def test_status_reads_only_requested_terminal_beneath_output() -> None:
+    instance = {"instance_id": 7, "host": "host", "port": 22}
+    terminal = {"kind": "continuous_corrective_training_terminal", "instance_id": 7}
+    seen: list[tuple[str, ...]] = []
+    result = LIFECYCLE.remote_action(
+        action="status",
+        instance=instance,
+        request={"terminal_path": "/output/persistent/terminal.json"},
+        runner=lambda command: seen.append(command) or json.dumps(terminal),
+    )
+    assert result["terminal"] == terminal
+    assert seen[-1][-1].endswith("cat /output/persistent/terminal.json")
+
+    with pytest.raises(ValueError, match="terminal path"):
+        LIFECYCLE.remote_action(action="status", instance=instance, request={"terminal_path": "/tmp/terminal.json"}, runner=FailRunner())
+
+
+def test_stage_setup_hydrates_only_operational_roots() -> None:
+    command = LIFECYCLE._stage_setup_command()
+    assert "tar --no-same-owner --no-same-permissions -xf /tmp/lehome-stage/code.bundle -C /prepared/code" in command
+    assert "tar --no-same-owner --no-same-permissions -xf /tmp/lehome-stage/parent.tar -C /cache/parent" in command
+    assert "mv /tmp/lehome-stage/generation /prepared/generation" in command
+    assert "chmod 600 /tmp/lehome-stage/token" in command
+
+
 def test_bootstrap_canary_uses_only_historical_image_and_binds_instance_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
