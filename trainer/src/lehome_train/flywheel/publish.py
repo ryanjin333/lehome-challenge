@@ -703,22 +703,23 @@ def _require_snapshot(bundle: CorrectivePublicationBundle, snapshot: Path) -> tu
     if len(bundle.selection.bindings) != TARGET_UNIQUE_SUCCESSES or bindings != expected:
         raise ValueError("materialized snapshot selected binding index is stale or incomplete")
     episodes = selection.get("episodes")
-    expected_payload = [
-        {
-            "raw_episode_id": item.episode_id,
-            "raw_manifest_sha256": item.episode_manifest_sha256,
-        }
+    expected_payload = {
+        item.episode_id: item.episode_manifest_sha256
         for item in bundle.selection.bindings
-    ]
-    actual_payload = [
-        {
-            "raw_episode_id": item.get("raw_episode_id"),
-            "raw_manifest_sha256": item.get("raw_manifest_sha256"),
-        }
-        if isinstance(item, Mapping) else None
+    }
+    actual_items = [
+        (item.get("raw_episode_id"), item.get("raw_manifest_sha256"))
+        if isinstance(item, Mapping) else (None, None)
         for item in episodes
     ] if isinstance(episodes, list) else None
-    if manifest.get("episode_count") != TARGET_UNIQUE_SUCCESSES or actual_payload != expected_payload:
+    actual_payload = dict(actual_items) if actual_items is not None else None
+    if (
+        manifest.get("episode_count") != TARGET_UNIQUE_SUCCESSES
+        or actual_items is None
+        or len(actual_items) != TARGET_UNIQUE_SUCCESSES
+        or len(actual_payload) != TARGET_UNIQUE_SUCCESSES
+        or actual_payload != expected_payload
+    ):
         raise ValueError("corrective snapshot does not contain the exact selected episode payload")
     return paths
 
