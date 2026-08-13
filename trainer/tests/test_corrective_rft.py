@@ -358,6 +358,7 @@ def test_corrective_selection_excludes_verified_horizon_episodes_before_exact_fl
     bundle = build_corrective_selection_bundle(attempts, artifacts)
 
     assert len(bundle.bindings) == 150
+    assert len(verify_corrective_selection_bundle(bundle)) == 150
     assert {item.attempt_id for item in bundle.bindings}.isdisjoint(horizon_attempt_ids)
     assert {
         category: sum(item["category"] == category for item in bundle.selected_attempt_receipts)
@@ -382,7 +383,7 @@ def test_typed_corrective_chain_binds_selected_artifacts_and_rejects_stale_manif
         attempt["hard_state_sha256"] = f"{index + 400:064x}"
         attempts.append(attempt)
     selected = select_corrective_successes(attempts)
-    artifacts = _verified_trainable_artifacts(tmp_path, selected)
+    artifacts = _verified_trainable_artifacts(tmp_path, attempts)
 
     bundle = build_corrective_selection_bundle(attempts, artifacts)
     bindings = verify_corrective_selection_bundle(bundle)
@@ -414,7 +415,7 @@ def test_selection_bundle_rejects_a_forged_binding_even_when_its_hash_is_recompu
         attempt["hard_state_sha256"] = f"{index + 400:064x}"
         attempts.append(attempt)
     selected = select_corrective_successes(attempts)
-    artifacts = _verified_trainable_artifacts(tmp_path, selected)
+    artifacts = _verified_trainable_artifacts(tmp_path, attempts)
     bundle = build_corrective_selection_bundle(attempts, artifacts)
     forged_bindings = (
         replace(bundle.bindings[0], episode_id="forged-episode"), *bundle.bindings[1:]
@@ -475,7 +476,7 @@ def test_verified_corrective_materialization_hands_exact_bindings_to_pre_hash_sn
         attempt["hard_state_sha256"] = f"{index + 400:064x}"
         attempts.append(attempt)
     selected = select_corrective_successes(attempts)
-    artifacts = _verified_trainable_artifacts(tmp_path, selected)
+    artifacts = _verified_trainable_artifacts(tmp_path, attempts)
     episode_by_root = {item["root"]: str(item["episode_id"]) for item in artifacts.values()}
     bundle = build_corrective_selection_bundle(attempts, artifacts)
     received: dict[str, object] = {}
@@ -537,7 +538,7 @@ def test_verified_corrective_materialization_rejects_a_final_snapshot_with_not_1
         attempt["randomization_sha256"] = f"{index + 200:064x}"
         attempt["hard_state_sha256"] = f"{index + 400:064x}"
         attempts.append(attempt)
-    artifacts = _verified_trainable_artifacts(tmp_path, select_corrective_successes(attempts))
+    artifacts = _verified_trainable_artifacts(tmp_path, attempts)
     bundle = build_corrective_selection_bundle(attempts, artifacts)
     episode_by_root = {item.root: item.episode_id for item in bundle.bindings}
     monkeypatch.setattr(

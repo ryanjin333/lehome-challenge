@@ -119,6 +119,7 @@ class CorrectiveSelectionBundle:
     """The complete typed handoff from campaign evidence to data publication."""
 
     campaign_receipt: Mapping[str, object]
+    candidate_bindings: tuple[CorrectiveEpisodeBinding, ...]
     bindings: tuple[CorrectiveEpisodeBinding, ...]
     selected_attempt_receipts: tuple[Mapping[str, object], ...]
     selection_sha256: str
@@ -468,6 +469,17 @@ def bind_corrective_episode_artifacts(
     selected = tuple(selected_attempts)
     if len(selected) != TARGET_UNIQUE_SUCCESSES:
         raise ValueError("corrective artifact binding requires exactly 150 selected attempts")
+    return bind_corrective_episode_artifacts_unbounded(selected, verified_episodes)
+
+
+def bind_corrective_episode_artifacts_unbounded(
+    attempts: Iterable[Mapping[str, object]],
+    verified_episodes: Mapping[str, Mapping[str, object]],
+) -> tuple[CorrectiveEpisodeBinding, ...]:
+    """Bind any nonempty canonical candidate set before deterministic selection."""
+    selected = tuple(attempts)
+    if not selected:
+        raise ValueError("corrective artifact binding requires candidate attempts")
     bindings: list[CorrectiveEpisodeBinding] = []
     for attempt in selected:
         attempt_id = attempt.get("attempt_id")
@@ -490,6 +502,7 @@ def bind_corrective_episode_artifacts(
 
 def _selection_body(
     campaign_receipt: Mapping[str, object],
+    candidate_bindings: Iterable[CorrectiveEpisodeBinding],
     bindings: Iterable[CorrectiveEpisodeBinding],
     selected_attempt_receipts: Iterable[Mapping[str, object]],
 ) -> dict[str, object]:
@@ -497,6 +510,15 @@ def _selection_body(
         "schema_version": 1,
         "kind": "corrective_rft_selection",
         "campaign_receipt_sha256": campaign_receipt.get("receipt_sha256"),
+        "candidate_bindings": [
+            {
+                "attempt_id": item.attempt_id,
+                "episode_id": item.episode_id,
+                "root": item.root,
+                "episode_manifest_sha256": item.episode_manifest_sha256,
+            }
+            for item in candidate_bindings
+        ],
         "selected_attempt_receipts": [dict(item) for item in selected_attempt_receipts],
         "bindings": [
             {
@@ -517,12 +539,18 @@ def build_corrective_selection_bundle(
     """Close the attempt -> exact selection -> verified artifact handoff."""
 
     frozen_attempts = tuple(attempts)
-    receipt = build_corrective_campaign_receipt(frozen_attempts)
-    eligible = _eligible_corrective_successes(_validate_attempts(frozen_attempts), verified_episodes)
+    validated = _validate_attempts(frozen_attempts)
+    receipt = build_corrective_campaign_receipt(validated)
+    candidate_receipts = tuple(item for item in validated if item["accepted_success"])
+    candidate_bindings = bind_corrective_episode_artifacts_unbounded(candidate_receipts, verified_episodes)
+    eligible = _eligible_corrective_successes(validated, verified_episodes)
     selected = _select_corrective_successes(eligible)
     bindings = bind_corrective_episode_artifacts(selected, verified_episodes)
-    body = _selection_body(receipt, bindings, selected)
-    return CorrectiveSelectionBundle(receipt, bindings, tuple(dict(item) for item in selected), _canonical_sha256(body))
+    body = _selection_body(receipt, candidate_bindings, bindings, selected)
+    return CorrectiveSelectionBundle(
+        receipt, candidate_bindings, bindings, tuple(dict(item) for item in selected),
+        _canonical_sha256(body),
+    )
 
 
 def verify_corrective_selection_bundle(
@@ -545,8 +573,30 @@ def verify_corrective_selection_bundle(
     validated_attempts = _validate_attempts(recorded_attempts)
     if build_corrective_campaign_receipt(validated_attempts) != dict(receipt):
         raise ValueError("corrective campaign receipt attempt ledger is stale")
+    accepted_receipts = tuple(item for item in validated_attempts if item["accepted_success"])
+    candidate_bindings = tuple(bundle.candidate_bindings)
+    if (
+        len(candidate_bindings) != len(accepted_receipts)
+        or len({item.attempt_id for item in candidate_bindings}) != len(candidate_bindings)
+        or any(
+            binding.attempt_id != receipt_item["attempt_id"]
+            or binding.episode_id != receipt_item["episode_id"]
+            for binding, receipt_item in zip(candidate_bindings, accepted_receipts, strict=True)
+        )
+    ):
+        raise ValueError("corrective candidate artifact ledger is stale or incomplete")
+    candidates = {
+        item.attempt_id: {
+            "episode_id": item.episode_id,
+            "release_stage": "seen",
+            "root": item.root,
+            "episode_manifest_sha256": item.episode_manifest_sha256,
+        }
+        for item in candidate_bindings
+    }
     selected_receipts = tuple(bundle.selected_attempt_receipts)
-    expected_selected = select_corrective_successes(validated_attempts)
+    eligible = _eligible_corrective_successes(validated_attempts, candidates)
+    expected_selected = _select_corrective_successes(eligible)
     if tuple(dict(item) for item in selected_receipts) != expected_selected:
         raise ValueError("corrective selected receipt ledger is stale or forged")
     bindings = tuple(bundle.bindings)
@@ -563,7 +613,9 @@ def verify_corrective_selection_bundle(
         for binding, receipt_item in zip(bindings, selected_receipts, strict=True)
     ):
         raise ValueError("corrective selected receipt and artifact binding differ")
-    if _canonical_sha256(_selection_body(receipt, bindings, selected_receipts)) != bundle.selection_sha256:
+    if _canonical_sha256(
+        _selection_body(receipt, candidate_bindings, bindings, selected_receipts)
+    ) != bundle.selection_sha256:
         raise ValueError("corrective selection bundle hash is stale")
     return bindings
 
