@@ -353,31 +353,28 @@ class HuggingFaceHubTransport:
         library = self._library()
         destination.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="lehome-hf-cache-") as cache:
-            def download_one(relative_path: str) -> None:
-                remote_path = (
-                    relative_path
-                    if remote_prefix is None
-                    else f"{remote_prefix}/{relative_path}"
+            remote_paths = tuple(
+                relative_path if remote_prefix is None else f"{remote_prefix}/{relative_path}"
+                for relative_path in relative_paths
+            )
+            snapshot_root = Path(cache) / "snapshot"
+            try:
+                library.snapshot_download(
+                    repo_id=repository,
+                    repo_type=self._repo_type(repository),
+                    revision=revision,
+                    allow_patterns=list(remote_paths),
+                    token=token,
+                    local_dir=snapshot_root,
+                    etag_timeout=self.timeout_seconds,
                 )
-                try:
-                    downloaded = library.hf_hub_download(
-                        repo_id=repository,
-                        repo_type=self._repo_type(repository),
-                        revision=revision,
-                        filename=remote_path,
-                        token=token,
-                        cache_dir=cache,
-                        etag_timeout=self.timeout_seconds,
-                    )
-                except (ConnectionError, TimeoutError):
-                    raise HubTransientError("Hub download timed out") from None
+            except (ConnectionError, TimeoutError):
+                raise HubTransientError("Hub download timed out") from None
+            for relative_path, remote_path in zip(relative_paths, remote_paths, strict=True):
+                downloaded = snapshot_root / remote_path
                 target = destination / relative_path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(downloaded, target)
-            with ThreadPoolExecutor(
-                max_workers=min(_MAX_PARALLEL_DOWNLOADS, len(relative_paths))
-            ) as executor:
-                tuple(executor.map(download_one, relative_paths))
         final = self._repo_info(repository=repository, revision=revision, token=token)
         if self._revision(final) != revision:
             raise ValueError("Hub readback revision changed during download")

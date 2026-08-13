@@ -494,12 +494,13 @@ def test_real_transport_downloads_an_allowlist_with_bounded_workers(
 
     class FakeLibrary:
         @staticmethod
-        def hf_hub_download(**kwargs: object) -> str:
-            filename = str(kwargs["filename"])
-            cached = Path(str(kwargs["cache_dir"])) / filename
-            cached.parent.mkdir(parents=True, exist_ok=True)
-            cached.write_bytes(filename.encode("utf-8"))
-            return str(cached)
+        def snapshot_download(**kwargs: object) -> str:
+            snapshot = Path(str(kwargs["local_dir"]))
+            for filename in kwargs["allow_patterns"]:
+                cached = snapshot / str(filename)
+                cached.parent.mkdir(parents=True, exist_ok=True)
+                cached.write_bytes(str(filename).encode("utf-8"))
+            return str(snapshot)
 
     monkeypatch.setattr(
         transport,
