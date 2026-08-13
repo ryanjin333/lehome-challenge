@@ -18,7 +18,7 @@ from typing import Callable, Mapping
 
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
 CORRECTIVE_SOURCE = {"revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c", "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35"}
-PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3", "subpath": "policies/step-12000"}
+PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3", "subpath": "policies/step-12000", "artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"}
 # Vast's raw expression grammar does not support a portable OR form for two
 # exact SKU strings.  Query only stable numeric facts, then enforce the narrow
 # WS/S allowlist on raw rows in ``_offer_gpu``.
@@ -136,7 +136,7 @@ def _stage_command(request: Mapping[str, object]) -> str:
     if request.get("generation_sha256") != request.get("sealed_generation_sha256"):
         raise ValueError("stage generation identity is not sealed")
     parent_sha = request.get("parent_checkpoint_sha256")
-    if request.get("parent_checkpoint_repository") != PARENT_CHECKPOINT["repository"] or request.get("parent_checkpoint_revision") != PARENT_CHECKPOINT["revision"] or request.get("parent_checkpoint_subpath") != PARENT_CHECKPOINT["subpath"] or not isinstance(parent_sha, str) or len(parent_sha) != 64 or any(char not in "0123456789abcdef" for char in parent_sha):
+    if request.get("parent_checkpoint_repository") != PARENT_CHECKPOINT["repository"] or request.get("parent_checkpoint_revision") != PARENT_CHECKPOINT["revision"] or request.get("parent_checkpoint_subpath") != PARENT_CHECKPOINT["subpath"] or parent_sha != PARENT_CHECKPOINT["artifact_sha256"]:
         raise ValueError("stage parent checkpoint identity is not approved")
     # The token is a file transport only; no value is embedded in local JSON or
     # a command string.  Remote validation is hashes/path identity, never logs.
