@@ -356,12 +356,17 @@ class HuggingFaceHubTransport:
             relative_path if remote_prefix is None else f"{remote_prefix}/{relative_path}"
             for relative_path in relative_paths
         )
+        allow_patterns = (
+            [f"{remote_prefix}/**"]
+            if remote_prefix is not None
+            else list(remote_paths)
+        )
         try:
             library.snapshot_download(
                 repo_id=repository,
                 repo_type=self._repo_type(repository),
                 revision=revision,
-                allow_patterns=list(remote_paths),
+                allow_patterns=allow_patterns,
                 token=token,
                 local_dir=destination,
                 etag_timeout=self.timeout_seconds,

@@ -524,6 +524,46 @@ def test_real_transport_downloads_an_allowlist_with_bounded_workers(
     } == set(files)
 
 
+def test_real_transport_uses_one_nested_release_prefix_filter_then_copies_exact_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    revision = "e" * 40
+    destination = tmp_path / "readback"
+    remote_prefix = "releases/corrective/immutable-001"
+    files = ("manifest.json", "meta/rft-selection.json", "data/episode-000001.bin")
+    calls: list[dict[str, object]] = []
+
+    class FakeLibrary:
+        @staticmethod
+        def snapshot_download(**kwargs: object) -> str:
+            calls.append(dict(kwargs))
+            snapshot = Path(str(kwargs["local_dir"]))
+            for relative_path in (*files, "unrequested/debug.json"):
+                target = snapshot / remote_prefix / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(relative_path, encoding="utf-8")
+            return str(snapshot)
+
+    monkeypatch.setattr(transport, "_repo_info", lambda **_kwargs: SimpleNamespace(sha=revision))
+    monkeypatch.setattr(transport, "_library", lambda: FakeLibrary())
+
+    resolved = transport.download_files(
+        repository="ryanjin333/lehome-groot-n17-data",
+        revision=revision,
+        destination=destination,
+        relative_paths=files,
+        remote_prefix=remote_prefix,
+        token="hf_prefix_filter_probe",
+    )
+
+    assert resolved == revision
+    assert calls[0]["allow_patterns"] == [f"{remote_prefix}/**"]
+    assert {str(path.relative_to(destination)) for path in destination.rglob("*") if path.is_file()} == set(files)
+    assert not (destination / "releases").exists()
+
+
 def test_real_transport_reuses_destination_for_snapshot_resume(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
