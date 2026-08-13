@@ -55,6 +55,8 @@ for one bounded optimizer-step capability command. Its receipt binds the
 capability result to the instance, image, and provider readback. Full
 `tune`/`train`/`resume` actions require that exact instance-bound receipt;
 they cannot promote an arbitrary digest or a receipt from another rental.
+Use the free `promote` action to recover and validate the receipt's bound SSH
+instance before staging; it never rents a replacement instance.
 
 Stage verifies a complete local sealed-generation tree after SCP, safely
 extracts the code bundle beneath `/prepared/code` and the approved parent
