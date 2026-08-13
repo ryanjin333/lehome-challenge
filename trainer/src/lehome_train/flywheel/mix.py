@@ -8,6 +8,7 @@ segment or an oversampling boundary.
 
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import json
 import math
@@ -35,6 +36,8 @@ GRADE_WEIGHTS = {"A": 1.0, "B": 0.5}
 SOURCE_WEIGHTS = {"organizer": 0.7, "flywheel": 0.3}
 _SPLIT_FRACTION = 0.1
 _CAMERAS = ("top_rgb", "left_rgb", "right_rgb")
+_DEFAULT_VIDEO_WORKERS = 4
+_MAX_VIDEO_WORKERS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -772,6 +775,83 @@ def _copy_selected_video(source: Path, destination: Path, *, start: int, stop: i
     copy_video(source, destination, steps=list(range(start, stop)))
 
 
+class _BoundedVideoSlicer:
+    """Run independently-addressed video slices with a bounded work queue."""
+
+    def __init__(self, workers: int) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mix-video")
+        self._workers = workers
+        self._pending: dict[Future[None], int] = {}
+        self._next_index = 0
+        self._closed = False
+
+    def submit(self, source: Path, destination: Path, *, start: int, stop: int) -> None:
+        self._require_open()
+        if len(self._pending) == self._workers:
+            self._wait_for_batch()
+        future = self._executor.submit(
+            _copy_selected_video, source, destination, start=start, stop=stop,
+        )
+        self._pending[future] = self._next_index
+        self._next_index += 1
+
+    def finish(self) -> None:
+        self._require_open()
+        while self._pending:
+            self._wait_for_batch()
+        self._executor.shutdown(wait=True)
+        self._closed = True
+
+    def cancel(self) -> None:
+        if self._closed:
+            return
+        for future in self._pending:
+            future.cancel()
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        self._pending.clear()
+        self._closed = True
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("bounded video slicer is already closed")
+
+    def _wait_for_batch(self) -> None:
+        completed, _ = wait(self._pending, return_when=FIRST_COMPLETED)
+        failures: list[tuple[int, BaseException]] = []
+        for future in sorted(completed, key=self._pending.__getitem__):
+            index = self._pending[future]
+            try:
+                future.result()
+            except BaseException as error:
+                failures.append((index, error))
+        if failures:
+            for future in self._pending:
+                if future not in completed:
+                    future.cancel()
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            for future in sorted(self._pending, key=self._pending.__getitem__):
+                if future in completed or future.cancelled():
+                    continue
+                try:
+                    future.result()
+                except BaseException as error:
+                    failures.append((self._pending[future], error))
+            self._pending.clear()
+            self._closed = True
+            raise min(failures, key=lambda item: item[0])[1]
+        wait(self._pending)
+        for future in sorted(self._pending, key=self._pending.__getitem__):
+            index = self._pending.pop(future)
+            try:
+                future.result()
+            except BaseException as error:
+                failures.append((index, error))
+        if failures:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._closed = True
+            raise min(failures, key=lambda item: item[0])[1]
+
+
 def _source_by_hash(sources: Iterable[_PreparedSource]) -> dict[str, _PreparedSource]:
     ordered = tuple(sources)
     result = {source.manifest_sha256: source for source in ordered}
@@ -879,9 +959,12 @@ def materialize_mixed_snapshot(
     destination: str | Path,
     *,
     persistent_source_evidence: Mapping[str, object] | None = None,
+    video_workers: int = _DEFAULT_VIDEO_WORKERS,
 ) -> dict[str, object]:
     """Atomically copy a frozen plan into one canonical prepared-v2 snapshot."""
 
+    if type(video_workers) is not int or not 1 <= video_workers <= _MAX_VIDEO_WORKERS:
+        raise ValueError(f"video_workers must be an integer from 1 to {_MAX_VIDEO_WORKERS}")
     verify_mix_plan(plan)
     validate_mix_plan_payload(plan.to_dict())
     destination = Path(destination)
@@ -903,6 +986,7 @@ def materialize_mixed_snapshot(
             raise ValueError("mix plan references an unavailable source manifest")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent))
+    video_slicer = _BoundedVideoSlicer(video_workers)
     try:
         global_index = 0
         episode_rows: list[dict[str, object]] = []
@@ -933,9 +1017,10 @@ def materialize_mixed_snapshot(
             for camera in _CAMERAS:
                 source_video = source.root / LEGACY_VIDEO_PATH.format(episode_chunk=numeric_source // int(source_chunk_size), episode_index=numeric_source, video_key=camera)
                 output_video = temporary / LEGACY_VIDEO_PATH.format(episode_chunk=numeric_destination // 1000, episode_index=numeric_destination, video_key=camera)
-                _copy_selected_video(source_video, output_video, start=selection.frame_start, stop=selection.frame_stop)
+                video_slicer.submit(source_video, output_video, start=selection.frame_start, stop=selection.frame_stop)
             episode_rows.append({"episode_index": numeric_destination, "length": ACTION_HORIZON, "task_index": 0, "tasks": [FIXED_INSTRUCTION]})
             global_index += ACTION_HORIZON
+        video_slicer.finish()
         meta = temporary / "meta"
         meta.mkdir(parents=True, exist_ok=True)
         info = {
@@ -993,5 +1078,6 @@ def materialize_mixed_snapshot(
         atomic_write_json(_generation_receipt_path(destination), _generation_receipt(destination))
         return {"path": str(destination), "mix_plan_sha256": plan.sha256, "statistics": statistics, "validation": validation}
     except BaseException:
+        video_slicer.cancel()
         shutil.rmtree(temporary, ignore_errors=True)
         raise

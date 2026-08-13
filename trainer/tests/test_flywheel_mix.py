@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import subprocess
 from collections import Counter
+from threading import Lock
+import time
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -123,6 +126,88 @@ def test_mix_materializes_real_ranges_with_exact_train_ratio_and_valid_stats(tmp
     (mixed / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="hash"):
         validate_prepared_dataset(mixed)
+
+
+def test_mix_parallel_video_materialization_is_bounded_and_deterministic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only independent video slices run concurrently; sealed output is stable."""
+
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    grade_a = _prepared_source(tmp_path / "grade-a", kind="flywheel", grade="A", episodes=1)
+    grade_b = _prepared_source(tmp_path / "grade-b", kind="flywheel", grade="B", episodes=1)
+    plan = build_mix_plan(organizer, [grade_a, grade_b], seed=20260813)
+    active = 0
+    maximum_active = 0
+    lock = Lock()
+
+    def copy_video(source: Path, destination: Path, *, start: int, stop: int) -> None:
+        nonlocal active, maximum_active
+        assert stop - start == ACTION_HORIZON
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            time.sleep(0.01)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr("lehome_train.flywheel.mix._copy_selected_video", copy_video)
+    single = materialize_mixed_snapshot(
+        plan, organizer, [grade_a, grade_b], tmp_path / "single", video_workers=1,
+    )
+    assert maximum_active == 1
+    maximum_active = 0
+    parallel = materialize_mixed_snapshot(
+        plan, organizer, [grade_a, grade_b], tmp_path / "parallel", video_workers=2,
+    )
+
+    assert maximum_active == 2
+    single_root = Path(single["path"])
+    parallel_root = Path(parallel["path"])
+    assert artifact_identities(single_root, exclude={"manifest.json"}) == artifact_identities(
+        parallel_root, exclude={"manifest.json"},
+    )
+    assert json.loads((single_root / "manifest.json").read_text(encoding="utf-8")) == json.loads(
+        (parallel_root / "manifest.json").read_text(encoding="utf-8"),
+    )
+    assert load_generation_receipt(single_root) == load_generation_receipt(parallel_root)
+
+
+@pytest.mark.parametrize("video_workers", (0, 1.5, 9))
+def test_mix_rejects_invalid_video_worker_caps(tmp_path: Path, video_workers: object) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+
+    with pytest.raises(ValueError, match="video_workers"):
+        materialize_mixed_snapshot(
+            plan, organizer, flywheel, tmp_path / "mixed", video_workers=video_workers,  # type: ignore[arg-type]
+        )
+
+
+def test_mix_video_failure_cleans_temporary_tree_without_generation_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    destination = tmp_path / "failed"
+
+    def fail_slice(source: Path, destination: Path, *, start: int, stop: int) -> None:
+        raise RuntimeError("synthetic slice failure")
+
+    monkeypatch.setattr("lehome_train.flywheel.mix._copy_selected_video", fail_slice)
+
+    with pytest.raises(RuntimeError, match="synthetic slice failure"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination, video_workers=2)
+
+    assert not destination.exists()
+    assert not destination.with_name(destination.name + ".generation.json").exists()
+    assert not list(tmp_path.glob(".failed.*.tmp"))
 
 
 def test_generation_receipt_binds_exact_70_30_mix_and_artifacts(tmp_path: Path) -> None:

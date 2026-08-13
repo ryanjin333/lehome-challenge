@@ -221,7 +221,7 @@ def _copy_selected_video(source: Path, destination: Path, *, steps: list[int]) -
     selection = "+".join(f"eq(n\\,{step})" for step in steps)
     command = ("ffmpeg", "-y", "-loglevel", "error", "-i", str(source), "-vf",
                f"select='{selection}',setpts=N/(30*TB)", "-an", "-c:v", "libx264",
-               "-pix_fmt", "yuv420p", "-r", "30", "-g", "30", str(destination))
+               "-pix_fmt", "yuv420p", "-r", "30", "-g", "30", "-threads", "1", str(destination))
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(command, check=True, capture_output=True, text=True, timeout=300)
