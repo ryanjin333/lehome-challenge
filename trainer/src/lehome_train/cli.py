@@ -71,6 +71,8 @@ def data_convert(
     converter_commit: str = typer.Option(..., "--converter-commit"),
     container_digest: str = typer.Option(..., "--container-digest"),
     groot_root: Path = typer.Option(..., "--groot-root"),
+    persistent_staging_root: Optional[Path] = typer.Option(None, "--persistent-staging-root"),
+    unbound_staging_data_adoption_root: Optional[Path] = typer.Option(None, "--unbound-staging-data-adoption-root"),
 ) -> None:
     """Convert deterministically and compute pinned train-only statistics."""
 
@@ -86,6 +88,8 @@ def data_convert(
             source_revision=source_revision,
             converter_commit=converter_commit,
             converter_container_digest=container_digest,
+            persistent_staging_root=persistent_staging_root,
+            unbound_staging_data_adoption_root=unbound_staging_data_adoption_root,
         )
         statistics = write_train_statistics(output, groot_root=groot_root)
         return {"manifest": manifest, "statistics": statistics}

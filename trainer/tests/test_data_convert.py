@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import threading
 import time
 
@@ -207,6 +208,113 @@ def test_conversion_is_deterministic_and_does_not_mutate_source(tmp_path: Path) 
         b"".join(path.read_bytes() for path in sorted(source.rglob("*")) if path.is_file())
     ).hexdigest()
     assert after == before
+
+
+def test_persistent_staging_reuses_receipted_semantic_parquet_but_regenerates_videos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source_dataset(tmp_path)
+    staging = tmp_path / "persistent-staging"
+    calls: list[Path] = []
+    original = converter._extract_video_segment
+
+    def interrupt_after_first_video(*args, **kwargs):
+        calls.append(args[1])
+        if len(calls) > 1:
+            raise RuntimeError("provider interrupted")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(converter, "_extract_video_segment", interrupt_after_first_video)
+    with pytest.raises(RuntimeError, match="provider interrupted"):
+        _convert(source, tmp_path / "output", persistent_staging_root=staging)
+    data = staging / "data" / "chunk-000" / "episode_000003.parquet"
+    before = data.read_bytes()
+    journal = json.loads((staging / "conversion-journal.json").read_text())
+    assert journal["receipts"]["data/chunk-000/episode_000003.parquet"]["sha256"] == hashlib.sha256(before).hexdigest()
+
+    monkeypatch.setattr(converter, "_extract_video_segment", original)
+    _convert(source, tmp_path / "output", persistent_staging_root=staging)
+    assert (tmp_path / "output" / "data" / "chunk-000" / "episode_000003.parquet").read_bytes() == before
+    assert not staging.exists()
+
+
+def test_unbound_orphan_adoption_claims_only_exact_parquets_and_regenerates_videos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source_dataset(tmp_path)
+    orphan = tmp_path / "orphan"
+    staging = tmp_path / "staging"
+    # Build a real v2 data-only orphan; delete videos so no temporal artifact
+    # can be reused from the failed Docker filesystem.
+    _convert(source, orphan)
+    shutil.rmtree(orphan / "videos")
+    shutil.rmtree(orphan / "meta")
+    (orphan / "manifest.json").unlink()
+    (orphan / "conversion-journal.json").unlink()
+    generated: list[Path] = []
+    original = converter._extract_video_segment
+    monkeypatch.setattr(
+        converter, "_extract_video_segment",
+        lambda *args, **kwargs: generated.append(args[1]) or original(*args, **kwargs),
+    )
+    manifest = _convert(
+        source, tmp_path / "output", persistent_staging_root=staging,
+        unbound_staging_data_adoption_root=orphan,
+    )
+    assert manifest["adopted_episode_data"] is True
+    assert not orphan.exists()
+    assert (tmp_path / "orphan.conversion-quarantine").is_dir()
+    assert len(generated) == 3 * len(CAMERA_KEYS)
+
+
+def test_persistent_mode_recognizes_exact_promoted_conversion_for_stats_resume(
+    tmp_path: Path,
+) -> None:
+    source = make_source_dataset(tmp_path)
+    destination = tmp_path / "output"
+    first = _convert(source, destination, persistent_staging_root=tmp_path / "staging")
+    second = _convert(source, destination, persistent_staging_root=tmp_path / "staging")
+    assert second == first
+    (destination / "data" / "chunk-000" / "episode_000003.parquet").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="persistent converted destination"):
+        _convert(source, destination, persistent_staging_root=tmp_path / "staging")
+
+
+def test_persistent_staging_rejects_unjournaled_or_unexpected_content(tmp_path: Path) -> None:
+    source = make_source_dataset(tmp_path)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "smuggled.bin").write_bytes(b"no")
+    with pytest.raises(ValueError, match="empty"):
+        _convert(source, tmp_path / "output", persistent_staging_root=staging)
+
+
+def test_persistent_staging_rejects_tampered_journal_identity_and_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source_dataset(tmp_path)
+    staging = tmp_path / "staging"
+    monkeypatch.setattr(converter, "_extract_video_segment", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(RuntimeError, match="stop"):
+        _convert(source, tmp_path / "output", persistent_staging_root=staging)
+    journal_path = staging / "conversion-journal.json"
+    journal = json.loads(journal_path.read_text()); journal["converter_commit"] = "f" * 40
+    journal_path.write_text(json.dumps(journal))
+    with pytest.raises(ValueError, match="identity"):
+        _convert(source, tmp_path / "output", persistent_staging_root=staging)
+
+
+def test_orphan_adoption_rejects_unexpected_video_and_tampered_parquet(
+    tmp_path: Path,
+) -> None:
+    source = make_source_dataset(tmp_path)
+    orphan = tmp_path / "orphan"
+    _convert(source, orphan)
+    (orphan / "manifest.json").unlink(); (orphan / "conversion-journal.json").unlink(); shutil.rmtree(orphan / "meta")
+    unexpected = orphan / "videos" / "chunk-000" / "bad" / "not-a-job.mp4"
+    unexpected.parent.mkdir(parents=True); unexpected.write_bytes(b"bad")
+    with pytest.raises(ValueError, match="missing or extra"):
+        _convert(source, tmp_path / "output", persistent_staging_root=tmp_path / "staging", unbound_staging_data_adoption_root=orphan)
 
 
 def test_conversion_validates_every_episode_camera_video(

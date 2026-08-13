@@ -129,6 +129,10 @@ def test_data_commands_invoke_real_data_adapters(
                 "sha256:" + "c" * 64,
                 "--groot-root",
                 str(tmp_path / "groot"),
+                "--persistent-staging-root",
+                str(tmp_path / "persistent-stage"),
+                "--unbound-staging-data-adoption-root",
+                str(tmp_path / "orphan"),
             ],
         )
         validate_result = CliRunner().invoke(
@@ -168,6 +172,8 @@ def test_data_commands_invoke_real_data_adapters(
         "validate",
         "publish",
     ]
+    assert calls[1][1][2]["persistent_staging_root"] == tmp_path / "persistent-stage"
+    assert calls[1][1][2]["unbound_staging_data_adoption_root"] == tmp_path / "orphan"
 
 
 def test_image_native_retrieve_and_restore_dispatch_checked_transports(

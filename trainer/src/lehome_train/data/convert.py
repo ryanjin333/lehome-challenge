@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 from typing import Any, Iterable, Mapping
 
 import pyarrow as pa
@@ -45,6 +46,217 @@ LEGACY_VIDEO_PATH = (
     "videos/chunk-{episode_chunk:03d}/{video_key}/"
     "episode_{episode_index:06d}.mp4"
 )
+_JOURNAL_NAME = "conversion-journal.json"
+
+
+def _sha256_size(path: Path) -> dict[str, object]:
+    digest = __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+    return {"sha256": digest, "byte_size": path.stat().st_size}
+
+
+def _matches_receipt(path: Path, receipt: object) -> bool:
+    return (
+        isinstance(receipt, Mapping)
+        and not path.is_symlink()
+        and path.is_file()
+        and receipt == _sha256_size(path)
+    )
+
+
+def _expected_episode_table(table: pa.Table, episode_id: int) -> pa.Table:
+    task_index = table.schema.get_field_index("task_index")
+    if task_index < 0:
+        raise ValueError(f"episode {episode_id} has no task_index column")
+    return table.set_column(
+        task_index, "task_index", pa.array([0] * table.num_rows, type=pa.int64())
+    )
+
+
+def _parquet_matches_expected(path: Path, expected: pa.Table) -> bool:
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        actual = pq.read_table(path)
+    except (OSError, pa.ArrowInvalid):
+        return False
+    return actual.schema == expected.schema and actual.equals(expected)
+
+
+def _journal_identity(
+    *, inspection: Mapping[str, Any], mapping: Mapping[str, Any], source_repository: str,
+    source_revision: str, converter_commit: str, converter_container_digest: str,
+    split_seed: int, validation_fraction: float, records: list[dict[str, Any]],
+    camera_keys: list[str], info: Mapping[str, Any], source: Path,
+) -> dict[str, object]:
+    chunks_size = int(info["chunks_size"])
+    jobs: dict[str, object] = {}
+    for record in sorted(records, key=lambda item: int(item["episode_index"])):
+        episode_id = int(record["episode_index"])
+        jobs[_legacy_path(Path("."), LEGACY_DATA_PATH, episode_id=episode_id, chunks_size=chunks_size).as_posix()] = {
+            "kind": "data", "episode_id": episode_id,
+            "source_range": [int(record["dataset_from_index"]), int(record["dataset_to_index"])],
+        }
+        for camera_key in camera_keys:
+            relative_source = format_v3_path(source, str(info["video_path"]), chunk_index=int(record[f"videos/{camera_key}/chunk_index"]), file_index=int(record[f"videos/{camera_key}/file_index"]), video_key=camera_key).relative_to(source).as_posix()
+            relative = _legacy_path(Path("."), LEGACY_VIDEO_PATH, episode_id=episode_id, chunks_size=chunks_size, video_key=camera_key).as_posix()
+            jobs[relative] = {"kind": "video", "episode_id": episode_id, "camera_key": camera_key, "source_path": relative_source, "start": float(record[f"videos/{camera_key}/from_timestamp"]), "frame_count": int(record["dataset_to_index"]) - int(record["dataset_from_index"]), "fps": float(info["fps"])}
+    return {
+        "schema_version": 1, "kind": "lerobot_v3_conversion_journal",
+        "source_repository": source_repository, "source_revision": source_revision,
+        "source_manifest_sha256": inspection["source_manifest_sha256"],
+        "source_artifacts": inspection["source_artifacts"],
+        "mapping_sha256": canonical_json_sha256(mapping), "converter_commit": converter_commit,
+        "converter_container_digest": converter_container_digest,
+        "pinned_groot_revision": ISAAC_GROOT_REVISION, "split_seed": split_seed,
+        "validation_fraction": validation_fraction, "jobs": dict(sorted(jobs.items())),
+    }
+
+
+def _load_or_create_journal(staging: Path, identity: Mapping[str, object]) -> tuple[dict[str, object], threading.Lock]:
+    journal_path = staging / _JOURNAL_NAME
+    if journal_path.exists():
+        if journal_path.is_symlink() or not journal_path.is_file():
+            raise ValueError("persistent conversion journal is unsafe")
+        current = read_json_object(journal_path)
+        receipts = current.pop("receipts", None)
+        if current != identity or not isinstance(receipts, Mapping):
+            raise ValueError("persistent conversion journal identity is incompatible")
+        journal = dict(identity) | {"receipts": dict(receipts)}
+    else:
+        if any(staging.iterdir()):
+            raise ValueError("persistent staging root must be empty before its first journal")
+        journal = dict(identity) | {"receipts": {}}
+        atomic_write_json(journal_path, journal)
+    return journal, threading.Lock()
+
+
+def _validate_staging_tree(staging: Path, journal: Mapping[str, object]) -> None:
+    jobs = journal.get("jobs")
+    receipts = journal.get("receipts")
+    if not isinstance(jobs, Mapping) or not isinstance(receipts, Mapping):
+        raise ValueError("persistent conversion journal is malformed")
+    allowed = set(jobs) | {_JOURNAL_NAME} | {
+        "meta/info.json", "meta/episodes.jsonl", "meta/episodes_stats.jsonl",
+        "meta/tasks.jsonl", "meta/modality.json", "meta/lehome_mapping.json",
+        "manifest.json",
+    }
+    for path in staging.rglob("*"):
+        if path.is_symlink() or (path.exists() and not path.is_dir() and not path.is_file()):
+            raise ValueError("persistent staging contains unsafe entry")
+        if path.is_file() and path.relative_to(staging).as_posix() not in allowed:
+            raise ValueError("persistent staging contains unexpected file")
+    if not set(receipts).issubset(set(jobs)):
+        raise ValueError("persistent conversion journal has unexpected receipts")
+
+
+def _record_receipt(staging: Path, journal: dict[str, object], lock: threading.Lock, relative: str) -> None:
+    with lock:
+        receipts = journal["receipts"]
+        assert isinstance(receipts, dict)
+        receipts[relative] = _sha256_size(staging / relative)
+        atomic_write_json(staging / _JOURNAL_NAME, journal)
+
+
+def _claim_and_adopt_orphan_data(
+    *, orphan: Path, staging: Path, info: Mapping[str, Any], records: list[dict[str, Any]],
+    tables: Mapping[int, pa.Table], camera_keys: list[str], journal: dict[str, object], lock: threading.Lock,
+) -> None:
+    """Claim once, then copy only exact source-semantic Parquets (never video)."""
+    claimed = orphan.with_name(orphan.name + ".conversion-quarantine")
+    if orphan.exists():
+        if orphan.is_symlink() or not orphan.is_dir():
+            raise ValueError("unbound staging adoption root is unsafe")
+        if claimed.exists():
+            raise ValueError("unbound staging quarantine already exists")
+        orphan.replace(claimed)
+    if claimed.is_symlink() or not claimed.is_dir():
+        raise ValueError("unbound staging quarantine is unavailable")
+    expected: dict[str, pa.Table] = {}
+    chunks = int(info["chunks_size"])
+    for record in records:
+        episode = int(record["episode_index"])
+        relative = _legacy_path(Path("."), LEGACY_DATA_PATH, episode_id=episode, chunks_size=chunks).as_posix()
+        expected[relative] = _expected_episode_table(tables[episode], episode)
+    actual: set[str] = set()
+    expected_videos: set[str] = set()
+    for record in records:
+        episode = int(record["episode_index"])
+        for camera in camera_keys:
+            expected_videos.add(_legacy_path(Path("."), LEGACY_VIDEO_PATH, episode_id=episode, chunks_size=chunks, video_key=camera).as_posix())
+    for path in claimed.rglob("*"):
+        if path.is_symlink() or (path.exists() and not path.is_dir() and not path.is_file()):
+            raise ValueError("unbound staging quarantine contains unsafe entry")
+        if path.is_file():
+            relative = path.relative_to(claimed).as_posix()
+            if relative.startswith("meta/"):
+                raise ValueError("unbound staging quarantine metadata is not adoptable")
+            if relative.startswith("data/"):
+                actual.add(relative)
+            elif relative.startswith("videos/"):
+                if relative not in expected_videos:
+                    raise ValueError("unbound staging quarantine has missing or extra video jobs")
+            else:
+                raise ValueError("unbound staging quarantine has unexpected path")
+    if actual != set(expected):
+        raise ValueError("unbound staging quarantine has missing or extra episode Parquets")
+    for relative, table in expected.items():
+        source = claimed / relative
+        if not _parquet_matches_expected(source, table):
+            raise ValueError("unbound staging episode Parquet is not source-semantically exact")
+        destination = staging / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        if not _parquet_matches_expected(destination, table):
+            raise ValueError("adopted episode Parquet failed destination semantic verification")
+        _record_receipt(staging, journal, lock, relative)
+
+
+def _persistent_destination_manifest(
+    destination: Path,
+    *, inspection: Mapping[str, Any], mapping: Mapping[str, Any],
+    source_repository: str, source_revision: str, converter_commit: str,
+    converter_container_digest: str, split_seed: int, validation_fraction: float,
+) -> dict[str, object]:
+    """Accept a promoted conversion only as a byte-authenticated resume point."""
+    if destination.is_symlink() or not destination.is_dir():
+        raise ValueError("persistent converted destination is unsafe")
+    manifest = read_json_object(destination / "manifest.json")
+    required = {
+        "source_format": "lerobot_v3_sharded", "output_format": "groot_lerobot_v2.1_per_episode",
+        "source_repository": source_repository, "source_revision": source_revision,
+        "source_manifest_sha256": inspection["source_manifest_sha256"],
+        "source_artifacts": inspection["source_artifacts"],
+        "mapping_sha256": canonical_json_sha256(mapping), "converter_commit": converter_commit,
+        "converter_container_digest": converter_container_digest,
+        "pinned_groot_revision": ISAAC_GROOT_REVISION, "split_seed": split_seed,
+        "validation_fraction": validation_fraction,
+    }
+    if any(manifest.get(key) != value for key, value in required.items()):
+        raise ValueError("persistent converted destination provenance is incompatible")
+    artifacts = manifest.get("output_artifacts")
+    if not isinstance(artifacts, list) or manifest.get("output_manifest_sha256") != canonical_json_sha256(artifacts):
+        raise ValueError("persistent converted destination artifact manifest is invalid")
+    actual = artifact_identities(destination, exclude={"manifest.json"})
+    # Statistics runs after atomic conversion promotion.  It records its three
+    # generated files in the manifest, so allow only those exact dynamic paths.
+    statistics = manifest.get("statistics")
+    dynamic: dict[str, str] = {}
+    if isinstance(statistics, Mapping) and statistics.get("status") == "computed_task_4_train_only":
+        files = statistics.get("files")
+        if not isinstance(files, list):
+            raise ValueError("persistent converted destination statistics are invalid")
+        for item in files:
+            if not isinstance(item, Mapping) or not isinstance(item.get("relative_path"), str) or not isinstance(item.get("sha256"), str):
+                raise ValueError("persistent converted destination statistics are invalid")
+            dynamic[item["relative_path"]] = item["sha256"]
+    observed = {item["relative_path"]: item for item in actual}
+    if any(path not in observed or observed[path]["sha256"] != digest for path, digest in dynamic.items()):
+        raise ValueError("persistent converted destination statistics changed")
+    actual_base = {path: item for path, item in observed.items() if path not in dynamic}
+    listed = {item.get("relative_path"): item for item in artifacts if isinstance(item, Mapping)}
+    if listed != actual_base:
+        raise ValueError("persistent converted destination artifact tree changed")
+    return manifest
 
 
 def _write_json_lines(path: Path, values: Iterable[Mapping[str, object]]) -> None:
@@ -152,27 +364,28 @@ def _write_episode_data(
     info: Mapping[str, Any],
     records: list[dict[str, Any]],
     tables: Mapping[int, pa.Table],
+    *,
+    journal: dict[str, object] | None = None,
+    journal_lock: threading.Lock | None = None,
 ) -> None:
     chunks_size = int(info["chunks_size"])
     for record in sorted(records, key=lambda item: int(item["episode_index"])):
         episode_id = int(record["episode_index"])
-        table = tables[episode_id]
-        task_index = table.schema.get_field_index("task_index")
-        if task_index < 0:
-            raise ValueError(f"episode {episode_id} has no task_index column")
-        table = table.set_column(
-            task_index,
-            "task_index",
-            pa.array([0] * table.num_rows, type=pa.int64()),
-        )
+        table = _expected_episode_table(tables[episode_id], episode_id)
         destination = _legacy_path(
             output,
             LEGACY_DATA_PATH,
             episode_id=episode_id,
             chunks_size=chunks_size,
         )
+        relative = destination.relative_to(output).as_posix()
+        receipt = None if journal is None else journal["receipts"].get(relative)  # type: ignore[index]
+        if _matches_receipt(destination, receipt) and _parquet_matches_expected(destination, table):
+            continue
         destination.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(table, destination, compression="zstd")
+        if journal is not None and journal_lock is not None:
+            _record_receipt(output, journal, journal_lock, relative)
 
 
 def _extract_video_segment(
@@ -311,6 +524,9 @@ def _write_episode_videos(
     info: Mapping[str, Any],
     records: list[dict[str, Any]],
     camera_keys: list[str],
+    *,
+    journal: dict[str, object] | None = None,
+    journal_lock: threading.Lock | None = None,
 ) -> None:
     source_pattern = info["video_path"]
     if not isinstance(source_pattern, str):
@@ -348,6 +564,14 @@ def _write_episode_videos(
 
     def run(job: tuple[Path, Path, float, int, float]) -> None:
         source_video, destination, start, frame_count, expected_fps = job
+        relative = destination.relative_to(output).as_posix()
+        receipt = None if journal is None else journal["receipts"].get(relative)  # type: ignore[index]
+        if _matches_receipt(destination, receipt):
+            try:
+                _validate_output_video(destination, expected_frame_count=frame_count, expected_fps=expected_fps)
+                return
+            except RuntimeError:
+                pass
         _extract_video_segment(
             source_video,
             destination,
@@ -355,6 +579,8 @@ def _write_episode_videos(
             expected_frame_count=frame_count,
             expected_fps=expected_fps,
         )
+        if journal is not None and journal_lock is not None:
+            _record_receipt(output, journal, journal_lock, relative)
 
     with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as executor:
         tuple(executor.map(run, jobs))
@@ -439,6 +665,8 @@ def convert_dataset(
     converter_container_digest: str,
     split_seed: int = 42,
     validation_fraction: float = 0.1,
+    persistent_staging_root: str | Path | None = None,
+    unbound_staging_data_adoption_root: str | Path | None = None,
 ) -> dict[str, object]:
     """Validate and convert a complete local v3 snapshot without remote writes."""
 
@@ -453,16 +681,24 @@ def convert_dataset(
     destination = Path(destination_path)
     if destination.resolve().is_relative_to(source.resolve()):
         raise ValueError("conversion destination must not be inside the source dataset")
-    if destination.exists():
-        raise FileExistsError(
-            f"refusing to overwrite existing conversion destination: {destination}"
-        )
     inspection = inspect_dataset(source)
     if not inspection["valid"]:
         errors = inspection["validation_errors"]
         raise ValueError(f"source schema validation failed: {errors[0]}")
     if inspection["proposed_mapping"] != mapping:
         raise ValueError("checked mapping does not match observed source schema")
+    if destination.exists():
+        if persistent_staging_root is None:
+            raise FileExistsError(
+                f"refusing to overwrite existing conversion destination: {destination}"
+            )
+        return _persistent_destination_manifest(
+            destination, inspection=inspection, mapping=mapping,
+            source_repository=source_repository, source_revision=source_revision,
+            converter_commit=converter_commit,
+            converter_container_digest=converter_container_digest, split_seed=split_seed,
+            validation_fraction=validation_fraction,
+        )
 
     split = split_episode_ids(
         inspection["episode_ids"],
@@ -474,16 +710,44 @@ def convert_dataset(
     camera_keys = [camera["source_key"] for camera in mapping["cameras"]]
     episode_tables = _load_episode_tables(source, info, records)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(
-        tempfile.mkdtemp(
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-            dir=destination.parent,
+    persistent = persistent_staging_root is not None
+    if persistent:
+        temporary = Path(persistent_staging_root)  # type: ignore[arg-type]
+        if temporary.is_symlink():
+            raise ValueError("persistent staging root must not be a symlink")
+        if temporary.exists() and not temporary.is_dir():
+            raise ValueError("persistent staging root must be a directory")
+        temporary.mkdir(parents=True, exist_ok=True)
+    else:
+        temporary = Path(
+            tempfile.mkdtemp(
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                dir=destination.parent,
+            )
         )
+    journal, journal_lock = _load_or_create_journal(
+        temporary,
+        _journal_identity(
+            inspection=inspection, mapping=mapping, source_repository=source_repository,
+            source_revision=source_revision, converter_commit=converter_commit,
+            converter_container_digest=converter_container_digest, split_seed=split_seed,
+            validation_fraction=validation_fraction, records=records, camera_keys=camera_keys,
+            info=info, source=source,
+        ),
     )
+    _validate_staging_tree(temporary, journal)
     try:
-        _write_episode_data(temporary, info, records, episode_tables)
-        _write_episode_videos(source, temporary, info, records, camera_keys)
+        adopted_episode_data = False
+        if unbound_staging_data_adoption_root is not None:
+            _claim_and_adopt_orphan_data(
+                orphan=Path(unbound_staging_data_adoption_root), staging=temporary,
+                info=info, records=records, tables=episode_tables, camera_keys=camera_keys, journal=journal,
+                lock=journal_lock,
+            )
+            adopted_episode_data = True
+        _write_episode_data(temporary, info, records, episode_tables, journal=journal, journal_lock=journal_lock)
+        _write_episode_videos(source, temporary, info, records, camera_keys, journal=journal, journal_lock=journal_lock)
         (temporary / "meta").mkdir(parents=True, exist_ok=True)
         atomic_write_json(
             temporary / "meta" / "info.json",
@@ -531,6 +795,8 @@ def convert_dataset(
             "source_revision": source_revision,
             "source_manifest_sha256": inspection["source_manifest_sha256"],
             "source_artifacts": inspection["source_artifacts"],
+            "conversion_journal_sha256": _sha256_size(temporary / _JOURNAL_NAME)["sha256"],
+            "adopted_episode_data": adopted_episode_data,
             "output_artifacts": output_artifacts,
             "output_manifest_sha256": canonical_json_sha256(output_artifacts),
             "mapping_sha256": canonical_json_sha256(mapping),
@@ -576,5 +842,6 @@ def convert_dataset(
         os.replace(temporary, destination)
         return manifest
     except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
+        if not persistent:
+            shutil.rmtree(temporary, ignore_errors=True)
         raise
