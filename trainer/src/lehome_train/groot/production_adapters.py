@@ -669,6 +669,8 @@ def _tar_checkpoint(
     destination: Path,
     run_root: Path,
     arcname: str,
+    *,
+    source_archive_relative: Path | None = None,
 ) -> None:
     if not source.is_dir() or source.is_symlink():
         raise ValueError("GR00T checkpoint source is unavailable")
@@ -683,7 +685,15 @@ def _tar_checkpoint(
             for path in archive_paths:
                 if path.is_symlink() or (not path.is_dir() and not path.is_file()):
                     raise ValueError("GR00T checkpoint contains an unsupported path")
-                relative = Path(arcname) / path.relative_to(run_root)
+                if path == source or source in path.parents:
+                    source_relative = (
+                        source.relative_to(run_root)
+                        if source_archive_relative is None
+                        else source_archive_relative
+                    )
+                    relative = Path(arcname) / source_relative / path.relative_to(source)
+                else:
+                    relative = Path(arcname) / path.relative_to(run_root)
                 info = archive.gettarinfo(str(path), arcname=relative.as_posix())
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""
@@ -911,6 +921,50 @@ class GrootTrainingSession:
             Path(self.config.output_dir) / "checkpoints" / f"step-{optimizer_step}.json",
             descriptor,
         )
+        return descriptor
+
+    def package_checkpoint_snapshot(
+        self,
+        snapshot_root: Path,
+        *,
+        optimizer_step: int,
+        sample_presentations: int,
+        schedule_sha256: str,
+    ) -> CheckpointDescriptor:
+        """Package a completion-verified immutable snapshot, never live output."""
+        if snapshot_root.is_symlink() or not snapshot_root.is_dir():
+            raise ValueError("checkpoint snapshot is unavailable")
+        # The observer has already validated the source.  Revalidate its copied
+        # trainer state before producing a resumable archive.
+        _verified_checkpoint_state_at(snapshot_root, optimizer_step, num_gpus=self.config.num_gpus)
+        # ``_tar_checkpoint`` only needs the run identity; snapshot naming is
+        # preserved in the archive by temporarily substituting its source path.
+        relative = f"checkpoints/step-{optimizer_step}.tar"
+        artifact_path = Path(self.config.output_dir) / relative
+        _tar_checkpoint(
+            snapshot_root,
+            artifact_path,
+            _run_root(self.config),
+            self.config.experiment_name,
+            source_archive_relative=Path(f"checkpoint-{optimizer_step}"),
+        )
+        descriptor = CheckpointDescriptor(
+            record=CheckpointRecord(
+                experiment_id=self.config.experiment_name,
+                optimizer_step=optimizer_step,
+                sample_presentations=sample_presentations,
+                experiment_config_sha256=canonical_json_sha256(self.experiment_config),
+                dataset_manifest_sha256=self.experiment_config.dataset_manifest_sha256,
+                schedule_sha256=schedule_sha256,
+                artifact=ArtifactIdentity(relative, sha256_file(artifact_path), artifact_path.stat().st_size),
+                resumable=True,
+                remotely_verified=False,
+            ),
+            normalization_sha256=self.normalization_sha256,
+            schedule_sha256=schedule_sha256,
+            locally_verified=True,
+        )
+        write_checkpoint_descriptor(Path(self.config.output_dir) / "checkpoints" / f"step-{optimizer_step}.json", descriptor)
         return descriptor
 
     def disk_free_bytes(self) -> int:
