@@ -41,6 +41,7 @@ def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: 
         if command[:4] == ("vastai", "--raw", "show", "volumes"): return "[]"
         if command[:4] == ("vastai", "--raw", "create", "instance"): return '{"new_contract":9}'
         if command[:4] == ("vastai", "--raw", "show", "instance"): return '{"id":9,"gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"ssh_host":"host","ssh_port":22,"driver_version":"595.71.05"}'
+        if command[0] == "lehome-hub-readback": return '{"tree_verified":true}'
         if command[:3] == ("vastai", "destroy", "instance"): return ""
         raise AssertionError(command)
     monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
@@ -51,7 +52,7 @@ def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: 
     instance = LIFECYCLE.rent(evidence=evidence, runner=runner)
     assert instance["instance_id"] == 9
     with pytest.raises(ValueError, match="destroy absence"):
-        LIFECYCLE.destroy(instance_id=9, training_receipt={"kind": "continuous_corrective_training_terminal", "instance_id": 9, "immutable_checkpoint_steps": [1000, 2000], "immutable_checkpoint_publications": [{"optimizer_step": 1000, "immutable_revision": "a" * 40, "readback_verified": True}, {"optimizer_step": 2000, "immutable_revision": "b" * 40, "readback_verified": True}]}, runner=runner)
+        LIFECYCLE.destroy(instance_id=9, training_receipt={"kind": "continuous_corrective_training_terminal", "instance_id": 9, "immutable_checkpoint_steps": [1000, 2000], "immutable_checkpoint_publications": [{"optimizer_step": 1000, "immutable_revision": "a" * 40, "artifact_sha256": "c" * 64, "readback_verified": True}, {"optimizer_step": 2000, "immutable_revision": "b" * 40, "artifact_sha256": "d" * 64, "readback_verified": True}]}, runner=runner)
 
 
 def test_rent_requires_capability_receipt_for_exact_image(monkeypatch: pytest.MonkeyPatch) -> None:

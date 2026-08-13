@@ -170,7 +170,13 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
     elif action in {"tune", "train", "status", "resume"}:
         if action == "resume" and request.get("generation_sha256") != request.get("resume_generation_sha256") or action == "resume" and request.get("config_sha256") != request.get("resume_config_sha256"):
             raise ValueError("resume requires exact generation/config identity")
-        command = "set -eu; lehome-train " + ("continuous-train" if action in {"train", "resume"} else action) + " --request /tmp/lehome-stage/continuous.json"
+        commands = {
+            "tune": "lehome-train smoke --request /tmp/lehome-stage/tune.json",
+            "train": "lehome-train continuous-train --request /tmp/lehome-stage/continuous.json",
+            "resume": "lehome-train continuous-train --request /tmp/lehome-stage/resume.json",
+            "status": "test -f /tmp/lehome-stage/terminal.json && cat /tmp/lehome-stage/terminal.json",
+        }
+        command = "set -eu; " + commands[action]
     else:
         raise ValueError("unsupported remote lifecycle action")
     runner((*_ssh_prefix(instance), command))
@@ -182,6 +188,14 @@ def destroy(*, instance_id: int, training_receipt: Mapping[str, object], runner:
     if training_receipt.get("kind") != "continuous_corrective_training_terminal" or training_receipt.get("instance_id") != instance_id or training_receipt.get("immutable_checkpoint_steps") != [1000, 2000] or not isinstance(publications, list) or {item.get("optimizer_step") for item in publications if isinstance(item, Mapping)} != {1000, 2000} or not all(isinstance(item, Mapping) and item.get("readback_verified") is True and isinstance(item.get("immutable_revision"), str) for item in publications):
         raise ValueError("instance-bound disposal requires two immutable checkpoints")
     if runner is not None:
+        for item in publications:
+            assert isinstance(item, Mapping)
+            revision, artifact = item.get("immutable_revision"), item.get("artifact_sha256")
+            if not isinstance(revision, str) or len(revision) != 40 or not isinstance(artifact, str) or len(artifact) != 64:
+                raise ValueError("immutable publication identity is invalid")
+            tree = _json(runner, ("lehome-hub-readback", revision, artifact))
+            if not isinstance(tree, Mapping) or tree.get("tree_verified") is not True:
+                raise ValueError("immutable HF tree readback failed")
         runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
         observed = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
         if observed not in ({}, None): raise ValueError("destroy absence readback failed")
