@@ -241,9 +241,53 @@ def destroy(*, instance_id: int, training_receipt: Mapping[str, object], runner:
     return {"paid_action": runner is not None, "destroy_authorized": True, "instance_id": instance_id}
 
 
+def _materialize(request: Mapping[str, object]) -> dict[str, object]:
+    """Build the only accepted 70/30 generation through the canonical mixer."""
+    organizer, corrective, destination, seed = (
+        request.get("organizer_root"),
+        request.get("corrective_roots"),
+        request.get("destination"),
+        request.get("seed"),
+    )
+    if (
+        not isinstance(organizer, str)
+        or not isinstance(corrective, list)
+        or not corrective
+        or not all(isinstance(item, str) and item for item in corrective)
+        or not isinstance(destination, str)
+        or type(seed) is not int
+    ):
+        raise ValueError("materialize requires organizer, corrective roots, destination, and integer seed")
+    from lehome_train.flywheel.mix import (
+        build_mix_plan,
+        materialize_mixed_snapshot,
+        verify_generation,
+    )
+
+    organizer_root = Path(organizer)
+    corrective_roots = [Path(item) for item in corrective]
+    destination_root = Path(destination)
+    if destination_root.exists() or destination_root.is_symlink():
+        raise ValueError("materialize destination must not already exist")
+    plan = build_mix_plan(organizer_root, corrective_roots, seed=seed)
+    materialize_mixed_snapshot(plan, organizer_root, corrective_roots, destination_root)
+    sealed = verify_generation(destination_root)
+    if sealed["organizer_training_frames"] * 3 != sealed["rft_training_frames"] * 7:
+        raise ValueError("materialized generation is not exact 70/30")
+    return {
+        "paid_action": False,
+        "action": "materialize",
+        "generation_root": str(destination_root),
+        "generation_receipt": str(destination_root.with_name(destination_root.name + ".generation.json")),
+        "generation_sha256": _hash(sealed),
+    }
+
+
 def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object]:
-    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("prepare", "capture-offers", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true")
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("materialize", "prepare", "capture-offers", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv); request = _load(args.request)
+    if args.action == "materialize":
+        return _materialize(request)
     if args.action == "prepare":
         generation = request.get("generation_root")
         if not isinstance(generation, str): raise ValueError("prepare requires generation_root")

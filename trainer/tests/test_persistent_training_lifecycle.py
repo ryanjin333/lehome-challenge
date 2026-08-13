@@ -78,3 +78,28 @@ def test_status_parses_authenticated_terminal() -> None:
     terminal = {"kind": "continuous_corrective_training_terminal", "instance_id": 7}
     result = LIFECYCLE.remote_action(action="status", instance=instance, request={}, runner=lambda _command: json.dumps(terminal))
     assert result["terminal"] == terminal
+
+
+def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None:
+    # The lifecycle's free preparation action must exercise the same canonical
+    # mix/materialization implementation as production, rather than accepting
+    # a hand-written receipt.
+    from test_flywheel_mix import _prepared_source
+
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
+    corrective_a = _prepared_source(tmp_path / "corrective-a", kind="flywheel", grade="A", episodes=1)
+    corrective_b = _prepared_source(tmp_path / "corrective-b", kind="flywheel", grade="B", episodes=1)
+    destination = tmp_path / "generation"
+    request = tmp_path / "materialize.json"
+    request.write_text(json.dumps({
+        "organizer_root": str(organizer),
+        "corrective_roots": [str(corrective_a), str(corrective_b)],
+        "destination": str(destination),
+        "seed": 20260812,
+    }))
+
+    report = LIFECYCLE.main_for_test(["materialize", "--request", str(request)])
+
+    assert report["paid_action"] is False
+    assert report["generation_root"] == str(destination)
+    assert (destination.with_name(destination.name + ".generation.json")).is_file()
