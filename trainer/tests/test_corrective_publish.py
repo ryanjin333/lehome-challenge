@@ -205,12 +205,17 @@ def _publication_input(tmp_path: Path):
     selected = select_corrective_successes(attempts)
     (snapshot / "manifest.json").write_bytes(canonical_json_bytes({
         "schema_version": 1, "source_format": "verified_flywheel_rft_release",
+        "episode_count": 150,
         "future_actions": {"horizon": 16},
         "corrective_campaign": {"campaign_receipt_sha256": selection.campaign_receipt["receipt_sha256"]},
     }))
     (snapshot / "meta" / "rft-selection.json").write_bytes(canonical_json_bytes({
         "schema_version": 1,
         "action_horizon": 16,
+        "episodes": [
+            {"raw_episode_id": item.episode_id, "raw_manifest_sha256": item.episode_manifest_sha256}
+            for item in selection.bindings
+        ],
         "corrective_campaign": {
             "campaign_receipt_sha256": selection.campaign_receipt["receipt_sha256"],
             "selected_bindings": [
@@ -243,6 +248,28 @@ def test_corrective_snapshot_requires_matching_16_step_horizons(
     (snapshot / path).write_bytes(canonical_json_bytes(current))
 
     with pytest.raises(ValueError, match="action horizon must be exactly 16"):
+        publish_module._require_snapshot(publication, snapshot)
+
+
+@pytest.mark.parametrize("mutation", ["manifest_count", "episodes_missing", "episode_identity"])
+def test_corrective_snapshot_requires_exact_selected_payload(
+    tmp_path: Path, mutation: str
+) -> None:
+    publication, snapshot = _publication_input(tmp_path)
+    if mutation == "manifest_count":
+        path = snapshot / "manifest.json"
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["episode_count"] = 149
+    else:
+        path = snapshot / "meta" / "rft-selection.json"
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if mutation == "episodes_missing":
+            value["episodes"].pop()
+        else:
+            value["episodes"][0]["raw_episode_id"] = "forged"
+    path.write_bytes(canonical_json_bytes(value))
+
+    with pytest.raises(ValueError, match="exact selected episode payload"):
         publish_module._require_snapshot(publication, snapshot)
 
 

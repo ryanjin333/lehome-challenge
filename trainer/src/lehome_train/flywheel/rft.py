@@ -135,7 +135,7 @@ def materialize_verified_corrective_rft_snapshot(
         validation_fraction=validation_fraction,
         corrective_campaign=corrective_metadata,
     )
-    if result.get("episode_count") != TARGET_UNIQUE_SUCCESSES:
+    if result.get("accepted_seen_successes") != TARGET_UNIQUE_SUCCESSES:
         raise ValueError("corrective materialization did not produce exactly 150 episodes")
     return {**result, "corrective_campaign": corrective_metadata}
 

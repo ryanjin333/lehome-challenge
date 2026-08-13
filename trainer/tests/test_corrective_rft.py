@@ -493,7 +493,7 @@ def test_verified_corrective_materialization_hands_exact_bindings_to_pre_hash_sn
         "materialize_rft_snapshot",
         lambda roots, destination, **kwargs: received.update(
             {"roots": tuple(roots), "destination": destination, **kwargs}
-        ) or {"path": str(destination), "episode_count": 150},
+        ) or {"path": str(destination), "accepted_seen_successes": 150},
     )
 
     result = materialize_verified_corrective_rft_snapshot(
@@ -545,7 +545,7 @@ def test_verified_corrective_materialization_rejects_a_final_snapshot_with_not_1
         rft, "_verify_raw",
         lambda root: {"episode_id": episode_by_root[str(root)], "identity": {"release_stage": "seen"}},
     )
-    monkeypatch.setattr(rft, "materialize_rft_snapshot", lambda *args, **kwargs: {"episode_count": 149})
+    monkeypatch.setattr(rft, "materialize_rft_snapshot", lambda *args, **kwargs: {"accepted_seen_successes": 149})
 
     with pytest.raises(ValueError, match="exactly 150 episodes"):
         materialize_verified_corrective_rft_snapshot(
