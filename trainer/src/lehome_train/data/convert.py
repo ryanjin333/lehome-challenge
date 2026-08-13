@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import json
 import math
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -61,30 +63,55 @@ def _same_or_nested(left: Path, right: Path) -> bool:
     return left_resolved == right_resolved or left_resolved in right_resolved.parents or right_resolved in left_resolved.parents
 
 
-def _persistent_lock(staging: Path) -> tuple[Path, tuple[int, int]]:
-    lock = staging.parent / f".{staging.name}.conversion.lock"
+def _exclusive_sibling_lock(
+    root: Path, *, suffix: str, ownership: str,
+) -> tuple[Path, tuple[int, int, bytes]]:
+    """Claim one conversion resource with an inode- and token-bound lock."""
+    root.parent.mkdir(parents=True, exist_ok=True)
+    lock = root.parent / f".{root.name}.{suffix}.lock"
     if lock.is_symlink():
-        raise ValueError("persistent conversion lock is unsafe")
+        raise ValueError(f"persistent conversion {ownership} lock is unsafe")
     try:
         descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        raise ValueError("persistent conversion staging is already owned") from None
+        raise ValueError(f"persistent conversion {ownership} is already owned") from None
     token = uuid.uuid4().hex.encode()
     try:
         os.write(descriptor, token)
         identity = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-    return lock, (identity.st_dev, identity.st_ino)
+    return lock, (identity.st_dev, identity.st_ino, token)
 
 
-def _release_persistent_lock(lock: Path, identity: tuple[int, int]) -> None:
+def _persistent_lock(staging: Path) -> tuple[Path, tuple[int, int, bytes]]:
+    return _exclusive_sibling_lock(staging, suffix="conversion", ownership="staging")
+
+
+def _release_persistent_lock(lock: Path, identity: tuple[int, int, bytes]) -> None:
     try:
         current = lock.stat()
-        if (current.st_dev, current.st_ino) == identity and lock.is_file() and not lock.is_symlink():
+        if (
+            (current.st_dev, current.st_ino) == identity[:2]
+            and lock.is_file()
+            and not lock.is_symlink()
+            and lock.read_bytes() == identity[2]
+        ):
             lock.unlink()
     except FileNotFoundError:
         pass
+
+
+@contextmanager
+def persistent_destination_operation_lock(destination: str | Path) -> Iterable[None]:
+    """Serialize persistent CLI conversion and statistics recovery for one output."""
+    lock, identity = _exclusive_sibling_lock(
+        Path(destination), suffix="data-convert-operation", ownership="destination",
+    )
+    try:
+        yield
+    finally:
+        _release_persistent_lock(lock, identity)
 
 
 def _sha256_size(path: Path) -> dict[str, object]:
@@ -276,6 +303,7 @@ def _persistent_destination_manifest(
     """Accept a promoted conversion only as a byte-authenticated resume point."""
     if destination.is_symlink() or not destination.is_dir():
         raise ValueError("persistent converted destination is unsafe")
+    _validate_destination_tree_nodes(destination)
     manifest = read_json_object(destination / "manifest.json")
     split = split_episode_ids(
         tuple(str(item) for item in inspection["episode_ids"]),
@@ -356,6 +384,18 @@ def _persistent_destination_manifest(
     if listed != actual_base:
         raise ValueError("persistent converted destination artifact tree changed")
     return manifest
+
+
+def _validate_destination_tree_nodes(destination: Path) -> None:
+    """Reject nodes that artifact hashing intentionally does not traverse."""
+    for path in destination.rglob("*"):
+        try:
+            mode = path.lstat().st_mode
+        except OSError as error:
+            raise ValueError("persistent converted destination is unsafe") from error
+        if stat.S_ISDIR(mode) or stat.S_ISREG(mode):
+            continue
+        raise ValueError("persistent converted destination contains unsafe entry")
 
 
 def _write_json_lines(path: Path, values: Iterable[Mapping[str, object]]) -> None:
@@ -811,7 +851,7 @@ def convert_dataset(
     destination.parent.mkdir(parents=True, exist_ok=True)
     persistent = persistent_staging_root is not None
     lock_path: Path | None = None
-    lock_identity: tuple[int, int] | None = None
+    lock_identity: tuple[int, int, bytes] | None = None
     if persistent:
         temporary = Path(persistent_staging_root)  # type: ignore[arg-type]
         adoption = None if unbound_staging_data_adoption_root is None else Path(unbound_staging_data_adoption_root)

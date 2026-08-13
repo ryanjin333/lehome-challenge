@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -71,7 +73,8 @@ def test_data_commands_invoke_real_data_adapters(
             convert_dataset=lambda source, output, **kwargs: calls.append(
                 ("convert", (source, output, kwargs))
             )
-            or {"converted": True}
+            or {"converted": True},
+            persistent_destination_operation_lock=lambda _output: nullcontext(),
         ),
         "lehome_train.data.stats": SimpleNamespace(
             write_train_statistics=lambda dataset, *, groot_root=None: calls.append(
@@ -174,6 +177,101 @@ def test_data_commands_invoke_real_data_adapters(
     ]
     assert calls[1][1][2]["persistent_staging_root"] == tmp_path / "persistent-stage"
     assert calls[1][1][2]["unbound_staging_data_adoption_root"] == tmp_path / "orphan"
+
+
+def test_persistent_data_convert_holds_destination_operation_lock_through_statistics(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    output = tmp_path / "prepared"
+
+    @contextmanager
+    def operation_lock(destination: Path):
+        lock = destination.parent / f".{destination.name}.data-convert-operation.lock"
+        try:
+            descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            raise ValueError("persistent conversion destination is already owned") from None
+        os.close(descriptor)
+        calls.append("locked")
+        try:
+            yield
+        finally:
+            lock.unlink(missing_ok=True)
+            calls.append("released")
+
+    fail_statistics = False
+
+    def write_statistics(*_args, **_kwargs):
+        calls.append("stats")
+        if fail_statistics:
+            raise RuntimeError("statistics failed")
+        return {"statistics": True}
+
+    injected = {
+        "lehome_train.data.convert": SimpleNamespace(
+            convert_dataset=lambda *_args, **_kwargs: calls.append("convert") or {"converted": True},
+            persistent_destination_operation_lock=operation_lock,
+        ),
+        "lehome_train.data.stats": SimpleNamespace(
+            write_train_statistics=write_statistics
+        ),
+    }
+    previous = {name: sys.modules.get(name) for name in injected}
+    sys.modules.update(injected)
+    try:
+        with operation_lock(output):
+            second = CliRunner().invoke(
+                app,
+                [
+                    "data", "convert", "--source", str(tmp_path), "--output", str(output),
+                    "--mapping", str(tmp_path / "mapping.json"), "--source-repository", "owner/source",
+                    "--source-revision", "a" * 40, "--converter-commit", "b" * 40,
+                    "--container-digest", "sha256:" + "c" * 64, "--groot-root", str(tmp_path / "groot"),
+                    "--persistent-staging-root", str(tmp_path / "stage"),
+                ],
+            )
+        assert second.exit_code == 1
+        assert "already owned" in second.output
+        assert calls == ["locked", "released"]
+
+        fail_statistics = True
+        statistics_failure = CliRunner().invoke(
+            app,
+            [
+                "data", "convert", "--source", str(tmp_path), "--output", str(output),
+                "--mapping", str(tmp_path / "mapping.json"), "--source-repository", "owner/source",
+                "--source-revision", "a" * 40, "--converter-commit", "b" * 40,
+                "--container-digest", "sha256:" + "c" * 64, "--groot-root", str(tmp_path / "groot"),
+                "--persistent-staging-root", str(tmp_path / "stage"),
+            ],
+        )
+        assert statistics_failure.exit_code == 1
+        assert "statistics failed" in statistics_failure.output
+        assert not (output.parent / ".prepared.data-convert-operation.lock").exists()
+        fail_statistics = False
+        completed = CliRunner().invoke(
+            app,
+            [
+                "data", "convert", "--source", str(tmp_path), "--output", str(output),
+                "--mapping", str(tmp_path / "mapping.json"), "--source-repository", "owner/source",
+                "--source-revision", "a" * 40, "--converter-commit", "b" * 40,
+                "--container-digest", "sha256:" + "c" * 64, "--groot-root", str(tmp_path / "groot"),
+                "--persistent-staging-root", str(tmp_path / "stage"),
+            ],
+        )
+        assert completed.exit_code == 0
+        assert calls == [
+            "locked", "released",  # competing CLI operation
+            "locked", "convert", "stats", "released",  # stats failure releases
+            "locked", "convert", "stats", "released",  # corrected retry owns anew
+        ]
+    finally:
+        for name, module in previous.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 def test_image_native_retrieve_and_restore_dispatch_checked_transports(

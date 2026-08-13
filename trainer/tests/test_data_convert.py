@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import threading
@@ -335,6 +336,36 @@ def test_persistent_destination_removes_only_partial_statistics_outputs_for_rest
     partial = destination / "meta" / "stats.json"; partial.write_text("{}")
     _convert(source, destination, persistent_staging_root=tmp_path / "staging")
     assert not partial.exists()
+
+
+def test_persistent_destination_rejects_special_nodes_before_artifact_read(
+    tmp_path: Path,
+) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("platform does not support FIFO regression coverage")
+    source = make_source_dataset(tmp_path)
+    destination = tmp_path / "output"
+    _convert(source, destination, persistent_staging_root=tmp_path / "staging")
+    fifo = destination / "meta" / "unexpected.pipe"
+    os.mkfifo(fifo)
+
+    with pytest.raises(ValueError, match="unsafe"):
+        _convert(source, destination, persistent_staging_root=tmp_path / "staging")
+
+
+def test_persistent_destination_operation_lock_is_exclusive_and_released(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "output"
+    lock = destination.parent / ".output.data-convert-operation.lock"
+
+    with converter.persistent_destination_operation_lock(destination):
+        assert lock.is_file()
+        with pytest.raises(ValueError, match="already owned"):
+            with converter.persistent_destination_operation_lock(destination):
+                pass
+
+    assert not lock.exists()
 
 
 def test_persistent_restart_excludes_stale_manifest_from_final_artifacts(

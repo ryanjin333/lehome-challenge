@@ -77,22 +77,31 @@ def data_convert(
     """Convert deterministically and compute pinned train-only statistics."""
 
     def operation() -> object:
-        from lehome_train.data.convert import convert_dataset
+        from lehome_train.data.convert import (
+            convert_dataset,
+            persistent_destination_operation_lock,
+        )
         from lehome_train.data.stats import write_train_statistics
 
-        manifest = convert_dataset(
-            source,
-            output,
-            mapping_path=mapping,
-            source_repository=source_repository,
-            source_revision=source_revision,
-            converter_commit=converter_commit,
-            converter_container_digest=container_digest,
-            persistent_staging_root=persistent_staging_root,
-            unbound_staging_data_adoption_root=unbound_staging_data_adoption_root,
-        )
-        statistics = write_train_statistics(output, groot_root=groot_root)
-        return {"manifest": manifest, "statistics": statistics}
+        def convert_and_write_statistics() -> dict[str, object]:
+            manifest = convert_dataset(
+                source,
+                output,
+                mapping_path=mapping,
+                source_repository=source_repository,
+                source_revision=source_revision,
+                converter_commit=converter_commit,
+                converter_container_digest=container_digest,
+                persistent_staging_root=persistent_staging_root,
+                unbound_staging_data_adoption_root=unbound_staging_data_adoption_root,
+            )
+            statistics = write_train_statistics(output, groot_root=groot_root)
+            return {"manifest": manifest, "statistics": statistics}
+
+        if persistent_staging_root is None:
+            return convert_and_write_statistics()
+        with persistent_destination_operation_lock(output):
+            return convert_and_write_statistics()
 
     _fail_closed(operation)
 
