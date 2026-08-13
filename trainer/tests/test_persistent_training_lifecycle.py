@@ -31,6 +31,30 @@ class FakeHub:
         return revision
 
 
+def _corrective_release_receipt(roots: list[Path], path: Path) -> Path:
+    """Fixture for the independently verified prior full-release readback."""
+    from lehome_train.data.inspect import artifact_identities
+    from lehome_train.io import atomic_write_json, canonical_json_sha256
+    for root in roots:
+        manifest_path = root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["source_revision"] = "a" * 40
+        manifest["source_release_id"] = "b" * 64
+        manifest["output_artifacts"] = artifact_identities(root, exclude={"manifest.json"})
+        manifest["output_manifest_sha256"] = canonical_json_sha256(manifest["output_artifacts"])
+        atomic_write_json(manifest_path, manifest)
+    payload = {
+        "published_release": LIFECYCLE.CORRECTIVE_SOURCE | {"release_id": "b" * 64},
+        "local_snapshot": {
+            "source_revision": "a" * 40,
+            "source_release_id": "b" * 64,
+            "trees": {str(root): LIFECYCLE._tree_readback_sha256(root) for root in roots},
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 def test_dry_run_never_calls_provider(tmp_path: Path) -> None:
     request = tmp_path / "request.json"
     request.write_text('{"generation_sha256":"' + "a" * 64 + '","config_sha256":"' + "b" * 64 + '"}')
@@ -128,6 +152,19 @@ def test_offer_without_storage_breakdown_treats_300gb_total_quote_as_conservativ
     assert evidence["account_hourly_total_usd"] == pytest.approx(0.7)
 
 
+def test_offer_rejects_account_wide_total_above_one_dollar_per_hour() -> None:
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return '[{"id":7,"gpu_name":"RTX PRO 6000 S","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"min_bid":0.5}]'
+        if command[:4] == ("vastai", "--raw", "show", "instances"):
+            return '[{"id":2,"dph_total":0.31}]'
+        if command[:4] == ("vastai", "--raw", "show", "volumes"):
+            return "[]"
+        raise AssertionError(command)
+    with pytest.raises(ValueError, match=r"exceeds \$1/hr"):
+        LIFECYCLE.capture_offers(runner=runner, now_unix=1)
+
+
 def test_rent_requires_capability_receipt_for_exact_image(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
     evidence = {"offer": {"id": 7, "min_bid": .5}, "search_mode": "interruptible", "expires_at_unix": 101, "trainer_image": "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:" + "a" * 64}
@@ -170,6 +207,11 @@ def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_ident
             "config_sha256": "b" * 64,
             "experiment_id": "persistent-001",
             "immutable_revision": "c" * 40,
+            "repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
+            "remote_prefix": "prefix",
+            "relative_path": "checkpoints/step-1000.tar",
+            "artifact_sha256": hashlib.sha256(b"artifact").hexdigest(),
+            "artifact_byte_size": 8,
         }],
         provider_reason="instance absent",
     )
@@ -182,15 +224,20 @@ def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_ident
                 "gpu_ram": 96000, "num_gpus": 1, "dph_total": .7,
                 "ssh_host": "replacement", "ssh_port": 22,
             })
+        if command == ("vastai", "--raw", "show", "instances"):
+            return '[{"id":10,"dph_total":0.7}]'
+        if command == ("vastai", "--raw", "show", "volumes"):
+            return "[]"
         raise AssertionError(command)
     replacement = {
         "instance_id": 10, "host": "replacement", "port": 22,
         "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
-        "provider_response_sha256": LIFECYCLE._hash({
+        "provider_response_sha256": LIFECYCLE._stable_instance_identity({
             "id": 10, "actual_status": "running", "gpu_name": "RTX PRO 6000 WS",
             "gpu_ram": 96000, "num_gpus": 1, "dph_total": .7,
             "ssh_host": "replacement", "ssh_port": 22,
         }),
+        "account_hourly_total_usd": .7,
     }
     capability = {
         "kind": "persistent_training_capability", "instance_id": 10,
@@ -207,6 +254,7 @@ def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_ident
     assert LIFECYCLE.classify_provider_interruption(instance={"instance_id": 9}, runner=runner) == "instance_absent"
     descriptor = LIFECYCLE.replacement_resume_descriptor(
         terminal=terminal, capability_receipt=capability, runner=runner,
+        transport=FakeHub(), token="test-token",
     )
     assert descriptor["instance"]["instance_id"] == 10
     assert descriptor["resume_checkpoint_publication"]["optimizer_step"] == 1000
@@ -317,6 +365,10 @@ def test_bootstrap_canary_uses_only_historical_image_and_binds_instance_receipt(
 
     def runner(command: tuple[str, ...]) -> str:
         commands.append(command)
+        if command[:4] == ("vastai", "--raw", "show", "instances"):
+            return "[]"
+        if command[:4] == ("vastai", "--raw", "show", "volumes"):
+            return "[]"
         if command[:4] == ("vastai", "--raw", "create", "instance"):
             return '{"new_contract":9}'
         if command[:4] == ("vastai", "--raw", "show", "instance"):
@@ -337,7 +389,7 @@ def test_bootstrap_canary_uses_only_historical_image_and_binds_instance_receipt(
     receipt_path = tmp_path / "code.bundle.sha256"
     receipt_path.write_text(hashlib.sha256(bundle_path.read_bytes()).hexdigest() + "  code.bundle\n", encoding="utf-8")
     receipt = LIFECYCLE.bootstrap_canary(
-        evidence={"offer": {"id": 7, "min_bid": .5}, "search_mode": "interruptible", "expires_at_unix": 101, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "code_bundle": str(bundle_path), "code_bundle_sha256_file": str(receipt_path)},
+        evidence={"offer": {"id": 7, "min_bid": .5, "dph_total": .7}, "search_mode": "interruptible", "expires_at_unix": 101, "account_hourly_total_usd": .7, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "code_bundle": str(bundle_path), "code_bundle_sha256_file": str(receipt_path)},
         runner=runner,
     )
 
@@ -357,13 +409,19 @@ def test_promote_canary_recovers_only_the_bound_instance_receipt() -> None:
         "training_capability": {"hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05", "image_digest": image.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .1}, "nvml": {"utilization_percent": 80}},
     }
     def runner(command: tuple[str, ...]) -> str:
-        assert command == ("vastai", "--raw", "show", "instance", "9")
-        return json.dumps({
-            "id": 9, "actual_status": "running", "gpu_name": "RTX PRO 6000 WS",
-            "gpu_ram": 96000, "num_gpus": 1, "dph_total": .7,
-            "ssh_host": "host", "ssh_port": 22,
-        })
-    receipt["instance"]["provider_response_sha256"] = LIFECYCLE._hash(json.loads(runner(("vastai", "--raw", "show", "instance", "9"))))
+        if command == ("vastai", "--raw", "show", "instance", "9"):
+            return json.dumps({
+                "id": 9, "actual_status": "running", "gpu_name": "RTX PRO 6000 WS",
+                "gpu_ram": 96000, "num_gpus": 1, "dph_total": .7,
+                "ssh_host": "host", "ssh_port": 22,
+            })
+        if command == ("vastai", "--raw", "show", "instances"):
+            return '[{"id":9,"dph_total":0.7}]'
+        if command == ("vastai", "--raw", "show", "volumes"):
+            return "[]"
+        raise AssertionError(command)
+    receipt["instance"]["provider_response_sha256"] = LIFECYCLE._stable_instance_identity(json.loads(runner(("vastai", "--raw", "show", "instance", "9"))))
+    receipt["instance"]["account_hourly_total_usd"] = .7
     receipt["provider_response_sha256"] = receipt["instance"]["provider_response_sha256"]
     assert LIFECYCLE.promote_canary(capability_receipt=receipt, runner=runner)["instance_id"] == 9
 
@@ -373,11 +431,33 @@ def test_promote_canary_requires_fresh_matching_live_provider_readback() -> None
     receipt = {
         "kind": "persistent_training_capability", "instance_id": 9,
         "trainer_image": image, "provider_response_sha256": "a" * 64,
-        "instance": {"instance_id": 9, "trainer_image": image, "provider_response_sha256": "a" * 64, "host": "host", "port": 22, "offer_evidence_sha256": "b" * 64},
+        "instance": {"instance_id": 9, "trainer_image": image, "provider_response_sha256": "a" * 64, "host": "host", "port": 22, "offer_evidence_sha256": "b" * 64, "account_hourly_total_usd": .7},
         "training_capability": {"hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05", "image_digest": image.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .1}, "nvml": {"utilization_percent": 80}},
     }
     with pytest.raises(ValueError, match="fresh live"):
         LIFECYCLE.promote_canary(capability_receipt=receipt, runner=lambda _: "{}")
+
+
+def test_rent_and_promotion_refuse_fabricated_over_cap_account_receipts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
+    image = "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:" + "a" * 64
+    evidence = {
+        "offer": {"id": 7, "min_bid": .5}, "search_mode": "interruptible",
+        "expires_at_unix": 101, "account_hourly_total_usd": 1.01,
+        "trainer_image": image,
+        "training_capability": {"hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05", "image_digest": image.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .2}, "nvml": {"utilization_percent": 90}},
+    }
+    with pytest.raises(ValueError, match=r"exceeds \$1/hr"):
+        LIFECYCLE.rent(evidence=evidence, runner=lambda _: "{}")
+    capability = {
+        "kind": "persistent_training_capability", "instance_id": 9,
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "provider_response_sha256": "a" * 64,
+        "instance": {"instance_id": 9, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "provider_response_sha256": "a" * 64, "host": "host", "port": 22, "account_hourly_total_usd": 1.01},
+        "training_capability": {"hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .2}, "nvml": {"utilization_percent": 90}},
+    }
+    with pytest.raises(ValueError, match=r"exceeds \$1/hr"):
+        LIFECYCLE.promote_canary(capability_receipt=capability, runner=lambda _: "{}")
 
 
 def test_bootstrap_canary_stages_current_code_and_cleans_up_after_probe_failure(
@@ -395,6 +475,8 @@ def test_bootstrap_canary_stages_current_code_and_cleans_up_after_probe_failure(
     def runner(command: tuple[str, ...]) -> str:
         nonlocal destroyed
         commands.append(command)
+        if command[:4] == ("vastai", "--raw", "show", "instances"): return "[]"
+        if command[:4] == ("vastai", "--raw", "show", "volumes"): return "[]"
         if command[:4] == ("vastai", "--raw", "create", "instance"): return '{"new_contract":9}'
         if command[:4] == ("vastai", "--raw", "show", "instance"): return "{}" if destroyed else '{"id":9,"gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"ssh_host":"host","ssh_port":22}'
         if command[:3] == ("vastai", "destroy", "instance"):
@@ -405,7 +487,7 @@ def test_bootstrap_canary_stages_current_code_and_cleans_up_after_probe_failure(
         raise AssertionError(command)
     monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
     with pytest.raises(RuntimeError, match="probe failed"):
-        LIFECYCLE.bootstrap_canary(evidence={"offer": {"id": 7, "min_bid": .5}, "search_mode": "interruptible", "expires_at_unix": 101, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "code_bundle": str(bundle), "code_bundle_sha256_file": str(receipt)}, runner=runner)
+        LIFECYCLE.bootstrap_canary(evidence={"offer": {"id": 7, "min_bid": .5, "dph_total": .7}, "search_mode": "interruptible", "expires_at_unix": 101, "account_hourly_total_usd": .7, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "code_bundle": str(bundle), "code_bundle_sha256_file": str(receipt)}, runner=runner)
     assert any(command[:3] == ("vastai", "destroy", "instance") for command in commands)
 
 
@@ -418,6 +500,7 @@ def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
     corrective_a = _prepared_source(tmp_path / "corrective-a", kind="flywheel", grade="A", episodes=1)
     corrective_b = _prepared_source(tmp_path / "corrective-b", kind="flywheel", grade="B", episodes=1)
+    release_receipt = _corrective_release_receipt([corrective_a, corrective_b], tmp_path / "corrective-release.json")
     destination = tmp_path / "generation"
     request = tmp_path / "materialize.json"
     request.write_text(json.dumps({
@@ -426,7 +509,7 @@ def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None
         "destination": str(destination),
         "seed": 20260812,
         "organizer_source_evidence": LIFECYCLE.ORGANIZER_SOURCE,
-        "corrective_source_evidence": LIFECYCLE.CORRECTIVE_SOURCE | {"release_id": "b" * 64},
+        "corrective_release_receipt": str(release_receipt),
     }))
 
     report = LIFECYCLE.main_for_test(["materialize", "--request", str(request)])
@@ -441,8 +524,9 @@ def test_prepare_requires_exact_pinned_sources_in_the_sealed_receipt(tmp_path: P
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
     corrective_a = _prepared_source(tmp_path / "corrective-a", kind="flywheel", grade="A", episodes=1)
     corrective_b = _prepared_source(tmp_path / "corrective-b", kind="flywheel", grade="B", episodes=1)
+    release_receipt = _corrective_release_receipt([corrective_a, corrective_b], tmp_path / "corrective-release.json")
     root = tmp_path / "generation"
-    LIFECYCLE._materialize({"organizer_root": str(organizer), "corrective_roots": [str(corrective_a), str(corrective_b)], "destination": str(root), "seed": 1, "organizer_source_evidence": LIFECYCLE.ORGANIZER_SOURCE, "corrective_source_evidence": LIFECYCLE.CORRECTIVE_SOURCE | {"release_id": "b" * 64}})
+    LIFECYCLE._materialize({"organizer_root": str(organizer), "corrective_roots": [str(corrective_a), str(corrective_b)], "destination": str(root), "seed": 1, "organizer_source_evidence": LIFECYCLE.ORGANIZER_SOURCE, "corrective_release_receipt": str(release_receipt)})
     request = tmp_path / "prepare.json"
     request.write_text(json.dumps({"generation_root": str(root)}), encoding="utf-8")
     assert LIFECYCLE.main_for_test(["prepare", "--request", str(request)])["paid_action"] is False

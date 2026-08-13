@@ -110,6 +110,27 @@ def test_continuous_launch_runs_one_process_to_2000_with_save_1000(
     assert command[command.index("--save-steps") + 1] == "1000"
 
 
+def test_continuous_launch_passes_verified_resume_checkpoint_to_official_process(
+    tmp_path: Path, official_checkout: Path
+) -> None:
+    output = tmp_path / "output"
+    checkpoint = output / "lehome-groot-baseline" / "checkpoint-1000"
+    checkpoint.mkdir(parents=True)
+    (checkpoint.parent / "lehome_launch.json").write_text(
+        __import__("json").dumps(config(output_dir=str(output), max_steps=2_000, save_steps=1_000, physical_batch_size=64).identity()),
+        encoding="utf-8",
+    )
+    calls: list[tuple[object, object]] = []
+    launch_continuous_finetune(
+        config(output_dir=str(output), max_steps=2_000, save_steps=1_000, physical_batch_size=64),
+        visible_devices="0", environment={}, official_checkout=official_checkout,
+        resume_checkpoint=checkpoint,
+        runner=lambda *args, **kwargs: calls.append((args, kwargs)) or subprocess.CompletedProcess([], 0),
+    )
+    command = calls[0][0][0]
+    assert command[command.index("--resume-from-checkpoint") + 1] == str(checkpoint)
+
+
 def test_build_launch_verifies_step_12000_parent_weights(
     tmp_path: Path, official_checkout: Path
 ) -> None:

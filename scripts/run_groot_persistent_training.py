@@ -33,6 +33,7 @@ BOOTSTRAP_TRAINER_IMAGE = (
     _DIGEST_PREFIX
     + "b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746"
 )
+MAX_ACCOUNT_HOURLY_USD = 1.00
 Runner = Callable[[tuple[str, ...]], str]
 
 
@@ -78,6 +79,44 @@ def _verify_prepare_evidence(receipt: Mapping[str, object]) -> None:
         raise ValueError("prepare corrective release evidence lacks an immutable local release ID")
 
 
+def _verified_corrective_release_evidence(
+    roots: list[Path], release_receipt_path: object,
+) -> dict[str, object]:
+    """Bind local RFT inputs to a prior full-release tree readback receipt.
+
+    The published HF identity and the snapshot's internal provenance deliberately
+    differ.  Both must be present in the locally authenticated release receipt;
+    callers cannot supply loose revision strings in a materialize request.
+    """
+    if not isinstance(release_receipt_path, str):
+        raise ValueError("materialize requires a verified corrective release receipt path")
+    receipt = _load_regular_json(Path(release_receipt_path), "corrective release receipt")
+    published = receipt.get("published_release")
+    local = receipt.get("local_snapshot")
+    if not isinstance(published, Mapping) or not isinstance(local, Mapping):
+        raise ValueError("corrective release receipt lacks published and local identities")
+    evidence = dict(published)
+    _verify_prepare_evidence({"organizer_source": ORGANIZER_SOURCE, "corrective_source": evidence})
+    internal_revision, internal_release_id = local.get("source_revision"), local.get("source_release_id")
+    if not isinstance(internal_revision, str) or re.fullmatch(r"[0-9a-f]{40}", internal_revision) is None or not isinstance(internal_release_id, str) or re.fullmatch(r"[0-9a-f]{64}", internal_release_id) is None:
+        raise ValueError("corrective release receipt local provenance is invalid")
+    expected_trees = local.get("trees")
+    if not isinstance(expected_trees, Mapping) or set(expected_trees) != {str(root) for root in roots}:
+        raise ValueError("corrective release receipt does not bind the local snapshot roots")
+    for root in roots:
+        manifest = _load_regular_json(root / "manifest.json", "corrective snapshot manifest")
+        if manifest.get("source_revision") != internal_revision or manifest.get("source_release_id") != internal_release_id:
+            raise ValueError("corrective snapshot provenance differs from verified release receipt")
+        if expected_trees.get(str(root)) != _tree_readback_sha256(root):
+            raise ValueError("corrective snapshot tree differs from verified release receipt")
+    return {
+        **evidence,
+        "local_source_revision": internal_revision,
+        "local_source_release_id": internal_release_id,
+        "local_tree_sha256": dict(expected_trees),
+    }
+
+
 def _run(command: tuple[str, ...]) -> str:
     completed = subprocess.run(command, check=True, text=True, capture_output=True)
     return completed.stdout
@@ -117,6 +156,38 @@ def _tree_readback_sha256(root: Path) -> str:
     return hashlib.sha256(b"".join(rows)).hexdigest()
 
 
+_STABLE_INSTANCE_FIELDS = (
+    "id", "actual_status", "gpu_name", "gpu_ram", "num_gpus", "dph_total",
+    "ssh_host", "ssh_port", "driver_version",
+)
+
+
+def _stable_instance_identity(row: Mapping[str, object]) -> str:
+    """Hash only contract facts Vast does not mutate with incidental metadata."""
+    return _hash(_project(row, _STABLE_INSTANCE_FIELDS))
+
+
+def _require_account_cap(total: object, *, label: str) -> float:
+    if type(total) not in (int, float) or not math.isfinite(float(total)) or float(total) < 0:
+        raise ValueError(f"{label} account-wide hourly total is invalid")
+    if float(total) > MAX_ACCOUNT_HOURLY_USD:
+        raise ValueError("account-wide instance and storage total exceeds $1/hr")
+    return float(total)
+
+
+def _live_account_total(*, runner: Runner) -> float:
+    """Read all charged instance/volume rows once, without duplicating disk."""
+    instances = _json(runner, ("vastai", "--raw", "show", "instances"))
+    volumes = _json(runner, ("vastai", "--raw", "show", "volumes"))
+    if not isinstance(instances, list) or not isinstance(volumes, list):
+        raise ValueError("provider account listing is invalid")
+    return _require_account_cap(
+        sum(float(row.get("dph_total", 0)) for row in instances if isinstance(row, Mapping))
+        + sum(float(row.get("storage_total_cost", 0)) for row in volumes if isinstance(row, Mapping)),
+        label="live provider",
+    )
+
+
 def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: int = 300) -> dict[str, object]:
     # Vast produces the total hourly quote only after the requested disk size is
     # supplied.  ``dph_total`` below is consequently the single all-in 300GB
@@ -145,7 +216,7 @@ def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: 
     existing_instance_total = sum(float(row.get("dph_total", 0)) for row in instances if isinstance(row, Mapping))
     existing_storage_total = sum(float(row.get("storage_total_cost", 0)) for row in volumes if isinstance(row, Mapping))
     total = existing_instance_total + existing_storage_total + float(offer["dph_total"])
-    if total > 2: raise ValueError("account-wide instance and storage total exceeds $2/hr")
+    _require_account_cap(total, label="captured offer")
     captured = int(time.time()) if now_unix is None else now_unix
     safe_offer = _project(offer, ("id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "dph_base", "storage_cost", "storage_cost_per_gb", "min_bid", "driver_version", "is_bid", "image"))
     return {"schema_version": 1, "kind": "persistent_training_offer", "offer": safe_offer, "account_hourly_total_usd": total, "existing_instance_hourly_total_usd": existing_instance_total, "existing_storage_hourly_total_usd": existing_storage_total, "requested_storage_gb": 300, "requested_storage_hourly_usd": requested_storage_hourly, "storage_quote_included_in_dph_total": True, "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds, "search_mode": "interruptible"}
@@ -164,6 +235,16 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
         validate_training_capability(capability)
     elif image != BOOTSTRAP_TRAINER_IMAGE:
         raise ValueError("bootstrap canary requires the historical structurally pinned trainer image")
+    _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")
+    quoted_offer_hourly = offer.get("dph_total")
+    if type(quoted_offer_hourly) not in (int, float) or float(quoted_offer_hourly) < 0:
+        raise ValueError("offer evidence lacks the all-in 300GB hourly quote")
+    # The capture receipt is short-lived but pre-rental account state can still
+    # change.  Re-read retained charges immediately before creating the lease.
+    _require_account_cap(
+        _live_account_total(runner=runner) + float(quoted_offer_hourly),
+        label="fresh rental projection",
+    )
     bid = offer.get("min_bid", offer.get("dph_total"))
     if type(bid) not in (int, float) or float(bid) >= 1: raise ValueError("offer bid price is invalid")
     created = _json(runner, ("vastai", "--raw", "create", "instance", str(offer["id"]), "--image", image, "--disk", "300", "--bid_price", str(bid), "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + image))
@@ -186,7 +267,7 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
         if absent not in ({}, None):
             raise ValueError("post-create cleanup absence readback failed")
         raise ValueError("instance readback does not match accepted offer")
-    return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "trainer_image": image, "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _hash(live)}
+    return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "trainer_image": image, "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _stable_instance_identity(live), "account_hourly_total_usd": _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")}
 
 
 def bootstrap_canary(*, evidence: Mapping[str, object], runner: Runner) -> dict[str, object]:
@@ -446,6 +527,7 @@ def promote_canary(*, capability_receipt: Mapping[str, object], runner: Runner) 
     if not isinstance(instance, Mapping):
         raise ValueError("capability receipt lacks an instance-bound SSH receipt")
     _require_instance_capability(instance, {"capability_receipt": capability_receipt})
+    _require_account_cap(instance.get("account_hourly_total_usd"), label="capability instance")
     instance_id = instance.get("instance_id")
     if type(instance_id) is not int:
         raise ValueError("capability receipt instance is invalid")
@@ -459,10 +541,14 @@ def promote_canary(*, capability_receipt: Mapping[str, object], runner: Runner) 
         or float(live.get("dph_total", 99)) >= 1
         or not isinstance(live.get("ssh_host"), str)
         or type(live.get("ssh_port")) is not int
-        or _hash(live) != instance.get("provider_response_sha256")
+        or _stable_instance_identity(live) != instance.get("provider_response_sha256")
     ):
         raise ValueError("fresh live provider readback does not match capability instance")
-    return dict(instance)
+    # This reads retained volumes and all current instances after the live
+    # instance readback.  The promoted instance is already in that list, so
+    # do not add it again.
+    total = _live_account_total(runner=runner)
+    return dict(instance) | {"account_hourly_total_usd": total}
 
 
 def provider_interruption_terminal(
@@ -547,8 +633,26 @@ def resume_identity(
     return candidate
 
 
+def discover_resume_publication(
+    terminal: Mapping[str, object], *, transport: HubTransport, token: str
+) -> Mapping[str, object]:
+    """Fresh-read the immutable Hub publication selected by the terminal.
+
+    A lost VM and its request JSON are never a source of checkpoint bytes.  The
+    terminal identifies a published revision, but this function authenticates
+    the complete tree and artifact digest again before a replacement may use it.
+    """
+    generation, config = terminal.get("generation_sha256"), terminal.get("config_sha256")
+    if not isinstance(generation, str) or not isinstance(config, str):
+        raise ValueError("provider interruption terminal is malformed")
+    publication = resume_identity(terminal, generation_sha256=generation, config_sha256=config)
+    _verify_publication_tree(publication=publication, transport=transport, token=token)
+    return publication
+
+
 def replacement_resume_descriptor(
-    *, terminal: Mapping[str, object], capability_receipt: Mapping[str, object], runner: Runner
+    *, terminal: Mapping[str, object], capability_receipt: Mapping[str, object], runner: Runner,
+    transport: HubTransport, token: str,
 ) -> dict[str, object]:
     """Promote a replacement canary and bind it to the last immutable resume.
 
@@ -561,7 +665,7 @@ def replacement_resume_descriptor(
     old_instance_id = terminal.get("instance_id")
     if not isinstance(generation, str) or not isinstance(config, str) or type(old_instance_id) is not int:
         raise ValueError("provider interruption terminal is malformed")
-    checkpoint = dict(resume_identity(terminal, generation_sha256=generation, config_sha256=config))
+    checkpoint = dict(discover_resume_publication(terminal, transport=transport, token=token))
     replacement = promote_canary(capability_receipt=capability_receipt, runner=runner)
     if replacement.get("instance_id") == old_instance_id:
         raise ValueError("replacement resume must use a newly bound instance")
@@ -609,7 +713,7 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
         ):
             raise ValueError("status terminal path must be beneath /output")
         commands = {
-            "tune": "PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src lehome-train smoke --request /prepared/config/tune.json",
+            "tune": "PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src lehome-train tune --request /prepared/config/tune.json",
             "train": "env -u HF_TOKEN PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src lehome-train continuous-train --request /prepared/config/continuous.json",
             "resume": "env -u HF_TOKEN PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src lehome-train continuous-train --request /prepared/config/resume.json",
             "status": "test -f " + str(terminal_path) + " && cat " + str(terminal_path),
@@ -729,11 +833,15 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
     if destination_root.exists() or destination_root.is_symlink():
         raise ValueError("materialize destination must not already exist")
     plan = build_mix_plan(organizer_root, corrective_roots, seed=seed)
+    # Organizer is pinned through its manifest contract.  Corrective roots are
+    # additionally bound to a previous authenticated full-release readback.
     organizer_evidence = request.get("organizer_source_evidence")
-    corrective_evidence = request.get("corrective_source_evidence")
-    if not isinstance(organizer_evidence, Mapping) or not isinstance(corrective_evidence, Mapping):
-        raise ValueError("materialize requires verified organizer and corrective release evidence")
-    evidence = {"organizer_source": dict(organizer_evidence), "corrective_source": dict(corrective_evidence)}
+    if not isinstance(organizer_evidence, Mapping):
+        raise ValueError("materialize requires verified organizer source evidence")
+    corrective_evidence = _verified_corrective_release_evidence(
+        corrective_roots, request.get("corrective_release_receipt"),
+    )
+    evidence = {"organizer_source": dict(organizer_evidence), "corrective_source": corrective_evidence}
     _verify_prepare_evidence(evidence)
     materialize_mixed_snapshot(
         plan, organizer_root, corrective_roots, destination_root,
@@ -779,7 +887,7 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
         capability = request.get("capability_receipt")
         if not isinstance(terminal, Mapping) or not isinstance(capability, Mapping):
             raise ValueError("replacement-resume requires interruption terminal and replacement capability receipt")
-        return {"paid_action": True, "action": "replacement-resume", **replacement_resume_descriptor(terminal=terminal, capability_receipt=capability, runner=runner)}
+        return {"paid_action": True, "action": "replacement-resume", **replacement_resume_descriptor(terminal=terminal, capability_receipt=capability, runner=runner, transport=HuggingFaceHubTransport(timeout_seconds=30.0), token=_read_private_token(args.token_file))}
     if args.action == "rent": return rent(evidence=request, runner=runner)
     if args.action == "destroy":
         return destroy(

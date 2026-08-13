@@ -914,9 +914,16 @@ class ProductionRuntime:
         uploader = HubCheckpointUploader(repository=repository, revision=revision, experiment_id=config.experiment_name, artifact_root=config.output_dir, token=token)
         schedule = ExposureSchedule(physical_batch_size=64, sample_presentations=128_000, checkpoint_sample_presentations=64_000)
         config_sha256 = canonical_json_sha256(config.identity())
+        resume_run_checkpoint = (
+            None
+            if resume is None
+            else Path(config.output_dir) / config.experiment_name / f"checkpoint-{resume.record.optimizer_step}"
+        )
         publications = run_continuous_supervisor(
             run_root=Path(config.output_dir) / config.experiment_name,
-            launch=lambda: launch_continuous_finetune(config, **_launch_kwargs()),
+            launch=lambda: launch_continuous_finetune(
+                config, **_launch_kwargs(), resume_checkpoint=resume_run_checkpoint,
+            ),
             package=lambda completed: session.package_checkpoint_snapshot(completed.snapshot_root, optimizer_step=completed.optimizer_step, sample_presentations=completed.optimizer_step * 64, schedule_sha256=schedule.sha256),
             publish=lambda checkpoint: uploader.publish_receipt(checkpoint, timeout_seconds=30.0),
         )

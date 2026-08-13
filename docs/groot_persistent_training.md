@@ -51,7 +51,7 @@ Provider actions are dry-run unless `--execute` is explicit. `capture-offers`
 uses the raw interruptible search and accepts only actual `RTX PRO 6000 WS` or
 `RTX PRO 6000 S` one-GPU 96,000MB-plus offers. Rent only one
 interruptible RTX PRO 6000 96GB at less than $1/hour when fresh instance plus
-storage/volume account total is at most $2/hour. Run a capability receipt with
+storage/volume account total is at most $1/hour. Run a capability receipt with
 the exact image digest, CUDA/Torch CUDA, compute capability, a finite optimizer
 step, and NVML telemetry. A newer Blackwell driver is accepted only by that
 training capability gate; rollout driver policy is separate.
@@ -77,7 +77,7 @@ publication and refuses a reused instance or changed generation/config IDs.
 
 Offer capture uses Vast `--storage 300`; the resulting `dph_total` is the
 single all-in 300GB quote.  Any reported storage breakdown is retained as
-evidence but is never added a second time to the account-wide `$2/hour` gate.
+evidence but is never added a second time to the account-wide `$1/hour` gate.
 
 Stage verifies a complete local sealed-generation tree after SCP, safely
 extracts the code bundle beneath `/prepared/code` and the approved parent

@@ -256,6 +256,7 @@ def launch_continuous_finetune(
     environment: Mapping[str, str] | None,
     official_checkout: str | os.PathLike[str],
     runner: Runner = subprocess.run,
+    resume_checkpoint: str | os.PathLike[str] | None = None,
 ) -> subprocess.CompletedProcess[object]:
     """Run the one official corrective process which owns both saves."""
 
@@ -265,13 +266,21 @@ def launch_continuous_finetune(
         raise ValueError("first continuous corrective run requires global batch 64")
     if config.max_steps != 2_000 or config.save_steps != 1_000:
         raise ValueError("continuous corrective training requires 1000/2000 checkpoints")
-    return launch_finetune(
+    launch = build_launch(
         config,
         visible_devices=visible_devices,
         environment=environment,
         official_checkout=official_checkout,
-        runner=runner,
     )
+    _write_or_verify_identity(config)
+    command = launch.command
+    if resume_checkpoint is not None:
+        checkpoint = Path(resume_checkpoint)
+        expected_root = Path(config.output_dir) / config.experiment_name
+        if checkpoint.is_symlink() or not checkpoint.is_dir() or expected_root not in checkpoint.parents:
+            raise ValueError("continuous resume checkpoint must be a verified checkpoint beneath the experiment output")
+        command = (*command, "--resume-from-checkpoint", str(checkpoint))
+    return runner(command, env=launch.environment, check=True)
 
 
 def _distributed_chunk_command(
