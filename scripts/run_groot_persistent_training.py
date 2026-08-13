@@ -500,7 +500,7 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
 
 
 def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object]:
-    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("materialize", "prepare", "capture-offers", "bootstrap-canary", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("materialize", "prepare", "capture-offers", "bootstrap-canary", "promote", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "materialize":
         return _materialize(request)
@@ -527,6 +527,7 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
     if not args.execute: return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
     if args.action == "capture-offers": return capture_offers(runner=runner)
     if args.action == "bootstrap-canary": return bootstrap_canary(evidence=request, runner=runner)
+    if args.action == "promote": return {"paid_action": False, "action": "promote", "instance": promote_canary(capability_receipt=request)}
     if args.action == "rent": return rent(evidence=request, runner=runner)
     if args.action == "destroy":
         return destroy(
