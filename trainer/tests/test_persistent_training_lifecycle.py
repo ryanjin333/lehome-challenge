@@ -26,7 +26,7 @@ def test_dry_run_never_calls_provider(tmp_path: Path) -> None:
 
 
 def test_destroy_requires_two_immutable_checkpoints_bound_to_instance(tmp_path: Path) -> None:
-    receipt = {"instance_id": 7, "immutable_checkpoint_steps": [1000]}
+    receipt = {"kind": "continuous_corrective_training_terminal", "instance_id": 7, "immutable_checkpoint_steps": [1000]}
     with pytest.raises(ValueError, match="instance-bound disposal"):
         LIFECYCLE.destroy(instance_id=7, training_receipt=receipt)
 
@@ -50,4 +50,4 @@ def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: 
     instance = LIFECYCLE.rent(evidence=evidence, runner=runner)
     assert instance["instance_id"] == 9
     with pytest.raises(ValueError, match="destroy absence"):
-        LIFECYCLE.destroy(instance_id=9, training_receipt={"instance_id": 9, "immutable_checkpoint_steps": [1000, 2000], "fresh_readbacks": True}, runner=runner)
+        LIFECYCLE.destroy(instance_id=9, training_receipt={"kind": "continuous_corrective_training_terminal", "instance_id": 9, "immutable_checkpoint_steps": [1000, 2000], "immutable_checkpoint_publications": [{"optimizer_step": 1000, "immutable_revision": "a" * 40, "readback_verified": True}, {"optimizer_step": 2000, "immutable_revision": "b" * 40, "readback_verified": True}]}, runner=runner)

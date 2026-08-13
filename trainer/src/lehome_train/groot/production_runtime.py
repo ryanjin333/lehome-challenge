@@ -765,7 +765,7 @@ class ProductionRuntime:
         fields = {
             "launch_config", "experiment_config", "generation_root", "parent_checkpoint_sha256",
             "normalization_sha256", "checkpoint_repository", "checkpoint_revision",
-            "result_output", "status_output",
+            "instance_id", "result_output", "status_output",
         }
         request = _exact(arguments, fields, "continuous-train")
         outputs = _prepare_outputs(request, "result_output", "status_output")
@@ -796,6 +796,7 @@ class ProductionRuntime:
         payload = run_continuous_training(
             generation_root=generation,
             parent_checkpoint_sha256=parent,
+            instance_id=request["instance_id"],
             launch=lambda: None,
             immutable_checkpoint_steps=lambda: verified,
         )

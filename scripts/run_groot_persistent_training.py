@@ -18,6 +18,7 @@ from typing import Callable, Mapping
 
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
 CORRECTIVE_SOURCE = {"revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c", "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35"}
+PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3", "subpath": "policies/step-12000"}
 OFFER_QUERY = "(gpu_name=RTX_PRO_6000_WS gpu_name=RTX_PRO_6000_S) gpu_ram>=96000 num_gpus=1 reliability>=0.95"
 _DIGEST_PREFIX = "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:"
 Runner = Callable[[tuple[str, ...]], str]
@@ -104,6 +105,12 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
     _stage_command(request)
     remote_dir = "/tmp/lehome-stage"
     runner((*_ssh_prefix(instance), "mkdir -p " + remote_dir))
+    generation_root = Path(str(request["generation_root"]))
+    if generation_root.is_symlink() or not generation_root.is_dir(): raise ValueError("stage generation root is unsafe")
+    runner(("scp", "-r", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(generation_root), "root@" + str(instance["host"]) + ":" + remote_dir + "/generation"))
+    generation_manifest = hashlib.sha256((generation_root / "manifest.json").read_bytes()).hexdigest()
+    observed_manifest = runner((*_ssh_prefix(instance), "sha256sum " + remote_dir + "/generation/manifest.json")).strip().split()
+    if not observed_manifest or observed_manifest[0] != generation_manifest: raise ValueError("remote generation manifest readback failed")
     pairs = (("code_bundle", "code.bundle"), ("generation_receipt", "generation.generation.json"), ("parent_checkpoint", "parent.tar"), ("launch_config", "launch.json"), ("modality_config", "modality.py"), ("token_file", "token"))
     receipts = []
     for field, remote_name in pairs:
@@ -114,7 +121,9 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
         observed = runner((*_ssh_prefix(instance), "sha256sum " + remote_dir + "/" + remote_name)).strip().split()
         if not observed or observed[0] != digest: raise ValueError("remote staged hash readback failed")
         receipts.append({"name": remote_name, "sha256": digest})
-    return {"paid_action": True, "action": "stage", "instance_id": instance["instance_id"], "transfers": receipts}
+    receipt_payload = json.loads(Path(str(request["generation_receipt"])).read_text(encoding="utf-8"))
+    if receipt_payload.get("dataset_manifest_sha256") != generation_manifest: raise ValueError("staged generation receipt does not bind its manifest")
+    return {"paid_action": True, "action": "stage", "instance_id": instance["instance_id"], "generation_manifest_sha256": generation_manifest, "transfers": receipts}
 
 
 def _stage_command(request: Mapping[str, object]) -> str:
@@ -123,6 +132,9 @@ def _stage_command(request: Mapping[str, object]) -> str:
         raise ValueError("stage requires exact code, generation, parent, config, modality, and token paths")
     if request.get("generation_sha256") != request.get("sealed_generation_sha256"):
         raise ValueError("stage generation identity is not sealed")
+    parent_sha = request.get("parent_checkpoint_sha256")
+    if request.get("parent_checkpoint_repository") != PARENT_CHECKPOINT["repository"] or request.get("parent_checkpoint_revision") != PARENT_CHECKPOINT["revision"] or request.get("parent_checkpoint_subpath") != PARENT_CHECKPOINT["subpath"] or not isinstance(parent_sha, str) or len(parent_sha) != 64 or any(char not in "0123456789abcdef" for char in parent_sha):
+        raise ValueError("stage parent checkpoint identity is not approved")
     # The token is a file transport only; no value is embedded in local JSON or
     # a command string.  Remote validation is hashes/path identity, never logs.
     return "set -eu; test -f /tmp/lehome-stage/code.bundle; sha256sum -c /tmp/lehome-stage/code.bundle.sha256; test -f /tmp/lehome-stage/generation.generation.json; lehome-train continuous-train --request /tmp/lehome-stage/continuous.json"
@@ -146,7 +158,8 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
 
 
 def destroy(*, instance_id: int, training_receipt: Mapping[str, object], runner: Runner | None = None) -> dict[str, object]:
-    if training_receipt.get("instance_id") != instance_id or training_receipt.get("immutable_checkpoint_steps") != [1000, 2000] or training_receipt.get("fresh_readbacks") is not True:
+    publications = training_receipt.get("immutable_checkpoint_publications")
+    if training_receipt.get("kind") != "continuous_corrective_training_terminal" or training_receipt.get("instance_id") != instance_id or training_receipt.get("immutable_checkpoint_steps") != [1000, 2000] or not isinstance(publications, list) or {item.get("optimizer_step") for item in publications if isinstance(item, Mapping)} != {1000, 2000} or not all(isinstance(item, Mapping) and item.get("readback_verified") is True and isinstance(item.get("immutable_revision"), str) for item in publications):
         raise ValueError("instance-bound disposal requires two immutable checkpoints")
     if runner is not None:
         runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))

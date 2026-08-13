@@ -39,6 +39,7 @@ def run_continuous_training(
     *,
     generation_root: str | Path,
     parent_checkpoint_sha256: str,
+    instance_id: int | None = None,
     launch: Callable[[], object],
     immutable_checkpoint_steps: Callable[[], tuple[int, ...]],
 ) -> dict[str, object]:
@@ -49,11 +50,14 @@ def run_continuous_training(
     if not _SHA256.fullmatch(parent_checkpoint_sha256):
         raise ValueError("parent checkpoint SHA-256 is invalid")
     verified = immutable_checkpoint_steps()
+    if instance_id is not None and (type(instance_id) is not int or instance_id <= 0):
+        raise ValueError("instance ID is invalid")
     if verified != (1000, 2000):
         return {
             "schema_version": 1,
             "kind": "continuous_corrective_training_terminal",
             "generation_sha256": generation["mix_plan_sha256"],
+            "instance_id": instance_id,
             "parent_checkpoint_sha256": parent_checkpoint_sha256,
             "optimizer_steps": 2000,
             "global_batch_size": 64,
@@ -66,6 +70,7 @@ def run_continuous_training(
         "schema_version": 1,
         "kind": "continuous_corrective_training_terminal",
         "generation_sha256": generation["mix_plan_sha256"],
+        "instance_id": instance_id,
         "parent_checkpoint_sha256": parent_checkpoint_sha256,
         "optimizer_steps": 2000,
         "global_batch_size": 64,
