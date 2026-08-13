@@ -117,6 +117,72 @@ def _verified_corrective_release_evidence(
     }
 
 
+def derive_corrective_receipt(
+    *, disposal_receipt: Path, snapshot_root: Path, output: Path,
+) -> dict[str, object]:
+    """Derive the local corrective binding from immutable disposal evidence.
+
+    This is intentionally free and local: no Hub client is constructed.  The
+    disposal receipt already records the authenticated private immutable tree;
+    this action only ties that published identity to the local snapshot's own
+    internal provenance and a complete safe tree digest.
+    """
+    disposal = _load_regular_json(disposal_receipt, "corrective disposal receipt")
+    release_id = CORRECTIVE_SOURCE["prefix"].rpartition("/")[2]
+    required = {
+        "schema_version": 1,
+        "disposable": True,
+        "repository": CORRECTIVE_SOURCE["repository"],
+        "immutable_revision": CORRECTIVE_SOURCE["revision"],
+        "remote_prefix": CORRECTIVE_SOURCE["prefix"],
+        "release_id": release_id,
+        "fresh_readback_verified": True,
+        "tree_listing_verified": True,
+    }
+    if any(disposal.get(key) != value for key, value in required.items()):
+        raise ValueError("corrective disposal receipt is not the approved private immutable release")
+    if snapshot_root.is_symlink() or not snapshot_root.is_dir():
+        raise ValueError("corrective snapshot root is unavailable")
+    manifest = _load_regular_json(snapshot_root / "manifest.json", "corrective snapshot manifest")
+    internal_revision, internal_release_id = manifest.get("source_revision"), manifest.get("source_release_id")
+    if (
+        manifest.get("source_format") != "verified_flywheel_rft_release"
+        or manifest.get("source_repository") != CORRECTIVE_SOURCE["repository"]
+        or not isinstance(internal_revision, str)
+        or re.fullmatch(r"[0-9a-f]{40}", internal_revision) is None
+        or not isinstance(internal_release_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", internal_release_id) is None
+    ):
+        raise ValueError("corrective snapshot local provenance is invalid")
+    if output.exists() or output.is_symlink():
+        raise ValueError("corrective release receipt output must not already exist")
+    payload = {
+        "schema_version": 1,
+        "published_release": {
+            **CORRECTIVE_SOURCE,
+            "release_id": release_id,
+            "disposal_receipt_sha256": hashlib.sha256(disposal_receipt.read_bytes()).hexdigest(),
+        },
+        "local_snapshot": {
+            "source_revision": internal_revision,
+            "source_release_id": internal_release_id,
+            "trees": {str(snapshot_root): _tree_readback_sha256(snapshot_root)},
+        },
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.parent.is_symlink() or not output.parent.is_dir():
+        raise ValueError("corrective release receipt output parent is unsafe")
+    temporary = output.with_name(f".{output.name}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        if temporary.is_symlink() or not temporary.is_file():
+            raise ValueError("corrective release receipt output is unsafe")
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return payload
+
+
 def _run(command: tuple[str, ...]) -> str:
     completed = subprocess.run(command, check=True, text=True, capture_output=True)
     return completed.stdout
@@ -860,10 +926,23 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
 
 
 def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object]:
-    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("materialize", "prepare", "capture-offers", "bootstrap-canary", "promote", "replacement-resume", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "bootstrap-canary", "promote", "replacement-resume", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "materialize":
         return _materialize(request)
+    if args.action == "derive-corrective-receipt":
+        fields = ("disposal_receipt", "snapshot_root", "output")
+        if any(not isinstance(request.get(field), str) for field in fields):
+            raise ValueError("derive-corrective-receipt requires disposal receipt, snapshot root, and output")
+        return {
+            "paid_action": False,
+            "action": args.action,
+            "receipt": derive_corrective_receipt(
+                disposal_receipt=Path(str(request["disposal_receipt"])),
+                snapshot_root=Path(str(request["snapshot_root"])),
+                output=Path(str(request["output"])),
+            ),
+        }
     if args.action == "prepare":
         generation = request.get("generation_root")
         if not isinstance(generation, str): raise ValueError("prepare requires generation_root")

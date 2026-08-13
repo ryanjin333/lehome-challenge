@@ -519,6 +519,39 @@ def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None
     assert (destination.with_name(destination.name + ".generation.json")).is_file()
 
 
+def test_derive_corrective_receipt_binds_disposal_proof_to_local_manifest_and_tree(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "materialized-rft-16"
+    root.mkdir()
+    (root / "frame.bin").write_bytes(b"accepted corrective frame")
+    (root / "manifest.json").write_text(json.dumps({
+        "source_format": "verified_flywheel_rft_release",
+        "source_repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"],
+        "source_revision": "c" * 40,
+        "source_release_id": "d" * 64,
+    }), encoding="utf-8")
+    disposal = tmp_path / "corrective-rft-disposal-receipt.json"
+    disposal.write_text(json.dumps({
+        "schema_version": 1, "disposable": True,
+        "repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"],
+        "immutable_revision": LIFECYCLE.CORRECTIVE_SOURCE["revision"],
+        "remote_prefix": LIFECYCLE.CORRECTIVE_SOURCE["prefix"],
+        "release_id": LIFECYCLE.CORRECTIVE_SOURCE["prefix"].rpartition("/")[2],
+        "fresh_readback_verified": True, "tree_listing_verified": True,
+    }), encoding="utf-8")
+    output = tmp_path / "corrective-release.json"
+    receipt = LIFECYCLE.derive_corrective_receipt(
+        disposal_receipt=disposal, snapshot_root=root, output=output,
+    )
+    assert receipt["published_release"]["revision"] == LIFECYCLE.CORRECTIVE_SOURCE["revision"]
+    assert receipt["local_snapshot"]["source_revision"] == "c" * 40
+    assert output.is_file() and not output.is_symlink()
+    (root / "frame.bin").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="tree"):
+        LIFECYCLE._verified_corrective_release_evidence([root], str(output))
+
+
 def test_prepare_requires_exact_pinned_sources_in_the_sealed_receipt(tmp_path: Path) -> None:
     from test_flywheel_mix import _prepared_source
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)

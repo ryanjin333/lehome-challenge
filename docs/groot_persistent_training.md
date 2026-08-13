@@ -10,6 +10,9 @@ chunked fixed-exposure `train` action remains the rollback path.
 Use only local evidence first:
 
 ```bash
+PYTHONPATH=source/lehome:trainer/src python3 \
+  scripts/run_groot_persistent_training.py derive-corrective-receipt \
+  --request corrective-release-receipt-request.json
 PYTHONPATH=source/lehome:trainer/src uv run python \
   scripts/run_groot_persistent_training.py materialize --request materialize-request.json
 PYTHONPATH=source/lehome:trainer/src uv run python \
@@ -28,7 +31,11 @@ python3 -m py_compile \
 git diff --check
 ```
 
-`materialize` is free and builds the generation itself with the canonical
+`derive-corrective-receipt` is free and local-only. It derives the corrective
+source receipt from the immutable disposal receipt and local materialized-RFT
+tree, binding the published private revision/prefix and the snapshot's internal
+source revision/release ID. It makes no Hub request. `materialize` accepts this
+derived receipt—not caller-attested corrective revision strings—and builds the generation itself with the canonical
 `build_mix_plan` and `materialize_mixed_snapshot` functions from a verified
 organizer root plus verified accepted corrective roots. It writes the sibling
 sealed receipt; it does not accept a hand-written receipt. `prepare` verifies
