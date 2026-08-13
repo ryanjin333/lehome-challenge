@@ -80,6 +80,33 @@ def test_status_parses_authenticated_terminal() -> None:
     assert result["terminal"] == terminal
 
 
+def test_bootstrap_canary_uses_only_historical_image_and_binds_instance_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(command)
+        if command[:4] == ("vastai", "--raw", "create", "instance"):
+            return '{"new_contract":9}'
+        if command[:4] == ("vastai", "--raw", "show", "instance"):
+            return '{"id":9,"gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"ssh_host":"host","ssh_port":22}'
+        if command[0] == "ssh":
+            return json.dumps({"hardware": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "driver_version": "595.71.05", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .2}, "nvml": {"utilization_percent": 80}})
+        raise AssertionError(command)
+
+    monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
+    receipt = LIFECYCLE.bootstrap_canary(
+        evidence={"offer": {"id": 7, "min_bid": .5}, "search_mode": "interruptible", "expires_at_unix": 101, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE},
+        runner=runner,
+    )
+
+    assert receipt["instance_id"] == 9
+    assert receipt["trainer_image"] == LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE
+    assert receipt["training_capability"]["image_digest"] == LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
+    assert any("--one-step" in command[-1] for command in commands if command[0] == "ssh")
+
+
 def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None:
     # The lifecycle's free preparation action must exercise the same canonical
     # mix/materialization implementation as production, rather than accepting

@@ -27,6 +27,10 @@ PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revisi
 # WS/S allowlist on raw rows in ``_offer_gpu``.
 OFFER_QUERY = "gpu_ram>=96000 num_gpus=1 reliability>=0.95"
 _DIGEST_PREFIX = "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:"
+BOOTSTRAP_TRAINER_IMAGE = (
+    _DIGEST_PREFIX
+    + "b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746"
+)
 Runner = Callable[[tuple[str, ...]], str]
 
 
@@ -94,16 +98,19 @@ def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: 
     return {"schema_version": 1, "kind": "persistent_training_offer", "offer": safe_offer, "account_hourly_total_usd": total, "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds, "search_mode": "interruptible"}
 
 
-def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep) -> dict[str, object]:
+def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep, require_capability: bool = True) -> dict[str, object]:
     offer = evidence.get("offer")
     if not isinstance(offer, Mapping) or type(offer.get("id")) is not int: raise ValueError("offer evidence is invalid")
     if evidence.get("search_mode") != "interruptible" or type(evidence.get("expires_at_unix")) is not int or evidence["expires_at_unix"] < int(time.time()): raise ValueError("offer evidence is expired or not interruptible")
     image = _trainer_image(evidence.get("trainer_image"))
     capability = evidence.get("training_capability")
     image_digest = image.rpartition("@")[2]
-    if not isinstance(capability, Mapping) or capability.get("image_digest") != image_digest or not isinstance(capability.get("optimizer_step"), Mapping) or capability["optimizer_step"].get("passed") is not True or not isinstance(capability.get("nvml"), Mapping):
-        raise ValueError("rent requires a matching accepted training capability receipt")
-    validate_training_capability(capability)
+    if require_capability:
+        if not isinstance(capability, Mapping) or capability.get("image_digest") != image_digest or not isinstance(capability.get("optimizer_step"), Mapping) or capability["optimizer_step"].get("passed") is not True or not isinstance(capability.get("nvml"), Mapping):
+            raise ValueError("rent requires a matching accepted training capability receipt")
+        validate_training_capability(capability)
+    elif image != BOOTSTRAP_TRAINER_IMAGE:
+        raise ValueError("bootstrap canary requires the historical structurally pinned trainer image")
     bid = offer.get("min_bid", offer.get("dph_total"))
     if type(bid) not in (int, float) or float(bid) >= 1: raise ValueError("offer bid price is invalid")
     created = _json(runner, ("vastai", "--raw", "create", "instance", str(offer["id"]), "--image", image, "--disk", "300", "--bid_price", str(bid), "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + image))
@@ -121,8 +128,41 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
         if absent not in ({}, None): raise ValueError("post-create cleanup absence readback failed")
         raise ValueError("instance readiness poll timed out")
     if not isinstance(live, Mapping) or live.get("id") != instance_id or not _offer_gpu(live) or live.get("num_gpus") != 1 or not live.get("ssh_host") or type(live.get("ssh_port")) is not int or float(live.get("dph_total", 99)) >= 1:
-        runner(("vastai", "destroy", "instance", str(instance_id), "--yes")); raise ValueError("instance readback does not match accepted offer")
+        runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+        absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+        if absent not in ({}, None):
+            raise ValueError("post-create cleanup absence readback failed")
+        raise ValueError("instance readback does not match accepted offer")
     return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "trainer_image": image, "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _hash(live)}
+
+
+def bootstrap_canary(*, evidence: Mapping[str, object], runner: Runner) -> dict[str, object]:
+    """Rent the one historical image only long enough to prove its capability.
+
+    Full 2K actions cannot call this path: they consume the resulting canonical
+    receipt through ``rent`` with ``require_capability=True``.
+    """
+    if evidence.get("trainer_image") != BOOTSTRAP_TRAINER_IMAGE:
+        raise ValueError("bootstrap canary requires the historical structurally pinned trainer image")
+    instance = rent(evidence=evidence, runner=runner, require_capability=False)
+    command = (*_ssh_prefix(instance), "set -eu; timeout 600 lehome-train validate-training-capability --one-step")
+    try:
+        capability = json.loads(runner(command))
+    except json.JSONDecodeError as error:
+        raise ValueError("bootstrap canary did not emit a capability receipt") from error
+    if not isinstance(capability, Mapping):
+        raise ValueError("bootstrap canary did not emit a capability receipt")
+    if capability.get("image_digest") != BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]:
+        raise ValueError("bootstrap capability image does not bind to rented image")
+    validated = dict(validate_training_capability(capability))
+    return {
+        "schema_version": 1,
+        "kind": "persistent_training_capability",
+        "instance_id": instance["instance_id"],
+        "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
+        "provider_response_sha256": instance["provider_response_sha256"],
+        "training_capability": validated,
+    }
 
 
 def _ssh_prefix(instance: Mapping[str, object]) -> tuple[str, ...]:
@@ -284,7 +324,7 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
 
 
 def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object]:
-    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("materialize", "prepare", "capture-offers", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true")
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("materialize", "prepare", "capture-offers", "bootstrap-canary", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "materialize":
         return _materialize(request)
@@ -300,6 +340,7 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
         return {"paid_action": False, "action": "prepare", "organizer_source": ORGANIZER_SOURCE, "corrective_source": CORRECTIVE_SOURCE, "request": request}
     if not args.execute: return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
     if args.action == "capture-offers": return capture_offers(runner=runner)
+    if args.action == "bootstrap-canary": return bootstrap_canary(evidence=request, runner=runner)
     if args.action == "rent": return rent(evidence=request, runner=runner)
     if args.action == "destroy": return destroy(instance_id=request.get("instance_id"), training_receipt=request, runner=runner)  # type: ignore[arg-type]
     instance = request.get("instance")
