@@ -156,6 +156,8 @@ def test_status_reads_only_requested_terminal_beneath_output() -> None:
 
     with pytest.raises(ValueError, match="terminal path"):
         LIFECYCLE.remote_action(action="status", instance=instance, request={"terminal_path": "/tmp/terminal.json"}, runner=FailRunner())
+    with pytest.raises(ValueError, match="terminal path"):
+        LIFECYCLE.remote_action(action="status", instance=instance, request={"terminal_path": "/output/x;whoami"}, runner=FailRunner())
 
 
 def test_stage_setup_hydrates_only_operational_roots() -> None:
@@ -208,6 +210,7 @@ def test_bootstrap_canary_uses_only_historical_image_and_binds_instance_receipt(
 
     assert receipt["instance_id"] == 9
     assert receipt["trainer_image"] == LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE
+    assert receipt["instance"]["host"] == "host"
     assert receipt["training_capability"]["image_digest"] == LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
     assert any("--one-step" in command[-1] for command in commands if command[0] == "ssh")
 

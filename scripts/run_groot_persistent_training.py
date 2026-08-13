@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import subprocess
 import tarfile
 import time
@@ -187,6 +188,7 @@ def bootstrap_canary(*, evidence: Mapping[str, object], runner: Runner) -> dict[
         "instance_id": instance["instance_id"],
         "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
         "provider_response_sha256": instance["provider_response_sha256"],
+        "instance": dict(instance),
         "training_capability": validated,
     }
 
@@ -390,6 +392,7 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
             type(terminal_path) is not str
             or not terminal_path.startswith("/output/")
             or ".." in Path(terminal_path).parts
+            or re.fullmatch(r"/output/[A-Za-z0-9._/-]+", terminal_path) is None
         ):
             raise ValueError("status terminal path must be beneath /output")
         commands = {
