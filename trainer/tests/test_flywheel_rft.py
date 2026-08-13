@@ -35,7 +35,7 @@ def test_rft_snapshot_trains_only_seen_successes_and_keeps_episode_holdout(
         (tmp_path / "snapshot" / "manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["episode_count"] == 2
-    assert manifest["future_actions"]["horizon"] == 40
+    assert manifest["future_actions"]["horizon"] == 16
     assert len(manifest["train_episode_ids"]) == 1
     assert len(manifest["validation_episode_ids"]) == 1
     selection = json.loads(
@@ -47,6 +47,7 @@ def test_rft_snapshot_trains_only_seen_successes_and_keeps_episode_holdout(
         "seen-success-1",
         "seen-success-2",
     }
+    assert selection["action_horizon"] == 16
     info = json.loads(
         (tmp_path / "snapshot" / "meta" / "info.json").read_text(encoding="utf-8")
     )

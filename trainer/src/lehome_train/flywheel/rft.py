@@ -151,7 +151,7 @@ def materialize_rft_snapshot(
     validation_fraction: float,
     corrective_campaign: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Select seen autonomous successes and build one efficient 40-step dataset."""
+    """Select seen autonomous successes and build one efficient 16-step dataset."""
 
     _require_identity(source_repository, source_revision, release_id)
     if type(split_seed) is not int:

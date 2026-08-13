@@ -53,8 +53,8 @@ def _raw_rft_episode(
             "action_source": "policy", "segment": 0,
             "state": [float(index)] * 12, "action": [float(index + 1)] * 12,
             "reward": 1.0, "success": accepted_success,
-            "policy_request_id": f"request-{index // 40}",
-            "policy_chunk_offset": index % 40,
+            "policy_request_id": f"request-{index // 16}",
+            "policy_chunk_offset": index % 16,
         })
     for camera in ("top_rgb", "left_rgb", "right_rgb"):
         _video(writer.staging / "videos" / f"{camera}.mp4", frames=frames)
@@ -120,21 +120,22 @@ def test_materializer_rejects_tampered_or_unlisted_raw_artifact(tmp_path: Path) 
 def test_rft_materializer_accepts_only_verified_seen_policy_successes(tmp_path: Path) -> None:
     report = materialize_rft_episode(_raw_rft_episode(tmp_path), tmp_path / "out")
 
-    assert report.selected_observations == 6
+    assert report.selected_observations == 30
     manifest = json.loads((tmp_path / "out" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["episode_count"] == 1
     assert manifest["frame_count"] == 45
     assert manifest["future_actions"] == {
-        "horizon": 40,
+        "horizon": 16,
         "loader_allow_padding": False,
         "materialized_windows": False,
         "tail_convention": "drop_incomplete_windows",
-        "valid_window_counts": {"0": 6},
+        "valid_window_counts": {"0": 30},
     }
     provenance = json.loads(
         (tmp_path / "out" / "meta" / "materialization-provenance.json").read_text(encoding="utf-8")
     )
     assert provenance["training_method"] == "rejection_finetuning"
+    assert provenance["selection_horizon"] == 16
     assert provenance["selected_frame_ranges"] == [{
         "raw_episode_id": "episode-rft-1",
         "frame_start": 0,

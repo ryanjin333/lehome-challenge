@@ -20,7 +20,7 @@ from lehome_train.io import sha256_file
 
 
 ACTION_HORIZON = 16
-RFT_ACTION_HORIZON = 40
+RFT_ACTION_HORIZON = 16
 CAMERA_KEYS = ("top_rgb", "left_rgb", "right_rgb")
 
 
