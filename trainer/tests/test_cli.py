@@ -316,6 +316,10 @@ def test_gpu_commands_dispatch_checked_request_to_runtime_factory(
             calls.append(("smoke", request))
             return {"status": "smoked"}
 
+        def tune(self, request: dict[str, object]) -> dict[str, object]:
+            calls.append(("tune", request))
+            return {"status": "tuned"}
+
         def train(self, request: dict[str, object]) -> dict[str, object]:
             calls.append(("train", request))
             return {"status": "trained"}

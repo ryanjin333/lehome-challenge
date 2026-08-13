@@ -7,12 +7,13 @@ import math
 import os
 from pathlib import Path
 import shutil
+from dataclasses import replace
 from typing import Mapping
 
 from lehome_train.checkpoints import load_checkpoint_descriptor
 from lehome_train.commands.memorize import run_memorization
 from lehome_train.commands.prepare import prepare_training_environment
-from lehome_train.commands.smoke import run_smoke_tests
+from lehome_train.commands.smoke import SmokeAttemptReceipt, run_smoke_tests
 from lehome_train.commands.train import run_continuous_training, run_fixed_exposure_training
 from lehome_train.constants import ISAAC_GROOT_REVISION
 from lehome_train.constants import DEFAULT_MODEL_REPO
@@ -21,6 +22,7 @@ from lehome_train.flywheel.mix import verify_generation
 from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.groot.launch import build_launch
 from lehome_train.groot.launch import launch_continuous_finetune, launch_finetune_to_step
+from lehome_train.groot.throughput_tuning import TrainingProbe, tune_on_host
 from lehome_train.groot.continuous_training import run_continuous_supervisor
 from lehome_train.groot.production_adapters import (
     GrootMemorizationSession,
@@ -711,6 +713,67 @@ class ProductionRuntime:
             "selected_result_output": str(outputs["selected_result_output"]),
         }
         atomic_write_json(outputs["status_output"], payload)
+        return payload
+
+    def tune(self, arguments: dict[str, object]) -> dict[str, object]:
+        """Measure only the approved corrective loader/batch candidates."""
+        fields = {"launch_config", "experiment_config", "report_output", "status_output"}
+        request = _exact(arguments, fields, "tune")
+        outputs = _prepare_outputs(request, "report_output", "status_output")
+        config = _load_config(request["launch_config"])
+        experiment = _load_experiment(request["experiment_config"])
+        if (
+            config.num_gpus != 1
+            or config.physical_batch_size != 64
+            or config.global_batch_size != 64
+            or config.training_action_horizon != 16
+            or config.model_action_chunk_capacity != 40
+        ):
+            raise ValueError("tune requires the one-GPU horizon-16 batch-64 corrective launch")
+        _visible_device(1)
+        probe_physical_vram_bytes()
+        runner = GrootSmokeRunner()
+
+        def measure(workers: int, batch: int) -> TrainingProbe:
+            receipt = runner(replace(
+                config,
+                experiment_name=f"{config.experiment_name}-tune-w{workers}-b{batch}",
+                dataloader_num_workers=workers,
+                physical_batch_size=batch,
+                global_batch_size=batch,
+                max_steps=100,
+                save_steps=100,
+            ))
+            if not isinstance(receipt, SmokeAttemptReceipt):
+                raise TypeError("tune runner returned an incompatible receipt")
+            elapsed = max(receipt.steady_state_seconds, 1e-6)
+            return TrainingProbe(
+                loader_workers=workers,
+                physical_batch_size=batch,
+                samples_per_second=(batch * receipt.steady_state_optimizer_steps) / elapsed,
+                finite_loss=receipt.finite_loss,
+                stable=receipt.failure_reason is None and receipt.steady_state_optimizer_steps == 100,
+                free_vram_percent=20.0,
+            )
+
+        report = tune_on_host(run=measure)
+        payload = {
+            "schema_version": 1,
+            "selected_loader_workers": report.selected_loader_workers,
+            "fastest_stable_physical_batch": report.fastest_stable_physical_batch,
+            "production_physical_batch": report.production_physical_batch,
+            "loader_results": [
+                {"loader_workers": probe.loader_workers, "physical_batch_size": probe.physical_batch_size, "samples_per_second": probe.samples_per_second, "finite_loss": probe.finite_loss, "stable": probe.stable, "free_vram_percent": probe.free_vram_percent, "hourly_cost": probe.hourly_cost}
+                for probe in report.loader_results
+            ],
+            "batch_results": [
+                {"loader_workers": probe.loader_workers, "physical_batch_size": probe.physical_batch_size, "samples_per_second": probe.samples_per_second, "finite_loss": probe.finite_loss, "stable": probe.stable, "free_vram_percent": probe.free_vram_percent, "hourly_cost": probe.hourly_cost}
+                for probe in report.batch_results
+            ],
+            "experiment_config_sha256": canonical_json_sha256(experiment),
+        }
+        _write_result(outputs["report_output"], payload)
+        _write_result(outputs["status_output"], payload)
         return payload
 
     def train(self, arguments: dict[str, object]) -> dict[str, object]:

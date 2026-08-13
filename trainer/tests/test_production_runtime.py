@@ -313,12 +313,29 @@ def test_smoke_uses_nvml_probe_and_canonical_controller_selection(
             "status_output": str(status_path),
         }
     )
-
     assert observed["physical_vram_bytes"] == 96 * 1024**3
     assert callable(observed["runner"])
     assert callable(observed["sampler_factory"])
     assert json.loads(selected_path.read_text(encoding="utf-8"))["physical_batch_size"] == 64
 
+
+def test_tune_uses_only_loader_4_8_12_and_batch_64_96_128(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launch_path = _write(tmp_path / "prepared" / "tune-launch.json", _launch_payload(tmp_path, batch=64, max_steps=2000))
+    experiment_path = _write(tmp_path / "prepared" / "experiment.json", _experiment_payload(batch=64))
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(runtime_module, "_visible_device", lambda *_args: "0")
+    monkeypatch.setattr(runtime_module, "probe_physical_vram_bytes", lambda: 96 * 1024**3)
+    monkeypatch.setattr(runtime_module, "GrootSmokeRunner", lambda: lambda config: calls.append((config.dataloader_num_workers, config.physical_batch_size)) or runtime_module.SmokeAttemptReceipt(100, 1, True, 0, 0, 1, 100, (), None))
+    result = runtime_module.ProductionRuntime().tune({
+        "launch_config": launch_path, "experiment_config": experiment_path,
+        "report_output": str(tmp_path / "output" / "report.json"),
+        "status_output": str(tmp_path / "output" / "status.json"),
+    })
+    assert result["production_physical_batch"] == 64
+    assert [workers for workers, batch in calls if batch == 64][:3] == [4, 8, 12]
+    assert [batch for workers, batch in calls if workers == result["selected_loader_workers"]][-3:] == [64, 96, 128]
 
 def test_train_delegates_all_budget_resume_storage_and_upload_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

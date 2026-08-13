@@ -275,6 +275,16 @@ def smoke(
     _gpu_command("smoke", request, runtime_factory)
 
 
+@app.command("tune")
+def tune(
+    request: Path = typer.Option(..., "--request"),
+    runtime_factory: Optional[str] = typer.Option(None, "--runtime-factory"),
+) -> None:
+    """Measure the bounded corrective loader and batch candidates."""
+
+    _gpu_command("tune", request, runtime_factory)
+
+
 @app.command("train")
 def train(
     request: Path = typer.Option(..., "--request"),
