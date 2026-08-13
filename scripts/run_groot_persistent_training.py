@@ -427,12 +427,28 @@ def _require_instance_capability(instance: Mapping[str, object], request: Mappin
     validate_training_capability(training_capability)
 
 
-def promote_canary(*, capability_receipt: Mapping[str, object]) -> dict[str, object]:
-    """Recover the authenticated canary instance for stage/train promotion."""
+def promote_canary(*, capability_receipt: Mapping[str, object], runner: Runner) -> dict[str, object]:
+    """Fresh-read the exact canary before allowing an operational promotion."""
     instance = capability_receipt.get("instance")
     if not isinstance(instance, Mapping):
         raise ValueError("capability receipt lacks an instance-bound SSH receipt")
     _require_instance_capability(instance, {"capability_receipt": capability_receipt})
+    instance_id = instance.get("instance_id")
+    if type(instance_id) is not int:
+        raise ValueError("capability receipt instance is invalid")
+    live = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+    if (
+        not isinstance(live, Mapping)
+        or live.get("id") != instance_id
+        or live.get("actual_status", "running") != "running"
+        or not _offer_gpu(live)
+        or live.get("num_gpus") != 1
+        or float(live.get("dph_total", 99)) >= 1
+        or not isinstance(live.get("ssh_host"), str)
+        or type(live.get("ssh_port")) is not int
+        or _hash(live) != instance.get("provider_response_sha256")
+    ):
+        raise ValueError("fresh live provider readback does not match capability instance")
     return dict(instance)
 
 
@@ -582,7 +598,7 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
     if not args.execute: return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
     if args.action == "capture-offers": return capture_offers(runner=runner)
     if args.action == "bootstrap-canary": return bootstrap_canary(evidence=request, runner=runner)
-    if args.action == "promote": return {"paid_action": False, "action": "promote", "instance": promote_canary(capability_receipt=request)}
+    if args.action == "promote": return {"paid_action": True, "action": "promote", "instance": promote_canary(capability_receipt=request, runner=runner)}
     if args.action == "rent": return rent(evidence=request, runner=runner)
     if args.action == "destroy":
         return destroy(

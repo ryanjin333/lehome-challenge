@@ -240,7 +240,28 @@ def test_promote_canary_recovers_only_the_bound_instance_receipt() -> None:
         "instance": {"instance_id": 9, "trainer_image": image, "provider_response_sha256": "a" * 64, "host": "host", "port": 22},
         "training_capability": {"hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05", "image_digest": image.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .1}, "nvml": {"utilization_percent": 80}},
     }
-    assert LIFECYCLE.promote_canary(capability_receipt=receipt)["instance_id"] == 9
+    def runner(command: tuple[str, ...]) -> str:
+        assert command == ("vastai", "--raw", "show", "instance", "9")
+        return json.dumps({
+            "id": 9, "actual_status": "running", "gpu_name": "RTX PRO 6000 WS",
+            "gpu_ram": 96000, "num_gpus": 1, "dph_total": .7,
+            "ssh_host": "host", "ssh_port": 22,
+        })
+    receipt["instance"]["provider_response_sha256"] = LIFECYCLE._hash(json.loads(runner(("vastai", "--raw", "show", "instance", "9"))))
+    receipt["provider_response_sha256"] = receipt["instance"]["provider_response_sha256"]
+    assert LIFECYCLE.promote_canary(capability_receipt=receipt, runner=runner)["instance_id"] == 9
+
+
+def test_promote_canary_requires_fresh_matching_live_provider_readback() -> None:
+    image = LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE
+    receipt = {
+        "kind": "persistent_training_capability", "instance_id": 9,
+        "trainer_image": image, "provider_response_sha256": "a" * 64,
+        "instance": {"instance_id": 9, "trainer_image": image, "provider_response_sha256": "a" * 64, "host": "host", "port": 22, "offer_evidence_sha256": "b" * 64},
+        "training_capability": {"hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05", "image_digest": image.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .1}, "nvml": {"utilization_percent": 80}},
+    }
+    with pytest.raises(ValueError, match="fresh live"):
+        LIFECYCLE.promote_canary(capability_receipt=receipt, runner=lambda _: "{}")
 
 
 def test_bootstrap_canary_stages_current_code_and_cleans_up_after_probe_failure(
