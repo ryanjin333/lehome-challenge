@@ -217,20 +217,74 @@ def _stage_setup_command() -> str:
     """Static remote setup: extraction is constrained to the three mounts."""
     return (
         "set -eu; "
-        "mkdir -p /prepared /prepared/code /cache /cache/parent /output; "
+        "mkdir -p /prepared /prepared/code /prepared/config /cache /cache/parent /output; "
         "rm -rf /prepared/generation; "
         "mv /tmp/lehome-stage/generation /prepared/generation; "
+        "mv /tmp/lehome-stage/generation.generation.json /prepared/generation.generation.json; "
+        "mv /tmp/lehome-stage/launch.json /prepared/config/launch.json; "
+        "mv /tmp/lehome-stage/experiment.json /prepared/config/experiment.json; "
+        "mv /tmp/lehome-stage/continuous.json /prepared/config/continuous.json; "
+        "mv /tmp/lehome-stage/resume.json /prepared/config/resume.json; "
+        "mv /tmp/lehome-stage/tune.json /prepared/config/tune.json; "
+        "mv /tmp/lehome-stage/modality.py /prepared/config/modality.py; "
+        "mv /tmp/lehome-stage/token /prepared/config/publisher.token; "
         "tar --no-same-owner --no-same-permissions -xf /tmp/lehome-stage/code.bundle -C /prepared/code; "
         "tar --no-same-owner --no-same-permissions -xf /tmp/lehome-stage/parent.tar -C /cache/parent; "
         "test \"$(sha256sum /tmp/lehome-stage/parent.tar | cut -d' ' -f1)\" = "
         + PARENT_CHECKPOINT["artifact_sha256"]
-        + "; chmod 600 /tmp/lehome-stage/token; "
+        + "; chmod 600 /prepared/config/publisher.token; "
         "test ! -L /prepared/generation; test ! -L /cache/parent; test ! -L /prepared/code"
     )
 
 
+def _load_regular_json(path: Path, label: str) -> Mapping[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} must be a regular JSON file")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError(f"{label} is malformed") from None
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} is malformed")
+    return value
+
+
+def _validate_staged_operational_requests(launch_path: Path, continuous_path: Path) -> None:
+    """Ensure the request already names the fixed paths created by staging."""
+    launch = _load_regular_json(launch_path, "launch config")
+    expected_launch = {
+        "base_model_path": "/cache/parent",
+        "dataset_path": "/prepared/generation",
+        "output_dir": "/output",
+        "modality_config_path": "/prepared/config/modality.py",
+    }
+    labels = {
+        "base_model_path": "base model path",
+        "dataset_path": "generation path",
+        "output_dir": "output path",
+        "modality_config_path": "modality path",
+    }
+    for key, expected in expected_launch.items():
+        if launch.get(key) != expected:
+            raise ValueError(f"stage {labels[key]} is not the hydrated operational path")
+    continuous = _load_regular_json(continuous_path, "continuous request")
+    expected_continuous = {
+        "launch_config": "/prepared/config/launch.json",
+        "experiment_config": "/prepared/config/experiment.json",
+        "generation_root": "/prepared/generation",
+        "publisher_token_file": "/prepared/config/publisher.token",
+    }
+    for key, expected in expected_continuous.items():
+        if continuous.get(key) != expected:
+            raise ValueError("stage continuous request is not bound to hydrated paths")
+
+
 def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     _stage_command(request)
+    _validate_staged_operational_requests(
+        Path(str(request["launch_config"])),
+        Path(str(request["continuous_request"])),
+    )
     remote_dir = "/tmp/lehome-stage"
     runner((*_ssh_prefix(instance), "mkdir -p " + remote_dir))
     generation_root = Path(str(request["generation_root"]))
@@ -317,9 +371,9 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
         ):
             raise ValueError("status terminal path must be beneath /output")
         commands = {
-            "tune": "lehome-train smoke --request /tmp/lehome-stage/tune.json",
-            "train": "env -u HF_TOKEN lehome-train continuous-train --request /tmp/lehome-stage/continuous.json",
-            "resume": "env -u HF_TOKEN lehome-train continuous-train --request /tmp/lehome-stage/resume.json",
+            "tune": "PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src lehome-train smoke --request /prepared/config/tune.json",
+            "train": "env -u HF_TOKEN PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src lehome-train continuous-train --request /prepared/config/continuous.json",
+            "resume": "env -u HF_TOKEN PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src lehome-train continuous-train --request /prepared/config/resume.json",
             "status": "test -f " + str(terminal_path) + " && cat " + str(terminal_path),
         }
         command = "set -eu; " + commands[action]

@@ -152,7 +152,17 @@ def test_stage_setup_hydrates_only_operational_roots() -> None:
     assert "tar --no-same-owner --no-same-permissions -xf /tmp/lehome-stage/code.bundle -C /prepared/code" in command
     assert "tar --no-same-owner --no-same-permissions -xf /tmp/lehome-stage/parent.tar -C /cache/parent" in command
     assert "mv /tmp/lehome-stage/generation /prepared/generation" in command
-    assert "chmod 600 /tmp/lehome-stage/token" in command
+    assert "chmod 600 /prepared/config/publisher.token" in command
+    assert "mv /tmp/lehome-stage/continuous.json /prepared/config/continuous.json" in command
+
+
+def test_stage_rejects_runtime_request_that_points_at_unstaged_paths(tmp_path: Path) -> None:
+    launch = tmp_path / "launch.json"
+    launch.write_text(json.dumps({"base_model_path": "/tmp/model", "dataset_path": "/prepared/generation", "output_dir": "/output/run", "modality_config_path": "/prepared/config/modality.py"}))
+    continuous = tmp_path / "continuous.json"
+    continuous.write_text(json.dumps({"launch_config": "/prepared/config/launch.json", "experiment_config": "/prepared/config/experiment.json", "generation_root": "/prepared/generation", "publisher_token_file": "/prepared/config/publisher.token"}))
+    with pytest.raises(ValueError, match="base model path"):
+        LIFECYCLE._validate_staged_operational_requests(launch, continuous)
 
 
 def test_bootstrap_canary_uses_only_historical_image_and_binds_instance_receipt(

@@ -10,14 +10,21 @@ chunked fixed-exposure `train` action remains the rollback path.
 Use only local evidence first:
 
 ```bash
-python3 scripts/run_groot_persistent_training.py prepare --request request.json
+PYTHONPATH=source/lehome:trainer/src uv run python \
+  scripts/run_groot_persistent_training.py materialize --request materialize-request.json
+PYTHONPATH=source/lehome:trainer/src uv run python \
+  scripts/run_groot_persistent_training.py prepare --request prepare-request.json
 PYTHONPATH=source/lehome:trainer/src uv run --project trainer pytest -q \
   trainer/tests/test_flywheel_mix.py trainer/tests/test_throughput_tuning.py \
   trainer/tests/test_continuous_training.py trainer/tests/test_groot_config.py \
   trainer/tests/test_groot_launch.py trainer/tests/test_persistent_training_lifecycle.py
 ```
 
-`prepare` verifies the supplied local sibling generation receipt is sealed
+`materialize` is free and builds the generation itself with the canonical
+`build_mix_plan` and `materialize_mixed_snapshot` functions from a verified
+organizer root plus verified accepted corrective roots. It writes the sibling
+sealed receipt; it does not accept a hand-written receipt. `prepare` verifies
+the supplied local sibling generation receipt is sealed
 before recording the exact organizer source (`lehome/dataset_challenge_merged`
 at `17e8dee8fac294ffd21d250501d3b31bf8679042`, `four_types_merged`) and its
 verified mirror/manifest, plus the private corrective revision and prefix. It
@@ -41,8 +48,21 @@ the exact image digest, CUDA/Torch CUDA, compute capability, a finite optimizer
 step, and NVML telemetry. A newer Blackwell driver is accepted only by that
 training capability gate; rollout driver policy is separate.
 
-The rent request must name an accepted trainer OCI digest. A historical image
-is not implicitly accepted: it still needs this training capability smoke.
+The two phases are deliberately separate. `bootstrap-canary --execute` may
+rent only the historical structurally pinned image
+`ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746`
+for one bounded optimizer-step capability command. Its receipt binds the
+capability result to the instance, image, and provider readback. Full
+`tune`/`train`/`resume` actions require that exact instance-bound receipt;
+they cannot promote an arbitrary digest or a receipt from another rental.
+
+Stage verifies a complete local sealed-generation tree after SCP, safely
+extracts the code bundle beneath `/prepared/code` and the approved parent
+archive beneath `/cache/parent`, and keeps terminal/status artifacts beneath
+`/output`. The staged trainer process is invoked with an explicit code
+`PYTHONPATH`; its environment unsets `HF_TOKEN`. The chmod-600 token file is
+read only by the asynchronous publisher parent and is never passed in the
+trainer command line or trainer environment.
 Stage uses strict port-bound SSH/SCP, transfers the complete sealed generation,
 receipt, clean code bundle, parent artifact, config/modality, and token file,
 then SHA-256-reads every remote file before a later tune/train action.
@@ -58,8 +78,10 @@ and no unseen source. It starts one official process and an observer that only
 snapshots checkpoints after upstream completion evidence. A single background
 publisher packages those independent copies and performs immutable Hub
 readbacks; caller-supplied checkpoint step lists are not trusted. On
-interruption, resume only with the same generation/config/image identities and
-the last authenticated resumable checkpoint.
+provider interruption, resume only with the same generation/config/image
+identities and the last authenticated resumable checkpoint after an immutable
+Hub download/readback. A code, data, or configuration failure is terminal but
+not resumable.
 
 Stage transfers require the exact clean code bundle hash, sealed generation and
 receipt, parent artifact digest, config/modality, and token-file path; the
