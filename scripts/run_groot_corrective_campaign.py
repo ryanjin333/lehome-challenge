@@ -250,7 +250,8 @@ def _terminal_receipt(root: Path, attempt: Mapping[str, object], baseline: Mappi
     return {
         "schema_version": 1, "attempt_id": attempt_id, "wave_index": attempt["wave_index"], "worker_slot": attempt["worker_slot"],
         "episode_id": episode_id, "category": attempt["category"], "release_stage": "seen", "outcome": episode["outcome"],
-        "accepted_success": episode["accepted_success"], "reset_sha256": episode["reset_hash"],
+        "accepted_success": episode["accepted_success"] and episode["terminal_reason"] == "success",
+        "reset_sha256": episode["reset_hash"],
         "randomization_sha256": _canonical_sha256(randomization), "hard_state_sha256": _canonical_sha256(terminal),
         "parent_checkpoint_repository": baseline["parent_checkpoint_repository"], "parent_checkpoint_revision": baseline["parent_checkpoint_revision"],
         "parent_checkpoint_artifact_sha256": baseline["parent_checkpoint_artifact_sha256"], "parent_checkpoint_step": baseline["parent_checkpoint_step"],

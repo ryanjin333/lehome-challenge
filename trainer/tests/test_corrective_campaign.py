@@ -98,13 +98,19 @@ def _snapshot(*, garment: str, randomization: dict[str, object]) -> dict[str, ob
     }
 
 
-def _complete(root: Path, attempt: dict[str, object], baseline: dict[str, object]) -> None:
+def _complete(
+    root: Path,
+    attempt: dict[str, object],
+    baseline: dict[str, object],
+    *,
+    terminal_reason: str = "success",
+) -> None:
     attempt_id = str(attempt["attempt_id"])
     artifact = root / "raw" / attempt_id
     reset = _snapshot(garment=str(attempt["garment_name"]), randomization={"seed": attempt["seed"]})
     terminal = _snapshot(garment=str(attempt["garment_name"]), randomization={"seed": attempt["seed"]})
     terminal["scene_state"] = {"terminal": attempt_id}
-    episode = {"episode_id": attempt_id, "terminal_reason": "success", "outcome": "success", "accepted_success": True, "reset_hash": _hash(reset), "identity": {"episode_id": attempt_id, "policy_repo": baseline["parent_checkpoint_repository"], "policy_revision": baseline["parent_checkpoint_revision"], "policy_step": 12000, "code_revision": baseline["code_revision"], "asset_revision": baseline["asset_revision"], "simulator_version": baseline["simulator_version"], "garment_name": attempt["garment_name"], "category": attempt["category"], "release_stage": "seen", "seed": attempt["seed"], "instruction": "fold", "strategy": "mild"}}
+    episode = {"episode_id": attempt_id, "terminal_reason": terminal_reason, "outcome": "success", "accepted_success": True, "reset_hash": _hash(reset), "identity": {"episode_id": attempt_id, "policy_repo": baseline["parent_checkpoint_repository"], "policy_revision": baseline["parent_checkpoint_revision"], "policy_step": 12000, "code_revision": baseline["code_revision"], "asset_revision": baseline["asset_revision"], "simulator_version": baseline["simulator_version"], "garment_name": attempt["garment_name"], "category": attempt["category"], "release_stage": "seen", "seed": attempt["seed"], "instruction": "fold", "strategy": "mild"}}
     _json(artifact / "episode.json", episode); _json(artifact / "snapshots" / "reset.json", reset); _json(artifact / "snapshots" / "terminal.json", terminal)
     manifest = {p.relative_to(artifact).as_posix(): {"sha256": hashlib.sha256(p.read_bytes()).hexdigest(), "size": p.stat().st_size} for p in sorted(artifact.rglob("*.json"))}
     _json(artifact / "SHA256SUMS.json", manifest)
@@ -128,6 +134,21 @@ def test_resume_closes_verified_wave_with_fresh_evidence_and_strict_receipts(tmp
     _provider_file(provider, _provider(evidence_id="evidence-2"))
     result = CAMPAIGN.run_corrective_campaign(_args(root, baseline, provider))
     assert result["closed_wave_count"] == 1 and len(list((root / "receipts").glob("*.json"))) == 4
+
+
+def test_terminal_receipt_does_not_accept_success_at_horizon(tmp_path: Path) -> None:
+    root, baseline, provider, base, _ = _setup(tmp_path)
+    first = CAMPAIGN.run_corrective_campaign(_args(root, baseline, provider))
+    attempts = json.loads(Path(first["launch_manifest"]).read_text())["attempts"]
+    _complete(root, attempts[0], base, terminal_reason="horizon")
+    for attempt in attempts[1:]:
+        _complete(root, attempt, base)
+    _provider_file(provider, _provider(evidence_id="evidence-2"))
+
+    CAMPAIGN.run_corrective_campaign(_args(root, baseline, provider))
+
+    receipt = json.loads((root / "receipts" / f"{attempts[0]['attempt_id']}.json").read_text())
+    assert receipt["accepted_success"] is False
 
 
 def test_resume_ignores_canary_sidecar_and_schedules_next_canonical_wave(tmp_path: Path) -> None:
