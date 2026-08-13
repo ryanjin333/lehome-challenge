@@ -17,6 +17,7 @@ from lehome_train.commands.train import run_continuous_training, run_fixed_expos
 from lehome_train.constants import ISAAC_GROOT_REVISION
 from lehome_train.constants import DEFAULT_MODEL_REPO
 from lehome_train.data.normalization import normalization_identity
+from lehome_train.flywheel.mix import verify_generation
 from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.groot.launch import build_launch
 from lehome_train.groot.launch import launch_continuous_finetune, launch_finetune_to_step
@@ -849,6 +850,7 @@ class ProductionRuntime:
         session = GrootTrainingSession(config=config, experiment_config=experiment, normalization_sha256=normalization, resume_checkpoint=resume)
         uploader = HubCheckpointUploader(repository=repository, revision=revision, experiment_id=config.experiment_name, artifact_root=config.output_dir, token=token)
         schedule = ExposureSchedule(physical_batch_size=64, sample_presentations=128_000, checkpoint_sample_presentations=64_000)
+        config_sha256 = canonical_json_sha256(config.identity())
         publications = run_continuous_supervisor(
             run_root=Path(config.output_dir) / config.experiment_name,
             launch=lambda: launch_continuous_finetune(config, **_launch_kwargs()),
@@ -863,7 +865,13 @@ class ProductionRuntime:
             launch=lambda: None,
             immutable_checkpoint_steps=lambda: verified,
         )
-        payload["immutable_checkpoint_publications"] = list(publications)
+        identity = {
+            "generation_sha256": _sha256(verify_generation(generation)["mix_plan_sha256"], "generation_sha256"),
+            "config_sha256": config_sha256,
+            "experiment_id": config.experiment_name,
+        }
+        payload.update(identity)
+        payload["immutable_checkpoint_publications"] = [dict(item) | identity for item in publications]
         if resume is not None:
             payload["resume_checkpoint_step"] = resume.record.optimizer_step
         _write_result(outputs["result_output"], payload)

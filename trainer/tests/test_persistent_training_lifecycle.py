@@ -43,6 +43,20 @@ def test_destroy_requires_two_immutable_checkpoints_bound_to_instance(tmp_path: 
         LIFECYCLE.destroy(instance_id=7, training_receipt=receipt)
 
 
+def test_destroy_requires_publications_bound_to_terminal_identity() -> None:
+    receipt = {
+        "kind": "continuous_corrective_training_terminal", "instance_id": 7,
+        "generation_sha256": "a" * 64, "config_sha256": "b" * 64,
+        "experiment_id": "persistent-001", "immutable_checkpoint_steps": [1000, 2000],
+        "immutable_checkpoint_publications": [
+            {"optimizer_step": step, "repository": "wrong/repo", "immutable_revision": "c" * 40, "remote_prefix": "prefix", "relative_path": f"step-{step}.tar", "artifact_sha256": "d" * 64, "artifact_byte_size": 1, "readback_verified": True, "generation_sha256": "a" * 64, "config_sha256": "b" * 64, "experiment_id": "persistent-001"}
+            for step in (1000, 2000)
+        ],
+    }
+    with pytest.raises(ValueError, match="approved model repository"):
+        LIFECYCLE.destroy(instance_id=7, training_receipt=receipt)
+
+
 def test_destroy_cli_reads_private_token_and_constructs_real_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -80,7 +94,7 @@ def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: 
     assert "untrusted_token" not in evidence["offer"]
     instance = LIFECYCLE.rent(evidence=evidence, runner=runner)
     assert instance["instance_id"] == 9
-    with pytest.raises(ValueError, match="destroy absence"):
+    with pytest.raises(ValueError, match="disposal terminal"):
         LIFECYCLE.destroy(instance_id=9, training_receipt={"kind": "continuous_corrective_training_terminal", "instance_id": 9, "immutable_checkpoint_steps": [1000, 2000], "immutable_checkpoint_publications": [{"optimizer_step": 1000, "repository": "ryanjin333/lehome-groot-n17-models", "immutable_revision": "a" * 40, "remote_prefix": "prefix", "relative_path": "checkpoints/step-1000.tar", "artifact_sha256": hashlib.sha256(b"artifact").hexdigest(), "artifact_byte_size": 8, "readback_verified": True}, {"optimizer_step": 2000, "repository": "ryanjin333/lehome-groot-n17-models", "immutable_revision": "b" * 40, "remote_prefix": "prefix", "relative_path": "checkpoints/step-2000.tar", "artifact_sha256": hashlib.sha256(b"artifact").hexdigest(), "artifact_byte_size": 8, "readback_verified": True}]}, runner=runner, transport=FakeHub(), token="test-token")
 
 

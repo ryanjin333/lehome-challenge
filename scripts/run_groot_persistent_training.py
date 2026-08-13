@@ -494,6 +494,8 @@ def _verify_publication_tree(*, publication: Mapping[str, object], transport: Hu
     """Perform the real authenticated immutable Hub readback, never a shell shim."""
     repository, revision, prefix = publication.get("repository"), publication.get("immutable_revision"), publication.get("remote_prefix")
     artifact, size = publication.get("artifact_sha256"), publication.get("artifact_byte_size")
+    if repository != PARENT_CHECKPOINT["repository"]:
+        raise ValueError("immutable publication repository is not the approved model repository")
     if not all(isinstance(value, str) and value for value in (repository, revision, prefix, artifact)) or type(size) is not int or size <= 0:
         raise ValueError("immutable publication binding is invalid")
     tree = transport.list_tree(repository=repository, revision=revision, token=token)
@@ -513,6 +515,20 @@ def destroy(*, instance_id: int, training_receipt: Mapping[str, object], runner:
     publications = training_receipt.get("immutable_checkpoint_publications")
     if training_receipt.get("kind") != "continuous_corrective_training_terminal" or training_receipt.get("instance_id") != instance_id or training_receipt.get("immutable_checkpoint_steps") != [1000, 2000] or not isinstance(publications, list) or {item.get("optimizer_step") for item in publications if isinstance(item, Mapping)} != {1000, 2000} or not all(isinstance(item, Mapping) and item.get("readback_verified") is True and isinstance(item.get("immutable_revision"), str) for item in publications):
         raise ValueError("instance-bound disposal requires two immutable checkpoints")
+    terminal_identity = (
+        training_receipt.get("generation_sha256"),
+        training_receipt.get("config_sha256"),
+        training_receipt.get("experiment_id"),
+    )
+    if not all(isinstance(value, str) and value for value in terminal_identity):
+        raise ValueError("disposal terminal lacks generation/config/experiment identity")
+    for item in publications:
+        assert isinstance(item, Mapping)
+        if (
+            item.get("repository") != PARENT_CHECKPOINT["repository"]
+            or (item.get("generation_sha256"), item.get("config_sha256"), item.get("experiment_id")) != terminal_identity
+        ):
+            raise ValueError("immutable publication is not bound to the approved model repository and terminal identity")
     if runner is not None:
         if transport is None or not isinstance(token, str) or not token:
             raise ValueError("destroy requires an authenticated Hub transport and token")
