@@ -272,7 +272,7 @@ def _verify_code_bundle_receipt(bundle: Path, receipt: Path) -> str:
     return digest
 
 
-def _stage_setup_command() -> str:
+def _stage_setup_command(parent_archive_sha256: str) -> str:
     """Static remote setup: extraction is constrained to the three mounts."""
     return (
         "set -eu; "
@@ -290,8 +290,10 @@ def _stage_setup_command() -> str:
         "tar --no-same-owner --no-same-permissions -xf /tmp/lehome-stage/code.bundle -C /prepared/code; "
         "tar --no-same-owner --no-same-permissions -xf /tmp/lehome-stage/parent.tar -C /cache/parent; "
         "test \"$(sha256sum /tmp/lehome-stage/parent.tar | cut -d' ' -f1)\" = "
+        + parent_archive_sha256
+        + "; PYTHONPATH=/prepared/code/trainer/src python -c \"from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; assert policy_artifact_sha256('/cache/parent') == '"
         + PARENT_CHECKPOINT["artifact_sha256"]
-        + "; chmod 600 /prepared/config/publisher.token; "
+        + "'\"; chmod 600 /prepared/config/publisher.token; "
         "test ! -L /prepared/generation; test ! -L /cache/parent; test ! -L /prepared/code"
     )
 
@@ -377,19 +379,31 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
     if request.get("code_bundle_sha256") != code_digest: raise ValueError("staged code bundle hash differs from request")
     _safe_archive(Path(str(request["code_bundle"])), "code bundle")
     _safe_archive(Path(str(request["parent_checkpoint"])), "parent checkpoint")
-    runner((*_ssh_prefix(instance), _stage_setup_command()))
+    parent_archive_sha256, _ = _parent_identities(request)
+    runner((*_ssh_prefix(instance), _stage_setup_command(parent_archive_sha256)))
     return {"paid_action": True, "action": "stage", "instance_id": instance["instance_id"], "generation_tree_sha256": generation_tree, "code_bundle_sha256": code_digest, "transfers": receipts}
 
 
+def _parent_identities(request: Mapping[str, object]) -> tuple[str, str]:
+    archive_sha, artifact_sha = request.get("parent_archive_sha256"), request.get("parent_checkpoint_sha256")
+    if (
+        not isinstance(archive_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", archive_sha) is None
+        or artifact_sha != PARENT_CHECKPOINT["artifact_sha256"]
+    ):
+        raise ValueError("stage parent archive and policy artifact identities are required")
+    return archive_sha, artifact_sha
+
+
 def _stage_command(request: Mapping[str, object]) -> str:
-    required = ("code_bundle", "code_bundle_sha256", "code_bundle_sha256_file", "generation_root", "generation_receipt", "parent_checkpoint", "parent_checkpoint_sha256", "launch_config", "experiment_config", "continuous_request", "resume_request", "tune_request", "modality_config", "token_file")
+    required = ("code_bundle", "code_bundle_sha256", "code_bundle_sha256_file", "generation_root", "generation_receipt", "parent_checkpoint", "parent_checkpoint_sha256", "parent_archive_sha256", "launch_config", "experiment_config", "continuous_request", "resume_request", "tune_request", "modality_config", "token_file")
     if any(not isinstance(request.get(key), str) or not request[key] for key in required):
         raise ValueError("stage requires exact code, generation, parent, config, modality, and token paths")
     if request.get("generation_sha256") != request.get("sealed_generation_sha256"):
         raise ValueError("stage generation identity is not sealed")
-    parent_sha = request.get("parent_checkpoint_sha256")
-    if request.get("parent_checkpoint_repository") != PARENT_CHECKPOINT["repository"] or request.get("parent_checkpoint_revision") != PARENT_CHECKPOINT["revision"] or request.get("parent_checkpoint_subpath") != PARENT_CHECKPOINT["subpath"] or parent_sha != PARENT_CHECKPOINT["artifact_sha256"]:
+    if request.get("parent_checkpoint_repository") != PARENT_CHECKPOINT["repository"] or request.get("parent_checkpoint_revision") != PARENT_CHECKPOINT["revision"] or request.get("parent_checkpoint_subpath") != PARENT_CHECKPOINT["subpath"]:
         raise ValueError("stage parent checkpoint identity is not approved")
+    _parent_identities(request)
     return "stage-validated"
 
 

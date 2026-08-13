@@ -161,12 +161,19 @@ def test_status_reads_only_requested_terminal_beneath_output() -> None:
 
 
 def test_stage_setup_hydrates_only_operational_roots() -> None:
-    command = LIFECYCLE._stage_setup_command()
+    command = LIFECYCLE._stage_setup_command("a" * 64)
     assert "tar --no-same-owner --no-same-permissions -xf /tmp/lehome-stage/code.bundle -C /prepared/code" in command
     assert "tar --no-same-owner --no-same-permissions -xf /tmp/lehome-stage/parent.tar -C /cache/parent" in command
     assert "mv /tmp/lehome-stage/generation /prepared/generation" in command
     assert "chmod 600 /prepared/config/publisher.token" in command
     assert "mv /tmp/lehome-stage/continuous.json /prepared/config/continuous.json" in command
+    assert "policy_artifact_sha256('/cache/parent')" in command
+
+
+def test_stage_requires_distinct_parent_archive_and_policy_artifact_hashes() -> None:
+    request = {"parent_checkpoint_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"], "parent_archive_sha256": "a" * 64,
+               "parent_checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "parent_checkpoint_revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "parent_checkpoint_subpath": LIFECYCLE.PARENT_CHECKPOINT["subpath"]}
+    assert LIFECYCLE._parent_identities(request) == ("a" * 64, LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"])
 
 
 def test_stage_rejects_runtime_request_that_points_at_unstaged_paths(tmp_path: Path) -> None:
