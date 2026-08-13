@@ -375,6 +375,15 @@ def _require_instance_capability(instance: Mapping[str, object], request: Mappin
     validate_training_capability(training_capability)
 
 
+def promote_canary(*, capability_receipt: Mapping[str, object]) -> dict[str, object]:
+    """Recover the authenticated canary instance for stage/train promotion."""
+    instance = capability_receipt.get("instance")
+    if not isinstance(instance, Mapping):
+        raise ValueError("capability receipt lacks an instance-bound SSH receipt")
+    _require_instance_capability(instance, {"capability_receipt": capability_receipt})
+    return dict(instance)
+
+
 def remote_action(*, action: str, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     instance_id = instance.get("instance_id")
     if type(instance_id) is not int: raise ValueError("instance receipt is invalid")

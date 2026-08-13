@@ -215,6 +215,17 @@ def test_bootstrap_canary_uses_only_historical_image_and_binds_instance_receipt(
     assert any("--one-step" in command[-1] for command in commands if command[0] == "ssh")
 
 
+def test_promote_canary_recovers_only_the_bound_instance_receipt() -> None:
+    image = LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE
+    receipt = {
+        "kind": "persistent_training_capability", "instance_id": 9,
+        "trainer_image": image, "provider_response_sha256": "a" * 64,
+        "instance": {"instance_id": 9, "trainer_image": image, "provider_response_sha256": "a" * 64, "host": "host", "port": 22},
+        "training_capability": {"hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05", "image_digest": image.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .1}, "nvml": {"utilization_percent": 80}},
+    }
+    assert LIFECYCLE.promote_canary(capability_receipt=receipt)["instance_id"] == 9
+
+
 def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None:
     # The lifecycle's free preparation action must exercise the same canonical
     # mix/materialization implementation as production, rather than accepting
