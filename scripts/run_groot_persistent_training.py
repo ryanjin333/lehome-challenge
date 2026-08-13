@@ -497,6 +497,16 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
         from lehome_train.flywheel.mix import verify_generation
         sealed = verify_generation(root)
         if sealed.get("organizer_training_frames", 0) * 3 != sealed.get("rft_training_frames", -1) * 7: raise ValueError("prepare generation is not exact 70/30")
+        revisions = sealed.get("source_revisions")
+        if not isinstance(revisions, Mapping):
+            raise ValueError("prepare sealed generation has no source revisions")
+        observed_revisions = set(revisions.values())
+        if ORGANIZER_SOURCE["revision"] not in observed_revisions:
+            raise ValueError("prepare organizer source revision is not pinned in sealed generation")
+        # The corrective Hub prefix is a source contract outside the materialized
+        # dataset, but the exact immutable revision must still be represented.
+        if CORRECTIVE_SOURCE["revision"] not in observed_revisions:
+            raise ValueError("prepare corrective source revision is not pinned in sealed generation")
         return {"paid_action": False, "action": "prepare", "organizer_source": ORGANIZER_SOURCE, "corrective_source": CORRECTIVE_SOURCE, "request": request}
     if not args.execute: return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
     if args.action == "capture-offers": return capture_offers(runner=runner)

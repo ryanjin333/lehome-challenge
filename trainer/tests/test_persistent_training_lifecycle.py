@@ -235,3 +235,16 @@ def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None
     assert report["paid_action"] is False
     assert report["generation_root"] == str(destination)
     assert (destination.with_name(destination.name + ".generation.json")).is_file()
+
+
+def test_prepare_requires_exact_pinned_sources_in_the_sealed_receipt(tmp_path: Path) -> None:
+    from test_flywheel_mix import _prepared_source
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
+    corrective_a = _prepared_source(tmp_path / "corrective-a", kind="flywheel", grade="A", episodes=1)
+    corrective_b = _prepared_source(tmp_path / "corrective-b", kind="flywheel", grade="B", episodes=1)
+    root = tmp_path / "generation"
+    LIFECYCLE._materialize({"organizer_root": str(organizer), "corrective_roots": [str(corrective_a), str(corrective_b)], "destination": str(root), "seed": 1})
+    request = tmp_path / "prepare.json"
+    request.write_text(json.dumps({"generation_root": str(root)}), encoding="utf-8")
+    with pytest.raises(ValueError, match="organizer source"):
+        LIFECYCLE.main_for_test(["prepare", "--request", str(request)])
