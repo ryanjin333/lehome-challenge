@@ -1,64 +1,110 @@
 #!/usr/bin/env python3
-"""Explicit, dry-run-by-default lifecycle gate for persistent corrective RFT."""
+"""Explicit, resume-safe Vast lifecycle for the 2K persistent RFT run.
+
+Every action is a dry-run unless ``--execute`` is supplied.  The command runner
+is injected in tests; normal execution uses the Vast CLI and SSH only after the
+caller explicitly crosses that boundary.
+"""
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 from pathlib import Path
-from typing import Protocol
+import subprocess
+import time
+from typing import Callable, Mapping
 
-ORGANIZER_SOURCE = {
-    "repository": "lehome/dataset_challenge_merged",
-    "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042",
-    "subdir": "four_types_merged",
-    "mirror_repository": "kunhsiang/lehome-four-types-merged",
-    "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc",
-    "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb",
-}
-CORRECTIVE_SOURCE = {
-    "revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c",
-    "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35",
-}
+ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
+CORRECTIVE_SOURCE = {"revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c", "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35"}
+OFFER_QUERY = "gpu_name=RTX_PRO_6000 gpu_ram>=96 num_gpus=1 reliability>=0.95"
+Runner = Callable[[tuple[str, ...]], str]
 
 
-class Provider(Protocol):
-    def rent(self, request: dict[str, object]) -> object: ...
+def _hash(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _load_request(path: str) -> dict[str, object]:
+def _load(path: str) -> dict[str, object]:
     value = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError("lifecycle request must be an object")
+    if not isinstance(value, dict): raise ValueError("lifecycle request must be an object")
     return value
 
 
-def destroy(*, instance_id: int, training_receipt: dict[str, object]) -> dict[str, object]:
-    if training_receipt.get("instance_id") != instance_id or training_receipt.get("immutable_checkpoint_steps") != [1000, 2000]:
+def _run(command: tuple[str, ...]) -> str:
+    completed = subprocess.run(command, check=True, text=True, capture_output=True)
+    return completed.stdout
+
+
+def _json(runner: Runner, command: tuple[str, ...]) -> object:
+    try: return json.loads(runner(command))
+    except json.JSONDecodeError as error: raise ValueError("provider response is invalid JSON") from error
+
+
+def capture_offers(*, runner: Runner) -> dict[str, object]:
+    offers = _json(runner, ("vastai", "--raw", "search", "offers", OFFER_QUERY, "--interruptible"))
+    instances = _json(runner, ("vastai", "--raw", "show", "instances"))
+    volumes = _json(runner, ("vastai", "--raw", "show", "volumes"))
+    if not all(isinstance(value, list) for value in (offers, instances, volumes)): raise ValueError("provider listing is invalid")
+    eligible = [row for row in offers if isinstance(row, Mapping) and row.get("gpu_name") == "RTX PRO 6000" and row.get("num_gpus") == 1 and float(row.get("gpu_ram", 0)) >= 96 and row.get("is_bid") is True and float(row.get("dph_total", 99)) < 1]
+    if not eligible: raise ValueError("no interruptible RTX PRO 6000 96GB offer under $1/hr")
+    offer = min(eligible, key=lambda row: float(row["dph_total"]))
+    total = sum(float(row.get("dph_total", 0)) for row in instances if isinstance(row, Mapping)) + sum(float(row.get("storage_total_cost", 0)) for row in volumes if isinstance(row, Mapping)) + float(offer["dph_total"])
+    if total > 2: raise ValueError("account-wide instance and storage total exceeds $2/hr")
+    return {"schema_version": 1, "kind": "persistent_training_offer", "offer": dict(offer), "account_hourly_total_usd": total, "captured_at_unix": int(time.time())}
+
+
+def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12) -> dict[str, object]:
+    offer = evidence.get("offer")
+    if not isinstance(offer, Mapping) or type(offer.get("id")) is not int: raise ValueError("offer evidence is invalid")
+    created = _json(runner, ("vastai", "--raw", "create", "instance", str(offer["id"]), "--ssh", "--direct", "--cancel-unavail"))
+    if not isinstance(created, Mapping) or type(created.get("new_contract")) is not int: raise ValueError("provider did not return an instance ID")
+    instance_id = created["new_contract"]
+    live: object = {}
+    for _ in range(max_readiness_polls):
+        live = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+        if isinstance(live, Mapping) and live.get("actual_status", "running") == "running" and live.get("ssh_host"):
+            break
+    else:
+        runner(("vastai", "destroy", "instance", str(instance_id), "--yes")); raise ValueError("instance readiness poll timed out")
+    if not isinstance(live, Mapping) or live.get("id") != instance_id or live.get("gpu_name") != "RTX PRO 6000" or live.get("num_gpus") != 1:
+        runner(("vastai", "destroy", "instance", str(instance_id), "--yes")); raise ValueError("instance readback does not match accepted offer")
+    return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _hash(live)}
+
+
+def remote_action(*, action: str, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
+    instance_id = instance.get("instance_id")
+    if type(instance_id) is not int: raise ValueError("instance receipt is invalid")
+    if action == "resume" and request.get("generation_sha256") != request.get("resume_generation_sha256") or action == "resume" and request.get("config_sha256") != request.get("resume_config_sha256"):
+        raise ValueError("resume requires exact generation/config identity")
+    command = request.get("remote_command")
+    if not isinstance(command, str) or not command: raise ValueError("remote action requires an explicit secret-safe command")
+    runner(("ssh", "-o", "ClearAllForwardings=yes", f"root@{instance.get('host')}", command))
+    return {"paid_action": True, "action": action, "instance_id": instance_id}
+
+
+def destroy(*, instance_id: int, training_receipt: Mapping[str, object], runner: Runner | None = None) -> dict[str, object]:
+    if training_receipt.get("instance_id") != instance_id or training_receipt.get("immutable_checkpoint_steps") != [1000, 2000] or training_receipt.get("fresh_readbacks") is not True:
         raise ValueError("instance-bound disposal requires two immutable checkpoints")
-    return {"paid_action": False, "destroy_authorized": True, "instance_id": instance_id}
+    if runner is not None:
+        runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+        observed = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+        if observed not in ({}, None): raise ValueError("destroy absence readback failed")
+    return {"paid_action": runner is not None, "destroy_authorized": True, "instance_id": instance_id}
 
 
-def main_for_test(argv: list[str], *, provider: Provider | object | None = None) -> dict[str, object]:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("prepare", "capture-offers", "rent", "stage", "tune", "train", "status", "resume", "destroy"))
-    parser.add_argument("--request", required=True)
-    parser.add_argument("--execute", action="store_true")
-    args = parser.parse_args(argv)
-    request = _load_request(args.request)
-    if args.action == "prepare":
-        return {"paid_action": False, "action": "prepare", "organizer_source": ORGANIZER_SOURCE, "corrective_source": CORRECTIVE_SOURCE, "request": request}
-    if not args.execute:
-        return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
-    if args.action != "rent":
-        raise ValueError("provider actions are intentionally explicit and unsupported by this local gate")
-    hourly = request.get("hourly_price")
-    account_total = request.get("account_hourly_total")
-    if type(hourly) not in (int, float) or type(account_total) not in (int, float) or hourly >= 1 or account_total > 2:
-        raise ValueError("rent requires interruptible RTX PRO 6000 under $1/hr and account total at most $2/hr")
-    if provider is None:
-        raise ValueError("rent requires an explicit provider adapter")
-    return {"paid_action": True, "action": "rent", "provider_result": provider.rent(request)}  # type: ignore[union-attr]
+def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object]:
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("prepare", "capture-offers", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true")
+    args = parser.parse_args(argv); request = _load(args.request)
+    if args.action == "prepare": return {"paid_action": False, "action": "prepare", "organizer_source": ORGANIZER_SOURCE, "corrective_source": CORRECTIVE_SOURCE, "request": request}
+    if not args.execute: return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
+    if args.action == "capture-offers": return capture_offers(runner=runner)
+    if args.action == "rent": return rent(evidence=request, runner=runner)
+    if args.action == "destroy": return destroy(instance_id=request.get("instance_id"), training_receipt=request, runner=runner)  # type: ignore[arg-type]
+    instance = request.get("instance")
+    if not isinstance(instance, Mapping): raise ValueError("remote action requires an instance receipt")
+    return remote_action(action=args.action, instance=instance, request=request, runner=runner)
 
 
-if __name__ == "__main__":
-    print(json.dumps(main_for_test(__import__("sys").argv[1:]), sort_keys=True))
+if __name__ == "__main__": print(json.dumps(main_for_test(__import__("sys").argv[1:]), sort_keys=True))
