@@ -317,6 +317,16 @@ def test_persistent_conversion_rejects_overlapping_staging_and_held_lock(tmp_pat
         _convert(source, tmp_path / "output", persistent_staging_root=staging)
 
 
+def test_persistent_validation_error_releases_owned_lock_for_corrected_retry(tmp_path: Path) -> None:
+    source = make_source_dataset(tmp_path); staging = tmp_path / "staging"; staging.mkdir()
+    (staging / "conversion-journal.json").write_text("{}")
+    with pytest.raises(ValueError, match="identity"):
+        _convert(source, tmp_path / "output", persistent_staging_root=staging)
+    assert not (tmp_path / ".staging.conversion.lock").exists()
+    (staging / "conversion-journal.json").unlink()
+    _convert(source, tmp_path / "output", persistent_staging_root=staging)
+
+
 def test_persistent_destination_removes_only_partial_statistics_outputs_for_restart(
     tmp_path: Path,
 ) -> None:

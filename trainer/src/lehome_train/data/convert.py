@@ -271,7 +271,7 @@ def _persistent_destination_manifest(
     *, inspection: Mapping[str, Any], mapping: Mapping[str, Any],
     source_repository: str, source_revision: str, converter_commit: str,
     converter_container_digest: str, split_seed: int, validation_fraction: float,
-    records: list[dict[str, Any]],
+    records: list[dict[str, Any]], source_dataset: str,
 ) -> dict[str, object]:
     """Accept a promoted conversion only as a byte-authenticated resume point."""
     if destination.is_symlink() or not destination.is_dir():
@@ -285,6 +285,7 @@ def _persistent_destination_manifest(
     # loader/statistics code trusts, beyond source provenance alone.
     required = {
         "source_format": "lerobot_v3_sharded", "output_format": "groot_lerobot_v2.1_per_episode",
+        "schema_version": 1, "source_dataset": source_dataset,
         "source_repository": source_repository, "source_revision": source_revision,
         "source_manifest_sha256": inspection["source_manifest_sha256"],
         "source_artifacts": inspection["source_artifacts"],
@@ -295,6 +296,10 @@ def _persistent_destination_manifest(
         "fps": inspection["fps"], "frame_count": inspection["frame_count"],
         "episode_count": inspection["episode_count"],
         "train_episode_ids": list(split.train), "validation_episode_ids": list(split.validation),
+        "camera_schema": [
+            {**camera, "dtype": "video", "shape": [480, 640, 3]}
+            for camera in mapping["cameras"]
+        ],
         "state_schema": {"source_key": "observation.state", "dimension": 12, "names": list(JOINT_NAMES)},
         "action_schema": mapping["action"],
         "fixed_language_instruction": FIXED_INSTRUCTION,
@@ -318,7 +323,9 @@ def _persistent_destination_manifest(
     # generated files in the manifest, so allow only those exact dynamic paths.
     statistics = manifest.get("statistics")
     dynamic: dict[str, str] = {}
-    if isinstance(statistics, Mapping) and statistics.get("status") == "computed_task_4_train_only":
+    if statistics == {"status": "pending_task_4_train_only", "files": []}:
+        pass
+    elif isinstance(statistics, Mapping) and statistics.get("status") == "computed_task_4_train_only":
         files = statistics.get("files")
         if not isinstance(files, list):
             raise ValueError("persistent converted destination statistics are invalid")
@@ -328,6 +335,8 @@ def _persistent_destination_manifest(
             dynamic[item["relative_path"]] = item["sha256"]
         if set(dynamic) != set(_DERIVED_STATISTICS_PATHS):
             raise ValueError("persistent converted destination statistics are incomplete")
+    else:
+        raise ValueError("persistent converted destination statistics are invalid")
     observed = {item["relative_path"]: item for item in actual}
     partial_derived = set(_DERIVED_STATISTICS_PATHS).intersection(observed).difference(dynamic)
     if partial_derived:
@@ -787,7 +796,7 @@ def convert_dataset(
             source_repository=source_repository, source_revision=source_revision,
             converter_commit=converter_commit,
             converter_container_digest=converter_container_digest, split_seed=split_seed,
-            validation_fraction=validation_fraction, records=load_v3_episode_records(source),
+            validation_fraction=validation_fraction, records=load_v3_episode_records(source), source_dataset=source.name,
         )
 
     split = split_episode_ids(
@@ -825,21 +834,21 @@ def convert_dataset(
                 dir=destination.parent,
             )
         )
-    journal: dict[str, object] | None = None
-    journal_lock: threading.Lock | None = None
-    if persistent:
-        journal, journal_lock = _load_or_create_journal(
-            temporary,
-            _journal_identity(
-                inspection=inspection, mapping=mapping, source_repository=source_repository,
-                source_revision=source_revision, converter_commit=converter_commit,
-                converter_container_digest=converter_container_digest, split_seed=split_seed,
-                validation_fraction=validation_fraction, records=records, camera_keys=camera_keys,
-                info=info, source=source,
-            ),
-        )
-        _validate_staging_tree(temporary, journal)
     try:
+        journal: dict[str, object] | None = None
+        journal_lock: threading.Lock | None = None
+        if persistent:
+            journal, journal_lock = _load_or_create_journal(
+                temporary,
+                _journal_identity(
+                    inspection=inspection, mapping=mapping, source_repository=source_repository,
+                    source_revision=source_revision, converter_commit=converter_commit,
+                    converter_container_digest=converter_container_digest, split_seed=split_seed,
+                    validation_fraction=validation_fraction, records=records, camera_keys=camera_keys,
+                    info=info, source=source,
+                ),
+            )
+            _validate_staging_tree(temporary, journal)
         adopted_episode_data = False
         if unbound_staging_data_adoption_root is not None:
             assert journal is not None and journal_lock is not None
