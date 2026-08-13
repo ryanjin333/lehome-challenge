@@ -86,8 +86,11 @@ is faster and cheaper. Run one long-lived optimization process through steps
 
 This is the preferred configuration under the shared $2/hour account cap. An
 H200 may be tested only as a separately approved cost experiment. Hardware is
-selected by measured samples per second and dollars per fixed sample exposure,
-not model name alone.
+selected by measured samples per second and measured dollars per training run,
+not model name alone. The first persistent run keeps the verified global batch
+of 64; larger batches are benchmark evidence for a later admitted run because
+changing batch while retaining step-1,000/2,000 checkpoints also changes sample
+exposure and optimization behavior.
 
 ### Host-driver policy
 
@@ -185,8 +188,11 @@ other workers continue. The controller records restarts and will not reuse an
 attempt identity whose canonical terminal artifact already exists.
 
 Persistent execution must not leak state between episodes. The acceptance test
-checks garment identity, simulator seed, action queue, policy session, camera
-buffers, success state, and output paths before each lease is admitted.
+checks garment identity, simulator seed and garment RNG, the client's local
+action queue, the server's existing reset endpoint, camera buffers, success
+state, and output paths before each lease is admitted. The first release does
+not invent multi-session policy-server semantics: each server remains private
+to one worker.
 
 ## Dynamic Task Queue
 
@@ -285,20 +291,25 @@ or one long episode cannot dominate through repeated frames. Validation is
 split by immutable raw episode lineage, never by frames from the same episode.
 
 Before any paid training, the repository must resolve the current action-window
-contract. Collection currently has evidence for 16-action policy chunks while
-legacy RFT materialization and parent-checkpoint metadata still contain 40-step
-assumptions. One canonical horizon must be derived from the pinned policy and
-official GR00T loader, then enforced consistently in:
+contract. The pinned checkpoint evidence distinguishes two values: the GR00T
+model's maximum action capacity is 40, while the `new_embodiment` processor
+`delta_indices` and live policy wire contain 16 actions. Legacy RFT launch and
+materialization metadata incorrectly use the ambiguous name `action_horizon`
+for 40. The implementation must preserve model capacity 40 while enforcing
+LeHome training targets and executed policy chunks at 16. Both values are
+named and bound consistently in:
 
 - rollout receipts;
 - selected frame windows;
 - prepared-dataset metadata;
 - mixture planning;
-- launcher configuration; and
+- launcher configuration (`model_max_action_horizon=40` and
+  `embodiment_action_horizon=16`); and
 - one real forward/loss smoke.
 
-No conversion shim may silently pad, truncate, or reinterpret the targets.
-Training remains blocked until this gate passes.
+No conversion shim may silently pad, truncate, reinterpret 16 targets as 40,
+or change the pinned model architecture from 40. Training remains blocked until
+this gate passes.
 
 ## Persistent Trainer
 
@@ -313,12 +324,15 @@ Before the real run, a bounded benchmark selects settings:
 3. use 100 steady optimizer steps for each admitted batch candidate;
 4. stop increasing after a proven OOM or less than 10% physical VRAM headroom;
 5. reject nonfinite loss or materially unstable step time; and
-6. select the highest sustained samples/second, using lower cost and more
-   headroom as tie-breakers.
+6. report the fastest stable candidate, using lower cost and more headroom as
+   tie-breakers.
 
-The selected batch changes optimizer-step counts only through the existing
-fixed sample-presentation schedule. Learning exposure, warmup fraction, and
-checkpoint sample boundaries remain invariant.
+The first production run remains at the verified global batch 64 and uses the
+benchmark to tune dataloader workers. Results for batches 96 and 128 are
+exploratory: they cannot silently replace batch 64 because the agreed
+step-1,000/2,000 milestones would then see more samples and change learning
+semantics. A later run may admit a larger batch only with an explicit learning
+rate/exposure plan and identical evaluation gates.
 
 The production process saves at steps 1,000 and 2,000 without being relaunched.
 A checkpoint observer waits for an upstream completion marker and validates the
@@ -435,7 +449,7 @@ On one RTX PRO 6000 96 GB host:
   rollout `<590` ceiling to this training-only machine;
 - pass the unified action-horizon real loader/loss smoke;
 - complete the loader-worker and batch-size benchmark;
-- run one continuous 2,000-step process;
+- run one continuous 2,000-step process at the verified global batch 64;
 - observe and immutably publish step 1,000 while later optimization progresses;
 - immutably publish step 2,000;
 - report optimizer steps/second, samples/second, GPU utilization, dataloader wait,
