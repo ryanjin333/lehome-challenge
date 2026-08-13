@@ -17,7 +17,7 @@ import tarfile
 import time
 from typing import Callable, Mapping
 
-from lehome_train.hub import HubTransport
+from lehome_train.hub import HubTransport, HuggingFaceHubTransport
 from lehome_train.release_manifest import validate_training_capability
 
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
@@ -43,6 +43,21 @@ def _load(path: str) -> dict[str, object]:
     value = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(value, dict): raise ValueError("lifecycle request must be an object")
     return value
+
+
+def _read_private_token(path_value: str | None) -> str:
+    if not path_value:
+        raise ValueError("destroy requires --token-file")
+    path = Path(path_value)
+    if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+        raise ValueError("token file must be a private regular file")
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        raise ValueError("token file is unreadable") from None
+    if not token or any(character.isspace() for character in token):
+        raise ValueError("token file is invalid")
+    return token
 
 
 def _run(command: tuple[str, ...]) -> str:
@@ -92,11 +107,15 @@ def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: 
     eligible = [row for row in offers if isinstance(row, Mapping) and _offer_gpu(row) and row.get("num_gpus") == 1 and float(row.get("dph_total", 99)) < 1]
     if not eligible: raise ValueError("no interruptible RTX PRO 6000 96GB offer under $1/hr")
     offer = min(eligible, key=lambda row: float(row["dph_total"]))
-    total = sum(float(row.get("dph_total", 0)) for row in instances if isinstance(row, Mapping)) + sum(float(row.get("storage_total_cost", 0)) for row in volumes if isinstance(row, Mapping)) + float(offer["dph_total"])
+    storage_unit_cost = offer.get("storage_cost", offer.get("storage_cost_per_gb", 0))
+    if type(storage_unit_cost) not in (int, float) or float(storage_unit_cost) < 0:
+        raise ValueError("offer storage quote is invalid")
+    requested_storage_hourly = float(storage_unit_cost) * 300
+    total = sum(float(row.get("dph_total", 0)) for row in instances if isinstance(row, Mapping)) + sum(float(row.get("storage_total_cost", 0)) for row in volumes if isinstance(row, Mapping)) + float(offer["dph_total"]) + requested_storage_hourly
     if total > 2: raise ValueError("account-wide instance and storage total exceeds $2/hr")
     captured = int(time.time()) if now_unix is None else now_unix
     safe_offer = _project(offer, ("id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "min_bid", "driver_version", "is_bid", "image"))
-    return {"schema_version": 1, "kind": "persistent_training_offer", "offer": safe_offer, "account_hourly_total_usd": total, "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds, "search_mode": "interruptible"}
+    return {"schema_version": 1, "kind": "persistent_training_offer", "offer": safe_offer, "account_hourly_total_usd": total, "requested_storage_gb": 300, "requested_storage_hourly_usd": requested_storage_hourly, "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds, "search_mode": "interruptible"}
 
 
 def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep, require_capability: bool = True) -> dict[str, object]:
@@ -393,7 +412,7 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
 
 
 def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object]:
-    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("materialize", "prepare", "capture-offers", "bootstrap-canary", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true")
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("materialize", "prepare", "capture-offers", "bootstrap-canary", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "materialize":
         return _materialize(request)
@@ -411,7 +430,14 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
     if args.action == "capture-offers": return capture_offers(runner=runner)
     if args.action == "bootstrap-canary": return bootstrap_canary(evidence=request, runner=runner)
     if args.action == "rent": return rent(evidence=request, runner=runner)
-    if args.action == "destroy": return destroy(instance_id=request.get("instance_id"), training_receipt=request, runner=runner)  # type: ignore[arg-type]
+    if args.action == "destroy":
+        return destroy(
+            instance_id=request.get("instance_id"),  # type: ignore[arg-type]
+            training_receipt=request,
+            runner=runner,
+            transport=HuggingFaceHubTransport(timeout_seconds=30.0),
+            token=_read_private_token(args.token_file),
+        )
     instance = request.get("instance")
     if not isinstance(instance, Mapping): raise ValueError("remote action requires an instance receipt")
     return remote_action(action=args.action, instance=instance, request=request, runner=runner)

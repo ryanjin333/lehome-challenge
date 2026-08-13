@@ -43,6 +43,24 @@ def test_destroy_requires_two_immutable_checkpoints_bound_to_instance(tmp_path: 
         LIFECYCLE.destroy(instance_id=7, training_receipt=receipt)
 
 
+def test_destroy_cli_reads_private_token_and_constructs_real_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = tmp_path / "hub.token"
+    token.write_text("publisher-token\n", encoding="utf-8")
+    token.chmod(0o600)
+    request = tmp_path / "destroy.json"
+    request.write_text(json.dumps({"instance_id": 7, "kind": "continuous_corrective_training_terminal", "immutable_checkpoint_steps": [1000, 2000], "immutable_checkpoint_publications": []}), encoding="utf-8")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(LIFECYCLE, "destroy", lambda **kwargs: captured.update(kwargs) or {"destroy_authorized": True})
+
+    result = LIFECYCLE.main_for_test(["destroy", "--request", str(request), "--execute", "--token-file", str(token)], runner=FailRunner())
+
+    assert result["destroy_authorized"] is True
+    assert captured["token"] == "publisher-token"
+    assert type(captured["transport"]).__name__ == "HuggingFaceHubTransport"
+
+
 def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     commands: list[tuple[str, ...]] = []
     def runner(command: tuple[str, ...]) -> str:
@@ -64,6 +82,21 @@ def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: 
     assert instance["instance_id"] == 9
     with pytest.raises(ValueError, match="destroy absence"):
         LIFECYCLE.destroy(instance_id=9, training_receipt={"kind": "continuous_corrective_training_terminal", "instance_id": 9, "immutable_checkpoint_steps": [1000, 2000], "immutable_checkpoint_publications": [{"optimizer_step": 1000, "repository": "ryanjin333/lehome-groot-n17-models", "immutable_revision": "a" * 40, "remote_prefix": "prefix", "relative_path": "checkpoints/step-1000.tar", "artifact_sha256": hashlib.sha256(b"artifact").hexdigest(), "artifact_byte_size": 8, "readback_verified": True}, {"optimizer_step": 2000, "repository": "ryanjin333/lehome-groot-n17-models", "immutable_revision": "b" * 40, "remote_prefix": "prefix", "relative_path": "checkpoints/step-2000.tar", "artifact_sha256": hashlib.sha256(b"artifact").hexdigest(), "artifact_byte_size": 8, "readback_verified": True}]}, runner=runner, transport=FakeHub(), token="test-token")
+
+
+def test_offer_total_conservatively_counts_requested_300gb_storage() -> None:
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return '[{"id":7,"gpu_name":"RTX PRO 6000 S","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"min_bid":0.5,"storage_cost":0.001}]'
+        if command[:4] == ("vastai", "--raw", "show", "instances"):
+            return "[]"
+        if command[:4] == ("vastai", "--raw", "show", "volumes"):
+            return "[]"
+        raise AssertionError(command)
+    evidence = LIFECYCLE.capture_offers(runner=runner, now_unix=1)
+    assert evidence["requested_storage_gb"] == 300
+    assert evidence["requested_storage_hourly_usd"] == pytest.approx(0.3)
+    assert evidence["account_hourly_total_usd"] == pytest.approx(1.0)
 
 
 def test_rent_requires_capability_receipt_for_exact_image(monkeypatch: pytest.MonkeyPatch) -> None:
