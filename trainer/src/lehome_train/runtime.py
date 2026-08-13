@@ -15,7 +15,7 @@ from lehome_train.preflight import reject_secret_bearing_config
 
 
 RUNTIME_FACTORY_ENV = "LEHOME_TRAIN_RUNTIME_FACTORY"
-_GPU_COMMANDS = frozenset({"prepare", "memorize", "smoke", "train"})
+_GPU_COMMANDS = frozenset({"prepare", "memorize", "smoke", "train", "continuous-train"})
 
 
 class CommandRuntime(Protocol):
@@ -28,6 +28,8 @@ class CommandRuntime(Protocol):
     def smoke(self, request: dict[str, object]) -> Mapping[str, object]: ...
 
     def train(self, request: dict[str, object]) -> Mapping[str, object]: ...
+
+    def continuous_train(self, request: dict[str, object]) -> Mapping[str, object]: ...
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -104,7 +106,8 @@ def load_runtime_adapter(
     except Exception:
         raise RuntimeError("training runtime factory could not be loaded") from None
     for command in _GPU_COMMANDS:
-        if not callable(getattr(adapter, command, None)):
+        attribute = command.replace("-", "_")
+        if not callable(getattr(adapter, attribute, None)):
             raise RuntimeError("training runtime factory returned an incomplete adapter")
     return adapter
 
@@ -121,7 +124,7 @@ def dispatch_runtime_request(
     arguments = read_runtime_request(request_path, expected_command=command)
     adapter = load_runtime_adapter(factory_spec, environ=environ)
     try:
-        result = getattr(adapter, command)(arguments)
+        result = getattr(adapter, command.replace("-", "_"))(arguments)
     except Exception:
         raise RuntimeError(f"{command} runtime adapter failed") from None
     if not isinstance(result, Mapping) or not all(type(key) is str for key in result):

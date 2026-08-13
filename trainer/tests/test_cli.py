@@ -294,7 +294,7 @@ def test_image_native_model_retrieve_is_pinned_beneath_cache() -> None:
     assert calls[0][1]["revision"] == DEFAULT_SETTINGS.model_revision
 
 
-@pytest.mark.parametrize("command", ["prepare", "memorize", "smoke", "train"])
+@pytest.mark.parametrize("command", ["prepare", "memorize", "smoke", "train", "continuous-train"])
 def test_gpu_commands_dispatch_checked_request_to_runtime_factory(
     command: str,
     tmp_path: Path,
@@ -317,6 +317,10 @@ def test_gpu_commands_dispatch_checked_request_to_runtime_factory(
         def train(self, request: dict[str, object]) -> dict[str, object]:
             calls.append(("train", request))
             return {"status": "trained"}
+
+        def continuous_train(self, request: dict[str, object]) -> dict[str, object]:
+            calls.append(("continuous-train", request))
+            return {"status": "continuous-trained"}
 
     sys.modules["test_lehome_runtime"] = SimpleNamespace(create=lambda: Runtime())
     request = tmp_path / f"{command}.json"

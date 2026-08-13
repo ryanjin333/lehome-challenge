@@ -268,6 +268,16 @@ def train(
     _gpu_command("train", request, runtime_factory)
 
 
+@app.command("continuous-train")
+def continuous_train(
+    request: Path = typer.Option(..., "--request"),
+    runtime_factory: Optional[str] = typer.Option(None, "--runtime-factory"),
+) -> None:
+    """Run sealed corrective training continuously through the runtime adapter."""
+
+    _gpu_command("continuous-train", request, runtime_factory)
+
+
 @app.command("report")
 def report(request: Path = typer.Option(..., "--request")) -> None:
     """Build and write a complete provenance report from checked JSON."""
