@@ -21,6 +21,10 @@ class CompletedCheckpoint:
     observed_at_unix: int
 
 
+class ProviderInterrupted(RuntimeError):
+    """A verified provider-side interruption that may resume from publication."""
+
+
 def _tree_sha256(root: Path) -> str:
     import hashlib
     digest = hashlib.sha256()
@@ -118,9 +122,13 @@ def run_continuous_supervisor(
             elif isinstance(receipt, dict) and receipt.get("readback_verified") is True and receipt.get("optimizer_step") == step:
                 immutable.append(receipt)
     if launch_error:
-        # An interrupt does not discard verified work.  The caller receives the
-        # last immutable publication and can resume only with its identities.
         training_thread.join()
+        error = launch_error[0]
+        # Only an external interruption preserves a resumable terminal.  A
+        # trainer/config/data error is evidence against continuation and must
+        # remain a hard failure rather than being mistaken for a provider stop.
+        if not isinstance(error, (KeyboardInterrupt, ProviderInterrupted)):
+            raise error
         return tuple(immutable)
     training_thread.join()
     return tuple(immutable)

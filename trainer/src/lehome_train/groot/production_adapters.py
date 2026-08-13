@@ -987,6 +987,7 @@ class HubCheckpointUploader:
         revision: str,
         experiment_id: str,
         artifact_root: str | os.PathLike[str] | None = None,
+        token: str | None = None,
     ) -> None:
         if repository != DEFAULT_MODEL_REPO:
             raise ValueError("checkpoint repository is not approved")
@@ -996,6 +997,15 @@ class HubCheckpointUploader:
         self.revision = revision
         self.experiment_id = experiment_id
         self.artifact_root = None if artifact_root is None else Path(artifact_root)
+        if token is not None and (
+            not isinstance(token, str)
+            or not token
+            or any(character.isspace() for character in token)
+        ):
+            raise ValueError("checkpoint publisher token is invalid")
+        # Deliberately do not mutate ``os.environ``: the official trainer is
+        # launched separately and must never inherit Hub credentials.
+        self._hub_environ = None if token is None else {"HF_TOKEN": token}
 
     def __call__(
         self, checkpoint: CheckpointDescriptor, *, timeout_seconds: float
@@ -1020,6 +1030,7 @@ class HubCheckpointUploader:
             repository=self.repository,
             read=True,
             write=True,
+            environ=self._hub_environ,
         )
         entry = SyncEntry(
             relative_path=checkpoint.record.artifact.relative_path,
@@ -1037,6 +1048,7 @@ class HubCheckpointUploader:
             source=self.artifact_root,
             entries=(entry,),
             remote_prefix=remote_prefix,
+            environ=self._hub_environ,
             max_attempts=1,
         )
         readback = Path(
@@ -1050,6 +1062,7 @@ class HubCheckpointUploader:
                 destination=readback,
                 relative_paths=(entry.relative_path,),
                 remote_prefix=remote_prefix,
+                environ=self._hub_environ,
                 max_attempts=1,
             )
             observed = readback / entry.relative_path

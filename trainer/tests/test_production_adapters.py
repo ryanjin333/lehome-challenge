@@ -639,3 +639,17 @@ def test_training_session_accepts_already_completed_exact_target_without_relaunc
     receipt = session.run_chunk(_request(schedule, 0, target))
 
     assert receipt.end_optimizer_step == target
+
+
+def test_checkpoint_uploader_uses_explicit_parent_token_without_process_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uploader = adapters.HubCheckpointUploader(
+        repository=adapters.DEFAULT_MODEL_REPO,
+        revision="a" * 40,
+        experiment_id="experiment-001",
+        artifact_root=tmp_path,
+        token="publisher-token",
+    )
+    assert uploader._hub_environ == {"HF_TOKEN": "publisher-token"}
+    assert "HF_TOKEN" not in __import__("os").environ

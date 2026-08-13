@@ -170,6 +170,60 @@ def _positive_integer(value: object, label: str) -> int:
     return value
 
 
+def _publisher_token(path_value: object) -> str:
+    """Read the chmod-600 staging file in the publisher parent only."""
+    path = _mounted_path(path_value, "publisher_token_file", must_exist=True, regular_file=True)
+    try:
+        mode = path.stat().st_mode & 0o777
+        token = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        raise ValueError("publisher token file is unreadable") from None
+    if mode & 0o077 or not token or any(character.isspace() for character in token):
+        raise ValueError("publisher token file must be private and non-empty")
+    return token
+
+
+def _resume_publication(
+    *,
+    value: object,
+    descriptor: object,
+    output_root: Path,
+    token: str,
+) -> object:
+    """Authenticate and hydrate one immutable resume archive before session init."""
+    if value is None and descriptor is None:
+        return None
+    if not isinstance(value, Mapping) or descriptor is None:
+        raise ValueError("resume requires both descriptor and immutable publication")
+    resume = load_checkpoint_descriptor(_mounted_path(descriptor, "resume_checkpoint", must_exist=True, regular_file=True))
+    required = {"repository", "immutable_revision", "remote_prefix", "relative_path", "artifact_sha256", "artifact_byte_size"}
+    if set(value) != required or value.get("repository") != DEFAULT_MODEL_REPO:
+        raise ValueError("resume immutable publication is incompatible")
+    revision, prefix, relative = value["immutable_revision"], value["remote_prefix"], value["relative_path"]
+    artifact, size = value["artifact_sha256"], value["artifact_byte_size"]
+    if not all(isinstance(item, str) and item for item in (revision, prefix, relative, artifact)) or type(size) is not int or size <= 0:
+        raise ValueError("resume immutable publication is malformed")
+    if resume.record.artifact.relative_path != relative or resume.record.artifact.sha256 != artifact or resume.record.artifact.byte_size != size:
+        raise ValueError("resume descriptor does not bind immutable publication")
+    transport = HuggingFaceHubTransport(timeout_seconds=30.0)
+    tree = transport.list_tree(repository=DEFAULT_MODEL_REPO, revision=revision, token=token)
+    remote_path = prefix.rstrip("/") + "/" + relative
+    if not any(entry.relative_path == remote_path and entry.entry_type == "file" for entry in tree):
+        raise ValueError("resume immutable tree lacks checkpoint archive")
+    transport.download_files(
+        repository=DEFAULT_MODEL_REPO,
+        revision=revision,
+        destination=output_root,
+        relative_paths=(relative,),
+        remote_prefix=prefix,
+        token=token,
+    )
+    local = output_root / relative
+    if not local.is_file() or local.stat().st_size != size or sha256_file(local) != artifact:
+        raise ValueError("resume immutable checkpoint readback mismatch")
+    return resume
+
+
 def _visible_device(expected_gpu_count: int = 1) -> str:
     value = os.environ.get("CUDA_VISIBLE_DEVICES")
     if not value:
@@ -766,7 +820,8 @@ class ProductionRuntime:
         fields = {
             "launch_config", "experiment_config", "generation_root", "parent_checkpoint_sha256",
             "normalization_sha256", "checkpoint_repository", "checkpoint_revision",
-            "instance_id", "result_output", "status_output",
+            "instance_id", "result_output", "status_output", "resume_checkpoint",
+            "resume_publication", "publisher_token_file",
         }
         request = _exact(arguments, fields, "continuous-train")
         outputs = _prepare_outputs(request, "result_output", "status_output")
@@ -784,8 +839,15 @@ class ProductionRuntime:
             raise ValueError("continuous checkpoint destination is incompatible")
         if config.max_steps != 2000 or config.save_steps != 1000 or config.global_batch_size != 64:
             raise ValueError("continuous-train requires the 2K batch-64 corrective launch")
-        session = GrootTrainingSession(config=config, experiment_config=experiment, normalization_sha256=normalization, resume_checkpoint=None)
-        uploader = HubCheckpointUploader(repository=repository, revision=revision, experiment_id=config.experiment_name, artifact_root=config.output_dir)
+        token = _publisher_token(request["publisher_token_file"])
+        resume = _resume_publication(
+            value=request["resume_publication"],
+            descriptor=request["resume_checkpoint"],
+            output_root=Path(config.output_dir),
+            token=token,
+        )
+        session = GrootTrainingSession(config=config, experiment_config=experiment, normalization_sha256=normalization, resume_checkpoint=resume)
+        uploader = HubCheckpointUploader(repository=repository, revision=revision, experiment_id=config.experiment_name, artifact_root=config.output_dir, token=token)
         schedule = ExposureSchedule(physical_batch_size=64, sample_presentations=128_000, checkpoint_sample_presentations=64_000)
         publications = run_continuous_supervisor(
             run_root=Path(config.output_dir) / config.experiment_name,
@@ -802,6 +864,8 @@ class ProductionRuntime:
             immutable_checkpoint_steps=lambda: verified,
         )
         payload["immutable_checkpoint_publications"] = list(publications)
+        if resume is not None:
+            payload["resume_checkpoint_step"] = resume.record.optimizer_step
         _write_result(outputs["result_output"], payload)
         atomic_write_json(outputs["status_output"], payload)
         return payload
