@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import re
 from typing import Mapping
@@ -51,6 +52,32 @@ def _optional_number(value: object, label: str) -> float | None:
     if type(value) not in (int, float) or float(value) < 0:
         raise ValueError(f"release manifest {label} must be nonnegative")
     return float(value)
+
+
+def validate_training_capability(value: object) -> Mapping[str, object]:
+    """Admit Blackwell training by real optimizer capability, not rollout R580."""
+    capability = _exact_keys(
+        value,
+        {"hardware", "driver_version", "image_digest", "cuda_runtime", "torch_cuda", "compute_capability", "optimizer_step", "nvml"},
+        "training capability",
+    )
+    if "RTX PRO 6000 Blackwell" not in _string(capability["hardware"], "training hardware"):
+        raise ValueError("training capability requires RTX PRO 6000 Blackwell")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", _string(capability["driver_version"], "training driver")):
+        raise ValueError("training driver version is invalid")
+    if not _DIGEST.fullmatch(_string(capability["image_digest"], "training image digest")):
+        raise ValueError("training image digest is invalid")
+    for key in ("cuda_runtime", "torch_cuda", "compute_capability"):
+        _string(capability[key], key)
+    step = capability["optimizer_step"]
+    if not isinstance(step, Mapping) or step.get("passed") is not True or type(step.get("loss")) not in (int, float):
+        raise ValueError("training capability requires a finite optimizer smoke")
+    if not math.isfinite(float(step["loss"])):
+        raise ValueError("training capability requires a finite optimizer smoke")
+    nvml = capability["nvml"]
+    if not isinstance(nvml, Mapping) or type(nvml.get("utilization_percent")) not in (int, float):
+        raise ValueError("training capability requires NVML telemetry")
+    return capability
 
 
 @dataclass(frozen=True, slots=True)

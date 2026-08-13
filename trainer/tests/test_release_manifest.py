@@ -11,6 +11,7 @@ from lehome_train.release_manifest import (
     MODEL_REVISION,
     ReleaseManifest,
     load_release_manifest,
+    validate_training_capability,
 )
 
 
@@ -22,6 +23,29 @@ OCI_DIGEST = "sha256:" + "a" * 64
 DATASET_REVISION = "b" * 40
 DATASET_MANIFEST_SHA256 = "c" * 64
 NORMALIZATION_SHA256 = "d" * 64
+
+
+def test_training_accepts_newer_blackwell_driver_after_capability_smoke() -> None:
+    capability = validate_training_capability({
+        "hardware": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "driver_version": "595.71.05",
+        "image_digest": OCI_DIGEST,
+        "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0",
+        "optimizer_step": {"passed": True, "loss": 0.2},
+        "nvml": {"utilization_percent": 80.0},
+    })
+    assert capability["driver_version"] == "595.71.05"
+
+
+def test_training_rejects_newer_driver_without_real_smoke() -> None:
+    with pytest.raises(ValueError, match="optimizer smoke"):
+        validate_training_capability({
+            "hardware": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+            "driver_version": "595.71.05", "image_digest": OCI_DIGEST,
+            "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0",
+            "optimizer_step": {"passed": False, "loss": 0.2},
+            "nvml": {"utilization_percent": 80.0},
+        })
 
 
 def _accepted_payload() -> dict[str, object]:
