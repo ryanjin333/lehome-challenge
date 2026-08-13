@@ -17,7 +17,15 @@ PYTHONPATH=source/lehome:trainer/src uv run python \
 PYTHONPATH=source/lehome:trainer/src uv run --project trainer pytest -q \
   trainer/tests/test_flywheel_mix.py trainer/tests/test_throughput_tuning.py \
   trainer/tests/test_continuous_training.py trainer/tests/test_groot_config.py \
-  trainer/tests/test_groot_launch.py trainer/tests/test_persistent_training_lifecycle.py
+  trainer/tests/test_groot_launch.py trainer/tests/test_production_adapters.py \
+  trainer/tests/test_train.py trainer/tests/test_production_runtime.py \
+  trainer/tests/test_release_manifest.py trainer/tests/test_persistent_training_lifecycle.py
+python3 -m py_compile \
+  trainer/src/lehome_train/groot/config.py \
+  trainer/src/lehome_train/groot/throughput_tuning.py \
+  trainer/src/lehome_train/groot/continuous_training.py \
+  scripts/run_groot_persistent_training.py
+git diff --check
 ```
 
 `materialize` is free and builds the generation itself with the canonical
