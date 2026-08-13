@@ -99,6 +99,17 @@ def test_offer_total_conservatively_counts_requested_300gb_storage() -> None:
     assert evidence["account_hourly_total_usd"] == pytest.approx(1.0)
 
 
+def test_offer_without_storage_quote_uses_nonzero_conservative_storage_bound() -> None:
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return '[{"id":7,"gpu_name":"RTX PRO 6000 S","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"min_bid":0.5}]'
+        if command[:4] in {("vastai", "--raw", "show", "instances"), ("vastai", "--raw", "show", "volumes")}:
+            return "[]"
+        raise AssertionError(command)
+    evidence = LIFECYCLE.capture_offers(runner=runner, now_unix=1)
+    assert evidence["requested_storage_hourly_usd"] > 0
+
+
 def test_rent_requires_capability_receipt_for_exact_image(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
     evidence = {"offer": {"id": 7, "min_bid": .5}, "search_mode": "interruptible", "expires_at_unix": 101, "trainer_image": "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:" + "a" * 64}
@@ -163,6 +174,15 @@ def test_stage_rejects_runtime_request_that_points_at_unstaged_paths(tmp_path: P
     continuous.write_text(json.dumps({"launch_config": "/prepared/config/launch.json", "experiment_config": "/prepared/config/experiment.json", "generation_root": "/prepared/generation", "publisher_token_file": "/prepared/config/publisher.token"}))
     with pytest.raises(ValueError, match="base model path"):
         LIFECYCLE._validate_staged_operational_requests(launch, continuous)
+
+
+def test_stage_requires_code_bundle_receipt_to_match_bundle(tmp_path: Path) -> None:
+    bundle = tmp_path / "code.bundle"
+    bundle.write_bytes(b"not-an-archive")
+    receipt = tmp_path / "code.bundle.sha256"
+    receipt.write_text("0" * 64 + "  code.bundle\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="code bundle receipt"):
+        LIFECYCLE._verify_code_bundle_receipt(bundle, receipt)
 
 
 def test_bootstrap_canary_uses_only_historical_image_and_binds_instance_receipt(

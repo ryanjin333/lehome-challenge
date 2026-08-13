@@ -107,7 +107,9 @@ def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: 
     eligible = [row for row in offers if isinstance(row, Mapping) and _offer_gpu(row) and row.get("num_gpus") == 1 and float(row.get("dph_total", 99)) < 1]
     if not eligible: raise ValueError("no interruptible RTX PRO 6000 96GB offer under $1/hr")
     offer = min(eligible, key=lambda row: float(row["dph_total"]))
-    storage_unit_cost = offer.get("storage_cost", offer.get("storage_cost_per_gb", 0))
+    # Some raw offer variants omit a disk quote.  Count a deliberately
+    # conservative fallback rather than silently treating 300GB as free.
+    storage_unit_cost = offer.get("storage_cost", offer.get("storage_cost_per_gb", 0.001))
     if type(storage_unit_cost) not in (int, float) or float(storage_unit_cost) < 0:
         raise ValueError("offer storage quote is invalid")
     requested_storage_hourly = float(storage_unit_cost) * 300
@@ -213,6 +215,19 @@ def _safe_archive(path: Path, label: str) -> None:
             raise ValueError(f"{label} has an unsafe archive member")
 
 
+def _verify_code_bundle_receipt(bundle: Path, receipt: Path) -> str:
+    if bundle.is_symlink() or not bundle.is_file() or receipt.is_symlink() or not receipt.is_file():
+        raise ValueError("code bundle receipt must name regular files")
+    try:
+        fields = receipt.read_text(encoding="utf-8").strip().split()
+    except (OSError, UnicodeError):
+        raise ValueError("code bundle receipt is unreadable") from None
+    digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    if len(fields) != 2 or fields[0] != digest or fields[1] not in {bundle.name, "code.bundle"}:
+        raise ValueError("code bundle receipt does not match bundle")
+    return digest
+
+
 def _stage_setup_command() -> str:
     """Static remote setup: extraction is constrained to the three mounts."""
     return (
@@ -293,6 +308,9 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
     generation_tree = _tree_readback_sha256(generation_root)
     observed_tree = runner((*_ssh_prefix(instance), "cd " + remote_dir + "/generation && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum")).strip().split()
     if not observed_tree or observed_tree[0] != generation_tree: raise ValueError("remote sealed generation tree readback failed")
+    code_bundle = Path(str(request["code_bundle"]))
+    if _verify_code_bundle_receipt(code_bundle, Path(str(request["code_bundle_sha256_file"]))) != request["code_bundle_sha256"]:
+        raise ValueError("staged code bundle hash differs from request")
     pairs = (
         ("code_bundle", "code.bundle"), ("code_bundle_sha256_file", "code.bundle.sha256"),
         ("generation_receipt", "generation.generation.json"), ("parent_checkpoint", "parent.tar"),
