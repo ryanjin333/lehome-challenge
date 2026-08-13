@@ -48,7 +48,6 @@ def run_continuous_training(
     generation = verify_generation(generation_root)
     if not _SHA256.fullmatch(parent_checkpoint_sha256):
         raise ValueError("parent checkpoint SHA-256 is invalid")
-    launch()
     verified = immutable_checkpoint_steps()
     if verified != (1000, 2000):
         return {

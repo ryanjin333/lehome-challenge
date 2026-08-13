@@ -87,13 +87,30 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
     return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _hash(live)}
 
 
+def _stage_command(request: Mapping[str, object]) -> str:
+    required = ("code_bundle", "code_bundle_sha256", "generation_root", "generation_receipt", "parent_checkpoint", "parent_checkpoint_sha256", "launch_config", "modality_config", "token_file")
+    if any(not isinstance(request.get(key), str) or not request[key] for key in required):
+        raise ValueError("stage requires exact code, generation, parent, config, modality, and token paths")
+    if request.get("generation_sha256") != request.get("sealed_generation_sha256"):
+        raise ValueError("stage generation identity is not sealed")
+    # The token is a file transport only; no value is embedded in local JSON or
+    # a command string.  Remote validation is hashes/path identity, never logs.
+    return "set -eu; test -f /tmp/lehome-stage/code.bundle; sha256sum -c /tmp/lehome-stage/code.bundle.sha256; test -f /tmp/lehome-stage/generation.generation.json; lehome-train continuous-train --request /tmp/lehome-stage/continuous.json"
+
+
 def remote_action(*, action: str, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     instance_id = instance.get("instance_id")
     if type(instance_id) is not int: raise ValueError("instance receipt is invalid")
     if action == "resume" and request.get("generation_sha256") != request.get("resume_generation_sha256") or action == "resume" and request.get("config_sha256") != request.get("resume_config_sha256"):
         raise ValueError("resume requires exact generation/config identity")
-    command = request.get("remote_command")
-    if not isinstance(command, str) or not command: raise ValueError("remote action requires an explicit secret-safe command")
+    if action == "stage":
+        command = _stage_command(request)
+    elif action in {"tune", "train", "status", "resume"}:
+        if action == "resume" and request.get("generation_sha256") != request.get("resume_generation_sha256") or action == "resume" and request.get("config_sha256") != request.get("resume_config_sha256"):
+            raise ValueError("resume requires exact generation/config identity")
+        command = "set -eu; lehome-train " + ("continuous-train" if action in {"train", "resume"} else action) + " --request /tmp/lehome-stage/continuous.json"
+    else:
+        raise ValueError("unsupported remote lifecycle action")
     runner(("ssh", "-o", "ClearAllForwardings=yes", f"root@{instance.get('host')}", command))
     return {"paid_action": True, "action": action, "instance_id": instance_id}
 
@@ -111,7 +128,17 @@ def destroy(*, instance_id: int, training_receipt: Mapping[str, object], runner:
 def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object]:
     parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("prepare", "capture-offers", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv); request = _load(args.request)
-    if args.action == "prepare": return {"paid_action": False, "action": "prepare", "organizer_source": ORGANIZER_SOURCE, "corrective_source": CORRECTIVE_SOURCE, "request": request}
+    if args.action == "prepare":
+        generation = request.get("generation_root")
+        if isinstance(generation, str):
+            root = Path(generation)
+            receipt = root.with_name(root.name + ".generation.json")
+            if not root.is_dir() or root.is_symlink() or not receipt.is_file() or receipt.is_symlink(): raise ValueError("prepare requires a local sealed generation")
+            try:
+                sealed = json.loads(receipt.read_text())
+            except (OSError, json.JSONDecodeError): raise ValueError("prepare generation receipt is invalid") from None
+            if not isinstance(sealed, Mapping) or sealed.get("sealed") is not True: raise ValueError("prepare requires a sealed generation")
+        return {"paid_action": False, "action": "prepare", "organizer_source": ORGANIZER_SOURCE, "corrective_source": CORRECTIVE_SOURCE, "request": request}
     if not args.execute: return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
     if args.action == "capture-offers": return capture_offers(runner=runner)
     if args.action == "rent": return rent(evidence=request, runner=runner)

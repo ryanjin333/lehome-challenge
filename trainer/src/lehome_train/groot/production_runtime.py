@@ -20,6 +20,7 @@ from lehome_train.data.normalization import normalization_identity
 from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.groot.launch import build_launch
 from lehome_train.groot.launch import launch_continuous_finetune, launch_finetune_to_step
+from lehome_train.groot.continuous_training import run_continuous_supervisor
 from lehome_train.groot.production_adapters import (
     GrootMemorizationSession,
     GrootSmokeRunner,
@@ -761,24 +762,39 @@ class ProductionRuntime:
 
     def continuous_train(self, arguments: dict[str, object]) -> dict[str, object]:
         fields = {
-            "launch_config", "generation_root", "parent_checkpoint_sha256",
-            "immutable_checkpoint_steps", "result_output", "status_output",
+            "launch_config", "experiment_config", "generation_root", "parent_checkpoint_sha256",
+            "normalization_sha256", "checkpoint_repository", "checkpoint_revision",
+            "result_output", "status_output",
         }
         request = _exact(arguments, fields, "continuous-train")
         outputs = _prepare_outputs(request, "result_output", "status_output")
         config = _load_config(request["launch_config"])
+        experiment = _load_experiment(request["experiment_config"])
         generation = _mounted_path(request["generation_root"], "generation_root", must_exist=True)
         parent = _sha256(request["parent_checkpoint_sha256"], "parent_checkpoint_sha256")
-        steps = request["immutable_checkpoint_steps"]
-        if not isinstance(steps, list) or any(type(step) is not int for step in steps):
-            raise ValueError("immutable checkpoint steps are invalid")
+        normalization = _sha256(request["normalization_sha256"], "normalization_sha256")
+        if normalization_identity(generation) != normalization or config.dataset_path != str(generation):
+            raise ValueError("continuous generation normalization or dataset path is incompatible")
+        if config.parent_checkpoint_artifact_sha256 != parent or config.training_action_horizon != 16 or config.model_action_chunk_capacity != 40:
+            raise ValueError("continuous parent or horizon identity is incompatible")
+        repository, revision = request["checkpoint_repository"], request["checkpoint_revision"]
+        if repository != DEFAULT_MODEL_REPO or type(revision) is not str or not revision:
+            raise ValueError("continuous checkpoint destination is incompatible")
         if config.max_steps != 2000 or config.save_steps != 1000 or config.global_batch_size != 64:
             raise ValueError("continuous-train requires the 2K batch-64 corrective launch")
+        session = GrootTrainingSession(config=config, experiment_config=experiment, normalization_sha256=normalization, resume_checkpoint=None)
+        uploader = HubCheckpointUploader(repository=repository, revision=revision, experiment_id=config.experiment_name, artifact_root=config.output_dir)
+        verified = run_continuous_supervisor(
+            run_root=Path(config.output_dir) / config.experiment_name,
+            launch=lambda: launch_continuous_finetune(config, **_launch_kwargs()),
+            package=lambda completed: session.package_checkpoint_snapshot(completed.snapshot_root, optimizer_step=completed.optimizer_step, sample_presentations=completed.optimizer_step * 64, schedule_sha256="0" * 64),
+            publish=lambda checkpoint: uploader(checkpoint, timeout_seconds=30.0),
+        )
         payload = run_continuous_training(
             generation_root=generation,
             parent_checkpoint_sha256=parent,
-            launch=lambda: launch_continuous_finetune(config, **_launch_kwargs()),
-            immutable_checkpoint_steps=lambda: tuple(steps),
+            launch=lambda: None,
+            immutable_checkpoint_steps=lambda: verified,
         )
         _write_result(outputs["result_output"], payload)
         atomic_write_json(outputs["status_output"], payload)

@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from lehome_train.groot.continuous_training import snapshot_checkpoint
+from lehome_train.groot.continuous_training import run_continuous_supervisor, snapshot_checkpoint
 
 
 def test_observer_never_packages_checkpoint_without_completion_marker(tmp_path: Path) -> None:
@@ -21,3 +21,14 @@ def test_snapshot_is_independent_byte_copy(tmp_path: Path) -> None:
     snapshot = snapshot_checkpoint(checkpoint, optimizer_step=1000)
     (checkpoint / "weights.bin").write_bytes(b"changed")
     assert (snapshot.snapshot_root / "weights.bin").read_bytes() == b"original"
+
+
+def test_supervisor_reads_completed_checkpoints_not_caller_steps(tmp_path: Path) -> None:
+    seen: list[int] = []
+    def launch() -> None:
+        for step in (1000, 2000):
+            checkpoint = tmp_path / f"checkpoint-{step}"; checkpoint.mkdir()
+            (checkpoint / "weights.bin").write_bytes(b"weights")
+            (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": step, "log_history": [{"step": step, "loss": 0.2}]}))
+    assert run_continuous_supervisor(run_root=tmp_path, launch=launch, package=lambda item: item, publish=lambda item: seen.append(item.optimizer_step) or True) == (1000, 2000)
+    assert seen == [1000, 2000]
