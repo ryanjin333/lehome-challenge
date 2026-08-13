@@ -250,7 +250,7 @@ def test_unbound_orphan_adoption_claims_only_exact_parquets_and_regenerates_vide
     shutil.rmtree(orphan / "videos")
     shutil.rmtree(orphan / "meta")
     (orphan / "manifest.json").unlink()
-    (orphan / "conversion-journal.json").unlink()
+    (orphan / "conversion-journal.json").unlink(missing_ok=True)
     generated: list[Path] = []
     original = converter._extract_video_segment
     monkeypatch.setattr(
@@ -278,6 +278,100 @@ def test_persistent_mode_recognizes_exact_promoted_conversion_for_stats_resume(
     (destination / "data" / "chunk-000" / "episode_000003.parquet").write_bytes(b"tampered")
     with pytest.raises(ValueError, match="persistent converted destination"):
         _convert(source, destination, persistent_staging_root=tmp_path / "staging")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("train_episode_ids", ["999"]),
+    ("validation_episode_ids", ["999"]),
+    ("future_actions", {"horizon": 40}),
+])
+def test_persistent_destination_rejects_any_downstream_manifest_contract_drift(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    source = make_source_dataset(tmp_path)
+    destination = tmp_path / "output"
+    _convert(source, destination, persistent_staging_root=tmp_path / "staging")
+    manifest_path = destination / "manifest.json"
+    manifest = json.loads(manifest_path.read_text()); manifest[field] = value
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="contract"):
+        _convert(source, destination, persistent_staging_root=tmp_path / "staging")
+
+
+def test_legacy_conversion_does_not_emit_resume_journal_or_fields(tmp_path: Path) -> None:
+    source = make_source_dataset(tmp_path)
+    legacy = _convert(source, tmp_path / "legacy")
+    persistent = _convert(source, tmp_path / "persistent", persistent_staging_root=tmp_path / "stage")
+    assert "conversion_journal_sha256" not in legacy and "adopted_episode_data" not in legacy
+    assert not (tmp_path / "legacy" / "conversion-journal.json").exists()
+    assert persistent["conversion_journal_sha256"]
+
+
+def test_persistent_conversion_rejects_overlapping_staging_and_held_lock(tmp_path: Path) -> None:
+    source = make_source_dataset(tmp_path)
+    with pytest.raises(ValueError, match="overlap"):
+        _convert(source, tmp_path / "output", persistent_staging_root=tmp_path / "output")
+    staging = tmp_path / "staging"; staging.mkdir()
+    lock = staging.parent / ".staging.conversion.lock"; lock.write_bytes(b"other-owner")
+    with pytest.raises(ValueError, match="already owned"):
+        _convert(source, tmp_path / "output", persistent_staging_root=staging)
+
+
+def test_persistent_destination_removes_only_partial_statistics_outputs_for_restart(
+    tmp_path: Path,
+) -> None:
+    source = make_source_dataset(tmp_path); destination = tmp_path / "output"
+    _convert(source, destination, persistent_staging_root=tmp_path / "staging")
+    partial = destination / "meta" / "stats.json"; partial.write_text("{}")
+    _convert(source, destination, persistent_staging_root=tmp_path / "staging")
+    assert not partial.exists()
+
+
+def test_persistent_restart_excludes_stale_manifest_from_final_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source_dataset(tmp_path); staging = tmp_path / "staging"
+    original_replace = converter.os.replace
+    def interrupt_manifest_promotion(source_path, destination_path):
+        if Path(destination_path) == tmp_path / "output":
+            raise RuntimeError("crash after manifest")
+        return original_replace(source_path, destination_path)
+    monkeypatch.setattr(converter.os, "replace", interrupt_manifest_promotion)
+    with pytest.raises(RuntimeError, match="crash after manifest"):
+        _convert(source, tmp_path / "output", persistent_staging_root=staging)
+    assert (staging / "manifest.json").is_file()
+    monkeypatch.setattr(converter.os, "replace", original_replace)
+    manifest = _convert(source, tmp_path / "output", persistent_staging_root=staging)
+    listed = {item["relative_path"] for item in manifest["output_artifacts"]}
+    assert "manifest.json" not in listed
+    assert converter.artifact_identities(tmp_path / "output", exclude={"manifest.json"}) == manifest["output_artifacts"]
+
+
+def test_persistent_journal_fails_closed_for_receipt_or_receipted_file_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source_dataset(tmp_path); staging = tmp_path / "staging"
+    monkeypatch.setattr(converter, "_extract_video_segment", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(RuntimeError, match="stop"):
+        _convert(source, tmp_path / "output", persistent_staging_root=staging)
+    journal_path = staging / "conversion-journal.json"; journal = json.loads(journal_path.read_text())
+    relative = next(iter(journal["receipts"])); journal["receipts"][relative]["sha256"] = "f" * 64
+    journal_path.write_text(json.dumps(journal))
+    with pytest.raises(ValueError, match="receipted file changed"):
+        _convert(source, tmp_path / "output", persistent_staging_root=staging)
+
+
+def test_persistent_journal_fails_closed_for_receipted_file_byte_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source_dataset(tmp_path); staging = tmp_path / "staging"
+    monkeypatch.setattr(converter, "_extract_video_segment", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(RuntimeError, match="stop"):
+        _convert(source, tmp_path / "output", persistent_staging_root=staging)
+    journal = json.loads((staging / "conversion-journal.json").read_text())
+    relative = next(iter(journal["receipts"])); (staging / relative).write_bytes(b"corrupt")
+    with pytest.raises(ValueError, match="receipted file changed"):
+        _convert(source, tmp_path / "output", persistent_staging_root=staging)
 
 
 def test_persistent_staging_rejects_unjournaled_or_unexpected_content(tmp_path: Path) -> None:
@@ -310,7 +404,7 @@ def test_orphan_adoption_rejects_unexpected_video_and_tampered_parquet(
     source = make_source_dataset(tmp_path)
     orphan = tmp_path / "orphan"
     _convert(source, orphan)
-    (orphan / "manifest.json").unlink(); (orphan / "conversion-journal.json").unlink(); shutil.rmtree(orphan / "meta")
+    (orphan / "manifest.json").unlink(); (orphan / "conversion-journal.json").unlink(missing_ok=True); shutil.rmtree(orphan / "meta")
     unexpected = orphan / "videos" / "chunk-000" / "bad" / "not-a-job.mp4"
     unexpected.parent.mkdir(parents=True); unexpected.write_bytes(b"bad")
     with pytest.raises(ValueError, match="missing or extra"):

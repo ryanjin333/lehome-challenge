@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import uuid
 from typing import Any, Iterable, Mapping
 
 import pyarrow as pa
@@ -47,6 +48,43 @@ LEGACY_VIDEO_PATH = (
     "episode_{episode_index:06d}.mp4"
 )
 _JOURNAL_NAME = "conversion-journal.json"
+_DERIVED_STATISTICS_PATHS = (
+    "meta/stats.json", "meta/relative_stats.json", "meta/lehome_groot_modality.py",
+)
+# The journal is a local crash-recovery record, not adversarially authenticated
+# storage.  We fail closed on mismatched known receipts; a coordinated local
+# rewrite of both content and receipt requires a separate signed trust root.
+
+
+def _same_or_nested(left: Path, right: Path) -> bool:
+    left_resolved, right_resolved = left.resolve(strict=False), right.resolve(strict=False)
+    return left_resolved == right_resolved or left_resolved in right_resolved.parents or right_resolved in left_resolved.parents
+
+
+def _persistent_lock(staging: Path) -> tuple[Path, tuple[int, int]]:
+    lock = staging.parent / f".{staging.name}.conversion.lock"
+    if lock.is_symlink():
+        raise ValueError("persistent conversion lock is unsafe")
+    try:
+        descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise ValueError("persistent conversion staging is already owned") from None
+    token = uuid.uuid4().hex.encode()
+    try:
+        os.write(descriptor, token)
+        identity = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    return lock, (identity.st_dev, identity.st_ino)
+
+
+def _release_persistent_lock(lock: Path, identity: tuple[int, int]) -> None:
+    try:
+        current = lock.stat()
+        if (current.st_dev, current.st_ino) == identity and lock.is_file() and not lock.is_symlink():
+            lock.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _sha256_size(path: Path) -> dict[str, object]:
@@ -60,6 +98,17 @@ def _matches_receipt(path: Path, receipt: object) -> bool:
         and not path.is_symlink()
         and path.is_file()
         and receipt == _sha256_size(path)
+    )
+
+
+def _valid_receipt(receipt: object) -> bool:
+    return (
+        isinstance(receipt, Mapping)
+        and set(receipt) == {"sha256", "byte_size"}
+        and isinstance(receipt.get("sha256"), str)
+        and __import__("re").fullmatch(r"[0-9a-f]{64}", receipt["sha256"]) is not None
+        and type(receipt.get("byte_size")) is int
+        and receipt["byte_size"] >= 0
     )
 
 
@@ -147,6 +196,12 @@ def _validate_staging_tree(staging: Path, journal: Mapping[str, object]) -> None
             raise ValueError("persistent staging contains unexpected file")
     if not set(receipts).issubset(set(jobs)):
         raise ValueError("persistent conversion journal has unexpected receipts")
+    if not all(_valid_receipt(receipt) for receipt in receipts.values()):
+        raise ValueError("persistent conversion journal has malformed receipts")
+    for relative, receipt in receipts.items():
+        path = staging / str(relative)
+        if path.exists() and not _matches_receipt(path, receipt):
+            raise ValueError("persistent conversion receipted file changed")
 
 
 def _record_receipt(staging: Path, journal: dict[str, object], lock: threading.Lock, relative: str) -> None:
@@ -216,11 +271,18 @@ def _persistent_destination_manifest(
     *, inspection: Mapping[str, Any], mapping: Mapping[str, Any],
     source_repository: str, source_revision: str, converter_commit: str,
     converter_container_digest: str, split_seed: int, validation_fraction: float,
+    records: list[dict[str, Any]],
 ) -> dict[str, object]:
     """Accept a promoted conversion only as a byte-authenticated resume point."""
     if destination.is_symlink() or not destination.is_dir():
         raise ValueError("persistent converted destination is unsafe")
     manifest = read_json_object(destination / "manifest.json")
+    split = split_episode_ids(
+        tuple(str(item) for item in inspection["episode_ids"]),
+        seed=split_seed, validation_fraction=validation_fraction,
+    )
+    # These are the complete deterministic conversion fields that downstream
+    # loader/statistics code trusts, beyond source provenance alone.
     required = {
         "source_format": "lerobot_v3_sharded", "output_format": "groot_lerobot_v2.1_per_episode",
         "source_repository": source_repository, "source_revision": source_revision,
@@ -230,9 +292,24 @@ def _persistent_destination_manifest(
         "converter_container_digest": converter_container_digest,
         "pinned_groot_revision": ISAAC_GROOT_REVISION, "split_seed": split_seed,
         "validation_fraction": validation_fraction,
+        "fps": inspection["fps"], "frame_count": inspection["frame_count"],
+        "episode_count": inspection["episode_count"],
+        "train_episode_ids": list(split.train), "validation_episode_ids": list(split.validation),
+        "state_schema": {"source_key": "observation.state", "dimension": 12, "names": list(JOINT_NAMES)},
+        "action_schema": mapping["action"],
+        "fixed_language_instruction": FIXED_INSTRUCTION,
+        "future_actions": {
+            "horizon": ACTION_HORIZON, "loader_allow_padding": False,
+            "materialized_windows": False, "tail_convention": "drop_incomplete_windows",
+            "valid_action_mask": "implicit_all_true_for_emitted_windows",
+            "valid_window_counts": {
+                str(record["episode_index"]): max(0, int(record["dataset_to_index"]) - int(record["dataset_from_index"]) - ACTION_HORIZON + 1)
+                for record in sorted(records, key=lambda item: int(item["episode_index"]))
+            },
+        },
     }
     if any(manifest.get(key) != value for key, value in required.items()):
-        raise ValueError("persistent converted destination provenance is incompatible")
+        raise ValueError("persistent converted destination contract is incompatible")
     artifacts = manifest.get("output_artifacts")
     if not isinstance(artifacts, list) or manifest.get("output_manifest_sha256") != canonical_json_sha256(artifacts):
         raise ValueError("persistent converted destination artifact manifest is invalid")
@@ -249,7 +326,20 @@ def _persistent_destination_manifest(
             if not isinstance(item, Mapping) or not isinstance(item.get("relative_path"), str) or not isinstance(item.get("sha256"), str):
                 raise ValueError("persistent converted destination statistics are invalid")
             dynamic[item["relative_path"]] = item["sha256"]
+        if set(dynamic) != set(_DERIVED_STATISTICS_PATHS):
+            raise ValueError("persistent converted destination statistics are incomplete")
     observed = {item["relative_path"]: item for item in actual}
+    partial_derived = set(_DERIVED_STATISTICS_PATHS).intersection(observed).difference(dynamic)
+    if partial_derived:
+        if not partial_derived.issubset(set(_DERIVED_STATISTICS_PATHS)):
+            raise ValueError("persistent converted destination has unexpected derived outputs")
+        for relative in partial_derived:
+            path = destination / relative
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("persistent converted destination derived output is unsafe")
+            path.unlink()
+        actual = artifact_identities(destination, exclude={"manifest.json"})
+        observed = {item["relative_path"]: item for item in actual}
     if any(path not in observed or observed[path]["sha256"] != digest for path, digest in dynamic.items()):
         raise ValueError("persistent converted destination statistics changed")
     actual_base = {path: item for path, item in observed.items() if path not in dynamic}
@@ -697,7 +787,7 @@ def convert_dataset(
             source_repository=source_repository, source_revision=source_revision,
             converter_commit=converter_commit,
             converter_container_digest=converter_container_digest, split_seed=split_seed,
-            validation_fraction=validation_fraction,
+            validation_fraction=validation_fraction, records=load_v3_episode_records(source),
         )
 
     split = split_episode_ids(
@@ -711,13 +801,22 @@ def convert_dataset(
     episode_tables = _load_episode_tables(source, info, records)
     destination.parent.mkdir(parents=True, exist_ok=True)
     persistent = persistent_staging_root is not None
+    lock_path: Path | None = None
+    lock_identity: tuple[int, int] | None = None
     if persistent:
         temporary = Path(persistent_staging_root)  # type: ignore[arg-type]
+        adoption = None if unbound_staging_data_adoption_root is None else Path(unbound_staging_data_adoption_root)
+        quarantine = None if adoption is None else adoption.with_name(adoption.name + ".conversion-quarantine")
+        if _same_or_nested(temporary, source) or _same_or_nested(temporary, destination) or (adoption is not None and _same_or_nested(temporary, adoption)) or (quarantine is not None and _same_or_nested(temporary, quarantine)):
+            raise ValueError("persistent staging root must not overlap source, destination, or adoption roots")
+        if destination.parent.exists() and temporary.parent.exists() and destination.parent.stat().st_dev != temporary.parent.stat().st_dev:
+            raise ValueError("persistent staging and destination must share a filesystem for atomic promotion")
         if temporary.is_symlink():
             raise ValueError("persistent staging root must not be a symlink")
         if temporary.exists() and not temporary.is_dir():
             raise ValueError("persistent staging root must be a directory")
         temporary.mkdir(parents=True, exist_ok=True)
+        lock_path, lock_identity = _persistent_lock(temporary)
     else:
         temporary = Path(
             tempfile.mkdtemp(
@@ -726,20 +825,24 @@ def convert_dataset(
                 dir=destination.parent,
             )
         )
-    journal, journal_lock = _load_or_create_journal(
-        temporary,
-        _journal_identity(
-            inspection=inspection, mapping=mapping, source_repository=source_repository,
-            source_revision=source_revision, converter_commit=converter_commit,
-            converter_container_digest=converter_container_digest, split_seed=split_seed,
-            validation_fraction=validation_fraction, records=records, camera_keys=camera_keys,
-            info=info, source=source,
-        ),
-    )
-    _validate_staging_tree(temporary, journal)
+    journal: dict[str, object] | None = None
+    journal_lock: threading.Lock | None = None
+    if persistent:
+        journal, journal_lock = _load_or_create_journal(
+            temporary,
+            _journal_identity(
+                inspection=inspection, mapping=mapping, source_repository=source_repository,
+                source_revision=source_revision, converter_commit=converter_commit,
+                converter_container_digest=converter_container_digest, split_seed=split_seed,
+                validation_fraction=validation_fraction, records=records, camera_keys=camera_keys,
+                info=info, source=source,
+            ),
+        )
+        _validate_staging_tree(temporary, journal)
     try:
         adopted_episode_data = False
         if unbound_staging_data_adoption_root is not None:
+            assert journal is not None and journal_lock is not None
             _claim_and_adopt_orphan_data(
                 orphan=Path(unbound_staging_data_adoption_root), staging=temporary,
                 info=info, records=records, tables=episode_tables, camera_keys=camera_keys, journal=journal,
@@ -785,7 +888,10 @@ def convert_dataset(
             )
             for record in sorted_records
         }
-        output_artifacts = artifact_identities(temporary)
+        # A crash after the prior attempt's manifest write leaves an allowed
+        # stale manifest in persistent staging.  It must never enter the new
+        # artifact set (nor make that set self-referential).
+        output_artifacts = artifact_identities(temporary, exclude={"manifest.json"})
         manifest: dict[str, object] = {
             "schema_version": 1,
             "source_dataset": source.name,
@@ -795,8 +901,6 @@ def convert_dataset(
             "source_revision": source_revision,
             "source_manifest_sha256": inspection["source_manifest_sha256"],
             "source_artifacts": inspection["source_artifacts"],
-            "conversion_journal_sha256": _sha256_size(temporary / _JOURNAL_NAME)["sha256"],
-            "adopted_episode_data": adopted_episode_data,
             "output_artifacts": output_artifacts,
             "output_manifest_sha256": canonical_json_sha256(output_artifacts),
             "mapping_sha256": canonical_json_sha256(mapping),
@@ -838,10 +942,17 @@ def convert_dataset(
                 "valid_window_counts": valid_window_counts,
             },
         }
+        if persistent:
+            manifest["conversion_journal_sha256"] = _sha256_size(temporary / _JOURNAL_NAME)["sha256"]
+            manifest["adopted_episode_data"] = adopted_episode_data
         atomic_write_json(temporary / "manifest.json", manifest)
         os.replace(temporary, destination)
+        if lock_path is not None and lock_identity is not None:
+            _release_persistent_lock(lock_path, lock_identity)
         return manifest
     except BaseException:
         if not persistent:
             shutil.rmtree(temporary, ignore_errors=True)
+        if lock_path is not None and lock_identity is not None:
+            _release_persistent_lock(lock_path, lock_identity)
         raise
