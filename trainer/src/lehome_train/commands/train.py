@@ -65,6 +65,7 @@ def run_continuous_training(
             "checkpoint_steps": [1000, 2000],
             "immutable_checkpoint_steps": list(verified),
             "disposable": False,
+            "resumable_checkpoint_step": max(verified, default=None),
         }
     return {
         "schema_version": 1,

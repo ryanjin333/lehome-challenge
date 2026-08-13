@@ -61,6 +61,17 @@ def _trainer_image(value: object) -> str:
     return value
 
 
+def _tree_readback_sha256(root: Path) -> str:
+    """Match the remote sorted ``sha256sum`` tree receipt byte-for-byte."""
+    rows: list[bytes] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("sealed generation contains a symlink")
+        if path.is_file():
+            rows.append(hashlib.sha256(path.read_bytes()).hexdigest().encode() + b"  ./" + path.relative_to(root).as_posix().encode() + b"\n")
+    return hashlib.sha256(b"".join(rows)).hexdigest()
+
+
 def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: int = 300) -> dict[str, object]:
     offers = _json(runner, ("vastai", "--raw", "search", "offers", OFFER_QUERY, "--interruptible"))
     instances = _json(runner, ("vastai", "--raw", "show", "instances"))
@@ -115,9 +126,9 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
     generation_root = Path(str(request["generation_root"]))
     if generation_root.is_symlink() or not generation_root.is_dir(): raise ValueError("stage generation root is unsafe")
     runner(("scp", "-r", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(generation_root), "root@" + str(instance["host"]) + ":" + remote_dir + "/generation"))
-    generation_manifest = hashlib.sha256((generation_root / "manifest.json").read_bytes()).hexdigest()
-    observed_manifest = runner((*_ssh_prefix(instance), "sha256sum " + remote_dir + "/generation/manifest.json")).strip().split()
-    if not observed_manifest or observed_manifest[0] != generation_manifest: raise ValueError("remote generation manifest readback failed")
+    generation_tree = _tree_readback_sha256(generation_root)
+    observed_tree = runner((*_ssh_prefix(instance), "cd " + remote_dir + "/generation && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum")).strip().split()
+    if not observed_tree or observed_tree[0] != generation_tree: raise ValueError("remote sealed generation tree readback failed")
     pairs = (("code_bundle", "code.bundle"), ("generation_receipt", "generation.generation.json"), ("parent_checkpoint", "parent.tar"), ("launch_config", "launch.json"), ("modality_config", "modality.py"), ("token_file", "token"))
     receipts = []
     for field, remote_name in pairs:
@@ -129,8 +140,10 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
         if not observed or observed[0] != digest: raise ValueError("remote staged hash readback failed")
         receipts.append({"name": remote_name, "sha256": digest})
     receipt_payload = json.loads(Path(str(request["generation_receipt"])).read_text(encoding="utf-8"))
-    if receipt_payload.get("dataset_manifest_sha256") != generation_manifest: raise ValueError("staged generation receipt does not bind its manifest")
-    return {"paid_action": True, "action": "stage", "instance_id": instance["instance_id"], "generation_manifest_sha256": generation_manifest, "transfers": receipts}
+    if receipt_payload.get("sealed") is not True: raise ValueError("staged generation receipt is not sealed")
+    code_digest = next(item["sha256"] for item in receipts if item["name"] == "code.bundle")
+    if request.get("code_bundle_sha256") != code_digest: raise ValueError("staged code bundle hash differs from request")
+    return {"paid_action": True, "action": "stage", "instance_id": instance["instance_id"], "generation_tree_sha256": generation_tree, "code_bundle_sha256": code_digest, "transfers": receipts}
 
 
 def _stage_command(request: Mapping[str, object]) -> str:

@@ -113,6 +113,9 @@ def run_continuous_supervisor(
             elif isinstance(receipt, dict) and receipt.get("readback_verified") is True and receipt.get("optimizer_step") == step:
                 immutable.append(receipt)
     if launch_error:
-        raise launch_error[0]
+        # An interrupt does not discard verified work.  The caller receives the
+        # last immutable publication and can resume only with its identities.
+        training_thread.join()
+        return tuple(immutable)
     training_thread.join()
     return tuple(immutable)
