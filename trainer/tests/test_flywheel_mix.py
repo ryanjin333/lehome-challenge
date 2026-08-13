@@ -140,6 +140,47 @@ def test_generation_receipt_binds_exact_70_30_mix_and_artifacts(tmp_path: Path) 
     verify_generation(result["path"])
 
 
+def test_mix_accepts_canonical_autonomous_rft_snapshot_not_expert_provenance(
+    tmp_path: Path,
+) -> None:
+    """The released RFT aggregate uses policy trajectories and rft-selection."""
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
+    rft = _prepared_source(tmp_path / "rft", kind="flywheel", grade="A", episodes=2, action_source="policy")
+    provenance = rft / "meta" / "materialization-provenance.json"
+    provenance.unlink()
+    manifest = json.loads((rft / "manifest.json").read_text(encoding="utf-8"))
+    manifest.update({
+        "source_format": "verified_flywheel_rft_release",
+        "source_repository": "ryanjin333/lehome-groot-n17-data",
+        "source_revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c",
+        "source_release_id": "b" * 64,
+    })
+    # Rebuild the listed artifact set after replacing provenance with the
+    # canonical aggregate selection artifact.
+    atomic_write_json(rft / "meta" / "rft-selection.json", {
+        "schema_version": 1,
+        "source_repository": "ryanjin333/lehome-groot-n17-data",
+        "source_revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c",
+        "release_id": "b" * 64,
+        "action_horizon": 16,
+        "excluded_public_unseen": 0,
+        "excluded_failed": 0,
+        "episodes": [
+            {"episode_index": index, "raw_episode_id": f"rft-{index}", "raw_manifest_sha256": ("c" if index == 0 else "d") * 64, "frame_count": 32, "valid_window_count": 17, "category": "top_long"}
+            for index in range(2)
+        ],
+    })
+    artifacts = artifact_identities(rft, exclude={"manifest.json"})
+    manifest["output_artifacts"] = artifacts
+    manifest["output_manifest_sha256"] = canonical_json_sha256(artifacts)
+    atomic_write_json(rft / "manifest.json", manifest)
+
+    plan = build_mix_plan(organizer, rft, seed=5)
+
+    assert plan.organizer_training_frames * 3 == plan.flywheel_training_frames * 7
+    assert {item.source_kind for item in plan.selections} == {"organizer", "flywheel"}
+
+
 def test_generation_changes_after_seal_are_rejected(tmp_path: Path) -> None:
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
     grade_a = _prepared_source(tmp_path / "grade-a", kind="flywheel", grade="A", episodes=1)

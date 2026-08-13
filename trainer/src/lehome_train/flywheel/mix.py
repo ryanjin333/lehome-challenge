@@ -264,6 +264,76 @@ def _materialized_provenance(
     return raw_hash, revision, counts, lineage_by_episode  # type: ignore[return-value]
 
 
+def _rft_snapshot_provenance(
+    root: Path,
+    *,
+    manifest: Mapping[str, Any],
+    materialized_episode_ids: Sequence[str],
+) -> tuple[str, str, Mapping[str, int], Mapping[str, tuple[str, int, int, tuple[str, ...]]], str]:
+    """Adapt the canonical aggregate autonomous-RFT snapshot to mix lineage."""
+    if manifest.get("source_format") != "verified_flywheel_rft_release":
+        raise ValueError("flywheel source lacks a supported materialization contract")
+    selection = _read_json(root / "meta" / "rft-selection.json")
+    repository, revision, release_id = (
+        selection.get("source_repository"),
+        selection.get("source_revision"),
+        selection.get("release_id"),
+    )
+    if (
+        repository != manifest.get("source_repository")
+        or revision != manifest.get("source_revision")
+        or release_id != manifest.get("source_release_id")
+    ):
+        raise ValueError("RFT selection identity does not match snapshot manifest")
+    revision = _revision(revision, "RFT source revision")
+    _sha256(release_id, "RFT source release ID")
+    if selection.get("action_horizon") != ACTION_HORIZON:
+        raise ValueError("RFT selection action horizon is incompatible")
+    excluded = (selection.get("excluded_public_unseen"), selection.get("excluded_failed"))
+    if any(type(value) is not int or value < 0 for value in excluded):
+        raise ValueError("RFT selection exclusion counts are invalid")
+    episodes = selection.get("episodes")
+    if not isinstance(episodes, list) or not episodes:
+        raise ValueError("RFT selection has no accepted autonomous episodes")
+    lineage: dict[str, tuple[str, int, int, tuple[str, ...]]] = {}
+    hashes: list[str] = []
+    categories: list[str] = []
+    by_index: dict[str, Mapping[str, Any]] = {}
+    for item in episodes:
+        if not isinstance(item, Mapping) or type(item.get("episode_index")) is not int:
+            raise ValueError("RFT selection episode is malformed")
+        episode_id = str(item["episode_index"])
+        if episode_id in by_index:
+            raise ValueError("RFT selection episode is duplicated")
+        raw_id, raw_hash, frame_count, category = (
+            item.get("raw_episode_id"), item.get("raw_manifest_sha256"),
+            item.get("frame_count"), item.get("category", "unknown"),
+        )
+        if not isinstance(raw_id, str) or not raw_id or type(frame_count) is not int or frame_count < ACTION_HORIZON:
+            raise ValueError("RFT selection episode has invalid policy trajectory identity")
+        _sha256(raw_hash, "RFT raw manifest hash")
+        if not isinstance(category, str) or not category:
+            raise ValueError("RFT selection category is invalid")
+        by_index[episode_id] = item
+        hashes.append(raw_hash)
+        categories.append(category)
+    for episode_id in materialized_episode_ids:
+        item = by_index.get(episode_id)
+        if item is None:
+            raise ValueError("RFT selection does not bind every materialized episode")
+        frame_count = item["frame_count"]
+        assert isinstance(frame_count, int)
+        lineage[episode_id] = (
+            str(item["raw_episode_id"]), 0, frame_count,
+            tuple(str(index) for index in range(frame_count)),
+        )
+    # A/B are DAgger-only quality labels. Aggregate RFT remains policy-only;
+    # equal treatment preserves source ratio without inventing grades.
+    counts = {"rft_policy_success": len(materialized_episode_ids)}
+    raw_binding = canonical_json_sha256({"release_id": release_id, "raw_manifest_hashes": sorted(hashes)})
+    return raw_binding, revision, counts, lineage, "A"
+
+
 def _prepared_source(root_value: str | Path, *, kind: str) -> _PreparedSource:
     root = Path(root_value)
     if root.is_symlink() or not root.is_dir():
@@ -292,14 +362,20 @@ def _prepared_source(root_value: str | Path, *, kind: str) -> _PreparedSource:
             raw_lineage_by_episode={},
             rejection_counts={},
         )
-    raw_hash, revision, counts, lineage_by_episode = _materialized_provenance(root, materialized_episode_ids=episode_ids)
+    if manifest.get("source_format") == "verified_flywheel_rft_release":
+        raw_hash, revision, counts, lineage_by_episode, grade = _rft_snapshot_provenance(
+            root, manifest=manifest, materialized_episode_ids=episode_ids
+        )
+    else:
+        raw_hash, revision, counts, lineage_by_episode = _materialized_provenance(root, materialized_episode_ids=episode_ids)
+        grade = str(_read_json(root / "meta" / "materialization-provenance.json")["quality_grade"])
     return _PreparedSource(
         root=root,
         kind=kind,
         manifest=manifest,
         manifest_sha256=manifest_sha,
         source_revision=revision,
-        quality_grade=str(_read_json(root / "meta" / "materialization-provenance.json")["quality_grade"]),
+        quality_grade=grade,
         raw_manifest_sha256=raw_hash,
         raw_lineage_by_episode=lineage_by_episode,
         rejection_counts=counts,
@@ -345,12 +421,17 @@ def _source_chunks(source: _PreparedSource) -> list[_Chunk]:
                 raw_frame_ids = tuple(str(value) for value in frames[start:stop])
             else:
                 try:
-                    raw_episode_id, raw_frame_start, raw_frame_stop, raw_frame_ids = source.raw_lineage_by_episode[episode_id]
+                    raw_episode_id, lineage_start, lineage_stop, lineage_ids = source.raw_lineage_by_episode[episode_id]
                 except KeyError:
                     raise ValueError("flywheel provenance is missing a materialized episode lineage") from None
                 raw_manifest_sha256 = source.raw_manifest_sha256
                 if raw_manifest_sha256 is None:
                     raise ValueError("flywheel source is missing raw manifest lineage")
+                if lineage_stop - lineage_start != len(lineage_ids) or stop > len(lineage_ids):
+                    raise ValueError("flywheel provenance does not cover selected policy frames")
+                raw_frame_start = lineage_start + start
+                raw_frame_stop = lineage_start + stop
+                raw_frame_ids = lineage_ids[start:stop]
             chunks.append(
                 _Chunk(
                     source_kind=source.kind,
