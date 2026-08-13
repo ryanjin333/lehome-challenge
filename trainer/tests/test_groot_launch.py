@@ -11,6 +11,7 @@ import pytest
 from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.groot.launch import (
     build_launch,
+    launch_continuous_finetune,
     launch_finetune,
     launch_finetune_to_step,
 )
@@ -83,6 +84,30 @@ def test_build_launch_uses_only_pinned_official_entrypoint_and_redacts_token(
     assert launch.environment["CUDA_VISIBLE_DEVICES"] == "1"
     assert "HF_TOKEN" not in launch.environment
     assert "hf_" not in " ".join(launch.command)
+
+
+def test_continuous_launch_runs_one_process_to_2000_with_save_1000(
+    tmp_path: Path, official_checkout: Path
+) -> None:
+    calls: list[tuple[object, object]] = []
+
+    launch_continuous_finetune(
+        config(
+            output_dir=str(tmp_path / "output"),
+            max_steps=2_000,
+            save_steps=1_000,
+            physical_batch_size=64,
+        ),
+        visible_devices="0",
+        environment={},
+        official_checkout=official_checkout,
+        runner=lambda *args, **kwargs: calls.append((args, kwargs)) or subprocess.CompletedProcess([], 0),
+    )
+
+    assert len(calls) == 1
+    command = calls[0][0][0]
+    assert command[command.index("--max-steps") + 1] == "2000"
+    assert command[command.index("--save-steps") + 1] == "1000"
 
 
 def test_build_launch_verifies_step_12000_parent_weights(

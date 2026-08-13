@@ -249,6 +249,31 @@ def launch_finetune(
     )
 
 
+def launch_continuous_finetune(
+    config: FineTuneLaunchConfig,
+    *,
+    visible_devices: str | None,
+    environment: Mapping[str, str] | None,
+    official_checkout: str | os.PathLike[str],
+    runner: Runner = subprocess.run,
+) -> subprocess.CompletedProcess[object]:
+    """Run the one official corrective process which owns both saves."""
+
+    if config.num_gpus != 1:
+        raise ValueError("continuous corrective training requires one GPU")
+    if config.global_batch_size != 64 or config.physical_batch_size != 64:
+        raise ValueError("first continuous corrective run requires global batch 64")
+    if config.max_steps != 2_000 or config.save_steps != 1_000:
+        raise ValueError("continuous corrective training requires 1000/2000 checkpoints")
+    return launch_finetune(
+        config,
+        visible_devices=visible_devices,
+        environment=environment,
+        official_checkout=official_checkout,
+        runner=runner,
+    )
+
+
 def _distributed_chunk_command(
     config: FineTuneLaunchConfig,
     *,
