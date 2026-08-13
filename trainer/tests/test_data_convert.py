@@ -268,6 +268,96 @@ def test_unbound_orphan_adoption_claims_only_exact_parquets_and_regenerates_vide
     assert len(generated) == 3 * len(CAMERA_KEYS)
 
 
+@pytest.mark.parametrize(
+    "case",
+    ["adoption_is_source", "adoption_contains_source", "adoption_is_destination", "quarantine_is_source"],
+)
+def test_persistent_adoption_rejects_all_overlap_before_mutating_paths(
+    tmp_path: Path, case: str,
+) -> None:
+    source = make_source_dataset(tmp_path / "source")
+    destination = tmp_path / "output"
+    staging = tmp_path / "staging"
+    if case == "adoption_is_source":
+        adoption = source
+    elif case == "adoption_contains_source":
+        adoption = tmp_path
+    elif case == "adoption_is_destination":
+        adoption = destination
+    else:
+        source = make_source_dataset(tmp_path / "orphan.conversion-quarantine")
+        adoption = tmp_path / "orphan"
+    source_before = {
+        path.relative_to(source).as_posix(): path.read_bytes()
+        for path in source.rglob("*") if path.is_file()
+    }
+
+    with pytest.raises(ValueError, match="overlap"):
+        _convert(
+            source, destination, persistent_staging_root=staging,
+            unbound_staging_data_adoption_root=adoption,
+        )
+
+    assert {
+        path.relative_to(source).as_posix(): path.read_bytes()
+        for path in source.rglob("*") if path.is_file()
+    } == source_before
+    assert not staging.exists()
+    assert not (staging.parent / ".staging.conversion.lock").exists()
+    if case == "quarantine_is_source":
+        assert not adoption.exists()
+
+
+def test_orphan_adoption_retries_atomic_copy_without_replacing_receipted_parquets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_source_dataset(tmp_path)
+    orphan = tmp_path / "orphan"
+    staging = tmp_path / "staging"
+    _convert(source, orphan)
+    shutil.rmtree(orphan / "videos")
+    shutil.rmtree(orphan / "meta")
+    (orphan / "manifest.json").unlink()
+    original_record = converter._record_receipt
+    interrupted = False
+
+    def interrupt_after_second_receipt(staging_root, journal, lock, relative):
+        nonlocal interrupted
+        if relative.endswith("episode_000007.parquet") and not interrupted:
+            interrupted = True
+            raise RuntimeError("interrupted after atomic adoption replacement")
+        return original_record(staging_root, journal, lock, relative)
+
+    monkeypatch.setattr(converter, "_record_receipt", interrupt_after_second_receipt)
+    with pytest.raises(RuntimeError, match="interrupted after atomic"):
+        _convert(
+            source, tmp_path / "output", persistent_staging_root=staging,
+            unbound_staging_data_adoption_root=orphan,
+        )
+    first = staging / "data" / "chunk-000" / "episode_000003.parquet"
+    first_bytes = first.read_bytes()
+    first_relative = first.relative_to(staging).as_posix()
+    journal = json.loads((staging / "conversion-journal.json").read_text())
+    assert journal["receipts"][first_relative]["sha256"] == hashlib.sha256(first_bytes).hexdigest()
+
+    monkeypatch.setattr(converter, "_record_receipt", original_record)
+    copied: list[Path] = []
+    original_copy2 = converter.shutil.copy2
+
+    def track_copy2(source_path, destination_path, *args, **kwargs):
+        if Path(destination_path) == first:
+            copied.append(Path(destination_path))
+        return original_copy2(source_path, destination_path, *args, **kwargs)
+
+    monkeypatch.setattr(converter.shutil, "copy2", track_copy2)
+    _convert(
+        source, tmp_path / "output", persistent_staging_root=staging,
+        unbound_staging_data_adoption_root=orphan,
+    )
+    assert copied == []
+    assert (tmp_path / "output" / first_relative).read_bytes() == first_bytes
+
+
 def test_persistent_mode_recognizes_exact_promoted_conversion_for_stats_resume(
     tmp_path: Path,
 ) -> None:

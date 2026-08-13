@@ -63,6 +63,23 @@ def _same_or_nested(left: Path, right: Path) -> bool:
     return left_resolved == right_resolved or left_resolved in right_resolved.parents or right_resolved in left_resolved.parents
 
 
+def _validate_persistent_path_roles(
+    *, source: Path, destination: Path, staging: Path, adoption: Path | None,
+) -> None:
+    """Reject aliases before persistent recovery can claim or create anything."""
+    roles = {"source": source, "destination": destination, "staging": staging}
+    if adoption is not None:
+        roles["adoption"] = adoption
+        roles["quarantine"] = adoption.with_name(adoption.name + ".conversion-quarantine")
+    items = list(roles.items())
+    if any(
+        _same_or_nested(left, right)
+        for index, (_left_name, left) in enumerate(items)
+        for _right_name, right in items[index + 1:]
+    ):
+        raise ValueError("persistent conversion paths must not overlap")
+
+
 def _exclusive_sibling_lock(
     root: Path, *, suffix: str, ownership: str,
 ) -> tuple[Path, tuple[int, int, bytes]]:
@@ -286,11 +303,21 @@ def _claim_and_adopt_orphan_data(
         if not _parquet_matches_expected(source, table):
             raise ValueError("unbound staging episode Parquet is not source-semantically exact")
         destination = staging / relative
+        receipt = journal["receipts"].get(relative)
+        if _matches_receipt(destination, receipt) and _parquet_matches_expected(destination, table):
+            continue
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-        if not _parquet_matches_expected(destination, table):
-            raise ValueError("adopted episode Parquet failed destination semantic verification")
-        _record_receipt(staging, journal, lock, relative)
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            shutil.copy2(source, temporary)
+            if not _parquet_matches_expected(temporary, table):
+                raise ValueError("adopted episode Parquet failed temporary semantic verification")
+            os.replace(temporary, destination)
+            if not _parquet_matches_expected(destination, table):
+                raise ValueError("adopted episode Parquet failed destination semantic verification")
+            _record_receipt(staging, journal, lock, relative)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _persistent_destination_manifest(
@@ -820,6 +847,18 @@ def convert_dataset(
     destination = Path(destination_path)
     if destination.resolve().is_relative_to(source.resolve()):
         raise ValueError("conversion destination must not be inside the source dataset")
+    persistent = persistent_staging_root is not None
+    if persistent:
+        _validate_persistent_path_roles(
+            source=source,
+            destination=destination,
+            staging=Path(persistent_staging_root),  # type: ignore[arg-type]
+            adoption=(
+                None
+                if unbound_staging_data_adoption_root is None
+                else Path(unbound_staging_data_adoption_root)
+            ),
+        )
     inspection = inspect_dataset(source)
     if not inspection["valid"]:
         errors = inspection["validation_errors"]
@@ -848,17 +887,14 @@ def convert_dataset(
     records = load_v3_episode_records(source)
     camera_keys = [camera["source_key"] for camera in mapping["cameras"]]
     episode_tables = _load_episode_tables(source, info, records)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    persistent = persistent_staging_root is not None
     lock_path: Path | None = None
     lock_identity: tuple[int, int, bytes] | None = None
     if persistent:
         temporary = Path(persistent_staging_root)  # type: ignore[arg-type]
         adoption = None if unbound_staging_data_adoption_root is None else Path(unbound_staging_data_adoption_root)
-        quarantine = None if adoption is None else adoption.with_name(adoption.name + ".conversion-quarantine")
-        if _same_or_nested(temporary, source) or _same_or_nested(temporary, destination) or (adoption is not None and _same_or_nested(temporary, adoption)) or (quarantine is not None and _same_or_nested(temporary, quarantine)):
-            raise ValueError("persistent staging root must not overlap source, destination, or adoption roots")
-        if destination.parent.exists() and temporary.parent.exists() and destination.parent.stat().st_dev != temporary.parent.stat().st_dev:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        if destination.parent.stat().st_dev != temporary.parent.stat().st_dev:
             raise ValueError("persistent staging and destination must share a filesystem for atomic promotion")
         if temporary.is_symlink():
             raise ValueError("persistent staging root must not be a symlink")
@@ -867,6 +903,7 @@ def convert_dataset(
         temporary.mkdir(parents=True, exist_ok=True)
         lock_path, lock_identity = _persistent_lock(temporary)
     else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = Path(
             tempfile.mkdtemp(
                 prefix=f".{destination.name}.",
