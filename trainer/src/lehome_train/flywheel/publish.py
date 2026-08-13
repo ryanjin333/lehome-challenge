@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 from typing import Iterable, Mapping
@@ -909,6 +910,62 @@ def publish_verified_corrective_rft(
     return result
 
 
+def verify_uploaded_corrective_rft(
+    bundle: CorrectiveReleasePublicationBundle,
+    materialized_snapshot: str | Path,
+    *,
+    immutable_revision: str,
+    transport: HubTransport,
+    disposal_receipt: str | Path,
+    staging_root: str | Path | None = None,
+) -> CorrectivePublicationResult:
+    """Resume tree and byte readback for an upload whose response path failed."""
+    if not re.fullmatch(r"[0-9a-f]{40}", immutable_revision):
+        raise ValueError("corrective readback revision must be immutable")
+    receipt = Path(disposal_receipt)
+    if receipt.exists() or receipt.is_symlink():
+        raise FileExistsError("corrective disposal receipt must not already exist")
+    verified = verify_corrective_release_publication_bundle(bundle)
+    snapshot = Path(materialized_snapshot)
+    stage_parent = Path(staging_root) if staging_root is not None else snapshot.parent
+    require_access(transport=transport, repository=DEFAULT_DATA_REPO, read=True, write=True)
+    staging, release_id, entries = _stage_release(verified, snapshot, stage_parent)
+    prefix = f"{_REMOTE_ROOT}/{release_id}"
+    try:
+        tree = list_repository_tree(
+            transport=transport, repository=DEFAULT_DATA_REPO,
+            revision=immutable_revision, max_attempts=1,
+        )
+        if not _tree_matches(tree, prefix, entries):
+            raise ValueError("corrective immutable remote tree does not match the release")
+        readback = Path(tempfile.mkdtemp(prefix="lehome-corrective-readback-", dir=stage_parent))
+        try:
+            download_files(
+                transport=transport, repository=DEFAULT_DATA_REPO,
+                revision=immutable_revision, destination=readback,
+                relative_paths=tuple(item.relative_path for item in entries),
+                remote_prefix=prefix, max_attempts=1,
+            )
+            _verify_readback(readback, entries)
+        finally:
+            shutil.rmtree(readback, ignore_errors=True)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    result = CorrectivePublicationResult(
+        DEFAULT_DATA_REPO, immutable_revision, prefix, release_id, entries, True,
+    )
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(receipt, {
+        "schema_version": 1, "repository": result.repository,
+        "immutable_revision": result.immutable_revision, "remote_prefix": result.remote_prefix,
+        "release_id": result.release_id, "entry_count": len(result.entries),
+        "instance_ids": {str(wave): verified.instance_ids[wave] for wave in sorted(verified.instance_ids)},
+        "release_provenance_sha256": verified.release_provenance_sha256,
+        "tree_listing_verified": True, "fresh_readback_verified": True, "disposable": True,
+    })
+    return result
+
+
 __all__ = (
     "CorrectiveCanaryAbortPublicationBundle",
     "CorrectiveCanaryPublicationBundle",
@@ -918,6 +975,7 @@ __all__ = (
     "publish_private_corrective_canary",
     "publish_private_corrective_canary_abort",
     "publish_verified_corrective_rft",
+    "verify_uploaded_corrective_rft",
     "verify_corrective_canary_publication_bundle",
     "verify_corrective_canary_abort_publication_bundle",
 )

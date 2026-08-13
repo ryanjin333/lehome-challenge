@@ -26,6 +26,7 @@ from lehome_train.flywheel.publish import (
     publish_private_corrective_canary,
     publish_private_corrective_canary_abort,
     publish_verified_corrective_rft,
+    verify_uploaded_corrective_rft,
 )
 from lehome_train.hub import HubAccess, HubTreeEntry
 from lehome_train.io import canonical_json_bytes, canonical_json_sha256, sha256_file
@@ -485,6 +486,28 @@ def test_corrective_publisher_failure_never_writes_disposal_receipt(tmp_path: Pa
         )
 
     assert not receipt.exists()
+
+
+def test_corrective_publisher_resumes_immutable_readback_without_reupload(tmp_path: Path, monkeypatch) -> None:
+    publication, snapshot = _release_with_instances(tmp_path)
+    receipt = tmp_path / "disposal.json"
+    monkeypatch.setenv("HF_TOKEN", TOKEN)
+    transport = FakeTransport(fail_at="download")
+    with pytest.raises(RuntimeError):
+        publish_verified_corrective_rft(
+            publication, snapshot, revision="main", transport=transport, disposal_receipt=receipt,
+        )
+    uploaded = transport.uploaded_paths
+    transport.fail_at = None
+
+    result = verify_uploaded_corrective_rft(
+        publication, snapshot, immutable_revision="a" * 40,
+        transport=transport, disposal_receipt=receipt,
+    )
+
+    assert result.disposable is True
+    assert transport.uploaded_paths == uploaded
+    assert json.loads(receipt.read_text())["fresh_readback_verified"] is True
 
 
 def test_publication_bundle_rejects_missing_or_unbound_attempt_artifacts(tmp_path: Path) -> None:
