@@ -16,6 +16,8 @@ import subprocess
 import time
 from typing import Callable, Mapping
 
+from lehome_train.hub import HubTransport
+
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
 CORRECTIVE_SOURCE = {"revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c", "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35"}
 PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3", "subpath": "policies/step-12000", "artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"}
@@ -191,19 +193,35 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
     return {"paid_action": True, "action": action, "instance_id": instance_id}
 
 
-def destroy(*, instance_id: int, training_receipt: Mapping[str, object], runner: Runner | None = None) -> dict[str, object]:
+def _verify_publication_tree(*, publication: Mapping[str, object], transport: HubTransport, token: str) -> None:
+    """Perform the real authenticated immutable Hub readback, never a shell shim."""
+    repository, revision, prefix = publication.get("repository"), publication.get("immutable_revision"), publication.get("remote_prefix")
+    artifact, size = publication.get("artifact_sha256"), publication.get("artifact_byte_size")
+    if not all(isinstance(value, str) and value for value in (repository, revision, prefix, artifact)) or type(size) is not int or size <= 0:
+        raise ValueError("immutable publication binding is invalid")
+    tree = transport.list_tree(repository=repository, revision=revision, token=token)
+    target = str(prefix).rstrip("/") + "/" + str(publication.get("relative_path", ""))
+    if not any(entry.relative_path == target and entry.entry_type == "file" for entry in tree):
+        raise ValueError("immutable Hub tree lacks checkpoint artifact")
+    from tempfile import TemporaryDirectory
+    with TemporaryDirectory(prefix="persistent-hub-readback-") as temporary:
+        destination = Path(temporary)
+        transport.download_files(repository=repository, revision=revision, destination=destination, relative_paths=(str(publication.get("relative_path")),), token=token, remote_prefix=prefix)
+        observed = destination / str(publication.get("relative_path"))
+        if not observed.is_file() or observed.stat().st_size != size or hashlib.sha256(observed.read_bytes()).hexdigest() != artifact:
+            raise ValueError("immutable Hub artifact readback mismatch")
+
+
+def destroy(*, instance_id: int, training_receipt: Mapping[str, object], runner: Runner | None = None, transport: HubTransport | None = None, token: str | None = None) -> dict[str, object]:
     publications = training_receipt.get("immutable_checkpoint_publications")
     if training_receipt.get("kind") != "continuous_corrective_training_terminal" or training_receipt.get("instance_id") != instance_id or training_receipt.get("immutable_checkpoint_steps") != [1000, 2000] or not isinstance(publications, list) or {item.get("optimizer_step") for item in publications if isinstance(item, Mapping)} != {1000, 2000} or not all(isinstance(item, Mapping) and item.get("readback_verified") is True and isinstance(item.get("immutable_revision"), str) for item in publications):
         raise ValueError("instance-bound disposal requires two immutable checkpoints")
     if runner is not None:
+        if transport is None or not isinstance(token, str) or not token:
+            raise ValueError("destroy requires an authenticated Hub transport and token")
         for item in publications:
             assert isinstance(item, Mapping)
-            revision, artifact = item.get("immutable_revision"), item.get("artifact_sha256")
-            if not isinstance(revision, str) or len(revision) != 40 or not isinstance(artifact, str) or len(artifact) != 64:
-                raise ValueError("immutable publication identity is invalid")
-            tree = _json(runner, ("lehome-hub-readback", revision, artifact))
-            if not isinstance(tree, Mapping) or tree.get("tree_verified") is not True:
-                raise ValueError("immutable HF tree readback failed")
+            _verify_publication_tree(publication=item, transport=transport, token=token)
         runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
         observed = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
         if observed not in ({}, None): raise ValueError("destroy absence readback failed")

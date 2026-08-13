@@ -1060,8 +1060,12 @@ class HubCheckpointUploader:
             )
             return {
                 "optimizer_step": checkpoint.record.optimizer_step,
+                "repository": self.repository,
                 "immutable_revision": immutable_revision,
+                "remote_prefix": remote_prefix,
+                "relative_path": entry.relative_path,
                 "artifact_sha256": entry.sha256,
+                "artifact_byte_size": entry.byte_size,
                 "readback_verified": verified,
             }
         finally:
