@@ -1,5 +1,6 @@
 from pathlib import Path
 import hashlib
+import json
 
 import pytest
 
@@ -56,7 +57,7 @@ def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: 
         raise AssertionError(command)
     monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
     image = "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:" + "a" * 64
-    evidence = LIFECYCLE.capture_offers(runner=runner, now_unix=100) | {"trainer_image": image, "training_capability": {"image_digest": image.rpartition("@")[2], "optimizer_step": {"passed": True}, "nvml": {"utilization_percent": 80}}}
+    evidence = LIFECYCLE.capture_offers(runner=runner, now_unix=100) | {"trainer_image": image, "training_capability": {"hardware": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "driver_version": "595.71.05", "image_digest": image.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .2}, "nvml": {"utilization_percent": 80}}}
     assert evidence["offer"]["gpu_name"] == "RTX PRO 6000 WS"
     assert "untrusted_token" not in evidence["offer"]
     instance = LIFECYCLE.rent(evidence=evidence, runner=runner)
@@ -70,3 +71,10 @@ def test_rent_requires_capability_receipt_for_exact_image(monkeypatch: pytest.Mo
     evidence = {"offer": {"id": 7, "min_bid": .5}, "search_mode": "interruptible", "expires_at_unix": 101, "trainer_image": "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:" + "a" * 64}
     with pytest.raises(ValueError, match="capability"):
         LIFECYCLE.rent(evidence=evidence, runner=lambda _: "{}")
+
+
+def test_status_parses_authenticated_terminal() -> None:
+    instance = {"instance_id": 7, "host": "host", "port": 22}
+    terminal = {"kind": "continuous_corrective_training_terminal", "instance_id": 7}
+    result = LIFECYCLE.remote_action(action="status", instance=instance, request={}, runner=lambda _command: json.dumps(terminal))
+    assert result["terminal"] == terminal

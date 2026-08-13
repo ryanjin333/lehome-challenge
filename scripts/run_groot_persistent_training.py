@@ -17,6 +17,7 @@ import time
 from typing import Callable, Mapping
 
 from lehome_train.hub import HubTransport
+from lehome_train.release_manifest import validate_training_capability
 
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
 CORRECTIVE_SOURCE = {"revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c", "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35"}
@@ -102,6 +103,7 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
     image_digest = image.rpartition("@")[2]
     if not isinstance(capability, Mapping) or capability.get("image_digest") != image_digest or not isinstance(capability.get("optimizer_step"), Mapping) or capability["optimizer_step"].get("passed") is not True or not isinstance(capability.get("nvml"), Mapping):
         raise ValueError("rent requires a matching accepted training capability receipt")
+    validate_training_capability(capability)
     bid = offer.get("min_bid", offer.get("dph_total"))
     if type(bid) not in (int, float) or float(bid) >= 1: raise ValueError("offer bid price is invalid")
     created = _json(runner, ("vastai", "--raw", "create", "instance", str(offer["id"]), "--image", image, "--disk", "300", "--bid_price", str(bid), "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + image))
@@ -139,7 +141,13 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
     generation_tree = _tree_readback_sha256(generation_root)
     observed_tree = runner((*_ssh_prefix(instance), "cd " + remote_dir + "/generation && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum")).strip().split()
     if not observed_tree or observed_tree[0] != generation_tree: raise ValueError("remote sealed generation tree readback failed")
-    pairs = (("code_bundle", "code.bundle"), ("generation_receipt", "generation.generation.json"), ("parent_checkpoint", "parent.tar"), ("launch_config", "launch.json"), ("modality_config", "modality.py"), ("token_file", "token"))
+    pairs = (
+        ("code_bundle", "code.bundle"), ("code_bundle_sha256_file", "code.bundle.sha256"),
+        ("generation_receipt", "generation.generation.json"), ("parent_checkpoint", "parent.tar"),
+        ("launch_config", "launch.json"), ("experiment_config", "experiment.json"),
+        ("continuous_request", "continuous.json"), ("resume_request", "resume.json"),
+        ("tune_request", "tune.json"), ("modality_config", "modality.py"), ("token_file", "token"),
+    )
     receipts = []
     for field, remote_name in pairs:
         source = Path(str(request[field]))
@@ -153,11 +161,13 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
     if receipt_payload.get("sealed") is not True: raise ValueError("staged generation receipt is not sealed")
     code_digest = next(item["sha256"] for item in receipts if item["name"] == "code.bundle")
     if request.get("code_bundle_sha256") != code_digest: raise ValueError("staged code bundle hash differs from request")
+    setup = "set -eu; mkdir -p /prepared /cache /output /tmp/lehome-stage/code; tar -xf /tmp/lehome-stage/code.bundle -C /tmp/lehome-stage/code; tar -tf /tmp/lehome-stage/parent.tar >/dev/null; test \"$(sha256sum /tmp/lehome-stage/parent.tar | cut -d' ' -f1)\" = " + PARENT_CHECKPOINT["artifact_sha256"] + "; chmod 600 /tmp/lehome-stage/token"
+    runner((*_ssh_prefix(instance), setup))
     return {"paid_action": True, "action": "stage", "instance_id": instance["instance_id"], "generation_tree_sha256": generation_tree, "code_bundle_sha256": code_digest, "transfers": receipts}
 
 
 def _stage_command(request: Mapping[str, object]) -> str:
-    required = ("code_bundle", "code_bundle_sha256", "generation_root", "generation_receipt", "parent_checkpoint", "parent_checkpoint_sha256", "launch_config", "modality_config", "token_file")
+    required = ("code_bundle", "code_bundle_sha256", "code_bundle_sha256_file", "generation_root", "generation_receipt", "parent_checkpoint", "parent_checkpoint_sha256", "launch_config", "experiment_config", "continuous_request", "resume_request", "tune_request", "modality_config", "token_file")
     if any(not isinstance(request.get(key), str) or not request[key] for key in required):
         raise ValueError("stage requires exact code, generation, parent, config, modality, and token paths")
     if request.get("generation_sha256") != request.get("sealed_generation_sha256"):
@@ -165,9 +175,7 @@ def _stage_command(request: Mapping[str, object]) -> str:
     parent_sha = request.get("parent_checkpoint_sha256")
     if request.get("parent_checkpoint_repository") != PARENT_CHECKPOINT["repository"] or request.get("parent_checkpoint_revision") != PARENT_CHECKPOINT["revision"] or request.get("parent_checkpoint_subpath") != PARENT_CHECKPOINT["subpath"] or parent_sha != PARENT_CHECKPOINT["artifact_sha256"]:
         raise ValueError("stage parent checkpoint identity is not approved")
-    # The token is a file transport only; no value is embedded in local JSON or
-    # a command string.  Remote validation is hashes/path identity, never logs.
-    return "set -eu; test -f /tmp/lehome-stage/code.bundle; sha256sum -c /tmp/lehome-stage/code.bundle.sha256; test -f /tmp/lehome-stage/generation.generation.json; lehome-train continuous-train --request /tmp/lehome-stage/continuous.json"
+    return "stage-validated"
 
 
 def remote_action(*, action: str, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
@@ -182,14 +190,19 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
             raise ValueError("resume requires exact generation/config identity")
         commands = {
             "tune": "lehome-train smoke --request /tmp/lehome-stage/tune.json",
-            "train": "lehome-train continuous-train --request /tmp/lehome-stage/continuous.json",
-            "resume": "lehome-train continuous-train --request /tmp/lehome-stage/resume.json",
+            "train": "env -u HF_TOKEN lehome-train continuous-train --request /tmp/lehome-stage/continuous.json",
+            "resume": "env -u HF_TOKEN lehome-train continuous-train --request /tmp/lehome-stage/resume.json",
             "status": "test -f /tmp/lehome-stage/terminal.json && cat /tmp/lehome-stage/terminal.json",
         }
         command = "set -eu; " + commands[action]
     else:
         raise ValueError("unsupported remote lifecycle action")
-    runner((*_ssh_prefix(instance), command))
+    output = runner((*_ssh_prefix(instance), command))
+    if action == "status":
+        try: terminal = json.loads(output)
+        except json.JSONDecodeError as error: raise ValueError("remote status terminal is invalid JSON") from error
+        if not isinstance(terminal, Mapping) or terminal.get("kind") != "continuous_corrective_training_terminal": raise ValueError("remote status terminal is invalid")
+        return {"paid_action": True, "action": action, "instance_id": instance_id, "terminal": dict(terminal)}
     return {"paid_action": True, "action": action, "instance_id": instance_id}
 
 
