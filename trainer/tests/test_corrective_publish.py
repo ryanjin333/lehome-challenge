@@ -500,14 +500,43 @@ def test_corrective_publisher_resumes_immutable_readback_without_reupload(tmp_pa
     uploaded = transport.uploaded_paths
     transport.fail_at = None
 
+    readback = tmp_path / "persistent-readback"
     result = verify_uploaded_corrective_rft(
         publication, snapshot, immutable_revision="a" * 40,
-        transport=transport, disposal_receipt=receipt,
+        transport=transport, disposal_receipt=receipt, readback_root=readback,
     )
 
     assert result.disposable is True
     assert transport.uploaded_paths == uploaded
     assert json.loads(receipt.read_text())["fresh_readback_verified"] is True
+    assert not readback.exists()
+
+
+def test_corrective_resume_retains_partial_readback_after_failure(tmp_path: Path, monkeypatch) -> None:
+    publication, snapshot = _release_with_instances(tmp_path)
+    monkeypatch.setenv("HF_TOKEN", TOKEN)
+    transport = FakeTransport()
+    publish_receipt = tmp_path / "initial.json"
+    publish_verified_corrective_rft(
+        publication, snapshot, revision="main", transport=transport, disposal_receipt=publish_receipt,
+    )
+    publish_receipt.unlink()
+    original_download = transport.download_files
+    readback = tmp_path / "persistent-readback"
+
+    def partial_failure(**kwargs):
+        destination = kwargs["destination"]
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "partial.marker").write_text("retained")
+        raise OSError("interrupted")
+
+    transport.download_files = partial_failure
+    with pytest.raises(RuntimeError):
+        verify_uploaded_corrective_rft(
+            publication, snapshot, immutable_revision="a" * 40, transport=transport,
+            disposal_receipt=tmp_path / "resume.json", readback_root=readback,
+        )
+    assert (readback / "partial.marker").read_text() == "retained"
 
 
 def test_publication_bundle_rejects_missing_or_unbound_attempt_artifacts(tmp_path: Path) -> None:

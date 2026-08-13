@@ -376,6 +376,7 @@ class HuggingFaceHubTransport:
                 if downloaded != target:
                     shutil.copyfile(downloaded, target)
             shutil.rmtree(destination / remote_prefix.split("/", 1)[0])
+        shutil.rmtree(destination / ".cache", ignore_errors=True)
         final = self._repo_info(repository=repository, revision=revision, token=token)
         if self._revision(final) != revision:
             raise ValueError("Hub readback revision changed during download")

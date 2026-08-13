@@ -537,6 +537,7 @@ def test_real_transport_reuses_destination_for_snapshot_resume(
         def snapshot_download(**kwargs: object) -> str:
             local = Path(str(kwargs["local_dir"]))
             calls.append(local)
+            (local / ".cache" / "huggingface").mkdir(parents=True, exist_ok=True)
             target = local / str(kwargs["allow_patterns"][0])
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(b"payload")
@@ -550,6 +551,7 @@ def test_real_transport_reuses_destination_for_snapshot_resume(
     )
 
     assert calls == [destination]
+    assert not (destination / ".cache").exists()
 
 
 def test_tree_listing_requires_and_preserves_an_explicit_immutable_revision() -> None:

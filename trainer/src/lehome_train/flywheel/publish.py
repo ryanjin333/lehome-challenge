@@ -857,6 +857,7 @@ def publish_verified_corrective_rft(
     transport: HubTransport,
     disposal_receipt: str | Path,
     staging_root: str | Path | None = None,
+    readback_root: str | Path | None = None,
 ) -> CorrectivePublicationResult:
     """Publish all audit evidence and authorize disposal only after full readback."""
 
@@ -885,7 +886,13 @@ def publish_verified_corrective_rft(
         )
         if not _tree_matches(tree, prefix, entries):
             raise ValueError("corrective immutable remote tree does not match the release")
-        readback = Path(tempfile.mkdtemp(prefix="lehome-corrective-readback-", dir=stage_parent))
+        readback = (
+            Path(readback_root) if readback_root is not None
+            else stage_parent / f"lehome-corrective-readback-{immutable_revision}"
+        )
+        if readback.is_symlink():
+            raise ValueError("corrective readback root is unsafe")
+        readback.mkdir(parents=True, exist_ok=True)
         try:
             download_files(
                 transport=transport, repository=DEFAULT_DATA_REPO, revision=immutable_revision,
@@ -893,7 +900,9 @@ def publish_verified_corrective_rft(
                 remote_prefix=prefix, max_attempts=1,
             )
             _verify_readback(readback, entries)
-        finally:
+        except BaseException:
+            raise
+        else:
             shutil.rmtree(readback, ignore_errors=True)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -918,6 +927,7 @@ def verify_uploaded_corrective_rft(
     transport: HubTransport,
     disposal_receipt: str | Path,
     staging_root: str | Path | None = None,
+    readback_root: str | Path | None = None,
 ) -> CorrectivePublicationResult:
     """Resume tree and byte readback for an upload whose response path failed."""
     if not re.fullmatch(r"[0-9a-f]{40}", immutable_revision):
@@ -938,7 +948,13 @@ def verify_uploaded_corrective_rft(
         )
         if not _tree_matches(tree, prefix, entries):
             raise ValueError("corrective immutable remote tree does not match the release")
-        readback = Path(tempfile.mkdtemp(prefix="lehome-corrective-readback-", dir=stage_parent))
+        readback = (
+            Path(readback_root) if readback_root is not None
+            else stage_parent / f"lehome-corrective-readback-{immutable_revision}"
+        )
+        if readback.is_symlink():
+            raise ValueError("corrective readback root is unsafe")
+        readback.mkdir(parents=True, exist_ok=True)
         try:
             download_files(
                 transport=transport, repository=DEFAULT_DATA_REPO,
@@ -947,7 +963,9 @@ def verify_uploaded_corrective_rft(
                 remote_prefix=prefix, max_attempts=1,
             )
             _verify_readback(readback, entries)
-        finally:
+        except BaseException:
+            raise
+        else:
             shutil.rmtree(readback, ignore_errors=True)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
