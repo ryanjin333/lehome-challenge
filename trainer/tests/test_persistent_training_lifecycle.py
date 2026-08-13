@@ -1,6 +1,7 @@
 from pathlib import Path
 import hashlib
 import json
+import subprocess
 
 import pytest
 
@@ -98,10 +99,10 @@ def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: 
         LIFECYCLE.destroy(instance_id=9, training_receipt={"kind": "continuous_corrective_training_terminal", "instance_id": 9, "immutable_checkpoint_steps": [1000, 2000], "immutable_checkpoint_publications": [{"optimizer_step": 1000, "repository": "ryanjin333/lehome-groot-n17-models", "immutable_revision": "a" * 40, "remote_prefix": "prefix", "relative_path": "checkpoints/step-1000.tar", "artifact_sha256": hashlib.sha256(b"artifact").hexdigest(), "artifact_byte_size": 8, "readback_verified": True}, {"optimizer_step": 2000, "repository": "ryanjin333/lehome-groot-n17-models", "immutable_revision": "b" * 40, "remote_prefix": "prefix", "relative_path": "checkpoints/step-2000.tar", "artifact_sha256": hashlib.sha256(b"artifact").hexdigest(), "artifact_byte_size": 8, "readback_verified": True}]}, runner=runner, transport=FakeHub(), token="test-token")
 
 
-def test_offer_total_conservatively_counts_requested_300gb_storage() -> None:
+def test_offer_total_uses_the_300gb_vast_quote_once() -> None:
     def runner(command: tuple[str, ...]) -> str:
         if command[:4] == ("vastai", "--raw", "search", "offers"):
-            return '[{"id":7,"gpu_name":"RTX PRO 6000 S","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"min_bid":0.5,"storage_cost":0.001}]'
+            return '[{"id":7,"gpu_name":"RTX PRO 6000 S","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"dph_base":0.4,"min_bid":0.5,"storage_cost":0.001}]'
         if command[:4] == ("vastai", "--raw", "show", "instances"):
             return "[]"
         if command[:4] == ("vastai", "--raw", "show", "volumes"):
@@ -110,10 +111,12 @@ def test_offer_total_conservatively_counts_requested_300gb_storage() -> None:
     evidence = LIFECYCLE.capture_offers(runner=runner, now_unix=1)
     assert evidence["requested_storage_gb"] == 300
     assert evidence["requested_storage_hourly_usd"] == pytest.approx(0.3)
-    assert evidence["account_hourly_total_usd"] == pytest.approx(1.0)
+    # ``dph_total`` comes from the explicit --storage 300 quote: it must not
+    # be added a second time merely because its storage component is exposed.
+    assert evidence["account_hourly_total_usd"] == pytest.approx(0.7)
 
 
-def test_offer_without_storage_quote_uses_nonzero_conservative_storage_bound() -> None:
+def test_offer_without_storage_breakdown_treats_300gb_total_quote_as_conservative() -> None:
     def runner(command: tuple[str, ...]) -> str:
         if command[:4] == ("vastai", "--raw", "search", "offers"):
             return '[{"id":7,"gpu_name":"RTX PRO 6000 S","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"min_bid":0.5}]'
@@ -121,7 +124,8 @@ def test_offer_without_storage_quote_uses_nonzero_conservative_storage_bound() -
             return "[]"
         raise AssertionError(command)
     evidence = LIFECYCLE.capture_offers(runner=runner, now_unix=1)
-    assert evidence["requested_storage_hourly_usd"] > 0
+    assert evidence["requested_storage_hourly_usd"] is None
+    assert evidence["account_hourly_total_usd"] == pytest.approx(0.7)
 
 
 def test_rent_requires_capability_receipt_for_exact_image(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -136,6 +140,104 @@ def test_status_parses_authenticated_terminal() -> None:
     terminal = {"kind": "continuous_corrective_training_terminal", "instance_id": 7}
     result = LIFECYCLE.remote_action(action="status", instance=instance, request={}, runner=lambda _command: json.dumps(terminal))
     assert result["terminal"] == terminal
+
+
+def test_provider_interruption_terminal_is_resumable_only_with_last_immutable_checkpoint() -> None:
+    terminal = LIFECYCLE.provider_interruption_terminal(
+        instance_id=9,
+        generation_sha256="a" * 64,
+        config_sha256="b" * 64,
+        experiment_id="persistent-001",
+        publications=[{"optimizer_step": 1000, "readback_verified": True}],
+        provider_reason="instance preempted",
+    )
+    assert terminal["status"] == "provider_interrupted"
+    assert terminal["resumable_checkpoint_step"] == 1000
+    with pytest.raises(ValueError, match="provider interruption"):
+        LIFECYCLE.resume_identity(terminal, generation_sha256="a" * 64, config_sha256="c" * 64)
+
+
+def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_identities() -> None:
+    terminal = LIFECYCLE.provider_interruption_terminal(
+        instance_id=9,
+        generation_sha256="a" * 64,
+        config_sha256="b" * 64,
+        experiment_id="persistent-001",
+        publications=[{
+            "optimizer_step": 1000,
+            "readback_verified": True,
+            "generation_sha256": "a" * 64,
+            "config_sha256": "b" * 64,
+            "experiment_id": "persistent-001",
+            "immutable_revision": "c" * 40,
+        }],
+        provider_reason="instance absent",
+    )
+    def runner(command: tuple[str, ...]) -> str:
+        if command == ("vastai", "--raw", "show", "instance", "9"):
+            return "{}"
+        if command == ("vastai", "--raw", "show", "instance", "10"):
+            return json.dumps({
+                "id": 10, "actual_status": "running", "gpu_name": "RTX PRO 6000 WS",
+                "gpu_ram": 96000, "num_gpus": 1, "dph_total": .7,
+                "ssh_host": "replacement", "ssh_port": 22,
+            })
+        raise AssertionError(command)
+    replacement = {
+        "instance_id": 10, "host": "replacement", "port": 22,
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "provider_response_sha256": LIFECYCLE._hash({
+            "id": 10, "actual_status": "running", "gpu_name": "RTX PRO 6000 WS",
+            "gpu_ram": 96000, "num_gpus": 1, "dph_total": .7,
+            "ssh_host": "replacement", "ssh_port": 22,
+        }),
+    }
+    capability = {
+        "kind": "persistent_training_capability", "instance_id": 10,
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "provider_response_sha256": replacement["provider_response_sha256"],
+        "instance": replacement,
+        "training_capability": {
+            "hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05",
+            "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+            "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0",
+            "optimizer_step": {"passed": True, "loss": .2}, "nvml": {"utilization_percent": 90},
+        },
+    }
+    assert LIFECYCLE.classify_provider_interruption(instance={"instance_id": 9}, runner=runner) == "instance_absent"
+    descriptor = LIFECYCLE.replacement_resume_descriptor(
+        terminal=terminal, capability_receipt=capability, runner=runner,
+    )
+    assert descriptor["instance"]["instance_id"] == 10
+    assert descriptor["resume_checkpoint_publication"]["optimizer_step"] == 1000
+    assert descriptor["generation_sha256"] == "a" * 64
+    assert descriptor["resume_generation_sha256"] == "a" * 64
+
+
+def test_remote_ssh_failure_is_terminalized_only_after_provider_interruption_readback() -> None:
+    instance = {"instance_id": 9, "host": "old", "port": 22, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "provider_response_sha256": "a" * 64}
+    request = {
+        "generation_sha256": "a" * 64, "config_sha256": "b" * 64,
+        "experiment_id": "persistent-001",
+        "immutable_checkpoint_publications": [{
+            "optimizer_step": 1000, "readback_verified": True,
+            "generation_sha256": "a" * 64, "config_sha256": "b" * 64,
+            "experiment_id": "persistent-001", "immutable_revision": "c" * 40,
+        }],
+        "capability_receipt": {"kind": "persistent_training_capability", "instance_id": 9, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "provider_response_sha256": "a" * 64, "training_capability": {"hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .2}, "nvml": {"utilization_percent": 90}}},
+    }
+    calls = 0
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal calls
+        calls += 1
+        if command[:2] == ("ssh", "-o"):
+            raise subprocess.CalledProcessError(255, command)
+        assert command == ("vastai", "--raw", "show", "instance", "9")
+        return '{"id":9,"actual_status":"interrupted"}'
+    result = LIFECYCLE.remote_action(action="train", instance=instance, request=request, runner=runner)
+    assert result["terminal"]["status"] == "provider_interrupted"
+    assert result["terminal"]["resumable_checkpoint_step"] == 1000
+    assert calls == 2
 
 
 def test_train_requires_capability_receipt_bound_to_its_instance() -> None:

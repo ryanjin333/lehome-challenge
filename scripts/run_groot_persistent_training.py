@@ -118,24 +118,37 @@ def _tree_readback_sha256(root: Path) -> str:
 
 
 def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: int = 300) -> dict[str, object]:
-    offers = _json(runner, ("vastai", "--raw", "search", "offers", OFFER_QUERY, "--interruptible"))
+    # Vast produces the total hourly quote only after the requested disk size is
+    # supplied.  ``dph_total`` below is consequently the single all-in 300GB
+    # quote; a separately reported storage component is evidence, not a second
+    # account charge.
+    offers = _json(runner, ("vastai", "--raw", "search", "offers", OFFER_QUERY, "--interruptible", "--storage", "300"))
     instances = _json(runner, ("vastai", "--raw", "show", "instances"))
     volumes = _json(runner, ("vastai", "--raw", "show", "volumes"))
     if not all(isinstance(value, list) for value in (offers, instances, volumes)): raise ValueError("provider listing is invalid")
     eligible = [row for row in offers if isinstance(row, Mapping) and _offer_gpu(row) and row.get("num_gpus") == 1 and float(row.get("dph_total", 99)) < 1]
     if not eligible: raise ValueError("no interruptible RTX PRO 6000 96GB offer under $1/hr")
     offer = min(eligible, key=lambda row: float(row["dph_total"]))
-    # Some raw offer variants omit a disk quote.  Count a deliberately
-    # conservative fallback rather than silently treating 300GB as free.
-    storage_unit_cost = offer.get("storage_cost", offer.get("storage_cost_per_gb", 0.001))
-    if type(storage_unit_cost) not in (int, float) or float(storage_unit_cost) < 0:
+    storage_unit_cost = offer.get("storage_cost", offer.get("storage_cost_per_gb"))
+    if storage_unit_cost is not None and (type(storage_unit_cost) not in (int, float) or float(storage_unit_cost) < 0):
         raise ValueError("offer storage quote is invalid")
-    requested_storage_hourly = float(storage_unit_cost) * 300
-    total = sum(float(row.get("dph_total", 0)) for row in instances if isinstance(row, Mapping)) + sum(float(row.get("storage_total_cost", 0)) for row in volumes if isinstance(row, Mapping)) + float(offer["dph_total"]) + requested_storage_hourly
+    base_hourly = offer.get("dph_base")
+    requested_storage_hourly: float | None
+    if type(base_hourly) in (int, float):
+        requested_storage_hourly = max(0.0, float(offer["dph_total"]) - float(base_hourly))
+    elif type(storage_unit_cost) in (int, float):
+        # Retain an explicit breakdown if Vast supplies it, while accounting
+        # from the all-in --storage quote only once.
+        requested_storage_hourly = float(storage_unit_cost) * 300
+    else:
+        requested_storage_hourly = None
+    existing_instance_total = sum(float(row.get("dph_total", 0)) for row in instances if isinstance(row, Mapping))
+    existing_storage_total = sum(float(row.get("storage_total_cost", 0)) for row in volumes if isinstance(row, Mapping))
+    total = existing_instance_total + existing_storage_total + float(offer["dph_total"])
     if total > 2: raise ValueError("account-wide instance and storage total exceeds $2/hr")
     captured = int(time.time()) if now_unix is None else now_unix
-    safe_offer = _project(offer, ("id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "min_bid", "driver_version", "is_bid", "image"))
-    return {"schema_version": 1, "kind": "persistent_training_offer", "offer": safe_offer, "account_hourly_total_usd": total, "requested_storage_gb": 300, "requested_storage_hourly_usd": requested_storage_hourly, "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds, "search_mode": "interruptible"}
+    safe_offer = _project(offer, ("id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "dph_base", "storage_cost", "storage_cost_per_gb", "min_bid", "driver_version", "is_bid", "image"))
+    return {"schema_version": 1, "kind": "persistent_training_offer", "offer": safe_offer, "account_hourly_total_usd": total, "existing_instance_hourly_total_usd": existing_instance_total, "existing_storage_hourly_total_usd": existing_storage_total, "requested_storage_gb": 300, "requested_storage_hourly_usd": requested_storage_hourly, "storage_quote_included_in_dph_total": True, "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds, "search_mode": "interruptible"}
 
 
 def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep, require_capability: bool = True) -> dict[str, object]:
@@ -452,6 +465,121 @@ def promote_canary(*, capability_receipt: Mapping[str, object], runner: Runner) 
     return dict(instance)
 
 
+def provider_interruption_terminal(
+    *,
+    instance_id: int,
+    generation_sha256: str,
+    config_sha256: str,
+    experiment_id: str,
+    publications: list[Mapping[str, object]],
+    provider_reason: str,
+) -> dict[str, object]:
+    """Record only a provider-side stop as resumable work."""
+    if (
+        type(instance_id) is not int
+        or re.fullmatch(r"[0-9a-f]{64}", generation_sha256) is None
+        or re.fullmatch(r"[0-9a-f]{64}", config_sha256) is None
+        or not isinstance(experiment_id, str)
+        or not experiment_id
+        or not isinstance(provider_reason, str)
+        or not provider_reason
+    ):
+        raise ValueError("provider interruption identity is invalid")
+    verified = [
+        dict(item) for item in publications
+        if item.get("readback_verified") is True and type(item.get("optimizer_step")) is int
+    ]
+    return {
+        "schema_version": 1,
+        "kind": "continuous_corrective_training_terminal",
+        "status": "provider_interrupted",
+        "instance_id": instance_id,
+        "generation_sha256": generation_sha256,
+        "config_sha256": config_sha256,
+        "experiment_id": experiment_id,
+        "provider_reason": provider_reason,
+        "immutable_checkpoint_publications": verified,
+        "resumable_checkpoint_step": max((int(item["optimizer_step"]) for item in verified), default=None),
+        "disposable": False,
+    }
+
+
+def classify_provider_interruption(
+    *, instance: Mapping[str, object], runner: Runner
+) -> str | None:
+    """Read provider state; SSH loss alone is never enough to call resume safe."""
+    instance_id = instance.get("instance_id")
+    if type(instance_id) is not int:
+        raise ValueError("instance receipt is invalid")
+    live = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+    if live in ({}, None):
+        return "instance_absent"
+    if not isinstance(live, Mapping) or live.get("id") != instance_id:
+        raise ValueError("provider interruption readback is invalid")
+    status = live.get("actual_status")
+    if status in {"interrupted", "terminated", "stopped", "offline"}:
+        return "provider_" + str(status)
+    return None
+
+
+def resume_identity(
+    terminal: Mapping[str, object], *, generation_sha256: str, config_sha256: str
+) -> Mapping[str, object]:
+    if terminal.get("status") != "provider_interrupted":
+        raise ValueError("resume requires a provider interruption terminal")
+    if terminal.get("generation_sha256") != generation_sha256 or terminal.get("config_sha256") != config_sha256:
+        raise ValueError("provider interruption resume identity is incompatible")
+    step = terminal.get("resumable_checkpoint_step")
+    publications = terminal.get("immutable_checkpoint_publications")
+    if type(step) is not int or step <= 0 or not isinstance(publications, list):
+        raise ValueError("provider interruption has no immutable resumable checkpoint")
+    candidates = [item for item in publications if isinstance(item, Mapping) and item.get("optimizer_step") == step]
+    if len(candidates) != 1:
+        raise ValueError("provider interruption checkpoint discovery is ambiguous")
+    candidate = candidates[0]
+    if (
+        candidate.get("generation_sha256") != generation_sha256
+        or candidate.get("config_sha256") != config_sha256
+        or candidate.get("experiment_id") != terminal.get("experiment_id")
+        or not isinstance(candidate.get("immutable_revision"), str)
+    ):
+        raise ValueError("provider interruption checkpoint is not bound to the terminal identity")
+    return candidate
+
+
+def replacement_resume_descriptor(
+    *, terminal: Mapping[str, object], capability_receipt: Mapping[str, object], runner: Runner
+) -> dict[str, object]:
+    """Promote a replacement canary and bind it to the last immutable resume.
+
+    The caller performs the explicit bootstrap/rent first.  This refuses to
+    reuse the interrupted instance, so a resume cannot accidentally target an
+    old SSH endpoint or change the sealed generation/config identity.
+    """
+    generation = terminal.get("generation_sha256")
+    config = terminal.get("config_sha256")
+    old_instance_id = terminal.get("instance_id")
+    if not isinstance(generation, str) or not isinstance(config, str) or type(old_instance_id) is not int:
+        raise ValueError("provider interruption terminal is malformed")
+    checkpoint = dict(resume_identity(terminal, generation_sha256=generation, config_sha256=config))
+    replacement = promote_canary(capability_receipt=capability_receipt, runner=runner)
+    if replacement.get("instance_id") == old_instance_id:
+        raise ValueError("replacement resume must use a newly bound instance")
+    return {
+        "schema_version": 1,
+        "kind": "persistent_training_replacement_resume",
+        "instance": replacement,
+        "capability_receipt": dict(capability_receipt),
+        "resume_checkpoint_publication": checkpoint,
+        "generation_sha256": generation,
+        "config_sha256": config,
+        "resume_generation_sha256": generation,
+        "resume_config_sha256": config,
+        "experiment_id": terminal.get("experiment_id"),
+        "replaced_instance_id": old_instance_id,
+    }
+
+
 def remote_action(*, action: str, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     instance_id = instance.get("instance_id")
     if type(instance_id) is not int: raise ValueError("instance receipt is invalid")
@@ -462,6 +590,14 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
     elif action in {"tune", "train", "status", "resume"}:
         if action in {"tune", "train", "resume"}:
             _require_instance_capability(instance, request)
+        if action == "resume" and isinstance(request.get("provider_interruption_terminal"), Mapping):
+            expected = resume_identity(
+                request["provider_interruption_terminal"],
+                generation_sha256=str(request.get("generation_sha256")),
+                config_sha256=str(request.get("config_sha256")),
+            )
+            if request.get("resume_checkpoint_publication") != expected:
+                raise ValueError("resume checkpoint descriptor is not the authenticated interruption publication")
         if action == "resume" and request.get("generation_sha256") != request.get("resume_generation_sha256") or action == "resume" and request.get("config_sha256") != request.get("resume_config_sha256"):
             raise ValueError("resume requires exact generation/config identity")
         terminal_path = request.get("terminal_path", "/output/persistent-training/terminal.json")
@@ -481,7 +617,30 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
         command = "set -eu; " + commands[action]
     else:
         raise ValueError("unsupported remote lifecycle action")
-    output = runner((*_ssh_prefix(instance), command))
+    try:
+        output = runner((*_ssh_prefix(instance), command))
+    except (subprocess.CalledProcessError, OSError, TimeoutError):
+        # A dead SSH connection is ambiguous.  It becomes resumable only after
+        # the provider itself reports an interruption/absence; ordinary code,
+        # data, or trainer failures are deliberately propagated unchanged.
+        reason = classify_provider_interruption(instance=instance, runner=runner)
+        if reason is None or action not in {"train", "resume"}:
+            raise
+        generation = request.get("generation_sha256")
+        config = request.get("config_sha256")
+        experiment = request.get("experiment_id")
+        publications = request.get("immutable_checkpoint_publications", [])
+        if not isinstance(generation, str) or not isinstance(config, str) or not isinstance(experiment, str) or not isinstance(publications, list):
+            raise ValueError("provider interruption request lacks immutable training identity") from None
+        terminal = provider_interruption_terminal(
+            instance_id=instance_id,
+            generation_sha256=generation,
+            config_sha256=config,
+            experiment_id=experiment,
+            publications=[item for item in publications if isinstance(item, Mapping)],
+            provider_reason=reason,
+        )
+        return {"paid_action": True, "action": action, "instance_id": instance_id, "terminal": terminal}
     if action == "status":
         try: terminal = json.loads(output)
         except json.JSONDecodeError as error: raise ValueError("remote status terminal is invalid JSON") from error
@@ -593,7 +752,7 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
 
 
 def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object]:
-    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("materialize", "prepare", "capture-offers", "bootstrap-canary", "promote", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("materialize", "prepare", "capture-offers", "bootstrap-canary", "promote", "replacement-resume", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "materialize":
         return _materialize(request)
@@ -615,6 +774,12 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
     if args.action == "capture-offers": return capture_offers(runner=runner)
     if args.action == "bootstrap-canary": return bootstrap_canary(evidence=request, runner=runner)
     if args.action == "promote": return {"paid_action": True, "action": "promote", "instance": promote_canary(capability_receipt=request, runner=runner)}
+    if args.action == "replacement-resume":
+        terminal = request.get("provider_interruption_terminal")
+        capability = request.get("capability_receipt")
+        if not isinstance(terminal, Mapping) or not isinstance(capability, Mapping):
+            raise ValueError("replacement-resume requires interruption terminal and replacement capability receipt")
+        return {"paid_action": True, "action": "replacement-resume", **replacement_resume_descriptor(terminal=terminal, capability_receipt=capability, runner=runner)}
     if args.action == "rent": return rent(evidence=request, runner=runner)
     if args.action == "destroy":
         return destroy(

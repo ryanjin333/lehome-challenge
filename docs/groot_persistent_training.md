@@ -55,8 +55,21 @@ for one bounded optimizer-step capability command. Its receipt binds the
 capability result to the instance, image, and provider readback. Full
 `tune`/`train`/`resume` actions require that exact instance-bound receipt;
 they cannot promote an arbitrary digest or a receipt from another rental.
-Use the free `promote` action to recover and validate the receipt's bound SSH
+Use the explicit `promote --execute` action to recover and validate the receipt's bound SSH
 instance before staging; it never rents a replacement instance.
+
+If a staged train/resume SSH connection fails, the lifecycle performs a fresh
+Vast instance readback.  Only `interrupted`, `terminated`, `stopped`, `offline`,
+or an absent instance produces a `provider_interrupted` terminal; trainer/code
+failures remain failures and cannot be resumed as a preemption.  Start an
+explicit replacement bootstrap canary, promote its new instance-bound
+capability receipt, then run `replacement-resume --execute` with that receipt
+and the interruption terminal.  It selects the latest immutable readback
+publication and refuses a reused instance or changed generation/config IDs.
+
+Offer capture uses Vast `--storage 300`; the resulting `dph_total` is the
+single all-in 300GB quote.  Any reported storage breakdown is retained as
+evidence but is never added a second time to the account-wide `$2/hour` gate.
 
 Stage verifies a complete local sealed-generation tree after SCP, safely
 extracts the code bundle beneath `/prepared/code` and the approved parent
