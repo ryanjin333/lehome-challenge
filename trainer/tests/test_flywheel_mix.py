@@ -15,8 +15,10 @@ from lehome_train.data.validate import validate_prepared_dataset
 from lehome_train.flywheel.mix import (
     ACTION_HORIZON,
     build_mix_plan,
+    load_generation_receipt,
     materialize_mixed_snapshot,
     validate_mix_plan_payload,
+    verify_generation,
 )
 from lehome_train.io import atomic_write_json, canonical_json_sha256
 from test_flywheel_materialize import _raw_episode
@@ -121,6 +123,34 @@ def test_mix_materializes_real_ranges_with_exact_train_ratio_and_valid_stats(tmp
     (mixed / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="hash"):
         validate_prepared_dataset(mixed)
+
+
+def test_generation_receipt_binds_exact_70_30_mix_and_artifacts(tmp_path: Path) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    grade_a = _prepared_source(tmp_path / "grade-a", kind="flywheel", grade="A", episodes=1)
+    grade_b = _prepared_source(tmp_path / "grade-b", kind="flywheel", grade="B", episodes=1)
+    plan = build_mix_plan(organizer, [grade_a, grade_b], seed=20260812)
+    result = materialize_mixed_snapshot(plan, organizer, [grade_a, grade_b], tmp_path / "generation")
+
+    receipt = load_generation_receipt(result["path"])
+
+    assert receipt["organizer_training_frames"] * 3 == receipt["rft_training_frames"] * 7
+    assert receipt["sealed"] is True
+    assert len(receipt["output_manifest_sha256"]) == 64
+    verify_generation(result["path"])
+
+
+def test_generation_changes_after_seal_are_rejected(tmp_path: Path) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    grade_a = _prepared_source(tmp_path / "grade-a", kind="flywheel", grade="A", episodes=1)
+    grade_b = _prepared_source(tmp_path / "grade-b", kind="flywheel", grade="B", episodes=1)
+    plan = build_mix_plan(organizer, [grade_a, grade_b], seed=20260812)
+    result = materialize_mixed_snapshot(plan, organizer, [grade_a, grade_b], tmp_path / "generation")
+    manifest = Path(result["path"]) / "manifest.json"
+    manifest.write_text(manifest.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sealed generation"):
+        verify_generation(result["path"])
 
 
 def test_mix_reserves_validation_source_ranges_before_training_oversampling(tmp_path: Path) -> None:

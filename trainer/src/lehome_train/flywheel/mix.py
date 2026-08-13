@@ -720,6 +720,71 @@ def _write_lines(path: Path, rows: Iterable[Mapping[str, object]]) -> None:
     path.write_bytes(b"".join(canonical_json_bytes(row) + b"\n" for row in rows))
 
 
+_GENERATION_RECEIPT_SUFFIX = ".generation.json"
+
+
+def _generation_receipt_path(root: Path) -> Path:
+    return root.with_name(root.name + _GENERATION_RECEIPT_SUFFIX)
+
+
+def _generation_receipt(root: Path) -> dict[str, object]:
+    manifest = _read_json(root / "manifest.json")
+    plan = validate_mix_plan_payload(manifest.get("flywheel_mix_plan", {}))
+    statistics = manifest.get("statistics")
+    if not isinstance(statistics, Mapping) or not isinstance(statistics.get("files"), list):
+        raise ValueError("sealed generation statistics are invalid")
+    return {
+        "schema_version": 1,
+        "sealed": True,
+        "source_revisions": dict(sorted(plan.source_revisions.items())),
+        "mix_plan_sha256": plan.sha256,
+        "organizer_training_frames": plan.organizer_training_frames,
+        "rft_training_frames": plan.flywheel_training_frames,
+        "split_seed": plan.split_seed,
+        "raw_manifest_hashes": list(plan.raw_manifest_hashes),
+        "dataset_manifest_sha256": sha256_file(root / "manifest.json"),
+        "output_manifest_sha256": manifest.get("output_manifest_sha256"),
+        "statistics_sha256": canonical_json_sha256(statistics),
+    }
+
+
+def load_generation_receipt(root_value: str | Path) -> dict[str, object]:
+    """Load the sibling immutable receipt for one materialized generation."""
+
+    root = Path(root_value)
+    receipt = _read_json(_generation_receipt_path(root))
+    expected = _generation_receipt(root)
+    if receipt != expected:
+        raise ValueError("sealed generation receipt is invalid")
+    return receipt
+
+
+def verify_generation(root_value: str | Path) -> dict[str, object]:
+    """Rehash a sealed generation and reject changed or extra dataset files."""
+
+    root = Path(root_value)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("sealed generation root is unavailable")
+    receipt = load_generation_receipt(root)
+    manifest = _read_json(root / "manifest.json")
+    artifacts = manifest.get("output_artifacts")
+    if not isinstance(artifacts, list) or manifest.get("output_manifest_sha256") != canonical_json_sha256(artifacts):
+        raise ValueError("sealed generation artifact manifest is invalid")
+    listed = {item.get("relative_path") for item in artifacts if isinstance(item, Mapping)}
+    # ``manifest.json`` owns the artifact list and is deliberately not a member
+    # of it; including it would make the manifest self-referential.
+    actual = {
+        item["relative_path"]
+        for item in artifact_identities(root, exclude={"manifest.json"})
+    }
+    if listed != actual:
+        raise ValueError("sealed generation files changed after seal")
+    _verify_artifacts(root, manifest)
+    if receipt["sealed"] is not True:
+        raise ValueError("sealed generation receipt is not sealed")
+    return receipt
+
+
 def materialize_mixed_snapshot(
     plan: MixPlan,
     organizer: str | Path,
@@ -822,7 +887,17 @@ def materialize_mixed_snapshot(
 
         statistics = write_train_statistics(temporary)
         validation = validate_prepared_dataset(temporary)
+        # Statistics and validation write their own evidence after the first
+        # source-artifact validation.  Seal the final closed file set only once
+        # those writes are complete; ``manifest.json`` remains excluded to
+        # avoid a self-referential artifact digest.
+        final_manifest = _read_json(temporary / "manifest.json")
+        final_artifacts = artifact_identities(temporary, exclude={"manifest.json"})
+        final_manifest["output_artifacts"] = final_artifacts
+        final_manifest["output_manifest_sha256"] = canonical_json_sha256(final_artifacts)
+        atomic_write_json(temporary / "manifest.json", final_manifest)
         temporary.replace(destination)
+        atomic_write_json(_generation_receipt_path(destination), _generation_receipt(destination))
         return {"path": str(destination), "mix_plan_sha256": plan.sha256, "statistics": statistics, "validation": validation}
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
