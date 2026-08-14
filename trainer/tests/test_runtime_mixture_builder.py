@@ -50,8 +50,10 @@ def _selected_150_document() -> tuple[dict[str, object], dict[str, object]]:
     return document, campaign
 
 
-def _raw_selected_campaign(tmp_path: Path) -> tuple[Path, dict[str, object], dict[str, object]]:
-    """Make all 150 canonical raw roots, including raw roots no window uses."""
+def _raw_selected_campaign(
+    tmp_path: Path, *, campaign_attempts: int = 150,
+) -> tuple[Path, dict[str, object], dict[str, object]]:
+    """Make selected raw roots plus optional rejected campaign-attempt roots."""
     from lehome.flywheel.artifacts import build_sha256_manifest
     from lehome_train.io import canonical_json_sha256
 
@@ -59,31 +61,40 @@ def _raw_selected_campaign(tmp_path: Path) -> tuple[Path, dict[str, object], dic
     categories = ("top_long", "top_short", "pant_long", "pant_short")
     rows: list[dict[str, str]] = []
     receipts: list[dict[str, object]] = []
-    for index in range(150):
+    if campaign_attempts < 150:
+        raise ValueError("campaign fixture must retain all selected attempts")
+    for index in range(campaign_attempts):
         attempt_id = f"attempt-{index:03d}"
         category = categories[index % len(categories)]
         raw = campaign / "raw" / attempt_id
-        _write(raw / "episode.json", {
-            "episode_id": attempt_id,
-            "accepted_success": True,
-            "outcome": "success",
-            "terminal_reason": "success",
-            "mode": "autonomous",
-            "identity": {"release_stage": "seen", "category": category},
-        })
-        _write(raw / "SHA256SUMS.json", build_sha256_manifest(raw))
-        rows.append({
-            "attempt_id": attempt_id,
-            "episode_id": attempt_id,
-            "episode_manifest_sha256": hashlib.sha256((raw / "SHA256SUMS.json").read_bytes()).hexdigest(),
-        })
+        selected = index < 150
+        if selected:
+            _write(raw / "episode.json", {
+                "episode_id": attempt_id,
+                "accepted_success": True,
+                "outcome": "success",
+                "terminal_reason": "success",
+                "mode": "autonomous",
+                "identity": {"release_stage": "seen", "category": category},
+            })
+            _write(raw / "SHA256SUMS.json", build_sha256_manifest(raw))
+            rows.append({
+                "attempt_id": attempt_id,
+                "episode_id": attempt_id,
+                "episode_manifest_sha256": hashlib.sha256((raw / "SHA256SUMS.json").read_bytes()).hexdigest(),
+            })
+        else:
+            # Rejected attempts are preserved as campaign evidence, but cannot
+            # be normalized because they are not in selected-150.
+            (raw / "rejected-attempt.txt").parent.mkdir(parents=True, exist_ok=True)
+            (raw / "rejected-attempt.txt").write_text("not selected", encoding="utf-8")
         receipts.append({
             "attempt_id": attempt_id,
             "episode_id": attempt_id,
             "category": category,
-            "accepted_success": True,
+            "accepted_success": selected,
             "release_stage": "seen",
-            "outcome": "success",
+            "outcome": "success" if selected else "failure",
         })
     document = {
         "schema_version": 1,
@@ -213,6 +224,41 @@ def test_selected_150_raw_roots_use_the_legacy_field_as_a_checksum_manifest_bind
     assert document["selected_bindings"][0]["episode_manifest_sha256"] != hashlib.sha256((raw / "episode.json").read_bytes()).hexdigest()
 
     validate_selected_raw_roots(campaign, validate_selected_bindings(document, receipt), receipt)
+
+
+def test_selected_150_allows_the_production_332_attempt_campaign_tree(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_builder import (
+        validate_selected_bindings,
+        validate_selected_raw_roots,
+    )
+
+    campaign, document, receipt = _raw_selected_campaign(tmp_path, campaign_attempts=332)
+
+    assert len(receipt["attempt_receipts"]) == 332
+    assert len(list((campaign / "raw").iterdir())) == 332
+    validate_selected_raw_roots(campaign, validate_selected_bindings(document, receipt), receipt)
+
+
+@pytest.mark.parametrize("mutation", ["unledgered", "symlink"])
+def test_selected_150_rejects_unledgered_or_symlinked_campaign_raw_entries(
+    tmp_path: Path, mutation: str,
+) -> None:
+    from lehome_train.groot.runtime_mixture_builder import (
+        validate_selected_bindings,
+        validate_selected_raw_roots,
+    )
+
+    campaign, document, receipt = _raw_selected_campaign(tmp_path, campaign_attempts=332)
+    raw = campaign / "raw"
+    if mutation == "unledgered":
+        (raw / "unledgered-attempt").mkdir()
+    else:
+        (raw / "attempt-151" / "rejected-attempt.txt").unlink()
+        (raw / "attempt-151").rmdir()
+        (raw / "attempt-151").symlink_to(raw / "attempt-150", target_is_directory=True)
+
+    with pytest.raises(ValueError, match="unledgered|unsafe"):
+        validate_selected_raw_roots(campaign, validate_selected_bindings(document, receipt), receipt)
 
 
 @pytest.mark.parametrize("mutation", ["checksum", "unused_selected", "raw_stage", "raw_outcome"])

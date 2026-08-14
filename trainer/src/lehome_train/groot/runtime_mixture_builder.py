@@ -169,9 +169,10 @@ def validate_selected_raw_roots(
 ) -> None:
     """Verify every selected raw artifact before any window can authorize a read.
 
-    The selected index is deliberately a closed 150-root allowlist.  In
-    particular, an unused selected attempt must still pass its terminal raw
-    artifact manifest and acceptance binding before normalization can begin.
+    The selected index is a closed 150-root verification allowlist, while the
+    campaign can retain nonselected, rejected attempt evidence.  In particular,
+    an unused selected attempt must still pass its terminal raw artifact
+    manifest and acceptance binding before normalization can begin.
     """
     if len(selected) != 150:
         raise ValueError("selected raw roots must contain exactly 150 bindings")
@@ -182,13 +183,17 @@ def validate_selected_raw_roots(
     expected_ids = set(selected)
     if any(not attempt_id or "/" in attempt_id or "\\" in attempt_id or attempt_id in {".", ".."} for attempt_id in expected_ids):
         raise ValueError("selected raw attempt identity is unsafe")
+    campaign_attempts = _campaign_attempt_ledger(campaign_receipt)
     try:
         entries = {entry.name: entry for entry in raw.iterdir()}
     except OSError as error:
         raise ValueError("campaign raw root is unavailable") from error
-    if any(entry.is_symlink() or not entry.is_dir() for entry in entries.values()) or set(entries) != expected_ids:
-        raise ValueError("campaign raw roots are missing, extra, or unsafe")
-    campaign_attempts = _campaign_attempt_ledger(campaign_receipt)
+    if (
+        any(entry.is_symlink() or not entry.is_dir() for entry in entries.values())
+        or not expected_ids <= set(entries)
+        or not set(entries) <= set(campaign_attempts)
+    ):
+        raise ValueError("campaign raw roots are missing, unledgered, or unsafe")
     try:
         from lehome.flywheel.artifacts import verify_episode_manifest
         from lehome_train.flywheel.materialize import _is_autonomous_policy_success
