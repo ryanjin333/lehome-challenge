@@ -307,6 +307,26 @@ def _mounted_path(
     return path
 
 
+def _runtime_mount_root(name: str) -> Path:
+    """Resolve one approved runtime mount by its canonical role.
+
+    Production keeps the literal ``/prepared``, ``/cache``, and ``/output``
+    contracts. Resolving from the approved mount list also lets the filesystem
+    transport preserve those contracts in isolated integration tests.
+    """
+
+    root = next((root for root in _ALLOWED_ROOTS if root.name == name), None)
+    if root is None:
+        raise RuntimeError(f"runtime {name} mount is unavailable")
+    return root
+
+
+def _prepared_launch_config_path() -> Path:
+    """Return the canonical staged launch path beneath the prepared mount."""
+
+    return _runtime_mount_root("prepared") / "config" / "launch.json"
+
+
 def _load_config(path_value: object) -> FineTuneLaunchConfig:
     path = _mounted_path(
         path_value,
@@ -880,7 +900,7 @@ class ProductionRuntime:
         from lehome_train.groot.runtime_mixture_warmup import bind_warmup_to_runtime_artifacts
 
         request = _exact(arguments, {"cpu_pilot", "binding"}, "runtime-gpu-warmup")
-        config = _load_config("/prepared/config/launch.json")
+        config = _load_config(str(_prepared_launch_config_path()))
         if (
             config.physical_batch_size != 64
             or config.global_batch_size != 64
@@ -888,8 +908,8 @@ class ProductionRuntime:
             or config.runtime_mixture_manifest is None
             or config.runtime_window_index is None
             or config.runtime_mounts_descriptor is None
-            or config.dataset_path == "/prepared/generation"
-            or config.base_model_path != "/cache/parent"
+            or config.dataset_path == str(_runtime_mount_root("prepared") / "generation")
+            or config.base_model_path != str(_runtime_mount_root("cache") / "parent")
         ):
             raise ValueError("runtime GPU warm-up launch is not the pinned batch-64/h16 mixture")
         manifest = _mounted_path(
@@ -1006,6 +1026,7 @@ class ProductionRuntime:
             window_index=window_index,
             mounts_descriptor=mounts,
             global_sample_offset=0,
+            expected_global_step=0,
             global_batch_size=64,
         )
         setattr(setup_module, "DatasetFactory", replacement)
