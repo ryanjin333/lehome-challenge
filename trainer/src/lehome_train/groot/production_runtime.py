@@ -147,6 +147,16 @@ def _load_smoke(path_value: object) -> SmokeResult:
     return load_json(SmokeResult, path)
 
 
+def _load_nonempty_json_artifact(path: Path, label: str) -> Mapping[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError(f"{label} is malformed") from None
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError(f"{label} is empty or malformed")
+    return value
+
+
 def _optional_string(value: object, label: str) -> str | None:
     if value is None:
         return None
@@ -1065,6 +1075,49 @@ class ProductionRuntime:
         payload["immutable_checkpoint_publications"] = [dict(item) | identity for item in publications]
         if resume is not None:
             payload["resume_checkpoint_step"] = resume.record.optimizer_step
+        _write_result(outputs["result_output"], payload)
+        atomic_write_json(outputs["status_output"], payload)
+        return payload
+
+    def runtime_mixture_train(self, arguments: dict[str, object]) -> dict[str, object]:
+        """Launch only the runtime loader path; legacy materialization is forbidden."""
+        fields = {
+            "launch_config", "experiment_config", "runtime_manifest", "runtime_window_index",
+            "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence",
+            "result_output", "status_output",
+        }
+        request = _exact(arguments, fields, "runtime-mixture-train")
+        outputs = _prepare_outputs(request, "result_output", "status_output")
+        config = _load_config(request["launch_config"])
+        experiment = _load_experiment(request["experiment_config"])
+        paths = {
+            key: _mounted_path(request[key], key, must_exist=True, regular_file=True)
+            for key in ("runtime_manifest", "runtime_window_index", "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence")
+        }
+        if (
+            config.runtime_mixture_manifest != str(paths["runtime_manifest"])
+            or config.runtime_window_index != str(paths["runtime_window_index"])
+            or config.runtime_mounts_descriptor != str(paths["runtime_mounts_descriptor"])
+            or config.dataset_path == "/prepared/generation"
+            or config.runtime_resume_global_step is None
+        ):
+            raise ValueError("runtime production request does not select the authenticated runtime mixture")
+        # Validate all derived artifacts before the official launcher can open a
+        # dataset.  This also verifies the mount receipt and source allowlists.
+        from lehome_train.groot.runtime_mixture import load_runtime_contract
+        contract = load_runtime_contract(paths["runtime_manifest"], paths["runtime_mounts_descriptor"])
+        for key in ("runtime_normalization", "runtime_source_evidence"):
+            _load_nonempty_json_artifact(paths[key], f"runtime production {key}")
+        if experiment.action_horizon != 16:
+            raise ValueError("runtime production experiment horizon is incompatible")
+        completed = launch_continuous_finetune(config, **_launch_kwargs())
+        payload = {
+            "status": "runtime-mixture-launched",
+            "runtime_manifest_sha256": sha256_file(paths["runtime_manifest"]),
+            "runtime_window_count": len(contract.training_windows),
+            "runtime_cycle_size": contract.manifest.cycle_size,
+            "launch_returncode": completed.returncode,
+        }
         _write_result(outputs["result_output"], payload)
         atomic_write_json(outputs["status_output"], payload)
         return payload

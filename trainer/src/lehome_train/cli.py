@@ -318,6 +318,15 @@ def continuous_train(
     _gpu_command("continuous-train", request, runtime_factory)
 
 
+@app.command("runtime-mixture-train")
+def runtime_mixture_train(
+    request: Path = typer.Option(..., "--request"),
+    runtime_factory: Optional[str] = typer.Option(None, "--runtime-factory"),
+) -> None:
+    """Run the explicit authenticated runtime-mixture production path."""
+    _gpu_command("runtime-mixture-train", request, runtime_factory)
+
+
 @app.command("report")
 def report(request: Path = typer.Option(..., "--request")) -> None:
     """Build and write a complete provenance report from checked JSON."""

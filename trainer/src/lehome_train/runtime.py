@@ -15,7 +15,7 @@ from lehome_train.preflight import reject_secret_bearing_config
 
 
 RUNTIME_FACTORY_ENV = "LEHOME_TRAIN_RUNTIME_FACTORY"
-_GPU_COMMANDS = frozenset({"prepare", "memorize", "smoke", "tune", "train", "continuous-train"})
+_GPU_COMMANDS = frozenset({"prepare", "memorize", "smoke", "tune", "train", "continuous-train", "runtime-mixture-train"})
 
 
 class CommandRuntime(Protocol):
@@ -32,6 +32,8 @@ class CommandRuntime(Protocol):
     def train(self, request: dict[str, object]) -> Mapping[str, object]: ...
 
     def continuous_train(self, request: dict[str, object]) -> Mapping[str, object]: ...
+
+    def runtime_mixture_train(self, request: dict[str, object]) -> Mapping[str, object]: ...
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
