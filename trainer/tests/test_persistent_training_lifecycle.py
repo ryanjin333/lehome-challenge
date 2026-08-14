@@ -1322,6 +1322,45 @@ def test_capture_runtime_cpu_pilot_offer_uses_exact_on_demand_contract() -> None
     assert "--on-demand" in commands[0] and "--storage" in commands[0]
 
 
+def test_capture_runtime_pilot_offer_canonicalizes_real_integral_float_cores() -> None:
+    """Vast raw JSON reports hardware cores as integral floats on live rows."""
+    valid = {
+        "id": 45818984, "ask_contract_id": 1, "machine_id": 2,
+        "cpu_arch": "amd64", "cpu_cores_effective": 36.0,
+        "cpu_ram": 64129, "disk_space": 142, "disk_bw": 500,
+        "inet_down": 1000, "reliability": .9973919, "num_gpus": 1,
+        "dph_total": .081333, "storage_total_cost": 0, "is_bid": False,
+        "rentable": True, "rented": False, "gpu_name": "RTX PRO 6000 WS",
+        "gpu_ram": 96000, "driver_version": "x",
+    }
+    invalid = [
+        valid | {"id": 1, "cpu_cores_effective": True, "dph_total": .01},
+        valid | {"id": 2, "cpu_cores_effective": 32.5, "dph_total": .01},
+        valid | {"id": 3, "cpu_cores_effective": float("nan"), "dph_total": .01},
+        valid | {"id": 4, "cpu_cores_effective": float("inf"), "dph_total": .01},
+        valid | {"id": 5, "cpu_cores_effective": "36", "dph_total": .01},
+    ]
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[2:4] == ("search", "offers"):
+            return json.dumps([*invalid, valid])
+        if command[2:4] in {("show", "instances"), ("show", "volumes")}:
+            return "[]"
+        raise AssertionError(command)
+
+    receipt = LIFECYCLE.capture_runtime_pilot_offer(runner=runner, now_unix=1)
+
+    assert receipt["offer"]["id"] == 45818984
+    assert receipt["offer"]["cpu_cores_effective"] == 36
+    assert type(receipt["offer"]["cpu_cores_effective"]) is int
+
+
+@pytest.mark.parametrize("value", [True, 32.5, float("nan"), float("inf"), "36"])
+def test_runtime_pilot_core_canonicalizer_rejects_non_integral_numeric_values(value: object) -> None:
+    with pytest.raises(ValueError, match="core count"):
+        LIFECYCLE._canonical_runtime_pilot_cpu_cores(value)
+
+
 def test_pro6000_offer_query_uses_vast_scaled_gibibyte_predicate() -> None:
     assert LIFECYCLE.OFFER_QUERY == "gpu_ram>=96 num_gpus=1 reliability>=0.95"
 
@@ -1383,7 +1422,7 @@ def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_pa
     commands: list[tuple[str, ...]] = []
     live = {
         "id": 44, "actual_status": "running", "cpu_arch": "amd64",
-        "cpu_cores_effective": 32, "cpu_ram": 64390, "disk_space": 124.75,
+        "cpu_cores_effective": 36.0, "cpu_ram": 64390, "disk_space": 124.75,
         "reliability": .99, "num_gpus": 1, "dph_total": .18,
         "ssh_host": "native-x86", "ssh_port": 22,
     }

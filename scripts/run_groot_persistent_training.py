@@ -260,7 +260,11 @@ def _stable_instance_identity(row: Mapping[str, object]) -> str:
 
 def _runtime_pilot_instance_identity(row: Mapping[str, object]) -> str:
     """Bind the CPU-pilot receipt to the native host facts it actually proved."""
-    return _hash(_project(row, _RUNTIME_PILOT_INSTANCE_FIELDS))
+    canonical = dict(row)
+    canonical["cpu_cores_effective"] = _canonical_runtime_pilot_cpu_cores(
+        row.get("cpu_cores_effective")
+    )
+    return _hash(_project(canonical, _RUNTIME_PILOT_INSTANCE_FIELDS))
 
 
 def _require_account_cap(total: object, *, label: str) -> float:
@@ -282,6 +286,16 @@ def _live_account_total(*, runner: Runner) -> float:
         + sum(float(row.get("storage_total_cost", 0)) for row in volumes if isinstance(row, Mapping)),
         label="live provider",
     )
+
+
+def _canonical_runtime_pilot_cpu_cores(value: object) -> int:
+    """Accept Vast's finite integral JSON number and freeze it as an int."""
+    if isinstance(value, bool) or type(value) not in (int, float):
+        raise ValueError("runtime pilot CPU core count must be an integral numeric value")
+    numeric = float(value)
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError("runtime pilot CPU core count must be an integral numeric value")
+    return int(numeric)
 
 
 def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: int = 300) -> dict[str, object]:
@@ -323,14 +337,25 @@ def capture_runtime_pilot_offer(*, runner: Runner, now_unix: int | None = None) 
     offers = _json(runner, ("vastai", "--raw", "search", "offers", RUNTIME_PILOT_OFFER_QUERY, "--on-demand", "--storage", "120", "--order", "dph", "--raw"))
     if not isinstance(offers, list):
         raise ValueError("runtime pilot provider offer listing is invalid")
-    eligible = [row for row in offers if isinstance(row, Mapping) and row.get("cpu_arch") == "amd64" and type(row.get("cpu_cores_effective")) is int and row["cpu_cores_effective"] >= 32 and type(row.get("cpu_ram")) in (int, float) and float(row["cpu_ram"]) >= 64000 and type(row.get("disk_space")) in (int, float) and float(row["disk_space"]) >= 120 and type(row.get("reliability")) in (int, float) and float(row["reliability"]) >= .98 and row.get("num_gpus") == 1 and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False and type(row.get("id")) is int and type(row.get("dph_total")) in (int, float)]
+    eligible: list[tuple[Mapping[str, object], int]] = []
+    for row in offers:
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            cores = _canonical_runtime_pilot_cpu_cores(row.get("cpu_cores_effective"))
+        except ValueError:
+            continue
+        if row.get("cpu_arch") == "amd64" and cores >= 32 and type(row.get("cpu_ram")) in (int, float) and float(row["cpu_ram"]) >= 64000 and type(row.get("disk_space")) in (int, float) and float(row["disk_space"]) >= 120 and type(row.get("reliability")) in (int, float) and float(row["reliability"]) >= .98 and row.get("num_gpus") == 1 and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False and type(row.get("id")) is int and type(row.get("dph_total")) in (int, float):
+            eligible.append((row, cores))
     if not eligible:
         raise ValueError("no on-demand native x86 runtime pilot offer is eligible")
-    offer = min(eligible, key=lambda row: (float(row["dph_total"]), -float(row.get("disk_bw", 0)), int(row["id"])))
+    offer, cores = min(eligible, key=lambda item: (float(item[0]["dph_total"]), -float(item[0].get("disk_bw", 0)), int(item[0]["id"])))
     total = _live_account_total(runner=runner) + float(offer["dph_total"])
     _require_account_cap(total, label="runtime pilot projected")
     captured = int(time.time()) if now_unix is None else now_unix
-    return {"schema_version": 1, "kind": "runtime_mixture_cpu_pilot_offer", "offer": _project(offer, _RUNTIME_PILOT_OFFER_FIELDS), "raw_offer_sha256": _hash(dict(offer)), "account_hourly_total_usd": total, "captured_at_unix": captured, "expires_at_unix": captured + 300, "search_mode": "on_demand", "platform_arch": "amd64", "storage_gb": 120}
+    canonical_offer = _project(offer, _RUNTIME_PILOT_OFFER_FIELDS)
+    canonical_offer["cpu_cores_effective"] = cores
+    return {"schema_version": 1, "kind": "runtime_mixture_cpu_pilot_offer", "offer": canonical_offer, "raw_offer_sha256": _hash(dict(offer)), "account_hourly_total_usd": total, "captured_at_unix": captured, "expires_at_unix": captured + 300, "search_mode": "on_demand", "platform_arch": "amd64", "storage_gb": 120}
 
 
 def _runtime_pilot_offer(evidence: Mapping[str, object]) -> Mapping[str, object]:
@@ -368,12 +393,15 @@ def _runtime_pilot_offer(evidence: Mapping[str, object]) -> Mapping[str, object]
 
 
 def _runtime_pilot_live_matches(*, live: Mapping[str, object], instance_id: int, offer: Mapping[str, object]) -> bool:
+    try:
+        cores = _canonical_runtime_pilot_cpu_cores(live.get("cpu_cores_effective"))
+    except ValueError:
+        return False
     return (
         live.get("id") == instance_id
         and live.get("actual_status", "running") == "running"
         and live.get("cpu_arch") == "amd64"
-        and type(live.get("cpu_cores_effective")) is int
-        and int(live["cpu_cores_effective"]) >= 32
+        and cores >= 32
         and type(live.get("cpu_ram")) in (int, float)
         and float(live["cpu_ram"]) >= 64000
         and type(live.get("disk_space")) in (int, float)
