@@ -211,3 +211,74 @@ def test_zero_step_wrapper_initializes_and_saves_without_entering_training(
     assert original_calls == []
     assert saved == [output / "initialized-model.bin"]
     assert not (output / "checkpoint-1").exists()
+
+
+def test_chunk_runtime_wrapper_keeps_guarded_arguments_and_runs_entrypoint_in_process(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The chunk guard must not bypass the DatasetFactory substitution."""
+    captured: list[list[str]] = []
+
+    class FakeTrainer:
+        def add_callback(self, _callback: object) -> None:
+            pass
+
+        def train(self, **_kwargs: object) -> None:
+            pass
+
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(Trainer=FakeTrainer))
+    from lehome_train.groot import runtime_mixture_entrypoint
+
+    monkeypatch.setattr(runtime_mixture_entrypoint, "main", lambda argv: captured.append(list(argv)) or 0)
+    wrapper = [
+        "-m", "lehome_train.groot.runtime_mixture_entrypoint",
+        "--mixture-manifest", "/runtime/mixture.json",
+        "--window-index", "/runtime/windows.json",
+        "--mounts-descriptor", "/runtime/mounts.json",
+        "--resume-sample-offset", "64",
+        "--resume-global-step", "1", "--global-batch-size", "64",
+        "--official-launch", str(tmp_path / "gr00t" / "experiment" / "launch_finetune.py"),
+        "--", "--output-dir", "/output", "--experiment-name", "run", "--num-gpus", "1",
+    ]
+
+    chunk_launch.main(["--stop-after-step", "1", "--", *wrapper])
+
+    assert captured == [wrapper[2:]]
+
+
+def test_runtime_chunk_authenticates_checkpoint_step_before_resetting_dataset_seed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "output" / "run"
+    checkpoint = output / "checkpoint-10"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "trainer_state.json").write_text('{"global_step":10}', encoding="utf-8")
+    seen: list[object] = []
+
+    class Dataset:
+        def seed(self, step: int) -> None: seen.append(("seed", step))
+        def reset_seed(self) -> None: seen.append("reset")
+
+    class FakeTrainer:
+        def __init__(self) -> None:
+            self.args = SimpleNamespace(output_dir=str(output))
+            self.train_dataset = Dataset()
+
+        def add_callback(self, _callback: object) -> None: pass
+        def train(self, **_kwargs: object) -> None: seen.append("train")
+
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(Trainer=FakeTrainer))
+    from lehome_train.groot import runtime_mixture_entrypoint
+    monkeypatch.setattr(runtime_mixture_entrypoint, "main", lambda _argv: FakeTrainer().train(resume_from_checkpoint=True) or 0)
+    wrapper = [
+        "-m", "lehome_train.groot.runtime_mixture_entrypoint",
+        "--mixture-manifest", "/runtime/mixture.json", "--window-index", "/runtime/windows.json",
+        "--mounts-descriptor", "/runtime/mounts.json", "--resume-sample-offset", "640",
+        "--resume-global-step", "10", "--global-batch-size", "64",
+        "--official-launch", str(tmp_path / "gr00t" / "experiment" / "launch_finetune.py"),
+        "--", "--output-dir", str(tmp_path / "output"), "--experiment-name", "run", "--num-gpus", "1",
+    ]
+
+    chunk_launch.main(["--stop-after-step", "11", "--", *wrapper])
+
+    assert seen == [("seed", 10), "reset", "train"]

@@ -447,19 +447,46 @@ class RuntimeMixtureDataset(IterableDataset):
     choose sources, so aggregating them preserves every complete 7/3 cycle.
     """
 
-    def __init__(self, contract: RuntimeContract, *, processor: Callable[[Any], Any] | None = None, decoder: Callable[..., Any] | None = None, global_sample_offset: int = 0, limit: int | None = None, worker_id: int | None = None, worker_count: int | None = None, rank: int = 0, world_size: int = 1) -> None:
+    def __init__(self, contract: RuntimeContract, *, processor: Callable[[Any], Any] | None = None, decoder: Callable[..., Any] | None = None, global_sample_offset: int = 0, expected_global_step: int | None = None, global_batch_size: int | None = None, limit: int | None = None, worker_id: int | None = None, worker_count: int | None = None, rank: int = 0, world_size: int = 1) -> None:
         if global_sample_offset < 0 or rank < 0 or world_size <= 0 or rank >= world_size:
             raise ValueError("invalid deterministic stream partition")
         if limit is not None and limit < 0:
             raise ValueError("limit must be nonnegative")
         self.contract, self.processor, self.decoder = contract, processor, decoder
+        if expected_global_step is not None:
+            if type(expected_global_step) is not int or expected_global_step < 0 or type(global_batch_size) is not int or global_batch_size <= 0:
+                raise ValueError("invalid authenticated checkpoint cursor")
+            if global_sample_offset not in {0, expected_global_step * global_batch_size}:
+                raise ValueError("runtime offset does not match authenticated checkpoint cursor")
+            global_sample_offset = expected_global_step * global_batch_size
+        elif global_batch_size is not None:
+            raise ValueError("global batch requires an authenticated checkpoint cursor")
         self.global_sample_offset, self.limit = global_sample_offset, limit
+        self.expected_global_step, self.global_batch_size = expected_global_step, global_batch_size
+        self._seeded_global_step: int | None = None
         self.explicit_worker_id, self.explicit_worker_count = worker_id, worker_count
         self.rank, self.world_size = rank, world_size
         self._loader = RangeSourceLoader(contract, decoder=decoder) if processor is not None else None
         self._train: dict[str, list[Window]] = {source.source_id: [] for source in contract.manifest.sources}
         for window in contract.training_windows:
             self._train[window.source_id].append(window)
+
+    def seed(self, global_step: int) -> None:
+        """Authenticate the trainer's resume boundary before worker iteration.
+
+        This is deliberately not a random seed: the immutable schedule already
+        owns randomness.  The only accepted value is the checkpoint's global
+        optimizer step bound in the operational runtime request.
+        """
+        if self.expected_global_step is None or type(global_step) is not int or global_step != self.expected_global_step:
+            raise ValueError("dataset seed does not match authenticated checkpoint global step")
+        self._seeded_global_step = global_step
+
+    def reset_seed(self) -> None:
+        if self.expected_global_step is None or self._seeded_global_step != self.expected_global_step:
+            raise ValueError("dataset reset requires the authenticated checkpoint seed")
+        assert self.global_batch_size is not None
+        self.global_sample_offset = self.expected_global_step * self.global_batch_size
 
     def _partition(self) -> tuple[int, int]:
         if self.explicit_worker_id is not None or self.explicit_worker_count is not None:
@@ -660,7 +687,7 @@ class RangeSourceLoader:
         return {"images": {key.rsplit(".", 1)[-1]: value for key, value in images.items()}, "state": states[0], "actions": actions, "window_id": window.window_id}
 
 
-def make_dataset_factory(*, mixture_manifest: str | os.PathLike[str], mounts_descriptor: str | os.PathLike[str], global_sample_offset: int = 0, decoder: Callable[..., Any] | None = None, expected_window_index: str | os.PathLike[str] | None = None) -> Callable[..., RuntimeMixtureDataset]:
+def make_dataset_factory(*, mixture_manifest: str | os.PathLike[str], mounts_descriptor: str | os.PathLike[str], global_sample_offset: int = 0, expected_global_step: int | None = None, global_batch_size: int | None = None, decoder: Callable[..., Any] | None = None, expected_window_index: str | os.PathLike[str] | None = None) -> Callable[..., RuntimeMixtureDataset]:
     """Return the sole injected factory; arbitrary upstream args stay untouched."""
 
     def factory(*_args: Any, processor: Callable[[Any], Any] | None = None, **_kwargs: Any) -> RuntimeMixtureDataset:
@@ -669,12 +696,12 @@ def make_dataset_factory(*, mixture_manifest: str | os.PathLike[str], mounts_des
             selected = (Path(mixture_manifest).parent / contract.manifest.window_index_path).resolve()
             if selected != Path(expected_window_index).resolve():
                 raise ValueError("selected window index does not match immutable manifest")
-        return RuntimeMixtureDataset(contract, processor=processor, decoder=decoder, global_sample_offset=global_sample_offset)
+        return RuntimeMixtureDataset(contract, processor=processor, decoder=decoder, global_sample_offset=global_sample_offset, expected_global_step=expected_global_step, global_batch_size=global_batch_size)
 
     return factory
 
 
-def runtime_dataset_factory_class(*, mixture_manifest: str | os.PathLike[str], window_index: str | os.PathLike[str], mounts_descriptor: str | os.PathLike[str], global_sample_offset: int) -> type[object]:
+def runtime_dataset_factory_class(*, mixture_manifest: str | os.PathLike[str], window_index: str | os.PathLike[str], mounts_descriptor: str | os.PathLike[str], global_sample_offset: int, expected_global_step: int | None = None, global_batch_size: int | None = None) -> type[object]:
     """Create the exact ``DatasetFactory(config).build(processor)`` replacement."""
 
     class RuntimeDatasetFactory:
@@ -682,7 +709,9 @@ def runtime_dataset_factory_class(*, mixture_manifest: str | os.PathLike[str], w
             self.config = config
 
         def build(self, processor: Any) -> tuple[RuntimeMixtureDataset, None]:
-            factory = make_dataset_factory(mixture_manifest=mixture_manifest, mounts_descriptor=mounts_descriptor, global_sample_offset=global_sample_offset, expected_window_index=window_index)
+            if global_batch_size is not None and getattr(self.config, "global_batch_size", None) != global_batch_size:
+                raise ValueError("pinned trainer global batch does not match runtime resume binding")
+            factory = make_dataset_factory(mixture_manifest=mixture_manifest, mounts_descriptor=mounts_descriptor, global_sample_offset=global_sample_offset, expected_global_step=expected_global_step, global_batch_size=global_batch_size, expected_window_index=window_index)
             dataset = factory(processor=processor)
             processor.set_statistics(dataset.get_dataset_statistics(), override=True)
             return dataset, None

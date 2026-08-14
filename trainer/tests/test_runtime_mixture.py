@@ -97,6 +97,26 @@ def test_schedule_resume_and_worker_partitions_keep_exact_seven_three_ratio(tmp_
     assert sorted(sample.global_position for sample in aggregate) == list(range(40))
 
 
+@pytest.mark.parametrize("workers", (1, 4))
+def test_authenticated_resume_seed_resets_to_exact_global_batch_offset(tmp_path: Path, workers: int) -> None:
+    from lehome_train.groot.runtime_mixture import RuntimeMixtureDataset, load_runtime_contract
+
+    contract = load_runtime_contract(*(_contract(tmp_path)[::2]))
+    uninterrupted = list(RuntimeMixtureDataset(contract, limit=160))
+    resumed = RuntimeMixtureDataset(
+        contract, expected_global_step=10, global_batch_size=10, limit=160,
+        worker_id=0, worker_count=workers,
+    )
+    resumed.seed(10)
+    resumed.reset_seed()
+    assert resumed.global_sample_offset == 100
+    assert [item.sample_id for item in resumed] == [
+        item.sample_id for item in uninterrupted[100::workers]
+    ]
+    with pytest.raises(ValueError, match="authenticated checkpoint"):
+        resumed.seed(9)
+
+
 @pytest.mark.parametrize("workers", (0, 1, 4))
 def test_torch_dataloader_workers_and_prefetch_preserve_global_positions(tmp_path: Path, workers: int) -> None:
     torch = pytest.importorskip("torch")

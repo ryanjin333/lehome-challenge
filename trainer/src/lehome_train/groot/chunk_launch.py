@@ -40,19 +40,19 @@ class StopAtOptimizerStep(TrainerCallback):
             control.should_training_stop = True
         return control
 
-def _resume_value(output_dir: str | Path, *, num_gpus: int = 1) -> bool:
-    """Return true only when the official output has a valid trainer checkpoint."""
+def _resume_step(output_dir: str | Path, *, num_gpus: int = 1) -> int | None:
+    """Return the authenticated latest checkpoint step, if one exists."""
 
     root = Path(output_dir)
     if not root.exists():
-        return False
+        return None
     candidates: list[tuple[int, Path]] = []
     for path in root.glob("checkpoint-*"):
         suffix = path.name.removeprefix("checkpoint-")
         if suffix.isdigit():
             candidates.append((int(suffix), path))
     if not candidates:
-        return False
+        return None
     step, checkpoint = max(candidates)
     state_path = checkpoint / "trainer_state.json"
     if checkpoint.is_symlink() or not checkpoint.is_dir() or state_path.is_symlink():
@@ -76,10 +76,27 @@ def _resume_value(output_dir: str | Path, *, num_gpus: int = 1) -> bool:
             or any(not entry.is_file() or entry.is_symlink() for entry in shard_root.iterdir())
         ):
             raise ValueError("latest GR00T checkpoint has incomplete ZeRO-2 shards")
-    return True
+    return step
 
 
-def _arguments(argv: list[str] | None) -> tuple[int, str, list[str]]:
+def _resume_value(output_dir: str | Path, *, num_gpus: int = 1) -> bool:
+    """Return true only when the official output has a valid trainer checkpoint."""
+
+    return _resume_step(output_dir, num_gpus=num_gpus) is not None
+
+
+def _runtime_checkpoint_step(arguments: list[str]) -> int:
+    try:
+        value = arguments[arguments.index("--resume-global-step") + 1]
+        step = int(value)
+    except (ValueError, IndexError):
+        raise ValueError("chunk runtime launcher requires an explicit resume global step") from None
+    if step < 0:
+        raise ValueError("chunk runtime launcher resume global step must be nonnegative")
+    return step
+
+
+def _arguments(argv: list[str] | None) -> tuple[int, str, list[str], list[str] | None]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--stop-after-step", type=int, required=True)
     parser.add_argument("remainder", nargs=argparse.REMAINDER)
@@ -97,12 +114,16 @@ def _arguments(argv: list[str] | None) -> tuple[int, str, list[str]]:
             raise ValueError("chunk runtime launcher requires canonical official launch arguments") from None
         if not entrypoint.endswith("gr00t/experiment/launch_finetune.py") or not official:
             raise ValueError("chunk runtime launcher requires the pinned official entrypoint")
-        return parsed.stop_after_step, entrypoint, official
+        # Keep the entire authenticated wrapper.  The chunk guard has to patch
+        # ``Trainer.train`` *and* let the wrapper replace DatasetFactory in
+        # this same interpreter; reducing this to the official script silently
+        # bypasses the runtime mixture.
+        return parsed.stop_after_step, entrypoint, official, remainder[2:]
     if not remainder or not remainder[0].endswith("gr00t/experiment/launch_finetune.py"):
         raise ValueError("chunk launcher requires the pinned official entrypoint")
     if parsed.stop_after_step < 0:
         raise ValueError("chunk stop optimizer step must be nonnegative")
-    return parsed.stop_after_step, remainder[0], remainder[1:]
+    return parsed.stop_after_step, remainder[0], remainder[1:], None
 
 
 def _official_num_gpus(arguments: list[str]) -> int:
@@ -242,7 +263,8 @@ def _cleanup_metadata_staging(metadata_staging: Path | None) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    stop_step, entrypoint, official_arguments = _arguments(argv)
+    stop_step, entrypoint, official_arguments, runtime_arguments = _arguments(argv)
+    expected_runtime_step = None if runtime_arguments is None else _runtime_checkpoint_step(runtime_arguments)
     num_gpus = _official_num_gpus(official_arguments)
     _configure_rank_device(num_gpus, os.environ)
     official_arguments, canonical_run, metadata_staging = _rank_metadata_staging(
@@ -277,16 +299,35 @@ def main(argv: list[str] | None = None) -> None:
         if stop_step == 0:
             return None
         trainer.add_callback(StopAtOptimizerStep(stop_step))
+        actual_step = 0
         if kwargs.get("resume_from_checkpoint") is True:
-            kwargs["resume_from_checkpoint"] = _resume_value(
-                trainer.args.output_dir, num_gpus=num_gpus
-            )
+            actual = _resume_step(trainer.args.output_dir, num_gpus=num_gpus)
+            kwargs["resume_from_checkpoint"] = actual is not None
+            actual_step = 0 if actual is None else actual
+        if expected_runtime_step is not None:
+            if actual_step != expected_runtime_step:
+                raise ValueError("runtime checkpoint step does not match authenticated runtime resume binding")
+            dataset = getattr(trainer, "train_dataset", None)
+            if dataset is None or not callable(getattr(dataset, "seed", None)) or not callable(getattr(dataset, "reset_seed", None)):
+                raise ValueError("pinned trainer did not expose a seed-resettable runtime dataset")
+            dataset.seed(actual_step)
+            dataset.reset_seed()
         return original_train(trainer, *args, **kwargs)
 
     Trainer.train = bounded_train
-    sys.argv = [entrypoint, *official_arguments]
     try:
-        runpy.run_path(entrypoint, run_name="__main__")
+        if runtime_arguments is None:
+            sys.argv = [entrypoint, *official_arguments]
+            runpy.run_path(entrypoint, run_name="__main__")
+        else:
+            separator = runtime_arguments.index("--")
+            guarded_arguments = [*runtime_arguments[: separator + 1], *official_arguments]
+            # Importing and calling the wrapper is intentional: it retains the
+            # active Trainer.train patch while it performs the narrow pinned
+            # DatasetFactory substitution before its runpy invocation.
+            from lehome_train.groot import runtime_mixture_entrypoint
+
+            runtime_mixture_entrypoint.main(guarded_arguments)
     finally:
         _cleanup_metadata_staging(metadata_staging)
 

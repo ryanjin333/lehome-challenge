@@ -186,6 +186,8 @@ def build_launch(
             "--window-index", config.runtime_window_index,
             "--mounts-descriptor", config.runtime_mounts_descriptor,
             "--resume-sample-offset", str(config.runtime_resume_sample_offset),
+            "--resume-global-step", str(config.runtime_resume_global_step),
+            "--global-batch-size", str(config.global_batch_size),
             "--official-launch", str(entrypoint),
             "--",
             *official_args,

@@ -31,3 +31,26 @@ def test_entrypoint_refuses_setup_hash_drift_before_patch(tmp_path: Path) -> Non
     setup = type("Setup", (), {"DatasetFactory": object})
     with pytest.raises(ValueError, match="setup hash"):
         run_official_launcher(official_launch=tmp_path / "launch_finetune.py", setup_module=setup, setup_sha256="a" * 64, mixture_manifest="m", window_index="w", mounts_descriptor="d", hash_file=lambda _path: "b" * 64)
+
+
+def test_entrypoint_passes_checkpoint_step_and_global_batch_to_runtime_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lehome_train.groot import runtime_mixture_entrypoint as entrypoint
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        entrypoint,
+        "runtime_dataset_factory_class",
+        lambda **kwargs: captured.update(kwargs) or object,
+    )
+    setup = type("Setup", (), {"DatasetFactory": object})
+    entrypoint.run_official_launcher(
+        official_launch=tmp_path / "launch_finetune.py", setup_module=setup,
+        setup_sha256="a" * 64, mixture_manifest="m", window_index="w",
+        mounts_descriptor="d", resume_sample_offset=640,
+        resume_global_step=10, global_batch_size=64,
+        runner=lambda *_: None, hash_file=lambda _path: "a" * 64,
+    )
+    assert captured["expected_global_step"] == 10
+    assert captured["global_batch_size"] == 64
