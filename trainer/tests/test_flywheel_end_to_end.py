@@ -15,6 +15,8 @@ import subprocess
 import sys
 
 from lehome_train.constants import ISAAC_GROOT_REVISION, MODEL_REVISION
+from lehome_train.data.convert import LEGACY_VIDEO_PATH
+from lehome_train.data.inspect import artifact_identities
 from lehome_train.data.normalization import normalization_identity
 from lehome_train.flywheel.augmentation import (
     augmentation_profile,
@@ -28,7 +30,7 @@ from lehome_train.flywheel.mix import (
 )
 from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.groot.launch import build_launch, launch_finetune_to_step
-from lehome_train.io import sha256_file
+from lehome_train.io import atomic_write_json, canonical_json_sha256, sha256_file
 from test_flywheel_materialize import _raw_episode
 from test_flywheel_mix import _prepared_source
 
@@ -90,6 +92,37 @@ def _source_frames(plan, *, split: str, raw: bool) -> set[tuple[object, ...]]:
     }
 
 
+def _canonicalize_materialized_fixture(root: Path) -> None:
+    """Upgrade the historical Task-1 test fixture to the current camera contract."""
+
+    for camera in ("top_rgb", "left_rgb", "right_rgb"):
+        source = root / LEGACY_VIDEO_PATH.format(
+            episode_chunk=0,
+            episode_index=0,
+            video_key=camera,
+        )
+        destination = root / LEGACY_VIDEO_PATH.format(
+            episode_chunk=0,
+            episode_index=0,
+            video_key=f"observation.images.{camera}",
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source.replace(destination)
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["features"] = {
+        f"observation.images.{camera}": {"dtype": "video", "shape": [480, 640, 3]}
+        for camera in ("top_rgb", "left_rgb", "right_rgb")
+    }
+    atomic_write_json(info_path, info)
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifacts = artifact_identities(root, exclude={"manifest.json", "selection-report.json"})
+    manifest["output_artifacts"] = artifacts
+    manifest["output_manifest_sha256"] = canonical_json_sha256(artifacts)
+    atomic_write_json(manifest_path, manifest)
+
+
 def test_local_flywheel_chain_reaches_pinned_groot_launch_contract(
     tmp_path: Path,
     monkeypatch,
@@ -115,6 +148,8 @@ def test_local_flywheel_chain_reaches_pinned_groot_launch_contract(
             encoding="utf-8"
         )
     )["quality_grade"] == "B"
+    _canonicalize_materialized_fixture(grade_a)
+    _canonicalize_materialized_fixture(grade_b)
 
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
     plan = build_mix_plan(organizer, [grade_a, grade_b], seed=20260804)

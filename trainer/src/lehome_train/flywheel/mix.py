@@ -834,13 +834,9 @@ def _source_camera_keys(source: _PreparedSource, info: Mapping[str, Any]) -> dic
                 candidates.append((source_key, item))
         if len(candidates) != 1 or candidates[0][0] != expected:
             raise ValueError("prepared mix source camera schema is missing or ambiguous")
-        # Older sealed per-episode materializations leave info.features empty
-        # but carry the same typed camera contract in manifest.camera_schema.
-        # This is accepted only for that writer's pinned legacy contract; new
-        # canonical sources must name the feature explicitly.
-        if not features and not _legacy_per_episode_video_layout(source, info):
+        if not features:
             raise ValueError("prepared mix source has no canonical camera feature contract")
-        feature = candidates[0][1] if not features else features.get(candidates[0][0])
+        feature = features.get(candidates[0][0])
         if (
             not isinstance(feature, Mapping)
             or feature.get("dtype") != "video"
@@ -851,31 +847,12 @@ def _source_camera_keys(source: _PreparedSource, info: Mapping[str, Any]) -> dic
     return result
 
 
-def _legacy_per_episode_video_layout(source: _PreparedSource, info: Mapping[str, Any]) -> bool:
-    """Recognize the sealed Task-1 layout emitted before ``info.features``.
-
-    That writer recorded canonical source keys in its manifest but stored the
-    physical files under the three GR00T target keys.  Treating an arbitrary
-    empty feature mapping this way would silently accept an untyped source, so
-    keep this compatibility path pinned to the old writer's complete contract.
-    """
-
-    return (
-        info.get("features") == {}
-        and info.get("video_path") == LEGACY_VIDEO_PATH
-        and source.manifest.get("schema_version") == 1
-        and source.manifest.get("output_format") == "groot_lerobot_v2.1_per_episode"
-        and source.manifest.get("source_format") == "flywheel_raw_terminal_artifact"
-    )
-
-
 def _source_video_path(
     source: _PreparedSource,
     info: Mapping[str, Any],
     *,
     episode: int,
     source_key: str,
-    legacy_target_key: str | None = None,
 ) -> Path:
     pattern, chunk_size = info.get("video_path"), info.get("chunks_size")
     if not isinstance(pattern, str) or type(chunk_size) is not int or chunk_size <= 0:
@@ -887,24 +864,24 @@ def _source_video_path(
     candidate = Path(relative)
     if candidate.is_absolute() or ".." in candidate.parts:
         raise ValueError("prepared mix source video path escapes its root")
-    path = source.root / candidate
-    if not path.is_symlink() and path.is_file():
-        return path
-    if legacy_target_key is not None and _legacy_per_episode_video_layout(source, info):
-        legacy_relative = pattern.format(
-            episode_chunk=episode // chunk_size,
-            episode_index=episode,
-            video_key=legacy_target_key,
-        )
-        legacy_candidate = Path(legacy_relative)
-        if (
-            not legacy_candidate.is_absolute()
-            and ".." not in legacy_candidate.parts
-            and not (source.root / legacy_candidate).is_symlink()
-            and (source.root / legacy_candidate).is_file()
-        ):
-            return source.root / legacy_candidate
-    raise ValueError("prepared mix source camera video is unavailable")
+    root = source.root
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("prepared mix source root is not a real directory")
+    path = root / candidate
+    current = root
+    for component in candidate.parts:
+        current = current / component
+        if current.is_symlink():
+            raise ValueError("prepared mix source camera video path contains a symlink")
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_path = path.resolve(strict=True)
+        resolved_path.relative_to(resolved_root)
+    except (OSError, ValueError) as error:
+        raise ValueError("prepared mix source video path escapes its root") from error
+    if not path.is_file():
+        raise ValueError("prepared mix source camera video is unavailable")
+    return path
 
 
 class _BoundedVideoSlicer:
@@ -1519,7 +1496,6 @@ def _materialize_mixed_work(
                 info,
                 episode=numeric_source,
                 source_key=source_cameras[selection.source_manifest_sha256][camera],
-                legacy_target_key=camera,
             )
             output_video = temporary / LEGACY_VIDEO_PATH.format(episode_chunk=numeric_destination // 1000, episode_index=numeric_destination, video_key=camera)
             video_job = _persistent_job_identity(selection, artifact=f"video:{camera}")

@@ -131,7 +131,7 @@ def test_mix_materializes_real_ranges_with_exact_train_ratio_and_valid_stats(tmp
         validate_prepared_dataset(mixed)
 
 
-def test_mix_resolves_canonical_source_camera_keys_and_rejects_ambiguity_or_escape(tmp_path: Path) -> None:
+def test_mix_resolves_canonical_source_camera_keys_and_rejects_ambiguity_escape_or_symlinks(tmp_path: Path) -> None:
     import lehome_train.flywheel.mix as mix
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
     source = mix._prepared_source(organizer, kind="organizer")
@@ -160,6 +160,24 @@ def test_mix_resolves_canonical_source_camera_keys_and_rejects_ambiguity_or_esca
         mix._source_camera_keys(source, info)
     info["video_path"] = "../videos/{video_key}/episode_{episode_index:06d}.mp4"
     with pytest.raises(ValueError, match="escapes"):
+        mix._source_video_path(source, info, episode=0, source_key="observation.images.top_rgb")
+    info["video_path"] = LEGACY_VIDEO_PATH
+
+    videos = organizer / "videos"
+    outside = tmp_path / "outside-videos"
+    videos.rename(outside)
+    videos.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        mix._source_video_path(source, info, episode=0, source_key="observation.images.top_rgb")
+
+    organizer = _prepared_source(tmp_path / "organizer-intermediate", kind="organizer")
+    source = mix._prepared_source(organizer, kind="organizer")
+    info = json.loads((organizer / "meta" / "info.json").read_text(encoding="utf-8"))
+    chunk = organizer / "videos" / "chunk-000"
+    outside_chunk = tmp_path / "outside-chunk"
+    chunk.rename(outside_chunk)
+    chunk.symlink_to(outside_chunk, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
         mix._source_video_path(source, info, episode=0, source_key="observation.images.top_rgb")
 
 
@@ -832,7 +850,7 @@ def test_mix_rejects_ineligible_flywheel_contracts(tmp_path: Path, grade: str, r
         build_mix_plan(organizer, flywheel, seed=1)
 
 
-def test_mix_consumes_the_real_task_1_materialized_contract(tmp_path: Path) -> None:
+def test_mix_rejects_historical_task_1_materialized_contract_without_canonical_features(tmp_path: Path) -> None:
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
     raw_a = _raw_episode(tmp_path / "raw-a", grade="A")
     raw_b = _raw_episode(tmp_path / "raw-b", grade="B")
@@ -844,13 +862,8 @@ def test_mix_consumes_the_real_task_1_materialized_contract(tmp_path: Path) -> N
     materialize_episode(raw_b, grade_b)
 
     plan = build_mix_plan(organizer, [grade_a, grade_b], seed=13)
-    result = materialize_mixed_snapshot(plan, organizer, [grade_a, grade_b], tmp_path / "mixed")
-
-    assert result["validation"]["valid"] is True
-    assert set(plan.raw_manifest_hashes) == {
-        json.loads((grade_a / "meta" / "materialization-provenance.json").read_text(encoding="utf-8"))["raw_manifest_sha256"],
-        json.loads((grade_b / "meta" / "materialization-provenance.json").read_text(encoding="utf-8"))["raw_manifest_sha256"],
-    }
+    with pytest.raises(ValueError, match="feature contract"):
+        materialize_mixed_snapshot(plan, organizer, [grade_a, grade_b], tmp_path / "mixed")
 
 
 def test_mix_keeps_overlapping_real_materializer_windows_in_one_split(tmp_path: Path) -> None:
