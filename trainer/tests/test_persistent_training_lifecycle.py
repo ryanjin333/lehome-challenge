@@ -1652,6 +1652,69 @@ def _schema4_pilot(*, instance_id: int, provider_sha: str, code_revision: str, c
     }
 
 
+def test_runtime_hydrate_dispatch_allows_cpu_pilot_lease_and_rejects_mismatched_image(
+    tmp_path: Path,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    request["failure_receipt"] = str(tmp_path / "hydrate-failure.json")
+    receipt = {
+        "kind": "runtime_mixture_hydration", "immutable_revision": "c" * 40,
+        "remote_prefix": "mixtures/" + "d" * 64, "fresh_readback_verified": True,
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command[0] == "ssh":
+            return json.dumps(receipt)
+        if command == ("vastai", "destroy", "instance", "44", "--yes"):
+            return ""
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return "{}"
+        raise AssertionError(command)
+
+    cpu = LIFECYCLE.remote_action(
+        action="runtime-hydrate", instance=instance, request=request, runner=runner,
+    )
+
+    assert cpu["hydration_receipt"] == receipt
+    assert any(
+        command[0] == "ssh"
+        and "hydrate-runtime-mixture --request /prepared/config/runtime-hydrate.json" in command[-1]
+        for command in calls
+    )
+
+    calls.clear()
+    gpu_instance = dict(instance) | {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    }
+    gpu = LIFECYCLE.remote_action(
+        action="runtime-hydrate", instance=gpu_instance, request=request, runner=runner,
+    )
+
+    assert gpu["hydration_receipt"] == receipt
+    assert any(command[0] == "ssh" for command in calls)
+
+    calls.clear()
+    mismatched = dict(instance) | {
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    }
+    with pytest.raises(ValueError, match="runtime CPU pilot"):
+        LIFECYCLE.remote_action(
+            action="runtime-hydrate", instance=mismatched, request=request, runner=runner,
+        )
+
+    assert not any(command[0] == "ssh" for command in calls)
+    assert calls == [
+        ("vastai", "destroy", "instance", "44", "--yes"),
+        ("vastai", "--raw", "show", "instance", "44"),
+    ]
+    assert json.loads(Path(str(request["failure_receipt"])).read_text())["cleanup_status"] == "destroyed_and_absent"
+
+
 def test_runtime_cpu_pilot_executes_only_loader_cli_and_persists_bound_lifecycle(tmp_path: Path) -> None:
     instance, request = _runtime_pilot_request_files(tmp_path)
     pilot = {

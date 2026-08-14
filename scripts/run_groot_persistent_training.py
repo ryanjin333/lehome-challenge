@@ -1200,6 +1200,16 @@ def _runtime_cpu_pilot_identity(instance: Mapping[str, object], request: Mapping
     return _runtime_campaign_binding(request)
 
 
+def _runtime_hydration_identity(
+    instance: Mapping[str, object], request: Mapping[str, object],
+) -> dict[str, object]:
+    """Select the exact lease identity admitted to runtime hydration."""
+    if instance.get("kind") == "runtime_mixture_cpu_pilot_instance":
+        _runtime_pilot_instance(instance)
+        return _runtime_cpu_pilot_identity(instance, request)
+    return _runtime_identity(instance, request)
+
+
 def _validated_runtime_pilot_value(receipt: Mapping[str, object]) -> dict[str, object]:
     """Validate only the current schema4 CPU-only pilot CLI output."""
     value = dict(receipt)
@@ -2200,7 +2210,7 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
 
 
 def runtime_mixture_hydrate(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
-    identity = _runtime_identity(instance, request)
+    identity = _runtime_hydration_identity(instance, request)
     output = runner((*_ssh_prefix(instance), "set -eu; HF_TOKEN=\"$(cat /prepared/config/runtime.token)\" PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src lehome-train hydrate-runtime-mixture --request /prepared/config/runtime-hydrate.json"))
     try:
         receipt = json.loads(output)
