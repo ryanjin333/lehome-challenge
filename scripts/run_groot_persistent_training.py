@@ -405,6 +405,17 @@ def _ssh_prefix(instance: Mapping[str, object]) -> tuple[str, ...]:
     return ("ssh", "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port), "root@" + host)
 
 
+def _attest_platform_arch(instance: Mapping[str, object], *, runner: Runner) -> str:
+    """Accept native x86 only after the just-rented host reports it over SSH."""
+    try:
+        arch = runner((*_ssh_prefix(instance), "set -eu; uname -m")).strip()
+    except (subprocess.CalledProcessError, OSError, TimeoutError) as error:
+        raise ValueError("native platform attestation is unavailable") from error
+    if arch not in {"x86_64", "amd64"}:
+        raise ValueError("runtime mixture requires native x86_64 platform proof")
+    return "x86_64"
+
+
 def _safe_archive(path: Path, label: str) -> None:
     """Reject traversal, links, and special files before any remote extraction."""
     try:

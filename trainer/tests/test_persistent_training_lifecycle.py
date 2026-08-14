@@ -1286,3 +1286,10 @@ def test_runtime_pilot_rejects_a_descriptive_unbound_claim(tmp_path: Path) -> No
 def test_account_cap_rejects_exactly_one_dollar_per_hour() -> None:
     with pytest.raises(ValueError, match="exceeds"):
         LIFECYCLE._require_account_cap(1.0, label="test")
+
+
+def test_platform_attestation_requires_native_x86_remote_proof() -> None:
+    instance = {"host": "native", "port": 22}
+    assert LIFECYCLE._attest_platform_arch(instance, runner=lambda command: "x86_64\n") == "x86_64"
+    with pytest.raises(ValueError, match="x86_64"):
+        LIFECYCLE._attest_platform_arch(instance, runner=lambda command: "aarch64\n")
