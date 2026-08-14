@@ -52,6 +52,9 @@ RUNTIME_CPU_PILOT_IMAGE = (
 )
 MAX_ACCOUNT_HOURLY_USD = 1.00
 Runner = Callable[[tuple[str, ...]], str]
+VAST_SSH_IDENTITY = Path(
+    os.environ.get("LEHOME_VAST_SSH_IDENTITY", "~/.ssh/vast_quest")
+).expanduser()
 
 
 class RuntimeResumeAlreadyClaimed(ValueError):
@@ -572,6 +575,7 @@ def rent_runtime_cpu_pilot(
     sleep: Callable[[float], None] = _bounded_sleep,
 ) -> dict[str, object]:
     """Create one bounded native-x86 lease and remove it on every failed proof."""
+    _require_vast_ssh_identity()
     _runtime_failure_receipt_path(evidence)
     _runtime_campaign_binding(evidence)
     offer = _runtime_pilot_offer(evidence)
@@ -625,6 +629,7 @@ def rent_runtime_cpu_pilot(
 
 
 def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep, require_capability: bool = True, abort_request: Mapping[str, object] | None = None) -> dict[str, object]:
+    _require_vast_ssh_identity()
     offer = evidence.get("offer")
     if not isinstance(offer, Mapping) or type(offer.get("id")) is not int: raise ValueError("offer evidence is invalid")
     if evidence.get("search_mode") != "interruptible" or type(evidence.get("expires_at_unix")) is not int or evidence["expires_at_unix"] < int(time.time()): raise ValueError("offer evidence is expired or not interruptible")
@@ -699,7 +704,7 @@ def bootstrap_canary(*, evidence: Mapping[str, object], runner: Runner) -> dict[
         _safe_archive(bundle_path, "bootstrap code bundle")
         remote = "/tmp/lehome-bootstrap"
         runner((*_ssh_prefix(instance), "set -eu; mkdir -p " + remote + " /prepared/bootstrap-code"))
-        runner(("scp", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(bundle_path), "root@" + str(instance["host"]) + ":" + remote + "/code.bundle"))
+        runner((*_scp_prefix(instance), str(bundle_path), "root@" + str(instance["host"]) + ":" + remote + "/code.bundle"))
         observed = runner((*_ssh_prefix(instance), "sha256sum " + remote + "/code.bundle")).strip().split()
         expected = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
         if not observed or observed[0] != expected:
@@ -735,10 +740,28 @@ def bootstrap_canary(*, evidence: Mapping[str, object], runner: Runner) -> dict[
     }
 
 
+def _require_vast_ssh_identity() -> Path:
+    """Require the explicitly provisioned Vast private key without reading it."""
+    if VAST_SSH_IDENTITY.is_symlink() or not VAST_SSH_IDENTITY.is_file():
+        raise ValueError("Vast SSH identity must be a regular file")
+    return VAST_SSH_IDENTITY
+
+
 def _ssh_prefix(instance: Mapping[str, object]) -> tuple[str, ...]:
     host, port = instance.get("host"), instance.get("port")
     if not isinstance(host, str) or not host or type(port) is not int or port <= 0: raise ValueError("instance SSH receipt is invalid")
-    return ("ssh", "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port), "root@" + host)
+    identity = _require_vast_ssh_identity()
+    return ("ssh", "-o", "IdentitiesOnly=yes", "-i", str(identity), "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port), "root@" + host)
+
+
+def _scp_prefix(instance: Mapping[str, object], *, recursive: bool = False) -> tuple[str, ...]:
+    host, port = instance.get("host"), instance.get("port")
+    if not isinstance(host, str) or not host or type(port) is not int or port <= 0: raise ValueError("instance SSH receipt is invalid")
+    identity = _require_vast_ssh_identity()
+    return (
+        "scp", *( ("-r",) if recursive else () ), "-o", "IdentitiesOnly=yes",
+        "-i", str(identity), "-o", "StrictHostKeyChecking=accept-new", "-P", str(port),
+    )
 
 
 def _attest_platform_arch(
@@ -1092,7 +1115,7 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
     _validate_replacement_stage_binding(resume_arguments, request, instance=instance)
     remote_dir = "/tmp/lehome-stage"
     runner((*_ssh_prefix(instance), "mkdir -p " + remote_dir))
-    runner(("scp", "-r", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(generation_root), "root@" + str(instance["host"]) + ":" + remote_dir + "/generation"))
+    runner((*_scp_prefix(instance, recursive=True), str(generation_root), "root@" + str(instance["host"]) + ":" + remote_dir + "/generation"))
     generation_tree = _tree_readback_sha256(generation_root)
     observed_tree = runner((*_ssh_prefix(instance), "cd " + remote_dir + "/generation && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum")).strip().split()
     if not observed_tree or observed_tree[0] != generation_tree: raise ValueError("remote sealed generation tree readback failed")
@@ -1113,7 +1136,7 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
         source = Path(str(request[field]))
         if source.is_symlink() or not source.is_file(): raise ValueError("stage input must be a regular file")
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
-        runner(("scp", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(source), "root@" + str(instance["host"]) + ":" + remote_dir + "/" + remote_name))
+        runner((*_scp_prefix(instance), str(source), "root@" + str(instance["host"]) + ":" + remote_dir + "/" + remote_name))
         observed = runner((*_ssh_prefix(instance), "sha256sum " + remote_dir + "/" + remote_name)).strip().split()
         if not observed or observed[0] != digest: raise ValueError("remote staged hash readback failed")
         receipts.append({"name": remote_name, "sha256": digest})
@@ -2063,7 +2086,7 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
         if source.is_symlink() or not source.is_file():
             raise ValueError("runtime bootstrap input must be a regular file")
         digest = sha256_file(source)
-        runner(("scp", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(source), "root@" + str(instance["host"]) + ":" + remote_dir + "/" + remote_name))
+        runner((*_scp_prefix(instance), str(source), "root@" + str(instance["host"]) + ":" + remote_dir + "/" + remote_name))
         observed = runner((*_ssh_prefix(instance), "sha256sum " + remote_dir + "/" + remote_name)).strip().split()
         if not observed or observed[0] != digest:
             raise ValueError("runtime bootstrap staged hash readback failed")
@@ -2101,7 +2124,7 @@ def runtime_mixture_warmup_stage(*, instance: Mapping[str, object], request: Map
         if source.is_symlink() or not source.is_file():
             raise ValueError("runtime warmup stage input must be a regular file")
         digest = sha256_file(source)
-        runner(("scp", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(source), "root@" + str(instance["host"]) + ":" + remote_dir + "/" + remote_name))
+        runner((*_scp_prefix(instance), str(source), "root@" + str(instance["host"]) + ":" + remote_dir + "/" + remote_name))
         observed = runner((*_ssh_prefix(instance), "sha256sum " + remote_dir + "/" + remote_name)).strip().split()
         if not observed or observed[0] != digest:
             raise ValueError("runtime warmup staged hash readback failed")
@@ -2230,7 +2253,7 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         if source.is_symlink() or not source.is_file():
             raise ValueError("runtime mixture stage input must be a regular file")
         digest = sha256_file(source)
-        runner(("scp", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(source), "root@" + str(instance["host"]) + ":" + remote_dir + "/" + remote_name))
+        runner((*_scp_prefix(instance), str(source), "root@" + str(instance["host"]) + ":" + remote_dir + "/" + remote_name))
         observed = runner((*_ssh_prefix(instance), "sha256sum " + remote_dir + "/" + remote_name)).strip().split()
         if not observed or observed[0] != digest:
             raise ValueError("runtime mixture staged hash readback failed")

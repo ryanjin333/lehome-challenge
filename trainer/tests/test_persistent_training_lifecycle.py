@@ -37,6 +37,63 @@ class FakeHub:
         return revision
 
 
+def test_vast_ssh_and_scp_prefixes_use_the_approved_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = tmp_path / "vast_quest"
+    identity.write_text("private-key-material", encoding="utf-8")
+    identity.chmod(0o600)
+    monkeypatch.setattr(LIFECYCLE, "VAST_SSH_IDENTITY", identity)
+    instance = {"host": "vast-host", "port": 22022}
+
+    ssh = LIFECYCLE._ssh_prefix(instance)
+    scp = LIFECYCLE._scp_prefix(instance, recursive=True)
+
+    for command in (ssh, scp):
+        assert ("-i", str(identity)) in zip(command, command[1:])
+        assert ("-o", "IdentitiesOnly=yes") in zip(command, command[1:])
+        assert ("-o", "StrictHostKeyChecking=accept-new") in zip(command, command[1:])
+    assert ssh[:1] == ("ssh",)
+    assert scp[:2] == ("scp", "-r")
+    assert ssh[-1] == "root@vast-host"
+    assert ("-p", "22022") in zip(ssh, ssh[1:])
+    assert ("-P", "22022") in zip(scp, scp[1:])
+
+
+@pytest.mark.parametrize("kind", ("missing", "directory", "symlink"))
+def test_invalid_vast_ssh_identity_stops_before_provider_or_ssh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    identity = tmp_path / "vast_quest"
+    if kind == "directory":
+        identity.mkdir()
+    elif kind == "symlink":
+        target = tmp_path / "target"
+        target.write_text("private-key-material", encoding="utf-8")
+        identity.symlink_to(target)
+    monkeypatch.setattr(LIFECYCLE, "VAST_SSH_IDENTITY", identity)
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        raise AssertionError("identity validation must run before the provider")
+
+    with pytest.raises(ValueError, match="Vast SSH identity must be a regular file"):
+        LIFECYCLE.rent(
+            evidence={
+                "offer": {"id": 7, "min_bid": 0.5, "dph_total": 0.7},
+                "search_mode": "interruptible",
+                "expires_at_unix": int(time.time()) + 60,
+                "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+                "account_hourly_total_usd": 0.7,
+            },
+            runner=runner,
+            require_capability=False,
+        )
+
+    assert calls == []
+
+
 def _canonical_resume_chain() -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
     instance = {
         "schema_version": 1,
