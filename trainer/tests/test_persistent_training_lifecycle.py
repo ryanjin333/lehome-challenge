@@ -36,6 +36,122 @@ class FakeHub:
         return revision
 
 
+def _canonical_resume_chain() -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    instance = {
+        "schema_version": 1,
+        "kind": "persistent_training_instance",
+        "instance_id": 10,
+        "host": "replacement",
+        "port": 22,
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "offer_evidence_sha256": "a" * 64,
+        "provider_response_sha256": "b" * 64,
+        "account_hourly_total_usd": 0.7,
+    }
+    publication = {
+        "optimizer_step": 1000,
+        "readback_verified": True,
+        "generation_sha256": "c" * 64,
+        "config_sha256": "d" * 64,
+        "experiment_id": "persistent-001",
+        "repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
+        "immutable_revision": "e" * 40,
+        "remote_prefix": "prefix",
+        "relative_path": "checkpoints/step-1000.tar",
+        "artifact_sha256": "f" * 64,
+        "artifact_byte_size": 8,
+        "descriptor_relative_path": "checkpoints/step-1000.json",
+        "descriptor_sha256": "a" * 64,
+        "descriptor_byte_size": 9,
+    }
+    capability = {
+        "schema_version": 1,
+        "kind": "persistent_training_capability",
+        "instance_id": 10,
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "provider_response_sha256": "b" * 64,
+        "instance": instance,
+        "training_capability": {
+            "hardware": "NVIDIA RTX PRO 6000 Blackwell",
+            "driver_version": "595.71.05",
+            "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+            "cuda_runtime": "12.8",
+            "torch_cuda": "12.8",
+            "compute_capability": "12.0",
+            "optimizer_step": {"passed": True, "loss": 0.2},
+            "nvml": {"utilization_percent": 90},
+        },
+    }
+    descriptor = {
+        "path": "/local/replacement/resume-checkpoint.json",
+        "sha256": "a" * 64,
+        "byte_size": 9,
+        "relative_path": "checkpoints/step-1000.json",
+    }
+    terminal = {
+        "schema_version": 1,
+        "kind": "continuous_corrective_training_terminal",
+        "status": "provider_interrupted",
+        "instance_id": 9,
+        "generation_sha256": "c" * 64,
+        "config_sha256": "d" * 64,
+        "experiment_id": "persistent-001",
+        "provider_reason": "instance_absent",
+        "immutable_checkpoint_publications": [publication],
+        "resumable_checkpoint_step": 1000,
+        "disposable": False,
+    }
+    replacement = {
+        "schema_version": 1,
+        "kind": "persistent_training_replacement_resume",
+        "instance": instance,
+        "capability_receipt": capability,
+        "resume_checkpoint_publication": publication,
+        "resume_checkpoint_descriptor": descriptor,
+        "generation_sha256": "c" * 64,
+        "config_sha256": "d" * 64,
+        "resume_generation_sha256": "c" * 64,
+        "resume_config_sha256": "d" * 64,
+        "experiment_id": "persistent-001",
+        "replaced_instance_id": 9,
+    }
+    request = {
+        "generation_sha256": "c" * 64,
+        "config_sha256": "d" * 64,
+        "resume_generation_sha256": "c" * 64,
+        "resume_config_sha256": "d" * 64,
+        "capability_receipt": capability,
+        "provider_interruption_terminal": terminal,
+        "resume_checkpoint_publication": publication,
+        "resume_checkpoint_descriptor": descriptor,
+        "replacement_resume_receipt": replacement,
+    }
+    envelope = {
+        "schema_version": 1,
+        "command": "continuous-train",
+        "arguments": {
+            "launch_config": "/prepared/config/launch.json",
+            "experiment_config": "/prepared/config/experiment.json",
+            "generation_root": "/prepared/generation",
+            "parent_checkpoint_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"],
+            "normalization_sha256": "b" * 64,
+            "checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
+            "checkpoint_revision": "main",
+            "instance_id": 10,
+            "result_output": "/output/results.json",
+            "status_output": "/output/status.json",
+            "resume_checkpoint": "/prepared/config/resume-checkpoint.json",
+            "resume_publication": publication,
+            "publisher_token_file": "/prepared/config/publisher.token",
+        },
+    }
+    return instance, request, envelope
+
+
+def _assert_no_resume_execution(calls: list[tuple[str, ...]]) -> None:
+    assert not any("continuous-train --request /prepared/config/resume.json" in command[-1] for command in calls)
+
+
 def _corrective_release_receipt(roots: list[Path], path: Path) -> Path:
     """Fixture for the independently verified prior full-release readback."""
     from lehome_train.data.inspect import artifact_identities
@@ -240,8 +356,10 @@ def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_ident
             return "[]"
         raise AssertionError(command)
     replacement = {
+        "schema_version": 1, "kind": "persistent_training_instance",
         "instance_id": 10, "host": "replacement", "port": 22,
         "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "offer_evidence_sha256": "a" * 64,
         "provider_response_sha256": LIFECYCLE._stable_instance_identity({
             "id": 10, "actual_status": "running", "gpu_name": "RTX PRO 6000 WS",
             "gpu_ram": 96000, "num_gpus": 1, "dph_total": .7,
@@ -250,7 +368,7 @@ def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_ident
         "account_hourly_total_usd": .7,
     }
     capability = {
-        "kind": "persistent_training_capability", "instance_id": 10,
+        "schema_version": 1, "kind": "persistent_training_capability", "instance_id": 10,
         "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
         "provider_response_sha256": replacement["provider_response_sha256"],
         "instance": replacement,
@@ -310,8 +428,19 @@ def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_ident
                 "schema_version": 1,
                 "command": "continuous-train",
                 "arguments": {
+                    "launch_config": "/prepared/config/launch.json",
+                    "experiment_config": "/prepared/config/experiment.json",
+                    "generation_root": "/prepared/generation",
+                    "parent_checkpoint_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"],
+                    "normalization_sha256": "c" * 64,
+                    "checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
+                    "checkpoint_revision": "main",
+                    "instance_id": descriptor["instance"]["instance_id"],
+                    "result_output": "/output/results.json",
+                    "status_output": "/output/status.json",
                     "resume_checkpoint": "/prepared/config/resume-checkpoint.json",
                     "resume_publication": publication,
+                    "publisher_token_file": "/prepared/config/publisher.token",
                 },
             })
         if "sha256sum /prepared/config/resume-checkpoint.json" in command[-1]:
@@ -327,73 +456,20 @@ def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_ident
 
 
 def test_resume_rechecks_the_staged_envelope_against_the_replacement_receipt(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    publication = {
-        "optimizer_step": 1000,
-        "readback_verified": True,
-        "generation_sha256": "a" * 64,
-        "config_sha256": "b" * 64,
-        "experiment_id": "persistent-001",
-        "immutable_revision": "c" * 40,
-        "repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
-        "remote_prefix": "prefix",
-        "relative_path": "checkpoints/step-1000.tar",
-        "artifact_sha256": "d" * 64,
-        "artifact_byte_size": 8,
-        "descriptor_relative_path": "checkpoints/step-1000.json",
-        "descriptor_sha256": "e" * 64,
-        "descriptor_byte_size": 9,
+    instance, request, envelope = _canonical_resume_chain()
+    publication = request["resume_checkpoint_publication"]
+    assert isinstance(publication, dict)
+    envelope["arguments"] = envelope["arguments"] | {
+        "resume_publication": publication | {"relative_path": "checkpoints/step-2000.tar"},
     }
-    descriptor = {
-        "path": "/local/replacement/resume-checkpoint.json",
-        "sha256": "e" * 64,
-        "byte_size": 9,
-        "relative_path": "checkpoints/step-1000.json",
-    }
-    instance = {"instance_id": 10, "host": "replacement", "port": 22}
-    request = {
-        "generation_sha256": "a" * 64,
-        "config_sha256": "b" * 64,
-        "resume_generation_sha256": "a" * 64,
-        "resume_config_sha256": "b" * 64,
-        "provider_interruption_terminal": {
-            "status": "provider_interrupted",
-            "generation_sha256": "a" * 64,
-            "config_sha256": "b" * 64,
-            "experiment_id": "persistent-001",
-            "resumable_checkpoint_step": 1000,
-            "immutable_checkpoint_publications": [publication],
-        },
-        "resume_checkpoint_publication": publication,
-        "resume_checkpoint_descriptor": descriptor,
-        "replacement_resume_receipt": {
-            "schema_version": 1,
-            "kind": "persistent_training_replacement_resume",
-            "instance": instance,
-            "generation_sha256": "a" * 64,
-            "config_sha256": "b" * 64,
-            "resume_generation_sha256": "a" * 64,
-            "resume_config_sha256": "b" * 64,
-            "resume_checkpoint_publication": publication,
-            "resume_checkpoint_descriptor": descriptor,
-        },
-    }
-    monkeypatch.setattr(LIFECYCLE, "_require_instance_capability", lambda *_args: None)
 
     def runner(command: tuple[str, ...]) -> str:
         if command[-1] == "cat /prepared/config/resume.json":
-            return json.dumps({
-                "schema_version": 1,
-                "command": "continuous-train",
-                "arguments": {
-                    "resume_checkpoint": "/prepared/config/resume-checkpoint.json",
-                    "resume_publication": publication | {"relative_path": "checkpoints/step-2000.tar"},
-                },
-            })
+            return json.dumps(envelope)
         raise AssertionError("resume command must not execute after staged envelope mismatch")
 
-    with pytest.raises(ValueError, match="staged resume envelope"):
+    with pytest.raises(ValueError, match="staged resume request identity"):
         LIFECYCLE.remote_action(
             action="resume",
             instance=instance,
@@ -404,73 +480,91 @@ def test_resume_rechecks_the_staged_envelope_against_the_replacement_receipt(
 
 @pytest.mark.parametrize("terminal", (None, "not-a-provider-terminal"))
 def test_resume_requires_a_provider_interruption_terminal_before_execution(
-    terminal: object, monkeypatch: pytest.MonkeyPatch,
+    terminal: object,
 ) -> None:
-    instance = {"instance_id": 10, "host": "replacement", "port": 22}
-    request = {
-        "generation_sha256": "a" * 64,
-        "config_sha256": "b" * 64,
-        "resume_generation_sha256": "a" * 64,
-        "resume_config_sha256": "b" * 64,
-    }
+    instance, request, _ = _canonical_resume_chain()
     if terminal is not None:
         request["provider_interruption_terminal"] = terminal
+    else:
+        request.pop("provider_interruption_terminal")
     calls: list[tuple[str, ...]] = []
-    monkeypatch.setattr(LIFECYCLE, "_require_instance_capability", lambda *_args: None)
 
     def runner(command: tuple[str, ...]) -> str:
         calls.append(command)
         return ""
 
-    with pytest.raises(ValueError, match="provider interruption terminal"):
+    with pytest.raises(ValueError, match="resume terminal schema"):
         LIFECYCLE.remote_action(action="resume", instance=instance, request=request, runner=runner)
     assert not any("continuous-train --request /prepared/config/resume.json" in command[-1] for command in calls)
 
 
 def test_resume_requires_a_replacement_receipt_before_execution(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    instance = {"instance_id": 10, "host": "replacement", "port": 22}
-    publication = {
-        "optimizer_step": 1000,
-        "generation_sha256": "a" * 64,
-        "config_sha256": "b" * 64,
-        "experiment_id": "persistent-001",
-        "immutable_revision": "c" * 40,
-        "repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
-        "remote_prefix": "prefix",
-        "relative_path": "checkpoints/step-1000.tar",
-        "artifact_sha256": "d" * 64,
-        "artifact_byte_size": 8,
-        "descriptor_relative_path": "checkpoints/step-1000.json",
-        "descriptor_sha256": "e" * 64,
-        "descriptor_byte_size": 9,
-    }
-    request = {
-        "generation_sha256": "a" * 64,
-        "config_sha256": "b" * 64,
-        "resume_generation_sha256": "a" * 64,
-        "resume_config_sha256": "b" * 64,
-        "provider_interruption_terminal": {
-            "status": "provider_interrupted",
-            "generation_sha256": "a" * 64,
-            "config_sha256": "b" * 64,
-            "experiment_id": "persistent-001",
-            "resumable_checkpoint_step": 1000,
-            "immutable_checkpoint_publications": [publication],
-        },
-        "resume_checkpoint_publication": publication,
-    }
+    instance, request, _ = _canonical_resume_chain()
+    request.pop("replacement_resume_receipt")
     calls: list[tuple[str, ...]] = []
-    monkeypatch.setattr(LIFECYCLE, "_require_instance_capability", lambda *_args: None)
 
     def runner(command: tuple[str, ...]) -> str:
         calls.append(command)
         return ""
 
-    with pytest.raises(ValueError, match="replacement receipt"):
+    with pytest.raises(ValueError, match="resume replacement schema"):
         LIFECYCLE.remote_action(action="resume", instance=instance, request=request, runner=runner)
     assert not any("continuous-train --request /prepared/config/resume.json" in command[-1] for command in calls)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ("generation_sha256", "resume_generation_sha256", "config_sha256", "resume_config_sha256"),
+)
+def test_resume_rejects_missing_identity_before_execution(identity: str) -> None:
+    instance, request, _ = _canonical_resume_chain()
+    request.pop(identity)
+    calls: list[tuple[str, ...]] = []
+
+    with pytest.raises(ValueError, match="resume identity is invalid"):
+        LIFECYCLE.remote_action(
+            action="resume", instance=instance, request=request,
+            runner=lambda command: calls.append(command) or "",
+        )
+    _assert_no_resume_execution(calls)
+
+
+@pytest.mark.parametrize("part", ("terminal", "replacement", "capability", "instance"))
+def test_resume_rejects_partial_mapping_chain_evidence_before_execution(part: str) -> None:
+    instance, request, _ = _canonical_resume_chain()
+    if part == "terminal":
+        request["provider_interruption_terminal"] = {"schema_version": 1}
+    elif part == "replacement":
+        request["replacement_resume_receipt"] = {"schema_version": 1}
+    elif part == "capability":
+        request["capability_receipt"] = {"schema_version": 1}
+    else:
+        instance = {"instance_id": 10}
+    calls: list[tuple[str, ...]] = []
+
+    with pytest.raises(ValueError, match="resume (identity|terminal|replacement|capability|instance) schema"):
+        LIFECYCLE.remote_action(
+            action="resume", instance=instance, request=request,
+            runner=lambda command: calls.append(command) or "",
+        )
+    _assert_no_resume_execution(calls)
+
+
+def test_resume_rejects_partial_staged_envelope_before_execution() -> None:
+    instance, request, envelope = _canonical_resume_chain()
+    envelope["arguments"] = {"resume_checkpoint": "/prepared/config/resume-checkpoint.json"}
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command[-1] == "cat /prepared/config/resume.json":
+            return json.dumps(envelope)
+        raise AssertionError("a partial envelope must not reach descriptor or training execution")
+
+    with pytest.raises(ValueError, match="staged resume request schema"):
+        LIFECYCLE.remote_action(action="resume", instance=instance, request=request, runner=runner)
+    _assert_no_resume_execution(calls)
 
 
 def test_remote_ssh_failure_is_terminalized_only_after_provider_interruption_readback() -> None:

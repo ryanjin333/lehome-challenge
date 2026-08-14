@@ -891,6 +891,187 @@ def resume_identity(
     return candidate
 
 
+_RESUME_PUBLICATION_FIELDS = {
+    "optimizer_step", "readback_verified", "generation_sha256", "config_sha256",
+    "experiment_id", "repository", "immutable_revision", "remote_prefix",
+    "relative_path", "artifact_sha256", "artifact_byte_size",
+    "descriptor_relative_path", "descriptor_sha256", "descriptor_byte_size",
+}
+_RESUME_TERMINAL_FIELDS = {
+    "schema_version", "kind", "status", "instance_id", "generation_sha256",
+    "config_sha256", "experiment_id", "provider_reason",
+    "immutable_checkpoint_publications", "resumable_checkpoint_step", "disposable",
+}
+_REPLACEMENT_RECEIPT_FIELDS = {
+    "schema_version", "kind", "instance", "capability_receipt",
+    "resume_checkpoint_publication", "resume_checkpoint_descriptor",
+    "generation_sha256", "config_sha256", "resume_generation_sha256",
+    "resume_config_sha256", "experiment_id", "replaced_instance_id",
+}
+_INSTANCE_RECEIPT_FIELDS = {
+    "schema_version", "kind", "instance_id", "host", "port", "trainer_image",
+    "offer_evidence_sha256", "provider_response_sha256", "account_hourly_total_usd",
+}
+_CAPABILITY_RECEIPT_FIELDS = {
+    "schema_version", "kind", "instance_id", "trainer_image",
+    "provider_response_sha256", "instance", "training_capability",
+}
+_CONTINUOUS_TRAIN_FIELDS = {
+    "launch_config", "experiment_config", "generation_root", "parent_checkpoint_sha256",
+    "normalization_sha256", "checkpoint_repository", "checkpoint_revision",
+    "instance_id", "result_output", "status_output", "resume_checkpoint",
+    "resume_publication", "publisher_token_file",
+}
+
+
+def _resume_sha256(value: object, label: str) -> str:
+    try:
+        return _sha256(value, label)
+    except ValueError:
+        raise ValueError(f"resume {label} is invalid") from None
+
+
+def _validate_resume_instance(instance: Mapping[str, object]) -> None:
+    if set(instance) != _INSTANCE_RECEIPT_FIELDS:
+        raise ValueError("resume instance schema is invalid")
+    if (
+        instance.get("schema_version") != 1
+        or instance.get("kind") != "persistent_training_instance"
+        or type(instance.get("instance_id")) is not int
+        or instance["instance_id"] <= 0
+        or not isinstance(instance.get("host"), str)
+        or not instance["host"]
+        or type(instance.get("port")) is not int
+        or instance["port"] <= 0
+        or type(instance.get("account_hourly_total_usd")) not in (int, float)
+    ):
+        raise ValueError("resume instance schema is invalid")
+    _trainer_image(instance.get("trainer_image"))
+    _resume_sha256(instance.get("offer_evidence_sha256"), "instance offer evidence SHA-256")
+    _resume_sha256(instance.get("provider_response_sha256"), "instance provider response SHA-256")
+    _require_account_cap(instance["account_hourly_total_usd"], label="resume instance")
+
+
+def _validate_resume_capability(
+    capability: object, *, instance: Mapping[str, object],
+) -> Mapping[str, object]:
+    if not isinstance(capability, Mapping) or set(capability) != _CAPABILITY_RECEIPT_FIELDS:
+        raise ValueError("resume capability schema is invalid")
+    if capability.get("schema_version") != 1 or capability.get("instance") != instance:
+        raise ValueError("resume capability schema is invalid")
+    _require_instance_capability(instance, {"capability_receipt": capability})
+    return capability
+
+
+def _validate_resume_publication(
+    publication: object, *, generation_sha256: str, config_sha256: str,
+    experiment_id: str,
+) -> Mapping[str, object]:
+    if not isinstance(publication, Mapping) or set(publication) != _RESUME_PUBLICATION_FIELDS:
+        raise ValueError("resume publication schema is invalid")
+    if (
+        publication.get("optimizer_step") is None
+        or type(publication["optimizer_step"]) is not int
+        or publication["optimizer_step"] <= 0
+        or publication.get("readback_verified") is not True
+        or publication.get("generation_sha256") != generation_sha256
+        or publication.get("config_sha256") != config_sha256
+        or publication.get("experiment_id") != experiment_id
+        or publication.get("repository") != PARENT_CHECKPOINT["repository"]
+        or not isinstance(publication.get("remote_prefix"), str)
+        or not publication["remote_prefix"]
+        or type(publication.get("artifact_byte_size")) is not int
+        or publication["artifact_byte_size"] <= 0
+        or type(publication.get("descriptor_byte_size")) is not int
+        or publication["descriptor_byte_size"] <= 0
+    ):
+        raise ValueError("resume publication schema is invalid")
+    paths = ("remote_prefix", "relative_path", "descriptor_relative_path")
+    if any(
+        not isinstance(publication.get(field), str)
+        or not publication[field]
+        or Path(publication[field]).is_absolute()
+        or ".." in Path(publication[field]).parts
+        for field in paths
+    ):
+        raise ValueError("resume publication schema is invalid")
+    _resume_sha256(publication.get("artifact_sha256"), "publication artifact SHA-256")
+    _resume_sha256(publication.get("descriptor_sha256"), "publication descriptor SHA-256")
+    revision = publication.get("immutable_revision")
+    if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+        raise ValueError("resume publication schema is invalid")
+    return publication
+
+
+def _validate_resume_terminal(
+    terminal: object, *, generation_sha256: str, config_sha256: str,
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    if not isinstance(terminal, Mapping) or set(terminal) != _RESUME_TERMINAL_FIELDS:
+        raise ValueError("resume terminal schema is invalid")
+    experiment = terminal.get("experiment_id")
+    if (
+        terminal.get("schema_version") != 1
+        or terminal.get("kind") != "continuous_corrective_training_terminal"
+        or terminal.get("status") != "provider_interrupted"
+        or type(terminal.get("instance_id")) is not int
+        or terminal["instance_id"] <= 0
+        or terminal.get("generation_sha256") != generation_sha256
+        or terminal.get("config_sha256") != config_sha256
+        or not isinstance(experiment, str)
+        or not experiment
+        or not isinstance(terminal.get("provider_reason"), str)
+        or not terminal["provider_reason"]
+        or terminal.get("disposable") is not False
+        or type(terminal.get("resumable_checkpoint_step")) is not int
+        or terminal["resumable_checkpoint_step"] <= 0
+        or not isinstance(terminal.get("immutable_checkpoint_publications"), list)
+        or not terminal["immutable_checkpoint_publications"]
+    ):
+        raise ValueError("resume terminal schema is invalid")
+    for publication in terminal["immutable_checkpoint_publications"]:
+        _validate_resume_publication(
+            publication, generation_sha256=generation_sha256,
+            config_sha256=config_sha256, experiment_id=experiment,
+        )
+    return terminal, resume_identity(
+        terminal, generation_sha256=generation_sha256, config_sha256=config_sha256,
+    )
+
+
+def _validate_replacement_resume_receipt(
+    receipt: object, *, instance: Mapping[str, object], capability: Mapping[str, object],
+    terminal: Mapping[str, object], publication: Mapping[str, object],
+    generation_sha256: str, config_sha256: str,
+) -> Mapping[str, object]:
+    if not isinstance(receipt, Mapping) or set(receipt) != _REPLACEMENT_RECEIPT_FIELDS:
+        raise ValueError("resume replacement schema is invalid")
+    descriptor = receipt.get("resume_checkpoint_descriptor")
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("kind") != "persistent_training_replacement_resume"
+        or receipt.get("instance") != instance
+        or receipt.get("capability_receipt") != capability
+        or receipt.get("resume_checkpoint_publication") != publication
+        or receipt.get("generation_sha256") != generation_sha256
+        or receipt.get("config_sha256") != config_sha256
+        or receipt.get("resume_generation_sha256") != generation_sha256
+        or receipt.get("resume_config_sha256") != config_sha256
+        or receipt.get("experiment_id") != terminal.get("experiment_id")
+        or receipt.get("replaced_instance_id") != terminal.get("instance_id")
+        or receipt.get("replaced_instance_id") == instance.get("instance_id")
+        or not isinstance(descriptor, Mapping)
+        or set(descriptor) != {"path", "sha256", "byte_size", "relative_path"}
+        or not isinstance(descriptor.get("path"), str)
+        or not Path(descriptor["path"]).is_absolute()
+        or ".." in Path(descriptor["path"]).parts
+        or descriptor.get("sha256") != publication.get("descriptor_sha256")
+        or descriptor.get("byte_size") != publication.get("descriptor_byte_size")
+        or descriptor.get("relative_path") != publication.get("descriptor_relative_path")
+    ):
+        raise ValueError("resume replacement schema is invalid")
+    return receipt
+
+
 def discover_resume_publication(
     terminal: Mapping[str, object], *, transport: HubTransport, token: str
 ) -> Mapping[str, object]:
@@ -1040,17 +1221,37 @@ def _verify_staged_resume_binding(
         )
     except (json.JSONDecodeError, subprocess.CalledProcessError, OSError, TimeoutError) as error:
         raise ValueError("staged resume envelope is unavailable") from error
+    arguments = envelope.get("arguments") if isinstance(envelope, Mapping) else None
     if (
         not isinstance(envelope, Mapping)
         or set(envelope) != {"schema_version", "command", "arguments"}
         or envelope.get("schema_version") != 1
         or envelope.get("command") != "continuous-train"
-        or not isinstance(envelope.get("arguments"), Mapping)
-        or envelope["arguments"].get("resume_checkpoint")
-        != "/prepared/config/resume-checkpoint.json"
-        or envelope["arguments"].get("resume_publication") != publication
+        or not isinstance(arguments, Mapping)
+        or set(arguments) != _CONTINUOUS_TRAIN_FIELDS
     ):
-        raise ValueError("staged resume envelope differs from the authenticated replacement receipt")
+        raise ValueError("staged resume request schema is invalid")
+    if (
+        arguments.get("launch_config") != "/prepared/config/launch.json"
+        or arguments.get("experiment_config") != "/prepared/config/experiment.json"
+        or arguments.get("generation_root") != "/prepared/generation"
+        or arguments.get("parent_checkpoint_sha256") != PARENT_CHECKPOINT["artifact_sha256"]
+        or _resume_sha256(arguments.get("normalization_sha256"), "normalization SHA-256")
+        != arguments.get("normalization_sha256")
+        or arguments.get("checkpoint_repository") != PARENT_CHECKPOINT["repository"]
+        or arguments.get("checkpoint_revision") != "main"
+        or arguments.get("instance_id") != instance.get("instance_id")
+        or not all(
+            isinstance(arguments.get(field), str)
+            and re.fullmatch(r"/output/[A-Za-z0-9._/-]+", arguments[field]) is not None
+            and ".." not in Path(arguments[field]).parts
+            for field in ("result_output", "status_output")
+        )
+        or arguments.get("resume_checkpoint") != "/prepared/config/resume-checkpoint.json"
+        or arguments.get("resume_publication") != publication
+        or arguments.get("publisher_token_file") != "/prepared/config/publisher.token"
+    ):
+        raise ValueError("staged resume request identity is incompatible")
     if (
         set(descriptor) != {"path", "sha256", "byte_size", "relative_path"}
         or not isinstance(descriptor.get("path"), str)
@@ -1079,37 +1280,39 @@ def _verify_staged_resume_binding(
 def remote_action(*, action: str, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     instance_id = instance.get("instance_id")
     if type(instance_id) is not int: raise ValueError("instance receipt is invalid")
-    if action == "resume" and request.get("generation_sha256") != request.get("resume_generation_sha256") or action == "resume" and request.get("config_sha256") != request.get("resume_config_sha256"):
-        raise ValueError("resume requires exact generation/config identity")
     if action == "stage":
         return stage(instance=instance, request=request, runner=runner)
     elif action in {"tune", "train", "status", "resume"}:
-        if action in {"tune", "train", "resume"}:
+        if action in {"tune", "train"}:
             _require_instance_capability(instance, request)
         if action == "resume":
-            terminal = request.get("provider_interruption_terminal")
-            if not isinstance(terminal, Mapping):
-                raise ValueError("resume requires a provider interruption terminal")
-            expected = resume_identity(
-                terminal,
-                generation_sha256=str(request.get("generation_sha256")),
-                config_sha256=str(request.get("config_sha256")),
+            generation = _resume_sha256(request.get("generation_sha256"), "identity")
+            resume_generation = _resume_sha256(
+                request.get("resume_generation_sha256"), "identity"
+            )
+            config = _resume_sha256(request.get("config_sha256"), "identity")
+            resume_config = _resume_sha256(
+                request.get("resume_config_sha256"), "identity"
+            )
+            if generation != resume_generation or config != resume_config:
+                raise ValueError("resume identity is incompatible")
+            _validate_resume_instance(instance)
+            capability = _validate_resume_capability(
+                request.get("capability_receipt"), instance=instance,
+            )
+            terminal, expected = _validate_resume_terminal(
+                request.get("provider_interruption_terminal"),
+                generation_sha256=generation, config_sha256=config,
             )
             if request.get("resume_checkpoint_publication") != expected:
                 raise ValueError("resume checkpoint descriptor is not the authenticated interruption publication")
-            replacement = request.get("replacement_resume_receipt")
-            if (
-                not isinstance(replacement, Mapping)
-                or replacement.get("schema_version") != 1
-                or replacement.get("kind") != "persistent_training_replacement_resume"
-                or replacement.get("instance") != instance
-                or replacement.get("resume_checkpoint_publication") != expected
-                or replacement.get("generation_sha256") != request.get("generation_sha256")
-                or replacement.get("config_sha256") != request.get("config_sha256")
-                or request.get("resume_checkpoint_descriptor")
-                != replacement.get("resume_checkpoint_descriptor")
-            ):
-                raise ValueError("resume replacement receipt is not freshly bound to the authenticated publication")
+            replacement = _validate_replacement_resume_receipt(
+                request.get("replacement_resume_receipt"), instance=instance,
+                capability=capability, terminal=terminal, publication=expected,
+                generation_sha256=generation, config_sha256=config,
+            )
+            if request.get("resume_checkpoint_descriptor") != replacement["resume_checkpoint_descriptor"]:
+                raise ValueError("resume replacement descriptor is not freshly bound")
             _verify_staged_resume_binding(
                 instance=instance,
                 publication=expected,
