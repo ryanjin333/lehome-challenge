@@ -98,6 +98,15 @@ def _bind_bundle(manifest: Path, bundle: Path) -> None:
     _write(manifest, value)
 
 
+def _evaluation_release(invocation: dict[str, object]) -> tuple[str, str]:
+    release_id = LIFECYCLE.canonical_sha256({
+        "invocation": invocation,
+        "trial_ids": LIFECYCLE.canonical_trial_ids(),
+        "kind": "diagnostic_evaluation_not_rft",
+    })
+    return release_id, f"evaluations/groot-n17-step-{invocation['policy_step']}/{release_id}"
+
+
 def test_malformed_preflight_makes_zero_provider_calls(tmp_path: Path) -> None:
     manifest = _write(tmp_path / "malformed.json", {"kind": "wrong"})
     invoked: list[tuple[str, ...]] = []
@@ -167,6 +176,45 @@ def test_rent_captures_only_r580_four_3090_host_and_hard_budget(tmp_path: Path) 
     create = next(command for command in invoked if command[:4] == ("vastai", "--raw", "create", "instance"))
     assert create[create.index("--image") + 1] == LIFECYCLE.APPROVED_IMAGE_REPOSITORY + "@" + LIFECYCLE.APPROVED_IMAGE_DIGEST
     assert "--on-demand" in next(command for command in invoked if command[:4] == ("vastai", "--raw", "search", "offers"))
+
+
+def test_watchdog_starts_before_the_first_running_readback(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    invoked: list[tuple[str, ...]] = []
+    watchdogs: list[tuple[int, int, Path]] = []
+    exact_reads = 0
+    create_attempted = False
+    destroyed = False
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal exact_reads, create_attempted, destroyed
+        invoked.append(command)
+        if command[:4] == ("vastai", "--raw", "create", "instance"):
+            create_attempted = True
+            return '{"new_contract":99}'
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return json.dumps([_healthy_offer()])
+        if command[:4] == ("vastai", "--raw", "show", "instance"):
+            exact_reads += 1
+            if exact_reads == 1:
+                raise RuntimeError("running readback failed")
+            return "{}" if destroyed else json.dumps(_healthy_instance())
+        if command[:3] == ("vastai", "destroy", "instance"):
+            destroyed = True
+            return ""
+        if command[-1] == "instances":
+            return "[]" if destroyed or not create_attempted else json.dumps([_healthy_instance()])
+        if command[-1] == "volumes":
+            return "[]"
+        raise AssertionError(command)
+
+    with pytest.raises(RuntimeError, match="running readback failed"):
+        LIFECYCLE.rent_evaluation(
+            manifest, lifecycle_root=tmp_path / "life", runner=runner,
+            watchdog_launcher=lambda instance_id, deadline, receipt: watchdogs.append((instance_id, deadline, receipt)) or 4321,
+        )
+    assert len(watchdogs) == 1 and watchdogs[0][0] == 99
+    assert sum(command[:3] == ("vastai", "destroy", "instance") for command in invoked) == 1
 
 
 def test_stage_launch_uses_exact_cpu_policy_server_four_cuda_slots_and_wall_cap(tmp_path: Path) -> None:
@@ -239,8 +287,9 @@ def test_remote_failure_syncs_redacted_evidence_and_destroys_exactly_once(tmp_pa
 def test_publication_receipt_must_bind_current_instance_and_exact_invocation(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     invocation = json.loads(manifest.read_text())["invocation"]
+    release_id, remote_prefix = _evaluation_release(invocation)
     instance = _write(tmp_path / "instance.json", {"kind": "groot_checkpoint_evaluation_instance", "instance_id": 99, "rent_claim_path": str(LIFECYCLE.EVALUATION_RENT_CLAIM_ROOT / "active.json"), "invocation_sha256": LIFECYCLE.canonical_sha256(invocation)})
-    publication = _write(tmp_path / "publication.json", {"kind": "groot_checkpoint_evaluation_publication", "disposable": True, "instance_id": 99, "instance_receipt_sha256": hashlib.sha256(instance.read_bytes()).hexdigest(), "invocation": invocation, "invocation_sha256": LIFECYCLE.canonical_sha256(invocation), "immutable_revision": "a" * 40, "remote_prefix": "evaluations/x", "repository_private": True, "tree_listing_verified": True, "fresh_readback_verified": True})
+    publication = _write(tmp_path / "publication.json", {"kind": "groot_checkpoint_evaluation_publication", "disposable": True, "instance_id": 99, "instance_receipt_sha256": hashlib.sha256(instance.read_bytes()).hexdigest(), "invocation": invocation, "invocation_sha256": LIFECYCLE.canonical_sha256(invocation), "immutable_revision": "a" * 40, "repository": "ryanjin333/lehome-groot-n17-data", "release_id": release_id, "remote_prefix": remote_prefix, "repository_private": True, "tree_listing_verified": True, "fresh_readback_verified": True})
     invoked: list[tuple[str, ...]] = []
     destroyed = False
     def runner(command: tuple[str, ...]) -> str:
@@ -264,6 +313,39 @@ def test_publication_receipt_must_bind_current_instance_and_exact_invocation(tmp
     stale = json.loads(publication.read_text()); stale["instance_id"] = 17; _write(publication, stale)
     with pytest.raises(ValueError, match="publication"):
         LIFECYCLE.destroy_after_publication(99, publication, instance, disposal_receipt=tmp_path / "disposal-2.json", runner=runner)
+
+
+@pytest.mark.parametrize(("field", "value"), (
+    ("repository", "attacker/other"),
+    ("release_id", "0" * 64),
+    ("remote_prefix", "evaluations/forged"),
+))
+def test_disposal_rejects_forged_release_identity_before_provider_calls(tmp_path: Path, field: str, value: str) -> None:
+    invocation = json.loads(_manifest(tmp_path).read_text())["invocation"]
+    release_id, remote_prefix = _evaluation_release(invocation)
+    instance = _write(tmp_path / "instance.json", {
+        "kind": "groot_checkpoint_evaluation_instance", "instance_id": 99,
+        "rent_claim_path": str(LIFECYCLE.EVALUATION_RENT_CLAIM_ROOT / "active.json"),
+        "invocation_sha256": LIFECYCLE.canonical_sha256(invocation),
+    })
+    publication_value = {
+        "kind": "groot_checkpoint_evaluation_publication", "disposable": True,
+        "repository": "ryanjin333/lehome-groot-n17-data", "repository_private": True,
+        "release_id": release_id, "remote_prefix": remote_prefix,
+        "immutable_revision": "a" * 40, "instance_id": 99,
+        "instance_receipt_sha256": hashlib.sha256(instance.read_bytes()).hexdigest(),
+        "invocation": invocation, "invocation_sha256": LIFECYCLE.canonical_sha256(invocation),
+        "tree_listing_verified": True, "fresh_readback_verified": True,
+    }
+    publication_value[field] = value
+    publication = _write(tmp_path / "publication.json", publication_value)
+    invoked: list[tuple[str, ...]] = []
+    with pytest.raises(ValueError, match="publication"):
+        LIFECYCLE.destroy_after_publication(
+            99, publication, instance, disposal_receipt=tmp_path / "disposal.json",
+            runner=lambda command: invoked.append(command),
+        )
+    assert invoked == []
 
 
 def test_rent_claim_is_singleton_and_second_controller_is_provider_free(tmp_path: Path) -> None:
@@ -336,6 +418,42 @@ def test_ambiguous_create_cleans_the_only_new_compatible_host_and_releases_claim
     assert list(claim_root.glob("*.json")) == []
 
 
+def test_ambiguous_create_cleans_a_transitional_single_new_host(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    invoked: list[tuple[str, ...]] = []
+    create_attempted = False
+    destroyed = False
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal create_attempted, destroyed
+        invoked.append(command)
+        if command[:4] == ("vastai", "--raw", "create", "instance"):
+            create_attempted = True
+            return "{}"
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return json.dumps([_healthy_offer()])
+        if command[:3] == ("vastai", "destroy", "instance"):
+            destroyed = True
+            return ""
+        if command[:4] == ("vastai", "--raw", "show", "instance"):
+            return "{}" if destroyed else json.dumps({"id": 99, "actual_status": "loading"})
+        if command[-1] == "instances":
+            if destroyed or not create_attempted:
+                return "[]"
+            return json.dumps([{"id": 99, "actual_status": "loading"}])
+        if command[-1] == "volumes":
+            return "[]"
+        raise AssertionError(command)
+
+    with pytest.raises(RuntimeError, match="lacks instance ID"):
+        LIFECYCLE.rent_evaluation(
+            manifest, lifecycle_root=tmp_path / "life", runner=runner,
+            ambiguous_create_polls=1,
+        )
+    assert sum(command[:3] == ("vastai", "destroy", "instance") for command in invoked) == 1
+    assert not (LIFECYCLE.EVALUATION_RENT_CLAIM_ROOT / "active.json").exists()
+
+
 def test_disposal_accepts_vast_instances_null_absence_shape() -> None:
     def runner(command: tuple[str, ...]) -> str:
         if command[:4] == ("vastai", "--raw", "show", "instance"):
@@ -406,6 +524,28 @@ def test_watchdog_and_explicit_disposal_share_one_destroy_lock() -> None:
     assert sum(command[:3] == ("vastai", "destroy", "instance") for command in invoked) == 1
 
 
+def test_destroy_retries_inconsistent_exact_absence_when_account_still_lists_instance() -> None:
+    destroyed = False
+    invoked: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal destroyed
+        invoked.append(command)
+        if command[:3] == ("vastai", "destroy", "instance"):
+            destroyed = True
+            return ""
+        if command[:4] == ("vastai", "--raw", "show", "instance"):
+            return '{"instances":null}'
+        if command[-1] == "instances":
+            return "[]" if destroyed else json.dumps([_healthy_instance()])
+        if command[-1] == "volumes":
+            return "[]"
+        raise AssertionError(command)
+
+    assert LIFECYCLE._destroy_owned_once(99, runner, polls=1) == (True, True, True, True)
+    assert sum(command[:3] == ("vastai", "destroy", "instance") for command in invoked) == 1
+
+
 def test_pretransport_validation_failure_still_cleans_host_and_releases_claim(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     bundle = tmp_path / "wrong.bundle"; bundle.write_bytes(b"wrong")
@@ -450,6 +590,7 @@ def test_pretransport_validation_failure_still_cleans_host_and_releases_claim(tm
 
 def test_disposal_absence_timeout_records_failure_after_exactly_one_destroy(tmp_path: Path) -> None:
     invocation = json.loads(_manifest(tmp_path).read_text())["invocation"]
+    release_id, remote_prefix = _evaluation_release(invocation)
     instance = _write(tmp_path / "instance.json", {
         "kind": "groot_checkpoint_evaluation_instance", "instance_id": 99,
         "rent_claim_path": str(LIFECYCLE.EVALUATION_RENT_CLAIM_ROOT / "active.json"),
@@ -459,7 +600,8 @@ def test_disposal_absence_timeout_records_failure_after_exactly_one_destroy(tmp_
         "kind": "groot_checkpoint_evaluation_publication", "disposable": True,
         "instance_id": 99, "instance_receipt_sha256": hashlib.sha256(instance.read_bytes()).hexdigest(),
         "invocation": invocation, "invocation_sha256": LIFECYCLE.canonical_sha256(invocation),
-        "immutable_revision": "a" * 40, "remote_prefix": "evaluations/x",
+        "immutable_revision": "a" * 40, "repository": "ryanjin333/lehome-groot-n17-data",
+        "release_id": release_id, "remote_prefix": remote_prefix,
         "repository_private": True, "tree_listing_verified": True, "fresh_readback_verified": True,
     })
     invoked: list[tuple[str, ...]] = []

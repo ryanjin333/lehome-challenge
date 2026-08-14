@@ -74,6 +74,7 @@ APPROVED_GROOT_PYTHON = _corrective_module().APPROVED_GROOT_PYTHON
 APPROVED_GROOT_PYTHON_SHA256 = _corrective_module().APPROVED_GROOT_PYTHON_SHA256
 APPROVED_ASSET_REVISION = _corrective_module().APPROVED_ASSET_REVISION
 APPROVED_POLICY_REPOSITORY = "ryanjin333/lehome-groot-n17-models"
+APPROVED_EVALUATION_REPOSITORY = "ryanjin333/lehome-groot-n17-data"
 APPROVED_POLICY_REVISION = "a9076779c970f382bf0341a1015275bf15f13822"
 APPROVED_POLICY_STEP = 12000
 APPROVED_POLICY_ARTIFACT_SHA256 = "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"
@@ -297,6 +298,7 @@ def _resolve_ambiguous_create(
     sleep: Callable[[float], None] = time.sleep,
 ) -> int | None:
     """Identify the only new compatible host after a malformed create reply."""
+    candidate: int | None = None
     for index in range(polls):
         rows = _raw(runner, ("vastai", "--raw", "show", "instances"))
         volumes = _raw(runner, ("vastai", "--raw", "show", "volumes"))
@@ -304,13 +306,21 @@ def _resolve_ambiguous_create(
             return None
         if len(rows) == 1:
             row = rows[0]
-            candidate = row.get("id") if isinstance(row, dict) else None
-            return candidate if type(candidate) is int and candidate > 0 and _approved_host(row, require_running=False) else None
+            observed = row.get("id") if isinstance(row, dict) else None
+            if type(observed) is not int or observed <= 0:
+                return None
+            candidate = observed
+            if _approved_host(row, require_running=False):
+                return candidate
         if rows:
-            return None
+            if len(rows) != 1:
+                return None
         if index + 1 < polls:
             sleep(2.0)
-    return None
+    # The account was empty immediately before create.  A sole positive-ID row
+    # is therefore owned even while Vast is still populating its offer fields;
+    # return it so the failure path destroys it instead of leaking the lease.
+    return candidate
 
 
 def _cleanup_failure(instance_id: int, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object], reason: str, *, sync_attempted: bool = False) -> None:
@@ -417,7 +427,7 @@ def _destroy_owned_once(
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         exact_empty, instances_empty, volumes_empty = _verify_absent(instance_id, runner, polls=1, sleep=sleep)
         destroy_issued = False
-        if not exact_empty:
+        if not exact_empty or not instances_empty:
             runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
             destroy_issued = True
             exact_empty, instances_empty, volumes_empty = _verify_absent(instance_id, runner, polls=polls, sleep=sleep)
@@ -519,14 +529,14 @@ def rent_evaluation(manifest_path: Path, *, lifecycle_root: Path, runner: Callab
         if type(candidate) is not int or candidate <= 0:
             raise RuntimeError("provider create response lacks instance ID")
         instance_id = candidate
-        live = _wait_running(instance_id, runner)
-        if _number(live.get("dph_total")) != evidence["instance_hourly_cost_usd"]:
-            raise ValueError("new instance readback cost differs from preflight offer")
-        invocation = manifest["invocation"]
         lease_started = timestamp
         lease_deadline = lease_started + MAX_WALL_SECONDS
         watchdog_receipt = lifecycle_root / f"watchdog-{instance_id}.json"
         watchdog_pid = watchdog_launcher(instance_id, lease_deadline, watchdog_receipt)
+        live = _wait_running(instance_id, runner)
+        if _number(live.get("dph_total")) != evidence["instance_hourly_cost_usd"]:
+            raise ValueError("new instance readback cost differs from preflight offer")
+        invocation = manifest["invocation"]
         receipt = {
             "schema_version": 1, "kind": "groot_checkpoint_evaluation_instance", "instance_id": instance_id,
             "host": live["ssh_host"], "port": live.get("ssh_port", 22), "invocation_sha256": canonical_sha256(invocation),
@@ -714,8 +724,18 @@ def destroy_after_publication(instance_id: int, publication_receipt: Path, insta
     publication = _publication(publication_receipt)
     instance = _read_json(instance_receipt, "instance receipt")
     invocation = publication.get("invocation")
+    expected_release_id = canonical_sha256({
+        "invocation": invocation,
+        "trial_ids": canonical_trial_ids(),
+        "kind": "diagnostic_evaluation_not_rft",
+    }) if isinstance(invocation, dict) else None
+    expected_prefix = (
+        f"evaluations/groot-n17-step-{invocation.get('policy_step')}/{expected_release_id}"
+        if isinstance(invocation, dict) else None
+    )
     if (
         publication.get("kind") != "groot_checkpoint_evaluation_publication"
+        or publication.get("repository") != APPROVED_EVALUATION_REPOSITORY
         or publication.get("disposable") is not True or publication.get("repository_private") is not True
         or publication.get("tree_listing_verified") is not True or publication.get("fresh_readback_verified") is not True
         or publication.get("instance_id") != instance_id or instance.get("instance_id") != instance_id
@@ -724,7 +744,8 @@ def destroy_after_publication(instance_id: int, publication_receipt: Path, insta
         or not isinstance(invocation, dict) or publication.get("invocation_sha256") != canonical_sha256(invocation)
         or instance.get("invocation_sha256") != canonical_sha256(invocation)
         or not isinstance(publication.get("immutable_revision"), str) or _COMMIT.fullmatch(str(publication["immutable_revision"])) is None
-        or not isinstance(publication.get("remote_prefix"), str) or not publication["remote_prefix"]
+        or publication.get("release_id") != expected_release_id
+        or publication.get("remote_prefix") != expected_prefix
     ):
         raise ValueError("publication receipt is not an exact immutable instance/invocation readback binding")
     try:
