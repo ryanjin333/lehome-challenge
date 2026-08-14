@@ -87,6 +87,17 @@ def _arguments(argv: list[str] | None) -> tuple[int, str, list[str]]:
     remainder = list(parsed.remainder)
     if remainder[:1] == ["--"]:
         remainder.pop(0)
+    if remainder[:2] == ["-m", "lehome_train.groot.runtime_mixture_entrypoint"]:
+        try:
+            official_index = remainder.index("--official-launch")
+            separator = remainder.index("--", official_index + 2)
+            entrypoint = remainder[official_index + 1]
+            official = remainder[separator + 1 :]
+        except (ValueError, IndexError):
+            raise ValueError("chunk runtime launcher requires canonical official launch arguments") from None
+        if not entrypoint.endswith("gr00t/experiment/launch_finetune.py") or not official:
+            raise ValueError("chunk runtime launcher requires the pinned official entrypoint")
+        return parsed.stop_after_step, entrypoint, official
     if not remainder or not remainder[0].endswith("gr00t/experiment/launch_finetune.py"):
         raise ValueError("chunk launcher requires the pinned official entrypoint")
     if parsed.stop_after_step < 0:

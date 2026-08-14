@@ -456,6 +456,7 @@ class RuntimeMixtureDataset(IterableDataset):
         self.global_sample_offset, self.limit = global_sample_offset, limit
         self.explicit_worker_id, self.explicit_worker_count = worker_id, worker_count
         self.rank, self.world_size = rank, world_size
+        self._loader = RangeSourceLoader(contract, decoder=decoder) if processor is not None else None
         self._train: dict[str, list[Window]] = {source.source_id: [] for source in contract.manifest.sources}
         for window in contract.training_windows:
             self._train[window.source_id].append(window)
@@ -483,7 +484,8 @@ class RuntimeMixtureDataset(IterableDataset):
     def _render(self, sample: RuntimeSample) -> Any:
         if self.processor is None:
             return sample
-        payload = RangeSourceLoader(self.contract, decoder=self.decoder).load(sample.window)
+        assert self._loader is not None
+        payload = self._loader.load(sample.window)
         return self.processor(pinned_processor_messages(payload))
 
     def __iter__(self) -> Iterator[Any]:
@@ -501,7 +503,7 @@ class RuntimeMixtureDataset(IterableDataset):
         return dict(self.contract.normalization["statistics"])  # pinned processor expects the statistics payload only
 
     def initial_actions(self) -> list[list[float]]:
-        return [[0.0] * 12 for _ in range(ACTION_HORIZON)]
+        return []
 
     def get_initial_actions(self) -> list[list[float]]:
         return self.initial_actions()
@@ -542,7 +544,7 @@ def pinned_processor_messages(payload: Mapping[str, object], *, backend: object 
     if state_value.shape != (12,) or action_value.shape != (ACTION_HORIZON, 12) or not np.isfinite(state_value).all() or not np.isfinite(action_value).all():
         raise ValueError("runtime VLA numeric drift")
     split = lambda array: {"left_arm": array[..., :5], "left_gripper": array[..., 5:6], "right_arm": array[..., 6:11], "right_gripper": array[..., 11:12]}
-    data = backend.VLAStepData(images={key: [np.asarray(value)[0]] for key, value in images.items()}, states=split(state_value), actions=split(action_value), text=INSTRUCTION, embodiment=backend.EmbodimentTag.NEW_EMBODIMENT)
+    data = backend.VLAStepData(images={key: [np.asarray(value)[0]] for key, value in images.items()}, states={key: value[None, :] for key, value in split(state_value).items()}, actions=split(action_value), text=INSTRUCTION, embodiment=backend.EmbodimentTag.NEW_EMBODIMENT)
     return [{"type": backend.MessageType.EPISODE_STEP.value, "content": data}]
 
 

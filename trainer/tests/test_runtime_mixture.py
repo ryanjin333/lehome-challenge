@@ -154,6 +154,7 @@ def test_pinned_message_is_vla_step_wrapped_in_one_episode_step_message() -> Non
     messages = pinned_processor_messages({"images": {"top_rgb": np.zeros((1, 2, 2, 3), dtype=np.uint8), "left_rgb": np.zeros((1, 2, 2, 3), dtype=np.uint8), "right_rgb": np.zeros((1, 2, 2, 3), dtype=np.uint8)}, "state": [0.0] * 12, "actions": [[0.0] * 12 for _ in range(16)]}, backend=backend)
     assert messages[0]["type"] == "episode_step"
     assert messages[0]["content"].kwargs["actions"]["left_arm"].dtype == np.float32
+    assert messages[0]["content"].kwargs["states"]["left_arm"].shape == (1, 5)
 
 
 def test_window_indexing_and_loader_caches_are_bounded(tmp_path: Path) -> None:
@@ -166,4 +167,4 @@ def test_window_indexing_and_loader_caches_are_bounded(tmp_path: Path) -> None:
     for index in range(20):
         loader._cache(loader._attempt_cache, Path(f"/attempt/{index}"), None)
     assert len(loader._attempt_cache) == loader.cache_cap
-    assert RuntimeMixtureDataset(contract).get_initial_actions() == [[0.0] * 12 for _ in range(16)]
+    assert RuntimeMixtureDataset(contract).get_initial_actions() == []
