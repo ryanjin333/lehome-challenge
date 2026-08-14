@@ -112,6 +112,7 @@ class HubTransport(Protocol):
         repository: str,
         revision: str,
         token: str,
+        remote_prefix: str | None = None,
     ) -> tuple[HubTreeEntry, ...]: ...
 
     def resolve_approved_ref(
@@ -618,6 +619,7 @@ class HuggingFaceHubTransport:
         repository: str,
         revision: str,
         token: str,
+        remote_prefix: str | None = None,
     ) -> tuple[HubTreeEntry, ...]:
         """List every path at one immutable commit using bounded HTTP calls."""
 
@@ -631,6 +633,43 @@ class HuggingFaceHubTransport:
             "revision": revision,
             "token": token,
         }
+        if remote_prefix is not None:
+            validate_artifact_relative_path(remote_prefix, "remote_prefix")
+            try:
+                raw_tree = tuple(
+                    api.list_repo_tree(
+                        **common,
+                        path_in_repo=remote_prefix,
+                        recursive=True,
+                        expand=False,
+                    )
+                )
+            except (ConnectionError, TimeoutError):
+                raise HubTransientError("Hub tree listing timed out") from None
+            entries: list[HubTreeEntry] = []
+            base = remote_prefix + "/"
+            for raw_entry in raw_tree:
+                path = getattr(raw_entry, "path", None)
+                if not isinstance(path, str) or not path.startswith(base):
+                    raise ValueError("Hub bounded tree listing returned an invalid path")
+                raw_type = getattr(raw_entry, "type", None) or getattr(
+                    raw_entry,
+                    "entry_type",
+                    None,
+                )
+                if raw_type in {"symlink", "link"}:
+                    entry_type: Literal["file", "directory", "symlink", "special"] = "symlink"
+                elif type(raw_entry).__name__ == "RepoFile":
+                    entry_type = "file"
+                elif type(raw_entry).__name__ == "RepoFolder":
+                    entry_type = "directory"
+                else:
+                    raise ValueError("Hub bounded tree listing returned an unsupported entry type")
+                entries.append(HubTreeEntry(path, entry_type))
+            final = self._repo_info(repository=repository, revision=revision, token=token)
+            if self._revision(final) != revision:
+                raise ValueError("Hub tree listing revision changed during listing")
+            return tuple(entries)
         try:
             raw_tree = tuple(
                 api.list_repo_tree(
@@ -916,6 +955,7 @@ def list_repository_tree(
     transport: HubTransport,
     repository: str,
     revision: str,
+    remote_prefix: str | None = None,
     environ: Mapping[str, str] | None = None,
     max_attempts: int = 3,
     sleeper: Callable[[float], None] = sleep,
@@ -924,6 +964,8 @@ def list_repository_tree(
 
     if not isinstance(revision, str) or not _COMMIT_REVISION.fullmatch(revision):
         raise ValueError("Hub tree revision must be an immutable 40-character commit")
+    if remote_prefix is not None:
+        validate_artifact_relative_path(remote_prefix, "remote_prefix")
     token = _process_token(environ)
     if type(max_attempts) is not int or max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
@@ -933,6 +975,7 @@ def list_repository_tree(
                 repository=repository,
                 revision=revision,
                 token=token,
+                **({"remote_prefix": remote_prefix} if remote_prefix is not None else {}),
             )
             break
         except HubTransientError:

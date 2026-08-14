@@ -352,7 +352,8 @@ def _remote_files_under_prefix(
     *, transport: HubTransport, repository: str, revision: str, prefix: str,
 ) -> tuple[str, ...]:
     tree = list_repository_tree(
-        transport=transport, repository=repository, revision=revision, max_attempts=1,
+        transport=transport, repository=repository, revision=revision, remote_prefix=prefix,
+        max_attempts=1,
     )
     base = prefix + "/"
     files: set[str] = set()
@@ -522,7 +523,8 @@ def adopt_uploaded_runtime_source(
     entries = _entries(local)
     require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=False)
     tree = list_repository_tree(
-        transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, max_attempts=1,
+        transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+        remote_prefix=prefix, max_attempts=1,
     )
     if not _tree_matches(tree, prefix=prefix, entries=entries):
         raise ValueError("adopted runtime source remote tree differs from the complete local source")
@@ -556,7 +558,8 @@ def verify_uploaded_runtime_source(
     prefix = str(journal["remote_prefix"])
     require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=False)
     tree = list_repository_tree(
-        transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, max_attempts=1,
+        transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+        remote_prefix=prefix, max_attempts=1,
     )
     if not _tree_matches(tree, prefix=prefix, entries=expected_entries):
         raise ValueError("runtime source remote tree differs from the immutable upload journal")
@@ -632,7 +635,10 @@ def publish_source(
             transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
             source=local, entries=entries, remote_prefix=prefix, max_attempts=1,
         )
-    tree = list_repository_tree(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, max_attempts=1)
+    tree = list_repository_tree(
+        transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+        remote_prefix=prefix, max_attempts=1,
+    )
     if not _tree_matches(tree, prefix=prefix, entries=entries):
         raise ValueError("source publication remote tree differs from the complete local source")
     _write_source_upload_journal(
@@ -656,7 +662,10 @@ def publish_pending_mixture(*, pending_root: str | Path, revision: str, receipt_
     entries = _entries(root)
     require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=True)
     immutable = upload_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, source=root, entries=entries, remote_prefix=prefix, max_attempts=1)
-    tree = list_repository_tree(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=immutable, max_attempts=1)
+    tree = list_repository_tree(
+        transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=immutable,
+        remote_prefix=prefix, max_attempts=1,
+    )
     if not _tree_matches(tree, prefix=prefix, entries=entries):
         raise ValueError("mixture publication remote tree differs from the complete pending artifact")
     with tempfile.TemporaryDirectory(prefix="lehome-mixture-readback-") as temporary:
@@ -747,7 +756,10 @@ def finalize_pending_mixture(
         entries = _entries(staging)
         require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=True)
         immutable = upload_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, source=staging, entries=entries, remote_prefix=str(pending["prefix"]), max_attempts=1)
-        tree = list_repository_tree(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=immutable, max_attempts=1)
+        tree = list_repository_tree(
+            transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=immutable,
+            remote_prefix=str(pending["prefix"]), max_attempts=1,
+        )
         if not _tree_matches(tree, prefix=str(pending["prefix"]), entries=entries):
             raise ValueError("runtime deployment remote tree differs from finalized bytes")
         with tempfile.TemporaryDirectory(prefix="lehome-runtime-final-readback-") as temporary:

@@ -1022,6 +1022,63 @@ def test_real_transport_lists_complete_tree_at_explicit_commit_with_token(
     ]
 
 
+@pytest.mark.parametrize(
+    ("unknown", "final_drift"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_real_transport_lists_one_immutable_prefix_without_expansion_or_file_rescan(
+    monkeypatch: pytest.MonkeyPatch, unknown: bool, final_drift: bool,
+) -> None:
+    revision = "d" * 40
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class RepoFolder:
+        def __init__(self, path: str) -> None:
+            self.path, self.tree_id = path, "tree"
+
+    class RepoFile:
+        def __init__(self, path: str) -> None:
+            self.path, self.blob_id, self.size = path, "blob", 1
+
+    class FakeApi:
+        def list_repo_tree(self, **kwargs: object) -> list[object]:
+            calls.append(("tree", kwargs))
+            entries: list[object] = [RepoFolder("rollouts/round-1/shards"), RepoFile("rollouts/round-1/shards/0001.bin")]
+            return entries + ([SimpleNamespace(path="rollouts/round-1/unknown")] if unknown else [])
+
+        def list_repo_files(self, **_kwargs: object) -> list[str]:
+            raise AssertionError("bounded prefix tree must not rescan all repository files")
+
+    transport = HuggingFaceHubTransport(timeout_seconds=19.0)
+    monkeypatch.setattr(transport, "_api", lambda _token: FakeApi())
+    observed_revisions = iter((revision, "e" * 40 if final_drift else revision))
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(sha=next(observed_revisions)),
+    )
+
+    if unknown or final_drift:
+        with pytest.raises(ValueError, match="unsupported|changed"):
+            transport.list_tree(
+                repository="ryanjin333/lehome-groot-n17-models", revision=revision,
+                remote_prefix="rollouts/round-1", token="hf_explicit_tree_token",
+            )
+    else:
+        assert transport.list_tree(
+            repository="ryanjin333/lehome-groot-n17-models", revision=revision,
+            remote_prefix="rollouts/round-1", token="hf_explicit_tree_token",
+        ) == (
+            hub_module.HubTreeEntry("rollouts/round-1/shards", "directory"),
+            hub_module.HubTreeEntry("rollouts/round-1/shards/0001.bin", "file"),
+        )
+    assert calls == [("tree", {
+        "repo_id": "ryanjin333/lehome-groot-n17-models", "repo_type": "model",
+        "revision": revision, "token": "hf_explicit_tree_token",
+        "path_in_repo": "rollouts/round-1", "recursive": True, "expand": False,
+    })]
+
+
 def test_real_transport_resolves_only_an_approved_ref_to_an_immutable_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

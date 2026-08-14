@@ -93,11 +93,14 @@ class MemoryTransport:
         self.calls.append(("resolve", ref, None))
         return self.branch_head
 
-    def list_tree(self, *, repository: str, revision: str, token: str) -> tuple[HubTreeEntry, ...]:
+    def list_tree(
+        self, *, repository: str, revision: str, token: str,
+        remote_prefix: str | None = None,
+    ) -> tuple[HubTreeEntry, ...]:
         assert repository == REPOSITORY and token == TOKEN
         if self.expected_revision is not None:
             assert revision == self.expected_revision
-        self.calls.append(("tree", revision, None))
+        self.calls.append(("tree", revision, remote_prefix))
         if self.fault == "list":
             raise OSError("tree failed")
         return tuple(HubTreeEntry(path, "file") for path in sorted(self.remote))
@@ -138,7 +141,8 @@ def test_source_publisher_proves_complete_remote_tree_and_fresh_bytes_without_mu
     _source(source)
     receipt_path.parent.mkdir()
     before = source_tree_sha256(source)
-    receipt = publish_source(root=source, source_type="bc", round_id=None, revision="draft", receipt_path=receipt_path, transport=MemoryTransport())
+    transport = MemoryTransport()
+    receipt = publish_source(root=source, source_type="bc", round_id=None, revision="draft", receipt_path=receipt_path, transport=transport)
 
     assert receipt == {
         "repository": REPOSITORY, "immutable_revision": REVISION,
@@ -147,6 +151,7 @@ def test_source_publisher_proves_complete_remote_tree_and_fresh_bytes_without_mu
     }
     assert source_tree_sha256(source) == before
     assert receipt_path.is_file() and not (source / "bc.json").exists()
+    assert ("tree", REVISION, "bc/full") in transport.calls
 
 
 def test_large_source_stages_only_the_exact_prefixed_allowlist_then_binds_the_final_head(
