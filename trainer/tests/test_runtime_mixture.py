@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import sys
+import types
 from collections import Counter
 from dataclasses import replace
 from itertools import islice
@@ -53,16 +56,24 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
         _write(bc / f"episodes/{episode}.json", {"episode_id": str(episode)})
     attempts = [_round(round_root, f"attempt-{number}") for number in range(3)]
     normalization = tmp_path / "mixture-normalization.json"
-    statistics = {
-        "state": {name: [float(index) for index in range(12)] for name in ("min", "max", "mean", "std", "q01", "q99")},
-        "action": {name: [float(index) for index in range(12)] for name in ("min", "max", "mean", "std", "q01", "q99")},
+    def grouped(dimensions: int) -> dict[str, list[float]]:
+        return {name: [float(index) for index in range(dimensions)] for name in ("min", "max", "mean", "std", "q01", "q99")}
+    statistics = {"new_embodiment": {
+        "state": {
+            "left_arm": grouped(5), "left_gripper": grouped(1),
+            "right_arm": grouped(5), "right_gripper": grouped(1),
+        },
+        "action": {
+            "left_arm": grouped(5), "left_gripper": grouped(1),
+            "right_arm": grouped(5), "right_gripper": grouped(1),
+        },
         "relative_action": {
             "left_arm": {name: [float(index) for index in range(5)] for name in ("min", "max", "mean", "std", "q01", "q99")},
             "left_gripper": {name: [0.0] for name in ("min", "max", "mean", "std", "q01", "q99")},
             "right_arm": {name: [float(index) for index in range(5)] for name in ("min", "max", "mean", "std", "q01", "q99")},
             "right_gripper": {name: [0.0] for name in ("min", "max", "mean", "std", "q01", "q99")},
         },
-    }
+    }}
     _write(normalization, {"schema_version": 3, "train_only": True, "derivation": {"train_window_ids": [f"bc-{index}" for index in range(7)] + [f"rollout-{index}" for index in range(3)], "sample_count": 160}, "statistics": statistics})
     sources = [
         {"source_id": "bc", "source_type": "bc", "quota": 7, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(bc), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(bc / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(bc / "acceptance.json"), "publication": {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "b" * 40, "prefix": "bc/full", "readback_receipt_path": "publication-readback.json", "readback_receipt_sha256": _sha_path(bc / "publication-readback.json")}, "source_identity": {"prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": _sha_path(bc / "manifest.json"), "action_source": "organizer_expert"}},
@@ -124,8 +135,46 @@ def test_dataset_exposes_exact_pinned_statistics_payload(tmp_path: Path) -> None
     contract = load_runtime_contract(*(_contract(tmp_path)[::2]))
 
     assert set(RuntimeMixtureDataset(contract).get_dataset_statistics()) == {
-        "state", "action", "relative_action",
+        "new_embodiment",
     }
+
+
+def test_statistics_integrate_with_the_pinned_state_action_processor(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture import RuntimeMixtureDataset, load_runtime_contract
+
+    pinned = "/private/tmp/lehome-corrective-live/final-run-c105615/persistent-training/Isaac-GR00T"
+    if not Path(pinned).is_dir():
+        pytest.skip("pinned Isaac-GR00T checkout is unavailable")
+    # The checked-in processor only needs scipy for pose operations, which this
+    # statistics-only integration does not execute. Keep the actual pinned
+    # StateActionProcessor while stubbing that unavailable optional dependency.
+    scipy = types.ModuleType("scipy")
+    spatial = types.ModuleType("scipy.spatial")
+    transform = types.ModuleType("scipy.spatial.transform")
+    interpolate = types.ModuleType("scipy.interpolate")
+    transform.Rotation = type("Rotation", (), {})
+    transform.Slerp = type("Slerp", (), {})
+    scipy.spatial = spatial
+    spatial.transform = transform
+    scipy.interpolate = interpolate
+    sys.modules.setdefault("scipy", scipy)
+    sys.modules.setdefault("scipy.spatial", spatial)
+    sys.modules.setdefault("scipy.spatial.transform", transform)
+    sys.modules.setdefault("scipy.interpolate", interpolate)
+    sys.path.insert(0, pinned)
+    try:
+        from gr00t.data.state_action.state_action_processor import StateActionProcessor
+    finally:
+        sys.path.remove(pinned)
+    contract = load_runtime_contract(*(_contract(tmp_path)[::2]))
+    processor = StateActionProcessor(modality_configs={"new_embodiment": {
+        "state": {"delta_indices": [0], "modality_keys": ["left_arm", "left_gripper", "right_arm", "right_gripper"]},
+        "action": {"delta_indices": list(range(16)), "modality_keys": ["left_arm", "left_gripper", "right_arm", "right_gripper"]},
+    }})
+
+    processor.set_statistics(RuntimeMixtureDataset(contract).get_dataset_statistics(), override=True)
+
+    assert processor.norm_params["new_embodiment"]["action"]["right_arm"]["min"].shape == (5,)
 
 
 def test_contract_rejects_normalization_not_derived_from_exact_train_windows(tmp_path: Path) -> None:
@@ -196,14 +245,58 @@ def test_authenticated_resume_seed_resets_to_exact_global_batch_offset(tmp_path:
         contract, expected_global_step=10, global_batch_size=10, limit=160,
         worker_id=0, worker_count=workers,
     )
-    resumed.seed(10)
-    resumed.reset_seed()
+    assert resumed.seed == contract.manifest.schedule_seed
+    resumed.reset_seed(contract.manifest.schedule_seed + 10)
     assert resumed.global_sample_offset == 100
     assert [item.sample_id for item in resumed] == [
         item.sample_id for item in uninterrupted[100::workers]
     ]
     with pytest.raises(ValueError, match="authenticated checkpoint"):
-        resumed.seed(9)
+        resumed.reset_seed(contract.manifest.schedule_seed + 9)
+
+
+def test_pinned_gr00t_trainer_get_train_dataloader_resets_the_authenticated_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lehome_train.groot.runtime_mixture import RuntimeMixtureDataset, load_runtime_contract
+
+    pinned = Path("/private/tmp/lehome-corrective-live/final-run-c105615/persistent-training/Isaac-GR00T/gr00t/experiment/trainer.py")
+    if not pinned.is_file():
+        pytest.skip("pinned Isaac-GR00T trainer is unavailable")
+    captured: dict[str, object] = {}
+    torch = types.ModuleType("torch")
+    torch.utils = types.SimpleNamespace(data=types.SimpleNamespace(DataLoader=lambda dataset, **kwargs: captured.update(dataset=dataset, kwargs=kwargs) or "pinned-loader"))
+    trainer_module = types.ModuleType("transformers.trainer")
+    trainer_module.TRAINER_STATE_NAME = "trainer_state.json"
+    trainer_module.Trainer = type("Trainer", (), {})
+    trainer_module.TrainerState = type("TrainerState", (), {})
+    trainer_module.get_last_checkpoint = lambda _path: None
+    callback_module = types.ModuleType("transformers.trainer_callback")
+    callback_module.TrainerCallback = object
+    utils_module = types.ModuleType("transformers.trainer_utils")
+    utils_module.EvalPrediction = object
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "transformers", types.ModuleType("transformers"))
+    monkeypatch.setitem(sys.modules, "transformers.trainer", trainer_module)
+    monkeypatch.setitem(sys.modules, "transformers.trainer_callback", callback_module)
+    monkeypatch.setitem(sys.modules, "transformers.trainer_utils", utils_module)
+    spec = importlib.util.spec_from_file_location("pinned_gr00t_trainer", pinned)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    contract = load_runtime_contract(*(_contract(tmp_path)[::2]))
+    dataset = RuntimeMixtureDataset(contract, expected_global_step=10, global_batch_size=10)
+    trainer = object.__new__(module.Gr00tTrainer)
+    trainer.args = types.SimpleNamespace(ignore_data_skip=False, dataloader_num_workers=0, dataloader_pin_memory=False)
+    trainer.state = types.SimpleNamespace(global_step=10)
+    trainer.train_dataset = dataset
+    trainer.data_collator = lambda value: value
+    trainer._get_collator_with_removed_columns = lambda value, **_kwargs: value
+    trainer._train_batch_size = 1
+
+    assert trainer.get_train_dataloader() == "pinned-loader"
+    assert dataset.global_sample_offset == 100
+    assert captured["dataset"] is dataset
 
 
 @pytest.mark.parametrize("workers", (0, 1, 4))

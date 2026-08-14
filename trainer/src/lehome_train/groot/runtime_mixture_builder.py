@@ -134,6 +134,16 @@ def _stats(rows: Iterable[list[float]], dimensions: int) -> dict[str, list[float
     return answer
 
 
+def _joint_groups(statistics: Mapping[str, list[float]]) -> dict[str, dict[str, list[float]]]:
+    """Split the 12-D LeHome vector into pinned GR00T joint-group statistics."""
+
+    slices = {"left_arm": slice(0, 5), "left_gripper": slice(5, 6), "right_arm": slice(6, 11), "right_gripper": slice(11, 12)}
+    return {
+        group: {field: list(statistics[field][indices]) for field in ("min", "max", "mean", "std", "q01", "q99")}
+        for group, indices in slices.items()
+    }
+
+
 def _accepted_from_campaign(receipt: Mapping[str, Any]) -> dict[str, str]:
     attempts = receipt.get("attempt_receipts")
     if not isinstance(attempts, list):
@@ -246,10 +256,10 @@ def _normalization_statistics(windows: list[dict[str, Any]], *, organizer_root: 
             relative["left_gripper"].append([action[5]])
             relative["right_arm"].append([action[index] - current[index] for index in range(6, 11)])
             relative["right_gripper"].append([action[11]])
-    return {"state": _stats(states, 12), "action": _stats(actions, 12), "relative_action": {name: _stats(rows, 5 if name.endswith("arm") else 1) for name, rows in relative.items()}}
+    return {"new_embodiment": {"state": _joint_groups(_stats(states, 12)), "action": _joint_groups(_stats(actions, 12)), "relative_action": {name: _stats(rows, 5 if name.endswith("arm") else 1) for name, rows in relative.items()}}}
 
 
-def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Path, disposal_receipt: str | Path, release_binding: str | Path, plan_state: str | Path, destination: str | Path) -> dict[str, Any]:
+def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Path, source_publications: str | Path, selected_bindings: str | Path, plan_state: str | Path, destination: str | Path) -> dict[str, Any]:
     """Create immutable local publication-pending bytes, never an authorized run."""
     organizer, campaign, destination = Path(organizer_root), Path(campaign_root), Path(destination)
     state = _load(Path(plan_state), "persisted mix-plan state"); plan = state.get("plan")
@@ -257,8 +267,8 @@ def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Pa
         raise ValueError("persisted plan hash is invalid")
     organizer_manifest = organizer / "manifest.json"; organizer_hash = sha256_file(organizer_manifest)
     campaign_receipt = campaign / "campaign-receipt.json"; receipt = _load(campaign_receipt, "campaign receipt")
-    selected_document = _load(Path(release_binding).parent.parent / "selected-bindings.json", "selected rollout bindings")
-    selected_rows = selected_document.get("selected")
+    selected_document = _load(Path(selected_bindings), "selected rollout bindings")
+    selected_rows = selected_document.get("selected_bindings")
     if not isinstance(selected_rows, list):
         raise ValueError("selected rollout bindings are malformed")
     selected = {item.get("attempt_id"): item.get("episode_manifest_sha256") for item in selected_rows if isinstance(item, dict) and type(item.get("attempt_id")) is str and type(item.get("episode_manifest_sha256")) is str}
@@ -269,7 +279,7 @@ def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Pa
     if destination.exists():
         raise FileExistsError("runtime mixture destination is immutable; choose an explicit new destination")
     publications = _source_publications(
-        Path(release_binding), {"organizer": organizer, "rollout": campaign}
+        Path(source_publications), {"organizer": organizer, "rollout": campaign}
     )
     staging = destination.parent / f".{destination.name}.{plan['sha256'][:12]}.tmp"
     if staging.exists():
@@ -295,7 +305,7 @@ def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Pa
         _write(staging / "windows.json", {"schema_version": 3, "windows": converted})
         pending = {"schema_version": 1, "kind": "runtime_mixture_publication_pending", "repository": APPROVED_MIXTURE_REPOSITORY, "mixture_id": mixture_id, "prefix": f"mixtures/{mixture_id}", "sources": source_entries, "normalization_sha256": sha256_file(staging / "mixture-normalization.json"), "windows_sha256": sha256_file(staging / "windows.json"), "publication_pending": True}
         _write(staging / "publication-pending.json", pending)
-        receipt_value = {"schema_version": 3, "kind": "runtime_mixture_generation", "publication_pending": True, "plan_sha256": plan["sha256"], "mixture_id": mixture_id, "prefix": pending["prefix"], "unique_windows": len(converted), "train_windows": sum(item["split"] == "train" for item in converted), "bc_train_windows": sum(item["source_type"] == "bc" and item["split"] == "train" for item in converted), "bc_validation_windows": sum(item["source_type"] == "bc" and item["split"] == "validation" for item in converted), "rollout_train_windows": sum(item["source_type"] == "rollout" and item["split"] == "train" for item in converted), "source_readback": {"source_publications_sha256": sha256_file(release_binding)}}
+        receipt_value = {"schema_version": 3, "kind": "runtime_mixture_generation", "publication_pending": True, "plan_sha256": plan["sha256"], "mixture_id": mixture_id, "prefix": pending["prefix"], "unique_windows": len(converted), "train_windows": sum(item["split"] == "train" for item in converted), "bc_train_windows": sum(item["source_type"] == "bc" and item["split"] == "train" for item in converted), "bc_validation_windows": sum(item["source_type"] == "bc" and item["split"] == "validation" for item in converted), "rollout_train_windows": sum(item["source_type"] == "rollout" and item["split"] == "train" for item in converted), "source_readback": {"source_publications_sha256": sha256_file(source_publications), "selected_bindings_sha256": sha256_file(selected_bindings)}}
         _write(staging / "generation-receipt.json", receipt_value)
         os.replace(staging, destination)
         return receipt_value
@@ -311,7 +321,7 @@ def build_from_request(path: str | Path) -> dict[str, Any]:
     if set(request) != required or request["schema_version"] != 1 or request["command"] != "build-runtime-mixture" or not isinstance(request["arguments"], dict):
         raise ValueError("runtime mixture build request has an incompatible schema")
     arguments = request["arguments"]
-    expected = {"organizer_root", "campaign_root", "disposal_receipt", "release_binding", "plan_state", "destination"}
+    expected = {"organizer_root", "campaign_root", "source_publications", "selected_bindings", "plan_state", "destination"}
     if set(arguments) != expected or not all(type(arguments[key]) is str and arguments[key] for key in expected):
         raise ValueError("runtime mixture build request arguments are incomplete or unknown")
     return build_runtime_mixture(**arguments)

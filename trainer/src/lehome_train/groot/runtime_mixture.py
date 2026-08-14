@@ -545,15 +545,18 @@ def _validate_normalization(value: object, windows: tuple[Window, ...]) -> dict[
     statistics = value["statistics"]
     if not isinstance(statistics, dict):
         raise ValueError("normalization statistics must be an object")
-    _exact(statistics, {"state", "action", "relative_action"}, label="normalization statistics")
-    _validate_stat_vector(statistics["state"], dimensions=12, label="normalization state")
-    _validate_stat_vector(statistics["action"], dimensions=12, label="normalization action")
-    relative = statistics["relative_action"]
-    if not isinstance(relative, dict):
-        raise ValueError("normalization relative_action must be an object")
-    _exact(relative, set(_RELATIVE_ACTION_DIMENSIONS), label="normalization relative_action")
-    for name, dimensions in _RELATIVE_ACTION_DIMENSIONS.items():
-        _validate_stat_vector(relative[name], dimensions=dimensions, label=f"normalization relative_action {name}")
+    _exact(statistics, {"new_embodiment"}, label="normalization statistics")
+    embodiment = statistics["new_embodiment"]
+    if not isinstance(embodiment, dict):
+        raise ValueError("normalization new_embodiment must be an object")
+    _exact(embodiment, {"state", "action", "relative_action"}, label="normalization new_embodiment")
+    for modality in ("state", "action", "relative_action"):
+        groups = embodiment[modality]
+        if not isinstance(groups, dict):
+            raise ValueError(f"normalization {modality} must be an object")
+        _exact(groups, set(_RELATIVE_ACTION_DIMENSIONS), label=f"normalization {modality}")
+        for name, dimensions in _RELATIVE_ACTION_DIMENSIONS.items():
+            _validate_stat_vector(groups[name], dimensions=dimensions, label=f"normalization {modality} {name}")
     return dict(statistics)
 
 
@@ -655,7 +658,9 @@ class RuntimeMixtureDataset(IterableDataset):
             raise ValueError("global batch requires an authenticated checkpoint cursor")
         self.global_sample_offset, self.limit = global_sample_offset, limit
         self.expected_global_step, self.global_batch_size = expected_global_step, global_batch_size
-        self._seeded_global_step: int | None = None
+        # Pinned Gr00tTrainer reads this integer and calls
+        # reset_seed(self.seed + checkpoint_global_step) on resume.
+        self.seed = contract.manifest.schedule_seed
         self.explicit_worker_id, self.explicit_worker_count = worker_id, worker_count
         self.rank, self.world_size = rank, world_size
         self._loader = RangeSourceLoader(contract, decoder=decoder) if processor is not None else None
@@ -663,19 +668,13 @@ class RuntimeMixtureDataset(IterableDataset):
         for window in contract.training_windows:
             self._train[window.source_id].append(window)
 
-    def seed(self, global_step: int) -> None:
-        """Authenticate the trainer's resume boundary before worker iteration.
-
-        This is deliberately not a random seed: the immutable schedule already
-        owns randomness.  The only accepted value is the checkpoint's global
-        optimizer step bound in the operational runtime request.
-        """
-        if self.expected_global_step is None or type(global_step) is not int or global_step != self.expected_global_step:
-            raise ValueError("dataset seed does not match authenticated checkpoint global step")
-        self._seeded_global_step = global_step
-
-    def reset_seed(self) -> None:
-        if self.expected_global_step is None or self._seeded_global_step != self.expected_global_step:
+    def reset_seed(self, new_seed: int) -> None:
+        """Accept the pinned trainer cursor only when it names this checkpoint."""
+        if (
+            self.expected_global_step is None
+            or type(new_seed) is not int
+            or new_seed != self.seed + self.expected_global_step
+        ):
             raise ValueError("dataset reset requires the authenticated checkpoint seed")
         assert self.global_batch_size is not None
         self.global_sample_offset = self.expected_global_step * self.global_batch_size

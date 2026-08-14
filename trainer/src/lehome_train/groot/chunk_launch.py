@@ -328,10 +328,12 @@ def main(argv: list[str] | None = None) -> None:
             if actual_step != expected_runtime_step:
                 raise ValueError("runtime checkpoint step does not match authenticated runtime resume binding")
             dataset = getattr(trainer, "train_dataset", None)
-            if dataset is None or not callable(getattr(dataset, "seed", None)) or not callable(getattr(dataset, "reset_seed", None)):
+            if dataset is None or type(getattr(dataset, "seed", None)) is not int or not callable(getattr(dataset, "reset_seed", None)):
                 raise ValueError("pinned trainer did not expose a seed-resettable runtime dataset")
-            dataset.seed(actual_step)
-            dataset.reset_seed()
+            # Gr00tTrainer.get_train_dataloader performs the pinned
+            # reset_seed(dataset.seed + state.global_step) call.  Do not
+            # pre-reset here, or an arbitrary Trainer implementation could
+            # bypass that exact upstream resume contract.
         return original_train(trainer, *args, **kwargs)
 
     Trainer.train = bounded_train

@@ -259,8 +259,8 @@ def test_runtime_chunk_authenticates_checkpoint_step_before_resetting_dataset_se
     seen: list[object] = []
 
     class Dataset:
-        def seed(self, step: int) -> None: seen.append(("seed", step))
-        def reset_seed(self) -> None: seen.append("reset")
+        seed = 17
+        def reset_seed(self, _new_seed: int) -> None: seen.append("reset")
 
     class FakeTrainer:
         def __init__(self) -> None:
@@ -283,4 +283,4 @@ def test_runtime_chunk_authenticates_checkpoint_step_before_resetting_dataset_se
 
     chunk_launch.main(["--stop-after-step", "11", "--", *wrapper])
 
-    assert seen == [("seed", 10), "reset", "train"]
+    assert seen == ["train"]
