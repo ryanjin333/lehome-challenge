@@ -257,7 +257,7 @@ def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: 
         if command[:4] == ("vastai", "--raw", "show", "instances"): return "[]"
         if command[:4] == ("vastai", "--raw", "show", "volumes"): return "[]"
         if command[:4] == ("vastai", "--raw", "create", "instance"): return '{"new_contract":9}'
-        if command[:4] == ("vastai", "--raw", "show", "instance"): return '{"id":9,"gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"ssh_host":"host","ssh_port":22,"driver_version":"595.71.05"}'
+        if command[:4] == ("vastai", "--raw", "show", "instance"): return '{"id":9,"actual_status":"running","gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"ssh_host":"host","ssh_port":22,"driver_version":"595.71.05"}'
         if command[:3] == ("vastai", "destroy", "instance"): return ""
         raise AssertionError(command)
     monkeypatch.setattr(LIFECYCLE.time, "time", lambda: 100)
@@ -950,10 +950,10 @@ def test_bootstrap_canary_uses_only_historical_image_and_binds_instance_receipt(
         if command[:4] == ("vastai", "--raw", "create", "instance"):
             return '{"new_contract":9}'
         if command[:4] == ("vastai", "--raw", "show", "instance"):
-            return '{"id":9,"gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"ssh_host":"host","ssh_port":22}'
+            return '{"id":9,"actual_status":"running","gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"ssh_host":"host","ssh_port":22}'
         if command[0] == "scp":
             return ""
-        if command[0] == "ssh" and "sha256sum" in command[-1]:
+        if command[0] == "ssh" and command[-1].startswith("sha256sum "):
             return hashlib.sha256(bundle_path.read_bytes()).hexdigest() + "  code.bundle\n"
         if command[0] == "ssh":
             return json.dumps({"hardware": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "driver_version": "595.71.05", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0", "optimizer_step": {"passed": True, "loss": .2}, "nvml": {"utilization_percent": 80}})
@@ -1056,7 +1056,7 @@ def test_bootstrap_canary_stages_current_code_and_cleans_up_after_probe_failure(
         if command[:4] == ("vastai", "--raw", "show", "instances"): return "[]"
         if command[:4] == ("vastai", "--raw", "show", "volumes"): return "[]"
         if command[:4] == ("vastai", "--raw", "create", "instance"): return '{"new_contract":9}'
-        if command[:4] == ("vastai", "--raw", "show", "instance"): return "{}" if destroyed else '{"id":9,"gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"ssh_host":"host","ssh_port":22}'
+        if command[:4] == ("vastai", "--raw", "show", "instance"): return "{}" if destroyed else '{"id":9,"actual_status":"running","gpu_name":"RTX PRO 6000 WS","num_gpus":1,"gpu_ram":96000,"dph_total":0.7,"ssh_host":"host","ssh_port":22}'
         if command[:3] == ("vastai", "destroy", "instance"):
             destroyed = True
             return ""
@@ -1410,6 +1410,8 @@ def _runtime_pilot_offer_evidence(*, failure_receipt: str) -> dict[str, object]:
         "raw_offer_sha256": LIFECYCLE._hash(offer), "account_hourly_total_usd": .18,
         "captured_at_unix": int(time.time()), "expires_at_unix": int(time.time()) + 60,
         "search_mode": "on_demand", "platform_arch": "amd64", "storage_gb": 120,
+        "trainer_image": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE,
+        "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2],
         "failure_receipt": failure_receipt, "code_revision": "a" * 40,
         "code_bundle_sha256": "b" * 64,
         "bc_readback_receipt": str(paths["bc"]),
@@ -1456,7 +1458,7 @@ def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_pa
     assert receipt["kind"] == "runtime_mixture_cpu_pilot_instance"
     assert receipt["platform_arch"] == "x86_64"
     assert LIFECYCLE.RUNTIME_PILOT_READINESS_POLLS == 120 and sleeps == [5.0, 5.0]
-    assert ("vastai", "--raw", "create", "instance", "8", "--image", LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "--disk", "120", "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE) in commands
+    assert ("vastai", "--raw", "create", "instance", "8", "--image", LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE, "--disk", "120", "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE) in commands
 
 
 def test_runtime_pilot_live_readback_accepts_real_null_reliability_but_binds_machine_price_and_gpu() -> None:
@@ -1602,7 +1604,8 @@ def _runtime_pilot_request_files(tmp_path: Path) -> tuple[dict[str, object], dic
     instance = {
         "schema_version": 1, "kind": "runtime_mixture_cpu_pilot_instance",
         "instance_id": 44, "host": "native-x86", "port": 22, "platform_arch": "x86_64",
-        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "offer_evidence_sha256": "1" * 64,
+        "trainer_image": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE,
+        "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2], "offer_evidence_sha256": "1" * 64,
         "provider_response_sha256": "2" * 64, "account_hourly_total_usd": .18,
     }
     request = {
@@ -1610,6 +1613,21 @@ def _runtime_pilot_request_files(tmp_path: Path) -> tuple[dict[str, object], dic
         "deployment_receipt": paths["deployment"], "code_revision": "3" * 40,
         "code_bundle_sha256": "4" * 64, "lifecycle_receipt": str(tmp_path / "pilot-lifecycle.json"),
     }
+    bootstrap = {
+        "schema_version": 1, "kind": "runtime_mixture_bootstrap_stage", "instance_id": 44,
+        "provider_response_sha256": "2" * 64, "platform_arch": "x86_64",
+        "trainer_image": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE,
+        "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2],
+        "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64,
+        "bc_revision": "a" * 40, "rollout_revision": "b" * 40,
+        "deployment_revision": "c" * 40, "bc_receipt_sha256": LIFECYCLE.sha256_file(Path(paths["bc"])),
+        "rollout_receipt_sha256": LIFECYCLE.sha256_file(Path(paths["rollout"])),
+        "deployment_receipt_sha256": LIFECYCLE.sha256_file(Path(paths["deployment"])),
+        "transfers": [{"name": "code.bundle", "sha256": "5" * 64}],
+    }
+    bootstrap_path = tmp_path / "bootstrap.json"
+    bootstrap_path.write_text(json.dumps(bootstrap), encoding="utf-8")
+    request["bootstrap_receipt"] = str(bootstrap_path)
     return instance, request
 
 
@@ -1621,7 +1639,7 @@ def _schema4_pilot(*, instance_id: int, provider_sha: str, code_revision: str, c
         "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24],
         "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {},
         "timing_rows": [{"worker_count": count, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 100.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for count in [0, 4, 8, 16, 24]],
-        "authenticated_evidence": {"provider_instance_id": instance_id, "provider_response_sha256": provider_sha, "platform_arch": "x86_64", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "code_revision": code_revision, "code_bundle_sha256": code_sha, "bc_revision": bc_revision, "rollout_revision": rollout_revision, "deployment_revision": deployment_revision},
+        "authenticated_evidence": {"provider_instance_id": instance_id, "provider_response_sha256": provider_sha, "platform_arch": "x86_64", "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2], "code_revision": code_revision, "code_bundle_sha256": code_sha, "bc_revision": bc_revision, "rollout_revision": rollout_revision, "deployment_revision": deployment_revision},
         "cache_cap": 1, "native_x86_required": True, "timeout_seconds": 60.0, "canonical_completion": True,
     }
 
@@ -1635,7 +1653,7 @@ def test_runtime_cpu_pilot_executes_only_loader_cli_and_persists_bound_lifecycle
         "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24],
         "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {},
         "timing_rows": [{"worker_count": count, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 100.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for count in [0, 4, 8, 16, 24]],
-        "authenticated_evidence": {"provider_instance_id": 44, "provider_response_sha256": "2" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40},
+        "authenticated_evidence": {"provider_instance_id": 44, "provider_response_sha256": "2" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2], "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40},
         "cache_cap": 1, "native_x86_required": True, "timeout_seconds": 60.0,
         "canonical_completion": True,
     }
@@ -1652,6 +1670,9 @@ def test_runtime_cpu_pilot_executes_only_loader_cli_and_persists_bound_lifecycle
     assert persisted["instance_id"] == 44
     assert persisted["deployment_revision"] == "c" * 40
     assert persisted["pilot_receipt"]["gpu_initialized"] is False
+    assert persisted["trainer_image"] == LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE
+    assert "parent_checkpoint_artifact_sha256" not in persisted
+    assert persisted["staged_transfers"] == [{"name": "code.bundle", "sha256": "5" * 64}]
 
 
 def test_runtime_cpu_pilot_destroy_requires_untampered_bound_pilot_lifecycle(tmp_path: Path) -> None:
@@ -1659,9 +1680,12 @@ def test_runtime_cpu_pilot_destroy_requires_untampered_bound_pilot_lifecycle(tmp
     lifecycle = {
         "schema_version": 1, "kind": "runtime_mixture_cpu_pilot_lifecycle", "instance_id": 44,
         "provider_response_sha256": "2" * 64, "platform_arch": "x86_64",
-        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "code_revision": "3" * 40,
+        "trainer_image": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE,
+        "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2], "code_revision": "3" * 40,
         "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40,
         "deployment_revision": "c" * 40, "deployment_receipt_sha256": LIFECYCLE.sha256_file(Path(str(request["deployment_receipt"]))),
+        "bootstrap_receipt_sha256": LIFECYCLE.sha256_file(Path(str(request["bootstrap_receipt"]))),
+        "staged_transfers": [{"name": "code.bundle", "sha256": "5" * 64}],
         "pilot_receipt": _schema4_pilot(instance_id=44, provider_sha="2" * 64, code_revision="3" * 40, code_sha="4" * 64, bc_revision="a" * 40, rollout_revision="b" * 40, deployment_revision="c" * 40),
     }
     calls: list[tuple[str, ...]] = []
@@ -1680,6 +1704,17 @@ def test_runtime_cpu_pilot_destroy_requires_untampered_bound_pilot_lifecycle(tmp
     lifecycle["pilot_receipt"]["authenticated_evidence"]["provider_instance_id"] = 45  # type: ignore[index]
     with pytest.raises(ValueError, match="pilot"):
         LIFECYCLE.destroy_runtime_cpu_pilot(instance_id=44, lifecycle_receipt=lifecycle, runner=runner)
+
+
+def test_runtime_cpu_bootstrap_receipt_rejects_source_or_deployment_receipt_drift(tmp_path: Path) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    path = Path(str(request["bootstrap_receipt"]))
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    receipt["deployment_revision"] = "f" * 40
+    path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="CPU pilot bootstrap"):
+        LIFECYCLE._runtime_bootstrap_receipt(path=path, instance=instance, request=request)
 
 
 @pytest.mark.parametrize("value", [{}, None, {"instances": None}])
@@ -1721,6 +1756,60 @@ def test_runtime_bootstrap_stage_is_an_explicit_pre_pilot_action(tmp_path: Path)
     report = LIFECYCLE.main_for_test(["runtime-bootstrap-stage", "--request", str(request)])
 
     assert report["paid_action"] is False and report["action"] == "runtime-bootstrap-stage"
+
+
+def test_runtime_cpu_bootstrap_stages_only_cpu_pilot_inputs_and_never_parent_material(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    bundle, bundle_sha, token = tmp_path / "code.bundle", tmp_path / "code.bundle.sha256", tmp_path / "runtime.token"
+    bundle.write_bytes(b"reviewed bundle")
+    bundle_sha.write_text("4" * 64 + "  code.bundle\n", encoding="utf-8")
+    token.write_text("private-token", encoding="utf-8")
+    token.chmod(0o600)
+    hydrate = tmp_path / "hydrate.json"
+    hydrate.write_text(json.dumps({"schema_version": 1, "command": "hydrate-runtime-mixture", "arguments": {"deployment_receipt": "/prepared/config/deployment-receipt.json", "source_readback_receipts": "/prepared/config", "destination": "/prepared/runtime", "mounts_descriptor": "/prepared/runtime/mounts.json"}}), encoding="utf-8")
+    pilot = tmp_path / "pilot.json"
+    pilot.write_text(json.dumps({"schema_version": 1, "command": "pilot-runtime-mixture", "arguments": {"mixture_manifest": "/prepared/runtime/mixture.json", "mounts_descriptor": "/prepared/runtime/mounts.json", "sample_count": 100, "worker_counts": [0, 4, 8, 16, 24], "timeout_seconds": 60, "authenticated_evidence": {}}}), encoding="utf-8")
+    output = tmp_path / "cpu-bootstrap.json"
+    request |= {
+        "code_bundle": str(bundle), "code_bundle_sha256_file": str(bundle_sha), "token_file": str(token),
+        "runtime_hydrate_request": str(hydrate), "runtime_pilot_request": str(pilot),
+        "bootstrap_receipt": str(output),
+    }
+    monkeypatch.setattr(LIFECYCLE, "_verify_reviewed_code_bundle", lambda *_args: "4" * 64)
+    sources = {
+        "code.bundle": bundle, "code.bundle.sha256": bundle_sha, "runtime.token": token,
+        "runtime-hydrate.json": hydrate, "runtime-pilot.json": pilot,
+        "bc-readback.json": Path(str(request["bc_readback_receipt"])),
+        "rollout-readback.json": Path(str(request["rollout_readback_receipt"])),
+        "deployment-receipt.json": Path(str(request["deployment_receipt"])),
+    }
+    calls: list[tuple[str, ...]] = []
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command[0] == "scp":
+            return ""
+        if command[0] == "ssh" and command[-1].startswith("sha256sum "):
+            name = command[-1].rpartition("/")[2]
+            return LIFECYCLE.sha256_file(sources[name]) + "  " + name + "\n"
+        return ""
+
+    result = LIFECYCLE.runtime_mixture_bootstrap_stage(instance=instance, request=request, runner=runner)
+
+    receipt = result["bootstrap_receipt"]
+    assert receipt["trainer_image"] == LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE
+    assert receipt["image_digest"] == LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2]
+    assert {item["name"] for item in receipt["transfers"]} == set(sources)
+    assert "parent_checkpoint_artifact_sha256" not in receipt
+    setup = calls[-1][-1]
+    assert "cd /tmp/lehome-runtime-bootstrap; sha256sum -c code.bundle.sha256" in setup
+    assert "git clone --quiet --no-checkout /tmp/lehome-runtime-bootstrap/code.bundle /prepared/code" in setup
+    assert "checkout --quiet --detach " + "3" * 40 in setup
+    assert "chmod 600 /prepared/config/runtime.token" in setup
+    assert "parent.tar" not in setup and "modality.py" not in setup and "launch.json" not in setup
+    assert "experiment.json" not in setup and "cuda" not in setup.lower()
+    assert LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE not in setup and "private-token" not in setup
 
 
 def test_runtime_cli_dispatch_never_calls_legacy_recuts(
@@ -1926,10 +2015,10 @@ def test_runtime_gpu_warmup_runs_exact_cli_and_binds_cpu_pilot_code_parent_and_i
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     instance, request = _runtime_pilot_request_files(tmp_path)
-    instance |= {"kind": "runtime_mixture_gpu_warmup_instance", "capability_sha256": "5" * 64}
+    instance |= {"kind": "runtime_mixture_gpu_warmup_instance", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "capability_sha256": "5" * 64}
     pilot = {
         "schema_version": 4, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "gpu_initialized": False,
-        "processor_contract": "pinned_processor_integration_required", "representative": {"three_cameras": True, "action_horizon": 16}, "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24], "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {str(n): {"decoded_samples": 100, "samples_per_second": 1.0} for n in [0, 4, 8, 16, 24]}, "timing_rows": [{"worker_count": n, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 1.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for n in [0, 4, 8, 16, 24]], "authenticated_evidence": {"provider_instance_id": 44, "provider_response_sha256": "2" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40}, "cache_cap": 1, "native_x86_required": True, "timeout_seconds": 60.0, "canonical_completion": True,
+        "processor_contract": "pinned_processor_integration_required", "representative": {"three_cameras": True, "action_horizon": 16}, "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24], "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {str(n): {"decoded_samples": 100, "samples_per_second": 1.0} for n in [0, 4, 8, 16, 24]}, "timing_rows": [{"worker_count": n, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 1.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for n in [0, 4, 8, 16, 24]], "authenticated_evidence": {"provider_instance_id": 44, "provider_response_sha256": "2" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2], "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40}, "cache_cap": 1, "native_x86_required": True, "timeout_seconds": 60.0, "canonical_completion": True,
     }
     pilot_path = tmp_path / "pilot.json"; pilot_path.write_text(json.dumps(pilot), encoding="utf-8")
     binding = {"mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "5" * 64}, "code": {"repository_revision": "3" * 40, "bundle_sha256": "4" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
@@ -1942,4 +2031,7 @@ def test_runtime_gpu_warmup_runs_exact_cli_and_binds_cpu_pilot_code_parent_and_i
 
     assert report["action"] == "runtime-gpu-warmup"
     assert "runtime-gpu-warmup --request /prepared/config/runtime-warmup.json" in calls[-1][-1]
-    assert json.loads(Path(str(request["warmup_lifecycle_receipt"])).read_text())["selected_loader_workers"] == 4
+    lifecycle = json.loads(Path(str(request["warmup_lifecycle_receipt"])).read_text())
+    assert lifecycle["selected_loader_workers"] == 4
+    assert lifecycle["trainer_image"] == LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE
+    assert lifecycle["parent_checkpoint_artifact_sha256"] == LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]

@@ -45,6 +45,10 @@ BOOTSTRAP_TRAINER_IMAGE = (
     _DIGEST_PREFIX
     + "b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746"
 )
+RUNTIME_CPU_PILOT_IMAGE = (
+    _DIGEST_PREFIX
+    + "d86f9859200c84ae17657e90d68bc4159b98812697f7fc2dd95b2b936ebb9c3e"
+)
 MAX_ACCOUNT_HOURLY_USD = 1.00
 Runner = Callable[[tuple[str, ...]], str]
 
@@ -366,7 +370,7 @@ def capture_runtime_pilot_offer(*, runner: Runner, now_unix: int | None = None) 
     captured = int(time.time()) if now_unix is None else now_unix
     canonical_offer = _project(offer, _RUNTIME_PILOT_OFFER_FIELDS)
     canonical_offer["cpu_cores_effective"] = cores
-    return {"schema_version": 1, "kind": "runtime_mixture_cpu_pilot_offer", "offer": canonical_offer, "raw_offer_sha256": _hash(dict(offer)), "account_hourly_total_usd": total, "captured_at_unix": captured, "expires_at_unix": captured + 300, "search_mode": "on_demand", "platform_arch": "amd64", "storage_gb": 120}
+    return {"schema_version": 1, "kind": "runtime_mixture_cpu_pilot_offer", "offer": canonical_offer, "raw_offer_sha256": _hash(dict(offer)), "account_hourly_total_usd": total, "captured_at_unix": captured, "expires_at_unix": captured + 300, "search_mode": "on_demand", "platform_arch": "amd64", "storage_gb": 120, "trainer_image": RUNTIME_CPU_PILOT_IMAGE, "image_digest": RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2]}
 
 
 def _runtime_pilot_offer(evidence: Mapping[str, object]) -> Mapping[str, object]:
@@ -384,6 +388,8 @@ def _runtime_pilot_offer(evidence: Mapping[str, object]) -> Mapping[str, object]
         or evidence.get("search_mode") != "on_demand"
         or evidence.get("platform_arch") != "amd64"
         or evidence.get("storage_gb") != 120
+        or evidence.get("trainer_image") != RUNTIME_CPU_PILOT_IMAGE
+        or evidence.get("image_digest") != RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2]
         or type(evidence.get("expires_at_unix")) is not int
         or int(evidence["expires_at_unix"]) < int(time.time())
         or not isinstance(offer, Mapping)
@@ -574,8 +580,8 @@ def rent_runtime_cpu_pilot(
     )
     created = _json(runner, (
         "vastai", "--raw", "create", "instance", str(offer["id"]), "--image",
-        BOOTSTRAP_TRAINER_IMAGE, "--disk", "120", "--ssh", "--direct", "--cancel-unavail",
-        "--env", "-e LEHOME_TRAIN_IMAGE=" + BOOTSTRAP_TRAINER_IMAGE,
+        RUNTIME_CPU_PILOT_IMAGE, "--disk", "120", "--ssh", "--direct", "--cancel-unavail",
+        "--env", "-e LEHOME_TRAIN_IMAGE=" + RUNTIME_CPU_PILOT_IMAGE,
     ))
     if not isinstance(created, Mapping) or type(created.get("new_contract")) is not int:
         raise ValueError("runtime CPU pilot provider did not return an instance ID")
@@ -596,7 +602,8 @@ def rent_runtime_cpu_pilot(
         instance = {
             "schema_version": 1, "kind": "runtime_mixture_cpu_pilot_instance",
             "instance_id": instance_id, "host": live["ssh_host"], "port": live["ssh_port"],
-            "platform_arch": "x86_64", "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
+            "platform_arch": "x86_64", "trainer_image": RUNTIME_CPU_PILOT_IMAGE,
+            "image_digest": RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2],
             "offer_evidence_sha256": _hash(evidence),
             "provider_response_sha256": _runtime_pilot_instance_identity(live),
             "account_hourly_total_usd": _require_account_cap(
@@ -1181,6 +1188,18 @@ def _runtime_identity(instance: Mapping[str, object], request: Mapping[str, obje
     return _runtime_campaign_binding(request)
 
 
+def _runtime_cpu_pilot_identity(instance: Mapping[str, object], request: Mapping[str, object]) -> dict[str, object]:
+    """Validate the CPU-only pilot lease without broadening GPU acceptance."""
+    if (
+        instance.get("platform_arch") != "x86_64"
+        or instance.get("trainer_image") != RUNTIME_CPU_PILOT_IMAGE
+        or instance.get("image_digest") != RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2]
+        or type(instance.get("instance_id")) is not int
+    ):
+        raise ValueError("runtime CPU pilot requires native x86_64 and the approved CPU-only pinned image")
+    return _runtime_campaign_binding(request)
+
+
 def _validated_runtime_pilot_value(receipt: Mapping[str, object]) -> dict[str, object]:
     """Validate only the current schema4 CPU-only pilot CLI output."""
     value = dict(receipt)
@@ -1196,7 +1215,7 @@ def _validated_runtime_pilot_value(receipt: Mapping[str, object]) -> dict[str, o
         or set(evidence) != {"provider_instance_id", "provider_response_sha256", "platform_arch", "image_digest", "code_revision", "code_bundle_sha256", "bc_revision", "rollout_revision", "deployment_revision"}
         or type(evidence.get("provider_instance_id")) is not int
         or evidence.get("platform_arch") != "x86_64"
-        or evidence.get("image_digest") != BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
+        or evidence.get("image_digest") != RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2]
         or any(re.fullmatch(r"[0-9a-f]{40}", str(evidence.get(key))) is None for key in ("code_revision", "bc_revision", "rollout_revision", "deployment_revision"))
         or re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("provider_response_sha256"))) is None
         or re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("code_bundle_sha256"))) is None
@@ -1241,6 +1260,8 @@ def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> None:
     binding = _runtime_campaign_binding(request)
     proof = pilot["authenticated_evidence"]
     if (
+        proof.get("image_digest") != RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2]
+        or
         proof.get("code_revision") != request.get("code_revision")
         or proof.get("code_bundle_sha256") != request.get("code_bundle_sha256")
         or proof.get("bc_revision") != binding["bc"]["immutable_revision"]
@@ -1248,6 +1269,21 @@ def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> None:
         or proof.get("deployment_revision") != binding["deployment"]["immutable_revision"]
     ):
         raise ValueError("runtime GPU warm-up pilot is not bound to immutable runtime sources")
+
+
+def _runtime_gpu_pilot_preflight(*, pilot: Mapping[str, object], request: Mapping[str, object], identity: Mapping[str, object]) -> None:
+    """Cross-check the CPU receipt without accepting its image on a GPU path."""
+    proof = pilot["authenticated_evidence"]
+    if (
+        not isinstance(proof, Mapping)
+        or proof.get("image_digest") != RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2]
+        or proof.get("code_revision") != request.get("code_revision")
+        or proof.get("code_bundle_sha256") != request.get("code_bundle_sha256")
+        or proof.get("bc_revision") != identity["bc"]["immutable_revision"]
+        or proof.get("rollout_revision") != identity["rollout"]["immutable_revision"]
+        or proof.get("deployment_revision") != identity["deployment"]["immutable_revision"]
+    ):
+        raise ValueError("runtime GPU warm-up pilot is not bound to the CPU image and immutable runtime sources")
 
 
 def _runtime_pilot_instance(instance: Mapping[str, object]) -> None:
@@ -1258,7 +1294,8 @@ def _runtime_pilot_instance(instance: Mapping[str, object]) -> None:
         or not isinstance(instance.get("host"), str)
         or type(instance.get("port")) is not int
         or instance.get("platform_arch") != "x86_64"
-        or instance.get("trainer_image") != BOOTSTRAP_TRAINER_IMAGE
+        or instance.get("trainer_image") != RUNTIME_CPU_PILOT_IMAGE
+        or instance.get("image_digest") != RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2]
         or re.fullmatch(r"[0-9a-f]{64}", str(instance.get("provider_response_sha256"))) is None
         or re.fullmatch(r"[0-9a-f]{64}", str(instance.get("offer_evidence_sha256"))) is None
     ):
@@ -1270,9 +1307,10 @@ def run_runtime_cpu_pilot(
 ) -> dict[str, object]:
     """Run the existing CPU-only loader sweep and bind its remote receipt locally."""
     _runtime_pilot_instance(instance)
-    identity = _runtime_identity(instance, request)
+    identity = _runtime_cpu_pilot_identity(instance, request)
     bundle = request.get("code_bundle_sha256")
     output = request.get("lifecycle_receipt")
+    bootstrap_path = request.get("bootstrap_receipt")
     if (
         type(bundle) is not str
         or re.fullmatch(r"[0-9a-f]{64}", bundle) is None
@@ -1280,8 +1318,20 @@ def run_runtime_cpu_pilot(
         or not Path(output).is_absolute()
         or Path(output).exists()
         or Path(output).is_symlink()
+        or type(bootstrap_path) is not str
     ):
         raise ValueError("runtime CPU pilot requires an absent absolute lifecycle receipt output")
+    bootstrap = _runtime_bootstrap_receipt(
+        path=Path(bootstrap_path), instance=instance, request=request,
+    )
+    if (
+        bootstrap.get("instance_id") != instance.get("instance_id")
+        or bootstrap.get("provider_response_sha256") != instance.get("provider_response_sha256")
+        or any(bootstrap.get(key) != identity[name]["immutable_revision"] for key, name in (
+            ("bc_revision", "bc"), ("rollout_revision", "rollout"), ("deployment_revision", "deployment"),
+        ))
+    ):
+        raise ValueError("runtime CPU pilot bootstrap receipt is not bound to its instance and immutable sources")
     command = (
         "set -eu; env -u HF_TOKEN PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src "
         "lehome-train pilot-runtime-mixture --request /prepared/config/runtime-pilot.json"
@@ -1298,7 +1348,7 @@ def run_runtime_cpu_pilot(
         proof.get("provider_instance_id") != instance.get("instance_id")
         or proof.get("provider_response_sha256") != instance.get("provider_response_sha256")
         or proof.get("platform_arch") != "x86_64"
-        or proof.get("image_digest") != BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
+        or proof.get("image_digest") != RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2]
         or proof.get("code_revision") != request.get("code_revision")
         or proof.get("code_bundle_sha256") != bundle
         or proof.get("bc_revision") != identity["bc"]["immutable_revision"]
@@ -1310,12 +1360,15 @@ def run_runtime_cpu_pilot(
         "schema_version": 1, "kind": "runtime_mixture_cpu_pilot_lifecycle",
         "instance_id": instance["instance_id"],
         "provider_response_sha256": instance["provider_response_sha256"],
-        "platform_arch": "x86_64", "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
+        "platform_arch": "x86_64", "trainer_image": RUNTIME_CPU_PILOT_IMAGE,
+        "image_digest": RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2],
         "code_revision": request["code_revision"], "code_bundle_sha256": bundle,
         "bc_revision": identity["bc"]["immutable_revision"],
         "rollout_revision": identity["rollout"]["immutable_revision"],
         "deployment_revision": identity["deployment"]["immutable_revision"],
         "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
+        "bootstrap_receipt_sha256": sha256_file(Path(bootstrap_path)),
+        "staged_transfers": bootstrap["transfers"],
         "pilot_receipt": pilot,
     }
     atomic_write_json(Path(output), lifecycle)
@@ -1378,6 +1431,7 @@ def run_runtime_gpu_warmup(
     _runtime_gpu_warmup_instance(instance)
     identity = _runtime_identity(instance, request)
     pilot = _validated_runtime_pilot(request.get("pilot_receipt"))
+    _runtime_gpu_pilot_preflight(pilot=pilot, request=request, identity=identity)
     binding_path = request.get("runtime_warmup_binding")
     output = request.get("warmup_lifecycle_receipt")
     if type(binding_path) is not str or type(output) is not str or not Path(output).is_absolute() or Path(output).exists() or Path(output).is_symlink():
@@ -1444,9 +1498,10 @@ def destroy_runtime_cpu_pilot(
     proof = validated["authenticated_evidence"]
     expected = {
         "instance_id": instance_id, "platform_arch": "x86_64",
-        "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
+        "trainer_image": RUNTIME_CPU_PILOT_IMAGE,
+        "image_digest": RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2],
     }
-    if any(lifecycle_receipt.get(key) != value for key, value in expected.items()) or re.fullmatch(r"[0-9a-f]{64}", str(lifecycle_receipt.get("provider_response_sha256"))) is None or re.fullmatch(r"[0-9a-f]{64}", str(lifecycle_receipt.get("code_bundle_sha256"))) is None or re.fullmatch(r"[0-9a-f]{64}", str(lifecycle_receipt.get("deployment_receipt_sha256"))) is None or any(re.fullmatch(r"[0-9a-f]{40}", str(lifecycle_receipt.get(key))) is None for key in ("code_revision", "bc_revision", "rollout_revision", "deployment_revision")) or proof.get("provider_instance_id") != instance_id or proof.get("provider_response_sha256") != lifecycle_receipt.get("provider_response_sha256") or proof.get("platform_arch") != "x86_64" or proof.get("image_digest") != BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2] or any(proof.get(key) != lifecycle_receipt.get(key) for key in ("code_revision", "code_bundle_sha256", "bc_revision", "rollout_revision", "deployment_revision")):
+    if any(lifecycle_receipt.get(key) != value for key, value in expected.items()) or any(re.fullmatch(r"[0-9a-f]{64}", str(lifecycle_receipt.get(key))) is None for key in ("provider_response_sha256", "code_bundle_sha256", "deployment_receipt_sha256", "bootstrap_receipt_sha256")) or not isinstance(lifecycle_receipt.get("staged_transfers"), list) or not lifecycle_receipt["staged_transfers"] or any(not isinstance(item, Mapping) or set(item) != {"name", "sha256"} or not isinstance(item.get("name"), str) or re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256"))) is None for item in lifecycle_receipt["staged_transfers"]) or any(re.fullmatch(r"[0-9a-f]{40}", str(lifecycle_receipt.get(key))) is None for key in ("code_revision", "bc_revision", "rollout_revision", "deployment_revision")) or proof.get("provider_instance_id") != instance_id or proof.get("provider_response_sha256") != lifecycle_receipt.get("provider_response_sha256") or proof.get("platform_arch") != "x86_64" or proof.get("image_digest") != RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2] or any(proof.get(key) != lifecycle_receipt.get(key) for key in ("code_revision", "code_bundle_sha256", "bc_revision", "rollout_revision", "deployment_revision")):
         raise ValueError("runtime CPU pilot destroy receipt is not bound to its authenticated pilot")
     runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
     if not _await_runtime_instance_absence(
@@ -1906,23 +1961,38 @@ def _runtime_envelope(path: Path, *, command: str, fields: set[str], label: str)
 
 def _runtime_bootstrap_receipt(*, path: Path, instance: Mapping[str, object], request: Mapping[str, object]) -> Mapping[str, object]:
     receipt = _load_regular_json(path, "runtime bootstrap stage receipt")
+    identity = _runtime_campaign_binding(request)
     expected = {
         "schema_version": 1, "kind": "runtime_mixture_bootstrap_stage",
-        "instance_id": instance.get("instance_id"), "provider_response_sha256": instance.get("provider_response_sha256"),
         "code_revision": request.get("code_revision"), "code_bundle_sha256": request.get("code_bundle_sha256"),
-        "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+        "trainer_image": RUNTIME_CPU_PILOT_IMAGE,
+        "image_digest": RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2],
+        "bc_revision": identity["bc"]["immutable_revision"],
+        "rollout_revision": identity["rollout"]["immutable_revision"],
+        "deployment_revision": identity["deployment"]["immutable_revision"],
+        "bc_receipt_sha256": identity["bc_receipt_sha256"],
+        "rollout_receipt_sha256": identity["rollout_receipt_sha256"],
+        "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
     }
     if any(receipt.get(key) != value for key, value in expected.items()):
-        raise ValueError("runtime final stage is not bound to this instance bootstrap receipt")
+        raise ValueError("runtime final stage is not bound to the CPU pilot bootstrap receipt")
+    if (
+        type(receipt.get("instance_id")) is not int
+        or re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("provider_response_sha256"))) is None
+        or not isinstance(receipt.get("transfers"), list)
+        or not receipt["transfers"]
+        or any(not isinstance(item, Mapping) or set(item) != {"name", "sha256"} or not isinstance(item.get("name"), str) or re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256"))) is None for item in receipt["transfers"])
+    ):
+        raise ValueError("runtime final stage CPU bootstrap receipt lacks immutable transfer evidence")
     return receipt
 
 
 def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     """Stage only the pre-pilot inputs needed to hydrate and measure a runtime mix."""
-    _runtime_identity(instance, request)
+    identity = _runtime_cpu_pilot_identity(instance, request)
     required = {
         "code_bundle": "code.bundle", "code_bundle_sha256_file": "code.bundle.sha256",
-        "parent_checkpoint": "parent.tar", "modality_config": "modality.py", "token_file": "runtime.token",
+        "token_file": "runtime.token",
         "runtime_hydrate_request": "runtime-hydrate.json", "runtime_pilot_request": "runtime-pilot.json",
         "bc_readback_receipt": "bc-readback.json", "rollout_readback_receipt": "rollout-readback.json",
         "deployment_receipt": "deployment-receipt.json",
@@ -1935,10 +2005,6 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
     code = Path(str(request["code_bundle"]))
     if _verify_reviewed_code_bundle(code, Path(str(request["code_bundle_sha256_file"])), request.get("code_revision")) != request.get("code_bundle_sha256"):
         raise ValueError("runtime bootstrap code bundle differs from the reviewed bundle")
-    parent = Path(str(request["parent_checkpoint"]))
-    if parent.is_symlink() or not parent.is_file() or sha256_file(parent) != PARENT_CHECKPOINT["archive_sha256"]:
-        raise ValueError("runtime bootstrap parent archive is incompatible")
-    _safe_archive(parent, "runtime mixture parent checkpoint")
     _read_private_token(str(request["token_file"]))
     hydrate = _runtime_envelope(Path(str(request["runtime_hydrate_request"])), command="hydrate-runtime-mixture", fields={"deployment_receipt", "source_readback_receipts", "destination", "mounts_descriptor"}, label="runtime hydration request")
     if hydrate["deployment_receipt"] != "/prepared/config/deployment-receipt.json" or hydrate["destination"] != "/prepared/runtime" or hydrate["mounts_descriptor"] != "/prepared/runtime/mounts.json":
@@ -1959,15 +2025,15 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
         if not observed or observed[0] != digest:
             raise ValueError("runtime bootstrap staged hash readback failed")
         transfers.append({"name": remote_name, "sha256": digest})
-    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/config /prepared/runtime /cache/parent /output; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/runtime-pilot.json /prepared/config/runtime-pilot.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; git clone --quiet --no-checkout " + remote_dir + "/code.bundle /prepared/code; git -C /prepared/code checkout --quiet --detach " + str(request["code_revision"]) + "; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -z \"$(git -C /prepared/code status --porcelain)\"; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/parent.tar -C /cache/parent; test \"$(sha256sum " + remote_dir + "/parent.tar | cut -d' ' -f1)\" = " + PARENT_CHECKPOINT["archive_sha256"] + "; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code; test ! -L /cache/parent"))
-    receipt = {"schema_version": 1, "kind": "runtime_mixture_bootstrap_stage", "instance_id": instance["instance_id"], "provider_response_sha256": instance["provider_response_sha256"], "code_revision": request["code_revision"], "code_bundle_sha256": request["code_bundle_sha256"], "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"], "transfers": transfers}
+    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/config /prepared/runtime /output; cd " + remote_dir + "; sha256sum -c code.bundle.sha256; mv runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv runtime-pilot.json /prepared/config/runtime-pilot.json; mv runtime.token /prepared/config/runtime.token; mv bc-readback.json /prepared/config/bc-readback.json; mv rollout-readback.json /prepared/config/rollout-readback.json; mv deployment-receipt.json /prepared/config/deployment-receipt.json; git clone --quiet --no-checkout " + remote_dir + "/code.bundle /prepared/code; git -C /prepared/code checkout --quiet --detach " + str(request["code_revision"]) + "; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -z \"$(git -C /prepared/code status --porcelain)\"; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code"))
+    receipt = {"schema_version": 1, "kind": "runtime_mixture_bootstrap_stage", "instance_id": instance["instance_id"], "provider_response_sha256": instance["provider_response_sha256"], "platform_arch": "x86_64", "trainer_image": RUNTIME_CPU_PILOT_IMAGE, "image_digest": RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2], "code_revision": request["code_revision"], "code_bundle_sha256": request["code_bundle_sha256"], "bc_revision": identity["bc"]["immutable_revision"], "rollout_revision": identity["rollout"]["immutable_revision"], "deployment_revision": identity["deployment"]["immutable_revision"], "bc_receipt_sha256": identity["bc_receipt_sha256"], "rollout_receipt_sha256": identity["rollout_receipt_sha256"], "deployment_receipt_sha256": identity["deployment_receipt_sha256"], "transfers": transfers}
     atomic_write_json(Path(output), receipt)
     return {"paid_action": True, "action": "runtime-bootstrap-stage", "bootstrap_receipt": receipt}
 
 
 def runtime_mixture_warmup_stage(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     """Stage the post-CPU, pre-measurement GPU slot without touching final inputs."""
-    _runtime_identity(instance, request)
+    identity = _runtime_identity(instance, request)
     _runtime_bootstrap_receipt(path=Path(str(request.get("bootstrap_receipt", ""))), instance=instance, request=request)
     required = {
         "pilot_receipt": "cpu-pilot.json", "runtime_warmup_binding": "runtime-warmup-binding.json",
@@ -1979,6 +2045,7 @@ def runtime_mixture_warmup_stage(*, instance: Mapping[str, object], request: Map
     if type(output) is not str or not Path(output).is_absolute() or Path(output).exists() or Path(output).is_symlink():
         raise ValueError("runtime warmup stage requires an absent absolute warmup_stage_receipt")
     pilot = _validated_runtime_pilot(request["pilot_receipt"])
+    _runtime_gpu_pilot_preflight(pilot=pilot, request=request, identity=identity)
     _runtime_envelope(Path(str(request["runtime_warmup_request"])), command="runtime-gpu-warmup", fields={"cpu_pilot", "binding"}, label="runtime GPU warm-up request")
     launch = _load_regular_json(Path(str(request["warmup_launch_config"])), "runtime warmup launch config")
     if launch.get("training_action_horizon") != 16 or launch.get("model_action_chunk_capacity") != 40:
@@ -2026,6 +2093,10 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         raise ValueError("runtime mixture stage requires reviewed code, config, token, and authenticated receipts")
     _runtime_bootstrap_receipt(
         path=Path(str(request["bootstrap_receipt"])), instance=instance, request=request,
+    )
+    _runtime_gpu_pilot_preflight(
+        pilot=_validated_runtime_pilot(request["pilot_receipt"]), request=request,
+        identity=_runtime_identity(instance, request),
     )
     warmup_stage = _load_regular_json(Path(str(request["warmup_stage_receipt"])), "runtime warmup stage receipt")
     if (
