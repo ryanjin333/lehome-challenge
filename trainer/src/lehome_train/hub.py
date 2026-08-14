@@ -453,6 +453,14 @@ class HuggingFaceHubTransport:
             else:
                 for relative_path in relative_paths:
                     remote_path = f"{remote_prefix}/{relative_path}"
+                    target = self._safe_download_path(destination, relative_path)
+                    if target.is_symlink() or (target.exists() and not target.is_file()):
+                        raise ValueError("Hub download target must be a regular file")
+                    if target.is_file():
+                        # Prefixed readback callers verify the completed artifact
+                        # content before receipt, so retain exact files materialized
+                        # before a rate limit instead of requesting them again.
+                        continue
                     self._safe_download_path(destination, remote_path)
                     downloaded = library.hf_hub_download(
                         repo_id=repository,

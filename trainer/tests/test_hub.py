@@ -629,6 +629,8 @@ def test_real_transport_preserves_completed_prefixed_bytes_when_direct_download_
     destination = tmp_path / "readback"
     remote_prefix = "bc/full"
     files = ("shards/0000.bin", "shards/0001.bin")
+    direct_calls: list[str] = []
+    rate_limited = True
 
     class FakeLibrary:
         @staticmethod
@@ -637,17 +639,24 @@ def test_real_transport_preserves_completed_prefixed_bytes_when_direct_download_
 
         @staticmethod
         def hf_hub_download(**kwargs: object) -> str:
+            nonlocal rate_limited
             snapshot = Path(str(kwargs["local_dir"]))
             filename = str(kwargs["filename"])
+            direct_calls.append(filename)
             if filename == f"{remote_prefix}/{files[0]}":
                 partial = snapshot / filename
                 partial.parent.mkdir(parents=True, exist_ok=True)
                 partial.write_bytes(b"partial-but-complete")
                 (snapshot / ".cache" / "huggingface").mkdir(parents=True, exist_ok=True)
                 return str(partial)
-            error = RuntimeError("rate limit")
-            error.status_code = 429  # type: ignore[attr-defined]
-            raise error
+            if rate_limited:
+                error = RuntimeError("rate limit")
+                error.status_code = 429  # type: ignore[attr-defined]
+                raise error
+            target = snapshot / filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"retried")
+            return str(target)
 
     monkeypatch.setattr(transport, "_repo_info", lambda **_kwargs: SimpleNamespace(sha=revision))
     monkeypatch.setattr(transport, "_library", lambda: FakeLibrary())
@@ -662,6 +671,21 @@ def test_real_transport_preserves_completed_prefixed_bytes_when_direct_download_
     assert (destination / files[0]).read_bytes() == b"partial-but-complete"
     assert not (destination / "bc").exists()
     assert not (destination / ".cache").exists()
+    assert direct_calls == [f"{remote_prefix}/{path}" for path in files]
+
+    rate_limited = False
+    resolved = transport.download_files(
+        repository="ryanjin333/lehome-groot-n17-data", revision=revision,
+        destination=destination, relative_paths=files, remote_prefix=remote_prefix,
+        token="hf_partial_readback_probe",
+    )
+
+    assert resolved == revision
+    assert direct_calls == [
+        f"{remote_prefix}/{files[0]}",
+        f"{remote_prefix}/{files[1]}",
+        f"{remote_prefix}/{files[1]}",
+    ]
 
 
 def test_real_transport_reuses_destination_for_snapshot_resume(
