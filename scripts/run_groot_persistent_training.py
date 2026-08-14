@@ -47,6 +47,10 @@ MAX_ACCOUNT_HOURLY_USD = 1.00
 Runner = Callable[[tuple[str, ...]], str]
 
 
+class RuntimeResumeAlreadyClaimed(ValueError):
+    """A successful replacement may not hydrate the same cursor twice."""
+
+
 def _hash(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -447,6 +451,10 @@ def _runtime_abort_on_failure(
         return operation()
     try:
         return operation()
+    except RuntimeResumeAlreadyClaimed:
+        # This is an idempotency/replay rejection for the active winner, not a
+        # failed paid action.  Its instance and failure receipt must stay put.
+        raise
     except BaseException as error:
         _runtime_abort_cleanup(instance=instance, request=request, error=error, runner=runner)
         raise
@@ -1522,6 +1530,22 @@ def resume_runtime_checkpoint(
     publication_for_claim = dict(publications[0])
     if publication_for_claim.get("optimizer_step") != 1000 or not isinstance(publication_for_claim.get("runtime_cursor"), Mapping):
         raise ValueError("runtime checkpoint replacement cursor is not the 1K boundary")
+    claim = {
+        "schema_version": 1, "kind": "runtime_mixture_resume_claim",
+        "terminal_sha256": sha256_file(terminal_file), "identity_sha256": identity.sha256,
+        "cursor_sha256": _hash(dict(publication_for_claim["runtime_cursor"])),
+        "publication_sha256": _hash(publication_for_claim),
+        "replacement_instance_id": replacement.get("instance_id"),
+        "experiment_config_sha256": sha256_file(Path(config_path)),
+    }
+    if type(claim["replacement_instance_id"]) is not int:
+        raise ValueError("runtime checkpoint replacement instance is invalid")
+    claim_path = terminal_file.with_name(terminal_file.name + ".resume-claim.json")
+    if claim_path.exists() or claim_path.is_symlink():
+        observed_claim = _load_regular_json(claim_path, "runtime checkpoint resume claim")
+        if observed_claim == claim:
+            raise RuntimeResumeAlreadyClaimed("runtime checkpoint cursor is already claimed by this replacement")
+        raise ValueError("runtime checkpoint cursor is already claimed by another replacement")
     from lehome_train.groot.runtime_checkpoint_lifecycle import (
         discover_runtime_checkpoint_anchor, provider_interruption_terminal,
     )
@@ -1558,23 +1582,13 @@ def resume_runtime_checkpoint(
     # therefore abort-cleans its lease without consuming the durable cursor.
     if publication != publication_for_claim:
         raise ValueError("runtime checkpoint anchor no longer matches its interruption terminal")
-    claim = {
-        "schema_version": 1, "kind": "runtime_mixture_resume_claim",
-        "terminal_sha256": sha256_file(terminal_file), "identity_sha256": identity.sha256,
-        "cursor_sha256": _hash(dict(publication_for_claim["runtime_cursor"])),
-        "publication_sha256": _hash(publication_for_claim),
-        "replacement_instance_id": replacement.get("instance_id"),
-        "experiment_config_sha256": sha256_file(Path(config_path)),
-    }
-    if type(claim["replacement_instance_id"]) is not int:
-        raise ValueError("runtime checkpoint replacement instance is invalid")
-    claim_path = terminal_file.with_name(terminal_file.name + ".resume-claim.json")
     try:
         descriptor = os.open(claim_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         observed_claim = _load_regular_json(claim_path, "runtime checkpoint resume claim")
-        if observed_claim != claim:
-            raise ValueError("runtime checkpoint cursor is already claimed by another replacement")
+        if observed_claim == claim:
+            raise RuntimeResumeAlreadyClaimed("runtime checkpoint cursor is already claimed by this replacement")
+        raise ValueError("runtime checkpoint cursor is already claimed by another replacement")
     else:
         try:
             payload = json.dumps(claim, sort_keys=True, separators=(",", ":")).encode("utf-8")

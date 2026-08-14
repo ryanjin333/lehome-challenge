@@ -268,17 +268,42 @@ def test_runtime_supervisor_packages_and_anchors_the_real_one_k_boundary(
     )
     assert resumed["instance_id"] == 11 and resumed["runtime_cursor"]["global_sample_offset"] == 64_000
     assert resumed["runtime_resume_anchor"] == {"immutable_anchor_revision": hub.main, "anchor_sha256": publication["runtime_checkpoint_anchor"]["anchor_sha256"]}
-    # The durable controller receipt gains one exclusive claim before any
-    # archive hydration.  A second replacement cannot consume that same
-    # lost-host cursor into a different output root.
-    with pytest.raises(ValueError, match="already claimed"):
-        LIFECYCLE.resume_runtime_checkpoint(
-            replacement={**replacement, "instance_id": 12, "host": "second-replacement"},
-            request={**replacement_request, "instance": {**replacement, "instance_id": 12}, "resume_destination": str(prepared / "second-resume-download")},
-            terminal=terminal,
-            hub=LIFECYCLE._RuntimeCheckpointHub(transport=hub, token="fake-token"),
-            destination=prepared / "second-resume-download",
+    # A claim is single-use even for the original replacement: replay with the
+    # already materialized destination, or a different fresh destination, is
+    # rejected before any cleanup/failure receipt can touch that active lease.
+    replay_calls: list[tuple[str, ...]] = []
+    replay_runner = lambda command: replay_calls.append(command) or (_ for _ in ()).throw(AssertionError(command))
+    with pytest.raises(LIFECYCLE.RuntimeResumeAlreadyClaimed):
+        LIFECYCLE.main_for_test(
+            ["runtime-checkpoint-replacement-resume", "--request", str(_write(tmp_path / "replay-same.json", replacement_request)), "--execute", "--token-file", str(token)],
+            runner=replay_runner, transport_factory=lambda **_kwargs: hub,
         )
+    same_instance_replay = {**replacement_request, "resume_destination": str(prepared / "same-instance-fresh-destination"), "failure_receipt": str(tmp_path / "same-instance-replay-failure.json")}
+    with pytest.raises(LIFECYCLE.RuntimeResumeAlreadyClaimed):
+        LIFECYCLE.main_for_test(
+            ["runtime-checkpoint-replacement-resume", "--request", str(_write(tmp_path / "replay-fresh.json", same_instance_replay)), "--execute", "--token-file", str(token)],
+            runner=replay_runner, transport_factory=lambda **_kwargs: hub,
+        )
+    assert replay_calls == [] and not Path(str(same_instance_replay["failure_receipt"])).exists()
+
+    # A different newly-rented replacement loses the same exclusive claim and
+    # is still abort-cleaned with an exact absence readback.
+    competing = {**replacement, "instance_id": 12, "host": "second-replacement", "provider_response_sha256": "d" * 64}
+    competing_request = {**replacement_request, "instance": competing, "resume_destination": str(prepared / "second-resume-download"), "failure_receipt": str(tmp_path / "competing-resume-failure.json")}
+    competing_destroyed = False
+    def competing_runner(command: tuple[str, ...]) -> str:
+        nonlocal competing_destroyed
+        if command == ("vastai", "destroy", "instance", "12", "--yes"):
+            competing_destroyed = True; return ""
+        if command == ("vastai", "--raw", "show", "instance", "12"):
+            return "{}" if competing_destroyed else '{"id":12}'
+        raise AssertionError(command)
+    with pytest.raises(ValueError, match="already claimed"):
+        LIFECYCLE.main_for_test(
+            ["runtime-checkpoint-replacement-resume", "--request", str(_write(tmp_path / "competing.json", competing_request)), "--execute", "--token-file", str(token)],
+            runner=competing_runner, transport_factory=lambda **_kwargs: hub,
+        )
+    assert competing_destroyed and json.loads(Path(str(competing_request["failure_receipt"])).read_text())["cleanup_status"] == "destroyed_and_absent"
 
     # A replacement host has no durable trainer output.  It consumes only the
     # discovered immutable archive and descriptor, then the real supervisor
