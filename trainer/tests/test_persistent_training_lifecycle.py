@@ -1242,13 +1242,13 @@ def test_runtime_mixture_train_uses_only_authenticated_receipts_and_never_legacy
     for name, value in receipts.items():
         path = tmp_path / f"{name}.json"; path.write_text(json.dumps(value), encoding="utf-8"); paths[name] = str(path)
     pilot = tmp_path / "pilot.json"
-    pilot.write_text(json.dumps({"schema_version": 2, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "gpu_initialized": False, "native_x86_required": True, "canonical_worker_counts": [0, 4, 8, 16, 24], "canonical_completion": True, "throughput_verified": True}), encoding="utf-8")
+    pilot.write_text(json.dumps({"schema_version": 3, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "gpu_initialized": False, "native_x86_required": True, "canonical_worker_counts": [0, 4, 8, 16, 24], "canonical_completion": True, "throughput_verified": True, "authenticated_evidence": {"provider_instance_id": 9, "provider_response_sha256": "0" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "code_revision": "1" * 40, "code_bundle_sha256": "2" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40}, "timing_rows": [{"worker_count": count, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 100.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for count in [0, 4, 8, 16, 24]]}), encoding="utf-8")
     calls: list[tuple[str, ...]] = []
     def runner(command: tuple[str, ...]) -> str:
         calls.append(command); return "{}"
     instance = {"instance_id": 44, "host": "native-x86", "port": 22, "platform_arch": "x86_64", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE}
     output = tmp_path / "execution.json"
-    request = {"bc_readback_receipt": paths["bc"], "rollout_readback_receipt": paths["rollout"], "deployment_receipt": paths["deployment"], "pilot_receipt": str(pilot), "code_revision": "1" * 40, "execution_receipt": str(output)}
+    request = {"bc_readback_receipt": paths["bc"], "rollout_readback_receipt": paths["rollout"], "deployment_receipt": paths["deployment"], "pilot_receipt": str(pilot), "code_revision": "1" * 40, "code_bundle_sha256": "2" * 64, "execution_receipt": str(output)}
 
     report = LIFECYCLE.remote_action(action="runtime-train", instance=instance, request=request, runner=runner)
 
@@ -1268,3 +1268,16 @@ def test_runtime_pilot_provider_plan_is_on_demand_x86_and_never_rents() -> None:
         "platform_arch": "x86_64", "purchase_option": "on_demand",
         "account_hourly_cap_usd": 1.0, "max_instances": 1,
     }
+
+
+def test_runtime_pilot_rejects_a_descriptive_unbound_claim(tmp_path: Path) -> None:
+    receipt = tmp_path / "pilot.json"
+    receipt.write_text(json.dumps({
+        "schema_version": 2, "kind": "runtime_mixture_loader_pilot",
+        "model_loaded": False, "gpu_initialized": False, "native_x86_required": True,
+        "canonical_worker_counts": [0, 4, 8, 16, 24],
+        "canonical_completion": True, "throughput_verified": True,
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="authenticated"):
+        LIFECYCLE._validated_runtime_pilot(str(receipt))

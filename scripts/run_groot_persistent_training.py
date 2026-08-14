@@ -814,15 +814,27 @@ def _validated_runtime_pilot(path_value: object) -> dict[str, object]:
     if type(path_value) is not str:
         raise ValueError("runtime mixture production requires a pilot receipt")
     value = dict(_load_regular_json(Path(path_value), "runtime mixture pilot receipt"))
+    evidence = value.get("authenticated_evidence")
+    rows = value.get("timing_rows")
     if (
-        value.get("schema_version") != 2
+        value.get("schema_version") != 3
         or value.get("kind") != "runtime_mixture_loader_pilot"
         or value.get("model_loaded") is not False or value.get("gpu_initialized") is not False
         or value.get("native_x86_required") is not True
         or value.get("canonical_worker_counts") != [0, 4, 8, 16, 24]
         or value.get("canonical_completion") is not True or value.get("throughput_verified") is not True
+        or not isinstance(evidence, Mapping)
+        or set(evidence) != {"provider_instance_id", "provider_response_sha256", "platform_arch", "image_digest", "code_revision", "code_bundle_sha256", "bc_revision", "rollout_revision", "deployment_revision"}
+        or type(evidence.get("provider_instance_id")) is not int
+        or evidence.get("platform_arch") != "x86_64"
+        or evidence.get("image_digest") != BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
+        or any(re.fullmatch(r"[0-9a-f]{40}", str(evidence.get(key))) is None for key in ("code_revision", "bc_revision", "rollout_revision", "deployment_revision"))
+        or re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("provider_response_sha256"))) is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("code_bundle_sha256"))) is None
+        or not isinstance(rows, list) or [row.get("worker_count") if isinstance(row, Mapping) else None for row in rows] != [0, 4, 8, 16, 24]
+        or any(not isinstance(row, Mapping) or set(row) != {"worker_count", "decoded_samples", "seconds", "samples_per_second", "host_cpu_seconds", "host_max_rss_mib", "latency_seconds_p50", "latency_seconds_p95"} or type(row.get("decoded_samples")) is not int or row["decoded_samples"] < 100 or any(type(row.get(key)) not in (int, float) or float(row[key]) < 0 for key in ("seconds", "samples_per_second", "host_cpu_seconds", "host_max_rss_mib", "latency_seconds_p50", "latency_seconds_p95")) for row in rows)
     ):
-        raise ValueError("runtime mixture production requires a successful canonical CPU-only pilot receipt")
+        raise ValueError("runtime mixture production requires an authenticated measured canonical CPU-only pilot receipt")
     return value
 
 
@@ -839,6 +851,17 @@ def runtime_mixture_train(*, instance: Mapping[str, object], request: Mapping[st
     """Execute only the receipt-bound runtime-mixture trainer, never legacy RFT."""
     identity = _runtime_identity(instance, request)
     pilot = _validated_runtime_pilot(request.get("pilot_receipt"))
+    pilot_evidence = pilot["authenticated_evidence"]
+    if (
+        type(request.get("code_bundle_sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", str(request.get("code_bundle_sha256"))) is None
+        or pilot_evidence.get("code_revision") != request.get("code_revision")
+        or pilot_evidence.get("code_bundle_sha256") != request.get("code_bundle_sha256")
+        or pilot_evidence.get("bc_revision") != identity["bc"]["immutable_revision"]
+        or pilot_evidence.get("rollout_revision") != identity["rollout"]["immutable_revision"]
+        or pilot_evidence.get("deployment_revision") != identity["deployment"]["immutable_revision"]
+    ):
+        raise ValueError("runtime mixture pilot evidence does not bind the staged code and immutable mixture")
     output = request.get("execution_receipt")
     if type(output) is not str or not Path(output).is_absolute() or Path(output).exists() or Path(output).is_symlink():
         raise ValueError("runtime mixture execution receipt must be an absent absolute path")
