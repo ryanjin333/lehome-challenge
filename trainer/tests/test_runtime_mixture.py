@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
+from itertools import islice
 from pathlib import Path
 
 import pytest
@@ -60,7 +61,7 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
     sources[1]["source_tree_sha256"] = source_tree_sha256(round_root)
     windows = []
     for episode in range(7):
-        windows.append({"window_id": f"bc-{episode}", "source_id": "bc", "source_type": "bc", "source_episode_id": str(episode), "start": 0, "stop": 16, "frame_ids": list(range(16)), "lineage_id": f"bc-{episode}", "split": "train", "source_locator": {"episode_root": f"episodes/{episode}", "prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": _sha_path(bc / "manifest.json")}})
+        windows.append({"window_id": f"bc-{episode}", "source_id": "bc", "source_type": "bc", "source_episode_id": str(episode), "start": 0, "stop": 16, "frame_ids": list(range(16)), "lineage_id": f"bc-{episode}", "split": "train", "source_locator": {"episode_id": str(episode), "prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": _sha_path(bc / "manifest.json")}})
     for index, (attempt_root, attempt_hash) in enumerate(attempts):
         windows.append({"window_id": f"rollout-{index}", "source_id": "round-1", "source_type": "rollout", "source_episode_id": f"attempt-{index}", "start": 0, "stop": 16, "frame_ids": list(range(16)), "lineage_id": f"rollout-{index}", "split": "train", "source_locator": {"attempt_root": attempt_root, "attempt_manifest_path": f"{attempt_root}/episode.json", "attempt_manifest_sha256": attempt_hash}})
     manifest = {"schema_version": 2, "kind": "lehome_runtime_mixture", "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40, "safe_prefix": "runtime-mixtures/phase-2", "sources": sources, "camera_schema": ["observation.images.top_rgb", "observation.images.left_rgb", "observation.images.right_rgb"], "image_shape": [480, 640, 3], "state_schema": {"dimension": 12, "storage": "absolute"}, "action_schema": {"dimension": 12, "storage": "absolute"}, "fps": 30, "action_horizon": 16, "instruction": "fold the garment on the table", "schedule_seed": 17, "cycle_size": 10, "mixture_normalization": {"path": "mixture-normalization.json", "sha256": sha256_file(normalization), "byte_size": normalization.stat().st_size}, "window_index": {"path": "windows.json", "sha256": "", "byte_size": 0}}
@@ -153,3 +154,16 @@ def test_pinned_message_is_vla_step_wrapped_in_one_episode_step_message() -> Non
     messages = pinned_processor_messages({"images": {"top_rgb": np.zeros((1, 2, 2, 3), dtype=np.uint8), "left_rgb": np.zeros((1, 2, 2, 3), dtype=np.uint8), "right_rgb": np.zeros((1, 2, 2, 3), dtype=np.uint8)}, "state": [0.0] * 12, "actions": [[0.0] * 12 for _ in range(16)]}, backend=backend)
     assert messages[0]["type"] == "episode_step"
     assert messages[0]["content"].kwargs["actions"]["left_arm"].dtype == np.float32
+
+
+def test_window_indexing_and_loader_caches_are_bounded(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture import RangeSourceLoader, RuntimeMixtureDataset, load_runtime_contract
+
+    contract = load_runtime_contract(*(_contract(tmp_path)[::2]))
+    dataset = RuntimeMixtureDataset(contract, limit=40)
+    assert len({sample.window.window_id for sample in islice(dataset, 40)}) <= 10
+    loader = RangeSourceLoader(contract, decoder=lambda *_: None)
+    for index in range(20):
+        loader._cache(loader._attempt_cache, Path(f"/attempt/{index}"), None)
+    assert len(loader._attempt_cache) == loader.cache_cap
+    assert RuntimeMixtureDataset(contract).get_initial_actions() == [[0.0] * 12 for _ in range(16)]

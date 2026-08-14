@@ -8,6 +8,7 @@ only authorizes a range in an already hydrated full-episode source.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
+from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
 import json
@@ -240,16 +241,19 @@ def _parse_window(value: object) -> Window:
     identity = value["source_locator"]
     if not isinstance(identity, dict):
         raise ValueError("window source identity is invalid")
-    expected = ({"episode_root", "prepared_manifest_path", "prepared_manifest_sha256"} if kind == "bc" else {"attempt_root", "attempt_manifest_path", "attempt_manifest_sha256"})
+    expected = ({"episode_id", "prepared_manifest_path", "prepared_manifest_sha256"} if kind == "bc" else {"attempt_root", "attempt_manifest_path", "attempt_manifest_sha256"})
     _exact(identity, expected, label="window source locator")
     if kind == "bc":
-        _relative(identity["episode_root"], label="BC episode root")
+        if identity["episode_id"] != value["source_episode_id"]:
+            raise ValueError("BC episode locator drift")
         _relative(identity["prepared_manifest_path"], label="BC prepared manifest path")
         _digest(identity["prepared_manifest_sha256"], label="BC prepared manifest hash")
     else:
         _relative(identity["attempt_root"], label="raw attempt root")
         _relative(identity["attempt_manifest_path"], label="raw attempt manifest path")
         _digest(identity["attempt_manifest_sha256"], label="raw attempt manifest hash")
+        if PurePosixPath(str(identity["attempt_manifest_path"])).parent.as_posix() != identity["attempt_root"]:
+            raise ValueError("raw attempt root must equal manifest parent")
     return Window(str(value["window_id"]), str(value["source_id"]), kind, str(value["source_episode_id"]), start, stop, tuple(frames), str(value["lineage_id"]), value["split"], dict(identity))
 
 
@@ -423,6 +427,18 @@ def _permutation(values: list[Any], seed: int, cycle: int, namespace: str) -> li
     return result
 
 
+def _permuted_index(length: int, *, seed: int, cycle: int, namespace: str, ordinal: int) -> int:
+    """O(1) affine permutation index; never copies/shuffles source windows."""
+    if length <= 0:
+        raise ValueError("source has no train windows")
+    material = hashlib.sha256(f"{seed}:{cycle}:{namespace}".encode()).digest()
+    offset = int.from_bytes(material[:8], "big") % length
+    stride = int.from_bytes(material[8:16], "big") % length or 1
+    while math.gcd(stride, length) != 1:
+        stride = (stride + 1) % length or 1
+    return (offset + ordinal * stride) % length
+
+
 class RuntimeMixtureDataset(IterableDataset):
     """Deterministic infinite logical sample stream, partitioned by global position.
 
@@ -460,8 +476,8 @@ class RuntimeMixtureDataset(IterableDataset):
         source_id = _permutation(slots, self.contract.manifest.schedule_seed, cycle, "slots")[position_in_cycle]
         # Occurrence index within this cycle drives the independently permuted source windows.
         occurrence = sum(item == source_id for item in _permutation(slots, self.contract.manifest.schedule_seed, cycle, "slots")[:position_in_cycle])
-        choices = _permutation(self._train[source_id], self.contract.manifest.schedule_seed, cycle, f"windows:{source_id}")
-        window = choices[occurrence % len(choices)]
+        choices = self._train[source_id]
+        window = choices[_permuted_index(len(choices), seed=self.contract.manifest.schedule_seed, cycle=cycle, namespace=f"windows:{source_id}", ordinal=occurrence)]
         return RuntimeSample(f"{position}:{window.window_id}", position, source_id, window.source_type, window)
 
     def _render(self, sample: RuntimeSample) -> Any:
@@ -486,6 +502,9 @@ class RuntimeMixtureDataset(IterableDataset):
 
     def initial_actions(self) -> list[list[float]]:
         return [[0.0] * 12 for _ in range(ACTION_HORIZON)]
+
+    def get_initial_actions(self) -> list[list[float]]:
+        return self.initial_actions()
 
 
 class PinnedGrootFrameDecoder:
@@ -547,6 +566,17 @@ class RangeSourceLoader:
     def __init__(self, contract: RuntimeContract, *, decoder: Callable[..., Any] | None = None) -> None:
         self.contract = contract
         self.decoder = decoder or PinnedGrootFrameDecoder()
+        self._attempt_cache: OrderedDict[Path, None] = OrderedDict()
+        self._video_cache: OrderedDict[tuple[Path, int], None] = OrderedDict()
+        self._bc_rows_cache: OrderedDict[Path, list[Any]] = OrderedDict()
+        self.cache_cap = 8
+
+    def _cache(self, cache: OrderedDict[Any, Any], key: Any, value: Any) -> Any:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > self.cache_cap:
+            cache.popitem(last=False)
+        return value
 
     def _bc_rows(self, root: Path, window: Window) -> tuple[list[Any], list[Any], dict[str, Path]]:
         import pyarrow.parquet as pq
@@ -558,7 +588,11 @@ class RangeSourceLoader:
         episode = int(window.source_episode_id)
         parquet = _safe_file(root, f"data/chunk-{episode // 1000:03d}/episode_{episode:06d}.parquet", label="BC episode parquet")
         try:
-            rows = pq.read_table(parquet).slice(window.start, ACTION_HORIZON).to_pylist()
+            rows = self._bc_rows_cache.get(parquet)
+            if rows is None:
+                rows = pq.read_table(parquet).to_pylist()
+                self._cache(self._bc_rows_cache, parquet, rows)
+            rows = rows[window.start:window.stop]
         except Exception as error:
             raise ValueError("invalid BC episode parquet") from error
         if len(rows) != ACTION_HORIZON or any(row.get("frame_index") != frame or row.get("episode_index") != episode for frame, row in zip(window.frame_ids, rows, strict=True)):
@@ -576,7 +610,9 @@ class RangeSourceLoader:
         identity = episode.get("identity")
         if not isinstance(identity, dict) or episode.get("accepted_success") is not True or episode.get("outcome") != "success" or episode.get("terminal_reason") != "success" or identity.get("release_stage") != "seen" or identity.get("instruction") != INSTRUCTION:
             raise ValueError("rollout attempt is not accepted successful seen policy data")
-        self._verify_checksums(attempt_root)
+        if attempt_root not in self._attempt_cache:
+            self._verify_checksums(attempt_root)
+            self._cache(self._attempt_cache, attempt_root, None)
         annotations = _safe_file(attempt_root, "annotations.jsonl", label="rollout annotations")
         try:
             rows = [_strict_pairs(list(json.loads(line, object_pairs_hook=lambda pairs: pairs).items())) for line in annotations.read_text(encoding="utf-8").splitlines() if line]
@@ -614,7 +650,10 @@ class RangeSourceLoader:
             if any(not isinstance(row, list) or len(row) != 12 or any(type(number) not in (int, float) or not math.isfinite(float(number)) for number in row) for row in values):
                 raise ValueError(f"{label} dimension or finite-value drift")
         for path in videos.values():
-            _video_probe(path, stop=window.stop)
+            key = (path, window.stop)
+            if key not in self._video_cache:
+                _video_probe(path, stop=window.stop)
+                self._cache(self._video_cache, key, None)
         images = {camera: self.decoder(path, (window.start,), FPS) for camera, path in videos.items()}
         return {"images": {key.rsplit(".", 1)[-1]: value for key, value in images.items()}, "state": states[0], "actions": actions, "window_id": window.window_id}
 
