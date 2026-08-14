@@ -1482,6 +1482,20 @@ def test_runtime_pilot_live_readback_accepts_real_null_reliability_but_binds_mac
     assert not LIFECYCLE._runtime_pilot_live_matches(live=live | {"machine_id": 142448}, instance_id=47723784, offer=offer)
     assert not LIFECYCLE._runtime_pilot_live_matches(live=live | {"dph_total": .144445}, instance_id=47723784, offer=offer)
     assert not LIFECYCLE._runtime_pilot_live_matches(live=live | {"reliability": .97}, instance_id=47723784, offer=offer)
+    assert not LIFECYCLE._runtime_pilot_live_matches(live={key: value for key, value in live.items() if key != "actual_status"}, instance_id=47723784, offer=offer)
+
+
+@pytest.mark.parametrize("value", [True, float("nan"), float("inf"), float("-inf"), "0.99"])
+def test_runtime_pilot_reliability_predicate_rejects_nonfinite_or_non_numeric_values(value: object) -> None:
+    with pytest.raises(ValueError, match="reliability"):
+        LIFECYCLE._runtime_pilot_reliability(value)
+
+
+def test_runtime_pilot_sealed_offer_rejects_infinite_reliability(tmp_path: Path) -> None:
+    evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json"))
+    evidence["offer"]["reliability"] = float("inf")  # type: ignore[index]
+    with pytest.raises(ValueError, match="offer evidence"):
+        LIFECYCLE._runtime_pilot_offer(evidence)
 
 
 def test_rent_runtime_cpu_pilot_mismatch_cleans_only_new_instance_and_proves_absence(tmp_path: Path) -> None:

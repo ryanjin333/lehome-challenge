@@ -301,6 +301,13 @@ def _canonical_runtime_pilot_cpu_cores(value: object) -> int:
     return int(numeric)
 
 
+def _runtime_pilot_reliability(value: object) -> float:
+    """Require a finite numeric reliability value from paid offer evidence."""
+    if isinstance(value, bool) or type(value) not in (int, float) or not math.isfinite(float(value)):
+        raise ValueError("runtime pilot reliability must be a finite numeric value")
+    return float(value)
+
+
 def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: int = 300) -> dict[str, object]:
     # Vast produces the total hourly quote only after the requested disk size is
     # supplied.  ``dph_total`` below is consequently the single all-in 300GB
@@ -346,9 +353,10 @@ def capture_runtime_pilot_offer(*, runner: Runner, now_unix: int | None = None) 
             continue
         try:
             cores = _canonical_runtime_pilot_cpu_cores(row.get("cpu_cores_effective"))
+            reliability = _runtime_pilot_reliability(row.get("reliability"))
         except ValueError:
             continue
-        if row.get("cpu_arch") == "amd64" and cores >= 32 and type(row.get("cpu_ram")) in (int, float) and float(row["cpu_ram"]) >= 64000 and type(row.get("disk_space")) in (int, float) and float(row["disk_space"]) >= 120 and type(row.get("reliability")) in (int, float) and float(row["reliability"]) >= .98 and row.get("num_gpus") == 1 and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False and type(row.get("id")) is int and type(row.get("dph_total")) in (int, float):
+        if row.get("cpu_arch") == "amd64" and cores >= 32 and type(row.get("cpu_ram")) in (int, float) and float(row["cpu_ram"]) >= 64000 and type(row.get("disk_space")) in (int, float) and float(row["disk_space"]) >= 120 and reliability >= .98 and row.get("num_gpus") == 1 and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False and type(row.get("id")) is int and type(row.get("dph_total")) in (int, float):
             eligible.append((row, cores))
     if not eligible:
         raise ValueError("no on-demand native x86 runtime pilot offer is eligible")
@@ -364,6 +372,12 @@ def capture_runtime_pilot_offer(*, runner: Runner, now_unix: int | None = None) 
 def _runtime_pilot_offer(evidence: Mapping[str, object]) -> Mapping[str, object]:
     """Validate the short-lived, on-demand CPU pilot offer receipt."""
     offer = evidence.get("offer")
+    try:
+        reliability = _runtime_pilot_reliability(
+            offer.get("reliability") if isinstance(offer, Mapping) else None
+        )
+    except ValueError:
+        raise ValueError("runtime CPU pilot offer evidence is invalid") from None
     if (
         evidence.get("schema_version") != 1
         or evidence.get("kind") != "runtime_mixture_cpu_pilot_offer"
@@ -385,8 +399,7 @@ def _runtime_pilot_offer(evidence: Mapping[str, object]) -> Mapping[str, object]
         or float(offer["cpu_ram"]) < 64000
         or type(offer.get("disk_space")) not in (int, float)
         or float(offer["disk_space"]) < 120
-        or type(offer.get("reliability")) not in (int, float)
-        or float(offer["reliability"]) < .98
+        or reliability < .98
         or offer.get("num_gpus") != 1
         or offer.get("is_bid") is not False
         or offer.get("rentable") is not True
@@ -405,11 +418,10 @@ def _runtime_pilot_live_matches(*, live: Mapping[str, object], instance_id: int,
     except ValueError:
         return False
     reliability = live.get("reliability")
-    reliability_matches = reliability is None or (
-        type(reliability) in (int, float)
-        and math.isfinite(float(reliability))
-        and float(reliability) >= .98
-    )
+    try:
+        reliability_matches = reliability is None or _runtime_pilot_reliability(reliability) >= .98
+    except ValueError:
+        reliability_matches = False
     driver_matches = (
         not isinstance(offer.get("driver_version"), str)
         or not offer["driver_version"]
@@ -417,7 +429,7 @@ def _runtime_pilot_live_matches(*, live: Mapping[str, object], instance_id: int,
     )
     return (
         live.get("id") == instance_id
-        and live.get("actual_status", "running") == "running"
+        and live.get("actual_status") == "running"
         and live.get("cpu_arch") == "amd64"
         and cores >= 32
         and type(live.get("cpu_ram")) in (int, float)
@@ -572,7 +584,7 @@ def rent_runtime_cpu_pilot(
         live: object = {}
         for _ in range(max_readiness_polls):
             live = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
-            if isinstance(live, Mapping) and live.get("actual_status", "running") == "running" and live.get("ssh_host"):
+            if isinstance(live, Mapping) and live.get("actual_status") == "running" and live.get("ssh_host"):
                 break
             sleep(5.0)
         else:
@@ -635,7 +647,7 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
     live: object = {}
     for _ in range(max_readiness_polls):
         live = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
-        if isinstance(live, Mapping) and live.get("actual_status", "running") == "running" and live.get("ssh_host"):
+        if isinstance(live, Mapping) and live.get("actual_status") == "running" and live.get("ssh_host"):
             break
         sleep(5.0)
     else:
