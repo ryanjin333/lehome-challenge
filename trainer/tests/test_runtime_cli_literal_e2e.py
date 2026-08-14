@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from lehome_train.hub import HubAccess, HubTreeEntry
-from lehome_train.hub import HubRateLimitError
+from lehome_train.hub import HubRateLimitError, HubTransientError
 from lehome_train.io import sha256_file
 
 
@@ -67,6 +67,7 @@ class _MemoryHub:
         self.uploaded: list[tuple[str, str]] = []
         self.download_counts: dict[str, int] = {}
         self.rate_limit_calls: dict[str, set[int]] = {}
+        self.fail_next_download = False
 
     def check_access(self, *, repository: str, token: str) -> HubAccess:
         assert repository == LIFECYCLE.PARENT_CHECKPOINT["repository"] and token == "fake-token"
@@ -92,6 +93,9 @@ class _MemoryHub:
     def download_files(self, *, repository: str, revision: str, destination: Path, relative_paths, token: str, remote_prefix: str | None = None) -> str:
         assert repository == LIFECYCLE.PARENT_CHECKPOINT["repository"] and token == "fake-token"
         assert remote_prefix is not None
+        if self.fail_next_download:
+            self.fail_next_download = False
+            raise HubTransientError("transient immutable readback failure")
         count = self.download_counts.get(remote_prefix, 0) + 1
         self.download_counts[remote_prefix] = count
         if count in self.rate_limit_calls.get(remote_prefix, set()):
@@ -217,6 +221,37 @@ def test_runtime_supervisor_packages_and_anchors_the_real_one_k_boundary(
         transport_factory=lambda **_kwargs: hub,
     )["terminal"]
     assert terminal["resumable_checkpoint_step"] == 1000
+
+    # A replacement that fails before immutable recovery must be abort-cleaned
+    # without consuming the durable cursor claim.  The next lease can recover
+    # the same 1K anchor normally.
+    failed_replacement = {"kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 77, "host": "failed-replacement", "port": 22, "platform_arch": "x86_64", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "provider_response_sha256": "c" * 64, "capability_sha256": "3" * 64}
+    failed_cleanup = False
+    failed_calls: list[tuple[str, ...]] = []
+    def failed_runner(command: tuple[str, ...]) -> str:
+        nonlocal failed_cleanup
+        failed_calls.append(command)
+        if command == ("vastai", "destroy", "instance", "77", "--yes"):
+            failed_cleanup = True; return ""
+        if command == ("vastai", "--raw", "show", "instance", "77"):
+            return "{}" if failed_cleanup else '{"id":77}'
+        raise AssertionError(command)
+    failed_request = {
+        "instance": failed_replacement, "code_revision": code_revision, "code_bundle_sha256": code_sha, "schedule_seed": 17,
+        "bc_readback_receipt": str(bc_receipt), "rollout_readback_receipt": str(rollout_receipt), "deployment_receipt": str(deployment_receipt),
+        "checkpoint_experiment_id": "runtime-mixture-70-30", "experiment_config": str(paths["experiment_config"]),
+        "runtime_source_evidence": str(paths["runtime_source_evidence"]), "terminal_receipt": str(lost_terminal),
+        "resume_destination": str(prepared / "failed-resume-download"), "failure_receipt": str(tmp_path / "failed-resume-failure.json"),
+    }
+    hub.fail_next_download = True
+    with pytest.raises(HubTransientError, match="readback failure"):
+        LIFECYCLE.main_for_test(
+            ["runtime-checkpoint-replacement-resume", "--request", str(_write(tmp_path / "failed-replacement.json", failed_request)), "--execute", "--token-file", str(token)],
+            runner=failed_runner, transport_factory=lambda **_kwargs: hub,
+        )
+    assert failed_calls == [("vastai", "destroy", "instance", "77", "--yes"), ("vastai", "--raw", "show", "instance", "77")]
+    assert failed_cleanup and json.loads(Path(str(failed_request["failure_receipt"])).read_text())["cleanup_status"] == "destroyed_and_absent"
+    assert not (lost_terminal.with_name(lost_terminal.name + ".resume-claim.json")).exists()
 
     replacement = {"kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 11, "host": "replacement", "port": 22, "platform_arch": "x86_64", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "provider_response_sha256": "b" * 64, "capability_sha256": "3" * 64}
     resume_destination = prepared / "resume-download"

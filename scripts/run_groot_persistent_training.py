@@ -1522,32 +1522,6 @@ def resume_runtime_checkpoint(
     publication_for_claim = dict(publications[0])
     if publication_for_claim.get("optimizer_step") != 1000 or not isinstance(publication_for_claim.get("runtime_cursor"), Mapping):
         raise ValueError("runtime checkpoint replacement cursor is not the 1K boundary")
-    claim = {
-        "schema_version": 1, "kind": "runtime_mixture_resume_claim",
-        "terminal_sha256": sha256_file(terminal_file), "identity_sha256": identity.sha256,
-        "cursor_sha256": _hash(dict(publication_for_claim["runtime_cursor"])),
-        "publication_sha256": _hash(publication_for_claim),
-        "replacement_instance_id": replacement.get("instance_id"),
-        "experiment_config_sha256": sha256_file(Path(config_path)),
-    }
-    if type(claim["replacement_instance_id"]) is not int:
-        raise ValueError("runtime checkpoint replacement instance is invalid")
-    claim_path = terminal_file.with_name(terminal_file.name + ".resume-claim.json")
-    try:
-        descriptor = os.open(claim_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        observed_claim = _load_regular_json(claim_path, "runtime checkpoint resume claim")
-        if observed_claim != claim:
-            raise ValueError("runtime checkpoint cursor is already claimed by another replacement")
-    else:
-        try:
-            payload = json.dumps(claim, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            os.write(descriptor, payload)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        if _load_regular_json(claim_path, "runtime checkpoint resume claim") != claim:
-            raise ValueError("runtime checkpoint resume claim readback mismatches")
     from lehome_train.groot.runtime_checkpoint_lifecycle import (
         discover_runtime_checkpoint_anchor, provider_interruption_terminal,
     )
@@ -1579,6 +1553,37 @@ def resume_runtime_checkpoint(
         "physical_batch_size": cursor.physical_batch_size,
         "action_horizon": 16,
     }
+    # Claim only after discovery has resolved a stable immutable ref and
+    # materialized both authenticated bytes.  A transient Hub readback failure
+    # therefore abort-cleans its lease without consuming the durable cursor.
+    if publication != publication_for_claim:
+        raise ValueError("runtime checkpoint anchor no longer matches its interruption terminal")
+    claim = {
+        "schema_version": 1, "kind": "runtime_mixture_resume_claim",
+        "terminal_sha256": sha256_file(terminal_file), "identity_sha256": identity.sha256,
+        "cursor_sha256": _hash(dict(publication_for_claim["runtime_cursor"])),
+        "publication_sha256": _hash(publication_for_claim),
+        "replacement_instance_id": replacement.get("instance_id"),
+        "experiment_config_sha256": sha256_file(Path(config_path)),
+    }
+    if type(claim["replacement_instance_id"]) is not int:
+        raise ValueError("runtime checkpoint replacement instance is invalid")
+    claim_path = terminal_file.with_name(terminal_file.name + ".resume-claim.json")
+    try:
+        descriptor = os.open(claim_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        observed_claim = _load_regular_json(claim_path, "runtime checkpoint resume claim")
+        if observed_claim != claim:
+            raise ValueError("runtime checkpoint cursor is already claimed by another replacement")
+    else:
+        try:
+            payload = json.dumps(claim, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if _load_regular_json(claim_path, "runtime checkpoint resume claim") != claim:
+            raise ValueError("runtime checkpoint resume claim readback mismatches")
     return {"paid_action": True, "action": "runtime-checkpoint-resume", "instance_id": replacement["instance_id"], "runtime_cursor": runtime_cursor, "checkpoint_archive": str(cursor.checkpoint_archive), "checkpoint_descriptor": str(cursor.checkpoint_descriptor), "runtime_resume_anchor": discovered.previous_link(), "runtime_resume_publication": publication, "recovered_terminal": recovered_terminal, "immutable_anchor_revision": discovered.immutable_anchor_revision, "runtime_resume_claim": str(claim_path)}
 
 
