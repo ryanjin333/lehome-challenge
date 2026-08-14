@@ -42,6 +42,7 @@ INSTRUCTION = "fold the garment on the table"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SOURCE_TYPES = {"bc", "rollout", "dagger"}
+APPROVED_MIXTURE_REPOSITORY = "ryanjin333/lehome-groot-n17-data"
 
 
 def _strict_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -277,7 +278,7 @@ def _parse_manifest(path: Path) -> MixtureManifest:
     if document["schema_version"] != 2 or document["kind"] != "lehome_runtime_mixture":
         raise ValueError("mixture manifest version is unsupported")
     repository = document["repository"]
-    if type(repository) is not str or not repository.startswith("private/") or repository.count("/") != 1:
+    if repository != APPROVED_MIXTURE_REPOSITORY:
         raise ValueError("repository is not an approved private repository")
     revision = document["revision"]
     if type(revision) is not str or not _REVISION.fullmatch(revision):
@@ -588,15 +589,18 @@ class RangeSourceLoader:
         return [row.get("state") for row in rows], [row.get("action") for row in rows], {f"observation.images.{name}_rgb": path for name, path in videos.items()}
 
     def _verify_checksums(self, root: Path) -> None:
-        sums = _safe_file(root, "SHA256SUMS", label="raw SHA256SUMS")
+        sums = _safe_file(root, "SHA256SUMS.json", label="raw SHA256SUMS.json")
+        receipt = _load_object(sums, label="raw SHA256SUMS.json")
         expected: dict[str, str] = {}
-        for line in sums.read_text(encoding="utf-8").splitlines():
-            digest, separator, relative = line.partition("  ")
-            if not separator or not _SHA256.fullmatch(digest) or relative in expected:
-                raise ValueError("invalid raw SHA256SUMS")
+        for relative, identity in receipt.items():
             _relative(relative, label="raw checksum path")
-            expected[relative] = digest
-        actual = {path.relative_to(root).as_posix(): sha256_file(path) for path in root.rglob("*") if path.is_file() and path.name != "SHA256SUMS"}
+            if not isinstance(identity, dict):
+                raise ValueError("invalid raw SHA256SUMS.json")
+            _exact(identity, {"sha256", "size"}, label="raw checksum identity")
+            expected[relative] = _digest(identity["sha256"], label="raw checksum hash")
+            if _integer(identity["size"], label="raw checksum size") != _safe_file(root, relative, label="raw checksum file").stat().st_size:
+                raise ValueError("raw checksum size drift")
+        actual = {path.relative_to(root).as_posix(): sha256_file(path) for path in root.rglob("*") if path.is_file() and path.name != "SHA256SUMS.json"}
         if actual != expected:
             raise ValueError("raw checksum drift")
 

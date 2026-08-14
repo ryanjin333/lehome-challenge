@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -101,6 +102,12 @@ def test_build_launch_selects_guarded_runtime_mixture_entrypoint_only_when_expli
     assert launch.command[launch.command.index("--resume-sample-offset") + 1] == "128"
     assert "--official-launch" in launch.command
     assert "--dataset-path" in launch.command
+    assert launch.environment["PYTHONPATH"] == str(official_checkout)
+
+
+def test_runtime_launch_preserves_existing_pythonpath_after_official_checkout(official_checkout: Path) -> None:
+    launch = build_launch(config(runtime_mixture_manifest="/runtime/mixture.json", runtime_window_index="/runtime/windows.json", runtime_mounts_descriptor="/runtime/mounts.json"), visible_devices="0", environment={"PYTHONPATH": "/sentinel"}, official_checkout=official_checkout)
+    assert launch.environment["PYTHONPATH"] == str(official_checkout) + os.pathsep + "/sentinel"
 
 
 def test_continuous_launch_runs_one_process_to_2000_with_save_1000(

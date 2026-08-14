@@ -84,6 +84,15 @@ def test_config_records_four_gpu_global_batch_math_and_presentations() -> None:
     assert distributed.identity()["global_batch_size"] == 4
 
 
+def test_runtime_resume_cursor_is_operational_and_derives_from_checkpoint_step() -> None:
+    first = config(runtime_mixture_manifest="/runtime/m.json", runtime_window_index="/runtime/w.json", runtime_mounts_descriptor="/runtime/d.json", runtime_resume_sample_offset=0)
+    resumed = config(runtime_mixture_manifest="/runtime/m.json", runtime_window_index="/runtime/w.json", runtime_mounts_descriptor="/runtime/d.json", runtime_resume_sample_offset=64)
+    assert first.identity() == resumed.identity()
+    assert resumed.runtime_resume_offset_for_global_step(3) == 192
+    with pytest.raises(ValueError, match="global_step"):
+        resumed.runtime_resume_offset_for_global_step(-1)
+
+
 def test_rft_config_binds_step_12000_parent_capacity_to_a_16_step_training_target() -> None:
     resolved = config(
         base_model_path="/cache/models/lehome/policies/step-12000",

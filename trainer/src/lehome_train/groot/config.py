@@ -238,7 +238,6 @@ class FineTuneLaunchConfig:
             "runtime_mixture_manifest": self.runtime_mixture_manifest,
             "runtime_window_index": self.runtime_window_index,
             "runtime_mounts_descriptor": self.runtime_mounts_descriptor,
-            "runtime_resume_sample_offset": self.runtime_resume_sample_offset,
         }
 
     def sample_presentations_for_optimizer_steps(self, optimizer_steps: int) -> int:
@@ -248,3 +247,9 @@ class FineTuneLaunchConfig:
             raise ValueError("optimizer steps must be nonnegative")
         assert self.global_batch_size is not None
         return optimizer_steps * self.global_batch_size
+
+    def runtime_resume_offset_for_global_step(self, global_step: int) -> int:
+        if type(global_step) is not int or global_step < 0:
+            raise ValueError("checkpoint global_step must be a nonnegative integer")
+        assert self.global_batch_size is not None
+        return global_step * self.global_batch_size

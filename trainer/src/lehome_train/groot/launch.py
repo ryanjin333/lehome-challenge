@@ -191,7 +191,8 @@ def build_launch(
             *official_args,
         )
         safe_environment = dict(safe_environment)
-        safe_environment["PYTHONPATH"] = str(Path(official_checkout))
+        existing_pythonpath = safe_environment.get("PYTHONPATH")
+        safe_environment["PYTHONPATH"] = str(Path(official_checkout)) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
     return OfficialLaunch(
         command=command,
         environment=safe_environment,
