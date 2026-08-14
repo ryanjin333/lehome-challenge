@@ -459,6 +459,40 @@ def _publisher_token(path_value: object) -> str:
     return token
 
 
+def _runtime_resume_checkpoint(
+    *, request: Mapping[str, object], config: FineTuneLaunchConfig, mixture_id: object,
+) -> Path | None:
+    """Restore only the checkpoint archive named by an authenticated runtime cursor."""
+    archive_value, descriptor_value, cursor = (
+        request["runtime_resume_archive"], request["runtime_resume_descriptor"], request["runtime_resume_cursor"],
+    )
+    if archive_value is None and descriptor_value is None and cursor is None:
+        return None
+    if not isinstance(cursor, Mapping) or archive_value is None or descriptor_value is None:
+        raise ValueError("runtime resume requires archive, descriptor, and authenticated cursor")
+    archive = _mounted_path(archive_value, "runtime_resume_archive", must_exist=True, regular_file=True)
+    descriptor_path = _mounted_path(descriptor_value, "runtime_resume_descriptor", must_exist=True, regular_file=True)
+    descriptor = load_checkpoint_descriptor(descriptor_path)
+    record = descriptor.record
+    step = record.optimizer_step
+    expected_cursor = {"optimizer_step": step, "global_sample_offset": step * 64, "physical_batch_size": 64, "action_horizon": 16}
+    if (
+        step != 1000 or cursor != expected_cursor or record.dataset_manifest_sha256 != mixture_id
+        or record.sample_presentations != step * 64 or not record.resumable
+        or record.artifact.sha256 != sha256_file(archive) or record.artifact.byte_size != archive.stat().st_size
+    ):
+        raise ValueError("runtime resume cursor or checkpoint archive is incompatible")
+    from lehome_train.groot.production_adapters import _restore_checkpoint_archive
+    _restore_checkpoint_archive(
+        archive, output_root=Path(config.output_dir), expected_member_root=config.experiment_name,
+        optimizer_step=step, expected_identity=config.identity(), num_gpus=config.num_gpus,
+    )
+    restored = Path(config.output_dir) / config.experiment_name / f"checkpoint-{step}"
+    if restored.is_symlink() or not restored.is_dir():
+        raise ValueError("runtime resume archive did not restore the required checkpoint")
+    return restored
+
+
 def _resume_publication(
     *,
     value: object,
@@ -1490,6 +1524,7 @@ class ProductionRuntime:
             "launch_config", "experiment_config", "runtime_manifest", "runtime_window_index",
             "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence",
             "cpu_pilot_receipt", "warmup_receipt", "runtime_warmup_binding",
+            "runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor",
             "result_output", "status_output",
         }
         request = _exact(arguments, fields, "runtime-mixture-train")
@@ -1545,7 +1580,12 @@ class ProductionRuntime:
             raise ValueError("runtime production launch workers do not match the GPU warm-up receipt")
         if experiment.action_horizon != 16:
             raise ValueError("runtime production experiment horizon is incompatible")
-        completed = launch_continuous_finetune(config, **_launch_kwargs())
+        resume_checkpoint = _runtime_resume_checkpoint(
+            request=request, config=config, mixture_id=getattr(contract.manifest, "mixture_id", None),
+        )
+        completed = launch_continuous_finetune(
+            config, **_launch_kwargs(), resume_checkpoint=resume_checkpoint,
+        )
         payload = {
             "status": "runtime-mixture-launched",
             "runtime_manifest_sha256": sha256_file(paths["runtime_manifest"]),
@@ -1553,6 +1593,7 @@ class ProductionRuntime:
             "runtime_cycle_size": contract.manifest.cycle_size,
             "selected_loader_workers": selected_workers,
             "warmup_receipt_sha256": sha256_file(paths["warmup_receipt"]),
+            "resume_checkpoint_step": None if resume_checkpoint is None else 1000,
             "launch_returncode": completed.returncode,
         }
         _write_result(outputs["result_output"], payload)

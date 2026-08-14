@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 import subprocess
@@ -301,7 +301,8 @@ def launch_continuous_finetune(
     # authenticated checkpoint immediately before Trainer.train.
     if config.runtime_mixture_manifest is not None:
         command = _distributed_chunk_command(
-            config, stop_after_optimizer_step=config.max_steps, launch=launch
+            config, stop_after_optimizer_step=config.max_steps,
+            launch=replace(launch, command=command),
         )
     return runner(command, env=launch.environment, check=True)
 

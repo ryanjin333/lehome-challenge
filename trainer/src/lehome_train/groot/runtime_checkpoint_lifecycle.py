@@ -21,7 +21,9 @@ from lehome_train.io import canonical_json_sha256, sha256_file
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
 _STEPS = (1000, 2000)
-_PROVIDER_LOSS_KINDS = {"instance_absent", "preempted", "provider_unreachable"}
+# A transport outage says nothing about the paid lease.  Only the lifecycle
+# runner's repeated fresh Vast readbacks may classify an interruption.
+_PROVIDER_LOSS_KINDS = {"instance_absent", "preempted"}
 
 
 def _sha(value: object, label: str) -> str:

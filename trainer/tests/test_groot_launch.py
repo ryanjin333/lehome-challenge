@@ -155,6 +155,28 @@ def test_continuous_launch_passes_verified_resume_checkpoint_to_official_process
     assert command[command.index("--resume-from-checkpoint") + 1] == str(checkpoint)
 
 
+def test_runtime_continuous_launch_keeps_resume_checkpoint_inside_chunk_wrapper(
+    tmp_path: Path, official_checkout: Path,
+) -> None:
+    output = tmp_path / "output"
+    checkpoint = output / "lehome-groot-baseline" / "checkpoint-1000"
+    checkpoint.mkdir(parents=True)
+    runtime = config(
+        output_dir=str(output), max_steps=2_000, save_steps=1_000, physical_batch_size=64,
+        runtime_mixture_manifest="/runtime/mixture.json", runtime_window_index="/runtime/windows.json",
+        runtime_mounts_descriptor="/runtime/mounts.json",
+    )
+    (checkpoint.parent / "lehome_launch.json").write_text(__import__("json").dumps(runtime.identity()), encoding="utf-8")
+    calls: list[tuple[object, object]] = []
+    launch_continuous_finetune(
+        runtime, visible_devices="0", environment={}, official_checkout=official_checkout,
+        resume_checkpoint=checkpoint,
+        runner=lambda *args, **kwargs: calls.append((args, kwargs)) or subprocess.CompletedProcess([], 0),
+    )
+    command = calls[0][0][0]
+    assert command[command.index("--resume-from-checkpoint") + 1] == str(checkpoint)
+
+
 def test_build_launch_verifies_step_12000_parent_weights(
     tmp_path: Path, official_checkout: Path
 ) -> None:

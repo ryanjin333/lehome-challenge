@@ -181,6 +181,20 @@ def test_resume_rejects_a_terminal_without_authenticated_provider_loss(tmp_path:
         discover_runtime_mixture_resume(terminal=terminal, identity=identity, hub=hub, destination=tmp_path / "hydrate")
 
 
+def test_provider_unreachable_is_not_a_resumable_runtime_terminal(tmp_path: Path) -> None:
+    identity, hub = _identity(), FakeHub()
+    root = tmp_path / "checkpoint"
+    one = publish_runtime_mixture_checkpoint(
+        identity=identity, checkpoint=_checkpoint(root, step=1000, identity=identity),
+        artifact_root=root, publisher=hub.publish, hub=hub,
+    )
+    with pytest.raises(ValueError, match="provider loss"):
+        provider_interruption_terminal(
+            identity=identity, instance_id="instance-a", publications=(one,),
+            provider_loss={"kind": "provider_unreachable", "evidence_sha256": "8" * 64},
+        )
+
+
 def test_resume_rejects_a_terminal_outside_the_stable_receipt_schema(tmp_path: Path) -> None:
     identity, hub = _identity(), FakeHub()
     root = tmp_path / "checkpoint"
