@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
 import sys
 
 import pytest
@@ -18,6 +19,11 @@ assert SPEC is not None and SPEC.loader is not None
 LIFECYCLE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = LIFECYCLE
 SPEC.loader.exec_module(LIFECYCLE)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_claim_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(LIFECYCLE, "EVALUATION_RENT_CLAIM_ROOT", tmp_path / "claims-global")
 
 
 def _write(path: Path, value: object) -> Path:
@@ -44,8 +50,8 @@ def _manifest(tmp_path: Path, **changes: object) -> Path:
         "simulator_device": "cpu",
         "policy_device_pool": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
         "workers": 4,
-        "strategy": "baseline",
-        "max_steps": 128,
+        "strategy": "canonical",
+        "max_steps": 600,
         "groot_revision": LIFECYCLE.APPROVED_GROOT_REVISION,
         "groot_root": LIFECYCLE.APPROVED_GROOT_ROOT,
         "groot_python": LIFECYCLE.APPROVED_GROOT_PYTHON,
@@ -100,6 +106,18 @@ def test_malformed_preflight_makes_zero_provider_calls(tmp_path: Path) -> None:
     assert invoked == []
 
 
+@pytest.mark.parametrize(("field", "value"), (("strategy", "mild"), ("max_steps", 128)))
+def test_manifest_rejects_campaign_default_drift_before_provider_calls(tmp_path: Path, field: str, value: object) -> None:
+    manifest = _manifest(tmp_path)
+    payload = json.loads(manifest.read_text())
+    payload["invocation"][field] = value
+    _write(manifest, payload)
+    invoked: list[tuple[str, ...]] = []
+    with pytest.raises(ValueError, match="canonical CPU policy-server"):
+        LIFECYCLE.rent_evaluation(manifest, lifecycle_root=tmp_path / "life", runner=lambda command: invoked.append(command))
+    assert invoked == []
+
+
 @pytest.mark.parametrize("field,value", [("dph_total", 1.0), ("driver_version", "570.1"), ("is_bid", True)])
 def test_capture_requires_sub_dollar_on_demand_r580_offer(tmp_path: Path, field: str, value: object) -> None:
     offer = _healthy_offer(); offer[field] = value
@@ -123,7 +141,7 @@ def test_rent_rejects_account_overlap_before_create(tmp_path: Path) -> None:
             return "[]"
         raise AssertionError(command)
     with pytest.raises(ValueError, match="zero instances"):
-        LIFECYCLE.rent_evaluation(_manifest(tmp_path), lifecycle_root=tmp_path / "life", runner=runner, claim_root=tmp_path / "claims")
+        LIFECYCLE.rent_evaluation(_manifest(tmp_path), lifecycle_root=tmp_path / "life", runner=runner)
     assert not any(command[:4] == ("vastai", "--raw", "create", "instance") for command in invoked)
 
 
@@ -140,7 +158,10 @@ def test_rent_captures_only_r580_four_3090_host_and_hard_budget(tmp_path: Path) 
         if command[:4] == ("vastai", "--raw", "show", "instance"):
             return json.dumps(_healthy_instance())
         raise AssertionError(command)
-    receipt = LIFECYCLE.rent_evaluation(_manifest(tmp_path), lifecycle_root=tmp_path / "life", runner=runner, claim_root=tmp_path / "claims")
+    receipt = LIFECYCLE.rent_evaluation(
+        _manifest(tmp_path), lifecycle_root=tmp_path / "life", runner=runner,
+        watchdog_launcher=lambda instance_id, deadline, receipt: 4321,
+    )
     assert receipt["instance_id"] == 99
     assert receipt["invocation_sha256"] == LIFECYCLE.canonical_sha256(json.loads(_manifest(tmp_path).read_text())["invocation"])
     create = next(command for command in invoked if command[:4] == ("vastai", "--raw", "create", "instance"))
@@ -153,7 +174,7 @@ def test_stage_launch_uses_exact_cpu_policy_server_four_cuda_slots_and_wall_cap(
     bundle = tmp_path / "code.bundle"; bundle.write_bytes(b"bundle")
     _bind_bundle(manifest, bundle)
     token = tmp_path / "token"; token.write_text("secret", encoding="utf-8"); token.chmod(0o600)
-    instance = {"kind": "groot_checkpoint_evaluation_instance", "instance_id": 99, "host": "example.test", "port": 22, "lease_deadline_unix": __import__("time").time_ns() // 1_000_000_000 + LIFECYCLE.MAX_WALL_SECONDS, "invocation_sha256": LIFECYCLE.canonical_sha256(json.loads(manifest.read_text())["invocation"])}
+    instance = {"kind": "groot_checkpoint_evaluation_instance", "instance_id": 99, "host": "example.test", "port": 22, "lease_deadline_unix": __import__("time").time_ns() // 1_000_000_000 + LIFECYCLE.MAX_WALL_SECONDS, "watchdog_pid": 4321, "watchdog_receipt": str(tmp_path / "watchdog.json"), "rent_claim_path": str(LIFECYCLE.EVALUATION_RENT_CLAIM_ROOT / "active.json"), "invocation_sha256": LIFECYCLE.canonical_sha256(json.loads(manifest.read_text())["invocation"])}
     invoked: list[tuple[str, ...]] = []
     def runner(command: tuple[str, ...]):
         invoked.append(command)
@@ -170,6 +191,8 @@ def test_stage_launch_uses_exact_cpu_policy_server_four_cuda_slots_and_wall_cap(
     assert "hf download lehome/asset_challenge --repo-type dataset --revision" in script
     assert all(f"cuda:{slot}" in script for slot in range(4))
     assert "timeout --signal=TERM --kill-after=20s " in script and f"{LIFECYCLE.MAX_WALL_SECONDS + 1}s" not in script
+    timeout_match = re.search(r"timeout --signal=TERM --kill-after=20s (\d+)s", script)
+    assert timeout_match is not None and int(timeout_match.group(1)) <= LIFECYCLE.MAX_WALL_SECONDS - LIFECYCLE.LEASE_WATCHDOG_RESERVE_SECONDS
     assert "git -C" in script and "diff --quiet" in script
     assert "/opt/lehome-challenge/.venv/bin/python -m scripts.run_groot_flywheel_campaign" in script
     assert "PYTHONPATH=" in script
@@ -190,7 +213,10 @@ def test_remote_failure_syncs_redacted_evidence_and_destroys_exactly_once(tmp_pa
     bundle = tmp_path / "code.bundle"; bundle.write_bytes(b"bundle")
     _bind_bundle(manifest, bundle)
     token = tmp_path / "token"; token.write_text("secret-token", encoding="utf-8"); token.chmod(0o600)
-    instance = {"kind": "groot_checkpoint_evaluation_instance", "instance_id": 99, "host": "example.test", "port": 22, "lease_deadline_unix": __import__("time").time_ns() // 1_000_000_000 + LIFECYCLE.MAX_WALL_SECONDS, "invocation_sha256": LIFECYCLE.canonical_sha256(json.loads(manifest.read_text())["invocation"])}
+    instance = {"kind": "groot_checkpoint_evaluation_instance", "instance_id": 99, "host": "example.test", "port": 22, "lease_deadline_unix": __import__("time").time_ns() // 1_000_000_000 + LIFECYCLE.MAX_WALL_SECONDS, "watchdog_pid": 4321, "watchdog_receipt": str(tmp_path / "watchdog.json"), "rent_claim_path": str(LIFECYCLE.EVALUATION_RENT_CLAIM_ROOT / "active.json"), "invocation_sha256": LIFECYCLE.canonical_sha256(json.loads(manifest.read_text())["invocation"])}
+    claim_path = LIFECYCLE._rent_claim_path(json.loads(manifest.read_text()))
+    claim = LIFECYCLE._acquire_rent_claim(claim_path, json.loads(manifest.read_text()))
+    LIFECYCLE._terminalize_rent_claim(claim_path, claim, status="succeeded", instance_id=99)
     invoked: list[tuple[str, ...]] = []; destroyed = False
     def runner(command: tuple[str, ...]):
         nonlocal destroyed
@@ -213,18 +239,27 @@ def test_remote_failure_syncs_redacted_evidence_and_destroys_exactly_once(tmp_pa
 def test_publication_receipt_must_bind_current_instance_and_exact_invocation(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     invocation = json.loads(manifest.read_text())["invocation"]
-    instance = _write(tmp_path / "instance.json", {"kind": "groot_checkpoint_evaluation_instance", "instance_id": 99, "invocation_sha256": LIFECYCLE.canonical_sha256(invocation)})
+    instance = _write(tmp_path / "instance.json", {"kind": "groot_checkpoint_evaluation_instance", "instance_id": 99, "rent_claim_path": str(LIFECYCLE.EVALUATION_RENT_CLAIM_ROOT / "active.json"), "invocation_sha256": LIFECYCLE.canonical_sha256(invocation)})
     publication = _write(tmp_path / "publication.json", {"kind": "groot_checkpoint_evaluation_publication", "disposable": True, "instance_id": 99, "instance_receipt_sha256": hashlib.sha256(instance.read_bytes()).hexdigest(), "invocation": invocation, "invocation_sha256": LIFECYCLE.canonical_sha256(invocation), "immutable_revision": "a" * 40, "remote_prefix": "evaluations/x", "repository_private": True, "tree_listing_verified": True, "fresh_readback_verified": True})
     invoked: list[tuple[str, ...]] = []
+    destroyed = False
     def runner(command: tuple[str, ...]) -> str:
+        nonlocal destroyed
         invoked.append(command)
-        if command[:3] == ("vastai", "destroy", "instance"): return ""
-        if command[:4] == ("vastai", "--raw", "show", "instance"): return "{}"
-        if command[-1] in {"instances", "volumes"}: return "[]"
+        if command[:3] == ("vastai", "destroy", "instance"):
+            destroyed = True; return ""
+        if command[:4] == ("vastai", "--raw", "show", "instance"): return "{}" if destroyed else json.dumps(_healthy_instance())
+        if command[-1] == "instances": return "[]" if destroyed else json.dumps([_healthy_instance()])
+        if command[-1] == "volumes": return "[]"
         raise AssertionError(command)
     disposal = tmp_path / "disposal.json"
+    claim_path = LIFECYCLE._rent_claim_path(json.loads(manifest.read_text()))
+    claim = LIFECYCLE._acquire_rent_claim(claim_path, json.loads(manifest.read_text()))
+    LIFECYCLE._terminalize_rent_claim(claim_path, claim, status="succeeded", instance_id=99)
     receipt = LIFECYCLE.destroy_after_publication(99, publication, instance, disposal_receipt=disposal, runner=runner)
     assert receipt["destroyed_and_absent"] is True
+    assert receipt["destroy_issued"] is True
+    assert sum(command[:3] == ("vastai", "destroy", "instance") for command in invoked) == 1
     assert receipt["publication_receipt_sha256"] == hashlib.sha256(publication.read_bytes()).hexdigest()
     stale = json.loads(publication.read_text()); stale["instance_id"] = 17; _write(publication, stale)
     with pytest.raises(ValueError, match="publication"):
@@ -233,18 +268,20 @@ def test_publication_receipt_must_bind_current_instance_and_exact_invocation(tmp
 
 def test_rent_claim_is_singleton_and_second_controller_is_provider_free(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
-    claim_root = tmp_path / "claims"
-    claim_path = LIFECYCLE._rent_claim_path(json.loads(manifest.read_text()), root=claim_root)
+    claim_path = LIFECYCLE._rent_claim_path(json.loads(manifest.read_text()))
     LIFECYCLE._acquire_rent_claim(claim_path, json.loads(manifest.read_text()))
+    other = json.loads(manifest.read_text())
+    other["code_bundle_sha256"] = "1" * 64
+    assert LIFECYCLE._rent_claim_path(other) == claim_path
     invoked: list[tuple[str, ...]] = []
     with pytest.raises(ValueError, match="already held"):
-        LIFECYCLE.rent_evaluation(manifest, lifecycle_root=tmp_path / "life", runner=lambda command: invoked.append(command), claim_root=claim_root)
+        LIFECYCLE.rent_evaluation(manifest, lifecycle_root=tmp_path / "life", runner=lambda command: invoked.append(command))
     assert invoked == []
 
 
 def test_ambiguous_create_blocks_claim_and_prevents_second_rent(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
-    claim_root = tmp_path / "claims"
+    claim_root = LIFECYCLE.EVALUATION_RENT_CLAIM_ROOT
     invoked: list[tuple[str, ...]] = []
 
     def runner(command: tuple[str, ...]) -> str:
@@ -258,18 +295,18 @@ def test_ambiguous_create_blocks_claim_and_prevents_second_rent(tmp_path: Path) 
         raise AssertionError(command)
 
     with pytest.raises(RuntimeError, match="lacks instance ID"):
-        LIFECYCLE.rent_evaluation(manifest, lifecycle_root=tmp_path / "life", runner=runner, claim_root=claim_root, ambiguous_create_polls=1)
-    claim_path = LIFECYCLE._rent_claim_path(json.loads(manifest.read_text()), root=claim_root)
+        LIFECYCLE.rent_evaluation(manifest, lifecycle_root=tmp_path / "life", runner=runner, ambiguous_create_polls=1)
+    claim_path = LIFECYCLE._rent_claim_path(json.loads(manifest.read_text()))
     assert json.loads(claim_path.read_text())["status"] == "blocked_ambiguous_create"
     later: list[tuple[str, ...]] = []
     with pytest.raises(ValueError, match="already held"):
-        LIFECYCLE.rent_evaluation(manifest, lifecycle_root=tmp_path / "later", runner=lambda command: later.append(command), claim_root=claim_root)
+        LIFECYCLE.rent_evaluation(manifest, lifecycle_root=tmp_path / "later", runner=lambda command: later.append(command))
     assert later == []
 
 
 def test_ambiguous_create_cleans_the_only_new_compatible_host_and_releases_claim(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
-    claim_root = tmp_path / "claims"
+    claim_root = LIFECYCLE.EVALUATION_RENT_CLAIM_ROOT
     invoked: list[tuple[str, ...]] = []
     create_attempted = False
     destroyed = False
@@ -294,7 +331,7 @@ def test_ambiguous_create_cleans_the_only_new_compatible_host_and_releases_claim
         raise AssertionError(command)
 
     with pytest.raises(RuntimeError, match="lacks instance ID"):
-        LIFECYCLE.rent_evaluation(manifest, lifecycle_root=tmp_path / "life", runner=runner, claim_root=claim_root, ambiguous_create_polls=1)
+        LIFECYCLE.rent_evaluation(manifest, lifecycle_root=tmp_path / "life", runner=runner, ambiguous_create_polls=1)
     assert sum(command[:3] == ("vastai", "destroy", "instance") for command in invoked) == 1
     assert list(claim_root.glob("*.json")) == []
 
@@ -307,10 +344,115 @@ def test_disposal_accepts_vast_instances_null_absence_shape() -> None:
     assert LIFECYCLE._verify_absent(99, runner) == (True, True, True)
 
 
+def test_disposal_does_not_treat_an_instance_row_as_absent() -> None:
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "show", "instance"):
+            return json.dumps(_healthy_instance())
+        if command[-1] == "instances":
+            return json.dumps([_healthy_instance()])
+        return "[]"
+
+    assert LIFECYCLE._verify_absent(99, runner, polls=1) == (False, False, True)
+
+
+def test_watchdog_destroys_once_at_deadline_and_keeps_account_empty(tmp_path: Path) -> None:
+    destroyed = False
+    invoked: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal destroyed
+        invoked.append(command)
+        if command[:3] == ("vastai", "destroy", "instance"):
+            destroyed = True
+            return ""
+        if command[:4] == ("vastai", "--raw", "show", "instance"):
+            return "{}" if destroyed else json.dumps(_healthy_instance())
+        if command[-1] == "instances":
+            return "[]" if destroyed else json.dumps([_healthy_instance()])
+        if command[-1] == "volumes":
+            return "[]"
+        raise AssertionError(command)
+
+    receipt = LIFECYCLE.enforce_lease_deadline(
+        99, 100, tmp_path / "watchdog.json", runner=runner,
+        sleep=lambda _seconds: None, now=lambda: 100,
+    )
+    assert receipt["destroyed_and_absent"] is True and receipt["destroy_issued"] is True
+    assert sum(command[:3] == ("vastai", "destroy", "instance") for command in invoked) == 1
+
+
+def test_watchdog_and_explicit_disposal_share_one_destroy_lock() -> None:
+    destroyed = False
+    invoked: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal destroyed
+        invoked.append(command)
+        if command[:3] == ("vastai", "destroy", "instance"):
+            destroyed = True
+            return ""
+        if command[:4] == ("vastai", "--raw", "show", "instance"):
+            return "{}" if destroyed else json.dumps(_healthy_instance())
+        if command[-1] == "instances":
+            return "[]" if destroyed else json.dumps([_healthy_instance()])
+        if command[-1] == "volumes":
+            return "[]"
+        raise AssertionError(command)
+
+    first = LIFECYCLE._destroy_owned_once(99, runner, polls=1)
+    second = LIFECYCLE._destroy_owned_once(99, runner, polls=1)
+    assert first == (True, True, True, True)
+    assert second == (False, True, True, True)
+    assert sum(command[:3] == ("vastai", "destroy", "instance") for command in invoked) == 1
+
+
+def test_pretransport_validation_failure_still_cleans_host_and_releases_claim(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    bundle = tmp_path / "wrong.bundle"; bundle.write_bytes(b"wrong")
+    token = tmp_path / "token"; token.write_text("secret", encoding="utf-8"); token.chmod(0o600)
+    invocation = json.loads(manifest.read_text())["invocation"]
+    instance = {
+        "kind": "groot_checkpoint_evaluation_instance", "instance_id": 99,
+        "host": "example.test", "port": 22,
+        "lease_deadline_unix": __import__("time").time_ns() // 1_000_000_000 + LIFECYCLE.MAX_WALL_SECONDS,
+        "watchdog_pid": 4321, "watchdog_receipt": str(tmp_path / "watchdog.json"),
+        "rent_claim_path": str(LIFECYCLE.EVALUATION_RENT_CLAIM_ROOT / "active.json"),
+        "invocation_sha256": LIFECYCLE.canonical_sha256(invocation),
+    }
+    claim_path = LIFECYCLE._rent_claim_path(json.loads(manifest.read_text()))
+    claim = LIFECYCLE._acquire_rent_claim(claim_path, json.loads(manifest.read_text()))
+    LIFECYCLE._terminalize_rent_claim(claim_path, claim, status="succeeded", instance_id=99)
+    destroyed = False
+    invoked: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal destroyed
+        invoked.append(command)
+        if command[:3] == ("vastai", "destroy", "instance"):
+            destroyed = True
+            return ""
+        if command[:4] == ("vastai", "--raw", "show", "instance"):
+            return "{}" if destroyed else json.dumps(_healthy_instance())
+        if command[-1] == "instances":
+            return "[]" if destroyed else json.dumps([_healthy_instance()])
+        if command[-1] == "volumes":
+            return "[]"
+        return type("Result", (), {"returncode": 0, "stdout": ""})()
+
+    with pytest.raises(RuntimeError, match="instance disposed"):
+        LIFECYCLE.stage_launch_sync_evaluation(
+            manifest, instance, lifecycle_root=tmp_path / "life", runner=runner,
+            code_bundle=bundle, token_file=token,
+        )
+    assert sum(command[:3] == ("vastai", "destroy", "instance") for command in invoked) == 1
+    assert not claim_path.exists()
+
+
 def test_disposal_absence_timeout_records_failure_after_exactly_one_destroy(tmp_path: Path) -> None:
     invocation = json.loads(_manifest(tmp_path).read_text())["invocation"]
     instance = _write(tmp_path / "instance.json", {
         "kind": "groot_checkpoint_evaluation_instance", "instance_id": 99,
+        "rent_claim_path": str(LIFECYCLE.EVALUATION_RENT_CLAIM_ROOT / "active.json"),
         "invocation_sha256": LIFECYCLE.canonical_sha256(invocation),
     })
     publication = _write(tmp_path / "publication.json", {

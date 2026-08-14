@@ -9,6 +9,7 @@ and disposal path.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -30,6 +31,7 @@ APPROVED_IMAGE_REPOSITORY = "ryanjin333/lehome-rollout"
 # This is the immutable Docker Hub manifest used by the canonical 1K/2K runs.
 APPROVED_IMAGE_DIGEST = "sha256:293c4f258f3742a7234699d706fb7088d0da8a764957bc79b244d830561abc12"
 MAX_WALL_SECONDS = 4 * 60 * 60
+LEASE_WATCHDOG_RESERVE_SECONDS = 5 * 60
 MAX_TOTAL_DOLLARS = 3.00
 MAX_PROJECTED_HOURLY_USD = 1.00  # strict: equality is rejected
 OFFER_QUERY = "gpu_name=RTX_3090 num_gpus=4 reliability>=0.95 cpu_cores_effective>=64 cpu_ram>=128 disk_space>=300 duration>=4"
@@ -161,6 +163,8 @@ def _validate_invocation(invocation: object) -> dict[str, object]:
         "simulator_device": "cpu",
         "policy_device_pool": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
         "workers": 4,
+        "strategy": "canonical",
+        "max_steps": 600,
     }
     if any(invocation.get(key) != value for key, value in required.items()):
         raise ValueError("lifecycle manifest invocation is not the canonical CPU policy-server top-40 run")
@@ -280,7 +284,7 @@ def _verify_absent(instance_id: int, runner: Callable[[tuple[str, ...]], object]
         exact = _raw(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
         instances = _raw(runner, ("vastai", "--raw", "show", "instances"))
         volumes = _raw(runner, ("vastai", "--raw", "show", "volumes"))
-        exact_absent = exact in (None, {}, []) or (isinstance(exact, dict) and exact.get("instances") is None)
+        exact_absent = exact in (None, {}, []) or exact == {"instances": None}
         status = (exact_absent, instances == [], volumes == [])
         if all(status) or index + 1 == polls:
             return status
@@ -311,32 +315,28 @@ def _resolve_ambiguous_create(
 
 def _cleanup_failure(instance_id: int, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object], reason: str, *, sync_attempted: bool = False) -> None:
     """Destroy the owned instance once and preserve redacted disposal evidence."""
-    runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
-    exact_empty, instances_empty, volumes_empty = _verify_absent(instance_id, runner)
+    destroy_issued, exact_empty, instances_empty, volumes_empty = _destroy_owned_once(instance_id, runner)
     receipt = {
         "schema_version": 1, "kind": "groot_checkpoint_evaluation_failure_disposal",
         "instance_id": instance_id, "reason": reason, "instance_absent": exact_empty,
         "account_instances_empty": instances_empty, "account_volumes_empty": volumes_empty,
-        "synced_available_evidence": sync_attempted, "redacted": True,
+        "destroy_issued": destroy_issued, "synced_available_evidence": sync_attempted, "redacted": True,
     }
     _write_new(lifecycle_root / f"failure-{instance_id}.json", receipt)
     if not all((exact_empty, instances_empty, volumes_empty)):
         raise RuntimeError("failure disposal did not verify empty provider account")
 
 
-def _rent_claim_path(manifest: Mapping[str, object], *, root: Path | None = None) -> Path:
-    claim_root = EVALUATION_RENT_CLAIM_ROOT if root is None else Path(root)
+def _rent_claim_path(manifest: Mapping[str, object]) -> Path:
+    claim_root = EVALUATION_RENT_CLAIM_ROOT
     if claim_root.is_symlink():
         raise ValueError("evaluation rent claim root is unsafe")
     claim_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if claim_root.is_symlink() or not claim_root.is_dir():
         raise ValueError("evaluation rent claim root is unsafe")
-    identity = {
-        "invocation": manifest["invocation"],
-        "rollout_image": manifest["rollout_image"],
-        "code_bundle_sha256": manifest["code_bundle_sha256"],
-    }
-    return claim_root / (canonical_sha256(identity) + ".json")
+    # One account-wide claim prevents distinct valid manifests from racing the
+    # zero-resource preflight into two simultaneous provider creates.
+    return claim_root / "active.json"
 
 
 def _acquire_rent_claim(path: Path, manifest: Mapping[str, object]) -> dict[str, object]:
@@ -403,12 +403,97 @@ def _terminalize_rent_claim(path: Path, claim: Mapping[str, object], *, status: 
     _replace_rent_claim(path, claim, replacement)
 
 
-def rent_evaluation(manifest_path: Path, *, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object], now_unix: int | None = None, claim_root: Path | None = None, ambiguous_create_polls: int = 60, sleep: Callable[[float], None] = time.sleep) -> dict[str, object]:
+def _destroy_owned_once(
+    instance_id: int, runner: Callable[[tuple[str, ...]], object], *, polls: int = 60,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[bool, bool, bool, bool]:
+    """Serialize watchdog, failure cleanup, and publication disposal."""
+    root = EVALUATION_RENT_CLAIM_ROOT
+    if root.is_symlink():
+        raise RuntimeError("evaluation destroy lock root is unsafe")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(root / "destroy.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        exact_empty, instances_empty, volumes_empty = _verify_absent(instance_id, runner, polls=1, sleep=sleep)
+        destroy_issued = False
+        if not exact_empty:
+            runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+            destroy_issued = True
+            exact_empty, instances_empty, volumes_empty = _verify_absent(instance_id, runner, polls=polls, sleep=sleep)
+        return destroy_issued, exact_empty, instances_empty, volumes_empty
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _release_completed_rent_claim(instance: Mapping[str, object]) -> None:
+    expected_path = EVALUATION_RENT_CLAIM_ROOT / "active.json"
+    if instance.get("rent_claim_path") != str(expected_path):
+        raise RuntimeError("evaluation instance does not bind the controller-owned rent claim")
+    claim = _read_json(expected_path, "evaluation rent claim")
+    if claim.get("status") != "succeeded" or claim.get("instance_id") != instance.get("instance_id"):
+        raise RuntimeError("evaluation rent claim does not match the completed instance")
+    expected_path.unlink()
+    parent_descriptor = os.open(expected_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _launch_lease_watchdog(instance_id: int, deadline_unix: int, receipt: Path) -> int:
+    """Start a detached local controller that enforces the hard lease deadline."""
+    process = subprocess.Popen(
+        (
+            "/usr/bin/caffeinate", "-dimsu", sys.executable,
+            str(Path(__file__).resolve()), "watchdog-destroy",
+            "--instance-id", str(instance_id), "--deadline-unix", str(deadline_unix),
+            "--receipt", str(receipt), "--execute",
+        ),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True, close_fds=True,
+    )
+    if type(process.pid) is not int or process.pid <= 0:
+        raise RuntimeError("evaluation lease watchdog did not start")
+    return process.pid
+
+
+def enforce_lease_deadline(
+    instance_id: int, deadline_unix: int, receipt: Path, *,
+    runner: Callable[[tuple[str, ...]], object], sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.time,
+) -> dict[str, object]:
+    """Destroy the owned host at the hard deadline unless it is already absent."""
+    if type(instance_id) is not int or instance_id <= 0 or type(deadline_unix) is not int or deadline_unix <= 0:
+        raise ValueError("evaluation lease watchdog identity is invalid")
+    if not receipt.is_absolute() or receipt.exists() or receipt.is_symlink():
+        raise ValueError("evaluation lease watchdog receipt must be an absent absolute path")
+    delay = max(0.0, float(deadline_unix) - now())
+    if delay:
+        sleep(delay)
+    destroy_issued, exact_empty, instances_empty, volumes_empty = _destroy_owned_once(
+        instance_id, runner, sleep=sleep,
+    )
+    value = {
+        "schema_version": 1, "kind": "groot_checkpoint_evaluation_lease_watchdog",
+        "instance_id": instance_id, "deadline_unix": deadline_unix,
+        "destroy_issued": destroy_issued, "instance_absent": exact_empty,
+        "account_instances_empty": instances_empty, "account_volumes_empty": volumes_empty,
+        "destroyed_and_absent": all((exact_empty, instances_empty, volumes_empty)),
+    }
+    written = _write_new(receipt, value)
+    if not written["destroyed_and_absent"]:
+        raise RuntimeError("evaluation lease watchdog could not verify provider absence")
+    return written
+
+
+def rent_evaluation(manifest_path: Path, *, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object], now_unix: int | None = None, ambiguous_create_polls: int = 60, sleep: Callable[[float], None] = time.sleep, watchdog_launcher: Callable[[int, int, Path], int] = _launch_lease_watchdog) -> dict[str, object]:
     """Rent exactly one compatible host after a validated local-only preflight."""
     manifest = read_lifecycle_manifest(manifest_path)  # must precede every provider call
     timestamp = time.time_ns() // 1_000_000_000 if now_unix is None else now_unix
     _ssh_identity()  # fail before the irreversible provider create call
-    claim_path = _rent_claim_path(manifest, root=claim_root)
+    claim_path = _rent_claim_path(manifest)
     claim = _acquire_rent_claim(claim_path, manifest)
     create_attempted = False
     instance_id: int | None = None
@@ -439,11 +524,16 @@ def rent_evaluation(manifest_path: Path, *, lifecycle_root: Path, runner: Callab
             raise ValueError("new instance readback cost differs from preflight offer")
         invocation = manifest["invocation"]
         lease_started = timestamp
+        lease_deadline = lease_started + MAX_WALL_SECONDS
+        watchdog_receipt = lifecycle_root / f"watchdog-{instance_id}.json"
+        watchdog_pid = watchdog_launcher(instance_id, lease_deadline, watchdog_receipt)
         receipt = {
             "schema_version": 1, "kind": "groot_checkpoint_evaluation_instance", "instance_id": instance_id,
             "host": live["ssh_host"], "port": live.get("ssh_port", 22), "invocation_sha256": canonical_sha256(invocation),
             "provider_evidence_sha256": canonical_sha256(evidence), "provider_response_sha256": canonical_sha256(live),
-            "lease_started_unix": lease_started, "lease_deadline_unix": lease_started + MAX_WALL_SECONDS,
+            "lease_started_unix": lease_started, "lease_deadline_unix": lease_deadline,
+            "watchdog_pid": watchdog_pid, "watchdog_receipt": str(watchdog_receipt),
+            "rent_claim_path": str(claim_path),
             "hard_wall_seconds": MAX_WALL_SECONDS, "total_dollar_ceiling_usd": MAX_TOTAL_DOLLARS,
         }
         written = _write_new(lifecycle_root / f"instance-{instance_id}.json", receipt)
@@ -514,16 +604,27 @@ def stage_launch_sync_evaluation(manifest_path: Path, instance_receipt: Mapping[
     if (instance_receipt.get("kind") != "groot_checkpoint_evaluation_instance" or type(instance_id) is not int or instance_id <= 0
             or instance_receipt.get("invocation_sha256") != canonical_sha256(invocation)
             or not isinstance(instance_receipt.get("host"), str) or type(instance_receipt.get("port")) is not int
-            or type(instance_receipt.get("lease_deadline_unix")) is not int):
+            or type(instance_receipt.get("lease_deadline_unix")) is not int
+            or type(instance_receipt.get("watchdog_pid")) is not int or instance_receipt["watchdog_pid"] <= 0
+            or not isinstance(instance_receipt.get("watchdog_receipt"), str)
+            or not Path(str(instance_receipt["watchdog_receipt"])).is_absolute()
+            or instance_receipt.get("rent_claim_path") != str(EVALUATION_RENT_CLAIM_ROOT / "active.json")):
         raise ValueError("instance receipt is not bound to the exact evaluation invocation")
     remote = f"root@{instance_receipt['host']}"; port = str(instance_receipt["port"])
     identity = canonical_sha256(invocation)[:16]
     remote_root = f"/workspace/checkpoint-evaluation/{identity}"
     output_remote = f"{remote_root}/evaluation"
     remaining_seconds = int(instance_receipt["lease_deadline_unix"]) - time.time_ns() // 1_000_000_000
+    campaign_seconds = remaining_seconds - LEASE_WATCHDOG_RESERVE_SECONDS
     sync_attempted = False
+    identity_file: str | None = None
+    transport_options = (
+        "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
+        "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+    )
     try:
-        if remaining_seconds <= 0 or remaining_seconds > MAX_WALL_SECONDS:
+        if campaign_seconds <= 0 or remaining_seconds > MAX_WALL_SECONDS:
             raise ValueError("instance lease deadline is invalid or exhausted")
         if code_bundle.is_symlink() or not code_bundle.is_file() or hashlib.sha256(code_bundle.read_bytes()).hexdigest() != manifest["code_bundle_sha256"]:
             raise ValueError("clean exact code bundle is unavailable")
@@ -532,11 +633,6 @@ def stage_launch_sync_evaluation(manifest_path: Path, instance_receipt: Mapping[
         _prelaunch_account(instance_receipt, runner)
         bundle_remote, token_remote = f"{remote_root}/code.bundle", f"{remote_root}/hf.token"
         identity_file = _ssh_identity()
-        transport_options = (
-            "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
-            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
-        )
         ssh = ("ssh", "-i", identity_file, *transport_options, "-p", port, remote)
         for command, label in ((ssh + ("mkdir", "-p", remote_root), "remote staging"),
                                (("scp", "-i", identity_file, *transport_options, "-P", port, str(code_bundle), f"{remote}:{bundle_remote}"), "code staging"),
@@ -575,7 +671,7 @@ def stage_launch_sync_evaluation(manifest_path: Path, instance_receipt: Mapping[
             + shlex.quote("from pathlib import Path; from scripts.run_groot_flywheel_trial import policy_artifact_sha256; assert policy_artifact_sha256(Path(" + repr(policy_path) + ")) == " + repr(str(invocation["policy_artifact_sha256"]))) + "; "
             + "export CUDA_VISIBLE_DEVICES=0,1,2,3 LEHOME_POLICY_DEVICE_POOL=cuda:0,cuda:1,cuda:2,cuda:3; "
             + "test \"$LEHOME_POLICY_DEVICE_POOL\" = cuda:0,cuda:1,cuda:2,cuda:3; "
-            + "timeout --signal=TERM --kill-after=20s " + str(remaining_seconds) + "s "
+            + "timeout --signal=TERM --kill-after=20s " + str(campaign_seconds) + "s "
             + corrective._controller_pythonpath(checkout, wire_target=wire_target) + " /opt/lehome-challenge/.venv/bin/python -m scripts.run_groot_flywheel_campaign"
             + " " + arguments
         )
@@ -597,8 +693,13 @@ def stage_launch_sync_evaluation(manifest_path: Path, instance_receipt: Mapping[
             # copy is intentionally best-effort and never carries token bytes
             # into a receipt; disposal remains mandatory either way.
             sync_attempted = True
-            runner(("scp", "-r", "-i", _ssh_identity(), *transport_options, "-P", port, f"{remote}:{output_remote}/.", str(lifecycle_root / f"synced-failure-{instance_id}")))
+            if identity_file is not None:
+                try:
+                    runner(("scp", "-r", "-i", identity_file, *transport_options, "-P", port, f"{remote}:{output_remote}/.", str(lifecycle_root / f"synced-failure-{instance_id}")))
+                except BaseException:
+                    pass
         _cleanup_failure(instance_id, lifecycle_root, runner, "remote_launch_failure", sync_attempted=sync_attempted)
+        _release_completed_rent_claim(instance_receipt)
         raise RuntimeError("remote launch failed; available evidence synchronized and instance disposed") from error
 
 
@@ -618,6 +719,7 @@ def destroy_after_publication(instance_id: int, publication_receipt: Path, insta
         or publication.get("disposable") is not True or publication.get("repository_private") is not True
         or publication.get("tree_listing_verified") is not True or publication.get("fresh_readback_verified") is not True
         or publication.get("instance_id") != instance_id or instance.get("instance_id") != instance_id
+        or instance.get("rent_claim_path") != str(EVALUATION_RENT_CLAIM_ROOT / "active.json")
         or publication.get("instance_receipt_sha256") != hashlib.sha256(instance_receipt.read_bytes()).hexdigest()
         or not isinstance(invocation, dict) or publication.get("invocation_sha256") != canonical_sha256(invocation)
         or instance.get("invocation_sha256") != canonical_sha256(invocation)
@@ -626,7 +728,9 @@ def destroy_after_publication(instance_id: int, publication_receipt: Path, insta
     ):
         raise ValueError("publication receipt is not an exact immutable instance/invocation readback binding")
     try:
-        runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+        destroy_issued, exact_empty, instances_empty, volumes_empty = _destroy_owned_once(
+            instance_id, runner, polls=absence_polls, sleep=sleep,
+        )
     except BaseException:
         _write_new(disposal_receipt, {
             "schema_version": 1, "kind": "groot_checkpoint_evaluation_disposal",
@@ -636,7 +740,6 @@ def destroy_after_publication(instance_id: int, publication_receipt: Path, insta
             "immutable_revision": publication["immutable_revision"], "remote_prefix": publication["remote_prefix"],
         })
         raise
-    exact_empty, instances_empty, volumes_empty = _verify_absent(instance_id, runner, polls=absence_polls, sleep=sleep)
     if not all((exact_empty, instances_empty, volumes_empty)):
         _write_new(disposal_receipt, {
             "schema_version": 1, "kind": "groot_checkpoint_evaluation_disposal",
@@ -645,19 +748,23 @@ def destroy_after_publication(instance_id: int, publication_receipt: Path, insta
             "instance_receipt_sha256": hashlib.sha256(instance_receipt.read_bytes()).hexdigest(),
             "immutable_revision": publication["immutable_revision"], "remote_prefix": publication["remote_prefix"],
             "instance_absent": exact_empty, "account_instances_empty": instances_empty,
-            "account_volumes_empty": volumes_empty, "destroyed_and_absent": False,
+            "account_volumes_empty": volumes_empty, "destroy_issued": destroy_issued,
+            "destroyed_and_absent": False,
             "absence_unverified": True,
         })
         raise ValueError("publication disposal did not empty the exact provider account")
-    return _write_new(disposal_receipt, {
+    written = _write_new(disposal_receipt, {
         "schema_version": 1, "kind": "groot_checkpoint_evaluation_disposal",
         "instance_id": instance_id,
         "publication_receipt_sha256": hashlib.sha256(publication_receipt.read_bytes()).hexdigest(),
         "instance_receipt_sha256": hashlib.sha256(instance_receipt.read_bytes()).hexdigest(),
         "immutable_revision": publication["immutable_revision"], "remote_prefix": publication["remote_prefix"],
         "instance_absent": exact_empty, "account_instances_empty": instances_empty,
-        "account_volumes_empty": volumes_empty, "destroyed_and_absent": True,
+        "account_volumes_empty": volumes_empty, "destroy_issued": destroy_issued,
+        "destroyed_and_absent": True,
     })
+    _release_completed_rent_claim(instance)
+    return written
 
 
 def compare_checkpoint_invocations(one: Mapping[str, object], two: Mapping[str, object]) -> dict[str, tuple[object, object]]:
@@ -680,6 +787,7 @@ def build_parser() -> argparse.ArgumentParser:
     rent = actions.add_parser("rent"); rent.add_argument("--manifest", type=Path, required=True); rent.add_argument("--lifecycle-root", type=Path, required=True); rent.add_argument("--execute", action="store_true")
     launch = actions.add_parser("stage-launch-sync"); launch.add_argument("--manifest", type=Path, required=True); launch.add_argument("--instance-receipt", type=Path, required=True); launch.add_argument("--lifecycle-root", type=Path, required=True); launch.add_argument("--code-git-bundle", type=Path, required=True); launch.add_argument("--token-file", type=Path, required=True); launch.add_argument("--execute", action="store_true")
     destroy = actions.add_parser("destroy"); destroy.add_argument("--instance-id", type=int, required=True); destroy.add_argument("--publication-receipt", type=Path, required=True); destroy.add_argument("--instance-receipt", type=Path, required=True); destroy.add_argument("--disposal-receipt", type=Path, required=True); destroy.add_argument("--execute", action="store_true")
+    watchdog = actions.add_parser("watchdog-destroy"); watchdog.add_argument("--instance-id", type=int, required=True); watchdog.add_argument("--deadline-unix", type=int, required=True); watchdog.add_argument("--receipt", type=Path, required=True); watchdog.add_argument("--execute", action="store_true")
     return parser
 
 
@@ -690,7 +798,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.action == "rent": result = rent_evaluation(args.manifest, lifecycle_root=args.lifecycle_root, runner=_subprocess_runner)
     elif args.action == "stage-launch-sync": result = stage_launch_sync_evaluation(args.manifest, _read_json(args.instance_receipt, "instance receipt"), lifecycle_root=args.lifecycle_root, runner=_subprocess_runner, code_bundle=args.code_git_bundle, token_file=args.token_file)
-    else: result = destroy_after_publication(args.instance_id, args.publication_receipt, args.instance_receipt, disposal_receipt=args.disposal_receipt, runner=_subprocess_runner)
+    elif args.action == "destroy": result = destroy_after_publication(args.instance_id, args.publication_receipt, args.instance_receipt, disposal_receipt=args.disposal_receipt, runner=_subprocess_runner)
+    else: result = enforce_lease_deadline(args.instance_id, args.deadline_unix, args.receipt, runner=_subprocess_runner)
     print(json.dumps(result, sort_keys=True))
     return 0
 
