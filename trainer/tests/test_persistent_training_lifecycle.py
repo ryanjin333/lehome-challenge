@@ -57,6 +57,7 @@ def _temporary_vast_ssh_identity(
     identity.write_text("private-key-material", encoding="utf-8")
     identity.chmod(0o600)
     monkeypatch.setattr(LIFECYCLE, "VAST_SSH_IDENTITY", identity)
+    monkeypatch.setattr(LIFECYCLE, "RUNTIME_GPU_RENT_CLAIM_ROOT", tmp_path / "gpu-rent-claims")
 
 
 def test_vast_ssh_and_scp_prefixes_use_the_approved_identity(
@@ -1591,6 +1592,13 @@ def _runtime_pilot_offer_evidence(*, failure_receipt: str) -> dict[str, object]:
     }
 
 
+def _canonical_runtime_gpu_claim_path(evidence: dict[str, object]) -> str:
+    return str(LIFECYCLE._runtime_gpu_rent_claim_path(
+        request=evidence, identity=LIFECYCLE._runtime_campaign_binding(evidence),
+        require_request_path=False,
+    ))
+
+
 def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_path: Path) -> None:
     commands: list[tuple[str, ...]] = []
     readiness_reads = 0
@@ -1958,9 +1966,16 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
         "code_bundle_sha256_file": str(bundle_receipt), "code_bundle_sha256": bundle_sha,
         "parent_checkpoint": str(parent),
         "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json"),
-        "rent_claim_receipt": str(tmp_path / "runtime-gpu-rent-claim.json"),
     }
+    evidence["rent_claim_receipt"] = _canonical_runtime_gpu_claim_path(evidence)
     assert "training_capability" not in evidence
+    rejected_calls: list[tuple[str, ...]] = []
+    with pytest.raises(ValueError, match="controller-owned canonical path"):
+        LIFECYCLE.rent_runtime_gpu_warmup(
+            evidence=evidence | {"rent_claim_receipt": str(tmp_path / "other-claim.json")},
+            runner=lambda command: rejected_calls.append(command) or "",
+        )
+    assert rejected_calls == []
     commands: list[tuple[str, ...]] = []
     live = {
         "id": 44, "actual_status": "running", "gpu_name": "RTX PRO 6000 WS",
@@ -2027,7 +2042,6 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
 
 def test_direct_gpu_rent_rejects_caller_capability_before_provider_calls(tmp_path: Path) -> None:
     evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json"))
-    evidence["rent_claim_receipt"] = str(tmp_path / "runtime-gpu-rent-claim.json")
     evidence["training_capability"] = {}
     calls: list[tuple[str, ...]] = []
 
@@ -2047,8 +2061,8 @@ def test_direct_gpu_probe_failure_destroys_and_proves_absence(
     evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json"))
     evidence |= {
         "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json"),
-        "rent_claim_receipt": str(tmp_path / "runtime-gpu-rent-claim.json"),
     }
+    evidence["rent_claim_receipt"] = _canonical_runtime_gpu_claim_path(evidence)
     rented = {
         "instance_id": 44, "provider_response_sha256": "a" * 64,
         "host": "pro6000", "port": 22,
@@ -2089,8 +2103,8 @@ def test_direct_gpu_rent_claim_allows_one_concurrent_controller_before_provider(
     evidence |= {
         "offer": {"id": 8, "dph_total": .18},
         "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json"),
-        "rent_claim_receipt": str(tmp_path / "runtime-gpu-rent-claim.json"),
     }
+    evidence["rent_claim_receipt"] = _canonical_runtime_gpu_claim_path(evidence)
     identity = LIFECYCLE._runtime_campaign_binding(evidence)
     monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_preflight", lambda _request: identity)
     monkeypatch.setattr(LIFECYCLE, "_attest_platform_arch", lambda *_args, **_kwargs: "x86_64")
@@ -2141,8 +2155,8 @@ def test_direct_gpu_post_probe_hash_failure_cleans_the_same_lease(
     evidence |= {
         "offer": {"id": 8, "dph_total": .18},
         "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json"),
-        "rent_claim_receipt": str(tmp_path / "runtime-gpu-rent-claim.json"),
     }
+    evidence["rent_claim_receipt"] = _canonical_runtime_gpu_claim_path(evidence)
     identity = LIFECYCLE._runtime_campaign_binding(evidence)
     monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_preflight", lambda _request: identity)
     monkeypatch.setattr(LIFECYCLE, "rent", lambda **_kwargs: {
@@ -2177,6 +2191,46 @@ def test_direct_gpu_post_probe_hash_failure_cleans_the_same_lease(
         ("vastai", "--raw", "show", "instance", "44"),
     ]
     assert not Path(str(evidence["rent_claim_receipt"])).exists()
+
+
+def test_direct_gpu_ambiguous_create_keeps_a_blocked_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json"))
+    evidence["bootstrap_capability_receipt"] = str(tmp_path / "bootstrap-capability.json")
+    evidence["rent_claim_receipt"] = _canonical_runtime_gpu_claim_path(evidence)
+    identity = LIFECYCLE._runtime_campaign_binding(evidence)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_preflight", lambda _request: identity)
+    monkeypatch.setattr(
+        LIFECYCLE, "rent",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            LIFECYCLE.RuntimeGpuRentOutcome(ValueError("ambiguous create"), no_lease_exists=False)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="ambiguous create"):
+        LIFECYCLE.rent_runtime_gpu_warmup(evidence=evidence, runner=lambda _command: "")
+
+    claim = json.loads(Path(str(evidence["rent_claim_receipt"])).read_text(encoding="utf-8"))
+    assert claim["status"] == "blocked" and claim["error_type"] == "RuntimeGpuRentOutcome"
+
+
+def test_direct_gpu_established_ssh_timeout_is_bounded_locally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    def timed_out(*args: object, **kwargs: object) -> object:
+        calls.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(LIFECYCLE.subprocess, "run", timed_out)
+    with pytest.raises(ValueError, match="unavailable"):
+        LIFECYCLE._attest_platform_arch(
+            {"host": "pro6000", "port": 22}, runner=LIFECYCLE._run,
+            ssh_connection_timeout_seconds=LIFECYCLE.RUNTIME_GPU_ARCH_TIMEOUT_SECONDS,
+        )
+    assert calls == [LIFECYCLE.RUNTIME_GPU_ARCH_TIMEOUT_SECONDS]
 
 
 def test_runtime_campaign_rejects_any_rollout_prefix_other_than_initial_round_one(

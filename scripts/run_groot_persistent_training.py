@@ -37,6 +37,9 @@ RUNTIME_PILOT_OFFER_QUERY = "cpu_arch=amd64 cpu_cores_effective>=32 cpu_ram>=64 
 RUNTIME_PILOT_READINESS_POLLS = 120
 RUNTIME_SSH_ATTESTATION_POLLS = 12
 RUNTIME_ABSENCE_READBACK_POLLS = 12
+RUNTIME_GPU_ARCH_TIMEOUT_SECONDS = 15
+RUNTIME_GPU_PROBE_TIMEOUT_SECONDS = 600
+RUNTIME_GPU_PROBE_CALL_TIMEOUT_SECONDS = 620
 _RUNTIME_PILOT_OFFER_FIELDS = (
     "id", "ask_contract_id", "machine_id", "cpu_arch", "cpu_cores_effective", "cpu_ram",
     "disk_space", "disk_bw", "inet_down", "reliability", "num_gpus", "dph_total",
@@ -52,6 +55,7 @@ RUNTIME_CPU_PILOT_IMAGE = (
     + "e4c7ac02d22f46485c1e7861a9e85b85daff14283ef62cb9e16025a3d1ecf555"
 )
 MAX_ACCOUNT_HOURLY_USD = 1.00
+RUNTIME_GPU_RENT_CLAIM_ROOT = Path("/private/tmp/lehome-runtime-gpu-rent-claims")
 Runner = Callable[[tuple[str, ...]], str]
 VAST_SSH_IDENTITY = Path(
     os.environ.get("LEHOME_VAST_SSH_IDENTITY", "~/.ssh/vast_quest")
@@ -60,6 +64,14 @@ VAST_SSH_IDENTITY = Path(
 
 class RuntimeResumeAlreadyClaimed(ValueError):
     """A successful replacement may not hydrate the same cursor twice."""
+
+
+class RuntimeGpuRentOutcome(ValueError):
+    """Tell the claim controller whether a failed rental is safe to retry."""
+
+    def __init__(self, error: BaseException, *, no_lease_exists: bool) -> None:
+        super().__init__(str(error))
+        self.no_lease_exists = no_lease_exists
 
 
 def _hash(value: object) -> str:
@@ -214,9 +226,22 @@ def derive_corrective_receipt(
     return payload
 
 
-def _run(command: tuple[str, ...]) -> str:
-    completed = subprocess.run(command, check=True, text=True, capture_output=True)
+def _run(command: tuple[str, ...], *, timeout_seconds: int | None = None) -> str:
+    completed = subprocess.run(
+        command, check=True, text=True, capture_output=True, timeout=timeout_seconds,
+    )
     return completed.stdout
+
+
+def _run_bounded(
+    runner: Runner, command: tuple[str, ...], *, timeout_seconds: int,
+) -> str:
+    """Bound real controller subprocesses while preserving injected test runners."""
+    if timeout_seconds <= 0:
+        raise ValueError("bounded runner timeout must be positive")
+    if runner is _run:
+        return _run(command, timeout_seconds=timeout_seconds)
+    return runner(command)
 
 
 def _bounded_sleep(seconds: float) -> None:
@@ -630,60 +655,72 @@ def rent_runtime_cpu_pilot(
 
 
 def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep, require_capability: bool = True, abort_request: Mapping[str, object] | None = None) -> dict[str, object]:
-    _require_vast_ssh_identity()
-    offer = evidence.get("offer")
-    if not isinstance(offer, Mapping) or type(offer.get("id")) is not int: raise ValueError("offer evidence is invalid")
-    if evidence.get("search_mode") != "interruptible" or type(evidence.get("expires_at_unix")) is not int or evidence["expires_at_unix"] < int(time.time()): raise ValueError("offer evidence is expired or not interruptible")
-    image = _trainer_image(evidence.get("trainer_image"))
-    capability = evidence.get("training_capability")
-    image_digest = image.rpartition("@")[2]
-    if require_capability:
-        if not isinstance(capability, Mapping) or capability.get("image_digest") != image_digest or not isinstance(capability.get("optimizer_step"), Mapping) or capability["optimizer_step"].get("passed") is not True or not isinstance(capability.get("nvml"), Mapping):
-            raise ValueError("rent requires a matching accepted training capability receipt")
-        validate_training_capability(capability)
-    elif image != BOOTSTRAP_TRAINER_IMAGE:
-        raise ValueError("bootstrap canary requires the historical structurally pinned trainer image")
-    _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")
-    quoted_offer_hourly = offer.get("dph_total")
-    if type(quoted_offer_hourly) not in (int, float) or float(quoted_offer_hourly) < 0:
-        raise ValueError("offer evidence lacks the all-in 300GB hourly quote")
-    # The capture receipt is short-lived but pre-rental account state can still
-    # change.  Re-read retained charges immediately before creating the lease.
-    _require_account_cap(
-        _live_account_total(runner=runner) + float(quoted_offer_hourly),
-        label="fresh rental projection",
-    )
-    bid = offer.get("min_bid", offer.get("dph_total"))
-    if type(bid) not in (int, float) or float(bid) >= 1: raise ValueError("offer bid price is invalid")
-    created = _json(runner, ("vastai", "--raw", "create", "instance", str(offer["id"]), "--image", image, "--disk", "300", "--bid_price", str(bid), "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + image))
-    if not isinstance(created, Mapping) or type(created.get("new_contract")) is not int: raise ValueError("provider did not return an instance ID")
+    def outcome(error: BaseException, *, no_lease_exists: bool) -> None:
+        if abort_request is not None:
+            raise RuntimeGpuRentOutcome(error, no_lease_exists=no_lease_exists) from error
+        raise error
+
+    try:
+        _require_vast_ssh_identity()
+        offer = evidence.get("offer")
+        if not isinstance(offer, Mapping) or type(offer.get("id")) is not int: raise ValueError("offer evidence is invalid")
+        if evidence.get("search_mode") != "interruptible" or type(evidence.get("expires_at_unix")) is not int or evidence["expires_at_unix"] < int(time.time()): raise ValueError("offer evidence is expired or not interruptible")
+        image = _trainer_image(evidence.get("trainer_image"))
+        capability = evidence.get("training_capability")
+        image_digest = image.rpartition("@")[2]
+        if require_capability:
+            if not isinstance(capability, Mapping) or capability.get("image_digest") != image_digest or not isinstance(capability.get("optimizer_step"), Mapping) or capability["optimizer_step"].get("passed") is not True or not isinstance(capability.get("nvml"), Mapping):
+                raise ValueError("rent requires a matching accepted training capability receipt")
+            validate_training_capability(capability)
+        elif image != BOOTSTRAP_TRAINER_IMAGE:
+            raise ValueError("bootstrap canary requires the historical structurally pinned trainer image")
+        _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")
+        quoted_offer_hourly = offer.get("dph_total")
+        if type(quoted_offer_hourly) not in (int, float) or float(quoted_offer_hourly) < 0:
+            raise ValueError("offer evidence lacks the all-in 300GB hourly quote")
+        _require_account_cap(
+            _live_account_total(runner=runner) + float(quoted_offer_hourly),
+            label="fresh rental projection",
+        )
+        bid = offer.get("min_bid", offer.get("dph_total"))
+        if type(bid) not in (int, float) or float(bid) >= 1: raise ValueError("offer bid price is invalid")
+    except BaseException as error:
+        outcome(error, no_lease_exists=True)
+        raise AssertionError("unreachable")
+    try:
+        created = _json(runner, ("vastai", "--raw", "create", "instance", str(offer["id"]), "--image", image, "--disk", "300", "--bid_price", str(bid), "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + image))
+    except BaseException as error:
+        outcome(error, no_lease_exists=False)
+        raise AssertionError("unreachable")
+    if not isinstance(created, Mapping) or type(created.get("new_contract")) is not int:
+        outcome(ValueError("provider did not return an instance ID"), no_lease_exists=False)
+        raise AssertionError("unreachable")
     instance_id = created["new_contract"]
     live: object = {}
-    for _ in range(max_readiness_polls):
-        live = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
-        if isinstance(live, Mapping) and live.get("actual_status") == "running" and live.get("ssh_host"):
-            break
-        sleep(5.0)
-    else:
-        error = ValueError("instance readiness poll timed out")
-        if abort_request is not None:
-            _runtime_abort_cleanup(instance={"instance_id": instance_id, "provider_response_sha256": _hash(created)}, request=abort_request, error=error, runner=runner)
+    try:
+        for _ in range(max_readiness_polls):
+            live = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+            if isinstance(live, Mapping) and live.get("actual_status") == "running" and live.get("ssh_host"):
+                break
+            sleep(5.0)
         else:
-            runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
-            absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
-            if absent not in ({}, None): raise ValueError("post-create cleanup absence readback failed")
-        raise error
-    if not isinstance(live, Mapping) or live.get("id") != instance_id or not _offer_gpu(live) or live.get("num_gpus") != 1 or not live.get("ssh_host") or type(live.get("ssh_port")) is not int or float(live.get("dph_total", 99)) >= 1:
-        error = ValueError("instance readback does not match accepted offer")
+            raise ValueError("instance readiness poll timed out")
+        if not isinstance(live, Mapping) or live.get("id") != instance_id or not _offer_gpu(live) or live.get("num_gpus") != 1 or not live.get("ssh_host") or type(live.get("ssh_port")) is not int or float(live.get("dph_total", 99)) >= 1:
+            raise ValueError("instance readback does not match accepted offer")
+        return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "trainer_image": image, "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _stable_instance_identity(live), "account_hourly_total_usd": _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")}
+    except BaseException as error:
         if abort_request is not None:
-            _runtime_abort_cleanup(instance={"instance_id": instance_id, "provider_response_sha256": _hash(live)}, request=abort_request, error=error, runner=runner)
-        else:
-            runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
-            absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
-            if absent not in ({}, None):
-                raise ValueError("post-create cleanup absence readback failed")
-        raise error
-    return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "trainer_image": image, "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _stable_instance_identity(live), "account_hourly_total_usd": _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")}
+            _runtime_abort_cleanup(
+                instance={"instance_id": instance_id, "provider_response_sha256": _hash(live if live else created)},
+                request=abort_request, error=error, runner=runner,
+            )
+            outcome(error, no_lease_exists=True)
+            raise AssertionError("unreachable")
+        runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+        absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+        if absent not in ({}, None):
+            raise ValueError("post-create cleanup absence readback failed")
+        raise
 
 
 def bootstrap_canary(*, evidence: Mapping[str, object], runner: Runner) -> dict[str, object]:
@@ -778,8 +815,14 @@ def _attest_platform_arch(
             *prefix[:-1], "-o", f"ConnectTimeout={ssh_connection_timeout_seconds}", prefix[-1],
         )
     try:
-        arch = runner((*prefix, "set -eu; uname -m")).strip()
-    except (subprocess.CalledProcessError, OSError, TimeoutError) as error:
+        command = (*prefix, "set -eu; uname -m")
+        if ssh_connection_timeout_seconds is None:
+            arch = runner(command).strip()
+        else:
+            arch = _run_bounded(
+                runner, command, timeout_seconds=ssh_connection_timeout_seconds,
+            ).strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, TimeoutError) as error:
         raise ValueError("native platform attestation is unavailable") from error
     if arch not in {"x86_64", "amd64"}:
         raise ValueError("runtime mixture requires native x86_64 platform proof")
@@ -1375,9 +1418,25 @@ def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> dict[str, obje
         raise ValueError("direct runtime GPU rent derives capability on its single lease")
     identity = _runtime_campaign_binding(request)
     _runtime_parent_checkpoint(request)
+    _require_vast_ssh_identity()
     offer = request.get("offer")
     if not isinstance(offer, Mapping) or type(offer.get("id")) is not int:
         raise ValueError("runtime GPU rent requires a fresh concrete offer before claiming a lease")
+    if (
+        request.get("search_mode") != "interruptible"
+        or type(request.get("expires_at_unix")) is not int
+        or request["expires_at_unix"] < int(time.time())
+        or _trainer_image(request.get("trainer_image")) != BOOTSTRAP_TRAINER_IMAGE
+    ):
+        raise ValueError("runtime GPU rent offer is not a fresh pinned interruptible lease")
+    _require_account_cap(request.get("account_hourly_total_usd"), label="runtime GPU offer evidence")
+    quote = offer.get("dph_total")
+    bid = offer.get("min_bid", quote)
+    if (
+        type(quote) not in (int, float) or float(quote) < 0
+        or type(bid) not in (int, float) or float(bid) >= 1
+    ):
+        raise ValueError("runtime GPU rent offer price is invalid")
     bundle = request.get("code_bundle")
     receipt = request.get("code_bundle_sha256_file")
     if type(bundle) is not str or type(receipt) is not str:
@@ -1392,14 +1451,42 @@ def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> dict[str, obje
         or Path(output).exists() or Path(output).is_symlink()
     ):
         raise ValueError("runtime GPU rent requires an absent bootstrap capability receipt")
-    claim = request.get("rent_claim_receipt")
-    if (
-        type(claim) is not str or not Path(claim).is_absolute()
-        or Path(claim).exists() or Path(claim).is_symlink()
-        or Path(claim).parent.is_symlink() or not Path(claim).parent.is_dir()
-    ):
-        raise ValueError("runtime GPU rent requires an absent claim receipt")
+    _runtime_gpu_rent_claim_path(request=request, identity=identity)
     return identity
+
+
+def _runtime_gpu_rent_claim_path(
+    *, request: Mapping[str, object], identity: Mapping[str, object],
+    require_request_path: bool = True,
+) -> Path:
+    """Use one controller-owned claim namespace per immutable direct campaign."""
+    identity_key = {
+        "code_revision": request.get("code_revision"),
+        "code_bundle_sha256": request.get("code_bundle_sha256"),
+        "trainer_image": request.get("trainer_image"),
+        "bc_revision": identity["bc"]["immutable_revision"],
+        "bc_receipt_sha256": identity["bc_receipt_sha256"],
+        "rollout_revision": identity["rollout"]["immutable_revision"],
+        "rollout_prefix": identity["rollout"]["remote_prefix"],
+        "rollout_receipt_sha256": identity["rollout_receipt_sha256"],
+        "deployment_revision": identity["deployment"]["immutable_revision"],
+        "mixture_id": identity["deployment"]["mixture_id"],
+        "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
+        "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
+        "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+    }
+    root = RUNTIME_GPU_RENT_CLAIM_ROOT
+    if root.is_symlink():
+        raise ValueError("runtime GPU rent claim root is unsafe")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("runtime GPU rent claim root is unsafe")
+    path = root / (_hash(identity_key) + ".json")
+    if require_request_path and request.get("rent_claim_receipt") != str(path):
+        raise ValueError("runtime GPU rent claim receipt must use the controller-owned canonical path")
+    if path.exists() or path.is_symlink():
+        raise ValueError("runtime GPU rent claim is already held; no provider action was taken")
+    return path
 
 
 def _runtime_gpu_rent_claim(
@@ -1410,7 +1497,8 @@ def _runtime_gpu_rent_claim(
     assert isinstance(offer, Mapping)
     claim = {
         "schema_version": 1, "kind": "runtime_mixture_gpu_rent_claim", "status": "claimed",
-        "request_sha256": _hash(dict(request)), "offer_sha256": _hash(dict(offer)),
+        "request_sha256": _hash({key: value for key, value in request.items() if key != "rent_claim_receipt"}),
+        "offer_sha256": _hash(dict(offer)),
         "bootstrap_capability_receipt": request["bootstrap_capability_receipt"],
         "code_revision": request["code_revision"], "code_bundle_sha256": request["code_bundle_sha256"],
         "bc_revision": identity["bc"]["immutable_revision"],
@@ -1433,6 +1521,11 @@ def _runtime_gpu_rent_claim(
             stream.write(canonical_json_bytes(claim))
             stream.flush()
             os.fsync(stream.fileno())
+        parent_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
     except BaseException:
         path.unlink(missing_ok=True)
         raise
@@ -1460,6 +1553,17 @@ def _terminalize_runtime_gpu_rent_claim(
     })
 
 
+def _block_runtime_gpu_rent_claim(
+    *, path: Path, claim: Mapping[str, object], error: BaseException,
+) -> None:
+    """Retain an ambiguous create claim so a retry cannot double-rent."""
+    if dict(_load_regular_json(path, "runtime GPU rent claim")) != dict(claim):
+        raise RuntimeError("runtime GPU rent claim changed before blocked terminalization")
+    atomic_write_json(path, dict(claim) | {
+        "status": "blocked", "error_type": type(error).__name__,
+    })
+
+
 def _runtime_gpu_bootstrap_capability(
     *, instance: Mapping[str, object], request: Mapping[str, object],
     identity: Mapping[str, object], runner: Runner,
@@ -1476,18 +1580,24 @@ def _runtime_gpu_bootstrap_capability(
     observed = runner((*_ssh_prefix(instance), "sha256sum " + remote + "/code.bundle")).strip().split()
     if not observed or observed[0] != bundle_sha:
         raise ValueError("runtime GPU bootstrap code bundle readback failed")
+    probe_prefix = _ssh_prefix(instance)
+    probe_prefix = (
+        *probe_prefix[:-1], "-o", f"ConnectTimeout={RUNTIME_GPU_ARCH_TIMEOUT_SECONDS}", probe_prefix[-1],
+    )
     command = (
         "set -eu; git clone --quiet --no-checkout " + remote + "/code.bundle /prepared/bootstrap-code; "
         "git -C /prepared/bootstrap-code checkout --quiet --detach " + str(request["code_revision"]) + "; "
         "test \"$(git -C /prepared/bootstrap-code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; "
         "test -z \"$(git -C /prepared/bootstrap-code status --porcelain)\"; "
-        "timeout 600 env -u HF_TOKEN PYTHONPATH=/prepared/bootstrap-code/source/lehome:/prepared/bootstrap-code/trainer/src "
+        "timeout " + str(RUNTIME_GPU_PROBE_TIMEOUT_SECONDS) + " env -u HF_TOKEN PYTHONPATH=/prepared/bootstrap-code/source/lehome:/prepared/bootstrap-code/trainer/src "
         "lehome-train validate-training-capability --one-step --image-digest "
         + BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
     )
     try:
-        capability = json.loads(runner((*_ssh_prefix(instance), command)))
-    except json.JSONDecodeError as error:
+        capability = json.loads(_run_bounded(
+            runner, (*probe_prefix, command), timeout_seconds=RUNTIME_GPU_PROBE_CALL_TIMEOUT_SECONDS,
+        ))
+    except (json.JSONDecodeError, subprocess.TimeoutExpired) as error:
         raise ValueError("runtime GPU bootstrap capability probe did not return JSON") from error
     if not isinstance(capability, Mapping):
         raise ValueError("runtime GPU bootstrap capability probe did not return a receipt")
@@ -1790,7 +1900,7 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
     """Promote only a fresh capable interruptible PRO6000 lease for warm-up."""
     _runtime_failure_receipt_path(evidence)
     identity = _runtime_gpu_rent_preflight(evidence)
-    claim_path = Path(str(evidence["rent_claim_receipt"]))
+    claim_path = _runtime_gpu_rent_claim_path(request=evidence, identity=identity)
     claim = _runtime_gpu_rent_claim(path=claim_path, request=evidence, identity=identity)
     rented: Mapping[str, object] | None = None
     try:
@@ -1798,7 +1908,9 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
             evidence=evidence, runner=runner, require_capability=False,
             abort_request=evidence,
         )
-        _attest_platform_arch(rented, runner=runner, ssh_connection_timeout_seconds=15)
+        _attest_platform_arch(
+            rented, runner=runner, ssh_connection_timeout_seconds=RUNTIME_GPU_ARCH_TIMEOUT_SECONDS,
+        )
         outer = _runtime_gpu_bootstrap_capability(
             instance=rented, request=evidence, identity=identity, runner=runner,
         )
@@ -1815,8 +1927,16 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
         }
     except BaseException as error:
         if rented is not None:
-            _runtime_abort_cleanup(instance=rented, request=evidence, error=error, runner=runner)
-        _release_runtime_gpu_rent_claim(path=claim_path, claim=claim)
+            try:
+                _runtime_abort_cleanup(instance=rented, request=evidence, error=error, runner=runner)
+            except BaseException as cleanup_error:
+                _block_runtime_gpu_rent_claim(path=claim_path, claim=claim, error=cleanup_error)
+                raise
+            _release_runtime_gpu_rent_claim(path=claim_path, claim=claim)
+        elif isinstance(error, RuntimeGpuRentOutcome) and error.no_lease_exists:
+            _release_runtime_gpu_rent_claim(path=claim_path, claim=claim)
+        else:
+            _block_runtime_gpu_rent_claim(path=claim_path, claim=claim, error=error)
         raise
 
 
