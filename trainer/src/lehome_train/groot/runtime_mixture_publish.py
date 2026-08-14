@@ -621,7 +621,8 @@ def publish_source(
         )
         upload_large_folder(
             transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
-            source=staging, entries=staged_entries, max_workers=_LARGE_SOURCE_UPLOAD_WORKERS,
+            source=staging, entries=staged_entries, remote_prefix=prefix,
+            max_workers=_LARGE_SOURCE_UPLOAD_WORKERS,
         )
         revision = resolve_approved_ref(
             transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, ref=revision,

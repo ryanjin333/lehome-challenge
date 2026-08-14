@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from fnmatch import fnmatch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -464,10 +465,21 @@ def test_real_transport_uses_resumable_large_upload_without_path_in_repo(
     payload = source / "rollouts" / "round-1" / "payload.bin"
     payload.parent.mkdir(parents=True)
     payload.write_bytes(b"payload")
+    (source / ".cache" / "huggingface").mkdir(parents=True)
+    (source / ".cache" / "huggingface" / "state.json").write_text("cache")
+    (source / "receipt.json").write_text("receipt")
+    (source / "other-root").mkdir()
+    (source / "other-root" / "secret.bin").write_bytes(b"outside")
     entries = (SyncEntry("rollouts/round-1/payload.bin", "0" * 64, len(b"payload")),)
 
     def upload_large_folder(**kwargs: object) -> None:
         assert "token" not in kwargs
+        selected = [
+            path.relative_to(source).as_posix()
+            for path in source.rglob("*")
+            if path.is_file() and fnmatch(path.relative_to(source).as_posix(), kwargs["allow_patterns"][0])
+        ]
+        assert selected == ["rollouts/round-1/payload.bin"]
         calls.append(kwargs)
 
     monkeypatch.setattr(
@@ -478,13 +490,14 @@ def test_real_transport_uses_resumable_large_upload_without_path_in_repo(
 
     transport.upload_large_folder(
         repository="ryanjin333/lehome-groot-n17-data", revision="main", source=source,
-        entries=entries, token="hf_large_upload_process_token", max_workers=4,
+        entries=entries, remote_prefix="rollouts/round-1",
+        token="hf_large_upload_process_token", max_workers=4,
     )
 
     assert calls == [{
         "repo_id": "ryanjin333/lehome-groot-n17-data", "repo_type": "dataset",
         "revision": "main", "folder_path": str(source),
-        "allow_patterns": ["rollouts/round-1/payload.bin"],
+        "allow_patterns": ["rollouts/round-1/**"],
         "ignore_patterns": [".cache", ".cache/**", ".huggingface", ".huggingface/**"],
         "num_workers": 4,
     }]

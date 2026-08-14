@@ -56,14 +56,15 @@ class MemoryTransport:
 
     def upload_large_folder(
         self, *, repository: str, revision: str, source: Path, entries, token: str,
-        max_workers: int,
+        remote_prefix: str, max_workers: int,
     ) -> None:
         """Provider-like resumable large upload, deliberately without a prefix API."""
 
         assert repository == REPOSITORY and token == TOKEN
         assert 1 <= max_workers <= 8
         staged = tuple(entries)
-        assert staged and all(entry.relative_path.startswith("rollouts/round-1/") for entry in staged)
+        assert remote_prefix == "rollouts/round-1"
+        assert staged and all(entry.relative_path.startswith(remote_prefix + "/") for entry in staged)
         assert all(not entry.relative_path.startswith(".cache/") for entry in staged)
         self.large_uploads.append({
             "revision": revision,
@@ -229,6 +230,38 @@ def test_large_source_rejects_an_unchanged_stale_branch_head_before_journal_or_r
         )
 
     assert not journal.exists() and not receipt.exists()
+
+
+@pytest.mark.parametrize("unsafe", ["extra-file", "symlink"])
+def test_large_source_rejects_an_unsafe_or_nonexact_preexisting_staged_prefix(
+    tmp_path: Path, unsafe: str,
+) -> None:
+    from lehome_train.groot.runtime_mixture_publish import publish_source
+
+    source = tmp_path / "source"
+    _source(source)
+    staging = tmp_path / "external-state"
+    prefix = staging / "rollouts" / "round-1"
+    prefix.mkdir(parents=True)
+    if unsafe == "extra-file":
+        (prefix / "unexpected.bin").write_bytes(b"outside allowlist")
+    else:
+        prefix.rmdir()
+        (staging / "rollouts").rmdir()
+        other = tmp_path / "other"
+        other.mkdir()
+        prefix.parent.symlink_to(other, target_is_directory=True)
+    journal, receipt = tmp_path / "journal.json", tmp_path / "receipt.json"
+    transport = MemoryTransport()
+
+    with pytest.raises(ValueError, match="staging|unsafe|allowlist"):
+        publish_source(
+            root=source, source_type="rollout", round_id="1", revision="main",
+            receipt_path=receipt, upload_journal_path=journal, readback_root=tmp_path / "readback",
+            large_upload=True, large_upload_staging_root=staging, transport=transport,
+        )
+
+    assert not transport.large_uploads and not journal.exists() and not receipt.exists()
 
 
 def test_source_readback_resumes_fixed_safe_batches_after_rate_limit_without_reuploading(

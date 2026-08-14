@@ -90,6 +90,7 @@ class HubTransport(Protocol):
         revision: str,
         source: Path,
         entries: tuple[SyncEntry, ...],
+        remote_prefix: str,
         token: str,
         max_workers: int,
     ) -> None: ...
@@ -483,6 +484,7 @@ class HuggingFaceHubTransport:
         revision: str,
         source: Path,
         entries: tuple[SyncEntry, ...],
+        remote_prefix: str,
         token: str,
         max_workers: int,
     ) -> None:
@@ -500,16 +502,18 @@ class HuggingFaceHubTransport:
             raise ValueError("Hub large upload workers must be bounded")
         if source.is_symlink() or not source.is_dir():
             raise ValueError("Hub large upload source must be a safe directory")
-        allowed: list[str] = []
+        validate_artifact_relative_path(remote_prefix, "remote_prefix")
+        glob = f"{remote_prefix}/**"
         for entry in entries:
             validate_artifact_relative_path(entry.relative_path)
             if any(component.startswith(".") for component in entry.relative_path.split("/")):
                 raise ValueError("Hub large upload allowlist cannot include hidden paths")
+            if not entry.relative_path.startswith(remote_prefix + "/"):
+                raise ValueError("Hub large upload allowlist does not match the staged prefix")
             path = source / entry.relative_path
             if path.is_symlink() or not path.is_file():
                 raise ValueError("Hub large upload allowlist file is unavailable")
-            allowed.append(entry.relative_path)
-        if not allowed or len(set(allowed)) != len(allowed):
+        if not entries or len({entry.relative_path for entry in entries}) != len(entries):
             raise ValueError("Hub large upload requires one exact non-empty allowlist")
         try:
             self._api(token).upload_large_folder(
@@ -517,7 +521,7 @@ class HuggingFaceHubTransport:
                 repo_type=self._repo_type(repository),
                 revision=revision,
                 folder_path=str(source),
-                allow_patterns=allowed,
+                allow_patterns=[glob],
                 ignore_patterns=[".cache", ".cache/**", ".huggingface", ".huggingface/**"],
                 num_workers=max_workers,
             )
@@ -797,6 +801,7 @@ def upload_large_folder(
     revision: str,
     source: str | Path,
     entries: tuple[SyncEntry, ...],
+    remote_prefix: str,
     environ: Mapping[str, str] | None = None,
     max_workers: int = 4,
 ) -> None:
@@ -811,6 +816,7 @@ def upload_large_folder(
             revision=revision,
             source=Path(source),
             entries=entries,
+            remote_prefix=remote_prefix,
             token=token,
             max_workers=max_workers,
         )
