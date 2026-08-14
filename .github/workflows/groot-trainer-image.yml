@@ -24,6 +24,11 @@ on:
         required: true
         type: boolean
         default: false
+      publish_runtime_pilot:
+        description: "Publish the immutable CPU runtime-pilot image to GHCR"
+        required: true
+        type: boolean
+        default: false
 
 env:
   IMAGE_REPOSITORY: ghcr.io/ryanjin333/lehome-groot-n17-trainer
@@ -149,6 +154,96 @@ jobs:
         with:
           name: unreleased-image-manifest-${{ github.sha }}
           path: release-manifest.json
+          if-no-files-found: error
+
+  publish-runtime-pilot:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_runtime_pilot
+    needs: cpu-safe
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RUNTIME_PILOT_TAG: runtime-pilot-${{ github.sha }}
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image: ${{ env.IMAGE_REPOSITORY }}
+      image_ref: ${{ env.IMAGE_REPOSITORY }}@${{ steps.build.outputs.digest }}
+      tag: runtime-pilot-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: metadata
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.IMAGE_REPOSITORY }}
+          tags: |
+            type=raw,value=runtime-pilot-${{ github.sha }}
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: trainer/Dockerfile.runtime-pilot
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          build-args: |
+            REPOSITORY_COMMIT=${{ github.sha }}
+      - name: Pull and smoke the runtime pilot at its exact digest
+        env:
+          OCI_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image_ref="${IMAGE_REPOSITORY}@${OCI_DIGEST}"
+          docker pull "${IMAGE_REPOSITORY}@${OCI_DIGEST}"
+          actual_revision=$(docker image inspect "$image_ref" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+          test "$actual_revision" = "$GITHUB_SHA"
+          docker run --rm --entrypoint /bin/bash "$image_ref" -euo pipefail -c "$(cat <<'RUNTIME_PILOT_SMOKE'
+          test "$(uname -m)" = "x86_64"
+          test "$(dpkg --print-architecture)" = "amd64"
+          /opt/runtime/bin/python - <<'PYTHON'
+          import sys
+          import torch
+          import torchcodec
+          import torchvision
+
+          assert sys.version_info[:3] == (3, 10, 18), sys.version
+          assert torch.__version__ == "2.7.1+cpu", torch.__version__
+          assert torch.version.cuda is None, torch.version.cuda
+          assert not torch.cuda.is_available()
+          assert torchvision.__version__ == "0.22.1+cpu", torchvision.__version__
+          assert torchcodec.__version__ == "0.4.0", torchcodec.__version__
+          PYTHON
+          test "$(git -C /opt/isaac-groot rev-parse HEAD)" = "23ace64f17aa5015259b8609d371eb61a357c776"
+          test "$(sha256sum /opt/isaac-groot/gr00t/model/gr00t_n1d7/setup.py | awk '{print $1}')" = "bdc3cf8a6b9c92a0e3f46d79dc3de05b0a8c70c4289d44ac0aa1c75698a93f31"
+          ffmpeg -version >/dev/null
+          ffprobe -version >/dev/null
+          lehome-train --help >/dev/null
+          test -z "$(find / -xdev -type f \( -name '*.safetensors' -o -name '*.ckpt' \) -print -quit)"
+          RUNTIME_PILOT_SMOKE
+          )"
+      - name: Write runtime-pilot publication receipt
+        env:
+          OCI_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'repository=%s\n' "$IMAGE_REPOSITORY"
+            printf 'tag=%s\n' "$RUNTIME_PILOT_TAG"
+            printf 'digest=%s\n' "$OCI_DIGEST"
+            printf 'git_sha=%s\n' "$GITHUB_SHA"
+            printf 'smoke_result=passed\n'
+          } > runtime-pilot-image.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-pilot-image-${{ github.sha }}
+          path: runtime-pilot-image.txt
           if-no-files-found: error
 
   gpu-structural:
