@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+from time import sleep
 from time import monotonic
 from typing import Callable, Mapping
 
@@ -990,6 +991,7 @@ class HubCheckpointUploader:
         artifact_root: str | os.PathLike[str] | None = None,
         token: str | None = None,
         transport: object | None = None,
+        retry_sleeper: Callable[[float], None] = sleep,
     ) -> None:
         if repository != DEFAULT_MODEL_REPO:
             raise ValueError("checkpoint repository is not approved")
@@ -1009,6 +1011,7 @@ class HubCheckpointUploader:
         # launched separately and must never inherit Hub credentials.
         self._hub_environ = None if token is None else {"HF_TOKEN": token}
         self._transport = transport
+        self._retry_sleeper = retry_sleeper
 
     def _transport_for(self, *, timeout_seconds: float) -> object:
         return self._transport or HuggingFaceHubTransport(timeout_seconds=timeout_seconds)
@@ -1069,7 +1072,8 @@ class HubCheckpointUploader:
             entries=(entry, descriptor_entry),
             remote_prefix=remote_prefix,
             environ=self._hub_environ,
-            max_attempts=1,
+            max_attempts=3,
+            sleeper=self._retry_sleeper,
         )
         readback = Path(
             tempfile.mkdtemp(prefix="checkpoint-readback-", dir=self.artifact_root)
@@ -1083,7 +1087,8 @@ class HubCheckpointUploader:
                 relative_paths=(entry.relative_path, descriptor_entry.relative_path),
                 remote_prefix=remote_prefix,
                 environ=self._hub_environ,
-                max_attempts=1,
+                max_attempts=3,
+                sleeper=self._retry_sleeper,
             )
             observed = readback / entry.relative_path
             observed_descriptor = readback / descriptor_entry.relative_path
@@ -1143,14 +1148,14 @@ class HubCheckpointUploader:
             immutable_revision = upload_files(
                 transport=transport, repository=self.repository, revision=self.revision,
                 source=anchor_root, entries=(entry,), remote_prefix=f"checkpoints/{self.experiment_id}",
-                environ=self._hub_environ, max_attempts=1,
+                environ=self._hub_environ, max_attempts=3, sleeper=self._retry_sleeper,
             )
             readback = anchor_root / "readback"
             download_files(
                 transport=transport, repository=self.repository, revision=immutable_revision,
                 destination=readback, relative_paths=("latest.json",),
                 remote_prefix=f"checkpoints/{self.experiment_id}", environ=self._hub_environ,
-                max_attempts=1,
+                max_attempts=3, sleeper=self._retry_sleeper,
             )
             observed = readback / "latest.json"
             if (

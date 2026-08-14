@@ -141,12 +141,13 @@ class RuntimeMixtureResumeIdentity:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeCheckpointAnchor:
-    """Known-ref discovery evidence for one immutable runtime checkpoint."""
+    """Known-ref discovery evidence for the durable runtime checkpoint chain."""
 
     immutable_anchor_revision: str
     anchor_sha256: str
     anchor: dict[str, object]
     resume: RuntimeMixtureResumeIdentity
+    publications: tuple[dict[str, object], ...]
 
     def previous_link(self) -> dict[str, str]:
         return {
@@ -535,6 +536,7 @@ def discover_runtime_checkpoint_anchor(
         if second_revision != first_revision:
             raise ValueError("runtime checkpoint anchor ref drifted during readback")
         step = int(checked["optimizer_step"])
+        publications: tuple[dict[str, object], ...]
         if step == 2000:
             previous_revision = str(checked["previous_anchor_immutable_revision"])
             previous_scratch = Path(tempfile.mkdtemp(prefix="runtime-anchor-previous-", dir=destination.parent))
@@ -551,6 +553,28 @@ def discover_runtime_checkpoint_anchor(
                 )
                 if int(prior["optimizer_step"]) != 1000:
                     raise ValueError("runtime checkpoint anchor previous link is not 1K")
+                prior_publication = {
+                    "schema_version": 1,
+                    "kind": "runtime_mixture_checkpoint_publication",
+                    **dict(prior["checkpoint"]),
+                    "identity": identity.to_dict(), "identity_sha256": identity.sha256,
+                    "runtime_cursor": {
+                        "optimizer_step": 1000, "global_sample_offset": 1000 * 64,
+                        "physical_batch_size": 64, "action_horizon": 16,
+                    },
+                    "fresh_tree_readback_verified": True,
+                }
+                previous_checkpoint_destination = Path(tempfile.mkdtemp(
+                    prefix="runtime-anchor-previous-checkpoint-", dir=destination.parent,
+                ))
+                shutil.rmtree(previous_checkpoint_destination)
+                try:
+                    _verify_publication_readback(
+                        publication=prior_publication, identity=identity, hub=hub,
+                        destination=previous_checkpoint_destination,
+                    )
+                finally:
+                    shutil.rmtree(previous_checkpoint_destination, ignore_errors=True)
             finally:
                 shutil.rmtree(previous_scratch, ignore_errors=True)
         publication = {
@@ -567,6 +591,7 @@ def discover_runtime_checkpoint_anchor(
         _verify_publication_readback(
             publication=publication, identity=identity, hub=hub, destination=destination,
         )
+        publications = (prior_publication, publication) if step == 2000 else (publication,)
         return RuntimeCheckpointAnchor(
             first_revision, anchor_sha256, checked,
             RuntimeMixtureResumeIdentity(
@@ -574,6 +599,7 @@ def discover_runtime_checkpoint_anchor(
                 destination / str(publication["relative_path"]),
                 destination / str(publication["descriptor_relative_path"]),
             ),
+            publications,
         )
     finally:
         shutil.rmtree(scratch, ignore_errors=True)

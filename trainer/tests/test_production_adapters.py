@@ -687,10 +687,12 @@ def test_checkpoint_uploader_publishes_descriptor_with_archive_to_one_immutable_
     monkeypatch.setattr(adapters, "require_access", lambda **_kwargs: None)
 
     def fake_upload(**kwargs: object) -> str:
+        assert kwargs["max_attempts"] == 3
         uploaded.extend(kwargs["entries"])
         return "e" * 40
 
     def fake_download(**kwargs: object) -> str:
+        assert kwargs["max_attempts"] == 3
         destination = kwargs["destination"]
         assert isinstance(destination, Path)
         for relative in kwargs["relative_paths"]:

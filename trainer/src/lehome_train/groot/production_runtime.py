@@ -16,6 +16,7 @@ from dataclasses import replace
 import sys
 import tempfile
 from time import monotonic
+from time import sleep
 from typing import Any, Mapping
 
 from lehome_train.checkpoints import load_checkpoint_descriptor
@@ -63,7 +64,7 @@ from lehome_train.schedule import (
     ExposureSchedule,
 )
 from lehome_train.telemetry import NvmlTelemetrySampler
-from lehome_train.hub import HuggingFaceHubTransport
+from lehome_train.hub import HuggingFaceHubTransport, download_files as hub_download_files
 from lehome_train.io import sha256_file
 
 
@@ -835,6 +836,7 @@ class ProductionRuntime:
         self,
         *,
         checkpoint_transport_factory: Callable[..., object] | None = None,
+        checkpoint_retry_sleeper: Callable[[float], None] = sleep,
     ) -> None:
         """Keep the Hub byte boundary injectable without widening the command API.
 
@@ -848,6 +850,7 @@ class ProductionRuntime:
             if checkpoint_transport_factory is None
             else checkpoint_transport_factory
         )
+        self._checkpoint_retry_sleeper = checkpoint_retry_sleeper
 
     def runtime_gpu_warmup_adapter(self, arguments: dict[str, object]) -> object:
         """Return the sole live adapter accepted by ``runtime-gpu-warmup``.
@@ -1725,7 +1728,7 @@ class ProductionRuntime:
         uploader = HubCheckpointUploader(
             repository=repository, revision=revision, experiment_id=config.experiment_name,
             artifact_root=config.output_dir, token=token,
-            transport=checkpoint_transport,
+            transport=checkpoint_transport, retry_sleeper=self._checkpoint_retry_sleeper,
         )
         schedule = ExposureSchedule(
             physical_batch_size=64, sample_presentations=128_000,
@@ -1737,12 +1740,20 @@ class ProductionRuntime:
         if identity.mixture_id != str(contract.manifest.mixture_id):
             raise ValueError("runtime checkpoint source evidence mixture identity disagrees with mounted runtime")
 
+        checkpoint_retry_sleeper = self._checkpoint_retry_sleeper
+
         class TokenBoundHub:
             def list_tree(self, *, repository: str, revision: str) -> object:
                 return checkpoint_transport.list_tree(repository=repository, revision=revision, token=token)
 
             def download_files(self, *, repository: str, revision: str, destination: Path, relative_paths: tuple[str, ...], remote_prefix: str) -> object:
-                return checkpoint_transport.download_files(repository=repository, revision=revision, destination=destination, relative_paths=relative_paths, remote_prefix=remote_prefix, token=token)
+                return hub_download_files(
+                    transport=checkpoint_transport, repository=repository,
+                    revision=revision, destination=destination,
+                    relative_paths=relative_paths, remote_prefix=remote_prefix,
+                    environ={"HF_TOKEN": token}, max_attempts=3,
+                    sleeper=checkpoint_retry_sleeper,
+                )
 
             def resolve_approved_ref(self, *, repository: str, ref: str) -> str:
                 return checkpoint_transport.resolve_approved_ref(repository=repository, ref=ref, token=token)

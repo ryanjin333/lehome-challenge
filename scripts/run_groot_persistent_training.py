@@ -458,6 +458,7 @@ def rent_runtime_cpu_pilot(
 ) -> dict[str, object]:
     """Create one bounded native-x86 lease and remove it on every failed proof."""
     _runtime_failure_receipt_path(evidence)
+    _runtime_campaign_binding(evidence)
     offer = _runtime_pilot_offer(evidence)
     _require_account_cap(
         _live_account_total(runner=runner) + float(offer["dph_total"]),
@@ -1045,19 +1046,31 @@ def _runtime_receipt(path_value: object, *, kind: str) -> tuple[dict[str, object
     return value, sha256_file(path)
 
 
+def _runtime_campaign_binding(request: Mapping[str, object]) -> dict[str, object]:
+    """Validate immutable mixture/code evidence before any paid provider call."""
+    if (
+        not isinstance(request.get("code_revision"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", str(request.get("code_revision"))) is None
+        or not isinstance(request.get("code_bundle_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", str(request.get("code_bundle_sha256"))) is None
+    ):
+        raise ValueError("runtime mixture production requires immutable code bindings")
+    bc, bc_sha = _runtime_receipt(request.get("bc_readback_receipt"), kind="bc")
+    rollout, rollout_sha = _runtime_receipt(request.get("rollout_readback_receipt"), kind="rollout")
+    deployment, deployment_sha = _runtime_receipt(request.get("deployment_receipt"), kind="deployment")
+    return {"bc": bc, "bc_receipt_sha256": bc_sha, "rollout": rollout,
+            "rollout_receipt_sha256": rollout_sha, "deployment": deployment,
+            "deployment_receipt_sha256": deployment_sha}
+
+
 def _runtime_identity(instance: Mapping[str, object], request: Mapping[str, object]) -> dict[str, object]:
     if (
         instance.get("platform_arch") != "x86_64"
         or instance.get("trainer_image") != BOOTSTRAP_TRAINER_IMAGE
         or type(instance.get("instance_id")) is not int
-        or not isinstance(request.get("code_revision"), str)
-        or re.fullmatch(r"[0-9a-f]{40}", str(request.get("code_revision"))) is None
     ):
         raise ValueError("runtime mixture production requires native x86_64 and the approved pinned image")
-    bc, bc_sha = _runtime_receipt(request.get("bc_readback_receipt"), kind="bc")
-    rollout, rollout_sha = _runtime_receipt(request.get("rollout_readback_receipt"), kind="rollout")
-    deployment, deployment_sha = _runtime_receipt(request.get("deployment_receipt"), kind="deployment")
-    return {"bc": bc, "bc_receipt_sha256": bc_sha, "rollout": rollout, "rollout_receipt_sha256": rollout_sha, "deployment": deployment, "deployment_receipt_sha256": deployment_sha}
+    return _runtime_campaign_binding(request)
 
 
 def _validated_runtime_pilot_value(receipt: Mapping[str, object]) -> dict[str, object]:
@@ -1112,6 +1125,21 @@ def _validated_runtime_pilot(path_value: object) -> dict[str, object]:
     return _validated_runtime_pilot_value(
         _load_regular_json(Path(path_value), "runtime mixture pilot receipt"),
     )
+
+
+def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> None:
+    """Bind an already-successful CPU pilot to immutable sources before rent."""
+    pilot = _validated_runtime_pilot(request.get("pilot_receipt"))
+    binding = _runtime_campaign_binding(request)
+    proof = pilot["authenticated_evidence"]
+    if (
+        proof.get("code_revision") != request.get("code_revision")
+        or proof.get("code_bundle_sha256") != request.get("code_bundle_sha256")
+        or proof.get("bc_revision") != binding["bc"]["immutable_revision"]
+        or proof.get("rollout_revision") != binding["rollout"]["immutable_revision"]
+        or proof.get("deployment_revision") != binding["deployment"]["immutable_revision"]
+    ):
+        raise ValueError("runtime GPU warm-up pilot is not bound to immutable runtime sources")
 
 
 def _runtime_pilot_instance(instance: Mapping[str, object]) -> None:
@@ -1277,6 +1305,7 @@ def run_runtime_gpu_warmup(
 def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -> dict[str, object]:
     """Promote only a fresh capable interruptible PRO6000 lease for warm-up."""
     _runtime_failure_receipt_path(evidence)
+    _runtime_gpu_rent_preflight(evidence)
     rented = rent(evidence=evidence, runner=runner, abort_request=evidence)
     try:
         _attest_platform_arch(rented, runner=runner)
@@ -1431,6 +1460,7 @@ def runtime_anchor_interruption_terminal(
     from lehome_train.groot.production_runtime import _runtime_checkpoint_identity_from_evidence
     from lehome_train.groot.runtime_checkpoint_lifecycle import (
         discover_runtime_checkpoint_anchor, provider_interruption_terminal,
+        runtime_mixture_completion_terminal,
     )
     identity = _runtime_checkpoint_identity_from_evidence(
         _load_regular_json(Path(identity_path), "runtime checkpoint source evidence")
@@ -1448,16 +1478,19 @@ def runtime_anchor_interruption_terminal(
         step = discovered.resume.optimizer_step
         if step not in request["expected_checkpoint_steps"]:
             raise ValueError("runtime checkpoint anchor step is outside the expected interruption policy")
-        publication = {
-            "schema_version": 1, "kind": "runtime_mixture_checkpoint_publication",
-            **dict(discovered.anchor["checkpoint"]), "identity": identity.to_dict(),
-            "identity_sha256": identity.sha256,
-            "runtime_cursor": {"optimizer_step": step, "global_sample_offset": step * 64, "physical_batch_size": 64, "action_horizon": 16},
-            "fresh_tree_readback_verified": True,
-        }
-        terminal = provider_interruption_terminal(
-            identity=identity, instance_id=str(instance["instance_id"]), publications=(publication,), provider_loss=loss,
-        )
+        if step == 2000:
+            # A completed chain cannot be resumed.  Discovery has validated its
+            # immutable 2K -> 1K link and freshly read both payloads, so route
+            # directly into the canonical disposal-capable completion terminal.
+            terminal = runtime_mixture_completion_terminal(
+                identity=identity, instance_id=str(instance["instance_id"]),
+                publications=discovered.publications,
+            )
+        else:
+            terminal = provider_interruption_terminal(
+                identity=identity, instance_id=str(instance["instance_id"]),
+                publications=discovered.publications, provider_loss=loss,
+            )
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     atomic_write_json(Path(output), terminal)
@@ -1479,6 +1512,42 @@ def resume_runtime_checkpoint(
     config_path = request.get("experiment_config")
     if not isinstance(provider_loss, Mapping) or not isinstance(config_path, str):
         raise ValueError("runtime checkpoint replacement requires loss evidence and experiment config")
+    terminal_path = request.get("terminal_receipt")
+    if type(terminal_path) is not str:
+        raise ValueError("runtime checkpoint replacement requires its durable terminal path")
+    terminal_file = Path(terminal_path)
+    publications = terminal.get("immutable_checkpoint_publications")
+    if not isinstance(publications, list) or len(publications) != 1 or not isinstance(publications[0], Mapping):
+        raise ValueError("runtime checkpoint replacement requires exactly one 1K publication")
+    publication_for_claim = dict(publications[0])
+    if publication_for_claim.get("optimizer_step") != 1000 or not isinstance(publication_for_claim.get("runtime_cursor"), Mapping):
+        raise ValueError("runtime checkpoint replacement cursor is not the 1K boundary")
+    claim = {
+        "schema_version": 1, "kind": "runtime_mixture_resume_claim",
+        "terminal_sha256": sha256_file(terminal_file), "identity_sha256": identity.sha256,
+        "cursor_sha256": _hash(dict(publication_for_claim["runtime_cursor"])),
+        "publication_sha256": _hash(publication_for_claim),
+        "replacement_instance_id": replacement.get("instance_id"),
+        "experiment_config_sha256": sha256_file(Path(config_path)),
+    }
+    if type(claim["replacement_instance_id"]) is not int:
+        raise ValueError("runtime checkpoint replacement instance is invalid")
+    claim_path = terminal_file.with_name(terminal_file.name + ".resume-claim.json")
+    try:
+        descriptor = os.open(claim_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        observed_claim = _load_regular_json(claim_path, "runtime checkpoint resume claim")
+        if observed_claim != claim:
+            raise ValueError("runtime checkpoint cursor is already claimed by another replacement")
+    else:
+        try:
+            payload = json.dumps(claim, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if _load_regular_json(claim_path, "runtime checkpoint resume claim") != claim:
+            raise ValueError("runtime checkpoint resume claim readback mismatches")
     from lehome_train.groot.runtime_checkpoint_lifecycle import (
         discover_runtime_checkpoint_anchor, provider_interruption_terminal,
     )
@@ -1510,7 +1579,7 @@ def resume_runtime_checkpoint(
         "physical_batch_size": cursor.physical_batch_size,
         "action_horizon": 16,
     }
-    return {"paid_action": True, "action": "runtime-checkpoint-resume", "instance_id": replacement["instance_id"], "runtime_cursor": runtime_cursor, "checkpoint_archive": str(cursor.checkpoint_archive), "checkpoint_descriptor": str(cursor.checkpoint_descriptor), "runtime_resume_anchor": discovered.previous_link(), "runtime_resume_publication": publication, "recovered_terminal": recovered_terminal, "immutable_anchor_revision": discovered.immutable_anchor_revision}
+    return {"paid_action": True, "action": "runtime-checkpoint-resume", "instance_id": replacement["instance_id"], "runtime_cursor": runtime_cursor, "checkpoint_archive": str(cursor.checkpoint_archive), "checkpoint_descriptor": str(cursor.checkpoint_descriptor), "runtime_resume_anchor": discovered.previous_link(), "runtime_resume_publication": publication, "recovered_terminal": recovered_terminal, "immutable_anchor_revision": discovered.immutable_anchor_revision, "runtime_resume_claim": str(claim_path)}
 
 
 def destroy_runtime_checkpoint_completion(
@@ -1778,7 +1847,9 @@ def runtime_mixture_warmup_stage(*, instance: Mapping[str, object], request: Map
         if not observed or observed[0] != digest:
             raise ValueError("runtime warmup staged hash readback failed")
         transfers.append({"name": remote_name, "sha256": digest})
-    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/warmup; mv " + remote_dir + "/cpu-pilot.json /prepared/config/cpu-pilot.json; mv " + remote_dir + "/runtime-warmup-binding.json /prepared/config/runtime-warmup-binding.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/launch.json /prepared/warmup/launch.json; test -d /prepared/code; test ! -L /prepared/code"))
+    # The production warm-up adapter consumes the canonical staged launch
+    # location.  Final staging later replaces this isolated warm-up config.
+    runner((*_ssh_prefix(instance), "set -eu; mv " + remote_dir + "/cpu-pilot.json /prepared/config/cpu-pilot.json; mv " + remote_dir + "/runtime-warmup-binding.json /prepared/config/runtime-warmup-binding.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/launch.json /prepared/config/launch.json; test -d /prepared/code; test ! -L /prepared/code"))
     receipt = {"schema_version": 1, "kind": "runtime_mixture_warmup_stage", "instance_id": instance["instance_id"], "provider_response_sha256": instance["provider_response_sha256"], "cpu_pilot_sha256": sha256_file(Path(str(request["pilot_receipt"]))), "bootstrap_receipt_sha256": sha256_file(Path(str(request["bootstrap_receipt"]))), "transfers": transfers}
     atomic_write_json(Path(output), receipt)
     return {"paid_action": True, "action": "runtime-warmup-stage", "warmup_stage_receipt": receipt}

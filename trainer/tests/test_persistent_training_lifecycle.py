@@ -1343,6 +1343,21 @@ def test_capture_runtime_cpu_pilot_offer_rejects_account_total_at_one_dollar() -
 
 
 def _runtime_pilot_offer_evidence(*, failure_receipt: str) -> dict[str, object]:
+    evidence_root = Path(failure_receipt).parent
+    source = {
+        "repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"],
+        "fresh_readback_verified": True, "tree_listing_verified": True,
+    }
+    bc = source | {"immutable_revision": "c" * 40, "remote_prefix": "bc/full"}
+    rollout = source | {"immutable_revision": "d" * 40, "remote_prefix": "rollouts/round-1"}
+    deployment = source | {
+        "immutable_revision": "e" * 40, "mixture_id": "f" * 64,
+        "remote_prefix": "mixtures/" + "f" * 64,
+        "pending_receipt_sha256": "0" * 64, "artifact_entries": ["manifest.json"],
+    }
+    paths = {"bc": evidence_root / "bc.json", "rollout": evidence_root / "rollout.json", "deployment": evidence_root / "deployment.json"}
+    for key, value in (("bc", bc), ("rollout", rollout), ("deployment", deployment)):
+        paths[key].write_text(json.dumps(value), encoding="utf-8")
     offer = {
         "id": 8, "ask_contract_id": 9, "machine_id": 10, "cpu_arch": "amd64",
         "cpu_cores_effective": 32, "cpu_ram": 64390, "disk_space": 124.75,
@@ -1356,7 +1371,11 @@ def _runtime_pilot_offer_evidence(*, failure_receipt: str) -> dict[str, object]:
         "raw_offer_sha256": LIFECYCLE._hash(offer), "account_hourly_total_usd": .18,
         "captured_at_unix": int(time.time()), "expires_at_unix": int(time.time()) + 60,
         "search_mode": "on_demand", "platform_arch": "amd64", "storage_gb": 120,
-        "failure_receipt": failure_receipt,
+        "failure_receipt": failure_receipt, "code_revision": "a" * 40,
+        "code_bundle_sha256": "b" * 64,
+        "bc_readback_receipt": str(paths["bc"]),
+        "rollout_readback_receipt": str(paths["rollout"]),
+        "deployment_receipt": str(paths["deployment"]),
     }
 
 
@@ -1461,6 +1480,26 @@ def test_rent_runtime_cpu_pilot_timeout_cleans_new_instance_and_proves_absence(t
         ("vastai", "destroy", "instance", "44", "--yes"),
         ("vastai", "--raw", "show", "instance", "44"),
     ]
+
+
+def test_runtime_rent_rejects_absent_or_invalid_preflight_evidence_before_provider_calls(tmp_path: Path) -> None:
+    """No offer/account/create command may precede immutable campaign validation."""
+    calls: list[tuple[str, ...]] = []
+    runner = lambda command: calls.append(command) or (_ for _ in ()).throw(AssertionError(command))
+
+    cpu = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "cpu-failure.json"))
+    cpu.pop("deployment_receipt")
+    with pytest.raises(ValueError, match="receipt path"):
+        LIFECYCLE.rent_runtime_cpu_pilot(evidence=cpu, runner=runner)
+
+    gpu = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "gpu-failure.json"))
+    invalid_pilot = tmp_path / "invalid-pilot.json"
+    invalid_pilot.write_text("{}", encoding="utf-8")
+    gpu["pilot_receipt"] = str(invalid_pilot)
+    with pytest.raises(ValueError, match="canonical CPU-only"):
+        LIFECYCLE.rent_runtime_gpu_warmup(evidence=gpu, runner=runner)
+
+    assert calls == []
 
 
 def _runtime_pilot_request_files(tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:

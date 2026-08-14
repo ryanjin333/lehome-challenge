@@ -701,6 +701,7 @@ def test_publisher_readback_promotes_an_actual_false_descriptor_for_runtime_resu
     monkeypatch.setattr(adapters, "require_access", lambda **_kwargs: None)
 
     def upload(**kwargs: object) -> str:
+        assert kwargs["max_attempts"] == 3
         source = kwargs["source"]
         assert isinstance(source, Path)
         for entry in kwargs["entries"]:
@@ -708,6 +709,7 @@ def test_publisher_readback_promotes_an_actual_false_descriptor_for_runtime_resu
         return "e" * 40
 
     def download(**kwargs: object) -> str:
+        assert kwargs["max_attempts"] == 3
         destination = kwargs["destination"]
         assert isinstance(destination, Path)
         for relative in kwargs["relative_paths"]:
