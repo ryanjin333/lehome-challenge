@@ -402,6 +402,77 @@ def test_resume_rechecks_the_staged_envelope_against_the_replacement_receipt(
         )
 
 
+@pytest.mark.parametrize("terminal", (None, "not-a-provider-terminal"))
+def test_resume_requires_a_provider_interruption_terminal_before_execution(
+    terminal: object, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = {"instance_id": 10, "host": "replacement", "port": 22}
+    request = {
+        "generation_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+        "resume_generation_sha256": "a" * 64,
+        "resume_config_sha256": "b" * 64,
+    }
+    if terminal is not None:
+        request["provider_interruption_terminal"] = terminal
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(LIFECYCLE, "_require_instance_capability", lambda *_args: None)
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        return ""
+
+    with pytest.raises(ValueError, match="provider interruption terminal"):
+        LIFECYCLE.remote_action(action="resume", instance=instance, request=request, runner=runner)
+    assert not any("continuous-train --request /prepared/config/resume.json" in command[-1] for command in calls)
+
+
+def test_resume_requires_a_replacement_receipt_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = {"instance_id": 10, "host": "replacement", "port": 22}
+    publication = {
+        "optimizer_step": 1000,
+        "generation_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+        "experiment_id": "persistent-001",
+        "immutable_revision": "c" * 40,
+        "repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
+        "remote_prefix": "prefix",
+        "relative_path": "checkpoints/step-1000.tar",
+        "artifact_sha256": "d" * 64,
+        "artifact_byte_size": 8,
+        "descriptor_relative_path": "checkpoints/step-1000.json",
+        "descriptor_sha256": "e" * 64,
+        "descriptor_byte_size": 9,
+    }
+    request = {
+        "generation_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+        "resume_generation_sha256": "a" * 64,
+        "resume_config_sha256": "b" * 64,
+        "provider_interruption_terminal": {
+            "status": "provider_interrupted",
+            "generation_sha256": "a" * 64,
+            "config_sha256": "b" * 64,
+            "experiment_id": "persistent-001",
+            "resumable_checkpoint_step": 1000,
+            "immutable_checkpoint_publications": [publication],
+        },
+        "resume_checkpoint_publication": publication,
+    }
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(LIFECYCLE, "_require_instance_capability", lambda *_args: None)
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        return ""
+
+    with pytest.raises(ValueError, match="replacement receipt"):
+        LIFECYCLE.remote_action(action="resume", instance=instance, request=request, runner=runner)
+    assert not any("continuous-train --request /prepared/config/resume.json" in command[-1] for command in calls)
+
+
 def test_remote_ssh_failure_is_terminalized_only_after_provider_interruption_readback() -> None:
     instance = {"instance_id": 9, "host": "old", "port": 22, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "provider_response_sha256": "a" * 64}
     request = {

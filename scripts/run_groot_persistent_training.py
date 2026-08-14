@@ -1086,9 +1086,12 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
     elif action in {"tune", "train", "status", "resume"}:
         if action in {"tune", "train", "resume"}:
             _require_instance_capability(instance, request)
-        if action == "resume" and isinstance(request.get("provider_interruption_terminal"), Mapping):
+        if action == "resume":
+            terminal = request.get("provider_interruption_terminal")
+            if not isinstance(terminal, Mapping):
+                raise ValueError("resume requires a provider interruption terminal")
             expected = resume_identity(
-                request["provider_interruption_terminal"],
+                terminal,
                 generation_sha256=str(request.get("generation_sha256")),
                 config_sha256=str(request.get("config_sha256")),
             )
@@ -1113,8 +1116,6 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
                 descriptor=replacement["resume_checkpoint_descriptor"],
                 runner=runner,
             )
-        if action == "resume" and request.get("generation_sha256") != request.get("resume_generation_sha256") or action == "resume" and request.get("config_sha256") != request.get("resume_config_sha256"):
-            raise ValueError("resume requires exact generation/config identity")
         terminal_path = request.get("terminal_path", "/output/persistent-training/terminal.json")
         if action == "status" and (
             type(terminal_path) is not str
