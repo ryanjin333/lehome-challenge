@@ -85,15 +85,30 @@ def _resume_value(output_dir: str | Path, *, num_gpus: int = 1) -> bool:
     return _resume_step(output_dir, num_gpus=num_gpus) is not None
 
 
-def _runtime_checkpoint_step(arguments: list[str]) -> int:
+def _runtime_checkpoint_binding(
+    runtime_arguments: list[str], official_arguments: list[str], *, num_gpus: int
+) -> tuple[int, int]:
+    """Derive the sole runtime cursor from the checked checkpoint directory."""
+
     try:
-        value = arguments[arguments.index("--resume-global-step") + 1]
-        step = int(value)
+        wrapper_options = runtime_arguments[:runtime_arguments.index("--")]
+    except ValueError:
+        raise ValueError("chunk runtime launcher requires a wrapper/official argument separator") from None
+    if any(
+        flag in wrapper_options
+        for flag in ("--resume-sample-offset", "--resume-global-step", "--global-batch-size")
+    ):
+        raise ValueError("runtime cursor flags must be injected from an authenticated checkpoint")
+    try:
+        output = Path(official_arguments[official_arguments.index("--output-dir") + 1])
+        experiment = official_arguments[official_arguments.index("--experiment-name") + 1]
+        global_batch = int(official_arguments[official_arguments.index("--global-batch-size") + 1])
     except (ValueError, IndexError):
-        raise ValueError("chunk runtime launcher requires an explicit resume global step") from None
-    if step < 0:
-        raise ValueError("chunk runtime launcher resume global step must be nonnegative")
-    return step
+        raise ValueError("chunk runtime launcher requires canonical output and global batch arguments") from None
+    if not output.is_absolute() or not experiment or "/" in experiment or "\\" in experiment or global_batch <= 0:
+        raise ValueError("chunk runtime launcher has unsafe checkpoint binding arguments")
+    step = _resume_step(output / experiment, num_gpus=num_gpus)
+    return (0 if step is None else step), global_batch
 
 
 def _arguments(argv: list[str] | None) -> tuple[int, str, list[str], list[str] | None]:
@@ -264,8 +279,13 @@ def _cleanup_metadata_staging(metadata_staging: Path | None) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     stop_step, entrypoint, official_arguments, runtime_arguments = _arguments(argv)
-    expected_runtime_step = None if runtime_arguments is None else _runtime_checkpoint_step(runtime_arguments)
     num_gpus = _official_num_gpus(official_arguments)
+    runtime_binding = (
+        None
+        if runtime_arguments is None
+        else _runtime_checkpoint_binding(runtime_arguments, official_arguments, num_gpus=num_gpus)
+    )
+    expected_runtime_step = None if runtime_binding is None else runtime_binding[0]
     _configure_rank_device(num_gpus, os.environ)
     official_arguments, canonical_run, metadata_staging = _rank_metadata_staging(
         official_arguments, num_gpus=num_gpus, environment=os.environ
@@ -321,7 +341,16 @@ def main(argv: list[str] | None = None) -> None:
             runpy.run_path(entrypoint, run_name="__main__")
         else:
             separator = runtime_arguments.index("--")
-            guarded_arguments = [*runtime_arguments[: separator + 1], *official_arguments]
+            assert runtime_binding is not None
+            step, global_batch = runtime_binding
+            guarded_arguments = [
+                *runtime_arguments[:separator],
+                "--resume-sample-offset", str(step * global_batch),
+                "--resume-global-step", str(step),
+                "--global-batch-size", str(global_batch),
+                "--",
+                *official_arguments,
+            ]
             # Importing and calling the wrapper is intentional: it retains the
             # active Trainer.train patch while it performs the narrow pinned
             # DatasetFactory substitution before its runpy invocation.

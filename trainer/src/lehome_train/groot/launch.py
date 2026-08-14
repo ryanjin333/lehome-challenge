@@ -185,9 +185,6 @@ def build_launch(
             "--mixture-manifest", config.runtime_mixture_manifest,
             "--window-index", config.runtime_window_index,
             "--mounts-descriptor", config.runtime_mounts_descriptor,
-            "--resume-sample-offset", str(config.runtime_resume_sample_offset),
-            "--resume-global-step", str(config.runtime_resume_global_step),
-            "--global-batch-size", str(config.global_batch_size),
             "--official-launch", str(entrypoint),
             "--",
             *official_args,
@@ -299,6 +296,13 @@ def launch_continuous_finetune(
         if checkpoint.is_symlink() or not checkpoint.is_dir() or expected_root not in checkpoint.parents:
             raise ValueError("continuous resume checkpoint must be a verified checkpoint beneath the experiment output")
         command = (*command, "--resume-from-checkpoint", str(checkpoint))
+    # Runtime mixtures must enter the chunk wrapper even on one GPU: it is the
+    # only place that derives and resets the deterministic cursor from the
+    # authenticated checkpoint immediately before Trainer.train.
+    if config.runtime_mixture_manifest is not None:
+        command = _distributed_chunk_command(
+            config, stop_after_optimizer_step=config.max_steps, launch=launch
+        )
     return runner(command, env=launch.environment, check=True)
 
 

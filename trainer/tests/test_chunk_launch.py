@@ -235,15 +235,18 @@ def test_chunk_runtime_wrapper_keeps_guarded_arguments_and_runs_entrypoint_in_pr
         "--mixture-manifest", "/runtime/mixture.json",
         "--window-index", "/runtime/windows.json",
         "--mounts-descriptor", "/runtime/mounts.json",
-        "--resume-sample-offset", "64",
-        "--resume-global-step", "1", "--global-batch-size", "64",
         "--official-launch", str(tmp_path / "gr00t" / "experiment" / "launch_finetune.py"),
-        "--", "--output-dir", "/output", "--experiment-name", "run", "--num-gpus", "1",
+        "--", "--output-dir", "/output", "--experiment-name", "run", "--num-gpus", "1", "--global-batch-size", "64",
     ]
 
     chunk_launch.main(["--stop-after-step", "1", "--", *wrapper])
 
-    assert captured == [wrapper[2:]]
+    separator = wrapper.index("--")
+    assert captured == [[
+        *wrapper[2:separator],
+        "--resume-sample-offset", "0", "--resume-global-step", "0", "--global-batch-size", "64",
+        "--", *wrapper[separator + 1:],
+    ]]
 
 
 def test_runtime_chunk_authenticates_checkpoint_step_before_resetting_dataset_seed(
@@ -273,10 +276,9 @@ def test_runtime_chunk_authenticates_checkpoint_step_before_resetting_dataset_se
     wrapper = [
         "-m", "lehome_train.groot.runtime_mixture_entrypoint",
         "--mixture-manifest", "/runtime/mixture.json", "--window-index", "/runtime/windows.json",
-        "--mounts-descriptor", "/runtime/mounts.json", "--resume-sample-offset", "640",
-        "--resume-global-step", "10", "--global-batch-size", "64",
+        "--mounts-descriptor", "/runtime/mounts.json",
         "--official-launch", str(tmp_path / "gr00t" / "experiment" / "launch_finetune.py"),
-        "--", "--output-dir", str(tmp_path / "output"), "--experiment-name", "run", "--num-gpus", "1",
+        "--", "--output-dir", str(tmp_path / "output"), "--experiment-name", "run", "--num-gpus", "1", "--global-batch-size", "64",
     ]
 
     chunk_launch.main(["--stop-after-step", "11", "--", *wrapper])

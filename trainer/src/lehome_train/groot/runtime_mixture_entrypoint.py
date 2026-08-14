@@ -62,9 +62,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mixture-manifest", required=True)
     parser.add_argument("--window-index", required=True)
     parser.add_argument("--mounts-descriptor", required=True)
+    # The production chunk wrapper injects this authenticated pair after it
+    # has inspected the checkpoint.  Users may not persist it in launch config.
     parser.add_argument("--resume-sample-offset", type=int, default=0)
-    parser.add_argument("--resume-global-step", type=int, required=True)
-    parser.add_argument("--global-batch-size", type=int, required=True)
+    parser.add_argument("--resume-global-step", type=int)
+    parser.add_argument("--global-batch-size", type=int)
     parser.add_argument("--official-launch", required=True)
     parser.add_argument("official_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)

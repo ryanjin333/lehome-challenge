@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
+from dataclasses import replace
 from itertools import islice
 from pathlib import Path
 
@@ -44,16 +45,28 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
     for root in (bc, round_root):
         _write(root / "receipt.json", {"accepted": True})
         _write(root / "acceptance.json", {"accepted_success": True})
+    _write(bc / "publication-readback.json", {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "b" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True})
+    _write(round_root / "publication-readback.json", {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "c" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True})
     _write(bc / "manifest.json", {"fps": 30, "fixed_language_instruction": "fold the garment on the table", "future_actions": {"horizon": 16}, "train_episode_ids": [str(index) for index in range(7)], "validation_episode_ids": []})
     # The loader test injects decoding, so opaque video bytes are enough for contract coverage.
     for episode in range(7):
         _write(bc / f"episodes/{episode}.json", {"episode_id": str(episode)})
     attempts = [_round(round_root, f"attempt-{number}") for number in range(3)]
     normalization = tmp_path / "mixture-normalization.json"
-    _write(normalization, {"train_only": True, "statistics": {"NEW_EMBODIMENT": {}}})
+    statistics = {
+        "state": {name: [float(index) for index in range(12)] for name in ("min", "max", "mean", "std", "q01", "q99")},
+        "action": {name: [float(index) for index in range(12)] for name in ("min", "max", "mean", "std", "q01", "q99")},
+        "relative_action": {
+            "left_arm": {name: [float(index) for index in range(5)] for name in ("min", "max", "mean", "std", "q01", "q99")},
+            "left_gripper": {name: [0.0] for name in ("min", "max", "mean", "std", "q01", "q99")},
+            "right_arm": {name: [float(index) for index in range(5)] for name in ("min", "max", "mean", "std", "q01", "q99")},
+            "right_gripper": {name: [0.0] for name in ("min", "max", "mean", "std", "q01", "q99")},
+        },
+    }
+    _write(normalization, {"schema_version": 3, "train_only": True, "derivation": {"train_window_ids": [f"bc-{index}" for index in range(7)] + [f"rollout-{index}" for index in range(3)], "sample_count": 160}, "statistics": statistics})
     sources = [
-        {"source_id": "bc", "source_type": "bc", "quota": 7, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(bc), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(bc / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(bc / "acceptance.json"), "source_identity": {"prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": _sha_path(bc / "manifest.json"), "action_source": "organizer_expert"}},
-        {"source_id": "round-1", "source_type": "rollout", "quota": 3, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(round_root), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(round_root / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(round_root / "acceptance.json"), "source_identity": {"round_manifest_path": "round.json", "round_manifest_sha256": "a" * 64, "action_source": "policy"}},
+        {"source_id": "bc", "source_type": "bc", "quota": 7, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(bc), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(bc / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(bc / "acceptance.json"), "publication": {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "b" * 40, "prefix": "bc/full", "readback_receipt_path": "publication-readback.json", "readback_receipt_sha256": _sha_path(bc / "publication-readback.json")}, "source_identity": {"prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": _sha_path(bc / "manifest.json"), "action_source": "organizer_expert"}},
+        {"source_id": "round-1", "source_type": "rollout", "quota": 3, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(round_root), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(round_root / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(round_root / "acceptance.json"), "publication": {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "c" * 40, "prefix": "rollouts/round-1", "readback_receipt_path": "publication-readback.json", "readback_receipt_sha256": _sha_path(round_root / "publication-readback.json")}, "source_identity": {"round_manifest_path": "round.json", "round_manifest_sha256": "a" * 64, "action_source": "policy"}},
     ]
     _write(round_root / "round.json", {"round_id": "round-1", "accepted_attempt_ids": [f"attempt-{index}" for index in range(3)]})
     sources[1]["source_identity"]["round_manifest_sha256"] = _sha_path(round_root / "round.json")
@@ -64,7 +77,8 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
         windows.append({"window_id": f"bc-{episode}", "source_id": "bc", "source_type": "bc", "source_episode_id": str(episode), "start": 0, "stop": 16, "frame_ids": list(range(16)), "lineage_id": f"bc-{episode}", "split": "train", "source_locator": {"episode_id": str(episode), "prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": _sha_path(bc / "manifest.json")}})
     for index, (attempt_root, attempt_hash) in enumerate(attempts):
         windows.append({"window_id": f"rollout-{index}", "source_id": "round-1", "source_type": "rollout", "source_episode_id": f"attempt-{index}", "start": 0, "stop": 16, "frame_ids": list(range(16)), "lineage_id": f"rollout-{index}", "split": "train", "source_locator": {"attempt_root": attempt_root, "attempt_manifest_path": f"{attempt_root}/episode.json", "attempt_manifest_sha256": attempt_hash}})
-    manifest = {"schema_version": 2, "kind": "lehome_runtime_mixture", "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40, "safe_prefix": "runtime-mixtures/phase-2", "sources": sources, "camera_schema": ["observation.images.top_rgb", "observation.images.left_rgb", "observation.images.right_rgb"], "image_shape": [480, 640, 3], "state_schema": {"dimension": 12, "storage": "absolute"}, "action_schema": {"dimension": 12, "storage": "absolute"}, "fps": 30, "action_horizon": 16, "instruction": "fold the garment on the table", "schedule_seed": 17, "cycle_size": 10, "mixture_normalization": {"path": "mixture-normalization.json", "sha256": sha256_file(normalization), "byte_size": normalization.stat().st_size}, "window_index": {"path": "windows.json", "sha256": "", "byte_size": 0}}
+    mixture_id = "d" * 64
+    manifest = {"schema_version": 2, "kind": "lehome_runtime_mixture", "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40, "safe_prefix": f"mixtures/{mixture_id}", "mixture_id": mixture_id, "sources": sources, "camera_schema": ["observation.images.top_rgb", "observation.images.left_rgb", "observation.images.right_rgb"], "image_shape": [480, 640, 3], "state_schema": {"dimension": 12, "storage": "absolute"}, "action_schema": {"dimension": 12, "storage": "absolute"}, "fps": 30, "action_horizon": 16, "instruction": "fold the garment on the table", "schedule_seed": 17, "cycle_size": 10, "mixture_normalization": {"path": "mixture-normalization.json", "sha256": sha256_file(normalization), "byte_size": normalization.stat().st_size}, "window_index": {"path": "windows.json", "sha256": "", "byte_size": 0}}
     index = {"schema_version": 2, "manifest_sha256": canonical_json_sha256(manifest), "windows": windows}
     index_path = tmp_path / "windows.json"
     _write(index_path, index)
@@ -72,9 +86,9 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
     manifest_path = tmp_path / "mixture.json"
     _write(manifest_path, manifest)
     release_receipt = tmp_path / "release-receipt.json"
-    _write(release_receipt, {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40, "remote_prefix": "runtime-mixtures/phase-2", "fresh_readback_verified": True, "tree_listing_verified": True})
+    _write(release_receipt, {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40, "remote_prefix": f"mixtures/{mixture_id}", "mixture_id": mixture_id, "fresh_readback_verified": True, "tree_listing_verified": True})
     mounts = tmp_path / "mounts.json"
-    _write(mounts, {"schema_version": 2, "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40, "safe_prefix": "runtime-mixtures/phase-2", "release_receipt_path": str(release_receipt), "release_receipt_sha256": _sha_path(release_receipt), "mounts": [{"source_id": source["source_id"], "root": str(root), "source_tree_sha256": source["source_tree_sha256"], "artifact_receipt_sha256": source["artifact_receipt_sha256"]} for source, root in zip(sources, (bc, round_root), strict=True)]})
+    _write(mounts, {"schema_version": 2, "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40, "safe_prefix": f"mixtures/{mixture_id}", "release_receipt_path": str(release_receipt), "release_receipt_sha256": _sha_path(release_receipt), "mounts": [{"source_id": source["source_id"], "root": str(root), "source_tree_sha256": source["source_tree_sha256"], "artifact_receipt_sha256": source["artifact_receipt_sha256"]} for source, root in zip(sources, (bc, round_root), strict=True)]})
     return manifest_path, index_path, mounts
 
 
@@ -85,6 +99,79 @@ def test_round_source_identity_is_root_level_and_windows_authenticate_attempts(t
     contract = load_runtime_contract(manifest, mounts)
     assert contract.manifest.sources[1].source_identity["round_manifest_path"] == "round.json"
     assert contract.windows[-1].source_locator["attempt_root"] == "attempts/attempt-2"
+
+
+def test_contract_rejects_sources_without_individual_immutable_publication_bindings(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture import _manifest_digest_binding, load_runtime_contract, sha256_file
+
+    manifest, index, mounts = _contract(tmp_path)
+    manifest_payload = json.loads(manifest.read_text())
+    del manifest_payload["sources"][0]["publication"]
+    index_payload = json.loads(index.read_text())
+    index_payload["manifest_sha256"] = _manifest_digest_binding(manifest_payload)
+    _write(index, index_payload)
+    manifest_payload["window_index"]["sha256"] = sha256_file(index)
+    manifest_payload["window_index"]["byte_size"] = index.stat().st_size
+    _write(manifest, manifest_payload)
+
+    with pytest.raises(ValueError, match="publication"):
+        load_runtime_contract(manifest, mounts)
+
+
+def test_dataset_exposes_exact_pinned_statistics_payload(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture import RuntimeMixtureDataset, load_runtime_contract
+
+    contract = load_runtime_contract(*(_contract(tmp_path)[::2]))
+
+    assert set(RuntimeMixtureDataset(contract).get_dataset_statistics()) == {
+        "state", "action", "relative_action",
+    }
+
+
+def test_contract_rejects_normalization_not_derived_from_exact_train_windows(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture import _manifest_digest_binding, load_runtime_contract, sha256_file
+
+    manifest, index, mounts = _contract(tmp_path)
+    normalization = manifest.parent / "mixture-normalization.json"
+    payload = json.loads(normalization.read_text())
+    payload["derivation"]["sample_count"] = 159
+    _write(normalization, payload)
+    manifest_payload = json.loads(manifest.read_text())
+    manifest_payload["mixture_normalization"]["sha256"] = sha256_file(normalization)
+    manifest_payload["mixture_normalization"]["byte_size"] = normalization.stat().st_size
+    index_payload = json.loads(index.read_text())
+    index_payload["manifest_sha256"] = _manifest_digest_binding(manifest_payload)
+    _write(index, index_payload)
+    manifest_payload["window_index"]["sha256"] = sha256_file(index)
+    manifest_payload["window_index"]["byte_size"] = index.stat().st_size
+    _write(manifest, manifest_payload)
+
+    with pytest.raises(ValueError, match="normalization derivation"):
+        load_runtime_contract(manifest, mounts)
+
+
+def test_video_probe_cache_is_by_video_identity_and_checks_each_window_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lehome_train.groot.runtime_mixture import RangeSourceLoader, load_runtime_contract
+
+    contract = load_runtime_contract(*(_contract(tmp_path)[::2]))
+    loader = RangeSourceLoader(contract, decoder=lambda *_: None)
+    path = tmp_path / "shared.mp4"
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        "lehome_train.groot.runtime_mixture._video_probe",
+        lambda candidate: calls.append(candidate) or {"fps": 30, "frame_count": 17},
+    )
+
+    first = loader._video_metadata(path)
+    second = loader._video_metadata(path)
+    loader._validate_video_stop(first, 17)
+
+    assert first == second == {"fps": 30, "frame_count": 17}
+    assert calls == [path]
+    with pytest.raises(ValueError, match="short"):
+        loader._validate_video_stop(second, 18)
 
 
 def test_schedule_resume_and_worker_partitions_keep_exact_seven_three_ratio(tmp_path: Path) -> None:
@@ -150,7 +237,7 @@ def test_rollout_loader_parses_canonical_jsonl_annotations(tmp_path: Path, monke
 
     manifest, _index, mounts = _contract(tmp_path)
     contract = load_runtime_contract(manifest, mounts)
-    monkeypatch.setattr("lehome_train.groot.runtime_mixture._video_probe", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture._video_probe", lambda *_args, **_kwargs: {"fps": 30, "frame_count": 16})
     window = next(item for item in contract.windows if item.source_type == "rollout")
 
     payload = RangeSourceLoader(contract, decoder=lambda *_: None).load(window)

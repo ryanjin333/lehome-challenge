@@ -95,11 +95,11 @@ def test_build_launch_selects_guarded_runtime_mixture_entrypoint_only_when_expli
             runtime_mixture_manifest="/runtime/mixture.json",
             runtime_window_index="/runtime/windows.json",
             runtime_mounts_descriptor="/runtime/mounts.json",
-            runtime_resume_sample_offset=128,
         ), visible_devices="0", environment={}, official_checkout=official_checkout,
     )
     assert launch.command[:3] == (sys.executable, "-m", "lehome_train.groot.runtime_mixture_entrypoint")
-    assert launch.command[launch.command.index("--resume-sample-offset") + 1] == "128"
+    assert "--resume-sample-offset" not in launch.command
+    assert "--resume-global-step" not in launch.command
     assert "--official-launch" in launch.command
     assert "--dataset-path" in launch.command
     assert launch.environment["PYTHONPATH"] == str(official_checkout)

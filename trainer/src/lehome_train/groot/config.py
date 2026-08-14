@@ -170,17 +170,15 @@ class FineTuneLaunchConfig:
                     raise ValueError(f"{field_name} must be an absolute path")
         if type(self.runtime_resume_sample_offset) is not int or self.runtime_resume_sample_offset < 0:
             raise ValueError("runtime_resume_sample_offset must be nonnegative")
-        if self.runtime_resume_global_step is not None:
-            if type(self.runtime_resume_global_step) is not int or self.runtime_resume_global_step < 0:
-                raise ValueError("runtime_resume_global_step must be nonnegative")
-            if self.runtime_mixture_manifest is None:
-                raise ValueError("runtime_resume_global_step requires a runtime mixture")
-            if self.runtime_resume_sample_offset != self.runtime_resume_global_step * resolved_global_batch:
-                raise ValueError("runtime resume offset does not match the bound checkpoint step and global batch")
-        elif self.runtime_mixture_manifest is not None:
-            if self.runtime_resume_sample_offset % resolved_global_batch:
-                raise ValueError("runtime resume offset must align to the global batch")
-            object.__setattr__(self, "runtime_resume_global_step", self.runtime_resume_sample_offset // resolved_global_batch)
+        if self.runtime_mixture_manifest is not None and (
+            self.runtime_resume_sample_offset != 0 or self.runtime_resume_global_step is not None
+        ):
+            # A launch document is immutable.  The actual cursor is derived at
+            # execution from the authenticated checkpoint descriptor, never
+            # from a field that would drift between the initial and resumed run.
+            raise ValueError("runtime resume cursor is derived only from an authenticated checkpoint")
+        if self.runtime_mixture_manifest is None and self.runtime_resume_global_step is not None:
+            raise ValueError("runtime_resume_global_step requires a runtime mixture")
         if not self.tune_projector:
             raise ValueError("tune_projector must be true")
         if not self.tune_diffusion_model:
@@ -250,7 +248,6 @@ class FineTuneLaunchConfig:
             "runtime_mixture_manifest": self.runtime_mixture_manifest,
             "runtime_window_index": self.runtime_window_index,
             "runtime_mounts_descriptor": self.runtime_mounts_descriptor,
-            "runtime_resume_global_step": self.runtime_resume_global_step,
         }
 
     def sample_presentations_for_optimizer_steps(self, optimizer_steps: int) -> int:

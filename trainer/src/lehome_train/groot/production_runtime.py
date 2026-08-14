@@ -1099,7 +1099,6 @@ class ProductionRuntime:
             or config.runtime_window_index != str(paths["runtime_window_index"])
             or config.runtime_mounts_descriptor != str(paths["runtime_mounts_descriptor"])
             or config.dataset_path == "/prepared/generation"
-            or config.runtime_resume_global_step is None
         ):
             raise ValueError("runtime production request does not select the authenticated runtime mixture")
         # Validate all derived artifacts before the official launcher can open a

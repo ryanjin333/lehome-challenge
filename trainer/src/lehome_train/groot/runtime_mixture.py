@@ -44,6 +44,13 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SOURCE_TYPES = {"bc", "rollout", "dagger"}
 APPROVED_MIXTURE_REPOSITORY = "ryanjin333/lehome-groot-n17-data"
+_STATISTIC_FIELDS = ("min", "max", "mean", "std", "q01", "q99")
+_RELATIVE_ACTION_DIMENSIONS = {
+    "left_arm": 5,
+    "left_gripper": 1,
+    "right_arm": 5,
+    "right_gripper": 1,
+}
 
 
 def _strict_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -124,6 +131,7 @@ class Source:
     artifact_receipt_sha256: str
     acceptance_receipt_path: str
     acceptance_receipt_sha256: str
+    publication: dict[str, object]
     source_identity: dict[str, object]
 
 
@@ -146,6 +154,7 @@ class MixtureManifest:
     repository: str
     revision: str
     safe_prefix: str
+    mixture_id: str
     sources: tuple[Source, ...]
     schedule_seed: int
     cycle_size: int
@@ -198,13 +207,37 @@ def _validate_source_identity(kind: str, value: object) -> dict[str, object]:
     return dict(value)
 
 
+def _validate_source_publication(kind: str, value: object) -> dict[str, object]:
+    """Require every mounted source to name its own immutable remote object."""
+
+    if not isinstance(value, dict):
+        raise ValueError("source publication must be an object")
+    _exact(
+        value,
+        {"repository", "revision", "prefix", "readback_receipt_path", "readback_receipt_sha256"},
+        label="source publication",
+    )
+    if value["repository"] != APPROVED_MIXTURE_REPOSITORY:
+        raise ValueError("source publication repository is not approved")
+    if type(value["revision"]) is not str or not _REVISION.fullmatch(value["revision"]):
+        raise ValueError("source publication revision is floating or invalid")
+    prefix = _relative(value["prefix"], label="source publication prefix")
+    if (kind == "bc" and prefix != "bc/full") or (
+        kind == "rollout" and re.fullmatch(r"rollouts/round-[1-9][0-9]*", prefix) is None
+    ) or kind == "dagger":
+        raise ValueError("source publication prefix is not approved for its source type")
+    _relative(value["readback_receipt_path"], label="source publication readback receipt path")
+    _digest(value["readback_receipt_sha256"], label="source publication readback receipt hash")
+    return dict(value)
+
+
 def _parse_source(value: object) -> Source:
     if not isinstance(value, dict):
         raise ValueError("source must be an object")
     _exact(value, {
         "source_id", "source_type", "quota", "release_stage", "source_tree_sha256",
         "artifact_receipt_path", "artifact_receipt_sha256", "acceptance_receipt_path",
-        "acceptance_receipt_sha256", "source_identity",
+        "acceptance_receipt_sha256", "publication", "source_identity",
     }, label="source")
     source_id, kind = value["source_id"], value["source_type"]
     if type(source_id) is not str or not source_id or "/" in source_id or "\\" in source_id:
@@ -218,6 +251,7 @@ def _parse_source(value: object) -> Source:
         _digest(value["source_tree_sha256"], label="source tree hash"),
         _relative(value["artifact_receipt_path"], label="artifact receipt path"), _digest(value["artifact_receipt_sha256"], label="artifact receipt hash"),
         _relative(value["acceptance_receipt_path"], label="acceptance receipt path"), _digest(value["acceptance_receipt_sha256"], label="acceptance receipt hash"),
+        _validate_source_publication(str(kind), value["publication"]),
         _validate_source_identity(str(kind), value["source_identity"]),
     )
 
@@ -269,7 +303,7 @@ def _manifest_digest_binding(document: dict[str, object]) -> str:
 def _parse_manifest(path: Path) -> MixtureManifest:
     document = _load_object(path, label="mixture manifest")
     required = {
-        "schema_version", "kind", "repository", "revision", "safe_prefix", "sources", "camera_schema", "image_shape", "state_schema", "action_schema", "fps", "action_horizon", "instruction", "schedule_seed", "cycle_size", "mixture_normalization", "window_index",
+        "schema_version", "kind", "repository", "revision", "safe_prefix", "mixture_id", "sources", "camera_schema", "image_shape", "state_schema", "action_schema", "fps", "action_horizon", "instruction", "schedule_seed", "cycle_size", "mixture_normalization", "window_index",
     }
     if set(document) == required | {"self_sha256"}:
         declared = _digest(document["self_sha256"], label="manifest self hash")
@@ -288,6 +322,9 @@ def _parse_manifest(path: Path) -> MixtureManifest:
     if type(revision) is not str or not _REVISION.fullmatch(revision):
         raise ValueError("revision is floating or invalid")
     safe_prefix = _relative(document["safe_prefix"], label="safe prefix")
+    mixture_id = _digest(document["mixture_id"], label="mixture ID")
+    if safe_prefix != f"mixtures/{mixture_id}":
+        raise ValueError("mixture prefix does not bind its content ID")
     sources_raw = document["sources"]
     if not isinstance(sources_raw, list):
         raise ValueError("sources must be an array")
@@ -316,7 +353,7 @@ def _parse_manifest(path: Path) -> MixtureManifest:
     if not isinstance(index, dict):
         raise ValueError("window index binding is invalid")
     _exact(index, {"path", "sha256", "byte_size"}, label="window index binding")
-    return MixtureManifest(str(repository), str(revision), safe_prefix, sources, schedule_seed, cycle_size, _relative(index["path"], label="window index path"), _digest(index["sha256"], label="window index hash"), _integer(index["byte_size"], label="window index size"), _relative(normalization["path"], label="mixture normalization path"), _digest(normalization["sha256"], label="mixture normalization hash"), _integer(normalization["byte_size"], label="mixture normalization size"), document)
+    return MixtureManifest(str(repository), str(revision), safe_prefix, mixture_id, sources, schedule_seed, cycle_size, _relative(index["path"], label="window index path"), _digest(index["sha256"], label="window index hash"), _integer(index["byte_size"], label="window index size"), _relative(normalization["path"], label="mixture normalization path"), _digest(normalization["sha256"], label="mixture normalization hash"), _integer(normalization["byte_size"], label="mixture normalization size"), document)
 
 
 def _safe_file(root: Path, relative: str, *, label: str) -> Path:
@@ -353,6 +390,7 @@ def _validate_mounts(path: Path, manifest: MixtureManifest) -> dict[str, Path]:
         receipt.get("repository") != manifest.repository
         or receipt.get("immutable_revision") != manifest.revision
         or receipt.get("remote_prefix") != manifest.safe_prefix
+        or receipt.get("mixture_id") != manifest.mixture_id
         or receipt.get("fresh_readback_verified") is not True
         or receipt.get("tree_listing_verified") is not True
     ):
@@ -380,6 +418,24 @@ def _validate_mounts(path: Path, manifest: MixtureManifest) -> dict[str, Path]:
         for relative, digest, label in ((source.acceptance_receipt_path, source.acceptance_receipt_sha256, "acceptance receipt"),):
             if sha256_file(_safe_file(root, relative, label=label)) != digest:
                 raise ValueError(f"{label} drift")
+        publication = source.publication
+        readback = _safe_file(root, str(publication["readback_receipt_path"]), label="source publication readback receipt")
+        if sha256_file(readback) != publication["readback_receipt_sha256"]:
+            raise ValueError("source publication readback receipt drift")
+        readback_value = _load_object(readback, label="source publication readback receipt")
+        _exact(
+            readback_value,
+            {"repository", "immutable_revision", "remote_prefix", "fresh_readback_verified", "tree_listing_verified"},
+            label="source publication readback receipt",
+        )
+        if (
+            readback_value["repository"] != publication["repository"]
+            or readback_value["immutable_revision"] != publication["revision"]
+            or readback_value["remote_prefix"] != publication["prefix"]
+            or readback_value["fresh_readback_verified"] is not True
+            or readback_value["tree_listing_verified"] is not True
+        ):
+            raise ValueError("source publication readback receipt does not prove the exact immutable source")
         mounts[source_id] = root
     if set(mounts) != set(required):
         raise ValueError("mounts have missing or extra source IDs")
@@ -450,6 +506,57 @@ def _validate_source_provenance(contract: RuntimeContract) -> None:
             raise ValueError("DAgger runtime data is forbidden for this campaign")
 
 
+def _validate_stat_vector(value: object, *, dimensions: int, label: str) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    _exact(value, set(_STATISTIC_FIELDS), label=label)
+    for field in _STATISTIC_FIELDS:
+        row = value[field]
+        if (
+            not isinstance(row, list)
+            or len(row) != dimensions
+            or any(type(item) not in (int, float) or not math.isfinite(float(item)) for item in row)
+        ):
+            raise ValueError(f"{label} {field} must be a finite {dimensions}D vector")
+    if any(float(value["std"][index]) < 0 for index in range(dimensions)):
+        raise ValueError(f"{label} standard deviation is negative")
+
+
+def _validate_normalization(value: object, windows: tuple[Window, ...]) -> dict[str, object]:
+    """Validate the exact envelope and payload consumed by pinned GR00T.
+
+    ``processor.set_statistics`` receives only ``statistics``.  The envelope
+    records why those values are safe, without leaking metadata into GR00T's
+    expected statistics mapping.
+    """
+
+    if not isinstance(value, dict):
+        raise ValueError("mixture normalization must be an object")
+    _exact(value, {"schema_version", "train_only", "derivation", "statistics"}, label="mixture normalization")
+    if value["schema_version"] != 3 or value["train_only"] is not True:
+        raise ValueError("mixture normalization is not train-only")
+    derivation = value["derivation"]
+    if not isinstance(derivation, dict):
+        raise ValueError("normalization derivation must be an object")
+    _exact(derivation, {"train_window_ids", "sample_count"}, label="normalization derivation")
+    expected_ids = [window.window_id for window in windows if window.split == "train"]
+    if derivation["train_window_ids"] != expected_ids or derivation["sample_count"] != len(expected_ids) * ACTION_HORIZON:
+        raise ValueError("normalization derivation does not match exact train windows")
+    statistics = value["statistics"]
+    if not isinstance(statistics, dict):
+        raise ValueError("normalization statistics must be an object")
+    _exact(statistics, {"state", "action", "relative_action"}, label="normalization statistics")
+    _validate_stat_vector(statistics["state"], dimensions=12, label="normalization state")
+    _validate_stat_vector(statistics["action"], dimensions=12, label="normalization action")
+    relative = statistics["relative_action"]
+    if not isinstance(relative, dict):
+        raise ValueError("normalization relative_action must be an object")
+    _exact(relative, set(_RELATIVE_ACTION_DIMENSIONS), label="normalization relative_action")
+    for name, dimensions in _RELATIVE_ACTION_DIMENSIONS.items():
+        _validate_stat_vector(relative[name], dimensions=dimensions, label=f"normalization relative_action {name}")
+    return dict(statistics)
+
+
 def load_runtime_contract(manifest_path: str | os.PathLike[str], mounts_path: str | os.PathLike[str]) -> RuntimeContract:
     """Authenticate immutable artifacts and operational mounts before any read."""
 
@@ -483,9 +590,7 @@ def load_runtime_contract(manifest_path: str | os.PathLike[str], mounts_path: st
     normalization = _safe_file(manifest_file.parent, manifest.normalization_path, label="mixture normalization")
     if normalization.stat().st_size != manifest.normalization_byte_size or sha256_file(normalization) != manifest.normalization_sha256:
         raise ValueError("mixture normalization hash or size mismatch")
-    normalization_value = _load_object(normalization, label="mixture normalization")
-    if normalization_value.get("train_only") is not True:
-        raise ValueError("mixture normalization is not train-only")
+    normalization_value = _validate_normalization(_load_object(normalization, label="mixture normalization"), windows)
     mounts = _validate_mounts(Path(mounts_path), manifest)
     for source in manifest.sources:
         identity = source.source_identity
@@ -614,7 +719,7 @@ class RuntimeMixtureDataset(IterableDataset):
 
     def get_dataset_statistics(self) -> dict[str, object]:
         """Return authenticated train-only normalization metadata for GR00T callers."""
-        return dict(self.contract.normalization["statistics"])  # pinned processor expects the statistics payload only
+        return dict(self.contract.normalization)  # pinned processor expects the statistics payload only
 
     def initial_actions(self) -> list[list[float]]:
         return []
@@ -662,7 +767,8 @@ def pinned_processor_messages(payload: Mapping[str, object], *, backend: object 
     return [{"type": backend.MessageType.EPISODE_STEP.value, "content": data}]
 
 
-def _video_probe(path: Path, *, stop: int) -> None:
+def _video_probe(path: Path) -> dict[str, int]:
+    """Return immutable video metadata once; window bounds stay a local check."""
     try:
         completed = subprocess.run(("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate,nb_frames", "-of", "json", str(path)), check=False, capture_output=True, text=True, timeout=15)
         data = json.loads(completed.stdout) if completed.returncode == 0 else {}
@@ -670,8 +776,9 @@ def _video_probe(path: Path, *, stop: int) -> None:
         frames = int(stream["nb_frames"])
         rate = stream["avg_frame_rate"]
         numerator, denominator = (int(part) for part in rate.split("/"))
-        if frames < stop or denominator == 0 or numerator / denominator != FPS:
+        if frames <= 0 or denominator == 0 or numerator / denominator != FPS:
             raise ValueError
+        return {"fps": FPS, "frame_count": frames}
     except (OSError, ValueError, KeyError, IndexError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
         raise ValueError("missing corrupt video or FPS drift") from error
 
@@ -683,9 +790,13 @@ class RangeSourceLoader:
         self.contract = contract
         self.decoder = decoder or PinnedGrootFrameDecoder()
         self._attempt_cache: OrderedDict[Path, None] = OrderedDict()
-        self._video_cache: OrderedDict[tuple[Path, int], None] = OrderedDict()
+        self._video_cache: OrderedDict[Path, dict[str, int]] = OrderedDict()
         self._bc_rows_cache: OrderedDict[Path, list[Any]] = OrderedDict()
         self.cache_cap = 8
+        # One loader lives in one DataLoader worker.  Keeping 2K video
+        # identities avoids re-probing ordinary campaign epochs while staying
+        # explicitly bounded under adversarial window cardinality.
+        self.video_cache_cap = 2048
 
     def _cache(self, cache: OrderedDict[Any, Any], key: Any, value: Any) -> Any:
         cache[key] = value
@@ -693,6 +804,28 @@ class RangeSourceLoader:
         while len(cache) > self.cache_cap:
             cache.popitem(last=False)
         return value
+
+    def _video_metadata(self, path: Path) -> dict[str, int]:
+        metadata = self._video_cache.get(path)
+        if metadata is None:
+            metadata = _video_probe(path)
+            self._video_cache[path] = metadata
+            while len(self._video_cache) > self.video_cache_cap:
+                self._video_cache.popitem(last=False)
+        else:
+            self._video_cache.move_to_end(path)
+        return dict(metadata)
+
+    @staticmethod
+    def _validate_video_stop(metadata: Mapping[str, object], stop: int) -> None:
+        if (
+            type(stop) is not int
+            or stop < 0
+            or metadata.get("fps") != FPS
+            or type(metadata.get("frame_count")) is not int
+            or int(metadata["frame_count"]) < stop
+        ):
+            raise ValueError("video is short or has FPS drift")
 
     def _bc_rows(self, root: Path, window: Window) -> tuple[list[Any], list[Any], dict[str, Path]]:
         import pyarrow.parquet as pq
@@ -772,10 +905,7 @@ class RangeSourceLoader:
             if any(not isinstance(row, list) or len(row) != 12 or any(type(number) not in (int, float) or not math.isfinite(float(number)) for number in row) for row in values):
                 raise ValueError(f"{label} dimension or finite-value drift")
         for path in videos.values():
-            key = (path, window.stop)
-            if key not in self._video_cache:
-                _video_probe(path, stop=window.stop)
-                self._cache(self._video_cache, key, None)
+            self._validate_video_stop(self._video_metadata(path), window.stop)
         images = {camera: self.decoder(path, (window.start,), FPS) for camera, path in videos.items()}
         return {"images": {key.rsplit(".", 1)[-1]: value for key, value in images.items()}, "state": states[0], "actions": actions, "window_id": window.window_id}
 
