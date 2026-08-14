@@ -29,7 +29,7 @@ PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revisi
 # Vast's raw expression grammar does not support a portable OR form for two
 # exact SKU strings.  Query only stable numeric facts, then enforce the narrow
 # WS/S allowlist on raw rows in ``_offer_gpu``.
-OFFER_QUERY = "gpu_ram>=96000 num_gpus=1 reliability>=0.95"
+OFFER_QUERY = "gpu_ram>=96 num_gpus=1 reliability>=0.95"
 RUNTIME_PILOT_OFFER_QUERY = "cpu_arch=amd64 cpu_cores_effective>=32 cpu_ram>=64 disk_space>=120 reliability>=0.98 num_gpus=1 direct_port_count>=2 duration>=1"
 _RUNTIME_PILOT_OFFER_FIELDS = (
     "id", "ask_contract_id", "machine_id", "cpu_arch", "cpu_cores_effective", "cpu_ram",
@@ -594,6 +594,26 @@ def _verify_code_bundle_receipt(bundle: Path, receipt: Path) -> str:
     return digest
 
 
+def _verify_reviewed_code_bundle(bundle: Path, receipt: Path, revision: object) -> str:
+    """Require a real clean Git bundle at the reviewed immutable revision."""
+    digest = _verify_code_bundle_receipt(bundle, receipt)
+    if type(revision) is not str or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+        raise ValueError("reviewed code bundle requires an immutable Git revision")
+    from tempfile import TemporaryDirectory
+    with TemporaryDirectory(prefix="runtime-code-bundle-") as temporary:
+        root = Path(temporary) / "source"
+        try:
+            subprocess.run(("git", "clone", "--quiet", str(bundle), str(root)), check=True, text=True, capture_output=True)
+            subprocess.run(("git", "-C", str(root), "checkout", "--quiet", "--detach", revision), check=True, text=True, capture_output=True)
+            head = subprocess.run(("git", "-C", str(root), "rev-parse", "HEAD"), check=True, text=True, capture_output=True).stdout.strip()
+            dirty = subprocess.run(("git", "-C", str(root), "status", "--porcelain"), check=True, text=True, capture_output=True).stdout
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise ValueError("reviewed code bundle is not a Git bundle containing the requested revision") from error
+        if head != revision or dirty:
+            raise ValueError("reviewed code bundle does not resolve to a clean requested revision")
+    return digest
+
+
 def _stage_setup_command(parent_archive_sha256: str) -> str:
     """Static remote setup: extraction is constrained to the three mounts."""
     return (
@@ -1002,7 +1022,7 @@ def _validated_runtime_pilot_value(receipt: Mapping[str, object]) -> dict[str, o
         or not isinstance(value.get("loader_throughput"), Mapping)
         or not isinstance(value.get("representative"), Mapping)
         or value["representative"].get("three_cameras") is not True
-        or value["representative"].get("action_horizon") != 40
+        or value["representative"].get("action_horizon") != 16
         or type(value.get("cache_cap")) is not int
         or type(value.get("timeout_seconds")) not in (int, float)
     )
@@ -1268,6 +1288,8 @@ def runtime_checkpoint_terminal(
     if provider_loss is None:
         terminal = runtime_mixture_completion_terminal(identity=identity, instance_id=str(instance["instance_id"]), publications=rows)
     else:
+        if provider_loss.get("kind") not in {"instance_absent", "preempted"}:
+            raise ValueError("runtime checkpoint replacement requires explicit provider absence or preemption")
         terminal = provider_interruption_terminal(identity=identity, instance_id=str(instance["instance_id"]), publications=rows, provider_loss=provider_loss)
     return {"paid_action": True, "action": "runtime-checkpoint-terminal", "terminal": terminal}
 
@@ -1280,7 +1302,7 @@ def classify_runtime_provider_loss(*, instance: Mapping[str, object], runner: Ru
     try:
         live = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
     except (subprocess.CalledProcessError, OSError, ValueError):
-        return {"kind": "provider_unreachable", "evidence_sha256": _hash({"instance_id": instance_id, "reason": "provider_unreachable"})}
+        return None
     if live in ({}, None):
         return {"kind": "instance_absent", "evidence_sha256": _hash({"instance_id": instance_id, "reason": "instance_absent"})}
     if isinstance(live, Mapping) and live.get("id") == instance_id and live.get("actual_status") in {"interrupted", "terminated", "stopped", "offline"}:
@@ -1397,13 +1419,15 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         "runtime_pilot_request": "runtime-pilot.json", "runtime_warmup_request": "runtime-warmup.json",
         "parent_checkpoint": "parent.tar",
         "modality_config": "modality.py", "token_file": "runtime.token",
+        "pilot_receipt": "cpu-pilot.json", "gpu_warmup_receipt": "gpu-warmup.json",
+        "runtime_warmup_binding": "runtime-warmup-binding.json", "selected_workers": "selected-workers.json",
         "bc_readback_receipt": "bc-readback.json", "rollout_readback_receipt": "rollout-readback.json",
         "deployment_receipt": "deployment-receipt.json",
     }
     if any(type(request.get(field)) is not str or not request[field] for field in required):
         raise ValueError("runtime mixture stage requires reviewed code, config, token, and authenticated receipts")
     code = Path(str(request["code_bundle"]))
-    if _verify_code_bundle_receipt(code, Path(str(request["code_bundle_sha256_file"]))) != request.get("code_bundle_sha256"):
+    if _verify_reviewed_code_bundle(code, Path(str(request["code_bundle_sha256_file"])), request.get("code_revision")) != request.get("code_bundle_sha256"):
         raise ValueError("runtime mixture stage code bundle receipt differs from the reviewed bundle")
     _safe_archive(code, "runtime mixture code bundle")
     parent = Path(str(request["parent_checkpoint"]))
@@ -1438,7 +1462,7 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         if not observed or observed[0] != digest:
             raise ValueError("runtime mixture staged hash readback failed")
         transfers.append({"name": remote_name, "sha256": digest})
-    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/code /prepared/config /prepared/runtime /cache/parent /output; mv " + remote_dir + "/launch.json /prepared/config/launch.json; mv " + remote_dir + "/experiment.json /prepared/config/experiment.json; mv " + remote_dir + "/runtime-train.json /prepared/config/runtime-train.json; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/runtime-pilot.json /prepared/config/runtime-pilot.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/code.bundle -C /prepared/code; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/parent.tar -C /cache/parent; test \"$(sha256sum " + remote_dir + "/parent.tar | cut -d' ' -f1)\" = " + PARENT_CHECKPOINT["archive_sha256"] + "; PYTHONPATH=/prepared/code/trainer/src python -c \"from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; assert policy_artifact_sha256('/cache/parent') == '" + PARENT_CHECKPOINT["artifact_sha256"] + "'\"; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code; test ! -L /cache/parent"))
+    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/code /prepared/config /prepared/runtime /cache/parent /output; mv " + remote_dir + "/launch.json /prepared/config/launch.json; mv " + remote_dir + "/experiment.json /prepared/config/experiment.json; mv " + remote_dir + "/runtime-train.json /prepared/config/runtime-train.json; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/runtime-pilot.json /prepared/config/runtime-pilot.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/cpu-pilot.json /prepared/config/cpu-pilot.json; mv " + remote_dir + "/gpu-warmup.json /prepared/config/gpu-warmup.json; mv " + remote_dir + "/runtime-warmup-binding.json /prepared/config/runtime-warmup-binding.json; mv " + remote_dir + "/selected-workers.json /prepared/config/selected-workers.json; mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/code.bundle -C /prepared/code; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/parent.tar -C /cache/parent; test \"$(sha256sum " + remote_dir + "/parent.tar | cut -d' ' -f1)\" = " + PARENT_CHECKPOINT["archive_sha256"] + "; PYTHONPATH=/prepared/code/trainer/src python -c \"from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; assert policy_artifact_sha256('/cache/parent') == '" + PARENT_CHECKPOINT["artifact_sha256"] + "'\"; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code; test ! -L /cache/parent"))
     return {"paid_action": True, "action": "runtime-stage", "instance_id": instance["instance_id"], "code_bundle_sha256": request["code_bundle_sha256"], "transfers": transfers}
 
 

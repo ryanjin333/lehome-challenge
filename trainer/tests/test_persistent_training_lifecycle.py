@@ -1311,6 +1311,10 @@ def test_capture_runtime_cpu_pilot_offer_uses_exact_on_demand_contract() -> None
     assert "--on-demand" in commands[0] and "--storage" in commands[0]
 
 
+def test_pro6000_offer_query_uses_vast_scaled_gibibyte_predicate() -> None:
+    assert LIFECYCLE.OFFER_QUERY == "gpu_ram>=96 num_gpus=1 reliability>=0.95"
+
+
 def test_capture_runtime_cpu_pilot_offer_rejects_account_total_at_one_dollar() -> None:
     offer = {"id": 8, "cpu_arch": "amd64", "cpu_cores_effective": 32, "cpu_ram": 64390, "disk_space": 124.75, "disk_bw": 500, "reliability": .99, "num_gpus": 1, "dph_total": .18, "is_bid": False, "rentable": True, "rented": False}
 
@@ -1477,7 +1481,7 @@ def test_runtime_cpu_pilot_executes_only_loader_cli_and_persists_bound_lifecycle
     pilot = {
         "schema_version": 4, "kind": "runtime_mixture_loader_pilot", "model_loaded": False,
         "gpu_initialized": False, "processor_contract": "pinned_processor_integration_required",
-        "representative": {"bc_window_id": "bc", "rollout_window_id": "rollout", "three_cameras": True, "action_horizon": 40},
+        "representative": {"bc_window_id": "bc", "rollout_window_id": "rollout", "three_cameras": True, "action_horizon": 16},
         "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24],
         "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {},
         "timing_rows": [{"worker_count": count, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 100.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for count in [0, 4, 8, 16, 24]],
@@ -1537,7 +1541,7 @@ def test_runtime_gpu_warmup_runs_exact_cli_and_binds_cpu_pilot_code_parent_and_i
     instance |= {"kind": "runtime_mixture_gpu_warmup_instance", "capability_sha256": "5" * 64}
     pilot = {
         "schema_version": 4, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "gpu_initialized": False,
-        "processor_contract": "pinned_processor_integration_required", "representative": {"three_cameras": True, "action_horizon": 40}, "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24], "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {str(n): {"decoded_samples": 100, "samples_per_second": 1.0} for n in [0, 4, 8, 16, 24]}, "timing_rows": [{"worker_count": n, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 1.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for n in [0, 4, 8, 16, 24]], "authenticated_evidence": {"provider_instance_id": 44, "provider_response_sha256": "2" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40}, "cache_cap": 1, "native_x86_required": True, "timeout_seconds": 60.0, "canonical_completion": True,
+        "processor_contract": "pinned_processor_integration_required", "representative": {"three_cameras": True, "action_horizon": 16}, "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24], "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {str(n): {"decoded_samples": 100, "samples_per_second": 1.0} for n in [0, 4, 8, 16, 24]}, "timing_rows": [{"worker_count": n, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 1.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for n in [0, 4, 8, 16, 24]], "authenticated_evidence": {"provider_instance_id": 44, "provider_response_sha256": "2" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40}, "cache_cap": 1, "native_x86_required": True, "timeout_seconds": 60.0, "canonical_completion": True,
     }
     pilot_path = tmp_path / "pilot.json"; pilot_path.write_text(json.dumps(pilot), encoding="utf-8")
     binding = {"mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "5" * 64}, "code": {"repository_revision": "3" * 40, "bundle_sha256": "4" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
