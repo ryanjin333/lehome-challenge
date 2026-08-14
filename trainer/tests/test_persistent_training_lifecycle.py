@@ -1228,3 +1228,43 @@ def test_prepare_requires_local_organizer_and_corrective_release_evidence(
     }
     with pytest.raises(ValueError, match="organizer evidence"):
         LIFECYCLE._verify_prepare_evidence(receipt)
+
+
+def test_runtime_mixture_train_uses_only_authenticated_receipts_and_never_legacy_generation(
+    tmp_path: Path,
+) -> None:
+    receipts = {
+        "bc": {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True},
+        "rollout": {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "b" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True},
+        "deployment": {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "e" * 64, "artifact_entries": [{"relative_path": "mixture.json", "sha256": "f" * 64, "byte_size": 1}], "fresh_readback_verified": True, "tree_listing_verified": True},
+    }
+    paths = {}
+    for name, value in receipts.items():
+        path = tmp_path / f"{name}.json"; path.write_text(json.dumps(value), encoding="utf-8"); paths[name] = str(path)
+    pilot = tmp_path / "pilot.json"
+    pilot.write_text(json.dumps({"schema_version": 2, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "gpu_initialized": False, "native_x86_required": True, "canonical_worker_counts": [0, 4, 8, 16, 24], "canonical_completion": True, "throughput_verified": True}), encoding="utf-8")
+    calls: list[tuple[str, ...]] = []
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command); return "{}"
+    instance = {"instance_id": 44, "host": "native-x86", "port": 22, "platform_arch": "x86_64", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE}
+    output = tmp_path / "execution.json"
+    request = {"bc_readback_receipt": paths["bc"], "rollout_readback_receipt": paths["rollout"], "deployment_receipt": paths["deployment"], "pilot_receipt": str(pilot), "code_revision": "1" * 40, "execution_receipt": str(output)}
+
+    report = LIFECYCLE.remote_action(action="runtime-train", instance=instance, request=request, runner=runner)
+
+    assert report["action"] == "runtime-train"
+    command = calls[-1][-1]
+    assert "runtime-mixture-train --request /prepared/config/runtime-train.json" in command
+    assert "/prepared/generation" not in command and "continuous-train" not in command
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    assert receipt["platform_arch"] == "x86_64" and receipt["deployment_revision"] == "c" * 40
+
+
+def test_runtime_pilot_provider_plan_is_on_demand_x86_and_never_rents() -> None:
+    plan = LIFECYCLE.runtime_mixture_pilot_provider_plan()
+
+    assert plan == {
+        "paid_action": False, "action": "runtime-pilot-plan", "provider_action": "not_rented",
+        "platform_arch": "x86_64", "purchase_option": "on_demand",
+        "account_hourly_cap_usd": 1.0, "max_instances": 1,
+    }

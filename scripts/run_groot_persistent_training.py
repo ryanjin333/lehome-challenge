@@ -20,6 +20,7 @@ import time
 from typing import Callable, Mapping
 
 from lehome_train.hub import HubTransport, HuggingFaceHubTransport
+from lehome_train.io import atomic_write_json, sha256_file
 from lehome_train.release_manifest import validate_training_capability
 
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
@@ -770,6 +771,150 @@ def _require_instance_capability(instance: Mapping[str, object], request: Mappin
     validate_training_capability(training_capability)
 
 
+def _runtime_receipt(path_value: object, *, kind: str) -> tuple[dict[str, object], str]:
+    if type(path_value) is not str:
+        raise ValueError("runtime mixture receipt path is required")
+    path = Path(path_value)
+    value = dict(_load_regular_json(path, "runtime mixture receipt"))
+    source_keys = {"repository", "immutable_revision", "remote_prefix", "fresh_readback_verified", "tree_listing_verified"}
+    deployment_keys = source_keys | {"mixture_id", "pending_receipt_sha256", "artifact_entries"}
+    if set(value) != (source_keys if kind in {"bc", "rollout"} else deployment_keys):
+        raise ValueError("runtime mixture receipt schema is incompatible")
+    prefix = value.get("remote_prefix")
+    if (
+        value.get("repository") != CORRECTIVE_SOURCE["repository"]
+        or type(value.get("immutable_revision")) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", str(value.get("immutable_revision"))) is None
+        or value.get("fresh_readback_verified") is not True
+        or value.get("tree_listing_verified") is not True
+        or (kind == "bc" and prefix != "bc/full")
+        or (kind == "rollout" and (type(prefix) is not str or re.fullmatch(r"rollouts/round-[1-9][0-9]*", prefix) is None))
+        or (kind == "deployment" and (not isinstance(value.get("mixture_id"), str) or prefix != "mixtures/" + str(value.get("mixture_id")) or not isinstance(value.get("artifact_entries"), list) or not value["artifact_entries"]))
+    ):
+        raise ValueError("runtime mixture receipt is not an authenticated campaign binding")
+    return value, sha256_file(path)
+
+
+def _runtime_identity(instance: Mapping[str, object], request: Mapping[str, object]) -> dict[str, object]:
+    if (
+        instance.get("platform_arch") != "x86_64"
+        or instance.get("trainer_image") != BOOTSTRAP_TRAINER_IMAGE
+        or type(instance.get("instance_id")) is not int
+        or not isinstance(request.get("code_revision"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", str(request.get("code_revision"))) is None
+    ):
+        raise ValueError("runtime mixture production requires native x86_64 and the approved pinned image")
+    bc, bc_sha = _runtime_receipt(request.get("bc_readback_receipt"), kind="bc")
+    rollout, rollout_sha = _runtime_receipt(request.get("rollout_readback_receipt"), kind="rollout")
+    deployment, deployment_sha = _runtime_receipt(request.get("deployment_receipt"), kind="deployment")
+    return {"bc": bc, "bc_receipt_sha256": bc_sha, "rollout": rollout, "rollout_receipt_sha256": rollout_sha, "deployment": deployment, "deployment_receipt_sha256": deployment_sha}
+
+
+def _validated_runtime_pilot(path_value: object) -> dict[str, object]:
+    if type(path_value) is not str:
+        raise ValueError("runtime mixture production requires a pilot receipt")
+    value = dict(_load_regular_json(Path(path_value), "runtime mixture pilot receipt"))
+    if (
+        value.get("schema_version") != 2
+        or value.get("kind") != "runtime_mixture_loader_pilot"
+        or value.get("model_loaded") is not False or value.get("gpu_initialized") is not False
+        or value.get("native_x86_required") is not True
+        or value.get("canonical_worker_counts") != [0, 4, 8, 16, 24]
+        or value.get("canonical_completion") is not True or value.get("throughput_verified") is not True
+    ):
+        raise ValueError("runtime mixture production requires a successful canonical CPU-only pilot receipt")
+    return value
+
+
+def runtime_mixture_pilot_provider_plan() -> dict[str, object]:
+    """Describe, but never place, the separately approved CPU-pilot rental."""
+    return {
+        "paid_action": False, "action": "runtime-pilot-plan", "provider_action": "not_rented",
+        "platform_arch": "x86_64", "purchase_option": "on_demand",
+        "account_hourly_cap_usd": MAX_ACCOUNT_HOURLY_USD, "max_instances": 1,
+    }
+
+
+def runtime_mixture_train(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
+    """Execute only the receipt-bound runtime-mixture trainer, never legacy RFT."""
+    identity = _runtime_identity(instance, request)
+    pilot = _validated_runtime_pilot(request.get("pilot_receipt"))
+    output = request.get("execution_receipt")
+    if type(output) is not str or not Path(output).is_absolute() or Path(output).exists() or Path(output).is_symlink():
+        raise ValueError("runtime mixture execution receipt must be an absent absolute path")
+    command = (
+        "set -eu; env -u HF_TOKEN PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src "
+        "lehome-train runtime-mixture-train --request /prepared/config/runtime-train.json"
+    )
+    runner((*_ssh_prefix(instance), command))
+    receipt = {
+        "schema_version": 1, "kind": "runtime_mixture_execution", "platform_arch": "x86_64",
+        "trainer_image": BOOTSTRAP_TRAINER_IMAGE, "code_revision": request["code_revision"],
+        "instance_id": instance["instance_id"], "bc_revision": identity["bc"]["immutable_revision"],
+        "bc_tree_receipt_sha256": identity["bc_receipt_sha256"],
+        "rollout_revision": identity["rollout"]["immutable_revision"],
+        "rollout_tree_receipt_sha256": identity["rollout_receipt_sha256"],
+        "deployment_revision": identity["deployment"]["immutable_revision"],
+        "deployment_tree_receipt_sha256": identity["deployment_receipt_sha256"],
+        "pilot_receipt_sha256": sha256_file(Path(str(request["pilot_receipt"]))),
+        "runtime_command": "runtime-mixture-train", "throughput_verified": pilot["throughput_verified"],
+    }
+    atomic_write_json(Path(output), receipt)
+    return {"paid_action": True, "action": "runtime-train", "instance_id": instance["instance_id"], "execution_receipt": receipt}
+
+
+def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
+    """Securely stage reviewed runtime-only inputs; legacy generation is absent."""
+    _runtime_identity(instance, request)
+    required = {
+        "code_bundle": "code.bundle", "code_bundle_sha256_file": "code.bundle.sha256",
+        "launch_config": "launch.json", "experiment_config": "experiment.json",
+        "runtime_train_request": "runtime-train.json", "runtime_hydrate_request": "runtime-hydrate.json",
+        "modality_config": "modality.py", "token_file": "runtime.token",
+        "bc_readback_receipt": "bc-readback.json", "rollout_readback_receipt": "rollout-readback.json",
+        "deployment_receipt": "deployment-receipt.json",
+    }
+    if any(type(request.get(field)) is not str or not request[field] for field in required):
+        raise ValueError("runtime mixture stage requires reviewed code, config, token, and authenticated receipts")
+    code = Path(str(request["code_bundle"]))
+    if _verify_code_bundle_receipt(code, Path(str(request["code_bundle_sha256_file"]))) != request.get("code_bundle_sha256"):
+        raise ValueError("runtime mixture stage code bundle receipt differs from the reviewed bundle")
+    _safe_archive(code, "runtime mixture code bundle")
+    _read_private_token(str(request["token_file"]))
+    for field in ("runtime_train_request", "runtime_hydrate_request"):
+        envelope = _load_regular_json(Path(str(request[field])), "runtime mixture reviewed request")
+        if envelope.get("command") not in {"runtime-mixture-train", "hydrate-runtime-mixture"} or "/prepared/generation" in json.dumps(envelope, sort_keys=True) or "continuous-train" in json.dumps(envelope, sort_keys=True):
+            raise ValueError("runtime mixture stage rejects legacy generation request content")
+    remote_dir = "/tmp/lehome-runtime-stage"
+    runner((*_ssh_prefix(instance), "mkdir -p " + remote_dir))
+    transfers: list[dict[str, str]] = []
+    for field, remote_name in required.items():
+        source = Path(str(request[field]))
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("runtime mixture stage input must be a regular file")
+        digest = sha256_file(source)
+        runner(("scp", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(source), "root@" + str(instance["host"]) + ":" + remote_dir + "/" + remote_name))
+        observed = runner((*_ssh_prefix(instance), "sha256sum " + remote_dir + "/" + remote_name)).strip().split()
+        if not observed or observed[0] != digest:
+            raise ValueError("runtime mixture staged hash readback failed")
+        transfers.append({"name": remote_name, "sha256": digest})
+    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/code /prepared/config /prepared/runtime /output; mv " + remote_dir + "/launch.json /prepared/config/launch.json; mv " + remote_dir + "/experiment.json /prepared/config/experiment.json; mv " + remote_dir + "/runtime-train.json /prepared/config/runtime-train.json; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/code.bundle -C /prepared/code; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code"))
+    return {"paid_action": True, "action": "runtime-stage", "instance_id": instance["instance_id"], "code_bundle_sha256": request["code_bundle_sha256"], "transfers": transfers}
+
+
+def runtime_mixture_hydrate(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
+    identity = _runtime_identity(instance, request)
+    output = runner((*_ssh_prefix(instance), "set -eu; HF_TOKEN=\"$(cat /prepared/config/runtime.token)\" PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src lehome-train hydrate-runtime-mixture --request /prepared/config/runtime-hydrate.json"))
+    try:
+        receipt = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise ValueError("runtime mixture hydration did not return an authenticated receipt") from error
+    deployment = identity["deployment"]
+    if not isinstance(receipt, Mapping) or receipt.get("kind") != "runtime_mixture_hydration" or receipt.get("immutable_revision") != deployment["immutable_revision"] or receipt.get("remote_prefix") != deployment["remote_prefix"] or receipt.get("fresh_readback_verified") is not True:
+        raise ValueError("runtime mixture hydration receipt is not bound to the approved deployment")
+    return {"paid_action": True, "action": "runtime-hydrate", "instance_id": instance["instance_id"], "hydration_receipt": dict(receipt)}
+
+
 def promote_canary(*, capability_receipt: Mapping[str, object], runner: Runner) -> dict[str, object]:
     """Fresh-read the exact canary before allowing an operational promotion."""
     instance = capability_receipt.get("instance")
@@ -1288,6 +1433,12 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
     if type(instance_id) is not int: raise ValueError("instance receipt is invalid")
     if action == "stage":
         return stage(instance=instance, request=request, runner=runner)
+    if action == "runtime-stage":
+        return runtime_mixture_stage(instance=instance, request=request, runner=runner)
+    if action == "runtime-hydrate":
+        return runtime_mixture_hydrate(instance=instance, request=request, runner=runner)
+    if action == "runtime-train":
+        return runtime_mixture_train(instance=instance, request=request, runner=runner)
     elif action in {"tune", "train", "status", "resume"}:
         if action in {"tune", "train"}:
             _require_instance_capability(instance, request)
@@ -1532,7 +1683,7 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
 
 
 def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object]:
-    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "bootstrap-canary", "promote", "replacement-resume", "rent", "stage", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "bootstrap-canary", "promote", "replacement-resume", "rent", "stage", "runtime-pilot-plan", "runtime-stage", "runtime-hydrate", "runtime-train", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "materialize":
         return _materialize(request)
@@ -1549,6 +1700,8 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
                 output=Path(str(request["output"])),
             ),
         }
+    if args.action == "runtime-pilot-plan":
+        return runtime_mixture_pilot_provider_plan()
     if args.action == "prepare":
         generation = request.get("generation_root")
         if not isinstance(generation, str): raise ValueError("prepare requires generation_root")
