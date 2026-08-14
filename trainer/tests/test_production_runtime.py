@@ -10,8 +10,10 @@ import lehome_train.groot.production_runtime as runtime_module
 from lehome_train.commands.sync import generate_sync_manifest
 from lehome_train.constants import MODEL_REVISION
 from lehome_train.data.normalization import normalization_identity
+from lehome_train.checkpoints import CheckpointDescriptor, write_checkpoint_descriptor
+from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.io import canonical_json_sha256, sha256_file
-from lehome_train.models import ExperimentConfig, SmokeResult
+from lehome_train.models import ArtifactIdentity, CheckpointRecord, ExperimentConfig, SmokeResult
 
 
 COMMIT = "a" * 40
@@ -336,6 +338,114 @@ def test_tune_uses_only_loader_4_8_12_and_batch_64_96_128(
     assert result["production_physical_batch"] == 64
     assert [workers for workers, batch in calls if batch == 64][:3] == [4, 8, 12]
     assert [batch for workers, batch in calls if workers == result["selected_loader_workers"]][-3:] == [64, 96, 128]
+
+
+def test_resume_downloads_and_consumes_the_immutable_authenticated_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_bytes = b"authenticated checkpoint archive"
+    archive_sha = __import__("hashlib").sha256(archive_bytes).hexdigest()
+    descriptor = CheckpointDescriptor(
+        record=CheckpointRecord(
+            experiment_id="corrective-rft-70-30-20260813",
+            optimizer_step=1000,
+            sample_presentations=64_000,
+            experiment_config_sha256="a" * 64,
+            dataset_manifest_sha256="b" * 64,
+            schedule_sha256="c" * 64,
+            artifact=ArtifactIdentity("checkpoints/step-1000.tar", archive_sha, len(archive_bytes)),
+            resumable=True,
+            remotely_verified=True,
+        ),
+        normalization_sha256="d" * 64,
+        schedule_sha256="c" * 64,
+        locally_verified=True,
+    )
+    staged = tmp_path / "prepared" / "resume-checkpoint.json"
+    staged.parent.mkdir()
+    write_checkpoint_descriptor(staged, descriptor)
+    descriptor_sha = sha256_file(staged)
+    downloaded: list[tuple[str, ...]] = []
+
+    class FakeTransport:
+        def list_tree(self, **_kwargs: object) -> tuple[object, ...]:
+            return (
+                SimpleNamespace(relative_path="prefix/checkpoints/step-1000.tar", entry_type="file"),
+                SimpleNamespace(relative_path="prefix/checkpoints/step-1000.json", entry_type="file"),
+            )
+
+        def download_files(self, **kwargs: object) -> None:
+            destination = kwargs["destination"]
+            assert isinstance(destination, Path)
+            paths = kwargs["relative_paths"]
+            assert isinstance(paths, tuple)
+            downloaded.append(paths)
+            for relative in paths:
+                target = destination / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(
+                    archive_bytes if relative.endswith(".tar") else staged.read_bytes()
+                )
+
+    monkeypatch.setattr(runtime_module, "HuggingFaceHubTransport", lambda **_kwargs: FakeTransport())
+    publication = {
+        "repository": runtime_module.DEFAULT_MODEL_REPO,
+        "immutable_revision": "e" * 40,
+        "remote_prefix": "prefix",
+        "relative_path": "checkpoints/step-1000.tar",
+        "artifact_sha256": archive_sha,
+        "artifact_byte_size": len(archive_bytes),
+        "descriptor_relative_path": "checkpoints/step-1000.json",
+        "descriptor_sha256": descriptor_sha,
+        "descriptor_byte_size": staged.stat().st_size,
+    }
+
+    observed = runtime_module._resume_publication(
+        value=publication,
+        descriptor=str(staged),
+        output_root=tmp_path / "output",
+        token="publisher-token",
+    )
+
+    assert observed == descriptor
+    assert downloaded == [("checkpoints/step-1000.tar", "checkpoints/step-1000.json")]
+
+
+def test_continuous_campaign_binds_local_dataset_revision_to_the_sealed_manifest(
+    tmp_path: Path,
+) -> None:
+    manifest_sha = "f" * 64
+    launch = _launch_payload(tmp_path, batch=64, max_steps=2_000) | {
+        "base_model_path": "/cache/parent",
+        "dataset_path": "/prepared/generation",
+        "dataset_revision": manifest_sha[:40],
+        "output_dir": "/output",
+        "modality_config_path": "/prepared/config/modality.py",
+        "experiment_name": "corrective-rft-70-30-20260813",
+        "augmentation_profile": "none",
+        "parent_checkpoint_repository": "ryanjin333/lehome-groot-n17-models",
+        "parent_checkpoint_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
+        "parent_checkpoint_subpath": "policies/step-12000",
+        "parent_checkpoint_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
+    }
+    config = FineTuneLaunchConfig(**launch)
+    experiment = ExperimentConfig(**(_experiment_payload(batch=64) | {
+        "container_digest": "sha256:b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746",
+        "dataset_repository": "local/sealed-mixed-generation",
+        "dataset_revision": manifest_sha[:40],
+        "dataset_manifest_sha256": manifest_sha,
+        "sample_presentations": 128_000,
+    }))
+
+    identity = runtime_module._continuous_campaign_identity(
+        config, experiment, {"sealed": True, "mix_plan_sha256": "a" * 64, "dataset_manifest_sha256": manifest_sha},
+    )
+
+    assert identity == {"mix_plan_sha256": "a" * 64, "dataset_manifest_sha256": manifest_sha}
+    with pytest.raises(ValueError, match="local dataset revision"):
+        runtime_module._continuous_campaign_identity(
+            config, experiment, {"sealed": True, "mix_plan_sha256": "a" * 64, "dataset_manifest_sha256": "e" * 64},
+        )
 
 def test_train_delegates_all_budget_resume_storage_and_upload_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

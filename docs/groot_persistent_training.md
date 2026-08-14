@@ -110,8 +110,12 @@ publisher packages those independent copies and performs immutable Hub
 readbacks; caller-supplied checkpoint step lists are not trusted. On
 provider interruption, resume only with the same generation/config/image
 identities and the last authenticated resumable checkpoint after an immutable
-Hub download/readback. A code, data, or configuration failure is terminal but
-not resumable.
+Hub download/readback. Each immutable checkpoint publication includes the
+archive and descriptor path, SHA-256, and byte size in one immutable commit.
+Replacement discovery authenticates and stages the descriptor at
+`/prepared/config/resume-checkpoint.json`; the runtime downloads it again with
+the archive and consumes only the byte-identical authenticated descriptor. A
+code, data, or configuration failure is terminal but not resumable.
 
 Stage transfers require the exact clean code bundle hash, sealed generation and
 receipt, parent artifact digest, config/modality, and token-file path; the

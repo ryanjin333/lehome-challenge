@@ -16,6 +16,7 @@ from typing import Callable, Mapping
 
 from lehome_train.checkpoints import (
     CheckpointDescriptor,
+    load_checkpoint_descriptor,
     require_compatible_checkpoint,
     write_checkpoint_descriptor,
 )
@@ -1024,6 +1025,20 @@ class HubCheckpointUploader:
             or sha256_file(artifact) != checkpoint.record.artifact.sha256
         ):
             raise ValueError("checkpoint upload artifact failed local verification")
+        descriptor_relative_path = (
+            f"checkpoints/step-{checkpoint.record.optimizer_step}.json"
+        )
+        descriptor_path = self.artifact_root / descriptor_relative_path
+        if descriptor_path.is_symlink() or not descriptor_path.is_file():
+            raise ValueError("checkpoint upload descriptor is unavailable")
+        if load_checkpoint_descriptor(descriptor_path) != checkpoint:
+            raise ValueError("checkpoint upload descriptor differs from checkpoint")
+        descriptor_entry = SyncEntry(
+            relative_path=descriptor_relative_path,
+            sha256=sha256_file(descriptor_path),
+            byte_size=descriptor_path.stat().st_size,
+            remotely_verified=False,
+        )
         transport = HuggingFaceHubTransport(timeout_seconds=timeout_seconds)
         require_access(
             transport=transport,
@@ -1046,7 +1061,7 @@ class HubCheckpointUploader:
             repository=self.repository,
             revision=self.revision,
             source=self.artifact_root,
-            entries=(entry,),
+            entries=(entry, descriptor_entry),
             remote_prefix=remote_prefix,
             environ=self._hub_environ,
             max_attempts=1,
@@ -1060,16 +1075,21 @@ class HubCheckpointUploader:
                 repository=self.repository,
                 revision=immutable_revision,
                 destination=readback,
-                relative_paths=(entry.relative_path,),
+                relative_paths=(entry.relative_path, descriptor_entry.relative_path),
                 remote_prefix=remote_prefix,
                 environ=self._hub_environ,
                 max_attempts=1,
             )
             observed = readback / entry.relative_path
+            observed_descriptor = readback / descriptor_entry.relative_path
             verified = (
                 observed.is_file()
                 and observed.stat().st_size == entry.byte_size
                 and sha256_file(observed) == entry.sha256
+                and observed_descriptor.is_file()
+                and observed_descriptor.stat().st_size == descriptor_entry.byte_size
+                and sha256_file(observed_descriptor) == descriptor_entry.sha256
+                and load_checkpoint_descriptor(observed_descriptor) == checkpoint
             )
             return {
                 "optimizer_step": checkpoint.record.optimizer_step,
@@ -1079,6 +1099,9 @@ class HubCheckpointUploader:
                 "relative_path": entry.relative_path,
                 "artifact_sha256": entry.sha256,
                 "artifact_byte_size": entry.byte_size,
+                "descriptor_relative_path": descriptor_entry.relative_path,
+                "descriptor_sha256": descriptor_entry.sha256,
+                "descriptor_byte_size": descriptor_entry.byte_size,
                 "readback_verified": verified,
             }
         finally:

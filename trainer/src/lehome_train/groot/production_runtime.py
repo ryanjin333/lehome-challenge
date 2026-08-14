@@ -16,7 +16,7 @@ from lehome_train.commands.prepare import prepare_training_environment
 from lehome_train.commands.smoke import SmokeAttemptReceipt, run_smoke_tests
 from lehome_train.commands.train import run_continuous_training, run_fixed_exposure_training
 from lehome_train.constants import ISAAC_GROOT_REVISION
-from lehome_train.constants import DEFAULT_MODEL_REPO
+from lehome_train.constants import DEFAULT_MODEL_REPO, MODEL_REVISION
 from lehome_train.data.normalization import normalization_identity
 from lehome_train.flywheel.mix import verify_generation
 from lehome_train.groot.config import FineTuneLaunchConfig
@@ -55,6 +55,15 @@ from lehome_train.io import sha256_file
 
 
 _ALLOWED_ROOTS = (Path("/prepared"), Path("/output"), Path("/cache"))
+_CONTINUOUS_EXPERIMENT = "corrective-rft-70-30-20260813"
+_CONTINUOUS_IMAGE = "sha256:b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746"
+_PARENT_CHECKPOINT = {
+    "repository": "ryanjin333/lehome-groot-n17-models",
+    "revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
+    "subpath": "policies/step-12000",
+    "artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
+}
+_LOCAL_SEALED_DATASET_REPOSITORY = "local/sealed-mixed-generation"
 
 
 def _exact(arguments: object, fields: set[str], command: str) -> Mapping[str, object]:
@@ -167,6 +176,60 @@ def _sha256(value: object, label: str) -> str:
     return value
 
 
+def _continuous_campaign_identity(
+    config: FineTuneLaunchConfig,
+    experiment: ExperimentConfig,
+    generation: Mapping[str, object],
+) -> dict[str, str]:
+    """Validate the one approved 2K campaign and receipt-derived local data ID."""
+    mix_plan = _sha256(generation.get("mix_plan_sha256"), "mix_plan_sha256")
+    manifest = _sha256(
+        generation.get("dataset_manifest_sha256"), "dataset_manifest_sha256"
+    )
+    if generation.get("sealed") is not True:
+        raise ValueError("continuous generation receipt is not sealed")
+    if (
+        config.base_model_revision != MODEL_REVISION
+        or config.base_model_path != "/cache/parent"
+        or config.dataset_path != "/prepared/generation"
+        or config.output_dir != "/output"
+        or config.modality_config_path != "/prepared/config/modality.py"
+        or config.experiment_name != _CONTINUOUS_EXPERIMENT
+        or config.physical_batch_size != 64
+        or config.global_batch_size != 64
+        or config.gradient_accumulation_steps != 1
+        or config.num_gpus != 1
+        or config.max_steps != 2000
+        or config.save_steps != 1000
+        or config.training_action_horizon != 16
+        or config.model_action_chunk_capacity != 40
+        or config.augmentation_profile != "none"
+        or config.dataloader_num_workers != 4
+        or config.parent_checkpoint_repository != _PARENT_CHECKPOINT["repository"]
+        or config.parent_checkpoint_revision != _PARENT_CHECKPOINT["revision"]
+        or config.parent_checkpoint_subpath != _PARENT_CHECKPOINT["subpath"]
+        or config.parent_checkpoint_artifact_sha256 != _PARENT_CHECKPOINT["artifact_sha256"]
+    ):
+        raise ValueError("continuous launch does not match the approved corrective campaign")
+    if config.dataset_revision != manifest[:40]:
+        raise ValueError("continuous local dataset revision is not derived from the sealed manifest")
+    if (
+        experiment.container_digest != _CONTINUOUS_IMAGE
+        or experiment.model_revision != MODEL_REVISION
+        or experiment.dataset_repository != _LOCAL_SEALED_DATASET_REPOSITORY
+        or experiment.dataset_revision != manifest[:40]
+        or experiment.dataset_manifest_sha256 != manifest
+        or experiment.physical_batch_size != 64
+        or experiment.gradient_accumulation_steps != 1
+        or experiment.sample_presentations != 128_000
+        or experiment.action_horizon != 16
+        or experiment.tune_language_backbone
+        or experiment.tune_visual_backbone
+    ):
+        raise ValueError("continuous experiment does not match the approved corrective campaign")
+    return {"mix_plan_sha256": mix_plan, "dataset_manifest_sha256": manifest}
+
+
 def _positive_integer(value: object, label: str) -> int:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{label} must be a positive integer")
@@ -198,32 +261,73 @@ def _resume_publication(
         return None
     if not isinstance(value, Mapping) or descriptor is None:
         raise ValueError("resume requires both descriptor and immutable publication")
-    resume = load_checkpoint_descriptor(_mounted_path(descriptor, "resume_checkpoint", must_exist=True, regular_file=True))
-    required = {"repository", "immutable_revision", "remote_prefix", "relative_path", "artifact_sha256", "artifact_byte_size"}
+    staged_descriptor = _mounted_path(
+        descriptor, "resume_checkpoint", must_exist=True, regular_file=True
+    )
+    required = {
+        "repository", "immutable_revision", "remote_prefix", "relative_path",
+        "artifact_sha256", "artifact_byte_size", "descriptor_relative_path",
+        "descriptor_sha256", "descriptor_byte_size",
+    }
     if set(value) != required or value.get("repository") != DEFAULT_MODEL_REPO:
         raise ValueError("resume immutable publication is incompatible")
     revision, prefix, relative = value["immutable_revision"], value["remote_prefix"], value["relative_path"]
     artifact, size = value["artifact_sha256"], value["artifact_byte_size"]
-    if not all(isinstance(item, str) and item for item in (revision, prefix, relative, artifact)) or type(size) is not int or size <= 0:
+    descriptor_relative = value["descriptor_relative_path"]
+    descriptor_sha, descriptor_size = value["descriptor_sha256"], value["descriptor_byte_size"]
+    if (
+        not all(
+            isinstance(item, str) and item
+            for item in (revision, prefix, relative, artifact, descriptor_relative, descriptor_sha)
+        )
+        or type(size) is not int
+        or size <= 0
+        or type(descriptor_size) is not int
+        or descriptor_size <= 0
+        or len(revision) != 40
+        or any(character not in "0123456789abcdef" for character in revision)
+    ):
         raise ValueError("resume immutable publication is malformed")
-    if resume.record.artifact.relative_path != relative or resume.record.artifact.sha256 != artifact or resume.record.artifact.byte_size != size:
-        raise ValueError("resume descriptor does not bind immutable publication")
+    if (
+        sha256_file(staged_descriptor) != descriptor_sha
+        or staged_descriptor.stat().st_size != descriptor_size
+    ):
+        raise ValueError("staged resume descriptor does not match immutable publication")
     transport = HuggingFaceHubTransport(timeout_seconds=30.0)
     tree = transport.list_tree(repository=DEFAULT_MODEL_REPO, revision=revision, token=token)
     remote_path = prefix.rstrip("/") + "/" + relative
-    if not any(entry.relative_path == remote_path and entry.entry_type == "file" for entry in tree):
-        raise ValueError("resume immutable tree lacks checkpoint archive")
+    remote_descriptor = prefix.rstrip("/") + "/" + descriptor_relative
+    remote_files = {
+        entry.relative_path for entry in tree if entry.entry_type == "file"
+    }
+    if remote_path not in remote_files or remote_descriptor not in remote_files:
+        raise ValueError("resume immutable tree lacks checkpoint archive or descriptor")
     transport.download_files(
         repository=DEFAULT_MODEL_REPO,
         revision=revision,
         destination=output_root,
-        relative_paths=(relative,),
+        relative_paths=(relative, descriptor_relative),
         remote_prefix=prefix,
         token=token,
     )
     local = output_root / relative
+    authenticated_descriptor = output_root / descriptor_relative
     if not local.is_file() or local.stat().st_size != size or sha256_file(local) != artifact:
         raise ValueError("resume immutable checkpoint readback mismatch")
+    if (
+        not authenticated_descriptor.is_file()
+        or authenticated_descriptor.stat().st_size != descriptor_size
+        or sha256_file(authenticated_descriptor) != descriptor_sha
+        or authenticated_descriptor.read_bytes() != staged_descriptor.read_bytes()
+    ):
+        raise ValueError("resume immutable descriptor readback mismatch")
+    resume = load_checkpoint_descriptor(authenticated_descriptor)
+    if (
+        resume.record.artifact.relative_path != relative
+        or resume.record.artifact.sha256 != artifact
+        or resume.record.artifact.byte_size != size
+    ):
+        raise ValueError("resume descriptor does not bind immutable publication")
     return resume
 
 
@@ -892,6 +996,10 @@ class ProductionRuntime:
         config = _load_config(request["launch_config"])
         experiment = _load_experiment(request["experiment_config"])
         generation = _mounted_path(request["generation_root"], "generation_root", must_exist=True)
+        generation_receipt = verify_generation(generation)
+        generation_identity = _continuous_campaign_identity(
+            config, experiment, generation_receipt
+        )
         parent = _sha256(request["parent_checkpoint_sha256"], "parent_checkpoint_sha256")
         normalization = _sha256(request["normalization_sha256"], "normalization_sha256")
         if normalization_identity(generation) != normalization or config.dataset_path != str(generation):
@@ -901,8 +1009,6 @@ class ProductionRuntime:
         repository, revision = request["checkpoint_repository"], request["checkpoint_revision"]
         if repository != DEFAULT_MODEL_REPO or type(revision) is not str or not revision:
             raise ValueError("continuous checkpoint destination is incompatible")
-        if config.max_steps != 2000 or config.save_steps != 1000 or config.global_batch_size != 64:
-            raise ValueError("continuous-train requires the 2K batch-64 corrective launch")
         token = _publisher_token(request["publisher_token_file"])
         resume = _resume_publication(
             value=request["resume_publication"],
@@ -936,7 +1042,7 @@ class ProductionRuntime:
             immutable_checkpoint_steps=lambda: verified,
         )
         identity = {
-            "generation_sha256": _sha256(verify_generation(generation)["mix_plan_sha256"], "generation_sha256"),
+            "generation_sha256": generation_identity["mix_plan_sha256"],
             "config_sha256": config_sha256,
             "experiment_id": config.experiment_name,
         }

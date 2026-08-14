@@ -24,7 +24,12 @@ class FailRunner:
 class FakeHub:
     def list_tree(self, *, repository, revision, token):
         from lehome_train.hub import HubTreeEntry
-        return (HubTreeEntry("prefix/checkpoints/step-1000.tar", "file"), HubTreeEntry("prefix/checkpoints/step-2000.tar", "file"))
+        return (
+            HubTreeEntry("prefix/checkpoints/step-1000.tar", "file"),
+            HubTreeEntry("prefix/checkpoints/step-1000.json", "file"),
+            HubTreeEntry("prefix/checkpoints/step-2000.tar", "file"),
+            HubTreeEntry("prefix/checkpoints/step-2000.json", "file"),
+        )
     def download_files(self, *, repository, revision, destination, relative_paths, token, remote_prefix=None):
         for relative in relative_paths:
             target = destination / relative; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(b"artifact")
@@ -74,7 +79,7 @@ def test_destroy_requires_publications_bound_to_terminal_identity() -> None:
         "generation_sha256": "a" * 64, "config_sha256": "b" * 64,
         "experiment_id": "persistent-001", "immutable_checkpoint_steps": [1000, 2000],
         "immutable_checkpoint_publications": [
-            {"optimizer_step": step, "repository": "wrong/repo", "immutable_revision": "c" * 40, "remote_prefix": "prefix", "relative_path": f"step-{step}.tar", "artifact_sha256": "d" * 64, "artifact_byte_size": 1, "readback_verified": True, "generation_sha256": "a" * 64, "config_sha256": "b" * 64, "experiment_id": "persistent-001"}
+            {"optimizer_step": step, "repository": "wrong/repo", "immutable_revision": "c" * 40, "remote_prefix": "prefix", "relative_path": f"step-{step}.tar", "artifact_sha256": "d" * 64, "artifact_byte_size": 1, "descriptor_relative_path": f"step-{step}.json", "descriptor_sha256": "d" * 64, "descriptor_byte_size": 1, "readback_verified": True, "generation_sha256": "a" * 64, "config_sha256": "b" * 64, "experiment_id": "persistent-001"}
             for step in (1000, 2000)
         ],
     }
@@ -120,7 +125,7 @@ def test_capture_rent_and_destroy_use_injected_cli_and_fresh_readback(tmp_path: 
     instance = LIFECYCLE.rent(evidence=evidence, runner=runner)
     assert instance["instance_id"] == 9
     with pytest.raises(ValueError, match="disposal terminal"):
-        LIFECYCLE.destroy(instance_id=9, training_receipt={"kind": "continuous_corrective_training_terminal", "instance_id": 9, "immutable_checkpoint_steps": [1000, 2000], "immutable_checkpoint_publications": [{"optimizer_step": 1000, "repository": "ryanjin333/lehome-groot-n17-models", "immutable_revision": "a" * 40, "remote_prefix": "prefix", "relative_path": "checkpoints/step-1000.tar", "artifact_sha256": hashlib.sha256(b"artifact").hexdigest(), "artifact_byte_size": 8, "readback_verified": True}, {"optimizer_step": 2000, "repository": "ryanjin333/lehome-groot-n17-models", "immutable_revision": "b" * 40, "remote_prefix": "prefix", "relative_path": "checkpoints/step-2000.tar", "artifact_sha256": hashlib.sha256(b"artifact").hexdigest(), "artifact_byte_size": 8, "readback_verified": True}]}, runner=runner, transport=FakeHub(), token="test-token")
+        LIFECYCLE.destroy(instance_id=9, training_receipt={"kind": "continuous_corrective_training_terminal", "instance_id": 9, "immutable_checkpoint_steps": [1000, 2000], "immutable_checkpoint_publications": [{"optimizer_step": 1000, "repository": "ryanjin333/lehome-groot-n17-models", "immutable_revision": "a" * 40, "remote_prefix": "prefix", "relative_path": "checkpoints/step-1000.tar", "artifact_sha256": hashlib.sha256(b"artifact").hexdigest(), "artifact_byte_size": 8, "descriptor_relative_path": "checkpoints/step-1000.json", "descriptor_sha256": hashlib.sha256(b"artifact").hexdigest(), "descriptor_byte_size": 8, "readback_verified": True}, {"optimizer_step": 2000, "repository": "ryanjin333/lehome-groot-n17-models", "immutable_revision": "b" * 40, "remote_prefix": "prefix", "relative_path": "checkpoints/step-2000.tar", "artifact_sha256": hashlib.sha256(b"artifact").hexdigest(), "artifact_byte_size": 8, "descriptor_relative_path": "checkpoints/step-2000.json", "descriptor_sha256": hashlib.sha256(b"artifact").hexdigest(), "descriptor_byte_size": 8, "readback_verified": True}]}, runner=runner, transport=FakeHub(), token="test-token")
 
 
 def test_offer_total_uses_the_300gb_vast_quote_once() -> None:
@@ -194,7 +199,9 @@ def test_provider_interruption_terminal_is_resumable_only_with_last_immutable_ch
         LIFECYCLE.resume_identity(terminal, generation_sha256="a" * 64, config_sha256="c" * 64)
 
 
-def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_identities() -> None:
+def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_identities(
+    tmp_path: Path,
+) -> None:
     terminal = LIFECYCLE.provider_interruption_terminal(
         instance_id=9,
         generation_sha256="a" * 64,
@@ -212,6 +219,9 @@ def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_ident
             "relative_path": "checkpoints/step-1000.tar",
             "artifact_sha256": hashlib.sha256(b"artifact").hexdigest(),
             "artifact_byte_size": 8,
+            "descriptor_relative_path": "checkpoints/step-1000.json",
+            "descriptor_sha256": hashlib.sha256(b"artifact").hexdigest(),
+            "descriptor_byte_size": 8,
         }],
         provider_reason="instance absent",
     )
@@ -254,10 +264,11 @@ def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_ident
     assert LIFECYCLE.classify_provider_interruption(instance={"instance_id": 9}, runner=runner) == "instance_absent"
     descriptor = LIFECYCLE.replacement_resume_descriptor(
         terminal=terminal, capability_receipt=capability, runner=runner,
-        transport=FakeHub(), token="test-token",
+        transport=FakeHub(), token="test-token", descriptor_output=tmp_path / "resume.json",
     )
     assert descriptor["instance"]["instance_id"] == 10
     assert descriptor["resume_checkpoint_publication"]["optimizer_step"] == 1000
+    assert descriptor["resume_checkpoint_descriptor"]["path"].endswith("resume.json")
     assert descriptor["generation_sha256"] == "a" * 64
     assert descriptor["resume_generation_sha256"] == "a" * 64
 
@@ -331,13 +342,16 @@ def test_stage_setup_hydrates_only_operational_roots() -> None:
     assert "mv /tmp/lehome-stage/generation /prepared/generation" in command
     assert "chmod 600 /prepared/config/publisher.token" in command
     assert "mv /tmp/lehome-stage/continuous.json /prepared/config/continuous.json" in command
+    assert "resume-checkpoint.json /prepared/config/resume-checkpoint.json" in command
     assert "policy_artifact_sha256('/cache/parent')" in command
 
 
 def test_stage_requires_distinct_parent_archive_and_policy_artifact_hashes() -> None:
-    request = {"parent_checkpoint_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"], "parent_archive_sha256": "a" * 64,
+    request = {"parent_checkpoint_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"], "parent_archive_sha256": "0ddd4e7ce351dd2172cd1edd967293a50d02c15c0f2c21ca39db94692a57e0b5",
                "parent_checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "parent_checkpoint_revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "parent_checkpoint_subpath": LIFECYCLE.PARENT_CHECKPOINT["subpath"]}
-    assert LIFECYCLE._parent_identities(request) == ("a" * 64, LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"])
+    assert LIFECYCLE._parent_identities(request) == ("0ddd4e7ce351dd2172cd1edd967293a50d02c15c0f2c21ca39db94692a57e0b5", LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"])
+    with pytest.raises(ValueError, match="parent archive"):
+        LIFECYCLE._parent_identities(request | {"parent_archive_sha256": "a" * 64})
 
 
 def test_stage_rejects_runtime_request_that_points_at_unstaged_paths(tmp_path: Path) -> None:
@@ -347,6 +361,89 @@ def test_stage_rejects_runtime_request_that_points_at_unstaged_paths(tmp_path: P
     continuous.write_text(json.dumps({"launch_config": "/prepared/config/launch.json", "experiment_config": "/prepared/config/experiment.json", "generation_root": "/prepared/generation", "publisher_token_file": "/prepared/config/publisher.token"}))
     with pytest.raises(ValueError, match="base model path"):
         LIFECYCLE._validate_staged_operational_requests(launch, continuous)
+
+
+def test_stage_validates_the_executable_nested_continuous_envelope(
+    tmp_path: Path,
+) -> None:
+    launch = tmp_path / "launch.json"
+    launch.write_text(json.dumps({
+        "base_model_path": "/cache/parent",
+        "dataset_path": "/prepared/generation",
+        "output_dir": "/output",
+        "modality_config_path": "/prepared/config/modality.py",
+        "dataset_revision": "b" * 40,
+    }))
+    continuous = tmp_path / "continuous.json"
+    continuous.write_text(json.dumps({
+        "schema_version": 1,
+        "command": "continuous-train",
+        "arguments": {
+            "launch_config": "/prepared/config/launch.json",
+            "experiment_config": "/prepared/config/experiment.json",
+            "generation_root": "/prepared/generation",
+            "publisher_token_file": "/prepared/config/publisher.token",
+        },
+    }))
+
+    LIFECYCLE._validate_staged_operational_requests(launch, continuous)
+
+
+def test_stage_generation_identity_comes_from_the_sibling_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    receipt = {
+        "schema_version": 1,
+        "sealed": True,
+        "mix_plan_sha256": "a" * 64,
+        "dataset_manifest_sha256": "b" * 64,
+    }
+    import lehome_train.flywheel.mix as mix
+    monkeypatch.setattr(mix, "load_generation_receipt", lambda _root: receipt)
+
+    identity = LIFECYCLE._sealed_generation_identity(generation)
+
+    assert identity == {
+        "mix_plan_sha256": "a" * 64,
+        "dataset_manifest_sha256": "b" * 64,
+        "dataset_revision": "b" * 40,
+    }
+    with pytest.raises(ValueError, match="caller generation identity"):
+        LIFECYCLE._sealed_generation_identity(
+            generation, claimed_mix_plan_sha256="c" * 64,
+        )
+
+
+def test_stage_rejects_a_resume_descriptor_that_does_not_match_its_publication(
+    tmp_path: Path,
+) -> None:
+    descriptor = tmp_path / "resume-checkpoint.json"
+    descriptor.write_bytes(b"authenticated descriptor")
+    descriptor_sha = hashlib.sha256(descriptor.read_bytes()).hexdigest()
+    arguments = {
+        "resume_checkpoint": "/prepared/config/resume-checkpoint.json",
+        "resume_publication": {
+            "repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
+            "immutable_revision": "a" * 40,
+            "remote_prefix": "checkpoint-staging/run/archive",
+            "relative_path": "checkpoints/step-1000.tar",
+            "artifact_sha256": "b" * 64,
+            "artifact_byte_size": 1,
+            "descriptor_relative_path": "checkpoints/step-1000.json",
+            "descriptor_sha256": descriptor_sha,
+            "descriptor_byte_size": descriptor.stat().st_size,
+        },
+    }
+    request = {"resume_checkpoint_descriptor": str(descriptor)}
+
+    assert LIFECYCLE._validate_resume_descriptor_for_stage(arguments, request) == (
+        str(descriptor), descriptor_sha, descriptor.stat().st_size,
+    )
+    descriptor.write_bytes(b"caller fabricated descriptor")
+    with pytest.raises(ValueError, match="source is unavailable|differs from immutable publication"):
+        LIFECYCLE._validate_resume_descriptor_for_stage(arguments, request)
 
 
 def test_stage_requires_code_bundle_receipt_to_match_bundle(tmp_path: Path) -> None:

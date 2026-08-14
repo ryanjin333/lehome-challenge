@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -23,7 +24,7 @@ from lehome_train.release_manifest import validate_training_capability
 
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
 CORRECTIVE_SOURCE = {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c", "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35"}
-PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3", "subpath": "policies/step-12000", "artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"}
+PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3", "subpath": "policies/step-12000", "archive_sha256": "0ddd4e7ce351dd2172cd1edd967293a50d02c15c0f2c21ca39db94692a57e0b5", "artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"}
 # Vast's raw expression grammar does not support a portable OR form for two
 # exact SKU strings.  Query only stable numeric facts, then enforce the narrow
 # WS/S allowlist on raw rows in ``_offer_gpu``.
@@ -444,6 +445,7 @@ def _stage_setup_command(parent_archive_sha256: str) -> str:
         "mv /tmp/lehome-stage/experiment.json /prepared/config/experiment.json; "
         "mv /tmp/lehome-stage/continuous.json /prepared/config/continuous.json; "
         "mv /tmp/lehome-stage/resume.json /prepared/config/resume.json; "
+        "if test -f /tmp/lehome-stage/resume-checkpoint.json; then mv /tmp/lehome-stage/resume-checkpoint.json /prepared/config/resume-checkpoint.json; fi; "
         "mv /tmp/lehome-stage/tune.json /prepared/config/tune.json; "
         "mv /tmp/lehome-stage/modality.py /prepared/config/modality.py; "
         "mv /tmp/lehome-stage/token /prepared/config/publisher.token; "
@@ -470,7 +472,51 @@ def _load_regular_json(path: Path, label: str) -> Mapping[str, object]:
     return value
 
 
-def _validate_staged_operational_requests(launch_path: Path, continuous_path: Path) -> None:
+def _sealed_generation_identity(
+    generation_root: Path,
+    *,
+    claimed_mix_plan_sha256: object | None = None,
+    claimed_dataset_manifest_sha256: object | None = None,
+) -> dict[str, str]:
+    """Derive lifecycle data identity from the verified sibling receipt only."""
+    from lehome_train.flywheel.mix import load_generation_receipt
+
+    if generation_root.is_symlink() or not generation_root.is_dir():
+        raise ValueError("stage generation root is unsafe")
+    receipt = load_generation_receipt(generation_root)
+    mix_plan = receipt.get("mix_plan_sha256")
+    manifest = receipt.get("dataset_manifest_sha256")
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("sealed") is not True
+        or not isinstance(mix_plan, str)
+        or re.fullmatch(r"[0-9a-f]{64}", mix_plan) is None
+        or not isinstance(manifest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest) is None
+    ):
+        raise ValueError("stage generation receipt identity is invalid")
+    if (
+        claimed_mix_plan_sha256 is not None
+        and claimed_mix_plan_sha256 != mix_plan
+    ) or (
+        claimed_dataset_manifest_sha256 is not None
+        and claimed_dataset_manifest_sha256 != manifest
+    ):
+        raise ValueError("stage caller generation identity differs from sealed receipt")
+    return {
+        "mix_plan_sha256": mix_plan,
+        "dataset_manifest_sha256": manifest,
+        # This is deliberately a local dataset convention, not a Hub revision.
+        "dataset_revision": manifest[:40],
+    }
+
+
+def _validate_staged_operational_requests(
+    launch_path: Path,
+    continuous_path: Path,
+    *,
+    generation_identity: Mapping[str, str] | None = None,
+) -> Mapping[str, object]:
     """Ensure the request already names the fixed paths created by staging."""
     launch = _load_regular_json(launch_path, "launch config")
     expected_launch = {
@@ -488,7 +534,17 @@ def _validate_staged_operational_requests(launch_path: Path, continuous_path: Pa
     for key, expected in expected_launch.items():
         if launch.get(key) != expected:
             raise ValueError(f"stage {labels[key]} is not the hydrated operational path")
+    if generation_identity is not None and launch.get("dataset_revision") != generation_identity["dataset_revision"]:
+        raise ValueError("stage launch dataset revision is not derived from the sealed manifest")
     continuous = _load_regular_json(continuous_path, "continuous request")
+    if (
+        set(continuous) != {"schema_version", "command", "arguments"}
+        or continuous.get("schema_version") != 1
+        or continuous.get("command") != "continuous-train"
+        or not isinstance(continuous.get("arguments"), Mapping)
+    ):
+        raise ValueError("stage continuous request is not an executable continuous-train envelope")
+    arguments = continuous["arguments"]
     expected_continuous = {
         "launch_config": "/prepared/config/launch.json",
         "experiment_config": "/prepared/config/experiment.json",
@@ -496,20 +552,98 @@ def _validate_staged_operational_requests(launch_path: Path, continuous_path: Pa
         "publisher_token_file": "/prepared/config/publisher.token",
     }
     for key, expected in expected_continuous.items():
-        if continuous.get(key) != expected:
+        if arguments.get(key) != expected:
             raise ValueError("stage continuous request is not bound to hydrated paths")
+    return arguments
+
+
+def _validate_staged_experiment(
+    experiment_path: Path, generation_identity: Mapping[str, str],
+) -> None:
+    experiment = _load_regular_json(experiment_path, "experiment config")
+    if (
+        experiment.get("dataset_repository") != "local/sealed-mixed-generation"
+        or experiment.get("dataset_manifest_sha256")
+        != generation_identity["dataset_manifest_sha256"]
+        or experiment.get("dataset_revision") != generation_identity["dataset_revision"]
+    ):
+        raise ValueError("stage experiment dataset identity is not derived from the sealed manifest")
+
+
+def _validate_resume_descriptor_for_stage(
+    arguments: Mapping[str, object], request: Mapping[str, object],
+) -> tuple[str, str, int] | None:
+    descriptor = arguments.get("resume_checkpoint")
+    publication = arguments.get("resume_publication")
+    source = request.get("resume_checkpoint_descriptor")
+    if descriptor is None and publication is None:
+        if source is not None:
+            raise ValueError("stage has a resume descriptor without a resume request")
+        return None
+    if descriptor != "/prepared/config/resume-checkpoint.json" or not isinstance(publication, Mapping):
+        raise ValueError("stage resume request is not bound to the hydrated descriptor")
+    if not isinstance(source, str) or not source:
+        raise ValueError("stage resume requires an authenticated descriptor source")
+    required = {
+        "repository", "immutable_revision", "remote_prefix", "relative_path",
+        "artifact_sha256", "artifact_byte_size", "descriptor_relative_path",
+        "descriptor_sha256", "descriptor_byte_size",
+    }
+    if set(publication) != required:
+        raise ValueError("stage resume publication is incompatible")
+    descriptor_sha = publication["descriptor_sha256"]
+    descriptor_size = publication["descriptor_byte_size"]
+    if (
+        not isinstance(descriptor_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", descriptor_sha) is None
+        or type(descriptor_size) is not int
+        or descriptor_size <= 0
+    ):
+        raise ValueError("stage resume descriptor identity is invalid")
+    path = Path(source)
+    if path.is_symlink() or not path.is_file() or path.stat().st_size != descriptor_size:
+        raise ValueError("stage resume descriptor source is unavailable")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != descriptor_sha:
+        raise ValueError("stage resume descriptor source differs from immutable publication")
+    return source, descriptor_sha, descriptor_size
 
 
 def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     _stage_command(request)
+    generation_root = Path(str(request["generation_root"]))
+    if Path(str(request["generation_receipt"])) != generation_root.with_name(
+        generation_root.name + ".generation.json"
+    ):
+        raise ValueError("stage generation receipt must be the sibling sealed receipt")
+    generation_identity = _sealed_generation_identity(
+        generation_root,
+        claimed_mix_plan_sha256=request.get("generation_sha256"),
+        claimed_dataset_manifest_sha256=request.get("dataset_manifest_sha256"),
+    )
+    if request.get("sealed_generation_sha256") != generation_identity["mix_plan_sha256"]:
+        raise ValueError("stage caller generation identity differs from sealed receipt")
+    if (
+        request.get("dataset_manifest_sha256")
+        != generation_identity["dataset_manifest_sha256"]
+        or request.get("dataset_revision") != generation_identity["dataset_revision"]
+    ):
+        raise ValueError("stage caller dataset identity differs from sealed receipt")
     _validate_staged_operational_requests(
         Path(str(request["launch_config"])),
         Path(str(request["continuous_request"])),
+        generation_identity=generation_identity,
     )
+    resume_arguments = _validate_staged_operational_requests(
+        Path(str(request["launch_config"])),
+        Path(str(request["resume_request"])),
+        generation_identity=generation_identity,
+    )
+    _validate_staged_experiment(
+        Path(str(request["experiment_config"])), generation_identity
+    )
+    resume_descriptor = _validate_resume_descriptor_for_stage(resume_arguments, request)
     remote_dir = "/tmp/lehome-stage"
     runner((*_ssh_prefix(instance), "mkdir -p " + remote_dir))
-    generation_root = Path(str(request["generation_root"]))
-    if generation_root.is_symlink() or not generation_root.is_dir(): raise ValueError("stage generation root is unsafe")
     runner(("scp", "-r", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(generation_root), "root@" + str(instance["host"]) + ":" + remote_dir + "/generation"))
     generation_tree = _tree_readback_sha256(generation_root)
     observed_tree = runner((*_ssh_prefix(instance), "cd " + remote_dir + "/generation && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum")).strip().split()
@@ -524,6 +658,8 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
         ("continuous_request", "continuous.json"), ("resume_request", "resume.json"),
         ("tune_request", "tune.json"), ("modality_config", "modality.py"), ("token_file", "token"),
     )
+    if resume_descriptor is not None:
+        pairs += (("resume_checkpoint_descriptor", "resume-checkpoint.json"),)
     receipts = []
     for field, remote_name in pairs:
         source = Path(str(request[field]))
@@ -541,14 +677,13 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
     _safe_archive(Path(str(request["parent_checkpoint"])), "parent checkpoint")
     parent_archive_sha256, _ = _parent_identities(request)
     runner((*_ssh_prefix(instance), _stage_setup_command(parent_archive_sha256)))
-    return {"paid_action": True, "action": "stage", "instance_id": instance["instance_id"], "generation_tree_sha256": generation_tree, "code_bundle_sha256": code_digest, "transfers": receipts}
+    return {"paid_action": True, "action": "stage", "instance_id": instance["instance_id"], "generation_tree_sha256": generation_tree, "code_bundle_sha256": code_digest, "generation_identity": generation_identity, "transfers": receipts}
 
 
 def _parent_identities(request: Mapping[str, object]) -> tuple[str, str]:
     archive_sha, artifact_sha = request.get("parent_archive_sha256"), request.get("parent_checkpoint_sha256")
     if (
-        not isinstance(archive_sha, str)
-        or re.fullmatch(r"[0-9a-f]{64}", archive_sha) is None
+        archive_sha != PARENT_CHECKPOINT["archive_sha256"]
         or artifact_sha != PARENT_CHECKPOINT["artifact_sha256"]
     ):
         raise ValueError("stage parent archive and policy artifact identities are required")
@@ -556,7 +691,7 @@ def _parent_identities(request: Mapping[str, object]) -> tuple[str, str]:
 
 
 def _stage_command(request: Mapping[str, object]) -> str:
-    required = ("code_bundle", "code_bundle_sha256", "code_bundle_sha256_file", "generation_root", "generation_receipt", "parent_checkpoint", "parent_checkpoint_sha256", "parent_archive_sha256", "launch_config", "experiment_config", "continuous_request", "resume_request", "tune_request", "modality_config", "token_file")
+    required = ("code_bundle", "code_bundle_sha256", "code_bundle_sha256_file", "generation_root", "generation_receipt", "generation_sha256", "sealed_generation_sha256", "dataset_manifest_sha256", "dataset_revision", "parent_checkpoint", "parent_checkpoint_sha256", "parent_archive_sha256", "launch_config", "experiment_config", "continuous_request", "resume_request", "tune_request", "modality_config", "token_file")
     if any(not isinstance(request.get(key), str) or not request[key] for key in required):
         raise ValueError("stage requires exact code, generation, parent, config, modality, and token paths")
     if request.get("generation_sha256") != request.get("sealed_generation_sha256"):
@@ -694,6 +829,15 @@ def resume_identity(
         or candidate.get("config_sha256") != config_sha256
         or candidate.get("experiment_id") != terminal.get("experiment_id")
         or not isinstance(candidate.get("immutable_revision"), str)
+        or not all(
+            isinstance(candidate.get(field), str) and candidate[field]
+            for field in (
+                "relative_path", "artifact_sha256", "descriptor_relative_path",
+                "descriptor_sha256",
+            )
+        )
+        or type(candidate.get("artifact_byte_size")) is not int
+        or type(candidate.get("descriptor_byte_size")) is not int
     ):
         raise ValueError("provider interruption checkpoint is not bound to the terminal identity")
     return candidate
@@ -716,9 +860,77 @@ def discover_resume_publication(
     return publication
 
 
+def _hydrate_resume_descriptor(
+    *, publication: Mapping[str, object], transport: HubTransport, token: str,
+    output: Path,
+) -> dict[str, object]:
+    """Persist a descriptor only after the immutable publication readback."""
+    descriptor = publication.get("descriptor_relative_path")
+    descriptor_sha = publication.get("descriptor_sha256")
+    descriptor_size = publication.get("descriptor_byte_size")
+    repository = publication.get("repository")
+    revision = publication.get("immutable_revision")
+    prefix = publication.get("remote_prefix")
+    if (
+        not all(isinstance(value, str) and value for value in (descriptor, descriptor_sha, repository, revision, prefix))
+        or type(descriptor_size) is not int
+        or descriptor_size <= 0
+        or output.exists()
+        or output.is_symlink()
+        or output.parent.is_symlink()
+        or not output.parent.is_dir()
+    ):
+        raise ValueError("resume descriptor hydration target or identity is invalid")
+    from tempfile import TemporaryDirectory
+
+    with TemporaryDirectory(prefix="persistent-resume-descriptor-") as temporary:
+        destination = Path(temporary)
+        transport.download_files(
+            repository=repository,
+            revision=revision,
+            destination=destination,
+            relative_paths=(descriptor,),
+            token=token,
+            remote_prefix=prefix,
+        )
+        observed = destination / descriptor
+        if (
+            not observed.is_file()
+            or observed.is_symlink()
+            or observed.stat().st_size != descriptor_size
+            or hashlib.sha256(observed.read_bytes()).hexdigest() != descriptor_sha
+        ):
+            raise ValueError("resume descriptor authenticated readback mismatch")
+        temporary = output.with_name(f".{output.name}.incomplete")
+        if temporary.exists() or temporary.is_symlink():
+            raise ValueError("resume descriptor hydration temporary path is unavailable")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(observed.read_bytes())
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, output)
+        finally:
+            temporary.unlink(missing_ok=True)
+    if (
+        output.is_symlink()
+        or not output.is_file()
+        or output.stat().st_size != descriptor_size
+        or hashlib.sha256(output.read_bytes()).hexdigest() != descriptor_sha
+    ):
+        output.unlink(missing_ok=True)
+        raise ValueError("resume descriptor hydration writeback mismatch")
+    return {
+        "path": str(output),
+        "sha256": descriptor_sha,
+        "byte_size": descriptor_size,
+        "relative_path": descriptor,
+    }
+
+
 def replacement_resume_descriptor(
     *, terminal: Mapping[str, object], capability_receipt: Mapping[str, object], runner: Runner,
-    transport: HubTransport, token: str,
+    transport: HubTransport, token: str, descriptor_output: Path,
 ) -> dict[str, object]:
     """Promote a replacement canary and bind it to the last immutable resume.
 
@@ -732,6 +944,12 @@ def replacement_resume_descriptor(
     if not isinstance(generation, str) or not isinstance(config, str) or type(old_instance_id) is not int:
         raise ValueError("provider interruption terminal is malformed")
     checkpoint = dict(discover_resume_publication(terminal, transport=transport, token=token))
+    hydrated_descriptor = _hydrate_resume_descriptor(
+        publication=checkpoint,
+        transport=transport,
+        token=token,
+        output=descriptor_output,
+    )
     replacement = promote_canary(capability_receipt=capability_receipt, runner=runner)
     if replacement.get("instance_id") == old_instance_id:
         raise ValueError("replacement resume must use a newly bound instance")
@@ -741,6 +959,7 @@ def replacement_resume_descriptor(
         "instance": replacement,
         "capability_receipt": dict(capability_receipt),
         "resume_checkpoint_publication": checkpoint,
+        "resume_checkpoint_descriptor": hydrated_descriptor,
         "generation_sha256": generation,
         "config_sha256": config,
         "resume_generation_sha256": generation,
@@ -823,20 +1042,44 @@ def _verify_publication_tree(*, publication: Mapping[str, object], transport: Hu
     """Perform the real authenticated immutable Hub readback, never a shell shim."""
     repository, revision, prefix = publication.get("repository"), publication.get("immutable_revision"), publication.get("remote_prefix")
     artifact, size = publication.get("artifact_sha256"), publication.get("artifact_byte_size")
+    descriptor, descriptor_sha, descriptor_size = (
+        publication.get("descriptor_relative_path"),
+        publication.get("descriptor_sha256"),
+        publication.get("descriptor_byte_size"),
+    )
     if repository != PARENT_CHECKPOINT["repository"]:
         raise ValueError("immutable publication repository is not the approved model repository")
-    if not all(isinstance(value, str) and value for value in (repository, revision, prefix, artifact)) or type(size) is not int or size <= 0:
+    if (
+        not all(
+            isinstance(value, str) and value
+            for value in (repository, revision, prefix, artifact, descriptor, descriptor_sha)
+        )
+        or type(size) is not int
+        or size <= 0
+        or type(descriptor_size) is not int
+        or descriptor_size <= 0
+    ):
         raise ValueError("immutable publication binding is invalid")
     tree = transport.list_tree(repository=repository, revision=revision, token=token)
     target = str(prefix).rstrip("/") + "/" + str(publication.get("relative_path", ""))
-    if not any(entry.relative_path == target and entry.entry_type == "file" for entry in tree):
-        raise ValueError("immutable Hub tree lacks checkpoint artifact")
+    descriptor_target = str(prefix).rstrip("/") + "/" + str(descriptor)
+    remote_files = {entry.relative_path for entry in tree if entry.entry_type == "file"}
+    if target not in remote_files or descriptor_target not in remote_files:
+        raise ValueError("immutable Hub tree lacks checkpoint artifact or descriptor")
     from tempfile import TemporaryDirectory
     with TemporaryDirectory(prefix="persistent-hub-readback-") as temporary:
         destination = Path(temporary)
-        transport.download_files(repository=repository, revision=revision, destination=destination, relative_paths=(str(publication.get("relative_path")),), token=token, remote_prefix=prefix)
+        transport.download_files(repository=repository, revision=revision, destination=destination, relative_paths=(str(publication.get("relative_path")), str(descriptor)), token=token, remote_prefix=prefix)
         observed = destination / str(publication.get("relative_path"))
-        if not observed.is_file() or observed.stat().st_size != size or hashlib.sha256(observed.read_bytes()).hexdigest() != artifact:
+        observed_descriptor = destination / str(descriptor)
+        if (
+            not observed.is_file()
+            or observed.stat().st_size != size
+            or hashlib.sha256(observed.read_bytes()).hexdigest() != artifact
+            or not observed_descriptor.is_file()
+            or observed_descriptor.stat().st_size != descriptor_size
+            or hashlib.sha256(observed_descriptor.read_bytes()).hexdigest() != descriptor_sha
+        ):
             raise ValueError("immutable Hub artifact readback mismatch")
 
 
@@ -972,9 +1215,10 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
     if args.action == "replacement-resume":
         terminal = request.get("provider_interruption_terminal")
         capability = request.get("capability_receipt")
-        if not isinstance(terminal, Mapping) or not isinstance(capability, Mapping):
-            raise ValueError("replacement-resume requires interruption terminal and replacement capability receipt")
-        return {"paid_action": True, "action": "replacement-resume", **replacement_resume_descriptor(terminal=terminal, capability_receipt=capability, runner=runner, transport=HuggingFaceHubTransport(timeout_seconds=30.0), token=_read_private_token(args.token_file))}
+        descriptor_output = request.get("resume_descriptor_output")
+        if not isinstance(terminal, Mapping) or not isinstance(capability, Mapping) or not isinstance(descriptor_output, str):
+            raise ValueError("replacement-resume requires interruption terminal, replacement capability receipt, and descriptor output")
+        return {"paid_action": True, "action": "replacement-resume", **replacement_resume_descriptor(terminal=terminal, capability_receipt=capability, runner=runner, transport=HuggingFaceHubTransport(timeout_seconds=30.0), token=_read_private_token(args.token_file), descriptor_output=Path(descriptor_output))}
     if args.action == "rent": return rent(evidence=request, runner=runner)
     if args.action == "destroy":
         return destroy(

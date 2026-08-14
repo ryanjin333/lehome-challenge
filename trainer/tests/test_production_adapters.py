@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import lehome_train.groot.production_adapters as adapters
-from lehome_train.checkpoints import CheckpointDescriptor
+from lehome_train.checkpoints import CheckpointDescriptor, write_checkpoint_descriptor
 from lehome_train.commands.train import TrainingChunkRequest
 from lehome_train.constants import MODEL_REVISION
 from lehome_train.groot.config import FineTuneLaunchConfig
@@ -653,3 +653,66 @@ def test_checkpoint_uploader_uses_explicit_parent_token_without_process_environm
     )
     assert uploader._hub_environ == {"HF_TOKEN": "publisher-token"}
     assert "HF_TOKEN" not in __import__("os").environ
+
+
+def test_checkpoint_uploader_publishes_descriptor_with_archive_to_one_immutable_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "checkpoints" / "step-1000.tar"
+    archive.parent.mkdir()
+    archive.write_bytes(b"checkpoint archive")
+    checkpoint = CheckpointDescriptor(
+        record=CheckpointRecord(
+            experiment_id="experiment-001",
+            optimizer_step=1000,
+            sample_presentations=64_000,
+            experiment_config_sha256="a" * 64,
+            dataset_manifest_sha256="b" * 64,
+            schedule_sha256="c" * 64,
+            artifact=ArtifactIdentity(
+                "checkpoints/step-1000.tar", sha256_file(archive), archive.stat().st_size,
+            ),
+            resumable=True,
+            remotely_verified=False,
+        ),
+        normalization_sha256="d" * 64,
+        schedule_sha256="c" * 64,
+        locally_verified=True,
+    )
+    descriptor = tmp_path / "checkpoints" / "step-1000.json"
+    write_checkpoint_descriptor(descriptor, checkpoint)
+    uploaded: list[object] = []
+
+    monkeypatch.setattr(adapters, "HuggingFaceHubTransport", lambda **_kwargs: object())
+    monkeypatch.setattr(adapters, "require_access", lambda **_kwargs: None)
+
+    def fake_upload(**kwargs: object) -> str:
+        uploaded.extend(kwargs["entries"])
+        return "e" * 40
+
+    def fake_download(**kwargs: object) -> str:
+        destination = kwargs["destination"]
+        assert isinstance(destination, Path)
+        for relative in kwargs["relative_paths"]:
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((tmp_path / relative).read_bytes())
+        return "e" * 40
+
+    monkeypatch.setattr(adapters, "upload_files", fake_upload)
+    monkeypatch.setattr(adapters, "download_files", fake_download)
+    publication = adapters.HubCheckpointUploader(
+        repository=adapters.DEFAULT_MODEL_REPO,
+        revision="main",
+        experiment_id="experiment-001",
+        artifact_root=tmp_path,
+        token="publisher-token",
+    ).publish_receipt(checkpoint, timeout_seconds=1)
+
+    assert {entry.relative_path for entry in uploaded} == {
+        "checkpoints/step-1000.tar", "checkpoints/step-1000.json",
+    }
+    assert publication["immutable_revision"] == "e" * 40
+    assert publication["descriptor_relative_path"] == "checkpoints/step-1000.json"
+    assert publication["descriptor_sha256"] == sha256_file(descriptor)
+    assert publication["descriptor_byte_size"] == descriptor.stat().st_size
