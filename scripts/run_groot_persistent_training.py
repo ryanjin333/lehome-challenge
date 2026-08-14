@@ -1497,7 +1497,7 @@ def resume_runtime_checkpoint(
         publications=(publication,), provider_loss=provider_loss,
     )
     cursor = discovered.resume
-    return {"paid_action": True, "action": "runtime-checkpoint-resume", "instance_id": replacement["instance_id"], "runtime_cursor": cursor.dataset_kwargs(), "checkpoint_archive": str(cursor.checkpoint_archive), "checkpoint_descriptor": str(cursor.checkpoint_descriptor), "recovered_terminal": recovered_terminal, "immutable_anchor_revision": discovered.immutable_anchor_revision}
+    return {"paid_action": True, "action": "runtime-checkpoint-resume", "instance_id": replacement["instance_id"], "runtime_cursor": cursor.dataset_kwargs(), "checkpoint_archive": str(cursor.checkpoint_archive), "checkpoint_descriptor": str(cursor.checkpoint_descriptor), "runtime_resume_anchor": discovered.previous_link(), "runtime_resume_publication": publication, "recovered_terminal": recovered_terminal, "immutable_anchor_revision": discovered.immutable_anchor_revision}
 
 
 def destroy_runtime_checkpoint_completion(
@@ -1832,7 +1832,9 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
     if (resume_archive is None and resume_descriptor is None and resume_cursor is None):
         resume_transfers: dict[str, str] = {}
     elif (
-        type(resume_archive) is str and type(resume_descriptor) is str and isinstance(resume_cursor, Mapping)
+        type(resume_archive) is str and type(resume_descriptor) is str
+        and isinstance(resume_cursor, Mapping) and isinstance(request.get("runtime_resume_anchor"), Mapping)
+        and isinstance(request.get("runtime_resume_publication"), Mapping)
     ):
         resume_transfers = {"runtime_resume_archive": "runtime-resume.tar", "runtime_resume_descriptor": "runtime-resume.json"}
     else:
@@ -1845,7 +1847,7 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         raise ValueError("runtime mixture stage parent step12000 archive is incompatible")
     _safe_archive(parent, "runtime mixture parent checkpoint")
     _read_private_token(str(request["token_file"]))
-    train = _runtime_envelope(Path(str(request["runtime_train_request"])), command="runtime-mixture-train", fields={"launch_config", "experiment_config", "runtime_manifest", "runtime_window_index", "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence", "cpu_pilot_receipt", "warmup_receipt", "runtime_warmup_binding", "runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor", "checkpoint_repository", "checkpoint_revision", "publisher_token_file", "instance_id", "result_output", "status_output"}, label="runtime train request")
+    train = _runtime_envelope(Path(str(request["runtime_train_request"])), command="runtime-mixture-train", fields={"launch_config", "experiment_config", "runtime_manifest", "runtime_window_index", "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence", "cpu_pilot_receipt", "warmup_receipt", "runtime_warmup_binding", "runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor", "runtime_resume_anchor", "runtime_resume_publication", "checkpoint_repository", "checkpoint_revision", "publisher_token_file", "instance_id", "result_output", "status_output"}, label="runtime train request")
     expected_train_paths = {
         "launch_config": "/prepared/config/launch.json", "experiment_config": "/prepared/config/experiment.json",
         "runtime_manifest": "/prepared/runtime/mixture.json", "runtime_window_index": "/prepared/runtime/window-index.json",
@@ -1864,9 +1866,11 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
             train.get("runtime_resume_archive") != "/prepared/config/runtime-resume.tar"
             or train.get("runtime_resume_descriptor") != "/prepared/config/runtime-resume.json"
             or train.get("runtime_resume_cursor") != resume_cursor
+            or train.get("runtime_resume_anchor") != request.get("runtime_resume_anchor")
+            or train.get("runtime_resume_publication") != request.get("runtime_resume_publication")
         ):
             raise ValueError("runtime train request resume inputs are not the staged authenticated cursor")
-    elif any(train.get(key) is not None for key in ("runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor")):
+    elif any(train.get(key) is not None for key in ("runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor", "runtime_resume_anchor", "runtime_resume_publication")):
         raise ValueError("initial runtime train request must not invent a resume cursor")
     _runtime_envelope(Path(str(request["runtime_hydrate_request"])), command="hydrate-runtime-mixture", fields={"deployment_receipt", "source_readback_receipts", "destination", "mounts_descriptor"}, label="runtime hydration request")
     _runtime_envelope(Path(str(request["runtime_pilot_request"])), command="pilot-runtime-mixture", fields={"mixture_manifest", "mounts_descriptor", "sample_count", "worker_counts", "timeout_seconds", "authenticated_evidence"}, label="runtime pilot request")

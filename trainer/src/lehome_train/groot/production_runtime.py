@@ -538,6 +538,56 @@ def _runtime_resume_checkpoint(
     return restored
 
 
+def _runtime_resume_anchor_link(
+    *, resume_checkpoint: Path | None, value: object,
+) -> dict[str, str] | None:
+    """Bind a resumed 2K publisher to the 1K anchor discovered by the host."""
+
+    if resume_checkpoint is None:
+        if value is not None:
+            raise ValueError("initial runtime training must not provide a resume anchor")
+        return None
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"immutable_anchor_revision", "anchor_sha256"}
+        or type(value["immutable_anchor_revision"]) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", value["immutable_anchor_revision"]) is None
+        or type(value["anchor_sha256"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value["anchor_sha256"]) is None
+    ):
+        raise ValueError("runtime resume requires its authenticated predecessor anchor link")
+    return {
+        "immutable_anchor_revision": value["immutable_anchor_revision"],
+        "anchor_sha256": value["anchor_sha256"],
+    }
+
+
+def _runtime_resume_publication(*, value: object, identity: RuntimeMixtureTrainingIdentity, anchor: dict[str, str] | None) -> dict[str, object] | None:
+    """Retain the exact 1K publication the consumed anchor authenticated."""
+
+    if anchor is None:
+        if value is not None:
+            raise ValueError("initial runtime training must not provide a resume publication")
+        return None
+    required = {
+        "schema_version", "kind", "optimizer_step", "repository", "immutable_revision",
+        "remote_prefix", "relative_path", "artifact_sha256", "artifact_byte_size",
+        "descriptor_relative_path", "descriptor_sha256", "descriptor_byte_size",
+        "readback_verified", "identity", "identity_sha256", "runtime_cursor",
+        "fresh_tree_readback_verified",
+    }
+    if (
+        not isinstance(value, Mapping) or set(value) != required
+        or value.get("schema_version") != 1 or value.get("kind") != "runtime_mixture_checkpoint_publication"
+        or value.get("optimizer_step") != 1000 or value.get("identity") != identity.to_dict()
+        or value.get("identity_sha256") != identity.sha256
+        or value.get("runtime_cursor") != {"optimizer_step": 1000, "global_sample_offset": 64_000, "physical_batch_size": 64, "action_horizon": 16}
+        or value.get("fresh_tree_readback_verified") is not True
+    ):
+        raise ValueError("runtime resume publication is not the authenticated 1K cursor")
+    return dict(value)
+
+
 def _resume_publication(
     *,
     value: object,
@@ -1570,6 +1620,7 @@ class ProductionRuntime:
             "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence",
             "cpu_pilot_receipt", "warmup_receipt", "runtime_warmup_binding",
             "runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor",
+            "runtime_resume_anchor", "runtime_resume_publication",
             "checkpoint_repository", "checkpoint_revision", "publisher_token_file", "instance_id",
             "result_output", "status_output",
         }
@@ -1635,6 +1686,9 @@ class ProductionRuntime:
         resume_checkpoint = _runtime_resume_checkpoint(
             request=request, config=config, mixture_id=getattr(contract.manifest, "mixture_id", None),
         )
+        previous_anchor = _runtime_resume_anchor_link(
+            resume_checkpoint=resume_checkpoint, value=request["runtime_resume_anchor"],
+        )
         # The observer snapshots the official save directory at 1K while the
         # trainer continues.  It uploads/readbacks the immutable archive before
         # the 2K boundary, so a provider loss after 1K has a real resume source.
@@ -1655,8 +1709,10 @@ class ProductionRuntime:
         )
         if identity.mixture_id != str(contract.manifest.mixture_id):
             raise ValueError("runtime checkpoint source evidence mixture identity disagrees with mounted runtime")
-        previous_anchor: dict[str, str] | None = None
-
+        resume_publication = _runtime_resume_publication(
+            value=request["runtime_resume_publication"], identity=identity,
+            anchor=previous_anchor,
+        )
         def publish_with_anchor(checkpoint: object) -> dict[str, object]:
             nonlocal previous_anchor
             raw = uploader.publish_receipt(checkpoint, timeout_seconds=30.0)  # type: ignore[arg-type]
@@ -1684,7 +1740,9 @@ class ProductionRuntime:
                 sample_presentations=completed.optimizer_step * 64, schedule_sha256=schedule.sha256,
             ),
             publish=publish_with_anchor,
+            already_published=() if resume_publication is None else (1000,),
         )
+        publications = (() if resume_publication is None else (resume_publication,)) + publications
         steps = [item.get("optimizer_step") for item in publications]
         if steps not in ([1000], [1000, 2000]):
             raise RuntimeError("runtime mixture did not publish an immutable 1K checkpoint")

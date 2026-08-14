@@ -63,6 +63,7 @@ def run_continuous_supervisor(
     package: Callable[[CompletedCheckpoint], object],
     publish: Callable[[object], bool],
     wait: Callable[[], None] | None = None,
+    already_published: tuple[int, ...] = (),
 ) -> tuple[dict[str, object], ...]:
     """Launch once, observe official save completion, publish in one worker.
 
@@ -83,7 +84,9 @@ def run_continuous_supervisor(
 
     training_thread = threading.Thread(target=train, daemon=False)
     training_thread.start()
-    submitted: dict[int, object] = {}
+    if any(step not in (1000, 2000) for step in already_published) or len(set(already_published)) != len(already_published):
+        raise ValueError("continuous supervisor already-published boundaries are invalid")
+    submitted: dict[int, object] = {step: None for step in already_published}
     finished_polls = 0
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="checkpoint-publisher") as executor:
         while not finished.is_set() or len(submitted) < 2:
@@ -116,7 +119,10 @@ def run_continuous_supervisor(
         for step in (1000, 2000):
             if step not in submitted:
                 continue
-            receipt = submitted[step].result()
+            future = submitted[step]
+            if future is None:
+                continue
+            receipt = future.result()
             if receipt is True:
                 immutable.append({"optimizer_step": step, "readback_verified": True})
             elif isinstance(receipt, dict) and receipt.get("readback_verified") is True and receipt.get("optimizer_step") == step:
