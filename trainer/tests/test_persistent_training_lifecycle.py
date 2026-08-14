@@ -1715,6 +1715,115 @@ def test_runtime_hydrate_dispatch_allows_cpu_pilot_lease_and_rejects_mismatched_
     assert json.loads(Path(str(request["failure_receipt"])).read_text())["cleanup_status"] == "destroyed_and_absent"
 
 
+def test_runtime_cpu_pilot_bootstrap_runtime_hydrate_and_run_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    Path(str(request["bootstrap_receipt"])).unlink()
+    bundle = tmp_path / "code.bundle"
+    bundle_sha = tmp_path / "code.bundle.sha256"
+    token = tmp_path / "runtime.token"
+    hydrate_request = tmp_path / "runtime-hydrate.json"
+    pilot_request = tmp_path / "runtime-pilot.json"
+    bundle.write_bytes(b"reviewed bundle")
+    bundle_sha.write_text("4" * 64 + "  code.bundle\n", encoding="utf-8")
+    token.write_text("private-token", encoding="utf-8")
+    token.chmod(0o600)
+    hydrate_request.write_text(json.dumps({
+        "schema_version": 1, "command": "hydrate-runtime-mixture",
+        "arguments": {
+            "deployment_receipt": "/prepared/config/deployment-receipt.json",
+            "source_readback_receipts": {
+                "organizer": "/prepared/config/bc-readback.json",
+                "rollout": "/prepared/config/rollout-readback.json",
+            }, "destination": "/prepared/runtime",
+            "mounts_descriptor": "/prepared/runtime/mounts.json",
+        },
+    }), encoding="utf-8")
+    pilot_request.write_text(json.dumps({
+        "schema_version": 1, "command": "pilot-runtime-mixture",
+        "arguments": {
+            "mixture_manifest": "/prepared/runtime/mixture.json",
+            "mounts_descriptor": "/prepared/runtime/mounts.json", "sample_count": 100,
+            "worker_counts": [0, 4, 8, 16, 24], "timeout_seconds": 60,
+            "authenticated_evidence": {},
+        },
+    }), encoding="utf-8")
+    request |= {
+        "code_bundle": str(bundle), "code_bundle_sha256_file": str(bundle_sha),
+        "token_file": str(token), "runtime_hydrate_request": str(hydrate_request),
+        "runtime_pilot_request": str(pilot_request),
+        "failure_receipt": str(tmp_path / "chain-failure.json"),
+    }
+    monkeypatch.setattr(LIFECYCLE, "_verify_reviewed_code_bundle", lambda *_args: "4" * 64)
+    sources = {
+        "code.bundle": bundle, "code.bundle.sha256": bundle_sha, "runtime.token": token,
+        "runtime-hydrate.json": hydrate_request, "runtime-pilot.json": pilot_request,
+        "bc-readback.json": Path(str(request["bc_readback_receipt"])),
+        "rollout-readback.json": Path(str(request["rollout_readback_receipt"])),
+        "deployment-receipt.json": Path(str(request["deployment_receipt"])),
+    }
+    hydration = {
+        "kind": "runtime_mixture_hydration", "immutable_revision": "c" * 40,
+        "remote_prefix": "mixtures/" + "d" * 64, "fresh_readback_verified": True,
+    }
+    pilot = _schema4_pilot(
+        instance_id=44, provider_sha="2" * 64, code_revision="3" * 40, code_sha="4" * 64,
+        bc_revision="a" * 40, rollout_revision="b" * 40, deployment_revision="c" * 40,
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command[0] == "scp":
+            return ""
+        if command == ("vastai", "destroy", "instance", "44", "--yes"):
+            return ""
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return "{}"
+        if command[0] == "ssh":
+            remote_command = command[-1]
+            if remote_command.startswith("sha256sum "):
+                name = remote_command.rpartition("/")[2]
+                return LIFECYCLE.sha256_file(sources[name]) + "  " + name + "\n"
+            if "hydrate-runtime-mixture --request /prepared/config/runtime-hydrate.json" in remote_command:
+                return json.dumps(hydration)
+            if "pilot-runtime-mixture --request /prepared/config/runtime-pilot.json" in remote_command:
+                return json.dumps(pilot)
+            return ""
+        raise AssertionError(command)
+
+    bootstrap = LIFECYCLE.remote_action(
+        action="runtime-bootstrap-stage", instance=instance, request=request, runner=runner,
+    )
+    hydrated = LIFECYCLE.remote_action(
+        action="runtime-hydrate", instance=instance, request=request, runner=runner,
+    )
+    measured = LIFECYCLE.run_runtime_cpu_pilot(instance=instance, request=request, runner=runner)
+
+    persisted_bootstrap = json.loads(Path(str(request["bootstrap_receipt"])).read_text())
+    persisted_pilot = json.loads(Path(str(request["lifecycle_receipt"])).read_text())
+    hydrate_command = next(
+        command for command in calls
+        if command[0] == "ssh"
+        and "hydrate-runtime-mixture --request /prepared/config/runtime-hydrate.json" in command[-1]
+    )
+    pilot_command = next(
+        command for command in calls
+        if command[0] == "ssh"
+        and "pilot-runtime-mixture --request /prepared/config/runtime-pilot.json" in command[-1]
+    )
+    assert bootstrap["bootstrap_receipt"] == persisted_bootstrap
+    assert {transfer["name"] for transfer in persisted_bootstrap["transfers"]} == set(sources)
+    assert hydrated["hydration_receipt"] == hydration
+    assert calls.index(hydrate_command) < calls.index(pilot_command)
+    assert measured["action"] == "runtime-pilot-run"
+    assert persisted_pilot["pilot_receipt"] == pilot
+    assert persisted_pilot["bootstrap_receipt_sha256"] == LIFECYCLE.sha256_file(
+        Path(str(request["bootstrap_receipt"])),
+    )
+
+
 def test_runtime_cpu_pilot_executes_only_loader_cli_and_persists_bound_lifecycle(tmp_path: Path) -> None:
     instance, request = _runtime_pilot_request_files(tmp_path)
     pilot = {
