@@ -40,6 +40,8 @@ def test_cli_help() -> None:
         "pilot-runtime-mixture",
         "hydrate-runtime-mixture",
         "publish-runtime-source",
+        "verify-uploaded-runtime-source",
+        "adopt-uploaded-runtime-source",
         "publish-runtime-mixture",
         "finalize-runtime-mixture",
     ],

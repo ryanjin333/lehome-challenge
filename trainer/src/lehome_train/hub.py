@@ -21,6 +21,7 @@ from lehome_train.models import SyncEntry, validate_artifact_relative_path
 _COMMIT_REVISION = re.compile(r"^[0-9a-f]{40}$")
 _INITIAL_RETRY_DELAY_SECONDS = 0.25
 _MAX_RETRY_DELAY_SECONDS = 1.0
+_RATE_LIMIT_RETRY_DELAY_SECONDS = 300.0
 _MAX_PARALLEL_DOWNLOADS = 16
 
 
@@ -59,6 +60,10 @@ class HubTreeEntry:
 
 class HubTransientError(RuntimeError):
     """A retryable transport failure whose details must not escape."""
+
+
+class HubRateLimitError(HubTransientError):
+    """A retryable rate limit that needs the provider's full window to clear."""
 
 
 class HubTransport(Protocol):
@@ -146,6 +151,47 @@ class HuggingFaceHubTransport:
             backend_factory=FiniteTimeoutSession,
         )
         return library
+
+    @staticmethod
+    def _is_rate_limited(error: Exception) -> bool:
+        response = getattr(error, "response", None)
+        if getattr(response, "status_code", None) == 429 or getattr(error, "status_code", None) == 429:
+            return True
+        return "rate limit" in str(error).casefold() or "too many requests" in str(error).casefold()
+
+    @staticmethod
+    def _preserve_partial_prefixed_download(
+        *, destination: Path, remote_prefix: str | None, relative_paths: tuple[str, ...],
+    ) -> None:
+        """Keep any complete materialized files if snapshot_download aborts mid-batch."""
+
+        if remote_prefix is None:
+            return
+        source_root = destination / remote_prefix
+        if not source_root.is_dir() or source_root.is_symlink():
+            return
+        for relative_path in relative_paths:
+            source, target = source_root / relative_path, destination / relative_path
+            if not source.is_file() or source.is_symlink() or target.exists() or target.is_symlink():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(target))
+        for directory in sorted(
+            (path for path in source_root.rglob("*") if path.is_dir() and not path.is_symlink()),
+            key=lambda path: len(path.parts), reverse=True,
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        try:
+            source_root.rmdir()
+        except OSError:
+            pass
+        try:
+            (destination / remote_prefix.split("/", 1)[0]).rmdir()
+        except OSError:
+            pass
 
     @staticmethod
     def _repo_type(repository: str) -> str:
@@ -356,11 +402,7 @@ class HuggingFaceHubTransport:
             relative_path if remote_prefix is None else f"{remote_prefix}/{relative_path}"
             for relative_path in relative_paths
         )
-        allow_patterns = (
-            [f"{remote_prefix}/**"]
-            if remote_prefix is not None
-            else list(remote_paths)
-        )
+        allow_patterns = list(remote_paths)
         try:
             library.snapshot_download(
                 repo_id=repository,
@@ -372,7 +414,19 @@ class HuggingFaceHubTransport:
                 etag_timeout=self.timeout_seconds,
             )
         except (ConnectionError, TimeoutError):
+            self._preserve_partial_prefixed_download(
+                destination=destination, remote_prefix=remote_prefix, relative_paths=relative_paths,
+            )
+            shutil.rmtree(destination / ".cache", ignore_errors=True)
             raise HubTransientError("Hub download timed out") from None
+        except Exception as error:
+            self._preserve_partial_prefixed_download(
+                destination=destination, remote_prefix=remote_prefix, relative_paths=relative_paths,
+            )
+            shutil.rmtree(destination / ".cache", ignore_errors=True)
+            if self._is_rate_limited(error):
+                raise HubRateLimitError("Hub download rate limited") from None
+            raise
         if remote_prefix is not None:
             for relative_path, remote_path in zip(relative_paths, remote_paths, strict=True):
                 downloaded = destination / remote_path
@@ -607,6 +661,12 @@ def download_files(
                 arguments["remote_prefix"] = remote_prefix
             observed = transport.download_files(**arguments)
             break
+        except HubRateLimitError:
+            if attempt == max_attempts:
+                raise RuntimeError(
+                    f"Hub download rate limited after {max_attempts} attempts"
+                ) from None
+            sleeper(_RATE_LIMIT_RETRY_DELAY_SECONDS)
         except HubTransientError:
             if attempt == max_attempts:
                 raise RuntimeError(

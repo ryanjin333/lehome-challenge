@@ -6,7 +6,7 @@ import shutil
 
 import pytest
 
-from lehome_train.hub import HubAccess, HubTreeEntry
+from lehome_train.hub import HubAccess, HubTransientError, HubTreeEntry
 from lehome_train.io import sha256_file
 
 
@@ -23,10 +23,13 @@ def _write(path: Path, value: object) -> None:
 class MemoryTransport:
     """Literal fake private Hub transport; it never opens a network socket."""
 
-    def __init__(self, *, fault: str | None = None) -> None:
+    def __init__(self, *, fault: str | None = None, expected_revision: str | None = None) -> None:
         self.fault = fault
+        self.expected_revision = expected_revision
         self.remote: dict[str, bytes] = {}
         self.calls: list[tuple[str, str, str | None]] = []
+        self.downloaded_files = 0
+        self.download_batches: list[tuple[str, ...]] = []
 
     def check_access(self, *, repository: str, token: str) -> HubAccess:
         assert repository == REPOSITORY
@@ -51,6 +54,8 @@ class MemoryTransport:
 
     def list_tree(self, *, repository: str, revision: str, token: str) -> tuple[HubTreeEntry, ...]:
         assert repository == REPOSITORY and token == TOKEN
+        if self.expected_revision is not None:
+            assert revision == self.expected_revision
         self.calls.append(("tree", revision, None))
         if self.fault == "list":
             raise OSError("tree failed")
@@ -59,13 +64,17 @@ class MemoryTransport:
     def download_files(self, *, repository: str, revision: str, destination: Path, relative_paths, token: str, remote_prefix: str | None = None) -> str:
         assert repository == REPOSITORY and token == TOKEN and remote_prefix is not None
         self.calls.append(("download", revision, remote_prefix))
+        self.download_batches.append(tuple(relative_paths))
         if self.fault == "download":
             raise OSError("download failed")
         for relative in relative_paths:
+            if self.fault == "rate-limit-at-957" and self.downloaded_files >= 957:
+                raise HubTransientError("rate limited")
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             payload = self.remote[f"{remote_prefix}/{relative}"]
             target.write_bytes(b"changed" if self.fault == "changed-readback" else payload)
+            self.downloaded_files += 1
         return "b" * 40 if self.fault == "wrong-readback-revision" else revision
 
 
@@ -97,6 +106,145 @@ def test_source_publisher_proves_complete_remote_tree_and_fresh_bytes_without_mu
     }
     assert source_tree_sha256(source) == before
     assert receipt_path.is_file() and not (source / "bc.json").exists()
+
+
+def test_source_readback_resumes_fixed_safe_batches_after_rate_limit_without_reuploading(
+    tmp_path: Path,
+) -> None:
+    from lehome_train.groot.runtime_mixture_publish import (
+        publish_source,
+        verify_uploaded_runtime_source,
+    )
+
+    source = tmp_path / "source"
+    for index in range(4_007):
+        path = source / "shards" / f"{index:04d}.bin"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"{index}".encode("ascii"))
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    journal = receipts / "source-upload.json"
+    receipt = receipts / "source-readback.json"
+    readback = tmp_path / "stable-readback"
+    transport = MemoryTransport(fault="rate-limit-at-957")
+
+    with pytest.raises(RuntimeError, match="download"):
+        publish_source(
+            root=source,
+            source_type="bc",
+            round_id=None,
+            revision="draft",
+            receipt_path=receipt,
+            upload_journal_path=journal,
+            readback_root=readback,
+            transport=transport,
+        )
+
+    assert journal.is_file()
+    assert not receipt.exists()
+    assert len([path for path in readback.rglob("*") if path.is_file()]) == 957
+    assert len([call for call in transport.calls if call[0] == "upload"]) == 1
+    assert max(map(len, transport.download_batches)) <= 800
+
+    transport.fault = None
+    result = verify_uploaded_runtime_source(
+        root=source,
+        upload_journal_path=journal,
+        readback_root=readback,
+        receipt_path=receipt,
+        transport=transport,
+    )
+
+    assert result["fresh_readback_verified"] is True
+    assert receipt.is_file()
+    assert len([call for call in transport.calls if call[0] == "upload"]) == 1
+    assert max(map(len, transport.download_batches)) <= 800
+    assert len([path for path in readback.rglob("*") if path.is_file()]) == 4_007
+
+
+@pytest.mark.parametrize("mutation", ["journal", "revision", "extra", "local-drift", "receipt-overlap"])
+def test_source_readback_verifier_rejects_unbound_or_unsafe_resume_state(
+    tmp_path: Path, mutation: str,
+) -> None:
+    from lehome_train.groot.runtime_mixture_publish import (
+        publish_source,
+        verify_uploaded_runtime_source,
+    )
+
+    source = tmp_path / "source"
+    _source(source)
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    journal = receipts / "source-upload.json"
+    receipt = receipts / "source-readback.json"
+    readback = tmp_path / "stable-readback"
+    transport = MemoryTransport(fault="download")
+    with pytest.raises(RuntimeError, match="download"):
+        publish_source(
+            root=source, source_type="bc", round_id=None, revision="draft",
+            receipt_path=receipt, upload_journal_path=journal,
+            readback_root=readback, transport=transport,
+        )
+    transport.fault = None
+    if mutation == "journal":
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+        payload["readback_pending"] = False
+        _write(journal, payload)
+    elif mutation == "revision":
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+        payload["immutable_revision"] = "b" * 40
+        _write(journal, payload)
+        transport.expected_revision = REVISION
+    elif mutation == "extra":
+        readback.mkdir(exist_ok=True)
+        (readback / "unexpected.bin").write_bytes(b"unexpected")
+    elif mutation == "local-drift":
+        (source / "manifest.json").write_bytes(b'{"schema":2}')
+    else:
+        receipt = readback / "receipt.json"
+
+    with pytest.raises((FileExistsError, RuntimeError, ValueError), match="journal|revision|readback|local|receipt|external|unsafe|tree"):
+        verify_uploaded_runtime_source(
+            root=source, upload_journal_path=journal,
+            readback_root=readback, receipt_path=receipt, transport=transport,
+        )
+    assert not receipt.exists()
+    assert not [call for call in transport.calls if call[0] == "upload"][1:]
+
+
+def test_adopt_uploaded_source_writes_only_a_pending_journal_then_feeds_no_upload_verifier(
+    tmp_path: Path,
+) -> None:
+    from lehome_train.groot.runtime_mixture_publish import (
+        adopt_uploaded_runtime_source,
+        verify_uploaded_runtime_source,
+    )
+
+    source = tmp_path / "source"
+    _source(source)
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    journal = receipts / "adopted-upload.json"
+    receipt = receipts / "readback.json"
+    transport = MemoryTransport()
+    for path in source.rglob("*"):
+        if path.is_file():
+            transport.remote[f"bc/full/{path.relative_to(source).as_posix()}"] = path.read_bytes()
+
+    adopted = adopt_uploaded_runtime_source(
+        root=source, source_type="bc", round_id=None, immutable_revision=REVISION,
+        upload_journal_path=journal, transport=transport,
+    )
+
+    assert adopted["readback_pending"] is True
+    assert journal.is_file() and not receipt.exists()
+    assert not [call for call in transport.calls if call[0] == "upload"]
+    verified = verify_uploaded_runtime_source(
+        root=source, upload_journal_path=journal, readback_root=tmp_path / "stable-readback",
+        receipt_path=receipt, transport=transport,
+    )
+    assert verified["fresh_readback_verified"] is True
+    assert not [call for call in transport.calls if call[0] == "upload"]
 
 
 def test_hydrator_recreates_exact_remote_trees_and_rewrites_only_local_receipt_mounts(

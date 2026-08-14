@@ -316,6 +316,36 @@ def publish_runtime_source(
     _fail_closed(operation)
 
 
+@app.command("verify-uploaded-runtime-source")
+def verify_uploaded_runtime_source(
+    request: Path = typer.Option(..., "--request"),
+) -> None:
+    """Resume strict readback of an already-uploaded immutable runtime source."""
+
+    def operation() -> object:
+        from lehome_train.groot.runtime_mixture_publish import verify_uploaded_runtime_source_from_request
+        from lehome_train.hub import HuggingFaceHubTransport
+
+        return verify_uploaded_runtime_source_from_request(request, transport=HuggingFaceHubTransport())
+
+    _fail_closed(operation)
+
+
+@app.command("adopt-uploaded-runtime-source")
+def adopt_uploaded_runtime_source(
+    request: Path = typer.Option(..., "--request"),
+) -> None:
+    """Bind an exact immutable remote source without uploading it again."""
+
+    def operation() -> object:
+        from lehome_train.groot.runtime_mixture_publish import adopt_uploaded_runtime_source_from_request
+        from lehome_train.hub import HuggingFaceHubTransport
+
+        return adopt_uploaded_runtime_source_from_request(request, transport=HuggingFaceHubTransport())
+
+    _fail_closed(operation)
+
+
 @app.command("publish-runtime-mixture")
 def publish_runtime_mixture(
     request: Path = typer.Option(..., "--request"),

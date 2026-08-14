@@ -112,6 +112,12 @@ _SOURCE_READBACK_KEYS = {
     "repository", "immutable_revision", "remote_prefix", "fresh_readback_verified",
     "tree_listing_verified",
 }
+_SOURCE_UPLOAD_JOURNAL_KEYS = {
+    "schema_version", "kind", "repository", "immutable_revision", "remote_prefix",
+    "source_type", "round_id", "artifact_entries", "tree_listing_verified",
+    "readback_pending",
+}
+_SOURCE_READBACK_BATCH_SIZE = 800
 _DEPLOYMENT_KEYS = {
     "repository", "immutable_revision", "remote_prefix", "mixture_id",
     "pending_receipt_sha256", "artifact_entries", "fresh_readback_verified",
@@ -155,6 +161,109 @@ def _hydration_entries(value: object, *, label: str) -> tuple[SyncEntry, ...]:
     if len({entry.relative_path for entry in entries}) != len(entries):
         raise ValueError(f"{label} has duplicate artifact paths")
     return tuple(sorted(entries, key=lambda entry: entry.relative_path))
+
+
+def _source_upload_journal(path: Path) -> tuple[dict[str, object], tuple[SyncEntry, ...]]:
+    journal = _load_exact(path, keys=_SOURCE_UPLOAD_JOURNAL_KEYS, label="runtime source upload journal")
+    entries = _hydration_entries(journal.get("artifact_entries"), label="runtime source upload journal")
+    prefix = journal.get("remote_prefix")
+    source_type = journal.get("source_type")
+    round_id = journal.get("round_id")
+    expected_prefix = (
+        "bc/full" if source_type == "bc" and round_id is None
+        else f"rollouts/round-{round_id}" if source_type == "rollout" and type(round_id) is str and re.fullmatch(r"[1-9][0-9]*", round_id)
+        else None
+    )
+    if (
+        journal.get("schema_version") != 1
+        or journal.get("kind") != "runtime_source_upload_journal"
+        or journal.get("repository") != APPROVED_MIXTURE_REPOSITORY
+        or journal.get("tree_listing_verified") is not True
+        or journal.get("readback_pending") is not True
+        or prefix != expected_prefix
+    ):
+        raise ValueError("runtime source upload journal is not an exact immutable source binding")
+    _immutable_revision(journal.get("immutable_revision"), label="runtime source upload journal")
+    return journal, entries
+
+
+def _preflight_readback_root(
+    *, root: Path, readback_root: str | Path, journal: Path, receipt: Path,
+) -> Path:
+    target = Path(readback_root)
+    if not target.is_absolute() or target.is_symlink() or target.parent.is_symlink() or not target.parent.is_dir():
+        raise ValueError("runtime source readback root must be an absolute safe path")
+    if target.exists() and not target.is_dir():
+        raise ValueError("runtime source readback root must be a directory when present")
+    if (
+        _within(target, root) or _within(journal, target) or _within(receipt, target)
+        or target.resolve(strict=False) == journal.resolve(strict=False)
+        or target.resolve(strict=False) == receipt.resolve(strict=False)
+    ):
+        raise ValueError("runtime source readback root must be external and non-overlapping")
+    return target
+
+
+def _verified_readback_entries(*, root: Path, entries: tuple[SyncEntry, ...]) -> tuple[SyncEntry, ...]:
+    """Reject an unsafe or unexpected stable readback; retain exact bytes only."""
+
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise ValueError("runtime source readback root is unavailable or unsafe")
+    if not root.exists():
+        return ()
+    expected = {entry.relative_path: entry for entry in entries}
+    expected_directories = {
+        "/".join(entry.relative_path.split("/")[:depth])
+        for entry in entries
+        for depth in range(1, len(entry.relative_path.split("/")))
+    }
+    present: list[SyncEntry] = []
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        with os.scandir(current) as children:
+            for child in children:
+                relative = Path(child.path).relative_to(root).as_posix()
+                if child.is_symlink():
+                    raise ValueError("runtime source readback contains a symlink")
+                if child.is_dir(follow_symlinks=False):
+                    if relative not in expected_directories:
+                        raise ValueError("runtime source readback contains an unexpected directory")
+                    pending.append(Path(child.path))
+                    continue
+                if not child.is_file(follow_symlinks=False):
+                    raise ValueError("runtime source readback contains an unsupported path type")
+                expected_entry = expected.get(relative)
+                if expected_entry is None:
+                    raise ValueError("runtime source readback contains an unexpected file")
+                actual = SyncEntry(relative, sha256_file(Path(child.path)), child.stat(follow_symlinks=False).st_size)
+                if actual != expected_entry:
+                    raise ValueError("runtime source readback bytes are tampered or incomplete")
+                present.append(actual)
+    return tuple(sorted(present, key=lambda entry: entry.relative_path))
+
+
+def _source_prefix(*, source_type: str, round_id: str | None) -> str:
+    if source_type == "bc" and round_id is None:
+        return "bc/full"
+    if source_type == "rollout" and isinstance(round_id, str) and re.fullmatch(r"[1-9][0-9]*", round_id):
+        return f"rollouts/round-{round_id}"
+    raise ValueError("source publication type or round ID is invalid")
+
+
+def _write_source_upload_journal(
+    *, path: Path, revision: str, prefix: str, source_type: str,
+    round_id: str | None, entries: tuple[SyncEntry, ...],
+) -> dict[str, object]:
+    journal = {
+        "schema_version": 1, "kind": "runtime_source_upload_journal",
+        "repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": revision,
+        "remote_prefix": prefix, "source_type": source_type, "round_id": round_id,
+        "artifact_entries": _entry_records(entries), "tree_listing_verified": True,
+        "readback_pending": True,
+    }
+    atomic_write_json(path, journal)
+    return journal
 
 
 def _source_readback(path: Path, *, source_type: str) -> dict[str, object]:
@@ -331,32 +440,119 @@ def hydrate_runtime_mixture_from_request(path: str | Path, *, transport: HubTran
         raise
 
 
-def publish_source(*, root: str | Path, source_type: str, round_id: str | None, revision: str, receipt_path: str | Path, transport: HubTransport) -> dict[str, object]:
-    """Publish one complete mounted source tree and verify a fresh readback."""
-    if source_type == "bc" and round_id is None:
-        prefix = "bc/full"
-    elif source_type == "rollout" and isinstance(round_id, str) and re.fullmatch(r"[1-9][0-9]*", round_id):
-        prefix = f"rollouts/round-{round_id}"
-    else:
-        raise ValueError("source publication type or round ID is invalid")
+def adopt_uploaded_runtime_source(
+    *, root: str | Path, source_type: str, round_id: str | None,
+    immutable_revision: str, upload_journal_path: str | Path, transport: HubTransport,
+) -> dict[str, object]:
+    """Bind a known immutable remote source without uploading or readback."""
+
+    local = Path(root)
+    prefix = _source_prefix(source_type=source_type, round_id=round_id)
+    revision = _immutable_revision(immutable_revision, label="runtime source adoption revision")
+    journal = _preflight_receipt_destination(
+        root=local, receipt_path=upload_journal_path, label="source upload journal",
+    )
+    entries = _entries(local)
+    require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=False)
+    tree = list_repository_tree(
+        transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, max_attempts=1,
+    )
+    if not _tree_matches(tree, prefix=prefix, entries=entries):
+        raise ValueError("adopted runtime source remote tree differs from the complete local source")
+    return _write_source_upload_journal(
+        path=journal, revision=revision, prefix=prefix, source_type=source_type,
+        round_id=round_id, entries=entries,
+    )
+
+
+def verify_uploaded_runtime_source(
+    *,
+    root: str | Path,
+    upload_journal_path: str | Path,
+    readback_root: str | Path,
+    receipt_path: str | Path,
+    transport: HubTransport,
+) -> dict[str, object]:
+    """Strictly resume or complete immutable source readback without uploading."""
+
+    local = Path(root)
+    journal_path = Path(upload_journal_path)
+    receipt = _preflight_receipt_destination(
+        root=local, receipt_path=receipt_path, label="runtime source readback", disallow=(journal_path,),
+    )
+    readback = _preflight_readback_root(root=local, readback_root=readback_root, journal=journal_path, receipt=receipt)
+    journal, expected_entries = _source_upload_journal(journal_path)
+    local_entries = _entries(local)
+    if local_entries != expected_entries:
+        raise ValueError("runtime source local tree differs from the immutable upload journal")
+    revision = _immutable_revision(journal["immutable_revision"], label="runtime source upload journal")
+    prefix = str(journal["remote_prefix"])
+    require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=False)
+    tree = list_repository_tree(
+        transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, max_attempts=1,
+    )
+    if not _tree_matches(tree, prefix=prefix, entries=expected_entries):
+        raise ValueError("runtime source remote tree differs from the immutable upload journal")
+    readback.mkdir(exist_ok=True)
+    verified = _verified_readback_entries(root=readback, entries=expected_entries)
+    missing = tuple(entry.relative_path for entry in expected_entries if entry not in set(verified))
+    for start in range(0, len(missing), _SOURCE_READBACK_BATCH_SIZE):
+        batch = missing[start:start + _SOURCE_READBACK_BATCH_SIZE]
+        download_files(
+            transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+            destination=readback, relative_paths=batch, remote_prefix=prefix, max_attempts=3,
+        )
+        verified = _verified_readback_entries(root=readback, entries=expected_entries)
+    if verified != expected_entries:
+        raise ValueError("runtime source readback does not contain the complete exact tree")
+    result = {
+        "repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": revision,
+        "remote_prefix": prefix, "fresh_readback_verified": True,
+        "tree_listing_verified": True,
+    }
+    atomic_write_json(receipt, result)
+    return result
+
+
+def publish_source(
+    *, root: str | Path, source_type: str, round_id: str | None, revision: str,
+    receipt_path: str | Path, transport: HubTransport,
+    upload_journal_path: str | Path | None = None,
+    readback_root: str | Path | None = None,
+) -> dict[str, object]:
+    """Upload one source, persist its immutable journal, then verify fresh bytes.
+
+    The default locations keep small legacy callers compatible while exposing a
+    stable resumable path for large source trees through the explicit fields.
+    """
+    prefix = _source_prefix(source_type=source_type, round_id=round_id)
     if not isinstance(revision, str) or not revision:
         raise ValueError("source publication revision target is required")
     local = Path(root)
     target = _preflight_receipt_destination(root=local, receipt_path=receipt_path, label="source publication")
+    journal_path = Path(upload_journal_path) if upload_journal_path is not None else target.with_name(f"{target.stem}-upload-journal.json")
+    journal = _preflight_receipt_destination(
+        root=local, receipt_path=journal_path, label="source upload journal", disallow=(target,),
+    )
+    stable_readback = (
+        Path(readback_root) if readback_root is not None
+        else target.parent / f"{target.stem}-readback"
+    )
+    _preflight_readback_root(root=local, readback_root=stable_readback, journal=journal, receipt=target)
     entries = _entries(local)
     require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=True)
     revision = upload_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, source=local, entries=entries, remote_prefix=prefix, max_attempts=1)
     tree = list_repository_tree(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, max_attempts=1)
     if not _tree_matches(tree, prefix=prefix, entries=entries):
         raise ValueError("source publication remote tree differs from the complete local source")
-    with tempfile.TemporaryDirectory(prefix="lehome-runtime-readback-") as temporary:
-        readback = Path(temporary)
-        download_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, destination=readback, relative_paths=tuple(item.relative_path for item in entries), remote_prefix=prefix, max_attempts=1)
-        if _entries(readback) != entries:
-            raise ValueError("source publication readback hash or size mismatch")
-    receipt = {"repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": revision, "remote_prefix": prefix, "fresh_readback_verified": True, "tree_listing_verified": True}
-    atomic_write_json(target, receipt)
-    return receipt
+    _write_source_upload_journal(
+        path=journal, revision=revision, prefix=prefix, source_type=source_type,
+        round_id=round_id, entries=entries,
+    )
+    return verify_uploaded_runtime_source(
+        root=local, upload_journal_path=journal, readback_root=stable_readback,
+        receipt_path=target, transport=transport,
+    )
 
 
 def publish_pending_mixture(*, pending_root: str | Path, revision: str, receipt_path: str | Path, transport: HubTransport) -> dict[str, object]:
@@ -485,17 +681,53 @@ def publish_source_from_request(path: str | Path, *, transport: HubTransport) ->
 
     request = _load_exact(Path(path), keys={"schema_version", "command", "arguments"}, label="runtime source publication request")
     arguments = request["arguments"]
-    expected = {"root", "source_type", "round_id", "revision", "receipt_path"}
+    legacy = {"root", "source_type", "round_id", "revision", "receipt_path"}
+    resumable = legacy | {"upload_journal_path", "readback_root"}
     if (
         request["schema_version"] != 1
         or request["command"] != "publish-runtime-source"
+        or not isinstance(arguments, dict)
+        or frozenset(arguments) not in {frozenset(legacy), frozenset(resumable)}
+        or any(type(arguments[key]) is not str or not arguments[key] for key in set(arguments) - {"round_id"})
+        or (arguments["round_id"] is not None and (type(arguments["round_id"]) is not str or not arguments["round_id"]))
+    ):
+        raise ValueError("runtime source publication request has an incompatible schema")
+    return publish_source(**arguments, transport=transport)
+
+
+def verify_uploaded_runtime_source_from_request(path: str | Path, *, transport: HubTransport) -> dict[str, object]:
+    """Run no-upload source verification from one exact reviewable envelope."""
+
+    request = _load_exact(Path(path), keys={"schema_version", "command", "arguments"}, label="runtime source verification request")
+    arguments = request["arguments"]
+    expected = {"root", "upload_journal_path", "readback_root", "receipt_path"}
+    if (
+        request["schema_version"] != 1
+        or request["command"] != "verify-uploaded-runtime-source"
+        or not isinstance(arguments, dict)
+        or set(arguments) != expected
+        or any(type(arguments[key]) is not str or not arguments[key] for key in expected)
+    ):
+        raise ValueError("runtime source verification request has an incompatible schema")
+    return verify_uploaded_runtime_source(**arguments, transport=transport)
+
+
+def adopt_uploaded_runtime_source_from_request(path: str | Path, *, transport: HubTransport) -> dict[str, object]:
+    """Create an upload journal for an exact pre-existing immutable source."""
+
+    request = _load_exact(Path(path), keys={"schema_version", "command", "arguments"}, label="runtime source adoption request")
+    arguments = request["arguments"]
+    expected = {"root", "source_type", "round_id", "immutable_revision", "upload_journal_path"}
+    if (
+        request["schema_version"] != 1
+        or request["command"] != "adopt-uploaded-runtime-source"
         or not isinstance(arguments, dict)
         or set(arguments) != expected
         or any(type(arguments[key]) is not str or not arguments[key] for key in expected - {"round_id"})
         or (arguments["round_id"] is not None and (type(arguments["round_id"]) is not str or not arguments["round_id"]))
     ):
-        raise ValueError("runtime source publication request has an incompatible schema")
-    return publish_source(**arguments, transport=transport)
+        raise ValueError("runtime source adoption request has an incompatible schema")
+    return adopt_uploaded_runtime_source(**arguments, transport=transport)
 
 
 def publish_pending_mixture_from_request(path: str | Path, *, transport: HubTransport) -> dict[str, object]:
