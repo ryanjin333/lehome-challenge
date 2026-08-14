@@ -333,9 +333,30 @@ def _safe_file(root: Path, relative: str, *, label: str) -> Path:
 
 def _validate_mounts(path: Path, manifest: MixtureManifest) -> dict[str, Path]:
     document = _load_object(path, label="mount descriptor")
-    _exact(document, {"schema_version", "mounts"}, label="mount descriptor")
-    if document["schema_version"] != 1 or not isinstance(document["mounts"], list):
+    _exact(document, {"schema_version", "repository", "revision", "safe_prefix", "release_receipt_path", "release_receipt_sha256", "mounts"}, label="mount descriptor")
+    if document["schema_version"] != 2 or not isinstance(document["mounts"], list):
         raise ValueError("mount descriptor is invalid")
+    if (
+        document["repository"] != manifest.repository
+        or document["revision"] != manifest.revision
+        or document["safe_prefix"] != manifest.safe_prefix
+    ):
+        raise ValueError("mount release identity does not match the immutable runtime manifest")
+    receipt_value = document["release_receipt_path"]
+    if type(receipt_value) is not str or not Path(receipt_value).is_absolute():
+        raise ValueError("mount release receipt path must be absolute")
+    receipt_path = Path(receipt_value)
+    if receipt_path.is_symlink() or not receipt_path.is_file() or sha256_file(receipt_path) != _digest(document["release_receipt_sha256"], label="mount release receipt hash"):
+        raise ValueError("mount release receipt drift")
+    receipt = _load_object(receipt_path, label="mount release receipt")
+    if (
+        receipt.get("repository") != manifest.repository
+        or receipt.get("immutable_revision") != manifest.revision
+        or receipt.get("remote_prefix") != manifest.safe_prefix
+        or receipt.get("fresh_readback_verified") is not True
+        or receipt.get("tree_listing_verified") is not True
+    ):
+        raise ValueError("mount release receipt does not prove a fresh immutable readback")
     required = {source.source_id: source for source in manifest.sources}
     mounts: dict[str, Path] = {}
     for entry in document["mounts"]:
@@ -363,6 +384,46 @@ def _validate_mounts(path: Path, manifest: MixtureManifest) -> dict[str, Path]:
     if set(mounts) != set(required):
         raise ValueError("mounts have missing or extra source IDs")
     return mounts
+
+
+def _string_id_set(value: object, *, label: str) -> set[str]:
+    if not isinstance(value, list) or any(type(item) is not str or not item for item in value):
+        raise ValueError(f"{label} must be a non-empty string ID list")
+    result = set(value)
+    if len(result) != len(value):
+        raise ValueError(f"{label} has duplicate IDs")
+    return result
+
+
+def _validate_source_provenance(contract: RuntimeContract) -> None:
+    """Bind every window to the authenticated source split/acceptance ledger."""
+    by_source: dict[str, list[Window]] = {}
+    for window in contract.windows:
+        by_source.setdefault(window.source_id, []).append(window)
+    for source in contract.manifest.sources:
+        root = contract.mounts[source.source_id]
+        identity = source.source_identity
+        manifest_name = "prepared_manifest_path" if source.source_type == "bc" else "round_manifest_path"
+        document = _load_object(_safe_file(root, str(identity[manifest_name]), label="source provenance manifest"), label="source provenance manifest")
+        windows = by_source.get(source.source_id, [])
+        if source.source_type == "bc":
+            train = _string_id_set(document.get("train_episode_ids"), label="BC prepared train episode IDs")
+            validation = _string_id_set(document.get("validation_episode_ids"), label="BC prepared validation episode IDs")
+            if train & validation:
+                raise ValueError("BC prepared train and validation episode IDs overlap")
+            for window in windows:
+                expected = train if window.split == "train" else validation
+                if window.source_episode_id not in expected:
+                    raise ValueError("BC window split does not match the authenticated prepared manifest")
+        elif source.source_type == "rollout":
+            accepted = _string_id_set(document.get("accepted_attempt_ids"), label="rollout accepted attempt IDs")
+            for window in windows:
+                if window.source_episode_id not in accepted:
+                    raise ValueError("rollout window is absent from the authenticated accepted-attempt allowlist")
+        elif source.quota:
+            # The manifest quota check normally catches this first; keep the
+            # provenance layer independently fail-closed for future schemas.
+            raise ValueError("DAgger runtime data is forbidden for this campaign")
 
 
 def load_runtime_contract(manifest_path: str | os.PathLike[str], mounts_path: str | os.PathLike[str]) -> RuntimeContract:
@@ -408,7 +469,9 @@ def load_runtime_contract(manifest_path: str | os.PathLike[str], mounts_path: st
         hash_name = "prepared_manifest_sha256" if source.source_type == "bc" else "round_manifest_sha256"
         if sha256_file(_safe_file(mounts[source.source_id], str(identity[path_name]), label="source identity manifest")) != identity[hash_name]:
             raise ValueError("source identity manifest drift")
-    return RuntimeContract(manifest, windows, mounts, normalization_value)
+    contract = RuntimeContract(manifest, windows, mounts, normalization_value)
+    _validate_source_provenance(contract)
+    return contract
 
 
 @dataclass(frozen=True, slots=True)

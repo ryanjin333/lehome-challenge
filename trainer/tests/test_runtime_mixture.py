@@ -44,7 +44,7 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
     for root in (bc, round_root):
         _write(root / "receipt.json", {"accepted": True})
         _write(root / "acceptance.json", {"accepted_success": True})
-    _write(bc / "manifest.json", {"fps": 30, "fixed_language_instruction": "fold the garment on the table", "future_actions": {"horizon": 16}})
+    _write(bc / "manifest.json", {"fps": 30, "fixed_language_instruction": "fold the garment on the table", "future_actions": {"horizon": 16}, "train_episode_ids": [str(index) for index in range(7)], "validation_episode_ids": []})
     # The loader test injects decoding, so opaque video bytes are enough for contract coverage.
     for episode in range(7):
         _write(bc / f"episodes/{episode}.json", {"episode_id": str(episode)})
@@ -55,7 +55,7 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
         {"source_id": "bc", "source_type": "bc", "quota": 7, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(bc), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(bc / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(bc / "acceptance.json"), "source_identity": {"prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": _sha_path(bc / "manifest.json"), "action_source": "organizer_expert"}},
         {"source_id": "round-1", "source_type": "rollout", "quota": 3, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(round_root), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(round_root / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(round_root / "acceptance.json"), "source_identity": {"round_manifest_path": "round.json", "round_manifest_sha256": "a" * 64, "action_source": "policy"}},
     ]
-    _write(round_root / "round.json", {"round_id": "round-1"})
+    _write(round_root / "round.json", {"round_id": "round-1", "accepted_attempt_ids": [f"attempt-{index}" for index in range(3)]})
     sources[1]["source_identity"]["round_manifest_sha256"] = _sha_path(round_root / "round.json")
     # The round identity file arrived after the source tree was first measured.
     sources[1]["source_tree_sha256"] = source_tree_sha256(round_root)
@@ -71,8 +71,10 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
     manifest["window_index"] = {"path": "windows.json", "sha256": sha256_file(index_path), "byte_size": index_path.stat().st_size}
     manifest_path = tmp_path / "mixture.json"
     _write(manifest_path, manifest)
+    release_receipt = tmp_path / "release-receipt.json"
+    _write(release_receipt, {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40, "remote_prefix": "runtime-mixtures/phase-2", "fresh_readback_verified": True, "tree_listing_verified": True})
     mounts = tmp_path / "mounts.json"
-    _write(mounts, {"schema_version": 1, "mounts": [{"source_id": source["source_id"], "root": str(root), "source_tree_sha256": source["source_tree_sha256"], "artifact_receipt_sha256": source["artifact_receipt_sha256"]} for source, root in zip(sources, (bc, round_root), strict=True)]})
+    _write(mounts, {"schema_version": 2, "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40, "safe_prefix": "runtime-mixtures/phase-2", "release_receipt_path": str(release_receipt), "release_receipt_sha256": _sha_path(release_receipt), "mounts": [{"source_id": source["source_id"], "root": str(root), "source_tree_sha256": source["source_tree_sha256"], "artifact_receipt_sha256": source["artifact_receipt_sha256"]} for source, root in zip(sources, (bc, round_root), strict=True)]})
     return manifest_path, index_path, mounts
 
 
@@ -151,6 +153,44 @@ def test_manifest_accepts_only_the_campaign_private_repository(tmp_path: Path) -
     payload["repository"] = "private/lehome-training"
     _write(manifest, payload)
     with pytest.raises(ValueError, match="approved private repository"):
+        load_runtime_contract(manifest, mounts)
+
+
+def test_mount_descriptor_requires_a_fresh_readback_of_the_exact_runtime_release(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture import load_runtime_contract
+
+    manifest, _index, mounts = _contract(tmp_path)
+    descriptor = json.loads(mounts.read_text())
+    descriptor["revision"] = "b" * 40
+    _write(mounts, descriptor)
+    with pytest.raises(ValueError, match="mount release identity"):
+        load_runtime_contract(manifest, mounts)
+
+
+def test_provenance_rejects_bc_validation_or_unaccepted_rollout_windows(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture import canonical_json_sha256, load_runtime_contract, source_tree_sha256
+
+    manifest, index, mounts = _contract(tmp_path)
+    prepared = tmp_path / "bc" / "manifest.json"
+    document = json.loads(prepared.read_text())
+    document["train_episode_ids"] = [str(index) for index in range(6)]
+    document["validation_episode_ids"] = ["6"]
+    _write(prepared, document)
+    payload = json.loads(manifest.read_text())
+    payload["sources"][0]["source_identity"]["prepared_manifest_sha256"] = _sha_path(prepared)
+    payload["sources"][0]["source_tree_sha256"] = source_tree_sha256(tmp_path / "bc")
+    binding = dict(payload)
+    binding["window_index"] = {"path": "windows.json", "sha256": "", "byte_size": 0}
+    index_payload = json.loads(index.read_text())
+    index_payload["manifest_sha256"] = canonical_json_sha256(binding)
+    _write(index, index_payload)
+    payload["window_index"]["sha256"] = _sha_path(index)
+    payload["window_index"]["byte_size"] = index.stat().st_size
+    _write(manifest, payload)
+    mounts_payload = json.loads(mounts.read_text())
+    mounts_payload["mounts"][0]["source_tree_sha256"] = payload["sources"][0]["source_tree_sha256"]
+    _write(mounts, mounts_payload)
+    with pytest.raises(ValueError, match="BC window split"):
         load_runtime_contract(manifest, mounts)
 
 
