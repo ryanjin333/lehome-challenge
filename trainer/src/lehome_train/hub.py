@@ -23,6 +23,7 @@ _INITIAL_RETRY_DELAY_SECONDS = 0.25
 _MAX_RETRY_DELAY_SECONDS = 1.0
 _RATE_LIMIT_RETRY_DELAY_SECONDS = 300.0
 _MAX_PARALLEL_DOWNLOADS = 16
+_MAX_LARGE_UPLOAD_WORKERS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +82,17 @@ class HubTransport(Protocol):
         token: str,
         remote_prefix: str | None = None,
     ) -> str: ...
+
+    def upload_large_folder(
+        self,
+        *,
+        repository: str,
+        revision: str,
+        source: Path,
+        entries: tuple[SyncEntry, ...],
+        token: str,
+        max_workers: int,
+    ) -> None: ...
 
     def download_files(
         self,
@@ -464,6 +476,55 @@ class HuggingFaceHubTransport:
                     raise HubTransientError("Hub upload timed out") from None
                 raise error
 
+    def upload_large_folder(
+        self,
+        *,
+        repository: str,
+        revision: str,
+        source: Path,
+        entries: tuple[SyncEntry, ...],
+        token: str,
+        max_workers: int,
+    ) -> None:
+        """Resume one caller-staged allowlist without using ``path_in_repo``.
+
+        ``huggingface_hub`` manages its resumable state below ``folder_path``.
+        The caller therefore stages the desired remote prefix into a private,
+        external root and this adapter permits only those fully-prefixed files.
+        """
+
+        if (
+            type(max_workers) is not int
+            or not 1 <= max_workers <= _MAX_LARGE_UPLOAD_WORKERS
+        ):
+            raise ValueError("Hub large upload workers must be bounded")
+        if source.is_symlink() or not source.is_dir():
+            raise ValueError("Hub large upload source must be a safe directory")
+        allowed: list[str] = []
+        for entry in entries:
+            validate_artifact_relative_path(entry.relative_path)
+            if any(component.startswith(".") for component in entry.relative_path.split("/")):
+                raise ValueError("Hub large upload allowlist cannot include hidden paths")
+            path = source / entry.relative_path
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("Hub large upload allowlist file is unavailable")
+            allowed.append(entry.relative_path)
+        if not allowed or len(set(allowed)) != len(allowed):
+            raise ValueError("Hub large upload requires one exact non-empty allowlist")
+        try:
+            self._api(token).upload_large_folder(
+                repo_id=repository,
+                repo_type=self._repo_type(repository),
+                revision=revision,
+                folder_path=str(source),
+                allow_patterns=allowed,
+                ignore_patterns=[".cache", ".cache/**", ".huggingface", ".huggingface/**"],
+                token=token,
+                num_workers=max_workers,
+            )
+        except (ConnectionError, TimeoutError):
+            raise HubTransientError("Hub large upload interrupted") from None
+
     def download_files(
         self,
         *,
@@ -728,6 +789,59 @@ def upload_files(
     if not isinstance(resolved, str) or not _COMMIT_REVISION.fullmatch(resolved):
         raise ValueError("Hub upload did not resolve to an immutable revision")
     return resolved
+
+
+def upload_large_folder(
+    *,
+    transport: HubTransport,
+    repository: str,
+    revision: str,
+    source: str | Path,
+    entries: tuple[SyncEntry, ...],
+    environ: Mapping[str, str] | None = None,
+    max_workers: int = 4,
+) -> None:
+    """Start or resume an explicit large upload without masking interruption state."""
+
+    if type(max_workers) is not int or not 1 <= max_workers <= _MAX_LARGE_UPLOAD_WORKERS:
+        raise ValueError("Hub large upload workers must be bounded")
+    token = _process_token(environ)
+    try:
+        transport.upload_large_folder(
+            repository=repository,
+            revision=revision,
+            source=Path(source),
+            entries=entries,
+            token=token,
+            max_workers=max_workers,
+        )
+    except HubTransientError:
+        raise RuntimeError("Hub large upload interrupted") from None
+    except Exception:
+        raise RuntimeError("Hub large upload failed") from None
+
+
+def resolve_approved_ref(
+    *,
+    transport: HubTransport,
+    repository: str,
+    ref: str,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the post-upload target ref to the immutable commit used for proof."""
+
+    token = _process_token(environ)
+    try:
+        revision = transport.resolve_approved_ref(
+            repository=repository,
+            ref=ref,
+            token=token,
+        )
+    except Exception:
+        raise RuntimeError("Hub branch resolution failed") from None
+    if not isinstance(revision, str) or not _COMMIT_REVISION.fullmatch(revision):
+        raise ValueError("Hub branch did not resolve to an immutable revision")
+    return revision
 
 
 def download_files(

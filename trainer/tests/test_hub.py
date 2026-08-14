@@ -454,6 +454,37 @@ def test_real_transport_recovers_branch_head_after_post_commit_failure(
     assert resolved == revision
 
 
+def test_real_transport_uses_resumable_large_upload_without_path_in_repo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    calls: list[dict[str, object]] = []
+    source = tmp_path / "staging"
+    payload = source / "rollouts" / "round-1" / "payload.bin"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"payload")
+    entries = (SyncEntry("rollouts/round-1/payload.bin", "0" * 64, len(b"payload")),)
+    monkeypatch.setattr(
+        transport,
+        "_api",
+        lambda _token: SimpleNamespace(upload_large_folder=lambda **kwargs: calls.append(kwargs)),
+    )
+
+    transport.upload_large_folder(
+        repository="ryanjin333/lehome-groot-n17-data", revision="main", source=source,
+        entries=entries, token="hf_large_upload_process_token", max_workers=4,
+    )
+
+    assert calls == [{
+        "repo_id": "ryanjin333/lehome-groot-n17-data", "repo_type": "dataset",
+        "revision": "main", "folder_path": str(source),
+        "allow_patterns": ["rollouts/round-1/payload.bin"],
+        "ignore_patterns": [".cache", ".cache/**", ".huggingface", ".huggingface/**"],
+        "token": "hf_large_upload_process_token", "num_workers": 4,
+    }]
+
+
 def test_download_requires_and_preserves_an_explicit_immutable_revision(
     tmp_path: Path,
 ) -> None:

@@ -28,6 +28,8 @@ class MemoryTransport:
         self.expected_revision = expected_revision
         self.remote: dict[str, bytes] = {}
         self.calls: list[tuple[str, str, str | None]] = []
+        self.large_uploads: list[dict[str, object]] = []
+        self.branch_head = REVISION
         self.downloaded_files = 0
         self.download_batches: list[tuple[str, ...]] = []
 
@@ -51,6 +53,44 @@ class MemoryTransport:
         if self.fault == "extra-remote-file":
             self.remote[f"{remote_prefix}/unexpected.bin"] = b"unexpected"
         return REVISION
+
+    def upload_large_folder(
+        self, *, repository: str, revision: str, source: Path, entries, token: str,
+        max_workers: int,
+    ) -> None:
+        """Provider-like resumable large upload, deliberately without a prefix API."""
+
+        assert repository == REPOSITORY and token == TOKEN
+        assert 1 <= max_workers <= 8
+        staged = tuple(entries)
+        assert staged and all(entry.relative_path.startswith("rollouts/round-1/") for entry in staged)
+        assert all(not entry.relative_path.startswith(".cache/") for entry in staged)
+        self.large_uploads.append({
+            "revision": revision,
+            "source": source,
+            "entries": staged,
+            "cache_present": (source / ".cache").exists(),
+            "payloads": {entry.relative_path: (source / entry.relative_path).read_bytes() for entry in staged},
+        })
+        if self.fault == "large-interrupt":
+            self.remote.update({
+                entry.relative_path: (source / entry.relative_path).read_bytes()
+                for entry in staged[:1]
+            })
+            cache = source / ".cache" / "huggingface"
+            cache.mkdir(parents=True, exist_ok=True)
+            (cache / "resume-state").write_bytes(b"resume")
+            raise HubTransientError("resumable upload interrupted")
+        if self.fault != "large-stale-head":
+            self.remote.update({
+                entry.relative_path: (source / entry.relative_path).read_bytes()
+                for entry in staged
+            })
+
+    def resolve_approved_ref(self, *, repository: str, ref: str, token: str) -> str:
+        assert repository == REPOSITORY and token == TOKEN
+        self.calls.append(("resolve", ref, None))
+        return self.branch_head
 
     def list_tree(self, *, repository: str, revision: str, token: str) -> tuple[HubTreeEntry, ...]:
         assert repository == REPOSITORY and token == TOKEN
@@ -106,6 +146,89 @@ def test_source_publisher_proves_complete_remote_tree_and_fresh_bytes_without_mu
     }
     assert source_tree_sha256(source) == before
     assert receipt_path.is_file() and not (source / "bc.json").exists()
+
+
+def test_large_source_stages_only_the_exact_prefixed_allowlist_then_binds_the_final_head(
+    tmp_path: Path,
+) -> None:
+    from lehome_train.groot.runtime_mixture import source_tree_sha256
+    from lehome_train.groot.runtime_mixture_publish import publish_source
+
+    source = tmp_path / "source"
+    _source(source)
+    before = source_tree_sha256(source)
+    staging = tmp_path / "external-resumable-state"
+    transport = MemoryTransport()
+
+    receipt = publish_source(
+        root=source, source_type="rollout", round_id="1", revision="main",
+        receipt_path=tmp_path / "receipt.json", upload_journal_path=tmp_path / "journal.json",
+        readback_root=tmp_path / "readback", large_upload=True,
+        large_upload_staging_root=staging, transport=transport,
+    )
+
+    assert receipt["immutable_revision"] == REVISION
+    assert source_tree_sha256(source) == before
+    assert not [call for call in transport.calls if call[0] == "upload"]
+    assert transport.calls.count(("resolve", "main", None)) == 1
+    assert len(transport.large_uploads) == 1
+    upload = transport.large_uploads[0]
+    assert upload["revision"] == "main" and upload["cache_present"] is False
+    assert set(upload["payloads"]) == {
+        "rollouts/round-1/manifest.json", "rollouts/round-1/nested/payload.bin",
+    }
+    assert not any(path.startswith(".cache/") for path in upload["payloads"])
+
+
+def test_large_source_interruption_preserves_external_staging_for_retry_but_no_receipt(
+    tmp_path: Path,
+) -> None:
+    from lehome_train.groot.runtime_mixture_publish import publish_source
+
+    source = tmp_path / "source"
+    _source(source)
+    staging, journal, receipt = tmp_path / "external-state", tmp_path / "journal.json", tmp_path / "receipt.json"
+    transport = MemoryTransport(fault="large-interrupt")
+    arguments = {
+        "root": source, "source_type": "rollout", "round_id": "1", "revision": "main",
+        "receipt_path": receipt, "upload_journal_path": journal, "readback_root": tmp_path / "readback",
+        "large_upload": True, "large_upload_staging_root": staging, "transport": transport,
+    }
+
+    with pytest.raises(RuntimeError, match="large"):
+        publish_source(**arguments)
+
+    assert (staging / ".cache" / "huggingface" / "resume-state").is_file()
+    assert not journal.exists() and not receipt.exists()
+    assert len(transport.large_uploads) == 1
+
+    transport.fault = None
+    result = publish_source(**arguments)
+
+    assert result["fresh_readback_verified"] is True
+    assert len(transport.large_uploads) == 2
+    assert transport.large_uploads[1]["cache_present"] is True
+
+
+def test_large_source_rejects_an_unchanged_stale_branch_head_before_journal_or_receipt(
+    tmp_path: Path,
+) -> None:
+    from lehome_train.groot.runtime_mixture_publish import publish_source
+
+    source = tmp_path / "source"
+    _source(source)
+    journal, receipt = tmp_path / "journal.json", tmp_path / "receipt.json"
+    transport = MemoryTransport(fault="large-stale-head")
+
+    with pytest.raises(ValueError, match="tree|remote"):
+        publish_source(
+            root=source, source_type="rollout", round_id="1", revision="main",
+            receipt_path=receipt, upload_journal_path=journal, readback_root=tmp_path / "readback",
+            large_upload=True, large_upload_staging_root=tmp_path / "external-state",
+            transport=transport,
+        )
+
+    assert not journal.exists() and not receipt.exists()
 
 
 def test_source_readback_resumes_fixed_safe_batches_after_rate_limit_without_reuploading(
@@ -486,6 +609,28 @@ def test_publish_request_envelopes_are_exact_and_use_injected_transport(tmp_path
     _write(request, {"schema_version": 1, "command": "publish-runtime-source", "arguments": {"root": str(source), "source_type": "bc", "round_id": None, "revision": "draft", "receipt_path": str(tmp_path / "other.json"), "repository": REPOSITORY}})
     with pytest.raises(ValueError, match="incompatible|unknown"):
         publish_source_from_request(request, transport=MemoryTransport())
+
+
+def test_large_source_publish_request_requires_the_explicit_external_staging_contract(
+    tmp_path: Path,
+) -> None:
+    from lehome_train.groot.runtime_mixture_publish import publish_source_from_request
+
+    source = tmp_path / "source"
+    _source(source)
+    request = tmp_path / "request.json"
+    _write(request, {
+        "schema_version": 1, "command": "publish-runtime-source", "arguments": {
+            "root": str(source), "source_type": "rollout", "round_id": "1", "revision": "main",
+            "receipt_path": str(tmp_path / "receipt.json"),
+            "upload_journal_path": str(tmp_path / "journal.json"),
+            "readback_root": str(tmp_path / "readback"),
+            "large_upload": True,
+            "large_upload_staging_root": str(tmp_path / "external-state"),
+        },
+    })
+
+    assert publish_source_from_request(request, transport=MemoryTransport())["immutable_revision"] == REVISION
 
 
 def test_pending_and_finalization_request_envelopes_use_the_same_fake_transport(tmp_path: Path) -> None:

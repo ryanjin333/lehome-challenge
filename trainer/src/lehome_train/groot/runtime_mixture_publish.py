@@ -23,7 +23,15 @@ from lehome_train.groot.runtime_mixture import (
     pending_mixture_id,
     source_tree_sha256,
 )
-from lehome_train.hub import HubTransport, require_access, upload_files, download_files, list_repository_tree
+from lehome_train.hub import (
+    HubTransport,
+    download_files,
+    list_repository_tree,
+    require_access,
+    resolve_approved_ref,
+    upload_files,
+    upload_large_folder,
+)
 from lehome_train.io import atomic_write_json, canonical_json_sha256, sha256_file
 from lehome_train.models import SyncEntry
 from lehome_train.redaction import generate_upload_allowlist
@@ -50,6 +58,64 @@ def _entries(root: Path) -> tuple[SyncEntry, ...]:
     if not paths:
         raise ValueError("publication tree is empty")
     return generate_upload_allowlist(root, tuple(sorted(paths)))
+
+
+def _stage_large_source(
+    *, root: Path, staging_root: str | Path, prefix: str, entries: tuple[SyncEntry, ...],
+    disallow: tuple[Path, ...],
+) -> tuple[Path, tuple[SyncEntry, ...]]:
+    """Materialize only approved source files below the target remote prefix."""
+
+    staging = Path(staging_root)
+    if (
+        not staging.is_absolute()
+        or staging.is_symlink()
+        or (staging.exists() and not staging.is_dir())
+        or staging.parent.is_symlink()
+        or not staging.parent.is_dir()
+        or _within(staging, root)
+        or _within(root, staging)
+        or any(_within(item, staging) or _within(staging, item) for item in disallow)
+    ):
+        raise ValueError("large source upload staging root must be an external safe directory")
+    if not staging.exists():
+        staging.mkdir()
+
+    staged = staging
+    for component in prefix.split("/"):
+        staged /= component
+        if staged.exists():
+            if staged.is_symlink() or not staged.is_dir():
+                raise ValueError("large source upload staging hierarchy is unsafe")
+        else:
+            staged.mkdir()
+
+    staged_entries = tuple(
+        SyncEntry(f"{prefix}/{entry.relative_path}", entry.sha256, entry.byte_size)
+        for entry in entries
+    )
+    if any(staged.iterdir()):
+        if _entries(staged) != entries:
+            raise ValueError("large source upload staging tree differs from the exact allowlist")
+        return staging, staged_entries
+
+    for entry in entries:
+        source = root / entry.relative_path
+        target = staged / entry.relative_path
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("large source upload allowlist file is unavailable")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source, target, follow_symlinks=False)
+        except OSError:
+            shutil.copyfile(source, target, follow_symlinks=False)
+        if target.is_symlink() or not target.is_file() or SyncEntry(
+            entry.relative_path, sha256_file(target), target.stat(follow_symlinks=False).st_size,
+        ) != entry:
+            raise ValueError("large source upload staging copy differs from the exact allowlist")
+    if _entries(staged) != entries:
+        raise ValueError("large source upload staging tree differs from the exact allowlist")
+    return staging, staged_entries
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -118,6 +184,7 @@ _SOURCE_UPLOAD_JOURNAL_KEYS = {
     "readback_pending",
 }
 _SOURCE_READBACK_BATCH_SIZE = 800
+_LARGE_SOURCE_UPLOAD_WORKERS = 4
 _DEPLOYMENT_KEYS = {
     "repository", "immutable_revision", "remote_prefix", "mixture_id",
     "pending_receipt_sha256", "artifact_entries", "fresh_readback_verified",
@@ -519,6 +586,8 @@ def publish_source(
     receipt_path: str | Path, transport: HubTransport,
     upload_journal_path: str | Path | None = None,
     readback_root: str | Path | None = None,
+    large_upload: bool = False,
+    large_upload_staging_root: str | Path | None = None,
 ) -> dict[str, object]:
     """Upload one source, persist its immutable journal, then verify fresh bytes.
 
@@ -540,8 +609,28 @@ def publish_source(
     )
     _preflight_readback_root(root=local, readback_root=stable_readback, journal=journal, receipt=target)
     entries = _entries(local)
+    if type(large_upload) is not bool:
+        raise ValueError("large source upload flag must be boolean")
+    if large_upload != (large_upload_staging_root is not None):
+        raise ValueError("large source upload requires one external staging root")
     require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=True)
-    revision = upload_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, source=local, entries=entries, remote_prefix=prefix, max_attempts=1)
+    if large_upload:
+        staging, staged_entries = _stage_large_source(
+            root=local, staging_root=large_upload_staging_root, prefix=prefix, entries=entries,
+            disallow=(target, journal, stable_readback),
+        )
+        upload_large_folder(
+            transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+            source=staging, entries=staged_entries, max_workers=_LARGE_SOURCE_UPLOAD_WORKERS,
+        )
+        revision = resolve_approved_ref(
+            transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, ref=revision,
+        )
+    else:
+        revision = upload_files(
+            transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+            source=local, entries=entries, remote_prefix=prefix, max_attempts=1,
+        )
     tree = list_repository_tree(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, max_attempts=1)
     if not _tree_matches(tree, prefix=prefix, entries=entries):
         raise ValueError("source publication remote tree differs from the complete local source")
@@ -683,13 +772,15 @@ def publish_source_from_request(path: str | Path, *, transport: HubTransport) ->
     arguments = request["arguments"]
     legacy = {"root", "source_type", "round_id", "revision", "receipt_path"}
     resumable = legacy | {"upload_journal_path", "readback_root"}
+    large = resumable | {"large_upload", "large_upload_staging_root"}
     if (
         request["schema_version"] != 1
         or request["command"] != "publish-runtime-source"
         or not isinstance(arguments, dict)
-        or frozenset(arguments) not in {frozenset(legacy), frozenset(resumable)}
-        or any(type(arguments[key]) is not str or not arguments[key] for key in set(arguments) - {"round_id"})
+        or frozenset(arguments) not in {frozenset(legacy), frozenset(resumable), frozenset(large)}
+        or any(type(arguments[key]) is not str or not arguments[key] for key in set(arguments) - {"round_id", "large_upload"})
         or (arguments["round_id"] is not None and (type(arguments["round_id"]) is not str or not arguments["round_id"]))
+        or (set(arguments) == large and arguments["large_upload"] is not True)
     ):
         raise ValueError("runtime source publication request has an incompatible schema")
     return publish_source(**arguments, transport=transport)
