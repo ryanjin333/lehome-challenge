@@ -427,11 +427,20 @@ def _await_runtime_instance_absence(
     if type(max_polls) is not int or max_polls <= 0:
         raise ValueError("runtime absence readback poll bound is invalid")
     for poll in range(max_polls):
-        if _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id))) in ({}, None):
+        if _runtime_instance_is_absent(
+            _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+        ):
             return True
         if poll + 1 < max_polls:
             sleep(5.0)
     return False
+
+
+def _runtime_instance_is_absent(value: object) -> bool:
+    """Recognize only the canonical absent forms returned by Vast raw JSON."""
+    return value is None or (type(value) is dict and not value) or (
+        type(value) is dict and set(value) == {"instances"} and value["instances"] is None
+    )
 
 
 def _runtime_pilot_cleanup(
@@ -1392,6 +1401,8 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
 
 def destroy_runtime_cpu_pilot(
     *, instance_id: int, lifecycle_receipt: Mapping[str, object], runner: Runner,
+    max_absence_polls: int = RUNTIME_ABSENCE_READBACK_POLLS,
+    sleep: Callable[[float], None] = _bounded_sleep,
 ) -> dict[str, object]:
     """Allow disposal only after the exact instance-bound measured pilot receipt."""
     if type(instance_id) is not int or lifecycle_receipt.get("kind") != "runtime_mixture_cpu_pilot_lifecycle":
@@ -1408,8 +1419,9 @@ def destroy_runtime_cpu_pilot(
     if any(lifecycle_receipt.get(key) != value for key, value in expected.items()) or re.fullmatch(r"[0-9a-f]{64}", str(lifecycle_receipt.get("provider_response_sha256"))) is None or re.fullmatch(r"[0-9a-f]{64}", str(lifecycle_receipt.get("code_bundle_sha256"))) is None or re.fullmatch(r"[0-9a-f]{64}", str(lifecycle_receipt.get("deployment_receipt_sha256"))) is None or any(re.fullmatch(r"[0-9a-f]{40}", str(lifecycle_receipt.get(key))) is None for key in ("code_revision", "bc_revision", "rollout_revision", "deployment_revision")) or proof.get("provider_instance_id") != instance_id or proof.get("provider_response_sha256") != lifecycle_receipt.get("provider_response_sha256") or proof.get("platform_arch") != "x86_64" or proof.get("image_digest") != BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2] or any(proof.get(key) != lifecycle_receipt.get(key) for key in ("code_revision", "code_bundle_sha256", "bc_revision", "rollout_revision", "deployment_revision")):
         raise ValueError("runtime CPU pilot destroy receipt is not bound to its authenticated pilot")
     runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
-    absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
-    if absent not in ({}, None):
+    if not _await_runtime_instance_absence(
+        instance_id=instance_id, runner=runner, max_polls=max_absence_polls, sleep=sleep,
+    ):
         raise ValueError("runtime CPU pilot destroy absence readback failed")
     return {"paid_action": True, "destroy_authorized": True, "instance_id": instance_id}
 
@@ -1670,8 +1682,9 @@ def destroy_runtime_checkpoint_completion(
     from lehome_train.groot.runtime_checkpoint_lifecycle import authorize_runtime_mixture_disposal
     authorization = authorize_runtime_mixture_disposal(instance_id=str(instance["instance_id"]), terminal=terminal, identity=identity, hub=hub)  # type: ignore[arg-type]
     runner(("vastai", "destroy", "instance", str(instance["instance_id"]), "--yes"))
-    absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance["instance_id"])))
-    if absent not in ({}, None):
+    if not _await_runtime_instance_absence(
+        instance_id=int(instance["instance_id"]), runner=runner,
+    ):
         raise ValueError("runtime checkpoint destroy absence readback failed")
     return {"paid_action": True, "destroy_authorized": True, "instance_id": instance["instance_id"], "authorization": authorization}
 

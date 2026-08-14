@@ -1625,14 +1625,31 @@ def test_runtime_cpu_pilot_destroy_requires_untampered_bound_pilot_lifecycle(tmp
         "pilot_receipt": _schema4_pilot(instance_id=44, provider_sha="2" * 64, code_revision="3" * 40, code_sha="4" * 64, bc_revision="a" * 40, rollout_revision="b" * 40, deployment_revision="c" * 40),
     }
     calls: list[tuple[str, ...]] = []
+    absence_reads = 0
+    sleeps: list[float] = []
     def runner(command: tuple[str, ...]) -> str:
+        nonlocal absence_reads
         calls.append(command)
-        return "{}" if command[:4] == ("vastai", "--raw", "show", "instance") else ""
+        if command[:4] == ("vastai", "--raw", "show", "instance"):
+            absence_reads += 1
+            return '{"id":44,"actual_status":"exiting"}' if absence_reads == 1 else '{"instances":null}'
+        return ""
 
-    assert LIFECYCLE.destroy_runtime_cpu_pilot(instance_id=44, lifecycle_receipt=lifecycle, runner=runner)["destroy_authorized"] is True
+    assert LIFECYCLE.destroy_runtime_cpu_pilot(instance_id=44, lifecycle_receipt=lifecycle, runner=runner, max_absence_polls=2, sleep=sleeps.append)["destroy_authorized"] is True
+    assert calls.count(("vastai", "destroy", "instance", "44", "--yes")) == 1 and sleeps == [5.0]
     lifecycle["pilot_receipt"]["authenticated_evidence"]["provider_instance_id"] = 45  # type: ignore[index]
     with pytest.raises(ValueError, match="pilot"):
         LIFECYCLE.destroy_runtime_cpu_pilot(instance_id=44, lifecycle_receipt=lifecycle, runner=runner)
+
+
+@pytest.mark.parametrize("value", [{}, None, {"instances": None}])
+def test_runtime_absence_parser_accepts_only_canonical_vast_absence_shapes(value: object) -> None:
+    assert LIFECYCLE._runtime_instance_is_absent(value) is True
+
+
+@pytest.mark.parametrize("value", [{"instances": []}, {"instances": {}}, {"instances": None, "id": 44}, [], {"id": 44}])
+def test_runtime_absence_parser_rejects_noncanonical_provider_shapes(value: object) -> None:
+    assert LIFECYCLE._runtime_instance_is_absent(value) is False
 
 
 def test_runtime_cpu_pilot_cli_actions_are_explicitly_gated_and_never_use_legacy_train(tmp_path: Path) -> None:
