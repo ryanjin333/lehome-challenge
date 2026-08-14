@@ -44,6 +44,11 @@ before recording the exact organizer source (`lehome/dataset_challenge_merged`
 at `17e8dee8fac294ffd21d250501d3b31bf8679042`, `four_types_merged`) and its
 verified mirror/manifest, plus the private corrective revision and prefix. It
 does not contact HF or Vast. Do not reuse the old horizon-40 mix tarball.
+The materialize report names the receipt-derived mix-plan SHA-256 as
+`generation_sha256`, exposes the manifest SHA-256 separately as
+`dataset_manifest_sha256`, and derives its local-only `dataset_revision` as
+the first 40 manifest characters. Its optional whole-receipt digest is named
+`generation_receipt_sha256`, so it cannot be substituted for lifecycle P.
 
 Verify a generation before use:
 
@@ -115,7 +120,12 @@ archive and descriptor path, SHA-256, and byte size in one immutable commit.
 Replacement discovery authenticates and stages the descriptor at
 `/prepared/config/resume-checkpoint.json`; the runtime downloads it again with
 the archive and consumes only the byte-identical authenticated descriptor. A
-code, data, or configuration failure is terminal but not resumable.
+replacement receipt retains its authenticated local hydration path, while stage
+binds the receipt's descriptor SHA-256/size/relative path to the mounted path.
+Immediately before `resume`, the remote re-reads the staged envelope and
+descriptor identity, so a later same-campaign checkpoint cannot replace the
+terminal-selected publication. A code, data, or configuration failure is
+terminal but not resumable.
 
 Stage transfers require the exact clean code bundle hash, sealed generation and
 receipt, parent artifact digest, config/modality, and token-file path; the

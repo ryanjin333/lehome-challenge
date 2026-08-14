@@ -42,6 +42,12 @@ def _hash(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _sha256(value: object, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
 def _load(path: str) -> dict[str, object]:
     value = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(value, dict): raise ValueError("lifecycle request must be an object")
@@ -589,7 +595,15 @@ def _validate_resume_descriptor_for_stage(
         "artifact_sha256", "artifact_byte_size", "descriptor_relative_path",
         "descriptor_sha256", "descriptor_byte_size",
     }
-    if set(publication) != required:
+    allowed = required | {
+        "optimizer_step", "readback_verified", "generation_sha256",
+        "config_sha256", "experiment_id",
+    }
+    if (
+        not required.issubset(publication)
+        or not set(publication).issubset(allowed)
+        or ("readback_verified" in publication and publication.get("readback_verified") is not True)
+    ):
         raise ValueError("stage resume publication is incompatible")
     descriptor_sha = publication["descriptor_sha256"]
     descriptor_size = publication["descriptor_byte_size"]
@@ -606,6 +620,39 @@ def _validate_resume_descriptor_for_stage(
     if hashlib.sha256(path.read_bytes()).hexdigest() != descriptor_sha:
         raise ValueError("stage resume descriptor source differs from immutable publication")
     return source, descriptor_sha, descriptor_size
+
+
+def _validate_replacement_stage_binding(
+    arguments: Mapping[str, object], request: Mapping[str, object], *,
+    instance: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    """Bind a staged resume to the exact authenticated replacement receipt."""
+    if arguments.get("resume_checkpoint") is None and arguments.get("resume_publication") is None:
+        if request.get("replacement_resume_receipt") is not None:
+            raise ValueError("stage replacement receipt is present without a resume")
+        return None
+    receipt = request.get("replacement_resume_receipt")
+    if not isinstance(receipt, Mapping):
+        raise ValueError("stage resume requires an authenticated replacement receipt")
+    publication = arguments.get("resume_publication")
+    descriptor = receipt.get("resume_checkpoint_descriptor")
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("kind") != "persistent_training_replacement_resume"
+        or receipt.get("instance") != instance
+        or receipt.get("generation_sha256") != request.get("generation_sha256")
+        or receipt.get("generation_sha256") != receipt.get("resume_generation_sha256")
+        or receipt.get("config_sha256") != receipt.get("resume_config_sha256")
+        or not isinstance(publication, Mapping)
+        or publication != receipt.get("resume_checkpoint_publication")
+        or not isinstance(descriptor, Mapping)
+        or descriptor.get("path") != request.get("resume_checkpoint_descriptor")
+        or descriptor.get("sha256") != publication.get("descriptor_sha256")
+        or descriptor.get("byte_size") != publication.get("descriptor_byte_size")
+        or descriptor.get("relative_path") != publication.get("descriptor_relative_path")
+    ):
+        raise ValueError("stage resume replacement publication or descriptor is incompatible")
+    return receipt
 
 
 def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
@@ -642,6 +689,7 @@ def stage(*, instance: Mapping[str, object], request: Mapping[str, object], runn
         Path(str(request["experiment_config"])), generation_identity
     )
     resume_descriptor = _validate_resume_descriptor_for_stage(resume_arguments, request)
+    _validate_replacement_stage_binding(resume_arguments, request, instance=instance)
     remote_dir = "/tmp/lehome-stage"
     runner((*_ssh_prefix(instance), "mkdir -p " + remote_dir))
     runner(("scp", "-r", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", str(instance["port"]), str(generation_root), "root@" + str(instance["host"]) + ":" + remote_dir + "/generation"))
@@ -875,12 +923,24 @@ def _hydrate_resume_descriptor(
         not all(isinstance(value, str) and value for value in (descriptor, descriptor_sha, repository, revision, prefix))
         or type(descriptor_size) is not int
         or descriptor_size <= 0
-        or output.exists()
-        or output.is_symlink()
         or output.parent.is_symlink()
         or not output.parent.is_dir()
     ):
         raise ValueError("resume descriptor hydration target or identity is invalid")
+    if output.exists() or output.is_symlink():
+        if (
+            output.is_symlink()
+            or not output.is_file()
+            or output.stat().st_size != descriptor_size
+            or hashlib.sha256(output.read_bytes()).hexdigest() != descriptor_sha
+        ):
+            raise ValueError("resume descriptor retry output is incompatible")
+        return {
+            "path": str(output),
+            "sha256": descriptor_sha,
+            "byte_size": descriptor_size,
+            "relative_path": descriptor,
+        }
     from tempfile import TemporaryDirectory
 
     with TemporaryDirectory(prefix="persistent-resume-descriptor-") as temporary:
@@ -969,6 +1029,53 @@ def replacement_resume_descriptor(
     }
 
 
+def _verify_staged_resume_binding(
+    *, instance: Mapping[str, object], publication: Mapping[str, object],
+    descriptor: Mapping[str, object], runner: Runner,
+) -> None:
+    """Re-read the staged resume inputs immediately before their execution."""
+    try:
+        envelope = json.loads(
+            runner((*_ssh_prefix(instance), "cat /prepared/config/resume.json"))
+        )
+    except (json.JSONDecodeError, subprocess.CalledProcessError, OSError, TimeoutError) as error:
+        raise ValueError("staged resume envelope is unavailable") from error
+    if (
+        not isinstance(envelope, Mapping)
+        or set(envelope) != {"schema_version", "command", "arguments"}
+        or envelope.get("schema_version") != 1
+        or envelope.get("command") != "continuous-train"
+        or not isinstance(envelope.get("arguments"), Mapping)
+        or envelope["arguments"].get("resume_checkpoint")
+        != "/prepared/config/resume-checkpoint.json"
+        or envelope["arguments"].get("resume_publication") != publication
+    ):
+        raise ValueError("staged resume envelope differs from the authenticated replacement receipt")
+    if (
+        set(descriptor) != {"path", "sha256", "byte_size", "relative_path"}
+        or not isinstance(descriptor.get("path"), str)
+        or not descriptor.get("path")
+        or descriptor.get("sha256") != publication.get("descriptor_sha256")
+        or descriptor.get("byte_size") != publication.get("descriptor_byte_size")
+        or descriptor.get("relative_path") != publication.get("descriptor_relative_path")
+    ):
+        raise ValueError("staged resume descriptor metadata differs from immutable publication")
+    try:
+        observed = runner((
+            *_ssh_prefix(instance),
+            "sha256sum /prepared/config/resume-checkpoint.json && "
+            "wc -c < /prepared/config/resume-checkpoint.json",
+        )).strip().splitlines()
+    except (subprocess.CalledProcessError, OSError, TimeoutError) as error:
+        raise ValueError("staged resume descriptor is unavailable") from error
+    if (
+        len(observed) != 2
+        or observed[0].split(maxsplit=1)[0] != descriptor["sha256"]
+        or observed[1].strip() != str(descriptor["byte_size"])
+    ):
+        raise ValueError("staged resume descriptor differs from the authenticated replacement receipt")
+
+
 def remote_action(*, action: str, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     instance_id = instance.get("instance_id")
     if type(instance_id) is not int: raise ValueError("instance receipt is invalid")
@@ -987,6 +1094,25 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
             )
             if request.get("resume_checkpoint_publication") != expected:
                 raise ValueError("resume checkpoint descriptor is not the authenticated interruption publication")
+            replacement = request.get("replacement_resume_receipt")
+            if (
+                not isinstance(replacement, Mapping)
+                or replacement.get("schema_version") != 1
+                or replacement.get("kind") != "persistent_training_replacement_resume"
+                or replacement.get("instance") != instance
+                or replacement.get("resume_checkpoint_publication") != expected
+                or replacement.get("generation_sha256") != request.get("generation_sha256")
+                or replacement.get("config_sha256") != request.get("config_sha256")
+                or request.get("resume_checkpoint_descriptor")
+                != replacement.get("resume_checkpoint_descriptor")
+            ):
+                raise ValueError("resume replacement receipt is not freshly bound to the authenticated publication")
+            _verify_staged_resume_binding(
+                instance=instance,
+                publication=expected,
+                descriptor=replacement["resume_checkpoint_descriptor"],
+                runner=runner,
+            )
         if action == "resume" and request.get("generation_sha256") != request.get("resume_generation_sha256") or action == "resume" and request.get("config_sha256") != request.get("resume_config_sha256"):
             raise ValueError("resume requires exact generation/config identity")
         terminal_path = request.get("terminal_path", "/output/persistent-training/terminal.json")
@@ -1167,12 +1293,20 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
     sealed = verify_generation(destination_root)
     if sealed["organizer_training_frames"] * 3 != sealed["rft_training_frames"] * 7:
         raise ValueError("materialized generation is not exact 70/30")
+    mix_plan = _sha256(sealed.get("mix_plan_sha256"), "materialized mix plan SHA-256")
+    manifest = _sha256(
+        sealed.get("dataset_manifest_sha256"), "materialized dataset manifest SHA-256"
+    )
     return {
         "paid_action": False,
         "action": "materialize",
         "generation_root": str(destination_root),
         "generation_receipt": str(destination_root.with_name(destination_root.name + ".generation.json")),
-        "generation_sha256": _hash(sealed),
+        "generation_sha256": mix_plan,
+        "sealed_generation_sha256": mix_plan,
+        "dataset_manifest_sha256": manifest,
+        "dataset_revision": manifest[:40],
+        "generation_receipt_sha256": _hash(sealed),
     }
 
 

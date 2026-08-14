@@ -269,7 +269,16 @@ def _resume_publication(
         "artifact_sha256", "artifact_byte_size", "descriptor_relative_path",
         "descriptor_sha256", "descriptor_byte_size",
     }
-    if set(value) != required or value.get("repository") != DEFAULT_MODEL_REPO:
+    allowed = required | {
+        "optimizer_step", "readback_verified", "generation_sha256",
+        "config_sha256", "experiment_id",
+    }
+    if (
+        not required.issubset(value)
+        or not set(value).issubset(allowed)
+        or value.get("repository") != DEFAULT_MODEL_REPO
+        or ("readback_verified" in value and value.get("readback_verified") is not True)
+    ):
         raise ValueError("resume immutable publication is incompatible")
     revision, prefix, relative = value["immutable_revision"], value["remote_prefix"], value["relative_path"]
     artifact, size = value["artifact_sha256"], value["artifact_byte_size"]
@@ -328,7 +337,13 @@ def _resume_publication(
         or resume.record.artifact.byte_size != size
     ):
         raise ValueError("resume descriptor does not bind immutable publication")
-    return resume
+    # The immutable descriptor deliberately records its pre-upload local state.
+    # Its remote verification is derived only from the archive+descriptor
+    # readback above, never from a caller-controlled serialized flag.
+    return replace(
+        resume,
+        record=replace(resume.record, remotely_verified=True),
+    )
 
 
 def _visible_device(expected_gpu_count: int = 1) -> str:

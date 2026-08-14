@@ -272,6 +272,135 @@ def test_provider_absence_builds_a_replacement_resume_descriptor_with_same_ident
     assert descriptor["generation_sha256"] == "a" * 64
     assert descriptor["resume_generation_sha256"] == "a" * 64
 
+    # The replacement receipt retains the local hydration path.  Stage binds
+    # that source to the mounted path, and resume rechecks the mounted envelope
+    # immediately before it executes.
+    publication = descriptor["resume_checkpoint_publication"]
+    local_descriptor = descriptor["resume_checkpoint_descriptor"]
+    assert isinstance(publication, dict)
+    assert isinstance(local_descriptor, dict)
+    stage_request = {
+        "generation_sha256": "a" * 64,
+        "resume_checkpoint_descriptor": str(tmp_path / "resume.json"),
+        "replacement_resume_receipt": descriptor,
+    }
+    LIFECYCLE._validate_replacement_stage_binding(
+        {
+            "resume_checkpoint": "/prepared/config/resume-checkpoint.json",
+            "resume_publication": publication,
+        },
+        stage_request,
+        instance=descriptor["instance"],
+    )
+    resume_request = {
+        "generation_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+        "resume_generation_sha256": "a" * 64,
+        "resume_config_sha256": "b" * 64,
+        "capability_receipt": capability,
+        "provider_interruption_terminal": terminal,
+        "resume_checkpoint_publication": publication,
+        "resume_checkpoint_descriptor": local_descriptor,
+        "replacement_resume_receipt": descriptor,
+    }
+
+    def resume_runner(command: tuple[str, ...]) -> str:
+        if command[-1] == "cat /prepared/config/resume.json":
+            return json.dumps({
+                "schema_version": 1,
+                "command": "continuous-train",
+                "arguments": {
+                    "resume_checkpoint": "/prepared/config/resume-checkpoint.json",
+                    "resume_publication": publication,
+                },
+            })
+        if "sha256sum /prepared/config/resume-checkpoint.json" in command[-1]:
+            return f"{local_descriptor['sha256']}  resume-checkpoint.json\n{local_descriptor['byte_size']}\n"
+        if "continuous-train --request /prepared/config/resume.json" in command[-1]:
+            return ""
+        raise AssertionError(command)
+
+    assert LIFECYCLE.remote_action(
+        action="resume", instance=descriptor["instance"], request=resume_request,
+        runner=resume_runner,
+    )["action"] == "resume"
+
+
+def test_resume_rechecks_the_staged_envelope_against_the_replacement_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publication = {
+        "optimizer_step": 1000,
+        "readback_verified": True,
+        "generation_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+        "experiment_id": "persistent-001",
+        "immutable_revision": "c" * 40,
+        "repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
+        "remote_prefix": "prefix",
+        "relative_path": "checkpoints/step-1000.tar",
+        "artifact_sha256": "d" * 64,
+        "artifact_byte_size": 8,
+        "descriptor_relative_path": "checkpoints/step-1000.json",
+        "descriptor_sha256": "e" * 64,
+        "descriptor_byte_size": 9,
+    }
+    descriptor = {
+        "path": "/local/replacement/resume-checkpoint.json",
+        "sha256": "e" * 64,
+        "byte_size": 9,
+        "relative_path": "checkpoints/step-1000.json",
+    }
+    instance = {"instance_id": 10, "host": "replacement", "port": 22}
+    request = {
+        "generation_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+        "resume_generation_sha256": "a" * 64,
+        "resume_config_sha256": "b" * 64,
+        "provider_interruption_terminal": {
+            "status": "provider_interrupted",
+            "generation_sha256": "a" * 64,
+            "config_sha256": "b" * 64,
+            "experiment_id": "persistent-001",
+            "resumable_checkpoint_step": 1000,
+            "immutable_checkpoint_publications": [publication],
+        },
+        "resume_checkpoint_publication": publication,
+        "resume_checkpoint_descriptor": descriptor,
+        "replacement_resume_receipt": {
+            "schema_version": 1,
+            "kind": "persistent_training_replacement_resume",
+            "instance": instance,
+            "generation_sha256": "a" * 64,
+            "config_sha256": "b" * 64,
+            "resume_generation_sha256": "a" * 64,
+            "resume_config_sha256": "b" * 64,
+            "resume_checkpoint_publication": publication,
+            "resume_checkpoint_descriptor": descriptor,
+        },
+    }
+    monkeypatch.setattr(LIFECYCLE, "_require_instance_capability", lambda *_args: None)
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[-1] == "cat /prepared/config/resume.json":
+            return json.dumps({
+                "schema_version": 1,
+                "command": "continuous-train",
+                "arguments": {
+                    "resume_checkpoint": "/prepared/config/resume-checkpoint.json",
+                    "resume_publication": publication | {"relative_path": "checkpoints/step-2000.tar"},
+                },
+            })
+        raise AssertionError("resume command must not execute after staged envelope mismatch")
+
+    with pytest.raises(ValueError, match="staged resume envelope"):
+        LIFECYCLE.remote_action(
+            action="resume",
+            instance=instance,
+            request=request,
+            runner=runner,
+        )
+
 
 def test_remote_ssh_failure_is_terminalized_only_after_provider_interruption_readback() -> None:
     instance = {"instance_id": 9, "host": "old", "port": 22, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "provider_response_sha256": "a" * 64}
@@ -446,6 +575,82 @@ def test_stage_rejects_a_resume_descriptor_that_does_not_match_its_publication(
         LIFECYCLE._validate_resume_descriptor_for_stage(arguments, request)
 
 
+def test_stage_requires_the_exact_authenticated_replacement_receipt(
+    tmp_path: Path,
+) -> None:
+    descriptor = tmp_path / "resume-checkpoint.json"
+    descriptor.write_bytes(b"authenticated descriptor")
+    descriptor_sha = hashlib.sha256(descriptor.read_bytes()).hexdigest()
+    publication = {
+        "repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
+        "immutable_revision": "a" * 40,
+        "remote_prefix": "checkpoint-staging/run/archive",
+        "relative_path": "checkpoints/step-1000.tar",
+        "artifact_sha256": "b" * 64,
+        "artifact_byte_size": 1,
+        "descriptor_relative_path": "checkpoints/step-1000.json",
+        "descriptor_sha256": descriptor_sha,
+        "descriptor_byte_size": descriptor.stat().st_size,
+    }
+    replacement = {
+        "schema_version": 1,
+        "kind": "persistent_training_replacement_resume",
+        "instance": {"instance_id": 10, "host": "replacement", "port": 22},
+        "generation_sha256": "c" * 64,
+        "config_sha256": "d" * 64,
+        "resume_generation_sha256": "c" * 64,
+        "resume_config_sha256": "d" * 64,
+        "experiment_id": "corrective-rft-70-30-20260813",
+        "resume_checkpoint_publication": publication,
+        "resume_checkpoint_descriptor": {
+            "path": str(descriptor), "sha256": descriptor_sha,
+            "byte_size": descriptor.stat().st_size,
+            "relative_path": "checkpoints/step-1000.json",
+        },
+    }
+    arguments = {
+        "resume_checkpoint": "/prepared/config/resume-checkpoint.json",
+        "resume_publication": publication,
+    }
+    request = {
+        "generation_sha256": "c" * 64,
+        "resume_checkpoint_descriptor": str(descriptor),
+        "replacement_resume_receipt": replacement,
+    }
+
+    instance = replacement["instance"]
+    LIFECYCLE._validate_replacement_stage_binding(arguments, request, instance=instance)
+    with pytest.raises(ValueError, match="replacement publication"):
+        LIFECYCLE._validate_replacement_stage_binding(
+            arguments | {"resume_publication": publication | {"relative_path": "checkpoints/step-2000.tar"}},
+            request,
+            instance=instance,
+        )
+
+
+def test_descriptor_hydration_reuses_only_the_exact_authenticated_retry_file(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "resume.json"
+    output.write_bytes(b"authenticated descriptor")
+    publication = {
+        "repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
+        "immutable_revision": "a" * 40,
+        "remote_prefix": "prefix",
+        "descriptor_relative_path": "checkpoints/step-1000.json",
+        "descriptor_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "descriptor_byte_size": output.stat().st_size,
+    }
+    assert LIFECYCLE._hydrate_resume_descriptor(
+        publication=publication, transport=FailRunner(), token="test-token", output=output,
+    )["path"] == str(output)
+    output.write_bytes(b"wrong retry descriptor")
+    with pytest.raises(ValueError, match="retry output"):
+        LIFECYCLE._hydrate_resume_descriptor(
+            publication=publication, transport=FailRunner(), token="test-token", output=output,
+        )
+
+
 def test_stage_requires_code_bundle_receipt_to_match_bundle(tmp_path: Path) -> None:
     bundle = tmp_path / "code.bundle"
     bundle.write_bytes(b"not-an-archive")
@@ -614,6 +819,8 @@ def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None
 
     assert report["paid_action"] is False
     assert report["generation_root"] == str(destination)
+    assert report["generation_sha256"] == report["sealed_generation_sha256"]
+    assert report["dataset_revision"] == report["dataset_manifest_sha256"][:40]
     assert (destination.with_name(destination.name + ".generation.json")).is_file()
 
 
@@ -637,7 +844,16 @@ def test_materialize_forwards_optional_video_workers_and_rejects_invalid_values(
     }
     seen: list[dict[str, object]] = []
     monkeypatch.setattr(mix, "materialize_mixed_snapshot", lambda *_args, **kwargs: seen.append(kwargs) or {})
-    monkeypatch.setattr(mix, "verify_generation", lambda _root: {"organizer_training_frames": 7, "rft_training_frames": 3})
+    monkeypatch.setattr(
+        mix,
+        "verify_generation",
+        lambda _root: {
+            "organizer_training_frames": 7,
+            "rft_training_frames": 3,
+            "mix_plan_sha256": "a" * 64,
+            "dataset_manifest_sha256": "b" * 64,
+        },
+    )
 
     assert LIFECYCLE._materialize(request | {"video_workers": 8})["action"] == "materialize"
     assert seen[-1]["video_workers"] == 8

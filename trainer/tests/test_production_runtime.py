@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import lehome_train.groot.production_adapters as adapters
 import lehome_train.groot.production_runtime as runtime_module
 from lehome_train.commands.sync import generate_sync_manifest
 from lehome_train.constants import MODEL_REVISION
@@ -355,7 +356,7 @@ def test_resume_downloads_and_consumes_the_immutable_authenticated_descriptor(
             schedule_sha256="c" * 64,
             artifact=ArtifactIdentity("checkpoints/step-1000.tar", archive_sha, len(archive_bytes)),
             resumable=True,
-            remotely_verified=True,
+            remotely_verified=False,
         ),
         normalization_sha256="d" * 64,
         schedule_sha256="c" * 64,
@@ -407,8 +408,96 @@ def test_resume_downloads_and_consumes_the_immutable_authenticated_descriptor(
         token="publisher-token",
     )
 
-    assert observed == descriptor
+    assert observed.record.remotely_verified is True
+    assert descriptor.record.remotely_verified is False
     assert downloaded == [("checkpoints/step-1000.tar", "checkpoints/step-1000.json")]
+
+
+def test_publisher_readback_promotes_an_actual_false_descriptor_for_runtime_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "artifacts"
+    archive = root / "checkpoints" / "step-1000.tar"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"checkpoint archive")
+    descriptor = CheckpointDescriptor(
+        record=CheckpointRecord(
+            experiment_id="corrective-rft-70-30-20260813",
+            optimizer_step=1000,
+            sample_presentations=64_000,
+            experiment_config_sha256="a" * 64,
+            dataset_manifest_sha256="b" * 64,
+            schedule_sha256="c" * 64,
+            artifact=ArtifactIdentity("checkpoints/step-1000.tar", sha256_file(archive), archive.stat().st_size),
+            resumable=True,
+            remotely_verified=False,
+        ),
+        normalization_sha256="d" * 64,
+        schedule_sha256="c" * 64,
+        locally_verified=True,
+    )
+    descriptor_path = root / "checkpoints" / "step-1000.json"
+    write_checkpoint_descriptor(descriptor_path, descriptor)
+    remote: dict[str, bytes] = {}
+
+    monkeypatch.setattr(adapters, "HuggingFaceHubTransport", lambda **_kwargs: object())
+    monkeypatch.setattr(adapters, "require_access", lambda **_kwargs: None)
+
+    def upload(**kwargs: object) -> str:
+        source = kwargs["source"]
+        assert isinstance(source, Path)
+        for entry in kwargs["entries"]:
+            remote[entry.relative_path] = (source / entry.relative_path).read_bytes()
+        return "e" * 40
+
+    def download(**kwargs: object) -> str:
+        destination = kwargs["destination"]
+        assert isinstance(destination, Path)
+        for relative in kwargs["relative_paths"]:
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(remote[relative])
+        return "e" * 40
+
+    monkeypatch.setattr(adapters, "upload_files", upload)
+    monkeypatch.setattr(adapters, "download_files", download)
+    publication = adapters.HubCheckpointUploader(
+        repository=runtime_module.DEFAULT_MODEL_REPO,
+        revision="main",
+        experiment_id="corrective-rft-70-30-20260813",
+        artifact_root=root,
+        token="publisher-token",
+    ).publish_receipt(descriptor, timeout_seconds=1)
+    staged = tmp_path / "prepared" / "resume-checkpoint.json"
+    staged.parent.mkdir()
+    staged.write_bytes(descriptor_path.read_bytes())
+
+    class RuntimeTransport:
+        def list_tree(self, **_kwargs: object) -> tuple[object, ...]:
+            return tuple(
+                SimpleNamespace(relative_path="prefix/" + path, entry_type="file")
+                for path in remote
+            )
+
+        def download_files(self, **kwargs: object) -> None:
+            destination = kwargs["destination"]
+            assert isinstance(destination, Path)
+            for relative in kwargs["relative_paths"]:
+                target = destination / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(remote[relative])
+
+    monkeypatch.setattr(runtime_module, "HuggingFaceHubTransport", lambda **_kwargs: RuntimeTransport())
+    publication = publication | {"remote_prefix": "prefix"}
+    resumed = runtime_module._resume_publication(
+        value=publication,
+        descriptor=str(staged),
+        output_root=tmp_path / "output",
+        token="publisher-token",
+    )
+
+    assert descriptor.record.remotely_verified is False
+    assert resumed.record.remotely_verified is True
 
 
 def test_continuous_campaign_binds_local_dataset_revision_to_the_sealed_manifest(
