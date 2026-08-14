@@ -244,7 +244,7 @@ def _stable_instance_identity(row: Mapping[str, object]) -> str:
 def _require_account_cap(total: object, *, label: str) -> float:
     if type(total) not in (int, float) or not math.isfinite(float(total)) or float(total) < 0:
         raise ValueError(f"{label} account-wide hourly total is invalid")
-    if float(total) > MAX_ACCOUNT_HOURLY_USD:
+    if float(total) >= MAX_ACCOUNT_HOURLY_USD:
         raise ValueError("account-wide instance and storage total exceeds $1/hr")
     return float(total)
 

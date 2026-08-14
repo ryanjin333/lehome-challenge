@@ -1281,3 +1281,8 @@ def test_runtime_pilot_rejects_a_descriptive_unbound_claim(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="authenticated"):
         LIFECYCLE._validated_runtime_pilot(str(receipt))
+
+
+def test_account_cap_rejects_exactly_one_dollar_per_hour() -> None:
+    with pytest.raises(ValueError, match="exceeds"):
+        LIFECYCLE._require_account_cap(1.0, label="test")
