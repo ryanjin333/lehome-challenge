@@ -501,17 +501,40 @@ def test_mix_persistent_resume_rejects_state_plan_source_and_code_drift(
         materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "destination", persistent_staging_root=staging)
 
 
+def test_mix_legacy_resume_compatibility_is_bound_to_the_h16_plan() -> None:
+    import lehome_train.flywheel.mix as mix
+
+    expected = {
+        "schema_version": 1,
+        "kind": "mixed_snapshot_resume",
+        "plan": {"sha256": "0316c8f245b93649ae09ada6cc312a31af77357b1bef070045f2e0db371c6057"},
+        "plan_sha256": "0316c8f245b93649ae09ada6cc312a31af77357b1bef070045f2e0db371c6057",
+        "materializer_sha256": "f" * 64,
+    }
+    legacy = dict(expected)
+    legacy["materializer_sha256"] = "41c786ec652baf5f3a64e1b0f91f090fda9d4b1952b8a113fd76fd04ac6c01d7"
+    assert mix._persistent_state_matches_expected(legacy, expected)
+    other_plan = dict(expected)
+    other_plan["plan_sha256"] = "0" * 64
+    legacy_other_plan = dict(other_plan)
+    legacy_other_plan["materializer_sha256"] = legacy["materializer_sha256"]
+    assert not mix._persistent_state_matches_expected(legacy_other_plan, other_plan)
+
+
 def test_mix_persistent_resume_accepts_only_the_known_pre_fix_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A fully receipted pre-fix tree may be resealed without regenerating jobs."""
 
+    import lehome_train.flywheel.mix as mix
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
     flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
     plan = build_mix_plan(organizer, flywheel, seed=20260813)
     staging, destination = tmp_path / "resume", tmp_path / "destination"
+    original_seal = mix._seal_mixed_work
     monkeypatch.setattr(
-        "lehome_train.flywheel.mix._seal_mixed_work",
+        mix,
+        "_seal_mixed_work",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("after jobs")),
     )
     with pytest.raises(RuntimeError, match="after jobs"):
@@ -521,13 +544,18 @@ def test_mix_persistent_resume_accepts_only_the_known_pre_fix_identity(
     state_path = staging / "state.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
     state["materializer_sha256"] = "41c786ec652baf5f3a64e1b0f91f090fda9d4b1952b8a113fd76fd04ac6c01d7"
+    monkeypatch.setattr(
+        mix,
+        "_PRE_FIX_PERSISTENT_STATE_COMPATIBILITY",
+        frozenset({(state["materializer_sha256"], plan.sha256)}),
+    )
     drifted_state = json.loads(json.dumps(state))
     drifted_state["sources"][0]["source_revision"] = "f" * 40
     atomic_write_json(state_path, drifted_state)
     with pytest.raises(ValueError, match="plan, source, or code"):
         materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)
     atomic_write_json(state_path, state)
-    monkeypatch.undo()
+    monkeypatch.setattr(mix, "_seal_mixed_work", original_seal)
     monkeypatch.setattr(
         "lehome_train.flywheel.mix.pq.write_table",
         lambda *args, **kwargs: pytest.fail("fully receipted parquet was regenerated"),

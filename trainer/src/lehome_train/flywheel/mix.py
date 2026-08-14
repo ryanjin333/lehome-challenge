@@ -1020,9 +1020,12 @@ _PERSISTENT_LOCK_NAME = "lock"
 
 # The completed h16 materialization was interrupted after sealing all jobs but
 # before it could correct the image feature keys below.  This is deliberately a
-# single immutable identity, not a cross-version resume policy.
-_PRE_FIX_MATERIALIZER_IDENTITIES = frozenset({
-    "41c786ec652baf5f3a64e1b0f91f090fda9d4b1952b8a113fd76fd04ac6c01d7",
+# single immutable state pair, not a cross-version resume policy.
+_PRE_FIX_PERSISTENT_STATE_COMPATIBILITY = frozenset({
+    (
+        "41c786ec652baf5f3a64e1b0f91f090fda9d4b1952b8a113fd76fd04ac6c01d7",
+        "0316c8f245b93649ae09ada6cc312a31af77357b1bef070045f2e0db371c6057",
+    ),
 })
 
 
@@ -1057,7 +1060,12 @@ def _persistent_state_matches_expected(state: object, expected_state: Mapping[st
     if not isinstance(state, Mapping):
         return False
     materializer_sha256 = state.get("materializer_sha256")
-    if materializer_sha256 not in _PRE_FIX_MATERIALIZER_IDENTITIES:
+    plan_sha256 = state.get("plan_sha256")
+    if (
+        not isinstance(materializer_sha256, str)
+        or not isinstance(plan_sha256, str)
+        or (materializer_sha256, plan_sha256) not in _PRE_FIX_PERSISTENT_STATE_COMPATIBILITY
+    ):
         return False
     legacy_expected = dict(expected_state)
     legacy_expected["materializer_sha256"] = materializer_sha256
