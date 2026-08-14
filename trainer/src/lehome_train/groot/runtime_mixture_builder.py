@@ -99,36 +99,129 @@ def _source_publications(path: Path) -> dict[str, dict[str, object]]:
     return result
 
 
+_CORRECTIVE_CATEGORIES = frozenset({"top_long", "top_short", "pant_long", "pant_short"})
+
+
+def _campaign_attempt_ledger(campaign_receipt: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
+    ledger = campaign_receipt.get("attempt_receipts")
+    if not isinstance(ledger, list):
+        raise ValueError("campaign accepted ledger is unavailable")
+    attempts: dict[str, Mapping[str, object]] = {}
+    for item in ledger:
+        if not isinstance(item, Mapping) or type(item.get("attempt_id")) is not str or not item["attempt_id"]:
+            raise ValueError("campaign accepted ledger is malformed")
+        attempt_id = item["attempt_id"]
+        if attempt_id in attempts:
+            raise ValueError("campaign accepted ledger has duplicate attempt IDs")
+        attempts[attempt_id] = item
+    return attempts
+
+
+def _require_selected_campaign_acceptance(
+    attempt_id: str, episode_id: str, campaign_attempt: Mapping[str, object] | None,
+) -> Mapping[str, object]:
+    """Require the selected row to be an autonomous, seen campaign success."""
+    if (
+        campaign_attempt is None
+        or campaign_attempt.get("attempt_id") != attempt_id
+        or campaign_attempt.get("episode_id") != episode_id
+        or campaign_attempt.get("category") not in _CORRECTIVE_CATEGORIES
+        or campaign_attempt.get("accepted_success") is not True
+        or campaign_attempt.get("release_stage") != "seen"
+        or campaign_attempt.get("outcome") != "success"
+    ):
+        raise ValueError("selected-150 binding is not an accepted seen campaign success")
+    return campaign_attempt
+
+
 def validate_selected_bindings(document: Mapping[str, object], campaign_receipt: Mapping[str, object]) -> dict[str, str]:
-    """Authenticate the exact selected-150 ledger before it reaches windows."""
+    """Authenticate the exact selected-150 ledger before it reaches windows.
+
+    ``episode_manifest_sha256`` is the immutable historical selected-index key.
+    Its value binds ``raw/<attempt>/SHA256SUMS.json``; campaign receipts bind
+    acceptance identity and never carried a duplicate artifact hash.
+    """
 
     if set(document) != {"schema_version", "selection_sha256", "selected_bindings"} or document.get("schema_version") != 1 or not isinstance(document.get("selected_bindings"), list):
         raise ValueError("selected-150 document has an incompatible schema")
     rows = document["selected_bindings"]
     if document.get("selection_sha256") != canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}) or len(rows) != 150:
         raise ValueError("selected-150 canonical binding is invalid")
-    ledger = campaign_receipt.get("attempt_receipts")
-    if not isinstance(ledger, list):
-        raise ValueError("campaign accepted ledger is unavailable")
-    accepted = {
-        item.get("attempt_id"): item
-        for item in ledger
-        if isinstance(item, dict) and item.get("accepted_success") is True and item.get("release_stage") == "seen"
-    }
+    campaign_attempts = _campaign_attempt_ledger(campaign_receipt)
     result: dict[str, str] = {}
     for row in rows:
         if not isinstance(row, dict) or set(row) != {"attempt_id", "episode_id", "episode_manifest_sha256"}:
             raise ValueError("selected-150 binding row is malformed")
-        attempt_id, episode_id, manifest_sha = row.get("attempt_id"), row.get("episode_id"), row.get("episode_manifest_sha256")
-        if type(attempt_id) is not str or type(episode_id) is not str or attempt_id != episode_id or attempt_id in result or type(manifest_sha) is not str or re.fullmatch(r"[0-9a-f]{64}", manifest_sha) is None:
-            raise ValueError("selected-150 identity or manifest binding is invalid")
-        accepted_row = accepted.get(attempt_id)
-        if not isinstance(accepted_row, dict) or accepted_row.get("episode_id") != episode_id or accepted_row.get("episode_manifest_sha256") != manifest_sha:
-            raise ValueError("selected-150 manifest does not match campaign accepted ledger")
-        result[attempt_id] = manifest_sha
+        attempt_id, episode_id, checksum_manifest_sha256 = row.get("attempt_id"), row.get("episode_id"), row.get("episode_manifest_sha256")
+        if type(attempt_id) is not str or type(episode_id) is not str or attempt_id != episode_id or attempt_id in result or type(checksum_manifest_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", checksum_manifest_sha256) is None:
+            raise ValueError("selected-150 identity or checksum-manifest binding is invalid")
+        _require_selected_campaign_acceptance(attempt_id, episode_id, campaign_attempts.get(attempt_id))
+        result[attempt_id] = checksum_manifest_sha256
     if len(result) != 150:
         raise ValueError("selected-150 bindings are not unique")
     return result
+
+
+def validate_selected_raw_roots(
+    campaign_root: str | Path,
+    selected: Mapping[str, str],
+    campaign_receipt: Mapping[str, object],
+) -> None:
+    """Verify every selected raw artifact before any window can authorize a read.
+
+    The selected index is deliberately a closed 150-root allowlist.  In
+    particular, an unused selected attempt must still pass its terminal raw
+    artifact manifest and acceptance binding before normalization can begin.
+    """
+    if len(selected) != 150:
+        raise ValueError("selected raw roots must contain exactly 150 bindings")
+    campaign = Path(campaign_root)
+    raw = campaign / "raw"
+    if campaign.is_symlink() or not campaign.is_dir() or raw.is_symlink() or not raw.is_dir():
+        raise ValueError("campaign raw root is missing or unsafe")
+    expected_ids = set(selected)
+    if any(not attempt_id or "/" in attempt_id or "\\" in attempt_id or attempt_id in {".", ".."} for attempt_id in expected_ids):
+        raise ValueError("selected raw attempt identity is unsafe")
+    try:
+        entries = {entry.name: entry for entry in raw.iterdir()}
+    except OSError as error:
+        raise ValueError("campaign raw root is unavailable") from error
+    if any(entry.is_symlink() or not entry.is_dir() for entry in entries.values()) or set(entries) != expected_ids:
+        raise ValueError("campaign raw roots are missing, extra, or unsafe")
+    campaign_attempts = _campaign_attempt_ledger(campaign_receipt)
+    try:
+        from lehome.flywheel.artifacts import verify_episode_manifest
+        from lehome_train.flywheel.materialize import _is_autonomous_policy_success
+    except ImportError as error:
+        raise RuntimeError("canonical raw artifact verification is unavailable") from error
+    for attempt_id in sorted(expected_ids):
+        attempt = entries[attempt_id]
+        checksum_manifest = attempt / "SHA256SUMS.json"
+        expected_checksum_manifest_sha256 = selected[attempt_id]
+        if (
+            type(expected_checksum_manifest_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_checksum_manifest_sha256) is None
+            or checksum_manifest.is_symlink()
+            or not checksum_manifest.is_file()
+            or sha256_file(checksum_manifest) != expected_checksum_manifest_sha256
+        ):
+            raise ValueError("raw rollout checksum-manifest binding drift")
+        try:
+            episode, _manifest = verify_episode_manifest(attempt)
+        except ValueError as error:
+            raise ValueError("raw rollout manifest verification failed") from error
+        campaign_attempt = _require_selected_campaign_acceptance(
+            attempt_id, attempt_id, campaign_attempts.get(attempt_id),
+        )
+        identity = episode.get("identity")
+        if (
+            episode.get("episode_id") != attempt_id
+            or not isinstance(identity, Mapping)
+            or identity.get("release_stage") != "seen"
+            or identity.get("category") != campaign_attempt.get("category")
+            or not _is_autonomous_policy_success(episode)
+        ):
+            raise ValueError("raw rollout identity or accepted autonomous success drift")
 
 
 def _write(path: Path, value: object) -> None:
@@ -257,11 +350,16 @@ def validate_plan_windows(plan: Mapping[str, Any], *, organizer_manifest: Path, 
     return [unique[key] for key in sorted(unique)]
 
 
-def _raw_attempt(root: Path, attempt_id: str, expected_checksum: str) -> tuple[list[list[float]], list[list[float]]]:
+def _raw_attempt(root: Path, attempt_id: str, expected_checksum_manifest_sha256: str) -> tuple[list[list[float]], list[list[float]]]:
+    """Read a previously full-tree-verified raw attempt for normalization.
+
+    The selected index's historical ``episode_manifest_sha256`` key carries
+    the SHA-256 of SHA256SUMS.json, not the hash of episode.json.
+    """
     attempt = root / "raw" / attempt_id
     sums = attempt / "SHA256SUMS.json"
     episode = _load(attempt / "episode.json", "raw episode")
-    if sha256_file(sums) != expected_checksum or episode.get("accepted_success") is not True or episode.get("outcome") != "success" or episode.get("terminal_reason") != "success" or not isinstance(episode.get("identity"), dict) or episode["identity"].get("release_stage") != "seen":
+    if sums.is_symlink() or not sums.is_file() or sha256_file(sums) != expected_checksum_manifest_sha256 or episode.get("accepted_success") is not True or episode.get("outcome") != "success" or episode.get("terminal_reason") != "success" or not isinstance(episode.get("identity"), dict) or episode["identity"].get("release_stage") != "seen":
         raise ValueError("raw rollout acceptance or checksum binding drift")
     rows: list[dict[str, Any]] = []
     for line in (attempt / "annotations.jsonl").read_text(encoding="utf-8").splitlines():
@@ -311,6 +409,9 @@ def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Pa
     campaign_receipt = campaign / "campaign-receipt.json"; receipt = _load(campaign_receipt, "campaign receipt")
     selected_document = _load(Path(selected_bindings), "selected rollout bindings")
     selected = validate_selected_bindings(selected_document, receipt)
+    # Authenticate all exact selected raw roots before a window can cause a
+    # normalization read.  This includes selected attempts that no window uses.
+    validate_selected_raw_roots(campaign, selected, receipt)
     windows = validate_plan_windows(plan, organizer_manifest=organizer_manifest, accepted_rollouts={key: key for key in selected})
     if destination.exists():
         raise FileExistsError("runtime mixture destination is immutable; choose an explicit new destination")

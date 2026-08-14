@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -11,6 +12,85 @@ import pytest
 def _write(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def _selected_150_document() -> tuple[dict[str, object], dict[str, object]]:
+    """Production-shaped selected index and campaign ledger, sans raw artifacts."""
+    from lehome_train.io import canonical_json_sha256
+
+    categories = ("top_long", "top_short", "pant_long", "pant_short")
+    rows = [
+        {
+            "attempt_id": f"attempt-{index:03d}",
+            "episode_id": f"attempt-{index:03d}",
+            # Historical name retained in the frozen index.  Its value binds
+            # SHA256SUMS.json, not episode.json.
+            "episode_manifest_sha256": f"{index:064x}",
+        }
+        for index in range(150)
+    ]
+    document = {
+        "schema_version": 1,
+        "selection_sha256": canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}),
+        "selected_bindings": rows,
+    }
+    campaign = {
+        "attempt_receipts": [
+            {
+                "attempt_id": row["attempt_id"],
+                "episode_id": row["episode_id"],
+                "category": categories[index % len(categories)],
+                "accepted_success": True,
+                "release_stage": "seen",
+                "outcome": "success",
+            }
+            for index, row in enumerate(rows)
+        ]
+    }
+    return document, campaign
+
+
+def _raw_selected_campaign(tmp_path: Path) -> tuple[Path, dict[str, object], dict[str, object]]:
+    """Make all 150 canonical raw roots, including raw roots no window uses."""
+    from lehome.flywheel.artifacts import build_sha256_manifest
+    from lehome_train.io import canonical_json_sha256
+
+    campaign = tmp_path / "campaign"
+    categories = ("top_long", "top_short", "pant_long", "pant_short")
+    rows: list[dict[str, str]] = []
+    receipts: list[dict[str, object]] = []
+    for index in range(150):
+        attempt_id = f"attempt-{index:03d}"
+        category = categories[index % len(categories)]
+        raw = campaign / "raw" / attempt_id
+        _write(raw / "episode.json", {
+            "episode_id": attempt_id,
+            "accepted_success": True,
+            "outcome": "success",
+            "terminal_reason": "success",
+            "mode": "autonomous",
+            "identity": {"release_stage": "seen", "category": category},
+        })
+        _write(raw / "SHA256SUMS.json", build_sha256_manifest(raw))
+        rows.append({
+            "attempt_id": attempt_id,
+            "episode_id": attempt_id,
+            "episode_manifest_sha256": hashlib.sha256((raw / "SHA256SUMS.json").read_bytes()).hexdigest(),
+        })
+        receipts.append({
+            "attempt_id": attempt_id,
+            "episode_id": attempt_id,
+            "category": category,
+            "accepted_success": True,
+            "release_stage": "seen",
+            "outcome": "success",
+        })
+    document = {
+        "schema_version": 1,
+        "selection_sha256": canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}),
+        "selected_bindings": rows,
+    }
+    return campaign, document, {"attempt_receipts": receipts}
 
 
 def test_builder_allows_authenticated_train_episode_to_be_demoted_to_frozen_mixture_validation(tmp_path: Path) -> None:
@@ -74,42 +154,35 @@ def test_builder_collapses_exact_duplicate_source_ranges_before_runtime_schedule
     assert len(windows) == 2
 
 
-def test_selected_150_requires_canonical_hash_exact_rows_and_accepted_manifest_bindings(tmp_path: Path) -> None:
+def test_selected_150_requires_canonical_hash_exact_rows_and_production_ledger_membership() -> None:
     from lehome_train.groot.runtime_mixture_builder import validate_selected_bindings
-    from lehome_train.io import canonical_json_sha256
 
-    rows = [
-        {"attempt_id": f"attempt-{index:03d}", "episode_id": f"attempt-{index:03d}", "episode_manifest_sha256": f"{index:064x}"}
-        for index in range(150)
-    ]
-    document = {"schema_version": 1, "selection_sha256": canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}), "selected_bindings": rows}
-    campaign = {"attempt_receipts": [{"attempt_id": row["attempt_id"], "episode_id": row["episode_id"], "accepted_success": True, "release_stage": "seen", "episode_manifest_sha256": row["episode_manifest_sha256"]} for row in rows]}
+    document, campaign = _selected_150_document()
+    rows = document["selected_bindings"]
 
-    assert validate_selected_bindings(document, campaign) == {row["attempt_id"]: row["episode_manifest_sha256"] for row in rows}
+    assert validate_selected_bindings(document, campaign) == {row["attempt_id"]: row["episode_manifest_sha256"] for row in rows}  # type: ignore[index]
     document["selected_bindings"][0]["episode_id"] = "wrong"
     with pytest.raises(ValueError, match="selected|identity|binding"):
         validate_selected_bindings(document, campaign)
 
 
-@pytest.mark.parametrize("mutation", ["selection_sha256", "count", "manifest"])
-def test_selected_150_rejects_hash_count_or_campaign_manifest_drift(mutation: str) -> None:
+@pytest.mark.parametrize("mutation", ["selection_sha256", "count", "accepted", "stage", "outcome"])
+def test_selected_150_rejects_hash_count_or_campaign_acceptance_drift(mutation: str) -> None:
     from lehome_train.groot.runtime_mixture_builder import validate_selected_bindings
-    from lehome_train.io import canonical_json_sha256
 
-    rows = [
-        {"attempt_id": f"attempt-{index:03d}", "episode_id": f"attempt-{index:03d}", "episode_manifest_sha256": f"{index:064x}"}
-        for index in range(150)
-    ]
-    document = {"schema_version": 1, "selection_sha256": canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}), "selected_bindings": rows}
-    campaign = {"attempt_receipts": [{"attempt_id": row["attempt_id"], "episode_id": row["episode_id"], "accepted_success": True, "release_stage": "seen", "episode_manifest_sha256": row["episode_manifest_sha256"]} for row in rows]}
+    document, campaign = _selected_150_document()
     if mutation == "selection_sha256":
         document["selection_sha256"] = "0" * 64
     elif mutation == "count":
-        document["selected_bindings"] = rows[:-1]
+        document["selected_bindings"] = document["selected_bindings"][:-1]
+    elif mutation == "accepted":
+        campaign["attempt_receipts"][0]["accepted_success"] = False
+    elif mutation == "stage":
+        campaign["attempt_receipts"][0]["release_stage"] = "public_unseen"
     else:
-        campaign["attempt_receipts"][0]["episode_manifest_sha256"] = "f" * 64
+        campaign["attempt_receipts"][0]["outcome"] = "failure"
 
-    with pytest.raises(ValueError, match="selected-150|manifest|binding"):
+    with pytest.raises(ValueError, match="selected-150|accepted|binding|ledger"):
         validate_selected_bindings(document, campaign)
 
 
@@ -117,18 +190,100 @@ def test_selected_150_rejects_legacy_opaque_hash_but_derives_a_new_canonical_art
     from lehome_train.groot.runtime_mixture_builder import validate_selected_bindings
     from lehome_train.io import canonical_json_sha256
 
-    rows = [
-        {"attempt_id": f"attempt-{index:03d}", "episode_id": f"attempt-{index:03d}", "episode_manifest_sha256": f"{index:064x}"}
-        for index in range(150)
-    ]
+    derived, campaign = _selected_150_document()
+    rows = derived["selected_bindings"]
     original_rows = json.loads(json.dumps(rows))
-    campaign = {"attempt_receipts": [{"attempt_id": row["attempt_id"], "episode_id": row["episode_id"], "accepted_success": True, "release_stage": "seen", "episode_manifest_sha256": row["episode_manifest_sha256"]} for row in rows]}
     legacy = {"schema_version": 1, "selection_sha256": "a" * 64, "selected_bindings": rows}
     with pytest.raises(ValueError, match="canonical"):
         validate_selected_bindings(legacy, campaign)
     derived = {"schema_version": 1, "selection_sha256": canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}), "selected_bindings": rows}
     assert validate_selected_bindings(derived, campaign)["attempt-000"] == "0" * 64
     assert rows == original_rows
+
+
+def test_selected_150_raw_roots_use_the_legacy_field_as_a_checksum_manifest_binding(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_builder import (
+        validate_selected_bindings,
+        validate_selected_raw_roots,
+    )
+
+    campaign, document, receipt = _raw_selected_campaign(tmp_path)
+    raw = campaign / "raw" / "attempt-000"
+    assert document["selected_bindings"][0]["episode_manifest_sha256"] == hashlib.sha256((raw / "SHA256SUMS.json").read_bytes()).hexdigest()
+    assert document["selected_bindings"][0]["episode_manifest_sha256"] != hashlib.sha256((raw / "episode.json").read_bytes()).hexdigest()
+
+    validate_selected_raw_roots(campaign, validate_selected_bindings(document, receipt), receipt)
+
+
+@pytest.mark.parametrize("mutation", ["checksum", "unused_selected", "raw_stage", "raw_outcome"])
+def test_selected_150_raw_roots_reject_checksum_or_acceptance_tampering(
+    tmp_path: Path, mutation: str,
+) -> None:
+    from lehome_train.groot.runtime_mixture_builder import (
+        validate_selected_bindings,
+        validate_selected_raw_roots,
+    )
+    from lehome_train.io import canonical_json_sha256
+
+    campaign, document, receipt = _raw_selected_campaign(tmp_path)
+    index = 149 if mutation == "unused_selected" else 0
+    raw = campaign / "raw" / f"attempt-{index:03d}"
+    if mutation == "checksum":
+        _write(raw / "SHA256SUMS.json", {"episode.json": {"sha256": "0" * 64, "size": 0}})
+    else:
+        episode = json.loads((raw / "episode.json").read_text(encoding="utf-8"))
+        if mutation == "raw_stage":
+            episode["identity"]["release_stage"] = "public_unseen"
+        elif mutation == "raw_outcome":
+            episode["outcome"] = "failure"
+        else:
+            episode["identity"]["category"] = "wrong"
+        _write(raw / "episode.json", episode)
+        episode_bytes = (raw / "episode.json").read_bytes()
+        _write(raw / "SHA256SUMS.json", {
+            "episode.json": {"sha256": hashlib.sha256(episode_bytes).hexdigest(), "size": len(episode_bytes)},
+        })
+        document["selected_bindings"][index]["episode_manifest_sha256"] = hashlib.sha256((raw / "SHA256SUMS.json").read_bytes()).hexdigest()
+        document["selection_sha256"] = canonical_json_sha256({
+            "schema_version": 1,
+            "selected_bindings": document["selected_bindings"],
+        })
+
+    with pytest.raises(ValueError, match="raw|checksum|manifest|accepted|identity"):
+        validate_selected_raw_roots(campaign, validate_selected_bindings(document, receipt), receipt)
+
+
+def test_builder_rejects_an_unused_selected_raw_tamper_before_window_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lehome_train.groot.runtime_mixture_builder import build_runtime_mixture
+    from lehome_train.io import canonical_json_sha256
+
+    campaign, document, receipt = _raw_selected_campaign(tmp_path)
+    _write(campaign / "campaign-receipt.json", receipt)
+    (campaign / "raw" / "attempt-149" / "SHA256SUMS.json").write_text("tampered", encoding="utf-8")
+    selected = tmp_path / "selected-150.json"
+    _write(selected, document)
+    organizer = tmp_path / "organizer"
+    _write(organizer / "manifest.json", {"train_episode_ids": [], "validation_episode_ids": []})
+    plan = {"selected_frame_ranges": []}
+    plan["sha256"] = canonical_json_sha256(plan)
+    state = tmp_path / "plan.json"
+    _write(state, {"plan": plan, "plan_sha256": plan["sha256"]})
+    monkeypatch.setattr(
+        "lehome_train.groot.runtime_mixture_builder.validate_plan_windows",
+        lambda *_args, **_kwargs: pytest.fail("raw validation must precede window selection"),
+    )
+
+    with pytest.raises(ValueError, match="raw rollout checksum-manifest binding drift"):
+        build_runtime_mixture(
+            organizer_root=organizer,
+            campaign_root=campaign,
+            source_publications=tmp_path / "source-publications.json",
+            selected_bindings=selected,
+            plan_state=state,
+            destination=tmp_path / "mixture",
+        )
 
 
 def test_loader_pilot_requires_the_canonical_x86_worker_sweep_but_rejects_caller_throughput_gate(
