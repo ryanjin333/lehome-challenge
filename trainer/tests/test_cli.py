@@ -36,6 +36,11 @@ def test_cli_help() -> None:
         "report",
         "sync",
         "restore",
+        "build-runtime-mixture",
+        "pilot-runtime-mixture",
+        "publish-runtime-source",
+        "publish-runtime-mixture",
+        "finalize-runtime-mixture",
     ],
 )
 def test_cli_registers_command_group(command: str) -> None:

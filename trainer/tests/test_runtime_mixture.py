@@ -48,8 +48,13 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
     for root in (bc, round_root):
         _write(root / "receipt.json", {"accepted": True})
         _write(root / "acceptance.json", {"accepted_success": True})
-    _write(bc / "publication-readback.json", {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "b" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True})
-    _write(round_root / "publication-readback.json", {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "c" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True})
+    # Publication receipts live outside the mounted source trees.  Adding a
+    # receipt after publishing must not mutate the tree that its readback
+    # proves, otherwise source-tree hashing would form a cycle.
+    bc_publication = tmp_path / "source-publication" / "bc-readback.json"
+    rollout_publication = tmp_path / "source-publication" / "rollout-readback.json"
+    _write(bc_publication, {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "b" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True})
+    _write(rollout_publication, {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "c" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True})
     _write(bc / "manifest.json", {"fps": 30, "fixed_language_instruction": "fold the garment on the table", "future_actions": {"horizon": 16}, "train_episode_ids": [str(index) for index in range(7)], "validation_episode_ids": []})
     # The loader test injects decoding, so opaque video bytes are enough for contract coverage.
     for episode in range(7):
@@ -76,8 +81,8 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
     }}
     _write(normalization, {"schema_version": 3, "train_only": True, "derivation": {"train_window_ids": [f"bc-{index}" for index in range(7)] + [f"rollout-{index}" for index in range(3)], "sample_count": 160}, "statistics": statistics})
     sources = [
-        {"source_id": "bc", "source_type": "bc", "quota": 7, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(bc), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(bc / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(bc / "acceptance.json"), "publication": {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "b" * 40, "prefix": "bc/full", "readback_receipt_path": "publication-readback.json", "readback_receipt_sha256": _sha_path(bc / "publication-readback.json")}, "source_identity": {"prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": _sha_path(bc / "manifest.json"), "action_source": "organizer_expert"}},
-        {"source_id": "round-1", "source_type": "rollout", "quota": 3, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(round_root), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(round_root / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(round_root / "acceptance.json"), "publication": {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "c" * 40, "prefix": "rollouts/round-1", "readback_receipt_path": "publication-readback.json", "readback_receipt_sha256": _sha_path(round_root / "publication-readback.json")}, "source_identity": {"round_manifest_path": "round.json", "round_manifest_sha256": "a" * 64, "action_source": "policy"}},
+        {"source_id": "bc", "source_type": "bc", "quota": 7, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(bc), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(bc / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(bc / "acceptance.json"), "publication": {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "b" * 40, "prefix": "bc/full", "readback_receipt_path": str(bc_publication), "readback_receipt_sha256": _sha_path(bc_publication)}, "source_identity": {"prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": _sha_path(bc / "manifest.json"), "action_source": "organizer_expert"}},
+        {"source_id": "round-1", "source_type": "rollout", "quota": 3, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(round_root), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(round_root / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(round_root / "acceptance.json"), "publication": {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "c" * 40, "prefix": "rollouts/round-1", "readback_receipt_path": str(rollout_publication), "readback_receipt_sha256": _sha_path(rollout_publication)}, "source_identity": {"round_manifest_path": "round.json", "round_manifest_sha256": "a" * 64, "action_source": "policy"}},
     ]
     _write(round_root / "round.json", {"round_id": "round-1", "accepted_attempt_ids": [f"attempt-{index}" for index in range(3)]})
     sources[1]["source_identity"]["round_manifest_sha256"] = _sha_path(round_root / "round.json")
@@ -89,7 +94,7 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
     for index, (attempt_root, attempt_hash) in enumerate(attempts):
         windows.append({"window_id": f"rollout-{index}", "source_id": "round-1", "source_type": "rollout", "source_episode_id": f"attempt-{index}", "start": 0, "stop": 16, "frame_ids": list(range(16)), "lineage_id": f"rollout-{index}", "split": "train", "source_locator": {"attempt_root": attempt_root, "attempt_manifest_path": f"{attempt_root}/episode.json", "attempt_manifest_sha256": attempt_hash}})
     mixture_id = "d" * 64
-    manifest = {"schema_version": 2, "kind": "lehome_runtime_mixture", "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40, "safe_prefix": f"mixtures/{mixture_id}", "mixture_id": mixture_id, "sources": sources, "camera_schema": ["observation.images.top_rgb", "observation.images.left_rgb", "observation.images.right_rgb"], "image_shape": [480, 640, 3], "state_schema": {"dimension": 12, "storage": "absolute"}, "action_schema": {"dimension": 12, "storage": "absolute"}, "fps": 30, "action_horizon": 16, "instruction": "fold the garment on the table", "schedule_seed": 17, "cycle_size": 10, "mixture_normalization": {"path": "mixture-normalization.json", "sha256": sha256_file(normalization), "byte_size": normalization.stat().st_size}, "window_index": {"path": "windows.json", "sha256": "", "byte_size": 0}}
+    manifest = {"schema_version": 2, "kind": "lehome_runtime_mixture", "repository": "ryanjin333/lehome-groot-n17-data", "safe_prefix": f"mixtures/{mixture_id}", "mixture_id": mixture_id, "sources": sources, "camera_schema": ["observation.images.top_rgb", "observation.images.left_rgb", "observation.images.right_rgb"], "image_shape": [480, 640, 3], "state_schema": {"dimension": 12, "storage": "absolute"}, "action_schema": {"dimension": 12, "storage": "absolute"}, "fps": 30, "action_horizon": 16, "instruction": "fold the garment on the table", "schedule_seed": 17, "cycle_size": 10, "mixture_normalization": {"path": "mixture-normalization.json", "sha256": sha256_file(normalization), "byte_size": normalization.stat().st_size}, "window_index": {"path": "windows.json", "sha256": "", "byte_size": 0}}
     index = {"schema_version": 2, "manifest_sha256": canonical_json_sha256(manifest), "windows": windows}
     index_path = tmp_path / "windows.json"
     _write(index_path, index)
@@ -97,9 +102,9 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
     manifest_path = tmp_path / "mixture.json"
     _write(manifest_path, manifest)
     release_receipt = tmp_path / "release-receipt.json"
-    _write(release_receipt, {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40, "remote_prefix": f"mixtures/{mixture_id}", "mixture_id": mixture_id, "fresh_readback_verified": True, "tree_listing_verified": True})
+    _write(release_receipt, {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40, "remote_prefix": f"mixtures/{mixture_id}", "mixture_id": mixture_id, "pending_receipt_sha256": "e" * 64, "artifact_entries": [{"relative_path": relative, "sha256": _sha_path(tmp_path / relative), "byte_size": (tmp_path / relative).stat().st_size} for relative in ("mixture.json", "windows.json", "mixture-normalization.json")], "fresh_readback_verified": True, "tree_listing_verified": True})
     mounts = tmp_path / "mounts.json"
-    _write(mounts, {"schema_version": 2, "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40, "safe_prefix": f"mixtures/{mixture_id}", "release_receipt_path": str(release_receipt), "release_receipt_sha256": _sha_path(release_receipt), "mounts": [{"source_id": source["source_id"], "root": str(root), "source_tree_sha256": source["source_tree_sha256"], "artifact_receipt_sha256": source["artifact_receipt_sha256"]} for source, root in zip(sources, (bc, round_root), strict=True)]})
+    _write(mounts, {"schema_version": 2, "repository": "ryanjin333/lehome-groot-n17-data", "safe_prefix": f"mixtures/{mixture_id}", "deployment_receipt_path": str(release_receipt), "deployment_receipt_sha256": _sha_path(release_receipt), "mounts": [{"source_id": source["source_id"], "root": str(root), "source_tree_sha256": source["source_tree_sha256"], "artifact_receipt_sha256": source["artifact_receipt_sha256"]} for source, root in zip(sources, (bc, round_root), strict=True)]})
     return manifest_path, index_path, mounts
 
 
@@ -354,7 +359,7 @@ def test_mount_descriptor_requires_a_fresh_readback_of_the_exact_runtime_release
 
     manifest, _index, mounts = _contract(tmp_path)
     descriptor = json.loads(mounts.read_text())
-    descriptor["revision"] = "b" * 40
+    descriptor["safe_prefix"] = "mixtures/" + "b" * 64
     _write(mounts, descriptor)
     with pytest.raises(ValueError, match="mount release identity"):
         load_runtime_contract(manifest, mounts)
@@ -382,6 +387,14 @@ def test_provenance_rejects_bc_validation_or_unaccepted_rollout_windows(tmp_path
     _write(manifest, payload)
     mounts_payload = json.loads(mounts.read_text())
     mounts_payload["mounts"][0]["source_tree_sha256"] = payload["sources"][0]["source_tree_sha256"]
+    deployment = Path(mounts_payload["deployment_receipt_path"])
+    deployment_payload = json.loads(deployment.read_text())
+    deployment_payload["artifact_entries"] = [
+        {"relative_path": relative, "sha256": _sha_path(tmp_path / relative), "byte_size": (tmp_path / relative).stat().st_size}
+        for relative in ("mixture.json", "windows.json", "mixture-normalization.json")
+    ]
+    _write(deployment, deployment_payload)
+    mounts_payload["deployment_receipt_sha256"] = _sha_path(deployment)
     _write(mounts, mounts_payload)
     with pytest.raises(ValueError, match="BC window split"):
         load_runtime_contract(manifest, mounts)

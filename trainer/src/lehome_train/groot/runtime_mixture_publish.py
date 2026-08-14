@@ -5,13 +5,22 @@ All network activity is behind ``HubTransport``; callers supply the process
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 from typing import Any
 
-from lehome_train.groot.runtime_mixture import APPROVED_MIXTURE_REPOSITORY, source_tree_sha256
+from lehome_train.groot.runtime_mixture import (
+    ACTION_HORIZON,
+    APPROVED_MIXTURE_REPOSITORY,
+    CAMERAS,
+    FPS,
+    INSTRUCTION,
+    load_runtime_contract,
+)
 from lehome_train.hub import HubTransport, require_access, upload_files, download_files, list_repository_tree
 from lehome_train.io import atomic_write_json, canonical_json_sha256, sha256_file
 from lehome_train.models import SyncEntry
@@ -31,11 +40,33 @@ def _entries(root: Path) -> tuple[SyncEntry, ...]:
     return tuple(result)
 
 
+def _load_exact(path: Path, *, keys: set[str], label: str) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} is missing or unsafe")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} is malformed") from error
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError(f"{label} has an incompatible schema")
+    return value
+
+
+def _tree_matches(tree: tuple[object, ...], *, prefix: str, entries: tuple[SyncEntry, ...]) -> bool:
+    expected = {f"{prefix}/{entry.relative_path}" for entry in entries}
+    observed = {
+        entry.relative_path
+        for entry in tree
+        if getattr(entry, "entry_type", None) == "file" and getattr(entry, "relative_path", "").startswith(prefix + "/")
+    }
+    return observed == expected
+
+
 def publish_source(*, root: str | Path, source_type: str, round_id: str | None, revision: str, receipt_path: str | Path, transport: HubTransport) -> dict[str, object]:
     """Publish one complete mounted source tree and verify a fresh readback."""
-    if source_type == "bc":
+    if source_type == "bc" and round_id is None:
         prefix = "bc/full"
-    elif source_type == "rollout" and isinstance(round_id, str) and round_id and "/" not in round_id:
+    elif source_type == "rollout" and isinstance(round_id, str) and re.fullmatch(r"[1-9][0-9]*", round_id):
         prefix = f"rollouts/round-{round_id}"
     else:
         raise ValueError("source publication type or round ID is invalid")
@@ -46,16 +77,14 @@ def publish_source(*, root: str | Path, source_type: str, round_id: str | None, 
     require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=True)
     revision = upload_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, source=local, entries=entries, remote_prefix=prefix, max_attempts=1)
     tree = list_repository_tree(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, max_attempts=1)
-    expected = {f"{prefix}/{entry.relative_path}" for entry in entries}
-    observed = {entry.relative_path for entry in tree if entry.entry_type == "file" and entry.relative_path.startswith(prefix + "/")}
-    if observed != expected:
+    if not _tree_matches(tree, prefix=prefix, entries=entries):
         raise ValueError("source publication remote tree differs from the complete local source")
     with tempfile.TemporaryDirectory(prefix="lehome-runtime-readback-") as temporary:
         readback = Path(temporary)
         download_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, destination=readback, relative_paths=tuple(item.relative_path for item in entries), remote_prefix=prefix, max_attempts=1)
         if _entries(readback) != entries:
             raise ValueError("source publication readback hash or size mismatch")
-    receipt = {"repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": revision, "remote_prefix": prefix, "source_tree_sha256": source_tree_sha256(local), "fresh_readback_verified": True, "tree_listing_verified": True}
+    receipt = {"repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": revision, "remote_prefix": prefix, "fresh_readback_verified": True, "tree_listing_verified": True}
     target = Path(receipt_path)
     if target.exists() or target.is_symlink():
         raise FileExistsError("source publication receipt destination is immutable")
@@ -66,8 +95,8 @@ def publish_source(*, root: str | Path, source_type: str, round_id: str | None, 
 def publish_pending_mixture(*, pending_root: str | Path, revision: str, receipt_path: str | Path, transport: HubTransport) -> dict[str, object]:
     """Upload only a builder's pending bytes under its deterministic prefix."""
     root = Path(pending_root)
-    pending = __import__("json").loads((root / "publication-pending.json").read_text(encoding="utf-8"))
-    if not isinstance(pending, dict) or pending.get("repository") != APPROVED_MIXTURE_REPOSITORY or pending.get("publication_pending") is not True or not isinstance(pending.get("mixture_id"), str):
+    pending = _load_exact(root / "publication-pending.json", keys={"schema_version", "kind", "repository", "mixture_id", "prefix", "sources", "normalization_sha256", "windows_sha256", "publication_pending"}, label="mixture publication pending artifact")
+    if pending.get("schema_version") != 1 or pending.get("kind") != "runtime_mixture_publication_pending" or pending.get("repository") != APPROVED_MIXTURE_REPOSITORY or pending.get("publication_pending") is not True or not isinstance(pending.get("mixture_id"), str):
         raise ValueError("mixture publication pending artifact is invalid")
     prefix = f"mixtures/{pending['mixture_id']}"
     if pending.get("prefix") != prefix:
@@ -75,6 +104,9 @@ def publish_pending_mixture(*, pending_root: str | Path, revision: str, receipt_
     entries = _entries(root)
     require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=True)
     immutable = upload_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, source=root, entries=entries, remote_prefix=prefix, max_attempts=1)
+    tree = list_repository_tree(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=immutable, max_attempts=1)
+    if not _tree_matches(tree, prefix=prefix, entries=entries):
+        raise ValueError("mixture publication remote tree differs from the complete pending artifact")
     with tempfile.TemporaryDirectory(prefix="lehome-mixture-readback-") as temporary:
         readback = Path(temporary)
         download_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=immutable, destination=readback, relative_paths=tuple(item.relative_path for item in entries), remote_prefix=prefix, max_attempts=1)
@@ -88,20 +120,152 @@ def publish_pending_mixture(*, pending_root: str | Path, revision: str, receipt_
     return receipt
 
 
-def finalize_pending_mixture(*, pending_root: str | Path, publication_receipt: str | Path, destination: str | Path, source_mounts: dict[str, str]) -> Path:
-    """Turn verified pending bytes into the schema consumed by RuntimeMixtureDataset."""
+def _entry_records(entries: tuple[SyncEntry, ...]) -> list[dict[str, object]]:
+    return [
+        {"relative_path": entry.relative_path, "sha256": entry.sha256, "byte_size": entry.byte_size}
+        for entry in entries
+    ]
+
+
+def finalize_pending_mixture(
+    *,
+    pending_root: str | Path,
+    publication_receipt: str | Path,
+    destination: str | Path,
+    deployment_receipt_path: str | Path,
+    source_mounts: dict[str, str],
+    revision: str,
+    transport: HubTransport,
+) -> Path:
+    """Publish and materialize final schema-2 bytes without a revision hash cycle.
+
+    The builder-pending revision remains immutable audit evidence.  This stage
+    copies those bytes, replaces only the runtime index with the schema-2
+    index, publishes the complete final tree, and records its actual revision
+    externally.  ``mixture.json`` deliberately omits that revision: the
+    deployment receipt binds it to exact final bytes after readback.
+    """
     root, output = Path(pending_root), Path(destination)
-    pending = __import__("json").loads((root / "publication-pending.json").read_text(encoding="utf-8"))
-    receipt = __import__("json").loads(Path(publication_receipt).read_text(encoding="utf-8"))
-    if output.exists() or pending.get("mixture_id") != receipt.get("mixture_id") or receipt.get("repository") != APPROVED_MIXTURE_REPOSITORY or receipt.get("remote_prefix") != pending.get("prefix") or receipt.get("fresh_readback_verified") is not True or receipt.get("tree_listing_verified") is not True:
+    pending = _load_exact(root / "publication-pending.json", keys={"schema_version", "kind", "repository", "mixture_id", "prefix", "sources", "normalization_sha256", "windows_sha256", "publication_pending"}, label="mixture publication pending artifact")
+    release = Path(publication_receipt)
+    receipt = _load_exact(release, keys={"repository", "immutable_revision", "remote_prefix", "mixture_id", "fresh_readback_verified", "tree_listing_verified"}, label="mixture publication receipt")
+    if (
+        output.exists()
+        or pending.get("schema_version") != 1
+        or pending.get("kind") != "runtime_mixture_publication_pending"
+        or pending.get("repository") != APPROVED_MIXTURE_REPOSITORY
+        or pending.get("publication_pending") is not True
+        or not isinstance(pending.get("mixture_id"), str)
+        or pending.get("mixture_id") != receipt.get("mixture_id")
+        or receipt.get("repository") != APPROVED_MIXTURE_REPOSITORY
+        or receipt.get("remote_prefix") != pending.get("prefix")
+        or type(receipt.get("immutable_revision")) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("immutable_revision"))) is None
+        or receipt.get("fresh_readback_verified") is not True
+        or receipt.get("tree_listing_verified") is not True
+    ):
         raise ValueError("mixture finalization receipt or destination is invalid")
-    windows = __import__("json").loads((root / "windows.json").read_text(encoding="utf-8"))["windows"]
-    output.mkdir(parents=True)
-    shutil.copy2(root / "mixture-normalization.json", output / "mixture-normalization.json")
-    manifest = {"schema_version": 2, "kind": "lehome_runtime_mixture", "repository": APPROVED_MIXTURE_REPOSITORY, "revision": receipt["immutable_revision"], "safe_prefix": pending["prefix"], "mixture_id": pending["mixture_id"], "sources": pending["sources"], "camera_schema": ["observation.images.top_rgb", "observation.images.left_rgb", "observation.images.right_rgb"], "image_shape": [480, 640, 3], "state_schema": {"dimension": 12, "storage": "absolute"}, "action_schema": {"dimension": 12, "storage": "absolute"}, "fps": 30, "action_horizon": 16, "instruction": "fold the garment on the table", "schedule_seed": 17, "cycle_size": 10, "mixture_normalization": {"path": "mixture-normalization.json", "sha256": sha256_file(output / "mixture-normalization.json"), "byte_size": (output / "mixture-normalization.json").stat().st_size}, "window_index": {"path": "windows.json", "sha256": "", "byte_size": 0}}
-    index = {"schema_version": 2, "manifest_sha256": canonical_json_sha256(manifest), "windows": windows}
-    atomic_write_json(output / "windows.json", index)
-    manifest["window_index"] = {"path": "windows.json", "sha256": sha256_file(output / "windows.json"), "byte_size": (output / "windows.json").stat().st_size}
-    atomic_write_json(output / "mixture.json", manifest)
-    atomic_write_json(output / "mounts.json", {"schema_version": 2, "repository": manifest["repository"], "revision": manifest["revision"], "safe_prefix": manifest["safe_prefix"], "release_receipt_path": str(Path(publication_receipt).resolve()), "release_receipt_sha256": sha256_file(Path(publication_receipt)), "mounts": [{"source_id": source["source_id"], "root": source_mounts[source["source_id"]], "source_tree_sha256": source["source_tree_sha256"], "artifact_receipt_sha256": source["artifact_receipt_sha256"]} for source in pending["sources"]]})
-    return output
+    normalization = root / "mixture-normalization.json"
+    windows_file = root / "windows.json"
+    if sha256_file(normalization) != pending["normalization_sha256"] or sha256_file(windows_file) != pending["windows_sha256"]:
+        raise ValueError("mixture finalization pending bytes drift")
+    windows_value = _load_exact(windows_file, keys={"schema_version", "windows"}, label="pending window index")
+    if windows_value["schema_version"] != 3 or not isinstance(windows_value["windows"], list):
+        raise ValueError("pending window index is invalid")
+    windows = windows_value["windows"]
+    if (
+        not isinstance(pending["sources"], list)
+        or set(source_mounts) != {item.get("source_id") for item in pending["sources"] if isinstance(item, dict)}
+        or not all(type(root) is str and Path(root).is_absolute() for root in source_mounts.values())
+        or not isinstance(revision, str)
+        or not revision
+    ):
+        raise ValueError("mixture finalization source mounts are incomplete")
+    deployment = Path(deployment_receipt_path)
+    if output.exists() or deployment.exists() or deployment.is_symlink():
+        raise FileExistsError("runtime finalization destinations are immutable")
+    staging = output.parent / f".{output.name}.{pending['mixture_id'][:12]}.tmp"
+    if staging.exists():
+        raise FileExistsError("runtime finalization staging already exists")
+    try:
+        shutil.copytree(root, staging)
+        shutil.copy2(normalization, staging / "mixture-normalization.json")
+        manifest = {"schema_version": 2, "kind": "lehome_runtime_mixture", "repository": APPROVED_MIXTURE_REPOSITORY, "safe_prefix": pending["prefix"], "mixture_id": pending["mixture_id"], "sources": pending["sources"], "camera_schema": list(CAMERAS), "image_shape": [480, 640, 3], "state_schema": {"dimension": 12, "storage": "absolute"}, "action_schema": {"dimension": 12, "storage": "absolute"}, "fps": FPS, "action_horizon": ACTION_HORIZON, "instruction": INSTRUCTION, "schedule_seed": 17, "cycle_size": 10, "mixture_normalization": {"path": "mixture-normalization.json", "sha256": sha256_file(staging / "mixture-normalization.json"), "byte_size": (staging / "mixture-normalization.json").stat().st_size}, "window_index": {"path": "windows.json", "sha256": "", "byte_size": 0}}
+        index = {"schema_version": 2, "manifest_sha256": canonical_json_sha256(manifest), "windows": windows}
+        atomic_write_json(staging / "windows.json", index)
+        manifest["window_index"] = {"path": "windows.json", "sha256": sha256_file(staging / "windows.json"), "byte_size": (staging / "windows.json").stat().st_size}
+        atomic_write_json(staging / "mixture.json", manifest)
+        entries = _entries(staging)
+        require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=True)
+        immutable = upload_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, source=staging, entries=entries, remote_prefix=str(pending["prefix"]), max_attempts=1)
+        tree = list_repository_tree(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=immutable, max_attempts=1)
+        if not _tree_matches(tree, prefix=str(pending["prefix"]), entries=entries):
+            raise ValueError("runtime deployment remote tree differs from finalized bytes")
+        with tempfile.TemporaryDirectory(prefix="lehome-runtime-final-readback-") as temporary:
+            readback = Path(temporary)
+            download_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=immutable, destination=readback, relative_paths=tuple(entry.relative_path for entry in entries), remote_prefix=str(pending["prefix"]), max_attempts=1)
+            if _entries(readback) != entries:
+                raise ValueError("runtime deployment readback hash or size mismatch")
+        deployment_value = {"repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": immutable, "remote_prefix": pending["prefix"], "mixture_id": pending["mixture_id"], "pending_receipt_sha256": sha256_file(release), "artifact_entries": _entry_records(entries), "fresh_readback_verified": True, "tree_listing_verified": True}
+        atomic_write_json(deployment, deployment_value)
+        atomic_write_json(staging / "mounts.json", {"schema_version": 2, "repository": manifest["repository"], "safe_prefix": manifest["safe_prefix"], "deployment_receipt_path": str(deployment.resolve()), "deployment_receipt_sha256": sha256_file(deployment), "mounts": [{"source_id": source["source_id"], "root": source_mounts[source["source_id"]], "source_tree_sha256": source["source_tree_sha256"], "artifact_receipt_sha256": source["artifact_receipt_sha256"]} for source in pending["sources"]]})
+        load_runtime_contract(staging / "mixture.json", staging / "mounts.json")
+        os.replace(staging, output)
+        return output
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def publish_source_from_request(path: str | Path, *, transport: HubTransport) -> dict[str, object]:
+    """Run one source publication from the exact offline-reviewable envelope."""
+
+    request = _load_exact(Path(path), keys={"schema_version", "command", "arguments"}, label="runtime source publication request")
+    arguments = request["arguments"]
+    expected = {"root", "source_type", "round_id", "revision", "receipt_path"}
+    if (
+        request["schema_version"] != 1
+        or request["command"] != "publish-runtime-source"
+        or not isinstance(arguments, dict)
+        or set(arguments) != expected
+        or any(type(arguments[key]) is not str or not arguments[key] for key in expected - {"round_id"})
+        or (arguments["round_id"] is not None and (type(arguments["round_id"]) is not str or not arguments["round_id"]))
+    ):
+        raise ValueError("runtime source publication request has an incompatible schema")
+    return publish_source(**arguments, transport=transport)
+
+
+def publish_pending_mixture_from_request(path: str | Path, *, transport: HubTransport) -> dict[str, object]:
+    """Run pending publication from the exact offline-reviewable envelope."""
+
+    request = _load_exact(Path(path), keys={"schema_version", "command", "arguments"}, label="runtime mixture publication request")
+    arguments = request["arguments"]
+    expected = {"pending_root", "revision", "receipt_path"}
+    if (
+        request["schema_version"] != 1
+        or request["command"] != "publish-runtime-mixture"
+        or not isinstance(arguments, dict)
+        or set(arguments) != expected
+        or any(type(arguments[key]) is not str or not arguments[key] for key in expected)
+    ):
+        raise ValueError("runtime mixture publication request has an incompatible schema")
+    return publish_pending_mixture(**arguments, transport=transport)
+
+
+def finalize_pending_mixture_from_request(path: str | Path, *, transport: HubTransport) -> Path:
+    """Run final deployment from the exact offline-reviewable envelope."""
+
+    request = _load_exact(Path(path), keys={"schema_version", "command", "arguments"}, label="runtime mixture finalization request")
+    arguments = request["arguments"]
+    expected = {"pending_root", "publication_receipt", "destination", "deployment_receipt_path", "source_mounts", "revision"}
+    if (
+        request["schema_version"] != 1
+        or request["command"] != "finalize-runtime-mixture"
+        or not isinstance(arguments, dict)
+        or set(arguments) != expected
+        or any(type(arguments[key]) is not str or not arguments[key] for key in expected - {"source_mounts"})
+        or not isinstance(arguments["source_mounts"], dict)
+        or any(type(key) is not str or type(value) is not str for key, value in arguments["source_mounts"].items())
+    ):
+        raise ValueError("runtime mixture finalization request has an incompatible schema")
+    return finalize_pending_mixture(**arguments, transport=transport)

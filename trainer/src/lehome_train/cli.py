@@ -286,6 +286,51 @@ def pilot_runtime_mixture(
     _fail_closed(operation)
 
 
+@app.command("publish-runtime-source")
+def publish_runtime_source(
+    request: Path = typer.Option(..., "--request"),
+) -> None:
+    """Publish one BC or rollout source through the injected Hub boundary."""
+
+    def operation() -> object:
+        from lehome_train.groot.runtime_mixture_publish import publish_source_from_request
+        from lehome_train.hub import HuggingFaceHubTransport
+
+        return publish_source_from_request(request, transport=HuggingFaceHubTransport())
+
+    _fail_closed(operation)
+
+
+@app.command("publish-runtime-mixture")
+def publish_runtime_mixture(
+    request: Path = typer.Option(..., "--request"),
+) -> None:
+    """Publish builder-pending mixture bytes through the injected Hub boundary."""
+
+    def operation() -> object:
+        from lehome_train.groot.runtime_mixture_publish import publish_pending_mixture_from_request
+        from lehome_train.hub import HuggingFaceHubTransport
+
+        return publish_pending_mixture_from_request(request, transport=HuggingFaceHubTransport())
+
+    _fail_closed(operation)
+
+
+@app.command("finalize-runtime-mixture")
+def finalize_runtime_mixture(
+    request: Path = typer.Option(..., "--request"),
+) -> None:
+    """Publish verified final bytes and write the local runtime deployment mount."""
+
+    def operation() -> object:
+        from lehome_train.groot.runtime_mixture_publish import finalize_pending_mixture_from_request
+        from lehome_train.hub import HuggingFaceHubTransport
+
+        return {"destination": str(finalize_pending_mixture_from_request(request, transport=HuggingFaceHubTransport()))}
+
+    _fail_closed(operation)
+
+
 @app.command("prepare")
 def prepare(
     request: Path = typer.Option(..., "--request"),

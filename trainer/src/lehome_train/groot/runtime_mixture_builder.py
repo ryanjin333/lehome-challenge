@@ -55,6 +55,12 @@ def _relative(value: object, label: str) -> str:
     return value
 
 
+def _external_receipt(value: object, label: str) -> Path:
+    if type(value) is not str or not value or not Path(value).is_absolute():
+        raise ValueError(f"{label} must be an absolute path")
+    return Path(value)
+
+
 def _source_publications(path: Path, roots: Mapping[str, Path]) -> dict[str, dict[str, object]]:
     """Authenticate separately published BC and rollout source trees.
 
@@ -78,8 +84,7 @@ def _source_publications(path: Path, roots: Mapping[str, Path]) -> dict[str, dic
             expected_prefix is None and re.fullmatch(r"rollouts/round-[1-9][0-9]*", prefix) is None
         ):
             raise ValueError("runtime mixture source publication prefix is invalid")
-        receipt_relative = _relative(item["readback_receipt_path"], "runtime mixture source readback receipt path")
-        receipt = roots[source_id] / receipt_relative
+        receipt = _external_receipt(item["readback_receipt_path"], "runtime mixture source readback receipt path")
         if receipt.is_symlink() or not receipt.is_file() or sha256_file(receipt) != _sha(item["readback_receipt_sha256"], "runtime mixture source readback receipt hash"):
             raise ValueError("runtime mixture source publication readback receipt drift")
         value = _load(receipt, "runtime mixture source publication readback receipt")
@@ -262,6 +267,8 @@ def _normalization_statistics(windows: list[dict[str, Any]], *, organizer_root: 
 def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Path, source_publications: str | Path, selected_bindings: str | Path, plan_state: str | Path, destination: str | Path) -> dict[str, Any]:
     """Create immutable local publication-pending bytes, never an authorized run."""
     organizer, campaign, destination = Path(organizer_root), Path(campaign_root), Path(destination)
+    if Path(selected_bindings).name != "selected-150.json" or Path(source_publications).name != "source-publications.json":
+        raise ValueError("runtime mixture requires explicit selected-150.json and source-publications.json")
     state = _load(Path(plan_state), "persisted mix-plan state"); plan = state.get("plan")
     if not isinstance(plan, dict) or plan.get("sha256") != state.get("plan_sha256") or canonical_json_sha256({key: value for key, value in plan.items() if key != "sha256"}) != plan.get("sha256"):
         raise ValueError("persisted plan hash is invalid")

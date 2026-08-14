@@ -90,6 +90,12 @@ def _relative(value: object, *, label: str) -> str:
     return value
 
 
+def _absolute_file_path(value: object, *, label: str) -> Path:
+    if type(value) is not str or not value or not Path(value).is_absolute():
+        raise ValueError(f"{label} must be an absolute path")
+    return Path(value)
+
+
 def _digest(value: object, *, label: str) -> str:
     if type(value) is not str or not _SHA256.fullmatch(value):
         raise ValueError(f"{label} must be a SHA-256")
@@ -152,7 +158,6 @@ class Window:
 @dataclass(frozen=True, slots=True)
 class MixtureManifest:
     repository: str
-    revision: str
     safe_prefix: str
     mixture_id: str
     sources: tuple[Source, ...]
@@ -226,7 +231,7 @@ def _validate_source_publication(kind: str, value: object) -> dict[str, object]:
         kind == "rollout" and re.fullmatch(r"rollouts/round-[1-9][0-9]*", prefix) is None
     ) or kind == "dagger":
         raise ValueError("source publication prefix is not approved for its source type")
-    _relative(value["readback_receipt_path"], label="source publication readback receipt path")
+    _absolute_file_path(value["readback_receipt_path"], label="source publication readback receipt path")
     _digest(value["readback_receipt_sha256"], label="source publication readback receipt hash")
     return dict(value)
 
@@ -303,7 +308,7 @@ def _manifest_digest_binding(document: dict[str, object]) -> str:
 def _parse_manifest(path: Path) -> MixtureManifest:
     document = _load_object(path, label="mixture manifest")
     required = {
-        "schema_version", "kind", "repository", "revision", "safe_prefix", "mixture_id", "sources", "camera_schema", "image_shape", "state_schema", "action_schema", "fps", "action_horizon", "instruction", "schedule_seed", "cycle_size", "mixture_normalization", "window_index",
+        "schema_version", "kind", "repository", "safe_prefix", "mixture_id", "sources", "camera_schema", "image_shape", "state_schema", "action_schema", "fps", "action_horizon", "instruction", "schedule_seed", "cycle_size", "mixture_normalization", "window_index",
     }
     if set(document) == required | {"self_sha256"}:
         declared = _digest(document["self_sha256"], label="manifest self hash")
@@ -318,9 +323,6 @@ def _parse_manifest(path: Path) -> MixtureManifest:
     repository = document["repository"]
     if repository != APPROVED_MIXTURE_REPOSITORY:
         raise ValueError("repository is not an approved private repository")
-    revision = document["revision"]
-    if type(revision) is not str or not _REVISION.fullmatch(revision):
-        raise ValueError("revision is floating or invalid")
     safe_prefix = _relative(document["safe_prefix"], label="safe prefix")
     mixture_id = _digest(document["mixture_id"], label="mixture ID")
     if safe_prefix != f"mixtures/{mixture_id}":
@@ -353,7 +355,7 @@ def _parse_manifest(path: Path) -> MixtureManifest:
     if not isinstance(index, dict):
         raise ValueError("window index binding is invalid")
     _exact(index, {"path", "sha256", "byte_size"}, label="window index binding")
-    return MixtureManifest(str(repository), str(revision), safe_prefix, mixture_id, sources, schedule_seed, cycle_size, _relative(index["path"], label="window index path"), _digest(index["sha256"], label="window index hash"), _integer(index["byte_size"], label="window index size"), _relative(normalization["path"], label="mixture normalization path"), _digest(normalization["sha256"], label="mixture normalization hash"), _integer(normalization["byte_size"], label="mixture normalization size"), document)
+    return MixtureManifest(str(repository), safe_prefix, mixture_id, sources, schedule_seed, cycle_size, _relative(index["path"], label="window index path"), _digest(index["sha256"], label="window index hash"), _integer(index["byte_size"], label="window index size"), _relative(normalization["path"], label="mixture normalization path"), _digest(normalization["sha256"], label="mixture normalization hash"), _integer(normalization["byte_size"], label="mixture normalization size"), document)
 
 
 def _safe_file(root: Path, relative: str, *, label: str) -> Path:
@@ -370,31 +372,51 @@ def _safe_file(root: Path, relative: str, *, label: str) -> Path:
 
 def _validate_mounts(path: Path, manifest: MixtureManifest) -> dict[str, Path]:
     document = _load_object(path, label="mount descriptor")
-    _exact(document, {"schema_version", "repository", "revision", "safe_prefix", "release_receipt_path", "release_receipt_sha256", "mounts"}, label="mount descriptor")
+    _exact(document, {"schema_version", "repository", "safe_prefix", "deployment_receipt_path", "deployment_receipt_sha256", "mounts"}, label="mount descriptor")
     if document["schema_version"] != 2 or not isinstance(document["mounts"], list):
         raise ValueError("mount descriptor is invalid")
     if (
         document["repository"] != manifest.repository
-        or document["revision"] != manifest.revision
         or document["safe_prefix"] != manifest.safe_prefix
     ):
         raise ValueError("mount release identity does not match the immutable runtime manifest")
-    receipt_value = document["release_receipt_path"]
+    receipt_value = document["deployment_receipt_path"]
     if type(receipt_value) is not str or not Path(receipt_value).is_absolute():
         raise ValueError("mount release receipt path must be absolute")
     receipt_path = Path(receipt_value)
-    if receipt_path.is_symlink() or not receipt_path.is_file() or sha256_file(receipt_path) != _digest(document["release_receipt_sha256"], label="mount release receipt hash"):
-        raise ValueError("mount release receipt drift")
-    receipt = _load_object(receipt_path, label="mount release receipt")
+    if receipt_path.is_symlink() or not receipt_path.is_file() or sha256_file(receipt_path) != _digest(document["deployment_receipt_sha256"], label="mount deployment receipt hash"):
+        raise ValueError("mount deployment receipt drift")
+    receipt = _load_object(receipt_path, label="mount deployment receipt")
+    _exact(
+        receipt,
+        {"repository", "immutable_revision", "remote_prefix", "mixture_id", "pending_receipt_sha256", "artifact_entries", "fresh_readback_verified", "tree_listing_verified"},
+        label="mount deployment receipt",
+    )
     if (
         receipt.get("repository") != manifest.repository
-        or receipt.get("immutable_revision") != manifest.revision
+        or type(receipt.get("immutable_revision")) is not str
+        or _REVISION.fullmatch(str(receipt.get("immutable_revision"))) is None
         or receipt.get("remote_prefix") != manifest.safe_prefix
         or receipt.get("mixture_id") != manifest.mixture_id
         or receipt.get("fresh_readback_verified") is not True
         or receipt.get("tree_listing_verified") is not True
     ):
-        raise ValueError("mount release receipt does not prove a fresh immutable readback")
+        raise ValueError("mount deployment receipt does not prove a fresh immutable readback")
+    _digest(receipt["pending_receipt_sha256"], label="deployment pending receipt hash")
+    artifacts = receipt["artifact_entries"]
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ValueError("mount deployment receipt has no artifact tree")
+    seen_artifacts: set[str] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise ValueError("mount deployment artifact is malformed")
+        _exact(artifact, {"relative_path", "sha256", "byte_size"}, label="mount deployment artifact")
+        relative = _relative(artifact["relative_path"], label="mount deployment artifact path")
+        if relative in seen_artifacts or sha256_file(_safe_file(path.parent, relative, label="mount deployment artifact")) != _digest(artifact["sha256"], label="mount deployment artifact hash") or _integer(artifact["byte_size"], label="mount deployment artifact size") != _safe_file(path.parent, relative, label="mount deployment artifact").stat().st_size:
+            raise ValueError("mount deployment artifact tree drift")
+        seen_artifacts.add(relative)
+    if {"mixture.json", manifest.window_index_path, manifest.normalization_path} - seen_artifacts:
+        raise ValueError("mount deployment receipt omits runtime artifacts")
     required = {source.source_id: source for source in manifest.sources}
     mounts: dict[str, Path] = {}
     for entry in document["mounts"]:
@@ -419,7 +441,12 @@ def _validate_mounts(path: Path, manifest: MixtureManifest) -> dict[str, Path]:
             if sha256_file(_safe_file(root, relative, label=label)) != digest:
                 raise ValueError(f"{label} drift")
         publication = source.publication
-        readback = _safe_file(root, str(publication["readback_receipt_path"]), label="source publication readback receipt")
+        readback = _absolute_file_path(
+            publication["readback_receipt_path"],
+            label="source publication readback receipt path",
+        )
+        if readback.is_symlink() or not readback.is_file():
+            raise ValueError("source publication readback receipt is missing or unsafe")
         if sha256_file(readback) != publication["readback_receipt_sha256"]:
             raise ValueError("source publication readback receipt drift")
         readback_value = _load_object(readback, label="source publication readback receipt")
