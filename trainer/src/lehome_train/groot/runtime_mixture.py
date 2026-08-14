@@ -412,11 +412,35 @@ def _validate_source_provenance(contract: RuntimeContract) -> None:
             if train & validation:
                 raise ValueError("BC prepared train and validation episode IDs overlap")
             for window in windows:
-                expected = train if window.split == "train" else validation
-                if window.source_episode_id not in expected:
+                # A frozen mixture may demote an original training lineage to
+                # validation, but can never promote an original holdout.
+                if (
+                    window.source_episode_id not in train | validation
+                    or (window.split == "train" and window.source_episode_id not in train)
+                ):
                     raise ValueError("BC window split does not match the authenticated prepared manifest")
         elif source.source_type == "rollout":
-            accepted = _string_id_set(document.get("accepted_attempt_ids"), label="rollout accepted attempt IDs")
+            explicit = document.get("accepted_attempt_ids")
+            if explicit is not None:
+                accepted = _string_id_set(explicit, label="rollout accepted attempt IDs")
+            else:
+                receipts = document.get("attempt_receipts")
+                if not isinstance(receipts, list):
+                    raise ValueError("rollout accepted attempt ledger is absent")
+                accepted = set()
+                for receipt in receipts:
+                    if not isinstance(receipt, dict):
+                        raise ValueError("rollout accepted attempt ledger is malformed")
+                    attempt_id = receipt.get("attempt_id")
+                    if (
+                        type(attempt_id) is str
+                        and receipt.get("episode_id") == attempt_id
+                        and receipt.get("accepted_success") is True
+                        and receipt.get("release_stage") == "seen"
+                    ):
+                        accepted.add(attempt_id)
+                if not accepted:
+                    raise ValueError("rollout accepted attempt ledger has no seen successes")
             for window in windows:
                 if window.source_episode_id not in accepted:
                     raise ValueError("rollout window is absent from the authenticated accepted-attempt allowlist")
@@ -707,7 +731,13 @@ class RangeSourceLoader:
             self._cache(self._attempt_cache, attempt_root, None)
         annotations = _safe_file(attempt_root, "annotations.jsonl", label="rollout annotations")
         try:
-            rows = [_strict_pairs(list(json.loads(line, object_pairs_hook=lambda pairs: pairs).items())) for line in annotations.read_text(encoding="utf-8").splitlines() if line]
+            rows = [
+                json.loads(line, object_pairs_hook=_strict_pairs)
+                for line in annotations.read_text(encoding="utf-8").splitlines()
+                if line
+            ]
+            if not all(isinstance(row, dict) for row in rows):
+                raise ValueError("rollout annotation is not an object")
         except (OSError, UnicodeError, json.JSONDecodeError, AttributeError) as error:
             raise ValueError("invalid rollout annotations") from error
         rows = rows[window.start:window.stop]

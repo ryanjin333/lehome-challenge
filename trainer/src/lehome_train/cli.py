@@ -258,6 +258,34 @@ def _gpu_command(command: str, request: Path, runtime_factory: Optional[str]) ->
     _fail_closed(operation)
 
 
+@app.command("build-runtime-mixture")
+def build_runtime_mixture(
+    request: Path = typer.Option(..., "--request"),
+) -> None:
+    """Build the local immutable 70/30 no-recut runtime-mixture contract."""
+
+    def operation() -> object:
+        from lehome_train.groot.runtime_mixture_builder import build_from_request
+
+        return build_from_request(request)
+
+    _fail_closed(operation)
+
+
+@app.command("pilot-runtime-mixture")
+def pilot_runtime_mixture(
+    request: Path = typer.Option(..., "--request"),
+) -> None:
+    """Run the model-free authenticated runtime-mixture loader pilot."""
+
+    def operation() -> object:
+        from lehome_train.groot.runtime_mixture_builder import pilot_from_request
+
+        return pilot_from_request(request)
+
+    _fail_closed(operation)
+
+
 @app.command("prepare")
 def prepare(
     request: Path = typer.Option(..., "--request"),

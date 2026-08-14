@@ -145,6 +145,19 @@ def test_rollout_loader_rejects_checksum_or_annotation_drift(tmp_path: Path) -> 
         RangeSourceLoader(contract, decoder=lambda *_: None).load(window)
 
 
+def test_rollout_loader_parses_canonical_jsonl_annotations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from lehome_train.groot.runtime_mixture import RangeSourceLoader, load_runtime_contract
+
+    manifest, _index, mounts = _contract(tmp_path)
+    contract = load_runtime_contract(manifest, mounts)
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture._video_probe", lambda *_args, **_kwargs: None)
+    window = next(item for item in contract.windows if item.source_type == "rollout")
+
+    payload = RangeSourceLoader(contract, decoder=lambda *_: None).load(window)
+
+    assert len(payload["actions"]) == 16
+
+
 def test_manifest_accepts_only_the_campaign_private_repository(tmp_path: Path) -> None:
     from lehome_train.groot.runtime_mixture import load_runtime_contract
 
