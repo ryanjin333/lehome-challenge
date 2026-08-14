@@ -468,6 +468,42 @@ def _continuous_campaign_identity(
     return {"mix_plan_sha256": mix_plan, "dataset_manifest_sha256": manifest}
 
 
+def _runtime_final_campaign(
+    config: FineTuneLaunchConfig, experiment: ExperimentConfig, binding: Mapping[str, object],
+) -> None:
+    """Fail closed unless the final 2K run is the one measured on this GPU lease."""
+    parent = binding.get("parent_checkpoint")
+    mixture = binding.get("mixture")
+    if not isinstance(parent, Mapping) or not isinstance(mixture, Mapping):
+        raise ValueError("runtime warm-up binding lacks immutable parent and mixture identities")
+    if (
+        config.base_model_path != "/cache/parent"
+        or config.base_model_revision != MODEL_REVISION
+        or config.physical_batch_size != 64 or config.global_batch_size != 64
+        or config.gradient_accumulation_steps != 1 or config.augmentation_profile != "none"
+        or config.num_gpus != 1 or config.max_steps != 2000 or config.save_steps != 1000
+        or config.training_action_horizon != 16 or config.model_action_chunk_capacity != 40
+        or config.parent_checkpoint_repository != parent.get("repository")
+        or config.parent_checkpoint_revision != parent.get("revision")
+        or config.parent_checkpoint_subpath != parent.get("subpath")
+        or config.parent_checkpoint_artifact_sha256 != parent.get("artifact_sha256")
+    ):
+        raise ValueError("runtime production launch is not the measured direct-GPU campaign")
+    if (
+        experiment.container_digest != _CONTINUOUS_IMAGE
+        or experiment.model_revision != MODEL_REVISION
+        or experiment.physical_batch_size != 64
+        or experiment.gradient_accumulation_steps != 1
+        or experiment.sample_presentations != 128_000
+        or experiment.action_horizon != 16
+        or experiment.tune_language_backbone or experiment.tune_visual_backbone
+        or experiment.dataset_repository != mixture.get("repository")
+        or experiment.dataset_revision != mixture.get("revision")
+        or experiment.dataset_manifest_sha256 != mixture.get("manifest_sha256")
+    ):
+        raise ValueError("runtime production experiment is not the measured direct-GPU campaign")
+
+
 def _positive_integer(value: object, label: str) -> int:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{label} must be a positive integer")
@@ -1717,6 +1753,7 @@ class ProductionRuntime:
             mounts_descriptor_path=paths["runtime_mounts_descriptor"],
         )
         selected_workers = validate_gpu_warmup_receipt(warmup, expected_binding=binding)
+        _runtime_final_campaign(config, experiment, binding)
         if config.dataloader_num_workers != selected_workers:
             raise ValueError("runtime production launch workers do not match the GPU warm-up receipt")
         if experiment.action_horizon != 16:

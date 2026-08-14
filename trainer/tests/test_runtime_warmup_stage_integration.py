@@ -12,6 +12,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tarfile
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,11 +73,14 @@ def _local_stage_transport(
             return ""
         shell = command[-1]
         assert command[0] == "ssh"
-        translated = shell.replace(
-            "/tmp/lehome-runtime-warmup", str(remote_root / "tmp" / "lehome-runtime-warmup")
-        )
+        translated = shell
+        for remote in (
+            "lehome-runtime-bootstrap", "lehome-runtime-warmup", "lehome-runtime-stage",
+        ):
+            translated = translated.replace("/tmp/" + remote, str(remote_root / "tmp" / remote))
         for name, root in mounts.items():
             translated = translated.replace("/" + name, str(root))
+        translated = translated.replace(" python -c", " " + sys.executable + " -c")
         completed = subprocess.run(
             ("/bin/sh", "-c", translated), check=True, capture_output=True, text=True
         )
@@ -101,7 +105,13 @@ def _campaign_receipts(tmp_path: Path) -> dict[str, Path]:
         "deployment": _write(tmp_path / "campaign" / "deployment.json", common | {
             "immutable_revision": "a" * 40, "remote_prefix": "mixtures/" + "d" * 64,
             "mixture_id": "d" * 64, "pending_receipt_sha256": "e" * 64,
-            "artifact_entries": ["mixture.json"],
+            "artifact_entries": [
+                {"relative_path": name, "sha256": digest * 64, "byte_size": 1}
+                for name, digest in (
+                    ("mixture.json", "1"), ("windows.json", "2"),
+                    ("mixture-normalization.json", "3"),
+                )
+            ],
         }),
     }
 
@@ -299,10 +309,8 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     monkeypatch.setattr(production, "_ALLOWED_ROOTS", (prepared, output, cache))
     manifest, windows, mounts = _contract(prepared / "runtime")
     normalization = manifest.parent / "mixture-normalization.json"
-    (prepared / "code").mkdir()
     (prepared / "config" / "modality.py").parent.mkdir(parents=True, exist_ok=True)
     (prepared / "config" / "modality.py").write_text("# fixture\n", encoding="utf-8")
-    (cache / "parent").mkdir(parents=True)
 
     instance = {
         "kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 44,
@@ -311,7 +319,35 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
         "provider_response_sha256": "1" * 64, "capability_sha256": "2" * 64,
     }
-    code_revision, code_sha256 = "3" * 40, "4" * 64
+    (tmp_path / "stage").mkdir()
+    code_root = tmp_path / "reviewed-code"
+    checkpoint_module = code_root / "trainer" / "src" / "lehome_train" / "groot" / "checkpoint_identity.py"
+    checkpoint_module.parent.mkdir(parents=True)
+    shutil.copyfile(REPOSITORY / "trainer" / "src" / "lehome_train" / "groot" / "checkpoint_identity.py", checkpoint_module)
+    subprocess.run(("git", "init", "-q"), cwd=code_root, check=True)
+    subprocess.run(("git", "add", "."), cwd=code_root, check=True)
+    subprocess.run(("git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "fixture"), cwd=code_root, check=True)
+    code_revision = subprocess.run(
+        ("git", "rev-parse", "HEAD"), cwd=code_root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    bundle = tmp_path / "stage" / "code.bundle"
+    subprocess.run(("git", "bundle", "create", str(bundle), "--all"), cwd=code_root, check=True)
+    code_sha256 = sha256_file(bundle)
+    bundle_sha = tmp_path / "stage" / "code.bundle.sha256"
+    bundle_sha.write_text(code_sha256 + "  code.bundle\n", encoding="utf-8")
+    parent_root = tmp_path / "parent-source"
+    parent_root.mkdir()
+    (parent_root / "model.safetensors").write_bytes(b"fixture-parent-weights")
+    parent = tmp_path / "stage" / "parent.tar"
+    with tarfile.open(parent, "w") as archive:
+        archive.add(parent_root / "model.safetensors", arcname="model.safetensors")
+    from lehome_train.groot.checkpoint_identity import policy_artifact_sha256
+    parent_identity = LIFECYCLE.PARENT_CHECKPOINT | {
+        "archive_sha256": sha256_file(parent),
+        "artifact_sha256": policy_artifact_sha256(parent_root),
+    }
+    monkeypatch.setattr(LIFECYCLE, "PARENT_CHECKPOINT", parent_identity)
     receipts = _campaign_receipts(tmp_path)
     binding = {
         "mixture": {
@@ -342,7 +378,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "dataset_path": str(prepared / "runtime"), "dataset_revision": "6" * 40,
         "modality_config_path": str(prepared / "config" / "modality.py"), "output_dir": str(output / "run"),
         "experiment_name": "runtime-mixture-70-30", "physical_batch_size": 64,
-        "global_batch_size": 64, "max_steps": 2000, "save_steps": 1000,
+        "global_batch_size": 64, "num_gpus": 1, "max_steps": 2000, "save_steps": 1000,
         "warmup_ratio": 0.05, "dataloader_num_workers": 4,
         "training_action_horizon": 16, "model_action_chunk_capacity": 40,
         "parent_checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
@@ -358,23 +394,27 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "arguments": {"binding": binding},
     })
     launch_path = _write(tmp_path / "stage" / "warmup-launch.json", launch)
-    bootstrap = _write(tmp_path / "stage" / "bootstrap.json", {
-        "schema_version": 1, "kind": "runtime_mixture_bootstrap_stage",
-            "instance_id": instance["instance_id"],
-            "provider_response_sha256": instance["provider_response_sha256"],
-            "platform_arch": "x86_64",
-            "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
-            "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
-        "code_revision": code_revision, "code_bundle_sha256": code_sha256,
-        "bc_revision": "b" * 40, "rollout_revision": "c" * 40,
-        "deployment_revision": "a" * 40,
-        "bc_receipt_sha256": sha256_file(receipts["bc"]),
-        "rollout_receipt_sha256": sha256_file(receipts["rollout"]),
-        "deployment_receipt_sha256": sha256_file(receipts["deployment"]),
-        "transfers": [{"name": "code.bundle", "sha256": "7" * 64}],
+    hydrate = _write(tmp_path / "stage" / "hydrate.json", {
+        "schema_version": 1, "command": "hydrate-runtime-mixture",
+        "arguments": {"deployment_receipt": "/prepared/config/deployment-receipt.json", "source_readback_receipts": "/prepared/config", "destination": "/prepared/runtime", "mounts_descriptor": "/prepared/runtime/mounts.json"},
     })
+    token = tmp_path / "stage" / "runtime.token"
+    token.write_text("fixture-token", encoding="utf-8")
+    token.chmod(0o600)
+    bootstrap = tmp_path / "stage" / "bootstrap.json"
     stage_receipt = tmp_path / "stage" / "warmup-stage.json"
     runner, calls = _local_stage_transport(tmp_path / "remote", runtime_mounts)
+    LIFECYCLE.runtime_mixture_bootstrap_stage(
+        instance=instance,
+        request={
+            "code_revision": code_revision, "code_bundle_sha256": code_sha256,
+            "code_bundle": str(bundle), "code_bundle_sha256_file": str(bundle_sha),
+            "token_file": str(token), "runtime_hydrate_request": str(hydrate),
+            "parent_checkpoint": str(parent), "bc_readback_receipt": str(receipts["bc"]),
+            "rollout_readback_receipt": str(receipts["rollout"]),
+            "deployment_receipt": str(receipts["deployment"]), "bootstrap_receipt": str(bootstrap),
+        }, runner=runner,
+    )
     report = LIFECYCLE.runtime_mixture_warmup_stage(
         instance=instance,
         request={
