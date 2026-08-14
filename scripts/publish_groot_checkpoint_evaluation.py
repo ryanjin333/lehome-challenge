@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import math
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from lehome.flywheel.artifacts import atomic_write_json, build_sha256_manifest, verify_episode_manifest
 from lehome.flywheel.matrix import build_public_matrix, matrix_sha256
@@ -174,7 +174,7 @@ def build_publication_plan(report_path: Path, staging_root: Path) -> dict[str, o
         atomic_write_json(root / "evaluation-manifest.json", manifest)
         atomic_write_json(root / "SHA256SUMS.json", build_sha256_manifest(root))
         entries = _snapshot_entries(root)
-        return {"root": str(root), "release_id": release_id, "remote_prefix": manifest["remote_prefix"], "entries": entries, "report": report, "metrics": derived_metrics}
+        return {"root": str(root), "release_id": release_id, "remote_prefix": manifest["remote_prefix"], "entries": entries, "report": report, "metrics": derived_metrics, "invocation": evaluation["invocation"]}
     except BaseException:
         shutil.rmtree(root, ignore_errors=True)
         raise
@@ -251,6 +251,38 @@ def _publish_and_readback(plan: dict[str, object], *, repository: str, branch: s
     return commit
 
 
+def build_publication_receipt(plan: Mapping[str, object], *, immutable_revision: str, instance_receipt_path: Path) -> dict[str, object]:
+    """Bind publication disposal authority to one exact launched evaluation.
+
+    Upload and fresh readback occur before this is called.  The receipt remains
+    useless for disposal unless the immutable Hub revision, closed prefix, local
+    instance receipt bytes, and exact invocation all agree.
+    """
+    if not isinstance(immutable_revision, str) or _COMMIT.fullmatch(immutable_revision) is None:
+        raise ValueError("immutable readback revision is invalid")
+    invocation = plan.get("invocation")
+    remote_prefix = plan.get("remote_prefix")
+    release_id = plan.get("release_id")
+    metrics = plan.get("metrics")
+    if (not isinstance(invocation, dict) or not isinstance(remote_prefix, str) or not remote_prefix
+            or not isinstance(release_id, str) or not re.fullmatch(r"[0-9a-f]{64}", release_id)
+            or not isinstance(metrics, dict)):
+        raise ValueError("publication readback plan lacks an immutable invocation or prefix")
+    instance = _regular_json(instance_receipt_path, "evaluation instance receipt")
+    instance_id = instance.get("instance_id")
+    if (instance.get("kind") != "groot_checkpoint_evaluation_instance" or type(instance_id) is not int or instance_id <= 0
+            or instance.get("invocation_sha256") != _canonical(invocation)):
+        raise ValueError("publication instance receipt does not match the exact invocation")
+    return {
+        "schema_version": 1, "kind": "groot_checkpoint_evaluation_publication",
+        "repository": _REPOSITORY, "repository_private": True,
+        "immutable_revision": immutable_revision, "remote_prefix": remote_prefix, "release_id": release_id,
+        "evaluation_metrics": metrics, "invocation": invocation, "invocation_sha256": _canonical(invocation),
+        "instance_id": instance_id, "instance_receipt_sha256": _sha256(instance_receipt_path),
+        "tree_listing_verified": True, "fresh_readback_verified": True, "disposable": True,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True)
@@ -259,6 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository", default=_REPOSITORY)
     parser.add_argument("--branch", default="main")
     parser.add_argument("--token-environ-pid", type=int)
+    parser.add_argument("--instance-receipt", type=Path)
     parser.add_argument("--dry-run-plan", action="store_true")
     return parser
 
@@ -272,14 +305,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.dry_run_plan:
         print(json.dumps({key: value for key, value in plan.items() if key != "report"}, sort_keys=True))
         return 0
-    if args.readback_root is None or args.token_environ_pid is None:
-        raise ValueError("publication requires --readback-root and --token-environ-pid")
+    if args.readback_root is None or args.token_environ_pid is None or args.instance_receipt is None:
+        raise ValueError("publication requires --readback-root, --token-environ-pid, and --instance-receipt")
     commit = _publish_and_readback(plan, repository=args.repository, branch=args.branch, token=_token_from_process(args.token_environ_pid), readback_root=args.readback_root)
-    receipt = {
-        "schema_version": 1, "repository": args.repository, "repository_private": True,
-        "immutable_revision": commit, "remote_prefix": plan["remote_prefix"], "release_id": plan["release_id"],
-        "evaluation_metrics": plan["metrics"], "fresh_readback_verified": True, "disposable": True,
-    }
+    receipt = build_publication_receipt(plan, immutable_revision=commit, instance_receipt_path=args.instance_receipt)
     atomic_write_json(receipt_path, receipt)
     print(json.dumps(receipt, sort_keys=True))
     return 0
