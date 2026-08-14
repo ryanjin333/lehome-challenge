@@ -363,17 +363,16 @@ def build_from_request(path: str | Path) -> dict[str, Any]:
 
 
 def pilot_from_request(path: str | Path) -> dict[str, Any]:
-    """Run a CPU-only deterministic loader pilot; it never imports a model."""
+    """Run CPU-only loader characterization; it is never a GPU admission gate."""
     request = _load(Path(path), "runtime mixture pilot request")
     if set(request) != {"schema_version", "command", "arguments"} or request.get("schema_version") != 1 or request.get("command") != "pilot-runtime-mixture" or not isinstance(request.get("arguments"), dict):
         raise ValueError("runtime mixture pilot request has an incompatible schema")
     arguments = request["arguments"]
     expected = {
         "mixture_manifest", "mounts_descriptor", "sample_count", "worker_counts",
-        "timeout_seconds", "gpu_starvation_floor_samples_per_second", "authenticated_evidence",
+        "timeout_seconds", "authenticated_evidence",
     }
     timeout = arguments.get("timeout_seconds")
-    starvation_floor = arguments.get("gpu_starvation_floor_samples_per_second")
     if (
         set(arguments) != expected
         or type(arguments.get("mixture_manifest")) is not str
@@ -382,10 +381,9 @@ def pilot_from_request(path: str | Path) -> dict[str, Any]:
         or arguments["sample_count"] < 100
         or arguments.get("worker_counts") != [0, 4, 8, 16, 24]
         or type(timeout) not in (int, float) or not math.isfinite(float(timeout)) or not 1 <= float(timeout) <= 1800
-        or type(starvation_floor) not in (int, float) or not math.isfinite(float(starvation_floor)) or float(starvation_floor) < 1.0
         or not isinstance(arguments.get("authenticated_evidence"), dict)
     ):
-        raise ValueError("runtime mixture pilot requires the canonical worker sweep, timeout, and conservative starvation floor")
+        raise ValueError("runtime mixture pilot requires the canonical worker sweep and timeout")
     from lehome_train.groot.runtime_mixture import RangeSourceLoader, RuntimeMixtureDataset, load_runtime_contract
 
     contract = load_runtime_contract(arguments["mixture_manifest"], arguments["mounts_descriptor"])
@@ -404,9 +402,7 @@ def pilot_from_request(path: str | Path) -> dict[str, Any]:
     except ImportError as error:
         raise RuntimeError("pilot must run inside the pinned trainer Docker image") from error
     worker_counts = list(arguments["worker_counts"])
-    requested_workers_index = 0
-    while requested_workers_index < len(worker_counts):
-        requested_workers = worker_counts[requested_workers_index]
+    for requested_workers in worker_counts:
         start = time.perf_counter()
         deadline = start + float(timeout)
         dataset = RuntimeMixtureDataset(contract, processor=_identity_processor, limit=arguments["sample_count"])
@@ -440,13 +436,9 @@ def pilot_from_request(path: str | Path) -> dict[str, Any]:
             "host_cpu_seconds": usage_self.ru_utime + usage_self.ru_stime + usage_children.ru_utime + usage_children.ru_stime,
             "host_max_rss_mib": rss_mib,
         }
-        if requested_workers == 24 and timings["24"]["samples_per_second"] > timings["16"]["samples_per_second"]:
-            worker_counts.append(32)
-        requested_workers_index += 1
     canonical_complete = all(timings[str(workers)]["decoded_samples"] == arguments["sample_count"] for workers in [0, 4, 8, 16, 24])
-    throughput_verified = canonical_complete and timings["24"]["samples_per_second"] >= float(starvation_floor)
     timing_rows = [
         {"worker_count": workers, **{key: timings[str(workers)][key] for key in ("decoded_samples", "seconds", "samples_per_second", "host_cpu_seconds", "host_max_rss_mib", "latency_seconds_p50", "latency_seconds_p95")}}
         for workers in [0, 4, 8, 16, 24]
     ]
-    return {"schema_version": 3, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "gpu_initialized": torch.cuda.is_initialized(), "processor_contract": "pinned_processor_integration_required", "representative": {"bc_window_id": bc.window_id, "rollout_window_id": rollout.window_id, "three_cameras": True, "action_horizon": ACTION_HORIZON}, "sample_count_per_worker": arguments["sample_count"], "worker_counts": worker_counts, "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": timings, "timing_rows": timing_rows, "authenticated_evidence": arguments["authenticated_evidence"], "cache_cap": loader.cache_cap, "native_x86_required": True, "timeout_seconds": float(timeout), "gpu_starvation_floor_samples_per_second": float(starvation_floor), "canonical_completion": canonical_complete, "throughput_verified": throughput_verified}
+    return {"schema_version": 4, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "gpu_initialized": torch.cuda.is_initialized(), "processor_contract": "pinned_processor_integration_required", "representative": {"bc_window_id": bc.window_id, "rollout_window_id": rollout.window_id, "three_cameras": True, "action_horizon": ACTION_HORIZON}, "sample_count_per_worker": arguments["sample_count"], "worker_counts": worker_counts, "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": timings, "timing_rows": timing_rows, "authenticated_evidence": arguments["authenticated_evidence"], "cache_cap": loader.cache_cap, "native_x86_required": True, "timeout_seconds": float(timeout), "canonical_completion": canonical_complete}

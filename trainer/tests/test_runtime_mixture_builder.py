@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
+import types
 
 import pytest
 
@@ -129,9 +131,13 @@ def test_selected_150_rejects_legacy_opaque_hash_but_derives_a_new_canonical_art
     assert rows == original_rows
 
 
-def test_loader_pilot_requires_the_canonical_x86_worker_sweep_and_starvation_floor(
-    tmp_path: Path,
+def test_loader_pilot_requires_the_canonical_x86_worker_sweep_but_rejects_caller_throughput_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # This contract fails before parquet construction; make its dependency
+    # optional on the macOS test lane.
+    monkeypatch.setitem(sys.modules, "pyarrow", types.ModuleType("pyarrow"))
+    monkeypatch.setitem(sys.modules, "pyarrow.parquet", types.ModuleType("pyarrow.parquet"))
     from lehome_train.groot.runtime_mixture_builder import pilot_from_request
 
     request = tmp_path / "pilot.json"
@@ -142,8 +148,9 @@ def test_loader_pilot_requires_the_canonical_x86_worker_sweep_and_starvation_flo
             "mixture_manifest": "/runtime/mixture.json",
             "mounts_descriptor": "/runtime/mounts.json",
             "sample_count": 100,
-            "worker_counts": [0, 1, 4],
+            "worker_counts": [0, 4, 8, 16, 24],
             "timeout_seconds": 60,
+            "authenticated_evidence": {"mixture_id": "a" * 64},
             "gpu_starvation_floor_samples_per_second": 1.0,
         },
     })

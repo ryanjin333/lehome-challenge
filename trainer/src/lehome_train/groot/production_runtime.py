@@ -1084,6 +1084,7 @@ class ProductionRuntime:
         fields = {
             "launch_config", "experiment_config", "runtime_manifest", "runtime_window_index",
             "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence",
+            "cpu_pilot_receipt", "warmup_receipt", "runtime_warmup_binding",
             "result_output", "status_output",
         }
         request = _exact(arguments, fields, "runtime-mixture-train")
@@ -1092,7 +1093,11 @@ class ProductionRuntime:
         experiment = _load_experiment(request["experiment_config"])
         paths = {
             key: _mounted_path(request[key], key, must_exist=True, regular_file=True)
-            for key in ("runtime_manifest", "runtime_window_index", "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence")
+            for key in (
+                "runtime_manifest", "runtime_window_index", "runtime_normalization",
+                "runtime_mounts_descriptor", "runtime_source_evidence", "cpu_pilot_receipt",
+                "warmup_receipt", "runtime_warmup_binding",
+            )
         }
         if (
             config.runtime_mixture_manifest != str(paths["runtime_manifest"])
@@ -1107,6 +1112,32 @@ class ProductionRuntime:
         contract = load_runtime_contract(paths["runtime_manifest"], paths["runtime_mounts_descriptor"])
         for key in ("runtime_normalization", "runtime_source_evidence"):
             _load_nonempty_json_artifact(paths[key], f"runtime production {key}")
+        # The mounted bytes, CPU characterization, and lifecycle attestation
+        # must all agree before the official model process is allowed to start.
+        from lehome_train.groot.runtime_mixture_warmup import (
+            bind_warmup_to_runtime_artifacts,
+            validate_gpu_warmup_receipt,
+        )
+        cpu_pilot = _load_nonempty_json_artifact(
+            paths["cpu_pilot_receipt"], "runtime production CPU pilot receipt"
+        )
+        warmup = _load_nonempty_json_artifact(
+            paths["warmup_receipt"], "runtime production GPU warm-up receipt"
+        )
+        binding = bind_warmup_to_runtime_artifacts(
+            binding=_load_nonempty_json_artifact(
+                paths["runtime_warmup_binding"], "runtime production warm-up binding"
+            ),
+            manifest_path=paths["runtime_manifest"],
+            window_index_path=paths["runtime_window_index"],
+            normalization_path=paths["runtime_normalization"],
+            mounts_descriptor_path=paths["runtime_mounts_descriptor"],
+        )
+        selected_workers = validate_gpu_warmup_receipt(
+            warmup, expected_binding=binding, expected_cpu_pilot=cpu_pilot
+        )
+        if config.dataloader_num_workers != selected_workers:
+            raise ValueError("runtime production launch workers do not match the GPU warm-up receipt")
         if experiment.action_horizon != 16:
             raise ValueError("runtime production experiment horizon is incompatible")
         completed = launch_continuous_finetune(config, **_launch_kwargs())
@@ -1115,6 +1146,8 @@ class ProductionRuntime:
             "runtime_manifest_sha256": sha256_file(paths["runtime_manifest"]),
             "runtime_window_count": len(contract.training_windows),
             "runtime_cycle_size": contract.manifest.cycle_size,
+            "selected_loader_workers": selected_workers,
+            "warmup_receipt_sha256": sha256_file(paths["warmup_receipt"]),
             "launch_returncode": completed.returncode,
         }
         _write_result(outputs["result_output"], payload)

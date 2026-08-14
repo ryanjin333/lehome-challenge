@@ -341,6 +341,21 @@ def test_tune_uses_only_loader_4_8_12_and_batch_64_96_128(
     assert [batch for workers, batch in calls if workers == result["selected_loader_workers"]][-3:] == [64, 96, 128]
 
 
+def test_runtime_mixture_train_requires_a_cross_checked_gpu_warmup_receipt() -> None:
+    with pytest.raises(ValueError, match="runtime-mixture-train"):
+        runtime_module.ProductionRuntime().runtime_mixture_train({
+            "launch_config": "/prepared/launch.json",
+            "experiment_config": "/prepared/experiment.json",
+            "runtime_manifest": "/prepared/mixture.json",
+            "runtime_window_index": "/prepared/windows.json",
+            "runtime_normalization": "/prepared/normalization.json",
+            "runtime_mounts_descriptor": "/prepared/mounts.json",
+            "runtime_source_evidence": "/prepared/sources.json",
+            "result_output": "/output/result.json",
+            "status_output": "/output/status.json",
+        })
+
+
 def test_resume_downloads_and_consumes_the_immutable_authenticated_descriptor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
