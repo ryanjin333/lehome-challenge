@@ -1469,6 +1469,95 @@ def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_pa
     assert ("vastai", "--raw", "create", "instance", "8", "--image", LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE, "--disk", "120", "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE) in commands
 
 
+def test_runtime_cpu_pilot_retries_transient_ssh_arch_attestation(tmp_path: Path) -> None:
+    commands: list[tuple[str, ...]] = []
+    sleeps: list[float] = []
+    ssh_attempts = 0
+    live = {
+        "id": 44, "actual_status": "running", "cpu_arch": "amd64",
+        "cpu_cores_effective": 32, "cpu_ram": 64390, "disk_space": 124.75,
+        "machine_id": 10, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000,
+        "driver_version": "x", "reliability": .99, "num_gpus": 1, "dph_total": .18,
+        "ssh_host": "native-x86", "ssh_port": 22,
+    }
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal ssh_attempts
+        commands.append(command)
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        if command[:4] == ("vastai", "--raw", "create", "instance"):
+            return '{"new_contract":44}'
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return json.dumps(live)
+        if command[-1] == "set -eu; uname -m":
+            ssh_attempts += 1
+            if ssh_attempts == 1:
+                raise subprocess.CalledProcessError(255, command)
+            return "x86_64\n"
+        raise AssertionError(command)
+
+    failure_receipt = tmp_path / "failure.json"
+    receipt = LIFECYCLE.rent_runtime_cpu_pilot(
+        evidence=_runtime_pilot_offer_evidence(failure_receipt=str(failure_receipt)),
+        runner=runner, sleep=sleeps.append,
+    )
+
+    assert receipt["instance_id"] == 44
+    assert ssh_attempts == 2
+    assert sleeps == [5.0]
+    assert not any(command[:3] == ("vastai", "destroy", "instance") for command in commands)
+    assert not failure_receipt.exists()
+
+
+def test_runtime_cpu_pilot_does_not_retry_aarch64_ssh_arch_attestation(tmp_path: Path) -> None:
+    commands: list[tuple[str, ...]] = []
+    sleeps: list[float] = []
+    destroyed = False
+    ssh_attempts = 0
+    live = {
+        "id": 44, "actual_status": "running", "cpu_arch": "amd64",
+        "cpu_cores_effective": 32, "cpu_ram": 64390, "disk_space": 124.75,
+        "machine_id": 10, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000,
+        "driver_version": "x", "reliability": .99, "num_gpus": 1, "dph_total": .18,
+        "ssh_host": "native-x86", "ssh_port": 22,
+    }
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal destroyed, ssh_attempts
+        commands.append(command)
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        if command[:4] == ("vastai", "--raw", "create", "instance"):
+            return '{"new_contract":44}'
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return "{}" if destroyed else json.dumps(live)
+        if command == ("vastai", "destroy", "instance", "44", "--yes"):
+            destroyed = True
+            return ""
+        if command[-1] == "set -eu; uname -m":
+            ssh_attempts += 1
+            return "aarch64\n"
+        raise AssertionError(command)
+
+    with pytest.raises(ValueError, match="x86_64"):
+        LIFECYCLE.rent_runtime_cpu_pilot(
+            evidence=_runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json")),
+            runner=runner, sleep=sleeps.append,
+        )
+
+    assert ssh_attempts == 1
+    assert commands.count(("vastai", "destroy", "instance", "44", "--yes")) == 1
+    assert commands[-1] == ("vastai", "--raw", "show", "instance", "44")
+    assert sleeps == []
+
+
 def test_runtime_pilot_live_readback_accepts_real_null_reliability_but_binds_machine_price_and_gpu() -> None:
     offer = {
         "id": 46568462, "ask_contract_id": 1, "machine_id": 142447,

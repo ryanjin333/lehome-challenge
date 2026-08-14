@@ -34,6 +34,7 @@ PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revisi
 OFFER_QUERY = "gpu_ram>=96 num_gpus=1 reliability>=0.95"
 RUNTIME_PILOT_OFFER_QUERY = "cpu_arch=amd64 cpu_cores_effective>=32 cpu_ram>=64 disk_space>=120 reliability>=0.98 num_gpus=1 direct_port_count>=2 duration>=1"
 RUNTIME_PILOT_READINESS_POLLS = 120
+RUNTIME_SSH_ATTESTATION_POLLS = 12
 RUNTIME_ABSENCE_READBACK_POLLS = 12
 _RUNTIME_PILOT_OFFER_FIELDS = (
     "id", "ask_contract_id", "machine_id", "cpu_arch", "cpu_cores_effective", "cpu_ram",
@@ -610,7 +611,7 @@ def rent_runtime_cpu_pilot(
                 evidence.get("account_hourly_total_usd"), label="runtime pilot offer evidence",
             ),
         }
-        _attest_platform_arch(instance, runner=runner)
+        _await_platform_arch_attestation(instance=instance, runner=runner, sleep=sleep)
         return instance
     except BaseException as error:
         _runtime_abort_cleanup(
@@ -749,6 +750,26 @@ def _attest_platform_arch(instance: Mapping[str, object], *, runner: Runner) -> 
     if arch not in {"x86_64", "amd64"}:
         raise ValueError("runtime mixture requires native x86_64 platform proof")
     return "x86_64"
+
+
+def _await_platform_arch_attestation(
+    *, instance: Mapping[str, object], runner: Runner,
+    max_polls: int = RUNTIME_SSH_ATTESTATION_POLLS,
+    sleep: Callable[[float], None] = _bounded_sleep,
+) -> str:
+    """Allow a just-running lease a short, bounded interval to accept SSH."""
+    if type(max_polls) is not int or max_polls <= 0:
+        raise ValueError("runtime SSH attestation poll bound is invalid")
+    for poll in range(max_polls):
+        try:
+            return _attest_platform_arch(instance, runner=runner)
+        except ValueError as error:
+            if not isinstance(error.__cause__, (subprocess.CalledProcessError, OSError, TimeoutError)):
+                raise
+            if poll + 1 == max_polls:
+                raise
+            sleep(5.0)
+    raise AssertionError("unreachable runtime SSH attestation state")
 
 
 def _safe_archive(path: Path, label: str) -> None:
