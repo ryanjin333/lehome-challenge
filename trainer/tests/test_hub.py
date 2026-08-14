@@ -973,6 +973,35 @@ def test_real_transport_lists_complete_tree_at_explicit_commit_with_token(
     ]
 
 
+def test_real_transport_resolves_only_an_approved_ref_to_an_immutable_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revision = "e" * 40
+    transport = HuggingFaceHubTransport(timeout_seconds=19.0)
+    calls: list[dict[str, object]] = []
+
+    def repo_info(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return SimpleNamespace(oid=revision)
+
+    monkeypatch.setattr(transport, "_repo_info", repo_info)
+
+    assert transport.resolve_approved_ref(
+        repository="ryanjin333/lehome-groot-n17-models",
+        ref="main",
+        token="hf_explicit_anchor_token",
+    ) == revision
+    assert calls == [{
+        "repository": "ryanjin333/lehome-groot-n17-models",
+        "revision": "main",
+        "token": "hf_explicit_anchor_token",
+    }]
+    with pytest.raises(ValueError, match="approved"):
+        transport.resolve_approved_ref(
+            repository="unapproved/repository", ref="main", token="hf_explicit_anchor_token"
+        )
+
+
 def test_hub_tree_entry_allows_repository_dotfiles_but_rejects_aliases() -> None:
     assert hub_module.HubTreeEntry(".gitattributes", "file").relative_path == ".gitattributes"
     assert hub_module.HubTreeEntry("nested/.metadata", "file").relative_path == "nested/.metadata"

@@ -101,6 +101,14 @@ class HubTransport(Protocol):
         token: str,
     ) -> tuple[HubTreeEntry, ...]: ...
 
+    def resolve_approved_ref(
+        self,
+        *,
+        repository: str,
+        ref: str,
+        token: str,
+    ) -> str: ...
+
 
 class HubRepositoryTransport(Protocol):
     """Explicit private-repository creation and verification boundary."""
@@ -310,6 +318,33 @@ class HuggingFaceHubTransport:
             revision=revision,
             token=token,
             timeout=self.timeout_seconds,
+        )
+
+    def resolve_approved_ref(
+        self,
+        *,
+        repository: str,
+        ref: str,
+        token: str,
+    ) -> str:
+        """Resolve one approved mutable ref to the immutable commit it names.
+
+        Callers must immediately use the returned full commit for every read;
+        this method deliberately does not make floating refs acceptable to the
+        regular tree/download APIs.
+        """
+        self._repo_type(repository)
+        if (
+            not isinstance(ref, str)
+            or not ref
+            or ref.startswith("/")
+            or "\\" in ref
+            or ".." in ref.split("/")
+            or any(not component for component in ref.split("/"))
+        ):
+            raise ValueError("Hub approved ref is not canonical")
+        return self._revision(
+            self._repo_info(repository=repository, revision=ref, token=token)
         )
 
     def check_access(self, *, repository: str, token: str) -> HubAccess:

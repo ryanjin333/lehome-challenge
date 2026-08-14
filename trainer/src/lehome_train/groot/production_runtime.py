@@ -30,6 +30,10 @@ from lehome_train.groot.launch import build_launch
 from lehome_train.groot.launch import launch_continuous_finetune, launch_finetune_to_step
 from lehome_train.groot.throughput_tuning import TrainingProbe, tune_on_host
 from lehome_train.groot.continuous_training import run_continuous_supervisor
+from lehome_train.groot.runtime_checkpoint_lifecycle import (
+    RuntimeMixtureTrainingIdentity,
+    build_runtime_checkpoint_anchor,
+)
 from lehome_train.groot.production_adapters import (
     GrootMemorizationSession,
     GrootSmokeRunner,
@@ -459,6 +463,35 @@ def _publisher_token(path_value: object) -> str:
     return token
 
 
+def _runtime_checkpoint_identity_from_evidence(value: object) -> RuntimeMixtureTrainingIdentity:
+    """Load the controller-authenticated identity without re-deriving it on a GPU."""
+    if not isinstance(value, Mapping) or set(value) != {
+        "mixture_id", "deployment_receipt_sha256", "source_revisions", "schedule_seed",
+        "code_bundle_sha256", "code_bundle_revision", "oci_image",
+        "parent_step12000_artifact_sha256", "physical_batch_size", "action_horizon",
+    } or not isinstance(value.get("source_revisions"), list):
+        raise ValueError("runtime checkpoint source evidence has an incompatible schema")
+    rows = value["source_revisions"]
+    try:
+        identity = RuntimeMixtureTrainingIdentity(
+            mixture_id=value["mixture_id"],
+            deployment_receipt_sha256=value["deployment_receipt_sha256"],
+            source_revisions=tuple(
+                (row["source_id"], row["immutable_revision"], row["prefix"], row["tree_sha256"])
+                for row in rows if isinstance(row, Mapping)
+            ),
+            schedule_seed=value["schedule_seed"], code_bundle_sha256=value["code_bundle_sha256"],
+            code_bundle_revision=value["code_bundle_revision"], oci_image=value["oci_image"],
+            parent_step12000_artifact_sha256=value["parent_step12000_artifact_sha256"],
+            physical_batch_size=value["physical_batch_size"], action_horizon=value["action_horizon"],
+        )
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("runtime checkpoint source evidence is malformed") from None
+    if identity.to_dict() != dict(value):
+        raise ValueError("runtime checkpoint source evidence is not canonical")
+    return identity
+
+
 def _runtime_resume_checkpoint(
     *, request: Mapping[str, object], config: FineTuneLaunchConfig, mixture_id: object,
 ) -> Path | None:
@@ -483,6 +516,18 @@ def _runtime_resume_checkpoint(
     ):
         raise ValueError("runtime resume cursor or checkpoint archive is incompatible")
     from lehome_train.groot.production_adapters import _restore_checkpoint_archive
+    consumption = Path(config.output_dir) / "runtime-resume-consumption.json"
+    evidence = {
+        "schema_version": 1, "kind": "runtime_mixture_resume_consumption",
+        "optimizer_step": step, "cursor": dict(cursor),
+        "archive_sha256": sha256_file(archive), "descriptor_sha256": sha256_file(descriptor_path),
+    }
+    if consumption.exists() or consumption.is_symlink():
+        existing = _load_nonempty_json_artifact(consumption, "runtime resume consumption receipt")
+        if existing != evidence:
+            raise ValueError("runtime resume checkpoint was already consumed by a different cursor")
+    else:
+        atomic_write_json(consumption, evidence)
     _restore_checkpoint_archive(
         archive, output_root=Path(config.output_dir), expected_member_root=config.experiment_name,
         optimizer_step=step, expected_identity=config.identity(), num_gpus=config.num_gpus,
@@ -1525,6 +1570,7 @@ class ProductionRuntime:
             "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence",
             "cpu_pilot_receipt", "warmup_receipt", "runtime_warmup_binding",
             "runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor",
+            "checkpoint_repository", "checkpoint_revision", "publisher_token_file", "instance_id",
             "result_output", "status_output",
         }
         request = _exact(arguments, fields, "runtime-mixture-train")
@@ -1580,21 +1626,78 @@ class ProductionRuntime:
             raise ValueError("runtime production launch workers do not match the GPU warm-up receipt")
         if experiment.action_horizon != 16:
             raise ValueError("runtime production experiment horizon is incompatible")
+        repository, revision = request["checkpoint_repository"], request["checkpoint_revision"]
+        if repository != DEFAULT_MODEL_REPO or revision != "main":
+            raise ValueError("runtime checkpoint publication destination is incompatible")
+        token = _publisher_token(request["publisher_token_file"])
+        if type(request["instance_id"]) is not int:
+            raise ValueError("runtime checkpoint publication requires an exact instance ID")
         resume_checkpoint = _runtime_resume_checkpoint(
             request=request, config=config, mixture_id=getattr(contract.manifest, "mixture_id", None),
         )
-        completed = launch_continuous_finetune(
-            config, **_launch_kwargs(), resume_checkpoint=resume_checkpoint,
+        # The observer snapshots the official save directory at 1K while the
+        # trainer continues.  It uploads/readbacks the immutable archive before
+        # the 2K boundary, so a provider loss after 1K has a real resume source.
+        session = GrootTrainingSession(
+            config=config, experiment_config=experiment,
+            normalization_sha256=sha256_file(paths["runtime_normalization"]), resume_checkpoint=None,
         )
+        uploader = HubCheckpointUploader(
+            repository=repository, revision=revision, experiment_id=config.experiment_name,
+            artifact_root=config.output_dir, token=token,
+        )
+        schedule = ExposureSchedule(
+            physical_batch_size=64, sample_presentations=128_000,
+            checkpoint_sample_presentations=64_000,
+        )
+        identity = _runtime_checkpoint_identity_from_evidence(
+            _load_nonempty_json_artifact(paths["runtime_source_evidence"], "runtime source evidence")
+        )
+        if identity.mixture_id != str(contract.manifest.mixture_id):
+            raise ValueError("runtime checkpoint source evidence mixture identity disagrees with mounted runtime")
+        previous_anchor: dict[str, str] | None = None
+
+        def publish_with_anchor(checkpoint: object) -> dict[str, object]:
+            nonlocal previous_anchor
+            raw = uploader.publish_receipt(checkpoint, timeout_seconds=30.0)  # type: ignore[arg-type]
+            anchor = build_runtime_checkpoint_anchor(
+                publication=raw, identity=identity, experiment_id=config.experiment_name,
+                experiment_config_sha256=canonical_json_sha256(experiment), anchor_ref=revision,
+                previous_anchor=previous_anchor,
+            )
+            anchor_receipt = uploader.publish_anchor(anchor, timeout_seconds=30.0)
+            if anchor_receipt.get("readback_verified") is not True:
+                raise ValueError("runtime checkpoint anchor lacks immutable readback")
+            previous_anchor = {
+                "immutable_anchor_revision": str(anchor_receipt["immutable_anchor_revision"]),
+                "anchor_sha256": str(anchor_receipt["anchor_sha256"]),
+            }
+            return raw | {"runtime_checkpoint_anchor": dict(anchor_receipt)}
+
+        publications = run_continuous_supervisor(
+            run_root=Path(config.output_dir) / config.experiment_name,
+            launch=lambda: launch_continuous_finetune(
+                config, **_launch_kwargs(), resume_checkpoint=resume_checkpoint,
+            ),
+            package=lambda completed: session.package_checkpoint_snapshot(
+                completed.snapshot_root, optimizer_step=completed.optimizer_step,
+                sample_presentations=completed.optimizer_step * 64, schedule_sha256=schedule.sha256,
+            ),
+            publish=publish_with_anchor,
+        )
+        steps = [item.get("optimizer_step") for item in publications]
+        if steps not in ([1000], [1000, 2000]):
+            raise RuntimeError("runtime mixture did not publish an immutable 1K checkpoint")
         payload = {
-            "status": "runtime-mixture-launched",
+            "status": "runtime-mixture-complete" if steps == [1000, 2000] else "runtime-mixture-interrupted",
             "runtime_manifest_sha256": sha256_file(paths["runtime_manifest"]),
             "runtime_window_count": len(contract.training_windows),
             "runtime_cycle_size": contract.manifest.cycle_size,
             "selected_loader_workers": selected_workers,
             "warmup_receipt_sha256": sha256_file(paths["warmup_receipt"]),
             "resume_checkpoint_step": None if resume_checkpoint is None else 1000,
-            "launch_returncode": completed.returncode,
+            "instance_id": request["instance_id"],
+            "immutable_checkpoint_publications": [dict(item) for item in publications],
         }
         _write_result(outputs["result_output"], payload)
         atomic_write_json(outputs["status_output"], payload)

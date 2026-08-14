@@ -989,6 +989,7 @@ class HubCheckpointUploader:
         experiment_id: str,
         artifact_root: str | os.PathLike[str] | None = None,
         token: str | None = None,
+        transport: object | None = None,
     ) -> None:
         if repository != DEFAULT_MODEL_REPO:
             raise ValueError("checkpoint repository is not approved")
@@ -1007,6 +1008,10 @@ class HubCheckpointUploader:
         # Deliberately do not mutate ``os.environ``: the official trainer is
         # launched separately and must never inherit Hub credentials.
         self._hub_environ = None if token is None else {"HF_TOKEN": token}
+        self._transport = transport
+
+    def _transport_for(self, *, timeout_seconds: float) -> object:
+        return self._transport or HuggingFaceHubTransport(timeout_seconds=timeout_seconds)
 
     def __call__(
         self, checkpoint: CheckpointDescriptor, *, timeout_seconds: float
@@ -1039,7 +1044,7 @@ class HubCheckpointUploader:
             byte_size=descriptor_path.stat().st_size,
             remotely_verified=False,
         )
-        transport = HuggingFaceHubTransport(timeout_seconds=timeout_seconds)
+        transport = self._transport_for(timeout_seconds=timeout_seconds)
         require_access(
             transport=transport,
             repository=self.repository,
@@ -1106,3 +1111,59 @@ class HubCheckpointUploader:
             }
         finally:
             shutil.rmtree(readback, ignore_errors=True)
+
+    def publish_anchor(
+        self, anchor: Mapping[str, object], *, timeout_seconds: float,
+    ) -> dict[str, object]:
+        """Atomically advance the durable known locator after immutable upload.
+
+        The caller builds and validates the anchored checkpoint identity first;
+        this boundary only writes the exact known path and readbacks the commit
+        returned by the Hub.  It never makes a floating ref readable.
+        """
+        if self.artifact_root is None:
+            raise ValueError("checkpoint uploader has no artifact root")
+        if (
+            anchor.get("repository") != self.repository
+            or anchor.get("anchor_ref") != self.revision
+            or anchor.get("experiment_id") != self.experiment_id
+        ):
+            raise ValueError("checkpoint anchor does not match uploader identity")
+        payload = canonical_json_bytes(dict(anchor))
+        anchor_root = Path(tempfile.mkdtemp(prefix="checkpoint-anchor-", dir=self.artifact_root))
+        try:
+            latest = anchor_root / "latest.json"
+            latest.write_bytes(payload)
+            entry = SyncEntry("latest.json", sha256_file(latest), latest.stat().st_size)
+            transport = self._transport_for(timeout_seconds=timeout_seconds)
+            require_access(
+                transport=transport, repository=self.repository, read=True, write=True,
+                environ=self._hub_environ,
+            )
+            immutable_revision = upload_files(
+                transport=transport, repository=self.repository, revision=self.revision,
+                source=anchor_root, entries=(entry,), remote_prefix=f"checkpoints/{self.experiment_id}",
+                environ=self._hub_environ, max_attempts=1,
+            )
+            readback = anchor_root / "readback"
+            download_files(
+                transport=transport, repository=self.repository, revision=immutable_revision,
+                destination=readback, relative_paths=("latest.json",),
+                remote_prefix=f"checkpoints/{self.experiment_id}", environ=self._hub_environ,
+                max_attempts=1,
+            )
+            observed = readback / "latest.json"
+            if (
+                observed.is_symlink() or not observed.is_file()
+                or observed.stat().st_size != entry.byte_size
+                or sha256_file(observed) != entry.sha256
+                or observed.read_bytes() != payload
+            ):
+                raise ValueError("checkpoint anchor immutable readback mismatch")
+            return {
+                "immutable_anchor_revision": immutable_revision,
+                "anchor_sha256": entry.sha256,
+                "readback_verified": True,
+            }
+        finally:
+            shutil.rmtree(anchor_root, ignore_errors=True)

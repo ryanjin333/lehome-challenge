@@ -1581,7 +1581,7 @@ def test_runtime_bootstrap_stage_is_an_explicit_pre_pilot_action(tmp_path: Path)
     assert report["paid_action"] is False and report["action"] == "runtime-bootstrap-stage"
 
 
-def test_fake_runtime_cli_lifecycle_e2e_uses_only_runtime_actions(
+def test_runtime_cli_dispatch_never_calls_legacy_recuts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Exercise the executable action dispatch: bootstrap -> 1K -> loss -> resume -> 2K -> dispose."""
@@ -1600,7 +1600,8 @@ def test_fake_runtime_cli_lifecycle_e2e_uses_only_runtime_actions(
     monkeypatch.setattr(LIFECYCLE, "run_runtime_gpu_warmup", lambda **kwargs: calls.append("warmup") or {"paid_action": True})
     monkeypatch.setattr(LIFECYCLE, "remote_action", lambda **kwargs: calls.append(str(kwargs["action"])) or {"paid_action": True, "action": kwargs["action"]})
     monkeypatch.setattr(LIFECYCLE, "publish_runtime_checkpoint", lambda **kwargs: calls.append("publish") or {"paid_action": True})
-    monkeypatch.setattr(LIFECYCLE, "runtime_checkpoint_terminal", lambda **kwargs: calls.append("interrupted" if kwargs.get("provider_loss") else "complete") or {"terminal": {"kind": "fake"}})
+    monkeypatch.setattr(LIFECYCLE, "runtime_anchor_interruption_terminal", lambda **kwargs: calls.append("interrupted") or {"paid_action": True})
+    monkeypatch.setattr(LIFECYCLE, "runtime_checkpoint_terminal", lambda **kwargs: calls.append("complete") or {"terminal": {"kind": "fake"}})
     monkeypatch.setattr(LIFECYCLE, "resume_runtime_checkpoint", lambda **kwargs: calls.append("resume") or {"paid_action": True})
     monkeypatch.setattr(LIFECYCLE, "destroy_runtime_checkpoint_completion", lambda **kwargs: calls.append("dispose") or {"paid_action": True})
     monkeypatch.setattr(LIFECYCLE, "_runtime_checkpoint_terminal_output", lambda request, terminal: dict(terminal))

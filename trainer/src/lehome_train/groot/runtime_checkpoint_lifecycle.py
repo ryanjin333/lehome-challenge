@@ -7,6 +7,7 @@ then derives safe resume/disposal evidence from those publications.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 import shutil
 import tempfile
@@ -15,7 +16,7 @@ from typing import Callable, Mapping, Protocol
 
 from lehome_train.checkpoints import CheckpointDescriptor, load_checkpoint_descriptor
 from lehome_train.constants import DEFAULT_MODEL_REPO
-from lehome_train.io import canonical_json_sha256, sha256_file
+from lehome_train.io import canonical_json_bytes, canonical_json_sha256, sha256_file
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -118,6 +119,7 @@ class RuntimeMixtureTrainingIdentity:
 class RuntimeCheckpointHub(Protocol):
     def list_tree(self, *, repository: str, revision: str) -> object: ...
     def download_files(self, *, repository: str, revision: str, destination: Path, relative_paths: tuple[str, ...], remote_prefix: str) -> object: ...
+    def resolve_approved_ref(self, *, repository: str, ref: str) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +136,22 @@ class RuntimeMixtureResumeIdentity:
             "global_sample_offset": self.global_sample_offset,
             "expected_global_step": self.optimizer_step,
             "global_batch_size": self.physical_batch_size,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeCheckpointAnchor:
+    """Known-ref discovery evidence for one immutable runtime checkpoint."""
+
+    immutable_anchor_revision: str
+    anchor_sha256: str
+    anchor: dict[str, object]
+    resume: RuntimeMixtureResumeIdentity
+
+    def previous_link(self) -> dict[str, str]:
+        return {
+            "immutable_anchor_revision": self.immutable_anchor_revision,
+            "anchor_sha256": self.anchor_sha256,
         }
 
 
@@ -289,6 +307,240 @@ def publish_runtime_mixture_checkpoint(
     _verify_publication_readback(publication=publication, identity=identity, hub=hub, destination=scratch)
     shutil.rmtree(scratch, ignore_errors=True)
     return publication
+
+
+def _experiment_id(value: object) -> str:
+    _relative(value, "runtime checkpoint experiment ID")
+    if "/" in str(value):
+        raise ValueError("runtime checkpoint experiment ID must be one path component")
+    return str(value)
+
+
+def _anchor_path(experiment_id: str) -> str:
+    return f"checkpoints/{experiment_id}/latest.json"
+
+
+def build_runtime_checkpoint_anchor(
+    *, publication: Mapping[str, object], identity: RuntimeMixtureTrainingIdentity,
+    experiment_id: str, experiment_config_sha256: str, anchor_ref: str,
+    previous_anchor: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Make the attested bytes written only after immutable publication readback.
+
+    The returned value deliberately excludes its own future commit ID/hash.  The
+    uploader obtains those from the atomic anchor commit and records them as
+    the next boundary's previous link.
+    """
+    experiment_id = _experiment_id(experiment_id)
+    _sha(experiment_config_sha256, "runtime checkpoint experiment config hash")
+    if anchor_ref != "main":
+        raise ValueError("runtime checkpoint anchor must use the approved main ref")
+    if publication.get("kind") == "runtime_mixture_checkpoint_publication":
+        checked = _publications((publication,), identity=identity)[0]
+    else:
+        step_value = publication.get("optimizer_step")
+        if step_value not in _STEPS:
+            raise ValueError("runtime checkpoint anchor requires a 1K or 2K immutable publication")
+        raw_publication = _publication_fields(publication, step=int(step_value))
+        checked = {
+            "schema_version": 1, "kind": "runtime_mixture_checkpoint_publication", **raw_publication,
+            "identity": identity.to_dict(), "identity_sha256": identity.sha256,
+            "runtime_cursor": {
+                "optimizer_step": step_value, "global_sample_offset": int(step_value) * 64,
+                "physical_batch_size": 64, "action_horizon": 16,
+            },
+            "fresh_tree_readback_verified": True,
+        }
+    step = int(checked["optimizer_step"])
+    if step == 1000:
+        if previous_anchor is not None:
+            raise ValueError("1K checkpoint anchor must not have a previous link")
+        previous_revision = previous_sha256 = None
+    else:
+        if not isinstance(previous_anchor, Mapping) or set(previous_anchor) != {
+            "immutable_anchor_revision", "anchor_sha256",
+        }:
+            raise ValueError("2K checkpoint anchor requires the exact previous anchor link")
+        previous_revision = _revision(
+            previous_anchor.get("immutable_anchor_revision"), "previous anchor immutable revision"
+        )
+        previous_sha256 = _sha(previous_anchor.get("anchor_sha256"), "previous anchor hash")
+    raw = _publication_fields(
+        {key: checked[key] for key in (
+            "optimizer_step", "repository", "immutable_revision", "remote_prefix", "relative_path",
+            "artifact_sha256", "artifact_byte_size", "descriptor_relative_path", "descriptor_sha256",
+            "descriptor_byte_size", "readback_verified",
+        )}, step=step,
+    )
+    return {
+        "schema_version": 1,
+        "kind": "runtime_mixture_checkpoint_anchor",
+        "repository": DEFAULT_MODEL_REPO,
+        "anchor_ref": anchor_ref,
+        "experiment_id": experiment_id,
+        "experiment_config_sha256": experiment_config_sha256,
+        "generation_sha256": identity.mixture_id,
+        "runtime_mixture_id": identity.mixture_id,
+        "identity": identity.to_dict(),
+        "identity_sha256": identity.sha256,
+        "optimizer_step": step,
+        "checkpoint": raw,
+        "previous_anchor_immutable_revision": previous_revision,
+        "previous_anchor_sha256": previous_sha256,
+    }
+
+
+def _validate_runtime_checkpoint_anchor(
+    anchor: object, *, identity: RuntimeMixtureTrainingIdentity, experiment_id: str,
+    experiment_config_sha256: str, anchor_ref: str,
+) -> dict[str, object]:
+    expected = {
+        "schema_version", "kind", "repository", "anchor_ref", "experiment_id",
+        "experiment_config_sha256", "generation_sha256", "runtime_mixture_id", "identity",
+        "identity_sha256", "optimizer_step", "checkpoint", "previous_anchor_immutable_revision",
+        "previous_anchor_sha256",
+    }
+    if not isinstance(anchor, Mapping) or set(anchor) != expected:
+        raise ValueError("runtime checkpoint anchor has an incompatible schema")
+    if (
+        anchor.get("schema_version") != 1
+        or anchor.get("kind") != "runtime_mixture_checkpoint_anchor"
+        or anchor.get("repository") != DEFAULT_MODEL_REPO
+        or anchor.get("anchor_ref") != anchor_ref
+        or anchor.get("experiment_id") != experiment_id
+        or anchor.get("experiment_config_sha256") != experiment_config_sha256
+        or anchor.get("generation_sha256") != identity.mixture_id
+        or anchor.get("runtime_mixture_id") != identity.mixture_id
+        or anchor.get("identity") != identity.to_dict()
+        or anchor.get("identity_sha256") != identity.sha256
+        or anchor.get("optimizer_step") not in _STEPS
+    ):
+        raise ValueError("runtime checkpoint anchor identity is incompatible")
+    step = int(anchor["optimizer_step"])
+    raw_checkpoint = anchor.get("checkpoint")
+    if not isinstance(raw_checkpoint, Mapping):
+        raise ValueError("runtime checkpoint anchor checkpoint is missing")
+    _publication_fields(raw_checkpoint, step=step)
+    previous_revision = anchor.get("previous_anchor_immutable_revision")
+    previous_sha256 = anchor.get("previous_anchor_sha256")
+    if step == 1000:
+        if previous_revision is not None or previous_sha256 is not None:
+            raise ValueError("1K runtime checkpoint anchor has an unauthorized previous link")
+    elif (
+        _revision(previous_revision, "previous anchor immutable revision") is None
+        or _sha(previous_sha256, "previous anchor hash") is None
+    ):
+        raise AssertionError("unreachable")
+    return dict(anchor)
+
+
+def _download_anchor(
+    *, hub: RuntimeCheckpointHub, revision: str, experiment_id: str, destination: Path,
+) -> tuple[dict[str, object], str]:
+    path = _anchor_path(experiment_id)
+    tree = _tree_paths(hub.list_tree(repository=DEFAULT_MODEL_REPO, revision=revision))
+    if path not in tree:
+        raise ValueError("runtime checkpoint anchor is absent from its immutable tree")
+    if destination.exists() or destination.is_symlink():
+        raise ValueError("runtime checkpoint anchor readback destination must be absent")
+    destination.mkdir(parents=True)
+    try:
+        hub.download_files(
+            repository=DEFAULT_MODEL_REPO, revision=revision, destination=destination,
+            relative_paths=("latest.json",), remote_prefix=f"checkpoints/{experiment_id}",
+        )
+        observed = destination / "latest.json"
+        if observed.is_symlink() or not observed.is_file():
+            raise ValueError("runtime checkpoint anchor readback is absent")
+        try:
+            value = json.loads(observed.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("runtime checkpoint anchor is not canonical JSON") from None
+        if canonical_json_bytes(value) != observed.read_bytes():
+            raise ValueError("runtime checkpoint anchor JSON is not canonical")
+        return dict(value) if isinstance(value, Mapping) else {}, sha256_file(observed)
+    except BaseException:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+
+
+def discover_runtime_checkpoint_anchor(
+    *, identity: RuntimeMixtureTrainingIdentity, experiment_id: str,
+    experiment_config_sha256: str, anchor_ref: str, hub: RuntimeCheckpointHub,
+    destination: Path,
+) -> RuntimeCheckpointAnchor:
+    """Resolve, freeze, and readback the durable checkpoint locator.
+
+    This is intentionally independent of lost-host output.  The known mutable
+    ref is resolved twice and every payload read uses the full immutable commit.
+    """
+    experiment_id = _experiment_id(experiment_id)
+    _sha(experiment_config_sha256, "runtime checkpoint experiment config hash")
+    if anchor_ref != "main":
+        raise ValueError("runtime checkpoint anchor must use the approved main ref")
+    first_revision = _revision(
+        hub.resolve_approved_ref(repository=DEFAULT_MODEL_REPO, ref=anchor_ref),
+        "runtime checkpoint anchor revision",
+    )
+    scratch = Path(tempfile.mkdtemp(prefix="runtime-anchor-readback-", dir=destination.parent))
+    shutil.rmtree(scratch)
+    anchor, anchor_sha256 = _download_anchor(
+        hub=hub, revision=first_revision, experiment_id=experiment_id, destination=scratch,
+    )
+    try:
+        checked = _validate_runtime_checkpoint_anchor(
+            anchor, identity=identity, experiment_id=experiment_id,
+            experiment_config_sha256=experiment_config_sha256, anchor_ref=anchor_ref,
+        )
+        second_revision = _revision(
+            hub.resolve_approved_ref(repository=DEFAULT_MODEL_REPO, ref=anchor_ref),
+            "runtime checkpoint anchor revision",
+        )
+        if second_revision != first_revision:
+            raise ValueError("runtime checkpoint anchor ref drifted during readback")
+        step = int(checked["optimizer_step"])
+        if step == 2000:
+            previous_revision = str(checked["previous_anchor_immutable_revision"])
+            previous_scratch = Path(tempfile.mkdtemp(prefix="runtime-anchor-previous-", dir=destination.parent))
+            shutil.rmtree(previous_scratch)
+            previous, previous_sha = _download_anchor(
+                hub=hub, revision=previous_revision, experiment_id=experiment_id, destination=previous_scratch,
+            )
+            try:
+                if previous_sha != checked["previous_anchor_sha256"]:
+                    raise ValueError("runtime checkpoint anchor previous link hash mismatches")
+                prior = _validate_runtime_checkpoint_anchor(
+                    previous, identity=identity, experiment_id=experiment_id,
+                    experiment_config_sha256=experiment_config_sha256, anchor_ref=anchor_ref,
+                )
+                if int(prior["optimizer_step"]) != 1000:
+                    raise ValueError("runtime checkpoint anchor previous link is not 1K")
+            finally:
+                shutil.rmtree(previous_scratch, ignore_errors=True)
+        publication = {
+            "schema_version": 1,
+            "kind": "runtime_mixture_checkpoint_publication",
+            **dict(checked["checkpoint"]),
+            "identity": identity.to_dict(), "identity_sha256": identity.sha256,
+            "runtime_cursor": {
+                "optimizer_step": step, "global_sample_offset": step * 64,
+                "physical_batch_size": 64, "action_horizon": 16,
+            },
+            "fresh_tree_readback_verified": True,
+        }
+        _verify_publication_readback(
+            publication=publication, identity=identity, hub=hub, destination=destination,
+        )
+        return RuntimeCheckpointAnchor(
+            first_revision, anchor_sha256, checked,
+            RuntimeMixtureResumeIdentity(
+                identity.sha256, step, step * 64, 64,
+                destination / str(publication["relative_path"]),
+                destination / str(publication["descriptor_relative_path"]),
+            ),
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _publications(

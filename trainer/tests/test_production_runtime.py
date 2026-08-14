@@ -718,13 +718,29 @@ def test_publisher_readback_promotes_an_actual_false_descriptor_for_runtime_resu
 
     monkeypatch.setattr(adapters, "upload_files", upload)
     monkeypatch.setattr(adapters, "download_files", download)
-    publication = adapters.HubCheckpointUploader(
+    uploader = adapters.HubCheckpointUploader(
         repository=runtime_module.DEFAULT_MODEL_REPO,
         revision="main",
         experiment_id="corrective-rft-70-30-20260813",
         artifact_root=root,
         token="publisher-token",
-    ).publish_receipt(descriptor, timeout_seconds=1)
+    )
+    publication = uploader.publish_receipt(descriptor, timeout_seconds=1)
+    anchor_receipt = uploader.publish_anchor(
+        {
+            "schema_version": 1,
+            "kind": "runtime_mixture_checkpoint_anchor",
+            "repository": runtime_module.DEFAULT_MODEL_REPO,
+            "anchor_ref": "main",
+            "experiment_id": "corrective-rft-70-30-20260813",
+        },
+        timeout_seconds=1,
+    )
+    assert anchor_receipt == {
+        "immutable_anchor_revision": "e" * 40,
+        "anchor_sha256": __import__("hashlib").sha256(remote["latest.json"]).hexdigest(),
+        "readback_verified": True,
+    }
     staged = tmp_path / "prepared" / "resume-checkpoint.json"
     staged.parent.mkdir()
     staged.write_bytes(descriptor_path.read_bytes())
