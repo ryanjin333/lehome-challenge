@@ -361,6 +361,18 @@ def test_persistent_lock_excludes_second_owner_and_releases_after_process_death(
             child.kill(); child.wait(timeout=5)
 
 
+def test_persistent_lock_rejects_symlink_and_fifo(tmp_path: Path) -> None:
+    target = tmp_path / "target"; target.write_text("x", encoding="utf-8")
+    link = tmp_path / "link"; link.symlink_to(target)
+    with pytest.raises(ValueError, match="regular"):
+        with _PersistentLock(link):
+            pass
+    fifo = tmp_path / "fifo"; os.mkfifo(fifo)
+    with pytest.raises(ValueError, match="regular"):
+        with _PersistentLock(fifo):
+            pass
+
+
 def test_mix_persistent_resume_rejects_state_plan_source_and_code_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -376,6 +388,26 @@ def test_mix_persistent_resume_rejects_state_plan_source_and_code_drift(
     (staging / "state.json").write_text(json.dumps(state), encoding="utf-8")
     with pytest.raises(ValueError, match="plan, source, or code"):
         materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "destination", persistent_staging_root=staging)
+
+
+def test_mix_persistent_state_binds_destination_and_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan, staging = build_mix_plan(organizer, flywheel, seed=20260813), tmp_path / "resume"
+    monkeypatch.setattr("lehome_train.flywheel.mix._copy_selected_video", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(RuntimeError, match="stop"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "one", persistent_staging_root=staging, persistent_source_evidence={"source": "one"})
+    with pytest.raises(ValueError, match="plan, source, or code"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "two", persistent_staging_root=staging, persistent_source_evidence={"source": "two"})
+
+
+def test_mix_persistent_initialization_is_idempotent_after_prestate_crash(tmp_path: Path) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan, staging = build_mix_plan(organizer, flywheel, seed=20260813), tmp_path / "resume"
+    (staging / "work").mkdir(parents=True); (staging / "receipts").mkdir()
+    materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "destination", persistent_staging_root=staging)
+    assert not staging.exists()
 
 
 def test_mix_persistent_resume_regenerates_semantically_wrong_parquet_and_invalid_video(

@@ -13,9 +13,11 @@ from dataclasses import dataclass
 import fcntl
 import json
 import math
+import os
 from pathlib import Path
 import random
 import shutil
+import stat
 import tempfile
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -903,7 +905,16 @@ _PERSISTENT_LOCK_NAME = "lock"
 def _mix_materializer_identity() -> str:
     """A restart must be tied to the bytes that implement this materializer."""
 
-    return sha256_file(Path(__file__))
+    from lehome_train.data import stats, validate
+    from lehome_train.flywheel import materialize
+    from lehome_train import io
+    return canonical_json_sha256({
+        "mix": sha256_file(Path(__file__)),
+        "materialize": sha256_file(Path(materialize.__file__)),
+        "validate": sha256_file(Path(validate.__file__)),
+        "statistics": sha256_file(Path(stats.__file__)),
+        "io": sha256_file(Path(io.__file__)),
+    })
 
 
 def _relative_under(path: Path, root: Path) -> str:
@@ -933,7 +944,18 @@ class _PersistentLock:
         self._stream: Any | None = None
 
     def __enter__(self) -> "_PersistentLock":
-        self._stream = self.path.open("a+b")
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(self.path, flags, 0o600)
+        except OSError as error:
+            raise ValueError("persistent materialization lock must be a regular non-symlink file") from error
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(descriptor)
+            raise ValueError("persistent materialization lock must be a regular non-symlink file")
+        self._stream = os.fdopen(descriptor, "a+b")
         try:
             fcntl.flock(self._stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -1025,6 +1047,18 @@ def _clean_persistent_postprocessing(work: Path) -> None:
             shutil.rmtree(path)
         elif path.exists() or path.is_symlink():
             path.unlink()
+
+
+def _clean_owned_atomic_temps(root: Path) -> None:
+    """Recover only atomic-write temporaries whose names this materializer owns."""
+
+    candidates = [root, root / _PERSISTENT_RECEIPTS_NAME]
+    for directory in candidates:
+        if not directory.exists() or directory.is_symlink() or not directory.is_dir():
+            continue
+        for path in directory.iterdir():
+            if path.is_file() and path.name.startswith(".") and path.name.endswith(".tmp"):
+                path.unlink()
 
 
 def _verify_promoted_generation_without_receipt(root: Path, *, plan_sha256: str) -> dict[str, object]:
@@ -1175,6 +1209,8 @@ def materialize_mixed_snapshot(
             expected_state: dict[str, object] = {
                 "schema_version": 1, "kind": "mixed_snapshot_resume", "plan": plan_body,
                 "plan_sha256": plan.sha256, "materializer_sha256": _mix_materializer_identity(),
+                "destination": str(destination.resolve()),
+                "persistent_source_evidence": None if persistent_source_evidence is None else dict(persistent_source_evidence),
                 "sources": [{"kind": source.kind, "manifest_sha256": source.manifest_sha256,
                              "source_revision": source.source_revision,
                              "raw_manifest_sha256": source.raw_manifest_sha256}
@@ -1196,6 +1232,7 @@ def materialize_mixed_snapshot(
             with _PersistentLock(persistent_root / _PERSISTENT_LOCK_NAME):
                 state_path = persistent_root / _PERSISTENT_STATE_NAME
                 if state_path.exists():
+                    _clean_owned_atomic_temps(persistent_root)
                     if state_path.is_symlink() or not state_path.is_file() or _read_json(state_path) != expected_state:
                         raise ValueError("persistent materialization state does not match this plan, source, or code")
                     # The atomic work-tree promotion can complete before its
@@ -1222,8 +1259,15 @@ def materialize_mixed_snapshot(
                 else:
                     if destination.exists():
                         raise FileExistsError("refusing to overwrite mixed snapshot destination")
-                    (persistent_root / _PERSISTENT_RECEIPTS_NAME).mkdir(mode=0o700)
-                    temporary.mkdir(mode=0o700)
+                    # A SIGKILL between mkdirs and state sealing is harmless:
+                    # recover only the two schema-owned empty directories.
+                    receipts_root = persistent_root / _PERSISTENT_RECEIPTS_NAME
+                    if receipts_root.exists() and (receipts_root.is_symlink() or not receipts_root.is_dir() or any(receipts_root.iterdir())):
+                        raise ValueError("persistent materialization initialization is not recoverable")
+                    if temporary.exists() and (temporary.is_symlink() or not temporary.is_dir() or any(temporary.iterdir())):
+                        raise ValueError("persistent materialization initialization is not recoverable")
+                    receipts_root.mkdir(mode=0o700, exist_ok=True)
+                    temporary.mkdir(mode=0o700, exist_ok=True)
                     atomic_write_json(state_path, expected_state)
                 state = expected_state
                 return _materialize_mixed_work(

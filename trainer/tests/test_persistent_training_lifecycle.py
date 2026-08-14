@@ -520,6 +520,22 @@ def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None
     assert (destination.with_name(destination.name + ".generation.json")).is_file()
 
 
+def test_materialize_allows_exact_existing_destination_for_resume_repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from test_flywheel_mix import _prepared_source
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
+    corrective = _prepared_source(tmp_path / "corrective", kind="flywheel", grade="A", episodes=2)
+    receipt = _corrective_release_receipt([corrective], tmp_path / "corrective-release.json")
+    destination, staging = tmp_path / "generation", tmp_path / "resume"
+    original = __import__("lehome_train.flywheel.mix", fromlist=["atomic_write_json"]).atomic_write_json
+    sibling = destination.with_name(destination.name + ".generation.json")
+    monkeypatch.setattr("lehome_train.flywheel.mix.atomic_write_json", lambda path, value: (_ for _ in ()).throw(RuntimeError("receipt interruption")) if path == sibling else original(path, value))
+    request = {"organizer_root": str(organizer), "corrective_roots": [str(corrective)], "destination": str(destination), "persistent_staging_root": str(staging), "seed": 1, "organizer_source_evidence": LIFECYCLE.ORGANIZER_SOURCE, "corrective_release_receipt": str(receipt)}
+    with pytest.raises(RuntimeError, match="receipt interruption"):
+        LIFECYCLE._materialize(request)
+    monkeypatch.setattr("lehome_train.flywheel.mix.atomic_write_json", original)
+    assert LIFECYCLE._materialize(request)["generation_root"] == str(destination)
+
+
 def test_derive_corrective_receipt_binds_disposal_proof_to_local_manifest_and_tree(
     tmp_path: Path,
 ) -> None:

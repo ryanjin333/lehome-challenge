@@ -899,8 +899,8 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
     organizer_root = Path(organizer)
     corrective_roots = [Path(item) for item in corrective]
     destination_root = Path(destination)
-    if destination_root.exists() or destination_root.is_symlink():
-        raise ValueError("materialize destination must not already exist")
+    if destination_root.is_symlink():
+        raise ValueError("materialize destination must not be a symlink")
     plan = build_mix_plan(organizer_root, corrective_roots, seed=seed)
     # Organizer is pinned through its manifest contract.  Corrective roots are
     # additionally bound to a previous authenticated full-release readback.
