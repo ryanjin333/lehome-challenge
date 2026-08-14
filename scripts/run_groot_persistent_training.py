@@ -30,6 +30,12 @@ PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revisi
 # exact SKU strings.  Query only stable numeric facts, then enforce the narrow
 # WS/S allowlist on raw rows in ``_offer_gpu``.
 OFFER_QUERY = "gpu_ram>=96000 num_gpus=1 reliability>=0.95"
+RUNTIME_PILOT_OFFER_QUERY = "cpu_arch=amd64 cpu_cores_effective>=32 cpu_ram>=64 disk_space>=120 reliability>=0.98 num_gpus=1 direct_port_count>=2 duration>=1"
+_RUNTIME_PILOT_OFFER_FIELDS = (
+    "id", "ask_contract_id", "machine_id", "cpu_arch", "cpu_cores_effective", "cpu_ram",
+    "disk_space", "disk_bw", "inet_down", "reliability", "num_gpus", "dph_total",
+    "storage_total_cost", "is_bid", "rentable", "rented", "gpu_name", "gpu_ram", "driver_version",
+)
 _DIGEST_PREFIX = "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:"
 BOOTSTRAP_TRAINER_IMAGE = (
     _DIGEST_PREFIX
@@ -294,6 +300,21 @@ def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: 
     captured = int(time.time()) if now_unix is None else now_unix
     safe_offer = _project(offer, ("id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "dph_base", "storage_cost", "storage_cost_per_gb", "min_bid", "driver_version", "is_bid", "image"))
     return {"schema_version": 1, "kind": "persistent_training_offer", "offer": safe_offer, "account_hourly_total_usd": total, "existing_instance_hourly_total_usd": existing_instance_total, "existing_storage_hourly_total_usd": existing_storage_total, "requested_storage_gb": 300, "requested_storage_hourly_usd": requested_storage_hourly, "storage_quote_included_in_dph_total": True, "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds, "search_mode": "interruptible"}
+
+
+def capture_runtime_pilot_offer(*, runner: Runner, now_unix: int | None = None) -> dict[str, object]:
+    """Capture the bounded on-demand native-x86 CPU-pilot lease evidence."""
+    offers = _json(runner, ("vastai", "--raw", "search", "offers", RUNTIME_PILOT_OFFER_QUERY, "--on-demand", "--storage", "120", "--order", "dph", "--raw"))
+    if not isinstance(offers, list):
+        raise ValueError("runtime pilot provider offer listing is invalid")
+    eligible = [row for row in offers if isinstance(row, Mapping) and row.get("cpu_arch") == "amd64" and type(row.get("cpu_cores_effective")) is int and row["cpu_cores_effective"] >= 32 and type(row.get("cpu_ram")) in (int, float) and float(row["cpu_ram"]) >= 64000 and type(row.get("disk_space")) in (int, float) and float(row["disk_space"]) >= 120 and row.get("num_gpus") == 1 and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False and type(row.get("id")) is int and type(row.get("dph_total")) in (int, float)]
+    if not eligible:
+        raise ValueError("no on-demand native x86 runtime pilot offer is eligible")
+    offer = min(eligible, key=lambda row: (float(row["dph_total"]), -float(row.get("disk_bw", 0)), int(row["id"])))
+    total = _live_account_total(runner=runner) + float(offer["dph_total"])
+    _require_account_cap(total, label="runtime pilot projected")
+    captured = int(time.time()) if now_unix is None else now_unix
+    return {"schema_version": 1, "kind": "runtime_mixture_cpu_pilot_offer", "offer": _project(offer, _RUNTIME_PILOT_OFFER_FIELDS), "raw_offer_sha256": _hash(dict(offer)), "account_hourly_total_usd": total, "captured_at_unix": captured, "expires_at_unix": captured + 300, "search_mode": "on_demand", "platform_arch": "amd64", "storage_gb": 120}
 
 
 def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep, require_capability: bool = True) -> dict[str, object]:

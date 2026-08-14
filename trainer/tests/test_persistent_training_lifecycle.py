@@ -1293,3 +1293,15 @@ def test_platform_attestation_requires_native_x86_remote_proof() -> None:
     assert LIFECYCLE._attest_platform_arch(instance, runner=lambda command: "x86_64\n") == "x86_64"
     with pytest.raises(ValueError, match="x86_64"):
         LIFECYCLE._attest_platform_arch(instance, runner=lambda command: "aarch64\n")
+
+
+def test_capture_runtime_cpu_pilot_offer_uses_exact_on_demand_contract() -> None:
+    commands: list[tuple[str, ...]] = []
+    offer = {"id": 8, "ask_contract_id": 9, "machine_id": 10, "cpu_arch": "amd64", "cpu_cores_effective": 32, "cpu_ram": 64390, "disk_space": 124.75, "disk_bw": 500, "inet_down": 1000, "reliability": .99, "num_gpus": 1, "dph_total": .18, "storage_total_cost": 0, "is_bid": False, "rentable": True, "rented": False, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "driver_version": "x"}
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(command)
+        if command[2:4] == ("search", "offers"): return json.dumps([offer])
+        return "[]"
+    receipt = LIFECYCLE.capture_runtime_pilot_offer(runner=runner, now_unix=1)
+    assert receipt["offer"]["id"] == 8 and receipt["account_hourly_total_usd"] < 1
+    assert "--on-demand" in commands[0] and "--storage" in commands[0]
