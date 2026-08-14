@@ -1534,6 +1534,83 @@ def test_runtime_cpu_pilot_cli_actions_are_explicitly_gated_and_never_use_legacy
     assert report == {"paid_action": False, "action": "runtime-pilot-destroy", "dry_run": True, "request": {"instance_id": 44}}
 
 
+def test_runtime_checkpoint_actions_are_explicit_dry_run_boundaries(tmp_path: Path) -> None:
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"instance": {"instance_id": 44}}), encoding="utf-8")
+
+    report = LIFECYCLE.main_for_test([
+        "runtime-checkpoint-replacement-resume", "--request", str(request),
+    ])
+
+    assert report["paid_action"] is False
+    assert report["action"] == "runtime-checkpoint-replacement-resume"
+    assert report["dry_run"] is True
+
+
+def test_runtime_abort_cleanup_writes_redacted_bound_non_disposable_receipt(tmp_path: Path) -> None:
+    output = tmp_path / "abort.json"
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        return "{}" if command[:4] == ("vastai", "--raw", "show", "instance") else ""
+
+    LIFECYCLE._runtime_abort_cleanup(
+        instance={"kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 44, "provider_response_sha256": "a" * 64},
+        request={"failure_receipt": str(output), "code_revision": "b" * 40, "code_bundle_sha256": "c" * 64},
+        error=RuntimeError("HF_TOKEN secret-value"), runner=runner,
+    )
+
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    assert receipt["instance_id"] == 44 and receipt["disposable"] is False
+    assert receipt["cleanup_status"] == "destroyed_and_absent"
+    assert receipt["error"] == "redacted remote failure"
+    assert calls[0] == ("vastai", "destroy", "instance", "44", "--yes")
+
+
+def test_runtime_abort_cleanup_retains_non_disposable_receipt_when_destroy_fails(tmp_path: Path) -> None:
+    output = tmp_path / "abort-failed.json"
+
+    with pytest.raises(RuntimeError, match="could not destroy"):
+        LIFECYCLE._runtime_abort_cleanup(
+            instance={"instance_id": 44, "provider_response_sha256": "a" * 64},
+            request={"failure_receipt": str(output), "code_revision": "b" * 40, "code_bundle_sha256": "c" * 64},
+            error=ValueError("stage failed"),
+            runner=lambda command: (_ for _ in ()).throw(OSError("provider down")),
+        )
+
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    assert receipt["disposable"] is False and receipt["cleanup_status"] == "destroy_failed"
+
+
+def test_runtime_selected_workers_are_checked_against_unmodified_launch_config(tmp_path: Path) -> None:
+    selected, launch = tmp_path / "selected.json", tmp_path / "launch.json"
+    selected.write_text(json.dumps({"selected_loader_workers": 4}), encoding="utf-8")
+    launch.write_text(json.dumps({"dataloader_num_workers": 4}), encoding="utf-8")
+
+    workers, identity = LIFECYCLE._runtime_stage_selected_workers(selected_path=selected, launch_path=launch)
+
+    assert workers == 4 and identity == LIFECYCLE.sha256_file(selected)
+    launch.write_text(json.dumps({"dataloader_num_workers": 8}), encoding="utf-8")
+    with pytest.raises(ValueError, match="workers"):
+        LIFECYCLE._runtime_stage_selected_workers(selected_path=selected, launch_path=launch)
+
+
+def test_runtime_provider_loss_requires_two_fresh_absence_readbacks() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    loss = LIFECYCLE.classify_runtime_provider_loss(
+        instance={"instance_id": 44},
+        runner=lambda command: calls.append(command) or "{}",
+    )
+
+    assert loss is not None and loss["kind"] == "instance_absent"
+    assert calls == [
+        ("vastai", "--raw", "show", "instance", "44"),
+        ("vastai", "--raw", "show", "instance", "44"),
+    ]
+
+
 def test_runtime_gpu_warmup_runs_exact_cli_and_binds_cpu_pilot_code_parent_and_instance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

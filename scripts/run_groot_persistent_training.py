@@ -391,6 +391,53 @@ def _runtime_pilot_cleanup(*, instance_id: int, runner: Runner) -> None:
         raise ValueError("runtime CPU pilot cleanup absence readback failed")
 
 
+def _runtime_abort_cleanup(*, instance: Mapping[str, object], request: Mapping[str, object], error: BaseException, runner: Runner) -> None:
+    """Persist redacted abort evidence, then destroy only this just-rented lease."""
+    instance_id = instance.get("instance_id")
+    if type(instance_id) is not int:
+        return
+    receipt = {
+        "schema_version": 1, "kind": "runtime_mixture_abort_cleanup", "instance_id": instance_id,
+        "provider_response_sha256": instance.get("provider_response_sha256"),
+        "code_revision": request.get("code_revision"), "code_bundle_sha256": request.get("code_bundle_sha256"),
+        "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+        # Failure receipts deliberately never serialize command output or exception
+        # text: either can contain a Hub token or a presigned URL.
+        "error_type": type(error).__name__, "error": "redacted remote failure",
+        "disposable": False,
+    }
+    output = request.get("failure_receipt")
+    def record(extra: Mapping[str, object]) -> None:
+        if type(output) is str and Path(output).is_absolute() and not Path(output).exists() and not Path(output).is_symlink():
+            atomic_write_json(Path(output), receipt | dict(extra))
+    try:
+        runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+        absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+    except BaseException:
+        record({"cleanup_status": "destroy_failed"})
+        raise RuntimeError("runtime abort cleanup could not destroy the newly rented instance") from error
+    if absent not in ({}, None):
+        record({"cleanup_status": "absence_unverified"})
+        raise RuntimeError("runtime abort cleanup did not verify instance absence") from error
+    record({"cleanup_status": "destroyed_and_absent"})
+
+
+def _runtime_abort_on_failure(
+    *, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner,
+    operation: Callable[[], dict[str, object]],
+) -> dict[str, object]:
+    """Run a paid runtime step and abort-clean only its freshly rented lease."""
+    if instance.get("kind") not in {
+        "runtime_mixture_cpu_pilot_instance", "runtime_mixture_gpu_warmup_instance",
+    }:
+        return operation()
+    try:
+        return operation()
+    except BaseException as error:
+        _runtime_abort_cleanup(instance=instance, request=request, error=error, runner=runner)
+        raise
+
+
 def rent_runtime_cpu_pilot(
     *, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12,
     sleep: Callable[[float], None] = _bounded_sleep,
@@ -434,12 +481,18 @@ def rent_runtime_cpu_pilot(
         }
         _attest_platform_arch(instance, runner=runner)
         return instance
-    except BaseException:
-        _runtime_pilot_cleanup(instance_id=instance_id, runner=runner)
+    except BaseException as error:
+        _runtime_abort_cleanup(
+            instance=locals().get("instance", {
+                "instance_id": instance_id,
+                "provider_response_sha256": _hash(created),
+            }),
+            request=evidence, error=error, runner=runner,
+        )
         raise
 
 
-def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep, require_capability: bool = True) -> dict[str, object]:
+def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep, require_capability: bool = True, abort_request: Mapping[str, object] | None = None) -> dict[str, object]:
     offer = evidence.get("offer")
     if not isinstance(offer, Mapping) or type(offer.get("id")) is not int: raise ValueError("offer evidence is invalid")
     if evidence.get("search_mode") != "interruptible" or type(evidence.get("expires_at_unix")) is not int or evidence["expires_at_unix"] < int(time.time()): raise ValueError("offer evidence is expired or not interruptible")
@@ -474,16 +527,24 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
             break
         sleep(5.0)
     else:
-        runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
-        absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
-        if absent not in ({}, None): raise ValueError("post-create cleanup absence readback failed")
-        raise ValueError("instance readiness poll timed out")
+        error = ValueError("instance readiness poll timed out")
+        if abort_request is not None:
+            _runtime_abort_cleanup(instance={"instance_id": instance_id, "provider_response_sha256": _hash(created)}, request=abort_request, error=error, runner=runner)
+        else:
+            runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+            absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+            if absent not in ({}, None): raise ValueError("post-create cleanup absence readback failed")
+        raise error
     if not isinstance(live, Mapping) or live.get("id") != instance_id or not _offer_gpu(live) or live.get("num_gpus") != 1 or not live.get("ssh_host") or type(live.get("ssh_port")) is not int or float(live.get("dph_total", 99)) >= 1:
-        runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
-        absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
-        if absent not in ({}, None):
-            raise ValueError("post-create cleanup absence readback failed")
-        raise ValueError("instance readback does not match accepted offer")
+        error = ValueError("instance readback does not match accepted offer")
+        if abort_request is not None:
+            _runtime_abort_cleanup(instance={"instance_id": instance_id, "provider_response_sha256": _hash(live)}, request=abort_request, error=error, runner=runner)
+        else:
+            runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+            absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+            if absent not in ({}, None):
+                raise ValueError("post-create cleanup absence readback failed")
+        raise error
     return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "trainer_image": image, "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _stable_instance_identity(live), "account_hourly_total_usd": _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")}
 
 
@@ -1201,8 +1262,12 @@ def run_runtime_gpu_warmup(
 
 def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -> dict[str, object]:
     """Promote only a fresh capable interruptible PRO6000 lease for warm-up."""
-    rented = rent(evidence=evidence, runner=runner)
-    _attest_platform_arch(rented, runner=runner)
+    rented = rent(evidence=evidence, runner=runner, abort_request=evidence)
+    try:
+        _attest_platform_arch(rented, runner=runner)
+    except BaseException as error:
+        _runtime_abort_cleanup(instance=rented, request=evidence, error=error, runner=runner)
+        raise
     capability = evidence.get("training_capability")
     if not isinstance(capability, Mapping):
         raise ValueError("runtime GPU warm-up requires a capability receipt")
@@ -1295,20 +1360,28 @@ def runtime_checkpoint_terminal(
 
 
 def classify_runtime_provider_loss(*, instance: Mapping[str, object], runner: Runner) -> dict[str, object] | None:
-    """Classify only provider evidence; SSH failure alone never creates a cursor."""
+    """Classify only two fresh provider readbacks; SSH/API loss is never a cursor."""
     instance_id = instance.get("instance_id")
     if type(instance_id) is not int:
         raise ValueError("runtime GPU instance is invalid")
     try:
-        live = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+        observed = tuple(
+            _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+            for _ in range(2)
+        )
     except (subprocess.CalledProcessError, OSError, ValueError):
         return None
-    if live in ({}, None):
-        return {"kind": "instance_absent", "evidence_sha256": _hash({"instance_id": instance_id, "reason": "instance_absent"})}
-    if isinstance(live, Mapping) and live.get("id") == instance_id and live.get("actual_status") in {"interrupted", "terminated", "stopped", "offline"}:
-        return {"kind": "preempted", "evidence_sha256": _hash(_project(live, _STABLE_INSTANCE_FIELDS))}
-    if not isinstance(live, Mapping) or live.get("id") != instance_id:
-        raise ValueError("runtime provider loss readback is invalid")
+    if all(live in ({}, None) for live in observed):
+        return {"kind": "instance_absent", "evidence_sha256": _hash({"instance_id": instance_id, "reason": "instance_absent", "readbacks": 2})}
+    states: list[Mapping[str, object]] = []
+    for live in observed:
+        if not isinstance(live, Mapping) or live.get("id") != instance_id:
+            raise ValueError("runtime provider loss readback is invalid")
+        if live.get("actual_status") not in {"interrupted", "terminated", "stopped", "offline"}:
+            return None
+        states.append(live)
+    if len(states) == 2:
+        return {"kind": "preempted", "evidence_sha256": _hash([_project(live, _STABLE_INSTANCE_FIELDS) for live in states])}
     return None
 
 
@@ -1336,6 +1409,55 @@ def destroy_runtime_checkpoint_completion(
     if absent not in ({}, None):
         raise ValueError("runtime checkpoint destroy absence readback failed")
     return {"paid_action": True, "destroy_authorized": True, "instance_id": instance["instance_id"], "authorization": authorization}
+
+
+class _RuntimeCheckpointHub:
+    """Token-bound adapter for the checkpoint module's deliberately small Hub API."""
+
+    def __init__(self, *, transport: HubTransport, token: str) -> None:
+        self._transport, self._token = transport, token
+
+    def list_tree(self, *, repository: str, revision: str) -> object:
+        return self._transport.list_tree(repository=repository, revision=revision, token=self._token)
+
+    def download_files(
+        self, *, repository: str, revision: str, destination: Path,
+        relative_paths: tuple[str, ...], remote_prefix: str,
+    ) -> object:
+        return self._transport.download_files(
+            repository=repository, revision=revision, destination=destination,
+            relative_paths=relative_paths, remote_prefix=remote_prefix, token=self._token,
+        )
+
+
+def _runtime_checkpoint_terminal_output(request: Mapping[str, object], terminal: Mapping[str, object]) -> dict[str, object]:
+    """Optionally persist an immutable terminal without accepting an overwrite."""
+    output = request.get("terminal_receipt")
+    if output is None:
+        return dict(terminal)
+    if type(output) is not str or not Path(output).is_absolute() or Path(output).exists() or Path(output).is_symlink():
+        raise ValueError("runtime checkpoint terminal receipt must be an absent absolute path")
+    atomic_write_json(Path(output), dict(terminal))
+    return dict(terminal)
+
+
+def _runtime_checkpoint_publisher(*, request: Mapping[str, object], token: str):
+    repository, revision, experiment, root = (
+        request.get("checkpoint_repository"), request.get("checkpoint_revision"),
+        request.get("checkpoint_experiment_id"), request.get("checkpoint_artifact_root"),
+    )
+    if (
+        repository != PARENT_CHECKPOINT["repository"] or type(revision) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", revision) is None or type(experiment) is not str
+        or not experiment or type(root) is not str
+    ):
+        raise ValueError("runtime checkpoint publisher identity is invalid")
+    from lehome_train.groot.production_adapters import HubCheckpointUploader
+    from lehome_train.groot.runtime_checkpoint_lifecycle import hub_checkpoint_publisher
+    return hub_checkpoint_publisher(HubCheckpointUploader(
+        repository=repository, revision=revision, experiment_id=experiment,
+        artifact_root=root, token=token,
+    ))
 
 
 def runtime_mixture_pilot_provider_plan() -> dict[str, object]:
@@ -1403,10 +1525,28 @@ def runtime_mixture_train(*, instance: Mapping[str, object], request: Mapping[st
         "deployment_tree_receipt_sha256": identity["deployment_receipt_sha256"],
         "pilot_receipt_sha256": sha256_file(Path(str(request["pilot_receipt"]))),
         "warmup_lifecycle_receipt_sha256": sha256_file(Path(warmup_path)),
+        "selected_loader_workers": warmup["selected_loader_workers"],
         "runtime_command": "runtime-mixture-train", "throughput_verified": pilot.get("throughput_verified", pilot["canonical_completion"]),
     }
     atomic_write_json(Path(output), receipt)
     return {"paid_action": True, "action": "runtime-train", "instance_id": instance["instance_id"], "execution_receipt": receipt}
+
+
+def _runtime_stage_selected_workers(*, selected_path: Path, launch_path: Path) -> tuple[int, str]:
+    """Bind the immutable warm-up selection to the already-generated launch JSON.
+
+    The lifecycle never rewrites the launch configuration after a warm-up.  The
+    canonical runtime command performs the same comparison immediately before
+    it starts the trainer; this preflight catches a mismatched staged artifact.
+    """
+    selected = _load_regular_json(selected_path, "runtime selected-workers receipt")
+    workers = selected.get("selected_loader_workers")
+    if type(workers) is not int or workers < 0 or workers > 64:
+        raise ValueError("runtime selected-workers receipt is invalid")
+    launch = _load_regular_json(launch_path, "runtime launch config")
+    if launch.get("dataloader_num_workers") != workers:
+        raise ValueError("runtime launch config workers do not match authenticated warm-up selection")
+    return workers, sha256_file(selected_path)
 
 
 def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
@@ -1429,7 +1569,9 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
     code = Path(str(request["code_bundle"]))
     if _verify_reviewed_code_bundle(code, Path(str(request["code_bundle_sha256_file"])), request.get("code_revision")) != request.get("code_bundle_sha256"):
         raise ValueError("runtime mixture stage code bundle receipt differs from the reviewed bundle")
-    _safe_archive(code, "runtime mixture code bundle")
+    selected_workers, selected_workers_sha256 = _runtime_stage_selected_workers(
+        selected_path=Path(str(request["selected_workers"])), launch_path=Path(str(request["launch_config"])),
+    )
     parent = Path(str(request["parent_checkpoint"]))
     if (
         parent.is_symlink() or not parent.is_file()
@@ -1462,8 +1604,8 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         if not observed or observed[0] != digest:
             raise ValueError("runtime mixture staged hash readback failed")
         transfers.append({"name": remote_name, "sha256": digest})
-    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/code /prepared/config /prepared/runtime /cache/parent /output; mv " + remote_dir + "/launch.json /prepared/config/launch.json; mv " + remote_dir + "/experiment.json /prepared/config/experiment.json; mv " + remote_dir + "/runtime-train.json /prepared/config/runtime-train.json; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/runtime-pilot.json /prepared/config/runtime-pilot.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/cpu-pilot.json /prepared/config/cpu-pilot.json; mv " + remote_dir + "/gpu-warmup.json /prepared/config/gpu-warmup.json; mv " + remote_dir + "/runtime-warmup-binding.json /prepared/config/runtime-warmup-binding.json; mv " + remote_dir + "/selected-workers.json /prepared/config/selected-workers.json; mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/code.bundle -C /prepared/code; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/parent.tar -C /cache/parent; test \"$(sha256sum " + remote_dir + "/parent.tar | cut -d' ' -f1)\" = " + PARENT_CHECKPOINT["archive_sha256"] + "; PYTHONPATH=/prepared/code/trainer/src python -c \"from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; assert policy_artifact_sha256('/cache/parent') == '" + PARENT_CHECKPOINT["artifact_sha256"] + "'\"; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code; test ! -L /cache/parent"))
-    return {"paid_action": True, "action": "runtime-stage", "instance_id": instance["instance_id"], "code_bundle_sha256": request["code_bundle_sha256"], "transfers": transfers}
+    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/config /prepared/runtime /cache/parent /output; mv " + remote_dir + "/launch.json /prepared/config/launch.json; mv " + remote_dir + "/experiment.json /prepared/config/experiment.json; mv " + remote_dir + "/runtime-train.json /prepared/config/runtime-train.json; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/runtime-pilot.json /prepared/config/runtime-pilot.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/cpu-pilot.json /prepared/config/cpu-pilot.json; mv " + remote_dir + "/gpu-warmup.json /prepared/config/gpu-warmup.json; mv " + remote_dir + "/runtime-warmup-binding.json /prepared/config/runtime-warmup-binding.json; mv " + remote_dir + "/selected-workers.json /prepared/config/selected-workers.json; mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; git clone --quiet --no-checkout " + remote_dir + "/code.bundle /prepared/code; git -C /prepared/code checkout --quiet --detach " + str(request["code_revision"]) + "; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -z \"$(git -C /prepared/code status --porcelain)\"; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/parent.tar -C /cache/parent; test \"$(sha256sum " + remote_dir + "/parent.tar | cut -d' ' -f1)\" = " + PARENT_CHECKPOINT["archive_sha256"] + "; PYTHONPATH=/prepared/code/trainer/src python -c \"from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; assert policy_artifact_sha256('/cache/parent') == '" + PARENT_CHECKPOINT["artifact_sha256"] + "'\"; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code; test ! -L /cache/parent"))
+    return {"paid_action": True, "action": "runtime-stage", "instance_id": instance["instance_id"], "code_bundle_sha256": request["code_bundle_sha256"], "launch_config_sha256": sha256_file(Path(str(request["launch_config"]))), "selected_loader_workers": selected_workers, "selected_workers_sha256": selected_workers_sha256, "transfers": transfers}
 
 
 def runtime_mixture_hydrate(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
@@ -1998,11 +2140,11 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
     if action == "stage":
         return stage(instance=instance, request=request, runner=runner)
     if action == "runtime-stage":
-        return runtime_mixture_stage(instance=instance, request=request, runner=runner)
+        return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: runtime_mixture_stage(instance=instance, request=request, runner=runner))
     if action == "runtime-hydrate":
-        return runtime_mixture_hydrate(instance=instance, request=request, runner=runner)
+        return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: runtime_mixture_hydrate(instance=instance, request=request, runner=runner))
     if action == "runtime-train":
-        return runtime_mixture_train(instance=instance, request=request, runner=runner)
+        return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: runtime_mixture_train(instance=instance, request=request, runner=runner))
     elif action in {"tune", "train", "status", "resume"}:
         if action in {"tune", "train"}:
             _require_instance_capability(instance, request)
@@ -2247,7 +2389,7 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
 
 
 def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object]:
-    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "capture-runtime-pilot-offer", "bootstrap-canary", "promote", "replacement-resume", "rent", "runtime-pilot-rent", "runtime-gpu-warmup-rent", "stage", "runtime-pilot-plan", "runtime-stage", "runtime-hydrate", "runtime-pilot-run", "runtime-gpu-warmup", "runtime-train", "tune", "train", "status", "resume", "destroy", "runtime-pilot-destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "capture-runtime-pilot-offer", "bootstrap-canary", "promote", "replacement-resume", "rent", "runtime-pilot-rent", "runtime-gpu-warmup-rent", "stage", "runtime-pilot-plan", "runtime-stage", "runtime-hydrate", "runtime-pilot-run", "runtime-gpu-warmup", "runtime-train", "runtime-checkpoint-publish", "runtime-checkpoint-complete", "runtime-checkpoint-interrupted", "runtime-checkpoint-replacement-resume", "runtime-checkpoint-dispose", "tune", "train", "status", "resume", "destroy", "runtime-pilot-destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "materialize":
         return _materialize(request)
@@ -2315,9 +2457,30 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
     instance = request.get("instance")
     if not isinstance(instance, Mapping): raise ValueError("remote action requires an instance receipt")
     if args.action == "runtime-pilot-run":
-        return run_runtime_cpu_pilot(instance=instance, request=request, runner=runner)
+        return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: run_runtime_cpu_pilot(instance=instance, request=request, runner=runner))
     if args.action == "runtime-gpu-warmup":
-        return run_runtime_gpu_warmup(instance=instance, request=request, runner=runner)
+        return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: run_runtime_gpu_warmup(instance=instance, request=request, runner=runner))
+    if args.action == "runtime-checkpoint-complete":
+        return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: {"paid_action": True, "action": args.action, "terminal": _runtime_checkpoint_terminal_output(request, runtime_checkpoint_terminal(instance=instance, request=request)["terminal"])})
+    if args.action == "runtime-checkpoint-interrupted":
+        loss = classify_runtime_provider_loss(instance=instance, runner=runner)
+        if loss is None:
+            raise ValueError("runtime checkpoint replacement requires repeated provider absence or preemption evidence")
+        return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: {"paid_action": True, "action": args.action, "terminal": _runtime_checkpoint_terminal_output(request, runtime_checkpoint_terminal(instance=instance, request=request, provider_loss=loss)["terminal"])})
+    token = _read_private_token(args.token_file)
+    hub = _RuntimeCheckpointHub(transport=HuggingFaceHubTransport(timeout_seconds=30.0), token=token)
+    if args.action == "runtime-checkpoint-publish":
+        return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: publish_runtime_checkpoint(instance=instance, request=request, publisher=_runtime_checkpoint_publisher(request=request, token=token), hub=hub))
+    if args.action == "runtime-checkpoint-replacement-resume":
+        terminal_path, destination = request.get("terminal_receipt"), request.get("resume_destination")
+        if type(terminal_path) is not str or type(destination) is not str or not Path(destination).is_absolute():
+            raise ValueError("runtime checkpoint replacement resume requires terminal receipt and absolute destination")
+        return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: resume_runtime_checkpoint(replacement=instance, request=request, terminal=_load_regular_json(Path(terminal_path), "runtime checkpoint terminal"), hub=hub, destination=Path(destination)))
+    if args.action == "runtime-checkpoint-dispose":
+        terminal_path = request.get("terminal_receipt")
+        if type(terminal_path) is not str:
+            raise ValueError("runtime checkpoint disposal requires terminal receipt")
+        return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: destroy_runtime_checkpoint_completion(instance=instance, request=request, terminal=_load_regular_json(Path(terminal_path), "runtime checkpoint terminal"), hub=hub, runner=runner))
     return remote_action(action=args.action, instance=instance, request=request, runner=runner)
 
 
