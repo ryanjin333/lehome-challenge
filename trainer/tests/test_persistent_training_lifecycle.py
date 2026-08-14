@@ -1278,6 +1278,14 @@ def test_runtime_pilot_provider_plan_is_on_demand_x86_and_never_rents() -> None:
     }
 
 
+def test_runtime_cpu_pilot_image_uses_the_published_immutable_index_digest() -> None:
+    assert LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE == (
+        "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:"
+        "e4c7ac02d22f46485c1e7861a9e85b85daff14283ef62cb9e16025a3d1ecf555"
+    )
+    assert LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE != LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE
+
+
 def test_runtime_pilot_rejects_a_descriptive_unbound_claim(tmp_path: Path) -> None:
     receipt = tmp_path / "pilot.json"
     receipt.write_text(json.dumps({
