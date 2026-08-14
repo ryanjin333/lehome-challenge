@@ -525,7 +525,7 @@ def test_real_transport_downloads_an_allowlist_with_bounded_workers(
     } == set(files)
 
 
-def test_real_transport_uses_exact_nested_release_prefix_allowlist_then_copies_exact_paths(
+def test_real_transport_uses_direct_exact_downloads_for_nested_release_prefixes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -538,14 +538,13 @@ def test_real_transport_uses_exact_nested_release_prefix_allowlist_then_copies_e
 
     class FakeLibrary:
         @staticmethod
-        def snapshot_download(**kwargs: object) -> str:
+        def hf_hub_download(**kwargs: object) -> str:
             calls.append(dict(kwargs))
             snapshot = Path(str(kwargs["local_dir"]))
-            for relative_path in (*files, "unrequested/debug.json"):
-                target = snapshot / remote_prefix / relative_path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(relative_path, encoding="utf-8")
-            return str(snapshot)
+            target = snapshot / str(kwargs["filename"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(kwargs["filename"]), encoding="utf-8")
+            return str(target)
 
     monkeypatch.setattr(transport, "_repo_info", lambda **_kwargs: SimpleNamespace(sha=revision))
     monkeypatch.setattr(transport, "_library", lambda: FakeLibrary())
@@ -560,12 +559,69 @@ def test_real_transport_uses_exact_nested_release_prefix_allowlist_then_copies_e
     )
 
     assert resolved == revision
-    assert calls[0]["allow_patterns"] == [f"{remote_prefix}/{path}" for path in files]
+    assert [call["filename"] for call in calls] == [f"{remote_prefix}/{path}" for path in files]
     assert {str(path.relative_to(destination)) for path in destination.rglob("*") if path.is_file()} == set(files)
     assert not (destination / "releases").exists()
 
 
-def test_real_transport_preserves_partial_prefixed_bytes_when_a_snapshot_rate_limits(
+def test_real_transport_downloads_prefixed_exact_files_directly_into_stable_targets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Large prefixed batches must not scan the complete repository tree."""
+
+    transport = HuggingFaceHubTransport()
+    revision = "e" * 40
+    destination = tmp_path / "readback"
+    remote_prefix = "bc/full"
+    files = ("manifest.json", "shards/0001.bin")
+    snapshot_calls: list[dict[str, object]] = []
+    direct_calls: list[dict[str, object]] = []
+
+    class FakeLibrary:
+        @staticmethod
+        def snapshot_download(**kwargs: object) -> str:
+            snapshot_calls.append(dict(kwargs))
+            snapshot = Path(str(kwargs["local_dir"]))
+            for remote_path in kwargs["allow_patterns"]:
+                target = snapshot / str(remote_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"snapshot")
+            return str(snapshot)
+
+        @staticmethod
+        def hf_hub_download(**kwargs: object) -> str:
+            direct_calls.append(dict(kwargs))
+            target = Path(str(kwargs["local_dir"])) / str(kwargs["filename"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(str(kwargs["filename"]).encode("utf-8"))
+            return str(target)
+
+    monkeypatch.setattr(transport, "_repo_info", lambda **_kwargs: SimpleNamespace(sha=revision))
+    monkeypatch.setattr(transport, "_library", lambda: FakeLibrary())
+
+    resolved = transport.download_files(
+        repository="ryanjin333/lehome-groot-n17-data",
+        revision=revision,
+        destination=destination,
+        relative_paths=files,
+        remote_prefix=remote_prefix,
+        token="hf_direct_prefix_probe",
+    )
+
+    assert resolved == revision
+    assert snapshot_calls == []
+    assert [call["filename"] for call in direct_calls] == [
+        f"{remote_prefix}/{path}" for path in files
+    ]
+    assert all(call["revision"] == revision for call in direct_calls)
+    assert all(call["repo_type"] == "dataset" for call in direct_calls)
+    assert all(call["local_dir_use_symlinks"] is False for call in direct_calls)
+    assert {str(path.relative_to(destination)) for path in destination.rglob("*") if path.is_file()} == set(files)
+    assert not (destination / "bc").exists()
+
+
+def test_real_transport_preserves_completed_prefixed_bytes_when_direct_download_rate_limits(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     transport = HuggingFaceHubTransport()
@@ -577,11 +633,18 @@ def test_real_transport_preserves_partial_prefixed_bytes_when_a_snapshot_rate_li
     class FakeLibrary:
         @staticmethod
         def snapshot_download(**kwargs: object) -> str:
+            return str(kwargs["local_dir"])
+
+        @staticmethod
+        def hf_hub_download(**kwargs: object) -> str:
             snapshot = Path(str(kwargs["local_dir"]))
-            partial = snapshot / remote_prefix / files[0]
-            partial.parent.mkdir(parents=True, exist_ok=True)
-            partial.write_bytes(b"partial-but-complete")
-            (snapshot / ".cache" / "huggingface").mkdir(parents=True, exist_ok=True)
+            filename = str(kwargs["filename"])
+            if filename == f"{remote_prefix}/{files[0]}":
+                partial = snapshot / filename
+                partial.parent.mkdir(parents=True, exist_ok=True)
+                partial.write_bytes(b"partial-but-complete")
+                (snapshot / ".cache" / "huggingface").mkdir(parents=True, exist_ok=True)
+                return str(partial)
             error = RuntimeError("rate limit")
             error.status_code = 429  # type: ignore[attr-defined]
             raise error

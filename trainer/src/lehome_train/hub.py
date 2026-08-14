@@ -194,6 +194,45 @@ class HuggingFaceHubTransport:
             pass
 
     @staticmethod
+    def _safe_download_path(destination: Path, relative_path: str) -> Path:
+        """Create a non-symlinked parent path beneath one caller-owned destination."""
+
+        validate_artifact_relative_path(relative_path)
+        if destination.exists() and destination.is_symlink():
+            raise ValueError("Hub download destination must not be a symlink")
+        destination.mkdir(parents=True, exist_ok=True)
+        current = destination
+        for component in relative_path.split("/")[:-1]:
+            current /= component
+            if current.exists():
+                if current.is_symlink() or not current.is_dir():
+                    raise ValueError("Hub download path contains an unsafe component")
+            else:
+                current.mkdir()
+        return destination / relative_path
+
+    @classmethod
+    def _materialize_prefixed_download(
+        cls,
+        *,
+        destination: Path,
+        remote_prefix: str,
+        relative_path: str,
+        downloaded: str | Path,
+    ) -> None:
+        """Move one direct exact-file result into the readback's stable layout."""
+
+        remote_path = f"{remote_prefix}/{relative_path}"
+        expected_source = cls._safe_download_path(destination, remote_path)
+        source = Path(downloaded)
+        if source != expected_source or not source.is_file() or source.is_symlink():
+            raise ValueError("Hub direct download returned an unsafe file path")
+        target = cls._safe_download_path(destination, relative_path)
+        if target.exists() and target.is_symlink():
+            raise ValueError("Hub download target must not be a symlink")
+        os.replace(source, target)
+
+    @staticmethod
     def _repo_type(repository: str) -> str:
         try:
             return _APPROVED_REPOSITORIES[repository]
@@ -392,27 +431,45 @@ class HuggingFaceHubTransport:
     ) -> str:
         if remote_prefix is not None:
             validate_artifact_relative_path(remote_prefix, "remote_prefix")
+        for relative_path in relative_paths:
+            validate_artifact_relative_path(relative_path)
         info = self._repo_info(repository=repository, revision=revision, token=token)
         observed = self._revision(info)
         if observed != revision:
             raise ValueError("Hub readback resolved a different immutable revision")
         library = self._library()
         destination.mkdir(parents=True, exist_ok=True)
-        remote_paths = tuple(
-            relative_path if remote_prefix is None else f"{remote_prefix}/{relative_path}"
-            for relative_path in relative_paths
-        )
-        allow_patterns = list(remote_paths)
         try:
-            library.snapshot_download(
-                repo_id=repository,
-                repo_type=self._repo_type(repository),
-                revision=revision,
-                allow_patterns=allow_patterns,
-                token=token,
-                local_dir=destination,
-                etag_timeout=self.timeout_seconds,
-            )
+            if remote_prefix is None:
+                library.snapshot_download(
+                    repo_id=repository,
+                    repo_type=self._repo_type(repository),
+                    revision=revision,
+                    allow_patterns=list(relative_paths),
+                    token=token,
+                    local_dir=destination,
+                    etag_timeout=self.timeout_seconds,
+                )
+            else:
+                for relative_path in relative_paths:
+                    remote_path = f"{remote_prefix}/{relative_path}"
+                    self._safe_download_path(destination, remote_path)
+                    downloaded = library.hf_hub_download(
+                        repo_id=repository,
+                        repo_type=self._repo_type(repository),
+                        revision=revision,
+                        filename=remote_path,
+                        token=token,
+                        local_dir=destination,
+                        local_dir_use_symlinks=False,
+                        etag_timeout=self.timeout_seconds,
+                    )
+                    self._materialize_prefixed_download(
+                        destination=destination,
+                        remote_prefix=remote_prefix,
+                        relative_path=relative_path,
+                        downloaded=downloaded,
+                    )
         except (ConnectionError, TimeoutError):
             self._preserve_partial_prefixed_download(
                 destination=destination, remote_prefix=remote_prefix, relative_paths=relative_paths,
@@ -428,12 +485,6 @@ class HuggingFaceHubTransport:
                 raise HubRateLimitError("Hub download rate limited") from None
             raise
         if remote_prefix is not None:
-            for relative_path, remote_path in zip(relative_paths, remote_paths, strict=True):
-                downloaded = destination / remote_path
-                target = destination / relative_path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if downloaded != target:
-                    shutil.copyfile(downloaded, target)
             shutil.rmtree(destination / remote_prefix.split("/", 1)[0])
         shutil.rmtree(destination / ".cache", ignore_errors=True)
         final = self._repo_info(repository=repository, revision=revision, token=token)
