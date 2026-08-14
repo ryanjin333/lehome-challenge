@@ -477,7 +477,7 @@ def _runtime_final_campaign(
     if not isinstance(parent, Mapping) or not isinstance(mixture, Mapping):
         raise ValueError("runtime warm-up binding lacks immutable parent and mixture identities")
     if (
-        config.base_model_path != "/cache/parent"
+        config.base_model_path != str(_runtime_mount_root("cache") / "parent")
         or config.base_model_revision != MODEL_REVISION
         or config.physical_batch_size != 64 or config.global_batch_size != 64
         or config.gradient_accumulation_steps != 1 or config.augmentation_profile != "none"
@@ -499,7 +499,7 @@ def _runtime_final_campaign(
         or experiment.tune_language_backbone or experiment.tune_visual_backbone
         or experiment.dataset_repository != mixture.get("repository")
         or experiment.dataset_revision != mixture.get("revision")
-        or experiment.dataset_manifest_sha256 != mixture.get("manifest_sha256")
+        or experiment.dataset_manifest_sha256 != mixture.get("mixture_id")
     ):
         raise ValueError("runtime production experiment is not the measured direct-GPU campaign")
 

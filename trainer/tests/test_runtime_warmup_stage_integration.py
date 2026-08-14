@@ -307,7 +307,8 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         runtime_mounts["prepared"], runtime_mounts["cache"], runtime_mounts["output"]
     )
     monkeypatch.setattr(production, "_ALLOWED_ROOTS", (prepared, output, cache))
-    manifest, windows, mounts = _contract(prepared / "runtime")
+    authoring = tmp_path / "authoring"
+    manifest, windows, mounts = _contract(authoring)
     normalization = manifest.parent / "mixture-normalization.json"
     (prepared / "config" / "modality.py").parent.mkdir(parents=True, exist_ok=True)
     (prepared / "config" / "modality.py").write_text("# fixture\n", encoding="utf-8")
@@ -349,13 +350,18 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     }
     monkeypatch.setattr(LIFECYCLE, "PARENT_CHECKPOINT", parent_identity)
     receipts = _campaign_receipts(tmp_path)
+    # Bootstrap receives the same authenticated deployment receipt that the
+    # real hydrator will consume; it must not pre-create its destination.
+    shutil.copyfile(authoring / "release-receipt.json", receipts["deployment"])
+    shutil.copyfile(authoring / "source-publication" / "bc-readback.json", receipts["bc"])
+    shutil.copyfile(authoring / "source-publication" / "rollout-readback.json", receipts["rollout"])
     binding = {
         "mixture": {
             "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40,
             "mixture_id": "d" * 64, "manifest_sha256": sha256_file(manifest),
             "window_index_sha256": sha256_file(windows),
             "normalization_sha256": sha256_file(normalization),
-            "source_revisions": {"bc": "b" * 40, "round-1": "c" * 40},
+                "source_revisions": {"organizer": "b" * 40, "rollout": "c" * 40},
         },
         "deployment": {
             "oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
@@ -385,8 +391,9 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "parent_checkpoint_revision": LIFECYCLE.PARENT_CHECKPOINT["revision"],
         "parent_checkpoint_subpath": "policies/step-12000",
         "parent_checkpoint_artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"],
-        "runtime_mixture_manifest": str(manifest), "runtime_window_index": str(windows),
-        "runtime_mounts_descriptor": str(mounts),
+        "runtime_mixture_manifest": str(prepared / "runtime" / "mixture.json"),
+        "runtime_window_index": str(prepared / "runtime" / "windows.json"),
+        "runtime_mounts_descriptor": str(prepared / "runtime" / "mounts.json"),
     }
     binding_path = _write(tmp_path / "stage" / "binding.json", binding)
     warmup_request = _write(tmp_path / "stage" / "runtime-warmup.json", {
@@ -396,7 +403,15 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     launch_path = _write(tmp_path / "stage" / "warmup-launch.json", launch)
     hydrate = _write(tmp_path / "stage" / "hydrate.json", {
         "schema_version": 1, "command": "hydrate-runtime-mixture",
-        "arguments": {"deployment_receipt": "/prepared/config/deployment-receipt.json", "source_readback_receipts": "/prepared/config", "destination": "/prepared/runtime", "mounts_descriptor": "/prepared/runtime/mounts.json"},
+        "arguments": {
+            "deployment_receipt": "/prepared/config/deployment-receipt.json",
+            "source_readback_receipts": {
+                "bc": "/prepared/config/bc-readback.json",
+                "round-1": "/prepared/config/rollout-readback.json",
+            },
+            "destination": "/prepared/runtime",
+            "mounts_descriptor": "/prepared/runtime/mounts.json",
+        },
     })
     token = tmp_path / "stage" / "runtime.token"
     token.write_text("fixture-token", encoding="utf-8")
@@ -415,6 +430,56 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
             "deployment_receipt": str(receipts["deployment"]), "bootstrap_receipt": str(bootstrap),
         }, runner=runner,
     )
+    assert all("mkdir -p /prepared/config /prepared/runtime" not in command[-1] for command in calls if command[0] == "ssh")
+    assert not (prepared / "runtime").exists()
+
+    # Exercise the real hydrator against its normal immutable deployment tree,
+    # with a local in-memory Hub only at the transport boundary.
+    from test_runtime_mixture_publish import MemoryTransport, TOKEN
+    from lehome_train.groot.runtime_mixture_publish import hydrate_runtime_mixture_from_request
+
+    monkeypatch.setenv("HF_TOKEN", TOKEN)
+    transport = MemoryTransport()
+    deployment = json.loads((authoring / "release-receipt.json").read_text(encoding="utf-8"))
+    for artifact in deployment["artifact_entries"]:
+        relative = artifact["relative_path"]
+        transport.remote[f"mixtures/{'d' * 64}/{relative}"] = (authoring / relative).read_bytes()
+    original_manifest = json.loads((authoring / "mixture.json").read_text(encoding="utf-8"))
+    for source in original_manifest["sources"]:
+        root = authoring / ("bc" if source["source_id"] == "bc" else "round-1")
+        prefix = source["publication"]["prefix"]
+        for source_file in root.rglob("*"):
+            if source_file.is_file():
+                transport.remote[f"{prefix}/{source_file.relative_to(root).as_posix()}"] = source_file.read_bytes()
+    hydrated_request = json.loads(
+        (prepared / "config" / "runtime-hydrate.json").read_text(encoding="utf-8")
+    )
+    hydrated_request["arguments"] = {
+        "deployment_receipt": str(prepared / "config" / "deployment-receipt.json"),
+        "source_readback_receipts": {
+            "bc": str(prepared / "config" / "bc-readback.json"),
+            "round-1": str(prepared / "config" / "rollout-readback.json"),
+        },
+        "destination": str(prepared / "runtime"),
+        "mounts_descriptor": str(prepared / "runtime" / "mounts.json"),
+    }
+    hydrated_path = _write(prepared / "config" / "runtime-hydrate.json", hydrated_request)
+    hydrate_runtime_mixture_from_request(hydrated_path, transport=transport)
+    assert {
+        "mixture.json", "windows.json", "mixture-normalization.json", "mounts.json",
+    } <= {path.name for path in (prepared / "runtime").iterdir()}
+    assert not (prepared / "runtime" / "window-index.json").exists()
+    assert not (prepared / "runtime" / "normalization.json").exists()
+    manifest = prepared / "runtime" / "mixture.json"
+    windows = prepared / "runtime" / "windows.json"
+    mounts = prepared / "runtime" / "mounts.json"
+    normalization = manifest.parent / "mixture-normalization.json"
+    assert binding["mixture"] == {
+        "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40,
+        "mixture_id": "d" * 64, "manifest_sha256": sha256_file(manifest),
+        "window_index_sha256": sha256_file(windows), "normalization_sha256": sha256_file(normalization),
+        "source_revisions": {"organizer": "b" * 40, "rollout": "c" * 40},
+    }
     report = LIFECYCLE.runtime_mixture_warmup_stage(
         instance=instance,
         request={
@@ -435,8 +500,14 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     assert report["action"] == "runtime-warmup-stage"
 
     loaded_pipelines, created_loaders = _install_low_level_runtime_fakes(monkeypatch, tmp_path)
+    hydrated_binding = binding | {"mixture": binding["mixture"] | {
+        # The legacy fixture is only the mounted-byte stand-in.  Controller
+        # admission above remains pinned to the finalized builder's
+        # organizer/rollout source IDs.
+        "source_revisions": {"bc": "b" * 40, "round-1": "c" * 40},
+    }}
     session = production.ProductionRuntime()._create_runtime_gpu_warmup_session(
-        {"binding": binding}
+        {"binding": hydrated_binding}
     )
     loader = session.loader_factory(4)
 
@@ -454,7 +525,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "mixture_id": "d" * 64, "manifest_sha256": sha256_file(manifest),
         "window_index_sha256": sha256_file(windows),
         "normalization_sha256": sha256_file(normalization),
-        "source_revisions": {"bc": "b" * 40, "round-1": "c" * 40},
+        "source_revisions": {"organizer": "b" * 40, "rollout": "c" * 40},
     }
     assert len(loaded_pipelines) == 1
     assert created_loaders == [loader]
