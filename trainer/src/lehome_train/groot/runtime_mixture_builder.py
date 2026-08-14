@@ -21,7 +21,7 @@ import pyarrow.parquet as pq
 
 from lehome_train.groot.runtime_mixture import (
     ACTION_HORIZON, APPROVED_MIXTURE_REPOSITORY, CAMERAS, FPS, INSTRUCTION,
-    source_tree_sha256,
+    pending_mixture_id, source_tree_sha256,
 )
 from lehome_train.io import canonical_json_bytes, canonical_json_sha256, sha256_file
 
@@ -61,7 +61,7 @@ def _external_receipt(value: object, label: str) -> Path:
     return Path(value)
 
 
-def _source_publications(path: Path, roots: Mapping[str, Path]) -> dict[str, dict[str, object]]:
+def _source_publications(path: Path) -> dict[str, dict[str, object]]:
     """Authenticate separately published BC and rollout source trees.
 
     This intentionally accepts no all-purpose corrective prefix: every source
@@ -93,6 +93,38 @@ def _source_publications(path: Path, roots: Mapping[str, Path]) -> dict[str, dic
         result[source_id] = dict(item)
     if set(result) != set(expected):
         raise ValueError("runtime mixture source publications are incomplete")
+    return result
+
+
+def validate_selected_bindings(document: Mapping[str, object], campaign_receipt: Mapping[str, object]) -> dict[str, str]:
+    """Authenticate the exact selected-150 ledger before it reaches windows."""
+
+    if set(document) != {"schema_version", "selection_sha256", "selected_bindings"} or document.get("schema_version") != 1 or not isinstance(document.get("selected_bindings"), list):
+        raise ValueError("selected-150 document has an incompatible schema")
+    rows = document["selected_bindings"]
+    if document.get("selection_sha256") != canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}) or len(rows) != 150:
+        raise ValueError("selected-150 canonical binding is invalid")
+    ledger = campaign_receipt.get("attempt_receipts")
+    if not isinstance(ledger, list):
+        raise ValueError("campaign accepted ledger is unavailable")
+    accepted = {
+        item.get("attempt_id"): item
+        for item in ledger
+        if isinstance(item, dict) and item.get("accepted_success") is True and item.get("release_stage") == "seen"
+    }
+    result: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"attempt_id", "episode_id", "episode_manifest_sha256"}:
+            raise ValueError("selected-150 binding row is malformed")
+        attempt_id, episode_id, manifest_sha = row.get("attempt_id"), row.get("episode_id"), row.get("episode_manifest_sha256")
+        if type(attempt_id) is not str or type(episode_id) is not str or attempt_id != episode_id or attempt_id in result or type(manifest_sha) is not str or re.fullmatch(r"[0-9a-f]{64}", manifest_sha) is None:
+            raise ValueError("selected-150 identity or manifest binding is invalid")
+        accepted_row = accepted.get(attempt_id)
+        if not isinstance(accepted_row, dict) or accepted_row.get("episode_id") != episode_id or accepted_row.get("episode_manifest_sha256") != manifest_sha:
+            raise ValueError("selected-150 manifest does not match campaign accepted ledger")
+        result[attempt_id] = manifest_sha
+    if len(result) != 150:
+        raise ValueError("selected-150 bindings are not unique")
     return result
 
 
@@ -275,19 +307,11 @@ def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Pa
     organizer_manifest = organizer / "manifest.json"; organizer_hash = sha256_file(organizer_manifest)
     campaign_receipt = campaign / "campaign-receipt.json"; receipt = _load(campaign_receipt, "campaign receipt")
     selected_document = _load(Path(selected_bindings), "selected rollout bindings")
-    selected_rows = selected_document.get("selected_bindings")
-    if not isinstance(selected_rows, list):
-        raise ValueError("selected rollout bindings are malformed")
-    selected = {item.get("attempt_id"): item.get("episode_manifest_sha256") for item in selected_rows if isinstance(item, dict) and type(item.get("attempt_id")) is str and type(item.get("episode_manifest_sha256")) is str}
-    accepted = _accepted_from_campaign(receipt)
-    if not set(selected).issubset(accepted) or len(selected) != len(selected_rows):
-        raise ValueError("selected rollout bindings are not an accepted seen allowlist")
+    selected = validate_selected_bindings(selected_document, receipt)
     windows = validate_plan_windows(plan, organizer_manifest=organizer_manifest, accepted_rollouts={key: key for key in selected})
     if destination.exists():
         raise FileExistsError("runtime mixture destination is immutable; choose an explicit new destination")
-    publications = _source_publications(
-        Path(source_publications), {"organizer": organizer, "rollout": campaign}
-    )
+    publications = _source_publications(Path(source_publications))
     staging = destination.parent / f".{destination.name}.{plan['sha256'][:12]}.tmp"
     if staging.exists():
         raise FileExistsError("runtime mixture staging already exists")
@@ -308,9 +332,10 @@ def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Pa
         # This is a deterministic publication target, not proof of publication.
         # It deliberately is not a loadable runtime manifest: a publisher must
         # upload these bytes and produce an immutable mixture readback receipt.
-        mixture_id = canonical_json_sha256({"plan_sha256": plan["sha256"], "sources": source_entries, "windows": converted, "normalization": normalization})
         _write(staging / "windows.json", {"schema_version": 3, "windows": converted})
-        pending = {"schema_version": 1, "kind": "runtime_mixture_publication_pending", "repository": APPROVED_MIXTURE_REPOSITORY, "mixture_id": mixture_id, "prefix": f"mixtures/{mixture_id}", "sources": source_entries, "normalization_sha256": sha256_file(staging / "mixture-normalization.json"), "windows_sha256": sha256_file(staging / "windows.json"), "publication_pending": True}
+        pending = {"schema_version": 1, "kind": "runtime_mixture_publication_pending", "repository": APPROVED_MIXTURE_REPOSITORY, "sources": source_entries, "normalization_sha256": sha256_file(staging / "mixture-normalization.json"), "windows_sha256": sha256_file(staging / "windows.json"), "publication_pending": True}
+        mixture_id = pending_mixture_id(pending)
+        pending = {**pending, "mixture_id": mixture_id, "prefix": f"mixtures/{mixture_id}"}
         _write(staging / "publication-pending.json", pending)
         receipt_value = {"schema_version": 3, "kind": "runtime_mixture_generation", "publication_pending": True, "plan_sha256": plan["sha256"], "mixture_id": mixture_id, "prefix": pending["prefix"], "unique_windows": len(converted), "train_windows": sum(item["split"] == "train" for item in converted), "bc_train_windows": sum(item["source_type"] == "bc" and item["split"] == "train" for item in converted), "bc_validation_windows": sum(item["source_type"] == "bc" and item["split"] == "validation" for item in converted), "rollout_train_windows": sum(item["source_type"] == "rollout" and item["split"] == "train" for item in converted), "source_readback": {"source_publications_sha256": sha256_file(source_publications), "selected_bindings_sha256": sha256_file(selected_bindings)}}
         _write(staging / "generation-receipt.json", receipt_value)

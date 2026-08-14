@@ -120,7 +120,54 @@ def test_source_publisher_never_leaks_token_shaped_transport_errors(tmp_path: Pa
     assert "hf_token_looks_real_but_is_fake" not in str(error.value)
 
 
+@pytest.mark.parametrize("relative", ["credentials.json", "nested/token.txt"])
+def test_publisher_uses_central_redaction_before_any_transport_call(tmp_path: Path, relative: str) -> None:
+    from lehome_train.groot.runtime_mixture_publish import publish_source
+
+    source = tmp_path / "source"
+    _source(source)
+    target = source / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("hf_" + "a" * 40 if relative.endswith(".txt") else "{}", encoding="utf-8")
+    transport = MemoryTransport()
+    with pytest.raises(ValueError, match="credential|token|access"):
+        publish_source(root=source, source_type="bc", round_id=None, revision="draft", receipt_path=tmp_path / "receipt.json", transport=transport)
+    assert transport.calls == []
+
+
+def test_source_receipt_destination_is_preflighted_external_and_absent_before_access(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_publish import publish_source
+
+    source = tmp_path / "source"
+    _source(source)
+    transport = MemoryTransport()
+    with pytest.raises((FileExistsError, ValueError), match="receipt|external|immutable"):
+        publish_source(root=source, source_type="bc", round_id=None, revision="draft", receipt_path=source / "receipt.json", transport=transport)
+    assert transport.calls == []
+
+
+def test_existing_or_overlapping_pending_receipt_destination_is_rejected_before_access(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_publish import publish_pending_mixture
+
+    pending, _source_mounts = _pending_from_runtime_contract(tmp_path)
+    transport = MemoryTransport()
+    target = pending / "receipt.json"
+    with pytest.raises((FileExistsError, ValueError), match="receipt|external|immutable"):
+        publish_pending_mixture(pending_root=pending, revision="draft", receipt_path=target, transport=transport)
+    assert transport.calls == []
+
+
+def test_tree_match_rejects_link_or_special_entries_under_the_exact_prefix() -> None:
+    from lehome_train.groot.runtime_mixture_publish import _tree_matches
+    from lehome_train.models import SyncEntry
+
+    entries = (SyncEntry("payload.json", "a" * 64, 1),)
+    assert not _tree_matches((HubTreeEntry("bc/full/payload.json", "file"), HubTreeEntry("bc/full/link", "symlink")), prefix="bc/full", entries=entries)
+    assert not _tree_matches((HubTreeEntry("bc/full/payload.json", "file"), HubTreeEntry("bc/full/device", "special")), prefix="bc/full", entries=entries)
+
+
 def _pending_from_runtime_contract(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    from lehome_train.groot.runtime_mixture import pending_mixture_id
     from test_runtime_mixture import _contract
 
     manifest_path, index_path, mounts_path = _contract(tmp_path / "contract")
@@ -132,13 +179,16 @@ def _pending_from_runtime_contract(tmp_path: Path) -> tuple[Path, dict[str, str]
     normalization = manifest_path.parent / "mixture-normalization.json"
     shutil.copy2(normalization, pending / normalization.name)
     _write(pending / "windows.json", {"schema_version": 3, "windows": index["windows"]})
-    _write(pending / "publication-pending.json", {
+    pending_value = {
         "schema_version": 1, "kind": "runtime_mixture_publication_pending",
-        "repository": REPOSITORY, "mixture_id": manifest["mixture_id"],
-        "prefix": manifest["safe_prefix"], "sources": manifest["sources"],
+        "repository": REPOSITORY, "sources": manifest["sources"],
         "normalization_sha256": sha256_file(pending / normalization.name),
         "windows_sha256": sha256_file(pending / "windows.json"),
         "publication_pending": True,
+    }
+    mixture_id = pending_mixture_id(pending_value)
+    _write(pending / "publication-pending.json", {
+        **pending_value, "mixture_id": mixture_id, "prefix": f"mixtures/{mixture_id}",
     })
     return pending, {entry["source_id"]: entry["root"] for entry in mounts["mounts"]}
 
@@ -165,6 +215,36 @@ def test_pending_publisher_and_finalizer_emit_loadable_contract_with_no_hash_cyc
         if path.is_file() and path.name != "mounts.json"
     }
     assert transport.remote == expected
+
+
+def test_pending_publisher_recomputes_its_content_address_before_access(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_publish import publish_pending_mixture
+
+    pending, _source_mounts = _pending_from_runtime_contract(tmp_path)
+    payload = json.loads((pending / "publication-pending.json").read_text(encoding="utf-8"))
+    payload["mixture_id"] = "f" * 64
+    payload["prefix"] = "mixtures/" + "f" * 64
+    _write(pending / "publication-pending.json", payload)
+    transport = MemoryTransport()
+    with pytest.raises(ValueError, match="content|mixture|prefix"):
+        publish_pending_mixture(pending_root=pending, revision="draft", receipt_path=tmp_path / "receipt.json", transport=transport)
+    assert transport.calls == []
+
+
+def test_finalizer_recomputes_pending_content_address_before_access(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_publish import finalize_pending_mixture, publish_pending_mixture
+
+    pending, source_mounts = _pending_from_runtime_contract(tmp_path)
+    receipt = tmp_path / "pending-receipt.json"
+    publish_pending_mixture(pending_root=pending, revision="draft", receipt_path=receipt, transport=MemoryTransport())
+    payload = json.loads((pending / "publication-pending.json").read_text(encoding="utf-8"))
+    payload["mixture_id"] = "f" * 64
+    payload["prefix"] = "mixtures/" + "f" * 64
+    _write(pending / "publication-pending.json", payload)
+    transport = MemoryTransport()
+    with pytest.raises(ValueError, match="content|mixture|prefix"):
+        finalize_pending_mixture(pending_root=pending, publication_receipt=receipt, destination=tmp_path / "final", deployment_receipt_path=tmp_path / "deployment.json", source_mounts=source_mounts, revision="final-draft", transport=transport)
+    assert transport.calls == []
 
 
 @pytest.mark.parametrize("mutation", ["pending", "receipt"])

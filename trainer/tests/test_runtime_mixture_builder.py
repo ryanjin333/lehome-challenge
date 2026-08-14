@@ -70,3 +70,60 @@ def test_builder_collapses_exact_duplicate_source_ranges_before_runtime_schedule
     windows = validate_plan_windows(plan, organizer_manifest=tmp_path / "organizer.json", accepted_rollouts={"attempt": "attempt"})
 
     assert len(windows) == 2
+
+
+def test_selected_150_requires_canonical_hash_exact_rows_and_accepted_manifest_bindings(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_builder import validate_selected_bindings
+    from lehome_train.io import canonical_json_sha256
+
+    rows = [
+        {"attempt_id": f"attempt-{index:03d}", "episode_id": f"attempt-{index:03d}", "episode_manifest_sha256": f"{index:064x}"}
+        for index in range(150)
+    ]
+    document = {"schema_version": 1, "selection_sha256": canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}), "selected_bindings": rows}
+    campaign = {"attempt_receipts": [{"attempt_id": row["attempt_id"], "episode_id": row["episode_id"], "accepted_success": True, "release_stage": "seen", "episode_manifest_sha256": row["episode_manifest_sha256"]} for row in rows]}
+
+    assert validate_selected_bindings(document, campaign) == {row["attempt_id"]: row["episode_manifest_sha256"] for row in rows}
+    document["selected_bindings"][0]["episode_id"] = "wrong"
+    with pytest.raises(ValueError, match="selected|identity|binding"):
+        validate_selected_bindings(document, campaign)
+
+
+@pytest.mark.parametrize("mutation", ["selection_sha256", "count", "manifest"])
+def test_selected_150_rejects_hash_count_or_campaign_manifest_drift(mutation: str) -> None:
+    from lehome_train.groot.runtime_mixture_builder import validate_selected_bindings
+    from lehome_train.io import canonical_json_sha256
+
+    rows = [
+        {"attempt_id": f"attempt-{index:03d}", "episode_id": f"attempt-{index:03d}", "episode_manifest_sha256": f"{index:064x}"}
+        for index in range(150)
+    ]
+    document = {"schema_version": 1, "selection_sha256": canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}), "selected_bindings": rows}
+    campaign = {"attempt_receipts": [{"attempt_id": row["attempt_id"], "episode_id": row["episode_id"], "accepted_success": True, "release_stage": "seen", "episode_manifest_sha256": row["episode_manifest_sha256"]} for row in rows]}
+    if mutation == "selection_sha256":
+        document["selection_sha256"] = "0" * 64
+    elif mutation == "count":
+        document["selected_bindings"] = rows[:-1]
+    else:
+        campaign["attempt_receipts"][0]["episode_manifest_sha256"] = "f" * 64
+
+    with pytest.raises(ValueError, match="selected-150|manifest|binding"):
+        validate_selected_bindings(document, campaign)
+
+
+def test_selected_150_rejects_legacy_opaque_hash_but_derives_a_new_canonical_artifact_without_mutation() -> None:
+    from lehome_train.groot.runtime_mixture_builder import validate_selected_bindings
+    from lehome_train.io import canonical_json_sha256
+
+    rows = [
+        {"attempt_id": f"attempt-{index:03d}", "episode_id": f"attempt-{index:03d}", "episode_manifest_sha256": f"{index:064x}"}
+        for index in range(150)
+    ]
+    original_rows = json.loads(json.dumps(rows))
+    campaign = {"attempt_receipts": [{"attempt_id": row["attempt_id"], "episode_id": row["episode_id"], "accepted_success": True, "release_stage": "seen", "episode_manifest_sha256": row["episode_manifest_sha256"]} for row in rows]}
+    legacy = {"schema_version": 1, "selection_sha256": "a" * 64, "selected_bindings": rows}
+    with pytest.raises(ValueError, match="canonical"):
+        validate_selected_bindings(legacy, campaign)
+    derived = {"schema_version": 1, "selection_sha256": canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}), "selected_bindings": rows}
+    assert validate_selected_bindings(derived, campaign)["attempt-000"] == "0" * 64
+    assert rows == original_rows

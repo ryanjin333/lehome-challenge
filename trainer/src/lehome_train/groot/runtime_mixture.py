@@ -126,6 +126,18 @@ def source_tree_sha256(root: str | os.PathLike[str]) -> str:
     return canonical_json_sha256(_source_tree_entries(Path(root)))
 
 
+def pending_mixture_id(value: Mapping[str, object]) -> str:
+    """Derive the mixture content address without self-referential fields."""
+
+    fields = {
+        "schema_version", "kind", "repository", "sources",
+        "normalization_sha256", "windows_sha256", "publication_pending",
+    }
+    if set(value) - {"mixture_id", "prefix", *fields} or set(value) & fields != fields:
+        raise ValueError("runtime mixture pending content has an incompatible schema")
+    return canonical_json_sha256({field: value[field] for field in sorted(fields)})
+
+
 @dataclass(frozen=True, slots=True)
 class Source:
     source_id: str

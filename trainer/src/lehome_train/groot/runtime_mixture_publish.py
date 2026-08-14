@@ -20,24 +20,56 @@ from lehome_train.groot.runtime_mixture import (
     FPS,
     INSTRUCTION,
     load_runtime_contract,
+    pending_mixture_id,
 )
 from lehome_train.hub import HubTransport, require_access, upload_files, download_files, list_repository_tree
 from lehome_train.io import atomic_write_json, canonical_json_sha256, sha256_file
 from lehome_train.models import SyncEntry
+from lehome_train.redaction import generate_upload_allowlist
 
 
 def _entries(root: Path) -> tuple[SyncEntry, ...]:
     if root.is_symlink() or not root.is_dir():
         raise ValueError("publication root is unavailable")
-    result: list[SyncEntry] = []
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            raise ValueError("publication tree contains a symlink")
-        if path.is_file():
-            result.append(SyncEntry(path.relative_to(root).as_posix(), sha256_file(path), path.stat().st_size))
-    if not result:
+    paths: list[str] = []
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        with os.scandir(current) as children:
+            for child in children:
+                relative = Path(child.path).relative_to(root).as_posix()
+                if child.is_symlink():
+                    raise ValueError("publication tree contains a symlink")
+                if child.is_dir(follow_symlinks=False):
+                    pending.append(Path(child.path))
+                elif child.is_file(follow_symlinks=False):
+                    paths.append(relative)
+                else:
+                    raise ValueError("publication tree contains an unsupported path type")
+    if not paths:
         raise ValueError("publication tree is empty")
-    return tuple(result)
+    return generate_upload_allowlist(root, tuple(sorted(paths)))
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except ValueError:
+        return False
+    return True
+
+
+def _preflight_receipt_destination(
+    *, root: Path, receipt_path: str | Path, label: str, disallow: tuple[Path, ...] = ()
+) -> Path:
+    target = Path(receipt_path)
+    if not target.is_absolute() or target.exists() or target.is_symlink():
+        raise FileExistsError(f"{label} receipt destination must be an absent absolute path")
+    if target.parent.is_symlink() or not target.parent.is_dir():
+        raise ValueError(f"{label} receipt destination parent is unavailable")
+    if _within(target, root) or any(target.resolve(strict=False) == item.resolve(strict=False) for item in disallow):
+        raise ValueError(f"{label} receipt destination must be external and non-overlapping")
+    return target
 
 
 def _load_exact(path: Path, *, keys: set[str], label: str) -> dict[str, object]:
@@ -54,12 +86,43 @@ def _load_exact(path: Path, *, keys: set[str], label: str) -> dict[str, object]:
 
 def _tree_matches(tree: tuple[object, ...], *, prefix: str, entries: tuple[SyncEntry, ...]) -> bool:
     expected = {f"{prefix}/{entry.relative_path}" for entry in entries}
-    observed = {
-        entry.relative_path
-        for entry in tree
-        if getattr(entry, "entry_type", None) == "file" and getattr(entry, "relative_path", "").startswith(prefix + "/")
+    directories = {
+        f"{prefix}/" + "/".join(parts[:index])
+        for entry in entries
+        for parts in (entry.relative_path.split("/"),)
+        for index in range(1, len(parts))
     }
+    observed: set[str] = set()
+    for entry in tree:
+        path, entry_type = getattr(entry, "relative_path", None), getattr(entry, "entry_type", None)
+        if not isinstance(path, str) or not path.startswith(prefix + "/"):
+            continue
+        if entry_type == "file" and path in expected:
+            observed.add(path)
+        elif entry_type == "directory" and path in directories:
+            continue
+        else:
+            return False
     return observed == expected
+
+
+_PENDING_KEYS = {"schema_version", "kind", "repository", "mixture_id", "prefix", "sources", "normalization_sha256", "windows_sha256", "publication_pending"}
+
+
+def _pending(root: Path) -> dict[str, object]:
+    pending = _load_exact(root / "publication-pending.json", keys=_PENDING_KEYS, label="mixture publication pending artifact")
+    mixture_id = pending.get("mixture_id")
+    if (
+        pending.get("schema_version") != 1
+        or pending.get("kind") != "runtime_mixture_publication_pending"
+        or pending.get("repository") != APPROVED_MIXTURE_REPOSITORY
+        or pending.get("publication_pending") is not True
+        or not isinstance(mixture_id, str)
+        or pending_mixture_id(pending) != mixture_id
+        or pending.get("prefix") != f"mixtures/{mixture_id}"
+    ):
+        raise ValueError("mixture publication pending artifact content address is invalid")
+    return pending
 
 
 def publish_source(*, root: str | Path, source_type: str, round_id: str | None, revision: str, receipt_path: str | Path, transport: HubTransport) -> dict[str, object]:
@@ -73,6 +136,7 @@ def publish_source(*, root: str | Path, source_type: str, round_id: str | None, 
     if not isinstance(revision, str) or not revision:
         raise ValueError("source publication revision target is required")
     local = Path(root)
+    target = _preflight_receipt_destination(root=local, receipt_path=receipt_path, label="source publication")
     entries = _entries(local)
     require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=True)
     revision = upload_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, source=local, entries=entries, remote_prefix=prefix, max_attempts=1)
@@ -85,9 +149,6 @@ def publish_source(*, root: str | Path, source_type: str, round_id: str | None, 
         if _entries(readback) != entries:
             raise ValueError("source publication readback hash or size mismatch")
     receipt = {"repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": revision, "remote_prefix": prefix, "fresh_readback_verified": True, "tree_listing_verified": True}
-    target = Path(receipt_path)
-    if target.exists() or target.is_symlink():
-        raise FileExistsError("source publication receipt destination is immutable")
     atomic_write_json(target, receipt)
     return receipt
 
@@ -95,9 +156,8 @@ def publish_source(*, root: str | Path, source_type: str, round_id: str | None, 
 def publish_pending_mixture(*, pending_root: str | Path, revision: str, receipt_path: str | Path, transport: HubTransport) -> dict[str, object]:
     """Upload only a builder's pending bytes under its deterministic prefix."""
     root = Path(pending_root)
-    pending = _load_exact(root / "publication-pending.json", keys={"schema_version", "kind", "repository", "mixture_id", "prefix", "sources", "normalization_sha256", "windows_sha256", "publication_pending"}, label="mixture publication pending artifact")
-    if pending.get("schema_version") != 1 or pending.get("kind") != "runtime_mixture_publication_pending" or pending.get("repository") != APPROVED_MIXTURE_REPOSITORY or pending.get("publication_pending") is not True or not isinstance(pending.get("mixture_id"), str):
-        raise ValueError("mixture publication pending artifact is invalid")
+    target = _preflight_receipt_destination(root=root, receipt_path=receipt_path, label="mixture publication")
+    pending = _pending(root)
     prefix = f"mixtures/{pending['mixture_id']}"
     if pending.get("prefix") != prefix:
         raise ValueError("mixture publication prefix drift")
@@ -113,9 +173,6 @@ def publish_pending_mixture(*, pending_root: str | Path, revision: str, receipt_
         if _entries(readback) != entries:
             raise ValueError("mixture publication readback hash or size mismatch")
     receipt = {"repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": immutable, "remote_prefix": prefix, "mixture_id": pending["mixture_id"], "fresh_readback_verified": True, "tree_listing_verified": True}
-    target = Path(receipt_path)
-    if target.exists() or target.is_symlink():
-        raise FileExistsError("mixture publication receipt destination is immutable")
     atomic_write_json(target, receipt)
     return receipt
 
@@ -146,7 +203,7 @@ def finalize_pending_mixture(
     deployment receipt binds it to exact final bytes after readback.
     """
     root, output = Path(pending_root), Path(destination)
-    pending = _load_exact(root / "publication-pending.json", keys={"schema_version", "kind", "repository", "mixture_id", "prefix", "sources", "normalization_sha256", "windows_sha256", "publication_pending"}, label="mixture publication pending artifact")
+    pending = _pending(root)
     release = Path(publication_receipt)
     receipt = _load_exact(release, keys={"repository", "immutable_revision", "remote_prefix", "mixture_id", "fresh_readback_verified", "tree_listing_verified"}, label="mixture publication receipt")
     if (
@@ -181,8 +238,8 @@ def finalize_pending_mixture(
         or not revision
     ):
         raise ValueError("mixture finalization source mounts are incomplete")
-    deployment = Path(deployment_receipt_path)
-    if output.exists() or deployment.exists() or deployment.is_symlink():
+    deployment = _preflight_receipt_destination(root=root, receipt_path=deployment_receipt_path, label="runtime deployment", disallow=(release,))
+    if output.exists() or _within(deployment, output):
         raise FileExistsError("runtime finalization destinations are immutable")
     staging = output.parent / f".{output.name}.{pending['mixture_id'][:12]}.tmp"
     if staging.exists():

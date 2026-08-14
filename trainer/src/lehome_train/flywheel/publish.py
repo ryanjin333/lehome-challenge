@@ -744,7 +744,13 @@ def _stage_release(
         _copy_receipt.write_bytes(canonical_json_bytes(corrective.selection.campaign_receipt))
         selected_index = {
             "schema_version": 1,
-            "selection_sha256": corrective.selection.selection_sha256,
+            "selection_sha256": canonical_json_sha256({
+                "schema_version": 1,
+                "selected_bindings": [
+                    {"attempt_id": item.attempt_id, "episode_id": item.episode_id, "episode_manifest_sha256": item.episode_manifest_sha256}
+                    for item in corrective.selection.bindings
+                ],
+            }),
             "selected_bindings": [
                 {"attempt_id": item.attempt_id, "episode_id": item.episode_id, "episode_manifest_sha256": item.episode_manifest_sha256}
                 for item in corrective.selection.bindings
