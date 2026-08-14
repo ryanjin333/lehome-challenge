@@ -42,10 +42,6 @@ _SPLIT_FRACTION = 0.1
 _CAMERAS = ("top_rgb", "left_rgb", "right_rgb")
 _DEFAULT_VIDEO_WORKERS = 4
 _MAX_VIDEO_WORKERS = 32
-# Raising this scheduler-only ceiling must remain compatible with persistent
-# work staged by the previous 8-worker implementation.  Replace this digest
-# when changing materialization behavior, not when changing only scheduling.
-_MATERIALIZER_MIX_COMPATIBILITY_SHA256 = "fd40a217d562281654918500e74ad9ef86f45ff28c8d7b9224e01ab6aeda278f"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1032,7 +1028,7 @@ def _mix_materializer_identity() -> str:
     from lehome_train import io
     from lehome_train import models
     return canonical_json_sha256({
-        "mix": _MATERIALIZER_MIX_COMPATIBILITY_SHA256,
+        "mix": sha256_file(Path(__file__)),
         "materialize": sha256_file(Path(materialize.__file__)),
         "validate": sha256_file(Path(validate.__file__)),
         "statistics": sha256_file(Path(stats.__file__)),

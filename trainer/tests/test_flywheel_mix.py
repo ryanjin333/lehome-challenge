@@ -548,30 +548,16 @@ def test_mix_materializer_identity_binds_all_behavior_dependencies(monkeypatch: 
     import lehome_train.data.inspect as inspect
     import lehome_train.data.mapping as mapping
     import lehome_train.data.split as split
+    import lehome_train.flywheel.mix as mix
     import lehome_train.groot.modality as modality
     import lehome_train.models as models
     from lehome_train.flywheel.mix import _mix_materializer_identity
     original = __import__("lehome_train.flywheel.mix", fromlist=["sha256_file"]).sha256_file
     baseline = _mix_materializer_identity()
-    for module in (convert, inspect, mapping, split, modality, models):
+    for module in (mix, convert, inspect, mapping, split, modality, models):
         monkeypatch.setattr("lehome_train.flywheel.mix.sha256_file", lambda path, original=original, module=module: "f" * 64 if Path(path) == Path(module.__file__) else original(path))
         assert _mix_materializer_identity() != baseline
         monkeypatch.undo()
-
-
-def test_mix_materializer_identity_keeps_worker_ceiling_scheduling_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Raising the scheduler ceiling must keep existing persistent state valid."""
-
-    import lehome_train.flywheel.mix as mix
-
-    original = mix.sha256_file
-    baseline = mix._mix_materializer_identity()
-    monkeypatch.setattr(
-        mix,
-        "sha256_file",
-        lambda path: "f" * 64 if Path(path) == Path(mix.__file__) else original(path),
-    )
-    assert mix._mix_materializer_identity() == baseline
 
 
 def test_validation_reservation_scales_with_bounded_state_for_23k_ranges() -> None:
