@@ -1321,20 +1321,8 @@ def _validated_runtime_pilot(path_value: object) -> dict[str, object]:
 
 
 def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> None:
-    """Bind an already-successful CPU pilot to immutable sources before rent."""
-    pilot = _validated_runtime_pilot(request.get("pilot_receipt"))
-    binding = _runtime_campaign_binding(request)
-    proof = pilot["authenticated_evidence"]
-    if (
-        proof.get("image_digest") != RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2]
-        or
-        proof.get("code_revision") != request.get("code_revision")
-        or proof.get("code_bundle_sha256") != request.get("code_bundle_sha256")
-        or proof.get("bc_revision") != binding["bc"]["immutable_revision"]
-        or proof.get("rollout_revision") != binding["rollout"]["immutable_revision"]
-        or proof.get("deployment_revision") != binding["deployment"]["immutable_revision"]
-    ):
-        raise ValueError("runtime GPU warm-up pilot is not bound to immutable runtime sources")
+    """Validate direct-GPU immutable source bindings before provider create."""
+    _runtime_campaign_binding(request)
 
 
 def _runtime_gpu_pilot_preflight(*, pilot: Mapping[str, object], request: Mapping[str, object], identity: Mapping[str, object]) -> None:
@@ -1490,14 +1478,46 @@ def _runtime_warmup_binding(
     return checked
 
 
+def _validated_runtime_gpu_warmup_lifecycle(
+    *, path: Path, instance: Mapping[str, object], request: Mapping[str, object],
+) -> tuple[dict[str, object], int]:
+    """Accept only a measured direct-GPU warm-up from this exact lease."""
+    warmup = dict(_load_regular_json(path, "runtime GPU warm-up lifecycle receipt"))
+    identity = _runtime_identity(instance, request)
+    binding = _runtime_warmup_binding(
+        binding=warmup.get("runtime_warmup_binding")
+        if isinstance(warmup.get("runtime_warmup_binding"), Mapping) else {},
+        instance=instance,
+        request=request,
+        identity=identity,
+    )
+    from lehome_train.groot.runtime_mixture_warmup import validate_gpu_warmup_receipt
+
+    selected = validate_gpu_warmup_receipt(
+        warmup.get("warmup_receipt") if isinstance(warmup.get("warmup_receipt"), Mapping) else {},
+        expected_binding=binding,
+    )
+    if (
+        warmup.get("kind") != "runtime_mixture_gpu_warmup_lifecycle"
+        or warmup.get("instance_id") != instance.get("instance_id")
+        or warmup.get("provider_response_sha256") != instance.get("provider_response_sha256")
+        or warmup.get("capability_sha256") != instance.get("capability_sha256")
+        or warmup.get("code_revision") != request.get("code_revision")
+        or warmup.get("code_bundle_sha256") != request.get("code_bundle_sha256")
+        or warmup.get("parent_checkpoint_artifact_sha256") != PARENT_CHECKPOINT["artifact_sha256"]
+        or warmup.get("deployment_revision") != identity["deployment"]["immutable_revision"]
+        or warmup.get("selected_loader_workers") != selected
+    ):
+        raise ValueError("runtime GPU warm-up receipt is not bound to the same GPU instance")
+    return warmup, selected
+
+
 def run_runtime_gpu_warmup(
     *, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner,
 ) -> dict[str, object]:
-    """Invoke the measured GPU adapter only after all CPU/deployment identities match."""
+    """Invoke the measured direct-GPU adapter after immutable identity checks."""
     _runtime_gpu_warmup_instance(instance)
     identity = _runtime_identity(instance, request)
-    pilot = _validated_runtime_pilot(request.get("pilot_receipt"))
-    _runtime_gpu_pilot_preflight(pilot=pilot, request=request, identity=identity)
     binding_path = request.get("runtime_warmup_binding")
     output = request.get("warmup_lifecycle_receipt")
     if type(binding_path) is not str or type(output) is not str or not Path(output).is_absolute() or Path(output).exists() or Path(output).is_symlink():
@@ -1514,7 +1534,7 @@ def run_runtime_gpu_warmup(
     if not isinstance(remote, Mapping):
         raise ValueError("runtime GPU warm-up did not return a measured receipt")
     from lehome_train.groot.runtime_mixture_warmup import validate_gpu_warmup_receipt
-    selected = validate_gpu_warmup_receipt(remote, expected_binding=binding, expected_cpu_pilot=pilot)
+    selected = validate_gpu_warmup_receipt(remote, expected_binding=binding)
     lifecycle = {
         "schema_version": 1, "kind": "runtime_mixture_gpu_warmup_lifecycle",
         "instance_id": instance["instance_id"], "provider_response_sha256": instance["provider_response_sha256"],
@@ -1522,7 +1542,6 @@ def run_runtime_gpu_warmup(
         "capability_sha256": instance["capability_sha256"], "code_revision": request["code_revision"],
         "code_bundle_sha256": request["code_bundle_sha256"], "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
         "deployment_revision": identity["deployment"]["immutable_revision"],
-        "cpu_pilot_sha256": sha256_file(Path(str(request["pilot_receipt"]))),
         "runtime_warmup_binding": binding, "warmup_receipt": dict(remote),
         "selected_loader_workers": selected,
     }
@@ -1545,6 +1564,7 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
         raise ValueError("runtime GPU warm-up requires a capability receipt")
     return {
         **rented, "kind": "runtime_mixture_gpu_warmup_instance", "platform_arch": "x86_64",
+        "image_digest": BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
         "capability_sha256": _hash(dict(capability)),
     }
 
@@ -1933,39 +1953,12 @@ def runtime_mixture_train(*, instance: Mapping[str, object], request: Mapping[st
     """Execute only the receipt-bound runtime-mixture trainer, never legacy RFT."""
     _runtime_gpu_warmup_instance(instance)
     identity = _runtime_identity(instance, request)
-    pilot = _validated_runtime_pilot(request.get("pilot_receipt"))
-    pilot_evidence = pilot["authenticated_evidence"]
     warmup_path = request.get("warmup_lifecycle_receipt")
     if type(warmup_path) is not str:
         raise ValueError("runtime mixture train requires the measured GPU warm-up lifecycle receipt")
-    warmup = _load_regular_json(Path(warmup_path), "runtime GPU warm-up lifecycle receipt")
-    checked_warmup_binding = _runtime_warmup_binding(
-        binding=warmup.get("runtime_warmup_binding") if isinstance(warmup.get("runtime_warmup_binding"), Mapping) else {},
-        instance=instance, request=request, identity=identity,
+    warmup, measured_workers = _validated_runtime_gpu_warmup_lifecycle(
+        path=Path(warmup_path), instance=instance, request=request,
     )
-    if (
-        type(request.get("code_bundle_sha256")) is not str
-        or re.fullmatch(r"[0-9a-f]{64}", str(request.get("code_bundle_sha256"))) is None
-        or pilot_evidence.get("code_revision") != request.get("code_revision")
-        or pilot_evidence.get("code_bundle_sha256") != request.get("code_bundle_sha256")
-        or pilot_evidence.get("bc_revision") != identity["bc"]["immutable_revision"]
-        or pilot_evidence.get("rollout_revision") != identity["rollout"]["immutable_revision"]
-        or pilot_evidence.get("deployment_revision") != identity["deployment"]["immutable_revision"]
-        or warmup.get("kind") != "runtime_mixture_gpu_warmup_lifecycle"
-        or warmup.get("instance_id") != instance.get("instance_id")
-        or warmup.get("provider_response_sha256") != instance.get("provider_response_sha256")
-        or warmup.get("capability_sha256") != instance.get("capability_sha256")
-        or warmup.get("code_revision") != request.get("code_revision")
-        or warmup.get("code_bundle_sha256") != request.get("code_bundle_sha256")
-        or warmup.get("parent_checkpoint_artifact_sha256") != PARENT_CHECKPOINT["artifact_sha256"]
-        or warmup.get("deployment_revision") != identity["deployment"]["immutable_revision"]
-        or warmup.get("cpu_pilot_sha256") != sha256_file(Path(str(request["pilot_receipt"])))
-        or not isinstance(warmup.get("runtime_warmup_binding"), Mapping)
-        or warmup.get("runtime_warmup_binding") != checked_warmup_binding
-        or not isinstance(warmup.get("warmup_receipt"), Mapping)
-        or type(warmup.get("selected_loader_workers")) is not int
-    ):
-        raise ValueError("runtime mixture pilot evidence does not bind the staged code and immutable mixture")
     output = request.get("execution_receipt")
     if type(output) is not str or not Path(output).is_absolute() or Path(output).exists() or Path(output).is_symlink():
         raise ValueError("runtime mixture execution receipt must be an absent absolute path")
@@ -1983,10 +1976,9 @@ def runtime_mixture_train(*, instance: Mapping[str, object], request: Mapping[st
         "rollout_tree_receipt_sha256": identity["rollout_receipt_sha256"],
         "deployment_revision": identity["deployment"]["immutable_revision"],
         "deployment_tree_receipt_sha256": identity["deployment_receipt_sha256"],
-        "pilot_receipt_sha256": sha256_file(Path(str(request["pilot_receipt"]))),
         "warmup_lifecycle_receipt_sha256": sha256_file(Path(warmup_path)),
-        "selected_loader_workers": warmup["selected_loader_workers"],
-        "runtime_command": "runtime-mixture-train", "throughput_verified": pilot.get("throughput_verified", pilot["canonical_completion"]),
+        "selected_loader_workers": measured_workers,
+        "runtime_command": "runtime-mixture-train", "throughput_verified": measured_workers == warmup["selected_loader_workers"],
     }
     atomic_write_json(Path(output), receipt)
     return {"paid_action": True, "action": "runtime-train", "instance_id": instance["instance_id"], "execution_receipt": receipt}
@@ -2031,8 +2023,8 @@ def _runtime_bootstrap_receipt(*, path: Path, instance: Mapping[str, object], re
     expected = {
         "schema_version": 1, "kind": "runtime_mixture_bootstrap_stage",
         "code_revision": request.get("code_revision"), "code_bundle_sha256": request.get("code_bundle_sha256"),
-        "trainer_image": RUNTIME_CPU_PILOT_IMAGE,
-        "image_digest": RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2],
+        "trainer_image": instance.get("trainer_image"),
+        "image_digest": instance.get("image_digest"),
         "bc_revision": identity["bc"]["immutable_revision"],
         "rollout_revision": identity["rollout"]["immutable_revision"],
         "deployment_revision": identity["deployment"]["immutable_revision"],
@@ -2041,7 +2033,7 @@ def _runtime_bootstrap_receipt(*, path: Path, instance: Mapping[str, object], re
         "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
     }
     if any(receipt.get(key) != value for key, value in expected.items()):
-        raise ValueError("runtime final stage is not bound to the CPU pilot bootstrap receipt")
+        raise ValueError("runtime bootstrap stage is not bound to its direct runtime instance")
     if (
         type(receipt.get("instance_id")) is not int
         or re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("provider_response_sha256"))) is None
@@ -2049,22 +2041,25 @@ def _runtime_bootstrap_receipt(*, path: Path, instance: Mapping[str, object], re
         or not receipt["transfers"]
         or any(not isinstance(item, Mapping) or set(item) != {"name", "sha256"} or not isinstance(item.get("name"), str) or re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256"))) is None for item in receipt["transfers"])
     ):
-        raise ValueError("runtime final stage CPU bootstrap receipt lacks immutable transfer evidence")
+        raise ValueError("runtime bootstrap receipt lacks immutable transfer evidence")
     return receipt
 
 
 def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
-    """Stage only the pre-pilot inputs needed to hydrate and measure a runtime mix."""
-    identity = _runtime_cpu_pilot_identity(instance, request)
+    """Stage immutable inputs on the direct-GPU lease before warm-up."""
+    identity = _runtime_hydration_identity(instance, request)
     required = {
         "code_bundle": "code.bundle", "code_bundle_sha256_file": "code.bundle.sha256",
         "token_file": "runtime.token",
-        "runtime_hydrate_request": "runtime-hydrate.json", "runtime_pilot_request": "runtime-pilot.json",
+        "runtime_hydrate_request": "runtime-hydrate.json",
         "bc_readback_receipt": "bc-readback.json", "rollout_readback_receipt": "rollout-readback.json",
         "deployment_receipt": "deployment-receipt.json",
     }
+    is_cpu_diagnostic = instance.get("kind") == "runtime_mixture_cpu_pilot_instance"
+    if is_cpu_diagnostic:
+        required["runtime_pilot_request"] = "runtime-pilot.json"
     if any(type(request.get(field)) is not str or not request[field] for field in required):
-        raise ValueError("runtime bootstrap stage requires only pre-pilot reviewed inputs")
+        raise ValueError("runtime bootstrap stage requires only reviewed immutable inputs")
     output = request.get("bootstrap_receipt")
     if type(output) is not str or not Path(output).is_absolute() or Path(output).exists() or Path(output).is_symlink():
         raise ValueError("runtime bootstrap stage requires an absent absolute bootstrap_receipt")
@@ -2075,9 +2070,10 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
     hydrate = _runtime_envelope(Path(str(request["runtime_hydrate_request"])), command="hydrate-runtime-mixture", fields={"deployment_receipt", "source_readback_receipts", "destination", "mounts_descriptor"}, label="runtime hydration request")
     if hydrate["deployment_receipt"] != "/prepared/config/deployment-receipt.json" or hydrate["destination"] != "/prepared/runtime" or hydrate["mounts_descriptor"] != "/prepared/runtime/mounts.json":
         raise ValueError("runtime hydration request paths are not canonical")
-    pilot = _runtime_envelope(Path(str(request["runtime_pilot_request"])), command="pilot-runtime-mixture", fields={"mixture_manifest", "mounts_descriptor", "sample_count", "worker_counts", "timeout_seconds", "authenticated_evidence"}, label="runtime pilot request")
-    if pilot["mixture_manifest"] != "/prepared/runtime/mixture.json" or pilot["mounts_descriptor"] != "/prepared/runtime/mounts.json":
-        raise ValueError("runtime pilot request paths are not canonical")
+    if is_cpu_diagnostic:
+        pilot = _runtime_envelope(Path(str(request["runtime_pilot_request"])), command="pilot-runtime-mixture", fields={"mixture_manifest", "mounts_descriptor", "sample_count", "worker_counts", "timeout_seconds", "authenticated_evidence"}, label="runtime pilot request")
+        if pilot["mixture_manifest"] != "/prepared/runtime/mixture.json" or pilot["mounts_descriptor"] != "/prepared/runtime/mounts.json":
+            raise ValueError("runtime pilot request paths are not canonical")
     remote_dir = "/tmp/lehome-runtime-bootstrap"
     runner((*_ssh_prefix(instance), "mkdir -p " + remote_dir))
     transfers: list[dict[str, str]] = []
@@ -2091,28 +2087,26 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
         if not observed or observed[0] != digest:
             raise ValueError("runtime bootstrap staged hash readback failed")
         transfers.append({"name": remote_name, "sha256": digest})
-    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/config /prepared/runtime /output; cd " + remote_dir + "; sha256sum -c code.bundle.sha256; mv runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv runtime-pilot.json /prepared/config/runtime-pilot.json; mv runtime.token /prepared/config/runtime.token; mv bc-readback.json /prepared/config/bc-readback.json; mv rollout-readback.json /prepared/config/rollout-readback.json; mv deployment-receipt.json /prepared/config/deployment-receipt.json; git clone --quiet --no-checkout " + remote_dir + "/code.bundle /prepared/code; git -C /prepared/code checkout --quiet --detach " + str(request["code_revision"]) + "; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -z \"$(git -C /prepared/code status --porcelain)\"; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code"))
-    receipt = {"schema_version": 1, "kind": "runtime_mixture_bootstrap_stage", "instance_id": instance["instance_id"], "provider_response_sha256": instance["provider_response_sha256"], "platform_arch": "x86_64", "trainer_image": RUNTIME_CPU_PILOT_IMAGE, "image_digest": RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2], "code_revision": request["code_revision"], "code_bundle_sha256": request["code_bundle_sha256"], "bc_revision": identity["bc"]["immutable_revision"], "rollout_revision": identity["rollout"]["immutable_revision"], "deployment_revision": identity["deployment"]["immutable_revision"], "bc_receipt_sha256": identity["bc_receipt_sha256"], "rollout_receipt_sha256": identity["rollout_receipt_sha256"], "deployment_receipt_sha256": identity["deployment_receipt_sha256"], "transfers": transfers}
+    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/config /prepared/runtime /output; cd " + remote_dir + "; sha256sum -c code.bundle.sha256; mv runtime-hydrate.json /prepared/config/runtime-hydrate.json; " + ("mv runtime-pilot.json /prepared/config/runtime-pilot.json; " if is_cpu_diagnostic else "") + "mv runtime.token /prepared/config/runtime.token; mv bc-readback.json /prepared/config/bc-readback.json; mv rollout-readback.json /prepared/config/rollout-readback.json; mv deployment-receipt.json /prepared/config/deployment-receipt.json; git clone --quiet --no-checkout " + remote_dir + "/code.bundle /prepared/code; git -C /prepared/code checkout --quiet --detach " + str(request["code_revision"]) + "; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -z \"$(git -C /prepared/code status --porcelain)\"; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code"))
+    receipt = {"schema_version": 1, "kind": "runtime_mixture_bootstrap_stage", "instance_id": instance["instance_id"], "provider_response_sha256": instance["provider_response_sha256"], "platform_arch": "x86_64", "trainer_image": instance["trainer_image"], "image_digest": instance["image_digest"], "code_revision": request["code_revision"], "code_bundle_sha256": request["code_bundle_sha256"], "bc_revision": identity["bc"]["immutable_revision"], "rollout_revision": identity["rollout"]["immutable_revision"], "deployment_revision": identity["deployment"]["immutable_revision"], "bc_receipt_sha256": identity["bc_receipt_sha256"], "rollout_receipt_sha256": identity["rollout_receipt_sha256"], "deployment_receipt_sha256": identity["deployment_receipt_sha256"], "transfers": transfers}
     atomic_write_json(Path(output), receipt)
     return {"paid_action": True, "action": "runtime-bootstrap-stage", "bootstrap_receipt": receipt}
 
 
 def runtime_mixture_warmup_stage(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
-    """Stage the post-CPU, pre-measurement GPU slot without touching final inputs."""
+    """Stage the direct-GPU measurement slot without touching final inputs."""
     identity = _runtime_identity(instance, request)
     _runtime_bootstrap_receipt(path=Path(str(request.get("bootstrap_receipt", ""))), instance=instance, request=request)
     required = {
-        "pilot_receipt": "cpu-pilot.json", "runtime_warmup_binding": "runtime-warmup-binding.json",
+        "runtime_warmup_binding": "runtime-warmup-binding.json",
         "runtime_warmup_request": "runtime-warmup.json", "warmup_launch_config": "launch.json",
     }
     if any(type(request.get(key)) is not str or not request[key] for key in required):
-        raise ValueError("runtime warmup stage requires CPU pilot, binding, warmup request, and isolated launch config")
+        raise ValueError("runtime warmup stage requires binding, warmup request, and isolated launch config")
     output = request.get("warmup_stage_receipt")
     if type(output) is not str or not Path(output).is_absolute() or Path(output).exists() or Path(output).is_symlink():
         raise ValueError("runtime warmup stage requires an absent absolute warmup_stage_receipt")
-    pilot = _validated_runtime_pilot(request["pilot_receipt"])
-    _runtime_gpu_pilot_preflight(pilot=pilot, request=request, identity=identity)
-    _runtime_envelope(Path(str(request["runtime_warmup_request"])), command="runtime-gpu-warmup", fields={"cpu_pilot", "binding"}, label="runtime GPU warm-up request")
+    _runtime_envelope(Path(str(request["runtime_warmup_request"])), command="runtime-gpu-warmup", fields={"binding"}, label="runtime GPU warm-up request")
     launch = _load_regular_json(Path(str(request["warmup_launch_config"])), "runtime warmup launch config")
     if launch.get("training_action_horizon") != 16 or launch.get("model_action_chunk_capacity") != 40:
         raise ValueError("runtime warmup launch config is incompatible")
@@ -2131,8 +2125,8 @@ def runtime_mixture_warmup_stage(*, instance: Mapping[str, object], request: Map
         transfers.append({"name": remote_name, "sha256": digest})
     # The production warm-up adapter consumes the canonical staged launch
     # location.  Final staging later replaces this isolated warm-up config.
-    runner((*_ssh_prefix(instance), "set -eu; mv " + remote_dir + "/cpu-pilot.json /prepared/config/cpu-pilot.json; mv " + remote_dir + "/runtime-warmup-binding.json /prepared/config/runtime-warmup-binding.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/launch.json /prepared/config/launch.json; test -d /prepared/code; test ! -L /prepared/code"))
-    receipt = {"schema_version": 1, "kind": "runtime_mixture_warmup_stage", "instance_id": instance["instance_id"], "provider_response_sha256": instance["provider_response_sha256"], "cpu_pilot_sha256": sha256_file(Path(str(request["pilot_receipt"]))), "bootstrap_receipt_sha256": sha256_file(Path(str(request["bootstrap_receipt"]))), "transfers": transfers}
+    runner((*_ssh_prefix(instance), "set -eu; mv " + remote_dir + "/runtime-warmup-binding.json /prepared/config/runtime-warmup-binding.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/launch.json /prepared/config/launch.json; test -d /prepared/code; test ! -L /prepared/code"))
+    receipt = {"schema_version": 1, "kind": "runtime_mixture_warmup_stage", "instance_id": instance["instance_id"], "provider_response_sha256": instance["provider_response_sha256"], "bootstrap_receipt_sha256": sha256_file(Path(str(request["bootstrap_receipt"]))), "transfers": transfers}
     atomic_write_json(Path(output), receipt)
     return {"paid_action": True, "action": "runtime-warmup-stage", "warmup_stage_receipt": receipt}
 
@@ -2146,10 +2140,10 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         "code_bundle": "code.bundle", "code_bundle_sha256_file": "code.bundle.sha256",
         "launch_config": "launch.json", "experiment_config": "experiment.json",
         "runtime_train_request": "runtime-train.json", "runtime_hydrate_request": "runtime-hydrate.json",
-        "runtime_pilot_request": "runtime-pilot.json", "runtime_warmup_request": "runtime-warmup.json",
+        "runtime_warmup_request": "runtime-warmup.json",
         "parent_checkpoint": "parent.tar",
         "modality_config": "modality.py", "token_file": "runtime.token",
-        "pilot_receipt": "cpu-pilot.json", "gpu_warmup_receipt": "gpu-warmup.json",
+        "gpu_warmup_receipt": "gpu-warmup.json",
         "runtime_warmup_binding": "runtime-warmup-binding.json", "selected_workers": "selected-workers.json",
         "runtime_source_evidence": "source-evidence.json",
         "bc_readback_receipt": "bc-readback.json", "rollout_readback_receipt": "rollout-readback.json",
@@ -2160,19 +2154,17 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
     _runtime_bootstrap_receipt(
         path=Path(str(request["bootstrap_receipt"])), instance=instance, request=request,
     )
-    _runtime_gpu_pilot_preflight(
-        pilot=_validated_runtime_pilot(request["pilot_receipt"]), request=request,
-        identity=_runtime_identity(instance, request),
-    )
     warmup_stage = _load_regular_json(Path(str(request["warmup_stage_receipt"])), "runtime warmup stage receipt")
     if (
         warmup_stage.get("kind") != "runtime_mixture_warmup_stage"
         or warmup_stage.get("instance_id") != instance.get("instance_id")
         or warmup_stage.get("provider_response_sha256") != instance.get("provider_response_sha256")
         or warmup_stage.get("bootstrap_receipt_sha256") != sha256_file(Path(str(request["bootstrap_receipt"])))
-        or warmup_stage.get("cpu_pilot_sha256") != sha256_file(Path(str(request["pilot_receipt"])))
     ):
         raise ValueError("runtime final stage is not bound to the measured warmup slot")
+    _, measured_workers = _validated_runtime_gpu_warmup_lifecycle(
+        path=Path(str(request["gpu_warmup_receipt"])), instance=instance, request=request,
+    )
     code = Path(str(request["code_bundle"]))
     if _verify_reviewed_code_bundle(code, Path(str(request["code_bundle_sha256_file"])), request.get("code_revision")) != request.get("code_bundle_sha256"):
         raise ValueError("runtime mixture stage code bundle receipt differs from the reviewed bundle")
@@ -2196,6 +2188,8 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
     selected_workers, selected_workers_sha256 = _runtime_stage_selected_workers(
         selected_path=Path(str(request["selected_workers"])), launch_path=Path(str(request["launch_config"])),
     )
+    if selected_workers != measured_workers:
+        raise ValueError("runtime final stage selected workers do not match the measured GPU warm-up")
     resume_archive, resume_descriptor, resume_cursor = (
         request.get("runtime_resume_archive"), request.get("runtime_resume_descriptor"), request.get("runtime_resume_cursor"),
     )
@@ -2217,12 +2211,12 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         raise ValueError("runtime mixture stage parent step12000 archive is incompatible")
     _safe_archive(parent, "runtime mixture parent checkpoint")
     _read_private_token(str(request["token_file"]))
-    train = _runtime_envelope(Path(str(request["runtime_train_request"])), command="runtime-mixture-train", fields={"launch_config", "experiment_config", "runtime_manifest", "runtime_window_index", "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence", "cpu_pilot_receipt", "warmup_receipt", "runtime_warmup_binding", "runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor", "runtime_resume_anchor", "runtime_resume_publication", "checkpoint_repository", "checkpoint_revision", "publisher_token_file", "instance_id", "result_output", "status_output"}, label="runtime train request")
+    train = _runtime_envelope(Path(str(request["runtime_train_request"])), command="runtime-mixture-train", fields={"launch_config", "experiment_config", "runtime_manifest", "runtime_window_index", "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence", "warmup_receipt", "runtime_warmup_binding", "runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor", "runtime_resume_anchor", "runtime_resume_publication", "checkpoint_repository", "checkpoint_revision", "publisher_token_file", "instance_id", "result_output", "status_output"}, label="runtime train request")
     expected_train_paths = {
         "launch_config": "/prepared/config/launch.json", "experiment_config": "/prepared/config/experiment.json",
         "runtime_manifest": "/prepared/runtime/mixture.json", "runtime_window_index": "/prepared/runtime/window-index.json",
         "runtime_normalization": "/prepared/runtime/normalization.json", "runtime_mounts_descriptor": "/prepared/runtime/mounts.json",
-        "runtime_source_evidence": "/prepared/runtime/source-evidence.json", "cpu_pilot_receipt": "/prepared/config/cpu-pilot.json",
+        "runtime_source_evidence": "/prepared/runtime/source-evidence.json",
         "warmup_receipt": "/prepared/config/gpu-warmup.json", "runtime_warmup_binding": "/prepared/config/runtime-warmup-binding.json",
         "publisher_token_file": "/prepared/config/runtime.token",
         "result_output": "/output/runtime-train-result.json", "status_output": "/output/runtime-train-status.json",
@@ -2243,8 +2237,7 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
     elif any(train.get(key) is not None for key in ("runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor", "runtime_resume_anchor", "runtime_resume_publication")):
         raise ValueError("initial runtime train request must not invent a resume cursor")
     _runtime_envelope(Path(str(request["runtime_hydrate_request"])), command="hydrate-runtime-mixture", fields={"deployment_receipt", "source_readback_receipts", "destination", "mounts_descriptor"}, label="runtime hydration request")
-    _runtime_envelope(Path(str(request["runtime_pilot_request"])), command="pilot-runtime-mixture", fields={"mixture_manifest", "mounts_descriptor", "sample_count", "worker_counts", "timeout_seconds", "authenticated_evidence"}, label="runtime pilot request")
-    _runtime_envelope(Path(str(request["runtime_warmup_request"])), command="runtime-gpu-warmup", fields={"cpu_pilot", "binding"}, label="runtime GPU warm-up request")
+    _runtime_envelope(Path(str(request["runtime_warmup_request"])), command="runtime-gpu-warmup", fields={"binding"}, label="runtime GPU warm-up request")
     remote_dir = "/tmp/lehome-runtime-stage"
     runner((*_ssh_prefix(instance), "mkdir -p " + remote_dir))
     transfers: list[dict[str, str]] = []
@@ -2259,7 +2252,7 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
             raise ValueError("runtime mixture staged hash readback failed")
         transfers.append({"name": remote_name, "sha256": digest})
     runner((*_ssh_prefix(instance), "set -eu; test -d /prepared/code; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; mkdir -p /prepared/final-slot; test ! -e /prepared/final-slot/bootstrap-code; mv /prepared/code /prepared/final-slot/bootstrap-code"))
-    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/config /prepared/runtime /cache/parent /output; mv " + remote_dir + "/launch.json /prepared/config/launch.json; mv " + remote_dir + "/experiment.json /prepared/config/experiment.json; mv " + remote_dir + "/runtime-train.json /prepared/config/runtime-train.json; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/runtime-pilot.json /prepared/config/runtime-pilot.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/cpu-pilot.json /prepared/config/cpu-pilot.json; mv " + remote_dir + "/gpu-warmup.json /prepared/config/gpu-warmup.json; mv " + remote_dir + "/runtime-warmup-binding.json /prepared/config/runtime-warmup-binding.json; mv " + remote_dir + "/selected-workers.json /prepared/config/selected-workers.json; mv " + remote_dir + "/source-evidence.json /prepared/runtime/source-evidence.json; mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; git clone --quiet --no-checkout " + remote_dir + "/code.bundle /prepared/code; git -C /prepared/code checkout --quiet --detach " + str(request["code_revision"]) + "; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -z \"$(git -C /prepared/code status --porcelain)\"; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/parent.tar -C /cache/parent; test \"$(sha256sum " + remote_dir + "/parent.tar | cut -d' ' -f1)\" = " + PARENT_CHECKPOINT["archive_sha256"] + "; PYTHONPATH=/prepared/code/trainer/src python -c \"from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; assert policy_artifact_sha256('/cache/parent') == '" + PARENT_CHECKPOINT["artifact_sha256"] + "'\"; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code; test ! -L /cache/parent"))
+    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/config /prepared/runtime /cache/parent /output; mv " + remote_dir + "/launch.json /prepared/config/launch.json; mv " + remote_dir + "/experiment.json /prepared/config/experiment.json; mv " + remote_dir + "/runtime-train.json /prepared/config/runtime-train.json; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/gpu-warmup.json /prepared/config/gpu-warmup.json; mv " + remote_dir + "/runtime-warmup-binding.json /prepared/config/runtime-warmup-binding.json; mv " + remote_dir + "/selected-workers.json /prepared/config/selected-workers.json; mv " + remote_dir + "/source-evidence.json /prepared/runtime/source-evidence.json; mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; git clone --quiet --no-checkout " + remote_dir + "/code.bundle /prepared/code; git -C /prepared/code checkout --quiet --detach " + str(request["code_revision"]) + "; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -z \"$(git -C /prepared/code status --porcelain)\"; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/parent.tar -C /cache/parent; test \"$(sha256sum " + remote_dir + "/parent.tar | cut -d' ' -f1)\" = " + PARENT_CHECKPOINT["archive_sha256"] + "; PYTHONPATH=/prepared/code/trainer/src python -c \"from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; assert policy_artifact_sha256('/cache/parent') == '" + PARENT_CHECKPOINT["artifact_sha256"] + "'\"; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code; test ! -L /cache/parent"))
     if resume_transfers:
         runner((*_ssh_prefix(instance), "set -eu; mv " + remote_dir + "/runtime-resume.tar /prepared/config/runtime-resume.tar; mv " + remote_dir + "/runtime-resume.json /prepared/config/runtime-resume.json"))
     return {"paid_action": True, "action": "runtime-stage", "instance_id": instance["instance_id"], "code_bundle_sha256": request["code_bundle_sha256"], "bootstrap_receipt_sha256": sha256_file(Path(str(request["bootstrap_receipt"]))), "launch_config_sha256": sha256_file(Path(str(request["launch_config"]))), "selected_loader_workers": selected_workers, "selected_workers_sha256": selected_workers_sha256, "runtime_resume": bool(resume_transfers), "transfers": transfers}

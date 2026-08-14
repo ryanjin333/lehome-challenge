@@ -357,6 +357,24 @@ def test_runtime_mixture_train_requires_a_cross_checked_gpu_warmup_receipt() -> 
         })
 
 
+def test_runtime_mixture_train_envelope_rejects_cpu_pilot_receipt() -> None:
+    arguments = {
+        "launch_config": "/prepared/launch.json", "experiment_config": "/prepared/experiment.json",
+        "runtime_manifest": "/prepared/mixture.json", "runtime_window_index": "/prepared/windows.json",
+        "runtime_normalization": "/prepared/normalization.json", "runtime_mounts_descriptor": "/prepared/mounts.json",
+        "runtime_source_evidence": "/prepared/sources.json", "warmup_receipt": "/prepared/warmup.json",
+        "runtime_warmup_binding": "/prepared/binding.json", "runtime_resume_archive": None,
+        "runtime_resume_descriptor": None, "runtime_resume_cursor": None, "runtime_resume_anchor": None,
+        "runtime_resume_publication": None, "checkpoint_repository": "repo", "checkpoint_revision": "main",
+        "publisher_token_file": "/prepared/token", "instance_id": 44,
+        "result_output": "/output/result.json", "status_output": "/output/status.json",
+        "cpu_pilot_receipt": "/prepared/cpu-pilot.json",
+    }
+
+    with pytest.raises(ValueError, match="incompatible schema"):
+        runtime_module.ProductionRuntime().runtime_mixture_train(arguments)
+
+
 def test_runtime_gpu_warmup_production_adapter_measures_live_loader_model_and_nvml(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -462,7 +480,7 @@ def test_runtime_gpu_warmup_production_adapter_measures_live_loader_model_and_nv
     production = runtime_module.ProductionRuntime()
     monkeypatch.setattr(production, "_create_runtime_gpu_warmup_session", lambda _arguments: session)
 
-    adapter = production.runtime_gpu_warmup_adapter({"cpu_pilot": {}, "binding": {}})
+    adapter = production.runtime_gpu_warmup_adapter({"binding": {}})
     assert adapter.runtime_state().to_dict() == {
         "torch_cuda_available": True,
         "torch_cuda_initialized": True,

@@ -332,11 +332,10 @@ def _gate() -> dict[str, object]:
 
 
 def build_gpu_warmup_receipt(
-    *, cpu_pilot: Mapping[str, object], binding: Mapping[str, object], adapter: GpuWarmupMetricsAdapter
+    *, binding: Mapping[str, object], adapter: GpuWarmupMetricsAdapter
 ) -> dict[str, object]:
     """Measure every fixed candidate and return only a non-starving receipt."""
 
-    cpu_pilot_sha256 = validate_cpu_pilot(cpu_pilot)
     checked_binding = validate_warmup_binding(binding)
     state = adapter.runtime_state()
     if not isinstance(state, RuntimeState):
@@ -356,7 +355,6 @@ def build_gpu_warmup_receipt(
     receipt = {
         "schema_version": 1,
         "kind": "runtime_mixture_gpu_warmup",
-        "cpu_pilot_sha256": cpu_pilot_sha256,
         "binding": checked_binding,
         "runtime_state": state.to_dict(),
         "gate": _gate(),
@@ -365,16 +363,16 @@ def build_gpu_warmup_receipt(
     }
     if selected is None:
         raise RuntimeError("no GPU warm-up worker count proved loader non-starvation")
-    validate_gpu_warmup_receipt(receipt, expected_binding=checked_binding, expected_cpu_pilot=cpu_pilot)
+    validate_gpu_warmup_receipt(receipt, expected_binding=checked_binding)
     return receipt
 
 
 def warmup_from_request(path: str | Path) -> dict[str, object]:
     """Run one schema-checked GPU warm-up through the image production factory.
 
-    The envelope intentionally carries only the authenticated CPU pilot and
-    immutable binding.  Candidate metrics are accepted only from the loaded
-    production factory's live model/DataLoader/NVML adapter.
+    The envelope carries only the immutable direct-GPU binding. Candidate
+    metrics are accepted only from the loaded production factory's live
+    model/DataLoader/NVML adapter.
     """
 
     from lehome_train.runtime import _request_arguments, load_runtime_adapter
@@ -382,12 +380,11 @@ def warmup_from_request(path: str | Path) -> dict[str, object]:
     arguments = _request_arguments(
         path,
         command="runtime-gpu-warmup",
-        expected_fields={"cpu_pilot", "binding"},
+        expected_fields={"binding"},
     )
-    cpu_pilot = arguments["cpu_pilot"]
     binding = arguments["binding"]
-    if not isinstance(cpu_pilot, Mapping) or not isinstance(binding, Mapping):
-        raise ValueError("runtime GPU warm-up requires CPU pilot and binding objects")
+    if not isinstance(binding, Mapping):
+        raise ValueError("runtime GPU warm-up requires a binding object")
     production = load_runtime_adapter(None)
     adapter_factory = getattr(production, "runtime_gpu_warmup_adapter", None)
     if not callable(adapter_factory):
@@ -396,25 +393,23 @@ def warmup_from_request(path: str | Path) -> dict[str, object]:
     if not isinstance(adapter, TorchRuntimeWarmupMetricsAdapter):
         raise RuntimeError("training runtime factory returned no live Torch warm-up adapter")
     receipt = build_gpu_warmup_receipt(
-        cpu_pilot=cpu_pilot,
         binding=binding,
         adapter=adapter,
     )
     validate_gpu_warmup_receipt(
         receipt,
         expected_binding=binding,
-        expected_cpu_pilot=cpu_pilot,
     )
     return receipt
 
 
 def validate_gpu_warmup_receipt(
-    receipt: Mapping[str, object], *, expected_binding: Mapping[str, object], expected_cpu_pilot: Mapping[str, object] | None = None
+    receipt: Mapping[str, object], *, expected_binding: Mapping[str, object]
 ) -> int:
     """Verify that an existing receipt still proves the fixed safe gate."""
 
     required = {
-        "schema_version", "kind", "cpu_pilot_sha256", "binding", "runtime_state",
+        "schema_version", "kind", "binding", "runtime_state",
         "gate", "candidates", "selected_loader_workers",
     }
     _exact(receipt, required, "GPU warm-up receipt")
@@ -424,9 +419,6 @@ def validate_gpu_warmup_receipt(
     receipt_binding = validate_warmup_binding(receipt["binding"] if isinstance(receipt["binding"], Mapping) else {})
     if receipt_binding != checked_binding:
         raise ValueError("GPU warm-up receipt binding does not match this runtime")
-    pilot_sha = _sha(receipt["cpu_pilot_sha256"], "GPU warm-up CPU pilot hash")
-    if expected_cpu_pilot is not None and pilot_sha != validate_cpu_pilot(expected_cpu_pilot):
-        raise ValueError("GPU warm-up receipt CPU pilot binding does not match")
     state = _exact(receipt["runtime_state"], {"torch_cuda_available", "torch_cuda_initialized", "model_loaded"}, "GPU warm-up runtime state")
     if any(type(state[name]) is not bool for name in state) or not all(state.values()):
         raise ValueError("GPU warm-up runtime state does not prove CUDA and model loading")

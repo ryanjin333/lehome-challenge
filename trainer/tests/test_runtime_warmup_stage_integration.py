@@ -308,12 +308,8 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 44,
         "host": "fixture", "port": 22, "platform_arch": "x86_64",
         "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
         "provider_response_sha256": "1" * 64, "capability_sha256": "2" * 64,
-    }
-    cpu_instance = {
-        "instance_id": 43, "provider_response_sha256": "6" * 64,
-        "platform_arch": "x86_64", "trainer_image": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE,
-        "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2],
     }
     code_revision, code_sha256 = "3" * 40, "4" * 64
     receipts = _campaign_receipts(tmp_path)
@@ -341,7 +337,6 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         },
         "physical_batch_size": 64, "action_horizon": 16,
     }
-    pilot = _cpu_pilot(instance=cpu_instance, code_revision=code_revision, code_sha256=code_sha256)
     launch = {
         "base_model_path": str(cache / "parent"), "base_model_revision": MODEL_REVISION,
         "dataset_path": str(prepared / "runtime"), "dataset_revision": "6" * 40,
@@ -357,20 +352,19 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "runtime_mixture_manifest": str(manifest), "runtime_window_index": str(windows),
         "runtime_mounts_descriptor": str(mounts),
     }
-    pilot_path = _write(tmp_path / "stage" / "pilot.json", pilot)
     binding_path = _write(tmp_path / "stage" / "binding.json", binding)
     warmup_request = _write(tmp_path / "stage" / "runtime-warmup.json", {
         "schema_version": 1, "command": "runtime-gpu-warmup",
-        "arguments": {"cpu_pilot": pilot, "binding": binding},
+        "arguments": {"binding": binding},
     })
     launch_path = _write(tmp_path / "stage" / "warmup-launch.json", launch)
     bootstrap = _write(tmp_path / "stage" / "bootstrap.json", {
         "schema_version": 1, "kind": "runtime_mixture_bootstrap_stage",
-        "instance_id": cpu_instance["instance_id"],
-        "provider_response_sha256": cpu_instance["provider_response_sha256"],
-        "platform_arch": "x86_64",
-        "trainer_image": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE,
-        "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2],
+            "instance_id": instance["instance_id"],
+            "provider_response_sha256": instance["provider_response_sha256"],
+            "platform_arch": "x86_64",
+            "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+            "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
         "code_revision": code_revision, "code_bundle_sha256": code_sha256,
         "bc_revision": "b" * 40, "rollout_revision": "c" * 40,
         "deployment_revision": "a" * 40,
@@ -388,7 +382,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
             "bc_readback_receipt": str(receipts["bc"]),
             "rollout_readback_receipt": str(receipts["rollout"]),
             "deployment_receipt": str(receipts["deployment"]),
-            "bootstrap_receipt": str(bootstrap), "pilot_receipt": str(pilot_path),
+            "bootstrap_receipt": str(bootstrap),
             "runtime_warmup_binding": str(binding_path),
             "runtime_warmup_request": str(warmup_request),
             "warmup_launch_config": str(launch_path),
@@ -402,7 +396,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
 
     loaded_pipelines, created_loaders = _install_low_level_runtime_fakes(monkeypatch, tmp_path)
     session = production.ProductionRuntime()._create_runtime_gpu_warmup_session(
-        {"cpu_pilot": pilot, "binding": binding}
+        {"binding": binding}
     )
     loader = session.loader_factory(4)
 

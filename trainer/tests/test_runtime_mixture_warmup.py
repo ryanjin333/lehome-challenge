@@ -107,7 +107,7 @@ def _receipt(adapter: _Adapter | None = None) -> dict[str, object]:
     from lehome_train.groot.runtime_mixture_warmup import build_gpu_warmup_receipt
 
     return build_gpu_warmup_receipt(
-        cpu_pilot=_cpu_pilot(), binding=_binding(), adapter=adapter or _Adapter()
+        binding=_binding(), adapter=adapter or _Adapter()
     )
 
 
@@ -118,6 +118,15 @@ def test_gpu_warmup_selects_lowest_worker_that_meets_fixed_gate() -> None:
     assert receipt["selected_loader_workers"] == 4
     assert adapter.calls == [(0, 10, 50), (4, 10, 50), (8, 10, 50), (16, 10, 50), (24, 10, 50)]
     assert receipt["gate"]["max_loader_wait_fraction"] == 0.10
+
+
+def test_gpu_warmup_receipt_requires_only_the_direct_gpu_binding() -> None:
+    from lehome_train.groot.runtime_mixture_warmup import build_gpu_warmup_receipt
+
+    receipt = build_gpu_warmup_receipt(binding=_binding(), adapter=_Adapter())
+
+    assert "cpu_pilot_sha256" not in receipt
+    assert receipt["selected_loader_workers"] == 4
 
 
 def test_gpu_warmup_selection_is_deterministic_not_fastest() -> None:
@@ -171,7 +180,7 @@ def test_warmup_receipt_does_not_allow_caller_threshold_injection() -> None:
 
     with pytest.raises(TypeError):
         build_gpu_warmup_receipt(
-            cpu_pilot=_cpu_pilot(), binding=_binding(), adapter=_Adapter(),
+            binding=_binding(), adapter=_Adapter(),
             max_loader_wait_fraction=1.0,
         )
 
@@ -248,13 +257,54 @@ def test_warmup_request_uses_production_factory_live_adapter_not_authored_rows(
     request.write_text(json.dumps({
         "schema_version": 1,
         "command": "runtime-gpu-warmup",
-        "arguments": {"cpu_pilot": _cpu_pilot(), "binding": _binding()},
+        "arguments": {"binding": _binding()},
     }), encoding="utf-8")
 
     receipt = warmup_from_request(request)
 
     assert receipt["selected_loader_workers"] == 0
-    assert calls == [{"cpu_pilot": _cpu_pilot(), "binding": _binding()}]
+    assert calls == [{"binding": _binding()}]
+
+
+def test_warmup_request_envelope_excludes_cpu_pilot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lehome_train.groot.runtime_mixture_warmup import (
+        GpuWarmupMeasurement,
+        TorchRuntimeWarmupMetricsAdapter,
+        warmup_from_request,
+    )
+
+    class ProductionFactory:
+        def __getattr__(self, _name: str):
+            return lambda *_args: {"status": "unused"}
+
+        def runtime_gpu_warmup_adapter(self, arguments: dict[str, object]):
+            assert arguments == {"binding": _binding()}
+            return TorchRuntimeWarmupMetricsAdapter(
+                model_loaded=lambda: True,
+                measure_live=lambda **_kwargs: GpuWarmupMeasurement(
+                    64 * 60, 50, 1.0, 20.0, 18.0, 90.0, False, None
+                ),
+            )
+
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: True, is_initialized=lambda: True)
+    ))
+    monkeypatch.setitem(sys.modules, "direct_gpu_production", types.SimpleNamespace(
+        create=lambda: ProductionFactory()
+    ))
+    monkeypatch.setenv("LEHOME_TRAIN_RUNTIME_FACTORY", "direct_gpu_production:create")
+    request = tmp_path / "runtime-warmup.json"
+    request.write_text(json.dumps({
+        "schema_version": 1,
+        "command": "runtime-gpu-warmup",
+        "arguments": {"binding": _binding()},
+    }), encoding="utf-8")
+
+    receipt = warmup_from_request(request)
+
+    assert "cpu_pilot_sha256" not in receipt
 
 
 def test_warmup_request_rejects_preauthored_candidate_rows_and_missing_factory(
@@ -267,7 +317,7 @@ def test_warmup_request_rejects_preauthored_candidate_rows_and_missing_factory(
         "schema_version": 1,
         "command": "runtime-gpu-warmup",
         "arguments": {
-            "cpu_pilot": _cpu_pilot(), "binding": _binding(),
+            "binding": _binding(),
             "candidates": [{"accepted": True}],
         },
     }), encoding="utf-8")
@@ -277,7 +327,7 @@ def test_warmup_request_rejects_preauthored_candidate_rows_and_missing_factory(
     request.write_text(json.dumps({
         "schema_version": 1,
         "command": "runtime-gpu-warmup",
-        "arguments": {"cpu_pilot": _cpu_pilot(), "binding": _binding()},
+        "arguments": {"binding": _binding()},
     }), encoding="utf-8")
     monkeypatch.delenv("LEHOME_TRAIN_RUNTIME_FACTORY", raising=False)
     with pytest.raises(RuntimeError, match="no training runtime factory"):

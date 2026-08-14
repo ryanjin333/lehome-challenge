@@ -37,6 +37,16 @@ class FakeHub:
         return revision
 
 
+@pytest.fixture(autouse=True)
+def _temporary_vast_ssh_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = tmp_path / "vast_quest"
+    identity.write_text("private-key-material", encoding="utf-8")
+    identity.chmod(0o600)
+    monkeypatch.setattr(LIFECYCLE, "VAST_SSH_IDENTITY", identity)
+
+
 def test_vast_ssh_and_scp_prefixes_use_the_approved_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -65,6 +75,7 @@ def test_invalid_vast_ssh_identity_stops_before_provider_or_ssh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
 ) -> None:
     identity = tmp_path / "vast_quest"
+    identity.unlink()
     if kind == "directory":
         identity.mkdir()
     elif kind == "symlink":
@@ -1299,21 +1310,39 @@ def test_runtime_mixture_train_uses_only_authenticated_receipts_and_never_legacy
     paths = {}
     for name, value in receipts.items():
         path = tmp_path / f"{name}.json"; path.write_text(json.dumps(value), encoding="utf-8"); paths[name] = str(path)
-    pilot = tmp_path / "pilot.json"
-    pilot.write_text(json.dumps(_schema4_pilot(
-        instance_id=9, provider_sha="0" * 64, code_revision="1" * 40,
-        code_sha="2" * 64, bc_revision="a" * 40, rollout_revision="b" * 40,
-        deployment_revision="c" * 40,
-    )), encoding="utf-8")
     calls: list[tuple[str, ...]] = []
     def runner(command: tuple[str, ...]) -> str:
         calls.append(command); return "{}"
     instance = {"schema_version": 1, "kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 44, "host": "native-x86", "port": 22, "platform_arch": "x86_64", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "offer_evidence_sha256": "a" * 64, "provider_response_sha256": "b" * 64, "capability_sha256": "c" * 64}
     output = tmp_path / "execution.json"
     binding = {"mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "c" * 64}, "code": {"repository_revision": "1" * 40, "bundle_sha256": "2" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
+    from lehome_train.groot.runtime_mixture_warmup import (
+        GpuWarmupMeasurement,
+        RuntimeState,
+        build_gpu_warmup_receipt,
+    )
+
+    class DirectGpuAdapter:
+        def runtime_state(self) -> RuntimeState:
+            return RuntimeState(True, True, True)
+
+        def measure(self, *, worker_count: int, burn_in_steps: int, measured_steps: int) -> GpuWarmupMeasurement:
+            viable = worker_count == 4
+            return GpuWarmupMeasurement(
+                decoded_samples=64 * (burn_in_steps + measured_steps),
+                measured_steps=measured_steps,
+                loader_wait_seconds=5.0 if viable else 20.0,
+                step_seconds=100.0,
+                gpu_busy_seconds=80.0 if viable else 50.0,
+                gpu_utilization_percent=80.0 if viable else 50.0,
+                oom=False,
+                error=None,
+            )
+
+    measured_warmup = build_gpu_warmup_receipt(binding=binding, adapter=DirectGpuAdapter())
     warmup = tmp_path / "warmup.json"
-    warmup.write_text(json.dumps({"kind": "runtime_mixture_gpu_warmup_lifecycle", "instance_id": 44, "provider_response_sha256": "b" * 64, "capability_sha256": "c" * 64, "code_revision": "1" * 40, "code_bundle_sha256": "2" * 64, "parent_checkpoint_artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"], "deployment_revision": "c" * 40, "cpu_pilot_sha256": LIFECYCLE.sha256_file(pilot), "runtime_warmup_binding": binding, "warmup_receipt": {}, "selected_loader_workers": 4}), encoding="utf-8")
-    request = {"bc_readback_receipt": paths["bc"], "rollout_readback_receipt": paths["rollout"], "deployment_receipt": paths["deployment"], "pilot_receipt": str(pilot), "warmup_lifecycle_receipt": str(warmup), "code_revision": "1" * 40, "code_bundle_sha256": "2" * 64, "execution_receipt": str(output), "failure_receipt": str(tmp_path / "failure.json")}
+    warmup.write_text(json.dumps({"kind": "runtime_mixture_gpu_warmup_lifecycle", "instance_id": 44, "provider_response_sha256": "b" * 64, "capability_sha256": "c" * 64, "code_revision": "1" * 40, "code_bundle_sha256": "2" * 64, "parent_checkpoint_artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"], "deployment_revision": "c" * 40, "runtime_warmup_binding": binding, "warmup_receipt": measured_warmup, "selected_loader_workers": 4}), encoding="utf-8")
+    request = {"bc_readback_receipt": paths["bc"], "rollout_readback_receipt": paths["rollout"], "deployment_receipt": paths["deployment"], "warmup_lifecycle_receipt": str(warmup), "code_revision": "1" * 40, "code_bundle_sha256": "2" * 64, "execution_receipt": str(output), "failure_receipt": str(tmp_path / "failure.json")}
 
     report = LIFECYCLE.remote_action(action="runtime-train", instance=instance, request=request, runner=runner)
 
@@ -1323,6 +1352,64 @@ def test_runtime_mixture_train_uses_only_authenticated_receipts_and_never_legacy
     assert "/prepared/generation" not in command and "continuous-train" not in command
     receipt = json.loads(output.read_text(encoding="utf-8"))
     assert receipt["platform_arch"] == "x86_64" and receipt["deployment_revision"] == "c" * 40
+    assert "pilot_receipt_sha256" not in receipt
+
+    warmup_payload = json.loads(warmup.read_text(encoding="utf-8"))
+    warmup_payload["instance_id"] = 45
+    warmup.write_text(json.dumps(warmup_payload), encoding="utf-8")
+    request["execution_receipt"] = str(tmp_path / "mismatched-execution.json")
+    with pytest.raises(ValueError, match="same GPU instance"):
+        LIFECYCLE.remote_action(action="runtime-train", instance=instance, request=request, runner=runner)
+
+
+def test_runtime_final_stage_rejects_a_warmup_from_another_gpu_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = {
+        "kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 44,
+        "host": "host", "port": 22, "platform_arch": "x86_64",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+        "provider_response_sha256": "a" * 64, "capability_sha256": "b" * 64,
+    }
+    binding = {
+        "mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "e" * 64, "window_index_sha256": "f" * 64, "normalization_sha256": "0" * 64, "source_revisions": {"organizer": "1" * 40, "rollout": "2" * 40}},
+        "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "b" * 64},
+        "code": {"repository_revision": "3" * 40, "bundle_sha256": "4" * 64, "isaac_groot_revision": "5" * 40},
+        "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]},
+        "physical_batch_size": 64, "action_horizon": 16,
+    }
+    warmup = tmp_path / "warmup.json"
+    warmup.write_text(json.dumps({
+        "kind": "runtime_mixture_gpu_warmup_lifecycle", "instance_id": 45,
+        "provider_response_sha256": "a" * 64, "capability_sha256": "b" * 64,
+        "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64,
+        "parent_checkpoint_artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"],
+        "deployment_revision": "c" * 40, "runtime_warmup_binding": binding,
+        "warmup_receipt": {}, "selected_loader_workers": 4,
+    }), encoding="utf-8")
+    receipts = {}
+    for name, payload in {
+        "bc": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "1" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True},
+        "rollout": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "2" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True},
+        "deployment": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "6" * 64, "artifact_entries": [{"relative_path": "mixture.json"}], "fresh_readback_verified": True, "tree_listing_verified": True},
+    }.items():
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        receipts[name] = str(path)
+    request = {
+        **{f"{name}_readback_receipt" if name != "deployment" else "deployment_receipt": path for name, path in receipts.items()},
+        "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64,
+    }
+    monkeypatch.setattr(
+        "lehome_train.groot.runtime_mixture_warmup.validate_gpu_warmup_receipt",
+        lambda _receipt, **_kwargs: 4,
+    )
+
+    with pytest.raises(ValueError, match="same GPU instance"):
+        LIFECYCLE._validated_runtime_gpu_warmup_lifecycle(
+            path=warmup, instance=instance, request=request,
+        )
 
 
 def test_runtime_pilot_provider_plan_is_on_demand_x86_and_never_rents() -> None:
@@ -1792,11 +1879,14 @@ def test_runtime_rent_rejects_absent_or_invalid_preflight_evidence_before_provid
         LIFECYCLE.rent_runtime_cpu_pilot(evidence=cpu, runner=runner)
 
     gpu = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "gpu-failure.json"))
-    invalid_pilot = tmp_path / "invalid-pilot.json"
-    invalid_pilot.write_text("{}", encoding="utf-8")
-    gpu["pilot_receipt"] = str(invalid_pilot)
-    with pytest.raises(ValueError, match="canonical CPU-only"):
+    gpu.pop("bc_readback_receipt")
+    with pytest.raises(ValueError, match="receipt path"):
         LIFECYCLE.rent_runtime_gpu_warmup(evidence=gpu, runner=runner)
+
+    tampered = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "tampered-gpu-failure.json"))
+    Path(str(tampered["deployment_receipt"])).write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="schema"):
+        LIFECYCLE.rent_runtime_gpu_warmup(evidence=tampered, runner=runner)
 
     assert calls == []
 
@@ -2096,7 +2186,7 @@ def test_runtime_cpu_bootstrap_receipt_rejects_source_or_deployment_receipt_drif
     receipt["deployment_revision"] = "f" * 40
     path.write_text(json.dumps(receipt), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="CPU pilot bootstrap"):
+    with pytest.raises(ValueError, match="bootstrap stage"):
         LIFECYCLE._runtime_bootstrap_receipt(path=path, instance=instance, request=request)
 
 
