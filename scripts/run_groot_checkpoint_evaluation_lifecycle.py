@@ -13,6 +13,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import re
 import stat
@@ -35,6 +36,7 @@ OFFER_QUERY = "gpu_name=RTX_3090 num_gpus=4 reliability>=0.95 cpu_cores_effectiv
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 VAST_SSH_IDENTITY = str(Path.home() / ".ssh" / "vast_quest")
+EVALUATION_RENT_CLAIM_ROOT = Path("/private/tmp/lehome-checkpoint-evaluation-rent-claims")
 
 
 def _corrective_module():
@@ -114,6 +116,8 @@ def _write_new(path: Path, value: Mapping[str, object]) -> dict[str, object]:
 
 
 def _number(value: object) -> float:
+    if isinstance(value, bool):
+        return math.inf
     try:
         parsed = float(value)
     except (TypeError, ValueError):
@@ -284,6 +288,27 @@ def _verify_absent(instance_id: int, runner: Callable[[tuple[str, ...]], object]
     return status
 
 
+def _resolve_ambiguous_create(
+    runner: Callable[[tuple[str, ...]], object], *, polls: int = 60,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int | None:
+    """Identify the only new compatible host after a malformed create reply."""
+    for index in range(polls):
+        rows = _raw(runner, ("vastai", "--raw", "show", "instances"))
+        volumes = _raw(runner, ("vastai", "--raw", "show", "volumes"))
+        if volumes != [] or not isinstance(rows, list):
+            return None
+        if len(rows) == 1:
+            row = rows[0]
+            candidate = row.get("id") if isinstance(row, dict) else None
+            return candidate if type(candidate) is int and candidate > 0 and _approved_host(row, require_running=False) else None
+        if rows:
+            return None
+        if index + 1 < polls:
+            sleep(2.0)
+    return None
+
+
 def _cleanup_failure(instance_id: int, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object], reason: str, *, sync_attempted: bool = False) -> None:
     """Destroy the owned instance once and preserve redacted disposal evidence."""
     runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
@@ -299,50 +324,156 @@ def _cleanup_failure(instance_id: int, lifecycle_root: Path, runner: Callable[[t
         raise RuntimeError("failure disposal did not verify empty provider account")
 
 
-def rent_evaluation(manifest_path: Path, *, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object], now_unix: int | None = None) -> dict[str, object]:
+def _rent_claim_path(manifest: Mapping[str, object], *, root: Path | None = None) -> Path:
+    claim_root = EVALUATION_RENT_CLAIM_ROOT if root is None else Path(root)
+    if claim_root.is_symlink():
+        raise ValueError("evaluation rent claim root is unsafe")
+    claim_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if claim_root.is_symlink() or not claim_root.is_dir():
+        raise ValueError("evaluation rent claim root is unsafe")
+    identity = {
+        "invocation": manifest["invocation"],
+        "rollout_image": manifest["rollout_image"],
+        "code_bundle_sha256": manifest["code_bundle_sha256"],
+    }
+    return claim_root / (canonical_sha256(identity) + ".json")
+
+
+def _acquire_rent_claim(path: Path, manifest: Mapping[str, object]) -> dict[str, object]:
+    claim = {
+        "schema_version": 1,
+        "kind": "groot_checkpoint_evaluation_rent_claim",
+        "status": "claimed",
+        "invocation_sha256": canonical_sha256(manifest["invocation"]),
+        "rollout_image": manifest["rollout_image"],
+        "code_bundle_sha256": manifest["code_bundle_sha256"],
+    }
+    encoded = (json.dumps(claim, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise ValueError("evaluation rent claim is already held; no provider action was taken") from error
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        parent_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return claim
+
+
+def _replace_rent_claim(path: Path, expected: Mapping[str, object], replacement: Mapping[str, object]) -> None:
+    if _read_json(path, "evaluation rent claim") != dict(expected):
+        raise RuntimeError("evaluation rent claim changed unexpectedly")
+    temporary = path.with_name(path.name + ".tmp")
+    if temporary.exists() or temporary.is_symlink():
+        raise RuntimeError("evaluation rent claim temporary path is not clean")
+    encoded = json.dumps(replacement, sort_keys=True, separators=(",", ":")) + "\n"
+    try:
+        temporary.write_text(encoded, encoding="utf-8")
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        parent_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _release_rent_claim(path: Path, claim: Mapping[str, object]) -> None:
+    if _read_json(path, "evaluation rent claim") != dict(claim):
+        raise RuntimeError("evaluation rent claim changed before release")
+    path.unlink()
+
+
+def _terminalize_rent_claim(path: Path, claim: Mapping[str, object], *, status: str, instance_id: int | None = None) -> None:
+    replacement = dict(claim) | {"status": status}
+    if instance_id is not None:
+        replacement["instance_id"] = instance_id
+    _replace_rent_claim(path, claim, replacement)
+
+
+def rent_evaluation(manifest_path: Path, *, lifecycle_root: Path, runner: Callable[[tuple[str, ...]], object], now_unix: int | None = None, claim_root: Path | None = None, ambiguous_create_polls: int = 60, sleep: Callable[[float], None] = time.sleep) -> dict[str, object]:
     """Rent exactly one compatible host after a validated local-only preflight."""
     manifest = read_lifecycle_manifest(manifest_path)  # must precede every provider call
     timestamp = time.time_ns() // 1_000_000_000 if now_unix is None else now_unix
-    instances = _raw(runner, ("vastai", "--raw", "show", "instances"))
-    volumes = _raw(runner, ("vastai", "--raw", "show", "volumes"))
-    if not isinstance(instances, list) or not isinstance(volumes, list):
-        raise ValueError("provider account preflight response is invalid")
-    # Do not query offers, much less create a host, while any account resource
-    # exists.  This makes the no-overlap check an actual provider-call gate.
-    if instances:
-        raise ValueError("evaluation lifecycle requires account-wide zero instances before rent")
-    if volumes:
-        raise ValueError("evaluation lifecycle requires account-wide zero volumes before rent")
-    offers = _raw(runner, ("vastai", "--raw", "search", "offers", OFFER_QUERY, "--on-demand", "--storage", "300"))
-    if not isinstance(offers, list):
-        raise ValueError("provider account preflight response is invalid")
-    evidence = capture_provider_evidence(offers=offers, instances=instances, volumes=volumes, output=lifecycle_root / f"provider-{timestamp}.json", now_unix=timestamp)
     _ssh_identity()  # fail before the irreversible provider create call
-    created = _raw(runner, (
-        "vastai", "--raw", "create", "instance", str(evidence["offer_id"]), "--image", str(manifest["rollout_image"]),
-        "--env", f"-e LEHOME_FLYWHEEL_IMAGE_IDENTITY={APPROVED_IMAGE_DIGEST}", "--disk", "300", "--ssh", "--direct", "--cancel-unavail",
-    ))
-    instance_id = created.get("new_contract") if isinstance(created, dict) else None
-    if type(instance_id) is not int or instance_id <= 0:
-        raise ValueError("provider create response lacks instance ID")
+    claim_path = _rent_claim_path(manifest, root=claim_root)
+    claim = _acquire_rent_claim(claim_path, manifest)
+    create_attempted = False
+    instance_id: int | None = None
     try:
+        instances = _raw(runner, ("vastai", "--raw", "show", "instances"))
+        volumes = _raw(runner, ("vastai", "--raw", "show", "volumes"))
+        if not isinstance(instances, list) or not isinstance(volumes, list):
+            raise ValueError("provider account preflight response is invalid")
+        if instances:
+            raise ValueError("evaluation lifecycle requires account-wide zero instances before rent")
+        if volumes:
+            raise ValueError("evaluation lifecycle requires account-wide zero volumes before rent")
+        offers = _raw(runner, ("vastai", "--raw", "search", "offers", OFFER_QUERY, "--on-demand", "--storage", "300"))
+        if not isinstance(offers, list):
+            raise ValueError("provider account preflight response is invalid")
+        evidence = capture_provider_evidence(offers=offers, instances=instances, volumes=volumes, output=lifecycle_root / f"provider-{timestamp}.json", now_unix=timestamp)
+        create_attempted = True
+        created = _raw(runner, (
+            "vastai", "--raw", "create", "instance", str(evidence["offer_id"]), "--image", str(manifest["rollout_image"]),
+            "--env", f"-e LEHOME_FLYWHEEL_IMAGE_IDENTITY={APPROVED_IMAGE_DIGEST}", "--disk", "300", "--ssh", "--direct", "--cancel-unavail",
+        ))
+        candidate = created.get("new_contract") if isinstance(created, dict) else None
+        if type(candidate) is not int or candidate <= 0:
+            raise RuntimeError("provider create response lacks instance ID")
+        instance_id = candidate
         live = _wait_running(instance_id, runner)
-    except BaseException:
-        _cleanup_failure(instance_id, lifecycle_root, runner, "post_create_readback_failure")
-        raise
-    if _number(live.get("dph_total")) != evidence["instance_hourly_cost_usd"]:
-        _cleanup_failure(instance_id, lifecycle_root, runner, "cost_readback_mismatch")
-        raise ValueError("new instance readback cost differs from preflight offer")
-    invocation = manifest["invocation"]
-    lease_started = timestamp
-    receipt = {
-        "schema_version": 1, "kind": "groot_checkpoint_evaluation_instance", "instance_id": instance_id,
-        "host": live["ssh_host"], "port": live.get("ssh_port", 22), "invocation_sha256": canonical_sha256(invocation),
-        "provider_evidence_sha256": canonical_sha256(evidence), "provider_response_sha256": canonical_sha256(live),
-        "lease_started_unix": lease_started, "lease_deadline_unix": lease_started + MAX_WALL_SECONDS,
-        "hard_wall_seconds": MAX_WALL_SECONDS, "total_dollar_ceiling_usd": MAX_TOTAL_DOLLARS,
-    }
-    return _write_new(lifecycle_root / f"instance-{instance_id}.json", receipt)
+        if _number(live.get("dph_total")) != evidence["instance_hourly_cost_usd"]:
+            raise ValueError("new instance readback cost differs from preflight offer")
+        invocation = manifest["invocation"]
+        lease_started = timestamp
+        receipt = {
+            "schema_version": 1, "kind": "groot_checkpoint_evaluation_instance", "instance_id": instance_id,
+            "host": live["ssh_host"], "port": live.get("ssh_port", 22), "invocation_sha256": canonical_sha256(invocation),
+            "provider_evidence_sha256": canonical_sha256(evidence), "provider_response_sha256": canonical_sha256(live),
+            "lease_started_unix": lease_started, "lease_deadline_unix": lease_started + MAX_WALL_SECONDS,
+            "hard_wall_seconds": MAX_WALL_SECONDS, "total_dollar_ceiling_usd": MAX_TOTAL_DOLLARS,
+        }
+        written = _write_new(lifecycle_root / f"instance-{instance_id}.json", receipt)
+        _terminalize_rent_claim(claim_path, claim, status="succeeded", instance_id=instance_id)
+        return written
+    except BaseException as error:
+        if instance_id is not None:
+            try:
+                _cleanup_failure(instance_id, lifecycle_root, runner, "post_create_failure")
+            except BaseException:
+                _terminalize_rent_claim(claim_path, claim, status="blocked_cleanup_unverified", instance_id=instance_id)
+                raise
+            _release_rent_claim(claim_path, claim)
+        elif create_attempted:
+            try:
+                resolved = _resolve_ambiguous_create(runner, polls=ambiguous_create_polls, sleep=sleep)
+            except BaseException:
+                resolved = None
+            if resolved is None:
+                _terminalize_rent_claim(claim_path, claim, status="blocked_ambiguous_create")
+            else:
+                try:
+                    _cleanup_failure(resolved, lifecycle_root, runner, "ambiguous_create_response")
+                except BaseException:
+                    _terminalize_rent_claim(claim_path, claim, status="blocked_cleanup_unverified", instance_id=resolved)
+                    raise
+                _release_rent_claim(claim_path, claim)
+        else:
+            _release_rent_claim(claim_path, claim)
+        raise error
 
 
 def _prelaunch_account(instance: Mapping[str, object], runner: Callable[[tuple[str, ...]], object]) -> None:
@@ -401,10 +532,15 @@ def stage_launch_sync_evaluation(manifest_path: Path, instance_receipt: Mapping[
         _prelaunch_account(instance_receipt, runner)
         bundle_remote, token_remote = f"{remote_root}/code.bundle", f"{remote_root}/hf.token"
         identity_file = _ssh_identity()
-        ssh = ("ssh", "-i", identity_file, "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", port, remote)
+        transport_options = (
+            "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+        )
+        ssh = ("ssh", "-i", identity_file, *transport_options, "-p", port, remote)
         for command, label in ((ssh + ("mkdir", "-p", remote_root), "remote staging"),
-                               (("scp", "-i", identity_file, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", port, str(code_bundle), f"{remote}:{bundle_remote}"), "code staging"),
-                               (("scp", "-i", identity_file, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", port, str(token_file), f"{remote}:{token_remote}"), "token staging")):
+                               (("scp", "-i", identity_file, *transport_options, "-P", port, str(code_bundle), f"{remote}:{bundle_remote}"), "code staging"),
+                               (("scp", "-i", identity_file, *transport_options, "-P", port, str(token_file), f"{remote}:{token_remote}"), "token staging")):
             result = runner(command)
             if getattr(result, "returncode", 0) not in (0, None):
                 raise RuntimeError(f"{label} failed")
@@ -420,6 +556,7 @@ def stage_launch_sync_evaluation(manifest_path: Path, instance_receipt: Mapping[
             corrective._controller_import_preflight(checkout, wire_target=wire_target),
             *corrective._asset_checkout_setup(checkout),
         ]
+        arguments = " ".join(shlex.quote(value) for value in campaign_arguments(invocation, runtime, checkout=checkout, output_root=output_remote))
         command = (
             "set -eu; chmod 600 " + shlex.quote(token_remote) + "; "
             + "git clone --no-checkout " + shlex.quote(bundle_remote) + " " + shlex.quote(checkout) + "; "
@@ -440,28 +577,12 @@ def stage_launch_sync_evaluation(manifest_path: Path, instance_receipt: Mapping[
             + "test \"$LEHOME_POLICY_DEVICE_POOL\" = cuda:0,cuda:1,cuda:2,cuda:3; "
             + "timeout --signal=TERM --kill-after=20s " + str(remaining_seconds) + "s "
             + corrective._controller_pythonpath(checkout, wire_target=wire_target) + " /opt/lehome-challenge/.venv/bin/python -m scripts.run_groot_flywheel_campaign"
-            + " --matrix " + shlex.quote(checkout + "/" + str(runtime["matrix_path"]))
-            + " --public-unseen-tops --execution-mode policy_server --device cpu --workers 4"
-            + " --policy-device cuda:0"
-            + " --policy-repo " + shlex.quote(str(invocation["policy_repo"]))
-            + " --policy-revision-file " + shlex.quote(policy_root + "/revision.txt")
-            + " --policy-path " + shlex.quote(policy_path)
-            + " --policy-step " + str(invocation["policy_step"])
-            + " --policy-artifact-sha256 " + shlex.quote(str(invocation["policy_artifact_sha256"]))
-            + " --code-revision " + shlex.quote(str(invocation["code_revision"]))
-            + " --asset-revision " + shlex.quote(str(invocation["asset_revision"]))
-            + " --release-assets-root " + shlex.quote(checkout + "/" + str(runtime["release_assets_root"]))
-            + " --simulator-version " + shlex.quote(str(invocation["simulator_version"]))
-            + " --image-identity " + shlex.quote(APPROVED_IMAGE_DIGEST)
-            + " --groot-root " + shlex.quote(str(runtime["groot_root"]))
-            + " --groot-revision " + shlex.quote(str(invocation["groot_revision"]))
-            + " --groot-python " + shlex.quote(str(invocation["groot_python"]))
-            + " --output-root " + shlex.quote(output_remote)
+            + " " + arguments
         )
         launched = runner(ssh + ("sh", "-lc", command))
         sync_root = lifecycle_root / f"synced-{instance_id}"
         sync_attempted = True
-        sync = runner(("scp", "-r", "-i", identity_file, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", port, f"{remote}:{output_remote}/.", str(sync_root)))
+        sync = runner(("scp", "-r", "-i", identity_file, *transport_options, "-P", port, f"{remote}:{output_remote}/.", str(sync_root)))
         if getattr(launched, "returncode", 0) not in (0, None) or getattr(sync, "returncode", 0) not in (0, None):
             raise RuntimeError("remote launch or evidence synchronization failed")
         return _write_new(lifecycle_root / f"launch-{instance_id}.json", {
@@ -476,7 +597,7 @@ def stage_launch_sync_evaluation(manifest_path: Path, instance_receipt: Mapping[
             # copy is intentionally best-effort and never carries token bytes
             # into a receipt; disposal remains mandatory either way.
             sync_attempted = True
-            runner(("scp", "-r", "-i", _ssh_identity(), "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-P", port, f"{remote}:{output_remote}/.", str(lifecycle_root / f"synced-failure-{instance_id}")))
+            runner(("scp", "-r", "-i", _ssh_identity(), *transport_options, "-P", port, f"{remote}:{output_remote}/.", str(lifecycle_root / f"synced-failure-{instance_id}")))
         _cleanup_failure(instance_id, lifecycle_root, runner, "remote_launch_failure", sync_attempted=sync_attempted)
         raise RuntimeError("remote launch failed; available evidence synchronized and instance disposed") from error
 
@@ -485,8 +606,10 @@ def _publication(path: Path) -> dict[str, object]:
     return _read_json(path, "publication receipt")
 
 
-def destroy_after_publication(instance_id: int, publication_receipt: Path, instance_receipt: Path, *, runner: Callable[[tuple[str, ...]], object]) -> bool:
+def destroy_after_publication(instance_id: int, publication_receipt: Path, instance_receipt: Path, *, disposal_receipt: Path, runner: Callable[[tuple[str, ...]], object], absence_polls: int = 60, sleep: Callable[[float], None] = time.sleep) -> dict[str, object]:
     """Destroy only after a private immutable, tree-listed, fresh-readback publication."""
+    if not disposal_receipt.is_absolute() or disposal_receipt.exists() or disposal_receipt.is_symlink():
+        raise ValueError("disposal receipt must be an absent absolute path")
     publication = _publication(publication_receipt)
     instance = _read_json(instance_receipt, "instance receipt")
     invocation = publication.get("invocation")
@@ -502,11 +625,39 @@ def destroy_after_publication(instance_id: int, publication_receipt: Path, insta
         or not isinstance(publication.get("remote_prefix"), str) or not publication["remote_prefix"]
     ):
         raise ValueError("publication receipt is not an exact immutable instance/invocation readback binding")
-    runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
-    exact_empty, instances_empty, volumes_empty = _verify_absent(instance_id, runner)
+    try:
+        runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+    except BaseException:
+        _write_new(disposal_receipt, {
+            "schema_version": 1, "kind": "groot_checkpoint_evaluation_disposal",
+            "instance_id": instance_id, "destroyed_and_absent": False, "destroy_failed": True,
+            "publication_receipt_sha256": hashlib.sha256(publication_receipt.read_bytes()).hexdigest(),
+            "instance_receipt_sha256": hashlib.sha256(instance_receipt.read_bytes()).hexdigest(),
+            "immutable_revision": publication["immutable_revision"], "remote_prefix": publication["remote_prefix"],
+        })
+        raise
+    exact_empty, instances_empty, volumes_empty = _verify_absent(instance_id, runner, polls=absence_polls, sleep=sleep)
     if not all((exact_empty, instances_empty, volumes_empty)):
+        _write_new(disposal_receipt, {
+            "schema_version": 1, "kind": "groot_checkpoint_evaluation_disposal",
+            "instance_id": instance_id,
+            "publication_receipt_sha256": hashlib.sha256(publication_receipt.read_bytes()).hexdigest(),
+            "instance_receipt_sha256": hashlib.sha256(instance_receipt.read_bytes()).hexdigest(),
+            "immutable_revision": publication["immutable_revision"], "remote_prefix": publication["remote_prefix"],
+            "instance_absent": exact_empty, "account_instances_empty": instances_empty,
+            "account_volumes_empty": volumes_empty, "destroyed_and_absent": False,
+            "absence_unverified": True,
+        })
         raise ValueError("publication disposal did not empty the exact provider account")
-    return True
+    return _write_new(disposal_receipt, {
+        "schema_version": 1, "kind": "groot_checkpoint_evaluation_disposal",
+        "instance_id": instance_id,
+        "publication_receipt_sha256": hashlib.sha256(publication_receipt.read_bytes()).hexdigest(),
+        "instance_receipt_sha256": hashlib.sha256(instance_receipt.read_bytes()).hexdigest(),
+        "immutable_revision": publication["immutable_revision"], "remote_prefix": publication["remote_prefix"],
+        "instance_absent": exact_empty, "account_instances_empty": instances_empty,
+        "account_volumes_empty": volumes_empty, "destroyed_and_absent": True,
+    })
 
 
 def compare_checkpoint_invocations(one: Mapping[str, object], two: Mapping[str, object]) -> dict[str, tuple[object, object]]:
@@ -528,7 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
     actions = parser.add_subparsers(dest="action", required=True)
     rent = actions.add_parser("rent"); rent.add_argument("--manifest", type=Path, required=True); rent.add_argument("--lifecycle-root", type=Path, required=True); rent.add_argument("--execute", action="store_true")
     launch = actions.add_parser("stage-launch-sync"); launch.add_argument("--manifest", type=Path, required=True); launch.add_argument("--instance-receipt", type=Path, required=True); launch.add_argument("--lifecycle-root", type=Path, required=True); launch.add_argument("--code-git-bundle", type=Path, required=True); launch.add_argument("--token-file", type=Path, required=True); launch.add_argument("--execute", action="store_true")
-    destroy = actions.add_parser("destroy"); destroy.add_argument("--instance-id", type=int, required=True); destroy.add_argument("--publication-receipt", type=Path, required=True); destroy.add_argument("--instance-receipt", type=Path, required=True); destroy.add_argument("--execute", action="store_true")
+    destroy = actions.add_parser("destroy"); destroy.add_argument("--instance-id", type=int, required=True); destroy.add_argument("--publication-receipt", type=Path, required=True); destroy.add_argument("--instance-receipt", type=Path, required=True); destroy.add_argument("--disposal-receipt", type=Path, required=True); destroy.add_argument("--execute", action="store_true")
     return parser
 
 
@@ -539,7 +690,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.action == "rent": result = rent_evaluation(args.manifest, lifecycle_root=args.lifecycle_root, runner=_subprocess_runner)
     elif args.action == "stage-launch-sync": result = stage_launch_sync_evaluation(args.manifest, _read_json(args.instance_receipt, "instance receipt"), lifecycle_root=args.lifecycle_root, runner=_subprocess_runner, code_bundle=args.code_git_bundle, token_file=args.token_file)
-    else: result = {"destroyed": destroy_after_publication(args.instance_id, args.publication_receipt, args.instance_receipt, runner=_subprocess_runner)}
+    else: result = destroy_after_publication(args.instance_id, args.publication_receipt, args.instance_receipt, disposal_receipt=args.disposal_receipt, runner=_subprocess_runner)
     print(json.dumps(result, sort_keys=True))
     return 0
 
