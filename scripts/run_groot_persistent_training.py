@@ -1371,8 +1371,118 @@ def _validated_runtime_pilot(path_value: object) -> dict[str, object]:
 
 def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> None:
     """Validate direct-GPU immutable source bindings before provider create."""
+    if "training_capability" in request:
+        raise ValueError("direct runtime GPU rent derives capability on its single lease")
     _runtime_campaign_binding(request)
     _runtime_parent_checkpoint(request)
+    bundle = request.get("code_bundle")
+    receipt = request.get("code_bundle_sha256_file")
+    if type(bundle) is not str or type(receipt) is not str:
+        raise ValueError("runtime GPU rent requires the reviewed code bundle and checksum")
+    if _verify_reviewed_code_bundle(
+        Path(bundle), Path(receipt), request.get("code_revision"),
+    ) != request.get("code_bundle_sha256"):
+        raise ValueError("runtime GPU rent code bundle differs from its immutable binding")
+    output = request.get("bootstrap_capability_receipt")
+    if (
+        type(output) is not str or not Path(output).is_absolute()
+        or Path(output).exists() or Path(output).is_symlink()
+    ):
+        raise ValueError("runtime GPU rent requires an absent bootstrap capability receipt")
+
+
+def _runtime_gpu_bootstrap_capability(
+    *, instance: Mapping[str, object], request: Mapping[str, object],
+    identity: Mapping[str, object], runner: Runner,
+) -> dict[str, object]:
+    """Probe the reviewed image on this lease before GPU warm-up can proceed."""
+    bundle = Path(str(request["code_bundle"]))
+    receipt = Path(str(request["code_bundle_sha256_file"]))
+    bundle_sha = _verify_reviewed_code_bundle(bundle, receipt, request.get("code_revision"))
+    if bundle_sha != request.get("code_bundle_sha256"):
+        raise ValueError("runtime GPU bootstrap code bundle differs from its immutable binding")
+    remote = "/tmp/lehome-runtime-gpu-bootstrap"
+    runner((*_ssh_prefix(instance), "set -eu; rm -rf " + remote + " /prepared/bootstrap-code; mkdir -p " + remote))
+    runner((*_scp_prefix(instance), str(bundle), "root@" + str(instance["host"]) + ":" + remote + "/code.bundle"))
+    observed = runner((*_ssh_prefix(instance), "sha256sum " + remote + "/code.bundle")).strip().split()
+    if not observed or observed[0] != bundle_sha:
+        raise ValueError("runtime GPU bootstrap code bundle readback failed")
+    command = (
+        "set -eu; git clone --quiet --no-checkout " + remote + "/code.bundle /prepared/bootstrap-code; "
+        "git -C /prepared/bootstrap-code checkout --quiet --detach " + str(request["code_revision"]) + "; "
+        "test \"$(git -C /prepared/bootstrap-code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; "
+        "test -z \"$(git -C /prepared/bootstrap-code status --porcelain)\"; "
+        "env -u HF_TOKEN PYTHONPATH=/prepared/bootstrap-code/source/lehome:/prepared/bootstrap-code/trainer/src "
+        "lehome-train validate-training-capability --one-step --image-digest "
+        + BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
+    )
+    try:
+        capability = json.loads(runner((*_ssh_prefix(instance), command)))
+    except json.JSONDecodeError as error:
+        raise ValueError("runtime GPU bootstrap capability probe did not return JSON") from error
+    if not isinstance(capability, Mapping):
+        raise ValueError("runtime GPU bootstrap capability probe did not return a receipt")
+    validated = dict(validate_training_capability(capability))
+    outer = {
+        "schema_version": 1, "kind": "runtime_mixture_gpu_bootstrap_capability",
+        "instance_id": instance["instance_id"],
+        "provider_response_sha256": instance["provider_response_sha256"],
+        "platform_arch": "x86_64", "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+        "code_revision": request["code_revision"], "code_bundle_sha256": bundle_sha,
+        "bc_revision": identity["bc"]["immutable_revision"],
+        "bc_receipt_sha256": identity["bc_receipt_sha256"],
+        "rollout_revision": identity["rollout"]["immutable_revision"],
+        "rollout_prefix": identity["rollout"]["remote_prefix"],
+        "rollout_receipt_sha256": identity["rollout_receipt_sha256"],
+        "deployment_revision": identity["deployment"]["immutable_revision"],
+        "mixture_id": identity["deployment"]["mixture_id"],
+        "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
+        "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
+        "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+        "training_capability": validated,
+    }
+    atomic_write_json(Path(str(request["bootstrap_capability_receipt"])), outer)
+    return outer
+
+
+def _runtime_gpu_bootstrap_capability_receipt(
+    *, path: Path, instance: Mapping[str, object], request: Mapping[str, object],
+    identity: Mapping[str, object],
+) -> dict[str, object]:
+    """Require the same-lease one-step probe before staging or measuring."""
+    value = dict(_load_regular_json(path, "runtime GPU bootstrap capability receipt"))
+    expected = {
+        "schema_version": 1, "kind": "runtime_mixture_gpu_bootstrap_capability",
+        "instance_id": instance.get("instance_id"),
+        "provider_response_sha256": instance.get("provider_response_sha256"),
+        "platform_arch": "x86_64", "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+        "code_revision": request.get("code_revision"),
+        "code_bundle_sha256": request.get("code_bundle_sha256"),
+        "bc_revision": identity["bc"]["immutable_revision"],
+        "bc_receipt_sha256": identity["bc_receipt_sha256"],
+        "rollout_revision": identity["rollout"]["immutable_revision"],
+        "rollout_prefix": "rollouts/round-1",
+        "rollout_receipt_sha256": identity["rollout_receipt_sha256"],
+        "deployment_revision": identity["deployment"]["immutable_revision"],
+        "mixture_id": identity["deployment"]["mixture_id"],
+        "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
+        "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
+        "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+    }
+    if (
+        set(value) != set(expected) | {"training_capability"}
+        or any(value.get(key) != expected_value for key, expected_value in expected.items())
+    ):
+        raise ValueError("runtime GPU bootstrap capability receipt is not bound to this lease and campaign")
+    try:
+        validate_training_capability(value.get("training_capability"))
+    except (TypeError, ValueError) as error:
+        raise ValueError("runtime GPU bootstrap capability receipt is invalid") from error
+    if sha256_file(path) != instance.get("capability_sha256"):
+        raise ValueError("runtime GPU instance does not bind its same-lease bootstrap capability receipt")
+    return value
 
 
 def _runtime_gpu_pilot_preflight(*, pilot: Mapping[str, object], request: Mapping[str, object], identity: Mapping[str, object]) -> None:
@@ -1552,6 +1662,7 @@ def _validated_runtime_gpu_warmup_lifecycle(
         or warmup.get("instance_id") != instance.get("instance_id")
         or warmup.get("provider_response_sha256") != instance.get("provider_response_sha256")
         or warmup.get("capability_sha256") != instance.get("capability_sha256")
+        or warmup.get("bootstrap_capability_receipt_sha256") != instance.get("capability_sha256")
         or warmup.get("code_revision") != request.get("code_revision")
         or warmup.get("code_bundle_sha256") != request.get("code_bundle_sha256")
         or warmup.get("parent_checkpoint_artifact_sha256") != PARENT_CHECKPOINT["artifact_sha256"]
@@ -1568,6 +1679,12 @@ def run_runtime_gpu_warmup(
     """Invoke the measured direct-GPU adapter after immutable identity checks."""
     _runtime_gpu_warmup_instance(instance)
     identity = _runtime_identity(instance, request)
+    capability_path = request.get("bootstrap_capability_receipt")
+    if type(capability_path) is not str:
+        raise ValueError("runtime GPU warm-up requires the same-lease bootstrap capability receipt")
+    _runtime_gpu_bootstrap_capability_receipt(
+        path=Path(capability_path), instance=instance, request=request, identity=identity,
+    )
     binding_path = request.get("runtime_warmup_binding")
     output = request.get("warmup_lifecycle_receipt")
     if type(binding_path) is not str or type(output) is not str or not Path(output).is_absolute() or Path(output).exists() or Path(output).is_symlink():
@@ -1590,6 +1707,7 @@ def run_runtime_gpu_warmup(
         "instance_id": instance["instance_id"], "provider_response_sha256": instance["provider_response_sha256"],
         "platform_arch": "x86_64", "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
         "capability_sha256": instance["capability_sha256"], "code_revision": request["code_revision"],
+        "bootstrap_capability_receipt_sha256": instance["capability_sha256"],
         "code_bundle_sha256": request["code_bundle_sha256"], "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
         "deployment_revision": identity["deployment"]["immutable_revision"],
         "runtime_warmup_binding": binding, "warmup_receipt": dict(remote),
@@ -1603,19 +1721,26 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
     """Promote only a fresh capable interruptible PRO6000 lease for warm-up."""
     _runtime_failure_receipt_path(evidence)
     _runtime_gpu_rent_preflight(evidence)
-    rented = rent(evidence=evidence, runner=runner, abort_request=evidence)
+    rented = rent(
+        evidence=evidence, runner=runner, require_capability=False,
+        abort_request=evidence,
+    )
     try:
         _attest_platform_arch(rented, runner=runner)
+        identity = _runtime_campaign_binding(evidence)
+        outer = _runtime_gpu_bootstrap_capability(
+            instance=rented, request=evidence, identity=identity, runner=runner,
+        )
     except BaseException as error:
         _runtime_abort_cleanup(instance=rented, request=evidence, error=error, runner=runner)
         raise
-    capability = evidence.get("training_capability")
-    if not isinstance(capability, Mapping):
-        raise ValueError("runtime GPU warm-up requires a capability receipt")
     return {
         **rented, "kind": "runtime_mixture_gpu_warmup_instance", "platform_arch": "x86_64",
         "image_digest": BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
-        "capability_sha256": _hash(dict(capability)),
+        "capability_sha256": sha256_file(Path(str(evidence["bootstrap_capability_receipt"]))),
+        "bootstrap_capability_receipt_sha256": sha256_file(
+            Path(str(evidence["bootstrap_capability_receipt"]))
+        ),
     }
 
 
@@ -2122,9 +2247,16 @@ def _runtime_bootstrap_receipt(*, path: Path, instance: Mapping[str, object], re
         "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
     }
     if instance.get("kind") == "runtime_mixture_gpu_warmup_instance":
+        capability_path = request.get("bootstrap_capability_receipt")
+        if type(capability_path) is not str:
+            raise ValueError("runtime bootstrap receipt lacks the same-lease capability receipt")
+        _runtime_gpu_bootstrap_capability_receipt(
+            path=Path(capability_path), instance=instance, request=request, identity=identity,
+        )
         expected |= {
             "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
             "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+            "bootstrap_capability_receipt_sha256": sha256_file(Path(capability_path)),
         }
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise ValueError("runtime bootstrap stage is not bound to its direct runtime instance")
@@ -2164,6 +2296,16 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
         raise ValueError("runtime bootstrap code bundle differs from the reviewed bundle")
     _read_private_token(str(request["token_file"]))
     parent = None if is_cpu_diagnostic else _runtime_parent_checkpoint(request)
+    bootstrap_capability = None
+    bootstrap_capability_sha = None
+    if parent is not None:
+        capability_path = request.get("bootstrap_capability_receipt")
+        if type(capability_path) is not str:
+            raise ValueError("runtime bootstrap stage requires the same-lease capability receipt")
+        bootstrap_capability = _runtime_gpu_bootstrap_capability_receipt(
+            path=Path(capability_path), instance=instance, request=request, identity=identity,
+        )
+        bootstrap_capability_sha = sha256_file(Path(capability_path))
     hydrate = _runtime_envelope(Path(str(request["runtime_hydrate_request"])), command="hydrate-runtime-mixture", fields={"deployment_receipt", "source_readback_receipts", "destination", "mounts_descriptor"}, label="runtime hydration request")
     if hydrate["deployment_receipt"] != "/prepared/config/deployment-receipt.json" or hydrate["destination"] != "/prepared/runtime" or hydrate["mounts_descriptor"] != "/prepared/runtime/mounts.json":
         raise ValueError("runtime hydration request paths are not canonical")
@@ -2199,7 +2341,12 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
     runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/config /cache /output; cd " + remote_dir + "; sha256sum -c code.bundle.sha256; mv runtime-hydrate.json /prepared/config/runtime-hydrate.json; " + ("mv runtime-pilot.json /prepared/config/runtime-pilot.json; " if is_cpu_diagnostic else "") + "mv runtime.token /prepared/config/runtime.token; mv bc-readback.json /prepared/config/bc-readback.json; mv rollout-readback.json /prepared/config/rollout-readback.json; mv deployment-receipt.json /prepared/config/deployment-receipt.json; git clone --quiet --no-checkout " + remote_dir + "/code.bundle /prepared/code; git -C /prepared/code checkout --quiet --detach " + str(request["code_revision"]) + "; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -z \"$(git -C /prepared/code status --porcelain)\"; " + parent_setup + "chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code; test ! -e /prepared/runtime"))
     receipt = {"schema_version": 1, "kind": "runtime_mixture_bootstrap_stage", "instance_id": instance["instance_id"], "provider_response_sha256": instance["provider_response_sha256"], "platform_arch": "x86_64", "trainer_image": instance["trainer_image"], "image_digest": instance["image_digest"], "code_revision": request["code_revision"], "code_bundle_sha256": request["code_bundle_sha256"], "bc_revision": identity["bc"]["immutable_revision"], "rollout_revision": identity["rollout"]["immutable_revision"], "deployment_revision": identity["deployment"]["immutable_revision"], "bc_receipt_sha256": identity["bc_receipt_sha256"], "rollout_receipt_sha256": identity["rollout_receipt_sha256"], "deployment_receipt_sha256": identity["deployment_receipt_sha256"], "transfers": transfers}
     if parent is not None:
-        receipt |= {"parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"], "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"]}
+        assert bootstrap_capability is not None and bootstrap_capability_sha is not None
+        receipt |= {
+            "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
+            "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+            "bootstrap_capability_receipt_sha256": bootstrap_capability_sha,
+        }
     atomic_write_json(Path(output), receipt)
     return {"paid_action": True, "action": "runtime-bootstrap-stage", "bootstrap_receipt": receipt}
 

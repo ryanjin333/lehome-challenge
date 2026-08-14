@@ -355,6 +355,38 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     shutil.copyfile(authoring / "release-receipt.json", receipts["deployment"])
     shutil.copyfile(authoring / "source-publication" / "bc-readback.json", receipts["bc"])
     shutil.copyfile(authoring / "source-publication" / "rollout-readback.json", receipts["rollout"])
+    campaign = LIFECYCLE._runtime_campaign_binding({
+        "code_revision": code_revision, "code_bundle_sha256": code_sha256,
+        "bc_readback_receipt": str(receipts["bc"]),
+        "rollout_readback_receipt": str(receipts["rollout"]),
+        "deployment_receipt": str(receipts["deployment"]),
+    })
+    bootstrap_capability = tmp_path / "stage" / "bootstrap-capability.json"
+    bootstrap_capability.write_text(json.dumps({
+        "schema_version": 1, "kind": "runtime_mixture_gpu_bootstrap_capability",
+        "instance_id": 44, "provider_response_sha256": "1" * 64,
+        "platform_arch": "x86_64", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+        "code_revision": code_revision, "code_bundle_sha256": code_sha256,
+        "bc_revision": campaign["bc"]["immutable_revision"],
+        "bc_receipt_sha256": campaign["bc_receipt_sha256"],
+        "rollout_revision": campaign["rollout"]["immutable_revision"],
+        "rollout_prefix": "rollouts/round-1",
+        "rollout_receipt_sha256": campaign["rollout_receipt_sha256"],
+        "deployment_revision": campaign["deployment"]["immutable_revision"],
+        "mixture_id": campaign["deployment"]["mixture_id"],
+        "deployment_receipt_sha256": campaign["deployment_receipt_sha256"],
+        "parent_archive_sha256": LIFECYCLE.PARENT_CHECKPOINT["archive_sha256"],
+        "parent_checkpoint_artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"],
+        "training_capability": {
+            "hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05",
+            "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+            "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0",
+            "optimizer_step": {"passed": True, "loss": .2},
+            "nvml": {"utilization_percent": 90},
+        },
+    }), encoding="utf-8")
+    instance["capability_sha256"] = sha256_file(bootstrap_capability)
     binding = {
         "mixture": {
             "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40,
@@ -425,11 +457,12 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
             "code_revision": code_revision, "code_bundle_sha256": code_sha256,
             "code_bundle": str(bundle), "code_bundle_sha256_file": str(bundle_sha),
             "token_file": str(token), "runtime_hydrate_request": str(hydrate),
-            "parent_checkpoint": str(parent), "bc_readback_receipt": str(receipts["bc"]),
-            "rollout_readback_receipt": str(receipts["rollout"]),
-            "deployment_receipt": str(receipts["deployment"]), "bootstrap_receipt": str(bootstrap),
-        }, runner=runner,
-    )
+                "parent_checkpoint": str(parent), "bc_readback_receipt": str(receipts["bc"]),
+                "rollout_readback_receipt": str(receipts["rollout"]),
+                "deployment_receipt": str(receipts["deployment"]), "bootstrap_receipt": str(bootstrap),
+                "bootstrap_capability_receipt": str(bootstrap_capability),
+            }, runner=runner,
+        )
     assert all("mkdir -p /prepared/config /prepared/runtime" not in command[-1] for command in calls if command[0] == "ssh")
     assert not (prepared / "runtime").exists()
 
@@ -488,6 +521,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
             "rollout_readback_receipt": str(receipts["rollout"]),
             "deployment_receipt": str(receipts["deployment"]),
             "bootstrap_receipt": str(bootstrap),
+            "bootstrap_capability_receipt": str(bootstrap_capability),
             "runtime_warmup_binding": str(binding_path),
             "runtime_warmup_request": str(warmup_request),
             "warmup_launch_config": str(launch_path),
