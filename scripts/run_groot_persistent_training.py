@@ -1675,18 +1675,44 @@ def resume_runtime_checkpoint(
 
 
 def destroy_runtime_checkpoint_completion(
-    *, instance: Mapping[str, object], request: Mapping[str, object], terminal: Mapping[str, object], hub: object, runner: Runner,
+    *, instance: Mapping[str, object], request: Mapping[str, object], terminal: Mapping[str, object], hub: object,
+    runner: Runner, max_absence_polls: int = RUNTIME_ABSENCE_READBACK_POLLS,
+    sleep: Callable[[float], None] = _bounded_sleep,
 ) -> dict[str, object]:
     """Authorize both readbacks before destroying the exact completed GPU lease."""
+    output = _runtime_failure_receipt_path(request)
+    instance_id = instance.get("instance_id")
+    if type(instance_id) is not int:
+        raise ValueError("runtime checkpoint disposal instance is invalid")
+    receipt = {
+        "schema_version": 1, "kind": "runtime_mixture_abort_cleanup", "instance_id": instance_id,
+        "provider_response_sha256": instance.get("provider_response_sha256"),
+        "code_revision": request.get("code_revision"), "code_bundle_sha256": request.get("code_bundle_sha256"),
+        "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+        "error_type": "RuntimeError", "error": "redacted remote failure", "disposable": False,
+    }
+    def record(status: str) -> None:
+        if not output.exists() and not output.is_symlink():
+            atomic_write_json(output, receipt | {"cleanup_status": status})
     identity = _runtime_checkpoint_identity(instance, request)
     from lehome_train.groot.runtime_checkpoint_lifecycle import authorize_runtime_mixture_disposal
-    authorization = authorize_runtime_mixture_disposal(instance_id=str(instance["instance_id"]), terminal=terminal, identity=identity, hub=hub)  # type: ignore[arg-type]
-    runner(("vastai", "destroy", "instance", str(instance["instance_id"]), "--yes"))
-    if not _await_runtime_instance_absence(
-        instance_id=int(instance["instance_id"]), runner=runner,
-    ):
-        raise ValueError("runtime checkpoint destroy absence readback failed")
-    return {"paid_action": True, "destroy_authorized": True, "instance_id": instance["instance_id"], "authorization": authorization}
+    authorization = authorize_runtime_mixture_disposal(instance_id=str(instance_id), terminal=terminal, identity=identity, hub=hub)  # type: ignore[arg-type]
+    try:
+        runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+    except BaseException as error:
+        record("destroy_failed")
+        raise RuntimeError("runtime checkpoint destroy command failed") from error
+    try:
+        absent = _await_runtime_instance_absence(
+            instance_id=instance_id, runner=runner, max_polls=max_absence_polls, sleep=sleep,
+        )
+    except BaseException as error:
+        record("absence_unverified")
+        raise RuntimeError("runtime checkpoint destroy could not verify instance absence") from error
+    if not absent:
+        record("absence_unverified")
+        raise RuntimeError("runtime checkpoint destroy did not verify instance absence")
+    return {"paid_action": True, "destroy_authorized": True, "instance_id": instance_id, "authorization": authorization}
 
 
 class _RuntimeCheckpointHub:
@@ -2950,7 +2976,11 @@ def main_for_test(
         terminal_path = request.get("terminal_receipt")
         if type(terminal_path) is not str:
             raise ValueError("runtime checkpoint disposal requires terminal receipt")
-        return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: destroy_runtime_checkpoint_completion(instance=instance, request=request, terminal=_load_regular_json(Path(terminal_path), "runtime checkpoint terminal"), hub=hub, runner=runner))
+        return destroy_runtime_checkpoint_completion(
+            instance=instance, request=request,
+            terminal=_load_regular_json(Path(terminal_path), "runtime checkpoint terminal"),
+            hub=hub, runner=runner,
+        )
     return remote_action(action=args.action, instance=instance, request=request, runner=runner)
 
 

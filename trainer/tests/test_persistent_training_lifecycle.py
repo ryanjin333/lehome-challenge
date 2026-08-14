@@ -1802,6 +1802,34 @@ def test_runtime_abort_cleanup_times_out_when_destroyed_row_persists(tmp_path: P
     assert json.loads(output.read_text())["cleanup_status"] == "absence_unverified"
 
 
+def test_checkpoint_disposal_persistent_absence_never_double_destroys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once terminal disposal issues destroy, its failure path owns cleanup."""
+    import lehome_train.groot.runtime_checkpoint_lifecycle as checkpoint_lifecycle
+
+    output = tmp_path / "dispose-failure.json"
+    monkeypatch.setattr(LIFECYCLE, "_runtime_checkpoint_identity", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(checkpoint_lifecycle, "authorize_runtime_mixture_disposal", lambda **_kwargs: {"authorized": True})
+    calls: list[tuple[str, ...]] = []
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command == ("vastai", "destroy", "instance", "44", "--yes"):
+            return ""
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return '{"id":44,"actual_status":"exiting"}'
+        raise AssertionError(command)
+
+    with pytest.raises(RuntimeError, match="did not verify instance absence"):
+        LIFECYCLE.destroy_runtime_checkpoint_completion(
+            instance={"instance_id": 44}, request={"failure_receipt": str(output), "code_revision": "a" * 40, "code_bundle_sha256": "b" * 64},
+            terminal={}, hub=object(), runner=runner, max_absence_polls=2, sleep=lambda _: None,
+        )
+
+    assert calls.count(("vastai", "destroy", "instance", "44", "--yes")) == 1
+    assert json.loads(output.read_text())["cleanup_status"] == "absence_unverified"
+
+
 def test_runtime_abort_cleanup_retains_non_disposable_receipt_when_destroy_fails(tmp_path: Path) -> None:
     output = tmp_path / "abort-failed.json"
 
