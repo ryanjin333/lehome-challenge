@@ -14,6 +14,9 @@ from pathlib import Path
 import shutil
 import tempfile
 import time
+import resource
+import statistics
+import sys
 from typing import Any, Iterable, Mapping
 import re
 
@@ -365,9 +368,23 @@ def pilot_from_request(path: str | Path) -> dict[str, Any]:
     if set(request) != {"schema_version", "command", "arguments"} or request.get("schema_version") != 1 or request.get("command") != "pilot-runtime-mixture" or not isinstance(request.get("arguments"), dict):
         raise ValueError("runtime mixture pilot request has an incompatible schema")
     arguments = request["arguments"]
-    expected = {"mixture_manifest", "mounts_descriptor", "sample_count", "worker_counts"}
-    if set(arguments) != expected or type(arguments.get("mixture_manifest")) is not str or type(arguments.get("mounts_descriptor")) is not str or type(arguments.get("sample_count")) is not int or arguments["sample_count"] < 100 or arguments.get("worker_counts") != [0, 1, 4]:
-        raise ValueError("runtime mixture pilot request arguments are incomplete or unknown")
+    expected = {
+        "mixture_manifest", "mounts_descriptor", "sample_count", "worker_counts",
+        "timeout_seconds", "gpu_starvation_floor_samples_per_second",
+    }
+    timeout = arguments.get("timeout_seconds")
+    starvation_floor = arguments.get("gpu_starvation_floor_samples_per_second")
+    if (
+        set(arguments) != expected
+        or type(arguments.get("mixture_manifest")) is not str
+        or type(arguments.get("mounts_descriptor")) is not str
+        or type(arguments.get("sample_count")) is not int
+        or arguments["sample_count"] < 100
+        or arguments.get("worker_counts") != [0, 4, 8, 16, 24]
+        or type(timeout) not in (int, float) or not math.isfinite(float(timeout)) or not 1 <= float(timeout) <= 1800
+        or type(starvation_floor) not in (int, float) or not math.isfinite(float(starvation_floor)) or float(starvation_floor) < 1.0
+    ):
+        raise ValueError("runtime mixture pilot requires the canonical worker sweep, timeout, and conservative starvation floor")
     from lehome_train.groot.runtime_mixture import RangeSourceLoader, RuntimeMixtureDataset, load_runtime_contract
 
     contract = load_runtime_contract(arguments["mixture_manifest"], arguments["mounts_descriptor"])
@@ -379,19 +396,51 @@ def pilot_from_request(path: str | Path) -> dict[str, Any]:
     loader = RangeSourceLoader(contract)
     # Representative real decodes catch camera/h16 contract drift before timing.
     loader.load(bc); loader.load(rollout)
-    timings: dict[str, dict[str, float | int]] = {}
+    timings: dict[str, dict[str, float | int | list[float]]] = {}
     try:
         from torch.utils.data import DataLoader
     except ImportError as error:
         raise RuntimeError("pilot must run inside the pinned trainer Docker image") from error
-    for requested_workers in arguments["worker_counts"]:
+    worker_counts = list(arguments["worker_counts"])
+    requested_workers_index = 0
+    while requested_workers_index < len(worker_counts):
+        requested_workers = worker_counts[requested_workers_index]
         start = time.perf_counter()
+        deadline = start + float(timeout)
         dataset = RuntimeMixtureDataset(contract, processor=_identity_processor, limit=arguments["sample_count"])
         loader_kwargs: dict[str, Any] = {"batch_size": None, "num_workers": requested_workers}
         if requested_workers:
             loader_kwargs["prefetch_factor"] = 2
         iterator = iter(DataLoader(dataset, **loader_kwargs))
-        decoded = sum(1 for _ in range(arguments["sample_count"]) if next(iterator) is not None)
+        latencies: list[float] = []
+        decoded = 0
+        for _ in range(arguments["sample_count"]):
+            sample_start = time.perf_counter()
+            value = next(iterator)
+            latencies.append(time.perf_counter() - sample_start)
+            if value is not None:
+                decoded += 1
+            if time.perf_counter() > deadline:
+                raise TimeoutError("runtime mixture pilot worker sweep exceeded its approved timeout")
         elapsed = time.perf_counter() - start
-        timings[str(requested_workers)] = {"seconds": elapsed, "decoded_samples": decoded, "samples_per_second": decoded / elapsed if elapsed else 0.0, "prefetch_factor": 2 if requested_workers else 0}
-    return {"schema_version": 1, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "processor_contract": "pinned_processor_integration_required", "representative": {"bc_window_id": bc.window_id, "rollout_window_id": rollout.window_id, "three_cameras": True, "action_horizon": ACTION_HORIZON}, "sample_count_per_worker": arguments["sample_count"], "worker_counts": arguments["worker_counts"], "loader_throughput": timings, "cache_cap": loader.cache_cap, "native_x86_required": True, "throughput_verified": False}
+        usage_self = resource.getrusage(resource.RUSAGE_SELF)
+        usage_children = resource.getrusage(resource.RUSAGE_CHILDREN)
+        max_rss = max(usage_self.ru_maxrss, usage_children.ru_maxrss)
+        # Linux reports KiB while macOS reports bytes.  The receipt normalizes
+        # to MiB so one pilot envelope remains portable across native x86 hosts.
+        rss_mib = max_rss / (1024 * 1024 if sys.platform == "darwin" else 1024)
+        timings[str(requested_workers)] = {
+            "seconds": elapsed, "decoded_samples": decoded,
+            "samples_per_second": decoded / elapsed if elapsed else 0.0,
+            "prefetch_factor": 2 if requested_workers else 0,
+            "latency_seconds_p50": statistics.median(latencies),
+            "latency_seconds_p95": sorted(latencies)[min(len(latencies) - 1, math.ceil(len(latencies) * .95) - 1)],
+            "host_cpu_seconds": usage_self.ru_utime + usage_self.ru_stime + usage_children.ru_utime + usage_children.ru_stime,
+            "host_max_rss_mib": rss_mib,
+        }
+        if requested_workers == 24 and timings["24"]["samples_per_second"] > timings["16"]["samples_per_second"]:
+            worker_counts.append(32)
+        requested_workers_index += 1
+    canonical_complete = all(timings[str(workers)]["decoded_samples"] == arguments["sample_count"] for workers in [0, 4, 8, 16, 24])
+    throughput_verified = canonical_complete and timings["24"]["samples_per_second"] >= float(starvation_floor)
+    return {"schema_version": 2, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "gpu_initialized": False, "processor_contract": "pinned_processor_integration_required", "representative": {"bc_window_id": bc.window_id, "rollout_window_id": rollout.window_id, "three_cameras": True, "action_horizon": ACTION_HORIZON}, "sample_count_per_worker": arguments["sample_count"], "worker_counts": worker_counts, "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": timings, "cache_cap": loader.cache_cap, "native_x86_required": True, "timeout_seconds": float(timeout), "gpu_starvation_floor_samples_per_second": float(starvation_floor), "canonical_completion": canonical_complete, "throughput_verified": throughput_verified}

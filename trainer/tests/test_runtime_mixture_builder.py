@@ -127,3 +127,26 @@ def test_selected_150_rejects_legacy_opaque_hash_but_derives_a_new_canonical_art
     derived = {"schema_version": 1, "selection_sha256": canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}), "selected_bindings": rows}
     assert validate_selected_bindings(derived, campaign)["attempt-000"] == "0" * 64
     assert rows == original_rows
+
+
+def test_loader_pilot_requires_the_canonical_x86_worker_sweep_and_starvation_floor(
+    tmp_path: Path,
+) -> None:
+    from lehome_train.groot.runtime_mixture_builder import pilot_from_request
+
+    request = tmp_path / "pilot.json"
+    _write(request, {
+        "schema_version": 1,
+        "command": "pilot-runtime-mixture",
+        "arguments": {
+            "mixture_manifest": "/runtime/mixture.json",
+            "mounts_descriptor": "/runtime/mounts.json",
+            "sample_count": 100,
+            "worker_counts": [0, 1, 4],
+            "timeout_seconds": 60,
+            "gpu_starvation_floor_samples_per_second": 1.0,
+        },
+    })
+
+    with pytest.raises(ValueError, match="canonical"):
+        pilot_from_request(request)
