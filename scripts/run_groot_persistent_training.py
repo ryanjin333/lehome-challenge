@@ -890,6 +890,9 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
         or not staging_root
     ):
         raise ValueError("materialize requires organizer, corrective roots, destination, persistent staging root, and integer seed")
+    video_workers = request.get("video_workers", 4)
+    if type(video_workers) is not int or not 1 <= video_workers <= 8:
+        raise ValueError("materialize video_workers must be an integer from 1 to 8")
     from lehome_train.flywheel.mix import (
         build_mix_plan,
         materialize_mixed_snapshot,
@@ -916,6 +919,7 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
         plan, organizer_root, corrective_roots, destination_root,
         persistent_source_evidence=evidence,
         persistent_staging_root=staging_root,
+        video_workers=video_workers,
     )
     sealed = verify_generation(destination_root)
     if sealed["organizer_training_frames"] * 3 != sealed["rft_training_frames"] * 7:

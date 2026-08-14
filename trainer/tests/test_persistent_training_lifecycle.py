@@ -520,6 +520,37 @@ def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None
     assert (destination.with_name(destination.name + ".generation.json")).is_file()
 
 
+def test_materialize_forwards_optional_video_workers_and_rejects_invalid_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_flywheel_mix import _prepared_source
+    import lehome_train.flywheel.mix as mix
+
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
+    corrective = _prepared_source(tmp_path / "corrective", kind="flywheel", grade="A", episodes=2)
+    receipt = _corrective_release_receipt([corrective], tmp_path / "corrective-release.json")
+    request = {
+        "organizer_root": str(organizer),
+        "corrective_roots": [str(corrective)],
+        "destination": str(tmp_path / "generation"),
+        "persistent_staging_root": str(tmp_path / "resume"),
+        "seed": 1,
+        "organizer_source_evidence": LIFECYCLE.ORGANIZER_SOURCE,
+        "corrective_release_receipt": str(receipt),
+    }
+    seen: list[dict[str, object]] = []
+    monkeypatch.setattr(mix, "materialize_mixed_snapshot", lambda *_args, **kwargs: seen.append(kwargs) or {})
+    monkeypatch.setattr(mix, "verify_generation", lambda _root: {"organizer_training_frames": 7, "rft_training_frames": 3})
+
+    assert LIFECYCLE._materialize(request | {"video_workers": 8})["action"] == "materialize"
+    assert seen[-1]["video_workers"] == 8
+    assert LIFECYCLE._materialize(request)["action"] == "materialize"
+    assert seen[-1]["video_workers"] == 4
+    for invalid in (0, 9, True, 1.0, "8"):
+        with pytest.raises(ValueError, match="video_workers"):
+            LIFECYCLE._materialize(request | {"video_workers": invalid})
+
+
 def test_materialize_allows_exact_existing_destination_for_resume_repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from test_flywheel_mix import _prepared_source
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
