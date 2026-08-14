@@ -1,82 +1,73 @@
-"""Pinned-GR00T entry boundary for the runtime-mixture dataset factory.
-
-It intentionally does not edit or copy NVIDIA's training loop.  The caller
-supplies normal official ``FinetuneConfig`` values; this module replaces only
-the upstream dataset-factory seam and calls the upstream ``run`` unchanged.
-"""
+"""Narrow in-process DatasetFactory substitution for pinned GR00T N1.7."""
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import importlib
-import inspect
 from pathlib import Path
-from typing import Any, Mapping
+import runpy
+import sys
+from typing import Any, Callable
 
-from lehome_train.groot.runtime_mixture import make_dataset_factory
-
-
-def _upstream_surface(module: object) -> tuple[object, object]:
-    config_type = getattr(module, "FinetuneConfig", None)
-    run = getattr(module, "run", None)
-    if not callable(config_type) or not callable(run):
-        raise ValueError("pinned GR00T FinetuneConfig or run integration symbol is missing")
-    return config_type, run
+from lehome_train.groot.runtime_mixture import runtime_dataset_factory_class
 
 
-def _accepts_dataset_factory(config_type: object) -> None:
-    """Reject a drifted upstream API rather than monkeypatching it."""
-
-    try:
-        signature = inspect.signature(config_type)
-    except (TypeError, ValueError) as error:
-        raise ValueError("pinned GR00T dataset factory integration symbol is not inspectable") from error
-    if "dataset_factory" in signature.parameters:
-        return
-    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
-        return
-    raise ValueError("pinned GR00T dataset factory integration symbol is missing")
+PINNED_SETUP_SHA256 = "bdc3cf8a6b9c92a0e3f46d79dc3de05b0a8c70c4289d44ac0aa1c75698a93f31"
 
 
-def run_runtime_mixture_finetune(
-    official_config: Mapping[str, object],
-    *,
-    mixture_manifest: str | Path,
-    window_index: str | Path,
-    mounts_descriptor: str | Path,
-    resume_sample_offset: int = 0,
-    upstream_module: object | None = None,
-) -> Any:
-    """Build official config fields unchanged, except for ``dataset_factory``.
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    ``window_index`` is checked against the manifest by ``make_dataset_factory``;
-    receiving it explicitly prevents a caller from accidentally believing a
-    different index is selected.  It is not injected into GR00T configuration.
+
+def run_official_launcher(*, official_launch: str | Path, setup_module: object, setup_sha256: str, mixture_manifest: str | Path, window_index: str | Path, mounts_descriptor: str | Path, resume_sample_offset: int = 0, official_argv: list[str] | None = None, runner: Callable[[str, list[str]], Any] | None = None, hash_file: Callable[[Path], str] = _sha256) -> Any:
+    """Run the unchanged official script while replacing exactly one local symbol.
+
+    The replacement is restored even when Tyro/configuration/training raises.
+    No config fields are fabricated and no other GR00T import is patched.
     """
-
-    if resume_sample_offset < 0:
-        raise ValueError("resume sample offset must be nonnegative")
-    manifest = Path(mixture_manifest)
-    if upstream_module is None:
-        try:
-            upstream_module = importlib.import_module("gr00t.experiment.launch_finetune")
-        except ImportError as error:
-            raise ValueError("pinned GR00T launch_finetune module is unavailable") from error
-    config_type, run = _upstream_surface(upstream_module)
-    _accepts_dataset_factory(config_type)
-    factory = make_dataset_factory(
-        mixture_manifest=manifest,
-        mounts_descriptor=mounts_descriptor,
-        global_sample_offset=resume_sample_offset,
-        expected_window_index=window_index,
-    )
-    values = dict(official_config)
-    if "dataset_factory" in values:
-        raise ValueError("official config must not override the runtime dataset factory")
-    values["dataset_factory"] = factory
-    # Construction fails closed if the checked pinned class does not expose the
-    # narrowly expected injection seam. No attributes are patched afterwards.
+    launch = Path(official_launch)
+    if resume_sample_offset < 0 or hash_file(launch.parent.parent / "model" / "gr00t_n1d7" / "setup.py") != setup_sha256:
+        raise ValueError("pinned GR00T setup hash mismatch")
+    original = getattr(setup_module, "DatasetFactory", None)
+    if original is None:
+        raise ValueError("pinned GR00T DatasetFactory symbol is missing")
+    replacement = runtime_dataset_factory_class(mixture_manifest=mixture_manifest, window_index=window_index, mounts_descriptor=mounts_descriptor, global_sample_offset=resume_sample_offset)
+    setattr(setup_module, "DatasetFactory", replacement)
     try:
-        config = config_type(**values)
-    except (TypeError, ValueError) as error:
-        raise ValueError("pinned GR00T config rejected runtime dataset factory") from error
-    return run(config)
+        argv = list(official_argv or [])
+        if runner is not None:
+            return runner(str(launch), argv)
+        previous = sys.argv
+        sys.argv = [str(launch), *argv]
+        try:
+            return runpy.run_path(str(launch), run_name="__main__")
+        finally:
+            sys.argv = previous
+    finally:
+        setattr(setup_module, "DatasetFactory", original)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mixture-manifest", required=True)
+    parser.add_argument("--window-index", required=True)
+    parser.add_argument("--mounts-descriptor", required=True)
+    parser.add_argument("--resume-sample-offset", type=int, default=0)
+    parser.add_argument("--official-launch", required=True)
+    parser.add_argument("official_args", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    checkout = Path(args.official_launch).resolve().parents[2]
+    sys.path.insert(0, str(checkout))
+    setup = importlib.import_module("gr00t.model.gr00t_n1d7.setup")
+    original = args.official_args[1:] if args.official_args[:1] == ["--"] else args.official_args
+    run_official_launcher(official_launch=args.official_launch, setup_module=setup, setup_sha256=PINNED_SETUP_SHA256, mixture_manifest=args.mixture_manifest, window_index=args.window_index, mounts_descriptor=args.mounts_descriptor, resume_sample_offset=args.resume_sample_offset, official_argv=original)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

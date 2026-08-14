@@ -131,9 +131,7 @@ def build_launch(
     visible_gpus = _require_visible_gpus(visible_devices, expected_count=config.num_gpus)
     safe_environment = _safe_environment(environment, visible_devices=visible_gpus)
     entrypoint = _official_entrypoint(official_checkout, safe_environment)
-    command = (
-        sys.executable,
-        str(entrypoint),
+    official_args = (
         "--base-model-path",
         config.base_model_path,
         "--dataset-path",
@@ -176,6 +174,24 @@ def build_launch(
             )
         ),
     )
+    command = (sys.executable, str(entrypoint), *official_args)
+    if config.runtime_mixture_manifest is not None:
+        assert config.runtime_window_index is not None
+        assert config.runtime_mounts_descriptor is not None
+        command = (
+            sys.executable,
+            "-m",
+            "lehome_train.groot.runtime_mixture_entrypoint",
+            "--mixture-manifest", config.runtime_mixture_manifest,
+            "--window-index", config.runtime_window_index,
+            "--mounts-descriptor", config.runtime_mounts_descriptor,
+            "--resume-sample-offset", str(config.runtime_resume_sample_offset),
+            "--official-launch", str(entrypoint),
+            "--",
+            *official_args,
+        )
+        safe_environment = dict(safe_environment)
+        safe_environment["PYTHONPATH"] = str(Path(official_checkout))
     return OfficialLaunch(
         command=command,
         environment=safe_environment,

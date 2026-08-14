@@ -1,52 +1,33 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
 
-def test_entrypoint_injects_only_dataset_factory_and_preserves_config() -> None:
-    from lehome_train.groot.runtime_mixture_entrypoint import run_runtime_mixture_finetune
+def test_factory_replacement_is_narrow_and_is_restored_after_official_runner(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_entrypoint import run_official_launcher
 
-    received: dict[str, object] = {}
+    setup = type("Setup", (), {"DatasetFactory": object})
+    original = setup.DatasetFactory
+    seen: dict[str, object] = {}
 
-    def run(config: object) -> str:
-        received["config"] = config
-        return "ran"
+    def runner(path: str, argv: list[str]) -> None:
+        seen["path"], seen["argv"], seen["factory"] = path, argv, setup.DatasetFactory
 
-    upstream = SimpleNamespace(FinetuneConfig=lambda **kwargs: SimpleNamespace(**kwargs), run=run)
-    result = run_runtime_mixture_finetune(
-        {"model_path": "/model", "max_steps": 12, "dataset_path": "/old", "tune_llm": False},
+    run_official_launcher(
+        official_launch=tmp_path / "launch_finetune.py", setup_module=setup, setup_sha256="a" * 64,
         mixture_manifest="mixture.json", window_index="windows.json", mounts_descriptor="mounts.json", resume_sample_offset=64,
-        upstream_module=upstream,
+        runner=runner, hash_file=lambda _path: "a" * 64,
     )
-    assert result == "ran"
-    config = received["config"]
-    assert config.model_path == "/model"
-    assert config.max_steps == 12
-    assert config.dataset_path == "/old"
-    assert callable(config.dataset_factory)
-    assert not hasattr(config, "runtime_mixture_manifest")
-    assert not hasattr(config, "resume_sample_offset")
+    assert seen["factory"] is not original
+    assert setup.DatasetFactory is original
+    assert seen["argv"] == []
 
 
-def test_entrypoint_fails_closed_when_pinned_surface_drifts() -> None:
-    from lehome_train.groot.runtime_mixture_entrypoint import run_runtime_mixture_finetune
+def test_entrypoint_refuses_setup_hash_drift_before_patch(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_entrypoint import run_official_launcher
 
-    with pytest.raises(ValueError, match="factory|run|FinetuneConfig"):
-        run_runtime_mixture_finetune({}, mixture_manifest="m", window_index="w", mounts_descriptor="d", upstream_module=object())
-
-
-def test_entrypoint_rejects_the_official_style_config_without_an_injection_seam() -> None:
-    from lehome_train.groot.runtime_mixture_entrypoint import run_runtime_mixture_finetune
-
-    @dataclass
-    class OfficialStyleConfig:
-        dataset_path: str
-
-    with pytest.raises(ValueError, match="dataset factory"):
-        run_runtime_mixture_finetune(
-            {"dataset_path": "/old"}, mixture_manifest="m", window_index="w", mounts_descriptor="d",
-            upstream_module=SimpleNamespace(FinetuneConfig=OfficialStyleConfig, run=lambda _config: None),
-        )
+    setup = type("Setup", (), {"DatasetFactory": object})
+    with pytest.raises(ValueError, match="setup hash"):
+        run_official_launcher(official_launch=tmp_path / "launch_finetune.py", setup_module=setup, setup_sha256="a" * 64, mixture_manifest="m", window_index="w", mounts_descriptor="d", hash_file=lambda _path: "b" * 64)

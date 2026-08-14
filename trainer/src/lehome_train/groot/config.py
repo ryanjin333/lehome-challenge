@@ -72,6 +72,10 @@ class FineTuneLaunchConfig:
     parent_checkpoint_revision: str | None = None
     parent_checkpoint_subpath: str | None = None
     parent_checkpoint_artifact_sha256: str | None = None
+    runtime_mixture_manifest: str | None = None
+    runtime_window_index: str | None = None
+    runtime_mounts_descriptor: str | None = None
+    runtime_resume_sample_offset: int = 0
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -152,6 +156,19 @@ class FineTuneLaunchConfig:
                 raise ValueError("parent checkpoint artifact SHA-256 is invalid")
             if not Path(self.base_model_path).is_absolute():
                 raise ValueError("parent checkpoint base_model_path must be absolute")
+        runtime_fields = (
+            self.runtime_mixture_manifest,
+            self.runtime_window_index,
+            self.runtime_mounts_descriptor,
+        )
+        if any(field is not None for field in runtime_fields) and not all(field is not None for field in runtime_fields):
+            raise ValueError("runtime mixture manifest, window index, and mounts descriptor must be complete")
+        if all(field is not None for field in runtime_fields):
+            for field_name, field in zip(("runtime_mixture_manifest", "runtime_window_index", "runtime_mounts_descriptor"), runtime_fields, strict=True):
+                if type(field) is not str or not Path(field).is_absolute():
+                    raise ValueError(f"{field_name} must be an absolute path")
+        if type(self.runtime_resume_sample_offset) is not int or self.runtime_resume_sample_offset < 0:
+            raise ValueError("runtime_resume_sample_offset must be nonnegative")
         if not self.tune_projector:
             raise ValueError("tune_projector must be true")
         if not self.tune_diffusion_model:
@@ -218,6 +235,10 @@ class FineTuneLaunchConfig:
             "parent_checkpoint_revision": self.parent_checkpoint_revision,
             "parent_checkpoint_subpath": self.parent_checkpoint_subpath,
             "parent_checkpoint_artifact_sha256": self.parent_checkpoint_artifact_sha256,
+            "runtime_mixture_manifest": self.runtime_mixture_manifest,
+            "runtime_window_index": self.runtime_window_index,
+            "runtime_mounts_descriptor": self.runtime_mounts_descriptor,
+            "runtime_resume_sample_offset": self.runtime_resume_sample_offset,
         }
 
     def sample_presentations_for_optimizer_steps(self, optimizer_steps: int) -> int:
