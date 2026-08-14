@@ -806,6 +806,107 @@ def _copy_selected_video(source: Path, destination: Path, *, start: int, stop: i
     copy_video(source, destination, steps=list(range(start, stop)))
 
 
+def _source_camera_keys(source: _PreparedSource, info: Mapping[str, Any]) -> dict[str, str]:
+    """Resolve canonical target cameras through the source's sealed schema."""
+
+    schema = source.manifest.get("camera_schema")
+    features = info.get("features")
+    pattern = info.get("video_path")
+    if (
+        not isinstance(schema, list)
+        or not isinstance(features, Mapping)
+        or not isinstance(pattern, str)
+        or "{video_key}" not in pattern
+    ):
+        raise ValueError("prepared mix source has no canonical camera/video path contract")
+    result: dict[str, str] = {}
+    for camera in _CAMERAS:
+        expected = f"observation.images.{camera}"
+        candidates: list[tuple[str, Mapping[str, Any]]] = []
+        for item in schema:
+            if not isinstance(item, Mapping):
+                continue
+            source_key = item.get("source_key")
+            target = item.get("target_modality")
+            if not isinstance(source_key, str):
+                continue
+            if target == camera or (target is None and source_key == expected):
+                candidates.append((source_key, item))
+        if len(candidates) != 1 or candidates[0][0] != expected:
+            raise ValueError("prepared mix source camera schema is missing or ambiguous")
+        # Older sealed per-episode materializations leave info.features empty
+        # but carry the same typed camera contract in manifest.camera_schema.
+        # This is accepted only for that writer's pinned legacy contract; new
+        # canonical sources must name the feature explicitly.
+        if not features and not _legacy_per_episode_video_layout(source, info):
+            raise ValueError("prepared mix source has no canonical camera feature contract")
+        feature = candidates[0][1] if not features else features.get(candidates[0][0])
+        if (
+            not isinstance(feature, Mapping)
+            or feature.get("dtype") != "video"
+            or feature.get("shape") != [480, 640, 3]
+        ):
+            raise ValueError("prepared mix source camera feature is not canonical video")
+        result[camera] = candidates[0][0]
+    return result
+
+
+def _legacy_per_episode_video_layout(source: _PreparedSource, info: Mapping[str, Any]) -> bool:
+    """Recognize the sealed Task-1 layout emitted before ``info.features``.
+
+    That writer recorded canonical source keys in its manifest but stored the
+    physical files under the three GR00T target keys.  Treating an arbitrary
+    empty feature mapping this way would silently accept an untyped source, so
+    keep this compatibility path pinned to the old writer's complete contract.
+    """
+
+    return (
+        info.get("features") == {}
+        and info.get("video_path") == LEGACY_VIDEO_PATH
+        and source.manifest.get("schema_version") == 1
+        and source.manifest.get("output_format") == "groot_lerobot_v2.1_per_episode"
+        and source.manifest.get("source_format") == "flywheel_raw_terminal_artifact"
+    )
+
+
+def _source_video_path(
+    source: _PreparedSource,
+    info: Mapping[str, Any],
+    *,
+    episode: int,
+    source_key: str,
+    legacy_target_key: str | None = None,
+) -> Path:
+    pattern, chunk_size = info.get("video_path"), info.get("chunks_size")
+    if not isinstance(pattern, str) or type(chunk_size) is not int or chunk_size <= 0:
+        raise ValueError("prepared mix source video path contract is invalid")
+    try:
+        relative = pattern.format(episode_chunk=episode // chunk_size, episode_index=episode, video_key=source_key)
+    except (IndexError, KeyError, ValueError) as error:
+        raise ValueError("prepared mix source video path pattern is invalid") from error
+    candidate = Path(relative)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError("prepared mix source video path escapes its root")
+    path = source.root / candidate
+    if not path.is_symlink() and path.is_file():
+        return path
+    if legacy_target_key is not None and _legacy_per_episode_video_layout(source, info):
+        legacy_relative = pattern.format(
+            episode_chunk=episode // chunk_size,
+            episode_index=episode,
+            video_key=legacy_target_key,
+        )
+        legacy_candidate = Path(legacy_relative)
+        if (
+            not legacy_candidate.is_absolute()
+            and ".." not in legacy_candidate.parts
+            and not (source.root / legacy_candidate).is_symlink()
+            and (source.root / legacy_candidate).is_file()
+        ):
+            return source.root / legacy_candidate
+    raise ValueError("prepared mix source camera video is unavailable")
+
+
 class _BoundedVideoSlicer:
     """Run independently-addressed video slices with a bounded work queue."""
 
@@ -1382,13 +1483,15 @@ def _materialize_mixed_work(
     receipts = None if persistent_root is None else persistent_root / _PERSISTENT_RECEIPTS_NAME
     if persistent_root is not None:
         _clean_persistent_postprocessing(temporary)
+    source_info = {key: _read_json(source.root / "meta" / "info.json") for key, source in sources.items()}
+    source_cameras = {key: _source_camera_keys(source, source_info[key]) for key, source in sources.items()}
     for selection in sorted(plan.selections, key=lambda item: int(item.destination_episode_id)):
         source = sources[selection.source_manifest_sha256]
         if (selection.raw_manifest_sha256, selection.raw_episode_id, selection.raw_frame_start, selection.raw_frame_stop, selection.raw_frame_ids) != _expected_raw_lineage(source, selection):
             raise ValueError("mix plan raw lineage no longer matches materialized inputs")
-        source_info = _read_json(source.root / "meta" / "info.json")
+        info = source_info[selection.source_manifest_sha256]
         numeric_source, numeric_destination = int(selection.source_episode_id), int(selection.destination_episode_id)
-        source_data = source.root / str(source_info["data_path"]).format(episode_chunk=numeric_source // int(source_info["chunks_size"]), episode_index=numeric_source)
+        source_data = source.root / str(info["data_path"]).format(episode_chunk=numeric_source // int(info["chunks_size"]), episode_index=numeric_source)
         table = pq.read_table(source_data).slice(selection.frame_start, ACTION_HORIZON)
         if table.num_rows != ACTION_HORIZON or tuple(str(value) for value in table["index"].to_pylist()) != selection.source_frame_ids:
             raise ValueError("mix source range changed after plan freeze")
@@ -1411,7 +1514,13 @@ def _materialize_mixed_work(
             if receipts is not None:
                 _record_persistent_receipt(temporary, receipts, parquet_job, output_data)
         for camera in _CAMERAS:
-            source_video = source.root / LEGACY_VIDEO_PATH.format(episode_chunk=numeric_source // int(source_info["chunks_size"]), episode_index=numeric_source, video_key=camera)
+            source_video = _source_video_path(
+                source,
+                info,
+                episode=numeric_source,
+                source_key=source_cameras[selection.source_manifest_sha256][camera],
+                legacy_target_key=camera,
+            )
             output_video = temporary / LEGACY_VIDEO_PATH.format(episode_chunk=numeric_destination // 1000, episode_index=numeric_destination, video_key=camera)
             video_job = _persistent_job_identity(selection, artifact=f"video:{camera}")
             reused_video = receipts is not None and _load_persistent_receipt(temporary, receipts, video_job, output_video)

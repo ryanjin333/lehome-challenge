@@ -54,14 +54,14 @@ def _prepared_source(root: Path, *, kind: str, grade: str | None = None, episode
             "task_index": pa.array([0] * ACTION_HORIZON, type=pa.int64()),
         }), path, compression="zstd")
         for camera in ("top_rgb", "left_rgb", "right_rgb"):
-            _video(root / LEGACY_VIDEO_PATH.format(episode_chunk=0, episode_index=episode, video_key=camera), frames=ACTION_HORIZON)
+            _video(root / LEGACY_VIDEO_PATH.format(episode_chunk=0, episode_index=episode, video_key=f"observation.images.{camera}"), frames=ACTION_HORIZON)
     meta = root / "meta"
     meta.mkdir(parents=True, exist_ok=True)
     atomic_write_json(meta / "info.json", {
         "codebase_version": "v2.1", "robot_type": "dual_so101_follower", "total_episodes": episodes,
         "total_frames": episodes * ACTION_HORIZON, "total_tasks": 1, "total_videos": episodes * 3,
         "total_chunks": 1, "chunks_size": 1000, "fps": 30, "data_path": LEGACY_DATA_PATH,
-        "video_path": LEGACY_VIDEO_PATH, "features": {},
+        "video_path": LEGACY_VIDEO_PATH, "features": {f"observation.images.{camera}": {"dtype": "video", "shape": [480, 640, 3]} for camera in ("top_rgb", "left_rgb", "right_rgb")},
     })
     (meta / "episodes.jsonl").write_text("".join(json.dumps({"episode_index": episode, "length": ACTION_HORIZON, "task_index": 0}) + "\n" for episode in range(episodes)), encoding="utf-8")
     (meta / "episodes_stats.jsonl").write_text("".join(json.dumps({"episode_index": episode, "stats": {}}) + "\n" for episode in range(episodes)), encoding="utf-8")
@@ -85,6 +85,7 @@ def _prepared_source(root: Path, *, kind: str, grade: str | None = None, episode
         "train_episode_ids": [str(episode) for episode in range(episodes)], "validation_episode_ids": [],
         "fixed_language_instruction": "fold the garment on the table",
         "future_actions": {"horizon": ACTION_HORIZON, "loader_allow_padding": False},
+        "camera_schema": [{"source_key": f"observation.images.{camera}", "target_modality": camera, "dtype": "video", "shape": [480, 640, 3]} for camera in ("top_rgb", "left_rgb", "right_rgb")],
     }
     atomic_write_json(root / "manifest.json", manifest)
     return root
@@ -128,6 +129,38 @@ def test_mix_materializes_real_ranges_with_exact_train_ratio_and_valid_stats(tmp
     (mixed / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="hash"):
         validate_prepared_dataset(mixed)
+
+
+def test_mix_resolves_canonical_source_camera_keys_and_rejects_ambiguity_or_escape(tmp_path: Path) -> None:
+    import lehome_train.flywheel.mix as mix
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    source = mix._prepared_source(organizer, kind="organizer")
+    info = json.loads((organizer / "meta" / "info.json").read_text(encoding="utf-8"))
+    assert mix._source_camera_keys(source, info) == {camera: f"observation.images.{camera}" for camera in ("top_rgb", "left_rgb", "right_rgb")}
+    # Canonical aggregate-RFT schemas omit target_modality but retain the exact
+    # observation.images suffix contract.
+    for item in source.manifest["camera_schema"]:
+        item.pop("target_modality")
+    assert mix._source_camera_keys(source, info)["top_rgb"] == "observation.images.top_rgb"
+    untyped_info = dict(info)
+    untyped_info["features"] = {}
+    with pytest.raises(ValueError, match="feature contract"):
+        mix._source_camera_keys(source, untyped_info)
+    malformed_info = dict(info)
+    malformed_info["features"] = dict(info["features"])
+    malformed_info["features"]["observation.images.top_rgb"] = {"dtype": "video", "shape": [1]}
+    with pytest.raises(ValueError, match="canonical video"):
+        mix._source_camera_keys(source, malformed_info)
+    source.manifest["camera_schema"].append(dict(source.manifest["camera_schema"][0]))
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        mix._source_camera_keys(source, info)
+    source.manifest["camera_schema"].pop()
+    source.manifest["camera_schema"] = [item for item in source.manifest["camera_schema"] if item["source_key"] != "observation.images.left_rgb"]
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        mix._source_camera_keys(source, info)
+    info["video_path"] = "../videos/{video_key}/episode_{episode_index:06d}.mp4"
+    with pytest.raises(ValueError, match="escapes"):
+        mix._source_video_path(source, info, episode=0, source_key="observation.images.top_rgb")
 
 
 def test_mix_parallel_video_materialization_is_bounded_and_deterministic(
@@ -653,6 +686,8 @@ def test_mix_accepts_canonical_autonomous_rft_snapshot_not_expert_provenance(
         "source_revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c",
         "source_release_id": "b" * 64,
     })
+    for camera in manifest["camera_schema"]:
+        camera.pop("target_modality", None)
     # Rebuild the listed artifact set after replacing provenance with the
     # canonical aggregate selection artifact.
     atomic_write_json(rft / "meta" / "rft-selection.json", {
@@ -664,7 +699,7 @@ def test_mix_accepts_canonical_autonomous_rft_snapshot_not_expert_provenance(
         "excluded_public_unseen": 0,
         "excluded_failed": 0,
         "episodes": [
-            {"episode_index": index, "raw_episode_id": f"rft-{index}", "raw_manifest_sha256": ("c" if index == 0 else "d") * 64, "frame_count": 32, "valid_window_count": 17, "category": "top_long"}
+            {"episode_index": index, "raw_episode_id": f"rft-{index}", "raw_manifest_sha256": ("c" if index == 0 else "d") * 64, "frame_count": 16, "valid_window_count": 1, "category": "top_long"}
             for index in range(2)
         ],
     })
@@ -674,6 +709,7 @@ def test_mix_accepts_canonical_autonomous_rft_snapshot_not_expert_provenance(
     atomic_write_json(rft / "manifest.json", manifest)
 
     plan = build_mix_plan(organizer, rft, seed=5)
+    materialize_mixed_snapshot(plan, organizer, rft, tmp_path / "mixed-rft")
 
     assert plan.organizer_training_frames * 3 == plan.flywheel_training_frames * 7
     assert {item.source_kind for item in plan.selections} == {"organizer", "flywheel"}
