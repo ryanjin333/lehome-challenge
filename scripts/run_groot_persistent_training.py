@@ -1033,6 +1033,12 @@ def _validate_resume_terminal(
             publication, generation_sha256=generation_sha256,
             config_sha256=config_sha256, experiment_id=experiment,
         )
+    canonical_step = max(
+        int(publication["optimizer_step"])
+        for publication in terminal["immutable_checkpoint_publications"]
+    )
+    if terminal["resumable_checkpoint_step"] != canonical_step:
+        raise ValueError("resume terminal resumable checkpoint is not canonical")
     return terminal, resume_identity(
         terminal, generation_sha256=generation_sha256, config_sha256=config_sha256,
     )

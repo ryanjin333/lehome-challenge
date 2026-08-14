@@ -148,6 +148,32 @@ def _canonical_resume_chain() -> tuple[dict[str, object], dict[str, object], dic
     return instance, request, envelope
 
 
+def _two_publication_resume_chain() -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    instance, request, envelope = _canonical_resume_chain()
+    first = request["resume_checkpoint_publication"]
+    terminal = request["provider_interruption_terminal"]
+    replacement = request["replacement_resume_receipt"]
+    descriptor = request["resume_checkpoint_descriptor"]
+    assert isinstance(first, dict)
+    assert isinstance(terminal, dict)
+    assert isinstance(replacement, dict)
+    assert isinstance(descriptor, dict)
+    latest = first | {
+        "optimizer_step": 2000,
+        "relative_path": "checkpoints/step-2000.tar",
+        "artifact_sha256": "1" * 64,
+        "descriptor_relative_path": "checkpoints/step-2000.json",
+        "descriptor_sha256": "2" * 64,
+    }
+    terminal["immutable_checkpoint_publications"] = [first, latest]
+    terminal["resumable_checkpoint_step"] = 2000
+    descriptor.update({"sha256": "2" * 64, "relative_path": "checkpoints/step-2000.json"})
+    replacement["resume_checkpoint_publication"] = latest
+    request["resume_checkpoint_publication"] = latest
+    envelope["arguments"]["resume_publication"] = latest
+    return instance, request, envelope
+
+
 def _assert_no_resume_execution(calls: list[tuple[str, ...]]) -> None:
     assert not any("continuous-train --request /prepared/config/resume.json" in command[-1] for command in calls)
 
@@ -598,6 +624,52 @@ def test_repeated_resume_preemption_terminalizes_the_validated_resume_lineage() 
     assert terminal["resumable_checkpoint_step"] == 1000
     assert terminal["disposable"] is False
     assert terminal["immutable_checkpoint_publications"] == request["provider_interruption_terminal"]["immutable_checkpoint_publications"]
+    LIFECYCLE._validate_resume_terminal(
+        terminal,
+        generation_sha256=request["generation_sha256"],
+        config_sha256=request["config_sha256"],
+    )
+
+
+def test_resume_rejects_stale_terminal_resumable_step_before_remote_execution() -> None:
+    instance, request, _ = _two_publication_resume_chain()
+    terminal = request["provider_interruption_terminal"]
+    assert isinstance(terminal, dict)
+    terminal["resumable_checkpoint_step"] = 1000
+    calls: list[tuple[str, ...]] = []
+
+    with pytest.raises(ValueError, match="resume terminal resumable checkpoint is not canonical"):
+        LIFECYCLE.remote_action(
+            action="resume", instance=instance, request=request,
+            runner=lambda command: calls.append(command) or "",
+        )
+    assert calls == []
+
+
+def test_repeated_resume_preemption_preserves_canonical_maximum_publication_lineage() -> None:
+    instance, request, envelope = _two_publication_resume_chain()
+    descriptor = request["resume_checkpoint_descriptor"]
+    original_terminal = request["provider_interruption_terminal"]
+    assert isinstance(descriptor, dict)
+    assert isinstance(original_terminal, dict)
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[-1] == "cat /prepared/config/resume.json":
+            return json.dumps(envelope)
+        if "sha256sum /prepared/config/resume-checkpoint.json" in command[-1]:
+            return f"{descriptor['sha256']}  resume-checkpoint.json\n{descriptor['byte_size']}\n"
+        if "continuous-train --request /prepared/config/resume.json" in command[-1]:
+            raise subprocess.CalledProcessError(255, command)
+        assert command == ("vastai", "--raw", "show", "instance", "10")
+        return '{"id":10,"actual_status":"interrupted"}'
+
+    result = LIFECYCLE.remote_action(
+        action="resume", instance=instance, request=request, runner=runner,
+    )
+
+    terminal = result["terminal"]
+    assert terminal["resumable_checkpoint_step"] == 2000
+    assert terminal["immutable_checkpoint_publications"] == original_terminal["immutable_checkpoint_publications"]
     LIFECYCLE._validate_resume_terminal(
         terminal,
         generation_sha256=request["generation_sha256"],
