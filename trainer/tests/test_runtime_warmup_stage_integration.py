@@ -135,7 +135,7 @@ def _cpu_pilot(*, instance: dict[str, object], code_revision: str, code_sha256: 
             "provider_instance_id": instance["instance_id"],
             "provider_response_sha256": instance["provider_response_sha256"],
             "platform_arch": "x86_64",
-            "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+            "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2],
             "code_revision": code_revision,
             "code_bundle_sha256": code_sha256,
             "bc_revision": "b" * 40,
@@ -310,6 +310,11 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
         "provider_response_sha256": "1" * 64, "capability_sha256": "2" * 64,
     }
+    cpu_instance = {
+        "instance_id": 43, "provider_response_sha256": "6" * 64,
+        "platform_arch": "x86_64", "trainer_image": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE,
+        "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2],
+    }
     code_revision, code_sha256 = "3" * 40, "4" * 64
     receipts = _campaign_receipts(tmp_path)
     binding = {
@@ -336,7 +341,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         },
         "physical_batch_size": 64, "action_horizon": 16,
     }
-    pilot = _cpu_pilot(instance=instance, code_revision=code_revision, code_sha256=code_sha256)
+    pilot = _cpu_pilot(instance=cpu_instance, code_revision=code_revision, code_sha256=code_sha256)
     launch = {
         "base_model_path": str(cache / "parent"), "base_model_revision": MODEL_REVISION,
         "dataset_path": str(prepared / "runtime"), "dataset_revision": "6" * 40,
@@ -361,10 +366,18 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     launch_path = _write(tmp_path / "stage" / "warmup-launch.json", launch)
     bootstrap = _write(tmp_path / "stage" / "bootstrap.json", {
         "schema_version": 1, "kind": "runtime_mixture_bootstrap_stage",
-        "instance_id": instance["instance_id"],
-        "provider_response_sha256": instance["provider_response_sha256"],
+        "instance_id": cpu_instance["instance_id"],
+        "provider_response_sha256": cpu_instance["provider_response_sha256"],
+        "platform_arch": "x86_64",
+        "trainer_image": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE,
+        "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2],
         "code_revision": code_revision, "code_bundle_sha256": code_sha256,
-        "parent_checkpoint_artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"],
+        "bc_revision": "b" * 40, "rollout_revision": "c" * 40,
+        "deployment_revision": "a" * 40,
+        "bc_receipt_sha256": sha256_file(receipts["bc"]),
+        "rollout_receipt_sha256": sha256_file(receipts["rollout"]),
+        "deployment_receipt_sha256": sha256_file(receipts["deployment"]),
+        "transfers": [{"name": "code.bundle", "sha256": "7" * 64}],
     })
     stage_receipt = tmp_path / "stage" / "warmup-stage.json"
     runner, calls = _local_stage_transport(tmp_path / "remote", runtime_mounts)
