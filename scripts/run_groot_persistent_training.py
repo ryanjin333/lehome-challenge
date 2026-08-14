@@ -1500,7 +1500,17 @@ def resume_runtime_checkpoint(
         publications=(publication,), provider_loss=provider_loss,
     )
     cursor = discovered.resume
-    return {"paid_action": True, "action": "runtime-checkpoint-resume", "instance_id": replacement["instance_id"], "runtime_cursor": cursor.dataset_kwargs(), "checkpoint_archive": str(cursor.checkpoint_archive), "checkpoint_descriptor": str(cursor.checkpoint_descriptor), "runtime_resume_anchor": discovered.previous_link(), "runtime_resume_publication": publication, "recovered_terminal": recovered_terminal, "immutable_anchor_revision": discovered.immutable_anchor_revision}
+    # This is the exact cursor consumed by ``runtime-mixture-train`` and then
+    # copied unchanged through final staging.  ``dataset_kwargs`` is an
+    # entrypoint-only projection and drops the h16 binding, so it must never
+    # become the lifecycle receipt.
+    runtime_cursor = {
+        "optimizer_step": cursor.optimizer_step,
+        "global_sample_offset": cursor.global_sample_offset,
+        "physical_batch_size": cursor.physical_batch_size,
+        "action_horizon": 16,
+    }
+    return {"paid_action": True, "action": "runtime-checkpoint-resume", "instance_id": replacement["instance_id"], "runtime_cursor": runtime_cursor, "checkpoint_archive": str(cursor.checkpoint_archive), "checkpoint_descriptor": str(cursor.checkpoint_descriptor), "runtime_resume_anchor": discovered.previous_link(), "runtime_resume_publication": publication, "recovered_terminal": recovered_terminal, "immutable_anchor_revision": discovered.immutable_anchor_revision}
 
 
 def destroy_runtime_checkpoint_completion(

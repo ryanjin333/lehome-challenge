@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -177,6 +178,9 @@ def test_runtime_supervisor_packages_and_anchors_the_real_one_k_boundary(
     result = production.ProductionRuntime(checkpoint_transport_factory=lambda **_kwargs: hub).runtime_mixture_train({**{key: str(value) for key, value in paths.items()}, "runtime_resume_archive": None, "runtime_resume_descriptor": None, "runtime_resume_cursor": None, "runtime_resume_anchor": None, "runtime_resume_publication": None, "checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "checkpoint_revision": "main", "publisher_token_file": str(token), "instance_id": 10, "result_output": str(output / "result.json"), "status_output": str(output / "status.json")})
     publication = result["immutable_checkpoint_publications"][0]
     assert result["status"] == "runtime-mixture-interrupted" and publication["optimizer_step"] == 1000
+    assert publication["kind"] == "runtime_mixture_checkpoint_publication"
+    assert publication["identity"] == identity
+    assert publication["runtime_cursor"] == {"optimizer_step": 1000, "global_sample_offset": 64_000, "physical_batch_size": 64, "action_horizon": 16}
     assert publication["runtime_checkpoint_anchor"]["readback_verified"] is True
     assert publication["readback_verified"] is True
     assert publication["runtime_checkpoint_anchor"]["immutable_anchor_revision"] == hub.main
@@ -198,3 +202,64 @@ def test_runtime_supervisor_packages_and_anchors_the_real_one_k_boundary(
         transport_factory=lambda **_kwargs: hub,
     )["terminal"]
     assert terminal["resumable_checkpoint_step"] == 1000
+
+    replacement = {"kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 11, "host": "replacement", "port": 22, "platform_arch": "x86_64", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "provider_response_sha256": "b" * 64, "capability_sha256": "3" * 64}
+    resume_destination = prepared / "resume-download"
+    replacement_request = {
+        "instance": replacement, "code_revision": code_revision, "code_bundle_sha256": code_sha, "schedule_seed": 17,
+        "bc_readback_receipt": str(bc_receipt), "rollout_readback_receipt": str(rollout_receipt), "deployment_receipt": str(deployment_receipt),
+        "checkpoint_experiment_id": "runtime-mixture-70-30", "experiment_config": str(paths["experiment_config"]),
+        "runtime_source_evidence": str(paths["runtime_source_evidence"]), "terminal_receipt": str(lost_terminal),
+        "resume_destination": str(resume_destination), "failure_receipt": str(tmp_path / "resume-failure.json"),
+    }
+    resumed = LIFECYCLE.main_for_test(
+        ["runtime-checkpoint-replacement-resume", "--request", str(_write(tmp_path / "replacement.json", replacement_request)), "--execute", "--token-file", str(token)],
+        runner=lambda command: (_ for _ in ()).throw(AssertionError(command)), transport_factory=lambda **_kwargs: hub,
+    )
+    assert resumed["instance_id"] == 11 and resumed["runtime_cursor"]["global_sample_offset"] == 64_000
+    assert resumed["runtime_resume_anchor"] == {"immutable_anchor_revision": hub.main, "anchor_sha256": publication["runtime_checkpoint_anchor"]["anchor_sha256"]}
+
+    # A replacement host has no durable trainer output.  It consumes only the
+    # discovered immutable archive and descriptor, then the real supervisor
+    # observes/packages/publishes the 2K completion boundary.
+    shutil.rmtree(run_root)
+    resume_archive = Path(resumed["checkpoint_archive"])
+    resume_descriptor = Path(resumed["checkpoint_descriptor"])
+    from lehome_train.checkpoints import load_checkpoint_descriptor
+    resume_record = load_checkpoint_descriptor(resume_descriptor).record
+    assert resume_record.dataset_manifest_sha256 == mixture_id
+    assert resume_record.sample_presentations == 64_000
+    assert resume_record.artifact.sha256 == sha256_file(resume_archive)
+    def launch_two_k(config, **_kwargs):
+        checkpoint = Path(config.output_dir) / config.experiment_name / "checkpoint-2000"; checkpoint.mkdir(parents=True)
+        (checkpoint / "weights.bin").write_bytes(b"immutable-2k")
+        _write(checkpoint / "trainer_state.json", {"global_step": 2000, "log_history": [{"step": 2000, "loss": .1}]})
+    monkeypatch.setattr(production, "launch_continuous_finetune", launch_two_k)
+    completed = production.ProductionRuntime(checkpoint_transport_factory=lambda **_kwargs: hub).runtime_mixture_train({**{key: str(value) for key, value in paths.items()}, "runtime_resume_archive": str(resume_archive), "runtime_resume_descriptor": str(resume_descriptor), "runtime_resume_cursor": resumed["runtime_cursor"], "runtime_resume_anchor": resumed["runtime_resume_anchor"], "runtime_resume_publication": resumed["runtime_resume_publication"], "checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "checkpoint_revision": "main", "publisher_token_file": str(token), "instance_id": 11, "result_output": str(output / "replacement-result.json"), "status_output": str(output / "replacement-status.json")})
+    publications = completed["immutable_checkpoint_publications"]
+    assert completed["status"] == "runtime-mixture-complete" and [item["optimizer_step"] for item in publications] == [1000, 2000]
+    assert publications[1]["runtime_checkpoint_anchor"]["readback_verified"] is True
+    assert publications[1]["runtime_checkpoint_anchor"]["immutable_anchor_revision"] == hub.main
+
+    completion_path = tmp_path / "complete-terminal.json"
+    completion_request = {**replacement_request, "instance": replacement, "runtime_checkpoint_publications": publications, "terminal_receipt": str(completion_path), "failure_receipt": str(tmp_path / "complete-failure.json")}
+    complete = LIFECYCLE.main_for_test(
+        ["runtime-checkpoint-complete", "--request", str(_write(tmp_path / "complete.json", completion_request)), "--execute", "--token-file", str(token)],
+        runner=lambda command: (_ for _ in ()).throw(AssertionError(command)), transport_factory=lambda **_kwargs: hub,
+    )["terminal"]
+    assert complete["disposable"] is True and complete["resumable_checkpoint_step"] == 2000
+
+    destroyed = False
+    def destroy_runner(command: tuple[str, ...]) -> str:
+        nonlocal destroyed
+        if command == ("vastai", "destroy", "instance", "11", "--yes"):
+            destroyed = True; return ""
+        if command == ("vastai", "--raw", "show", "instance", "11"):
+            return "{}" if destroyed else '{"id":11}'
+        raise AssertionError(command)
+    dispose_request = {**replacement_request, "instance": replacement, "terminal_receipt": str(completion_path), "failure_receipt": str(tmp_path / "dispose-failure.json")}
+    disposed = LIFECYCLE.main_for_test(
+        ["runtime-checkpoint-dispose", "--request", str(_write(tmp_path / "dispose.json", dispose_request)), "--execute", "--token-file", str(token)],
+        runner=destroy_runner, transport_factory=lambda **_kwargs: hub,
+    )
+    assert destroyed and disposed["destroy_authorized"] is True and disposed["instance_id"] == 11

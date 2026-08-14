@@ -274,6 +274,42 @@ def verify_runtime_mixture_publication(
     return _verify_publication_readback(publication=publication, identity=identity, hub=hub, destination=destination)
 
 
+def attest_runtime_mixture_checkpoint_publication(
+    *, raw_publication: Mapping[str, object], identity: RuntimeMixtureTrainingIdentity,
+    hub: RuntimeCheckpointHub, destination: Path,
+) -> dict[str, object]:
+    """Canonicalize an uploader receipt only after a fresh immutable readback.
+
+    ``HubCheckpointUploader`` owns upload and its immediate byte readback.  The
+    runtime lifecycle owns the resume/disposal schema, so it reconstructs that
+    schema from the uploader's returned immutable coordinates and reads the
+    bytes again through its deliberately small Hub protocol.  No trainer or
+    caller-provided field is carried into the resulting cursor identity.
+    """
+    step = raw_publication.get("optimizer_step")
+    if step not in _STEPS:
+        raise ValueError("runtime checkpoint publication has an unsupported step")
+    raw = _publication_fields(raw_publication, step=int(step))
+    publication = {
+        "schema_version": 1,
+        "kind": "runtime_mixture_checkpoint_publication",
+        **raw,
+        "identity": identity.to_dict(),
+        "identity_sha256": identity.sha256,
+        "runtime_cursor": {
+            "optimizer_step": step,
+            "global_sample_offset": int(step) * identity.physical_batch_size,
+            "physical_batch_size": identity.physical_batch_size,
+            "action_horizon": identity.action_horizon,
+        },
+        "fresh_tree_readback_verified": True,
+    }
+    _verify_publication_readback(
+        publication=publication, identity=identity, hub=hub, destination=destination,
+    )
+    return publication
+
+
 def publish_runtime_mixture_checkpoint(
     *, identity: RuntimeMixtureTrainingIdentity, checkpoint: CheckpointDescriptor, artifact_root: Path,
     publisher: Callable[..., dict[str, object]], hub: RuntimeCheckpointHub,

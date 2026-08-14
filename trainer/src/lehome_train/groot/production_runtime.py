@@ -10,9 +10,11 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 from dataclasses import replace
 import sys
+import tempfile
 from time import monotonic
 from typing import Any, Mapping
 
@@ -32,6 +34,7 @@ from lehome_train.groot.throughput_tuning import TrainingProbe, tune_on_host
 from lehome_train.groot.continuous_training import run_continuous_supervisor
 from lehome_train.groot.runtime_checkpoint_lifecycle import (
     RuntimeMixtureTrainingIdentity,
+    attest_runtime_mixture_checkpoint_publication,
     build_runtime_checkpoint_anchor,
 )
 from lehome_train.groot.production_adapters import (
@@ -516,7 +519,11 @@ def _runtime_resume_checkpoint(
     ):
         raise ValueError("runtime resume cursor or checkpoint archive is incompatible")
     from lehome_train.groot.production_adapters import _restore_checkpoint_archive
-    consumption = Path(config.output_dir) / "runtime-resume-consumption.json"
+    output_root = Path(config.output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    if output_root.is_symlink() or not output_root.is_dir():
+        raise ValueError("runtime resume output root is unsafe")
+    consumption = output_root / "runtime-resume-consumption.json"
     evidence = {
         "schema_version": 1, "kind": "runtime_mixture_resume_consumption",
         "optimizer_step": step, "cursor": dict(cursor),
@@ -529,7 +536,7 @@ def _runtime_resume_checkpoint(
     else:
         atomic_write_json(consumption, evidence)
     _restore_checkpoint_archive(
-        archive, output_root=Path(config.output_dir), expected_member_root=config.experiment_name,
+        archive, output_root=output_root, expected_member_root=config.experiment_name,
         optimizer_step=step, expected_identity=config.identity(), num_gpus=config.num_gpus,
     )
     restored = Path(config.output_dir) / config.experiment_name / f"checkpoint-{step}"
@@ -1714,10 +1721,11 @@ class ProductionRuntime:
             config=config, experiment_config=experiment,
             normalization_sha256=sha256_file(paths["runtime_normalization"]), resume_checkpoint=None,
         )
+        checkpoint_transport = self._checkpoint_transport_factory(timeout_seconds=30.0)
         uploader = HubCheckpointUploader(
             repository=repository, revision=revision, experiment_id=config.experiment_name,
             artifact_root=config.output_dir, token=token,
-            transport=self._checkpoint_transport_factory(timeout_seconds=30.0),
+            transport=checkpoint_transport,
         )
         schedule = ExposureSchedule(
             physical_batch_size=64, sample_presentations=128_000,
@@ -1728,6 +1736,18 @@ class ProductionRuntime:
         )
         if identity.mixture_id != str(contract.manifest.mixture_id):
             raise ValueError("runtime checkpoint source evidence mixture identity disagrees with mounted runtime")
+
+        class TokenBoundHub:
+            def list_tree(self, *, repository: str, revision: str) -> object:
+                return checkpoint_transport.list_tree(repository=repository, revision=revision, token=token)
+
+            def download_files(self, *, repository: str, revision: str, destination: Path, relative_paths: tuple[str, ...], remote_prefix: str) -> object:
+                return checkpoint_transport.download_files(repository=repository, revision=revision, destination=destination, relative_paths=relative_paths, remote_prefix=remote_prefix, token=token)
+
+            def resolve_approved_ref(self, *, repository: str, ref: str) -> str:
+                return checkpoint_transport.resolve_approved_ref(repository=repository, ref=ref, token=token)
+
+        lifecycle_hub = TokenBoundHub()
         resume_publication = _runtime_resume_publication(
             value=request["runtime_resume_publication"], identity=identity,
             anchor=previous_anchor,
@@ -1735,8 +1755,17 @@ class ProductionRuntime:
         def publish_with_anchor(checkpoint: object) -> dict[str, object]:
             nonlocal previous_anchor
             raw = uploader.publish_receipt(checkpoint, timeout_seconds=30.0)  # type: ignore[arg-type]
+            verification_root = Path(tempfile.mkdtemp(prefix="runtime-publication-readback-", dir=config.output_dir))
+            shutil.rmtree(verification_root)
+            try:
+                publication = attest_runtime_mixture_checkpoint_publication(
+                    raw_publication=raw, identity=identity, hub=lifecycle_hub,
+                    destination=verification_root,
+                )
+            finally:
+                shutil.rmtree(verification_root, ignore_errors=True)
             anchor = build_runtime_checkpoint_anchor(
-                publication=raw, identity=identity, experiment_id=config.experiment_name,
+                publication=publication, identity=identity, experiment_id=config.experiment_name,
                 experiment_config_sha256=canonical_json_sha256(experiment), anchor_ref=revision,
                 previous_anchor=previous_anchor,
             )
@@ -1747,7 +1776,7 @@ class ProductionRuntime:
                 "immutable_anchor_revision": str(anchor_receipt["immutable_anchor_revision"]),
                 "anchor_sha256": str(anchor_receipt["anchor_sha256"]),
             }
-            return raw | {"runtime_checkpoint_anchor": dict(anchor_receipt)}
+            return publication | {"runtime_checkpoint_anchor": dict(anchor_receipt)}
 
         publications = run_continuous_supervisor(
             run_root=Path(config.output_dir) / config.experiment_name,
