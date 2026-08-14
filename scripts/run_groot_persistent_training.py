@@ -1440,7 +1440,10 @@ def runtime_anchor_interruption_terminal(
         discovered = discover_runtime_checkpoint_anchor(
             identity=identity, experiment_id=experiment_id,
             experiment_config_sha256=_hash(_load_regular_json(Path(config_path), "runtime checkpoint experiment config")),
-            anchor_ref="main", hub=hub, destination=scratch,  # type: ignore[arg-type]
+            # Discovery owns an absent destination for checkpoint byte
+            # readback.  ``mkdtemp`` has already created the parent scratch
+            # directory, so use a fresh child rather than passing it itself.
+            anchor_ref="main", hub=hub, destination=scratch / "checkpoint",  # type: ignore[arg-type]
         )
         step = discovered.resume.optimizer_step
         if step not in request["expected_checkpoint_steps"]:
@@ -2679,7 +2682,10 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object]:
+def main_for_test(
+    argv: list[str], *, runner: Runner = _run,
+    transport_factory: Callable[..., HubTransport] = HuggingFaceHubTransport,
+) -> dict[str, object]:
     parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "capture-runtime-pilot-offer", "bootstrap-canary", "promote", "replacement-resume", "rent", "runtime-pilot-rent", "runtime-gpu-warmup-rent", "stage", "runtime-pilot-plan", "runtime-bootstrap-stage", "runtime-warmup-stage", "runtime-stage", "runtime-hydrate", "runtime-pilot-run", "runtime-gpu-warmup", "runtime-train", "runtime-checkpoint-publish", "runtime-checkpoint-complete", "runtime-checkpoint-interrupted", "runtime-checkpoint-replacement-resume", "runtime-checkpoint-dispose", "tune", "train", "status", "resume", "destroy", "runtime-pilot-destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "materialize":
@@ -2724,7 +2730,7 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
         descriptor_output = request.get("resume_descriptor_output")
         if not isinstance(terminal, Mapping) or not isinstance(capability, Mapping) or not isinstance(descriptor_output, str):
             raise ValueError("replacement-resume requires interruption terminal, replacement capability receipt, and descriptor output")
-        return {"paid_action": True, "action": "replacement-resume", **replacement_resume_descriptor(terminal=terminal, capability_receipt=capability, runner=runner, transport=HuggingFaceHubTransport(timeout_seconds=30.0), token=_read_private_token(args.token_file), descriptor_output=Path(descriptor_output))}
+        return {"paid_action": True, "action": "replacement-resume", **replacement_resume_descriptor(terminal=terminal, capability_receipt=capability, runner=runner, transport=transport_factory(timeout_seconds=30.0), token=_read_private_token(args.token_file), descriptor_output=Path(descriptor_output))}
     if args.action == "rent": return rent(evidence=request, runner=runner)
     if args.action == "runtime-pilot-rent": return rent_runtime_cpu_pilot(evidence=request, runner=runner)
     if args.action == "runtime-gpu-warmup-rent": return rent_runtime_gpu_warmup(evidence=request, runner=runner)
@@ -2733,7 +2739,7 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
             instance_id=request.get("instance_id"),  # type: ignore[arg-type]
             training_receipt=request,
             runner=runner,
-            transport=HuggingFaceHubTransport(timeout_seconds=30.0),
+            transport=transport_factory(timeout_seconds=30.0),
             token=_read_private_token(args.token_file),
         )
     if args.action == "runtime-pilot-destroy":
@@ -2755,10 +2761,10 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
         return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: {"paid_action": True, "action": args.action, "terminal": _runtime_checkpoint_terminal_output(request, runtime_checkpoint_terminal(instance=instance, request=request)["terminal"])})
     if args.action == "runtime-checkpoint-interrupted":
         token = _read_private_token(args.token_file)
-        hub = _RuntimeCheckpointHub(transport=HuggingFaceHubTransport(timeout_seconds=30.0), token=token)
+        hub = _RuntimeCheckpointHub(transport=transport_factory(timeout_seconds=30.0), token=token)
         return runtime_anchor_interruption_terminal(instance=instance, request=request, runner=runner, hub=hub)
     token = _read_private_token(args.token_file)
-    hub = _RuntimeCheckpointHub(transport=HuggingFaceHubTransport(timeout_seconds=30.0), token=token)
+    hub = _RuntimeCheckpointHub(transport=transport_factory(timeout_seconds=30.0), token=token)
     if args.action == "runtime-checkpoint-publish":
         return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: publish_runtime_checkpoint(instance=instance, request=request, publisher=_runtime_checkpoint_publisher(request=request, token=token), hub=hub))
     if args.action == "runtime-checkpoint-replacement-resume":

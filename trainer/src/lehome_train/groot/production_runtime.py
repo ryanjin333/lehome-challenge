@@ -824,6 +824,24 @@ def _network_measurement(path_value: object) -> dict[str, object]:
 class ProductionRuntime:
     """Checked image runtime that delegates policy to Tasks 8-10 controllers."""
 
+    def __init__(
+        self,
+        *,
+        checkpoint_transport_factory: Callable[..., object] | None = None,
+    ) -> None:
+        """Keep the Hub byte boundary injectable without widening the command API.
+
+        The image uses the real transport by default.  A caller that already
+        owns a private transport (notably the in-memory lifecycle proof) can
+        supply it explicitly; model/trainer, supervisor, packaging, and
+        checkpoint lifecycle operations remain the production implementations.
+        """
+        self._checkpoint_transport_factory = (
+            HuggingFaceHubTransport
+            if checkpoint_transport_factory is None
+            else checkpoint_transport_factory
+        )
+
     def runtime_gpu_warmup_adapter(self, arguments: dict[str, object]) -> object:
         """Return the sole live adapter accepted by ``runtime-gpu-warmup``.
 
@@ -1699,6 +1717,7 @@ class ProductionRuntime:
         uploader = HubCheckpointUploader(
             repository=repository, revision=revision, experiment_id=config.experiment_name,
             artifact_root=config.output_dir, token=token,
+            transport=self._checkpoint_transport_factory(timeout_seconds=30.0),
         )
         schedule = ExposureSchedule(
             physical_batch_size=64, sample_presentations=128_000,
