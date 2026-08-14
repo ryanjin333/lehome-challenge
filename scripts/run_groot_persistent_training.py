@@ -1594,7 +1594,7 @@ def _runtime_gpu_bootstrap_capability(
         "test \"$(git -C /prepared/bootstrap-code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; "
         "test -z \"$(git -C /prepared/bootstrap-code status --porcelain)\"; "
         "timeout " + str(RUNTIME_GPU_PROBE_TIMEOUT_SECONDS) + " env -u HF_TOKEN PYTHONPATH=/prepared/bootstrap-code/source/lehome:/prepared/bootstrap-code/trainer/src "
-        "lehome-train validate-training-capability --one-step --image-digest "
+        "python -m lehome_train.cli validate-training-capability --one-step --image-digest "
         + BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
     )
     try:

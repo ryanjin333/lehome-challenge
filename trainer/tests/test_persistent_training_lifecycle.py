@@ -2030,7 +2030,13 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
         and ("-o", "ConnectTimeout=15") in zip(command, command[1:])
         for command in commands
     )
-    assert any("timeout 600 env -u HF_TOKEN" in command[-1] for command in commands)
+    probe_commands = [
+        command[-1] for command in commands
+        if "validate-training-capability" in command[-1]
+    ]
+    assert probe_commands and all("timeout 600 env -u HF_TOKEN" in command for command in probe_commands)
+    assert all("python -m lehome_train.cli validate-training-capability" in command for command in probe_commands)
+    assert all("lehome-train validate-training-capability" not in command for command in probe_commands)
     outer["deployment_revision"] = "0" * 40
     outer_path.write_text(json.dumps(outer), encoding="utf-8")
     with pytest.raises(ValueError, match="lease and campaign"):
