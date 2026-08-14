@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1.7
+FROM python:3.10.18-slim-bookworm@sha256:445b9efb2c047a7ccdb30d293fd6b1aa0f62a55062dc2b69051df91e10848749
+
+ARG UV_VERSION=0.10.7
+ARG UV_SHA256=9ac6cee4e379a5abfca06e78a777b26b7ba1f81cb7935b97054d80d85ac00774
+ARG DEBIAN_SNAPSHOT=20250930T000000Z
+ARG ISAAC_GROOT_REVISION=23ace64f17aa5015259b8609d371eb61a357c776
+ARG PINNED_SETUP_SHA256=bdc3cf8a6b9c92a0e3f46d79dc3de05b0a8c70c4289d44ac0aa1c75698a93f31
+ARG REPOSITORY_COMMIT
+
+LABEL org.opencontainers.image.source="https://github.com/lehome-official/lehome-challenge" \
+      org.opencontainers.image.revision="${REPOSITORY_COMMIT}" \
+      io.lehome.runtime-pilot="cpu-only" \
+      io.lehome.isaac-groot-revision="${ISAAC_GROOT_REVISION}"
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive \
+    UV_PROJECT_ENVIRONMENT=/opt/runtime \
+    UV_LINK_MODE=copy \
+    UV_HTTP_TIMEOUT=300
+
+COPY --chmod=0755 trainer/docker/sshd-wrapper.sh /usr/local/sbin/lehome-sshd-wrapper
+COPY --chmod=0755 trainer/docker/entrypoint.sh /usr/local/bin/lehome-entrypoint
+
+RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/sources.list.d/debian.sources \
+    && printf '%s\n' "deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" > /etc/apt/sources.list \
+    && apt-get -qq -o Acquire::Check-Valid-Until=false update
+
+RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get -qq install -y --no-install-recommends ca-certificates curl git openssh-server tar util-linux
+
+RUN --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get -qq install -y --no-install-recommends ffmpeg
+
+RUN dpkg-divert --local --rename --add /usr/sbin/sshd \
+    && ln -s /usr/local/sbin/lehome-sshd-wrapper /usr/sbin/sshd \
+    && bash -n /usr/local/sbin/lehome-sshd-wrapper \
+    && /usr/sbin/sshd -t \
+    && rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub
+
+RUN curl -fsSLo /tmp/uv.tar.gz "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
+    && echo "${UV_SHA256}  /tmp/uv.tar.gz" | sha256sum --check --strict \
+    && tar -xzf /tmp/uv.tar.gz -C /tmp \
+    && install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uv /usr/local/bin/uv \
+    && rm -rf /tmp/uv.tar.gz /tmp/uv-x86_64-unknown-linux-gnu
+
+WORKDIR /opt/runtime-pilot
+COPY trainer/runtime-pilot/pyproject.toml trainer/runtime-pilot/uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project --no-cache \
+    && /opt/runtime/bin/python -c 'import torch; assert torch.__version__ == "2.7.1+cpu" and not torch.cuda.is_available(); import torchcodec, torchvision; assert torchvision.__version__ == "0.22.1+cpu" and torchcodec.__version__ == "0.4.0"'
+
+WORKDIR /opt/isaac-groot
+RUN git init . \
+    && git remote add origin https://github.com/NVIDIA/Isaac-GR00T.git \
+    && git fetch --depth=1 origin "${ISAAC_GROOT_REVISION}" \
+    && GIT_LFS_SKIP_SMUDGE=1 git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "${ISAAC_GROOT_REVISION}" \
+    && test "$(sha256sum gr00t/model/gr00t_n1d7/setup.py | awk '{print $1}')" = "${PINNED_SETUP_SHA256}" \
+    && git config --system --add safe.directory /opt/isaac-groot
+
+WORKDIR /opt/trainer
+COPY trainer/src ./src
+RUN printf '%s\n' '#!/bin/sh' 'exec /opt/runtime/bin/python -m lehome_train.cli "$@"' > /usr/local/bin/lehome-train \
+    && chmod 0755 /usr/local/bin/lehome-train \
+    && if ! id -u sshd >/dev/null 2>&1; then useradd --system --user-group --home-dir /run/sshd --no-create-home --shell /usr/sbin/nologin sshd; fi \
+    && install -d -o root -g root -m 0755 /run/sshd \
+    && groupadd --gid 10001 trainer \
+    && useradd --uid 10001 --gid trainer --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin trainer \
+    && install -d -o trainer -g trainer -m 0750 /cache /prepared /output \
+    && install -d -o root -g root -m 1777 /cache/tmp \
+    && PYTHONPATH=/opt/trainer/src:/opt/isaac-groot /opt/runtime/bin/python -c 'import gr00t.data.types, gr00t.utils.video_utils, torchcodec' \
+    && PYTHONPATH=/opt/trainer/src:/opt/isaac-groot lehome-train --help >/dev/null
+
+ENV PATH=/opt/runtime/bin:/usr/local/bin:/usr/bin:/bin \
+    VIRTUAL_ENV=/opt/runtime \
+    PYTHONPATH=/opt/trainer/src:/opt/isaac-groot \
+    LEHOME_GROOT_ROOT=/opt/isaac-groot \
+    HF_HOME=/cache/huggingface \
+    HF_HUB_CACHE=/cache/huggingface/hub \
+    HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
+    XDG_CACHE_HOME=/cache/xdg \
+    TORCH_HOME=/cache/torch \
+    WANDB_DIR=/output/wandb \
+    TMPDIR=/cache/tmp \
+    HOME=/root \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Vast injects managed SSH before runtime Docker options. Keep its Bash
+# derivation compatible, then drop trainer commands to the unprivileged user.
+SHELL ["/bin/bash", "-c"]
+USER root
+WORKDIR /output
+ENTRYPOINT ["/usr/local/bin/lehome-entrypoint"]
+CMD ["--help"]

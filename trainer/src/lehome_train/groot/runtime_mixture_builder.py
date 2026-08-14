@@ -499,8 +499,14 @@ def pilot_from_request(path: str | Path) -> dict[str, Any]:
     if bc is None or rollout is None:
         raise ValueError("pilot requires both BC and rollout training windows")
     loader = RangeSourceLoader(contract)
-    # Representative real decodes catch camera/h16 contract drift before timing.
-    loader.load(bc); loader.load(rollout)
+    # Decode and convert one authenticated h16 payload of each source type
+    # through the pinned N1.7 VLAStepData surface before timing.  This stays
+    # model-free while catching message/type drift that an identity processor
+    # would otherwise conceal.
+    from lehome_train.groot.runtime_mixture import pinned_processor_messages
+
+    pinned_processor_messages(loader.load(bc))
+    pinned_processor_messages(loader.load(rollout))
     timings: dict[str, dict[str, float | int | list[float]]] = {}
     try:
         import torch

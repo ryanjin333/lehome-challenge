@@ -358,3 +358,84 @@ def test_loader_pilot_requires_the_canonical_x86_worker_sweep_but_rejects_caller
 
     with pytest.raises(ValueError, match="canonical"):
         pilot_from_request(request)
+
+
+def test_loader_pilot_converts_one_bc_and_one_rollout_payload_through_pinned_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CPU pilot validates the pinned VLAStepData message surface before timing."""
+    monkeypatch.setitem(sys.modules, "pyarrow", types.ModuleType("pyarrow"))
+    monkeypatch.setitem(sys.modules, "pyarrow.parquet", types.ModuleType("pyarrow.parquet"))
+    import lehome_train.groot.runtime_mixture as mixture
+
+    class Window:
+        def __init__(self, source_type: str, window_id: str) -> None:
+            self.source_type = source_type
+            self.window_id = window_id
+
+    bc, rollout = Window("bc", "bc-h16"), Window("rollout", "rollout-h16")
+    contract = types.SimpleNamespace(training_windows=(bc, rollout))
+    decoded = {"bc-h16": {"source": "bc"}, "rollout-h16": {"source": "rollout"}}
+    calls: list[object] = []
+
+    class Loader:
+        cache_cap = 2
+
+        def __init__(self, _contract: object) -> None:
+            pass
+
+        def load(self, window: Window) -> object:
+            return decoded[window.window_id]
+
+    class Dataset:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    class DataLoader:
+        def __init__(self, _dataset: object, **_kwargs: object) -> None:
+            self._remaining = 100
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> object:
+            if self._remaining == 0:
+                raise StopIteration
+            self._remaining -= 1
+            return object()
+
+    torch = types.ModuleType("torch")
+    torch.cuda = types.SimpleNamespace(is_initialized=lambda: False)
+    torch_utils = types.ModuleType("torch.utils")
+    torch_utils_data = types.ModuleType("torch.utils.data")
+    torch_utils_data.DataLoader = DataLoader
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch.utils", torch_utils)
+    monkeypatch.setitem(sys.modules, "torch.utils.data", torch_utils_data)
+    monkeypatch.setattr(mixture, "load_runtime_contract", lambda *_args: contract)
+    monkeypatch.setattr(mixture, "RangeSourceLoader", Loader)
+    monkeypatch.setattr(mixture, "RuntimeMixtureDataset", Dataset)
+    monkeypatch.setattr(mixture, "pinned_processor_messages", lambda payload: calls.append(payload) or [{"content": payload}])
+
+    request = tmp_path / "pilot.json"
+    _write(request, {
+        "schema_version": 1,
+        "command": "pilot-runtime-mixture",
+        "arguments": {
+            "mixture_manifest": "/runtime/mixture.json",
+            "mounts_descriptor": "/runtime/mounts.json",
+            "sample_count": 100,
+            "worker_counts": [0, 4, 8, 16, 24],
+            "timeout_seconds": 60,
+            "authenticated_evidence": {"mixture_id": "a" * 64},
+        },
+    })
+
+    from lehome_train.groot.runtime_mixture_builder import pilot_from_request
+
+    receipt = pilot_from_request(request)
+
+    assert calls == [decoded["bc-h16"], decoded["rollout-h16"]]
+    assert receipt["schema_version"] == 4
+    assert receipt["model_loaded"] is False
+    assert receipt["authenticated_evidence"] == {"mixture_id": "a" * 64}
