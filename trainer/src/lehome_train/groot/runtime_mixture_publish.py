@@ -12,8 +12,8 @@ import tempfile
 from typing import Any
 
 from lehome_train.groot.runtime_mixture import APPROVED_MIXTURE_REPOSITORY, source_tree_sha256
-from lehome_train.hub import HubTransport, require_access, upload_files, download_files
-from lehome_train.io import canonical_json_bytes, sha256_file
+from lehome_train.hub import HubTransport, require_access, upload_files, download_files, list_repository_tree
+from lehome_train.io import atomic_write_json, sha256_file
 from lehome_train.models import SyncEntry
 
 
@@ -31,7 +31,7 @@ def _entries(root: Path) -> tuple[SyncEntry, ...]:
     return tuple(result)
 
 
-def publish_source(*, root: str | Path, source_type: str, round_id: str | None, revision: str, transport: HubTransport) -> dict[str, object]:
+def publish_source(*, root: str | Path, source_type: str, round_id: str | None, revision: str, receipt_path: str | Path, transport: HubTransport) -> dict[str, object]:
     """Publish one complete mounted source tree and verify a fresh readback."""
     if source_type == "bc":
         prefix = "bc/full"
@@ -45,9 +45,19 @@ def publish_source(*, root: str | Path, source_type: str, round_id: str | None, 
     entries = _entries(local)
     require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=True)
     revision = upload_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, source=local, entries=entries, remote_prefix=prefix, max_attempts=1)
+    tree = list_repository_tree(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, max_attempts=1)
+    expected = {f"{prefix}/{entry.relative_path}" for entry in entries}
+    observed = {entry.relative_path for entry in tree if entry.entry_type == "file" and entry.relative_path.startswith(prefix + "/")}
+    if observed != expected:
+        raise ValueError("source publication remote tree differs from the complete local source")
     with tempfile.TemporaryDirectory(prefix="lehome-runtime-readback-") as temporary:
         readback = Path(temporary)
         download_files(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, destination=readback, relative_paths=tuple(item.relative_path for item in entries), remote_prefix=prefix, max_attempts=1)
         if _entries(readback) != entries:
             raise ValueError("source publication readback hash or size mismatch")
-    return {"repository": APPROVED_MIXTURE_REPOSITORY, "revision": revision, "prefix": prefix, "source_tree_sha256": source_tree_sha256(local), "fresh_readback_verified": True, "tree_listing_verified": True}
+    receipt = {"repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": revision, "remote_prefix": prefix, "source_tree_sha256": source_tree_sha256(local), "fresh_readback_verified": True, "tree_listing_verified": True}
+    target = Path(receipt_path)
+    if target.exists() or target.is_symlink():
+        raise FileExistsError("source publication receipt destination is immutable")
+    atomic_write_json(target, receipt)
+    return receipt
