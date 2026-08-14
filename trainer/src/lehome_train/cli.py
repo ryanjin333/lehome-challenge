@@ -286,6 +286,20 @@ def pilot_runtime_mixture(
     _fail_closed(operation)
 
 
+@app.command("runtime-gpu-warmup")
+def runtime_gpu_warmup(
+    request: Path = typer.Option(..., "--request"),
+) -> None:
+    """Measure the loaded runtime mixture and emit its GPU warm-up receipt."""
+
+    def operation() -> object:
+        from lehome_train.groot.runtime_mixture_warmup import warmup_from_request
+
+        return warmup_from_request(request)
+
+    _fail_closed(operation)
+
+
 @app.command("hydrate-runtime-mixture")
 def hydrate_runtime_mixture(
     request: Path = typer.Option(..., "--request"),

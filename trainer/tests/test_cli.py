@@ -38,6 +38,7 @@ def test_cli_help() -> None:
         "restore",
         "build-runtime-mixture",
         "pilot-runtime-mixture",
+        "runtime-gpu-warmup",
         "hydrate-runtime-mixture",
         "publish-runtime-source",
         "verify-uploaded-runtime-source",
@@ -56,6 +57,29 @@ def test_cli_registers_command_group(command: str) -> None:
 
     assert result.exit_code == 0
     assert f"Usage: lehome-train {command}" in strip_ansi(result.stdout)
+
+
+def test_runtime_gpu_warmup_cli_dispatches_the_exact_request_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lehome_train.groot import runtime_mixture_warmup
+
+    request = tmp_path / "runtime-warmup.json"
+    request.write_text("{}", encoding="utf-8")
+    observed: list[Path] = []
+    monkeypatch.setattr(
+        runtime_mixture_warmup,
+        "warmup_from_request",
+        lambda path: observed.append(path) or {"selected_loader_workers": 4},
+    )
+
+    result = CliRunner().invoke(
+        app, ["runtime-gpu-warmup", "--request", str(request)]
+    )
+
+    assert result.exit_code == 0
+    assert observed == [request]
+    assert '"selected_loader_workers":4' in result.stdout
 
 
 @pytest.mark.parametrize("subcommand", ["inspect", "convert", "validate", "publish", "retrieve"])

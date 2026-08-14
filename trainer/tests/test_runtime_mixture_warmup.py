@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 import sys
 import types
+import json
+from pathlib import Path
 
 
 HASH = "a" * 64
@@ -209,3 +211,74 @@ def test_live_adapter_queries_torch_state_and_delegates_live_measurement(
         "torch_cuda_available": True, "torch_cuda_initialized": True, "model_loaded": True,
     }
     assert adapter.measure(worker_count=4, burn_in_steps=10, measured_steps=50) == expected
+
+
+def test_warmup_request_uses_production_factory_live_adapter_not_authored_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lehome_train.groot.runtime_mixture_warmup import (
+        GpuWarmupMeasurement,
+        TorchRuntimeWarmupMetricsAdapter,
+        warmup_from_request,
+    )
+
+    calls: list[dict[str, object]] = []
+
+    class ProductionFactory:
+        def __getattr__(self, _name: str):
+            return lambda *_args: {"status": "unused"}
+
+        def runtime_gpu_warmup_adapter(self, arguments: dict[str, object]):
+            calls.append(arguments)
+            return TorchRuntimeWarmupMetricsAdapter(
+                model_loaded=lambda: True,
+                measure_live=lambda **_kwargs: GpuWarmupMeasurement(
+                    64 * 60, 50, 1.0, 20.0, 18.0, 90.0, False, None
+                ),
+            )
+
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: True, is_initialized=lambda: True)
+    ))
+    monkeypatch.setitem(sys.modules, "warmup_production", types.SimpleNamespace(
+        create=lambda: ProductionFactory()
+    ))
+    monkeypatch.setenv("LEHOME_TRAIN_RUNTIME_FACTORY", "warmup_production:create")
+    request = tmp_path / "runtime-warmup.json"
+    request.write_text(json.dumps({
+        "schema_version": 1,
+        "command": "runtime-gpu-warmup",
+        "arguments": {"cpu_pilot": _cpu_pilot(), "binding": _binding()},
+    }), encoding="utf-8")
+
+    receipt = warmup_from_request(request)
+
+    assert receipt["selected_loader_workers"] == 0
+    assert calls == [{"cpu_pilot": _cpu_pilot(), "binding": _binding()}]
+
+
+def test_warmup_request_rejects_preauthored_candidate_rows_and_missing_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lehome_train.groot.runtime_mixture_warmup import warmup_from_request
+
+    request = tmp_path / "runtime-warmup.json"
+    request.write_text(json.dumps({
+        "schema_version": 1,
+        "command": "runtime-gpu-warmup",
+        "arguments": {
+            "cpu_pilot": _cpu_pilot(), "binding": _binding(),
+            "candidates": [{"accepted": True}],
+        },
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="incomplete or unknown"):
+        warmup_from_request(request)
+
+    request.write_text(json.dumps({
+        "schema_version": 1,
+        "command": "runtime-gpu-warmup",
+        "arguments": {"cpu_pilot": _cpu_pilot(), "binding": _binding()},
+    }), encoding="utf-8")
+    monkeypatch.delenv("LEHOME_TRAIN_RUNTIME_FACTORY", raising=False)
+    with pytest.raises(RuntimeError, match="no training runtime factory"):
+        warmup_from_request(request)

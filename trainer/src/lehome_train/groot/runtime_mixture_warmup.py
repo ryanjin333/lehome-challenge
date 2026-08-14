@@ -369,6 +369,45 @@ def build_gpu_warmup_receipt(
     return receipt
 
 
+def warmup_from_request(path: str | Path) -> dict[str, object]:
+    """Run one schema-checked GPU warm-up through the image production factory.
+
+    The envelope intentionally carries only the authenticated CPU pilot and
+    immutable binding.  Candidate metrics are accepted only from the loaded
+    production factory's live model/DataLoader/NVML adapter.
+    """
+
+    from lehome_train.runtime import _request_arguments, load_runtime_adapter
+
+    arguments = _request_arguments(
+        path,
+        command="runtime-gpu-warmup",
+        expected_fields={"cpu_pilot", "binding"},
+    )
+    cpu_pilot = arguments["cpu_pilot"]
+    binding = arguments["binding"]
+    if not isinstance(cpu_pilot, Mapping) or not isinstance(binding, Mapping):
+        raise ValueError("runtime GPU warm-up requires CPU pilot and binding objects")
+    production = load_runtime_adapter(None)
+    adapter_factory = getattr(production, "runtime_gpu_warmup_adapter", None)
+    if not callable(adapter_factory):
+        raise RuntimeError("training runtime factory has no runtime GPU warm-up adapter")
+    adapter = adapter_factory(dict(arguments))
+    if not isinstance(adapter, TorchRuntimeWarmupMetricsAdapter):
+        raise RuntimeError("training runtime factory returned no live Torch warm-up adapter")
+    receipt = build_gpu_warmup_receipt(
+        cpu_pilot=cpu_pilot,
+        binding=binding,
+        adapter=adapter,
+    )
+    validate_gpu_warmup_receipt(
+        receipt,
+        expected_binding=binding,
+        expected_cpu_pilot=cpu_pilot,
+    )
+    return receipt
+
+
 def validate_gpu_warmup_receipt(
     receipt: Mapping[str, object], *, expected_binding: Mapping[str, object], expected_cpu_pilot: Mapping[str, object] | None = None
 ) -> int:
