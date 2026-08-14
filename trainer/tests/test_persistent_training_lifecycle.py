@@ -2040,6 +2040,111 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
         )
 
 
+def test_direct_gpu_rent_passes_the_ten_minute_readiness_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direct lease tolerates provider loading beyond the legacy 60 seconds."""
+    capability = tmp_path / "bootstrap-capability.json"
+    capability.write_text("{}", encoding="utf-8")
+    claim_path = tmp_path / "claim.json"
+    observed: dict[str, object] = {}
+    instance = {
+        "instance_id": 44, "provider_response_sha256": "a" * 64,
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+    }
+
+    monkeypatch.setattr(LIFECYCLE, "_runtime_failure_receipt_path", lambda _request: tmp_path / "failure.json")
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_preflight", lambda _request: {})
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_claim_path", lambda **_kwargs: claim_path)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_claim", lambda **_kwargs: {"status": "claimed"})
+    monkeypatch.setattr(LIFECYCLE, "_attest_platform_arch", lambda *_args, **_kwargs: "x86_64")
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_bootstrap_capability", lambda **_kwargs: {})
+    monkeypatch.setattr(LIFECYCLE, "_terminalize_runtime_gpu_rent_claim", lambda **_kwargs: None)
+
+    def fake_rent(**kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        return instance
+
+    monkeypatch.setattr(LIFECYCLE, "rent", fake_rent)
+
+    LIFECYCLE.rent_runtime_gpu_warmup(
+        evidence={"bootstrap_capability_receipt": str(capability)}, runner=lambda _command: "",
+    )
+
+    assert observed["max_readiness_polls"] == LIFECYCLE.RUNTIME_GPU_WARMUP_READINESS_POLLS == 120
+
+
+def test_gpu_readiness_accepts_running_after_more_than_legacy_sixty_seconds(tmp_path: Path) -> None:
+    """A direct GPU lease may remain loading for 12 five-second reads before running."""
+    evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json")) | {
+        "search_mode": "interruptible", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+    }
+    reads = 0
+    sleeps: list[float] = []
+    live = {
+        "id": 44, "actual_status": "running", "gpu_name": "RTX PRO 6000 WS",
+        "gpu_ram": 96000, "num_gpus": 1, "dph_total": .18,
+        "ssh_host": "pro6000", "ssh_port": 22,
+    }
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal reads
+        if command[:4] in {("vastai", "--raw", "show", "instances"), ("vastai", "--raw", "show", "volumes")}:
+            return "[]"
+        if command[:4] == ("vastai", "--raw", "create", "instance"):
+            return '{"new_contract":44}'
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            reads += 1
+            return json.dumps(live if reads == 13 else {"id": 44, "actual_status": "loading"})
+        raise AssertionError(command)
+
+    receipt = LIFECYCLE.rent(
+        evidence=evidence, runner=runner, require_capability=False,
+        max_readiness_polls=LIFECYCLE.RUNTIME_GPU_WARMUP_READINESS_POLLS,
+        sleep=sleeps.append,
+    )
+
+    assert receipt["instance_id"] == 44
+    assert reads == 13 and sleeps == [5.0] * 12
+
+
+def test_gpu_readiness_times_out_at_ten_minutes_and_destroys_once(tmp_path: Path) -> None:
+    """Persistent loading ends the direct path after 120 polls with proven cleanup."""
+    evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json")) | {
+        "search_mode": "interruptible", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+    }
+    destroyed = False
+    status_reads = 0
+    sleeps: list[float] = []
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal destroyed, status_reads
+        calls.append(command)
+        if command[:4] in {("vastai", "--raw", "show", "instances"), ("vastai", "--raw", "show", "volumes")}:
+            return "[]"
+        if command[:4] == ("vastai", "--raw", "create", "instance"):
+            return '{"new_contract":44}'
+        if command == ("vastai", "destroy", "instance", "44", "--yes"):
+            destroyed = True
+            return ""
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            status_reads += 1
+            return "{}" if destroyed else '{"id":44,"actual_status":"loading"}'
+        raise AssertionError(command)
+
+    with pytest.raises(ValueError, match="readiness poll timed out"):
+        LIFECYCLE.rent(
+            evidence=evidence, runner=runner, require_capability=False,
+            max_readiness_polls=LIFECYCLE.RUNTIME_GPU_WARMUP_READINESS_POLLS,
+            sleep=sleeps.append,
+        )
+
+    assert status_reads == 121 and sleeps == [5.0] * 120
+    assert calls.count(("vastai", "--raw", "create", "instance", "8", "--image", LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "--disk", "300", "--bid_price", "0.18", "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE)) == 1
+    assert calls.count(("vastai", "destroy", "instance", "44", "--yes")) == 1
+
+
 def test_direct_gpu_rent_rejects_caller_capability_before_provider_calls(tmp_path: Path) -> None:
     evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json"))
     evidence["training_capability"] = {}

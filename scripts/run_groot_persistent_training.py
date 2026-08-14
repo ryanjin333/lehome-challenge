@@ -35,6 +35,10 @@ PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revisi
 OFFER_QUERY = "gpu_ram>=96 num_gpus=1 reliability>=0.95"
 RUNTIME_PILOT_OFFER_QUERY = "cpu_arch=amd64 cpu_cores_effective>=32 cpu_ram>=64 disk_space>=120 reliability>=0.98 num_gpus=1 direct_port_count>=2 duration>=1"
 RUNTIME_PILOT_READINESS_POLLS = 120
+# Direct PRO6000 leases observed in Vast can remain loading beyond the generic
+# one-minute readiness window.  Keep this override local to the paid direct GPU
+# path; legacy rentals retain ``rent``'s twelve-poll default.
+RUNTIME_GPU_WARMUP_READINESS_POLLS = 120
 RUNTIME_SSH_ATTESTATION_POLLS = 12
 RUNTIME_ABSENCE_READBACK_POLLS = 12
 RUNTIME_GPU_ARCH_TIMEOUT_SECONDS = 15
@@ -1897,7 +1901,7 @@ def run_runtime_gpu_warmup(
 
 
 def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -> dict[str, object]:
-    """Promote only a fresh capable interruptible PRO6000 lease for warm-up."""
+    """Promote a fresh direct PRO6000 lease after up to ten minutes of readiness."""
     _runtime_failure_receipt_path(evidence)
     identity = _runtime_gpu_rent_preflight(evidence)
     claim_path = _runtime_gpu_rent_claim_path(request=evidence, identity=identity)
@@ -1907,6 +1911,7 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
         rented = rent(
             evidence=evidence, runner=runner, require_capability=False,
             abort_request=evidence,
+            max_readiness_polls=RUNTIME_GPU_WARMUP_READINESS_POLLS,
         )
         _attest_platform_arch(
             rented, runner=runner, ssh_connection_timeout_seconds=RUNTIME_GPU_ARCH_TIMEOUT_SECONDS,
