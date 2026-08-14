@@ -410,6 +410,47 @@ def test_mix_persistent_initialization_is_idempotent_after_prestate_crash(tmp_pa
     assert not staging.exists()
 
 
+def test_mix_persistent_stateless_root_rejects_unrelated_file_without_deleting_it(tmp_path: Path) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan, staging = build_mix_plan(organizer, flywheel, seed=20260813), tmp_path / "resume"
+    staging.mkdir(); unrelated = staging / "do-not-delete"; unrelated.write_text("user", encoding="utf-8")
+    with pytest.raises(ValueError, match="unexpected"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "destination", persistent_staging_root=staging)
+    assert unrelated.read_text(encoding="utf-8") == "user"
+
+
+def test_mix_materializer_identity_binds_all_behavior_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
+    import lehome_train.data.convert as convert
+    import lehome_train.data.inspect as inspect
+    import lehome_train.data.mapping as mapping
+    import lehome_train.data.split as split
+    from lehome_train.flywheel.mix import _mix_materializer_identity
+    original = __import__("lehome_train.flywheel.mix", fromlist=["sha256_file"]).sha256_file
+    baseline = _mix_materializer_identity()
+    for module in (convert, inspect, mapping, split):
+        monkeypatch.setattr("lehome_train.flywheel.mix.sha256_file", lambda path, original=original, module=module: "f" * 64 if Path(path) == Path(module.__file__) else original(path))
+        assert _mix_materializer_identity() != baseline
+        monkeypatch.undo()
+
+
+def test_validation_reservation_scales_with_bounded_state_for_23k_ranges() -> None:
+    from lehome_train.flywheel.mix import _Chunk, _reserve_validation_chunks
+    chunks = [
+        _Chunk(
+            source_kind="organizer" if index % 2 == 0 else "flywheel", source_root=Path("/source"),
+            source_manifest_sha256=("a" if index % 2 == 0 else "b") * 64, source_revision="c" * 40,
+            episode_id=str(index), start=0, stop=ACTION_HORIZON, frame_ids=tuple(str(frame) for frame in range(ACTION_HORIZON)),
+            raw_manifest_sha256=("d" if index % 2 == 0 else "e") * 64, raw_episode_id=str(index),
+            raw_frame_start=0, raw_frame_stop=ACTION_HORIZON, raw_frame_ids=tuple(str(frame) for frame in range(ACTION_HORIZON)), quality_grade=None,
+        )
+        for index in range(23_089)
+    ]
+    selected = _reserve_validation_chunks(chunks, 2_308, seed=20260813)
+    assert len(selected) == 2_308
+    assert {item.source_kind for item in chunks if item not in selected} == {"organizer", "flywheel"}
+
+
 def test_mix_persistent_resume_regenerates_semantically_wrong_parquet_and_invalid_video(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -460,6 +501,31 @@ def test_mix_persistent_resume_repairs_only_exact_post_promotion_receipt(
     assert destination.is_dir() and staging.exists() and not receipt.exists()
     assert materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)["resumed_after_promotion"] is True
     verify_generation(destination)
+
+
+def test_mix_persistent_resume_rejects_sealed_destination_plan_or_evidence_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    staging, destination = tmp_path / "resume", tmp_path / "destination"
+    receipt = destination.with_name(destination.name + ".generation.json")
+    original = atomic_write_json
+    monkeypatch.setattr("lehome_train.flywheel.mix.atomic_write_json", lambda path, value: (_ for _ in ()).throw(RuntimeError("receipt interruption")) if path == receipt else original(path, value))
+    with pytest.raises(RuntimeError, match="receipt interruption"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging, persistent_source_evidence={"seed": 1})
+    monkeypatch.setattr("lehome_train.flywheel.mix.atomic_write_json", original)
+    # A valid sealed receipt from a different evidence binding must not consume
+    # this staging root, even though the selected files remain byte-valid.
+    from lehome_train.flywheel.mix import _generation_receipt
+    manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8")); manifest["persistent_source_evidence"] = {"seed": 2}; (destination / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    original(destination.with_name(destination.name + ".generation.json"), _generation_receipt(destination))
+    with pytest.raises(ValueError, match="sealed destination"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging, persistent_source_evidence={"seed": 1})
+    assert staging.exists()
+    with pytest.raises(ValueError, match="plan, source, or code"):
+        materialize_mixed_snapshot(build_mix_plan(organizer, flywheel, seed=20260814), organizer, flywheel, destination, persistent_staging_root=staging, persistent_source_evidence={"seed": 1})
 
 
 def test_mix_persistent_resume_rejects_arbitrary_post_promotion_destination(

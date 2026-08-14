@@ -514,58 +514,63 @@ def _reserve_validation_chunks(items: Sequence[_Chunk], count: int, *, seed: int
     if any(groups_by_kind[kind] < 1 for kind in SOURCE_WEIGHTS):
         raise ValueError("mix has no lineage episode for a required training kind")
     random.Random(seed).shuffle(groups)
-    # Dynamic programming picks an exact validation-slot total without consuming
-    # the final lineage episode of either required training kind.  A range group
-    # is indivisible: all overlapping Task-1 windows inherit one split.
-    states: dict[tuple[int, int, int], tuple[int, ...]] = {(0, 0, 0): ()}
+    # Store one predecessor per reachable total, rather than a selected-index
+    # tuple for every (total, organizer-count, flywheel-count) state.  Positive
+    # group sizes make the leave-one constraint equivalent to never selecting
+    # all groups of a kind, which we reject after restoration.
+    predecessor: list[tuple[int, int] | None] = [None] * (count + 1)
+    predecessor[0] = (-1, -1)
     for index, group in enumerate(groups):
-        kind = group[0].source_kind
         size = len(group)
-        for (frames, organizer_groups, flywheel_groups), selected in tuple(states.items()):
-            selected_by_kind = organizer_groups if kind == "organizer" else flywheel_groups
-            if frames + size > count or selected_by_kind >= groups_by_kind[kind] - 1:
-                continue
-            next_key = (
-                frames + size,
-                organizer_groups + (kind == "organizer"),
-                flywheel_groups + (kind == "flywheel"),
-            )
-            if next_key not in states:
-                states[next_key] = selected + (index,)
-    matches = [selected for (frames, _, _), selected in states.items() if frames == count]
-    if not matches:
+        for slots in range(count, size - 1, -1):
+            if predecessor[slots] is None and predecessor[slots - size] is not None:
+                predecessor[slots] = (slots - size, index)
+    if predecessor[count] is None:
         raise ValueError("mix has too few distinct lineage episodes for an unsplit validation holdout")
-    return [item for index in matches[0] for item in groups[index]]
+    selected: list[int] = []
+    slots = count
+    while slots:
+        previous = predecessor[slots]
+        assert previous is not None
+        slots, index = previous
+        selected.append(index)
+    selected_by_kind = {kind: sum(groups[index][0].source_kind == kind for index in selected) for kind in SOURCE_WEIGHTS}
+    if any(selected_by_kind[kind] >= groups_by_kind[kind] for kind in SOURCE_WEIGHTS):
+        raise ValueError("mix has too few distinct lineage episodes for an unsplit validation holdout")
+    return [item for index in selected for item in groups[index]]
 
 
 def _require_cross_split_source_frame_disjointness(selections: Sequence[FrameSelection]) -> None:
     """Reject plans whose train and validation source frames intersect."""
 
-    source_frames = {"train": set(), "validation": set()}
+    source_frames: dict[tuple[str, str, str], str] = {}
     for item in selections:
         item_frames = _source_frame_keys(item)
         if len(item_frames) != ACTION_HORIZON:
             raise ValueError("flywheel mix plan source range has duplicate frame IDs")
-        source_frames[item.split].update(item_frames)
-    if source_frames["train"] & source_frames["validation"]:
-        raise ValueError("flywheel mix plan train and validation source frames overlap")
+        for frame in item_frames:
+            previous = source_frames.setdefault(frame, item.split)
+            if previous != item.split:
+                raise ValueError("flywheel mix plan train and validation source frames overlap")
 
 
 def _require_cross_split_raw_lineage_isolation(selections: Sequence[FrameSelection]) -> None:
     """Reject plans that split a raw episode or reuse one raw frame across splits."""
 
-    raw_frames = {"train": set(), "validation": set()}
-    raw_episodes = {"train": set(), "validation": set()}
+    raw_frames: dict[tuple[str, str, str], str] = {}
+    raw_episodes: dict[tuple[str, str], str] = {}
     for item in selections:
         item_frames = _raw_frame_keys(item)
         if len(item_frames) != ACTION_HORIZON:
             raise ValueError("flywheel mix plan raw lineage range has duplicate frame IDs")
-        raw_frames[item.split].update(item_frames)
-        raw_episodes[item.split].add(_raw_episode_key(item))
-    if raw_frames["train"] & raw_frames["validation"]:
-        raise ValueError("flywheel mix plan train and validation raw frames overlap")
-    if raw_episodes["train"] & raw_episodes["validation"]:
-        raise ValueError("flywheel mix plan splits one immutable raw lineage episode across train and validation")
+        for frame in item_frames:
+            previous = raw_frames.setdefault(frame, item.split)
+            if previous != item.split:
+                raise ValueError("flywheel mix plan train and validation raw frames overlap")
+        episode = _raw_episode_key(item)
+        previous_episode = raw_episodes.setdefault(episode, item.split)
+        if previous_episode != item.split:
+            raise ValueError("flywheel mix plan splits one immutable raw lineage episode across train and validation")
 
 
 def _total_with_exact_train_slots(train_slots: int, *, split_seed: int) -> tuple[int, set[str]]:
@@ -905,7 +910,7 @@ _PERSISTENT_LOCK_NAME = "lock"
 def _mix_materializer_identity() -> str:
     """A restart must be tied to the bytes that implement this materializer."""
 
-    from lehome_train.data import stats, validate
+    from lehome_train.data import convert, inspect, mapping, split, stats, validate
     from lehome_train.flywheel import materialize
     from lehome_train import io
     return canonical_json_sha256({
@@ -914,6 +919,10 @@ def _mix_materializer_identity() -> str:
         "validate": sha256_file(Path(validate.__file__)),
         "statistics": sha256_file(Path(stats.__file__)),
         "io": sha256_file(Path(io.__file__)),
+        "convert": sha256_file(Path(convert.__file__)),
+        "inspect": sha256_file(Path(inspect.__file__)),
+        "mapping": sha256_file(Path(mapping.__file__)),
+        "split": sha256_file(Path(split.__file__)),
     })
 
 
@@ -1061,7 +1070,9 @@ def _clean_owned_atomic_temps(root: Path) -> None:
                 path.unlink()
 
 
-def _verify_promoted_generation_without_receipt(root: Path, *, plan_sha256: str) -> dict[str, object]:
+def _verify_promoted_generation_without_receipt(
+    root: Path, *, plan_sha256: str, persistent_source_evidence: object,
+) -> dict[str, object]:
     """Verify a promoted tree before repairing only its missing sibling receipt."""
 
     if root.is_symlink() or not root.is_dir():
@@ -1070,6 +1081,8 @@ def _verify_promoted_generation_without_receipt(root: Path, *, plan_sha256: str)
     plan = validate_mix_plan_payload(manifest.get("flywheel_mix_plan", {}))
     if plan.sha256 != plan_sha256:
         raise ValueError("persistent materialization destination belongs to another plan")
+    if manifest.get("persistent_source_evidence") != persistent_source_evidence:
+        raise ValueError("persistent materialization destination source evidence differs from staging state")
     artifacts = manifest.get("output_artifacts")
     if not isinstance(artifacts, list) or manifest.get("output_manifest_sha256") != canonical_json_sha256(artifacts):
         raise ValueError("persistent materialization destination manifest is invalid")
@@ -1079,6 +1092,19 @@ def _verify_promoted_generation_without_receipt(root: Path, *, plan_sha256: str)
         raise ValueError("persistent materialization destination files changed after promotion")
     _verify_artifacts(root, manifest)
     return _generation_receipt(root)
+
+
+def _validate_stateless_persistent_root(root: Path) -> None:
+    """Allow only recoverable pre-state initialization entries; never delete others."""
+
+    allowed = {_PERSISTENT_LOCK_NAME, _PERSISTENT_WORK_NAME, _PERSISTENT_RECEIPTS_NAME}
+    for entry in root.iterdir():
+        if entry.name not in allowed or entry.is_symlink():
+            raise ValueError("persistent materialization initialization has an unexpected entry")
+        if entry.name == _PERSISTENT_LOCK_NAME and not entry.is_file():
+            raise ValueError("persistent materialization initialization lock is invalid")
+        if entry.name in {_PERSISTENT_WORK_NAME, _PERSISTENT_RECEIPTS_NAME} and (not entry.is_dir() or any(entry.iterdir())):
+            raise ValueError("persistent materialization initialization is not recoverable")
 
 
 def _generation_receipt(root: Path) -> dict[str, object]:
@@ -1246,9 +1272,14 @@ def materialize_mixed_snapshot(
                             if _generation_receipt_path(destination).exists():
                                 raise ValueError("persistent materialization destination exists but is not the exact sealed generation") from error
                             try:
-                                receipt = _verify_promoted_generation_without_receipt(destination, plan_sha256=plan.sha256)
+                                receipt = _verify_promoted_generation_without_receipt(destination, plan_sha256=plan.sha256, persistent_source_evidence=expected_state["persistent_source_evidence"])
                             except ValueError as repair_error:
                                 raise ValueError("persistent materialization destination exists but is not the exact promoted generation") from repair_error
+                        if (
+                            receipt.get("mix_plan_sha256") != plan.sha256
+                            or receipt.get("persistent_source_evidence") != expected_state["persistent_source_evidence"]
+                        ):
+                            raise ValueError("persistent materialization sealed destination differs from staging state")
                         atomic_write_json(_generation_receipt_path(destination), receipt)
                         shutil.rmtree(persistent_root)
                         return {"path": str(destination), "mix_plan_sha256": plan.sha256, "resumed_after_promotion": True}
@@ -1259,13 +1290,10 @@ def materialize_mixed_snapshot(
                 else:
                     if destination.exists():
                         raise FileExistsError("refusing to overwrite mixed snapshot destination")
+                    _validate_stateless_persistent_root(persistent_root)
                     # A SIGKILL between mkdirs and state sealing is harmless:
                     # recover only the two schema-owned empty directories.
                     receipts_root = persistent_root / _PERSISTENT_RECEIPTS_NAME
-                    if receipts_root.exists() and (receipts_root.is_symlink() or not receipts_root.is_dir() or any(receipts_root.iterdir())):
-                        raise ValueError("persistent materialization initialization is not recoverable")
-                    if temporary.exists() and (temporary.is_symlink() or not temporary.is_dir() or any(temporary.iterdir())):
-                        raise ValueError("persistent materialization initialization is not recoverable")
                     receipts_root.mkdir(mode=0o700, exist_ok=True)
                     temporary.mkdir(mode=0o700, exist_ok=True)
                     atomic_write_json(state_path, expected_state)
