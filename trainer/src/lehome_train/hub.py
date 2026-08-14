@@ -233,6 +233,16 @@ class HuggingFaceHubTransport:
         os.replace(source, target)
 
     @staticmethod
+    def _remove_prefixed_download_root(*, destination: Path, remote_prefix: str) -> None:
+        """Remove only the direct-download staging root after rejecting aliases."""
+
+        root = destination / remote_prefix.split("/", 1)[0]
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            raise ValueError("Hub download staging root is unsafe")
+        if root.exists():
+            shutil.rmtree(root)
+
+    @staticmethod
     def _repo_type(repository: str) -> str:
         try:
             return _APPROVED_REPOSITORIES[repository]
@@ -478,6 +488,15 @@ class HuggingFaceHubTransport:
                         relative_path=relative_path,
                         downloaded=downloaded,
                     )
+            if remote_prefix is not None:
+                self._remove_prefixed_download_root(
+                    destination=destination,
+                    remote_prefix=remote_prefix,
+                )
+            shutil.rmtree(destination / ".cache", ignore_errors=True)
+            final = self._repo_info(repository=repository, revision=revision, token=token)
+            if self._revision(final) != revision:
+                raise ValueError("Hub readback revision changed during download")
         except (ConnectionError, TimeoutError):
             self._preserve_partial_prefixed_download(
                 destination=destination, remote_prefix=remote_prefix, relative_paths=relative_paths,
@@ -492,12 +511,6 @@ class HuggingFaceHubTransport:
             if self._is_rate_limited(error):
                 raise HubRateLimitError("Hub download rate limited") from None
             raise
-        if remote_prefix is not None:
-            shutil.rmtree(destination / remote_prefix.split("/", 1)[0])
-        shutil.rmtree(destination / ".cache", ignore_errors=True)
-        final = self._repo_info(repository=repository, revision=revision, token=token)
-        if self._revision(final) != revision:
-            raise ValueError("Hub readback revision changed during download")
         return revision
 
     def list_tree(

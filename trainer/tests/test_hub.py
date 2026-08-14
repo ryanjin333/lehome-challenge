@@ -688,6 +688,111 @@ def test_real_transport_preserves_completed_prefixed_bytes_when_direct_download_
     ]
 
 
+def test_real_transport_all_existing_prefixed_targets_need_no_staging_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    revision = "e" * 40
+    destination = tmp_path / "readback"
+    files = ("manifest.json", "shards/0001.bin")
+    for relative_path in files:
+        target = destination / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"verified")
+
+    class FakeLibrary:
+        @staticmethod
+        def hf_hub_download(**_kwargs: object) -> str:
+            raise AssertionError("completed targets must not be requested")
+
+    monkeypatch.setattr(transport, "_repo_info", lambda **_kwargs: SimpleNamespace(sha=revision))
+    monkeypatch.setattr(transport, "_library", lambda: FakeLibrary())
+
+    assert transport.download_files(
+        repository="ryanjin333/lehome-groot-n17-data",
+        revision=revision,
+        destination=destination,
+        relative_paths=files,
+        remote_prefix="bc/full",
+        token="hf_all_existing_probe",
+    ) == revision
+    assert not (destination / "bc").exists()
+
+
+def test_real_transport_rejects_a_symlinked_absent_prefixed_staging_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    revision = "e" * 40
+    destination = tmp_path / "readback"
+    target = destination / "manifest.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"verified")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (destination / "bc").symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(transport, "_repo_info", lambda **_kwargs: SimpleNamespace(sha=revision))
+    monkeypatch.setattr(transport, "_library", lambda: SimpleNamespace())
+
+    with pytest.raises(ValueError, match="unsafe"):
+        transport.download_files(
+            repository="ryanjin333/lehome-groot-n17-data",
+            revision=revision,
+            destination=destination,
+            relative_paths=("manifest.json",),
+            remote_prefix="bc/full",
+            token="hf_staging_symlink_probe",
+        )
+
+
+def test_final_immutable_readback_rate_limit_is_retried_and_preserves_targets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    revision = "e" * 40
+    destination = tmp_path / "readback"
+    target = destination / "manifest.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"verified")
+    (destination / ".cache" / "huggingface").mkdir(parents=True)
+    responses: list[object] = [
+        SimpleNamespace(sha=revision),
+        RuntimeError("rate limit"),
+        SimpleNamespace(sha=revision),
+        SimpleNamespace(sha=revision),
+    ]
+    responses[1].status_code = 429  # type: ignore[attr-defined]
+    delays: list[float] = []
+
+    def repo_info(**_kwargs: object) -> object:
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(transport, "_repo_info", repo_info)
+    monkeypatch.setattr(transport, "_library", lambda: SimpleNamespace())
+
+    assert download_files(
+        transport=transport,
+        repository="ryanjin333/lehome-groot-n17-data",
+        revision=revision,
+        destination=destination,
+        relative_paths=("manifest.json",),
+        remote_prefix="bc/full",
+        environ={"HF_TOKEN": "hf_final_rate_limit_probe"},
+        max_attempts=2,
+        sleeper=delays.append,
+    ) == revision
+    assert target.read_bytes() == b"verified"
+    assert not (destination / ".cache").exists()
+    assert delays == [300.0]
+
+
 def test_real_transport_reuses_destination_for_snapshot_resume(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
