@@ -519,7 +519,6 @@ class HuggingFaceHubTransport:
                 folder_path=str(source),
                 allow_patterns=allowed,
                 ignore_patterns=[".cache", ".cache/**", ".huggingface", ".huggingface/**"],
-                token=token,
                 num_workers=max_workers,
             )
         except (ConnectionError, TimeoutError):

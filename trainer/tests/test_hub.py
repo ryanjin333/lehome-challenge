@@ -465,10 +465,15 @@ def test_real_transport_uses_resumable_large_upload_without_path_in_repo(
     payload.parent.mkdir(parents=True)
     payload.write_bytes(b"payload")
     entries = (SyncEntry("rollouts/round-1/payload.bin", "0" * 64, len(b"payload")),)
+
+    def upload_large_folder(**kwargs: object) -> None:
+        assert "token" not in kwargs
+        calls.append(kwargs)
+
     monkeypatch.setattr(
         transport,
         "_api",
-        lambda _token: SimpleNamespace(upload_large_folder=lambda **kwargs: calls.append(kwargs)),
+        lambda _token: SimpleNamespace(upload_large_folder=upload_large_folder),
     )
 
     transport.upload_large_folder(
@@ -481,7 +486,7 @@ def test_real_transport_uses_resumable_large_upload_without_path_in_repo(
         "revision": "main", "folder_path": str(source),
         "allow_patterns": ["rollouts/round-1/payload.bin"],
         "ignore_patterns": [".cache", ".cache/**", ".huggingface", ".huggingface/**"],
-        "token": "hf_large_upload_process_token", "num_workers": 4,
+        "num_workers": 4,
     }]
 
 
