@@ -567,6 +567,44 @@ def test_resume_rejects_partial_staged_envelope_before_execution() -> None:
     _assert_no_resume_execution(calls)
 
 
+def test_repeated_resume_preemption_terminalizes_the_validated_resume_lineage() -> None:
+    instance, request, envelope = _canonical_resume_chain()
+    descriptor = request["resume_checkpoint_descriptor"]
+    assert isinstance(descriptor, dict)
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command[-1] == "cat /prepared/config/resume.json":
+            return json.dumps(envelope)
+        if "sha256sum /prepared/config/resume-checkpoint.json" in command[-1]:
+            return f"{descriptor['sha256']}  resume-checkpoint.json\n{descriptor['byte_size']}\n"
+        if "continuous-train --request /prepared/config/resume.json" in command[-1]:
+            raise subprocess.CalledProcessError(255, command)
+        assert command == ("vastai", "--raw", "show", "instance", "10")
+        return '{"id":10,"actual_status":"interrupted"}'
+
+    result = LIFECYCLE.remote_action(
+        action="resume", instance=instance, request=request, runner=runner,
+    )
+
+    terminal = result["terminal"]
+    assert result["action"] == "resume"
+    assert terminal["instance_id"] == 10
+    assert terminal["generation_sha256"] == request["generation_sha256"]
+    assert terminal["config_sha256"] == request["config_sha256"]
+    assert terminal["experiment_id"] == request["provider_interruption_terminal"]["experiment_id"]
+    assert terminal["provider_reason"] == "provider_interrupted"
+    assert terminal["resumable_checkpoint_step"] == 1000
+    assert terminal["disposable"] is False
+    assert terminal["immutable_checkpoint_publications"] == request["provider_interruption_terminal"]["immutable_checkpoint_publications"]
+    LIFECYCLE._validate_resume_terminal(
+        terminal,
+        generation_sha256=request["generation_sha256"],
+        config_sha256=request["config_sha256"],
+    )
+
+
 def test_remote_ssh_failure_is_terminalized_only_after_provider_interruption_readback() -> None:
     instance = {"instance_id": 9, "host": "old", "port": 22, "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "provider_response_sha256": "a" * 64}
     request = {

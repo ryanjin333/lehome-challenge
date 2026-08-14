@@ -1345,12 +1345,23 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
         reason = classify_provider_interruption(instance=instance, runner=runner)
         if reason is None or action not in {"train", "resume"}:
             raise
-        generation = request.get("generation_sha256")
-        config = request.get("config_sha256")
-        experiment = request.get("experiment_id")
-        publications = request.get("immutable_checkpoint_publications", [])
-        if not isinstance(generation, str) or not isinstance(config, str) or not isinstance(experiment, str) or not isinstance(publications, list):
-            raise ValueError("provider interruption request lacks immutable training identity") from None
+        if action == "resume":
+            # These were fully authenticated before the resume command ran;
+            # never require caller-provided duplicates for a repeated preemption.
+            experiment = terminal["experiment_id"]
+            publications = terminal["immutable_checkpoint_publications"]
+        else:
+            generation = request.get("generation_sha256")
+            config = request.get("config_sha256")
+            experiment = request.get("experiment_id")
+            publications = request.get("immutable_checkpoint_publications", [])
+            if (
+                not isinstance(generation, str)
+                or not isinstance(config, str)
+                or not isinstance(experiment, str)
+                or not isinstance(publications, list)
+            ):
+                raise ValueError("provider interruption request lacks immutable training identity") from None
         terminal = provider_interruption_terminal(
             instance_id=instance_id,
             generation_sha256=generation,
