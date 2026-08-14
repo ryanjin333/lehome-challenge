@@ -241,10 +241,20 @@ _STABLE_INSTANCE_FIELDS = (
     "ssh_host", "ssh_port", "driver_version",
 )
 
+_RUNTIME_PILOT_INSTANCE_FIELDS = (
+    "id", "actual_status", "cpu_arch", "cpu_cores_effective", "cpu_ram", "disk_space",
+    "reliability", "num_gpus", "dph_total", "ssh_host", "ssh_port",
+)
+
 
 def _stable_instance_identity(row: Mapping[str, object]) -> str:
     """Hash only contract facts Vast does not mutate with incidental metadata."""
     return _hash(_project(row, _STABLE_INSTANCE_FIELDS))
+
+
+def _runtime_pilot_instance_identity(row: Mapping[str, object]) -> str:
+    """Bind the CPU-pilot receipt to the native host facts it actually proved."""
+    return _hash(_project(row, _RUNTIME_PILOT_INSTANCE_FIELDS))
 
 
 def _require_account_cap(total: object, *, label: str) -> float:
@@ -307,7 +317,7 @@ def capture_runtime_pilot_offer(*, runner: Runner, now_unix: int | None = None) 
     offers = _json(runner, ("vastai", "--raw", "search", "offers", RUNTIME_PILOT_OFFER_QUERY, "--on-demand", "--storage", "120", "--order", "dph", "--raw"))
     if not isinstance(offers, list):
         raise ValueError("runtime pilot provider offer listing is invalid")
-    eligible = [row for row in offers if isinstance(row, Mapping) and row.get("cpu_arch") == "amd64" and type(row.get("cpu_cores_effective")) is int and row["cpu_cores_effective"] >= 32 and type(row.get("cpu_ram")) in (int, float) and float(row["cpu_ram"]) >= 64000 and type(row.get("disk_space")) in (int, float) and float(row["disk_space"]) >= 120 and row.get("num_gpus") == 1 and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False and type(row.get("id")) is int and type(row.get("dph_total")) in (int, float)]
+    eligible = [row for row in offers if isinstance(row, Mapping) and row.get("cpu_arch") == "amd64" and type(row.get("cpu_cores_effective")) is int and row["cpu_cores_effective"] >= 32 and type(row.get("cpu_ram")) in (int, float) and float(row["cpu_ram"]) >= 64000 and type(row.get("disk_space")) in (int, float) and float(row["disk_space"]) >= 120 and type(row.get("reliability")) in (int, float) and float(row["reliability"]) >= .98 and row.get("num_gpus") == 1 and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False and type(row.get("id")) is int and type(row.get("dph_total")) in (int, float)]
     if not eligible:
         raise ValueError("no on-demand native x86 runtime pilot offer is eligible")
     offer = min(eligible, key=lambda row: (float(row["dph_total"]), -float(row.get("disk_bw", 0)), int(row["id"])))
@@ -315,6 +325,118 @@ def capture_runtime_pilot_offer(*, runner: Runner, now_unix: int | None = None) 
     _require_account_cap(total, label="runtime pilot projected")
     captured = int(time.time()) if now_unix is None else now_unix
     return {"schema_version": 1, "kind": "runtime_mixture_cpu_pilot_offer", "offer": _project(offer, _RUNTIME_PILOT_OFFER_FIELDS), "raw_offer_sha256": _hash(dict(offer)), "account_hourly_total_usd": total, "captured_at_unix": captured, "expires_at_unix": captured + 300, "search_mode": "on_demand", "platform_arch": "amd64", "storage_gb": 120}
+
+
+def _runtime_pilot_offer(evidence: Mapping[str, object]) -> Mapping[str, object]:
+    """Validate the short-lived, on-demand CPU pilot offer receipt."""
+    offer = evidence.get("offer")
+    if (
+        evidence.get("schema_version") != 1
+        or evidence.get("kind") != "runtime_mixture_cpu_pilot_offer"
+        or evidence.get("search_mode") != "on_demand"
+        or evidence.get("platform_arch") != "amd64"
+        or evidence.get("storage_gb") != 120
+        or type(evidence.get("expires_at_unix")) is not int
+        or int(evidence["expires_at_unix"]) < int(time.time())
+        or not isinstance(offer, Mapping)
+        or type(offer.get("id")) is not int
+        or offer.get("cpu_arch") != "amd64"
+        or type(offer.get("cpu_cores_effective")) is not int
+        or int(offer["cpu_cores_effective"]) < 32
+        or type(offer.get("cpu_ram")) not in (int, float)
+        or float(offer["cpu_ram"]) < 64000
+        or type(offer.get("disk_space")) not in (int, float)
+        or float(offer["disk_space"]) < 120
+        or type(offer.get("reliability")) not in (int, float)
+        or float(offer["reliability"]) < .98
+        or offer.get("num_gpus") != 1
+        or offer.get("is_bid") is not False
+        or offer.get("rentable") is not True
+        or offer.get("rented") is not False
+        or type(offer.get("dph_total")) not in (int, float)
+        or re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("raw_offer_sha256"))) is None
+    ):
+        raise ValueError("runtime CPU pilot offer evidence is invalid")
+    _require_account_cap(evidence.get("account_hourly_total_usd"), label="runtime pilot offer evidence")
+    return offer
+
+
+def _runtime_pilot_live_matches(*, live: Mapping[str, object], instance_id: int, offer: Mapping[str, object]) -> bool:
+    return (
+        live.get("id") == instance_id
+        and live.get("actual_status", "running") == "running"
+        and live.get("cpu_arch") == "amd64"
+        and type(live.get("cpu_cores_effective")) is int
+        and int(live["cpu_cores_effective"]) >= 32
+        and type(live.get("cpu_ram")) in (int, float)
+        and float(live["cpu_ram"]) >= 64000
+        and type(live.get("disk_space")) in (int, float)
+        and float(live["disk_space"]) >= 120
+        and type(live.get("reliability")) in (int, float)
+        and float(live["reliability"]) >= .98
+        and live.get("num_gpus") == 1
+        and live.get("dph_total") == offer.get("dph_total")
+        and isinstance(live.get("ssh_host"), str)
+        and bool(live.get("ssh_host"))
+        and type(live.get("ssh_port")) is int
+        and int(live["ssh_port"]) > 0
+    )
+
+
+def _runtime_pilot_cleanup(*, instance_id: int, runner: Runner) -> None:
+    """Destroy only the instance that this invocation just created."""
+    runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+    absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+    if absent not in ({}, None):
+        raise ValueError("runtime CPU pilot cleanup absence readback failed")
+
+
+def rent_runtime_cpu_pilot(
+    *, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12,
+    sleep: Callable[[float], None] = _bounded_sleep,
+) -> dict[str, object]:
+    """Create one bounded native-x86 lease and remove it on every failed proof."""
+    offer = _runtime_pilot_offer(evidence)
+    _require_account_cap(
+        _live_account_total(runner=runner) + float(offer["dph_total"]),
+        label="fresh runtime pilot projection",
+    )
+    created = _json(runner, (
+        "vastai", "--raw", "create", "instance", str(offer["id"]), "--image",
+        BOOTSTRAP_TRAINER_IMAGE, "--disk", "120", "--ssh", "--direct", "--cancel-unavail",
+        "--env", "-e LEHOME_TRAIN_IMAGE=" + BOOTSTRAP_TRAINER_IMAGE,
+    ))
+    if not isinstance(created, Mapping) or type(created.get("new_contract")) is not int:
+        raise ValueError("runtime CPU pilot provider did not return an instance ID")
+    instance_id = int(created["new_contract"])
+    try:
+        live: object = {}
+        for _ in range(max_readiness_polls):
+            live = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+            if isinstance(live, Mapping) and live.get("actual_status", "running") == "running" and live.get("ssh_host"):
+                break
+            sleep(5.0)
+        else:
+            raise ValueError("runtime CPU pilot readiness poll timed out")
+        if not isinstance(live, Mapping) or not _runtime_pilot_live_matches(
+            live=live, instance_id=instance_id, offer=offer,
+        ):
+            raise ValueError("runtime CPU pilot instance readback does not match accepted offer")
+        instance = {
+            "schema_version": 1, "kind": "runtime_mixture_cpu_pilot_instance",
+            "instance_id": instance_id, "host": live["ssh_host"], "port": live["ssh_port"],
+            "platform_arch": "x86_64", "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
+            "offer_evidence_sha256": _hash(evidence),
+            "provider_response_sha256": _runtime_pilot_instance_identity(live),
+            "account_hourly_total_usd": _require_account_cap(
+                evidence.get("account_hourly_total_usd"), label="runtime pilot offer evidence",
+            ),
+        }
+        _attest_platform_arch(instance, runner=runner)
+        return instance
+    except BaseException:
+        _runtime_pilot_cleanup(instance_id=instance_id, runner=runner)
+        raise
 
 
 def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep, require_capability: bool = True) -> dict[str, object]:
@@ -842,19 +964,17 @@ def _runtime_identity(instance: Mapping[str, object], request: Mapping[str, obje
     return {"bc": bc, "bc_receipt_sha256": bc_sha, "rollout": rollout, "rollout_receipt_sha256": rollout_sha, "deployment": deployment, "deployment_receipt_sha256": deployment_sha}
 
 
-def _validated_runtime_pilot(path_value: object) -> dict[str, object]:
-    if type(path_value) is not str:
-        raise ValueError("runtime mixture production requires a pilot receipt")
-    value = dict(_load_regular_json(Path(path_value), "runtime mixture pilot receipt"))
+def _validated_runtime_pilot_value(receipt: Mapping[str, object]) -> dict[str, object]:
+    """Validate either the established receipt or the current pilot CLI output."""
+    value = dict(receipt)
     evidence = value.get("authenticated_evidence")
     rows = value.get("timing_rows")
-    if (
-        value.get("schema_version") != 3
-        or value.get("kind") != "runtime_mixture_loader_pilot"
+    common_invalid = (
+        value.get("kind") != "runtime_mixture_loader_pilot"
         or value.get("model_loaded") is not False or value.get("gpu_initialized") is not False
         or value.get("native_x86_required") is not True
         or value.get("canonical_worker_counts") != [0, 4, 8, 16, 24]
-        or value.get("canonical_completion") is not True or value.get("throughput_verified") is not True
+        or value.get("canonical_completion") is not True
         or not isinstance(evidence, Mapping)
         or set(evidence) != {"provider_instance_id", "provider_response_sha256", "platform_arch", "image_digest", "code_revision", "code_bundle_sha256", "bc_revision", "rollout_revision", "deployment_revision"}
         or type(evidence.get("provider_instance_id")) is not int
@@ -865,9 +985,134 @@ def _validated_runtime_pilot(path_value: object) -> dict[str, object]:
         or re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("code_bundle_sha256"))) is None
         or not isinstance(rows, list) or [row.get("worker_count") if isinstance(row, Mapping) else None for row in rows] != [0, 4, 8, 16, 24]
         or any(not isinstance(row, Mapping) or set(row) != {"worker_count", "decoded_samples", "seconds", "samples_per_second", "host_cpu_seconds", "host_max_rss_mib", "latency_seconds_p50", "latency_seconds_p95"} or type(row.get("decoded_samples")) is not int or row["decoded_samples"] < 100 or any(type(row.get(key)) not in (int, float) or float(row[key]) < 0 for key in ("seconds", "samples_per_second", "host_cpu_seconds", "host_max_rss_mib", "latency_seconds_p50", "latency_seconds_p95")) for row in rows)
-    ):
+    )
+    version = value.get("schema_version")
+    legacy_invalid = version == 3 and value.get("throughput_verified") is not True
+    current_invalid = version == 4 and (
+        set(value) != {
+            "schema_version", "kind", "model_loaded", "gpu_initialized", "processor_contract",
+            "representative", "sample_count_per_worker", "worker_counts", "canonical_worker_counts",
+            "loader_throughput", "timing_rows", "authenticated_evidence", "cache_cap",
+            "native_x86_required", "timeout_seconds", "canonical_completion",
+        }
+        or value.get("processor_contract") != "pinned_processor_integration_required"
+        or value.get("worker_counts") != [0, 4, 8, 16, 24]
+        or type(value.get("sample_count_per_worker")) is not int
+        or int(value["sample_count_per_worker"]) < 100
+        or not isinstance(value.get("loader_throughput"), Mapping)
+        or not isinstance(value.get("representative"), Mapping)
+        or value["representative"].get("three_cameras") is not True
+        or value["representative"].get("action_horizon") != 40
+        or type(value.get("cache_cap")) is not int
+        or type(value.get("timeout_seconds")) not in (int, float)
+    )
+    if version not in {3, 4} or common_invalid or legacy_invalid or current_invalid:
         raise ValueError("runtime mixture production requires an authenticated measured canonical CPU-only pilot receipt")
     return value
+
+
+def _validated_runtime_pilot(path_value: object) -> dict[str, object]:
+    if type(path_value) is not str:
+        raise ValueError("runtime mixture production requires a pilot receipt")
+    return _validated_runtime_pilot_value(
+        _load_regular_json(Path(path_value), "runtime mixture pilot receipt"),
+    )
+
+
+def _runtime_pilot_instance(instance: Mapping[str, object]) -> None:
+    if (
+        instance.get("schema_version") != 1
+        or instance.get("kind") != "runtime_mixture_cpu_pilot_instance"
+        or type(instance.get("instance_id")) is not int
+        or not isinstance(instance.get("host"), str)
+        or type(instance.get("port")) is not int
+        or instance.get("platform_arch") != "x86_64"
+        or instance.get("trainer_image") != BOOTSTRAP_TRAINER_IMAGE
+        or re.fullmatch(r"[0-9a-f]{64}", str(instance.get("provider_response_sha256"))) is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(instance.get("offer_evidence_sha256"))) is None
+    ):
+        raise ValueError("runtime CPU pilot instance receipt is invalid")
+
+
+def run_runtime_cpu_pilot(
+    *, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner,
+) -> dict[str, object]:
+    """Run the existing CPU-only loader sweep and bind its remote receipt locally."""
+    _runtime_pilot_instance(instance)
+    identity = _runtime_identity(instance, request)
+    bundle = request.get("code_bundle_sha256")
+    output = request.get("lifecycle_receipt")
+    if (
+        type(bundle) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", bundle) is None
+        or type(output) is not str
+        or not Path(output).is_absolute()
+        or Path(output).exists()
+        or Path(output).is_symlink()
+    ):
+        raise ValueError("runtime CPU pilot requires an absent absolute lifecycle receipt output")
+    command = (
+        "set -eu; env -u HF_TOKEN PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src "
+        "lehome-train pilot-runtime-mixture --request /prepared/config/runtime-pilot.json"
+    )
+    try:
+        remote = _json(runner, (*_ssh_prefix(instance), command))
+    except ValueError as error:
+        raise ValueError("runtime CPU pilot did not return a measured receipt") from error
+    if not isinstance(remote, Mapping):
+        raise ValueError("runtime CPU pilot did not return a measured receipt")
+    pilot = _validated_runtime_pilot_value(remote)
+    proof = pilot["authenticated_evidence"]
+    if (
+        proof.get("provider_instance_id") != instance.get("instance_id")
+        or proof.get("provider_response_sha256") != instance.get("provider_response_sha256")
+        or proof.get("platform_arch") != "x86_64"
+        or proof.get("image_digest") != BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
+        or proof.get("code_revision") != request.get("code_revision")
+        or proof.get("code_bundle_sha256") != bundle
+        or proof.get("bc_revision") != identity["bc"]["immutable_revision"]
+        or proof.get("rollout_revision") != identity["rollout"]["immutable_revision"]
+        or proof.get("deployment_revision") != identity["deployment"]["immutable_revision"]
+    ):
+        raise ValueError("runtime CPU pilot measured receipt is not bound to provider, code, image, and mixture")
+    lifecycle = {
+        "schema_version": 1, "kind": "runtime_mixture_cpu_pilot_lifecycle",
+        "instance_id": instance["instance_id"],
+        "provider_response_sha256": instance["provider_response_sha256"],
+        "platform_arch": "x86_64", "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
+        "code_revision": request["code_revision"], "code_bundle_sha256": bundle,
+        "bc_revision": identity["bc"]["immutable_revision"],
+        "rollout_revision": identity["rollout"]["immutable_revision"],
+        "deployment_revision": identity["deployment"]["immutable_revision"],
+        "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
+        "pilot_receipt": pilot,
+    }
+    atomic_write_json(Path(output), lifecycle)
+    return {"paid_action": True, "action": "runtime-pilot-run", "instance_id": instance["instance_id"], "lifecycle_receipt": lifecycle}
+
+
+def destroy_runtime_cpu_pilot(
+    *, instance_id: int, lifecycle_receipt: Mapping[str, object], runner: Runner,
+) -> dict[str, object]:
+    """Allow disposal only after the exact instance-bound measured pilot receipt."""
+    if type(instance_id) is not int or lifecycle_receipt.get("kind") != "runtime_mixture_cpu_pilot_lifecycle":
+        raise ValueError("runtime CPU pilot destroy receipt is invalid")
+    pilot = lifecycle_receipt.get("pilot_receipt")
+    if not isinstance(pilot, Mapping):
+        raise ValueError("runtime CPU pilot destroy requires an authenticated pilot receipt")
+    validated = _validated_runtime_pilot_value(pilot)
+    proof = validated["authenticated_evidence"]
+    expected = {
+        "instance_id": instance_id, "platform_arch": "x86_64",
+        "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
+    }
+    if any(lifecycle_receipt.get(key) != value for key, value in expected.items()) or re.fullmatch(r"[0-9a-f]{64}", str(lifecycle_receipt.get("provider_response_sha256"))) is None or re.fullmatch(r"[0-9a-f]{64}", str(lifecycle_receipt.get("code_bundle_sha256"))) is None or re.fullmatch(r"[0-9a-f]{64}", str(lifecycle_receipt.get("deployment_receipt_sha256"))) is None or any(re.fullmatch(r"[0-9a-f]{40}", str(lifecycle_receipt.get(key))) is None for key in ("code_revision", "bc_revision", "rollout_revision", "deployment_revision")) or proof.get("provider_instance_id") != instance_id or proof.get("provider_response_sha256") != lifecycle_receipt.get("provider_response_sha256") or proof.get("platform_arch") != "x86_64" or proof.get("image_digest") != BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2] or any(proof.get(key) != lifecycle_receipt.get(key) for key in ("code_revision", "code_bundle_sha256", "bc_revision", "rollout_revision", "deployment_revision")):
+        raise ValueError("runtime CPU pilot destroy receipt is not bound to its authenticated pilot")
+    runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
+    absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
+    if absent not in ({}, None):
+        raise ValueError("runtime CPU pilot destroy absence readback failed")
+    return {"paid_action": True, "destroy_authorized": True, "instance_id": instance_id}
 
 
 def runtime_mixture_pilot_provider_plan() -> dict[str, object]:
@@ -912,7 +1157,7 @@ def runtime_mixture_train(*, instance: Mapping[str, object], request: Mapping[st
         "deployment_revision": identity["deployment"]["immutable_revision"],
         "deployment_tree_receipt_sha256": identity["deployment_receipt_sha256"],
         "pilot_receipt_sha256": sha256_file(Path(str(request["pilot_receipt"]))),
-        "runtime_command": "runtime-mixture-train", "throughput_verified": pilot["throughput_verified"],
+        "runtime_command": "runtime-mixture-train", "throughput_verified": pilot.get("throughput_verified", pilot["canonical_completion"]),
     }
     atomic_write_json(Path(output), receipt)
     return {"paid_action": True, "action": "runtime-train", "instance_id": instance["instance_id"], "execution_receipt": receipt}
@@ -925,6 +1170,7 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         "code_bundle": "code.bundle", "code_bundle_sha256_file": "code.bundle.sha256",
         "launch_config": "launch.json", "experiment_config": "experiment.json",
         "runtime_train_request": "runtime-train.json", "runtime_hydrate_request": "runtime-hydrate.json",
+        "runtime_pilot_request": "runtime-pilot.json",
         "modality_config": "modality.py", "token_file": "runtime.token",
         "bc_readback_receipt": "bc-readback.json", "rollout_readback_receipt": "rollout-readback.json",
         "deployment_receipt": "deployment-receipt.json",
@@ -936,9 +1182,9 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         raise ValueError("runtime mixture stage code bundle receipt differs from the reviewed bundle")
     _safe_archive(code, "runtime mixture code bundle")
     _read_private_token(str(request["token_file"]))
-    for field in ("runtime_train_request", "runtime_hydrate_request"):
+    for field in ("runtime_train_request", "runtime_hydrate_request", "runtime_pilot_request"):
         envelope = _load_regular_json(Path(str(request[field])), "runtime mixture reviewed request")
-        if envelope.get("command") not in {"runtime-mixture-train", "hydrate-runtime-mixture"} or "/prepared/generation" in json.dumps(envelope, sort_keys=True) or "continuous-train" in json.dumps(envelope, sort_keys=True):
+        if envelope.get("command") not in {"runtime-mixture-train", "hydrate-runtime-mixture", "pilot-runtime-mixture"} or "/prepared/generation" in json.dumps(envelope, sort_keys=True) or "continuous-train" in json.dumps(envelope, sort_keys=True):
             raise ValueError("runtime mixture stage rejects legacy generation request content")
     remote_dir = "/tmp/lehome-runtime-stage"
     runner((*_ssh_prefix(instance), "mkdir -p " + remote_dir))
@@ -953,7 +1199,7 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         if not observed or observed[0] != digest:
             raise ValueError("runtime mixture staged hash readback failed")
         transfers.append({"name": remote_name, "sha256": digest})
-    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/code /prepared/config /prepared/runtime /output; mv " + remote_dir + "/launch.json /prepared/config/launch.json; mv " + remote_dir + "/experiment.json /prepared/config/experiment.json; mv " + remote_dir + "/runtime-train.json /prepared/config/runtime-train.json; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/code.bundle -C /prepared/code; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code"))
+    runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/code /prepared/config /prepared/runtime /output; mv " + remote_dir + "/launch.json /prepared/config/launch.json; mv " + remote_dir + "/experiment.json /prepared/config/experiment.json; mv " + remote_dir + "/runtime-train.json /prepared/config/runtime-train.json; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/runtime-pilot.json /prepared/config/runtime-pilot.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/code.bundle -C /prepared/code; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code"))
     return {"paid_action": True, "action": "runtime-stage", "instance_id": instance["instance_id"], "code_bundle_sha256": request["code_bundle_sha256"], "transfers": transfers}
 
 
@@ -1738,7 +1984,7 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
 
 
 def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object]:
-    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "bootstrap-canary", "promote", "replacement-resume", "rent", "stage", "runtime-pilot-plan", "runtime-stage", "runtime-hydrate", "runtime-train", "tune", "train", "status", "resume", "destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "capture-runtime-pilot-offer", "bootstrap-canary", "promote", "replacement-resume", "rent", "runtime-pilot-rent", "stage", "runtime-pilot-plan", "runtime-stage", "runtime-hydrate", "runtime-pilot-run", "runtime-train", "tune", "train", "status", "resume", "destroy", "runtime-pilot-destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "materialize":
         return _materialize(request)
@@ -1773,6 +2019,7 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
         return {"paid_action": False, "action": "prepare", "organizer_source": ORGANIZER_SOURCE, "corrective_source": CORRECTIVE_SOURCE, "request": request}
     if not args.execute: return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
     if args.action == "capture-offers": return capture_offers(runner=runner)
+    if args.action == "capture-runtime-pilot-offer": return capture_runtime_pilot_offer(runner=runner)
     if args.action == "bootstrap-canary": return bootstrap_canary(evidence=request, runner=runner)
     if args.action == "promote": return {"paid_action": True, "action": "promote", "instance": promote_canary(capability_receipt=request, runner=runner)}
     if args.action == "replacement-resume":
@@ -1783,6 +2030,7 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
             raise ValueError("replacement-resume requires interruption terminal, replacement capability receipt, and descriptor output")
         return {"paid_action": True, "action": "replacement-resume", **replacement_resume_descriptor(terminal=terminal, capability_receipt=capability, runner=runner, transport=HuggingFaceHubTransport(timeout_seconds=30.0), token=_read_private_token(args.token_file), descriptor_output=Path(descriptor_output))}
     if args.action == "rent": return rent(evidence=request, runner=runner)
+    if args.action == "runtime-pilot-rent": return rent_runtime_cpu_pilot(evidence=request, runner=runner)
     if args.action == "destroy":
         return destroy(
             instance_id=request.get("instance_id"),  # type: ignore[arg-type]
@@ -1791,8 +2039,19 @@ def main_for_test(argv: list[str], *, runner: Runner = _run) -> dict[str, object
             transport=HuggingFaceHubTransport(timeout_seconds=30.0),
             token=_read_private_token(args.token_file),
         )
+    if args.action == "runtime-pilot-destroy":
+        lifecycle_path = request.get("lifecycle_receipt")
+        if type(lifecycle_path) is not str or type(request.get("instance_id")) is not int:
+            raise ValueError("runtime-pilot-destroy requires instance_id and lifecycle_receipt path")
+        return destroy_runtime_cpu_pilot(
+            instance_id=request["instance_id"],
+            lifecycle_receipt=_load_regular_json(Path(lifecycle_path), "runtime CPU pilot lifecycle receipt"),
+            runner=runner,
+        )
     instance = request.get("instance")
     if not isinstance(instance, Mapping): raise ValueError("remote action requires an instance receipt")
+    if args.action == "runtime-pilot-run":
+        return run_runtime_cpu_pilot(instance=instance, request=request, runner=runner)
     return remote_action(action=args.action, instance=instance, request=request, runner=runner)
 
 

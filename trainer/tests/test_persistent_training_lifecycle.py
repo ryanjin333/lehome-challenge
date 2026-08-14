@@ -2,6 +2,7 @@ from pathlib import Path
 import hashlib
 import json
 import subprocess
+import time
 
 import pytest
 
@@ -1305,3 +1306,222 @@ def test_capture_runtime_cpu_pilot_offer_uses_exact_on_demand_contract() -> None
     receipt = LIFECYCLE.capture_runtime_pilot_offer(runner=runner, now_unix=1)
     assert receipt["offer"]["id"] == 8 and receipt["account_hourly_total_usd"] < 1
     assert "--on-demand" in commands[0] and "--storage" in commands[0]
+
+
+def test_capture_runtime_cpu_pilot_offer_rejects_account_total_at_one_dollar() -> None:
+    offer = {"id": 8, "cpu_arch": "amd64", "cpu_cores_effective": 32, "cpu_ram": 64390, "disk_space": 124.75, "disk_bw": 500, "reliability": .99, "num_gpus": 1, "dph_total": .18, "is_bid": False, "rentable": True, "rented": False}
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[2:4] == ("search", "offers"):
+            return json.dumps([offer])
+        if command[2:4] == ("show", "instances"):
+            return '[{"dph_total":0.82}]'
+        if command[2:4] == ("show", "volumes"):
+            return "[]"
+        raise AssertionError(command)
+
+    with pytest.raises(ValueError, match="exceeds"):
+        LIFECYCLE.capture_runtime_pilot_offer(runner=runner, now_unix=1)
+
+
+def _runtime_pilot_offer_evidence() -> dict[str, object]:
+    offer = {
+        "id": 8, "ask_contract_id": 9, "machine_id": 10, "cpu_arch": "amd64",
+        "cpu_cores_effective": 32, "cpu_ram": 64390, "disk_space": 124.75,
+        "disk_bw": 500, "inet_down": 1000, "reliability": .99, "num_gpus": 1,
+        "dph_total": .18, "storage_total_cost": 0, "is_bid": False,
+        "rentable": True, "rented": False, "gpu_name": "RTX PRO 6000 WS",
+        "gpu_ram": 96000, "driver_version": "x",
+    }
+    return {
+        "schema_version": 1, "kind": "runtime_mixture_cpu_pilot_offer", "offer": offer,
+        "raw_offer_sha256": LIFECYCLE._hash(offer), "account_hourly_total_usd": .18,
+        "captured_at_unix": int(time.time()), "expires_at_unix": int(time.time()) + 60,
+        "search_mode": "on_demand", "platform_arch": "amd64", "storage_gb": 120,
+    }
+
+
+def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof() -> None:
+    commands: list[tuple[str, ...]] = []
+    live = {
+        "id": 44, "actual_status": "running", "cpu_arch": "amd64",
+        "cpu_cores_effective": 32, "cpu_ram": 64390, "disk_space": 124.75,
+        "reliability": .99, "num_gpus": 1, "dph_total": .18,
+        "ssh_host": "native-x86", "ssh_port": 22,
+    }
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(command)
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        if command[:4] == ("vastai", "--raw", "create", "instance"):
+            return '{"new_contract":44}'
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return json.dumps(live)
+        if command[-1] == "set -eu; uname -m":
+            return "x86_64\n"
+        raise AssertionError(command)
+
+    receipt = LIFECYCLE.rent_runtime_cpu_pilot(
+        evidence=_runtime_pilot_offer_evidence(), runner=runner, sleep=lambda _: None,
+    )
+
+    assert receipt["kind"] == "runtime_mixture_cpu_pilot_instance"
+    assert receipt["platform_arch"] == "x86_64"
+    assert ("vastai", "--raw", "create", "instance", "8", "--image", LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "--disk", "120", "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE) in commands
+
+
+def test_rent_runtime_cpu_pilot_mismatch_cleans_only_new_instance_and_proves_absence() -> None:
+    calls: list[tuple[str, ...]] = []
+    destroyed = False
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal destroyed
+        calls.append(command)
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        if command[:4] == ("vastai", "--raw", "create", "instance"):
+            return '{"new_contract":44}'
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return "{}" if destroyed else json.dumps({
+                "id": 44, "actual_status": "running", "cpu_arch": "aarch64",
+                "cpu_cores_effective": 32, "cpu_ram": 64390, "disk_space": 124.75,
+                "reliability": .99, "num_gpus": 1, "dph_total": .18,
+                "ssh_host": "wrong", "ssh_port": 22,
+            })
+        if command == ("vastai", "destroy", "instance", "44", "--yes"):
+            destroyed = True
+            return ""
+        raise AssertionError(command)
+
+    with pytest.raises(ValueError, match="readback"):
+        LIFECYCLE.rent_runtime_cpu_pilot(
+            evidence=_runtime_pilot_offer_evidence(), runner=runner, sleep=lambda _: None,
+        )
+
+    assert calls[-2:] == [
+        ("vastai", "destroy", "instance", "44", "--yes"),
+        ("vastai", "--raw", "show", "instance", "44"),
+    ]
+
+
+def test_rent_runtime_cpu_pilot_timeout_cleans_new_instance_and_proves_absence() -> None:
+    calls: list[tuple[str, ...]] = []
+    destroyed = False
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal destroyed
+        calls.append(command)
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        if command[:4] == ("vastai", "--raw", "create", "instance"):
+            return '{"new_contract":44}'
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return "{}" if destroyed else '{"id":44,"actual_status":"loading"}'
+        if command == ("vastai", "destroy", "instance", "44", "--yes"):
+            destroyed = True
+            return ""
+        raise AssertionError(command)
+
+    with pytest.raises(ValueError, match="timed out"):
+        LIFECYCLE.rent_runtime_cpu_pilot(
+            evidence=_runtime_pilot_offer_evidence(), runner=runner,
+            max_readiness_polls=1, sleep=lambda _: None,
+        )
+
+    assert calls[-2:] == [
+        ("vastai", "destroy", "instance", "44", "--yes"),
+        ("vastai", "--raw", "show", "instance", "44"),
+    ]
+
+
+def _runtime_pilot_request_files(tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:
+    receipts = {
+        "bc": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "a" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True},
+        "rollout": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "b" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True},
+        "deployment": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "e" * 64, "artifact_entries": [{"relative_path": "mixture.json", "sha256": "f" * 64, "byte_size": 1}], "fresh_readback_verified": True, "tree_listing_verified": True},
+    }
+    paths: dict[str, str] = {}
+    for name, receipt in receipts.items():
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        paths[name] = str(path)
+    instance = {
+        "schema_version": 1, "kind": "runtime_mixture_cpu_pilot_instance",
+        "instance_id": 44, "host": "native-x86", "port": 22, "platform_arch": "x86_64",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "offer_evidence_sha256": "1" * 64,
+        "provider_response_sha256": "2" * 64, "account_hourly_total_usd": .18,
+    }
+    request = {
+        "bc_readback_receipt": paths["bc"], "rollout_readback_receipt": paths["rollout"],
+        "deployment_receipt": paths["deployment"], "code_revision": "3" * 40,
+        "code_bundle_sha256": "4" * 64, "lifecycle_receipt": str(tmp_path / "pilot-lifecycle.json"),
+    }
+    return instance, request
+
+
+def test_runtime_cpu_pilot_executes_only_loader_cli_and_persists_bound_lifecycle(tmp_path: Path) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    pilot = {
+        "schema_version": 4, "kind": "runtime_mixture_loader_pilot", "model_loaded": False,
+        "gpu_initialized": False, "processor_contract": "pinned_processor_integration_required",
+        "representative": {"bc_window_id": "bc", "rollout_window_id": "rollout", "three_cameras": True, "action_horizon": 40},
+        "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24],
+        "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {},
+        "timing_rows": [{"worker_count": count, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 100.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for count in [0, 4, 8, 16, 24]],
+        "authenticated_evidence": {"provider_instance_id": 44, "provider_response_sha256": "2" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40},
+        "cache_cap": 1, "native_x86_required": True, "timeout_seconds": 60.0,
+        "canonical_completion": True,
+    }
+    calls: list[tuple[str, ...]] = []
+    report = LIFECYCLE.run_runtime_cpu_pilot(
+        instance=instance, request=request,
+        runner=lambda command: calls.append(command) or json.dumps(pilot),
+    )
+
+    assert report["action"] == "runtime-pilot-run"
+    assert "pilot-runtime-mixture --request /prepared/config/runtime-pilot.json" in calls[-1][-1]
+    assert "runtime-mixture-train" not in calls[-1][-1] and "continuous-train" not in calls[-1][-1]
+    persisted = json.loads(Path(str(request["lifecycle_receipt"])).read_text(encoding="utf-8"))
+    assert persisted["instance_id"] == 44
+    assert persisted["deployment_revision"] == "c" * 40
+    assert persisted["pilot_receipt"]["gpu_initialized"] is False
+
+
+def test_runtime_cpu_pilot_destroy_requires_untampered_bound_pilot_lifecycle(tmp_path: Path) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    lifecycle = {
+        "schema_version": 1, "kind": "runtime_mixture_cpu_pilot_lifecycle", "instance_id": 44,
+        "provider_response_sha256": "2" * 64, "platform_arch": "x86_64",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "code_revision": "3" * 40,
+        "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40,
+        "deployment_revision": "c" * 40, "deployment_receipt_sha256": LIFECYCLE.sha256_file(Path(str(request["deployment_receipt"]))),
+        "pilot_receipt": {"schema_version": 3, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "gpu_initialized": False, "native_x86_required": True, "canonical_worker_counts": [0, 4, 8, 16, 24], "canonical_completion": True, "throughput_verified": True, "authenticated_evidence": {"provider_instance_id": 44, "provider_response_sha256": "2" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40}, "timing_rows": [{"worker_count": count, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 100.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for count in [0, 4, 8, 16, 24]]},
+    }
+    calls: list[tuple[str, ...]] = []
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        return "{}" if command[:4] == ("vastai", "--raw", "show", "instance") else ""
+
+    assert LIFECYCLE.destroy_runtime_cpu_pilot(instance_id=44, lifecycle_receipt=lifecycle, runner=runner)["destroy_authorized"] is True
+    lifecycle["pilot_receipt"]["authenticated_evidence"]["provider_instance_id"] = 45  # type: ignore[index]
+    with pytest.raises(ValueError, match="pilot"):
+        LIFECYCLE.destroy_runtime_cpu_pilot(instance_id=44, lifecycle_receipt=lifecycle, runner=runner)
+
+
+def test_runtime_cpu_pilot_cli_actions_are_explicitly_gated_and_never_use_legacy_train(tmp_path: Path) -> None:
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"instance_id": 44}), encoding="utf-8")
+
+    report = LIFECYCLE.main_for_test(["runtime-pilot-destroy", "--request", str(request)])
+
+    assert report == {"paid_action": False, "action": "runtime-pilot-destroy", "dry_run": True, "request": {"instance_id": 44}}
