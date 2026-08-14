@@ -741,10 +741,20 @@ def _ssh_prefix(instance: Mapping[str, object]) -> tuple[str, ...]:
     return ("ssh", "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port), "root@" + host)
 
 
-def _attest_platform_arch(instance: Mapping[str, object], *, runner: Runner) -> str:
+def _attest_platform_arch(
+    instance: Mapping[str, object], *, runner: Runner,
+    ssh_connection_timeout_seconds: int | None = None,
+) -> str:
     """Accept native x86 only after the just-rented host reports it over SSH."""
+    prefix = _ssh_prefix(instance)
+    if ssh_connection_timeout_seconds is not None:
+        if type(ssh_connection_timeout_seconds) is not int or ssh_connection_timeout_seconds <= 0:
+            raise ValueError("platform attestation SSH connection timeout is invalid")
+        prefix = (
+            *prefix[:-1], "-o", f"ConnectTimeout={ssh_connection_timeout_seconds}", prefix[-1],
+        )
     try:
-        arch = runner((*_ssh_prefix(instance), "set -eu; uname -m")).strip()
+        arch = runner((*prefix, "set -eu; uname -m")).strip()
     except (subprocess.CalledProcessError, OSError, TimeoutError) as error:
         raise ValueError("native platform attestation is unavailable") from error
     if arch not in {"x86_64", "amd64"}:
@@ -762,7 +772,9 @@ def _await_platform_arch_attestation(
         raise ValueError("runtime SSH attestation poll bound is invalid")
     for poll in range(max_polls):
         try:
-            return _attest_platform_arch(instance, runner=runner)
+            return _attest_platform_arch(
+                instance, runner=runner, ssh_connection_timeout_seconds=5,
+            )
         except ValueError as error:
             if not isinstance(error.__cause__, (subprocess.CalledProcessError, OSError, TimeoutError)):
                 raise

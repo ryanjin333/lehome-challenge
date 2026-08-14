@@ -1513,6 +1513,63 @@ def test_runtime_cpu_pilot_retries_transient_ssh_arch_attestation(tmp_path: Path
     assert not failure_receipt.exists()
 
 
+def test_runtime_cpu_pilot_exhausts_bounded_transient_ssh_arch_attestation(tmp_path: Path) -> None:
+    commands: list[tuple[str, ...]] = []
+    sleeps: list[float] = []
+    destroyed = False
+    ssh_attempts = 0
+    live = {
+        "id": 44, "actual_status": "running", "cpu_arch": "amd64",
+        "cpu_cores_effective": 32, "cpu_ram": 64390, "disk_space": 124.75,
+        "machine_id": 10, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000,
+        "driver_version": "x", "reliability": .99, "num_gpus": 1, "dph_total": .18,
+        "ssh_host": "native-x86", "ssh_port": 22,
+    }
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal destroyed, ssh_attempts
+        commands.append(command)
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        if command[:4] == ("vastai", "--raw", "create", "instance"):
+            return '{"new_contract":44}'
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return "{}" if destroyed else json.dumps(live)
+        if command == ("vastai", "destroy", "instance", "44", "--yes"):
+            destroyed = True
+            return ""
+        if command[-1] == "set -eu; uname -m":
+            ssh_attempts += 1
+            raise subprocess.CalledProcessError(255, command)
+        raise AssertionError(command)
+
+    failure_receipt = tmp_path / "failure.json"
+    with pytest.raises(ValueError, match="unavailable"):
+        LIFECYCLE.rent_runtime_cpu_pilot(
+            evidence=_runtime_pilot_offer_evidence(failure_receipt=str(failure_receipt)),
+            runner=runner, sleep=sleeps.append,
+        )
+
+    ssh_commands = [command for command in commands if command[-1] == "set -eu; uname -m"]
+    assert len(ssh_commands) == 12
+    assert all(("-o", "ConnectTimeout=5") in zip(command, command[1:]) for command in ssh_commands)
+    assert all(command.index("ConnectTimeout=5") < command.index("root@native-x86") for command in ssh_commands)
+    assert sleeps == [5.0] * 11
+    assert commands.count(("vastai", "destroy", "instance", "44", "--yes")) == 1
+    assert commands[-1] == ("vastai", "--raw", "show", "instance", "44")
+    assert json.loads(failure_receipt.read_text(encoding="utf-8")) == {
+        "schema_version": 1, "kind": "runtime_mixture_abort_cleanup", "instance_id": 44,
+        "provider_response_sha256": LIFECYCLE._runtime_pilot_instance_identity(live),
+        "code_revision": "a" * 40, "code_bundle_sha256": "b" * 64,
+        "parent_checkpoint_artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"],
+        "error_type": "ValueError", "error": "redacted remote failure", "disposable": False,
+        "cleanup_status": "destroyed_and_absent",
+    }
+
+
 def test_runtime_cpu_pilot_does_not_retry_aarch64_ssh_arch_attestation(tmp_path: Path) -> None:
     commands: list[tuple[str, ...]] = []
     sleeps: list[float] = []
