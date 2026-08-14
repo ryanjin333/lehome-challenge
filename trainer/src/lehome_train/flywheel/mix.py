@@ -1018,6 +1018,13 @@ _PERSISTENT_WORK_NAME = "work"
 _PERSISTENT_RECEIPTS_NAME = "receipts"
 _PERSISTENT_LOCK_NAME = "lock"
 
+# The completed h16 materialization was interrupted after sealing all jobs but
+# before it could correct the image feature keys below.  This is deliberately a
+# single immutable identity, not a cross-version resume policy.
+_PRE_FIX_MATERIALIZER_IDENTITIES = frozenset({
+    "41c786ec652baf5f3a64e1b0f91f090fda9d4b1952b8a113fd76fd04ac6c01d7",
+})
+
 
 def _mix_materializer_identity() -> str:
     """A restart must be tied to the bytes that implement this materializer."""
@@ -1040,6 +1047,21 @@ def _mix_materializer_identity() -> str:
         "modality": sha256_file(Path(modality.__file__)),
         "models": sha256_file(Path(models.__file__)),
     })
+
+
+def _persistent_state_matches_expected(state: object, expected_state: Mapping[str, object]) -> bool:
+    """Permit the one receipted pre-fix state only with every other field exact."""
+
+    if state == expected_state:
+        return True
+    if not isinstance(state, Mapping):
+        return False
+    materializer_sha256 = state.get("materializer_sha256")
+    if materializer_sha256 not in _PRE_FIX_MATERIALIZER_IDENTITIES:
+        return False
+    legacy_expected = dict(expected_state)
+    legacy_expected["materializer_sha256"] = materializer_sha256
+    return state == legacy_expected
 
 
 def _relative_under(path: Path, root: Path) -> str:
@@ -1379,7 +1401,11 @@ def materialize_mixed_snapshot(
                 state_path = persistent_root / _PERSISTENT_STATE_NAME
                 if state_path.exists():
                     _clean_owned_atomic_temps(persistent_root, receipt_names=expected_receipts)
-                    if state_path.is_symlink() or not state_path.is_file() or _read_json(state_path) != expected_state:
+                    if (
+                        state_path.is_symlink()
+                        or not state_path.is_file()
+                        or not _persistent_state_matches_expected(_read_json(state_path), expected_state)
+                    ):
                         raise ValueError("persistent materialization state does not match this plan, source, or code")
                     # The atomic work-tree promotion can complete before its
                     # sibling receipt.  At that point work/ no longer exists;
@@ -1538,7 +1564,7 @@ def _seal_mixed_work(
             "total_frames": global_index, "total_tasks": 1, "total_videos": len(episode_rows) * len(_CAMERAS),
             "total_chunks": math.ceil(len(episode_rows) / 1000), "chunks_size": 1000, "fps": 30,
             "data_path": LEGACY_DATA_PATH, "video_path": LEGACY_VIDEO_PATH,
-            "features": {camera: {"dtype": "video", "shape": [480, 640, 3], "info": {"video.fps": 30}} for camera in _CAMERAS}}
+            "features": {f"observation.images.{camera}": {"dtype": "video", "shape": [480, 640, 3], "info": {"video.fps": 30}} for camera in _CAMERAS}}
     atomic_write_json(meta / "info.json", info)
     _write_lines(meta / "episodes.jsonl", episode_rows)
     _write_lines(meta / "episodes_stats.jsonl", ({"episode_index": row["episode_index"], "stats": {}} for row in episode_rows))

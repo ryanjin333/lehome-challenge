@@ -123,6 +123,13 @@ def test_mix_materializes_real_ranges_with_exact_train_ratio_and_valid_stats(tmp
     manifest = json.loads((mixed / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["flywheel_mix_plan"]["sha256"] == plan.sha256
     assert json.loads((mixed / "meta" / "mix-selection.json").read_text(encoding="utf-8"))["sha256"] == plan.sha256
+    info = json.loads((mixed / "meta" / "info.json").read_text(encoding="utf-8"))
+    assert info["features"] == {
+        f"observation.images.{camera}": {
+            "dtype": "video", "shape": [480, 640, 3], "info": {"video.fps": 30},
+        }
+        for camera in ("top_rgb", "left_rgb", "right_rgb")
+    }
     assert manifest["train_episode_ids"]
     assert manifest["validation_episode_ids"]
     first = pq.read_table(mixed / LEGACY_DATA_PATH.format(episode_chunk=0, episode_index=0))
@@ -492,6 +499,48 @@ def test_mix_persistent_resume_rejects_state_plan_source_and_code_drift(
     (staging / "state.json").write_text(json.dumps(state), encoding="utf-8")
     with pytest.raises(ValueError, match="plan, source, or code"):
         materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "destination", persistent_staging_root=staging)
+
+
+def test_mix_persistent_resume_accepts_only_the_known_pre_fix_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fully receipted pre-fix tree may be resealed without regenerating jobs."""
+
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    staging, destination = tmp_path / "resume", tmp_path / "destination"
+    monkeypatch.setattr(
+        "lehome_train.flywheel.mix._seal_mixed_work",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("after jobs")),
+    )
+    with pytest.raises(RuntimeError, match="after jobs"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)
+    expected_receipt_count = len(plan.selections) * 4
+    assert len(list((staging / "receipts").glob("*.json"))) == expected_receipt_count
+    state_path = staging / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["materializer_sha256"] = "41c786ec652baf5f3a64e1b0f91f090fda9d4b1952b8a113fd76fd04ac6c01d7"
+    drifted_state = json.loads(json.dumps(state))
+    drifted_state["sources"][0]["source_revision"] = "f" * 40
+    atomic_write_json(state_path, drifted_state)
+    with pytest.raises(ValueError, match="plan, source, or code"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)
+    atomic_write_json(state_path, state)
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        "lehome_train.flywheel.mix.pq.write_table",
+        lambda *args, **kwargs: pytest.fail("fully receipted parquet was regenerated"),
+    )
+    monkeypatch.setattr(
+        "lehome_train.flywheel.mix._copy_selected_video",
+        lambda *args, **kwargs: pytest.fail("fully receipted video was regenerated"),
+    )
+
+    result = materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)
+
+    assert result["path"] == str(destination)
+    assert not staging.exists()
 
 
 def test_mix_persistent_state_binds_destination_and_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
