@@ -3,6 +3,7 @@ import hashlib
 import json
 import subprocess
 import tarfile
+import threading
 import time
 
 import pytest
@@ -1957,6 +1958,7 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
         "code_bundle_sha256_file": str(bundle_receipt), "code_bundle_sha256": bundle_sha,
         "parent_checkpoint": str(parent),
         "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json"),
+        "rent_claim_receipt": str(tmp_path / "runtime-gpu-rent-claim.json"),
     }
     assert "training_capability" not in evidence
     commands: list[tuple[str, ...]] = []
@@ -2008,6 +2010,12 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
     assert outer["training_capability"] == capability
     assert outer["rollout_prefix"] == "rollouts/round-1"
     assert not any(row[:3] == ("vastai", "destroy", "instance") for row in commands)
+    assert any(
+        command[-1] == "set -eu; uname -m"
+        and ("-o", "ConnectTimeout=15") in zip(command, command[1:])
+        for command in commands
+    )
+    assert any("timeout 600 env -u HF_TOKEN" in command[-1] for command in commands)
     outer["deployment_revision"] = "0" * 40
     outer_path.write_text(json.dumps(outer), encoding="utf-8")
     with pytest.raises(ValueError, match="lease and campaign"):
@@ -2019,6 +2027,7 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
 
 def test_direct_gpu_rent_rejects_caller_capability_before_provider_calls(tmp_path: Path) -> None:
     evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json"))
+    evidence["rent_claim_receipt"] = str(tmp_path / "runtime-gpu-rent-claim.json")
     evidence["training_capability"] = {}
     calls: list[tuple[str, ...]] = []
 
@@ -2036,12 +2045,19 @@ def test_direct_gpu_probe_failure_destroys_and_proves_absence(
 ) -> None:
     """A failed same-lease promotion cannot leave a billable warm-up candidate."""
     evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json"))
+    evidence |= {
+        "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json"),
+        "rent_claim_receipt": str(tmp_path / "runtime-gpu-rent-claim.json"),
+    }
     rented = {
         "instance_id": 44, "provider_response_sha256": "a" * 64,
         "host": "pro6000", "port": 22,
     }
     commands: list[tuple[str, ...]] = []
-    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_preflight", lambda _request: None)
+    monkeypatch.setattr(
+        LIFECYCLE, "_runtime_gpu_rent_preflight",
+        lambda request: LIFECYCLE._runtime_campaign_binding(request),
+    )
     monkeypatch.setattr(LIFECYCLE, "rent", lambda **_kwargs: rented)
     monkeypatch.setattr(LIFECYCLE, "_attest_platform_arch", lambda *_args, **_kwargs: "x86_64")
     monkeypatch.setattr(
@@ -2062,6 +2078,105 @@ def test_direct_gpu_probe_failure_destroys_and_proves_absence(
         ("vastai", "--raw", "show", "instance", "44"),
     ]
     assert json.loads(Path(str(evidence["failure_receipt"])).read_text(encoding="utf-8"))["cleanup_status"] == "destroyed_and_absent"
+    assert not Path(str(evidence["rent_claim_receipt"])).exists()
+
+
+def test_direct_gpu_rent_claim_allows_one_concurrent_controller_before_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The O_EXCL claim makes the losing controller provider-free."""
+    evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json"))
+    evidence |= {
+        "offer": {"id": 8, "dph_total": .18},
+        "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json"),
+        "rent_claim_receipt": str(tmp_path / "runtime-gpu-rent-claim.json"),
+    }
+    identity = LIFECYCLE._runtime_campaign_binding(evidence)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_preflight", lambda _request: identity)
+    monkeypatch.setattr(LIFECYCLE, "_attest_platform_arch", lambda *_args, **_kwargs: "x86_64")
+    entered, release = threading.Event(), threading.Event()
+    rent_calls: list[object] = []
+
+    def fake_rent(**_kwargs: object) -> dict[str, object]:
+        rent_calls.append(object())
+        entered.set()
+        assert release.wait(1)
+        return {"instance_id": 44, "provider_response_sha256": "a" * 64, "host": "pro6000", "port": 22}
+
+    def fake_probe(**_kwargs: object) -> dict[str, object]:
+        LIFECYCLE.atomic_write_json(Path(str(evidence["bootstrap_capability_receipt"])), {"probe": "accepted"})
+        return {"probe": "accepted"}
+
+    monkeypatch.setattr(LIFECYCLE, "rent", fake_rent)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_bootstrap_capability", fake_probe)
+    results: list[object] = []
+
+    def invoke() -> None:
+        try:
+            results.append(LIFECYCLE.rent_runtime_gpu_warmup(evidence=evidence, runner=lambda _command: ""))
+        except BaseException as error:
+            results.append(error)
+
+    winner = threading.Thread(target=invoke)
+    winner.start()
+    assert entered.wait(1)
+    loser = threading.Thread(target=invoke)
+    loser.start(); loser.join(timeout=1)
+    assert not loser.is_alive()
+    release.set(); winner.join(timeout=1)
+    assert not winner.is_alive()
+
+    assert len(rent_calls) == 1
+    assert sum(isinstance(value, ValueError) for value in results) == 1
+    assert sum(isinstance(value, dict) for value in results) == 1
+    claim = json.loads(Path(str(evidence["rent_claim_receipt"])).read_text(encoding="utf-8"))
+    assert claim["status"] == "succeeded" and claim["instance_id"] == 44
+
+
+def test_direct_gpu_post_probe_hash_failure_cleans_the_same_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Receipt hashing is also inside the post-create cleanup boundary."""
+    evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json"))
+    evidence |= {
+        "offer": {"id": 8, "dph_total": .18},
+        "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json"),
+        "rent_claim_receipt": str(tmp_path / "runtime-gpu-rent-claim.json"),
+    }
+    identity = LIFECYCLE._runtime_campaign_binding(evidence)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_preflight", lambda _request: identity)
+    monkeypatch.setattr(LIFECYCLE, "rent", lambda **_kwargs: {
+        "instance_id": 44, "provider_response_sha256": "a" * 64, "host": "pro6000", "port": 22,
+    })
+    monkeypatch.setattr(LIFECYCLE, "_attest_platform_arch", lambda *_args, **_kwargs: "x86_64")
+    monkeypatch.setattr(
+        LIFECYCLE, "_runtime_gpu_bootstrap_capability",
+        lambda **_kwargs: LIFECYCLE.atomic_write_json(
+            Path(str(evidence["bootstrap_capability_receipt"])), {"probe": "accepted"}
+        ) or {"probe": "accepted"},
+    )
+    original_sha256_file = LIFECYCLE.sha256_file
+    capability_path = Path(str(evidence["bootstrap_capability_receipt"]))
+    monkeypatch.setattr(
+        LIFECYCLE, "sha256_file",
+        lambda path: (_ for _ in ()).throw(OSError("hash read failed"))
+        if Path(path) == capability_path else original_sha256_file(path),
+    )
+    commands: list[tuple[str, ...]] = []
+
+    with pytest.raises(OSError, match="hash read failed"):
+        LIFECYCLE.rent_runtime_gpu_warmup(
+            evidence=evidence,
+            runner=lambda command: commands.append(command) or (
+                "{}" if command == ("vastai", "--raw", "show", "instance", "44") else ""
+            ),
+        )
+
+    assert commands == [
+        ("vastai", "destroy", "instance", "44", "--yes"),
+        ("vastai", "--raw", "show", "instance", "44"),
+    ]
+    assert not Path(str(evidence["rent_claim_receipt"])).exists()
 
 
 def test_runtime_campaign_rejects_any_rollout_prefix_other_than_initial_round_one(

@@ -22,7 +22,7 @@ import time
 from typing import Callable, Mapping
 
 from lehome_train.hub import HubTransport, HuggingFaceHubTransport
-from lehome_train.io import atomic_write_json, sha256_file
+from lehome_train.io import atomic_write_json, canonical_json_bytes, sha256_file
 from lehome_train.constants import MODEL_REVISION
 from lehome_train.release_manifest import validate_training_capability
 
@@ -1369,12 +1369,15 @@ def _validated_runtime_pilot(path_value: object) -> dict[str, object]:
     )
 
 
-def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> None:
+def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> dict[str, object]:
     """Validate direct-GPU immutable source bindings before provider create."""
     if "training_capability" in request:
         raise ValueError("direct runtime GPU rent derives capability on its single lease")
-    _runtime_campaign_binding(request)
+    identity = _runtime_campaign_binding(request)
     _runtime_parent_checkpoint(request)
+    offer = request.get("offer")
+    if not isinstance(offer, Mapping) or type(offer.get("id")) is not int:
+        raise ValueError("runtime GPU rent requires a fresh concrete offer before claiming a lease")
     bundle = request.get("code_bundle")
     receipt = request.get("code_bundle_sha256_file")
     if type(bundle) is not str or type(receipt) is not str:
@@ -1389,6 +1392,72 @@ def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> None:
         or Path(output).exists() or Path(output).is_symlink()
     ):
         raise ValueError("runtime GPU rent requires an absent bootstrap capability receipt")
+    claim = request.get("rent_claim_receipt")
+    if (
+        type(claim) is not str or not Path(claim).is_absolute()
+        or Path(claim).exists() or Path(claim).is_symlink()
+        or Path(claim).parent.is_symlink() or not Path(claim).parent.is_dir()
+    ):
+        raise ValueError("runtime GPU rent requires an absent claim receipt")
+    return identity
+
+
+def _runtime_gpu_rent_claim(
+    *, path: Path, request: Mapping[str, object], identity: Mapping[str, object],
+) -> dict[str, object]:
+    """Atomically admit exactly one controller to create a direct GPU lease."""
+    offer = request["offer"]
+    assert isinstance(offer, Mapping)
+    claim = {
+        "schema_version": 1, "kind": "runtime_mixture_gpu_rent_claim", "status": "claimed",
+        "request_sha256": _hash(dict(request)), "offer_sha256": _hash(dict(offer)),
+        "bootstrap_capability_receipt": request["bootstrap_capability_receipt"],
+        "code_revision": request["code_revision"], "code_bundle_sha256": request["code_bundle_sha256"],
+        "bc_revision": identity["bc"]["immutable_revision"],
+        "bc_receipt_sha256": identity["bc_receipt_sha256"],
+        "rollout_revision": identity["rollout"]["immutable_revision"],
+        "rollout_prefix": identity["rollout"]["remote_prefix"],
+        "rollout_receipt_sha256": identity["rollout_receipt_sha256"],
+        "deployment_revision": identity["deployment"]["immutable_revision"],
+        "mixture_id": identity["deployment"]["mixture_id"],
+        "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
+        "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
+        "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+    }
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise ValueError("runtime GPU rent claim is already held; no provider action was taken") from error
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(canonical_json_bytes(claim))
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return claim
+
+
+def _release_runtime_gpu_rent_claim(*, path: Path, claim: Mapping[str, object]) -> None:
+    """Release only this failed controller's claim after any lease is absent."""
+    if dict(_load_regular_json(path, "runtime GPU rent claim")) != dict(claim):
+        raise RuntimeError("runtime GPU rent claim changed before failure cleanup")
+    path.unlink()
+
+
+def _terminalize_runtime_gpu_rent_claim(
+    *, path: Path, claim: Mapping[str, object], instance: Mapping[str, object],
+    capability_sha256: str,
+) -> None:
+    """Keep a durable winner record so replay cannot rent another GPU."""
+    if dict(_load_regular_json(path, "runtime GPU rent claim")) != dict(claim):
+        raise RuntimeError("runtime GPU rent claim changed before success terminalization")
+    atomic_write_json(path, dict(claim) | {
+        "status": "succeeded", "instance_id": instance["instance_id"],
+        "provider_response_sha256": instance["provider_response_sha256"],
+        "capability_sha256": capability_sha256,
+    })
 
 
 def _runtime_gpu_bootstrap_capability(
@@ -1412,7 +1481,7 @@ def _runtime_gpu_bootstrap_capability(
         "git -C /prepared/bootstrap-code checkout --quiet --detach " + str(request["code_revision"]) + "; "
         "test \"$(git -C /prepared/bootstrap-code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; "
         "test -z \"$(git -C /prepared/bootstrap-code status --porcelain)\"; "
-        "env -u HF_TOKEN PYTHONPATH=/prepared/bootstrap-code/source/lehome:/prepared/bootstrap-code/trainer/src "
+        "timeout 600 env -u HF_TOKEN PYTHONPATH=/prepared/bootstrap-code/source/lehome:/prepared/bootstrap-code/trainer/src "
         "lehome-train validate-training-capability --one-step --image-digest "
         + BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
     )
@@ -1720,28 +1789,35 @@ def run_runtime_gpu_warmup(
 def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -> dict[str, object]:
     """Promote only a fresh capable interruptible PRO6000 lease for warm-up."""
     _runtime_failure_receipt_path(evidence)
-    _runtime_gpu_rent_preflight(evidence)
-    rented = rent(
-        evidence=evidence, runner=runner, require_capability=False,
-        abort_request=evidence,
-    )
+    identity = _runtime_gpu_rent_preflight(evidence)
+    claim_path = Path(str(evidence["rent_claim_receipt"]))
+    claim = _runtime_gpu_rent_claim(path=claim_path, request=evidence, identity=identity)
+    rented: Mapping[str, object] | None = None
     try:
-        _attest_platform_arch(rented, runner=runner)
-        identity = _runtime_campaign_binding(evidence)
+        rented = rent(
+            evidence=evidence, runner=runner, require_capability=False,
+            abort_request=evidence,
+        )
+        _attest_platform_arch(rented, runner=runner, ssh_connection_timeout_seconds=15)
         outer = _runtime_gpu_bootstrap_capability(
             instance=rented, request=evidence, identity=identity, runner=runner,
         )
+        capability_sha256 = sha256_file(Path(str(evidence["bootstrap_capability_receipt"])))
+        _terminalize_runtime_gpu_rent_claim(
+            path=claim_path, claim=claim, instance=rented,
+            capability_sha256=capability_sha256,
+        )
+        return {
+            **rented, "kind": "runtime_mixture_gpu_warmup_instance", "platform_arch": "x86_64",
+            "image_digest": BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+            "capability_sha256": capability_sha256,
+            "bootstrap_capability_receipt_sha256": capability_sha256,
+        }
     except BaseException as error:
-        _runtime_abort_cleanup(instance=rented, request=evidence, error=error, runner=runner)
+        if rented is not None:
+            _runtime_abort_cleanup(instance=rented, request=evidence, error=error, runner=runner)
+        _release_runtime_gpu_rent_claim(path=claim_path, claim=claim)
         raise
-    return {
-        **rented, "kind": "runtime_mixture_gpu_warmup_instance", "platform_arch": "x86_64",
-        "image_digest": BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
-        "capability_sha256": sha256_file(Path(str(evidence["bootstrap_capability_receipt"]))),
-        "bootstrap_capability_receipt_sha256": sha256_file(
-            Path(str(evidence["bootstrap_capability_receipt"]))
-        ),
-    }
 
 
 def destroy_runtime_cpu_pilot(
