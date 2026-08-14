@@ -1420,6 +1420,8 @@ def _runtime_pilot_offer_evidence(*, failure_receipt: str) -> dict[str, object]:
 
 def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_path: Path) -> None:
     commands: list[tuple[str, ...]] = []
+    readiness_reads = 0
+    sleeps: list[float] = []
     live = {
         "id": 44, "actual_status": "running", "cpu_arch": "amd64",
         "cpu_cores_effective": 36.0, "cpu_ram": 64390, "disk_space": 124.75,
@@ -1428,6 +1430,7 @@ def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_pa
     }
 
     def runner(command: tuple[str, ...]) -> str:
+        nonlocal readiness_reads
         commands.append(command)
         if command[:4] in {
             ("vastai", "--raw", "show", "instances"),
@@ -1437,17 +1440,21 @@ def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_pa
         if command[:4] == ("vastai", "--raw", "create", "instance"):
             return '{"new_contract":44}'
         if command == ("vastai", "--raw", "show", "instance", "44"):
+            readiness_reads += 1
+            if readiness_reads < 3:
+                return '{"id":44,"actual_status":"loading"}'
             return json.dumps(live)
         if command[-1] == "set -eu; uname -m":
             return "x86_64\n"
         raise AssertionError(command)
 
     receipt = LIFECYCLE.rent_runtime_cpu_pilot(
-        evidence=_runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json")), runner=runner, sleep=lambda _: None,
+        evidence=_runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json")), runner=runner, sleep=sleeps.append,
     )
 
     assert receipt["kind"] == "runtime_mixture_cpu_pilot_instance"
     assert receipt["platform_arch"] == "x86_64"
+    assert LIFECYCLE.RUNTIME_PILOT_READINESS_POLLS == 120 and sleeps == [5.0, 5.0]
     assert ("vastai", "--raw", "create", "instance", "8", "--image", LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "--disk", "120", "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE) in commands
 
 
@@ -1724,6 +1731,58 @@ def test_runtime_abort_cleanup_writes_redacted_bound_non_disposable_receipt(tmp_
     assert receipt["cleanup_status"] == "destroyed_and_absent"
     assert receipt["error"] == "redacted remote failure"
     assert calls[0] == ("vastai", "destroy", "instance", "44", "--yes")
+
+
+def test_runtime_abort_cleanup_polls_transitional_destroy_until_absent(tmp_path: Path) -> None:
+    output = tmp_path / "abort-poll.json"
+    absent_reads = iter(['{"id":44,"actual_status":"exiting"}', "{}"])
+    calls: list[tuple[str, ...]] = []
+    sleeps: list[float] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command == ("vastai", "destroy", "instance", "44", "--yes"):
+            return ""
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return next(absent_reads)
+        raise AssertionError(command)
+
+    LIFECYCLE._runtime_abort_cleanup(
+        instance={"instance_id": 44, "provider_response_sha256": "a" * 64},
+        request={"failure_receipt": str(output), "code_revision": "b" * 40, "code_bundle_sha256": "c" * 64},
+        error=ValueError("staged failure"), runner=runner, max_absence_polls=2, sleep=sleeps.append,
+    )
+
+    assert calls == [
+        ("vastai", "destroy", "instance", "44", "--yes"),
+        ("vastai", "--raw", "show", "instance", "44"),
+        ("vastai", "--raw", "show", "instance", "44"),
+    ]
+    assert sleeps == [5.0]
+    assert json.loads(output.read_text())["cleanup_status"] == "destroyed_and_absent"
+
+
+def test_runtime_abort_cleanup_times_out_when_destroyed_row_persists(tmp_path: Path) -> None:
+    output = tmp_path / "abort-timeout.json"
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command == ("vastai", "destroy", "instance", "44", "--yes"):
+            return ""
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return '{"id":44,"actual_status":"exiting"}'
+        raise AssertionError(command)
+
+    with pytest.raises(RuntimeError, match="did not verify instance absence"):
+        LIFECYCLE._runtime_abort_cleanup(
+            instance={"instance_id": 44, "provider_response_sha256": "a" * 64},
+            request={"failure_receipt": str(output), "code_revision": "b" * 40, "code_bundle_sha256": "c" * 64},
+            error=ValueError("staged failure"), runner=runner, max_absence_polls=2, sleep=lambda _: None,
+        )
+
+    assert calls.count(("vastai", "destroy", "instance", "44", "--yes")) == 1
+    assert json.loads(output.read_text())["cleanup_status"] == "absence_unverified"
 
 
 def test_runtime_abort_cleanup_retains_non_disposable_receipt_when_destroy_fails(tmp_path: Path) -> None:

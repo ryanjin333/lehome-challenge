@@ -33,6 +33,8 @@ PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revisi
 # WS/S allowlist on raw rows in ``_offer_gpu``.
 OFFER_QUERY = "gpu_ram>=96 num_gpus=1 reliability>=0.95"
 RUNTIME_PILOT_OFFER_QUERY = "cpu_arch=amd64 cpu_cores_effective>=32 cpu_ram>=64 disk_space>=120 reliability>=0.98 num_gpus=1 direct_port_count>=2 duration>=1"
+RUNTIME_PILOT_READINESS_POLLS = 120
+RUNTIME_ABSENCE_READBACK_POLLS = 12
 _RUNTIME_PILOT_OFFER_FIELDS = (
     "id", "ask_contract_id", "machine_id", "cpu_arch", "cpu_cores_effective", "cpu_ram",
     "disk_space", "disk_bw", "inet_down", "reliability", "num_gpus", "dph_total",
@@ -417,15 +419,39 @@ def _runtime_pilot_live_matches(*, live: Mapping[str, object], instance_id: int,
     )
 
 
-def _runtime_pilot_cleanup(*, instance_id: int, runner: Runner) -> None:
+def _await_runtime_instance_absence(
+    *, instance_id: int, runner: Runner, max_polls: int = RUNTIME_ABSENCE_READBACK_POLLS,
+    sleep: Callable[[float], None] = _bounded_sleep,
+) -> bool:
+    """Wait a bounded interval for Vast's eventually-consistent destroy view."""
+    if type(max_polls) is not int or max_polls <= 0:
+        raise ValueError("runtime absence readback poll bound is invalid")
+    for poll in range(max_polls):
+        if _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id))) in ({}, None):
+            return True
+        if poll + 1 < max_polls:
+            sleep(5.0)
+    return False
+
+
+def _runtime_pilot_cleanup(
+    *, instance_id: int, runner: Runner,
+    max_absence_polls: int = RUNTIME_ABSENCE_READBACK_POLLS,
+    sleep: Callable[[float], None] = _bounded_sleep,
+) -> None:
     """Destroy only the instance that this invocation just created."""
     runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
-    absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
-    if absent not in ({}, None):
+    if not _await_runtime_instance_absence(
+        instance_id=instance_id, runner=runner, max_polls=max_absence_polls, sleep=sleep,
+    ):
         raise ValueError("runtime CPU pilot cleanup absence readback failed")
 
 
-def _runtime_abort_cleanup(*, instance: Mapping[str, object], request: Mapping[str, object], error: BaseException, runner: Runner) -> None:
+def _runtime_abort_cleanup(
+    *, instance: Mapping[str, object], request: Mapping[str, object], error: BaseException,
+    runner: Runner, max_absence_polls: int = RUNTIME_ABSENCE_READBACK_POLLS,
+    sleep: Callable[[float], None] = _bounded_sleep,
+) -> None:
     """Persist redacted abort evidence, then destroy only this just-rented lease."""
     instance_id = instance.get("instance_id")
     if type(instance_id) is not int:
@@ -446,11 +472,18 @@ def _runtime_abort_cleanup(*, instance: Mapping[str, object], request: Mapping[s
             atomic_write_json(output, receipt | dict(extra))
     try:
         runner(("vastai", "destroy", "instance", str(instance_id), "--yes"))
-        absent = _json(runner, ("vastai", "--raw", "show", "instance", str(instance_id)))
     except BaseException:
         record({"cleanup_status": "destroy_failed"})
         raise RuntimeError("runtime abort cleanup could not destroy the newly rented instance") from error
-    if absent not in ({}, None):
+    try:
+        absent = _await_runtime_instance_absence(
+            instance_id=instance_id, runner=runner,
+            max_polls=max_absence_polls, sleep=sleep,
+        )
+    except BaseException:
+        record({"cleanup_status": "absence_unverified"})
+        raise RuntimeError("runtime abort cleanup could not verify instance absence") from error
+    if not absent:
         record({"cleanup_status": "absence_unverified"})
         raise RuntimeError("runtime abort cleanup did not verify instance absence") from error
     record({"cleanup_status": "destroyed_and_absent"})
@@ -489,7 +522,7 @@ def _runtime_abort_on_failure(
 
 
 def rent_runtime_cpu_pilot(
-    *, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12,
+    *, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = RUNTIME_PILOT_READINESS_POLLS,
     sleep: Callable[[float], None] = _bounded_sleep,
 ) -> dict[str, object]:
     """Create one bounded native-x86 lease and remove it on every failed proof."""
@@ -539,7 +572,7 @@ def rent_runtime_cpu_pilot(
                 "instance_id": instance_id,
                 "provider_response_sha256": _hash(created),
             }),
-            request=evidence, error=error, runner=runner,
+            request=evidence, error=error, runner=runner, sleep=sleep,
         )
         raise
 
