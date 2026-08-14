@@ -262,7 +262,7 @@ def _gpu_command(command: str, request: Path, runtime_factory: Optional[str]) ->
 def build_runtime_mixture(
     request: Path = typer.Option(..., "--request"),
 ) -> None:
-    """Build the local immutable 70/30 no-recut runtime-mixture contract."""
+    """Stage immutable 70/30 bytes pending explicit private-repo publication."""
 
     def operation() -> object:
         from lehome_train.groot.runtime_mixture_builder import build_from_request

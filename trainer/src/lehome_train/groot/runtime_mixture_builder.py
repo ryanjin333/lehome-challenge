@@ -15,6 +15,7 @@ import shutil
 import tempfile
 import time
 from typing import Any, Iterable, Mapping
+import re
 
 import pyarrow.parquet as pq
 
@@ -46,6 +47,48 @@ def _sha(value: object, label: str) -> str:
     if type(value) is not str or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
         raise ValueError(f"{label} must be a SHA-256")
     return value
+
+
+def _relative(value: object, label: str) -> str:
+    if type(value) is not str or not value or value.startswith("/") or "\\" in value or any(part in {"", ".", ".."} for part in value.split("/")):
+        raise ValueError(f"{label} must be a safe relative path")
+    return value
+
+
+def _source_publications(path: Path, roots: Mapping[str, Path]) -> dict[str, dict[str, object]]:
+    """Authenticate separately published BC and rollout source trees.
+
+    This intentionally accepts no all-purpose corrective prefix: every source
+    names its own immutable repository revision, prefix, and readback receipt.
+    """
+
+    document = _load(path, "runtime mixture source publications")
+    if set(document) != {"schema_version", "kind", "sources"} or document["schema_version"] != 1 or document["kind"] != "runtime_mixture_source_publications" or not isinstance(document["sources"], list):
+        raise ValueError("runtime mixture source publications have an incompatible schema")
+    result: dict[str, dict[str, object]] = {}
+    expected = {"organizer": ("bc", "bc/full"), "rollout": ("rollout", None)}
+    for item in document["sources"]:
+        if not isinstance(item, dict) or set(item) != {"source_id", "source_type", "repository", "revision", "prefix", "readback_receipt_path", "readback_receipt_sha256"}:
+            raise ValueError("runtime mixture source publication entry is malformed")
+        source_id, source_type, prefix = item["source_id"], item["source_type"], item["prefix"]
+        if source_id not in expected or source_id in result or source_type != expected[source_id][0] or item["repository"] != APPROVED_MIXTURE_REPOSITORY or type(item["revision"]) is not str or re.fullmatch(r"[0-9a-f]{40}", item["revision"]) is None or type(prefix) is not str:
+            raise ValueError("runtime mixture source publication identity is invalid")
+        expected_prefix = expected[source_id][1]
+        if (expected_prefix is not None and prefix != expected_prefix) or (
+            expected_prefix is None and re.fullmatch(r"rollouts/round-[1-9][0-9]*", prefix) is None
+        ):
+            raise ValueError("runtime mixture source publication prefix is invalid")
+        receipt_relative = _relative(item["readback_receipt_path"], "runtime mixture source readback receipt path")
+        receipt = roots[source_id] / receipt_relative
+        if receipt.is_symlink() or not receipt.is_file() or sha256_file(receipt) != _sha(item["readback_receipt_sha256"], "runtime mixture source readback receipt hash"):
+            raise ValueError("runtime mixture source publication readback receipt drift")
+        value = _load(receipt, "runtime mixture source publication readback receipt")
+        if set(value) != {"repository", "immutable_revision", "remote_prefix", "fresh_readback_verified", "tree_listing_verified"} or value.get("repository") != item["repository"] or value.get("immutable_revision") != item["revision"] or value.get("remote_prefix") != prefix or value.get("fresh_readback_verified") is not True or value.get("tree_listing_verified") is not True:
+            raise ValueError("runtime mixture source publication readback is not authenticated")
+        result[source_id] = dict(item)
+    if set(result) != set(expected):
+        raise ValueError("runtime mixture source publications are incomplete")
+    return result
 
 
 def _write(path: Path, value: object) -> None:
@@ -179,7 +222,7 @@ def _raw_attempt(root: Path, attempt_id: str, expected_checksum: str) -> tuple[l
     return ([_finite_vector(row.get("state"), label="rollout state") for row in rows], [_finite_vector(row.get("action"), label="rollout action") for row in rows])
 
 
-def _normalization(windows: list[dict[str, Any]], *, organizer_root: Path, campaign_root: Path, selected: Mapping[str, str]) -> dict[str, Any]:
+def _normalization_statistics(windows: list[dict[str, Any]], *, organizer_root: Path, campaign_root: Path, selected: Mapping[str, str]) -> dict[str, Any]:
     states: list[list[float]] = []; actions: list[list[float]] = []; relative: dict[str, list[list[float]]] = {"left_arm": [], "left_gripper": [], "right_arm": [], "right_gripper": []}
     cache: dict[tuple[str, str], tuple[list[list[float]], list[list[float]]]] = {}
     for window in windows:
@@ -203,11 +246,11 @@ def _normalization(windows: list[dict[str, Any]], *, organizer_root: Path, campa
             relative["left_gripper"].append([action[5]])
             relative["right_arm"].append([action[index] - current[index] for index in range(6, 11)])
             relative["right_gripper"].append([action[11]])
-    return {"schema_version": 2, "train_only": True, "embodiment": "NEW_EMBODIMENT", "state": _stats(states, 12), "action": _stats(actions, 12), "relative_action": {name: _stats(rows, 5 if name.endswith("arm") else 1) for name, rows in relative.items()}}
+    return {"state": _stats(states, 12), "action": _stats(actions, 12), "relative_action": {name: _stats(rows, 5 if name.endswith("arm") else 1) for name, rows in relative.items()}}
 
 
 def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Path, disposal_receipt: str | Path, release_binding: str | Path, plan_state: str | Path, destination: str | Path) -> dict[str, Any]:
-    """Authenticate the fixed plan and atomically create the local v2 contract."""
+    """Create immutable local publication-pending bytes, never an authorized run."""
     organizer, campaign, destination = Path(organizer_root), Path(campaign_root), Path(destination)
     state = _load(Path(plan_state), "persisted mix-plan state"); plan = state.get("plan")
     if not isinstance(plan, dict) or plan.get("sha256") != state.get("plan_sha256") or canonical_json_sha256({key: value for key, value in plan.items() if key != "sha256"}) != plan.get("sha256"):
@@ -224,37 +267,35 @@ def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Pa
         raise ValueError("selected rollout bindings are not an accepted seen allowlist")
     windows = validate_plan_windows(plan, organizer_manifest=organizer_manifest, accepted_rollouts={key: key for key in selected})
     if destination.exists():
-        receipt_path = destination / "generation-receipt.json"
-        if receipt_path.is_file() and _load(receipt_path, "existing generation receipt").get("plan_sha256") == plan["sha256"]:
-            return _load(receipt_path, "existing generation receipt")
-        raise FileExistsError("runtime mixture destination exists with a different contract")
-    release = _load(Path(disposal_receipt), "corrective disposal receipt")
-    binding = _load(Path(release_binding), "corrective release binding")
-    published = binding.get("published_release")
-    if not isinstance(published, dict) or published.get("repository") != APPROVED_MIXTURE_REPOSITORY or release.get("immutable_revision") != published.get("revision") or release.get("remote_prefix") != published.get("prefix") or release.get("fresh_readback_verified") is not True or release.get("tree_listing_verified") is not True:
-        raise ValueError("corrective release/disposal binding is not authenticated")
+        raise FileExistsError("runtime mixture destination is immutable; choose an explicit new destination")
+    publications = _source_publications(
+        Path(release_binding), {"organizer": organizer, "rollout": campaign}
+    )
     staging = destination.parent / f".{destination.name}.{plan['sha256'][:12]}.tmp"
     if staging.exists():
         raise FileExistsError("runtime mixture staging already exists")
     try:
         staging.mkdir(parents=True)
-        normalization = _normalization(windows, organizer_root=organizer, campaign_root=campaign, selected=selected)
-        _write(staging / "mixture-normalization.json", normalization)
+        statistics = _normalization_statistics(windows, organizer_root=organizer, campaign_root=campaign, selected=selected)
         source_entries = [
-            {"source_id": "organizer", "source_type": "bc", "quota": 7, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(organizer), "artifact_receipt_path": "manifest.json", "artifact_receipt_sha256": organizer_hash, "acceptance_receipt_path": "manifest.json", "acceptance_receipt_sha256": organizer_hash, "source_identity": {"prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": organizer_hash, "action_source": "organizer_expert"}},
-            {"source_id": "rollout", "source_type": "rollout", "quota": 3, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(campaign), "artifact_receipt_path": "campaign-receipt.json", "artifact_receipt_sha256": sha256_file(campaign_receipt), "acceptance_receipt_path": "campaign-receipt.json", "acceptance_receipt_sha256": sha256_file(campaign_receipt), "source_identity": {"round_manifest_path": "campaign-receipt.json", "round_manifest_sha256": sha256_file(campaign_receipt), "action_source": "policy"}},
+            {"source_id": "organizer", "source_type": "bc", "quota": 7, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(organizer), "artifact_receipt_path": "manifest.json", "artifact_receipt_sha256": organizer_hash, "acceptance_receipt_path": "manifest.json", "acceptance_receipt_sha256": organizer_hash, "publication": {key: publications["organizer"][key] for key in ("repository", "revision", "prefix", "readback_receipt_path", "readback_receipt_sha256")}, "source_identity": {"prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": organizer_hash, "action_source": "organizer_expert"}},
+            {"source_id": "rollout", "source_type": "rollout", "quota": 3, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(campaign), "artifact_receipt_path": "campaign-receipt.json", "artifact_receipt_sha256": sha256_file(campaign_receipt), "acceptance_receipt_path": "campaign-receipt.json", "acceptance_receipt_sha256": sha256_file(campaign_receipt), "publication": {key: publications["rollout"][key] for key in ("repository", "revision", "prefix", "readback_receipt_path", "readback_receipt_sha256")}, "source_identity": {"round_manifest_path": "campaign-receipt.json", "round_manifest_sha256": sha256_file(campaign_receipt), "action_source": "policy"}},
         ]
         converted = []
         for number, item in enumerate(windows):
             kind = "bc" if item["source_kind"] == "organizer" else "rollout"; episode = item["raw_episode_id"]
             locator = ({"episode_id": episode, "prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": organizer_hash} if kind == "bc" else {"attempt_root": f"raw/{episode}", "attempt_manifest_path": f"raw/{episode}/episode.json", "attempt_manifest_sha256": sha256_file(campaign / "raw" / episode / "episode.json")})
             converted.append({"window_id": f"{kind}-{number:06d}", "source_id": "organizer" if kind == "bc" else "rollout", "source_type": kind, "source_episode_id": episode, "start": item["raw_frame_start"], "stop": item["raw_frame_stop"], "frame_ids": list(range(item["raw_frame_start"], item["raw_frame_stop"])), "lineage_id": f"{kind}:{episode}", "split": item["split"], "source_locator": locator})
-        manifest = {"schema_version": 2, "kind": "lehome_runtime_mixture", "repository": APPROVED_MIXTURE_REPOSITORY, "revision": published["revision"], "safe_prefix": published["prefix"], "sources": source_entries, "camera_schema": list(CAMERAS), "image_shape": [480, 640, 3], "state_schema": {"dimension": 12, "storage": "absolute"}, "action_schema": {"dimension": 12, "storage": "absolute"}, "fps": FPS, "action_horizon": ACTION_HORIZON, "instruction": INSTRUCTION, "schedule_seed": plan["seed"], "cycle_size": 10, "mixture_normalization": {"path": "mixture-normalization.json", "sha256": sha256_file(staging / "mixture-normalization.json"), "byte_size": (staging / "mixture-normalization.json").stat().st_size}, "window_index": {"path": "windows.json", "sha256": "", "byte_size": 0}}
-        index = {"schema_version": 2, "manifest_sha256": canonical_json_sha256(manifest), "windows": converted}
-        _write(staging / "windows.json", index); manifest["window_index"] = {"path": "windows.json", "sha256": sha256_file(staging / "windows.json"), "byte_size": (staging / "windows.json").stat().st_size}
-        _write(staging / "mixture.json", manifest)
-        _write(staging / "mounts.json", {"schema_version": 2, "repository": manifest["repository"], "revision": manifest["revision"], "safe_prefix": manifest["safe_prefix"], "release_receipt_path": str(Path(disposal_receipt)), "release_receipt_sha256": sha256_file(disposal_receipt), "mounts": [{"source_id": "organizer", "root": str(organizer), "source_tree_sha256": source_entries[0]["source_tree_sha256"], "artifact_receipt_sha256": organizer_hash}, {"source_id": "rollout", "root": str(campaign), "source_tree_sha256": source_entries[1]["source_tree_sha256"], "artifact_receipt_sha256": source_entries[1]["artifact_receipt_sha256"]}]})
-        receipt_value = {"schema_version": 2, "kind": "runtime_mixture_generation", "plan_sha256": plan["sha256"], "unique_windows": len(converted), "train_windows": sum(item["split"] == "train" for item in converted), "bc_train_windows": sum(item["source_type"] == "bc" and item["split"] == "train" for item in converted), "bc_validation_windows": sum(item["source_type"] == "bc" and item["split"] == "validation" for item in converted), "rollout_train_windows": sum(item["source_type"] == "rollout" and item["split"] == "train" for item in converted), "manifest_sha256": sha256_file(staging / "mixture.json"), "source_readback": {"disposal_receipt_sha256": sha256_file(disposal_receipt), "release_binding_sha256": sha256_file(release_binding)}}
+        normalization = {"schema_version": 3, "train_only": True, "derivation": {"train_window_ids": [item["window_id"] for item in converted if item["split"] == "train"], "sample_count": sum(item["split"] == "train" for item in converted) * ACTION_HORIZON}, "statistics": statistics}
+        _write(staging / "mixture-normalization.json", normalization)
+        # This is a deterministic publication target, not proof of publication.
+        # It deliberately is not a loadable runtime manifest: a publisher must
+        # upload these bytes and produce an immutable mixture readback receipt.
+        mixture_id = canonical_json_sha256({"plan_sha256": plan["sha256"], "sources": source_entries, "windows": converted, "normalization": normalization})
+        _write(staging / "windows.json", {"schema_version": 3, "windows": converted})
+        pending = {"schema_version": 1, "kind": "runtime_mixture_publication_pending", "repository": APPROVED_MIXTURE_REPOSITORY, "mixture_id": mixture_id, "prefix": f"mixtures/{mixture_id}", "sources": source_entries, "normalization_sha256": sha256_file(staging / "mixture-normalization.json"), "windows_sha256": sha256_file(staging / "windows.json"), "publication_pending": True}
+        _write(staging / "publication-pending.json", pending)
+        receipt_value = {"schema_version": 3, "kind": "runtime_mixture_generation", "publication_pending": True, "plan_sha256": plan["sha256"], "mixture_id": mixture_id, "prefix": pending["prefix"], "unique_windows": len(converted), "train_windows": sum(item["split"] == "train" for item in converted), "bc_train_windows": sum(item["source_type"] == "bc" and item["split"] == "train" for item in converted), "bc_validation_windows": sum(item["source_type"] == "bc" and item["split"] == "validation" for item in converted), "rollout_train_windows": sum(item["source_type"] == "rollout" and item["split"] == "train" for item in converted), "source_readback": {"source_publications_sha256": sha256_file(release_binding)}}
         _write(staging / "generation-receipt.json", receipt_value)
         os.replace(staging, destination)
         return receipt_value
