@@ -38,6 +38,7 @@ def test_cli_help() -> None:
         "restore",
         "build-runtime-mixture",
         "pilot-runtime-mixture",
+        "hydrate-runtime-mixture",
         "publish-runtime-source",
         "publish-runtime-mixture",
         "finalize-runtime-mixture",

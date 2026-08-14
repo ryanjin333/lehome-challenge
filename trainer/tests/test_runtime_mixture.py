@@ -117,6 +117,38 @@ def test_round_source_identity_is_root_level_and_windows_authenticate_attempts(t
     assert contract.windows[-1].source_locator["attempt_root"] == "attempts/attempt-2"
 
 
+def test_local_mount_can_override_only_the_external_source_readback_receipt_paths(tmp_path: Path) -> None:
+    """Hydration must not rewrite immutable mixture bytes just to relocate receipts."""
+    from lehome_train.groot.runtime_mixture import _manifest_digest_binding, load_runtime_contract, sha256_file
+
+    manifest, _index, mounts = _contract(tmp_path)
+    manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+    mounts_value = json.loads(mounts.read_text(encoding="utf-8"))
+    for source, entry in zip(manifest_value["sources"], mounts_value["mounts"], strict=True):
+        publication = source["publication"]
+        external = Path(publication["readback_receipt_path"])
+        publication["readback_receipt_path"] = "/unavailable/authoring-host/receipt.json"
+        entry["source_readback_receipt_path"] = str(external)
+        entry["source_readback_receipt_sha256"] = _sha_path(external)
+    index = tmp_path / "windows.json"
+    index_value = json.loads(index.read_text(encoding="utf-8"))
+    index_value["manifest_sha256"] = _manifest_digest_binding(manifest_value)
+    _write(index, index_value)
+    manifest_value["window_index"]["sha256"] = sha256_file(index)
+    manifest_value["window_index"]["byte_size"] = index.stat().st_size
+    _write(manifest, manifest_value)
+    deployment = tmp_path / "release-receipt.json"
+    deployment_value = json.loads(deployment.read_text(encoding="utf-8"))
+    for artifact in deployment_value["artifact_entries"]:
+        target = tmp_path / artifact["relative_path"]
+        artifact.update({"sha256": _sha_path(target), "byte_size": target.stat().st_size})
+    _write(deployment, deployment_value)
+    mounts_value["deployment_receipt_sha256"] = _sha_path(deployment)
+    _write(mounts, mounts_value)
+
+    assert load_runtime_contract(manifest, mounts).mounts["bc"] == tmp_path / "bc"
+
+
 def test_contract_rejects_sources_without_individual_immutable_publication_bindings(tmp_path: Path) -> None:
     from lehome_train.groot.runtime_mixture import _manifest_digest_binding, load_runtime_contract, sha256_file
 

@@ -21,6 +21,7 @@ from lehome_train.groot.runtime_mixture import (
     INSTRUCTION,
     load_runtime_contract,
     pending_mixture_id,
+    source_tree_sha256,
 )
 from lehome_train.hub import HubTransport, require_access, upload_files, download_files, list_repository_tree
 from lehome_train.io import atomic_write_json, canonical_json_sha256, sha256_file
@@ -107,6 +108,15 @@ def _tree_matches(tree: tuple[object, ...], *, prefix: str, entries: tuple[SyncE
 
 
 _PENDING_KEYS = {"schema_version", "kind", "repository", "mixture_id", "prefix", "sources", "normalization_sha256", "windows_sha256", "publication_pending"}
+_SOURCE_READBACK_KEYS = {
+    "repository", "immutable_revision", "remote_prefix", "fresh_readback_verified",
+    "tree_listing_verified",
+}
+_DEPLOYMENT_KEYS = {
+    "repository", "immutable_revision", "remote_prefix", "mixture_id",
+    "pending_receipt_sha256", "artifact_entries", "fresh_readback_verified",
+    "tree_listing_verified",
+}
 
 
 def _pending(root: Path) -> dict[str, object]:
@@ -123,6 +133,202 @@ def _pending(root: Path) -> dict[str, object]:
     ):
         raise ValueError("mixture publication pending artifact content address is invalid")
     return pending
+
+
+def _immutable_revision(value: object, *, label: str) -> str:
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        raise ValueError(f"{label} must name an immutable revision")
+    return value
+
+
+def _hydration_entries(value: object, *, label: str) -> tuple[SyncEntry, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{label} must contain an exact artifact tree")
+    entries: list[SyncEntry] = []
+    for record in value:
+        if not isinstance(record, dict) or set(record) != {"relative_path", "sha256", "byte_size"}:
+            raise ValueError(f"{label} artifact is malformed")
+        try:
+            entries.append(SyncEntry(record["relative_path"], record["sha256"], record["byte_size"]))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{label} artifact is malformed") from error
+    if len({entry.relative_path for entry in entries}) != len(entries):
+        raise ValueError(f"{label} has duplicate artifact paths")
+    return tuple(sorted(entries, key=lambda entry: entry.relative_path))
+
+
+def _source_readback(path: Path, *, source_type: str) -> dict[str, object]:
+    receipt = _load_exact(path, keys=_SOURCE_READBACK_KEYS, label="runtime source readback receipt")
+    prefix = receipt.get("remote_prefix")
+    if (
+        receipt.get("repository") != APPROVED_MIXTURE_REPOSITORY
+        or receipt.get("fresh_readback_verified") is not True
+        or receipt.get("tree_listing_verified") is not True
+        or (source_type == "bc" and prefix != "bc/full")
+        or (source_type == "rollout" and (type(prefix) is not str or re.fullmatch(r"rollouts/round-[1-9][0-9]*", prefix) is None))
+    ):
+        raise ValueError("runtime source readback receipt is not an authenticated campaign source")
+    _immutable_revision(receipt.get("immutable_revision"), label="runtime source readback receipt")
+    return receipt
+
+
+def _remote_files_under_prefix(
+    *, transport: HubTransport, repository: str, revision: str, prefix: str,
+) -> tuple[str, ...]:
+    tree = list_repository_tree(
+        transport=transport, repository=repository, revision=revision, max_attempts=1,
+    )
+    base = prefix + "/"
+    files: set[str] = set()
+    directories: set[str] = set()
+    for entry in tree:
+        if not entry.relative_path.startswith(base):
+            continue
+        relative = entry.relative_path.removeprefix(base)
+        if entry.entry_type == "file":
+            files.add(relative)
+        elif entry.entry_type == "directory":
+            directories.add(relative)
+        else:
+            raise ValueError("runtime hydration remote tree contains a symlink or special entry")
+    if not files or any(
+        directory not in {"/".join(path.split("/")[:depth]) for path in files for depth in range(1, len(path.split("/")))}
+        for directory in directories
+    ):
+        raise ValueError("runtime hydration remote tree is incomplete or unexpected")
+    return tuple(sorted(files))
+
+
+def _copy_receipt(source: Path, destination: Path, *, expected_sha256: str) -> None:
+    if source.is_symlink() or not source.is_file() or sha256_file(source) != expected_sha256:
+        raise ValueError("runtime source readback receipt drift")
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError("runtime hydration receipt destination is immutable")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    if destination.is_symlink() or sha256_file(destination) != expected_sha256:
+        raise ValueError("runtime source readback receipt copy mismatch")
+
+
+def hydrate_runtime_mixture_from_request(path: str | Path, *, transport: HubTransport) -> dict[str, object]:
+    """Hydrate only the receipt-bound immutable runtime mixture on an x86 host.
+
+    The immutable manifest keeps authoring receipt paths.  This writes a local
+    mount descriptor that replaces those *locations* while requiring identical
+    receipt bytes, avoiding an immutable-manifest rewrite or hash cycle.
+    """
+    request = _load_exact(Path(path), keys={"schema_version", "command", "arguments"}, label="runtime mixture hydration request")
+    arguments = request["arguments"]
+    expected = {"deployment_receipt", "source_readback_receipts", "destination", "mounts_descriptor"}
+    if (
+        request.get("schema_version") != 1
+        or request.get("command") != "hydrate-runtime-mixture"
+        or not isinstance(arguments, dict)
+        or set(arguments) != expected
+        or any(type(arguments[key]) is not str or not arguments[key] for key in expected - {"source_readback_receipts"})
+        or not isinstance(arguments.get("source_readback_receipts"), dict)
+        or any(type(key) is not str or type(value) is not str or not value for key, value in arguments["source_readback_receipts"].items())
+    ):
+        raise ValueError("runtime mixture hydration request has an incompatible schema")
+    deployment_path = Path(arguments["deployment_receipt"])
+    deployment = _load_exact(deployment_path, keys=_DEPLOYMENT_KEYS, label="runtime deployment receipt")
+    if (
+        deployment.get("repository") != APPROVED_MIXTURE_REPOSITORY
+        or deployment.get("fresh_readback_verified") is not True
+        or deployment.get("tree_listing_verified") is not True
+        or type(deployment.get("remote_prefix")) is not str
+        or type(deployment.get("mixture_id")) is not str
+        or deployment["remote_prefix"] != f"mixtures/{deployment['mixture_id']}"
+    ):
+        raise ValueError("runtime deployment receipt is not authenticated")
+    revision = _immutable_revision(deployment.get("immutable_revision"), label="runtime deployment receipt")
+    entries = _hydration_entries(deployment.get("artifact_entries"), label="runtime deployment receipt")
+    destination, mounts_path = Path(arguments["destination"]), Path(arguments["mounts_descriptor"])
+    if (
+        not destination.is_absolute() or not mounts_path.is_absolute()
+        or destination.exists() or mounts_path.exists() or destination.is_symlink() or mounts_path.is_symlink()
+        or mounts_path.parent != destination
+        or deployment_path.is_symlink() or not deployment_path.is_file()
+    ):
+        raise ValueError("runtime hydration destinations must be absent absolute paths beside the mixture")
+    require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=False)
+    prefix = str(deployment["remote_prefix"])
+    if _remote_files_under_prefix(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, prefix=prefix) != tuple(entry.relative_path for entry in entries):
+        raise ValueError("runtime deployment remote tree differs from the authenticated receipt")
+    destination.mkdir(parents=True)
+    try:
+        download_files(
+            transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+            destination=destination, relative_paths=tuple(entry.relative_path for entry in entries),
+            remote_prefix=prefix, max_attempts=1,
+        )
+        if _entries(destination) != entries:
+            raise ValueError("runtime deployment hydration bytes differ from the authenticated receipt")
+        manifest = _load_exact(destination / "mixture.json", keys={
+            "schema_version", "kind", "repository", "safe_prefix", "mixture_id", "sources",
+            "camera_schema", "image_shape", "state_schema", "action_schema", "fps", "action_horizon",
+            "instruction", "schedule_seed", "cycle_size", "mixture_normalization", "window_index",
+        }, label="hydrated runtime mixture manifest")
+        sources = manifest.get("sources")
+        receipt_paths = arguments["source_readback_receipts"]
+        if not isinstance(sources, list) or not sources:
+            raise ValueError("hydrated runtime mixture lacks sources")
+        if {source.get("source_id") for source in sources if isinstance(source, dict)} != set(receipt_paths):
+            raise ValueError("runtime source receipts do not exactly cover immutable mixture sources")
+        roots: list[dict[str, object]] = []
+        receipt_root = destination.parent / "receipts"
+        for source in sources:
+            if not isinstance(source, dict) or type(source.get("source_id")) is not str or source.get("source_type") not in {"bc", "rollout"} or not isinstance(source.get("publication"), dict):
+                raise ValueError("hydrated runtime source is malformed")
+            source_id = source["source_id"]
+            publication = source["publication"]
+            receipt_path = Path(receipt_paths[source_id])
+            receipt = _source_readback(receipt_path, source_type=source["source_type"])
+            if (
+                publication.get("repository") != receipt["repository"]
+                or publication.get("revision") != receipt["immutable_revision"]
+                or publication.get("prefix") != receipt["remote_prefix"]
+                or publication.get("readback_receipt_sha256") != sha256_file(receipt_path)
+            ):
+                raise ValueError("runtime source receipt does not bind the immutable manifest publication")
+            source_root = destination.parent / "sources" / source_id
+            source_files = _remote_files_under_prefix(
+                transport=transport, repository=APPROVED_MIXTURE_REPOSITORY,
+                revision=str(receipt["immutable_revision"]), prefix=str(receipt["remote_prefix"]),
+            )
+            source_root.mkdir(parents=True)
+            download_files(
+                transport=transport, repository=APPROVED_MIXTURE_REPOSITORY,
+                revision=str(receipt["immutable_revision"]), destination=source_root,
+                relative_paths=source_files, remote_prefix=str(receipt["remote_prefix"]), max_attempts=1,
+            )
+            if source_tree_sha256(source_root) != source.get("source_tree_sha256"):
+                raise ValueError("runtime source hydration tree differs from immutable manifest")
+            local_receipt = receipt_root / f"{source_id}-readback.json"
+            _copy_receipt(receipt_path, local_receipt, expected_sha256=str(publication["readback_receipt_sha256"]))
+            roots.append({
+                "source_id": source_id, "root": str(source_root),
+                "source_tree_sha256": source["source_tree_sha256"],
+                "artifact_receipt_sha256": source["artifact_receipt_sha256"],
+                "source_readback_receipt_path": str(local_receipt),
+                "source_readback_receipt_sha256": sha256_file(local_receipt),
+            })
+        atomic_write_json(mounts_path, {
+            "schema_version": 2, "repository": APPROVED_MIXTURE_REPOSITORY,
+            "safe_prefix": prefix, "deployment_receipt_path": str(deployment_path),
+            "deployment_receipt_sha256": sha256_file(deployment_path), "mounts": roots,
+        })
+        load_runtime_contract(destination / "mixture.json", mounts_path)
+        return {
+            "schema_version": 1, "kind": "runtime_mixture_hydration",
+            "repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": revision,
+            "remote_prefix": prefix, "mixture_id": deployment["mixture_id"],
+            "artifact_tree_sha256": canonical_json_sha256(_entry_records(entries)),
+            "mounts_descriptor": str(mounts_path), "fresh_readback_verified": True,
+        }
+    except BaseException:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
 
 
 def publish_source(*, root: str | Path, source_type: str, round_id: str | None, revision: str, receipt_path: str | Path, transport: HubTransport) -> dict[str, object]:

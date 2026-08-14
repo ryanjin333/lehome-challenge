@@ -286,6 +286,21 @@ def pilot_runtime_mixture(
     _fail_closed(operation)
 
 
+@app.command("hydrate-runtime-mixture")
+def hydrate_runtime_mixture(
+    request: Path = typer.Option(..., "--request"),
+) -> None:
+    """Hydrate and verify the exact immutable runtime mixture on the target host."""
+
+    def operation() -> object:
+        from lehome_train.groot.runtime_mixture_publish import hydrate_runtime_mixture_from_request
+        from lehome_train.hub import HuggingFaceHubTransport
+
+        return hydrate_runtime_mixture_from_request(request, transport=HuggingFaceHubTransport())
+
+    _fail_closed(operation)
+
+
 @app.command("publish-runtime-source")
 def publish_runtime_source(
     request: Path = typer.Option(..., "--request"),

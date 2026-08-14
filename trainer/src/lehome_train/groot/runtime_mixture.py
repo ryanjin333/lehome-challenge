@@ -434,7 +434,12 @@ def _validate_mounts(path: Path, manifest: MixtureManifest) -> dict[str, Path]:
     for entry in document["mounts"]:
         if not isinstance(entry, dict):
             raise ValueError("mount entry is invalid")
-        _exact(entry, {"source_id", "root", "source_tree_sha256", "artifact_receipt_sha256"}, label="mount entry")
+        standard_mount_keys = {"source_id", "root", "source_tree_sha256", "artifact_receipt_sha256"}
+        override_mount_keys = standard_mount_keys | {
+            "source_readback_receipt_path", "source_readback_receipt_sha256",
+        }
+        if frozenset(entry) not in {frozenset(standard_mount_keys), frozenset(override_mount_keys)}:
+            _exact(entry, standard_mount_keys, label="mount entry")
         source_id = entry["source_id"]
         if type(source_id) is not str or source_id not in required or source_id in mounts:
             raise ValueError("mounts have missing or extra source IDs")
@@ -453,13 +458,20 @@ def _validate_mounts(path: Path, manifest: MixtureManifest) -> dict[str, Path]:
             if sha256_file(_safe_file(root, relative, label=label)) != digest:
                 raise ValueError(f"{label} drift")
         publication = source.publication
+        readback_path = publication["readback_receipt_path"]
+        readback_sha256 = publication["readback_receipt_sha256"]
+        if set(entry) == override_mount_keys:
+            readback_path = entry["source_readback_receipt_path"]
+            readback_sha256 = entry["source_readback_receipt_sha256"]
+            if readback_sha256 != publication["readback_receipt_sha256"]:
+                raise ValueError("mount source readback receipt identity differs from immutable manifest")
         readback = _absolute_file_path(
-            publication["readback_receipt_path"],
+            readback_path,
             label="source publication readback receipt path",
         )
         if readback.is_symlink() or not readback.is_file():
             raise ValueError("source publication readback receipt is missing or unsafe")
-        if sha256_file(readback) != publication["readback_receipt_sha256"]:
+        if sha256_file(readback) != readback_sha256:
             raise ValueError("source publication readback receipt drift")
         readback_value = _load_object(readback, label="source publication readback receipt")
         _exact(

@@ -99,6 +99,49 @@ def test_source_publisher_proves_complete_remote_tree_and_fresh_bytes_without_mu
     assert receipt_path.is_file() and not (source / "bc.json").exists()
 
 
+def test_hydrator_recreates_exact_remote_trees_and_rewrites_only_local_receipt_mounts(
+    tmp_path: Path,
+) -> None:
+    from lehome_train.groot.runtime_mixture import load_runtime_contract
+    from lehome_train.groot.runtime_mixture_publish import hydrate_runtime_mixture_from_request
+    from test_runtime_mixture import _contract
+
+    manifest, _index, _mounts = _contract(tmp_path / "authoring")
+    manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+    deployment = manifest.parent / "release-receipt.json"
+    transport = MemoryTransport()
+    for artifact in json.loads(deployment.read_text(encoding="utf-8"))["artifact_entries"]:
+        relative = artifact["relative_path"]
+        transport.remote[f"mixtures/{'d' * 64}/{relative}"] = (manifest.parent / relative).read_bytes()
+    receipt_paths: dict[str, str] = {}
+    for source in manifest_value["sources"]:
+        root = manifest.parent / ("bc" if source["source_id"] == "bc" else "round-1")
+        prefix = source["publication"]["prefix"]
+        for file in root.rglob("*"):
+            if file.is_file():
+                transport.remote[f"{prefix}/{file.relative_to(root).as_posix()}"] = file.read_bytes()
+        receipt_paths[source["source_id"]] = source["publication"]["readback_receipt_path"]
+    request = tmp_path / "hydrate.json"
+    destination = tmp_path / "hydrated" / "mixture"
+    mounts = destination / "mounts.json"
+    _write(request, {
+        "schema_version": 1,
+        "command": "hydrate-runtime-mixture",
+        "arguments": {
+            "deployment_receipt": str(deployment),
+            "source_readback_receipts": receipt_paths,
+            "destination": str(destination),
+            "mounts_descriptor": str(mounts),
+        },
+    })
+
+    result = hydrate_runtime_mixture_from_request(request, transport=transport)
+
+    assert result["immutable_revision"] == "a" * 40
+    assert load_runtime_contract(destination / "mixture.json", mounts).mounts["bc"] == destination.parent / "sources" / "bc"
+    assert all("/authoring/" not in entry["source_readback_receipt_path"] for entry in json.loads(mounts.read_text())["mounts"])
+
+
 @pytest.mark.parametrize("fault", ["partial-upload", "extra-remote-file", "changed-readback", "download"])
 def test_source_publisher_rejects_incomplete_or_changed_remote_content(tmp_path: Path, fault: str) -> None:
     from lehome_train.groot.runtime_mixture_publish import publish_source
