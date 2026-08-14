@@ -270,7 +270,48 @@ def test_mix_real_ffmpeg_video_materialization_is_identical_across_worker_counts
     assert load_generation_receipt(single_root) == load_generation_receipt(parallel_root)
 
 
-@pytest.mark.parametrize("video_workers", (0, 1.5, 9))
+@pytest.mark.parametrize("video_workers", (16, 24, 32))
+def test_mix_accepts_high_video_worker_caps_without_starting_extra_ffmpeg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, video_workers: int,
+) -> None:
+    """Ceiling coverage uses copied fixture videos, never a 32-process ffmpeg run."""
+
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    seen: list[int] = []
+
+    class InlineVideoSlicer:
+        def __init__(self, workers: int) -> None:
+            seen.append(workers)
+
+        def submit(
+            self,
+            source: Path,
+            destination: Path,
+            *,
+            start: int,
+            stop: int,
+            on_complete: object = None,
+        ) -> None:
+            assert stop - start == ACTION_HORIZON
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            if on_complete is not None:
+                on_complete()  # type: ignore[operator]
+
+        def finish(self) -> None:
+            pass
+
+        def cancel(self) -> None:
+            pass
+
+    monkeypatch.setattr("lehome_train.flywheel.mix._BoundedVideoSlicer", InlineVideoSlicer)
+    materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "mixed", video_workers=video_workers)
+    assert seen == [video_workers]
+
+
+@pytest.mark.parametrize("video_workers", (0, 1.5, 33, True, "8"))
 def test_mix_rejects_invalid_video_worker_caps(tmp_path: Path, video_workers: object) -> None:
     organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
     flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
@@ -516,6 +557,21 @@ def test_mix_materializer_identity_binds_all_behavior_dependencies(monkeypatch: 
         monkeypatch.setattr("lehome_train.flywheel.mix.sha256_file", lambda path, original=original, module=module: "f" * 64 if Path(path) == Path(module.__file__) else original(path))
         assert _mix_materializer_identity() != baseline
         monkeypatch.undo()
+
+
+def test_mix_materializer_identity_keeps_worker_ceiling_scheduling_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Raising the scheduler ceiling must keep existing persistent state valid."""
+
+    import lehome_train.flywheel.mix as mix
+
+    original = mix.sha256_file
+    baseline = mix._mix_materializer_identity()
+    monkeypatch.setattr(
+        mix,
+        "sha256_file",
+        lambda path: "f" * 64 if Path(path) == Path(mix.__file__) else original(path),
+    )
+    assert mix._mix_materializer_identity() == baseline
 
 
 def test_validation_reservation_scales_with_bounded_state_for_23k_ranges() -> None:

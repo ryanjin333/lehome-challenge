@@ -1130,11 +1130,12 @@ def test_materialize_forwards_optional_video_workers_and_rejects_invalid_values(
         },
     )
 
-    assert LIFECYCLE._materialize(request | {"video_workers": 8})["action"] == "materialize"
-    assert seen[-1]["video_workers"] == 8
+    for video_workers in (16, 24, 32):
+        assert LIFECYCLE._materialize(request | {"video_workers": video_workers})["action"] == "materialize"
+        assert seen[-1]["video_workers"] == video_workers
     assert LIFECYCLE._materialize(request)["action"] == "materialize"
     assert seen[-1]["video_workers"] == 4
-    for invalid in (0, 9, True, 1.0, "8"):
+    for invalid in (0, 33, True, 1.0, "8"):
         with pytest.raises(ValueError, match="video_workers"):
             LIFECYCLE._materialize(request | {"video_workers": invalid})
 
