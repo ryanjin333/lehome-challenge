@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ from lehome_train.data.inspect import artifact_identities
 from lehome_train.data.validate import validate_prepared_dataset
 from lehome_train.flywheel.mix import (
     ACTION_HORIZON,
+    _PersistentLock,
     build_mix_plan,
     load_generation_receipt,
     materialize_mixed_snapshot,
@@ -236,6 +238,229 @@ def test_mix_video_failure_cleans_temporary_tree_without_generation_receipt(
     assert not destination.exists()
     assert not destination.with_name(destination.name + ".generation.json").exists()
     assert not list(tmp_path.glob(".failed.*.tmp"))
+
+
+def test_mix_persistent_staging_retains_verified_work_after_a_slice_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A named staging root is the opt-in crash-resume boundary."""
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    staging = tmp_path / "resume"
+
+    def fail_slice(source: Path, destination: Path, *, start: int, stop: int) -> None:
+        raise RuntimeError("synthetic persistent slice failure")
+
+    monkeypatch.setattr("lehome_train.flywheel.mix._copy_selected_video", fail_slice)
+    with pytest.raises(RuntimeError, match="synthetic persistent slice failure"):
+        materialize_mixed_snapshot(
+            plan, organizer, flywheel, tmp_path / "failed-persistent",
+            persistent_staging_root=staging,
+        )
+    assert (staging / "state.json").is_file()
+    assert (staging / "work").is_dir()
+
+
+def test_mix_persistent_restart_reuses_verified_parquet_and_matches_fresh_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    staging = tmp_path / "resume"
+    destination = tmp_path / "resumed"
+    original_slice = __import__("lehome_train.flywheel.mix", fromlist=["_copy_selected_video"])._copy_selected_video
+    original_write = pq.write_table
+    writes = 0
+
+    def fail_slice(source: Path, destination: Path, *, start: int, stop: int) -> None:
+        raise RuntimeError("interrupted after parquet")
+
+    monkeypatch.setattr("lehome_train.flywheel.mix._copy_selected_video", fail_slice)
+    with pytest.raises(RuntimeError, match="interrupted after parquet"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)
+
+    def count_write(*args: object, **kwargs: object) -> None:
+        nonlocal writes
+        if len(args) > 1 and "data/chunk-" in str(args[1]):
+            writes += 1
+        original_write(*args, **kwargs)
+
+    monkeypatch.setattr("lehome_train.flywheel.mix._copy_selected_video", original_slice)
+    monkeypatch.setattr("lehome_train.flywheel.mix.pq.write_table", count_write)
+    materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging, video_workers=1)
+    assert 0 < writes < len(plan.selections)
+    monkeypatch.setattr("lehome_train.flywheel.mix.pq.write_table", original_write)
+    fresh = tmp_path / "fresh"
+    materialize_mixed_snapshot(plan, organizer, flywheel, fresh, video_workers=4)
+    assert artifact_identities(destination, exclude={"manifest.json"}) == artifact_identities(fresh, exclude={"manifest.json"})
+    assert not staging.exists()
+
+
+def test_mix_persistent_resume_rejects_tampered_state_and_unexpected_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    staging = tmp_path / "resume"
+    monkeypatch.setattr("lehome_train.flywheel.mix._copy_selected_video", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(RuntimeError, match="stop"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "destination", persistent_staging_root=staging)
+    (staging / "unexpected").write_text("no", encoding="utf-8")
+    with pytest.raises(ValueError, match="unexpected"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "destination", persistent_staging_root=staging)
+
+
+@pytest.mark.parametrize("node", ("symlink", "fifo"))
+def test_mix_persistent_resume_rejects_symlink_and_special_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, node: str,
+) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    staging = tmp_path / "resume"
+    monkeypatch.setattr("lehome_train.flywheel.mix._copy_selected_video", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(RuntimeError, match="stop"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "destination", persistent_staging_root=staging)
+    bad = staging / "work" / "data" / "chunk-000" / "bad"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    if node == "symlink":
+        bad.symlink_to(staging / "state.json")
+    else:
+        os.mkfifo(bad)
+    with pytest.raises(ValueError, match="unexpected"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "destination", persistent_staging_root=staging)
+
+
+def test_persistent_lock_excludes_second_owner_and_releases_after_process_death(tmp_path: Path) -> None:
+    lock_path = tmp_path / "lock"
+    with _PersistentLock(lock_path):
+        with pytest.raises(RuntimeError, match="locked"):
+            with _PersistentLock(lock_path):
+                pass
+    # flock ownership is tied to the process descriptor, rather than an O_EXCL
+    # sentinel: a killed process releases it for the next recovery attempt.
+    child = subprocess.Popen(("python3", "-c", "import fcntl,time; f=open(__import__('sys').argv[1], 'a+b'); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(60)", str(lock_path)))
+    try:
+        for _ in range(50):
+            try:
+                with _PersistentLock(lock_path):
+                    pass
+            except RuntimeError:
+                break
+            time.sleep(.01)
+        else:
+            pytest.fail("child did not acquire advisory lock")
+        child.kill(); child.wait(timeout=5)
+        with _PersistentLock(lock_path):
+            pass
+    finally:
+        if child.poll() is None:
+            child.kill(); child.wait(timeout=5)
+
+
+def test_mix_persistent_resume_rejects_state_plan_source_and_code_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    staging = tmp_path / "resume"
+    monkeypatch.setattr("lehome_train.flywheel.mix._copy_selected_video", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(RuntimeError, match="stop"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "destination", persistent_staging_root=staging)
+    state = json.loads((staging / "state.json").read_text(encoding="utf-8"))
+    state["materializer_sha256"] = "0" * 64
+    (staging / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="plan, source, or code"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "destination", persistent_staging_root=staging)
+
+
+def test_mix_persistent_resume_regenerates_semantically_wrong_parquet_and_invalid_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    staging, destination = tmp_path / "resume", tmp_path / "destination"
+    monkeypatch.setattr("lehome_train.flywheel.mix._seal_mixed_work", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("after jobs")))
+    with pytest.raises(RuntimeError, match="after jobs"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)
+    parquet = next((staging / "work" / "data").rglob("*.parquet"))
+    video = next((staging / "work" / "videos").rglob("*.mp4"))
+    table = pq.read_table(parquet).set_column(0, "observation.state", pa.array([[99.0] * 12] * ACTION_HORIZON, type=pa.list_(pa.float32(), 12)))
+    pq.write_table(table, parquet, compression="zstd")
+    video.write_bytes(b"not an mp4")
+    # Model a fully written receipt for corrupt media; the semantic/ffprobe
+    # validators, not merely receipt presence, decide whether it is reusable.
+    from lehome_train.io import sha256_file
+    for receipt in (staging / "receipts").glob("*.json"):
+        body = json.loads(receipt.read_text(encoding="utf-8"))
+        candidate = staging / "work" / body["relative_path"]
+        if candidate in (parquet, video):
+            body["sha256"], body["byte_size"] = sha256_file(candidate), candidate.stat().st_size
+            receipt.write_text(json.dumps(body), encoding="utf-8")
+    monkeypatch.undo()
+    materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)
+    _validate_output_video(next(destination.rglob("*.mp4")), expected_frame_count=ACTION_HORIZON, expected_fps=30)
+    assert pq.read_table(destination / parquet.relative_to(staging / "work"))["observation.state"][0].as_py()[0] != 99.0
+
+
+def test_mix_persistent_resume_repairs_only_exact_post_promotion_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    staging, destination = tmp_path / "resume", tmp_path / "destination"
+    receipt = destination.with_name(destination.name + ".generation.json")
+    original = atomic_write_json
+    def fail_receipt(path: Path, value: object) -> None:
+        if path == receipt:
+            raise RuntimeError("lost after promotion")
+        original(path, value)
+    monkeypatch.setattr("lehome_train.flywheel.mix.atomic_write_json", fail_receipt)
+    with pytest.raises(RuntimeError, match="lost after promotion"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)
+    monkeypatch.setattr("lehome_train.flywheel.mix.atomic_write_json", original)
+    assert destination.is_dir() and staging.exists() and not receipt.exists()
+    assert materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)["resumed_after_promotion"] is True
+    verify_generation(destination)
+
+
+def test_mix_persistent_resume_rejects_arbitrary_post_promotion_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    staging, destination = tmp_path / "resume", tmp_path / "destination"
+    monkeypatch.setattr("lehome_train.flywheel.mix._copy_selected_video", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(RuntimeError, match="stop"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)
+    destination.mkdir(); (destination / "manifest.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="destination"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)
+
+
+def test_mix_persistent_resume_discards_stale_postprocessing_before_reseal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan = build_mix_plan(organizer, flywheel, seed=20260813)
+    staging, destination = tmp_path / "resume", tmp_path / "destination"
+    monkeypatch.setattr("lehome_train.flywheel.mix._seal_mixed_work", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("after jobs")))
+    with pytest.raises(RuntimeError, match="after jobs"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)
+    stale = staging / "work" / "meta" / "validation.json"
+    stale.parent.mkdir(parents=True); stale.write_text("stale", encoding="utf-8")
+    monkeypatch.undo()
+    materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging)
+    assert not (destination / "meta" / "validation.json").exists()
+    verify_generation(destination)
 
 
 def test_mix_receipt_failure_removes_just_promoted_destination_and_partial_receipt(

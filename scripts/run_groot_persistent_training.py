@@ -872,11 +872,12 @@ def destroy(*, instance_id: int, training_receipt: Mapping[str, object], runner:
 
 def _materialize(request: Mapping[str, object]) -> dict[str, object]:
     """Build the only accepted 70/30 generation through the canonical mixer."""
-    organizer, corrective, destination, seed = (
+    organizer, corrective, destination, seed, staging_root = (
         request.get("organizer_root"),
         request.get("corrective_roots"),
         request.get("destination"),
         request.get("seed"),
+        request.get("persistent_staging_root"),
     )
     if (
         not isinstance(organizer, str)
@@ -885,8 +886,10 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
         or not all(isinstance(item, str) and item for item in corrective)
         or not isinstance(destination, str)
         or type(seed) is not int
+        or not isinstance(staging_root, str)
+        or not staging_root
     ):
-        raise ValueError("materialize requires organizer, corrective roots, destination, and integer seed")
+        raise ValueError("materialize requires organizer, corrective roots, destination, persistent staging root, and integer seed")
     from lehome_train.flywheel.mix import (
         build_mix_plan,
         materialize_mixed_snapshot,
@@ -912,6 +915,7 @@ def _materialize(request: Mapping[str, object]) -> dict[str, object]:
     materialize_mixed_snapshot(
         plan, organizer_root, corrective_roots, destination_root,
         persistent_source_evidence=evidence,
+        persistent_staging_root=staging_root,
     )
     sealed = verify_generation(destination_root)
     if sealed["organizer_training_frames"] * 3 != sealed["rft_training_frames"] * 7:

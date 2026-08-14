@@ -507,6 +507,7 @@ def test_materialize_builds_a_verified_sealed_generation(tmp_path: Path) -> None
         "organizer_root": str(organizer),
         "corrective_roots": [str(corrective_a), str(corrective_b)],
         "destination": str(destination),
+        "persistent_staging_root": str(tmp_path / "materialize-resume"),
         "seed": 20260812,
         "organizer_source_evidence": LIFECYCLE.ORGANIZER_SOURCE,
         "corrective_release_receipt": str(release_receipt),
@@ -559,7 +560,7 @@ def test_prepare_requires_exact_pinned_sources_in_the_sealed_receipt(tmp_path: P
     corrective_b = _prepared_source(tmp_path / "corrective-b", kind="flywheel", grade="B", episodes=1)
     release_receipt = _corrective_release_receipt([corrective_a, corrective_b], tmp_path / "corrective-release.json")
     root = tmp_path / "generation"
-    LIFECYCLE._materialize({"organizer_root": str(organizer), "corrective_roots": [str(corrective_a), str(corrective_b)], "destination": str(root), "seed": 1, "organizer_source_evidence": LIFECYCLE.ORGANIZER_SOURCE, "corrective_release_receipt": str(release_receipt)})
+    LIFECYCLE._materialize({"organizer_root": str(organizer), "corrective_roots": [str(corrective_a), str(corrective_b)], "destination": str(root), "persistent_staging_root": str(tmp_path / "generation-resume"), "seed": 1, "organizer_source_evidence": LIFECYCLE.ORGANIZER_SOURCE, "corrective_release_receipt": str(release_receipt)})
     request = tmp_path / "prepare.json"
     request.write_text(json.dumps({"generation_root": str(root)}), encoding="utf-8")
     assert LIFECYCLE.main_for_test(["prepare", "--request", str(request)])["paid_action"] is False
