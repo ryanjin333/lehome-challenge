@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -354,6 +355,247 @@ def test_runtime_mixture_train_requires_a_cross_checked_gpu_warmup_receipt() -> 
             "result_output": "/output/result.json",
             "status_output": "/output/status.json",
         })
+
+
+def test_runtime_gpu_warmup_production_adapter_measures_live_loader_model_and_nvml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production factory exposes measurements, never caller-authored rows."""
+
+    class FakeCuda:
+        def __init__(self) -> None:
+            self.synchronizations = 0
+            self.empty_cache_calls = 0
+            self.ipc_collect_calls = 0
+
+        def is_available(self) -> bool:
+            return True
+
+        def is_initialized(self) -> bool:
+            return True
+
+        def synchronize(self) -> None:
+            self.synchronizations += 1
+
+        def empty_cache(self) -> None:
+            self.empty_cache_calls += 1
+
+        def ipc_collect(self) -> None:
+            self.ipc_collect_calls += 1
+
+    class FakeTensor:
+        shape = (64, 1)
+
+        def to(self, device: str, *, non_blocking: bool) -> "FakeTensor":
+            assert device == "cuda" and non_blocking is True
+            return self
+
+    class FakeLoss:
+        def backward(self) -> None:
+            return None
+
+    class FakeModel:
+        def parameters(self):
+            return iter((SimpleNamespace(device=SimpleNamespace(type="cuda")),))
+
+        def train(self) -> None:
+            return None
+
+        def __call__(self, **batch: object) -> object:
+            assert isinstance(batch["pixel_values"], FakeTensor)
+            return SimpleNamespace(loss=FakeLoss())
+
+    class FakeOptimizer:
+        def __init__(self) -> None:
+            self.steps = 0
+            self.clears = 0
+
+        def step(self) -> None:
+            self.steps += 1
+
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            assert set_to_none is True
+            self.clears += 1
+
+    class FakeLoader:
+        def __init__(self) -> None:
+            self.shutdowns = 0
+
+        def __iter__(self) -> "FakeLoader":
+            return self
+
+        def __next__(self) -> dict[str, FakeTensor]:
+            return {"pixel_values": FakeTensor()}
+
+        def _shutdown_workers(self) -> None:
+            self.shutdowns += 1
+
+    class FakeSampler:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def sample(self) -> object:
+            return SimpleNamespace(gpu_utilization_percent=80.0)
+
+        def close(self) -> None:
+            self.closed = True
+
+    cuda = FakeCuda()
+    fake_torch = SimpleNamespace(cuda=cuda)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    loaders: list[FakeLoader] = []
+    samplers: list[FakeSampler] = []
+    times = iter(
+        value
+        for step in range(60)
+        for value in (float(step), float(step), float(step) + 0.01, float(step) + 0.20)
+    )
+    optimizer = FakeOptimizer()
+    session = runtime_module._RuntimeMixtureWarmupSession(
+        torch_module=fake_torch,
+        model=FakeModel(),
+        optimizer=optimizer,
+        loader_factory=lambda workers: loaders.append(FakeLoader()) or loaders[-1],
+        sampler_factory=lambda: samplers.append(FakeSampler()) or samplers[-1],
+        clock=lambda: next(times),
+    )
+    production = runtime_module.ProductionRuntime()
+    monkeypatch.setattr(production, "_create_runtime_gpu_warmup_session", lambda _arguments: session)
+
+    adapter = production.runtime_gpu_warmup_adapter({"cpu_pilot": {}, "binding": {}})
+    assert adapter.runtime_state().to_dict() == {
+        "torch_cuda_available": True,
+        "torch_cuda_initialized": True,
+        "model_loaded": True,
+    }
+    measured = adapter.measure(worker_count=4, burn_in_steps=10, measured_steps=50)
+
+    assert measured.decoded_samples == 64 * 60
+    assert measured.measured_steps == 50
+    assert measured.oom is False and measured.error is None
+    assert measured.loader_wait_seconds == pytest.approx(0.5)
+    assert measured.step_seconds == pytest.approx(10.0)
+    assert measured.gpu_busy_seconds == pytest.approx(8.0)
+    assert measured.gpu_utilization_percent == 80.0
+    assert optimizer.steps == 60 and optimizer.clears == 60
+    assert len(loaders) == len(samplers) == 1
+    assert loaders[0].shutdowns == 1 and samplers[0].closed is True
+    assert cuda.empty_cache_calls == cuda.ipc_collect_calls == 1
+
+
+def test_runtime_gpu_warmup_records_oom_and_cleans_workers_without_claiming_success() -> None:
+    class FakeCuda:
+        def synchronize(self) -> None:
+            return None
+
+        def empty_cache(self) -> None:
+            return None
+
+        def ipc_collect(self) -> None:
+            return None
+
+    class OomModel:
+        def parameters(self):
+            return iter((SimpleNamespace(device=SimpleNamespace(type="cuda")),))
+
+        def train(self) -> None:
+            return None
+
+        def __call__(self, **_batch: object) -> object:
+            raise RuntimeError("CUDA out of memory")
+
+    class Loader:
+        shutdowns = 0
+
+        def __iter__(self) -> "Loader":
+            return self
+
+        def __next__(self) -> dict[str, object]:
+            return {"batch": SimpleNamespace(shape=(64,), to=lambda *_args, **_kwargs: self)}
+
+        def _shutdown_workers(self) -> None:
+            self.shutdowns += 1
+
+    loader = Loader()
+    sampler = SimpleNamespace(sample=lambda: pytest.fail("NVML sampling must not follow an OOM"), closed=False)
+
+    def sampler_factory() -> object:
+        sampler.close = lambda: setattr(sampler, "closed", True)
+        return sampler
+
+    session = runtime_module._RuntimeMixtureWarmupSession(
+        torch_module=SimpleNamespace(cuda=FakeCuda()),
+        model=OomModel(),
+        optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda **_kwargs: None),
+        loader_factory=lambda _workers: loader,
+        sampler_factory=sampler_factory,
+        clock=iter((0.0, 0.0, 0.01)).__next__,
+    )
+
+    measured = session.measure(worker_count=0, burn_in_steps=10, measured_steps=50)
+
+    assert measured.oom is True
+    assert measured.measured_steps == 0
+    assert measured.decoded_samples == 64
+    assert "out of memory" in (measured.error or "").lower()
+    assert loader.shutdowns == 1
+    assert sampler.closed is True
+
+
+def test_runtime_gpu_warmup_never_substitutes_unloaded_model_or_missing_nvml() -> None:
+    class FakeCuda:
+        def synchronize(self) -> None:
+            return None
+
+        def empty_cache(self) -> None:
+            return None
+
+        def ipc_collect(self) -> None:
+            return None
+
+    class Model:
+        def __init__(self, device: str) -> None:
+            self._device = device
+
+        def parameters(self):
+            return iter((SimpleNamespace(device=SimpleNamespace(type=self._device)),))
+
+    unused_loader = lambda _workers: pytest.fail("loader must not replace an unloaded model")
+    unloaded = runtime_module._RuntimeMixtureWarmupSession(
+        torch_module=SimpleNamespace(cuda=FakeCuda()),
+        model=Model("cpu"),
+        optimizer=SimpleNamespace(),
+        loader_factory=unused_loader,
+        sampler_factory=lambda: pytest.fail("NVML must not replace an unloaded model"),
+    )
+    absent_model = unloaded.measure(worker_count=0, burn_in_steps=10, measured_steps=50)
+    assert absent_model.measured_steps == absent_model.decoded_samples == 0
+    assert absent_model.oom is False
+    assert "not loaded" in (absent_model.error or "")
+
+    # Python special methods are resolved on the type, so a real tiny iterator
+    # keeps this focused on the unavailable NVML path.
+    class OneBatchLoader:
+        def __iter__(self) -> "OneBatchLoader":
+            return self
+
+        def __next__(self) -> object:
+            return SimpleNamespace(shape=(64,))
+
+        def _shutdown_workers(self) -> None:
+            return None
+
+    missing_nvml = runtime_module._RuntimeMixtureWarmupSession(
+        torch_module=SimpleNamespace(cuda=FakeCuda()),
+        model=Model("cuda"),
+        optimizer=SimpleNamespace(),
+        loader_factory=lambda _workers: OneBatchLoader(),
+        sampler_factory=lambda: (_ for _ in ()).throw(RuntimeError("NVML unavailable")),
+    )
+    absent_nvml = missing_nvml.measure(worker_count=0, burn_in_steps=10, measured_steps=50)
+    assert absent_nvml.measured_steps == absent_nvml.decoded_samples == 0
+    assert absent_nvml.oom is False
+    assert absent_nvml.error == "NVML unavailable"
 
 
 def test_resume_downloads_and_consumes_the_immutable_authenticated_descriptor(

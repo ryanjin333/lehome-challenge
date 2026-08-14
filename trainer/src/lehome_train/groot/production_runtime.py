@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+import gc
+import importlib
 import json
 import math
 import os
 from pathlib import Path
 import shutil
 from dataclasses import replace
-from typing import Mapping
+import sys
+from time import monotonic
+from typing import Any, Mapping
 
 from lehome_train.checkpoints import load_checkpoint_descriptor
 from lehome_train.commands.memorize import run_memorization
@@ -64,6 +70,200 @@ _PARENT_CHECKPOINT = {
     "artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
 }
 _LOCAL_SEALED_DATASET_REPOSITORY = "local/sealed-mixed-generation"
+
+
+def _is_oom(error: BaseException) -> bool:
+    """Identify the only measurement failure that has a dedicated receipt bit."""
+
+    return "out of memory" in str(error).lower()
+
+
+def _batch_sample_count(value: object) -> int:
+    """Recover the actual leading batch dimension from a collated torch batch."""
+
+    if isinstance(value, Mapping):
+        for nested in value.values():
+            try:
+                return _batch_sample_count(nested)
+            except ValueError:
+                continue
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            try:
+                return _batch_sample_count(nested)
+            except ValueError:
+                continue
+    else:
+        shape = getattr(value, "shape", None)
+        if shape is not None and len(shape) > 0 and type(shape[0]) is int and shape[0] > 0:
+            return shape[0]
+    raise ValueError("runtime GPU warm-up batch has no actual sample dimension")
+
+
+def _move_to_cuda(value: object, *, torch_module: object) -> object:
+    """Move the actual collated batch to the loaded model's CUDA device."""
+
+    if isinstance(value, Mapping):
+        return {key: _move_to_cuda(item, torch_module=torch_module) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_move_to_cuda(item, torch_module=torch_module) for item in value)
+    if isinstance(value, list):
+        return [_move_to_cuda(item, torch_module=torch_module) for item in value]
+    move = getattr(value, "to", None)
+    if callable(move):
+        return move("cuda", non_blocking=True)
+    return value
+
+
+def _close_loader_workers(*, loader: object, iterator: object | None, torch_module: object) -> None:
+    """Bound worker/process and allocator lifetime before the next candidate."""
+
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if not callable(shutdown):
+        shutdown = getattr(getattr(loader, "_iterator", None), "_shutdown_workers", None)
+    if callable(shutdown):
+        shutdown()
+    del iterator
+    del loader
+    gc.collect()
+    cuda = getattr(torch_module, "cuda", None)
+    if cuda is None:
+        return
+    synchronize = getattr(cuda, "synchronize", None)
+    if callable(synchronize):
+        synchronize()
+    empty_cache = getattr(cuda, "empty_cache", None)
+    if callable(empty_cache):
+        empty_cache()
+    ipc_collect = getattr(cuda, "ipc_collect", None)
+    if callable(ipc_collect):
+        ipc_collect()
+
+
+@dataclass(slots=True)
+class _RuntimeMixtureWarmupSession:
+    """One loaded pinned model plus deterministic worker-specific loaders.
+
+    This class is intentionally below the receipt layer: it returns only live
+    observations consumed by ``TorchRuntimeWarmupMetricsAdapter``.  The model
+    remains resident across candidates while every DataLoader and NVML handle
+    has a bounded lifetime.
+    """
+
+    torch_module: object
+    model: object
+    optimizer: object
+    loader_factory: Callable[[int], object]
+    sampler_factory: Callable[[], object]
+    clock: Callable[[], float] = monotonic
+
+    def model_loaded(self) -> bool:
+        try:
+            parameter = next(iter(self.model.parameters()))
+        except (AttributeError, StopIteration, TypeError):
+            return False
+        device = getattr(parameter, "device", None)
+        return getattr(device, "type", None) == "cuda"
+
+    def _run_model_step(self, batch: object) -> None:
+        cuda = getattr(self.torch_module, "cuda", None)
+        synchronize = getattr(cuda, "synchronize", None)
+        if not callable(synchronize):
+            raise RuntimeError("GPU warm-up requires torch CUDA synchronization")
+        synchronize()
+        moved = _move_to_cuda(batch, torch_module=self.torch_module)
+        self.model.train()
+        output = self.model(**moved) if isinstance(moved, Mapping) else self.model(moved)
+        loss = getattr(output, "loss", None)
+        if loss is None and isinstance(output, Mapping):
+            loss = output.get("loss")
+        backward = getattr(loss, "backward", None)
+        if not callable(backward):
+            raise RuntimeError("pinned GR00T model did not return a trainable loss")
+        backward()
+        self.optimizer.step()
+        zero_grad = getattr(self.optimizer, "zero_grad", None)
+        if not callable(zero_grad):
+            raise RuntimeError("pinned GR00T optimizer cannot clear gradients")
+        zero_grad(set_to_none=True)
+        synchronize()
+
+    def measure(
+        self, *, worker_count: int, burn_in_steps: int, measured_steps: int
+    ) -> object:
+        """Run exactly the requested burn-in and measured real training steps."""
+
+        from lehome_train.groot.runtime_mixture_warmup import GpuWarmupMeasurement
+
+        loader: object | None = None
+        iterator: object | None = None
+        sampler: object | None = None
+        decoded_samples = 0
+        completed = 0
+        loader_wait = 0.0
+        step_seconds = 0.0
+        busy_seconds = 0.0
+        utilizations: list[float] = []
+        oom = False
+        error_text: str | None = None
+        try:
+            if type(worker_count) is not int or worker_count not in (0, 4, 8, 16, 24):
+                raise ValueError("runtime GPU warm-up worker count is not canonical")
+            if type(burn_in_steps) is not int or burn_in_steps != 10 or type(measured_steps) is not int or measured_steps != 50:
+                raise ValueError("runtime GPU warm-up duration is not canonical")
+            if not self.model_loaded():
+                raise RuntimeError("pinned GR00T CUDA model is not loaded")
+            loader = self.loader_factory(worker_count)
+            iterator = iter(loader)
+            sampler = self.sampler_factory()
+            if not callable(getattr(sampler, "sample", None)):
+                raise RuntimeError("GPU warm-up requires a live NVML sampler")
+            for index in range(burn_in_steps + measured_steps):
+                cycle_started = self.clock()
+                waiting_started = self.clock()
+                batch = next(iterator)
+                waiting_finished = self.clock()
+                decoded_samples += _batch_sample_count(batch)
+                self._run_model_step(batch)
+                cycle_finished = self.clock()
+                if index < burn_in_steps:
+                    continue
+                sample = sampler.sample()
+                utilization = getattr(sample, "gpu_utilization_percent", None)
+                if type(utilization) not in (int, float) or not math.isfinite(float(utilization)) or not 0.0 <= float(utilization) <= 100.0:
+                    raise RuntimeError("GPU warm-up NVML utilization is unavailable")
+                elapsed = cycle_finished - cycle_started
+                waited = waiting_finished - waiting_started
+                if elapsed <= 0.0 or waited < 0.0:
+                    raise RuntimeError("GPU warm-up clock did not produce a valid duration")
+                completed += 1
+                loader_wait += waited
+                step_seconds += elapsed
+                utilizations.append(float(utilization))
+                busy_seconds += elapsed * float(utilization) / 100.0
+        except Exception as caught:
+            oom = _is_oom(caught)
+            error_text = str(caught) or type(caught).__name__
+        finally:
+            try:
+                close = getattr(sampler, "close", None)
+                if callable(close):
+                    close()
+            finally:
+                if loader is not None:
+                    _close_loader_workers(
+                        loader=loader, iterator=iterator, torch_module=self.torch_module
+                    )
+        return GpuWarmupMeasurement(
+            decoded_samples=decoded_samples,
+            measured_steps=completed,
+            loader_wait_seconds=loader_wait,
+            step_seconds=step_seconds,
+            gpu_busy_seconds=busy_seconds,
+            gpu_utilization_percent=(sum(utilizations) / len(utilizations) if utilizations else 0.0),
+            oom=oom,
+            error=error_text,
+        )
 
 
 def _exact(arguments: object, fields: set[str], command: str) -> Mapping[str, object]:
@@ -494,6 +694,211 @@ def _network_measurement(path_value: object) -> dict[str, object]:
 
 class ProductionRuntime:
     """Checked image runtime that delegates policy to Tasks 8-10 controllers."""
+
+    def runtime_gpu_warmup_adapter(self, arguments: dict[str, object]) -> object:
+        """Return the sole live adapter accepted by ``runtime-gpu-warmup``.
+
+        The command envelope cannot select a loader, model, metrics row, or
+        threshold.  It is bound instead to the staged launch configuration and
+        mounted immutable mixture that the following runtime-training command
+        will consume.
+        """
+
+        request = _exact(arguments, {"cpu_pilot", "binding"}, "runtime-gpu-warmup")
+        from lehome_train.groot.runtime_mixture_warmup import TorchRuntimeWarmupMetricsAdapter
+
+        session = self._create_runtime_gpu_warmup_session(request)
+        if not isinstance(session, _RuntimeMixtureWarmupSession):
+            raise RuntimeError("runtime GPU warm-up did not construct a live pinned session")
+        return TorchRuntimeWarmupMetricsAdapter(
+            model_loaded=session.model_loaded,
+            measure_live=session.measure,
+        )
+
+    def _create_runtime_gpu_warmup_session(
+        self, arguments: Mapping[str, object]
+    ) -> _RuntimeMixtureWarmupSession:
+        """Build the exact authenticated GR00T runtime model and dataset once."""
+
+        from lehome_train.groot.runtime_mixture_warmup import bind_warmup_to_runtime_artifacts
+
+        request = _exact(arguments, {"cpu_pilot", "binding"}, "runtime-gpu-warmup")
+        config = _load_config("/prepared/config/launch.json")
+        if (
+            config.physical_batch_size != 64
+            or config.global_batch_size != 64
+            or config.training_action_horizon != 16
+            or config.runtime_mixture_manifest is None
+            or config.runtime_window_index is None
+            or config.runtime_mounts_descriptor is None
+            or config.dataset_path == "/prepared/generation"
+            or config.base_model_path != "/cache/parent"
+        ):
+            raise ValueError("runtime GPU warm-up launch is not the pinned batch-64/h16 mixture")
+        manifest = _mounted_path(
+            config.runtime_mixture_manifest, "runtime warm-up manifest", must_exist=True, regular_file=True
+        )
+        window_index = _mounted_path(
+            config.runtime_window_index, "runtime warm-up window index", must_exist=True, regular_file=True
+        )
+        mounts = _mounted_path(
+            config.runtime_mounts_descriptor, "runtime warm-up mounts", must_exist=True, regular_file=True
+        )
+        normalization = _mounted_path(
+            str(manifest.parent / "mixture-normalization.json"),
+            "runtime warm-up normalization", must_exist=True, regular_file=True,
+        )
+        bind_warmup_to_runtime_artifacts(
+            binding=request["binding"] if isinstance(request["binding"], Mapping) else {},
+            manifest_path=manifest,
+            window_index_path=window_index,
+            normalization_path=normalization,
+            mounts_descriptor_path=mounts,
+        )
+        binding = request["binding"]
+        assert isinstance(binding, Mapping)
+        parent = binding.get("parent_checkpoint")
+        if not isinstance(parent, Mapping) or (
+            config.parent_checkpoint_repository != parent.get("repository")
+            or config.parent_checkpoint_revision != parent.get("revision")
+            or config.parent_checkpoint_subpath != parent.get("subpath")
+            or config.parent_checkpoint_artifact_sha256 != parent.get("artifact_sha256")
+        ):
+            raise ValueError("runtime GPU warm-up launch parent does not match its receipt binding")
+        try:
+            import torch
+        except ImportError as error:
+            raise RuntimeError("runtime GPU warm-up requires the pinned PyTorch runtime") from error
+        if not torch.cuda.is_available():
+            raise RuntimeError("runtime GPU warm-up requires an available CUDA device")
+        # Use the same launch builder as the execution command so the official
+        # checkout identity, clean state, visible GPU count, and parent hash
+        # are checked before importing its model/session implementation.
+        launch = build_launch(
+            config,
+            visible_devices=_visible_device(config.num_gpus),
+            environment=os.environ,
+            official_checkout=os.environ.get("LEHOME_GROOT_ROOT", "/opt/isaac-groot"),
+        )
+        try:
+            entrypoint = Path(launch.command[launch.command.index("--official-launch") + 1])
+        except (ValueError, IndexError) as error:
+            raise RuntimeError("pinned runtime mixture launcher is unavailable") from error
+        checkout = entrypoint.parents[2]
+        if str(checkout) not in sys.path:
+            sys.path.insert(0, str(checkout))
+        modality = Path(config.modality_config_path)
+        if modality.suffix != ".py" or not modality.is_file():
+            raise RuntimeError("pinned runtime mixture modality configuration is unavailable")
+        if str(modality.parent) not in sys.path:
+            sys.path.append(str(modality.parent))
+        importlib.import_module(modality.stem)
+        try:
+            from gr00t.configs.base_config import get_default_config
+            from gr00t.data.embodiment_tags import EmbodimentTag
+            from gr00t.model.registry import MODEL_REGISTRY
+            setup_module = importlib.import_module("gr00t.model.gr00t_n1d7.setup")
+        except ImportError as error:
+            raise RuntimeError("pinned GR00T runtime model/session is unavailable") from error
+        embodiment = EmbodimentTag.resolve("NEW_EMBODIMENT").value
+        pinned_config = get_default_config().load_dict(
+            {
+                "data": {
+                    "download_cache": False,
+                    "datasets": [{
+                        "dataset_paths": [config.dataset_path],
+                        "mix_ratio": 1.0,
+                        "embodiment_tag": embodiment,
+                    }],
+                }
+            }
+        )
+        pinned_config.load_config_path = None
+        pinned_config.model.tune_llm = config.tune_llm
+        pinned_config.model.tune_visual = config.tune_visual
+        pinned_config.model.tune_projector = config.tune_projector
+        pinned_config.model.tune_diffusion_model = config.tune_diffusion_model
+        pinned_config.model.load_bf16 = False
+        pinned_config.model.reproject_vision = False
+        pinned_config.model.model_name = "nvidia/Cosmos-Reason2-2B"
+        pinned_config.model.backbone_trainable_params_fp32 = True
+        pinned_config.model.use_relative_action = True
+        pinned_config.training.experiment_name = f"{config.experiment_name}-runtime-warmup"
+        pinned_config.training.start_from_checkpoint = config.base_model_path
+        pinned_config.training.optim = "adamw_torch"
+        pinned_config.training.global_batch_size = 64
+        pinned_config.training.dataloader_num_workers = 0
+        pinned_config.training.learning_rate = config.learning_rate
+        pinned_config.training.gradient_accumulation_steps = 1
+        pinned_config.training.output_dir = config.output_dir
+        pinned_config.training.save_steps = config.save_steps
+        pinned_config.training.save_total_limit = config.save_total_limit
+        pinned_config.training.num_gpus = 1
+        pinned_config.training.use_wandb = False
+        pinned_config.training.max_steps = 60
+        pinned_config.training.weight_decay = config.weight_decay
+        pinned_config.training.warmup_ratio = config.warmup_ratio
+        replacement = None
+        original = getattr(setup_module, "DatasetFactory", None)
+        if original is None:
+            raise RuntimeError("pinned GR00T DatasetFactory is unavailable")
+        from lehome_train.groot.runtime_mixture import runtime_dataset_factory_class
+
+        replacement = runtime_dataset_factory_class(
+            mixture_manifest=manifest,
+            window_index=window_index,
+            mounts_descriptor=mounts,
+            global_sample_offset=0,
+            global_batch_size=64,
+        )
+        setattr(setup_module, "DatasetFactory", replacement)
+        try:
+            pipeline = MODEL_REGISTRY.get(type(pinned_config.model))
+            if pipeline is None:
+                raise RuntimeError("pinned GR00T model pipeline is not registered")
+            save_cfg_dir = Path(config.output_dir) / pinned_config.training.experiment_name / "experiment_cfg"
+            save_cfg_dir.mkdir(parents=True, exist_ok=True)
+            pipeline_instance = pipeline(pinned_config, save_cfg_dir)
+            pipeline_instance.setup()
+        finally:
+            setattr(setup_module, "DatasetFactory", original)
+        model = pipeline_instance.return_model()
+        model.to("cuda")
+        model.train()
+        if not torch.cuda.is_initialized():
+            raise RuntimeError("pinned GR00T model did not initialize CUDA")
+        optimizer = torch.optim.AdamW(
+            (parameter for parameter in model.parameters() if parameter.requires_grad),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        dataset, _unused_eval = pipeline_instance.return_dataset()
+        collator = pipeline_instance.return_collator()
+
+        def loader_factory(workers: int) -> object:
+            kwargs: dict[str, Any] = {
+                "batch_size": 64,
+                "collate_fn": collator,
+                "num_workers": workers,
+                "pin_memory": True,
+            }
+            if workers:
+                kwargs["persistent_workers"] = True
+                kwargs["prefetch_factor"] = 2
+                kwargs["multiprocessing_context"] = pinned_config.data.multiprocessing_context
+            return torch.utils.data.DataLoader(dataset, **kwargs)
+
+        # Constructing a sampler now makes missing NVML a command failure,
+        # rather than a candidate-local zero-utilization claim.
+        probe = NvmlTelemetrySampler()
+        probe.close()
+        return _RuntimeMixtureWarmupSession(
+            torch_module=torch,
+            model=model,
+            optimizer=optimizer,
+            loader_factory=loader_factory,
+            sampler_factory=NvmlTelemetrySampler,
+        )
 
     def prepare(self, arguments: dict[str, object]) -> dict[str, object]:
         fields = {
