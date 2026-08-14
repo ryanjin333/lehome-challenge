@@ -1247,9 +1247,12 @@ def test_runtime_mixture_train_uses_only_authenticated_receipts_and_never_legacy
     calls: list[tuple[str, ...]] = []
     def runner(command: tuple[str, ...]) -> str:
         calls.append(command); return "{}"
-    instance = {"instance_id": 44, "host": "native-x86", "port": 22, "platform_arch": "x86_64", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE}
+    instance = {"schema_version": 1, "kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 44, "host": "native-x86", "port": 22, "platform_arch": "x86_64", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "offer_evidence_sha256": "a" * 64, "provider_response_sha256": "b" * 64, "capability_sha256": "c" * 64}
     output = tmp_path / "execution.json"
-    request = {"bc_readback_receipt": paths["bc"], "rollout_readback_receipt": paths["rollout"], "deployment_receipt": paths["deployment"], "pilot_receipt": str(pilot), "code_revision": "1" * 40, "code_bundle_sha256": "2" * 64, "execution_receipt": str(output)}
+    binding = {"mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "c" * 64}, "code": {"repository_revision": "1" * 40, "bundle_sha256": "2" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
+    warmup = tmp_path / "warmup.json"
+    warmup.write_text(json.dumps({"kind": "runtime_mixture_gpu_warmup_lifecycle", "instance_id": 44, "provider_response_sha256": "b" * 64, "capability_sha256": "c" * 64, "code_revision": "1" * 40, "code_bundle_sha256": "2" * 64, "parent_checkpoint_artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"], "deployment_revision": "c" * 40, "cpu_pilot_sha256": LIFECYCLE.sha256_file(pilot), "runtime_warmup_binding": binding, "warmup_receipt": {}, "selected_loader_workers": 4}), encoding="utf-8")
+    request = {"bc_readback_receipt": paths["bc"], "rollout_readback_receipt": paths["rollout"], "deployment_receipt": paths["deployment"], "pilot_receipt": str(pilot), "warmup_lifecycle_receipt": str(warmup), "code_revision": "1" * 40, "code_bundle_sha256": "2" * 64, "execution_receipt": str(output)}
 
     report = LIFECYCLE.remote_action(action="runtime-train", instance=instance, request=request, runner=runner)
 
@@ -1525,3 +1528,26 @@ def test_runtime_cpu_pilot_cli_actions_are_explicitly_gated_and_never_use_legacy
     report = LIFECYCLE.main_for_test(["runtime-pilot-destroy", "--request", str(request)])
 
     assert report == {"paid_action": False, "action": "runtime-pilot-destroy", "dry_run": True, "request": {"instance_id": 44}}
+
+
+def test_runtime_gpu_warmup_runs_exact_cli_and_binds_cpu_pilot_code_parent_and_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {"kind": "runtime_mixture_gpu_warmup_instance", "capability_sha256": "5" * 64}
+    pilot = {
+        "schema_version": 4, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "gpu_initialized": False,
+        "processor_contract": "pinned_processor_integration_required", "representative": {"three_cameras": True, "action_horizon": 40}, "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24], "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {str(n): {"decoded_samples": 100, "samples_per_second": 1.0} for n in [0, 4, 8, 16, 24]}, "timing_rows": [{"worker_count": n, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 1.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for n in [0, 4, 8, 16, 24]], "authenticated_evidence": {"provider_instance_id": 44, "provider_response_sha256": "2" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40}, "cache_cap": 1, "native_x86_required": True, "timeout_seconds": 60.0, "canonical_completion": True,
+    }
+    pilot_path = tmp_path / "pilot.json"; pilot_path.write_text(json.dumps(pilot), encoding="utf-8")
+    binding = {"mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "5" * 64}, "code": {"repository_revision": "3" * 40, "bundle_sha256": "4" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
+    binding_path = tmp_path / "binding.json"; binding_path.write_text(json.dumps(binding), encoding="utf-8")
+    request |= {"pilot_receipt": str(pilot_path), "runtime_warmup_binding": str(binding_path), "warmup_lifecycle_receipt": str(tmp_path / "warmup-lifecycle.json")}
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_warmup.validate_warmup_binding", lambda value: dict(value))
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_warmup.validate_gpu_warmup_receipt", lambda receipt, **kwargs: 4)
+    calls: list[tuple[str, ...]] = []
+    report = LIFECYCLE.run_runtime_gpu_warmup(instance=instance, request=request, runner=lambda command: calls.append(command) or json.dumps({"kind": "runtime_mixture_gpu_warmup"}))
+
+    assert report["action"] == "runtime-gpu-warmup"
+    assert "runtime-gpu-warmup --request /prepared/config/runtime-warmup.json" in calls[-1][-1]
+    assert json.loads(Path(str(request["warmup_lifecycle_receipt"])).read_text())["selected_loader_workers"] == 4
