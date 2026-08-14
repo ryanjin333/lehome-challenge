@@ -536,6 +536,18 @@ def test_materialize_allows_exact_existing_destination_for_resume_repair(tmp_pat
     assert LIFECYCLE._materialize(request)["generation_root"] == str(destination)
 
 
+def test_materialize_accepts_terminal_retry_after_staging_cleanup(tmp_path: Path) -> None:
+    from test_flywheel_mix import _prepared_source
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
+    corrective = _prepared_source(tmp_path / "corrective", kind="flywheel", grade="A", episodes=2)
+    release = _corrective_release_receipt([corrective], tmp_path / "corrective-release.json")
+    destination, staging = tmp_path / "generation", tmp_path / "resume"
+    request = {"organizer_root": str(organizer), "corrective_roots": [str(corrective)], "destination": str(destination), "persistent_staging_root": str(staging), "seed": 1, "organizer_source_evidence": LIFECYCLE.ORGANIZER_SOURCE, "corrective_release_receipt": str(release)}
+    LIFECYCLE._materialize(request)
+    assert not staging.exists()
+    assert LIFECYCLE._materialize(request)["generation_root"] == str(destination)
+
+
 def test_derive_corrective_receipt_binds_disposal_proof_to_local_manifest_and_tree(
     tmp_path: Path,
 ) -> None:

@@ -420,15 +420,36 @@ def test_mix_persistent_stateless_root_rejects_unrelated_file_without_deleting_i
     assert unrelated.read_text(encoding="utf-8") == "user"
 
 
+def test_mix_persistent_stateless_retry_removes_only_owned_state_atomic_temp(tmp_path: Path) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan, staging = build_mix_plan(organizer, flywheel, seed=20260813), tmp_path / "resume"
+    staging.mkdir(); owned = staging / ".state.json.kill-window.tmp"; owned.write_text("partial", encoding="utf-8")
+    materialize_mixed_snapshot(plan, organizer, flywheel, tmp_path / "destination", persistent_staging_root=staging)
+    assert not owned.exists() and not staging.exists()
+
+
+def test_mix_persistent_terminal_retry_accepts_only_exact_sealed_destination(tmp_path: Path) -> None:
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer")
+    flywheel = _prepared_source(tmp_path / "flywheel", kind="flywheel", grade="A")
+    plan, staging, destination = build_mix_plan(organizer, flywheel, seed=20260813), tmp_path / "resume", tmp_path / "destination"
+    materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging, persistent_source_evidence={"seed": 1})
+    assert materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=staging, persistent_source_evidence={"seed": 1})["resumed_after_terminal_cleanup"] is True
+    with pytest.raises(ValueError, match="terminal destination"):
+        materialize_mixed_snapshot(plan, organizer, flywheel, destination, persistent_staging_root=tmp_path / "other", persistent_source_evidence={"seed": 2})
+
+
 def test_mix_materializer_identity_binds_all_behavior_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     import lehome_train.data.convert as convert
     import lehome_train.data.inspect as inspect
     import lehome_train.data.mapping as mapping
     import lehome_train.data.split as split
+    import lehome_train.groot.modality as modality
+    import lehome_train.models as models
     from lehome_train.flywheel.mix import _mix_materializer_identity
     original = __import__("lehome_train.flywheel.mix", fromlist=["sha256_file"]).sha256_file
     baseline = _mix_materializer_identity()
-    for module in (convert, inspect, mapping, split):
+    for module in (convert, inspect, mapping, split, modality, models):
         monkeypatch.setattr("lehome_train.flywheel.mix.sha256_file", lambda path, original=original, module=module: "f" * 64 if Path(path) == Path(module.__file__) else original(path))
         assert _mix_materializer_identity() != baseline
         monkeypatch.undo()
@@ -448,7 +469,22 @@ def test_validation_reservation_scales_with_bounded_state_for_23k_ranges() -> No
     ]
     selected = _reserve_validation_chunks(chunks, 2_308, seed=20260813)
     assert len(selected) == 2_308
-    assert {item.source_kind for item in chunks if item not in selected} == {"organizer", "flywheel"}
+    selected_episodes = {item.raw_episode_id for item in selected}
+    assert {item.source_kind for item in chunks if item.raw_episode_id not in selected_episodes} == {"organizer", "flywheel"}
+
+
+def test_validation_reservation_keeps_both_kinds_trainable_when_balanced_holdout_exists() -> None:
+    from lehome_train.flywheel.mix import _Chunk, _reserve_validation_chunks
+    chunks = [
+        _Chunk("organizer" if index < 2 else "flywheel", Path("/source"), ("a" if index < 2 else "b") * 64, "c" * 40,
+               str(index), 0, ACTION_HORIZON, tuple(str(frame) for frame in range(ACTION_HORIZON)),
+               ("d" if index < 2 else "e") * 64, str(index), 0, ACTION_HORIZON,
+               tuple(str(frame) for frame in range(ACTION_HORIZON)), None)
+        for index in range(4)
+    ]
+    selected = _reserve_validation_chunks(chunks, 2, seed=5)
+    assert [item.source_kind for item in selected].count("organizer") == 1
+    assert [item.source_kind for item in selected].count("flywheel") == 1
 
 
 def test_mix_persistent_resume_regenerates_semantically_wrong_parquet_and_invalid_video(

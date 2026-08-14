@@ -514,29 +514,51 @@ def _reserve_validation_chunks(items: Sequence[_Chunk], count: int, *, seed: int
     if any(groups_by_kind[kind] < 1 for kind in SOURCE_WEIGHTS):
         raise ValueError("mix has no lineage episode for a required training kind")
     random.Random(seed).shuffle(groups)
-    # Store one predecessor per reachable total, rather than a selected-index
-    # tuple for every (total, organizer-count, flywheel-count) state.  Positive
-    # group sizes make the leave-one constraint equivalent to never selecting
-    # all groups of a kind, which we reject after restoration.
-    predecessor: list[tuple[int, int] | None] = [None] * (count + 1)
-    predecessor[0] = (-1, -1)
-    for index, group in enumerate(groups):
-        size = len(group)
-        for slots in range(count, size - 1, -1):
-            if predecessor[slots] is None and predecessor[slots - size] is not None:
+    # Per-kind bitsets give exact 0/1 subset reachability in C-level integer
+    # operations.  Keep one predecessor only for newly reached totals, bounded
+    # by ``count + 1`` per kind, rather than materializing selected tuples.
+    # Omitting the full total leaves at least one lineage group of each kind in
+    # train, including the one-group case where that kind can contribute zero.
+    by_kind = {
+        kind: [(index, group) for index, group in enumerate(groups) if group[0].source_kind == kind]
+        for kind in SOURCE_WEIGHTS
+    }
+
+    def reachable(kind: str) -> tuple[int, list[tuple[int, int] | None]]:
+        bits = 1
+        predecessor: list[tuple[int, int] | None] = [None] * (count + 1)
+        predecessor[0] = (-1, -1)
+        mask = (1 << (count + 1)) - 1
+        total = sum(len(group) for _, group in by_kind[kind])
+        for index, group in by_kind[kind]:
+            size = len(group)
+            newly = ((bits << size) & mask) & ~bits
+            pending = newly
+            while pending:
+                least = pending & -pending
+                slots = least.bit_length() - 1
                 predecessor[slots] = (slots - size, index)
-    if predecessor[count] is None:
+                pending ^= least
+            bits |= newly
+        if total <= count:
+            bits &= ~(1 << total)
+            predecessor[total] = None
+        return bits, predecessor
+
+    organizer_bits, organizer_predecessor = reachable("organizer")
+    flywheel_bits, flywheel_predecessor = reachable("flywheel")
+    organizer_slots = next((slots for slots in range(count, -1, -1) if organizer_bits & (1 << slots) and flywheel_bits & (1 << (count - slots))), None)
+    if organizer_slots is None:
         raise ValueError("mix has too few distinct lineage episodes for an unsplit validation holdout")
-    selected: list[int] = []
-    slots = count
-    while slots:
-        previous = predecessor[slots]
-        assert previous is not None
-        slots, index = previous
-        selected.append(index)
-    selected_by_kind = {kind: sum(groups[index][0].source_kind == kind for index in selected) for kind in SOURCE_WEIGHTS}
-    if any(selected_by_kind[kind] >= groups_by_kind[kind] for kind in SOURCE_WEIGHTS):
-        raise ValueError("mix has too few distinct lineage episodes for an unsplit validation holdout")
+    def restore(predecessor: list[tuple[int, int] | None], slots: int) -> list[int]:
+        selected: list[int] = []
+        while slots:
+            previous = predecessor[slots]
+            assert previous is not None
+            slots, index = previous
+            selected.append(index)
+        return selected
+    selected = restore(organizer_predecessor, organizer_slots) + restore(flywheel_predecessor, count - organizer_slots)
     return [item for index in selected for item in groups[index]]
 
 
@@ -912,7 +934,9 @@ def _mix_materializer_identity() -> str:
 
     from lehome_train.data import convert, inspect, mapping, split, stats, validate
     from lehome_train.flywheel import materialize
+    from lehome_train.groot import modality
     from lehome_train import io
+    from lehome_train import models
     return canonical_json_sha256({
         "mix": sha256_file(Path(__file__)),
         "materialize": sha256_file(Path(materialize.__file__)),
@@ -923,6 +947,8 @@ def _mix_materializer_identity() -> str:
         "inspect": sha256_file(Path(inspect.__file__)),
         "mapping": sha256_file(Path(mapping.__file__)),
         "split": sha256_file(Path(split.__file__)),
+        "modality": sha256_file(Path(modality.__file__)),
+        "models": sha256_file(Path(models.__file__)),
     })
 
 
@@ -1058,15 +1084,19 @@ def _clean_persistent_postprocessing(work: Path) -> None:
             path.unlink()
 
 
-def _clean_owned_atomic_temps(root: Path) -> None:
+def _clean_owned_atomic_temps(root: Path, *, receipt_names: set[str] | None = None) -> None:
     """Recover only atomic-write temporaries whose names this materializer owns."""
 
-    candidates = [root, root / _PERSISTENT_RECEIPTS_NAME]
-    for directory in candidates:
-        if not directory.exists() or directory.is_symlink() or not directory.is_dir():
-            continue
-        for path in directory.iterdir():
-            if path.is_file() and path.name.startswith(".") and path.name.endswith(".tmp"):
+    if root.exists() and root.is_dir() and not root.is_symlink():
+        for path in root.iterdir():
+            if path.is_file() and path.name.startswith(".state.json.") and path.name.endswith(".tmp"):
+                path.unlink()
+    receipts = root / _PERSISTENT_RECEIPTS_NAME
+    if receipt_names is not None and receipts.exists() and receipts.is_dir() and not receipts.is_symlink():
+        for path in receipts.iterdir():
+            if not path.is_file() or not path.name.startswith(".") or not path.name.endswith(".tmp"):
+                continue
+            if any(path.name.startswith(f".{name}.") for name in receipt_names):
                 path.unlink()
 
 
@@ -1258,7 +1288,7 @@ def materialize_mixed_snapshot(
             with _PersistentLock(persistent_root / _PERSISTENT_LOCK_NAME):
                 state_path = persistent_root / _PERSISTENT_STATE_NAME
                 if state_path.exists():
-                    _clean_owned_atomic_temps(persistent_root)
+                    _clean_owned_atomic_temps(persistent_root, receipt_names=expected_receipts)
                     if state_path.is_symlink() or not state_path.is_file() or _read_json(state_path) != expected_state:
                         raise ValueError("persistent materialization state does not match this plan, source, or code")
                     # The atomic work-tree promotion can complete before its
@@ -1288,9 +1318,20 @@ def materialize_mixed_snapshot(
                     _clean_persistent_postprocessing(temporary)
                     _validate_persistent_tree(persistent_root, allowed_receipts=expected_receipts, allowed_work=expected_work)
                 else:
-                    if destination.exists():
-                        raise FileExistsError("refusing to overwrite mixed snapshot destination")
+                    _clean_owned_atomic_temps(persistent_root)
                     _validate_stateless_persistent_root(persistent_root)
+                    if destination.exists():
+                        try:
+                            receipt = verify_generation(destination)
+                        except ValueError as error:
+                            raise ValueError("persistent materialization terminal destination is not an exact sealed generation") from error
+                        if (
+                            receipt.get("mix_plan_sha256") != plan.sha256
+                            or receipt.get("persistent_source_evidence") != expected_state["persistent_source_evidence"]
+                        ):
+                            raise ValueError("persistent materialization terminal destination differs from this request")
+                        shutil.rmtree(persistent_root)
+                        return {"path": str(destination), "mix_plan_sha256": plan.sha256, "resumed_after_terminal_cleanup": True}
                     # A SIGKILL between mkdirs and state sealing is harmless:
                     # recover only the two schema-owned empty directories.
                     receipts_root = persistent_root / _PERSISTENT_RECEIPTS_NAME
