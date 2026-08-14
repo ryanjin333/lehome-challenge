@@ -1425,7 +1425,8 @@ def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_pa
     live = {
         "id": 44, "actual_status": "running", "cpu_arch": "amd64",
         "cpu_cores_effective": 36.0, "cpu_ram": 64390, "disk_space": 124.75,
-        "reliability": .99, "num_gpus": 1, "dph_total": .18,
+        "machine_id": 10, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000,
+        "driver_version": "x", "reliability": .99, "num_gpus": 1, "dph_total": .18,
         "ssh_host": "native-x86", "ssh_port": 22,
     }
 
@@ -1456,6 +1457,31 @@ def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_pa
     assert receipt["platform_arch"] == "x86_64"
     assert LIFECYCLE.RUNTIME_PILOT_READINESS_POLLS == 120 and sleeps == [5.0, 5.0]
     assert ("vastai", "--raw", "create", "instance", "8", "--image", LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "--disk", "120", "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE) in commands
+
+
+def test_runtime_pilot_live_readback_accepts_real_null_reliability_but_binds_machine_price_and_gpu() -> None:
+    offer = {
+        "id": 46568462, "ask_contract_id": 1, "machine_id": 142447,
+        "cpu_arch": "amd64", "cpu_cores_effective": 48, "cpu_ram": 128716,
+        "disk_space": 120, "disk_bw": 500, "inet_down": 1000,
+        "reliability": .9952681, "num_gpus": 1, "dph_total": .144444,
+        "is_bid": False, "rentable": True, "rented": False,
+        "gpu_name": "Tesla V100", "gpu_ram": 32768, "driver_version": "580.173.02",
+    }
+    live = {
+        "id": 47723784, "actual_status": "running", "machine_id": 142447,
+        "cpu_arch": "amd64", "cpu_cores_effective": 48.0, "cpu_ram": 128716,
+        "disk_space": 120, "dph_total": .144444, "gpu_name": "Tesla V100",
+        "gpu_ram": 32768, "driver_version": "580.173.02", "num_gpus": 1,
+        "reliability": None, "ask_contract_id": None, "rented": None,
+        "ssh_host": "real-host", "ssh_port": 22,
+    }
+
+    assert LIFECYCLE._runtime_pilot_live_matches(live=live, instance_id=47723784, offer=offer)
+    assert LIFECYCLE._runtime_pilot_instance_identity(live) == LIFECYCLE._runtime_pilot_instance_identity(live | {"reliability": .1})
+    assert not LIFECYCLE._runtime_pilot_live_matches(live=live | {"machine_id": 142448}, instance_id=47723784, offer=offer)
+    assert not LIFECYCLE._runtime_pilot_live_matches(live=live | {"dph_total": .144445}, instance_id=47723784, offer=offer)
+    assert not LIFECYCLE._runtime_pilot_live_matches(live=live | {"reliability": .97}, instance_id=47723784, offer=offer)
 
 
 def test_rent_runtime_cpu_pilot_mismatch_cleans_only_new_instance_and_proves_absence(tmp_path: Path) -> None:

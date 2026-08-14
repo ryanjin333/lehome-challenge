@@ -251,7 +251,8 @@ _STABLE_INSTANCE_FIELDS = (
 
 _RUNTIME_PILOT_INSTANCE_FIELDS = (
     "id", "actual_status", "cpu_arch", "cpu_cores_effective", "cpu_ram", "disk_space",
-    "reliability", "num_gpus", "dph_total", "ssh_host", "ssh_port",
+    "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "driver_version",
+    "ssh_host", "ssh_port",
 )
 
 
@@ -376,6 +377,10 @@ def _runtime_pilot_offer(evidence: Mapping[str, object]) -> Mapping[str, object]
         or offer.get("cpu_arch") != "amd64"
         or type(offer.get("cpu_cores_effective")) is not int
         or int(offer["cpu_cores_effective"]) < 32
+        or type(offer.get("machine_id")) is not int
+        or not isinstance(offer.get("gpu_name"), str) or not offer["gpu_name"]
+        or type(offer.get("gpu_ram")) not in (int, float) or float(offer["gpu_ram"]) <= 0
+        or not isinstance(offer.get("driver_version"), str) or not offer["driver_version"]
         or type(offer.get("cpu_ram")) not in (int, float)
         or float(offer["cpu_ram"]) < 64000
         or type(offer.get("disk_space")) not in (int, float)
@@ -399,19 +404,32 @@ def _runtime_pilot_live_matches(*, live: Mapping[str, object], instance_id: int,
         cores = _canonical_runtime_pilot_cpu_cores(live.get("cpu_cores_effective"))
     except ValueError:
         return False
+    reliability = live.get("reliability")
+    reliability_matches = reliability is None or (
+        type(reliability) in (int, float)
+        and math.isfinite(float(reliability))
+        and float(reliability) >= .98
+    )
+    driver_matches = (
+        not isinstance(offer.get("driver_version"), str)
+        or not offer["driver_version"]
+        or live.get("driver_version") == offer["driver_version"]
+    )
     return (
         live.get("id") == instance_id
         and live.get("actual_status", "running") == "running"
         and live.get("cpu_arch") == "amd64"
         and cores >= 32
         and type(live.get("cpu_ram")) in (int, float)
-        and float(live["cpu_ram"]) >= 64000
+        and float(live["cpu_ram"]) >= float(offer.get("cpu_ram", 64000))
         and type(live.get("disk_space")) in (int, float)
         and float(live["disk_space"]) >= 120
-        and type(live.get("reliability")) in (int, float)
-        and float(live["reliability"]) >= .98
-        and live.get("num_gpus") == 1
+        and live.get("machine_id") == offer.get("machine_id")
+        and live.get("gpu_name") == offer.get("gpu_name")
+        and live.get("gpu_ram") == offer.get("gpu_ram")
+        and live.get("num_gpus") == offer.get("num_gpus") == 1
         and live.get("dph_total") == offer.get("dph_total")
+        and driver_matches and reliability_matches
         and isinstance(live.get("ssh_host"), str)
         and bool(live.get("ssh_host"))
         and type(live.get("ssh_port")) is int
