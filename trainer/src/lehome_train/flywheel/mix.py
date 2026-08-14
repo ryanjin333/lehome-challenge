@@ -981,12 +981,24 @@ def _expected_raw_lineage(
         start, stop = selection.frame_start, selection.frame_stop
         return source.manifest_sha256, selection.source_episode_id, start, stop, tuple(str(frame_id) for frame_id in range(start, stop))
     try:
-        raw_episode_id, start, stop, frame_ids = source.raw_lineage_by_episode[selection.source_episode_id]
+        raw_episode_id, lineage_start, lineage_stop, lineage_ids = source.raw_lineage_by_episode[selection.source_episode_id]
     except KeyError:
         raise ValueError("mix source provenance is missing the planned materialized episode") from None
     if source.raw_manifest_sha256 is None:
         raise ValueError("mix source provenance is missing the planned raw manifest")
-    return source.raw_manifest_sha256, raw_episode_id, start, stop, frame_ids
+    start, stop = selection.frame_start, selection.frame_stop
+    if (
+        start < 0
+        or stop - start != ACTION_HORIZON
+        or lineage_stop - lineage_start != len(lineage_ids)
+        or stop > len(lineage_ids)
+    ):
+        raise ValueError("mix source provenance does not cover the planned raw range")
+    raw_start, raw_stop = lineage_start + start, lineage_start + stop
+    raw_ids = lineage_ids[start:stop]
+    if raw_ids != tuple(str(frame_id) for frame_id in range(raw_start, raw_stop)):
+        raise ValueError("mix source provenance raw frame IDs are not canonical")
+    return source.raw_manifest_sha256, raw_episode_id, raw_start, raw_stop, raw_ids
 
 
 def _write_lines(path: Path, rows: Iterable[Mapping[str, object]]) -> None:

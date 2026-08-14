@@ -37,34 +37,46 @@ def _video(path: Path, *, frames: int) -> None:
     subprocess.run(("ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=2x2:r=30", "-frames:v", str(frames), "-pix_fmt", "yuv420p", str(path)), check=True)
 
 
-def _prepared_source(root: Path, *, kind: str, grade: str | None = None, episodes: int = 2, release_stage: str = "seen", accepted_success: bool = True, action_source: str = "expert") -> Path:
+def _prepared_source(
+    root: Path,
+    *,
+    kind: str,
+    grade: str | None = None,
+    episodes: int = 2,
+    frames: int = ACTION_HORIZON,
+    episode_start: int = 0,
+    release_stage: str = "seen",
+    accepted_success: bool = True,
+    action_source: str = "expert",
+) -> Path:
     """Small real prepared-v2 fixture with parquet and all required MP4 streams."""
 
     for episode in range(episodes):
-        base = episode * ACTION_HORIZON
-        path = root / LEGACY_DATA_PATH.format(episode_chunk=0, episode_index=episode)
+        episode_id = episode_start + episode
+        base = episode * frames
+        path = root / LEGACY_DATA_PATH.format(episode_chunk=episode_id // 1000, episode_index=episode_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(pa.table({
-            "observation.state": pa.array([[float(base + frame)] * 12 for frame in range(ACTION_HORIZON)], type=pa.list_(pa.float32(), 12)),
-            "action": pa.array([[float(base + frame + 1)] * 12 for frame in range(ACTION_HORIZON)], type=pa.list_(pa.float32(), 12)),
-            "timestamp": pa.array([frame / 30 for frame in range(ACTION_HORIZON)], type=pa.float32()),
-            "frame_index": pa.array(range(ACTION_HORIZON), type=pa.int64()),
-            "episode_index": pa.array([episode] * ACTION_HORIZON, type=pa.int64()),
-            "index": pa.array(range(base, base + ACTION_HORIZON), type=pa.int64()),
-            "task_index": pa.array([0] * ACTION_HORIZON, type=pa.int64()),
+            "observation.state": pa.array([[float(base + frame)] * 12 for frame in range(frames)], type=pa.list_(pa.float32(), 12)),
+            "action": pa.array([[float(base + frame + 1)] * 12 for frame in range(frames)], type=pa.list_(pa.float32(), 12)),
+            "timestamp": pa.array([frame / 30 for frame in range(frames)], type=pa.float32()),
+            "frame_index": pa.array(range(frames), type=pa.int64()),
+            "episode_index": pa.array([episode_id] * frames, type=pa.int64()),
+            "index": pa.array(range(base, base + frames), type=pa.int64()),
+            "task_index": pa.array([0] * frames, type=pa.int64()),
         }), path, compression="zstd")
         for camera in ("top_rgb", "left_rgb", "right_rgb"):
-            _video(root / LEGACY_VIDEO_PATH.format(episode_chunk=0, episode_index=episode, video_key=f"observation.images.{camera}"), frames=ACTION_HORIZON)
+            _video(root / LEGACY_VIDEO_PATH.format(episode_chunk=episode_id // 1000, episode_index=episode_id, video_key=f"observation.images.{camera}"), frames=frames)
     meta = root / "meta"
     meta.mkdir(parents=True, exist_ok=True)
     atomic_write_json(meta / "info.json", {
         "codebase_version": "v2.1", "robot_type": "dual_so101_follower", "total_episodes": episodes,
-        "total_frames": episodes * ACTION_HORIZON, "total_tasks": 1, "total_videos": episodes * 3,
+        "total_frames": episodes * frames, "total_tasks": 1, "total_videos": episodes * 3,
         "total_chunks": 1, "chunks_size": 1000, "fps": 30, "data_path": LEGACY_DATA_PATH,
         "video_path": LEGACY_VIDEO_PATH, "features": {f"observation.images.{camera}": {"dtype": "video", "shape": [480, 640, 3]} for camera in ("top_rgb", "left_rgb", "right_rgb")},
     })
-    (meta / "episodes.jsonl").write_text("".join(json.dumps({"episode_index": episode, "length": ACTION_HORIZON, "task_index": 0}) + "\n" for episode in range(episodes)), encoding="utf-8")
-    (meta / "episodes_stats.jsonl").write_text("".join(json.dumps({"episode_index": episode, "stats": {}}) + "\n" for episode in range(episodes)), encoding="utf-8")
+    (meta / "episodes.jsonl").write_text("".join(json.dumps({"episode_index": episode_start + episode, "length": frames, "task_index": 0}) + "\n" for episode in range(episodes)), encoding="utf-8")
+    (meta / "episodes_stats.jsonl").write_text("".join(json.dumps({"episode_index": episode_start + episode, "stats": {}}) + "\n" for episode in range(episodes)), encoding="utf-8")
     (meta / "tasks.jsonl").write_text('{"task":"fold the garment on the table","task_index":0}\n', encoding="utf-8")
     atomic_write_json(meta / "modality.json", _modality_metadata())
     if kind == "flywheel":
@@ -81,8 +93,8 @@ def _prepared_source(root: Path, *, kind: str, grade: str | None = None, episode
     manifest = {
         "schema_version": 1, "output_format": "groot_lerobot_v2.1_per_episode", "source_revision": REVISION,
         "output_artifacts": artifacts, "output_manifest_sha256": canonical_json_sha256(artifacts),
-        "frame_count": episodes * ACTION_HORIZON, "episode_count": episodes, "fps": 30,
-        "train_episode_ids": [str(episode) for episode in range(episodes)], "validation_episode_ids": [],
+        "frame_count": episodes * frames, "episode_count": episodes, "fps": 30,
+        "train_episode_ids": [str(episode_start + episode) for episode in range(episodes)], "validation_episode_ids": [],
         "fixed_language_instruction": "fold the garment on the table",
         "future_actions": {"horizon": ACTION_HORIZON, "loader_allow_padding": False},
         "camera_schema": [{"source_key": f"observation.images.{camera}", "target_modality": camera, "dtype": "video", "shape": [480, 640, 3]} for camera in ("top_rgb", "left_rgb", "right_rgb")],
@@ -731,6 +743,75 @@ def test_mix_accepts_canonical_autonomous_rft_snapshot_not_expert_provenance(
 
     assert plan.organizer_training_frames * 3 == plan.flywheel_training_frames * 7
     assert {item.source_kind for item in plan.selections} == {"organizer", "flywheel"}
+
+
+def test_mix_materializes_nonzero_canonical_rft_chunk_with_exact_raw_lineage(tmp_path: Path) -> None:
+    """A selected policy chunk is only one bounded slice of its raw trajectory."""
+
+    import lehome_train.flywheel.mix as mix
+
+    organizer = _prepared_source(tmp_path / "organizer", kind="organizer", episodes=2)
+    rft = _prepared_source(
+        tmp_path / "rft",
+        kind="flywheel",
+        grade="A",
+        episodes=2,
+        frames=32,
+        episode_start=70,
+        action_source="policy",
+    )
+    (rft / "meta" / "materialization-provenance.json").unlink()
+    manifest = json.loads((rft / "manifest.json").read_text(encoding="utf-8"))
+    manifest.update({
+        "source_format": "verified_flywheel_rft_release",
+        "source_repository": "ryanjin333/lehome-groot-n17-data",
+        "source_revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c",
+        "source_release_id": "b" * 64,
+    })
+    for camera in manifest["camera_schema"]:
+        camera.pop("target_modality", None)
+    atomic_write_json(rft / "meta" / "rft-selection.json", {
+        "schema_version": 1,
+        "source_repository": "ryanjin333/lehome-groot-n17-data",
+        "source_revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c",
+        "release_id": "b" * 64,
+        "action_horizon": 16,
+        "excluded_public_unseen": 0,
+        "excluded_failed": 0,
+        "episodes": [
+            {"episode_index": 70 + index, "raw_episode_id": f"rft-{70 + index}", "raw_manifest_sha256": ("c" if index == 0 else "d") * 64, "frame_count": 326, "valid_window_count": 311, "category": "top_long"}
+            for index in range(2)
+        ],
+    })
+    artifacts = artifact_identities(rft, exclude={"manifest.json"})
+    manifest["output_artifacts"] = artifacts
+    manifest["output_manifest_sha256"] = canonical_json_sha256(artifacts)
+    atomic_write_json(rft / "manifest.json", manifest)
+
+    plan = build_mix_plan(organizer, rft, seed=5)
+    selected = next(item for item in plan.selections if item.source_kind == "flywheel" and item.frame_start == ACTION_HORIZON)
+    assert selected.source_episode_id in {"70", "71"}
+    assert (selected.raw_frame_start, selected.raw_frame_stop, selected.raw_frame_ids) == (
+        ACTION_HORIZON,
+        2 * ACTION_HORIZON,
+        tuple(str(index) for index in range(ACTION_HORIZON, 2 * ACTION_HORIZON)),
+    )
+
+    materialize_mixed_snapshot(plan, organizer, rft, tmp_path / "mixed")
+
+    payload = plan.to_dict()
+    tampered = next(
+        item for item in payload["selected_frame_ranges"]
+        if item["source_kind"] == "flywheel" and item["frame_start"] == ACTION_HORIZON
+    )
+    tampered.update({
+        "raw_frame_start": 2 * ACTION_HORIZON,
+        "raw_frame_stop": 3 * ACTION_HORIZON,
+        "raw_frame_ids": [str(index) for index in range(2 * ACTION_HORIZON, 3 * ACTION_HORIZON)],
+    })
+    payload["sha256"] = canonical_json_sha256({key: value for key, value in payload.items() if key != "sha256"})
+    with pytest.raises(ValueError, match="raw lineage no longer matches"):
+        materialize_mixed_snapshot(mix._plan_from_payload(payload), organizer, rft, tmp_path / "tampered")
 
 
 def test_generation_changes_after_seal_are_rejected(tmp_path: Path) -> None:
