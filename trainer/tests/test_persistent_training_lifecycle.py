@@ -1573,6 +1573,19 @@ def _runtime_pilot_offer_evidence(*, failure_receipt: str) -> dict[str, object]:
     paths = {"bc": evidence_root / "bc.json", "rollout": evidence_root / "rollout.json", "deployment": evidence_root / "deployment.json"}
     for key, value in (("bc", bc), ("rollout", rollout), ("deployment", deployment)):
         paths[key].write_text(json.dumps(value), encoding="utf-8")
+    hydrate_request = evidence_root / "runtime-hydrate.json"
+    hydrate_request.write_text(json.dumps({
+        "schema_version": 1, "command": "hydrate-runtime-mixture",
+        "arguments": {
+            "deployment_receipt": "/prepared/config/deployment-receipt.json",
+            "source_readback_receipts": {
+                "organizer": "/prepared/config/bc-readback.json",
+                "rollout": "/prepared/config/rollout-readback.json",
+            },
+            "destination": "/prepared/runtime",
+            "mounts_descriptor": "/prepared/runtime/mounts.json",
+        },
+    }), encoding="utf-8")
     offer = {
         "id": 8, "ask_contract_id": 9, "machine_id": 10, "cpu_arch": "amd64",
         "cpu_cores_effective": 32, "cpu_ram": 64390, "disk_space": 124.75,
@@ -1593,6 +1606,7 @@ def _runtime_pilot_offer_evidence(*, failure_receipt: str) -> dict[str, object]:
         "bc_readback_receipt": str(paths["bc"]),
         "rollout_readback_receipt": str(paths["rollout"]),
         "deployment_receipt": str(paths["deployment"]),
+        "runtime_hydrate_request": str(hydrate_request),
     }
 
 
@@ -1689,6 +1703,7 @@ def test_direct_gpu_datacenter_policy_drift_stops_before_provider_create(
     monkeypatch.setattr(LIFECYCLE, "_runtime_campaign_binding", lambda _request: {})
     monkeypatch.setattr(LIFECYCLE, "_runtime_parent_checkpoint", lambda _request: None)
     monkeypatch.setattr(LIFECYCLE, "_require_vast_ssh_identity", lambda: None)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_hydration_request_sha256", lambda _request: "a" * 64)
     request = {
         "failure_receipt": str(tmp_path / "failure.json"), "search_mode": "on_demand",
         "expires_at_unix": int(time.time()) + 60,
@@ -2925,6 +2940,37 @@ def test_runtime_rent_rejects_absent_or_invalid_preflight_evidence_before_provid
     assert calls == []
 
 
+def test_direct_gpu_rent_rejects_stale_hydration_source_ids_before_any_provider_call(
+    tmp_path: Path,
+) -> None:
+    """The live ``bc``/``round-1`` request must never reach image or provider work."""
+    calls: list[tuple[str, ...]] = []
+    evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json")) | {
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+    }
+    hydrate = tmp_path / "stale-runtime-hydrate.json"
+    hydrate.write_text(json.dumps({
+        "schema_version": 1, "command": "hydrate-runtime-mixture",
+        "arguments": {
+            "deployment_receipt": "/prepared/config/deployment-receipt.json",
+            "source_readback_receipts": {
+                "bc": "/prepared/config/bc-readback.json",
+                "round-1": "/prepared/config/rollout-readback.json",
+            },
+            "destination": "/prepared/runtime",
+            "mounts_descriptor": "/prepared/runtime/mounts.json",
+        },
+    }), encoding="utf-8")
+    evidence["runtime_hydrate_request"] = str(hydrate)
+
+    with pytest.raises(ValueError, match="hydration request sources"):
+        LIFECYCLE.rent_runtime_gpu_warmup(
+            evidence=evidence, runner=lambda command: calls.append(command) or "",
+        )
+
+    assert calls == []
+
+
 def test_runtime_gpu_probe_uses_absolute_exact_image_executables() -> None:
     """SSH must not depend on the image's interactive PATH for the one-step probe."""
     command = LIFECYCLE._runtime_gpu_probe_command("a" * 40)
@@ -3174,6 +3220,9 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
     claim = json.loads(Path(str(evidence["rent_claim_receipt"])).read_text(encoding="utf-8"))
     assert claim["attempted_offer"]["id"] == 42
     assert claim["attempted_offer"]["dph_total"] == 2.5
+    hydrate_sha256 = LIFECYCLE.sha256_file(Path(str(evidence["runtime_hydrate_request"])))
+    assert claim["runtime_hydrate_request_sha256"] == hydrate_sha256
+    assert outer["runtime_hydrate_request_sha256"] == hydrate_sha256
     assert not any("--interruptible" in command or "--bid_price" in command for command in commands)
     assert instance["instance_id"] == outer["instance_id"] == 44
     assert instance["capability_sha256"] == LIFECYCLE.sha256_file(outer_path)
@@ -3910,7 +3959,7 @@ def test_runtime_cpu_bootstrap_stages_only_cpu_pilot_inputs_and_never_parent_mat
     token.write_text("private-token", encoding="utf-8")
     token.chmod(0o600)
     hydrate = tmp_path / "hydrate.json"
-    hydrate.write_text(json.dumps({"schema_version": 1, "command": "hydrate-runtime-mixture", "arguments": {"deployment_receipt": "/prepared/config/deployment-receipt.json", "source_readback_receipts": "/prepared/config", "destination": "/prepared/runtime", "mounts_descriptor": "/prepared/runtime/mounts.json"}}), encoding="utf-8")
+    hydrate.write_text(json.dumps({"schema_version": 1, "command": "hydrate-runtime-mixture", "arguments": {"deployment_receipt": "/prepared/config/deployment-receipt.json", "source_readback_receipts": {"organizer": "/prepared/config/bc-readback.json", "rollout": "/prepared/config/rollout-readback.json"}, "destination": "/prepared/runtime", "mounts_descriptor": "/prepared/runtime/mounts.json"}}), encoding="utf-8")
     pilot = tmp_path / "pilot.json"
     pilot.write_text(json.dumps({"schema_version": 1, "command": "pilot-runtime-mixture", "arguments": {"mixture_manifest": "/prepared/runtime/mixture.json", "mounts_descriptor": "/prepared/runtime/mounts.json", "sample_count": 100, "worker_counts": [0, 4, 8, 16, 24], "timeout_seconds": 60, "authenticated_evidence": {}}}), encoding="utf-8")
     output = tmp_path / "cpu-bootstrap.json"
@@ -3981,7 +4030,7 @@ def test_runtime_gpu_bootstrap_hydrates_the_immutable_parent_on_host_without_scp
         LIFECYCLE.PARENT_CHECKPOINT | {"archive_sha256": LIFECYCLE.sha256_file(parent)},
     )
     hydrate = tmp_path / "hydrate.json"
-    hydrate.write_text(json.dumps({"schema_version": 1, "command": "hydrate-runtime-mixture", "arguments": {"deployment_receipt": "/prepared/config/deployment-receipt.json", "source_readback_receipts": "/prepared/config", "destination": "/prepared/runtime", "mounts_descriptor": "/prepared/runtime/mounts.json"}}), encoding="utf-8")
+    hydrate.write_text(json.dumps({"schema_version": 1, "command": "hydrate-runtime-mixture", "arguments": {"deployment_receipt": "/prepared/config/deployment-receipt.json", "source_readback_receipts": {"organizer": "/prepared/config/bc-readback.json", "rollout": "/prepared/config/rollout-readback.json"}, "destination": "/prepared/runtime", "mounts_descriptor": "/prepared/runtime/mounts.json"}}), encoding="utf-8")
     capability = tmp_path / "capability.json"
     capability.write_text("{}", encoding="utf-8")
     output = tmp_path / "gpu-bootstrap.json"
@@ -3992,7 +4041,10 @@ def test_runtime_gpu_bootstrap_hydrates_the_immutable_parent_on_host_without_scp
         "bootstrap_receipt": str(output),
     }
     monkeypatch.setattr(LIFECYCLE, "_verify_reviewed_code_bundle", lambda *_args: "4" * 64)
-    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_bootstrap_capability_receipt", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        LIFECYCLE, "_runtime_gpu_bootstrap_capability_receipt",
+        lambda **_kwargs: {"runtime_hydrate_request_sha256": LIFECYCLE.sha256_file(hydrate)},
+    )
     sources = {
         "code.bundle": bundle, "code.bundle.sha256": bundle_sha, "runtime.token": token,
         "runtime-hydrate.json": hydrate,
@@ -4062,6 +4114,7 @@ def test_runtime_gpu_parent_hydration_rejects_malformed_controller_mode_before_p
 
     monkeypatch.setattr(LIFECYCLE, "_runtime_campaign_binding", lambda _request: {})
     monkeypatch.setattr(LIFECYCLE, "_runtime_parent_checkpoint", lambda _request: tmp_path / "parent.tar")
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_hydration_request_sha256", lambda _request: "a" * 64)
     calls: list[tuple[str, ...]] = []
 
     with pytest.raises(ValueError, match="parent hydration"):

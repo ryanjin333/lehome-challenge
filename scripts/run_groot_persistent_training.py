@@ -93,6 +93,10 @@ _RUNTIME_GPU_CLI_REQUESTS = {
         "/prepared/config/runtime-train.json",
     ),
 }
+_RUNTIME_GPU_HYDRATION_RECEIPT_PATHS = {
+    "organizer": "/prepared/config/bc-readback.json",
+    "rollout": "/prepared/config/rollout-readback.json",
+}
 RUNTIME_CPU_PILOT_IMAGE = (
     _DIGEST_PREFIX
     + "e4c7ac02d22f46485c1e7861a9e85b85daff14283ef62cb9e16025a3d1ecf555"
@@ -1905,6 +1909,7 @@ def _runtime_gpu_rent_preflight(
     if "training_capability" in request:
         raise ValueError("direct runtime GPU rent derives capability on its single lease")
     identity = _runtime_campaign_binding(request)
+    _runtime_gpu_hydration_request_sha256(request)
     _runtime_parent_checkpoint(request)
     _runtime_gpu_parent_hydration()
     _require_vast_ssh_identity()
@@ -1988,6 +1993,7 @@ def _runtime_gpu_rent_claim_path(
         "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
         "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
         "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+        "runtime_hydrate_request_sha256": _runtime_gpu_hydration_request_sha256(request),
     }
     root = RUNTIME_GPU_RENT_CLAIM_ROOT
     if root.is_symlink():
@@ -2026,6 +2032,7 @@ def _runtime_gpu_rent_claim(
         "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
         "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
         "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+        "runtime_hydrate_request_sha256": _runtime_gpu_hydration_request_sha256(request),
     }
     if request.get("search_mode") == "on_demand":
         attempt = _runtime_gpu_attempted_offer(
@@ -2142,6 +2149,7 @@ def _runtime_gpu_claim_immutable(
         "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
         "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
         "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+        "runtime_hydrate_request_sha256": _runtime_gpu_hydration_request_sha256(request),
     }
     return all(claim.get(key) == value for key, value in expected.items())
 
@@ -2155,7 +2163,7 @@ def _valid_blocked_runtime_gpu_claim(
         "bc_revision", "bc_receipt_sha256", "rollout_revision", "rollout_prefix",
         "rollout_receipt_sha256", "deployment_revision", "mixture_id",
         "deployment_receipt_sha256", "parent_archive_sha256",
-        "parent_checkpoint_artifact_sha256",
+        "parent_checkpoint_artifact_sha256", "runtime_hydrate_request_sha256",
     }
     is_on_demand = "attempted_offer" in claim or "attempted_offer_sha256" in claim
     if is_on_demand:
@@ -2174,7 +2182,7 @@ def _valid_blocked_runtime_gpu_claim(
         and claim.get("status") == "blocked"
         and claim.get("error_type") == "RuntimeGpuRentOutcome"
         and isinstance(claim.get("bootstrap_capability_receipt"), str)
-        and all(re.fullmatch(r"[0-9a-f]{64}", str(claim.get(key))) for key in ("request_sha256", "offer_sha256", "code_bundle_sha256", "bc_receipt_sha256", "rollout_receipt_sha256", "deployment_receipt_sha256", "parent_archive_sha256", "parent_checkpoint_artifact_sha256"))
+        and all(re.fullmatch(r"[0-9a-f]{64}", str(claim.get(key))) for key in ("request_sha256", "offer_sha256", "code_bundle_sha256", "bc_receipt_sha256", "rollout_receipt_sha256", "deployment_receipt_sha256", "parent_archive_sha256", "parent_checkpoint_artifact_sha256", "runtime_hydrate_request_sha256"))
         and (not is_on_demand or attempt_is_authenticated)
         and _runtime_gpu_claim_immutable(claim=claim, identity=identity, request=request)
     )
@@ -2818,6 +2826,7 @@ def _runtime_gpu_bootstrap_capability(
         "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
         "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
         "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+        "runtime_hydrate_request_sha256": _runtime_gpu_hydration_request_sha256(request),
         "training_capability": validated,
     }
     atomic_write_json(Path(str(request["bootstrap_capability_receipt"])), outer)
@@ -2850,8 +2859,9 @@ def _runtime_gpu_bootstrap_capability_receipt(
         "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
     }
     if (
-        set(value) != set(expected) | {"training_capability"}
+        set(value) != set(expected) | {"runtime_hydrate_request_sha256", "training_capability"}
         or any(value.get(key) != expected_value for key, expected_value in expected.items())
+        or re.fullmatch(r"[0-9a-f]{64}", str(value.get("runtime_hydrate_request_sha256"))) is None
     ):
         raise ValueError("runtime GPU bootstrap capability receipt is not bound to this lease and campaign")
     try:
@@ -3636,6 +3646,28 @@ def _runtime_envelope(path: Path, *, command: str, fields: set[str], label: str)
     return arguments
 
 
+def _runtime_gpu_hydration_request_sha256(request: Mapping[str, object]) -> str:
+    """Authenticate the sole direct-GPU hydrator envelope before a lease exists."""
+    value = request.get("runtime_hydrate_request")
+    if type(value) is not str or not Path(value).is_absolute():
+        raise ValueError("runtime GPU rent requires an absolute hydration request")
+    path = Path(value)
+    arguments = _runtime_envelope(
+        path,
+        command="hydrate-runtime-mixture",
+        fields={"deployment_receipt", "source_readback_receipts", "destination", "mounts_descriptor"},
+        label="runtime GPU hydration request",
+    )
+    if (
+        arguments.get("deployment_receipt") != "/prepared/config/deployment-receipt.json"
+        or arguments.get("source_readback_receipts") != _RUNTIME_GPU_HYDRATION_RECEIPT_PATHS
+        or arguments.get("destination") != "/prepared/runtime"
+        or arguments.get("mounts_descriptor") != "/prepared/runtime/mounts.json"
+    ):
+        raise ValueError("runtime GPU hydration request sources and paths are not canonical")
+    return sha256_file(path)
+
+
 def _runtime_bootstrap_receipt(*, path: Path, instance: Mapping[str, object], request: Mapping[str, object]) -> Mapping[str, object]:
     receipt = _load_regular_json(path, "runtime bootstrap stage receipt")
     identity = _runtime_campaign_binding(request)
@@ -3655,13 +3687,14 @@ def _runtime_bootstrap_receipt(*, path: Path, instance: Mapping[str, object], re
         capability_path = request.get("bootstrap_capability_receipt")
         if type(capability_path) is not str:
             raise ValueError("runtime bootstrap receipt lacks the same-lease capability receipt")
-        _runtime_gpu_bootstrap_capability_receipt(
+        capability = _runtime_gpu_bootstrap_capability_receipt(
             path=Path(capability_path), instance=instance, request=request, identity=identity,
         )
         hydration = _runtime_gpu_parent_hydration()
         expected |= {
             "parent_hydration": hydration,
             "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+            "runtime_hydrate_request_sha256": capability["runtime_hydrate_request_sha256"],
             "bootstrap_capability_receipt_sha256": sha256_file(Path(capability_path)),
         }
     if any(receipt.get(key) != value for key, value in expected.items()):
@@ -3719,6 +3752,8 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
     hydrate = _runtime_envelope(Path(str(request["runtime_hydrate_request"])), command="hydrate-runtime-mixture", fields={"deployment_receipt", "source_readback_receipts", "destination", "mounts_descriptor"}, label="runtime hydration request")
     if hydrate["deployment_receipt"] != "/prepared/config/deployment-receipt.json" or hydrate["destination"] != "/prepared/runtime" or hydrate["mounts_descriptor"] != "/prepared/runtime/mounts.json":
         raise ValueError("runtime hydration request paths are not canonical")
+    if not is_cpu_diagnostic:
+        _runtime_gpu_hydration_request_sha256(request)
     if is_cpu_diagnostic:
         pilot = _runtime_envelope(Path(str(request["runtime_pilot_request"])), command="pilot-runtime-mixture", fields={"mixture_manifest", "mounts_descriptor", "sample_count", "worker_counts", "timeout_seconds", "authenticated_evidence"}, label="runtime pilot request")
         if pilot["mixture_manifest"] != "/prepared/runtime/mixture.json" or pilot["mounts_descriptor"] != "/prepared/runtime/mounts.json":
@@ -3749,6 +3784,7 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
         receipt |= {
             "parent_hydration": parent_hydration,
             "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+            "runtime_hydrate_request_sha256": bootstrap_capability["runtime_hydrate_request_sha256"],
             "bootstrap_capability_receipt_sha256": bootstrap_capability_sha,
         }
     atomic_write_json(Path(output), receipt)
@@ -3905,7 +3941,7 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
             raise ValueError("runtime train request resume inputs are not the staged authenticated cursor")
     elif any(train.get(key) is not None for key in ("runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor", "runtime_resume_anchor", "runtime_resume_publication")):
         raise ValueError("initial runtime train request must not invent a resume cursor")
-    _runtime_envelope(Path(str(request["runtime_hydrate_request"])), command="hydrate-runtime-mixture", fields={"deployment_receipt", "source_readback_receipts", "destination", "mounts_descriptor"}, label="runtime hydration request")
+    _runtime_gpu_hydration_request_sha256(request)
     _runtime_envelope(Path(str(request["runtime_warmup_request"])), command="runtime-gpu-warmup", fields={"binding"}, label="runtime GPU warm-up request")
     remote_dir = "/tmp/lehome-runtime-stage"
     runner((*_ssh_prefix(instance), "mkdir -p " + remote_dir))

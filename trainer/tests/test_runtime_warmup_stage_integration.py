@@ -362,6 +362,18 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "rollout_readback_receipt": str(receipts["rollout"]),
         "deployment_receipt": str(receipts["deployment"]),
     })
+    hydrate = _write(tmp_path / "stage" / "hydrate.json", {
+        "schema_version": 1, "command": "hydrate-runtime-mixture",
+        "arguments": {
+            "deployment_receipt": "/prepared/config/deployment-receipt.json",
+            "source_readback_receipts": {
+                "organizer": "/prepared/config/bc-readback.json",
+                "rollout": "/prepared/config/rollout-readback.json",
+            },
+            "destination": "/prepared/runtime",
+            "mounts_descriptor": "/prepared/runtime/mounts.json",
+        },
+    })
     bootstrap_capability = tmp_path / "stage" / "bootstrap-capability.json"
     bootstrap_capability.write_text(json.dumps({
         "schema_version": 1, "kind": "runtime_mixture_gpu_bootstrap_capability",
@@ -379,6 +391,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "deployment_receipt_sha256": campaign["deployment_receipt_sha256"],
         "parent_archive_sha256": LIFECYCLE.PARENT_CHECKPOINT["archive_sha256"],
         "parent_checkpoint_artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"],
+        "runtime_hydrate_request_sha256": sha256_file(hydrate),
         "training_capability": {
             "hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05",
             "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
@@ -434,18 +447,6 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "arguments": {"binding": binding},
     })
     launch_path = _write(tmp_path / "stage" / "warmup-launch.json", launch)
-    hydrate = _write(tmp_path / "stage" / "hydrate.json", {
-        "schema_version": 1, "command": "hydrate-runtime-mixture",
-        "arguments": {
-            "deployment_receipt": "/prepared/config/deployment-receipt.json",
-            "source_readback_receipts": {
-                "bc": "/prepared/config/bc-readback.json",
-                "round-1": "/prepared/config/rollout-readback.json",
-            },
-            "destination": "/prepared/runtime",
-            "mounts_descriptor": "/prepared/runtime/mounts.json",
-        },
-    })
     token = tmp_path / "stage" / "runtime.token"
     token.write_text("fixture-token", encoding="utf-8")
     token.chmod(0o600)
@@ -490,6 +491,10 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     assert policy_artifact_sha256(cache / "parent") == parent_identity["artifact_sha256"]
     assert all("mkdir -p /prepared/config /prepared/runtime" not in command[-1] for command in calls if command[0] == "ssh")
     assert not (prepared / "runtime").exists()
+    assert json.loads((prepared / "config" / "runtime-hydrate.json").read_text(encoding="utf-8"))["arguments"]["source_readback_receipts"] == {
+        "organizer": "/prepared/config/bc-readback.json",
+        "rollout": "/prepared/config/rollout-readback.json",
+    }
 
     # Exercise the real hydrator against its normal immutable deployment tree,
     # with a local in-memory Hub only at the transport boundary.
