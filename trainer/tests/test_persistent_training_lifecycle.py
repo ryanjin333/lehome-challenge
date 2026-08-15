@@ -4074,6 +4074,34 @@ def test_runtime_hydration_recovery_admission_error_never_enters_cleanup(
     assert not Path(str(request["failure_receipt"])).exists()
 
 
+@pytest.mark.parametrize("failure", (RuntimeError("intent readback mismatch"), OSError("intent I/O")))
+def test_runtime_hydration_recovery_intent_exception_never_enters_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: BaseException,
+) -> None:
+    instance = {"kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 44, "provider_response_sha256": "2" * 64}
+    request = {"instance": instance, "failure_receipt": str(tmp_path / "failure.json")}
+    request_path = tmp_path / "recover.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    monkeypatch.setattr(LIFECYCLE, "validate_runtime_gpu_hydration_recovery_request", lambda **_kwargs: {
+        "identity": {}, "request_sha256": "a" * 64, "capability_sha256": "b" * 64,
+    })
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_hydration_rate_limit_snapshot", lambda **_kwargs: {
+        "schema_version": 1, "kind": "runtime_mixture_hydration_rate_limit_terminal",
+        "request_sha256": "a" * 64, "exit_code": 1, "organizer_files": 1, "rollout_files": 0,
+    })
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_hydration_recovery_intent", lambda **_kwargs: (_ for _ in ()).throw(failure))
+    calls: list[tuple[str, ...]] = []
+
+    with pytest.raises(LIFECYCLE.RuntimeHydrationRecoveryAdmissionError):
+        LIFECYCLE.main_for_test(
+            ["runtime-hydrate-recover", "--request", str(request_path), "--execute"],
+            runner=lambda command: calls.append(command) or "",
+        )
+
+    assert calls == []
+    assert not Path(str(request["failure_receipt"])).exists()
+
+
 def test_direct_runtime_hydrate_partial_initialization_reattaches_after_ssh_255(
     tmp_path: Path,
 ) -> None:

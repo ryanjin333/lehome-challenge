@@ -4444,7 +4444,7 @@ def _run_runtime_gpu_hydration_recovery_validated(
         terminal = _runtime_gpu_hydration_rate_limit_snapshot(
             instance=instance, request_sha256=request_sha256, runner=runner,
         )
-    except ValueError as error:
+    except Exception as error:
         raise RuntimeHydrationRecoveryAdmissionError(str(error)) from error
     if terminal is None:
         return _runtime_gpu_hydration_pending(
@@ -4455,7 +4455,7 @@ def _run_runtime_gpu_hydration_recovery_validated(
             instance=instance, request=request, request_sha256=request_sha256,
             capability_sha256=capability_sha256, partial_sources=terminal,
         )
-    except ValueError as error:
+    except Exception as error:
         raise RuntimeHydrationRecoveryAdmissionError(str(error)) from error
     ssh_prefix = _runtime_hydration_ssh_prefix(instance)
     try:
