@@ -33,6 +33,12 @@ PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revisi
 # exact SKU strings.  Query only stable numeric facts, then enforce the narrow
 # WS/S allowlist on raw rows in ``_offer_gpu``.
 OFFER_QUERY = "gpu_ram>=96 num_gpus=1 reliability>=0.95"
+# Direct training leases are a distinct purchase policy: require a Vast
+# datacenter offer without changing the interruptible rollout query above.
+RUNTIME_GPU_DATACENTER_OFFER_QUERY = OFFER_QUERY + " datacenter=True"
+RUNTIME_GPU_DATACENTER_POLICY = {
+    "query": RUNTIME_GPU_DATACENTER_OFFER_QUERY, "required": True,
+}
 RUNTIME_PILOT_OFFER_QUERY = "cpu_arch=amd64 cpu_cores_effective>=32 cpu_ram>=64 disk_space>=120 reliability>=0.98 num_gpus=1 direct_port_count>=2 duration>=1"
 RUNTIME_PILOT_READINESS_POLLS = 120
 # Direct PRO6000 leases observed in Vast can remain loading beyond the generic
@@ -433,6 +439,25 @@ def _offer_gpu(row: Mapping[str, object]) -> bool:
     return row.get("gpu_name") in {"RTX PRO 6000 WS", "RTX PRO 6000 S"} and float(row.get("gpu_ram", 0)) >= 96000
 
 
+def _runtime_gpu_datacenter_row(row: Mapping[str, object]) -> bool:
+    """Trust the exact provider query when the response omits its filter field."""
+    value = row.get("datacenter")
+    return value is None or value is True
+
+
+def _runtime_gpu_datacenter_query(*, machine_id: int | None = None) -> str:
+    if machine_id is None:
+        return RUNTIME_GPU_DATACENTER_OFFER_QUERY
+    if not _positive_int(machine_id):
+        raise ValueError("runtime GPU datacenter query requires a machine ID")
+    return "machine_id=" + str(machine_id) + " " + RUNTIME_GPU_DATACENTER_OFFER_QUERY
+
+
+def _require_runtime_gpu_datacenter_policy(value: object) -> None:
+    if value != RUNTIME_GPU_DATACENTER_POLICY:
+        raise ValueError("runtime GPU rent requires the exact datacenter policy")
+
+
 def _project(row: Mapping[str, object], fields: tuple[str, ...]) -> dict[str, object]:
     return {field: row[field] for field in fields if field in row}
 
@@ -575,7 +600,7 @@ def capture_runtime_gpu_warmup_offer(
 ) -> dict[str, object]:
     """Capture the uncapped, non-auction 300GB PRO6000 direct-lease quote."""
     offers = _json(runner, (
-        "vastai", "--raw", "search", "offers", OFFER_QUERY,
+        "vastai", "--raw", "search", "offers", RUNTIME_GPU_DATACENTER_OFFER_QUERY,
         "--on-demand", "--storage", "300", "--order", "dph",
     ))
     instances = _json(runner, ("vastai", "--raw", "show", "instances"))
@@ -585,7 +610,7 @@ def capture_runtime_gpu_warmup_offer(
     eligible = [
         row for row in offers if isinstance(row, Mapping)
         and _positive_int(row.get("id")) and _positive_int(row.get("machine_id"))
-        and _offer_gpu(row) and row.get("num_gpus") == 1 and row.get("is_bid") is False
+        and _offer_gpu(row) and _runtime_gpu_datacenter_row(row) and row.get("num_gpus") == 1 and row.get("is_bid") is False
         and row.get("rentable") is True and row.get("rented") is False
         and type(row.get("dph_total")) in (int, float)
         and math.isfinite(float(row["dph_total"])) and float(row["dph_total"]) > 0
@@ -601,7 +626,7 @@ def capture_runtime_gpu_warmup_offer(
     )
     captured = int(time.time()) if now_unix is None else now_unix
     safe_offer = _project(
-        offer, ("id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "driver_version", "is_bid", "rentable", "rented"),
+        offer, ("id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "driver_version", "is_bid", "rentable", "rented", "datacenter"),
     )
     return {
         "schema_version": 1, "kind": "runtime_mixture_gpu_warmup_offer",
@@ -611,7 +636,7 @@ def capture_runtime_gpu_warmup_offer(
         "existing_storage_hourly_total_usd": existing_storage_total,
         "requested_storage_gb": 300, "storage_quote_included_in_dph_total": True,
         "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds,
-        "search_mode": "on_demand",
+        "search_mode": "on_demand", "datacenter_policy": dict(RUNTIME_GPU_DATACENTER_POLICY),
     }
 
 
@@ -906,7 +931,7 @@ def _fresh_on_demand_runtime_gpu_offer(
     """Re-read the captured machine contract before an uncapped direct create."""
     value = _json(runner, (
         "vastai", "--raw", "search", "offers",
-        "machine_id=" + str(offer["machine_id"]) + " num_gpus=1 gpu_ram>=96",
+        _runtime_gpu_datacenter_query(machine_id=int(offer["machine_id"])),
         "--on-demand", "--storage", "300",
     ))
     if not isinstance(value, list) or not any(isinstance(row, Mapping) for row in value):
@@ -919,7 +944,7 @@ def _fresh_on_demand_runtime_gpu_offer(
         and row.get("num_gpus") == offer.get("num_gpus") == 1
         and row.get("dph_total") == offer.get("dph_total")
         and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False
-        and _offer_gpu(row)
+        and _offer_gpu(row) and _runtime_gpu_datacenter_row(row)
     ]
     if not matching:
         raise ValueError("on-demand GPU offer readback does not match captured evidence")
@@ -961,6 +986,9 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
         ):
             raise ValueError("offer evidence lacks the all-in 300GB hourly quote")
         if direct_gpu_on_demand:
+            _require_runtime_gpu_datacenter_policy(evidence.get("datacenter_policy"))
+            if not _runtime_gpu_datacenter_row(offer):
+                raise ValueError("on-demand GPU offer evidence is not a datacenter offer")
             if offer.get("is_bid") is not False:
                 raise ValueError("on-demand GPU offer evidence is auctioned")
             instances = _json(runner, ("vastai", "--raw", "show", "instances"))
@@ -1011,6 +1039,7 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
             and live.get("gpu_name") == offer.get("gpu_name")
             and live.get("gpu_ram") == offer.get("gpu_ram")
             and live.get("dph_total") == quoted_offer_hourly
+            and _runtime_gpu_datacenter_row(live)
         )
         if not isinstance(live, Mapping) or live.get("id") != instance_id or (abort_request is not None and live.get("machine_id") != offer.get("machine_id")) or not _offer_gpu(live) or live.get("num_gpus") != 1 or not live.get("ssh_host") or type(live.get("ssh_port")) is not int or (direct_gpu_on_demand and not live_matches_direct_offer) or (not direct_gpu_on_demand and float(live.get("dph_total", 99)) >= 1):
             raise ValueError("instance readback does not match accepted offer")
@@ -1766,9 +1795,12 @@ def _runtime_gpu_rent_preflight(
         or offer.get("is_bid") is not False or not _positive_int(offer.get("machine_id"))
         or offer.get("rentable") is not True or offer.get("rented") is not False
         or not _offer_gpu(offer) or offer.get("num_gpus") != 1
+        or not _runtime_gpu_datacenter_row(offer)
         or request.get("requested_storage_gb") != 300
     ):
         raise ValueError("runtime GPU rent offer is not a valid on-demand 300GB PRO6000 lease")
+    if search_mode == "on_demand":
+        _require_runtime_gpu_datacenter_policy(request.get("datacenter_policy"))
     bundle = request.get("code_bundle")
     receipt = request.get("code_bundle_sha256_file")
     if type(bundle) is not str or type(receipt) is not str:
@@ -2117,7 +2149,7 @@ def _runtime_gpu_recovery_offer_snapshot(
     if not _positive_int(original_offer_id):
         raise ValueError("runtime GPU recovery original offer is invalid")
     if search_mode == "on_demand":
-        query = "machine_id=" + str(expected_machine_id) + " num_gpus=1 gpu_ram>=96"
+        query = _runtime_gpu_datacenter_query(machine_id=expected_machine_id)
         value = _json(runner, (
             "vastai", "--raw", "search", "offers", query, "--on-demand", "--storage", "300",
         ))
@@ -2133,7 +2165,7 @@ def _runtime_gpu_recovery_offer_snapshot(
             and row.get("num_gpus") == original_offer.get("num_gpus") == 1
             and row.get("dph_total") == original_offer.get("dph_total")
             and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False
-            and _offer_gpu(row)
+            and _offer_gpu(row) and _runtime_gpu_datacenter_row(row)
         ]
         if not matching:
             raise ValueError("runtime GPU recovery on-demand offer drifted")
@@ -2267,7 +2299,7 @@ def _runtime_gpu_recovery_reconciled_receipt_is_valid(
         if is_on_demand:
             fields |= {"original_search_mode", "blocked_rent_request"}
         query = (
-            "machine_id=" + str(machine_id) + " num_gpus=1 gpu_ram>=96"
+            _runtime_gpu_datacenter_query(machine_id=machine_id)
             if is_on_demand else "id = " + str(original_offer_id)
         )
         return (

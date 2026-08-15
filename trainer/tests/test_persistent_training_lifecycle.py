@@ -1635,13 +1635,17 @@ def test_capture_runtime_gpu_warmup_offer_is_on_demand_and_uncapped() -> None:
         commands.append(command)
         if command[:4] == ("vastai", "--raw", "search", "offers"):
             return json.dumps([{
+                "id": 7, "machine_id": 140799, "gpu_name": "RTX PRO 6000 WS",
+                "gpu_ram": 96000, "num_gpus": 1, "dph_total": .75,
+                "datacenter": False, "is_bid": False, "rentable": True, "rented": False,
+            }, {
                 "id": 9, "machine_id": 140800, "gpu_name": "RTX PRO 6000 S",
                 "gpu_ram": 96000, "num_gpus": 1, "dph_total": 3.25,
-                "is_bid": False, "rentable": True, "rented": False, "driver_version": "595.71.05",
+                "datacenter": True, "is_bid": False, "rentable": True, "rented": False, "driver_version": "595.71.05",
             }, {
                 "id": 47725426, "machine_id": 41998, "gpu_name": "RTX PRO 6000 WS",
                 "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.111111,
-                "is_bid": False, "rentable": True, "rented": False, "driver_version": "595.71.05",
+                "datacenter": True, "is_bid": False, "rentable": True, "rented": False, "driver_version": "595.71.05",
             }, {
                 "id": 47749612, "machine_id": 59343, "gpu_name": "RTX PRO 6000 WS",
                 "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.07,
@@ -1661,12 +1665,40 @@ def test_capture_runtime_gpu_warmup_offer_is_on_demand_and_uncapped() -> None:
     assert evidence["offer"]["id"] == 47725426
     assert evidence["offer"]["machine_id"] == 41998
     assert evidence["offer"]["dph_total"] == 1.111111
+    assert evidence["datacenter_policy"] == LIFECYCLE.RUNTIME_GPU_DATACENTER_POLICY
     assert evidence["account_hourly_total_usd"] == pytest.approx(7.111111)
     assert commands[0] == (
-        "vastai", "--raw", "search", "offers", LIFECYCLE.OFFER_QUERY,
+        "vastai", "--raw", "search", "offers", LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
         "--on-demand", "--storage", "300", "--order", "dph",
     )
     assert not any("--interruptible" in command or "--bid_price" in command for command in commands)
+
+
+def test_direct_gpu_datacenter_policy_drift_stops_before_provider_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(LIFECYCLE, "_runtime_campaign_binding", lambda _request: {})
+    monkeypatch.setattr(LIFECYCLE, "_runtime_parent_checkpoint", lambda _request: None)
+    monkeypatch.setattr(LIFECYCLE, "_require_vast_ssh_identity", lambda: None)
+    request = {
+        "failure_receipt": str(tmp_path / "failure.json"), "search_mode": "on_demand",
+        "expires_at_unix": int(time.time()) + 60,
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "account_hourly_total_usd": 100.0, "requested_storage_gb": 300,
+        "datacenter_policy": {"query": LIFECYCLE.OFFER_QUERY, "required": True},
+        "offer": {
+            "id": 1, "machine_id": 2, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000,
+            "num_gpus": 1, "dph_total": 1.5, "is_bid": False, "rentable": True, "rented": False,
+        },
+    }
+
+    with pytest.raises(ValueError, match="datacenter policy"):
+        LIFECYCLE.rent_runtime_gpu_warmup(
+            evidence=request, runner=lambda command: calls.append(command) or "",
+        )
+
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -1676,6 +1708,7 @@ def test_capture_runtime_gpu_warmup_offer_is_on_demand_and_uncapped() -> None:
         [{"machine_id": 41998, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.2, "is_bid": False, "rentable": True, "rented": False}],
         [{"machine_id": 41998, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.111111, "is_bid": True, "rentable": True, "rented": False}],
         [{"machine_id": 41998, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.111111, "is_bid": False, "rentable": False, "rented": True}],
+        [{"machine_id": 41998, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.111111, "datacenter": False, "is_bid": False, "rentable": True, "rented": False}],
     ),
 )
 def test_fresh_on_demand_gpu_machine_readback_rejects_drift_or_unavailable_rows(
@@ -1695,7 +1728,7 @@ def test_fresh_on_demand_gpu_machine_readback_rejects_drift_or_unavailable_rows(
     with pytest.raises(ValueError, match="on-demand GPU offer readback"):
         LIFECYCLE._fresh_on_demand_runtime_gpu_offer(runner=runner, offer=offer)
     assert commands == [
-        ("vastai", "--raw", "search", "offers", "machine_id=41998 num_gpus=1 gpu_ram>=96", "--on-demand", "--storage", "300"),
+        ("vastai", "--raw", "search", "offers", "machine_id=41998 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY, "--on-demand", "--storage", "300"),
     ]
 
 
@@ -1724,7 +1757,7 @@ def _blocked_gpu_rent_recovery_fixture(
         "bootstrap_capability_receipt": str(tmp_path / "bootstrap.json"),
     }
     if on_demand:
-        original |= {"search_mode": "on_demand", "requested_storage_gb": 300, "account_hourly_total_usd": 3.25}
+        original |= {"search_mode": "on_demand", "requested_storage_gb": 300, "account_hourly_total_usd": 3.25, "datacenter_policy": LIFECYCLE.RUNTIME_GPU_DATACENTER_POLICY}
         original["offer"] = {
             "id": 47749612, "machine_id": 59343, "gpu_name": "RTX PRO 6000 WS",
             "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.07,
@@ -1841,7 +1874,7 @@ def test_on_demand_ambiguous_claim_recovers_and_allows_a_different_machine(
     def runner(command: tuple[str, ...]) -> str:
         commands.append(command)
         if command == (
-            "vastai", "--raw", "search", "offers", "machine_id=59343 num_gpus=1 gpu_ram>=96",
+            "vastai", "--raw", "search", "offers", "machine_id=59343 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
             "--on-demand", "--storage", "300",
         ):
             return "[]"
@@ -1857,7 +1890,7 @@ def test_on_demand_ambiguous_claim_recovers_and_allows_a_different_machine(
     assert receipt["released"] is True and receipt["original_search_mode"] == "on_demand"
     assert receipt["blacklisted_machine_id"] == 59343 and not claim_path.exists()
     assert commands.count((
-        "vastai", "--raw", "search", "offers", "machine_id=59343 num_gpus=1 gpu_ram>=96",
+        "vastai", "--raw", "search", "offers", "machine_id=59343 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
         "--on-demand", "--storage", "300",
     )) == 2
     fresh = dict(original) | {
@@ -1913,6 +1946,11 @@ def test_on_demand_recovery_rejects_wrong_authenticated_machine_before_provider(
             "id": 47749610, "machine_id": 59343, "gpu_name": "RTX PRO 6000 WS",
             "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.07,
             "is_bid": True, "rentable": True, "rented": False,
+        }],
+        [{
+            "id": 47749610, "machine_id": 59343, "gpu_name": "RTX PRO 6000 WS",
+            "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.07,
+            "datacenter": False, "is_bid": False, "rentable": True, "rented": False,
         }],
     ),
 )
@@ -2818,7 +2856,8 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
         "code_revision": revision, "code_bundle": str(bundle),
         "code_bundle_sha256_file": str(bundle_receipt), "code_bundle_sha256": bundle_sha,
         "parent_checkpoint": str(parent),
-        "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json"),
+            "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json"),
+            "datacenter_policy": LIFECYCLE.RUNTIME_GPU_DATACENTER_POLICY,
     }
     evidence["offer"] = dict(evidence["offer"]) | {"dph_total": 3.25, "is_bid": False}  # type: ignore[arg-type]
     evidence["rent_claim_receipt"] = _canonical_runtime_gpu_claim_path(evidence)
@@ -2853,7 +2892,7 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
     def runner(command: tuple[str, ...]) -> str:
         commands.append(command)
         if command == (
-            "vastai", "--raw", "search", "offers", "machine_id=10 num_gpus=1 gpu_ram>=96",
+            "vastai", "--raw", "search", "offers", "machine_id=10 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
             "--on-demand", "--storage", "300",
         ):
             return json.dumps([
@@ -2894,7 +2933,7 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
         "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
     ) in commands
     assert (
-        "vastai", "--raw", "search", "offers", "machine_id=10 num_gpus=1 gpu_ram>=96",
+        "vastai", "--raw", "search", "offers", "machine_id=10 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
         "--on-demand", "--storage", "300",
     ) in commands
     assert not any("--interruptible" in command or "--bid_price" in command for command in commands)
