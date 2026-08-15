@@ -3655,7 +3655,9 @@ def test_runtime_hydrate_dispatch_allows_cpu_pilot_lease_and_rejects_mismatched_
     )
 
     assert gpu["hydration_receipt"] == receipt
-    assert any(command[0] == "ssh" for command in calls)
+    gpu_command = next(command[-1] for command in calls if command[0] == "ssh")
+    assert "/opt/runtime/bin/python -m lehome_train.cli hydrate-runtime-mixture" in gpu_command
+    assert "lehome-train" not in gpu_command
 
     calls.clear()
     mismatched = dict(instance) | {
@@ -4319,3 +4321,28 @@ def test_runtime_gpu_warmup_runs_exact_cli_and_binds_cpu_pilot_code_parent_and_i
     assert lifecycle["selected_loader_workers"] == 4
     assert lifecycle["trainer_image"] == LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE
     assert lifecycle["parent_checkpoint_artifact_sha256"] == LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]
+
+
+def test_direct_runtime_gpu_commands_use_the_pinned_python_without_ssh_path() -> None:
+    """Every paid direct-GPU CLI edge must survive Vast's sparse SSH PATH."""
+    commands = (
+        LIFECYCLE._runtime_gpu_cli_command("hydrate-runtime-mixture"),
+        LIFECYCLE._runtime_gpu_cli_command("runtime-gpu-warmup"),
+        LIFECYCLE._runtime_gpu_cli_command("runtime-mixture-train"),
+        LIFECYCLE._runtime_gpu_parent_hash_check_command(),
+        LIFECYCLE._runtime_gpu_parent_hydration_command(
+            remote_dir="/tmp/lehome-runtime-bootstrap",
+            hydration=LIFECYCLE._runtime_gpu_parent_hydration(),
+        ),
+    )
+
+    for command in commands:
+        assert LIFECYCLE.RUNTIME_GPU_PYTHON in command
+        assert re.search(r"(?<![A-Za-z0-9_/-])python(?:\s|$)", command) is None
+        assert "lehome-train" not in command
+    assert "/opt/runtime/bin/python -m lehome_train.cli hydrate-runtime-mixture" in commands[0]
+    assert "HF_TOKEN=\"$(cat /prepared/config/runtime.token)\"" in commands[0]
+    assert "env -u HF_TOKEN" in commands[1]
+    assert "env -u HF_TOKEN" in commands[2]
+    assert "/opt/runtime/bin/python -c" in commands[3]
+    assert "/opt/runtime/bin/python -c" in commands[4]

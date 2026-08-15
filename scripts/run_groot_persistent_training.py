@@ -77,6 +77,22 @@ BOOTSTRAP_TRAINER_IMAGE = (
     _DIGEST_PREFIX
     + "b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746"
 )
+RUNTIME_GPU_PYTHON = "/opt/runtime/bin/python"
+_RUNTIME_GPU_STAGED_PYTHONPATH = "/prepared/code/source/lehome:/prepared/code/trainer/src"
+_RUNTIME_GPU_CLI_REQUESTS = {
+    "hydrate-runtime-mixture": (
+        "HF_TOKEN=\"$(cat /prepared/config/runtime.token)\"",
+        "/prepared/config/runtime-hydrate.json",
+    ),
+    "runtime-gpu-warmup": (
+        "env -u HF_TOKEN",
+        "/prepared/config/runtime-warmup.json",
+    ),
+    "runtime-mixture-train": (
+        "env -u HF_TOKEN",
+        "/prepared/config/runtime-train.json",
+    ),
+}
 RUNTIME_CPU_PILOT_IMAGE = (
     _DIGEST_PREFIX
     + "e4c7ac02d22f46485c1e7861a9e85b85daff14283ef62cb9e16025a3d1ecf555"
@@ -118,6 +134,19 @@ _RUNTIME_GPU_PROBE_STAGE_TRACE = (
     "LEHOME_RUNTIME_GPU_PROBE_STAGE=capability",
 )
 _RUNTIME_GPU_NO_CUDA_ERROR = "training capability requires CUDA"
+
+
+def _runtime_gpu_cli_command(command: str) -> str:
+    """Return a reviewed direct-GPU CLI command independent of SSH PATH."""
+    try:
+        environment, request = _RUNTIME_GPU_CLI_REQUESTS[command]
+    except KeyError as error:
+        raise ValueError("runtime GPU CLI command is not approved") from error
+    return (
+        "set -eu; " + environment + " PYTHONPATH=" + _RUNTIME_GPU_STAGED_PYTHONPATH
+        + " " + RUNTIME_GPU_PYTHON + " -m lehome_train.cli " + command
+        + " --request " + request
+    )
 
 
 def _sanitize_runtime_gpu_probe_stderr(value: object) -> str:
@@ -162,7 +191,7 @@ def _runtime_gpu_probe_command(code_revision: str) -> str:
         + f"printf '%s\\n' '{stage}clean' >&2; test -z \"$(/usr/bin/git -C /prepared/bootstrap-code status --porcelain)\"; "
         + f"printf '%s\\n' '{stage}capability' >&2; /usr/bin/timeout {RUNTIME_GPU_PROBE_TIMEOUT_SECONDS} /usr/bin/env -u HF_TOKEN "
         + "PYTHONPATH=/prepared/bootstrap-code/source/lehome:/prepared/bootstrap-code/trainer/src "
-        + "/opt/runtime/bin/python -m lehome_train.cli validate-training-capability --one-step --image-digest "
+        + RUNTIME_GPU_PYTHON + " -m lehome_train.cli validate-training-capability --one-step --image-digest "
         + BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
     )
 
@@ -1733,7 +1762,7 @@ def _runtime_gpu_parent_hydration_command(
         "trap 'unset HF_TOKEN; rm -rf \"$parent_tmp\"' EXIT; "
         "test -s /prepared/config/runtime.token; "
         "HF_TOKEN=\"$(cat /prepared/config/runtime.token)\"; export HF_TOKEN; "
-        "/opt/runtime/bin/python -c " + shlex.quote(script) + "; unset HF_TOKEN; "
+        + RUNTIME_GPU_PYTHON + " -c " + shlex.quote(script) + "; unset HF_TOKEN; "
         "test -d " + shlex.quote(source) + "; test ! -L " + shlex.quote(source) + "; "
         "if test -e \"$parent_tmp/repo/.cache\"; then test -d \"$parent_tmp/repo/.cache\"; test ! -L \"$parent_tmp/repo/.cache\"; rm -rf \"$parent_tmp/repo/.cache\"; fi; "
         "test -z \"$(find \"$parent_tmp/repo\" -xdev \\( -type l -o \\( ! -type d -a ! -type f \\) \\) -print -quit)\"; "
@@ -1741,12 +1770,24 @@ def _runtime_gpu_parent_hydration_command(
         "cp -a \"$parent_tmp/repo/policies/step-12000/.\" /cache/parent; "
         "test ! -e /cache/parent/policies; "
         "test ! -L /cache/parent; "
-        "PYTHONPATH=/prepared/code/trainer/src /opt/runtime/bin/python -c "
+        "PYTHONPATH=/prepared/code/trainer/src " + RUNTIME_GPU_PYTHON + " -c "
         + shlex.quote(
             "from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; "
             "assert policy_artifact_sha256('/cache/parent') == " + repr(artifact)
         )
         + "; rm -rf \"$parent_tmp\"; trap - EXIT; "
+    )
+
+
+def _runtime_gpu_parent_hash_check_command() -> str:
+    """Verify the already-hydrated direct-GPU parent without relying on PATH."""
+    return (
+        "PYTHONPATH=/prepared/code/trainer/src " + RUNTIME_GPU_PYTHON + " -c "
+        + shlex.quote(
+            "from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; "
+            "assert policy_artifact_sha256('/cache/parent') == "
+            + repr(PARENT_CHECKPOINT["artifact_sha256"])
+        )
     )
 
 
@@ -3030,10 +3071,7 @@ def run_runtime_gpu_warmup(
         binding=_load_regular_json(Path(binding_path), "runtime GPU warm-up binding"),
         instance=instance, request=request, identity=identity,
     )
-    command = (
-        "set -eu; env -u HF_TOKEN PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src "
-        "lehome-train runtime-gpu-warmup --request /prepared/config/runtime-warmup.json"
-    )
+    command = _runtime_gpu_cli_command("runtime-gpu-warmup")
     remote = _json(runner, (*_ssh_prefix(instance), command))
     if not isinstance(remote, Mapping):
         raise ValueError("runtime GPU warm-up did not return a measured receipt")
@@ -3507,10 +3545,7 @@ def runtime_mixture_train(*, instance: Mapping[str, object], request: Mapping[st
     output = request.get("execution_receipt")
     if type(output) is not str or not Path(output).is_absolute() or Path(output).exists() or Path(output).is_symlink():
         raise ValueError("runtime mixture execution receipt must be an absent absolute path")
-    command = (
-        "set -eu; env -u HF_TOKEN PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src "
-        "lehome-train runtime-mixture-train --request /prepared/config/runtime-train.json"
-    )
+    command = _runtime_gpu_cli_command("runtime-mixture-train")
     runner((*_ssh_prefix(instance), command))
     receipt = {
         "schema_version": 1, "kind": "runtime_mixture_execution", "platform_arch": "x86_64",
@@ -3897,7 +3932,7 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         if not observed or observed[0] != digest:
             raise ValueError("runtime mixture staged warm-up receipt readback failed")
         transfers.append({"name": "gpu-warmup.json", "sha256": digest})
-    runner((*_ssh_prefix(instance), "set -eu; test -d /prepared/code; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -d /cache/parent; test ! -L /cache/parent; PYTHONPATH=/prepared/code/trainer/src python -c \"from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; assert policy_artifact_sha256('/cache/parent') == '" + PARENT_CHECKPOINT["artifact_sha256"] + "'\"; mkdir -p /prepared/final-slot; test ! -e /prepared/final-slot/bootstrap-code; mv /prepared/code /prepared/final-slot/bootstrap-code"))
+    runner((*_ssh_prefix(instance), "set -eu; test -d /prepared/code; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -d /cache/parent; test ! -L /cache/parent; " + _runtime_gpu_parent_hash_check_command() + "; mkdir -p /prepared/final-slot; test ! -e /prepared/final-slot/bootstrap-code; mv /prepared/code /prepared/final-slot/bootstrap-code"))
     runner((*_ssh_prefix(instance), "set -eu; test -d /prepared/runtime; mkdir -p /prepared/config /output; mv " + remote_dir + "/launch.json /prepared/config/launch.json; mv " + remote_dir + "/experiment.json /prepared/config/experiment.json; mv " + remote_dir + "/runtime-train.json /prepared/config/runtime-train.json; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/gpu-warmup.json /prepared/config/gpu-warmup.json; mv " + remote_dir + "/runtime-warmup-binding.json /prepared/config/runtime-warmup-binding.json; mv " + remote_dir + "/selected-workers.json /prepared/config/selected-workers.json; mv " + remote_dir + "/source-evidence.json /prepared/runtime/source-evidence.json; mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; git clone --quiet --no-checkout " + remote_dir + "/code.bundle /prepared/code; git -C /prepared/code checkout --quiet --detach " + str(request["code_revision"]) + "; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -z \"$(git -C /prepared/code status --porcelain)\"; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code; test ! -L /cache/parent"))
     if resume_transfers:
         runner((*_ssh_prefix(instance), "set -eu; mv " + remote_dir + "/runtime-resume.tar /prepared/config/runtime-resume.tar; mv " + remote_dir + "/runtime-resume.json /prepared/config/runtime-resume.json"))
@@ -3906,7 +3941,14 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
 
 def runtime_mixture_hydrate(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     identity = _runtime_hydration_identity(instance, request)
-    output = runner((*_ssh_prefix(instance), "set -eu; HF_TOKEN=\"$(cat /prepared/config/runtime.token)\" PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src lehome-train hydrate-runtime-mixture --request /prepared/config/runtime-hydrate.json"))
+    command = (
+        _runtime_gpu_cli_command("hydrate-runtime-mixture")
+        if instance.get("kind") == "runtime_mixture_gpu_warmup_instance"
+        else "set -eu; HF_TOKEN=\"$(cat /prepared/config/runtime.token)\" "
+        "PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src "
+        "lehome-train hydrate-runtime-mixture --request /prepared/config/runtime-hydrate.json"
+    )
+    output = runner((*_ssh_prefix(instance), command))
     try:
         receipt = json.loads(output)
     except json.JSONDecodeError as error:
