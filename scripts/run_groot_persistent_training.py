@@ -445,14 +445,8 @@ def _runtime_gpu_datacenter_row(row: Mapping[str, object]) -> bool:
     return value is None or value is True
 
 
-def _runtime_gpu_datacenter_query(
-    *, machine_id: int | None = None, offer_id: int | None = None,
-) -> str:
+def _runtime_gpu_datacenter_query(*, machine_id: int | None = None) -> str:
     filters: list[str] = []
-    if offer_id is not None:
-        if not _positive_int(offer_id):
-            raise ValueError("runtime GPU datacenter query requires an offer ID")
-        filters.append("id=" + str(offer_id))
     if machine_id is not None:
         if not _positive_int(machine_id):
             raise ValueError("runtime GPU datacenter query requires a machine ID")
@@ -932,32 +926,56 @@ def rent_runtime_cpu_pilot(
         raise
 
 
-def _fresh_on_demand_runtime_gpu_offer(
-    *, runner: Runner, offer: Mapping[str, object],
-) -> None:
-    """Re-read the captured machine contract before an uncapped direct create."""
-    value = _json(runner, (
-        "vastai", "--raw", "search", "offers",
-        _runtime_gpu_datacenter_query(
-            machine_id=int(offer["machine_id"]), offer_id=int(offer["id"]),
-        ),
-        "--on-demand", "--storage", "300",
+def _final_runtime_gpu_datacenter_offer(*, runner: Runner) -> dict[str, object]:
+    """Select the one immediate direct-lease attempt from Vast's global offer view."""
+    rows = _json(runner, (
+        "vastai", "--raw", "search", "offers", RUNTIME_GPU_DATACENTER_OFFER_QUERY,
+        "--on-demand", "--storage", "300", "--order", "dph",
     ))
-    if not isinstance(value, list) or not any(isinstance(row, Mapping) for row in value):
-        raise ValueError("on-demand GPU offer readback is invalid")
-    matching = [
-        row for row in value if isinstance(row, Mapping)
-        and row.get("id") == offer.get("id")
-        and row.get("machine_id") == offer.get("machine_id")
-        and row.get("gpu_name") == offer.get("gpu_name")
-        and row.get("gpu_ram") == offer.get("gpu_ram")
-        and row.get("num_gpus") == offer.get("num_gpus") == 1
-        and row.get("dph_total") == offer.get("dph_total")
-        and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False
-        and _offer_gpu(row) and _runtime_gpu_datacenter_row(row)
+    if not isinstance(rows, list):
+        raise ValueError("final on-demand GPU offer search is invalid")
+    eligible = [
+        row for row in rows if isinstance(row, Mapping)
+        and _positive_int(row.get("id")) and _positive_int(row.get("machine_id"))
+        and type(row.get("gpu_ram")) in (int, float) and _offer_gpu(row)
+        and row.get("num_gpus") == 1 and row.get("is_bid") is False
+        and row.get("rentable") is True and row.get("rented") is False
+        and _runtime_gpu_datacenter_row(row)
+        and type(row.get("dph_total")) in (int, float)
+        and math.isfinite(float(row["dph_total"])) and float(row["dph_total"]) > 0
     ]
-    if len(matching) != 1:
-        raise ValueError("on-demand GPU offer readback does not match captured evidence")
+    if not eligible or len({row["id"] for row in eligible}) != len(eligible):
+        raise ValueError("final on-demand GPU offer is unavailable or ambiguous")
+    selected = min(eligible, key=lambda row: (float(row["dph_total"]), int(row["id"])))
+    return _project(selected, (
+        "id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total",
+        "driver_version", "datacenter", "is_bid", "rentable", "rented",
+    ))
+
+
+_RUNTIME_GPU_ATTEMPT_REQUIRED_FIELDS = frozenset({
+    "id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total",
+    "is_bid", "rentable", "rented",
+})
+_RUNTIME_GPU_ATTEMPT_FIELDS = _RUNTIME_GPU_ATTEMPT_REQUIRED_FIELDS | {"driver_version", "datacenter"}
+
+
+def _runtime_gpu_attempted_offer(value: Mapping[str, object]) -> dict[str, object]:
+    """Freeze the exact ephemeral row that is permitted to reach create."""
+    offer = _project(value, tuple(_RUNTIME_GPU_ATTEMPT_FIELDS))
+    if (
+        not _RUNTIME_GPU_ATTEMPT_REQUIRED_FIELDS.issubset(offer)
+        or set(offer) - _RUNTIME_GPU_ATTEMPT_FIELDS
+        or not _positive_int(offer.get("id")) or not _positive_int(offer.get("machine_id"))
+        or type(offer.get("gpu_ram")) not in (int, float) or not _offer_gpu(offer)
+        or offer.get("num_gpus") != 1 or offer.get("is_bid") is not False
+        or offer.get("rentable") is not True or offer.get("rented") is not False
+        or not _runtime_gpu_datacenter_row(offer)
+        or type(offer.get("dph_total")) not in (int, float)
+        or not math.isfinite(float(offer["dph_total"])) or float(offer["dph_total"]) <= 0
+    ):
+        raise ValueError("final on-demand GPU offer is invalid")
+    return offer
 
 
 def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep, require_capability: bool = True, abort_request: Mapping[str, object] | None = None, direct_gpu_on_demand: bool = False) -> dict[str, object]:
@@ -997,17 +1015,7 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
             raise ValueError("offer evidence lacks the all-in 300GB hourly quote")
         if direct_gpu_on_demand:
             _require_runtime_gpu_datacenter_policy(evidence.get("datacenter_policy"))
-            if not _runtime_gpu_datacenter_row(offer):
-                raise ValueError("on-demand GPU offer evidence is not a datacenter offer")
-            if offer.get("is_bid") is not False:
-                raise ValueError("on-demand GPU offer evidence is auctioned")
-            instances = _json(runner, ("vastai", "--raw", "show", "instances"))
-            volumes = _json(runner, ("vastai", "--raw", "show", "volumes"))
-            if not isinstance(instances, list) or not isinstance(volumes, list):
-                raise ValueError("on-demand GPU account readback is invalid")
-            _uncapped_provider_row_total(instances, field="dph_total", label="on-demand GPU instances")
-            _uncapped_provider_row_total(volumes, field="storage_total_cost", label="on-demand GPU volumes")
-            _fresh_on_demand_runtime_gpu_offer(runner=runner, offer=offer)
+            _runtime_gpu_attempted_offer(offer)
         else:
             _require_account_cap(
                 _live_account_total(runner=runner) + float(quoted_offer_hourly),
@@ -1871,6 +1879,7 @@ def _runtime_gpu_rent_claim_path(
 
 def _runtime_gpu_rent_claim(
     *, path: Path, request: Mapping[str, object], identity: Mapping[str, object],
+    attempted_offer: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Atomically admit exactly one controller to create a direct GPU lease."""
     offer = request["offer"]
@@ -1892,6 +1901,14 @@ def _runtime_gpu_rent_claim(
         "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
         "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
     }
+    if request.get("search_mode") == "on_demand":
+        attempt = _runtime_gpu_attempted_offer(
+            offer if attempted_offer is None else attempted_offer,
+        )
+        claim |= {
+            "attempted_offer": attempt,
+            "attempted_offer_sha256": _hash(attempt),
+        }
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError as error:
@@ -2014,14 +2031,35 @@ def _valid_blocked_runtime_gpu_claim(
         "deployment_receipt_sha256", "parent_archive_sha256",
         "parent_checkpoint_artifact_sha256",
     }
+    is_on_demand = "attempted_offer" in claim or "attempted_offer_sha256" in claim
+    if is_on_demand:
+        fields |= {"attempted_offer", "attempted_offer_sha256"}
+    attempt = claim.get("attempted_offer")
+    try:
+        attempt_is_authenticated = (
+            isinstance(attempt, Mapping)
+            and claim.get("attempted_offer_sha256") == _hash(dict(attempt))
+            and _runtime_gpu_attempted_offer(attempt) == dict(attempt)
+        )
+    except ValueError:
+        attempt_is_authenticated = False
     return (
         set(claim) == fields
         and claim.get("status") == "blocked"
         and claim.get("error_type") == "RuntimeGpuRentOutcome"
         and isinstance(claim.get("bootstrap_capability_receipt"), str)
         and all(re.fullmatch(r"[0-9a-f]{64}", str(claim.get(key))) for key in ("request_sha256", "offer_sha256", "code_bundle_sha256", "bc_receipt_sha256", "rollout_receipt_sha256", "deployment_receipt_sha256", "parent_archive_sha256", "parent_checkpoint_artifact_sha256"))
+        and (not is_on_demand or attempt_is_authenticated)
         and _runtime_gpu_claim_immutable(claim=claim, identity=identity, request=request)
     )
+
+
+def _runtime_gpu_claimed_attempted_offer(claim: Mapping[str, object]) -> dict[str, object]:
+    """Load the exact row durably bound before an ambiguous direct create."""
+    value = claim.get("attempted_offer")
+    if not isinstance(value, Mapping) or claim.get("attempted_offer_sha256") != _hash(dict(value)):
+        raise ValueError("runtime GPU claim attempted offer is not authenticated")
+    return _runtime_gpu_attempted_offer(value)
 
 
 def _runtime_gpu_recovery_receipt_path(claim_path: Path) -> Path:
@@ -2120,11 +2158,7 @@ def _runtime_gpu_recovery_request(
     if original.get("search_mode") == "interruptible":
         if request.get("expected_original_machine_id") != RUNTIME_GPU_LEGACY_RECOVERY_BLACKLISTED_MACHINE_ID:
             raise ValueError("runtime GPU recovery request must bind the approved legacy machine")
-    elif (
-        original.get("search_mode") != "on_demand" or not isinstance(original_offer, Mapping)
-        or not _positive_int(original_offer.get("machine_id"))
-        or request.get("expected_original_machine_id") != original_offer.get("machine_id")
-    ):
+    elif original.get("search_mode") != "on_demand" or not isinstance(original_offer, Mapping):
         raise ValueError("runtime GPU recovery request must bind the authenticated on-demand machine")
     return blocked, int(request["expected_original_machine_id"]), receipt
 
@@ -2159,9 +2193,7 @@ def _runtime_gpu_recovery_offer_snapshot(
     if not _positive_int(original_offer_id):
         raise ValueError("runtime GPU recovery original offer is invalid")
     if search_mode == "on_demand":
-        query = _runtime_gpu_datacenter_query(
-            machine_id=expected_machine_id, offer_id=int(original_offer_id),
-        )
+        query = _runtime_gpu_datacenter_query(machine_id=expected_machine_id)
         value = _json(runner, (
             "vastai", "--raw", "search", "offers", query, "--on-demand", "--storage", "300",
         ))
@@ -2175,7 +2207,7 @@ def _runtime_gpu_recovery_offer_snapshot(
             }
         matching = [
             row for row in value if isinstance(row, Mapping)
-            and row.get("id") == original_offer_id
+            and _positive_int(row.get("id"))
             and row.get("machine_id") == expected_machine_id
             and row.get("gpu_name") == original_offer.get("gpu_name")
             and row.get("gpu_ram") == original_offer.get("gpu_ram")
@@ -2189,6 +2221,7 @@ def _runtime_gpu_recovery_offer_snapshot(
         proof = _project(matching[0], (
             "id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "is_bid", "rentable", "rented",
         ))
+        proof["attempted_offer_id"] = original_offer_id
         return "present", proof
     if search_mode != "interruptible":
         raise ValueError("runtime GPU recovery original offer mode is invalid")
@@ -2241,11 +2274,13 @@ def _runtime_gpu_recovery_offer_proof_is_valid(
 def _runtime_gpu_recovery_on_demand_offer_proof_is_valid(
     proof: object, *, original_offer: Mapping[str, object], machine_id: int,
 ) -> bool:
-    fields = {"id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "is_bid", "rentable", "rented"}
+    fields = {"id", "attempted_offer_id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "is_bid", "rentable", "rented"}
+    compared_fields = fields - {"id", "attempted_offer_id"}
     return (
         isinstance(proof, Mapping) and set(proof) == fields
-        and all(proof.get(key) == original_offer.get(key) for key in fields)
-        and proof.get("id") == original_offer.get("id") and _positive_int(proof.get("id"))
+        and all(proof.get(key) == original_offer.get(key) for key in compared_fields)
+        and proof.get("attempted_offer_id") == original_offer.get("id")
+        and _positive_int(proof.get("attempted_offer_id")) and _positive_int(proof.get("id"))
         and proof.get("machine_id") == machine_id and _positive_int(machine_id)
         and _offer_gpu(proof) and proof.get("num_gpus") == 1
         and type(proof.get("dph_total")) in (int, float)
@@ -2319,7 +2354,7 @@ def _runtime_gpu_recovery_reconciled_receipt_is_valid(
         else:
             snapshot_fields.remove("original_offer_id")
         query = (
-            _runtime_gpu_datacenter_query(machine_id=machine_id, offer_id=original_offer_id)
+            _runtime_gpu_datacenter_query(machine_id=machine_id)
             if is_on_demand else "id = " + str(original_offer_id)
         )
         return (
@@ -2386,6 +2421,11 @@ def recover_runtime_gpu_rent(
     except (UnicodeError, json.JSONDecodeError): raise ValueError("runtime GPU recovery canonical claim is malformed") from None
     if not isinstance(claim_value, Mapping) or not _valid_blocked_runtime_gpu_claim(claim=claim_value, identity=identity, request=original) or claim_value.get("request_sha256") != _hash({key: value for key, value in original.items() if key != "rent_claim_receipt"}) or claim_value.get("offer_sha256") != _hash(dict(original_offer)):
         raise ValueError("runtime GPU recovery canonical claim does not bind the original request")
+    recovery_offer: Mapping[str, object] = original_offer
+    if original_search_mode == "on_demand":
+        recovery_offer = _runtime_gpu_claimed_attempted_offer(claim_value)
+        if expected_machine_id != recovery_offer.get("machine_id"):
+            raise ValueError("runtime GPU recovery request must bind the authenticated on-demand machine")
     archives = _runtime_gpu_recovery_archives(claim_path=claim_path, identity=identity, request=original, allow_recovery_receipt=receipt is not None)
     expires = original.get("expires_at_unix")
     if type(expires) is not int or _recovery_now(now_unix) < expires + RUNTIME_GPU_RECOVERY_GRACE_SECONDS:
@@ -2400,7 +2440,7 @@ def recover_runtime_gpu_rent(
         receipt = initial_receipt
     if receipt == initial_receipt:
         mode, start_offer = _runtime_gpu_recovery_offer_snapshot(
-            runner=runner, original_offer=original_offer, expected_machine_id=expected_machine_id,
+            runner=runner, original_offer=recovery_offer, expected_machine_id=expected_machine_id,
             search_mode=str(original["search_mode"]),
             timestamp_unix=_recovery_now(now_unix),
         )
@@ -2417,7 +2457,7 @@ def recover_runtime_gpu_rent(
             })
             sleep(RUNTIME_GPU_RECOVERY_POLL_SECONDS)
         end_mode, end_offer = _runtime_gpu_recovery_offer_snapshot(
-            runner=runner, original_offer=original_offer, expected_machine_id=expected_machine_id,
+            runner=runner, original_offer=recovery_offer, expected_machine_id=expected_machine_id,
             search_mode=str(original["search_mode"]),
             timestamp_unix=_recovery_now(now_unix),
         )
@@ -2429,13 +2469,13 @@ def recover_runtime_gpu_rent(
         archived_current = {
             "relative_filename": archive_path.name, "byte_sha256": claim_sha256,
             "request_sha256": claim_value["request_sha256"], "offer_sha256": claim_value["offer_sha256"],
-            "reconciled_machine_id": expected_machine_id if mode == "present" else None, "original_offer_id": original_offer["id"],
+            "reconciled_machine_id": expected_machine_id if mode == "present" else None, "original_offer_id": recovery_offer["id"],
         }
         final = {
             "schema_version": 1, "kind": "runtime_mixture_gpu_rent_recovery_receipt",
             "status": "reconciled", "released": False,
             "canonical_claim_path": str(claim_path), "canonical_claim_sha256": claim_sha256,
-            "archive_claims": archives + [archived_current], "original_offer_id": original_offer["id"],
+            "archive_claims": archives + [archived_current], "original_offer_id": recovery_offer["id"],
             "reconciled_machine_id": expected_machine_id,
             "observations": observations, "start_offer_proof": start_offer,
             "start_offer_proof_sha256": _hash(start_offer), "end_offer_proof": end_offer,
@@ -2449,7 +2489,7 @@ def recover_runtime_gpu_rent(
         _replace_json_durably(receipt_path, final); _runtime_gpu_recovery_crash("reconciled", crash_after); receipt = final
     archive_path = _runtime_gpu_recovery_archive_path(claim_path, claim_sha256)
     current_machine = expected_machine_id if receipt.get("offer_proof_mode") == "present" else None
-    expected_archives = [row for row in archives if row["relative_filename"] != archive_path.name] + [{"relative_filename": archive_path.name, "byte_sha256": claim_sha256, "request_sha256": claim_value["request_sha256"], "offer_sha256": claim_value["offer_sha256"], "reconciled_machine_id": current_machine, "original_offer_id": original_offer["id"]}]
+    expected_archives = [row for row in archives if row["relative_filename"] != archive_path.name] + [{"relative_filename": archive_path.name, "byte_sha256": claim_sha256, "request_sha256": claim_value["request_sha256"], "offer_sha256": claim_value["offer_sha256"], "reconciled_machine_id": current_machine, "original_offer_id": recovery_offer["id"]}]
     if receipt.get("status") == "released":
         reconciled = dict(receipt); reconciled.pop("archive_path", None)
         reconciled["status"] = "reconciled"; reconciled["released"] = False
@@ -2458,15 +2498,15 @@ def recover_runtime_gpu_rent(
             or receipt.get("archive_path") != str(archive_path)
             or not _runtime_gpu_recovery_reconciled_receipt_is_valid(
                 reconciled, claim_path=claim_path, claim_sha256=claim_sha256,
-                original_offer_id=int(original_offer["id"]), machine_id=expected_machine_id,
+                original_offer_id=int(recovery_offer["id"]), machine_id=expected_machine_id,
                 archives=expected_archives, search_mode=original_search_mode,
-                original_offer=original_offer,
+                original_offer=recovery_offer,
                 blocked_rent_request=str(blocked_path) if original_search_mode == "on_demand" else None,
             )
         ):
             raise ValueError("runtime GPU recovery released receipt is not authenticated")
         return {"paid_action": False, "action": "runtime-gpu-rent-recover", "recovery_receipt": receipt}
-    if not _runtime_gpu_recovery_reconciled_receipt_is_valid(receipt, claim_path=claim_path, claim_sha256=claim_sha256, original_offer_id=int(original_offer["id"]), machine_id=expected_machine_id, archives=expected_archives, search_mode=original_search_mode, original_offer=original_offer, blocked_rent_request=str(blocked_path) if original_search_mode == "on_demand" else None):
+    if not _runtime_gpu_recovery_reconciled_receipt_is_valid(receipt, claim_path=claim_path, claim_sha256=claim_sha256, original_offer_id=int(recovery_offer["id"]), machine_id=expected_machine_id, archives=expected_archives, search_mode=original_search_mode, original_offer=recovery_offer, blocked_rent_request=str(blocked_path) if original_search_mode == "on_demand" else None):
         raise ValueError("runtime GPU recovery receipt is not an authenticated reconciled state")
     if not archive_path.exists():
         if claim_path.is_symlink() or not claim_path.is_file() or claim_path.read_bytes() != claim_bytes: raise RuntimeError("runtime GPU recovery canonical claim changed before archive")
@@ -2537,15 +2577,18 @@ def _validate_runtime_gpu_recovery_for_new_rent(
         if blocked_path is None or not blocked_path.is_absolute() or blocked_path.is_symlink() or not blocked_path.is_file():
             raise ValueError("runtime GPU recovery receipt original request is invalid")
         original = _load_regular_json(blocked_path, "blocked runtime GPU rent request")
-        original_offer = original.get("offer") if isinstance(original, Mapping) else None
+        captured_offer = original.get("offer") if isinstance(original, Mapping) else None
+        try:
+            original_offer = _runtime_gpu_claimed_attempted_offer(archived_claim)
+        except ValueError as error:
+            raise ValueError("runtime GPU recovery receipt attempted offer is not authenticated") from error
         expected_machine = receipt.get("reconciled_machine_id") if mode == "present" else receipt.get("blacklisted_machine_id")
         if (
-            original.get("search_mode") != "on_demand" or not isinstance(original_offer, Mapping)
+            original.get("search_mode") != "on_demand" or not isinstance(captured_offer, Mapping)
             or original_offer.get("id") != receipt.get("original_offer_id")
             or original_offer.get("machine_id") != expected_machine
-            or original_offer.get("is_bid") is not False or original_offer.get("rentable") is not True or original_offer.get("rented") is not False
             or archived_claim.get("request_sha256") != _hash({key: value for key, value in original.items() if key != "rent_claim_receipt"})
-            or archived_claim.get("offer_sha256") != _hash(dict(original_offer))
+            or archived_claim.get("offer_sha256") != _hash(dict(captured_offer))
         ):
             raise ValueError("runtime GPU recovery receipt original request is not authenticated")
     archived_rows = _runtime_gpu_recovery_archives(
@@ -2922,12 +2965,20 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
     # This stays outside the provider runner boundary, so every direct-GPU
     # invocation verifies the pinned image before it can claim or create a lease.
     _runtime_gpu_exact_image_preflight_from_request(evidence)
+    # Vast offer identifiers are ephemeral.  Bind the one global datacenter
+    # selection to O_EXCL and send that exact row straight to create; never
+    # re-query its ID after the selection.
+    attempted_offer = _final_runtime_gpu_datacenter_offer(runner=runner)
     claim_path = _runtime_gpu_rent_claim_path(request=evidence, identity=identity)
-    claim = _runtime_gpu_rent_claim(path=claim_path, request=evidence, identity=identity)
+    claim = _runtime_gpu_rent_claim(
+        path=claim_path, request=evidence, identity=identity,
+        attempted_offer=attempted_offer,
+    )
+    attempted_evidence = dict(evidence) | {"offer": attempted_offer}
     rented: Mapping[str, object] | None = None
     try:
         rented = rent(
-            evidence=evidence, runner=runner, require_capability=False,
+            evidence=attempted_evidence, runner=runner, require_capability=False,
             abort_request=evidence,
             max_readiness_polls=RUNTIME_GPU_WARMUP_READINESS_POLLS,
             direct_gpu_on_demand=True,
