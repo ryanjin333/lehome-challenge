@@ -1913,9 +1913,7 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
             abort_request=evidence,
             max_readiness_polls=RUNTIME_GPU_WARMUP_READINESS_POLLS,
         )
-        _attest_platform_arch(
-            rented, runner=runner, ssh_connection_timeout_seconds=RUNTIME_GPU_ARCH_TIMEOUT_SECONDS,
-        )
+        _await_platform_arch_attestation(instance=rented, runner=runner)
         outer = _runtime_gpu_bootstrap_capability(
             instance=rented, request=evidence, identity=identity, runner=runner,
         )

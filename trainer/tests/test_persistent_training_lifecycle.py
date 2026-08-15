@@ -2027,7 +2027,7 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
     assert not any(row[:3] == ("vastai", "destroy", "instance") for row in commands)
     assert any(
         command[-1] == "set -eu; uname -m"
-        and ("-o", "ConnectTimeout=15") in zip(command, command[1:])
+        and ("-o", "ConnectTimeout=5") in zip(command, command[1:])
         for command in commands
     )
     probe_commands = [
@@ -2078,6 +2078,43 @@ def test_direct_gpu_rent_passes_the_ten_minute_readiness_bound(
     )
 
     assert observed["max_readiness_polls"] == LIFECYCLE.RUNTIME_GPU_WARMUP_READINESS_POLLS == 120
+
+
+def test_direct_gpu_rent_uses_bounded_ssh_attestation_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = tmp_path / "bootstrap-capability.json"
+    capability.write_text("{}", encoding="utf-8")
+    claim_path = tmp_path / "claim.json"
+    observed: list[tuple[Mapping[str, object], object]] = []
+    instance = {
+        "instance_id": 44, "provider_response_sha256": "a" * 64,
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+    }
+
+    monkeypatch.setattr(LIFECYCLE, "_runtime_failure_receipt_path", lambda _request: tmp_path / "failure.json")
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_preflight", lambda _request: {})
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_claim_path", lambda **_kwargs: claim_path)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_claim", lambda **_kwargs: {"status": "claimed"})
+    monkeypatch.setattr(LIFECYCLE, "rent", lambda **_kwargs: instance)
+    monkeypatch.setattr(
+        LIFECYCLE, "_attest_platform_arch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("one-shot SSH attestation used")),
+    )
+    monkeypatch.setattr(
+        LIFECYCLE, "_await_platform_arch_attestation",
+        lambda *, instance, runner: observed.append((instance, runner)) or "x86_64",
+    )
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_bootstrap_capability", lambda **_kwargs: {})
+    monkeypatch.setattr(LIFECYCLE, "_terminalize_runtime_gpu_rent_claim", lambda **_kwargs: None)
+
+    runner = lambda _command: ""
+    result = LIFECYCLE.rent_runtime_gpu_warmup(
+        evidence={"bootstrap_capability_receipt": str(capability)}, runner=runner,
+    )
+
+    assert observed == [(instance, runner)]
+    assert result["instance_id"] == 44
 
 
 def test_gpu_readiness_accepts_running_after_more_than_legacy_sixty_seconds(tmp_path: Path) -> None:
