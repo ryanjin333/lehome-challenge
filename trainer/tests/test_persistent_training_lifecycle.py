@@ -3241,6 +3241,18 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
     assert probe_commands and all("/usr/bin/timeout 600 /usr/bin/env -u HF_TOKEN" in command for command in probe_commands)
     assert all("/opt/runtime/bin/python -m lehome_train.cli validate-training-capability" in command for command in probe_commands)
     assert all("lehome-train validate-training-capability" not in command for command in probe_commands)
+    hydrate_path = Path(str(evidence["runtime_hydrate_request"]))
+    hydrate_path.write_text(
+        json.dumps(json.loads(hydrate_path.read_text(encoding="utf-8")), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    command_count = len(commands)
+    with pytest.raises(ValueError, match="lease and campaign"):
+        LIFECYCLE._runtime_gpu_bootstrap_capability_receipt(
+            path=outer_path, instance=instance, request=evidence,
+            identity=LIFECYCLE._runtime_campaign_binding(evidence),
+        )
+    assert len(commands) == command_count
     outer["deployment_revision"] = "0" * 40
     outer_path.write_text(json.dumps(outer), encoding="utf-8")
     with pytest.raises(ValueError, match="lease and campaign"):

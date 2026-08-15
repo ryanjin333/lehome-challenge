@@ -2861,7 +2861,7 @@ def _runtime_gpu_bootstrap_capability_receipt(
     if (
         set(value) != set(expected) | {"runtime_hydrate_request_sha256", "training_capability"}
         or any(value.get(key) != expected_value for key, expected_value in expected.items())
-        or re.fullmatch(r"[0-9a-f]{64}", str(value.get("runtime_hydrate_request_sha256"))) is None
+        or value.get("runtime_hydrate_request_sha256") != _runtime_gpu_hydration_request_sha256(request)
     ):
         raise ValueError("runtime GPU bootstrap capability receipt is not bound to this lease and campaign")
     try:
@@ -3794,6 +3794,7 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
 def runtime_mixture_warmup_stage(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
     """Stage the direct-GPU measurement slot without touching final inputs."""
     identity = _runtime_identity(instance, request)
+    _runtime_gpu_hydration_request_sha256(request)
     _runtime_bootstrap_receipt(path=Path(str(request.get("bootstrap_receipt", ""))), instance=instance, request=request)
     required = {
         "runtime_warmup_binding": "runtime-warmup-binding.json",
