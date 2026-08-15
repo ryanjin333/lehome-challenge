@@ -1939,6 +1939,33 @@ def test_direct_gpu_retry_accepts_released_recovery_on_different_offer_and_machi
                     request=fresh, identity=identity, allow_held=True,
                 ),
             )
+
+
+def test_ambiguous_rent_recovery_releases_after_two_absent_offer_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery, claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(tmp_path, monkeypatch)
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return "[]"
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        raise AssertionError(command)
+
+    result = LIFECYCLE.recover_runtime_gpu_rent(
+        request=recovery, runner=runner, now_unix=int(original["expires_at_unix"]) + 300,
+        sleep=lambda _: None,
+    )
+
+    receipt = result["recovery_receipt"]
+    assert receipt["offer_proof_mode"] == "absent"
+    assert receipt["blacklisted_machine_id"] == 140799
+    assert receipt["start_offer_snapshot"]["matching_count"] == receipt["end_offer_snapshot"]["matching_count"] == 0
+    assert receipt["released"] is True and not claim_path.exists()
 def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_path: Path) -> None:
     commands: list[tuple[str, ...]] = []
     readiness_reads = 0

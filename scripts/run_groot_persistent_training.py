@@ -1788,6 +1788,27 @@ def _runtime_gpu_recovery_live_offer(
     return _project(offer, ("id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total"))
 
 
+def _runtime_gpu_recovery_offer_snapshot(
+    *, runner: Runner, original_offer_id: int, expected_machine_id: int, timestamp_unix: int,
+) -> tuple[str, dict[str, object]]:
+    value = _json(runner, (
+        "vastai", "--raw", "search", "offers", OFFER_QUERY, "--interruptible", "--storage", "300",
+    ))
+    if not isinstance(value, list):
+        raise ValueError("runtime GPU recovery offer search is invalid")
+    matching = [row for row in value if isinstance(row, Mapping) and row.get("id") == original_offer_id]
+    if not matching:
+        return "absent", {"timestamp_unix": timestamp_unix, "response_sha256": _hash(value), "matching_count": 0}
+    if len(matching) != 1:
+        raise ValueError("runtime GPU recovery original offer is ambiguous")
+    # Reuse the narrow live-row validation without persisting raw provider fields.
+    proof = _runtime_gpu_recovery_live_offer(
+        runner=lambda _command: json.dumps(value), original_offer_id=original_offer_id,
+        expected_machine_id=expected_machine_id,
+    )
+    return "present", proof
+
+
 def _recovery_now(now_unix: int | Callable[[], int] | None) -> int:
     value = int(time.time()) if now_unix is None else (now_unix() if callable(now_unix) else now_unix)
     if type(value) is not int:
@@ -1817,25 +1838,32 @@ def _runtime_gpu_recovery_reconciled_receipt_is_valid(
     receipt: Mapping[str, object], *, claim_path: Path, claim_sha256: str,
     original_offer_id: int, machine_id: int, archives: list[dict[str, object]],
 ) -> bool:
+    observations = receipt.get("observations")
+    expected_empty_hash = _hash([])
+    common = (
+        receipt.get("schema_version") == 1 and receipt.get("kind") == "runtime_mixture_gpu_rent_recovery_receipt"
+        and receipt.get("status") == "reconciled" and receipt.get("released") is False
+        and receipt.get("canonical_claim_path") == str(claim_path) and receipt.get("canonical_claim_sha256") == claim_sha256
+        and receipt.get("original_offer_id") == original_offer_id and receipt.get("archive_claims") == archives
+        and isinstance(observations, list) and len(observations) == RUNTIME_GPU_RECOVERY_OBSERVATION_POLLS
+        and all(isinstance(row, Mapping) and set(row) == {"timestamp_unix", "instances_sha256", "volumes_sha256"} and type(row.get("timestamp_unix")) is int and row.get("instances_sha256") == expected_empty_hash and row.get("volumes_sha256") == expected_empty_hash for row in observations)
+    )
+    if receipt.get("offer_proof_mode") == "absent":
+        snapshot_fields = {"timestamp_unix", "response_sha256", "matching_count"}
+        return (
+            common and set(receipt) == {"schema_version", "kind", "status", "released", "canonical_claim_path", "canonical_claim_sha256", "archive_claims", "original_offer_id", "observations", "offer_proof_mode", "blacklisted_machine_id", "start_offer_snapshot", "end_offer_snapshot"}
+            and receipt.get("blacklisted_machine_id") == machine_id
+            and all(isinstance(snapshot, Mapping) and set(snapshot) == snapshot_fields and type(snapshot.get("timestamp_unix")) is int and snapshot.get("response_sha256") == expected_empty_hash and snapshot.get("matching_count") == 0 for snapshot in (receipt.get("start_offer_snapshot"), receipt.get("end_offer_snapshot")))
+        )
     fields = {
         "schema_version", "kind", "status", "released", "canonical_claim_path",
         "canonical_claim_sha256", "archive_claims", "original_offer_id", "reconciled_machine_id",
         "observations", "start_offer_proof", "start_offer_proof_sha256", "end_offer_proof",
-        "end_offer_proof_sha256",
+        "end_offer_proof_sha256", "offer_proof_mode",
     }
-    observations = receipt.get("observations")
-    expected_empty_hash = _hash([])
     return (
-        set(receipt) == fields and receipt.get("schema_version") == 1
-        and receipt.get("kind") == "runtime_mixture_gpu_rent_recovery_receipt"
-        and receipt.get("status") == "reconciled" and receipt.get("released") is False
-        and receipt.get("canonical_claim_path") == str(claim_path)
-        and receipt.get("canonical_claim_sha256") == claim_sha256
-        and receipt.get("original_offer_id") == original_offer_id
+        common and set(receipt) == fields and receipt.get("offer_proof_mode") == "present"
         and receipt.get("reconciled_machine_id") == machine_id
-        and receipt.get("archive_claims") == archives
-        and isinstance(observations, list) and len(observations) == RUNTIME_GPU_RECOVERY_OBSERVATION_POLLS
-        and all(isinstance(row, Mapping) and set(row) == {"timestamp_unix", "instances_sha256", "volumes_sha256"} and type(row.get("timestamp_unix")) is int and row.get("instances_sha256") == expected_empty_hash and row.get("volumes_sha256") == expected_empty_hash for row in observations)
         and _runtime_gpu_recovery_offer_proof_is_valid(receipt.get("start_offer_proof"), offer_id=original_offer_id, machine_id=machine_id)
         and _runtime_gpu_recovery_offer_proof_is_valid(receipt.get("end_offer_proof"), offer_id=original_offer_id, machine_id=machine_id)
         and receipt.get("start_offer_proof_sha256") == _hash(receipt.get("start_offer_proof"))
@@ -1889,9 +1917,9 @@ def recover_runtime_gpu_rent(
         _runtime_gpu_recovery_crash("observing", crash_after)
         receipt = initial_receipt
     if receipt == initial_receipt:
-        start_offer = _runtime_gpu_recovery_live_offer(
-            runner=runner, original_offer_id=int(original_offer["id"]),
-            expected_machine_id=expected_machine_id,
+        mode, start_offer = _runtime_gpu_recovery_offer_snapshot(
+            runner=runner, original_offer_id=int(original_offer["id"]), expected_machine_id=expected_machine_id,
+            timestamp_unix=_recovery_now(now_unix),
         )
         observations: list[dict[str, object]] = []
         for _ in range(RUNTIME_GPU_RECOVERY_OBSERVATION_POLLS):
@@ -1905,15 +1933,17 @@ def recover_runtime_gpu_rent(
                 "instances_sha256": _hash(instances), "volumes_sha256": _hash(volumes),
             })
             sleep(RUNTIME_GPU_RECOVERY_POLL_SECONDS)
-        end_offer = _runtime_gpu_recovery_live_offer(
-            runner=runner, original_offer_id=int(original_offer["id"]),
-            expected_machine_id=expected_machine_id,
+        end_mode, end_offer = _runtime_gpu_recovery_offer_snapshot(
+            runner=runner, original_offer_id=int(original_offer["id"]), expected_machine_id=expected_machine_id,
+            timestamp_unix=_recovery_now(now_unix),
         )
+        if end_mode != mode:
+            raise ValueError("runtime GPU recovery original offer changed between snapshots")
         archive_path = _runtime_gpu_recovery_archive_path(claim_path, claim_sha256)
         archived_current = {
             "relative_filename": archive_path.name, "byte_sha256": claim_sha256,
             "request_sha256": claim_value["request_sha256"], "offer_sha256": claim_value["offer_sha256"],
-            "reconciled_machine_id": expected_machine_id, "original_offer_id": original_offer["id"],
+            "reconciled_machine_id": expected_machine_id if mode == "present" else None, "original_offer_id": original_offer["id"],
         }
         final = {
             "schema_version": 1, "kind": "runtime_mixture_gpu_rent_recovery_receipt",
@@ -1923,11 +1953,15 @@ def recover_runtime_gpu_rent(
             "reconciled_machine_id": expected_machine_id,
             "observations": observations, "start_offer_proof": start_offer,
             "start_offer_proof_sha256": _hash(start_offer), "end_offer_proof": end_offer,
-            "end_offer_proof_sha256": _hash(end_offer),
+            "end_offer_proof_sha256": _hash(end_offer), "offer_proof_mode": mode,
         }
+        if mode == "absent":
+            final.pop("reconciled_machine_id"); final.pop("start_offer_proof"); final.pop("start_offer_proof_sha256"); final.pop("end_offer_proof"); final.pop("end_offer_proof_sha256")
+            final |= {"blacklisted_machine_id": expected_machine_id, "start_offer_snapshot": start_offer, "end_offer_snapshot": end_offer}
         _replace_json_durably(receipt_path, final); _runtime_gpu_recovery_crash("reconciled", crash_after); receipt = final
     archive_path = _runtime_gpu_recovery_archive_path(claim_path, claim_sha256)
-    expected_archives = [row for row in archives if row["relative_filename"] != archive_path.name] + [{"relative_filename": archive_path.name, "byte_sha256": claim_sha256, "request_sha256": claim_value["request_sha256"], "offer_sha256": claim_value["offer_sha256"], "reconciled_machine_id": expected_machine_id, "original_offer_id": original_offer["id"]}]
+    current_machine = expected_machine_id if receipt.get("offer_proof_mode") == "present" else None
+    expected_archives = [row for row in archives if row["relative_filename"] != archive_path.name] + [{"relative_filename": archive_path.name, "byte_sha256": claim_sha256, "request_sha256": claim_value["request_sha256"], "offer_sha256": claim_value["offer_sha256"], "reconciled_machine_id": current_machine, "original_offer_id": original_offer["id"]}]
     if receipt.get("status") == "released":
         reconciled = dict(receipt); reconciled.pop("archive_path", None)
         reconciled["status"] = "reconciled"; reconciled["released"] = False
@@ -1968,12 +2002,16 @@ def _validate_runtime_gpu_recovery_for_new_rent(
     if request.get("recovery_receipt") != str(recovery_path):
         raise ValueError("runtime GPU rent requires the canonical recovery receipt")
     receipt = _load_regular_json(recovery_path, "runtime GPU recovery receipt")
+    mode = receipt.get("offer_proof_mode")
     fields = {
         "schema_version", "kind", "status", "released", "canonical_claim_path",
         "canonical_claim_sha256", "archive_claims", "original_offer_id", "reconciled_machine_id",
         "observations", "start_offer_proof", "start_offer_proof_sha256", "end_offer_proof",
-        "end_offer_proof_sha256", "archive_path",
+        "end_offer_proof_sha256", "offer_proof_mode", "archive_path",
     }
+    if mode == "absent":
+        fields -= {"reconciled_machine_id", "start_offer_proof", "start_offer_proof_sha256", "end_offer_proof", "end_offer_proof_sha256"}
+        fields |= {"blacklisted_machine_id", "start_offer_snapshot", "end_offer_snapshot"}
     if set(receipt) != fields or receipt.get("schema_version") != 1 or receipt.get("kind") != "runtime_mixture_gpu_rent_recovery_receipt" or receipt.get("status") != "released" or receipt.get("released") is not True or receipt.get("canonical_claim_path") != str(claim_path):
         raise ValueError("runtime GPU recovery receipt is not a released canonical recovery")
     archive_path = _runtime_gpu_recovery_archive_path(
@@ -1984,7 +2022,7 @@ def _validate_runtime_gpu_recovery_for_new_rent(
         or archive_path.is_symlink() or not archive_path.is_file()
         or hashlib.sha256(archive_path.read_bytes()).hexdigest() != receipt.get("canonical_claim_sha256")
         or not _positive_int(receipt.get("original_offer_id"))
-        or not _positive_int(receipt.get("reconciled_machine_id"))
+        or not _positive_int(receipt.get("reconciled_machine_id") if mode == "present" else receipt.get("blacklisted_machine_id"))
     ):
         raise ValueError("runtime GPU recovery receipt archive is invalid")
     try:
@@ -2007,7 +2045,7 @@ def _validate_runtime_gpu_recovery_for_new_rent(
         raise ValueError("runtime GPU recovery receipt canonical archive is ambiguous")
     archived_rows = [
         row | {
-            "reconciled_machine_id": receipt["reconciled_machine_id"],
+            "reconciled_machine_id": receipt["reconciled_machine_id"] if mode == "present" else None,
             "original_offer_id": receipt["original_offer_id"],
         }
         if row in current_rows else row
@@ -2020,13 +2058,13 @@ def _validate_runtime_gpu_recovery_for_new_rent(
     if not _runtime_gpu_recovery_reconciled_receipt_is_valid(
         reconciled, claim_path=claim_path, claim_sha256=str(receipt["canonical_claim_sha256"]),
         original_offer_id=int(receipt["original_offer_id"]),
-        machine_id=int(receipt["reconciled_machine_id"]), archives=archived_rows,
+        machine_id=int(receipt["reconciled_machine_id"] if mode == "present" else receipt["blacklisted_machine_id"]), archives=archived_rows,
     ):
         raise ValueError("runtime GPU recovery receipt proofs are invalid")
     offer = request.get("offer")
     if (
         not isinstance(offer, Mapping) or offer.get("id") == receipt.get("original_offer_id")
-        or offer.get("machine_id") == receipt.get("reconciled_machine_id")
+        or offer.get("machine_id") == (receipt.get("reconciled_machine_id") if mode == "present" else receipt.get("blacklisted_machine_id"))
     ):
         raise ValueError("runtime GPU recovery retry requires a different offer and machine")
 
