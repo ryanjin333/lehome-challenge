@@ -423,6 +423,7 @@ def capture_runtime_gpu_warmup_offer(
         row for row in offers if isinstance(row, Mapping)
         and _positive_int(row.get("id")) and _positive_int(row.get("machine_id"))
         and _offer_gpu(row) and row.get("num_gpus") == 1 and row.get("is_bid") is False
+        and row.get("rentable") is True and row.get("rented") is False
         and type(row.get("dph_total")) in (int, float)
         and math.isfinite(float(row["dph_total"])) and float(row["dph_total"]) > 0
     ]
@@ -437,7 +438,7 @@ def capture_runtime_gpu_warmup_offer(
     )
     captured = int(time.time()) if now_unix is None else now_unix
     safe_offer = _project(
-        offer, ("id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "driver_version", "is_bid"),
+        offer, ("id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "driver_version", "is_bid", "rentable", "rented"),
     )
     return {
         "schema_version": 1, "kind": "runtime_mixture_gpu_warmup_offer",
@@ -732,24 +733,25 @@ def rent_runtime_cpu_pilot(
 def _fresh_on_demand_runtime_gpu_offer(
     *, runner: Runner, offer: Mapping[str, object],
 ) -> None:
-    """Re-read exactly the captured offer before an uncapped direct create."""
+    """Re-read the captured machine contract before an uncapped direct create."""
     value = _json(runner, (
-        "vastai", "--raw", "search", "offers", "id = " + str(offer["id"]),
+        "vastai", "--raw", "search", "offers",
+        "machine_id=" + str(offer["machine_id"]) + " num_gpus=1 gpu_ram>=96",
         "--on-demand", "--storage", "300",
     ))
-    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], Mapping):
+    if not isinstance(value, list) or not any(isinstance(row, Mapping) for row in value):
         raise ValueError("on-demand GPU offer readback is invalid")
-    live = value[0]
-    if (
-        live.get("id") != offer.get("id")
-        or live.get("machine_id") != offer.get("machine_id")
-        or live.get("gpu_name") != offer.get("gpu_name")
-        or live.get("gpu_ram") != offer.get("gpu_ram")
-        or live.get("num_gpus") != offer.get("num_gpus")
-        or live.get("dph_total") != offer.get("dph_total")
-        or live.get("is_bid") is not False
-        or not _offer_gpu(live) or live.get("num_gpus") != 1
-    ):
+    matching = [
+        row for row in value if isinstance(row, Mapping)
+        and row.get("machine_id") == offer.get("machine_id")
+        and row.get("gpu_name") == offer.get("gpu_name")
+        and row.get("gpu_ram") == offer.get("gpu_ram")
+        and row.get("num_gpus") == offer.get("num_gpus") == 1
+        and row.get("dph_total") == offer.get("dph_total")
+        and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False
+        and _offer_gpu(row)
+    ]
+    if not matching:
         raise ValueError("on-demand GPU offer readback does not match captured evidence")
 
 
@@ -1592,6 +1594,7 @@ def _runtime_gpu_rent_preflight(
     elif (
         type(quote) not in (int, float) or not math.isfinite(float(quote)) or float(quote) <= 0
         or offer.get("is_bid") is not False or not _positive_int(offer.get("machine_id"))
+        or offer.get("rentable") is not True or offer.get("rented") is not False
         or not _offer_gpu(offer) or offer.get("num_gpus") != 1
         or request.get("requested_storage_gb") != 300
     ):

@@ -1634,11 +1634,15 @@ def test_capture_runtime_gpu_warmup_offer_is_on_demand_and_uncapped() -> None:
             return json.dumps([{
                 "id": 9, "machine_id": 140800, "gpu_name": "RTX PRO 6000 S",
                 "gpu_ram": 96000, "num_gpus": 1, "dph_total": 3.25,
-                "is_bid": False, "driver_version": "595.71.05",
+                "is_bid": False, "rentable": True, "rented": False, "driver_version": "595.71.05",
             }, {
                 "id": 47725426, "machine_id": 41998, "gpu_name": "RTX PRO 6000 WS",
                 "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.111111,
-                "is_bid": False, "driver_version": "595.71.05",
+                "is_bid": False, "rentable": True, "rented": False, "driver_version": "595.71.05",
+            }, {
+                "id": 47749612, "machine_id": 59343, "gpu_name": "RTX PRO 6000 WS",
+                "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.07,
+                "is_bid": False, "rentable": False, "rented": True, "driver_version": "595.71.05",
             }])
         if command[:4] == ("vastai", "--raw", "show", "instances"):
             return '[{"id": 1, "dph_total": 4.0}]'
@@ -1660,6 +1664,36 @@ def test_capture_runtime_gpu_warmup_offer_is_on_demand_and_uncapped() -> None:
         "--on-demand", "--storage", "300", "--order", "dph",
     )
     assert not any("--interruptible" in command or "--bid_price" in command for command in commands)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    (
+        [],
+        [{"machine_id": 41998, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.2, "is_bid": False, "rentable": True, "rented": False}],
+        [{"machine_id": 41998, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.111111, "is_bid": True, "rentable": True, "rented": False}],
+        [{"machine_id": 41998, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.111111, "is_bid": False, "rentable": False, "rented": True}],
+    ),
+)
+def test_fresh_on_demand_gpu_machine_readback_rejects_drift_or_unavailable_rows(
+    rows: list[object],
+) -> None:
+    offer = {
+        "id": 47749612, "machine_id": 41998, "gpu_name": "RTX PRO 6000 WS",
+        "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.111111,
+        "is_bid": False, "rentable": True, "rented": False,
+    }
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(command)
+        return json.dumps(rows)
+
+    with pytest.raises(ValueError, match="on-demand GPU offer readback"):
+        LIFECYCLE._fresh_on_demand_runtime_gpu_offer(runner=runner, offer=offer)
+    assert commands == [
+        ("vastai", "--raw", "search", "offers", "machine_id=41998 num_gpus=1 gpu_ram>=96", "--on-demand", "--storage", "300"),
+    ]
 
 
 def test_ambiguous_rent_recovery_requires_exact_small_request_schema(tmp_path: Path) -> None:
@@ -1882,7 +1916,7 @@ def test_absent_recovery_consumer_accepts_legacy_archive_set_regardless_of_scan_
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert [row["relative_filename"] for row in receipt["archive_claims"][:-1]] == [claim_path.stem + suffix for suffix in suffixes]
     fresh = dict(original) | {
-        "offer": dict(original["offer"]) | {"id": 47725426, "machine_id": 41998, "is_bid": False, "dph_total": 1.111111},  # type: ignore[arg-type]
+        "offer": dict(original["offer"]) | {"id": 47725426, "machine_id": 41998, "is_bid": False, "rentable": True, "rented": False, "dph_total": 1.111111},  # type: ignore[arg-type]
         "search_mode": "on_demand", "requested_storage_gb": 300,
         "recovery_receipt": str(receipt_path),
     }
@@ -2040,7 +2074,7 @@ def test_direct_gpu_retry_accepts_released_recovery_on_different_offer_and_machi
         sleep=lambda _: None,
     )
     fresh = dict(original) | {
-        "offer": dict(original["offer"]) | {"id": 9, "machine_id": 140800, "is_bid": False},  # type: ignore[arg-type]
+        "offer": dict(original["offer"]) | {"id": 9, "machine_id": 140800, "is_bid": False, "rentable": True, "rented": False},  # type: ignore[arg-type]
         "search_mode": "on_demand", "requested_storage_gb": 300,
         "recovery_receipt": str(recovery["recovery_receipt"]),
     }
@@ -2171,7 +2205,7 @@ def test_absent_recovery_consumer_accepts_only_a_different_offer_and_machine(
         request=recovery, runner=runner, now_unix=lambda: next(clock), sleep=lambda _: None,
     )
     fresh = dict(original) | {
-        "offer": dict(original["offer"]) | {"id": 9, "machine_id": 140800, "is_bid": False},  # type: ignore[arg-type]
+        "offer": dict(original["offer"]) | {"id": 9, "machine_id": 140800, "is_bid": False, "rentable": True, "rented": False},  # type: ignore[arg-type]
         "search_mode": "on_demand", "requested_storage_gb": 300,
         "recovery_receipt": str(recovery["recovery_receipt"]),
     }
@@ -2592,10 +2626,13 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
     def runner(command: tuple[str, ...]) -> str:
         commands.append(command)
         if command == (
-            "vastai", "--raw", "search", "offers", "id = 8",
+            "vastai", "--raw", "search", "offers", "machine_id=10 num_gpus=1 gpu_ram>=96",
             "--on-demand", "--storage", "300",
         ):
-            return json.dumps([evidence["offer"]])
+            return json.dumps([
+                dict(evidence["offer"]) | {"id": 7},
+                dict(evidence["offer"]) | {"id": 9},
+            ])
         if command[:4] in {
             ("vastai", "--raw", "show", "instances"),
             ("vastai", "--raw", "show", "volumes"),
@@ -2630,7 +2667,7 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
         "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
     ) in commands
     assert (
-        "vastai", "--raw", "search", "offers", "id = 8",
+        "vastai", "--raw", "search", "offers", "machine_id=10 num_gpus=1 gpu_ram>=96",
         "--on-demand", "--storage", "300",
     ) in commands
     assert not any("--interruptible" in command or "--bid_price" in command for command in commands)
