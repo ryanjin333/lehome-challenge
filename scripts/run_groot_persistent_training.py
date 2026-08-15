@@ -41,6 +41,9 @@ RUNTIME_PILOT_READINESS_POLLS = 120
 RUNTIME_GPU_WARMUP_READINESS_POLLS = 120
 RUNTIME_SSH_ATTESTATION_POLLS = 12
 RUNTIME_ABSENCE_READBACK_POLLS = 12
+RUNTIME_GPU_RECOVERY_GRACE_SECONDS = 300
+RUNTIME_GPU_RECOVERY_OBSERVATION_POLLS = 12
+RUNTIME_GPU_RECOVERY_POLL_SECONDS = 5.0
 RUNTIME_GPU_ARCH_TIMEOUT_SECONDS = 15
 RUNTIME_GPU_PROBE_TIMEOUT_SECONDS = 600
 RUNTIME_GPU_PROBE_CALL_TIMEOUT_SECONDS = 620
@@ -283,7 +286,7 @@ def _tree_readback_sha256(root: Path) -> str:
 
 
 _STABLE_INSTANCE_FIELDS = (
-    "id", "actual_status", "gpu_name", "gpu_ram", "num_gpus", "dph_total",
+    "id", "machine_id", "actual_status", "gpu_name", "gpu_ram", "num_gpus", "dph_total",
     "ssh_host", "ssh_port", "driver_version",
 )
 
@@ -355,7 +358,12 @@ def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: 
     instances = _json(runner, ("vastai", "--raw", "show", "instances"))
     volumes = _json(runner, ("vastai", "--raw", "show", "volumes"))
     if not all(isinstance(value, list) for value in (offers, instances, volumes)): raise ValueError("provider listing is invalid")
-    eligible = [row for row in offers if isinstance(row, Mapping) and _offer_gpu(row) and row.get("num_gpus") == 1 and float(row.get("dph_total", 99)) < 1]
+    eligible = [
+        row for row in offers if isinstance(row, Mapping) and _positive_int(row.get("machine_id"))
+        and _offer_gpu(row) and row.get("num_gpus") == 1
+        and type(row.get("dph_total")) in (int, float) and math.isfinite(float(row["dph_total"]))
+        and float(row["dph_total"]) < 1
+    ]
     if not eligible: raise ValueError("no interruptible RTX PRO 6000 96GB offer under $1/hr")
     offer = min(eligible, key=lambda row: float(row["dph_total"]))
     storage_unit_cost = offer.get("storage_cost", offer.get("storage_cost_per_gb"))
@@ -376,7 +384,7 @@ def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: 
     total = existing_instance_total + existing_storage_total + float(offer["dph_total"])
     _require_account_cap(total, label="captured offer")
     captured = int(time.time()) if now_unix is None else now_unix
-    safe_offer = _project(offer, ("id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "dph_base", "storage_cost", "storage_cost_per_gb", "min_bid", "driver_version", "is_bid", "image"))
+    safe_offer = _project(offer, ("id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "dph_base", "storage_cost", "storage_cost_per_gb", "min_bid", "driver_version", "is_bid", "image"))
     return {"schema_version": 1, "kind": "persistent_training_offer", "offer": safe_offer, "account_hourly_total_usd": total, "existing_instance_hourly_total_usd": existing_instance_total, "existing_storage_hourly_total_usd": existing_storage_total, "requested_storage_gb": 300, "requested_storage_hourly_usd": requested_storage_hourly, "storage_quote_included_in_dph_total": True, "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds, "search_mode": "interruptible"}
 
 
@@ -667,7 +675,10 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
     try:
         _require_vast_ssh_identity()
         offer = evidence.get("offer")
-        if not isinstance(offer, Mapping) or type(offer.get("id")) is not int: raise ValueError("offer evidence is invalid")
+        if (
+            not isinstance(offer, Mapping) or not _positive_int(offer.get("id"))
+            or (abort_request is not None and not _positive_int(offer.get("machine_id")))
+        ): raise ValueError("offer evidence is invalid")
         if evidence.get("search_mode") != "interruptible" or type(evidence.get("expires_at_unix")) is not int or evidence["expires_at_unix"] < int(time.time()): raise ValueError("offer evidence is expired or not interruptible")
         image = _trainer_image(evidence.get("trainer_image"))
         capability = evidence.get("training_capability")
@@ -709,9 +720,9 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
             sleep(5.0)
         else:
             raise ValueError("instance readiness poll timed out")
-        if not isinstance(live, Mapping) or live.get("id") != instance_id or not _offer_gpu(live) or live.get("num_gpus") != 1 or not live.get("ssh_host") or type(live.get("ssh_port")) is not int or float(live.get("dph_total", 99)) >= 1:
+        if not isinstance(live, Mapping) or live.get("id") != instance_id or (abort_request is not None and live.get("machine_id") != offer.get("machine_id")) or not _offer_gpu(live) or live.get("num_gpus") != 1 or not live.get("ssh_host") or type(live.get("ssh_port")) is not int or float(live.get("dph_total", 99)) >= 1:
             raise ValueError("instance readback does not match accepted offer")
-        return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "host": live.get("ssh_host"), "port": live.get("ssh_port"), "trainer_image": image, "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _stable_instance_identity(live), "account_hourly_total_usd": _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")}
+        return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "machine_id": live.get("machine_id"), "host": live.get("ssh_host"), "port": live.get("ssh_port"), "trainer_image": image, "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _stable_instance_identity(live), "account_hourly_total_usd": _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")}
     except BaseException as error:
         if abort_request is not None:
             _runtime_abort_cleanup(
@@ -1416,7 +1427,13 @@ def _validated_runtime_pilot(path_value: object) -> dict[str, object]:
     )
 
 
-def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> dict[str, object]:
+def _positive_int(value: object) -> bool:
+    return type(value) is int and int(value) > 0
+
+
+def _runtime_gpu_rent_preflight(
+    request: Mapping[str, object], *, recovery_safe: bool = False,
+) -> dict[str, object]:
     """Validate direct-GPU immutable source bindings before provider create."""
     if "training_capability" in request:
         raise ValueError("direct runtime GPU rent derives capability on its single lease")
@@ -1424,12 +1441,12 @@ def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> dict[str, obje
     _runtime_parent_checkpoint(request)
     _require_vast_ssh_identity()
     offer = request.get("offer")
-    if not isinstance(offer, Mapping) or type(offer.get("id")) is not int:
+    if not isinstance(offer, Mapping) or not _positive_int(offer.get("id")):
         raise ValueError("runtime GPU rent requires a fresh concrete offer before claiming a lease")
     if (
         request.get("search_mode") != "interruptible"
         or type(request.get("expires_at_unix")) is not int
-        or request["expires_at_unix"] < int(time.time())
+        or (not recovery_safe and request["expires_at_unix"] < int(time.time()))
         or _trainer_image(request.get("trainer_image")) != BOOTSTRAP_TRAINER_IMAGE
     ):
         raise ValueError("runtime GPU rent offer is not a fresh pinned interruptible lease")
@@ -1437,8 +1454,9 @@ def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> dict[str, obje
     quote = offer.get("dph_total")
     bid = offer.get("min_bid", quote)
     if (
-        type(quote) not in (int, float) or float(quote) < 0
-        or type(bid) not in (int, float) or float(bid) >= 1
+        type(quote) not in (int, float) or not math.isfinite(float(quote)) or float(quote) < 0
+        or type(bid) not in (int, float) or not math.isfinite(float(bid)) or float(bid) >= 1
+        or not recovery_safe and not _positive_int(offer.get("machine_id"))
     ):
         raise ValueError("runtime GPU rent offer price is invalid")
     bundle = request.get("code_bundle")
@@ -1450,18 +1468,24 @@ def _runtime_gpu_rent_preflight(request: Mapping[str, object]) -> dict[str, obje
     ) != request.get("code_bundle_sha256"):
         raise ValueError("runtime GPU rent code bundle differs from its immutable binding")
     output = request.get("bootstrap_capability_receipt")
-    if (
+    if not recovery_safe and (
         type(output) is not str or not Path(output).is_absolute()
         or Path(output).exists() or Path(output).is_symlink()
     ):
         raise ValueError("runtime GPU rent requires an absent bootstrap capability receipt")
-    _runtime_gpu_rent_claim_path(request=request, identity=identity)
+    claim_path = _runtime_gpu_rent_claim_path(
+        request=request, identity=identity, allow_held=recovery_safe,
+    )
+    if not recovery_safe:
+        _validate_runtime_gpu_recovery_for_new_rent(
+            request=request, identity=identity, claim_path=claim_path,
+        )
     return identity
 
 
 def _runtime_gpu_rent_claim_path(
     *, request: Mapping[str, object], identity: Mapping[str, object],
-    require_request_path: bool = True,
+    require_request_path: bool = True, allow_held: bool = False,
 ) -> Path:
     """Use one controller-owned claim namespace per immutable direct campaign."""
     identity_key = {
@@ -1488,7 +1512,7 @@ def _runtime_gpu_rent_claim_path(
     path = root / (_hash(identity_key) + ".json")
     if require_request_path and request.get("rent_claim_receipt") != str(path):
         raise ValueError("runtime GPU rent claim receipt must use the controller-owned canonical path")
-    if path.exists() or path.is_symlink():
+    if not allow_held and (path.exists() or path.is_symlink()):
         raise ValueError("runtime GPU rent claim is already held; no provider action was taken")
     return path
 
@@ -1566,6 +1590,347 @@ def _block_runtime_gpu_rent_claim(
     atomic_write_json(path, dict(claim) | {
         "status": "blocked", "error_type": type(error).__name__,
     })
+
+
+def _fsync_parent(path: Path) -> None:
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_exclusive_json(path: Path, value: Mapping[str, object]) -> None:
+    """Create controller evidence once, and make both file and name durable."""
+    _write_exclusive_bytes(path, canonical_json_bytes(dict(value)))
+
+
+def _write_exclusive_bytes(path: Path, payload: bytes) -> None:
+    """Create immutable byte evidence exactly as it was authenticated."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _fsync_parent(path)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _replace_json_durably(path: Path, value: Mapping[str, object]) -> None:
+    """Atomically replace an already-owned recovery receipt and fsync its name."""
+    temporary = path.with_name("." + path.name + ".tmp-" + hashlib.sha256(os.urandom(16)).hexdigest())
+    try:
+        _write_exclusive_json(temporary, value)
+        os.replace(temporary, path)
+        _fsync_parent(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _runtime_gpu_claim_immutable(
+    *, claim: Mapping[str, object], identity: Mapping[str, object], request: Mapping[str, object],
+) -> bool:
+    expected = {
+        "schema_version": 1, "kind": "runtime_mixture_gpu_rent_claim",
+        "code_revision": request.get("code_revision"),
+        "code_bundle_sha256": request.get("code_bundle_sha256"),
+        "bc_revision": identity["bc"]["immutable_revision"],
+        "bc_receipt_sha256": identity["bc_receipt_sha256"],
+        "rollout_revision": identity["rollout"]["immutable_revision"],
+        "rollout_prefix": identity["rollout"]["remote_prefix"],
+        "rollout_receipt_sha256": identity["rollout_receipt_sha256"],
+        "deployment_revision": identity["deployment"]["immutable_revision"],
+        "mixture_id": identity["deployment"]["mixture_id"],
+        "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
+        "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
+        "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+    }
+    return all(claim.get(key) == value for key, value in expected.items())
+
+
+def _valid_blocked_runtime_gpu_claim(
+    *, claim: Mapping[str, object], identity: Mapping[str, object], request: Mapping[str, object],
+) -> bool:
+    fields = {
+        "schema_version", "kind", "status", "error_type", "request_sha256", "offer_sha256",
+        "bootstrap_capability_receipt", "code_revision", "code_bundle_sha256",
+        "bc_revision", "bc_receipt_sha256", "rollout_revision", "rollout_prefix",
+        "rollout_receipt_sha256", "deployment_revision", "mixture_id",
+        "deployment_receipt_sha256", "parent_archive_sha256",
+        "parent_checkpoint_artifact_sha256",
+    }
+    return (
+        set(claim) == fields
+        and claim.get("status") == "blocked"
+        and claim.get("error_type") == "RuntimeGpuRentOutcome"
+        and isinstance(claim.get("bootstrap_capability_receipt"), str)
+        and all(re.fullmatch(r"[0-9a-f]{64}", str(claim.get(key))) for key in ("request_sha256", "offer_sha256", "code_bundle_sha256", "bc_receipt_sha256", "rollout_receipt_sha256", "deployment_receipt_sha256", "parent_archive_sha256", "parent_checkpoint_artifact_sha256"))
+        and _runtime_gpu_claim_immutable(claim=claim, identity=identity, request=request)
+    )
+
+
+def _runtime_gpu_recovery_receipt_path(claim_path: Path) -> Path:
+    return claim_path.with_name(claim_path.stem + ".recovery.json")
+
+
+def _runtime_gpu_recovery_archive_path(claim_path: Path, claim_bytes_sha256: str) -> Path:
+    return claim_path.with_name(claim_path.stem + ".blocked-" + claim_bytes_sha256 + ".json")
+
+
+def _runtime_gpu_recovery_archives(
+    *, claim_path: Path, identity: Mapping[str, object], request: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Authenticate every historical archive in this controller-owned namespace."""
+    prefix = claim_path.stem + ".blocked-"
+    rows: list[dict[str, object]] = []
+    digests: set[str] = set()
+    for path in sorted(claim_path.parent.iterdir()):
+        if path != claim_path and path.name.startswith(claim_path.stem + ".") and not path.name.startswith(prefix):
+            raise ValueError("runtime GPU recovery archive namespace has an unrelated file")
+        if not path.name.startswith(prefix):
+            continue
+        digest = path.name[len(prefix):-5] if path.name.endswith(".json") else ""
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None or path.is_symlink() or not path.is_file():
+            raise ValueError("runtime GPU recovery archive namespace is malformed")
+        raw = path.read_bytes()
+        actual = hashlib.sha256(raw).hexdigest()
+        if actual != digest or actual in digests:
+            raise ValueError("runtime GPU recovery archive hash is ambiguous")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            raise ValueError("runtime GPU recovery archive is malformed") from None
+        if not isinstance(value, Mapping) or not _valid_blocked_runtime_gpu_claim(
+            claim=value, identity=identity, request=request,
+        ):
+            raise ValueError("runtime GPU recovery archive is not a matching blocked claim")
+        digests.add(actual)
+        rows.append({
+            "relative_filename": path.name, "byte_sha256": actual,
+            "request_sha256": value["request_sha256"], "offer_sha256": value["offer_sha256"],
+            "reconciled_machine_id": None, "original_offer_id": None,
+        })
+    return rows
+
+
+def _runtime_gpu_recovery_request(
+    request: Mapping[str, object],
+) -> tuple[Path, int, Path]:
+    fields = {
+        "schema_version", "kind", "blocked_rent_request", "expected_original_machine_id",
+        "recovery_receipt",
+    }
+    if (
+        set(request) != fields or request.get("schema_version") != 1
+        or request.get("kind") != "runtime_mixture_gpu_rent_recovery"
+        or not isinstance(request.get("blocked_rent_request"), str)
+        or not _positive_int(request.get("expected_original_machine_id"))
+        or not isinstance(request.get("recovery_receipt"), str)
+    ):
+        raise ValueError("runtime GPU recovery request schema is invalid")
+    blocked = Path(str(request["blocked_rent_request"]))
+    receipt = Path(str(request["recovery_receipt"]))
+    if (
+        not blocked.is_absolute() or blocked.is_symlink() or not blocked.is_file()
+        or not receipt.is_absolute() or receipt.exists() or receipt.is_symlink()
+    ):
+        raise ValueError("runtime GPU recovery paths are unsafe or unavailable")
+    return blocked, int(request["expected_original_machine_id"]), receipt
+
+
+def _runtime_gpu_recovery_live_offer(
+    *, runner: Runner, original_offer_id: int, expected_machine_id: int,
+) -> dict[str, object]:
+    value = _json(runner, (
+        "vastai", "--raw", "search", "offers", OFFER_QUERY, "--interruptible", "--storage", "300",
+    ))
+    if not isinstance(value, list):
+        raise ValueError("runtime GPU recovery offer search is invalid")
+    matching = [row for row in value if isinstance(row, Mapping) and row.get("id") == original_offer_id]
+    if len(matching) != 1:
+        raise ValueError("runtime GPU recovery original offer is missing or ambiguous")
+    offer = matching[0]
+    if (
+        not _positive_int(offer.get("machine_id")) or offer.get("machine_id") != expected_machine_id
+        or not _offer_gpu(offer) or offer.get("num_gpus") != 1
+        or type(offer.get("dph_total")) not in (int, float)
+        or not math.isfinite(float(offer["dph_total"])) or float(offer["dph_total"]) >= 1
+    ):
+        raise ValueError("runtime GPU recovery original offer drifted")
+    safe = _project(offer, (
+        "id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "dph_base",
+        "storage_cost", "storage_cost_per_gb", "min_bid", "driver_version", "is_bid", "image",
+    ))
+    return safe
+
+
+def _recovery_now(now_unix: int | Callable[[], int] | None) -> int:
+    value = int(time.time()) if now_unix is None else (now_unix() if callable(now_unix) else now_unix)
+    if type(value) is not int:
+        raise ValueError("runtime GPU recovery clock is invalid")
+    return value
+
+
+def recover_runtime_gpu_rent(
+    *, request: Mapping[str, object], runner: Runner,
+    now_unix: int | Callable[[], int] | None = None,
+    sleep: Callable[[float], None] = _bounded_sleep,
+) -> dict[str, object]:
+    """Fail-closed, read-only reconciliation before one blocked lease is released."""
+    blocked_path, expected_machine_id, receipt_path = _runtime_gpu_recovery_request(request)
+    original = dict(_load_regular_json(blocked_path, "blocked runtime GPU rent request"))
+    identity = _runtime_gpu_rent_preflight(original, recovery_safe=True)
+    claim_path = _runtime_gpu_rent_claim_path(
+        request=original, identity=identity, allow_held=True,
+    )
+    if str(receipt_path) != str(_runtime_gpu_recovery_receipt_path(claim_path)):
+        raise ValueError("runtime GPU recovery receipt must use the controller-owned canonical path")
+    if claim_path.is_symlink() or not claim_path.is_file():
+        raise ValueError("runtime GPU recovery canonical blocked claim is unavailable")
+    claim_bytes = claim_path.read_bytes()
+    claim_sha256 = hashlib.sha256(claim_bytes).hexdigest()
+    try:
+        claim_value = json.loads(claim_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        raise ValueError("runtime GPU recovery canonical claim is malformed") from None
+    if not isinstance(claim_value, Mapping) or not _valid_blocked_runtime_gpu_claim(
+        claim=claim_value, identity=identity, request=original,
+    ):
+        raise ValueError("runtime GPU recovery canonical claim is not a matching blocked claim")
+    original_request_sha = _hash({key: value for key, value in original.items() if key != "rent_claim_receipt"})
+    original_offer = original.get("offer")
+    if (
+        claim_value.get("request_sha256") != original_request_sha
+        or not isinstance(original_offer, Mapping) or not _positive_int(original_offer.get("id"))
+        or claim_value.get("offer_sha256") != _hash(dict(original_offer))
+    ):
+        raise ValueError("runtime GPU recovery canonical claim does not bind the original request")
+    archives = _runtime_gpu_recovery_archives(
+        claim_path=claim_path, identity=identity, request=original,
+    )
+    expires = original.get("expires_at_unix")
+    if type(expires) is not int or _recovery_now(now_unix) < expires + RUNTIME_GPU_RECOVERY_GRACE_SECONDS:
+        raise ValueError("runtime GPU recovery grace period has not elapsed")
+    initial_receipt = {
+        "schema_version": 1, "kind": "runtime_mixture_gpu_rent_recovery_receipt",
+        "status": "observing", "released": False, "canonical_claim_sha256": claim_sha256,
+    }
+    _write_exclusive_json(receipt_path, initial_receipt)
+    released = False
+    try:
+        start_offer = _runtime_gpu_recovery_live_offer(
+            runner=runner, original_offer_id=int(original_offer["id"]),
+            expected_machine_id=expected_machine_id,
+        )
+        observations: list[dict[str, object]] = []
+        for _ in range(RUNTIME_GPU_RECOVERY_OBSERVATION_POLLS):
+            timestamp = _recovery_now(now_unix)
+            instances = _json(runner, ("vastai", "--raw", "show", "instances"))
+            volumes = _json(runner, ("vastai", "--raw", "show", "volumes"))
+            if instances != [] or volumes != []:
+                raise ValueError("runtime GPU recovery provider account is not provably empty")
+            observations.append({
+                "timestamp_unix": timestamp,
+                "instances_sha256": _hash(instances), "volumes_sha256": _hash(volumes),
+            })
+            sleep(RUNTIME_GPU_RECOVERY_POLL_SECONDS)
+        end_offer = _runtime_gpu_recovery_live_offer(
+            runner=runner, original_offer_id=int(original_offer["id"]),
+            expected_machine_id=expected_machine_id,
+        )
+        archive_path = _runtime_gpu_recovery_archive_path(claim_path, claim_sha256)
+        archived_current = {
+            "relative_filename": archive_path.name, "byte_sha256": claim_sha256,
+            "request_sha256": claim_value["request_sha256"], "offer_sha256": claim_value["offer_sha256"],
+            "reconciled_machine_id": expected_machine_id, "original_offer_id": original_offer["id"],
+        }
+        final = {
+            "schema_version": 1, "kind": "runtime_mixture_gpu_rent_recovery_receipt",
+            "status": "reconciled", "released": False,
+            "canonical_claim_path": str(claim_path), "canonical_claim_sha256": claim_sha256,
+            "archive_claims": archives + [archived_current], "original_offer_id": original_offer["id"],
+            "reconciled_machine_id": expected_machine_id,
+            "observations": observations, "start_offer_proof": start_offer,
+            "start_offer_proof_sha256": _hash(start_offer), "end_offer_proof": end_offer,
+            "end_offer_proof_sha256": _hash(end_offer),
+        }
+        _replace_json_durably(receipt_path, final)
+        if claim_path.is_symlink() or claim_path.read_bytes() != claim_bytes:
+            raise RuntimeError("runtime GPU recovery canonical claim changed before archive")
+        _write_exclusive_bytes(archive_path, claim_bytes)
+        if archive_path.read_bytes() != claim_bytes:
+            raise RuntimeError("runtime GPU recovery archive readback mismatches canonical claim")
+        claim_path.unlink()
+        _fsync_parent(claim_path)
+        released_final = final | {"released": True, "status": "released", "archive_path": str(archive_path)}
+        _replace_json_durably(receipt_path, released_final)
+        if dict(_load_regular_json(receipt_path, "runtime GPU recovery receipt")) != released_final:
+            raise RuntimeError("runtime GPU recovery receipt readback mismatches")
+        released = True
+        return {"paid_action": False, "action": "runtime-gpu-rent-recover", "recovery_receipt": released_final}
+    except BaseException:
+        if not released:
+            try:
+                if (
+                    receipt_path.exists() and not receipt_path.is_symlink()
+                    and claim_path.is_file() and not claim_path.is_symlink()
+                    and claim_path.read_bytes() == claim_bytes
+                    and _load_regular_json(receipt_path, "runtime GPU recovery receipt").get("released") is False
+                ):
+                    receipt_path.unlink()
+                    _fsync_parent(receipt_path)
+            except BaseException:
+                pass
+        raise
+
+
+def _validate_runtime_gpu_recovery_for_new_rent(
+    *, request: Mapping[str, object], identity: Mapping[str, object], claim_path: Path,
+) -> None:
+    """A recovered claim may be retried exactly once on another offer and machine."""
+    recovery_path = _runtime_gpu_recovery_receipt_path(claim_path)
+    namespace = list(claim_path.parent.glob(claim_path.stem + ".blocked-*.json"))
+    if not namespace and not recovery_path.exists():
+        return
+    if request.get("recovery_receipt") != str(recovery_path):
+        raise ValueError("runtime GPU rent requires the canonical recovery receipt")
+    receipt = _load_regular_json(recovery_path, "runtime GPU recovery receipt")
+    fields = {
+        "schema_version", "kind", "status", "released", "canonical_claim_path",
+        "canonical_claim_sha256", "archive_claims", "original_offer_id", "reconciled_machine_id",
+        "observations", "start_offer_proof", "start_offer_proof_sha256", "end_offer_proof",
+        "end_offer_proof_sha256", "archive_path",
+    }
+    if set(receipt) != fields or receipt.get("schema_version") != 1 or receipt.get("kind") != "runtime_mixture_gpu_rent_recovery_receipt" or receipt.get("status") != "released" or receipt.get("released") is not True or receipt.get("canonical_claim_path") != str(claim_path):
+        raise ValueError("runtime GPU recovery receipt is not a released canonical recovery")
+    archive_path = _runtime_gpu_recovery_archive_path(
+        claim_path, str(receipt.get("canonical_claim_sha256")),
+    ) if re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("canonical_claim_sha256"))) else None
+    if (
+        archive_path is None or receipt.get("archive_path") != str(archive_path)
+        or archive_path.is_symlink() or not archive_path.is_file()
+        or hashlib.sha256(archive_path.read_bytes()).hexdigest() != receipt.get("canonical_claim_sha256")
+        or not _positive_int(receipt.get("original_offer_id"))
+        or not _positive_int(receipt.get("reconciled_machine_id"))
+    ):
+        raise ValueError("runtime GPU recovery receipt archive is invalid")
+    try:
+        archived_claim = json.loads(archive_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("runtime GPU recovery receipt archive is invalid") from None
+    if not isinstance(archived_claim, Mapping) or not _valid_blocked_runtime_gpu_claim(
+        claim=archived_claim, identity=identity, request=request,
+    ):
+        raise ValueError("runtime GPU recovery receipt archive is not a matching blocked claim")
+    offer = request.get("offer")
+    if (
+        not isinstance(offer, Mapping) or offer.get("id") == receipt.get("original_offer_id")
+        or offer.get("machine_id") == receipt.get("reconciled_machine_id")
+    ):
+        raise ValueError("runtime GPU recovery retry requires a different offer and machine")
 
 
 def _runtime_gpu_bootstrap_capability(
@@ -3522,7 +3887,7 @@ def main_for_test(
     argv: list[str], *, runner: Runner = _run,
     transport_factory: Callable[..., HubTransport] = HuggingFaceHubTransport,
 ) -> dict[str, object]:
-    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "capture-runtime-pilot-offer", "bootstrap-canary", "promote", "replacement-resume", "rent", "runtime-pilot-rent", "runtime-gpu-warmup-rent", "stage", "runtime-pilot-plan", "runtime-bootstrap-stage", "runtime-warmup-stage", "runtime-stage", "runtime-hydrate", "runtime-pilot-run", "runtime-gpu-warmup", "runtime-train", "runtime-checkpoint-publish", "runtime-checkpoint-complete", "runtime-checkpoint-interrupted", "runtime-checkpoint-replacement-resume", "runtime-checkpoint-dispose", "tune", "train", "status", "resume", "destroy", "runtime-pilot-destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "capture-runtime-pilot-offer", "bootstrap-canary", "promote", "replacement-resume", "rent", "runtime-pilot-rent", "runtime-gpu-warmup-rent", "runtime-gpu-rent-recover", "stage", "runtime-pilot-plan", "runtime-bootstrap-stage", "runtime-warmup-stage", "runtime-stage", "runtime-hydrate", "runtime-pilot-run", "runtime-gpu-warmup", "runtime-train", "runtime-checkpoint-publish", "runtime-checkpoint-complete", "runtime-checkpoint-interrupted", "runtime-checkpoint-replacement-resume", "runtime-checkpoint-dispose", "tune", "train", "status", "resume", "destroy", "runtime-pilot-destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "materialize":
         return _materialize(request)
@@ -3557,6 +3922,7 @@ def main_for_test(
         return {"paid_action": False, "action": "prepare", "organizer_source": ORGANIZER_SOURCE, "corrective_source": CORRECTIVE_SOURCE, "request": request}
     if not args.execute: return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
     if args.action == "capture-offers": return capture_offers(runner=runner)
+    if args.action == "runtime-gpu-rent-recover": return recover_runtime_gpu_rent(request=request, runner=runner)
     if args.action == "capture-runtime-pilot-offer": return capture_runtime_pilot_offer(runner=runner)
     if args.action == "bootstrap-canary": return bootstrap_canary(evidence=request, runner=runner)
     if args.action == "promote": return {"paid_action": True, "action": "promote", "instance": promote_canary(capability_receipt=request, runner=runner)}
