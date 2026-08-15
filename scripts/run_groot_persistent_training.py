@@ -53,6 +53,7 @@ RUNTIME_GPU_LEGACY_RECOVERY_BLACKLISTED_MACHINE_ID = 140799
 RUNTIME_GPU_ARCH_TIMEOUT_SECONDS = 15
 RUNTIME_GPU_PROBE_TIMEOUT_SECONDS = 600
 RUNTIME_GPU_PROBE_CALL_TIMEOUT_SECONDS = 620
+RUNTIME_GPU_PROBE_DIAGNOSTIC_LIMIT = 240
 _RUNTIME_PILOT_OFFER_FIELDS = (
     "id", "ask_contract_id", "machine_id", "cpu_arch", "cpu_cores_effective", "cpu_ram",
     "disk_space", "disk_bw", "inet_down", "reliability", "num_gpus", "dph_total",
@@ -77,6 +78,129 @@ VAST_SSH_IDENTITY = Path(
 
 class RuntimeResumeAlreadyClaimed(ValueError):
     """A successful replacement may not hydrate the same cursor twice."""
+
+
+class RuntimeGpuBootstrapProbeError(ValueError):
+    """A redacted, stage-bound failure from the single-lease GPU capability probe."""
+
+    def __init__(self, *, stage: str, executable: str, stderr: str) -> None:
+        self.stage = stage
+        self.executable = executable
+        self.stderr = _sanitize_runtime_gpu_probe_stderr(stderr)
+        super().__init__(f"runtime GPU bootstrap probe failed at {stage}")
+
+
+_RUNTIME_GPU_PROBE_EXECUTABLES = {
+    "clone": "/usr/bin/git",
+    "checkout": "/usr/bin/git",
+    "revision": "/usr/bin/git",
+    "clean": "/usr/bin/git",
+    "capability": "/opt/runtime/bin/python",
+}
+
+
+def _sanitize_runtime_gpu_probe_stderr(value: object) -> str:
+    """Keep a short useful diagnostic without serializing paths or credentials."""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    elif isinstance(value, str):
+        text = value
+    else:
+        return "unavailable"
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    text = re.sub(
+        r"(?i)\b(hf_token|token|authorization|bearer|password|secret|api[_-]?key)\b\s*(?:=|:)?\s*[^\s;,:]+",
+        "<credential>", text,
+    )
+    text = re.sub(r"(?i)https?://[^\s]+", "<url>", text)
+    text = re.sub(r"(?<![A-Za-z0-9_.-])/(?:[^\s:;]+)", "<path>", text)
+    text = " ".join(text.split())
+    return (text[:RUNTIME_GPU_PROBE_DIAGNOSTIC_LIMIT] or "unavailable")
+
+
+def _runtime_gpu_probe_command(code_revision: str) -> str:
+    """The exact capability command, independent of SSH's non-interactive PATH."""
+    if re.fullmatch(r"[0-9a-f]{40}", code_revision) is None:
+        raise ValueError("runtime GPU probe requires an immutable code revision")
+    remote = "/tmp/lehome-runtime-gpu-bootstrap"
+    stage = "LEHOME_RUNTIME_GPU_PROBE_STAGE="
+    return (
+        "set -eu; "
+        + f"printf '%s\\n' '{stage}clone' >&2; /usr/bin/git clone --quiet --no-checkout {remote}/code.bundle /prepared/bootstrap-code; "
+        + f"printf '%s\\n' '{stage}checkout' >&2; /usr/bin/git -C /prepared/bootstrap-code checkout --quiet --detach {code_revision}; "
+        + f"printf '%s\\n' '{stage}revision' >&2; test \"$(/usr/bin/git -C /prepared/bootstrap-code rev-parse HEAD)\" = {code_revision}; "
+        + f"printf '%s\\n' '{stage}clean' >&2; test -z \"$(/usr/bin/git -C /prepared/bootstrap-code status --porcelain)\"; "
+        + f"printf '%s\\n' '{stage}capability' >&2; /usr/bin/timeout {RUNTIME_GPU_PROBE_TIMEOUT_SECONDS} /usr/bin/env -u HF_TOKEN "
+        + "PYTHONPATH=/prepared/bootstrap-code/source/lehome:/prepared/bootstrap-code/trainer/src "
+        + "/opt/runtime/bin/python -m lehome_train.cli validate-training-capability --one-step --image-digest "
+        + BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
+    )
+
+
+def _runtime_gpu_probe_error(error: BaseException) -> RuntimeGpuBootstrapProbeError:
+    """Classify only controller-authored stage markers; never retain raw command text."""
+    raw = getattr(error, "stderr", None)
+    if raw is None:
+        raw = getattr(error, "output", None)
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", errors="replace")
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        text = "unavailable"
+    matches = re.findall(r"LEHOME_RUNTIME_GPU_PROBE_STAGE=(clone|checkout|revision|clean|capability)", text)
+    stage = matches[-1] if matches else "unknown"
+    return RuntimeGpuBootstrapProbeError(
+        stage=stage, executable=_RUNTIME_GPU_PROBE_EXECUTABLES.get(stage, "unavailable"), stderr=text,
+    )
+
+
+def _runtime_gpu_exact_image_preflight(*, bundle: Path, code_revision: str) -> dict[str, object]:
+    """Run the literal SSH probe prerequisites locally before a paid direct-GPU lease."""
+    if not bundle.is_file() or bundle.is_symlink():
+        raise ValueError("runtime GPU image preflight requires a regular code bundle")
+    command = (
+        "docker", "run", "--rm", "--platform", "linux/amd64", "--entrypoint", "/bin/sh",
+        "--mount", "type=bind,src=" + str(bundle.resolve())
+        + ",dst=/tmp/lehome-runtime-gpu-bootstrap/code.bundle,readonly",
+        BOOTSTRAP_TRAINER_IMAGE, "-lc", _runtime_gpu_probe_command(code_revision),
+    )
+    try:
+        completed = subprocess.run(
+            command, check=False, text=True, capture_output=True,
+            timeout=RUNTIME_GPU_PROBE_CALL_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError("runtime GPU exact-image preflight could not run Docker") from error
+    stderr = completed.stderr or ""
+    if completed.returncode == 0:
+        return {
+            "provider_free": True, "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
+            "code_revision": code_revision, "cli_import": "passed", "cuda_step": "passed",
+        }
+    if completed.returncode == 1 and "training capability requires CUDA" in stderr:
+        return {
+            "provider_free": True, "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
+            "code_revision": code_revision, "cli_import": "passed", "cuda_step": "not_run_no_local_gpu",
+        }
+    raise _runtime_gpu_probe_error(subprocess.CalledProcessError(
+        completed.returncode, command, output=completed.stdout, stderr=stderr,
+    ))
+
+
+def _runtime_gpu_exact_image_preflight_from_request(request: Mapping[str, object]) -> dict[str, object]:
+    """Bind the local exact-image proof to the same reviewed bundle used by rent."""
+    bundle = request.get("code_bundle")
+    receipt = request.get("code_bundle_sha256_file")
+    revision = request.get("code_revision")
+    if type(bundle) is not str or type(receipt) is not str or type(revision) is not str:
+        raise ValueError("runtime GPU image preflight requires reviewed code bundle bindings")
+    bundle_sha = _verify_reviewed_code_bundle(Path(bundle), Path(receipt), revision)
+    if bundle_sha != request.get("code_bundle_sha256"):
+        raise ValueError("runtime GPU image preflight code bundle differs from its immutable binding")
+    return _runtime_gpu_exact_image_preflight(bundle=Path(bundle), code_revision=revision) | {
+        "code_bundle_sha256": bundle_sha,
+    }
 
 
 class RuntimeGpuRentOutcome(ValueError):
@@ -607,16 +731,23 @@ def _runtime_abort_cleanup(
     instance_id = instance.get("instance_id")
     if type(instance_id) is not int:
         return
+    probe_error = error if isinstance(error, RuntimeGpuBootstrapProbeError) else None
     receipt = {
         "schema_version": 1, "kind": "runtime_mixture_abort_cleanup", "instance_id": instance_id,
         "provider_response_sha256": instance.get("provider_response_sha256"),
         "code_revision": request.get("code_revision"), "code_bundle_sha256": request.get("code_bundle_sha256"),
         "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
-        # Failure receipts deliberately never serialize command output or exception
-        # text: either can contain a Hub token or a presigned URL.
         "error_type": type(error).__name__, "error": "redacted remote failure",
         "disposable": False,
     }
+    if probe_error is not None:
+        # Only a controller-authored stage/executable and redacted bounded stderr
+        # may survive.  Raw command output can carry Hub tokens or presigned URLs.
+        receipt |= {
+            "failure_stage": probe_error.stage,
+            "failure_executable": probe_error.executable,
+            "sanitized_stderr": probe_error.stderr,
+        }
     output = _runtime_failure_receipt_path(request)
     def record(extra: Mapping[str, object]) -> None:
         if not output.exists() and not output.is_symlink():
@@ -2384,21 +2515,18 @@ def _runtime_gpu_bootstrap_capability(
     probe_prefix = (
         *probe_prefix[:-1], "-o", f"ConnectTimeout={RUNTIME_GPU_ARCH_TIMEOUT_SECONDS}", probe_prefix[-1],
     )
-    command = (
-        "set -eu; git clone --quiet --no-checkout " + remote + "/code.bundle /prepared/bootstrap-code; "
-        "git -C /prepared/bootstrap-code checkout --quiet --detach " + str(request["code_revision"]) + "; "
-        "test \"$(git -C /prepared/bootstrap-code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; "
-        "test -z \"$(git -C /prepared/bootstrap-code status --porcelain)\"; "
-        "timeout " + str(RUNTIME_GPU_PROBE_TIMEOUT_SECONDS) + " env -u HF_TOKEN PYTHONPATH=/prepared/bootstrap-code/source/lehome:/prepared/bootstrap-code/trainer/src "
-        "python -m lehome_train.cli validate-training-capability --one-step --image-digest "
-        + BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
-    )
+    command = _runtime_gpu_probe_command(str(request["code_revision"]))
     try:
         capability = json.loads(_run_bounded(
             runner, (*probe_prefix, command), timeout_seconds=RUNTIME_GPU_PROBE_CALL_TIMEOUT_SECONDS,
         ))
-    except (json.JSONDecodeError, subprocess.TimeoutExpired) as error:
-        raise ValueError("runtime GPU bootstrap capability probe did not return JSON") from error
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+        raise _runtime_gpu_probe_error(error) from error
+    except json.JSONDecodeError as error:
+        raise RuntimeGpuBootstrapProbeError(
+            stage="capability", executable="/opt/runtime/bin/python",
+            stderr="capability command did not return JSON",
+        ) from error
     if not isinstance(capability, Mapping):
         raise ValueError("runtime GPU bootstrap capability probe did not return a receipt")
     validated = dict(validate_training_capability(capability))
@@ -2700,6 +2828,12 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
     """Promote a fresh direct PRO6000 lease after up to ten minutes of readiness."""
     _runtime_failure_receipt_path(evidence)
     identity = _runtime_gpu_rent_preflight(evidence)
+    # The production CLI uses the real runner.  Tests inject a runner for the
+    # provider boundary and exercise the exact-image check independently.
+    # Therefore no normal paid invocation can create a lease before the local
+    # pinned-image command has resolved every executable and imported the CLI.
+    if runner is _run:
+        _runtime_gpu_exact_image_preflight_from_request(evidence)
     claim_path = _runtime_gpu_rent_claim_path(request=evidence, identity=identity)
     claim = _runtime_gpu_rent_claim(path=claim_path, request=evidence, identity=identity)
     rented: Mapping[str, object] | None = None
@@ -4319,7 +4453,7 @@ def main_for_test(
     argv: list[str], *, runner: Runner = _run,
     transport_factory: Callable[..., HubTransport] = HuggingFaceHubTransport,
 ) -> dict[str, object]:
-    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "capture-runtime-pilot-offer", "capture-runtime-gpu-warmup-offer", "bootstrap-canary", "promote", "replacement-resume", "rent", "runtime-pilot-rent", "runtime-gpu-warmup-rent", "runtime-gpu-rent-recover", "stage", "runtime-pilot-plan", "runtime-bootstrap-stage", "runtime-warmup-stage", "runtime-stage", "runtime-hydrate", "runtime-pilot-run", "runtime-gpu-warmup", "runtime-train", "runtime-checkpoint-publish", "runtime-checkpoint-complete", "runtime-checkpoint-interrupted", "runtime-checkpoint-replacement-resume", "runtime-checkpoint-dispose", "tune", "train", "status", "resume", "destroy", "runtime-pilot-destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "capture-runtime-pilot-offer", "capture-runtime-gpu-warmup-offer", "runtime-gpu-image-preflight", "bootstrap-canary", "promote", "replacement-resume", "rent", "runtime-pilot-rent", "runtime-gpu-warmup-rent", "runtime-gpu-rent-recover", "stage", "runtime-pilot-plan", "runtime-bootstrap-stage", "runtime-warmup-stage", "runtime-stage", "runtime-hydrate", "runtime-pilot-run", "runtime-gpu-warmup", "runtime-train", "runtime-checkpoint-publish", "runtime-checkpoint-complete", "runtime-checkpoint-interrupted", "runtime-checkpoint-replacement-resume", "runtime-checkpoint-dispose", "tune", "train", "status", "resume", "destroy", "runtime-pilot-destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "materialize":
         return _materialize(request)
@@ -4353,6 +4487,8 @@ def main_for_test(
         _verify_prepare_evidence(evidence)
         return {"paid_action": False, "action": "prepare", "organizer_source": ORGANIZER_SOURCE, "corrective_source": CORRECTIVE_SOURCE, "request": request}
     if not args.execute: return {"paid_action": False, "action": args.action, "dry_run": True, "request": request}
+    if args.action == "runtime-gpu-image-preflight":
+        return {"paid_action": False, "action": args.action, "preflight": _runtime_gpu_exact_image_preflight_from_request(request)}
     if args.action == "capture-offers": return capture_offers(runner=runner)
     if args.action == "runtime-gpu-rent-recover": return recover_runtime_gpu_rent(request=request, runner=runner)
     if args.action == "capture-runtime-pilot-offer": return capture_runtime_pilot_offer(runner=runner)

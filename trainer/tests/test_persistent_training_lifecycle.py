@@ -2663,6 +2663,44 @@ def test_runtime_rent_rejects_absent_or_invalid_preflight_evidence_before_provid
     assert calls == []
 
 
+def test_runtime_gpu_probe_uses_absolute_exact_image_executables() -> None:
+    """SSH must not depend on the image's interactive PATH for the one-step probe."""
+    command = LIFECYCLE._runtime_gpu_probe_command("a" * 40)
+
+    assert "/usr/bin/git clone --quiet --no-checkout" in command
+    assert "/usr/bin/git -C /prepared/bootstrap-code checkout --quiet --detach " + "a" * 40 in command
+    assert "/usr/bin/timeout 600 /usr/bin/env -u HF_TOKEN" in command
+    assert "/opt/runtime/bin/python -m lehome_train.cli validate-training-capability --one-step" in command
+    assert " timeout 600 env -u HF_TOKEN " not in command
+
+
+def test_runtime_gpu_exact_image_preflight_accepts_cuda_unavailable_after_cli_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The provider-free check accepts the expected no-GPU terminal only after CLI startup."""
+    bundle = tmp_path / "code.bundle"
+    bundle.write_bytes(b"bundle")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 1, "", "training capability requires CUDA\n")
+
+    monkeypatch.setattr(LIFECYCLE.subprocess, "run", fake_run)
+    result = LIFECYCLE._runtime_gpu_exact_image_preflight(
+        bundle=bundle, code_revision="a" * 40,
+    )
+
+    assert result["provider_free"] is True
+    assert result["cli_import"] == "passed"
+    assert result["cuda_step"] == "not_run_no_local_gpu"
+    assert calls and calls[0][:6] == (
+        "docker", "run", "--rm", "--platform", "linux/amd64", "--entrypoint",
+    )
+    assert LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE in calls[0]
+    assert "/opt/runtime/bin/python -m lehome_train.cli" in calls[0][-1]
+
+
 def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2800,8 +2838,8 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
         command[-1] for command in commands
         if "validate-training-capability" in command[-1]
     ]
-    assert probe_commands and all("timeout 600 env -u HF_TOKEN" in command for command in probe_commands)
-    assert all("python -m lehome_train.cli validate-training-capability" in command for command in probe_commands)
+    assert probe_commands and all("/usr/bin/timeout 600 /usr/bin/env -u HF_TOKEN" in command for command in probe_commands)
+    assert all("/opt/runtime/bin/python -m lehome_train.cli validate-training-capability" in command for command in probe_commands)
     assert all("lehome-train validate-training-capability" not in command for command in probe_commands)
     outer["deployment_revision"] = "0" * 40
     outer_path.write_text(json.dumps(outer), encoding="utf-8")
@@ -3621,6 +3659,30 @@ def test_runtime_abort_cleanup_writes_redacted_bound_non_disposable_receipt(tmp_
     assert receipt["cleanup_status"] == "destroyed_and_absent"
     assert receipt["error"] == "redacted remote failure"
     assert calls[0] == ("vastai", "destroy", "instance", "44", "--yes")
+
+
+def test_runtime_abort_cleanup_records_bounded_sanitized_probe_diagnostic(tmp_path: Path) -> None:
+    output = tmp_path / "abort-probe.json"
+
+    def runner(command: tuple[str, ...]) -> str:
+        return "{}" if command[:4] == ("vastai", "--raw", "show", "instance") else ""
+
+    LIFECYCLE._runtime_abort_cleanup(
+        instance={"instance_id": 44, "provider_response_sha256": "a" * 64},
+        request={"failure_receipt": str(output), "code_revision": "b" * 40, "code_bundle_sha256": "c" * 64},
+        error=LIFECYCLE.RuntimeGpuBootstrapProbeError(
+            stage="capability", executable="/opt/runtime/bin/python",
+            stderr="HF_TOKEN=secret-value /private/credential/path python: not found " + "x" * 800,
+        ),
+        runner=runner,
+    )
+
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    assert receipt["failure_stage"] == "capability"
+    assert receipt["failure_executable"] == "/opt/runtime/bin/python"
+    assert "secret-value" not in receipt["sanitized_stderr"]
+    assert "/private/credential/path" not in receipt["sanitized_stderr"]
+    assert len(receipt["sanitized_stderr"]) <= LIFECYCLE.RUNTIME_GPU_PROBE_DIAGNOSTIC_LIMIT
 
 
 def test_runtime_abort_cleanup_polls_transitional_destroy_until_absent(tmp_path: Path) -> None:
