@@ -115,6 +115,11 @@ def test_malformed_preflight_makes_zero_provider_calls(tmp_path: Path) -> None:
     assert invoked == []
 
 
+def test_lifecycle_uses_the_exact_public_pullthrough_mirror_manifest() -> None:
+    assert LIFECYCLE.APPROVED_IMAGE_REPOSITORY == "mirror.gcr.io/ryanjin333/lehome-rollout"
+    assert LIFECYCLE.APPROVED_IMAGE_DIGEST == "sha256:293c4f258f3742a7234699d706fb7088d0da8a764957bc79b244d830561abc12"
+
+
 @pytest.mark.parametrize(("field", "value"), (("strategy", "mild"), ("max_steps", 128)))
 def test_manifest_rejects_campaign_default_drift_before_provider_calls(tmp_path: Path, field: str, value: object) -> None:
     manifest = _manifest(tmp_path)

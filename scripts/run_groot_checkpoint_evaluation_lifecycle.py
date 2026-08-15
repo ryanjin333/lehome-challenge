@@ -27,7 +27,7 @@ from typing import Callable, Mapping, Sequence
 from lehome.flywheel.matrix import build_public_matrix, matrix_sha256
 
 
-APPROVED_IMAGE_REPOSITORY = "ryanjin333/lehome-rollout"
+APPROVED_IMAGE_REPOSITORY = "mirror.gcr.io/ryanjin333/lehome-rollout"
 # This is the immutable Docker Hub manifest used by the canonical 1K/2K runs.
 APPROVED_IMAGE_DIGEST = "sha256:293c4f258f3742a7234699d706fb7088d0da8a764957bc79b244d830561abc12"
 MAX_WALL_SECONDS = 4 * 60 * 60
