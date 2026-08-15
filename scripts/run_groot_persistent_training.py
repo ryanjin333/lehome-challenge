@@ -105,6 +105,7 @@ RUNTIME_CPU_PILOT_IMAGE = (
 )
 MAX_ACCOUNT_HOURLY_USD = 1.00
 RUNTIME_GPU_RENT_CLAIM_ROOT = Path("/private/tmp/lehome-runtime-gpu-rent-claims")
+RUNTIME_GPU_HYDRATION_INTENT_ROOT = Path("/private/tmp/lehome-runtime-gpu-hydration-intents")
 Runner = Callable[[tuple[str, ...]], str]
 VAST_SSH_IDENTITY = Path(
     os.environ.get("LEHOME_VAST_SSH_IDENTITY", "~/.ssh/vast_quest")
@@ -3985,15 +3986,36 @@ def _runtime_hydration_job_dir(request_sha256: str) -> str:
     return "/prepared/runtime-hydrate-jobs/" + request_sha256
 
 
+def _runtime_gpu_hydration_intent_root() -> Path:
+    """Prepare only the controller-owned root that admits hydration launch intent."""
+    root = RUNTIME_GPU_HYDRATION_INTENT_ROOT
+    if not root.is_absolute() or root.is_symlink():
+        raise ValueError("runtime hydration intent root is unsafe")
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as error:
+        raise ValueError("runtime hydration intent root is unsafe") from error
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("runtime hydration intent root is unsafe")
+    _fsync_parent(root)
+    return root
+
+
 def _runtime_gpu_hydration_launch_intent_path(
-    *, instance: Mapping[str, object], request: Mapping[str, object], request_sha256: str,
+    *, instance: Mapping[str, object], request_sha256: str,
 ) -> Path:
-    """Keep controller-side launch intent separate from the one-shot failure receipt."""
+    """Derive intent solely from immutable lease and hydration request identity."""
     instance_id = instance.get("instance_id")
     if type(instance_id) is not int or instance_id <= 0:
         raise ValueError("runtime hydration launch intent requires an instance id")
-    failure = _runtime_failure_receipt_path(request)
-    return failure.with_name(failure.name + ".runtime-hydrate-" + str(instance_id) + "-" + request_sha256 + ".intent.json")
+    provider_response_sha256 = instance.get("provider_response_sha256")
+    if type(provider_response_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", provider_response_sha256) is None:
+        raise ValueError("runtime hydration launch intent requires a provider response hash")
+    if re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None:
+        raise ValueError("runtime hydration launch intent requires a hydration request hash")
+    return _runtime_gpu_hydration_intent_root() / (
+        str(instance_id) + "-" + provider_response_sha256 + "-" + request_sha256 + ".json"
+    )
 
 
 def _runtime_gpu_hydration_launch_intent(
@@ -4001,7 +4023,7 @@ def _runtime_gpu_hydration_launch_intent(
 ) -> bool:
     """Create a durable first-launch marker, or authenticate a reattach-only retry."""
     path = _runtime_gpu_hydration_launch_intent_path(
-        instance=instance, request=request, request_sha256=request_sha256,
+        instance=instance, request_sha256=request_sha256,
     )
     expected = {
         "schema_version": 1, "kind": "runtime_mixture_hydration_launch_intent",

@@ -59,6 +59,7 @@ def _temporary_vast_ssh_identity(
     identity.chmod(0o600)
     monkeypatch.setattr(LIFECYCLE, "VAST_SSH_IDENTITY", identity)
     monkeypatch.setattr(LIFECYCLE, "RUNTIME_GPU_RENT_CLAIM_ROOT", tmp_path / "gpu-rent-claims")
+    monkeypatch.setattr(LIFECYCLE, "RUNTIME_GPU_HYDRATION_INTENT_ROOT", tmp_path / "gpu-hydration-intents")
     # Unit tests inject the provider boundary and intentionally do not launch
     # Docker.  Production rent remains responsible for the real preflight.
     monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_exact_image_preflight_from_request", lambda _request: {})
@@ -4017,7 +4018,7 @@ def test_direct_runtime_hydrate_launch_intent_tamper_stops_before_remote_reconne
 
     assert LIFECYCLE.runtime_mixture_hydrate(instance=instance, request=request, runner=pending_runner)["pending"] is True
     intent = LIFECYCLE._runtime_gpu_hydration_launch_intent_path(
-        instance=instance, request=request,
+        instance=instance,
         request_sha256=LIFECYCLE._runtime_gpu_hydration_request_sha256(request),
     )
     intent.write_text("{}", encoding="utf-8")
@@ -4035,6 +4036,128 @@ def test_direct_runtime_hydrate_worker_owns_pid_before_running_or_terminal_state
     assert "mv \"$job/status.tmp\" \"$job/status\"" in command
     assert "mv \"$job/terminal.tmp\" \"$job/terminal\"" in command
     assert "/usr/bin/setsid /usr/bin/nohup" in command
+
+
+def test_direct_runtime_hydrate_intent_path_is_canonical_across_failure_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    }
+    request_sha256 = LIFECYCLE._runtime_gpu_hydration_request_sha256(request)
+    monkeypatch.setattr(LIFECYCLE, "RUNTIME_GPU_HYDRATION_INTENT_ROOT", tmp_path / "controller-intents", raising=False)
+    first = dict(request) | {"failure_receipt": str(tmp_path / "first-failure.json")}
+    second = dict(request) | {"failure_receipt": str(tmp_path / "second-failure.json")}
+
+    assert LIFECYCLE._runtime_gpu_hydration_launch_intent_path(
+        instance=instance, request_sha256=request_sha256,
+    ) == LIFECYCLE._runtime_gpu_hydration_launch_intent_path(
+        instance=instance, request_sha256=request_sha256,
+    )
+
+
+def test_direct_runtime_hydrate_intent_o_excl_has_one_first_launcher_across_failure_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    }
+    request_sha256 = LIFECYCLE._runtime_gpu_hydration_request_sha256(request)
+    monkeypatch.setattr(LIFECYCLE, "RUNTIME_GPU_HYDRATION_INTENT_ROOT", tmp_path / "controller-intents", raising=False)
+    requests = [
+        dict(request) | {"failure_receipt": str(tmp_path / name)}
+        for name in ("first-failure.json", "second-failure.json")
+    ]
+    barrier = threading.Barrier(2)
+    results: list[bool] = []
+
+    def claim(candidate: dict[str, object]) -> None:
+        barrier.wait()
+        results.append(LIFECYCLE._runtime_gpu_hydration_launch_intent(
+            instance=instance, request=candidate, request_sha256=request_sha256,
+        ))
+
+    threads = [threading.Thread(target=claim, args=(candidate,)) for candidate in requests]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+
+    assert sorted(results) == [False, True]
+
+
+def test_direct_runtime_hydrate_different_failure_receipts_still_reattach_without_provider_mutation(
+    tmp_path: Path,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    }
+    first = dict(request) | {"failure_receipt": str(tmp_path / "first-failure.json")}
+    second = dict(request) | {"failure_receipt": str(tmp_path / "second-failure.json")}
+    request_sha256 = LIFECYCLE._runtime_gpu_hydration_request_sha256(request)
+    starts: list[str] = []
+    receipt = {
+        "kind": "runtime_mixture_hydration", "immutable_revision": "c" * 40,
+        "remote_prefix": "mixtures/" + "d" * 64, "fresh_readback_verified": True,
+    }
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[0] == "vastai":
+            raise AssertionError("same hydration identity must not mutate the provider")
+        if command[0] != "ssh":
+            raise AssertionError(command)
+        if "/usr/bin/setsid /usr/bin/nohup" in command[-1] or "printf 'attached\\n'" in command[-1]:
+            starts.append(command[-1])
+            if len(starts) == 1:
+                raise subprocess.CalledProcessError(255, command)
+            return "attached\n"
+        if "kill -0" in command[-1]:
+            return "success " + request_sha256 + "\n"
+        if "/receipt.json" in command[-1]:
+            return json.dumps(receipt)
+        raise AssertionError(command)
+
+    pending = LIFECYCLE.remote_action(
+        action="runtime-hydrate", instance=instance, request=first, runner=runner,
+    )
+    result = LIFECYCLE.remote_action(
+        action="runtime-hydrate", instance=instance, request=second, runner=runner,
+    )
+
+    assert pending["pending"] is True
+    assert result["hydration_receipt"] == receipt
+    assert "/usr/bin/setsid /usr/bin/nohup" in starts[0]
+    assert "/usr/bin/setsid /usr/bin/nohup" not in starts[1]
+
+
+def test_direct_runtime_hydrate_rejects_an_unsafe_controller_intent_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    }
+    request["failure_receipt"] = str(tmp_path / "failure.json")
+    unsafe = tmp_path / "unsafe-intent-root"
+    target = tmp_path / "target"
+    target.mkdir()
+    unsafe.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(LIFECYCLE, "RUNTIME_GPU_HYDRATION_INTENT_ROOT", unsafe, raising=False)
+
+    with pytest.raises(ValueError, match="intent root is unsafe"):
+        LIFECYCLE._runtime_gpu_hydration_launch_intent(
+            instance=instance, request=request,
+            request_sha256=LIFECYCLE._runtime_gpu_hydration_request_sha256(request),
+        )
 
 
 def test_runtime_cpu_pilot_bootstrap_runtime_hydrate_and_run_chain(
