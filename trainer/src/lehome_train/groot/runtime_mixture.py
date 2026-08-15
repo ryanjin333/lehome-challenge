@@ -21,6 +21,7 @@ import subprocess
 from typing import Any, Literal
 
 from lehome_train.io import canonical_json_sha256, sha256_file
+from lehome_train.groot.experiment_manifest import batch64_quotas
 
 try:  # Torch is a runtime dependency of pinned GR00T, not of macOS import tests.
     from torch.utils.data import IterableDataset, get_worker_info
@@ -129,10 +130,14 @@ def source_tree_sha256(root: str | os.PathLike[str]) -> str:
 def pending_mixture_id(value: Mapping[str, object]) -> str:
     """Derive the mixture content address without self-referential fields."""
 
-    fields = {
+    legacy_fields = {
         "schema_version", "kind", "repository", "sources",
         "normalization_sha256", "windows_sha256", "publication_pending",
     }
+    bound_fields = legacy_fields | {
+        "experiment_manifest_sha256", "mixture_weights", "source_quotas",
+    }
+    fields = bound_fields if type(value.get("schema_version")) is int and value.get("schema_version") == 2 else legacy_fields
     if set(value) - {"mixture_id", "prefix", *fields} or set(value) & fields != fields:
         raise ValueError("runtime mixture pending content has an incompatible schema")
     return canonical_json_sha256({field: value[field] for field in sorted(fields)})
@@ -182,6 +187,9 @@ class MixtureManifest:
     normalization_sha256: str
     normalization_byte_size: int
     raw: dict[str, object]
+    experiment_manifest_sha256: str | None
+    weights: Mapping[str, int]
+    quotas: Mapping[str, int]
 
     @property
     def action_horizon(self) -> int:
@@ -319,9 +327,11 @@ def _manifest_digest_binding(document: dict[str, object]) -> str:
 
 def _parse_manifest(path: Path) -> MixtureManifest:
     document = _load_object(path, label="mixture manifest")
-    required = {
+    legacy_required = {
         "schema_version", "kind", "repository", "safe_prefix", "mixture_id", "sources", "camera_schema", "image_shape", "state_schema", "action_schema", "fps", "action_horizon", "instruction", "schedule_seed", "cycle_size", "mixture_normalization", "window_index",
     }
+    manifest_binding_fields = {"experiment_manifest_sha256", "mixture_weights", "source_quotas"}
+    required = legacy_required | manifest_binding_fields if type(document.get("schema_version")) is int and document.get("schema_version") == 3 else legacy_required
     if set(document) == required | {"self_sha256"}:
         declared = _digest(document["self_sha256"], label="manifest self hash")
         hashed = dict(document)
@@ -330,7 +340,7 @@ def _parse_manifest(path: Path) -> MixtureManifest:
             raise ValueError("manifest self hash mismatch")
     elif set(document) != required:
         _exact(document, required, label="mixture manifest")
-    if document["schema_version"] != 2 or document["kind"] != "lehome_runtime_mixture":
+    if type(document["schema_version"]) is not int or document["schema_version"] not in {2, 3} or document["kind"] != "lehome_runtime_mixture":
         raise ValueError("mixture manifest version is unsupported")
     repository = document["repository"]
     if repository != APPROVED_MIXTURE_REPOSITORY:
@@ -357,8 +367,27 @@ def _parse_manifest(path: Path) -> MixtureManifest:
     if cycle_size != sum(source.quota for source in sources):
         raise ValueError("quota and cycle size mismatch")
     quotas = {kind: sum(source.quota for source in sources if source.source_type == kind) for kind in _SOURCE_TYPES}
-    if quotas != {"bc": 7, "rollout": 3, "dagger": 0}:
-        raise ValueError("runtime quota contract must be exactly BC 7 rollout 3 dagger 0")
+    if document["schema_version"] == 2:
+        weights: Mapping[str, int] = {"bc": 70, "rollout": 30, "dagger": 0}
+        if quotas != {"bc": 7, "rollout": 3, "dagger": 0}:
+            raise ValueError("legacy runtime quota contract must be exactly BC 7 rollout 3 dagger 0")
+        experiment_manifest_sha256: str | None = None
+    else:
+        experiment_manifest_sha256 = _digest(document["experiment_manifest_sha256"], label="experiment manifest hash")
+        raw_weights = document["mixture_weights"]
+        raw_quotas = document["source_quotas"]
+        if not isinstance(raw_weights, dict) or not isinstance(raw_quotas, dict):
+            raise ValueError("runtime experiment binding is invalid")
+        _exact(raw_weights, {"bc", "rollout", "dagger"}, label="runtime mixture weights")
+        _exact(raw_quotas, {"bc", "rollout", "dagger"}, label="runtime source quotas")
+        if any(type(raw_weights[kind]) is not int or type(raw_quotas[kind]) is not int for kind in ("bc", "rollout", "dagger")):
+            raise ValueError("runtime weights and quotas must be integers")
+        if raw_weights["bc"] <= 0 or raw_weights["rollout"] <= 0 or raw_weights["dagger"] != 0 or raw_weights["bc"] + raw_weights["rollout"] != 100:
+            raise ValueError("runtime weights do not meet campaign constraints")
+        expected_quotas = batch64_quotas(raw_weights)
+        if cycle_size != 64 or dict(raw_quotas) != expected_quotas or quotas != expected_quotas:
+            raise ValueError("runtime quotas do not match the manifest weights")
+        weights = {kind: int(raw_weights[kind]) for kind in ("bc", "rollout", "dagger")}
     normalization = document["mixture_normalization"]
     if not isinstance(normalization, dict):
         raise ValueError("mixture normalization binding is invalid")
@@ -367,7 +396,7 @@ def _parse_manifest(path: Path) -> MixtureManifest:
     if not isinstance(index, dict):
         raise ValueError("window index binding is invalid")
     _exact(index, {"path", "sha256", "byte_size"}, label="window index binding")
-    return MixtureManifest(str(repository), safe_prefix, mixture_id, sources, schedule_seed, cycle_size, _relative(index["path"], label="window index path"), _digest(index["sha256"], label="window index hash"), _integer(index["byte_size"], label="window index size"), _relative(normalization["path"], label="mixture normalization path"), _digest(normalization["sha256"], label="mixture normalization hash"), _integer(normalization["byte_size"], label="mixture normalization size"), document)
+    return MixtureManifest(str(repository), safe_prefix, mixture_id, sources, schedule_seed, cycle_size, _relative(index["path"], label="window index path"), _digest(index["sha256"], label="window index hash"), _integer(index["byte_size"], label="window index size"), _relative(normalization["path"], label="mixture normalization path"), _digest(normalization["sha256"], label="mixture normalization hash"), _integer(normalization["byte_size"], label="mixture normalization size"), document, experiment_manifest_sha256, weights, quotas)
 
 
 def _safe_file(root: Path, relative: str, *, label: str) -> Path:
@@ -399,11 +428,9 @@ def _validate_mounts(path: Path, manifest: MixtureManifest) -> dict[str, Path]:
     if receipt_path.is_symlink() or not receipt_path.is_file() or sha256_file(receipt_path) != _digest(document["deployment_receipt_sha256"], label="mount deployment receipt hash"):
         raise ValueError("mount deployment receipt drift")
     receipt = _load_object(receipt_path, label="mount deployment receipt")
-    _exact(
-        receipt,
-        {"repository", "immutable_revision", "remote_prefix", "mixture_id", "pending_receipt_sha256", "artifact_entries", "fresh_readback_verified", "tree_listing_verified"},
-        label="mount deployment receipt",
-    )
+    legacy_receipt_keys = {"repository", "immutable_revision", "remote_prefix", "mixture_id", "pending_receipt_sha256", "artifact_entries", "fresh_readback_verified", "tree_listing_verified"}
+    bound_receipt_keys = legacy_receipt_keys | {"experiment_manifest_sha256", "mixture_weights", "source_quotas"}
+    _exact(receipt, bound_receipt_keys if manifest.experiment_manifest_sha256 is not None else legacy_receipt_keys, label="mount deployment receipt")
     if (
         receipt.get("repository") != manifest.repository
         or type(receipt.get("immutable_revision")) is not str
@@ -414,6 +441,12 @@ def _validate_mounts(path: Path, manifest: MixtureManifest) -> dict[str, Path]:
         or receipt.get("tree_listing_verified") is not True
     ):
         raise ValueError("mount deployment receipt does not prove a fresh immutable readback")
+    if manifest.experiment_manifest_sha256 is not None and (
+        receipt["experiment_manifest_sha256"] != manifest.experiment_manifest_sha256
+        or receipt["mixture_weights"] != dict(manifest.weights)
+        or receipt["source_quotas"] != dict(manifest.quotas)
+    ):
+        raise ValueError("mount deployment receipt experiment binding drift")
     _digest(receipt["pending_receipt_sha256"], label="deployment pending receipt hash")
     artifacts = receipt["artifact_entries"]
     if not isinstance(artifacts, list) or not artifacts:
@@ -690,7 +723,7 @@ class RuntimeMixtureDataset(IterableDataset):
 
     Stock ``DataLoader`` workers are supported because workers independently
     take a stride of logical positions.  They do not independently shuffle or
-    choose sources, so aggregating them preserves every complete 7/3 cycle.
+    choose sources, so aggregating them preserves every complete cycle.
     """
 
     def __init__(self, contract: RuntimeContract, *, processor: Callable[[Any], Any] | None = None, decoder: Callable[..., Any] | None = None, global_sample_offset: int = 0, expected_global_step: int | None = None, global_batch_size: int | None = None, limit: int | None = None, worker_id: int | None = None, worker_count: int | None = None, rank: int = 0, world_size: int = 1) -> None:
@@ -707,6 +740,11 @@ class RuntimeMixtureDataset(IterableDataset):
             global_sample_offset = expected_global_step * global_batch_size
         elif global_batch_size is not None:
             raise ValueError("global batch requires an authenticated checkpoint cursor")
+        if contract.manifest.experiment_manifest_sha256 is not None and (
+            global_sample_offset % contract.manifest.cycle_size
+            or global_batch_size is not None and global_batch_size != contract.manifest.cycle_size
+        ):
+            raise ValueError("manifest-bound runtime offsets must be batch-aligned")
         self.global_sample_offset, self.limit = global_sample_offset, limit
         self.expected_global_step, self.global_batch_size = expected_global_step, global_batch_size
         # Pinned Gr00tTrainer reads this integer and calls

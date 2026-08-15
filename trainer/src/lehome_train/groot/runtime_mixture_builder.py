@@ -7,6 +7,7 @@ the organizer or recorder trees at runtime.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -26,6 +27,7 @@ from lehome_train.groot.runtime_mixture import (
     ACTION_HORIZON, APPROVED_MIXTURE_REPOSITORY, CAMERAS, FPS, INSTRUCTION,
     pending_mixture_id, source_tree_sha256,
 )
+from lehome_train.groot.experiment_manifest import load_experiment_manifest
 from lehome_train.io import canonical_json_bytes, canonical_json_sha256, sha256_file
 
 
@@ -44,6 +46,114 @@ def _load(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be an object")
     return value
+
+
+def _strict_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON field")
+        value[key] = item
+    return value
+
+
+def load_authenticated_bc_garment_index(
+    organizer_root: Path,
+    organizer_manifest: Path,
+    relative_path: str,
+    expected_sha256: str,
+    *,
+    held_out_garments: tuple[str, ...],
+) -> dict[str, str]:
+    """Authenticate the exact BC episode-to-garment attestation in its bundle."""
+
+    safe_relative = _relative(relative_path, "BC garment index path")
+    root = organizer_root.resolve(strict=True)
+    index = organizer_root / safe_relative
+    try:
+        if index.is_symlink() or not index.is_file():
+            raise ValueError("BC garment index is missing or unsafe")
+        index.resolve(strict=True).relative_to(root)
+    except (OSError, ValueError) as error:
+        raise ValueError("BC garment index is missing or unsafe") from error
+    payload = index.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != _sha(expected_sha256, "BC garment index hash"):
+        raise ValueError("BC garment index hash drift")
+    try:
+        document = json.loads(payload.decode("utf-8"), object_pairs_hook=_strict_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("BC garment index is malformed") from error
+    if canonical_json_bytes(document) != payload or not isinstance(document, dict) or set(document) != {"schema_version", "kind", "episodes"} or type(document["schema_version"]) is not int or document["schema_version"] != 1 or document["kind"] != "lehome_bc_garment_index" or not isinstance(document["episodes"], list):
+        raise ValueError("BC garment index has an incompatible schema")
+    organizer = _load(organizer_manifest, "organizer manifest")
+    train, validation = organizer.get("train_episode_ids"), organizer.get("validation_episode_ids")
+    if not isinstance(train, list) or not isinstance(validation, list) or any(type(item) is not str or not item for item in train + validation) or len(set(train + validation)) != len(train) + len(validation):
+        raise ValueError("organizer split ledger is malformed")
+    garments: dict[str, str] = {}
+    for row in document["episodes"]:
+        if not isinstance(row, dict) or set(row) != {"episode_id", "garment_name"}:
+            raise ValueError("BC garment index row is malformed")
+        episode_id, garment_name = row["episode_id"], row["garment_name"]
+        if type(episode_id) is not str or not episode_id or type(garment_name) is not str or not garment_name or episode_id in garments:
+            raise ValueError("BC garment index identity is malformed")
+        if garment_name in held_out_garments:
+            raise ValueError("BC garment index selects a held-out garment")
+        garments[episode_id] = garment_name
+    if set(garments) != set(train + validation):
+        raise ValueError("BC garment index does not exactly cover organizer split IDs")
+    return garments
+
+
+def immutable_source_identities(
+    organizer_root: Path, campaign_root: Path, organizer_manifest: Path, campaign_receipt: Path,
+) -> dict[str, str]:
+    """Measure every mutable source identity used by the immutable build."""
+
+    return {
+        "organizer_tree_sha256": source_tree_sha256(organizer_root),
+        "campaign_tree_sha256": source_tree_sha256(campaign_root),
+        "organizer_manifest_sha256": sha256_file(organizer_manifest),
+        "campaign_receipt_sha256": sha256_file(campaign_receipt),
+    }
+
+
+def require_unchanged_source_identities(
+    expected: Mapping[str, str], *, organizer_root: Path, campaign_root: Path,
+    organizer_manifest: Path, campaign_receipt: Path,
+) -> None:
+    if immutable_source_identities(organizer_root, campaign_root, organizer_manifest, campaign_receipt) != dict(expected):
+        raise ValueError("immutable runtime source changed during mixture generation")
+
+
+def control_file_sha256(path: Path, *, label: str) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} is missing or unsafe")
+    return sha256_file(path)
+
+
+def build_input_snapshot(
+    *, organizer_root: Path, campaign_root: Path, organizer_manifest: Path,
+    campaign_receipt: Path, source_publications: Path, selected_bindings: Path,
+    plan_state: Path, experiment_manifest: Path,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Measure all source/control identities before parsing any build input."""
+
+    source = immutable_source_identities(organizer_root, campaign_root, organizer_manifest, campaign_receipt)
+    controls = {
+        "organizer_manifest_sha256": source["organizer_manifest_sha256"],
+        "campaign_receipt_sha256": source["campaign_receipt_sha256"],
+        "source_publications_sha256": control_file_sha256(source_publications, label="source publications"),
+        "selected_bindings_sha256": control_file_sha256(selected_bindings, label="selected bindings"),
+        "plan_state_sha256": control_file_sha256(plan_state, label="plan state"),
+        "experiment_manifest_file_sha256": control_file_sha256(experiment_manifest, label="experiment manifest"),
+    }
+    return source, controls
+
+
+def require_unchanged_control_files(expected: Mapping[str, str], *, paths: Mapping[str, Path]) -> None:
+    for name, path in paths.items():
+        if control_file_sha256(path, label=name.replace("_", " ")) != expected[name]:
+            raise ValueError("immutable runtime control input changed during mixture generation")
 
 
 def _sha(value: object, label: str) -> str:
@@ -166,7 +276,9 @@ def validate_selected_raw_roots(
     campaign_root: str | Path,
     selected: Mapping[str, str],
     campaign_receipt: Mapping[str, object],
-) -> None:
+    *,
+    held_out_garments: tuple[str, ...] = (),
+) -> dict[str, str]:
     """Verify every selected raw artifact before any window can authorize a read.
 
     The selected index is a closed 150-root verification allowlist, while the
@@ -199,6 +311,7 @@ def validate_selected_raw_roots(
         from lehome_train.flywheel.materialize import _is_autonomous_policy_success
     except ImportError as error:
         raise RuntimeError("canonical raw artifact verification is unavailable") from error
+    garments: dict[str, str] = {}
     for attempt_id in sorted(expected_ids):
         attempt = entries[attempt_id]
         checksum_manifest = attempt / "SHA256SUMS.json"
@@ -227,6 +340,13 @@ def validate_selected_raw_roots(
             or not _is_autonomous_policy_success(episode)
         ):
             raise ValueError("raw rollout identity or accepted autonomous success drift")
+        garment_name = identity.get("garment_name")
+        if type(garment_name) is not str or not garment_name:
+            raise ValueError("raw rollout garment identity is missing")
+        if garment_name in held_out_garments:
+            raise ValueError("raw rollout selects a held-out garment")
+        garments[attempt_id] = garment_name
+    return garments
 
 
 def _write(path: Path, value: object) -> None:
@@ -341,8 +461,9 @@ def validate_plan_windows(plan: Mapping[str, Any], *, organizer_manifest: Path, 
             if type(source_start) is not int or type(source_stop) is not int or source_start < 0 or source_stop - source_start != ACTION_HORIZON:
                 raise ValueError("organizer selection has an invalid source range")
             # A physical mixed snapshot repeated source ranges to express its
-            # ratio.  Runtime retains one authorized raw h16 and the fixed 7/3
-            # schedule supplies replacement without duplicating allowlist rows.
+            # ratio.  Runtime retains one authorized raw h16 and the
+            # manifest-bound batch schedule supplies replacement without
+            # duplicating allowlist rows.
             key = (kind, raw_id, start, stop)
         else:
             # Flywheel materialization had physical oversampling; collapse only
@@ -402,51 +523,129 @@ def _normalization_statistics(windows: list[dict[str, Any]], *, organizer_root: 
     return {"new_embodiment": {"state": _joint_groups(_stats(states, 12)), "action": _joint_groups(_stats(actions, 12)), "relative_action": {name: _stats(rows, 5 if name.endswith("arm") else 1) for name, rows in relative.items()}}}
 
 
-def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Path, source_publications: str | Path, selected_bindings: str | Path, plan_state: str | Path, destination: str | Path) -> dict[str, Any]:
+def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Path, source_publications: str | Path, selected_bindings: str | Path, plan_state: str | Path, destination: str | Path, experiment_manifest: str | Path | None = None) -> dict[str, Any]:
     """Create immutable local publication-pending bytes, never an authorized run."""
     organizer, campaign, destination = Path(organizer_root), Path(campaign_root), Path(destination)
-    if Path(selected_bindings).name != "selected-150.json" or Path(source_publications).name != "source-publications.json":
+    source_publications_path, selected_bindings_path, plan_state_path = Path(source_publications), Path(selected_bindings), Path(plan_state)
+    if source_publications_path.name != "source-publications.json" or selected_bindings_path.name != "selected-150.json":
         raise ValueError("runtime mixture requires explicit selected-150.json and source-publications.json")
-    state = _load(Path(plan_state), "persisted mix-plan state"); plan = state.get("plan")
+    if experiment_manifest is None:
+        raise ValueError("runtime mixture builds require an experiment manifest")
+    experiment_manifest_path = Path(experiment_manifest)
+    organizer_manifest = organizer / "manifest.json"
+    campaign_receipt = campaign / "campaign-receipt.json"
+    source_identities, control_hashes = build_input_snapshot(
+        organizer_root=organizer, campaign_root=campaign, organizer_manifest=organizer_manifest,
+        campaign_receipt=campaign_receipt, source_publications=source_publications_path,
+        selected_bindings=selected_bindings_path, plan_state=plan_state_path,
+        experiment_manifest=experiment_manifest_path,
+    )
+    state = _load(plan_state_path, "persisted mix-plan state"); plan = state.get("plan")
     if not isinstance(plan, dict) or plan.get("sha256") != state.get("plan_sha256") or canonical_json_sha256({key: value for key, value in plan.items() if key != "sha256"}) != plan.get("sha256"):
         raise ValueError("persisted plan hash is invalid")
-    organizer_manifest = organizer / "manifest.json"; organizer_hash = sha256_file(organizer_manifest)
-    campaign_receipt = campaign / "campaign-receipt.json"; receipt = _load(campaign_receipt, "campaign receipt")
-    selected_document = _load(Path(selected_bindings), "selected rollout bindings")
+    receipt = _load(campaign_receipt, "campaign receipt")
+    selected_document = _load(selected_bindings_path, "selected rollout bindings")
     selected = validate_selected_bindings(selected_document, receipt)
+    experiment = load_experiment_manifest(experiment_manifest_path)
+    assert experiment.bc_bundle.garment_index_path is not None
+    assert experiment.bc_bundle.garment_index_sha256 is not None
+    load_authenticated_bc_garment_index(
+        organizer, organizer_manifest, experiment.bc_bundle.garment_index_path,
+        experiment.bc_bundle.garment_index_sha256,
+        held_out_garments=experiment.held_out_garments,
+    )
+    control_hashes["bc_garment_index_sha256"] = control_file_sha256(
+        organizer / experiment.bc_bundle.garment_index_path, label="BC garment index",
+    )
+    organizer_hash = source_identities["organizer_manifest_sha256"]
+    campaign_receipt_hash = source_identities["campaign_receipt_sha256"]
+    if (
+        source_identities["organizer_tree_sha256"] != experiment.bc_bundle.tree_sha256
+        or source_identities["campaign_tree_sha256"] != experiment.rollout_bundle.tree_sha256
+        or organizer_hash != experiment.bc_bundle.manifest_sha256
+        or campaign_receipt_hash != experiment.rollout_bundle.manifest_sha256
+    ):
+        raise ValueError("experiment manifest does not bind immutable source identities")
     # Authenticate all exact selected raw roots before a window can cause a
-    # normalization read.  This includes selected attempts that no window uses.
-    validate_selected_raw_roots(campaign, selected, receipt)
+    # normalization read, including unused selected attempts.  The immutable
+    # campaign held-out set is supplied during this authenticated pass.
+    validate_selected_raw_roots(
+        campaign, selected, receipt, held_out_garments=experiment.held_out_garments,
+    )
     windows = validate_plan_windows(plan, organizer_manifest=organizer_manifest, accepted_rollouts={key: key for key in selected})
+    # Organizer provenance authenticates the immutable split ledger, not a
+    # garment identity.  It can reject a held-out ID only when that ID is the
+    # immutable episode identifier; no unbound side metadata is trusted.
+    if any(
+        item["source_kind"] == "organizer" and item["raw_episode_id"] in experiment.held_out_garments
+        for item in windows
+    ):
+        raise ValueError("runtime mixture selects a held-out organizer episode ID")
     if destination.exists():
         raise FileExistsError("runtime mixture destination is immutable; choose an explicit new destination")
-    publications = _source_publications(Path(source_publications))
+    publications = _source_publications(source_publications_path)
+    if (
+        experiment.mixture_manifest_sha256 != plan["sha256"]
+        or experiment.bc_bundle.repository != publications["organizer"]["repository"]
+        or experiment.bc_bundle.revision != publications["organizer"]["revision"]
+        or experiment.bc_bundle.prefix != publications["organizer"]["prefix"]
+        or experiment.rollout_bundle.repository != publications["rollout"]["repository"]
+        or experiment.rollout_bundle.revision != publications["rollout"]["revision"]
+        or experiment.rollout_bundle.prefix != publications["rollout"]["prefix"]
+        or experiment.bc_bundle.tree_sha256 != source_identities["organizer_tree_sha256"]
+        or experiment.rollout_bundle.tree_sha256 != source_identities["campaign_tree_sha256"]
+        or experiment.bc_bundle.manifest_sha256 != organizer_hash
+        or experiment.rollout_bundle.manifest_sha256 != campaign_receipt_hash
+    ):
+        raise ValueError("experiment manifest does not bind the immutable runtime sources")
     staging = destination.parent / f".{destination.name}.{plan['sha256'][:12]}.tmp"
     if staging.exists():
         raise FileExistsError("runtime mixture staging already exists")
     try:
         staging.mkdir(parents=True)
-        statistics = _normalization_statistics(windows, organizer_root=organizer, campaign_root=campaign, selected=selected)
         source_entries = [
-            {"source_id": "organizer", "source_type": "bc", "quota": 7, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(organizer), "artifact_receipt_path": "manifest.json", "artifact_receipt_sha256": organizer_hash, "acceptance_receipt_path": "manifest.json", "acceptance_receipt_sha256": organizer_hash, "publication": {key: publications["organizer"][key] for key in ("repository", "revision", "prefix", "readback_receipt_path", "readback_receipt_sha256")}, "source_identity": {"prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": organizer_hash, "action_source": "organizer_expert"}},
-            {"source_id": "rollout", "source_type": "rollout", "quota": 3, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(campaign), "artifact_receipt_path": "campaign-receipt.json", "artifact_receipt_sha256": sha256_file(campaign_receipt), "acceptance_receipt_path": "campaign-receipt.json", "acceptance_receipt_sha256": sha256_file(campaign_receipt), "publication": {key: publications["rollout"][key] for key in ("repository", "revision", "prefix", "readback_receipt_path", "readback_receipt_sha256")}, "source_identity": {"round_manifest_path": "campaign-receipt.json", "round_manifest_sha256": sha256_file(campaign_receipt), "action_source": "policy"}},
+            {"source_id": "organizer", "source_type": "bc", "quota": experiment.quotas["bc"], "release_stage": "seen", "source_tree_sha256": source_identities["organizer_tree_sha256"], "artifact_receipt_path": "manifest.json", "artifact_receipt_sha256": organizer_hash, "acceptance_receipt_path": "manifest.json", "acceptance_receipt_sha256": organizer_hash, "publication": {key: publications["organizer"][key] for key in ("repository", "revision", "prefix", "readback_receipt_path", "readback_receipt_sha256")}, "source_identity": {"prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": organizer_hash, "action_source": "organizer_expert"}},
+            {"source_id": "rollout", "source_type": "rollout", "quota": experiment.quotas["rollout"], "release_stage": "seen", "source_tree_sha256": source_identities["campaign_tree_sha256"], "artifact_receipt_path": "campaign-receipt.json", "artifact_receipt_sha256": campaign_receipt_hash, "acceptance_receipt_path": "campaign-receipt.json", "acceptance_receipt_sha256": campaign_receipt_hash, "publication": {key: publications["rollout"][key] for key in ("repository", "revision", "prefix", "readback_receipt_path", "readback_receipt_sha256")}, "source_identity": {"round_manifest_path": "campaign-receipt.json", "round_manifest_sha256": campaign_receipt_hash, "action_source": "policy"}},
         ]
         converted = []
         for number, item in enumerate(windows):
             kind = "bc" if item["source_kind"] == "organizer" else "rollout"; episode = item["raw_episode_id"]
             locator = ({"episode_id": episode, "prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": organizer_hash} if kind == "bc" else {"attempt_root": f"raw/{episode}", "attempt_manifest_path": f"raw/{episode}/episode.json", "attempt_manifest_sha256": sha256_file(campaign / "raw" / episode / "episode.json")})
             converted.append({"window_id": f"{kind}-{number:06d}", "source_id": "organizer" if kind == "bc" else "rollout", "source_type": kind, "source_episode_id": episode, "start": item["raw_frame_start"], "stop": item["raw_frame_stop"], "frame_ids": list(range(item["raw_frame_start"], item["raw_frame_stop"])), "lineage_id": f"{kind}:{episode}", "split": item["split"], "source_locator": locator})
+        statistics = _normalization_statistics(windows, organizer_root=organizer, campaign_root=campaign, selected=selected)
+        require_unchanged_source_identities(
+            source_identities, organizer_root=organizer, campaign_root=campaign,
+            organizer_manifest=organizer_manifest, campaign_receipt=campaign_receipt,
+        )
+        require_unchanged_control_files(
+            control_hashes,
+            paths={
+                "organizer_manifest_sha256": organizer_manifest,
+                "campaign_receipt_sha256": campaign_receipt,
+                "source_publications_sha256": source_publications_path,
+                "selected_bindings_sha256": selected_bindings_path,
+                "plan_state_sha256": plan_state_path,
+                "experiment_manifest_file_sha256": experiment_manifest_path,
+                "bc_garment_index_sha256": organizer / experiment.bc_bundle.garment_index_path,
+            },
+        )
         normalization = {"schema_version": 3, "train_only": True, "derivation": {"train_window_ids": [item["window_id"] for item in converted if item["split"] == "train"], "sample_count": sum(item["split"] == "train" for item in converted) * ACTION_HORIZON}, "statistics": statistics}
         _write(staging / "mixture-normalization.json", normalization)
         # This is a deterministic publication target, not proof of publication.
         # It deliberately is not a loadable runtime manifest: a publisher must
         # upload these bytes and produce an immutable mixture readback receipt.
         _write(staging / "windows.json", {"schema_version": 3, "windows": converted})
-        pending = {"schema_version": 1, "kind": "runtime_mixture_publication_pending", "repository": APPROVED_MIXTURE_REPOSITORY, "sources": source_entries, "normalization_sha256": sha256_file(staging / "mixture-normalization.json"), "windows_sha256": sha256_file(staging / "windows.json"), "publication_pending": True}
+        lineages = {
+            split: canonical_json_sha256({"split": split, "lineage_ids": sorted(item["lineage_id"] for item in converted if item["split"] == split)})
+            for split in ("train", "validation")
+        }
+        if lineages["train"] != experiment.train_lineage_sha256 or lineages["validation"] != experiment.validation_lineage_sha256:
+            raise ValueError("experiment manifest lineage binding drift")
+        pending = {"schema_version": 2, "kind": "runtime_mixture_publication_pending", "repository": APPROVED_MIXTURE_REPOSITORY, "sources": source_entries, "normalization_sha256": sha256_file(staging / "mixture-normalization.json"), "windows_sha256": sha256_file(staging / "windows.json"), "experiment_manifest_sha256": experiment.identity_sha256, "mixture_weights": dict(experiment.weights), "source_quotas": dict(experiment.quotas), "publication_pending": True}
         mixture_id = pending_mixture_id(pending)
         pending = {**pending, "mixture_id": mixture_id, "prefix": f"mixtures/{mixture_id}"}
         _write(staging / "publication-pending.json", pending)
-        receipt_value = {"schema_version": 3, "kind": "runtime_mixture_generation", "publication_pending": True, "plan_sha256": plan["sha256"], "mixture_id": mixture_id, "prefix": pending["prefix"], "unique_windows": len(converted), "train_windows": sum(item["split"] == "train" for item in converted), "bc_train_windows": sum(item["source_type"] == "bc" and item["split"] == "train" for item in converted), "bc_validation_windows": sum(item["source_type"] == "bc" and item["split"] == "validation" for item in converted), "rollout_train_windows": sum(item["source_type"] == "rollout" and item["split"] == "train" for item in converted), "source_readback": {"source_publications_sha256": sha256_file(source_publications), "selected_bindings_sha256": sha256_file(selected_bindings)}}
+        receipt_value = {"schema_version": 4, "kind": "runtime_mixture_generation", "publication_pending": True, "plan_sha256": plan["sha256"], "experiment_manifest_sha256": experiment.identity_sha256, "mixture_weights": dict(experiment.weights), "source_quotas": dict(experiment.quotas), "lineage": lineages, "mixture_id": mixture_id, "prefix": pending["prefix"], "unique_windows": len(converted), "train_windows": sum(item["split"] == "train" for item in converted), "bc_train_windows": sum(item["source_type"] == "bc" and item["split"] == "train" for item in converted), "bc_validation_windows": sum(item["source_type"] == "bc" and item["split"] == "validation" for item in converted), "rollout_train_windows": sum(item["source_type"] == "rollout" and item["split"] == "train" for item in converted), "source_readback": {"source_publications_sha256": control_hashes["source_publications_sha256"], "selected_bindings_sha256": control_hashes["selected_bindings_sha256"]}, "control_inputs": {"plan_state_sha256": control_hashes["plan_state_sha256"], "experiment_manifest_file_sha256": control_hashes["experiment_manifest_file_sha256"], "bc_garment_index_sha256": control_hashes["bc_garment_index_sha256"]}}
         _write(staging / "generation-receipt.json", receipt_value)
         os.replace(staging, destination)
         return receipt_value
@@ -462,7 +661,7 @@ def build_from_request(path: str | Path) -> dict[str, Any]:
     if set(request) != required or request["schema_version"] != 1 or request["command"] != "build-runtime-mixture" or not isinstance(request["arguments"], dict):
         raise ValueError("runtime mixture build request has an incompatible schema")
     arguments = request["arguments"]
-    expected = {"organizer_root", "campaign_root", "source_publications", "selected_bindings", "plan_state", "destination"}
+    expected = {"organizer_root", "campaign_root", "source_publications", "selected_bindings", "plan_state", "destination", "experiment_manifest"}
     if set(arguments) != expected or not all(type(arguments[key]) is str and arguments[key] for key in expected):
         raise ValueError("runtime mixture build request arguments are incomplete or unknown")
     return build_runtime_mixture(**arguments)

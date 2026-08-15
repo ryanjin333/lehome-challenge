@@ -23,6 +23,7 @@ from lehome_train.groot.runtime_mixture import (
     pending_mixture_id,
     source_tree_sha256,
 )
+from lehome_train.groot.experiment_manifest import batch64_quotas
 from lehome_train.hub import (
     HubTransport,
     download_files,
@@ -143,11 +144,20 @@ def _load_exact(path: Path, *, keys: set[str], label: str) -> dict[str, object]:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"{label} is missing or unsafe")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_strict_pairs)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"{label} is malformed") from error
     if not isinstance(value, dict) or set(value) != keys:
         raise ValueError(f"{label} has an incompatible schema")
+    return value
+
+
+def _strict_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON field")
+        value[key] = item
     return value
 
 
@@ -174,6 +184,7 @@ def _tree_matches(tree: tuple[object, ...], *, prefix: str, entries: tuple[SyncE
 
 
 _PENDING_KEYS = {"schema_version", "kind", "repository", "mixture_id", "prefix", "sources", "normalization_sha256", "windows_sha256", "publication_pending"}
+_BOUND_PENDING_KEYS = _PENDING_KEYS | {"experiment_manifest_sha256", "mixture_weights", "source_quotas"}
 _SOURCE_READBACK_KEYS = {
     "repository", "immutable_revision", "remote_prefix", "fresh_readback_verified",
     "tree_listing_verified",
@@ -190,13 +201,26 @@ _DEPLOYMENT_KEYS = {
     "pending_receipt_sha256", "artifact_entries", "fresh_readback_verified",
     "tree_listing_verified",
 }
+_BOUND_DEPLOYMENT_KEYS = _DEPLOYMENT_KEYS | {"experiment_manifest_sha256", "mixture_weights", "source_quotas"}
 
 
 def _pending(root: Path) -> dict[str, object]:
-    pending = _load_exact(root / "publication-pending.json", keys=_PENDING_KEYS, label="mixture publication pending artifact")
+    path = root / "publication-pending.json"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("mixture publication pending artifact is missing or unsafe")
+    try:
+        pending = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_strict_pairs)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("mixture publication pending artifact is malformed") from error
+    if not isinstance(pending, dict):
+        raise ValueError("mixture publication pending artifact has an incompatible schema")
+    keys = _BOUND_PENDING_KEYS if type(pending.get("schema_version")) is int and pending.get("schema_version") == 2 else _PENDING_KEYS
+    if set(pending) != keys:
+        raise ValueError("mixture publication pending artifact has an incompatible schema")
     mixture_id = pending.get("mixture_id")
     if (
-        pending.get("schema_version") != 1
+        type(pending.get("schema_version")) is not int
+        or pending.get("schema_version") not in {1, 2}
         or pending.get("kind") != "runtime_mixture_publication_pending"
         or pending.get("repository") != APPROVED_MIXTURE_REPOSITORY
         or pending.get("publication_pending") is not True
@@ -205,6 +229,26 @@ def _pending(root: Path) -> dict[str, object]:
         or pending.get("prefix") != f"mixtures/{mixture_id}"
     ):
         raise ValueError("mixture publication pending artifact content address is invalid")
+    if pending["schema_version"] == 2:
+        weights, quotas = pending["mixture_weights"], pending["source_quotas"]
+        if (
+            not isinstance(pending["experiment_manifest_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", pending["experiment_manifest_sha256"]) is None
+            or not isinstance(weights, dict) or not isinstance(quotas, dict)
+            or set(weights) != {"bc", "rollout", "dagger"} or set(quotas) != {"bc", "rollout", "dagger"}
+            or any(type(weights[kind]) is not int or type(quotas[kind]) is not int for kind in ("bc", "rollout", "dagger"))
+            or weights["bc"] <= 0 or weights["rollout"] <= 0 or weights["dagger"] != 0 or weights["bc"] + weights["rollout"] != 100
+        ):
+            raise ValueError("manifest-bound pending mixture weights are invalid")
+        expected = batch64_quotas(weights)
+        if not isinstance(pending["sources"], list) or any(
+            not isinstance(item, dict) or type(item.get("quota")) is not int
+            for item in pending["sources"]
+        ):
+            raise ValueError("manifest-bound pending source quotas are invalid")
+        actual = {kind: sum(item["quota"] for item in pending["sources"] if item.get("source_type") == kind) for kind in expected}
+        if quotas != expected or actual != expected:
+            raise ValueError("manifest-bound pending mixture quotas drift")
     return pending
 
 
@@ -437,7 +481,8 @@ def hydrate_runtime_mixture_from_request(path: str | Path, *, transport: HubTran
     arguments = request["arguments"]
     expected = {"deployment_receipt", "source_readback_receipts", "destination", "mounts_descriptor"}
     if (
-        request.get("schema_version") != 1
+        type(request.get("schema_version")) is not int
+        or request.get("schema_version") != 1
         or request.get("command") != "hydrate-runtime-mixture"
         or not isinstance(arguments, dict)
         or set(arguments) != expected
@@ -447,7 +492,15 @@ def hydrate_runtime_mixture_from_request(path: str | Path, *, transport: HubTran
     ):
         raise ValueError("runtime mixture hydration request has an incompatible schema")
     deployment_path = Path(arguments["deployment_receipt"])
-    deployment = _load_exact(deployment_path, keys=_DEPLOYMENT_KEYS, label="runtime deployment receipt")
+    try:
+        deployment_probe = json.loads(deployment_path.read_text(encoding="utf-8"), object_pairs_hook=_strict_pairs)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("runtime deployment receipt is malformed") from error
+    deployment = _load_exact(
+        deployment_path,
+        keys=_BOUND_DEPLOYMENT_KEYS if isinstance(deployment_probe, dict) and "experiment_manifest_sha256" in deployment_probe else _DEPLOYMENT_KEYS,
+        label="runtime deployment receipt",
+    )
     if (
         deployment.get("repository") != APPROVED_MIXTURE_REPOSITORY
         or deployment.get("fresh_readback_verified") is not True
@@ -480,11 +533,18 @@ def hydrate_runtime_mixture_from_request(path: str | Path, *, transport: HubTran
         )
         if _entries(destination) != entries:
             raise ValueError("runtime deployment hydration bytes differ from the authenticated receipt")
-        manifest = _load_exact(destination / "mixture.json", keys={
+        legacy_manifest_keys = {
             "schema_version", "kind", "repository", "safe_prefix", "mixture_id", "sources",
             "camera_schema", "image_shape", "state_schema", "action_schema", "fps", "action_horizon",
             "instruction", "schedule_seed", "cycle_size", "mixture_normalization", "window_index",
-        }, label="hydrated runtime mixture manifest")
+        }
+        manifest_probe = json.loads((destination / "mixture.json").read_text(encoding="utf-8"), object_pairs_hook=_strict_pairs)
+        manifest = _load_exact(destination / "mixture.json", keys=legacy_manifest_keys | {"experiment_manifest_sha256", "mixture_weights", "source_quotas"} if isinstance(manifest_probe, dict) and type(manifest_probe.get("schema_version")) is int and manifest_probe.get("schema_version") == 3 else legacy_manifest_keys, label="hydrated runtime mixture manifest")
+        if manifest.get("schema_version") == 3:
+            if any(deployment.get(key) != manifest.get(key) for key in ("experiment_manifest_sha256", "mixture_weights", "source_quotas")):
+                raise ValueError("hydrated runtime experiment binding differs from deployment receipt")
+        elif set(deployment) != _DEPLOYMENT_KEYS:
+            raise ValueError("legacy hydrated runtime cannot use a manifest-bound deployment receipt")
         sources = manifest.get("sources")
         receipt_paths = arguments["source_readback_receipts"]
         if not isinstance(sources, list) or not sources:
@@ -537,13 +597,16 @@ def hydrate_runtime_mixture_from_request(path: str | Path, *, transport: HubTran
             "deployment_receipt_sha256": sha256_file(deployment_path), "mounts": roots,
         })
         load_runtime_contract(destination / "mixture.json", mounts_path)
-        return {
+        result = {
             "schema_version": 1, "kind": "runtime_mixture_hydration",
             "repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": revision,
             "remote_prefix": prefix, "mixture_id": deployment["mixture_id"],
             "artifact_tree_sha256": canonical_json_sha256(_entry_records(entries)),
             "mounts_descriptor": str(mounts_path), "fresh_readback_verified": True,
         }
+        if manifest.get("schema_version") == 3:
+            result.update({key: manifest[key] for key in ("experiment_manifest_sha256", "mixture_weights", "source_quotas")})
+        return result
     except BaseException:
         # A bounded Hub retry can resume exact regular files at these stable
         # targets.  Preserve them; any drift is rejected on the next entry.
@@ -716,6 +779,8 @@ def publish_pending_mixture(*, pending_root: str | Path, revision: str, receipt_
         if _entries(readback) != entries:
             raise ValueError("mixture publication readback hash or size mismatch")
     receipt = {"repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": immutable, "remote_prefix": prefix, "mixture_id": pending["mixture_id"], "fresh_readback_verified": True, "tree_listing_verified": True}
+    if pending["schema_version"] == 2:
+        receipt.update({key: pending[key] for key in ("experiment_manifest_sha256", "mixture_weights", "source_quotas")})
     atomic_write_json(target, receipt)
     return receipt
 
@@ -748,10 +813,13 @@ def finalize_pending_mixture(
     root, output = Path(pending_root), Path(destination)
     pending = _pending(root)
     release = Path(publication_receipt)
-    receipt = _load_exact(release, keys={"repository", "immutable_revision", "remote_prefix", "mixture_id", "fresh_readback_verified", "tree_listing_verified"}, label="mixture publication receipt")
+    receipt_keys = {"repository", "immutable_revision", "remote_prefix", "mixture_id", "fresh_readback_verified", "tree_listing_verified"}
+    if pending.get("schema_version") == 2:
+        receipt_keys |= {"experiment_manifest_sha256", "mixture_weights", "source_quotas"}
+    receipt = _load_exact(release, keys=receipt_keys, label="mixture publication receipt")
     if (
         output.exists()
-        or pending.get("schema_version") != 1
+        or pending.get("schema_version") not in {1, 2}
         or pending.get("kind") != "runtime_mixture_publication_pending"
         or pending.get("repository") != APPROVED_MIXTURE_REPOSITORY
         or pending.get("publication_pending") is not True
@@ -765,12 +833,14 @@ def finalize_pending_mixture(
         or receipt.get("tree_listing_verified") is not True
     ):
         raise ValueError("mixture finalization receipt or destination is invalid")
+    if pending["schema_version"] == 2 and any(receipt[key] != pending[key] for key in ("experiment_manifest_sha256", "mixture_weights", "source_quotas")):
+        raise ValueError("mixture finalization experiment binding drift")
     normalization = root / "mixture-normalization.json"
     windows_file = root / "windows.json"
     if sha256_file(normalization) != pending["normalization_sha256"] or sha256_file(windows_file) != pending["windows_sha256"]:
         raise ValueError("mixture finalization pending bytes drift")
     windows_value = _load_exact(windows_file, keys={"schema_version", "windows"}, label="pending window index")
-    if windows_value["schema_version"] != 3 or not isinstance(windows_value["windows"], list):
+    if type(windows_value["schema_version"]) is not int or windows_value["schema_version"] != 3 or not isinstance(windows_value["windows"], list):
         raise ValueError("pending window index is invalid")
     windows = windows_value["windows"]
     if (
@@ -790,7 +860,9 @@ def finalize_pending_mixture(
     try:
         shutil.copytree(root, staging)
         shutil.copy2(normalization, staging / "mixture-normalization.json")
-        manifest = {"schema_version": 2, "kind": "lehome_runtime_mixture", "repository": APPROVED_MIXTURE_REPOSITORY, "safe_prefix": pending["prefix"], "mixture_id": pending["mixture_id"], "sources": pending["sources"], "camera_schema": list(CAMERAS), "image_shape": [480, 640, 3], "state_schema": {"dimension": 12, "storage": "absolute"}, "action_schema": {"dimension": 12, "storage": "absolute"}, "fps": FPS, "action_horizon": ACTION_HORIZON, "instruction": INSTRUCTION, "schedule_seed": 17, "cycle_size": 10, "mixture_normalization": {"path": "mixture-normalization.json", "sha256": sha256_file(staging / "mixture-normalization.json"), "byte_size": (staging / "mixture-normalization.json").stat().st_size}, "window_index": {"path": "windows.json", "sha256": "", "byte_size": 0}}
+        manifest = {"schema_version": 3 if pending["schema_version"] == 2 else 2, "kind": "lehome_runtime_mixture", "repository": APPROVED_MIXTURE_REPOSITORY, "safe_prefix": pending["prefix"], "mixture_id": pending["mixture_id"], "sources": pending["sources"], "camera_schema": list(CAMERAS), "image_shape": [480, 640, 3], "state_schema": {"dimension": 12, "storage": "absolute"}, "action_schema": {"dimension": 12, "storage": "absolute"}, "fps": FPS, "action_horizon": ACTION_HORIZON, "instruction": INSTRUCTION, "schedule_seed": 17, "cycle_size": sum(source["quota"] for source in pending["sources"]), "mixture_normalization": {"path": "mixture-normalization.json", "sha256": sha256_file(staging / "mixture-normalization.json"), "byte_size": (staging / "mixture-normalization.json").stat().st_size}, "window_index": {"path": "windows.json", "sha256": "", "byte_size": 0}}
+        if pending["schema_version"] == 2:
+            manifest.update({key: pending[key] for key in ("experiment_manifest_sha256", "mixture_weights", "source_quotas")})
         index = {"schema_version": 2, "manifest_sha256": canonical_json_sha256(manifest), "windows": windows}
         atomic_write_json(staging / "windows.json", index)
         manifest["window_index"] = {"path": "windows.json", "sha256": sha256_file(staging / "windows.json"), "byte_size": (staging / "windows.json").stat().st_size}
@@ -810,6 +882,8 @@ def finalize_pending_mixture(
             if _entries(readback) != entries:
                 raise ValueError("runtime deployment readback hash or size mismatch")
         deployment_value = {"repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": immutable, "remote_prefix": pending["prefix"], "mixture_id": pending["mixture_id"], "pending_receipt_sha256": sha256_file(release), "artifact_entries": _entry_records(entries), "fresh_readback_verified": True, "tree_listing_verified": True}
+        if pending["schema_version"] == 2:
+            deployment_value.update({key: pending[key] for key in ("experiment_manifest_sha256", "mixture_weights", "source_quotas")})
         atomic_write_json(deployment, deployment_value)
         atomic_write_json(staging / "mounts.json", {"schema_version": 2, "repository": manifest["repository"], "safe_prefix": manifest["safe_prefix"], "deployment_receipt_path": str(deployment.resolve()), "deployment_receipt_sha256": sha256_file(deployment), "mounts": [{"source_id": source["source_id"], "root": source_mounts[source["source_id"]], "source_tree_sha256": source["source_tree_sha256"], "artifact_receipt_sha256": source["artifact_receipt_sha256"]} for source in pending["sources"]]})
         load_runtime_contract(staging / "mixture.json", staging / "mounts.json")

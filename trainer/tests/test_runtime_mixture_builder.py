@@ -75,7 +75,7 @@ def _raw_selected_campaign(
                 "outcome": "success",
                 "terminal_reason": "success",
                 "mode": "autonomous",
-                "identity": {"release_stage": "seen", "category": category},
+                "identity": {"release_stage": "seen", "category": category, "garment_name": f"{category}-seen-{index}"},
             })
             _write(raw / "SHA256SUMS.json", build_sha256_manifest(raw))
             rows.append({
@@ -102,6 +102,191 @@ def _raw_selected_campaign(
         "selected_bindings": rows,
     }
     return campaign, document, {"attempt_receipts": receipts}
+
+
+def _experiment_with_empty_bc_garment_index(organizer: Path, campaign: Path) -> dict[str, object]:
+    from test_experiment_manifest import _manifest
+    from lehome_train.io import canonical_json_bytes, sha256_file
+    from lehome_train.groot.runtime_mixture import source_tree_sha256
+
+    index = organizer / "garment-index.json"
+    index.write_bytes(canonical_json_bytes({"schema_version": 1, "kind": "lehome_bc_garment_index", "episodes": []}))
+    experiment = _manifest()
+    experiment["bc_bundle"]["garment_index_sha256"] = sha256_file(index)  # type: ignore[index]
+    experiment["bc_bundle"]["tree_sha256"] = source_tree_sha256(organizer)  # type: ignore[index]
+    experiment["bc_bundle"]["manifest_sha256"] = sha256_file(organizer / "manifest.json")  # type: ignore[index]
+    experiment["rollout_bundle"]["tree_sha256"] = source_tree_sha256(campaign)  # type: ignore[index]
+    experiment["rollout_bundle"]["manifest_sha256"] = sha256_file(campaign / "campaign-receipt.json")  # type: ignore[index]
+    return experiment
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "duplicate", "heldout", "tamper", "unknown"])
+def test_authenticated_bc_garment_index_fails_closed_on_coverage_and_identity_drift(
+    tmp_path: Path, mutation: str,
+) -> None:
+    from lehome_train.groot.runtime_mixture_builder import load_authenticated_bc_garment_index
+    from lehome_train.io import canonical_json_bytes, sha256_file
+
+    organizer = tmp_path / "organizer"
+    manifest = organizer / "manifest.json"
+    _write(manifest, {"train_episode_ids": ["episode-0"], "validation_episode_ids": ["episode-1"]})
+    index = organizer / "garment-index.json"
+    value: dict[str, object] = {"schema_version": 1, "kind": "lehome_bc_garment_index", "episodes": [
+        {"episode_id": "episode-0", "garment_name": "Top_Long_Seen_1"},
+        {"episode_id": "episode-1", "garment_name": "Pant_Long_Seen_1"},
+    ]}
+    if mutation == "missing":
+        value["episodes"] = value["episodes"][:-1]  # type: ignore[index]
+    elif mutation == "extra":
+        value["episodes"].append({"episode_id": "extra", "garment_name": "Top_Long_Seen_2"})  # type: ignore[index]
+    elif mutation == "duplicate":
+        value["episodes"].append({"episode_id": "episode-0", "garment_name": "Top_Long_Seen_2"})  # type: ignore[index]
+    elif mutation == "heldout":
+        value["episodes"][1]["garment_name"] = "Pant_Short_Unseen_1"  # type: ignore[index]
+    elif mutation == "unknown":
+        value["unexpected"] = True
+    index.parent.mkdir(parents=True, exist_ok=True)
+    index.write_bytes(canonical_json_bytes(value))
+    expected = sha256_file(index)
+    if mutation == "tamper":
+        index.write_text(index.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        load_authenticated_bc_garment_index(
+            organizer, manifest, "garment-index.json", expected,
+            held_out_garments=("Top_Long_Unseen_1", "Top_Short_Unseen_1", "Pant_Long_Unseen_1", "Pant_Short_Unseen_1"),
+        )
+
+
+def test_authenticated_bc_garment_index_returns_complete_nonheld_mapping(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_builder import load_authenticated_bc_garment_index
+    from lehome_train.io import canonical_json_bytes, sha256_file
+
+    organizer = tmp_path / "organizer"
+    manifest = organizer / "manifest.json"
+    _write(manifest, {"train_episode_ids": ["episode-0"], "validation_episode_ids": ["episode-1"]})
+    index = organizer / "garment-index.json"
+    index.parent.mkdir(parents=True, exist_ok=True)
+    index.write_bytes(canonical_json_bytes({"schema_version": 1, "kind": "lehome_bc_garment_index", "episodes": [
+        {"episode_id": "episode-0", "garment_name": "Top_Long_Seen_1"},
+        {"episode_id": "episode-1", "garment_name": "Pant_Long_Seen_1"},
+    ]}))
+
+    assert load_authenticated_bc_garment_index(
+        organizer, manifest, "garment-index.json", sha256_file(index),
+        held_out_garments=("Top_Long_Unseen_1", "Top_Short_Unseen_1", "Pant_Long_Unseen_1", "Pant_Short_Unseen_1"),
+    ) == {"episode-0": "Top_Long_Seen_1", "episode-1": "Pant_Long_Seen_1"}
+
+
+def test_source_mutation_during_normalization_blocks_pending_destination(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_builder import (
+        immutable_source_identities,
+        require_unchanged_source_identities,
+    )
+
+    organizer, campaign = tmp_path / "organizer", tmp_path / "campaign"
+    _write(organizer / "manifest.json", {"train_episode_ids": [], "validation_episode_ids": []})
+    _write(organizer / "garment-index.json", {})
+    _write(campaign / "campaign-receipt.json", {"attempt_receipts": []})
+    identities = immutable_source_identities(
+        organizer, campaign, organizer / "manifest.json", campaign / "campaign-receipt.json",
+    )
+    # This write represents a source root being modified by a concurrent actor
+    # while normalization is reading already authenticated inputs.
+    (organizer / "changed-during-normalization.bin").write_bytes(b"changed")
+
+    with pytest.raises(ValueError, match="changed during mixture generation"):
+        require_unchanged_source_identities(
+            identities, organizer_root=organizer, campaign_root=campaign,
+            organizer_manifest=organizer / "manifest.json", campaign_receipt=campaign / "campaign-receipt.json",
+        )
+    assert not (tmp_path / "mixture").exists()
+
+
+def test_builder_rejects_root_mutation_during_normalization_before_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lehome_train.groot.runtime_mixture import source_tree_sha256
+    from lehome_train.groot.runtime_mixture_builder import build_runtime_mixture
+    from lehome_train.io import canonical_json_sha256, sha256_file
+
+    organizer, campaign = tmp_path / "organizer", tmp_path / "campaign"
+    _write(organizer / "manifest.json", {"train_episode_ids": [], "validation_episode_ids": []})
+    _write(organizer / "garment-index.json", {})
+    _write(campaign / "campaign-receipt.json", {"attempt_receipts": []})
+    plan = {"selected_frame_ranges": []}
+    plan["sha256"] = canonical_json_sha256(plan)
+    _write(tmp_path / "plan.json", {"plan": plan, "plan_sha256": plan["sha256"]})
+    _write(tmp_path / "selected-150.json", {})
+    _write(tmp_path / "source-publications.json", {})
+    _write(tmp_path / "experiment.json", {})
+    bundle = types.SimpleNamespace(
+        repository="ryanjin333/lehome-groot-n17-data", revision="b" * 40, prefix="bc/full",
+        tree_sha256=source_tree_sha256(organizer), manifest_sha256=sha256_file(organizer / "manifest.json"),
+        garment_index_path="garment-index.json", garment_index_sha256="a" * 64,
+    )
+    rollout = types.SimpleNamespace(
+        repository="ryanjin333/lehome-groot-n17-data", revision="c" * 40, prefix="rollouts/round-1",
+        tree_sha256=source_tree_sha256(campaign), manifest_sha256=sha256_file(campaign / "campaign-receipt.json"),
+    )
+    experiment = types.SimpleNamespace(
+        bc_bundle=bundle, rollout_bundle=rollout, held_out_garments=(),
+        mixture_manifest_sha256=plan["sha256"], quotas={"bc": 7, "rollout": 3}, weights={"bc": 70, "rollout": 30, "dagger": 0},
+        identity_sha256="d" * 64, train_lineage_sha256=canonical_json_sha256({"split": "train", "lineage_ids": ["bc:episode-0"]}),
+        validation_lineage_sha256=canonical_json_sha256({"split": "validation", "lineage_ids": []}),
+    )
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_builder.load_experiment_manifest", lambda _path: experiment)
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_builder.load_authenticated_bc_garment_index", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_builder.validate_selected_bindings", lambda *_args: {"attempt-000": "a" * 64})
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_builder.validate_selected_raw_roots", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_builder.validate_plan_windows", lambda *_args, **_kwargs: [{"source_kind": "organizer", "raw_episode_id": "episode-0", "raw_frame_start": 0, "raw_frame_stop": 16, "split": "train"}])
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_builder._source_publications", lambda _path: {"organizer": {"repository": bundle.repository, "revision": bundle.revision, "prefix": bundle.prefix, "readback_receipt_path": "/tmp/bc.json", "readback_receipt_sha256": "a" * 64}, "rollout": {"repository": rollout.repository, "revision": rollout.revision, "prefix": rollout.prefix, "readback_receipt_path": "/tmp/rollout.json", "readback_receipt_sha256": "a" * 64}})
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_builder._normalization_statistics", lambda *_args, **_kwargs: (organizer / "mutated-during-normalization.bin").write_bytes(b"drift") or {})
+
+    with pytest.raises(ValueError, match="changed during mixture generation"):
+        build_runtime_mixture(
+            organizer_root=organizer, campaign_root=campaign,
+            source_publications=tmp_path / "source-publications.json", selected_bindings=tmp_path / "selected-150.json",
+            plan_state=tmp_path / "plan.json", destination=tmp_path / "mixture", experiment_manifest=tmp_path / "experiment.json",
+        )
+    assert not (tmp_path / "mixture").exists()
+
+
+@pytest.mark.parametrize("garment", [
+    "Top_Long_Unseen_1", "Top_Short_Unseen_1", "Pant_Long_Unseen_1", "Pant_Short_Unseen_1",
+])
+def test_authenticated_rollout_garment_identity_rejects_each_held_out_name(
+    tmp_path: Path, garment: str,
+) -> None:
+    from lehome.flywheel.artifacts import build_sha256_manifest
+    from lehome_train.io import canonical_json_sha256
+    from lehome_train.groot.runtime_mixture_builder import validate_selected_bindings, validate_selected_raw_roots
+
+    campaign, document, receipt = _raw_selected_campaign(tmp_path)
+    raw = campaign / "raw" / "attempt-000"
+    episode = json.loads((raw / "episode.json").read_text(encoding="utf-8"))
+    episode["identity"]["garment_name"] = garment
+    _write(raw / "episode.json", episode)
+    (raw / "SHA256SUMS.json").unlink()
+    _write(raw / "SHA256SUMS.json", build_sha256_manifest(raw))
+    document["selected_bindings"][0]["episode_manifest_sha256"] = hashlib.sha256((raw / "SHA256SUMS.json").read_bytes()).hexdigest()
+    document["selection_sha256"] = canonical_json_sha256({"schema_version": 1, "selected_bindings": document["selected_bindings"]})
+
+    with pytest.raises(ValueError, match="held-out garment"):
+        validate_selected_raw_roots(
+            campaign, validate_selected_bindings(document, receipt), receipt,
+            held_out_garments=(garment,),
+        )
+
+
+def test_authenticated_rollout_garment_identity_keeps_nonheld_seen_control(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_builder import validate_selected_bindings, validate_selected_raw_roots
+
+    campaign, document, receipt = _raw_selected_campaign(tmp_path)
+
+    garments = validate_selected_raw_roots(campaign, validate_selected_bindings(document, receipt), receipt)
+
+    assert garments["attempt-000"] == "top_long-seen-0"
 
 
 def test_builder_allows_authenticated_train_episode_to_be_demoted_to_frozen_mixture_validation(tmp_path: Path) -> None:
@@ -310,12 +495,15 @@ def test_builder_rejects_an_unused_selected_raw_tamper_before_window_selection(
     (campaign / "raw" / "attempt-149" / "SHA256SUMS.json").write_text("tampered", encoding="utf-8")
     selected = tmp_path / "selected-150.json"
     _write(selected, document)
+    _write(tmp_path / "source-publications.json", {})
     organizer = tmp_path / "organizer"
     _write(organizer / "manifest.json", {"train_episode_ids": [], "validation_episode_ids": []})
     plan = {"selected_frame_ranges": []}
     plan["sha256"] = canonical_json_sha256(plan)
     state = tmp_path / "plan.json"
     _write(state, {"plan": plan, "plan_sha256": plan["sha256"]})
+    experiment = tmp_path / "experiment.json"
+    _write(experiment, _experiment_with_empty_bc_garment_index(organizer, campaign))
     monkeypatch.setattr(
         "lehome_train.groot.runtime_mixture_builder.validate_plan_windows",
         lambda *_args, **_kwargs: pytest.fail("raw validation must precede window selection"),
@@ -329,6 +517,52 @@ def test_builder_rejects_an_unused_selected_raw_tamper_before_window_selection(
             selected_bindings=selected,
             plan_state=state,
             destination=tmp_path / "mixture",
+            experiment_manifest=experiment,
+        )
+
+
+def test_builder_rejects_unused_selected_held_out_garment_before_window_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lehome.flywheel.artifacts import build_sha256_manifest
+    from lehome_train.groot.runtime_mixture_builder import build_runtime_mixture
+    from lehome_train.io import canonical_json_sha256
+
+    campaign, document, receipt = _raw_selected_campaign(tmp_path)
+    _write(campaign / "campaign-receipt.json", receipt)
+    raw = campaign / "raw" / "attempt-149"
+    episode = json.loads((raw / "episode.json").read_text(encoding="utf-8"))
+    episode["identity"]["garment_name"] = "Pant_Short_Unseen_1"
+    _write(raw / "episode.json", episode)
+    (raw / "SHA256SUMS.json").unlink()
+    _write(raw / "SHA256SUMS.json", build_sha256_manifest(raw))
+    document["selected_bindings"][149]["episode_manifest_sha256"] = hashlib.sha256((raw / "SHA256SUMS.json").read_bytes()).hexdigest()
+    document["selection_sha256"] = canonical_json_sha256({"schema_version": 1, "selected_bindings": document["selected_bindings"]})
+    selected = tmp_path / "selected-150.json"
+    _write(selected, document)
+    _write(tmp_path / "source-publications.json", {})
+    organizer = tmp_path / "organizer"
+    _write(organizer / "manifest.json", {"train_episode_ids": [], "validation_episode_ids": []})
+    plan = {"selected_frame_ranges": []}
+    plan["sha256"] = canonical_json_sha256(plan)
+    state = tmp_path / "plan.json"
+    _write(state, {"plan": plan, "plan_sha256": plan["sha256"]})
+    experiment = tmp_path / "experiment.json"
+    _write(experiment, _experiment_with_empty_bc_garment_index(organizer, campaign))
+    monkeypatch.setattr(
+        "lehome_train.groot.runtime_mixture_builder.validate_plan_windows",
+        lambda *_args, **_kwargs: pytest.fail("all selected raw roots must be validated before window selection"),
+    )
+
+    with pytest.raises(ValueError, match="held-out garment"):
+        build_runtime_mixture(
+            organizer_root=organizer,
+            campaign_root=campaign,
+            source_publications=tmp_path / "source-publications.json",
+            selected_bindings=selected,
+            plan_state=state,
+            destination=tmp_path / "mixture",
+            experiment_manifest=experiment,
         )
 
 

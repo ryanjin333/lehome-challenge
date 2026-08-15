@@ -117,6 +117,67 @@ def test_round_source_identity_is_root_level_and_windows_authenticate_attempts(t
     assert contract.windows[-1].source_locator["attempt_root"] == "attempts/attempt-2"
 
 
+def test_schema_v3_runtime_manifest_admits_manifest_bound_80_20_batch_cycle(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture import RuntimeMixtureDataset, _manifest_digest_binding, load_runtime_contract, sha256_file
+
+    manifest, index, mounts = _contract(tmp_path)
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value.update({
+        "schema_version": 3,
+        "experiment_manifest_sha256": "f" * 64,
+        "mixture_weights": {"bc": 80, "rollout": 20, "dagger": 0},
+        "source_quotas": {"bc": 51, "rollout": 13, "dagger": 0},
+        "cycle_size": 64,
+    })
+    value["sources"][0]["quota"] = 51
+    value["sources"][1]["quota"] = 13
+    index_value = json.loads(index.read_text(encoding="utf-8"))
+    index_value["manifest_sha256"] = _manifest_digest_binding(value)
+    _write(index, index_value)
+    value["window_index"].update({"sha256": sha256_file(index), "byte_size": index.stat().st_size})
+    _write(manifest, value)
+    deployment = tmp_path / "release-receipt.json"
+    receipt = json.loads(deployment.read_text(encoding="utf-8"))
+    receipt.update({
+        "experiment_manifest_sha256": "f" * 64,
+        "mixture_weights": {"bc": 80, "rollout": 20, "dagger": 0},
+        "source_quotas": {"bc": 51, "rollout": 13, "dagger": 0},
+    })
+    for entry in receipt["artifact_entries"]:
+        target = tmp_path / entry["relative_path"]
+        entry.update({"sha256": _sha_path(target), "byte_size": target.stat().st_size})
+    _write(deployment, receipt)
+    mounts_value = json.loads(mounts.read_text(encoding="utf-8"))
+    mounts_value["deployment_receipt_sha256"] = _sha_path(deployment)
+    _write(mounts, mounts_value)
+
+    contract = load_runtime_contract(manifest, mounts)
+
+    assert contract.manifest.experiment_manifest_sha256 == "f" * 64
+    assert contract.manifest.quotas == {"bc": 51, "rollout": 13, "dagger": 0}
+    samples = list(RuntimeMixtureDataset(contract, limit=128))
+    assert Counter(sample.source_type for sample in samples[:64]) == {"bc": 51, "rollout": 13}
+    assert Counter(sample.source_type for sample in samples[64:]) == {"bc": 51, "rollout": 13}
+    resumed = RuntimeMixtureDataset(
+        contract, expected_global_step=1, global_batch_size=64, limit=128,
+    )
+    assert Counter(sample.source_type for sample in resumed) == {"bc": 51, "rollout": 13}
+    with pytest.raises(ValueError, match="batch-aligned"):
+        RuntimeMixtureDataset(contract, expected_global_step=1, global_batch_size=10)
+
+    original_receipt = json.loads(deployment.read_text(encoding="utf-8"))
+    for key, changed in {
+        "experiment_manifest_sha256": "e" * 64,
+        "mixture_weights": {"bc": 70, "rollout": 30, "dagger": 0},
+        "source_quotas": {"bc": 45, "rollout": 19, "dagger": 0},
+    }.items():
+        _write(deployment, {**original_receipt, key: changed})
+        mounts_value["deployment_receipt_sha256"] = _sha_path(deployment)
+        _write(mounts, mounts_value)
+        with pytest.raises(ValueError, match="experiment binding"):
+            load_runtime_contract(manifest, mounts)
+
+
 def test_local_mount_can_override_only_the_external_source_readback_receipt_paths(tmp_path: Path) -> None:
     """Hydration must not rewrite immutable mixture bytes just to relocate receipts."""
     from lehome_train.groot.runtime_mixture import _manifest_digest_binding, load_runtime_contract, sha256_file

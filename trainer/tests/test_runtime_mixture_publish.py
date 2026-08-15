@@ -451,6 +451,70 @@ def test_hydrator_recreates_exact_remote_trees_and_rewrites_only_local_receipt_m
     assert all("/authoring/" not in entry["source_readback_receipt_path"] for entry in json.loads(mounts.read_text())["mounts"])
 
 
+@pytest.mark.parametrize("mismatch", [None, "experiment_manifest_sha256", "mixture_weights", "source_quotas"])
+def test_hydrator_accepts_bound_schema_v3_and_rejects_any_deployment_binding_drift(
+    tmp_path: Path, mismatch: str | None,
+) -> None:
+    from lehome_train.groot.runtime_mixture import _manifest_digest_binding, sha256_file
+    from lehome_train.groot.runtime_mixture_publish import hydrate_runtime_mixture_from_request
+    from test_runtime_mixture import _contract, _sha_path
+
+    manifest, index, mounts = _contract(tmp_path / "authoring")
+    manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+    binding = {
+        "experiment_manifest_sha256": "f" * 64,
+        "mixture_weights": {"bc": 80, "rollout": 20, "dagger": 0},
+        "source_quotas": {"bc": 51, "rollout": 13, "dagger": 0},
+    }
+    manifest_value.update({"schema_version": 3, "cycle_size": 64, **binding})
+    manifest_value["sources"][0]["quota"] = 51
+    manifest_value["sources"][1]["quota"] = 13
+    index_value = json.loads(index.read_text(encoding="utf-8"))
+    index_value["manifest_sha256"] = _manifest_digest_binding(manifest_value)
+    _write(index, index_value)
+    manifest_value["window_index"].update({"sha256": sha256_file(index), "byte_size": index.stat().st_size})
+    _write(manifest, manifest_value)
+    deployment = manifest.parent / "release-receipt.json"
+    deployment_value = json.loads(deployment.read_text(encoding="utf-8"))
+    deployment_value.update(binding)
+    for artifact in deployment_value["artifact_entries"]:
+        file = manifest.parent / artifact["relative_path"]
+        artifact.update({"sha256": _sha_path(file), "byte_size": file.stat().st_size})
+    if mismatch is not None:
+        deployment_value[mismatch] = (
+            "e" * 64 if mismatch == "experiment_manifest_sha256"
+            else {"bc": 70, "rollout": 30, "dagger": 0} if mismatch == "mixture_weights"
+            else {"bc": 45, "rollout": 19, "dagger": 0}
+        )
+    _write(deployment, deployment_value)
+    transport = MemoryTransport()
+    for artifact in deployment_value["artifact_entries"]:
+        relative = artifact["relative_path"]
+        transport.remote[f"mixtures/{'d' * 64}/{relative}"] = (manifest.parent / relative).read_bytes()
+    receipt_paths: dict[str, str] = {}
+    for source in manifest_value["sources"]:
+        root = manifest.parent / ("bc" if source["source_id"] == "bc" else "round-1")
+        prefix = source["publication"]["prefix"]
+        for file in root.rglob("*"):
+            if file.is_file():
+                transport.remote[f"{prefix}/{file.relative_to(root).as_posix()}"] = file.read_bytes()
+        receipt_paths[source["source_id"]] = source["publication"]["readback_receipt_path"]
+    destination = tmp_path / "hydrated" / "mixture"
+    request = tmp_path / "hydrate.json"
+    _write(request, {"schema_version": 1, "command": "hydrate-runtime-mixture", "arguments": {
+        "deployment_receipt": str(deployment), "source_readback_receipts": receipt_paths,
+        "destination": str(destination), "mounts_descriptor": str(destination / "mounts.json"),
+    }})
+
+    if mismatch is None:
+        result = hydrate_runtime_mixture_from_request(request, transport=transport)
+        assert result["experiment_manifest_sha256"] == "f" * 64
+        assert result["source_quotas"] == {"bc": 51, "rollout": 13, "dagger": 0}
+    else:
+        with pytest.raises(ValueError, match="experiment binding"):
+            hydrate_runtime_mixture_from_request(request, transport=transport)
+
+
 def test_hydrator_preserves_and_resumes_partial_stable_targets_after_a_rate_limit(
     tmp_path: Path,
 ) -> None:
@@ -627,6 +691,81 @@ def test_pending_publisher_and_finalizer_emit_loadable_contract_with_no_hash_cyc
         if path.is_file() and path.name != "mounts.json"
     }
     assert transport.remote == expected
+
+
+def test_manifest_bound_pending_artifact_binds_80_20_content_and_final_runtime_contract(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture import pending_mixture_id
+    from lehome_train.groot.runtime_mixture_publish import finalize_pending_mixture, publish_pending_mixture
+
+    pending, source_mounts = _pending_from_runtime_contract(tmp_path)
+    value = json.loads((pending / "publication-pending.json").read_text(encoding="utf-8"))
+    value.update({
+        "schema_version": 2,
+        "experiment_manifest_sha256": "f" * 64,
+        "mixture_weights": {"bc": 80, "rollout": 20, "dagger": 0},
+        "source_quotas": {"bc": 51, "rollout": 13, "dagger": 0},
+    })
+    value["sources"][0]["quota"] = 51
+    value["sources"][1]["quota"] = 13
+    value.pop("mixture_id")
+    value.pop("prefix")
+    mixture_id = pending_mixture_id(value)
+    _write(pending / "publication-pending.json", {**value, "mixture_id": mixture_id, "prefix": f"mixtures/{mixture_id}"})
+
+    transport = MemoryTransport()
+    receipt_path = tmp_path / "receipts" / "pending.json"
+    receipt_path.parent.mkdir()
+    receipt = publish_pending_mixture(pending_root=pending, revision="draft", receipt_path=receipt_path, transport=transport)
+    output = finalize_pending_mixture(
+        pending_root=pending, publication_receipt=receipt_path, destination=tmp_path / "final",
+        deployment_receipt_path=tmp_path / "receipts" / "deployment.json", source_mounts=source_mounts,
+        revision="final-draft", transport=transport,
+    )
+
+    final = json.loads((output / "mixture.json").read_text(encoding="utf-8"))
+    assert receipt["experiment_manifest_sha256"] == "f" * 64
+    assert final["schema_version"] == 3
+    assert final["mixture_weights"] == {"bc": 80, "rollout": 20, "dagger": 0}
+    assert final["source_quotas"] == {"bc": 51, "rollout": 13, "dagger": 0}
+
+
+@pytest.mark.parametrize("mutation", ["schema-float", "schema-bool", "quota-float", "quota-bool"])
+def test_pending_rejects_noninteger_schema_or_quota_before_hub_access(
+    tmp_path: Path, mutation: str,
+) -> None:
+    from lehome_train.groot.runtime_mixture import pending_mixture_id
+    from lehome_train.groot.runtime_mixture_publish import publish_pending_mixture
+
+    pending, _source_mounts = _pending_from_runtime_contract(tmp_path)
+    value = json.loads((pending / "publication-pending.json").read_text(encoding="utf-8"))
+    value.update({
+        "schema_version": 2,
+        "experiment_manifest_sha256": "f" * 64,
+        "mixture_weights": {"bc": 80, "rollout": 20, "dagger": 0},
+        "source_quotas": {"bc": 51, "rollout": 13, "dagger": 0},
+    })
+    value["sources"][0]["quota"] = 51
+    value["sources"][1]["quota"] = 13
+    if mutation == "schema-float":
+        value["schema_version"] = 2.0
+    elif mutation == "schema-bool":
+        value["schema_version"] = True
+    elif mutation == "quota-float":
+        value["source_quotas"]["bc"] = 4.0
+    else:
+        value["source_quotas"]["bc"] = True
+    value.pop("mixture_id")
+    value.pop("prefix")
+    mixture_id = "a" * 64 if mutation in {"schema-float", "schema-bool"} else pending_mixture_id(value)
+    _write(pending / "publication-pending.json", {**value, "mixture_id": mixture_id, "prefix": f"mixtures/{mixture_id}"})
+    transport = MemoryTransport()
+
+    with pytest.raises(ValueError):
+        publish_pending_mixture(
+            pending_root=pending, revision="draft", receipt_path=tmp_path / "receipt.json", transport=transport,
+        )
+
+    assert transport.calls == []
 
 
 def test_pending_publisher_recomputes_its_content_address_before_access(tmp_path: Path) -> None:
