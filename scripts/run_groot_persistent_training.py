@@ -44,6 +44,12 @@ RUNTIME_ABSENCE_READBACK_POLLS = 12
 RUNTIME_GPU_RECOVERY_GRACE_SECONDS = 300
 RUNTIME_GPU_RECOVERY_OBSERVATION_POLLS = 12
 RUNTIME_GPU_RECOVERY_POLL_SECONDS = 5.0
+# The only legacy, machine-id-less blocked direct-GPU claim this recovery path
+# may release was reconciled against this explicitly approved machine.  An
+# absent-offer receipt has no provider-authenticated machine row, so accepting
+# a caller-controlled alternative here would turn its conservative blacklist
+# into an unauthenticated bypass during the next rent.
+RUNTIME_GPU_LEGACY_RECOVERY_BLACKLISTED_MACHINE_ID = 140799
 RUNTIME_GPU_ARCH_TIMEOUT_SECONDS = 15
 RUNTIME_GPU_PROBE_TIMEOUT_SECONDS = 600
 RUNTIME_GPU_PROBE_CALL_TIMEOUT_SECONDS = 620
@@ -1843,6 +1849,7 @@ def _runtime_gpu_recovery_reconciled_receipt_is_valid(
 ) -> bool:
     observations = receipt.get("observations")
     expected_empty_hash = _hash([])
+    observation_timestamps = [row.get("timestamp_unix") for row in observations] if isinstance(observations, list) else []
     common = (
         receipt.get("schema_version") == 1 and receipt.get("kind") == "runtime_mixture_gpu_rent_recovery_receipt"
         and receipt.get("status") == "reconciled" and receipt.get("released") is False
@@ -1850,6 +1857,7 @@ def _runtime_gpu_recovery_reconciled_receipt_is_valid(
         and receipt.get("original_offer_id") == original_offer_id and receipt.get("archive_claims") == archives
         and isinstance(observations, list) and len(observations) == RUNTIME_GPU_RECOVERY_OBSERVATION_POLLS
         and all(isinstance(row, Mapping) and set(row) == {"timestamp_unix", "instances_sha256", "volumes_sha256"} and type(row.get("timestamp_unix")) is int and row.get("instances_sha256") == expected_empty_hash and row.get("volumes_sha256") == expected_empty_hash for row in observations)
+        and all(before <= after for before, after in zip(observation_timestamps, observation_timestamps[1:]))
     )
     if receipt.get("offer_proof_mode") == "absent":
         snapshot_fields = {"timestamp_unix", "query_sha256", "response_sha256", "matching_count"}
@@ -2030,6 +2038,7 @@ def _validate_runtime_gpu_recovery_for_new_rent(
         or hashlib.sha256(archive_path.read_bytes()).hexdigest() != receipt.get("canonical_claim_sha256")
         or not _positive_int(receipt.get("original_offer_id"))
         or not _positive_int(receipt.get("reconciled_machine_id") if mode == "present" else receipt.get("blacklisted_machine_id"))
+        or (mode == "absent" and receipt.get("blacklisted_machine_id") != RUNTIME_GPU_LEGACY_RECOVERY_BLACKLISTED_MACHINE_ID)
     ):
         raise ValueError("runtime GPU recovery receipt archive is invalid")
     try:

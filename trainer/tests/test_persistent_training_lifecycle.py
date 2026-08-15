@@ -1967,6 +1967,103 @@ def test_ambiguous_rent_recovery_releases_after_two_absent_offer_snapshots(
     assert receipt["blacklisted_machine_id"] == 140799
     assert receipt["start_offer_snapshot"]["matching_count"] == receipt["end_offer_snapshot"]["matching_count"] == 0
     assert receipt["released"] is True and not claim_path.exists()
+
+
+@pytest.mark.parametrize("responses", ([[], [{"id": 8, "machine_id": 140799, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": .18}]], [None], [[{"id": 8}, {"id": 8}]], [[{"id": 9}]]))
+def test_absent_offer_recovery_rejects_reappearance_or_invalid_narrow_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, responses: list[object],
+) -> None:
+    recovery, claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(tmp_path, monkeypatch)
+    searches: list[tuple[str, ...]] = []
+    values = iter(responses)
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            searches.append(command); return json.dumps(next(values))
+        if command[:4] in {("vastai", "--raw", "show", "instances"), ("vastai", "--raw", "show", "volumes")}:
+            return "[]"
+        raise AssertionError(command)
+    clock = iter(range(int(original["expires_at_unix"]) + 300, int(original["expires_at_unix"]) + 400, 5))
+    with pytest.raises(ValueError):
+        LIFECYCLE.recover_runtime_gpu_rent(request=recovery, runner=runner, now_unix=lambda: next(clock), sleep=lambda _: None)
+    assert claim_path.exists() and json.loads(Path(str(recovery["recovery_receipt"])).read_text())["status"] == "observing"
+    assert searches and all(command[4] == "id = 8" for command in searches)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "query_sha256", "response_sha256", "matching_count", "start_timestamp",
+        "end_timestamp", "observation_timestamp", "blacklisted_machine_id",
+        "original_offer_id", "archive_claims",
+    ),
+)
+def test_absent_recovery_consumer_rejects_every_authenticated_proof_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str,
+) -> None:
+    recovery, _claim, _path, original = _blocked_gpu_rent_recovery_fixture(tmp_path, monkeypatch)
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"): return "[]"
+        if command[:4] in {("vastai", "--raw", "show", "instances"), ("vastai", "--raw", "show", "volumes")} : return "[]"
+        raise AssertionError(command)
+    clock = iter(range(int(original["expires_at_unix"]) + 300, int(original["expires_at_unix"]) + 400, 5))
+    LIFECYCLE.recover_runtime_gpu_rent(request=recovery, runner=runner, now_unix=lambda: next(clock), sleep=lambda _: None)
+    receipt_path = Path(str(recovery["recovery_receipt"])); receipt = json.loads(receipt_path.read_text())
+    if tamper in {"query_sha256", "response_sha256"}:
+        receipt["start_offer_snapshot"][tamper] = "0" * 64
+    elif tamper == "matching_count":
+        receipt["start_offer_snapshot"]["matching_count"] = 1
+    elif tamper == "start_timestamp":
+        receipt["start_offer_snapshot"]["timestamp_unix"] = receipt["end_offer_snapshot"]["timestamp_unix"]
+    elif tamper == "end_timestamp":
+        receipt["end_offer_snapshot"]["timestamp_unix"] = receipt["start_offer_snapshot"]["timestamp_unix"] + 59
+    elif tamper == "observation_timestamp":
+        receipt["observations"][0]["timestamp_unix"] = receipt["start_offer_snapshot"]["timestamp_unix"] - 1
+    elif tamper in {"blacklisted_machine_id", "original_offer_id"}:
+        receipt[tamper] = 1
+    else:
+        receipt["archive_claims"] = []
+    receipt_path.write_text(json.dumps(receipt))
+    fresh = dict(original) | {"offer": dict(original["offer"]) | {"id": 9, "machine_id": 140800}, "recovery_receipt": str(receipt_path)}  # type: ignore[arg-type]
+    identity = LIFECYCLE._runtime_campaign_binding(fresh)
+    with pytest.raises(ValueError, match="recovery receipt"):
+        LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(request=fresh, identity=identity, claim_path=LIFECYCLE._runtime_gpu_rent_claim_path(request=fresh, identity=identity, allow_held=True))
+
+
+def test_absent_recovery_consumer_accepts_only_a_different_offer_and_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery, _claim, _path, original = _blocked_gpu_rent_recovery_fixture(tmp_path, monkeypatch)
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            assert command[4] == "id = 8"
+            return "[]"
+        if command[:4] in {("vastai", "--raw", "show", "instances"), ("vastai", "--raw", "show", "volumes")}:
+            return "[]"
+        raise AssertionError(command)
+
+    clock = iter(range(int(original["expires_at_unix"]) + 300, int(original["expires_at_unix"]) + 400, 5))
+    LIFECYCLE.recover_runtime_gpu_rent(
+        request=recovery, runner=runner, now_unix=lambda: next(clock), sleep=lambda _: None,
+    )
+    fresh = dict(original) | {
+        "offer": dict(original["offer"]) | {"id": 9, "machine_id": 140800},  # type: ignore[arg-type]
+        "recovery_receipt": str(recovery["recovery_receipt"]),
+    }
+    identity = LIFECYCLE._runtime_campaign_binding(fresh)
+    claim_path = LIFECYCLE._runtime_gpu_rent_claim_path(request=fresh, identity=identity, allow_held=True)
+
+    LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
+        request=fresh, identity=identity, claim_path=claim_path,
+    )
+    for offer in (
+        dict(fresh["offer"]) | {"id": 8},  # type: ignore[arg-type]
+        dict(fresh["offer"]) | {"machine_id": 140799},  # type: ignore[arg-type]
+    ):
+        with pytest.raises(ValueError, match="different offer and machine"):
+            LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
+                request=fresh | {"offer": offer}, identity=identity, claim_path=claim_path,
+            )
 def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_path: Path) -> None:
     commands: list[tuple[str, ...]] = []
     readiness_reads = 0
