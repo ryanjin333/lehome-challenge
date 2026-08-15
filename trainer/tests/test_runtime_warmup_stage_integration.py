@@ -485,6 +485,9 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
                 "bootstrap_capability_receipt": str(bootstrap_capability),
             }, runner=runner,
         )
+    assert (cache / "parent" / "model.safetensors").is_file()
+    assert not (cache / "parent" / "policies").exists()
+    assert policy_artifact_sha256(cache / "parent") == parent_identity["artifact_sha256"]
     assert all("mkdir -p /prepared/config /prepared/runtime" not in command[-1] for command in calls if command[0] == "ssh")
     assert not (prepared / "runtime").exists()
 

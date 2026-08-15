@@ -1738,7 +1738,8 @@ def _runtime_gpu_parent_hydration_command(
         "if test -e \"$parent_tmp/repo/.cache\"; then test -d \"$parent_tmp/repo/.cache\"; test ! -L \"$parent_tmp/repo/.cache\"; rm -rf \"$parent_tmp/repo/.cache\"; fi; "
         "test -z \"$(find \"$parent_tmp/repo\" -xdev \\( -type l -o \\( ! -type d -a ! -type f \\) \\) -print -quit)\"; "
         "test -z \"$(find \"$parent_tmp/repo\" -mindepth 1 -maxdepth 1 ! -name policies -print -quit)\"; "
-        "mv \"$parent_tmp/repo/policies\" /cache/parent/policies; "
+        "cp -a \"$parent_tmp/repo/policies/step-12000/.\" /cache/parent; "
+        "test ! -e /cache/parent/policies; "
         "test ! -L /cache/parent; "
         "PYTHONPATH=/prepared/code/trainer/src /opt/runtime/bin/python -c "
         + shlex.quote(

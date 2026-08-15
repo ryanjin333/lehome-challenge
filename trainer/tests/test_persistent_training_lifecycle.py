@@ -4030,6 +4030,8 @@ def test_runtime_gpu_bootstrap_hydrates_the_immutable_parent_on_host_without_scp
     assert "HF_TOKEN=\"$(cat /prepared/config/runtime.token)\"" in setup
     assert "private-token" not in setup and "parent.tar" not in setup
     assert "test -z \"$(find \"$parent_tmp/repo\"" in setup
+    assert "cp -a \"$parent_tmp/repo/policies/step-12000/.\" /cache/parent" in setup
+    assert "mv \"$parent_tmp/repo/policies\" /cache/parent/policies" not in setup
     assert "policy_artifact_sha256" in setup and "/cache/parent" in setup
     assert receipt["parent_hydration"] == hydration
     assert receipt["parent_checkpoint_artifact_sha256"] == hydration["artifact_sha256"]
