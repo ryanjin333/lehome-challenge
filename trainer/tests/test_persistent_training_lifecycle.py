@@ -4160,6 +4160,30 @@ def test_direct_runtime_hydrate_rejects_an_unsafe_controller_intent_root(
         )
 
 
+def test_direct_runtime_hydrate_test_intent_root_never_touches_the_controller_root(
+    tmp_path: Path,
+) -> None:
+    real_root = Path("/private/tmp/lehome-runtime-gpu-hydration-intents")
+    before = (real_root.exists(), real_root.stat().st_mtime_ns if real_root.exists() else None)
+    assert LIFECYCLE.RUNTIME_GPU_HYDRATION_INTENT_ROOT == tmp_path / "gpu-hydration-intents"
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    }
+    request["failure_receipt"] = str(tmp_path / "failure.json")
+
+    result = LIFECYCLE.runtime_mixture_hydrate(
+        instance=instance, request=request,
+        runner=lambda command: (_ for _ in ()).throw(subprocess.CalledProcessError(255, command)),
+    )
+
+    after = (real_root.exists(), real_root.stat().st_mtime_ns if real_root.exists() else None)
+    assert result["pending"] is True
+    assert before == after
+
+
 def test_runtime_cpu_pilot_bootstrap_runtime_hydrate_and_run_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -4033,16 +4033,27 @@ def _runtime_gpu_hydration_launch_intent(
         "code_revision": request.get("code_revision"), "code_bundle_sha256": request.get("code_bundle_sha256"),
         "runtime_hydrate_request_sha256": request_sha256,
     }
+    def attached() -> bool:
+        # O_EXCL makes the name visible before the winner has fsynced its bytes.
+        # Wait only for that local write window; a stable malformed file is tamper.
+        for _ in range(20):
+            if path.is_symlink():
+                raise ValueError("runtime hydration launch intent is tampered or incompatible")
+            try:
+                observed = dict(_load_regular_json(path, "runtime hydration launch intent"))
+            except ValueError:
+                time.sleep(0.01)
+                continue
+            if observed != expected:
+                raise ValueError("runtime hydration launch intent is tampered or incompatible")
+            return True
+        raise ValueError("runtime hydration launch intent is malformed or incomplete")
     if path.exists() or path.is_symlink():
-        if path.is_symlink() or dict(_load_regular_json(path, "runtime hydration launch intent")) != expected:
-            raise ValueError("runtime hydration launch intent is tampered or incompatible")
-        return True
+        return attached()
     try:
         _write_exclusive_json(path, expected)
     except FileExistsError:
-        if path.is_symlink() or dict(_load_regular_json(path, "runtime hydration launch intent")) != expected:
-            raise ValueError("runtime hydration launch intent is tampered or incompatible") from None
-        return True
+        return attached()
     if dict(_load_regular_json(path, "runtime hydration launch intent")) != expected:
         raise RuntimeError("runtime hydration launch intent readback mismatches")
     return False
