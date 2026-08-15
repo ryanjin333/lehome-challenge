@@ -1850,6 +1850,60 @@ def test_ambiguous_rent_recovery_reconciles_the_five_real_legacy_archive_names(
     assert all(re.fullmatch(r"[0-9a-f]{64}", str(entry["byte_sha256"])) for entry in archives)
 
 
+def test_absent_recovery_consumer_accepts_legacy_archive_set_regardless_of_scan_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery, claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(tmp_path, monkeypatch)
+    claim = json.loads(claim_path.read_text(encoding="utf-8"))
+    suffixes = (
+        ".blocked-no-instance-offer-32602753-20260814T1525.json",
+        ".blocked-no-instance-offer-38355172-20260814T1527.json",
+        ".blocked-no-instance-offer-46000988-20260814T1523.json",
+        ".blocked-no-instance-offer-47277315-20260814T1521.json",
+        ".blocked-verified-empty-20260814T1510.json",
+    )
+    for index, suffix in enumerate(suffixes):
+        archived = claim | {"request_sha256": f"{index + 1:x}" * 64, "offer_sha256": f"{index + 6:x}" * 64}
+        claim_path.with_name(claim_path.stem + suffix).write_bytes(LIFECYCLE.canonical_json_bytes(archived))
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            assert command[4] == "id = 8"
+            return "[]"
+        if command[:4] in {("vastai", "--raw", "show", "instances"), ("vastai", "--raw", "show", "volumes")}:
+            return "[]"
+        raise AssertionError(command)
+
+    clock = iter(range(int(original["expires_at_unix"]) + 300, int(original["expires_at_unix"]) + 400, 5))
+    LIFECYCLE.recover_runtime_gpu_rent(
+        request=recovery, runner=runner, now_unix=lambda: next(clock), sleep=lambda _: None,
+    )
+    receipt_path = Path(str(recovery["recovery_receipt"]))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert [row["relative_filename"] for row in receipt["archive_claims"][:-1]] == [claim_path.stem + suffix for suffix in suffixes]
+    fresh = dict(original) | {
+        "offer": dict(original["offer"]) | {"id": 47725426, "machine_id": 41998, "is_bid": False, "dph_total": 1.111111},  # type: ignore[arg-type]
+        "search_mode": "on_demand", "requested_storage_gb": 300,
+        "recovery_receipt": str(receipt_path),
+    }
+    identity = LIFECYCLE._runtime_campaign_binding(fresh)
+    consumer_claim_path = LIFECYCLE._runtime_gpu_rent_claim_path(request=fresh, identity=identity, allow_held=True)
+
+    LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
+        request=fresh, identity=identity, claim_path=consumer_claim_path,
+    )
+    for mutated_claims in (
+        receipt["archive_claims"][1:],
+        receipt["archive_claims"] + [receipt["archive_claims"][0]],
+        [dict(row) | ({"byte_sha256": "0" * 64} if index == 0 else {}) for index, row in enumerate(receipt["archive_claims"])],
+    ):
+        receipt_path.write_text(json.dumps(receipt | {"archive_claims": mutated_claims}), encoding="utf-8")
+        with pytest.raises(ValueError, match="recovery receipt"):
+            LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
+                request=fresh, identity=identity, claim_path=consumer_claim_path,
+            )
+
+
 def test_ambiguous_rent_recovery_rejects_invalid_legacy_archive_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

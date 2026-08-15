@@ -1976,6 +1976,33 @@ def _runtime_gpu_recovery_offer_proof_is_valid(
     )
 
 
+def _runtime_gpu_recovery_archive_claims_match(
+    receipt_rows: object, archive_rows: list[dict[str, object]],
+) -> bool:
+    """Compare authenticated archive rows as a strict filename-keyed set."""
+    fields = {
+        "relative_filename", "byte_sha256", "request_sha256", "offer_sha256",
+        "reconciled_machine_id", "original_offer_id",
+    }
+    if not isinstance(receipt_rows, list) or len(receipt_rows) != len(archive_rows):
+        return False
+    normalized: dict[str, dict[str, object]] = {}
+    for row in receipt_rows:
+        if (
+            not isinstance(row, Mapping) or set(row) != fields
+            or not isinstance(row.get("relative_filename"), str)
+            or not row["relative_filename"]
+            or any(re.fullmatch(r"[0-9a-f]{64}", str(row.get(key))) is None for key in ("byte_sha256", "request_sha256", "offer_sha256"))
+            or row.get("reconciled_machine_id") is not None and not _positive_int(row.get("reconciled_machine_id"))
+            or row.get("original_offer_id") is not None and not _positive_int(row.get("original_offer_id"))
+            or row["relative_filename"] in normalized
+        ):
+            return False
+        normalized[row["relative_filename"]] = dict(row)
+    expected = {str(row["relative_filename"]): row for row in archive_rows}
+    return len(expected) == len(archive_rows) and normalized == expected
+
+
 def _runtime_gpu_recovery_reconciled_receipt_is_valid(
     receipt: Mapping[str, object], *, claim_path: Path, claim_sha256: str,
     original_offer_id: int, machine_id: int, archives: list[dict[str, object]],
@@ -1987,7 +2014,8 @@ def _runtime_gpu_recovery_reconciled_receipt_is_valid(
         receipt.get("schema_version") == 1 and receipt.get("kind") == "runtime_mixture_gpu_rent_recovery_receipt"
         and receipt.get("status") == "reconciled" and receipt.get("released") is False
         and receipt.get("canonical_claim_path") == str(claim_path) and receipt.get("canonical_claim_sha256") == claim_sha256
-        and receipt.get("original_offer_id") == original_offer_id and receipt.get("archive_claims") == archives
+        and receipt.get("original_offer_id") == original_offer_id
+        and _runtime_gpu_recovery_archive_claims_match(receipt.get("archive_claims"), archives)
         and isinstance(observations, list) and len(observations) == RUNTIME_GPU_RECOVERY_OBSERVATION_POLLS
         and all(isinstance(row, Mapping) and set(row) == {"timestamp_unix", "instances_sha256", "volumes_sha256"} and type(row.get("timestamp_unix")) is int and row.get("instances_sha256") == expected_empty_hash and row.get("volumes_sha256") == expected_empty_hash for row in observations)
         and all(before <= after for before, after in zip(observation_timestamps, observation_timestamps[1:]))
