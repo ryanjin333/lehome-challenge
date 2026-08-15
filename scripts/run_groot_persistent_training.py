@@ -1680,6 +1680,23 @@ def _runtime_gpu_recovery_archive_path(claim_path: Path, claim_bytes_sha256: str
     return claim_path.with_name(claim_path.stem + ".blocked-" + claim_bytes_sha256 + ".json")
 
 
+_RUNTIME_GPU_LEGACY_ARCHIVE_SUFFIXES = frozenset({
+    ".blocked-no-instance-offer-32602753-20260814T1525.json",
+    ".blocked-no-instance-offer-38355172-20260814T1527.json",
+    ".blocked-no-instance-offer-46000988-20260814T1523.json",
+    ".blocked-no-instance-offer-47277315-20260814T1521.json",
+    ".blocked-verified-empty-20260814T1510.json",
+})
+
+
+def _runtime_gpu_recovery_archive_name_is_valid(path: Path, claim_path: Path) -> bool:
+    suffix = path.name.removeprefix(claim_path.stem)
+    return (
+        suffix in _RUNTIME_GPU_LEGACY_ARCHIVE_SUFFIXES
+        or re.fullmatch(r"\.blocked-[0-9a-f]{64}\.json", suffix) is not None
+    )
+
+
 def _runtime_gpu_recovery_archives(
     *, claim_path: Path, identity: Mapping[str, object], request: Mapping[str, object],
 ) -> list[dict[str, object]]:
@@ -1692,12 +1709,16 @@ def _runtime_gpu_recovery_archives(
             raise ValueError("runtime GPU recovery archive namespace has an unrelated file")
         if not path.name.startswith(prefix):
             continue
-        digest = path.name[len(prefix):-5] if path.name.endswith(".json") else ""
-        if re.fullmatch(r"[0-9a-f]{64}", digest) is None or path.is_symlink() or not path.is_file():
+        if not _runtime_gpu_recovery_archive_name_is_valid(path, claim_path) or path.is_symlink() or not path.is_file():
             raise ValueError("runtime GPU recovery archive namespace is malformed")
         raw = path.read_bytes()
         actual = hashlib.sha256(raw).hexdigest()
-        if actual != digest or actual in digests:
+        suffix = path.name.removeprefix(claim_path.stem)
+        named_digest = suffix.removeprefix(".blocked-").removesuffix(".json")
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", named_digest) is not None
+            and actual != named_digest
+        ) or actual in digests:
             raise ValueError("runtime GPU recovery archive hash is ambiguous")
         try:
             value = json.loads(raw.decode("utf-8"))

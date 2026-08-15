@@ -1,6 +1,7 @@
 from pathlib import Path
 import hashlib
 import json
+import re
 import subprocess
 import tarfile
 import threading
@@ -1752,6 +1753,45 @@ def test_ambiguous_rent_recovery_rejects_malformed_prior_archive_before_provider
             now_unix=int(original["expires_at_unix"]) + 300, sleep=lambda _: None,
         )
     assert claim_path.exists()
+
+
+def test_ambiguous_rent_recovery_reconciles_the_five_real_legacy_archive_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The existing blocked-claim namespace is validated without provider access."""
+    _recovery, claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(tmp_path, monkeypatch)
+    claim = json.loads(claim_path.read_text(encoding="utf-8"))
+    suffixes = (
+        ".blocked-no-instance-offer-32602753-20260814T1525.json",
+        ".blocked-no-instance-offer-38355172-20260814T1527.json",
+        ".blocked-no-instance-offer-46000988-20260814T1523.json",
+        ".blocked-no-instance-offer-47277315-20260814T1521.json",
+        ".blocked-verified-empty-20260814T1510.json",
+    )
+    for index, suffix in enumerate(suffixes):
+        archived = claim | {"request_sha256": f"{index + 1:x}" * 64, "offer_sha256": f"{index + 6:x}" * 64}
+        claim_path.with_name(claim_path.stem + suffix).write_bytes(LIFECYCLE.canonical_json_bytes(archived))
+
+    archives = LIFECYCLE._runtime_gpu_recovery_archives(
+        claim_path=claim_path, identity=LIFECYCLE._runtime_campaign_binding(original), request=original,
+    )
+
+    assert [entry["relative_filename"] for entry in archives] == [claim_path.stem + suffix for suffix in suffixes]
+    assert all(re.fullmatch(r"[0-9a-f]{64}", str(entry["byte_sha256"])) for entry in archives)
+
+
+def test_ambiguous_rent_recovery_rejects_invalid_legacy_archive_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _recovery, claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(tmp_path, monkeypatch)
+    claim_path.with_name(
+        claim_path.stem + ".blocked-no-instance-offer-1-20260814T1510.json"
+    ).write_bytes(LIFECYCLE.canonical_json_bytes(json.loads(claim_path.read_text(encoding="utf-8"))))
+
+    with pytest.raises(ValueError, match="archive namespace"):
+        LIFECYCLE._runtime_gpu_recovery_archives(
+            claim_path=claim_path, identity=LIFECYCLE._runtime_campaign_binding(original), request=original,
+        )
 
 
 def test_ambiguous_rent_recovery_reconciles_multiple_prior_archives_and_gates_retry(
