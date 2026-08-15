@@ -2053,6 +2053,66 @@ def test_on_demand_recovery_authenticates_original_offer_id_in_present_proofs(
         )
 
 
+def test_on_demand_recovery_releases_when_the_same_machine_churns_offer_id_and_price(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery, claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(
+        tmp_path, monkeypatch, on_demand=True,
+    )
+    observed = dict(original["offer"]) | {"id": 47749699, "dph_total": 1.5822}  # type: ignore[arg-type]
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return json.dumps([observed])
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        raise AssertionError(command)
+
+    result = LIFECYCLE.recover_runtime_gpu_rent(
+        request=recovery, runner=runner,
+        now_unix=int(original["expires_at_unix"]) + 300, sleep=lambda _: None,
+    )
+
+    receipt = result["recovery_receipt"]
+    assert receipt["released"] is True and not claim_path.exists()
+    for proof_name in ("start_offer_proof", "end_offer_proof"):
+        proof = receipt[proof_name]
+        assert proof["attempted_offer_id"] == original["offer"]["id"]  # type: ignore[index]
+        assert proof["observed_offer_id"] == observed["id"]
+        assert proof["observed_dph_total"] == observed["dph_total"]
+
+
+@pytest.mark.parametrize("field, value", (
+    ("machine_id", 59344), ("gpu_name", "RTX 3090"), ("datacenter", False),
+))
+def test_on_demand_recovery_rejects_churned_snapshot_without_machine_sku_or_datacenter_invariants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: object,
+) -> None:
+    recovery, claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(
+        tmp_path, monkeypatch, on_demand=True,
+    )
+    observed = dict(original["offer"]) | {"id": 47749699, "dph_total": 1.5822, field: value}  # type: ignore[arg-type]
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return json.dumps([observed])
+        raise AssertionError(command)
+
+    with pytest.raises(ValueError, match="on-demand offer drifted"):
+        LIFECYCLE.recover_runtime_gpu_rent(
+            request=recovery, runner=runner,
+            now_unix=int(original["expires_at_unix"]) + 300, sleep=lambda _: None,
+        )
+
+    assert claim_path.exists()
+    assert not any(command[:4] == ("vastai", "--raw", "show", "instances") for command in calls)
+
+
 @pytest.mark.parametrize("field, value", (("id", 47749610), ("dph_total", 1.08)))
 def test_on_demand_recovery_rejects_tampered_claimed_attempted_row_before_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: object,
@@ -2099,7 +2159,7 @@ def test_on_demand_recovery_rejects_wrong_authenticated_machine_before_provider(
     (
         {},
         [{
-            "id": 47749610, "machine_id": 59343, "gpu_name": "RTX PRO 6000 WS",
+            "id": 47749610, "machine_id": 59343, "gpu_name": "RTX 3090",
             "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.08,
             "is_bid": False, "rentable": True, "rented": False,
         }],

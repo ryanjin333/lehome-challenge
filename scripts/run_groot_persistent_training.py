@@ -2296,16 +2296,22 @@ def _runtime_gpu_recovery_offer_snapshot(
             and row.get("gpu_name") == original_offer.get("gpu_name")
             and row.get("gpu_ram") == original_offer.get("gpu_ram")
             and row.get("num_gpus") == original_offer.get("num_gpus") == 1
-            and row.get("dph_total") == original_offer.get("dph_total")
+            and type(row.get("dph_total")) in (int, float)
+            and math.isfinite(float(row["dph_total"])) and float(row["dph_total"]) > 0
             and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False
             and _offer_gpu(row) and _runtime_gpu_datacenter_row(row)
         ]
         if len(matching) != 1:
             raise ValueError("runtime GPU recovery on-demand offer drifted")
-        proof = _project(matching[0], (
-            "id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "is_bid", "rentable", "rented",
-        ))
-        proof["attempted_offer_id"] = original_offer_id
+        observed = matching[0]
+        proof = {
+            "attempted_offer_id": original_offer_id,
+            "observed_offer_id": observed["id"], "machine_id": observed["machine_id"],
+            "gpu_name": observed["gpu_name"], "gpu_ram": observed["gpu_ram"],
+            "num_gpus": observed["num_gpus"], "observed_dph_total": observed["dph_total"],
+            "is_bid": observed["is_bid"], "rentable": observed["rentable"],
+            "rented": observed["rented"], "datacenter_policy": RUNTIME_GPU_DATACENTER_POLICY,
+        }
         return "present", proof
     if search_mode != "interruptible":
         raise ValueError("runtime GPU recovery original offer mode is invalid")
@@ -2358,18 +2364,21 @@ def _runtime_gpu_recovery_offer_proof_is_valid(
 def _runtime_gpu_recovery_on_demand_offer_proof_is_valid(
     proof: object, *, original_offer: Mapping[str, object], machine_id: int,
 ) -> bool:
-    fields = {"id", "attempted_offer_id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "is_bid", "rentable", "rented"}
-    compared_fields = fields - {"id", "attempted_offer_id"}
+    fields = {
+        "attempted_offer_id", "observed_offer_id", "machine_id", "gpu_name", "gpu_ram",
+        "num_gpus", "observed_dph_total", "is_bid", "rentable", "rented", "datacenter_policy",
+    }
     return (
         isinstance(proof, Mapping) and set(proof) == fields
-        and all(proof.get(key) == original_offer.get(key) for key in compared_fields)
+        and all(proof.get(key) == original_offer.get(key) for key in ("machine_id", "gpu_name", "gpu_ram", "num_gpus"))
         and proof.get("attempted_offer_id") == original_offer.get("id")
-        and _positive_int(proof.get("attempted_offer_id")) and _positive_int(proof.get("id"))
+        and _positive_int(proof.get("attempted_offer_id")) and _positive_int(proof.get("observed_offer_id"))
         and proof.get("machine_id") == machine_id and _positive_int(machine_id)
         and _offer_gpu(proof) and proof.get("num_gpus") == 1
-        and type(proof.get("dph_total")) in (int, float)
-        and math.isfinite(float(proof["dph_total"])) and float(proof["dph_total"]) > 0
+        and type(proof.get("observed_dph_total")) in (int, float)
+        and math.isfinite(float(proof["observed_dph_total"])) and float(proof["observed_dph_total"]) > 0
         and proof.get("is_bid") is False and proof.get("rentable") is True and proof.get("rented") is False
+        and proof.get("datacenter_policy") == RUNTIME_GPU_DATACENTER_POLICY
     )
 
 
