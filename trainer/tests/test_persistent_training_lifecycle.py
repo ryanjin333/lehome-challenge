@@ -79,6 +79,8 @@ def test_vast_ssh_and_scp_prefixes_use_the_approved_identity(
     for command in (ssh, scp):
         assert ("-i", str(identity)) in zip(command, command[1:])
         assert ("-o", "IdentitiesOnly=yes") in zip(command, command[1:])
+        assert ("-o", "ServerAliveInterval=15") in zip(command, command[1:])
+        assert ("-o", "ServerAliveCountMax=4") in zip(command, command[1:])
         assert ("-o", "StrictHostKeyChecking=accept-new") in zip(command, command[1:])
     assert ssh[:1] == ("ssh",)
     assert scp[:2] == ("scp", "-r")
@@ -3657,6 +3659,20 @@ def _runtime_pilot_request_files(tmp_path: Path) -> tuple[dict[str, object], dic
     bootstrap_path = tmp_path / "bootstrap.json"
     bootstrap_path.write_text(json.dumps(bootstrap), encoding="utf-8")
     request["bootstrap_receipt"] = str(bootstrap_path)
+    hydrate_request = tmp_path / "runtime-hydrate.json"
+    hydrate_request.write_text(json.dumps({
+        "schema_version": 1, "command": "hydrate-runtime-mixture",
+        "arguments": {
+            "deployment_receipt": "/prepared/config/deployment-receipt.json",
+            "source_readback_receipts": {
+                "organizer": "/prepared/config/bc-readback.json",
+                "rollout": "/prepared/config/rollout-readback.json",
+            },
+            "destination": "/prepared/runtime",
+            "mounts_descriptor": "/prepared/runtime/mounts.json",
+        },
+    }), encoding="utf-8")
+    request["runtime_hydrate_request"] = str(hydrate_request)
     return instance, request
 
 
@@ -3711,8 +3727,22 @@ def test_runtime_hydrate_dispatch_allows_cpu_pilot_lease_and_rejects_mismatched_
         "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
         "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
     }
+    request_sha256 = LIFECYCLE._runtime_gpu_hydration_request_sha256(request)
+
+    def gpu_runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command[0] != "ssh":
+            raise AssertionError(command)
+        if "/usr/bin/setsid /usr/bin/nohup" in command[-1]:
+            return "started\n"
+        if "kill -0" in command[-1]:
+            return "success " + request_sha256 + "\n"
+        if "/receipt.json" in command[-1]:
+            return json.dumps(receipt)
+        raise AssertionError(command)
+
     gpu = LIFECYCLE.remote_action(
-        action="runtime-hydrate", instance=gpu_instance, request=request, runner=runner,
+        action="runtime-hydrate", instance=gpu_instance, request=request, runner=gpu_runner,
     )
 
     assert gpu["hydration_receipt"] == receipt
@@ -3735,6 +3765,153 @@ def test_runtime_hydrate_dispatch_allows_cpu_pilot_lease_and_rejects_mismatched_
         ("vastai", "destroy", "instance", "44", "--yes"),
         ("vastai", "--raw", "show", "instance", "44"),
     ]
+    assert json.loads(Path(str(request["failure_receipt"])).read_text())["cleanup_status"] == "destroyed_and_absent"
+
+
+def test_direct_runtime_hydrate_tolerates_one_transport_255_then_collects_the_same_job(
+    tmp_path: Path,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    }
+    request["failure_receipt"] = str(tmp_path / "hydrate-failure.json")
+    calls: list[tuple[str, ...]] = []
+    polls = 0
+    request_sha256 = LIFECYCLE._runtime_gpu_hydration_request_sha256(request)
+    receipt = {
+        "kind": "runtime_mixture_hydration", "immutable_revision": "c" * 40,
+        "remote_prefix": "mixtures/" + "d" * 64, "fresh_readback_verified": True,
+    }
+
+    def runner(command: tuple[str, ...]) -> str:
+        nonlocal polls
+        calls.append(command)
+        if command[0] == "ssh" and "/usr/bin/setsid /usr/bin/nohup" in command[-1]:
+            return "started\n"
+        if command[0] == "ssh" and "kill -0" in command[-1]:
+            polls += 1
+            if polls == 1:
+                raise subprocess.CalledProcessError(255, command, stderr="transport reset")
+            return "success " + request_sha256 + "\n"
+        if command[0] == "ssh" and "/receipt.json" in command[-1]:
+            return json.dumps(receipt)
+        if command[0] == "vastai":
+            raise AssertionError("unresolved hydration transport must not destroy")
+        raise AssertionError(command)
+
+    result = LIFECYCLE.remote_action(
+        action="runtime-hydrate", instance=instance, request=request, runner=runner,
+    )
+
+    assert result["hydration_receipt"] == receipt
+    assert polls == 2
+    assert not Path(str(request["failure_receipt"])).exists()
+    assert all(
+        ("-o", "ConnectTimeout=15") in zip(command, command[1:])
+        for command in calls if command[0] == "ssh"
+    )
+
+
+def test_direct_runtime_hydrate_reattaches_pending_job_without_second_launch(
+    tmp_path: Path,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    }
+    start_results: list[str] = []
+    request_sha256 = LIFECYCLE._runtime_gpu_hydration_request_sha256(request)
+    status = ["running\n", "running\n", "running\n", "success " + request_sha256 + "\n"]
+    receipt = {
+        "kind": "runtime_mixture_hydration", "immutable_revision": "c" * 40,
+        "remote_prefix": "mixtures/" + "d" * 64, "fresh_readback_verified": True,
+    }
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[0] != "ssh":
+            raise AssertionError(command)
+        if "/usr/bin/setsid /usr/bin/nohup" in command[-1]:
+            result = "started\n" if not start_results else "attached\n"
+            start_results.append(result.strip())
+            return result
+        if "kill -0" in command[-1]:
+            return status.pop(0)
+        if "/receipt.json" in command[-1]:
+            return json.dumps(receipt)
+        raise AssertionError(command)
+
+    first = LIFECYCLE.runtime_mixture_hydrate(
+        instance=instance, request=request, runner=runner, sleep=lambda _seconds: None,
+    )
+    second = LIFECYCLE.runtime_mixture_hydrate(
+        instance=instance, request=request, runner=runner, sleep=lambda _seconds: None,
+    )
+
+    assert first["pending"] is True
+    assert second["hydration_receipt"] == receipt
+    assert start_results == ["started", "attached"]
+
+
+@pytest.mark.parametrize("state", ("failure", "tampered", "disappeared"))
+def test_direct_runtime_hydrate_terminal_or_identity_failure_is_not_pending(
+    tmp_path: Path, state: str,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    }
+    request_sha256 = LIFECYCLE._runtime_gpu_hydration_request_sha256(request)
+    status = "failure " + request_sha256 + " 1\n" if state == "failure" else state + "\n"
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[0] == "ssh" and "/usr/bin/setsid /usr/bin/nohup" in command[-1]:
+            return "started\n"
+        if command[0] == "ssh" and "kill -0" in command[-1]:
+            return status
+        raise AssertionError(command)
+
+    with pytest.raises(ValueError, match="runtime hydration"):
+        LIFECYCLE.runtime_mixture_hydrate(instance=instance, request=request, runner=runner)
+
+
+def test_direct_runtime_hydrate_terminal_failure_invokes_the_existing_cleanup_once(
+    tmp_path: Path,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    }
+    request["failure_receipt"] = str(tmp_path / "terminal-failure.json")
+    request_sha256 = LIFECYCLE._runtime_gpu_hydration_request_sha256(request)
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command[0] == "ssh" and "/usr/bin/setsid /usr/bin/nohup" in command[-1]:
+            return "started\n"
+        if command[0] == "ssh" and "kill -0" in command[-1]:
+            return "failure " + request_sha256 + " 1\n"
+        if command == ("vastai", "destroy", "instance", "44", "--yes"):
+            return ""
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return "{}"
+        raise AssertionError(command)
+
+    with pytest.raises(ValueError, match="terminal nonzero"):
+        LIFECYCLE.remote_action(
+            action="runtime-hydrate", instance=instance, request=request, runner=runner,
+        )
+
+    assert calls.count(("vastai", "destroy", "instance", "44", "--yes")) == 1
     assert json.loads(Path(str(request["failure_receipt"])).read_text())["cleanup_status"] == "destroyed_and_absent"
 
 

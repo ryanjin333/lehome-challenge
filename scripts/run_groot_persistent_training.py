@@ -67,6 +67,8 @@ RUNTIME_GPU_ARCH_TIMEOUT_SECONDS = 15
 RUNTIME_GPU_PROBE_TIMEOUT_SECONDS = 600
 RUNTIME_GPU_PROBE_CALL_TIMEOUT_SECONDS = 620
 RUNTIME_GPU_PROBE_DIAGNOSTIC_LIMIT = 240
+RUNTIME_HYDRATE_STATUS_POLLS = 3
+RUNTIME_HYDRATE_POLL_SECONDS = 5.0
 _RUNTIME_PILOT_OFFER_FIELDS = (
     "id", "ask_contract_id", "machine_id", "cpu_arch", "cpu_cores_effective", "cpu_ram",
     "disk_space", "disk_bw", "inet_down", "reliability", "num_gpus", "dph_total",
@@ -1192,7 +1194,7 @@ def _ssh_prefix(instance: Mapping[str, object]) -> tuple[str, ...]:
     host, port = instance.get("host"), instance.get("port")
     if not isinstance(host, str) or not host or type(port) is not int or port <= 0: raise ValueError("instance SSH receipt is invalid")
     identity = _require_vast_ssh_identity()
-    return ("ssh", "-o", "IdentitiesOnly=yes", "-i", str(identity), "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port), "root@" + host)
+    return ("ssh", "-o", "IdentitiesOnly=yes", "-i", str(identity), "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port), "root@" + host)
 
 
 def _scp_prefix(instance: Mapping[str, object], *, recursive: bool = False) -> tuple[str, ...]:
@@ -1201,7 +1203,8 @@ def _scp_prefix(instance: Mapping[str, object], *, recursive: bool = False) -> t
     identity = _require_vast_ssh_identity()
     return (
         "scp", *( ("-r",) if recursive else () ), "-o", "IdentitiesOnly=yes",
-        "-i", str(identity), "-o", "StrictHostKeyChecking=accept-new", "-P", str(port),
+        "-i", str(identity), "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+        "-o", "StrictHostKeyChecking=accept-new", "-P", str(port),
     )
 
 
@@ -3976,16 +3979,142 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
     return {"paid_action": True, "action": "runtime-stage", "instance_id": instance["instance_id"], "code_bundle_sha256": request["code_bundle_sha256"], "bootstrap_receipt_sha256": sha256_file(Path(str(request["bootstrap_receipt"]))), "warmup_lifecycle_receipt_sha256": sha256_file(Path(str(request["gpu_warmup_receipt"]))), "launch_config_sha256": sha256_file(Path(str(request["launch_config"]))), "selected_loader_workers": selected_workers, "selected_workers_sha256": selected_workers_sha256, "runtime_resume": bool(resume_transfers), "transfers": transfers}
 
 
-def runtime_mixture_hydrate(*, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner) -> dict[str, object]:
-    identity = _runtime_hydration_identity(instance, request)
-    command = (
-        _runtime_gpu_cli_command("hydrate-runtime-mixture")
-        if instance.get("kind") == "runtime_mixture_gpu_warmup_instance"
-        else "set -eu; HF_TOKEN=\"$(cat /prepared/config/runtime.token)\" "
+def _runtime_hydration_job_dir(request_sha256: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None:
+        raise ValueError("runtime hydration job identity is invalid")
+    return "/prepared/runtime-hydrate-jobs/" + request_sha256
+
+
+def _runtime_gpu_hydration_job_start_command(request_sha256: str) -> str:
+    """Launch once, or attach, without tying a multi-hour download to SSH."""
+    job = _runtime_hydration_job_dir(request_sha256)
+    root = "/prepared/runtime-hydrate-jobs"
+    worker = (
+        "job=$1; sha=$2; umask 077; "
+        "if HF_TOKEN=\"$(cat /prepared/config/runtime.token)\" "
         "PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src "
-        "lehome-train hydrate-runtime-mixture --request /prepared/config/runtime-hydrate.json"
+        + RUNTIME_GPU_PYTHON
+        + " -m lehome_train.cli hydrate-runtime-mixture --request /prepared/config/runtime-hydrate.json "
+        " >\"$job/receipt.tmp\" 2>\"$job/stderr.log\"; then "
+        "test -s \"$job/receipt.tmp\"; mv \"$job/receipt.tmp\" \"$job/receipt.json\"; chmod 400 \"$job/receipt.json\" \"$job/stderr.log\"; "
+        "printf 'success %s\\n' \"$sha\" > \"$job/terminal.tmp\"; mv \"$job/terminal.tmp\" \"$job/terminal\"; chmod 400 \"$job/terminal\"; "
+        "else code=$?; rm -f \"$job/receipt.tmp\"; chmod 400 \"$job/stderr.log\"; "
+        "printf 'failure %s %s\\n' \"$sha\" \"$code\" > \"$job/terminal.tmp\"; mv \"$job/terminal.tmp\" \"$job/terminal\"; chmod 400 \"$job/terminal\"; fi"
     )
-    output = runner((*_ssh_prefix(instance), command))
+    return (
+        "set -eu; root=" + shlex.quote(root) + "; job=" + shlex.quote(job) + "; sha=" + shlex.quote(request_sha256) + "; "
+        "test ! -L \"$root\"; mkdir -p \"$root\"; test ! -L \"$root\"; "
+        "if mkdir \"$job\" 2>/dev/null; then chmod 700 \"$job\"; printf '%s\\n' \"$sha\" > \"$job/request-sha256\"; chmod 400 \"$job/request-sha256\"; "
+        "printf 'running %s\\n' \"$sha\" > \"$job/status\"; chmod 400 \"$job/status\"; "
+        "/usr/bin/setsid /usr/bin/nohup /bin/sh -c " + shlex.quote(worker) + " sh \"$job\" \"$sha\" </dev/null >/dev/null 2>&1 & "
+        "printf '%s\\n' \"$!\" > \"$job/pid\"; chmod 400 \"$job/pid\"; printf 'started\\n'; "
+        "else test -d \"$job\"; test ! -L \"$job\"; test -f \"$job/request-sha256\"; test ! -L \"$job/request-sha256\"; "
+        "test \"$(cat \"$job/request-sha256\")\" = \"$sha\"; test -f \"$job/status\"; test ! -L \"$job/status\"; "
+        "test \"$(cat \"$job/status\")\" = \"running $sha\"; if test ! -e \"$job/terminal\"; then test -f \"$job/pid\"; test ! -L \"$job/pid\"; fi; printf 'attached\\n'; fi"
+    )
+
+
+def _runtime_gpu_hydration_job_status_command(request_sha256: str) -> str:
+    """Read only the authenticated job state; logs are intentionally never returned."""
+    job = _runtime_hydration_job_dir(request_sha256)
+    return (
+        "set -eu; job=" + shlex.quote(job) + "; sha=" + shlex.quote(request_sha256) + "; "
+        "test -d \"$job\"; test ! -L \"$job\"; test -f \"$job/request-sha256\"; test ! -L \"$job/request-sha256\"; "
+        "test \"$(cat \"$job/request-sha256\")\" = \"$sha\"; test -f \"$job/status\"; test ! -L \"$job/status\"; "
+        "test \"$(cat \"$job/status\")\" = \"running $sha\"; "
+        "if test -e \"$job/terminal\"; then test -f \"$job/terminal\"; test ! -L \"$job/terminal\"; cat \"$job/terminal\"; "
+        "else test -f \"$job/pid\"; test ! -L \"$job/pid\"; pid=$(cat \"$job/pid\"); case \"$pid\" in *[!0-9]*|'') exit 9;; esac; "
+        "if kill -0 \"$pid\" 2>/dev/null; then printf 'running\\n'; else printf 'disappeared\\n'; fi; fi"
+    )
+
+
+def _runtime_gpu_hydration_job_receipt_command(request_sha256: str) -> str:
+    job = _runtime_hydration_job_dir(request_sha256)
+    return "set -eu; job=" + shlex.quote(job) + "; test -f \"$job/receipt.json\"; test ! -L \"$job/receipt.json\"; cat \"$job/receipt.json\""
+
+
+def _runtime_hydration_ssh_prefix(instance: Mapping[str, object]) -> tuple[str, ...]:
+    """A bounded reconnect attempt for detached hydration state only."""
+    prefix = _ssh_prefix(instance)
+    return (*prefix[:-1], "-o", "ConnectTimeout=15", prefix[-1])
+
+
+def _runtime_hydration_transport_error(error: BaseException) -> bool:
+    return isinstance(error, (OSError, TimeoutError, subprocess.TimeoutExpired)) or (
+        isinstance(error, subprocess.CalledProcessError) and error.returncode == 255
+    )
+
+
+def _runtime_gpu_hydration_job_state(value: str, *, request_sha256: str) -> tuple[str, int | None]:
+    if value == "running\n":
+        return "running", None
+    if value == "disappeared\n":
+        return "disappeared", None
+    if value == "success " + request_sha256 + "\n":
+        return "success", None
+    match = re.fullmatch(r"failure " + re.escape(request_sha256) + r" ([1-9][0-9]*)\n", value)
+    if match is not None:
+        return "failure", int(match.group(1))
+    raise ValueError("runtime hydration job identity or terminal state is invalid")
+
+
+def _runtime_gpu_hydration_pending(*, instance: Mapping[str, object], request_sha256: str) -> dict[str, object]:
+    return {
+        "paid_action": True, "action": "runtime-hydrate", "instance_id": instance["instance_id"],
+        "pending": True, "runtime_hydrate_request_sha256": request_sha256,
+    }
+
+
+def runtime_mixture_hydrate(
+    *, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner,
+    sleep: Callable[[float], None] = _bounded_sleep,
+) -> dict[str, object]:
+    identity = _runtime_hydration_identity(instance, request)
+    if instance.get("kind") == "runtime_mixture_gpu_warmup_instance":
+        request_sha256 = _runtime_gpu_hydration_request_sha256(request)
+        try:
+            started = runner((*_runtime_hydration_ssh_prefix(instance), _runtime_gpu_hydration_job_start_command(request_sha256)))
+        except BaseException as error:
+            if _runtime_hydration_transport_error(error):
+                return _runtime_gpu_hydration_pending(instance=instance, request_sha256=request_sha256)
+            raise ValueError("runtime hydration job could not be started or attached") from error
+        if started not in {"started\n", "attached\n"}:
+            raise ValueError("runtime hydration job start identity is invalid")
+        for poll in range(RUNTIME_HYDRATE_STATUS_POLLS):
+            try:
+                state, _exit_code = _runtime_gpu_hydration_job_state(
+                    runner((*_runtime_hydration_ssh_prefix(instance), _runtime_gpu_hydration_job_status_command(request_sha256))),
+                    request_sha256=request_sha256,
+                )
+            except BaseException as error:
+                if _runtime_hydration_transport_error(error):
+                    if poll + 1 < RUNTIME_HYDRATE_STATUS_POLLS:
+                        sleep(RUNTIME_HYDRATE_POLL_SECONDS)
+                    continue
+                raise ValueError("runtime hydration job status is unavailable or tampered") from error
+            if state == "success":
+                try:
+                    output = runner((*_runtime_hydration_ssh_prefix(instance), _runtime_gpu_hydration_job_receipt_command(request_sha256)))
+                except BaseException as error:
+                    if _runtime_hydration_transport_error(error):
+                        return _runtime_gpu_hydration_pending(instance=instance, request_sha256=request_sha256)
+                    raise ValueError("runtime hydration job receipt is unavailable or tampered") from error
+                break
+            if state == "failure":
+                raise ValueError("runtime hydration remote job failed with a terminal nonzero exit")
+            if state == "disappeared":
+                raise ValueError("runtime hydration job disappeared without a terminal marker")
+            if poll + 1 < RUNTIME_HYDRATE_STATUS_POLLS:
+                sleep(RUNTIME_HYDRATE_POLL_SECONDS)
+        else:
+            return _runtime_gpu_hydration_pending(instance=instance, request_sha256=request_sha256)
+    else:
+        command = (
+            "set -eu; HF_TOKEN=\"$(cat /prepared/config/runtime.token)\" "
+            "PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src "
+            "lehome-train hydrate-runtime-mixture --request /prepared/config/runtime-hydrate.json"
+        )
+        output = runner((*_ssh_prefix(instance), command))
     try:
         receipt = json.loads(output)
     except json.JSONDecodeError as error:
