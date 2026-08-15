@@ -97,6 +97,14 @@ _RUNTIME_GPU_PROBE_EXECUTABLES = {
     "clean": "/usr/bin/git",
     "capability": "/opt/runtime/bin/python",
 }
+_RUNTIME_GPU_PROBE_STAGE_TRACE = (
+    "LEHOME_RUNTIME_GPU_PROBE_STAGE=clone",
+    "LEHOME_RUNTIME_GPU_PROBE_STAGE=checkout",
+    "LEHOME_RUNTIME_GPU_PROBE_STAGE=revision",
+    "LEHOME_RUNTIME_GPU_PROBE_STAGE=clean",
+    "LEHOME_RUNTIME_GPU_PROBE_STAGE=capability",
+)
+_RUNTIME_GPU_NO_CUDA_ERROR = "training capability requires CUDA"
 
 
 def _sanitize_runtime_gpu_probe_stderr(value: object) -> str:
@@ -108,8 +116,15 @@ def _sanitize_runtime_gpu_probe_stderr(value: object) -> str:
     else:
         return "unavailable"
     text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    # Handle Authorization separately so its Bearer scheme and its credential
+    # are one redaction.  Values intentionally include colon-bearing tokens.
     text = re.sub(
-        r"(?i)\b(hf_token|token|authorization|bearer|password|secret|api[_-]?key)\b\s*(?:=|:)?\s*[^\s;,:]+",
+        r"(?i)\bauthorization\b\s*(?:=|:)\s*(?:bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s;,]+)",
+        "<credential>", text,
+    )
+    text = re.sub(r"(?i)\bbearer\s+(?:\"[^\"]*\"|'[^']*'|[^\s;,]+)", "<credential>", text)
+    text = re.sub(
+        r"(?i)\b(hf_token|token|password|secret|api[_-]?key)\b\s*(?:=|:)\s*(?:\"[^\"]*\"|'[^']*'|[^\s;,]+)",
         "<credential>", text,
     )
     text = re.sub(r"(?i)https?://[^\s]+", "<url>", text)
@@ -135,6 +150,23 @@ def _runtime_gpu_probe_command(code_revision: str) -> str:
         + "/opt/runtime/bin/python -m lehome_train.cli validate-training-capability --one-step --image-digest "
         + BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2]
     )
+
+
+def _runtime_gpu_no_cuda_terminal_is_exact(stderr: str) -> bool:
+    """Accept only the complete controller trace and Typer's sole CUDA error box."""
+    lines = stderr.replace("\r\n", "\n").replace("\r", "\n").strip().split("\n")
+    trace_length = len(_RUNTIME_GPU_PROBE_STAGE_TRACE)
+    if len(lines) != trace_length + 3 or tuple(lines[:trace_length]) != _RUNTIME_GPU_PROBE_STAGE_TRACE:
+        return False
+    top, middle, bottom = lines[trace_length:]
+    if (
+        re.fullmatch(r"╭─ Error ─+╮", top) is None
+        or re.fullmatch(r"│ training capability requires CUDA +│", middle) is None
+        or re.fullmatch(r"╰─+╯", bottom) is None
+        or len(top) != len(middle) or len(top) != len(bottom)
+    ):
+        return False
+    return middle == "│ " + _RUNTIME_GPU_NO_CUDA_ERROR + " " * (len(top) - len(_RUNTIME_GPU_NO_CUDA_ERROR) - 3) + "│"
 
 
 def _runtime_gpu_probe_error(error: BaseException) -> RuntimeGpuBootstrapProbeError:
@@ -178,7 +210,7 @@ def _runtime_gpu_exact_image_preflight(*, bundle: Path, code_revision: str) -> d
             "provider_free": True, "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
             "code_revision": code_revision, "cli_import": "passed", "cuda_step": "passed",
         }
-    if completed.returncode == 1 and "training capability requires CUDA" in stderr:
+    if completed.returncode == 1 and _runtime_gpu_no_cuda_terminal_is_exact(stderr):
         return {
             "provider_free": True, "trainer_image": BOOTSTRAP_TRAINER_IMAGE,
             "code_revision": code_revision, "cli_import": "passed", "cuda_step": "not_run_no_local_gpu",

@@ -2684,7 +2684,16 @@ def test_runtime_gpu_exact_image_preflight_accepts_cuda_unavailable_after_cli_im
 
     def fake_run(command: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(command)
-        return subprocess.CompletedProcess(command, 1, "", "training capability requires CUDA\n")
+        return subprocess.CompletedProcess(command, 1, "", "\n".join((
+            "LEHOME_RUNTIME_GPU_PROBE_STAGE=clone",
+            "LEHOME_RUNTIME_GPU_PROBE_STAGE=checkout",
+            "LEHOME_RUNTIME_GPU_PROBE_STAGE=revision",
+            "LEHOME_RUNTIME_GPU_PROBE_STAGE=clean",
+            "LEHOME_RUNTIME_GPU_PROBE_STAGE=capability",
+            "╭─ Error ──────────────────────────────────────────────────────────────────────╮",
+            "│ training capability requires CUDA                                            │",
+            "╰──────────────────────────────────────────────────────────────────────────────╯",
+        )))
 
     monkeypatch.setattr(LIFECYCLE.subprocess, "run", fake_run)
     result = LIFECYCLE._runtime_gpu_exact_image_preflight(
@@ -2699,6 +2708,40 @@ def test_runtime_gpu_exact_image_preflight_accepts_cuda_unavailable_after_cli_im
     )
     assert LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE in calls[0]
     assert "/opt/runtime/bin/python -m lehome_train.cli" in calls[0][-1]
+
+
+@pytest.mark.parametrize("stderr", (
+    "training capability requires CUDA",
+    "LEHOME_RUNTIME_GPU_PROBE_STAGE=clone\ntraining capability requires CUDA",
+    "unexpected prefix\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clone\nLEHOME_RUNTIME_GPU_PROBE_STAGE=checkout\nLEHOME_RUNTIME_GPU_PROBE_STAGE=revision\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clean\nLEHOME_RUNTIME_GPU_PROBE_STAGE=capability\ntraining capability requires CUDA",
+    "LEHOME_RUNTIME_GPU_PROBE_STAGE=clone\nLEHOME_RUNTIME_GPU_PROBE_STAGE=checkout\nLEHOME_RUNTIME_GPU_PROBE_STAGE=revision\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clean\nLEHOME_RUNTIME_GPU_PROBE_STAGE=capability\ntraining capability requires CUDA\nunexpected suffix",
+    "LEHOME_RUNTIME_GPU_PROBE_STAGE=clone\nLEHOME_RUNTIME_GPU_PROBE_STAGE=checkout\nLEHOME_RUNTIME_GPU_PROBE_STAGE=revision\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clean\nLEHOME_RUNTIME_GPU_PROBE_STAGE=capability\ntraining capability requires CUDA",
+    "LEHOME_RUNTIME_GPU_PROBE_STAGE=clone\nLEHOME_RUNTIME_GPU_PROBE_STAGE=checkout\nLEHOME_RUNTIME_GPU_PROBE_STAGE=revision\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clean\nLEHOME_RUNTIME_GPU_PROBE_STAGE=capability",
+))
+def test_runtime_gpu_exact_image_preflight_rejects_noncanonical_cuda_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stderr: str,
+) -> None:
+    bundle = tmp_path / "code.bundle"
+    bundle.write_bytes(b"bundle")
+
+    def fake_run(command: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 1, "", stderr)
+
+    monkeypatch.setattr(LIFECYCLE.subprocess, "run", fake_run)
+    with pytest.raises(LIFECYCLE.RuntimeGpuBootstrapProbeError):
+        LIFECYCLE._runtime_gpu_exact_image_preflight(bundle=bundle, code_revision="a" * 40)
+
+
+@pytest.mark.parametrize(("stderr", "secret"), (
+    ("HF_TOKEN=secret-value", "secret-value"),
+    ("Authorization: Bearer hunter2", "hunter2"),
+    ("api_key: alpha:omega", "alpha:omega"),
+))
+def test_runtime_gpu_probe_stderr_redacts_complete_credential_values(stderr: str, secret: str) -> None:
+    sanitized = LIFECYCLE._sanitize_runtime_gpu_probe_stderr(stderr)
+
+    assert secret not in sanitized
+    assert sanitized == "<credential>"
 
 
 def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
