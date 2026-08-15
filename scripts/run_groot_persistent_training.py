@@ -1791,15 +1791,18 @@ def _runtime_gpu_recovery_live_offer(
 def _runtime_gpu_recovery_offer_snapshot(
     *, runner: Runner, original_offer_id: int, expected_machine_id: int, timestamp_unix: int,
 ) -> tuple[str, dict[str, object]]:
+    query = "id = " + str(original_offer_id)
     value = _json(runner, (
-        "vastai", "--raw", "search", "offers", OFFER_QUERY, "--interruptible", "--storage", "300",
+        "vastai", "--raw", "search", "offers", query, "--interruptible", "--storage", "300",
     ))
     if not isinstance(value, list):
         raise ValueError("runtime GPU recovery offer search is invalid")
     matching = [row for row in value if isinstance(row, Mapping) and row.get("id") == original_offer_id]
     if not matching:
-        return "absent", {"timestamp_unix": timestamp_unix, "response_sha256": _hash(value), "matching_count": 0}
-    if len(matching) != 1:
+        if value != []:
+            raise ValueError("runtime GPU recovery narrow offer search is inconsistent")
+        return "absent", {"timestamp_unix": timestamp_unix, "query_sha256": _hash(query), "response_sha256": _hash(value), "matching_count": 0}
+    if len(value) != 1 or len(matching) != 1:
         raise ValueError("runtime GPU recovery original offer is ambiguous")
     # Reuse the narrow live-row validation without persisting raw provider fields.
     proof = _runtime_gpu_recovery_live_offer(
@@ -1849,11 +1852,13 @@ def _runtime_gpu_recovery_reconciled_receipt_is_valid(
         and all(isinstance(row, Mapping) and set(row) == {"timestamp_unix", "instances_sha256", "volumes_sha256"} and type(row.get("timestamp_unix")) is int and row.get("instances_sha256") == expected_empty_hash and row.get("volumes_sha256") == expected_empty_hash for row in observations)
     )
     if receipt.get("offer_proof_mode") == "absent":
-        snapshot_fields = {"timestamp_unix", "response_sha256", "matching_count"}
+        snapshot_fields = {"timestamp_unix", "query_sha256", "response_sha256", "matching_count"}
         return (
             common and set(receipt) == {"schema_version", "kind", "status", "released", "canonical_claim_path", "canonical_claim_sha256", "archive_claims", "original_offer_id", "observations", "offer_proof_mode", "blacklisted_machine_id", "start_offer_snapshot", "end_offer_snapshot"}
             and receipt.get("blacklisted_machine_id") == machine_id
-            and all(isinstance(snapshot, Mapping) and set(snapshot) == snapshot_fields and type(snapshot.get("timestamp_unix")) is int and snapshot.get("response_sha256") == expected_empty_hash and snapshot.get("matching_count") == 0 for snapshot in (receipt.get("start_offer_snapshot"), receipt.get("end_offer_snapshot")))
+            and all(isinstance(snapshot, Mapping) and set(snapshot) == snapshot_fields and type(snapshot.get("timestamp_unix")) is int and snapshot.get("query_sha256") == _hash("id = " + str(original_offer_id)) and snapshot.get("response_sha256") == expected_empty_hash and snapshot.get("matching_count") == 0 for snapshot in (receipt.get("start_offer_snapshot"), receipt.get("end_offer_snapshot")))
+            and receipt["end_offer_snapshot"]["timestamp_unix"] >= receipt["start_offer_snapshot"]["timestamp_unix"] + RUNTIME_GPU_RECOVERY_OBSERVATION_POLLS * RUNTIME_GPU_RECOVERY_POLL_SECONDS
+            and all(receipt["start_offer_snapshot"]["timestamp_unix"] <= row["timestamp_unix"] <= receipt["end_offer_snapshot"]["timestamp_unix"] for row in observations)
         )
     fields = {
         "schema_version", "kind", "status", "released", "canonical_claim_path",
@@ -1939,6 +1944,8 @@ def recover_runtime_gpu_rent(
         )
         if end_mode != mode:
             raise ValueError("runtime GPU recovery original offer changed between snapshots")
+        if mode == "absent" and end_offer["timestamp_unix"] < start_offer["timestamp_unix"] + RUNTIME_GPU_RECOVERY_OBSERVATION_POLLS * RUNTIME_GPU_RECOVERY_POLL_SECONDS:
+            raise ValueError("runtime GPU recovery absent offer snapshots are not sufficiently separated")
         archive_path = _runtime_gpu_recovery_archive_path(claim_path, claim_sha256)
         archived_current = {
             "relative_filename": archive_path.name, "byte_sha256": claim_sha256,

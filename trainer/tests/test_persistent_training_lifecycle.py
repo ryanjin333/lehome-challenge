@@ -1956,8 +1956,9 @@ def test_ambiguous_rent_recovery_releases_after_two_absent_offer_snapshots(
             return "[]"
         raise AssertionError(command)
 
+    clock = iter(range(int(original["expires_at_unix"]) + 300, int(original["expires_at_unix"]) + 400, 5))
     result = LIFECYCLE.recover_runtime_gpu_rent(
-        request=recovery, runner=runner, now_unix=int(original["expires_at_unix"]) + 300,
+        request=recovery, runner=runner, now_unix=lambda: next(clock),
         sleep=lambda _: None,
     )
 
