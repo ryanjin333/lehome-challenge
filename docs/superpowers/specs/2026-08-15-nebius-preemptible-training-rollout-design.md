@@ -58,8 +58,7 @@ requests are batched and routed by session.
 - Cloth simulation: CPU only. The GPU is used for rendering/interoperability and
   policy inference, not CUDA cloth simulation.
 - Training global batch: 64.
-- Default training GPU: RTX PRO 6000. H200 is an opt-in, measured training-only
-  profile and is never selected automatically.
+- Training GPU: RTX PRO 6000. H200 is deferred from the initial implementation.
 - Training duration: exactly 2,000 optimizer steps.
 - Local checkpoint cadence: every 500 steps.
 - Hugging Face checkpoint cadence: every 1,000 steps.
@@ -156,39 +155,6 @@ The same image can be reused by another GR00T/LeRobot competition by supplying a
 different immutable experiment manifest. A different model family may require a
 new application container, but the Packer host image, Terraform module, disk
 contract, and recovery services remain reusable.
-
-The training image family may produce platform-specific host variants from the
-same Packer source when Nebius driver or base-image requirements differ. The
-pinned training container, manifest contract, disk layout, and recovery services
-remain identical across an RTX PRO 6000 variant and a later admitted H200
-variant.
-
-### Training GPU economics
-
-Using the operator-observed preemptible prices of $1.08/hour for RTX PRO 6000
-and $2.58/hour for H200, H200 must complete the same admitted workload at least
-`2.58 / 1.08 = 2.39` times faster to reduce compute cost. That comparison uses
-end-to-end admitted training time, including loader stalls and checkpoint work,
-not peak tensor throughput.
-
-The initial batch-64 run stays on RTX PRO 6000 because 96 GB VRAM is expected to
-fit the agreed workload and its Nebius preset provides 24 vCPUs for video decode
-and data loading. The H200 preset provides more VRAM and memory bandwidth but
-only 16 vCPUs, so a CPU-fed workload may not realize the GPU's peak advantage.
-
-The Terraform training module keeps the GPU platform explicit, but H200 remains
-blocked until a separately authorized identical-workload benchmark proves one
-of these operator decisions:
-
-- cost promotion: at least 2.39x end-to-end throughput at the current prices; or
-- deadline promotion: the operator explicitly accepts a higher total cost for a
-  materially shorter wall-clock run.
-
-The benchmark holds parent checkpoint, experiment manifest, batch 64, precision,
-optimizer, sample ordering, checkpoint behavior, and measured steady-step range
-constant. H200 is not a rollout candidate because the LeHome appliance depends
-on the RTX rendering path and the four-worker design benefits from the
-RTX PRO 6000 preset's larger CPU allocation.
 
 ### LeHome rollout image: `lehome-rollout`
 
@@ -730,6 +696,7 @@ topology.
 This design does not:
 
 - create paid Nebius resources during repository implementation;
+- create or benchmark an H200 image or runtime profile;
 - run training and rollout simultaneously on one VM;
 - attach the shared disk to both runtime VMs;
 - base the training image on the LeHome simulator tarball;
