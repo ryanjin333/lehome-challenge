@@ -380,11 +380,50 @@ def _copy_receipt(source: Path, destination: Path, *, expected_sha256: str) -> N
     if source.is_symlink() or not source.is_file() or sha256_file(source) != expected_sha256:
         raise ValueError("runtime source readback receipt drift")
     if destination.exists() or destination.is_symlink():
-        raise FileExistsError("runtime hydration receipt destination is immutable")
+        if destination.is_symlink() or not destination.is_file() or sha256_file(destination) != expected_sha256:
+            raise ValueError("runtime hydration receipt destination is immutable")
+        return
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination)
     if destination.is_symlink() or sha256_file(destination) != expected_sha256:
         raise ValueError("runtime source readback receipt copy mismatch")
+
+
+def _resume_hydration_tree(
+    root: Path, *, expected_entries: tuple[SyncEntry, ...] | None = None,
+    expected_paths: tuple[str, ...] | None = None, label: str,
+) -> None:
+    """Permit only authenticated completed files left by an interrupted download."""
+    if (expected_entries is None) == (expected_paths is None):
+        raise ValueError("runtime hydration resume contract is invalid")
+    allowed = (
+        {entry.relative_path: entry for entry in expected_entries}
+        if expected_entries is not None else {path: None for path in expected_paths or ()}
+    )
+    if not root.exists():
+        root.mkdir(parents=True)
+        return
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f"{label} is not a safe resumable directory")
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        with os.scandir(current) as children:
+            for child in children:
+                path = Path(child.path)
+                relative = path.relative_to(root).as_posix()
+                if child.is_symlink():
+                    raise ValueError(f"{label} contains a symlink")
+                if child.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                    continue
+                if not child.is_file(follow_symlinks=False) or relative not in allowed:
+                    raise ValueError(f"{label} contains an unexpected entry")
+                entry = allowed[relative]
+                if entry is not None and (
+                    sha256_file(path) != entry.sha256 or path.stat(follow_symlinks=False).st_size != entry.byte_size
+                ):
+                    raise ValueError(f"{label} contains a changed partial artifact")
 
 
 def hydrate_runtime_mixture_from_request(path: str | Path, *, transport: HubTransport) -> dict[str, object]:
@@ -423,16 +462,16 @@ def hydrate_runtime_mixture_from_request(path: str | Path, *, transport: HubTran
     destination, mounts_path = Path(arguments["destination"]), Path(arguments["mounts_descriptor"])
     if (
         not destination.is_absolute() or not mounts_path.is_absolute()
-        or destination.exists() or mounts_path.exists() or destination.is_symlink() or mounts_path.is_symlink()
+        or mounts_path.exists() or destination.is_symlink() or mounts_path.is_symlink()
         or mounts_path.parent != destination
         or deployment_path.is_symlink() or not deployment_path.is_file()
     ):
-        raise ValueError("runtime hydration destinations must be absent absolute paths beside the mixture")
+        raise ValueError("runtime hydration destinations must be safe absolute paths beside the mixture")
     require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=False)
     prefix = str(deployment["remote_prefix"])
     if _remote_files_under_prefix(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision, prefix=prefix) != tuple(entry.relative_path for entry in entries):
         raise ValueError("runtime deployment remote tree differs from the authenticated receipt")
-    destination.mkdir(parents=True)
+    _resume_hydration_tree(destination, expected_entries=entries, label="runtime hydration destination")
     try:
         download_files(
             transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
@@ -473,7 +512,9 @@ def hydrate_runtime_mixture_from_request(path: str | Path, *, transport: HubTran
                 transport=transport, repository=APPROVED_MIXTURE_REPOSITORY,
                 revision=str(receipt["immutable_revision"]), prefix=str(receipt["remote_prefix"]),
             )
-            source_root.mkdir(parents=True)
+            _resume_hydration_tree(
+                source_root, expected_paths=source_files, label="runtime hydration source destination",
+            )
             download_files(
                 transport=transport, repository=APPROVED_MIXTURE_REPOSITORY,
                 revision=str(receipt["immutable_revision"]), destination=source_root,
@@ -504,7 +545,8 @@ def hydrate_runtime_mixture_from_request(path: str | Path, *, transport: HubTran
             "mounts_descriptor": str(mounts_path), "fresh_readback_verified": True,
         }
     except BaseException:
-        shutil.rmtree(destination, ignore_errors=True)
+        # A bounded Hub retry can resume exact regular files at these stable
+        # targets.  Preserve them; any drift is rejected on the next entry.
         raise
 
 

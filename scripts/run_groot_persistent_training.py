@@ -69,6 +69,8 @@ RUNTIME_GPU_PROBE_CALL_TIMEOUT_SECONDS = 620
 RUNTIME_GPU_PROBE_DIAGNOSTIC_LIMIT = 240
 RUNTIME_HYDRATE_STATUS_POLLS = 3
 RUNTIME_HYDRATE_POLL_SECONDS = 5.0
+RUNTIME_GPU_HYDRATION_RATE_LIMIT_ATTEMPTS = 3
+RUNTIME_GPU_HYDRATION_RATE_LIMIT_DELAY_SECONDS = 300
 _RUNTIME_PILOT_OFFER_FIELDS = (
     "id", "ask_contract_id", "machine_id", "cpu_arch", "cpu_cores_effective", "cpu_ram",
     "disk_space", "disk_bw", "inet_down", "reliability", "num_gpus", "dph_total",
@@ -4067,15 +4069,17 @@ def _runtime_gpu_hydration_job_start_command(request_sha256: str, *, initial_lau
         "job=$1; sha=$2; umask 077; "
         "printf '%s\\n' \"$$\" > \"$job/pid.tmp\"; mv \"$job/pid.tmp\" \"$job/pid\"; chmod 400 \"$job/pid\"; "
         "printf 'running %s\\n' \"$sha\" > \"$job/status.tmp\"; mv \"$job/status.tmp\" \"$job/status\"; chmod 400 \"$job/status\"; "
-        "if HF_TOKEN=\"$(cat /prepared/config/runtime.token)\" "
+        "attempt=1; max_attempts=" + str(RUNTIME_GPU_HYDRATION_RATE_LIMIT_ATTEMPTS) + "; while :; do if HF_TOKEN=\"$(cat /prepared/config/runtime.token)\" "
         "PYTHONPATH=/prepared/code/source/lehome:/prepared/code/trainer/src "
         + RUNTIME_GPU_PYTHON
         + " -m lehome_train.cli hydrate-runtime-mixture --request /prepared/config/runtime-hydrate.json "
         " >\"$job/receipt.tmp\" 2>\"$job/stderr.log\"; then "
         "test -s \"$job/receipt.tmp\"; mv \"$job/receipt.tmp\" \"$job/receipt.json\"; chmod 400 \"$job/receipt.json\" \"$job/stderr.log\"; "
-        "printf 'success %s\\n' \"$sha\" > \"$job/terminal.tmp\"; mv \"$job/terminal.tmp\" \"$job/terminal\"; chmod 400 \"$job/terminal\"; "
-        "else code=$?; rm -f \"$job/receipt.tmp\"; chmod 400 \"$job/stderr.log\"; "
-        "printf 'failure %s %s\\n' \"$sha\" \"$code\" > \"$job/terminal.tmp\"; mv \"$job/terminal.tmp\" \"$job/terminal\"; chmod 400 \"$job/terminal\"; fi"
+        "printf 'success %s\\n' \"$sha\" > \"$job/terminal.tmp\"; mv \"$job/terminal.tmp\" \"$job/terminal\"; chmod 400 \"$job/terminal\"; break; "
+        "else code=$?; if test \"$attempt\" -lt \"$max_attempts\" && grep -Fq 'Hub download rate limited after 1 attempts' \"$job/stderr.log\"; then "
+        "rm -f \"$job/receipt.tmp\"; attempt=$((attempt + 1)); /usr/bin/sleep " + str(RUNTIME_GPU_HYDRATION_RATE_LIMIT_DELAY_SECONDS) + "; continue; fi; "
+        "rm -f \"$job/receipt.tmp\"; chmod 400 \"$job/stderr.log\"; printf 'failure %s %s\\n' \"$sha\" \"$code\" > \"$job/terminal.tmp\"; "
+        "mv \"$job/terminal.tmp\" \"$job/terminal\"; chmod 400 \"$job/terminal\"; break; fi; done"
     )
     prefix = (
         "set -eu; root=" + shlex.quote(root) + "; job=" + shlex.quote(job) + "; sha=" + shlex.quote(request_sha256) + "; "

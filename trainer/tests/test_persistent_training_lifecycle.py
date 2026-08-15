@@ -4036,6 +4036,9 @@ def test_direct_runtime_hydrate_worker_owns_pid_before_running_or_terminal_state
     assert "mv \"$job/status.tmp\" \"$job/status\"" in command
     assert "mv \"$job/terminal.tmp\" \"$job/terminal\"" in command
     assert "/usr/bin/setsid /usr/bin/nohup" in command
+    assert "max_attempts=3" in command
+    assert "Hub download rate limited after 1 attempts" in command
+    assert "/usr/bin/sleep 300" in command
 
 
 def test_direct_runtime_hydrate_intent_path_is_canonical_across_failure_receipts(

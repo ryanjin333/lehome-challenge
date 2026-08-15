@@ -6,7 +6,7 @@ import shutil
 
 import pytest
 
-from lehome_train.hub import HubAccess, HubTransientError, HubTreeEntry
+from lehome_train.hub import HubAccess, HubRateLimitError, HubTransientError, HubTreeEntry
 from lehome_train.io import sha256_file
 
 
@@ -449,6 +449,66 @@ def test_hydrator_recreates_exact_remote_trees_and_rewrites_only_local_receipt_m
     assert result["immutable_revision"] == "a" * 40
     assert load_runtime_contract(destination / "mixture.json", mounts).mounts["bc"] == destination.parent / "sources" / "bc"
     assert all("/authoring/" not in entry["source_readback_receipt_path"] for entry in json.loads(mounts.read_text())["mounts"])
+
+
+def test_hydrator_preserves_and_resumes_partial_stable_targets_after_a_rate_limit(
+    tmp_path: Path,
+) -> None:
+    from lehome_train.groot.runtime_mixture_publish import hydrate_runtime_mixture_from_request
+    from test_runtime_mixture import _contract
+
+    manifest, _index, _mounts = _contract(tmp_path / "authoring")
+    manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+    deployment = manifest.parent / "release-receipt.json"
+
+    class RateOnceTransport(MemoryTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rate_limited = True
+
+        def download_files(self, **kwargs: object) -> str:
+            if self.rate_limited:
+                self.rate_limited = False
+                destination = kwargs["destination"]
+                relative = kwargs["relative_paths"][0]
+                prefix = kwargs["remote_prefix"]
+                assert isinstance(destination, Path) and isinstance(relative, str) and isinstance(prefix, str)
+                target = destination / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(self.remote[f"{prefix}/{relative}"])
+                raise HubRateLimitError("rate limited")
+            return super().download_files(**kwargs)
+
+    transport = RateOnceTransport()
+    for artifact in json.loads(deployment.read_text(encoding="utf-8"))["artifact_entries"]:
+        relative = artifact["relative_path"]
+        transport.remote[f"mixtures/{'d' * 64}/{relative}"] = (manifest.parent / relative).read_bytes()
+    receipt_paths: dict[str, str] = {}
+    for source in manifest_value["sources"]:
+        root = manifest.parent / ("bc" if source["source_id"] == "bc" else "round-1")
+        prefix = source["publication"]["prefix"]
+        for file in root.rglob("*"):
+            if file.is_file():
+                transport.remote[f"{prefix}/{file.relative_to(root).as_posix()}"] = file.read_bytes()
+        receipt_paths[source["source_id"]] = source["publication"]["readback_receipt_path"]
+    request = tmp_path / "hydrate.json"
+    destination = tmp_path / "hydrated" / "mixture"
+    _write(request, {
+        "schema_version": 1, "command": "hydrate-runtime-mixture",
+        "arguments": {
+            "deployment_receipt": str(deployment), "source_readback_receipts": receipt_paths,
+            "destination": str(destination), "mounts_descriptor": str(destination / "mounts.json"),
+        },
+    })
+
+    with pytest.raises(RuntimeError, match="rate limited after 1 attempts"):
+        hydrate_runtime_mixture_from_request(request, transport=transport)
+    assert any(path.is_file() for path in destination.rglob("*"))
+    assert not (destination / "mounts.json").exists()
+
+    result = hydrate_runtime_mixture_from_request(request, transport=transport)
+    assert result["kind"] == "runtime_mixture_hydration"
+    assert (destination / "mounts.json").is_file()
 
 
 @pytest.mark.parametrize("fault", ["partial-upload", "extra-remote-file", "changed-readback", "download"])
