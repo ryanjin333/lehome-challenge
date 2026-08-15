@@ -4603,7 +4603,8 @@ def test_runtime_cli_dispatch_never_calls_legacy_recuts(
     calls: list[str] = []
     monkeypatch.setattr(LIFECYCLE, "runtime_mixture_bootstrap_stage", lambda **kwargs: calls.append("bootstrap") or {"paid_action": True})
     monkeypatch.setattr(LIFECYCLE, "run_runtime_cpu_pilot", lambda **kwargs: calls.append("pilot") or {"paid_action": True})
-    monkeypatch.setattr(LIFECYCLE, "run_runtime_gpu_warmup", lambda **kwargs: calls.append("warmup") or {"paid_action": True})
+    monkeypatch.setattr(LIFECYCLE, "validate_runtime_gpu_warmup_request", lambda **kwargs: {})
+    monkeypatch.setattr(LIFECYCLE, "_run_runtime_gpu_warmup_validated", lambda **kwargs: calls.append("warmup") or {"paid_action": True})
     monkeypatch.setattr(LIFECYCLE, "remote_action", lambda **kwargs: calls.append(str(kwargs["action"])) or {"paid_action": True, "action": kwargs["action"]})
     monkeypatch.setattr(LIFECYCLE, "publish_runtime_checkpoint", lambda **kwargs: calls.append("publish") or {"paid_action": True})
     monkeypatch.setattr(LIFECYCLE, "runtime_anchor_interruption_terminal", lambda **kwargs: calls.append("interrupted") or {"paid_action": True})
@@ -4835,6 +4836,79 @@ def test_runtime_gpu_warmup_runs_exact_cli_and_binds_cpu_pilot_code_parent_and_i
     assert lifecycle["selected_loader_workers"] == 4
     assert lifecycle["trainer_image"] == LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE
     assert lifecycle["parent_checkpoint_artifact_sha256"] == LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]
+
+
+@pytest.mark.parametrize("hydrate_value", (None, "tampered"))
+def test_runtime_gpu_warmup_rejects_local_hydrate_request_drift_before_cleanup(
+    tmp_path: Path, hydrate_value: str | None,
+) -> None:
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+        "capability_sha256": "5" * 64,
+    }
+    request["failure_receipt"] = str(tmp_path / "failure.json")
+    if hydrate_value is None:
+        request.pop("runtime_hydrate_request")
+    else:
+        drifted = tmp_path / "drifted-hydrate.json"
+        drifted.write_text("{}", encoding="utf-8")
+        request["runtime_hydrate_request"] = str(drifted)
+    request_path = tmp_path / "warmup-request.json"
+    request_path.write_text(json.dumps(dict(request) | {"instance": instance}), encoding="utf-8")
+    calls: list[tuple[str, ...]] = []
+
+    with pytest.raises(ValueError, match="hydration request"):
+        LIFECYCLE.main_for_test(
+            ["runtime-gpu-warmup", "--request", str(request_path), "--execute"],
+            runner=lambda command: calls.append(command) or "",
+        )
+
+    assert calls == []
+    assert not Path(str(request["failure_receipt"])).exists()
+
+
+def test_runtime_gpu_warmup_remote_failure_still_uses_the_single_cleanup_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = {
+        "kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 44,
+        "provider_response_sha256": "2" * 64,
+    }
+    failure = tmp_path / "failure.json"
+    request_path = tmp_path / "warmup-request.json"
+    request_path.write_text(json.dumps({"instance": instance, "failure_receipt": str(failure)}), encoding="utf-8")
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(LIFECYCLE, "validate_runtime_gpu_warmup_request", lambda **_kwargs: {"validated": True})
+
+    def remote_failure(*, runner, **_kwargs: object) -> dict[str, object]:
+        runner(("ssh", "warmup"))
+        raise ValueError("remote warmup failure")
+
+    monkeypatch.setattr(LIFECYCLE, "_run_runtime_gpu_warmup_validated", remote_failure)
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command == ("vastai", "destroy", "instance", "44", "--yes"):
+            return ""
+        if command == ("vastai", "--raw", "show", "instance", "44"):
+            return "{}"
+        if command == ("ssh", "warmup"):
+            return ""
+        raise AssertionError(command)
+
+    with pytest.raises(ValueError, match="remote warmup failure"):
+        LIFECYCLE.main_for_test(
+            ["runtime-gpu-warmup", "--request", str(request_path), "--execute"], runner=runner,
+        )
+
+    assert calls == [
+        ("ssh", "warmup"), ("vastai", "destroy", "instance", "44", "--yes"),
+        ("vastai", "--raw", "show", "instance", "44"),
+    ]
+    assert json.loads(failure.read_text())["cleanup_status"] == "destroyed_and_absent"
 
 
 def test_direct_runtime_gpu_commands_use_the_pinned_python_without_ssh_path() -> None:

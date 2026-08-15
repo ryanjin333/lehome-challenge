@@ -3067,12 +3067,15 @@ def _validated_runtime_gpu_warmup_lifecycle(
     return warmup, selected
 
 
-def run_runtime_gpu_warmup(
-    *, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner,
+def validate_runtime_gpu_warmup_request(
+    *, instance: Mapping[str, object], request: Mapping[str, object],
 ) -> dict[str, object]:
-    """Invoke the measured direct-GPU adapter after immutable identity checks."""
+    """Validate every local warm-up input before a cleanup-owning SSH action."""
     _runtime_gpu_warmup_instance(instance)
     identity = _runtime_identity(instance, request)
+    # This is deliberately first: capability evidence and hydration use the
+    # identical reviewed envelope, so an operator omission is never a lease failure.
+    _runtime_gpu_hydration_request_sha256(request)
     capability_path = request.get("bootstrap_capability_receipt")
     if type(capability_path) is not str:
         raise ValueError("runtime GPU warm-up requires the same-lease bootstrap capability receipt")
@@ -3087,6 +3090,19 @@ def run_runtime_gpu_warmup(
         binding=_load_regular_json(Path(binding_path), "runtime GPU warm-up binding"),
         instance=instance, request=request, identity=identity,
     )
+    return {"identity": identity, "binding": binding, "output": output}
+
+
+def _run_runtime_gpu_warmup_validated(
+    *, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner,
+    validated: Mapping[str, object],
+) -> dict[str, object]:
+    """Run only the remote warm-up once its local request has been authenticated."""
+    identity = validated.get("identity")
+    binding = validated.get("binding")
+    output = validated.get("output")
+    if not isinstance(identity, Mapping) or not isinstance(binding, Mapping) or type(output) is not str:
+        raise ValueError("runtime GPU warm-up validated request is invalid")
     command = _runtime_gpu_cli_command("runtime-gpu-warmup")
     remote = _json(runner, (*_ssh_prefix(instance), command))
     if not isinstance(remote, Mapping):
@@ -3106,6 +3122,16 @@ def run_runtime_gpu_warmup(
     }
     atomic_write_json(Path(output), lifecycle)
     return {"paid_action": True, "action": "runtime-gpu-warmup", "instance_id": instance["instance_id"], "warmup_lifecycle_receipt": lifecycle}
+
+
+def run_runtime_gpu_warmup(
+    *, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner,
+) -> dict[str, object]:
+    """Public direct invocation: validate locally, then execute the exact warm-up CLI."""
+    return _run_runtime_gpu_warmup_validated(
+        instance=instance, request=request, runner=runner,
+        validated=validate_runtime_gpu_warmup_request(instance=instance, request=request),
+    )
 
 
 def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -> dict[str, object]:
@@ -5079,7 +5105,13 @@ def main_for_test(
     if args.action == "runtime-pilot-run":
         return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: run_runtime_cpu_pilot(instance=instance, request=request, runner=runner))
     if args.action == "runtime-gpu-warmup":
-        return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: run_runtime_gpu_warmup(instance=instance, request=request, runner=runner))
+        validated = validate_runtime_gpu_warmup_request(instance=instance, request=request)
+        return _runtime_abort_on_failure(
+            instance=instance, request=request, runner=runner,
+            operation=lambda: _run_runtime_gpu_warmup_validated(
+                instance=instance, request=request, runner=runner, validated=validated,
+            ),
+        )
     if args.action == "runtime-checkpoint-complete":
         return _runtime_abort_on_failure(instance=instance, request=request, runner=runner, operation=lambda: {"paid_action": True, "action": args.action, "terminal": _runtime_checkpoint_terminal_output(request, runtime_checkpoint_terminal(instance=instance, request=request)["terminal"])})
     if args.action == "runtime-checkpoint-interrupted":
