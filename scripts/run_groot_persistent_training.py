@@ -1699,12 +1699,15 @@ def _runtime_gpu_recovery_archive_name_is_valid(path: Path, claim_path: Path) ->
 
 def _runtime_gpu_recovery_archives(
     *, claim_path: Path, identity: Mapping[str, object], request: Mapping[str, object],
+    allow_recovery_receipt: bool = False,
 ) -> list[dict[str, object]]:
     """Authenticate every historical archive in this controller-owned namespace."""
     prefix = claim_path.stem + ".blocked-"
     rows: list[dict[str, object]] = []
     digests: set[str] = set()
     for path in sorted(claim_path.parent.iterdir()):
+        if allow_recovery_receipt and path == _runtime_gpu_recovery_receipt_path(claim_path):
+            continue
         if path != claim_path and path.name.startswith(claim_path.stem + ".") and not path.name.startswith(prefix):
             raise ValueError("runtime GPU recovery archive namespace has an unrelated file")
         if not path.name.startswith(prefix):
@@ -1756,7 +1759,8 @@ def _runtime_gpu_recovery_request(
     receipt = Path(str(request["recovery_receipt"]))
     if (
         not blocked.is_absolute() or blocked.is_symlink() or not blocked.is_file()
-        or not receipt.is_absolute() or receipt.exists() or receipt.is_symlink()
+        or not receipt.is_absolute() or receipt.is_symlink()
+        or receipt.exists() and not receipt.is_file()
     ):
         raise ValueError("runtime GPU recovery paths are unsafe or unavailable")
     return blocked, int(request["expected_original_machine_id"]), receipt
@@ -1781,11 +1785,7 @@ def _runtime_gpu_recovery_live_offer(
         or not math.isfinite(float(offer["dph_total"])) or float(offer["dph_total"]) >= 1
     ):
         raise ValueError("runtime GPU recovery original offer drifted")
-    safe = _project(offer, (
-        "id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "dph_base",
-        "storage_cost", "storage_cost_per_gb", "min_bid", "driver_version", "is_bid", "image",
-    ))
-    return safe
+    return _project(offer, ("id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total"))
 
 
 def _recovery_now(now_unix: int | Callable[[], int] | None) -> int:
@@ -1795,10 +1795,59 @@ def _recovery_now(now_unix: int | Callable[[], int] | None) -> int:
     return value
 
 
+def _runtime_gpu_recovery_crash(stage: str, crash_after: str | None) -> None:
+    if crash_after == stage:
+        raise RuntimeError("injected recovery crash after " + stage)
+
+
+def _runtime_gpu_recovery_offer_proof_is_valid(
+    proof: object, *, offer_id: object, machine_id: object,
+) -> bool:
+    return (
+        isinstance(proof, Mapping)
+        and set(proof) == {"id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total"}
+        and proof.get("id") == offer_id and proof.get("machine_id") == machine_id
+        and _positive_int(offer_id) and _positive_int(machine_id) and _offer_gpu(proof)
+        and proof.get("num_gpus") == 1 and type(proof.get("dph_total")) in (int, float)
+        and math.isfinite(float(proof["dph_total"])) and float(proof["dph_total"]) < 1
+    )
+
+
+def _runtime_gpu_recovery_reconciled_receipt_is_valid(
+    receipt: Mapping[str, object], *, claim_path: Path, claim_sha256: str,
+    original_offer_id: int, machine_id: int, archives: list[dict[str, object]],
+) -> bool:
+    fields = {
+        "schema_version", "kind", "status", "released", "canonical_claim_path",
+        "canonical_claim_sha256", "archive_claims", "original_offer_id", "reconciled_machine_id",
+        "observations", "start_offer_proof", "start_offer_proof_sha256", "end_offer_proof",
+        "end_offer_proof_sha256",
+    }
+    observations = receipt.get("observations")
+    expected_empty_hash = _hash([])
+    return (
+        set(receipt) == fields and receipt.get("schema_version") == 1
+        and receipt.get("kind") == "runtime_mixture_gpu_rent_recovery_receipt"
+        and receipt.get("status") == "reconciled" and receipt.get("released") is False
+        and receipt.get("canonical_claim_path") == str(claim_path)
+        and receipt.get("canonical_claim_sha256") == claim_sha256
+        and receipt.get("original_offer_id") == original_offer_id
+        and receipt.get("reconciled_machine_id") == machine_id
+        and receipt.get("archive_claims") == archives
+        and isinstance(observations, list) and len(observations) == RUNTIME_GPU_RECOVERY_OBSERVATION_POLLS
+        and all(isinstance(row, Mapping) and set(row) == {"timestamp_unix", "instances_sha256", "volumes_sha256"} and type(row.get("timestamp_unix")) is int and row.get("instances_sha256") == expected_empty_hash and row.get("volumes_sha256") == expected_empty_hash for row in observations)
+        and _runtime_gpu_recovery_offer_proof_is_valid(receipt.get("start_offer_proof"), offer_id=original_offer_id, machine_id=machine_id)
+        and _runtime_gpu_recovery_offer_proof_is_valid(receipt.get("end_offer_proof"), offer_id=original_offer_id, machine_id=machine_id)
+        and receipt.get("start_offer_proof_sha256") == _hash(receipt.get("start_offer_proof"))
+        and receipt.get("end_offer_proof_sha256") == _hash(receipt.get("end_offer_proof"))
+    )
+
+
 def recover_runtime_gpu_rent(
     *, request: Mapping[str, object], runner: Runner,
     now_unix: int | Callable[[], int] | None = None,
     sleep: Callable[[float], None] = _bounded_sleep,
+    crash_after: str | None = None,
 ) -> dict[str, object]:
     """Fail-closed, read-only reconciliation before one blocked lease is released."""
     blocked_path, expected_machine_id, receipt_path = _runtime_gpu_recovery_request(request)
@@ -1809,29 +1858,25 @@ def recover_runtime_gpu_rent(
     )
     if str(receipt_path) != str(_runtime_gpu_recovery_receipt_path(claim_path)):
         raise ValueError("runtime GPU recovery receipt must use the controller-owned canonical path")
-    if claim_path.is_symlink() or not claim_path.is_file():
-        raise ValueError("runtime GPU recovery canonical blocked claim is unavailable")
-    claim_bytes = claim_path.read_bytes()
-    claim_sha256 = hashlib.sha256(claim_bytes).hexdigest()
-    try:
-        claim_value = json.loads(claim_bytes.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError):
-        raise ValueError("runtime GPU recovery canonical claim is malformed") from None
-    if not isinstance(claim_value, Mapping) or not _valid_blocked_runtime_gpu_claim(
-        claim=claim_value, identity=identity, request=original,
-    ):
-        raise ValueError("runtime GPU recovery canonical claim is not a matching blocked claim")
-    original_request_sha = _hash({key: value for key, value in original.items() if key != "rent_claim_receipt"})
     original_offer = original.get("offer")
-    if (
-        claim_value.get("request_sha256") != original_request_sha
-        or not isinstance(original_offer, Mapping) or not _positive_int(original_offer.get("id"))
-        or claim_value.get("offer_sha256") != _hash(dict(original_offer))
-    ):
+    if not isinstance(original_offer, Mapping) or not _positive_int(original_offer.get("id")):
+        raise ValueError("runtime GPU recovery original offer is invalid")
+    claim_bytes = claim_path.read_bytes() if claim_path.is_file() and not claim_path.is_symlink() else None
+    receipt = dict(_load_regular_json(receipt_path, "runtime GPU recovery receipt")) if receipt_path.exists() else None
+    if claim_bytes is None:
+        if receipt is None or receipt.get("canonical_claim_path") != str(claim_path) or not isinstance(receipt.get("canonical_claim_sha256"), str):
+            raise ValueError("runtime GPU recovery canonical blocked claim is unavailable")
+        claim_sha256 = str(receipt["canonical_claim_sha256"])
+        archive_path = _runtime_gpu_recovery_archive_path(claim_path, claim_sha256)
+        if archive_path.is_symlink() or not archive_path.is_file() or hashlib.sha256(archive_path.read_bytes()).hexdigest() != claim_sha256:
+            raise ValueError("runtime GPU recovery canonical archive is unavailable")
+        claim_bytes = archive_path.read_bytes()
+    claim_sha256 = hashlib.sha256(claim_bytes).hexdigest()
+    try: claim_value = json.loads(claim_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError): raise ValueError("runtime GPU recovery canonical claim is malformed") from None
+    if not isinstance(claim_value, Mapping) or not _valid_blocked_runtime_gpu_claim(claim=claim_value, identity=identity, request=original) or claim_value.get("request_sha256") != _hash({key: value for key, value in original.items() if key != "rent_claim_receipt"}) or claim_value.get("offer_sha256") != _hash(dict(original_offer)):
         raise ValueError("runtime GPU recovery canonical claim does not bind the original request")
-    archives = _runtime_gpu_recovery_archives(
-        claim_path=claim_path, identity=identity, request=original,
-    )
+    archives = _runtime_gpu_recovery_archives(claim_path=claim_path, identity=identity, request=original, allow_recovery_receipt=receipt is not None)
     expires = original.get("expires_at_unix")
     if type(expires) is not int or _recovery_now(now_unix) < expires + RUNTIME_GPU_RECOVERY_GRACE_SECONDS:
         raise ValueError("runtime GPU recovery grace period has not elapsed")
@@ -1839,9 +1884,11 @@ def recover_runtime_gpu_rent(
         "schema_version": 1, "kind": "runtime_mixture_gpu_rent_recovery_receipt",
         "status": "observing", "released": False, "canonical_claim_sha256": claim_sha256,
     }
-    _write_exclusive_json(receipt_path, initial_receipt)
-    released = False
-    try:
+    if receipt is None:
+        _write_exclusive_json(receipt_path, initial_receipt)
+        _runtime_gpu_recovery_crash("observing", crash_after)
+        receipt = initial_receipt
+    if receipt == initial_receipt:
         start_offer = _runtime_gpu_recovery_live_offer(
             runner=runner, original_offer_id=int(original_offer["id"]),
             expected_machine_id=expected_machine_id,
@@ -1878,34 +1925,36 @@ def recover_runtime_gpu_rent(
             "start_offer_proof_sha256": _hash(start_offer), "end_offer_proof": end_offer,
             "end_offer_proof_sha256": _hash(end_offer),
         }
-        _replace_json_durably(receipt_path, final)
-        if claim_path.is_symlink() or claim_path.read_bytes() != claim_bytes:
-            raise RuntimeError("runtime GPU recovery canonical claim changed before archive")
-        _write_exclusive_bytes(archive_path, claim_bytes)
-        if archive_path.read_bytes() != claim_bytes:
-            raise RuntimeError("runtime GPU recovery archive readback mismatches canonical claim")
-        claim_path.unlink()
-        _fsync_parent(claim_path)
-        released_final = final | {"released": True, "status": "released", "archive_path": str(archive_path)}
-        _replace_json_durably(receipt_path, released_final)
-        if dict(_load_regular_json(receipt_path, "runtime GPU recovery receipt")) != released_final:
-            raise RuntimeError("runtime GPU recovery receipt readback mismatches")
-        released = True
-        return {"paid_action": False, "action": "runtime-gpu-rent-recover", "recovery_receipt": released_final}
-    except BaseException:
-        if not released:
-            try:
-                if (
-                    receipt_path.exists() and not receipt_path.is_symlink()
-                    and claim_path.is_file() and not claim_path.is_symlink()
-                    and claim_path.read_bytes() == claim_bytes
-                    and _load_regular_json(receipt_path, "runtime GPU recovery receipt").get("released") is False
-                ):
-                    receipt_path.unlink()
-                    _fsync_parent(receipt_path)
-            except BaseException:
-                pass
-        raise
+        _replace_json_durably(receipt_path, final); _runtime_gpu_recovery_crash("reconciled", crash_after); receipt = final
+    archive_path = _runtime_gpu_recovery_archive_path(claim_path, claim_sha256)
+    expected_archives = [row for row in archives if row["relative_filename"] != archive_path.name] + [{"relative_filename": archive_path.name, "byte_sha256": claim_sha256, "request_sha256": claim_value["request_sha256"], "offer_sha256": claim_value["offer_sha256"], "reconciled_machine_id": expected_machine_id, "original_offer_id": original_offer["id"]}]
+    if receipt.get("status") == "released":
+        reconciled = dict(receipt); reconciled.pop("archive_path", None)
+        reconciled["status"] = "reconciled"; reconciled["released"] = False
+        if (
+            claim_path.exists() or receipt.get("released") is not True
+            or receipt.get("archive_path") != str(archive_path)
+            or not _runtime_gpu_recovery_reconciled_receipt_is_valid(
+                reconciled, claim_path=claim_path, claim_sha256=claim_sha256,
+                original_offer_id=int(original_offer["id"]), machine_id=expected_machine_id,
+                archives=expected_archives,
+            )
+        ):
+            raise ValueError("runtime GPU recovery released receipt is not authenticated")
+        return {"paid_action": False, "action": "runtime-gpu-rent-recover", "recovery_receipt": receipt}
+    if not _runtime_gpu_recovery_reconciled_receipt_is_valid(receipt, claim_path=claim_path, claim_sha256=claim_sha256, original_offer_id=int(original_offer["id"]), machine_id=expected_machine_id, archives=expected_archives):
+        raise ValueError("runtime GPU recovery receipt is not an authenticated reconciled state")
+    if not archive_path.exists():
+        if claim_path.is_symlink() or not claim_path.is_file() or claim_path.read_bytes() != claim_bytes: raise RuntimeError("runtime GPU recovery canonical claim changed before archive")
+        _write_exclusive_bytes(archive_path, claim_bytes); _runtime_gpu_recovery_crash("archived", crash_after)
+    if archive_path.is_symlink() or not archive_path.is_file() or archive_path.read_bytes() != claim_bytes: raise RuntimeError("runtime GPU recovery archive readback mismatches canonical claim")
+    if claim_path.exists():
+        if claim_path.is_symlink() or claim_path.read_bytes() != claim_bytes: raise RuntimeError("runtime GPU recovery canonical claim changed before release")
+        claim_path.unlink(); _fsync_parent(claim_path); _runtime_gpu_recovery_crash("unlinked", crash_after)
+    released_final = dict(receipt) | {"released": True, "status": "released", "archive_path": str(archive_path)}
+    _replace_json_durably(receipt_path, released_final); _runtime_gpu_recovery_crash("released", crash_after)
+    if dict(_load_regular_json(receipt_path, "runtime GPU recovery receipt")) != released_final: raise RuntimeError("runtime GPU recovery receipt readback mismatches")
+    return {"paid_action": False, "action": "runtime-gpu-rent-recover", "recovery_receipt": released_final}
 
 
 def _validate_runtime_gpu_recovery_for_new_rent(
@@ -1946,6 +1995,19 @@ def _validate_runtime_gpu_recovery_for_new_rent(
         claim=archived_claim, identity=identity, request=request,
     ):
         raise ValueError("runtime GPU recovery receipt archive is not a matching blocked claim")
+    archived_rows = _runtime_gpu_recovery_archives(
+        claim_path=claim_path, identity=identity, request=request, allow_recovery_receipt=True,
+    )
+    reconciled = dict(receipt)
+    reconciled.pop("archive_path")
+    reconciled["status"] = "reconciled"
+    reconciled["released"] = False
+    if not _runtime_gpu_recovery_reconciled_receipt_is_valid(
+        reconciled, claim_path=claim_path, claim_sha256=str(receipt["canonical_claim_sha256"]),
+        original_offer_id=int(receipt["original_offer_id"]),
+        machine_id=int(receipt["reconciled_machine_id"]), archives=archived_rows,
+    ):
+        raise ValueError("runtime GPU recovery receipt proofs are invalid")
     offer = request.get("offer")
     if (
         not isinstance(offer, Mapping) or offer.get("id") == receipt.get("original_offer_id")

@@ -1737,7 +1737,8 @@ def test_ambiguous_rent_recovery_rejects_any_nonempty_or_transitional_account_re
             request=recovery, runner=runner,
             now_unix=int(original["expires_at_unix"]) + 300, sleep=lambda _: None,
         )
-    assert claim_path.exists() and not Path(str(recovery["recovery_receipt"])).exists()
+    observing = json.loads(Path(str(recovery["recovery_receipt"])).read_text(encoding="utf-8"))
+    assert claim_path.exists() and observing["status"] == "observing" and observing["released"] is False
 
 
 def test_ambiguous_rent_recovery_rejects_malformed_prior_archive_before_provider(
@@ -1821,32 +1822,78 @@ def test_ambiguous_rent_recovery_reconciles_multiple_prior_archives_and_gates_re
             request=recovery, runner=runner, now_unix=int(original["expires_at_unix"]) + 299,
             sleep=lambda _: None,
         )
+
+
+@pytest.mark.parametrize("crash_after", ("observing", "reconciled", "archived", "unlinked", "released"))
+def test_ambiguous_rent_recovery_resumes_after_each_durable_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crash_after: str,
+) -> None:
+    recovery, claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(tmp_path, monkeypatch)
+    live_offer = dict(original["offer"]) | {"machine_id": 140799}  # type: ignore[arg-type]
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return json.dumps([live_offer])
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        raise AssertionError(command)
+
+    with pytest.raises(RuntimeError, match="injected recovery crash"):
+        LIFECYCLE.recover_runtime_gpu_rent(
+            request=recovery, runner=runner, now_unix=int(original["expires_at_unix"]) + 300,
+            sleep=lambda _: None, crash_after=crash_after,
+        )
     result = LIFECYCLE.recover_runtime_gpu_rent(
         request=recovery, runner=runner, now_unix=int(original["expires_at_unix"]) + 300,
         sleep=lambda _: None,
     )
-    assert len(result["recovery_receipt"]["archive_claims"]) == 6
+    archive = Path(str(result["recovery_receipt"]["archive_path"]))
+    assert result["recovery_receipt"]["released"] is True
+    assert not claim_path.exists() and archive.is_file()
+    assert len(list(claim_path.parent.glob(claim_path.stem + ".blocked-" + "[0-9a-f]" * 64 + ".json"))) == 1
+
+
+@pytest.mark.parametrize("field", ("observations", "start_offer_proof_sha256", "archive_claims"))
+def test_direct_gpu_retry_rejects_tampered_recovery_receipt_before_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str,
+) -> None:
+    recovery, _claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(tmp_path, monkeypatch)
+    live_offer = dict(original["offer"]) | {"machine_id": 140799}  # type: ignore[arg-type]
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return json.dumps([live_offer])
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        raise AssertionError(command)
+
+    LIFECYCLE.recover_runtime_gpu_rent(
+        request=recovery, runner=runner, now_unix=int(original["expires_at_unix"]) + 300,
+        sleep=lambda _: None,
+    )
+    receipt_path = Path(str(recovery["recovery_receipt"]))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt[field] = [] if field != "start_offer_proof_sha256" else "0" * 64
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     fresh = dict(original) | {
         "offer": dict(original["offer"]) | {"id": 9, "machine_id": 140800},  # type: ignore[arg-type]
-        "recovery_receipt": str(recovery["recovery_receipt"]),
+        "recovery_receipt": str(receipt_path),
     }
     identity = LIFECYCLE._runtime_campaign_binding(fresh)
-    LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
-        request=fresh, identity=identity,
-        claim_path=LIFECYCLE._runtime_gpu_rent_claim_path(
-            request=fresh, identity=identity, allow_held=True,
-        ),
-    )
-    with pytest.raises(ValueError, match="different offer and machine"):
+
+    with pytest.raises(ValueError, match="recovery receipt"):
         LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
-            request=fresh | {"offer": dict(fresh["offer"]) | {"machine_id": 140799}},  # type: ignore[arg-type]
-            identity=identity,
+            request=fresh, identity=identity,
             claim_path=LIFECYCLE._runtime_gpu_rent_claim_path(
                 request=fresh, identity=identity, allow_held=True,
             ),
         )
-
-
 def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_path: Path) -> None:
     commands: list[tuple[str, ...]] = []
     readiness_reads = 0
