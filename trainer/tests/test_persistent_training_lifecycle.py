@@ -1714,16 +1714,24 @@ def test_ambiguous_rent_recovery_requires_exact_small_request_schema(tmp_path: P
 
 
 def _blocked_gpu_rent_recovery_fixture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, on_demand: bool = False,
 ) -> tuple[dict[str, object], Path, Path, dict[str, object]]:
     original = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json")) | {
         "search_mode": "interruptible", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
         "bootstrap_capability_receipt": str(tmp_path / "bootstrap.json"),
     }
-    original["offer"] = {
-        "id": 8, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000,
-        "num_gpus": 1, "dph_total": .18,
-    }
+    if on_demand:
+        original |= {"search_mode": "on_demand", "requested_storage_gb": 300, "account_hourly_total_usd": 3.25}
+        original["offer"] = {
+            "id": 47749612, "machine_id": 59343, "gpu_name": "RTX PRO 6000 WS",
+            "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.07,
+            "is_bid": False, "rentable": True, "rented": False,
+        }
+    else:
+        original["offer"] = {
+            "id": 8, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000,
+            "num_gpus": 1, "dph_total": .18,
+        }
     # This models the legacy blocked request: its captured offer predated
     # machine_id evidence.  Recovery may reconcile, but never rewrite it.
     identity = LIFECYCLE._runtime_campaign_binding(original)
@@ -1746,7 +1754,7 @@ def _blocked_gpu_rent_recovery_fixture(
     recovery = {
         "schema_version": 1, "kind": "runtime_mixture_gpu_rent_recovery",
         "blocked_rent_request": str(original_path),
-        "expected_original_machine_id": 140799,
+        "expected_original_machine_id": 59343 if on_demand else 140799,
         "recovery_receipt": str(recovery_path),
     }
     return recovery, claim_path, original_path, original
@@ -1817,6 +1825,113 @@ def test_ambiguous_rent_recovery_observes_empty_account_twelve_times_then_archiv
     assert commands.count(("vastai", "--raw", "show", "volumes")) == 12
     archive = Path(str(receipt["archive_path"]))
     assert archive.exists() and json.loads(archive.read_text(encoding="utf-8"))["status"] == "blocked"
+
+
+def test_on_demand_ambiguous_claim_recovers_and_allows_a_different_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery, claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(
+        tmp_path, monkeypatch, on_demand=True,
+    )
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(command)
+        if command == (
+            "vastai", "--raw", "search", "offers", "machine_id=59343 num_gpus=1 gpu_ram>=96",
+            "--on-demand", "--storage", "300",
+        ):
+            return "[]"
+        if command[:4] in {("vastai", "--raw", "show", "instances"), ("vastai", "--raw", "show", "volumes")}:
+            return "[]"
+        raise AssertionError(command)
+
+    clock = iter(range(int(original["expires_at_unix"]) + 300, int(original["expires_at_unix"]) + 400, 5))
+    result = LIFECYCLE.recover_runtime_gpu_rent(
+        request=recovery, runner=runner, now_unix=lambda: next(clock), sleep=lambda _: None,
+    )
+    receipt = result["recovery_receipt"]
+    assert receipt["released"] is True and receipt["original_search_mode"] == "on_demand"
+    assert receipt["blacklisted_machine_id"] == 59343 and not claim_path.exists()
+    assert commands.count((
+        "vastai", "--raw", "search", "offers", "machine_id=59343 num_gpus=1 gpu_ram>=96",
+        "--on-demand", "--storage", "300",
+    )) == 2
+    fresh = dict(original) | {
+        "offer": {
+            "id": 47725426, "machine_id": 41998, "gpu_name": "RTX PRO 6000 WS",
+            "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.111111,
+            "is_bid": False, "rentable": True, "rented": False,
+        },
+        "recovery_receipt": str(recovery["recovery_receipt"]),
+    }
+    identity = LIFECYCLE._runtime_campaign_binding(fresh)
+    consumer_claim_path = LIFECYCLE._runtime_gpu_rent_claim_path(request=fresh, identity=identity, allow_held=True)
+    LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
+        request=fresh, identity=identity, claim_path=consumer_claim_path,
+    )
+    with pytest.raises(ValueError, match="different offer and machine"):
+        LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
+            request=fresh | {"offer": dict(fresh["offer"]) | {"machine_id": 59343}},  # type: ignore[arg-type]
+            identity=identity, claim_path=consumer_claim_path,
+        )
+
+
+def test_on_demand_recovery_rejects_wrong_authenticated_machine_before_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery, claim_path, _original_path, _original = _blocked_gpu_rent_recovery_fixture(
+        tmp_path, monkeypatch, on_demand=True,
+    )
+    recovery = dict(recovery) | {"expected_original_machine_id": 59344}
+    receipt_path = Path(str(recovery["recovery_receipt"]))
+    claim_before = claim_path.read_bytes()
+    calls: list[tuple[str, ...]] = []
+
+    with pytest.raises(ValueError, match="authenticated on-demand machine"):
+        LIFECYCLE.recover_runtime_gpu_rent(
+            request=recovery, runner=lambda command: calls.append(command) or "[]",
+            now_unix=2_000_000_000, sleep=lambda _: None,
+        )
+
+    assert calls == [] and claim_path.read_bytes() == claim_before and not receipt_path.exists()
+
+
+@pytest.mark.parametrize(
+    "search_response",
+    (
+        {},
+        [{
+            "id": 47749610, "machine_id": 59343, "gpu_name": "RTX PRO 6000 WS",
+            "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.08,
+            "is_bid": False, "rentable": True, "rented": False,
+        }],
+        [{
+            "id": 47749610, "machine_id": 59343, "gpu_name": "RTX PRO 6000 WS",
+            "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.07,
+            "is_bid": True, "rentable": True, "rented": False,
+        }],
+    ),
+)
+def test_on_demand_recovery_rejects_malformed_or_drifted_machine_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, search_response: object,
+) -> None:
+    recovery, claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(
+        tmp_path, monkeypatch, on_demand=True,
+    )
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return json.dumps(search_response)
+        raise AssertionError(command)
+
+    with pytest.raises(ValueError, match="recovery.*offer"):
+        LIFECYCLE.recover_runtime_gpu_rent(
+            request=recovery, runner=runner,
+            now_unix=int(original["expires_at_unix"]) + 300, sleep=lambda _: None,
+        )
+    observing = json.loads(Path(str(recovery["recovery_receipt"])).read_text(encoding="utf-8"))
+    assert claim_path.exists() and observing["status"] == "observing"
 
 
 @pytest.mark.parametrize("provider_response", ["{}", "null", '[{"id":1}]'])
