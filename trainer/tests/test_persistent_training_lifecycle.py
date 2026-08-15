@@ -1728,8 +1728,53 @@ def test_fresh_on_demand_gpu_machine_readback_rejects_drift_or_unavailable_rows(
     with pytest.raises(ValueError, match="on-demand GPU offer readback"):
         LIFECYCLE._fresh_on_demand_runtime_gpu_offer(runner=runner, offer=offer)
     assert commands == [
-        ("vastai", "--raw", "search", "offers", "machine_id=41998 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY, "--on-demand", "--storage", "300"),
+        ("vastai", "--raw", "search", "offers", "id=47749612 machine_id=41998 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY, "--on-demand", "--storage", "300"),
     ]
+
+
+@pytest.mark.parametrize(
+    "fresh_rows",
+    (
+        [{"id": 101, "machine_id": 20, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.5, "is_bid": False, "rentable": True, "rented": False}],
+        [{"machine_id": 20, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.5, "is_bid": False, "rentable": True, "rented": False}],
+        [
+            {"id": 100, "machine_id": 20, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.5, "is_bid": False, "rentable": True, "rented": False},
+            {"id": 100, "machine_id": 20, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.5, "is_bid": False, "rentable": True, "rented": False},
+        ],
+    ),
+)
+def test_direct_gpu_freshness_binds_exact_offer_id_before_provider_create(
+    fresh_rows: list[object],
+) -> None:
+    commands: list[tuple[str, ...]] = []
+    evidence = {
+        "offer": {"id": 100, "machine_id": 20, "gpu_name": "RTX PRO 6000 WS", "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.5, "is_bid": False, "rentable": True, "rented": False},
+        "search_mode": "on_demand", "expires_at_unix": int(time.time()) + 60,
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "account_hourly_total_usd": 1.5,
+        "datacenter_policy": LIFECYCLE.RUNTIME_GPU_DATACENTER_POLICY,
+    }
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(command)
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return json.dumps(fresh_rows)
+        if command[:4] == ("vastai", "--raw", "create", "instance"):
+            raise AssertionError("exact offer ID mismatch must stop before provider create")
+        raise AssertionError(command)
+
+    with pytest.raises(ValueError, match="on-demand GPU offer readback"):
+        LIFECYCLE.rent(
+            evidence=evidence, runner=runner, require_capability=False,
+            direct_gpu_on_demand=True,
+        )
+
+    assert not any(command[:4] == ("vastai", "--raw", "create", "instance") for command in commands)
 
 
 def test_ambiguous_rent_recovery_requires_exact_small_request_schema(tmp_path: Path) -> None:
@@ -1874,7 +1919,7 @@ def test_on_demand_ambiguous_claim_recovers_and_allows_a_different_machine(
     def runner(command: tuple[str, ...]) -> str:
         commands.append(command)
         if command == (
-            "vastai", "--raw", "search", "offers", "machine_id=59343 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
+            "vastai", "--raw", "search", "offers", "id=47749612 machine_id=59343 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
             "--on-demand", "--storage", "300",
         ):
             return "[]"
@@ -1889,8 +1934,10 @@ def test_on_demand_ambiguous_claim_recovers_and_allows_a_different_machine(
     receipt = result["recovery_receipt"]
     assert receipt["released"] is True and receipt["original_search_mode"] == "on_demand"
     assert receipt["blacklisted_machine_id"] == 59343 and not claim_path.exists()
+    assert receipt["start_offer_snapshot"]["original_offer_id"] == original["offer"]["id"]  # type: ignore[index]
+    assert receipt["end_offer_snapshot"]["original_offer_id"] == original["offer"]["id"]  # type: ignore[index]
     assert commands.count((
-        "vastai", "--raw", "search", "offers", "machine_id=59343 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
+        "vastai", "--raw", "search", "offers", "id=47749612 machine_id=59343 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
         "--on-demand", "--storage", "300",
     )) == 2
     fresh = dict(original) | {
@@ -1910,6 +1957,49 @@ def test_on_demand_ambiguous_claim_recovers_and_allows_a_different_machine(
         LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
             request=fresh | {"offer": dict(fresh["offer"]) | {"machine_id": 59343}},  # type: ignore[arg-type]
             identity=identity, claim_path=consumer_claim_path,
+        )
+
+
+def test_on_demand_recovery_authenticates_original_offer_id_in_present_proofs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery, _claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(
+        tmp_path, monkeypatch, on_demand=True,
+    )
+    live_offer = dict(original["offer"])  # type: ignore[arg-type]
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return json.dumps([live_offer])
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        raise AssertionError(command)
+
+    LIFECYCLE.recover_runtime_gpu_rent(
+        request=recovery, runner=runner,
+        now_unix=int(original["expires_at_unix"]) + 300, sleep=lambda _: None,
+    )
+    receipt_path = Path(str(recovery["recovery_receipt"]))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["start_offer_proof"]["id"] == original["offer"]["id"]  # type: ignore[index]
+    receipt["start_offer_proof"]["id"] = 47749610
+    receipt["start_offer_proof_sha256"] = LIFECYCLE._hash(receipt["start_offer_proof"])
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    fresh = dict(original) | {
+        "offer": dict(original["offer"]) | {"id": 47725426, "machine_id": 41998},  # type: ignore[arg-type]
+        "recovery_receipt": str(receipt_path),
+    }
+    identity = LIFECYCLE._runtime_campaign_binding(fresh)
+
+    with pytest.raises(ValueError, match="recovery receipt"):
+        LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
+            request=fresh, identity=identity,
+            claim_path=LIFECYCLE._runtime_gpu_rent_claim_path(
+                request=fresh, identity=identity, allow_held=True,
+            ),
         )
 
 
@@ -2892,13 +2982,10 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
     def runner(command: tuple[str, ...]) -> str:
         commands.append(command)
         if command == (
-            "vastai", "--raw", "search", "offers", "machine_id=10 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
+            "vastai", "--raw", "search", "offers", "id=8 machine_id=10 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
             "--on-demand", "--storage", "300",
         ):
-            return json.dumps([
-                dict(evidence["offer"]) | {"id": 7},
-                dict(evidence["offer"]) | {"id": 9},
-            ])
+            return json.dumps([dict(evidence["offer"])])
         if command[:4] in {
             ("vastai", "--raw", "show", "instances"),
             ("vastai", "--raw", "show", "volumes"),
@@ -2933,7 +3020,7 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
         "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
     ) in commands
     assert (
-        "vastai", "--raw", "search", "offers", "machine_id=10 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
+        "vastai", "--raw", "search", "offers", "id=8 machine_id=10 " + LIFECYCLE.RUNTIME_GPU_DATACENTER_OFFER_QUERY,
         "--on-demand", "--storage", "300",
     ) in commands
     assert not any("--interruptible" in command or "--bid_price" in command for command in commands)

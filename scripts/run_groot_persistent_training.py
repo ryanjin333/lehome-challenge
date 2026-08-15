@@ -445,12 +445,19 @@ def _runtime_gpu_datacenter_row(row: Mapping[str, object]) -> bool:
     return value is None or value is True
 
 
-def _runtime_gpu_datacenter_query(*, machine_id: int | None = None) -> str:
-    if machine_id is None:
-        return RUNTIME_GPU_DATACENTER_OFFER_QUERY
-    if not _positive_int(machine_id):
-        raise ValueError("runtime GPU datacenter query requires a machine ID")
-    return "machine_id=" + str(machine_id) + " " + RUNTIME_GPU_DATACENTER_OFFER_QUERY
+def _runtime_gpu_datacenter_query(
+    *, machine_id: int | None = None, offer_id: int | None = None,
+) -> str:
+    filters: list[str] = []
+    if offer_id is not None:
+        if not _positive_int(offer_id):
+            raise ValueError("runtime GPU datacenter query requires an offer ID")
+        filters.append("id=" + str(offer_id))
+    if machine_id is not None:
+        if not _positive_int(machine_id):
+            raise ValueError("runtime GPU datacenter query requires a machine ID")
+        filters.append("machine_id=" + str(machine_id))
+    return " ".join(filters + [RUNTIME_GPU_DATACENTER_OFFER_QUERY])
 
 
 def _require_runtime_gpu_datacenter_policy(value: object) -> None:
@@ -931,13 +938,16 @@ def _fresh_on_demand_runtime_gpu_offer(
     """Re-read the captured machine contract before an uncapped direct create."""
     value = _json(runner, (
         "vastai", "--raw", "search", "offers",
-        _runtime_gpu_datacenter_query(machine_id=int(offer["machine_id"])),
+        _runtime_gpu_datacenter_query(
+            machine_id=int(offer["machine_id"]), offer_id=int(offer["id"]),
+        ),
         "--on-demand", "--storage", "300",
     ))
     if not isinstance(value, list) or not any(isinstance(row, Mapping) for row in value):
         raise ValueError("on-demand GPU offer readback is invalid")
     matching = [
         row for row in value if isinstance(row, Mapping)
+        and row.get("id") == offer.get("id")
         and row.get("machine_id") == offer.get("machine_id")
         and row.get("gpu_name") == offer.get("gpu_name")
         and row.get("gpu_ram") == offer.get("gpu_ram")
@@ -946,7 +956,7 @@ def _fresh_on_demand_runtime_gpu_offer(
         and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False
         and _offer_gpu(row) and _runtime_gpu_datacenter_row(row)
     ]
-    if not matching:
+    if len(matching) != 1:
         raise ValueError("on-demand GPU offer readback does not match captured evidence")
 
 
@@ -2149,16 +2159,23 @@ def _runtime_gpu_recovery_offer_snapshot(
     if not _positive_int(original_offer_id):
         raise ValueError("runtime GPU recovery original offer is invalid")
     if search_mode == "on_demand":
-        query = _runtime_gpu_datacenter_query(machine_id=expected_machine_id)
+        query = _runtime_gpu_datacenter_query(
+            machine_id=expected_machine_id, offer_id=int(original_offer_id),
+        )
         value = _json(runner, (
             "vastai", "--raw", "search", "offers", query, "--on-demand", "--storage", "300",
         ))
         if not isinstance(value, list):
             raise ValueError("runtime GPU recovery offer search is invalid")
         if value == []:
-            return "absent", {"timestamp_unix": timestamp_unix, "query_sha256": _hash(query), "response_sha256": _hash(value), "matching_count": 0}
+            return "absent", {
+                "timestamp_unix": timestamp_unix, "original_offer_id": original_offer_id,
+                "query_sha256": _hash(query), "response_sha256": _hash(value),
+                "matching_count": 0,
+            }
         matching = [
             row for row in value if isinstance(row, Mapping)
+            and row.get("id") == original_offer_id
             and row.get("machine_id") == expected_machine_id
             and row.get("gpu_name") == original_offer.get("gpu_name")
             and row.get("gpu_ram") == original_offer.get("gpu_ram")
@@ -2167,10 +2184,10 @@ def _runtime_gpu_recovery_offer_snapshot(
             and row.get("is_bid") is False and row.get("rentable") is True and row.get("rented") is False
             and _offer_gpu(row) and _runtime_gpu_datacenter_row(row)
         ]
-        if not matching:
+        if len(matching) != 1:
             raise ValueError("runtime GPU recovery on-demand offer drifted")
         proof = _project(matching[0], (
-            "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "is_bid", "rentable", "rented",
+            "id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "is_bid", "rentable", "rented",
         ))
         return "present", proof
     if search_mode != "interruptible":
@@ -2224,10 +2241,11 @@ def _runtime_gpu_recovery_offer_proof_is_valid(
 def _runtime_gpu_recovery_on_demand_offer_proof_is_valid(
     proof: object, *, original_offer: Mapping[str, object], machine_id: int,
 ) -> bool:
-    fields = {"machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "is_bid", "rentable", "rented"}
+    fields = {"id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "is_bid", "rentable", "rented"}
     return (
         isinstance(proof, Mapping) and set(proof) == fields
         and all(proof.get(key) == original_offer.get(key) for key in fields)
+        and proof.get("id") == original_offer.get("id") and _positive_int(proof.get("id"))
         and proof.get("machine_id") == machine_id and _positive_int(machine_id)
         and _offer_gpu(proof) and proof.get("num_gpus") == 1
         and type(proof.get("dph_total")) in (int, float)
@@ -2294,18 +2312,20 @@ def _runtime_gpu_recovery_reconciled_receipt_is_valid(
     if not is_on_demand and ("original_search_mode" in receipt or "blocked_rent_request" in receipt):
         return False
     if receipt.get("offer_proof_mode") == "absent":
-        snapshot_fields = {"timestamp_unix", "query_sha256", "response_sha256", "matching_count"}
+        snapshot_fields = {"timestamp_unix", "original_offer_id", "query_sha256", "response_sha256", "matching_count"}
         fields = {"schema_version", "kind", "status", "released", "canonical_claim_path", "canonical_claim_sha256", "archive_claims", "original_offer_id", "observations", "offer_proof_mode", "blacklisted_machine_id", "start_offer_snapshot", "end_offer_snapshot"}
         if is_on_demand:
             fields |= {"original_search_mode", "blocked_rent_request"}
+        else:
+            snapshot_fields.remove("original_offer_id")
         query = (
-            _runtime_gpu_datacenter_query(machine_id=machine_id)
+            _runtime_gpu_datacenter_query(machine_id=machine_id, offer_id=original_offer_id)
             if is_on_demand else "id = " + str(original_offer_id)
         )
         return (
             common and set(receipt) == fields
             and receipt.get("blacklisted_machine_id") == machine_id
-            and all(isinstance(snapshot, Mapping) and set(snapshot) == snapshot_fields and type(snapshot.get("timestamp_unix")) is int and snapshot.get("query_sha256") == _hash(query) and snapshot.get("response_sha256") == expected_empty_hash and snapshot.get("matching_count") == 0 for snapshot in (receipt.get("start_offer_snapshot"), receipt.get("end_offer_snapshot")))
+            and all(isinstance(snapshot, Mapping) and set(snapshot) == snapshot_fields and type(snapshot.get("timestamp_unix")) is int and (not is_on_demand or snapshot.get("original_offer_id") == original_offer_id) and snapshot.get("query_sha256") == _hash(query) and snapshot.get("response_sha256") == expected_empty_hash and snapshot.get("matching_count") == 0 for snapshot in (receipt.get("start_offer_snapshot"), receipt.get("end_offer_snapshot")))
             and receipt["end_offer_snapshot"]["timestamp_unix"] >= receipt["start_offer_snapshot"]["timestamp_unix"] + RUNTIME_GPU_RECOVERY_OBSERVATION_POLLS * RUNTIME_GPU_RECOVERY_POLL_SECONDS
             and all(receipt["start_offer_snapshot"]["timestamp_unix"] <= row["timestamp_unix"] <= receipt["end_offer_snapshot"]["timestamp_unix"] for row in observations)
         )
