@@ -69,8 +69,8 @@ RUNTIME_GPU_PROBE_CALL_TIMEOUT_SECONDS = 620
 RUNTIME_GPU_PROBE_DIAGNOSTIC_LIMIT = 240
 RUNTIME_HYDRATE_STATUS_POLLS = 3
 RUNTIME_HYDRATE_POLL_SECONDS = 5.0
-RUNTIME_GPU_HYDRATION_RATE_LIMIT_ATTEMPTS = 3
-RUNTIME_GPU_HYDRATION_RATE_LIMIT_DELAY_SECONDS = 300
+RUNTIME_GPU_HYDRATION_RATE_LIMIT_ATTEMPTS = 6
+RUNTIME_GPU_HYDRATION_RATE_LIMIT_DELAY_SECONDS = 900
 RUNTIME_GPU_HYDRATION_RECOVERY_RATE_LIMIT_ATTEMPTS = 6
 RUNTIME_GPU_HYDRATION_RECOVERY_RATE_LIMIT_DELAY_SECONDS = 900
 _RUNTIME_PILOT_OFFER_FIELDS = (
@@ -128,6 +128,10 @@ class RuntimeGpuBootstrapProbeError(ValueError):
         self.executable = executable
         self.stderr = _sanitize_runtime_gpu_probe_stderr(stderr)
         super().__init__(f"runtime GPU bootstrap probe failed at {stage}")
+
+
+class RuntimeHydrationRecoveryAdmissionError(ValueError):
+    """A pre-worker recovery admission failure that must preserve the live lease."""
 
 
 _RUNTIME_GPU_PROBE_EXECUTABLES = {
@@ -4186,7 +4190,9 @@ def _runtime_gpu_hydration_job_start_command(request_sha256: str, *, initial_lau
     )
 
 
-def _runtime_gpu_hydration_rate_limit_terminal_command(request_sha256: str) -> str:
+def _runtime_gpu_hydration_rate_limit_terminal_command(
+    request_sha256: str, *, sources_root: str = "/prepared/sources",
+) -> str:
     """Return only authenticated non-secret evidence for the exhausted live job."""
     job = _runtime_hydration_job_dir(request_sha256)
     return (
@@ -4197,11 +4203,11 @@ def _runtime_gpu_hydration_rate_limit_terminal_command(request_sha256: str) -> s
         "test \"$(cat \"$job/status\")\" = \"running $sha\"; test -f \"$job/terminal\"; test ! -L \"$job/terminal\"; "
         "test \"$(cat \"$job/terminal\")\" = \"failure $sha 1\"; test -f \"$job/stderr.log\"; test ! -L \"$job/stderr.log\"; "
         "grep -Fq 'Hub download rate limited after 1 attempts' \"$job/stderr.log\"; "
-        "sources=/prepared/sources; test -d \"$sources\"; test ! -L \"$sources\"; "
-        "for source in organizer rollout; do tree=\"$sources/$source\"; test -d \"$tree\"; test ! -L \"$tree\"; "
-        "if find \"$tree\" ! -type d ! -type f -print -quit | grep -q .; then exit 9; fi; done; "
-        "organizer_files=$(find \"$sources/organizer\" -type f | wc -l | tr -d ' '); "
-        "rollout_files=$(find \"$sources/rollout\" -type f | wc -l | tr -d ' '); "
+        "sources=" + shlex.quote(sources_root) + "; test -d \"$sources\"; test ! -L \"$sources\"; "
+        "for source in organizer rollout; do tree=\"$sources/$source\"; if test -L \"$tree\"; then exit 9; "
+        "elif test -e \"$tree\"; then test -d \"$tree\"; if find \"$tree\" ! -type d ! -type f -print -quit | grep -q .; then exit 9; fi; fi; done; "
+        "if test -e \"$sources/organizer\"; then organizer_files=$(find \"$sources/organizer\" -type f | wc -l | tr -d ' '); else organizer_files=0; fi; "
+        "if test -e \"$sources/rollout\"; then rollout_files=$(find \"$sources/rollout\" -type f | wc -l | tr -d ' '); else rollout_files=0; fi; "
         "case \"$organizer_files:$rollout_files\" in *[!0-9:]*|'':) exit 9;; esac; "
         "printf '{\\\"schema_version\\\":1,\\\"kind\\\":\\\"runtime_mixture_hydration_rate_limit_terminal\\\",\\\"request_sha256\\\":\\\"%s\\\",\\\"exit_code\\\":1,\\\"organizer_files\\\":%s,\\\"rollout_files\\\":%s}\\n' \"$sha\" \"$organizer_files\" \"$rollout_files\""
     )
@@ -4254,8 +4260,8 @@ def _runtime_gpu_hydration_recovery_job_start_command(request_sha256: str, *, in
         "test \"$(cat \"$job/terminal\")\" = \"failure $sha 1\"; test -f \"$job/stderr.log\"; test ! -L \"$job/stderr.log\"; "
         "grep -Fq 'Hub download rate limited after 1 attempts' \"$job/stderr.log\"; "
         "sources=/prepared/sources; test -d \"$sources\"; test ! -L \"$sources\"; "
-        "for source in organizer rollout; do tree=\"$sources/$source\"; test -d \"$tree\"; test ! -L \"$tree\"; "
-        "if find \"$tree\" ! -type d ! -type f -print -quit | grep -q .; then exit 9; fi; done; "
+        "for source in organizer rollout; do tree=\"$sources/$source\"; if test -L \"$tree\"; then exit 9; "
+        "elif test -e \"$tree\"; then test -d \"$tree\"; if find \"$tree\" ! -type d ! -type f -print -quit | grep -q .; then exit 9; fi; fi; done; "
     )
     if initial_launch:
         return (
@@ -4383,6 +4389,21 @@ def _runtime_gpu_hydration_recovery_receipt(
     return dict(receipt)
 
 
+def _runtime_abort_after_hydration_recovery_launch(
+    *, instance: Mapping[str, object], request: Mapping[str, object], runner: Runner,
+    operation: Callable[[], dict[str, object]],
+) -> dict[str, object]:
+    """Keep pre-launch admission failures from destroying a recoverable lease."""
+    _runtime_failure_receipt_path(request)
+    try:
+        return operation()
+    except RuntimeHydrationRecoveryAdmissionError:
+        raise
+    except BaseException as error:
+        _runtime_abort_cleanup(instance=instance, request=request, error=error, runner=runner)
+        raise
+
+
 def validate_runtime_gpu_hydration_recovery_request(
     *, instance: Mapping[str, object], request: Mapping[str, object],
 ) -> dict[str, object]:
@@ -4419,17 +4440,23 @@ def _run_runtime_gpu_hydration_recovery_validated(
         or not isinstance(identity, Mapping)
     ):
         raise ValueError("runtime hydration recovery validation is invalid")
-    terminal = _runtime_gpu_hydration_rate_limit_snapshot(
-        instance=instance, request_sha256=request_sha256, runner=runner,
-    )
+    try:
+        terminal = _runtime_gpu_hydration_rate_limit_snapshot(
+            instance=instance, request_sha256=request_sha256, runner=runner,
+        )
+    except ValueError as error:
+        raise RuntimeHydrationRecoveryAdmissionError(str(error)) from error
     if terminal is None:
         return _runtime_gpu_hydration_pending(
             instance=instance, request_sha256=request_sha256, unresolved=True,
         ) | {"rate_limit_recovery": True}
-    reattach = _runtime_gpu_hydration_recovery_intent(
-        instance=instance, request=request, request_sha256=request_sha256,
-        capability_sha256=capability_sha256, partial_sources=terminal,
-    )
+    try:
+        reattach = _runtime_gpu_hydration_recovery_intent(
+            instance=instance, request=request, request_sha256=request_sha256,
+            capability_sha256=capability_sha256, partial_sources=terminal,
+        )
+    except ValueError as error:
+        raise RuntimeHydrationRecoveryAdmissionError(str(error)) from error
     ssh_prefix = _runtime_hydration_ssh_prefix(instance)
     try:
         started = runner((*ssh_prefix, _runtime_gpu_hydration_recovery_job_start_command(
@@ -4440,9 +4467,13 @@ def _run_runtime_gpu_hydration_recovery_validated(
             return _runtime_gpu_hydration_pending(
                 instance=instance, request_sha256=request_sha256, unresolved=True,
             ) | {"rate_limit_recovery": True}
-        raise ValueError("runtime hydration recovery worker could not be started or attached") from error
+        raise RuntimeHydrationRecoveryAdmissionError(
+            "runtime hydration recovery worker could not be started or attached"
+        ) from error
     if started not in {"recovery-started\n", "recovery-attached\n"}:
-        raise ValueError("runtime hydration recovery worker start identity is invalid")
+        raise RuntimeHydrationRecoveryAdmissionError(
+            "runtime hydration recovery worker start identity is invalid"
+        )
     for poll in range(RUNTIME_HYDRATE_STATUS_POLLS):
         try:
             status = runner((*ssh_prefix, _runtime_gpu_hydration_recovery_job_status_command(request_sha256)))
@@ -5124,7 +5155,7 @@ def remote_action(*, action: str, instance: Mapping[str, object], request: Mappi
         validated = validate_runtime_gpu_hydration_recovery_request(
             instance=instance, request=request,
         )
-        return _runtime_abort_on_failure(
+        return _runtime_abort_after_hydration_recovery_launch(
             instance=instance, request=request, runner=runner,
             operation=lambda: _run_runtime_gpu_hydration_recovery_validated(
                 instance=instance, request=request, runner=runner, validated=validated,
@@ -5468,7 +5499,7 @@ def main_for_test(
         validated = validate_runtime_gpu_hydration_recovery_request(
             instance=instance, request=request,
         )
-        return _runtime_abort_on_failure(
+        return _runtime_abort_after_hydration_recovery_launch(
             instance=instance, request=request, runner=runner,
             operation=lambda: _run_runtime_gpu_hydration_recovery_validated(
                 instance=instance, request=request, runner=runner, validated=validated,

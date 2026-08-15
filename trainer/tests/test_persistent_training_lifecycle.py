@@ -4018,6 +4018,62 @@ def test_direct_runtime_hydrate_recovers_only_the_authenticated_exhausted_rate_l
     assert not any(command[0] == "vastai" for command in calls)
 
 
+def test_runtime_hydration_rate_limit_classifier_accepts_absent_not_started_source_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live organizer-only partial layout is a valid resumable hydration state."""
+    request_sha256 = "a" * 64
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "request-sha256").write_text(request_sha256, encoding="utf-8")
+    (job / "status").write_text("running " + request_sha256, encoding="utf-8")
+    (job / "terminal").write_text("failure " + request_sha256 + " 1", encoding="utf-8")
+    (job / "stderr.log").write_text("Hub download rate limited after 1 attempts\n", encoding="utf-8")
+    sources = tmp_path / "sources"
+    organizer = sources / "organizer"
+    organizer.mkdir(parents=True)
+    (organizer / "part-0001").write_bytes(b"partial")
+    # Deliberately do not create sources/rollout: it has not started yet.
+    monkeypatch.setattr(LIFECYCLE, "_runtime_hydration_job_dir", lambda _sha: str(job))
+
+    command = LIFECYCLE._runtime_gpu_hydration_rate_limit_terminal_command(
+        request_sha256, sources_root=str(sources),
+    )
+    result = subprocess.run(("/bin/sh", "-c", command), text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "schema_version": 1, "kind": "runtime_mixture_hydration_rate_limit_terminal",
+        "request_sha256": request_sha256, "exit_code": 1,
+        "organizer_files": 1, "rollout_files": 0,
+    }
+
+
+def test_runtime_hydration_recovery_admission_error_never_enters_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = {
+        "kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 44,
+        "provider_response_sha256": "2" * 64, "host": "native-x86", "port": 22,
+    }
+    request = {"instance": instance, "failure_receipt": str(tmp_path / "failure.json")}
+    request_path = tmp_path / "recover.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    monkeypatch.setattr(LIFECYCLE, "validate_runtime_gpu_hydration_recovery_request", lambda **_kwargs: {
+        "identity": {}, "request_sha256": "a" * 64, "capability_sha256": "b" * 64,
+    })
+    calls: list[tuple[str, ...]] = []
+
+    with pytest.raises(ValueError, match="authenticated exhausted Hub rate limit"):
+        LIFECYCLE.main_for_test(
+            ["runtime-hydrate-recover", "--request", str(request_path), "--execute"],
+            runner=lambda command: calls.append(command) or (_ for _ in ()).throw(subprocess.CalledProcessError(1, command)),
+        )
+
+    assert calls and all(command[0] == "ssh" for command in calls)
+    assert not Path(str(request["failure_receipt"])).exists()
+
+
 def test_direct_runtime_hydrate_partial_initialization_reattaches_after_ssh_255(
     tmp_path: Path,
 ) -> None:
@@ -4136,9 +4192,9 @@ def test_direct_runtime_hydrate_worker_owns_pid_before_running_or_terminal_state
     assert "mv \"$job/status.tmp\" \"$job/status\"" in command
     assert "mv \"$job/terminal.tmp\" \"$job/terminal\"" in command
     assert "/usr/bin/setsid /usr/bin/nohup" in command
-    assert "max_attempts=3" in command
+    assert "max_attempts=6" in command
     assert "Hub download rate limited after 1 attempts" in command
-    assert "/usr/bin/sleep 300" in command
+    assert "/usr/bin/sleep 900" in command
 
 
 def test_direct_runtime_hydrate_intent_path_is_canonical_across_failure_receipts(
