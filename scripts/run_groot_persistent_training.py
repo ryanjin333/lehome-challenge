@@ -1998,6 +1998,21 @@ def _validate_runtime_gpu_recovery_for_new_rent(
     archived_rows = _runtime_gpu_recovery_archives(
         claim_path=claim_path, identity=identity, request=request, allow_recovery_receipt=True,
     )
+    current_rows = [
+        row for row in archived_rows
+        if row["relative_filename"] == archive_path.name
+        and row["byte_sha256"] == receipt["canonical_claim_sha256"]
+    ]
+    if len(current_rows) != 1:
+        raise ValueError("runtime GPU recovery receipt canonical archive is ambiguous")
+    archived_rows = [
+        row | {
+            "reconciled_machine_id": receipt["reconciled_machine_id"],
+            "original_offer_id": receipt["original_offer_id"],
+        }
+        if row in current_rows else row
+        for row in archived_rows
+    ]
     reconciled = dict(receipt)
     reconciled.pop("archive_path")
     reconciled["status"] = "reconciled"

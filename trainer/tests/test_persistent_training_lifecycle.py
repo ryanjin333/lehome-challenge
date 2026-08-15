@@ -1894,6 +1894,51 @@ def test_direct_gpu_retry_rejects_tampered_recovery_receipt_before_provider(
                 request=fresh, identity=identity, allow_held=True,
             ),
         )
+
+
+def test_direct_gpu_retry_accepts_released_recovery_on_different_offer_and_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery, claim_path, _original_path, original = _blocked_gpu_rent_recovery_fixture(tmp_path, monkeypatch)
+    live_offer = dict(original["offer"]) | {"machine_id": 140799}  # type: ignore[arg-type]
+
+    def runner(command: tuple[str, ...]) -> str:
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return json.dumps([live_offer])
+        if command[:4] in {
+            ("vastai", "--raw", "show", "instances"),
+            ("vastai", "--raw", "show", "volumes"),
+        }:
+            return "[]"
+        raise AssertionError(command)
+
+    LIFECYCLE.recover_runtime_gpu_rent(
+        request=recovery, runner=runner, now_unix=int(original["expires_at_unix"]) + 300,
+        sleep=lambda _: None,
+    )
+    fresh = dict(original) | {
+        "offer": dict(original["offer"]) | {"id": 9, "machine_id": 140800},  # type: ignore[arg-type]
+        "recovery_receipt": str(recovery["recovery_receipt"]),
+    }
+    identity = LIFECYCLE._runtime_campaign_binding(fresh)
+
+    LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
+        request=fresh, identity=identity,
+        claim_path=LIFECYCLE._runtime_gpu_rent_claim_path(
+            request=fresh, identity=identity, allow_held=True,
+        ),
+    )
+    for offer in (
+        dict(fresh["offer"]) | {"id": 8},  # type: ignore[arg-type]
+        dict(fresh["offer"]) | {"machine_id": 140799},  # type: ignore[arg-type]
+    ):
+        with pytest.raises(ValueError, match="different offer and machine"):
+            LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
+                request=fresh | {"offer": offer}, identity=identity,
+                claim_path=LIFECYCLE._runtime_gpu_rent_claim_path(
+                    request=fresh, identity=identity, allow_held=True,
+                ),
+            )
 def test_rent_runtime_cpu_pilot_uses_exact_on_demand_create_and_x86_proof(tmp_path: Path) -> None:
     commands: list[tuple[str, ...]] = []
     readiness_reads = 0
