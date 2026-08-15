@@ -3918,6 +3918,106 @@ def test_direct_runtime_hydrate_terminal_failure_invokes_the_existing_cleanup_on
     assert json.loads(Path(str(request["failure_receipt"])).read_text())["cleanup_status"] == "destroyed_and_absent"
 
 
+def test_direct_runtime_hydrate_recovers_only_the_authenticated_exhausted_rate_limit(
+    tmp_path: Path,
+) -> None:
+    """A completed rate-limit terminal keeps this same lease alive for one recovery worker."""
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+    }
+    request["failure_receipt"] = str(tmp_path / "hydrate-failure.json")
+    identity = LIFECYCLE._runtime_campaign_binding(request)
+    request_sha256 = LIFECYCLE._runtime_gpu_hydration_request_sha256(request)
+    capability = {
+        "schema_version": 1, "kind": "runtime_mixture_gpu_bootstrap_capability",
+        "instance_id": 44, "provider_response_sha256": "2" * 64,
+        "platform_arch": "x86_64", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+        "code_revision": request["code_revision"], "code_bundle_sha256": request["code_bundle_sha256"],
+        "bc_revision": identity["bc"]["immutable_revision"],
+        "bc_receipt_sha256": identity["bc_receipt_sha256"],
+        "rollout_revision": identity["rollout"]["immutable_revision"],
+        "rollout_prefix": identity["rollout"]["remote_prefix"],
+        "rollout_receipt_sha256": identity["rollout_receipt_sha256"],
+        "deployment_revision": identity["deployment"]["immutable_revision"],
+        "mixture_id": identity["deployment"]["mixture_id"],
+        "deployment_receipt_sha256": identity["deployment_receipt_sha256"],
+        "parent_archive_sha256": LIFECYCLE.PARENT_CHECKPOINT["archive_sha256"],
+        "parent_checkpoint_artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"],
+        "runtime_hydrate_request_sha256": request_sha256,
+        "training_capability": {
+            "hardware": "NVIDIA RTX PRO 6000 Blackwell", "driver_version": "595.71.05",
+            "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+            "cuda_runtime": "12.8", "torch_cuda": "12.8", "compute_capability": "12.0",
+            "optimizer_step": {"passed": True, "loss": .2}, "nvml": {"utilization_percent": 90},
+        },
+    }
+    capability_path = tmp_path / "bootstrap-capability.json"
+    capability_path.write_text(json.dumps(capability), encoding="utf-8")
+    request["bootstrap_capability_receipt"] = str(capability_path)
+    instance["capability_sha256"] = LIFECYCLE.sha256_file(capability_path)
+    request["instance"] = instance
+    request_path = tmp_path / "recover-request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    calls: list[tuple[str, ...]] = []
+    hydration_receipt = {
+        "schema_version": 1, "kind": "runtime_mixture_hydration",
+        "repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"],
+        "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64,
+        "mixture_id": "d" * 64,
+        "artifact_tree_sha256": LIFECYCLE._hash(_runtime_deployment_entries()),
+        "mounts_descriptor": "/prepared/runtime/mounts.json", "fresh_readback_verified": True,
+    }
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command[0] != "ssh":
+            raise AssertionError("the authenticated rate limit must not clean up")
+        if "/usr/bin/setsid /usr/bin/nohup" in command[-1] and "/recovery" not in command[-1]:
+            return "started\n"
+        if "rate-limit-terminal" in command[-1]:
+            return json.dumps({
+                "schema_version": 1, "kind": "runtime_mixture_hydration_rate_limit_terminal",
+                "request_sha256": request_sha256, "exit_code": 1,
+                "organizer_files": 3511, "rollout_files": 0,
+            })
+        if "/usr/bin/setsid /usr/bin/nohup" in command[-1] and "/recovery" in command[-1]:
+            return "recovery-started\n"
+        if "printf 'recovery-attached" in command[-1]:
+            return "recovery-attached\n"
+        if "/recovery;" in command[-1] and "receipt.json" in command[-1]:
+            return json.dumps(hydration_receipt)
+        if "/recovery;" in command[-1] and "pid=$(cat" in command[-1]:
+            return "success " + request_sha256 + "\n"
+        if "kill -0" in command[-1]:
+            return "failure " + request_sha256 + " 1\n"
+        raise AssertionError(command)
+
+    original = LIFECYCLE.main_for_test(
+        ["runtime-hydrate", "--request", str(request_path), "--execute"], runner=runner,
+    )
+    assert original["rate_limit_recovery_required"] is True
+    assert not Path(str(request["failure_receipt"])).exists()
+
+    recovered = LIFECYCLE.main_for_test(
+        ["runtime-hydrate-recover", "--request", str(request_path), "--execute"], runner=runner,
+    )
+    assert recovered["hydration_receipt"] == hydration_receipt
+    assert recovered["rate_limit_recovery"] is True
+    reattached = LIFECYCLE.main_for_test(
+        ["runtime-hydrate-recover", "--request", str(request_path), "--execute"], runner=runner,
+    )
+    assert reattached["hydration_receipt"] == hydration_receipt
+    assert sum(
+        "/usr/bin/setsid /usr/bin/nohup" in command[-1] and "/recovery" in command[-1]
+        for command in calls if command[0] == "ssh"
+    ) == 1
+    assert not any(command[0] == "vastai" for command in calls)
+
+
 def test_direct_runtime_hydrate_partial_initialization_reattaches_after_ssh_255(
     tmp_path: Path,
 ) -> None:
