@@ -59,6 +59,9 @@ def _temporary_vast_ssh_identity(
     identity.chmod(0o600)
     monkeypatch.setattr(LIFECYCLE, "VAST_SSH_IDENTITY", identity)
     monkeypatch.setattr(LIFECYCLE, "RUNTIME_GPU_RENT_CLAIM_ROOT", tmp_path / "gpu-rent-claims")
+    # Unit tests inject the provider boundary and intentionally do not launch
+    # Docker.  Production rent remains responsible for the real preflight.
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_exact_image_preflight_from_request", lambda _request: {})
 
 
 def test_vast_ssh_and_scp_prefixes_use_the_approved_identity(
@@ -2717,6 +2720,10 @@ def test_runtime_gpu_exact_image_preflight_accepts_cuda_unavailable_after_cli_im
     "LEHOME_RUNTIME_GPU_PROBE_STAGE=clone\nLEHOME_RUNTIME_GPU_PROBE_STAGE=checkout\nLEHOME_RUNTIME_GPU_PROBE_STAGE=revision\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clean\nLEHOME_RUNTIME_GPU_PROBE_STAGE=capability\ntraining capability requires CUDA\nunexpected suffix",
     "LEHOME_RUNTIME_GPU_PROBE_STAGE=clone\nLEHOME_RUNTIME_GPU_PROBE_STAGE=checkout\nLEHOME_RUNTIME_GPU_PROBE_STAGE=revision\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clean\nLEHOME_RUNTIME_GPU_PROBE_STAGE=capability\ntraining capability requires CUDA",
     "LEHOME_RUNTIME_GPU_PROBE_STAGE=clone\nLEHOME_RUNTIME_GPU_PROBE_STAGE=checkout\nLEHOME_RUNTIME_GPU_PROBE_STAGE=revision\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clean\nLEHOME_RUNTIME_GPU_PROBE_STAGE=capability",
+    "\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clone\nLEHOME_RUNTIME_GPU_PROBE_STAGE=checkout\nLEHOME_RUNTIME_GPU_PROBE_STAGE=revision\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clean\nLEHOME_RUNTIME_GPU_PROBE_STAGE=capability\n╭─ Error ──────────────────────────────────────────────────────────────────────╮\n│ training capability requires CUDA                                            │\n╰──────────────────────────────────────────────────────────────────────────────╯",
+    "LEHOME_RUNTIME_GPU_PROBE_STAGE=clone\nLEHOME_RUNTIME_GPU_PROBE_STAGE=checkout\nLEHOME_RUNTIME_GPU_PROBE_STAGE=revision\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clean\nLEHOME_RUNTIME_GPU_PROBE_STAGE=capability\n╭─ Error ──────────────────────────────────────────────────────────────────────╮\n│ training capability requires CUDA                                            │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+    " LEHOME_RUNTIME_GPU_PROBE_STAGE=clone\nLEHOME_RUNTIME_GPU_PROBE_STAGE=checkout\nLEHOME_RUNTIME_GPU_PROBE_STAGE=revision\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clean\nLEHOME_RUNTIME_GPU_PROBE_STAGE=capability\n╭─ Error ──────────────────────────────────────────────────────────────────────╮\n│ training capability requires CUDA                                            │\n╰──────────────────────────────────────────────────────────────────────────────╯",
+    "LEHOME_RUNTIME_GPU_PROBE_STAGE=clone\nLEHOME_RUNTIME_GPU_PROBE_STAGE=checkout\nLEHOME_RUNTIME_GPU_PROBE_STAGE=revision\nLEHOME_RUNTIME_GPU_PROBE_STAGE=clean\nLEHOME_RUNTIME_GPU_PROBE_STAGE=capability\n╭─ Error ──────────────────────────────────────────────────────────────────────╮\n│ training capability requires CUDA                                            │\n╰──────────────────────────────────────────────────────────────────────────────╯ ",
 ))
 def test_runtime_gpu_exact_image_preflight_rejects_noncanonical_cuda_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stderr: str,
@@ -2735,6 +2742,8 @@ def test_runtime_gpu_exact_image_preflight_rejects_noncanonical_cuda_terminal(
 @pytest.mark.parametrize(("stderr", "secret"), (
     ("HF_TOKEN=secret-value", "secret-value"),
     ("Authorization: Bearer hunter2", "hunter2"),
+    ("Authorization: Basic abc123", "abc123"),
+    ("Authorization: Digest username=alice, realm=example, nonce=abc123", "Digest username=alice, realm=example, nonce=abc123"),
     ("api_key: alpha:omega", "alpha:omega"),
 ))
 def test_runtime_gpu_probe_stderr_redacts_complete_credential_values(stderr: str, secret: str) -> None:
@@ -2742,6 +2751,28 @@ def test_runtime_gpu_probe_stderr_redacts_complete_credential_values(stderr: str
 
     assert secret not in sanitized
     assert sanitized == "<credential>"
+
+
+def test_direct_gpu_rent_preflights_before_any_claim_or_provider_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = {"failure_receipt": str(tmp_path / "failure.json")}
+    calls: list[dict[str, str]] = []
+    provider_calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_preflight", lambda _request: {})
+
+    def fail_preflight(request: dict[str, str]) -> dict[str, object]:
+        calls.append(request)
+        raise ValueError("exact image preflight failed")
+
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_exact_image_preflight_from_request", fail_preflight)
+    with pytest.raises(ValueError, match="exact image preflight failed"):
+        LIFECYCLE.rent_runtime_gpu_warmup(
+            evidence=evidence, runner=lambda command: provider_calls.append(command) or "",
+        )
+
+    assert calls == [evidence]
+    assert provider_calls == []
 
 
 def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(

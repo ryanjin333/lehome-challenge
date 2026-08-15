@@ -115,13 +115,15 @@ def _sanitize_runtime_gpu_probe_stderr(value: object) -> str:
         text = value
     else:
         return "unavailable"
-    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
-    # Handle Authorization separately so its Bearer scheme and its credential
-    # are one redaction.  Values intentionally include colon-bearing tokens.
+    # Redact an Authorization header before flattening line boundaries: every
+    # scheme's complete value is sensitive, including multi-token Digest data.
     text = re.sub(
-        r"(?i)\bauthorization\b\s*(?:=|:)\s*(?:bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s;,]+)",
+        r"(?i)\bauthorization\b\s*(?:=|:)\s*[^\r\n]*",
         "<credential>", text,
     )
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    # Bearer values outside an Authorization header and keyed values still
+    # need complete redaction; values intentionally include colon characters.
     text = re.sub(r"(?i)\bbearer\s+(?:\"[^\"]*\"|'[^']*'|[^\s;,]+)", "<credential>", text)
     text = re.sub(
         r"(?i)\b(hf_token|token|password|secret|api[_-]?key)\b\s*(?:=|:)\s*(?:\"[^\"]*\"|'[^']*'|[^\s;,]+)",
@@ -154,7 +156,12 @@ def _runtime_gpu_probe_command(code_revision: str) -> str:
 
 def _runtime_gpu_no_cuda_terminal_is_exact(stderr: str) -> bool:
     """Accept only the complete controller trace and Typer's sole CUDA error box."""
-    lines = stderr.replace("\r\n", "\n").replace("\r", "\n").strip().split("\n")
+    normalized = stderr.replace("\r\n", "\n").replace("\r", "\n")
+    if normalized.endswith("\n"):
+        normalized = normalized[:-1]
+    if normalized.endswith("\n"):
+        return False
+    lines = normalized.split("\n")
     trace_length = len(_RUNTIME_GPU_PROBE_STAGE_TRACE)
     if len(lines) != trace_length + 3 or tuple(lines[:trace_length]) != _RUNTIME_GPU_PROBE_STAGE_TRACE:
         return False
@@ -2860,12 +2867,9 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
     """Promote a fresh direct PRO6000 lease after up to ten minutes of readiness."""
     _runtime_failure_receipt_path(evidence)
     identity = _runtime_gpu_rent_preflight(evidence)
-    # The production CLI uses the real runner.  Tests inject a runner for the
-    # provider boundary and exercise the exact-image check independently.
-    # Therefore no normal paid invocation can create a lease before the local
-    # pinned-image command has resolved every executable and imported the CLI.
-    if runner is _run:
-        _runtime_gpu_exact_image_preflight_from_request(evidence)
+    # This stays outside the provider runner boundary, so every direct-GPU
+    # invocation verifies the pinned image before it can claim or create a lease.
+    _runtime_gpu_exact_image_preflight_from_request(evidence)
     claim_path = _runtime_gpu_rent_claim_path(request=evidence, identity=identity)
     claim = _runtime_gpu_rent_claim(path=claim_path, request=evidence, identity=identity)
     rented: Mapping[str, object] | None = None
