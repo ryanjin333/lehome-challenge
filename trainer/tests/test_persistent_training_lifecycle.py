@@ -3893,6 +3893,122 @@ def test_runtime_cpu_bootstrap_stages_only_cpu_pilot_inputs_and_never_parent_mat
     assert LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE not in setup and "private-token" not in setup
 
 
+def test_runtime_gpu_bootstrap_hydrates_the_immutable_parent_on_host_without_scp_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direct GPU lease must fetch its verified parent, never receive 12GB over SCP."""
+    instance, request = _runtime_pilot_request_files(tmp_path)
+    instance |= {
+        "kind": "runtime_mixture_gpu_warmup_instance",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+        "capability_sha256": "5" * 64,
+    }
+    bundle, bundle_sha, token = tmp_path / "code.bundle", tmp_path / "code.bundle.sha256", tmp_path / "runtime.token"
+    bundle.write_bytes(b"reviewed bundle")
+    bundle_sha.write_text("4" * 64 + "  code.bundle\n", encoding="utf-8")
+    token.write_text("private-token", encoding="utf-8")
+    token.chmod(0o600)
+    parent_payload = tmp_path / "parent.bin"
+    parent_payload.write_bytes(b"parent")
+    parent = tmp_path / "parent.tar"
+    with tarfile.open(parent, "w") as archive:
+        archive.add(parent_payload, arcname="policies/step-12000/weights.bin")
+    monkeypatch.setattr(
+        LIFECYCLE, "PARENT_CHECKPOINT",
+        LIFECYCLE.PARENT_CHECKPOINT | {"archive_sha256": LIFECYCLE.sha256_file(parent)},
+    )
+    hydrate = tmp_path / "hydrate.json"
+    hydrate.write_text(json.dumps({"schema_version": 1, "command": "hydrate-runtime-mixture", "arguments": {"deployment_receipt": "/prepared/config/deployment-receipt.json", "source_readback_receipts": "/prepared/config", "destination": "/prepared/runtime", "mounts_descriptor": "/prepared/runtime/mounts.json"}}), encoding="utf-8")
+    capability = tmp_path / "capability.json"
+    capability.write_text("{}", encoding="utf-8")
+    output = tmp_path / "gpu-bootstrap.json"
+    request |= {
+        "code_bundle": str(bundle), "code_bundle_sha256_file": str(bundle_sha),
+        "token_file": str(token), "runtime_hydrate_request": str(hydrate),
+        "parent_checkpoint": str(parent), "bootstrap_capability_receipt": str(capability),
+        "bootstrap_receipt": str(output),
+    }
+    monkeypatch.setattr(LIFECYCLE, "_verify_reviewed_code_bundle", lambda *_args: "4" * 64)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_bootstrap_capability_receipt", lambda **_kwargs: {})
+    sources = {
+        "code.bundle": bundle, "code.bundle.sha256": bundle_sha, "runtime.token": token,
+        "runtime-hydrate.json": hydrate,
+        "bc-readback.json": Path(str(request["bc_readback_receipt"])),
+        "rollout-readback.json": Path(str(request["rollout_readback_receipt"])),
+        "deployment-receipt.json": Path(str(request["deployment_receipt"])),
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command[0] == "scp":
+            return ""
+        if command[0] == "ssh" and command[-1].startswith("sha256sum "):
+            name = command[-1].rpartition("/")[2]
+            return LIFECYCLE.sha256_file(sources[name]) + "  " + name + "\n"
+        return ""
+
+    receipt = LIFECYCLE.runtime_mixture_bootstrap_stage(
+        instance=instance, request=request, runner=runner,
+    )["bootstrap_receipt"]
+
+    scp_destinations = [command[-1] for command in calls if command[0] == "scp"]
+    setup = calls[-1][-1]
+    hydration = {
+        "mode": "hf_snapshot_download",
+        "repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
+        "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"],
+        "subpath": LIFECYCLE.PARENT_CHECKPOINT["subpath"],
+        "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"],
+    }
+    assert not any(destination.endswith("/parent.tar") for destination in scp_destinations)
+    assert "snapshot_download" in setup and "repo_type=" in setup
+    assert LIFECYCLE.PARENT_CHECKPOINT["repository"] in setup
+    assert LIFECYCLE.PARENT_CHECKPOINT["revision"] in setup
+    assert LIFECYCLE.PARENT_CHECKPOINT["subpath"] in setup
+    assert "HF_TOKEN=\"$(cat /prepared/config/runtime.token)\"" in setup
+    assert "private-token" not in setup and "parent.tar" not in setup
+    assert "test -z \"$(find \"$parent_tmp/repo\"" in setup
+    assert "policy_artifact_sha256" in setup and "/cache/parent" in setup
+    assert receipt["parent_hydration"] == hydration
+    assert receipt["parent_checkpoint_artifact_sha256"] == hydration["artifact_sha256"]
+    assert "parent_archive_sha256" not in receipt
+    assert LIFECYCLE._runtime_bootstrap_receipt(
+        path=output, instance=instance, request=request,
+    ) == receipt
+    receipt["parent_hydration"]["revision"] = "0" * 40
+    output.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="bootstrap stage"):
+        LIFECYCLE._runtime_bootstrap_receipt(path=output, instance=instance, request=request)
+    receipt["parent_hydration"]["revision"] = hydration["revision"]
+    receipt["parent_archive_sha256"] = LIFECYCLE.PARENT_CHECKPOINT["archive_sha256"]
+    output.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="cannot claim an archive"):
+        LIFECYCLE._runtime_bootstrap_receipt(path=output, instance=instance, request=request)
+
+
+def test_runtime_gpu_parent_hydration_rejects_malformed_controller_mode_before_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        LIFECYCLE, "RUNTIME_GPU_PARENT_HYDRATION",
+        {"mode": "archive", "repository": "unapproved/repo"},
+    )
+
+    monkeypatch.setattr(LIFECYCLE, "_runtime_campaign_binding", lambda _request: {})
+    monkeypatch.setattr(LIFECYCLE, "_runtime_parent_checkpoint", lambda _request: tmp_path / "parent.tar")
+    calls: list[tuple[str, ...]] = []
+
+    with pytest.raises(ValueError, match="parent hydration"):
+        LIFECYCLE.rent_runtime_gpu_warmup(
+            evidence={"failure_receipt": str(tmp_path / "failure.json")},
+            runner=lambda command: calls.append(command) or "",
+        )
+
+    assert calls == []
+
+
 def test_runtime_cli_dispatch_never_calls_legacy_recuts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

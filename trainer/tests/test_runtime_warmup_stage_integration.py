@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -451,6 +452,27 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     bootstrap = tmp_path / "stage" / "bootstrap.json"
     stage_receipt = tmp_path / "stage" / "warmup-stage.json"
     runner, calls = _local_stage_transport(tmp_path / "remote", runtime_mounts)
+
+    # The real GPU host now hydrates this immutable parent from HF instead of
+    # receiving the archive over SCP.  This local transport has no Hub service,
+    # so stand in only for that authenticated remote download; stage/copy and
+    # the actual checkpoint hash verification remain real below.
+    def local_parent_hydration(*, remote_dir: str, hydration: dict[str, str]) -> str:
+        assert remote_dir == "/tmp/lehome-runtime-bootstrap"
+        assert hydration["artifact_sha256"] == parent_identity["artifact_sha256"]
+        return (
+            "test ! -e /cache/parent; mkdir -p /cache/parent; cp -a "
+            + shlex.quote(str(parent_root) + "/.")
+            + " /cache/parent; PYTHONPATH=/prepared/code/trainer/src python -c "
+            + shlex.quote(
+                "from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; "
+                "assert policy_artifact_sha256('/cache/parent') == "
+                + repr(parent_identity["artifact_sha256"])
+            )
+            + "; "
+        )
+
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_parent_hydration_command", local_parent_hydration)
     LIFECYCLE.runtime_mixture_bootstrap_stage(
         instance=instance,
         request={

@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -29,6 +30,12 @@ from lehome_train.release_manifest import validate_training_capability
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
 CORRECTIVE_SOURCE = {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c", "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35"}
 PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3", "subpath": "policies/step-12000", "archive_sha256": "0ddd4e7ce351dd2172cd1edd967293a50d02c15c0f2c21ca39db94692a57e0b5", "artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"}
+# The direct GPU host receives only a token and immutable controller evidence.
+# Its parent checkpoint is hydrated from this exact model-repository commit after
+# the reviewed code bundle has been checked out on the host.
+RUNTIME_GPU_PARENT_HYDRATION = {
+    "mode": "hf_snapshot_download",
+}
 # Vast's raw expression grammar does not support a portable OR form for two
 # exact SKU strings.  Query only stable numeric facts, then enforce the narrow
 # WS/S allowlist on raw rows in ``_offer_gpu``.
@@ -1672,6 +1679,76 @@ def _runtime_parent_checkpoint(request: Mapping[str, object]) -> Path:
     return path
 
 
+def _runtime_gpu_parent_hydration() -> dict[str, str]:
+    """Return the only controller-authenticated remote parent hydration mode."""
+    expected = {
+        "mode": "hf_snapshot_download",
+        "repository": PARENT_CHECKPOINT["repository"],
+        "revision": PARENT_CHECKPOINT["revision"],
+        "subpath": PARENT_CHECKPOINT["subpath"],
+        "artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
+    }
+    hydration = RUNTIME_GPU_PARENT_HYDRATION
+    repository, revision = expected["repository"], expected["revision"]
+    subpath, artifact = expected["subpath"], expected["artifact_sha256"]
+    path = Path(subpath) if type(subpath) is str else None
+    if (
+        hydration != {"mode": "hf_snapshot_download"}
+        or not isinstance(repository, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repository) is None
+        or not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None
+        or path is None or path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts)
+        or not isinstance(artifact, str) or re.fullmatch(r"[0-9a-f]{64}", artifact) is None
+    ):
+        raise ValueError("runtime GPU parent hydration is not the approved immutable HF mode")
+    return dict(expected)
+
+
+def _runtime_gpu_parent_hydration_command(
+    *, remote_dir: str, hydration: Mapping[str, str],
+) -> str:
+    """Build the literal fail-closed remote parent download without token bytes."""
+    repository = hydration["repository"]
+    revision = hydration["revision"]
+    subpath = hydration["subpath"]
+    artifact = hydration["artifact_sha256"]
+    parent_tmp = remote_dir + "/parent-hf"
+    repo_root = parent_tmp + "/repo"
+    provider_cache = parent_tmp + "/provider-cache"
+    source = repo_root + "/" + subpath
+    script = (
+        "import os; from huggingface_hub import HfApi, snapshot_download; "
+        "repository=" + json.dumps(repository) + "; revision=" + json.dumps(revision)
+        + "; subpath=" + json.dumps(subpath) + "; root=" + json.dumps(repo_root)
+        + "; cache=" + json.dumps(provider_cache) + "; token=os.environ['HF_TOKEN']; "
+        "info=HfApi(token=token).model_info(repo_id=repository, revision=revision, token=token); "
+        "assert getattr(info, 'sha', None) == revision, 'resolved parent revision mismatch'; "
+        "snapshot_download(repo_id=repository, repo_type=\"model\", revision=revision, "
+        "allow_patterns=[subpath + '/**'], local_dir=root, cache_dir=cache, "
+        "token=token, local_dir_use_symlinks=False)"
+    )
+    return (
+        "test ! -e /cache/parent; test ! -e " + shlex.quote(parent_tmp) + "; "
+        "mkdir -p /cache/parent " + shlex.quote(parent_tmp) + "; "
+        "parent_tmp=" + shlex.quote(parent_tmp) + "; "
+        "trap 'unset HF_TOKEN; rm -rf \"$parent_tmp\"' EXIT; "
+        "test -s /prepared/config/runtime.token; "
+        "HF_TOKEN=\"$(cat /prepared/config/runtime.token)\"; export HF_TOKEN; "
+        "/opt/runtime/bin/python -c " + shlex.quote(script) + "; unset HF_TOKEN; "
+        "test -d " + shlex.quote(source) + "; test ! -L " + shlex.quote(source) + "; "
+        "if test -e \"$parent_tmp/repo/.cache\"; then test -d \"$parent_tmp/repo/.cache\"; test ! -L \"$parent_tmp/repo/.cache\"; rm -rf \"$parent_tmp/repo/.cache\"; fi; "
+        "test -z \"$(find \"$parent_tmp/repo\" -xdev \\( -type l -o \\( ! -type d -a ! -type f \\) \\) -print -quit)\"; "
+        "test -z \"$(find \"$parent_tmp/repo\" -mindepth 1 -maxdepth 1 ! -name policies -print -quit)\"; "
+        "mv \"$parent_tmp/repo/policies\" /cache/parent/policies; "
+        "test ! -L /cache/parent; "
+        "PYTHONPATH=/prepared/code/trainer/src /opt/runtime/bin/python -c "
+        + shlex.quote(
+            "from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; "
+            "assert policy_artifact_sha256('/cache/parent') == " + repr(artifact)
+        )
+        + "; rm -rf \"$parent_tmp\"; trap - EXIT; "
+    )
+
+
 def _runtime_campaign_binding(request: Mapping[str, object]) -> dict[str, object]:
     """Validate immutable mixture/code evidence before any paid provider call."""
     if (
@@ -1787,6 +1864,7 @@ def _runtime_gpu_rent_preflight(
         raise ValueError("direct runtime GPU rent derives capability on its single lease")
     identity = _runtime_campaign_binding(request)
     _runtime_parent_checkpoint(request)
+    _runtime_gpu_parent_hydration()
     _require_vast_ssh_identity()
     offer = request.get("offer")
     if not isinstance(offer, Mapping) or not _positive_int(offer.get("id")):
@@ -3535,13 +3613,19 @@ def _runtime_bootstrap_receipt(*, path: Path, instance: Mapping[str, object], re
         _runtime_gpu_bootstrap_capability_receipt(
             path=Path(capability_path), instance=instance, request=request, identity=identity,
         )
+        hydration = _runtime_gpu_parent_hydration()
         expected |= {
-            "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
+            "parent_hydration": hydration,
             "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
             "bootstrap_capability_receipt_sha256": sha256_file(Path(capability_path)),
         }
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise ValueError("runtime bootstrap stage is not bound to its direct runtime instance")
+    if (
+        instance.get("kind") == "runtime_mixture_gpu_warmup_instance"
+        and "parent_archive_sha256" in receipt
+    ):
+        raise ValueError("runtime bootstrap stage cannot claim an archive parent transfer")
     if (
         receipt.get("instance_id") != instance.get("instance_id")
         or receipt.get("provider_response_sha256") != instance.get("provider_response_sha256")
@@ -3566,8 +3650,6 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
     is_cpu_diagnostic = instance.get("kind") == "runtime_mixture_cpu_pilot_instance"
     if is_cpu_diagnostic:
         required["runtime_pilot_request"] = "runtime-pilot.json"
-    else:
-        required["parent_checkpoint"] = "parent.tar"
     if any(type(request.get(field)) is not str or not request[field] for field in required):
         raise ValueError("runtime bootstrap stage requires only reviewed immutable inputs")
     output = request.get("bootstrap_receipt")
@@ -3578,6 +3660,7 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
         raise ValueError("runtime bootstrap code bundle differs from the reviewed bundle")
     _read_private_token(str(request["token_file"]))
     parent = None if is_cpu_diagnostic else _runtime_parent_checkpoint(request)
+    parent_hydration = None if parent is None else _runtime_gpu_parent_hydration()
     bootstrap_capability = None
     bootstrap_capability_sha = None
     if parent is not None:
@@ -3611,21 +3694,15 @@ def runtime_mixture_bootstrap_stage(*, instance: Mapping[str, object], request: 
         if not observed or observed[0] != digest:
             raise ValueError("runtime bootstrap staged hash readback failed")
         transfers.append({"name": remote_name, "sha256": digest})
-    parent_setup = ""
-    if parent is not None:
-        parent_setup = (
-            "test ! -e /cache/parent; mkdir -p /cache/parent; "
-            "test \"$(sha256sum " + remote_dir + "/parent.tar | cut -d' ' -f1)\" = " + PARENT_CHECKPOINT["archive_sha256"] + "; "
-            "tar --no-same-owner --no-same-permissions -xf " + remote_dir + "/parent.tar -C /cache/parent; "
-            "PYTHONPATH=/prepared/code/trainer/src python -c \"from lehome_train.groot.checkpoint_identity import policy_artifact_sha256; assert policy_artifact_sha256('/cache/parent') == '" + PARENT_CHECKPOINT["artifact_sha256"] + "'\"; "
-            "test ! -L /cache/parent; "
-        )
+    parent_setup = "" if parent_hydration is None else _runtime_gpu_parent_hydration_command(
+        remote_dir=remote_dir, hydration=parent_hydration,
+    )
     runner((*_ssh_prefix(instance), "set -eu; mkdir -p /prepared/config /cache /output; cd " + remote_dir + "; sha256sum -c code.bundle.sha256; mv runtime-hydrate.json /prepared/config/runtime-hydrate.json; " + ("mv runtime-pilot.json /prepared/config/runtime-pilot.json; " if is_cpu_diagnostic else "") + "mv runtime.token /prepared/config/runtime.token; mv bc-readback.json /prepared/config/bc-readback.json; mv rollout-readback.json /prepared/config/rollout-readback.json; mv deployment-receipt.json /prepared/config/deployment-receipt.json; git clone --quiet --no-checkout " + remote_dir + "/code.bundle /prepared/code; git -C /prepared/code checkout --quiet --detach " + str(request["code_revision"]) + "; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -z \"$(git -C /prepared/code status --porcelain)\"; " + parent_setup + "chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code; test ! -e /prepared/runtime"))
     receipt = {"schema_version": 1, "kind": "runtime_mixture_bootstrap_stage", "instance_id": instance["instance_id"], "provider_response_sha256": instance["provider_response_sha256"], "platform_arch": "x86_64", "trainer_image": instance["trainer_image"], "image_digest": instance["image_digest"], "code_revision": request["code_revision"], "code_bundle_sha256": request["code_bundle_sha256"], "bc_revision": identity["bc"]["immutable_revision"], "rollout_revision": identity["rollout"]["immutable_revision"], "deployment_revision": identity["deployment"]["immutable_revision"], "bc_receipt_sha256": identity["bc_receipt_sha256"], "rollout_receipt_sha256": identity["rollout_receipt_sha256"], "deployment_receipt_sha256": identity["deployment_receipt_sha256"], "transfers": transfers}
     if parent is not None:
-        assert bootstrap_capability is not None and bootstrap_capability_sha is not None
+        assert bootstrap_capability is not None and bootstrap_capability_sha is not None and parent_hydration is not None
         receipt |= {
-            "parent_archive_sha256": PARENT_CHECKPOINT["archive_sha256"],
+            "parent_hydration": parent_hydration,
             "parent_checkpoint_artifact_sha256": PARENT_CHECKPOINT["artifact_sha256"],
             "bootstrap_capability_receipt_sha256": bootstrap_capability_sha,
         }
