@@ -1761,6 +1761,8 @@ def _runtime_gpu_recovery_request(
         or not isinstance(request.get("recovery_receipt"), str)
     ):
         raise ValueError("runtime GPU recovery request schema is invalid")
+    if request.get("expected_original_machine_id") != RUNTIME_GPU_LEGACY_RECOVERY_BLACKLISTED_MACHINE_ID:
+        raise ValueError("runtime GPU recovery request must bind the approved legacy machine")
     blocked = Path(str(request["blocked_rent_request"]))
     receipt = Path(str(request["recovery_receipt"]))
     if (

@@ -1681,6 +1681,38 @@ def _blocked_gpu_rent_recovery_fixture(
     return recovery, claim_path, original_path, original
 
 
+@pytest.mark.parametrize("preexisting_observing", (False, True))
+def test_ambiguous_rent_recovery_rejects_wrong_legacy_machine_before_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preexisting_observing: bool,
+) -> None:
+    recovery, claim_path, _original_path, _original = _blocked_gpu_rent_recovery_fixture(tmp_path, monkeypatch)
+    recovery = dict(recovery) | {"expected_original_machine_id": 140800}
+    receipt_path = Path(str(recovery["recovery_receipt"]))
+    if preexisting_observing:
+        LIFECYCLE._write_exclusive_json(receipt_path, {
+            "schema_version": 1,
+            "kind": "runtime_mixture_gpu_rent_recovery_receipt",
+            "status": "observing",
+            "released": False,
+            "canonical_claim_sha256": hashlib.sha256(claim_path.read_bytes()).hexdigest(),
+        })
+    claim_before = claim_path.read_bytes()
+    receipt_before = receipt_path.read_bytes() if receipt_path.exists() else None
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        raise AssertionError("recovery must reject before provider access")
+
+    with pytest.raises(ValueError, match="approved legacy machine"):
+        LIFECYCLE.recover_runtime_gpu_rent(
+            request=recovery, runner=runner, now_unix=2_000_000_000, sleep=lambda _: None,
+        )
+
+    assert calls == [] and claim_path.read_bytes() == claim_before
+    assert (receipt_path.read_bytes() if receipt_path.exists() else None) == receipt_before
+
+
 def test_ambiguous_rent_recovery_observes_empty_account_twelve_times_then_archives(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
