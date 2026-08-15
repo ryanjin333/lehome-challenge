@@ -1750,6 +1750,29 @@ def test_final_datacenter_direct_gpu_selection_rejects_invalid_or_duplicate_rows
         LIFECYCLE._final_runtime_gpu_datacenter_offer(runner=lambda _command: json.dumps(rows))
 
 
+def test_final_datacenter_direct_gpu_selection_excludes_recovered_machine() -> None:
+    blacklisted = _final_direct_gpu_offer() | {"id": 101, "machine_id": 140799, "dph_total": 1.0}
+    replacement = _final_direct_gpu_offer() | {"id": 102, "machine_id": 140800, "dph_total": 1.1}
+
+    selected = LIFECYCLE._final_runtime_gpu_datacenter_offer(
+        runner=lambda _command: json.dumps([blacklisted, replacement]),
+        excluded_machine_id=140799,
+    )
+
+    assert selected == replacement
+    with pytest.raises(ValueError, match="final on-demand GPU offer"):
+        LIFECYCLE._final_runtime_gpu_datacenter_offer(
+            runner=lambda _command: json.dumps([blacklisted]),
+            excluded_machine_id=140799,
+        )
+
+
+def test_no_recovery_returns_no_direct_gpu_machine_exclusion(tmp_path: Path) -> None:
+    assert LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
+        request={}, identity={}, claim_path=tmp_path / "no-recovery.json",
+    ) is None
+
+
 def test_invalid_final_datacenter_rows_stop_before_claim_or_create(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1768,6 +1791,34 @@ def test_invalid_final_datacenter_rows_stop_before_claim_or_create(
         if command[:4] == ("vastai", "--raw", "search", "offers"):
             return json.dumps([duplicate, duplicate])
         raise AssertionError("invalid final rows must stop before provider create")
+
+    with pytest.raises(ValueError, match="final on-demand GPU offer"):
+        LIFECYCLE.rent_runtime_gpu_warmup(evidence=evidence, runner=runner)
+
+    assert not Path(str(evidence["rent_claim_receipt"])).exists()
+    assert not any(command[:4] == ("vastai", "--raw", "create", "instance") for command in commands)
+
+
+def test_recovery_exclusion_with_no_remaining_offer_stops_before_claim_or_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json")) | {
+        "bootstrap_capability_receipt": str(tmp_path / "bootstrap.json"),
+        "datacenter_policy": LIFECYCLE.RUNTIME_GPU_DATACENTER_POLICY,
+    }
+    evidence["rent_claim_receipt"] = _canonical_runtime_gpu_claim_path(evidence)
+    identity = LIFECYCLE._runtime_campaign_binding(evidence)
+    monkeypatch.setattr(
+        LIFECYCLE, "_runtime_gpu_rent_preflight",
+        lambda _request: dict(identity) | {"recovery_excluded_machine_id": 140799},
+    )
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(command)
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return json.dumps([_final_direct_gpu_offer() | {"machine_id": 140799}])
+        raise AssertionError("excluded-only final offer must stop before claim or create")
 
     with pytest.raises(ValueError, match="final on-demand GPU offer"):
         LIFECYCLE.rent_runtime_gpu_warmup(evidence=evidence, runner=runner)
@@ -1949,9 +2000,9 @@ def test_on_demand_ambiguous_claim_recovers_and_allows_a_different_machine(
     }
     identity = LIFECYCLE._runtime_campaign_binding(fresh)
     consumer_claim_path = LIFECYCLE._runtime_gpu_rent_claim_path(request=fresh, identity=identity, allow_held=True)
-    LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
+    assert LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
         request=fresh, identity=identity, claim_path=consumer_claim_path,
-    )
+    ) == 59343
     with pytest.raises(ValueError, match="different offer and machine"):
         LIFECYCLE._validate_runtime_gpu_recovery_for_new_rent(
             request=fresh | {"offer": dict(fresh["offer"]) | {"machine_id": 59343}},  # type: ignore[arg-type]
@@ -2985,6 +3036,11 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
             runner=lambda command: rejected_calls.append(command) or "",
         )
     assert rejected_calls == []
+    recovery_identity = LIFECYCLE._runtime_campaign_binding(evidence)
+    monkeypatch.setattr(
+        LIFECYCLE, "_runtime_gpu_rent_preflight",
+        lambda _request: dict(recovery_identity) | {"recovery_excluded_machine_id": 140799},
+    )
     commands: list[tuple[str, ...]] = []
     final_offer = dict(evidence["offer"]) | {  # type: ignore[arg-type]
         "id": 42, "machine_id": 11, "dph_total": 2.5,
@@ -3010,6 +3066,7 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
         ):
             return json.dumps([
                 final_offer | {"id": 41, "machine_id": 12, "dph_total": .75, "datacenter": False},
+                final_offer | {"id": 40, "machine_id": 140799, "dph_total": 1.0},
                 final_offer,
             ])
         if command[:4] in {

@@ -926,8 +926,12 @@ def rent_runtime_cpu_pilot(
         raise
 
 
-def _final_runtime_gpu_datacenter_offer(*, runner: Runner) -> dict[str, object]:
+def _final_runtime_gpu_datacenter_offer(
+    *, runner: Runner, excluded_machine_id: int | None = None,
+) -> dict[str, object]:
     """Select the one immediate direct-lease attempt from Vast's global offer view."""
+    if excluded_machine_id is not None and not _positive_int(excluded_machine_id):
+        raise ValueError("final on-demand GPU exclusion machine is invalid")
     rows = _json(runner, (
         "vastai", "--raw", "search", "offers", RUNTIME_GPU_DATACENTER_OFFER_QUERY,
         "--on-demand", "--storage", "300", "--order", "dph",
@@ -937,6 +941,7 @@ def _final_runtime_gpu_datacenter_offer(*, runner: Runner) -> dict[str, object]:
     eligible = [
         row for row in rows if isinstance(row, Mapping)
         and _positive_int(row.get("id")) and _positive_int(row.get("machine_id"))
+        and row.get("machine_id") != excluded_machine_id
         and type(row.get("gpu_ram")) in (int, float) and _offer_gpu(row)
         and row.get("num_gpus") == 1 and row.get("is_bid") is False
         and row.get("rentable") is True and row.get("rented") is False
@@ -1837,9 +1842,10 @@ def _runtime_gpu_rent_preflight(
         request=request, identity=identity, allow_held=recovery_safe,
     )
     if not recovery_safe:
-        _validate_runtime_gpu_recovery_for_new_rent(
+        excluded_machine_id = _validate_runtime_gpu_recovery_for_new_rent(
             request=request, identity=identity, claim_path=claim_path,
         )
+        identity = dict(identity) | {"recovery_excluded_machine_id": excluded_machine_id}
     return identity
 
 
@@ -2523,12 +2529,12 @@ def recover_runtime_gpu_rent(
 
 def _validate_runtime_gpu_recovery_for_new_rent(
     *, request: Mapping[str, object], identity: Mapping[str, object], claim_path: Path,
-) -> None:
-    """A recovered claim may be retried exactly once on another offer and machine."""
+) -> int | None:
+    """Authenticate a recovery and return the one machine it excludes, if any."""
     recovery_path = _runtime_gpu_recovery_receipt_path(claim_path)
     namespace = list(claim_path.parent.glob(claim_path.stem + ".blocked-*.json"))
     if not namespace and not recovery_path.exists():
-        return
+        return None
     if request.get("recovery_receipt") != str(recovery_path):
         raise ValueError("runtime GPU rent requires the canonical recovery receipt")
     receipt = _load_regular_json(recovery_path, "runtime GPU recovery receipt")
@@ -2622,11 +2628,13 @@ def _validate_runtime_gpu_recovery_for_new_rent(
     ):
         raise ValueError("runtime GPU recovery receipt proofs are invalid")
     offer = request.get("offer")
+    excluded_machine_id = receipt.get("reconciled_machine_id") if mode == "present" else receipt.get("blacklisted_machine_id")
     if (
         not isinstance(offer, Mapping) or offer.get("id") == receipt.get("original_offer_id")
-        or offer.get("machine_id") == (receipt.get("reconciled_machine_id") if mode == "present" else receipt.get("blacklisted_machine_id"))
+        or offer.get("machine_id") == excluded_machine_id
     ):
         raise ValueError("runtime GPU recovery retry requires a different offer and machine")
+    return int(excluded_machine_id)
 
 
 def _runtime_gpu_bootstrap_capability(
@@ -2968,7 +2976,12 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
     # Vast offer identifiers are ephemeral.  Bind the one global datacenter
     # selection to O_EXCL and send that exact row straight to create; never
     # re-query its ID after the selection.
-    attempted_offer = _final_runtime_gpu_datacenter_offer(runner=runner)
+    excluded_machine_id = identity.get("recovery_excluded_machine_id")
+    if excluded_machine_id is not None and not _positive_int(excluded_machine_id):
+        raise ValueError("runtime GPU recovery exclusion is invalid")
+    attempted_offer = _final_runtime_gpu_datacenter_offer(
+        runner=runner, excluded_machine_id=excluded_machine_id,
+    )
     claim_path = _runtime_gpu_rent_claim_path(request=evidence, identity=identity)
     claim = _runtime_gpu_rent_claim(
         path=claim_path, request=evidence, identity=identity,
