@@ -394,6 +394,63 @@ def capture_offers(*, runner: Runner, now_unix: int | None = None, ttl_seconds: 
     return {"schema_version": 1, "kind": "persistent_training_offer", "offer": safe_offer, "account_hourly_total_usd": total, "existing_instance_hourly_total_usd": existing_instance_total, "existing_storage_hourly_total_usd": existing_storage_total, "requested_storage_gb": 300, "requested_storage_hourly_usd": requested_storage_hourly, "storage_quote_included_in_dph_total": True, "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds, "search_mode": "interruptible"}
 
 
+def _uncapped_provider_row_total(rows: list[object], *, field: str, label: str) -> float:
+    """Sum provider quotes only after validating their numeric shape, never a cap."""
+    total = 0.0
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ValueError(label + " provider listing is invalid")
+        value = row.get(field, 0)
+        if type(value) not in (int, float) or not math.isfinite(float(value)) or float(value) < 0:
+            raise ValueError(label + " provider quote is invalid")
+        total += float(value)
+    return total
+
+
+def capture_runtime_gpu_warmup_offer(
+    *, runner: Runner, now_unix: int | None = None, ttl_seconds: int = 300,
+) -> dict[str, object]:
+    """Capture the uncapped, non-auction 300GB PRO6000 direct-lease quote."""
+    offers = _json(runner, (
+        "vastai", "--raw", "search", "offers", OFFER_QUERY,
+        "--on-demand", "--storage", "300", "--order", "dph",
+    ))
+    instances = _json(runner, ("vastai", "--raw", "show", "instances"))
+    volumes = _json(runner, ("vastai", "--raw", "show", "volumes"))
+    if not all(isinstance(value, list) for value in (offers, instances, volumes)):
+        raise ValueError("runtime GPU provider listing is invalid")
+    eligible = [
+        row for row in offers if isinstance(row, Mapping)
+        and _positive_int(row.get("id")) and _positive_int(row.get("machine_id"))
+        and _offer_gpu(row) and row.get("num_gpus") == 1 and row.get("is_bid") is False
+        and type(row.get("dph_total")) in (int, float)
+        and math.isfinite(float(row["dph_total"])) and float(row["dph_total"]) > 0
+    ]
+    if not eligible:
+        raise ValueError("no on-demand non-auction RTX PRO 6000 96GB offer is available")
+    offer = min(eligible, key=lambda row: (float(row["dph_total"]), int(row["id"])))
+    existing_instance_total = _uncapped_provider_row_total(
+        instances, field="dph_total", label="runtime GPU instances",
+    )
+    existing_storage_total = _uncapped_provider_row_total(
+        volumes, field="storage_total_cost", label="runtime GPU volumes",
+    )
+    captured = int(time.time()) if now_unix is None else now_unix
+    safe_offer = _project(
+        offer, ("id", "machine_id", "gpu_name", "gpu_ram", "num_gpus", "dph_total", "driver_version", "is_bid"),
+    )
+    return {
+        "schema_version": 1, "kind": "runtime_mixture_gpu_warmup_offer",
+        "offer": safe_offer, "raw_offer_sha256": _hash(offer),
+        "account_hourly_total_usd": existing_instance_total + existing_storage_total + float(offer["dph_total"]),
+        "existing_instance_hourly_total_usd": existing_instance_total,
+        "existing_storage_hourly_total_usd": existing_storage_total,
+        "requested_storage_gb": 300, "storage_quote_included_in_dph_total": True,
+        "captured_at_unix": captured, "expires_at_unix": captured + ttl_seconds,
+        "search_mode": "on_demand",
+    }
+
+
 def capture_runtime_pilot_offer(*, runner: Runner, now_unix: int | None = None) -> dict[str, object]:
     """Capture the bounded on-demand native-x86 CPU-pilot lease evidence."""
     offers = _json(runner, ("vastai", "--raw", "search", "offers", RUNTIME_PILOT_OFFER_QUERY, "--on-demand", "--storage", "120", "--order", "dph", "--raw"))
@@ -672,7 +729,31 @@ def rent_runtime_cpu_pilot(
         raise
 
 
-def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep, require_capability: bool = True, abort_request: Mapping[str, object] | None = None) -> dict[str, object]:
+def _fresh_on_demand_runtime_gpu_offer(
+    *, runner: Runner, offer: Mapping[str, object],
+) -> None:
+    """Re-read exactly the captured offer before an uncapped direct create."""
+    value = _json(runner, (
+        "vastai", "--raw", "search", "offers", "id = " + str(offer["id"]),
+        "--on-demand", "--storage", "300",
+    ))
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], Mapping):
+        raise ValueError("on-demand GPU offer readback is invalid")
+    live = value[0]
+    if (
+        live.get("id") != offer.get("id")
+        or live.get("machine_id") != offer.get("machine_id")
+        or live.get("gpu_name") != offer.get("gpu_name")
+        or live.get("gpu_ram") != offer.get("gpu_ram")
+        or live.get("num_gpus") != offer.get("num_gpus")
+        or live.get("dph_total") != offer.get("dph_total")
+        or live.get("is_bid") is not False
+        or not _offer_gpu(live) or live.get("num_gpus") != 1
+    ):
+        raise ValueError("on-demand GPU offer readback does not match captured evidence")
+
+
+def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls: int = 12, sleep: Callable[[float], None] = _bounded_sleep, require_capability: bool = True, abort_request: Mapping[str, object] | None = None, direct_gpu_on_demand: bool = False) -> dict[str, object]:
     def outcome(error: BaseException, *, no_lease_exists: bool) -> None:
         if abort_request is not None:
             raise RuntimeGpuRentOutcome(error, no_lease_exists=no_lease_exists) from error
@@ -685,7 +766,9 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
             not isinstance(offer, Mapping) or not _positive_int(offer.get("id"))
             or (abort_request is not None and not _positive_int(offer.get("machine_id")))
         ): raise ValueError("offer evidence is invalid")
-        if evidence.get("search_mode") != "interruptible" or type(evidence.get("expires_at_unix")) is not int or evidence["expires_at_unix"] < int(time.time()): raise ValueError("offer evidence is expired or not interruptible")
+        required_mode = "on_demand" if direct_gpu_on_demand else "interruptible"
+        if evidence.get("search_mode") != required_mode or type(evidence.get("expires_at_unix")) is not int or evidence["expires_at_unix"] < int(time.time()):
+            raise ValueError("offer evidence is expired or not " + required_mode)
         image = _trainer_image(evidence.get("trainer_image"))
         capability = evidence.get("training_capability")
         image_digest = image.rpartition("@")[2]
@@ -695,21 +778,46 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
             validate_training_capability(capability)
         elif image != BOOTSTRAP_TRAINER_IMAGE:
             raise ValueError("bootstrap canary requires the historical structurally pinned trainer image")
-        _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")
+        if not direct_gpu_on_demand:
+            _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")
         quoted_offer_hourly = offer.get("dph_total")
-        if type(quoted_offer_hourly) not in (int, float) or float(quoted_offer_hourly) < 0:
+        if (
+            type(quoted_offer_hourly) not in (int, float)
+            or not math.isfinite(float(quoted_offer_hourly))
+            or float(quoted_offer_hourly) < 0
+            or (direct_gpu_on_demand and float(quoted_offer_hourly) <= 0)
+        ):
             raise ValueError("offer evidence lacks the all-in 300GB hourly quote")
-        _require_account_cap(
-            _live_account_total(runner=runner) + float(quoted_offer_hourly),
-            label="fresh rental projection",
-        )
-        bid = offer.get("min_bid", offer.get("dph_total"))
-        if type(bid) not in (int, float) or float(bid) >= 1: raise ValueError("offer bid price is invalid")
+        if direct_gpu_on_demand:
+            if offer.get("is_bid") is not False:
+                raise ValueError("on-demand GPU offer evidence is auctioned")
+            instances = _json(runner, ("vastai", "--raw", "show", "instances"))
+            volumes = _json(runner, ("vastai", "--raw", "show", "volumes"))
+            if not isinstance(instances, list) or not isinstance(volumes, list):
+                raise ValueError("on-demand GPU account readback is invalid")
+            _uncapped_provider_row_total(instances, field="dph_total", label="on-demand GPU instances")
+            _uncapped_provider_row_total(volumes, field="storage_total_cost", label="on-demand GPU volumes")
+            _fresh_on_demand_runtime_gpu_offer(runner=runner, offer=offer)
+        else:
+            _require_account_cap(
+                _live_account_total(runner=runner) + float(quoted_offer_hourly),
+                label="fresh rental projection",
+            )
+            bid = offer.get("min_bid", offer.get("dph_total"))
+            if type(bid) not in (int, float) or float(bid) >= 1: raise ValueError("offer bid price is invalid")
     except BaseException as error:
         outcome(error, no_lease_exists=True)
         raise AssertionError("unreachable")
     try:
-        created = _json(runner, ("vastai", "--raw", "create", "instance", str(offer["id"]), "--image", image, "--disk", "300", "--bid_price", str(bid), "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + image))
+        create = (
+            "vastai", "--raw", "create", "instance", str(offer["id"]), "--image", image,
+            "--disk", "300",
+        )
+        if not direct_gpu_on_demand:
+            create += ("--bid_price", str(bid))
+        created = _json(runner, create + (
+            "--ssh", "--direct", "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + image,
+        ))
     except BaseException as error:
         outcome(error, no_lease_exists=False)
         raise AssertionError("unreachable")
@@ -726,9 +834,19 @@ def rent(*, evidence: Mapping[str, object], runner: Runner, max_readiness_polls:
             sleep(5.0)
         else:
             raise ValueError("instance readiness poll timed out")
-        if not isinstance(live, Mapping) or live.get("id") != instance_id or (abort_request is not None and live.get("machine_id") != offer.get("machine_id")) or not _offer_gpu(live) or live.get("num_gpus") != 1 or not live.get("ssh_host") or type(live.get("ssh_port")) is not int or float(live.get("dph_total", 99)) >= 1:
+        live_matches_direct_offer = (
+            isinstance(live, Mapping) and direct_gpu_on_demand and live.get("machine_id") == offer.get("machine_id")
+            and live.get("gpu_name") == offer.get("gpu_name")
+            and live.get("gpu_ram") == offer.get("gpu_ram")
+            and live.get("dph_total") == quoted_offer_hourly
+        )
+        if not isinstance(live, Mapping) or live.get("id") != instance_id or (abort_request is not None and live.get("machine_id") != offer.get("machine_id")) or not _offer_gpu(live) or live.get("num_gpus") != 1 or not live.get("ssh_host") or type(live.get("ssh_port")) is not int or (direct_gpu_on_demand and not live_matches_direct_offer) or (not direct_gpu_on_demand and float(live.get("dph_total", 99)) >= 1):
             raise ValueError("instance readback does not match accepted offer")
-        return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "machine_id": live.get("machine_id"), "host": live.get("ssh_host"), "port": live.get("ssh_port"), "trainer_image": image, "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _stable_instance_identity(live), "account_hourly_total_usd": _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")}
+        account_total = (
+            float(evidence["account_hourly_total_usd"])
+            if direct_gpu_on_demand else _require_account_cap(evidence.get("account_hourly_total_usd"), label="offer evidence")
+        )
+        return {"schema_version": 1, "kind": "persistent_training_instance", "instance_id": instance_id, "machine_id": live.get("machine_id"), "host": live.get("ssh_host"), "port": live.get("ssh_port"), "trainer_image": image, "offer_evidence_sha256": _hash(evidence), "provider_response_sha256": _stable_instance_identity(live), "account_hourly_total_usd": account_total}
     except BaseException as error:
         if abort_request is not None:
             _runtime_abort_cleanup(
@@ -1450,21 +1568,34 @@ def _runtime_gpu_rent_preflight(
     if not isinstance(offer, Mapping) or not _positive_int(offer.get("id")):
         raise ValueError("runtime GPU rent requires a fresh concrete offer before claiming a lease")
     if (
-        request.get("search_mode") != "interruptible"
-        or type(request.get("expires_at_unix")) is not int
+        type(request.get("expires_at_unix")) is not int
         or (not recovery_safe and request["expires_at_unix"] < int(time.time()))
         or _trainer_image(request.get("trainer_image")) != BOOTSTRAP_TRAINER_IMAGE
     ):
-        raise ValueError("runtime GPU rent offer is not a fresh pinned interruptible lease")
-    _require_account_cap(request.get("account_hourly_total_usd"), label="runtime GPU offer evidence")
+        raise ValueError("runtime GPU rent offer is not a fresh pinned lease")
+    if recovery_safe:
+        if request.get("search_mode") not in {"interruptible", "on_demand"}:
+            raise ValueError("runtime GPU recovery original offer mode is invalid")
+    elif request.get("search_mode") != "on_demand":
+        raise ValueError("runtime GPU rent offer is not a fresh pinned on-demand lease")
+    total = request.get("account_hourly_total_usd")
+    if type(total) not in (int, float) or not math.isfinite(float(total)) or float(total) < 0:
+        raise ValueError("runtime GPU offer evidence account-wide hourly total is invalid")
     quote = offer.get("dph_total")
-    bid = offer.get("min_bid", quote)
-    if (
-        type(quote) not in (int, float) or not math.isfinite(float(quote)) or float(quote) < 0
-        or type(bid) not in (int, float) or not math.isfinite(float(bid)) or float(bid) >= 1
-        or not recovery_safe and not _positive_int(offer.get("machine_id"))
+    if recovery_safe:
+        bid = offer.get("min_bid", quote)
+        if (
+            type(quote) not in (int, float) or not math.isfinite(float(quote)) or float(quote) < 0
+            or type(bid) not in (int, float) or not math.isfinite(float(bid)) or float(bid) >= 1
+        ):
+            raise ValueError("runtime GPU recovery original offer price is invalid")
+    elif (
+        type(quote) not in (int, float) or not math.isfinite(float(quote)) or float(quote) <= 0
+        or offer.get("is_bid") is not False or not _positive_int(offer.get("machine_id"))
+        or not _offer_gpu(offer) or offer.get("num_gpus") != 1
+        or request.get("requested_storage_gb") != 300
     ):
-        raise ValueError("runtime GPU rent offer price is invalid")
+        raise ValueError("runtime GPU rent offer is not a valid on-demand 300GB PRO6000 lease")
     bundle = request.get("code_bundle")
     receipt = request.get("code_bundle_sha256_file")
     if type(bundle) is not str or type(receipt) is not str:
@@ -2431,6 +2562,7 @@ def rent_runtime_gpu_warmup(*, evidence: Mapping[str, object], runner: Runner) -
             evidence=evidence, runner=runner, require_capability=False,
             abort_request=evidence,
             max_readiness_polls=RUNTIME_GPU_WARMUP_READINESS_POLLS,
+            direct_gpu_on_demand=True,
         )
         _await_platform_arch_attestation(instance=rented, runner=runner)
         outer = _runtime_gpu_bootstrap_capability(
@@ -4041,7 +4173,7 @@ def main_for_test(
     argv: list[str], *, runner: Runner = _run,
     transport_factory: Callable[..., HubTransport] = HuggingFaceHubTransport,
 ) -> dict[str, object]:
-    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "capture-runtime-pilot-offer", "bootstrap-canary", "promote", "replacement-resume", "rent", "runtime-pilot-rent", "runtime-gpu-warmup-rent", "runtime-gpu-rent-recover", "stage", "runtime-pilot-plan", "runtime-bootstrap-stage", "runtime-warmup-stage", "runtime-stage", "runtime-hydrate", "runtime-pilot-run", "runtime-gpu-warmup", "runtime-train", "runtime-checkpoint-publish", "runtime-checkpoint-complete", "runtime-checkpoint-interrupted", "runtime-checkpoint-replacement-resume", "runtime-checkpoint-dispose", "tune", "train", "status", "resume", "destroy", "runtime-pilot-destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
+    parser = argparse.ArgumentParser(); parser.add_argument("action", choices=("derive-corrective-receipt", "materialize", "prepare", "capture-offers", "capture-runtime-pilot-offer", "capture-runtime-gpu-warmup-offer", "bootstrap-canary", "promote", "replacement-resume", "rent", "runtime-pilot-rent", "runtime-gpu-warmup-rent", "runtime-gpu-rent-recover", "stage", "runtime-pilot-plan", "runtime-bootstrap-stage", "runtime-warmup-stage", "runtime-stage", "runtime-hydrate", "runtime-pilot-run", "runtime-gpu-warmup", "runtime-train", "runtime-checkpoint-publish", "runtime-checkpoint-complete", "runtime-checkpoint-interrupted", "runtime-checkpoint-replacement-resume", "runtime-checkpoint-dispose", "tune", "train", "status", "resume", "destroy", "runtime-pilot-destroy")); parser.add_argument("--request", required=True); parser.add_argument("--execute", action="store_true"); parser.add_argument("--token-file")
     args = parser.parse_args(argv); request = _load(args.request)
     if args.action == "materialize":
         return _materialize(request)
@@ -4078,6 +4210,7 @@ def main_for_test(
     if args.action == "capture-offers": return capture_offers(runner=runner)
     if args.action == "runtime-gpu-rent-recover": return recover_runtime_gpu_rent(request=request, runner=runner)
     if args.action == "capture-runtime-pilot-offer": return capture_runtime_pilot_offer(runner=runner)
+    if args.action == "capture-runtime-gpu-warmup-offer": return capture_runtime_gpu_warmup_offer(runner=runner)
     if args.action == "bootstrap-canary": return bootstrap_canary(evidence=request, runner=runner)
     if args.action == "promote": return {"paid_action": True, "action": "promote", "instance": promote_canary(capability_receipt=request, runner=runner)}
     if args.action == "replacement-resume":

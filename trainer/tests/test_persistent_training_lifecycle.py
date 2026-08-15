@@ -1625,6 +1625,43 @@ def test_capture_offers_authenticates_machine_id_in_direct_gpu_evidence() -> Non
     }
 
 
+def test_capture_runtime_gpu_warmup_offer_is_on_demand_and_uncapped() -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: tuple[str, ...]) -> str:
+        commands.append(command)
+        if command[:4] == ("vastai", "--raw", "search", "offers"):
+            return json.dumps([{
+                "id": 9, "machine_id": 140800, "gpu_name": "RTX PRO 6000 S",
+                "gpu_ram": 96000, "num_gpus": 1, "dph_total": 3.25,
+                "is_bid": False, "driver_version": "595.71.05",
+            }, {
+                "id": 47725426, "machine_id": 41998, "gpu_name": "RTX PRO 6000 WS",
+                "gpu_ram": 96000, "num_gpus": 1, "dph_total": 1.111111,
+                "is_bid": False, "driver_version": "595.71.05",
+            }])
+        if command[:4] == ("vastai", "--raw", "show", "instances"):
+            return '[{"id": 1, "dph_total": 4.0}]'
+        if command[:4] == ("vastai", "--raw", "show", "volumes"):
+            return '[{"id": 2, "storage_total_cost": 2.0}]'
+        raise AssertionError(command)
+
+    evidence = LIFECYCLE.capture_runtime_gpu_warmup_offer(runner=runner, now_unix=100)
+
+    assert evidence["kind"] == "runtime_mixture_gpu_warmup_offer"
+    assert evidence["search_mode"] == "on_demand"
+    assert evidence["requested_storage_gb"] == 300
+    assert evidence["offer"]["id"] == 47725426
+    assert evidence["offer"]["machine_id"] == 41998
+    assert evidence["offer"]["dph_total"] == 1.111111
+    assert evidence["account_hourly_total_usd"] == pytest.approx(7.111111)
+    assert commands[0] == (
+        "vastai", "--raw", "search", "offers", LIFECYCLE.OFFER_QUERY,
+        "--on-demand", "--storage", "300", "--order", "dph",
+    )
+    assert not any("--interruptible" in command or "--bid_price" in command for command in commands)
+
+
 def test_ambiguous_rent_recovery_requires_exact_small_request_schema(tmp_path: Path) -> None:
     """The controller recovery entrypoint rejects any caller-controlled extras."""
     request = {
@@ -1949,7 +1986,8 @@ def test_direct_gpu_retry_accepts_released_recovery_on_different_offer_and_machi
         sleep=lambda _: None,
     )
     fresh = dict(original) | {
-        "offer": dict(original["offer"]) | {"id": 9, "machine_id": 140800},  # type: ignore[arg-type]
+        "offer": dict(original["offer"]) | {"id": 9, "machine_id": 140800, "is_bid": False},  # type: ignore[arg-type]
+        "search_mode": "on_demand", "requested_storage_gb": 300,
         "recovery_receipt": str(recovery["recovery_receipt"]),
     }
     identity = LIFECYCLE._runtime_campaign_binding(fresh)
@@ -2079,7 +2117,8 @@ def test_absent_recovery_consumer_accepts_only_a_different_offer_and_machine(
         request=recovery, runner=runner, now_unix=lambda: next(clock), sleep=lambda _: None,
     )
     fresh = dict(original) | {
-        "offer": dict(original["offer"]) | {"id": 9, "machine_id": 140800},  # type: ignore[arg-type]
+        "offer": dict(original["offer"]) | {"id": 9, "machine_id": 140800, "is_bid": False},  # type: ignore[arg-type]
+        "search_mode": "on_demand", "requested_storage_gb": 300,
         "recovery_receipt": str(recovery["recovery_receipt"]),
     }
     identity = LIFECYCLE._runtime_campaign_binding(fresh)
@@ -2456,7 +2495,9 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
     evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json"))
     evidence |= {
         "kind": "runtime_mixture_gpu_warmup_offer",
-        "search_mode": "interruptible",
+        "search_mode": "on_demand",
+        "requested_storage_gb": 300,
+        "account_hourly_total_usd": 3.25,
         "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
         "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
         "code_revision": revision, "code_bundle": str(bundle),
@@ -2464,6 +2505,7 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
         "parent_checkpoint": str(parent),
         "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json"),
     }
+    evidence["offer"] = dict(evidence["offer"]) | {"dph_total": 3.25, "is_bid": False}  # type: ignore[arg-type]
     evidence["rent_claim_receipt"] = _canonical_runtime_gpu_claim_path(evidence)
     assert "training_capability" not in evidence
     rejected_calls: list[tuple[str, ...]] = []
@@ -2473,10 +2515,16 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
             runner=lambda command: rejected_calls.append(command) or "",
         )
     assert rejected_calls == []
+    with pytest.raises(ValueError, match="on-demand"):
+        LIFECYCLE.rent_runtime_gpu_warmup(
+            evidence=evidence | {"search_mode": "interruptible"},
+            runner=lambda command: rejected_calls.append(command) or "",
+        )
+    assert rejected_calls == []
     commands: list[tuple[str, ...]] = []
     live = {
         "id": 44, "machine_id": 10, "actual_status": "running", "gpu_name": "RTX PRO 6000 WS",
-        "gpu_ram": 96000, "num_gpus": 1, "dph_total": .18,
+        "gpu_ram": 96000, "num_gpus": 1, "dph_total": 3.25,
         "ssh_host": "pro6000", "ssh_port": 22, "driver_version": "595.71.05",
     }
     capability = {
@@ -2489,6 +2537,11 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
 
     def runner(command: tuple[str, ...]) -> str:
         commands.append(command)
+        if command == (
+            "vastai", "--raw", "search", "offers", "id = 8",
+            "--on-demand", "--storage", "300",
+        ):
+            return json.dumps([evidence["offer"]])
         if command[:4] in {
             ("vastai", "--raw", "show", "instances"),
             ("vastai", "--raw", "show", "volumes"),
@@ -2517,6 +2570,16 @@ def test_direct_gpu_rent_creates_once_then_probes_that_same_lease(
     assert len([row for row in commands if row[:4] == (
         "vastai", "--raw", "create", "instance"
     )]) == 1
+    assert (
+        "vastai", "--raw", "create", "instance", "8", "--image",
+        LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "--disk", "300", "--ssh", "--direct",
+        "--cancel-unavail", "--env", "-e LEHOME_TRAIN_IMAGE=" + LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+    ) in commands
+    assert (
+        "vastai", "--raw", "search", "offers", "id = 8",
+        "--on-demand", "--storage", "300",
+    ) in commands
+    assert not any("--interruptible" in command or "--bid_price" in command for command in commands)
     assert instance["instance_id"] == outer["instance_id"] == 44
     assert instance["capability_sha256"] == LIFECYCLE.sha256_file(outer_path)
     assert outer["training_capability"] == capability
