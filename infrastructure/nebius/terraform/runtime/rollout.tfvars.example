@@ -1,0 +1,9 @@
+# Example role selection for the rollout appliance. Copy to a real .tfvars
+# (gitignored) and fill exact ids.
+active_role      = "rollout"
+image_id         = "image-lehome-rollout-REPLACE"
+shared_disk_id   = "disk-REPLACE"
+subnet_id        = "vpcsubnet-REPLACE"
+parent_id        = "project-REPLACE"
+manifest_uri     = "hf://datasets/ryanjin333/lehome-groot-n17-data/rollouts/round-1/manifest.json"
+manifest_sha256  = "REPLACE_64_HEX_DIGEST"
