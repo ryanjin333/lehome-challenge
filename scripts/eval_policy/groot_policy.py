@@ -494,6 +494,18 @@ class SessionPolicyClient:
         self._session_ready = False
         self._send_reset(advance_generation=True)
 
+    @property
+    def episode_generation(self) -> int:
+        """The gateway generation acknowledged by the most recent reset."""
+
+        return self._episode_generation
+
+    @property
+    def action_horizon(self) -> int:
+        """Action chunks are kept locally at the protocol's fixed H=16."""
+
+        return _SESSION_ACTION_HORIZON
+
     def cancel(self, request_id: str) -> None:
         """Tell the gateway that an outstanding inference must not be routed."""
 

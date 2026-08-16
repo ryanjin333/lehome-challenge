@@ -298,6 +298,7 @@ def test_readiness_is_durably_marked_not_ready_on_shutdown(tmp_path) -> None:
     assert json.loads(path.read_text(encoding="utf-8")) == {
         "policy_sha256": "a" * 64,
         "ready": False,
+        "runtime_device": "cuda:0",
     }
 
 

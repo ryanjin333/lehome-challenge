@@ -245,8 +245,10 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
         raise
 
 
-def write_readiness(path: Path, *, ready: bool, policy_sha256: str) -> None:
-    _write_json(path, {"ready": ready, "policy_sha256": policy_sha256})
+def write_readiness(path: Path, *, ready: bool, policy_sha256: str, runtime_device: str = "cuda:0") -> None:
+    if runtime_device not in {"cuda:0", "cpu"}:
+        raise ValueError("gateway runtime device must be observed cpu or cuda:0")
+    _write_json(path, {"ready": ready, "policy_sha256": policy_sha256, "runtime_device": runtime_device})
 
 
 def append_receipt(path: Path, receipt: dict[str, object]) -> None:
@@ -319,7 +321,7 @@ def run(args: argparse.Namespace, *, socket: Any | None = None, model: Any | Non
     router.setsockopt(zmq.LINGER, 0)
     router.bind(f"tcp://{args.host}:{args.port}")
     try:
-        write_readiness(ready_file, ready=True, policy_sha256=args.policy_sha256)
+        write_readiness(ready_file, ready=True, policy_sha256=args.policy_sha256, runtime_device=args.device)
         poller = zmq.Poller()
         poller.register(router, zmq.POLLIN)
         while True:
@@ -337,7 +339,7 @@ def run(args: argparse.Namespace, *, socket: Any | None = None, model: Any | Non
             )
             _write_json(metrics_file, gateway.metrics())
     finally:
-        write_readiness(ready_file, ready=False, policy_sha256=args.policy_sha256)
+        write_readiness(ready_file, ready=False, policy_sha256=args.policy_sha256, runtime_device=args.device)
         _write_json(metrics_file, gateway.metrics())
         router.close(linger=0)
 

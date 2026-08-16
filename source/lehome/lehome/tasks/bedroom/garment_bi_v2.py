@@ -805,6 +805,30 @@ class GarmentEnv(DirectRLEnv):
             return "tensor"
         raise RuntimeError(f"flywheel cloth state does not support device {self.device!r}")
 
+    def flywheel_runtime_devices(self) -> dict[str, str]:
+        """Read the live Kit renderer slot and prove all camera outputs exist.
+
+        This intentionally does not consult launch arguments: the receipt must
+        describe the renderer that Kit actually selected after startup.
+        """
+
+        try:
+            import carb
+
+            settings = carb.settings.get_settings()
+            active_gpu = settings.get("/renderer/activeGpu")
+        except Exception as error:
+            raise RuntimeError("Kit active renderer GPU is unavailable") from error
+        if not isinstance(active_gpu, int) or isinstance(active_gpu, bool) or active_gpu < 0:
+            raise RuntimeError("Kit active renderer GPU is invalid")
+        cameras = (self.top_camera, self.left_camera, self.right_camera)
+        for camera in cameras:
+            output = getattr(getattr(camera, "data", None), "output", None)
+            if not isinstance(output, dict) or "rgb" not in output or output["rgb"] is None:
+                raise RuntimeError("live camera output ownership is unavailable")
+        device = f"cuda:{active_gpu}"
+        return {"renderer_device": device, "camera_device": device}
+
     def flywheel_capture_state(self) -> dict[str, object]:
         """Return the complete mutable simulator state needed for hard replay."""
         if self.object is None:

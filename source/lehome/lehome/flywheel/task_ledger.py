@@ -232,6 +232,28 @@ class TaskLedger:
             )
             return renewed
 
+    def record_interrupted(self, worker_id: str, attempt_id: str, lease_id: str, reason: str) -> str:
+        """Release an interrupted active lease as an explicit immutable retry."""
+
+        worker_id = _require_identifier(worker_id, field="worker_id")
+        attempt_id = _require_identifier(attempt_id, field="attempt_id")
+        lease_id = _require_identifier(lease_id, field="lease_id")
+        reason = _require_identifier(reason, field="reason")
+        with self._write():
+            now_ns = self._now()
+            self._expire_leases(now_ns)
+            state = self._state_for_attempt(attempt_id)
+            self._require_active_lease(state, worker_id, lease_id)
+            self._append_event(
+                "interrupted", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
+                payload={"reason": reason}, at_ns=now_ns,
+            )
+            self._append_event(
+                "retryable", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
+                payload={"reason": "worker_interrupted"}, at_ns=now_ns,
+            )
+            return "retryable"
+
     def record_terminal(self, worker_id: str, attempt_id: str, lease_id: str, raw_artifact_id: str) -> str:
         """Close worker execution before asynchronous validation begins."""
 

@@ -5,7 +5,7 @@ import gymnasium as gym
 import torch
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Mapping, Optional
 
 from isaaclab.envs import DirectRLEnv
 from isaaclab_tasks.utils import parse_env_cfg
@@ -84,6 +84,175 @@ def _validate_active_flywheel_garment(env: DirectRLEnv, identity) -> None:
         raise ValueError("active environment garment does not match immutable flywheel identity")
 
 
+class EvaluationSession:
+    """One reusable environment/policy pair for sequential assigned episodes.
+
+    Legacy :func:`eval` still owns its command-line parsing and garment-list
+    selection.  This session only owns resources after they have been created,
+    which also lets a persistent worker keep one Isaac application alive while
+    changing garments through the environment's native interface.
+    """
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        *,
+        env: DirectRLEnv,
+        policy: BasePolicy,
+        env_cfg: Any,
+        ee_solver: Optional[Any] = None,
+        is_bimanual: bool = False,
+        env_factory: Any = None,
+    ) -> None:
+        self.args = args
+        self.env = env
+        self.policy = policy
+        self.env_cfg = env_cfg
+        self.ee_solver = ee_solver
+        self.is_bimanual = is_bimanual
+        self._env_factory = env_factory or (lambda cfg: gym.make(args.task, cfg=cfg).unwrapped)
+
+    @property
+    def runtime_receipt(self) -> dict[str, object]:
+        """Report the actual CPU-cloth/GPU-render split without guessing it."""
+
+        simulation_device = str(getattr(self.env, "device", getattr(self.args, "device", ""))).lower()
+        if simulation_device != "cpu":
+            raise ValueError("persistent evaluation requires an environment running CPU cloth simulation")
+        observed_devices = getattr(self.env, "flywheel_runtime_devices", None)
+        observed_devices = observed_devices() if callable(observed_devices) else None
+        if not isinstance(observed_devices, Mapping):
+            observed_devices = {
+                "renderer_device": getattr(self.env, "renderer_device", None),
+                "camera_device": getattr(self.env, "camera_device", None),
+            }
+        renderer_device = str(observed_devices.get("renderer_device") or "")
+        camera_device = str(observed_devices.get("camera_device") or "")
+        if not renderer_device or not camera_device:
+            raise ValueError("persistent evaluation cannot determine renderer/camera device")
+        backend = getattr(self.env, "_flywheel_cloth_backend", None)
+        readback = getattr(self.env, "_flywheel_cpu_cloth_state", None)
+        canary = getattr(self.env, "flywheel_visible_garment_contact", None)
+        if not callable(backend) or not callable(readback) or not callable(canary):
+            raise ValueError("persistent evaluation cannot observe CPU cloth/contact canary")
+        if backend() != "usd":
+            raise ValueError("persistent evaluation requires observed USD CPU cloth backend")
+        positions, velocities = readback()
+        try:
+            position_count, velocity_count = len(positions), len(velocities)
+        except TypeError as error:
+            raise ValueError("persistent evaluation CPU cloth readback is unavailable") from error
+        if position_count <= 0 or velocity_count <= 0 or position_count != velocity_count:
+            raise ValueError("persistent evaluation CPU cloth readback is invalid")
+        contact = canary()
+        if not isinstance(contact, Mapping) or not isinstance(contact.get("observed"), bool):
+            raise ValueError("persistent evaluation visible-contact canary is unavailable")
+        return {
+            "simulation_device": simulation_device,
+            "cloth_device": simulation_device,
+            "cloth_backend": backend(),
+            "cloth_readback": {"positions": position_count, "velocities": velocity_count},
+            "visible_contact_canary": dict(contact),
+            "renderer_device": renderer_device,
+            "camera_device": camera_device,
+            "policy_device": str(getattr(self.policy, "runtime_device", "")),
+        }
+
+    def prepare_episode(
+        self,
+        *,
+        garment_name: str,
+        garment_stage: str = "Release",
+        seed: int,
+        episode_generation: int,
+        reset_policy: bool = True,
+    ) -> None:
+        """Switch/reset episode-local state without relaunching Isaac when possible."""
+
+        if not isinstance(garment_name, str) or not garment_name:
+            raise ValueError("garment_name must be a non-empty string")
+        if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+            raise ValueError("seed must be a non-negative integer")
+        if not isinstance(episode_generation, int) or episode_generation < 1:
+            raise ValueError("episode_generation must be positive")
+        current_name = getattr(self.env_cfg, "garment_name", None)
+        current_stage = getattr(self.env_cfg, "garment_version", None)
+        if current_name != garment_name or current_stage != garment_stage:
+            switch = getattr(self.env, "switch_garment", None)
+            if callable(switch):
+                switch(garment_name, garment_stage)
+            else:
+                self.env.close()
+                self.env_cfg.garment_name = garment_name
+                self.env_cfg.garment_version = garment_stage
+                self.env = self._env_factory(self.env_cfg)
+                initialize_obs = getattr(self.env, "initialize_obs", None)
+                if callable(initialize_obs):
+                    initialize_obs()
+        self.env_cfg.garment_name = garment_name
+        self.env_cfg.garment_version = garment_stage
+        for target in (self.env_cfg, getattr(self.env, "cfg", None)):
+            if target is not None:
+                setattr(target, "seed", seed)
+                setattr(target, "random_seed", seed)
+        set_seed = getattr(self.env, "set_seed", None)
+        if callable(set_seed):
+            set_seed(seed)
+        reset = getattr(self.policy, "reset", None)
+        # Legacy registry adapters are permitted to be stateless.  The
+        # persistent worker separately requires ``reset()`` before admitting
+        # a session-aware policy to a lease.
+        if reset_policy and callable(reset):
+            reset()
+
+    def run_episode(
+        self,
+        *,
+        assignment: Dict[str, Any],
+        policy: BasePolicy,
+        attempt_output_dir: Path | None = None,
+        reset_policy: bool = False,
+        cancellation_event: Any = None,
+    ) -> Dict[str, Any]:
+        """Run one already-prepared assignment using the existing evaluation loop."""
+
+        garment_name = assignment.get("garment", assignment.get("garment_name"))
+        if not isinstance(garment_name, str) or not garment_name:
+            raise ValueError("assignment requires garment")
+        # The persistent launcher uses a transparent proxy while it lazily
+        # binds its policy client to the one freshly-created Isaac session.
+        # Actual inference always remains on ``self.policy``.
+        del policy
+        if attempt_output_dir is None:
+            # The ordinary eval CLI deliberately keeps the exact caller-owned
+            # writer roots.  Persistent collection opts in below.
+            episode_args = self.args
+        else:
+            episode_args = argparse.Namespace(**vars(self.args))
+            # Keep diagnostics/dataset roots attempt-scoped.  This is the same
+            # evaluation writer path the CLI uses, not a second writer.
+            episode_args.video_dir = str(attempt_output_dir / "videos")
+            episode_args.eval_dataset_path = str(attempt_output_dir / "dataset")
+            episode_args.persistent_output_dir = str(attempt_output_dir)
+        metrics = run_evaluation_loop(
+            env=self.env, policy=self.policy, args=episode_args, ee_solver=self.ee_solver,
+            is_bimanual=self.is_bimanual, garment_name=garment_name, reset_policy=reset_policy,
+            cancellation_event=cancellation_event,
+        )
+        return {
+            "metrics": metrics,
+            "success": bool(metrics and metrics[-1].get("success", False)),
+        }
+
+    def close(self) -> None:
+        try:
+            close_policy = getattr(self.policy, "close", None)
+            if callable(close_policy):
+                close_policy()
+        finally:
+            self.env.close()
+
+
 def run_evaluation_loop(
     env: DirectRLEnv,
     policy: BasePolicy,
@@ -91,6 +260,8 @@ def run_evaluation_loop(
     ee_solver: Optional[Any] = None,
     is_bimanual: bool = False,
     garment_name: Optional[str] = None,
+    reset_policy: bool = True,
+    cancellation_event: Any = None,
 ) -> List[Dict[str, Any]]:
     """
     Core evaluation loop.
@@ -168,7 +339,8 @@ def run_evaluation_loop(
     for i in range(args.num_episodes):
         # 1. Reset Environment & Policy
         env.reset()
-        policy.reset()
+        if reset_policy:
+            policy.reset()
         stabilize_garment_after_reset(env, args)
 
         recorder = None
@@ -218,6 +390,8 @@ def run_evaluation_loop(
         visible_contact = None
 
         for st in range(args.max_steps):
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise InterruptedError("persistent worker cancellation requested")
             if rate_limiter:
                 rate_limiter.sleep(env)
 
@@ -545,6 +719,10 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     env.initialize_obs()
     if flywheel_identity is not None:
         _validate_active_flywheel_garment(env, flywheel_identity)
+    session = EvaluationSession(
+        args, env=env, policy=policy, env_cfg=env_cfg, ee_solver=ee_solver,
+        is_bimanual=is_bimanual,
+    )
 
     try:
         for garment_idx, (garment_name, garment_stage) in enumerate(eval_list):
@@ -552,36 +730,26 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
                 f"Evaluating: {garment_name} ({garment_stage}) ({garment_idx+1}/{len(eval_list)})"
             )
 
-            # Switch Garment Logic
-            if garment_idx > 0:
-                if hasattr(env, "switch_garment"):
-                    env.switch_garment(garment_name, garment_stage)
-                    env.reset()
-                    policy.reset()
-                else:
-                    env.close()
-                    env_cfg.garment_name = garment_name
-                    env_cfg.garment_version = garment_stage
-                    env = gym.make(args.task, cfg=env_cfg).unwrapped
-                    env.initialize_obs()
-                    policy.reset()
+            session.prepare_episode(
+                garment_name=garment_name, garment_stage=garment_stage,
+                seed=args.seed, episode_generation=garment_idx + 1, reset_policy=False,
+            )
+            if flywheel_identity is not None:
+                _validate_active_flywheel_garment(session.env, flywheel_identity)
 
             # Run Loop
-            metrics = run_evaluation_loop(
-                env=env,
+            metrics = session.run_episode(
+                assignment={"garment": garment_name},
                 policy=policy,
-                args=args,
-                ee_solver=ee_solver,
-                is_bimanual=is_bimanual,
-                garment_name=garment_name,
-            )
+                reset_policy=True,
+            )["metrics"]
 
             all_garment_metrics.append(
                 {"garment_name": garment_name, "metrics": metrics}
             )
 
     finally:
-        env.close()
+        session.close()
 
     # Print summary across all garments
     logger.info("=" * 60)
