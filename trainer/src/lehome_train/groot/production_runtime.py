@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import gc
 import importlib
 import json
 import math
 import os
+import platform
 from pathlib import Path
 import re
 import shutil
+import signal
 from dataclasses import replace
 import sys
+import socket
+import statistics
 import tempfile
 from time import monotonic
 from time import sleep
@@ -32,7 +36,8 @@ from lehome_train.groot.config import FineTuneLaunchConfig
 from lehome_train.groot.launch import build_launch
 from lehome_train.groot.launch import launch_continuous_finetune, launch_finetune_to_step
 from lehome_train.groot.throughput_tuning import TrainingProbe, tune_on_host
-from lehome_train.groot.continuous_training import run_continuous_supervisor
+from lehome_train.groot.continuous_training import PreemptionController, run_continuous_supervisor
+from lehome_train.groot.local_recovery import LocalRecoveryCheckpoint, discover_local_recovery
 from lehome_train.groot.runtime_checkpoint_lifecycle import (
     RuntimeMixtureTrainingIdentity,
     attest_runtime_mixture_checkpoint_publication,
@@ -78,6 +83,146 @@ _PARENT_CHECKPOINT = {
     "artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
 }
 _LOCAL_SEALED_DATASET_REPOSITORY = "local/sealed-mixed-generation"
+
+
+@dataclass(frozen=True, slots=True)
+class _SelectedRuntimeRecovery:
+    source: str
+    optimizer_step: int
+    path: Path
+    local: LocalRecoveryCheckpoint | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedRuntimeResume:
+    archive: Path
+    descriptor_path: Path
+    descriptor: object
+    cursor: dict[str, int]
+
+    @property
+    def optimizer_step(self) -> int:
+        return self.cursor["optimizer_step"]
+
+
+def _select_runtime_recovery(*, local: LocalRecoveryCheckpoint | None, hf_checkpoint: Path | None, hf_descriptor: object | None, parent_checkpoint: Path, local_anchor_verified: bool | None = None) -> _SelectedRuntimeRecovery:
+    """Select the newest authenticated cursor, keeping the exact parent fallback."""
+    hf_step = getattr(getattr(hf_descriptor, "record", None), "optimizer_step", None)
+    if hf_checkpoint is not None and (type(hf_step) is not int or hf_step not in (1000, 2000)):
+        raise ValueError("runtime HF recovery descriptor has an invalid cursor")
+    if hf_checkpoint is not None and hf_step == 2000:
+        # A bare local 2K trainer receipt is not terminal evidence.  An
+        # independently authenticated HF 2K is, and selecting it avoids a
+        # duplicate upload/gradient launch in the journal crash window.
+        if local is None or local.optimizer_step != 2000 or local.terminal_immutable_publication is None:
+            return _SelectedRuntimeRecovery("terminal", 2000, hf_checkpoint)
+    if local is not None and local.optimizer_step == 2000:
+        source = "terminal" if local.terminal_immutable_publication is not None else "publication_only"
+        return _SelectedRuntimeRecovery(source, 2000, local.checkpoint_path, local)
+    if hf_checkpoint is not None and hf_step == 2000:
+        return _SelectedRuntimeRecovery("terminal", 2000, hf_checkpoint)
+    if local is not None:
+        if hf_checkpoint is None or local.optimizer_step > hf_step:
+            return _SelectedRuntimeRecovery("local", local.optimizer_step, local.checkpoint_path, local)
+        if local.optimizer_step == hf_step:
+            # A bare local 1K receipt is durable trainer state, but it cannot
+            # carry the preceding immutable chain until its publication journal
+            # completes.  On an equal authenticated HF cursor, retain local
+            # first only once that chain is fully validated.
+            anchored = (
+                local.last_immutable_publication is not None
+                and local.last_immutable_anchor is not None
+            ) if local_anchor_verified is None else local_anchor_verified
+            if anchored:
+                return _SelectedRuntimeRecovery("local", local.optimizer_step, local.checkpoint_path, local)
+    if hf_checkpoint is not None:
+        assert type(hf_step) is int
+        return _SelectedRuntimeRecovery("hf", hf_step, hf_checkpoint)
+    return _SelectedRuntimeRecovery("parent", 0, parent_checkpoint)
+
+
+def _live_device_provenance(torch_module: object) -> object:
+    """Read non-secret device identity from the actual torch/NVML process.
+
+    UUID collection is deliberately fail-closed: name and VRAM alone are not a
+    stable receipt identity for a rented device.
+    """
+
+    from lehome_train.groot.runtime_mixture_warmup import RuntimeState
+
+    cuda = getattr(torch_module, "cuda", None)
+    try:
+        import pynvml
+    except Exception as error:
+        raise RuntimeError("GPU warm-up requires an NVML stable GPU UUID") from error
+    nvml_initialized = False
+    try:
+        try:
+            pynvml.nvmlInit()
+            nvml_initialized = True
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            raw_uuid = pynvml.nvmlDeviceGetUUID(handle)
+            gpu_uuid = raw_uuid.decode("utf-8") if isinstance(raw_uuid, bytes) else raw_uuid
+        except Exception as error:
+            raise RuntimeError("GPU warm-up requires an NVML stable GPU UUID") from error
+        get_properties = getattr(cuda, "get_device_properties", None)
+        get_name = getattr(cuda, "get_device_name", None)
+        if not callable(get_properties) or not callable(get_name):
+            raise RuntimeError("GPU warm-up CUDA device provenance is unavailable")
+        properties = get_properties(0)
+        total_vram = getattr(properties, "total_memory", None)
+        torch_version = getattr(torch_module, "__version__", None)
+        if torch_version is not None:
+            torch_version = str(torch_version)
+        cuda_version = getattr(getattr(torch_module, "version", None), "cuda", None)
+        device_name = get_name(0)
+        return RuntimeState(
+            torch_cuda_available=getattr(cuda, "is_available")(),
+            torch_cuda_initialized=getattr(cuda, "is_initialized")(),
+            model_loaded=True,
+            hostname=socket.gethostname(),
+            host_architecture=platform.machine(),
+            torch_version=torch_version,
+            cuda_version=cuda_version,
+            gpu_device_name=device_name,
+            gpu_uuid=gpu_uuid,
+            total_vram_bytes=total_vram,
+        )
+    finally:
+        if nvml_initialized:
+            failed_read = sys.exc_info()[0] is not None
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                # A failed cleanup must not erase a failed UUID/device read.
+                if not failed_read:
+                    raise
+
+
+def _authenticated_materialization_proof(contract: object) -> dict[str, object]:
+    """Decode one authenticated BC and rollout h16 window from this session."""
+
+    from lehome_train.groot.runtime_mixture import RangeSourceLoader
+
+    windows = getattr(contract, "training_windows", ())
+    loader = RangeSourceLoader(contract)
+    proof: dict[str, object] = {}
+    for source_type in ("bc", "rollout"):
+        window = next((item for item in windows if getattr(item, "source_type", None) == source_type), None)
+        if window is None:
+            raise RuntimeError(f"GPU warm-up authenticated runtime has no {source_type} h16 window")
+        payload = loader.load(window)
+        images = payload.get("images") if isinstance(payload, Mapping) else None
+        actions = payload.get("actions") if isinstance(payload, Mapping) else None
+        if not isinstance(images, Mapping) or set(images) != {"top_rgb", "left_rgb", "right_rgb"} or not isinstance(actions, list) or len(actions) != 16:
+            raise RuntimeError("GPU warm-up live loader failed BC/rollout h16 three-camera materialization")
+        proof[source_type] = {
+            "source_type": source_type,
+            "window_id": window.window_id,
+            "action_horizon": len(actions),
+            "camera_count": len(images),
+        }
+    return proof
 
 
 def _is_oom(error: BaseException) -> bool:
@@ -163,7 +308,10 @@ class _RuntimeMixtureWarmupSession:
     optimizer: object
     loader_factory: Callable[[int], object]
     sampler_factory: Callable[[], object]
+    runtime_state_probe: Callable[[], object] = lambda: (_ for _ in ()).throw(RuntimeError("GPU warm-up device provenance probe is unavailable"))
+    materialization_proof_factory: Callable[[], Mapping[str, object]] = lambda: {}
     clock: Callable[[], float] = monotonic
+    _materialization_proof: Mapping[str, object] | None = field(default=None, init=False)
 
     def model_loaded(self) -> bool:
         try:
@@ -173,7 +321,17 @@ class _RuntimeMixtureWarmupSession:
         device = getattr(parameter, "device", None)
         return getattr(device, "type", None) == "cuda"
 
-    def _run_model_step(self, batch: object) -> None:
+    def runtime_state(self) -> object:
+        from lehome_train.groot.runtime_mixture_warmup import RuntimeState
+
+        result = self.runtime_state_probe()
+        if not isinstance(result, RuntimeState):
+            raise RuntimeError("GPU warm-up device provenance probe returned an invalid receipt")
+        if not self.model_loaded():
+            raise RuntimeError("pinned GR00T CUDA model is not loaded")
+        return result
+
+    def _run_model_step(self, batch: object) -> float:
         cuda = getattr(self.torch_module, "cuda", None)
         synchronize = getattr(cuda, "synchronize", None)
         if not callable(synchronize):
@@ -188,6 +346,12 @@ class _RuntimeMixtureWarmupSession:
         backward = getattr(loss, "backward", None)
         if not callable(backward):
             raise RuntimeError("pinned GR00T model did not return a trainable loss")
+        item = getattr(loss, "item", None)
+        if not callable(item):
+            raise RuntimeError("pinned GR00T model loss is not materialized")
+        loss_value = item()
+        if type(loss_value) not in (int, float) or not math.isfinite(float(loss_value)):
+            raise RuntimeError("pinned GR00T model returned a non-finite loss")
         backward()
         self.optimizer.step()
         zero_grad = getattr(self.optimizer, "zero_grad", None)
@@ -195,6 +359,7 @@ class _RuntimeMixtureWarmupSession:
             raise RuntimeError("pinned GR00T optimizer cannot clear gradients")
         zero_grad(set_to_none=True)
         synchronize()
+        return float(loss_value)
 
     def measure(
         self, *, worker_count: int, burn_in_steps: int, measured_steps: int
@@ -212,15 +377,30 @@ class _RuntimeMixtureWarmupSession:
         step_seconds = 0.0
         busy_seconds = 0.0
         utilizations: list[float] = []
+        observed_batches: list[int] = []
+        losses: list[float] = []
+        latencies: list[float] = []
+        minimum_free_vram: int | None = None
+        peak_allocated = 0
+        peak_reserved = 0
+        materialization_proof: Mapping[str, object] | None = None
         oom = False
         error_text: str | None = None
         try:
-            if type(worker_count) is not int or worker_count not in (0, 4, 8, 16, 24):
+            if type(worker_count) is not int or worker_count not in (0, 4, 8, 12, 16):
                 raise ValueError("runtime GPU warm-up worker count is not canonical")
             if type(burn_in_steps) is not int or burn_in_steps != 10 or type(measured_steps) is not int or measured_steps != 50:
                 raise ValueError("runtime GPU warm-up duration is not canonical")
             if not self.model_loaded():
                 raise RuntimeError("pinned GR00T CUDA model is not loaded")
+            cuda = getattr(self.torch_module, "cuda", None)
+            reset_peaks = getattr(cuda, "reset_peak_memory_stats", None)
+            memory_allocated = getattr(cuda, "max_memory_allocated", None)
+            memory_reserved = getattr(cuda, "max_memory_reserved", None)
+            memory_info = getattr(cuda, "mem_get_info", None)
+            if not all(callable(method) for method in (reset_peaks, memory_allocated, memory_reserved, memory_info)):
+                raise RuntimeError("GPU warm-up CUDA allocator telemetry is unavailable")
+            reset_peaks()
             loader = self.loader_factory(worker_count)
             iterator = iter(loader)
             sampler = self.sampler_factory()
@@ -231,8 +411,10 @@ class _RuntimeMixtureWarmupSession:
                 waiting_started = self.clock()
                 batch = next(iterator)
                 waiting_finished = self.clock()
-                decoded_samples += _batch_sample_count(batch)
-                self._run_model_step(batch)
+                batch_size = _batch_sample_count(batch)
+                decoded_samples += batch_size
+                observed_batches.append(batch_size)
+                loss = self._run_model_step(batch)
                 cycle_finished = self.clock()
                 if index < burn_in_steps:
                     continue
@@ -249,6 +431,19 @@ class _RuntimeMixtureWarmupSession:
                 step_seconds += elapsed
                 utilizations.append(float(utilization))
                 busy_seconds += elapsed * float(utilization) / 100.0
+                losses.append(loss)
+                latencies.append(elapsed)
+                free, _total = memory_info()
+                if type(free) is not int or free < 0:
+                    raise RuntimeError("GPU warm-up free-memory telemetry is unavailable")
+                minimum_free_vram = free if minimum_free_vram is None else min(minimum_free_vram, free)
+            peak_allocated = memory_allocated()
+            peak_reserved = memory_reserved()
+            if type(peak_allocated) is not int or peak_allocated < 0 or type(peak_reserved) is not int or peak_reserved < 0:
+                raise RuntimeError("GPU warm-up allocator peak telemetry is unavailable")
+            if self._materialization_proof is None:
+                self._materialization_proof = self.materialization_proof_factory()
+            materialization_proof = self._materialization_proof
         except Exception as caught:
             oom = _is_oom(caught)
             error_text = str(caught) or type(caught).__name__
@@ -271,6 +466,17 @@ class _RuntimeMixtureWarmupSession:
             gpu_utilization_percent=(sum(utilizations) / len(utilizations) if utilizations else 0.0),
             oom=oom,
             error=error_text,
+            observed_batch_sizes=tuple(observed_batches),
+            loss_min=min(losses) if losses else None,
+            loss_max=max(losses) if losses else None,
+            loss_final=losses[-1] if losses else None,
+            peak_memory_allocated_bytes=peak_allocated,
+            peak_memory_reserved_bytes=peak_reserved,
+            minimum_free_vram_bytes=minimum_free_vram or 0,
+            samples_per_second=(64 * completed / step_seconds if step_seconds else 0.0),
+            step_latency_p50_seconds=(statistics.median(latencies) if latencies else None),
+            step_latency_p95_seconds=(sorted(latencies)[min(len(latencies) - 1, math.ceil(len(latencies) * .95) - 1)] if latencies else None),
+            materialization_proof=materialization_proof,
         )
 
 
@@ -438,7 +644,7 @@ def _continuous_campaign_identity(
         or config.gradient_accumulation_steps != 1
         or config.num_gpus != 1
         or config.max_steps != 2000
-        or config.save_steps != 1000
+        or config.save_steps != 500
         or config.training_action_horizon != 16
         or config.model_action_chunk_capacity != 40
         or config.augmentation_profile != "none"
@@ -481,7 +687,7 @@ def _runtime_final_campaign(
         or config.base_model_revision != MODEL_REVISION
         or config.physical_batch_size != 64 or config.global_batch_size != 64
         or config.gradient_accumulation_steps != 1 or config.augmentation_profile != "none"
-        or config.num_gpus != 1 or config.max_steps != 2000 or config.save_steps != 1000
+        or config.num_gpus != 1 or config.max_steps != 2000 or config.save_steps != 500
         or config.training_action_horizon != 16 or config.model_action_chunk_capacity != 40
         or config.parent_checkpoint_repository != parent.get("repository")
         or config.parent_checkpoint_revision != parent.get("revision")
@@ -552,10 +758,10 @@ def _runtime_checkpoint_identity_from_evidence(value: object) -> RuntimeMixtureT
     return identity
 
 
-def _runtime_resume_checkpoint(
+def _validate_runtime_resume_checkpoint(
     *, request: Mapping[str, object], config: FineTuneLaunchConfig, mixture_id: object,
-) -> Path | None:
-    """Restore only the checkpoint archive named by an authenticated runtime cursor."""
+) -> _ValidatedRuntimeResume | None:
+    """Validate HF bytes and cursor before local-first recovery selection."""
     archive_value, descriptor_value, cursor = (
         request["runtime_resume_archive"], request["runtime_resume_descriptor"], request["runtime_resume_cursor"],
     )
@@ -570,12 +776,29 @@ def _runtime_resume_checkpoint(
     step = record.optimizer_step
     expected_cursor = {"optimizer_step": step, "global_sample_offset": step * 64, "physical_batch_size": 64, "action_horizon": 16}
     if (
-        step != 1000 or cursor != expected_cursor or record.dataset_manifest_sha256 != mixture_id
+        set(cursor) != set(expected_cursor)
+        or any(type(cursor.get(key)) is not int for key in expected_cursor)
+        or step not in (1000, 2000) or cursor != expected_cursor or record.dataset_manifest_sha256 != mixture_id
         or record.sample_presentations != step * 64 or not record.resumable
         or record.artifact.sha256 != sha256_file(archive) or record.artifact.byte_size != archive.stat().st_size
     ):
         raise ValueError("runtime resume cursor or checkpoint archive is incompatible")
-    from lehome_train.groot.production_adapters import _restore_checkpoint_archive
+    return _ValidatedRuntimeResume(
+        archive=archive, descriptor_path=descriptor_path, descriptor=descriptor,
+        cursor={key: cursor[key] for key in ("optimizer_step", "global_sample_offset", "physical_batch_size", "action_horizon")},
+    )
+
+
+def _restore_validated_runtime_resume_checkpoint(
+    *, validated: _ValidatedRuntimeResume, config: FineTuneLaunchConfig,
+    preserve_existing_run: bool,
+) -> Path:
+    """Materialize HF bytes only after selection, preserving local fallback state."""
+    from lehome_train.groot.production_adapters import _restore_checkpoint_archive, _verified_checkpoint_state_at
+
+    archive, descriptor_path, step = (
+        validated.archive, validated.descriptor_path, validated.optimizer_step,
+    )
     output_root = Path(config.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     if output_root.is_symlink() or not output_root.is_dir():
@@ -583,7 +806,7 @@ def _runtime_resume_checkpoint(
     consumption = output_root / "runtime-resume-consumption.json"
     evidence = {
         "schema_version": 1, "kind": "runtime_mixture_resume_consumption",
-        "optimizer_step": step, "cursor": dict(cursor),
+        "optimizer_step": step, "cursor": validated.cursor,
         "archive_sha256": sha256_file(archive), "descriptor_sha256": sha256_file(descriptor_path),
     }
     if consumption.exists() or consumption.is_symlink():
@@ -592,13 +815,72 @@ def _runtime_resume_checkpoint(
             raise ValueError("runtime resume checkpoint was already consumed by a different cursor")
     else:
         atomic_write_json(consumption, evidence)
+    restore_root = output_root
+    normal_run_root = output_root / config.experiment_name
+    if normal_run_root.exists() or normal_run_root.is_symlink():
+        if not preserve_existing_run:
+            raise ValueError("runtime resume checkpoint destination already exists")
+        staging_name = f".runtime-hf-resume-{step}-{sha256_file(archive)[:16]}"
+        restore_root = output_root / staging_name
+        incomplete = restore_root / ".INCOMPLETE.json"
+        staging_evidence = {
+            "schema_version": 1, "kind": "runtime_hf_resume_staging",
+            "optimizer_step": step, "archive_sha256": sha256_file(archive),
+            "descriptor_sha256": sha256_file(descriptor_path),
+        }
+        if restore_root.exists() or restore_root.is_symlink():
+            if restore_root.is_symlink() or not restore_root.is_dir():
+                raise ValueError("runtime HF resume staging root is unsafe")
+            restored = restore_root / config.experiment_name / f"checkpoint-{step}"
+            identity_path = restore_root / config.experiment_name / "lehome_launch.json"
+            if incomplete.exists() or incomplete.is_symlink():
+                if incomplete.is_symlink() or not incomplete.is_file() or _load_nonempty_json_artifact(
+                    incomplete, "runtime HF resume staging receipt"
+                ) != staging_evidence:
+                    raise ValueError("runtime HF resume staging is unsafe")
+                try:
+                    if (
+                        restored.is_symlink() or not restored.is_dir()
+                        or identity_path.is_symlink() or not identity_path.is_file()
+                        or _load_nonempty_json_artifact(identity_path, "runtime HF resume staging identity") != config.identity()
+                    ):
+                        raise ValueError("incomplete")
+                    _verified_checkpoint_state_at(restored, step, num_gpus=config.num_gpus)
+                except ValueError:
+                    # This exact private staging root is recoverable state; it
+                    # never contains the verified local fallback run.
+                    shutil.rmtree(restore_root)
+                else:
+                    incomplete.unlink()
+                    return restored
+            else:
+                if (
+                    restored.is_symlink() or not restored.is_dir()
+                    or identity_path.is_symlink() or not identity_path.is_file()
+                    or _load_nonempty_json_artifact(identity_path, "runtime HF resume staging identity") != config.identity()
+                ):
+                    raise ValueError("runtime HF resume staging is incomplete or incompatible")
+                _verified_checkpoint_state_at(restored, step, num_gpus=config.num_gpus)
+                return restored
+        temporary = Path(tempfile.mkdtemp(prefix=f".{staging_name}.", suffix=".incomplete", dir=output_root))
+        try:
+            atomic_write_json(temporary / ".INCOMPLETE.json", staging_evidence)
+            os.replace(temporary, restore_root)
+        except BaseException:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
     _restore_checkpoint_archive(
-        archive, output_root=output_root, expected_member_root=config.experiment_name,
+        archive, output_root=restore_root, expected_member_root=config.experiment_name,
         optimizer_step=step, expected_identity=config.identity(), num_gpus=config.num_gpus,
     )
-    restored = Path(config.output_dir) / config.experiment_name / f"checkpoint-{step}"
+    restored = restore_root / config.experiment_name / f"checkpoint-{step}"
     if restored.is_symlink() or not restored.is_dir():
         raise ValueError("runtime resume archive did not restore the required checkpoint")
+    if restore_root != output_root:
+        incomplete = restore_root / ".INCOMPLETE.json"
+        if incomplete.is_symlink() or not incomplete.is_file():
+            raise ValueError("runtime HF resume staging completion marker is missing")
+        incomplete.unlink()
     return restored
 
 
@@ -626,8 +908,8 @@ def _runtime_resume_anchor_link(
     }
 
 
-def _runtime_resume_publication(*, value: object, identity: RuntimeMixtureTrainingIdentity, anchor: dict[str, str] | None) -> dict[str, object] | None:
-    """Retain the exact 1K publication the consumed anchor authenticated."""
+def _runtime_resume_publication(*, value: object, identity: RuntimeMixtureTrainingIdentity, anchor: dict[str, str] | None, optimizer_step: int = 1000, archive: Path | None = None, descriptor_path: Path | None = None) -> dict[str, object] | None:
+    """Retain one canonical immutable publication bound to the consumed cursor."""
 
     if anchor is None:
         if value is not None:
@@ -640,15 +922,41 @@ def _runtime_resume_publication(*, value: object, identity: RuntimeMixtureTraini
         "readback_verified", "identity", "identity_sha256", "runtime_cursor",
         "fresh_tree_readback_verified",
     }
+    cursor = value.get("runtime_cursor") if isinstance(value, Mapping) else None
+    def safe_relative(item: object) -> bool:
+        return (
+            type(item) is str and bool(item) and not item.startswith("/")
+            and "\\" not in item and all(part not in {"", ".", ".."} for part in item.split("/"))
+        )
+    def sha(item: object) -> bool:
+        return type(item) is str and re.fullmatch(r"[0-9a-f]{64}", item) is not None
+    cursor_valid = (
+        isinstance(cursor, Mapping)
+        and set(cursor) == {"optimizer_step", "global_sample_offset", "physical_batch_size", "action_horizon"}
+        and all(type(cursor.get(key)) is int for key in cursor)
+        and cursor == {"optimizer_step": optimizer_step, "global_sample_offset": optimizer_step * 64, "physical_batch_size": 64, "action_horizon": 16}
+    )
     if (
         not isinstance(value, Mapping) or set(value) != required
-        or value.get("schema_version") != 1 or value.get("kind") != "runtime_mixture_checkpoint_publication"
-        or value.get("optimizer_step") != 1000 or value.get("identity") != identity.to_dict()
+        or type(value.get("schema_version")) is not int or value.get("schema_version") != 1 or value.get("kind") != "runtime_mixture_checkpoint_publication"
+        or optimizer_step not in (1000, 2000) or type(value.get("optimizer_step")) is not int or value.get("optimizer_step") != optimizer_step or value.get("identity") != identity.to_dict()
         or value.get("identity_sha256") != identity.sha256
-        or value.get("runtime_cursor") != {"optimizer_step": 1000, "global_sample_offset": 64_000, "physical_batch_size": 64, "action_horizon": 16}
+        or value.get("repository") != DEFAULT_MODEL_REPO
+        or type(value.get("immutable_revision")) is not str or re.fullmatch(r"[0-9a-f]{40}", value["immutable_revision"]) is None
+        or not safe_relative(value.get("remote_prefix")) or not safe_relative(value.get("relative_path")) or not safe_relative(value.get("descriptor_relative_path"))
+        or not sha(value.get("artifact_sha256")) or not sha(value.get("descriptor_sha256"))
+        or any(type(value.get(field)) is not int or value[field] <= 0 for field in ("artifact_byte_size", "descriptor_byte_size"))
+        or value.get("readback_verified") is not True or not cursor_valid
         or value.get("fresh_tree_readback_verified") is not True
     ):
-        raise ValueError("runtime resume publication is not the authenticated 1K cursor")
+        raise ValueError("runtime resume publication is not the authenticated immutable cursor")
+    if (archive is None) != (descriptor_path is None):
+        raise ValueError("runtime resume publication archive and descriptor evidence must be paired")
+    if archive is not None and descriptor_path is not None and (
+        value["artifact_sha256"] != sha256_file(archive) or value["artifact_byte_size"] != archive.stat().st_size
+        or value["descriptor_sha256"] != sha256_file(descriptor_path) or value["descriptor_byte_size"] != descriptor_path.stat().st_size
+    ):
+        raise ValueError("runtime resume publication does not match the authenticated archive/descriptor")
     return dict(value)
 
 
@@ -893,6 +1201,7 @@ class ProductionRuntime:
         *,
         checkpoint_transport_factory: Callable[..., object] | None = None,
         checkpoint_retry_sleeper: Callable[[float], None] = sleep,
+        device_provenance_probe: Callable[[object], object] | None = None,
     ) -> None:
         """Keep the Hub byte boundary injectable without widening the command API.
 
@@ -907,6 +1216,9 @@ class ProductionRuntime:
             else checkpoint_transport_factory
         )
         self._checkpoint_retry_sleeper = checkpoint_retry_sleeper
+        self._device_provenance_probe = (
+            _live_device_provenance if device_provenance_probe is None else device_provenance_probe
+        )
 
     def runtime_gpu_warmup_adapter(self, arguments: dict[str, object]) -> object:
         """Return the sole live adapter accepted by ``runtime-gpu-warmup``.
@@ -926,6 +1238,7 @@ class ProductionRuntime:
         return TorchRuntimeWarmupMetricsAdapter(
             model_loaded=session.model_loaded,
             measure_live=session.measure,
+            runtime_state_live=session.runtime_state,
         )
 
     def _create_runtime_gpu_warmup_session(
@@ -968,6 +1281,11 @@ class ProductionRuntime:
             normalization_path=normalization,
             mounts_descriptor_path=mounts,
         )
+        from lehome_train.groot.runtime_mixture import load_runtime_contract
+
+        contract = load_runtime_contract(manifest, mounts)
+        if contract.manifest.experiment_manifest_sha256 is None:
+            raise ValueError("legacy runtime mixture is not admitted to this campaign")
         binding = request["binding"]
         assert isinstance(binding, Mapping)
         parent = binding.get("parent_checkpoint")
@@ -1112,6 +1430,8 @@ class ProductionRuntime:
             optimizer=optimizer,
             loader_factory=loader_factory,
             sampler_factory=NvmlTelemetrySampler,
+            runtime_state_probe=lambda: self._device_provenance_probe(torch),
+            materialization_proof_factory=lambda: _authenticated_materialization_proof(contract),
         )
 
     def prepare(self, arguments: dict[str, object]) -> dict[str, object]:
@@ -1706,6 +2026,7 @@ class ProductionRuntime:
             "warmup_receipt", "runtime_warmup_binding",
             "runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor",
             "runtime_resume_anchor", "runtime_resume_publication",
+            "local_recovery_root",
             "checkpoint_repository", "checkpoint_revision", "publisher_token_file", "instance_id",
             "result_output", "status_output",
         }
@@ -1764,12 +2085,14 @@ class ProductionRuntime:
         token = _publisher_token(request["publisher_token_file"])
         if type(request["instance_id"]) is not int:
             raise ValueError("runtime checkpoint publication requires an exact instance ID")
-        resume_checkpoint = _runtime_resume_checkpoint(
+        local_recovery_root = _mounted_path(request["local_recovery_root"], "local_recovery_root")
+        if local_recovery_root != _runtime_mount_root("output") / "local-recovery":
+            raise ValueError("local recovery root is not the approved protected shared-disk mount")
+        validated_hf_resume = _validate_runtime_resume_checkpoint(
             request=request, config=config, mixture_id=getattr(contract.manifest, "mixture_id", None),
         )
-        previous_anchor = _runtime_resume_anchor_link(
-            resume_checkpoint=resume_checkpoint, value=request["runtime_resume_anchor"],
-        )
+        hf_archive_path = None if validated_hf_resume is None else validated_hf_resume.archive
+        hf_descriptor_path = None if validated_hf_resume is None else validated_hf_resume.descriptor_path
         # The observer snapshots the official save directory at 1K while the
         # trainer continues.  It uploads/readbacks the immutable archive before
         # the 2K boundary, so a provider loss after 1K has a real resume source.
@@ -1792,6 +2115,99 @@ class ProductionRuntime:
         )
         if identity.mixture_id != str(contract.manifest.mixture_id):
             raise ValueError("runtime checkpoint source evidence mixture identity disagrees with mounted runtime")
+        experiment_manifest_sha256 = getattr(contract.manifest, "experiment_manifest_sha256", None)
+        if type(experiment_manifest_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", experiment_manifest_sha256) is None:
+            raise ValueError("runtime mixture lacks an exact experiment manifest binding")
+        local_identity = {
+            "experiment_manifest_sha256": experiment_manifest_sha256,
+            "parent_checkpoint_artifact_sha256": identity.parent_step12000_artifact_sha256,
+            "runtime_mixture_id": identity.mixture_id,
+            "trainer_code_sha256": identity.code_bundle_sha256,
+            "trainer_code_revision": identity.code_bundle_revision,
+        }
+        local = discover_local_recovery(metadata_root=local_recovery_root, identity=local_identity)
+        hf_descriptor = None if validated_hf_resume is None else validated_hf_resume.descriptor
+        hf_anchor = _runtime_resume_anchor_link(
+            resume_checkpoint=None if validated_hf_resume is None else validated_hf_resume.archive,
+            value=request["runtime_resume_anchor"],
+        )
+        hf_publication = _runtime_resume_publication(
+            value=request["runtime_resume_publication"], identity=identity,
+            anchor=hf_anchor,
+            optimizer_step=1000 if validated_hf_resume is None else validated_hf_resume.optimizer_step,
+            archive=hf_archive_path, descriptor_path=hf_descriptor_path,
+        )
+        local_anchor_verified = False
+        if local is not None and local.optimizer_step >= 1000 and local.last_immutable_publication is not None:
+            local_anchor = _runtime_resume_anchor_link(
+                resume_checkpoint=local.checkpoint_path, value=local.last_immutable_anchor,
+            )
+            _runtime_resume_publication(
+                value=local.last_immutable_publication, identity=identity,
+                anchor=local_anchor, optimizer_step=1000,
+            )
+            local_anchor_verified = True
+        selected_recovery = _select_runtime_recovery(
+            local=local,
+            hf_checkpoint=None if validated_hf_resume is None else validated_hf_resume.archive,
+            hf_descriptor=hf_descriptor, parent_checkpoint=Path(config.base_model_path),
+            local_anchor_verified=local_anchor_verified,
+        )
+        hf_resume_checkpoint = None
+        if selected_recovery.source in {"hf", "terminal"} and selected_recovery.local is None:
+            assert validated_hf_resume is not None
+            hf_resume_checkpoint = _restore_validated_runtime_resume_checkpoint(
+                validated=validated_hf_resume, config=config,
+                preserve_existing_run=local is not None,
+            )
+        if selected_recovery.source == "terminal":
+            terminal_publications: list[dict[str, object]] = []
+            if selected_recovery.local is not None:
+                publication = selected_recovery.local.terminal_immutable_publication
+                anchor = selected_recovery.local.terminal_immutable_anchor
+                checked = _runtime_resume_publication(
+                    value=publication, identity=identity, anchor=anchor, optimizer_step=2000,
+                )
+                assert checked is not None
+                terminal_publications.append(checked)
+            else:
+                assert hf_publication is not None
+                terminal_publications.append(hf_publication)
+            payload = {
+                "status": "runtime-mixture-terminal-local-2000" if selected_recovery.local is not None else "runtime-mixture-terminal-hf-2000",
+                "runtime_manifest_sha256": sha256_file(paths["runtime_manifest"]),
+                "resume_checkpoint_step": 2000, "instance_id": request["instance_id"],
+                "immutable_checkpoint_publications": terminal_publications,
+            }
+            _write_result(outputs["result_output"], payload)
+            atomic_write_json(outputs["status_output"], payload)
+            return payload
+        if selected_recovery.source in {"parent", "publication_only"}:
+            resume_checkpoint = None
+        elif selected_recovery.source == "hf":
+            assert hf_resume_checkpoint is not None
+            resume_checkpoint = hf_resume_checkpoint
+        else:
+            resume_checkpoint = selected_recovery.path
+        if selected_recovery.source in {"local", "publication_only"} and selected_recovery.local is not None:
+            # v3 local receipts are durable before an asynchronous 1K Hub
+            # readback.  Resume their trainer state without inventing an HF
+            # predecessor; the supervisor will publish the retained 1K first.
+            previous_anchor = (
+                None if selected_recovery.local.last_immutable_anchor is None
+                else _runtime_resume_anchor_link(
+                    resume_checkpoint=selected_recovery.path,
+                    value=selected_recovery.local.last_immutable_anchor,
+                )
+            )
+            local_publication = selected_recovery.local.last_immutable_publication
+        elif selected_recovery.source == "hf":
+            assert hf_anchor is not None and hf_publication is not None
+            previous_anchor = hf_anchor
+            local_publication = hf_publication
+        else:
+            previous_anchor = None
+            local_publication = None
 
         checkpoint_retry_sleeper = self._checkpoint_retry_sleeper
 
@@ -1813,8 +2229,10 @@ class ProductionRuntime:
 
         lifecycle_hub = TokenBoundHub()
         resume_publication = _runtime_resume_publication(
-            value=request["runtime_resume_publication"], identity=identity,
+            value=local_publication, identity=identity,
             anchor=previous_anchor,
+            archive=hf_archive_path if selected_recovery.source == "hf" else None,
+            descriptor_path=hf_descriptor_path if selected_recovery.source == "hf" else None,
         )
         def publish_with_anchor(checkpoint: object) -> dict[str, object]:
             nonlocal previous_anchor
@@ -1842,20 +2260,51 @@ class ProductionRuntime:
             }
             return publication | {"runtime_checkpoint_anchor": dict(anchor_receipt)}
 
-        publications = run_continuous_supervisor(
-            run_root=Path(config.output_dir) / config.experiment_name,
-            launch=lambda: launch_continuous_finetune(
-                config, **_launch_kwargs(), resume_checkpoint=resume_checkpoint,
-            ),
-            package=lambda completed: session.package_checkpoint_snapshot(
-                completed.snapshot_root, optimizer_step=completed.optimizer_step,
-                sample_presentations=completed.optimizer_step * 64, schedule_sha256=schedule.sha256,
-            ),
-            publish=publish_with_anchor,
-            already_published=() if resume_publication is None else (1000,),
-        )
+        preemption = PreemptionController()
+        try:
+            previous_handler = signal.signal(signal.SIGTERM, preemption.handler)
+        except ValueError:
+            # Unit tests and embedded callers may not run on the main thread;
+            # the explicit controller remains testable without OS side effects.
+            previous_handler = None
+        try:
+            publications = run_continuous_supervisor(
+                run_root=Path(config.output_dir) / config.experiment_name,
+                launch=lambda: launch_continuous_finetune(
+                    config, **_launch_kwargs(), resume_checkpoint=resume_checkpoint,
+                ) if selected_recovery.source != "publication_only" else None,
+                package=lambda completed: session.package_checkpoint_snapshot(
+                    completed.snapshot_root, optimizer_step=completed.optimizer_step,
+                    sample_presentations=completed.optimizer_step * 64, schedule_sha256=schedule.sha256,
+                ),
+                publish=publish_with_anchor,
+                already_published=() if resume_publication is None else (1000,),
+                local_recovery_root=local_recovery_root, local_identity=local_identity,
+                preemption=preemption,
+                initial_immutable_publication=resume_publication,
+                initial_immutable_anchor=previous_anchor,
+            )
+        finally:
+            if previous_handler is not None:
+                signal.signal(signal.SIGTERM, previous_handler)
         publications = (() if resume_publication is None else (resume_publication,)) + publications
         steps = [item.get("optimizer_step") for item in publications]
+        if preemption.requested:
+            payload = {
+                "status": "runtime-mixture-preempted",
+                "runtime_manifest_sha256": sha256_file(paths["runtime_manifest"]),
+                "runtime_window_count": len(contract.training_windows),
+                "runtime_cycle_size": contract.manifest.cycle_size,
+                "selected_loader_workers": selected_workers,
+                "warmup_receipt_sha256": sha256_file(paths["warmup_receipt"]),
+                "resume_checkpoint_step": selected_recovery.optimizer_step if selected_recovery.source == "publication_only" else (None if resume_checkpoint is None else selected_recovery.optimizer_step),
+                "instance_id": request["instance_id"],
+                "immutable_checkpoint_publications": [dict(item) for item in publications],
+                "preemption": preemption.status(),
+            }
+            _write_result(outputs["result_output"], payload)
+            atomic_write_json(outputs["status_output"], payload)
+            return payload
         if steps not in ([1000], [1000, 2000]):
             raise RuntimeError("runtime mixture did not publish an immutable 1K checkpoint")
         payload = {
@@ -1865,9 +2314,10 @@ class ProductionRuntime:
             "runtime_cycle_size": contract.manifest.cycle_size,
             "selected_loader_workers": selected_workers,
             "warmup_receipt_sha256": sha256_file(paths["warmup_receipt"]),
-            "resume_checkpoint_step": None if resume_checkpoint is None else 1000,
+            "resume_checkpoint_step": selected_recovery.optimizer_step if selected_recovery.source == "publication_only" else (None if resume_checkpoint is None else selected_recovery.optimizer_step),
             "instance_id": request["instance_id"],
             "immutable_checkpoint_publications": [dict(item) for item in publications],
+            "preemption": preemption.status(),
         }
         _write_result(outputs["result_output"], payload)
         atomic_write_json(outputs["status_output"], payload)

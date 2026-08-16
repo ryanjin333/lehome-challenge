@@ -95,6 +95,8 @@ def test_build_launch_selects_guarded_runtime_mixture_entrypoint_only_when_expli
             runtime_mixture_manifest="/runtime/mixture.json",
             runtime_window_index="/runtime/windows.json",
             runtime_mounts_descriptor="/runtime/mounts.json",
+            max_steps=2_000,
+            save_steps=500,
         ), visible_devices="0", environment={}, official_checkout=official_checkout,
     )
     assert launch.command[:3] == (sys.executable, "-m", "lehome_train.groot.runtime_mixture_entrypoint")
@@ -106,11 +108,11 @@ def test_build_launch_selects_guarded_runtime_mixture_entrypoint_only_when_expli
 
 
 def test_runtime_launch_preserves_existing_pythonpath_after_official_checkout(official_checkout: Path) -> None:
-    launch = build_launch(config(runtime_mixture_manifest="/runtime/mixture.json", runtime_window_index="/runtime/windows.json", runtime_mounts_descriptor="/runtime/mounts.json"), visible_devices="0", environment={"PYTHONPATH": "/sentinel"}, official_checkout=official_checkout)
+    launch = build_launch(config(runtime_mixture_manifest="/runtime/mixture.json", runtime_window_index="/runtime/windows.json", runtime_mounts_descriptor="/runtime/mounts.json", max_steps=2_000, save_steps=500), visible_devices="0", environment={"PYTHONPATH": "/sentinel"}, official_checkout=official_checkout)
     assert launch.environment["PYTHONPATH"] == str(official_checkout) + os.pathsep + "/sentinel"
 
 
-def test_continuous_launch_runs_one_process_to_2000_with_save_1000(
+def test_continuous_launch_runs_one_process_to_2000_with_save_500(
     tmp_path: Path, official_checkout: Path
 ) -> None:
     calls: list[tuple[object, object]] = []
@@ -119,7 +121,7 @@ def test_continuous_launch_runs_one_process_to_2000_with_save_1000(
         config(
             output_dir=str(tmp_path / "output"),
             max_steps=2_000,
-            save_steps=1_000,
+            save_steps=500,
             physical_batch_size=64,
         ),
         visible_devices="0",
@@ -131,28 +133,82 @@ def test_continuous_launch_runs_one_process_to_2000_with_save_1000(
     assert len(calls) == 1
     command = calls[0][0][0]
     assert command[command.index("--max-steps") + 1] == "2000"
-    assert command[command.index("--save-steps") + 1] == "1000"
+    assert command[command.index("--save-steps") + 1] == "500"
 
 
-def test_continuous_launch_passes_verified_resume_checkpoint_to_official_process(
-    tmp_path: Path, official_checkout: Path
+@pytest.mark.parametrize("step", (500, 1000, 1500))
+def test_continuous_launch_passes_every_verified_500_boundary_to_official_process(
+    tmp_path: Path, official_checkout: Path, step: int,
 ) -> None:
     output = tmp_path / "output"
-    checkpoint = output / "lehome-groot-baseline" / "checkpoint-1000"
+    checkpoint = output / "lehome-groot-baseline" / f"checkpoint-{step}"
     checkpoint.mkdir(parents=True)
     (checkpoint.parent / "lehome_launch.json").write_text(
-        __import__("json").dumps(config(output_dir=str(output), max_steps=2_000, save_steps=1_000, physical_batch_size=64).identity()),
+        __import__("json").dumps(config(output_dir=str(output), max_steps=2_000, save_steps=500, physical_batch_size=64).identity()),
         encoding="utf-8",
     )
     calls: list[tuple[object, object]] = []
     launch_continuous_finetune(
-        config(output_dir=str(output), max_steps=2_000, save_steps=1_000, physical_batch_size=64),
+        config(output_dir=str(output), max_steps=2_000, save_steps=500, physical_batch_size=64),
         visible_devices="0", environment={}, official_checkout=official_checkout,
         resume_checkpoint=checkpoint,
         runner=lambda *args, **kwargs: calls.append((args, kwargs)) or subprocess.CompletedProcess([], 0),
     )
     command = calls[0][0][0]
     assert command[command.index("--resume-from-checkpoint") + 1] == str(checkpoint)
+
+
+def test_continuous_launch_accepts_a_private_hf_staging_checkpoint_without_replacing_local_run(
+    tmp_path: Path, official_checkout: Path,
+) -> None:
+    output = tmp_path / "output"
+    resolved = config(output_dir=str(output), max_steps=2_000, save_steps=500, physical_batch_size=64)
+    local = output / "lehome-groot-baseline" / "checkpoint-1000"
+    local.mkdir(parents=True)
+    (local.parent / "lehome_launch.json").write_text(__import__("json").dumps(resolved.identity()), encoding="utf-8")
+    (local / "weights.bin").write_bytes(b"local-fallback")
+    staged = output / ".runtime-hf-resume-1000-deadbeefdeadbeef" / "lehome-groot-baseline" / "checkpoint-1000"
+    staged.mkdir(parents=True)
+    calls: list[tuple[object, object]] = []
+
+    launch_continuous_finetune(
+        resolved, visible_devices="0", environment={}, official_checkout=official_checkout,
+        resume_checkpoint=staged,
+        runner=lambda *args, **kwargs: calls.append((args, kwargs)) or subprocess.CompletedProcess([], 0),
+    )
+
+    command = calls[0][0][0]
+    assert command[command.index("--resume-from-checkpoint") + 1] == str(staged)
+    assert (local / "weights.bin").read_bytes() == b"local-fallback"
+
+
+@pytest.mark.parametrize("kind", ("canonical", "staging"))
+def test_continuous_launch_rejects_a_resume_checkpoint_with_a_symlinked_ancestor(
+    tmp_path: Path, official_checkout: Path, kind: str,
+) -> None:
+    output = tmp_path / "output"
+    resolved = config(output_dir=str(output), max_steps=2_000, save_steps=500, physical_batch_size=64)
+    external = tmp_path / "external" / resolved.experiment_name
+    checkpoint = external / "checkpoint-1000"
+    checkpoint.mkdir(parents=True)
+    (external / "lehome_launch.json").write_text(
+        __import__("json").dumps(resolved.identity()), encoding="utf-8",
+    )
+    output.mkdir()
+    if kind == "canonical":
+        os.symlink(external, output / resolved.experiment_name, target_is_directory=True)
+        selected = output / resolved.experiment_name / "checkpoint-1000"
+    else:
+        staging = output / ".runtime-hf-resume-1000-deadbeefdeadbeef"
+        os.symlink(external.parent, staging, target_is_directory=True)
+        selected = staging / resolved.experiment_name / "checkpoint-1000"
+
+    with pytest.raises(ValueError, match="symlink"):
+        launch_continuous_finetune(
+            resolved, visible_devices="0", environment={}, official_checkout=official_checkout,
+            resume_checkpoint=selected,
+            runner=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0),
+        )
 
 
 def test_runtime_continuous_launch_keeps_resume_checkpoint_inside_chunk_wrapper(
@@ -162,7 +218,7 @@ def test_runtime_continuous_launch_keeps_resume_checkpoint_inside_chunk_wrapper(
     checkpoint = output / "lehome-groot-baseline" / "checkpoint-1000"
     checkpoint.mkdir(parents=True)
     runtime = config(
-        output_dir=str(output), max_steps=2_000, save_steps=1_000, physical_batch_size=64,
+        output_dir=str(output), max_steps=2_000, save_steps=500, physical_batch_size=64,
         runtime_mixture_manifest="/runtime/mixture.json", runtime_window_index="/runtime/windows.json",
         runtime_mounts_descriptor="/runtime/mounts.json",
     )
@@ -175,6 +231,77 @@ def test_runtime_continuous_launch_keeps_resume_checkpoint_inside_chunk_wrapper(
     )
     command = calls[0][0][0]
     assert command[command.index("--resume-from-checkpoint") + 1] == str(checkpoint)
+
+
+def test_runtime_chunk_consumes_the_explicit_staged_resume_not_canonical_local_state(
+    tmp_path: Path, official_checkout: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real chunk handoff must retain the authenticated selected directory."""
+    from types import SimpleNamespace
+    import lehome_train.groot.chunk_launch as chunk_launch
+    from lehome_train.groot import runtime_mixture_entrypoint
+
+    output = tmp_path / "output"
+    resolved = config(
+        output_dir=str(output), max_steps=2_000, save_steps=500,
+        physical_batch_size=64, runtime_mixture_manifest="/runtime/mixture.json",
+        runtime_window_index="/runtime/windows.json", runtime_mounts_descriptor="/runtime/mounts.json",
+    )
+    canonical = output / resolved.experiment_name / "checkpoint-1500"
+    canonical.mkdir(parents=True)
+    (canonical / "trainer_state.json").write_text('{"global_step":1500}', encoding="utf-8")
+    (canonical / "weights.bin").write_bytes(b"unauthenticated-canonical-local")
+    (canonical.parent / "lehome_launch.json").write_text(
+        __import__("json").dumps(resolved.identity()), encoding="utf-8",
+    )
+    staged = (
+        output / ".runtime-hf-resume-1000-deadbeefdeadbeef"
+        / resolved.experiment_name / "checkpoint-1000"
+    )
+    staged.mkdir(parents=True)
+    (staged / "trainer_state.json").write_text('{"global_step":1000}', encoding="utf-8")
+    (staged / "weights.bin").write_bytes(b"authenticated-staged-hf")
+    original_resume_values: list[object] = []
+    runtime_argv: list[list[str]] = []
+
+    class Dataset:
+        seed = 23
+
+        def reset_seed(self, _seed: int) -> None:
+            pass
+
+    class FakeTrainer:
+        def __init__(self) -> None:
+            self.args = SimpleNamespace(output_dir=str(canonical.parent))
+            self.train_dataset = Dataset()
+
+        def add_callback(self, _callback: object) -> None:
+            pass
+
+        def train(self, *, resume_from_checkpoint: object) -> None:
+            original_resume_values.append(resume_from_checkpoint)
+
+    def run_runtime(argv: list[str]) -> int:
+        runtime_argv.append(list(argv))
+        FakeTrainer().train(resume_from_checkpoint=True)
+        return 0
+
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(Trainer=FakeTrainer))
+    monkeypatch.setattr(runtime_mixture_entrypoint, "main", run_runtime)
+
+    def run_chunk(command: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[object]:
+        chunk_index = command.index("lehome_train.groot.chunk_launch")
+        chunk_launch.main(list(command[chunk_index + 1 :]))
+        return subprocess.CompletedProcess(command, 0)
+
+    launch_continuous_finetune(
+        resolved, visible_devices="0", environment={}, official_checkout=official_checkout,
+        resume_checkpoint=staged, runner=run_chunk,
+    )
+
+    assert original_resume_values == [str(staged)]
+    assert runtime_argv and runtime_argv[0][runtime_argv[0].index("--resume-global-step") + 1] == "1000"
+    assert runtime_argv[0][runtime_argv[0].index("--resume-sample-offset") + 1] == "64000"
 
 
 def test_build_launch_verifies_step_12000_parent_weights(

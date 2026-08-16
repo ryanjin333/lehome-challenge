@@ -40,29 +40,22 @@ class StopAtOptimizerStep(TrainerCallback):
             control.should_training_stop = True
         return control
 
-def _resume_step(output_dir: str | Path, *, num_gpus: int = 1) -> int | None:
-    """Return the authenticated latest checkpoint step, if one exists."""
+def _checkpoint_step(checkpoint: Path, *, num_gpus: int = 1) -> int:
+    """Validate one selected official checkpoint and return its exact step."""
 
-    root = Path(output_dir)
-    if not root.exists():
-        return None
-    candidates: list[tuple[int, Path]] = []
-    for path in root.glob("checkpoint-*"):
-        suffix = path.name.removeprefix("checkpoint-")
-        if suffix.isdigit():
-            candidates.append((int(suffix), path))
-    if not candidates:
-        return None
-    step, checkpoint = max(candidates)
+    suffix = checkpoint.name.removeprefix("checkpoint-")
+    if not suffix.isdigit():
+        raise ValueError("runtime resume checkpoint has an invalid boundary")
+    step = int(suffix)
     state_path = checkpoint / "trainer_state.json"
     if checkpoint.is_symlink() or not checkpoint.is_dir() or state_path.is_symlink():
-        raise ValueError("latest GR00T checkpoint is not a regular directory")
+        raise ValueError("runtime resume checkpoint is not a regular directory")
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        raise ValueError("latest GR00T checkpoint has invalid trainer state") from None
+        raise ValueError("runtime resume checkpoint has invalid trainer state") from None
     if not isinstance(state, dict) or state.get("global_step") != step:
-        raise ValueError("latest GR00T checkpoint trainer state does not match its step")
+        raise ValueError("runtime resume checkpoint trainer state does not match its step")
     if num_gpus == 4:
         shard_root = checkpoint / f"global_step{step}"
         expected = {
@@ -75,8 +68,25 @@ def _resume_step(output_dir: str | Path, *, num_gpus: int = 1) -> int | None:
             or {entry.name for entry in shard_root.iterdir()} != expected
             or any(not entry.is_file() or entry.is_symlink() for entry in shard_root.iterdir())
         ):
-            raise ValueError("latest GR00T checkpoint has incomplete ZeRO-2 shards")
+            raise ValueError("runtime resume checkpoint has incomplete ZeRO-2 shards")
     return step
+
+
+def _resume_step(output_dir: str | Path, *, num_gpus: int = 1) -> int | None:
+    """Return the validated latest checkpoint step, if one exists."""
+
+    root = Path(output_dir)
+    if not root.exists():
+        return None
+    candidates: list[tuple[int, Path]] = []
+    for path in root.glob("checkpoint-*"):
+        suffix = path.name.removeprefix("checkpoint-")
+        if suffix.isdigit():
+            candidates.append((int(suffix), path))
+    if not candidates:
+        return None
+    _step, checkpoint = max(candidates)
+    return _checkpoint_step(checkpoint, num_gpus=num_gpus)
 
 
 def _resume_value(output_dir: str | Path, *, num_gpus: int = 1) -> bool:
@@ -85,10 +95,56 @@ def _resume_value(output_dir: str | Path, *, num_gpus: int = 1) -> bool:
     return _resume_step(output_dir, num_gpus=num_gpus) is not None
 
 
+def _symlink_free_selected_checkpoint(*, checkpoint: Path, output_root: Path, experiment: str) -> None:
+    """Reject a selected resume path with any redirected trusted component."""
+
+    if (
+        not output_root.is_absolute() or ".." in output_root.parts
+        or experiment in {"", ".", ".."} or "/" in experiment or "\\" in experiment
+    ):
+        raise ValueError("chunk runtime launcher has unsafe checkpoint binding arguments")
+    canonical_run = output_root / experiment
+    staging_root = checkpoint.parent.parent
+    permitted_staging = (
+        staging_root.parent == output_root
+        and staging_root.name.startswith(".runtime-hf-resume-")
+        and checkpoint.parent.name == experiment
+    )
+    if (
+        not checkpoint.is_absolute() or checkpoint.is_symlink() or not checkpoint.is_dir()
+        or (checkpoint.parent != canonical_run and not permitted_staging)
+    ):
+        raise ValueError("chunk runtime launcher has an unsafe authenticated runtime resume checkpoint")
+    try:
+        relative = checkpoint.relative_to(output_root)
+    except ValueError:
+        raise ValueError("chunk runtime launcher has an unsafe authenticated runtime resume checkpoint") from None
+    current = output_root
+    for part in (".", *relative.parts):
+        if current.is_symlink():
+            raise ValueError("chunk runtime launcher has a symlinked authenticated runtime resume checkpoint")
+        if part != ".":
+            current /= part
+    resolved_output = output_root.resolve(strict=True)
+    resolved_canonical_run = canonical_run.resolve(strict=False)
+    resolved_staging_root = staging_root.resolve(strict=False)
+    resolved_checkpoint = checkpoint.resolve(strict=True)
+    try:
+        resolved_checkpoint.relative_to(resolved_output)
+    except ValueError:
+        raise ValueError("chunk runtime launcher has an unsafe authenticated runtime resume checkpoint") from None
+    expected_parent = (
+        resolved_staging_root / experiment
+        if permitted_staging else resolved_canonical_run
+    )
+    if resolved_checkpoint.parent != expected_parent:
+        raise ValueError("chunk runtime launcher has an unsafe authenticated runtime resume checkpoint")
+
+
 def _runtime_checkpoint_binding(
     runtime_arguments: list[str], official_arguments: list[str], *, num_gpus: int
-) -> tuple[int, int]:
-    """Derive the sole runtime cursor from the checked checkpoint directory."""
+) -> tuple[int, int, Path | None]:
+    """Bind the runtime cursor and Trainer resume input to one exact directory."""
 
     try:
         wrapper_options = runtime_arguments[:runtime_arguments.index("--")]
@@ -105,10 +161,28 @@ def _runtime_checkpoint_binding(
         global_batch = int(official_arguments[official_arguments.index("--global-batch-size") + 1])
     except (ValueError, IndexError):
         raise ValueError("chunk runtime launcher requires canonical output and global batch arguments") from None
-    if not output.is_absolute() or not experiment or "/" in experiment or "\\" in experiment or global_batch <= 0:
+    if (
+        not output.is_absolute() or ".." in output.parts
+        or experiment in {"", ".", ".."} or "/" in experiment or "\\" in experiment
+        or global_batch <= 0
+    ):
         raise ValueError("chunk runtime launcher has unsafe checkpoint binding arguments")
-    step = _resume_step(output / experiment, num_gpus=num_gpus)
-    return (0 if step is None else step), global_batch
+    positions = [index for index, item in enumerate(official_arguments) if item == "--resume-from-checkpoint"]
+    if len(positions) > 1:
+        raise ValueError("chunk runtime launcher has ambiguous authenticated runtime resume checkpoint")
+    if not positions:
+        # The official launcher unconditionally asks Trainer to resume.  A
+        # runtime parent launch has no controller-selected cursor, so the
+        # chunk guard must suppress canonical-directory rediscovery.
+        return 0, global_batch, None
+    position = positions[0]
+    if position + 1 >= len(official_arguments):
+        raise ValueError("chunk runtime launcher has an invalid authenticated runtime resume checkpoint")
+    checkpoint = Path(official_arguments[position + 1])
+    _symlink_free_selected_checkpoint(
+        checkpoint=checkpoint, output_root=output, experiment=experiment,
+    )
+    return _checkpoint_step(checkpoint, num_gpus=num_gpus), global_batch, checkpoint
 
 
 def _arguments(argv: list[str] | None) -> tuple[int, str, list[str], list[str] | None]:
@@ -286,6 +360,7 @@ def main(argv: list[str] | None = None) -> None:
         else _runtime_checkpoint_binding(runtime_arguments, official_arguments, num_gpus=num_gpus)
     )
     expected_runtime_step = None if runtime_binding is None else runtime_binding[0]
+    selected_runtime_checkpoint = None if runtime_binding is None else runtime_binding[2]
     _configure_rank_device(num_gpus, os.environ)
     official_arguments, canonical_run, metadata_staging = _rank_metadata_staging(
         official_arguments, num_gpus=num_gpus, environment=os.environ
@@ -320,10 +395,21 @@ def main(argv: list[str] | None = None) -> None:
             return None
         trainer.add_callback(StopAtOptimizerStep(stop_step))
         actual_step = 0
-        if kwargs.get("resume_from_checkpoint") is True:
+        if selected_runtime_checkpoint is not None:
+            # The selected path was validated before any trainer code ran.
+            # Preserve it as a path: the official Trainer accepts this exact
+            # directory, while a boolean would re-discover unrelated bytes.
+            kwargs["resume_from_checkpoint"] = str(selected_runtime_checkpoint)
+            actual_step = _checkpoint_step(selected_runtime_checkpoint, num_gpus=num_gpus)
+        elif kwargs.get("resume_from_checkpoint") is True:
             actual = _resume_step(trainer.args.output_dir, num_gpus=num_gpus)
-            kwargs["resume_from_checkpoint"] = actual is not None
-            actual_step = 0 if actual is None else actual
+            if expected_runtime_step is None:
+                kwargs["resume_from_checkpoint"] = actual is not None
+                actual_step = 0 if actual is None else actual
+            else:
+                # Runtime parent starts are never allowed to pick an
+                # incidental canonical checkpoint behind the controller.
+                kwargs["resume_from_checkpoint"] = False
         if expected_runtime_step is not None:
             if actual_step != expected_runtime_step:
                 raise ValueError("runtime checkpoint step does not match authenticated runtime resume binding")
@@ -344,7 +430,7 @@ def main(argv: list[str] | None = None) -> None:
         else:
             separator = runtime_arguments.index("--")
             assert runtime_binding is not None
-            step, global_batch = runtime_binding
+            step, global_batch, _selected_checkpoint = runtime_binding
             guarded_arguments = [
                 *runtime_arguments[:separator],
                 "--resume-sample-offset", str(step * global_batch),

@@ -234,6 +234,35 @@ def _write_or_verify_identity(config: FineTuneLaunchConfig) -> None:
 Runner = Callable[..., subprocess.CompletedProcess[object]]
 
 
+def _symlink_free_resume_path(*, checkpoint: Path, output_root: Path, experiment_name: str) -> Path:
+    """Accept only the controller-selected canonical or private staged path."""
+
+    canonical_run = output_root / experiment_name
+    staging_root = checkpoint.parent.parent
+    permitted_staging = (
+        staging_root.parent == output_root
+        and staging_root.name.startswith(".runtime-hf-resume-")
+        and checkpoint.parent.name == experiment_name
+    )
+    if (
+        not output_root.is_absolute() or not checkpoint.is_absolute()
+        or checkpoint.is_symlink() or not checkpoint.is_dir()
+        or (checkpoint.parent != canonical_run and not permitted_staging)
+    ):
+        raise ValueError("continuous resume checkpoint must be a verified checkpoint beneath the experiment output")
+    try:
+        relative = checkpoint.relative_to(output_root)
+    except ValueError:
+        raise ValueError("continuous resume checkpoint must be beneath the experiment output") from None
+    current = output_root
+    for part in (".", *relative.parts):
+        if current.is_symlink():
+            raise ValueError("continuous resume checkpoint has a symlinked output ancestor")
+        if part != ".":
+            current /= part
+    return checkpoint
+
+
 def launch_finetune(
     config: FineTuneLaunchConfig,
     *,
@@ -280,8 +309,14 @@ def launch_continuous_finetune(
         raise ValueError("continuous corrective training requires one GPU")
     if config.global_batch_size != 64 or config.physical_batch_size != 64:
         raise ValueError("first continuous corrective run requires global batch 64")
-    if config.max_steps != 2_000 or config.save_steps != 1_000:
-        raise ValueError("continuous corrective training requires 1000/2000 checkpoints")
+    if config.max_steps != 2_000 or config.save_steps != 500:
+        raise ValueError("continuous corrective training requires 500-step official saves through 2000")
+    checkpoint = None
+    if resume_checkpoint is not None:
+        checkpoint = _symlink_free_resume_path(
+            checkpoint=Path(resume_checkpoint), output_root=Path(config.output_dir),
+            experiment_name=config.experiment_name,
+        )
     launch = build_launch(
         config,
         visible_devices=visible_devices,
@@ -290,11 +325,7 @@ def launch_continuous_finetune(
     )
     _write_or_verify_identity(config)
     command = launch.command
-    if resume_checkpoint is not None:
-        checkpoint = Path(resume_checkpoint)
-        expected_root = Path(config.output_dir) / config.experiment_name
-        if checkpoint.is_symlink() or not checkpoint.is_dir() or expected_root not in checkpoint.parents:
-            raise ValueError("continuous resume checkpoint must be a verified checkpoint beneath the experiment output")
+    if checkpoint is not None:
         command = (*command, "--resume-from-checkpoint", str(checkpoint))
     # Runtime mixtures must enter the chunk wrapper even on one GPU: it is the
     # only place that derives and resets the deterministic cursor from the

@@ -16,12 +16,13 @@ from typing import Callable, Mapping, Protocol
 
 from lehome_train.checkpoints import CheckpointDescriptor, load_checkpoint_descriptor
 from lehome_train.constants import DEFAULT_MODEL_REPO
+from lehome_train.groot.local_recovery import HF_RECOVERY_STEPS
 from lehome_train.io import canonical_json_bytes, canonical_json_sha256, sha256_file
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
-_STEPS = (1000, 2000)
+_STEPS = HF_RECOVERY_STEPS
 # A transport outage says nothing about the paid lease.  Only the lifecycle
 # runner's repeated fresh Vast readbacks may classify an interruption.
 _PROVIDER_LOSS_KINDS = {"instance_absent", "preempted"}

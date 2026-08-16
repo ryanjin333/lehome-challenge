@@ -684,7 +684,7 @@ def pilot_from_request(path: str | Path) -> dict[str, Any]:
         or type(arguments.get("mounts_descriptor")) is not str
         or type(arguments.get("sample_count")) is not int
         or arguments["sample_count"] < 100
-        or arguments.get("worker_counts") != [0, 4, 8, 16, 24]
+        or arguments.get("worker_counts") != [0, 4, 8, 12, 16]
         or type(timeout) not in (int, float) or not math.isfinite(float(timeout)) or not 1 <= float(timeout) <= 1800
         or not isinstance(arguments.get("authenticated_evidence"), dict)
     ):
@@ -747,9 +747,9 @@ def pilot_from_request(path: str | Path) -> dict[str, Any]:
             "host_cpu_seconds": usage_self.ru_utime + usage_self.ru_stime + usage_children.ru_utime + usage_children.ru_stime,
             "host_max_rss_mib": rss_mib,
         }
-    canonical_complete = all(timings[str(workers)]["decoded_samples"] == arguments["sample_count"] for workers in [0, 4, 8, 16, 24])
+    canonical_complete = all(timings[str(workers)]["decoded_samples"] == arguments["sample_count"] for workers in [0, 4, 8, 12, 16])
     timing_rows = [
         {"worker_count": workers, **{key: timings[str(workers)][key] for key in ("decoded_samples", "seconds", "samples_per_second", "host_cpu_seconds", "host_max_rss_mib", "latency_seconds_p50", "latency_seconds_p95")}}
-        for workers in [0, 4, 8, 16, 24]
+        for workers in [0, 4, 8, 12, 16]
     ]
-    return {"schema_version": 4, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "gpu_initialized": torch.cuda.is_initialized(), "processor_contract": "pinned_processor_integration_required", "representative": {"bc_window_id": bc.window_id, "rollout_window_id": rollout.window_id, "three_cameras": True, "action_horizon": ACTION_HORIZON}, "sample_count_per_worker": arguments["sample_count"], "worker_counts": worker_counts, "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": timings, "timing_rows": timing_rows, "authenticated_evidence": arguments["authenticated_evidence"], "cache_cap": loader.cache_cap, "native_x86_required": True, "timeout_seconds": float(timeout), "canonical_completion": canonical_complete}
+    return {"schema_version": 4, "kind": "runtime_mixture_loader_pilot", "model_loaded": False, "gpu_initialized": torch.cuda.is_initialized(), "processor_contract": "pinned_processor_integration_required", "representative": {"bc_window_id": bc.window_id, "rollout_window_id": rollout.window_id, "three_cameras": True, "action_horizon": ACTION_HORIZON}, "sample_count_per_worker": arguments["sample_count"], "worker_counts": worker_counts, "canonical_worker_counts": [0, 4, 8, 12, 16], "loader_throughput": timings, "timing_rows": timing_rows, "authenticated_evidence": arguments["authenticated_evidence"], "cache_cap": loader.cache_cap, "native_x86_required": True, "timeout_seconds": float(timeout), "canonical_completion": canonical_complete}

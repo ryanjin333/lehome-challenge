@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+
+import pytest
 
 import lehome_train.groot.chunk_launch as chunk_launch
 from lehome_train.groot.chunk_launch import StopAtOptimizerStep, _resume_value
@@ -284,3 +287,91 @@ def test_runtime_chunk_authenticates_checkpoint_step_before_resetting_dataset_se
     chunk_launch.main(["--stop-after-step", "11", "--", *wrapper])
 
     assert seen == ["train"]
+
+
+def test_runtime_checkpoint_binding_rejects_a_resume_path_outside_selected_safe_roots(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "untrusted" / "run" / "checkpoint-1000"
+    outside.mkdir(parents=True)
+    (outside / "trainer_state.json").write_text('{"global_step":1000}', encoding="utf-8")
+    official = [
+        "--output-dir", str(tmp_path / "output"), "--experiment-name", "run",
+        "--num-gpus", "1", "--global-batch-size", "64",
+        "--resume-from-checkpoint", str(outside),
+    ]
+
+    with pytest.raises(ValueError, match="authenticated runtime resume checkpoint"):
+        chunk_launch._runtime_checkpoint_binding(["--"], official, num_gpus=1)
+
+
+@pytest.mark.parametrize("kind", ("canonical", "staging", "output"))
+def test_runtime_checkpoint_binding_rejects_symlinked_resume_ancestry(
+    tmp_path: Path, kind: str,
+) -> None:
+    output = tmp_path / "output"
+    if kind == "output":
+        external_output = tmp_path / "external-output"
+        checkpoint = external_output / "run" / "checkpoint-1000"
+        checkpoint.mkdir(parents=True)
+        os.symlink(external_output, output, target_is_directory=True)
+        checkpoint = output / "run" / "checkpoint-1000"
+    elif kind == "canonical":
+        output.mkdir()
+        external_run = tmp_path / "external-run"
+        checkpoint = external_run / "checkpoint-1000"
+        checkpoint.mkdir(parents=True)
+        os.symlink(external_run, output / "run", target_is_directory=True)
+        checkpoint = output / "run" / "checkpoint-1000"
+    else:
+        output.mkdir()
+        external_stage = tmp_path / "external-stage"
+        checkpoint = external_stage / "run" / "checkpoint-1000"
+        checkpoint.mkdir(parents=True)
+        os.symlink(
+            external_stage, output / ".runtime-hf-resume-1000-deadbeefdeadbeef",
+            target_is_directory=True,
+        )
+        checkpoint = output / ".runtime-hf-resume-1000-deadbeefdeadbeef" / "run" / "checkpoint-1000"
+    (checkpoint / "trainer_state.json").write_text('{"global_step":1000}', encoding="utf-8")
+    official = [
+        "--output-dir", str(output), "--experiment-name", "run",
+        "--num-gpus", "1", "--global-batch-size", "64",
+        "--resume-from-checkpoint", str(checkpoint),
+    ]
+
+    with pytest.raises(ValueError, match="symlink"):
+        chunk_launch._runtime_checkpoint_binding(["--"], official, num_gpus=1)
+
+
+@pytest.mark.parametrize("experiment", (".", ".."))
+def test_runtime_checkpoint_binding_rejects_non_component_experiment_direct_bypass(
+    tmp_path: Path, experiment: str,
+) -> None:
+    output = tmp_path / "output"
+    checkpoint = output / "checkpoint-1000"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "trainer_state.json").write_text('{"global_step":1000}', encoding="utf-8")
+    official = [
+        "--output-dir", str(output), "--experiment-name", experiment,
+        "--num-gpus", "1", "--global-batch-size", "64",
+        "--resume-from-checkpoint", str(checkpoint),
+    ]
+
+    with pytest.raises(ValueError, match="unsafe checkpoint binding"):
+        chunk_launch._runtime_checkpoint_binding(["--"], official, num_gpus=1)
+
+
+def test_runtime_checkpoint_binding_rejects_dotdot_output_direct_bypass(tmp_path: Path) -> None:
+    output = tmp_path / "output" / ".." / "external"
+    checkpoint = tmp_path / "external" / "run" / "checkpoint-1000"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "trainer_state.json").write_text('{"global_step":1000}', encoding="utf-8")
+    official = [
+        "--output-dir", str(output), "--experiment-name", "run",
+        "--num-gpus", "1", "--global-batch-size", "64",
+        "--resume-from-checkpoint", str(checkpoint),
+    ]
+
+    with pytest.raises(ValueError, match="unsafe checkpoint binding"):
+        chunk_launch._runtime_checkpoint_binding(["--"], official, num_gpus=1)

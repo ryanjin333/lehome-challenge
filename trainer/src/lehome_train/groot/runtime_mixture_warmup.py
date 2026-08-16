@@ -17,7 +17,7 @@ from typing import Protocol
 from lehome_train.io import canonical_json_sha256, sha256_file
 
 
-WORKER_COUNTS = (0, 4, 8, 16, 24)
+WORKER_COUNTS = (0, 4, 8, 12, 16)
 BURN_IN_STEPS = 10
 MEASURED_STEPS = 50
 PHYSICAL_BATCH_SIZE = 64
@@ -25,6 +25,10 @@ ACTION_HORIZON = 16
 MAX_LOADER_WAIT_FRACTION = 0.10
 MIN_GPU_BUSY_FRACTION = 0.70
 MIN_GPU_UTILIZATION_PERCENT = 70.0
+GIBIBYTE = 1024 ** 3
+MIN_TOTAL_VRAM_BYTES = 90 * GIBIBYTE
+MIN_FREE_VRAM_BYTES = 4 * GIBIBYTE
+MIN_FREE_VRAM_FRACTION = 0.05
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 
@@ -36,12 +40,26 @@ class RuntimeState:
     torch_cuda_available: bool
     torch_cuda_initialized: bool
     model_loaded: bool
+    hostname: str
+    host_architecture: str
+    torch_version: str
+    cuda_version: str
+    gpu_device_name: str
+    gpu_uuid: str
+    total_vram_bytes: int
 
-    def to_dict(self) -> dict[str, bool]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "torch_cuda_available": self.torch_cuda_available,
             "torch_cuda_initialized": self.torch_cuda_initialized,
             "model_loaded": self.model_loaded,
+            "hostname": self.hostname,
+            "host_architecture": self.host_architecture,
+            "torch_version": self.torch_version,
+            "cuda_version": self.cuda_version,
+            "gpu_device_name": self.gpu_device_name,
+            "gpu_uuid": self.gpu_uuid,
+            "total_vram_bytes": self.total_vram_bytes,
         }
 
 
@@ -57,6 +75,17 @@ class GpuWarmupMeasurement:
     gpu_utilization_percent: float
     oom: bool
     error: str | None
+    observed_batch_sizes: tuple[int, ...]
+    loss_min: float | None
+    loss_max: float | None
+    loss_final: float | None
+    peak_memory_allocated_bytes: int
+    peak_memory_reserved_bytes: int
+    minimum_free_vram_bytes: int
+    samples_per_second: float
+    step_latency_p50_seconds: float | None
+    step_latency_p95_seconds: float | None
+    materialization_proof: Mapping[str, object] | None
 
 
 class GpuWarmupMetricsAdapter(Protocol):
@@ -87,23 +116,19 @@ class TorchRuntimeWarmupMetricsAdapter:
         *,
         model_loaded: Callable[[], bool],
         measure_live: Callable[..., GpuWarmupMeasurement],
+        runtime_state_live: Callable[[], RuntimeState],
     ) -> None:
         self._model_loaded = model_loaded
         self._measure_live = measure_live
+        self._runtime_state_live = runtime_state_live
 
     def runtime_state(self) -> RuntimeState:
-        try:
-            import torch
-        except ImportError as error:
-            raise RuntimeError("GPU warm-up requires the pinned PyTorch runtime") from error
-        loaded = self._model_loaded()
-        if type(loaded) is not bool:
-            raise TypeError("GPU warm-up model_loaded probe must return bool")
-        return RuntimeState(
-            torch_cuda_available=torch.cuda.is_available(),
-            torch_cuda_initialized=torch.cuda.is_initialized(),
-            model_loaded=loaded,
-        )
+        result = self._runtime_state_live()
+        if not isinstance(result, RuntimeState):
+            raise TypeError("GPU warm-up live runtime-state probe returned an invalid receipt")
+        if result.model_loaded != self._model_loaded():
+            raise RuntimeError("GPU warm-up model-loaded probe drifted during runtime-state collection")
+        return result
 
     def measure(
         self, *, worker_count: int, burn_in_steps: int, measured_steps: int
@@ -140,6 +165,12 @@ def _finite(value: object, label: str, *, minimum: float = 0.0) -> float:
     if type(value) not in (int, float) or not math.isfinite(float(value)) or float(value) < minimum:
         raise ValueError(f"{label} must be a finite number at least {minimum}")
     return float(value)
+
+
+def _integer(value: object, label: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{label} must be an integer at least {minimum}")
+    return value
 
 
 def validate_cpu_pilot(cpu_pilot: Mapping[str, object]) -> str:
@@ -194,14 +225,14 @@ def validate_warmup_binding(binding: Mapping[str, object]) -> dict[str, object]:
     _exact(binding, required, "GPU warm-up binding")
     mixture = _exact(
         binding["mixture"],
-        {"repository", "revision", "mixture_id", "manifest_sha256", "window_index_sha256", "normalization_sha256", "source_revisions"},
+        {"repository", "revision", "mixture_id", "manifest_sha256", "window_index_sha256", "normalization_sha256", "experiment_manifest_sha256", "source_revisions"},
         "GPU warm-up mixture binding",
     )
     if type(mixture["repository"]) is not str or not mixture["repository"]:
         raise ValueError("GPU warm-up mixture repository is invalid")
     for name in ("revision",):
         _revision(mixture[name], f"GPU warm-up mixture {name}")
-    for name in ("mixture_id", "manifest_sha256", "window_index_sha256", "normalization_sha256"):
+    for name in ("mixture_id", "manifest_sha256", "window_index_sha256", "normalization_sha256", "experiment_manifest_sha256"):
         _sha(mixture[name], f"GPU warm-up mixture {name}")
     sources = mixture["source_revisions"]
     if not isinstance(sources, Mapping) or not sources or not all(
@@ -222,7 +253,12 @@ def validate_warmup_binding(binding: Mapping[str, object]) -> dict[str, object]:
         raise ValueError("GPU warm-up parent checkpoint identity is invalid")
     _revision(parent["revision"], "GPU warm-up parent checkpoint revision")
     _sha(parent["artifact_sha256"], "GPU warm-up parent checkpoint hash")
-    if binding["physical_batch_size"] != PHYSICAL_BATCH_SIZE or binding["action_horizon"] != ACTION_HORIZON:
+    if (
+        type(binding["physical_batch_size"]) is not int
+        or type(binding["action_horizon"]) is not int
+        or binding["physical_batch_size"] != PHYSICAL_BATCH_SIZE
+        or binding["action_horizon"] != ACTION_HORIZON
+    ):
         raise ValueError("GPU warm-up binding must use batch 64 and horizon 16")
     return {key: dict(value) if isinstance(value, Mapping) else value for key, value in binding.items()}
 
@@ -250,6 +286,8 @@ def bind_warmup_to_runtime_artifacts(
     normalization = Path(normalization_path)
     mounts = Path(mounts_descriptor_path)
     contract = load_runtime_contract(manifest, mounts)
+    if contract.manifest.experiment_manifest_sha256 is None:
+        raise ValueError("legacy runtime mixture is not admitted to this campaign")
     if (
         sha256_file(index) != contract.manifest.window_index_sha256
         or sha256_file(normalization) != contract.manifest.normalization_sha256
@@ -269,6 +307,7 @@ def bind_warmup_to_runtime_artifacts(
         "manifest_sha256": sha256_file(manifest),
         "window_index_sha256": contract.manifest.window_index_sha256,
         "normalization_sha256": contract.manifest.normalization_sha256,
+        "experiment_manifest_sha256": contract.manifest.experiment_manifest_sha256,
         "source_revisions": {
             source.source_id: source.publication["revision"]
             for source in contract.manifest.sources
@@ -279,8 +318,45 @@ def bind_warmup_to_runtime_artifacts(
     return checked
 
 
+def _materialization_proof(value: Mapping[str, object] | None) -> dict[str, object]:
+    """Require h16/three-camera BC and rollout evidence from the live session."""
+
+    if not isinstance(value, Mapping) or set(value) != {"bc", "rollout"}:
+        raise ValueError("GPU warm-up lacks authenticated materialization proof")
+    checked: dict[str, object] = {}
+    for source_type in ("bc", "rollout"):
+        item = value[source_type]
+        if not isinstance(item, Mapping) or set(item) != {"source_type", "window_id", "action_horizon", "camera_count"}:
+            raise ValueError("GPU warm-up materialization proof is invalid")
+        if (
+            item["source_type"] != source_type
+            or type(item["window_id"]) is not str or not item["window_id"]
+            or type(item["action_horizon"]) is not int or item["action_horizon"] != ACTION_HORIZON
+            or type(item["camera_count"]) is not int or item["camera_count"] != 3
+        ):
+            raise ValueError("GPU warm-up materialization proof does not prove BC/rollout h16 cameras")
+        checked[source_type] = dict(item)
+    return checked
+
+
+def _runtime_state(value: Mapping[str, object]) -> dict[str, object]:
+    fields = {
+        "torch_cuda_available", "torch_cuda_initialized", "model_loaded", "hostname",
+        "host_architecture", "torch_version", "cuda_version", "gpu_device_name",
+        "gpu_uuid", "total_vram_bytes",
+    }
+    state = _exact(value, fields, "GPU warm-up runtime state")
+    if any(type(state[name]) is not bool for name in ("torch_cuda_available", "torch_cuda_initialized", "model_loaded")) or not all(state[name] for name in ("torch_cuda_available", "torch_cuda_initialized", "model_loaded")):
+        raise ValueError("GPU warm-up runtime state does not prove CUDA and model loading")
+    if any(type(state[name]) is not str or not state[name].strip() for name in ("hostname", "host_architecture", "torch_version", "cuda_version", "gpu_device_name", "gpu_uuid")):
+        raise ValueError("GPU warm-up runtime provenance is incomplete")
+    if type(state["total_vram_bytes"]) is not int or state["total_vram_bytes"] < MIN_TOTAL_VRAM_BYTES:
+        raise ValueError("GPU warm-up runtime does not have the required 90 GiB VRAM")
+    return dict(state)
+
+
 def _candidate(
-    *, worker_count: int, measurement: GpuWarmupMeasurement
+    *, worker_count: int, measurement: GpuWarmupMeasurement, total_vram_bytes: int
 ) -> dict[str, object]:
     if type(measurement.decoded_samples) is not int or measurement.decoded_samples < 0 or type(measurement.measured_steps) is not int or measurement.measured_steps < 0 or type(measurement.oom) is not bool or (measurement.error is not None and (type(measurement.error) is not str or not measurement.error)):
         raise ValueError("GPU warm-up adapter returned an invalid measurement")
@@ -288,6 +364,36 @@ def _candidate(
     steps = _finite(measurement.step_seconds, "GPU step seconds")
     busy = _finite(measurement.gpu_busy_seconds, "GPU busy seconds")
     utilization = _finite(measurement.gpu_utilization_percent, "GPU utilization percent")
+    samples_per_second = _finite(measurement.samples_per_second, "GPU warm-up samples per second")
+    if samples_per_second <= 0.0 and not measurement.oom and measurement.error is None:
+        raise ValueError("GPU warm-up samples per second must be positive")
+    if type(measurement.peak_memory_allocated_bytes) is not int or measurement.peak_memory_allocated_bytes < 0 or type(measurement.peak_memory_reserved_bytes) is not int or measurement.peak_memory_reserved_bytes < 0 or type(measurement.minimum_free_vram_bytes) is not int or measurement.minimum_free_vram_bytes < 0:
+        raise ValueError("GPU warm-up memory measurement is invalid")
+    if measurement.peak_memory_allocated_bytes > measurement.peak_memory_reserved_bytes:
+        raise ValueError("GPU warm-up allocated peak exceeds reserved peak")
+    batches = list(measurement.observed_batch_sizes)
+    if not all(type(batch) is int and batch > 0 for batch in batches):
+        raise ValueError("GPU warm-up observed batch sizes are invalid")
+    losses = (measurement.loss_min, measurement.loss_max, measurement.loss_final)
+    loss_valid = all(type(loss) in (int, float) and math.isfinite(float(loss)) for loss in losses)
+    if loss_valid and float(measurement.loss_min) > float(measurement.loss_max):
+        raise ValueError("GPU warm-up loss summary is inverted")
+    p50 = None if measurement.step_latency_p50_seconds is None else _finite(measurement.step_latency_p50_seconds, "GPU warm-up p50 step latency")
+    p95 = None if measurement.step_latency_p95_seconds is None else _finite(measurement.step_latency_p95_seconds, "GPU warm-up p95 step latency")
+    if p50 is not None and p95 is not None and p95 < p50:
+        raise ValueError("GPU warm-up p95 step latency is below p50")
+    proof = (
+        None
+        if measurement.oom or measurement.error is not None
+        else _materialization_proof(measurement.materialization_proof)
+    )
+    if not measurement.oom and measurement.error is None and (
+        batches != [PHYSICAL_BATCH_SIZE] * (BURN_IN_STEPS + MEASURED_STEPS)
+        or not loss_valid or p50 is None or p95 is None
+        or measurement.minimum_free_vram_bytes < MIN_FREE_VRAM_BYTES
+        or measurement.minimum_free_vram_bytes / total_vram_bytes < MIN_FREE_VRAM_FRACTION
+    ):
+        raise ValueError("GPU warm-up successful candidate lacks required live admission evidence")
     if busy > steps:
         raise ValueError("GPU busy seconds exceed measured step seconds")
     wait_fraction = loader_wait / steps if steps else None
@@ -297,6 +403,11 @@ def _candidate(
         and measurement.error is None
         and measurement.measured_steps == MEASURED_STEPS
         and measurement.decoded_samples >= PHYSICAL_BATCH_SIZE * (BURN_IN_STEPS + MEASURED_STEPS)
+        and batches == [PHYSICAL_BATCH_SIZE] * (BURN_IN_STEPS + MEASURED_STEPS)
+        and loss_valid
+        and p50 is not None and p95 is not None
+        and measurement.minimum_free_vram_bytes >= MIN_FREE_VRAM_BYTES
+        and measurement.minimum_free_vram_bytes / total_vram_bytes >= MIN_FREE_VRAM_FRACTION
         and wait_fraction is not None
         and busy_fraction is not None
         and wait_fraction <= MAX_LOADER_WAIT_FRACTION
@@ -314,6 +425,17 @@ def _candidate(
         "gpu_busy_seconds": busy,
         "gpu_busy_fraction": busy_fraction,
         "gpu_utilization_percent": utilization,
+        "observed_batch_sizes": batches,
+        "loss_min": measurement.loss_min,
+        "loss_max": measurement.loss_max,
+        "loss_final": measurement.loss_final,
+        "peak_memory_allocated_bytes": measurement.peak_memory_allocated_bytes,
+        "peak_memory_reserved_bytes": measurement.peak_memory_reserved_bytes,
+        "minimum_free_vram_bytes": measurement.minimum_free_vram_bytes,
+        "samples_per_second": samples_per_second,
+        "step_latency_p50_seconds": p50,
+        "step_latency_p95_seconds": p95,
+        "materialization_proof": proof,
         "oom": measurement.oom,
         "error": measurement.error,
         "accepted": accepted,
@@ -328,7 +450,33 @@ def _gate() -> dict[str, object]:
         "max_loader_wait_fraction": MAX_LOADER_WAIT_FRACTION,
         "min_gpu_busy_fraction": MIN_GPU_BUSY_FRACTION,
         "min_gpu_utilization_percent": MIN_GPU_UTILIZATION_PERCENT,
+        "min_total_vram_bytes": MIN_TOTAL_VRAM_BYTES,
+        "min_free_vram_bytes": MIN_FREE_VRAM_BYTES,
+        "min_free_vram_fraction": MIN_FREE_VRAM_FRACTION,
     }
+
+
+def _validate_gate(value: object) -> None:
+    expected = _gate()
+    gate = _exact(value, set(expected), "GPU warm-up receipt gate")
+    workers = gate["worker_counts"]
+    if not isinstance(workers, list) or any(type(worker) is not int for worker in workers):
+        raise ValueError("GPU warm-up receipt worker gate is not integral")
+    for name in ("burn_in_steps", "measured_steps", "min_total_vram_bytes", "min_free_vram_bytes"):
+        _integer(gate[name], f"GPU warm-up receipt gate {name}")
+    if gate != expected:
+        raise ValueError("GPU warm-up receipt gate was caller-modified")
+
+
+def _fastest_admitted_worker(candidates: list[Mapping[str, object]]) -> int | None:
+    """Select highest measured stable throughput; ties use lower worker count."""
+
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda item: (float(item["samples_per_second"]), -int(item["worker_count"])),
+    )["worker_count"]  # type: ignore[return-value]
 
 
 def build_gpu_warmup_receipt(
@@ -340,9 +488,11 @@ def build_gpu_warmup_receipt(
     state = adapter.runtime_state()
     if not isinstance(state, RuntimeState):
         raise TypeError("GPU warm-up adapter must return RuntimeState")
+    _runtime_state(state.to_dict())
     candidates = [
         _candidate(
             worker_count=workers,
+            total_vram_bytes=state.total_vram_bytes,
             measurement=adapter.measure(
                 worker_count=workers,
                 burn_in_steps=BURN_IN_STEPS,
@@ -351,9 +501,9 @@ def build_gpu_warmup_receipt(
         )
         for workers in WORKER_COUNTS
     ]
-    selected = next((item["worker_count"] for item in candidates if item["accepted"]), None)
+    selected = _fastest_admitted_worker([item for item in candidates if item["accepted"]])
     receipt = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "runtime_mixture_gpu_warmup",
         "binding": checked_binding,
         "runtime_state": state.to_dict(),
@@ -413,35 +563,71 @@ def validate_gpu_warmup_receipt(
         "gate", "candidates", "selected_loader_workers",
     }
     _exact(receipt, required, "GPU warm-up receipt")
-    if receipt["schema_version"] != 1 or receipt["kind"] != "runtime_mixture_gpu_warmup":
+    if type(receipt["schema_version"]) is not int or receipt["schema_version"] != 2 or receipt["kind"] != "runtime_mixture_gpu_warmup":
         raise ValueError("GPU warm-up receipt has an incompatible schema")
     checked_binding = validate_warmup_binding(expected_binding)
     receipt_binding = validate_warmup_binding(receipt["binding"] if isinstance(receipt["binding"], Mapping) else {})
     if receipt_binding != checked_binding:
         raise ValueError("GPU warm-up receipt binding does not match this runtime")
-    state = _exact(receipt["runtime_state"], {"torch_cuda_available", "torch_cuda_initialized", "model_loaded"}, "GPU warm-up runtime state")
-    if any(type(state[name]) is not bool for name in state) or not all(state.values()):
-        raise ValueError("GPU warm-up runtime state does not prove CUDA and model loading")
-    if receipt["gate"] != _gate():
-        raise ValueError("GPU warm-up receipt gate was caller-modified")
+    state = _runtime_state(receipt["runtime_state"] if isinstance(receipt["runtime_state"], Mapping) else {})
+    _validate_gate(receipt["gate"])
     rows = receipt["candidates"]
     if not isinstance(rows, list) or len(rows) != len(WORKER_COUNTS):
         raise ValueError("GPU warm-up receipt candidates are incomplete")
-    admitted: list[int] = []
+    admitted: list[Mapping[str, object]] = []
     candidate_fields = {
         "worker_count", "burn_in_steps", "measured_steps", "decoded_samples",
         "loader_wait_seconds", "step_seconds", "loader_wait_fraction",
         "gpu_busy_seconds", "gpu_busy_fraction", "gpu_utilization_percent", "oom",
-        "error", "accepted",
+        "error", "observed_batch_sizes", "loss_min", "loss_max", "loss_final",
+        "peak_memory_allocated_bytes", "peak_memory_reserved_bytes",
+        "minimum_free_vram_bytes", "samples_per_second", "step_latency_p50_seconds",
+        "step_latency_p95_seconds", "materialization_proof", "accepted",
     }
     for workers, row in zip(WORKER_COUNTS, rows, strict=True):
         item = _exact(row, candidate_fields, "GPU warm-up candidate")
-        if item["worker_count"] != workers or item["burn_in_steps"] != BURN_IN_STEPS or type(item["measured_steps"]) is not int or type(item["decoded_samples"]) is not int or item["decoded_samples"] < 0 or type(item["oom"]) is not bool or (item["error"] is not None and (type(item["error"]) is not str or not item["error"])) or type(item["accepted"]) is not bool:
+        if (
+            type(item["worker_count"]) is not int or item["worker_count"] != workers
+            or type(item["burn_in_steps"]) is not int or item["burn_in_steps"] != BURN_IN_STEPS
+            or type(item["measured_steps"]) is not int
+            or type(item["decoded_samples"]) is not int or item["decoded_samples"] < 0
+            or type(item["oom"]) is not bool
+            or (item["error"] is not None and (type(item["error"]) is not str or not item["error"]))
+            or type(item["accepted"]) is not bool
+        ):
             raise ValueError("GPU warm-up candidate identity is invalid")
         wait = _finite(item["loader_wait_seconds"], "GPU warm-up loader wait seconds")
         steps = _finite(item["step_seconds"], "GPU warm-up step seconds")
         busy = _finite(item["gpu_busy_seconds"], "GPU warm-up busy seconds")
         utilization = _finite(item["gpu_utilization_percent"], "GPU warm-up utilization")
+        samples_per_second = _finite(item["samples_per_second"], "GPU warm-up samples per second")
+        if samples_per_second <= 0.0 and not item["oom"] and item["error"] is None:
+            raise ValueError("GPU warm-up samples per second must be positive")
+        if type(item["peak_memory_allocated_bytes"]) is not int or item["peak_memory_allocated_bytes"] < 0 or type(item["peak_memory_reserved_bytes"]) is not int or item["peak_memory_reserved_bytes"] < 0 or item["peak_memory_allocated_bytes"] > item["peak_memory_reserved_bytes"] or type(item["minimum_free_vram_bytes"]) is not int or item["minimum_free_vram_bytes"] < 0:
+            raise ValueError("GPU warm-up candidate memory telemetry is invalid")
+        batches = item["observed_batch_sizes"]
+        if not isinstance(batches, list) or any(type(batch) is not int or batch <= 0 for batch in batches):
+            raise ValueError("GPU warm-up candidate batch observations are invalid")
+        losses = (item["loss_min"], item["loss_max"], item["loss_final"])
+        loss_valid = all(type(loss) in (int, float) and math.isfinite(float(loss)) for loss in losses)
+        if loss_valid and float(item["loss_min"]) > float(item["loss_max"]):
+            raise ValueError("GPU warm-up candidate loss summary is invalid")
+        p50 = None if item["step_latency_p50_seconds"] is None else _finite(item["step_latency_p50_seconds"], "GPU warm-up p50 step latency")
+        p95 = None if item["step_latency_p95_seconds"] is None else _finite(item["step_latency_p95_seconds"], "GPU warm-up p95 step latency")
+        if p50 is not None and p95 is not None and p95 < p50:
+            raise ValueError("GPU warm-up candidate latency summary is invalid")
+        if item["oom"] or item["error"] is not None:
+            if item["materialization_proof"] is not None:
+                raise ValueError("GPU warm-up failed candidate must not claim materialization proof")
+        else:
+            _materialization_proof(item["materialization_proof"] if isinstance(item["materialization_proof"], Mapping) else None)
+        if not item["oom"] and item["error"] is None and (
+            batches != [PHYSICAL_BATCH_SIZE] * (BURN_IN_STEPS + MEASURED_STEPS)
+            or not loss_valid or p50 is None or p95 is None
+            or item["minimum_free_vram_bytes"] < MIN_FREE_VRAM_BYTES
+            or item["minimum_free_vram_bytes"] / state["total_vram_bytes"] < MIN_FREE_VRAM_FRACTION
+        ):
+            raise ValueError("GPU warm-up candidate lacks required live admission evidence")
         if busy > steps:
             raise ValueError("GPU warm-up candidate metric fraction drift")
         if steps == 0:
@@ -456,6 +642,10 @@ def validate_gpu_warmup_receipt(
         accepted = (
             not item["oom"] and item["error"] is None and item["measured_steps"] == MEASURED_STEPS
             and item["decoded_samples"] >= PHYSICAL_BATCH_SIZE * (BURN_IN_STEPS + MEASURED_STEPS)
+            and batches == [PHYSICAL_BATCH_SIZE] * (BURN_IN_STEPS + MEASURED_STEPS) and loss_valid
+            and p50 is not None and p95 is not None
+            and item["minimum_free_vram_bytes"] >= MIN_FREE_VRAM_BYTES
+            and item["minimum_free_vram_bytes"] / state["total_vram_bytes"] >= MIN_FREE_VRAM_FRACTION
             and wait_fraction is not None and busy_fraction is not None
             and wait_fraction <= MAX_LOADER_WAIT_FRACTION and busy_fraction >= MIN_GPU_BUSY_FRACTION
             and utilization >= MIN_GPU_UTILIZATION_PERCENT
@@ -463,7 +653,12 @@ def validate_gpu_warmup_receipt(
         if item["accepted"] is not accepted:
             raise ValueError("GPU warm-up candidate acceptance was tampered")
         if accepted:
-            admitted.append(workers)
-    if not admitted or receipt["selected_loader_workers"] != admitted[0]:
-        raise ValueError("GPU warm-up receipt does not select the lowest admitted worker")
-    return admitted[0]
+            admitted.append(item)
+    selected = _fastest_admitted_worker(admitted)
+    if (
+        type(receipt["selected_loader_workers"]) is not int
+        or selected is None
+        or receipt["selected_loader_workers"] != selected
+    ):
+        raise ValueError("GPU warm-up receipt does not select the fastest admitted worker")
+    return selected

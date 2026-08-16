@@ -168,6 +168,15 @@ class FineTuneLaunchConfig:
             for field_name, field in zip(("runtime_mixture_manifest", "runtime_window_index", "runtime_mounts_descriptor"), runtime_fields, strict=True):
                 if type(field) is not str or not Path(field).is_absolute():
                     raise ValueError(f"{field_name} must be an absolute path")
+            if (
+                self.num_gpus != 1
+                or self.physical_batch_size != 64
+                or self.global_batch_size != 64
+                or self.max_steps != 2000
+                or self.save_steps != 500
+                or self.save_total_limit != 5
+            ):
+                raise ValueError("runtime mixture requires batch64, 2K steps, and local checkpoint cadence 500")
         if type(self.runtime_resume_sample_offset) is not int or self.runtime_resume_sample_offset < 0:
             raise ValueError("runtime_resume_sample_offset must be nonnegative")
         if self.runtime_mixture_manifest is not None and (
@@ -187,10 +196,12 @@ class FineTuneLaunchConfig:
             raise ValueError("tune_llm must be false")
         if self.tune_visual:
             raise ValueError("tune_visual must be false")
-        for field_name in ("max_steps", "save_steps", "dataloader_num_workers", "save_total_limit"):
+        for field_name in ("max_steps", "save_steps", "save_total_limit"):
             value = getattr(self, field_name)
             if not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{field_name} must be positive")
+        if type(self.dataloader_num_workers) is not int or self.dataloader_num_workers < 0:
+            raise ValueError("dataloader_num_workers must be nonnegative")
         for field_name in ("learning_rate", "weight_decay"):
             value = getattr(self, field_name)
             if not isinstance(value, (float, int)) or value <= 0:

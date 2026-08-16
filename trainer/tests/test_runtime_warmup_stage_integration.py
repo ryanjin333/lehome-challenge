@@ -310,6 +310,34 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     monkeypatch.setattr(production, "_ALLOWED_ROOTS", (prepared, output, cache))
     authoring = tmp_path / "authoring"
     manifest, windows, mounts = _contract(authoring)
+    from lehome_train.groot.runtime_mixture import _manifest_digest_binding
+
+    experiment_manifest_sha256 = "f" * 64
+    manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+    experiment_binding = {
+        "experiment_manifest_sha256": experiment_manifest_sha256,
+        "mixture_weights": {"bc": 80, "rollout": 20, "dagger": 0},
+        "source_quotas": {"bc": 51, "rollout": 13, "dagger": 0},
+    }
+    manifest_value.update({"schema_version": 3, "cycle_size": 64, **experiment_binding})
+    manifest_value["sources"][0]["quota"] = 51
+    manifest_value["sources"][1]["quota"] = 13
+    windows_value = json.loads(windows.read_text(encoding="utf-8"))
+    windows_value["manifest_sha256"] = _manifest_digest_binding(manifest_value)
+    _write(windows, windows_value)
+    manifest_value["window_index"].update({
+        "sha256": sha256_file(windows), "byte_size": windows.stat().st_size,
+    })
+    _write(manifest, manifest_value)
+    deployment_value = json.loads((authoring / "release-receipt.json").read_text(encoding="utf-8"))
+    deployment_value.update(experiment_binding)
+    for artifact in deployment_value["artifact_entries"]:
+        target = authoring / artifact["relative_path"]
+        artifact.update({"sha256": sha256_file(target), "byte_size": target.stat().st_size})
+    _write(authoring / "release-receipt.json", deployment_value)
+    mounts_value = json.loads(mounts.read_text(encoding="utf-8"))
+    mounts_value["deployment_receipt_sha256"] = sha256_file(authoring / "release-receipt.json")
+    _write(mounts, mounts_value)
     normalization = manifest.parent / "mixture-normalization.json"
     (prepared / "config" / "modality.py").parent.mkdir(parents=True, exist_ok=True)
     (prepared / "config" / "modality.py").write_text("# fixture\n", encoding="utf-8")
@@ -353,9 +381,9 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     receipts = _campaign_receipts(tmp_path)
     # Bootstrap receives the same authenticated deployment receipt that the
     # real hydrator will consume; it must not pre-create its destination.
-    shutil.copyfile(authoring / "release-receipt.json", receipts["deployment"])
     shutil.copyfile(authoring / "source-publication" / "bc-readback.json", receipts["bc"])
     shutil.copyfile(authoring / "source-publication" / "rollout-readback.json", receipts["rollout"])
+    shutil.copyfile(authoring / "release-receipt.json", receipts["deployment"])
     campaign = LIFECYCLE._runtime_campaign_binding({
         "code_revision": code_revision, "code_bundle_sha256": code_sha256,
         "bc_readback_receipt": str(receipts["bc"]),
@@ -407,7 +435,8 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
             "mixture_id": "d" * 64, "manifest_sha256": sha256_file(manifest),
             "window_index_sha256": sha256_file(windows),
             "normalization_sha256": sha256_file(normalization),
-                "source_revisions": {"organizer": "b" * 40, "rollout": "c" * 40},
+            "experiment_manifest_sha256": experiment_manifest_sha256,
+            "source_revisions": {"organizer": "b" * 40, "rollout": "c" * 40},
         },
         "deployment": {
             "oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
@@ -430,7 +459,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "dataset_path": str(prepared / "runtime"), "dataset_revision": "6" * 40,
         "modality_config_path": str(prepared / "config" / "modality.py"), "output_dir": str(output / "run"),
         "experiment_name": "runtime-mixture-70-30", "physical_batch_size": 64,
-        "global_batch_size": 64, "num_gpus": 1, "max_steps": 2000, "save_steps": 1000,
+        "global_batch_size": 64, "num_gpus": 1, "max_steps": 2000, "save_steps": 500,
         "warmup_ratio": 0.05, "dataloader_num_workers": 4,
         "training_action_horizon": 16, "model_action_chunk_capacity": 40,
         "parent_checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"],
@@ -495,6 +524,9 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "organizer": "/prepared/config/bc-readback.json",
         "rollout": "/prepared/config/rollout-readback.json",
     }
+    # The lifecycle identity receipt remains the legacy campaign envelope,
+    # while the actual hydrator consumes the schema-v3 artifact binding.
+    shutil.copyfile(authoring / "release-receipt.json", prepared / "config" / "deployment-receipt.json")
 
     # Exercise the real hydrator against its normal immutable deployment tree,
     # with a local in-memory Hub only at the transport boundary.
@@ -541,6 +573,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40,
         "mixture_id": "d" * 64, "manifest_sha256": sha256_file(manifest),
         "window_index_sha256": sha256_file(windows), "normalization_sha256": sha256_file(normalization),
+        "experiment_manifest_sha256": experiment_manifest_sha256,
         "source_revisions": {"organizer": "b" * 40, "rollout": "c" * 40},
     }
     report = LIFECYCLE.runtime_mixture_warmup_stage(
@@ -590,6 +623,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
         "mixture_id": "d" * 64, "manifest_sha256": sha256_file(manifest),
         "window_index_sha256": sha256_file(windows),
         "normalization_sha256": sha256_file(normalization),
+        "experiment_manifest_sha256": experiment_manifest_sha256,
         "source_revisions": {"organizer": "b" * 40, "rollout": "c" * 40},
     }
     assert len(loaded_pipelines) == 1

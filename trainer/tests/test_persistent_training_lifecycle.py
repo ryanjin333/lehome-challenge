@@ -1325,7 +1325,7 @@ def test_runtime_mixture_train_uses_only_authenticated_receipts_and_never_legacy
     receipts = {
         "bc": {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True},
         "rollout": {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "b" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True},
-            "deployment": {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "e" * 64, "artifact_entries": _runtime_deployment_entries(), "fresh_readback_verified": True, "tree_listing_verified": True},
+            "deployment": {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "e" * 64, "artifact_entries": _runtime_deployment_entries(), "fresh_readback_verified": True, "tree_listing_verified": True, "experiment_manifest_sha256": "0" * 64, "mixture_weights": {"bc": 70, "rollout": 30, "dagger": 0}, "source_quotas": {"bc": 45, "rollout": 19, "dagger": 0}},
     }
     paths = {}
     for name, value in receipts.items():
@@ -1335,7 +1335,7 @@ def test_runtime_mixture_train_uses_only_authenticated_receipts_and_never_legacy
         calls.append(command); return "{}"
     instance = {"schema_version": 1, "kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 44, "host": "native-x86", "port": 22, "platform_arch": "x86_64", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "offer_evidence_sha256": "a" * 64, "provider_response_sha256": "b" * 64, "capability_sha256": "c" * 64}
     output = tmp_path / "execution.json"
-    binding = {"mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "c" * 64}, "code": {"repository_revision": "1" * 40, "bundle_sha256": "2" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
+    binding = {"mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "experiment_manifest_sha256": "0" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "c" * 64}, "code": {"repository_revision": "1" * 40, "bundle_sha256": "2" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
     from lehome_train.groot.runtime_mixture_warmup import (
         GpuWarmupMeasurement,
         RuntimeState,
@@ -1344,7 +1344,10 @@ def test_runtime_mixture_train_uses_only_authenticated_receipts_and_never_legacy
 
     class DirectGpuAdapter:
         def runtime_state(self) -> RuntimeState:
-            return RuntimeState(True, True, True)
+            return RuntimeState(
+                True, True, True, "gpu-host", "x86_64", "2.7.0", "12.8",
+                "NVIDIA RTX PRO 6000", "GPU-fixture", 96 * 1024**3,
+            )
 
         def measure(self, *, worker_count: int, burn_in_steps: int, measured_steps: int) -> GpuWarmupMeasurement:
             viable = worker_count == 4
@@ -1354,10 +1357,24 @@ def test_runtime_mixture_train_uses_only_authenticated_receipts_and_never_legacy
                 loader_wait_seconds=5.0 if viable else 20.0,
                 step_seconds=100.0,
                 gpu_busy_seconds=80.0 if viable else 50.0,
-                gpu_utilization_percent=80.0 if viable else 50.0,
-                oom=False,
-                error=None,
-            )
+                    gpu_utilization_percent=80.0 if viable else 50.0,
+                    oom=False,
+                    error=None,
+                    observed_batch_sizes=(64,) * 60,
+                    loss_min=.1,
+                    loss_max=.3,
+                    loss_final=.2,
+                    peak_memory_allocated_bytes=32 * 1024**3,
+                    peak_memory_reserved_bytes=40 * 1024**3,
+                    minimum_free_vram_bytes=20 * 1024**3,
+                    samples_per_second=64.0,
+                    step_latency_p50_seconds=1.0,
+                    step_latency_p95_seconds=1.5,
+                    materialization_proof={
+                        "bc": {"source_type": "bc", "window_id": "bc-1", "action_horizon": 16, "camera_count": 3},
+                        "rollout": {"source_type": "rollout", "window_id": "rollout-1", "action_horizon": 16, "camera_count": 3},
+                    },
+                )
 
     measured_warmup = build_gpu_warmup_receipt(binding=binding, adapter=DirectGpuAdapter())
     warmup = tmp_path / "warmup.json"
@@ -1393,7 +1410,7 @@ def test_runtime_final_stage_rejects_a_warmup_from_another_gpu_instance(
         "provider_response_sha256": "a" * 64, "capability_sha256": "b" * 64,
     }
     binding = {
-        "mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "e" * 64, "window_index_sha256": "f" * 64, "normalization_sha256": "0" * 64, "source_revisions": {"organizer": "1" * 40, "rollout": "2" * 40}},
+            "mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "e" * 64, "window_index_sha256": "f" * 64, "normalization_sha256": "0" * 64, "experiment_manifest_sha256": "9" * 64, "source_revisions": {"organizer": "1" * 40, "rollout": "2" * 40}},
         "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "b" * 64},
         "code": {"repository_revision": "3" * 40, "bundle_sha256": "4" * 64, "isaac_groot_revision": "5" * 40},
         "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]},
@@ -1412,7 +1429,7 @@ def test_runtime_final_stage_rejects_a_warmup_from_another_gpu_instance(
     for name, payload in {
         "bc": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "1" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True},
         "rollout": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "2" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True},
-            "deployment": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "6" * 64, "artifact_entries": _runtime_deployment_entries(), "fresh_readback_verified": True, "tree_listing_verified": True},
+                "deployment": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "6" * 64, "artifact_entries": _runtime_deployment_entries(), "fresh_readback_verified": True, "tree_listing_verified": True, "experiment_manifest_sha256": "9" * 64, "mixture_weights": {"bc": 70, "rollout": 30, "dagger": 0}, "source_quotas": {"bc": 45, "rollout": 19, "dagger": 0}},
     }.items():
         path = tmp_path / f"{name}.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -1703,7 +1720,15 @@ def test_direct_gpu_datacenter_policy_drift_stops_before_provider_create(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, ...]] = []
-    monkeypatch.setattr(LIFECYCLE, "_runtime_campaign_binding", lambda _request: {})
+    monkeypatch.setattr(LIFECYCLE, "_runtime_campaign_binding", lambda _request: {"deployment": {
+        "repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40,
+        "remote_prefix": "mixtures/" + "b" * 64, "fresh_readback_verified": True,
+        "tree_listing_verified": True, "mixture_id": "b" * 64,
+        "pending_receipt_sha256": "c" * 64, "artifact_entries": [],
+        "experiment_manifest_sha256": "d" * 64,
+        "mixture_weights": {"bc": 70, "rollout": 30, "dagger": 0},
+        "source_quotas": {"bc": 45, "rollout": 19, "dagger": 0},
+    }})
     monkeypatch.setattr(LIFECYCLE, "_runtime_parent_checkpoint", lambda _request: None)
     monkeypatch.setattr(LIFECYCLE, "_require_vast_ssh_identity", lambda: None)
     monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_hydration_request_sha256", lambda _request: "a" * 64)
@@ -2943,6 +2968,33 @@ def test_runtime_rent_rejects_absent_or_invalid_preflight_evidence_before_provid
     assert calls == []
 
 
+def test_direct_gpu_paid_preflight_rejects_legacy_deployment_before_provider_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json")) | {
+        "kind": "runtime_mixture_gpu_warmup_offer", "search_mode": "on_demand",
+        "requested_storage_gb": 300, "account_hourly_total_usd": 1.0,
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "parent_checkpoint": str(tmp_path / "missing-parent.tar"),
+        "code_bundle": str(tmp_path / "missing.bundle"),
+        "code_bundle_sha256_file": str(tmp_path / "missing.bundle.sha256"),
+        "bootstrap_capability_receipt": str(tmp_path / "bootstrap.json"),
+        "datacenter_policy": LIFECYCLE.RUNTIME_GPU_DATACENTER_POLICY,
+    }
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_hydration_request_sha256", lambda _request: "a" * 64)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_parent_checkpoint", lambda _request: None)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_parent_hydration", lambda: {})
+    monkeypatch.setattr(LIFECYCLE, "_require_vast_ssh_identity", lambda: None)
+    monkeypatch.setattr(LIFECYCLE, "_verify_reviewed_code_bundle", lambda *_args: evidence["code_bundle_sha256"])
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_rent_claim_path", lambda **_kwargs: tmp_path / "claim.json")
+
+    with pytest.raises(ValueError, match="schema-v3 manifest-bound"):
+        LIFECYCLE.rent_runtime_gpu_warmup(
+            evidence=evidence, runner=lambda command: calls.append(command) or "",
+        )
+
+    assert calls == []
+
+
 def test_direct_gpu_rent_rejects_stale_hydration_source_ids_before_any_provider_call(
     tmp_path: Path,
 ) -> None:
@@ -3626,7 +3678,7 @@ def _runtime_pilot_request_files(tmp_path: Path) -> tuple[dict[str, object], dic
     receipts = {
         "bc": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "a" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True},
         "rollout": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "b" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True},
-        "deployment": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "e" * 64, "artifact_entries": _runtime_deployment_entries(), "fresh_readback_verified": True, "tree_listing_verified": True},
+        "deployment": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "e" * 64, "artifact_entries": _runtime_deployment_entries(), "fresh_readback_verified": True, "tree_listing_verified": True, "experiment_manifest_sha256": "0" * 64, "mixture_weights": {"bc": 70, "rollout": 30, "dagger": 0}, "source_quotas": {"bc": 45, "rollout": 19, "dagger": 0}},
     }
     paths: dict[str, str] = {}
     for name, receipt in receipts.items():
@@ -3682,9 +3734,9 @@ def _schema4_pilot(*, instance_id: int, provider_sha: str, code_revision: str, c
         "schema_version": 4, "kind": "runtime_mixture_loader_pilot", "model_loaded": False,
         "gpu_initialized": False, "processor_contract": "pinned_processor_integration_required",
         "representative": {"three_cameras": True, "action_horizon": 16},
-        "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24],
-        "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {},
-        "timing_rows": [{"worker_count": count, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 100.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for count in [0, 4, 8, 16, 24]],
+        "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 12, 16],
+        "canonical_worker_counts": [0, 4, 8, 12, 16], "loader_throughput": {},
+        "timing_rows": [{"worker_count": count, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 100.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for count in [0, 4, 8, 12, 16]],
         "authenticated_evidence": {"provider_instance_id": instance_id, "provider_response_sha256": provider_sha, "platform_arch": "x86_64", "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2], "code_revision": code_revision, "code_bundle_sha256": code_sha, "bc_revision": bc_revision, "rollout_revision": rollout_revision, "deployment_revision": deployment_revision},
         "cache_cap": 1, "native_x86_required": True, "timeout_seconds": 60.0, "canonical_completion": True,
     }
@@ -4486,9 +4538,9 @@ def test_runtime_cpu_pilot_executes_only_loader_cli_and_persists_bound_lifecycle
         "schema_version": 4, "kind": "runtime_mixture_loader_pilot", "model_loaded": False,
         "gpu_initialized": False, "processor_contract": "pinned_processor_integration_required",
         "representative": {"bc_window_id": "bc", "rollout_window_id": "rollout", "three_cameras": True, "action_horizon": 16},
-        "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24],
-        "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {},
-        "timing_rows": [{"worker_count": count, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 100.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for count in [0, 4, 8, 16, 24]],
+        "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 12, 16],
+        "canonical_worker_counts": [0, 4, 8, 12, 16], "loader_throughput": {},
+        "timing_rows": [{"worker_count": count, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 100.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for count in [0, 4, 8, 12, 16]],
         "authenticated_evidence": {"provider_instance_id": 44, "provider_response_sha256": "2" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2], "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40},
         "cache_cap": 1, "native_x86_required": True, "timeout_seconds": 60.0,
         "canonical_completion": True,
@@ -4757,7 +4809,15 @@ def test_runtime_gpu_parent_hydration_rejects_malformed_controller_mode_before_p
         {"mode": "archive", "repository": "unapproved/repo"},
     )
 
-    monkeypatch.setattr(LIFECYCLE, "_runtime_campaign_binding", lambda _request: {})
+    monkeypatch.setattr(LIFECYCLE, "_runtime_campaign_binding", lambda _request: {"deployment": {
+        "repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40,
+        "remote_prefix": "mixtures/" + "b" * 64, "fresh_readback_verified": True,
+        "tree_listing_verified": True, "mixture_id": "b" * 64,
+        "pending_receipt_sha256": "c" * 64, "artifact_entries": [],
+        "experiment_manifest_sha256": "d" * 64,
+        "mixture_weights": {"bc": 70, "rollout": 30, "dagger": 0},
+        "source_quotas": {"bc": 45, "rollout": 19, "dagger": 0},
+    }})
     monkeypatch.setattr(LIFECYCLE, "_runtime_parent_checkpoint", lambda _request: tmp_path / "parent.tar")
     monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_hydration_request_sha256", lambda _request: "a" * 64)
     calls: list[tuple[str, ...]] = []
@@ -5005,7 +5065,7 @@ def test_runtime_gpu_warmup_runs_exact_cli_and_binds_cpu_pilot_code_parent_and_i
         "processor_contract": "pinned_processor_integration_required", "representative": {"three_cameras": True, "action_horizon": 16}, "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24], "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {str(n): {"decoded_samples": 100, "samples_per_second": 1.0} for n in [0, 4, 8, 16, 24]}, "timing_rows": [{"worker_count": n, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 1.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for n in [0, 4, 8, 16, 24]], "authenticated_evidence": {"provider_instance_id": 44, "provider_response_sha256": "2" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2], "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40}, "cache_cap": 1, "native_x86_required": True, "timeout_seconds": 60.0, "canonical_completion": True,
     }
     pilot_path = tmp_path / "pilot.json"; pilot_path.write_text(json.dumps(pilot), encoding="utf-8")
-    binding = {"mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "5" * 64}, "code": {"repository_revision": "3" * 40, "bundle_sha256": "4" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
+    binding = {"mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "experiment_manifest_sha256": "0" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "5" * 64}, "code": {"repository_revision": "3" * 40, "bundle_sha256": "4" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
     binding_path = tmp_path / "binding.json"; binding_path.write_text(json.dumps(binding), encoding="utf-8")
     request |= {"pilot_receipt": str(pilot_path), "runtime_warmup_binding": str(binding_path), "warmup_lifecycle_receipt": str(tmp_path / "warmup-lifecycle.json"), "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json")}
     monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_bootstrap_capability_receipt", lambda **_kwargs: {})

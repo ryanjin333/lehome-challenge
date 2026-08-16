@@ -85,10 +85,10 @@ def test_config_records_four_gpu_global_batch_math_and_presentations() -> None:
 
 
 def test_runtime_resume_cursor_is_derived_only_from_an_authenticated_checkpoint() -> None:
-    initial = config(runtime_mixture_manifest="/runtime/m.json", runtime_window_index="/runtime/w.json", runtime_mounts_descriptor="/runtime/d.json")
+    initial = config(runtime_mixture_manifest="/runtime/m.json", runtime_window_index="/runtime/w.json", runtime_mounts_descriptor="/runtime/d.json", max_steps=2_000, save_steps=500)
     assert initial.runtime_resume_offset_for_global_step(3) == 192
     with pytest.raises(ValueError, match="authenticated checkpoint"):
-        config(runtime_mixture_manifest="/runtime/m.json", runtime_window_index="/runtime/w.json", runtime_mounts_descriptor="/runtime/d.json", runtime_resume_sample_offset=64)
+        config(runtime_mixture_manifest="/runtime/m.json", runtime_window_index="/runtime/w.json", runtime_mounts_descriptor="/runtime/d.json", max_steps=2_000, save_steps=500, runtime_resume_sample_offset=64)
     with pytest.raises(ValueError, match="global_step"):
         initial.runtime_resume_offset_for_global_step(-1)
 
@@ -98,6 +98,8 @@ def test_runtime_checkpoint_cursor_is_not_an_immutable_launch_identity_field() -
         runtime_mixture_manifest="/runtime/m.json",
         runtime_window_index="/runtime/w.json",
         runtime_mounts_descriptor="/runtime/d.json",
+        max_steps=2_000,
+        save_steps=500,
     )
 
     assert "runtime_resume_global_step" not in immutable.identity()
@@ -109,6 +111,8 @@ def test_runtime_resume_cursor_must_match_the_bound_checkpoint_step() -> None:
             runtime_mixture_manifest="/runtime/m.json",
             runtime_window_index="/runtime/w.json",
             runtime_mounts_descriptor="/runtime/d.json",
+            max_steps=2_000,
+            save_steps=500,
             runtime_resume_sample_offset=128,
             runtime_resume_global_step=1,
         )

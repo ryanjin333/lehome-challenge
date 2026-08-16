@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import subprocess
 import tarfile
@@ -44,6 +45,9 @@ from lehome_train.models import (
 from lehome_train.offline_eval import OfflineEvaluation, evaluate_action_predictions
 from lehome_train.schedule import ExposureSchedule
 from lehome_train.telemetry import NvmlTelemetrySampler
+
+
+_SAFETENSORS_SHARD = re.compile(r"^model-(\d{5})-of-(\d{5})\.safetensors$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +262,13 @@ def _verified_checkpoint_state_at(
     state_path = checkpoint / "trainer_state.json"
     if not checkpoint.is_dir() or checkpoint.is_symlink() or not state_path.is_file():
         raise ValueError("GR00T checkpoint boundary has no trainer-state evidence")
+    _verify_model_weight_layout(checkpoint)
+    required_artifacts = ("optimizer.pt", "scheduler.pt", "rng_state.pth")
+    if any(
+        (checkpoint / name).is_symlink() or not (checkpoint / name).is_file()
+        for name in required_artifacts
+    ):
+        raise ValueError("GR00T checkpoint boundary lacks complete model/optimizer/scheduler/RNG state")
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -283,6 +294,81 @@ def _verified_checkpoint_state_at(
     if num_gpus == 4:
         _verify_zero2_shards(checkpoint, optimizer_step)
     return state
+
+
+def _strict_checkpoint_index(path: Path) -> dict[str, object]:
+    """Parse the ordinary HF safetensors index without duplicate JSON keys."""
+
+    def unique_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if type(key) is not str or key in value:
+                raise ValueError("GR00T checkpoint safetensors index is malformed")
+            value[key] = item
+        return value
+
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("GR00T checkpoint safetensors index is invalid")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("GR00T checkpoint safetensors index is malformed") from None
+    if type(value) is not dict:
+        raise ValueError("GR00T checkpoint safetensors index is malformed")
+    return value
+
+
+def _verify_model_weight_layout(checkpoint: Path) -> None:
+    """Require one unambiguous monolithic or complete indexed HF model layout."""
+
+    monolithic = checkpoint / "model.safetensors"
+    index = checkpoint / "model.safetensors.index.json"
+    entries = list(checkpoint.iterdir())
+    root_safetensors = {entry.name for entry in entries if entry.name.endswith(".safetensors")}
+    monolithic_visible = monolithic.exists() or monolithic.is_symlink()
+    index_visible = index.exists() or index.is_symlink()
+    if monolithic_visible:
+        if (
+            monolithic.is_symlink() or not monolithic.is_file()
+            or index_visible or root_safetensors != {monolithic.name}
+        ):
+            raise ValueError("GR00T checkpoint has ambiguous or unsafe model weights")
+        return
+    if index.is_symlink() or not index.is_file():
+        raise ValueError("GR00T checkpoint has no complete safetensors model weights")
+    payload = _strict_checkpoint_index(index)
+    if set(payload) != {"metadata", "weight_map"}:
+        raise ValueError("GR00T checkpoint safetensors index is incompatible")
+    metadata, weight_map = payload["metadata"], payload["weight_map"]
+    if (
+        type(metadata) is not dict or set(metadata) != {"total_size"}
+        or type(metadata.get("total_size")) is not int or metadata["total_size"] < 0
+        or type(weight_map) is not dict or not weight_map
+    ):
+        raise ValueError("GR00T checkpoint safetensors index is incompatible")
+    if any(type(tensor) is not str or not tensor or type(name) is not str for tensor, name in weight_map.items()):
+        raise ValueError("GR00T checkpoint safetensors index is incompatible")
+    shard_names = sorted(set(weight_map.values()))
+    parsed: list[tuple[int, int]] = []
+    for name in shard_names:
+        match = _SAFETENSORS_SHARD.fullmatch(name)
+        if match is None or Path(name).name != name:
+            raise ValueError("GR00T checkpoint safetensors index has an unsafe shard path")
+        parsed.append((int(match.group(1)), int(match.group(2))))
+    totals = {total for _, total in parsed}
+    if len(totals) != 1:
+        raise ValueError("GR00T checkpoint safetensors shard totals are inconsistent")
+    total = totals.pop()
+    if (
+        total <= 0 or len(shard_names) != total
+        or {number for number, _ in parsed} != set(range(1, total + 1))
+        or root_safetensors != set(shard_names)
+    ):
+        raise ValueError("GR00T checkpoint safetensors shard set is incomplete or ambiguous")
+    for name in shard_names:
+        shard = checkpoint / name
+        if shard.is_symlink() or not shard.is_file():
+            raise ValueError("GR00T checkpoint safetensors shards must be regular files")
 
 
 def _verify_zero2_shards(checkpoint: Path, optimizer_step: int) -> None:

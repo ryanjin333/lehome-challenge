@@ -18,6 +18,24 @@ from lehome_train.io import canonical_json_sha256, sha256_file
 from lehome_train.models import ArtifactIdentity, CheckpointRecord, ExperimentConfig, SmokeResult
 
 
+@pytest.fixture(autouse=True)
+def _complete_official_checkpoint_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep production recovery fixtures in the official full-state layout."""
+
+    original_mkdir = Path.mkdir
+
+    def mkdir(path: Path, *args: object, **kwargs: object) -> None:
+        original_mkdir(path, *args, **kwargs)
+        suffix = path.name.removeprefix("checkpoint-")
+        if suffix.isdecimal():
+            for name in ("model.safetensors", "optimizer.pt", "scheduler.pt", "rng_state.pth"):
+                artifact = path / name
+                if not artifact.exists():
+                    artifact.write_bytes(name.encode("ascii"))
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+
+
 COMMIT = "a" * 40
 DATASET_REVISION = "b" * 40
 DATASET_SHA256 = "c" * 64
@@ -323,7 +341,7 @@ def test_smoke_uses_nvml_probe_and_canonical_controller_selection(
     assert json.loads(selected_path.read_text(encoding="utf-8"))["physical_batch_size"] == 64
 
 
-def test_tune_uses_only_loader_4_8_12_and_batch_64_96_128(
+def test_tune_uses_only_fixed_batch64_loader_candidates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     launch_path = _write(tmp_path / "prepared" / "tune-launch.json", _launch_payload(tmp_path, batch=64, max_steps=2000))
@@ -338,8 +356,20 @@ def test_tune_uses_only_loader_4_8_12_and_batch_64_96_128(
         "status_output": str(tmp_path / "output" / "status.json"),
     })
     assert result["production_physical_batch"] == 64
-    assert [workers for workers, batch in calls if batch == 64][:3] == [4, 8, 12]
-    assert [batch for workers, batch in calls if workers == result["selected_loader_workers"]][-3:] == [64, 96, 128]
+    assert [workers for workers, batch in calls] == [0, 4, 8, 12, 16]
+    assert all(batch == 64 for _workers, batch in calls)
+
+
+def test_runtime_mixture_launch_locks_2k_and_local_500_step_cadence(tmp_path: Path) -> None:
+    launch = _launch_payload(tmp_path, batch=64, max_steps=2000)
+    launch.update({
+        "runtime_mixture_manifest": "/prepared/mixture.json",
+        "runtime_window_index": "/prepared/windows.json",
+        "runtime_mounts_descriptor": "/prepared/mounts.json",
+        "save_steps": 1000,
+    })
+    with pytest.raises(ValueError, match="local checkpoint cadence"):
+        FineTuneLaunchConfig(**launch)
 
 
 def test_runtime_mixture_train_requires_a_cross_checked_gpu_warmup_receipt() -> None:
@@ -375,6 +405,496 @@ def test_runtime_mixture_train_envelope_rejects_cpu_pilot_receipt() -> None:
         runtime_module.ProductionRuntime().runtime_mixture_train(arguments)
 
 
+def test_runtime_recovery_selection_prefers_local_1500_then_hf_then_parent(tmp_path: Path) -> None:
+    from lehome_train.groot.local_recovery import attest_local_checkpoint
+
+    identity = {
+        "experiment_manifest_sha256": "a" * 64,
+        "parent_checkpoint_artifact_sha256": "b" * 64,
+        "runtime_mixture_id": "c" * 64,
+        "trainer_code_sha256": "d" * 64,
+        "trainer_code_revision": "e" * 40,
+    }
+    official = tmp_path / "output" / "run" / "checkpoint-1500"
+    official.mkdir(parents=True)
+    (official / "weights.bin").write_bytes(b"weights")
+    (official / "trainer_state.json").write_text(json.dumps({"global_step": 1500, "log_history": [{"step": 1500, "loss": .25}]}))
+    local = attest_local_checkpoint(
+        checkpoint=official, metadata_root=tmp_path / "output" / "local-recovery", optimizer_step=1500,
+        identity=identity,
+    )
+    hf = SimpleNamespace(record=SimpleNamespace(optimizer_step=1000))
+
+    selected = runtime_module._select_runtime_recovery(local=local, hf_checkpoint=tmp_path / "hf-1000", hf_descriptor=hf, parent_checkpoint=tmp_path / "parent")
+    assert selected.path == official and selected.optimizer_step == 1500 and selected.source == "local"
+    selected = runtime_module._select_runtime_recovery(local=None, hf_checkpoint=tmp_path / "hf-1000", hf_descriptor=hf, parent_checkpoint=tmp_path / "parent")
+    assert selected.path == tmp_path / "hf-1000" and selected.source == "hf"
+    hf_2000 = SimpleNamespace(record=SimpleNamespace(optimizer_step=2000))
+    selected = runtime_module._select_runtime_recovery(local=None, hf_checkpoint=tmp_path / "hf-2000", hf_descriptor=hf_2000, parent_checkpoint=tmp_path / "parent")
+    assert selected.source == "terminal" and selected.optimizer_step == 2000
+    selected = runtime_module._select_runtime_recovery(local=None, hf_checkpoint=None, hf_descriptor=None, parent_checkpoint=tmp_path / "parent")
+    assert selected.path == tmp_path / "parent" and selected.source == "parent"
+
+
+def test_runtime_recovery_uses_authenticated_hf_2k_terminal_when_local_2k_lacks_its_journal(tmp_path: Path) -> None:
+    from lehome_train.groot.local_recovery import attest_local_checkpoint
+
+    identity = {
+        "experiment_manifest_sha256": "a" * 64,
+        "parent_checkpoint_artifact_sha256": "b" * 64,
+        "runtime_mixture_id": "c" * 64,
+        "trainer_code_sha256": "d" * 64,
+        "trainer_code_revision": "e" * 40,
+    }
+    checkpoint = tmp_path / "output" / "run" / "checkpoint-2000"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "weights.bin").write_bytes(b"weights")
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps({"global_step": 2000, "log_history": [{"step": 2000, "loss": .25}]}),
+    )
+    local = attest_local_checkpoint(
+        checkpoint=checkpoint, metadata_root=tmp_path / "output" / "local-recovery",
+        optimizer_step=2000, identity=identity,
+    )
+    hf = SimpleNamespace(record=SimpleNamespace(optimizer_step=2000))
+
+    selected = runtime_module._select_runtime_recovery(
+        local=local, hf_checkpoint=tmp_path / "hf-2000", hf_descriptor=hf,
+        parent_checkpoint=tmp_path / "parent",
+    )
+
+    assert selected.source == "terminal"
+    assert selected.local is None
+    assert selected.path == tmp_path / "hf-2000"
+
+
+def test_runtime_authenticated_hf_two_k_bypasses_an_unmarked_local_two_k_journal(tmp_path: Path) -> None:
+    from lehome_train.groot.local_recovery import (
+        attest_local_checkpoint,
+        discover_local_recovery,
+        record_immutable_publication,
+    )
+
+    identity = {
+        "experiment_manifest_sha256": "a" * 64,
+        "parent_checkpoint_artifact_sha256": "b" * 64,
+        "runtime_mixture_id": "c" * 64,
+        "trainer_code_sha256": "d" * 64,
+        "trainer_code_revision": "e" * 40,
+    }
+    checkpoint = tmp_path / "output" / "run" / "checkpoint-2000"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "weights.bin").write_bytes(b"weights")
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps({"global_step": 2000, "log_history": [{"step": 2000, "loss": .25}]}),
+    )
+    metadata = tmp_path / "output" / "local-recovery"
+    local = attest_local_checkpoint(
+        checkpoint=checkpoint, metadata_root=metadata, optimizer_step=2000, identity=identity,
+    )
+    record_immutable_publication(
+        metadata_root=metadata, checkpoint=local,
+        publication={"optimizer_step": 2000, "readback_verified": True, "immutable_revision": "1" * 40},
+        anchor={"immutable_anchor_revision": "1" * 40, "anchor_sha256": "2" * 64},
+    )
+    (metadata / "publication-2000.COMPLETE").unlink()
+    recovered = discover_local_recovery(metadata_root=metadata, identity=identity)
+    assert recovered is not None and recovered.terminal_immutable_publication is None
+
+    selected = runtime_module._select_runtime_recovery(
+        local=recovered, hf_checkpoint=tmp_path / "authenticated-hf-2000",
+        hf_descriptor=SimpleNamespace(record=SimpleNamespace(optimizer_step=2000)),
+        parent_checkpoint=tmp_path / "parent",
+    )
+    assert selected.source == "terminal"
+    assert selected.local is None
+
+
+@pytest.mark.parametrize("tamper", (None, "publication", "anchor", "float-cursor", "readback", "artifact", "descriptor", "revision", "size", "manifest"))
+def test_runtime_mixture_hf_2k_terminal_restores_then_requires_bound_publication_and_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str | None,
+) -> None:
+    """The actual runtime may terminal at 2K only after cursor and chain validation."""
+    prepared, output, cache = tmp_path / "prepared", tmp_path / "output", tmp_path / "cache"
+    for root in (prepared, output, cache): root.mkdir()
+    runtime_paths = {
+        key: prepared / f"{key}.json"
+        for key in ("manifest", "windows", "normalization", "mounts", "sources", "warmup", "binding")
+    }
+    for path in runtime_paths.values(): path.write_text('{"ok":true}', encoding="utf-8")
+    token = prepared / "token"; token.write_text("publisher-token", encoding="utf-8"); token.chmod(0o600)
+    identity = __import__("lehome_train.groot.runtime_checkpoint_lifecycle", fromlist=["RuntimeMixtureTrainingIdentity"]).RuntimeMixtureTrainingIdentity(
+        mixture_id="a" * 64, deployment_receipt_sha256="b" * 64,
+        source_revisions=(("organizer", "c" * 40, "bc/full", "d" * 64), ("rollout", "e" * 40, "rollouts/round-1", "f" * 64)),
+        schedule_seed=1, code_bundle_sha256="1" * 64, code_bundle_revision="2" * 40,
+        oci_image="sha256:" + "3" * 64, parent_step12000_artifact_sha256="4" * 64,
+    )
+    runtime_paths["sources"].write_text(json.dumps(identity.to_dict()), encoding="utf-8")
+    experiment = ExperimentConfig(**_experiment_payload(batch=64))
+    experiment_path = _write(prepared / "experiment.json", experiment.to_dict())
+    archive = prepared / "resume.tar"; archive.write_bytes(b"authenticated-2k")
+    descriptor = CheckpointDescriptor(
+        record=CheckpointRecord("runtime", 2000, 128_000, "5" * 64, identity.mixture_id, "6" * 64,
+            ArtifactIdentity("checkpoints/step-2000.tar", sha256_file(archive), archive.stat().st_size), True, False),
+        normalization_sha256="7" * 64, schedule_sha256="6" * 64, locally_verified=True,
+    )
+    descriptor_path = prepared / "resume.json"; write_checkpoint_descriptor(descriptor_path, descriptor)
+    config = SimpleNamespace(
+        runtime_mixture_manifest=str(runtime_paths["manifest"]), runtime_window_index=str(runtime_paths["windows"]),
+        runtime_mounts_descriptor=str(runtime_paths["mounts"]), dataset_path=str(prepared / "dataset"),
+        base_model_path=str(cache / "parent"), output_dir=str(output), experiment_name="runtime", dataloader_num_workers=4, num_gpus=1,
+        identity=lambda: {},
+    )
+    publication = {
+        "schema_version": 1, "kind": "runtime_mixture_checkpoint_publication", "optimizer_step": 2000,
+        "repository": runtime_module.DEFAULT_MODEL_REPO, "immutable_revision": "8" * 40,
+        "remote_prefix": "runtime/checkpoint", "relative_path": "checkpoints/step-2000.tar",
+        "artifact_sha256": sha256_file(archive), "artifact_byte_size": archive.stat().st_size,
+        "descriptor_relative_path": "checkpoints/step-2000.json", "descriptor_sha256": sha256_file(descriptor_path),
+        "descriptor_byte_size": descriptor_path.stat().st_size, "readback_verified": True,
+        "identity": identity.to_dict(), "identity_sha256": identity.sha256,
+        "runtime_cursor": {"optimizer_step": 2000, "global_sample_offset": 128_000, "physical_batch_size": 64, "action_horizon": 16},
+        "fresh_tree_readback_verified": True,
+    }
+    anchor = {"immutable_anchor_revision": "8" * 40, "anchor_sha256": "9" * 64}
+    if tamper == "publication": publication = None  # type: ignore[assignment]
+    if tamper == "anchor": anchor = None  # type: ignore[assignment]
+    if tamper == "float-cursor": publication["runtime_cursor"]["physical_batch_size"] = 64.0
+    if tamper == "readback": publication["readback_verified"] = False
+    if tamper == "artifact": publication["artifact_sha256"] = "0" * 64
+    if tamper == "descriptor": publication["descriptor_sha256"] = "0" * 64
+    if tamper == "revision": publication["immutable_revision"] = "not-a-revision"
+    if tamper == "size": publication["artifact_byte_size"] = float(archive.stat().st_size)
+    restored: list[Path] = []
+    launched = False
+    monkeypatch.setattr(runtime_module, "_load_config", lambda _path: config)
+    monkeypatch.setattr(runtime_module, "_load_experiment", lambda _path: experiment)
+    monkeypatch.setattr(runtime_module, "_runtime_final_campaign", lambda *_args: None)
+    monkeypatch.setattr(runtime_module, "GrootTrainingSession", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(runtime_module, "HubCheckpointUploader", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(runtime_module, "launch_continuous_finetune", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("terminal 2K must not launch gradients")))
+    monkeypatch.setattr(
+        "lehome_train.groot.runtime_mixture.load_runtime_contract",
+        lambda *_args: SimpleNamespace(
+            manifest=SimpleNamespace(
+                mixture_id=identity.mixture_id, cycle_size=64,
+                **({} if tamper == "manifest" else {"experiment_manifest_sha256": "f" * 64}),
+            ), training_windows=(),
+        ),
+    )
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_warmup.bind_warmup_to_runtime_artifacts", lambda **_kwargs: {"binding": True})
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_warmup.validate_gpu_warmup_receipt", lambda *_args, **_kwargs: 4)
+    def restore(_archive: Path, **kwargs: object) -> None:
+        root = kwargs["output_root"]
+        assert isinstance(root, Path)
+        restored.append(root)
+        checkpoint = root / "runtime" / "checkpoint-2000"
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "weights.bin").write_bytes(b"authenticated-2k")
+        (checkpoint / "trainer_state.json").write_text(
+            json.dumps({"global_step": 2000, "log_history": [{"step": 2000, "loss": .25}]}),
+        )
+
+    monkeypatch.setattr("lehome_train.groot.production_adapters._restore_checkpoint_archive", restore)
+    request = {
+        "launch_config": str(prepared / "launch.json"), "experiment_config": experiment_path,
+        "runtime_manifest": str(runtime_paths["manifest"]), "runtime_window_index": str(runtime_paths["windows"]),
+        "runtime_normalization": str(runtime_paths["normalization"]), "runtime_mounts_descriptor": str(runtime_paths["mounts"]),
+        "runtime_source_evidence": str(runtime_paths["sources"]), "warmup_receipt": str(runtime_paths["warmup"]),
+        "runtime_warmup_binding": str(runtime_paths["binding"]), "runtime_resume_archive": str(archive),
+        "runtime_resume_descriptor": str(descriptor_path), "runtime_resume_cursor": publication["runtime_cursor"] if publication else {"optimizer_step": 2000, "global_sample_offset": 128_000, "physical_batch_size": 64, "action_horizon": 16},
+        "runtime_resume_anchor": anchor, "runtime_resume_publication": publication,
+        "local_recovery_root": str(output / "local-recovery"), "checkpoint_repository": runtime_module.DEFAULT_MODEL_REPO,
+        "checkpoint_revision": "main", "publisher_token_file": str(token), "instance_id": 7,
+        "result_output": str(output / "result.json"), "status_output": str(output / "status.json"),
+    }
+    if tamper is None:
+        result = runtime_module.ProductionRuntime(checkpoint_transport_factory=lambda **_kwargs: object()).runtime_mixture_train(request)
+        assert result["status"] == "runtime-mixture-terminal-hf-2000"
+        assert result["immutable_checkpoint_publications"] == [publication]
+        assert restored == [output]
+
+        # Crash after local 2K attestation but before the terminal local
+        # journal: the already-authenticated HF terminal remains sufficient,
+        # with neither a new publication nor gradient launch.
+        from lehome_train.groot.local_recovery import attest_local_checkpoint, discover_local_recovery
+        local = attest_local_checkpoint(
+            checkpoint=output / "runtime" / "checkpoint-2000",
+            metadata_root=output / "local-recovery", optimizer_step=2000,
+            identity={
+                "experiment_manifest_sha256": "f" * 64,
+                "parent_checkpoint_artifact_sha256": identity.parent_step12000_artifact_sha256,
+                "runtime_mixture_id": identity.mixture_id,
+                "trainer_code_sha256": identity.code_bundle_sha256,
+                "trainer_code_revision": identity.code_bundle_revision,
+            },
+        )
+        assert discover_local_recovery(
+            metadata_root=output / "local-recovery", identity={
+                "experiment_manifest_sha256": "f" * 64,
+                "parent_checkpoint_artifact_sha256": identity.parent_step12000_artifact_sha256,
+                "runtime_mixture_id": identity.mixture_id,
+                "trainer_code_sha256": identity.code_bundle_sha256,
+                "trainer_code_revision": identity.code_bundle_revision,
+            },
+        ).terminal_immutable_publication is None
+        monkeypatch.setattr(
+            runtime_module, "run_continuous_supervisor",
+            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("terminal HF evidence must not republish")),
+        )
+        recovered = runtime_module.ProductionRuntime(checkpoint_transport_factory=lambda **_kwargs: object()).runtime_mixture_train(request)
+        assert recovered["status"] == "runtime-mixture-terminal-hf-2000"
+        assert recovered["immutable_checkpoint_publications"] == [publication]
+        assert restored[-1] != output
+        assert local.terminal_immutable_publication is None
+    else:
+        with pytest.raises(ValueError, match="authenticated immutable cursor|authenticated predecessor anchor|does not match|cursor or checkpoint archive|experiment manifest binding"):
+            runtime_module.ProductionRuntime(checkpoint_transport_factory=lambda **_kwargs: object()).runtime_mixture_train(request)
+
+
+@pytest.mark.parametrize(
+    ("local_step", "journal", "expect_source", "expect_restore"),
+    [
+        (1500, False, "local", False),
+        (1000, True, "local", False),
+        (1000, False, "hf", True),
+    ],
+)
+def test_runtime_local_first_selection_validates_hf_without_restoring_until_selected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    local_step: int,
+    journal: bool,
+    expect_source: str,
+    expect_restore: bool,
+) -> None:
+    """A retained local cursor is never displaced by eager HF restoration."""
+    from lehome_train.groot.local_recovery import attest_local_checkpoint, record_immutable_publication
+    from lehome_train.groot.runtime_checkpoint_lifecycle import RuntimeMixtureTrainingIdentity
+
+    prepared, output, cache = tmp_path / "prepared", tmp_path / "output", tmp_path / "cache"
+    for root in (prepared, output, cache):
+        root.mkdir()
+    artifact_paths = {
+        key: prepared / f"{key}.json"
+        for key in ("manifest", "windows", "normalization", "mounts", "sources", "warmup", "binding")
+    }
+    for path in artifact_paths.values():
+        path.write_text('{"ok":true}', encoding="utf-8")
+    token = prepared / "token"; token.write_text("publisher-token", encoding="utf-8"); token.chmod(0o600)
+    identity = RuntimeMixtureTrainingIdentity(
+        mixture_id="a" * 64, deployment_receipt_sha256="b" * 64,
+        source_revisions=(("organizer", "c" * 40, "bc/full", "d" * 64), ("rollout", "e" * 40, "rollouts/round-1", "f" * 64)),
+        schedule_seed=1, code_bundle_sha256="1" * 64, code_bundle_revision="2" * 40,
+        oci_image="sha256:" + "3" * 64, parent_step12000_artifact_sha256="4" * 64,
+    )
+    artifact_paths["sources"].write_text(json.dumps(identity.to_dict()), encoding="utf-8")
+    experiment = ExperimentConfig(**_experiment_payload(batch=64))
+    experiment_path = _write(prepared / "experiment.json", experiment.to_dict())
+    archive = prepared / "resume.tar"; archive.write_bytes(b"authenticated-1k")
+    descriptor = CheckpointDescriptor(
+        record=CheckpointRecord("runtime", 1000, 64_000, "5" * 64, identity.mixture_id, "6" * 64,
+            ArtifactIdentity("checkpoints/step-1000.tar", sha256_file(archive), archive.stat().st_size), True, False),
+        normalization_sha256="7" * 64, schedule_sha256="6" * 64, locally_verified=True,
+    )
+    descriptor_path = prepared / "resume.json"; write_checkpoint_descriptor(descriptor_path, descriptor)
+    config = SimpleNamespace(
+        runtime_mixture_manifest=str(artifact_paths["manifest"]), runtime_window_index=str(artifact_paths["windows"]),
+        runtime_mounts_descriptor=str(artifact_paths["mounts"]), dataset_path=str(prepared / "dataset"),
+        base_model_path=str(cache / "parent"), output_dir=str(output), experiment_name="runtime",
+        dataloader_num_workers=4, num_gpus=1, identity=lambda: {},
+    )
+    publication = {
+        "schema_version": 1, "kind": "runtime_mixture_checkpoint_publication", "optimizer_step": 1000,
+        "repository": runtime_module.DEFAULT_MODEL_REPO, "immutable_revision": "8" * 40,
+        "remote_prefix": "runtime/checkpoint", "relative_path": "checkpoints/step-1000.tar",
+        "artifact_sha256": sha256_file(archive), "artifact_byte_size": archive.stat().st_size,
+        "descriptor_relative_path": "checkpoints/step-1000.json", "descriptor_sha256": sha256_file(descriptor_path),
+        "descriptor_byte_size": descriptor_path.stat().st_size, "readback_verified": True,
+        "identity": identity.to_dict(), "identity_sha256": identity.sha256,
+        "runtime_cursor": {"optimizer_step": 1000, "global_sample_offset": 64_000, "physical_batch_size": 64, "action_horizon": 16},
+        "fresh_tree_readback_verified": True,
+    }
+    anchor = {"immutable_anchor_revision": "8" * 40, "anchor_sha256": "9" * 64}
+    official = output / "runtime" / f"checkpoint-{local_step}"
+    official.mkdir(parents=True)
+    (official / "weights.bin").write_bytes(b"preserved-local")
+    (official / "trainer_state.json").write_text(json.dumps({"global_step": local_step, "log_history": [{"step": local_step, "loss": .2}]}))
+    local_identity = {
+        "experiment_manifest_sha256": "f" * 64,
+        "parent_checkpoint_artifact_sha256": identity.parent_step12000_artifact_sha256,
+        "runtime_mixture_id": identity.mixture_id, "trainer_code_sha256": identity.code_bundle_sha256,
+        "trainer_code_revision": identity.code_bundle_revision,
+    }
+    local = attest_local_checkpoint(
+        checkpoint=official, metadata_root=output / "local-recovery", optimizer_step=local_step,
+        identity=local_identity,
+    )
+    if journal:
+        record_immutable_publication(
+            metadata_root=output / "local-recovery", checkpoint=local,
+            publication=publication, anchor=anchor,
+        )
+    restored_roots: list[Path] = []
+    launched: list[Path | None] = []
+    monkeypatch.setattr(runtime_module, "_load_config", lambda _path: config)
+    monkeypatch.setattr(runtime_module, "_load_experiment", lambda _path: experiment)
+    monkeypatch.setattr(runtime_module, "_runtime_final_campaign", lambda *_args: None)
+    monkeypatch.setattr(runtime_module, "GrootTrainingSession", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(runtime_module, "HubCheckpointUploader", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture.load_runtime_contract", lambda *_args: SimpleNamespace(manifest=SimpleNamespace(mixture_id=identity.mixture_id, cycle_size=64, experiment_manifest_sha256="f" * 64), training_windows=()))
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_warmup.bind_warmup_to_runtime_artifacts", lambda **_kwargs: {"binding": True})
+    monkeypatch.setattr("lehome_train.groot.runtime_mixture_warmup.validate_gpu_warmup_receipt", lambda *_args, **_kwargs: 4)
+    def restore(_archive: Path, **kwargs: object) -> None:
+        root = kwargs["output_root"]
+        assert isinstance(root, Path)
+        restored_roots.append(root)
+        run = root / "runtime"; run.mkdir()
+        (run / "lehome_launch.json").write_text("{}", encoding="utf-8")
+        checkpoint = run / "checkpoint-1000"; checkpoint.mkdir()
+        (checkpoint / "weights.bin").write_bytes(b"hf")
+        (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 1000, "log_history": [{"step": 1000, "loss": .1}]}))
+    monkeypatch.setattr("lehome_train.groot.production_adapters._restore_checkpoint_archive", restore)
+    monkeypatch.setattr(runtime_module, "launch_continuous_finetune", lambda _config, **kwargs: launched.append(kwargs.get("resume_checkpoint")))
+    def supervisor(**kwargs: object) -> tuple[dict[str, object], ...]:
+        launch = kwargs["launch"]
+        assert callable(launch)
+        launch()
+        return () if kwargs["already_published"] else (publication,)
+    monkeypatch.setattr(runtime_module, "run_continuous_supervisor", supervisor)
+    request = {
+        "launch_config": str(prepared / "launch.json"), "experiment_config": experiment_path,
+        "runtime_manifest": str(artifact_paths["manifest"]), "runtime_window_index": str(artifact_paths["windows"]),
+        "runtime_normalization": str(artifact_paths["normalization"]), "runtime_mounts_descriptor": str(artifact_paths["mounts"]),
+        "runtime_source_evidence": str(artifact_paths["sources"]), "warmup_receipt": str(artifact_paths["warmup"]),
+        "runtime_warmup_binding": str(artifact_paths["binding"]), "runtime_resume_archive": str(archive),
+        "runtime_resume_descriptor": str(descriptor_path), "runtime_resume_cursor": publication["runtime_cursor"],
+        "runtime_resume_anchor": anchor, "runtime_resume_publication": publication,
+        "local_recovery_root": str(output / "local-recovery"), "checkpoint_repository": runtime_module.DEFAULT_MODEL_REPO,
+        "checkpoint_revision": "main", "publisher_token_file": str(token), "instance_id": 7,
+        "result_output": str(output / "result.json"), "status_output": str(output / "status.json"),
+    }
+
+    result = runtime_module.ProductionRuntime(checkpoint_transport_factory=lambda **_kwargs: object()).runtime_mixture_train(request)
+
+    assert result["status"] == "runtime-mixture-interrupted"
+    assert bool(restored_roots) is expect_restore
+    assert (official / "weights.bin").read_bytes() == b"preserved-local"
+    if expect_source == "local":
+        assert launched == [official]
+    else:
+        assert len(launched) == 1 and launched[0] is not None
+        assert Path(launched[0]).parent.parent.parent == output
+        assert Path(launched[0]) != official
+
+
+def test_hf_resume_staging_recovers_an_interrupted_private_restore_without_touching_local_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output"; output.mkdir()
+    local = output / "runtime" / "checkpoint-1000"; local.mkdir(parents=True)
+    (local / "weights.bin").write_bytes(b"verified-local-fallback")
+    archive = tmp_path / "resume.tar"; archive.write_bytes(b"hf-archive")
+    descriptor = tmp_path / "resume.json"; descriptor.write_text("{}", encoding="utf-8")
+    validated = runtime_module._ValidatedRuntimeResume(
+        archive=archive, descriptor_path=descriptor, descriptor=object(),
+        cursor={"optimizer_step": 1000, "global_sample_offset": 64_000, "physical_batch_size": 64, "action_horizon": 16},
+    )
+    config = SimpleNamespace(output_dir=str(output), experiment_name="runtime", num_gpus=1, identity=lambda: {})
+    calls: list[Path] = []
+
+    monkeypatch.setattr(
+        "lehome_train.groot.production_adapters._restore_checkpoint_archive",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("simulated termination")),
+    )
+    with pytest.raises(RuntimeError, match="termination"):
+        runtime_module._restore_validated_runtime_resume_checkpoint(
+            validated=validated, config=config, preserve_existing_run=True,
+        )
+    staging = output / f".runtime-hf-resume-1000-{sha256_file(archive)[:16]}"
+    assert (staging / ".INCOMPLETE.json").is_file()
+    assert (local / "weights.bin").read_bytes() == b"verified-local-fallback"
+
+    def restore(_archive: Path, **kwargs: object) -> None:
+        root = kwargs["output_root"]
+        assert isinstance(root, Path)
+        calls.append(root)
+        run = root / "runtime"; run.mkdir()
+        (run / "lehome_launch.json").write_text("{}", encoding="utf-8")
+        (run / "checkpoint-1000").mkdir()
+
+    monkeypatch.setattr("lehome_train.groot.production_adapters._restore_checkpoint_archive", restore)
+    restored = runtime_module._restore_validated_runtime_resume_checkpoint(
+        validated=validated, config=config, preserve_existing_run=True,
+    )
+
+    assert restored == staging / "runtime" / "checkpoint-1000"
+    assert calls == [staging]
+    assert not (staging / ".INCOMPLETE.json").exists()
+    assert (local / "weights.bin").read_bytes() == b"verified-local-fallback"
+    assert not list(output.glob(f".{staging.name}.*.incomplete"))
+
+
+def test_live_device_provenance_shuts_down_nvml_without_masking_device_read_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    fake_nvml = SimpleNamespace(
+        nvmlInit=lambda: events.append("init"),
+        nvmlDeviceGetHandleByIndex=lambda _index: object(),
+        nvmlDeviceGetUUID=lambda _handle: "GPU-1234",
+        nvmlShutdown=lambda: events.append("shutdown"),
+    )
+    fake_cuda = SimpleNamespace(
+        get_device_properties=lambda _index: (_ for _ in ()).throw(RuntimeError("device properties failed")),
+        get_device_name=lambda _index: "NVIDIA RTX PRO 6000",
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
+
+    with pytest.raises(RuntimeError, match="device properties failed"):
+        runtime_module._live_device_provenance(SimpleNamespace(cuda=fake_cuda))
+
+    assert events == ["init", "shutdown"]
+
+    events.clear()
+    fake_nvml.nvmlDeviceGetUUID = lambda _handle: (_ for _ in ()).throw(ValueError("UUID read failed"))
+    with pytest.raises(RuntimeError, match="stable GPU UUID") as raised:
+        runtime_module._live_device_provenance(SimpleNamespace(cuda=fake_cuda))
+
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert str(raised.value.__cause__) == "UUID read failed"
+    assert events == ["init", "shutdown"]
+
+
+def test_live_device_provenance_normalizes_a_torchversion_string_subclass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TorchVersion(str):
+        pass
+
+    fake_nvml = SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlDeviceGetHandleByIndex=lambda _index: object(),
+        nvmlDeviceGetUUID=lambda _handle: "GPU-1234",
+        nvmlShutdown=lambda: None,
+    )
+    fake_cuda = SimpleNamespace(
+        is_available=lambda: True, is_initialized=lambda: True,
+        get_device_properties=lambda _index: SimpleNamespace(total_memory=96 * 1024**3),
+        get_device_name=lambda _index: "NVIDIA RTX PRO 6000",
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
+
+    state = runtime_module._live_device_provenance(SimpleNamespace(
+        cuda=fake_cuda, __version__=TorchVersion("2.7.0+cu128"),
+        version=SimpleNamespace(cuda="12.8"),
+    ))
+
+    assert type(state.torch_version) is str
+    assert state.torch_version == "2.7.0+cu128"
+
+
 def test_runtime_gpu_warmup_production_adapter_measures_live_loader_model_and_nvml(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -401,6 +921,18 @@ def test_runtime_gpu_warmup_production_adapter_measures_live_loader_model_and_nv
         def ipc_collect(self) -> None:
             self.ipc_collect_calls += 1
 
+        def reset_peak_memory_stats(self) -> None:
+            return None
+
+        def max_memory_allocated(self) -> int:
+            return 32 * 1024**3
+
+        def max_memory_reserved(self) -> int:
+            return 40 * 1024**3
+
+        def mem_get_info(self) -> tuple[int, int]:
+            return (20 * 1024**3, 96 * 1024**3)
+
     class FakeTensor:
         shape = (64, 1)
 
@@ -411,6 +943,9 @@ def test_runtime_gpu_warmup_production_adapter_measures_live_loader_model_and_nv
     class FakeLoss:
         def backward(self) -> None:
             return None
+
+        def item(self) -> float:
+            return 0.125
 
     class FakeModel:
         def parameters(self):
@@ -475,18 +1010,24 @@ def test_runtime_gpu_warmup_production_adapter_measures_live_loader_model_and_nv
         optimizer=optimizer,
         loader_factory=lambda workers: loaders.append(FakeLoader()) or loaders[-1],
         sampler_factory=lambda: samplers.append(FakeSampler()) or samplers[-1],
+        runtime_state_probe=lambda: __import__("lehome_train.groot.runtime_mixture_warmup", fromlist=["RuntimeState"]).RuntimeState(
+            torch_cuda_available=True, torch_cuda_initialized=True, model_loaded=True,
+            hostname="gpu-host", host_architecture="x86_64", torch_version="2.7.0",
+            cuda_version="12.8", gpu_device_name="NVIDIA RTX PRO 6000",
+            gpu_uuid="GPU-1234", total_vram_bytes=96 * 1024**3,
+        ),
+        materialization_proof_factory=lambda: {
+            "bc": {"source_type": "bc", "window_id": "bc-window", "action_horizon": 16, "camera_count": 3},
+            "rollout": {"source_type": "rollout", "window_id": "rollout-window", "action_horizon": 16, "camera_count": 3},
+        },
         clock=lambda: next(times),
     )
     production = runtime_module.ProductionRuntime()
     monkeypatch.setattr(production, "_create_runtime_gpu_warmup_session", lambda _arguments: session)
 
     adapter = production.runtime_gpu_warmup_adapter({"binding": {}})
-    assert adapter.runtime_state().to_dict() == {
-        "torch_cuda_available": True,
-        "torch_cuda_initialized": True,
-        "model_loaded": True,
-    }
-    measured = adapter.measure(worker_count=4, burn_in_steps=10, measured_steps=50)
+    assert adapter.runtime_state().to_dict()["gpu_uuid"] == "GPU-1234"
+    measured = adapter.measure(worker_count=12, burn_in_steps=10, measured_steps=50)
 
     assert measured.decoded_samples == 64 * 60
     assert measured.measured_steps == 50
@@ -495,10 +1036,16 @@ def test_runtime_gpu_warmup_production_adapter_measures_live_loader_model_and_nv
     assert measured.step_seconds == pytest.approx(10.0)
     assert measured.gpu_busy_seconds == pytest.approx(8.0)
     assert measured.gpu_utilization_percent == 80.0
+    assert measured.observed_batch_sizes == (64,) * 60
+    assert measured.loss_min == measured.loss_max == measured.loss_final == 0.125
+    assert measured.minimum_free_vram_bytes == 20 * 1024**3
+    assert measured.materialization_proof is not None
     assert optimizer.steps == 60 and optimizer.clears == 60
     assert len(loaders) == len(samplers) == 1
     assert loaders[0].shutdowns == 1 and samplers[0].closed is True
     assert cuda.empty_cache_calls == cuda.ipc_collect_calls == 1
+    rejected = session.measure(worker_count=24, burn_in_steps=10, measured_steps=50)
+    assert rejected.error == "runtime GPU warm-up worker count is not canonical"
 
 
 def test_runtime_gpu_warmup_records_oom_and_cleans_workers_without_claiming_success() -> None:
@@ -511,6 +1058,18 @@ def test_runtime_gpu_warmup_records_oom_and_cleans_workers_without_claiming_succ
 
         def ipc_collect(self) -> None:
             return None
+
+        def reset_peak_memory_stats(self) -> None:
+            return None
+
+        def max_memory_allocated(self) -> int:
+            return 32 * 1024**3
+
+        def max_memory_reserved(self) -> int:
+            return 40 * 1024**3
+
+        def mem_get_info(self) -> tuple[int, int]:
+            return (20 * 1024**3, 96 * 1024**3)
 
     class OomModel:
         def parameters(self):
@@ -570,6 +1129,18 @@ def test_runtime_gpu_warmup_never_substitutes_unloaded_model_or_missing_nvml() -
 
         def ipc_collect(self) -> None:
             return None
+
+        def reset_peak_memory_stats(self) -> None:
+            return None
+
+        def max_memory_allocated(self) -> int:
+            return 32 * 1024**3
+
+        def max_memory_reserved(self) -> int:
+            return 40 * 1024**3
+
+        def mem_get_info(self) -> tuple[int, int]:
+            return (20 * 1024**3, 96 * 1024**3)
 
     class Model:
         def __init__(self, device: str) -> None:
@@ -804,7 +1375,8 @@ def test_continuous_campaign_binds_local_dataset_revision_to_the_sealed_manifest
         "output_dir": "/output",
         "modality_config_path": "/prepared/config/modality.py",
         "experiment_name": "corrective-rft-70-30-20260813",
-        "augmentation_profile": "none",
+            "augmentation_profile": "none",
+            "save_steps": 500,
         "parent_checkpoint_repository": "ryanjin333/lehome-groot-n17-models",
         "parent_checkpoint_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
         "parent_checkpoint_subpath": "policies/step-12000",

@@ -115,7 +115,12 @@ class _MemoryHub:
 class _WarmupAdapter:
     def runtime_state(self):
         from lehome_train.groot.runtime_mixture_warmup import RuntimeState
-        return RuntimeState(torch_cuda_available=True, torch_cuda_initialized=True, model_loaded=True)
+        return RuntimeState(
+            torch_cuda_available=True, torch_cuda_initialized=True, model_loaded=True,
+            hostname="gpu-host", host_architecture="x86_64", torch_version="2.7.0",
+            cuda_version="12.8", gpu_device_name="NVIDIA RTX PRO 6000",
+            gpu_uuid="GPU-fixture", total_vram_bytes=96 * 1024**3,
+        )
 
     def measure(self, *, worker_count: int, burn_in_steps: int, measured_steps: int):
         from lehome_train.groot.runtime_mixture_warmup import GpuWarmupMeasurement
@@ -123,6 +128,18 @@ class _WarmupAdapter:
             decoded_samples=64 * (burn_in_steps + measured_steps), measured_steps=measured_steps,
             loader_wait_seconds=20.0 if worker_count == 0 else 1.0, step_seconds=20.0, gpu_busy_seconds=18.0,
             gpu_utilization_percent=90.0, oom=False, error=None,
+            observed_batch_sizes=(64,) * (burn_in_steps + measured_steps),
+            loss_min=.1, loss_max=.3, loss_final=.2,
+            peak_memory_allocated_bytes=32 * 1024**3,
+            peak_memory_reserved_bytes=40 * 1024**3,
+            minimum_free_vram_bytes=20 * 1024**3,
+            samples_per_second=192.0,
+            step_latency_p50_seconds=.3,
+            step_latency_p95_seconds=.5,
+            materialization_proof={
+                "bc": {"source_type": "bc", "window_id": "bc-1", "action_horizon": 16, "camera_count": 3},
+                "rollout": {"source_type": "rollout", "window_id": "rollout-1", "action_horizon": 16, "camera_count": 3},
+            },
         )
 
 
@@ -146,6 +163,42 @@ def test_runtime_supervisor_packages_and_anchors_the_real_one_k_boundary(
     prepared, output, cache = tmp_path / "prepared", tmp_path / "output", tmp_path / "cache"
     monkeypatch.setattr(production, "_ALLOWED_ROOTS", (prepared, output, cache))
     manifest, windows, mounts = _contract(prepared / "runtime")
+    # Upgrade the generic mixture fixture to the production-only v3 contract.
+    # The runtime path binds this experiment manifest digest into both warm-up
+    # and local-recovery receipts, so legacy v2 bytes are intentionally barred.
+    from lehome_train.groot.runtime_mixture import _manifest_digest_binding
+    manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+    manifest_value.update({
+        "schema_version": 3,
+        "experiment_manifest_sha256": "f" * 64,
+        "mixture_weights": {"bc": 80, "rollout": 20, "dagger": 0},
+        "source_quotas": {"bc": 51, "rollout": 13, "dagger": 0},
+        "cycle_size": 64,
+    })
+    manifest_value["sources"][0]["quota"] = 51
+    manifest_value["sources"][1]["quota"] = 13
+    windows_value = json.loads(windows.read_text(encoding="utf-8"))
+    windows_value["manifest_sha256"] = _manifest_digest_binding(manifest_value)
+    _write(windows, windows_value)
+    manifest_value["window_index"] = {
+        "path": "windows.json", "sha256": sha256_file(windows),
+        "byte_size": windows.stat().st_size,
+    }
+    _write(manifest, manifest_value)
+    deployment_receipt_path = manifest.parent / "release-receipt.json"
+    deployment_receipt = json.loads(deployment_receipt_path.read_text(encoding="utf-8"))
+    deployment_receipt.update({
+        "experiment_manifest_sha256": "f" * 64,
+        "mixture_weights": {"bc": 80, "rollout": 20, "dagger": 0},
+        "source_quotas": {"bc": 51, "rollout": 13, "dagger": 0},
+    })
+    for entry in deployment_receipt["artifact_entries"]:
+        artifact = manifest.parent / entry["relative_path"]
+        entry.update({"sha256": sha256_file(artifact), "byte_size": artifact.stat().st_size})
+    _write(deployment_receipt_path, deployment_receipt)
+    mounts_value = json.loads(mounts.read_text(encoding="utf-8"))
+    mounts_value["deployment_receipt_sha256"] = sha256_file(deployment_receipt_path)
+    _write(mounts, mounts_value)
     normalization = manifest.parent / "mixture-normalization.json"
     bc_receipt = manifest.parent / "source-publication" / "bc-readback.json"
     rollout_receipt = manifest.parent / "source-publication" / "rollout-readback.json"
@@ -158,7 +211,8 @@ def test_runtime_supervisor_packages_and_anchors_the_real_one_k_boundary(
     binding = {
         "mixture": {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40, "mixture_id": mixture_id,
                     "manifest_sha256": sha256_file(manifest), "window_index_sha256": sha256_file(windows),
-                    "normalization_sha256": sha256_file(normalization), "source_revisions": {"bc": "b" * 40, "round-1": "c" * 40}},
+                    "normalization_sha256": sha256_file(normalization), "experiment_manifest_sha256": "f" * 64,
+                    "source_revisions": {"bc": "b" * 40, "round-1": "c" * 40}},
         "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "3" * 64},
         "code": {"repository_revision": code_revision, "bundle_sha256": code_sha, "isaac_groot_revision": "4" * 40},
         "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]},
@@ -166,7 +220,7 @@ def test_runtime_supervisor_packages_and_anchors_the_real_one_k_boundary(
     }
     warmup = build_gpu_warmup_receipt(binding=binding, adapter=_WarmupAdapter())
     launch = {"base_model_path": str(cache / "parent"), "base_model_revision": MODEL_REVISION, "dataset_path": str(manifest.parent), "dataset_revision": "6" * 40,
-              "modality_config_path": str(modality), "output_dir": str(run_root), "experiment_name": "runtime-mixture-70-30", "physical_batch_size": 64, "global_batch_size": 64, "gradient_accumulation_steps": 1, "augmentation_profile": "none", "num_gpus": 1, "max_steps": 2000, "save_steps": 1000, "training_action_horizon": 16, "model_action_chunk_capacity": 40, "warmup_ratio": .05, "dataloader_num_workers": 4,
+              "modality_config_path": str(modality), "output_dir": str(run_root), "experiment_name": "runtime-mixture-70-30", "physical_batch_size": 64, "global_batch_size": 64, "gradient_accumulation_steps": 1, "augmentation_profile": "none", "num_gpus": 1, "max_steps": 2000, "save_steps": 500, "training_action_horizon": 16, "model_action_chunk_capacity": 40, "warmup_ratio": .05, "dataloader_num_workers": 4,
               "parent_checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "parent_checkpoint_revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "parent_checkpoint_subpath": "policies/step-12000", "parent_checkpoint_artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"], "runtime_mixture_manifest": str(manifest), "runtime_window_index": str(windows), "runtime_mounts_descriptor": str(mounts)}
     experiment = ExperimentConfig(repository_commit=code_revision, container_digest=LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], model_repository="nvidia/GR00T-N1.7-3B", model_revision=MODEL_REVISION, dataset_repository="ryanjin333/lehome-groot-n17-data", dataset_revision="a" * 40, dataset_manifest_sha256=mixture_id, physical_batch_size=64, gradient_accumulation_steps=1, sample_presentations=128_000, action_horizon=16, tune_language_backbone=False, tune_visual_backbone=False)
     identity = {"mixture_id": mixture_id, "deployment_receipt_sha256": sha256_file(deployment_receipt), "source_revisions": [{"source_id": "organizer", "immutable_revision": "b" * 40, "prefix": "bc/full", "tree_sha256": sha256_file(bc_receipt)}, {"source_id": "rollout", "immutable_revision": "c" * 40, "prefix": "rollouts/round-1", "tree_sha256": sha256_file(rollout_receipt)}], "schedule_seed": 17, "code_bundle_sha256": code_sha, "code_bundle_revision": code_revision, "oci_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "parent_step12000_artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"], "physical_batch_size": 64, "action_horizon": 16}
@@ -182,12 +236,15 @@ def test_runtime_supervisor_packages_and_anchors_the_real_one_k_boundary(
     retry_delays: list[float] = []
     def launch_one_k(config, **_kwargs):
         checkpoint = Path(config.output_dir) / config.experiment_name / "checkpoint-1000"; checkpoint.mkdir(parents=True)
-        (checkpoint / "weights.bin").write_bytes(b"immutable-1k")
+        (checkpoint / "model.safetensors").write_bytes(b"immutable-1k")
+        (checkpoint / "optimizer.pt").write_bytes(b"optimizer-1k")
+        (checkpoint / "scheduler.pt").write_bytes(b"scheduler-1k")
+        (checkpoint / "rng_state.pth").write_bytes(b"rng-1k")
         _write(checkpoint / "trainer_state.json", {"global_step": 1000, "log_history": [{"step": 1000, "loss": .2}]})
         run = checkpoint.parent; _write(run / "lehome_launch.json", config.identity())
         raise ProviderInterrupted("provider loss after durable 1K")
     monkeypatch.setattr(production, "launch_continuous_finetune", launch_one_k)
-    result = production.ProductionRuntime(checkpoint_transport_factory=lambda **_kwargs: hub, checkpoint_retry_sleeper=retry_delays.append).runtime_mixture_train({**{key: str(value) for key, value in paths.items()}, "runtime_resume_archive": None, "runtime_resume_descriptor": None, "runtime_resume_cursor": None, "runtime_resume_anchor": None, "runtime_resume_publication": None, "checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "checkpoint_revision": "main", "publisher_token_file": str(token), "instance_id": 10, "result_output": str(output / "result.json"), "status_output": str(output / "status.json")})
+    result = production.ProductionRuntime(checkpoint_transport_factory=lambda **_kwargs: hub, checkpoint_retry_sleeper=retry_delays.append).runtime_mixture_train({**{key: str(value) for key, value in paths.items()}, "runtime_resume_archive": None, "runtime_resume_descriptor": None, "runtime_resume_cursor": None, "runtime_resume_anchor": None, "runtime_resume_publication": None, "local_recovery_root": str(output / "local-recovery"), "checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "checkpoint_revision": "main", "publisher_token_file": str(token), "instance_id": 10, "result_output": str(output / "result.json"), "status_output": str(output / "status.json")})
     publication = result["immutable_checkpoint_publications"][0]
     assert result["status"] == "runtime-mixture-interrupted" and publication["optimizer_step"] == 1000
     assert publication["kind"] == "runtime_mixture_checkpoint_publication"
@@ -299,10 +356,13 @@ def test_runtime_supervisor_packages_and_anchors_the_real_one_k_boundary(
         )
     assert competing_destroyed and json.loads(Path(str(competing_request["failure_receipt"])).read_text())["cleanup_status"] == "destroyed_and_absent"
 
-    # A replacement host has no durable trainer output.  It consumes only the
-    # discovered immutable archive and descriptor, then the real supervisor
-    # observes/packages/publishes the 2K completion boundary.
+    # This branch deliberately models a fresh output mount, not a shared-disk
+    # local recovery.  Discard both the trainer tree and its sidecars: leaving
+    # receipts that point at deleted checkpoints is correctly fail-closed.
+    # The replacement consumes only the discovered immutable archive and
+    # descriptor, then observes/packages/publishes the 2K boundary.
     shutil.rmtree(run_root)
+    shutil.rmtree(output / "local-recovery")
     resume_archive = Path(resumed["checkpoint_archive"])
     resume_descriptor = Path(resumed["checkpoint_descriptor"])
     from lehome_train.checkpoints import load_checkpoint_descriptor
@@ -312,10 +372,13 @@ def test_runtime_supervisor_packages_and_anchors_the_real_one_k_boundary(
     assert resume_record.artifact.sha256 == sha256_file(resume_archive)
     def launch_two_k(config, **_kwargs):
         checkpoint = Path(config.output_dir) / config.experiment_name / "checkpoint-2000"; checkpoint.mkdir(parents=True)
-        (checkpoint / "weights.bin").write_bytes(b"immutable-2k")
+        (checkpoint / "model.safetensors").write_bytes(b"immutable-2k")
+        (checkpoint / "optimizer.pt").write_bytes(b"optimizer-2k")
+        (checkpoint / "scheduler.pt").write_bytes(b"scheduler-2k")
+        (checkpoint / "rng_state.pth").write_bytes(b"rng-2k")
         _write(checkpoint / "trainer_state.json", {"global_step": 2000, "log_history": [{"step": 2000, "loss": .1}]})
     monkeypatch.setattr(production, "launch_continuous_finetune", launch_two_k)
-    completed = production.ProductionRuntime(checkpoint_transport_factory=lambda **_kwargs: hub, checkpoint_retry_sleeper=retry_delays.append).runtime_mixture_train({**{key: str(value) for key, value in paths.items()}, "runtime_resume_archive": str(resume_archive), "runtime_resume_descriptor": str(resume_descriptor), "runtime_resume_cursor": resumed["runtime_cursor"], "runtime_resume_anchor": resumed["runtime_resume_anchor"], "runtime_resume_publication": resumed["runtime_resume_publication"], "checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "checkpoint_revision": "main", "publisher_token_file": str(token), "instance_id": 11, "result_output": str(output / "replacement-result.json"), "status_output": str(output / "replacement-status.json")})
+    completed = production.ProductionRuntime(checkpoint_transport_factory=lambda **_kwargs: hub, checkpoint_retry_sleeper=retry_delays.append).runtime_mixture_train({**{key: str(value) for key, value in paths.items()}, "runtime_resume_archive": str(resume_archive), "runtime_resume_descriptor": str(resume_descriptor), "runtime_resume_cursor": resumed["runtime_cursor"], "runtime_resume_anchor": resumed["runtime_resume_anchor"], "runtime_resume_publication": resumed["runtime_resume_publication"], "local_recovery_root": str(output / "local-recovery"), "checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "checkpoint_revision": "main", "publisher_token_file": str(token), "instance_id": 11, "result_output": str(output / "replacement-result.json"), "status_output": str(output / "replacement-status.json")})
     publications = completed["immutable_checkpoint_publications"]
     assert completed["status"] == "runtime-mixture-complete" and [item["optimizer_step"] for item in publications] == [1000, 2000]
     assert publications[1]["runtime_checkpoint_anchor"]["readback_verified"] is True

@@ -86,7 +86,10 @@ def _write_checkpoint(config: FineTuneLaunchConfig, step: int) -> Path:
     )
     checkpoint = run_root / f"checkpoint-{step}"
     checkpoint.mkdir(parents=True, exist_ok=True)
-    (checkpoint / "weights.bin").write_bytes(f"weights-{step}".encode())
+    (checkpoint / "model.safetensors").write_bytes(f"weights-{step}".encode())
+    (checkpoint / "optimizer.pt").write_bytes(f"optimizer-{step}".encode())
+    (checkpoint / "scheduler.pt").write_bytes(f"scheduler-{step}".encode())
+    (checkpoint / "rng_state.pth").write_bytes(f"rng-{step}".encode())
     (checkpoint / "trainer_state.json").write_text(
         json.dumps(
             {
@@ -97,6 +100,48 @@ def _write_checkpoint(config: FineTuneLaunchConfig, step: int) -> Path:
         encoding="utf-8",
     )
     return checkpoint
+
+
+def _write_indexed_checkpoint(config: FineTuneLaunchConfig, step: int) -> Path:
+    checkpoint = _write_checkpoint(config, step)
+    (checkpoint / "model.safetensors").unlink()
+    (checkpoint / "model-00001-of-00002.safetensors").write_bytes(b"first-shard")
+    (checkpoint / "model-00002-of-00002.safetensors").write_bytes(b"second-shard")
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps({
+            "metadata": {"total_size": 22},
+            "weight_map": {
+                "model.layers.0.weight": "model-00001-of-00002.safetensors",
+                "model.layers.1.weight": "model-00002-of-00002.safetensors",
+            },
+        }),
+        encoding="utf-8",
+    )
+    return checkpoint
+
+
+@pytest.mark.parametrize("mutation", ("missing", "mixed", "extra", "duplicate_json_key"))
+def test_verified_checkpoint_state_rejects_incomplete_or_ambiguous_safetensors_layout(
+    tmp_path: Path, mutation: str,
+) -> None:
+    config = _config(tmp_path, batch=64, max_steps=500, save_steps=500)
+    checkpoint = _write_indexed_checkpoint(config, 500)
+    if mutation == "missing":
+        (checkpoint / "model-00002-of-00002.safetensors").unlink()
+    elif mutation == "mixed":
+        (checkpoint / "model.safetensors").write_bytes(b"ambiguous")
+    elif mutation == "extra":
+        (checkpoint / "model-00003-of-00003.safetensors").write_bytes(b"extra")
+    else:
+        (checkpoint / "model.safetensors.index.json").write_text(
+            '{"metadata":{"total_size":22},"metadata":{"total_size":22},'
+            '"weight_map":{"model.layers.0.weight":"model-00001-of-00002.safetensors",'
+            '"model.layers.1.weight":"model-00002-of-00002.safetensors"}}',
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ValueError, match="safetensors|model weights"):
+        adapters._verified_checkpoint_state_at(checkpoint, 500)
 
 
 def _write_zero2_shards(checkpoint: Path) -> None:

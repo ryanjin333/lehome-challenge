@@ -25,6 +25,7 @@ from typing import Callable, Mapping
 from lehome_train.hub import HubTransport, HuggingFaceHubTransport
 from lehome_train.io import atomic_write_json, canonical_json_bytes, sha256_file
 from lehome_train.constants import MODEL_REVISION
+from lehome_train.groot.experiment_manifest import batch64_quotas
 from lehome_train.release_manifest import validate_training_capability
 
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
@@ -1659,7 +1660,13 @@ def _runtime_receipt(path_value: object, *, kind: str) -> tuple[dict[str, object
     value = dict(_load_regular_json(path, "runtime mixture receipt"))
     source_keys = {"repository", "immutable_revision", "remote_prefix", "fresh_readback_verified", "tree_listing_verified"}
     deployment_keys = source_keys | {"mixture_id", "pending_receipt_sha256", "artifact_entries"}
-    if set(value) != (source_keys if kind in {"bc", "rollout"} else deployment_keys):
+    bound_deployment_keys = deployment_keys | {
+        "experiment_manifest_sha256", "mixture_weights", "source_quotas",
+    }
+    expected_keys = source_keys if kind in {"bc", "rollout"} else deployment_keys
+    if kind == "deployment" and set(value) == bound_deployment_keys:
+        expected_keys = bound_deployment_keys
+    if set(value) != expected_keys:
         raise ValueError("runtime mixture receipt schema is incompatible")
     prefix = value.get("remote_prefix")
     if (
@@ -1692,6 +1699,24 @@ def _runtime_deployment_receipt_is_canonical(
         or not isinstance(entries, list)
         or not entries
     ):
+        return False
+    bound_fields = {"experiment_manifest_sha256", "mixture_weights", "source_quotas"}
+    if bound_fields <= set(receipt):
+        experiment_manifest_sha256 = receipt.get("experiment_manifest_sha256")
+        weights, quotas = receipt.get("mixture_weights"), receipt.get("source_quotas")
+        kinds = {"bc", "rollout", "dagger"}
+        if (
+            type(experiment_manifest_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", experiment_manifest_sha256) is None
+            or not isinstance(weights, Mapping) or set(weights) != kinds
+            or not isinstance(quotas, Mapping) or set(quotas) != kinds
+            or any(type(weights[item]) is not int or type(quotas[item]) is not int for item in kinds)
+            or weights["bc"] <= 0 or weights["rollout"] <= 0 or weights["dagger"] != 0
+            or weights["bc"] + weights["rollout"] != 100
+            or dict(quotas) != batch64_quotas(dict(weights))
+        ):
+            return False
+    elif bound_fields & set(receipt):
         return False
     paths: set[str] = set()
     for entry in entries:
@@ -1807,7 +1832,7 @@ def _runtime_gpu_parent_hash_check_command() -> str:
     )
 
 
-def _runtime_campaign_binding(request: Mapping[str, object]) -> dict[str, object]:
+def _runtime_campaign_binding(request: Mapping[str, object], *, require_manifest_bound: bool = False) -> dict[str, object]:
     """Validate immutable mixture/code evidence before any paid provider call."""
     if (
         not isinstance(request.get("code_revision"), str)
@@ -1819,6 +1844,16 @@ def _runtime_campaign_binding(request: Mapping[str, object]) -> dict[str, object
     bc, bc_sha = _runtime_receipt(request.get("bc_readback_receipt"), kind="bc")
     rollout, rollout_sha = _runtime_receipt(request.get("rollout_readback_receipt"), kind="rollout")
     deployment, deployment_sha = _runtime_receipt(request.get("deployment_receipt"), kind="deployment")
+    # Every path that can rent or operate the final campaign reaches this
+    # binding before its first provider call.  A schema-v2 deployment receipt
+    # is deliberately diagnostic-only: paid execution must bind the immutable
+    # experiment identity and exact batch-64 source quotas.
+    if require_manifest_bound and set(deployment) != {
+        "repository", "immutable_revision", "remote_prefix", "fresh_readback_verified",
+        "tree_listing_verified", "mixture_id", "pending_receipt_sha256", "artifact_entries",
+        "experiment_manifest_sha256", "mixture_weights", "source_quotas",
+    }:
+        raise ValueError("paid runtime campaign requires a schema-v3 manifest-bound deployment receipt")
     return {"bc": bc, "bc_receipt_sha256": bc_sha, "rollout": rollout,
             "rollout_receipt_sha256": rollout_sha, "deployment": deployment,
             "deployment_receipt_sha256": deployment_sha}
@@ -1831,7 +1866,7 @@ def _runtime_identity(instance: Mapping[str, object], request: Mapping[str, obje
         or type(instance.get("instance_id")) is not int
     ):
         raise ValueError("runtime mixture production requires native x86_64 and the approved pinned image")
-    return _runtime_campaign_binding(request)
+    return _runtime_campaign_binding(request, require_manifest_bound=True)
 
 
 def _runtime_cpu_pilot_identity(instance: Mapping[str, object], request: Mapping[str, object]) -> dict[str, object]:
@@ -1865,7 +1900,7 @@ def _validated_runtime_pilot_value(receipt: Mapping[str, object]) -> dict[str, o
         value.get("kind") != "runtime_mixture_loader_pilot"
         or value.get("model_loaded") is not False or value.get("gpu_initialized") is not False
         or value.get("native_x86_required") is not True
-        or value.get("canonical_worker_counts") != [0, 4, 8, 16, 24]
+        or value.get("canonical_worker_counts") != [0, 4, 8, 12, 16]
         or value.get("canonical_completion") is not True
         or not isinstance(evidence, Mapping)
         or set(evidence) != {"provider_instance_id", "provider_response_sha256", "platform_arch", "image_digest", "code_revision", "code_bundle_sha256", "bc_revision", "rollout_revision", "deployment_revision"}
@@ -1875,7 +1910,7 @@ def _validated_runtime_pilot_value(receipt: Mapping[str, object]) -> dict[str, o
         or any(re.fullmatch(r"[0-9a-f]{40}", str(evidence.get(key))) is None for key in ("code_revision", "bc_revision", "rollout_revision", "deployment_revision"))
         or re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("provider_response_sha256"))) is None
         or re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("code_bundle_sha256"))) is None
-        or not isinstance(rows, list) or [row.get("worker_count") if isinstance(row, Mapping) else None for row in rows] != [0, 4, 8, 16, 24]
+        or not isinstance(rows, list) or [row.get("worker_count") if isinstance(row, Mapping) else None for row in rows] != [0, 4, 8, 12, 16]
         or any(not isinstance(row, Mapping) or set(row) != {"worker_count", "decoded_samples", "seconds", "samples_per_second", "host_cpu_seconds", "host_max_rss_mib", "latency_seconds_p50", "latency_seconds_p95"} or type(row.get("decoded_samples")) is not int or row["decoded_samples"] < 100 or any(type(row.get(key)) not in (int, float) or float(row[key]) < 0 for key in ("seconds", "samples_per_second", "host_cpu_seconds", "host_max_rss_mib", "latency_seconds_p50", "latency_seconds_p95")) for row in rows)
     )
     version = value.get("schema_version")
@@ -1887,7 +1922,7 @@ def _validated_runtime_pilot_value(receipt: Mapping[str, object]) -> dict[str, o
             "native_x86_required", "timeout_seconds", "canonical_completion",
         }
         or value.get("processor_contract") != "pinned_processor_integration_required"
-        or value.get("worker_counts") != [0, 4, 8, 16, 24]
+        or value.get("worker_counts") != [0, 4, 8, 12, 16]
         or type(value.get("sample_count_per_worker")) is not int
         or int(value["sample_count_per_worker"]) < 100
         or not isinstance(value.get("loader_throughput"), Mapping)
@@ -1982,6 +2017,12 @@ def _runtime_gpu_rent_preflight(
         excluded_machine_id = _validate_runtime_gpu_recovery_for_new_rent(
             request=request, identity=identity, claim_path=claim_path,
         )
+    deployment = identity.get("deployment")
+    if not isinstance(deployment, Mapping) or set(deployment) != {
+        "repository", "immutable_revision", "remote_prefix", "fresh_readback_verified", "tree_listing_verified", "mixture_id", "pending_receipt_sha256", "artifact_entries", "experiment_manifest_sha256", "mixture_weights", "source_quotas",
+    }:
+        raise ValueError("paid runtime campaign requires a schema-v3 manifest-bound deployment receipt")
+    if not recovery_safe:
         identity = dict(identity) | {"recovery_excluded_machine_id": excluded_machine_id}
     return identity
 
@@ -3636,7 +3677,7 @@ def _runtime_final_launch_contract(
     expected = {
         "base_model_revision": MODEL_REVISION,
         "physical_batch_size": 64, "global_batch_size": 64, "num_gpus": 1,
-        "max_steps": 2000, "save_steps": 1000,
+        "max_steps": 2000, "save_steps": 500,
         "training_action_horizon": 16, "model_action_chunk_capacity": 40,
         "parent_checkpoint_repository": parent["repository"],
         "parent_checkpoint_revision": parent["revision"],
@@ -3955,7 +3996,7 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
     else:
         raise ValueError("runtime stage resume requires exact archive, descriptor, and cursor together")
     _read_private_token(str(request["token_file"]))
-    train = _runtime_envelope(Path(str(request["runtime_train_request"])), command="runtime-mixture-train", fields={"launch_config", "experiment_config", "runtime_manifest", "runtime_window_index", "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence", "warmup_receipt", "runtime_warmup_binding", "runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor", "runtime_resume_anchor", "runtime_resume_publication", "checkpoint_repository", "checkpoint_revision", "publisher_token_file", "instance_id", "result_output", "status_output"}, label="runtime train request")
+    train = _runtime_envelope(Path(str(request["runtime_train_request"])), command="runtime-mixture-train", fields={"launch_config", "experiment_config", "runtime_manifest", "runtime_window_index", "runtime_normalization", "runtime_mounts_descriptor", "runtime_source_evidence", "warmup_receipt", "runtime_warmup_binding", "runtime_resume_archive", "runtime_resume_descriptor", "runtime_resume_cursor", "runtime_resume_anchor", "runtime_resume_publication", "local_recovery_root", "checkpoint_repository", "checkpoint_revision", "publisher_token_file", "instance_id", "result_output", "status_output"}, label="runtime train request")
     expected_train_paths = {
         "launch_config": "/prepared/config/launch.json", "experiment_config": "/prepared/config/experiment.json",
         "runtime_manifest": "/prepared/runtime/mixture.json", "runtime_window_index": "/prepared/runtime/windows.json",
@@ -3963,6 +4004,7 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         "runtime_source_evidence": "/prepared/runtime/source-evidence.json",
         "warmup_receipt": "/prepared/config/gpu-warmup.json", "runtime_warmup_binding": "/prepared/config/runtime-warmup-binding.json",
         "publisher_token_file": "/prepared/config/runtime.token",
+        "local_recovery_root": "/output/local-recovery",
         "result_output": "/output/runtime-train-result.json", "status_output": "/output/runtime-train-status.json",
     }
     if any(train.get(key) != value for key, value in expected_train_paths.items()):
