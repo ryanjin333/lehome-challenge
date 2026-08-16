@@ -9,7 +9,21 @@ import types
 import numpy as np
 import pytest
 
+_REPOSITORY_ROOT = Path(__file__).parents[2]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
 import scripts.run_groot_policy_server as policy_server
+
+
+def _load_groot_policy_module():
+    package = types.ModuleType("scripts.eval_policy")
+    package.__path__ = [str(Path(__file__).parents[2] / "scripts" / "eval_policy")]
+    sys.modules["scripts.eval_policy"] = package
+    for name in ("scripts.eval_policy.base_policy", "scripts.eval_policy.registry"):
+        sys.modules.pop(name, None)
+    sys.modules.pop("scripts.eval_policy.groot_policy", None)
+    return importlib.import_module("scripts.eval_policy.groot_policy")
 
 
 @pytest.fixture(scope="module")
@@ -141,3 +155,203 @@ def test_policy_server_uses_pinned_run_lifecycle_without_context_manager(monkeyp
     assert isinstance(events[3][1], FakePolicy)
     assert events[3][2:] == ("127.0.0.1", 5555, "t" * 32)
     assert events[4:] == ["run"]
+
+
+def test_session_client_caches_one_horizon_16_chunk_locally_and_reset_clears_it() -> None:
+    from lehome.flywheel import policy_protocol as protocol
+
+    module = _load_groot_policy_module()
+    requests = []
+    guard = protocol.SessionRequestGuard(policy_sha256="a" * 64)
+    chunk = np.arange(16 * 12, dtype=np.float32).reshape(16, 12)
+
+    def transport(payload: bytes) -> bytes:
+        request = protocol.unpack_envelope(payload)
+        assert isinstance(request, protocol.PolicyRequest)
+        guard.accept(request, now_ns=1_000)
+        requests.append(request)
+        if request.operation == "infer":
+            return protocol.pack_envelope(
+                protocol.PolicyResponse.ok(
+                    request, action_chunk=chunk.tobytes(), action_horizon=16
+                )
+            )
+        return protocol.pack_envelope(protocol.PolicyResponse.ok(request))
+
+    client = module.SessionPolicyClient(
+        "tcp://127.0.0.1:5500",
+        "a" * 64,
+        1.0,
+        session_id="worker-0",
+        request_transport=transport,
+        now_ns=lambda: 1_000,
+    )
+    observation = {"state": [0.0] * 12}
+
+    returned = [client.select_action_with_provenance(observation) for _ in range(16)]
+    assert [item.chunk_offset for item in returned] == list(range(16))
+    assert len([request for request in requests if request.operation == "infer"]) == 1
+
+    client.reset()
+    after_reset = client.select_action_with_provenance(observation)
+    assert after_reset.chunk_offset == 0
+    assert len([request for request in requests if request.operation == "infer"]) == 2
+    assert len([request for request in requests if request.operation == "reset"]) == 2
+    assert [request.request_id for request in requests] == [
+        f"worker-0:{index:020d}" for index in range(1, 5)
+    ]
+
+
+def test_session_client_rejects_stale_or_expired_responses_and_replays_reset_after_gateway_restart() -> None:
+    from lehome.flywheel import policy_protocol as protocol
+
+    module = _load_groot_policy_module()
+    chunk = np.zeros((16, 12), dtype=np.float32).tobytes()
+    initial_gateway = protocol.SessionRequestGuard(policy_sha256="a" * 64)
+    restarted_gateway = protocol.SessionRequestGuard(policy_sha256="a" * 64)
+    requests = []
+    restarted = False
+
+    def transport(payload: bytes) -> bytes:
+        nonlocal restarted
+        request = protocol.unpack_envelope(payload)
+        assert isinstance(request, protocol.PolicyRequest)
+        requests.append(request)
+        gateway = restarted_gateway if restarted else initial_gateway
+        try:
+            gateway.accept(request, now_ns=1_000)
+        except protocol.SessionStateError:
+            return protocol.pack_envelope(protocol.PolicyResponse.error(request, error_code="unknown_session"))
+        if request.operation == "reset":
+            return protocol.pack_envelope(protocol.PolicyResponse.ok(request))
+        if not restarted:
+            restarted = True
+            return protocol.pack_envelope(protocol.PolicyResponse.error(request, error_code="unknown_session"))
+        return protocol.pack_envelope(
+            protocol.PolicyResponse.ok(request, action_chunk=chunk, action_horizon=16)
+        )
+
+    client = module.SessionPolicyClient(
+        "tcp://127.0.0.1:5500", "a" * 64, 1.0,
+        session_id="worker-0", request_transport=transport, now_ns=lambda: 1_000,
+    )
+    action = client.select_action_with_provenance({"state": [0.0] * 12})
+    assert action.value.shape == (12,)
+    assert [request.operation for request in requests] == ["reset", "infer", "reset", "infer"]
+    assert requests[1].request_id == requests[3].request_id
+
+    stale_request = protocol.PolicyRequest.infer(
+        session_id="worker-1", episode_generation=1, request_id="infer-1",
+        policy_sha256="a" * 64, deadline_ns=2_000, observation={"state": [0.0] * 12},
+    )
+    stale_response = protocol.PolicyResponse.ok(stale_request, action_chunk=chunk, action_horizon=16)
+    with pytest.raises(protocol.StaleResponseError):
+        protocol.validate_response_for_request(
+            stale_response,
+            protocol.PolicyRequest.infer(
+                session_id="worker-1", episode_generation=2, request_id="infer-1",
+                policy_sha256="a" * 64, deadline_ns=2_000, observation={"state": [0.0] * 12},
+            ),
+            now_ns=1_000,
+        )
+    with pytest.raises(protocol.ExpiredRequestError):
+        protocol.validate_response_for_request(stale_response, stale_request, now_ns=2_000)
+
+
+def test_session_client_recovers_when_reset_was_accepted_but_its_reply_timed_out() -> None:
+    from lehome.flywheel import policy_protocol as protocol
+
+    module = _load_groot_policy_module()
+    guard = protocol.SessionRequestGuard(policy_sha256="a" * 64)
+    requests = []
+    reset_reply_lost = False
+    chunk = np.zeros((16, 12), dtype=np.float32).tobytes()
+
+    def transport(payload: bytes) -> bytes:
+        nonlocal reset_reply_lost
+        request = protocol.unpack_envelope(payload)
+        assert isinstance(request, protocol.PolicyRequest)
+        guard.accept(request, now_ns=1_000)
+        requests.append(request)
+        if request.operation == "reset" and not reset_reply_lost:
+            reset_reply_lost = True
+            raise TimeoutError("reply lost after gateway accepted reset")
+        if request.operation == "infer":
+            return protocol.pack_envelope(
+                protocol.PolicyResponse.ok(request, action_chunk=chunk, action_horizon=16)
+            )
+        return protocol.pack_envelope(protocol.PolicyResponse.ok(request))
+
+    client = module.SessionPolicyClient(
+        "tcp://127.0.0.1:5500", "a" * 64, 1.0,
+        session_id="worker-0", request_transport=transport, now_ns=lambda: 1_000,
+    )
+    with pytest.raises(TimeoutError, match="reply lost"):
+        client.reset()
+
+    action = client.select_action_with_provenance({"state": [0.0] * 12})
+    assert action.value.shape == (12,)
+    assert [(request.operation, request.episode_generation) for request in requests] == [
+        ("reset", 1), ("reset", 1), ("infer", 1),
+    ]
+
+
+def test_session_client_discards_dealer_socket_after_timeout_before_late_reply_can_poison_retry(monkeypatch) -> None:
+    from lehome.flywheel import policy_protocol as protocol
+
+    module = _load_groot_policy_module()
+    fake_zmq = types.SimpleNamespace(DEALER=1, LINGER=2, SNDTIMEO=3, RCVTIMEO=4, IDENTITY=5)
+    monkeypatch.setitem(sys.modules, "zmq", fake_zmq)
+    chunk = np.zeros((16, 12), dtype=np.float32).tobytes()
+
+    class Socket:
+        def __init__(self, *, timeout_first_inference: bool) -> None:
+            self.timeout_first_inference = timeout_first_inference
+            self.sent = []
+            self.pending = []
+            self.closed = False
+
+        def setsockopt(self, *_args) -> None:
+            pass
+
+        def connect(self, _endpoint) -> None:
+            pass
+
+        def send(self, payload: bytes) -> None:
+            request = protocol.unpack_envelope(payload)
+            assert isinstance(request, protocol.PolicyRequest)
+            self.sent.append(request)
+            if request.operation == "infer":
+                self.pending.append(
+                    protocol.pack_envelope(
+                        protocol.PolicyResponse.ok(request, action_chunk=chunk, action_horizon=16)
+                    )
+                )
+            else:
+                self.pending.append(protocol.pack_envelope(protocol.PolicyResponse.ok(request)))
+
+        def recv(self) -> bytes:
+            if self.timeout_first_inference and self.sent[-1].operation == "infer":
+                self.timeout_first_inference = False
+                raise TimeoutError("first response timed out but remains queued")
+            return self.pending.pop(0)
+
+        def close(self, *_args, **_kwargs) -> None:
+            self.closed = True
+
+    poisoned = Socket(timeout_first_inference=True)
+    replacement = Socket(timeout_first_inference=False)
+    sockets = [poisoned, replacement]
+    client = module.SessionPolicyClient(
+        "tcp://127.0.0.1:5500", "a" * 64, 1.0,
+        session_id="worker-0", socket_factory=lambda: sockets.pop(0), now_ns=lambda: 1_000,
+    )
+
+    with pytest.raises(TimeoutError, match="remains queued"):
+        client.select_action_with_provenance({"state": [0.0] * 12})
+    next_action = client.select_action_with_provenance({"state": [0.0] * 12})
+
+    assert poisoned.closed is True
+    assert len(poisoned.pending) == 1  # The late first reply was never read as the retry response.
+    assert next_action.value.shape == (12,)
+    assert [request.operation for request in replacement.sent] == ["infer"]

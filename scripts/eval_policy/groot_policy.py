@@ -15,11 +15,21 @@ import json
 import os
 from pathlib import Path
 from stat import S_ISREG
-from time import perf_counter_ns
+from time import perf_counter_ns, time_ns
 from typing import Any, Mapping
 from uuid import uuid4
 
 import numpy as np
+
+from lehome.flywheel.policy_protocol import (
+    ACTION_HORIZON as _SESSION_ACTION_HORIZON,
+    PolicyRequest,
+    PolicyResponse,
+    SessionStateError,
+    pack_envelope,
+    unpack_envelope,
+    validate_response_for_request,
+)
 
 from .base_policy import BasePolicy
 from .registry import PolicyRegistry
@@ -357,6 +367,196 @@ class QueuedAction:
     chunk_offset: int
 
 
+class SessionPolicyClient:
+    """Appliance-only DEALER client for the session-aware rollout gateway.
+
+    It is intentionally not a ``PolicyServerClient`` subclass: its msgpack
+    envelopes and reset semantics are incompatible with NVIDIA's synchronous
+    REP server used by the legacy evaluation path.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        policy_sha256: str,
+        timeout_seconds: float,
+        *,
+        session_id: str | None = None,
+        socket_factory: Any | None = None,
+        request_transport: Any | None = None,
+        now_ns: Any = time_ns,
+    ) -> None:
+        if not endpoint.startswith("tcp://127.0.0.1:"):
+            raise ValueError("session policy gateway endpoint must use loopback TCP")
+        if timeout_seconds <= 0:
+            raise ValueError("session policy gateway timeout must be positive")
+        if not isinstance(policy_sha256, str) or len(policy_sha256) != 64:
+            raise ValueError("session policy gateway requires a policy SHA-256")
+        self._endpoint = endpoint
+        self._policy_sha256 = policy_sha256
+        self._timeout_ns = max(1, round(timeout_seconds * 1_000_000_000))
+        self._timeout_milliseconds = max(1, round(timeout_seconds * 1_000))
+        self._session_id = session_id or uuid4().hex
+        self._socket_factory = socket_factory or self._default_socket_factory
+        self._request_transport = request_transport
+        self._now_ns = now_ns
+        self._socket: Any | None = None
+        self._action_queue = ActionChunkQueue()
+        self._episode_generation = 0
+        self._request_sequence = 0
+        self._session_ready = False
+        self._session_started = False
+
+    def _default_socket_factory(self) -> Any:
+        try:
+            import zmq
+        except ImportError as error:
+            raise RuntimeError("session gateway requires pinned pyzmq") from error
+        return zmq.Context.instance().socket(zmq.DEALER)
+
+    def _new_socket(self) -> Any:
+        try:
+            import zmq
+        except ImportError as error:
+            raise RuntimeError("session gateway requires pinned pyzmq") from error
+        socket = self._socket_factory()
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.SNDTIMEO, self._timeout_milliseconds)
+        socket.setsockopt(zmq.RCVTIMEO, self._timeout_milliseconds)
+        socket.setsockopt(zmq.IDENTITY, f"lehome-policy-{self._session_id}".encode("ascii"))
+        socket.connect(self._endpoint)
+        self._socket = socket
+        return socket
+
+    def _discard_socket(self) -> None:
+        socket, self._socket = self._socket, None
+        if socket is not None:
+            try:
+                socket.close(linger=0)
+            except TypeError:
+                socket.close()
+
+    def close(self) -> None:
+        self._discard_socket()
+
+    def _deadline_ns(self) -> int:
+        return self._now_ns() + self._timeout_ns
+
+    def _next_request_id(self) -> str:
+        self._request_sequence += 1
+        return f"{self._session_id}:{self._request_sequence:020d}"
+
+    def _exchange(self, request: PolicyRequest) -> PolicyResponse:
+        try:
+            payload = pack_envelope(request)
+            if self._request_transport is not None:
+                received = self._request_transport(payload)
+            else:
+                socket = self._socket or self._new_socket()
+                socket.send(payload)
+                received = socket.recv()
+            response = unpack_envelope(received)
+            if not isinstance(response, PolicyResponse):
+                raise ValueError("session gateway returned a request instead of a response")
+            return response
+        except Exception:
+            # A DEALER socket may retain a late reply after a receive timeout.
+            # It cannot be reused because the next request could consume that
+            # reply and bind it to the wrong request identity.
+            if self._request_transport is None:
+                self._discard_socket()
+            raise
+
+    def _send_reset(self, *, advance_generation: bool) -> None:
+        if advance_generation:
+            self._episode_generation += 1
+            self._session_started = True
+        request = PolicyRequest.reset(
+            session_id=self._session_id,
+            episode_generation=self._episode_generation,
+            request_id=self._next_request_id(),
+            policy_sha256=self._policy_sha256,
+            deadline_ns=self._deadline_ns(),
+        )
+        response = self._exchange(request)
+        validate_response_for_request(response, request, now_ns=self._now_ns())
+        self._session_ready = True
+
+    def _ensure_session(self) -> None:
+        if self._session_ready:
+            return
+        self._send_reset(advance_generation=not self._session_started)
+
+    def reset(self) -> None:
+        """Begin a new episode generation and discard every cached action."""
+
+        self._action_queue.clear()
+        self._session_ready = False
+        self._send_reset(advance_generation=True)
+
+    def cancel(self, request_id: str) -> None:
+        """Tell the gateway that an outstanding inference must not be routed."""
+
+        self._ensure_session()
+        request = PolicyRequest.cancel(
+            session_id=self._session_id,
+            episode_generation=self._episode_generation,
+            request_id=self._next_request_id(),
+            policy_sha256=self._policy_sha256,
+            deadline_ns=self._deadline_ns(),
+            cancelled_request_id=request_id,
+        )
+        response = self._exchange(request)
+        validate_response_for_request(response, request, now_ns=self._now_ns())
+
+    def _request_action_chunk(self, observation: Mapping[str, Any]) -> tuple[np.ndarray, str]:
+        self._ensure_session()
+        request = PolicyRequest.infer(
+            session_id=self._session_id,
+            episode_generation=self._episode_generation,
+            request_id=self._next_request_id(),
+            policy_sha256=self._policy_sha256,
+            deadline_ns=self._deadline_ns(),
+            observation=dict(observation),
+        )
+        try:
+            response = self._exchange(request)
+            validate_response_for_request(response, request, now_ns=self._now_ns())
+        except SessionStateError:
+            # The only recoverable protocol rejection is a restarted gateway
+            # that forgot this otherwise-live session.  Replay a reset without
+            # advancing the worker's episode, then preserve the request ID.
+            if response.error_code != "unknown_session":
+                raise
+            self._discard_socket()
+            self._session_ready = False
+            self._ensure_session()
+            response = self._exchange(request)
+            validate_response_for_request(response, request, now_ns=self._now_ns())
+        if response.action_chunk is None:
+            raise ValueError("inference response did not include an action chunk")
+        expected_bytes = _SESSION_ACTION_HORIZON * _ACTION_DIMENSION * np.dtype(np.float32).itemsize
+        if len(response.action_chunk) != expected_bytes:
+            raise ValueError("session gateway action chunk has invalid byte length")
+        return (
+            np.frombuffer(response.action_chunk, dtype=np.float32).reshape(
+                _SESSION_ACTION_HORIZON, _ACTION_DIMENSION
+            ).copy(),
+            request.request_id,
+        )
+
+    def select_action(self, observation: Mapping[str, Any]) -> np.ndarray:
+        return self.select_action_with_provenance(observation).value
+
+    def select_action_with_provenance(self, observation: Mapping[str, Any]) -> QueuedAction:
+        queued_action = self._action_queue.pop_with_provenance()
+        if queued_action is not None:
+            return queued_action
+        chunk, request_id = self._request_action_chunk(observation)
+        self._action_queue.extend(chunk, request_id=request_id)
+        return self._action_queue.pop_with_provenance_required()
+
+
 def _append_policy_telemetry(*, request_id: str, latency_seconds: float, queue_depth_after_enqueue: int) -> None:
     """Append one strict record to the campaign-provisioned telemetry file."""
     raw_path = os.environ.get("LEHOME_FLYWHEEL_POLICY_TELEMETRY_PATH")
@@ -501,6 +701,7 @@ __all__ = [
     "GrootPolicy",
     "GrootServerPolicy",
     "PolicyServerClient",
+    "SessionPolicyClient",
     "ActionChunkQueue",
     "QueuedAction",
     "build_groot_observation",

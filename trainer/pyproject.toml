@@ -20,6 +20,8 @@ lehome-train = "lehome_train.cli:main"
 
 [dependency-groups]
 dev = [
+    "msgpack==1.1.0",
+    "pyzmq==27.0.1",
     "pytest==8.4.1",
 ]
 
