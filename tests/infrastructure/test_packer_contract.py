@@ -41,8 +41,8 @@ def test_cpu_builder_shape_and_base_image():
 def test_image_names_are_unique_and_role_specific():
     training = _read("training.pkr.hcl")
     rollout = _read("rollout.pkr.hcl")
-    assert "name         = var.training_image_name" in training
-    assert "name         = var.rollout_image_name" in rollout
+    assert re.search(r"name\s*=\s*var\.training_image_name", training)
+    assert re.search(r"name\s*=\s*var\.rollout_image_name", rollout)
     variables = _read("variables.pkr.hcl")
     training_default = re.search(
         r'variable\s+"training_image_name"\s*{[^}]*default\s*=\s*"([^"]+)"', variables, re.DOTALL,
