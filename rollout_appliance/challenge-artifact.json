@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "kind": "lehome_challenge_artifact",
+  "repository": "lehome/docker",
+  "revision": "a914115729bb0bfd260971b9c8d4147bff38c1fb",
+  "filename": "lehome-challenge.tar.gz",
+  "size": 26676771349,
+  "sha256": "1a85e389962909debc4ee9988d8a8c388f905fba60686ef78b1623e6872f7123",
+  "note": "Packer downloads this exact LFS object, verifies byte length and SHA-256 before docker load, then builds the derived layer. The tarball itself is never committed."
+}
