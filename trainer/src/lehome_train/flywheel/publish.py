@@ -30,6 +30,94 @@ from lehome_train.redaction import generate_upload_allowlist
 
 
 _REMOTE_ROOT = "corrective-rft"
+_ROUND_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+_EPISODE_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+MAX_ROLL_ROUND_EPISODES = 150
+
+
+class RolloutRoundSealError(RuntimeError):
+    """An immutable rollout round cannot be sealed from incomplete evidence."""
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutRoundSeal:
+    """The durable seal that permits calling a rollout round complete."""
+
+    round_id: str
+    episode_count: int
+    episode_sha256s: Mapping[str, str]
+    seal_receipt_path: Path
+
+
+def _load_sync_receipt(receipts_root: Path, attempt_id: str, round_id: str) -> dict[str, object]:
+    if not attempt_id or "/" in attempt_id or attempt_id in {".", ".."}:
+        raise RolloutRoundSealError(f"attempt_id is not path-safe: {attempt_id!r}")
+    path = receipts_root / f"{attempt_id}.sync.json"
+    if path.is_symlink() or not path.is_file():
+        raise RolloutRoundSealError(f"sync receipt missing for accepted episode {attempt_id!r}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RolloutRoundSealError(f"sync receipt unreadable for {attempt_id!r}: {error}") from error
+    if not isinstance(payload, dict):
+        raise RolloutRoundSealError(f"sync receipt for {attempt_id!r} must be a JSON object")
+    if payload.get("schema_version") != 1:
+        raise RolloutRoundSealError(f"sync receipt schema_version for {attempt_id!r} must be 1")
+    if payload.get("round_id") != round_id:
+        raise RolloutRoundSealError(f"sync receipt round_id for {attempt_id!r} does not match the sealed round")
+    if payload.get("readback_verified") is not True:
+        raise RolloutRoundSealError(f"sync receipt readback for {attempt_id!r} is not verified")
+    episode_sha256 = payload.get("episode_sha256")
+    if not isinstance(episode_sha256, str) or not _EPISODE_SHA256_PATTERN.match(episode_sha256):
+        raise RolloutRoundSealError(f"sync receipt episode_sha256 for {attempt_id!r} is invalid")
+    return payload
+
+
+def seal_rollout_round(
+    *,
+    receipts_root: str | Path,
+    round_id: str,
+    attempt_ids: Iterable[str],
+    seal_receipt_path: str | Path,
+) -> RolloutRoundSeal:
+    """Seal one immutable round once every accepted episode is Hub-durable.
+
+    Publication status is tracked separately from validation: an episode only
+    counts after ledger validation, and the round only seals after every
+    readback-verified sync receipt exists.  The seal receipt itself is
+    written once and is never resealed.
+    """
+    receipts_root_path = Path(receipts_root).resolve()
+    if receipts_root_path.is_symlink() or not receipts_root_path.is_dir():
+        raise RolloutRoundSealError("receipts root must be a real directory")
+    if not isinstance(round_id, str) or not _ROUND_ID_PATTERN.match(round_id):
+        raise RolloutRoundSealError(f"round_id must be path-safe lowercase, got {round_id!r}")
+    ids = tuple(attempt_ids)
+    if not ids:
+        raise RolloutRoundSealError("a rollout round must seal at least one accepted episode")
+    if len(ids) != len(set(ids)):
+        raise RolloutRoundSealError("attempt_ids contains duplicates")
+    if len(ids) > MAX_ROLL_ROUND_EPISODES:
+        raise RolloutRoundSealError(f"a rollout round cannot exceed {MAX_ROLL_ROUND_EPISODES} accepted episodes")
+    episode_sha256s: dict[str, str] = {}
+    for attempt_id in ids:
+        payload = _load_sync_receipt(receipts_root_path, attempt_id, round_id)
+        episode_sha256s[attempt_id] = str(payload["episode_sha256"])
+
+    seal_path = Path(seal_receipt_path).resolve()
+    if seal_path.exists() or seal_path.is_symlink():
+        raise RolloutRoundSealError("rollout round seal receipt already exists")
+    seal_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(seal_path, {
+        "schema_version": 1,
+        "kind": "rollout_round_seal",
+        "round_id": round_id,
+        "episode_count": len(ids),
+        "episode_sha256s": episode_sha256s,
+        "readback_verified": True,
+        "seal_sha256": canonical_json_sha256({"round_id": round_id, "episode_sha256s": episode_sha256s}),
+    })
+    return RolloutRoundSeal(round_id, len(ids), episode_sha256s, seal_path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -994,11 +1082,15 @@ __all__ = (
     "CorrectiveCanaryAbortPublicationBundle",
     "CorrectiveCanaryPublicationBundle",
     "CorrectivePublicationResult",
+    "MAX_ROLL_ROUND_EPISODES",
+    "RolloutRoundSeal",
+    "RolloutRoundSealError",
     "build_corrective_canary_abort_publication_bundle",
     "build_corrective_canary_publication_bundle",
     "publish_private_corrective_canary",
     "publish_private_corrective_canary_abort",
     "publish_verified_corrective_rft",
+    "seal_rollout_round",
     "verify_uploaded_corrective_rft",
     "verify_corrective_canary_publication_bundle",
     "verify_corrective_canary_abort_publication_bundle",
