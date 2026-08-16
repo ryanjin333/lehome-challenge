@@ -71,3 +71,12 @@ _build
 
 # Docker history
 .isaac-lab-docker-history
+
+# Nebius infrastructure tooling and state
+infrastructure/nebius/.tools/
+infrastructure/nebius/rollout-stage/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.auto.tfvars
+*.tfvars.secret
