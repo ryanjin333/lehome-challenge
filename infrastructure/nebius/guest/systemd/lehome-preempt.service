@@ -1,0 +1,15 @@
+[Unit]
+Description=Record LeHome preemption shutdown hooks
+DefaultDependencies=no
+After=lehome-workspace.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/opt/lehome/guest/bin/lehome-preempt.sh
+TimeoutStopSec=55
+KillMode=none
+
+[Install]
+WantedBy=multi-user.target

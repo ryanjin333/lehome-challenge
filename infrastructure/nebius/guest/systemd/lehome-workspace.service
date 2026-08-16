@@ -1,0 +1,16 @@
+[Unit]
+Description=Mount and admit the LeHome shared disk role lease
+DefaultDependencies=no
+After=local-fs.target
+Before=lehome-preempt.service
+ConditionPathExists=/opt/lehome/guest/lehome_workspace.py
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/lehome/guest/bin/lehome-workspace.sh
+TimeoutStartSec=120
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
