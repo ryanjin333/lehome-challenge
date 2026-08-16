@@ -28,22 +28,24 @@ PYTHONPATH=source/lehome:trainer/src uv run --project trainer pytest -q \
 echo "== packer fmt + validate =="
 "${PACKER}" init infrastructure/nebius/packer
 "${PACKER}" fmt -check infrastructure/nebius/packer
+echo "== stage rollout runtime code =="
+bash infrastructure/nebius/tools/stage-rollout.sh
+# Validate the directory so plugins.pkr.hcl, variables.pkr.hcl, and both
+# sources load together. The builder plugin parses the service-account key
+# even in offline validation, so point it at a synthetic throwaway PEM that
+# bootstrap.sh generates in the ignored .tools directory.
+VALIDATION_KEY="infrastructure/nebius/.tools/test-validation-key.pem"
+if [[ ! -f "${VALIDATION_KEY}" ]]; then
+  openssl genrsa -out "${VALIDATION_KEY}" 2048 2>/dev/null
+fi
 "${PACKER}" validate \
   -var 'project_id=test-project' \
   -var 'subnet_id=test-subnet' \
   -var 'service_account_id=test-sa' \
   -var 'service_account_public_key_id=test-key' \
-  -var 'service_account_private_key_file=/dev/null' \
+  -var "service_account_private_key_file=${VALIDATION_KEY}" \
   -var 'image_version=0.0.0-test' \
-  infrastructure/nebius/packer/training.pkr.hcl
-"${PACKER}" validate \
-  -var 'project_id=test-project' \
-  -var 'subnet_id=test-subnet' \
-  -var 'service_account_id=test-sa' \
-  -var 'service_account_public_key_id=test-key' \
-  -var 'service_account_private_key_file=/dev/null' \
-  -var 'image_version=0.0.0-test' \
-  infrastructure/nebius/packer/rollout.pkr.hcl
+  infrastructure/nebius/packer
 
 echo "== terraform fmt + validate =="
 for root in infrastructure/nebius/terraform/storage infrastructure/nebius/terraform/runtime; do
