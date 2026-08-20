@@ -440,3 +440,11 @@ exit 0
     assert pull_count.read_text(encoding="utf-8").strip() == "3"
     pulls = [line for line in docker_log.read_text(encoding="utf-8").splitlines() if line.startswith("pull ")]
     assert pulls == [f"pull {TRAINING_OCI}"] * 3
+
+
+def test_training_installer_cleans_staged_guest_only_after_worker_install() -> None:
+    common = (SCRIPTS_DIR / "install-common.sh").read_text(encoding="utf-8")
+    training = (SCRIPTS_DIR / "install-training.sh").read_text(encoding="utf-8")
+
+    assert "rm -rf /tmp/lehome-guest" not in common
+    assert training.index("/tmp/lehome-guest/bin/lehome-experiment-worker.sh") < training.index("rm -rf /tmp/run_lehome_experiment_worker.py /tmp/lehome_train /tmp/lehome-guest")

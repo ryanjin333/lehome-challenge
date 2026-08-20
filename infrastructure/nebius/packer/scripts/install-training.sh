@@ -34,7 +34,7 @@ install -d -m 0755 /opt/lehome/trainer/src
 cp -a /tmp/lehome_train /opt/lehome/trainer/src/lehome_train
 chown -R root:root /opt/lehome/scripts /opt/lehome/trainer
 python3 -m py_compile /opt/lehome/scripts/run_lehome_experiment_worker.py /opt/lehome/trainer/src/lehome_train/groot/experiment_worker.py /opt/lehome/trainer/src/lehome_train/groot/experiment_runtime_request.py
-rm -rf /tmp/run_lehome_experiment_worker.py /tmp/lehome_train
+rm -rf /tmp/run_lehome_experiment_worker.py /tmp/lehome_train /tmp/lehome-guest
 systemctl daemon-reload
 # The worker is installed but deliberately inert until its non-secret env and
 # separate credential files are supplied by the operator.

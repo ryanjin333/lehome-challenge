@@ -52,6 +52,7 @@ systemctl enable lehome-workspace.service lehome-preempt.service
 # Python for the guest services (no third-party packages required).
 apt-get install -y --no-install-recommends python3 git
 
-# Cleanup before image capture.
-rm -rf /tmp/lehome-guest /var/lib/apt/lists/*
+# The training installer consumes the staged experiment-worker files after
+# common setup.  It owns their final removal once that consumer is complete.
+rm -rf /var/lib/apt/lists/*
 apt-get clean
