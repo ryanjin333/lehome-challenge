@@ -1,0 +1,856 @@
+"""Seal one completed persistent-worker unseen-80 evaluation report."""
+
+from __future__ import annotations
+
+import argparse
+from io import BytesIO
+from collections import Counter, defaultdict
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sqlite3
+from typing import Mapping
+from urllib.parse import quote
+
+
+_CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CANDIDATES = ("original_baseline", "new_step_2k")
+_PAIRING_UNAVAILABLE = {"status": "baseline_evaluation_required"}
+_PAIRING_AVAILABLE_FIELDS = {
+    "status", "baseline_report_sha256", "paired_trials", "candidate_wins",
+    "baseline_wins", "ties", "paired_improvement", "progress_improvement",
+    "recovery_improvement",
+}
+_BASELINE_FIELDS = {
+    "schema_version", "kind", "matrix_sha256", "report_sha256", "policy_digest",
+    "episode_artifacts", "promotion_metrics", "readback_verified", "sealed",
+}
+_BASELINE_ARTIFACT_FIELDS = {"trial_id", "official_success", "episode_sha256", "worker_receipt_sha256"}
+
+
+def _sha256_file(path: Path) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"evaluation evidence must be a regular file: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _json_object(path: Path, label: str) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} must be a regular JSON file")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} is invalid") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+def _load_matrix(path: Path, expected_sha256: str) -> list[dict[str, object]]:
+    if not isinstance(expected_sha256, str) or _SHA256.fullmatch(expected_sha256) is None:
+        raise ValueError("matrix SHA-256 is invalid")
+    if _sha256_file(path) != expected_sha256:
+        raise ValueError("matrix SHA-256 mismatch")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("evaluation matrix is invalid") from error
+    if not isinstance(value, list) or not value or len(value) % len(_CATEGORIES) or not all(isinstance(item, dict) for item in value):
+        raise ValueError("evaluation matrix must contain an equal nonzero count for all categories")
+    rows = [dict(item) for item in value]
+    counts = Counter(item.get("category") for item in rows)
+    if set(counts) != set(_CATEGORIES) or len(set(counts.values())) != 1:
+        raise ValueError("evaluation matrix must contain an equal count for all categories")
+    trial_ids = [item.get("trial_id") for item in rows]
+    if not all(isinstance(item, str) and item for item in trial_ids) or len(set(trial_ids)) != len(rows):
+        raise ValueError("evaluation matrix trial IDs are invalid")
+    if any(item.get("release_stage") != "public_unseen" for item in rows):
+        raise ValueError("evaluation matrix must be public-unseen only")
+    return rows
+
+
+def _validate_policy_inputs(
+    candidate_key: str,
+    policy_repo: str,
+    policy_revision: str,
+    policy_step: int,
+    policy_artifact_sha256: str,
+) -> None:
+    if candidate_key not in _CANDIDATES:
+        raise ValueError("candidate key is not approved")
+    if not isinstance(policy_repo, str) or not policy_repo or any(character.isspace() for character in policy_repo):
+        raise ValueError("policy repository is invalid")
+    if not isinstance(policy_revision, str) or _COMMIT.fullmatch(policy_revision) is None:
+        raise ValueError("policy revision must be an immutable commit")
+    if type(policy_step) is not int or policy_step <= 0:
+        raise ValueError("policy step must be a positive integer")
+    if not isinstance(policy_artifact_sha256, str) or _SHA256.fullmatch(policy_artifact_sha256) is None:
+        raise ValueError("policy artifact SHA-256 is invalid")
+
+
+def _open_ledger(path: Path) -> sqlite3.Connection:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("evaluation ledger must be a regular file")
+    # Read-only mode still follows a persisted WAL. ``immutable=1`` would
+    # silently ignore terminal events that have not been checkpointed yet.
+    connection = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _indexed_json_files(root: Path, name: str, id_key: str) -> dict[str, tuple[Path, dict[str, object]]]:
+    indexed: dict[str, tuple[Path, dict[str, object]]] = {}
+    for path in root.rglob(name):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"evaluation {name} evidence is unsafe")
+        payload = _json_object(path, name)
+        identifier = payload.get(id_key)
+        if not isinstance(identifier, str) or not identifier or identifier in indexed:
+            raise ValueError(f"evaluation {name} identities are invalid or duplicated")
+        indexed[identifier] = (path, payload)
+    return indexed
+
+
+def report_sha256(report: Mapping[str, object]) -> str:
+    payload = dict(report)
+    payload.pop("report_sha256", None)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_sha256(value: Mapping[str, object], *, omitted: str = "report_sha256") -> str:
+    body = dict(value)
+    body.pop(omitted, None)
+    return hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    ).hexdigest()
+
+
+def _digest(value: object, label: str) -> str:
+    if type(value) is not str or _SHA256.fullmatch(value) is None:
+        raise ValueError(f"{label} must be SHA-256")
+    return value
+
+
+def _finite(value: object, label: str, *, nonnegative: bool = False) -> float:
+    if type(value) not in (int, float) or not math.isfinite(float(value)) or (nonnegative and float(value) < 0):
+        raise ValueError(f"{label} is invalid")
+    return float(value)
+
+
+def _paired_metrics(
+    legacy: Mapping[str, object],
+    baseline_evidence: Mapping[str, object] | None,
+    *,
+    expected_policy_digest: str,
+) -> dict[str, object]:
+    """Compute paired ranking evidence, or name the missing baseline explicitly.
+
+    An absent 12K reference is never encoded as ``0.0``.  That distinction is
+    important because zero is a real tie, while a missing baseline must block
+    promotion until the exact frozen-matrix evidence is supplied.
+    """
+    if baseline_evidence is None:
+        return dict(_PAIRING_UNAVAILABLE)
+    baseline = dict(baseline_evidence)
+    if set(baseline) != _BASELINE_FIELDS or baseline.get("schema_version") != 1 or baseline.get("kind") != "lehome_experiment_paired_unseen20_baseline":
+        raise ValueError("paired baseline evidence schema is invalid")
+    if baseline.get("readback_verified") is not True or baseline.get("sealed") is not True:
+        raise ValueError("paired baseline evidence is not sealed/read-back verified")
+    if baseline.get("matrix_sha256") != legacy.get("matrix_sha256"):
+        raise ValueError("paired baseline does not use the candidate matrix")
+    baseline_digest = _digest(baseline.get("report_sha256"), "paired baseline report")
+    if baseline_digest != _canonical_sha256(baseline):
+        raise ValueError("paired baseline report digest mismatch")
+    baseline_policy_digest = _digest(baseline.get("policy_digest"), "paired baseline policy")
+    if baseline_policy_digest != expected_policy_digest:
+        raise ValueError("paired baseline policy does not match the pinned original parent")
+    raw_trials = baseline.get("episode_artifacts")
+    if not isinstance(raw_trials, list) or not raw_trials:
+        raise ValueError("paired baseline episode evidence is invalid")
+    outcomes: dict[str, int] = {}
+    for artifact in raw_trials:
+        if not isinstance(artifact, Mapping) or set(artifact) != _BASELINE_ARTIFACT_FIELDS:
+            raise ValueError("paired baseline episode evidence schema is invalid")
+        trial = artifact.get("trial_id")
+        if type(trial) is not str or not trial or trial in outcomes or type(artifact.get("official_success")) is not int or artifact["official_success"] not in (0, 1):
+            raise ValueError("paired baseline episode identity is invalid")
+        _digest(artifact.get("episode_sha256"), "paired baseline episode")
+        _digest(artifact.get("worker_receipt_sha256"), "paired baseline worker receipt")
+        outcomes[trial] = int(artifact["official_success"])
+    candidate_trials = legacy.get("trials")
+    if not isinstance(candidate_trials, list):
+        raise ValueError("candidate trials are invalid")
+    if {item.get("trial_id") for item in candidate_trials if isinstance(item, Mapping)} != set(outcomes):
+        raise ValueError("paired baseline trial identities do not match candidate")
+    candidate_wins = baseline_wins = ties = 0
+    for trial in candidate_trials:
+        if not isinstance(trial, Mapping) or type(trial.get("trial_id")) is not str or type(trial.get("official_success")) is not int:
+            raise ValueError("candidate paired trial is invalid")
+        candidate_success = int(trial["official_success"])
+        baseline_success = outcomes[trial["trial_id"]]
+        if candidate_success > baseline_success:
+            candidate_wins += 1
+        elif candidate_success < baseline_success:
+            baseline_wins += 1
+        else:
+            ties += 1
+    metrics = baseline.get("promotion_metrics")
+    if not isinstance(metrics, Mapping) or set(metrics) != {"progress", "recovery"}:
+        raise ValueError("paired baseline aggregate metrics are invalid")
+    progress = metrics.get("progress")
+    recovery = metrics.get("recovery")
+    if not isinstance(progress, Mapping) or set(progress) != {"observed_episodes", "mean_terminal_progress"} or type(progress.get("observed_episodes")) is not int or progress["observed_episodes"] < 0:
+        raise ValueError("paired baseline progress evidence is invalid")
+    baseline_progress = _finite(progress.get("mean_terminal_progress"), "paired baseline terminal progress", nonnegative=True)
+    if baseline_progress > 1:
+        raise ValueError("paired baseline terminal progress is invalid")
+    if not isinstance(recovery, Mapping) or set(recovery) != {"recovery_attempts", "successful_recoveries"} or type(recovery.get("recovery_attempts")) is not int or type(recovery.get("successful_recoveries")) is not int or not 0 <= recovery["successful_recoveries"] <= recovery["recovery_attempts"]:
+        raise ValueError("paired baseline recovery evidence is invalid")
+    baseline_recovery = (recovery["successful_recoveries"] / recovery["recovery_attempts"]) if recovery["recovery_attempts"] else 0.0
+    candidate_progress = legacy.get("progress")
+    candidate_recovery = legacy.get("recovery")
+    if not isinstance(candidate_progress, Mapping) or not isinstance(candidate_recovery, Mapping):
+        raise ValueError("candidate aggregate metrics are invalid")
+    candidate_progress_value = _finite(candidate_progress.get("mean_terminal_progress"), "candidate terminal progress", nonnegative=True)
+    attempts = candidate_recovery.get("recovery_attempts")
+    recoveries = candidate_recovery.get("successful_recoveries")
+    if type(attempts) is not int or type(recoveries) is not int or not 0 <= recoveries <= attempts:
+        raise ValueError("candidate recovery evidence is invalid")
+    candidate_recovery_value = recoveries / attempts if attempts else 0.0
+    paired_trials = len(candidate_trials)
+    return {
+        "status": "available",
+        "baseline_report_sha256": baseline_digest,
+        "paired_trials": paired_trials,
+        "candidate_wins": candidate_wins,
+        "baseline_wins": baseline_wins,
+        "ties": ties,
+        "paired_improvement": (candidate_wins - baseline_wins) / paired_trials,
+        "progress_improvement": candidate_progress_value - baseline_progress,
+        "recovery_improvement": candidate_recovery_value - baseline_recovery,
+    }
+
+
+def build_paired_baseline_evidence(
+    *,
+    campaign_root: Path,
+    matrix_path: Path,
+    matrix_sha256: str,
+    policy_repo: str,
+    policy_revision: str,
+    policy_step: int,
+    policy_artifact_sha256: str,
+) -> dict[str, object]:
+    """Seal one original-12K (or explicitly supplied) paired baseline run."""
+    legacy = build_report(
+        campaign_root=campaign_root,
+        matrix_path=matrix_path,
+        matrix_sha256=matrix_sha256,
+        candidate_key="original_baseline",
+        policy_repo=policy_repo,
+        policy_revision=policy_revision,
+        policy_step=policy_step,
+        policy_artifact_sha256=policy_artifact_sha256,
+    )
+    # Do not allow a locally sealed evaluator record to stand in for a Hub
+    # receipt.  It shares the final-80 terminal receipt gate even though its
+    # output shape is intentionally smaller.
+    _terminal_sync_artifacts(campaign_root=Path(campaign_root), legacy=legacy)
+    evidence: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "lehome_experiment_paired_unseen20_baseline",
+        "matrix_sha256": matrix_sha256,
+        "policy_digest": policy_artifact_sha256,
+        "episode_artifacts": [
+            {
+                "trial_id": trial["trial_id"],
+                "official_success": trial["official_success"],
+                "episode_sha256": trial["episode_sha256"],
+                "worker_receipt_sha256": trial["worker_receipt_sha256"],
+            }
+            for trial in legacy["trials"]
+        ],
+        "promotion_metrics": {"progress": legacy["progress"], "recovery": legacy["recovery"]},
+        "readback_verified": True,
+        "sealed": True,
+    }
+    evidence["report_sha256"] = _canonical_sha256(evidence)
+    return evidence
+
+
+def build_report(
+    *,
+    campaign_root: Path,
+    matrix_path: Path,
+    matrix_sha256: str,
+    candidate_key: str,
+    policy_repo: str,
+    policy_revision: str,
+    policy_step: int,
+    policy_artifact_sha256: str,
+) -> dict[str, object]:
+    """Verify all 80 terminal artifacts and return a self-hashed score report."""
+
+    _validate_policy_inputs(candidate_key, policy_repo, policy_revision, policy_step, policy_artifact_sha256)
+    root = Path(campaign_root)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("campaign root must be a materialized directory")
+    rows = _load_matrix(Path(matrix_path), matrix_sha256)
+    ledger_path = root / "ledger.sqlite3"
+    with _open_ledger(ledger_path) as ledger:
+        attempts = list(ledger.execute("SELECT attempt_id, schedule_index, assignment_json FROM attempts ORDER BY schedule_index"))
+        if len(attempts) != len(rows):
+            raise ValueError("evaluation ledger does not contain exactly the frozen-matrix attempts")
+        attempt_ids: list[str] = []
+        for index, (attempt, expected) in enumerate(zip(attempts, rows)):
+            try:
+                assignment = json.loads(attempt["assignment_json"])
+            except (TypeError, json.JSONDecodeError) as error:
+                raise ValueError("evaluation ledger assignment is invalid") from error
+            if attempt["schedule_index"] != index or assignment != expected:
+                raise ValueError("evaluation ledger assignments do not match the frozen matrix")
+            attempt_ids.append(str(attempt["attempt_id"]))
+        terminal_by_attempt: dict[str, str] = {}
+        terminal_at_ns: dict[str, int] = {}
+        infrastructure_retry_count = 0
+        gpu_seconds = 0.0
+        for event in ledger.execute("SELECT at_ns, event_type, attempt_id, payload_json FROM events ORDER BY event_id"):
+            if event["event_type"] in {"infrastructure_abort", "retryable", "lease_expired", "preempted"}:
+                infrastructure_retry_count += 1
+                try:
+                    payload = json.loads(event["payload_json"] or "{}")
+                except (TypeError, json.JSONDecodeError) as error:
+                    raise ValueError("evaluation infrastructure event payload is invalid") from error
+                value = payload.get("gpu_seconds", 0.0) if isinstance(payload, dict) else 0.0
+                if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                    raise ValueError("evaluation infrastructure GPU seconds are invalid")
+                gpu_seconds += float(value)
+                continue
+            if event["event_type"] in {"accepted", "rejected"}:
+                attempt_id = str(event["attempt_id"])
+                if attempt_id in terminal_by_attempt:
+                    raise ValueError("evaluation ledger contains duplicate terminal outcomes")
+                terminal_by_attempt[attempt_id] = str(event["event_type"])
+                terminal_at_ns[attempt_id] = int(event["at_ns"])
+    if set(terminal_by_attempt) != set(attempt_ids):
+        raise ValueError("evaluation ledger is missing terminal outcomes")
+
+    episodes = _indexed_json_files(root, "episode.json", "episode_id")
+    receipts = _indexed_json_files(root, "worker-receipt.json", "attempt_id")
+    if set(episodes) != set(attempt_ids) or set(receipts) != set(attempt_ids):
+        raise ValueError("evaluation terminal artifact coverage is incomplete")
+
+    category_scores = {category: {"episodes": 0, "official_successes": 0} for category in _CATEGORIES}
+    garment_scores: dict[str, dict[str, int]] = defaultdict(lambda: {"episodes": 0, "official_successes": 0})
+    trials: list[dict[str, object]] = []
+    code_revisions: set[str] = set()
+    asset_revisions: set[str] = set()
+    simulator_versions: set[str] = set()
+    image_identities: set[str] = set()
+    progress_total = 0.0
+    progress_observed = 0
+    recovery_attempts = 0
+    successful_recoveries = 0
+    safety_failure = False
+    for attempt_id, assignment in zip(attempt_ids, rows):
+        episode_path, episode = episodes[attempt_id]
+        receipt_path, receipt = receipts[attempt_id]
+        identity = episode.get("identity")
+        provenance = episode.get("provenance")
+        if not isinstance(identity, dict) or not isinstance(provenance, dict):
+            raise ValueError("evaluation episode lacks policy identity")
+        if (
+            identity.get("policy_repo") != policy_repo
+            or identity.get("policy_revision") != policy_revision
+            or identity.get("policy_step") != policy_step
+            or provenance.get("policy_artifact_sha256") != policy_artifact_sha256
+        ):
+            raise ValueError("evaluation episode policy identity does not match the served checkpoint")
+        if (
+            identity.get("episode_id") != attempt_id
+            or identity.get("garment_name") != assignment.get("garment_name")
+            or identity.get("category") != assignment.get("category")
+            or identity.get("release_stage") != assignment.get("release_stage")
+            or identity.get("seed") != assignment.get("seed")
+        ):
+            raise ValueError("evaluation episode identity does not match the frozen assignment")
+        if provenance.get("simulator_device") != "cpu" or provenance.get("policy_device") != "cuda:0":
+            raise ValueError("evaluation episode does not prove CPU cloth and GPU policy execution")
+        accepted_success = episode.get("accepted_success")
+        official_success = accepted_success is True and episode.get("outcome") == "success"
+        if type(accepted_success) is not bool:
+            raise ValueError("evaluation episode success field is invalid")
+        metrics = episode.get("metrics", {})
+        if metrics is not None and not isinstance(metrics, dict):
+            raise ValueError("evaluation episode metrics are invalid")
+        metrics = metrics or {}
+        terminal_progress = metrics.get("terminal_progress")
+        if terminal_progress is not None:
+            if type(terminal_progress) not in (int, float) or not math.isfinite(terminal_progress) or not 0 <= float(terminal_progress) <= 1:
+                raise ValueError("evaluation terminal progress is invalid")
+            progress_total += float(terminal_progress)
+            progress_observed += 1
+        recovered = metrics.get("recovered", False)
+        recovery_attempted = metrics.get("recovery_attempted", recovered is True)
+        if type(recovered) is not bool or type(recovery_attempted) is not bool:
+            raise ValueError("evaluation recovery metric is invalid")
+        recovery_attempts += int(recovery_attempted)
+        successful_recoveries += int(recovered)
+        episode_safety = episode.get("safety_failure", False)
+        if type(episode_safety) is not bool:
+            raise ValueError("evaluation safety metric is invalid")
+        safety_failure = safety_failure or episode_safety
+        expected_terminal = "accepted" if official_success else "rejected"
+        if terminal_by_attempt[attempt_id] != expected_terminal:
+            raise ValueError("evaluation ledger terminal outcome disagrees with episode evidence")
+        receipt_outcome = receipt.get("outcome")
+        if not isinstance(receipt_outcome, dict) or receipt_outcome.get("success") is not official_success:
+            raise ValueError("evaluation worker receipt disagrees with episode evidence")
+        category = str(assignment["category"])
+        garment = str(assignment["garment_name"])
+        category_scores[category]["episodes"] += 1
+        garment_scores[garment]["episodes"] += 1
+        if official_success:
+            category_scores[category]["official_successes"] += 1
+            garment_scores[garment]["official_successes"] += 1
+        code_revisions.add(str(identity.get("code_revision")))
+        asset_revisions.add(str(identity.get("asset_revision")))
+        simulator_versions.add(str(identity.get("simulator_version")))
+        image_identities.add(str(provenance.get("image_identity")))
+        trials.append({
+            "schedule_index": len(trials),
+            "trial_id": assignment["trial_id"],
+            "attempt_id": attempt_id,
+            "category": category,
+            "garment": garment,
+            "seed": assignment["seed"],
+            "official_success": int(official_success),
+            "terminal_event": expected_terminal,
+            "episode_sha256": _sha256_file(episode_path),
+            "worker_receipt_sha256": _sha256_file(receipt_path),
+        })
+    for values in (code_revisions, asset_revisions, simulator_versions, image_identities):
+        if len(values) != 1 or "None" in values:
+            raise ValueError("evaluation runtime identity is inconsistent")
+
+    successes = sum(item["official_successes"] for item in category_scores.values())
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "lehome_groot_persistent_unseen80_evaluation",
+        "candidate_key": candidate_key,
+        "identity": {
+            "policy_repo": policy_repo,
+            "policy_revision": policy_revision,
+            "policy_step": policy_step,
+            "policy_artifact_sha256": policy_artifact_sha256,
+            "code_revision": next(iter(code_revisions)),
+            "asset_revision": next(iter(asset_revisions)),
+            "simulator_version": next(iter(simulator_versions)),
+            "image_identity": next(iter(image_identities)),
+        },
+        "matrix_sha256": matrix_sha256,
+        "ledger_sha256": _sha256_file(ledger_path),
+        "completed_at_ns": max(terminal_at_ns.values()),
+        "episodes": len(rows),
+        "official_successes": successes,
+        "success_rate": successes / len(rows),
+        "per_category": {
+            category: {**values, "success_rate": values["official_successes"] / values["episodes"]}
+            for category, values in category_scores.items()
+        },
+        "per_garment": {
+            garment: {**values, "success_rate": values["official_successes"] / values["episodes"]}
+            for garment, values in sorted(garment_scores.items())
+        },
+        "gates": {
+            "overall_ge_70": successes / len(rows) >= 0.70,
+            "each_category_ge_60": all(values["official_successes"] / values["episodes"] >= 0.60 for values in category_scores.values()),
+        },
+        "safety": {"evaluated": False, "physical_approval": False},
+        "infrastructure_retry_count": infrastructure_retry_count,
+        "gpu_seconds": gpu_seconds,
+        "progress": {"observed_episodes": progress_observed, "mean_terminal_progress": progress_total / progress_observed if progress_observed else 0.0},
+        "recovery": {"recovery_attempts": recovery_attempts, "successful_recoveries": successful_recoveries},
+        "safety_failure": safety_failure,
+        "trials": trials,
+    }
+    report["report_sha256"] = report_sha256(report)
+    return report
+
+
+def build_experiment_report(
+    *,
+    experiment_job: object,
+    checkpoint_publication: Mapping[str, object],
+    campaign_root: Path,
+    matrix_path: Path,
+    matrix_sha256: str,
+    baseline_evidence: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Build the controller-facing report from terminal rollout evidence.
+
+    This is intentionally a thin binding over the existing artifact verifier:
+    it does not trust a score file from a worker, and it records the exact
+    publication receipt and immutable artifact the policy server loaded.
+    """
+    from lehome_train.groot.experiment_publication import parse_checkpoint_publication
+
+    publication = parse_checkpoint_publication(checkpoint_publication)
+    experiment_id = getattr(experiment_job, "experiment_id", None)
+    training = getattr(experiment_job, "training", None)
+    evaluation = getattr(experiment_job, "evaluation", None)
+    if not isinstance(experiment_id, str) or publication.experiment_id != experiment_id or publication.job_digest != experiment_id or publication.target_step != getattr(training, "target_step", None):
+        raise ValueError("strict report does not bind the experiment job")
+    if matrix_sha256 != getattr(evaluation, "matrix_sha256", None):
+        raise ValueError("strict report does not bind the frozen evaluation matrix")
+    legacy = build_report(
+        campaign_root=campaign_root,
+        matrix_path=matrix_path,
+        matrix_sha256=matrix_sha256,
+        candidate_key="new_step_2k",
+        policy_repo=publication.repository,
+        policy_revision=publication.immutable_revision,
+        policy_step=publication.target_step,
+        policy_artifact_sha256=publication.artifact_sha256,
+    )
+    per_category = legacy["per_category"]
+    if not isinstance(per_category, dict) or set(per_category) != set(_CATEGORIES):
+        raise ValueError("strict report is missing category evidence")
+    categories = {
+        category: {
+            "successes": per_category[category]["official_successes"],
+            "episodes": per_category[category]["episodes"],
+        }
+        for category in _CATEGORIES
+    }
+    trainer = getattr(experiment_job, "trainer", None)
+    data_sources = getattr(experiment_job, "data_sources", None)
+    if not isinstance(trainer, Mapping) or not isinstance(data_sources, tuple):
+        raise ValueError("strict report has no immutable trainer/data bindings")
+    expected_baseline_policy = _digest(
+        getattr(evaluation, "policy_digest", None),
+        "pinned original baseline policy",
+    )
+    pairing = _paired_metrics(
+        legacy,
+        baseline_evidence,
+        expected_policy_digest=expected_baseline_policy,
+    )
+    report = {
+        "schema_version": 1,
+        "experiment_id": experiment_id,
+        "checkpoint_receipt_sha256": publication.receipt_sha256,
+        "matrix_sha256": matrix_sha256,
+        "policy_digest": publication.artifact_sha256,
+        "categories": categories,
+        "episode_artifacts": legacy["trials"],
+        "promotion_metrics": {
+            "overall_successes": legacy["official_successes"],
+            "overall_episodes": legacy["episodes"],
+            "overall_success_rate": legacy["success_rate"],
+            "safety_failure": legacy["safety_failure"],
+            # The controller may rank only a report with ``available`` pairing
+            # evidence.  A missing baseline is intentionally typed rather than
+            # silently treated as a neutral paired score.
+            "paired_improvement": pairing.get("paired_improvement", 0.0),
+            "gpu_seconds": legacy["gpu_seconds"],
+            "infrastructure_retry_count": legacy["infrastructure_retry_count"],
+            "progress": legacy["progress"],
+            "recovery": legacy["recovery"],
+            "pairing": pairing,
+        },
+        "provenance": {
+            "trainer": dict(trainer),
+            "runtime": {
+                "code_revision": legacy["identity"]["code_revision"],
+                "asset_revision": legacy["identity"]["asset_revision"],
+                "simulator_version": legacy["identity"]["simulator_version"],
+                "image_identity": legacy["identity"]["image_identity"],
+            },
+            "data_sources": [
+                {"kind": source.kind, "repository": source.repository, "revision": source.revision, "prefix": source.prefix, "manifest_sha256": source.manifest_sha256, "tree_sha256": source.tree_sha256}
+                for source in data_sources
+            ],
+        },
+        "strict_seal": False,
+        "evidence_report_sha256": legacy["report_sha256"],
+    }
+    report["report_sha256"] = report_sha256(report)
+    return report
+
+
+def _terminal_sync_artifacts(*, campaign_root: Path, legacy: Mapping[str, object]) -> list[dict[str, object]]:
+    """Bind every final episode to its own Hub read-back receipt.
+
+    The normal training/promotion report deliberately keeps a local evidence
+    shape.  Final unseen-80 selection is stricter: every terminal episode must
+    have a separate immutable Hub receipt.  This helper refuses to upgrade
+    local-only outcomes into a final candidate receipt.
+    """
+    trials = legacy.get("trials")
+    if not isinstance(trials, list):
+        raise ValueError("final evaluation trial evidence is invalid")
+    receipts_root = campaign_root / "hf-sync-receipts"
+    if receipts_root.is_symlink() or not receipts_root.is_dir():
+        raise ValueError("final evaluation requires terminal Hub sync receipts")
+    final: list[dict[str, object]] = []
+    for trial in trials:
+        if not isinstance(trial, Mapping):
+            raise ValueError("final evaluation trial evidence is invalid")
+        attempt = trial.get("attempt_id")
+        trial_id = trial.get("trial_id")
+        category = trial.get("category")
+        success = trial.get("official_success")
+        if type(attempt) is not str or _SHA256.fullmatch(attempt) is None or type(trial_id) is not str or not trial_id or category not in _CATEGORIES or type(success) is not int or success not in (0, 1):
+            raise ValueError("final evaluation trial identity is invalid")
+        sync_path = receipts_root / f"{attempt}.sync.json"
+        receipt = _json_object(sync_path, "final evaluation Hub receipt")
+        required = {
+            "schema_version", "attempt_id", "repository", "round_id", "remote_prefix",
+            "publication_ref", "immutable_revision", "entry_count", "episode_sha256",
+            "readback_verified",
+        }
+        if set(receipt) != required or receipt.get("schema_version") != 1 or receipt.get("attempt_id") != attempt or receipt.get("readback_verified") is not True:
+            raise ValueError("final evaluation Hub receipt is not read-back verified")
+        if type(receipt.get("immutable_revision")) is not str or _COMMIT.fullmatch(receipt["immutable_revision"]) is None or type(receipt.get("entry_count")) is not int or receipt["entry_count"] <= 0:
+            raise ValueError("final evaluation Hub receipt identity is invalid")
+        final.append({
+            "trial_id": trial_id,
+            "category": category,
+            "official_success": success,
+            "artifact_sha256": _digest(receipt.get("episode_sha256"), "final evaluation episode"),
+            "receipt_sha256": _sha256_file(sync_path),
+            "readback_verified": True,
+            "sealed": True,
+        })
+    return final
+
+
+def _seen_regression_flag(value: Mapping[str, object]) -> bool:
+    """Require an explicit sealed/read-back seen-regression decision."""
+    document = dict(value)
+    expected = {
+        "schema_version", "kind", "candidate_checkpoint_receipt_sha256",
+        "major_seen_regression", "readback_verified", "sealed", "report_sha256",
+    }
+    if set(document) != expected or document.get("schema_version") != 1 or document.get("kind") != "lehome_experiment_seen_regression_evidence" or document.get("readback_verified") is not True or document.get("sealed") is not True or type(document.get("major_seen_regression")) is not bool:
+        raise ValueError("final evaluation seen-regression evidence is invalid")
+    _digest(document.get("candidate_checkpoint_receipt_sha256"), "seen-regression checkpoint receipt")
+    digest = _digest(document.get("report_sha256"), "seen-regression report")
+    if digest != _canonical_sha256(document):
+        raise ValueError("final evaluation seen-regression evidence digest mismatch")
+    return bool(document["major_seen_regression"])
+
+
+def build_final_unseen80_report(
+    *,
+    experiment_job: object,
+    checkpoint_publication: Mapping[str, object],
+    campaign_root: Path,
+    matrix_path: Path,
+    matrix_sha256: str,
+    candidate_id: str,
+    seen_regression_evidence: Mapping[str, object],
+) -> dict[str, object]:
+    """Emit the sealed final-evaluation receipt consumed by winner selection.
+
+    This is deliberately distinct from :func:`build_experiment_report`: the
+    latter is an unseen-20 promotion report, while this path permits only a
+    frozen 80-row, 20-per-category public-unseen matrix with terminal Hub
+    receipts for every episode.
+    """
+    from lehome_train.groot.experiment_publication import parse_checkpoint_publication
+    from lehome_train.groot.experiment_winner import seal_final_unseen80_report
+
+    publication = parse_checkpoint_publication(checkpoint_publication)
+    experiment_id = getattr(experiment_job, "experiment_id", None)
+    training = getattr(experiment_job, "training", None)
+    if type(experiment_id) is not str or publication.canonical.get("schema_version") != 2 or publication.experiment_id != experiment_id or publication.job_digest != experiment_id or publication.target_step != getattr(training, "target_step", None):
+        raise ValueError("final evaluation does not bind a publication-v2 experiment job")
+    if type(candidate_id) is not str or not candidate_id:
+        raise ValueError("final evaluation candidate ID is invalid")
+    rows = _load_matrix(Path(matrix_path), matrix_sha256)
+    if len(rows) != 80 or any(sum(item.get("category") == category for item in rows) != 20 for category in _CATEGORIES):
+        raise ValueError("final evaluation requires the exact frozen unseen-80 matrix")
+    legacy = build_report(
+        campaign_root=campaign_root,
+        matrix_path=matrix_path,
+        matrix_sha256=matrix_sha256,
+        candidate_key="new_step_2k",
+        policy_repo=publication.repository,
+        policy_revision=publication.immutable_revision,
+        policy_step=publication.target_step,
+        policy_artifact_sha256=publication.artifact_sha256,
+    )
+    artifacts = _terminal_sync_artifacts(campaign_root=Path(campaign_root), legacy=legacy)
+    categories = {
+        category: {
+            "successes": int(legacy["per_category"][category]["official_successes"]),
+            "episodes": int(legacy["per_category"][category]["episodes"]),
+        }
+        for category in _CATEGORIES
+    }
+    seen = _seen_regression_flag(seen_regression_evidence)
+    if seen_regression_evidence.get("candidate_checkpoint_receipt_sha256") != publication.receipt_sha256:
+        raise ValueError("final evaluation seen-regression evidence does not bind checkpoint")
+    report = seal_final_unseen80_report({
+        "schema_version": 2,
+        "kind": "lehome_experiment_final_unseen80",
+        "candidate_id": candidate_id,
+        "experiment_id": experiment_id,
+        "checkpoint_receipt_sha256": publication.receipt_sha256,
+        "checkpoint_publication": dict(publication.canonical),
+        "matrix_sha256": matrix_sha256,
+        "policy_digest": publication.artifact_sha256,
+        "categories": categories,
+        "overall_successes": int(legacy["official_successes"]),
+        "episode_artifacts": artifacts,
+        "safety_failure": bool(legacy["safety_failure"]),
+        "major_seen_regression": seen,
+    })
+    return report
+
+
+def write_experiment_report(path: Path, report: Mapping[str, object]) -> Path:
+    """Atomically publish a controller report and immutable digest sidecar."""
+    output = Path(path)
+    write_report(output, report)
+    sidecar = output.with_suffix(output.suffix + ".sha256")
+    descriptor = os.open(sidecar, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+            handle.write(_sha256_file(output) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        sidecar.unlink(missing_ok=True)
+        raise
+    directory = os.open(output.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return output
+
+
+class HuggingFaceFinalReportTransport:
+    """Small explicit Hugging Face adapter used only by the final publisher."""
+
+    def __init__(self, token_file: Path) -> None:
+        token = Path(token_file)
+        if token.is_symlink() or not token.is_file() or (token.stat().st_mode & 0o777) != 0o600:
+            raise ValueError("final Hugging Face token file is unsafe")
+        self.token = token.read_text(encoding="utf-8").strip()
+        if not self.token:
+            raise ValueError("final Hugging Face token is empty")
+
+    def _api(self):
+        try:
+            from huggingface_hub import HfApi
+        except ImportError as error:
+            raise RuntimeError("huggingface_hub is required for final report publication") from error
+        return HfApi(token=self.token)
+
+    def upload_bytes(self, repository: str, path: str, payload: bytes) -> None:
+        self._api().upload_file(
+            path_or_fileobj=BytesIO(payload),
+            path_in_repo=path,
+            repo_id=repository,
+            repo_type="dataset",
+            commit_message="publish immutable LeHome final unseen-80 receipt",
+        )
+
+    def read_bytes(self, repository: str, path: str) -> bytes:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as error:
+            raise RuntimeError("huggingface_hub is required for final report readback") from error
+        downloaded = hf_hub_download(repo_id=repository, repo_type="dataset", filename=path, force_download=True, token=self.token)
+        return Path(downloaded).read_bytes()
+
+
+def write_final_unseen80_report(
+    path: Path,
+    report: Mapping[str, object],
+    *,
+    transport: object,
+    repository: str,
+    remote_path: str,
+) -> Path:
+    """Publish/read back the final receipt before persisting a local copy."""
+    from lehome_train.groot.experiment_winner import publish_final_unseen80_report
+
+    published = publish_final_unseen80_report(
+        report,
+        transport=transport,
+        repository=repository,
+        path=remote_path,
+    )
+    return write_experiment_report(path, published)
+
+
+def write_report(path: Path, report: Mapping[str, object]) -> None:
+    output = Path(path)
+    if output.exists() or output.is_symlink():
+        raise ValueError("evaluation report output must not already exist")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--campaign-root", type=Path, required=True)
+    parser.add_argument("--matrix", type=Path, required=True)
+    parser.add_argument("--matrix-sha256", required=True)
+    parser.add_argument("--candidate-key", choices=_CANDIDATES, required=True)
+    parser.add_argument("--policy-repo", required=True)
+    parser.add_argument("--policy-revision", required=True)
+    parser.add_argument("--policy-step", type=int, required=True)
+    parser.add_argument("--policy-artifact-sha256", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    report = build_report(
+        campaign_root=args.campaign_root,
+        matrix_path=args.matrix,
+        matrix_sha256=args.matrix_sha256,
+        candidate_key=args.candidate_key,
+        policy_repo=args.policy_repo,
+        policy_revision=args.policy_revision,
+        policy_step=args.policy_step,
+        policy_artifact_sha256=args.policy_artifact_sha256,
+    )
+    write_report(args.output, report)
+    print(report["report_sha256"])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

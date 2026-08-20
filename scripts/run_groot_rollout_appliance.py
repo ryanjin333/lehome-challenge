@@ -20,8 +20,11 @@ from dataclasses import replace as dataclasses_replace
 import json
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+from uuid import uuid4
 
 
+DEFAULT_POLICY_GATEWAY_ENDPOINT = "tcp://127.0.0.1:15555"
+DEFAULT_POLICY_TIMEOUT_SECONDS = 180
 APPLIANCE_SERVICES = (
     "workspace_admission",
     "policy_server",
@@ -51,6 +54,10 @@ class ApplianceConfig:
     renderer_device: str
     policy_device: str
     debug_low_worker_count: bool = False
+    database: Path | None = None
+    attempt_matrix: Path | None = None
+    policy_ready_file: Path | None = None
+    initial_garment: str = "Top_Long_Unseen_0"
 
     def __post_init__(self) -> None:
         if self.worker_count < 1:
@@ -132,20 +139,32 @@ def build_process_topology(config: ApplianceConfig) -> ProcessTopology:
         command=("run_groot_artifact_sync.py", "--role", "uploader"),
         cpu_cores=allocate(1),
     ))
+    workspace = config.workspace_root
+    database = config.database or (workspace / "rollouts" / "ledger.sqlite3")
+    attempt_matrix = config.attempt_matrix or (workspace / "eval" / "matrices" / "unseen-80.json")
+    policy_ready_file = config.policy_ready_file or (
+        workspace / "eval" / "receipts" / "policy" / "ready.json"
+    )
     for index in range(config.worker_count):
         worker_root = config.workspace_root / "rollouts" / "attempts" / f"worker-{index}"
+        session_id = f"worker-{index}-{uuid4().hex}"
         services.append(ServiceSpec(
             name=f"worker-{index}",
             service="worker",
             command=(
                 "run_groot_persistent_worker.py",
                 "--worker-id", f"worker-{index}",
-                "--session-id", f"session-{index}",
+                "--session-id", session_id,
                 "--policy-gateway-endpoint", config.policy_gateway_endpoint,
                 "--policy-sha256", config.policy_sha256,
                 "--renderer-device", config.renderer_device,
                 "--policy-device", config.policy_device,
                 "--output-root", str(worker_root),
+                "--database", str(database),
+                "--attempt-matrix", str(attempt_matrix),
+                "--policy-ready-file", str(policy_ready_file),
+                "--initial-garment", config.initial_garment,
+                "--policy-timeout-seconds", str(DEFAULT_POLICY_TIMEOUT_SECONDS),
             ),
             cpu_cores=allocate(WORKER_CORES),
             output_root=worker_root,
@@ -247,7 +266,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--worker-count", type=int, default=PRODUCTION_WORKER_COUNT)
     parser.add_argument("--vcpu-budget", type=int, default=24)
     parser.add_argument("--policy-sha256", required=True)
-    parser.add_argument("--policy-gateway-endpoint", default="tcp://127.0.0.1:5555")
+    parser.add_argument("--policy-gateway-endpoint", default=DEFAULT_POLICY_GATEWAY_ENDPOINT)
     parser.add_argument("--renderer-device", default="cuda:0")
     parser.add_argument("--policy-device", default="cuda:0")
     parser.add_argument("--debug-low-worker-count", action="store_true")

@@ -13,7 +13,11 @@ terraform {
   }
 }
 
-provider "nebius" {}
+provider "nebius" {
+  profile = {
+    name = var.nebius_profile
+  }
+}
 
 resource "nebius_compute_v1_instance" "runtime" {
   parent_id = var.parent_id
@@ -24,6 +28,9 @@ resource "nebius_compute_v1_instance" "runtime" {
     preset   = "1gpu-24vcpu-218gb"
   }
 
+  # Runtime infrastructure is stopped at rest. Starting paid GPU compute is an
+  # explicit operator action after the immutable run inputs are ready.
+  stopped         = true
   recovery_policy = "FAIL"
 
   preemptible = {
@@ -38,7 +45,7 @@ resource "nebius_compute_v1_instance" "runtime" {
       name = "lehome-${var.active_role}-boot"
       spec = {
         type            = "NETWORK_SSD"
-        size_gibibytes  = 128
+        size_gibibytes  = 192
         source_image_id = var.image_id
       }
     }
@@ -66,6 +73,26 @@ resource "nebius_compute_v1_instance" "runtime" {
       }
     }
   ]
+
+  # First-boot operator access only. The public key is not a secret; the
+  # matching private key never enters Terraform state.
+  cloud_init_user_data = <<-EOT
+    #cloud-config
+    users:
+      - name: ubuntu
+        sudo: ALL=(ALL) NOPASSWD:ALL
+        groups: [sudo]
+        shell: /bin/bash
+        ssh_authorized_keys:
+          - ${var.ssh_public_key}
+    write_files:
+      - path: /etc/lehome/runtime.env
+        permissions: "0644"
+        content: |
+          LEHOME_ROLE=${var.active_role}
+          LEHOME_RUN_ID=lehome-rft-70-30-v1
+          LEHOME_WORKSPACE_DEVICE=/dev/disk/by-id/virtio-lehome
+    EOT
 
   labels = {
     lehome_role            = var.active_role

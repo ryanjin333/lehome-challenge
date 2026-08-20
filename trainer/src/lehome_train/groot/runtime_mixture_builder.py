@@ -24,7 +24,8 @@ import re
 import pyarrow.parquet as pq
 
 from lehome_train.groot.runtime_mixture import (
-    ACTION_HORIZON, APPROVED_MIXTURE_REPOSITORY, CAMERAS, FPS, INSTRUCTION,
+    ACTION_HORIZON, APPROVED_BC_REPOSITORY, APPROVED_MIXTURE_REPOSITORY,
+    APPROVED_ROLLOUT_REPOSITORY, CAMERAS, FPS, INSTRUCTION,
     pending_mixture_id, source_tree_sha256,
 )
 from lehome_train.groot.experiment_manifest import load_experiment_manifest
@@ -185,12 +186,15 @@ def _source_publications(path: Path) -> dict[str, dict[str, object]]:
     if set(document) != {"schema_version", "kind", "sources"} or document["schema_version"] != 1 or document["kind"] != "runtime_mixture_source_publications" or not isinstance(document["sources"], list):
         raise ValueError("runtime mixture source publications have an incompatible schema")
     result: dict[str, dict[str, object]] = {}
-    expected = {"organizer": ("bc", "bc/full"), "rollout": ("rollout", None)}
+    expected = {
+        "organizer": ("bc", "bc/full", APPROVED_BC_REPOSITORY),
+        "rollout": ("rollout", None, APPROVED_ROLLOUT_REPOSITORY),
+    }
     for item in document["sources"]:
         if not isinstance(item, dict) or set(item) != {"source_id", "source_type", "repository", "revision", "prefix", "readback_receipt_path", "readback_receipt_sha256"}:
             raise ValueError("runtime mixture source publication entry is malformed")
         source_id, source_type, prefix = item["source_id"], item["source_type"], item["prefix"]
-        if source_id not in expected or source_id in result or source_type != expected[source_id][0] or item["repository"] != APPROVED_MIXTURE_REPOSITORY or type(item["revision"]) is not str or re.fullmatch(r"[0-9a-f]{40}", item["revision"]) is None or type(prefix) is not str:
+        if source_id not in expected or source_id in result or source_type != expected[source_id][0] or item["repository"] != expected[source_id][2] or type(item["revision"]) is not str or re.fullmatch(r"[0-9a-f]{40}", item["revision"]) is None or type(prefix) is not str:
             raise ValueError("runtime mixture source publication identity is invalid")
         expected_prefix = expected[source_id][1]
         if (expected_prefix is not None and prefix != expected_prefix) or (
@@ -245,17 +249,42 @@ def _require_selected_campaign_acceptance(
 
 
 def validate_selected_bindings(document: Mapping[str, object], campaign_receipt: Mapping[str, object]) -> dict[str, str]:
-    """Authenticate the exact selected-150 ledger before it reaches windows.
+    """Authenticate the bounded selected-success ledger before it reaches windows.
 
     ``episode_manifest_sha256`` is the immutable historical selected-index key.
     Its value binds ``raw/<attempt>/SHA256SUMS.json``; campaign receipts bind
     acceptance identity and never carried a duplicate artifact hash.
+
+    Schema 1 is the historical ``selected-150.json`` shape and deliberately
+    derives its count from rows.  Schema 2 adds the count/cap explicitly for
+    new adapters while retaining the filename used by downstream publication.
     """
 
-    if set(document) != {"schema_version", "selection_sha256", "selected_bindings"} or document.get("schema_version") != 1 or not isinstance(document.get("selected_bindings"), list):
+    schema = document.get("schema_version")
+    legacy_keys = {"schema_version", "selection_sha256", "selected_bindings"}
+    explicit_keys = legacy_keys | {"selected_count", "max_selected_count"}
+    schema_matches = (
+        (schema == 1 and set(document) == legacy_keys)
+        or (schema == 2 and set(document) == explicit_keys)
+    )
+    if not schema_matches or not isinstance(document.get("selected_bindings"), list):
         raise ValueError("selected-150 document has an incompatible schema")
     rows = document["selected_bindings"]
-    if document.get("selection_sha256") != canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}) or len(rows) != 150:
+    binding = (
+        {"schema_version": 1, "selected_bindings": rows}
+        if schema == 1 else {
+            "schema_version": 2, "selected_count": document.get("selected_count"),
+            "max_selected_count": document.get("max_selected_count"), "selected_bindings": rows,
+        }
+    )
+    if (
+        document.get("selection_sha256") != canonical_json_sha256(binding)
+        or not 1 <= len(rows) <= 150
+        or (schema == 2 and (
+            document.get("selected_count") != len(rows)
+            or document.get("max_selected_count") != 150
+        ))
+    ):
         raise ValueError("selected-150 canonical binding is invalid")
     campaign_attempts = _campaign_attempt_ledger(campaign_receipt)
     result: dict[str, str] = {}
@@ -267,7 +296,7 @@ def validate_selected_bindings(document: Mapping[str, object], campaign_receipt:
             raise ValueError("selected-150 identity or checksum-manifest binding is invalid")
         _require_selected_campaign_acceptance(attempt_id, episode_id, campaign_attempts.get(attempt_id))
         result[attempt_id] = checksum_manifest_sha256
-    if len(result) != 150:
+    if len(result) != len(rows):
         raise ValueError("selected-150 bindings are not unique")
     return result
 
@@ -281,13 +310,13 @@ def validate_selected_raw_roots(
 ) -> dict[str, str]:
     """Verify every selected raw artifact before any window can authorize a read.
 
-    The selected index is a closed 150-root verification allowlist, while the
+    The selected index is a closed bounded verification allowlist, while the
     campaign can retain nonselected, rejected attempt evidence.  In particular,
     an unused selected attempt must still pass its terminal raw artifact
     manifest and acceptance binding before normalization can begin.
     """
-    if len(selected) != 150:
-        raise ValueError("selected raw roots must contain exactly 150 bindings")
+    if not 1 <= len(selected) <= 150:
+        raise ValueError("selected raw roots must contain one to 150 bindings")
     campaign = Path(campaign_root)
     raw = campaign / "raw"
     if campaign.is_symlink() or not campaign.is_dir() or raw.is_symlink() or not raw.is_dir():
@@ -476,6 +505,56 @@ def validate_plan_windows(plan: Mapping[str, Any], *, organizer_manifest: Path, 
     return [unique[key] for key in sorted(unique)]
 
 
+def validate_generated_runtime_plan_bindings(
+    plan: Mapping[str, object], *, organizer_root: Path, campaign_root: Path,
+    organizer_manifest: Path, campaign_receipt: Path, selected_bindings: Path,
+    garment_index: Path, experiment: object,
+) -> None:
+    """Fail closed if a new standalone plan was made from different inputs.
+
+    Legacy plans do not carry this envelope.  Schema-1 runtime plans do, so a
+    stale plan cannot be paired with a newly adapted source, BC index, or a
+    different batch-64 70/30 experiment profile.
+    """
+    if plan.get("kind") != "runtime_mixture_plan":
+        return
+    expected_keys = {"schema_version", "kind", "input_bindings", "selected_frame_ranges", "sha256"}
+    if set(plan) != expected_keys or plan.get("schema_version") != 1 or not isinstance(plan.get("input_bindings"), Mapping):
+        raise ValueError("generated runtime plan schema is incompatible")
+    bindings = plan["input_bindings"]
+    expected_binding_keys = {
+        "organizer_manifest_sha256", "organizer_tree_sha256", "campaign_receipt_sha256",
+        "campaign_tree_sha256", "selected_bindings_sha256", "source_lineage_sha256",
+        "garment_index_sha256", "experiment_config_sha256", "runtime_schedule",
+    }
+    if set(bindings) != expected_binding_keys:
+        raise ValueError("generated runtime plan input bindings are incomplete")
+    from lehome_train.groot.runtime_mixture import source_tree_sha256
+
+    actual = {
+        "organizer_manifest_sha256": sha256_file(organizer_manifest),
+        "organizer_tree_sha256": source_tree_sha256(organizer_root),
+        "campaign_receipt_sha256": sha256_file(campaign_receipt),
+        "campaign_tree_sha256": source_tree_sha256(campaign_root),
+        "selected_bindings_sha256": sha256_file(selected_bindings),
+        "source_lineage_sha256": control_file_sha256(campaign_root / "source-lineage.json", label="source lineage"),
+        "garment_index_sha256": sha256_file(garment_index),
+    }
+    for name, value in actual.items():
+        if bindings.get(name) != value:
+            raise ValueError("generated runtime plan input binding drift")
+    from lehome_train.groot.experiment_manifest import runtime_profile_document
+
+    if bindings.get("experiment_config_sha256") != canonical_json_sha256(runtime_profile_document(experiment)):
+        raise ValueError("generated runtime plan experiment profile drift")
+    schedule = bindings.get("runtime_schedule")
+    if not isinstance(schedule, Mapping) or dict(schedule) != {
+        "bc": experiment.weights["bc"], "rollout": experiment.weights["rollout"],
+        "batch_size": 64, "action_horizon": ACTION_HORIZON,
+    }:
+        raise ValueError("generated runtime plan scheduling profile drift")
+
+
 def _raw_attempt(root: Path, attempt_id: str, expected_checksum_manifest_sha256: str) -> tuple[list[list[float]], list[list[float]]]:
     """Read a previously full-tree-verified raw attempt for normalization.
 
@@ -485,7 +564,9 @@ def _raw_attempt(root: Path, attempt_id: str, expected_checksum_manifest_sha256:
     attempt = root / "raw" / attempt_id
     sums = attempt / "SHA256SUMS.json"
     episode = _load(attempt / "episode.json", "raw episode")
-    if sums.is_symlink() or not sums.is_file() or sha256_file(sums) != expected_checksum_manifest_sha256 or episode.get("accepted_success") is not True or episode.get("outcome") != "success" or episode.get("terminal_reason") != "success" or not isinstance(episode.get("identity"), dict) or episode["identity"].get("release_stage") != "seen":
+    from lehome_train.flywheel.materialize import _is_autonomous_policy_success
+
+    if sums.is_symlink() or not sums.is_file() or sha256_file(sums) != expected_checksum_manifest_sha256 or not _is_autonomous_policy_success(episode) or not isinstance(episode.get("identity"), dict) or episode["identity"].get("release_stage") != "seen":
         raise ValueError("raw rollout acceptance or checksum binding drift")
     rows: list[dict[str, Any]] = []
     for line in (attempt / "annotations.jsonl").read_text(encoding="utf-8").splitlines():
@@ -546,9 +627,23 @@ def build_runtime_mixture(*, organizer_root: str | Path, campaign_root: str | Pa
     receipt = _load(campaign_receipt, "campaign receipt")
     selected_document = _load(selected_bindings_path, "selected rollout bindings")
     selected = validate_selected_bindings(selected_document, receipt)
+    if selected_document.get("schema_version") == 2:
+        # New multi-round sources are derived adapters rather than legacy
+        # monolithic campaigns.  Recheck their copied seals, immutable Hub
+        # receipts, and origin digests every time before any window is admitted.
+        from lehome_train.groot.rollout_source_adapter import validate_derived_rollout_source
+
+        validate_derived_rollout_source(campaign, selected=selected, campaign_receipt=receipt)
     experiment = load_experiment_manifest(experiment_manifest_path)
     assert experiment.bc_bundle.garment_index_path is not None
     assert experiment.bc_bundle.garment_index_sha256 is not None
+    validate_generated_runtime_plan_bindings(
+        plan, organizer_root=organizer, campaign_root=campaign,
+        organizer_manifest=organizer_manifest, campaign_receipt=campaign_receipt,
+        selected_bindings=selected_bindings_path,
+        garment_index=organizer / experiment.bc_bundle.garment_index_path,
+        experiment=experiment,
+    )
     load_authenticated_bc_garment_index(
         organizer, organizer_manifest, experiment.bc_bundle.garment_index_path,
         experiment.bc_bundle.garment_index_sha256,

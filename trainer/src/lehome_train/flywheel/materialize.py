@@ -40,15 +40,16 @@ class MaterializationReport:
 
 def _is_autonomous_policy_success(raw: Mapping[str, object]) -> bool:
     """Accept either the legacy autonomous marker or the closed release schema."""
-    if not (
-        raw.get("accepted_success") is True
-        and raw.get("outcome") == "success"
-        and raw.get("terminal_reason") == "success"
-    ):
+    if raw.get("accepted_success") is not True or raw.get("outcome") != "success":
         return False
     mode = raw.get("mode")
     if mode is not None:
-        return mode == "autonomous"
+        return mode == "autonomous" and raw.get("terminal_reason") == "success"
+    # Persistent collection evaluates the official success predicate on the
+    # last frame.  A trajectory may therefore be accepted at its horizon even
+    # though the worker's lifecycle reason remains ``horizon``.
+    if raw.get("terminal_reason") not in {"success", "horizon"}:
+        return False
     provenance = raw.get("provenance")
     if not isinstance(provenance, Mapping):
         return False
@@ -59,7 +60,7 @@ def _is_autonomous_policy_success(raw: Mapping[str, object]) -> bool:
         and raw.get("bc_target_count") == 0
         and provenance.get("execution_backend") == "policy_server"
         and provenance.get("execution_mode") == "policy_server"
-        and provenance.get("parity_stage") == "server_cpu"
+        and provenance.get("parity_stage") in {"server_cpu", "persistent_collection"}
         and provenance.get("simulator_device") == "cpu"
         and isinstance(policy_device, str)
         and policy_device.startswith("cuda:")

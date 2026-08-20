@@ -1,0 +1,26 @@
+[Unit]
+Description=LeHome experiment controller
+After=network-online.target lehome-experiment-controller-state.service lehome-experiment-controller-proxy.service
+Requires=lehome-experiment-controller-state.service
+Requires=lehome-experiment-controller-proxy.service
+Wants=network-online.target
+ConditionPathExists=/etc/lehome/experiment-bootstrap.ready
+[Service]
+Type=simple
+User=lehome-controller
+EnvironmentFile=/etc/lehome/experiment-controller.env
+LoadCredential=controller-token:/etc/lehome/private/controller-token
+Environment=LEHOME_CONTROLLER_TOKEN_FILE=%d/controller-token
+ExecStart=/usr/local/bin/lehome-experiment-controller
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=55
+KillMode=process
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/lehome/controller
+RuntimeDirectory=lehome-controller
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+[Install]
+WantedBy=multi-user.target

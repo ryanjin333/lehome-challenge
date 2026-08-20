@@ -6,6 +6,7 @@ import subprocess
 import tarfile
 import threading
 import time
+from typing import Callable
 
 import pytest
 
@@ -18,6 +19,13 @@ assert SPEC is not None and SPEC.loader is not None
 LIFECYCLE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = LIFECYCLE
 SPEC.loader.exec_module(LIFECYCLE)
+
+# Runtime training deliberately reads BC from the public data repository and
+# rollouts plus the immutable mixture deployment from the private rollout
+# repository.  Keeping those identities named in fixtures prevents a legacy
+# single-repository receipt from getting past the campaign-binding boundary.
+RUNTIME_BC_REPOSITORY = LIFECYCLE.RUNTIME_BC_REPOSITORY
+RUNTIME_ROLLOUT_REPOSITORY = LIFECYCLE.RUNTIME_ROLLOUT_REPOSITORY
 
 
 class FailRunner:
@@ -1323,9 +1331,9 @@ def test_runtime_mixture_train_uses_only_authenticated_receipts_and_never_legacy
     tmp_path: Path,
 ) -> None:
     receipts = {
-        "bc": {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True},
-        "rollout": {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "b" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True},
-            "deployment": {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "e" * 64, "artifact_entries": _runtime_deployment_entries(), "fresh_readback_verified": True, "tree_listing_verified": True, "experiment_manifest_sha256": "0" * 64, "mixture_weights": {"bc": 70, "rollout": 30, "dagger": 0}, "source_quotas": {"bc": 45, "rollout": 19, "dagger": 0}},
+        "bc": {"repository": RUNTIME_BC_REPOSITORY, "immutable_revision": "a" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True},
+        "rollout": {"repository": RUNTIME_ROLLOUT_REPOSITORY, "immutable_revision": "b" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True},
+            "deployment": {"repository": RUNTIME_ROLLOUT_REPOSITORY, "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "e" * 64, "artifact_entries": _runtime_deployment_entries(), "fresh_readback_verified": True, "tree_listing_verified": True, "experiment_manifest_sha256": "0" * 64, "mixture_weights": {"bc": 70, "rollout": 30, "dagger": 0}, "source_quotas": {"bc": 45, "rollout": 19, "dagger": 0}},
     }
     paths = {}
     for name, value in receipts.items():
@@ -1335,7 +1343,7 @@ def test_runtime_mixture_train_uses_only_authenticated_receipts_and_never_legacy
         calls.append(command); return "{}"
     instance = {"schema_version": 1, "kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 44, "host": "native-x86", "port": 22, "platform_arch": "x86_64", "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE, "offer_evidence_sha256": "a" * 64, "provider_response_sha256": "b" * 64, "capability_sha256": "c" * 64}
     output = tmp_path / "execution.json"
-    binding = {"mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "experiment_manifest_sha256": "0" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "c" * 64}, "code": {"repository_revision": "1" * 40, "bundle_sha256": "2" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
+    binding = {"mixture": {"repository": RUNTIME_ROLLOUT_REPOSITORY, "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "experiment_manifest_sha256": "0" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "c" * 64}, "code": {"repository_revision": "1" * 40, "bundle_sha256": "2" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
     from lehome_train.groot.runtime_mixture_warmup import (
         GpuWarmupMeasurement,
         RuntimeState,
@@ -1360,7 +1368,7 @@ def test_runtime_mixture_train_uses_only_authenticated_receipts_and_never_legacy
                     gpu_utilization_percent=80.0 if viable else 50.0,
                     oom=False,
                     error=None,
-                    observed_batch_sizes=(64,) * 60,
+                        observed_batch_sizes=(64,) * (burn_in_steps + measured_steps),
                     loss_min=.1,
                     loss_max=.3,
                     loss_final=.2,
@@ -1410,7 +1418,7 @@ def test_runtime_final_stage_rejects_a_warmup_from_another_gpu_instance(
         "provider_response_sha256": "a" * 64, "capability_sha256": "b" * 64,
     }
     binding = {
-            "mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "e" * 64, "window_index_sha256": "f" * 64, "normalization_sha256": "0" * 64, "experiment_manifest_sha256": "9" * 64, "source_revisions": {"organizer": "1" * 40, "rollout": "2" * 40}},
+            "mixture": {"repository": RUNTIME_ROLLOUT_REPOSITORY, "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "e" * 64, "window_index_sha256": "f" * 64, "normalization_sha256": "0" * 64, "experiment_manifest_sha256": "9" * 64, "source_revisions": {"organizer": "1" * 40, "rollout": "2" * 40}},
         "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "b" * 64},
         "code": {"repository_revision": "3" * 40, "bundle_sha256": "4" * 64, "isaac_groot_revision": "5" * 40},
         "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]},
@@ -1427,9 +1435,9 @@ def test_runtime_final_stage_rejects_a_warmup_from_another_gpu_instance(
     }), encoding="utf-8")
     receipts = {}
     for name, payload in {
-        "bc": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "1" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True},
-        "rollout": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "2" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True},
-                "deployment": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "6" * 64, "artifact_entries": _runtime_deployment_entries(), "fresh_readback_verified": True, "tree_listing_verified": True, "experiment_manifest_sha256": "9" * 64, "mixture_weights": {"bc": 70, "rollout": 30, "dagger": 0}, "source_quotas": {"bc": 45, "rollout": 19, "dagger": 0}},
+        "bc": {"repository": RUNTIME_BC_REPOSITORY, "immutable_revision": "1" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True},
+        "rollout": {"repository": RUNTIME_ROLLOUT_REPOSITORY, "immutable_revision": "2" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True},
+                "deployment": {"repository": RUNTIME_ROLLOUT_REPOSITORY, "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "6" * 64, "artifact_entries": _runtime_deployment_entries(), "fresh_readback_verified": True, "tree_listing_verified": True, "experiment_manifest_sha256": "9" * 64, "mixture_weights": {"bc": 70, "rollout": 30, "dagger": 0}, "source_quotas": {"bc": 45, "rollout": 19, "dagger": 0}},
     }.items():
         path = tmp_path / f"{name}.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -1572,13 +1580,19 @@ def test_capture_runtime_cpu_pilot_offer_rejects_account_total_at_one_dollar() -
 
 def _runtime_pilot_offer_evidence(*, failure_receipt: str) -> dict[str, object]:
     evidence_root = Path(failure_receipt).parent
-    source = {
-        "repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"],
-        "fresh_readback_verified": True, "tree_listing_verified": True,
+    source = {"fresh_readback_verified": True, "tree_listing_verified": True}
+    bc = source | {
+        "repository": RUNTIME_BC_REPOSITORY,
+        "immutable_revision": "c" * 40,
+        "remote_prefix": "bc/full",
     }
-    bc = source | {"immutable_revision": "c" * 40, "remote_prefix": "bc/full"}
-    rollout = source | {"immutable_revision": "d" * 40, "remote_prefix": "rollouts/round-1"}
+    rollout = source | {
+        "repository": RUNTIME_ROLLOUT_REPOSITORY,
+        "immutable_revision": "d" * 40,
+        "remote_prefix": "rollouts/round-1",
+    }
     deployment = source | {
+        "repository": RUNTIME_ROLLOUT_REPOSITORY,
         "immutable_revision": "e" * 40, "mixture_id": "f" * 64,
         "remote_prefix": "mixtures/" + "f" * 64,
         "pending_receipt_sha256": "0" * 64,
@@ -1721,7 +1735,7 @@ def test_direct_gpu_datacenter_policy_drift_stops_before_provider_create(
 ) -> None:
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(LIFECYCLE, "_runtime_campaign_binding", lambda _request: {"deployment": {
-        "repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40,
+        "repository": RUNTIME_ROLLOUT_REPOSITORY, "immutable_revision": "a" * 40,
         "remote_prefix": "mixtures/" + "b" * 64, "fresh_readback_verified": True,
         "tree_listing_verified": True, "mixture_id": "b" * 64,
         "pending_receipt_sha256": "c" * 64, "artifact_entries": [],
@@ -3660,13 +3674,13 @@ def test_direct_gpu_established_ssh_timeout_is_bounded_locally(
     assert calls == [LIFECYCLE.RUNTIME_GPU_ARCH_TIMEOUT_SECONDS]
 
 
-def test_runtime_campaign_rejects_any_rollout_prefix_other_than_initial_round_one(
+def test_runtime_campaign_rejects_a_noncanonical_rollout_round_prefix(
     tmp_path: Path,
 ) -> None:
     evidence = _runtime_pilot_offer_evidence(failure_receipt=str(tmp_path / "failure.json"))
     Path(str(evidence["rollout_readback_receipt"])).write_text(json.dumps({
-        "repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"],
-        "immutable_revision": "d" * 40, "remote_prefix": "rollouts/round-2",
+        "repository": RUNTIME_ROLLOUT_REPOSITORY,
+        "immutable_revision": "d" * 40, "remote_prefix": "rollouts/round-two",
         "fresh_readback_verified": True, "tree_listing_verified": True,
     }), encoding="utf-8")
 
@@ -3676,9 +3690,9 @@ def test_runtime_campaign_rejects_any_rollout_prefix_other_than_initial_round_on
 
 def _runtime_pilot_request_files(tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:
     receipts = {
-        "bc": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "a" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True},
-        "rollout": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "b" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True},
-        "deployment": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "e" * 64, "artifact_entries": _runtime_deployment_entries(), "fresh_readback_verified": True, "tree_listing_verified": True, "experiment_manifest_sha256": "0" * 64, "mixture_weights": {"bc": 70, "rollout": 30, "dagger": 0}, "source_quotas": {"bc": 45, "rollout": 19, "dagger": 0}},
+        "bc": {"repository": RUNTIME_BC_REPOSITORY, "immutable_revision": "a" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True},
+        "rollout": {"repository": RUNTIME_ROLLOUT_REPOSITORY, "immutable_revision": "b" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True},
+        "deployment": {"repository": RUNTIME_ROLLOUT_REPOSITORY, "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64, "mixture_id": "d" * 64, "pending_receipt_sha256": "e" * 64, "artifact_entries": _runtime_deployment_entries(), "fresh_readback_verified": True, "tree_listing_verified": True, "experiment_manifest_sha256": "0" * 64, "mixture_weights": {"bc": 70, "rollout": 30, "dagger": 0}, "source_quotas": {"bc": 45, "rollout": 19, "dagger": 0}},
     }
     paths: dict[str, str] = {}
     for name, receipt in receipts.items():
@@ -4017,7 +4031,7 @@ def test_direct_runtime_hydrate_recovers_only_the_authenticated_exhausted_rate_l
     calls: list[tuple[str, ...]] = []
     hydration_receipt = {
         "schema_version": 1, "kind": "runtime_mixture_hydration",
-        "repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"],
+        "repository": RUNTIME_ROLLOUT_REPOSITORY,
         "immutable_revision": "c" * 40, "remote_prefix": "mixtures/" + "d" * 64,
         "mixture_id": "d" * 64,
         "artifact_tree_sha256": LIFECYCLE._hash(_runtime_deployment_entries()),
@@ -4810,7 +4824,7 @@ def test_runtime_gpu_parent_hydration_rejects_malformed_controller_mode_before_p
     )
 
     monkeypatch.setattr(LIFECYCLE, "_runtime_campaign_binding", lambda _request: {"deployment": {
-        "repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40,
+        "repository": RUNTIME_ROLLOUT_REPOSITORY, "immutable_revision": "a" * 40,
         "remote_prefix": "mixtures/" + "b" * 64, "fresh_readback_verified": True,
         "tree_listing_verified": True, "mixture_id": "b" * 64,
         "pending_receipt_sha256": "c" * 64, "artifact_entries": [],
@@ -5040,6 +5054,204 @@ def test_runtime_selected_workers_are_checked_against_unmodified_launch_config(t
         LIFECYCLE._runtime_stage_selected_workers(selected_path=selected, launch_path=launch)
 
 
+def _runtime_stage_awr_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, awr_enabled: bool,
+) -> tuple[
+    dict[str, object], dict[str, object], list[tuple[str, ...]],
+    Callable[[tuple[str, ...]], str],
+]:
+    """Build a fully local final-stage fixture while retaining SCP readback checks."""
+    from lehome_train.groot.awr_weighting import AwrReplayConfig
+    from lehome_train.groot.runtime_checkpoint_lifecycle import RuntimeMixtureTrainingIdentity
+
+    instance = {
+        "kind": "runtime_mixture_gpu_warmup_instance", "instance_id": 44,
+        "host": "stage-host", "port": 22, "platform_arch": "x86_64",
+        "trainer_image": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE,
+        "image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+        "provider_response_sha256": "a" * 64, "capability_sha256": "b" * 64,
+    }
+    runtime_identity = {
+        "bc": {"immutable_revision": "1" * 40}, "bc_receipt_sha256": "2" * 64,
+        "rollout": {"immutable_revision": "3" * 40, "remote_prefix": "rollouts/round-1"},
+        "rollout_receipt_sha256": "4" * 64,
+        "deployment": {"mixture_id": "5" * 64}, "deployment_receipt_sha256": "6" * 64,
+    }
+    identity = RuntimeMixtureTrainingIdentity(
+        mixture_id="5" * 64, deployment_receipt_sha256="6" * 64,
+        source_revisions=(("organizer", "1" * 40, "bc/full", "2" * 64), ("rollout", "3" * 40, "rollouts/round-1", "4" * 64)),
+        schedule_seed=7, code_bundle_sha256="7" * 64, code_bundle_revision="8" * 40,
+        oci_image=LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
+        parent_step12000_artifact_sha256=LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"],
+    )
+    source_evidence = identity.to_dict()
+    launch = {"dataloader_num_workers": 4}
+    request: dict[str, object] = {
+        "code_revision": "8" * 40, "code_bundle_sha256": "7" * 64,
+        "schedule_seed": 7,
+    }
+    if awr_enabled:
+        evidence = tmp_path / "awr-progress.json"
+        evidence.write_text('{"progress":"bound"}', encoding="utf-8")
+        config = AwrReplayConfig(temperature=0.7, minimum=0.25, maximum=4.0)
+        launch |= {
+            "runtime_awr_evidence_path": "/prepared/runtime/awr-progress.json",
+            "runtime_awr_evidence_sha256": LIFECYCLE.sha256_file(evidence),
+            "runtime_awr_temperature": config.temperature,
+            "runtime_awr_minimum": config.minimum,
+            "runtime_awr_maximum": config.maximum,
+        }
+        source_evidence |= {
+            "awr_evidence_sha256": LIFECYCLE.sha256_file(evidence),
+            "awr_config_sha256": config.sha256,
+        }
+        request["runtime_awr_evidence"] = str(evidence)
+    source = tmp_path / "source-evidence.json"
+    source.write_text(json.dumps(source_evidence), encoding="utf-8")
+    launch_path = tmp_path / "launch.json"
+    launch_path.write_text(json.dumps(launch), encoding="utf-8")
+    request["launch_config"] = str(launch_path)
+    request["runtime_source_evidence"] = str(source)
+
+    file_values = {
+        "bootstrap_receipt": "bootstrap.json", "warmup_stage_receipt": "warmup-stage.json",
+        "code_bundle": "code.bundle", "code_bundle_sha256_file": "code.bundle.sha256",
+        "experiment_config": "experiment.json", "runtime_train_request": "runtime-train.json",
+        "runtime_hydrate_request": "runtime-hydrate.json", "runtime_warmup_request": "runtime-warmup.json",
+        "modality_config": "modality.py", "token_file": "runtime.token",
+        "gpu_warmup_receipt": "gpu-warmup.json", "runtime_warmup_binding": "runtime-warmup-binding.json",
+        "selected_workers": "selected-workers.json", "bc_readback_receipt": "bc-readback.json",
+        "rollout_readback_receipt": "rollout-readback.json", "deployment_receipt": "deployment-receipt.json",
+    }
+    for field, name in file_values.items():
+        path = tmp_path / name
+        path.write_text("{}", encoding="utf-8")
+        request[field] = str(path)
+    bootstrap = Path(str(request["bootstrap_receipt"]))
+    Path(str(request["warmup_stage_receipt"])).write_text(json.dumps({
+        "kind": "runtime_mixture_warmup_stage", "instance_id": 44,
+        "provider_response_sha256": "a" * 64,
+        "bootstrap_receipt_sha256": LIFECYCLE.sha256_file(bootstrap),
+        "launch_contract": {},
+    }), encoding="utf-8")
+
+    train_paths = {
+        "launch_config": "/prepared/config/launch.json", "experiment_config": "/prepared/config/experiment.json",
+        "runtime_manifest": "/prepared/runtime/mixture.json", "runtime_window_index": "/prepared/runtime/windows.json",
+        "runtime_normalization": "/prepared/runtime/mixture-normalization.json", "runtime_mounts_descriptor": "/prepared/runtime/mounts.json",
+        "runtime_source_evidence": "/prepared/runtime/source-evidence.json",
+        "warmup_receipt": "/prepared/config/gpu-warmup.json", "runtime_warmup_binding": "/prepared/config/runtime-warmup-binding.json",
+        "publisher_token_file": "/prepared/config/runtime.token", "local_recovery_root": "/output/local-recovery",
+        "checkpoint_repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "checkpoint_revision": "main",
+        "instance_id": 44, "result_output": "/output/runtime-train-result.json", "status_output": "/output/runtime-train-status.json",
+        "runtime_resume_archive": None, "runtime_resume_descriptor": None, "runtime_resume_cursor": None,
+        "runtime_resume_anchor": None, "runtime_resume_publication": None,
+    }
+    monkeypatch.setattr(LIFECYCLE, "_runtime_identity", lambda *_args: runtime_identity)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_bootstrap_receipt", lambda **_kwargs: {})
+    monkeypatch.setattr(LIFECYCLE, "_validated_runtime_gpu_warmup_lifecycle", lambda **_kwargs: ({"warmup_receipt": {}, "runtime_warmup_binding": {"parent_checkpoint": {}, "mixture": {}}}, 4))
+    monkeypatch.setattr(LIFECYCLE, "_verify_reviewed_code_bundle", lambda *_args: "7" * 64)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_stage_selected_workers", lambda **_kwargs: (4, "9" * 64))
+    monkeypatch.setattr(LIFECYCLE, "_runtime_final_launch_contract", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(LIFECYCLE, "_runtime_final_experiment_contract", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_hydration_request_sha256", lambda *_args: "0" * 64)
+    monkeypatch.setattr(LIFECYCLE, "_read_private_token", lambda *_args: "token")
+    monkeypatch.setattr(LIFECYCLE, "_runtime_envelope", lambda _path, *, command, **_kwargs: train_paths if command == "runtime-mixture-train" else {})
+
+    calls: list[tuple[str, ...]] = []
+    remote_hashes: dict[str, str] = {}
+    def runner(command: tuple[str, ...]) -> str:
+        calls.append(command)
+        if command[0] == "scp":
+            remote_hashes[command[-1].rpartition("/")[2]] = LIFECYCLE.sha256_file(Path(command[-2]))
+        if command[-1].startswith("sha256sum "):
+            name = command[-1].rpartition("/")[2]
+            return remote_hashes[name] + "  " + name + "\n"
+        return ""
+    return instance, request, calls, runner
+
+
+def test_runtime_stage_transfers_hash_bound_awr_evidence_before_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, request, calls, runner = _runtime_stage_awr_fixture(tmp_path, monkeypatch, awr_enabled=True)
+
+    report = LIFECYCLE.runtime_mixture_stage(instance=instance, request=request, runner=runner)
+
+    evidence = Path(str(request["runtime_awr_evidence"]))
+    assert {"name": "awr-progress.json", "sha256": LIFECYCLE.sha256_file(evidence)} in report["transfers"]
+    assert any(command[0] == "scp" and command[-1].endswith("/awr-progress.json") for command in calls)
+    assert any("mv /tmp/lehome-runtime-stage/awr-progress.json /prepared/runtime/awr-progress.json" in command[-1] for command in calls)
+
+
+@pytest.mark.parametrize("tamper", ("local-evidence", "source-evidence", "source-config", "launch-config"))
+def test_runtime_stage_rejects_tampered_awr_binding_before_ssh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str,
+) -> None:
+    instance, request, calls, runner = _runtime_stage_awr_fixture(tmp_path, monkeypatch, awr_enabled=True)
+    if tamper == "local-evidence":
+        Path(str(request["runtime_awr_evidence"])).write_text('{"progress":"tampered"}', encoding="utf-8")
+    elif tamper == "source-evidence":
+        source = Path(str(request["runtime_source_evidence"]))
+        value = json.loads(source.read_text(encoding="utf-8")); value["awr_evidence_sha256"] = "e" * 64
+        source.write_text(json.dumps(value), encoding="utf-8")
+    elif tamper == "source-config":
+        source = Path(str(request["runtime_source_evidence"]))
+        value = json.loads(source.read_text(encoding="utf-8")); value["awr_config_sha256"] = "f" * 64
+        source.write_text(json.dumps(value), encoding="utf-8")
+    else:
+        launch = Path(str(request["launch_config"]))
+        value = json.loads(launch.read_text(encoding="utf-8")); value["runtime_awr_temperature"] = 0.8
+        launch.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime AWR"):
+        LIFECYCLE.runtime_mixture_stage(instance=instance, request=request, runner=runner)
+
+    assert calls == []
+
+
+def test_runtime_stage_preserves_unweighted_request_and_source_evidence_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, request, calls, runner = _runtime_stage_awr_fixture(tmp_path, monkeypatch, awr_enabled=False)
+
+    report = LIFECYCLE.runtime_mixture_stage(instance=instance, request=request, runner=runner)
+
+    assert "runtime_awr_evidence" not in request
+    assert all(item["name"] != "awr-progress.json" for item in report["transfers"])
+    assert not any("awr-progress.json" in " ".join(command) for command in calls)
+
+
+def test_runtime_stage_rejects_awr_digests_when_launch_is_unweighted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, request, calls, runner = _runtime_stage_awr_fixture(tmp_path, monkeypatch, awr_enabled=False)
+    source = Path(str(request["runtime_source_evidence"]))
+    value = json.loads(source.read_text(encoding="utf-8")); value["awr_evidence_sha256"] = "a" * 64; value["awr_config_sha256"] = "b" * 64
+    source.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime AWR"):
+        LIFECYCLE.runtime_mixture_stage(instance=instance, request=request, runner=runner)
+
+    assert calls == []
+
+
+def test_runtime_checkpoint_identity_carries_the_hash_bound_awr_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lehome_train.groot.awr_weighting import AwrReplayConfig
+
+    instance, request, _calls, _runner = _runtime_stage_awr_fixture(tmp_path, monkeypatch, awr_enabled=True)
+
+    identity = LIFECYCLE._runtime_checkpoint_identity(instance, request)
+
+    launch = json.loads(Path(str(request["launch_config"])).read_text(encoding="utf-8"))
+    assert identity.awr_evidence_sha256 == launch["runtime_awr_evidence_sha256"]
+    assert identity.awr_config_sha256 == AwrReplayConfig(
+        temperature=launch["runtime_awr_temperature"], minimum=launch["runtime_awr_minimum"], maximum=launch["runtime_awr_maximum"],
+    ).sha256
+
+
 def test_runtime_provider_loss_requires_two_fresh_absence_readbacks() -> None:
     calls: list[tuple[str, ...]] = []
 
@@ -5065,7 +5277,7 @@ def test_runtime_gpu_warmup_runs_exact_cli_and_binds_cpu_pilot_code_parent_and_i
         "processor_contract": "pinned_processor_integration_required", "representative": {"three_cameras": True, "action_horizon": 16}, "sample_count_per_worker": 100, "worker_counts": [0, 4, 8, 16, 24], "canonical_worker_counts": [0, 4, 8, 16, 24], "loader_throughput": {str(n): {"decoded_samples": 100, "samples_per_second": 1.0} for n in [0, 4, 8, 16, 24]}, "timing_rows": [{"worker_count": n, "decoded_samples": 100, "seconds": 1.0, "samples_per_second": 1.0, "host_cpu_seconds": 1.0, "host_max_rss_mib": 1.0, "latency_seconds_p50": .01, "latency_seconds_p95": .02} for n in [0, 4, 8, 16, 24]], "authenticated_evidence": {"provider_instance_id": 44, "provider_response_sha256": "2" * 64, "platform_arch": "x86_64", "image_digest": LIFECYCLE.RUNTIME_CPU_PILOT_IMAGE.rpartition("@")[2], "code_revision": "3" * 40, "code_bundle_sha256": "4" * 64, "bc_revision": "a" * 40, "rollout_revision": "b" * 40, "deployment_revision": "c" * 40}, "cache_cap": 1, "native_x86_required": True, "timeout_seconds": 60.0, "canonical_completion": True,
     }
     pilot_path = tmp_path / "pilot.json"; pilot_path.write_text(json.dumps(pilot), encoding="utf-8")
-    binding = {"mixture": {"repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"], "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "experiment_manifest_sha256": "0" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "5" * 64}, "code": {"repository_revision": "3" * 40, "bundle_sha256": "4" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
+    binding = {"mixture": {"repository": RUNTIME_ROLLOUT_REPOSITORY, "revision": "c" * 40, "mixture_id": "d" * 64, "manifest_sha256": "6" * 64, "window_index_sha256": "7" * 64, "normalization_sha256": "8" * 64, "experiment_manifest_sha256": "0" * 64, "source_revisions": {"organizer": "a" * 40, "rollout": "b" * 40}}, "deployment": {"oci_image_digest": LIFECYCLE.BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2], "provider": "vast", "capability_sha256": "5" * 64}, "code": {"repository_revision": "3" * 40, "bundle_sha256": "4" * 64, "isaac_groot_revision": "9" * 40}, "parent_checkpoint": {"repository": LIFECYCLE.PARENT_CHECKPOINT["repository"], "revision": LIFECYCLE.PARENT_CHECKPOINT["revision"], "subpath": "policies/step-12000", "artifact_sha256": LIFECYCLE.PARENT_CHECKPOINT["artifact_sha256"]}, "physical_batch_size": 64, "action_horizon": 16}
     binding_path = tmp_path / "binding.json"; binding_path.write_text(json.dumps(binding), encoding="utf-8")
     request |= {"pilot_receipt": str(pilot_path), "runtime_warmup_binding": str(binding_path), "warmup_lifecycle_receipt": str(tmp_path / "warmup-lifecycle.json"), "bootstrap_capability_receipt": str(tmp_path / "bootstrap-capability.json")}
     monkeypatch.setattr(LIFECYCLE, "_runtime_gpu_bootstrap_capability_receipt", lambda **_kwargs: {})

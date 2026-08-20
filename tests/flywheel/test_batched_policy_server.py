@@ -340,6 +340,16 @@ def test_run_marks_ready_file_not_ready_when_polling_stops(monkeypatch, tmp_path
     assert json.loads(ready.read_text(encoding="utf-8"))["ready"] is False
 
 
+def test_write_json_ready_file_is_world_readable(tmp_path) -> None:
+    module = _server_module()
+    ready = tmp_path / "ready.json"
+
+    module.write_readiness(ready, ready=True, policy_sha256="a" * 64)
+
+    assert ready.stat().st_mode & 0o777 == 0o644
+    assert json.loads(ready.read_text(encoding="utf-8"))["ready"] is True
+
+
 def test_write_json_unlinks_its_temporary_file_when_fsync_fails(monkeypatch, tmp_path) -> None:
     module = _server_module()
     destination = tmp_path / "metrics.json"
@@ -385,3 +395,37 @@ def test_run_marks_ready_not_ready_when_poller_startup_fails(monkeypatch, tmp_pa
         module.run(args, socket=Socket(), model=_Model())
 
     assert json.loads(ready.read_text(encoding="utf-8"))["ready"] is False
+
+
+def test_gateway_evicts_idle_session_when_at_cap() -> None:
+    from lehome.flywheel import policy_protocol as protocol
+    BatchedPolicyGateway = _gateway_class()
+
+    now = [1_000]
+    gateway = BatchedPolicyGateway(_Model(), policy_sha256="a" * 64, batch_window_ns=100, now_ns=lambda: now[0])
+    for index in range(4):
+        request = _request(protocol, session_id=f"old-{index}", request_id=f"reset-{index}", operation="reset")
+        assert protocol.unpack_envelope(gateway.receive(str(index).encode(), protocol.pack_envelope(request))).status == "ok"
+        now[0] += 1
+    now[0] += 30_000_000_000
+    replacement = protocol.PolicyRequest.reset(
+        session_id="worker-live", episode_generation=1, request_id="reset-live",
+        policy_sha256="a" * 64, deadline_ns=now[0] + 10_000,
+    )
+    response = protocol.unpack_envelope(gateway.receive(b"live", protocol.pack_envelope(replacement)))
+    assert response.status == "ok", response.error_code
+    infer = protocol.PolicyRequest.infer(
+        session_id="worker-live", episode_generation=1, request_id="infer-live",
+        policy_sha256="a" * 64, deadline_ns=now[0] + 10_000,
+        observation={
+            "video": {camera: __import__("numpy").zeros((1, 1, 2, 3, 3), dtype=__import__("numpy").uint8) for camera in ("top_rgb", "left_rgb", "right_rgb")},
+            "state": {
+                "left_arm": __import__("numpy").zeros((1, 1, 5), dtype=__import__("numpy").float32),
+                "left_gripper": __import__("numpy").zeros((1, 1, 1), dtype=__import__("numpy").float32),
+                "right_arm": __import__("numpy").zeros((1, 1, 5), dtype=__import__("numpy").float32),
+                "right_gripper": __import__("numpy").zeros((1, 1, 1), dtype=__import__("numpy").float32),
+            },
+            "language": {"annotation.human.task_description": [["fold the garment on the table"]]},
+        },
+    )
+    assert gateway.receive(b"live", protocol.pack_envelope(infer)) is None

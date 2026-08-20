@@ -120,6 +120,25 @@ def _write_indexed_checkpoint(config: FineTuneLaunchConfig, step: int) -> Path:
     return checkpoint
 
 
+def test_verified_checkpoint_state_accepts_official_groot_index_metadata(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, batch=64, max_steps=500, save_steps=500)
+    checkpoint = _write_indexed_checkpoint(config, 500)
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps({
+            "metadata": {"total_parameters": 3144016000, "total_size": 22},
+            "weight_map": {
+                "model.layers.0.weight": "model-00001-of-00002.safetensors",
+                "model.layers.1.weight": "model-00002-of-00002.safetensors",
+            },
+        }),
+        encoding="utf-8",
+    )
+    state = adapters._verified_checkpoint_state_at(checkpoint, 500)
+    assert state["global_step"] == 500
+
+
 @pytest.mark.parametrize("mutation", ("missing", "mixed", "extra", "duplicate_json_key"))
 def test_verified_checkpoint_state_rejects_incomplete_or_ambiguous_safetensors_layout(
     tmp_path: Path, mutation: str,
@@ -763,3 +782,76 @@ def test_checkpoint_uploader_publishes_descriptor_with_archive_to_one_immutable_
     assert publication["descriptor_relative_path"] == "checkpoints/step-1000.json"
     assert publication["descriptor_sha256"] == sha256_file(descriptor)
     assert publication["descriptor_byte_size"] == descriptor.stat().st_size
+
+def test_checkpoint_uploader_uses_large_folder_path_for_multi_gigabyte_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "checkpoints" / "step-1000.tar"
+    archive.parent.mkdir()
+    archive.write_bytes(b"checkpoint archive")
+    checkpoint = CheckpointDescriptor(
+        record=CheckpointRecord(
+            experiment_id="experiment-001",
+            optimizer_step=1000,
+            sample_presentations=64_000,
+            experiment_config_sha256="a" * 64,
+            dataset_manifest_sha256="b" * 64,
+            schedule_sha256="c" * 64,
+            artifact=ArtifactIdentity(
+                "checkpoints/step-1000.tar", sha256_file(archive), 25_547_888_640,
+            ),
+            resumable=True,
+            remotely_verified=False,
+        ),
+        normalization_sha256="d" * 64,
+        schedule_sha256="c" * 64,
+        locally_verified=True,
+    )
+    # Bypass the live size check so the test can use a tiny fixture file.
+    object.__setattr__(checkpoint.record.artifact, "byte_size", 25_547_888_640)
+    descriptor = tmp_path / "checkpoints" / "step-1000.json"
+    write_checkpoint_descriptor(descriptor, checkpoint)
+    uploaded: dict[str, object] = {}
+
+    monkeypatch.setattr(adapters, "HuggingFaceHubTransport", lambda **_kwargs: object())
+    monkeypatch.setattr(adapters, "require_access", lambda **_kwargs: None)
+    monkeypatch.setattr(adapters.HubCheckpointUploader, "_local_artifact_matches", lambda self, checkpoint, artifact: True)
+
+    def fake_large(**kwargs: object) -> None:
+        uploaded.update(kwargs)
+
+    def fake_resolve(**kwargs: object) -> str:
+        return "e" * 40
+
+    def fake_download(**kwargs: object) -> str:
+        destination = kwargs["destination"]
+        assert isinstance(destination, Path)
+        for relative in kwargs["relative_paths"]:
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((tmp_path / relative).read_bytes())
+        return "e" * 40
+
+    monkeypatch.setattr(adapters, "upload_large_folder", fake_large)
+    monkeypatch.setattr(adapters, "resolve_approved_ref", fake_resolve)
+    monkeypatch.setattr(adapters, "download_files", fake_download)
+    monkeypatch.setattr(
+        adapters,
+        "upload_files",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("small upload path must not be used")),
+    )
+    publication = adapters.HubCheckpointUploader(
+        repository=adapters.DEFAULT_MODEL_REPO,
+        revision="main",
+        experiment_id="experiment-001",
+        artifact_root=tmp_path,
+        token="publisher-token",
+    ).publish_receipt(checkpoint, timeout_seconds=1)
+
+    assert uploaded["remote_prefix"].startswith("checkpoint-staging/experiment-001/")
+    assert {entry.relative_path for entry in uploaded["entries"]} == {
+        f"{uploaded['remote_prefix']}/checkpoints/step-1000.tar",
+        f"{uploaded['remote_prefix']}/checkpoints/step-1000.json",
+    }
+    assert publication["immutable_revision"] == "e" * 40
+    assert publication["readback_verified"] is True

@@ -33,7 +33,9 @@ from lehome_train.hub import (
     HuggingFaceHubTransport,
     download_files,
     require_access,
+    resolve_approved_ref,
     upload_files,
+    upload_large_folder,
 )
 from lehome_train.io import canonical_json_bytes, canonical_json_sha256, sha256_file
 from lehome_train.models import (
@@ -48,6 +50,10 @@ from lehome_train.telemetry import NvmlTelemetrySampler
 
 
 _SAFETENSORS_SHARD = re.compile(r"^model-(\d{5})-of-(\d{5})\.safetensors$")
+
+_LARGE_CHECKPOINT_ARCHIVE_BYTES = 1_000_000_000
+_LARGE_CHECKPOINT_UPLOAD_WORKERS = 8
+_LARGE_CHECKPOINT_HUB_TIMEOUT_SECONDS = 21600.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,9 +346,13 @@ def _verify_model_weight_layout(checkpoint: Path) -> None:
     if set(payload) != {"metadata", "weight_map"}:
         raise ValueError("GR00T checkpoint safetensors index is incompatible")
     metadata, weight_map = payload["metadata"], payload["weight_map"]
+    allowed_metadata = {"total_size", "total_parameters"}
     if (
-        type(metadata) is not dict or set(metadata) != {"total_size"}
+        type(metadata) is not dict
+        or "total_size" not in metadata
+        or not set(metadata) <= allowed_metadata
         or type(metadata.get("total_size")) is not int or metadata["total_size"] < 0
+        or ("total_parameters" in metadata and (type(metadata["total_parameters"]) is not int or metadata["total_parameters"] < 0))
         or type(weight_map) is not dict or not weight_map
     ):
         raise ValueError("GR00T checkpoint safetensors index is incompatible")
@@ -1099,6 +1109,71 @@ class HubCheckpointUploader:
         self._transport = transport
         self._retry_sleeper = retry_sleeper
 
+    def _local_artifact_matches(
+        self, checkpoint: CheckpointDescriptor, artifact: Path
+    ) -> bool:
+        if artifact.is_symlink() or not artifact.is_file():
+            return False
+        return (
+            artifact.stat().st_size == checkpoint.record.artifact.byte_size
+            and sha256_file(artifact) == checkpoint.record.artifact.sha256
+        )
+
+    def _stage_large_checkpoint_upload(
+        self,
+        *,
+        remote_prefix: str,
+        entries: tuple[SyncEntry, ...],
+    ) -> tuple[Path, tuple[SyncEntry, ...]]:
+        if self.artifact_root is None:
+            raise ValueError("checkpoint uploader has no artifact root")
+        staging = self.artifact_root / ".checkpoint-upload-staging"
+        if staging.exists():
+            if staging.is_symlink() or not staging.is_dir():
+                raise ValueError("checkpoint large upload staging root is unsafe")
+        else:
+            staging.mkdir()
+        staged_entries = tuple(
+            SyncEntry(
+                relative_path=f"{remote_prefix}/{entry.relative_path}",
+                sha256=entry.sha256,
+                byte_size=entry.byte_size,
+                remotely_verified=entry.remotely_verified,
+            )
+            for entry in entries
+        )
+        for entry, staged in zip(entries, staged_entries, strict=True):
+            source = self.artifact_root / entry.relative_path
+            target = staging / staged.relative_path
+            if source.is_symlink() or not source.is_file():
+                raise ValueError("checkpoint large upload allowlist file is unavailable")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                if (
+                    target.is_symlink()
+                    or not target.is_file()
+                    or sha256_file(target) != entry.sha256
+                    or target.stat().st_size != source.stat().st_size
+                ):
+                    raise ValueError(
+                        "checkpoint large upload staging tree differs from the exact allowlist"
+                    )
+                continue
+            try:
+                os.link(source, target, follow_symlinks=False)
+            except OSError:
+                shutil.copyfile(source, target, follow_symlinks=False)
+            if (
+                target.is_symlink()
+                or not target.is_file()
+                or sha256_file(target) != entry.sha256
+                or target.stat().st_size != source.stat().st_size
+            ):
+                raise ValueError(
+                    "checkpoint large upload staging copy differs from the exact allowlist"
+                )
+        return staging, staged_entries
+
     def _transport_for(self, *, timeout_seconds: float) -> object:
         return self._transport or HuggingFaceHubTransport(timeout_seconds=timeout_seconds)
 
@@ -1113,11 +1188,7 @@ class HubCheckpointUploader:
         if self.artifact_root is None:
             raise ValueError("checkpoint uploader has no artifact root")
         artifact = self.artifact_root / checkpoint.record.artifact.relative_path
-        if (
-            not artifact.is_file()
-            or artifact.stat().st_size != checkpoint.record.artifact.byte_size
-            or sha256_file(artifact) != checkpoint.record.artifact.sha256
-        ):
+        if not self._local_artifact_matches(checkpoint, artifact):
             raise ValueError("checkpoint upload artifact failed local verification")
         descriptor_relative_path = (
             f"checkpoints/step-{checkpoint.record.optimizer_step}.json"
@@ -1150,23 +1221,50 @@ class HubCheckpointUploader:
         remote_prefix = (
             f"checkpoint-staging/{self.experiment_id}/{entry.sha256}"
         )
-        immutable_revision = upload_files(
-            transport=transport,
-            repository=self.repository,
-            revision=self.revision,
-            source=self.artifact_root,
-            entries=(entry, descriptor_entry),
-            remote_prefix=remote_prefix,
-            environ=self._hub_environ,
-            max_attempts=3,
-            sleeper=self._retry_sleeper,
-        )
+        if checkpoint.record.artifact.byte_size >= _LARGE_CHECKPOINT_ARCHIVE_BYTES:
+            staging, staged_entries = self._stage_large_checkpoint_upload(
+                remote_prefix=remote_prefix,
+                entries=(entry, descriptor_entry),
+            )
+            large_transport = HuggingFaceHubTransport(
+                timeout_seconds=_LARGE_CHECKPOINT_HUB_TIMEOUT_SECONDS
+            )
+            upload_large_folder(
+                transport=large_transport,
+                repository=self.repository,
+                revision=self.revision,
+                source=staging,
+                entries=staged_entries,
+                remote_prefix=remote_prefix,
+                environ=self._hub_environ,
+                max_workers=_LARGE_CHECKPOINT_UPLOAD_WORKERS,
+            )
+            immutable_revision = resolve_approved_ref(
+                transport=large_transport,
+                repository=self.repository,
+                ref=self.revision,
+                environ=self._hub_environ,
+            )
+            readback_transport = large_transport
+        else:
+            immutable_revision = upload_files(
+                transport=transport,
+                repository=self.repository,
+                revision=self.revision,
+                source=self.artifact_root,
+                entries=(entry, descriptor_entry),
+                remote_prefix=remote_prefix,
+                environ=self._hub_environ,
+                max_attempts=3,
+                sleeper=self._retry_sleeper,
+            )
+            readback_transport = transport
         readback = Path(
             tempfile.mkdtemp(prefix="checkpoint-readback-", dir=self.artifact_root)
         )
         try:
             download_files(
-                transport=transport,
+                transport=readback_transport,
                 repository=self.repository,
                 revision=immutable_revision,
                 destination=readback,
@@ -1178,12 +1276,16 @@ class HubCheckpointUploader:
             )
             observed = readback / entry.relative_path
             observed_descriptor = readback / descriptor_entry.relative_path
+            local_artifact = self.artifact_root / entry.relative_path
+            local_descriptor = self.artifact_root / descriptor_entry.relative_path
             verified = (
                 observed.is_file()
-                and observed.stat().st_size == entry.byte_size
+                and not observed.is_symlink()
+                and observed.stat().st_size == local_artifact.stat().st_size
                 and sha256_file(observed) == entry.sha256
                 and observed_descriptor.is_file()
-                and observed_descriptor.stat().st_size == descriptor_entry.byte_size
+                and not observed_descriptor.is_symlink()
+                and observed_descriptor.stat().st_size == local_descriptor.stat().st_size
                 and sha256_file(observed_descriptor) == descriptor_entry.sha256
                 and load_checkpoint_descriptor(observed_descriptor) == checkpoint
             )

@@ -10,6 +10,7 @@ import pytest
 
 from lehome.flywheel.hub_sync import HubSyncDaemon, HubSyncError
 from lehome_train.hub import HubAccess, HubTreeEntry, HubTransientError
+from lehome_train.constants import DEFAULT_ROLLOUT_REPO
 from lehome_train.models import SyncEntry
 from lehome_train.flywheel.publish import (
     RolloutRoundSealError,
@@ -17,8 +18,10 @@ from lehome_train.flywheel.publish import (
 )
 
 
-REPOSITORY = "lehome/rollouts"
+REPOSITORY = DEFAULT_ROLLOUT_REPO
 ROUND_ID = "round-1"
+PUBLICATION_REF = "rollout-round-1"
+FIRST_COMMIT = "1" * 40
 
 
 class FakeTransport:
@@ -29,6 +32,7 @@ class FakeTransport:
         self.upload_failures = 0
         self.uploads: list[tuple[str, tuple[str, ...]]] = []
         self.readbacks = 0
+        self.readback_revisions: list[str] = []
 
     def check_access(self, *, repository, token):
         return HubAccess(can_read=True, can_write=True)
@@ -42,13 +46,14 @@ class FakeTransport:
         for entry in entries:
             data = (Path(source) / entry.relative_path).read_bytes()
             bucket[entry.relative_path] = data
-        return revision
+        return FIRST_COMMIT
 
     def upload_large_folder(self, **kwargs):
         raise AssertionError("episode sync must use upload_files")
 
     def download_files(self, *, repository, revision, destination, relative_paths, token, remote_prefix=None):
         self.readbacks += 1
+        self.readback_revisions.append(revision)
         bucket = self.store.get(remote_prefix, {})
         for relative_path in relative_paths:
             target = Path(destination) / relative_path
@@ -95,7 +100,7 @@ def daemon(tmp_path):
         repository=REPOSITORY, round_id=ROUND_ID, token="token",
         transport=transport, accepted_root=accepted_root,
         receipts_root=tmp_path / "receipts", readback_root=tmp_path / "readback",
-        revision="0" * 40, max_attempts=3,
+        revision=PUBLICATION_REF, max_attempts=3,
     )
     return sync, transport, accepted_root
 
@@ -111,11 +116,15 @@ def test_sync_uploads_immutable_path_and_verifies_readback(daemon):
     prefix = f"rollout-rounds/{ROUND_ID}/attempt-1"
     assert transport.uploads == [(prefix, ("videos/top.mp4", "worker-receipt.json"))]
     assert transport.readbacks == 1
+    assert transport.readback_revisions == [FIRST_COMMIT]
     receipt_file = sync.receipts_root / "attempt-1.sync.json"
     assert receipt_file.is_file()
     on_disk = json.loads(receipt_file.read_text())
     assert on_disk["remote_prefix"] == prefix
+    assert on_disk["publication_ref"] == PUBLICATION_REF
+    assert on_disk["immutable_revision"] == FIRST_COMMIT
     assert on_disk["readback_verified"] is True
+    assert on_disk["repository"] == DEFAULT_ROLLOUT_REPO
 
 
 def test_duplicate_sync_returns_existing_receipt_without_reupload(daemon):
@@ -194,15 +203,15 @@ def test_round_pending_reports_unsynced_episodes(daemon):
     assert pending == ("attempt-7",)
     assert not sync.round_sealable(("attempt-7", "attempt-8"))
     assert sync.round_sealable(("attempt-8",))
-def test_mutable_branch_revision_is_rejected(tmp_path):
+def test_immutable_commit_is_rejected_as_publication_target(tmp_path):
     accepted_root = tmp_path / "accepted"
     accepted_root.mkdir()
-    with pytest.raises(HubSyncError, match="immutable"):
+    with pytest.raises(HubSyncError, match="mutable branch"):
         HubSyncDaemon(
             repository=REPOSITORY, round_id=ROUND_ID, token="token",
             transport=FakeTransport(), accepted_root=accepted_root,
             receipts_root=tmp_path / "receipts", readback_root=tmp_path / "readback",
-            revision="main", max_attempts=3,
+            revision="0" * 40, max_attempts=3,
         )
 def test_round_seal_requires_every_sync_receipt(daemon, tmp_path):
     sync, _transport, accepted_root = daemon
@@ -220,6 +229,8 @@ def test_round_seal_requires_every_sync_receipt(daemon, tmp_path):
     on_disk = json.loads((tmp_path / "round-1.seal.json").read_text())
     assert on_disk["readback_verified"] is True
     assert on_disk["episode_sha256s"]["attempt-9"] == receipt.episode_sha256
+    assert on_disk["immutable_revisions"]["attempt-9"] == receipt.immutable_revision
+    assert on_disk["repository"] == DEFAULT_ROLLOUT_REPO
 
     with pytest.raises(RolloutRoundSealError, match="missing"):
         seal_rollout_round(
@@ -257,6 +268,31 @@ def test_round_seal_rejects_unverified_or_wrong_round_receipt(daemon, tmp_path):
             attempt_ids=("attempt-10",),
             seal_receipt_path=tmp_path / "round-1.bad3.json",
         )
+
+
+def test_round_seal_rejects_receipt_without_exact_immutable_hub_binding(daemon, tmp_path):
+    sync, _transport, accepted_root = daemon
+    synced = _make_accepted_episode(accepted_root, "attempt-immutable")
+    sync.sync_episode("attempt-immutable", synced)
+    receipt_file = sync.receipts_root / "attempt-immutable.sync.json"
+    original = json.loads(receipt_file.read_text())
+
+    for field, value in (
+        ("repository", "owner/other"),
+        ("immutable_revision", "main"),
+        ("remote_prefix", "rollout-rounds/round-1/other-attempt"),
+        ("attempt_id", "other-attempt"),
+    ):
+        payload = dict(original)
+        payload[field] = value
+        receipt_file.write_text(json.dumps(payload, sort_keys=True))
+        with pytest.raises(RolloutRoundSealError, match="repository|immutable|prefix|attempt_id"):
+            seal_rollout_round(
+                receipts_root=sync.receipts_root,
+                round_id=ROUND_ID,
+                attempt_ids=("attempt-immutable",),
+                seal_receipt_path=tmp_path / f"bad-{field}.json",
+            )
 
 
 def test_round_seal_enforces_target_bounds_and_no_reseal(daemon, tmp_path):

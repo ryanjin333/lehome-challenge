@@ -15,6 +15,7 @@ from lehome_train.groot.launch import (
     launch_continuous_finetune,
     launch_finetune,
     launch_finetune_to_step,
+    launch_sweep_finetune,
 )
 from lehome_train.groot.metrics import parse_trainer_log_lines
 from lehome_train.constants import ISAAC_GROOT_REVISION
@@ -105,6 +106,47 @@ def test_build_launch_selects_guarded_runtime_mixture_entrypoint_only_when_expli
     assert "--official-launch" in launch.command
     assert "--dataset-path" in launch.command
     assert launch.environment["PYTHONPATH"] == str(official_checkout)
+
+
+@pytest.mark.parametrize("step", (500, 1000, 2000))
+def test_build_launch_carries_explicit_sweep_profile_rungs(official_checkout: Path, tmp_path: Path, step: int) -> None:
+    from lehome_train.groot.experiment_manifest import SweepRuntimeProfile, batch64_quotas
+    weights = {"bc": 100, "rollout": 0, "dagger": 0}
+    profile = SweepRuntimeProfile(weights, batch64_quotas(weights), step, 500, True, 16, 64)
+    launch = build_launch(config(runtime_mixture_manifest="/runtime/m.json", runtime_window_index="/runtime/w.json", runtime_mounts_descriptor="/runtime/d.json", runtime_sweep_profile=profile, max_steps=step, save_steps=500), visible_devices="0", environment={}, official_checkout=official_checkout)
+    assert launch.command[launch.command.index("--max-steps") + 1] == str(step)
+
+
+def test_build_launch_passes_explicit_awr_identity_only_to_runtime_wrapper(
+    official_checkout: Path,
+) -> None:
+    launch = build_launch(
+        config(
+            runtime_mixture_manifest="/runtime/mixture.json",
+            runtime_window_index="/runtime/windows.json",
+            runtime_mounts_descriptor="/runtime/mounts.json",
+            runtime_awr_evidence_path="/runtime/awr.json",
+            runtime_awr_evidence_sha256="d" * 64,
+            runtime_awr_temperature=0.75,
+            runtime_awr_minimum=0.5,
+            runtime_awr_maximum=3.0,
+            max_steps=2_000,
+            save_steps=500,
+        ),
+        visible_devices="0",
+        environment={},
+        official_checkout=official_checkout,
+    )
+
+    separator = launch.command.index("--")
+    wrapper = launch.command[:separator]
+    official = launch.command[separator + 1 :]
+    assert wrapper[wrapper.index("--awr-evidence") + 1] == "/runtime/awr.json"
+    assert wrapper[wrapper.index("--awr-evidence-sha256") + 1] == "d" * 64
+    assert wrapper[wrapper.index("--awr-temperature") + 1] == "0.75"
+    assert wrapper[wrapper.index("--awr-minimum") + 1] == "0.5"
+    assert wrapper[wrapper.index("--awr-maximum") + 1] == "3.0"
+    assert not any(argument.startswith("--awr-") for argument in official)
 
 
 def test_runtime_launch_preserves_existing_pythonpath_after_official_checkout(official_checkout: Path) -> None:
@@ -230,6 +272,45 @@ def test_runtime_continuous_launch_keeps_resume_checkpoint_inside_chunk_wrapper(
         runner=lambda *args, **kwargs: calls.append((args, kwargs)) or subprocess.CompletedProcess([], 0),
     )
     command = calls[0][0][0]
+    assert command[command.index("--resume-from-checkpoint") + 1] == str(checkpoint)
+
+
+@pytest.mark.parametrize(("parent_step", "target_step"), ((500, 1000), (1000, 2000)))
+def test_sweep_launch_uses_an_absolute_target_and_authenticated_parent_cursor(
+    tmp_path: Path, official_checkout: Path, parent_step: int, target_step: int,
+) -> None:
+    """A promoted rung supplies its full state to the same Trainer process."""
+    from lehome_train.groot.experiment_manifest import SweepRuntimeProfile
+
+    output = tmp_path / "output"
+    resolved = config(
+        output_dir=str(output), max_steps=target_step, save_steps=500,
+        physical_batch_size=64, global_batch_size=64,
+        runtime_mixture_manifest="/runtime/mixture.json",
+        runtime_window_index="/runtime/windows.json",
+        runtime_mounts_descriptor="/runtime/mounts.json",
+        runtime_sweep_profile=SweepRuntimeProfile(
+            weights={"bc": 95, "rollout": 5, "dagger": 0},
+            quotas={"bc": 61, "rollout": 3, "dagger": 0},
+            target_step=target_step, save_steps=500, terminal_publish=True,
+            action_horizon=16, global_batch_size=64,
+        ),
+    )
+    checkpoint = (
+        output / f".runtime-sweep-parent-{parent_step}-deadbeefdeadbeef"
+        / resolved.experiment_name / f"checkpoint-{parent_step}"
+    )
+    checkpoint.mkdir(parents=True)
+    calls: list[tuple[object, object]] = []
+
+    launch_sweep_finetune(
+        resolved, visible_devices="0", environment={}, official_checkout=official_checkout,
+        resume_checkpoint=checkpoint,
+        runner=lambda *args, **kwargs: calls.append((args, kwargs)) or subprocess.CompletedProcess([], 0),
+    )
+
+    command = calls[0][0][0]
+    assert command[command.index("--stop-after-step") + 1] == str(target_step)
     assert command[command.index("--resume-from-checkpoint") + 1] == str(checkpoint)
 
 

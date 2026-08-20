@@ -178,6 +178,19 @@ def build_launch(
     if config.runtime_mixture_manifest is not None:
         assert config.runtime_window_index is not None
         assert config.runtime_mounts_descriptor is not None
+        awr_arguments: tuple[str, ...] = ()
+        if config.runtime_awr_evidence_path is not None:
+            assert config.runtime_awr_evidence_sha256 is not None
+            assert config.runtime_awr_temperature is not None
+            assert config.runtime_awr_minimum is not None
+            assert config.runtime_awr_maximum is not None
+            awr_arguments = (
+                "--awr-evidence", config.runtime_awr_evidence_path,
+                "--awr-evidence-sha256", config.runtime_awr_evidence_sha256,
+                "--awr-temperature", str(float(config.runtime_awr_temperature)),
+                "--awr-minimum", str(float(config.runtime_awr_minimum)),
+                "--awr-maximum", str(float(config.runtime_awr_maximum)),
+            )
         command = (
             sys.executable,
             "-m",
@@ -185,6 +198,7 @@ def build_launch(
             "--mixture-manifest", config.runtime_mixture_manifest,
             "--window-index", config.runtime_window_index,
             "--mounts-descriptor", config.runtime_mounts_descriptor,
+            *awr_arguments,
             "--official-launch", str(entrypoint),
             "--",
             *official_args,
@@ -241,7 +255,10 @@ def _symlink_free_resume_path(*, checkpoint: Path, output_root: Path, experiment
     staging_root = checkpoint.parent.parent
     permitted_staging = (
         staging_root.parent == output_root
-        and staging_root.name.startswith(".runtime-hf-resume-")
+        and staging_root.name.startswith((
+            ".runtime-hf-resume-",
+            ".runtime-sweep-parent-",
+        ))
         and checkpoint.parent.name == experiment_name
     )
     if (
@@ -335,6 +352,62 @@ def launch_continuous_finetune(
             config, stop_after_optimizer_step=config.max_steps,
             launch=replace(launch, command=command),
         )
+    return runner(command, env=launch.environment, check=True)
+
+
+def launch_sweep_finetune(
+    config: FineTuneLaunchConfig,
+    *,
+    visible_devices: str | None,
+    environment: Mapping[str, str] | None,
+    official_checkout: str | os.PathLike[str],
+    runner: Runner = subprocess.run,
+    resume_checkpoint: str | os.PathLike[str] | None = None,
+) -> subprocess.CompletedProcess[object]:
+    """Run one bounded 500/1K/2K sweep rung through the official launcher.
+
+    This is deliberately separate from ``launch_continuous_finetune``: the
+    latter is the fixed legacy 2K corrective run, whereas sweep children use
+    an *absolute* terminal step and may start from an authenticated prior
+    rung.  Both paths retain the same one-GPU/batch-64/save-every-500
+    invariants and the runtime-mixture chunk wrapper.
+    """
+
+    profile = config.runtime_sweep_profile
+    if (
+        config.num_gpus != 1
+        or config.global_batch_size != 64
+        or config.physical_batch_size != 64
+        or config.save_steps != 500
+        or config.max_steps not in (500, 1000, 2000)
+        or profile is None
+        or profile.target_step != config.max_steps
+        or profile.save_steps != 500
+        or profile.global_batch_size != 64
+        or config.runtime_mixture_manifest is None
+    ):
+        raise ValueError("sweep finetune requires the isolated h16/b64 500-step rung contract")
+    checkpoint = None
+    if resume_checkpoint is not None:
+        checkpoint = _symlink_free_resume_path(
+            checkpoint=Path(resume_checkpoint), output_root=Path(config.output_dir),
+            experiment_name=config.experiment_name,
+        )
+    launch = build_launch(
+        config,
+        visible_devices=visible_devices,
+        environment=environment,
+        official_checkout=official_checkout,
+    )
+    _write_or_verify_identity(config)
+    command = launch.command
+    if checkpoint is not None:
+        command = (*command, "--resume-from-checkpoint", str(checkpoint))
+    command = _distributed_chunk_command(
+        config,
+        stop_after_optimizer_step=config.max_steps,
+        launch=replace(launch, command=command),
+    )
     return runner(command, env=launch.environment, check=True)
 
 

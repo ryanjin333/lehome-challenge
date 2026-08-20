@@ -22,7 +22,13 @@ from typing import Mapping
 PINNED = re.compile(r"^[0-9a-f]{40}$")
 CATEGORIES = frozenset({"top_long", "top_short", "pant_long", "pant_short"})
 RELEASE_STAGES = frozenset({"seen", "public_unseen"})
-STRATEGIES = frozenset({"canonical", "mild", "strong"})
+STRATEGIES = frozenset({
+    "canonical",
+    "mild",
+    "strong",
+    "mild_geometry",
+    "strong_geometry",
+})
 
 
 class ActionSource(StrEnum):

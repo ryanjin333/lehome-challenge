@@ -36,6 +36,8 @@ def test_cli_help() -> None:
         "report",
         "sync",
         "restore",
+        "build-rollout-source",
+        "build-runtime-plan",
         "build-runtime-mixture",
         "pilot-runtime-mixture",
         "runtime-gpu-warmup",

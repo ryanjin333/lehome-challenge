@@ -98,6 +98,46 @@ def _identity() -> RuntimeMixtureTrainingIdentity:
     )
 
 
+def test_runtime_training_identity_binds_optional_awr_evidence_and_configuration() -> None:
+    identity = RuntimeMixtureTrainingIdentity(
+        mixture_id="a" * 64,
+        deployment_receipt_sha256="b" * 64,
+        source_revisions=(
+            ("organizer", "c" * 40, "bc/full", "d" * 64),
+            ("rollout", "e" * 40, "rollouts/round-1", "f" * 64),
+        ),
+        schedule_seed=17,
+        code_bundle_sha256="1" * 64,
+        code_bundle_revision="2" * 40,
+        oci_image="sha256:" + "3" * 64,
+        parent_step12000_artifact_sha256="4" * 64,
+        awr_evidence_sha256="8" * 64,
+        awr_config_sha256="9" * 64,
+    )
+
+    assert identity.to_dict()["awr_evidence_sha256"] == "8" * 64
+    assert identity.to_dict()["awr_config_sha256"] == "9" * 64
+    assert identity.sha256 != _identity().sha256
+
+
+def test_runtime_training_identity_rejects_a_partial_awr_binding() -> None:
+    with pytest.raises(ValueError, match="AWR.*together"):
+        RuntimeMixtureTrainingIdentity(
+            mixture_id="a" * 64,
+            deployment_receipt_sha256="b" * 64,
+            source_revisions=(
+                ("organizer", "c" * 40, "bc/full", "d" * 64),
+                ("rollout", "e" * 40, "rollouts/round-1", "f" * 64),
+            ),
+            schedule_seed=17,
+            code_bundle_sha256="1" * 64,
+            code_bundle_revision="2" * 40,
+            oci_image="sha256:" + "3" * 64,
+            parent_step12000_artifact_sha256="4" * 64,
+            awr_evidence_sha256="8" * 64,
+        )
+
+
 def _checkpoint(root: Path, *, step: int, identity: RuntimeMixtureTrainingIdentity) -> CheckpointDescriptor:
     archive = root / "checkpoints" / f"step-{step}.tar"
     archive.parent.mkdir(parents=True, exist_ok=True)

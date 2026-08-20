@@ -19,6 +19,15 @@ def test_provider_is_pinned_exact():
         assert 'version = "0.6.42"' in main
 
 
+def test_runtime_provider_uses_explicit_non_secret_cli_profile():
+    runtime = _read("runtime", "main.tf")
+    runtime_vars = _read("runtime", "variables.tf")
+
+    assert "profile = {" in runtime
+    assert "name = var.nebius_profile" in runtime
+    assert 'variable "nebius_profile"' in runtime_vars
+
+
 def test_storage_own_protected_500gib_network_ssd():
     storage = _read("storage", "main.tf")
     assert "500" in storage
@@ -31,6 +40,7 @@ def test_runtime_is_preemptible_rtx6000_with_fail_recovery():
     runtime = _read("runtime", "main.tf")
     assert '"gpu-rtx6000"' in runtime
     assert '"1gpu-24vcpu-218gb"' in runtime
+    assert "stopped         = true" in runtime
     assert 'recovery_policy = "FAIL"' in runtime
     assert "on_preemption" in runtime and '"STOP"' in runtime
 
@@ -39,6 +49,9 @@ def test_runtime_boot_disk_is_disposable_custom_image():
     runtime = _read("runtime", "main.tf")
     assert "image_id" in runtime
     assert "boot_disk" in runtime
+    assert "cloud_init_user_data" in runtime
+    assert "ssh_authorized_keys" in runtime
+    assert "var.ssh_public_key" in runtime
 
 
 def test_one_existing_secondary_disk_attached_read_write():

@@ -40,6 +40,11 @@ def test_episode_identity_requires_pinned_artifacts_and_is_immutable() -> None:
         value.seed = 43  # type: ignore[misc]
 
 
+@pytest.mark.parametrize("strategy", ("mild_geometry", "strong_geometry"))
+def test_episode_identity_accepts_stable_geometry_collection_profiles(strategy: str) -> None:
+    assert replace(identity(), strategy=strategy).strategy == strategy
+
+
 @pytest.mark.parametrize("field,value", [("category", "dress"), ("release_stage", "private"), ("strategy", "random")])
 def test_episode_identity_rejects_unknown_contract_values(field: str, value: str) -> None:
     with pytest.raises(ValueError):

@@ -65,6 +65,8 @@ class RuntimeMixtureTrainingIdentity:
     code_bundle_revision: str
     oci_image: str
     parent_step12000_artifact_sha256: str
+    awr_evidence_sha256: str | None = None
+    awr_config_sha256: str | None = None
     physical_batch_size: int = 64
     action_horizon: int = 16
 
@@ -74,6 +76,11 @@ class RuntimeMixtureTrainingIdentity:
         _sha(self.code_bundle_sha256, "code_bundle_sha256")
         _revision(self.code_bundle_revision, "code_bundle_revision")
         _sha(self.parent_step12000_artifact_sha256, "parent_step12000_artifact_sha256")
+        if (self.awr_evidence_sha256 is None) != (self.awr_config_sha256 is None):
+            raise ValueError("runtime AWR evidence and configuration must be bound together")
+        if self.awr_evidence_sha256 is not None:
+            _sha(self.awr_evidence_sha256, "awr_evidence_sha256")
+            _sha(self.awr_config_sha256, "awr_config_sha256")
         if type(self.schedule_seed) is not int or self.schedule_seed < 0:
             raise ValueError("schedule_seed must be a nonnegative integer")
         if type(self.oci_image) is not str or not self.oci_image.startswith("sha256:"):
@@ -96,7 +103,7 @@ class RuntimeMixtureTrainingIdentity:
                 raise ValueError("runtime source identity has an unauthorized prefix")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "mixture_id": self.mixture_id,
             "deployment_receipt_sha256": self.deployment_receipt_sha256,
             "source_revisions": [
@@ -111,6 +118,10 @@ class RuntimeMixtureTrainingIdentity:
             "physical_batch_size": self.physical_batch_size,
             "action_horizon": self.action_horizon,
         }
+        if self.awr_evidence_sha256 is not None:
+            result["awr_evidence_sha256"] = self.awr_evidence_sha256
+            result["awr_config_sha256"] = self.awr_config_sha256
+        return result
 
     @property
     def sha256(self) -> str:
@@ -288,8 +299,34 @@ def attest_runtime_mixture_checkpoint_publication(
     bytes again through its deliberately small Hub protocol.  No trainer or
     caller-provided field is carried into the resulting cursor identity.
     """
+    return _attest_checkpoint_publication(
+        raw_publication=raw_publication, identity=identity, hub=hub,
+        destination=destination, allowed_steps=_STEPS,
+    )
+
+
+def attest_sweep_runtime_checkpoint_publication(
+    *, raw_publication: Mapping[str, object], identity: RuntimeMixtureTrainingIdentity,
+    hub: RuntimeCheckpointHub, destination: Path,
+) -> dict[str, object]:
+    """Read back one isolated sweep terminal checkpoint.
+
+    This deliberately does not alter the legacy observer's 1K/2K-only
+    surface.  The sweep controller binds promoted parents to the returned
+    immutable receipt rather than using the legacy global anchor chain.
+    """
+    return _attest_checkpoint_publication(
+        raw_publication=raw_publication, identity=identity, hub=hub,
+        destination=destination, allowed_steps=(500, 1000, 2000),
+    )
+
+
+def _attest_checkpoint_publication(
+    *, raw_publication: Mapping[str, object], identity: RuntimeMixtureTrainingIdentity,
+    hub: RuntimeCheckpointHub, destination: Path, allowed_steps: tuple[int, ...],
+) -> dict[str, object]:
     step = raw_publication.get("optimizer_step")
-    if step not in _STEPS:
+    if step not in allowed_steps:
         raise ValueError("runtime checkpoint publication has an unsupported step")
     raw = _publication_fields(raw_publication, step=int(step))
     publication = {

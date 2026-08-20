@@ -14,6 +14,91 @@ def _write(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
+def test_source_publications_bind_bc_and_rollout_to_their_distinct_approved_repositories(
+    tmp_path: Path,
+) -> None:
+    from lehome_train.groot.runtime_mixture_builder import _source_publications
+    from lehome_train.io import sha256_file
+
+    bc_receipt = tmp_path / "bc-readback.json"
+    rollout_receipt = tmp_path / "rollout-readback.json"
+    _write(bc_receipt, {
+        "repository": "ryanjin333/lehome-groot-n17-data",
+        "immutable_revision": "b" * 40,
+        "remote_prefix": "bc/full",
+        "fresh_readback_verified": True,
+        "tree_listing_verified": True,
+    })
+    _write(rollout_receipt, {
+        "repository": "ryanjin333/lehome-groot-n17-rollouts",
+        "immutable_revision": "c" * 40,
+        "remote_prefix": "rollouts/round-2",
+        "fresh_readback_verified": True,
+        "tree_listing_verified": True,
+    })
+    publications = tmp_path / "source-publications.json"
+    _write(publications, {
+        "schema_version": 1,
+        "kind": "runtime_mixture_source_publications",
+        "sources": [
+            {
+                "source_id": "organizer", "source_type": "bc",
+                "repository": "ryanjin333/lehome-groot-n17-data",
+                "revision": "b" * 40, "prefix": "bc/full",
+                "readback_receipt_path": str(bc_receipt),
+                "readback_receipt_sha256": sha256_file(bc_receipt),
+            },
+            {
+                "source_id": "rollout", "source_type": "rollout",
+                "repository": "ryanjin333/lehome-groot-n17-rollouts",
+                "revision": "c" * 40, "prefix": "rollouts/round-2",
+                "readback_receipt_path": str(rollout_receipt),
+                "readback_receipt_sha256": sha256_file(rollout_receipt),
+            },
+        ],
+    })
+
+    loaded = _source_publications(publications)
+
+    assert loaded["organizer"]["repository"] == "ryanjin333/lehome-groot-n17-data"
+    assert loaded["rollout"]["repository"] == "ryanjin333/lehome-groot-n17-rollouts"
+
+
+def test_raw_attempt_accepts_a_canonical_success_reached_at_horizon(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_builder import _raw_attempt
+    from lehome_train.io import sha256_file
+
+    attempt = tmp_path / "raw" / "accepted-at-horizon"
+    _write(attempt / "episode.json", {
+        "episode_id": "accepted-at-horizon",
+        "accepted_success": True,
+        "outcome": "success",
+        "terminal_reason": "horizon",
+        "identity": {"release_stage": "seen"},
+        "bc_target_count": 0,
+        "provenance": {
+            "execution_backend": "policy_server",
+            "execution_mode": "policy_server",
+            "parity_stage": "persistent_collection",
+            "simulator_device": "cpu",
+            "policy_device": "cuda:0",
+            "policy_artifact_sha256": "a" * 64,
+        },
+    })
+    attempt.joinpath("annotations.jsonl").write_text(
+        json.dumps({"state": [0.0] * 12, "action": [1.0] * 12}) + "\n",
+        encoding="utf-8",
+    )
+    _write(attempt / "SHA256SUMS.json", {})
+
+    states, actions = _raw_attempt(
+        tmp_path, "accepted-at-horizon", sha256_file(attempt / "SHA256SUMS.json"),
+    )
+
+    assert states == [[0.0] * 12]
+    assert actions == [[1.0] * 12]
+
+
 def _selected_150_document() -> tuple[dict[str, object], dict[str, object]]:
     """Production-shaped selected index and campaign ledger, sans raw artifacts."""
     from lehome_train.io import canonical_json_sha256
@@ -226,7 +311,7 @@ def test_builder_rejects_root_mutation_during_normalization_before_destination(
         garment_index_path="garment-index.json", garment_index_sha256="a" * 64,
     )
     rollout = types.SimpleNamespace(
-        repository="ryanjin333/lehome-groot-n17-data", revision="c" * 40, prefix="rollouts/round-1",
+        repository="ryanjin333/lehome-groot-n17-rollouts", revision="c" * 40, prefix="rollouts/round-1",
         tree_sha256=source_tree_sha256(campaign), manifest_sha256=sha256_file(campaign / "campaign-receipt.json"),
     )
     experiment = types.SimpleNamespace(
@@ -362,15 +447,13 @@ def test_selected_150_requires_canonical_hash_exact_rows_and_production_ledger_m
         validate_selected_bindings(document, campaign)
 
 
-@pytest.mark.parametrize("mutation", ["selection_sha256", "count", "accepted", "stage", "outcome"])
+@pytest.mark.parametrize("mutation", ["selection_sha256", "accepted", "stage", "outcome"])
 def test_selected_150_rejects_hash_count_or_campaign_acceptance_drift(mutation: str) -> None:
     from lehome_train.groot.runtime_mixture_builder import validate_selected_bindings
 
     document, campaign = _selected_150_document()
     if mutation == "selection_sha256":
         document["selection_sha256"] = "0" * 64
-    elif mutation == "count":
-        document["selected_bindings"] = document["selected_bindings"][:-1]
     elif mutation == "accepted":
         campaign["attempt_receipts"][0]["accepted_success"] = False
     elif mutation == "stage":
@@ -395,6 +478,46 @@ def test_selected_150_rejects_legacy_opaque_hash_but_derives_a_new_canonical_art
     derived = {"schema_version": 1, "selection_sha256": canonical_json_sha256({"schema_version": 1, "selected_bindings": rows}), "selected_bindings": rows}
     assert validate_selected_bindings(derived, campaign)["attempt-000"] == "0" * 64
     assert rows == original_rows
+
+
+def test_selected_bindings_accepts_one_to_150_sealed_successes_with_explicit_v2_count() -> None:
+    from lehome_train.groot.runtime_mixture_builder import validate_selected_bindings
+    from lehome_train.io import canonical_json_sha256
+
+    document, campaign = _selected_150_document()
+    rows = document["selected_bindings"][:2]
+    document = {
+        "schema_version": 2,
+        "selected_count": 2,
+        "max_selected_count": 150,
+        "selected_bindings": rows,
+    }
+    document["selection_sha256"] = canonical_json_sha256(document)
+
+    assert validate_selected_bindings(document, campaign) == {
+        row["attempt_id"]: row["episode_manifest_sha256"] for row in rows
+    }
+
+
+@pytest.mark.parametrize("count", [0, 151])
+def test_selected_bindings_rejects_empty_or_over_cap_v2_indexes(count: int) -> None:
+    from lehome_train.groot.runtime_mixture_builder import validate_selected_bindings
+    from lehome_train.io import canonical_json_sha256
+
+    document, campaign = _selected_150_document()
+    rows = document["selected_bindings"][:count]
+    if count == 151:
+        rows.append(dict(rows[0]))
+    document = {
+        "schema_version": 2,
+        "selected_count": count,
+        "max_selected_count": 150,
+        "selected_bindings": rows,
+    }
+    document["selection_sha256"] = canonical_json_sha256(document)
+
+    with pytest.raises(ValueError, match="selected|count|cap"):
+        validate_selected_bindings(document, campaign)
 
 
 def test_selected_150_raw_roots_use_the_legacy_field_as_a_checksum_manifest_binding(tmp_path: Path) -> None:

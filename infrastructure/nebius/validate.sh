@@ -17,12 +17,17 @@ bash infrastructure/nebius/tools/bootstrap.sh
 echo "== shell syntax checks =="
 for script in infrastructure/nebius/tools/bootstrap.sh \
               infrastructure/nebius/packer/scripts/*.sh \
-              rollout_appliance/entrypoint.sh; do
+              rollout_appliance/entrypoint.sh \
+              rollout_appliance/smoke_one_episode.sh \
+              rollout_appliance/run_12k_campaign.sh \
+              rollout_appliance/run_controlled_recovery_campaign.sh \
+              rollout_appliance/run_controlled_recovery_smoke.sh \
+              rollout_appliance/run_randomized_top_short_pilot.sh; do
   bash -n "${script}"
 done
 
 echo "== python infrastructure tests =="
-PYTHONPATH=source/lehome:trainer/src uv run --project trainer pytest -q \
+PYTHONPATH=.:source/lehome:trainer/src uv run --project trainer pytest -q \
   tests/infrastructure
 
 echo "== packer fmt + validate =="
@@ -44,10 +49,16 @@ fi
   -var 'service_account_id=test-sa' \
   -var 'service_account_public_key_id=test-key' \
   -var "service_account_private_key_file=${VALIDATION_KEY}" \
+  -var 'rollout_parent_image_id=test-image' \
   -var 'image_version=0.0.0-test' \
+  -var 'trainer_code_revision=0000000000000000000000000000000000000000' \
+  -var 'ghcr_pull_token=' \
   infrastructure/nebius/packer
 
 echo "== terraform fmt + validate =="
+"${TERRAFORM}" -chdir=infrastructure/nebius/terraform/experiment-pool init -backend=false
+"${TERRAFORM}" -chdir=infrastructure/nebius/terraform/experiment-pool fmt -check -recursive
+"${TERRAFORM}" -chdir=infrastructure/nebius/terraform/experiment-pool validate
 for root in infrastructure/nebius/terraform/storage infrastructure/nebius/terraform/runtime; do
   "${TERRAFORM}" -chdir="${root}" init -backend=false
   "${TERRAFORM}" -chdir="${root}" fmt -check -recursive
@@ -56,7 +67,7 @@ done
 
 echo
 echo "All free validation passed. Paid next steps (operator-approved only):"
-echo "  1. ${PACKER} build infrastructure/nebius/packer/training.pkr.hcl"
+echo "  1. ${PACKER} build -var trainer_code_revision=<exact-40-character-commit> infrastructure/nebius/packer/training.pkr.hcl"
 echo "  2. ${PACKER} build infrastructure/nebius/packer/rollout.pkr.hcl"
 echo "  3. ${TERRAFORM} -chdir=infrastructure/nebius/terraform/storage apply"
 echo "  4. ${TERRAFORM} -chdir=infrastructure/nebius/terraform/runtime apply -var-file=<role>.tfvars"

@@ -103,6 +103,51 @@ def test_runtime_checkpoint_cursor_is_not_an_immutable_launch_identity_field() -
     )
 
     assert "runtime_resume_global_step" not in immutable.identity()
+    assert not any(key.startswith("runtime_awr_") for key in immutable.identity())
+
+
+def test_runtime_awr_configuration_is_complete_and_part_of_launch_identity() -> None:
+    from lehome_train.groot.awr_weighting import AwrReplayConfig
+
+    resolved = config(
+        runtime_mixture_manifest="/runtime/m.json",
+        runtime_window_index="/runtime/w.json",
+        runtime_mounts_descriptor="/runtime/d.json",
+        runtime_awr_evidence_path="/runtime/awr.json",
+        runtime_awr_evidence_sha256="d" * 64,
+        runtime_awr_temperature=0.75,
+        runtime_awr_minimum=0.5,
+        runtime_awr_maximum=3.0,
+        max_steps=2_000,
+        save_steps=500,
+    )
+
+    identity = resolved.identity()
+    assert identity["runtime_awr_evidence_path"] == "/runtime/awr.json"
+    assert identity["runtime_awr_evidence_sha256"] == "d" * 64
+    assert identity["runtime_awr_config_sha256"] == AwrReplayConfig(
+        temperature=0.75, minimum=0.5, maximum=3.0
+    ).sha256
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"runtime_awr_evidence_path": "/runtime/awr.json"},
+        {
+            "runtime_awr_evidence_path": "/runtime/awr.json",
+            "runtime_awr_evidence_sha256": "d" * 64,
+            "runtime_awr_temperature": 1.0,
+            "runtime_awr_minimum": 0.5,
+            "runtime_awr_maximum": None,
+        },
+    ],
+)
+def test_runtime_awr_configuration_fails_closed_when_partial(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="AWR.*complete"):
+        config(**overrides)
 
 
 def test_runtime_resume_cursor_must_match_the_bound_checkpoint_step() -> None:

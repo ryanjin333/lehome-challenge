@@ -272,6 +272,34 @@ def build_runtime_mixture(
     _fail_closed(operation)
 
 
+@app.command("build-rollout-source")
+def build_rollout_source(
+    request: Path = typer.Option(..., "--request"),
+) -> None:
+    """Combine sealed rollout rounds into a fresh canonical round-N source."""
+
+    def operation() -> object:
+        from lehome_train.groot.rollout_source_adapter import build_from_request
+
+        return build_from_request(request)
+
+    _fail_closed(operation)
+
+
+@app.command("build-runtime-plan")
+def build_runtime_plan(
+    request: Path = typer.Option(..., "--request"),
+) -> None:
+    """Freeze h16 BC/rollout selections from immutable local source roots."""
+
+    def operation() -> object:
+        from lehome_train.groot.rollout_source_adapter import build_runtime_plan_from_request
+
+        return build_runtime_plan_from_request(request)
+
+    _fail_closed(operation)
+
+
 @app.command("pilot-runtime-mixture")
 def pilot_runtime_mixture(
     request: Path = typer.Option(..., "--request"),

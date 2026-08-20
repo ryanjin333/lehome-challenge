@@ -2,6 +2,7 @@
 Description=Record LeHome preemption shutdown hooks
 DefaultDependencies=no
 After=lehome-workspace.service
+Before=lehome-training.service
 
 [Service]
 Type=oneshot

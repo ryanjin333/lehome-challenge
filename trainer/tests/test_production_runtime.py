@@ -43,6 +43,171 @@ NORMALIZATION_SHA256 = "d" * 64
 IMAGE_DIGEST = "sha256:" + "e" * 64
 
 
+def test_runtime_checkpoint_source_evidence_binds_the_exact_awr_transform() -> None:
+    from lehome_train.groot.awr_weighting import AwrReplayConfig
+    from lehome_train.groot.runtime_checkpoint_lifecycle import (
+        RuntimeMixtureTrainingIdentity,
+    )
+
+    awr_config = AwrReplayConfig(temperature=0.75, minimum=0.5, maximum=3.0)
+    identity = RuntimeMixtureTrainingIdentity(
+        mixture_id="a" * 64,
+        deployment_receipt_sha256="b" * 64,
+        source_revisions=(
+            ("organizer", "c" * 40, "bc/full", "d" * 64),
+            ("rollout", "e" * 40, "rollouts/round-1", "f" * 64),
+        ),
+        schedule_seed=17,
+        code_bundle_sha256="1" * 64,
+        code_bundle_revision="2" * 40,
+        oci_image="sha256:" + "3" * 64,
+        parent_step12000_artifact_sha256="4" * 64,
+        awr_evidence_sha256="8" * 64,
+        awr_config_sha256=awr_config.sha256,
+    )
+    parsed = runtime_module._runtime_checkpoint_identity_from_evidence(
+        identity.to_dict()
+    )
+    config = SimpleNamespace(
+        runtime_awr_evidence_sha256="8" * 64,
+        runtime_awr_temperature=0.75,
+        runtime_awr_minimum=0.5,
+        runtime_awr_maximum=3.0,
+    )
+    assert parsed.awr_evidence_sha256 == "8" * 64
+    runtime_module._validate_runtime_awr_training_identity(
+        config=config, identity=parsed
+    )
+    with pytest.raises(ValueError, match="AWR.*identity"):
+        runtime_module._validate_runtime_awr_training_identity(
+            config=SimpleNamespace(
+                runtime_awr_evidence_sha256="8" * 64,
+                runtime_awr_temperature=0.75,
+                runtime_awr_minimum=0.5,
+                runtime_awr_maximum=4.0,
+            ),
+            identity=parsed,
+        )
+
+
+def test_runtime_awr_evidence_is_loaded_from_the_protected_mount_and_bound_to_manifest(
+    tmp_path: Path,
+) -> None:
+    evidence = {
+        "schema_version": 1,
+        "kind": "lehome_awr_progress_evidence",
+        "mixture_id": "a" * 64,
+        "mixture_manifest_sha256": canonical_json_sha256({"manifest": "bound"}),
+        "episodes": [
+            {
+                "episode_id": "attempt-1",
+                "lineage_id": "lineage-1",
+                "split": "train",
+                "score_kind": "progress",
+                "score": 1.0,
+                "provenance_path": "receipts/attempt-1.json",
+                "provenance_sha256": "b" * 64,
+            }
+        ],
+    }
+    evidence_path = tmp_path / "prepared" / "awr.json"
+    _write(evidence_path, evidence)
+    config = SimpleNamespace(
+        runtime_awr_evidence_path=str(evidence_path),
+        runtime_awr_evidence_sha256=canonical_json_sha256(evidence),
+        runtime_awr_temperature=0.75,
+        runtime_awr_minimum=0.5,
+        runtime_awr_maximum=3.0,
+    )
+    contract = SimpleNamespace(
+        manifest=SimpleNamespace(mixture_id="a" * 64, raw={"manifest": "bound"})
+    )
+
+    binding = runtime_module._load_runtime_awr_binding(
+        config=config, contract=contract
+    )
+
+    assert binding is not None
+    assert binding.checkpoint_identity() == {
+        "awr_evidence_sha256": canonical_json_sha256(evidence),
+        "awr_config_sha256": __import__(
+            "lehome_train.groot.awr_weighting", fromlist=["AwrReplayConfig"]
+        ).AwrReplayConfig(temperature=0.75, minimum=0.5, maximum=3.0).sha256,
+    }
+
+
+def test_runtime_warmup_dataset_factory_uses_the_same_bound_awr_objects_as_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Warm-up must exercise the exact replay transform that training will use."""
+    evidence = {
+        "schema_version": 1,
+        "kind": "lehome_awr_progress_evidence",
+        "mixture_id": "a" * 64,
+        "mixture_manifest_sha256": canonical_json_sha256({"manifest": "bound"}),
+        "episodes": [{
+            "episode_id": "attempt-1", "lineage_id": "lineage-1", "split": "train",
+            "score_kind": "progress", "score": 1.0,
+            "provenance_path": "receipts/attempt-1.json", "provenance_sha256": "b" * 64,
+        }],
+    }
+    evidence_path = tmp_path / "prepared" / "awr.json"
+    _write(evidence_path, evidence)
+    config = SimpleNamespace(
+        runtime_awr_evidence_path=str(evidence_path),
+        runtime_awr_evidence_sha256=canonical_json_sha256(evidence),
+        runtime_awr_temperature=0.75, runtime_awr_minimum=0.5, runtime_awr_maximum=3.0,
+    )
+    contract = SimpleNamespace(
+        manifest=SimpleNamespace(mixture_id="a" * 64, raw={"manifest": "bound"})
+    )
+    captured: dict[str, object] = {}
+
+    def capture_factory(**kwargs: object) -> type[object]:
+        captured.update(kwargs)
+        return object
+
+    import lehome_train.groot.runtime_mixture as runtime_mixture
+
+    monkeypatch.setattr(runtime_mixture, "runtime_dataset_factory_class", capture_factory)
+    result = runtime_module._runtime_warmup_dataset_factory(
+        config=config, contract=contract,
+        manifest=tmp_path / "prepared" / "mixture.json",
+        window_index=tmp_path / "prepared" / "windows.json",
+        mounts=tmp_path / "prepared" / "mounts.json",
+    )
+
+    assert result is object
+    assert captured["awr_evidence"].identity_sha256 == canonical_json_sha256(evidence)
+    assert captured["awr_config"].sha256 == (
+        __import__("lehome_train.groot.awr_weighting", fromlist=["AwrReplayConfig"])
+        .AwrReplayConfig(temperature=0.75, minimum=0.5, maximum=3.0).sha256
+    )
+
+
+def test_runtime_warmup_dataset_factory_keeps_disabled_awr_factory_arguments_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(runtime_awr_evidence_path=None)
+    contract = SimpleNamespace(manifest=SimpleNamespace(mixture_id="a" * 64, raw={}))
+    captured: dict[str, object] = {}
+
+    def capture_factory(**kwargs: object) -> type[object]:
+        captured.update(kwargs)
+        return object
+
+    import lehome_train.groot.runtime_mixture as runtime_mixture
+
+    monkeypatch.setattr(runtime_mixture, "runtime_dataset_factory_class", capture_factory)
+    assert runtime_module._runtime_warmup_dataset_factory(
+        config=config, contract=contract,
+        manifest=tmp_path / "prepared" / "mixture.json",
+        window_index=tmp_path / "prepared" / "windows.json",
+        mounts=tmp_path / "prepared" / "mounts.json",
+    ) is object
+    assert "awr_evidence" not in captured and "awr_config" not in captured
+
+
 @pytest.fixture(autouse=True)
 def mounted_test_roots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -993,14 +1158,29 @@ def test_runtime_gpu_warmup_production_adapter_measures_live_loader_model_and_nv
         def close(self) -> None:
             self.closed = True
 
+    class FakeAutocast:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    def fake_autocast(*, device_type: str, dtype: object) -> FakeAutocast:
+        assert device_type == "cuda"
+        assert dtype is fake_bfloat16
+        return FakeAutocast()
+
     cuda = FakeCuda()
-    fake_torch = SimpleNamespace(cuda=cuda)
+    fake_bfloat16 = object()
+    fake_torch = SimpleNamespace(
+        cuda=cuda, autocast=fake_autocast, bfloat16=fake_bfloat16,
+    )
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     loaders: list[FakeLoader] = []
     samplers: list[FakeSampler] = []
     times = iter(
         value
-        for step in range(60)
+            for step in range(7)
         for value in (float(step), float(step), float(step) + 0.01, float(step) + 0.20)
     )
     optimizer = FakeOptimizer()
@@ -1027,20 +1207,20 @@ def test_runtime_gpu_warmup_production_adapter_measures_live_loader_model_and_nv
 
     adapter = production.runtime_gpu_warmup_adapter({"binding": {}})
     assert adapter.runtime_state().to_dict()["gpu_uuid"] == "GPU-1234"
-    measured = adapter.measure(worker_count=12, burn_in_steps=10, measured_steps=50)
+    measured = adapter.measure(worker_count=12, burn_in_steps=2, measured_steps=5)
 
-    assert measured.decoded_samples == 64 * 60
-    assert measured.measured_steps == 50
+    assert measured.decoded_samples == 64 * 7
+    assert measured.measured_steps == 5
     assert measured.oom is False and measured.error is None
-    assert measured.loader_wait_seconds == pytest.approx(0.5)
-    assert measured.step_seconds == pytest.approx(10.0)
-    assert measured.gpu_busy_seconds == pytest.approx(8.0)
+    assert measured.loader_wait_seconds == pytest.approx(0.05)
+    assert measured.step_seconds == pytest.approx(1.0)
+    assert measured.gpu_busy_seconds == pytest.approx(0.8)
     assert measured.gpu_utilization_percent == 80.0
-    assert measured.observed_batch_sizes == (64,) * 60
+    assert measured.observed_batch_sizes == (64,) * 7
     assert measured.loss_min == measured.loss_max == measured.loss_final == 0.125
     assert measured.minimum_free_vram_bytes == 20 * 1024**3
     assert measured.materialization_proof is not None
-    assert optimizer.steps == 60 and optimizer.clears == 60
+    assert optimizer.steps == 7 and optimizer.clears == 7
     assert len(loaders) == len(samplers) == 1
     assert loaders[0].shutdowns == 1 and samplers[0].closed is True
     assert cuda.empty_cache_calls == cuda.ipc_collect_calls == 1
@@ -1100,8 +1280,24 @@ def test_runtime_gpu_warmup_records_oom_and_cleans_workers_without_claiming_succ
         sampler.close = lambda: setattr(sampler, "closed", True)
         return sampler
 
+    class FakeAutocast:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    fake_bfloat16 = object()
+
+    def fake_autocast(*, device_type: str, dtype: object) -> FakeAutocast:
+        assert device_type == "cuda"
+        assert dtype is fake_bfloat16
+        return FakeAutocast()
+
     session = runtime_module._RuntimeMixtureWarmupSession(
-        torch_module=SimpleNamespace(cuda=FakeCuda()),
+        torch_module=SimpleNamespace(
+            cuda=FakeCuda(), autocast=fake_autocast, bfloat16=fake_bfloat16,
+        ),
         model=OomModel(),
         optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda **_kwargs: None),
         loader_factory=lambda _workers: loader,
@@ -1109,7 +1305,7 @@ def test_runtime_gpu_warmup_records_oom_and_cleans_workers_without_claiming_succ
         clock=iter((0.0, 0.0, 0.01)).__next__,
     )
 
-    measured = session.measure(worker_count=0, burn_in_steps=10, measured_steps=50)
+    measured = session.measure(worker_count=4, burn_in_steps=2, measured_steps=5)
 
     assert measured.oom is True
     assert measured.measured_steps == 0
@@ -1157,7 +1353,7 @@ def test_runtime_gpu_warmup_never_substitutes_unloaded_model_or_missing_nvml() -
         loader_factory=unused_loader,
         sampler_factory=lambda: pytest.fail("NVML must not replace an unloaded model"),
     )
-    absent_model = unloaded.measure(worker_count=0, burn_in_steps=10, measured_steps=50)
+    absent_model = unloaded.measure(worker_count=4, burn_in_steps=2, measured_steps=5)
     assert absent_model.measured_steps == absent_model.decoded_samples == 0
     assert absent_model.oom is False
     assert "not loaded" in (absent_model.error or "")
@@ -1181,7 +1377,7 @@ def test_runtime_gpu_warmup_never_substitutes_unloaded_model_or_missing_nvml() -
         loader_factory=lambda _workers: OneBatchLoader(),
         sampler_factory=lambda: (_ for _ in ()).throw(RuntimeError("NVML unavailable")),
     )
-    absent_nvml = missing_nvml.measure(worker_count=0, burn_in_steps=10, measured_steps=50)
+    absent_nvml = missing_nvml.measure(worker_count=4, burn_in_steps=2, measured_steps=5)
     assert absent_nvml.measured_steps == absent_nvml.decoded_samples == 0
     assert absent_nvml.oom is False
     assert absent_nvml.error == "NVML unavailable"

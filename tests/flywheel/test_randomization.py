@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import pytest
+import lehome.flywheel.randomization as randomization
 
 from lehome.flywheel.randomization import (
     read_or_author_garment_display_color,
     sample_randomization,
     validate_material_receipt,
+    validate_randomization_receipt,
 )
 
 
@@ -65,6 +67,49 @@ def test_strong_stays_inside_physical_bounds() -> None:
     assert abs(result.values["robot_base_translation_m"][1]) <= 0.02
     assert 1 <= result.values["table_texture_id"] <= 100
     assert all(0.65 <= value <= 1.0 for value in result.values["garment_display_color"])
+
+
+def test_geometry_profile_is_reproducible_without_unstable_material_fields() -> None:
+    first = sample_randomization("mild_geometry", seed=139)
+    second = sample_randomization("mild_geometry", seed=139)
+
+    assert first == second
+    assert set(first.values) == {
+        "light_intensity_scale",
+        "camera_translation_m",
+        "garment_yaw_deg",
+        "robot_base_translation_m",
+    }
+    assert "table_texture_id" not in first.values
+    assert "garment_display_color" not in first.values
+
+    receipt = dict(first.values)
+    validate_randomization_receipt(dict(first.values), receipt)
+
+
+def test_geometry_receipt_still_fails_closed_on_missing_or_extra_readback() -> None:
+    sampled = dict(sample_randomization("strong_geometry", seed=149).values)
+    missing = dict(sampled)
+    missing.pop("garment_yaw_deg")
+    with pytest.raises(RuntimeError, match="fields"):
+        validate_randomization_receipt(sampled, missing)
+
+    extra = {**sampled, "table_texture_path": "/assets/1.png"}
+    with pytest.raises(RuntimeError, match="fields"):
+        validate_randomization_receipt(sampled, extra)
+
+
+def test_randomization_field_profile_controls_material_application() -> None:
+    assert hasattr(randomization, "randomization_materials_enabled")
+    geometry = dict(sample_randomization("mild_geometry", seed=139).values)
+    full = dict(sample_randomization("mild", seed=139).values)
+
+    assert randomization.randomization_materials_enabled(geometry) is False
+    assert randomization.randomization_materials_enabled(full) is True
+
+    partial_material = {**geometry, "table_texture_id": 7}
+    with pytest.raises(RuntimeError, match="fields"):
+        randomization.randomization_materials_enabled(partial_material)
 
 
 def test_material_receipt_requires_exact_usd_readback() -> None:

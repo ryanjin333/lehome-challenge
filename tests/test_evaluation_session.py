@@ -1,9 +1,31 @@
 from __future__ import annotations
 
+import ast
 import importlib
+import hashlib
+import json
 from pathlib import Path
 import sys
 import types
+
+
+def test_cpu_visible_contact_uses_the_same_authoritative_usd_readback_as_runtime_evidence() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "flywheel_visible_garment_contact"
+    )
+    method_source = ast.get_source_segment(source, method)
+    assert method_source is not None
+    assert "self._flywheel_cpu_cloth_state()" in method_source
+    assert "get_current_mesh_points" not in method_source
 
 
 def _cpu_cloth_evidence(env) -> None:
@@ -163,3 +185,336 @@ def test_evaluation_session_explicit_reset_flag_preserves_legacy_per_episode_res
     session.run_episode(assignment={"garment": "shirt"}, policy=object(), reset_policy=False)
 
     assert reset_flags == [True, False]
+
+
+def test_persistent_attempt_authors_an_official_flywheel_manifest(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    captured = []
+    monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **kwargs: captured.append(kwargs["args"]) or [])
+    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    args = types.SimpleNamespace(
+        task="task", device="cpu", renderer_device="cuda:0", camera_device="cuda:0",
+        policy_device="cuda:0", video_dir="legacy-videos", eval_dataset_path="legacy-dataset",
+        flywheel_manifest=None,
+    )
+    session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
+    attempt = tmp_path / "attempt"
+    session.run_episode(
+        assignment={
+            "garment": "Top_Long_Seen_0", "seed": 107, "category": "top_long",
+            "release_stage": "seen", "difficulty": "seen", "attempt_id": "top-long-seen-0-seed-107",
+        },
+        policy=object(),
+        attempt_output_dir=attempt,
+    )
+    manifest_path = Path(captured[0].flywheel_manifest)
+    assert manifest_path == attempt / "flywheel-manifest.json"
+    payload = __import__("json").loads(manifest_path.read_text())
+    assert payload["episode_id"] == "top-long-seen-0-seed-107"
+    assert payload["identity"]["garment_name"] == "Top_Long_Seen_0"
+    assert payload["identity"]["strategy"] == "canonical"
+    assert payload["policy_revision"] == "30ac1a84da67b099e115ad147bcd61e9d60046d3"
+    assert payload["image_identity"].startswith("sha256:")
+
+
+def test_persistent_attempt_records_the_explicit_served_policy_identity(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    captured = []
+    monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **kwargs: captured.append(kwargs["args"]) or [])
+    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    args = types.SimpleNamespace(
+        task="task", device="cpu", renderer_device="cuda:0", camera_device="cuda:0",
+        policy_device="cuda:0", video_dir="legacy-videos", eval_dataset_path="legacy-dataset",
+        flywheel_manifest=None,
+        policy_repo="ryanjin333/lehome-groot-n17-models",
+        policy_revision="e" * 40,
+        policy_step=2000,
+        policy_artifact_sha256="7" * 64,
+    )
+    session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
+    attempt = tmp_path / "attempt"
+
+    session.run_episode(
+        assignment={
+            "garment": "Top_Long_Unseen_0", "seed": 601, "category": "top_long",
+            "release_stage": "public_unseen", "attempt_id": "top-long-public-unseen-0-seed-601",
+        },
+        policy=object(),
+        attempt_output_dir=attempt,
+    )
+
+    payload = __import__("json").loads(Path(captured[0].flywheel_manifest).read_text())
+    assert payload["policy_revision"] == "e" * 40
+    assert payload["identity"]["policy_repo"] == "ryanjin333/lehome-groot-n17-models"
+    assert payload["identity"]["policy_revision"] == "e" * 40
+    assert payload["identity"]["policy_step"] == 2000
+    assert payload["policy_artifact_sha256"] == "7" * 64
+
+
+def test_persistent_randomized_assignment_authors_geometry_only_strategy(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    captured = []
+    monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **kwargs: captured.append(kwargs["args"]) or [])
+    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    args = types.SimpleNamespace(
+        task="task", device="cpu", renderer_device="cuda:0", camera_device="cuda:0",
+        policy_device="cuda:0", video_dir="legacy-videos", eval_dataset_path="legacy-dataset",
+        flywheel_manifest=None,
+    )
+    session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
+    attempt = tmp_path / "attempt"
+    session.run_episode(
+        assignment={
+            "garment": "Top_Short_Seen_0", "seed": 139, "category": "top_short",
+            "release_stage": "seen", "difficulty": "randomized",
+            "attempt_id": "top-short-seen-0-mild-geometry-seed-139",
+        },
+        policy=object(),
+        attempt_output_dir=attempt,
+    )
+
+    payload = __import__("json").loads(Path(captured[0].flywheel_manifest).read_text())
+    assert payload["strategy"] == "mild_geometry"
+    assert payload["identity"]["strategy"] == "mild_geometry"
+
+
+def test_persistent_assignment_preserves_explicit_geometry_strategy(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    assignment = {
+        "garment": "Top_Short_Seen_1", "seed": 149, "category": "top_short",
+        "release_stage": "seen", "difficulty": "randomized", "strategy": "strong_geometry",
+        "attempt_id": "top-short-seen-1-strong-geometry-seed-149",
+    }
+    args = types.SimpleNamespace(policy_device="cuda:0")
+
+    path = evaluation._write_persistent_flywheel_manifest(tmp_path / "attempt", assignment, args)
+    payload = __import__("json").loads(path.read_text())
+
+    assert payload["strategy"] == "strong_geometry"
+    assert payload["identity"]["strategy"] == "strong_geometry"
+
+
+def test_persistent_assignment_rejects_unstable_material_randomization(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    assignment = {
+        "garment": "Top_Short_Seen_1", "seed": 149, "category": "top_short",
+        "release_stage": "seen", "difficulty": "randomized", "strategy": "strong",
+        "attempt_id": "top-short-seen-1-strong-seed-149",
+    }
+
+    with __import__("pytest").raises(ValueError, match="geometry-only"):
+        evaluation._write_persistent_flywheel_manifest(
+            tmp_path / "attempt", assignment, types.SimpleNamespace(policy_device="cuda:0")
+        )
+
+
+def test_persistent_manifest_hands_controlled_recovery_identity_to_validator(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    from lehome.flywheel.recovery_collection import load_controlled_recovery
+
+    reset = tmp_path / "source-reset.json"
+    annotations = tmp_path / "source-annotations.jsonl"
+    reset.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+    annotations.write_text(
+        "".join(
+            json.dumps({"step": step, "action": [float(step)] * 12, "success": step == 3}) + "\n"
+            for step in range(4)
+        ),
+        encoding="utf-8",
+    )
+    category = "top_long"
+    garment = "Top_Long_Seen_0"
+    continuation_state = [0.0] * 12
+    state_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "category": category,
+                "garment": garment,
+                "state_rounding": "fixed_6dp",
+                "state": ["0.000000"] * 12,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assignment = {
+        "recovery_kind": "controlled_success_recovery_v1",
+        "attempt_id": "controlled-top-long-0",
+        "category": category,
+        "garment": garment,
+        "release_stage": "seen",
+        "seed": 7,
+        "strategy": "canonical",
+        "source_reset": str(reset),
+        "source_reset_sha256": hashlib.sha256(reset.read_bytes()).hexdigest(),
+        "source_annotations": str(annotations),
+        "source_annotations_sha256": hashlib.sha256(annotations.read_bytes()).hexdigest(),
+        "prefix_stop": 2,
+        "source_first_success_step": 3,
+        "action_prefix_sha256": hashlib.sha256(
+            (json.dumps([[0.0] * 12, [1.0] * 12], sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        ).hexdigest(),
+        "perturbation_profile": {
+            "cloth_displacement_m": 0.002,
+            "cloth_velocity_mps": 0.01,
+            "gripper_offset_rad": 0.02,
+        },
+        "perturbation_seed": 7,
+        "source_round_id": "round",
+        "source_episode_id": "episode",
+        "source_episode_digest": "a" * 64,
+        "source_immutable_revision": "b" * 40,
+        "source_continuation_state": continuation_state,
+        "source_state_fingerprint": state_fingerprint,
+        "perturbation_fingerprint": "d" * 64,
+        "source_state_perturbation_fingerprint": "e" * 64,
+    }
+
+    manifest_path = evaluation._write_persistent_flywheel_manifest(
+        tmp_path / "attempt", assignment, types.SimpleNamespace(policy_device="cuda:0")
+    )
+    envelope = json.loads(manifest_path.read_text(encoding="utf-8"))["controlled_recovery"]
+
+    recovery = load_controlled_recovery(envelope)
+
+    assert envelope["category"] == category
+    assert envelope["garment"] == garment
+    assert recovery.continuation_state == tuple(continuation_state)
+
+
+def test_cpu_cloth_runtime_receipt_skips_contact_canary_until_requested(monkeypatch) -> None:
+    evaluation = _evaluation(monkeypatch)
+    calls = {"canary": 0}
+
+    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    _cpu_cloth_evidence(env)
+    def boom():
+        calls["canary"] += 1
+        raise RuntimeError("contact should not run at startup")
+    env.flywheel_visible_garment_contact = boom
+    args = types.SimpleNamespace(device="cpu", renderer_device="cuda:0", camera_device="cuda:0")
+    session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
+
+    receipt = session.runtime_receipt
+    assert "visible_contact_canary" not in receipt
+    assert calls["canary"] == 0
+    session._include_contact_canary = True
+    try:
+        session.runtime_receipt
+    except RuntimeError as error:
+        assert "contact should not run at startup" in str(error)
+    else:
+        raise AssertionError("expected contact canary to run only when requested")
+    assert calls["canary"] == 1
+
+
+def test_persistent_episode_enables_fresh_cloth_and_contact_runtime_evidence(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    monkeypatch.setattr(
+        evaluation,
+        "run_evaluation_loop",
+        lambda **_kwargs: [{"return": 0.0, "length": 1, "success": False}],
+    )
+
+    env = types.SimpleNamespace(
+        device="cpu",
+        renderer_device="cuda:0",
+        camera_device="cuda:0",
+        cfg=types.SimpleNamespace(garment_name="Top_Short_Seen_9", garment_version="Release"),
+    )
+    _cpu_cloth_evidence(env)
+    args = types.SimpleNamespace(
+        task="task",
+        device="cpu",
+        renderer_device="cuda:0",
+        camera_device="cuda:0",
+        video_dir="video",
+        eval_dataset_path="dataset",
+        flywheel_manifest=None,
+    )
+    session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
+
+    session.run_episode(
+        assignment={"garment": "Top_Short_Seen_9"},
+        attempt_output_dir=tmp_path / "attempt",
+        policy=object(),
+        cancellation_event=None,
+    )
+
+    receipt = session.runtime_receipt
+    assert receipt["cloth_readback"] == {"positions": 1, "velocities": 1}
+    assert receipt["visible_contact_canary"] == {"observed": False}
+
+
+
+
+def test_run_episode_passes_hard_state_restore_into_evaluation_loop(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    captured = []
+    monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **kwargs: captured.append(kwargs["args"]) or [])
+    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    args = types.SimpleNamespace(task="task", device="cpu", video_dir="v", eval_dataset_path="d")
+    session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
+    session.run_episode(
+        assignment={"garment": "Pant_Long_Seen_8", "restore_snapshot": "/tmp/terminal.json"},
+        policy=object(),
+    )
+    assert captured[0].restore_snapshot == "/tmp/terminal.json"
+    assert getattr(session, "_pending_restore_snapshot", None) in (None, "/tmp/terminal.json")
+
+
+def test_verified_success_replay_binds_checked_snapshot_and_lineage_to_manifest(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    captured = []
+    monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **kwargs: captured.append(kwargs["args"]) or [])
+    snapshot = tmp_path / "reset.json"
+    snapshot.write_text(json.dumps({"schema_version": 1, "garment_name": "Top_Long_Seen_0"}), encoding="utf-8")
+    digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    args = types.SimpleNamespace(
+        task="task", device="cpu", renderer_device="cuda:0", camera_device="cuda:0",
+        policy_device="cuda:0", video_dir="video", eval_dataset_path="dataset", flywheel_manifest=None,
+    )
+    session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
+
+    attempt = tmp_path / "attempt"
+    session.run_episode(
+        assignment={
+            "attempt_id": "replay-top-long-000", "garment": "Top_Long_Seen_0", "category": "top_long",
+            "release_stage": "seen", "seed": 50_000, "strategy": "mild_geometry",
+            "replay_kind": "verified_success_reset_v1", "restore_snapshot": str(snapshot),
+            "restore_snapshot_sha256": digest, "parent_episode_id": "original-top-long-1",
+            "lineage_id": "original-top-long-1",
+        },
+        policy=object(),
+        attempt_output_dir=attempt,
+    )
+
+    assert captured[0].restore_snapshot == json.loads(snapshot.read_text(encoding="utf-8"))
+    manifest = json.loads((attempt / "flywheel-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["restore_snapshot"] == str(snapshot)
+    assert manifest["restore_snapshot_sha256"] == digest
+    assert manifest["parent_episode_id"] == "original-top-long-1"
+    assert manifest["lineage_id"] == "original-top-long-1"
+    assert manifest["replay_kind"] == "verified_success_reset_v1"
+
+
+def test_verified_success_replay_rejects_a_tampered_snapshot_before_evaluation(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    invoked = []
+    monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **_kwargs: invoked.append(True) or [])
+    snapshot = tmp_path / "reset.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    args = types.SimpleNamespace(task="task", device="cpu", video_dir="video", eval_dataset_path="dataset")
+    session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
+
+    with __import__("pytest").raises(ValueError, match="SHA-256"):
+        session.run_episode(
+            assignment={
+                "garment": "Top_Long_Seen_0", "replay_kind": "verified_success_reset_v1",
+                "restore_snapshot": str(snapshot), "restore_snapshot_sha256": "0" * 64,
+            },
+            policy=object(),
+        )
+    assert invoked == []

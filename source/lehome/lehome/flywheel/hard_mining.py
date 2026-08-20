@@ -46,6 +46,7 @@ class RankedFailure:
     official_success: bool
     official_return: float | None
     score: float
+    eligible_for_recovery: bool
     priority_reasons: tuple[str, ...]
     diagnostics: Mapping[str, float | int | bool]
 
@@ -56,15 +57,18 @@ class RankedFailure:
         score: float,
         *,
         category_gap: float,
-        low_progress: float,
-        stalled: float,
+        progress: float,
+        stall_fraction: float,
+        short_stall: float,
+        dead_terminal: bool,
+        eligible_for_recovery: bool,
     ) -> RankedFailure:
         reasons = tuple(
             reason
             for reason, present in (
                 ("category_gap", category_gap > 0.0),
-                ("low_progress", low_progress > 0.0),
-                ("stalled", stalled > 0.0),
+                ("high_progress", progress >= 0.5),
+                ("short_stall", stall_fraction <= 0.25),
                 ("restorable", evidence.restorable),
             )
             if present
@@ -75,6 +79,7 @@ class RankedFailure:
             official_success=evidence.official_success,
             official_return=evidence.preserved_official_return,
             score=score,
+            eligible_for_recovery=eligible_for_recovery,
             priority_reasons=reasons,
             diagnostics=MappingProxyType(
                 {
@@ -83,8 +88,11 @@ class RankedFailure:
                     "length": evidence.length,
                     "restorable": evidence.restorable,
                     "category_gap": category_gap,
-                    "low_progress": low_progress,
-                    "stalled": stalled,
+                    "progress": progress,
+                    "stall_fraction": stall_fraction,
+                    "short_stall": short_stall,
+                    "dead_terminal": dead_terminal,
+                    "eligible_for_recovery": eligible_for_recovery,
                 }
             ),
         )
@@ -108,16 +116,32 @@ def rank_failures(
     ranked: list[RankedFailure] = []
     for failure in failures:
         category_gap = 1.0 - _category_metric(category_success, failure.category)
-        low_progress = 1.0 - min(max(failure.max_progress, 0.0), 1.0)
-        stalled = min(failure.stalled_steps / max(failure.length, 1), 1.0)
-        score = 4.0 * category_gap + 3.0 * low_progress + 2.0 * stalled + float(failure.restorable)
+        progress = min(max(failure.max_progress, 0.0), 1.0)
+        stall_fraction = min(failure.stalled_steps / max(failure.length, 1), 1.0)
+        short_stall = 1.0 - stall_fraction
+        dead_terminal = progress < 0.25 or stall_fraction > 0.75
+        eligible_for_recovery = failure.restorable and progress >= 0.35 and stall_fraction <= 0.5
+        score = 4.0 * category_gap + 4.0 * progress + 2.0 * short_stall + float(failure.restorable)
         ranked.append(
             RankedFailure.from_evidence(
                 failure,
                 score,
                 category_gap=category_gap,
-                low_progress=low_progress,
-                stalled=stalled,
+                progress=progress,
+                stall_fraction=stall_fraction,
+                short_stall=short_stall,
+                dead_terminal=dead_terminal,
+                eligible_for_recovery=eligible_for_recovery,
             )
         )
-    return tuple(sorted(ranked, key=lambda item: (-item.score, item.episode_id)))
+    return tuple(
+        sorted(
+            ranked,
+            key=lambda item: (
+                not item.eligible_for_recovery,
+                bool(item.diagnostics["dead_terminal"]),
+                -item.score,
+                item.episode_id,
+            ),
+        )
+    )

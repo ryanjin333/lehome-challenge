@@ -20,7 +20,10 @@ import re
 import subprocess
 from typing import Any, Literal
 
+from lehome_train.constants import DEFAULT_DATA_REPO, DEFAULT_ROLLOUT_REPO
 from lehome_train.io import canonical_json_sha256, sha256_file
+from lehome_train.flywheel.materialize import _is_autonomous_policy_success
+from lehome_train.groot.awr_weighting import AwrReplayConfig, ProgressEvidenceSet
 from lehome_train.groot.experiment_manifest import batch64_quotas
 
 try:  # Torch is a runtime dependency of pinned GR00T, not of macOS import tests.
@@ -42,9 +45,13 @@ CAMERAS = (
 )
 INSTRUCTION = "fold the garment on the table"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_ROLLOUT_CATEGORIES = frozenset({"top_long", "top_short", "pant_long", "pant_short"})
+_CATEGORY_REPLAY_RESOLUTION = 1_000_000
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SOURCE_TYPES = {"bc", "rollout", "dagger"}
-APPROVED_MIXTURE_REPOSITORY = "ryanjin333/lehome-groot-n17-data"
+APPROVED_MIXTURE_REPOSITORY = DEFAULT_ROLLOUT_REPO
+APPROVED_BC_REPOSITORY = DEFAULT_DATA_REPO
+APPROVED_ROLLOUT_REPOSITORY = DEFAULT_ROLLOUT_REPO
 _STATISTIC_FIELDS = ("min", "max", "mean", "std", "q01", "q99")
 _RELATIVE_ACTION_DIMENSIONS = {
     "left_arm": 5,
@@ -242,7 +249,12 @@ def _validate_source_publication(kind: str, value: object) -> dict[str, object]:
         {"repository", "revision", "prefix", "readback_receipt_path", "readback_receipt_sha256"},
         label="source publication",
     )
-    if value["repository"] != APPROVED_MIXTURE_REPOSITORY:
+    approved_repository = (
+        APPROVED_BC_REPOSITORY if kind == "bc"
+        else APPROVED_ROLLOUT_REPOSITORY if kind == "rollout"
+        else None
+    )
+    if value["repository"] != approved_repository:
         raise ValueError("source publication repository is not approved")
     if type(value["revision"]) is not str or not _REVISION.fullmatch(value["revision"]):
         raise ValueError("source publication revision is floating or invalid")
@@ -718,6 +730,70 @@ def _permuted_index(length: int, *, seed: int, cycle: int, namespace: str, ordin
     return (offset + ordinal * stride) % length
 
 
+def _rollout_category(contract: RuntimeContract, window: Window) -> str:
+    """Authenticate the category used by the balanced replay schedule."""
+    root = contract.mounts[window.source_id]
+    locator = window.source_locator
+    attempt_path = _safe_file(
+        root,
+        str(locator["attempt_manifest_path"]),
+        label="attempt manifest",
+    )
+    episode = _load_object(attempt_path, label="attempt manifest")
+    identity = episode.get("identity")
+    if (
+        sha256_file(attempt_path) != locator["attempt_manifest_sha256"]
+        or episode.get("episode_id") != window.source_episode_id
+        or not isinstance(identity, dict)
+        or identity.get("category") not in _ROLLOUT_CATEGORIES
+        or identity.get("release_stage") != "seen"
+        or identity.get("instruction") != INSTRUCTION
+        or not _is_autonomous_policy_success(episode)
+    ):
+        raise ValueError("rollout attempt is not authenticated category-balanced policy data")
+    return str(identity["category"])
+
+
+def _category_balanced_multiplicities(
+    choices: list[Window],
+    weights: list[float],
+    categories: list[str],
+) -> tuple[int, ...]:
+    """Allocate identical replay mass per category, then AWR mass within it."""
+    if len(choices) != len(weights) or len(choices) != len(categories) or not choices:
+        raise ValueError("category-balanced replay inputs are inconsistent")
+    grouped: dict[str, list[int]] = {}
+    for index, category in enumerate(categories):
+        if category not in _ROLLOUT_CATEGORIES:
+            raise ValueError("category-balanced replay category is invalid")
+        grouped.setdefault(category, []).append(index)
+    multiplicities = [0] * len(choices)
+    for category in sorted(grouped):
+        indices = grouped[category]
+        if len(indices) > _CATEGORY_REPLAY_RESOLUTION:
+            raise ValueError("category has too many rollout windows for replay resolution")
+        total = sum(weights[index] for index in indices)
+        if not math.isfinite(total) or total <= 0.0:
+            raise ValueError("category replay weight mass is invalid")
+        remaining = _CATEGORY_REPLAY_RESOLUTION - len(indices)
+        scaled = {index: remaining * weights[index] / total for index in indices}
+        for index in indices:
+            multiplicities[index] = 1 + int(math.floor(scaled[index]))
+        unassigned = _CATEGORY_REPLAY_RESOLUTION - sum(multiplicities[index] for index in indices)
+        order = sorted(
+            indices,
+            key=lambda index: (
+                -(scaled[index] - math.floor(scaled[index])),
+                choices[index].window_id,
+            ),
+        )
+        for index in order[:unassigned]:
+            multiplicities[index] += 1
+        if sum(multiplicities[index] for index in indices) != _CATEGORY_REPLAY_RESOLUTION:
+            raise ValueError("category replay apportionment drift")
+    return tuple(multiplicities)
+
+
 class RuntimeMixtureDataset(IterableDataset):
     """Deterministic infinite logical sample stream, partitioned by global position.
 
@@ -726,7 +802,7 @@ class RuntimeMixtureDataset(IterableDataset):
     choose sources, so aggregating them preserves every complete cycle.
     """
 
-    def __init__(self, contract: RuntimeContract, *, processor: Callable[[Any], Any] | None = None, decoder: Callable[..., Any] | None = None, global_sample_offset: int = 0, expected_global_step: int | None = None, global_batch_size: int | None = None, limit: int | None = None, worker_id: int | None = None, worker_count: int | None = None, rank: int = 0, world_size: int = 1) -> None:
+    def __init__(self, contract: RuntimeContract, *, processor: Callable[[Any], Any] | None = None, decoder: Callable[..., Any] | None = None, global_sample_offset: int = 0, expected_global_step: int | None = None, global_batch_size: int | None = None, limit: int | None = None, worker_id: int | None = None, worker_count: int | None = None, rank: int = 0, world_size: int = 1, awr_evidence: ProgressEvidenceSet | None = None, awr_config: AwrReplayConfig | None = None) -> None:
         if global_sample_offset < 0 or rank < 0 or world_size <= 0 or rank >= world_size:
             raise ValueError("invalid deterministic stream partition")
         if limit is not None and limit < 0:
@@ -756,6 +832,43 @@ class RuntimeMixtureDataset(IterableDataset):
         self._train: dict[str, list[Window]] = {source.source_id: [] for source in contract.manifest.sources}
         for window in contract.training_windows:
             self._train[window.source_id].append(window)
+        self._awr_replay_slots: dict[str, tuple[int, ...]] = {}
+        if (awr_evidence is None) != (awr_config is None):
+            raise ValueError("AWR evidence and configuration must be supplied together")
+        if awr_evidence is not None and awr_config is not None:
+            awr_evidence.validate_binding(
+                mixture_id=contract.manifest.mixture_id,
+                mixture_manifest_sha256=canonical_json_sha256(contract.manifest.raw),
+            )
+            weights = awr_evidence.weights(awr_config)
+            rollout_windows = [
+                window for window in contract.training_windows if window.source_type == "rollout"
+            ]
+            expected_episodes = {window.source_episode_id for window in rollout_windows}
+            if set(weights) != expected_episodes:
+                raise ValueError("missing AWR evidence for rollout train episodes")
+            for source_id, choices in self._train.items():
+                if not choices or choices[0].source_type != "rollout":
+                    continue
+                replay_weights: list[float] = []
+                categories: list[str] = []
+                for window in choices:
+                    evidence = awr_evidence.episodes[window.source_episode_id]
+                    if evidence.lineage_id != window.lineage_id:
+                        raise ValueError("AWR evidence lineage does not match rollout window")
+                    # This is a deterministic replay schedule, not an ignored
+                    # per-sample loss field. Category apportionment first gives
+                    # each garment family identical replay mass; AWR progress
+                    # weights then rank windows only within that family. This
+                    # prevents an easy, high-acceptance category from taking
+                    # over the rollout stream.
+                    replay_weights.append(weights[window.source_episode_id])
+                    categories.append(_rollout_category(contract, window))
+                self._awr_replay_slots[source_id] = _category_balanced_multiplicities(
+                    choices,
+                    replay_weights,
+                    categories,
+                )
 
     def reset_seed(self, new_seed: int) -> None:
         """Accept the pinned trainer cursor only when it names this checkpoint."""
@@ -785,7 +898,18 @@ class RuntimeMixtureDataset(IterableDataset):
         # Occurrence index within this cycle drives the independently permuted source windows.
         occurrence = sum(item == source_id for item in _permutation(slots, self.contract.manifest.schedule_seed, cycle, "slots")[:position_in_cycle])
         choices = self._train[source_id]
-        window = choices[_permuted_index(len(choices), seed=self.contract.manifest.schedule_seed, cycle=cycle, namespace=f"windows:{source_id}", ordinal=occurrence)]
+        multiplicities = self._awr_replay_slots.get(source_id)
+        if multiplicities is None:
+            window = choices[_permuted_index(len(choices), seed=self.contract.manifest.schedule_seed, cycle=cycle, namespace=f"windows:{source_id}", ordinal=occurrence)]
+        else:
+            slot = _permuted_index(sum(multiplicities), seed=self.contract.manifest.schedule_seed, cycle=cycle, namespace=f"awr-windows:{source_id}", ordinal=occurrence)
+            running = 0
+            window = choices[-1]
+            for candidate, multiplicity in zip(choices, multiplicities, strict=True):
+                running += multiplicity
+                if slot < running:
+                    window = candidate
+                    break
         return RuntimeSample(f"{position}:{window.window_id}", position, source_id, window.source_type, window)
 
     def _render(self, sample: RuntimeSample) -> Any:
@@ -945,7 +1069,7 @@ class RangeSourceLoader:
         if sha256_file(attempt_path) != locator["attempt_manifest_sha256"] or episode.get("episode_id") != window.source_episode_id:
             raise ValueError("rollout attempt identity drift")
         identity = episode.get("identity")
-        if not isinstance(identity, dict) or episode.get("accepted_success") is not True or episode.get("outcome") != "success" or episode.get("terminal_reason") != "success" or identity.get("release_stage") != "seen" or identity.get("instruction") != INSTRUCTION:
+        if not isinstance(identity, dict) or identity.get("release_stage") != "seen" or identity.get("instruction") != INSTRUCTION or not _is_autonomous_policy_success(episode):
             raise ValueError("rollout attempt is not accepted successful seen policy data")
         if attempt_root not in self._attempt_cache:
             self._verify_checksums(attempt_root)
@@ -998,7 +1122,7 @@ class RangeSourceLoader:
         return {"images": {key.rsplit(".", 1)[-1]: value for key, value in images.items()}, "state": states[0], "actions": actions, "window_id": window.window_id}
 
 
-def make_dataset_factory(*, mixture_manifest: str | os.PathLike[str], mounts_descriptor: str | os.PathLike[str], global_sample_offset: int = 0, expected_global_step: int | None = None, global_batch_size: int | None = None, decoder: Callable[..., Any] | None = None, expected_window_index: str | os.PathLike[str] | None = None) -> Callable[..., RuntimeMixtureDataset]:
+def make_dataset_factory(*, mixture_manifest: str | os.PathLike[str], mounts_descriptor: str | os.PathLike[str], global_sample_offset: int = 0, expected_global_step: int | None = None, global_batch_size: int | None = None, decoder: Callable[..., Any] | None = None, expected_window_index: str | os.PathLike[str] | None = None, awr_evidence: ProgressEvidenceSet | None = None, awr_config: AwrReplayConfig | None = None) -> Callable[..., RuntimeMixtureDataset]:
     """Return the sole injected factory; arbitrary upstream args stay untouched."""
 
     def factory(*_args: Any, processor: Callable[[Any], Any] | None = None, **_kwargs: Any) -> RuntimeMixtureDataset:
@@ -1007,22 +1131,28 @@ def make_dataset_factory(*, mixture_manifest: str | os.PathLike[str], mounts_des
             selected = (Path(mixture_manifest).parent / contract.manifest.window_index_path).resolve()
             if selected != Path(expected_window_index).resolve():
                 raise ValueError("selected window index does not match immutable manifest")
-        return RuntimeMixtureDataset(contract, processor=processor, decoder=decoder, global_sample_offset=global_sample_offset, expected_global_step=expected_global_step, global_batch_size=global_batch_size)
+        return RuntimeMixtureDataset(contract, processor=processor, decoder=decoder, global_sample_offset=global_sample_offset, expected_global_step=expected_global_step, global_batch_size=global_batch_size, awr_evidence=awr_evidence, awr_config=awr_config)
 
     return factory
 
 
-def runtime_dataset_factory_class(*, mixture_manifest: str | os.PathLike[str], window_index: str | os.PathLike[str], mounts_descriptor: str | os.PathLike[str], global_sample_offset: int, expected_global_step: int | None = None, global_batch_size: int | None = None) -> type[object]:
+def runtime_dataset_factory_class(*, mixture_manifest: str | os.PathLike[str], window_index: str | os.PathLike[str], mounts_descriptor: str | os.PathLike[str], global_sample_offset: int, expected_global_step: int | None = None, global_batch_size: int | None = None, awr_evidence: ProgressEvidenceSet | None = None, awr_config: AwrReplayConfig | None = None) -> type[object]:
     """Create the exact ``DatasetFactory(config).build(processor)`` replacement."""
+
+    def observed_global_batch(config: object) -> object:
+        training = getattr(config, "training", None)
+        if training is not None and getattr(training, "global_batch_size", None) is not None:
+            return training.global_batch_size
+        return getattr(config, "global_batch_size", None)
 
     class RuntimeDatasetFactory:
         def __init__(self, config: object) -> None:
             self.config = config
 
         def build(self, processor: Any) -> tuple[RuntimeMixtureDataset, None]:
-            if global_batch_size is not None and getattr(self.config, "global_batch_size", None) != global_batch_size:
+            if global_batch_size is not None and observed_global_batch(self.config) != global_batch_size:
                 raise ValueError("pinned trainer global batch does not match runtime resume binding")
-            factory = make_dataset_factory(mixture_manifest=mixture_manifest, mounts_descriptor=mounts_descriptor, global_sample_offset=global_sample_offset, expected_global_step=expected_global_step, global_batch_size=global_batch_size, expected_window_index=window_index)
+            factory = make_dataset_factory(mixture_manifest=mixture_manifest, mounts_descriptor=mounts_descriptor, global_sample_offset=global_sample_offset, expected_global_step=expected_global_step, global_batch_size=global_batch_size, expected_window_index=window_index, awr_evidence=awr_evidence, awr_config=awr_config)
             dataset = factory(processor=processor)
             processor.set_statistics(dataset.get_dataset_statistics(), override=True)
             return dataset, None

@@ -237,6 +237,10 @@ def release_role(config: WorkspaceConfig, clock_ns: Callable[[], int]) -> dict[s
     manifest = load_manifest(path)
     if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         raise WorkspaceError("cannot release a role on an unsupported manifest schema")
+    if manifest.get("run_id") != config.run_id:
+        raise WorkspaceError(
+            f"run identity mismatch: manifest {manifest.get('run_id')!r} versus boot {config.run_id!r}"
+        )
     active_role = manifest.get("active_role")
     if active_role != config.role:
         raise WorkspaceError(f"cannot release role {config.role!r}: disk leased to {active_role!r}")
@@ -265,3 +269,86 @@ def ensure_layout(config: WorkspaceConfig) -> tuple[Path, ...]:
         target.mkdir(parents=True, exist_ok=True)
         created.append(target)
     return tuple(created)
+
+
+
+def _subprocess_runner(command: Sequence[str]) -> CommandResult:
+    import subprocess
+
+    completed = subprocess.run(list(command), capture_output=True, text=True, check=False)
+    return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+
+
+def admit_workspace(
+    config: WorkspaceConfig,
+    runner: CommandRunner,
+    clock_ns: Callable[[], int],
+    mount_table_text: str = "",
+) -> dict[str, object]:
+    """Format if blank, mount, initialize or acquire the role lease, then lay out dirs."""
+    observed = blkid_uuid(config.device, runner)
+    if observed is None:
+        assigned = config.expected_uuid or str(uuid4())
+        format_blank_disk(config.device, assigned, runner)
+        observed = blkid_uuid(config.device, runner)
+        if observed is None:
+            raise WorkspaceError("formatted disk still has no filesystem UUID")
+    if config.expected_uuid is not None and observed != config.expected_uuid.lower():
+        raise WorkspaceError("mounted disk UUID does not match expected_uuid")
+    if not mount_table_text:
+        mounts = Path("/proc/mounts")
+        mount_table_text = mounts.read_text(encoding="utf-8") if mounts.is_file() else ""
+    mount_workspace(config, runner, mount_table_text)
+    path = manifest_path(config)
+    if path.exists() or path.is_symlink():
+        manifest = acquire_role(config, observed, clock_ns)
+    else:
+        manifest = initialize_manifest(config, observed, clock_ns)
+    ensure_layout(config)
+    return manifest
+
+
+def release_workspace(
+    config: WorkspaceConfig,
+    runner: CommandRunner,
+    clock_ns: Callable[[], int],
+) -> dict[str, object]:
+    """Release an already-admitted role without mounting or formatting anything.
+
+    This deliberately does *not* call :func:`admit_workspace`: shutdown must
+    never make a formatting decision, even if a device alias has changed.
+    """
+    observed = blkid_uuid(config.device, runner)
+    if observed is None:
+        raise WorkspaceError("cannot release a role from a blank workspace disk")
+    if config.expected_uuid is not None and observed != config.expected_uuid.lower():
+        raise WorkspaceError("release disk UUID does not match expected_uuid")
+    return release_role(config, clock_ns)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+    import time
+
+    parser = argparse.ArgumentParser(description="Admit the LeHome shared workspace disk.")
+    parser.add_argument("--device", required=True)
+    parser.add_argument("--role", required=True, choices=ROLES)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--expected-uuid", default=None)
+    parser.add_argument("--release", action="store_true", help="release an already-admitted role lease")
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    config = WorkspaceConfig(
+        device=args.device,
+        role=args.role,
+        run_id=args.run_id,
+        expected_uuid=args.expected_uuid,
+    )
+    if args.release:
+        release_workspace(config, _subprocess_runner, time.time_ns)
+    else:
+        admit_workspace(config, _subprocess_runner, time.time_ns)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

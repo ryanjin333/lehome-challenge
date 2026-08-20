@@ -1,3 +1,13 @@
+variable "nebius_profile" {
+  type        = string
+  description = "Existing Nebius CLI profile used by the provider; contains no credential material in Terraform state."
+
+  validation {
+    condition     = length(trimspace(var.nebius_profile)) > 0
+    error_message = "nebius_profile must name an existing Nebius CLI profile."
+  }
+}
+
 variable "parent_id" {
   type        = string
   description = "Nebius project that owns the runtime instance."
@@ -41,4 +51,9 @@ variable "manifest_sha256" {
     condition     = can(regex("^[0-9a-f]{64}$", var.manifest_sha256))
     error_message = "manifest_sha256 must be a 64-char lowercase hex digest."
   }
+}
+
+variable "ssh_public_key" {
+  type        = string
+  description = "Operator SSH public key injected through cloud-init on first boot."
 }

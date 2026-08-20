@@ -14,7 +14,7 @@ import tempfile
 from time import sleep
 from typing import Any, Callable, Literal, Mapping, Protocol
 
-from lehome_train.constants import DEFAULT_DATA_REPO, DEFAULT_MODEL_REPO
+from lehome_train.constants import DEFAULT_DATA_REPO, DEFAULT_MODEL_REPO, DEFAULT_ROLLOUT_REPO
 from lehome_train.models import SyncEntry, validate_artifact_relative_path
 
 
@@ -141,6 +141,7 @@ class HubRepositoryTransport(Protocol):
 _APPROVED_REPOSITORIES = {
     DEFAULT_DATA_REPO: "dataset",
     DEFAULT_MODEL_REPO: "model",
+    DEFAULT_ROLLOUT_REPO: "dataset",
 }
 
 

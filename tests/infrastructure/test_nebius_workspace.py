@@ -185,6 +185,27 @@ def test_release_role_requires_current_holder(config, tmp_path):
         release_role(rollout, lambda: 2)
 
 
+def test_release_role_requires_the_original_run_identity(config, tmp_path):
+    (tmp_path / "lehome").mkdir()
+    initialize_manifest(config, UUID, lambda: 1)
+    replacement = WorkspaceConfig(
+        device="/dev/vdb", role="training", run_id="replacement-run", mount_point=config.mount_point,
+    )
+    with pytest.raises(WorkspaceError, match="run identity mismatch"):
+        release_role(replacement, lambda: 2)
+
+
+def test_release_workspace_never_mounts_or_formats(config, tmp_path):
+    from lehome_workspace import release_workspace
+
+    (tmp_path / "lehome").mkdir()
+    initialize_manifest(config, UUID, lambda: 1)
+    runner = FakeRunner()
+    released = release_workspace(config, runner, lambda: 2)
+    assert released["active_role"] is None
+    assert [command[0] for command in runner.commands] == ["blkid"]
+
+
 def test_load_manifest_rejects_symlink(config, tmp_path):
     (tmp_path / "lehome").mkdir()
     target = tmp_path / "elsewhere.json"
@@ -202,3 +223,58 @@ def test_ensure_layout_creates_durable_tree(config, tmp_path):
     assert (Path(config.mount_point) / "rollouts" / "accepted").is_dir()
     assert (Path(config.mount_point) / "ledgers").is_dir()
     assert len(created) == 15
+
+
+
+class BlankThenFormattedRunner(FakeRunner):
+    def __init__(self):
+        super().__init__(blkid_exit=2, blkid_stdout="")
+        self._formatted = False
+
+    def __call__(self, command):
+        self.commands.append(tuple(command))
+        if command[0] == "mkfs.ext4":
+            self._formatted = True
+            return CommandResult(0, "", "")
+        if command[0] == "blkid":
+            if self._formatted:
+                return CommandResult(0, UUID, "")
+            return CommandResult(2, "", "")
+        return CommandResult(0, "", "")
+
+
+def test_admit_workspace_formats_blank_then_leases(config, tmp_path):
+    from lehome_workspace import admit_workspace
+
+    runner = BlankThenFormattedRunner()
+    seen = {"n": 0}
+
+    def clock():
+        seen["n"] += 1
+        return seen["n"]
+
+    Path(config.mount_point).mkdir()
+    manifest = admit_workspace(config, runner, clock, mount_table_text="")
+    assert manifest["active_role"] == "training"
+    assert manifest["disk_uuid"] == UUID
+    assert any(command[0] == "mkfs.ext4" for command in runner.commands)
+    assert (Path(config.mount_point) / "datasets" / "bc" / "full").is_dir()
+
+
+def test_workspace_cli_requires_role_and_run_id():
+    from lehome_workspace import main
+    import pytest
+
+    with pytest.raises(SystemExit) as help_exit:
+        main(["--help"])
+    assert help_exit.value.code == 0
+    with pytest.raises(SystemExit) as missing_exit:
+        main([])
+    assert missing_exit.value.code == 2
+
+
+def test_workspace_unit_waits_for_cloud_init_runtime_env():
+    unit = (Path(__file__).resolve().parents[2] / "infrastructure" / "nebius" / "guest" / "systemd" / "lehome-workspace.service").read_text(encoding="utf-8")
+    assert "cloud-init.service" in unit
+    assert "EnvironmentFile=-/etc/lehome/runtime.env" in unit
+    assert "missing /etc/lehome/runtime.env" in unit

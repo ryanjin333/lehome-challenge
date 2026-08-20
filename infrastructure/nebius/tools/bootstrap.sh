@@ -65,5 +65,5 @@ fetch_verified \
   "${!terraform_var}"
 
 chmod +x "${TOOLS_DIR}/packer" "${TOOLS_DIR}/terraform"
-"${TOOLS_DIR}/packer" version | head -1
-"${TOOLS_DIR}/terraform" version | head -1
+"${TOOLS_DIR}/packer" version | sed -n '1p'
+"${TOOLS_DIR}/terraform" version | sed -n '1p'

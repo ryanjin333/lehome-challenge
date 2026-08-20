@@ -13,6 +13,7 @@ import shutil
 import tempfile
 from typing import Any
 
+from lehome_train.constants import DEFAULT_DATA_REPO, DEFAULT_ROLLOUT_REPO
 from lehome_train.groot.runtime_mixture import (
     ACTION_HORIZON,
     APPROVED_MIXTURE_REPOSITORY,
@@ -288,7 +289,7 @@ def _source_upload_journal(path: Path) -> tuple[dict[str, object], tuple[SyncEnt
     if (
         journal.get("schema_version") != 1
         or journal.get("kind") != "runtime_source_upload_journal"
-        or journal.get("repository") != APPROVED_MIXTURE_REPOSITORY
+        or journal.get("repository") != _source_repository(str(source_type))
         or journal.get("tree_listing_verified") is not True
         or journal.get("readback_pending") is not True
         or prefix != expected_prefix
@@ -362,13 +363,21 @@ def _source_prefix(*, source_type: str, round_id: str | None) -> str:
     raise ValueError("source publication type or round ID is invalid")
 
 
+def _source_repository(source_type: str) -> str:
+    if source_type == "bc":
+        return DEFAULT_DATA_REPO
+    if source_type == "rollout":
+        return DEFAULT_ROLLOUT_REPO
+    raise ValueError("source publication type is invalid")
+
+
 def _write_source_upload_journal(
     *, path: Path, revision: str, prefix: str, source_type: str,
     round_id: str | None, entries: tuple[SyncEntry, ...],
 ) -> dict[str, object]:
     journal = {
         "schema_version": 1, "kind": "runtime_source_upload_journal",
-        "repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": revision,
+        "repository": _source_repository(source_type), "immutable_revision": revision,
         "remote_prefix": prefix, "source_type": source_type, "round_id": round_id,
         "artifact_entries": _entry_records(entries), "tree_listing_verified": True,
         "readback_pending": True,
@@ -381,7 +390,7 @@ def _source_readback(path: Path, *, source_type: str) -> dict[str, object]:
     receipt = _load_exact(path, keys=_SOURCE_READBACK_KEYS, label="runtime source readback receipt")
     prefix = receipt.get("remote_prefix")
     if (
-        receipt.get("repository") != APPROVED_MIXTURE_REPOSITORY
+        receipt.get("repository") != _source_repository(source_type)
         or receipt.get("fresh_readback_verified") is not True
         or receipt.get("tree_listing_verified") is not True
         or (source_type == "bc" and prefix != "bc/full")
@@ -568,15 +577,16 @@ def hydrate_runtime_mixture_from_request(path: str | Path, *, transport: HubTran
             ):
                 raise ValueError("runtime source receipt does not bind the immutable manifest publication")
             source_root = destination.parent / "sources" / source_id
+            source_repository = str(receipt["repository"])
             source_files = _remote_files_under_prefix(
-                transport=transport, repository=APPROVED_MIXTURE_REPOSITORY,
+                transport=transport, repository=source_repository,
                 revision=str(receipt["immutable_revision"]), prefix=str(receipt["remote_prefix"]),
             )
             _resume_hydration_tree(
                 source_root, expected_paths=source_files, label="runtime hydration source destination",
             )
             download_files(
-                transport=transport, repository=APPROVED_MIXTURE_REPOSITORY,
+                transport=transport, repository=source_repository,
                 revision=str(receipt["immutable_revision"]), destination=source_root,
                 relative_paths=source_files, remote_prefix=str(receipt["remote_prefix"]), max_attempts=1,
             )
@@ -621,14 +631,15 @@ def adopt_uploaded_runtime_source(
 
     local = Path(root)
     prefix = _source_prefix(source_type=source_type, round_id=round_id)
+    repository = _source_repository(source_type)
     revision = _immutable_revision(immutable_revision, label="runtime source adoption revision")
     journal = _preflight_receipt_destination(
         root=local, receipt_path=upload_journal_path, label="source upload journal",
     )
     entries = _entries(local)
-    require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=False)
+    require_access(transport=transport, repository=repository, read=True, write=False)
     tree = list_repository_tree(
-        transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+        transport=transport, repository=repository, revision=revision,
         remote_prefix=prefix, max_attempts=1,
     )
     if not _tree_matches(tree, prefix=prefix, entries=entries):
@@ -661,9 +672,10 @@ def verify_uploaded_runtime_source(
         raise ValueError("runtime source local tree differs from the immutable upload journal")
     revision = _immutable_revision(journal["immutable_revision"], label="runtime source upload journal")
     prefix = str(journal["remote_prefix"])
-    require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=False)
+    repository = str(journal["repository"])
+    require_access(transport=transport, repository=repository, read=True, write=False)
     tree = list_repository_tree(
-        transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+        transport=transport, repository=repository, revision=revision,
         remote_prefix=prefix, max_attempts=1,
     )
     if not _tree_matches(tree, prefix=prefix, entries=expected_entries):
@@ -674,14 +686,14 @@ def verify_uploaded_runtime_source(
     for start in range(0, len(missing), _SOURCE_READBACK_BATCH_SIZE):
         batch = missing[start:start + _SOURCE_READBACK_BATCH_SIZE]
         download_files(
-            transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+            transport=transport, repository=repository, revision=revision,
             destination=readback, relative_paths=batch, remote_prefix=prefix, max_attempts=3,
         )
         verified = _verified_readback_entries(root=readback, entries=expected_entries)
     if verified != expected_entries:
         raise ValueError("runtime source readback does not contain the complete exact tree")
     result = {
-        "repository": APPROVED_MIXTURE_REPOSITORY, "immutable_revision": revision,
+        "repository": repository, "immutable_revision": revision,
         "remote_prefix": prefix, "fresh_readback_verified": True,
         "tree_listing_verified": True,
     }
@@ -703,6 +715,7 @@ def publish_source(
     stable resumable path for large source trees through the explicit fields.
     """
     prefix = _source_prefix(source_type=source_type, round_id=round_id)
+    repository = _source_repository(source_type)
     if not isinstance(revision, str) or not revision:
         raise ValueError("source publication revision target is required")
     local = Path(root)
@@ -721,27 +734,27 @@ def publish_source(
         raise ValueError("large source upload flag must be boolean")
     if large_upload != (large_upload_staging_root is not None):
         raise ValueError("large source upload requires one external staging root")
-    require_access(transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, read=True, write=True)
+    require_access(transport=transport, repository=repository, read=True, write=True)
     if large_upload:
         staging, staged_entries = _stage_large_source(
             root=local, staging_root=large_upload_staging_root, prefix=prefix, entries=entries,
             disallow=(target, journal, stable_readback),
         )
         upload_large_folder(
-            transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+            transport=transport, repository=repository, revision=revision,
             source=staging, entries=staged_entries, remote_prefix=prefix,
             max_workers=_LARGE_SOURCE_UPLOAD_WORKERS,
         )
         revision = resolve_approved_ref(
-            transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, ref=revision,
+            transport=transport, repository=repository, ref=revision,
         )
     else:
         revision = upload_files(
-            transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+            transport=transport, repository=repository, revision=revision,
             source=local, entries=entries, remote_prefix=prefix, max_attempts=1,
         )
     tree = list_repository_tree(
-        transport=transport, repository=APPROVED_MIXTURE_REPOSITORY, revision=revision,
+        transport=transport, repository=repository, revision=revision,
         remote_prefix=prefix, max_attempts=1,
     )
     if not _tree_matches(tree, prefix=prefix, entries=entries):

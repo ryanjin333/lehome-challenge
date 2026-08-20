@@ -92,18 +92,20 @@ def _local_stage_transport(
 
 def _campaign_receipts(tmp_path: Path) -> dict[str, Path]:
     common = {
-        "repository": LIFECYCLE.CORRECTIVE_SOURCE["repository"],
         "fresh_readback_verified": True,
         "tree_listing_verified": True,
     }
     return {
         "bc": _write(tmp_path / "campaign" / "bc.json", common | {
+            "repository": LIFECYCLE.RUNTIME_BC_REPOSITORY,
             "immutable_revision": "b" * 40, "remote_prefix": "bc/full",
         }),
         "rollout": _write(tmp_path / "campaign" / "rollout.json", common | {
+            "repository": LIFECYCLE.RUNTIME_ROLLOUT_REPOSITORY,
             "immutable_revision": "c" * 40, "remote_prefix": "rollouts/round-1",
         }),
         "deployment": _write(tmp_path / "campaign" / "deployment.json", common | {
+            "repository": LIFECYCLE.RUNTIME_ROLLOUT_REPOSITORY,
             "immutable_revision": "a" * 40, "remote_prefix": "mixtures/" + "d" * 64,
             "mixture_id": "d" * 64, "pending_receipt_sha256": "e" * 64,
             "artifact_entries": [
@@ -431,7 +433,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     instance["capability_sha256"] = sha256_file(bootstrap_capability)
     binding = {
         "mixture": {
-            "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40,
+                "repository": "ryanjin333/lehome-groot-n17-rollouts", "revision": "a" * 40,
             "mixture_id": "d" * 64, "manifest_sha256": sha256_file(manifest),
             "window_index_sha256": sha256_file(windows),
             "normalization_sha256": sha256_file(normalization),
@@ -570,7 +572,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     mounts = prepared / "runtime" / "mounts.json"
     normalization = manifest.parent / "mixture-normalization.json"
     assert binding["mixture"] == {
-        "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40,
+            "repository": "ryanjin333/lehome-groot-n17-rollouts", "revision": "a" * 40,
         "mixture_id": "d" * 64, "manifest_sha256": sha256_file(manifest),
         "window_index_sha256": sha256_file(windows), "normalization_sha256": sha256_file(normalization),
         "experiment_manifest_sha256": experiment_manifest_sha256,
@@ -619,7 +621,7 @@ def test_runtime_warmup_stage_copies_the_canonical_launch_into_the_real_session(
     assert launch["dataloader_num_workers"] == 4
     assert launch["dataset_path"] == str(prepared / "runtime")
     assert binding["mixture"] == {
-        "repository": "ryanjin333/lehome-groot-n17-data", "revision": "a" * 40,
+            "repository": "ryanjin333/lehome-groot-n17-rollouts", "revision": "a" * 40,
         "mixture_id": "d" * 64, "manifest_sha256": sha256_file(manifest),
         "window_index_sha256": sha256_file(windows),
         "normalization_sha256": sha256_file(normalization),

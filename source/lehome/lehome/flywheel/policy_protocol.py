@@ -377,6 +377,10 @@ class SessionRequestGuard:
                 raise SessionStateError("reset must advance episode_generation")
             seen = self._seen_request_ids.get(key)
             if seen is not None and request.request_id in seen:
+                # An identical reset identity can be retried after the
+                # gateway accepted it and the DEALER reply was lost.
+                if current_generation == request.episode_generation:
+                    return
                 raise DuplicateRequestError("policy request_id was already used for this session generation")
             if current_generation == request.episode_generation:
                 # A reset can be accepted by the gateway just before its reply

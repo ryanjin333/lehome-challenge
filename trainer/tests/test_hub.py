@@ -930,6 +930,26 @@ def test_approved_private_repository_creation_is_explicit_and_never_public() -> 
         )
 
 
+def test_rollout_repository_is_an_approved_private_dataset_target() -> None:
+    transport = FakeRepositoryTransport()
+
+    ensure_approved_private_repository(
+        transport=transport,
+        repository="ryanjin333/lehome-groot-n17-rollouts",
+        create=True,
+        environ={"HF_TOKEN": "hf_process_memory_only"},
+        timeout_seconds=12.0,
+    )
+
+    assert transport.ensure_calls == [{
+        "repository": "ryanjin333/lehome-groot-n17-rollouts",
+        "repo_type": "dataset",
+        "token": "hf_process_memory_only",
+        "create": True,
+        "timeout_seconds": 12.0,
+    }]
+
+
 def test_real_transport_is_lazy_and_requires_finite_timeout() -> None:
     transport = HuggingFaceHubTransport(timeout_seconds=15.0)
 

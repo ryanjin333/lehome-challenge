@@ -1,0 +1,18 @@
+[Unit]
+Description=Run one immutable LeHome runtime-mixture training transaction
+After=lehome-workspace.service lehome-preempt.service
+Requires=lehome-workspace.service
+ConditionPathExists=/opt/lehome/guest/bin/lehome-training.sh
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/lehome/runtime.env
+ExecStart=/opt/lehome/guest/bin/lehome-training.sh
+ExecStop=/opt/lehome/guest/bin/lehome-training-control.sh stop
+ExecStopPost=-/opt/lehome/guest/bin/lehome-workspace.sh --release
+TimeoutStopSec=55
+KillMode=process
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

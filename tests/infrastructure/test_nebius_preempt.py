@@ -3,20 +3,27 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 
 import pytest
 
 GUEST_DIR = Path(__file__).resolve().parents[2] / "infrastructure" / "nebius" / "guest"
+SOURCE_DIR = Path(__file__).resolve().parents[2] / "source" / "lehome"
 sys.path.insert(0, str(GUEST_DIR))
+sys.path.insert(0, str(SOURCE_DIR))
 
+import lehome_preempt  # noqa: E402
 from lehome_preempt import (  # noqa: E402
     PREEMPTION_BUDGET_SECONDS,
     CommandResult,
     PreemptionError,
     PreemptionHooks,
+    RolloutPreemptionContext,
+    build_rollout_preemption_hooks,
     handle_preemption,
+    main,
 )
 
 
@@ -200,3 +207,232 @@ def test_checkpoint_hook_ignored_for_rollout_role(tmp_path):
     )
     assert not result.checkpoint_requested
     assert calls == []
+
+
+def test_training_preempt_main_refuses_a_failed_process_stop_without_receipt(tmp_path):
+    receipts = tmp_path / "receipts"
+    with pytest.raises(PreemptionError, match="trainer stop was not confirmed"):
+        main([
+            "--role", "training", "--run-id", "run-1", "--receipts-dir", str(receipts),
+            "--training-stop-status", "failed",
+        ])
+    assert not receipts.exists()
+
+
+def test_training_preempt_main_records_confirmed_stop_and_explicit_non_applicable_steps(tmp_path):
+    receipts = tmp_path / "receipts"
+    assert main([
+        "--role", "training", "--run-id", "run-1", "--receipts-dir", str(receipts),
+        "--training-stop-status", "stopped",
+    ]) == 0
+    receipt = json.loads((receipts / "preemption-receipt.json").read_text(encoding="utf-8"))
+    assert receipt["completed_steps"] == [
+        "stop_leases", "mark_interrupted", "flush_ledgers", "close_terminal_artifacts",
+    ]
+    assert receipt["steps"]["stop_leases"] == {"verified": True, "training_process": "stopped"}
+    assert receipt["steps"]["mark_interrupted"] == {"applicable": False, "role": "training"}
+    assert receipt["steps"]["flush_ledgers"] == {"applicable": False, "role": "training"}
+    assert receipt["steps"]["close_terminal_artifacts"] == {"applicable": False, "role": "training"}
+    assert receipt["errors"] == []
+
+
+def test_rollout_preemption_hooks_pause_retry_flush_and_finalize_real_ledger(tmp_path):
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    run_root = tmp_path / "workspace" / "campaign"
+    run_root.mkdir(parents=True)
+    matrix = [
+        {"attempt_id": "attempt-a", "garment": "Top_Long_Seen_0", "seed": 1},
+        {"attempt_id": "attempt-b", "garment": "Top_Short_Seen_0", "seed": 2},
+    ]
+    matrix_path = run_root / "matrix.json"
+    matrix_path.write_text(json.dumps(matrix), encoding="utf-8")
+    matrix_sha256 = hashlib.sha256(matrix_path.read_bytes()).hexdigest()
+    database = run_root / "ledger.sqlite3"
+    ledger = TaskLedger(database, attempt_matrix=matrix, max_attempts=2, target_accepted=2)
+    try:
+        first = ledger.lease_next("worker-1", lease_duration_ns=30_000_000_000)
+        second = ledger.lease_next("worker-2", lease_duration_ns=30_000_000_000)
+        assert first is not None and second is not None
+    finally:
+        ledger.close()
+
+    finalized = []
+    context = RolloutPreemptionContext(
+        run_id="run-1", run_root=run_root, database=database, attempt_matrix=matrix_path,
+        attempt_matrix_sha256=matrix_sha256, max_attempts=2, target_accepted=2,
+    )
+    hooks = build_rollout_preemption_hooks(
+        context,
+        finalizer=lambda **kwargs: finalized.append(kwargs) or 0,
+    )
+    stopped = hooks.stop_leases()
+    interrupted = hooks.mark_interrupted()
+    flushed = hooks.flush_ledgers()
+    closed = hooks.close_terminal_artifacts()
+
+    assert stopped == {"verified": True, "campaign_paused": True, "active_leases_interrupted": 2}
+    assert interrupted == {"verified": True, "retryable_preemption_attempts": 2}
+    assert flushed["verified"] is True and flushed["wal_checkpoint_busy"] == 0
+    assert closed["verified"] is True and closed["finalized"] == 0
+    assert finalized and finalized[0]["database"] == database
+
+    reopened = TaskLedger(database, attempt_matrix=matrix, max_attempts=2, target_accepted=2)
+    try:
+        assert reopened.is_stopped
+        assert reopened.status(first.attempt.attempt_id) == "retryable"
+        assert reopened.status(second.attempt.attempt_id) == "retryable"
+        events = reopened.events()
+        assert sum(event.event_type == "campaign_paused" for event in events) == 1
+        assert sum(event.event_type == "interrupted" for event in events) == 2
+    finally:
+        reopened.close()
+
+
+def test_rollout_preemption_reuses_controlled_materialization_rows_without_changing_attempt_ids(tmp_path):
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    run_root = tmp_path / "workspace" / "campaign"; run_root.mkdir(parents=True)
+    reset, annotations = run_root / "reset.json", run_root / "annotations.jsonl"
+    reset.write_text("{}", encoding="utf-8"); annotations.write_text("", encoding="utf-8")
+    caps = {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}
+    categories = ["pant_long"] * 4 + ["top_long"] + ["top_short"] * 3
+    rows = [
+        {
+            "attempt_id": f"controlled-{index}", "trial_id": f"controlled-{index}",
+            "category": category, "category_acceptance_cap": caps[category],
+            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_v1",
+            "controlled_matrix_sha256": "a" * 64, "perturbation_seed": 71_000 + index,
+            "perturbation_fingerprint": f"{index + 100:064x}",
+            "source_state_perturbation_fingerprint": f"{index + 200:064x}",
+            "source_continuation_state": [0.0] * 12,
+            "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round",
+            "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}",
+            "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64,
+            "action_prefix_sha256": "c" * 64, "prefix_stop": 1,
+            "source_first_success_step": 2, "source_reset": str(reset),
+            "source_annotations": str(annotations),
+        }
+        for index, category in enumerate(categories)
+    ]
+    matrix_path = run_root / "materialization.json"
+    matrix_path.write_text(json.dumps({"schema_version": 1, "kind": "controlled_success_recovery_materialization_v1", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}), encoding="utf-8")
+    database = run_root / "ledger.sqlite3"
+    ledger = TaskLedger(database, attempt_matrix=rows, max_attempts=8, target_accepted=8)
+    original_ids = [attempt.attempt_id for attempt in ledger.attempts()]; ledger.close()
+    context = RolloutPreemptionContext(run_id="controlled", run_root=run_root, database=database, attempt_matrix=matrix_path, attempt_matrix_sha256=hashlib.sha256(matrix_path.read_bytes()).hexdigest(), max_attempts=8, target_accepted=8)
+    hooks = build_rollout_preemption_hooks(context, finalizer=lambda **_kwargs: 0)
+    hooks.stop_leases()
+    reopened = TaskLedger(database, attempt_matrix=rows, max_attempts=8, target_accepted=8)
+    try:
+        assert [attempt.attempt_id for attempt in reopened.attempts()] == original_ids
+    finally:
+        reopened.close()
+
+
+def test_controlled_smoke_preemption_passes_explicit_finalizer_mode_only_for_exact_1_1(tmp_path):
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    root = tmp_path / "workspace" / "smoke"; root.mkdir(parents=True)
+    matrix = [{"attempt_id": "smoke", "garment": "Top_Long_Seen_0", "seed": 1}]
+    matrix_path = root / "smoke.json"; matrix_path.write_text(json.dumps(matrix), encoding="utf-8")
+    database = root / "ledger.sqlite3"
+    TaskLedger(database, attempt_matrix=matrix, max_attempts=1, target_accepted=1).close()
+    context = RolloutPreemptionContext(
+        run_id="smoke", run_root=root, database=database, attempt_matrix=matrix_path,
+        attempt_matrix_sha256=hashlib.sha256(matrix_path.read_bytes()).hexdigest(),
+        max_attempts=1, target_accepted=1, controlled_recovery_smoke=True,
+        controlled_recovery_smoke_run_id="a" * 32,
+        controlled_recovery_smoke_matrix_sha256="b" * 64,
+        controlled_recovery_smoke_materialization_sha256="c" * 64,
+        controlled_recovery_smoke_row_index=0,
+    )
+    calls = []
+    hooks = build_rollout_preemption_hooks(context, finalizer=lambda **kwargs: calls.append(kwargs) or 0)
+    assert hooks.close_terminal_artifacts()["verified"] is True
+    assert calls[0]["controlled_recovery_smoke"] is True
+    with pytest.raises(PreemptionError, match="exactly 1/1"):
+        RolloutPreemptionContext(
+            run_id="bad", run_root=root, database=database, attempt_matrix=matrix_path,
+            attempt_matrix_sha256=hashlib.sha256(matrix_path.read_bytes()).hexdigest(),
+            max_attempts=2, target_accepted=1, controlled_recovery_smoke=True,
+            controlled_recovery_smoke_run_id="a" * 32,
+            controlled_recovery_smoke_matrix_sha256="b" * 64,
+            controlled_recovery_smoke_materialization_sha256="c" * 64,
+            controlled_recovery_smoke_row_index=0,
+        )
+
+
+def test_rollout_preempt_main_refuses_missing_context_without_receipt(tmp_path):
+    receipts = tmp_path / "receipts"
+    with pytest.raises(PreemptionError, match="rollout preemption context"):
+        main([
+            "--role", "rollout", "--run-id", "run-1", "--receipts-dir", str(receipts),
+            "--training-stop-status", "not-applicable",
+            "--rollout-context", str(tmp_path / "missing-context.json"),
+            "--workspace-root", str(tmp_path / "workspace"),
+        ])
+    assert not receipts.exists()
+
+
+def _write_active_rollout_context(tmp_path: Path, *, run_id: str) -> tuple[Path, Path]:
+    """Create the root-authored minimum context needed before hook binding."""
+
+    workspace = tmp_path / "workspace"
+    run_root = workspace / "campaign"
+    run_root.mkdir(parents=True)
+    database = run_root / "ledger.sqlite3"
+    database.write_bytes(b"ledger-placeholder")
+    matrix = run_root / "attempt-matrix.json"
+    matrix.write_text("[]\n", encoding="utf-8")
+    context = workspace / "rollout-preemption.json"
+    context.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "lehome_rollout_preemption_context",
+                "active": True,
+                "run_id": run_id,
+                "run_root": str(run_root),
+                "database": str(database),
+                "attempt_matrix": str(matrix),
+                "attempt_matrix_sha256": hashlib.sha256(matrix.read_bytes()).hexdigest(),
+                "max_attempts": 1,
+                "target_accepted": 1,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return workspace, context
+
+
+def test_rollout_preempt_main_derives_receipt_run_id_from_root_authored_context(
+    tmp_path, monkeypatch,
+):
+    workspace, context = _write_active_rollout_context(tmp_path, run_id="active-campaign")
+    receipts = tmp_path / "receipts"
+    monkeypatch.setattr(lehome_preempt, "build_rollout_preemption_hooks", lambda _context: make_hooks())
+
+    assert main([
+        "--role", "rollout", "--receipts-dir", str(receipts),
+        "--training-stop-status", "not-applicable",
+        "--rollout-context", str(context), "--workspace-root", str(workspace),
+    ]) == 0
+
+    receipt = json.loads((receipts / "preemption-receipt.json").read_text(encoding="utf-8"))
+    assert receipt["run_id"] == "active-campaign"
+
+
+def test_rollout_preempt_main_refuses_an_explicit_run_id_that_conflicts_with_context(
+    tmp_path, monkeypatch,
+):
+    workspace, context = _write_active_rollout_context(tmp_path, run_id="active-campaign")
+    monkeypatch.setattr(lehome_preempt, "build_rollout_preemption_hooks", lambda _context: make_hooks())
+
+    with pytest.raises(PreemptionError, match="does not match"):
+        main([
+            "--role", "rollout", "--run-id", "stale-runtime-env", "--receipts-dir", str(tmp_path / "receipts"),
+            "--training-stop-status", "not-applicable",
+            "--rollout-context", str(context), "--workspace-root", str(workspace),
+        ])

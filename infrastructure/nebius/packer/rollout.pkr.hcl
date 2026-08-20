@@ -44,7 +44,7 @@ source "nebius-image" "lehome-rollout" {
 
   # Large temporary boot disk: tarball + loaded layers + derived layer.
   disk {
-    size_gibibytes = 160
+    size_gibibytes = 192
     type           = "NETWORK_SSD"
   }
 

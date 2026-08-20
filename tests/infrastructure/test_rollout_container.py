@@ -33,7 +33,9 @@ def test_dockerfile_derives_from_loaded_challenge_image():
     assert len(from_lines) == 1
     assert "LEHOME_BASE_IMAGE" in from_lines[0]
     # The default base tag must pin the exact challenge revision.
-    assert f"lehome-challenge@{EXPECTED_REVISION}" in dockerfile or EXPECTED_REVISION in dockerfile
+    assert EXPECTED_REVISION in dockerfile
+    assert f"lehome-challenge:{EXPECTED_REVISION}" in dockerfile
+    assert f"lehome-challenge@{EXPECTED_REVISION}" not in dockerfile
 
 
 def test_dockerfile_copies_only_runtime_code_and_no_secrets():
@@ -58,9 +60,14 @@ def test_dockerfile_copies_only_runtime_code_and_no_secrets():
 def test_entrypoint_defaults_to_appliance_supervisor_with_checks():
     entrypoint = (APPLIANCE_DIR / "entrypoint.sh").read_text(encoding="utf-8")
     assert "run_groot_rollout_appliance.py" in entrypoint
+    assert "/opt/lehome-challenge/.venv/bin/python" in entrypoint
+    assert "/opt/runtime/bin/python" not in entrypoint
     assert "exec" in entrypoint
-    # Non-secret admission checks: presence only, never value printing.
-    assert "HF_TOKEN" in entrypoint
+    # Controller/finalizer/supervisor need no Hub secret. Only the uploader
+    # receives a private token-file path at runtime.
+    assert "require_env HF_TOKEN" not in entrypoint
+    assert "LEHOME_HF_TOKEN_FILE" in entrypoint
+    assert "--token-file" in entrypoint
     assert "-n \"" in entrypoint or ":-" in entrypoint
     assert "echo \"$HF_TOKEN\"" not in entrypoint
     assert entrypoint.startswith("#!/")
@@ -71,6 +78,10 @@ def test_dockerfile_entrypoint_and_no_baked_model():
     entrypoint_lines = [line for line in dockerfile.splitlines() if line.strip().startswith("ENTRYPOINT")]
     assert len(entrypoint_lines) == 1
     assert "lehome-rollout-entrypoint" in entrypoint_lines[0]
+    # Official challenge image python, not the trainer-container /opt/runtime path.
+    assert "/opt/lehome-challenge/.venv/bin/python" in dockerfile
+    assert "/opt/runtime/bin/python" not in dockerfile
+
     lowered = dockerfile.lower()
     assert "safetensors" not in lowered
     # No checkpoint may be baked into the derived layer.
@@ -78,3 +89,17 @@ def test_dockerfile_entrypoint_and_no_baked_model():
         if line.strip().startswith("COPY"):
             assert "checkpoint" not in line.lower()
             assert ".safetensors" not in line
+
+
+def test_rollout_layer_carries_the_pinned_geometry_pilot_recipe() -> None:
+    dockerfile = (APPLIANCE_DIR / "Dockerfile").read_text(encoding="utf-8")
+    for name in (
+        "run_12k_campaign.sh",
+        "run_randomized_top_short_pilot.sh",
+        "campaign_top_short_geometry_pilot.json",
+        "campaign_top_short_geometry_pilot.json.sha256",
+    ):
+        assert name in dockerfile
+    assert "build_randomized_pilot_matrix.py" in dockerfile
+    assert "build_controlled_recovery_matrix.py" in dockerfile
+    assert "run_controlled_recovery_campaign.sh" in dockerfile

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,9 @@ from lehome.flywheel.task_ledger import TaskLedger
 
 
 _CUDA_DEVICE = re.compile(r"^cuda:([0-9]+)$")
+_DEFAULT_POLICY_REPO = "ryanjin333/lehome-groot-n17-models"
+_DEFAULT_POLICY_REVISION = "30ac1a84da67b099e115ad147bcd61e9d60046d3"
+_DEFAULT_POLICY_ARTIFACT_SHA256 = "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"
 
 
 class LedgerWorkerController:
@@ -32,6 +36,12 @@ class LedgerWorkerController:
 
     def record_interrupted(self, worker_id: str, attempt_id: str, lease_id: str, reason: str) -> None:
         self._ledger.record_interrupted(worker_id, attempt_id, lease_id, reason)
+
+    def reject_attempt(self, worker_id: str, attempt_id: str, lease_id: str, *, reason: str) -> str:
+        return self._ledger.reject_attempt(worker_id, attempt_id, lease_id, reason=reason)
+
+    def record_infrastructure_abort(self, worker_id: str, attempt_id: str, lease_id: str, *, reason: str) -> str:
+        return self._ledger.record_infrastructure_abort(worker_id, attempt_id, lease_id, reason=reason)
 
     def heartbeat(self, worker_id: str, attempt_id: str, lease_id: str):
         return self._ledger.heartbeat(worker_id, attempt_id, lease_id, lease_duration_ns=self._lease_duration_ns)
@@ -54,15 +64,9 @@ def prepare_cpu_cloth_launch(args: argparse.Namespace, *, environ: MutableMappin
 
 
 def _load_matrix(path: Path) -> list[Mapping[str, object]]:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("attempt matrix must be a regular JSON file")
-    try:
-        decoded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError("attempt matrix must be valid JSON") from error
-    if not isinstance(decoded, list) or not all(isinstance(item, dict) for item in decoded):
-        raise ValueError("attempt matrix must be a JSON array of assignments")
-    return decoded
+    from lehome.flywheel.recovery_collection import load_attempt_matrix
+
+    return load_attempt_matrix(path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -82,21 +86,52 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-device", required=True, help="physical CUDA device used by the policy gateway")
     parser.add_argument("--policy-gateway-endpoint", required=True)
     parser.add_argument("--policy-sha256", required=True)
-    parser.add_argument("--policy-timeout-seconds", type=float, default=5.0)
+    parser.add_argument("--policy-repo", default=_DEFAULT_POLICY_REPO)
+    parser.add_argument("--policy-revision", default=_DEFAULT_POLICY_REVISION)
+    parser.add_argument("--policy-step", type=int, default=12000)
+    parser.add_argument("--policy-artifact-sha256", default=_DEFAULT_POLICY_ARTIFACT_SHA256)
+    parser.add_argument("--policy-timeout-seconds", type=float, default=180.0)
+    parser.add_argument(
+        "--preparation-timeout-seconds",
+        type=float,
+        default=180.0,
+        help="strict wall-clock bound for one native Isaac garment preparation",
+    )
     parser.add_argument("--policy-ready-file", type=Path, required=True)
     parser.add_argument("--initial-garment", required=True)
     return parser
 
 
+def _progress(message: str) -> None:
+    """Write a flushed checkpoint the smoke log can see after a silent Kit exit."""
+
+    line = f"persistent worker: {message}\n"
+    print(line, end="", flush=True)
+    try:
+        path = Path("/eval/logs/worker-progress.txt")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.flush()
+    except OSError:
+        pass
+
+
 def _build_cpu_cloth_session(args: argparse.Namespace):
     """Import Isaac only after AppLauncher is live, then build one reusable env."""
 
-    import gymnasium as gym
-    import lehome.tasks.bedroom  # noqa: F401 - registers the task with Gym.
-    from isaaclab_tasks.utils import parse_env_cfg
-    from scripts.eval_policy.groot_policy import SessionPolicyClient
-    from scripts.utils.evaluation import EvaluationSession
+    _progress(f"importing gym and task for {args.task}")
+    try:
+        import gymnasium as gym
+        import lehome.tasks.bedroom  # noqa: F401 - registers the task with Gym.
+        from isaaclab_tasks.utils import parse_env_cfg
+        from scripts.eval_policy.groot_policy import SessionPolicyClient
+        from scripts.utils.evaluation import EvaluationSession
+    except Exception as error:
+        _progress(f"import failed: {type(error).__name__}: {error}")
+        raise
 
+    _progress("parse_env_cfg")
     env_cfg = parse_env_cfg(args.task, device="cpu")
     env_cfg.sim.use_fabric = False
     env_cfg.seed = args.seed
@@ -105,8 +140,11 @@ def _build_cpu_cloth_session(args: argparse.Namespace):
     env_cfg.particle_cfg_path = args.particle_cfg_path
     env_cfg.garment_name = args.initial_garment
     env_cfg.garment_version = "Release"
+    _progress(f"gym.make {args.task} garment={args.initial_garment}")
     env = gym.make(args.task, cfg=env_cfg).unwrapped
+    _progress("initialize_obs")
     env.initialize_obs()
+    _progress("obs initialized")
     if args.device != "cpu":
         raise ValueError("persistent worker must force CPU physics before environment creation")
     args.num_episodes = 1
@@ -126,6 +164,7 @@ def _build_cpu_cloth_session(args: argparse.Namespace):
         session_id=args.session_id,
     )
     policy.runtime_device = readiness["runtime_device"]
+    _progress("EvaluationSession constructed")
     return EvaluationSession(args, env=env, policy=policy, env_cfg=env_cfg, is_bimanual="bi" in args.task.lower())
 
 
@@ -134,6 +173,13 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
         raise ValueError("persistent worker requires CPU cloth physics")
     if args.lease_seconds <= 0:
         raise ValueError("lease seconds must be positive")
+    if (
+        isinstance(args.preparation_timeout_seconds, bool)
+        or not isinstance(args.preparation_timeout_seconds, (int, float))
+        or not math.isfinite(args.preparation_timeout_seconds)
+        or args.preparation_timeout_seconds <= 0
+    ):
+        raise ValueError("preparation timeout seconds must be positive")
     ledger = ledger_factory(
         args.database, attempt_matrix=_load_matrix(args.attempt_matrix), max_attempts=args.max_attempts,
         target_accepted=args.target_accepted,
@@ -168,6 +214,7 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
             simulator_factory=simulator_factory, policy=_PolicyProxy(), output_root=args.output_root,
             renderer_device=args.renderer_device, policy_device=args.policy_device,
             heartbeat_interval_seconds=max(0.1, args.lease_seconds / 3.0),
+            preparation_timeout_seconds=args.preparation_timeout_seconds,
         )
         return worker.run()
     finally:
@@ -184,9 +231,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     prepare_cpu_cloth_launch(args)
     simulation_app = launch_app_from_args(args)
+    _progress("kit launched")
     try:
+        _progress("run() starting")
         run(args)
+        _progress("run() returned")
     finally:
+        _progress("closing kit")
         close_app(simulation_app)
     return 0
 
@@ -195,5 +246,18 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (RuntimeError, ValueError) as error:
-        print(f"persistent worker error: {error}", file=sys.stderr)
+        print(f"persistent worker error: {error}", file=sys.stderr, flush=True)
+        try:
+            Path("/eval/logs/worker-error.txt").write_text(f"{type(error).__name__}: {error}\n")
+        except OSError:
+            pass
         raise SystemExit(2)
+    except BaseException:
+        import traceback
+        detail = traceback.format_exc()
+        try:
+            Path("/eval/logs/worker-error.txt").write_text(detail)
+        except OSError:
+            pass
+        traceback.print_exc()
+        raise

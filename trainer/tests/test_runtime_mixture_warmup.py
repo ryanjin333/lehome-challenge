@@ -13,6 +13,20 @@ HASH = "a" * 64
 REVISION = "b" * 40
 
 
+def test_gpu_sanity_sweep_is_short_and_excludes_cpu_only_zero_worker_baseline() -> None:
+    from lehome_train.groot.runtime_mixture_warmup import (
+        BURN_IN_STEPS,
+        CPU_WORKER_COUNTS,
+        MEASURED_STEPS,
+        WORKER_COUNTS,
+    )
+
+    assert CPU_WORKER_COUNTS == (0, 4, 8, 12, 16)
+    assert WORKER_COUNTS == (4, 8, 12, 16)
+    assert BURN_IN_STEPS == 2
+    assert MEASURED_STEPS == 5
+
+
 def _cpu_pilot() -> dict[str, object]:
     return {
         "schema_version": 4,
@@ -135,10 +149,10 @@ def _live_measurement(**overrides: object):
     from lehome_train.groot.runtime_mixture_warmup import GpuWarmupMeasurement
 
     values: dict[str, object] = {
-        "decoded_samples": 64 * 60, "measured_steps": 50,
+        "decoded_samples": 64 * 7, "measured_steps": 5,
         "loader_wait_seconds": 1.0, "step_seconds": 20.0,
         "gpu_busy_seconds": 18.0, "gpu_utilization_percent": 90.0,
-        "oom": False, "error": None, "observed_batch_sizes": (64,) * 60,
+        "oom": False, "error": None, "observed_batch_sizes": (64,) * 7,
         "loss_min": 0.1, "loss_max": 0.2, "loss_final": 0.15,
         "peak_memory_allocated_bytes": 32 * 1024**3,
         "peak_memory_reserved_bytes": 40 * 1024**3,
@@ -167,14 +181,14 @@ def test_gpu_warmup_selects_lowest_worker_that_meets_fixed_gate() -> None:
     receipt = _receipt(adapter)
 
     assert receipt["selected_loader_workers"] == 4
-    assert adapter.calls == [(0, 10, 50), (4, 10, 50), (8, 10, 50), (12, 10, 50), (16, 10, 50)]
+    assert adapter.calls == [(4, 2, 5), (8, 2, 5), (12, 2, 5), (16, 2, 5)]
     assert receipt["gate"]["max_loader_wait_fraction"] == 0.10
 
 
 def test_gpu_warmup_selects_the_fastest_stable_admitted_worker() -> None:
     receipt = _receipt(_Adapter(
-        viable={0, 4, 8, 12, 16},
-        samples_per_second={0: 100.0, 4: 200.0, 8: 300.0, 12: 400.0, 16: 250.0},
+        viable={4, 8, 12, 16},
+        samples_per_second={4: 200.0, 8: 300.0, 12: 400.0, 16: 250.0},
     ))
 
     assert receipt["selected_loader_workers"] == 12
@@ -193,7 +207,7 @@ def test_gpu_warmup_receipt_requires_live_gpu_memory_loss_latency_and_materializ
 
     receipt = _receipt()
     assert receipt["runtime_state"]["total_vram_bytes"] == 96 * 1024**3
-    assert receipt["candidates"][0]["observed_batch_sizes"] == [64] * 60
+    assert receipt["candidates"][0]["observed_batch_sizes"] == [64] * 7
     assert receipt["candidates"][0]["materialization_proof"]["bc"]["camera_count"] == 3
 
     for path, value in (
@@ -232,15 +246,15 @@ def test_gpu_warmup_receipt_rejects_float_and_bool_discrete_evidence() -> None:
         (("schema_version",), 2.0),
         (("binding", "physical_batch_size"), 64.0),
         (("binding", "action_horizon"), 16.0),
-        (("gate", "worker_counts"), [False, 4, 8, 12, 16]),
-        (("gate", "burn_in_steps"), 10.0),
+        (("gate", "worker_counts"), [False, 8, 12, 16]),
+        (("gate", "burn_in_steps"), 2.0),
         (("gate", "min_total_vram_bytes"), float(90 * 1024**3)),
         (("gate", "min_free_vram_bytes"), float(4 * 1024**3)),
         (("runtime_state", "total_vram_bytes"), float(96 * 1024**3)),
         (("candidates", 0, "worker_count"), False),
-        (("candidates", 0, "burn_in_steps"), 10.0),
-        (("candidates", 0, "measured_steps"), 50.0),
-        (("candidates", 0, "decoded_samples"), float(64 * 60)),
+        (("candidates", 0, "burn_in_steps"), 2.0),
+        (("candidates", 0, "measured_steps"), 5.0),
+        (("candidates", 0, "decoded_samples"), float(64 * 7)),
         (("candidates", 0, "peak_memory_allocated_bytes"), float(32 * 1024**3)),
         (("candidates", 0, "peak_memory_reserved_bytes"), float(40 * 1024**3)),
         (("candidates", 0, "minimum_free_vram_bytes"), float(20 * 1024**3)),
@@ -280,7 +294,7 @@ def test_gpu_warmup_rejects_oom_even_when_other_metrics_claim_success() -> None:
 
 
 def test_gpu_warmup_records_an_oom_candidate_but_can_select_another_worker() -> None:
-    receipt = _receipt(_Adapter(viable={8}, oom=0))
+    receipt = _receipt(_Adapter(viable={8}, oom=4))
 
     assert receipt["selected_loader_workers"] == 8
     assert receipt["candidates"][0]["oom"] is True
@@ -372,7 +386,7 @@ def test_live_adapter_queries_torch_state_and_delegates_live_measurement(
     )
 
     assert adapter.runtime_state().to_dict() == _Adapter().runtime_state().to_dict()
-    assert adapter.measure(worker_count=4, burn_in_steps=10, measured_steps=50) == expected
+    assert adapter.measure(worker_count=4, burn_in_steps=2, measured_steps=5) == expected
 
 
 def test_warmup_request_uses_production_factory_live_adapter_not_authored_rows(
@@ -414,7 +428,7 @@ def test_warmup_request_uses_production_factory_live_adapter_not_authored_rows(
 
     receipt = warmup_from_request(request)
 
-    assert receipt["selected_loader_workers"] == 0
+    assert receipt["selected_loader_workers"] == 4
     assert calls == [{"binding": _binding()}]
 
 

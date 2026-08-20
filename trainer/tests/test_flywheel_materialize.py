@@ -45,6 +45,7 @@ def _raw_rft_episode(
     frames: int = 45,
     production_schema: bool = True,
     category: str = "top_long",
+    parity_stage: str = "server_cpu",
 ) -> Path:
     writer = EpisodeArtifactWriter(root, episode_id)
     for index in range(frames):
@@ -65,7 +66,7 @@ def _raw_rft_episode(
         "provenance": {
             "execution_backend": "policy_server",
             "execution_mode": "policy_server",
-            "parity_stage": "server_cpu",
+            "parity_stage": parity_stage,
             "policy_artifact_sha256": "c" * 64,
             "policy_device": "cuda:0",
             "simulator_device": "cpu",
@@ -142,6 +143,19 @@ def test_rft_materializer_accepts_only_verified_seen_policy_successes(tmp_path: 
         "frame_stop": 45,
         "action_source": "policy",
     }]
+
+
+def test_rft_materializer_accepts_verified_persistent_collection_success(tmp_path: Path) -> None:
+    report = materialize_rft_episode(
+        _raw_rft_episode(
+            tmp_path,
+            parity_stage="persistent_collection",
+            terminal_reason="horizon",
+        ),
+        tmp_path / "out",
+    )
+
+    assert report.selected_observations == 30
 
 
 @pytest.mark.parametrize(

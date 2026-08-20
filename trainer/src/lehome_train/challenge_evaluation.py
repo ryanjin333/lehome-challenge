@@ -448,3 +448,27 @@ def select_challenge_winner(bundle: Mapping[str, object]) -> dict[str, object]:
     if improvers:
         return build_next_round_manifest(min(improvers, key=lambda report: _candidate_key(report, baseline)))
     return _rejected(["no safe, provenance-valid candidate improved unseen performance over original_baseline"])
+
+
+def select_async_sweep_final_winner(
+    finalists: Mapping[str, Mapping[str, object]],
+    *,
+    baseline_report: Mapping[str, object] | None,
+    original_12k_checkpoint_digest: str,
+    final_matrix_sha256: str,
+) -> dict[str, object]:
+    """Run the dynamic async-sweep gate without changing the legacy five-arm gate.
+
+    The historical challenge selector above intentionally remains pinned to its
+    published five-candidate manifest.  New asynchronous jobs have generated
+    experiment IDs, so they use the stricter publication-v2 and sealed
+    per-episode receipt contract in ``experiment_winner`` instead.
+    """
+    from lehome_train.groot.experiment_winner import select_async_final_winner
+
+    return select_async_final_winner(
+        finalists,
+        baseline_report=baseline_report,
+        original_12k_checkpoint_digest=original_12k_checkpoint_digest,
+        final_matrix_sha256=final_matrix_sha256,
+    )

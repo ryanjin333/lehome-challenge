@@ -22,11 +22,22 @@ def _write(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 
 
-def _round(root: Path, attempt_id: str) -> tuple[str, str]:
+def test_generated_mixture_uses_the_private_rollout_repository() -> None:
+    from lehome_train.groot.runtime_mixture import APPROVED_MIXTURE_REPOSITORY
+
+    assert APPROVED_MIXTURE_REPOSITORY == "ryanjin333/lehome-groot-n17-rollouts"
+
+
+def _round(root: Path, attempt_id: str, *, category: str = "top_long") -> tuple[str, str]:
     attempt = root / "attempts" / attempt_id
     _write(attempt / "episode.json", {
         "episode_id": attempt_id, "accepted_success": True, "outcome": "success", "terminal_reason": "success",
-        "identity": {"release_stage": "seen", "instruction": "fold the garment on the table"},
+        "mode": "autonomous",
+        "identity": {
+            "category": category,
+            "release_stage": "seen",
+            "instruction": "fold the garment on the table",
+        },
     })
     (attempt / "annotations.jsonl").write_text(
         "".join(json.dumps({"step": step, "action_source": "policy", "state": [float(step)] * 12, "action": [float(step + 1)] * 12}) + "\n" for step in range(16)), encoding="utf-8"
@@ -41,7 +52,11 @@ def _round(root: Path, attempt_id: str) -> tuple[str, str]:
     return attempt.relative_to(root).as_posix(), _sha_path(attempt / "episode.json")
 
 
-def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _contract(
+    tmp_path: Path,
+    *,
+    rollout_categories: tuple[str, ...] = ("top_long", "top_long", "top_long"),
+) -> tuple[Path, Path, Path]:
     from lehome_train.groot.runtime_mixture import canonical_json_sha256, sha256_file, source_tree_sha256
 
     bc, round_root = tmp_path / "bc", tmp_path / "round-1"
@@ -54,12 +69,15 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
     bc_publication = tmp_path / "source-publication" / "bc-readback.json"
     rollout_publication = tmp_path / "source-publication" / "rollout-readback.json"
     _write(bc_publication, {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "b" * 40, "remote_prefix": "bc/full", "fresh_readback_verified": True, "tree_listing_verified": True})
-    _write(rollout_publication, {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "c" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True})
+    _write(rollout_publication, {"repository": "ryanjin333/lehome-groot-n17-rollouts", "immutable_revision": "c" * 40, "remote_prefix": "rollouts/round-1", "fresh_readback_verified": True, "tree_listing_verified": True})
     _write(bc / "manifest.json", {"fps": 30, "fixed_language_instruction": "fold the garment on the table", "future_actions": {"horizon": 16}, "train_episode_ids": [str(index) for index in range(7)], "validation_episode_ids": []})
     # The loader test injects decoding, so opaque video bytes are enough for contract coverage.
     for episode in range(7):
         _write(bc / f"episodes/{episode}.json", {"episode_id": str(episode)})
-    attempts = [_round(round_root, f"attempt-{number}") for number in range(3)]
+    attempts = [
+        _round(round_root, f"attempt-{number}", category=category)
+        for number, category in enumerate(rollout_categories)
+    ]
     normalization = tmp_path / "mixture-normalization.json"
     def grouped(dimensions: int) -> dict[str, list[float]]:
         return {name: [float(index) for index in range(dimensions)] for name in ("min", "max", "mean", "std", "q01", "q99")}
@@ -79,12 +97,12 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
             "right_gripper": {name: [0.0] for name in ("min", "max", "mean", "std", "q01", "q99")},
         },
     }}
-    _write(normalization, {"schema_version": 3, "train_only": True, "derivation": {"train_window_ids": [f"bc-{index}" for index in range(7)] + [f"rollout-{index}" for index in range(3)], "sample_count": 160}, "statistics": statistics})
+    _write(normalization, {"schema_version": 3, "train_only": True, "derivation": {"train_window_ids": [f"bc-{index}" for index in range(7)] + [f"rollout-{index}" for index in range(len(attempts))], "sample_count": 16 * (7 + len(attempts))}, "statistics": statistics})
     sources = [
         {"source_id": "bc", "source_type": "bc", "quota": 7, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(bc), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(bc / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(bc / "acceptance.json"), "publication": {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "b" * 40, "prefix": "bc/full", "readback_receipt_path": str(bc_publication), "readback_receipt_sha256": _sha_path(bc_publication)}, "source_identity": {"prepared_manifest_path": "manifest.json", "prepared_manifest_sha256": _sha_path(bc / "manifest.json"), "action_source": "organizer_expert"}},
-        {"source_id": "round-1", "source_type": "rollout", "quota": 3, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(round_root), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(round_root / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(round_root / "acceptance.json"), "publication": {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "c" * 40, "prefix": "rollouts/round-1", "readback_receipt_path": str(rollout_publication), "readback_receipt_sha256": _sha_path(rollout_publication)}, "source_identity": {"round_manifest_path": "round.json", "round_manifest_sha256": "a" * 64, "action_source": "policy"}},
+        {"source_id": "round-1", "source_type": "rollout", "quota": 3, "release_stage": "seen", "source_tree_sha256": source_tree_sha256(round_root), "artifact_receipt_path": "receipt.json", "artifact_receipt_sha256": _sha_path(round_root / "receipt.json"), "acceptance_receipt_path": "acceptance.json", "acceptance_receipt_sha256": _sha_path(round_root / "acceptance.json"), "publication": {"repository": "ryanjin333/lehome-groot-n17-rollouts", "revision": "c" * 40, "prefix": "rollouts/round-1", "readback_receipt_path": str(rollout_publication), "readback_receipt_sha256": _sha_path(rollout_publication)}, "source_identity": {"round_manifest_path": "round.json", "round_manifest_sha256": "a" * 64, "action_source": "policy"}},
     ]
-    _write(round_root / "round.json", {"round_id": "round-1", "accepted_attempt_ids": [f"attempt-{index}" for index in range(3)]})
+    _write(round_root / "round.json", {"round_id": "round-1", "accepted_attempt_ids": [f"attempt-{index}" for index in range(len(attempts))]})
     sources[1]["source_identity"]["round_manifest_sha256"] = _sha_path(round_root / "round.json")
     # The round identity file arrived after the source tree was first measured.
     sources[1]["source_tree_sha256"] = source_tree_sha256(round_root)
@@ -94,7 +112,7 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
     for index, (attempt_root, attempt_hash) in enumerate(attempts):
         windows.append({"window_id": f"rollout-{index}", "source_id": "round-1", "source_type": "rollout", "source_episode_id": f"attempt-{index}", "start": 0, "stop": 16, "frame_ids": list(range(16)), "lineage_id": f"rollout-{index}", "split": "train", "source_locator": {"attempt_root": attempt_root, "attempt_manifest_path": f"{attempt_root}/episode.json", "attempt_manifest_sha256": attempt_hash}})
     mixture_id = "d" * 64
-    manifest = {"schema_version": 2, "kind": "lehome_runtime_mixture", "repository": "ryanjin333/lehome-groot-n17-data", "safe_prefix": f"mixtures/{mixture_id}", "mixture_id": mixture_id, "sources": sources, "camera_schema": ["observation.images.top_rgb", "observation.images.left_rgb", "observation.images.right_rgb"], "image_shape": [480, 640, 3], "state_schema": {"dimension": 12, "storage": "absolute"}, "action_schema": {"dimension": 12, "storage": "absolute"}, "fps": 30, "action_horizon": 16, "instruction": "fold the garment on the table", "schedule_seed": 17, "cycle_size": 10, "mixture_normalization": {"path": "mixture-normalization.json", "sha256": sha256_file(normalization), "byte_size": normalization.stat().st_size}, "window_index": {"path": "windows.json", "sha256": "", "byte_size": 0}}
+    manifest = {"schema_version": 2, "kind": "lehome_runtime_mixture", "repository": "ryanjin333/lehome-groot-n17-rollouts", "safe_prefix": f"mixtures/{mixture_id}", "mixture_id": mixture_id, "sources": sources, "camera_schema": ["observation.images.top_rgb", "observation.images.left_rgb", "observation.images.right_rgb"], "image_shape": [480, 640, 3], "state_schema": {"dimension": 12, "storage": "absolute"}, "action_schema": {"dimension": 12, "storage": "absolute"}, "fps": 30, "action_horizon": 16, "instruction": "fold the garment on the table", "schedule_seed": 17, "cycle_size": 10, "mixture_normalization": {"path": "mixture-normalization.json", "sha256": sha256_file(normalization), "byte_size": normalization.stat().st_size}, "window_index": {"path": "windows.json", "sha256": "", "byte_size": 0}}
     index = {"schema_version": 2, "manifest_sha256": canonical_json_sha256(manifest), "windows": windows}
     index_path = tmp_path / "windows.json"
     _write(index_path, index)
@@ -102,9 +120,9 @@ def _contract(tmp_path: Path) -> tuple[Path, Path, Path]:
     manifest_path = tmp_path / "mixture.json"
     _write(manifest_path, manifest)
     release_receipt = tmp_path / "release-receipt.json"
-    _write(release_receipt, {"repository": "ryanjin333/lehome-groot-n17-data", "immutable_revision": "a" * 40, "remote_prefix": f"mixtures/{mixture_id}", "mixture_id": mixture_id, "pending_receipt_sha256": "e" * 64, "artifact_entries": [{"relative_path": relative, "sha256": _sha_path(tmp_path / relative), "byte_size": (tmp_path / relative).stat().st_size} for relative in ("mixture.json", "windows.json", "mixture-normalization.json")], "fresh_readback_verified": True, "tree_listing_verified": True})
+    _write(release_receipt, {"repository": "ryanjin333/lehome-groot-n17-rollouts", "immutable_revision": "a" * 40, "remote_prefix": f"mixtures/{mixture_id}", "mixture_id": mixture_id, "pending_receipt_sha256": "e" * 64, "artifact_entries": [{"relative_path": relative, "sha256": _sha_path(tmp_path / relative), "byte_size": (tmp_path / relative).stat().st_size} for relative in ("mixture.json", "windows.json", "mixture-normalization.json")], "fresh_readback_verified": True, "tree_listing_verified": True})
     mounts = tmp_path / "mounts.json"
-    _write(mounts, {"schema_version": 2, "repository": "ryanjin333/lehome-groot-n17-data", "safe_prefix": f"mixtures/{mixture_id}", "deployment_receipt_path": str(release_receipt), "deployment_receipt_sha256": _sha_path(release_receipt), "mounts": [{"source_id": source["source_id"], "root": str(root), "source_tree_sha256": source["source_tree_sha256"], "artifact_receipt_sha256": source["artifact_receipt_sha256"]} for source, root in zip(sources, (bc, round_root), strict=True)]})
+    _write(mounts, {"schema_version": 2, "repository": "ryanjin333/lehome-groot-n17-rollouts", "safe_prefix": f"mixtures/{mixture_id}", "deployment_receipt_path": str(release_receipt), "deployment_receipt_sha256": _sha_path(release_receipt), "mounts": [{"source_id": source["source_id"], "root": str(root), "source_tree_sha256": source["source_tree_sha256"], "artifact_receipt_sha256": source["artifact_receipt_sha256"]} for source, root in zip(sources, (bc, round_root), strict=True)]})
     return manifest_path, index_path, mounts
 
 
@@ -527,3 +545,214 @@ def test_window_indexing_and_loader_caches_are_bounded(tmp_path: Path) -> None:
         loader._cache(loader._attempt_cache, Path(f"/attempt/{index}"), None)
     assert len(loader._attempt_cache) == loader.cache_cap
     assert RuntimeMixtureDataset(contract).get_initial_actions() == []
+
+
+def test_runtime_dataset_factory_reads_official_training_global_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lehome_train.groot import runtime_mixture as module
+
+    class OfficialTraining:
+        global_batch_size = 64
+
+    class OfficialConfig:
+        training = OfficialTraining()
+
+    class Processor:
+        def set_statistics(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        module,
+        "make_dataset_factory",
+        lambda **_kwargs: (lambda *args, processor=None, **kwargs: type("Dataset", (), {"get_dataset_statistics": staticmethod(lambda: {})})()),
+    )
+    factory_cls = module.runtime_dataset_factory_class(
+        mixture_manifest="/prepared/runtime/mixture.json",
+        window_index="/prepared/runtime/windows.json",
+        mounts_descriptor="/prepared/runtime/mounts.json",
+        global_sample_offset=0,
+        expected_global_step=0,
+        global_batch_size=64,
+    )
+    dataset, unused = factory_cls(OfficialConfig()).build(Processor())
+    assert unused is None
+    assert dataset is not None
+
+    mismatch = factory_cls(type("Mismatch", (), {"training": type("T", (), {"global_batch_size": 8})()})())
+    with pytest.raises(ValueError, match="pinned trainer global batch"):
+        mismatch.build(processor=Processor())
+
+
+def test_runtime_dataset_uses_bound_awr_evidence_as_deterministic_rollout_replay(
+    tmp_path: Path,
+) -> None:
+    from lehome_train.groot.awr_weighting import (
+        AwrReplayConfig,
+        canonical_evidence_sha256,
+        load_progress_evidence,
+    )
+    from lehome_train.groot.runtime_mixture import (
+        RuntimeMixtureDataset,
+        canonical_json_sha256,
+        load_runtime_contract,
+        make_dataset_factory,
+    )
+
+    manifest, _index, mounts = _contract(tmp_path)
+    contract = load_runtime_contract(manifest, mounts)
+    document = {
+        "schema_version": 1,
+        "kind": "lehome_awr_progress_evidence",
+        "mixture_id": contract.manifest.mixture_id,
+        "mixture_manifest_sha256": canonical_json_sha256(contract.manifest.raw),
+        "episodes": [
+            {
+                "episode_id": "attempt-0", "lineage_id": "rollout-0", "split": "train",
+                "score_kind": "progress", "score": -1.0,
+                "provenance_path": "receipts/attempt-0.json", "provenance_sha256": "a" * 64,
+            },
+            {
+                "episode_id": "attempt-1", "lineage_id": "rollout-1", "split": "train",
+                "score_kind": "progress", "score": 0.0,
+                "provenance_path": "receipts/attempt-1.json", "provenance_sha256": "b" * 64,
+            },
+            {
+                "episode_id": "attempt-2", "lineage_id": "rollout-2", "split": "train",
+                "score_kind": "advantage", "score": 2.0,
+                "provenance_path": "receipts/attempt-2.json", "provenance_sha256": "c" * 64,
+            },
+        ],
+    }
+    evidence_path = tmp_path / "awr-progress.json"
+    _write(evidence_path, document)
+    evidence = load_progress_evidence(
+        evidence_path,
+        expected_sha256=canonical_evidence_sha256(document),
+        mixture_id=contract.manifest.mixture_id,
+        mixture_manifest_sha256=canonical_json_sha256(contract.manifest.raw),
+    )
+
+    disabled = list(RuntimeMixtureDataset(contract, limit=200))
+    weighted_factory = make_dataset_factory(
+        mixture_manifest=manifest,
+        mounts_descriptor=mounts,
+        awr_evidence=evidence,
+        awr_config=AwrReplayConfig(temperature=1.0, minimum=0.5, maximum=2.0),
+    )
+    weighted = list(islice(weighted_factory(), 20_000))
+    unweighted = list(islice(RuntimeMixtureDataset(contract), 20_000))
+
+    assert [sample.sample_id for sample in disabled] == [
+        sample.sample_id for sample in RuntimeMixtureDataset(contract, limit=200)
+    ]
+    rollout_counts = Counter(
+        sample.window.source_episode_id for sample in weighted if sample.source_type == "rollout"
+    )
+    assert rollout_counts["attempt-2"] > rollout_counts["attempt-1"] > rollout_counts["attempt-0"]
+    assert [sample.window.window_id for sample in weighted if sample.source_type == "bc"] == [
+        sample.window.window_id for sample in unweighted if sample.source_type == "bc"
+    ]
+
+
+def test_awr_replay_balances_categories_before_weighting_within_category(tmp_path: Path) -> None:
+    from lehome_train.groot.awr_weighting import (
+        AwrReplayConfig,
+        canonical_evidence_sha256,
+        load_progress_evidence,
+    )
+    from lehome_train.groot.runtime_mixture import (
+        RuntimeMixtureDataset,
+        canonical_json_sha256,
+        load_runtime_contract,
+    )
+
+    categories = (
+        "top_long",
+        "top_short",
+        "pant_long",
+        "pant_short",
+        "pant_short",
+        "pant_short",
+    )
+    manifest, _index, mounts = _contract(tmp_path, rollout_categories=categories)
+    contract = load_runtime_contract(manifest, mounts)
+    document = {
+        "schema_version": 1,
+        "kind": "lehome_awr_progress_evidence",
+        "mixture_id": contract.manifest.mixture_id,
+        "mixture_manifest_sha256": canonical_json_sha256(contract.manifest.raw),
+        "episodes": [
+            {
+                "episode_id": f"attempt-{index}",
+                "lineage_id": f"rollout-{index}",
+                "split": "train",
+                "score_kind": "progress",
+                "score": 0.0,
+                "provenance_path": f"receipts/attempt-{index}.json",
+                "provenance_sha256": f"{index + 1:x}" * 64,
+            }
+            for index in range(len(categories))
+        ],
+    }
+    path = tmp_path / "awr-balanced-progress.json"
+    _write(path, document)
+    evidence = load_progress_evidence(
+        path,
+        expected_sha256=canonical_evidence_sha256(document),
+        mixture_id=contract.manifest.mixture_id,
+        mixture_manifest_sha256=canonical_json_sha256(contract.manifest.raw),
+    )
+
+    samples = islice(
+        RuntimeMixtureDataset(
+            contract,
+            awr_evidence=evidence,
+            awr_config=AwrReplayConfig(temperature=1.0, minimum=0.5, maximum=2.0),
+        ),
+        100_000,
+    )
+    by_category = Counter(
+        categories[int(sample.window.source_episode_id.removeprefix("attempt-"))]
+        for sample in samples
+        if sample.source_type == "rollout"
+    )
+
+    assert set(by_category) == {"top_long", "top_short", "pant_long", "pant_short"}
+    assert max(by_category.values()) / min(by_category.values()) < 1.05
+
+
+def test_runtime_dataset_fails_closed_for_missing_awr_rollout_evidence(tmp_path: Path) -> None:
+    from lehome_train.groot.awr_weighting import (
+        AwrReplayConfig,
+        canonical_evidence_sha256,
+        load_progress_evidence,
+    )
+    from lehome_train.groot.runtime_mixture import RuntimeMixtureDataset, canonical_json_sha256, load_runtime_contract
+
+    manifest, _index, mounts = _contract(tmp_path)
+    contract = load_runtime_contract(manifest, mounts)
+    document = {
+        "schema_version": 1, "kind": "lehome_awr_progress_evidence",
+        "mixture_id": contract.manifest.mixture_id,
+        "mixture_manifest_sha256": canonical_json_sha256(contract.manifest.raw),
+        "episodes": [{
+            "episode_id": "attempt-0", "lineage_id": "rollout-0", "split": "train",
+            "score_kind": "progress", "score": 0.0,
+            "provenance_path": "receipts/attempt-0.json", "provenance_sha256": "a" * 64,
+        }],
+    }
+    path = tmp_path / "awr-progress.json"
+    _write(path, document)
+    evidence = load_progress_evidence(
+        path, expected_sha256=canonical_evidence_sha256(document),
+        mixture_id=contract.manifest.mixture_id,
+        mixture_manifest_sha256=canonical_json_sha256(contract.manifest.raw),
+    )
+
+    with pytest.raises(ValueError, match="missing AWR evidence"):
+        RuntimeMixtureDataset(
+            contract,
+            awr_evidence=evidence,
+            awr_config=AwrReplayConfig(temperature=1.0, minimum=0.5, maximum=2.0),
+        )

@@ -1,0 +1,13 @@
+[
+  {
+    "attempt_id": "top-short-seen-9-mild-geometry-seed-313",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_9",
+    "garment_name": "Top_Short_Seen_9",
+    "release_stage": "seen",
+    "seed": 313,
+    "strategy": "mild_geometry",
+    "trial_id": "top-short-seen-9-mild-geometry-seed-313"
+  }
+]

@@ -23,6 +23,7 @@ from uuid import uuid4
 
 _ROUND_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+_PUBLICATION_REF_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 MANIFEST_NAME = "SHA256SUMS.json"
 REMOTE_ROOT = "rollout-rounds"
 
@@ -48,6 +49,7 @@ class SyncReceipt:
     repository: str
     round_id: str
     remote_prefix: str
+    immutable_revision: str
     entry_count: int
     episode_sha256: str
     readback_verified: bool
@@ -186,8 +188,13 @@ class HubSyncDaemon:
             raise HubSyncError(f"round_id must be path-safe lowercase, got {round_id!r}")
         if not isinstance(token, str) or not token:
             raise HubSyncError("token must be a non-empty string")
-        if not isinstance(revision, str) or not _REVISION_PATTERN.match(revision):
-            raise HubSyncError(f"revision must be an immutable 40-hex commit SHA, got {revision!r}")
+        if (
+            not isinstance(revision, str)
+            or not _PUBLICATION_REF_PATTERN.fullmatch(revision)
+            or _REVISION_PATTERN.fullmatch(revision)
+            or any(component in {"", ".", ".."} for component in revision.split("/"))
+        ):
+            raise HubSyncError(f"revision must be a canonical mutable branch ref, got {revision!r}")
         if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
             raise HubSyncError("max_attempts must be a positive integer")
         self.repository = repository
@@ -197,7 +204,7 @@ class HubSyncDaemon:
         self._accepted_root = Path(accepted_root).resolve()
         self.receipts_root = Path(receipts_root).resolve()
         self._readback_root = Path(readback_root).resolve()
-        self._revision = revision
+        self._publication_ref = revision
         self._max_attempts = max_attempts
         if self._accepted_root.is_symlink() or not self._accepted_root.is_dir():
             raise HubSyncError("accepted root must be a real directory")
@@ -238,10 +245,10 @@ class HubSyncDaemon:
             raise HubSyncError("sync receipt path is unsafe")
 
         remote_prefix = f"{REMOTE_ROOT}/{self.round_id}/{attempt_id}"
-        revision = self._call_with_retry(
+        immutable_revision = self._call_with_retry(
             lambda: self._transport.upload_files(
                 repository=self.repository,
-                revision=self._revision,
+                revision=self._publication_ref,
                 source=resolved,
                 entries=tuple(entries),
                 token=self._token,
@@ -249,12 +256,14 @@ class HubSyncDaemon:
             ),
             f"{attempt_id} upload",
         )
-        if not isinstance(revision, str) or revision != self._revision:
-            raise HubSyncError(f"{attempt_id} upload returned a different revision: {revision!r}")
+        if not isinstance(immutable_revision, str) or not _REVISION_PATTERN.fullmatch(immutable_revision):
+            raise HubSyncError(
+                f"{attempt_id} upload did not return an immutable commit: {immutable_revision!r}"
+            )
 
         def _readback() -> None:
             tree = self._transport.list_tree(
-                repository=self.repository, revision=revision, token=self._token, remote_prefix=remote_prefix,
+                repository=self.repository, revision=immutable_revision, token=self._token, remote_prefix=remote_prefix,
             )
             observed = {
                 entry.relative_path.removeprefix(remote_prefix + "/")
@@ -269,7 +278,7 @@ class HubSyncDaemon:
             destination = self._readback_root / f"{attempt_id}-{uuid4().hex}"
             try:
                 self._transport.download_files(
-                    repository=self.repository, revision=revision, destination=destination,
+                    repository=self.repository, revision=immutable_revision, destination=destination,
                     relative_paths=tuple(entry.relative_path for entry in entries),
                     token=self._token, remote_prefix=remote_prefix,
                 )
@@ -291,7 +300,8 @@ class HubSyncDaemon:
             "repository": self.repository,
             "round_id": self.round_id,
             "remote_prefix": remote_prefix,
-            "immutable_revision": revision,
+            "publication_ref": self._publication_ref,
+            "immutable_revision": immutable_revision,
             "entry_count": len(entries),
             "episode_sha256": digest,
             "readback_verified": True,
@@ -322,6 +332,7 @@ class HubSyncDaemon:
             repository=str(payload["repository"]),
             round_id=str(payload["round_id"]),
             remote_prefix=str(payload["remote_prefix"]),
+            immutable_revision=str(payload["immutable_revision"]),
             entry_count=int(payload["entry_count"]),  # type: ignore[arg-type]
             episode_sha256=str(payload["episode_sha256"]),
             readback_verified=bool(payload["readback_verified"]),

@@ -1,0 +1,30 @@
+[Unit]
+Description=LeHome immutable four-worker experiment evaluator
+After=network-online.target docker.service lehome-workspace.service
+Wants=network-online.target
+ConditionPathExists=/etc/lehome/experiment-bootstrap.ready
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/lehome/experiment-evaluator.env
+LoadCredential=controller-token:/etc/lehome/private/controller-token
+LoadCredential=hf-token:/etc/lehome/private/hf-token
+Environment=LEHOME_CONTROLLER_TOKEN_FILE=%d/controller-token
+Environment=LEHOME_HF_TOKEN_FILE=%d/hf-token
+ExecStartPre=/usr/bin/install -m 0600 %d/controller-token /run/lehome/controller-token
+ExecStartPre=/usr/bin/install -m 0600 %d/hf-token /run/lehome/hf-token
+ExecStart=/opt/lehome/rollout_appliance/run_experiment_evaluator.sh
+ExecStopPost=/usr/bin/rm -f /run/lehome/controller-token /run/lehome/hf-token
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=90
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/mnt/lehome /eval/logs /kitcache /run/lehome
+RuntimeDirectory=lehome
+
+[Install]
+WantedBy=multi-user.target

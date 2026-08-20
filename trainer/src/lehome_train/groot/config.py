@@ -12,6 +12,8 @@ from lehome_train.flywheel.augmentation import (
     augmentation_profile as resolve_augmentation_profile,
     validated_augmentation_receipt,
 )
+from lehome_train.groot.awr_weighting import AwrReplayConfig
+from lehome_train.groot.experiment_manifest import SweepRuntimeProfile
 
 
 ACTION_HORIZON = 16
@@ -75,8 +77,14 @@ class FineTuneLaunchConfig:
     runtime_mixture_manifest: str | None = None
     runtime_window_index: str | None = None
     runtime_mounts_descriptor: str | None = None
+    runtime_awr_evidence_path: str | None = None
+    runtime_awr_evidence_sha256: str | None = None
+    runtime_awr_temperature: float | None = None
+    runtime_awr_minimum: float | None = None
+    runtime_awr_maximum: float | None = None
     runtime_resume_sample_offset: int = 0
     runtime_resume_global_step: int | None = None
+    runtime_sweep_profile: SweepRuntimeProfile | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -136,7 +144,7 @@ class FineTuneLaunchConfig:
             assert self.parent_checkpoint_revision is not None
             assert self.parent_checkpoint_subpath is not None
             assert self.parent_checkpoint_artifact_sha256 is not None
-            if (
+            if self.runtime_sweep_profile is None and (
                 not self.parent_checkpoint_repository
                 or any(character.isspace() for character in self.parent_checkpoint_repository)
             ):
@@ -168,7 +176,7 @@ class FineTuneLaunchConfig:
             for field_name, field in zip(("runtime_mixture_manifest", "runtime_window_index", "runtime_mounts_descriptor"), runtime_fields, strict=True):
                 if type(field) is not str or not Path(field).is_absolute():
                     raise ValueError(f"{field_name} must be an absolute path")
-            if (
+            if self.runtime_sweep_profile is None and (
                 self.num_gpus != 1
                 or self.physical_batch_size != 64
                 or self.global_batch_size != 64
@@ -177,6 +185,38 @@ class FineTuneLaunchConfig:
                 or self.save_total_limit != 5
             ):
                 raise ValueError("runtime mixture requires batch64, 2K steps, and local checkpoint cadence 500")
+        if self.runtime_sweep_profile is not None:
+            profile = self.runtime_sweep_profile
+            if (self.runtime_mixture_manifest is None or self.num_gpus != 1 or self.physical_batch_size != 64 or self.global_batch_size != 64 or self.gradient_accumulation_steps != 1 or self.max_steps != profile.target_step or self.save_steps != 500 or profile.save_steps != 500 or profile.action_horizon != ACTION_HORIZON or profile.global_batch_size != 64):
+                raise ValueError("sweep runtime profile launch invariants drift")
+        awr_fields = (
+            self.runtime_awr_evidence_path,
+            self.runtime_awr_evidence_sha256,
+            self.runtime_awr_temperature,
+            self.runtime_awr_minimum,
+            self.runtime_awr_maximum,
+        )
+        if any(field is not None for field in awr_fields) and not all(
+            field is not None for field in awr_fields
+        ):
+            raise ValueError("runtime AWR configuration must be complete")
+        if all(field is not None for field in awr_fields):
+            if self.runtime_mixture_manifest is None:
+                raise ValueError("runtime AWR configuration requires a runtime mixture")
+            assert self.runtime_awr_evidence_path is not None
+            assert self.runtime_awr_evidence_sha256 is not None
+            assert self.runtime_awr_temperature is not None
+            assert self.runtime_awr_minimum is not None
+            assert self.runtime_awr_maximum is not None
+            if not Path(self.runtime_awr_evidence_path).is_absolute():
+                raise ValueError("runtime AWR evidence path must be absolute")
+            if not _SHA256.fullmatch(self.runtime_awr_evidence_sha256):
+                raise ValueError("runtime AWR evidence SHA-256 is invalid")
+            AwrReplayConfig(
+                temperature=self.runtime_awr_temperature,
+                minimum=self.runtime_awr_minimum,
+                maximum=self.runtime_awr_maximum,
+            )
         if type(self.runtime_resume_sample_offset) is not int or self.runtime_resume_sample_offset < 0:
             raise ValueError("runtime_resume_sample_offset must be nonnegative")
         if self.runtime_mixture_manifest is not None and (
@@ -220,7 +260,7 @@ class FineTuneLaunchConfig:
     def identity(self) -> dict[str, object]:
         """Return command-relevant provenance without secret environment data."""
 
-        return {
+        identity: dict[str, object] = {
             "base_model_path": self.base_model_path,
             "base_model_revision": self.base_model_revision,
             "dataset_path": self.dataset_path,
@@ -259,7 +299,27 @@ class FineTuneLaunchConfig:
             "runtime_mixture_manifest": self.runtime_mixture_manifest,
             "runtime_window_index": self.runtime_window_index,
             "runtime_mounts_descriptor": self.runtime_mounts_descriptor,
+            "runtime_sweep_profile": None if self.runtime_sweep_profile is None else {
+                "weights": dict(self.runtime_sweep_profile.weights),
+                "quotas": dict(self.runtime_sweep_profile.quotas),
+                "target_step": self.runtime_sweep_profile.target_step,
+            },
         }
+        if self.runtime_awr_evidence_path is not None:
+            assert self.runtime_awr_evidence_sha256 is not None
+            assert self.runtime_awr_temperature is not None
+            assert self.runtime_awr_minimum is not None
+            assert self.runtime_awr_maximum is not None
+            identity.update({
+                "runtime_awr_evidence_path": self.runtime_awr_evidence_path,
+                "runtime_awr_evidence_sha256": self.runtime_awr_evidence_sha256,
+                "runtime_awr_config_sha256": AwrReplayConfig(
+                temperature=self.runtime_awr_temperature,
+                    minimum=self.runtime_awr_minimum,
+                    maximum=self.runtime_awr_maximum,
+                ).sha256,
+            })
+        return identity
 
     def sample_presentations_for_optimizer_steps(self, optimizer_steps: int) -> int:
         """Return global samples consumed by a whole-number optimizer-step count."""

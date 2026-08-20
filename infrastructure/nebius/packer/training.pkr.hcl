@@ -63,11 +63,24 @@ build {
     destination = "/tmp/lehome-guest"
   }
 
+  provisioner "file" {
+    source      = "${path.root}/../../../scripts/run_lehome_experiment_worker.py"
+    destination = "/tmp/run_lehome_experiment_worker.py"
+  }
+
+  provisioner "file" {
+    source      = "${path.root}/../../../trainer/src/lehome_train"
+    destination = "/tmp/lehome_train"
+  }
+
   provisioner "shell" {
+    environment_vars = [
+      "GHCR_PULL_TOKEN=${var.ghcr_pull_token}",
+    ]
     inline = [
       "chmod +x /tmp/install-common.sh /tmp/install-training.sh",
       "sudo -E /tmp/install-common.sh",
-      "sudo -E TRAINING_OCI_IMAGE='${var.training_oci_image}' TRAINING_OCI_DIGEST='${var.training_oci_image}' TRAINER_CODE_REVISION='${var.trainer_code_revision}' /tmp/install-training.sh",
+      "sudo -E TRAINING_OCI_IMAGE='${var.training_oci_image}' TRAINING_OCI_DIGEST='${var.training_oci_digest}' TRAINER_CODE_REVISION='${var.trainer_code_revision}' /tmp/install-training.sh",
       "rm -f /tmp/install-common.sh /tmp/install-training.sh",
     ]
   }

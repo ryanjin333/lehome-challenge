@@ -1,0 +1,222 @@
+[
+  {
+    "attempt_id": "top-short-seen-0-mild-geometry-seed-211",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_0",
+    "garment_name": "Top_Short_Seen_0",
+    "release_stage": "seen",
+    "seed": 211,
+    "strategy": "mild_geometry",
+    "trial_id": "top-short-seen-0-mild-geometry-seed-211"
+  },
+  {
+    "attempt_id": "top-short-seen-0-strong-geometry-seed-223",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_0",
+    "garment_name": "Top_Short_Seen_0",
+    "release_stage": "seen",
+    "seed": 223,
+    "strategy": "strong_geometry",
+    "trial_id": "top-short-seen-0-strong-geometry-seed-223"
+  },
+  {
+    "attempt_id": "top-short-seen-1-mild-geometry-seed-227",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_1",
+    "garment_name": "Top_Short_Seen_1",
+    "release_stage": "seen",
+    "seed": 227,
+    "strategy": "mild_geometry",
+    "trial_id": "top-short-seen-1-mild-geometry-seed-227"
+  },
+  {
+    "attempt_id": "top-short-seen-1-strong-geometry-seed-229",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_1",
+    "garment_name": "Top_Short_Seen_1",
+    "release_stage": "seen",
+    "seed": 229,
+    "strategy": "strong_geometry",
+    "trial_id": "top-short-seen-1-strong-geometry-seed-229"
+  },
+  {
+    "attempt_id": "top-short-seen-2-mild-geometry-seed-233",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_2",
+    "garment_name": "Top_Short_Seen_2",
+    "release_stage": "seen",
+    "seed": 233,
+    "strategy": "mild_geometry",
+    "trial_id": "top-short-seen-2-mild-geometry-seed-233"
+  },
+  {
+    "attempt_id": "top-short-seen-2-strong-geometry-seed-239",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_2",
+    "garment_name": "Top_Short_Seen_2",
+    "release_stage": "seen",
+    "seed": 239,
+    "strategy": "strong_geometry",
+    "trial_id": "top-short-seen-2-strong-geometry-seed-239"
+  },
+  {
+    "attempt_id": "top-short-seen-3-mild-geometry-seed-241",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_3",
+    "garment_name": "Top_Short_Seen_3",
+    "release_stage": "seen",
+    "seed": 241,
+    "strategy": "mild_geometry",
+    "trial_id": "top-short-seen-3-mild-geometry-seed-241"
+  },
+  {
+    "attempt_id": "top-short-seen-3-strong-geometry-seed-251",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_3",
+    "garment_name": "Top_Short_Seen_3",
+    "release_stage": "seen",
+    "seed": 251,
+    "strategy": "strong_geometry",
+    "trial_id": "top-short-seen-3-strong-geometry-seed-251"
+  },
+  {
+    "attempt_id": "top-short-seen-4-mild-geometry-seed-257",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_4",
+    "garment_name": "Top_Short_Seen_4",
+    "release_stage": "seen",
+    "seed": 257,
+    "strategy": "mild_geometry",
+    "trial_id": "top-short-seen-4-mild-geometry-seed-257"
+  },
+  {
+    "attempt_id": "top-short-seen-4-strong-geometry-seed-263",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_4",
+    "garment_name": "Top_Short_Seen_4",
+    "release_stage": "seen",
+    "seed": 263,
+    "strategy": "strong_geometry",
+    "trial_id": "top-short-seen-4-strong-geometry-seed-263"
+  },
+  {
+    "attempt_id": "top-short-seen-5-mild-geometry-seed-269",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_5",
+    "garment_name": "Top_Short_Seen_5",
+    "release_stage": "seen",
+    "seed": 269,
+    "strategy": "mild_geometry",
+    "trial_id": "top-short-seen-5-mild-geometry-seed-269"
+  },
+  {
+    "attempt_id": "top-short-seen-5-strong-geometry-seed-271",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_5",
+    "garment_name": "Top_Short_Seen_5",
+    "release_stage": "seen",
+    "seed": 271,
+    "strategy": "strong_geometry",
+    "trial_id": "top-short-seen-5-strong-geometry-seed-271"
+  },
+  {
+    "attempt_id": "top-short-seen-6-mild-geometry-seed-277",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_6",
+    "garment_name": "Top_Short_Seen_6",
+    "release_stage": "seen",
+    "seed": 277,
+    "strategy": "mild_geometry",
+    "trial_id": "top-short-seen-6-mild-geometry-seed-277"
+  },
+  {
+    "attempt_id": "top-short-seen-6-strong-geometry-seed-281",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_6",
+    "garment_name": "Top_Short_Seen_6",
+    "release_stage": "seen",
+    "seed": 281,
+    "strategy": "strong_geometry",
+    "trial_id": "top-short-seen-6-strong-geometry-seed-281"
+  },
+  {
+    "attempt_id": "top-short-seen-7-mild-geometry-seed-283",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_7",
+    "garment_name": "Top_Short_Seen_7",
+    "release_stage": "seen",
+    "seed": 283,
+    "strategy": "mild_geometry",
+    "trial_id": "top-short-seen-7-mild-geometry-seed-283"
+  },
+  {
+    "attempt_id": "top-short-seen-7-strong-geometry-seed-293",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_7",
+    "garment_name": "Top_Short_Seen_7",
+    "release_stage": "seen",
+    "seed": 293,
+    "strategy": "strong_geometry",
+    "trial_id": "top-short-seen-7-strong-geometry-seed-293"
+  },
+  {
+    "attempt_id": "top-short-seen-8-mild-geometry-seed-307",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_8",
+    "garment_name": "Top_Short_Seen_8",
+    "release_stage": "seen",
+    "seed": 307,
+    "strategy": "mild_geometry",
+    "trial_id": "top-short-seen-8-mild-geometry-seed-307"
+  },
+  {
+    "attempt_id": "top-short-seen-8-strong-geometry-seed-311",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_8",
+    "garment_name": "Top_Short_Seen_8",
+    "release_stage": "seen",
+    "seed": 311,
+    "strategy": "strong_geometry",
+    "trial_id": "top-short-seen-8-strong-geometry-seed-311"
+  },
+  {
+    "attempt_id": "top-short-seen-9-mild-geometry-seed-313",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_9",
+    "garment_name": "Top_Short_Seen_9",
+    "release_stage": "seen",
+    "seed": 313,
+    "strategy": "mild_geometry",
+    "trial_id": "top-short-seen-9-mild-geometry-seed-313"
+  },
+  {
+    "attempt_id": "top-short-seen-9-strong-geometry-seed-317",
+    "category": "top_short",
+    "difficulty": "randomized",
+    "garment": "Top_Short_Seen_9",
+    "garment_name": "Top_Short_Seen_9",
+    "release_stage": "seen",
+    "seed": 317,
+    "strategy": "strong_geometry",
+    "trial_id": "top-short-seen-9-strong-geometry-seed-317"
+  }
+]

@@ -30,6 +30,8 @@ from lehome_train.release_manifest import validate_training_capability
 
 ORGANIZER_SOURCE = {"repository": "lehome/dataset_challenge_merged", "revision": "17e8dee8fac294ffd21d250501d3b31bf8679042", "subdir": "four_types_merged", "mirror_repository": "kunhsiang/lehome-four-types-merged", "mirror_revision": "2ebcccf528dec91cefac0c94a9214a83028ae6cc", "manifest_sha256": "bf8fbae82002a33ff304b9a70993bdfe1c678ba9e8f798c1ad370d58969435eb"}
 CORRECTIVE_SOURCE = {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "e6cd1c182514c15271c805d03a646e7a4f95b17c", "prefix": "corrective-rft/b96be3db22174a12dab62a8a673f7c7d083f87aa7b50c4e03ee43e064da56c35"}
+RUNTIME_BC_REPOSITORY = "ryanjin333/lehome-groot-n17-data"
+RUNTIME_ROLLOUT_REPOSITORY = "ryanjin333/lehome-groot-n17-rollouts"
 PARENT_CHECKPOINT = {"repository": "ryanjin333/lehome-groot-n17-models", "revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3", "subpath": "policies/step-12000", "archive_sha256": "0ddd4e7ce351dd2172cd1edd967293a50d02c15c0f2c21ca39db94692a57e0b5", "artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"}
 # The direct GPU host receives only a token and immutable controller evidence.
 # Its parent checkpoint is hydrated from this exact model-repository commit after
@@ -1669,14 +1671,20 @@ def _runtime_receipt(path_value: object, *, kind: str) -> tuple[dict[str, object
     if set(value) != expected_keys:
         raise ValueError("runtime mixture receipt schema is incompatible")
     prefix = value.get("remote_prefix")
+    expected_repository = (
+        RUNTIME_BC_REPOSITORY if kind == "bc" else RUNTIME_ROLLOUT_REPOSITORY
+    )
     if (
-        value.get("repository") != CORRECTIVE_SOURCE["repository"]
+        value.get("repository") != expected_repository
         or type(value.get("immutable_revision")) is not str
         or re.fullmatch(r"[0-9a-f]{40}", str(value.get("immutable_revision"))) is None
         or value.get("fresh_readback_verified") is not True
         or value.get("tree_listing_verified") is not True
         or (kind == "bc" and prefix != "bc/full")
-        or (kind == "rollout" and prefix != "rollouts/round-1")
+        or (kind == "rollout" and (
+            type(prefix) is not str
+            or re.fullmatch(r"rollouts/round-[1-9][0-9]*", prefix) is None
+        ))
         or (kind == "deployment" and not _runtime_deployment_receipt_is_canonical(value, prefix))
     ):
         raise ValueError("runtime mixture receipt is not an authenticated campaign binding")
@@ -3058,7 +3066,7 @@ def _runtime_warmup_binding(
     if (
         not isinstance(mixture, Mapping) or not isinstance(deployment, Mapping)
         or not isinstance(code, Mapping) or not isinstance(parent, Mapping)
-        or mixture.get("repository") != CORRECTIVE_SOURCE["repository"]
+        or mixture.get("repository") != RUNTIME_ROLLOUT_REPOSITORY
         or mixture.get("revision") != identity["deployment"]["immutable_revision"]
         or mixture.get("mixture_id") != identity["deployment"]["mixture_id"]
         or mixture.get("source_revisions") != {
@@ -3276,6 +3284,12 @@ def _runtime_checkpoint_identity(instance: Mapping[str, object], request: Mappin
     seed = request.get("schedule_seed")
     if type(seed) is not int:
         raise ValueError("runtime checkpoint lifecycle requires integer schedule_seed")
+    source_path = request.get("runtime_source_evidence")
+    if type(source_path) is not str:
+        raise ValueError("runtime checkpoint lifecycle requires runtime source evidence")
+    awr_binding = _runtime_awr_identity_binding(
+        _load_regular_json(Path(source_path), "runtime checkpoint source evidence")
+    )
     from lehome_train.groot.runtime_checkpoint_lifecycle import RuntimeMixtureTrainingIdentity
     return RuntimeMixtureTrainingIdentity(
         mixture_id=str(identity["deployment"]["mixture_id"]),
@@ -3288,6 +3302,7 @@ def _runtime_checkpoint_identity(instance: Mapping[str, object], request: Mappin
         code_bundle_revision=str(request["code_revision"]),
         oci_image=BOOTSTRAP_TRAINER_IMAGE.rpartition("@")[2],
         parent_step12000_artifact_sha256=PARENT_CHECKPOINT["artifact_sha256"],
+        **awr_binding,
     )
 
 
@@ -3670,6 +3685,66 @@ def _runtime_stage_selected_workers(*, selected_path: Path, launch_path: Path) -
     return workers, sha256_file(selected_path)
 
 
+def _runtime_awr_identity_binding(source_evidence: Mapping[str, object]) -> dict[str, str | None]:
+    """Return the optional paired AWR identity fields from source evidence."""
+    evidence_sha256 = source_evidence.get("awr_evidence_sha256")
+    config_sha256 = source_evidence.get("awr_config_sha256")
+    if evidence_sha256 is None and config_sha256 is None:
+        return {"awr_evidence_sha256": None, "awr_config_sha256": None}
+    if type(evidence_sha256) is not str or type(config_sha256) is not str:
+        raise ValueError("runtime AWR source evidence must contain paired digests")
+    return {
+        "awr_evidence_sha256": evidence_sha256,
+        "awr_config_sha256": config_sha256,
+    }
+
+
+def _runtime_awr_stage_binding(
+    *, launch: Mapping[str, object], source_evidence: Mapping[str, object], evidence_path: object,
+) -> dict[str, str] | None:
+    """Verify the controller AWR input before the stage can open an SSH connection."""
+    fields = (
+        "runtime_awr_evidence_path", "runtime_awr_evidence_sha256",
+        "runtime_awr_temperature", "runtime_awr_minimum", "runtime_awr_maximum",
+    )
+    values = tuple(launch.get(field) for field in fields)
+    if all(value is None for value in values):
+        if evidence_path is not None or any(
+            field in source_evidence for field in ("awr_evidence_sha256", "awr_config_sha256")
+        ):
+            raise ValueError("runtime AWR evidence is present for an unweighted launch")
+        return None
+    if any(value is None for value in values):
+        raise ValueError("runtime AWR launch configuration must be complete")
+    path_value, evidence_sha256, temperature, minimum, maximum = values
+    if (
+        path_value != "/prepared/runtime/awr-progress.json"
+        or type(evidence_sha256) is not str
+        or type(evidence_path) is not str
+    ):
+        raise ValueError("runtime AWR evidence path or controller input is invalid")
+    evidence = Path(evidence_path)
+    if evidence.is_symlink() or not evidence.is_file() or sha256_file(evidence) != evidence_sha256:
+        raise ValueError("runtime AWR controller evidence does not match the launch hash")
+    from lehome_train.groot.awr_weighting import AwrReplayConfig
+    try:
+        config_sha256 = AwrReplayConfig(
+            temperature=temperature, minimum=minimum, maximum=maximum,
+        ).sha256
+    except ValueError:
+        raise ValueError("runtime AWR launch configuration is invalid") from None
+    binding = _runtime_awr_identity_binding(source_evidence)
+    if (
+        binding["awr_evidence_sha256"] != evidence_sha256
+        or binding["awr_config_sha256"] != config_sha256
+    ):
+        raise ValueError("runtime AWR source evidence does not match the launch transform")
+    return {
+        "awr_evidence_sha256": evidence_sha256,
+        "awr_config_sha256": config_sha256,
+    }
+
+
 def _runtime_final_launch_contract(
     launch: Mapping[str, object], *, parent: Mapping[str, object],
 ) -> dict[str, object]:
@@ -3967,10 +4042,15 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
         ]
     ):
         raise ValueError("runtime checkpoint source evidence is not bound to staged provider, code, and runtime artifacts")
+    final_launch = _load_regular_json(Path(str(request["launch_config"])), "runtime final launch config")
+    awr_binding = _runtime_awr_stage_binding(
+        launch=final_launch,
+        source_evidence=source_evidence,
+        evidence_path=request.get("runtime_awr_evidence"),
+    )
     selected_workers, selected_workers_sha256 = _runtime_stage_selected_workers(
         selected_path=Path(str(request["selected_workers"])), launch_path=Path(str(request["launch_config"])),
     )
-    final_launch = _load_regular_json(Path(str(request["launch_config"])), "runtime final launch config")
     expected_launch = _runtime_final_launch_contract(
         final_launch, parent=warmup_lifecycle["runtime_warmup_binding"]["parent_checkpoint"],
     )
@@ -4029,6 +4109,8 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
     transfers: list[dict[str, str]] = []
     transfer_fields = (required | resume_transfers).copy()
     transfer_fields.pop("gpu_warmup_receipt")
+    if awr_binding is not None:
+        transfer_fields["runtime_awr_evidence"] = "awr-progress.json"
     for field, remote_name in transfer_fields.items():
         source = Path(str(request[field]))
         if source.is_symlink() or not source.is_file():
@@ -4050,7 +4132,8 @@ def runtime_mixture_stage(*, instance: Mapping[str, object], request: Mapping[st
             raise ValueError("runtime mixture staged warm-up receipt readback failed")
         transfers.append({"name": "gpu-warmup.json", "sha256": digest})
     runner((*_ssh_prefix(instance), "set -eu; test -d /prepared/code; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -d /cache/parent; test ! -L /cache/parent; " + _runtime_gpu_parent_hash_check_command() + "; mkdir -p /prepared/final-slot; test ! -e /prepared/final-slot/bootstrap-code; mv /prepared/code /prepared/final-slot/bootstrap-code"))
-    runner((*_ssh_prefix(instance), "set -eu; test -d /prepared/runtime; mkdir -p /prepared/config /output; mv " + remote_dir + "/launch.json /prepared/config/launch.json; mv " + remote_dir + "/experiment.json /prepared/config/experiment.json; mv " + remote_dir + "/runtime-train.json /prepared/config/runtime-train.json; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/gpu-warmup.json /prepared/config/gpu-warmup.json; mv " + remote_dir + "/runtime-warmup-binding.json /prepared/config/runtime-warmup-binding.json; mv " + remote_dir + "/selected-workers.json /prepared/config/selected-workers.json; mv " + remote_dir + "/source-evidence.json /prepared/runtime/source-evidence.json; mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; git clone --quiet --no-checkout " + remote_dir + "/code.bundle /prepared/code; git -C /prepared/code checkout --quiet --detach " + str(request["code_revision"]) + "; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -z \"$(git -C /prepared/code status --porcelain)\"; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code; test ! -L /cache/parent"))
+    awr_move = " mv " + remote_dir + "/awr-progress.json /prepared/runtime/awr-progress.json;" if awr_binding is not None else ""
+    runner((*_ssh_prefix(instance), "set -eu; test -d /prepared/runtime; mkdir -p /prepared/config /output; mv " + remote_dir + "/launch.json /prepared/config/launch.json; mv " + remote_dir + "/experiment.json /prepared/config/experiment.json; mv " + remote_dir + "/runtime-train.json /prepared/config/runtime-train.json; mv " + remote_dir + "/runtime-hydrate.json /prepared/config/runtime-hydrate.json; mv " + remote_dir + "/runtime-warmup.json /prepared/config/runtime-warmup.json; mv " + remote_dir + "/modality.py /prepared/config/modality.py; mv " + remote_dir + "/runtime.token /prepared/config/runtime.token; mv " + remote_dir + "/gpu-warmup.json /prepared/config/gpu-warmup.json; mv " + remote_dir + "/runtime-warmup-binding.json /prepared/config/runtime-warmup-binding.json; mv " + remote_dir + "/selected-workers.json /prepared/config/selected-workers.json; mv " + remote_dir + "/source-evidence.json /prepared/runtime/source-evidence.json;" + awr_move + " mv " + remote_dir + "/bc-readback.json /prepared/config/bc-readback.json; mv " + remote_dir + "/rollout-readback.json /prepared/config/rollout-readback.json; mv " + remote_dir + "/deployment-receipt.json /prepared/config/deployment-receipt.json; git clone --quiet --no-checkout " + remote_dir + "/code.bundle /prepared/code; git -C /prepared/code checkout --quiet --detach " + str(request["code_revision"]) + "; test \"$(git -C /prepared/code rev-parse HEAD)\" = " + str(request["code_revision"]) + "; test -z \"$(git -C /prepared/code status --porcelain)\"; chmod 600 /prepared/config/runtime.token; test ! -L /prepared/code; test ! -L /cache/parent"))
     if resume_transfers:
         runner((*_ssh_prefix(instance), "set -eu; mv " + remote_dir + "/runtime-resume.tar /prepared/config/runtime-resume.tar; mv " + remote_dir + "/runtime-resume.json /prepared/config/runtime-resume.json"))
     return {"paid_action": True, "action": "runtime-stage", "instance_id": instance["instance_id"], "code_bundle_sha256": request["code_bundle_sha256"], "bootstrap_receipt_sha256": sha256_file(Path(str(request["bootstrap_receipt"]))), "warmup_lifecycle_receipt_sha256": sha256_file(Path(str(request["gpu_warmup_receipt"]))), "launch_config_sha256": sha256_file(Path(str(request["launch_config"]))), "selected_loader_workers": selected_workers, "selected_workers_sha256": selected_workers_sha256, "runtime_resume": bool(resume_transfers), "transfers": transfers}

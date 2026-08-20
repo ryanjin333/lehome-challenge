@@ -22,6 +22,16 @@ BOUNDS = {
     "strong": RandomizationBounds(light=(0.65, 1.35), camera_m=0.02, garment_yaw_deg=15.0, base_m=0.02),
 }
 
+GEOMETRY_FIELDS = frozenset({
+    "light_intensity_scale",
+    "camera_translation_m",
+    "garment_yaw_deg",
+    "robot_base_translation_m",
+})
+MATERIAL_FIELDS = frozenset({"table_texture_id", "garment_display_color"})
+FULL_RANDOMIZATION_FIELDS = GEOMETRY_FIELDS | MATERIAL_FIELDS
+GEOMETRY_STRATEGIES = frozenset({"mild_geometry", "strong_geometry"})
+
 
 def read_or_author_garment_display_color(attribute) -> list[list[float]]:
     """Return a restorable color, authoring USD's conventional white fallback.
@@ -53,8 +63,9 @@ def sample_randomization(strategy: str, *, seed: int) -> RandomizationRecord:
         raise ValueError("randomization seed must be a non-negative integer")
     if strategy == "canonical":
         return RandomizationRecord(strategy, {})
+    bounds_name = strategy.removesuffix("_geometry")
     try:
-        bounds = BOUNDS[strategy]
+        bounds = BOUNDS[bounds_name]
     except KeyError as error:
         raise ValueError(f"unsupported randomization strategy: {strategy}") from error
     rng = np.random.default_rng(seed)
@@ -63,9 +74,12 @@ def sample_randomization(strategy: str, *, seed: int) -> RandomizationRecord:
         "camera_translation_m": tuple(float(value) for value in rng.uniform(-bounds.camera_m, bounds.camera_m, 3)),
         "garment_yaw_deg": float(rng.uniform(-bounds.garment_yaw_deg, bounds.garment_yaw_deg)),
         "robot_base_translation_m": tuple(float(value) for value in rng.uniform(-bounds.base_m, bounds.base_m, 3)),
-        "table_texture_id": int(rng.integers(1, 101)),
-        "garment_display_color": tuple(float(value) for value in rng.uniform(0.65, 1.0, 3)),
     }
+    if strategy not in GEOMETRY_STRATEGIES:
+        values.update({
+            "table_texture_id": int(rng.integers(1, 101)),
+            "garment_display_color": tuple(float(value) for value in rng.uniform(0.65, 1.0, 3)),
+        })
     return RandomizationRecord(strategy, values)
 
 
@@ -83,9 +97,22 @@ def validate_material_receipt(sampled: dict[str, object], receipt: dict[str, obj
         raise RuntimeError("flywheel garment displayColor readback mismatch")
 
 
+def randomization_materials_enabled(sampled: dict[str, object]) -> bool:
+    """Validate one supported field profile and report whether materials are included."""
+
+    sampled_fields = set(sampled)
+    if sampled_fields == set(GEOMETRY_FIELDS):
+        return False
+    if sampled_fields == set(FULL_RANDOMIZATION_FIELDS):
+        return True
+    raise RuntimeError("flywheel randomization sample fields are unsupported")
+
+
 def validate_randomization_receipt(sampled: dict[str, object], receipt: dict[str, object]) -> None:
     """Require every sampled value and only the defined USD proof metadata."""
-    extras = {"table_texture_path", "table_shader_input"}
+    sampled_fields = set(sampled)
+    materials_enabled = False if not sampled else randomization_materials_enabled(sampled)
+    extras = {"table_texture_path", "table_shader_input"} if materials_enabled else set()
     if set(receipt) - set(sampled) - extras or set(sampled) - set(receipt):
         raise RuntimeError("flywheel randomization receipt fields do not match sample")
     for key, expected in sampled.items():
@@ -95,13 +122,20 @@ def validate_randomization_receipt(sampled: dict[str, object], receipt: dict[str
         elif isinstance(expected, float):
             if not np.isclose(actual, expected, atol=1e-5): raise RuntimeError("flywheel randomization readback mismatch")
         elif actual != expected: raise RuntimeError("flywheel randomization readback mismatch")
-    if sampled:
+    if materials_enabled:
         validate_material_receipt(sampled, receipt)
 
 
 __all__ = [
     "BOUNDS",
+    "FULL_RANDOMIZATION_FIELDS",
+    "GEOMETRY_FIELDS",
+    "GEOMETRY_STRATEGIES",
+    "MATERIAL_FIELDS",
     "RandomizationBounds",
     "read_or_author_garment_display_color",
+    "randomization_materials_enabled",
     "sample_randomization",
+    "validate_material_receipt",
+    "validate_randomization_receipt",
 ]

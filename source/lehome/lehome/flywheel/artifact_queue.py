@@ -14,6 +14,8 @@ episodes without ever blocking a simulator worker:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -37,6 +39,7 @@ class FinalizationResult:
     outcome: str
     reason: str
     accepted_dir: Path | None
+    terminal_dir: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,12 +127,27 @@ class ArtifactFinalizationQueue:
         ledger: Any,
         max_pending_items: int,
         max_pending_bytes: int,
+        evaluation_only: bool = False,
+        evaluation_terminal_root: Path | None = None,
     ) -> None:
         if not isinstance(max_pending_items, int) or isinstance(max_pending_items, bool) or max_pending_items < 1:
             raise ValueError("max_pending_items must be a positive integer")
         if not isinstance(max_pending_bytes, int) or isinstance(max_pending_bytes, bool) or max_pending_bytes < 1:
             raise ValueError("max_pending_bytes must be a positive integer")
         self._run_root = Path(run_root).resolve()
+        if type(evaluation_only) is not bool:
+            raise ValueError("evaluation_only must be a boolean")
+        self._evaluation_terminal_root: Path | None = None
+        if evaluation_only and evaluation_terminal_root is None:
+            evaluation_terminal_root = self._run_root / "evaluation-terminal"
+        if not evaluation_only and evaluation_terminal_root is not None:
+            raise ValueError("evaluation terminal root requires evaluation-only mode")
+        if evaluation_terminal_root is not None:
+            requested = Path(evaluation_terminal_root)
+            expected = self._run_root / "evaluation-terminal"
+            if requested.is_symlink() or requested.resolve() != expected:
+                raise ValueError("evaluation terminal root must be the canonical run-root child")
+            self._evaluation_terminal_root = expected
         self._ledger = ledger
         self._max_pending_items = max_pending_items
         self._max_pending_bytes = max_pending_bytes
@@ -175,15 +193,73 @@ class ArtifactFinalizationQueue:
         reason = _validate_raw_episode(item.output_dir, item.attempt_id)
         if reason is None:
             succeeded, success_reason = _episode_succeeded(item.output_dir)
+            if self._evaluation_terminal_root is not None:
+                terminal_dir = self._publish_evaluation_terminal(item)
+                outcome = "accepted" if succeeded else "rejected"
+                self._ledger.validate_terminal(
+                    item.attempt_id, outcome, artifact_id=str(terminal_dir),
+                )
+                return FinalizationResult(
+                    item.attempt_id,
+                    outcome,
+                    "" if succeeded else success_reason,
+                    None,
+                    terminal_dir,
+                )
             reason = None if succeeded else success_reason
-
         if reason is None:
-            accepted_dir = self._accept(item)
-            self._ledger.validate_terminal(item.attempt_id, "accepted", artifact_id=str(accepted_dir))
-            return FinalizationResult(item.attempt_id, "accepted", "", accepted_dir)
+            # Multiple appliance finalizer processes may observe terminal
+            # handoffs at once. Serialize the cap check, move, and append-only
+            # ledger transition across them so no losing success is moved to
+            # accepted before the category/global quota is known to be open.
+            with self._admission_lock():
+                if self._controlled_category_full(item.attempt_id):
+                    reason = "controlled recovery category acceptance cap already reached"
+                elif self._ledger.accepted_count() >= self._ledger.target_accepted():
+                    reason = "accepted episode target already reached"
+                else:
+                    accepted_dir = self._accept(item)
+                    self._ledger.validate_terminal(item.attempt_id, "accepted", artifact_id=str(accepted_dir))
+                    return FinalizationResult(item.attempt_id, "accepted", "", accepted_dir)
 
         self._ledger.validate_terminal(item.attempt_id, "rejected")
         return FinalizationResult(item.attempt_id, "rejected", reason, None)
+
+    def _controlled_category_full(self, attempt_id: str) -> bool:
+        assignment = next(
+            (attempt.assignment for attempt in self._ledger.attempts() if attempt.attempt_id == attempt_id),
+            None,
+        )
+        if not isinstance(assignment, dict) or assignment.get("recovery_kind") != "controlled_success_recovery_v1":
+            return False
+        category = assignment.get("category")
+        cap = assignment.get("category_acceptance_cap")
+        if not isinstance(category, str) or type(cap) is not int or cap < 0:
+            raise ValueError("controlled recovery assignment has an invalid category cap")
+        accepted = 0
+        for attempt in self._ledger.attempts():
+            candidate = attempt.assignment
+            if (candidate.get("recovery_kind") == "controlled_success_recovery_v1"
+                    and candidate.get("category") == category
+                    and self._ledger.status(attempt.attempt_id) == "accepted"):
+                accepted += 1
+        return accepted >= cap
+
+    @contextmanager
+    def _admission_lock(self):
+        self._run_root.mkdir(parents=True, exist_ok=True)
+        if self._run_root.is_symlink() or not self._run_root.is_dir():
+            raise ValueError("run root must be a real directory")
+        path = self._run_root / ".finalizer-admission.lock"
+        if path.is_symlink():
+            raise ValueError("finalizer admission lock is unsafe")
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
     def drain(self, *, deadline_seconds: float) -> int:
         """Finalize every pending episode within the shutdown deadline."""
@@ -204,6 +280,22 @@ class ArtifactFinalizationQueue:
         destination = accepted_root / item.attempt_id
         if destination.exists() or destination.is_symlink():
             raise ValueError(f"accepted artifact already exists: {item.attempt_id}")
+        os.replace(item.output_dir, destination)
+        manifest = build_sha256_manifest(destination)
+        atomic_write_json(destination / MANIFEST_NAME, manifest)
+        return destination
+
+    def _publish_evaluation_terminal(self, item: _PendingItem) -> Path:
+        """Retain every valid evaluation outcome without training admission."""
+        if self._evaluation_terminal_root is None:
+            raise RuntimeError("evaluation terminal publication is not enabled")
+        root = self._evaluation_terminal_root
+        root.mkdir(parents=True, exist_ok=True)
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError("evaluation terminal root must be a real directory")
+        destination = root / item.attempt_id
+        if destination.exists() or destination.is_symlink():
+            raise ValueError(f"evaluation terminal artifact already exists: {item.attempt_id}")
         os.replace(item.output_dir, destination)
         manifest = build_sha256_manifest(destination)
         atomic_write_json(destination / MANIFEST_NAME, manifest)

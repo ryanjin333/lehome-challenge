@@ -521,6 +521,15 @@ class SessionPolicyClient:
         response = self._exchange(request)
         validate_response_for_request(response, request, now_ns=self._now_ns())
 
+    def _gateway_observation(self, observation: Mapping[str, Any]) -> dict[str, Any]:
+        """Send the GR00T video/state/language contract, not raw Isaac keys."""
+
+        if "observation.state" in observation and all(
+            f"observation.images.{camera}" in observation for camera in _CAMERAS
+        ):
+            return build_groot_observation(observation)
+        return dict(observation)
+
     def _request_action_chunk(self, observation: Mapping[str, Any]) -> tuple[np.ndarray, str]:
         self._ensure_session()
         request = PolicyRequest.infer(
@@ -529,7 +538,7 @@ class SessionPolicyClient:
             request_id=self._next_request_id(),
             policy_sha256=self._policy_sha256,
             deadline_ns=self._deadline_ns(),
-            observation=dict(observation),
+            observation=self._gateway_observation(observation),
         )
         try:
             response = self._exchange(request)

@@ -65,6 +65,7 @@ class BatchedPolicyGateway:
         )
         self._peers: dict[tuple[str, int, str], bytes] = {}
         self._sessions: set[str] = set()
+        self._session_last_ns: dict[str, int] = {}
         self._metrics = {
             "accepted": 0,
             "rejected": 0,
@@ -113,7 +114,9 @@ class BatchedPolicyGateway:
         if now_ns >= request.deadline_ns:
             return self._error(request, "expired")
         if request.operation == "reset" and request.session_id not in self._sessions and len(self._sessions) >= 4:
-            return self._error(request, "session_limit")
+            evicted = self._evict_idle_session(now_ns)
+            if evicted is None:
+                return self._error(request, "session_limit")
         try:
             self._guard.accept(request, now_ns=now_ns)
         except PolicyDigestError:
@@ -127,6 +130,7 @@ class BatchedPolicyGateway:
         self._metrics["accepted"] += 1
         if request.operation == "reset":
             self._sessions.add(request.session_id)
+            self._session_last_ns[request.session_id] = now_ns
             for identity in tuple(self._peers):
                 if identity[0] == request.session_id and identity[1] != request.episode_generation:
                     del self._peers[identity]
@@ -143,8 +147,31 @@ class BatchedPolicyGateway:
                 self._metrics["dropped_cancelled"] += 1
             return pack_envelope(PolicyResponse.ok(request))
         self._peers[self._identity(request)] = peer
+        self._session_last_ns[request.session_id] = now_ns
         self._batcher.enqueue(request, received_ns=now_ns)
         return None
+
+    def _evict_idle_session(self, now_ns: int, *, idle_after_ns: int = 30_000_000_000) -> str | None:
+        """Free one unused session slot so a replacement Isaac worker can attach.
+
+        A dead worker leaves its session id in ``_sessions`` forever.  Smoke plus
+        two failed 4-wide restarts filled the cap and then rejected live workers
+        with ``session_limit`` even though only two Isaac processes were inferring.
+        Evict the least-recently-used session that has no in-flight peer and has
+        been idle longer than ``idle_after_ns`` (30s by default).
+        """
+
+        busy = {identity[0] for identity in self._peers}
+        idle = [
+            session_id for session_id in self._sessions
+            if session_id not in busy and now_ns - self._session_last_ns.get(session_id, now_ns) >= idle_after_ns
+        ]
+        if not idle:
+            return None
+        victim = min(idle, key=lambda session_id: self._session_last_ns.get(session_id, 0))
+        self._sessions.discard(victim)
+        self._session_last_ns.pop(victim, None)
+        return victim
 
     def flush(self) -> list[tuple[bytes, bytes]]:
         now_ns = self._now_ns()
@@ -229,7 +256,9 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
     fd, temporary = tempfile.mkstemp(prefix=f".{canonical.name}.", suffix=".tmp", dir=canonical.parent)
     try:
         try:
-            os.fchmod(fd, 0o600)
+            # Isaac workers run as uid 1234 and must read the handshake.
+            # These files contain only readiness/metrics, never tokens.
+            os.fchmod(fd, 0o644)
             if os.write(fd, payload) != len(payload):
                 raise RuntimeError("policy JSON output was not fully written")
             os.fsync(fd)

@@ -18,6 +18,7 @@ HF_RECOVERY_STEPS = (1000, 2000)
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _IDENTITY_KEYS = {"experiment_manifest_sha256", "parent_checkpoint_artifact_sha256", "runtime_mixture_id", "trainer_code_sha256", "trainer_code_revision"}
+_AWR_IDENTITY_KEYS = {"awr_evidence_sha256", "awr_config_sha256"}
 
 
 class AttestationCancelled(RuntimeError):
@@ -38,9 +39,10 @@ class LocalRecoveryCheckpoint:
 
 
 def _identity(value: Mapping[str, object]) -> dict[str, str]:
-    if set(value) != _IDENTITY_KEYS:
+    selected = set(value)
+    if selected not in (_IDENTITY_KEYS, _IDENTITY_KEYS | _AWR_IDENTITY_KEYS):
         raise ValueError("local checkpoint identity is incompatible")
-    for key in _IDENTITY_KEYS - {"trainer_code_revision"}:
+    for key in selected - {"trainer_code_revision"}:
         if type(value[key]) is not str or _SHA.fullmatch(str(value[key])) is None:
             raise ValueError("local checkpoint identity is incompatible")
     if type(value["trainer_code_revision"]) is not str or _REVISION.fullmatch(str(value["trainer_code_revision"])) is None:

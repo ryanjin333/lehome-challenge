@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import sys
 import threading
 import time
 import types
+
+import pytest
 
 
 @dataclass
@@ -110,6 +113,28 @@ def test_worker_reuses_one_cpu_cloth_simulator_and_immediately_leases_next_attem
     assert all(receipt["cloth_device"] == "cpu" for receipt in receipts)
     assert all(receipt["action_horizon"] == 16 for receipt in receipts)
     assert sessions[0].closed is True
+
+
+def test_worker_reports_simulator_factory_failure_before_slow_kit_shutdown(tmp_path, capsys) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    def fail_factory():
+        raise TypeError("live constructor mismatch")
+
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=FakeController([]),
+        simulator_factory=fail_factory, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+
+    try:
+        worker.run()
+    except TypeError as error:
+        assert str(error) == "live constructor mismatch"
+    else:
+        raise AssertionError("simulator factory failure was not propagated")
+
+    assert "simulator factory failed: TypeError: live constructor mismatch" in capsys.readouterr().out
 
 
 def test_worker_records_an_interruption_then_stops_leasing_for_shutdown(tmp_path) -> None:
@@ -346,5 +371,372 @@ def test_worker_heartbeats_while_an_episode_blocks_and_stops_the_timer(tmp_path)
     release.set()
     thread.join(timeout=1.0)
 
-    assert controller.heartbeats == [("worker-0", "attempt-a", "lease-a")]
+    assert controller.heartbeats[0] == ("worker-0", "attempt-a", "lease-a")
+    assert set(controller.heartbeats) == {("worker-0", "attempt-a", "lease-a")}
     assert not thread.is_alive()
+
+
+def test_worker_leases_before_visible_contact_canary(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    class DeferredContactSession(FakeSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.runtime_receipt = dict(self.runtime_receipt)
+            self.runtime_receipt.pop("visible_contact_canary", None)
+
+        def run_episode(self, *, assignment, attempt_output_dir, policy, cancellation_event):
+            self.runtime_receipt["visible_contact_canary"] = {"observed": False}
+            return super().run_episode(
+                assignment=assignment, attempt_output_dir=attempt_output_dir,
+                policy=policy, cancellation_event=cancellation_event,
+            )
+
+    controller = FakeController([
+        Lease(Attempt("attempt-a", {"garment": "Top_Long_Seen_0", "seed": 11, "category": "top_long"}), "lease-a"),
+    ])
+    session = DeferredContactSession()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+
+    receipts = worker.run()
+
+    assert [item["attempt_id"] for item in receipts] == ["attempt-a"]
+    assert session.runs == ["attempt-a"]
+
+
+def test_worker_leases_without_startup_cloth_readback(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    class NoReadbackSession(FakeSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.runtime_receipt = dict(self.runtime_receipt)
+            self.runtime_receipt.pop("cloth_readback", None)
+            self.runtime_receipt.pop("visible_contact_canary", None)
+
+        def run_episode(self, *, assignment, attempt_output_dir, policy, cancellation_event):
+            self.runtime_receipt["cloth_readback"] = {"positions": 1, "velocities": 1}
+            self.runtime_receipt["visible_contact_canary"] = {"observed": False}
+            return super().run_episode(
+                assignment=assignment, attempt_output_dir=attempt_output_dir,
+                policy=policy, cancellation_event=cancellation_event,
+            )
+
+    controller = FakeController([
+        Lease(Attempt("attempt-a", {"garment": "Top_Long_Seen_0", "seed": 11, "category": "top_long"}), "lease-a"),
+    ])
+    session = NoReadbackSession()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+    receipts = worker.run()
+    assert [item["attempt_id"] for item in receipts] == ["attempt-a"]
+    assert session.runs == ["attempt-a"]
+
+
+def test_worker_infrastructure_aborts_an_episode_without_post_reset_cloth_evidence(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    class MissingPostResetEvidence(FakeSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.runtime_receipt = dict(self.runtime_receipt)
+            self.runtime_receipt.pop("cloth_readback", None)
+            self.runtime_receipt.pop("visible_contact_canary", None)
+
+    class Controller(FakeController):
+        def __init__(self, leases):
+            super().__init__(leases)
+            self.aborted = []
+
+        def record_infrastructure_abort(self, worker_id, attempt_id, lease_id, *, reason):
+            self.aborted.append((worker_id, attempt_id, lease_id, reason))
+            return "infrastructure_abort"
+
+    controller = Controller([
+        Lease(Attempt("attempt-a", {"garment": "Top_Long_Seen_0", "seed": 11}), "lease-a"),
+    ])
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=MissingPostResetEvidence, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+
+    assert worker.run() == []
+    assert controller.completed == []
+    assert controller.interrupted == []
+    assert controller.aborted == [("worker-0", "attempt-a", "lease-a", "runtime_evidence_invalid")]
+    assert list(tmp_path.rglob("worker-receipt.json")) == []
+
+
+def test_worker_continues_after_a_single_episode_runtime_error(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    class FailThenOk(FakeSession):
+        def run_episode(self, *, assignment, attempt_output_dir, policy, cancellation_event):
+            self.runs.append(str(assignment["attempt_id"]))
+            if assignment["attempt_id"] == "attempt-a":
+                raise RuntimeError("flywheel garment displayColor readback mismatch")
+            return {"success": True}
+
+    controller = FakeController([
+        Lease(Attempt("attempt-a", {"garment": "Pant_Long_Seen_0", "seed": 151, "category": "pant_long"}), "lease-a"),
+        Lease(Attempt("attempt-b", {"garment": "Top_Long_Seen_0", "seed": 11, "category": "top_long"}), "lease-b"),
+    ])
+    session = FailThenOk()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+    with pytest.raises(RuntimeError, match="displayColor"):
+        worker.run()
+    assert session.runs == ["attempt-a"]
+    assert controller.interrupted == []
+
+
+def test_worker_rejects_a_restore_mismatch_instead_of_retrying_the_same_lease(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    class RestoreBoom(FakeSession):
+        def run_episode(self, *, assignment, attempt_output_dir, policy, cancellation_event):
+            self.runs.append(str(assignment["attempt_id"]))
+            if assignment["attempt_id"] == "attempt-a":
+                raise ValueError("snapshot garment does not match the active environment")
+            return {"success": True}
+
+    class Controller(FakeController):
+        def __init__(self, leases):
+            super().__init__(leases)
+            self.rejected = []
+        def reject_attempt(self, worker_id, attempt_id, lease_id, *, reason):
+            self.rejected.append((worker_id, attempt_id, lease_id, reason))
+            return "rejected"
+
+    bad = Lease(Attempt("attempt-a", {"garment": "Pant_Long_Seen_5", "seed": 149, "restore_snapshot": "/tmp/term.json"}), "lease-a")
+    nxt = Lease(Attempt("attempt-b", {"garment": "Pant_Long_Seen_7", "seed": 151}), "lease-b")
+    controller = Controller([bad, nxt])
+    session = RestoreBoom()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+    receipts = worker.run()
+    assert session.runs == ["attempt-a", "attempt-b"]
+    assert controller.rejected[0][:3] == ("worker-0", "attempt-a", "lease-a")
+    assert [item["attempt_id"] for item in receipts] == ["attempt-b"]
+
+
+def test_worker_heartbeats_while_preparing_an_episode(tmp_path) -> None:
+    """A slow garment switch must retain its lease before inference begins."""
+
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingPreparationSession(FakeSession):
+        def prepare_episode(self, *, garment_name, seed, episode_generation, reset_policy=True):
+            started.set()
+            assert release.wait(timeout=1.0)
+            return super().prepare_episode(
+                garment_name=garment_name, seed=seed, episode_generation=episode_generation,
+                reset_policy=reset_policy,
+            )
+
+    controller = FakeController([Lease(Attempt("attempt-a", {"garment": "shirt", "seed": 1}), "lease-a")])
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=BlockingPreparationSession, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0", heartbeat_interval_seconds=0.01,
+        preparation_timeout_seconds=1.0,
+    )
+    thread = threading.Thread(target=worker.run)
+    thread.start()
+    assert started.wait(timeout=1.0)
+    deadline = time.monotonic() + 1.0
+    while not controller.heartbeats and time.monotonic() < deadline:
+        time.sleep(0.01)
+    release.set()
+    thread.join(timeout=1.0)
+
+    assert controller.heartbeats
+    assert set(controller.heartbeats) == {("worker-0", "attempt-a", "lease-a")}
+    assert not thread.is_alive()
+
+
+def test_preparation_timeout_rejects_then_requests_an_isolated_hard_exit(tmp_path, capsys) -> None:
+    """A native preparation hang is terminal for its lease, never retried forever."""
+
+    from lehome.flywheel.persistent_worker import PreparationTimeoutError, PersistentRolloutWorker
+
+    started = threading.Event()
+    release = threading.Event()
+    hard_exit_called = threading.Event()
+    exit_codes: list[int] = []
+
+    class Controller(FakeController):
+        def __init__(self, leases):
+            super().__init__(leases)
+            self.rejected = []
+
+        def record_infrastructure_abort(self, worker_id, attempt_id, lease_id, *, reason):
+            self.rejected.append((worker_id, attempt_id, lease_id, reason))
+            return "infrastructure_abort"
+
+    class BlockingPreparationSession(FakeSession):
+        def prepare_episode(self, *, garment_name, seed, episode_generation, reset_policy=True):
+            started.set()
+            assert release.wait(timeout=1.0)
+            return super().prepare_episode(
+                garment_name=garment_name, seed=seed, episode_generation=episode_generation,
+                reset_policy=reset_policy,
+            )
+
+    controller = Controller([Lease(Attempt("attempt-a", {"garment": "shirt", "seed": 1}), "lease-a")])
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=BlockingPreparationSession, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0", heartbeat_interval_seconds=0.01,
+        preparation_timeout_seconds=0.03,
+        hard_exit=lambda status: (exit_codes.append(status), hard_exit_called.set()),
+    )
+    errors: list[BaseException] = []
+
+    def run_worker() -> None:
+        try:
+            worker.run()
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run_worker)
+    thread.start()
+    assert started.wait(timeout=1.0)
+    assert hard_exit_called.wait(timeout=1.0)
+    assert controller.rejected == [("worker-0", "attempt-a", "lease-a", "preparation_timeout")]
+    assert exit_codes == [70]
+    assert "preparation timeout; aborting infrastructure-invalid attempt" in capsys.readouterr().out
+
+    # The injected test exit returns instead of terminating the process. Let
+    # preparation return so the worker can surface the same timeout locally.
+    release.set()
+    thread.join(timeout=1.0)
+    assert len(errors) == 1
+    assert isinstance(errors[0], PreparationTimeoutError)
+    assert not thread.is_alive()
+
+
+def test_normal_preparation_cancels_its_watchdog(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    exit_codes: list[int] = []
+    controller = FakeController([Lease(Attempt("attempt-a", {"garment": "shirt", "seed": 1}), "lease-a")])
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=FakeSession, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0", preparation_timeout_seconds=0.03,
+        hard_exit=exit_codes.append,
+    )
+
+    assert [receipt["attempt_id"] for receipt in worker.run()] == ["attempt-a"]
+    time.sleep(0.06)
+    assert exit_codes == []
+
+
+def test_worker_requires_a_strictly_positive_preparation_timeout(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+    import pytest
+
+    with pytest.raises(ValueError, match="preparation_timeout_seconds must be positive"):
+        PersistentRolloutWorker(
+            worker_id="worker-0", session_id="session-0", controller=FakeController([]),
+            simulator_factory=FakeSession, policy=FakePolicy(), output_root=tmp_path,
+            renderer_device="cuda:0", policy_device="cuda:0", preparation_timeout_seconds=0,
+        )
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+def test_launcher_rejects_an_invalid_preparation_timeout_before_opening_the_ledger(monkeypatch, timeout) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(repository))
+    from scripts.run_groot_persistent_worker import run
+
+    opened_ledger = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened_ledger.append(True)
+        raise AssertionError("invalid preparation timeout must not open the ledger")
+
+    args = types.SimpleNamespace(device="cpu", lease_seconds=30.0, preparation_timeout_seconds=timeout)
+    with pytest.raises(ValueError, match="preparation timeout seconds must be positive"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened_ledger == []
+
+
+def test_runtime_worker_loads_generated_controlled_materialization_shape(tmp_path) -> None:
+    from scripts.run_groot_persistent_worker import _load_matrix
+
+    reset, annotations = tmp_path / "reset.json", tmp_path / "annotations.jsonl"
+    reset.write_text("{}", encoding="utf-8"); annotations.write_text("", encoding="utf-8")
+    caps = {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}
+    categories = ["pant_long"] * 4 + ["top_long"] + ["top_short"] * 3
+    rows = [
+        {
+            "attempt_id": f"controlled-{index}", "trial_id": f"controlled-{index}",
+            "category": category, "category_acceptance_cap": caps[category],
+            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_v1",
+            "controlled_matrix_sha256": "a" * 64, "perturbation_seed": 71_000 + index,
+            "perturbation_fingerprint": f"{index + 100:064x}",
+            "source_state_perturbation_fingerprint": f"{index + 200:064x}",
+            "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round",
+            "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}",
+            "source_continuation_state": [float(index)] * 12,
+            "source_immutable_revision": "a" * 40,
+            "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64,
+            "action_prefix_sha256": "c" * 64, "prefix_stop": 1,
+            "source_first_success_step": 2, "source_reset": str(reset),
+            "source_annotations": str(annotations),
+        }
+        for index, category in enumerate(categories)
+    ]
+    path = tmp_path / "materialization.json"
+    path.write_text(json.dumps({"schema_version": 1, "kind": "controlled_success_recovery_materialization_v1", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}), encoding="utf-8")
+    assert _load_matrix(path) == rows
+
+
+def test_failed_preparation_stops_its_heartbeat_before_the_next_lease(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    class FailsFirstPreparation(FakeSession):
+        def prepare_episode(self, *, garment_name, seed, episode_generation, reset_policy=True):
+            if garment_name == "bad-shirt":
+                time.sleep(0.03)
+                raise RuntimeError("garment preparation failed")
+            return super().prepare_episode(
+                garment_name=garment_name, seed=seed, episode_generation=episode_generation,
+                reset_policy=reset_policy,
+            )
+
+    controller = FakeController([
+        Lease(Attempt("attempt-a", {"garment": "bad-shirt", "seed": 1}), "lease-a"),
+        Lease(Attempt("attempt-b", {"garment": "good-shirt", "seed": 2}), "lease-b"),
+    ])
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=FailsFirstPreparation, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0", heartbeat_interval_seconds=0.01,
+    )
+
+    with pytest.raises(RuntimeError, match="garment preparation failed"):
+        worker.run()
+    old_heartbeat_count = controller.heartbeats.count(("worker-0", "attempt-a", "lease-a"))
+    time.sleep(0.04)
+    assert old_heartbeat_count >= 1
+    assert controller.heartbeats.count(("worker-0", "attempt-a", "lease-a")) == old_heartbeat_count

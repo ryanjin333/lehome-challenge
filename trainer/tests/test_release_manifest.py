@@ -48,7 +48,7 @@ def test_capture_training_capability_runs_one_optimizer_step_and_validates(
 
 ROOT = Path(__file__).resolve().parents[2]
 TRAINER = ROOT / "trainer"
-LOCK_SHA256 = "5df7702213f15d7116e6889cf9cf24d7c9983ca920c22f6852e68c5413b57964"
+LOCK_SHA256 = "363aac368ca82cf649b817097e54c4c9c4b31283594cfb958e6febd403e0f7d8"
 REPOSITORY_COMMIT = "7d367df39a94917c6c1df6befe011eef1a0ce3ca"
 OCI_DIGEST = "sha256:" + "a" * 64
 DATASET_REVISION = "b" * 40

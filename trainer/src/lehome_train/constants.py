@@ -14,6 +14,7 @@ ISAAC_GROOT_REVISION: Final = "23ace64f17aa5015259b8609d371eb61a357c776"
 MODEL_REVISION: Final = "2fc962b973bccdd5d8ce4f67cc63b264d6886495"
 DEFAULT_DATA_REPO: Final = "ryanjin333/lehome-groot-n17-data"
 DEFAULT_MODEL_REPO: Final = "ryanjin333/lehome-groot-n17-models"
+DEFAULT_ROLLOUT_REPO: Final = "ryanjin333/lehome-groot-n17-rollouts"
 
 
 @dataclass(frozen=True, slots=True)

@@ -202,6 +202,47 @@ def test_session_client_caches_one_horizon_16_chunk_locally_and_reset_clears_it(
     ]
 
 
+def test_session_client_converts_lehome_observation_before_infer() -> None:
+    from lehome.flywheel import policy_protocol as protocol
+
+    module = _load_groot_policy_module()
+    chunk = np.zeros((16, 12), dtype=np.float32)
+    requests = []
+
+    def transport(payload: bytes) -> bytes:
+        request = protocol.unpack_envelope(payload)
+        assert isinstance(request, protocol.PolicyRequest)
+        requests.append(request)
+        if request.operation == "infer":
+            return protocol.pack_envelope(
+                protocol.PolicyResponse.ok(
+                    request, action_chunk=chunk.tobytes(), action_horizon=16
+                )
+            )
+        return protocol.pack_envelope(protocol.PolicyResponse.ok(request))
+
+    client = module.SessionPolicyClient(
+        "tcp://127.0.0.1:5500",
+        "a" * 64,
+        1.0,
+        session_id="worker-0",
+        request_transport=transport,
+        now_ns=lambda: 1_000,
+    )
+    observation = {
+        "observation.state": np.zeros(12, dtype=np.float32),
+        "observation.images.top_rgb": np.zeros((4, 6, 3), dtype=np.uint8),
+        "observation.images.left_rgb": np.zeros((4, 6, 3), dtype=np.uint8),
+        "observation.images.right_rgb": np.zeros((4, 6, 3), dtype=np.uint8),
+    }
+    action = client.select_action_with_provenance(observation)
+    assert action.value.shape == (12,)
+    infer = next(request for request in requests if request.operation == "infer")
+    assert set(infer.observation) == {"video", "state", "language"}
+    assert set(infer.observation["video"]) == {"top_rgb", "left_rgb", "right_rgb"}
+    assert infer.observation["video"]["top_rgb"].shape == (1, 1, 4, 6, 3)
+
+
 def test_session_client_rejects_stale_or_expired_responses_and_replays_reset_after_gateway_restart() -> None:
     from lehome.flywheel import policy_protocol as protocol
 

@@ -12,7 +12,7 @@ import shutil
 import tempfile
 from typing import Iterable, Mapping
 
-from lehome_train.constants import DEFAULT_DATA_REPO
+from lehome_train.constants import DEFAULT_DATA_REPO, DEFAULT_ROLLOUT_REPO
 from lehome_train.flywheel.corrective import (
     APPROVED_PARENT_ARTIFACT_SHA256,
     APPROVED_PARENT_REPOSITORY,
@@ -32,6 +32,7 @@ from lehome_train.redaction import generate_upload_allowlist
 _REMOTE_ROOT = "corrective-rft"
 _ROUND_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _EPISODE_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_IMMUTABLE_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 MAX_ROLL_ROUND_EPISODES = 150
 
 
@@ -45,7 +46,9 @@ class RolloutRoundSeal:
 
     round_id: str
     episode_count: int
+    repository: str
     episode_sha256s: Mapping[str, str]
+    immutable_revisions: Mapping[str, str]
     seal_receipt_path: Path
 
 
@@ -70,6 +73,19 @@ def _load_sync_receipt(receipts_root: Path, attempt_id: str, round_id: str) -> d
     episode_sha256 = payload.get("episode_sha256")
     if not isinstance(episode_sha256, str) or not _EPISODE_SHA256_PATTERN.match(episode_sha256):
         raise RolloutRoundSealError(f"sync receipt episode_sha256 for {attempt_id!r} is invalid")
+    if payload.get("attempt_id") != attempt_id:
+        raise RolloutRoundSealError(f"sync receipt attempt_id for {attempt_id!r} does not match")
+    if payload.get("repository") != DEFAULT_ROLLOUT_REPO:
+        raise RolloutRoundSealError(f"sync receipt repository for {attempt_id!r} is not approved")
+    immutable_revision = payload.get("immutable_revision")
+    if (
+        not isinstance(immutable_revision, str)
+        or not _IMMUTABLE_REVISION_PATTERN.fullmatch(immutable_revision)
+    ):
+        raise RolloutRoundSealError(f"sync receipt immutable revision for {attempt_id!r} is invalid")
+    expected_prefix = f"rollout-rounds/{round_id}/{attempt_id}"
+    if payload.get("remote_prefix") != expected_prefix:
+        raise RolloutRoundSealError(f"sync receipt prefix for {attempt_id!r} does not match")
     return payload
 
 
@@ -100,24 +116,37 @@ def seal_rollout_round(
     if len(ids) > MAX_ROLL_ROUND_EPISODES:
         raise RolloutRoundSealError(f"a rollout round cannot exceed {MAX_ROLL_ROUND_EPISODES} accepted episodes")
     episode_sha256s: dict[str, str] = {}
+    immutable_revisions: dict[str, str] = {}
     for attempt_id in ids:
         payload = _load_sync_receipt(receipts_root_path, attempt_id, round_id)
         episode_sha256s[attempt_id] = str(payload["episode_sha256"])
+        immutable_revisions[attempt_id] = str(payload["immutable_revision"])
 
     seal_path = Path(seal_receipt_path).resolve()
     if seal_path.exists() or seal_path.is_symlink():
         raise RolloutRoundSealError("rollout round seal receipt already exists")
     seal_path.parent.mkdir(parents=True, exist_ok=True)
+    seal_body = {
+        "round_id": round_id,
+        "repository": DEFAULT_ROLLOUT_REPO,
+        "episode_sha256s": episode_sha256s,
+        "immutable_revisions": immutable_revisions,
+    }
     atomic_write_json(seal_path, {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "rollout_round_seal",
         "round_id": round_id,
+        "repository": DEFAULT_ROLLOUT_REPO,
         "episode_count": len(ids),
         "episode_sha256s": episode_sha256s,
+        "immutable_revisions": immutable_revisions,
         "readback_verified": True,
-        "seal_sha256": canonical_json_sha256({"round_id": round_id, "episode_sha256s": episode_sha256s}),
+        "seal_sha256": canonical_json_sha256(seal_body),
     })
-    return RolloutRoundSeal(round_id, len(ids), episode_sha256s, seal_path)
+    return RolloutRoundSeal(
+        round_id, len(ids), DEFAULT_ROLLOUT_REPO,
+        episode_sha256s, immutable_revisions, seal_path,
+    )
 
 
 @dataclass(frozen=True, slots=True)

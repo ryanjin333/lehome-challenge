@@ -48,6 +48,33 @@ def _official_sharded(root: Path, step: int) -> Path:
     return checkpoint
 
 
+def test_local_recovery_identity_binds_optional_awr_transform(tmp_path: Path) -> None:
+    from lehome_train.groot.local_recovery import (
+        attest_local_checkpoint,
+        discover_local_recovery,
+    )
+
+    identity = _identity() | {
+        "awr_evidence_sha256": "f" * 64,
+        "awr_config_sha256": "1" * 64,
+    }
+    local = attest_local_checkpoint(
+        checkpoint=_official(tmp_path / "run", 500),
+        metadata_root=tmp_path / "shared",
+        optimizer_step=500,
+        identity=identity,
+    )
+
+    assert discover_local_recovery(
+        metadata_root=tmp_path / "shared", identity=identity
+    ) == local
+    with pytest.raises(ValueError, match="identity"):
+        discover_local_recovery(
+            metadata_root=tmp_path / "shared",
+            identity=identity | {"awr_config_sha256": "2" * 64},
+        )
+
+
 def test_attestation_accepts_a_complete_indexed_safetensors_checkpoint(tmp_path: Path) -> None:
     from lehome_train.groot.local_recovery import attest_local_checkpoint
 

@@ -33,10 +33,19 @@ from lehome_train.constants import DEFAULT_MODEL_REPO, MODEL_REVISION
 from lehome_train.data.normalization import normalization_identity
 from lehome_train.flywheel.mix import verify_generation
 from lehome_train.groot.config import FineTuneLaunchConfig
+from lehome_train.groot.awr_weighting import (
+    AwrReplayConfig,
+    ProgressEvidenceSet,
+    load_progress_evidence,
+)
 from lehome_train.groot.launch import build_launch
-from lehome_train.groot.launch import launch_continuous_finetune, launch_finetune_to_step
+from lehome_train.groot.launch import (
+    launch_continuous_finetune,
+    launch_finetune_to_step,
+    launch_sweep_finetune,
+)
 from lehome_train.groot.throughput_tuning import TrainingProbe, tune_on_host
-from lehome_train.groot.continuous_training import PreemptionController, run_continuous_supervisor
+from lehome_train.groot.continuous_training import PreemptionController, run_continuous_supervisor, run_sweep_supervisor
 from lehome_train.groot.local_recovery import LocalRecoveryCheckpoint, discover_local_recovery
 from lehome_train.groot.runtime_checkpoint_lifecycle import (
     RuntimeMixtureTrainingIdentity,
@@ -52,6 +61,7 @@ from lehome_train.groot.production_adapters import (
     probe_physical_vram_bytes,
     probe_visible_gpu_memory,
     _launch_kwargs,
+    _verified_checkpoint_state_at,
 )
 from lehome_train.io import (
     atomic_write_json,
@@ -103,6 +113,20 @@ class _ValidatedRuntimeResume:
     @property
     def optimizer_step(self) -> int:
         return self.cursor["optimizer_step"]
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeAwrBinding:
+    """One authenticated replay transform shared by warm-up and training."""
+
+    evidence: ProgressEvidenceSet
+    config: AwrReplayConfig
+
+    def checkpoint_identity(self) -> dict[str, str]:
+        return {
+            "awr_evidence_sha256": self.evidence.identity_sha256,
+            "awr_config_sha256": self.config.sha256,
+        }
 
 
 def _select_runtime_recovery(*, local: LocalRecoveryCheckpoint | None, hf_checkpoint: Path | None, hf_descriptor: object | None, parent_checkpoint: Path, local_anchor_verified: bool | None = None) -> _SelectedRuntimeRecovery:
@@ -339,20 +363,27 @@ class _RuntimeMixtureWarmupSession:
         synchronize()
         moved = _move_to_cuda(batch, torch_module=self.torch_module)
         self.model.train()
-        output = self.model(**moved) if isinstance(moved, Mapping) else self.model(moved)
-        loss = getattr(output, "loss", None)
-        if loss is None and isinstance(output, Mapping):
-            loss = output.get("loss")
-        backward = getattr(loss, "backward", None)
-        if not callable(backward):
-            raise RuntimeError("pinned GR00T model did not return a trainable loss")
-        item = getattr(loss, "item", None)
-        if not callable(item):
-            raise RuntimeError("pinned GR00T model loss is not materialized")
-        loss_value = item()
-        if type(loss_value) not in (int, float) or not math.isfinite(float(loss_value)):
-            raise RuntimeError("pinned GR00T model returned a non-finite loss")
-        backward()
+        autocast = getattr(self.torch_module, "autocast", None)
+        if not callable(autocast):
+            raise RuntimeError("GPU warm-up requires torch autocast")
+        bfloat16 = getattr(self.torch_module, "bfloat16", None)
+        if bfloat16 is None:
+            raise RuntimeError("GPU warm-up requires torch.bfloat16")
+        with autocast(device_type="cuda", dtype=bfloat16):
+            output = self.model(**moved) if isinstance(moved, Mapping) else self.model(moved)
+            loss = getattr(output, "loss", None)
+            if loss is None and isinstance(output, Mapping):
+                loss = output.get("loss")
+            backward = getattr(loss, "backward", None)
+            if not callable(backward):
+                raise RuntimeError("pinned GR00T model did not return a trainable loss")
+            item = getattr(loss, "item", None)
+            if not callable(item):
+                raise RuntimeError("pinned GR00T model loss is not materialized")
+            loss_value = item()
+            if type(loss_value) not in (int, float) or not math.isfinite(float(loss_value)):
+                raise RuntimeError("pinned GR00T model returned a non-finite loss")
+            backward()
         self.optimizer.step()
         zero_grad = getattr(self.optimizer, "zero_grad", None)
         if not callable(zero_grad):
@@ -387,9 +418,9 @@ class _RuntimeMixtureWarmupSession:
         oom = False
         error_text: str | None = None
         try:
-            if type(worker_count) is not int or worker_count not in (0, 4, 8, 12, 16):
+            if type(worker_count) is not int or worker_count not in (4, 8, 12, 16):
                 raise ValueError("runtime GPU warm-up worker count is not canonical")
-            if type(burn_in_steps) is not int or burn_in_steps != 10 or type(measured_steps) is not int or measured_steps != 50:
+            if type(burn_in_steps) is not int or burn_in_steps != 2 or type(measured_steps) is not int or measured_steps != 5:
                 raise ValueError("runtime GPU warm-up duration is not canonical")
             if not self.model_loaded():
                 raise RuntimeError("pinned GR00T CUDA model is not loaded")
@@ -547,6 +578,21 @@ def _load_config(path_value: object) -> FineTuneLaunchConfig:
     if not isinstance(raw, dict):
         raise ValueError("launch_config root must be an object")
     reject_secret_bearing_config(raw)
+    # Runtime request sets store JSON, while FineTuneLaunchConfig keeps the
+    # isolated sweep profile as a typed value.  Decode only this exact nested
+    # profile; the legacy request shape remains unchanged.
+    sweep_profile = raw.get("runtime_sweep_profile")
+    if sweep_profile is not None:
+        if not isinstance(sweep_profile, Mapping):
+            raise ValueError("launch_config sweep profile is malformed")
+        scratch = Path(tempfile.mkdtemp(prefix="sweep-profile-")) / "profile.json"
+        try:
+            scratch.write_bytes(json.dumps(dict(sweep_profile), sort_keys=True, separators=(",", ":")).encode())
+            from lehome_train.groot.experiment_manifest import load_sweep_runtime_profile
+            raw = dict(raw)
+            raw["runtime_sweep_profile"] = load_sweep_runtime_profile(scratch)
+        finally:
+            shutil.rmtree(scratch.parent, ignore_errors=True)
     try:
         config = FineTuneLaunchConfig(**raw)
     except (TypeError, ValueError):
@@ -710,6 +756,316 @@ def _runtime_final_campaign(
         raise ValueError("runtime production experiment is not the measured direct-GPU campaign")
 
 
+def _sweep_overlay_binding(
+    *, config: FineTuneLaunchConfig, experiment: ExperimentConfig,
+) -> Mapping[str, object] | None:
+    """Validate dynamic sweep bytes before the legacy 2K gate is considered."""
+    overlay_value = os.environ.get("LEHOME_SWEEP_TRAIN_OVERLAY")
+    binding_value = os.environ.get("LEHOME_SWEEP_RUNTIME_BINDING")
+    if overlay_value is None and binding_value is None:
+        return None
+    if not overlay_value or not binding_value or config.runtime_sweep_profile is None:
+        raise ValueError("sweep runtime overlay is incomplete")
+    overlay = _mounted_path(overlay_value, "sweep runtime overlay", must_exist=True, regular_file=True)
+    binding = _mounted_path(binding_value, "sweep runtime binding", must_exist=True, regular_file=True)
+    overlay_sha = os.environ.get("LEHOME_SWEEP_TRAIN_OVERLAY_SHA256")
+    binding_sha = os.environ.get("LEHOME_SWEEP_RUNTIME_BINDING_SHA256")
+    if (
+        not isinstance(overlay_sha, str) or not isinstance(binding_sha, str)
+        or sha256_file(overlay) != overlay_sha or sha256_file(binding) != binding_sha
+    ):
+        raise ValueError("sweep runtime overlay or binding hash mismatch")
+    try:
+        overlay_document = json.loads(overlay.read_text(encoding="utf-8"))
+        binding_document = json.loads(binding.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("sweep runtime overlay is malformed") from error
+    if (
+        not isinstance(overlay_document, Mapping)
+        or not isinstance(binding_document, Mapping)
+        or binding_document.get("schema_version") != 1
+        or binding_document.get("kind") != "lehome_sweep_runtime_request_binding"
+        or binding_document.get("experiment_id") != config.experiment_name
+        or overlay_document.get("experiment_id") != config.experiment_name
+        or overlay_document.get("job_digest") != config.experiment_name
+        or binding_document.get("overlay_sha256") != overlay_sha
+        or binding_document.get("target_step") != config.max_steps
+        or config.runtime_sweep_profile.target_step != config.max_steps
+        or experiment.sample_presentations != config.max_steps * 64
+    ):
+        raise ValueError("sweep runtime binding does not match dynamic launch")
+    parent_publication = binding_document.get("parent_publication")
+    parent_path = binding_document.get("parent_checkpoint_path")
+    parent_cursor = binding_document.get("parent_cursor")
+    if config.max_steps == 500:
+        if parent_publication is not None or parent_path is not None or parent_cursor is not None:
+            raise ValueError("root 500-step sweep launch cannot consume a promoted parent")
+    else:
+        parent_fields = {
+            "schema_version", "experiment_id", "job_digest", "target_step",
+            "repository", "immutable_revision", "remote_prefix", "relative_path",
+            "artifact_sha256", "artifact_byte_size", "descriptor_relative_path",
+            "descriptor_sha256", "descriptor_byte_size", "receipt_sha256",
+            "readback_verified",
+        }
+        if (
+            not isinstance(parent_publication, Mapping)
+            or not isinstance(parent_path, str)
+            or not isinstance(parent_cursor, Mapping)
+            or set(parent_publication) != parent_fields
+            or parent_publication.get("schema_version") != 2
+            or parent_publication.get("readback_verified") is not True
+            or config.base_model_path != parent_path
+            or _mounted_path(parent_path, "sweep promoted parent", must_exist=True).is_dir() is False
+        ):
+            raise ValueError("promoted sweep launch lacks its staged exact parent")
+        expected_cursor = {
+            "optimizer_step": parent_publication.get("target_step"),
+            "global_sample_offset": int(parent_publication.get("target_step", -1)) * 64,
+            "physical_batch_size": 64,
+            "action_horizon": 16,
+        }
+        if parent_cursor != expected_cursor:
+            raise ValueError("promoted sweep parent cursor does not bind its publication")
+    return binding_document
+
+
+def _runtime_sweep_campaign(
+    config: FineTuneLaunchConfig,
+    experiment: ExperimentConfig,
+    binding: Mapping[str, object],
+) -> None:
+    """Narrow admission for the isolated 500/1K/2K sweep path."""
+    profile = config.runtime_sweep_profile
+    if profile is None or (
+        config.num_gpus != 1
+        or config.physical_batch_size != 64
+        or config.global_batch_size != 64
+        or config.gradient_accumulation_steps != 1
+        or config.save_steps != 500
+        or config.max_steps not in (500, 1000, 2000)
+        or profile.target_step != config.max_steps
+        or profile.save_steps != 500
+        or profile.action_horizon != 16
+        or profile.global_batch_size != 64
+        or config.training_action_horizon != 16
+        or config.model_action_chunk_capacity != 40
+        or config.output_dir != f"/output/sweep/{config.experiment_name}"
+        or experiment.sample_presentations != config.max_steps * 64
+        or experiment.physical_batch_size != 64
+        or experiment.gradient_accumulation_steps != 1
+        or experiment.action_horizon != 16
+        or experiment.tune_language_backbone
+        or experiment.tune_visual_backbone
+    ):
+        raise ValueError("runtime sweep launch invariants drift")
+    if binding.get("parent_publication") is None:
+        if config.max_steps != 500 or config.base_model_path != str(_runtime_mount_root("cache") / "parent"):
+            raise ValueError("root sweep launch parent is incompatible")
+
+
+def _sweep_checkpoint_step(path: Path) -> int:
+    """Parse one local sweep checkpoint name without trusting its parent."""
+
+    match = re.fullmatch(r"checkpoint-([0-9]+)", path.name)
+    if match is None:
+        raise ValueError("sweep resume checkpoint has an unsafe name")
+    return int(match.group(1))
+
+
+def _safe_sweep_output_root(config: FineTuneLaunchConfig) -> Path:
+    """Return the private, non-symlinked output root used by one sweep job."""
+
+    root = Path(config.output_dir)
+    if not root.is_absolute() or ".." in root.parts:
+        raise ValueError("sweep output root is unsafe")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("sweep output root is unsafe")
+    current = Path(root.anchor)
+    for part in root.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise ValueError("sweep output root has a symlinked ancestor")
+    return root
+
+
+def _validated_sweep_parent_archive(
+    *, config: FineTuneLaunchConfig, binding: Mapping[str, object],
+) -> tuple[Path, int, Mapping[str, object]]:
+    """Re-bind a promoted sweep resume to immutable archive bytes.
+
+    The extracted cache directory is useful as the base policy path, but it is
+    not sufficient evidence for an optimizer resume: a continuation must be
+    reconstructed from the immutable archive and its descriptor immediately
+    before launch.  This keeps a model-only cache from silently resetting the
+    optimizer/global-step state.
+    """
+
+    publication = binding.get("parent_publication")
+    cursor = binding.get("parent_cursor")
+    if not isinstance(publication, Mapping) or not isinstance(cursor, Mapping):
+        raise ValueError("promoted sweep launch lacks an authenticated parent publication")
+    step = publication.get("target_step")
+    expected_cursor = {
+        "optimizer_step": step,
+        "global_sample_offset": step * 64 if type(step) is int else None,
+        "physical_batch_size": 64,
+        "action_horizon": 16,
+    }
+    if (
+        type(step) is not int
+        or step not in (500, 1000)
+        or step >= config.max_steps
+        or dict(cursor) != expected_cursor
+    ):
+        raise ValueError("promoted sweep parent cursor does not bind its absolute target")
+    archive_value = os.environ.get("LEHOME_SWEEP_PARENT_ARCHIVE")
+    descriptor_value = os.environ.get("LEHOME_SWEEP_PARENT_DESCRIPTOR")
+    checkpoint_value = os.environ.get("LEHOME_SWEEP_PARENT_CHECKPOINT")
+    if not archive_value or not descriptor_value or not checkpoint_value:
+        raise ValueError("promoted sweep requires immutable full-state resume inputs")
+    archive = _mounted_path(archive_value, "sweep promoted parent archive", must_exist=True, regular_file=True)
+    descriptor_path = _mounted_path(descriptor_value, "sweep promoted parent descriptor", must_exist=True, regular_file=True)
+    parent_cache = _mounted_path(checkpoint_value, "sweep promoted parent cache", must_exist=True)
+    if (
+        parent_cache != Path(config.base_model_path)
+        or archive.is_symlink()
+        or descriptor_path.is_symlink()
+        or sha256_file(archive) != publication.get("artifact_sha256")
+        or archive.stat().st_size != publication.get("artifact_byte_size")
+        or sha256_file(descriptor_path) != publication.get("descriptor_sha256")
+        or descriptor_path.stat().st_size != publication.get("descriptor_byte_size")
+    ):
+        raise ValueError("promoted sweep full-state resume bytes do not match their publication")
+    descriptor = load_checkpoint_descriptor(descriptor_path)
+    record = descriptor.record
+    if (
+        record.optimizer_step != step
+        or not record.resumable
+        or record.artifact.sha256 != publication.get("artifact_sha256")
+        or record.artifact.byte_size != publication.get("artifact_byte_size")
+    ):
+        raise ValueError("promoted sweep full-state descriptor does not bind its parent")
+    from lehome_train.groot.checkpoint_identity import policy_artifact_sha256
+
+    if policy_artifact_sha256(parent_cache) != config.parent_checkpoint_artifact_sha256:
+        raise ValueError("promoted sweep cached parent policy does not match its immutable publication")
+    return archive, step, publication
+
+
+def _copy_promoted_sweep_checkpoint(*, archive: Path, destination: Path, step: int) -> None:
+    """Extract one full, symlink-free parent checkpoint into a private stage."""
+
+    from lehome_train.groot.experiment_runtime_request import _extract_promoted_policy
+
+    _extract_promoted_policy(archive, optimizer_step=step, destination=destination)
+    _verified_checkpoint_state_at(destination, step, num_gpus=1)
+
+
+def _stage_promoted_sweep_resume(
+    *, config: FineTuneLaunchConfig, binding: Mapping[str, object],
+) -> Path:
+    """Stage an archive-authenticated parent below the child's output root.
+
+    ``launch_finetune.py`` only accepts a resume directory beneath the child
+    output root.  We never point it at the mutable cache extraction; instead
+    we atomically create a private stage whose receipt pins the archive and
+    full parent publication.  The chunk wrapper then receives the exact
+    trainer checkpoint and derives the inherited global step from it.
+    """
+
+    archive, step, publication = _validated_sweep_parent_archive(config=config, binding=binding)
+    output_root = _safe_sweep_output_root(config)
+    archive_sha = str(publication["artifact_sha256"])
+    stage = output_root / f".runtime-sweep-parent-{step}-{archive_sha[:16]}"
+    checkpoint = stage / config.experiment_name / f"checkpoint-{step}"
+    evidence = {
+        "schema_version": 1,
+        "kind": "lehome_sweep_parent_resume_stage",
+        "experiment_id": config.experiment_name,
+        "target_step": config.max_steps,
+        "parent_publication": dict(publication),
+        "archive_sha256": archive_sha,
+        "resume_checkpoint": f"{config.experiment_name}/checkpoint-{step}",
+    }
+    evidence_path = stage / "sweep-parent-resume.json"
+
+    def verify_existing() -> Path:
+        if stage.is_symlink() or not stage.is_dir() or evidence_path.is_symlink() or not evidence_path.is_file():
+            raise ValueError("promoted sweep resume stage is unsafe")
+        if _load_nonempty_json_artifact(evidence_path, "promoted sweep resume stage") != evidence:
+            raise ValueError("promoted sweep resume stage does not bind its immutable parent")
+        _verified_checkpoint_state_at(checkpoint, step, num_gpus=1)
+        from lehome_train.groot.checkpoint_identity import policy_artifact_sha256
+        if policy_artifact_sha256(checkpoint) != config.parent_checkpoint_artifact_sha256:
+            raise ValueError("promoted sweep staged parent policy does not match its immutable publication")
+        return checkpoint
+
+    if stage.exists() or stage.is_symlink():
+        return verify_existing()
+    temporary = Path(tempfile.mkdtemp(prefix=f".{stage.name}.", suffix=".incomplete", dir=output_root))
+    try:
+        staged_checkpoint = temporary / config.experiment_name / f"checkpoint-{step}"
+        staged_checkpoint.parent.mkdir(parents=True, mode=0o700)
+        _copy_promoted_sweep_checkpoint(archive=archive, destination=staged_checkpoint, step=step)
+        from lehome_train.groot.checkpoint_identity import policy_artifact_sha256
+        if policy_artifact_sha256(staged_checkpoint) != config.parent_checkpoint_artifact_sha256:
+            raise ValueError("promoted sweep archive policy does not match its immutable publication")
+        (temporary / "sweep-parent-resume.json").write_bytes(canonical_json_bytes(evidence))
+        (temporary / "sweep-parent-resume.json").chmod(0o600)
+        os.replace(temporary, stage)
+    except FileExistsError:
+        shutil.rmtree(temporary, ignore_errors=True)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return verify_existing()
+
+
+def _select_sweep_resume_checkpoint(
+    *, config: FineTuneLaunchConfig, binding: Mapping[str, object],
+) -> Path | None:
+    """Prefer a verified child-local boundary; otherwise stage its parent.
+
+    Local 500-step saves survive a preemption on the protected disk.  A child
+    may only reuse a boundary after its immutable parent has been checked, so
+    an old/mismatched local run cannot turn a promoted continuation into a
+    model-only reset.
+    """
+
+    output_root = _safe_sweep_output_root(config)
+    parent_publication = binding.get("parent_publication")
+    parent_step: int | None = None
+    staged_parent: Path | None = None
+    if parent_publication is not None:
+        staged_parent = _stage_promoted_sweep_resume(config=config, binding=binding)
+        parent_step = _sweep_checkpoint_step(staged_parent)
+    run_root = output_root / config.experiment_name
+    if run_root.exists() or run_root.is_symlink():
+        if run_root.is_symlink() or not run_root.is_dir():
+            raise ValueError("sweep local recovery run root is unsafe")
+        candidates = sorted(
+            (
+                path for path in run_root.iterdir()
+                if path.name.startswith("checkpoint-")
+            ),
+            key=_sweep_checkpoint_step,
+        )
+        if candidates:
+            local = candidates[-1]
+            step = _sweep_checkpoint_step(local)
+            if (
+                step not in (500, 1000, 1500, 2000)
+                or step > config.max_steps
+                or (parent_step is not None and step <= parent_step)
+            ):
+                raise ValueError("sweep local recovery does not advance from its authenticated parent")
+            _verified_checkpoint_state_at(local, step, num_gpus=1)
+            return local
+    return staged_parent
+
+
 def _positive_integer(value: object, label: str) -> int:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{label} must be a positive integer")
@@ -731,10 +1087,14 @@ def _publisher_token(path_value: object) -> str:
 
 def _runtime_checkpoint_identity_from_evidence(value: object) -> RuntimeMixtureTrainingIdentity:
     """Load the controller-authenticated identity without re-deriving it on a GPU."""
-    if not isinstance(value, Mapping) or set(value) != {
+    base_fields = {
         "mixture_id", "deployment_receipt_sha256", "source_revisions", "schedule_seed",
         "code_bundle_sha256", "code_bundle_revision", "oci_image",
         "parent_step12000_artifact_sha256", "physical_batch_size", "action_horizon",
+    }
+    awr_fields = {"awr_evidence_sha256", "awr_config_sha256"}
+    if not isinstance(value, Mapping) or set(value) not in {
+        frozenset(base_fields), frozenset(base_fields | awr_fields)
     } or not isinstance(value.get("source_revisions"), list):
         raise ValueError("runtime checkpoint source evidence has an incompatible schema")
     rows = value["source_revisions"]
@@ -749,6 +1109,8 @@ def _runtime_checkpoint_identity_from_evidence(value: object) -> RuntimeMixtureT
             schedule_seed=value["schedule_seed"], code_bundle_sha256=value["code_bundle_sha256"],
             code_bundle_revision=value["code_bundle_revision"], oci_image=value["oci_image"],
             parent_step12000_artifact_sha256=value["parent_step12000_artifact_sha256"],
+            awr_evidence_sha256=value.get("awr_evidence_sha256"),
+            awr_config_sha256=value.get("awr_config_sha256"),
             physical_batch_size=value["physical_batch_size"], action_horizon=value["action_horizon"],
         )
     except (KeyError, TypeError, ValueError):
@@ -756,6 +1118,84 @@ def _runtime_checkpoint_identity_from_evidence(value: object) -> RuntimeMixtureT
     if identity.to_dict() != dict(value):
         raise ValueError("runtime checkpoint source evidence is not canonical")
     return identity
+
+
+def _validate_runtime_awr_training_identity(
+    *, config: object, identity: RuntimeMixtureTrainingIdentity
+) -> None:
+    evidence_sha256 = getattr(config, "runtime_awr_evidence_sha256", None)
+    temperature = getattr(config, "runtime_awr_temperature", None)
+    minimum = getattr(config, "runtime_awr_minimum", None)
+    maximum = getattr(config, "runtime_awr_maximum", None)
+    if evidence_sha256 is None:
+        expected_config_sha256 = None
+    else:
+        expected_config_sha256 = AwrReplayConfig(
+            temperature=temperature,
+            minimum=minimum,
+            maximum=maximum,
+        ).sha256
+    if (
+        identity.awr_evidence_sha256 != evidence_sha256
+        or identity.awr_config_sha256 != expected_config_sha256
+    ):
+        raise ValueError("runtime AWR checkpoint identity does not match the launch transform")
+
+
+def _load_runtime_awr_binding(
+    *, config: object, contract: object,
+) -> _RuntimeAwrBinding | None:
+    evidence_path = getattr(config, "runtime_awr_evidence_path", None)
+    if evidence_path is None:
+        return None
+    selected = _mounted_path(
+        evidence_path,
+        "runtime_awr_evidence_path",
+        must_exist=True,
+        regular_file=True,
+    )
+    evidence_sha256 = getattr(config, "runtime_awr_evidence_sha256", None)
+    awr_config = AwrReplayConfig(
+        temperature=getattr(config, "runtime_awr_temperature", None),
+        minimum=getattr(config, "runtime_awr_minimum", None),
+        maximum=getattr(config, "runtime_awr_maximum", None),
+    )
+    manifest = getattr(contract, "manifest", None)
+    evidence = load_progress_evidence(
+        selected,
+        expected_sha256=evidence_sha256,
+        mixture_id=getattr(manifest, "mixture_id", None),
+        mixture_manifest_sha256=canonical_json_sha256(getattr(manifest, "raw", None)),
+    )
+    return _RuntimeAwrBinding(evidence=evidence, config=awr_config)
+
+
+def _runtime_warmup_dataset_factory(
+    *, config: object, contract: object, manifest: Path, window_index: Path, mounts: Path,
+) -> type[object]:
+    """Create the warm-up factory with the authenticated training transform.
+
+    The no-AWR path retains the original keyword set exactly.  When AWR is
+    enabled, evidence is reloaded from the protected mount and passed as the
+    parsed immutable object, rather than leaving warm-up to test a different
+    sampler than the final pinned entrypoint.
+    """
+
+    from lehome_train.groot.runtime_mixture import runtime_dataset_factory_class
+
+    kwargs: dict[str, object] = {
+        "mixture_manifest": manifest,
+        "window_index": window_index,
+        "mounts_descriptor": mounts,
+        "global_sample_offset": 0,
+        "expected_global_step": 0,
+        "global_batch_size": 64,
+    }
+    awr_binding = _load_runtime_awr_binding(config=config, contract=contract)
+    if awr_binding is not None:
+        kwargs["awr_evidence"] = awr_binding.evidence
+        kwargs["awr_config"] = awr_binding.config
+    return runtime_dataset_factory_class(**kwargs)
 
 
 def _validate_runtime_resume_checkpoint(
@@ -1373,15 +1813,12 @@ class ProductionRuntime:
         original = getattr(setup_module, "DatasetFactory", None)
         if original is None:
             raise RuntimeError("pinned GR00T DatasetFactory is unavailable")
-        from lehome_train.groot.runtime_mixture import runtime_dataset_factory_class
-
-        replacement = runtime_dataset_factory_class(
-            mixture_manifest=manifest,
+        replacement = _runtime_warmup_dataset_factory(
+            config=config,
+            contract=contract,
+            manifest=manifest,
             window_index=window_index,
-            mounts_descriptor=mounts,
-            global_sample_offset=0,
-            expected_global_step=0,
-            global_batch_size=64,
+            mounts=mounts,
         )
         setattr(setup_module, "DatasetFactory", replacement)
         try:
@@ -2018,6 +2455,118 @@ class ProductionRuntime:
         atomic_write_json(outputs["status_output"], payload)
         return payload
 
+    def _runtime_sweep_train(
+        self,
+        *,
+        request: Mapping[str, object],
+        outputs: Mapping[str, Path],
+        config: FineTuneLaunchConfig,
+        experiment: ExperimentConfig,
+        paths: Mapping[str, Path],
+        contract: object,
+        sweep_binding: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Run an independent short rung without weakening legacy 2K logic."""
+        _runtime_sweep_campaign(config, experiment, sweep_binding)
+        repository, revision = request["checkpoint_repository"], request["checkpoint_revision"]
+        if repository != DEFAULT_MODEL_REPO or revision != "main":
+            raise ValueError("runtime sweep checkpoint publication destination is incompatible")
+        token = _publisher_token(request["publisher_token_file"])
+        if type(request["instance_id"]) is not int:
+            raise ValueError("runtime sweep requires an exact instance ID")
+        # The existing loader/GPU warmup is still required.  It proves the
+        # common h16/b64 input path; the overlay only changes parent/rung.
+        from lehome_train.groot.runtime_mixture_warmup import (
+            bind_warmup_to_runtime_artifacts,
+            validate_gpu_warmup_receipt,
+        )
+        warmup = _load_nonempty_json_artifact(paths["warmup_receipt"], "runtime sweep GPU warm-up receipt")
+        warmup_binding = bind_warmup_to_runtime_artifacts(
+            binding=_load_nonempty_json_artifact(paths["runtime_warmup_binding"], "runtime sweep warm-up binding"),
+            manifest_path=paths["runtime_manifest"],
+            window_index_path=paths["runtime_window_index"],
+            normalization_path=paths["runtime_normalization"],
+            mounts_descriptor_path=paths["runtime_mounts_descriptor"],
+        )
+        selected_workers = validate_gpu_warmup_receipt(warmup, expected_binding=warmup_binding)
+        if config.dataloader_num_workers != selected_workers:
+            raise ValueError("runtime sweep workers do not match GPU warm-up receipt")
+        # A promoted child must resume the complete authenticated Trainer
+        # state.  This may select a surviving child-local 500-step checkpoint
+        # after preemption, otherwise it atomically stages the exact parent
+        # archive below this child's output root.  ``None`` is valid only for
+        # a root 500-step arm.
+        resume_checkpoint = _select_sweep_resume_checkpoint(
+            config=config, binding=sweep_binding,
+        )
+        if config.max_steps > 500 and resume_checkpoint is None:
+            raise ValueError("promoted sweep launch cannot reset from model weights")
+        resume_step = (
+            None if resume_checkpoint is None else _sweep_checkpoint_step(resume_checkpoint)
+        )
+        session = GrootTrainingSession(
+            config=config,
+            experiment_config=experiment,
+            normalization_sha256=sha256_file(paths["runtime_normalization"]),
+            resume_checkpoint=None,
+        )
+        uploader = HubCheckpointUploader(
+            repository=repository,
+            revision=revision,
+            experiment_id=config.experiment_name,
+            artifact_root=config.output_dir,
+            token=token,
+            transport=self._checkpoint_transport_factory(timeout_seconds=21600.0),
+            retry_sleeper=self._checkpoint_retry_sleeper,
+        )
+        schedule = ExposureSchedule(
+            physical_batch_size=64,
+            sample_presentations=config.max_steps * 64,
+            checkpoint_sample_presentations=500 * 64,
+        )
+        preemption = PreemptionController()
+        try:
+            previous_handler = signal.signal(signal.SIGTERM, preemption.handler)
+        except ValueError:
+            previous_handler = None
+        try:
+            publications = run_sweep_supervisor(
+                run_root=Path(config.output_dir) / config.experiment_name,
+                target_step=config.max_steps,
+                # ``max_steps`` is absolute.  A 500-parent->1K child adds
+                # exactly 500 gradients and a 1K-parent->2K child exactly
+                # 1K; the chunk wrapper reads the inherited cursor from this
+                # explicit checkpoint before calling Trainer.train.
+                launch=lambda: None if resume_step == config.max_steps else launch_sweep_finetune(
+                    config, **_launch_kwargs(), resume_checkpoint=resume_checkpoint,
+                ),
+                package=lambda completed: session.package_checkpoint_snapshot(
+                    completed.snapshot_root,
+                    optimizer_step=completed.optimizer_step,
+                    sample_presentations=completed.optimizer_step * 64,
+                    schedule_sha256=schedule.sha256,
+                ),
+                publish=lambda checkpoint: uploader.publish_receipt(checkpoint, timeout_seconds=21600.0),
+                preemption=preemption,
+            )
+        finally:
+            if previous_handler is not None:
+                signal.signal(signal.SIGTERM, previous_handler)
+        payload: dict[str, object] = {
+            "status": "runtime-sweep-preempted" if preemption.requested else "runtime-sweep-complete",
+            "experiment_id": config.experiment_name,
+            "target_step": config.max_steps,
+            "runtime_manifest_sha256": sha256_file(paths["runtime_manifest"]),
+            "selected_loader_workers": selected_workers,
+            "instance_id": request["instance_id"],
+            "resume_checkpoint_step": resume_step,
+            "immutable_checkpoint_publications": [dict(item) for item in publications],
+            "preemption": preemption.status(),
+        }
+        _write_result(outputs["result_output"], payload)
+        atomic_write_json(outputs["status_output"], payload)
+        return payload
+
     def runtime_mixture_train(self, arguments: dict[str, object]) -> dict[str, object]:
         """Launch only the runtime loader path; legacy materialization is forbidden."""
         fields = {
@@ -2053,6 +2602,13 @@ class ProductionRuntime:
         # dataset.  This also verifies the mount receipt and source allowlists.
         from lehome_train.groot.runtime_mixture import load_runtime_contract
         contract = load_runtime_contract(paths["runtime_manifest"], paths["runtime_mounts_descriptor"])
+        sweep_binding = _sweep_overlay_binding(config=config, experiment=experiment)
+        if sweep_binding is not None:
+            return self._runtime_sweep_train(
+                request=request, outputs=outputs, config=config, experiment=experiment,
+                paths=paths, contract=contract, sweep_binding=sweep_binding,
+            )
+        awr_binding = _load_runtime_awr_binding(config=config, contract=contract)
         for key in ("runtime_normalization", "runtime_source_evidence"):
             _load_nonempty_json_artifact(paths[key], f"runtime production {key}")
         # The mounted bytes and direct-GPU lifecycle attestation must agree
@@ -2100,7 +2656,7 @@ class ProductionRuntime:
             config=config, experiment_config=experiment,
             normalization_sha256=sha256_file(paths["runtime_normalization"]), resume_checkpoint=None,
         )
-        checkpoint_transport = self._checkpoint_transport_factory(timeout_seconds=30.0)
+        checkpoint_transport = self._checkpoint_transport_factory(timeout_seconds=21600.0)
         uploader = HubCheckpointUploader(
             repository=repository, revision=revision, experiment_id=config.experiment_name,
             artifact_root=config.output_dir, token=token,
@@ -2113,6 +2669,12 @@ class ProductionRuntime:
         identity = _runtime_checkpoint_identity_from_evidence(
             _load_nonempty_json_artifact(paths["runtime_source_evidence"], "runtime source evidence")
         )
+        _validate_runtime_awr_training_identity(config=config, identity=identity)
+        if awr_binding is not None and awr_binding.checkpoint_identity() != {
+            "awr_evidence_sha256": identity.awr_evidence_sha256,
+            "awr_config_sha256": identity.awr_config_sha256,
+        }:
+            raise ValueError("runtime AWR mounted evidence does not match checkpoint identity")
         if identity.mixture_id != str(contract.manifest.mixture_id):
             raise ValueError("runtime checkpoint source evidence mixture identity disagrees with mounted runtime")
         experiment_manifest_sha256 = getattr(contract.manifest, "experiment_manifest_sha256", None)
@@ -2125,6 +2687,9 @@ class ProductionRuntime:
             "trainer_code_sha256": identity.code_bundle_sha256,
             "trainer_code_revision": identity.code_bundle_revision,
         }
+        if identity.awr_evidence_sha256 is not None:
+            local_identity["awr_evidence_sha256"] = identity.awr_evidence_sha256
+            local_identity["awr_config_sha256"] = identity.awr_config_sha256
         local = discover_local_recovery(metadata_root=local_recovery_root, identity=local_identity)
         hf_descriptor = None if validated_hf_resume is None else validated_hf_resume.descriptor
         hf_anchor = _runtime_resume_anchor_link(
@@ -2236,7 +2801,7 @@ class ProductionRuntime:
         )
         def publish_with_anchor(checkpoint: object) -> dict[str, object]:
             nonlocal previous_anchor
-            raw = uploader.publish_receipt(checkpoint, timeout_seconds=30.0)  # type: ignore[arg-type]
+            raw = uploader.publish_receipt(checkpoint, timeout_seconds=21600.0)  # type: ignore[arg-type]
             verification_root = Path(tempfile.mkdtemp(prefix="runtime-publication-readback-", dir=config.output_dir))
             shutil.rmtree(verification_root)
             try:
@@ -2251,7 +2816,7 @@ class ProductionRuntime:
                 experiment_config_sha256=canonical_json_sha256(experiment), anchor_ref=revision,
                 previous_anchor=previous_anchor,
             )
-            anchor_receipt = uploader.publish_anchor(anchor, timeout_seconds=30.0)
+            anchor_receipt = uploader.publish_anchor(anchor, timeout_seconds=21600.0)
             if anchor_receipt.get("readback_verified") is not True:
                 raise ValueError("runtime checkpoint anchor lacks immutable readback")
             previous_anchor = {

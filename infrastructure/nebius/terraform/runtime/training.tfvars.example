@@ -2,9 +2,11 @@
 # (gitignored) and fill exact ids. ML hyperparameters are NOT passed here;
 # Terraform hands the VM one immutable manifest identity only.
 active_role      = "training"
+nebius_profile   = "profile-REPLACE"
 image_id         = "image-vla-training-base-REPLACE"
 shared_disk_id   = "disk-REPLACE"
 subnet_id        = "vpcsubnet-REPLACE"
 parent_id        = "project-REPLACE"
 manifest_uri     = "hf://datasets/ryanjin333/lehome-groot-n17-data/manifests/lehome-rft-70-30-v1.yaml"
 manifest_sha256  = "REPLACE_64_HEX_DIGEST"
+ssh_public_key   = "ssh-ed25519 AAAA... operator@local"

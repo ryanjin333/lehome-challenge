@@ -14,7 +14,6 @@ require_env() {
   fi
 }
 
-require_env HF_TOKEN
 require_env LEHOME_WORKSPACE
 
 if [ ! -d "${LEHOME_WORKSPACE}" ]; then
@@ -24,16 +23,17 @@ fi
 
 case "${MODE}" in
   supervisor)
-    exec /opt/runtime/bin/python /opt/lehome/scripts/run_groot_rollout_appliance.py "${@:2}"
+    exec /opt/lehome-challenge/.venv/bin/python /opt/lehome/scripts/run_groot_rollout_appliance.py "${@:2}"
     ;;
   controller)
-    exec /opt/runtime/bin/python /opt/lehome/scripts/run_groot_rollout_controller.py "${@:2}"
+    exec /opt/lehome-challenge/.venv/bin/python /opt/lehome/scripts/run_groot_rollout_controller.py "${@:2}"
     ;;
   finalizer)
-    exec /opt/runtime/bin/python /opt/lehome/scripts/run_groot_artifact_sync.py --role finalizer "${@:2}"
+    exec /opt/lehome-challenge/.venv/bin/python /opt/lehome/scripts/run_groot_artifact_sync.py --role finalizer "${@:2}"
     ;;
   uploader)
-    exec /opt/runtime/bin/python /opt/lehome/scripts/run_groot_artifact_sync.py --role uploader "${@:2}"
+    token_file="${LEHOME_HF_TOKEN_FILE:-${LEHOME_WORKSPACE}/secrets/hf_token}"
+    exec /opt/lehome-challenge/.venv/bin/python /opt/lehome/scripts/run_groot_artifact_sync.py --role uploader --token-file "${token_file}" "${@:2}"
     ;;
   *)
     echo "entrypoint: unknown mode ${MODE}" >&2

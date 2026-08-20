@@ -183,3 +183,28 @@ def test_response_validation_rejects_stale_generation_and_deadline() -> None:
         )
     with pytest.raises(protocol.ExpiredRequestError):
         protocol.validate_response_for_request(response, request, now_ns=request.deadline_ns)
+
+
+def test_guard_treats_identical_reset_identity_as_idempotent_reattachment() -> None:
+    from lehome.flywheel import policy_protocol as protocol
+
+    guard = protocol.SessionRequestGuard(policy_sha256="a" * 64)
+    reset = protocol.PolicyRequest.reset(
+        session_id="worker-0",
+        episode_generation=1,
+        request_id="reset-1",
+        policy_sha256="a" * 64,
+        deadline_ns=2_000,
+    )
+    guard.accept(reset, now_ns=1_000)
+    guard.accept(reset, now_ns=1_000)
+    infer = protocol.PolicyRequest.infer(
+        session_id="worker-0",
+        episode_generation=1,
+        request_id="infer-1",
+        policy_sha256="a" * 64,
+        deadline_ns=2_000,
+        observation={"state": [0.0] * 12},
+    )
+    guard.accept(infer, now_ns=1_000)
+    assert guard.is_request_live(infer, now_ns=1_000) is True

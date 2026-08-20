@@ -344,6 +344,35 @@ def test_runtime_checkpoint_binding_rejects_symlinked_resume_ancestry(
         chunk_launch._runtime_checkpoint_binding(["--"], official, num_gpus=1)
 
 
+@pytest.mark.parametrize(("parent_step", "target_step"), ((500, 1000), (1000, 2000)))
+def test_runtime_checkpoint_binding_accepts_a_private_promoted_sweep_parent(
+    tmp_path: Path, parent_step: int, target_step: int,
+) -> None:
+    """The Trainer receives the parent global step, not a model-only reset."""
+    output = tmp_path / "output"
+    checkpoint = (
+        output / f".runtime-sweep-parent-{parent_step}-deadbeefdeadbeef"
+        / "run" / f"checkpoint-{parent_step}"
+    )
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps({"global_step": parent_step}), encoding="utf-8",
+    )
+    official = [
+        "--output-dir", str(output), "--experiment-name", "run",
+        "--num-gpus", "1", "--global-batch-size", "64",
+        "--max-steps", str(target_step),
+        "--resume-from-checkpoint", str(checkpoint),
+    ]
+
+    start_step, batch, selected = chunk_launch._runtime_checkpoint_binding(
+        ["--"], official, num_gpus=1,
+    )
+
+    assert (start_step, batch, selected) == (parent_step, 64, checkpoint)
+    assert target_step - start_step in (500, 1000)
+
+
 @pytest.mark.parametrize("experiment", (".", ".."))
 def test_runtime_checkpoint_binding_rejects_non_component_experiment_direct_bypass(
     tmp_path: Path, experiment: str,

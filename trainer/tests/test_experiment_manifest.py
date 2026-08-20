@@ -22,7 +22,7 @@ def _manifest(*, bc: int = 70, rollout: int = 30) -> dict[str, object]:
             "artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
         },
         "bc_bundle": {"repository": "ryanjin333/lehome-groot-n17-data", "revision": revision, "prefix": "bc/full", "tree_sha256": digest, "manifest_sha256": digest, "garment_index_path": "garment-index.json", "garment_index_sha256": digest},
-        "rollout_bundle": {"repository": "ryanjin333/lehome-groot-n17-data", "revision": "c" * 40, "prefix": "rollouts/round-1", "tree_sha256": digest, "manifest_sha256": digest},
+        "rollout_bundle": {"repository": "ryanjin333/lehome-groot-n17-rollouts", "revision": "c" * 40, "prefix": "rollouts/round-1", "tree_sha256": digest, "manifest_sha256": digest},
         "mixture_manifest_sha256": digest,
         "lineage": {"train_sha256": digest, "validation_sha256": "d" * 64},
         "mixture_weights": {"bc": bc, "rollout": rollout, "dagger": 0},
@@ -60,6 +60,51 @@ def test_manifest_change_to_80_20_changes_identity_and_derives_batch64_schedule(
 
     assert changed.quotas == {"bc": 51, "rollout": 13, "dagger": 0}
     assert original.identity_sha256 != changed.identity_sha256
+
+
+def test_manifest_accepts_a_fresh_immutable_rollout_round_prefix(tmp_path: Path) -> None:
+    from lehome_train.groot.experiment_manifest import load_experiment_manifest
+
+    value = _manifest()
+    value["rollout_bundle"]["prefix"] = "rollouts/round-2"  # type: ignore[index]
+    path = tmp_path / "experiment.json"
+    _write(path, value)
+
+    assert load_experiment_manifest(path).rollout_bundle.prefix == "rollouts/round-2"
+
+
+@pytest.mark.parametrize(
+    ("weights", "quotas"),
+    [
+        ({"bc": 100, "rollout": 0, "dagger": 0}, {"bc": 64, "rollout": 0, "dagger": 0}),
+        ({"bc": 95, "rollout": 5, "dagger": 0}, {"bc": 61, "rollout": 3, "dagger": 0}),
+        ({"bc": 90, "rollout": 10, "dagger": 0}, {"bc": 58, "rollout": 6, "dagger": 0}),
+        ({"bc": 85, "rollout": 15, "dagger": 0}, {"bc": 54, "rollout": 10, "dagger": 0}),
+        ({"bc": 80, "rollout": 20, "dagger": 0}, {"bc": 51, "rollout": 13, "dagger": 0}),
+        ({"bc": 70, "rollout": 30, "dagger": 0}, {"bc": 45, "rollout": 19, "dagger": 0}),
+    ],
+)
+def test_batch64_sweep_profiles_include_the_bc_control(
+    weights: dict[str, int], quotas: dict[str, int]
+) -> None:
+    from lehome_train.groot.experiment_manifest import batch64_quotas
+
+    assert batch64_quotas(weights) == quotas
+
+
+@pytest.mark.parametrize("target_step", [500, 1000, 2000])
+def test_sweep_runtime_profile_accepts_only_exact_rungs(tmp_path: Path, target_step: int) -> None:
+    from lehome_train.groot.experiment_manifest import load_sweep_runtime_profile
+
+    document = {
+        "schema_version": 1,
+        "kind": "lehome_sweep_runtime_profile",
+        "mixture_weights": {"bc": 100, "rollout": 0, "dagger": 0},
+        "training": {"action_horizon": 16, "global_batch_size": 64, "target_step": target_step, "save_steps": 500, "terminal_publish": True},
+    }
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    assert load_sweep_runtime_profile(path).target_step == target_step
 
 
 @pytest.mark.parametrize("mutation", ["float", "dagger", "heldout", "unsafe-prefix", "duplicate"])

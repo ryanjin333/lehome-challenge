@@ -105,6 +105,30 @@ def test_failed_episode_is_rejected(tmp_path, ledger):
     assert not (run_root / "accepted" / attempt_id).exists()
 
 
+def test_evaluation_only_preserves_success_and_failure_as_non_bundle_terminal_artifacts(tmp_path, ledger):
+    run_root = tmp_path / "run"
+    queue = _queue(tmp_path, ledger, evaluation_only=True)
+    success = handoff_terminal(ledger, run_root, attempt_index=0, success=True)
+    failure = handoff_terminal(ledger, run_root, attempt_index=1, success=False)
+    for handoff in (success, failure):
+        queue.enqueue(*handoff[:3], handoff[3])
+
+    successful_result = queue.finalize_next()
+    failed_result = queue.finalize_next()
+
+    assert successful_result is not None and successful_result.outcome == "accepted"
+    assert failed_result is not None and failed_result.outcome == "rejected"
+    assert ledger.status(success[1]) == "accepted"
+    assert ledger.status(failure[1]) == "rejected"
+    for attempt_id in (success[1], failure[1]):
+        terminal = run_root / "evaluation-terminal" / attempt_id
+        assert (terminal / "worker-receipt.json").is_file()
+        assert (terminal / "SHA256SUMS.json").is_file()
+    assert not (run_root / "accepted").exists()
+    assert failed_result.accepted_dir is None
+    assert failed_result.terminal_dir == run_root / "evaluation-terminal" / failure[1]
+
+
 def test_empty_video_file_is_rejected(tmp_path, ledger):
     run_root = tmp_path / "run"
     queue = _queue(tmp_path, ledger)
@@ -163,6 +187,54 @@ def test_duplicate_enqueue_for_same_attempt_is_refused(tmp_path, ledger):
     queue.enqueue(*handoff[:3], handoff[3])
     with pytest.raises(ValueError, match="already pending"):
         queue.enqueue(*handoff[:3], handoff[3])
+
+
+def test_concurrent_successes_never_exceed_the_accepted_target(tmp_path) -> None:
+    matrix = (
+        {"episode": "episode-001", "category": "top-long"},
+        {"episode": "episode-002", "category": "top-long"},
+    )
+    ledger = TaskLedger(tmp_path / "cap.db", attempt_matrix=matrix, max_attempts=2, target_accepted=1)
+    run_root = tmp_path / "run"
+    queue = ArtifactFinalizationQueue(
+        run_root=run_root, ledger=ledger, max_pending_items=2, max_pending_bytes=1 << 30,
+    )
+    first = handoff_terminal(ledger, run_root, attempt_index=0)
+    second = handoff_terminal(ledger, run_root, attempt_index=1)
+    queue.enqueue(*first[:3], first[3])
+    queue.enqueue(*second[:3], second[3])
+
+    first_result = queue.finalize_next()
+    second_result = queue.finalize_next()
+
+    assert first_result is not None and first_result.outcome == "accepted"
+    assert second_result is not None and second_result.outcome == "rejected"
+    assert second_result.reason == "accepted episode target already reached"
+    assert len(tuple((run_root / "accepted").iterdir())) == 1
+    assert second[3].is_dir()
+    ledger.close()
+
+
+def test_controlled_matrix_category_cap_rejects_extra_successes_while_legacy_is_unchanged(tmp_path) -> None:
+    matrix = (
+        {"episode": "episode-001", "category": "top_long", "recovery_kind": "controlled_success_recovery_v1", "category_acceptance_cap": 1},
+        {"episode": "episode-002", "category": "top_long", "recovery_kind": "controlled_success_recovery_v1", "category_acceptance_cap": 1},
+        {"episode": "episode-003", "category": "pant_short"},
+    )
+    ledger = TaskLedger(tmp_path / "caps.db", attempt_matrix=matrix, max_attempts=3, target_accepted=3)
+    run_root = tmp_path / "run"
+    queue = ArtifactFinalizationQueue(run_root=run_root, ledger=ledger, max_pending_items=3, max_pending_bytes=1 << 30)
+    first = handoff_terminal(ledger, run_root, attempt_index=0)
+    second = handoff_terminal(ledger, run_root, attempt_index=1)
+    legacy = handoff_terminal(ledger, run_root, attempt_index=2)
+    for handoff in (first, second, legacy):
+        queue.enqueue(*handoff[:3], handoff[3])
+    assert queue.finalize_next().outcome == "accepted"
+    rejected = queue.finalize_next()
+    assert rejected.outcome == "rejected"
+    assert rejected.reason == "controlled recovery category acceptance cap already reached"
+    assert queue.finalize_next().outcome == "accepted"
+    ledger.close()
 
 
 def test_enqueue_rejects_artifact_outside_run_root(tmp_path, ledger):

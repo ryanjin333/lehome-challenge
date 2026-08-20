@@ -184,6 +184,18 @@ class TaskLedger:
         with self._lock:
             return self._state_for_attempt(attempt_id).status
 
+    def accepted_count(self) -> int:
+        """Return the durable accepted total for finalizer admission."""
+
+        with self._lock:
+            return self._accepted_count()
+
+    def target_accepted(self) -> int:
+        """Return the immutable accepted-episode campaign cap."""
+
+        with self._lock:
+            return self._target_accepted()
+
     def lease_next(self, worker_id: str, *, lease_duration_ns: int) -> Lease | None:
         """Give a free worker the earliest retryable/pending schedule entry."""
 
@@ -253,6 +265,66 @@ class TaskLedger:
                 payload={"reason": "worker_interrupted"}, at_ns=now_ns,
             )
             return "retryable"
+
+    def reject_attempt(self, worker_id: str, attempt_id: str, lease_id: str, *, reason: str) -> str:
+        """Close a leased attempt as rejected so a restore failure cannot retry-storm."""
+
+        worker_id = _require_identifier(worker_id, field="worker_id")
+        attempt_id = _require_identifier(attempt_id, field="attempt_id")
+        lease_id = _require_identifier(lease_id, field="lease_id")
+        reason = _require_identifier(reason, field="reason")
+        with self._write():
+            now_ns = self._now()
+            self._expire_leases(now_ns)
+            state = self._state_for_attempt(attempt_id)
+            self._require_active_lease(state, worker_id, lease_id)
+            self._append_event(
+                "interrupted", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
+                payload={"reason": reason}, at_ns=now_ns,
+            )
+            self._append_event(
+                "terminal_pending_validation", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
+                payload={"raw_artifact_id": f"rejected:{reason}", "reason": reason}, at_ns=now_ns,
+            )
+            self._append_event(
+                "rejected", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
+                payload={"reason": reason}, at_ns=now_ns,
+            )
+            return "rejected"
+
+    def record_infrastructure_abort(
+        self, worker_id: str, attempt_id: str, lease_id: str, *, reason: str,
+    ) -> str:
+        """Atomically quarantine a leased attempt as an infrastructure failure.
+
+        This is intentionally distinct from a policy/data ``rejected`` result:
+        a native Isaac preparation timeout means the rollout is invalid, not a
+        failed action sequence.  All three events commit in one transaction so
+        an abrupt isolated-worker exit cannot leave a retryable lease behind.
+        """
+
+        worker_id = _require_identifier(worker_id, field="worker_id")
+        attempt_id = _require_identifier(attempt_id, field="attempt_id")
+        lease_id = _require_identifier(lease_id, field="lease_id")
+        reason = _require_identifier(reason, field="reason")
+        with self._write():
+            now_ns = self._now()
+            self._expire_leases(now_ns)
+            state = self._state_for_attempt(attempt_id)
+            self._require_active_lease(state, worker_id, lease_id)
+            self._append_event(
+                "interrupted", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
+                payload={"reason": reason}, at_ns=now_ns,
+            )
+            self._append_event(
+                "terminal_pending_validation", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
+                payload={"raw_artifact_id": f"infrastructure_abort:{reason}", "reason": reason}, at_ns=now_ns,
+            )
+            self._append_event(
+                "infrastructure_abort", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
+                payload={"reason": reason}, at_ns=now_ns,
+            )
+            return "infrastructure_abort"
 
     def record_terminal(self, worker_id: str, attempt_id: str, lease_id: str, raw_artifact_id: str) -> str:
         """Close worker execution before asynchronous validation begins."""

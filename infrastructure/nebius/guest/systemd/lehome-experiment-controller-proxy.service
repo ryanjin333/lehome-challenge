@@ -1,0 +1,24 @@
+[Unit]
+Description=LeHome private TLS proxy for the experiment controller
+After=network-online.target
+Wants=network-online.target
+Before=lehome-experiment-controller.service
+ConditionPathExists=/etc/lehome/experiment-bootstrap.ready
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/nginx -t -c /etc/lehome/nginx-experiment-controller.conf
+ExecStart=/usr/sbin/nginx -c /etc/lehome/nginx-experiment-controller.conf -g "daemon off;"
+ExecReload=/usr/sbin/nginx -c /etc/lehome/nginx-experiment-controller.conf -s reload
+ExecStop=/usr/sbin/nginx -c /etc/lehome/nginx-experiment-controller.conf -s quit
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=mixed
+PrivateTmp=true
+RuntimeDirectory=lehome-controller-proxy
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+
+[Install]
+RequiredBy=lehome-experiment-controller.service

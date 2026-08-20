@@ -370,3 +370,76 @@ def test_attempt_table_insert_trigger_blocks_external_schedule_injection_after_b
         assert lease.attempt.attempt_id != "f" * 64
     finally:
         ledger.close()
+
+
+def test_reject_attempt_does_not_remain_retryable(ledger) -> None:
+    lease = ledger.lease_next("worker-a", lease_duration_ns=100)
+    assert lease is not None
+    assert ledger.reject_attempt("worker-a", lease.attempt.attempt_id, lease.lease_id, reason="ValueError") == "rejected"
+    assert ledger.status(lease.attempt.attempt_id) == "rejected"
+    next_lease = ledger.lease_next("worker-b", lease_duration_ns=100)
+    assert next_lease is not None
+    assert next_lease.attempt.attempt_id != lease.attempt.attempt_id
+    # rejected attempt itself must not be leased again
+    statuses = [ledger.status(attempt.attempt_id) for attempt in ledger.attempts() if attempt.attempt_id == lease.attempt.attempt_id]
+    assert statuses == ["rejected"]
+
+
+def test_preparation_timeout_is_an_atomic_distinct_infrastructure_abort_across_reopen(tmp_path) -> None:
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    database = tmp_path / "infrastructure-abort.sqlite3"
+    first = TaskLedger(database, attempt_matrix=_matrix(2), max_attempts=2, target_accepted=1, clock_ns=lambda: 1)
+    try:
+        lease = first.lease_next("worker-a", lease_duration_ns=100)
+        assert lease is not None
+        assert first.record_infrastructure_abort(
+            "worker-a", lease.attempt.attempt_id, lease.lease_id, reason="preparation_timeout",
+        ) == "infrastructure_abort"
+        assert first.status(lease.attempt.attempt_id) == "infrastructure_abort"
+        assert [event.event_type for event in first.events(lease.attempt.attempt_id)] == [
+            "leased", "interrupted", "terminal_pending_validation", "infrastructure_abort",
+        ]
+        audit = first.audit_connection()
+        try:
+            rows = audit.execute(
+                "SELECT event_type, payload_json FROM events WHERE attempt_id = ? ORDER BY event_id",
+                (lease.attempt.attempt_id,),
+            ).fetchall()
+            assert [row["event_type"] for row in rows][-1] == "infrastructure_abort"
+            assert "preparation_timeout" in rows[-1]["payload_json"]
+        finally:
+            audit.close()
+    finally:
+        first.close()
+
+    reopened = TaskLedger(database, attempt_matrix=_matrix(2), max_attempts=2, target_accepted=1, clock_ns=lambda: 1)
+    try:
+        assert reopened.status(lease.attempt.attempt_id) == "infrastructure_abort"
+        next_lease = reopened.lease_next("worker-b", lease_duration_ns=100)
+        assert next_lease is not None
+        assert next_lease.attempt.attempt_id != lease.attempt.attempt_id
+    finally:
+        reopened.close()
+
+
+def test_an_active_broken_first_attempt_cannot_retry_storm_or_starve_later_rows(tmp_path) -> None:
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    ledger = TaskLedger(
+        tmp_path / "broken-first.sqlite3", attempt_matrix=_matrix(2), max_attempts=2, target_accepted=2,
+        clock_ns=lambda: 1,
+    )
+    try:
+        broken = ledger.lease_next("worker-a", lease_duration_ns=100)
+        assert broken is not None
+        # A worker that re-raises a deterministic execution failure leaves its
+        # lease active for bounded supervisor handling; it must not append a
+        # retryable transition that repeatedly wins earliest-row selection.
+        later = ledger.lease_next("worker-b", lease_duration_ns=100)
+        assert later is not None
+        assert later.attempt.schedule_index == 1
+        assert [event.event_type for event in ledger.events(broken.attempt.attempt_id)] == ["leased"]
+        assert len([event for event in ledger.events() if event.event_type == "leased"]) == 2
+    finally:
+        ledger.close()

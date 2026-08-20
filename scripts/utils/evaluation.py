@@ -1,6 +1,9 @@
 import os
 import argparse
+import hashlib
 import json
+import re
+import stat
 import gymnasium as gym
 import torch
 import numpy as np
@@ -28,6 +31,13 @@ from .common import stabilize_garment_after_reset
 from lehome.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_LOWERCASE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_DEFAULT_POLICY_REPO = "ryanjin333/lehome-groot-n17-models"
+_DEFAULT_POLICY_REVISION = "30ac1a84da67b099e115ad147bcd61e9d60046d3"
+_DEFAULT_POLICY_STEP = 12000
+_DEFAULT_POLICY_ARTIFACT_SHA256 = "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"
 
 
 def _load_flywheel_manifest(path_value: str | None) -> dict[str, object] | None:
@@ -84,6 +94,203 @@ def _validate_active_flywheel_garment(env: DirectRLEnv, identity) -> None:
         raise ValueError("active environment garment does not match immutable flywheel identity")
 
 
+
+
+def _persistent_assignment_is_complete(assignment: Mapping[str, Any]) -> bool:
+    garment = assignment.get("garment", assignment.get("garment_name"))
+    seed = assignment.get("seed")
+    category = assignment.get("category")
+    attempt_id = assignment.get("attempt_id") or assignment.get("trial_id")
+    return (
+        isinstance(garment, str) and bool(garment)
+        and isinstance(seed, int) and not isinstance(seed, bool) and seed >= 0
+        and isinstance(category, str) and bool(category)
+        and isinstance(attempt_id, str) and bool(attempt_id)
+    )
+
+
+def _persistent_collection_strategy(assignment: Mapping[str, Any]) -> str:
+    """Resolve the recorded strategy without enabling unstable material edits."""
+
+    explicit = assignment.get("strategy")
+    if explicit is None:
+        return "mild_geometry" if assignment.get("difficulty") == "randomized" else "canonical"
+    if explicit in {"mild", "strong"}:
+        raise ValueError("persistent collection only supports geometry-only randomization")
+    if explicit not in {"canonical", "mild_geometry", "strong_geometry"}:
+        raise ValueError("persistent collection has an unsupported randomization strategy")
+    return str(explicit)
+
+
+def _persistent_policy_identity(args: argparse.Namespace) -> tuple[str, str, int, str]:
+    """Validate the exact checkpoint identity served to this worker."""
+
+    repository = getattr(args, "policy_repo", _DEFAULT_POLICY_REPO)
+    revision = getattr(args, "policy_revision", _DEFAULT_POLICY_REVISION)
+    step = getattr(args, "policy_step", _DEFAULT_POLICY_STEP)
+    artifact_sha256 = getattr(
+        args, "policy_artifact_sha256", _DEFAULT_POLICY_ARTIFACT_SHA256,
+    )
+    if not isinstance(repository, str) or not repository or any(character.isspace() for character in repository):
+        raise ValueError("persistent policy repository is invalid")
+    if not isinstance(revision, str) or _LOWERCASE_COMMIT.fullmatch(revision) is None:
+        raise ValueError("persistent policy revision must be an immutable commit")
+    if type(step) is not int or step <= 0:
+        raise ValueError("persistent policy step must be a positive integer")
+    if not isinstance(artifact_sha256, str) or _LOWERCASE_SHA256.fullmatch(artifact_sha256) is None:
+        raise ValueError("persistent policy artifact SHA-256 is invalid")
+    return repository, revision, step, artifact_sha256
+
+
+def _verified_restore_assignment(
+    assignment: Mapping[str, Any],
+) -> tuple[object | None, dict[str, object] | None]:
+    """Read a digest-bound replay reset once, before Isaac can restore it."""
+
+    restore = assignment.get("restore_snapshot") or assignment.get("hard_state_snapshot")
+    expected = assignment.get("restore_snapshot_sha256")
+    replay_kind = assignment.get("replay_kind")
+    verification_required = replay_kind == "verified_success_reset_v1" or expected is not None
+    if not verification_required:
+        return restore, None
+    if not isinstance(restore, (str, Path)):
+        raise ValueError("verified replay restore snapshot must be an absolute regular file")
+    path = Path(restore)
+    if not path.is_absolute() or path.is_symlink():
+        raise ValueError("verified replay restore snapshot must be an absolute regular file")
+    try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise ValueError("verified replay restore snapshot must be an absolute regular file")
+        payload_bytes = path.read_bytes()
+    except OSError as error:
+        raise ValueError("verified replay restore snapshot must be an absolute regular file") from error
+    if not isinstance(expected, str) or _LOWERCASE_SHA256.fullmatch(expected) is None:
+        raise ValueError("verified replay restore snapshot requires a lowercase SHA-256")
+    if hashlib.sha256(payload_bytes).hexdigest() != expected:
+        raise ValueError("verified replay restore snapshot SHA-256 mismatch")
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("verified replay restore snapshot must contain JSON") from error
+    if not isinstance(payload, dict):
+        raise ValueError("verified replay restore snapshot must contain a JSON object")
+    lineage = {
+        key: assignment.get(key)
+        for key in ("parent_episode_id", "lineage_id", "replay_kind")
+        if assignment.get(key) is not None
+    }
+    if replay_kind == "verified_success_reset_v1":
+        if (
+            not isinstance(lineage.get("parent_episode_id"), str)
+            or not lineage["parent_episode_id"]
+            or not isinstance(lineage.get("lineage_id"), str)
+            or lineage["lineage_id"] != lineage["parent_episode_id"]
+        ):
+            raise ValueError("verified success replay requires matching parent and lineage IDs")
+    return payload, {
+        "restore_snapshot": str(path),
+        "restore_snapshot_sha256": expected,
+        **lineage,
+    }
+
+
+def _write_persistent_flywheel_manifest(
+    attempt_output_dir: Path,
+    assignment: Mapping[str, Any],
+    args: argparse.Namespace,
+    *,
+    verified_restore: Mapping[str, object] | None = None,
+) -> Path:
+    """Author one attempt-scoped autonomous recorder contract for persistent collection."""
+
+    from lehome.flywheel.artifacts import atomic_write_json
+    from lehome.flywheel.models import EpisodeIdentity
+
+    garment = assignment.get("garment", assignment.get("garment_name"))
+    seed = assignment.get("seed")
+    category = assignment.get("category")
+    release_stage = assignment.get("release_stage", "seen")
+    attempt_id = assignment.get("attempt_id") or assignment.get("trial_id")
+    if not isinstance(garment, str) or not garment:
+        raise ValueError("persistent flywheel assignment requires a garment")
+    if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+        raise ValueError("persistent flywheel assignment requires a non-negative seed")
+    if not isinstance(category, str) or not category:
+        raise ValueError("persistent flywheel assignment requires a category")
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise ValueError("persistent flywheel assignment requires an attempt id")
+    policy_repo, policy_revision, policy_step, policy_artifact_sha256 = _persistent_policy_identity(args)
+    # The material path remains disabled on this Isaac build because its USD
+    # displayColor readback is unstable. Geometry-only profiles retain strict
+    # readback while varying the scene properties that transfer to unseen tops.
+    strategy = _persistent_collection_strategy(assignment)
+    identity = EpisodeIdentity(
+        episode_id=attempt_id,
+        policy_repo=policy_repo,
+        policy_revision=policy_revision,
+        policy_step=policy_step,
+        code_revision="61e60d18dcda662b144d1cc0fb05fa2beec82033",
+        asset_revision="bea65fd960ad5a1bb3bd3fa77164b28001c08ef9",
+        simulator_version="5.1.0.0",
+        garment_name=garment,
+        category=category,
+        release_stage=str(release_stage),
+        seed=seed,
+        instruction="fold the garment on the table",
+        strategy=strategy,
+    )
+    path = attempt_output_dir / "flywheel-manifest.json"
+    payload = {
+        "schema_version": 1,
+        "policy_revision": identity.policy_revision,
+        "seed": identity.seed,
+        "garment": identity.garment_name,
+        "strategy": identity.strategy,
+        "episode_id": identity.episode_id,
+        "identity": {
+            "episode_id": identity.episode_id,
+            "policy_repo": identity.policy_repo,
+            "policy_revision": identity.policy_revision,
+            "policy_step": identity.policy_step,
+            "code_revision": identity.code_revision,
+            "asset_revision": identity.asset_revision,
+            "simulator_version": identity.simulator_version,
+            "garment_name": identity.garment_name,
+            "category": identity.category,
+            "release_stage": identity.release_stage,
+            "seed": identity.seed,
+            "instruction": identity.instruction,
+            "strategy": identity.strategy,
+        },
+        "policy_artifact_sha256": policy_artifact_sha256,
+        "image_identity": "sha256:afb35941768cabfe2f18173df27190b78a5b3044fbbbe71c3029539ffbc821d7",
+        "execution_mode": "policy_server",
+        "execution_backend": "policy_server",
+        "simulator_device": "cpu",
+        "policy_device": str(getattr(args, "policy_device", "cuda:0")),
+        "parity_stage": "persistent_collection",
+    }
+    if verified_restore is not None:
+        payload.update(verified_restore)
+    if assignment.get("recovery_kind") == "controlled_success_recovery_v1":
+        controlled_keys = {
+            "recovery_kind", "category", "garment", "source_round_id", "source_episode_id", "source_episode_digest",
+            "source_immutable_revision", "source_reset", "source_reset_sha256",
+            "source_annotations", "source_annotations_sha256", "source_first_success_step",
+            "prefix_stop", "action_prefix_sha256", "perturbation_profile",
+            "perturbation_seed", "source_continuation_state", "source_state_fingerprint", "perturbation_fingerprint",
+            "source_state_perturbation_fingerprint", "category_acceptance_cap",
+            "controlled_smoke", "controlled_smoke_teacher_probe",
+        }
+        payload["controlled_recovery"] = {
+            key: assignment[key] for key in controlled_keys if key in assignment
+        }
+    attempt_output_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, payload)
+    return path
+
+
+
 class EvaluationSession:
     """One reusable environment/policy pair for sequential assigned episodes.
 
@@ -119,44 +326,81 @@ class EvaluationSession:
         simulation_device = str(getattr(self.env, "device", getattr(self.args, "device", ""))).lower()
         if simulation_device != "cpu":
             raise ValueError("persistent evaluation requires an environment running CPU cloth simulation")
-        observed_devices = getattr(self.env, "flywheel_runtime_devices", None)
-        observed_devices = observed_devices() if callable(observed_devices) else None
-        if not isinstance(observed_devices, Mapping):
-            observed_devices = {
-                "renderer_device": getattr(self.env, "renderer_device", None),
-                "camera_device": getattr(self.env, "camera_device", None),
-            }
+        # Prefer already-known env/args devices at startup. Query Kit
+        # /renderer/activeGpu only after the first reset, when other workers
+        # are not still owning the GPU startup path.
+        observed_devices = {
+            "renderer_device": getattr(self.env, "renderer_device", None) or getattr(self.args, "renderer_device", None),
+            "camera_device": getattr(self.env, "camera_device", None) or getattr(self.args, "camera_device", None),
+        }
+        if getattr(self, "_include_live_runtime_evidence", False):
+            live = getattr(self.env, "flywheel_runtime_devices", None)
+            live = live() if callable(live) else None
+            if isinstance(live, Mapping):
+                observed_devices = live
         renderer_device = str(observed_devices.get("renderer_device") or "")
         camera_device = str(observed_devices.get("camera_device") or "")
         if not renderer_device or not camera_device:
             raise ValueError("persistent evaluation cannot determine renderer/camera device")
         backend = getattr(self.env, "_flywheel_cloth_backend", None)
-        readback = getattr(self.env, "_flywheel_cpu_cloth_state", None)
-        canary = getattr(self.env, "flywheel_visible_garment_contact", None)
-        if not callable(backend) or not callable(readback) or not callable(canary):
-            raise ValueError("persistent evaluation cannot observe CPU cloth/contact canary")
+        if not callable(backend):
+            raise ValueError("persistent evaluation cannot observe CPU cloth backend")
         if backend() != "usd":
             raise ValueError("persistent evaluation requires observed USD CPU cloth backend")
-        positions, velocities = readback()
-        try:
-            position_count, velocity_count = len(positions), len(velocities)
-        except TypeError as error:
-            raise ValueError("persistent evaluation CPU cloth readback is unavailable") from error
-        if position_count <= 0 or velocity_count <= 0 or position_count != velocity_count:
-            raise ValueError("persistent evaluation CPU cloth readback is invalid")
-        contact = canary()
-        if not isinstance(contact, Mapping) or not isinstance(contact.get("observed"), bool):
-            raise ValueError("persistent evaluation visible-contact canary is unavailable")
-        return {
+        receipt = {
             "simulation_device": simulation_device,
             "cloth_device": simulation_device,
             "cloth_backend": backend(),
-            "cloth_readback": {"positions": position_count, "velocities": velocity_count},
-            "visible_contact_canary": dict(contact),
             "renderer_device": renderer_device,
             "camera_device": camera_device,
             "policy_device": str(getattr(self.policy, "runtime_device", "")),
         }
+        # Startup admission must not touch USD points or camera RGB while other
+        # Isaac workers already own the GPU. Live cloth/contact evidence is
+        # collected only after the first reset.
+        if getattr(self, "_include_live_runtime_evidence", False):
+            readback = getattr(self.env, "_flywheel_cpu_cloth_state", None)
+            if not callable(readback):
+                raise ValueError("persistent evaluation cannot observe CPU cloth readback")
+            positions, velocities = readback()
+            try:
+                position_count, velocity_count = len(positions), len(velocities)
+            except TypeError as error:
+                raise ValueError("persistent evaluation CPU cloth readback is unavailable") from error
+            if position_count <= 0 or velocity_count <= 0 or position_count != velocity_count:
+                raise ValueError("persistent evaluation CPU cloth readback is invalid")
+            receipt["cloth_readback"] = {"positions": position_count, "velocities": velocity_count}
+        if getattr(self, "_include_contact_canary", False):
+            canary = getattr(self.env, "flywheel_visible_garment_contact", None)
+            if not callable(canary):
+                raise ValueError("persistent evaluation cannot observe visible-contact canary")
+            contact = canary()
+            if not isinstance(contact, Mapping) or not isinstance(contact.get("observed"), bool):
+                raise ValueError("persistent evaluation visible-contact canary is unavailable")
+            receipt["visible_contact_canary"] = dict(contact)
+        return receipt
+
+
+    def restore_hard_state(self, payload: Mapping[str, Any] | str | Path) -> None:
+        """Restore a failed-episode terminal snapshot after garment/policy reset."""
+
+        from lehome.flywheel.snapshots import Snapshot, restore_snapshot
+
+        if not isinstance(payload, Mapping):
+            path = Path(payload)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        snapshot = Snapshot(
+            schema_version=int(payload["schema_version"]),
+            robot_position=tuple(payload["robot_position"]),
+            robot_velocity=tuple(payload["robot_velocity"]),
+            cloth_position=tuple(tuple(point) for point in payload["cloth_position"]),
+            cloth_velocity=tuple(tuple(point) for point in payload["cloth_velocity"]),
+            rng_state=dict(payload["rng_state"]),
+            garment_name=str(payload["garment_name"]),
+            randomization=dict(payload.get("randomization") or {}),
+            scene_state=dict(payload.get("scene_state") or {}),
+        )
+        restore_snapshot(self.env, snapshot)
 
     def prepare_episode(
         self,
@@ -219,6 +463,9 @@ class EvaluationSession:
         garment_name = assignment.get("garment", assignment.get("garment_name"))
         if not isinstance(garment_name, str) or not garment_name:
             raise ValueError("assignment requires garment")
+        restore, verified_restore = _verified_restore_assignment(assignment)
+        if restore is not None:
+            self._pending_restore_snapshot = restore
         # The persistent launcher uses a transparent proxy while it lazily
         # binds its policy client to the one freshly-created Isaac session.
         # Actual inference always remains on ``self.policy``.
@@ -234,11 +481,30 @@ class EvaluationSession:
             episode_args.video_dir = str(attempt_output_dir / "videos")
             episode_args.eval_dataset_path = str(attempt_output_dir / "dataset")
             episode_args.persistent_output_dir = str(attempt_output_dir)
+            if getattr(episode_args, "flywheel_manifest", None) is None:
+                if _persistent_assignment_is_complete(assignment):
+                    episode_args.flywheel_manifest = str(
+                        _write_persistent_flywheel_manifest(
+                            attempt_output_dir,
+                            assignment,
+                            episode_args,
+                            verified_restore=verified_restore,
+                        )
+                    )
+        if getattr(self, "_pending_restore_snapshot", None) is not None:
+            episode_args.restore_snapshot = self._pending_restore_snapshot
+            self._pending_restore_snapshot = None
         metrics = run_evaluation_loop(
             env=self.env, policy=self.policy, args=episode_args, ee_solver=self.ee_solver,
             is_bimanual=self.is_bimanual, garment_name=garment_name, reset_policy=reset_policy,
             cancellation_event=cancellation_event,
         )
+        if attempt_output_dir is not None:
+            # The persistent worker validates this property immediately after
+            # the episode. Only then is it safe and meaningful to touch live
+            # USD cloth arrays, camera ownership, and the contact canary.
+            self._include_live_runtime_evidence = True
+            self._include_contact_canary = True
         return {
             "metrics": metrics,
             "success": bool(metrics and metrics[-1].get("success", False)),
@@ -339,13 +605,29 @@ def run_evaluation_loop(
     for i in range(args.num_episodes):
         # 1. Reset Environment & Policy
         env.reset()
-        if reset_policy:
-            policy.reset()
         stabilize_garment_after_reset(env, args)
+        restore = getattr(args, "restore_snapshot", None)
+        if restore is not None:
+            from lehome.flywheel.snapshots import Snapshot, restore_snapshot
+            payload = restore if isinstance(restore, Mapping) else json.loads(Path(restore).read_text(encoding="utf-8"))
+            snapshot = Snapshot(
+                schema_version=int(payload["schema_version"]),
+                robot_position=tuple(payload["robot_position"]),
+                robot_velocity=tuple(payload["robot_velocity"]),
+                cloth_position=tuple(tuple(point) for point in payload["cloth_position"]),
+                cloth_velocity=tuple(tuple(point) for point in payload["cloth_velocity"]),
+                rng_state=dict(payload["rng_state"]),
+                garment_name=str(payload["garment_name"]),
+                randomization=dict(payload.get("randomization") or {}),
+                scene_state=dict(payload.get("scene_state") or {}),
+            )
+            restore_snapshot(env, snapshot)
+            args.restore_snapshot = None
 
         recorder = None
         reset_snapshot = None
         randomization_receipt = {}
+        controlled_provenance = None
         if flywheel_manifest is not None:
             from lehome.flywheel.isaac_recorder import AutonomousRecorder
             from lehome.flywheel.models import EpisodeIdentity
@@ -354,9 +636,22 @@ def run_evaluation_loop(
 
             strategy = flywheel_manifest.get("strategy", "canonical")
             sampled = sample_randomization(strategy, seed=flywheel_manifest.get("seed", args.seed))
+            controlled = flywheel_manifest.get("controlled_recovery")
+            if controlled is not None:
+                if not isinstance(controlled, Mapping) or strategy != "canonical":
+                    raise ValueError("controlled recovery requires a canonical immutable manifest")
+                if restore is not None:
+                    raise ValueError("controlled recovery cannot combine a second restore snapshot")
+                # Validate the immutable source boundary before randomization
+                # can mutate the simulator. Bootstrap reloads after the
+                # readback to defend against input replacement in between.
+                from lehome.flywheel.recovery_collection import bootstrap_controlled_recovery, load_controlled_recovery
+                load_controlled_recovery(controlled)
             randomization_receipt = env.apply_flywheel_randomization(sampled)
             from lehome.flywheel.randomization import validate_randomization_receipt
             validate_randomization_receipt(dict(sampled.values), dict(randomization_receipt))
+            if controlled is not None:
+                controlled_provenance = bootstrap_controlled_recovery(env, controlled)
             identity = flywheel_identity
             if identity is None:  # pragma: no cover - guarded above, keeps type flow explicit.
                 raise RuntimeError("missing flywheel identity")
@@ -365,10 +660,14 @@ def run_evaluation_loop(
                 policy_revision=flywheel_manifest["policy_revision"],
                 episode_id=flywheel_manifest.get("episode_id"),
                 identity=identity,
-                provenance={"policy_artifact_sha256": flywheel_manifest["policy_artifact_sha256"], "image_identity": flywheel_manifest["image_identity"], "execution_mode": flywheel_manifest["execution_mode"], "execution_backend": flywheel_manifest["execution_backend"], "simulator_device": flywheel_manifest["simulator_device"], "policy_device": flywheel_manifest.get("policy_device"), "parity_stage": flywheel_manifest.get("parity_stage"), "strategy_sampled": dict(sampled.values), "strategy_receipt": dict(randomization_receipt)},
+                provenance={"policy_artifact_sha256": flywheel_manifest["policy_artifact_sha256"], "image_identity": flywheel_manifest["image_identity"], "execution_mode": flywheel_manifest["execution_mode"], "execution_backend": flywheel_manifest["execution_backend"], "simulator_device": flywheel_manifest["simulator_device"], "policy_device": flywheel_manifest.get("policy_device"), "parity_stage": flywheel_manifest.get("parity_stage"), "strategy_sampled": dict(sampled.values), "strategy_receipt": dict(randomization_receipt), **({"controlled_recovery": dict(controlled_provenance)} if controlled_provenance is not None else {})},
             )
             reset_snapshot = capture_snapshot(env, randomization={"strategy": strategy, "sampled": dict(sampled.values), "receipt": dict(randomization_receipt)})
             recorder.record_snapshot("reset", reset_snapshot)
+        if reset_policy:
+            # Controlled recovery must reset its temporal policy state only
+            # after the authenticated source-prefix bootstrap is complete.
+            policy.reset()
 
         # 2. Initial Observation (Numpy)
         object_initial_pose = env.get_all_pose() if args.save_datasets else None

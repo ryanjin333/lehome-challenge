@@ -495,3 +495,51 @@ def run_continuous_supervisor(
         return tuple(immutable)
     training_thread.join()
     return tuple(immutable)
+
+
+def run_sweep_supervisor(
+    *,
+    run_root: Path,
+    target_step: int,
+    launch: Callable[[], object],
+    record_local: Callable[[CompletedCheckpoint], object] | None = None,
+    package: Callable[[CompletedCheckpoint], object],
+    publish: Callable[[object], Mapping[str, object]],
+    preemption: PreemptionController | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Publish independent 500-step sweep boundaries.
+
+    This intentionally has no 1K-to-2K dependency: a short experiment's
+    terminal checkpoint is useful on its own, and a promoted job authenticates
+    its parent separately.  The legacy ``run_continuous_supervisor`` retains
+    its 1K anchor chain unchanged.
+    """
+    if target_step not in (500, 1000, 2000):
+        raise ValueError("sweep target step must be 500, 1000, or 2000")
+    run_root = Path(run_root)
+    if not run_root.is_absolute() or run_root.is_symlink():
+        raise ValueError("sweep run root is unsafe")
+    if preemption is None or not preemption.requested:
+        launch()
+    published: list[dict[str, object]] = []
+    for step in range(500, target_step + 1, 500):
+        checkpoint = run_root / f"checkpoint-{step}"
+        if checkpoint.is_dir():
+            snapshot = snapshot_checkpoint(checkpoint, optimizer_step=step)
+            if record_local is not None:
+                record_local(snapshot)
+            receipt = publish(package(snapshot))
+            if (
+                not isinstance(receipt, Mapping)
+                or receipt.get("optimizer_step") != step
+                or receipt.get("readback_verified") is not True
+            ):
+                raise ValueError("sweep checkpoint publisher lacks readback verification")
+            published.append(dict(receipt))
+        if preemption is not None and preemption.requested:
+            preemption.finalized_step = step if checkpoint.is_dir() else (published[-1]["optimizer_step"] if published else None)
+            break
+    if not preemption or not preemption.requested:
+        if not published or published[-1]["optimizer_step"] != target_step:
+            raise RuntimeError("sweep training did not expose its terminal checkpoint")
+    return tuple(published)

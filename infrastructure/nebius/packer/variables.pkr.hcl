@@ -28,6 +28,13 @@ variable "service_account_private_key_file" {
   sensitive   = true
 }
 
+variable "ghcr_pull_token" {
+  type        = string
+  description = "Optional GHCR pull token used only during image build; never baked."
+  sensitive   = true
+  default     = ""
+}
+
 variable "image_version" {
   type        = string
   description = "Version label stamped into golden image metadata."
@@ -43,13 +50,24 @@ variable "rollout_image_name" {
   default = "lehome-rollout"
 }
 
+variable "rollout_parent_image_id" {
+  type        = string
+  description = "Existing READY rollout image used for fast code-only rebuilds."
+  default     = ""
+}
+
 variable "training_oci_image" {
   type    = string
   default = "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746"
 }
 
+variable "training_oci_digest" {
+  type        = string
+  description = "Bare SHA-256 digest expected for the pinned trainer image."
+  default     = "b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746"
+}
+
 variable "trainer_code_revision" {
   type        = string
   description = "Exact trainer code revision baked as image metadata, not source."
-  default     = "b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746"
 }

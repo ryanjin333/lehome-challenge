@@ -227,3 +227,63 @@ def test_shutdown_sends_sigterm_to_every_child(config):
     assert appliance.stopped
     for child in appliance.children.values():
         assert child.signaled
+
+
+
+def _session_ids(topology):
+    ids = []
+    for spec in topology.services:
+        if spec.service != "worker":
+            continue
+        command = spec.command
+        ids.append(command[command.index("--session-id") + 1])
+    return ids
+
+
+def test_workers_receive_unique_session_ids_that_are_not_reused_across_plans(config):
+    first = build_process_topology(config)
+    second = build_process_topology(config)
+    first_ids = _session_ids(first)
+    second_ids = _session_ids(second)
+    assert len(first_ids) == 4
+    assert len(set(first_ids)) == 4
+    assert set(first_ids).isdisjoint(set(second_ids))
+    assert all(not session_id.startswith("session-") for session_id in first_ids)
+
+
+def test_default_gateway_port_leaves_dcgm_on_5555(tmp_path):
+    config = ApplianceConfig(
+        workspace_root=tmp_path / "workspace",
+        worker_count=4,
+        vcpu_budget=24,
+        policy_sha256="a" * 64,
+        policy_gateway_endpoint=_module.DEFAULT_POLICY_GATEWAY_ENDPOINT,
+        renderer_device="cuda:0",
+        policy_device="cuda:0",
+    )
+    topology = build_process_topology(config)
+    policy = next(spec for spec in topology.services if spec.service == "policy_server")
+    worker = next(spec for spec in topology.services if spec.service == "worker")
+    assert _module.DEFAULT_POLICY_GATEWAY_ENDPOINT == "tcp://127.0.0.1:15555"
+    assert policy.command[policy.command.index("--port") + 1] == "15555"
+    assert "5555" not in policy.command
+    assert "tcp://127.0.0.1:15555" in worker.command
+    assert worker.command[worker.command.index("--policy-timeout-seconds") + 1] == "180"
+
+
+def test_worker_command_includes_required_smoke_flags(config):
+    topology = build_process_topology(config)
+    worker = next(spec for spec in topology.services if spec.service == "worker")
+    command = worker.command
+    for flag in (
+        "--database",
+        "--attempt-matrix",
+        "--policy-ready-file",
+        "--initial-garment",
+        "--policy-timeout-seconds",
+        "--session-id",
+    ):
+        assert flag in command
+    session_id = command[command.index("--session-id") + 1]
+    assert session_id.startswith("worker-0-")
+    assert session_id != "session-0"

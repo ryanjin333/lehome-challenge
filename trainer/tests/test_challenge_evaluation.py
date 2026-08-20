@@ -161,3 +161,14 @@ def test_publish_writes_sealed_report_snapshot_and_matching_hashes(tmp_path):
     sums = json.loads((root / "SHA256SUMS.json").read_text(encoding="utf-8"))
     for name in expected - {"SHA256SUMS.json"}:
         assert sums[name]["sha256"] == hashlib.sha256((root / name).read_bytes()).hexdigest()
+
+
+def test_async_sweep_selection_is_a_separate_fail_closed_path_from_legacy_five_candidate_gate():
+    from lehome_train.challenge_evaluation import select_async_sweep_final_winner
+
+    assert select_async_sweep_final_winner(
+        {},
+        baseline_report=None,
+        original_12k_checkpoint_digest="a" * 64,
+        final_matrix_sha256="b" * 64,
+    ) == {"decision": "baseline_evaluation_required"}

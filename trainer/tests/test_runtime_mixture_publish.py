@@ -12,6 +12,8 @@ from lehome_train.io import sha256_file
 
 TOKEN = "hf_fake_process_token_only"
 REPOSITORY = "ryanjin333/lehome-groot-n17-data"
+ROLLOUT_REPOSITORY = "ryanjin333/lehome-groot-n17-rollouts"
+MIXTURE_REPOSITORY = ROLLOUT_REPOSITORY
 REVISION = "a" * 40
 
 
@@ -23,23 +25,30 @@ def _write(path: Path, value: object) -> None:
 class MemoryTransport:
     """Literal fake private Hub transport; it never opens a network socket."""
 
-    def __init__(self, *, fault: str | None = None, expected_revision: str | None = None) -> None:
+    def __init__(
+        self, *, fault: str | None = None, expected_revision: str | None = None,
+        expected_repository: str = REPOSITORY,
+    ) -> None:
         self.fault = fault
         self.expected_revision = expected_revision
+        self.expected_repositories = {
+            expected_repository,
+        } if expected_repository != REPOSITORY else {REPOSITORY, ROLLOUT_REPOSITORY}
         self.remote: dict[str, bytes] = {}
         self.calls: list[tuple[str, str, str | None]] = []
+        self.repository_calls: list[tuple[str, str, str | None]] = []
         self.large_uploads: list[dict[str, object]] = []
         self.branch_head = REVISION
         self.downloaded_files = 0
         self.download_batches: list[tuple[str, ...]] = []
 
     def check_access(self, *, repository: str, token: str) -> HubAccess:
-        assert repository == REPOSITORY
+        assert repository in self.expected_repositories
         assert token == TOKEN
         return HubAccess(can_read=True, can_write=True, private_repository=True)
 
     def upload_files(self, *, repository: str, revision: str, source: Path, entries, token: str, remote_prefix: str | None = None) -> str:
-        assert repository == REPOSITORY and token == TOKEN and remote_prefix is not None
+        assert repository in self.expected_repositories and token == TOKEN and remote_prefix is not None
         self.calls.append(("upload", revision, remote_prefix))
         if self.fault == "upload":
             raise OSError("hf_token_looks_real_but_is_fake")
@@ -60,7 +69,7 @@ class MemoryTransport:
     ) -> None:
         """Provider-like resumable large upload, deliberately without a prefix API."""
 
-        assert repository == REPOSITORY and token == TOKEN
+        assert repository in self.expected_repositories and token == TOKEN
         assert 1 <= max_workers <= 8
         staged = tuple(entries)
         assert remote_prefix == "rollouts/round-1"
@@ -89,7 +98,7 @@ class MemoryTransport:
             })
 
     def resolve_approved_ref(self, *, repository: str, ref: str, token: str) -> str:
-        assert repository == REPOSITORY and token == TOKEN
+        assert repository in self.expected_repositories and token == TOKEN
         self.calls.append(("resolve", ref, None))
         return self.branch_head
 
@@ -97,17 +106,19 @@ class MemoryTransport:
         self, *, repository: str, revision: str, token: str,
         remote_prefix: str | None = None,
     ) -> tuple[HubTreeEntry, ...]:
-        assert repository == REPOSITORY and token == TOKEN
+        assert repository in self.expected_repositories and token == TOKEN
         if self.expected_revision is not None:
             assert revision == self.expected_revision
         self.calls.append(("tree", revision, remote_prefix))
+        self.repository_calls.append(("tree", repository, remote_prefix))
         if self.fault == "list":
             raise OSError("tree failed")
         return tuple(HubTreeEntry(path, "file") for path in sorted(self.remote))
 
     def download_files(self, *, repository: str, revision: str, destination: Path, relative_paths, token: str, remote_prefix: str | None = None) -> str:
-        assert repository == REPOSITORY and token == TOKEN and remote_prefix is not None
+        assert repository in self.expected_repositories and token == TOKEN and remote_prefix is not None
         self.calls.append(("download", revision, remote_prefix))
+        self.repository_calls.append(("download", repository, remote_prefix))
         self.download_batches.append(tuple(relative_paths))
         if self.fault == "download":
             raise OSError("download failed")
@@ -152,6 +163,26 @@ def test_source_publisher_proves_complete_remote_tree_and_fresh_bytes_without_mu
     assert source_tree_sha256(source) == before
     assert receipt_path.is_file() and not (source / "bc.json").exists()
     assert ("tree", REVISION, "bc/full") in transport.calls
+
+
+def test_rollout_source_publishes_to_the_private_rollout_repository(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture_publish import publish_source
+
+    source = tmp_path / "rollout"
+    _source(source)
+    transport = MemoryTransport(expected_repository=ROLLOUT_REPOSITORY)
+
+    receipt = publish_source(
+        root=source,
+        source_type="rollout",
+        round_id="2",
+        revision="draft",
+        receipt_path=tmp_path / "round-2.json",
+        transport=transport,
+    )
+
+    assert receipt["repository"] == ROLLOUT_REPOSITORY
+    assert receipt["remote_prefix"] == "rollouts/round-2"
 
 
 def test_large_source_stages_only_the_exact_prefixed_allowlist_then_binds_the_final_head(
@@ -449,6 +480,10 @@ def test_hydrator_recreates_exact_remote_trees_and_rewrites_only_local_receipt_m
     assert result["immutable_revision"] == "a" * 40
     assert load_runtime_contract(destination / "mixture.json", mounts).mounts["bc"] == destination.parent / "sources" / "bc"
     assert all("/authoring/" not in entry["source_readback_receipt_path"] for entry in json.loads(mounts.read_text())["mounts"])
+    assert ("tree", REPOSITORY, "bc/full") in transport.repository_calls
+    assert ("download", REPOSITORY, "bc/full") in transport.repository_calls
+    assert ("tree", ROLLOUT_REPOSITORY, "rollouts/round-1") in transport.repository_calls
+    assert ("download", ROLLOUT_REPOSITORY, "rollouts/round-1") in transport.repository_calls
 
 
 @pytest.mark.parametrize("mismatch", [None, "experiment_manifest_sha256", "mixture_weights", "source_quotas"])
@@ -657,7 +692,7 @@ def _pending_from_runtime_contract(tmp_path: Path) -> tuple[Path, dict[str, str]
     _write(pending / "windows.json", {"schema_version": 3, "windows": index["windows"]})
     pending_value = {
         "schema_version": 1, "kind": "runtime_mixture_publication_pending",
-        "repository": REPOSITORY, "sources": manifest["sources"],
+        "repository": MIXTURE_REPOSITORY, "sources": manifest["sources"],
         "normalization_sha256": sha256_file(pending / normalization.name),
         "windows_sha256": sha256_file(pending / "windows.json"),
         "publication_pending": True,

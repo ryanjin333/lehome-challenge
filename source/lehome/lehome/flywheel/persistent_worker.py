@@ -10,16 +10,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import re
-from threading import Event, Thread
+from threading import Event, Thread, Timer
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
 
 ACTION_HORIZON = 16
 _SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
+_PREPARATION_TIMEOUT_REASON = "preparation_timeout"
+_PREPARATION_TIMEOUT_EXIT_STATUS = 70
+
+
+class PreparationTimeoutError(RuntimeError):
+    """Raised only when an injected test hard-exit returns to Python."""
+
+
+class InfrastructureInvalidAttemptError(ValueError):
+    """An episode cannot be used because runtime evidence is invalid."""
 
 
 class _LeaseController(Protocol):
@@ -28,6 +39,10 @@ class _LeaseController(Protocol):
     def record_terminal(self, worker_id: str, attempt_id: str, lease_id: str, raw_artifact_id: str) -> Any: ...
 
     def heartbeat(self, worker_id: str, attempt_id: str, lease_id: str) -> Any: ...
+
+    def reject_attempt(self, worker_id: str, attempt_id: str, lease_id: str, *, reason: str) -> str: ...
+
+    def record_infrastructure_abort(self, worker_id: str, attempt_id: str, lease_id: str, *, reason: str) -> str: ...
 
 
 class _EpisodeSession(Protocol):
@@ -129,6 +144,8 @@ class PersistentRolloutWorker:
         renderer_device: str,
         policy_device: str,
         heartbeat_interval_seconds: float = 30.0,
+        preparation_timeout_seconds: float = 180.0,
+        hard_exit: Callable[[int], None] = os._exit,
     ) -> None:
         self.identity = WorkerIdentity(worker_id, session_id, renderer_device, policy_device)
         self._controller = controller
@@ -138,24 +155,38 @@ class PersistentRolloutWorker:
         self._episode_generation = 0
         if heartbeat_interval_seconds <= 0:
             raise ValueError("heartbeat_interval_seconds must be positive")
+        if (
+            isinstance(preparation_timeout_seconds, bool)
+            or not isinstance(preparation_timeout_seconds, (int, float))
+            or not math.isfinite(preparation_timeout_seconds)
+            or preparation_timeout_seconds <= 0
+        ):
+            raise ValueError("preparation_timeout_seconds must be positive")
+        if not callable(hard_exit):
+            raise ValueError("hard_exit must be callable")
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._preparation_timeout_seconds = float(preparation_timeout_seconds)
+        self._hard_exit = hard_exit
 
     @property
     def episode_generation(self) -> int:
         return self._episode_generation
 
-    def _validate_runtime_receipt(self, session: _EpisodeSession) -> Mapping[str, object]:
+    def _validate_runtime_receipt(self, session: _EpisodeSession, *, require_contact: bool = True) -> Mapping[str, object]:
         raw = getattr(session, "runtime_receipt", None)
         receipt = raw() if callable(raw) else raw
         if not isinstance(receipt, Mapping):
             raise ValueError("persistent worker session must expose a runtime receipt")
         if receipt.get("simulation_device") != "cpu" or receipt.get("cloth_device") != "cpu":
             raise ValueError("persistent rollout requires CPU cloth simulation")
-        if receipt.get("cloth_backend") != "usd" or not isinstance(receipt.get("cloth_readback"), Mapping):
-            raise ValueError("persistent rollout requires observed CPU USD cloth readback")
-        contact = receipt.get("visible_contact_canary")
-        if not isinstance(contact, Mapping) or not isinstance(contact.get("observed"), bool):
-            raise ValueError("persistent rollout requires visible-contact canary evidence")
+        if receipt.get("cloth_backend") != "usd":
+            raise ValueError("persistent rollout requires observed CPU USD cloth backend")
+        if require_contact:
+            if not isinstance(receipt.get("cloth_readback"), Mapping):
+                raise ValueError("persistent rollout requires observed CPU USD cloth readback")
+            contact = receipt.get("visible_contact_canary")
+            if not isinstance(contact, Mapping) or not isinstance(contact.get("observed"), bool):
+                raise ValueError("persistent rollout requires visible-contact canary evidence")
         if receipt.get("renderer_device") != self.identity.renderer_device:
             raise ValueError("runtime receipt renderer device does not match worker identity")
         if receipt.get("camera_device", self.identity.renderer_device) != self.identity.renderer_device:
@@ -198,9 +229,31 @@ class PersistentRolloutWorker:
             raise ValueError("persistent worker output directory already exists")
         return path
 
-    def _run_with_heartbeat(self, session: _EpisodeSession, *, assignment: Mapping[str, object], output_dir: Path, attempt_id: str, lease_id: str) -> Mapping[str, object]:
+    def _prepare_and_run_with_heartbeat(
+        self,
+        session: _EpisodeSession,
+        *,
+        garment_name: str,
+        seed: int,
+        generation: int,
+        assignment: Mapping[str, object],
+        output_dir: Path,
+        attempt_id: str,
+        lease_id: str,
+    ) -> Mapping[str, object]:
+        """Keep an active lease through reset and irreversibly quarantine a hung reset.
+
+        Isaac/Omniverse preparation can block inside native USD code.  The
+        watchdog therefore records a terminal rejection before calling
+        ``os._exit`` in production; normal Python unwinding is not dependable
+        after that boundary.  Tests inject a returning exit hook and observe
+        :class:`PreparationTimeoutError` once the artificial preparation call
+        is released.
+        """
+
         stop = Event()
         failures: list[BaseException] = []
+        preparation_timed_out = Event()
 
         def heartbeat() -> None:
             while not stop.wait(self._heartbeat_interval_seconds):
@@ -210,9 +263,62 @@ class PersistentRolloutWorker:
                     failures.append(error)
                     stop.set()
 
+        def expire_preparation() -> None:
+            preparation_timed_out.set()
+            try:
+                abort = getattr(self._controller, "record_infrastructure_abort", None)
+                if not callable(abort):
+                    raise RuntimeError("controller does not support durable infrastructure abort")
+                abort(
+                    self.identity.worker_id,
+                    attempt_id,
+                    lease_id,
+                    reason=_PREPARATION_TIMEOUT_REASON,
+                )
+                print(
+                    "persistent worker: preparation timeout; aborting infrastructure-invalid attempt "
+                    f"attempt_id={attempt_id} lease_id={lease_id} reason={_PREPARATION_TIMEOUT_REASON}",
+                    flush=True,
+                )
+            except BaseException as error:
+                # We still terminate the isolated worker: allowing a native
+                # hang to retain this simulator process is worse than relying
+                # on the controller's lease expiry/recovery path.
+                print(
+                    "persistent worker: preparation timeout infrastructure-abort failed: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
+            self._hard_exit(_PREPARATION_TIMEOUT_EXIT_STATUS)
+
+        # Start the lease-renewal loop before entering prepare_episode, not
+        # merely after its first slow garment switch.  The first renewal keeps
+        # the same cadence as episode execution and avoids extending a lease
+        # before the worker has actually reached its preparation boundary.
         thread = Thread(target=heartbeat, name=f"lease-heartbeat-{self.identity.worker_id}", daemon=True)
         thread.start()
+        watchdog = Timer(self._preparation_timeout_seconds, expire_preparation)
+        watchdog.daemon = True
         try:
+            watchdog.start()
+            try:
+                session.prepare_episode(
+                    garment_name=garment_name,
+                    seed=seed,
+                    episode_generation=generation,
+                    reset_policy=False,
+                )
+            finally:
+                watchdog.cancel()
+                # ``Timer.cancel`` cannot prevent a callback that has just
+                # started.  Joining proves a normal preparation has no late
+                # timeout thread left that could reject a completed lease.
+                watchdog.join()
+            if preparation_timed_out.is_set():
+                raise PreparationTimeoutError(
+                    f"preparation exceeded {self._preparation_timeout_seconds:g}s "
+                    f"({_PREPARATION_TIMEOUT_REASON})"
+                )
             outcome = session.run_episode(
                 assignment=assignment, attempt_output_dir=output_dir, policy=self._policy,
                 cancellation_event=stop,
@@ -247,12 +353,27 @@ class PersistentRolloutWorker:
 
         if max_episodes is not None and (not isinstance(max_episodes, int) or max_episodes < 0):
             raise ValueError("max_episodes must be a non-negative integer or None")
-        session = self._simulator_factory()
-        runtime_receipt = self._validate_runtime_receipt(session)
+        try:
+            session = self._simulator_factory()
+        except BaseException as error:
+            # Isaac/Kit shutdown can take minutes. Emit the actionable cause
+            # before the outer launcher enters that shutdown path.
+            print(
+                f"persistent worker: simulator factory failed: {type(error).__name__}: {error}",
+                flush=True,
+            )
+            raise
+        print("persistent worker: simulator session ready", flush=True)
+        # Device/backend identity can be checked before the first reset.
+        # Visible-contact geometry is only reliable after Isaac has reset the
+        # garment, so do not block the first lease on that canary.
+        runtime_receipt = self._validate_runtime_receipt(session, require_contact=False)
+        print("persistent worker: runtime receipt validated", flush=True)
         receipts: list[dict[str, object]] = []
         try:
             while max_episodes is None or len(receipts) < max_episodes:
                 lease = self._controller.lease_next(self.identity.worker_id)
+                print(f"persistent worker: lease_next -> {lease!r}", flush=True)
                 if lease is None:
                     break
                 attempt_id, assignment = _assignment_for(lease)
@@ -271,22 +392,64 @@ class PersistentRolloutWorker:
                     output_dir = self._episode_output_dir(
                         attempt_id=attempt_id, lease_id=lease_id, generation=generation,
                     )
-                    session.prepare_episode(
-                        garment_name=garment_name, seed=seed, episode_generation=generation,
-                        reset_policy=False,
-                    )
-                    outcome = self._run_with_heartbeat(
-                        session, assignment={**dict(assignment), "attempt_id": attempt_id}, output_dir=output_dir,
-                        attempt_id=attempt_id, lease_id=lease_id,
+                    outcome = self._prepare_and_run_with_heartbeat(
+                        session,
+                        garment_name=garment_name,
+                        seed=seed,
+                        generation=generation,
+                        assignment={**dict(assignment), "attempt_id": attempt_id},
+                        output_dir=output_dir,
+                        attempt_id=attempt_id,
+                        lease_id=lease_id,
                     )
                     if not isinstance(outcome, Mapping):
                         raise ValueError("episode session must return a mapping receipt")
+                    # Startup only establishes CPU/renderer identity.  The
+                    # physical-cloth readback and visible-contact canary must
+                    # be freshly observable after reset and episode execution
+                    # before this lease can become terminal.
+                    try:
+                        runtime_receipt = self._validate_runtime_receipt(session, require_contact=True)
+                    except ValueError as error:
+                        raise InfrastructureInvalidAttemptError(str(error)) from error
                 except BaseException as error:
-                    self._record_interruption(attempt_id=attempt_id, lease_id=lease_id, reason=type(error).__name__)
-                    if isinstance(error, KeyboardInterrupt):
+                    print(f"persistent worker: episode failed: {type(error).__name__}: {error}", flush=True)
+                    if isinstance(error, PreparationTimeoutError):
+                        # In production the watchdog has already hard-exited.
+                        # This path exists solely when an injected test exit
+                        # hook returns; never append a contradictory retry.
                         raise
+                    if isinstance(error, InfrastructureInvalidAttemptError):
+                        abort = getattr(self._controller, "record_infrastructure_abort", None)
+                        if not callable(abort):
+                            raise RuntimeError("controller does not support durable infrastructure abort") from error
+                        abort(
+                            self.identity.worker_id,
+                            attempt_id,
+                            lease_id,
+                            reason="runtime_evidence_invalid",
+                        )
+                        continue
+                    restore_failed = "snapshot" in str(error).lower() or "restore" in str(error).lower()
+                    if restore_failed:
+                        reject = getattr(self._controller, "reject_attempt", None)
+                        if callable(reject):
+                            reject(self.identity.worker_id, attempt_id, lease_id, reason=type(error).__name__)
+                        else:
+                            self._record_interruption(attempt_id=attempt_id, lease_id=lease_id, reason=type(error).__name__)
+                        continue
                     if isinstance(error, InterruptedError):
+                        # Explicit preemption/cancellation is the one normal
+                        # retryable path: release once and let a replacement
+                        # worker continue the immutable attempt later.
+                        self._record_interruption(
+                            attempt_id=attempt_id, lease_id=lease_id, reason=type(error).__name__,
+                        )
                         break
+                    # Ordinary deterministic errors are not retryable from
+                    # this process.  Let the bounded shell supervisor decide
+                    # whether to restart; do not append retryable ledger
+                    # events that repeatedly select the earliest bad row.
                     raise
 
                 receipt: dict[str, object] = {
@@ -318,4 +481,7 @@ class PersistentRolloutWorker:
         return receipts
 
 
-__all__ = ["ACTION_HORIZON", "PersistentRolloutWorker", "WorkerIdentity"]
+__all__ = [
+    "ACTION_HORIZON", "InfrastructureInvalidAttemptError", "PreparationTimeoutError",
+    "PersistentRolloutWorker", "WorkerIdentity",
+]

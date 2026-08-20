@@ -1,0 +1,12 @@
+[Unit]
+Description=Mount protected LeHome experiment controller state disk
+After=local-fs.target
+Before=lehome-experiment-controller.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/lehome-experiment-controller-state
+RemainAfterExit=yes
+
+[Install]
+RequiredBy=lehome-experiment-controller.service

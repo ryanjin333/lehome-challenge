@@ -107,7 +107,10 @@ def _symlink_free_selected_checkpoint(*, checkpoint: Path, output_root: Path, ex
     staging_root = checkpoint.parent.parent
     permitted_staging = (
         staging_root.parent == output_root
-        and staging_root.name.startswith(".runtime-hf-resume-")
+        and staging_root.name.startswith((
+            ".runtime-hf-resume-",
+            ".runtime-sweep-parent-",
+        ))
         and checkpoint.parent.name == experiment
     )
     if (

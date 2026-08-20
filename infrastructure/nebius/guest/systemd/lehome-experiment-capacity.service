@@ -1,0 +1,30 @@
+[Unit]
+Description=LeHome exact-ID Nebius capacity lifecycle
+After=network-online.target lehome-experiment-controller.service
+Requires=lehome-experiment-controller.service
+Wants=network-online.target
+ConditionPathExists=/etc/lehome/experiment-bootstrap.ready
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+EnvironmentFile=/etc/lehome/experiment-capacity.env
+Environment=HOME=/nonexistent
+LoadCredential=controller-token:/etc/lehome/private/controller-token
+LoadCredential=nebius-private-key:/etc/lehome/private/nebius-private-key
+ExecStart=/usr/local/bin/lehome-experiment-capacity
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+KillMode=process
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/lehome/controller/audit /run/lehome-capacity
+RuntimeDirectory=lehome-capacity
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

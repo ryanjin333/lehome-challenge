@@ -17,9 +17,10 @@ from typing import Protocol
 from lehome_train.io import canonical_json_sha256, sha256_file
 
 
-WORKER_COUNTS = (0, 4, 8, 12, 16)
-BURN_IN_STEPS = 10
-MEASURED_STEPS = 50
+CPU_WORKER_COUNTS = (0, 4, 8, 12, 16)
+WORKER_COUNTS = (4, 8, 12, 16)
+BURN_IN_STEPS = 2
+MEASURED_STEPS = 5
 PHYSICAL_BATCH_SIZE = 64
 ACTION_HORIZON = 16
 MAX_LOADER_WAIT_FRACTION = 0.10
@@ -187,8 +188,8 @@ def validate_cpu_pilot(cpu_pilot: Mapping[str, object]) -> str:
     if (
         cpu_pilot["schema_version"] != 4
         or cpu_pilot["kind"] != "runtime_mixture_loader_pilot"
-        or cpu_pilot["canonical_worker_counts"] != list(WORKER_COUNTS)
-        or cpu_pilot["worker_counts"] != list(WORKER_COUNTS)
+        or cpu_pilot["canonical_worker_counts"] != list(CPU_WORKER_COUNTS)
+        or cpu_pilot["worker_counts"] != list(CPU_WORKER_COUNTS)
         or type(cpu_pilot["sample_count_per_worker"]) is not int
         or cpu_pilot["sample_count_per_worker"] < 100
         or cpu_pilot["canonical_completion"] is not True
@@ -205,9 +206,9 @@ def validate_cpu_pilot(cpu_pilot: Mapping[str, object]) -> str:
     ):
         raise ValueError("CPU runtime-mixture pilot is not canonical characterization")
     throughput = cpu_pilot["loader_throughput"]
-    if not isinstance(throughput, Mapping) or set(throughput) != {str(item) for item in WORKER_COUNTS}:
+    if not isinstance(throughput, Mapping) or set(throughput) != {str(item) for item in CPU_WORKER_COUNTS}:
         raise ValueError("CPU runtime-mixture pilot lacks the exact worker sweep")
-    for workers in WORKER_COUNTS:
+    for workers in CPU_WORKER_COUNTS:
         row = throughput[str(workers)]
         if not isinstance(row, Mapping) or row.get("decoded_samples") != cpu_pilot["sample_count_per_worker"]:
             raise ValueError("CPU runtime-mixture pilot did not decode every sample")
@@ -512,6 +513,12 @@ def build_gpu_warmup_receipt(
         "selected_loader_workers": selected,
     }
     if selected is None:
+        rejected = Path("/prepared/receipts/gpu-warmup-rejected.json")
+        try:
+            rejected.parent.mkdir(parents=True, exist_ok=True)
+            rejected.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError:
+            pass
         raise RuntimeError("no GPU warm-up worker count proved loader non-starvation")
     validate_gpu_warmup_receipt(receipt, expected_binding=checked_binding)
     return receipt

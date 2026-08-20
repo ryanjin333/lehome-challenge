@@ -55,7 +55,10 @@ tokens, PEM paths, or model hyperparameters in Terraform state.
    `project_id`, `subnet_id`, `service_account_id`,
    `service_account_public_key_id`, and `service_account_private_key_file`.
 2. Build `vla-training-base` with the on-demand CPU builder
-   (`cpu-d3` / `16vcpu-64gb`). This builder is not preemptible.
+   (`cpu-d3` / `16vcpu-64gb`) and provide the exact 40-character trainer
+   source commit as `-var trainer_code_revision=...`. This builder is not
+   preemptible; its immutable host manifest records that revision alongside
+   the pinned OCI digest.
 3. Stage rollout code with `infrastructure/nebius/tools/stage-rollout.sh`,
    then build `lehome-rollout` the same way.
 4. Apply `infrastructure/nebius/terraform/storage` to create the 500 GiB
