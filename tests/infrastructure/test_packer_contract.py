@@ -303,6 +303,7 @@ def test_rollout_stage_includes_the_persistent_evaluation_summarizer():
 def test_incremental_rollout_image_uses_existing_ready_image_without_redownloading_tarball():
     patch_template = _read("rollout-patch.pkr.hcl")
     patch_install = (SCRIPTS_DIR / "install-rollout-patch.sh").read_text(encoding="utf-8")
+    variables = _read("variables.pkr.hcl")
 
     assert 'base_image {' in patch_template
     assert 'id = var.rollout_parent_image_id' in patch_template
@@ -310,6 +311,10 @@ def test_incremental_rollout_image_uses_existing_ready_image_without_redownloadi
     assert "rollout-stage" in patch_template
     assert "lehome-rollout:build" in patch_install
     assert "docker build" in patch_install
+    assert "LEHOME_ROLLOUT_CODE_REVISION=${var.rollout_code_revision}" in patch_template
+    assert 'ROLLOUT_CODE_REVISION="${LEHOME_ROLLOUT_CODE_REVISION:?LEHOME_ROLLOUT_CODE_REVISION is required}"' in patch_install
+    assert 'APPLIANCE_COMMIT="${ROLLOUT_CODE_REVISION}"' in patch_install
+    assert 'variable "rollout_code_revision"' in variables
     assert "/opt/lehome/rollout_appliance" in patch_install
     assert "lehome-challenge.tar.gz" not in patch_template + patch_install
     assert "docker load" not in patch_install
@@ -417,10 +422,11 @@ exit 0
     env = os.environ.copy()
     env.update(
         {
-            "PATH": f"{fake_bin}:/usr/bin:/bin",
-            "DOCKER_LOG": str(docker_log),
-            "PULL_COUNT": str(pull_count),
-        }
+                "PATH": f"{fake_bin}:/usr/bin:/bin",
+                "DOCKER_LOG": str(docker_log),
+                "PULL_COUNT": str(pull_count),
+                "LEHOME_ROLLOUT_CODE_REVISION": "a" * 40,
+            }
     )
     result = subprocess.run(
         ["/bin/bash", str(SCRIPTS_DIR / "install-rollout-patch.sh")],

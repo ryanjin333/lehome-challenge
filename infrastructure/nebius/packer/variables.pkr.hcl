@@ -56,6 +56,11 @@ variable "rollout_parent_image_id" {
   default     = ""
 }
 
+variable "rollout_code_revision" {
+  type        = string
+  description = "Exact Git revision embedded in an incremental rollout OCI layer."
+}
+
 variable "training_oci_image" {
   type    = string
   default = "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746"

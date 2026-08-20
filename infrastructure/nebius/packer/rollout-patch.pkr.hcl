@@ -56,6 +56,9 @@ build {
   }
 
   provisioner "shell" {
+    environment_vars = [
+      "LEHOME_ROLLOUT_CODE_REVISION=${var.rollout_code_revision}",
+    ]
     inline = [
       "chmod +x /tmp/install-rollout-patch.sh",
       "sudo -E /tmp/install-rollout-patch.sh",

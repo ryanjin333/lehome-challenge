@@ -2,6 +2,9 @@
 # Apply a code-only rollout layer on top of an existing READY rollout image.
 set -euo pipefail
 
+ROLLOUT_CODE_REVISION="${LEHOME_ROLLOUT_CODE_REVISION:?LEHOME_ROLLOUT_CODE_REVISION is required}"
+[[ "${ROLLOUT_CODE_REVISION}" =~ ^[0-9a-f]{40}$ ]] || { echo "rollout code revision must be an immutable 40-character commit" >&2; exit 2; }
+
 PINNED_BASE="lehome-challenge:a914115729bb0bfd260971b9c8d4147bff38c1fb"
 DERIVED_TAG="lehome-rollout:build"
 TRAINER_IMAGE="ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746"
@@ -11,7 +14,7 @@ docker image inspect "${PINNED_BASE}" >/dev/null
 
 docker build \
   --build-arg LEHOME_BASE_IMAGE="${PINNED_BASE}" \
-  --build-arg APPLIANCE_COMMIT="$(git -C /tmp/lehome-repo rev-parse HEAD 2>/dev/null || echo staged)" \
+  --build-arg APPLIANCE_COMMIT="${ROLLOUT_CODE_REVISION}" \
   --tag "${DERIVED_TAG}" \
   --file /tmp/lehome-repo/rollout_appliance/Dockerfile \
   /tmp/lehome-repo

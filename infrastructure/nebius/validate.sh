@@ -52,6 +52,7 @@ fi
   -var 'rollout_parent_image_id=test-image' \
   -var 'image_version=0.0.0-test' \
   -var 'trainer_code_revision=0000000000000000000000000000000000000000' \
+  -var 'rollout_code_revision=0000000000000000000000000000000000000000' \
   -var 'ghcr_pull_token=' \
   infrastructure/nebius/packer
 
