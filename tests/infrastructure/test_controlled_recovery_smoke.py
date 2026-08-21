@@ -97,13 +97,14 @@ def _fake_snapshot_source_base(path: Path) -> None:
         #!/usr/bin/env bash
         set -euo pipefail
         python3 - "${LEHOME_CAMPAIGN_ROOT}" "${LEHOME_ATTEMPT_MATRIX}" "${LEHOME_ROUND_ID}" "${LEHOME_SNAPSHOT_SOURCE_TEST_CASE}" <<'PY'
-        import hashlib, json, sqlite3, sys
+        import hashlib, json, os, sqlite3, sys
         from pathlib import Path
         root, descriptor, round_id, case = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
         if case == 'absent-ledger': raise SystemExit(1)
         row = json.loads(descriptor.read_text())[0]
         attempt = hashlib.sha256(json.dumps({'schedule_index': 0, 'assignment': row}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         root.mkdir(parents=True, exist_ok=True)
+        (root / 'base-launch.json').write_text(json.dumps({'initial_garment': os.environ.get('LEHOME_INITIAL_GARMENT')}))
         con = sqlite3.connect(root / 'ledger.sqlite3')
         con.execute('create table events (event_type text, attempt_id text)')
         con.execute('insert into events values (?, ?)', ('rejected' if case == 'rejected' else 'accepted', attempt))
@@ -154,7 +155,13 @@ def _fake_snapshot_source_base(path: Path) -> None:
 
 
 def _run_snapshot_source_bootstrap(
-    tmp_path: Path, case: str, *, runtime_source_root: Path | None = None, clear_pythonpath: bool = False,
+    tmp_path: Path,
+    case: str,
+    *,
+    garment: str = "Top_Long_Seen_0",
+    category: str = "top_long",
+    runtime_source_root: Path | None = None,
+    clear_pythonpath: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     # The contract rejects every symlink ancestor. pytest's ordinary macOS
     # temporary root is addressed through /var, a symlink to /private.
@@ -167,7 +174,7 @@ def _run_snapshot_source_bootstrap(
     elif runtime_source_root is not None and runtime_source_root.is_relative_to("/private"):
         runtime_source_root = Path("/System/Volumes/Data/private") / runtime_source_root.relative_to("/private")
     descriptor = tmp_path / "source-descriptor.json"
-    _write(descriptor, [{"snapshot_source_bootstrap": True, "category": "top_long", "garment": "Top_Long_Seen_0", "seed": 50110, "source_seed": 50110}])
+    _write(descriptor, [{"snapshot_source_bootstrap": True, "category": category, "garment": garment, "seed": 50110, "source_seed": 50110}])
     digest = hashlib.sha256(descriptor.read_bytes()).hexdigest()
     run_id = hashlib.sha256(f"{tmp_path}:{case}".encode()).hexdigest()[:32]
     identity = hashlib.sha256(f"{run_id}:{digest}".encode("ascii")).hexdigest()[:20]
@@ -484,6 +491,19 @@ def test_snapshot_source_bootstrap_classifies_rejection_and_infrastructure_disti
     assert not (nonzero_root / "snapshot-source-bootstrap.envelope.json").exists()
 
 
+def test_snapshot_source_bootstrap_passes_a_nondefault_descriptor_garment_before_launch(tmp_path: Path) -> None:
+    result, root = _run_snapshot_source_bootstrap(
+        tmp_path / "pant-long",
+        "rejected",
+        garment="Pant_Long_Seen_4",
+        category="pant_long",
+    )
+    assert result.returncode == 3
+    assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
+        "initial_garment": "Pant_Long_Seen_4",
+    }
+
+
 @pytest.mark.parametrize("case", ["no-h16", "bad-manifest", "receipt-not-readback", "receipt-mismatch", "strict-seal"])
 def test_snapshot_source_bootstrap_fails_closed_after_accepted_terminal(tmp_path: Path, case: str) -> None:
     result, root = _run_snapshot_source_bootstrap(tmp_path / case, case)
@@ -522,6 +542,9 @@ def test_snapshot_source_bootstrap_writes_one_audit_only_envelope_atomically(tmp
     assert payload["source_only"] is True
     assert payload["readback_verified"] is True
     assert len(payload["episode_sha256s"]) == len(payload["immutable_revisions"]) == 1
+    assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
+        "initial_garment": "Top_Long_Seen_0",
+    }
     assert not list(root.glob("*.strict.seal.json"))
     with pytest.raises(ValueError):
         _seal(envelope)

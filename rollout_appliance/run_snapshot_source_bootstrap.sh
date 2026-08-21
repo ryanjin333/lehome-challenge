@@ -34,6 +34,26 @@ fi
 if [ "$(sha256sum "${DESCRIPTOR}" | awk '{print $1}')" != "${DESCRIPTOR_SHA256}" ]; then
   echo "snapshot source bootstrap descriptor hash changed" >&2; exit 2
 fi
+INITIAL_GARMENT="$(python3 - "${DESCRIPTOR}" <<'PY'
+import json, re, sys
+from pathlib import Path
+
+try:
+    payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, ValueError) as error:
+    raise SystemExit(f"snapshot source bootstrap descriptor is unreadable: {error}")
+if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+    raise SystemExit("snapshot source bootstrap descriptor must contain exactly one assignment")
+row = payload[0]
+garment = row.get("garment")
+if not isinstance(garment, str) or re.fullmatch(r"[A-Za-z0-9_.-]+", garment) is None:
+    raise SystemExit("snapshot source bootstrap garment is invalid")
+garment_name = row.get("garment_name")
+if garment_name is not None and garment_name != garment:
+    raise SystemExit("snapshot source bootstrap garment identity is inconsistent")
+print(garment)
+PY
+)" || exit 2
 identity="$(python3 - "${RUN_ID}" "${DESCRIPTOR_SHA256}" <<'PY'
 import hashlib, sys
 print(hashlib.sha256(f"{sys.argv[1]}:{sys.argv[2]}".encode("ascii")).hexdigest()[:20])
@@ -49,6 +69,7 @@ env LEHOME_WORKSPACE="${WORKSPACE}" LEHOME_CAMPAIGN_ROOT="${ROOT}" \
   LEHOME_ATTEMPT_MATRIX="${DESCRIPTOR}" LEHOME_ATTEMPT_MATRIX_SHA256="${DESCRIPTOR_SHA256}" \
   LEHOME_RUN_ID="${RUN_ID}" LEHOME_ROUND_ID="snapshot-source-bootstrap-${identity}-unsealed-source" \
   LEHOME_WORKER_COUNT=1 LEHOME_MAX_ATTEMPTS=1 LEHOME_TARGET_ACCEPTED=1 \
+  LEHOME_INITIAL_GARMENT="${INITIAL_GARMENT}" \
   LEHOME_ENABLE_HF_UPLOAD=1 LEHOME_SKIP_ROUND_SEAL=1 LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP=1 \
   LEHOME_CONTROLLED_RECOVERY_SMOKE=0 LEHOME_RESUME_PREEMPTED_ROLLOUT=0 \
   bash "${BASE}"
