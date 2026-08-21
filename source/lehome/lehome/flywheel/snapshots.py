@@ -11,6 +11,9 @@ from typing import Any, Mapping, Protocol
 import numpy as np
 
 
+PHYSX_CLOTH_STATE_AUTHORITY = "physx_cloth_view_world_v1"
+
+
 class SnapshotAdapter(Protocol):
     def flywheel_capture_state(self) -> Mapping[str, object]: ...
 
@@ -52,10 +55,18 @@ class Snapshot:
     # Exact USD/camera/root properties mutated by flywheel randomization.
     # Optional for pre-randomization snapshots produced by older callers.
     scene_state: dict[str, object] = field(default_factory=dict)
+    # Version 2 snapshots are captured from the live PhysX cloth view in world
+    # coordinates. Version 1 is retained only for unrelated legacy callers and
+    # is never admitted by controlled-recovery v3.
+    cloth_state_authority: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version not in (1, 2):
             raise ValueError("unsupported snapshot schema version")
+        if self.schema_version == 1 and self.cloth_state_authority is not None:
+            raise ValueError("snapshot v1 cannot declare a cloth state authority")
+        if self.schema_version == 2 and self.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY:
+            raise ValueError("snapshot v2 requires the live PhysX cloth state authority")
         if len(self.robot_position) != 12 or len(self.robot_velocity) != 12:
             raise ValueError("snapshot robot vectors must be 12-D")
         if len(self.cloth_position) != len(self.cloth_velocity) or not self.cloth_position:
@@ -72,7 +83,7 @@ class Snapshot:
             raise ValueError("snapshot values must be finite")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "robot_position": list(self.robot_position),
             "robot_velocity": list(self.robot_velocity),
@@ -83,6 +94,9 @@ class Snapshot:
             "randomization": _json_round_trip(self.randomization),
             "scene_state": _json_round_trip(self.scene_state),
         }
+        if self.schema_version == 2:
+            payload["cloth_state_authority"] = self.cloth_state_authority
+        return payload
 
 
 def _read(adapter: object, name: str) -> object:
@@ -101,8 +115,9 @@ def capture_snapshot(adapter: SnapshotAdapter | object, *, randomization: Mappin
         "rng_state": _read(adapter, "rng_state"),
         "garment_name": _read(adapter, "garment_name"),
     }
+    authority = state.get("cloth_state_authority")
     return Snapshot(
-        schema_version=1,
+        schema_version=2 if authority is not None else 1,
         robot_position=_finite_tuple(state["robot_position"], name="robot_position"),
         robot_velocity=_finite_tuple(state["robot_velocity"], name="robot_velocity"),
         cloth_position=_finite_xyz(state["cloth_position"], name="cloth_position"),
@@ -111,6 +126,7 @@ def capture_snapshot(adapter: SnapshotAdapter | object, *, randomization: Mappin
         garment_name=str(state["garment_name"]),
         randomization=_json_round_trip(dict(randomization)),
         scene_state=_json_round_trip(state.get("scene_state", {})),
+        cloth_state_authority=None if authority is None else str(authority),
     )
 
 
@@ -139,4 +155,4 @@ def restore_snapshot(adapter: SnapshotAdapter | object, snapshot: Snapshot) -> N
         adapter.scene_state = _json_round_trip(snapshot.scene_state)
 
 
-__all__ = ["Snapshot", "SnapshotAdapter", "canonical_reset_hash", "capture_snapshot", "restore_snapshot"]
+__all__ = ["PHYSX_CLOTH_STATE_AUTHORITY", "Snapshot", "SnapshotAdapter", "canonical_reset_hash", "capture_snapshot", "restore_snapshot"]

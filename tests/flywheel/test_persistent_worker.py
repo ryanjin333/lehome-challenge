@@ -63,7 +63,7 @@ class FakeSession:
             "cloth_device": "cpu",
             "renderer_device": "cuda:0",
             "camera_device": "cuda:0",
-            "cloth_backend": "usd",
+            "cloth_backend": "physx_cloth_view",
             "cloth_readback": {"positions": 1, "velocities": 1},
             "visible_contact_canary": {"observed": False},
             "policy_device": "cuda:0",
@@ -124,7 +124,7 @@ def test_worker_reuses_authenticated_source_seed_for_controlled_recovery_reset(t
     controller = FakeController([
         Lease(Attempt("attempt-controlled", {
             "garment": "Pant_Long_Seen_4", "seed": 71_000,
-                "source_seed": 50_110, "recovery_kind": "controlled_success_recovery_snapshot_v2",
+                "source_seed": 50_110, "recovery_kind": "controlled_success_recovery_snapshot_v3",
         }), "lease-controlled"),
     ])
     worker = PersistentRolloutWorker(
@@ -715,7 +715,7 @@ def test_runtime_worker_loads_generated_controlled_materialization_shape(tmp_pat
         {
             "attempt_id": f"controlled-{index}", "trial_id": f"controlled-{index}",
             "category": category, "category_acceptance_cap": caps[category],
-            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v2",
+            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v3",
             "controlled_matrix_sha256": "a" * 64, "perturbation_seed": 71_000 + index,
             "perturbation_fingerprint": f"{index + 100:064x}",
             "source_state_perturbation_fingerprint": f"{index + 200:064x}",
@@ -731,7 +731,7 @@ def test_runtime_worker_loads_generated_controlled_materialization_shape(tmp_pat
         for index, category in enumerate(categories)
     ]
     path = tmp_path / "materialization.json"
-    path.write_text(json.dumps({"schema_version": 2, "kind": "controlled_success_recovery_materialization_v2", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}), encoding="utf-8")
+    path.write_text(json.dumps({"schema_version": 3, "kind": "controlled_success_recovery_materialization_v3", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}), encoding="utf-8")
     assert _load_matrix(path) == rows
 
 

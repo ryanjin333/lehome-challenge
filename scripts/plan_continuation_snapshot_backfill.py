@@ -2,7 +2,7 @@
 """Report whether a sealed recovery audit can feed the H16 snapshot contract.
 
 This is deliberately a planner, not a migration: it never synthesizes a
-physical Snapshot from annotations or a replay prefix.  Pre-v3 audits are
+physical Snapshot from annotations or a replay prefix.  Pre-v4 audits are
 historical evidence only and require fresh autonomous source collection.
 """
 
@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Mapping
 
 
-_CONTRACT = "authenticated_full_snapshot_at_fresh_h16_next_action_boundary_physical_state_authority"
+_CONTRACT = "authenticated_physx_cloth_view_snapshot_at_fresh_h16_next_action_boundary_v1"
 
 
 def _canonical(value: object) -> bytes:
@@ -48,15 +48,15 @@ def plan_continuation_snapshot_backfill(*, audit_path: str | Path) -> dict[str, 
     if len(set(existing_ids)) != len(existing_ids):
         raise ValueError("recovery audit admitted episode IDs collide")
 
-    v3 = (
-        audit.get("schema_version") == 3
+    current = (
+        audit.get("schema_version") == 4
         and audit.get("kind") == "lehome_successful_recovery_audit"
         and audit.get("continuation_contract") == _CONTRACT
     )
     # A sealed v2 audit has no selected snapshot file/hash binding.  Even if a
     # later filesystem happens to contain a similarly named JSON file, it is
     # not immutable evidence for those historic rows and remains ineligible.
-    eligible = len(audit.get("selected_recoveries", [])) if v3 and isinstance(audit.get("selected_recoveries"), list) else 0
+    eligible = len(audit.get("selected_recoveries", [])) if current and isinstance(audit.get("selected_recoveries"), list) else 0
     document: dict[str, object] = {
         "schema_version": 1,
         "kind": "lehome_continuation_snapshot_backfill_plan",
@@ -64,8 +64,8 @@ def plan_continuation_snapshot_backfill(*, audit_path: str | Path) -> dict[str, 
         "audit_schema_version": audit.get("schema_version"),
         "existing_accepted_success_count": len(admitted),
         "eligible_snapshot_contract_source_count": eligible,
-        "legacy_audit_ineligible": not v3,
-        "action": "fresh_autonomous_success_collection_required" if not v3 else "audit_v3_sources_may_be_materialized",
+        "legacy_audit_ineligible": not current,
+        "action": "fresh_autonomous_success_collection_required" if not current else "audit_v4_sources_may_be_materialized",
         "required_source_artifact": {
             "path_template": "snapshots/continuations/{step:06d}.json",
             "capture_timing": "before_action_at_every_positive_h16_policy_boundary",

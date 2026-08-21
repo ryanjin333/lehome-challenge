@@ -63,7 +63,7 @@ def _load_attempt_matrix(
     from lehome.flywheel.recovery_collection import load_attempt_matrix
 
     matrix = load_attempt_matrix(path)
-    controlled = [item for item in matrix if item.get("recovery_kind") == "controlled_success_recovery_snapshot_v2"]
+    controlled = [item for item in matrix if item.get("recovery_kind") == "controlled_success_recovery_snapshot_v3"]
     if controlled:
         if len(controlled) != len(matrix):
             raise ValueError("controlled recovery matrix must not mix legacy assignments")
@@ -297,7 +297,7 @@ def run_sealer_once(
     """Seal the exact accepted ledger set after every Hub readback is durable."""
 
     matrix = _load_attempt_matrix(attempt_matrix)
-    controlled = bool(matrix and matrix[0].get("recovery_kind") == "controlled_success_recovery_snapshot_v2")
+    controlled = bool(matrix and matrix[0].get("recovery_kind") == "controlled_success_recovery_snapshot_v3")
     ledger = TaskLedger(
         database,
         attempt_matrix=matrix,

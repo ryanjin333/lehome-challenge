@@ -183,7 +183,7 @@ if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
 row = rows[0]
 for key in ("controlled_smoke", "controlled_smoke_matrix_sha256", "controlled_smoke_materialization_sha256"):
     if key not in row: raise SystemExit("controlled smoke descriptor lineage is incomplete")
-if row.get("controlled_smoke") is not True or row.get("recovery_kind") != "controlled_success_recovery_snapshot_v2": raise SystemExit("controlled smoke descriptor kind is invalid")
+if row.get("controlled_smoke") is not True or row.get("recovery_kind") != "controlled_success_recovery_snapshot_v3": raise SystemExit("controlled smoke descriptor kind is invalid")
 for key in ("controlled_smoke_matrix_sha256", "controlled_smoke_materialization_sha256"):
     if not isinstance(row.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", row[key]) is None: raise SystemExit("controlled smoke descriptor hash is invalid")
 identity = hashlib.sha256(f"{run_id}:{full_matrix}:{full_materialization}".encode("ascii")).hexdigest()[:20]

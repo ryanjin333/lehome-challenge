@@ -272,7 +272,7 @@ def _write_persistent_flywheel_manifest(
     }
     if verified_restore is not None:
         payload.update(verified_restore)
-    if assignment.get("recovery_kind") == "controlled_success_recovery_snapshot_v2":
+    if assignment.get("recovery_kind") == "controlled_success_recovery_snapshot_v3":
         controlled_keys = {
             "recovery_kind", "category", "garment", "source_round_id", "source_episode_id", "source_episode_digest",
             "source_immutable_revision", "source_reset", "source_reset_sha256",
@@ -346,8 +346,8 @@ class EvaluationSession:
         backend = getattr(self.env, "_flywheel_cloth_backend", None)
         if not callable(backend):
             raise ValueError("persistent evaluation cannot observe CPU cloth backend")
-        if backend() != "usd":
-            raise ValueError("persistent evaluation requires observed USD CPU cloth backend")
+        if backend() != "physx_cloth_view":
+            raise ValueError("persistent evaluation requires the live PhysX cloth backend")
         receipt = {
             "simulation_device": simulation_device,
             "cloth_device": simulation_device,
@@ -356,20 +356,21 @@ class EvaluationSession:
             "camera_device": camera_device,
             "policy_device": str(getattr(self.policy, "runtime_device", "")),
         }
-        # Startup admission must not touch USD points or camera RGB while other
-        # Isaac workers already own the GPU. Live cloth/contact evidence is
-        # collected only after the first reset.
+        # Startup admission validates the initialized backend identity without
+        # reading live cloth particles or camera RGB while other Isaac workers
+        # may still own the GPU startup path. Fresh cloth/contact evidence is
+        # collected only after the episode reset.
         if getattr(self, "_include_live_runtime_evidence", False):
-            readback = getattr(self.env, "_flywheel_cpu_cloth_state", None)
+            readback = getattr(self.env, "_flywheel_physics_cloth_state", None)
             if not callable(readback):
-                raise ValueError("persistent evaluation cannot observe CPU cloth readback")
+                raise ValueError("persistent evaluation cannot observe PhysX cloth readback")
             positions, velocities = readback()
             try:
                 position_count, velocity_count = len(positions), len(velocities)
             except TypeError as error:
-                raise ValueError("persistent evaluation CPU cloth readback is unavailable") from error
+                raise ValueError("persistent evaluation PhysX cloth readback is unavailable") from error
             if position_count <= 0 or velocity_count <= 0 or position_count != velocity_count:
-                raise ValueError("persistent evaluation CPU cloth readback is invalid")
+                raise ValueError("persistent evaluation PhysX cloth readback is invalid")
             receipt["cloth_readback"] = {"positions": position_count, "velocities": velocity_count}
         if getattr(self, "_include_contact_canary", False):
             canary = getattr(self.env, "flywheel_visible_garment_contact", None)
@@ -400,6 +401,7 @@ class EvaluationSession:
             garment_name=str(payload["garment_name"]),
             randomization=dict(payload.get("randomization") or {}),
             scene_state=dict(payload.get("scene_state") or {}),
+            cloth_state_authority=payload.get("cloth_state_authority"),
         )
         restore_snapshot(self.env, snapshot)
 
@@ -621,6 +623,7 @@ def run_evaluation_loop(
                 garment_name=str(payload["garment_name"]),
                 randomization=dict(payload.get("randomization") or {}),
                 scene_state=dict(payload.get("scene_state") or {}),
+                cloth_state_authority=payload.get("cloth_state_authority"),
             )
             restore_snapshot(env, snapshot)
             args.restore_snapshot = None

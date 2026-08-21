@@ -301,7 +301,7 @@ def test_rollout_preemption_reuses_controlled_materialization_rows_without_chang
         {
             "attempt_id": f"controlled-{index}", "trial_id": f"controlled-{index}",
             "category": category, "category_acceptance_cap": caps[category],
-            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v2",
+            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v3",
             "controlled_matrix_sha256": "a" * 64, "perturbation_seed": 71_000 + index,
             "perturbation_fingerprint": f"{index + 100:064x}",
             "source_state_perturbation_fingerprint": f"{index + 200:064x}",
@@ -316,7 +316,7 @@ def test_rollout_preemption_reuses_controlled_materialization_rows_without_chang
         for index, category in enumerate(categories)
     ]
     matrix_path = run_root / "materialization.json"
-    matrix_path.write_text(json.dumps({"schema_version": 2, "kind": "controlled_success_recovery_materialization_v2", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}), encoding="utf-8")
+    matrix_path.write_text(json.dumps({"schema_version": 3, "kind": "controlled_success_recovery_materialization_v3", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}), encoding="utf-8")
     database = run_root / "ledger.sqlite3"
     ledger = TaskLedger(database, attempt_matrix=rows, max_attempts=8, target_accepted=8)
     original_ids = [attempt.attempt_id for attempt in ledger.attempts()]; ledger.close()

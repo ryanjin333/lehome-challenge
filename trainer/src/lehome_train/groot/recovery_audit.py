@@ -19,7 +19,7 @@ import re
 import tempfile
 from typing import Any, Mapping, Sequence
 
-from lehome.flywheel.snapshots import Snapshot
+from lehome.flywheel.snapshots import PHYSX_CLOTH_STATE_AUTHORITY, Snapshot
 from lehome_train.groot.rollout_source_adapter import _accepted_episode, _seal
 from lehome_train.io import canonical_json_bytes, canonical_json_sha256, sha256_file
 
@@ -28,7 +28,7 @@ _CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
 _HORIZON = 16
 _SOURCE_ROUND_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 _SOURCE_REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_CONTINUATION_CONTRACT = "authenticated_full_snapshot_at_fresh_h16_next_action_boundary_physical_state_authority"
+_CONTINUATION_CONTRACT = "authenticated_physx_cloth_view_snapshot_at_fresh_h16_next_action_boundary_v1"
 
 
 @dataclass(frozen=True)
@@ -247,6 +247,7 @@ def _snapshot(value: object) -> Snapshot:
             garment_name=str(value["garment_name"]),
             randomization=dict(value.get("randomization") or {}),
             scene_state=dict(value.get("scene_state") or {}),
+            cloth_state_authority=value.get("cloth_state_authority"),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("continuation snapshot does not satisfy the Snapshot schema") from error
@@ -259,7 +260,7 @@ def _continuation_start(
     """Bind a physical H=16 snapshot to its next source policy request.
 
     A pre-action annotation alone authenticates the policy-cache boundary, not
-    the simulator's hidden physical state.  Version 3 therefore admits only a
+    the simulator's hidden physical state.  Version 4 therefore admits only a
     complete Snapshot captured at that same boundary and checksum-bound into
     the sealed source artifact.  Missing legacy snapshots are deliberately an
     exclusion, never an invitation to open-loop replay a prefix.
@@ -278,6 +279,9 @@ def _continuation_start(
         ))
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return None
+    if (reset_snapshot.schema_version != 2
+            or reset_snapshot.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY):
+        return None
 
     for index in range(event.adverse_start, event.confirmation):
         row = rows[index]
@@ -292,6 +296,9 @@ def _continuation_start(
         try:
             snapshot = _snapshot(json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_strict_pairs, parse_constant=_reject_constant))
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            continue
+        if (snapshot.schema_version != 2
+                or snapshot.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY):
             continue
         randomization = dict(snapshot.randomization)
         continuation_step = randomization.pop("continuation_step", None)
@@ -579,7 +586,7 @@ def audit_successful_recoveries(
     counts = {category: sum(row["category"] == category for row in selected) for category in _CATEGORIES}
     shortfalls = {category: max(0, per_category_minimum - count) for category, count in counts.items()}
     document: dict[str, object] = {
-        "schema_version": 3, "kind": "lehome_successful_recovery_audit", "horizon": _HORIZON,
+        "schema_version": 4, "kind": "lehome_successful_recovery_audit", "horizon": _HORIZON,
         "thresholds": asdict(thresholds), "per_category_minimum": per_category_minimum,
         "rounds": round_records, "admitted_episodes": admitted,
         "selected_recoveries": selected, "duplicates": duplicates, "exclusions": exclusions,

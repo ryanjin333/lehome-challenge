@@ -9,7 +9,7 @@ import sys
 import types
 
 
-def test_cpu_visible_contact_uses_the_same_authoritative_usd_readback_as_runtime_evidence() -> None:
+def test_cpu_visible_contact_uses_the_same_authoritative_physx_readback_as_runtime_evidence() -> None:
     source_path = (
         Path(__file__).resolve().parents[1]
         / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
@@ -24,8 +24,72 @@ def test_cpu_visible_contact_uses_the_same_authoritative_usd_readback_as_runtime
     )
     method_source = ast.get_source_segment(source, method)
     assert method_source is not None
-    assert "self._flywheel_cpu_cloth_state()" in method_source
+    assert "self._flywheel_physics_cloth_state()" in method_source
+    assert "self._flywheel_cpu_cloth_state()" not in method_source
     assert "get_current_mesh_points" not in method_source
+
+
+def test_garment_initializes_the_physx_cloth_view_on_cpu_and_cuda() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/assets/object/Garment.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    assert "from pxr import Vt" in source
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "initialize"
+    )
+    method_source = ast.get_source_segment(source, method)
+    assert method_source is not None
+    assert 'if "cuda" in self._device' not in method_source
+    assert "self._cloth_prim_view.initialize(self.physics_sim_view)" in method_source
+    assert "is_physics_handle_valid" in method_source
+
+
+def test_garment_reset_uses_the_authoritative_physx_view_on_cpu_and_cuda() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/assets/object/Garment.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    methods = {
+        node.name: ast.get_source_segment(source, node)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"_get_initial_info", "reset"}
+    }
+    assert "get_world_positions" in methods["_get_initial_info"]
+    assert "get_velocities" in methods["_get_initial_info"]
+    assert "self._device" not in methods["_get_initial_info"]
+    assert "set_world_positions" in methods["reset"]
+    assert "set_velocities" in methods["reset"]
+    assert 'if self._device == "cpu"' not in methods["reset"]
+
+
+def test_garment_restore_keeps_legacy_cpu_replay_separate_from_controlled_physx_restore() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "flywheel_restore_state"
+    )
+    method_source = ast.get_source_segment(source, method)
+    assert method_source is not None
+    assert "schema_version == 1" in method_source
+    assert "_flywheel_legacy_cpu_cloth_attributes" in method_source
+    assert "schema_version == 2" in method_source
+    assert 'cloth_state_authority", None) == "physx_cloth_view_world_v1"' in method_source
 
 
 def _cpu_cloth_evidence(env) -> None:
@@ -33,8 +97,8 @@ def _cpu_cloth_evidence(env) -> None:
         env.renderer_device = "cuda:0"
     if not hasattr(env, "camera_device"):
         env.camera_device = env.renderer_device
-    env._flywheel_cloth_backend = lambda: "usd"
-    env._flywheel_cpu_cloth_state = lambda: ([0.0], [0.0])
+    env._flywheel_cloth_backend = lambda: "physx_cloth_view"
+    env._flywheel_physics_cloth_state = lambda: ([0.0], [0.0])
     env.flywheel_visible_garment_contact = lambda: {"observed": False}
 
 
@@ -315,8 +379,8 @@ def test_persistent_manifest_hands_controlled_recovery_identity_to_validator(mon
     reset = tmp_path / "source-reset.json"
     continuation_snapshot = tmp_path / "source-continuation.json"
     annotations = tmp_path / "source-annotations.jsonl"
-    reset.write_text(json.dumps({"schema_version": 1, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": "Top_Long_Seen_0", "randomization": {"strategy": "canonical"}, "scene_state": {}}), encoding="utf-8")
-    continuation_snapshot.write_text(json.dumps({"schema_version": 1, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": "Top_Long_Seen_0", "randomization": {"strategy": "canonical", "continuation_step": 16}, "scene_state": {}}), encoding="utf-8")
+    reset.write_text(json.dumps({"schema_version": 2, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": "Top_Long_Seen_0", "randomization": {"strategy": "canonical"}, "scene_state": {}, "cloth_state_authority": "physx_cloth_view_world_v1"}), encoding="utf-8")
+    continuation_snapshot.write_text(json.dumps({"schema_version": 2, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": "Top_Long_Seen_0", "randomization": {"strategy": "canonical", "continuation_step": 16}, "scene_state": {}, "cloth_state_authority": "physx_cloth_view_world_v1"}), encoding="utf-8")
     annotations.write_text(
         "".join(
                 json.dumps({"step": step, "action": [float(step)] * 12, "success": step == 19}) + "\n"
@@ -340,7 +404,7 @@ def test_persistent_manifest_hands_controlled_recovery_identity_to_validator(mon
         ).encode("utf-8")
     ).hexdigest()
     assignment = {
-        "recovery_kind": "controlled_success_recovery_snapshot_v2",
+        "recovery_kind": "controlled_success_recovery_snapshot_v3",
         "attempt_id": "controlled-top-long-0",
         "category": category,
         "garment": garment,

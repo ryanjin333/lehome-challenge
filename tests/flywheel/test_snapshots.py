@@ -57,6 +57,14 @@ class SceneStateAdapter(FakeAdapter):
         self.scene_state = snapshot.scene_state
 
 
+class PhysicsClothAdapter(SceneStateAdapter):
+    def flywheel_capture_state(self):
+        return {
+            **super().flywheel_capture_state(),
+            "cloth_state_authority": "physx_cloth_view_world_v1",
+        }
+
+
 def test_snapshot_round_trip_restores_every_state_group() -> None:
     env = FakeAdapter()
     snapshot = capture_snapshot(env, randomization={"strategy": "canonical"})
@@ -102,3 +110,30 @@ def test_canonical_reset_hash_is_stable_and_changes_with_the_reset_state() -> No
     env.cloth_position[0, 0] += 0.01
     changed = capture_snapshot(env, randomization={"strategy": "canonical"})
     assert canonical_reset_hash(changed) != canonical_reset_hash(first)
+
+
+def test_physics_cloth_capture_emits_a_versioned_authority_contract() -> None:
+    snapshot = capture_snapshot(
+        PhysicsClothAdapter(), randomization={"strategy": "canonical"}
+    )
+
+    assert snapshot.schema_version == 2
+    assert snapshot.cloth_state_authority == "physx_cloth_view_world_v1"
+    assert snapshot.to_dict()["cloth_state_authority"] == "physx_cloth_view_world_v1"
+
+
+def test_version_two_snapshot_rejects_nonphysics_cloth_authority() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="cloth state authority"):
+        Snapshot(
+            schema_version=2,
+            robot_position=(0.0,) * 12,
+            robot_velocity=(0.0,) * 12,
+            cloth_position=((0.0, 0.0, 0.0),),
+            cloth_velocity=((0.0, 0.0, 0.0),),
+            rng_state={},
+            garment_name="Pant_Long_Seen_0",
+            randomization={"strategy": "canonical"},
+            cloth_state_authority="usd_authored_points_v1",
+        )

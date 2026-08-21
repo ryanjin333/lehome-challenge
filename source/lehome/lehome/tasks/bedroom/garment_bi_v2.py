@@ -748,13 +748,13 @@ class GarmentEnv(DirectRLEnv):
         return True
 
     @staticmethod
-    def _flywheel_local_cloth_arrays(positions, velocities) -> tuple[np.ndarray, np.ndarray]:
-        """Validate the CPU USD cloth representation before snapshotting or writing it."""
+    def _flywheel_cloth_arrays(positions, velocities) -> tuple[np.ndarray, np.ndarray]:
+        """Validate live PhysX cloth-view particle state."""
         try:
             local_positions = np.asarray(positions, dtype=np.float32)
             local_velocities = np.asarray(velocities, dtype=np.float32)
         except (TypeError, ValueError) as error:
-            raise RuntimeError("CPU garment USD cloth state is not numeric") from error
+            raise RuntimeError("garment PhysX cloth state is not numeric") from error
         if (
             local_positions.ndim != 2
             or local_velocities.ndim != 2
@@ -762,47 +762,76 @@ class GarmentEnv(DirectRLEnv):
             or local_velocities.shape[1:] != (3,)
             or local_positions.shape[0] != local_velocities.shape[0]
         ):
-            raise RuntimeError("CPU garment USD cloth positions and velocities must be aligned Nx3 arrays")
+            raise RuntimeError("garment PhysX cloth positions and velocities must be aligned Nx3 arrays")
         if not np.isfinite(local_positions).all() or not np.isfinite(local_velocities).all():
-            raise RuntimeError("CPU garment USD cloth positions and velocities must be finite")
+            raise RuntimeError("garment PhysX cloth positions and velocities must be finite")
         return local_positions.copy(), local_velocities.copy()
 
-    def _flywheel_cpu_cloth_attributes(self):
+    def _flywheel_legacy_cpu_cloth_attributes(self):
+        """Expose USD particles only for restoring pre-PhysX legacy snapshots."""
+
         prim = getattr(self.object, "_prim", None)
         get_attribute = getattr(prim, "GetAttribute", None)
         if not callable(get_attribute):
-            raise RuntimeError("CPU garment does not expose a USD prim for cloth state")
+            raise RuntimeError("legacy CPU garment does not expose a USD prim for cloth state")
         positions_attr = get_attribute("points")
         velocities_attr = get_attribute("velocities")
         if positions_attr is None or velocities_attr is None:
-            raise RuntimeError("CPU garment USD prim is missing points or velocities")
-        if not callable(getattr(positions_attr, "Get", None)) or not callable(getattr(velocities_attr, "Get", None)):
-            raise RuntimeError("CPU garment USD points or velocities are unreadable")
+            raise RuntimeError("legacy CPU garment USD prim is missing points or velocities")
+        if (not callable(getattr(positions_attr, "Get", None))
+                or not callable(getattr(velocities_attr, "Get", None))):
+            raise RuntimeError("legacy CPU garment USD points or velocities are unreadable")
         return positions_attr, velocities_attr
 
-    def _flywheel_cpu_cloth_state(self) -> tuple[np.ndarray, np.ndarray]:
-        positions_attr, velocities_attr = self._flywheel_cpu_cloth_attributes()
-        positions = positions_attr.Get()
-        velocities = velocities_attr.Get()
+    def _flywheel_legacy_cpu_cloth_state(self) -> tuple[np.ndarray, np.ndarray]:
+        positions_attr, velocities_attr = self._flywheel_legacy_cpu_cloth_attributes()
+        positions, velocities = positions_attr.Get(), velocities_attr.Get()
         if positions is None or velocities is None:
-            raise RuntimeError("CPU garment USD points or velocities are unset")
-        return self._flywheel_local_cloth_arrays(positions, velocities)
+            raise RuntimeError("legacy CPU garment USD points or velocities are unset")
+        return self._flywheel_cloth_arrays(positions, velocities)
 
     @staticmethod
-    def _flywheel_usd_vec3f_array(values: np.ndarray):
-        """Use USD's native vector array when available, with a test-only plain-sequence fallback."""
+    def _flywheel_legacy_usd_vec3f_array(values: np.ndarray):
+        """Convert legacy CPU cloth arrays to USD's native vector representation."""
+
         try:
             from pxr import Gf, Vt
         except ImportError:
             return values.tolist()
         return Vt.Vec3fArray([Gf.Vec3f(*map(float, row)) for row in values])
 
+    def _flywheel_physics_cloth_view(self):
+        cloth = getattr(self.object, "_cloth_prim_view", None)
+        valid = getattr(cloth, "is_physics_handle_valid", None)
+        required = (
+            "get_world_positions", "get_velocities",
+            "set_world_positions", "set_velocities",
+        )
+        if cloth is None or not callable(valid) or not bool(valid()):
+            raise RuntimeError("garment PhysX cloth view is not initialized")
+        if any(not callable(getattr(cloth, method, None)) for method in required):
+            raise RuntimeError("garment PhysX cloth view is not fully restorable")
+        return cloth
+
+    def _flywheel_physics_cloth_state(self) -> tuple[np.ndarray, np.ndarray]:
+        cloth = self._flywheel_physics_cloth_view()
+
+        def _numpy(value):
+            return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+
+        positions = _numpy(cloth.get_world_positions())
+        velocities = _numpy(cloth.get_velocities())
+        if positions.ndim == 3:
+            positions = positions[0]
+        if velocities.ndim == 3:
+            velocities = velocities[0]
+        return self._flywheel_cloth_arrays(positions, velocities)
+
     def _flywheel_cloth_backend(self) -> str:
         device = str(self.device).lower()
-        if device == "cpu":
-            return "usd"
-        if device == "cuda" or (device.startswith("cuda:") and device[5:].isdigit()):
-            return "tensor"
+        if device == "cpu" or device == "cuda" or (device.startswith("cuda:") and device[5:].isdigit()):
+            self._flywheel_physics_cloth_view()
+            return "physx_cloth_view"
         raise RuntimeError(f"flywheel cloth state does not support device {self.device!r}")
 
     def flywheel_runtime_devices(self) -> dict[str, str]:
@@ -837,20 +866,9 @@ class GarmentEnv(DirectRLEnv):
         def _numpy(value):
             return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
 
-        if self._flywheel_cloth_backend() == "usd":
-            positions, velocities = self._flywheel_cpu_cloth_state()
-        else:
-            if not hasattr(self.object, "_cloth_prim_view"):
-                raise RuntimeError("cannot snapshot an uninitialized garment")
-            cloth = self.object._cloth_prim_view
-            if not hasattr(cloth, "get_world_positions") or not hasattr(cloth, "get_velocities"):
-                raise RuntimeError("Isaac cloth view does not expose restorable position and velocity")
-            positions = _numpy(cloth.get_world_positions())
-            velocities = _numpy(cloth.get_velocities())
-            if positions.ndim == 3:
-                positions = positions[0]
-            if velocities.ndim == 3:
-                velocities = velocities[0]
+        if self._flywheel_cloth_backend() != "physx_cloth_view":
+            raise RuntimeError("controlled snapshots require the live PhysX cloth view")
+        positions, velocities = self._flywheel_physics_cloth_state()
         rng_name, rng_keys, rng_pos, rng_gauss, rng_cached = self.garment_rng.get_state()
         return {
             "robot_position": np.concatenate(
@@ -871,6 +889,7 @@ class GarmentEnv(DirectRLEnv):
             },
             "garment_name": self.cfg.garment_name,
             "scene_state": self._flywheel_capture_scene_state(),
+            "cloth_state_authority": "physx_cloth_view_world_v1",
         }
 
     def flywheel_visible_garment_contact(self) -> dict[str, object]:
@@ -881,20 +900,9 @@ class GarmentEnv(DirectRLEnv):
         def _numpy(value):
             return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
 
-        if self._flywheel_cloth_backend() == "tensor":
-            if not hasattr(self.object, "_cloth_prim_view"):
-                raise RuntimeError("Isaac cloth view is unavailable for CUDA contact evidence")
-            cloth = self.object._cloth_prim_view
-            if not hasattr(cloth, "get_world_positions"):
-                raise RuntimeError("Isaac cloth view does not expose particle positions for contact evidence")
-            particle_positions = _numpy(cloth.get_world_positions())
-            if particle_positions.ndim == 3: particle_positions = particle_positions[0]
-        else:
-            # Use the same authoritative USD particle readback that the CPU
-            # runtime receipt has already validated.  GarmentObject's display
-            # mesh helper can transiently return an empty array after a reset,
-            # even while the live USD cloth points remain complete.
-            particle_positions, _ = self._flywheel_cpu_cloth_state()
+        if self._flywheel_cloth_backend() != "physx_cloth_view":
+            raise RuntimeError("visible contact requires the live PhysX cloth view")
+        particle_positions, _ = self._flywheel_physics_cloth_state()
         gripper_positions = []
         for arm in (self.left_arm, self.right_arm):
             names = getattr(arm, "body_names", None)
@@ -918,21 +926,29 @@ class GarmentEnv(DirectRLEnv):
             raise RuntimeError("cannot restore an uninitialized garment")
         if snapshot.garment_name != self.cfg.garment_name:
             raise ValueError("snapshot garment does not match the active environment")
-        cloth_backend = self._flywheel_cloth_backend()
-        if cloth_backend == "usd":
-            positions_attr, velocities_attr = self._flywheel_cpu_cloth_attributes()
-            if not callable(getattr(positions_attr, "Set", None)) or not callable(getattr(velocities_attr, "Set", None)):
-                raise RuntimeError("CPU garment USD points or velocities are not writable")
-            cloth_position, cloth_velocity = self._flywheel_local_cloth_arrays(
-                snapshot.cloth_position, snapshot.cloth_velocity
-            )
+        schema_version = getattr(snapshot, "schema_version", None)
+        device_name = str(self.device).lower()
+        legacy_cpu = schema_version == 1 and device_name == "cpu"
+        cloth_position, cloth_velocity = self._flywheel_cloth_arrays(
+            snapshot.cloth_position, snapshot.cloth_velocity
+        )
+        if legacy_cpu:
+            positions_attr, velocities_attr = self._flywheel_legacy_cpu_cloth_attributes()
+            if (not callable(getattr(positions_attr, "Set", None))
+                    or not callable(getattr(velocities_attr, "Set", None))):
+                raise RuntimeError("legacy CPU garment USD points or velocities are not writable")
+            cloth = None
+        elif schema_version == 1:
+            if self._flywheel_cloth_backend() != "physx_cloth_view":
+                raise RuntimeError("legacy CUDA restore requires the live PhysX cloth view")
+            cloth = self._flywheel_physics_cloth_view()
+        elif (schema_version == 2
+                and getattr(snapshot, "cloth_state_authority", None) == "physx_cloth_view_world_v1"):
+            if self._flywheel_cloth_backend() != "physx_cloth_view":
+                raise RuntimeError("controlled restore requires the live PhysX cloth view")
+            cloth = self._flywheel_physics_cloth_view()
         else:
-            if not hasattr(self.object, "_cloth_prim_view"):
-                raise RuntimeError("cannot restore an uninitialized garment")
-            cloth = self.object._cloth_prim_view
-            required = ("set_world_positions", "set_velocities")
-            if any(not hasattr(cloth, method) for method in required):
-                raise RuntimeError("Isaac cloth view does not expose restorable position and velocity")
+            raise ValueError("snapshot has no supported cloth-state authority")
         rng_state = snapshot.rng_state
         if rng_state.get("kind") != "numpy.RandomState":
             raise ValueError("unsupported flywheel RNG snapshot")
@@ -962,22 +978,24 @@ class GarmentEnv(DirectRLEnv):
             self._flywheel_restore_scene_state(snapshot.scene_state)
             if snapshot.randomization.get("strategy") == "canonical":
                 self._flywheel_randomization_baseline = dict(snapshot.scene_state)
-        # Scene restoration calls GarmentObject.set_all_pose(), which overwrites
-        # USD particle points.  Apply the snapshot cloth last for both backends.
-        if cloth_backend == "usd":
-            if positions_attr.Set(self._flywheel_usd_vec3f_array(cloth_position)) is False:
-                raise RuntimeError("CPU garment USD points write failed")
-            if velocities_attr.Set(self._flywheel_usd_vec3f_array(cloth_velocity)) is False:
-                raise RuntimeError("CPU garment USD velocities write failed")
-            observed_position, observed_velocity = self._flywheel_cpu_cloth_state()
-            if not (
-                np.allclose(observed_position, cloth_position, rtol=0.0, atol=1e-6)
-                and np.allclose(observed_velocity, cloth_velocity, rtol=0.0, atol=1e-6)
-            ):
-                raise RuntimeError("CPU garment USD cloth write readback mismatch")
+        # Scene restoration may author USD points. Apply the selected snapshot
+        # cloth representation last. Controlled recovery never reaches the
+        # legacy branch because its loader requires a v2 PhysX authority.
+        if legacy_cpu:
+            if positions_attr.Set(self._flywheel_legacy_usd_vec3f_array(cloth_position)) is False:
+                raise RuntimeError("legacy CPU garment USD points write failed")
+            if velocities_attr.Set(self._flywheel_legacy_usd_vec3f_array(cloth_velocity)) is False:
+                raise RuntimeError("legacy CPU garment USD velocities write failed")
+            observed_position, observed_velocity = self._flywheel_legacy_cpu_cloth_state()
         else:
-            cloth.set_world_positions(torch.tensor(snapshot.cloth_position, dtype=torch.float32, device=device).unsqueeze(0))
-            cloth.set_velocities(torch.tensor(snapshot.cloth_velocity, dtype=torch.float32, device=device).unsqueeze(0))
+            cloth.set_world_positions(torch.tensor(cloth_position, dtype=torch.float32, device=device).unsqueeze(0))
+            cloth.set_velocities(torch.tensor(cloth_velocity, dtype=torch.float32, device=device).unsqueeze(0))
+            observed_position, observed_velocity = self._flywheel_physics_cloth_state()
+        if not (
+            np.allclose(observed_position, cloth_position, rtol=0.0, atol=1e-6)
+            and np.allclose(observed_velocity, cloth_velocity, rtol=0.0, atol=1e-6)
+        ):
+            raise RuntimeError("garment cloth write readback mismatch")
         self._flywheel_randomization_receipt = dict(snapshot.randomization)
 
     def apply_flywheel_randomization(self, randomization) -> dict[str, object]:

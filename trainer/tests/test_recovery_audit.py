@@ -68,7 +68,7 @@ def _round(
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in annotations), encoding="utf-8",
         )
         _write(raw / "snapshots" / "reset.json", {
-            "schema_version": 1,
+            "schema_version": 2,
             "robot_position": [state_base] * 12,
             "robot_velocity": [0.0] * 12,
             "cloth_position": [[0.0, 0.0, 0.0]],
@@ -77,10 +77,11 @@ def _round(
             "garment_name": f"{category}-seen-0",
             "randomization": {"strategy": "canonical"},
             "scene_state": {},
+            "cloth_state_authority": "physx_cloth_view_world_v1",
         })
         for step in range(16, len(annotations), 16):
             _write(raw / "snapshots" / "continuations" / f"{step:06d}.json", {
-                "schema_version": 1,
+                "schema_version": 2,
                 "robot_position": [state_base + step / 1000] * 12,
                 "robot_velocity": [0.0] * 12,
                 "cloth_position": [[0.0, 0.0, 0.0]],
@@ -89,6 +90,7 @@ def _round(
                 "garment_name": f"{category}-seen-0",
                 "randomization": {"strategy": "canonical", "continuation_step": step},
                 "scene_state": {},
+                "cloth_state_authority": "physx_cloth_view_world_v1",
             })
         _write(raw / "episode.json", {
             "episode_id": attempt_id, "accepted_success": True, "outcome": "success",
@@ -316,7 +318,7 @@ def test_audit_advances_an_adverse_start_inside_a_cached_chunk_to_the_next_fresh
     )
 
     document = json.loads(output.read_text(encoding="utf-8"))
-    assert document["schema_version"] == 3
+    assert document["schema_version"] == 4
     selected = document["selected_recoveries"]
     assert len(selected) == 1
     continuation = selected[0]["continuation_start"]

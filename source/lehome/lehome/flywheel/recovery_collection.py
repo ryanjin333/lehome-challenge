@@ -17,16 +17,19 @@ import re
 import stat
 from typing import Any, Mapping, Sequence
 
-from lehome.flywheel.snapshots import Snapshot
+from lehome.flywheel.snapshots import PHYSX_CLOTH_STATE_AUTHORITY, Snapshot
 
 
-RECOVERY_KIND = "controlled_success_recovery_snapshot_v2"
+RECOVERY_KIND = "controlled_success_recovery_snapshot_v3"
 _SHA256_LENGTH = 64
 _LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_CLOTH_DISPLACEMENT_M = 0.01
 _MAX_CLOTH_VELOCITY_MPS = 0.05
 _MAX_GRIPPER_OFFSET_RAD = 0.08
 _REPLAY_FIDELITY_TOLERANCE_RAD = 0.005
+_ROBOT_VELOCITY_FIDELITY_TOLERANCE_RADPS = 0.005
+_CLOTH_POSITION_FIDELITY_TOLERANCE_M = 1e-5
+_CLOTH_VELOCITY_FIDELITY_TOLERANCE_MPS = 1e-5
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,24 +146,67 @@ def _continuation_state(value: object, *, category: object, garment: object, fin
     return state
 
 
-def _replay_fidelity(env: object, expected: Sequence[float]) -> Mapping[str, object]:
+def _replay_fidelity(env: object, expected: Snapshot) -> Mapping[str, object]:
     from lehome.flywheel.snapshots import capture_snapshot
 
-    observed = tuple(capture_snapshot(
+    observed = capture_snapshot(
         env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND},
-    ).robot_position)
-    if len(observed) != 12 or not all(math.isfinite(value) for value in observed):
+    )
+    if observed.schema_version != 2 or observed.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY:
+        raise ValueError("controlled recovery replay fidelity lacks PhysX cloth authority")
+    observed_robot = tuple(observed.robot_position)
+    observed_robot_velocity = tuple(observed.robot_velocity)
+    if (len(observed_robot) != 12 or len(observed_robot_velocity) != 12
+            or not all(math.isfinite(value) for value in (*observed_robot, *observed_robot_velocity))):
         raise ValueError("controlled recovery replay fidelity state is invalid")
-    max_error = max(abs(actual - target) for actual, target in zip(observed, expected, strict=True))
+    robot_error = max(abs(actual - target) for actual, target in zip(observed_robot, expected.robot_position, strict=True))
+    robot_velocity_error = max(
+        abs(actual - target)
+        for actual, target in zip(observed_robot_velocity, expected.robot_velocity, strict=True)
+    )
+    if len(observed.cloth_position) != len(expected.cloth_position) or len(observed.cloth_velocity) != len(expected.cloth_velocity):
+        raise ValueError("controlled recovery replay fidelity cloth shape is invalid")
+    cloth_position_error = max(
+        abs(actual - target)
+        for actual_point, target_point in zip(observed.cloth_position, expected.cloth_position, strict=True)
+        for actual, target in zip(actual_point, target_point, strict=True)
+    )
+    cloth_velocity_error = max(
+        abs(actual - target)
+        for actual_point, target_point in zip(observed.cloth_velocity, expected.cloth_velocity, strict=True)
+        for actual, target in zip(actual_point, target_point, strict=True)
+    )
+    def physical_state(snapshot: Snapshot) -> dict[str, object]:
+        return {
+            "robot_position": list(snapshot.robot_position),
+            "robot_velocity": list(snapshot.robot_velocity),
+            "cloth_position": [list(point) for point in snapshot.cloth_position],
+            "cloth_velocity": [list(point) for point in snapshot.cloth_velocity],
+            "cloth_state_authority": snapshot.cloth_state_authority,
+        }
+
     result = {
         "verified": True,
         "tolerance_rad": _REPLAY_FIDELITY_TOLERANCE_RAD,
-        "max_abs_error_rad": max_error,
-        "expected_state_sha256": hashlib.sha256(_canonical_bytes(list(expected))).hexdigest(),
-        "observed_state_sha256": hashlib.sha256(_canonical_bytes(list(observed))).hexdigest(),
+        "max_abs_error_rad": robot_error,
+        "robot_velocity_tolerance_radps": _ROBOT_VELOCITY_FIDELITY_TOLERANCE_RADPS,
+        "max_abs_robot_velocity_error_radps": robot_velocity_error,
+        "cloth_position_tolerance_m": _CLOTH_POSITION_FIDELITY_TOLERANCE_M,
+        "cloth_velocity_tolerance_mps": _CLOTH_VELOCITY_FIDELITY_TOLERANCE_MPS,
+        "max_abs_cloth_position_error_m": cloth_position_error,
+        "max_abs_cloth_velocity_error_mps": cloth_velocity_error,
+        "expected_state_sha256": hashlib.sha256(_canonical_bytes(physical_state(expected))).hexdigest(),
+        "observed_state_sha256": hashlib.sha256(_canonical_bytes(physical_state(observed))).hexdigest(),
+        "cloth_state_authority": PHYSX_CLOTH_STATE_AUTHORITY,
     }
-    if max_error > _REPLAY_FIDELITY_TOLERANCE_RAD:
+    if robot_error > _REPLAY_FIDELITY_TOLERANCE_RAD:
         raise ValueError("controlled recovery replay fidelity exceeds fixed robot-position tolerance")
+    if robot_velocity_error > _ROBOT_VELOCITY_FIDELITY_TOLERANCE_RADPS:
+        raise ValueError("controlled recovery replay fidelity exceeds fixed robot-velocity tolerance")
+    if cloth_position_error > _CLOTH_POSITION_FIDELITY_TOLERANCE_M:
+        raise ValueError("controlled recovery replay fidelity exceeds fixed cloth-position tolerance")
+    if cloth_velocity_error > _CLOTH_VELOCITY_FIDELITY_TOLERANCE_MPS:
+        raise ValueError("controlled recovery replay fidelity exceeds fixed cloth-velocity tolerance")
     return result
 
 
@@ -208,6 +254,10 @@ def load_controlled_recovery(assignment: Mapping[str, object]) -> ControlledReco
     if not isinstance(snapshot_payload, Mapping):
         raise ValueError("source continuation snapshot must contain a JSON object")
     continuation_snapshot = _snapshot(snapshot_payload)
+    if (reset_snapshot.schema_version != 2 or continuation_snapshot.schema_version != 2
+            or reset_snapshot.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY
+            or continuation_snapshot.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY):
+        raise ValueError("controlled recovery requires PhysX-authoritative v2 source snapshots")
     annotations_value = assignment.get("source_annotations")
     if not isinstance(annotations_value, str):
         raise ValueError("source annotations must be an absolute regular file")
@@ -312,7 +362,7 @@ def _strict_json_object(path: Path, *, field: str) -> dict[str, object]:
 def _strict_snapshot(payload: Mapping[str, object]) -> Snapshot:
     required = {
         "schema_version", "robot_position", "robot_velocity", "cloth_position", "cloth_velocity",
-        "rng_state", "garment_name", "randomization",
+        "rng_state", "garment_name", "randomization", "cloth_state_authority",
     }
     if set(payload) not in (required, required | {"scene_state"}):
         raise ValueError("continuation snapshot has an incompatible schema")
@@ -346,6 +396,7 @@ def _strict_snapshot(payload: Mapping[str, object]) -> Snapshot:
             cloth_velocity=cloth(payload["cloth_velocity"], name="cloth_velocity"),
             rng_state=dict(payload["rng_state"]), garment_name=payload["garment_name"],
             randomization=dict(payload["randomization"]), scene_state=dict(payload.get("scene_state", {})),
+            cloth_state_authority=str(payload["cloth_state_authority"]),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("continuation snapshot has an incompatible schema") from error
@@ -528,7 +579,7 @@ def load_attempt_matrix(path_value: str | Path) -> list[Mapping[str, object]]:
         raise ValueError("attempt matrix must be a JSON array or controlled materialization")
     matrix_sha256 = decoded.get("matrix_sha256")
     rows, target, caps = decoded.get("rows"), decoded.get("target_accepted"), decoded.get("category_acceptance_caps")
-    if decoded.get("schema_version") != 2 or decoded.get("kind") != "controlled_success_recovery_materialization_v2":
+    if decoded.get("schema_version") != 3 or decoded.get("kind") != "controlled_success_recovery_materialization_v3":
         raise ValueError("controlled materialization has an incompatible schema")
     if not isinstance(matrix_sha256, str) or _LOWERCASE_SHA256.fullmatch(matrix_sha256) is None:
         raise ValueError("controlled materialization matrix hash is invalid")
@@ -625,6 +676,7 @@ def _snapshot(value: Mapping[str, object]) -> Snapshot:
         cloth_velocity=tuple(tuple(point) for point in value["cloth_velocity"]),
         rng_state=dict(value["rng_state"]), garment_name=str(value["garment_name"]),
         randomization=dict(value.get("randomization") or {}), scene_state=dict(value.get("scene_state") or {}),
+        cloth_state_authority=value.get("cloth_state_authority"),
     )
 
 
@@ -641,7 +693,7 @@ def apply_controlled_perturbation(snapshot: Mapping[str, object] | Snapshot, pro
     joints = list(source.robot_position)
     for index in (5, 11):
         joints[index] += rng.uniform(-values["gripper_offset_rad"], values["gripper_offset_rad"])
-    return Snapshot(source.schema_version, tuple(joints), source.robot_velocity, displaced, velocities, source.rng_state, source.garment_name, source.randomization, source.scene_state)
+    return Snapshot(source.schema_version, tuple(joints), source.robot_velocity, displaced, velocities, source.rng_state, source.garment_name, source.randomization, source.scene_state, source.cloth_state_authority)
 
 
 def bootstrap_controlled_recovery(env: object, assignment: Mapping[str, object]) -> Mapping[str, object]:
@@ -651,14 +703,14 @@ def bootstrap_controlled_recovery(env: object, assignment: Mapping[str, object])
 
     recovery = load_controlled_recovery(assignment)
     restore_snapshot(env, recovery.continuation_snapshot)
-    checks = [_replay_fidelity(env, recovery.continuation_state)]
+    checks = [_replay_fidelity(env, recovery.continuation_snapshot)]
     teacher_provenance: Mapping[str, object] | None = None
     if recovery.teacher_actions:
         replay_action_prefix(env, recovery.teacher_actions)
         if not _teacher_success(env):
             raise ValueError("controlled recovery teacher probe did not reproduce source success")
         restore_snapshot(env, recovery.continuation_snapshot)
-        checks.append(_replay_fidelity(env, recovery.continuation_state))
+        checks.append(_replay_fidelity(env, recovery.continuation_snapshot))
         teacher_provenance = {"enabled": True, "verified": True, "replayed_action_count": len(recovery.teacher_actions)}
     intermediate = capture_snapshot(env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND})
     perturbed = apply_controlled_perturbation(intermediate, recovery.perturbation_profile, recovery.perturbation_seed)

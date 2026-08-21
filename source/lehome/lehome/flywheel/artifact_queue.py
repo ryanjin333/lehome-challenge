@@ -230,7 +230,7 @@ class ArtifactFinalizationQueue:
             (attempt.assignment for attempt in self._ledger.attempts() if attempt.attempt_id == attempt_id),
             None,
         )
-        if not isinstance(assignment, dict) or assignment.get("recovery_kind") != "controlled_success_recovery_snapshot_v2":
+        if not isinstance(assignment, dict) or assignment.get("recovery_kind") != "controlled_success_recovery_snapshot_v3":
             return False
         category = assignment.get("category")
         cap = assignment.get("category_acceptance_cap")
@@ -239,7 +239,7 @@ class ArtifactFinalizationQueue:
         accepted = 0
         for attempt in self._ledger.attempts():
             candidate = attempt.assignment
-            if (candidate.get("recovery_kind") == "controlled_success_recovery_snapshot_v2"
+            if (candidate.get("recovery_kind") == "controlled_success_recovery_snapshot_v3"
                     and candidate.get("category") == category
                     and self._ledger.status(attempt.attempt_id) == "accepted"):
                 accepted += 1

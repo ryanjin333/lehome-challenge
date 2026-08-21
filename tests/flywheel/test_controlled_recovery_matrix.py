@@ -24,12 +24,12 @@ def _accepted(root: Path, round_id: str, episode: str, category: str) -> dict[st
     raw = root / episode / "raw" / episode
     reset = raw / "snapshots" / "reset.json"
     annotations = raw / "annotations.jsonl"
-    reset_hash = _write(reset, {"schema_version": 1, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen", "randomization": {"strategy": "canonical"}, "scene_state": {}})
+    reset_hash = _write(reset, {"schema_version": 2, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen", "randomization": {"strategy": "canonical"}, "scene_state": {}, "cloth_state_authority": "physx_cloth_view_world_v1"})
     annotations.parent.mkdir(parents=True, exist_ok=True)
     annotations.write_text("".join(json.dumps({"step": index, "action": [float(index)] * 12, "action_source": "policy", "reward": float(index), "success": index >= 19, "state": [float(index)] * 12, "policy_request_id": f"request-{index // 16}", "policy_chunk_offset": index % 16}, sort_keys=True) + "\n" for index in range(20)), encoding="utf-8")
     annotation_hash = hashlib.sha256(annotations.read_bytes()).hexdigest()
     continuation = raw / "snapshots" / "continuations" / "000016.json"
-    continuation_hash = _write(continuation, {"schema_version": 1, "robot_position": [16.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen", "randomization": {"strategy": "canonical", "continuation_step": 16}, "scene_state": {}})
+    continuation_hash = _write(continuation, {"schema_version": 2, "robot_position": [16.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen", "randomization": {"strategy": "canonical", "continuation_step": 16}, "scene_state": {}, "cloth_state_authority": "physx_cloth_view_world_v1"})
     episode_hash = _write(raw / "episode.json", {"episode_id": episode, "accepted_success": True, "outcome": "success", "terminal_reason": "success", "identity": {"category": category, "garment_name": f"{category}-seen", "seed": 50110}})
     manifest = {
         path.relative_to(raw).as_posix(): {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "size": path.stat().st_size}
@@ -44,7 +44,7 @@ def _accepted(root: Path, round_id: str, episode: str, category: str) -> dict[st
 
 
 def _audit(selected: list[dict[str, object]]) -> dict[str, object]:
-    audit = {"schema_version": 3, "kind": "lehome_successful_recovery_audit", "continuation_contract": "authenticated_full_snapshot_at_fresh_h16_next_action_boundary_physical_state_authority", "semantic_sha256": "", "selected_recoveries": selected, "shortfalls": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}}
+    audit = {"schema_version": 4, "kind": "lehome_successful_recovery_audit", "continuation_contract": "authenticated_physx_cloth_view_snapshot_at_fresh_h16_next_action_boundary_v1", "semantic_sha256": "", "selected_recoveries": selected, "shortfalls": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}}
     audit["semantic_sha256"] = hashlib.sha256(json.dumps({key: value for key, value in audit.items() if key != "semantic_sha256"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return audit
 
@@ -63,14 +63,14 @@ def test_builder_emits_portable_96_attempt_schedule_with_a_separate_hydration_de
     first_receipt = build_controlled_recovery_matrix(audit_path=audit_path, accepted_roots=[accepted], output=first)
     build_controlled_recovery_matrix(audit_path=audit_path, accepted_roots=[accepted], output=second)
     matrix = json.loads(first.read_text(encoding="utf-8"))
-    assert matrix["kind"] == "controlled_success_recovery_matrix_v2"
+    assert matrix["kind"] == "controlled_success_recovery_matrix_v3"
     rows = matrix["rows"]
     assert len(rows) == 96
     assert {category: sum(row["category"] == category for row in rows) for category in ("pant_long", "top_long", "top_short")} == {
         "pant_long": 32, "top_long": 32, "top_short": 32,
     }
     assert not any(row["category"] == "pant_short" for row in rows)
-    assert all(row["recovery_kind"] == "controlled_success_recovery_snapshot_v2" for row in rows)
+    assert all(row["recovery_kind"] == "controlled_success_recovery_snapshot_v3" for row in rows)
     assert all(row["source_continuation_state"] == [16.0] * 12 for row in rows)
     assert all("source_reset" not in row and "source_annotations" not in row for row in rows)
     assert not any(str(tmp_path) in first.read_text(encoding="utf-8") for _ in [0])
@@ -126,7 +126,7 @@ def test_builder_treats_audit_shortfalls_as_diagnostics_not_campaign_caps(tmp_pa
         _accepted(accepted, "round-3", "ts", "top_short"),
     ]
     audit = _audit(selected)
-    # This is the real v3 audit result for per_category_minimum=1: the active
+    # This is the real v4 audit result for per_category_minimum=1: the active
     # categories are ready, while the deliberately excluded pant-short category
     # still has an audit-only shortfall.  These are not collection acceptance caps.
     audit["shortfalls"] = {
@@ -349,3 +349,22 @@ def test_legacy_v2_audit_with_116_successes_requires_fresh_snapshot_sources(tmp_
     assert plan["eligible_snapshot_contract_source_count"] == 0
     assert plan["legacy_audit_ineligible"] is True
     assert plan["action"] == "fresh_autonomous_success_collection_required"
+
+
+def test_current_v4_physx_audit_is_eligible_for_materialization(tmp_path: Path) -> None:
+    from scripts.plan_continuation_snapshot_backfill import plan_continuation_snapshot_backfill
+
+    audit = tmp_path / "recovery-audit-v4.json"
+    _write(audit, {
+        "schema_version": 4,
+        "kind": "lehome_successful_recovery_audit",
+        "continuation_contract": "authenticated_physx_cloth_view_snapshot_at_fresh_h16_next_action_boundary_v1",
+        "admitted_episodes": [{"source_episode_id": "success-physx"}],
+        "selected_recoveries": [{"source_episode_id": "success-physx"}],
+    })
+
+    plan = plan_continuation_snapshot_backfill(audit_path=audit)
+
+    assert plan["eligible_snapshot_contract_source_count"] == 1
+    assert plan["legacy_audit_ineligible"] is False
+    assert plan["action"] == "audit_v4_sources_may_be_materialized"

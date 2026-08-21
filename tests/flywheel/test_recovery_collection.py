@@ -9,10 +9,11 @@ import pytest
 
 def _snapshot() -> dict[str, object]:
     return {
-        "schema_version": 1, "robot_position": [0.0] * 12,
+        "schema_version": 2, "robot_position": [0.0] * 12,
         "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]],
         "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {},
-        "garment_name": "Top_Long_Seen_0", "randomization": {"strategy": "canonical"}, "scene_state": {},
+        "garment_name": "Top_Long_Seen_0", "randomization": {"strategy": "canonical"},
+        "scene_state": {}, "cloth_state_authority": "physx_cloth_view_world_v1",
     }
 
 
@@ -31,7 +32,7 @@ def _assignment(tmp_path, *, state: list[float] | None = None, teacher: bool = F
     annotations.write_text("".join(json.dumps({"step": step, "action": [float(step)] * 12, "success": step == 19}) + "\n" for step in range(20)), encoding="utf-8")
     category, garment = "top_long", "Top_Long_Seen_0"
     return {
-        "recovery_kind": "controlled_success_recovery_snapshot_v2", "source_reset": str(reset), "source_reset_sha256": hashlib.sha256(reset.read_bytes()).hexdigest(),
+        "recovery_kind": "controlled_success_recovery_snapshot_v3", "source_reset": str(reset), "source_reset_sha256": hashlib.sha256(reset.read_bytes()).hexdigest(),
         "source_continuation_snapshot": str(continuation), "source_continuation_snapshot_sha256": hashlib.sha256(continuation.read_bytes()).hexdigest(),
         "source_annotations": str(annotations), "source_annotations_sha256": hashlib.sha256(annotations.read_bytes()).hexdigest(), "prefix_stop": 16, "source_first_success_step": 19,
         "perturbation_profile": {"cloth_displacement_m": 0.002, "cloth_velocity_mps": 0.01, "gripper_offset_rad": 0.02}, "perturbation_seed": 7,
@@ -156,6 +157,8 @@ def test_production_bootstrap_restores_prefixes_then_perturbs_before_policy_cont
     assert env.actions == []
     assert env.state["cloth_position"] != _snapshot()["cloth_position"]
     assert provenance["source_episode_id"] == "episode"
+    fidelity = provenance["replay_fidelity"]
+    assert fidelity["expected_state_sha256"] == fidelity["observed_state_sha256"]
 
 
 def test_controlled_recovery_fails_closed_for_missing_or_tampered_continuation_state_before_mutation(tmp_path) -> None:
@@ -192,6 +195,79 @@ def test_controlled_recovery_replay_fidelity_accepts_tolerance_and_rejects_drift
     with pytest.raises(ValueError, match="replay fidelity"):
         bootstrap_controlled_recovery(rejected, _assignment(tmp_path / "rejected"))
     assert rejected.state["cloth_position"] == _snapshot()["cloth_position"]
+
+
+def test_controlled_recovery_replay_fidelity_rejects_robot_velocity_drift_before_perturbation(tmp_path) -> None:
+    from lehome.flywheel.recovery_collection import bootstrap_controlled_recovery
+
+    class Env:
+        def __init__(self) -> None:
+            self.state = _snapshot()
+
+        def flywheel_restore_state(self, snapshot) -> None:
+            self.state = snapshot.to_dict()
+
+        def flywheel_capture_state(self):
+            observed = dict(self.state)
+            observed["robot_velocity"] = [0.0051] * 12
+            return observed
+
+    env = Env()
+    with pytest.raises(ValueError, match="robot-velocity tolerance"):
+        bootstrap_controlled_recovery(env, _assignment(tmp_path / "robot-velocity"))
+    assert env.state["cloth_position"] == _snapshot()["cloth_position"]
+
+
+@pytest.mark.parametrize(
+    ("field", "drift", "message"),
+    [
+        ("cloth_position", 1.1e-5, "cloth-position tolerance"),
+        ("cloth_velocity", 1.1e-5, "cloth-velocity tolerance"),
+    ],
+)
+def test_controlled_recovery_rejects_live_cloth_drift_before_teacher_replay(
+    tmp_path, field: str, drift: float, message: str,
+) -> None:
+    from lehome.flywheel.recovery_collection import bootstrap_controlled_recovery
+
+    class Env:
+        def __init__(self) -> None:
+            self.state = _snapshot()
+            self.actions: list[list[float]] = []
+
+        def flywheel_restore_state(self, snapshot) -> None:
+            self.state = snapshot.to_dict()
+
+        def flywheel_capture_state(self):
+            observed = json.loads(json.dumps(self.state))
+            observed[field][0][0] += drift
+            return observed
+
+        def step(self, action) -> None:
+            self.actions.append(action)
+
+    env = Env()
+    with pytest.raises(ValueError, match=message):
+        bootstrap_controlled_recovery(
+            env, _assignment(tmp_path / field, teacher=True)
+        )
+    assert env.actions == []
+
+
+def test_controlled_recovery_rejects_legacy_usd_snapshots_before_mutation(tmp_path) -> None:
+    from lehome.flywheel.recovery_collection import load_controlled_recovery
+
+    assignment = _assignment(tmp_path)
+    for field in ("source_reset", "source_continuation_snapshot"):
+        path = Path(assignment[field])
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["schema_version"] = 1
+        payload.pop("cloth_state_authority")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        assignment[f"{field}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    with pytest.raises(ValueError, match="PhysX-authoritative"):
+        load_controlled_recovery(assignment)
 
 
 def test_smoke_teacher_probe_requires_success_then_reconstructs_the_verified_boundary(tmp_path) -> None:
@@ -235,9 +311,9 @@ def test_single_materialization_loader_returns_hydrated_rows_and_rejects_identit
     reset.write_text("{}", encoding="utf-8"); annotations.write_text("", encoding="utf-8"); continuation.write_text("{}", encoding="utf-8")
     categories = ["pant_long"] * 4 + ["top_long"] + ["top_short"] * 3
     caps = {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}
-    rows = [{"attempt_id": f"controlled-{index}", "trial_id": f"controlled-{index}", "category": category, "category_acceptance_cap": caps[category], "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v2", "controlled_matrix_sha256": "a" * 64, "perturbation_seed": index, "perturbation_fingerprint": f"{index + 100:064x}", "source_state_perturbation_fingerprint": f"{index + 200:064x}", "source_seed": 50110, "source_continuation_state": [0.0] * 12, "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round", "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}", "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64, "source_continuation_snapshot_sha256": "c" * 64, "prefix_stop": 16, "source_first_success_step": 19, "source_reset": str(reset), "source_annotations": str(annotations), "source_continuation_snapshot": str(continuation)} for index, category in enumerate(categories)]
+    rows = [{"attempt_id": f"controlled-{index}", "trial_id": f"controlled-{index}", "category": category, "category_acceptance_cap": caps[category], "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v3", "controlled_matrix_sha256": "a" * 64, "perturbation_seed": index, "perturbation_fingerprint": f"{index + 100:064x}", "source_state_perturbation_fingerprint": f"{index + 200:064x}", "source_seed": 50110, "source_continuation_state": [0.0] * 12, "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round", "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}", "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64, "source_continuation_snapshot_sha256": "c" * 64, "prefix_stop": 16, "source_first_success_step": 19, "source_reset": str(reset), "source_annotations": str(annotations), "source_continuation_snapshot": str(continuation)} for index, category in enumerate(categories)]
     descriptor = tmp_path / "materialization.json"
-    payload = {"schema_version": 2, "kind": "controlled_success_recovery_materialization_v2", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}
+    payload = {"schema_version": 3, "kind": "controlled_success_recovery_materialization_v3", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}
     descriptor.write_text(json.dumps(payload), encoding="utf-8")
     assert load_attempt_matrix(descriptor) == rows
     linked = tmp_path / "linked"; linked.symlink_to(tmp_path, target_is_directory=True)
@@ -261,7 +337,7 @@ def test_materialization_loader_rejects_unreachable_or_noncanonical_controlled_s
         {
             "attempt_id": f"attempt-{index}", "trial_id": f"trial-{index}",
             "category": "pant_long", "category_acceptance_cap": 4,
-            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v2",
+            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v3",
             "controlled_matrix_sha256": "a" * 64, "perturbation_seed": index,
             "perturbation_fingerprint": f"{index + 100:064x}",
             "source_state_perturbation_fingerprint": f"{index + 200:064x}",
@@ -275,7 +351,7 @@ def test_materialization_loader_rejects_unreachable_or_noncanonical_controlled_s
         for index in range(8)
     ]
     path = tmp_path / "bad-materialization.json"
-    path.write_text(json.dumps({"schema_version": 2, "kind": "controlled_success_recovery_materialization_v2", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}, "rows": rows}), encoding="utf-8")
+    path.write_text(json.dumps({"schema_version": 3, "kind": "controlled_success_recovery_materialization_v3", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}, "rows": rows}), encoding="utf-8")
     with pytest.raises(ValueError, match="reachable|category"):
         load_attempt_matrix(path)
 
@@ -325,8 +401,8 @@ def test_controlled_recovery_rejects_parent_symlink_inputs_before_mutation(tmp_p
     [
         (
             {
-                "schema_version": 2,
-                "kind": "controlled_success_recovery_materialization_v2",
+                "schema_version": 3,
+                "kind": "controlled_success_recovery_materialization_v3",
                 "matrix_sha256": "a" * 64,
                 "target_accepted": 8,
                 "category_acceptance_caps": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0},

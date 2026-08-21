@@ -179,11 +179,11 @@ class PersistentRolloutWorker:
             raise ValueError("persistent worker session must expose a runtime receipt")
         if receipt.get("simulation_device") != "cpu" or receipt.get("cloth_device") != "cpu":
             raise ValueError("persistent rollout requires CPU cloth simulation")
-        if receipt.get("cloth_backend") != "usd":
-            raise ValueError("persistent rollout requires observed CPU USD cloth backend")
+        if receipt.get("cloth_backend") != "physx_cloth_view":
+            raise ValueError("persistent rollout requires the live PhysX cloth backend")
         if require_contact:
             if not isinstance(receipt.get("cloth_readback"), Mapping):
-                raise ValueError("persistent rollout requires observed CPU USD cloth readback")
+                raise ValueError("persistent rollout requires observed PhysX cloth readback")
             contact = receipt.get("visible_contact_canary")
             if not isinstance(contact, Mapping) or not isinstance(contact.get("observed"), bool):
                 raise ValueError("persistent rollout requires visible-contact canary evidence")
@@ -387,7 +387,7 @@ class PersistentRolloutWorker:
                 if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
                     raise ValueError("attempt seed must be a non-negative integer")
                 environment_seed = seed
-                if assignment.get("recovery_kind") == "controlled_success_recovery_snapshot_v2":
+                if assignment.get("recovery_kind") == "controlled_success_recovery_snapshot_v3":
                     source_seed = assignment.get("source_seed")
                     if type(source_seed) is not int or source_seed < 0:
                         raise ValueError("controlled recovery requires a non-negative authenticated source seed")
@@ -468,7 +468,7 @@ class PersistentRolloutWorker:
                     "worker_id": self.identity.worker_id,
                     "session_id": self.identity.session_id,
                     "seed": seed,
-                    **({"source_seed": environment_seed} if assignment.get("recovery_kind") == "controlled_success_recovery_snapshot_v2" else {}),
+                    **({"source_seed": environment_seed} if assignment.get("recovery_kind") == "controlled_success_recovery_snapshot_v3" else {}),
                     "garment": garment_name,
                     "episode_generation": generation,
                     "output_dir": str(output_dir),

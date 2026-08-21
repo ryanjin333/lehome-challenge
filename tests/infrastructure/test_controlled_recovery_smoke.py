@@ -39,12 +39,12 @@ def _artifacts(tmp_path: Path) -> dict[str, str]:
         episode = f"episode-{index}"
         raw = accepted / episode / "raw" / episode
         reset = raw / "snapshots" / "reset.json"
-        reset_hash = _write(reset, {"schema_version": 1, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen", "randomization": {"strategy": "canonical"}, "scene_state": {}})
+        reset_hash = _write(reset, {"schema_version": 2, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen", "randomization": {"strategy": "canonical"}, "scene_state": {}, "cloth_state_authority": "physx_cloth_view_world_v1"})
         annotations = raw / "annotations.jsonl"; annotations.parent.mkdir(parents=True, exist_ok=True)
         annotations.write_text("".join(json.dumps({"step": step, "action": [float(step)] * 12, "action_source": "policy", "success": step >= 19, "state": [float(step)] * 12, "policy_request_id": f"request-{step // 16}", "policy_chunk_offset": step % 16}) + "\n" for step in range(20)), encoding="utf-8")
         annotations_hash = hashlib.sha256(annotations.read_bytes()).hexdigest()
         continuation = raw / "snapshots" / "continuations" / "000016.json"
-        continuation_hash = _write(continuation, {"schema_version": 1, "robot_position": [16.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen", "randomization": {"strategy": "canonical", "continuation_step": 16}, "scene_state": {}})
+        continuation_hash = _write(continuation, {"schema_version": 2, "robot_position": [16.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen", "randomization": {"strategy": "canonical", "continuation_step": 16}, "scene_state": {}, "cloth_state_authority": "physx_cloth_view_world_v1"})
         episode_hash = _write(raw / "episode.json", {"episode_id": episode, "accepted_success": True, "outcome": "success", "terminal_reason": "success", "identity": {"category": category, "garment_name": f"{category}-seen", "seed": 50110}})
         manifest_hash = _write(raw / "SHA256SUMS.json", {item.relative_to(raw).as_posix(): {"sha256": hashlib.sha256(item.read_bytes()).hexdigest(), "size": item.stat().st_size} for item in (reset, annotations, continuation, raw / "episode.json")})
         digest = hashlib.sha256(("round" + episode).encode()).hexdigest()
@@ -52,7 +52,7 @@ def _artifacts(tmp_path: Path) -> dict[str, str]:
         state = [16.0] * 12
         fingerprint = _state_fingerprint(category=category, garment=garment, state=state)
         selected.append({"source_round_id": "round", "source_episode_id": episode, "source_episode_digest": digest, "source_immutable_revision": "a" * 40, "category": category, "garment": garment, "fingerprint": fingerprint, "continuation_start": {"annotation_index": 16, "step": 16, "policy_request_id": "request-1", "policy_chunk_offset": 0, "policy_observation_state": state, "state": state, "state_fingerprint": fingerprint, "snapshot_relative_path": "snapshots/continuations/000016.json", "snapshot_sha256": continuation_hash, "snapshot_continuation_step": 16, "snapshot_robot_position": state}, "recovery_event": {"adverse_start": 15, "recovery_confirmation": 18}, "source_artifacts": {"package_sync_digest": digest, "raw_checksum_manifest_sha256": manifest_hash, "episode_manifest_sha256": episode_hash, "annotations_sha256": annotations_hash, "reset_sha256": reset_hash}})
-    audit = {"schema_version": 3, "kind": "lehome_successful_recovery_audit", "continuation_contract": "authenticated_full_snapshot_at_fresh_h16_next_action_boundary_physical_state_authority", "semantic_sha256": "", "selected_recoveries": selected, "shortfalls": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}}
+    audit = {"schema_version": 4, "kind": "lehome_successful_recovery_audit", "continuation_contract": "authenticated_physx_cloth_view_snapshot_at_fresh_h16_next_action_boundary_v1", "semantic_sha256": "", "selected_recoveries": selected, "shortfalls": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}}
     audit["semantic_sha256"] = hashlib.sha256(json.dumps({key: value for key, value in audit.items() if key != "semantic_sha256"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     audit_path = tmp_path / "audit.json"; _write(audit_path, audit)
     audit_path.with_suffix(".json.sha256").write_text(hashlib.sha256(audit_path.read_bytes()).hexdigest() + "\n", encoding="ascii")
@@ -114,7 +114,7 @@ def _fake_snapshot_source_base(path: Path) -> None:
         episode_payload = {'episode_id': attempt, 'mode': 'autonomous', 'accepted_success': True, 'outcome': 'success', 'terminal_reason': 'success', 'bc_target_count': 0, 'identity': {'category': category, 'garment_name': garment, 'seed': (50111 if case == 'seed-mismatch' else seed)}}
         episode = raw / 'episode.json'; episode.write_text(json.dumps(episode_payload, sort_keys=True))
         reset = raw / 'snapshots' / 'reset.json'; reset.parent.mkdir(parents=True, exist_ok=True)
-        reset.write_text(json.dumps({'schema_version': 1, 'robot_position': [0.0] * 12, 'robot_velocity': [0.0] * 12, 'cloth_position': [[0.0, 0.0, 0.0]], 'cloth_velocity': [[0.0, 0.0, 0.0]], 'rng_state': {}, 'garment_name': garment, 'randomization': {'strategy': 'canonical'}, 'scene_state': {}}, sort_keys=True))
+        reset.write_text(json.dumps({'schema_version': 2, 'robot_position': [0.0] * 12, 'robot_velocity': [0.0] * 12, 'cloth_position': [[0.0, 0.0, 0.0]], 'cloth_velocity': [[0.0, 0.0, 0.0]], 'rng_state': {}, 'garment_name': garment, 'randomization': {'strategy': 'canonical'}, 'scene_state': {}, 'cloth_state_authority': 'physx_cloth_view_world_v1'}, sort_keys=True))
         annotations = raw / 'annotations.jsonl'
         boundary = 32 if case == 'after-success' else 16
         annotation_rows = []
@@ -129,7 +129,7 @@ def _fake_snapshot_source_base(path: Path) -> None:
             h16 = raw / 'snapshots' / 'continuations' / filename; h16.parent.mkdir(parents=True)
             continuation_step = boundary + 16 if case == 'wrong-continuation-step' else boundary
             snapshot_strategy = 'geometry' if case == 'randomization-mismatch' else 'canonical'
-            snapshot = {'schema_version': (2 if case == 'bad-snapshot' else 1), 'robot_position': [float(boundary)] * 12, 'robot_velocity': [0.0] * 12, 'cloth_position': [[0.0, 0.0, 0.0]], 'cloth_velocity': [[0.0, 0.0, 0.0]], 'rng_state': {}, 'garment_name': ('Other_Garment' if case == 'garment-mismatch' else garment), 'randomization': {'strategy': snapshot_strategy, 'continuation_step': continuation_step}, 'scene_state': {}}
+            snapshot = {'schema_version': (1 if case == 'bad-snapshot' else 2), 'robot_position': [float(boundary)] * 12, 'robot_velocity': [0.0] * 12, 'cloth_position': [[0.0, 0.0, 0.0]], 'cloth_velocity': [[0.0, 0.0, 0.0]], 'rng_state': {}, 'garment_name': ('Other_Garment' if case == 'garment-mismatch' else garment), 'randomization': {'strategy': snapshot_strategy, 'continuation_step': continuation_step}, 'scene_state': {}, 'cloth_state_authority': 'physx_cloth_view_world_v1'}
             h16.write_text(json.dumps(snapshot, sort_keys=True))
             entries[h16.relative_to(raw).as_posix()] = {'sha256': ('0' * 64 if case == 'bad-manifest' else hashlib.sha256(h16.read_bytes()).hexdigest()), 'size': h16.stat().st_size}
         (raw / 'SHA256SUMS.json').write_text(json.dumps(entries, sort_keys=True))
@@ -505,7 +505,7 @@ def test_snapshot_source_bootstrap_uses_the_physical_boundary_when_the_policy_ob
 
 
 @pytest.mark.parametrize("case", ["bad-request-chunk", "success-unlatched"])
-def test_snapshot_source_bootstrap_requires_an_audit_v3_trace(tmp_path: Path, case: str) -> None:
+def test_snapshot_source_bootstrap_requires_an_audit_v4_trace(tmp_path: Path, case: str) -> None:
     result, root = _run_snapshot_source_bootstrap(tmp_path / case, case)
     assert result.returncode == 4, result.stderr
     assert not (root / "snapshot-source-bootstrap.envelope.json").exists()

@@ -363,9 +363,15 @@ class GarmentObject(SingleClothPrim):
         # set local pose for initialization (wait for the update of scene manager)
         self.set_world_pose(position=self.init_pos, orientation=self.init_ori)
 
-        if "cuda" in self._device:
-            self.physics_sim_view = SimulationManager.get_physics_sim_view()
-            self._cloth_prim_view.initialize(self.physics_sim_view)
+        # Controlled-recovery snapshots must address the live PhysX particle
+        # state, even when the environment's simulation device is CPU. USD
+        # ``points``/``velocities`` are authored scene data and are not a
+        # sufficient continuation-state authority once simulation is running.
+        self.physics_sim_view = SimulationManager.get_physics_sim_view()
+        self._cloth_prim_view.initialize(self.physics_sim_view)
+        valid = getattr(self._cloth_prim_view, "is_physics_handle_valid", None)
+        if not callable(valid) or not bool(valid()):
+            raise RuntimeError("garment PhysX cloth view failed to initialize")
 
         self._get_initial_info()
 
@@ -379,13 +385,11 @@ class GarmentObject(SingleClothPrim):
         Meanwhile, return back to the initial positions of all particles that make up the object.
         """
         logger.debug("[GarmentObject] Performing soft reset")
-        # Reset Points Positions
-        if self._device == "cpu":
-            self._prim.GetAttribute("points").Set(
-                Vt.Vec3fArray.FromNumpy(self.initial_points_positions)
-            )
-        else:
-            self._cloth_prim_view.set_world_positions(self.initial_points_positions)
+        # Reset the same live PhysX state used by controlled-recovery capture
+        # and restore. Authoring USD ``points`` after simulation starts does
+        # not reset the solver particles on CPU.
+        self._cloth_prim_view.set_world_positions(self.initial_points_positions)
+        self._cloth_prim_view.set_velocities(self.initial_points_velocities)
 
         # Get position range from configuration
         pos_reset_range, pos_source = self._get_config_value(
@@ -647,14 +651,18 @@ class GarmentObject(SingleClothPrim):
 
     def _get_initial_info(self):
         """
-        Return the initial positions of all particles that make up the object.
+        Retain the initial live PhysX state for deterministic soft resets.
         """
-        if self._device == "cpu":
-            self.initial_points_positions = (
-                self._get_points_pose().detach().cpu().numpy()
-            )
-        else:
-            self.initial_points_positions = self._cloth_prim_view.get_world_positions()
+        positions = self._cloth_prim_view.get_world_positions()
+        velocities = self._cloth_prim_view.get_velocities()
+        self.initial_points_positions = (
+            positions.clone() if callable(getattr(positions, "clone", None))
+            else np.array(positions, copy=True)
+        )
+        self.initial_points_velocities = (
+            velocities.clone() if callable(getattr(velocities, "clone", None))
+            else np.array(velocities, copy=True)
+        )
 
     def transform_points(self, points, pos, ori, scale):
         """
@@ -701,12 +709,8 @@ class GarmentObject(SingleClothPrim):
             self.set_world_pose(
                 [0.0, 0.0, 0.0], euler_angles_to_quat([0.0, 0.0, 0.0], degrees=True)
             )
-            if self._device == "cpu":
-                self._prim.GetAttribute("points").Set(
-                    Vt.Vec3fArray.FromNumpy(self.initial_points_positions)
-                )
-            else:
-                self._cloth_prim_view.set_world_positions(self.initial_points_positions)
+            self._cloth_prim_view.set_world_positions(self.initial_points_positions)
+            self._cloth_prim_view.set_velocities(self.initial_points_velocities)
             self.set_world_pose(pos, euler_angles_to_quat(ori, degrees=True))
             self.reset_pose = np.array(pose, dtype=np.float32)
 
