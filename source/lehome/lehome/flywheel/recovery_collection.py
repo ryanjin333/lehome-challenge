@@ -196,6 +196,12 @@ def load_controlled_recovery(assignment: Mapping[str, object]) -> ControlledReco
 
     if assignment.get("recovery_kind") != RECOVERY_KIND:
         raise ValueError("assignment is not a controlled success recovery")
+    _, reset_payload = _verified_json_file(
+        assignment.get("source_reset"), assignment.get("source_reset_sha256"), field="source reset snapshot"
+    )
+    if not isinstance(reset_payload, Mapping):
+        raise ValueError("source reset snapshot must contain a JSON object")
+    reset_snapshot = _snapshot(reset_payload)
     snapshot_path, snapshot_payload = _verified_json_file(
         assignment.get("source_continuation_snapshot"), assignment.get("source_continuation_snapshot_sha256"), field="source continuation snapshot"
     )
@@ -209,6 +215,9 @@ def load_controlled_recovery(assignment: Mapping[str, object]) -> ControlledReco
     stop = assignment.get("prefix_stop")
     if type(stop) is not int or not 0 < stop < len(actions) or stop % 16:
         raise ValueError("continuation boundary must be a strict positive H16 action index")
+    _validate_continuation_snapshot_boundary(
+        continuation_snapshot=continuation_snapshot, reset_snapshot=reset_snapshot, step=stop,
+    )
     first_success = assignment.get("source_first_success_step")
     if type(first_success) is not int or not stop < first_success < len(actions):
         raise ValueError("continuation boundary must precede the first recorded success")
@@ -342,6 +351,26 @@ def _strict_snapshot(payload: Mapping[str, object]) -> Snapshot:
         raise ValueError("continuation snapshot has an incompatible schema") from error
 
 
+def _validate_continuation_snapshot_boundary(
+    *, continuation_snapshot: Snapshot, reset_snapshot: Snapshot, step: int,
+) -> None:
+    """Bind the physical snapshot to the exact next-action H16 boundary.
+
+    Policy observations are intentionally separate evidence: the legacy garment
+    environment exposes a one-step-lagged joint tensor, while Snapshot capture
+    reads the live articulation.  Restore fidelity must therefore use the
+    manifest-authenticated physical state, not overwrite it with the lagged
+    policy observation.
+    """
+
+    randomization = dict(continuation_snapshot.randomization)
+    continuation_step = randomization.pop("continuation_step", None)
+    if type(continuation_step) is not int or continuation_step != step:
+        raise ValueError("continuation snapshot does not bind the exact H16 next-action boundary")
+    if randomization != dict(reset_snapshot.randomization):
+        raise ValueError("continuation snapshot randomization does not match the authenticated reset")
+
+
 def validate_snapshot_source_bootstrap_evidence(
     *, accepted_root: str | Path, descriptor_path: str | Path,
 ) -> tuple[int, ...]:
@@ -453,9 +482,11 @@ def validate_snapshot_source_bootstrap_evidence(
                 or row.get("category") != category or row.get("garment_name") != garment or row.get("seed") != seed
                 or not isinstance(state, list) or len(state) != 12
                 or any(type(item) not in (int, float) or not math.isfinite(float(item)) for item in state)
-                or tuple(float(item) for item in state) != snapshot.robot_position
                 or snapshot.garment_name != garment):
             raise ValueError("snapshot source continuation does not match the authenticated H16 annotation")
+        _validate_continuation_snapshot_boundary(
+            continuation_snapshot=snapshot, reset_snapshot=reset, step=step,
+        )
         steps.append(step)
     return tuple(steps)
 

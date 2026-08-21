@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Mapping
 
 
-_CONTRACT = "authenticated_full_snapshot_at_fresh_h16_policy_boundary_before_action"
+_CONTRACT = "authenticated_full_snapshot_at_fresh_h16_next_action_boundary_physical_state_authority"
 
 
 def _canonical(value: object) -> bytes:
@@ -70,7 +70,7 @@ def plan_continuation_snapshot_backfill(*, audit_path: str | Path) -> dict[str, 
             "path_template": "snapshots/continuations/{step:06d}.json",
             "capture_timing": "before_action_at_every_positive_h16_policy_boundary",
             "authentication": "SHA256SUMS.json+sealed_release+audit_snapshot_sha256",
-            "annotation_binding": "source_seed+category+garment+step+policy_request_id+annotation_state_equals_snapshot_robot_position",
+            "annotation_binding": "source_seed+category+garment+step+policy_request_id+snapshot.continuation_step; physical snapshot state is authoritative and policy observation state remains separate",
         },
     }
     document["semantic_sha256"] = hashlib.sha256(_canonical(document)).hexdigest()

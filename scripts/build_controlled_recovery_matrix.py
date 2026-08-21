@@ -10,6 +10,7 @@ _CATEGORIES = ("pant_long", "top_long", "top_short")
 _CAPS = {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}
 _PROFILE = {"cloth_displacement_m": 0.002, "cloth_velocity_mps": 0.01, "gripper_offset_rad": 0.02}
 _HORIZON = 16
+_CONTINUATION_CONTRACT = "authenticated_full_snapshot_at_fresh_h16_next_action_boundary_physical_state_authority"
 
 def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
@@ -102,15 +103,19 @@ def _continuation(
     index, step = evidence.get("annotation_index"), evidence.get("step")
     request_id, chunk_offset = evidence.get("policy_request_id"), evidence.get("policy_chunk_offset")
     state, fingerprint = evidence.get("state"), evidence.get("state_fingerprint")
+    policy_state = evidence.get("policy_observation_state")
+    snapshot_state, snapshot_step = evidence.get("snapshot_robot_position"), evidence.get("snapshot_continuation_step")
     if (type(index) is not int or type(step) is not int or index <= 0 or step != index
             or not isinstance(request_id, str) or not request_id.strip() or chunk_offset != 0
-            or not isinstance(state, list) or not isinstance(fingerprint, str) or len(fingerprint) != 64):
+            or not isinstance(state, list) or not isinstance(policy_state, list)
+            or snapshot_state != state or snapshot_step != index
+            or not isinstance(fingerprint, str) or len(fingerprint) != 64):
         raise ValueError("audit continuation provenance is malformed")
     if index >= len(annotation_rows):
         raise ValueError("audit continuation is outside accepted annotations")
     annotation = annotation_rows[index]
     if (annotation.get("step") != step or annotation.get("policy_request_id") != request_id
-            or annotation.get("policy_chunk_offset") != 0 or annotation.get("state") != state):
+            or annotation.get("policy_chunk_offset") != 0 or annotation.get("state") != policy_state):
         raise ValueError("audit continuation does not match accepted chunk-boundary evidence")
     event = row.get("recovery_event")
     if not isinstance(event, Mapping):
@@ -171,10 +176,18 @@ def _source(row: Mapping[str, object], roots: Sequence[Path]) -> dict[str, objec
         raise ValueError("audit continuation must precede the first successful source record")
     portable = {key: row[key] for key in ("source_round_id", "source_round_ordinal", "source_episode_id", "source_episode_digest", "source_immutable_revision", "source_receipt_file_name", "source_receipt_remote_prefix", "source_receipt_publication_ref", "source_receipt_sha256", "receipt_immutable_revision", "garment", "category") if key in row}
     try:
+        reset_snapshot = _json(reset, label="accepted reset snapshot")
         snapshot = _json(continuation_snapshot, label="accepted continuation snapshot")
     except ValueError:
-        raise ValueError("accepted continuation snapshot is malformed") from None
-    if snapshot.get("robot_position") != continuation_state or snapshot.get("garment_name") != row.get("garment"):
+        raise ValueError("accepted source snapshot is malformed") from None
+    randomization = snapshot.get("randomization")
+    reset_randomization = reset_snapshot.get("randomization")
+    if not isinstance(randomization, Mapping) or not isinstance(reset_randomization, Mapping):
+        raise ValueError("accepted source snapshot randomization is malformed")
+    base_randomization = dict(randomization)
+    continuation_step = base_randomization.pop("continuation_step", None)
+    if (snapshot.get("robot_position") != continuation_state or snapshot.get("garment_name") != row.get("garment")
+            or continuation_step != stop or base_randomization != dict(reset_randomization)):
         raise ValueError("accepted continuation snapshot does not match audit boundary state")
     portable.update({"source_artifacts": dict(artifacts), "source_seed": source_seed, "source_continuation_state": continuation_state, "source_state_fingerprint": fingerprint, "source_reset_sha256": _sha256(reset), "source_annotations_sha256": annotation_hash, "source_continuation_snapshot_sha256": _sha256(continuation_snapshot), "source_continuation_snapshot_relative_path": relative, "source_first_success_step": first_success, "prefix_stop": stop})
     return {"portable": portable, "source_reset": str(reset), "source_annotations": str(annotations), "source_continuation_snapshot": str(continuation_snapshot)}
@@ -200,7 +213,7 @@ def build_controlled_recovery_matrix(*, audit_path: Path | str, accepted_roots: 
     audit, audit_sha = _json(audit_file, label="recovery audit"), _sha256(audit_file)
     if sidecar.is_symlink() or not sidecar.is_file() or sidecar.read_text(encoding="ascii").strip() != audit_sha: raise ValueError("recovery audit SHA-256 sidecar mismatch")
     audit_semantic = {key: value for key, value in audit.items() if key != "semantic_sha256"}
-    if audit.get("schema_version") != 3 or audit.get("kind") != "lehome_successful_recovery_audit" or audit.get("continuation_contract") != "authenticated_full_snapshot_at_fresh_h16_policy_boundary_before_action" or audit.get("semantic_sha256") != hashlib.sha256(json.dumps(audit_semantic, sort_keys=True, separators=(",", ":")).encode()).hexdigest(): raise ValueError("recovery audit semantic identity mismatch")
+    if audit.get("schema_version") != 3 or audit.get("kind") != "lehome_successful_recovery_audit" or audit.get("continuation_contract") != _CONTINUATION_CONTRACT or audit.get("semantic_sha256") != hashlib.sha256(json.dumps(audit_semantic, sort_keys=True, separators=(",", ":")).encode()).hexdigest(): raise ValueError("recovery audit semantic identity mismatch")
     roots = tuple(Path(root) for root in accepted_roots)
     if not roots or any(not root.is_absolute() or root.is_symlink() or not root.is_dir() for root in roots): raise ValueError("accepted roots must be real absolute directories")
     selected, shortfalls = audit.get("selected_recoveries"), audit.get("shortfalls")

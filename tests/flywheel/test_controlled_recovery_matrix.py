@@ -24,12 +24,12 @@ def _accepted(root: Path, round_id: str, episode: str, category: str) -> dict[st
     raw = root / episode / "raw" / episode
     reset = raw / "snapshots" / "reset.json"
     annotations = raw / "annotations.jsonl"
-    reset_hash = _write(reset, {"schema_version": 1, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen"})
+    reset_hash = _write(reset, {"schema_version": 1, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen", "randomization": {"strategy": "canonical"}, "scene_state": {}})
     annotations.parent.mkdir(parents=True, exist_ok=True)
     annotations.write_text("".join(json.dumps({"step": index, "action": [float(index)] * 12, "action_source": "policy", "reward": float(index), "success": index >= 19, "state": [float(index)] * 12, "policy_request_id": f"request-{index // 16}", "policy_chunk_offset": index % 16}, sort_keys=True) + "\n" for index in range(20)), encoding="utf-8")
     annotation_hash = hashlib.sha256(annotations.read_bytes()).hexdigest()
     continuation = raw / "snapshots" / "continuations" / "000016.json"
-    continuation_hash = _write(continuation, {"schema_version": 1, "robot_position": [16.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen", "randomization": {}, "scene_state": {}})
+    continuation_hash = _write(continuation, {"schema_version": 1, "robot_position": [16.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen", "randomization": {"strategy": "canonical", "continuation_step": 16}, "scene_state": {}})
     episode_hash = _write(raw / "episode.json", {"episode_id": episode, "accepted_success": True, "outcome": "success", "terminal_reason": "success", "identity": {"category": category, "garment_name": f"{category}-seen", "seed": 50110}})
     manifest = {
         path.relative_to(raw).as_posix(): {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "size": path.stat().st_size}
@@ -40,11 +40,11 @@ def _accepted(root: Path, round_id: str, episode: str, category: str) -> dict[st
     garment = f"{category}-seen"
     state = [16.0] * 12
     fingerprint = _state_fingerprint(category=category, garment=garment, state=state)
-    return {"source_round_id": round_id, "source_episode_id": episode, "source_episode_digest": package_hash, "source_immutable_revision": "a" * 40, "category": category, "garment": garment, "fingerprint": fingerprint, "continuation_start": {"annotation_index": 16, "step": 16, "policy_request_id": "request-1", "policy_chunk_offset": 0, "state": state, "state_fingerprint": fingerprint, "snapshot_relative_path": "snapshots/continuations/000016.json", "snapshot_sha256": continuation_hash, "snapshot_robot_position": state}, "recovery_event": {"adverse_start": 15, "recovery_confirmation": 18}, "source_artifacts": {"package_sync_digest": package_hash, "raw_checksum_manifest_sha256": raw_manifest_hash, "episode_manifest_sha256": episode_hash, "annotations_sha256": annotation_hash, "reset_sha256": reset_hash}}
+    return {"source_round_id": round_id, "source_episode_id": episode, "source_episode_digest": package_hash, "source_immutable_revision": "a" * 40, "category": category, "garment": garment, "fingerprint": fingerprint, "continuation_start": {"annotation_index": 16, "step": 16, "policy_request_id": "request-1", "policy_chunk_offset": 0, "policy_observation_state": state, "state": state, "state_fingerprint": fingerprint, "snapshot_relative_path": "snapshots/continuations/000016.json", "snapshot_sha256": continuation_hash, "snapshot_continuation_step": 16, "snapshot_robot_position": state}, "recovery_event": {"adverse_start": 15, "recovery_confirmation": 18}, "source_artifacts": {"package_sync_digest": package_hash, "raw_checksum_manifest_sha256": raw_manifest_hash, "episode_manifest_sha256": episode_hash, "annotations_sha256": annotation_hash, "reset_sha256": reset_hash}}
 
 
 def _audit(selected: list[dict[str, object]]) -> dict[str, object]:
-    audit = {"schema_version": 3, "kind": "lehome_successful_recovery_audit", "continuation_contract": "authenticated_full_snapshot_at_fresh_h16_policy_boundary_before_action", "semantic_sha256": "", "selected_recoveries": selected, "shortfalls": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}}
+    audit = {"schema_version": 3, "kind": "lehome_successful_recovery_audit", "continuation_contract": "authenticated_full_snapshot_at_fresh_h16_next_action_boundary_physical_state_authority", "semantic_sha256": "", "selected_recoveries": selected, "shortfalls": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}}
     audit["semantic_sha256"] = hashlib.sha256(json.dumps({key: value for key, value in audit.items() if key != "semantic_sha256"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return audit
 
@@ -151,8 +151,7 @@ def test_builder_carries_the_exact_authenticated_continuation_state_into_portabl
     selected[0]["continuation_start"]["state"] = [16.0 + index / 10 for index in range(12)]
     raw = accepted / "long" / "raw" / "long"
     annotation_rows = [json.loads(line) for line in (raw / "annotations.jsonl").read_text(encoding="utf-8").splitlines()]
-    annotation_rows[16]["state"] = selected[0]["continuation_start"]["state"]
-    (raw / "annotations.jsonl").write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in annotation_rows), encoding="utf-8")
+    assert annotation_rows[16]["state"] != selected[0]["continuation_start"]["state"]
     continuation = raw / "snapshots" / "continuations" / "000016.json"
     snapshot = json.loads(continuation.read_text(encoding="utf-8"))
     snapshot["robot_position"] = selected[0]["continuation_start"]["state"]

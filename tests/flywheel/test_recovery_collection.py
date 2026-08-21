@@ -12,7 +12,7 @@ def _snapshot() -> dict[str, object]:
         "schema_version": 1, "robot_position": [0.0] * 12,
         "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]],
         "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {},
-        "garment_name": "Top_Long_Seen_0",
+        "garment_name": "Top_Long_Seen_0", "randomization": {"strategy": "canonical"}, "scene_state": {},
     }
 
 
@@ -25,7 +25,7 @@ def _assignment(tmp_path, *, state: list[float] | None = None, teacher: bool = F
     tmp_path.mkdir(parents=True, exist_ok=True)
     reset = tmp_path / "reset.json"; continuation = tmp_path / "continuation.json"; annotations = tmp_path / "annotations.jsonl"
     source_state = state or [0.0] * 12
-    source_snapshot = _snapshot() | {"robot_position": source_state}
+    source_snapshot = _snapshot() | {"robot_position": source_state, "randomization": {"strategy": "canonical", "continuation_step": 16}}
     reset.write_text(json.dumps(_snapshot()), encoding="utf-8")
     continuation.write_text(json.dumps(source_snapshot), encoding="utf-8")
     annotations.write_text("".join(json.dumps({"step": step, "action": [float(step)] * 12, "success": step == 19}) + "\n" for step in range(20)), encoding="utf-8")
@@ -112,6 +112,28 @@ def test_verified_controlled_lineage_rejects_tampered_and_unsafe_files(tmp_path)
     annotations.symlink_to(tmp_path / "elsewhere")
     with pytest.raises(ValueError, match="absolute regular file"):
         load_controlled_recovery(assignment)
+
+
+def test_controlled_runtime_binds_the_physical_snapshot_to_the_exact_h16_boundary_and_reset(tmp_path) -> None:
+    from lehome.flywheel.recovery_collection import load_controlled_recovery
+
+    wrong_step = _assignment(tmp_path / "wrong-step")
+    continuation = Path(wrong_step["source_continuation_snapshot"])
+    payload = json.loads(continuation.read_text(encoding="utf-8"))
+    payload["randomization"]["continuation_step"] = 32
+    continuation.write_text(json.dumps(payload), encoding="utf-8")
+    wrong_step["source_continuation_snapshot_sha256"] = hashlib.sha256(continuation.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="H16 next-action boundary"):
+        load_controlled_recovery(wrong_step)
+
+    wrong_reset = _assignment(tmp_path / "wrong-reset")
+    reset = Path(wrong_reset["source_reset"])
+    payload = json.loads(reset.read_text(encoding="utf-8"))
+    payload["randomization"] = {"strategy": "geometry"}
+    reset.write_text(json.dumps(payload), encoding="utf-8")
+    wrong_reset["source_reset_sha256"] = hashlib.sha256(reset.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="randomization"):
+        load_controlled_recovery(wrong_reset)
 
 
 def test_production_bootstrap_restores_prefixes_then_perturbs_before_policy_continuation(tmp_path) -> None:

@@ -28,6 +28,7 @@ _CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
 _HORIZON = 16
 _SOURCE_ROUND_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 _SOURCE_REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_CONTINUATION_CONTRACT = "authenticated_full_snapshot_at_fresh_h16_next_action_boundary_physical_state_authority"
 
 
 @dataclass(frozen=True)
@@ -264,11 +265,24 @@ def _continuation_start(
     exclusion, never an invitation to open-loop replay a prefix.
     """
 
+    reset_relative = "snapshots/reset.json"
+    reset_record = checksum_manifest.get(reset_relative)
+    reset_path = raw / reset_relative
+    if (not isinstance(reset_record, Mapping) or reset_path.is_symlink() or not reset_path.is_file()
+            or reset_record.get("sha256") != sha256_file(reset_path)
+            or reset_record.get("size") != reset_path.stat().st_size):
+        return None
+    try:
+        reset_snapshot = _snapshot(json.loads(
+            reset_path.read_text(encoding="utf-8"), object_pairs_hook=_strict_pairs, parse_constant=_reject_constant,
+        ))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+
     for index in range(event.adverse_start, event.confirmation):
         row = rows[index]
         if row["policy_chunk_offset"] != 0:
             continue
-        state = list(row["state"])
         relative = f"snapshots/continuations/{index:06d}.json"
         record = checksum_manifest.get(relative)
         path = raw / relative
@@ -279,17 +293,24 @@ def _continuation_start(
             snapshot = _snapshot(json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_strict_pairs, parse_constant=_reject_constant))
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
             continue
-        if snapshot.garment_name != garment or list(snapshot.robot_position) != state:
+        randomization = dict(snapshot.randomization)
+        continuation_step = randomization.pop("continuation_step", None)
+        if (snapshot.garment_name != garment or reset_snapshot.garment_name != garment
+                or type(continuation_step) is not int or continuation_step != index
+                or randomization != dict(reset_snapshot.randomization)):
             continue
+        state = list(snapshot.robot_position)
         return {
             "annotation_index": index,
             "step": row["step"],
             "policy_request_id": row["policy_request_id"],
             "policy_chunk_offset": 0,
+            "policy_observation_state": list(row["state"]),
             "state": state,
             "state_fingerprint": _fingerprint(category=category, garment=garment, state=state),
             "snapshot_relative_path": relative,
             "snapshot_sha256": sha256_file(path),
+            "snapshot_continuation_step": continuation_step,
             "snapshot_robot_position": list(snapshot.robot_position),
         }
     return None
@@ -563,7 +584,7 @@ def audit_successful_recoveries(
         "rounds": round_records, "admitted_episodes": admitted,
         "selected_recoveries": selected, "duplicates": duplicates, "exclusions": exclusions,
         "per_category_counts": counts, "shortfalls": shortfalls, "ready": not any(shortfalls.values()),
-        "continuation_contract": "authenticated_full_snapshot_at_fresh_h16_policy_boundary_before_action",
+        "continuation_contract": _CONTINUATION_CONTRACT,
         "fingerprint_normalization": "category+garment+fresh_policy_continuation_snapshot_robot_position fixed_6dp canonical JSON SHA-256",
         "detector_mode": "reward_drawdown_only_no_reward_freshness_annotations",
     }

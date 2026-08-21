@@ -315,8 +315,8 @@ def test_persistent_manifest_hands_controlled_recovery_identity_to_validator(mon
     reset = tmp_path / "source-reset.json"
     continuation_snapshot = tmp_path / "source-continuation.json"
     annotations = tmp_path / "source-annotations.jsonl"
-    reset.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
-    continuation_snapshot.write_text(json.dumps({"schema_version": 1, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": "Top_Long_Seen_0", "randomization": {}, "scene_state": {}}), encoding="utf-8")
+    reset.write_text(json.dumps({"schema_version": 1, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": "Top_Long_Seen_0", "randomization": {"strategy": "canonical"}, "scene_state": {}}), encoding="utf-8")
+    continuation_snapshot.write_text(json.dumps({"schema_version": 1, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": "Top_Long_Seen_0", "randomization": {"strategy": "canonical", "continuation_step": 16}, "scene_state": {}}), encoding="utf-8")
     annotations.write_text(
         "".join(
                 json.dumps({"step": step, "action": [float(step)] * 12, "success": step == 19}) + "\n"

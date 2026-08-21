@@ -67,6 +67,17 @@ def _round(
         (raw / "annotations.jsonl").write_text(
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in annotations), encoding="utf-8",
         )
+        _write(raw / "snapshots" / "reset.json", {
+            "schema_version": 1,
+            "robot_position": [state_base] * 12,
+            "robot_velocity": [0.0] * 12,
+            "cloth_position": [[0.0, 0.0, 0.0]],
+            "cloth_velocity": [[0.0, 0.0, 0.0]],
+            "rng_state": {"seed": offset},
+            "garment_name": f"{category}-seen-0",
+            "randomization": {"strategy": "canonical"},
+            "scene_state": {},
+        })
         for step in range(16, len(annotations), 16):
             _write(raw / "snapshots" / "continuations" / f"{step:06d}.json", {
                 "schema_version": 1,
@@ -76,7 +87,7 @@ def _round(
                 "cloth_velocity": [[0.0, 0.0, 0.0]],
                 "rng_state": {"seed": offset},
                 "garment_name": f"{category}-seen-0",
-                "randomization": {},
+                "randomization": {"strategy": "canonical", "continuation_step": step},
                 "scene_state": {},
             })
         _write(raw / "episode.json", {
@@ -293,6 +304,11 @@ def test_audit_advances_an_adverse_start_inside_a_cached_chunk_to_the_next_fresh
     root, receipts, seal = _round(tmp_path, round_id="original-round", episodes={
         "recover-boundary": ("top_long", rewards, 3.0),
     })
+    annotations = root / "recover-boundary/raw/recover-boundary/annotations.jsonl"
+    rows = [json.loads(line) for line in annotations.read_text(encoding="utf-8").splitlines()]
+    rows[32]["state"] = [3.031] * 12
+    annotations.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8")
+    _reseal_episode(root, receipts, seal, "recover-boundary")
     output = tmp_path / "result.json"
 
     audit_successful_recoveries(
@@ -309,7 +325,60 @@ def test_audit_advances_an_adverse_start_inside_a_cached_chunk_to_the_next_fresh
     assert continuation["policy_chunk_offset"] == 0
     assert continuation["policy_request_id"] == "request-recover-boundary-2"
     assert continuation["state"] == [3.032] * 12
+    assert continuation["snapshot_continuation_step"] == 32
     assert selected[0]["fingerprint"] == continuation["state_fingerprint"]
+
+
+def test_audit_rejects_a_snapshot_whose_declared_continuation_step_is_wrong(tmp_path: Path) -> None:
+    from lehome_train.groot.recovery_audit import audit_successful_recoveries
+
+    rewards = [0.0] * 16 + [0.4, 0.4, 0.2] + [0.2] * 13 + [0.35, 0.4, 0.5] + [0.5] * 4
+    root, receipts, seal = _round(tmp_path, round_id="original-round", episodes={
+        "recover-boundary": ("top_long", rewards, 3.0),
+    })
+    continuation = root / "recover-boundary/raw/recover-boundary/snapshots/continuations/000032.json"
+    payload = json.loads(continuation.read_text(encoding="utf-8"))
+    payload["randomization"]["continuation_step"] = 16
+    _write(continuation, payload)
+    _reseal_episode(root, receipts, seal, "recover-boundary")
+    output = tmp_path / "wrong-step.json"
+
+    audit_successful_recoveries(
+        accepted_roots=(root,), receipt_roots=(receipts,), round_seal_paths=(seal,), output_path=output,
+    )
+
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["selected_recoveries"] == []
+    assert document["exclusions"] == [{
+        "source_round_id": "original-round", "source_episode_id": "recover-boundary",
+        "reason": "no_authenticated_h16_snapshot_before_recovery_confirmation",
+    }]
+
+
+def test_audit_rejects_a_continuation_from_a_different_reset_randomization(tmp_path: Path) -> None:
+    from lehome_train.groot.recovery_audit import audit_successful_recoveries
+
+    rewards = [0.0] * 16 + [0.4, 0.4, 0.2] + [0.2] * 13 + [0.35, 0.4, 0.5] + [0.5] * 4
+    root, receipts, seal = _round(tmp_path, round_id="original-round", episodes={
+        "recover-boundary": ("top_long", rewards, 3.0),
+    })
+    continuation = root / "recover-boundary/raw/recover-boundary/snapshots/continuations/000032.json"
+    payload = json.loads(continuation.read_text(encoding="utf-8"))
+    payload["randomization"]["strategy"] = "geometry"
+    _write(continuation, payload)
+    _reseal_episode(root, receipts, seal, "recover-boundary")
+    output = tmp_path / "wrong-randomization.json"
+
+    audit_successful_recoveries(
+        accepted_roots=(root,), receipt_roots=(receipts,), round_seal_paths=(seal,), output_path=output,
+    )
+
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["selected_recoveries"] == []
+    assert document["exclusions"] == [{
+        "source_round_id": "original-round", "source_episode_id": "recover-boundary",
+        "reason": "no_authenticated_h16_snapshot_before_recovery_confirmation",
+    }]
 
 
 def test_audit_rejects_missing_or_malformed_policy_chunk_provenance(tmp_path: Path) -> None:
