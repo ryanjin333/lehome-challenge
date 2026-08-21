@@ -313,12 +313,14 @@ def test_persistent_manifest_hands_controlled_recovery_identity_to_validator(mon
     from lehome.flywheel.recovery_collection import load_controlled_recovery
 
     reset = tmp_path / "source-reset.json"
+    continuation_snapshot = tmp_path / "source-continuation.json"
     annotations = tmp_path / "source-annotations.jsonl"
     reset.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+    continuation_snapshot.write_text(json.dumps({"schema_version": 1, "robot_position": [0.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": "Top_Long_Seen_0", "randomization": {}, "scene_state": {}}), encoding="utf-8")
     annotations.write_text(
         "".join(
-            json.dumps({"step": step, "action": [float(step)] * 12, "success": step == 3}) + "\n"
-            for step in range(4)
+                json.dumps({"step": step, "action": [float(step)] * 12, "success": step == 19}) + "\n"
+                for step in range(20)
         ),
         encoding="utf-8",
     )
@@ -338,7 +340,7 @@ def test_persistent_manifest_hands_controlled_recovery_identity_to_validator(mon
         ).encode("utf-8")
     ).hexdigest()
     assignment = {
-        "recovery_kind": "controlled_success_recovery_v1",
+        "recovery_kind": "controlled_success_recovery_snapshot_v2",
         "attempt_id": "controlled-top-long-0",
         "category": category,
         "garment": garment,
@@ -347,13 +349,12 @@ def test_persistent_manifest_hands_controlled_recovery_identity_to_validator(mon
         "strategy": "canonical",
         "source_reset": str(reset),
         "source_reset_sha256": hashlib.sha256(reset.read_bytes()).hexdigest(),
+        "source_continuation_snapshot": str(continuation_snapshot),
+        "source_continuation_snapshot_sha256": hashlib.sha256(continuation_snapshot.read_bytes()).hexdigest(),
         "source_annotations": str(annotations),
         "source_annotations_sha256": hashlib.sha256(annotations.read_bytes()).hexdigest(),
-        "prefix_stop": 2,
-        "source_first_success_step": 3,
-        "action_prefix_sha256": hashlib.sha256(
-            (json.dumps([[0.0] * 12, [1.0] * 12], sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-        ).hexdigest(),
+        "prefix_stop": 16,
+        "source_first_success_step": 19,
         "perturbation_profile": {
             "cloth_displacement_m": 0.002,
             "cloth_velocity_mps": 0.01,
@@ -364,6 +365,7 @@ def test_persistent_manifest_hands_controlled_recovery_identity_to_validator(mon
         "source_episode_id": "episode",
         "source_episode_digest": "a" * 64,
         "source_immutable_revision": "b" * 40,
+        "source_seed": 50110,
         "source_continuation_state": continuation_state,
         "source_state_fingerprint": state_fingerprint,
         "perturbation_fingerprint": "d" * 64,

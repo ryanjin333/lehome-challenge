@@ -225,6 +225,12 @@ class MixedSourceRecorder:
             raise ValueError("recorder frame step continuity is invalid")
         annotation = asdict(frame)
         annotation["action_source"] = frame.action_source.value
+        if self.identity is not None:
+            annotation.update({
+                "category": self.identity.category,
+                "garment_name": self.identity.garment_name,
+                "seed": self.identity.seed,
+            })
         self.writer.append_annotation(annotation)
         self._annotations.append(annotation)
         self._frames.append(frame)
@@ -243,6 +249,25 @@ class MixedSourceRecorder:
         self._snapshots.add(name)
         if name == "reset":
             self._reset_hash = canonical_reset_hash(snapshot)
+
+    def record_continuation_snapshot(self, step: int, snapshot: Snapshot) -> None:
+        """Persist a full simulator state immediately before an H=16 action.
+
+        ``step`` is the next annotation/action index.  This makes a recovery
+        source directly restorable at a fresh policy-request boundary without
+        trying to reconstruct hidden simulator state through open-loop replay.
+        """
+
+        if self._finished or type(step) is not int or step <= 0 or step != self.step or step % self.horizon:
+            raise ValueError("continuation snapshot must be the current positive H16 boundary before finalization")
+        if not isinstance(snapshot, Snapshot):
+            raise ValueError("recorder snapshots must use the validated Snapshot schema")
+        directory = self.writer.staging / "snapshots" / "continuations"
+        directory.mkdir(parents=True, exist_ok=True)
+        destination = directory / f"{step:06d}.json"
+        if destination.exists():
+            raise ValueError("continuation snapshot already exists for this H16 boundary")
+        atomic_write_json(destination, snapshot.to_dict())
 
     def _encode_videos(self) -> tuple[str, ...]:
         if any(self.video_sink.count(camera) != self.step for camera in CANONICAL_CAMERA_NAMES):
@@ -389,6 +414,9 @@ class AutonomousRecorder:
         if name not in {"reset", "terminal"}:
             raise ValueError("snapshot name must be reset or terminal before finalization")
         self._recorder.record_snapshot(name, snapshot)
+
+    def record_continuation_snapshot(self, step: int, snapshot: Snapshot) -> None:
+        self._recorder.record_continuation_snapshot(step, snapshot)
 
     def finish(
         self,

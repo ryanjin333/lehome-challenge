@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -66,6 +67,18 @@ def _round(
         (raw / "annotations.jsonl").write_text(
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in annotations), encoding="utf-8",
         )
+        for step in range(16, len(annotations), 16):
+            _write(raw / "snapshots" / "continuations" / f"{step:06d}.json", {
+                "schema_version": 1,
+                "robot_position": [state_base + step / 1000] * 12,
+                "robot_velocity": [0.0] * 12,
+                "cloth_position": [[0.0, 0.0, 0.0]],
+                "cloth_velocity": [[0.0, 0.0, 0.0]],
+                "rng_state": {"seed": offset},
+                "garment_name": f"{category}-seen-0",
+                "randomization": {},
+                "scene_state": {},
+            })
         _write(raw / "episode.json", {
             "episode_id": attempt_id, "accepted_success": True, "outcome": "success",
             "terminal_reason": "success", "bc_target_count": 0,
@@ -76,7 +89,7 @@ def _round(
             },
             "identity": {
                 "release_stage": "seen", "category": category,
-                "garment_name": f"{category}-seen-0",
+                "garment_name": f"{category}-seen-0", "seed": 50_000 + offset,
             },
         })
         _write(raw / "SHA256SUMS.json", build_sha256_manifest(raw))
@@ -180,6 +193,96 @@ def test_audit_selects_only_h16_corrective_windows_and_reports_shortfalls(tmp_pa
     assert output.with_suffix(".json.sha256").read_text(encoding="ascii").strip() == hashlib.sha256(output.read_bytes()).hexdigest()
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.update({"kind": "rollout_round_seal"}),
+        lambda value: value.update({"source_only": False}),
+        lambda value: value.update({"readback_verified": False}),
+        lambda value: value.update({"episode_count": 0}),
+        lambda value: value["episode_sha256s"].update({"second": "a" * 64}) or value["immutable_revisions"].update({"second": "b" * 40}),
+        lambda value: value.update({"immutable_revisions": {"different": "b" * 40}}),
+        lambda value: value.update({"episode_sha256s": {"one": "z" * 64}}),
+        lambda value: value.update({"immutable_revisions": {"one": "z" * 40}}),
+        lambda value: value.update({"round_id": ""}),
+        lambda value: value.update({"round_id": "../unsafe"}),
+        lambda value: value.update({"repository": ""}),
+        lambda value: value.update({"repository": "owner/../unsafe"}),
+        lambda value: value.update({"unexpected": True}),
+        lambda value: value.pop("repository"),
+    ],
+)
+def test_source_only_envelope_is_fail_closed_and_not_a_strict_round_seal(tmp_path: Path, mutate: object) -> None:
+    from lehome_train.groot.recovery_audit import _audit_source_seal
+    from lehome_train.groot.rollout_source_adapter import _seal
+    assert callable(mutate)
+    body = {"schema_version": 1, "kind": "snapshot_source_bootstrap_envelope", "round_id": "snapshot-source-bootstrap-abc-unsealed-source", "repository": "ryanjin333/lehome-groot-n17-rollouts", "episode_count": 1, "episode_sha256s": {"one": "a" * 64}, "immutable_revisions": {"one": "b" * 40}, "readback_verified": True, "source_only": True}
+    from lehome_train.io import canonical_json_sha256
+    mutate(body)
+    body["envelope_sha256"] = canonical_json_sha256(body)
+    path = tmp_path / "source-envelope.json"; _write(path, body)
+    with pytest.raises(ValueError):
+        _audit_source_seal(path)
+    with pytest.raises(ValueError):
+        _seal(path)
+
+
+def test_source_only_envelope_rejects_raw_checksum_tampering_but_a_canonical_one_is_audit_only(tmp_path: Path) -> None:
+    from lehome_train.groot.recovery_audit import _audit_source_seal
+    from lehome_train.groot.rollout_source_adapter import _seal
+    from lehome_train.io import canonical_json_sha256
+
+    body = {"schema_version": 1, "kind": "snapshot_source_bootstrap_envelope", "round_id": "snapshot-source-bootstrap-abc-unsealed-source", "repository": "ryanjin333/lehome-groot-n17-rollouts", "episode_count": 1, "episode_sha256s": {"one": "a" * 64}, "immutable_revisions": {"one": "b" * 40}, "readback_verified": True, "source_only": True}
+    body["envelope_sha256"] = canonical_json_sha256(body)
+    path = tmp_path / "source-envelope.json"; _write(path, body)
+    assert _audit_source_seal(path)["seal_sha256"] == body["envelope_sha256"]
+    with pytest.raises(ValueError):
+        _seal(path)
+    body["episode_sha256s"]["one"] = "c" * 64
+    _write(path, body)
+    with pytest.raises(ValueError, match="checksum"):
+        _audit_source_seal(path)
+
+
+def _source_only_envelope(path: Path, strict_seal: Path) -> Path:
+    from lehome_train.io import canonical_json_sha256
+
+    strict = json.loads(strict_seal.read_text(encoding="utf-8"))
+    body = {
+        "schema_version": 1, "kind": "snapshot_source_bootstrap_envelope",
+        "round_id": strict["round_id"], "repository": strict["repository"],
+        "episode_count": 1, "episode_sha256s": strict["episode_sha256s"],
+        "immutable_revisions": strict["immutable_revisions"],
+        "readback_verified": True, "source_only": True,
+    }
+    body["envelope_sha256"] = canonical_json_sha256(body)
+    _write(path, body)
+    return path
+
+
+def test_audit_rejects_duplicate_source_envelope_rounds_and_cross_run_episode_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from lehome_train.groot.recovery_audit import audit_successful_recoveries
+
+    materialize = types.ModuleType("lehome_train.flywheel.materialize")
+    materialize._is_autonomous_policy_success = lambda _: True  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "lehome_train.flywheel.materialize", materialize)
+    rewards = [0.0] * 16 + [0.4, 0.1] + [0.1] * 14 + [0.5] * 16
+    root, receipts, strict = _round(tmp_path, round_id="source-round-one", episodes={"shared-attempt": ("top_long", rewards, 1.0)})
+    envelope = _source_only_envelope(tmp_path / "source-one-envelope.json", strict)
+    with pytest.raises(ValueError, match="round seal ID collision"):
+        audit_successful_recoveries(
+            accepted_roots=(root, root), receipt_roots=(receipts, receipts),
+            round_seal_paths=(envelope, envelope), output_path=tmp_path / "duplicate-round.json",
+        )
+    second_root, second_receipts, second_strict = _round(tmp_path, round_id="source-round-two", episodes={"shared-attempt": ("top_long", rewards, 2.0)})
+    second_envelope = _source_only_envelope(tmp_path / "source-two-envelope.json", second_strict)
+    with pytest.raises(ValueError, match="cross-round episode-ID collision"):
+        audit_successful_recoveries(
+            accepted_roots=(root, second_root), receipt_roots=(receipts, second_receipts),
+            round_seal_paths=(envelope, second_envelope), output_path=tmp_path / "duplicate-episode.json",
+        )
+
+
 def test_audit_advances_an_adverse_start_inside_a_cached_chunk_to_the_next_fresh_policy_boundary(tmp_path: Path) -> None:
     """A reset continuation may start only at an authenticated offset-zero action."""
     from lehome_train.groot.recovery_audit import audit_successful_recoveries
@@ -197,7 +300,7 @@ def test_audit_advances_an_adverse_start_inside_a_cached_chunk_to_the_next_fresh
     )
 
     document = json.loads(output.read_text(encoding="utf-8"))
-    assert document["schema_version"] == 2
+    assert document["schema_version"] == 3
     selected = document["selected_recoveries"]
     assert len(selected) == 1
     continuation = selected[0]["continuation_start"]
@@ -283,7 +386,7 @@ def test_audit_excludes_a_recovery_when_the_only_fresh_boundary_is_the_confirmat
     assert document["selected_recoveries"] == []
     assert document["exclusions"] == [{
         "source_round_id": "original-round", "source_episode_id": "no-boundary",
-        "reason": "no_fresh_policy_boundary_before_recovery_confirmation",
+        "reason": "no_authenticated_h16_snapshot_before_recovery_confirmation",
     }]
 
 
@@ -366,7 +469,7 @@ def test_audit_excludes_a_recovery_without_one_full_h16_window(tmp_path: Path) -
     assert document["selected_recoveries"] == []
     assert document["exclusions"] == [{
         "source_round_id": "original-round", "source_episode_id": "too-short",
-        "reason": "no_fresh_policy_boundary_before_recovery_confirmation",
+        "reason": "no_authenticated_h16_snapshot_before_recovery_confirmation",
     }]
 
 

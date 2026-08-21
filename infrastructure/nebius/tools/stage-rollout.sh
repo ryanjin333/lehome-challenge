@@ -38,6 +38,7 @@ chmod 0755 "${STAGE_DIR}/scripts/build_success_replay_matrix.py"
 chmod 0755 "${STAGE_DIR}/scripts/materialize_finalist_seen_regression_handoff.py"
 chmod 0755 "${STAGE_DIR}/scripts/run_lehome_experiment_evaluator.py"
 chmod 0755 "${STAGE_DIR}/rollout_appliance/run_success_replay_campaign.sh"
+chmod 0755 "${STAGE_DIR}/rollout_appliance/run_snapshot_source_bootstrap.sh"
 
 # Safety scan: no credential VALUES may enter the staged tree. Match only
 # literal token values and PEM key blocks, not the key-name identifiers used

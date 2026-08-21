@@ -217,8 +217,8 @@ def test_concurrent_successes_never_exceed_the_accepted_target(tmp_path) -> None
 
 def test_controlled_matrix_category_cap_rejects_extra_successes_while_legacy_is_unchanged(tmp_path) -> None:
     matrix = (
-        {"episode": "episode-001", "category": "top_long", "recovery_kind": "controlled_success_recovery_v1", "category_acceptance_cap": 1},
-        {"episode": "episode-002", "category": "top_long", "recovery_kind": "controlled_success_recovery_v1", "category_acceptance_cap": 1},
+        {"episode": "episode-001", "category": "top_long", "recovery_kind": "controlled_success_recovery_snapshot_v2", "category_acceptance_cap": 1},
+        {"episode": "episode-002", "category": "top_long", "recovery_kind": "controlled_success_recovery_snapshot_v2", "category_acceptance_cap": 1},
         {"episode": "episode-003", "category": "pant_short"},
     )
     ledger = TaskLedger(tmp_path / "caps.db", attempt_matrix=matrix, max_attempts=3, target_accepted=3)

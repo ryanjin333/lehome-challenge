@@ -293,30 +293,30 @@ def test_rollout_preemption_reuses_controlled_materialization_rows_without_chang
     from lehome.flywheel.task_ledger import TaskLedger
 
     run_root = tmp_path / "workspace" / "campaign"; run_root.mkdir(parents=True)
-    reset, annotations = run_root / "reset.json", run_root / "annotations.jsonl"
-    reset.write_text("{}", encoding="utf-8"); annotations.write_text("", encoding="utf-8")
+    reset, annotations, continuation = run_root / "reset.json", run_root / "annotations.jsonl", run_root / "continuation.json"
+    reset.write_text("{}", encoding="utf-8"); annotations.write_text("", encoding="utf-8"); continuation.write_text("{}", encoding="utf-8")
     caps = {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}
     categories = ["pant_long"] * 4 + ["top_long"] + ["top_short"] * 3
     rows = [
         {
             "attempt_id": f"controlled-{index}", "trial_id": f"controlled-{index}",
             "category": category, "category_acceptance_cap": caps[category],
-            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_v1",
+            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v2",
             "controlled_matrix_sha256": "a" * 64, "perturbation_seed": 71_000 + index,
             "perturbation_fingerprint": f"{index + 100:064x}",
             "source_state_perturbation_fingerprint": f"{index + 200:064x}",
-            "source_continuation_state": [0.0] * 12,
+            "source_seed": 50110, "source_continuation_state": [0.0] * 12,
             "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round",
             "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}",
             "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64,
-            "action_prefix_sha256": "c" * 64, "prefix_stop": 1,
-            "source_first_success_step": 2, "source_reset": str(reset),
-            "source_annotations": str(annotations),
+            "source_continuation_snapshot_sha256": "c" * 64, "prefix_stop": 16,
+            "source_first_success_step": 19, "source_reset": str(reset),
+            "source_annotations": str(annotations), "source_continuation_snapshot": str(continuation),
         }
         for index, category in enumerate(categories)
     ]
     matrix_path = run_root / "materialization.json"
-    matrix_path.write_text(json.dumps({"schema_version": 1, "kind": "controlled_success_recovery_materialization_v1", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}), encoding="utf-8")
+    matrix_path.write_text(json.dumps({"schema_version": 2, "kind": "controlled_success_recovery_materialization_v2", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}), encoding="utf-8")
     database = run_root / "ledger.sqlite3"
     ledger = TaskLedger(database, attempt_matrix=rows, max_attempts=8, target_accepted=8)
     original_ids = [attempt.attempt_id for attempt in ledger.attempts()]; ledger.close()

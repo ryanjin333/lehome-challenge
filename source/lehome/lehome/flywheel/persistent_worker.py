@@ -386,6 +386,15 @@ class PersistentRolloutWorker:
                     raise ValueError("attempt garment must be a non-empty string")
                 if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
                     raise ValueError("attempt seed must be a non-negative integer")
+                environment_seed = seed
+                if assignment.get("recovery_kind") == "controlled_success_recovery_snapshot_v2":
+                    source_seed = assignment.get("source_seed")
+                    if type(source_seed) is not int or source_seed < 0:
+                        raise ValueError("controlled recovery requires a non-negative authenticated source seed")
+                    # The assignment seed identifies the bounded perturbation;
+                    # The source seed rebuilds the matching scene before its
+                    # authenticated H16 physical snapshot is restored.
+                    environment_seed = source_seed
 
                 try:
                     generation = self._reset_policy_generation()
@@ -395,7 +404,7 @@ class PersistentRolloutWorker:
                     outcome = self._prepare_and_run_with_heartbeat(
                         session,
                         garment_name=garment_name,
-                        seed=seed,
+                        seed=environment_seed,
                         generation=generation,
                         assignment={**dict(assignment), "attempt_id": attempt_id},
                         output_dir=output_dir,
@@ -459,6 +468,7 @@ class PersistentRolloutWorker:
                     "worker_id": self.identity.worker_id,
                     "session_id": self.identity.session_id,
                     "seed": seed,
+                    **({"source_seed": environment_seed} if assignment.get("recovery_kind") == "controlled_success_recovery_snapshot_v2" else {}),
                     "garment": garment_name,
                     "episode_generation": generation,
                     "output_dir": str(output_dir),

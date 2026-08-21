@@ -1,8 +1,8 @@
 """Verified bootstrap for controlled autonomous success-recovery rollouts.
 
-The source action prefix is provenance, never data: it deterministically puts
-the simulator at an audited intermediate state.  The recorder is deliberately
-created only after that prefix and its bounded perturbation have completed.
+Version 2 restores a checksum-authenticated physical H=16 continuation
+Snapshot directly.  It never reconstructs that boundary with a long
+open-loop source prefix.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from typing import Any, Mapping, Sequence
 from lehome.flywheel.snapshots import Snapshot
 
 
-RECOVERY_KIND = "controlled_success_recovery_v1"
+RECOVERY_KIND = "controlled_success_recovery_snapshot_v2"
 _SHA256_LENGTH = 64
 _LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_CLOTH_DISPLACEMENT_M = 0.01
@@ -31,8 +31,7 @@ _REPLAY_FIDELITY_TOLERANCE_RAD = 0.005
 
 @dataclass(frozen=True, slots=True)
 class ControlledRecovery:
-    reset_payload: Mapping[str, object]
-    prefix_actions: tuple[tuple[float, ...], ...]
+    continuation_snapshot: Snapshot
     teacher_actions: tuple[tuple[float, ...], ...]
     continuation_state: tuple[float, ...]
     perturbation_profile: Mapping[str, float]
@@ -52,15 +51,39 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _verified_json_file(value: object, expected: object, *, field: str) -> tuple[Path, object]:
-    if not isinstance(value, str):
+def _strict_absolute_regular_file(value: object, *, field: str) -> Path:
+    """Reject symlinks at the leaf *and every existing ancestor*.
+
+    ``Path.resolve`` alone is insufficient: it accepts an ancestor symlink and
+    would let a post-validation replacement redirect an immutable bootstrap
+    input.  All source evidence paths are expected to be absolute files under
+    a real materialization root.
+    """
+
+    if not isinstance(value, (str, Path)):
         raise ValueError(f"{field} must be an absolute regular file")
     path = Path(value)
-    if not path.is_absolute() or path.is_symlink():
+    if not path.is_absolute():
         raise ValueError(f"{field} must be an absolute regular file")
-    try:
-        if not stat.S_ISREG(path.stat().st_mode):
+    current = path
+    while True:
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            raise ValueError(f"{field} must be an absolute regular file") from error
+        if stat.S_ISLNK(metadata.st_mode):
             raise ValueError(f"{field} must be an absolute regular file")
+        if current.parent == current:
+            break
+        current = current.parent
+    if not stat.S_ISREG(path.stat().st_mode):
+        raise ValueError(f"{field} must be an absolute regular file")
+    return path
+
+
+def _verified_json_file(value: object, expected: object, *, field: str) -> tuple[Path, object]:
+    path = _strict_absolute_regular_file(value, field=field)
+    try:
         payload = path.read_bytes()
     except OSError as error:
         raise ValueError(f"{field} must be an absolute regular file") from error
@@ -75,8 +98,7 @@ def _verified_json_file(value: object, expected: object, *, field: str) -> tuple
 
 
 def _annotations(path: Path, expected: object) -> tuple[tuple[tuple[float, ...], ...], tuple[bool, ...]]:
-    if path.is_symlink() or not path.is_absolute() or not stat.S_ISREG(path.stat().st_mode):
-        raise ValueError("source annotations must be an absolute regular file")
+    path = _strict_absolute_regular_file(str(path), field="source annotations")
     if not isinstance(expected, str) or _sha256(path) != expected:
         raise ValueError("source annotations SHA-256 mismatch")
     rows: list[Mapping[str, object]] = []
@@ -174,27 +196,24 @@ def load_controlled_recovery(assignment: Mapping[str, object]) -> ControlledReco
 
     if assignment.get("recovery_kind") != RECOVERY_KIND:
         raise ValueError("assignment is not a controlled success recovery")
-    reset_path, reset = _verified_json_file(
-        assignment.get("source_reset"), assignment.get("source_reset_sha256"), field="source reset"
+    snapshot_path, snapshot_payload = _verified_json_file(
+        assignment.get("source_continuation_snapshot"), assignment.get("source_continuation_snapshot_sha256"), field="source continuation snapshot"
     )
-    if not isinstance(reset, Mapping):
-        raise ValueError("source reset must contain a JSON object")
+    if not isinstance(snapshot_payload, Mapping):
+        raise ValueError("source continuation snapshot must contain a JSON object")
+    continuation_snapshot = _snapshot(snapshot_payload)
     annotations_value = assignment.get("source_annotations")
     if not isinstance(annotations_value, str):
         raise ValueError("source annotations must be an absolute regular file")
     actions, successes = _annotations(Path(annotations_value), assignment.get("source_annotations_sha256"))
     stop = assignment.get("prefix_stop")
-    if type(stop) is not int or not 1 <= stop < len(actions):
-        raise ValueError("prefix stop must select a strict nonempty action prefix")
+    if type(stop) is not int or not 0 < stop < len(actions) or stop % 16:
+        raise ValueError("continuation boundary must be a strict positive H16 action index")
     first_success = assignment.get("source_first_success_step")
     if type(first_success) is not int or not stop < first_success < len(actions):
-        raise ValueError("prefix stop must precede the first recorded success")
+        raise ValueError("continuation boundary must precede the first recorded success")
     if not successes[first_success] or any(successes[:first_success]):
         raise ValueError("source first recorded success does not match authenticated annotations")
-    prefix = actions[:stop]
-    expected_prefix = assignment.get("action_prefix_sha256")
-    if not isinstance(expected_prefix, str) or hashlib.sha256(_canonical_bytes([list(action) for action in prefix])).hexdigest() != expected_prefix:
-        raise ValueError("action prefix SHA-256 mismatch")
     seed = assignment.get("perturbation_seed")
     if type(seed) is not int or seed < 0:
         raise ValueError("perturbation seed must be a non-negative integer")
@@ -202,18 +221,243 @@ def load_controlled_recovery(assignment: Mapping[str, object]) -> ControlledReco
     required = ("source_round_id", "source_episode_id", "source_episode_digest", "source_immutable_revision", "source_state_fingerprint", "perturbation_fingerprint", "source_state_perturbation_fingerprint")
     if any(not isinstance(assignment.get(key), str) or not assignment[key] for key in required):
         raise ValueError("controlled recovery source lineage is incomplete")
+    if type(assignment.get("source_seed")) is not int or assignment["source_seed"] < 0:
+        raise ValueError("controlled recovery source reset seed is invalid")
     continuation = _continuation_state(
         assignment.get("source_continuation_state"), category=assignment.get("category"),
         garment=assignment.get("garment"), fingerprint=assignment.get("source_state_fingerprint"),
     )
+    if (continuation_snapshot.garment_name != assignment.get("garment")
+            or list(continuation_snapshot.robot_position) != list(continuation)):
+        raise ValueError("source continuation snapshot does not match authenticated annotation state")
     teacher_probe = assignment.get("controlled_smoke_teacher_probe", False)
     if type(teacher_probe) is not bool:
         raise ValueError("controlled recovery teacher probe flag is invalid")
     if teacher_probe and assignment.get("controlled_smoke") is not True:
         raise ValueError("controlled recovery teacher probe is smoke-only")
-    provenance = {key: assignment[key] for key in assignment if key.startswith("source_") or key in {"action_prefix_sha256", "prefix_stop", "perturbation_profile", "perturbation_seed", "perturbation_fingerprint", "recovery_kind", "controlled_smoke_teacher_probe"}}
-    provenance.update({"source_reset": str(reset_path), "source_annotations": str(Path(annotations_value))})
-    return ControlledRecovery(reset, prefix, actions[stop:first_success + 1] if teacher_probe else (), continuation, profile, seed, provenance)
+    provenance = {key: assignment[key] for key in assignment if key.startswith("source_") or key in {"prefix_stop", "perturbation_profile", "perturbation_seed", "perturbation_fingerprint", "recovery_kind", "controlled_smoke_teacher_probe"}}
+    provenance.update({"source_continuation_snapshot": str(snapshot_path), "source_annotations": str(Path(annotations_value))})
+    return ControlledRecovery(continuation_snapshot, actions[stop:first_success + 1] if teacher_probe else (), continuation, profile, seed, provenance)
+
+
+def _validate_v2_smoke_descriptor(row: Mapping[str, object]) -> None:
+    """Admit only the immutable one-row descriptor produced by the smoke wrapper."""
+
+    if row.get("controlled_smoke") is not True:
+        raise ValueError("v2 controlled list requires an explicit controlled smoke descriptor")
+    run_id = row.get("controlled_smoke_run_id")
+    matrix_sha256 = row.get("controlled_smoke_matrix_sha256")
+    materialization_sha256 = row.get("controlled_smoke_materialization_sha256")
+    row_index = row.get("controlled_smoke_row_index")
+    if (not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None
+            or not isinstance(matrix_sha256, str) or _LOWERCASE_SHA256.fullmatch(matrix_sha256) is None
+            or not isinstance(materialization_sha256, str) or _LOWERCASE_SHA256.fullmatch(materialization_sha256) is None
+            or type(row_index) is not int or row_index < 0
+            or row.get("controlled_matrix_sha256") != matrix_sha256):
+        raise ValueError("controlled smoke descriptor lineage is invalid")
+    identity = hashlib.sha256(f"{run_id}:{matrix_sha256}:{materialization_sha256}".encode("ascii")).hexdigest()[:20]
+    if row.get("controlled_smoke_identity") != identity:
+        raise ValueError("controlled smoke descriptor identity is invalid")
+    zero, teacher = row.get("controlled_smoke_zero_perturbation"), row.get("controlled_smoke_teacher_probe")
+    if type(zero) is not bool or type(teacher) is not bool:
+        raise ValueError("controlled smoke descriptor mode is invalid")
+    mode = (
+        "zero_perturbation_teacher_continuation_probe_v1" if zero else "teacher_continuation_probe_v1"
+    ) if teacher else ("zero_perturbation_control_v1" if zero else "bounded_perturbation_v1")
+    mode_identity = hashlib.sha256(f"{identity}:{mode}".encode("ascii")).hexdigest()[:20]
+    if row.get("controlled_smoke_perturbation_mode") != mode or row.get("controlled_smoke_mode_identity") != mode_identity:
+        raise ValueError("controlled smoke descriptor mode identity is invalid")
+
+
+def _strict_json_value_from_text(text: str, *, field: str) -> object:
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{field} has duplicate JSON fields")
+            result[key] = value
+        return result
+
+    def reject_constant(_: str) -> object:
+        raise ValueError("non-finite JSON constant")
+
+    try:
+        return json.loads(
+            text, object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ValueError(f"{field} must be strict JSON") from error
+
+
+def _strict_json_object(path: Path, *, field: str) -> dict[str, object]:
+    try:
+        payload = _strict_json_value_from_text(path.read_text(encoding="utf-8"), field=field)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ValueError(f"{field} must be a strict JSON object") from error
+    if type(payload) is not dict:
+        raise ValueError(f"{field} must be a strict JSON object")
+    return payload
+
+
+def _strict_snapshot(payload: Mapping[str, object]) -> Snapshot:
+    required = {
+        "schema_version", "robot_position", "robot_velocity", "cloth_position", "cloth_velocity",
+        "rng_state", "garment_name", "randomization",
+    }
+    if set(payload) not in (required, required | {"scene_state"}):
+        raise ValueError("continuation snapshot has an incompatible schema")
+
+    def vector(value: object, *, name: str) -> tuple[float, ...]:
+        if not isinstance(value, list) or len(value) != 12 or any(type(item) not in (int, float) or not math.isfinite(float(item)) for item in value):
+            raise ValueError(f"continuation snapshot {name} must be finite 12-D")
+        return tuple(float(item) for item in value)
+
+    def cloth(value: object, *, name: str) -> tuple[tuple[float, float, float], ...]:
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"continuation snapshot {name} must be finite N-by-3")
+        rows: list[tuple[float, float, float]] = []
+        for point in value:
+            if not isinstance(point, list) or len(point) != 3 or any(type(item) not in (int, float) or not math.isfinite(float(item)) for item in point):
+                raise ValueError(f"continuation snapshot {name} must be finite N-by-3")
+            rows.append(tuple(float(item) for item in point))
+        return tuple(rows)
+
+    if (type(payload.get("schema_version")) is not int or not isinstance(payload.get("rng_state"), dict)
+            or not isinstance(payload.get("garment_name"), str) or not payload["garment_name"]
+            or not isinstance(payload.get("randomization"), dict)
+            or not isinstance(payload.get("scene_state", {}), dict)):
+        raise ValueError("continuation snapshot has an incompatible schema")
+    try:
+        return Snapshot(
+            schema_version=payload["schema_version"],
+            robot_position=vector(payload["robot_position"], name="robot_position"),
+            robot_velocity=vector(payload["robot_velocity"], name="robot_velocity"),
+            cloth_position=cloth(payload["cloth_position"], name="cloth_position"),
+            cloth_velocity=cloth(payload["cloth_velocity"], name="cloth_velocity"),
+            rng_state=dict(payload["rng_state"]), garment_name=payload["garment_name"],
+            randomization=dict(payload["randomization"]), scene_state=dict(payload.get("scene_state", {})),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("continuation snapshot has an incompatible schema") from error
+
+
+def validate_snapshot_source_bootstrap_evidence(
+    *, accepted_root: str | Path, descriptor_path: str | Path,
+) -> tuple[int, ...]:
+    """Validate one ordinary autonomous source before a source-only envelope.
+
+    The bootstrap wrapper calls this shared collection-side gate after receipt
+    readback.  It intentionally refuses partial snapshot evidence: a later
+    recovery audit may only select a full H=16 physical boundary that is
+    manifest-authenticated and tied back to the descriptor/episode/annotation
+    identity.
+    """
+
+    descriptor_file = _strict_absolute_regular_file(descriptor_path, field="snapshot source descriptor")
+    try:
+        rows = _strict_json_value_from_text(descriptor_file.read_text(encoding="utf-8"), field="snapshot source descriptor")
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ValueError("snapshot source descriptor is malformed") from error
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
+        raise ValueError("snapshot source descriptor must contain exactly one row")
+    descriptor_row = rows[0]
+    category, garment, seed = descriptor_row.get("category"), descriptor_row.get("garment"), descriptor_row.get("seed")
+    if (descriptor_row.get("snapshot_source_bootstrap") is not True or descriptor_row.get("recovery_kind") is not None
+            or category not in {"top_long", "top_short", "pant_long", "pant_short"}
+            or not isinstance(garment, str) or not garment
+            or type(seed) is not int or seed < 0 or descriptor_row.get("source_seed") != seed):
+        raise ValueError("snapshot source descriptor lineage is invalid")
+    accepted = Path(accepted_root)
+    if not accepted.is_absolute() or accepted.is_symlink() or not accepted.is_dir():
+        raise ValueError("snapshot source accepted root is unsafe")
+    raw = accepted / "raw" / accepted.name
+    manifest_path = _strict_absolute_regular_file(raw / "SHA256SUMS.json", field="snapshot source checksum manifest")
+    _strict_absolute_regular_file(raw / "episode.json", field="snapshot source episode")
+    annotations_path = _strict_absolute_regular_file(raw / "annotations.jsonl", field="snapshot source annotations")
+    reset_path = _strict_absolute_regular_file(raw / "snapshots" / "reset.json", field="snapshot source reset")
+    try:
+        from lehome.flywheel.artifacts import verify_episode_manifest
+        episode, manifest = verify_episode_manifest(raw)
+    except (ImportError, ValueError) as error:
+        raise ValueError("snapshot source checksum manifest does not authenticate the accepted episode") from error
+    del manifest_path, manifest
+    if not isinstance(episode, Mapping):
+        raise ValueError("snapshot source episode is malformed")
+    identity = episode.get("identity")
+    if (episode.get("episode_id") != accepted.name or episode.get("mode") != "autonomous"
+            or episode.get("accepted_success") is not True or episode.get("outcome") != "success"
+            or episode.get("terminal_reason") != "success" or episode.get("bc_target_count") != 0
+            or not isinstance(identity, Mapping) or identity.get("category") != category
+            or identity.get("garment_name") != garment or identity.get("seed") != seed):
+        raise ValueError("snapshot source episode is not an accepted autonomous descriptor-bound success")
+    reset = _strict_snapshot(_strict_json_object(reset_path, field="snapshot source reset"))
+    if reset.garment_name != garment:
+        raise ValueError("snapshot source reset garment does not match the descriptor")
+    annotation_rows: list[dict[str, object]] = []
+    try:
+        for line in annotations_path.read_text(encoding="utf-8").splitlines():
+            value = _strict_json_value_from_text(line, field="snapshot source annotation")
+            if type(value) is not dict:
+                raise ValueError("snapshot source annotation must be a strict JSON object")
+            annotation_rows.append(value)
+    except (OSError, UnicodeError) as error:
+        raise ValueError("snapshot source annotations are unreadable") from error
+    if not annotation_rows:
+        raise ValueError("snapshot source annotations are empty")
+    request_ids: set[str] = set()
+    for index, row in enumerate(annotation_rows):
+        state, action, success = row.get("state"), row.get("action"), row.get("success")
+        if (row.get("step") != index or row.get("action_source") != "policy"
+                or not isinstance(row.get("policy_request_id"), str) or not row["policy_request_id"]
+                or type(row.get("policy_chunk_offset")) is not int or row["policy_chunk_offset"] != index % 16
+                or not isinstance(state, list) or len(state) != 12
+                or not isinstance(action, list) or len(action) != 12
+                or type(success) is not bool or type(row.get("reward")) not in (int, float)
+                or not math.isfinite(float(row["reward"]))
+                or any(type(item) not in (int, float) or not math.isfinite(float(item)) for item in (*state, *action))
+                or row.get("category") != category or row.get("garment_name") != garment or row.get("seed") != seed):
+            raise ValueError("snapshot source annotations do not satisfy the autonomous H16 trace contract")
+        if index % 16 == 0:
+            if row["policy_request_id"] in request_ids:
+                raise ValueError("snapshot source annotations reuse a policy request")
+            request_ids.add(row["policy_request_id"])
+        elif row["policy_request_id"] != annotation_rows[index - 1]["policy_request_id"]:
+            raise ValueError("snapshot source annotations do not preserve a 16-row policy chunk")
+    first_success = next((index for index, row in enumerate(annotation_rows) if row["success"]), None)
+    if first_success is None:
+        raise ValueError("snapshot source annotations lack an official first success")
+    if any(not row["success"] for row in annotation_rows[first_success:]):
+        raise ValueError("snapshot source annotations do not latch success through terminal")
+    directory = raw / "snapshots" / "continuations"
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("snapshot source has no continuation snapshots")
+    continuations = sorted(directory.iterdir())
+    if not continuations:
+        raise ValueError("snapshot source has no continuation snapshots")
+    steps: list[int] = []
+    for path in continuations:
+        if path.is_dir() or path.suffix != ".json":
+            raise ValueError("snapshot source continuation directory contains an unexpected path")
+        strict_path = _strict_absolute_regular_file(path, field="snapshot source continuation")
+        match = re.fullmatch(r"([0-9]{6})\.json", strict_path.name)
+        if match is None:
+            raise ValueError("snapshot source continuation filename is not a six-digit H16 boundary")
+        step = int(match.group(1))
+        if step <= 0 or step % 16 or step >= first_success or step >= len(annotation_rows):
+            raise ValueError("snapshot source continuation boundary is invalid")
+        snapshot = _strict_snapshot(_strict_json_object(strict_path, field="snapshot source continuation"))
+        row = annotation_rows[step]
+        state = row.get("state")
+        if (row.get("step") != step or row.get("action_source") != "policy" or row.get("policy_chunk_offset") != 0
+                or row.get("category") != category or row.get("garment_name") != garment or row.get("seed") != seed
+                or not isinstance(state, list) or len(state) != 12
+                or any(type(item) not in (int, float) or not math.isfinite(float(item)) for item in state)
+                or tuple(float(item) for item in state) != snapshot.robot_position
+                or snapshot.garment_name != garment):
+            raise ValueError("snapshot source continuation does not match the authenticated H16 annotation")
+        steps.append(step)
+    return tuple(steps)
 
 
 def load_attempt_matrix(path_value: str | Path) -> list[Mapping[str, object]]:
@@ -233,13 +477,27 @@ def load_attempt_matrix(path_value: str | Path) -> list[Mapping[str, object]]:
     if isinstance(decoded, list):
         if not all(isinstance(row, Mapping) for row in decoded):
             raise ValueError("attempt matrix must be a JSON array of assignments")
+        v2_rows = [row for row in decoded if row.get("recovery_kind") == RECOVERY_KIND]
+        if v2_rows:
+            if len(decoded) != 1 or len(v2_rows) != 1:
+                raise ValueError("v2 controlled smoke list must contain exactly one row")
+            _validate_v2_smoke_descriptor(v2_rows[0])
+            return [dict(v2_rows[0])]
+        for row in decoded:
+            controlled = (
+                "recovery_kind" in row
+                or any(str(key).startswith("source_continuation_") for key in row)
+                or "category_acceptance_cap" in row
+            )
+            if controlled and row.get("recovery_kind") != RECOVERY_KIND:
+                raise ValueError("legacy or incompatible controlled recovery list is forbidden")
         return [dict(row) for row in decoded]
     envelope = {"schema_version", "kind", "matrix_sha256", "target_accepted", "category_acceptance_caps", "rows"}
     if not isinstance(decoded, Mapping) or set(decoded) != envelope:
         raise ValueError("attempt matrix must be a JSON array or controlled materialization")
     matrix_sha256 = decoded.get("matrix_sha256")
     rows, target, caps = decoded.get("rows"), decoded.get("target_accepted"), decoded.get("category_acceptance_caps")
-    if decoded.get("schema_version") != 1 or decoded.get("kind") != "controlled_success_recovery_materialization_v1":
+    if decoded.get("schema_version") != 2 or decoded.get("kind") != "controlled_success_recovery_materialization_v2":
         raise ValueError("controlled materialization has an incompatible schema")
     if not isinstance(matrix_sha256, str) or _LOWERCASE_SHA256.fullmatch(matrix_sha256) is None:
         raise ValueError("controlled materialization matrix hash is invalid")
@@ -275,22 +533,26 @@ def load_attempt_matrix(path_value: str | Path) -> list[Mapping[str, object]]:
             if not isinstance(value, str) or _LOWERCASE_SHA256.fullmatch(value) is None or value in seen:
                 raise ValueError("controlled materialization fingerprints must be unique lowercase SHA-256 values")
             seen.add(value)
-        for field in ("source_episode_digest", "source_reset_sha256", "source_annotations_sha256", "action_prefix_sha256", "source_state_fingerprint"):
+        for field in ("source_episode_digest", "source_reset_sha256", "source_annotations_sha256", "source_continuation_snapshot_sha256", "source_state_fingerprint"):
             if not isinstance(row.get(field), str) or _LOWERCASE_SHA256.fullmatch(str(row[field])) is None:
                 raise ValueError("controlled materialization source identity is invalid")
+        if type(row.get("source_seed")) is not int or row["source_seed"] < 0:
+            raise ValueError("controlled materialization source reset seed is invalid")
         continuation = row.get("source_continuation_state")
         if (not isinstance(continuation, list) or len(continuation) != 12
                 or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in continuation)):
             raise ValueError("controlled materialization continuation state is invalid")
         if not isinstance(row.get("source_round_id"), str) or not row["source_round_id"] or not isinstance(row.get("source_episode_id"), str) or not row["source_episode_id"]:
             raise ValueError("controlled materialization source identity is invalid")
-        if type(row.get("prefix_stop")) is not int or type(row.get("source_first_success_step")) is not int or not 0 < row["prefix_stop"] < row["source_first_success_step"]:
-            raise ValueError("controlled materialization source prefix is invalid")
-        for field in ("source_reset", "source_annotations"):
+        if (type(row.get("prefix_stop")) is not int or type(row.get("source_first_success_step")) is not int
+                or not 0 < row["prefix_stop"] < row["source_first_success_step"] or row["prefix_stop"] % 16):
+            raise ValueError("controlled materialization continuation boundary is invalid")
+        for field in ("source_reset", "source_annotations", "source_continuation_snapshot"):
             value = row.get(field)
-            candidate = Path(value) if isinstance(value, str) else None
-            if candidate is None or not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_file():
-                raise ValueError("controlled materialization source path is unsafe")
+            try:
+                _strict_absolute_regular_file(value, field="controlled materialization source path")
+            except ValueError as error:
+                raise ValueError("controlled materialization source path is unsafe") from error
         hydrated.append(dict(row))
     if any(categories[category] < cap for category, cap in expected_caps.items() if cap):
         raise ValueError("controlled materialization schedule cannot reach its category acceptance caps")
@@ -352,21 +614,19 @@ def apply_controlled_perturbation(snapshot: Mapping[str, object] | Snapshot, pro
 
 
 def bootstrap_controlled_recovery(env: object, assignment: Mapping[str, object]) -> Mapping[str, object]:
-    """Restore, prefix replay, perturb, restore/read back, then expose lineage."""
+    """Restore an authenticated H16 boundary, teacher-check, then perturb."""
 
     from lehome.flywheel.snapshots import capture_snapshot, restore_snapshot
 
     recovery = load_controlled_recovery(assignment)
-    restore_snapshot(env, _snapshot(recovery.reset_payload))
-    replay_action_prefix(env, recovery.prefix_actions)
+    restore_snapshot(env, recovery.continuation_snapshot)
     checks = [_replay_fidelity(env, recovery.continuation_state)]
     teacher_provenance: Mapping[str, object] | None = None
     if recovery.teacher_actions:
         replay_action_prefix(env, recovery.teacher_actions)
         if not _teacher_success(env):
             raise ValueError("controlled recovery teacher probe did not reproduce source success")
-        restore_snapshot(env, _snapshot(recovery.reset_payload))
-        replay_action_prefix(env, recovery.prefix_actions)
+        restore_snapshot(env, recovery.continuation_snapshot)
         checks.append(_replay_fidelity(env, recovery.continuation_state))
         teacher_provenance = {"enabled": True, "verified": True, "replayed_action_count": len(recovery.teacher_actions)}
     intermediate = capture_snapshot(env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND})

@@ -15,15 +15,19 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Any, Mapping, Sequence
 
+from lehome.flywheel.snapshots import Snapshot
 from lehome_train.groot.rollout_source_adapter import _accepted_episode, _seal
 from lehome_train.io import canonical_json_bytes, canonical_json_sha256, sha256_file
 
 
 _CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
 _HORIZON = 16
+_SOURCE_ROUND_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
+_SOURCE_REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,42 @@ def _output_path(path: str | Path) -> Path:
     if target.with_name(target.name + ".sha256").exists():
         raise FileExistsError("audit output checksum path already exists")
     return target
+
+
+def _audit_source_seal(path: Path) -> Mapping[str, object]:
+    """Accept a one-episode source envelope only in the recovery-audit lane.
+
+    This is intentionally not added to rollout_source_adapter._seal: it is
+    non-trainable provenance for fresh snapshot sources, never a strict round
+    seal consumable by training/source adapters.
+    """
+
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("recovery audit source envelope is malformed") from error
+    if document.get("kind") == "rollout_round_seal":
+        return _seal(path)
+    required = {"schema_version", "kind", "round_id", "repository", "episode_count", "episode_sha256s", "immutable_revisions", "readback_verified", "source_only", "envelope_sha256"}
+    if not isinstance(document, Mapping) or set(document) != required or document.get("schema_version") != 1 or document.get("kind") != "snapshot_source_bootstrap_envelope" or document.get("source_only") is not True or document.get("readback_verified") is not True or document.get("episode_count") != 1:
+        raise ValueError("recovery audit source envelope is invalid")
+    expected = dict(document); claimed = expected.pop("envelope_sha256")
+    if not isinstance(claimed, str) or claimed != canonical_json_sha256(expected):
+        raise ValueError("recovery audit source envelope checksum mismatch")
+    episodes, revisions = document["episode_sha256s"], document["immutable_revisions"]
+    if (not isinstance(document["round_id"], str) or _SOURCE_ROUND_ID.fullmatch(document["round_id"]) is None
+            or not isinstance(document["repository"], str) or _SOURCE_REPOSITORY.fullmatch(document["repository"]) is None
+            or not isinstance(episodes, Mapping) or not isinstance(revisions, Mapping)
+            or set(episodes) != set(revisions) or len(episodes) != 1):
+        raise ValueError("recovery audit source envelope lineage is invalid")
+    episode_id = next(iter(episodes))
+    if (not isinstance(episode_id, str) or not episode_id
+            or not isinstance(episodes[episode_id], str) or len(episodes[episode_id]) != 64
+            or any(character not in "0123456789abcdef" for character in episodes[episode_id])
+            or not isinstance(revisions[episode_id], str) or len(revisions[episode_id]) != 40
+            or any(character not in "0123456789abcdef" for character in revisions[episode_id])):
+        raise ValueError("recovery audit source envelope lineage is invalid")
+    return {**document, "seal_sha256": claimed}
 
 
 def _overlaps(left: Path, right: Path) -> bool:
@@ -192,14 +232,36 @@ def _validate_policy_chunk_trace(rows: Sequence[Mapping[str, object]]) -> None:
             raise ValueError("annotation policy chunk trace changes request before offset 15")
 
 
+def _snapshot(value: object) -> Snapshot:
+    if not isinstance(value, Mapping):
+        raise ValueError("continuation snapshot must be a JSON object")
+    try:
+        return Snapshot(
+            schema_version=int(value["schema_version"]),
+            robot_position=tuple(value["robot_position"]),
+            robot_velocity=tuple(value["robot_velocity"]),
+            cloth_position=tuple(tuple(point) for point in value["cloth_position"]),
+            cloth_velocity=tuple(tuple(point) for point in value["cloth_velocity"]),
+            rng_state=dict(value["rng_state"]),
+            garment_name=str(value["garment_name"]),
+            randomization=dict(value.get("randomization") or {}),
+            scene_state=dict(value.get("scene_state") or {}),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("continuation snapshot does not satisfy the Snapshot schema") from error
+
+
 def _continuation_start(
     *, rows: Sequence[Mapping[str, object]], event: _Event, category: str, garment: str,
+    raw: Path, checksum_manifest: Mapping[str, object],
 ) -> dict[str, object] | None:
-    """Bind a reset-safe policy continuation at an authenticated chunk boundary.
+    """Bind a physical H=16 snapshot to its next source policy request.
 
-    Replaying the source prefix reconstructs physical state but not GR00T's
-    action-cache/session history.  Only an action with offset zero is therefore
-    evidence that a new policy request can begin from the selected state.
+    A pre-action annotation alone authenticates the policy-cache boundary, not
+    the simulator's hidden physical state.  Version 3 therefore admits only a
+    complete Snapshot captured at that same boundary and checksum-bound into
+    the sealed source artifact.  Missing legacy snapshots are deliberately an
+    exclusion, never an invitation to open-loop replay a prefix.
     """
 
     for index in range(event.adverse_start, event.confirmation):
@@ -207,6 +269,18 @@ def _continuation_start(
         if row["policy_chunk_offset"] != 0:
             continue
         state = list(row["state"])
+        relative = f"snapshots/continuations/{index:06d}.json"
+        record = checksum_manifest.get(relative)
+        path = raw / relative
+        if (not isinstance(record, Mapping) or path.is_symlink() or not path.is_file()
+                or record.get("sha256") != sha256_file(path) or record.get("size") != path.stat().st_size):
+            continue
+        try:
+            snapshot = _snapshot(json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_strict_pairs, parse_constant=_reject_constant))
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            continue
+        if snapshot.garment_name != garment or list(snapshot.robot_position) != state:
+            continue
         return {
             "annotation_index": index,
             "step": row["step"],
@@ -214,6 +288,9 @@ def _continuation_start(
             "policy_chunk_offset": 0,
             "state": state,
             "state_fingerprint": _fingerprint(category=category, garment=garment, state=state),
+            "snapshot_relative_path": relative,
+            "snapshot_sha256": sha256_file(path),
+            "snapshot_robot_position": list(snapshot.robot_position),
         }
     return None
 
@@ -356,7 +433,7 @@ def audit_successful_recoveries(
     seen_rounds: set[str] = set()
     seen_episodes: set[str] = set()
     for ordinal, (root, receipt_root, seal_path) in enumerate(zip(accepted, receipts, seals, strict=True)):
-        seal = _seal(seal_path)
+        seal = _audit_source_seal(seal_path)
         round_id = str(seal["round_id"])
         if round_id in seen_rounds:
             raise ValueError("round seal ID collision")
@@ -375,7 +452,20 @@ def audit_successful_recoveries(
             )
             identity = episode["identity"]
             category, garment = str(identity["category"]), str(identity["garment_name"])
+            source_seed = identity.get("seed")
+            if type(source_seed) is not int or source_seed < 0:
+                raise ValueError("successful recovery source lacks a non-negative identity seed")
             rows = _annotations(raw / "annotations.jsonl")
+            try:
+                checksum_manifest = json.loads(
+                    (raw / "SHA256SUMS.json").read_text(encoding="utf-8"),
+                    object_pairs_hook=_strict_pairs,
+                    parse_constant=_reject_constant,
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+                raise ValueError("successful recovery source checksum manifest is malformed") from error
+            if not isinstance(checksum_manifest, Mapping):
+                raise ValueError("successful recovery source checksum manifest is malformed")
             package = root / attempt_id
             admitted_record: dict[str, object] = {
                 "source_round_id": round_id, "source_round_ordinal": ordinal,
@@ -397,6 +487,7 @@ def audit_successful_recoveries(
                     "annotations_sha256": sha256_file(raw / "annotations.jsonl"),
                 },
                 "category": category, "garment": garment, "release_stage": identity["release_stage"],
+                "source_seed": source_seed,
                 "annotation_count": len(rows), "official_success_step": next(
                     row["step"] for row in rows if row["success"]
                 ),
@@ -418,11 +509,12 @@ def audit_successful_recoveries(
             }
             continuation = _continuation_start(
                 rows=rows, event=found, category=category, garment=garment,
+                raw=raw, checksum_manifest=checksum_manifest,
             )
             if continuation is None:
                 exclusions.append({
                     "source_round_id": round_id, "source_episode_id": attempt_id,
-                    "reason": "no_fresh_policy_boundary_before_recovery_confirmation",
+                    "reason": "no_authenticated_h16_snapshot_before_recovery_confirmation",
                 })
                 continue
             lineage = _lineage_id({
@@ -466,12 +558,13 @@ def audit_successful_recoveries(
     counts = {category: sum(row["category"] == category for row in selected) for category in _CATEGORIES}
     shortfalls = {category: max(0, per_category_minimum - count) for category, count in counts.items()}
     document: dict[str, object] = {
-        "schema_version": 2, "kind": "lehome_successful_recovery_audit", "horizon": _HORIZON,
+        "schema_version": 3, "kind": "lehome_successful_recovery_audit", "horizon": _HORIZON,
         "thresholds": asdict(thresholds), "per_category_minimum": per_category_minimum,
         "rounds": round_records, "admitted_episodes": admitted,
         "selected_recoveries": selected, "duplicates": duplicates, "exclusions": exclusions,
         "per_category_counts": counts, "shortfalls": shortfalls, "ready": not any(shortfalls.values()),
-        "fingerprint_normalization": "category+garment+fresh_policy_continuation_state fixed_6dp canonical JSON SHA-256",
+        "continuation_contract": "authenticated_full_snapshot_at_fresh_h16_policy_boundary_before_action",
+        "fingerprint_normalization": "category+garment+fresh_policy_continuation_snapshot_robot_position fixed_6dp canonical JSON SHA-256",
         "detector_mode": "reward_drawdown_only_no_reward_freshness_annotations",
     }
     document["semantic_sha256"] = canonical_json_sha256(document)

@@ -84,6 +84,7 @@ for artifact in \
   run_success_replay_campaign.sh \
   run_controlled_recovery_campaign.sh \
   run_controlled_recovery_smoke.sh \
+  run_snapshot_source_bootstrap.sh \
   run_experiment_evaluator.sh \
   worker_supervisor.sh \
   run_randomized_top_short_pilot.sh \
@@ -105,6 +106,7 @@ chmod 0755 \
   /opt/lehome/rollout_appliance/run_success_replay_campaign.sh \
   /opt/lehome/rollout_appliance/run_controlled_recovery_campaign.sh \
   /opt/lehome/rollout_appliance/run_controlled_recovery_smoke.sh \
+  /opt/lehome/rollout_appliance/run_snapshot_source_bootstrap.sh \
   /opt/lehome/rollout_appliance/run_experiment_evaluator.sh \
   /opt/lehome/rollout_appliance/worker_supervisor.sh \
   /opt/lehome/rollout_appliance/run_randomized_top_short_pilot.sh
@@ -112,6 +114,7 @@ install -D -m 0644 /tmp/lehome-guest/systemd/lehome-experiment-evaluator.service
 systemctl daemon-reload
 systemctl disable lehome-experiment-evaluator.service >/dev/null 2>&1 || true
 bash -n /opt/lehome/rollout_appliance/run_success_replay_campaign.sh
+bash -n /opt/lehome/rollout_appliance/run_snapshot_source_bootstrap.sh
 
 # 7. Worker-side Linux wheels. Isaac's 3.11 venv has no pip; keep msgpack and
 # pyzmq on PYTHONPATH so the session gateway can talk to the policy server.

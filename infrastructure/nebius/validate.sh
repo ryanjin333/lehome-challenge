@@ -22,6 +22,7 @@ for script in infrastructure/nebius/tools/bootstrap.sh \
               rollout_appliance/run_12k_campaign.sh \
               rollout_appliance/run_controlled_recovery_campaign.sh \
               rollout_appliance/run_controlled_recovery_smoke.sh \
+              rollout_appliance/run_snapshot_source_bootstrap.sh \
               rollout_appliance/run_randomized_top_short_pilot.sh; do
   bash -n "${script}"
 done

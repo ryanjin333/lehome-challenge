@@ -54,6 +54,7 @@ CONTROLLED_RECOVERY_SMOKE_RUN_ID="${LEHOME_CONTROLLED_RECOVERY_SMOKE_RUN_ID:-}"
 CONTROLLED_RECOVERY_SMOKE_MATRIX_SHA256="${LEHOME_CONTROLLED_RECOVERY_MATRIX_SHA256:-}"
 CONTROLLED_RECOVERY_SMOKE_MATERIALIZATION_SHA256="${LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION_SHA256:-}"
 CONTROLLED_RECOVERY_SMOKE_ROW_INDEX="${LEHOME_CONTROLLED_RECOVERY_SMOKE_ROW_INDEX:-}"
+SNAPSHOT_SOURCE_BOOTSTRAP="${LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP:-0}"
 RESUME_PREEMPTED_ROLLOUT="${LEHOME_RESUME_PREEMPTED_ROLLOUT:-0}"
 EVALUATION_TERMINAL_UPLOAD="${LEHOME_EVALUATION_TERMINAL_UPLOAD:-0}"
 
@@ -75,6 +76,10 @@ esac
 case "${CONTROLLED_RECOVERY_SMOKE}" in
   "0"|"1") ;;
   *) echo "LEHOME_CONTROLLED_RECOVERY_SMOKE must be exactly 0 or 1" >&2; exit 2 ;;
+esac
+case "${SNAPSHOT_SOURCE_BOOTSTRAP}" in
+  "0"|"1") ;;
+  *) echo "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP must be exactly 0 or 1" >&2; exit 2 ;;
 esac
 case "${RESUME_PREEMPTED_ROLLOUT}" in
   "0"|"1") ;;
@@ -131,7 +136,30 @@ if [ "${MATRIX_ACTUAL_SHA256}" != "${MATRIX_EXPECTED_SHA256}" ]; then
   echo "attempt matrix SHA-256 mismatch: expected ${MATRIX_EXPECTED_SHA256}, got ${MATRIX_ACTUAL_SHA256}" >&2
   exit 2
 fi
-if [ "${SKIP_ROUND_SEAL}" = "1" ]; then
+if [ "${SKIP_ROUND_SEAL}" = "1" ] && [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" = "1" ]; then
+  if [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || [ "${WORKER_COUNT}" != "1" ] \
+      || [ "${MAX_ATTEMPTS}" != "1" ] || [ "${TARGET_ACCEPTED}" != "1" ] \
+      || [ "${ENABLE_HF_UPLOAD}" != "1" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ] \
+      || ! [[ "${RUN_ID}" =~ ^[0-9a-f]{32}$ ]] \
+      || ! [[ "${ROUND_ID}" =~ ^snapshot-source-bootstrap-[0-9a-f]{20}-unsealed-source$ ]]; then
+    echo "LEHOME_SKIP_ROUND_SEAL is reserved for the exact snapshot-source bootstrap tuple" >&2
+    exit 2
+  fi
+  python3 - "${MATRIX}" "${MATRIX_EXPECTED_SHA256}" "${RUN_ID}" "${ROUND_ID}" <<'PY'
+import hashlib, json, re, sys
+from pathlib import Path
+path, expected, run_id, round_id = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+try: rows = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, ValueError) as error: raise SystemExit(f"snapshot source descriptor is malformed: {error}")
+if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict): raise SystemExit("snapshot source descriptor must contain exactly one row")
+row = rows[0]
+if row.get("snapshot_source_bootstrap") is not True or "recovery_kind" in row: raise SystemExit("snapshot source descriptor must be ordinary autonomous collection")
+if type(row.get("source_seed")) is not int or row["source_seed"] < 0 or row.get("seed") != row["source_seed"]: raise SystemExit("snapshot source descriptor seed binding is invalid")
+if row.get("snapshot_source_descriptor_sha256") not in (None, expected): raise SystemExit("snapshot source descriptor hash is invalid")
+identity = hashlib.sha256(f"{run_id}:{expected}".encode("ascii")).hexdigest()[:20]
+if round_id != f"snapshot-source-bootstrap-{identity}-unsealed-source": raise SystemExit("snapshot source descriptor does not bind the active run identity")
+PY
+elif [ "${SKIP_ROUND_SEAL}" = "1" ]; then
   # This is intentionally an allow-list, not a general skip switch.  A
   # staging smoke has one attempt and never creates a trainable round seal.
   if [ "${CONTROLLED_RECOVERY_SMOKE}" != "1" ] || [ "${WORKER_COUNT}" != "1" ] \
@@ -155,7 +183,7 @@ if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
 row = rows[0]
 for key in ("controlled_smoke", "controlled_smoke_matrix_sha256", "controlled_smoke_materialization_sha256"):
     if key not in row: raise SystemExit("controlled smoke descriptor lineage is incomplete")
-if row.get("controlled_smoke") is not True or row.get("recovery_kind") != "controlled_success_recovery_v1": raise SystemExit("controlled smoke descriptor kind is invalid")
+if row.get("controlled_smoke") is not True or row.get("recovery_kind") != "controlled_success_recovery_snapshot_v2": raise SystemExit("controlled smoke descriptor kind is invalid")
 for key in ("controlled_smoke_matrix_sha256", "controlled_smoke_materialization_sha256"):
     if not isinstance(row.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", row[key]) is None: raise SystemExit("controlled smoke descriptor hash is invalid")
 identity = hashlib.sha256(f"{run_id}:{full_matrix}:{full_materialization}".encode("ascii")).hexdigest()[:20]

@@ -23,21 +23,42 @@ def _state_fingerprint(*, category: str, garment: str, state: list[float]) -> st
 
 def _assignment(tmp_path, *, state: list[float] | None = None, teacher: bool = False) -> dict[str, object]:
     tmp_path.mkdir(parents=True, exist_ok=True)
-    reset = tmp_path / "reset.json"; annotations = tmp_path / "annotations.jsonl"
-    reset.write_text(json.dumps(_snapshot()), encoding="utf-8")
-    annotations.write_text("".join(json.dumps({"step": step, "action": [float(step)] * 12, "success": step == 3}) + "\n" for step in range(4)), encoding="utf-8")
+    reset = tmp_path / "reset.json"; continuation = tmp_path / "continuation.json"; annotations = tmp_path / "annotations.jsonl"
     source_state = state or [0.0] * 12
+    source_snapshot = _snapshot() | {"robot_position": source_state}
+    reset.write_text(json.dumps(_snapshot()), encoding="utf-8")
+    continuation.write_text(json.dumps(source_snapshot), encoding="utf-8")
+    annotations.write_text("".join(json.dumps({"step": step, "action": [float(step)] * 12, "success": step == 19}) + "\n" for step in range(20)), encoding="utf-8")
     category, garment = "top_long", "Top_Long_Seen_0"
     return {
-        "recovery_kind": "controlled_success_recovery_v1", "source_reset": str(reset), "source_reset_sha256": hashlib.sha256(reset.read_bytes()).hexdigest(),
-        "source_annotations": str(annotations), "source_annotations_sha256": hashlib.sha256(annotations.read_bytes()).hexdigest(), "prefix_stop": 2, "source_first_success_step": 3,
-        "action_prefix_sha256": hashlib.sha256((json.dumps([[0.0] * 12, [1.0] * 12], sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest(),
+        "recovery_kind": "controlled_success_recovery_snapshot_v2", "source_reset": str(reset), "source_reset_sha256": hashlib.sha256(reset.read_bytes()).hexdigest(),
+        "source_continuation_snapshot": str(continuation), "source_continuation_snapshot_sha256": hashlib.sha256(continuation.read_bytes()).hexdigest(),
+        "source_annotations": str(annotations), "source_annotations_sha256": hashlib.sha256(annotations.read_bytes()).hexdigest(), "prefix_stop": 16, "source_first_success_step": 19,
         "perturbation_profile": {"cloth_displacement_m": 0.002, "cloth_velocity_mps": 0.01, "gripper_offset_rad": 0.02}, "perturbation_seed": 7,
         "source_round_id": "round", "source_episode_id": "episode", "source_episode_digest": "a" * 64, "source_immutable_revision": "b" * 40,
-        "category": category, "garment": garment, "source_continuation_state": source_state,
+        "category": category, "garment": garment, "source_seed": 50110, "source_continuation_state": source_state,
         "source_state_fingerprint": _state_fingerprint(category=category, garment=garment, state=source_state), "perturbation_fingerprint": "d" * 64, "source_state_perturbation_fingerprint": "e" * 64,
         **({"controlled_smoke": True, "controlled_smoke_teacher_probe": True} if teacher else {}),
     }
+
+
+def _smoke_descriptor_row(tmp_path: Path) -> dict[str, object]:
+    row = _assignment(tmp_path)
+    run_id, matrix_sha256, materialization_sha256 = "a" * 32, "b" * 64, "c" * 64
+    identity = hashlib.sha256(f"{run_id}:{matrix_sha256}:{materialization_sha256}".encode("ascii")).hexdigest()[:20]
+    mode = "bounded_perturbation_v1"
+    row.update({
+        "attempt_id": "smoke-attempt", "trial_id": "smoke-trial", "strategy": "canonical",
+        "category_acceptance_cap": 1, "controlled_matrix_sha256": matrix_sha256,
+        "controlled_smoke": True, "controlled_smoke_run_id": run_id,
+        "controlled_smoke_row_index": 0, "controlled_smoke_identity": identity,
+        "controlled_smoke_mode_identity": hashlib.sha256(f"{identity}:{mode}".encode("ascii")).hexdigest()[:20],
+        "controlled_smoke_perturbation_mode": mode, "controlled_smoke_zero_perturbation": False,
+        "controlled_smoke_teacher_probe": False,
+        "controlled_smoke_matrix_sha256": matrix_sha256,
+        "controlled_smoke_materialization_sha256": materialization_sha256,
+    })
+    return row
 
 
 def test_controlled_replay_is_exact_and_recorder_state_is_after_bootstrap() -> None:
@@ -80,13 +101,10 @@ def test_controlled_recovery_rejects_invalid_actions_and_perturbation_bounds() -
 def test_verified_controlled_lineage_rejects_tampered_and_unsafe_files(tmp_path) -> None:
     from lehome.flywheel.recovery_collection import load_controlled_recovery
 
-    reset = tmp_path / "reset.json"
-    annotations = tmp_path / "annotations.jsonl"
-    reset.write_text(json.dumps(_snapshot()), encoding="utf-8")
-    annotations.write_text("".join(json.dumps({"step": step, "action": [float(step)] * 12, "success": step == 3}) + "\n" for step in range(4)), encoding="utf-8")
     assignment = _assignment(tmp_path)
     recovery = load_controlled_recovery(assignment)
-    assert recovery.prefix_actions == ((0.0,) * 12, (1.0,) * 12)
+    assert recovery.continuation_snapshot.robot_position == (0.0,) * 12
+    annotations = Path(assignment["source_annotations"])
     annotations.write_text("tampered\n", encoding="utf-8")
     with pytest.raises(ValueError, match="SHA-256"):
         load_controlled_recovery(assignment)
@@ -99,10 +117,6 @@ def test_verified_controlled_lineage_rejects_tampered_and_unsafe_files(tmp_path)
 def test_production_bootstrap_restores_prefixes_then_perturbs_before_policy_continuation(tmp_path) -> None:
     from lehome.flywheel.recovery_collection import bootstrap_controlled_recovery
 
-    reset = tmp_path / "reset.json"
-    annotations = tmp_path / "annotations.jsonl"
-    reset.write_text(json.dumps(_snapshot()), encoding="utf-8")
-    annotations.write_text("".join(json.dumps({"step": step, "action": [float(step)] * 12, "success": step == 3}) + "\n" for step in range(4)), encoding="utf-8")
     assignment = _assignment(tmp_path)
 
     class Env:
@@ -117,7 +131,7 @@ def test_production_bootstrap_restores_prefixes_then_perturbs_before_policy_cont
 
     env = Env()
     provenance = bootstrap_controlled_recovery(env, assignment)
-    assert env.actions == [[0.0] * 12, [1.0] * 12]
+    assert env.actions == []
     assert env.state["cloth_position"] != _snapshot()["cloth_position"]
     assert provenance["source_episode_id"] == "episode"
 
@@ -142,10 +156,10 @@ def test_controlled_recovery_replay_fidelity_accepts_tolerance_and_rejects_drift
         def __init__(self, drift: float) -> None:
             self.state = _snapshot(); self.actions: list[list[float]] = []; self.drift = drift
         def flywheel_restore_state(self, snapshot) -> None: self.state = snapshot.to_dict()
-        def flywheel_capture_state(self): return self.state
-        def step(self, action) -> None:
-            self.actions.append(action)
-            self.state["robot_position"] = [self.drift] * 12
+        def step(self, action) -> None: self.actions.append(action)
+        def flywheel_capture_state(self):
+            observed = dict(self.state); observed["robot_position"] = [self.drift] * 12
+            return observed
 
     accepted = Env(0.0049)
     provenance = bootstrap_controlled_recovery(accepted, _assignment(tmp_path / "accepted"))
@@ -172,7 +186,7 @@ def test_smoke_teacher_probe_requires_success_then_reconstructs_the_verified_bou
 
     env = Env(True)
     provenance = bootstrap_controlled_recovery(env, _assignment(tmp_path / "teacher", teacher=True))
-    assert env.actions == [[0.0] * 12, [1.0] * 12, [2.0] * 12, [3.0] * 12, [0.0] * 12, [1.0] * 12]
+    assert env.actions == [[16.0] * 12, [17.0] * 12, [18.0] * 12, [19.0] * 12]
     assert provenance["teacher_probe"]["verified"] is True
     assert len(provenance["replay_fidelity_checks"]) == 2
     with pytest.raises(ValueError, match="teacher probe"):
@@ -185,7 +199,7 @@ def test_teacher_probe_rejects_a_source_that_does_not_mark_its_declared_first_su
     assignment = _assignment(tmp_path / "source-success", teacher=True)
     annotations = Path(assignment["source_annotations"])
     rows = [json.loads(line) for line in annotations.read_text(encoding="utf-8").splitlines()]
-    rows[3]["success"] = False
+    rows[19]["success"] = False
     annotations.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     assignment["source_annotations_sha256"] = hashlib.sha256(annotations.read_bytes()).hexdigest()
     with pytest.raises(ValueError, match="first recorded success"):
@@ -195,15 +209,21 @@ def test_teacher_probe_rejects_a_source_that_does_not_mark_its_declared_first_su
 def test_single_materialization_loader_returns_hydrated_rows_and_rejects_identity_tampering(tmp_path) -> None:
     from lehome.flywheel.recovery_collection import load_attempt_matrix
 
-    reset, annotations = tmp_path / "reset.json", tmp_path / "annotations.jsonl"
-    reset.write_text("{}", encoding="utf-8"); annotations.write_text("", encoding="utf-8")
+    reset, annotations, continuation = tmp_path / "reset.json", tmp_path / "annotations.jsonl", tmp_path / "continuation.json"
+    reset.write_text("{}", encoding="utf-8"); annotations.write_text("", encoding="utf-8"); continuation.write_text("{}", encoding="utf-8")
     categories = ["pant_long"] * 4 + ["top_long"] + ["top_short"] * 3
     caps = {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}
-    rows = [{"attempt_id": f"controlled-{index}", "trial_id": f"controlled-{index}", "category": category, "category_acceptance_cap": caps[category], "strategy": "canonical", "recovery_kind": "controlled_success_recovery_v1", "controlled_matrix_sha256": "a" * 64, "perturbation_seed": index, "perturbation_fingerprint": f"{index + 100:064x}", "source_state_perturbation_fingerprint": f"{index + 200:064x}", "source_continuation_state": [0.0] * 12, "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round", "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}", "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64, "action_prefix_sha256": "c" * 64, "prefix_stop": 1, "source_first_success_step": 2, "source_reset": str(reset), "source_annotations": str(annotations)} for index, category in enumerate(categories)]
+    rows = [{"attempt_id": f"controlled-{index}", "trial_id": f"controlled-{index}", "category": category, "category_acceptance_cap": caps[category], "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v2", "controlled_matrix_sha256": "a" * 64, "perturbation_seed": index, "perturbation_fingerprint": f"{index + 100:064x}", "source_state_perturbation_fingerprint": f"{index + 200:064x}", "source_seed": 50110, "source_continuation_state": [0.0] * 12, "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round", "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}", "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64, "source_continuation_snapshot_sha256": "c" * 64, "prefix_stop": 16, "source_first_success_step": 19, "source_reset": str(reset), "source_annotations": str(annotations), "source_continuation_snapshot": str(continuation)} for index, category in enumerate(categories)]
     descriptor = tmp_path / "materialization.json"
-    payload = {"schema_version": 1, "kind": "controlled_success_recovery_materialization_v1", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}
+    payload = {"schema_version": 2, "kind": "controlled_success_recovery_materialization_v2", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}
     descriptor.write_text(json.dumps(payload), encoding="utf-8")
     assert load_attempt_matrix(descriptor) == rows
+    linked = tmp_path / "linked"; linked.symlink_to(tmp_path, target_is_directory=True)
+    rows[0]["source_continuation_snapshot"] = str(linked / "continuation.json")
+    descriptor.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="source path is unsafe"):
+        load_attempt_matrix(descriptor)
+    rows[0]["source_continuation_snapshot"] = str(continuation)
     rows[0]["controlled_matrix_sha256"] = "b" * 64
     descriptor.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="matrix hash"):
@@ -213,29 +233,69 @@ def test_single_materialization_loader_returns_hydrated_rows_and_rejects_identit
 def test_materialization_loader_rejects_unreachable_or_noncanonical_controlled_schedule(tmp_path) -> None:
     from lehome.flywheel.recovery_collection import load_attempt_matrix
 
-    reset, annotations = tmp_path / "reset.json", tmp_path / "annotations.jsonl"
-    reset.write_text("{}", encoding="utf-8"); annotations.write_text("", encoding="utf-8")
+    reset, annotations, continuation = tmp_path / "reset.json", tmp_path / "annotations.jsonl", tmp_path / "continuation.json"
+    reset.write_text("{}", encoding="utf-8"); annotations.write_text("", encoding="utf-8"); continuation.write_text("{}", encoding="utf-8")
     rows = [
         {
             "attempt_id": f"attempt-{index}", "trial_id": f"trial-{index}",
             "category": "pant_long", "category_acceptance_cap": 4,
-            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_v1",
+            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v2",
             "controlled_matrix_sha256": "a" * 64, "perturbation_seed": index,
             "perturbation_fingerprint": f"{index + 100:064x}",
             "source_state_perturbation_fingerprint": f"{index + 200:064x}",
-                "source_continuation_state": [0.0] * 12, "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round",
+                "source_seed": 50110, "source_continuation_state": [0.0] * 12, "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round",
             "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}",
             "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64,
-            "action_prefix_sha256": "c" * 64, "prefix_stop": 1,
-            "source_first_success_step": 2, "source_reset": str(reset),
-            "source_annotations": str(annotations),
+            "source_continuation_snapshot_sha256": "c" * 64, "prefix_stop": 16,
+            "source_first_success_step": 19, "source_reset": str(reset),
+            "source_annotations": str(annotations), "source_continuation_snapshot": str(continuation),
         }
         for index in range(8)
     ]
     path = tmp_path / "bad-materialization.json"
-    path.write_text(json.dumps({"schema_version": 1, "kind": "controlled_success_recovery_materialization_v1", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}, "rows": rows}), encoding="utf-8")
+    path.write_text(json.dumps({"schema_version": 2, "kind": "controlled_success_recovery_materialization_v2", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}, "rows": rows}), encoding="utf-8")
     with pytest.raises(ValueError, match="reachable|category"):
         load_attempt_matrix(path)
+
+
+def test_loader_rejects_legacy_controlled_list_but_keeps_ordinary_lists(tmp_path) -> None:
+    from lehome.flywheel.recovery_collection import load_attempt_matrix
+
+    legacy = tmp_path / "legacy-controlled.json"
+    legacy.write_text(json.dumps([{"recovery_kind": "controlled_success_recovery_v1", "prefix_stop": 16}]), encoding="utf-8")
+    with pytest.raises(ValueError, match="legacy or incompatible"):
+        load_attempt_matrix(legacy)
+    ordinary = tmp_path / "ordinary.json"
+    ordinary.write_text(json.dumps([{"garment": "Top_Long_Seen_0", "seed": 7}]), encoding="utf-8")
+    assert load_attempt_matrix(ordinary) == [{"garment": "Top_Long_Seen_0", "seed": 7}]
+
+
+def test_loader_admits_only_the_exact_single_v2_smoke_descriptor_list(tmp_path: Path) -> None:
+    from lehome.flywheel.recovery_collection import load_attempt_matrix
+
+    arbitrary = tmp_path / "arbitrary-v2.json"
+    arbitrary.write_text(json.dumps([_assignment(tmp_path / "arbitrary")]), encoding="utf-8")
+    with pytest.raises(ValueError, match="controlled smoke"):
+        load_attempt_matrix(arbitrary)
+    row = _smoke_descriptor_row(tmp_path / "smoke")
+    multiple = tmp_path / "multiple-v2.json"
+    multiple.write_text(json.dumps([row, row]), encoding="utf-8")
+    with pytest.raises(ValueError, match="exactly one"):
+        load_attempt_matrix(multiple)
+    exact = tmp_path / "exact-smoke.json"
+    exact.write_text(json.dumps([row]), encoding="utf-8")
+    assert load_attempt_matrix(exact) == [row]
+
+
+def test_controlled_recovery_rejects_parent_symlink_inputs_before_mutation(tmp_path) -> None:
+    from lehome.flywheel.recovery_collection import load_controlled_recovery
+
+    real = tmp_path / "real"; real.mkdir()
+    assignment = _assignment(real)
+    parent = tmp_path / "linked"; parent.symlink_to(real, target_is_directory=True)
+    assignment["source_continuation_snapshot"] = str(parent / "continuation.json")
+    with pytest.raises(ValueError, match="absolute regular file"):
+        load_controlled_recovery(assignment)
 
 
 @pytest.mark.parametrize(
@@ -243,8 +303,8 @@ def test_materialization_loader_rejects_unreachable_or_noncanonical_controlled_s
     [
         (
             {
-                "schema_version": 1,
-                "kind": "controlled_success_recovery_materialization_v1",
+                "schema_version": 2,
+                "kind": "controlled_success_recovery_materialization_v2",
                 "matrix_sha256": "a" * 64,
                 "target_accepted": 8,
                 "category_acceptance_caps": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0},

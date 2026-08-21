@@ -120,11 +120,11 @@ if zero == "1":
     if not isinstance(profile, dict) or set(profile) != required or any(type(profile[key]) not in (int, float) for key in required):
         raise SystemExit("controlled smoke zero control source profile is malformed")
     zero_profile = {key: 0.0 for key in sorted(required)}
-    seed, episode_digest, prefix = expected.get("perturbation_seed"), expected.get("source_episode_digest"), expected.get("action_prefix_sha256")
+    seed, episode_digest, snapshot = expected.get("perturbation_seed"), expected.get("source_episode_digest"), expected.get("source_continuation_snapshot_sha256")
     source_state = expected.get("source_state_fingerprint")
-    if type(seed) is not int or not all(isinstance(value, str) and len(value) == 64 for value in (episode_digest, prefix, source_state)):
+    if type(seed) is not int or not all(isinstance(value, str) and len(value) == 64 for value in (episode_digest, snapshot, source_state)):
         raise SystemExit("controlled smoke zero control source provenance is malformed")
-    perturbation = hashlib.sha256((json.dumps({**zero_profile, "seed": seed, "source_episode_digest": episode_digest, "prefix_sha256": prefix}, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()).hexdigest()
+    perturbation = hashlib.sha256((json.dumps({**zero_profile, "seed": seed, "source_episode_digest": episode_digest, "continuation_snapshot_sha256": snapshot}, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()).hexdigest()
     expected.update({"perturbation_profile": zero_profile, "perturbation_fingerprint": perturbation, "source_state_perturbation_fingerprint": hashlib.sha256((json.dumps({"source_state_fingerprint": source_state, "perturbation_fingerprint": perturbation}, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()).hexdigest()})
 expected.update({"controlled_smoke": True, "controlled_smoke_run_id": run_id, "controlled_smoke_row_index": row_index, "controlled_smoke_identity": identity, "controlled_smoke_mode_identity": mode_identity, "controlled_smoke_perturbation_mode": mode, "controlled_smoke_zero_perturbation": zero == "1", "controlled_smoke_teacher_probe": teacher == "1", "controlled_smoke_matrix_sha256": matrix_sha, "controlled_smoke_materialization_sha256": materialization_sha})
 if not isinstance(rows, list) or rows != [expected]: raise SystemExit("controlled smoke resume descriptor does not match the requested row")
@@ -216,11 +216,11 @@ if zero == "1":
     if not isinstance(profile, dict) or set(profile) != required or any(type(profile[key]) not in (int, float) for key in required):
         raise SystemExit("controlled smoke zero control source profile is malformed")
     zero_profile = {key: 0.0 for key in sorted(required)}
-    seed, episode_digest, prefix = row.get("perturbation_seed"), row.get("source_episode_digest"), row.get("action_prefix_sha256")
+    seed, episode_digest, snapshot = row.get("perturbation_seed"), row.get("source_episode_digest"), row.get("source_continuation_snapshot_sha256")
     source_state = row.get("source_state_fingerprint")
-    if type(seed) is not int or not all(isinstance(value, str) and len(value) == 64 for value in (episode_digest, prefix, source_state)):
+    if type(seed) is not int or not all(isinstance(value, str) and len(value) == 64 for value in (episode_digest, snapshot, source_state)):
         raise SystemExit("controlled smoke zero control source provenance is malformed")
-    perturbation = hashlib.sha256((json.dumps({**zero_profile, "seed": seed, "source_episode_digest": episode_digest, "prefix_sha256": prefix}, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()).hexdigest()
+    perturbation = hashlib.sha256((json.dumps({**zero_profile, "seed": seed, "source_episode_digest": episode_digest, "continuation_snapshot_sha256": snapshot}, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()).hexdigest()
     row.update({"perturbation_profile": zero_profile, "perturbation_fingerprint": perturbation, "source_state_perturbation_fingerprint": hashlib.sha256((json.dumps({"source_state_fingerprint": source_state, "perturbation_fingerprint": perturbation}, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()).hexdigest()})
 row.update({"controlled_smoke": True, "controlled_smoke_run_id": run_id, "controlled_smoke_row_index": row_index, "controlled_smoke_identity": identity, "controlled_smoke_mode_identity": mode_identity, "controlled_smoke_perturbation_mode": mode, "controlled_smoke_zero_perturbation": zero == "1", "controlled_smoke_teacher_probe": teacher == "1", "controlled_smoke_matrix_sha256": matrix_digest, "controlled_smoke_materialization_sha256": materialization_digest})
 directory = root / "smoke-descriptors"

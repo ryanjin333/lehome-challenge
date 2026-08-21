@@ -59,6 +59,7 @@ chmod 0755 \
   /opt/lehome/rollout_appliance/run_12k_campaign.sh \
   /opt/lehome/rollout_appliance/run_controlled_recovery_campaign.sh \
   /opt/lehome/rollout_appliance/run_controlled_recovery_smoke.sh \
+  /opt/lehome/rollout_appliance/run_snapshot_source_bootstrap.sh \
   /opt/lehome/rollout_appliance/run_experiment_evaluator.sh \
   /opt/lehome/rollout_appliance/worker_supervisor.sh \
   /opt/lehome/rollout_appliance/prepare-merged-lehome.sh \

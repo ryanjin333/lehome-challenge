@@ -115,6 +115,30 @@ def test_worker_reuses_one_cpu_cloth_simulator_and_immediately_leases_next_attem
     assert sessions[0].closed is True
 
 
+def test_worker_reuses_authenticated_source_seed_for_controlled_recovery_reset(tmp_path) -> None:
+    """A perturbation seed must never reseed the source-prefix replay."""
+
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    session = FakeSession()
+    controller = FakeController([
+        Lease(Attempt("attempt-controlled", {
+            "garment": "Pant_Long_Seen_4", "seed": 71_000,
+                "source_seed": 50_110, "recovery_kind": "controlled_success_recovery_snapshot_v2",
+        }), "lease-controlled"),
+    ])
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+
+    receipts = worker.run()
+
+    assert session.prepared == [("Pant_Long_Seen_4", 50_110, 1)]
+    assert receipts[0]["seed"] == 71_000
+
+
 def test_worker_reports_simulator_factory_failure_before_slow_kit_shutdown(tmp_path, capsys) -> None:
     from lehome.flywheel.persistent_worker import PersistentRolloutWorker
 
@@ -683,31 +707,31 @@ def test_launcher_rejects_an_invalid_preparation_timeout_before_opening_the_ledg
 def test_runtime_worker_loads_generated_controlled_materialization_shape(tmp_path) -> None:
     from scripts.run_groot_persistent_worker import _load_matrix
 
-    reset, annotations = tmp_path / "reset.json", tmp_path / "annotations.jsonl"
-    reset.write_text("{}", encoding="utf-8"); annotations.write_text("", encoding="utf-8")
+    reset, annotations, continuation = tmp_path / "reset.json", tmp_path / "annotations.jsonl", tmp_path / "continuation.json"
+    reset.write_text("{}", encoding="utf-8"); annotations.write_text("", encoding="utf-8"); continuation.write_text("{}", encoding="utf-8")
     caps = {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}
     categories = ["pant_long"] * 4 + ["top_long"] + ["top_short"] * 3
     rows = [
         {
             "attempt_id": f"controlled-{index}", "trial_id": f"controlled-{index}",
             "category": category, "category_acceptance_cap": caps[category],
-            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_v1",
+            "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v2",
             "controlled_matrix_sha256": "a" * 64, "perturbation_seed": 71_000 + index,
             "perturbation_fingerprint": f"{index + 100:064x}",
             "source_state_perturbation_fingerprint": f"{index + 200:064x}",
             "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round",
             "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}",
-            "source_continuation_state": [float(index)] * 12,
+            "source_seed": 50110, "source_continuation_state": [float(index)] * 12,
             "source_immutable_revision": "a" * 40,
             "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64,
-            "action_prefix_sha256": "c" * 64, "prefix_stop": 1,
-            "source_first_success_step": 2, "source_reset": str(reset),
-            "source_annotations": str(annotations),
+            "source_continuation_snapshot_sha256": "c" * 64, "prefix_stop": 16,
+            "source_first_success_step": 19, "source_reset": str(reset),
+            "source_annotations": str(annotations), "source_continuation_snapshot": str(continuation),
         }
         for index, category in enumerate(categories)
     ]
     path = tmp_path / "materialization.json"
-    path.write_text(json.dumps({"schema_version": 1, "kind": "controlled_success_recovery_materialization_v1", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}), encoding="utf-8")
+    path.write_text(json.dumps({"schema_version": 2, "kind": "controlled_success_recovery_materialization_v2", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}), encoding="utf-8")
     assert _load_matrix(path) == rows
 
 

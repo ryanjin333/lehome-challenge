@@ -272,13 +272,14 @@ def _write_persistent_flywheel_manifest(
     }
     if verified_restore is not None:
         payload.update(verified_restore)
-    if assignment.get("recovery_kind") == "controlled_success_recovery_v1":
+    if assignment.get("recovery_kind") == "controlled_success_recovery_snapshot_v2":
         controlled_keys = {
             "recovery_kind", "category", "garment", "source_round_id", "source_episode_id", "source_episode_digest",
             "source_immutable_revision", "source_reset", "source_reset_sha256",
             "source_annotations", "source_annotations_sha256", "source_first_success_step",
-            "prefix_stop", "action_prefix_sha256", "perturbation_profile",
-            "perturbation_seed", "source_continuation_state", "source_state_fingerprint", "perturbation_fingerprint",
+            "source_continuation_snapshot", "source_continuation_snapshot_sha256",
+            "source_continuation_snapshot_relative_path", "prefix_stop", "perturbation_profile",
+            "perturbation_seed", "source_seed", "source_continuation_state", "source_state_fingerprint", "perturbation_fingerprint",
             "source_state_perturbation_fingerprint", "category_acceptance_cap",
             "controlled_smoke", "controlled_smoke_teacher_probe",
         }
@@ -767,6 +768,23 @@ def run_evaluation_loop(
 
             # Update Observation
             observation_dict = env._get_observations()
+            # A successful autonomous source can later be admitted for a
+            # controlled recovery only from an authenticated fresh H=16 policy
+            # boundary.  Capture the complete physical state *before* the next
+            # policy action, never after reconstructing it with a long prefix.
+            if recorder is not None and not success_flag and recorder.step > 0 and recorder.step % 16 == 0:
+                recorder.record_continuation_snapshot(
+                    recorder.step,
+                    capture_snapshot(
+                        env,
+                        randomization={
+                            "strategy": strategy,
+                            "sampled": dict(sampled.values),
+                            "receipt": dict(randomization_receipt),
+                            "continuation_step": recorder.step,
+                        },
+                    ),
+                )
 
             # Recording
             if args.save_datasets:

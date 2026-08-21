@@ -37,6 +37,7 @@ COPY rollout_appliance/smoke_one_episode.sh \
      rollout_appliance/run_success_replay_campaign.sh \
      rollout_appliance/run_controlled_recovery_campaign.sh \
      rollout_appliance/run_controlled_recovery_smoke.sh \
+     rollout_appliance/run_snapshot_source_bootstrap.sh \
      rollout_appliance/worker_supervisor.sh \
      rollout_appliance/run_randomized_top_short_pilot.sh \
      rollout_appliance/campaign_top_short_geometry_pilot.json \
@@ -51,12 +52,14 @@ RUN chmod 0755 /usr/local/bin/lehome-rollout-entrypoint \
                   /opt/lehome/rollout_appliance/run_success_replay_campaign.sh \
                   /opt/lehome/rollout_appliance/run_controlled_recovery_campaign.sh \
                   /opt/lehome/rollout_appliance/run_controlled_recovery_smoke.sh \
+                  /opt/lehome/rollout_appliance/run_snapshot_source_bootstrap.sh \
                   /opt/lehome/rollout_appliance/worker_supervisor.sh \
                   /opt/lehome/rollout_appliance/run_randomized_top_short_pilot.sh \
     && bash -n /opt/lehome/rollout_appliance/run_12k_campaign.sh \
     && bash -n /opt/lehome/rollout_appliance/run_success_replay_campaign.sh \
     && bash -n /opt/lehome/rollout_appliance/run_controlled_recovery_campaign.sh \
     && bash -n /opt/lehome/rollout_appliance/run_controlled_recovery_smoke.sh \
+    && bash -n /opt/lehome/rollout_appliance/run_snapshot_source_bootstrap.sh \
     && bash -n /opt/lehome/rollout_appliance/worker_supervisor.sh \
     && bash -n /opt/lehome/rollout_appliance/run_randomized_top_short_pilot.sh \
     && /opt/lehome-challenge/.venv/bin/python -m py_compile \

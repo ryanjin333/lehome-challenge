@@ -133,13 +133,27 @@ def _source(row: Mapping[str, object], roots: Sequence[Path]) -> dict[str, objec
     if not isinstance(artifacts, Mapping) or artifacts.get("package_sync_digest") != row.get("source_episode_digest"): raise ValueError("audit source package digest does not match its portable episode identity")
     if artifacts.get("raw_checksum_manifest_sha256") != _sha256(raw_manifest): raise ValueError("accepted source checksum manifest SHA-256 mismatch")
     manifest = _json(raw_manifest, label="accepted source checksum manifest")
-    for path, relative in ((reset, "snapshots/reset.json"), (annotations, "annotations.jsonl"), (episode_path, "episode.json")):
-        record = manifest.get(relative)
+    evidence = row.get("continuation_start")
+    if not isinstance(evidence, Mapping):
+        raise ValueError("audit selected recovery lacks continuation snapshot evidence")
+    relative = evidence.get("snapshot_relative_path")
+    snapshot_sha = evidence.get("snapshot_sha256")
+    if (not isinstance(relative, str) or relative != f"snapshots/continuations/{int(evidence.get('annotation_index', -1)):06d}.json"
+            or not isinstance(snapshot_sha, str) or len(snapshot_sha) != 64):
+        raise ValueError("audit continuation snapshot evidence is malformed")
+    continuation_snapshot = _safe_file(raw, relative)
+    for path, relative_path in ((reset, "snapshots/reset.json"), (annotations, "annotations.jsonl"), (episode_path, "episode.json"), (continuation_snapshot, relative)):
+        record = manifest.get(relative_path)
         if not isinstance(record, Mapping) or record.get("sha256") != _sha256(path) or record.get("size") != path.stat().st_size: raise ValueError("accepted source checksum manifest does not authenticate source artifacts")
+    if _sha256(continuation_snapshot) != snapshot_sha:
+        raise ValueError("audit continuation snapshot hash does not match accepted source")
     if artifacts.get("annotations_sha256") != _sha256(annotations) or artifacts.get("episode_manifest_sha256") != _sha256(episode_path): raise ValueError("accepted source artifact SHA-256 mismatch")
     episode_doc = _json(episode_path, label="accepted source episode")
     identity = episode_doc.get("identity")
     if not isinstance(identity, Mapping) or episode_doc.get("episode_id") != episode or episode_doc.get("accepted_success") is not True or episode_doc.get("outcome") != "success" or episode_doc.get("terminal_reason") != "success" or identity.get("category") != category or identity.get("garment_name") != row.get("garment"): raise ValueError("audit source is not a terminal successful accepted episode")
+    source_seed = identity.get("seed")
+    if type(source_seed) is not int or source_seed < 0:
+        raise ValueError("audit source lacks a non-negative authenticated reset seed")
     annotation_rows, annotation_hash = _annotations(annotations)
     _validate_policy_chunk_trace(annotation_rows)
     actions, first_success = [], None
@@ -156,8 +170,14 @@ def _source(row: Mapping[str, object], roots: Sequence[Path]) -> dict[str, objec
     if stop >= first_success:
         raise ValueError("audit continuation must precede the first successful source record")
     portable = {key: row[key] for key in ("source_round_id", "source_round_ordinal", "source_episode_id", "source_episode_digest", "source_immutable_revision", "source_receipt_file_name", "source_receipt_remote_prefix", "source_receipt_publication_ref", "source_receipt_sha256", "receipt_immutable_revision", "garment", "category") if key in row}
-    portable.update({"source_artifacts": dict(artifacts), "source_continuation_state": continuation_state, "source_state_fingerprint": fingerprint, "source_reset_sha256": _sha256(reset), "source_annotations_sha256": annotation_hash, "source_first_success_step": first_success, "prefix_stop": stop, "action_prefix_sha256": hashlib.sha256(_canonical(actions[:stop])).hexdigest()})
-    return {"portable": portable, "source_reset": str(reset), "source_annotations": str(annotations)}
+    try:
+        snapshot = _json(continuation_snapshot, label="accepted continuation snapshot")
+    except ValueError:
+        raise ValueError("accepted continuation snapshot is malformed") from None
+    if snapshot.get("robot_position") != continuation_state or snapshot.get("garment_name") != row.get("garment"):
+        raise ValueError("accepted continuation snapshot does not match audit boundary state")
+    portable.update({"source_artifacts": dict(artifacts), "source_seed": source_seed, "source_continuation_state": continuation_state, "source_state_fingerprint": fingerprint, "source_reset_sha256": _sha256(reset), "source_annotations_sha256": annotation_hash, "source_continuation_snapshot_sha256": _sha256(continuation_snapshot), "source_continuation_snapshot_relative_path": relative, "source_first_success_step": first_success, "prefix_stop": stop})
+    return {"portable": portable, "source_reset": str(reset), "source_annotations": str(annotations), "source_continuation_snapshot": str(continuation_snapshot)}
 
 def _write_absent(path: Path, payload: bytes) -> None:
     if not path.is_absolute() or path.exists() or path.is_symlink(): raise FileExistsError("output must be an absent absolute path")
@@ -180,7 +200,7 @@ def build_controlled_recovery_matrix(*, audit_path: Path | str, accepted_roots: 
     audit, audit_sha = _json(audit_file, label="recovery audit"), _sha256(audit_file)
     if sidecar.is_symlink() or not sidecar.is_file() or sidecar.read_text(encoding="ascii").strip() != audit_sha: raise ValueError("recovery audit SHA-256 sidecar mismatch")
     audit_semantic = {key: value for key, value in audit.items() if key != "semantic_sha256"}
-    if audit.get("schema_version") != 2 or audit.get("kind") != "lehome_successful_recovery_audit" or audit.get("semantic_sha256") != hashlib.sha256(json.dumps(audit_semantic, sort_keys=True, separators=(",", ":")).encode()).hexdigest(): raise ValueError("recovery audit semantic identity mismatch")
+    if audit.get("schema_version") != 3 or audit.get("kind") != "lehome_successful_recovery_audit" or audit.get("continuation_contract") != "authenticated_full_snapshot_at_fresh_h16_policy_boundary_before_action" or audit.get("semantic_sha256") != hashlib.sha256(json.dumps(audit_semantic, sort_keys=True, separators=(",", ":")).encode()).hexdigest(): raise ValueError("recovery audit semantic identity mismatch")
     roots = tuple(Path(root) for root in accepted_roots)
     if not roots or any(not root.is_absolute() or root.is_symlink() or not root.is_dir() for root in roots): raise ValueError("accepted roots must be real absolute directories")
     selected, shortfalls = audit.get("selected_recoveries"), audit.get("shortfalls")
@@ -203,16 +223,16 @@ def build_controlled_recovery_matrix(*, audit_path: Path | str, accepted_roots: 
         schedule.append(next(category for category in _CATEGORIES if counts[category] == least_count))
     for index, category in enumerate(schedule):
         source = by_category[category][index % len(by_category[category])]; portable = source["portable"]; seed = 71_000 + index
-        perturbation = hashlib.sha256(_canonical({**_PROFILE, "seed": seed, "source_episode_digest": portable["source_episode_digest"], "prefix_sha256": portable["action_prefix_sha256"]})).hexdigest()
+        perturbation = hashlib.sha256(_canonical({**_PROFILE, "seed": seed, "source_episode_digest": portable["source_episode_digest"], "continuation_snapshot_sha256": portable["source_continuation_snapshot_sha256"]})).hexdigest()
         source_perturbation = hashlib.sha256(_canonical({"source_state_fingerprint": portable["source_state_fingerprint"], "perturbation_fingerprint": perturbation})).hexdigest()
         attempt_id = f"controlled-{category.replace('_', '-')}-{index:03d}-{perturbation[:16]}"
-        row = {"attempt_id": attempt_id, "trial_id": attempt_id, "garment": portable["garment"], "garment_name": portable["garment"], "category": category, "release_stage": "seen", "seed": seed, "strategy": "canonical", "recovery_kind": "controlled_success_recovery_v1", "category_acceptance_cap": _CAPS[category], **portable, "perturbation_profile": dict(_PROFILE), "perturbation_seed": seed, "perturbation_fingerprint": perturbation, "source_state_perturbation_fingerprint": source_perturbation}
-        semantic_rows.append(row); hydrated_rows.append({**row, "source_reset": source["source_reset"], "source_annotations": source["source_annotations"]})
-    matrix = {"schema_version": 1, "kind": "controlled_success_recovery_matrix_v1", "audit": {"file_sha256": audit_sha, "semantic_sha256": audit["semantic_sha256"]}, "target_accepted": 8, "category_acceptance_caps": dict(_CAPS), "rows": semantic_rows}
+        row = {"attempt_id": attempt_id, "trial_id": attempt_id, "garment": portable["garment"], "garment_name": portable["garment"], "category": category, "release_stage": "seen", "seed": seed, "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v2", "category_acceptance_cap": _CAPS[category], **portable, "perturbation_profile": dict(_PROFILE), "perturbation_seed": seed, "perturbation_fingerprint": perturbation, "source_state_perturbation_fingerprint": source_perturbation}
+        semantic_rows.append(row); hydrated_rows.append({**row, "source_reset": source["source_reset"], "source_annotations": source["source_annotations"], "source_continuation_snapshot": source["source_continuation_snapshot"]})
+    matrix = {"schema_version": 2, "kind": "controlled_success_recovery_matrix_v2", "audit": {"file_sha256": audit_sha, "semantic_sha256": audit["semantic_sha256"]}, "target_accepted": 8, "category_acceptance_caps": dict(_CAPS), "rows": semantic_rows}
     target, materialization = Path(output), Path(str(output) + ".materialization.json")
     receipt, materialization_receipt = Path(str(target) + ".sha256"), Path(str(materialization) + ".sha256")
     _preflight((target, receipt, materialization, materialization_receipt))
-    payload = _canonical(matrix); matrix_sha = hashlib.sha256(payload).hexdigest(); hydration_payload = _canonical({"schema_version": 1, "kind": "controlled_success_recovery_materialization_v1", "matrix_sha256": matrix_sha, "target_accepted": 8, "category_acceptance_caps": dict(_CAPS), "rows": [{**row, "controlled_matrix_sha256": matrix_sha} for row in hydrated_rows]})
+    payload = _canonical(matrix); matrix_sha = hashlib.sha256(payload).hexdigest(); hydration_payload = _canonical({"schema_version": 2, "kind": "controlled_success_recovery_materialization_v2", "matrix_sha256": matrix_sha, "target_accepted": 8, "category_acceptance_caps": dict(_CAPS), "rows": [{**row, "controlled_matrix_sha256": matrix_sha} for row in hydrated_rows]})
     _write_absent(target, payload); _write_absent(receipt, (matrix_sha + "\n").encode()); _write_absent(materialization, hydration_payload); _write_absent(materialization_receipt, (hashlib.sha256(hydration_payload).hexdigest() + "\n").encode())
     return {"matrix_path": str(target), "matrix_sha256": matrix_sha, "materialization_path": str(materialization), "materialization_sha256": hashlib.sha256(hydration_payload).hexdigest(), "attempt_count": max_attempts, "category_acceptance_caps": dict(_CAPS), "target_accepted": 8}
 

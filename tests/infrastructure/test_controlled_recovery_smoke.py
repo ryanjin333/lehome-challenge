@@ -6,12 +6,16 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import textwrap
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SMOKE = REPO_ROOT / "rollout_appliance" / "run_controlled_recovery_smoke.sh"
 PRODUCTION = REPO_ROOT / "rollout_appliance" / "run_controlled_recovery_campaign.sh"
+SNAPSHOT_SOURCE_BOOTSTRAP = REPO_ROOT / "rollout_appliance" / "run_snapshot_source_bootstrap.sh"
 
 
 def _write(path: Path, payload: object) -> str:
@@ -39,14 +43,16 @@ def _artifacts(tmp_path: Path) -> dict[str, str]:
         annotations = raw / "annotations.jsonl"; annotations.parent.mkdir(parents=True, exist_ok=True)
         annotations.write_text("".join(json.dumps({"step": step, "action": [float(step)] * 12, "action_source": "policy", "success": step >= 19, "state": [float(step)] * 12, "policy_request_id": f"request-{step // 16}", "policy_chunk_offset": step % 16}) + "\n" for step in range(20)), encoding="utf-8")
         annotations_hash = hashlib.sha256(annotations.read_bytes()).hexdigest()
-        episode_hash = _write(raw / "episode.json", {"episode_id": episode, "accepted_success": True, "outcome": "success", "terminal_reason": "success", "identity": {"category": category, "garment_name": f"{category}-seen"}})
-        manifest_hash = _write(raw / "SHA256SUMS.json", {item.relative_to(raw).as_posix(): {"sha256": hashlib.sha256(item.read_bytes()).hexdigest(), "size": item.stat().st_size} for item in (reset, annotations, raw / "episode.json")})
+        continuation = raw / "snapshots" / "continuations" / "000016.json"
+        continuation_hash = _write(continuation, {"schema_version": 1, "robot_position": [16.0] * 12, "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]], "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {}, "garment_name": f"{category}-seen", "randomization": {}, "scene_state": {}})
+        episode_hash = _write(raw / "episode.json", {"episode_id": episode, "accepted_success": True, "outcome": "success", "terminal_reason": "success", "identity": {"category": category, "garment_name": f"{category}-seen", "seed": 50110}})
+        manifest_hash = _write(raw / "SHA256SUMS.json", {item.relative_to(raw).as_posix(): {"sha256": hashlib.sha256(item.read_bytes()).hexdigest(), "size": item.stat().st_size} for item in (reset, annotations, continuation, raw / "episode.json")})
         digest = hashlib.sha256(("round" + episode).encode()).hexdigest()
         garment = f"{category}-seen"
         state = [16.0] * 12
         fingerprint = _state_fingerprint(category=category, garment=garment, state=state)
-        selected.append({"source_round_id": "round", "source_episode_id": episode, "source_episode_digest": digest, "source_immutable_revision": "a" * 40, "category": category, "garment": garment, "fingerprint": fingerprint, "continuation_start": {"annotation_index": 16, "step": 16, "policy_request_id": "request-1", "policy_chunk_offset": 0, "state": state, "state_fingerprint": fingerprint}, "recovery_event": {"adverse_start": 15, "recovery_confirmation": 18}, "source_artifacts": {"package_sync_digest": digest, "raw_checksum_manifest_sha256": manifest_hash, "episode_manifest_sha256": episode_hash, "annotations_sha256": annotations_hash, "reset_sha256": reset_hash}})
-    audit = {"schema_version": 2, "kind": "lehome_successful_recovery_audit", "semantic_sha256": "", "selected_recoveries": selected, "shortfalls": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}}
+        selected.append({"source_round_id": "round", "source_episode_id": episode, "source_episode_digest": digest, "source_immutable_revision": "a" * 40, "category": category, "garment": garment, "fingerprint": fingerprint, "continuation_start": {"annotation_index": 16, "step": 16, "policy_request_id": "request-1", "policy_chunk_offset": 0, "state": state, "state_fingerprint": fingerprint, "snapshot_relative_path": "snapshots/continuations/000016.json", "snapshot_sha256": continuation_hash, "snapshot_robot_position": state}, "recovery_event": {"adverse_start": 15, "recovery_confirmation": 18}, "source_artifacts": {"package_sync_digest": digest, "raw_checksum_manifest_sha256": manifest_hash, "episode_manifest_sha256": episode_hash, "annotations_sha256": annotations_hash, "reset_sha256": reset_hash}})
+    audit = {"schema_version": 3, "kind": "lehome_successful_recovery_audit", "continuation_contract": "authenticated_full_snapshot_at_fresh_h16_policy_boundary_before_action", "semantic_sha256": "", "selected_recoveries": selected, "shortfalls": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}}
     audit["semantic_sha256"] = hashlib.sha256(json.dumps({key: value for key, value in audit.items() if key != "semantic_sha256"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     audit_path = tmp_path / "audit.json"; _write(audit_path, audit)
     audit_path.with_suffix(".json.sha256").write_text(hashlib.sha256(audit_path.read_bytes()).hexdigest() + "\n", encoding="ascii")
@@ -83,6 +89,92 @@ def _fake_base(path: Path, *, terminal: str = "accepted", receipt_ok: bool = Tru
         PY
     """), encoding="utf-8")
     path.chmod(0o755)
+
+
+def _fake_snapshot_source_base(path: Path) -> None:
+    """Emit only the terminal evidence the bootstrap wrapper is allowed to inspect."""
+    path.write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        set -euo pipefail
+        python3 - "${LEHOME_CAMPAIGN_ROOT}" "${LEHOME_ATTEMPT_MATRIX}" "${LEHOME_ROUND_ID}" "${LEHOME_SNAPSHOT_SOURCE_TEST_CASE}" <<'PY'
+        import hashlib, json, sqlite3, sys
+        from pathlib import Path
+        root, descriptor, round_id, case = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+        if case == 'absent-ledger': raise SystemExit(1)
+        row = json.loads(descriptor.read_text())[0]
+        attempt = hashlib.sha256(json.dumps({'schedule_index': 0, 'assignment': row}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        root.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(root / 'ledger.sqlite3')
+        con.execute('create table events (event_type text, attempt_id text)')
+        con.execute('insert into events values (?, ?)', ('rejected' if case == 'rejected' else 'accepted', attempt))
+        con.commit(); con.close()
+        if case == 'rejected': raise SystemExit(0)
+        raw = root / 'accepted' / attempt / 'raw' / attempt; raw.mkdir(parents=True)
+        garment, category, seed = 'Top_Long_Seen_0', 'top_long', 50110
+        episode_payload = {'episode_id': attempt, 'mode': 'autonomous', 'accepted_success': True, 'outcome': 'success', 'terminal_reason': 'success', 'bc_target_count': 0, 'identity': {'category': category, 'garment_name': garment, 'seed': (50111 if case == 'seed-mismatch' else seed)}}
+        episode = raw / 'episode.json'; episode.write_text(json.dumps(episode_payload, sort_keys=True))
+        reset = raw / 'snapshots' / 'reset.json'; reset.parent.mkdir(parents=True, exist_ok=True)
+        reset.write_text(json.dumps({'schema_version': 1, 'robot_position': [0.0] * 12, 'robot_velocity': [0.0] * 12, 'cloth_position': [[0.0, 0.0, 0.0]], 'cloth_velocity': [[0.0, 0.0, 0.0]], 'rng_state': {}, 'garment_name': garment, 'randomization': {}, 'scene_state': {}}, sort_keys=True))
+        annotations = raw / 'annotations.jsonl'
+        boundary = 32 if case == 'after-success' else 16
+        annotation_rows = []
+        for step in range(33):
+            state = [float(boundary)] * 12 if step == boundary else [float(step)] * 12
+            if case == 'annotation-state-mismatch' and step == boundary: state = [99.0] * 12
+            annotation_rows.append({'step': step, 'action': [float(step)] * 12, 'action_source': 'policy', 'policy_request_id': (f'request-{step // 16}' if case != 'bad-request-chunk' or step != 17 else 'request-bad'), 'policy_chunk_offset': step % 16, 'state': state, 'reward': 1.0, 'success': (step >= 19 and not (case == 'success-unlatched' and step == 20)), 'category': category, 'garment_name': garment, 'seed': seed})
+        annotations.write_text(''.join(json.dumps(item, sort_keys=True) + '\\n' for item in annotation_rows))
+        entries = {'episode.json': {'sha256': hashlib.sha256(episode.read_bytes()).hexdigest(), 'size': episode.stat().st_size}, 'annotations.jsonl': {'sha256': hashlib.sha256(annotations.read_bytes()).hexdigest(), 'size': annotations.stat().st_size}, 'snapshots/reset.json': {'sha256': hashlib.sha256(reset.read_bytes()).hexdigest(), 'size': reset.stat().st_size}}
+        if case != 'no-h16':
+            filename = '000015.json' if case == 'bad-boundary-filename' else f'{boundary:06d}.json'
+            h16 = raw / 'snapshots' / 'continuations' / filename; h16.parent.mkdir(parents=True)
+            snapshot = {'schema_version': (2 if case == 'bad-snapshot' else 1), 'robot_position': [float(boundary)] * 12, 'robot_velocity': [0.0] * 12, 'cloth_position': [[0.0, 0.0, 0.0]], 'cloth_velocity': [[0.0, 0.0, 0.0]], 'rng_state': {}, 'garment_name': ('Other_Garment' if case == 'garment-mismatch' else garment), 'randomization': {}, 'scene_state': {}}
+            h16.write_text(json.dumps(snapshot, sort_keys=True))
+            entries[h16.relative_to(raw).as_posix()] = {'sha256': ('0' * 64 if case == 'bad-manifest' else hashlib.sha256(h16.read_bytes()).hexdigest()), 'size': h16.stat().st_size}
+        (raw / 'SHA256SUMS.json').write_text(json.dumps(entries, sort_keys=True))
+        if case == 'parent-symlink':
+            real_raw = raw.with_name('real-raw'); raw.rename(real_raw); raw.symlink_to(real_raw, target_is_directory=True)
+        package_entries = []
+        for current, _, names in __import__('os').walk(root / 'accepted' / attempt):
+            for name in names:
+                item = Path(current) / name
+                relative = item.relative_to(root / 'accepted' / attempt).as_posix()
+                if relative != 'SHA256SUMS.json': package_entries.append({'relative_path': relative, 'sha256': hashlib.sha256(item.read_bytes()).hexdigest(), 'byte_size': item.stat().st_size})
+        package_entries.sort(key=lambda item: item['relative_path'])
+        digest = hashlib.sha256(json.dumps(package_entries, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        receipt = {'attempt_id': attempt, 'round_id': round_id, 'repository': 'ryanjin333/lehome-groot-n17-rollouts', 'remote_prefix': f'rollout-rounds/{round_id}/{attempt}', 'readback_verified': case != 'receipt-not-readback', 'episode_sha256': ('a' * 64 if case == 'receipt-mismatch' else digest), 'entry_count': len(package_entries), 'immutable_revision': 'b' * 40}
+        receipts = root / 'hf-sync-receipts'; receipts.mkdir(); (receipts / f'{attempt}.sync.json').write_text(json.dumps(receipt))
+        if case == 'strict-seal': (root / 'source.strict.seal.json').write_text('{}')
+        if case == 'envelope-collision': (root / 'snapshot-source-bootstrap.envelope.json').write_text('{"sentinel":true}')
+        raise SystemExit(1 if case == 'nonzero' else 0)
+        PY
+    """), encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _run_snapshot_source_bootstrap(
+    tmp_path: Path, case: str, *, runtime_source_root: Path | None = None, clear_pythonpath: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    # The contract rejects every symlink ancestor. pytest's ordinary macOS
+    # temporary root is addressed through /var, a symlink to /private.
+    if tmp_path.is_relative_to("/var"):
+        tmp_path = Path("/System/Volumes/Data/private/var") / tmp_path.relative_to("/var")
+    elif tmp_path.is_relative_to("/private"):
+        tmp_path = Path("/System/Volumes/Data/private") / tmp_path.relative_to("/private")
+    if runtime_source_root is not None and runtime_source_root.is_relative_to("/var"):
+        runtime_source_root = Path("/System/Volumes/Data/private/var") / runtime_source_root.relative_to("/var")
+    elif runtime_source_root is not None and runtime_source_root.is_relative_to("/private"):
+        runtime_source_root = Path("/System/Volumes/Data/private") / runtime_source_root.relative_to("/private")
+    descriptor = tmp_path / "source-descriptor.json"
+    _write(descriptor, [{"snapshot_source_bootstrap": True, "category": "top_long", "garment": "Top_Long_Seen_0", "seed": 50110, "source_seed": 50110}])
+    digest = hashlib.sha256(descriptor.read_bytes()).hexdigest()
+    run_id = hashlib.sha256(f"{tmp_path}:{case}".encode()).hexdigest()[:32]
+    identity = hashlib.sha256(f"{run_id}:{digest}".encode("ascii")).hexdigest()[:20]
+    root = tmp_path / "eval" / f"snapshot-source-bootstrap-{identity}"
+    base = tmp_path / "snapshot-source-base.sh"; _fake_snapshot_source_base(base)
+    env = {**os.environ, "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR": str(descriptor), "LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR_SHA256": digest, "LEHOME_SNAPSHOT_SOURCE_RUN_ID": run_id, "LEHOME_SNAPSHOT_SOURCE_BASE_CAMPAIGN": str(base), "LEHOME_SNAPSHOT_SOURCE_TEST_CASE": case, "LEHOME_SNAPSHOT_SOURCE_RUNTIME_ROOT": str(runtime_source_root or (REPO_ROOT / "source" / "lehome"))}
+    if clear_pythonpath:
+        env["PYTHONPATH"] = ""
+    return subprocess.run(["/bin/bash", str(SNAPSHOT_SOURCE_BOOTSTRAP)], env=env, text=True, capture_output=True, check=False), root
 
 
 def _run(tmp_path: Path, *, terminal: str = "accepted", receipt_ok: bool = True, fault: str = "", input_name: str = "inputs", zero_perturbation: bool = False, teacher_probe: bool = False) -> tuple[subprocess.CompletedProcess[str], Path]:
@@ -348,3 +440,100 @@ def test_rollout_image_packages_the_unconditionally_sourced_worker_supervisor() 
     assert "rollout_appliance/worker_supervisor.sh" in dockerfile
     assert "chmod 0755 /opt/lehome/rollout_appliance" in dockerfile
     assert "bash -n /opt/lehome/rollout_appliance/worker_supervisor.sh" in dockerfile
+
+
+def test_snapshot_source_bootstrap_is_a_separate_one_worker_unsealed_tuple() -> None:
+    bootstrap = REPO_ROOT / "rollout_appliance" / "run_snapshot_source_bootstrap.sh"
+    source = bootstrap.read_text(encoding="utf-8")
+    base = (REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh").read_text(encoding="utf-8")
+    installer = (REPO_ROOT / "infrastructure/nebius/packer/scripts/install-rollout.sh").read_text(encoding="utf-8")
+    assert "LEHOME_WORKER_COUNT=1 LEHOME_MAX_ATTEMPTS=1 LEHOME_TARGET_ACCEPTED=1" in source
+    assert "LEHOME_ENABLE_HF_UPLOAD=1 LEHOME_SKIP_ROUND_SEAL=1 LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP=1" in source
+    assert "fresh absent run root; resume is forbidden" in source
+    assert "readback_verified" in source
+    assert "SNAPSHOT_SOURCE_BOOTSTRAP" in base and "snapshot-source-bootstrap" in base
+    assert "run_snapshot_source_bootstrap.sh" in installer
+
+
+def test_snapshot_source_bootstrap_classifies_rejection_and_infrastructure_distinctly(tmp_path: Path) -> None:
+    rejected, rejected_root = _run_snapshot_source_bootstrap(tmp_path / "rejected", "rejected")
+    assert rejected.returncode == 3
+    assert not (rejected_root / "snapshot-source-bootstrap.envelope.json").exists()
+    absent, absent_root = _run_snapshot_source_bootstrap(tmp_path / "absent", "absent-ledger")
+    assert absent.returncode == 4
+    assert not (absent_root / "snapshot-source-bootstrap.envelope.json").exists()
+    nonzero, nonzero_root = _run_snapshot_source_bootstrap(tmp_path / "nonzero", "nonzero")
+    assert nonzero.returncode == 4
+    assert not (nonzero_root / "snapshot-source-bootstrap.envelope.json").exists()
+
+
+@pytest.mark.parametrize("case", ["no-h16", "bad-manifest", "receipt-not-readback", "receipt-mismatch", "strict-seal"])
+def test_snapshot_source_bootstrap_fails_closed_after_accepted_terminal(tmp_path: Path, case: str) -> None:
+    result, root = _run_snapshot_source_bootstrap(tmp_path / case, case)
+    assert result.returncode == 4, result.stderr
+    assert not (root / "snapshot-source-bootstrap.envelope.json").exists()
+
+
+@pytest.mark.parametrize("case", ["bad-boundary-filename", "bad-snapshot", "garment-mismatch", "seed-mismatch", "annotation-state-mismatch", "after-success", "parent-symlink"])
+def test_snapshot_source_bootstrap_requires_a_usable_authenticated_h16_source(tmp_path: Path, case: str) -> None:
+    result, root = _run_snapshot_source_bootstrap(tmp_path / case, case)
+    assert result.returncode == 4, result.stderr
+    assert not (root / "snapshot-source-bootstrap.envelope.json").exists()
+
+
+@pytest.mark.parametrize("case", ["bad-request-chunk", "success-unlatched"])
+def test_snapshot_source_bootstrap_requires_an_audit_v3_trace(tmp_path: Path, case: str) -> None:
+    result, root = _run_snapshot_source_bootstrap(tmp_path / case, case)
+    assert result.returncode == 4, result.stderr
+    assert not (root / "snapshot-source-bootstrap.envelope.json").exists()
+
+
+def test_snapshot_source_bootstrap_writes_one_audit_only_envelope_atomically(tmp_path: Path) -> None:
+    from lehome_train.groot.rollout_source_adapter import _seal
+
+    result, root = _run_snapshot_source_bootstrap(tmp_path / "accepted", "accepted")
+    assert result.returncode == 0, result.stderr
+    envelope = root / "snapshot-source-bootstrap.envelope.json"
+    payload = json.loads(envelope.read_text(encoding="utf-8"))
+    assert payload["kind"] == "snapshot_source_bootstrap_envelope"
+    assert payload["source_only"] is True
+    assert payload["readback_verified"] is True
+    assert len(payload["episode_sha256s"]) == len(payload["immutable_revisions"]) == 1
+    assert not list(root.glob("*.strict.seal.json"))
+    with pytest.raises(ValueError):
+        _seal(envelope)
+    collision, collision_root = _run_snapshot_source_bootstrap(tmp_path / "collision", "envelope-collision")
+    assert collision.returncode == 4
+    assert json.loads((collision_root / "snapshot-source-bootstrap.envelope.json").read_text()) == {"sentinel": True}
+
+
+def test_snapshot_source_bootstrap_imports_from_the_explicit_packaged_runtime_root(tmp_path: Path) -> None:
+    staged = tmp_path / "opt" / "lehome" / "source" / "lehome"
+    shutil.copytree(REPO_ROOT / "source" / "lehome", staged)
+    result, root = _run_snapshot_source_bootstrap(
+        tmp_path / "staged", "accepted", runtime_source_root=staged, clear_pythonpath=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (root / "snapshot-source-bootstrap.envelope.json").is_file()
+
+
+def test_snapshot_source_bootstrap_missing_packaged_runtime_root_is_infrastructure_failure(tmp_path: Path) -> None:
+    result, root = _run_snapshot_source_bootstrap(
+        tmp_path / "missing", "accepted", runtime_source_root=tmp_path / "missing-package", clear_pythonpath=True,
+    )
+    assert result.returncode == 4, result.stderr
+    assert "post-acceptance evidence verification failed" in result.stderr
+    assert not (root / "snapshot-source-bootstrap.envelope.json").exists()
+
+
+def test_snapshot_source_bootstrap_rejects_a_packaged_runtime_root_with_a_symlink_ancestor(tmp_path: Path) -> None:
+    staged_parent = tmp_path / "staged-parent"
+    staged = staged_parent / "source" / "lehome"
+    shutil.copytree(REPO_ROOT / "source" / "lehome", staged)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(staged_parent, target_is_directory=True)
+    result, root = _run_snapshot_source_bootstrap(
+        tmp_path / "symlinked", "accepted", runtime_source_root=linked_parent / "source" / "lehome", clear_pythonpath=True,
+    )
+    assert result.returncode == 4, result.stderr
+    assert not (root / "snapshot-source-bootstrap.envelope.json").exists()

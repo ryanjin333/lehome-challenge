@@ -61,6 +61,9 @@ def test_mixed_recorder_selects_only_complete_post_takeover_expert_windows(tmp_p
     assert final.selection_report.selected == 1
     assert final.annotations[0]["action_source"] == "policy"
     assert final.annotations[2]["action_source"] == "expert"
+    assert final.annotations[0]["category"] == "pant_long"
+    assert final.annotations[0]["garment_name"] == "Pant_Long_Seen_0"
+    assert final.annotations[0]["seed"] == 1
 
 
 def test_mixed_recorder_enforces_source_specific_provenance_and_hold_exclusion(tmp_path) -> None:
@@ -188,6 +191,30 @@ def test_recorder_checksum_covers_reset_and_terminal_snapshots(tmp_path) -> None
     manifest = json.loads((final.path / "SHA256SUMS.json").read_text(encoding="utf-8"))
     assert "snapshots/reset.json" in manifest and "snapshots/terminal.json" in manifest
     assert final.episode["reset_hash"] == canonical_reset_hash(snapshot)
+
+
+def test_autonomous_recorder_authenticates_h16_continuation_snapshots(tmp_path) -> None:
+    """A future recovery source must retain physical state at policy boundaries.
+
+    The boundary is recorded after action 15 and before action 16, so the
+    snapshot name is the next annotation index rather than the prior action.
+    """
+
+    recorder = AutonomousRecorder.for_test(tmp_path, policy_revision="a" * 40)
+    boundary = snapshot()
+    recorder.record_snapshot("reset", boundary)
+    for step in range(16):
+        recorder.record_step(observation(), np.ones(12), reward=0.0, success=False, request_id="r0", chunk_offset=step)
+    recorder.record_continuation_snapshot(16, boundary)
+    recorder.record_snapshot("terminal", boundary)
+    final = recorder.finish(reason="horizon", accepted_success=False)
+
+    continuation = final.path / "snapshots" / "continuations" / "000016.json"
+    manifest = json.loads((final.path / "SHA256SUMS.json").read_text(encoding="utf-8"))
+    assert continuation.is_file()
+    assert "snapshots/continuations/000016.json" in manifest
+    with pytest.raises(ValueError, match="H16"):
+        recorder.record_continuation_snapshot(17, boundary)
 
 
 def test_autonomous_recorder_persists_simulator_contact_evidence(tmp_path, monkeypatch) -> None:
