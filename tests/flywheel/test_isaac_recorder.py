@@ -178,6 +178,7 @@ def test_autonomous_recorder_marks_policy_source_and_terminal_reason(tmp_path) -
     assert final.annotations[0]["policy_request_id"] == "r1"
 
     payload = json.loads((final.path / "episode.json").read_text(encoding="utf-8"))
+    assert payload["mode"] == "autonomous"
     assert payload["bc_target_count"] == 0
 
 

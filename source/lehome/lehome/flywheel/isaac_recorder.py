@@ -365,6 +365,7 @@ class MixedSourceRecorder:
             raise ValueError("terminal reason is required")
         self._finished = True
         episode = self._base_episode() | {
+            "mode": self.mode,
             "terminal_reason": reason,
             "accepted_success": bool(accepted_success),
             "outcome": "success" if accepted_success else "timeout",
