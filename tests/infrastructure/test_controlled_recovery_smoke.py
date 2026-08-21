@@ -104,7 +104,7 @@ def _fake_snapshot_source_base(path: Path) -> None:
         row = json.loads(descriptor.read_text())[0]
         attempt = hashlib.sha256(json.dumps({'schedule_index': 0, 'assignment': row}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         root.mkdir(parents=True, exist_ok=True)
-        (root / 'base-launch.json').write_text(json.dumps({'initial_garment': os.environ.get('LEHOME_INITIAL_GARMENT')}))
+        (root / 'base-launch.json').write_text(json.dumps({'initial_garment': os.environ.get('LEHOME_INITIAL_GARMENT'), 'simulator_device': os.environ.get('LEHOME_SIMULATOR_DEVICE')}))
         con = sqlite3.connect(root / 'ledger.sqlite3')
         con.execute('create table events (event_type text, attempt_id text)')
         con.execute('insert into events values (?, ?)', ('rejected' if case == 'rejected' else 'accepted', attempt))
@@ -507,7 +507,8 @@ def test_snapshot_source_bootstrap_is_a_separate_one_worker_unsealed_tuple() -> 
     installer = (REPO_ROOT / "infrastructure/nebius/packer/scripts/install-rollout.sh").read_text(encoding="utf-8")
     assert "LEHOME_WORKER_COUNT=1 LEHOME_MAX_ATTEMPTS=1 LEHOME_TARGET_ACCEPTED=1" in source
     assert "LEHOME_ENABLE_HF_UPLOAD=1 LEHOME_SKIP_ROUND_SEAL=1 LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP=1" in source
-    assert "LEHOME_SIMULATOR_DEVICE=cpu" in source
+    assert "LEHOME_SIMULATOR_DEVICE=cuda:0" in source
+    assert "LEHOME_SIMULATOR_DEVICE=cpu" not in source
     assert "fresh absent run root; resume is forbidden" in source
     assert "readback_verified" in source
     assert "SNAPSHOT_SOURCE_BOOTSTRAP" in base and "snapshot-source-bootstrap" in base
@@ -538,6 +539,17 @@ def test_snapshot_source_bootstrap_passes_a_nondefault_descriptor_garment_before
     assert result.returncode == 3
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Pant_Long_Seen_4",
+        "simulator_device": "cuda:0",
+    }
+
+
+def test_snapshot_source_bootstrap_forces_canonical_cuda_simulator_device(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LEHOME_SIMULATOR_DEVICE", "cpu")
+    result, root = _run_snapshot_source_bootstrap(tmp_path / "cuda-source", "rejected")
+    assert result.returncode == 3
+    assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
+        "initial_garment": "Top_Long_Seen_0",
+        "simulator_device": "cuda:0",
     }
 
 
@@ -581,6 +593,7 @@ def test_snapshot_source_bootstrap_writes_one_audit_only_envelope_atomically(tmp
     assert len(payload["episode_sha256s"]) == len(payload["immutable_revisions"]) == 1
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Top_Long_Seen_0",
+        "simulator_device": "cuda:0",
     }
     assert not list(root.glob("*.strict.seal.json"))
     with pytest.raises(ValueError):
