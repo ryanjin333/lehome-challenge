@@ -8,7 +8,7 @@ if [[ -f "${RUNTIME_ENV}" ]]; then
 fi
 ROLE="${LEHOME_ROLE:?LEHOME_ROLE is required}"
 RECEIPTS_DIR="${LEHOME_RECEIPTS_DIR:-/mnt/lehome/receipts}"
-ROLLOUT_CONTEXT="${LEHOME_ROLLOUT_PREEMPTION_CONTEXT:-/run/lehome/rollout-preemption.json}"
+ROLLOUT_CONTEXT="${LEHOME_ROLLOUT_PREEMPTION_CONTEXT:-/run/lehome-rollout/rollout-preemption.json}"
 WORKSPACE_ROOT="${LEHOME_WORKSPACE_ROOT:-/mnt/lehome}"
 # The training service owns the actual child PID.  Signal it before writing
 # the generic lifecycle receipt, so its SIGTERM trap can retain a complete

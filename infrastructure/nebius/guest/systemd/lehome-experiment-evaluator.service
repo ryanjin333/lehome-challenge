@@ -23,7 +23,7 @@ KillMode=mixed
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/mnt/lehome /eval/logs /kitcache /run/lehome
+ReadWritePaths=/mnt/lehome /eval/logs /kitcache /run/lehome /run/lehome-rollout
 RuntimeDirectory=lehome
 
 [Install]

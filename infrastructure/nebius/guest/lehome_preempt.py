@@ -441,7 +441,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--rollout-context", type=Path,
-        default=Path("/run/lehome/rollout-preemption.json"),
+        default=Path("/run/lehome-rollout/rollout-preemption.json"),
     )
     parser.add_argument("--workspace-root", type=Path, default=Path("/mnt/lehome"))
     args = parser.parse_args(list(argv) if argv is not None else None)

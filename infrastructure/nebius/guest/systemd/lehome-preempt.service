@@ -7,6 +7,9 @@ Before=lehome-training.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+Group=ubuntu
+RuntimeDirectory=lehome-rollout
+RuntimeDirectoryMode=0770
 ExecStart=/bin/true
 ExecStop=/opt/lehome/guest/bin/lehome-preempt.sh
 TimeoutStopSec=55

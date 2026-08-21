@@ -47,7 +47,7 @@ ROUND_ID="${LEHOME_ROUND_ID:-round-3}"
 HF_REVISION="${LEHOME_HF_REVISION:-main}"
 ENABLE_HF_UPLOAD="${LEHOME_ENABLE_HF_UPLOAD:-}"
 RUN_ID="${LEHOME_RUN_ID:-lehome-rft-70-30-v1}"
-PREEMPTION_CONTEXT="${LEHOME_ROLLOUT_PREEMPTION_CONTEXT:-/run/lehome/rollout-preemption.json}"
+PREEMPTION_CONTEXT="${LEHOME_ROLLOUT_PREEMPTION_CONTEXT:-/run/lehome-rollout/rollout-preemption.json}"
 SKIP_ROUND_SEAL="${LEHOME_SKIP_ROUND_SEAL:-0}"
 CONTROLLED_RECOVERY_SMOKE="${LEHOME_CONTROLLED_RECOVERY_SMOKE:-0}"
 CONTROLLED_RECOVERY_SMOKE_RUN_ID="${LEHOME_CONTROLLED_RECOVERY_SMOKE_RUN_ID:-}"
@@ -227,7 +227,11 @@ fi
 
 write_preemption_context() {
   local active="$1"
-  install -d -m 0755 "$(dirname "${PREEMPTION_CONTEXT}")"
+  local preemption_context_dir
+  preemption_context_dir="$(dirname "${PREEMPTION_CONTEXT}")"
+  if [ ! -d "${preemption_context_dir}" ]; then
+    install -d -m 0770 "${preemption_context_dir}"
+  fi
   python3 - \
     "${PREEMPTION_CONTEXT}" "${RUN_ID}" "${CAMPAIGN_ROOT}" "${LEDGER}" \
     "${MATRIX}" "${MATRIX_ACTUAL_SHA256}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" "${active}" \
