@@ -251,6 +251,21 @@ def test_rollout_host_install_and_stage_carry_controlled_recovery_runtime():
     assert "build_controlled_recovery_matrix.py" in stage
 
 
+def test_rollout_merge_overlays_the_physx_garment_runtime_used_by_workers():
+    merge = (
+        REPO_ROOT / "rollout_appliance" / "prepare-merged-lehome.sh"
+    ).read_text(encoding="utf-8")
+
+    official_copy = "cp -a /opt/lehome-challenge/source/lehome/lehome /out/lehome"
+    patched_garment = (
+        "cp -a /opt/lehome/source/lehome/lehome/assets/object/Garment.py "
+        "/opt/lehome/merged/lehome/assets/object/Garment.py"
+    )
+    assert official_copy in merge
+    assert patched_garment in merge
+    assert merge.index(official_copy) < merge.index(patched_garment)
+
+
 def test_rollout_image_and_stage_carry_the_success_replay_campaign_tools():
     install = (SCRIPTS_DIR / "install-rollout.sh").read_text(encoding="utf-8")
     stage = (REPO_ROOT / "infrastructure" / "nebius" / "tools" / "stage-rollout.sh").read_text(encoding="utf-8")
