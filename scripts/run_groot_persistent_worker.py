@@ -1,4 +1,4 @@
-"""Run one long-lived CUDA-cloth Isaac worker against the append-only ledger."""
+"""Run one long-lived PhysX-cloth Isaac worker against the append-only ledger."""
 
 from __future__ import annotations
 
@@ -47,18 +47,24 @@ class LedgerWorkerController:
         return self._ledger.heartbeat(worker_id, attempt_id, lease_id, lease_duration_ns=self._lease_duration_ns)
 
 
-def prepare_cuda_cloth_launch(args: argparse.Namespace, *, environ: MutableMapping[str, str] | None = None) -> str:
-    """Bind simulation, cloth, renderer, and cameras to one physical CUDA GPU."""
+def prepare_persistent_cloth_launch(
+    args: argparse.Namespace, *, environ: MutableMapping[str, str] | None = None,
+) -> str:
+    """Bind renderer/policy to CUDA and select the explicit cloth simulator."""
 
     renderer = _CUDA_DEVICE.fullmatch(str(getattr(args, "renderer_device", "")))
     policy = _CUDA_DEVICE.fullmatch(str(getattr(args, "policy_device", "")))
     if renderer is None or policy is None:
         raise ValueError("renderer and policy devices must be cuda:<physical GPU>")
     if renderer.group(1) != policy.group(1):
-        raise ValueError("persistent worker requires policy and cloth on the same physical CUDA device")
+        raise ValueError("persistent worker requires policy and renderer on the same physical CUDA device")
+    requested_simulator = getattr(args, "simulator_device", None)
+    simulator_device = args.renderer_device if requested_simulator is None else str(requested_simulator).lower()
+    if simulator_device != "cpu" and simulator_device != args.renderer_device:
+        raise ValueError("simulator device must be cpu or the assigned renderer CUDA device")
     target_environ = os.environ if environ is None else environ
     target_environ["LEHOME_FLYWHEEL_WORKER_GPU"] = renderer.group(1)
-    args.device = args.renderer_device
+    args.device = simulator_device
     args.camera_device = args.renderer_device
     return renderer.group(1)
 
@@ -84,6 +90,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-accepted", type=int, default=150)
     parser.add_argument("--renderer-device", required=True, help="physical CUDA device used for renderer/cameras")
     parser.add_argument("--policy-device", required=True, help="physical CUDA device used by the policy gateway")
+    parser.add_argument(
+        "--simulator-device", default=None,
+        help="cloth simulator device; CPU is admitted only for snapshot-source bootstrap diagnostics",
+    )
     parser.add_argument("--policy-gateway-endpoint", required=True)
     parser.add_argument("--policy-sha256", required=True)
     parser.add_argument("--policy-repo", default=_DEFAULT_POLICY_REPO)
@@ -117,7 +127,7 @@ def _progress(message: str) -> None:
         pass
 
 
-def _build_cuda_cloth_session(args: argparse.Namespace):
+def _build_cloth_session(args: argparse.Namespace):
     """Import Isaac only after AppLauncher is live, then build one reusable env."""
 
     _progress(f"importing gym and task for {args.task}")
@@ -145,8 +155,8 @@ def _build_cuda_cloth_session(args: argparse.Namespace):
     _progress("initialize_obs")
     env.initialize_obs()
     _progress("obs initialized")
-    if args.device != args.renderer_device or _CUDA_DEVICE.fullmatch(args.device) is None:
-        raise ValueError("persistent worker must bind CUDA cloth physics to the renderer device")
+    if args.device != "cpu" and (args.device != args.renderer_device or _CUDA_DEVICE.fullmatch(args.device) is None):
+        raise ValueError("persistent worker simulator device is not bound to the requested backend")
     args.num_episodes = 1
     args.flywheel_manifest = None
     if args.policy_ready_file.is_symlink() or not args.policy_ready_file.is_file():
@@ -178,14 +188,29 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
         or args.preparation_timeout_seconds <= 0
     ):
         raise ValueError("preparation timeout seconds must be positive")
-    if args.device != args.renderer_device or _CUDA_DEVICE.fullmatch(args.device) is None:
-        raise ValueError("persistent worker requires CUDA cloth physics on the renderer device")
+    if args.device != "cpu" and (args.device != args.renderer_device or _CUDA_DEVICE.fullmatch(args.device) is None):
+        raise ValueError("persistent worker simulator device is not bound to the requested backend")
+    matrix = _load_matrix(args.attempt_matrix)
+    source_row = matrix[0] if len(matrix) == 1 else None
+    if args.device == "cpu" and (
+        source_row is None
+        or source_row.get("snapshot_source_bootstrap") is not True
+        or "recovery_kind" in source_row
+        or type(source_row.get("seed")) is not int
+        or source_row["seed"] < 0
+        or source_row.get("source_seed") != source_row["seed"]
+        or not isinstance(source_row.get("garment"), str)
+        or not source_row["garment"]
+        or not isinstance(source_row.get("category"), str)
+        or not source_row["category"]
+    ):
+        raise ValueError("CPU cloth is reserved for one-row snapshot-source bootstrap diagnostics")
     ledger = ledger_factory(
-        args.database, attempt_matrix=_load_matrix(args.attempt_matrix), max_attempts=args.max_attempts,
+        args.database, attempt_matrix=matrix, max_attempts=args.max_attempts,
         target_accepted=args.target_accepted,
     )
     try:
-        factory = session_factory or (lambda: _build_cuda_cloth_session(args))
+        factory = session_factory or (lambda: _build_cloth_session(args))
         policy_holder: dict[str, object] = {}
 
         def simulator_factory():
@@ -212,7 +237,7 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
             worker_id=args.worker_id, session_id=args.session_id,
             controller=LedgerWorkerController(ledger, lease_duration_ns=round(args.lease_seconds * 1_000_000_000)),
             simulator_factory=simulator_factory, policy=_PolicyProxy(), output_root=args.output_root,
-            renderer_device=args.renderer_device, policy_device=args.policy_device,
+            renderer_device=args.renderer_device, policy_device=args.policy_device, simulator_device=args.device,
             heartbeat_interval_seconds=max(0.1, args.lease_seconds / 3.0),
             preparation_timeout_seconds=args.preparation_timeout_seconds,
         )
@@ -229,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
 
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args(argv)
-    prepare_cuda_cloth_launch(args)
+    prepare_persistent_cloth_launch(args)
     simulation_app = launch_app_from_args(args)
     _progress("kit launched")
     try:

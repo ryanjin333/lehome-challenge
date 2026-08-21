@@ -208,7 +208,7 @@ def test_worker_refuses_a_restarted_worker_output_collision(tmp_path) -> None:
         worker.run()
 
 
-def test_worker_refuses_cpu_cloth_before_requesting_a_lease(tmp_path) -> None:
+def test_worker_refuses_a_cloth_device_that_does_not_match_its_assignment(tmp_path) -> None:
     from lehome.flywheel.persistent_worker import PersistentRolloutWorker
 
     controller = FakeController([])
@@ -221,7 +221,7 @@ def test_worker_refuses_cpu_cloth_before_requesting_a_lease(tmp_path) -> None:
     )
 
     import pytest
-    with pytest.raises(ValueError, match="CUDA cloth"):
+    with pytest.raises(ValueError, match="assigned simulator device"):
         worker.run()
 
 
@@ -357,33 +357,137 @@ def test_worker_receipt_uses_the_policy_clients_actual_episode_generation(tmp_pa
 def test_launcher_binds_cloth_physics_to_the_renderer_cuda_device(monkeypatch) -> None:
     repository = Path(__file__).resolve().parents[2]
     monkeypatch.syspath_prepend(str(repository))
-    from scripts.run_groot_persistent_worker import prepare_cuda_cloth_launch
+    from scripts.run_groot_persistent_worker import prepare_persistent_cloth_launch
 
-    args = types.SimpleNamespace(device="cuda:9", renderer_device="cuda:2", policy_device="cuda:2")
+    args = types.SimpleNamespace(
+        device="cuda:9", simulator_device="cuda:2",
+        renderer_device="cuda:2", policy_device="cuda:2",
+    )
     environment: dict[str, str] = {}
 
-    assert prepare_cuda_cloth_launch(args, environ=environment) == "2"
+    assert prepare_persistent_cloth_launch(args, environ=environment) == "2"
     assert args.device == "cuda:2"
     assert args.camera_device == "cuda:2"
     assert environment == {"LEHOME_FLYWHEEL_WORKER_GPU": "2"}
 
 
+def test_parsed_default_simulator_inherits_a_nonzero_renderer_gpu(monkeypatch, tmp_path) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(repository))
+    from scripts.run_groot_persistent_worker import build_parser, prepare_persistent_cloth_launch
+
+    utils_package = types.ModuleType("scripts.utils")
+    utils_package.__path__ = []
+    parser_module = types.ModuleType("scripts.utils.parser")
+    parser_module.setup_eval_parser = lambda: __import__("argparse").ArgumentParser()
+    monkeypatch.setitem(sys.modules, "scripts.utils", utils_package)
+    monkeypatch.setitem(sys.modules, "scripts.utils.parser", parser_module)
+
+    args = build_parser().parse_args([
+        "--database", str(tmp_path / "ledger.sqlite3"),
+        "--attempt-matrix", str(tmp_path / "matrix.json"),
+        "--worker-id", "worker-2",
+        "--session-id", "session-2",
+        "--output-root", str(tmp_path / "output"),
+        "--renderer-device", "cuda:2",
+        "--policy-device", "cuda:2",
+        "--policy-gateway-endpoint", "tcp://127.0.0.1:15555",
+        "--policy-sha256", "a" * 64,
+        "--policy-ready-file", str(tmp_path / "ready.json"),
+        "--initial-garment", "Top_Short_Seen_2",
+    ])
+
+    environment: dict[str, str] = {}
+    assert prepare_persistent_cloth_launch(args, environ=environment) == "2"
+    assert args.device == "cuda:2"
+    assert args.camera_device == "cuda:2"
+    assert environment == {"LEHOME_FLYWHEEL_WORKER_GPU": "2"}
+
+
+def test_launcher_preserves_cpu_cloth_for_the_source_bootstrap_diagnostic(monkeypatch) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(repository))
+    from scripts.run_groot_persistent_worker import prepare_persistent_cloth_launch
+
+    args = types.SimpleNamespace(
+        device="cuda:9", simulator_device="cpu",
+        renderer_device="cuda:2", policy_device="cuda:2",
+    )
+    environment: dict[str, str] = {}
+
+    assert prepare_persistent_cloth_launch(args, environ=environment) == "2"
+    assert args.device == "cpu"
+    assert args.camera_device == "cuda:2"
+    assert environment == {"LEHOME_FLYWHEEL_WORKER_GPU": "2"}
+
+
 def test_launcher_rejects_a_non_cuda_renderer_or_policy() -> None:
-    from scripts.run_groot_persistent_worker import prepare_cuda_cloth_launch
+    from scripts.run_groot_persistent_worker import prepare_persistent_cloth_launch
 
     with pytest.raises(ValueError, match="renderer and policy devices"):
-        prepare_cuda_cloth_launch(types.SimpleNamespace(
-            device="cpu", renderer_device="cpu", policy_device="cuda:0",
+        prepare_persistent_cloth_launch(types.SimpleNamespace(
+            device="cpu", simulator_device="cpu", renderer_device="cpu", policy_device="cuda:0",
         ), environ={})
 
 
 def test_launcher_rejects_a_policy_on_a_different_physical_gpu() -> None:
-    from scripts.run_groot_persistent_worker import prepare_cuda_cloth_launch
+    from scripts.run_groot_persistent_worker import prepare_persistent_cloth_launch
 
     with pytest.raises(ValueError, match="same physical CUDA device"):
-        prepare_cuda_cloth_launch(types.SimpleNamespace(
-            device="cuda:0", renderer_device="cuda:0", policy_device="cuda:1",
+        prepare_persistent_cloth_launch(types.SimpleNamespace(
+            device="cuda:0", simulator_device="cuda:0", renderer_device="cuda:0", policy_device="cuda:1",
         ), environ={})
+
+
+def test_runtime_rejects_cpu_cloth_for_a_non_source_matrix_before_opening_the_ledger(tmp_path) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps([{
+        "attempt_id": "ordinary", "garment": "Top_Short_Seen_2", "seed": 50066,
+    }]), encoding="utf-8")
+    opened_ledger: list[bool] = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened_ledger.append(True)
+        raise AssertionError("non-source CPU matrix must fail before the ledger opens")
+
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=1, target_accepted=1,
+    )
+
+    with pytest.raises(ValueError, match="CPU cloth is reserved for one-row snapshot-source bootstrap"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened_ledger == []
+
+
+def test_runtime_rejects_a_cpu_source_descriptor_with_mismatched_seed_before_ledger(tmp_path) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps([{
+        "attempt_id": "source", "category": "top_short", "garment": "Top_Short_Seen_2",
+        "seed": 50066, "source_seed": 50067, "snapshot_source_bootstrap": True,
+    }]), encoding="utf-8")
+    opened_ledger: list[bool] = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened_ledger.append(True)
+        raise AssertionError("invalid CPU source descriptor must fail before the ledger opens")
+
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=1, target_accepted=1,
+    )
+
+    with pytest.raises(ValueError, match="CPU cloth is reserved for one-row snapshot-source bootstrap"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened_ledger == []
 
 
 def test_worker_heartbeats_while_an_episode_blocks_and_stops_the_timer(tmp_path) -> None:

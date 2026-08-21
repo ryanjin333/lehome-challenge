@@ -398,6 +398,40 @@ def test_base_skip_seal_gate_rejects_any_non_smoke_tuple_before_docker(tmp_path:
     assert "reserved for the exact controlled-recovery smoke tuple" in result.stderr
 
 
+def test_base_cpu_cloth_requires_the_exact_unsealed_snapshot_source_tuple(tmp_path: Path) -> None:
+    matrix = tmp_path / "source.json"
+    matrix.write_text(
+        json.dumps([{
+            "snapshot_source_bootstrap": True,
+            "category": "top_short",
+            "garment": "Top_Short_Seen_2",
+            "seed": 50066,
+            "source_seed": 50066,
+        }]),
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(matrix.read_bytes()).hexdigest()
+    env = {
+        **os.environ,
+        "LEHOME_WORKSPACE": str(tmp_path),
+        "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "run"),
+        "LEHOME_ATTEMPT_MATRIX": str(matrix),
+        "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+        "LEHOME_WORKER_COUNT": "1",
+        "LEHOME_MAX_ATTEMPTS": "1",
+        "LEHOME_TARGET_ACCEPTED": "1",
+        "LEHOME_SIMULATOR_DEVICE": "cpu",
+        "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP": "1",
+        "LEHOME_ENABLE_HF_UPLOAD": "1",
+        "LEHOME_SKIP_ROUND_SEAL": "0",
+        "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+    }
+    runner = REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh"
+    result = subprocess.run(["/bin/bash", str(runner)], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 2
+    assert "exact unsealed snapshot-source bootstrap tuple" in result.stderr
+
+
 def test_actual_base_campaign_smoke_shims_drain_the_upload_and_never_invoke_sealer(tmp_path: Path) -> None:
     """Exercise the real base shell runner with Docker/worker shims, not a fake base."""
     generated = _artifacts(tmp_path / "inputs")
@@ -473,9 +507,12 @@ def test_snapshot_source_bootstrap_is_a_separate_one_worker_unsealed_tuple() -> 
     installer = (REPO_ROOT / "infrastructure/nebius/packer/scripts/install-rollout.sh").read_text(encoding="utf-8")
     assert "LEHOME_WORKER_COUNT=1 LEHOME_MAX_ATTEMPTS=1 LEHOME_TARGET_ACCEPTED=1" in source
     assert "LEHOME_ENABLE_HF_UPLOAD=1 LEHOME_SKIP_ROUND_SEAL=1 LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP=1" in source
+    assert "LEHOME_SIMULATOR_DEVICE=cpu" in source
     assert "fresh absent run root; resume is forbidden" in source
     assert "readback_verified" in source
     assert "SNAPSHOT_SOURCE_BOOTSTRAP" in base and "snapshot-source-bootstrap" in base
+    assert '--simulator-device "${SIMULATOR_DEVICE}"' in base
+    assert "CPU cloth requires the exact unsealed snapshot-source bootstrap tuple" in base
     assert "run_snapshot_source_bootstrap.sh" in installer
 
 

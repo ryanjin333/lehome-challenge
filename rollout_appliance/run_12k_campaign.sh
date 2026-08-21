@@ -39,6 +39,7 @@ PREPARATION_TIMEOUT_SECONDS="${LEHOME_PREPARATION_TIMEOUT_SECONDS:-180}"
 MAX_WORKER_RESTARTS="${LEHOME_MAX_WORKER_RESTARTS:-2}"
 MAX_STEPS="${LEHOME_MAX_STEPS:-600}"
 INITIAL_GARMENT="${LEHOME_INITIAL_GARMENT:-Top_Long_Seen_0}"
+SIMULATOR_DEVICE="${LEHOME_SIMULATOR_DEVICE:-cuda:0}"
 ROLLOUT_IMAGE="${LEHOME_ROLLOUT_IMAGE:-lehome-rollout:build}"
 KIT_SEED="${LEHOME_KIT_SEED:-${WORKSPACE}/eval/kit/w0}"
 HF_TOKEN_FILE="${LEHOME_HF_TOKEN_FILE:-${WORKSPACE}/secrets/hf_token}"
@@ -80,6 +81,20 @@ esac
 case "${SNAPSHOT_SOURCE_BOOTSTRAP}" in
   "0"|"1") ;;
   *) echo "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP must be exactly 0 or 1" >&2; exit 2 ;;
+esac
+case "${SIMULATOR_DEVICE}" in
+  "cuda:0") ;;
+  "cpu")
+    if [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "1" ] || [ "${WORKER_COUNT}" != "1" ] \
+        || [ "${MAX_ATTEMPTS}" != "1" ] || [ "${TARGET_ACCEPTED}" != "1" ] \
+        || [ "${ENABLE_HF_UPLOAD}" != "1" ] || [ "${SKIP_ROUND_SEAL}" != "1" ] \
+        || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ] \
+        || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ]; then
+      echo "CPU cloth requires the exact unsealed snapshot-source bootstrap tuple" >&2
+      exit 2
+    fi
+    ;;
+  *) echo "LEHOME_SIMULATOR_DEVICE must be exactly cpu or cuda:0" >&2; exit 2 ;;
 esac
 case "${RESUME_PREEMPTED_ROLLOUT}" in
   "0"|"1") ;;
@@ -505,6 +520,7 @@ launch_worker() {
       --output-root "${CAMPAIGN_ROOT}/worker-${index}" \
       --renderer-device cuda:0 \
       --policy-device cuda:0 \
+      --simulator-device "${SIMULATOR_DEVICE}" \
       --policy-gateway-endpoint tcp://127.0.0.1:15555 \
       --policy-sha256 "${POLICY_SHA256}" \
       --policy-repo "${POLICY_REPO}" \

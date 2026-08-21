@@ -240,8 +240,8 @@ def _write_persistent_flywheel_manifest(
         strategy=strategy,
     )
     simulator_device = str(getattr(args, "device", "")).lower()
-    if re.fullmatch(r"cuda:[0-9]+", simulator_device) is None:
-        raise ValueError("persistent flywheel assignment requires a canonical CUDA simulator device")
+    if simulator_device != "cpu" and re.fullmatch(r"cuda:[0-9]+", simulator_device) is None:
+        raise ValueError("persistent flywheel assignment requires cpu or a canonical CUDA simulator device")
     path = attempt_output_dir / "flywheel-manifest.json"
     payload = {
         "schema_version": 1,
@@ -271,7 +271,7 @@ def _write_persistent_flywheel_manifest(
         "execution_backend": "policy_server",
         "simulator_device": simulator_device,
         "policy_device": str(getattr(args, "policy_device", "cuda:0")),
-        "parity_stage": "persistent_collection",
+        "parity_stage": "server_cpu" if simulator_device == "cpu" else "persistent_collection",
     }
     if verified_restore is not None:
         payload.update(verified_restore)
@@ -325,11 +325,11 @@ class EvaluationSession:
 
     @property
     def runtime_receipt(self) -> dict[str, object]:
-        """Report the actual CUDA cloth/render binding without guessing it."""
+        """Report the actual cloth/render binding without guessing it."""
 
         simulation_device = str(getattr(self.env, "device", getattr(self.args, "device", ""))).lower()
-        if re.fullmatch(r"cuda:[0-9]+", simulation_device) is None:
-            raise ValueError("persistent evaluation requires an environment running CUDA cloth simulation")
+        if simulation_device != "cpu" and re.fullmatch(r"cuda:[0-9]+", simulation_device) is None:
+            raise ValueError("persistent evaluation requires a canonical CPU or CUDA cloth simulator")
         # Prefer already-known env/args devices at startup. Query Kit
         # /renderer/activeGpu only after the first reset, when other workers
         # are not still owning the GPU startup path.
@@ -346,11 +346,13 @@ class EvaluationSession:
         camera_device = str(observed_devices.get("camera_device") or "")
         if not renderer_device or not camera_device:
             raise ValueError("persistent evaluation cannot determine renderer/camera device")
-        if renderer_device != simulation_device or camera_device != simulation_device:
-            raise ValueError("persistent evaluation requires cloth, renderer, and cameras on one CUDA device")
+        if re.fullmatch(r"cuda:[0-9]+", renderer_device) is None or camera_device != renderer_device:
+            raise ValueError("persistent evaluation requires renderer and cameras on one CUDA device")
+        if simulation_device != "cpu" and renderer_device != simulation_device:
+            raise ValueError("persistent evaluation requires CUDA cloth and rendering on one device")
         backend = getattr(self.env, "_flywheel_cloth_backend", None)
         if not callable(backend):
-            raise ValueError("persistent evaluation cannot observe CUDA cloth backend")
+            raise ValueError("persistent evaluation cannot observe the cloth backend")
         if backend() != "physx_cloth_view":
             raise ValueError("persistent evaluation requires the live PhysX cloth backend")
         receipt = {

@@ -262,6 +262,22 @@ def test_cuda_cloth_runtime_receipt_requires_cuda_environment_device(monkeypatch
     assert session.runtime_receipt["renderer_device"] == "cuda:0"
 
 
+def test_source_bootstrap_runtime_receipt_preserves_cpu_cloth_with_cuda_rendering(monkeypatch) -> None:
+    evaluation = _evaluation(monkeypatch)
+
+    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    _cloth_evidence(env)
+    args = types.SimpleNamespace(device="cpu", renderer_device="cuda:0", camera_device="cuda:0")
+    policy = types.SimpleNamespace(runtime_device="cuda:0")
+    session = evaluation.EvaluationSession(args, env=env, policy=policy, env_cfg=env.cfg)
+
+    assert session.runtime_receipt["simulation_device"] == "cpu"
+    assert session.runtime_receipt["cloth_device"] == "cpu"
+    assert session.runtime_receipt["renderer_device"] == "cuda:0"
+    assert session.runtime_receipt["camera_device"] == "cuda:0"
+    assert session.runtime_receipt["policy_device"] == "cuda:0"
+
+
 def test_cuda_cloth_runtime_receipt_uses_observed_renderer_and_camera_devices(monkeypatch) -> None:
     evaluation = _evaluation(monkeypatch)
 
@@ -358,6 +374,34 @@ def test_persistent_attempt_authors_an_official_flywheel_manifest(monkeypatch, t
     assert payload["policy_revision"] == "30ac1a84da67b099e115ad147bcd61e9d60046d3"
     assert payload["image_identity"].startswith("sha256:")
     assert payload["simulator_device"] == "cuda:0"
+
+
+def test_source_bootstrap_manifest_marks_the_cpu_policy_server_parity_stage(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    captured = []
+    monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **kwargs: captured.append(kwargs["args"]) or [])
+    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    args = types.SimpleNamespace(
+        task="task", device="cpu", renderer_device="cuda:0", camera_device="cuda:0",
+        policy_device="cuda:0", video_dir="legacy-videos", eval_dataset_path="legacy-dataset",
+        flywheel_manifest=None,
+    )
+    session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
+    attempt = tmp_path / "attempt"
+
+    session.run_episode(
+        assignment={
+            "garment": "Top_Short_Seen_2", "seed": 50066, "category": "top_short",
+            "release_stage": "seen", "difficulty": "seen", "attempt_id": "source-cpu",
+        },
+        policy=object(),
+        attempt_output_dir=attempt,
+    )
+
+    payload = __import__("json").loads(Path(captured[0].flywheel_manifest).read_text())
+    assert payload["simulator_device"] == "cpu"
+    assert payload["policy_device"] == "cuda:0"
+    assert payload["parity_stage"] == "server_cpu"
 
 
 def test_persistent_attempt_records_the_explicit_served_policy_identity(monkeypatch, tmp_path) -> None:

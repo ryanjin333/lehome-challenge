@@ -71,7 +71,7 @@ class WorkerIdentity:
         if re.fullmatch(r"cuda:[0-9]+", self.renderer_device) is None:
             raise ValueError("renderer_device must be a canonical CUDA device")
         if self.policy_device != self.renderer_device:
-            raise ValueError("persistent worker requires policy and cloth on the same physical CUDA device")
+            raise ValueError("persistent worker requires policy and renderer on the same physical CUDA device")
 
 
 def _assignment_for(lease: Any) -> tuple[str, Mapping[str, object]]:
@@ -147,11 +147,15 @@ class PersistentRolloutWorker:
         output_root: Path | str,
         renderer_device: str,
         policy_device: str,
+        simulator_device: str | None = None,
         heartbeat_interval_seconds: float = 30.0,
         preparation_timeout_seconds: float = 180.0,
         hard_exit: Callable[[int], None] = os._exit,
     ) -> None:
         self.identity = WorkerIdentity(worker_id, session_id, renderer_device, policy_device)
+        self._simulator_device = renderer_device if simulator_device is None else simulator_device
+        if self._simulator_device != "cpu" and self._simulator_device != renderer_device:
+            raise ValueError("simulator_device must be cpu or the assigned renderer device")
         self._controller = controller
         self._simulator_factory = simulator_factory
         self._policy = policy
@@ -182,10 +186,10 @@ class PersistentRolloutWorker:
         if not isinstance(receipt, Mapping):
             raise ValueError("persistent worker session must expose a runtime receipt")
         if (
-            receipt.get("simulation_device") != self.identity.renderer_device
-            or receipt.get("cloth_device") != self.identity.renderer_device
+            receipt.get("simulation_device") != self._simulator_device
+            or receipt.get("cloth_device") != self._simulator_device
         ):
-            raise ValueError("persistent rollout requires CUDA cloth simulation on the assigned renderer device")
+            raise ValueError("persistent rollout cloth device does not match the assigned simulator device")
         if receipt.get("cloth_backend") != "physx_cloth_view":
             raise ValueError("persistent rollout requires the live PhysX cloth backend")
         if require_contact:
