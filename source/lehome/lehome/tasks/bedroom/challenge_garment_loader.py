@@ -71,8 +71,29 @@ class ChallengeGarmentLoader:
                 f"No JSON configuration file found in directory: {garment_dir}"
             )
 
-        # Load configuration file using OmegaConf
-        return OmegaConf.load(filepath)
+        # Preflight every local USD before Isaac receives the paths. A missing
+        # reference can otherwise enter Kit's interactive asset resolver and
+        # block forever in a headless rollout worker.
+        config = OmegaConf.load(filepath)
+        self._validate_local_usd(config.asset_path, label="garment asset")
+        for visual_path in getattr(config, "visual_usd_paths", None) or []:
+            if visual_path is not None:
+                self._validate_local_usd(visual_path, label="garment visual USD")
+        return config
+
+    @staticmethod
+    def _validate_local_usd(value: object, *, label: str) -> None:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} path is missing or malformed")
+        # GarmentObject treats a leading slash as repository-root-relative.
+        # Match that runtime resolution exactly rather than filesystem-root.
+        path = (
+            os.path.join(os.getcwd(), value[1:])
+            if value.startswith("/")
+            else os.path.join(os.getcwd(), value)
+        )
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"{label} file not found: {path}")
 
     def get_garment_type(self, garment_name: str) -> str:
         """

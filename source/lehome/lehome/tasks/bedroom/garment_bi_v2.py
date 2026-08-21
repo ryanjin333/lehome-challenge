@@ -1103,21 +1103,24 @@ class GarmentEnv(DirectRLEnv):
             f"[GarmentEnv] Switching garment to: {garment_name} (version: {garment_version})"
         )
 
+        if garment_version is None:
+            garment_version = self.cfg.garment_version
+
+        # Validate the replacement while the current garment is still intact.
+        # Bad assets must fail without destroying the usable scene.
+        next_garment_config = self.garment_loader.load_garment_config(
+            garment_name, garment_version
+        )
+
         if self.object is not None:
             self._delete_garment_object()
             logger.info("[GarmentEnv] Old garment object deleted")
-
-        if garment_version is None:
-            garment_version = self.cfg.garment_version
 
         # Update config
         self.cfg.garment_name = garment_name
         self.cfg.garment_version = garment_version
 
-        # Reload garment configuration
-        self.garment_config = self.garment_loader.load_garment_config(
-            garment_name, garment_version
-        )
+        self.garment_config = next_garment_config
         logger.debug(f"[GarmentEnv] Garment config reloaded for {garment_name}")
 
         # solve particle ditorition

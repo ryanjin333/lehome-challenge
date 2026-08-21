@@ -114,6 +114,55 @@ def test_eight_row_lower_bound_starts_with_the_exact_reachable_acceptance_caps(t
     assert Counter(row["category"] for row in rows) == {"pant_long": 4, "top_long": 1, "top_short": 3}
 
 
+def test_builder_treats_audit_shortfalls_as_diagnostics_not_campaign_caps(tmp_path: Path) -> None:
+    """One authenticated source per active category can seed the fixed 4/1/3 campaign."""
+
+    from scripts.build_controlled_recovery_matrix import build_controlled_recovery_matrix
+
+    accepted = tmp_path / "accepted"
+    selected = [
+        _accepted(accepted, "round-1", "long", "pant_long"),
+        _accepted(accepted, "round-2", "tl", "top_long"),
+        _accepted(accepted, "round-3", "ts", "top_short"),
+    ]
+    audit = _audit(selected)
+    # This is the real v3 audit result for per_category_minimum=1: the active
+    # categories are ready, while the deliberately excluded pant-short category
+    # still has an audit-only shortfall.  These are not collection acceptance caps.
+    audit["shortfalls"] = {
+        "pant_long": 0,
+        "pant_short": 1,
+        "top_long": 0,
+        "top_short": 0,
+    }
+    audit["semantic_sha256"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in audit.items() if key != "semantic_sha256"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    audit_path = tmp_path / "audit.json"
+    _write(audit_path, audit)
+    audit_path.with_name("audit.json.sha256").write_text(
+        hashlib.sha256(audit_path.read_bytes()).hexdigest() + "\n", encoding="ascii"
+    )
+
+    result = build_controlled_recovery_matrix(
+        audit_path=audit_path,
+        accepted_roots=[accepted],
+        output=tmp_path / "matrix.json",
+        max_attempts=8,
+    )
+
+    rows = json.loads(Path(result["materialization_path"]).read_text(encoding="utf-8"))["rows"]
+    assert Counter(row["category"] for row in rows) == {
+        "pant_long": 4,
+        "top_long": 1,
+        "top_short": 3,
+    }
+
+
 def test_builder_uses_only_the_authenticated_explicit_continuation_boundary(tmp_path: Path) -> None:
     from scripts.build_controlled_recovery_matrix import build_controlled_recovery_matrix
 

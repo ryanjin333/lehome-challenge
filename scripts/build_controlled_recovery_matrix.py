@@ -218,10 +218,10 @@ def build_controlled_recovery_matrix(*, audit_path: Path | str, accepted_roots: 
     if not roots or any(not root.is_absolute() or root.is_symlink() or not root.is_dir() for root in roots): raise ValueError("accepted roots must be real absolute directories")
     selected, shortfalls = audit.get("selected_recoveries"), audit.get("shortfalls")
     if not isinstance(selected, list) or not isinstance(shortfalls, Mapping): raise ValueError("recovery audit selection is malformed")
+    if set(shortfalls) != set(_CAPS) or any(type(value) is not int or value < 0 for value in shortfalls.values()): raise ValueError("recovery audit shortfalls are malformed")
     sources = [_source(row, roots) for row in selected if isinstance(row, Mapping) and row.get("category") in _CATEGORIES]
     by_category = {category: [source for source in sources if source["portable"]["category"] == category] for category in _CATEGORIES}
     for category, cap in _CAPS.items():
-        if int(shortfalls.get(category, 0)) != cap: raise ValueError("audit shortfall does not match immutable controlled recovery caps")
         if cap and not by_category[category]: raise ValueError("controlled recovery shortfall lacks an audited source")
     semantic_rows, hydrated_rows = [], []
     # The first eight rows must make every immutable acceptance cap reachable
