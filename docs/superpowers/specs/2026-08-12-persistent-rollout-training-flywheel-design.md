@@ -162,15 +162,16 @@ finishes and disposes the rollout rental before renting the trainer.
 ## Persistent Rollout Worker
 
 Each worker owns one Isaac application, one environment, one renderer GPU, and
-one GR00T policy server for its lifetime. Current simulation parity remains:
+one GR00T policy server for its lifetime. Current simulation parity requires:
 
-- cloth physics, environment state, control, and success checks use the admitted
-  CPU simulation path;
-- RTX rendering uses the assigned GPU; and
-- GR00T inference uses the assigned GPU.
+- cloth physics, environment state, control, and success checks use a canonical
+  CUDA device;
+- RTX rendering and cameras use that same CUDA device; and
+- GR00T inference uses that same CUDA device.
 
-GPU cloth physics is not enabled by this project. It requires a separate parity
-and contact-behavior acceptance experiment.
+Isaac Sim 5.1 does not implement the required particle-cloth view on a CPU
+simulation view. CPU cloth or a split-device configuration fails before a
+worker leases an attempt.
 
 For every task, the worker:
 

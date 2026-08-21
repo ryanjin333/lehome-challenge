@@ -364,7 +364,7 @@ class GarmentObject(SingleClothPrim):
         self.set_world_pose(position=self.init_pos, orientation=self.init_ori)
 
         # Controlled-recovery snapshots must address the live PhysX particle
-        # state, even when the environment's simulation device is CPU. USD
+        # state on the CUDA physics pipeline. USD
         # ``points``/``velocities`` are authored scene data and are not a
         # sufficient continuation-state authority once simulation is running.
         self._ensure_physics_cloth_view()
@@ -410,7 +410,7 @@ class GarmentObject(SingleClothPrim):
         logger.debug("[GarmentObject] Performing soft reset")
         # Reset the same live PhysX state used by controlled-recovery capture
         # and restore. Authoring USD ``points`` after simulation starts does
-        # not reset the solver particles on CPU.
+        # not reset the live solver particles.
         cloth = self._ensure_physics_cloth_view()
         cloth.set_world_positions(self.initial_points_positions)
         cloth.set_velocities(self.initial_points_velocities)

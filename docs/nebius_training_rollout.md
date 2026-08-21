@@ -153,18 +153,21 @@ shared disk to two VMs.
 4. Apply the same runtime root with `rollout.tfvars` and the rollout image
    id. The disk attaches `READ_WRITE` with `device_id=lehome`.
 
-## 8. Four-Worker CPU-Cloth Rollout
+## 8. Four-Worker CUDA-Cloth Rollout
 
 Default is four persistent Isaac workers plus one batched policy server.
-Cloth simulation stays on CPU. The policy server owns the model once and
-batches at most four sessions. The policy gateway binds `127.0.0.1:15555`
-so DCGM can keep `localhost:5555`.
+Each Isaac environment, its PhysX particle-cloth view, renderer, and cameras
+must bind the same assigned CUDA device. Isaac Sim 5.1 does not implement
+`CpuSimulationView::createParticleClothView`; a CPU simulator receipt is now a
+hard admission failure. The policy server owns the model once and batches at
+most four sessions. The policy gateway binds `127.0.0.1:15555` so DCGM can
+keep `localhost:5555`.
 
 Do not boot another GPU until the frozen 1-episode smoke command is the
 thing you will run. The current captured golden image is
 `lehome-rollout-20260818-final7` (`computeimage-u00sfetv9456n1q937`), family
 `lehome-rollout`, version `2026-08-18.7`. It has DCGM,
-`/opt/lehome/pydeps`, writable `/eval/logs` and `/kitcache`, the CPU-cloth
+`/opt/lehome/pydeps`, writable `/eval/logs` and `/kitcache`, the cloth
 contact fix, the active-lease worker supervisor guard, and
 `smoke_one_episode.sh`. It also carries the reviewed, durable rollout
 preemption path that pauses the campaign, makes active leases retryable,
@@ -204,13 +207,15 @@ debugger.
 Pinned identities live in `rollout_appliance/one_episode_smoke.py`.
 
 The `final6` predecessor passed this gate on 2026-08-18. The untouched boot
-started the policy on `cuda:0`, created the simulator with CPU cloth, leased
+started the policy on `cuda:0`, created the simulator with the then-current CPU cloth path, leased
 the frozen episode, ran 600 steps, wrote all three videos and immutable
 receipts, settled the terminal handoff, and exited 0. The task itself was a
 normal policy failure; no infrastructure abort or unsettled handoff remained.
 The episode JSON SHA-256 was
 `6e24e7ba5ca9230def609ca3d2ccdedecfeb7dbfceee676ae13c805fd09d0806`.
-`final7` is the code-reviewed successor to that live-smoked image. Its image
+That historical smoke predates authenticated live PhysX continuation snapshots;
+it therefore does not prove the current cloth-view contract. `final7` was the
+code-reviewed successor to that live-smoked image. Its image
 build and in-image syntax/compile checks passed, but it has not been booted for
 a second paid GPU smoke because its changes are confined to shutdown safety
 and image defaults.
@@ -224,7 +229,7 @@ download or evaluate the previous campaign 1K/2K.
 On first boot prove:
 
 - official challenge image already present
-- cloth on CPU
+- cloth, simulator, renderer, cameras, and policy on the same canonical CUDA device
 - one checkpoint loaded once
 - session routing, VRAM, and policy latency
 - terminal artifact publication

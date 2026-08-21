@@ -68,6 +68,10 @@ class WorkerIdentity:
         for field in ("worker_id", "session_id", "renderer_device", "policy_device"):
             if not isinstance(getattr(self, field), str) or not getattr(self, field):
                 raise ValueError(f"{field} must be a non-empty string")
+        if re.fullmatch(r"cuda:[0-9]+", self.renderer_device) is None:
+            raise ValueError("renderer_device must be a canonical CUDA device")
+        if self.policy_device != self.renderer_device:
+            raise ValueError("persistent worker requires policy and cloth on the same physical CUDA device")
 
 
 def _assignment_for(lease: Any) -> tuple[str, Mapping[str, object]]:
@@ -177,8 +181,11 @@ class PersistentRolloutWorker:
         receipt = raw() if callable(raw) else raw
         if not isinstance(receipt, Mapping):
             raise ValueError("persistent worker session must expose a runtime receipt")
-        if receipt.get("simulation_device") != "cpu" or receipt.get("cloth_device") != "cpu":
-            raise ValueError("persistent rollout requires CPU cloth simulation")
+        if (
+            receipt.get("simulation_device") != self.identity.renderer_device
+            or receipt.get("cloth_device") != self.identity.renderer_device
+        ):
+            raise ValueError("persistent rollout requires CUDA cloth simulation on the assigned renderer device")
         if receipt.get("cloth_backend") != "physx_cloth_view":
             raise ValueError("persistent rollout requires the live PhysX cloth backend")
         if require_contact:
@@ -413,7 +420,7 @@ class PersistentRolloutWorker:
                     )
                     if not isinstance(outcome, Mapping):
                         raise ValueError("episode session must return a mapping receipt")
-                    # Startup only establishes CPU/renderer identity.  The
+                    # Startup only establishes CUDA device identity.  The
                     # physical-cloth readback and visible-contact canary must
                     # be freshly observable after reset and episode execution
                     # before this lease can become terminal.
@@ -473,8 +480,8 @@ class PersistentRolloutWorker:
                     "episode_generation": generation,
                     "output_dir": str(output_dir),
                     "action_horizon": self._action_horizon(),
-                    "simulation_device": "cpu",
-                    "cloth_device": "cpu",
+                    "simulation_device": runtime_receipt["simulation_device"],
+                    "cloth_device": runtime_receipt["cloth_device"],
                     "renderer_device": runtime_receipt["renderer_device"],
                     "camera_device": runtime_receipt["camera_device"],
                     "policy_device": self.identity.policy_device,

@@ -55,8 +55,9 @@ requests are batched and routed by session.
 - Training and rollout never run concurrently on that disk.
 - Rollout worker count: four by default. Three-worker staging is not the normal
   production topology.
-- Cloth simulation: CPU only. The GPU is used for rendering/interoperability and
-  policy inference, not CUDA cloth simulation.
+- Cloth simulation: CUDA on the same physical device as rendering, cameras,
+  and policy inference. Isaac Sim 5.1 does not implement particle-cloth views
+  for `CpuSimulationView`.
 - Training global batch: 64.
 - Training GPU: RTX PRO 6000. H200 is deferred from the initial implementation.
 - Training duration: exactly 2,000 optimizer steps.
@@ -198,7 +199,7 @@ Image creation and GPU runtime validation are different gates:
 - A CPU Packer builder can verify downloads, hashes, package installation,
   service definitions, and image creation.
 - It cannot prove CUDA training, GR00T inference, Isaac rendering, camera output,
-  CPU cloth behavior, or four-worker stability.
+  CUDA cloth behavior or four-worker stability.
 - Each golden image therefore requires a later bounded RTX PRO 6000 smoke test
   before production use.
 
@@ -415,25 +416,26 @@ four.
 The initial CPU-affinity budget is approximately five cores per Isaac worker
 and four cores shared by the policy gateway, controller, writer, uploader, and
 operating system. Affinity is a starting configuration, not an unmeasured
-throughput claim. The paid smoke must report CPU saturation, renderer and policy
-GPU pressure, memory, video backlog, simulator failures, inference latency, and
-accepted episodes per hour.
+throughput claim. The paid smoke must report CPU saturation, CUDA cloth,
+renderer and policy GPU pressure, memory, video backlog, simulator failures,
+inference latency, and accepted episodes per hour.
 
-## CPU Cloth Contract
+## CUDA Cloth Contract
 
-The organizer runtime and this deployment use the admitted CPU simulation path.
-No code path may enable GPU cloth merely because CUDA is available.
+Persistent collection uses one canonical `cuda:N` device for simulation,
+PhysX particle cloth, rendering, cameras, and policy inference. A worker must
+reject mismatched device indices before leasing an attempt.
 
 The runtime admission receipt records:
 
-- simulation device and cloth device as CPU;
+- matching canonical CUDA simulation and cloth devices;
 - renderer device and GPU identity;
 - policy inference device;
 - relevant Isaac/LeHome runtime versions; and
 - a visible cloth-contact canary result.
 
-A configuration that moves cloth simulation to CUDA fails before campaign
-leases begin.
+A CPU simulator or a configuration that splits these components across CUDA
+devices fails before campaign leases begin.
 
 ## Session-Aware Policy Gateway
 
@@ -655,7 +657,7 @@ Metrics contain identities and hashes but no credential values or raw secrets.
 - session batching, routing, cancellation, timeout, stale-response, and restart
   tests;
 - dynamic leasing, no-wave-barrier, retry, and duplicate-terminal tests;
-- CPU-cloth configuration rejection tests;
+- non-CUDA cloth configuration rejection tests;
 - bounded writer/upload backpressure tests; and
 - four-category evaluation matrix and threshold tests.
 
@@ -676,7 +678,7 @@ On one preemptible RTX PRO 6000 VM from `vla-training-base`:
 On one preemptible RTX PRO 6000 VM from `lehome-rollout`:
 
 - prove the official challenge image is already present;
-- prove cloth simulation remains on CPU;
+- prove cloth simulation uses the same CUDA device as renderer, cameras, and policy;
 - load one checkpoint exactly once;
 - start four persistent Isaac workers;
 - route simultaneous requests to the correct sessions;
@@ -701,7 +703,7 @@ This design does not:
 - attach the shared disk to both runtime VMs;
 - base the training image on the LeHome simulator tarball;
 - bake experiment data, model weights, or credentials into images;
-- enable CUDA cloth simulation;
+- run persistent particle-cloth views on a CPU simulation device;
 - train on any held-out evaluation garment;
 - treat local scratch files as immutable Hub publications;
 - silently change 70/30 to another mixture during resume;

@@ -92,7 +92,8 @@ one-worker zero-perturbation teacher probe
 ```
 
 Evaluation uses one loaded checkpoint and four persistent Isaac workers behind the
-session-aware policy server. Cloth physics remains on CPU. Each worker has an isolated
+session-aware policy server. Each worker binds simulator, PhysX cloth, renderer,
+cameras, and policy to one canonical CUDA device. Each worker has an isolated
 shared-memory/IPC namespace, preparation watchdog, heartbeat, session ID, seed, and
 attempt directory.
 

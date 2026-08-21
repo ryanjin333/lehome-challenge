@@ -98,7 +98,7 @@ def _round(
             "provenance": {
                 "execution_backend": "policy_server", "execution_mode": "policy_server",
                 "parity_stage": "persistent_collection", "policy_artifact_sha256": "c" * 64,
-                "policy_device": "cuda:0", "simulator_device": "cpu",
+                "policy_device": "cuda:0", "simulator_device": "cuda:0",
             },
             "identity": {
                 "release_stage": "seen", "category": category,

@@ -170,7 +170,7 @@ def test_garment_restore_keeps_legacy_cpu_replay_separate_from_controlled_physx_
     assert 'cloth_state_authority", None) == "physx_cloth_view_world_v1"' in method_source
 
 
-def _cpu_cloth_evidence(env) -> None:
+def _cloth_evidence(env) -> None:
     if not hasattr(env, "renderer_device"):
         env.renderer_device = "cuda:0"
     if not hasattr(env, "camera_device"):
@@ -249,27 +249,27 @@ def test_evaluation_session_switches_garments_without_recreating_a_switchable_en
     assert env.cfg.random_seed == 42
 
 
-def test_cpu_cloth_runtime_receipt_requires_cpu_environment_device(monkeypatch) -> None:
+def test_cuda_cloth_runtime_receipt_requires_cuda_environment_device(monkeypatch) -> None:
     evaluation = _evaluation(monkeypatch)
 
-    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
-    _cpu_cloth_evidence(env)
+    env = types.SimpleNamespace(device="cuda:0", cfg=types.SimpleNamespace())
+    _cloth_evidence(env)
     args = types.SimpleNamespace(device="cuda:0", renderer_device="cuda:0", camera_device="cuda:0")
     session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
 
-    assert session.runtime_receipt["simulation_device"] == "cpu"
-    assert session.runtime_receipt["cloth_device"] == "cpu"
+    assert session.runtime_receipt["simulation_device"] == "cuda:0"
+    assert session.runtime_receipt["cloth_device"] == "cuda:0"
     assert session.runtime_receipt["renderer_device"] == "cuda:0"
 
 
-def test_cpu_cloth_runtime_receipt_uses_observed_renderer_and_camera_devices(monkeypatch) -> None:
+def test_cuda_cloth_runtime_receipt_uses_observed_renderer_and_camera_devices(monkeypatch) -> None:
     evaluation = _evaluation(monkeypatch)
 
     env = types.SimpleNamespace(
-        device="cpu", renderer_device="cuda:2", camera_device="cuda:2", cfg=types.SimpleNamespace(),
+        device="cuda:2", renderer_device="cuda:2", camera_device="cuda:2", cfg=types.SimpleNamespace(),
     )
-    _cpu_cloth_evidence(env)
-    args = types.SimpleNamespace(device="cpu", renderer_device="cuda:0", camera_device="cuda:0")
+    _cloth_evidence(env)
+    args = types.SimpleNamespace(device="cuda:2", renderer_device="cuda:0", camera_device="cuda:0")
     session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
 
     assert session.runtime_receipt["renderer_device"] == "cuda:2"
@@ -333,9 +333,9 @@ def test_persistent_attempt_authors_an_official_flywheel_manifest(monkeypatch, t
     evaluation = _evaluation(monkeypatch)
     captured = []
     monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **kwargs: captured.append(kwargs["args"]) or [])
-    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    env = types.SimpleNamespace(device="cuda:0", cfg=types.SimpleNamespace())
     args = types.SimpleNamespace(
-        task="task", device="cpu", renderer_device="cuda:0", camera_device="cuda:0",
+        task="task", device="cuda:0", renderer_device="cuda:0", camera_device="cuda:0",
         policy_device="cuda:0", video_dir="legacy-videos", eval_dataset_path="legacy-dataset",
         flywheel_manifest=None,
     )
@@ -357,15 +357,16 @@ def test_persistent_attempt_authors_an_official_flywheel_manifest(monkeypatch, t
     assert payload["identity"]["strategy"] == "canonical"
     assert payload["policy_revision"] == "30ac1a84da67b099e115ad147bcd61e9d60046d3"
     assert payload["image_identity"].startswith("sha256:")
+    assert payload["simulator_device"] == "cuda:0"
 
 
 def test_persistent_attempt_records_the_explicit_served_policy_identity(monkeypatch, tmp_path) -> None:
     evaluation = _evaluation(monkeypatch)
     captured = []
     monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **kwargs: captured.append(kwargs["args"]) or [])
-    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    env = types.SimpleNamespace(device="cuda:0", cfg=types.SimpleNamespace())
     args = types.SimpleNamespace(
-        task="task", device="cpu", renderer_device="cuda:0", camera_device="cuda:0",
+        task="task", device="cuda:0", renderer_device="cuda:0", camera_device="cuda:0",
         policy_device="cuda:0", video_dir="legacy-videos", eval_dataset_path="legacy-dataset",
         flywheel_manifest=None,
         policy_repo="ryanjin333/lehome-groot-n17-models",
@@ -397,9 +398,9 @@ def test_persistent_randomized_assignment_authors_geometry_only_strategy(monkeyp
     evaluation = _evaluation(monkeypatch)
     captured = []
     monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **kwargs: captured.append(kwargs["args"]) or [])
-    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    env = types.SimpleNamespace(device="cuda:0", cfg=types.SimpleNamespace())
     args = types.SimpleNamespace(
-        task="task", device="cpu", renderer_device="cuda:0", camera_device="cuda:0",
+        task="task", device="cuda:0", renderer_device="cuda:0", camera_device="cuda:0",
         policy_device="cuda:0", video_dir="legacy-videos", eval_dataset_path="legacy-dataset",
         flywheel_manifest=None,
     )
@@ -427,7 +428,7 @@ def test_persistent_assignment_preserves_explicit_geometry_strategy(monkeypatch,
         "release_stage": "seen", "difficulty": "randomized", "strategy": "strong_geometry",
         "attempt_id": "top-short-seen-1-strong-geometry-seed-149",
     }
-    args = types.SimpleNamespace(policy_device="cuda:0")
+    args = types.SimpleNamespace(device="cuda:0", policy_device="cuda:0")
 
     path = evaluation._write_persistent_flywheel_manifest(tmp_path / "attempt", assignment, args)
     payload = __import__("json").loads(path.read_text())
@@ -515,7 +516,7 @@ def test_persistent_manifest_hands_controlled_recovery_identity_to_validator(mon
     }
 
     manifest_path = evaluation._write_persistent_flywheel_manifest(
-        tmp_path / "attempt", assignment, types.SimpleNamespace(policy_device="cuda:0")
+        tmp_path / "attempt", assignment, types.SimpleNamespace(device="cuda:0", policy_device="cuda:0")
     )
     envelope = json.loads(manifest_path.read_text(encoding="utf-8"))["controlled_recovery"]
 
@@ -526,17 +527,17 @@ def test_persistent_manifest_hands_controlled_recovery_identity_to_validator(mon
     assert recovery.continuation_state == tuple(continuation_state)
 
 
-def test_cpu_cloth_runtime_receipt_skips_contact_canary_until_requested(monkeypatch) -> None:
+def test_cuda_cloth_runtime_receipt_skips_contact_canary_until_requested(monkeypatch) -> None:
     evaluation = _evaluation(monkeypatch)
     calls = {"canary": 0}
 
-    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
-    _cpu_cloth_evidence(env)
+    env = types.SimpleNamespace(device="cuda:0", cfg=types.SimpleNamespace())
+    _cloth_evidence(env)
     def boom():
         calls["canary"] += 1
         raise RuntimeError("contact should not run at startup")
     env.flywheel_visible_garment_contact = boom
-    args = types.SimpleNamespace(device="cpu", renderer_device="cuda:0", camera_device="cuda:0")
+    args = types.SimpleNamespace(device="cuda:0", renderer_device="cuda:0", camera_device="cuda:0")
     session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
 
     receipt = session.runtime_receipt
@@ -561,15 +562,15 @@ def test_persistent_episode_enables_fresh_cloth_and_contact_runtime_evidence(mon
     )
 
     env = types.SimpleNamespace(
-        device="cpu",
+        device="cuda:0",
         renderer_device="cuda:0",
         camera_device="cuda:0",
         cfg=types.SimpleNamespace(garment_name="Top_Short_Seen_9", garment_version="Release"),
     )
-    _cpu_cloth_evidence(env)
+    _cloth_evidence(env)
     args = types.SimpleNamespace(
         task="task",
-        device="cpu",
+        device="cuda:0",
         renderer_device="cuda:0",
         camera_device="cuda:0",
         video_dir="video",
@@ -614,9 +615,9 @@ def test_verified_success_replay_binds_checked_snapshot_and_lineage_to_manifest(
     snapshot = tmp_path / "reset.json"
     snapshot.write_text(json.dumps({"schema_version": 1, "garment_name": "Top_Long_Seen_0"}), encoding="utf-8")
     digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
-    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    env = types.SimpleNamespace(device="cuda:0", cfg=types.SimpleNamespace())
     args = types.SimpleNamespace(
-        task="task", device="cpu", renderer_device="cuda:0", camera_device="cuda:0",
+        task="task", device="cuda:0", renderer_device="cuda:0", camera_device="cuda:0",
         policy_device="cuda:0", video_dir="video", eval_dataset_path="dataset", flywheel_manifest=None,
     )
     session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)

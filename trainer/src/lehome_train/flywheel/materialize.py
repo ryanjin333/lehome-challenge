@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from typing import Any, Mapping
@@ -22,6 +23,7 @@ from lehome_train.io import sha256_file
 ACTION_HORIZON = 16
 RFT_ACTION_HORIZON = 16
 CAMERA_KEYS = ("top_rgb", "left_rgb", "right_rgb")
+_CUDA_DEVICE = re.compile(r"cuda:[0-9]+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,16 +57,25 @@ def _is_autonomous_policy_success(raw: Mapping[str, object]) -> bool:
         return False
     artifact_sha256 = provenance.get("policy_artifact_sha256")
     policy_device = provenance.get("policy_device")
+    parity_stage = provenance.get("parity_stage")
+    simulator_device = provenance.get("simulator_device")
+    canonical_policy = isinstance(policy_device, str) and _CUDA_DEVICE.fullmatch(policy_device) is not None
+    persistent_cuda = (
+        isinstance(simulator_device, str)
+        and _CUDA_DEVICE.fullmatch(simulator_device) is not None
+        and policy_device == simulator_device
+    )
     return (
         type(raw.get("bc_target_count")) is int
         and raw.get("bc_target_count") == 0
         and provenance.get("execution_backend") == "policy_server"
         and provenance.get("execution_mode") == "policy_server"
-        and provenance.get("parity_stage") in {"server_cpu", "persistent_collection"}
-        and provenance.get("simulator_device") == "cpu"
-        and isinstance(policy_device, str)
-        and policy_device.startswith("cuda:")
-        and policy_device.removeprefix("cuda:").isdigit()
+        and parity_stage in {"server_cpu", "persistent_collection"}
+        and (
+            (parity_stage == "server_cpu" and simulator_device == "cpu")
+            or (parity_stage == "persistent_collection" and persistent_cuda)
+        )
+        and canonical_policy
         and isinstance(artifact_sha256, str)
         and len(artifact_sha256) == 64
         and all(character in "0123456789abcdef" for character in artifact_sha256)

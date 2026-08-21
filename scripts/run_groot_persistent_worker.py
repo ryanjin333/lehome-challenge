@@ -1,4 +1,4 @@
-"""Run one long-lived CPU-cloth Isaac worker against the append-only ledger."""
+"""Run one long-lived CUDA-cloth Isaac worker against the append-only ledger."""
 
 from __future__ import annotations
 
@@ -47,18 +47,18 @@ class LedgerWorkerController:
         return self._ledger.heartbeat(worker_id, attempt_id, lease_id, lease_duration_ns=self._lease_duration_ns)
 
 
-def prepare_cpu_cloth_launch(args: argparse.Namespace, *, environ: MutableMapping[str, str] | None = None) -> str:
-    """Validate the physical renderer before fixing simulation/cloth to CPU."""
+def prepare_cuda_cloth_launch(args: argparse.Namespace, *, environ: MutableMapping[str, str] | None = None) -> str:
+    """Bind simulation, cloth, renderer, and cameras to one physical CUDA GPU."""
 
     renderer = _CUDA_DEVICE.fullmatch(str(getattr(args, "renderer_device", "")))
     policy = _CUDA_DEVICE.fullmatch(str(getattr(args, "policy_device", "")))
     if renderer is None or policy is None:
         raise ValueError("renderer and policy devices must be cuda:<physical GPU>")
+    if renderer.group(1) != policy.group(1):
+        raise ValueError("persistent worker requires policy and cloth on the same physical CUDA device")
     target_environ = os.environ if environ is None else environ
     target_environ["LEHOME_FLYWHEEL_WORKER_GPU"] = renderer.group(1)
-    # ``launch_app_from_args`` reads this environment variable to set Kit's
-    # renderer GPU while preserving this CPU value for task/cloth config.
-    args.device = "cpu"
+    args.device = args.renderer_device
     args.camera_device = args.renderer_device
     return renderer.group(1)
 
@@ -117,7 +117,7 @@ def _progress(message: str) -> None:
         pass
 
 
-def _build_cpu_cloth_session(args: argparse.Namespace):
+def _build_cuda_cloth_session(args: argparse.Namespace):
     """Import Isaac only after AppLauncher is live, then build one reusable env."""
 
     _progress(f"importing gym and task for {args.task}")
@@ -132,7 +132,7 @@ def _build_cpu_cloth_session(args: argparse.Namespace):
         raise
 
     _progress("parse_env_cfg")
-    env_cfg = parse_env_cfg(args.task, device="cpu")
+    env_cfg = parse_env_cfg(args.task, device=args.device)
     env_cfg.sim.use_fabric = False
     env_cfg.seed = args.seed
     env_cfg.random_seed = args.seed
@@ -145,8 +145,8 @@ def _build_cpu_cloth_session(args: argparse.Namespace):
     _progress("initialize_obs")
     env.initialize_obs()
     _progress("obs initialized")
-    if args.device != "cpu":
-        raise ValueError("persistent worker must force CPU physics before environment creation")
+    if args.device != args.renderer_device or _CUDA_DEVICE.fullmatch(args.device) is None:
+        raise ValueError("persistent worker must bind CUDA cloth physics to the renderer device")
     args.num_episodes = 1
     args.flywheel_manifest = None
     if args.policy_ready_file.is_symlink() or not args.policy_ready_file.is_file():
@@ -169,8 +169,6 @@ def _build_cpu_cloth_session(args: argparse.Namespace):
 
 
 def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory: Any = TaskLedger) -> list[dict[str, object]]:
-    if args.device != "cpu":
-        raise ValueError("persistent worker requires CPU cloth physics")
     if args.lease_seconds <= 0:
         raise ValueError("lease seconds must be positive")
     if (
@@ -180,12 +178,14 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
         or args.preparation_timeout_seconds <= 0
     ):
         raise ValueError("preparation timeout seconds must be positive")
+    if args.device != args.renderer_device or _CUDA_DEVICE.fullmatch(args.device) is None:
+        raise ValueError("persistent worker requires CUDA cloth physics on the renderer device")
     ledger = ledger_factory(
         args.database, attempt_matrix=_load_matrix(args.attempt_matrix), max_attempts=args.max_attempts,
         target_accepted=args.target_accepted,
     )
     try:
-        factory = session_factory or (lambda: _build_cpu_cloth_session(args))
+        factory = session_factory or (lambda: _build_cuda_cloth_session(args))
         policy_holder: dict[str, object] = {}
 
         def simulator_factory():
@@ -229,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
 
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args(argv)
-    prepare_cpu_cloth_launch(args)
+    prepare_cuda_cloth_launch(args)
     simulation_app = launch_app_from_args(args)
     _progress("kit launched")
     try:

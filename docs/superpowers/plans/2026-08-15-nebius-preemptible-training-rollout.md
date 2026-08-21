@@ -4,7 +4,7 @@
 
 **Goal:** Build locally verifiable Nebius templates for a reusable RTX PRO 6000 training appliance and a LeHome-specific four-worker rollout appliance, with one protected 500 GiB shared disk and complete recovery from preemption.
 
-**Architecture:** Packer creates two immutable golden images through temporary CPU builders. Terraform creates exactly one preemptible `gpu-rtx6000` runtime role at a time and attaches the same protected network SSD. Training is driven by an immutable experiment manifest so the initial 70/30 mixture can later become 80/20 without rebuilding an image. Rollout uses one loaded policy behind a session-aware batching gateway, four persistent CPU-cloth Isaac workers, an append-only controller ledger, and background artifact/Hugging Face publication.
+**Architecture:** Packer creates two immutable golden images through temporary CPU builders. Terraform creates exactly one preemptible `gpu-rtx6000` runtime role at a time and attaches the same protected network SSD. Training is driven by an immutable experiment manifest so the initial 70/30 mixture can later become 80/20 without rebuilding an image. Rollout uses one loaded policy behind a session-aware batching gateway, four persistent CUDA-cloth Isaac workers, an append-only controller ledger, and background artifact/Hugging Face publication.
 
 **Tech Stack:** Python 3.11 for the Isaac/runtime project, the trainer project's pinned Python 3.10.18 for training control-plane tools, pytest, GR00T N1.7, LeRobot, Isaac Sim 5.1, ZeroMQ/msgpack, SQLite WAL, Hugging Face Hub, Docker, Packer with `github.com/nebius/nebius` `0.0.7`, Terraform with `nebius/nebius` `0.6.42`, systemd.
 
@@ -409,7 +409,7 @@ git add -f \
 git commit -m "Add persistent rollout controller"
 ```
 
-### Task 9: Run four persistent CPU-cloth Isaac workers
+### Task 9: Run four persistent CUDA-cloth Isaac workers
 
 **Files:**
 - Create: `source/lehome/lehome/flywheel/persistent_worker.py`
@@ -432,7 +432,7 @@ PYTHONPATH=source/lehome:trainer/src uv run --project trainer pytest -q \
 
 - [ ] **Step 3: Extract a reusable evaluation session**
 
-Preserve the current `eval` CLI behavior while making one `AppLauncher`/environment reusable across assigned episodes. Force cloth simulation to CPU in the runtime config and validate it in the worker receipt. Keep rendering, camera interop, and policy inference on the RTX PRO 6000.
+Preserve the current `eval` CLI behavior while making one `AppLauncher`/environment reusable across assigned episodes. Bind cloth simulation, rendering, camera interop, and policy inference to the same canonical CUDA device and validate that binding in the worker receipt. Reject CPU cloth and mismatched device indices before an attempt is leased.
 
 - [ ] **Step 4: Run tests and commit**
 
@@ -446,7 +446,7 @@ git add source/lehome/lehome/flywheel/persistent_worker.py \
 git add -f \
   tests/flywheel/test_persistent_worker.py \
   tests/test_evaluation_session.py
-git commit -m "Add persistent CPU-cloth Isaac workers"
+git commit -m "Add persistent CUDA-cloth Isaac workers"
 ```
 
 ### Task 10: Finalize, validate, and publish episodes in the background
@@ -736,7 +736,7 @@ Document:
 5. immutable download/hash verification of parent model and data bundles;
 6. loader pilot, batch-64 2K training, local/HF recovery behavior;
 7. safe role handoff from training to rollout;
-8. four-worker CPU-cloth rollout startup, monitoring, preemption, and restart;
+8. four-worker CUDA-cloth rollout startup, monitoring, preemption, and restart;
 9. immutable round sealing and Hugging Face readback;
 10. five-candidate 80-unseen/200-seen evaluation and winner gate;
 11. physical-test approval boundary; and
@@ -808,6 +808,6 @@ These gates are intentionally not executed by this plan without new user approva
 3. Create the protected 500 GiB network SSD.
 4. Launch one preemptible RTX PRO 6000 training VM and prove CUDA, video decode, batch creation, loader selection, checkpoint/resume, and Hugging Face readback.
 5. Stop/detach training and launch one preemptible RTX PRO 6000 rollout VM.
-6. Prove CPU cloth, four persistent workers, one model load, correct session routing, stable VRAM, acceptable policy latency, terminal artifact publication, and restart after forced interruption.
+6. Prove CUDA cloth, four persistent workers, one model load, correct session routing, stable VRAM, acceptable policy latency, terminal artifact publication, and restart after forced interruption.
 
 Production training and rollout begin only after their respective paid smoke gates pass.

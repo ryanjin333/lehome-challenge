@@ -46,6 +46,8 @@ def _raw_rft_episode(
     production_schema: bool = True,
     category: str = "top_long",
     parity_stage: str = "server_cpu",
+    simulator_device: str | None = None,
+    policy_device: str = "cuda:0",
 ) -> Path:
     writer = EpisodeArtifactWriter(root, episode_id)
     for index in range(frames):
@@ -68,8 +70,8 @@ def _raw_rft_episode(
             "execution_mode": "policy_server",
             "parity_stage": parity_stage,
             "policy_artifact_sha256": "c" * 64,
-            "policy_device": "cuda:0",
-            "simulator_device": "cpu",
+            "policy_device": policy_device,
+            "simulator_device": simulator_device or ("cuda:0" if parity_stage == "persistent_collection" else "cpu"),
         },
         "identity": {
             "category": category,
@@ -156,6 +158,32 @@ def test_rft_materializer_accepts_verified_persistent_collection_success(tmp_pat
     )
 
     assert report.selected_observations == 30
+
+
+def test_rft_materializer_rejects_cpu_persistent_collection_success(tmp_path: Path) -> None:
+    raw = _raw_rft_episode(
+        tmp_path,
+        parity_stage="persistent_collection",
+        terminal_reason="horizon",
+        simulator_device="cpu",
+    )
+
+    with pytest.raises(ValueError, match="accepted autonomous success"):
+        materialize_rft_episode(raw, tmp_path / "out")
+
+
+@pytest.mark.parametrize("device", ["cuda:²", "cuda:١", "cuda:٠"])
+def test_rft_materializer_rejects_non_ascii_cuda_device(device: str, tmp_path: Path) -> None:
+    raw = _raw_rft_episode(
+        tmp_path,
+        parity_stage="persistent_collection",
+        terminal_reason="horizon",
+        simulator_device=device,
+        policy_device=device,
+    )
+
+    with pytest.raises(ValueError, match="accepted autonomous success"):
+        materialize_rft_episode(raw, tmp_path / "out")
 
 
 @pytest.mark.parametrize(

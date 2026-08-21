@@ -2,9 +2,9 @@
 
 Process topology on one preemptible RTX PRO 6000 (24 vCPU) machine:
 
-    GPU:  one batched policy server (single loaded checkpoint)
-    CPU:  one controller, one finalizer/writer pool, one HF uploader,
-          and four persistent CPU-cloth Isaac workers (5 cores each)
+    GPU:  one batched policy server (single loaded checkpoint) and four
+          persistent CUDA-cloth Isaac workers
+    CPU:  one controller, one finalizer/writer pool, and one HF uploader
 
 The model server starts before any worker; no worker starts until shared-disk
 admission and the policy readiness digest both verify.  Four workers is the

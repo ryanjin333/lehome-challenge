@@ -59,8 +59,8 @@ class FakeSession:
         self.runs: list[str] = []
         self.closed = False
         self.runtime_receipt = {
-            "simulation_device": "cpu",
-            "cloth_device": "cpu",
+            "simulation_device": "cuda:0",
+            "cloth_device": "cuda:0",
             "renderer_device": "cuda:0",
             "camera_device": "cuda:0",
             "cloth_backend": "physx_cloth_view",
@@ -81,7 +81,7 @@ class FakeSession:
         self.closed = True
 
 
-def test_worker_reuses_one_cpu_cloth_simulator_and_immediately_leases_next_attempt(tmp_path) -> None:
+def test_worker_reuses_one_cuda_cloth_simulator_and_immediately_leases_next_attempt(tmp_path) -> None:
     from lehome.flywheel.persistent_worker import PersistentRolloutWorker
 
     controller = FakeController([
@@ -110,7 +110,7 @@ def test_worker_reuses_one_cpu_cloth_simulator_and_immediately_leases_next_attem
         str(tmp_path / "worker-0" / "session-0" / "attempt-a" / "lease-a" / "generation-1"),
         str(tmp_path / "worker-0" / "session-0" / "attempt-b" / "lease-b" / "generation-2"),
     ]
-    assert all(receipt["cloth_device"] == "cpu" for receipt in receipts)
+    assert all(receipt["cloth_device"] == "cuda:0" for receipt in receipts)
     assert all(receipt["action_horizon"] == 16 for receipt in receipts)
     assert sessions[0].closed is True
 
@@ -208,12 +208,12 @@ def test_worker_refuses_a_restarted_worker_output_collision(tmp_path) -> None:
         worker.run()
 
 
-def test_worker_refuses_gpu_cloth_before_requesting_a_lease(tmp_path) -> None:
+def test_worker_refuses_cpu_cloth_before_requesting_a_lease(tmp_path) -> None:
     from lehome.flywheel.persistent_worker import PersistentRolloutWorker
 
     controller = FakeController([])
     session = FakeSession()
-    session.runtime_receipt["cloth_device"] = "cuda:0"
+    session.runtime_receipt["cloth_device"] = "cpu"
     worker = PersistentRolloutWorker(
         worker_id="worker-0", session_id="session-0", controller=controller,
         simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
@@ -221,7 +221,7 @@ def test_worker_refuses_gpu_cloth_before_requesting_a_lease(tmp_path) -> None:
     )
 
     import pytest
-    with pytest.raises(ValueError, match="CPU cloth"):
+    with pytest.raises(ValueError, match="CUDA cloth"):
         worker.run()
 
 
@@ -354,18 +354,36 @@ def test_worker_receipt_uses_the_policy_clients_actual_episode_generation(tmp_pa
     assert receipts[0]["episode_generation"] == policy.episode_generation == 41
 
 
-def test_launcher_validates_the_renderer_before_forcing_cpu_cloth(monkeypatch) -> None:
+def test_launcher_binds_cloth_physics_to_the_renderer_cuda_device(monkeypatch) -> None:
     repository = Path(__file__).resolve().parents[2]
     monkeypatch.syspath_prepend(str(repository))
-    from scripts.run_groot_persistent_worker import prepare_cpu_cloth_launch
+    from scripts.run_groot_persistent_worker import prepare_cuda_cloth_launch
 
-    args = types.SimpleNamespace(device="cuda:9", renderer_device="cuda:2", policy_device="cuda:3")
+    args = types.SimpleNamespace(device="cuda:9", renderer_device="cuda:2", policy_device="cuda:2")
     environment: dict[str, str] = {}
 
-    assert prepare_cpu_cloth_launch(args, environ=environment) == "2"
-    assert args.device == "cpu"
+    assert prepare_cuda_cloth_launch(args, environ=environment) == "2"
+    assert args.device == "cuda:2"
     assert args.camera_device == "cuda:2"
     assert environment == {"LEHOME_FLYWHEEL_WORKER_GPU": "2"}
+
+
+def test_launcher_rejects_a_non_cuda_renderer_or_policy() -> None:
+    from scripts.run_groot_persistent_worker import prepare_cuda_cloth_launch
+
+    with pytest.raises(ValueError, match="renderer and policy devices"):
+        prepare_cuda_cloth_launch(types.SimpleNamespace(
+            device="cpu", renderer_device="cpu", policy_device="cuda:0",
+        ), environ={})
+
+
+def test_launcher_rejects_a_policy_on_a_different_physical_gpu() -> None:
+    from scripts.run_groot_persistent_worker import prepare_cuda_cloth_launch
+
+    with pytest.raises(ValueError, match="same physical CUDA device"):
+        prepare_cuda_cloth_launch(types.SimpleNamespace(
+            device="cuda:0", renderer_device="cuda:0", policy_device="cuda:1",
+        ), environ={})
 
 
 def test_worker_heartbeats_while_an_episode_blocks_and_stops_the_timer(tmp_path) -> None:
