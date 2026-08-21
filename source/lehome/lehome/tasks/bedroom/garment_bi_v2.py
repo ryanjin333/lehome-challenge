@@ -801,17 +801,10 @@ class GarmentEnv(DirectRLEnv):
         return Vt.Vec3fArray([Gf.Vec3f(*map(float, row)) for row in values])
 
     def _flywheel_physics_cloth_view(self):
-        cloth = getattr(self.object, "_cloth_prim_view", None)
-        valid = getattr(cloth, "is_physics_handle_valid", None)
-        required = (
-            "get_world_positions", "get_velocities",
-            "set_world_positions", "set_velocities",
-        )
-        if cloth is None or not callable(valid) or not bool(valid()):
+        ensure = getattr(self.object, "_ensure_physics_cloth_view", None)
+        if not callable(ensure):
             raise RuntimeError("garment PhysX cloth view is not initialized")
-        if any(not callable(getattr(cloth, method, None)) for method in required):
-            raise RuntimeError("garment PhysX cloth view is not fully restorable")
-        return cloth
+        return ensure()
 
     def _flywheel_physics_cloth_state(self) -> tuple[np.ndarray, np.ndarray]:
         cloth = self._flywheel_physics_cloth_view()

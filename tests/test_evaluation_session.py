@@ -46,8 +46,84 @@ def test_garment_initializes_the_physx_cloth_view_on_cpu_and_cuda() -> None:
     method_source = ast.get_source_segment(source, method)
     assert method_source is not None
     assert 'if "cuda" in self._device' not in method_source
-    assert "self._cloth_prim_view.initialize(self.physics_sim_view)" in method_source
-    assert "is_physics_handle_valid" in method_source
+    assert "self._ensure_physics_cloth_view()" in method_source
+
+
+def test_garment_rebinds_a_stale_physx_cloth_view_after_simulation_start() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/assets/object/Garment.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_ensure_physics_cloth_view"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    current_view = object()
+
+    class SimulationManager:
+        @staticmethod
+        def get_physics_sim_view():
+            return current_view
+
+    namespace = {"SimulationManager": SimulationManager}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    class View:
+        def __init__(self) -> None:
+            self.valid = False
+            self.initialized_with = None
+
+        def is_physics_handle_valid(self):
+            return self.valid
+
+        def initialize(self, value):
+            self.initialized_with = value
+            self.valid = True
+
+        def get_world_positions(self):
+            return []
+
+        def get_velocities(self):
+            return []
+
+        def set_world_positions(self, _value):
+            return None
+
+        def set_velocities(self, _value):
+            return None
+
+    holder = types.SimpleNamespace(_cloth_prim_view=View(), physics_sim_view=None)
+    rebound = namespace["_ensure_physics_cloth_view"](holder)
+
+    assert rebound is holder._cloth_prim_view
+    assert rebound.initialized_with is current_view
+    assert holder.physics_sim_view is current_view
+
+
+def test_persistent_worker_reports_runtime_preflight_failure_before_kit_close() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts/run_groot_persistent_worker.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "main"
+    )
+    method_source = ast.get_source_segment(source, method)
+    assert method_source is not None
+    assert "run() failed before kit close" in method_source
+    assert method_source.index("run() failed before kit close") < method_source.index("closing kit")
 
 
 def test_garment_reset_uses_the_authoritative_physx_view_on_cpu_and_cuda() -> None:
@@ -61,13 +137,15 @@ def test_garment_reset_uses_the_authoritative_physx_view_on_cpu_and_cuda() -> No
         node.name: ast.get_source_segment(source, node)
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in {"_get_initial_info", "reset"}
+        and node.name in {"_get_initial_info", "reset", "set_all_pose"}
     }
     assert "get_world_positions" in methods["_get_initial_info"]
     assert "get_velocities" in methods["_get_initial_info"]
     assert "self._device" not in methods["_get_initial_info"]
     assert "set_world_positions" in methods["reset"]
     assert "set_velocities" in methods["reset"]
+    assert "_ensure_physics_cloth_view" in methods["reset"]
+    assert "_ensure_physics_cloth_view" in methods["set_all_pose"]
     assert 'if self._device == "cpu"' not in methods["reset"]
 
 

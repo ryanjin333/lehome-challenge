@@ -367,17 +367,40 @@ class GarmentObject(SingleClothPrim):
         # state, even when the environment's simulation device is CPU. USD
         # ``points``/``velocities`` are authored scene data and are not a
         # sufficient continuation-state authority once simulation is running.
-        self.physics_sim_view = SimulationManager.get_physics_sim_view()
-        self._cloth_prim_view.initialize(self.physics_sim_view)
-        valid = getattr(self._cloth_prim_view, "is_physics_handle_valid", None)
-        if not callable(valid) or not bool(valid()):
-            raise RuntimeError("garment PhysX cloth view failed to initialize")
+        self._ensure_physics_cloth_view()
 
         self._get_initial_info()
 
         self._prim.GetAttribute("points").Set(
             Vt.Vec3fArray.FromNumpy(self._get_points_pose().detach().cpu().numpy())
         )
+
+    def _ensure_physics_cloth_view(self):
+        """Return a live cloth view, rebinding after a physics-scene reset.
+
+        Isaac can replace its simulation view between object construction and
+        the first live rollout reset.  A cloth handle that was valid during
+        ``initialize`` must therefore be checked again at every flywheel
+        boundary and rebound to the current simulation view when stale.
+        """
+
+        cloth = getattr(self, "_cloth_prim_view", None)
+        valid = getattr(cloth, "is_physics_handle_valid", None)
+        initialize = getattr(cloth, "initialize", None)
+        required = (
+            "get_world_positions", "get_velocities",
+            "set_world_positions", "set_velocities",
+        )
+        if cloth is None or not callable(valid) or not callable(initialize):
+            raise RuntimeError("garment PhysX cloth view is unavailable")
+        if any(not callable(getattr(cloth, method, None)) for method in required):
+            raise RuntimeError("garment PhysX cloth view is not fully restorable")
+        if not bool(valid()):
+            self.physics_sim_view = SimulationManager.get_physics_sim_view()
+            initialize(self.physics_sim_view)
+        if not bool(valid()):
+            raise RuntimeError("garment PhysX cloth view failed to initialize")
+        return cloth
 
     def reset(self):
         """
@@ -388,8 +411,9 @@ class GarmentObject(SingleClothPrim):
         # Reset the same live PhysX state used by controlled-recovery capture
         # and restore. Authoring USD ``points`` after simulation starts does
         # not reset the solver particles on CPU.
-        self._cloth_prim_view.set_world_positions(self.initial_points_positions)
-        self._cloth_prim_view.set_velocities(self.initial_points_velocities)
+        cloth = self._ensure_physics_cloth_view()
+        cloth.set_world_positions(self.initial_points_positions)
+        cloth.set_velocities(self.initial_points_velocities)
 
         # Get position range from configuration
         pos_reset_range, pos_source = self._get_config_value(
@@ -496,8 +520,9 @@ class GarmentObject(SingleClothPrim):
                 scale_world.detach().cpu().numpy(),
             )
         else:
+            cloth = self._ensure_physics_cloth_view()
             mesh_points = (
-                self._cloth_prim_view.get_world_positions()
+                cloth.get_world_positions()
                 .squeeze(0)
                 .detach()
                 .cpu()
@@ -653,8 +678,9 @@ class GarmentObject(SingleClothPrim):
         """
         Retain the initial live PhysX state for deterministic soft resets.
         """
-        positions = self._cloth_prim_view.get_world_positions()
-        velocities = self._cloth_prim_view.get_velocities()
+        cloth = self._ensure_physics_cloth_view()
+        positions = cloth.get_world_positions()
+        velocities = cloth.get_velocities()
         self.initial_points_positions = (
             positions.clone() if callable(getattr(positions, "clone", None))
             else np.array(positions, copy=True)
@@ -709,8 +735,9 @@ class GarmentObject(SingleClothPrim):
             self.set_world_pose(
                 [0.0, 0.0, 0.0], euler_angles_to_quat([0.0, 0.0, 0.0], degrees=True)
             )
-            self._cloth_prim_view.set_world_positions(self.initial_points_positions)
-            self._cloth_prim_view.set_velocities(self.initial_points_velocities)
+            cloth = self._ensure_physics_cloth_view()
+            cloth.set_world_positions(self.initial_points_positions)
+            cloth.set_velocities(self.initial_points_velocities)
             self.set_world_pose(pos, euler_angles_to_quat(ori, degrees=True))
             self.reset_pose = np.array(pose, dtype=np.float32)
 

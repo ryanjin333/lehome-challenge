@@ -234,7 +234,11 @@ def main(argv: list[str] | None = None) -> int:
     _progress("kit launched")
     try:
         _progress("run() starting")
-        run(args)
+        try:
+            run(args)
+        except BaseException as error:
+            _progress(f"run() failed before kit close: {type(error).__name__}: {error}")
+            raise
         _progress("run() returned")
     finally:
         _progress("closing kit")
