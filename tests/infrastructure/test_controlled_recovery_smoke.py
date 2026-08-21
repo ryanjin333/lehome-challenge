@@ -171,7 +171,22 @@ def _run_snapshot_source_bootstrap(
     identity = hashlib.sha256(f"{run_id}:{digest}".encode("ascii")).hexdigest()[:20]
     root = tmp_path / "eval" / f"snapshot-source-bootstrap-{identity}"
     base = tmp_path / "snapshot-source-base.sh"; _fake_snapshot_source_base(base)
+    fake_bin = tmp_path / "fake-bin"; fake_bin.mkdir(parents=True)
+    docker = fake_bin / "docker"
+    docker.write_text(textwrap.dedent("""\
+        #!/usr/bin/env python3
+        import os, sys
+        if len(sys.argv) < 4 or sys.argv[1] != "run" or sys.argv[-3] != "-":
+            raise SystemExit("unexpected validator docker invocation")
+        for index, argument in enumerate(sys.argv[:-1]):
+            if argument == "-e":
+                key, value = sys.argv[index + 1].split("=", 1)
+                os.environ[key] = value
+        os.execv(sys.executable, [sys.executable, *sys.argv[-3:]])
+    """), encoding="utf-8")
+    docker.chmod(0o755)
     env = {**os.environ, "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR": str(descriptor), "LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR_SHA256": digest, "LEHOME_SNAPSHOT_SOURCE_RUN_ID": run_id, "LEHOME_SNAPSHOT_SOURCE_BASE_CAMPAIGN": str(base), "LEHOME_SNAPSHOT_SOURCE_TEST_CASE": case, "LEHOME_SNAPSHOT_SOURCE_RUNTIME_ROOT": str(runtime_source_root or (REPO_ROOT / "source" / "lehome"))}
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
     if clear_pythonpath:
         env["PYTHONPATH"] = ""
     return subprocess.run(["/bin/bash", str(SNAPSHOT_SOURCE_BOOTSTRAP)], env=env, text=True, capture_output=True, check=False), root
@@ -515,6 +530,14 @@ def test_snapshot_source_bootstrap_imports_from_the_explicit_packaged_runtime_ro
     )
     assert result.returncode == 0, result.stderr
     assert (root / "snapshot-source-bootstrap.envelope.json").is_file()
+
+
+def test_snapshot_source_bootstrap_uses_the_dependency_complete_rollout_runtime_for_validation() -> None:
+    source = SNAPSHOT_SOURCE_BOOTSTRAP.read_text(encoding="utf-8")
+    assert "docker run --rm --user 1234:1234 --network none -i" in source
+    assert '-v "${DESCRIPTOR}:${DESCRIPTOR}:ro"' in source
+    assert "--entrypoint /opt/lehome-challenge/.venv/bin/python" in source
+    assert 'PYTHONPATH="${RUNTIME_SOURCE_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" python3' not in source
 
 
 def test_snapshot_source_bootstrap_missing_packaged_runtime_root_is_infrastructure_failure(tmp_path: Path) -> None:

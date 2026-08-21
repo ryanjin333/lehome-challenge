@@ -8,9 +8,10 @@ DESCRIPTOR="${LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR:?LEHOME_SNAPSHOT_SOURCE_DESCRIPT
 DESCRIPTOR_SHA256="${LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR_SHA256:?LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR_SHA256 is required}"
 RUN_ID="${LEHOME_SNAPSHOT_SOURCE_RUN_ID:?LEHOME_SNAPSHOT_SOURCE_RUN_ID is required}"
 BASE="${LEHOME_SNAPSHOT_SOURCE_BASE_CAMPAIGN:-/opt/lehome/rollout_appliance/run_12k_campaign.sh}"
-# This is appliance configuration, never descriptor-controlled input.  Keep it
-# first in PYTHONPATH so the post-acceptance validator uses the image's exact
-# staged collection contract even when the caller has an ambient Python path.
+ROLLOUT_IMAGE="${LEHOME_ROLLOUT_IMAGE:-lehome-rollout:build}"
+# This is appliance configuration, never descriptor-controlled input.  The
+# post-acceptance validator mounts it into the dependency-complete rollout
+# runtime and never inherits the host Python environment.
 RUNTIME_SOURCE_ROOT="${LEHOME_SNAPSHOT_SOURCE_RUNTIME_ROOT:-/opt/lehome/source/lehome}"
 
 safe_runtime_source_root() {
@@ -85,7 +86,13 @@ if ! safe_runtime_source_root "${RUNTIME_SOURCE_ROOT}"; then
   echo "snapshot source bootstrap packaged runtime source is missing or unsafe" >&2
   verification_status=1
 else
-PYTHONPATH="${RUNTIME_SOURCE_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${ROOT}" "${DESCRIPTOR}" <<'PY'
+docker run --rm --user 1234:1234 --network none -i \
+  -v "${WORKSPACE}:${WORKSPACE}" \
+  -v "${DESCRIPTOR}:${DESCRIPTOR}:ro" \
+  -v "${RUNTIME_SOURCE_ROOT}:${RUNTIME_SOURCE_ROOT}:ro" \
+  -e "PYTHONPATH=${RUNTIME_SOURCE_ROOT}" \
+  --entrypoint /opt/lehome-challenge/.venv/bin/python \
+  "${ROLLOUT_IMAGE}" - "${ROOT}" "${DESCRIPTOR}" <<'PY'
 import hashlib, json, os, re, sqlite3, sys, tempfile
 from pathlib import Path
 root, descriptor = Path(sys.argv[1]), Path(sys.argv[2]); ledger = root / "ledger.sqlite3"; receipts = root / "hf-sync-receipts"
