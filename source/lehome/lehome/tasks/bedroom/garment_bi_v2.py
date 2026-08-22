@@ -23,6 +23,7 @@ from lehome.utils.depth_to_pointcloud import generate_pointcloud_from_data
 from lehome.assets.scenes.bedroom import MARBLE_BEDROOM_USD_PATH
 from lehome.devices.action_process import preprocess_device_action
 from lehome.assets.object.Garment import GarmentObject
+from lehome.assets.collider_audit import audit_current_usd_stage
 from lehome.tasks.bedroom.challenge_garment_loader import ChallengeGarmentLoader
 from lehome.flywheel.isaac_camera import read_camera_world_pose, write_camera_world_pose
 import logging
@@ -39,6 +40,7 @@ class GarmentEnv(DirectRLEnv):
         self.cfg = cfg
         self.action_scale = self.cfg.action_scale
         self.object = None  # Will be created in _setup_scene
+        self._flywheel_collider_health = None
 
         # Cache for distance-based reward (to handle step_interval decorator)
         self._last_computed_reward = 0.0
@@ -140,6 +142,10 @@ class GarmentEnv(DirectRLEnv):
             logger.debug(
                 f"[GarmentEnv] Could not delete existing prim (may not exist): {e}"
             )
+
+        # Garment recreation changes the composed stage.  Never reuse collider
+        # evidence captured for the previous garment in a persistent worker.
+        self._flywheel_collider_health = None
 
         # Create new garment object
         try:
@@ -832,8 +838,46 @@ class GarmentEnv(DirectRLEnv):
             velocities = velocities[0]
         return self._flywheel_cloth_arrays(positions, velocities)
 
+    def flywheel_collider_health(self) -> dict[str, object]:
+        """Cache a fail-closed audit of live USD collision approximations.
+
+        Collision authoring is immutable during an evaluation episode, so one
+        composed-stage readback is sufficient and avoids adding per-step USD
+        traversal overhead.  The returned mapping is carried through the
+        existing health gate as infrastructure evidence, never as a setting
+        change.
+        """
+
+        if self._flywheel_collider_health is None:
+            try:
+                self._flywheel_collider_health = audit_current_usd_stage()
+            except (RuntimeError, TypeError, ValueError, AttributeError):
+                self._flywheel_collider_health = {
+                    "healthy": False,
+                    "reason": "collider_static_audit_unavailable",
+                    "metric_name": "dynamic_triangle_mesh_collider_count",
+                    "metric_value": "unavailable",
+                    "metric_limit": 0,
+                    "offending_colliders": [],
+                }
+        result = self._flywheel_collider_health
+        if not isinstance(result, dict) or result.get("healthy") is not True:
+            return result if isinstance(result, dict) else {
+                "healthy": False,
+                "reason": "collider_static_audit_unavailable",
+                "metric_name": "dynamic_triangle_mesh_collider_count",
+                "metric_value": "unavailable",
+                "metric_limit": 0,
+                "offending_colliders": [],
+            }
+        return dict(result)
+
     def flywheel_cloth_physical_health(self) -> dict[str, object]:
         """Fail closed when live cloth state is numerically outside this scene's scale."""
+
+        collider_health = self.flywheel_collider_health()
+        if collider_health.get("healthy") is not True:
+            return collider_health
 
         try:
             positions, velocities = self._flywheel_physics_cloth_state()
@@ -883,11 +927,21 @@ class GarmentEnv(DirectRLEnv):
         max_position_m = float(np.max(np.abs(positions))) if positions.size else float("inf")
         max_extent_m = float(np.max(np.ptp(positions, axis=0))) if positions.size else float("inf")
         max_velocity_mps = float(np.max(np.linalg.norm(velocities, axis=1))) if velocities.size else float("inf")
-        if (
-            max_position_m > max_position_limit_m
-            or max_extent_m > max_extent_limit_m
-            or max_velocity_mps > max_velocity_limit_mps
+        exceeded_metrics = []
+        for metric_name, metric_value, metric_limit in (
+            ("max_position_m", max_position_m, max_position_limit_m),
+            ("max_extent_m", max_extent_m, max_extent_limit_m),
+            ("max_velocity_mps", max_velocity_mps, max_velocity_limit_mps),
         ):
+            if metric_value > metric_limit:
+                exceeded_metrics.append(
+                    {
+                        "metric_name": metric_name,
+                        "metric_value": metric_value,
+                        "metric_limit": metric_limit,
+                    }
+                )
+        if exceeded_metrics:
             return {
                 "healthy": False,
                 "reason": "simulator_numerical_divergence",
@@ -897,6 +951,7 @@ class GarmentEnv(DirectRLEnv):
                 "max_position_limit_m": max_position_limit_m,
                 "max_extent_limit_m": max_extent_limit_m,
                 "max_velocity_limit_mps": max_velocity_limit_mps,
+                "exceeded_metrics": exceeded_metrics,
             }
         return {
             "healthy": True,

@@ -49,8 +49,41 @@ def _require_flywheel_cloth_health(env: Any) -> None:
             if isinstance(health, Mapping)
             else "simulator_numerical_divergence"
         )
+        evidence: list[str] = []
+        if isinstance(health, Mapping):
+            exceeded_metrics = health.get("exceeded_metrics")
+            if isinstance(exceeded_metrics, (list, tuple)):
+                for metric in exceeded_metrics:
+                    if not isinstance(metric, Mapping):
+                        continue
+                    metric_name = metric.get("metric_name")
+                    if isinstance(metric_name, str):
+                        evidence.append(
+                            f"{metric_name}={metric.get('metric_value')} "
+                            f"limit={metric.get('metric_limit')}"
+                        )
+            metric_name = health.get("metric_name")
+            if isinstance(metric_name, str):
+                evidence.append(
+                    f"{metric_name}={health.get('metric_value')} "
+                    f"limit={health.get('metric_limit')}"
+                )
+            offending_colliders = health.get("offending_colliders")
+            if isinstance(offending_colliders, (list, tuple)):
+                for collider in offending_colliders[:3]:
+                    if not isinstance(collider, Mapping):
+                        continue
+                    usd_prim = collider.get("usd_prim")
+                    prim_type = collider.get("prim_type")
+                    approximation = collider.get("approximation")
+                    if all(isinstance(value, str) for value in (usd_prim, prim_type, approximation)):
+                        evidence.append(
+                            f"usd_prim={usd_prim} prim_type={prim_type} "
+                            f"approximation={approximation}"
+                        )
+        diagnostic_suffix = f" ({'; '.join(evidence)})" if evidence else ""
         raise SimulatorNumericalDivergenceError(
-            f"{reason}: cloth physical-health admission failed"
+            f"{reason}: cloth physical-health admission failed{diagnostic_suffix}"
         )
 
 _LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")

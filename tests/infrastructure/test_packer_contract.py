@@ -261,9 +261,15 @@ def test_rollout_merge_overlays_the_physx_garment_runtime_used_by_workers():
         "cp -a /opt/lehome/source/lehome/lehome/assets/object/Garment.py "
         "/opt/lehome/merged/lehome/assets/object/Garment.py"
     )
+    patched_collider_audit = (
+        "cp -a /opt/lehome/source/lehome/lehome/assets/collider_audit.py "
+        "/opt/lehome/merged/lehome/assets/collider_audit.py"
+    )
     assert official_copy in merge
     assert patched_garment in merge
+    assert patched_collider_audit in merge
     assert merge.index(official_copy) < merge.index(patched_garment)
+    assert merge.index(official_copy) < merge.index(patched_collider_audit)
 
 
 def test_rollout_image_and_stage_carry_the_success_replay_campaign_tools():

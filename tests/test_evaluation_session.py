@@ -2,13 +2,571 @@ from __future__ import annotations
 
 import ast
 import importlib
+import importlib.util
 import hashlib
 import json
 from pathlib import Path
 import sys
 import types
+from collections.abc import Mapping
 
 import numpy as np
+
+
+def _collider_audit_module():
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/assets/collider_audit.py"
+    )
+    spec = importlib.util.spec_from_file_location("collider_audit_test", source_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_dynamic_mesh_collider_audit_reports_exact_prim_metric_and_limit() -> None:
+    audit = _collider_audit_module()
+    link = {
+        "path": "/World/Robot/link",
+        "type_name": "Xform",
+        "rigid_body": True,
+        "kinematic": False,
+    }
+    mesh = {
+        "path": "/World/Robot/link/visual_mesh",
+        "type_name": "Mesh",
+        "collision": True,
+        "approximation": "none",
+        "parent": link,
+    }
+    sdf_mesh = {
+        "path": "/World/Robot/link/collision_mesh",
+        "type_name": "Mesh",
+        "collision": True,
+        "approximation": "sdf",
+        "parent": link,
+    }
+
+    result = audit.audit_dynamic_mesh_colliders([mesh, sdf_mesh])
+
+    assert result == {
+        "healthy": False,
+        "reason": "unsupported_dynamic_triangle_mesh_collider",
+        "metric_name": "dynamic_triangle_mesh_collider_count",
+        "metric_value": 1,
+        "metric_limit": 0,
+        "offending_colliders": [
+            {
+                "usd_prim": "/World/Robot/link/visual_mesh",
+                "prim_type": "Mesh",
+                "approximation": "none",
+                "rigid_body_prim": "/World/Robot/link",
+                "rigid_body_kinematic": False,
+            }
+        ],
+    }
+
+
+def test_dynamic_mesh_collider_audit_fails_closed_when_approximation_is_unreadable() -> None:
+    audit = _collider_audit_module()
+    result = audit.audit_dynamic_mesh_colliders([
+        {
+            "path": "/World/Robot/link/unreadable_mesh",
+            "type_name": "Mesh",
+            "collision": True,
+            "parent": {
+                "path": "/World/Robot/link",
+                "type_name": "Xform",
+                "rigid_body": True,
+                "kinematic": False,
+            },
+        }
+    ])
+
+    assert result["healthy"] is False
+    assert result["metric_value"] == 1
+    assert result["offending_colliders"][0]["approximation"] == "<unreadable>"
+
+
+def test_dynamic_mesh_collider_audit_fails_closed_for_unknown_approximations() -> None:
+    audit = _collider_audit_module()
+    rigid_body = {
+        "path": "/World/Robot/link",
+        "type_name": "Xform",
+        "rigid_body": True,
+        "kinematic": False,
+    }
+    result = audit.audit_dynamic_mesh_colliders([
+        {
+            "path": "/World/Robot/link/unknown",
+            "type_name": "Mesh",
+            "collision": True,
+            "approximation": "unexpectedApproximation",
+            "parent": rigid_body,
+        },
+        {
+            "path": "/World/Robot/link/mistyped",
+            "type_name": "Mesh",
+            "collision": True,
+            "approximation": False,
+            "parent": rigid_body,
+        },
+    ])
+
+    assert result["healthy"] is False
+    assert result["metric_value"] == 2
+    assert [item["approximation"] for item in result["offending_colliders"]] == [
+        "unexpectedapproximation",
+        "false",
+    ]
+
+
+def test_mesh_simplification_is_an_unsupported_dynamic_triangle_mesh() -> None:
+    audit = _collider_audit_module()
+    result = audit.audit_dynamic_mesh_colliders([
+        {
+            "path": "/World/Robot/link/simplified_mesh",
+            "type_name": "Mesh",
+            "collision": True,
+            "approximation": "meshSimplification",
+            "parent": {
+                "path": "/World/Robot/link",
+                "type_name": "Xform",
+                "rigid_body": True,
+                "kinematic": False,
+            },
+        }
+    ])
+
+    assert result["healthy"] is False
+    assert result["metric_value"] == 1
+    assert result["offending_colliders"][0]["approximation"] == "meshsimplification"
+
+
+def test_usd_collider_audit_uses_instance_proxies_and_mesh_collision_api(monkeypatch) -> None:
+    audit = _collider_audit_module()
+
+    class Attribute:
+        def __init__(self, value):
+            self.value = value
+
+        def Get(self):
+            return self.value
+
+    class Prim:
+        def __init__(self, path, type_name, parent=None, *, collision=False, rigid_body=False):
+            self.path = path
+            self.type_name = type_name
+            self.parent = parent
+            self.collision = collision
+            self.rigid_body = rigid_body
+
+        def IsA(self, schema):
+            return schema == "Mesh" and self.type_name == "Mesh"
+
+        def HasAPI(self, api):
+            return (api == "CollisionAPI" and self.collision) or (
+                api == "RigidBodyAPI" and self.rigid_body
+            )
+
+        def GetParent(self):
+            return self.parent
+
+        def GetAttribute(self, name):
+            return Attribute(False) if name == "physics:kinematicEnabled" else None
+
+        def GetPath(self):
+            return self.path
+
+        def GetTypeName(self):
+            return self.type_name
+
+        def __bool__(self):
+            return True
+
+    rigid_body = Prim("/so101_new_calib/base", "Xform", rigid_body=True)
+    collision_xform = Prim(
+        "/so101_new_calib/base/collisions",
+        "Xform",
+        parent=rigid_body,
+    )
+    instance_proxy_mesh = Prim(
+        "/so101_new_calib/base/collisions/mesh_0",
+        "Mesh",
+        parent=collision_xform,
+        collision=True,
+    )
+
+    class Stage:
+        def Traverse(self):
+            raise AssertionError("audit must traverse instance proxies")
+
+    class MeshCollisionAPI:
+        def __init__(self, prim):
+            self.prim = prim
+
+        def GetApproximationAttr(self):
+            assert self.prim is instance_proxy_mesh
+            return Attribute("convexDecomposition")
+
+    pxr = types.ModuleType("pxr")
+    pxr.Usd = types.SimpleNamespace(
+        PrimRange=types.SimpleNamespace(
+            Stage=lambda stage, traversal: [instance_proxy_mesh]
+        ),
+        TraverseInstanceProxies=lambda: "instance-proxies",
+    )
+    pxr.UsdGeom = types.SimpleNamespace(Mesh="Mesh")
+    pxr.UsdPhysics = types.SimpleNamespace(
+        CollisionAPI="CollisionAPI",
+        RigidBodyAPI="RigidBodyAPI",
+        MeshCollisionAPI=MeshCollisionAPI,
+    )
+    monkeypatch.setitem(sys.modules, "pxr", pxr)
+
+    assert audit.audit_usd_stage(Stage()) == {
+        "healthy": True,
+        "metric_name": "dynamic_triangle_mesh_collider_count",
+        "metric_value": 0,
+        "metric_limit": 0,
+        "offending_colliders": [],
+    }
+
+
+def test_usd_collider_audit_finds_rigid_body_below_collision_ancestor(monkeypatch) -> None:
+    audit = _collider_audit_module()
+
+    class Attribute:
+        def __init__(self, value):
+            self.value = value
+
+        def Get(self):
+            return self.value
+
+    class Prim:
+        def __init__(self, path, type_name, parent=None, *, collision=False, rigid_body=False):
+            self.path = path
+            self.type_name = type_name
+            self.parent = parent
+            self.collision = collision
+            self.rigid_body = rigid_body
+
+        def IsA(self, schema):
+            return schema == "Mesh" and self.type_name == "Mesh"
+
+        def HasAPI(self, api):
+            return (api == "CollisionAPI" and self.collision) or (
+                api == "RigidBodyAPI" and self.rigid_body
+            )
+
+        def GetParent(self):
+            return self.parent
+
+        def GetAttribute(self, name):
+            return Attribute(False) if name == "physics:kinematicEnabled" else None
+
+        def GetPath(self):
+            return self.path
+
+        def GetTypeName(self):
+            return self.type_name
+
+        def __bool__(self):
+            return True
+
+    collision_root = Prim("/World/collisions", "Xform")
+    rigid_body = Prim(
+        "/World/collisions/dynamic_link",
+        "Xform",
+        parent=collision_root,
+        rigid_body=True,
+    )
+    mesh = Prim(
+        "/World/collisions/dynamic_link/mesh",
+        "Mesh",
+        parent=rigid_body,
+        collision=True,
+    )
+
+    class MeshCollisionAPI:
+        def __init__(self, prim):
+            assert prim is mesh
+
+        def GetApproximationAttr(self):
+            return Attribute("none")
+
+    pxr = types.ModuleType("pxr")
+    pxr.Usd = types.SimpleNamespace(
+        PrimRange=types.SimpleNamespace(Stage=lambda stage, traversal: [mesh]),
+        TraverseInstanceProxies=lambda: "instance-proxies",
+    )
+    pxr.UsdGeom = types.SimpleNamespace(Mesh="Mesh")
+    pxr.UsdPhysics = types.SimpleNamespace(
+        CollisionAPI="CollisionAPI",
+        RigidBodyAPI="RigidBodyAPI",
+        MeshCollisionAPI=MeshCollisionAPI,
+    )
+    monkeypatch.setitem(sys.modules, "pxr", pxr)
+
+    result = audit.audit_usd_stage(object())
+
+    assert result["healthy"] is False
+    assert result["metric_value"] == 1
+    assert result["offending_colliders"][0]["usd_prim"] == str(mesh.GetPath())
+    assert result["offending_colliders"][0]["rigid_body_prim"] == str(
+        rigid_body.GetPath()
+    )
+
+
+def test_usd_collider_audit_skips_parent_only_and_disabled_physics(monkeypatch) -> None:
+    audit = _collider_audit_module()
+
+    class Attribute:
+        def __init__(self, value):
+            self.value = value
+
+        def Get(self):
+            return self.value
+
+    class Prim:
+        def __init__(
+            self,
+            path,
+            type_name,
+            parent=None,
+            *,
+            collision=False,
+            rigid_body=False,
+            collision_enabled=True,
+            rigid_body_enabled=True,
+        ):
+            self.path = path
+            self.type_name = type_name
+            self.parent = parent
+            self.collision = collision
+            self.rigid_body = rigid_body
+            self.collision_enabled = collision_enabled
+            self.rigid_body_enabled = rigid_body_enabled
+
+        def IsA(self, schema):
+            return schema == "Mesh" and self.type_name == "Mesh"
+
+        def HasAPI(self, api):
+            return (api == "CollisionAPI" and self.collision) or (
+                api == "RigidBodyAPI" and self.rigid_body
+            )
+
+        def GetParent(self):
+            return self.parent
+
+        def GetAttribute(self, name):
+            values = {
+                "physics:collisionEnabled": self.collision_enabled,
+                "physics:rigidBodyEnabled": self.rigid_body_enabled,
+                "physics:kinematicEnabled": False,
+            }
+            return Attribute(values[name]) if name in values else None
+
+        def GetPath(self):
+            return self.path
+
+        def GetTypeName(self):
+            return self.type_name
+
+        def __bool__(self):
+            return True
+
+    active_body = Prim("/World/active", "Xform", rigid_body=True)
+    disabled_body = Prim(
+        "/World/disabled-body",
+        "Xform",
+        rigid_body=True,
+        rigid_body_enabled=False,
+    )
+    parent_collision = Prim(
+        "/World/active/parent-collision",
+        "Xform",
+        parent=active_body,
+        collision=True,
+    )
+    parent_only_mesh = Prim(
+        "/World/active/parent-collision/mesh",
+        "Mesh",
+        parent=parent_collision,
+    )
+    disabled_collision_mesh = Prim(
+        "/World/active/disabled-collision",
+        "Mesh",
+        parent=active_body,
+        collision=True,
+        collision_enabled=False,
+    )
+    disabled_body_mesh = Prim(
+        "/World/disabled-body/mesh",
+        "Mesh",
+        parent=disabled_body,
+        collision=True,
+    )
+    active_mesh = Prim(
+        "/World/active/mesh",
+        "Mesh",
+        parent=active_body,
+        collision=True,
+    )
+    meshes = [
+        parent_only_mesh,
+        disabled_collision_mesh,
+        disabled_body_mesh,
+        active_mesh,
+    ]
+
+    class MeshCollisionAPI:
+        def __init__(self, prim):
+            self.prim = prim
+
+        def GetApproximationAttr(self):
+            return Attribute("none")
+
+    pxr = types.ModuleType("pxr")
+    pxr.Usd = types.SimpleNamespace(
+        PrimRange=types.SimpleNamespace(Stage=lambda stage, traversal: meshes),
+        TraverseInstanceProxies=lambda: "instance-proxies",
+    )
+    pxr.UsdGeom = types.SimpleNamespace(Mesh="Mesh")
+    pxr.UsdPhysics = types.SimpleNamespace(
+        CollisionAPI="CollisionAPI",
+        RigidBodyAPI="RigidBodyAPI",
+        MeshCollisionAPI=MeshCollisionAPI,
+    )
+    monkeypatch.setitem(sys.modules, "pxr", pxr)
+
+    result = audit.audit_usd_stage(object())
+
+    assert result["metric_value"] == 1
+    assert [item["usd_prim"] for item in result["offending_colliders"]] == [
+        "/World/active/mesh"
+    ]
+
+
+def test_collider_health_and_admission_gate_fail_closed_with_live_evidence() -> None:
+    env_source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    env_tree = ast.parse(env_source_path.read_text(encoding="utf-8"))
+    methods = {
+        node.name: node
+        for node in ast.walk(env_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"flywheel_collider_health", "flywheel_cloth_physical_health"}
+    }
+    env_module = ast.Module(
+        body=[methods["flywheel_collider_health"], methods["flywheel_cloth_physical_health"]],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(env_module)
+    collision_health = {
+        "healthy": False,
+        "reason": "unsupported_dynamic_triangle_mesh_collider",
+        "metric_name": "dynamic_triangle_mesh_collider_count",
+        "metric_value": 1,
+        "metric_limit": 0,
+        "offending_colliders": [
+            {
+                "usd_prim": "/World/Robot/link/visual_mesh",
+                "prim_type": "Mesh",
+                "approximation": "none",
+            }
+        ],
+    }
+    namespace = {"np": np, "audit_current_usd_stage": lambda: collision_health}
+    exec(compile(env_module, str(env_source_path), "exec"), namespace)
+    env = types.SimpleNamespace(_flywheel_collider_health=None)
+    env.flywheel_collider_health = types.MethodType(namespace["flywheel_collider_health"], env)
+    health = namespace["flywheel_cloth_physical_health"](env)
+    assert health is collision_health
+
+    evaluation_source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    evaluation_tree = ast.parse(evaluation_source_path.read_text(encoding="utf-8"))
+    gate = next(
+        node
+        for node in ast.walk(evaluation_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_require_flywheel_cloth_health"
+    )
+    gate_module = ast.Module(body=[gate], type_ignores=[])
+    ast.fix_missing_locations(gate_module)
+    error_type = type("SimulatorNumericalDivergenceError", (RuntimeError,), {})
+    gate_namespace = {
+        "Any": object,
+        "Mapping": Mapping,
+        "SimulatorNumericalDivergenceError": error_type,
+    }
+    exec(compile(gate_module, str(evaluation_source_path), "exec"), gate_namespace)
+
+    with __import__("pytest").raises(
+        error_type,
+        match=(
+            r"dynamic_triangle_mesh_collider_count=1 limit=0; .*"
+            r"usd_prim=/World/Robot/link/visual_mesh prim_type=Mesh approximation=none"
+        ),
+    ):
+        gate_namespace["_require_flywheel_cloth_health"](
+            types.SimpleNamespace(flywheel_cloth_physical_health=lambda: health)
+        )
+
+
+def test_collider_health_converts_a_stage_readback_error_to_fail_closed_evidence() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "flywheel_collider_health"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {
+        "audit_current_usd_stage": lambda: (_ for _ in ()).throw(
+            RuntimeError("stage readback failed")
+        )
+    }
+    exec(compile(module, str(source_path), "exec"), namespace)
+    env = types.SimpleNamespace(_flywheel_collider_health=None)
+
+    health = namespace["flywheel_collider_health"](env)
+
+    assert health == {
+        "healthy": False,
+        "reason": "collider_static_audit_unavailable",
+        "metric_name": "dynamic_triangle_mesh_collider_count",
+        "metric_value": "unavailable",
+        "metric_limit": 0,
+        "offending_colliders": [],
+    }
+
+
+def test_garment_recreation_invalidates_the_composed_stage_collider_audit() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_create_garment_object"
+    )
+    method_source = ast.get_source_segment(source, method)
+    assert method_source is not None
+    assert "self._flywheel_collider_health = None" in method_source
 
 
 def test_cpu_visible_contact_uses_the_same_authoritative_physx_readback_as_runtime_evidence() -> None:
@@ -386,12 +944,14 @@ def test_cloth_physical_health_rejects_finite_but_astronomical_state() -> None:
     exec(compile(module, str(source_path), "exec"), namespace)
 
     normal = types.SimpleNamespace(
+        flywheel_collider_health=lambda: {"healthy": True},
         _flywheel_physics_cloth_state=lambda: (
             np.asarray([[0.2, 0.1, 0.7], [0.3, 0.1, 0.7]], dtype=np.float32),
             np.zeros((2, 3), dtype=np.float32),
         )
     )
     divergent = types.SimpleNamespace(
+        flywheel_collider_health=lambda: {"healthy": True},
         _flywheel_physics_cloth_state=lambda: (
             np.asarray([[1_000_000.0, 0.0, 0.0], [0.0, 1_000_000.0, 0.0]], dtype=np.float32),
             np.asarray([[1_000_000.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32),
@@ -402,6 +962,69 @@ def test_cloth_physical_health_rejects_finite_but_astronomical_state() -> None:
     health = namespace["flywheel_cloth_physical_health"](divergent)
     assert health["healthy"] is False
     assert health["reason"] == "simulator_numerical_divergence"
+
+
+def test_cloth_physical_health_reports_every_exceeded_metric_to_the_admission_gate() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "flywheel_cloth_physical_health"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    env = types.SimpleNamespace(
+        flywheel_collider_health=lambda: {"healthy": True},
+        _flywheel_physics_cloth_state=lambda: (
+            np.asarray([[10.0, 0.0, 0.0], [-10.0, 0.0, 0.0]], dtype=np.float32),
+            np.asarray([[6.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32),
+        ),
+    )
+
+    health = namespace["flywheel_cloth_physical_health"](env)
+
+    assert health["healthy"] is False
+    assert health["exceeded_metrics"] == [
+        {"metric_name": "max_position_m", "metric_value": 10.0, "metric_limit": 2.0},
+        {"metric_name": "max_extent_m", "metric_value": 20.0, "metric_limit": 4.0},
+        {"metric_name": "max_velocity_mps", "metric_value": 6.0, "metric_limit": 5.0001},
+    ]
+
+    evaluation_source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    evaluation_tree = ast.parse(evaluation_source_path.read_text(encoding="utf-8"))
+    gate = next(
+        node
+        for node in ast.walk(evaluation_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_require_flywheel_cloth_health"
+    )
+    gate_module = ast.Module(body=[gate], type_ignores=[])
+    ast.fix_missing_locations(gate_module)
+    error_type = type("SimulatorNumericalDivergenceError", (RuntimeError,), {})
+    gate_namespace = {
+        "Any": object,
+        "Mapping": Mapping,
+        "SimulatorNumericalDivergenceError": error_type,
+    }
+    exec(compile(gate_module, str(evaluation_source_path), "exec"), gate_namespace)
+
+    with __import__("pytest").raises(
+        error_type,
+        match=(
+            r"max_position_m=10.0 limit=2.0; max_extent_m=20.0 limit=4.0; "
+            r"max_velocity_mps=6.0 limit=5.0001"
+        ),
+    ):
+        gate_namespace["_require_flywheel_cloth_health"](
+            types.SimpleNamespace(flywheel_cloth_physical_health=lambda: health)
+        )
 
 
 def test_cloth_physical_health_classifies_invalid_physx_readback_as_divergence() -> None:
@@ -422,6 +1045,7 @@ def test_cloth_physical_health_classifies_invalid_physx_readback_as_divergence()
     exec(compile(module, str(source_path), "exec"), namespace)
 
     invalid = types.SimpleNamespace(
+        flywheel_collider_health=lambda: {"healthy": True},
         _flywheel_physics_cloth_state=lambda: (_ for _ in ()).throw(
             RuntimeError("garment PhysX cloth positions and velocities must be finite")
         )
@@ -513,6 +1137,7 @@ def test_cloth_physical_health_uses_garment_specific_scale_and_reset_overrides()
     exec(compile(module, str(source_path), "exec"), namespace)
 
     env = types.SimpleNamespace(
+        flywheel_collider_health=lambda: {"healthy": True},
         _flywheel_physics_cloth_state=lambda: (
             np.asarray([[2.1, 0.0, 0.7], [2.2, 0.0, 0.7]], dtype=np.float32),
             np.zeros((2, 3), dtype=np.float32),
