@@ -1055,6 +1055,9 @@ def test_cloth_physical_health_classifies_invalid_physx_readback_as_divergence()
     assert health == {
         "healthy": False,
         "reason": "simulator_numerical_divergence",
+        "metric_name": "cloth_state_readback",
+        "metric_value": "garment PhysX cloth positions and velocities must be finite",
+        "metric_limit": "finite_aligned_nx3",
     }
 
 

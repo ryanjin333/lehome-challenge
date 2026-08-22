@@ -881,8 +881,14 @@ class GarmentEnv(DirectRLEnv):
 
         try:
             positions, velocities = self._flywheel_physics_cloth_state()
-        except (RuntimeError, TypeError, ValueError):
-            return {"healthy": False, "reason": "simulator_numerical_divergence"}
+        except (RuntimeError, TypeError, ValueError) as error:
+            return {
+                "healthy": False,
+                "reason": "simulator_numerical_divergence",
+                "metric_name": "cloth_state_readback",
+                "metric_value": str(error) or type(error).__name__,
+                "metric_limit": "finite_aligned_nx3",
+            }
         if not np.isfinite(positions).all() or not np.isfinite(velocities).all():
             return {"healthy": False, "reason": "simulator_numerical_divergence"}
 
