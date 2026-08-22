@@ -33,9 +33,24 @@ from lehome.flywheel.persistent_worker import SimulatorNumericalDivergenceError
 
 logger = get_logger(__name__)
 
+_FLYWHEEL_POLICY_ACTION_JOINT_NAMES = (
+    "left_shoulder_pan",
+    "left_shoulder_lift",
+    "left_elbow_flex",
+    "left_wrist_flex",
+    "left_wrist_roll",
+    "left_gripper",
+    "right_shoulder_pan",
+    "right_shoulder_lift",
+    "right_elbow_flex",
+    "right_wrist_flex",
+    "right_wrist_roll",
+    "right_gripper",
+)
+
 
 def _flywheel_policy_action_limit_diagnostics(env: Any, action: Any) -> dict[str, object]:
-    """Return bounded counts for the target sent to the live articulations."""
+    """Return bounded target-limit and live-position diagnostics for flywheel steps."""
 
     def numpy_array(value: Any) -> np.ndarray:
         detach = getattr(value, "detach", None)
@@ -53,24 +68,55 @@ def _flywheel_policy_action_limit_diagnostics(env: Any, action: Any) -> dict[str
         values = numpy_array(action)
         left_limits = numpy_array(env.left_arm.data.soft_joint_pos_limits)
         right_limits = numpy_array(env.right_arm.data.soft_joint_pos_limits)
+        left_positions = numpy_array(env.left_arm.data.joint_pos)
+        right_positions = numpy_array(env.right_arm.data.joint_pos)
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return {"policy_action_limits_available": False}
     if (
         values.shape != (1, 12)
         or left_limits.shape != (1, 6, 2)
         or right_limits.shape != (1, 6, 2)
+        or left_positions.shape != (1, 6)
+        or right_positions.shape != (1, 6)
     ):
         return {"policy_action_limits_available": False}
     limits = np.concatenate((left_limits[0], right_limits[0]), axis=0)
+    positions = np.concatenate((left_positions[0], right_positions[0]), axis=0)
+    if (
+        not np.isfinite(limits).all()
+        or not np.isfinite(positions).all()
+        or np.any(limits[:, 0] > limits[:, 1])
+    ):
+        return {"policy_action_limits_available": False}
     finite = np.isfinite(values[0])
     outside = finite & (
         (values[0] < limits[:, 0]) | (values[0] > limits[:, 1])
     )
+    joint_diagnostics: dict[str, dict[str, bool | float]] = {}
+    for index, joint_name in enumerate(_FLYWHEEL_POLICY_ACTION_JOINT_NAMES):
+        target_finite = bool(finite[index])
+        if target_finite:
+            violation = max(
+                float(limits[index, 0] - values[0, index]),
+                float(values[0, index] - limits[index, 1]),
+                0.0,
+            )
+            target_to_live_delta = abs(float(values[0, index] - positions[index]))
+        else:
+            violation = 0.0
+            target_to_live_delta = 0.0
+        joint_diagnostics[joint_name] = {
+            "target_finite": target_finite,
+            "outside_live_joint_limit": bool(outside[index]),
+            "limit_violation_rad": round(violation, 8),
+            "target_to_live_joint_position_delta_rad": round(target_to_live_delta, 8),
+        }
     return {
         "policy_action_limits_available": True,
         "policy_action_dimension": 12,
         "policy_action_nonfinite_count": int((~finite).sum()),
         "policy_action_outside_live_joint_limit_count": int(outside.sum()),
+        "policy_action_joint_diagnostics": joint_diagnostics,
     }
 
 
@@ -138,10 +184,45 @@ def _require_flywheel_cloth_health(
                 "policy_action_outside_live_joint_limit_count",
                 "policy_action_steps_outside_live_joint_limits",
                 "policy_action_max_outside_live_joint_limit_count",
+                "policy_action_total_steps",
             ):
                 value = policy_action_diagnostics.get(field)
                 if type(value) is int and value >= 0:
                     evidence.append(f"{field}={value}")
+            outside_steps = policy_action_diagnostics.get(
+                "policy_action_outside_live_joint_limit_step_counts"
+            )
+            max_violation = policy_action_diagnostics.get(
+                "policy_action_max_limit_violation_rad"
+            )
+            max_delta = policy_action_diagnostics.get(
+                "policy_action_max_target_to_live_joint_position_delta_rad"
+            )
+            if all(isinstance(values, Mapping) for values in (outside_steps, max_violation, max_delta)):
+                joint_evidence: list[str] = []
+                for joint_name in _FLYWHEEL_POLICY_ACTION_JOINT_NAMES:
+                    outside_step_count = outside_steps.get(joint_name)
+                    violation = max_violation.get(joint_name)
+                    delta = max_delta.get(joint_name)
+                    if (
+                        type(outside_step_count) is not int
+                        or outside_step_count < 0
+                        or type(violation) is not float
+                        or not float("-inf") < violation < float("inf")
+                        or type(delta) is not float
+                        or not float("-inf") < delta < float("inf")
+                    ):
+                        joint_evidence = []
+                        break
+                    joint_evidence.append(
+                        f"{joint_name}(outside_steps={outside_step_count},"
+                        f"max_violation_rad={violation},"
+                        f"max_target_to_live_joint_position_delta_rad={delta})"
+                    )
+                if joint_evidence:
+                    evidence.append(
+                        "policy_action_joint_summary=" + ",".join(joint_evidence)
+                    )
         diagnostic_suffix = f" ({'; '.join(evidence)})" if evidence else ""
         raise SimulatorNumericalDivergenceError(
             f"{reason}: cloth physical-health admission failed{diagnostic_suffix}"
@@ -842,6 +923,10 @@ def run_evaluation_loop(
         visible_contact = None
         policy_action_steps_outside_live_joint_limits = 0
         policy_action_max_outside_live_joint_limit_count = 0
+        policy_action_total_steps = 0
+        policy_action_outside_live_joint_limit_step_counts: dict[str, int] = {}
+        policy_action_max_limit_violation_rad: dict[str, float] = {}
+        policy_action_max_target_to_live_joint_position_delta_rad: dict[str, float] = {}
 
         for st in range(args.max_steps):
             if cancellation_event is not None and cancellation_event.is_set():
@@ -885,6 +970,7 @@ def run_evaluation_loop(
             policy_action_diagnostics = None
             if recorder is not None:
                 policy_action_diagnostics = _flywheel_policy_action_limit_diagnostics(env, action)
+                policy_action_total_steps += 1
                 if policy_action_diagnostics.get("policy_action_limits_available") is True:
                     outside_count = policy_action_diagnostics.get(
                         "policy_action_outside_live_joint_limit_count"
@@ -896,6 +982,52 @@ def run_evaluation_loop(
                             policy_action_max_outside_live_joint_limit_count,
                             outside_count,
                         )
+                    joint_diagnostics = policy_action_diagnostics.get(
+                        "policy_action_joint_diagnostics"
+                    )
+                    if isinstance(joint_diagnostics, Mapping):
+                        for joint_name, joint_diagnostic in joint_diagnostics.items():
+                            if not isinstance(joint_diagnostic, Mapping):
+                                continue
+                            target_finite = joint_diagnostic.get("target_finite")
+                            outside_limit = joint_diagnostic.get(
+                                "outside_live_joint_limit"
+                            )
+                            violation = joint_diagnostic.get("limit_violation_rad")
+                            delta = joint_diagnostic.get(
+                                "target_to_live_joint_position_delta_rad"
+                            )
+                            policy_action_outside_live_joint_limit_step_counts.setdefault(
+                                joint_name, 0
+                            )
+                            policy_action_max_limit_violation_rad.setdefault(
+                                joint_name, 0.0
+                            )
+                            policy_action_max_target_to_live_joint_position_delta_rad.setdefault(
+                                joint_name, 0.0
+                            )
+                            if (
+                                target_finite is not True
+                                or type(outside_limit) is not bool
+                                or type(violation) is not float
+                                or type(delta) is not float
+                            ):
+                                continue
+                            if outside_limit:
+                                policy_action_outside_live_joint_limit_step_counts[
+                                    joint_name
+                                ] += 1
+                            policy_action_max_limit_violation_rad[joint_name] = max(
+                                policy_action_max_limit_violation_rad[joint_name], violation
+                            )
+                            policy_action_max_target_to_live_joint_position_delta_rad[
+                                joint_name
+                            ] = max(
+                                policy_action_max_target_to_live_joint_position_delta_rad[
+                                    joint_name
+                                ],
+                                delta,
+                            )
                     policy_action_diagnostics = {
                         **policy_action_diagnostics,
                         "policy_action_steps_outside_live_joint_limits": (
@@ -903,6 +1035,30 @@ def run_evaluation_loop(
                         ),
                         "policy_action_max_outside_live_joint_limit_count": (
                             policy_action_max_outside_live_joint_limit_count
+                        ),
+                        "policy_action_total_steps": policy_action_total_steps,
+                        "policy_action_outside_live_joint_limit_step_counts": (
+                            policy_action_outside_live_joint_limit_step_counts
+                        ),
+                        "policy_action_max_limit_violation_rad": (
+                            policy_action_max_limit_violation_rad
+                        ),
+                        "policy_action_max_target_to_live_joint_position_delta_rad": (
+                            policy_action_max_target_to_live_joint_position_delta_rad
+                        ),
+                    }
+                else:
+                    policy_action_diagnostics = {
+                        **policy_action_diagnostics,
+                        "policy_action_total_steps": policy_action_total_steps,
+                        "policy_action_outside_live_joint_limit_step_counts": (
+                            policy_action_outside_live_joint_limit_step_counts
+                        ),
+                        "policy_action_max_limit_violation_rad": (
+                            policy_action_max_limit_violation_rad
+                        ),
+                        "policy_action_max_target_to_live_joint_position_delta_rad": (
+                            policy_action_max_target_to_live_joint_position_delta_rad
                         ),
                     }
             env.step(action)

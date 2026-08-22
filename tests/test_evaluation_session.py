@@ -691,6 +691,12 @@ def test_collider_health_and_admission_gate_fail_closed_with_live_evidence() -> 
         "Any": object,
         "Mapping": Mapping,
         "SimulatorNumericalDivergenceError": error_type,
+        "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES": (
+            "left_shoulder_pan", "left_shoulder_lift", "left_elbow_flex",
+            "left_wrist_flex", "left_wrist_roll", "left_gripper",
+            "right_shoulder_pan", "right_shoulder_lift", "right_elbow_flex",
+            "right_wrist_flex", "right_wrist_roll", "right_gripper",
+        ),
     }
     exec(compile(gate_module, str(evaluation_source_path), "exec"), gate_namespace)
 
@@ -1628,6 +1634,12 @@ def test_cloth_physical_health_reports_every_exceeded_metric_to_the_admission_ga
         "Any": object,
         "Mapping": Mapping,
         "SimulatorNumericalDivergenceError": error_type,
+        "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES": (
+            "left_shoulder_pan", "left_shoulder_lift", "left_elbow_flex",
+            "left_wrist_flex", "left_wrist_roll", "left_gripper",
+            "right_shoulder_pan", "right_shoulder_lift", "right_elbow_flex",
+            "right_wrist_flex", "right_wrist_roll", "right_gripper",
+        ),
     }
     exec(compile(gate_module, str(evaluation_source_path), "exec"), gate_namespace)
 
@@ -2356,7 +2368,17 @@ def test_policy_action_diagnostics_count_only_nonfinite_and_live_limit_violation
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name == "_flywheel_policy_action_limit_diagnostics"
     )
-    module = ast.Module(body=[helper], type_ignores=[])
+    joint_names = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES"
+            for target in node.targets
+        )
+    )
+    module = ast.Module(body=[joint_names, helper], type_ignores=[])
     ast.fix_missing_locations(module)
     namespace = {"Any": object, "np": np}
     exec(compile(module, str(source_path), "exec"), namespace)
@@ -2379,22 +2401,370 @@ def test_policy_action_diagnostics_count_only_nonfinite_and_live_limit_violation
     )
     env = types.SimpleNamespace(
         left_arm=types.SimpleNamespace(
-            data=types.SimpleNamespace(soft_joint_pos_limits=TensorLike(limits))
+            data=types.SimpleNamespace(
+                soft_joint_pos_limits=TensorLike(limits),
+                joint_pos=TensorLike(np.zeros((1, 6), dtype=np.float32)),
+            )
         ),
         right_arm=types.SimpleNamespace(
-            data=types.SimpleNamespace(soft_joint_pos_limits=TensorLike(limits))
+            data=types.SimpleNamespace(
+                soft_joint_pos_limits=TensorLike(limits),
+                joint_pos=TensorLike(np.zeros((1, 6), dtype=np.float32)),
+            )
         ),
     )
     action = TensorLike(
         [[-1.5, -1.0, 0.0, 1.0, 1.5, np.nan, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
     )
 
-    assert namespace["_flywheel_policy_action_limit_diagnostics"](env, action) == {
+    diagnostics = namespace["_flywheel_policy_action_limit_diagnostics"](env, action)
+    assert {
+        key: diagnostics[key]
+        for key in (
+            "policy_action_limits_available",
+            "policy_action_dimension",
+            "policy_action_nonfinite_count",
+            "policy_action_outside_live_joint_limit_count",
+        )
+    } == {
         "policy_action_limits_available": True,
         "policy_action_dimension": 12,
         "policy_action_nonfinite_count": 1,
         "policy_action_outside_live_joint_limit_count": 2,
     }
+    assert diagnostics["policy_action_joint_diagnostics"]["left_gripper"] == {
+        "target_finite": False,
+        "outside_live_joint_limit": False,
+        "limit_violation_rad": 0.0,
+        "target_to_live_joint_position_delta_rad": 0.0,
+    }
+
+
+def test_policy_action_diagnostics_label_every_joint_with_limit_and_live_delta() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    helper = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_flywheel_policy_action_limit_diagnostics"
+    )
+    joint_names = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES"
+            for target in node.targets
+        )
+    )
+    module = ast.Module(body=[joint_names, helper], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"Any": object, "np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    class TensorLike:
+        def __init__(self, values):
+            self.values = np.asarray(values, dtype=np.float32)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.values
+
+    limits = np.repeat(
+        np.asarray([[[-1.0, 1.0]]], dtype=np.float32), repeats=6, axis=1
+    )
+    env = types.SimpleNamespace(
+        left_arm=types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                soft_joint_pos_limits=TensorLike(limits),
+                joint_pos=TensorLike([[0.2, -0.2, 0.0, 0.3, -0.4, 0.5]]),
+            )
+        ),
+        right_arm=types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                soft_joint_pos_limits=TensorLike(limits),
+                joint_pos=TensorLike([[-0.5, 0.4, -0.3, 0.2, -0.1, 0.0]]),
+            )
+        ),
+    )
+    action = TensorLike(
+        [[-1.25, -0.2, 0.0, 0.3, 1.5, 0.5, -0.5, 0.4, -0.3, 0.2, -0.1, 0.0]]
+    )
+
+    diagnostics = namespace["_flywheel_policy_action_limit_diagnostics"](env, action)
+
+    assert diagnostics["policy_action_joint_diagnostics"] == {
+        "left_shoulder_pan": {
+            "target_finite": True,
+            "outside_live_joint_limit": True,
+            "limit_violation_rad": 0.25,
+            "target_to_live_joint_position_delta_rad": 1.45000005,
+        },
+        "left_shoulder_lift": {
+            "target_finite": True,
+            "outside_live_joint_limit": False,
+            "limit_violation_rad": 0.0,
+            "target_to_live_joint_position_delta_rad": 0.0,
+        },
+        "left_elbow_flex": {
+            "target_finite": True,
+            "outside_live_joint_limit": False,
+            "limit_violation_rad": 0.0,
+            "target_to_live_joint_position_delta_rad": 0.0,
+        },
+        "left_wrist_flex": {
+            "target_finite": True,
+            "outside_live_joint_limit": False,
+            "limit_violation_rad": 0.0,
+            "target_to_live_joint_position_delta_rad": 0.0,
+        },
+        "left_wrist_roll": {
+            "target_finite": True,
+            "outside_live_joint_limit": True,
+            "limit_violation_rad": 0.5,
+            "target_to_live_joint_position_delta_rad": 1.89999998,
+        },
+        "left_gripper": {
+            "target_finite": True,
+            "outside_live_joint_limit": False,
+            "limit_violation_rad": 0.0,
+            "target_to_live_joint_position_delta_rad": 0.0,
+        },
+        "right_shoulder_pan": {
+            "target_finite": True,
+            "outside_live_joint_limit": False,
+            "limit_violation_rad": 0.0,
+            "target_to_live_joint_position_delta_rad": 0.0,
+        },
+        "right_shoulder_lift": {
+            "target_finite": True,
+            "outside_live_joint_limit": False,
+            "limit_violation_rad": 0.0,
+            "target_to_live_joint_position_delta_rad": 0.0,
+        },
+        "right_elbow_flex": {
+            "target_finite": True,
+            "outside_live_joint_limit": False,
+            "limit_violation_rad": 0.0,
+            "target_to_live_joint_position_delta_rad": 0.0,
+        },
+        "right_wrist_flex": {
+            "target_finite": True,
+            "outside_live_joint_limit": False,
+            "limit_violation_rad": 0.0,
+            "target_to_live_joint_position_delta_rad": 0.0,
+        },
+        "right_wrist_roll": {
+            "target_finite": True,
+            "outside_live_joint_limit": False,
+            "limit_violation_rad": 0.0,
+            "target_to_live_joint_position_delta_rad": 0.0,
+        },
+        "right_gripper": {
+            "target_finite": True,
+            "outside_live_joint_limit": False,
+            "limit_violation_rad": 0.0,
+            "target_to_live_joint_position_delta_rad": 0.0,
+        },
+    }
+
+
+def test_policy_action_diagnostics_use_one_canonical_semantic_joint_order() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    constant = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES"
+            for target in node.targets
+        )
+    )
+    assert ast.literal_eval(constant.value) == (
+        "left_shoulder_pan",
+        "left_shoulder_lift",
+        "left_elbow_flex",
+        "left_wrist_flex",
+        "left_wrist_roll",
+        "left_gripper",
+        "right_shoulder_pan",
+        "right_shoulder_lift",
+        "right_elbow_flex",
+        "right_wrist_flex",
+        "right_wrist_roll",
+        "right_gripper",
+    )
+    for function_name in (
+        "_flywheel_policy_action_limit_diagnostics",
+        "_require_flywheel_cloth_health",
+    ):
+        function = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == function_name
+        )
+        assert "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES" in ast.get_source_segment(source, function)
+
+
+def test_policy_action_diagnostics_fail_closed_for_nonfinite_live_position() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    helper = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_flywheel_policy_action_limit_diagnostics"
+    )
+    joint_names = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES"
+            for target in node.targets
+        )
+    )
+    module = ast.Module(body=[joint_names, helper], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"Any": object, "np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    env = types.SimpleNamespace(
+        left_arm=types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                soft_joint_pos_limits=np.zeros((1, 6, 2), dtype=np.float32),
+                joint_pos=np.zeros((1, 6), dtype=np.float32),
+            )
+        ),
+        right_arm=types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                soft_joint_pos_limits=np.zeros((1, 6, 2), dtype=np.float32),
+                joint_pos=np.asarray([[0.0, 0.0, 0.0, np.nan, 0.0, 0.0]], dtype=np.float32),
+            )
+        ),
+    )
+
+    assert namespace["_flywheel_policy_action_limit_diagnostics"](
+        env, np.zeros((1, 12), dtype=np.float32)
+    ) == {"policy_action_limits_available": False}
+
+
+def test_nonfinite_policy_target_keeps_all_cumulative_joint_keys_and_summary() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    constant = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES"
+            for target in node.targets
+        )
+    )
+    helper = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_flywheel_policy_action_limit_diagnostics"
+    )
+    gate = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_require_flywheel_cloth_health"
+    )
+    module = ast.Module(body=[constant, helper, gate], type_ignores=[])
+    ast.fix_missing_locations(module)
+    error_type = type("SimulatorNumericalDivergenceError", (RuntimeError,), {})
+    namespace = {
+        "Any": object,
+        "Mapping": Mapping,
+        "SimulatorNumericalDivergenceError": error_type,
+        "np": np,
+    }
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    limits = np.repeat(
+        np.asarray([[[-1.0, 1.0]]], dtype=np.float32), repeats=6, axis=1
+    )
+    env = types.SimpleNamespace(
+        left_arm=types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                soft_joint_pos_limits=limits,
+                joint_pos=np.zeros((1, 6), dtype=np.float32),
+            )
+        ),
+        right_arm=types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                soft_joint_pos_limits=limits,
+                joint_pos=np.zeros((1, 6), dtype=np.float32),
+            )
+        ),
+    )
+    step = namespace["_flywheel_policy_action_limit_diagnostics"](
+        env,
+        np.asarray(
+            [[0.0, 0.0, 0.0, 0.0, 0.0, np.nan, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+            dtype=np.float32,
+        ),
+    )
+    joints = step["policy_action_joint_diagnostics"]
+    assert joints["left_gripper"]["target_finite"] is False
+    assert step["policy_action_nonfinite_count"] == 1
+    cumulative_counts = {joint_name: 0 for joint_name in joints}
+    cumulative_violation = {
+        joint_name: 0.0 for joint_name in joints
+    }
+    cumulative_delta = {joint_name: 0.0 for joint_name in joints}
+
+    with __import__("pytest").raises(error_type) as raised:
+        namespace["_require_flywheel_cloth_health"](
+            types.SimpleNamespace(
+                flywheel_cloth_physical_health=lambda: {
+                    "healthy": False,
+                    "reason": "simulator_numerical_divergence",
+                }
+            ),
+            policy_action_diagnostics={
+                **step,
+                "policy_action_total_steps": 1,
+                "policy_action_outside_live_joint_limit_step_counts": cumulative_counts,
+                "policy_action_max_limit_violation_rad": cumulative_violation,
+                "policy_action_max_target_to_live_joint_position_delta_rad": cumulative_delta,
+            },
+        )
+
+    message = str(raised.value)
+    for joint_name in joints:
+        assert f"{joint_name}(outside_steps=0,max_violation_rad=0.0," in message
+
+    loop = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "run_evaluation_loop"
+    )
+    loop_source = ast.get_source_segment(source, loop)
+    assert loop_source is not None
+    assert loop_source.index("policy_action_outside_live_joint_limit_step_counts.setdefault") < loop_source.index(
+        "target_finite is not True"
+    )
 
 
 def test_cloth_failure_includes_bounded_policy_action_history_without_coordinates() -> None:
@@ -2414,6 +2784,12 @@ def test_cloth_failure_includes_bounded_policy_action_history_without_coordinate
         "Any": object,
         "Mapping": Mapping,
         "SimulatorNumericalDivergenceError": error_type,
+        "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES": (
+            "left_shoulder_pan", "left_shoulder_lift", "left_elbow_flex",
+            "left_wrist_flex", "left_wrist_roll", "left_gripper",
+            "right_shoulder_pan", "right_shoulder_lift", "right_elbow_flex",
+            "right_wrist_flex", "right_wrist_roll", "right_gripper",
+        ),
     }
     exec(compile(module, str(source_path), "exec"), namespace)
     diagnostics = {
@@ -2423,6 +2799,49 @@ def test_cloth_failure_includes_bounded_policy_action_history_without_coordinate
         "policy_action_outside_live_joint_limit_count": 3,
         "policy_action_steps_outside_live_joint_limits": 2,
         "policy_action_max_outside_live_joint_limit_count": 4,
+        "policy_action_total_steps": 7,
+        "policy_action_outside_live_joint_limit_step_counts": {
+            "left_shoulder_pan": 2,
+            "left_shoulder_lift": 0,
+            "left_elbow_flex": 0,
+            "left_wrist_flex": 0,
+            "left_wrist_roll": 1,
+            "left_gripper": 0,
+            "right_shoulder_pan": 0,
+            "right_shoulder_lift": 0,
+            "right_elbow_flex": 0,
+            "right_wrist_flex": 0,
+            "right_wrist_roll": 0,
+            "right_gripper": 0,
+        },
+        "policy_action_max_limit_violation_rad": {
+            "left_shoulder_pan": 0.25,
+            "left_shoulder_lift": 0.0,
+            "left_elbow_flex": 0.0,
+            "left_wrist_flex": 0.0,
+            "left_wrist_roll": 0.5,
+            "left_gripper": 0.0,
+            "right_shoulder_pan": 0.0,
+            "right_shoulder_lift": 0.0,
+            "right_elbow_flex": 0.0,
+            "right_wrist_flex": 0.0,
+            "right_wrist_roll": 0.0,
+            "right_gripper": 0.0,
+        },
+        "policy_action_max_target_to_live_joint_position_delta_rad": {
+            "left_shoulder_pan": 1.45,
+            "left_shoulder_lift": 0.0,
+            "left_elbow_flex": 0.0,
+            "left_wrist_flex": 0.0,
+            "left_wrist_roll": 1.9,
+            "left_gripper": 0.0,
+            "right_shoulder_pan": 0.0,
+            "right_shoulder_lift": 0.0,
+            "right_elbow_flex": 0.0,
+            "right_wrist_flex": 0.0,
+            "right_wrist_roll": 0.0,
+            "right_gripper": 0.0,
+        },
     }
 
     with __import__("pytest").raises(
@@ -2431,7 +2850,33 @@ def test_cloth_failure_includes_bounded_policy_action_history_without_coordinate
             r"policy_action_nonfinite_count=0; "
             r"policy_action_outside_live_joint_limit_count=3; "
             r"policy_action_steps_outside_live_joint_limits=2; "
-            r"policy_action_max_outside_live_joint_limit_count=4"
+            r"policy_action_max_outside_live_joint_limit_count=4; "
+            r"policy_action_total_steps=7; "
+            r"policy_action_joint_summary="
+            r"left_shoulder_pan\(outside_steps=2,max_violation_rad=0.25,"
+            r"max_target_to_live_joint_position_delta_rad=1.45\),"
+            r"left_shoulder_lift\(outside_steps=0,max_violation_rad=0.0,"
+            r"max_target_to_live_joint_position_delta_rad=0.0\),"
+            r"left_elbow_flex\(outside_steps=0,max_violation_rad=0.0,"
+            r"max_target_to_live_joint_position_delta_rad=0.0\),"
+            r"left_wrist_flex\(outside_steps=0,max_violation_rad=0.0,"
+            r"max_target_to_live_joint_position_delta_rad=0.0\),"
+            r"left_wrist_roll\(outside_steps=1,max_violation_rad=0.5,"
+            r"max_target_to_live_joint_position_delta_rad=1.9\),"
+            r"left_gripper\(outside_steps=0,max_violation_rad=0.0,"
+            r"max_target_to_live_joint_position_delta_rad=0.0\),"
+            r"right_shoulder_pan\(outside_steps=0,max_violation_rad=0.0,"
+            r"max_target_to_live_joint_position_delta_rad=0.0\),"
+            r"right_shoulder_lift\(outside_steps=0,max_violation_rad=0.0,"
+            r"max_target_to_live_joint_position_delta_rad=0.0\),"
+            r"right_elbow_flex\(outside_steps=0,max_violation_rad=0.0,"
+            r"max_target_to_live_joint_position_delta_rad=0.0\),"
+            r"right_wrist_flex\(outside_steps=0,max_violation_rad=0.0,"
+            r"max_target_to_live_joint_position_delta_rad=0.0\),"
+            r"right_wrist_roll\(outside_steps=0,max_violation_rad=0.0,"
+            r"max_target_to_live_joint_position_delta_rad=0.0\),"
+            r"right_gripper\(outside_steps=0,max_violation_rad=0.0,"
+            r"max_target_to_live_joint_position_delta_rad=0.0\)"
         ),
     ) as raised:
         namespace["_require_flywheel_cloth_health"](
@@ -2467,6 +2912,60 @@ def test_policy_action_diagnostics_are_sampled_before_each_step_and_bound_to_hea
     assert diagnostic_index < step_index < health_index
 
 
+def test_policy_action_diagnostics_accumulate_exact_per_joint_cumulative_fields() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    loop = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "run_evaluation_loop"
+    )
+    loop_source = ast.get_source_segment(source, loop)
+    assert loop_source is not None
+
+    for field in (
+        "policy_action_total_steps",
+        "policy_action_outside_live_joint_limit_step_counts",
+        "policy_action_max_limit_violation_rad",
+        "policy_action_max_target_to_live_joint_position_delta_rad",
+    ):
+        assert field in loop_source
+
+
+def test_policy_action_diagnostics_keep_prior_cumulative_evidence_after_unavailable_step() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    loop = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "run_evaluation_loop"
+    )
+    unavailable_branch = next(
+        node
+        for node in ast.walk(loop)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and "policy_action_limits_available" in ast.unparse(node.test)
+        and node.orelse
+    )
+    unavailable_source = "\n".join(
+        ast.get_source_segment(source, statement) or ""
+        for statement in unavailable_branch.orelse
+    )
+
+    for field in (
+        "policy_action_total_steps",
+        "policy_action_outside_live_joint_limit_step_counts",
+        "policy_action_max_limit_violation_rad",
+        "policy_action_max_target_to_live_joint_position_delta_rad",
+    ):
+        assert field in unavailable_source
+
+
 def test_cloth_failure_reports_when_live_policy_limits_are_unavailable() -> None:
     source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
     source = source_path.read_text(encoding="utf-8")
@@ -2484,6 +2983,12 @@ def test_cloth_failure_reports_when_live_policy_limits_are_unavailable() -> None
         "Any": object,
         "Mapping": Mapping,
         "SimulatorNumericalDivergenceError": error_type,
+        "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES": (
+            "left_shoulder_pan", "left_shoulder_lift", "left_elbow_flex",
+            "left_wrist_flex", "left_wrist_roll", "left_gripper",
+            "right_shoulder_pan", "right_shoulder_lift", "right_elbow_flex",
+            "right_wrist_flex", "right_wrist_roll", "right_gripper",
+        ),
     }
     exec(compile(module, str(source_path), "exec"), namespace)
 
