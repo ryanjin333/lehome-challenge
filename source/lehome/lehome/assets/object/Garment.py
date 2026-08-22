@@ -18,11 +18,15 @@ from isaacsim.core.utils.rotations import euler_angles_to_quat, quat_to_rot_matr
 from isaacsim.core.simulation_manager import SimulationManager
 from pxr import Vt
 
+from lehome.flywheel.persistent_worker import SimulatorNumericalDivergenceError
 from lehome.utils.logger import get_logger
 
 # Create logger at module level using unified logger utility
 # Will use global log file name if set, otherwise use default
 logger = get_logger(__name__)
+
+
+_PHYSX_RESET_READBACK_ATOL = 1e-6
 
 
 class GarmentObject(SingleClothPrim):
@@ -402,19 +406,137 @@ class GarmentObject(SingleClothPrim):
             raise RuntimeError("garment PhysX cloth view failed to initialize")
         return cloth
 
+    @staticmethod
+    def _state_as_numpy(value):
+        """Read either a torch-backed Isaac state or a CPU test state."""
+
+        return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+
+    @staticmethod
+    def _state_like(reference, values):
+        """Return ``values`` in the backend/device expected by the PhysX view."""
+
+        if isinstance(reference, torch.Tensor):
+            return torch.as_tensor(values, dtype=reference.dtype, device=reference.device)
+        return np.asarray(values, dtype=np.asarray(reference).dtype)
+
+    @staticmethod
+    def _transform_world_particle_positions(
+        points, initial_position, initial_orientation, target_position, target_orientation
+    ):
+        """Apply a root rigid-transform delta to world-space cloth particles."""
+
+        points_array = np.asarray(points)
+        if points_array.shape[-1:] != (3,):
+            raise SimulatorNumericalDivergenceError(
+                "garment world particle positions must end in xyz"
+            )
+        initial_position_array = np.asarray(initial_position, dtype=np.float64).reshape(-1)
+        target_position_array = np.asarray(target_position, dtype=np.float64).reshape(-1)
+        if initial_position_array.shape != (3,) or target_position_array.shape != (3,):
+            raise SimulatorNumericalDivergenceError("garment root positions must be xyz")
+        initial_rotation = np.asarray(quat_to_rot_matrix(initial_orientation), dtype=np.float64)
+        target_rotation = np.asarray(quat_to_rot_matrix(target_orientation), dtype=np.float64)
+        if initial_rotation.shape != (3, 3) or target_rotation.shape != (3, 3):
+            raise SimulatorNumericalDivergenceError(
+                "garment root orientations must be rigid rotations"
+            )
+        delta_rotation = target_rotation @ initial_rotation.T
+        transformed = (
+            (points_array.reshape(-1, 3) - initial_position_array) @ delta_rotation.T
+            + target_position_array
+        )
+        return transformed.reshape(points_array.shape).astype(points_array.dtype, copy=False)
+
+    @staticmethod
+    def _root_pose_matches(actual_position, actual_orientation, target_position, target_orientation) -> bool:
+        actual_position_array = GarmentObject._state_as_numpy(actual_position).reshape(-1)
+        actual_orientation_array = GarmentObject._state_as_numpy(actual_orientation).reshape(-1)
+        target_position_array = GarmentObject._state_as_numpy(target_position).reshape(-1)
+        target_orientation_array = GarmentObject._state_as_numpy(target_orientation).reshape(-1)
+        return bool(
+            np.allclose(actual_position_array, target_position_array, rtol=0.0, atol=_PHYSX_RESET_READBACK_ATOL)
+            and (
+                np.allclose(actual_orientation_array, target_orientation_array, rtol=0.0, atol=_PHYSX_RESET_READBACK_ATOL)
+                or np.allclose(actual_orientation_array, -target_orientation_array, rtol=0.0, atol=_PHYSX_RESET_READBACK_ATOL)
+            )
+        )
+
+    def _restore_world_particle_state(self, target_position, target_orientation) -> None:
+        """Restore the reset state in one coherent world frame and prove it stuck."""
+
+        try:
+            target_positions = self._transform_world_particle_positions(
+                self._state_as_numpy(self.initial_points_positions),
+                self._state_as_numpy(self.initial_root_position),
+                self._state_as_numpy(self.initial_root_orientation),
+                self._state_as_numpy(target_position),
+                self._state_as_numpy(target_orientation),
+            )
+            expected_positions = self._state_like(
+                self.initial_points_positions, target_positions
+            )
+            expected_velocities = (
+                torch.zeros_like(self.initial_points_velocities)
+                if isinstance(self.initial_points_velocities, torch.Tensor)
+                else np.zeros_like(self.initial_points_velocities)
+            )
+        except SimulatorNumericalDivergenceError:
+            raise
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise SimulatorNumericalDivergenceError(
+                "garment PhysX reset source state is invalid"
+            ) from error
+
+        # PhysX particle state is world-space. Set the root first, then write
+        # the transformed particles so a parent teleport cannot invalidate the
+        # solver state that was just restored.
+        try:
+            self.set_world_pose(target_position, target_orientation)
+            actual_root_position, actual_root_orientation = self.get_world_pose()
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise SimulatorNumericalDivergenceError(
+                "garment root pose write readback failed"
+            ) from error
+        if not self._root_pose_matches(
+            actual_root_position, actual_root_orientation, target_position, target_orientation
+        ):
+            raise SimulatorNumericalDivergenceError(
+                "garment root pose write readback mismatch"
+            )
+
+        try:
+            cloth = self._ensure_physics_cloth_view()
+            cloth.set_world_positions(expected_positions)
+            cloth.set_velocities(expected_velocities)
+            observed_positions = self._state_as_numpy(cloth.get_world_positions())
+            observed_velocities = self._state_as_numpy(cloth.get_velocities())
+            readback_matches = np.allclose(
+                observed_positions,
+                self._state_as_numpy(expected_positions),
+                rtol=0.0,
+                atol=_PHYSX_RESET_READBACK_ATOL,
+            ) and np.allclose(
+                observed_velocities,
+                self._state_as_numpy(expected_velocities),
+                rtol=0.0,
+                atol=_PHYSX_RESET_READBACK_ATOL,
+            )
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise SimulatorNumericalDivergenceError(
+                "garment PhysX reset write readback failed"
+            ) from error
+        if not readback_matches:
+            raise SimulatorNumericalDivergenceError(
+                "garment PhysX reset write readback mismatch"
+            )
+
     def reset(self):
         """
         Perform soft reset by randomly modifying the object's position and orientation.
         Meanwhile, return back to the initial positions of all particles that make up the object.
         """
         logger.debug("[GarmentObject] Performing soft reset")
-        # Reset the same live PhysX state used by controlled-recovery capture
-        # and restore. Authoring USD ``points`` after simulation starts does
-        # not reset the live solver particles.
-        cloth = self._ensure_physics_cloth_view()
-        cloth.set_world_positions(self.initial_points_positions)
-        cloth.set_velocities(self.initial_points_velocities)
-
         # Get position range from configuration
         pos_reset_range, pos_source = self._get_config_value(
             "soft_reset_pos_range", "common"
@@ -488,7 +610,7 @@ class GarmentObject(SingleClothPrim):
             ]
             logger.debug(f"[GarmentObject] Using global random module for reset")
 
-        self.set_world_pose(pos, euler_angles_to_quat(ori, degrees=True))
+        self._restore_world_particle_state(pos, euler_angles_to_quat(ori, degrees=True))
         self.reset_pose = np.concatenate(
             [np.array(pos, dtype=np.float32), np.array(ori, dtype=np.float32)]
         )
@@ -681,6 +803,7 @@ class GarmentObject(SingleClothPrim):
         cloth = self._ensure_physics_cloth_view()
         positions = cloth.get_world_positions()
         velocities = cloth.get_velocities()
+        root_position, root_orientation = self.get_world_pose()
         self.initial_points_positions = (
             positions.clone() if callable(getattr(positions, "clone", None))
             else np.array(positions, copy=True)
@@ -688,6 +811,14 @@ class GarmentObject(SingleClothPrim):
         self.initial_points_velocities = (
             velocities.clone() if callable(getattr(velocities, "clone", None))
             else np.array(velocities, copy=True)
+        )
+        self.initial_root_position = (
+            root_position.clone() if callable(getattr(root_position, "clone", None))
+            else np.array(root_position, copy=True)
+        )
+        self.initial_root_orientation = (
+            root_orientation.clone() if callable(getattr(root_orientation, "clone", None))
+            else np.array(root_orientation, copy=True)
         )
 
     def transform_points(self, points, pos, ori, scale):
@@ -732,13 +863,7 @@ class GarmentObject(SingleClothPrim):
             pose = pose_dict["Garment"]
             pos = pose[:3]
             ori = pose[3:]
-            self.set_world_pose(
-                [0.0, 0.0, 0.0], euler_angles_to_quat([0.0, 0.0, 0.0], degrees=True)
-            )
-            cloth = self._ensure_physics_cloth_view()
-            cloth.set_world_positions(self.initial_points_positions)
-            cloth.set_velocities(self.initial_points_velocities)
-            self.set_world_pose(pos, euler_angles_to_quat(ori, degrees=True))
+            self._restore_world_particle_state(pos, euler_angles_to_quat(ori, degrees=True))
             self.reset_pose = np.array(pose, dtype=np.float32)
 
             logger.info(

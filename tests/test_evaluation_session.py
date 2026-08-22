@@ -8,6 +8,8 @@ from pathlib import Path
 import sys
 import types
 
+import numpy as np
+
 
 def test_cpu_visible_contact_uses_the_same_authoritative_physx_readback_as_runtime_evidence() -> None:
     source_path = (
@@ -137,16 +139,89 @@ def test_garment_reset_uses_the_authoritative_physx_view_on_cpu_and_cuda() -> No
         node.name: ast.get_source_segment(source, node)
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in {"_get_initial_info", "reset", "set_all_pose"}
+        and node.name in {"_get_initial_info", "reset", "set_all_pose", "_restore_world_particle_state"}
     }
     assert "get_world_positions" in methods["_get_initial_info"]
     assert "get_velocities" in methods["_get_initial_info"]
     assert "self._device" not in methods["_get_initial_info"]
-    assert "set_world_positions" in methods["reset"]
-    assert "set_velocities" in methods["reset"]
-    assert "_ensure_physics_cloth_view" in methods["reset"]
-    assert "_ensure_physics_cloth_view" in methods["set_all_pose"]
+    assert "_restore_world_particle_state" in methods["reset"]
+    assert "_restore_world_particle_state" in methods["set_all_pose"]
+    assert "set_world_positions" in methods["_restore_world_particle_state"]
+    assert "set_velocities" in methods["_restore_world_particle_state"]
+    assert "_ensure_physics_cloth_view" in methods["_restore_world_particle_state"]
     assert 'if self._device == "cpu"' not in methods["reset"]
+
+
+def test_garment_world_particle_transform_applies_the_root_pose_delta() -> None:
+    """Live PhysX particles are world-space, so a reset must move that world state."""
+
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/assets/object/Garment.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_transform_world_particle_positions"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    simulator_error = type("SimulatorNumericalDivergenceError", (ValueError,), {})
+    namespace = {
+        "np": np,
+        "quat_to_rot_matrix": lambda quaternion: np.asarray(quaternion, dtype=np.float64).reshape(3, 3),
+        "SimulatorNumericalDivergenceError": simulator_error,
+    }
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    initial_points = np.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    initial_position = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    initial_rotation = np.eye(3, dtype=np.float32)
+    target_position = np.asarray([2.0, 3.0, 0.0], dtype=np.float32)
+    target_rotation = np.asarray(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32
+    )
+
+    actual = namespace["_transform_world_particle_positions"](
+        initial_points, initial_position, initial_rotation, target_position, target_rotation
+    )
+
+    np.testing.assert_allclose(actual, np.asarray([[2.0, 4.0, 0.0], [1.0, 3.0, 0.0]], dtype=np.float32))
+
+    with __import__("pytest").raises(simulator_error):
+        namespace["_transform_world_particle_positions"](
+            np.asarray([1.0, 2.0], dtype=np.float32),
+            initial_position,
+            initial_rotation,
+            target_position,
+            target_rotation,
+        )
+
+
+def test_garment_reset_delegates_to_frame_consistent_physx_restore_with_zero_velocity() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/assets/object/Garment.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    methods = {
+        node.name: ast.get_source_segment(source, node)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"reset", "set_all_pose", "_restore_world_particle_state"}
+    }
+    assert "self._restore_world_particle_state(" in methods["reset"]
+    assert "self._restore_world_particle_state(" in methods["set_all_pose"]
+    assert "self.set_world_pose(" in methods["_restore_world_particle_state"]
+    assert methods["_restore_world_particle_state"].index("self.set_world_pose(") < methods[
+        "_restore_world_particle_state"
+    ].index("cloth.set_world_positions(")
+    assert "zeros_like" in methods["_restore_world_particle_state"]
+    assert "readback mismatch" in methods["_restore_world_particle_state"]
+    assert "SimulatorNumericalDivergenceError" in methods["_restore_world_particle_state"]
 
 
 def test_garment_restore_keeps_legacy_cpu_replay_separate_from_controlled_physx_restore() -> None:
@@ -200,6 +275,8 @@ def _evaluation(monkeypatch):
         "scripts.utils.common": types.ModuleType("scripts.utils.common"),
         "lehome.utils.record": types.ModuleType("lehome.utils.record"),
         "lehome.utils.logger": types.ModuleType("lehome.utils.logger"),
+        "lehome.flywheel": types.ModuleType("lehome.flywheel"),
+        "lehome.flywheel.persistent_worker": types.ModuleType("lehome.flywheel.persistent_worker"),
     }
     modules["isaaclab.envs"].DirectRLEnv = object
     modules["isaaclab_tasks.utils"].parse_env_cfg = lambda *_args, **_kwargs: None
@@ -213,6 +290,12 @@ def _evaluation(monkeypatch):
     modules["lehome.utils.record"].get_next_experiment_path_with_gap = lambda *_args, **_kwargs: None
     modules["lehome.utils.record"].append_episode_initial_pose = lambda *_args, **_kwargs: None
     modules["lehome.utils.logger"].get_logger = lambda *_args, **_kwargs: types.SimpleNamespace(info=lambda *_args: None)
+    modules["lehome.flywheel.persistent_worker"].SimulatorNumericalDivergenceError = type(
+        "SimulatorNumericalDivergenceError", (ValueError,), {}
+    )
+    modules["lehome.flywheel"].__path__ = [
+        str(repository / "source" / "lehome" / "lehome" / "flywheel")
+    ]
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.delitem(sys.modules, "scripts.utils.evaluation", raising=False)
@@ -232,6 +315,9 @@ def test_evaluation_session_switches_garments_without_recreating_a_switchable_en
             self.cfg.garment_name = name
             self.cfg.garment_version = stage
 
+        def set_seed(self, seed):
+            calls.append(("seed", seed))
+
         def close(self):
             calls.append("close")
 
@@ -244,9 +330,209 @@ def test_evaluation_session_switches_garments_without_recreating_a_switchable_en
     session = evaluation.EvaluationSession(args, env=env, policy=Policy(), env_cfg=env.cfg)
     session.prepare_episode(garment_name="Top_Long_Seen_1", garment_stage="Release", seed=42, episode_generation=1)
 
-    assert calls == [("switch", "Top_Long_Seen_1", "Release"), "reset"]
+    assert calls == [("seed", 42), ("switch", "Top_Long_Seen_1", "Release"), "reset"]
     assert env.cfg.seed == 42
     assert env.cfg.random_seed == 42
+
+
+def test_garment_environment_set_seed_rebinds_the_active_object_rng() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "set_seed"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    first_object = types.SimpleNamespace(rng=None)
+    second_object = types.SimpleNamespace(rng=None)
+    first = types.SimpleNamespace(cfg=types.SimpleNamespace(seed=None, random_seed=None, use_random_seed=True), object=first_object)
+    second = types.SimpleNamespace(cfg=types.SimpleNamespace(seed=None, random_seed=None, use_random_seed=True), object=second_object)
+
+    namespace["set_seed"](first, 50_110)
+    namespace["set_seed"](second, 50_110)
+
+    assert first.cfg.seed == second.cfg.seed == 50_110
+    assert first.cfg.random_seed == second.cfg.random_seed == 50_110
+    assert first.cfg.use_random_seed is False
+    assert second.cfg.use_random_seed is False
+    assert first.object.rng is first.garment_rng
+    assert second.object.rng is second.garment_rng
+    assert first.garment_rng.uniform() == second.garment_rng.uniform()
+
+
+def test_cloth_physical_health_rejects_finite_but_astronomical_state() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "flywheel_cloth_physical_health"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    normal = types.SimpleNamespace(
+        _flywheel_physics_cloth_state=lambda: (
+            np.asarray([[0.2, 0.1, 0.7], [0.3, 0.1, 0.7]], dtype=np.float32),
+            np.zeros((2, 3), dtype=np.float32),
+        )
+    )
+    divergent = types.SimpleNamespace(
+        _flywheel_physics_cloth_state=lambda: (
+            np.asarray([[1_000_000.0, 0.0, 0.0], [0.0, 1_000_000.0, 0.0]], dtype=np.float32),
+            np.asarray([[1_000_000.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32),
+        )
+    )
+
+    assert namespace["flywheel_cloth_physical_health"](normal)["healthy"] is True
+    health = namespace["flywheel_cloth_physical_health"](divergent)
+    assert health["healthy"] is False
+    assert health["reason"] == "simulator_numerical_divergence"
+
+
+def test_cloth_physical_health_classifies_invalid_physx_readback_as_divergence() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "flywheel_cloth_physical_health"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    invalid = types.SimpleNamespace(
+        _flywheel_physics_cloth_state=lambda: (_ for _ in ()).throw(
+            RuntimeError("garment PhysX cloth positions and velocities must be finite")
+        )
+    )
+
+    health = namespace["flywheel_cloth_physical_health"](invalid)
+    assert health == {
+        "healthy": False,
+        "reason": "simulator_numerical_divergence",
+    }
+
+
+def test_flywheel_evaluation_checks_physical_health_before_success_or_recording() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    source = source_path.read_text(encoding="utf-8")
+    method = ast.parse(source)
+    loop = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run_evaluation_loop"
+    )
+    loop_source = ast.get_source_segment(source, loop)
+    assert loop_source is not None
+    health_index = loop_source.index("_require_flywheel_cloth_health(env)")
+    assert health_index > loop_source.index("stabilize_garment_after_reset(env, args)")
+    assert health_index < loop_source.index("observation_dict = env._get_observations()")
+    assert health_index < loop_source.index("env._get_success()")
+    assert health_index < loop_source.index("recorder.record_step(")
+    assert health_index < loop_source.index("recorder.record_continuation_snapshot(")
+
+
+def test_evaluation_session_refuses_a_switchable_environment_without_deterministic_seed_binding(monkeypatch) -> None:
+    evaluation = _evaluation(monkeypatch)
+    env = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(garment_name="Top_Long_Seen_0", garment_version="Release"),
+        switch_garment=lambda *_args: None,
+    )
+    session = evaluation.EvaluationSession(
+        types.SimpleNamespace(), env=env, policy=object(), env_cfg=env.cfg,
+        require_deterministic_seed=True,
+    )
+
+    with __import__("pytest").raises(ValueError, match="set_seed"):
+        session.prepare_episode(
+            garment_name="Top_Long_Seen_1", seed=50_110, episode_generation=1
+        )
+
+
+def test_evaluation_session_preserves_explicit_random_seed_mode(monkeypatch) -> None:
+    evaluation = _evaluation(monkeypatch)
+    calls = []
+    env = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(
+            garment_name="Top_Long_Seen_0", garment_version="Release",
+            use_random_seed=True,
+        ),
+        set_seed=lambda seed: calls.append(seed),
+    )
+    session = evaluation.EvaluationSession(
+        types.SimpleNamespace(use_random_seed=True),
+        env=env,
+        policy=object(),
+        env_cfg=env.cfg,
+    )
+
+    session.prepare_episode(
+        garment_name="Top_Long_Seen_0", seed=42, episode_generation=1
+    )
+
+    assert calls == []
+    assert env.cfg.use_random_seed is True
+
+
+def test_cloth_physical_health_uses_garment_specific_scale_and_reset_overrides() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "flywheel_cloth_physical_health"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    env = types.SimpleNamespace(
+        _flywheel_physics_cloth_state=lambda: (
+            np.asarray([[2.1, 0.0, 0.7], [2.2, 0.0, 0.7]], dtype=np.float32),
+            np.zeros((2, 3), dtype=np.float32),
+        ),
+        particle_config={
+            "objects": {
+                "common": {
+                    "scale": [0.1, 0.1, 0.1],
+                    "soft_reset_pos_range": [0.0] * 6,
+                },
+                "particle_system": {"max_velocity": 5.0},
+            }
+        },
+        garment_config={
+            "scale": [0.5, 0.5, 0.5],
+            "soft_reset_pos_range": [2.0, 0.0, 0.7, 2.0, 0.0, 0.7],
+        },
+    )
+
+    assert namespace["flywheel_cloth_physical_health"](env)["healthy"] is True
 
 
 def test_cuda_cloth_runtime_receipt_requires_cuda_environment_device(monkeypatch) -> None:
@@ -302,6 +588,7 @@ def test_evaluation_session_does_not_reset_a_policy_that_the_worker_already_rese
 
     env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace(garment_name="shirt", garment_version="Release"))
     env.close = lambda: None
+    env.set_seed = lambda _seed: None
     args = types.SimpleNamespace(task="task", device="cpu", renderer_device="cuda:0", camera_device="cuda:0")
     session = evaluation.EvaluationSession(args, env=env, policy=Policy(), env_cfg=env.cfg)
     session.prepare_episode(garment_name="shirt", seed=42, episode_generation=1, reset_policy=False)

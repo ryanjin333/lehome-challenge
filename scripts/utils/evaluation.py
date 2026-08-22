@@ -29,8 +29,29 @@ from lehome.utils.record import (
 )
 from .common import stabilize_garment_after_reset
 from lehome.utils.logger import get_logger
+from lehome.flywheel.persistent_worker import SimulatorNumericalDivergenceError
 
 logger = get_logger(__name__)
+
+
+def _require_flywheel_cloth_health(env: Any) -> None:
+    """Stop a recording before numerical cloth divergence can become data."""
+
+    check = getattr(env, "flywheel_cloth_physical_health", None)
+    if not callable(check):
+        raise SimulatorNumericalDivergenceError(
+            "simulator_numerical_divergence: cloth health readback unavailable"
+        )
+    health = check()
+    if not isinstance(health, Mapping) or health.get("healthy") is not True:
+        reason = (
+            health.get("reason", "simulator_numerical_divergence")
+            if isinstance(health, Mapping)
+            else "simulator_numerical_divergence"
+        )
+        raise SimulatorNumericalDivergenceError(
+            f"{reason}: cloth physical-health admission failed"
+        )
 
 _LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LOWERCASE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -314,6 +335,7 @@ class EvaluationSession:
         ee_solver: Optional[Any] = None,
         is_bimanual: bool = False,
         env_factory: Any = None,
+        require_deterministic_seed: bool = False,
     ) -> None:
         self.args = args
         self.env = env
@@ -322,6 +344,7 @@ class EvaluationSession:
         self.ee_solver = ee_solver
         self.is_bimanual = is_bimanual
         self._env_factory = env_factory or (lambda cfg: gym.make(args.task, cfg=cfg).unwrapped)
+        self._require_deterministic_seed = require_deterministic_seed
 
     @property
     def runtime_receipt(self) -> dict[str, object]:
@@ -429,6 +452,18 @@ class EvaluationSession:
             raise ValueError("seed must be a non-negative integer")
         if not isinstance(episode_generation, int) or episode_generation < 1:
             raise ValueError("episode_generation must be positive")
+        deterministic_seed = self._require_deterministic_seed or not bool(
+            getattr(self.args, "use_random_seed", False)
+        )
+        if deterministic_seed:
+            for target in (self.env_cfg, getattr(self.env, "cfg", None)):
+                if target is not None:
+                    setattr(target, "seed", seed)
+                    setattr(target, "random_seed", seed)
+            set_seed = getattr(self.env, "set_seed", None)
+            if not callable(set_seed):
+                raise ValueError("persistent evaluation requires environment set_seed(seed)")
+            set_seed(seed)
         current_name = getattr(self.env_cfg, "garment_name", None)
         current_stage = getattr(self.env_cfg, "garment_version", None)
         if current_name != garment_name or current_stage != garment_stage:
@@ -445,13 +480,6 @@ class EvaluationSession:
                     initialize_obs()
         self.env_cfg.garment_name = garment_name
         self.env_cfg.garment_version = garment_stage
-        for target in (self.env_cfg, getattr(self.env, "cfg", None)):
-            if target is not None:
-                setattr(target, "seed", seed)
-                setattr(target, "random_seed", seed)
-        set_seed = getattr(self.env, "set_seed", None)
-        if callable(set_seed):
-            set_seed(seed)
         reset = getattr(self.policy, "reset", None)
         # Legacy registry adapters are permitted to be stateless.  The
         # persistent worker separately requires ``reset()`` before admitting
@@ -673,6 +701,7 @@ def run_evaluation_loop(
                 identity=identity,
                 provenance={"policy_artifact_sha256": flywheel_manifest["policy_artifact_sha256"], "image_identity": flywheel_manifest["image_identity"], "execution_mode": flywheel_manifest["execution_mode"], "execution_backend": flywheel_manifest["execution_backend"], "simulator_device": flywheel_manifest["simulator_device"], "policy_device": flywheel_manifest.get("policy_device"), "parity_stage": flywheel_manifest.get("parity_stage"), "strategy_sampled": dict(sampled.values), "strategy_receipt": dict(randomization_receipt), **({"controlled_recovery": dict(controlled_provenance)} if controlled_provenance is not None else {})},
             )
+            _require_flywheel_cloth_health(env)
             reset_snapshot = capture_snapshot(env, randomization={"strategy": strategy, "sampled": dict(sampled.values), "receipt": dict(randomization_receipt)})
             recorder.record_snapshot("reset", reset_snapshot)
         if reset_policy:
@@ -739,6 +768,8 @@ def run_evaluation_loop(
 
             # 6. Step Environment
             env.step(action)
+            if recorder is not None:
+                _require_flywheel_cloth_health(env)
             if recorder is not None:
                 current_contact = env.flywheel_visible_garment_contact()
                 if visible_contact is None or current_contact["minimum_distance_m"] < visible_contact["minimum_distance_m"]:
@@ -1049,6 +1080,7 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     session = EvaluationSession(
         args, env=env, policy=policy, env_cfg=env_cfg, ee_solver=ee_solver,
         is_bimanual=is_bimanual,
+        require_deterministic_seed=flywheel_identity is not None,
     )
 
     try:

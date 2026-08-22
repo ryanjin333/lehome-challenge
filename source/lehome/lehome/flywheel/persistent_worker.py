@@ -33,6 +33,10 @@ class InfrastructureInvalidAttemptError(ValueError):
     """An episode cannot be used because runtime evidence is invalid."""
 
 
+class SimulatorNumericalDivergenceError(InfrastructureInvalidAttemptError):
+    """Live simulator state became nonphysical and must not enter the ledger."""
+
+
 class _LeaseController(Protocol):
     def lease_next(self, worker_id: str) -> Any | None: ...
 
@@ -447,7 +451,11 @@ class PersistentRolloutWorker:
                             self.identity.worker_id,
                             attempt_id,
                             lease_id,
-                            reason="runtime_evidence_invalid",
+                            reason=(
+                                "simulator_numerical_divergence"
+                                if isinstance(error, SimulatorNumericalDivergenceError)
+                                else "runtime_evidence_invalid"
+                            ),
                         )
                         continue
                     restore_failed = "snapshot" in str(error).lower() or "restore" in str(error).lower()
@@ -505,4 +513,5 @@ class PersistentRolloutWorker:
 __all__ = [
     "ACTION_HORIZON", "InfrastructureInvalidAttemptError", "PreparationTimeoutError",
     "PersistentRolloutWorker", "WorkerIdentity",
+    "SimulatorNumericalDivergenceError",
 ]

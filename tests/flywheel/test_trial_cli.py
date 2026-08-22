@@ -1157,6 +1157,7 @@ def test_scoped_parent_token_reaches_the_real_groot_server_evaluation_constructi
 
     class Environment:
         def initialize_obs(self): pass
+        def set_seed(self, _seed): pass
         def close(self): pass
 
     modules = {

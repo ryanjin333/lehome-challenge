@@ -621,6 +621,44 @@ def test_worker_infrastructure_aborts_an_episode_without_post_reset_cloth_eviden
     assert list(tmp_path.rglob("worker-receipt.json")) == []
 
 
+def test_worker_classifies_cloth_numerical_divergence_as_infrastructure_invalid(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import (
+        PersistentRolloutWorker,
+        SimulatorNumericalDivergenceError,
+    )
+
+    class DivergentSession(FakeSession):
+        def run_episode(self, *, assignment, attempt_output_dir, policy, cancellation_event):
+            self.runs.append(str(assignment["attempt_id"]))
+            raise SimulatorNumericalDivergenceError(
+                "simulator_numerical_divergence: cloth physical-health admission failed"
+            )
+
+    class Controller(FakeController):
+        def __init__(self, leases):
+            super().__init__(leases)
+            self.aborted = []
+
+        def record_infrastructure_abort(self, worker_id, attempt_id, lease_id, *, reason):
+            self.aborted.append((worker_id, attempt_id, lease_id, reason))
+            return "infrastructure_abort"
+
+    controller = Controller([
+        Lease(Attempt("attempt-a", {"garment": "Top_Long_Seen_0", "seed": 11}), "lease-a"),
+    ])
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=DivergentSession, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+
+    assert worker.run() == []
+    assert controller.completed == []
+    assert controller.aborted == [
+        ("worker-0", "attempt-a", "lease-a", "simulator_numerical_divergence")
+    ]
+
+
 def test_worker_continues_after_a_single_episode_runtime_error(tmp_path) -> None:
     from lehome.flywheel.persistent_worker import PersistentRolloutWorker
 

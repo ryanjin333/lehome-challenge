@@ -175,7 +175,14 @@ def _build_cloth_session(args: argparse.Namespace):
     )
     policy.runtime_device = readiness["runtime_device"]
     _progress("EvaluationSession constructed")
-    return EvaluationSession(args, env=env, policy=policy, env_cfg=env_cfg, is_bimanual="bi" in args.task.lower())
+    return EvaluationSession(
+        args,
+        env=env,
+        policy=policy,
+        env_cfg=env_cfg,
+        is_bimanual="bi" in args.task.lower(),
+        require_deterministic_seed=True,
+    )
 
 
 def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory: Any = TaskLedger) -> list[dict[str, object]]:

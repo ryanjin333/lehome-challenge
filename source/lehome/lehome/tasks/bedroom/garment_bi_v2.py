@@ -64,6 +64,18 @@ class GarmentEnv(DirectRLEnv):
         self.left_joint_pos = self.left_arm.data.joint_pos
         self.right_joint_pos = self.right_arm.data.joint_pos
 
+    def set_seed(self, seed: int) -> None:
+        """Bind an episode seed before creating or resetting its garment."""
+
+        if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+            raise ValueError("garment seed must be a non-negative integer")
+        self.cfg.use_random_seed = False
+        self.cfg.seed = seed
+        self.cfg.random_seed = seed
+        self.garment_rng = np.random.RandomState(seed)
+        if self.object is not None:
+            self.object.rng = self.garment_rng
+
     def _setup_scene(self):
         self.left_arm = Articulation(self.cfg.left_robot)
         self.right_arm = Articulation(self.cfg.right_robot)
@@ -819,6 +831,79 @@ class GarmentEnv(DirectRLEnv):
         if velocities.ndim == 3:
             velocities = velocities[0]
         return self._flywheel_cloth_arrays(positions, velocities)
+
+    def flywheel_cloth_physical_health(self) -> dict[str, object]:
+        """Fail closed when live cloth state is numerically outside this scene's scale."""
+
+        try:
+            positions, velocities = self._flywheel_physics_cloth_state()
+        except (RuntimeError, TypeError, ValueError):
+            return {"healthy": False, "reason": "simulator_numerical_divergence"}
+        if not np.isfinite(positions).all() or not np.isfinite(velocities).all():
+            return {"healthy": False, "reason": "simulator_numerical_divergence"}
+
+        def _config_get(value, key, default):
+            getter = getattr(value, "get", None)
+            return getter(key, default) if callable(getter) else getattr(value, key, default)
+
+        objects = _config_get(getattr(self, "particle_config", None), "objects", None)
+        common = _config_get(objects, "common", {})
+        particle_system = _config_get(objects, "particle_system", {})
+        garment = getattr(self, "garment_config", None)
+        scale = np.asarray(
+            _config_get(garment, "scale", _config_get(common, "scale", [1.0, 1.0, 1.0])),
+            dtype=np.float64,
+        )
+        reset_range = np.asarray(
+            _config_get(
+                garment,
+                "soft_reset_pos_range",
+                _config_get(common, "soft_reset_pos_range", [0.0] * 6),
+            ),
+            dtype=np.float64,
+        )
+        configured_max_velocity_mps = float(_config_get(particle_system, "max_velocity", 5.0))
+        if (
+            scale.shape != (3,)
+            or reset_range.shape != (6,)
+            or not np.isfinite(scale).all()
+            or not np.isfinite(reset_range).all()
+            or not np.isfinite(configured_max_velocity_mps)
+            or configured_max_velocity_mps <= 0.0
+        ):
+            return {"healthy": False, "reason": "simulator_numerical_divergence"}
+        # The reset configuration locates the garment and its existing scale
+        # bounds its authored local mesh. This is an admission envelope only;
+        # it does not alter PhysX settings or policy actions.
+        reset_position_envelope_m = float(np.max(np.abs(reset_range)))
+        garment_scale_envelope_m = float(np.max(np.abs(scale)))
+        max_position_limit_m = reset_position_envelope_m + 2.0 * garment_scale_envelope_m
+        max_extent_limit_m = 4.0 * garment_scale_envelope_m
+        max_velocity_limit_mps = configured_max_velocity_mps + 1e-4
+        max_position_m = float(np.max(np.abs(positions))) if positions.size else float("inf")
+        max_extent_m = float(np.max(np.ptp(positions, axis=0))) if positions.size else float("inf")
+        max_velocity_mps = float(np.max(np.linalg.norm(velocities, axis=1))) if velocities.size else float("inf")
+        if (
+            max_position_m > max_position_limit_m
+            or max_extent_m > max_extent_limit_m
+            or max_velocity_mps > max_velocity_limit_mps
+        ):
+            return {
+                "healthy": False,
+                "reason": "simulator_numerical_divergence",
+                "max_position_m": max_position_m,
+                "max_extent_m": max_extent_m,
+                "max_velocity_mps": max_velocity_mps,
+                "max_position_limit_m": max_position_limit_m,
+                "max_extent_limit_m": max_extent_limit_m,
+                "max_velocity_limit_mps": max_velocity_limit_mps,
+            }
+        return {
+            "healthy": True,
+            "max_position_m": max_position_m,
+            "max_extent_m": max_extent_m,
+            "max_velocity_mps": max_velocity_mps,
+        }
 
     def _flywheel_cloth_backend(self) -> str:
         device = str(self.device).lower()
