@@ -34,7 +34,51 @@ from lehome.flywheel.persistent_worker import SimulatorNumericalDivergenceError
 logger = get_logger(__name__)
 
 
-def _require_flywheel_cloth_health(env: Any) -> None:
+def _flywheel_policy_action_limit_diagnostics(env: Any, action: Any) -> dict[str, object]:
+    """Return bounded counts for the target sent to the live articulations."""
+
+    def numpy_array(value: Any) -> np.ndarray:
+        detach = getattr(value, "detach", None)
+        if callable(detach):
+            value = detach()
+        to_cpu = getattr(value, "cpu", None)
+        if callable(to_cpu):
+            value = to_cpu()
+        to_numpy = getattr(value, "numpy", None)
+        if callable(to_numpy):
+            value = to_numpy()
+        return np.asarray(value, dtype=np.float32)
+
+    try:
+        values = numpy_array(action)
+        left_limits = numpy_array(env.left_arm.data.soft_joint_pos_limits)
+        right_limits = numpy_array(env.right_arm.data.soft_joint_pos_limits)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return {"policy_action_limits_available": False}
+    if (
+        values.shape != (1, 12)
+        or left_limits.shape != (1, 6, 2)
+        or right_limits.shape != (1, 6, 2)
+    ):
+        return {"policy_action_limits_available": False}
+    limits = np.concatenate((left_limits[0], right_limits[0]), axis=0)
+    finite = np.isfinite(values[0])
+    outside = finite & (
+        (values[0] < limits[:, 0]) | (values[0] > limits[:, 1])
+    )
+    return {
+        "policy_action_limits_available": True,
+        "policy_action_dimension": 12,
+        "policy_action_nonfinite_count": int((~finite).sum()),
+        "policy_action_outside_live_joint_limit_count": int(outside.sum()),
+    }
+
+
+def _require_flywheel_cloth_health(
+    env: Any,
+    *,
+    policy_action_diagnostics: Mapping[str, object] | None = None,
+) -> None:
     """Stop a recording before numerical cloth divergence can become data."""
 
     check = getattr(env, "flywheel_cloth_physical_health", None)
@@ -81,6 +125,23 @@ def _require_flywheel_cloth_health(env: Any) -> None:
                             f"usd_prim={usd_prim} prim_type={prim_type} "
                             f"approximation={approximation}"
                         )
+        if isinstance(policy_action_diagnostics, Mapping):
+            limits_available = policy_action_diagnostics.get(
+                "policy_action_limits_available"
+            )
+            if type(limits_available) is bool:
+                evidence.append(
+                    f"policy_action_limits_available={limits_available}"
+                )
+            for field in (
+                "policy_action_nonfinite_count",
+                "policy_action_outside_live_joint_limit_count",
+                "policy_action_steps_outside_live_joint_limits",
+                "policy_action_max_outside_live_joint_limit_count",
+            ):
+                value = policy_action_diagnostics.get(field)
+                if type(value) is int and value >= 0:
+                    evidence.append(f"{field}={value}")
         diagnostic_suffix = f" ({'; '.join(evidence)})" if evidence else ""
         raise SimulatorNumericalDivergenceError(
             f"{reason}: cloth physical-health admission failed{diagnostic_suffix}"
@@ -779,6 +840,8 @@ def run_evaluation_loop(
         success = torch.tensor(False)
         terminal_reason = "horizon"
         visible_contact = None
+        policy_action_steps_outside_live_joint_limits = 0
+        policy_action_max_outside_live_joint_limit_count = 0
 
         for st in range(args.max_steps):
             if cancellation_event is not None and cancellation_event.is_set():
@@ -819,9 +882,34 @@ def run_evaluation_loop(
                 ).unsqueeze(0)
 
             # 6. Step Environment
+            policy_action_diagnostics = None
+            if recorder is not None:
+                policy_action_diagnostics = _flywheel_policy_action_limit_diagnostics(env, action)
+                if policy_action_diagnostics.get("policy_action_limits_available") is True:
+                    outside_count = policy_action_diagnostics.get(
+                        "policy_action_outside_live_joint_limit_count"
+                    )
+                    if type(outside_count) is int:
+                        if outside_count > 0:
+                            policy_action_steps_outside_live_joint_limits += 1
+                        policy_action_max_outside_live_joint_limit_count = max(
+                            policy_action_max_outside_live_joint_limit_count,
+                            outside_count,
+                        )
+                    policy_action_diagnostics = {
+                        **policy_action_diagnostics,
+                        "policy_action_steps_outside_live_joint_limits": (
+                            policy_action_steps_outside_live_joint_limits
+                        ),
+                        "policy_action_max_outside_live_joint_limit_count": (
+                            policy_action_max_outside_live_joint_limit_count
+                        ),
+                    }
             env.step(action)
             if recorder is not None:
-                _require_flywheel_cloth_health(env)
+                _require_flywheel_cloth_health(
+                    env, policy_action_diagnostics=policy_action_diagnostics
+                )
             if recorder is not None:
                 current_contact = env.flywheel_visible_garment_contact()
                 if visible_contact is None or current_contact["minimum_distance_m"] < visible_contact["minimum_distance_m"]:

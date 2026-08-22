@@ -2344,3 +2344,158 @@ def test_verified_success_replay_rejects_a_tampered_snapshot_before_evaluation(m
             policy=object(),
         )
     assert invoked == []
+
+
+def test_policy_action_diagnostics_count_only_nonfinite_and_live_limit_violations() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    helper = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_flywheel_policy_action_limit_diagnostics"
+    )
+    module = ast.Module(body=[helper], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"Any": object, "np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    class TensorLike:
+        def __init__(self, values):
+            self.values = np.asarray(values, dtype=np.float32)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.values
+
+    limits = np.repeat(
+        np.asarray([[[-1.0, 1.0]]], dtype=np.float32), repeats=6, axis=1
+    )
+    env = types.SimpleNamespace(
+        left_arm=types.SimpleNamespace(
+            data=types.SimpleNamespace(soft_joint_pos_limits=TensorLike(limits))
+        ),
+        right_arm=types.SimpleNamespace(
+            data=types.SimpleNamespace(soft_joint_pos_limits=TensorLike(limits))
+        ),
+    )
+    action = TensorLike(
+        [[-1.5, -1.0, 0.0, 1.0, 1.5, np.nan, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+    )
+
+    assert namespace["_flywheel_policy_action_limit_diagnostics"](env, action) == {
+        "policy_action_limits_available": True,
+        "policy_action_dimension": 12,
+        "policy_action_nonfinite_count": 1,
+        "policy_action_outside_live_joint_limit_count": 2,
+    }
+
+
+def test_cloth_failure_includes_bounded_policy_action_history_without_coordinates() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    gate = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_require_flywheel_cloth_health"
+    )
+    module = ast.Module(body=[gate], type_ignores=[])
+    ast.fix_missing_locations(module)
+    error_type = type("SimulatorNumericalDivergenceError", (RuntimeError,), {})
+    namespace = {
+        "Any": object,
+        "Mapping": Mapping,
+        "SimulatorNumericalDivergenceError": error_type,
+    }
+    exec(compile(module, str(source_path), "exec"), namespace)
+    diagnostics = {
+        "policy_action_limits_available": True,
+        "policy_action_dimension": 12,
+        "policy_action_nonfinite_count": 0,
+        "policy_action_outside_live_joint_limit_count": 3,
+        "policy_action_steps_outside_live_joint_limits": 2,
+        "policy_action_max_outside_live_joint_limit_count": 4,
+    }
+
+    with __import__("pytest").raises(
+        error_type,
+        match=(
+            r"policy_action_nonfinite_count=0; "
+            r"policy_action_outside_live_joint_limit_count=3; "
+            r"policy_action_steps_outside_live_joint_limits=2; "
+            r"policy_action_max_outside_live_joint_limit_count=4"
+        ),
+    ) as raised:
+        namespace["_require_flywheel_cloth_health"](
+            types.SimpleNamespace(
+                flywheel_cloth_physical_health=lambda: {
+                    "healthy": False,
+                    "reason": "simulator_numerical_divergence",
+                }
+            ),
+            policy_action_diagnostics=diagnostics,
+        )
+
+    assert "[" not in str(raised.value)
+
+
+def test_policy_action_diagnostics_are_sampled_before_each_step_and_bound_to_health_failure() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    loop = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "run_evaluation_loop"
+    )
+    loop_source = ast.get_source_segment(source, loop)
+    assert loop_source is not None
+    diagnostic_index = loop_source.index("_flywheel_policy_action_limit_diagnostics(env, action)")
+    step_index = loop_source.index("env.step(action)")
+    health_index = loop_source.index(
+        "_require_flywheel_cloth_health(\n                    env, policy_action_diagnostics=policy_action_diagnostics\n                )"
+    )
+    assert diagnostic_index < step_index < health_index
+
+
+def test_cloth_failure_reports_when_live_policy_limits_are_unavailable() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    gate = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_require_flywheel_cloth_health"
+    )
+    module = ast.Module(body=[gate], type_ignores=[])
+    ast.fix_missing_locations(module)
+    error_type = type("SimulatorNumericalDivergenceError", (RuntimeError,), {})
+    namespace = {
+        "Any": object,
+        "Mapping": Mapping,
+        "SimulatorNumericalDivergenceError": error_type,
+    }
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    with __import__("pytest").raises(
+        error_type, match=r"policy_action_limits_available=False"
+    ):
+        namespace["_require_flywheel_cloth_health"](
+            types.SimpleNamespace(
+                flywheel_cloth_physical_health=lambda: {
+                    "healthy": False,
+                    "reason": "simulator_numerical_divergence",
+                }
+            ),
+            policy_action_diagnostics={"policy_action_limits_available": False},
+        )
