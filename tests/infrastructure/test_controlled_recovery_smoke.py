@@ -507,8 +507,8 @@ def test_snapshot_source_bootstrap_is_a_separate_one_worker_unsealed_tuple() -> 
     installer = (REPO_ROOT / "infrastructure/nebius/packer/scripts/install-rollout.sh").read_text(encoding="utf-8")
     assert "LEHOME_WORKER_COUNT=1 LEHOME_MAX_ATTEMPTS=1 LEHOME_TARGET_ACCEPTED=1" in source
     assert "LEHOME_ENABLE_HF_UPLOAD=1 LEHOME_SKIP_ROUND_SEAL=1 LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP=1" in source
-    assert "LEHOME_SIMULATOR_DEVICE=cuda:0" in source
-    assert "LEHOME_SIMULATOR_DEVICE=cpu" not in source
+    assert "LEHOME_SIMULATOR_DEVICE=cpu" in source
+    assert "LEHOME_SIMULATOR_DEVICE=cuda:0" not in source
     assert "fresh absent run root; resume is forbidden" in source
     assert "readback_verified" in source
     assert "SNAPSHOT_SOURCE_BOOTSTRAP" in base and "snapshot-source-bootstrap" in base
@@ -539,17 +539,17 @@ def test_snapshot_source_bootstrap_passes_a_nondefault_descriptor_garment_before
     assert result.returncode == 3
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Pant_Long_Seen_4",
-        "simulator_device": "cuda:0",
+        "simulator_device": "cpu",
     }
 
 
-def test_snapshot_source_bootstrap_forces_canonical_cuda_simulator_device(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LEHOME_SIMULATOR_DEVICE", "cpu")
-    result, root = _run_snapshot_source_bootstrap(tmp_path / "cuda-source", "rejected")
+def test_snapshot_source_bootstrap_forces_the_isolated_cpu_simulator_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LEHOME_SIMULATOR_DEVICE", "cuda:0")
+    result, root = _run_snapshot_source_bootstrap(tmp_path / "cpu-source", "rejected")
     assert result.returncode == 3
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Top_Long_Seen_0",
-        "simulator_device": "cuda:0",
+        "simulator_device": "cpu",
     }
 
 
@@ -593,7 +593,7 @@ def test_snapshot_source_bootstrap_writes_one_audit_only_envelope_atomically(tmp
     assert len(payload["episode_sha256s"]) == len(payload["immutable_revisions"]) == 1
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Top_Long_Seen_0",
-        "simulator_device": "cuda:0",
+        "simulator_device": "cpu",
     }
     assert not list(root.glob("*.strict.seal.json"))
     with pytest.raises(ValueError):
