@@ -1102,6 +1102,66 @@ def _legacy_topology_projector():
     return namespace["_flywheel_project_legacy_usd_to_physx"], simulator_error
 
 
+def _physx_weld_map_reader():
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_flywheel_physx_weld_maps"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    simulator_error = type("SimulatorNumericalDivergenceError", (ValueError,), {})
+    namespace = {"SimulatorNumericalDivergenceError": simulator_error}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    return namespace["_flywheel_physx_weld_maps"], simulator_error
+
+
+def test_physx_weld_map_reader_uses_active_cloth_prim_and_fails_closed() -> None:
+    read_maps, simulator_error = _physx_weld_map_reader()
+
+    class Attribute:
+        def __init__(self, value):
+            self.value = value
+
+        def IsValid(self):
+            return True
+
+        def Get(self):
+            return self.value
+
+    class Prim:
+        def __init__(self, attrs):
+            self.attrs = attrs
+
+        def GetAttribute(self, name):
+            return self.attrs.get(name)
+
+    class Environment:
+        def __init__(self, attrs):
+            self.object = type("Object", (), {"_prim": Prim(attrs)})()
+
+    attrs = {
+        "physxParticle:weldedVerticesRemapToOrig": Attribute([2, 0, 1]),
+        "physxParticle:weldedVerticesRemapToWeld": Attribute([1, 2, 0]),
+    }
+    assert read_maps(Environment(attrs)) == ([2, 0, 1], [1, 2, 0])
+
+    with __import__("pytest").raises(
+        simulator_error,
+        match=r"missing physxParticle:weldedVerticesRemapToWeld",
+    ):
+        read_maps(Environment({
+            "physxParticle:weldedVerticesRemapToOrig": Attribute([0]),
+        }))
+
+
 def test_legacy_usd_snapshot_is_projected_into_live_physx_particle_order() -> None:
     project, _ = _legacy_topology_projector()
     asset = np.asarray(
@@ -1116,13 +1176,17 @@ def test_legacy_usd_snapshot_is_projected_into_live_physx_particle_order() -> No
         [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [1.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
         dtype=np.float32,
     )
+    # The native cooked-map order is deliberately not authored USD order.
     live_rest = np.asarray(
-        [[2.0, 0.0, 0.0], [0.000004, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        [[20.0, 0.0, 0.0], [30.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
         dtype=np.float32,
     )
+    welded_to_orig = np.asarray([3, 0, 1], dtype=np.int32)
+    orig_to_weld = np.asarray([1, 2, 1, 0], dtype=np.int32)
 
     positions, velocities = project(
-        source_position, source_velocity, asset, live_rest
+        source_position, source_velocity, asset, live_rest,
+        welded_to_orig, orig_to_weld,
     )
 
     np.testing.assert_array_equal(positions[:, 0], [12.0, 10.0, 11.0])
@@ -1146,7 +1210,10 @@ def test_legacy_usd_projection_rejects_inconsistent_duplicate_seam_state() -> No
             r"velocity_max_abs_delta=0"
         ),
     ):
-        project(positions, np.zeros_like(positions), asset, asset[:2])
+        project(
+            positions, np.zeros_like(positions), asset, asset[:2],
+            np.asarray([0, 1], dtype=np.int32), np.asarray([0, 1, 0], dtype=np.int32),
+        )
 
 
 def test_legacy_usd_projection_classifies_cardinality_mismatch_as_simulator_divergence() -> None:
@@ -1154,41 +1221,108 @@ def test_legacy_usd_projection_classifies_cardinality_mismatch_as_simulator_dive
     asset = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
     with __import__("pytest").raises(
         simulator_error,
-        match=r"cardinality mismatch: usd_unique_count=2 live_physx_count=1",
+        match=r"weldedVerticesRemapToOrig size mismatch: live_physx_count=1 remap_to_orig_count=2",
     ):
-        project(asset, np.zeros_like(asset), asset, asset[:1])
+        project(
+            asset, np.zeros_like(asset), asset, asset[:1],
+            np.asarray([0, 1], dtype=np.int32), np.asarray([0, 0], dtype=np.int32),
+        )
 
 
-def test_legacy_usd_projection_reports_nearest_coordinate_distance_metrics() -> None:
+def test_legacy_usd_projection_uses_weld_maps_when_live_rest_has_deformed() -> None:
     project, simulator_error = _legacy_topology_projector()
     asset = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
     live_rest = np.asarray([[0.0, 0.0, 0.0], [9.0, 0.0, 0.0]], dtype=np.float32)
 
-    with __import__("pytest").raises(
-        simulator_error,
-        match=(
-            r"nearest-coordinate distance mismatch: max_distance=8(?:\.0+)? "
-            r"median_distance=4(?:\.0+)? tolerance=1e-05"
-        ),
-    ):
-        project(asset, np.zeros_like(asset), asset, live_rest)
+    positions, velocities = project(
+        asset, np.zeros_like(asset), asset, live_rest,
+        np.asarray([1, 0], dtype=np.int32), np.asarray([1, 0], dtype=np.int32),
+    )
+
+    np.testing.assert_array_equal(positions[:, 0], [1.0, 0.0])
+    np.testing.assert_array_equal(velocities, np.zeros((2, 3), dtype=np.float32))
 
 
-def test_legacy_usd_projection_reports_non_bijective_mapping_metrics() -> None:
+def test_legacy_usd_projection_rejects_inconsistent_weld_maps() -> None:
     project, simulator_error = _legacy_topology_projector()
     asset = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
-    live_rest = np.asarray(
-        [[0.0, 0.0, 0.0], [0.000001, 0.0, 0.0]], dtype=np.float32
+
+    with __import__("pytest").raises(
+        simulator_error,
+        match=r"weld map inverse representative mismatch: welded_index=0 original_index=0 mapped_welded_index=1",
+    ):
+        project(
+            asset, np.zeros_like(asset), asset, asset,
+            np.asarray([0, 1], dtype=np.int32), np.asarray([1, 0], dtype=np.int32),
+        )
+
+
+def test_legacy_usd_projection_rejects_weld_map_that_groups_distinct_authored_vertices() -> None:
+    project, simulator_error = _legacy_topology_projector()
+    asset = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float32
     )
 
     with __import__("pytest").raises(
         simulator_error,
         match=(
-            r"non-bijective mapping: mapped_unique_count=1 expected_unique_count=2 "
-            r"missing_unique_count=1"
+            r"weld map groups distinct authored vertices: original_index=1 "
+            r"representative_index=0 asset_max_abs_delta=1"
         ),
     ):
-        project(asset, np.zeros_like(asset), asset, live_rest)
+        project(
+            np.zeros_like(asset), np.zeros_like(asset), asset, asset[:2],
+            np.asarray([0, 2], dtype=np.int32), np.asarray([0, 0, 1], dtype=np.int32),
+        )
+
+
+def test_legacy_usd_projection_rejects_missing_or_non_integer_weld_maps() -> None:
+    project, simulator_error = _legacy_topology_projector()
+    asset = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+
+    with __import__("pytest").raises(
+        simulator_error,
+        match=r"weldedVerticesRemapToOrig must be a one-dimensional integer array",
+    ):
+        project(asset, np.zeros_like(asset), asset, asset, None, np.asarray([0, 1]))
+    with __import__("pytest").raises(
+        simulator_error,
+        match=r"weldedVerticesRemapToWeld contains out-of-range index: index=1 value=2 live_physx_count=2",
+    ):
+        project(
+            asset, np.zeros_like(asset), asset, asset,
+            np.asarray([0, 1], dtype=np.int32), np.asarray([0, 2], dtype=np.int32),
+        )
+
+
+def test_legacy_usd_projection_handles_exact_pant_short_weld_shape_and_nonidentity_order() -> None:
+    project, _ = _legacy_topology_projector()
+    authored_count = 10_221
+    welded_count = 10_033
+    asset = np.zeros((authored_count, 3), dtype=np.float32)
+    source_positions = np.zeros_like(asset)
+    source_velocities = np.zeros_like(asset)
+    welded_to_orig = np.concatenate((
+        np.arange(8, 10_025, dtype=np.int32),
+        np.arange(0, 8, dtype=np.int32),
+        np.arange(10_213, 10_221, dtype=np.int32),
+    ))
+    assert welded_to_orig.shape == (welded_count,)
+    orig_to_weld = np.zeros(authored_count, dtype=np.int32)
+    orig_to_weld[welded_to_orig] = np.arange(welded_count, dtype=np.int32)
+    # The 188 welded-away seam rows share particle zero's state exactly.
+    source_positions[welded_to_orig, 0] = welded_to_orig
+    source_velocities[welded_to_orig, 0] = welded_to_orig
+    source_positions[10_025:10_213] = source_positions[welded_to_orig[0]]
+    source_velocities[10_025:10_213] = source_velocities[welded_to_orig[0]]
+    positions, velocities = project(
+        source_positions, source_velocities, asset,
+        np.full((welded_count, 3), 42.0, dtype=np.float32),
+        welded_to_orig, orig_to_weld,
+    )
+
+    np.testing.assert_array_equal(positions[:, 0], welded_to_orig)
+    np.testing.assert_array_equal(velocities[:, 0], welded_to_orig)
 
 
 def test_legacy_cuda_restore_uses_scene_pose_frame_conversion_before_physx_write() -> None:

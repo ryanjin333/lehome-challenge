@@ -831,27 +831,26 @@ class GarmentEnv(DirectRLEnv):
     @staticmethod
     def _flywheel_project_legacy_usd_to_physx(
         positions, velocities, asset_positions, live_rest_positions,
-        *, topology_tolerance: float = 1e-5,
+        welded_vertices_remap_to_orig, welded_vertices_remap_to_weld,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Project duplicate USD seam vertices into the live PhysX particle order."""
+        """Project legacy USD state into the cooked PhysX particle order.
+
+        PhysX's cooked weld maps, rather than position proximity, are the only
+        topology identity authority.  The live particle positions can already
+        have moved from authored USD rest points when a restore begins.
+        """
 
         source_positions = np.asarray(positions, dtype=np.float32)
         source_velocities = np.asarray(velocities, dtype=np.float32)
         asset = np.asarray(asset_positions, dtype=np.float32)
-        live_rest = np.asarray(live_rest_positions, dtype=np.float32)
         if (
             source_positions.ndim != 2
             or source_positions.shape[1:] != (3,)
             or source_velocities.shape != source_positions.shape
             or asset.shape != source_positions.shape
-            or live_rest.ndim != 2
-            or live_rest.shape[1:] != (3,)
             or not np.isfinite(source_positions).all()
             or not np.isfinite(source_velocities).all()
             or not np.isfinite(asset).all()
-            or not np.isfinite(live_rest).all()
-            or not np.isfinite(topology_tolerance)
-            or topology_tolerance <= 0.0
         ):
             raise SimulatorNumericalDivergenceError(
                 "legacy USD to PhysX cloth topology is invalid"
@@ -861,85 +860,143 @@ class GarmentEnv(DirectRLEnv):
                 "legacy USD to PhysX cloth topology is invalid: usd_row_count=0"
             )
 
+        def integer_vector(value, attribute_name: str) -> np.ndarray:
+            try:
+                vector = np.asarray(value)
+            except (TypeError, ValueError) as error:
+                raise SimulatorNumericalDivergenceError(
+                    f"{attribute_name} must be a one-dimensional integer array"
+                ) from error
+            if vector.ndim != 1 or vector.dtype.kind not in "iu":
+                raise SimulatorNumericalDivergenceError(
+                    f"{attribute_name} must be a one-dimensional integer array"
+                )
+            return vector.astype(np.int64, copy=False)
+
+        remap_to_orig = integer_vector(
+            welded_vertices_remap_to_orig, "weldedVerticesRemapToOrig"
+        )
+        remap_to_weld = integer_vector(
+            welded_vertices_remap_to_weld, "weldedVerticesRemapToWeld"
+        )
+        live_physx_count = len(remap_to_orig)
+        if len(remap_to_weld) != len(source_positions):
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD and live PhysX cloth topology weldedVerticesRemapToWeld "
+                "size mismatch: "
+                f"usd_row_count={len(source_positions)} remap_to_weld_count={len(remap_to_weld)}"
+            )
+        try:
+            live_rest = np.asarray(live_rest_positions, dtype=np.float32)
+        except (TypeError, ValueError) as error:
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD to PhysX cloth topology live particle positions are invalid"
+            ) from error
+        if live_rest.ndim != 2 or live_rest.shape[1:] != (3,) or not np.isfinite(live_rest).all():
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD to PhysX cloth topology live particle positions are invalid"
+            )
+        # Live coordinates only validate the current particle-array shape.  They
+        # are never used as identity evidence or a proximity admission gate:
+        # PhysX may integrate cloth before this restore path runs.
+        if live_physx_count == 0:
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD to PhysX cloth topology has no live PhysX particles"
+            )
+        if live_physx_count != len(live_rest):
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD and live PhysX cloth topology weldedVerticesRemapToOrig "
+                "size mismatch: "
+                f"live_physx_count={len(live_rest)} "
+                f"remap_to_orig_count={live_physx_count}"
+            )
+
+        invalid_orig = np.flatnonzero(
+            (remap_to_orig < 0) | (remap_to_orig >= len(source_positions))
+        )
+        if invalid_orig.size:
+            index = int(invalid_orig[0])
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD to PhysX cloth topology weldedVerticesRemapToOrig "
+                f"contains out-of-range index: index={index} value={int(remap_to_orig[index])} "
+                f"usd_row_count={len(source_positions)}"
+            )
+        if np.unique(remap_to_orig).size != live_physx_count:
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD to PhysX cloth topology weldedVerticesRemapToOrig must be unique: "
+                f"live_physx_count={live_physx_count} "
+                f"unique_original_count={np.unique(remap_to_orig).size}"
+            )
+        invalid_weld = np.flatnonzero(
+            (remap_to_weld < 0) | (remap_to_weld >= live_physx_count)
+        )
+        if invalid_weld.size:
+            index = int(invalid_weld[0])
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD to PhysX cloth topology weldedVerticesRemapToWeld "
+                f"contains out-of-range index: index={index} value={int(remap_to_weld[index])} "
+                f"live_physx_count={live_physx_count}"
+            )
+        mapped_weld_count = int(np.unique(remap_to_weld).size)
+        if mapped_weld_count != live_physx_count:
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD to PhysX cloth topology weldedVerticesRemapToWeld "
+                "does not cover every live PhysX particle: "
+                f"mapped_welded_count={mapped_weld_count} "
+                f"live_physx_count={live_physx_count}"
+            )
+
+        representative_welds = remap_to_weld[remap_to_orig]
+        mismatch = np.flatnonzero(
+            representative_welds != np.arange(live_physx_count, dtype=np.int64)
+        )
+        if mismatch.size:
+            welded_index = int(mismatch[0])
+            original_index = int(remap_to_orig[welded_index])
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD to PhysX cloth topology weld map inverse representative mismatch: "
+                f"welded_index={welded_index} original_index={original_index} "
+                f"mapped_welded_index={int(remap_to_weld[original_index])}"
+            )
+
+        representative_for_authored = remap_to_orig[remap_to_weld]
         normalized_asset = asset.copy()
         normalized_asset[normalized_asset == 0.0] = 0.0
-        first_by_point: dict[bytes, int] = {}
-        representatives: list[int] = []
-        groups: dict[int, list[int]] = {}
-        for index, point in enumerate(normalized_asset):
-            key = point.tobytes()
-            representative = first_by_point.get(key)
-            if representative is None:
-                first_by_point[key] = index
-                representatives.append(index)
-                groups[index] = [index]
-            else:
-                groups[representative].append(index)
-        representative_indices = np.asarray(representatives, dtype=np.int64)
-        unique_asset = asset[representative_indices]
-        if len(unique_asset) != len(live_rest):
+        asset_max_abs_delta = np.max(
+            np.abs(normalized_asset - normalized_asset[representative_for_authored]), axis=1
+        )
+        geometry_mismatch = np.flatnonzero(asset_max_abs_delta != 0.0)
+        if geometry_mismatch.size:
+            original_index = int(geometry_mismatch[0])
+            representative = int(representative_for_authored[original_index])
             raise SimulatorNumericalDivergenceError(
-                "legacy USD and live PhysX cloth topology cardinality mismatch: "
-                f"usd_unique_count={len(unique_asset)} live_physx_count={len(live_rest)} "
-                f"usd_row_count={len(asset)} "
-                f"duplicate_seam_row_count={len(asset) - len(unique_asset)}"
+                "legacy USD to PhysX cloth topology weld map groups distinct authored vertices: "
+                f"original_index={original_index} representative_index={representative} "
+                f"asset_max_abs_delta={float(asset_max_abs_delta[original_index]):.9g}"
             )
 
-        for representative, group in groups.items():
-            if len(group) == 1:
-                continue
-            duplicate_indices = np.asarray(group[1:], dtype=np.int64)
-            position_max_abs_delta = float(np.max(np.abs(
-                source_positions[duplicate_indices] - source_positions[representative]
-            )))
-            velocity_max_abs_delta = float(np.max(np.abs(
-                source_velocities[duplicate_indices] - source_velocities[representative]
-            )))
-            if position_max_abs_delta != 0.0 or velocity_max_abs_delta != 0.0:
-                raise SimulatorNumericalDivergenceError(
-                    "legacy USD duplicate seam state is inconsistent: "
-                    f"representative_index={representative} duplicate_index={group[1]} "
-                    f"position_max_abs_delta={position_max_abs_delta:.9g} "
-                    f"velocity_max_abs_delta={velocity_max_abs_delta:.9g}"
-                )
+        position_max_abs_delta = np.max(
+            np.abs(source_positions - source_positions[representative_for_authored]), axis=1
+        )
+        velocity_max_abs_delta = np.max(
+            np.abs(source_velocities - source_velocities[representative_for_authored]), axis=1
+        )
+        state_mismatch = np.flatnonzero(
+            (position_max_abs_delta != 0.0) | (velocity_max_abs_delta != 0.0)
+        )
+        if state_mismatch.size:
+            duplicate_index = int(state_mismatch[0])
+            representative = int(representative_for_authored[duplicate_index])
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD duplicate seam state is inconsistent: "
+                f"representative_index={representative} duplicate_index={duplicate_index} "
+                f"position_max_abs_delta={float(position_max_abs_delta[duplicate_index]):.9g} "
+                f"velocity_max_abs_delta={float(velocity_max_abs_delta[duplicate_index]):.9g}"
+            )
 
-        selected_chunks: list[np.ndarray] = []
-        distance_chunks: list[np.ndarray] = []
-        for start in range(0, len(live_rest), 256):
-            delta = live_rest[start : start + 256, None, :] - unique_asset[None, :, :]
-            squared_distance = np.einsum("ijk,ijk->ij", delta, delta)
-            selected = np.argmin(squared_distance, axis=1)
-            selected_chunks.append(selected)
-            distance_chunks.append(
-                np.sqrt(squared_distance[np.arange(len(selected)), selected])
-            )
-        selected_groups = np.concatenate(selected_chunks)
-        selected_distances = np.concatenate(distance_chunks)
-        max_distance = float(np.max(selected_distances))
-        median_distance = float(np.median(selected_distances))
-        if max_distance > topology_tolerance:
-            raise SimulatorNumericalDivergenceError(
-                "legacy USD and live PhysX cloth topology nearest-coordinate distance mismatch: "
-                f"max_distance={max_distance:.9g} median_distance={median_distance:.9g} "
-                f"tolerance={topology_tolerance:.9g}"
-            )
-        mapped_unique_count = int(np.unique(selected_groups).size)
-        if (
-            mapped_unique_count != len(unique_asset)
-            or not np.array_equal(
-                np.sort(selected_groups), np.arange(len(unique_asset), dtype=selected_groups.dtype)
-            )
-        ):
-            raise SimulatorNumericalDivergenceError(
-                "legacy USD and live PhysX cloth topology non-bijective mapping: "
-                f"mapped_unique_count={mapped_unique_count} "
-                f"expected_unique_count={len(unique_asset)} "
-                f"missing_unique_count={len(unique_asset) - mapped_unique_count}"
-            )
-        projected_indices = representative_indices[selected_groups]
         return (
-            source_positions[projected_indices].copy(),
-            source_velocities[projected_indices].copy(),
+            source_positions[remap_to_orig].copy(),
+            source_velocities[remap_to_orig].copy(),
         )
 
     @staticmethod
@@ -994,6 +1051,40 @@ class GarmentEnv(DirectRLEnv):
                 or not callable(getattr(velocities_attr, "Get", None))):
             raise RuntimeError("legacy CPU garment USD points or velocities are unreadable")
         return positions_attr, velocities_attr
+
+    def _flywheel_physx_weld_maps(self):
+        """Read the cooked topology maps from the active PhysX cloth prim."""
+
+        prim = getattr(self.object, "_prim", None)
+        get_attribute = getattr(prim, "GetAttribute", None)
+        if not callable(get_attribute):
+            raise SimulatorNumericalDivergenceError(
+                "live PhysX cloth prim does not expose cooked weld maps"
+            )
+
+        def read_map(attribute_name: str):
+            attribute = get_attribute(attribute_name)
+            is_valid = getattr(attribute, "IsValid", None)
+            if attribute is None or (callable(is_valid) and not is_valid()):
+                raise SimulatorNumericalDivergenceError(
+                    f"live PhysX cloth prim is missing {attribute_name}"
+                )
+            get_value = getattr(attribute, "Get", None)
+            if not callable(get_value):
+                raise SimulatorNumericalDivergenceError(
+                    f"live PhysX cloth prim cannot read {attribute_name}"
+                )
+            value = get_value()
+            if value is None:
+                raise SimulatorNumericalDivergenceError(
+                    f"live PhysX cloth prim has unset {attribute_name}"
+                )
+            return value
+
+        return (
+            read_map("physxParticle:weldedVerticesRemapToOrig"),
+            read_map("physxParticle:weldedVerticesRemapToWeld"),
+        )
 
     def _flywheel_legacy_cpu_cloth_state(self) -> tuple[np.ndarray, np.ndarray]:
         positions_attr, velocities_attr = self._flywheel_legacy_cpu_cloth_attributes()
@@ -1283,17 +1374,12 @@ class GarmentEnv(DirectRLEnv):
                 )
             asset_points = to_numpy(self.object._get_points_pose()).reshape(-1, 3)
             live_rest_world = to_numpy(self.object.initial_points_positions).reshape(-1, 3)
-            initial_position = to_numpy(self.object.initial_root_position).reshape(3)
-            initial_orientation = to_numpy(self.object.initial_root_orientation).reshape(4)
-            scale_array = to_numpy(scale).reshape(3)
-            initial_rotation = np.asarray(
-                quat_to_rot_matrix(initial_orientation), dtype=np.float32
+            welded_vertices_remap_to_orig, welded_vertices_remap_to_weld = (
+                self._flywheel_physx_weld_maps()
             )
-            live_rest_local = (
-                (live_rest_world - initial_position) @ initial_rotation
-            ) / scale_array
             cloth_position, cloth_velocity = self._flywheel_project_legacy_usd_to_physx(
-                cloth_position, cloth_velocity, asset_points, live_rest_local
+                cloth_position, cloth_velocity, asset_points, live_rest_world,
+                welded_vertices_remap_to_orig, welded_vertices_remap_to_weld,
             )
             cloth_position, cloth_velocity = self._flywheel_legacy_local_to_world(
                 cloth_position, cloth_velocity, pose[:3], rotation, scale
