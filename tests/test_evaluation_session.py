@@ -52,8 +52,8 @@ def test_dynamic_mesh_collider_audit_reports_exact_prim_metric_and_limit() -> No
 
     assert result == {
         "healthy": False,
-        "reason": "unsupported_dynamic_triangle_mesh_collider",
-        "metric_name": "dynamic_triangle_mesh_collider_count",
+        "reason": "unsupported_dynamic_collider_geometry",
+        "metric_name": "unsupported_dynamic_collider_count",
         "metric_value": 1,
         "metric_limit": 0,
         "offending_colliders": [
@@ -144,6 +144,117 @@ def test_mesh_simplification_is_an_unsupported_dynamic_triangle_mesh() -> None:
     assert result["offending_colliders"][0]["approximation"] == "meshsimplification"
 
 
+def test_dynamic_plane_collider_is_rejected_even_without_mesh_schema() -> None:
+    audit = _collider_audit_module()
+    rigid_body = {
+        "path": "/World/Scene/GroundPlane",
+        "type_name": "Xform",
+        "rigid_body": True,
+        "kinematic": False,
+    }
+
+    result = audit.audit_dynamic_mesh_colliders([
+        {
+            "path": "/World/Scene/GroundPlane/CollisionPlane",
+            "type_name": "Plane",
+            "collision": True,
+            "parent": rigid_body,
+        }
+    ])
+
+    assert result["healthy"] is False
+    assert result["metric_value"] == 1
+    assert result["offending_colliders"] == [
+        {
+            "usd_prim": "/World/Scene/GroundPlane/CollisionPlane",
+            "prim_type": "Plane",
+            "approximation": "not_applicable",
+            "rigid_body_prim": "/World/Scene/GroundPlane",
+            "rigid_body_kinematic": False,
+        }
+    ]
+
+
+def test_dynamic_collision_xform_uses_authored_mesh_approximation() -> None:
+    audit = _collider_audit_module()
+    rigid_body = {
+        "path": "/World/Robot/base",
+        "type_name": "Xform",
+        "rigid_body": True,
+        "kinematic": False,
+    }
+
+    result = audit.audit_dynamic_mesh_colliders([
+        {
+            "path": "/World/Robot/base/collisions",
+            "type_name": "Xform",
+            "collision": True,
+            "mesh_collision": True,
+            "approximation": "convexDecomposition",
+            "parent": rigid_body,
+        }
+    ])
+
+    assert result["healthy"] is True
+    assert result["metric_value"] == 0
+
+
+def test_room_spawn_disables_authored_dynamic_ground_plane_before_simulation() -> None:
+    scene_source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/assets/scenes/bedroom.py"
+    )
+    scene_tree = ast.parse(scene_source_path.read_text(encoding="utf-8"))
+    scene_cfg = next(
+        node.value
+        for node in scene_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "MARBLE_BEDROOM_CFG"
+            for target in node.targets
+        )
+    )
+    assert isinstance(scene_cfg, ast.Call)
+    spawn_cfg = next(
+        keyword.value for keyword in scene_cfg.keywords if keyword.arg == "spawn"
+    )
+    assert isinstance(spawn_cfg, ast.Call)
+    rigid_props = next(
+        keyword.value for keyword in spawn_cfg.keywords if keyword.arg == "rigid_props"
+    )
+    assert isinstance(rigid_props, ast.Call)
+    assert isinstance(rigid_props.func, ast.Attribute)
+    assert rigid_props.func.attr == "RigidBodyPropertiesCfg"
+    rigid_enabled = next(
+        keyword.value
+        for keyword in rigid_props.keywords
+        if keyword.arg == "rigid_body_enabled"
+    )
+    assert isinstance(rigid_enabled, ast.Constant)
+    assert rigid_enabled.value is False
+
+    env_source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(env_source_path.read_text(encoding="utf-8"))
+    setup = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_setup_scene"
+    )
+    room_cfg = next(
+        node
+        for node in ast.walk(setup)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "MARBLE_BEDROOM_CFG"
+        and node.attr == "spawn"
+    )
+    assert room_cfg is not None
+
+
 def test_usd_collider_audit_uses_instance_proxies_and_mesh_collision_api(monkeypatch) -> None:
     audit = _collider_audit_module()
 
@@ -227,7 +338,7 @@ def test_usd_collider_audit_uses_instance_proxies_and_mesh_collision_api(monkeyp
 
     assert audit.audit_usd_stage(Stage()) == {
         "healthy": True,
-        "metric_name": "dynamic_triangle_mesh_collider_count",
+        "metric_name": "unsupported_dynamic_collider_count",
         "metric_value": 0,
         "metric_limit": 0,
         "offending_colliders": [],
@@ -317,6 +428,84 @@ def test_usd_collider_audit_finds_rigid_body_below_collision_ancestor(monkeypatc
     assert result["offending_colliders"][0]["rigid_body_prim"] == str(
         rigid_body.GetPath()
     )
+
+
+def test_usd_collider_audit_normalizes_dynamic_plane_geometry(monkeypatch) -> None:
+    audit = _collider_audit_module()
+
+    class Attribute:
+        def __init__(self, value):
+            self.value = value
+
+        def Get(self):
+            return self.value
+
+    class Prim:
+        def __init__(self, path, type_name, parent=None, *, collision=False, rigid=False):
+            self.path = path
+            self.type_name = type_name
+            self.parent = parent
+            self.collision = collision
+            self.rigid = rigid
+
+        def IsA(self, schema):
+            return schema == "Mesh" and self.type_name == "Mesh"
+
+        def HasAPI(self, api):
+            return (api == "CollisionAPI" and self.collision) or (
+                api == "RigidBodyAPI" and self.rigid
+            )
+
+        def GetParent(self):
+            return self.parent
+
+        def GetAttribute(self, name):
+            values = {
+                "physics:collisionEnabled": True,
+                "physics:rigidBodyEnabled": True,
+                "physics:kinematicEnabled": False,
+            }
+            return Attribute(values[name]) if name in values else None
+
+        def GetPath(self):
+            return self.path
+
+        def GetTypeName(self):
+            return self.type_name
+
+        def __bool__(self):
+            return True
+
+    rigid = Prim("/World/Scene/GroundPlane", "Xform", rigid=True)
+    plane = Prim(
+        "/World/Scene/GroundPlane/CollisionPlane",
+        "Plane",
+        parent=rigid,
+        collision=True,
+    )
+
+    class MeshCollisionAPI:
+        def __init__(self, prim):
+            raise AssertionError("Plane geometry must not be adapted as a mesh")
+
+    pxr = types.ModuleType("pxr")
+    pxr.Usd = types.SimpleNamespace(
+        PrimRange=types.SimpleNamespace(Stage=lambda stage, traversal: [plane]),
+        TraverseInstanceProxies=lambda: "instance-proxies",
+    )
+    pxr.UsdGeom = types.SimpleNamespace(Mesh="Mesh")
+    pxr.UsdPhysics = types.SimpleNamespace(
+        CollisionAPI="CollisionAPI",
+        RigidBodyAPI="RigidBodyAPI",
+        MeshCollisionAPI=MeshCollisionAPI,
+    )
+    monkeypatch.setitem(sys.modules, "pxr", pxr)
+
+    result = audit.audit_usd_stage(object())
+
+    assert result["healthy"] is False
+    assert result["metric_value"] == 1
+    assert result["offending_colliders"][0]["prim_type"] == "Plane"
 
 
 def test_usd_collider_audit_skips_parent_only_and_disabled_physics(monkeypatch) -> None:
@@ -468,8 +657,8 @@ def test_collider_health_and_admission_gate_fail_closed_with_live_evidence() -> 
     ast.fix_missing_locations(env_module)
     collision_health = {
         "healthy": False,
-        "reason": "unsupported_dynamic_triangle_mesh_collider",
-        "metric_name": "dynamic_triangle_mesh_collider_count",
+        "reason": "unsupported_dynamic_collider_geometry",
+        "metric_name": "unsupported_dynamic_collider_count",
         "metric_value": 1,
         "metric_limit": 0,
         "offending_colliders": [
@@ -508,7 +697,7 @@ def test_collider_health_and_admission_gate_fail_closed_with_live_evidence() -> 
     with __import__("pytest").raises(
         error_type,
         match=(
-            r"dynamic_triangle_mesh_collider_count=1 limit=0; .*"
+            r"unsupported_dynamic_collider_count=1 limit=0; .*"
             r"usd_prim=/World/Robot/link/visual_mesh prim_type=Mesh approximation=none"
         ),
     ):
@@ -544,7 +733,7 @@ def test_collider_health_converts_a_stage_readback_error_to_fail_closed_evidence
     assert health == {
         "healthy": False,
         "reason": "collider_static_audit_unavailable",
-        "metric_name": "dynamic_triangle_mesh_collider_count",
+        "metric_name": "unsupported_dynamic_collider_count",
         "metric_value": "unavailable",
         "metric_limit": 0,
         "offending_colliders": [],

@@ -20,7 +20,7 @@ import isaacsim.core.utils.prims as prims_utils
 from lehome.tasks.bedroom.garment_bi_cfg_v2 import GarmentEnvCfg
 from lehome.utils.success_checker_chanllege import success_checker_garment_fold
 from lehome.utils.depth_to_pointcloud import generate_pointcloud_from_data
-from lehome.assets.scenes.bedroom import MARBLE_BEDROOM_USD_PATH
+from lehome.assets.scenes.bedroom import MARBLE_BEDROOM_CFG
 from lehome.devices.action_process import preprocess_device_action
 from lehome.assets.object.Garment import GarmentObject
 from lehome.assets.collider_audit import audit_current_usd_stage
@@ -84,7 +84,7 @@ class GarmentEnv(DirectRLEnv):
         self.top_camera = TiledCamera(self.cfg.top_camera)
         self.left_camera = TiledCamera(self.cfg.left_wrist)
         self.right_camera = TiledCamera(self.cfg.right_wrist)
-        cfg = sim_utils.UsdFileCfg(usd_path=f"{MARBLE_BEDROOM_USD_PATH}")
+        cfg = MARBLE_BEDROOM_CFG.spawn
         cfg.func(
             "/World/Scene",
             cfg,
@@ -855,7 +855,7 @@ class GarmentEnv(DirectRLEnv):
                 self._flywheel_collider_health = {
                     "healthy": False,
                     "reason": "collider_static_audit_unavailable",
-                    "metric_name": "dynamic_triangle_mesh_collider_count",
+                    "metric_name": "unsupported_dynamic_collider_count",
                     "metric_value": "unavailable",
                     "metric_limit": 0,
                     "offending_colliders": [],
@@ -865,7 +865,7 @@ class GarmentEnv(DirectRLEnv):
             return result if isinstance(result, dict) else {
                 "healthy": False,
                 "reason": "collider_static_audit_unavailable",
-                "metric_name": "dynamic_triangle_mesh_collider_count",
+                "metric_name": "unsupported_dynamic_collider_count",
                 "metric_value": "unavailable",
                 "metric_limit": 0,
                 "offending_colliders": [],

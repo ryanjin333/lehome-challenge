@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU/static USD audit for the PhysX dynamic triangle-mesh restriction."""
+"""CPU/static USD audit for PhysX dynamic-collider compatibility."""
 
 from __future__ import annotations
 

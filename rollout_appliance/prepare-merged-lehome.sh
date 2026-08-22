@@ -12,6 +12,8 @@ sudo cp -a /opt/lehome/source/lehome/lehome/flywheel/. /opt/lehome/merged/lehome
 sudo mkdir -p /opt/lehome/merged/lehome/assets/object
 sudo cp -a /opt/lehome/source/lehome/lehome/assets/object/Garment.py /opt/lehome/merged/lehome/assets/object/Garment.py
 sudo cp -a /opt/lehome/source/lehome/lehome/assets/collider_audit.py /opt/lehome/merged/lehome/assets/collider_audit.py
+sudo mkdir -p /opt/lehome/merged/lehome/assets/scenes
+sudo cp -a /opt/lehome/source/lehome/lehome/assets/scenes/bedroom.py /opt/lehome/merged/lehome/assets/scenes/bedroom.py
 sudo cp -a /opt/lehome/source/lehome/lehome/tasks/bedroom/garment_bi_v2.py /opt/lehome/merged/lehome/tasks/bedroom/garment_bi_v2.py
 sudo cp -a /opt/lehome/source/lehome/lehome/devices/__init__.py /opt/lehome/merged/lehome/devices/__init__.py
 if [ -f /opt/lehome/source/lehome/lehome/devices/action_process.py ]; then

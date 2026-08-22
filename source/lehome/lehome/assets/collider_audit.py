@@ -1,9 +1,9 @@
-"""Fail-closed USD evidence for unsupported dynamic triangle-mesh colliders.
+"""Fail-closed USD evidence for unsupported dynamic collision geometry.
 
-PhysX rejects triangle-mesh collision shapes on non-kinematic dynamic rigid
-bodies.  The value ``none`` is the USD/PhysX approximation spelling for that
-triangle-mesh mode.  This module deliberately audits the composed stage; it
-does not mutate collision approximation or simulation settings.
+PhysX rejects planes, heightfields, tetrahedron meshes, and non-SDF triangle
+meshes on non-kinematic dynamic rigid bodies.  This module deliberately audits
+the composed stage; it does not mutate collision approximation or simulation
+settings.
 """
 
 from __future__ import annotations
@@ -19,6 +19,13 @@ _SAFE_DYNAMIC_MESH_APPROXIMATIONS = frozenset({
     "convexhull",
     "sdf",
     "spherefill",
+})
+_SAFE_DYNAMIC_PRIMITIVE_TYPES = frozenset({
+    "Capsule",
+    "Cone",
+    "Cube",
+    "Cylinder",
+    "Sphere",
 })
 
 
@@ -62,31 +69,41 @@ def _rigid_body_for(prim: Any) -> Any:
 
 
 def audit_dynamic_mesh_colliders(prims: Iterable[Any]) -> dict[str, object]:
-    """Report, without modifying, dynamic triangle mesh collision shapes.
+    """Report, without modifying, unsupported dynamic collision shapes.
 
-    ``prims`` is intentionally a small normalized interface so the evidence
-    logic is CPU-testable without Isaac: mesh records expose ``collision``,
-    ``approximation``, ``parent``, and their ancestor exposes ``rigid_body``
-    and ``kinematic``.  :func:`audit_usd_stage` adapts real USD prims to it.
+    The legacy function name is retained for callers. ``prims`` is a small
+    normalized interface so the evidence logic is CPU-testable without Isaac:
+    collision records expose ``mesh_collision``, ``approximation``, ``parent``,
+    and their ancestor exposes ``rigid_body`` and ``kinematic``.
+    :func:`audit_usd_stage` adapts real USD prims to it.
     """
 
     offending: list[dict[str, object]] = []
     for prim in prims:
-        if _prim_type(prim) != "Mesh" or not bool(_field(prim, "collision", False)):
+        if not bool(_field(prim, "collision", False)):
             continue
         rigid_body = _rigid_body_for(prim)
         if rigid_body is None or bool(_field(rigid_body, "kinematic", False)):
             continue
-        approximation = _field(prim, "approximation")
-        normalized_approximation = (
-            str(approximation).strip().lower() if approximation is not None else "<unreadable>"
-        )
-        if normalized_approximation in _SAFE_DYNAMIC_MESH_APPROXIMATIONS:
+        prim_type = _prim_type(prim)
+        mesh_collision = bool(_field(prim, "mesh_collision", prim_type == "Mesh"))
+        if mesh_collision:
+            approximation = _field(prim, "approximation")
+            normalized_approximation = (
+                str(approximation).strip().lower()
+                if approximation is not None
+                else "<unreadable>"
+            )
+            supported = normalized_approximation in _SAFE_DYNAMIC_MESH_APPROXIMATIONS
+        else:
+            normalized_approximation = "not_applicable"
+            supported = prim_type in _SAFE_DYNAMIC_PRIMITIVE_TYPES
+        if supported:
             continue
         offending.append(
             {
                 "usd_prim": _prim_path(prim),
-                "prim_type": _prim_type(prim),
+                "prim_type": prim_type,
                 "approximation": normalized_approximation,
                 "rigid_body_prim": _prim_path(rigid_body),
                 "rigid_body_kinematic": False,
@@ -95,11 +112,11 @@ def audit_dynamic_mesh_colliders(prims: Iterable[Any]) -> dict[str, object]:
     return {
         "healthy": not offending,
         **(
-            {"reason": "unsupported_dynamic_triangle_mesh_collider"}
+            {"reason": "unsupported_dynamic_collider_geometry"}
             if offending
             else {}
         ),
-        "metric_name": "dynamic_triangle_mesh_collider_count",
+        "metric_name": "unsupported_dynamic_collider_count",
         "metric_value": len(offending),
         "metric_limit": 0,
         "offending_colliders": offending,
@@ -115,7 +132,7 @@ def audit_usd_stage(stage: Any) -> dict[str, object]:
         return {
             "healthy": False,
             "reason": "collider_static_audit_unavailable",
-            "metric_name": "dynamic_triangle_mesh_collider_count",
+            "metric_name": "unsupported_dynamic_collider_count",
             "metric_value": "unavailable",
             "metric_limit": 0,
             "offending_colliders": [],
@@ -124,7 +141,7 @@ def audit_usd_stage(stage: Any) -> dict[str, object]:
         return {
             "healthy": False,
             "reason": "collider_static_audit_unavailable",
-            "metric_name": "dynamic_triangle_mesh_collider_count",
+            "metric_name": "unsupported_dynamic_collider_count",
             "metric_value": "unavailable",
             "metric_limit": 0,
             "offending_colliders": [],
@@ -140,10 +157,9 @@ def audit_usd_stage(stage: Any) -> dict[str, object]:
 
     normalized_prims: list[dict[str, object]] = []
     for prim in Usd.PrimRange.Stage(stage, Usd.TraverseInstanceProxies()):
-        if not prim.IsA(UsdGeom.Mesh):
-            continue
-        # CollisionAPI and MeshCollisionAPI author the mesh collider itself;
-        # they are not inherited from an arbitrary ancestor Xform.
+        # CollisionAPI authors the collider itself; it is not inherited from
+        # an arbitrary ancestor Xform. MeshCollisionAPI may be authored on an
+        # Xform that references collision mesh children, as in the SO-101 USD.
         if not prim.HasAPI(UsdPhysics.CollisionAPI):
             continue
         collision_enabled_attribute = prim.GetAttribute("physics:collisionEnabled")
@@ -165,13 +181,23 @@ def audit_usd_stage(stage: Any) -> dict[str, object]:
             continue
         kinematic_attribute = rigid_body.GetAttribute("physics:kinematicEnabled")
         kinematic = bool(kinematic_attribute.Get()) if kinematic_attribute else False
-        approximation_attribute = UsdPhysics.MeshCollisionAPI(prim).GetApproximationAttr()
-        approximation = approximation_attribute.Get() if approximation_attribute else None
+        mesh_collision = prim.IsA(UsdGeom.Mesh) or prim.HasAPI(
+            UsdPhysics.MeshCollisionAPI
+        )
+        approximation = None
+        if mesh_collision:
+            approximation_attribute = UsdPhysics.MeshCollisionAPI(
+                prim
+            ).GetApproximationAttr()
+            approximation = (
+                approximation_attribute.Get() if approximation_attribute else None
+            )
         normalized_prims.append(
             {
                 "path": str(prim.GetPath()),
                 "type_name": str(prim.GetTypeName()),
                 "collision": True,
+                "mesh_collision": mesh_collision,
                 "approximation": approximation,
                 "parent": {
                     "path": str(rigid_body.GetPath()),
@@ -193,7 +219,7 @@ def audit_current_usd_stage() -> dict[str, object]:
         return {
             "healthy": False,
             "reason": "collider_static_audit_unavailable",
-            "metric_name": "dynamic_triangle_mesh_collider_count",
+            "metric_name": "unsupported_dynamic_collider_count",
             "metric_value": "unavailable",
             "metric_limit": 0,
             "offending_colliders": [],
@@ -210,7 +236,7 @@ def audit_usd_file(usd_path: str) -> dict[str, object]:
         return {
             "healthy": False,
             "reason": "collider_static_audit_unavailable",
-            "metric_name": "dynamic_triangle_mesh_collider_count",
+            "metric_name": "unsupported_dynamic_collider_count",
             "metric_value": "unavailable",
             "metric_limit": 0,
             "offending_colliders": [],
