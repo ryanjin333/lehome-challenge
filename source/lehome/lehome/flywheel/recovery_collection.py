@@ -17,7 +17,9 @@ import re
 import stat
 from typing import Any, Mapping, Sequence
 
-from lehome.flywheel.snapshots import PHYSX_CLOTH_STATE_AUTHORITY, Snapshot
+from lehome.flywheel.snapshots import (
+    LEGACY_USD_LOCAL_CLOTH_AUTHORITY, PHYSX_CLOTH_STATE_AUTHORITY, Snapshot,
+)
 
 
 RECOVERY_KIND = "controlled_success_recovery_snapshot_v3"
@@ -422,6 +424,109 @@ def _validate_continuation_snapshot_boundary(
         raise ValueError("continuation snapshot randomization does not match the authenticated reset")
 
 
+def validate_snapshot_source_descriptor(descriptor_path: str | Path) -> dict[str, object]:
+    """Validate one source assignment before any simulator is started."""
+
+    descriptor_file = _strict_absolute_regular_file(
+        descriptor_path, field="snapshot source descriptor"
+    )
+    try:
+        rows = _strict_json_value_from_text(
+            descriptor_file.read_text(encoding="utf-8"), field="snapshot source descriptor"
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ValueError("snapshot source descriptor is malformed") from error
+    if not isinstance(rows, list) or len(rows) != 1 or type(rows[0]) is not dict:
+        raise ValueError("snapshot source descriptor must contain exactly one row")
+    row = dict(rows[0])
+    category, garment, seed = row.get("category"), row.get("garment"), row.get("seed")
+    if (
+        row.get("snapshot_source_bootstrap") is not True
+        or row.get("recovery_kind") is not None
+        or category not in {"top_long", "top_short", "pant_long", "pant_short"}
+        or not isinstance(garment, str) or not garment
+        or type(seed) is not int or seed < 0
+        or row.get("source_seed") != seed
+    ):
+        raise ValueError("snapshot source descriptor lineage is invalid")
+
+    replay_kind = row.get("replay_kind")
+    restore_keys = {
+        "restore_snapshot", "restore_snapshot_sha256", "restore_snapshot_cloth_frame",
+        "parent_episode_id", "lineage_id",
+    }
+    if replay_kind is None:
+        if any(key in row for key in restore_keys):
+            raise ValueError("ordinary snapshot source descriptor cannot carry replay state")
+        return row
+    if replay_kind != "verified_success_reset_v1":
+        raise ValueError("snapshot source descriptor replay kind is invalid")
+    if row.get("parent_episode_id") != row.get("lineage_id") or not isinstance(
+        row.get("parent_episode_id"), str
+    ) or not row["parent_episode_id"]:
+        raise ValueError("snapshot source descriptor replay lineage is invalid")
+    if row.get("restore_snapshot_cloth_frame") != LEGACY_USD_LOCAL_CLOTH_AUTHORITY:
+        raise ValueError("snapshot source descriptor cloth frame is invalid")
+    restore = _strict_absolute_regular_file(
+        row.get("restore_snapshot"), field="snapshot source restore snapshot"
+    )
+    expected = row.get("restore_snapshot_sha256")
+    if not isinstance(expected, str) or _LOWERCASE_SHA256.fullmatch(expected) is None:
+        raise ValueError("snapshot source restore snapshot SHA-256 is invalid")
+    if _sha256(restore) != expected:
+        raise ValueError("snapshot source restore snapshot SHA-256 mismatch")
+    payload = _strict_json_object(restore, field="snapshot source restore snapshot")
+    required = {
+        "schema_version", "robot_position", "robot_velocity", "cloth_position",
+        "cloth_velocity", "rng_state", "garment_name", "randomization", "scene_state",
+    }
+    if set(payload) != required or payload.get("schema_version") != 1:
+        raise ValueError("snapshot source restore snapshot has an incompatible schema")
+
+    def vector(value: object, *, size: int, name: str) -> tuple[float, ...]:
+        if (
+            not isinstance(value, list) or len(value) != size
+            or any(type(item) not in (int, float) or not math.isfinite(float(item)) for item in value)
+        ):
+            raise ValueError(f"snapshot source restore snapshot {name} is invalid")
+        return tuple(float(item) for item in value)
+
+    def cloth(value: object, *, name: str) -> tuple[tuple[float, float, float], ...]:
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"snapshot source restore snapshot {name} is invalid")
+        rows: list[tuple[float, float, float]] = []
+        for point in value:
+            if (
+                not isinstance(point, list) or len(point) != 3
+                or any(type(item) not in (int, float) or not math.isfinite(float(item)) for item in point)
+            ):
+                raise ValueError(f"snapshot source restore snapshot {name} is invalid")
+            rows.append(tuple(float(item) for item in point))
+        return tuple(rows)
+
+    try:
+        snapshot = Snapshot(
+            schema_version=1,
+            robot_position=vector(payload["robot_position"], size=12, name="robot_position"),
+            robot_velocity=vector(payload["robot_velocity"], size=12, name="robot_velocity"),
+            cloth_position=cloth(payload["cloth_position"], name="cloth_position"),
+            cloth_velocity=cloth(payload["cloth_velocity"], name="cloth_velocity"),
+            rng_state=dict(payload["rng_state"]), garment_name=str(payload["garment_name"]),
+            randomization=dict(payload["randomization"]), scene_state=dict(payload["scene_state"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("snapshot source restore snapshot has an incompatible schema") from error
+    pose = snapshot.scene_state.get("garment_reset_pose")
+    if (
+        snapshot.garment_name != garment
+        or snapshot.randomization.get("strategy") != "canonical"
+        or not isinstance(pose, list) or len(pose) != 6
+        or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in pose)
+    ):
+        raise ValueError("snapshot source restore snapshot cloth frame is invalid")
+    return row
+
+
 def validate_snapshot_source_bootstrap_evidence(
     *, accepted_root: str | Path, descriptor_path: str | Path,
 ) -> tuple[int, ...]:
@@ -434,20 +539,8 @@ def validate_snapshot_source_bootstrap_evidence(
     identity.
     """
 
-    descriptor_file = _strict_absolute_regular_file(descriptor_path, field="snapshot source descriptor")
-    try:
-        rows = _strict_json_value_from_text(descriptor_file.read_text(encoding="utf-8"), field="snapshot source descriptor")
-    except (OSError, UnicodeError, ValueError) as error:
-        raise ValueError("snapshot source descriptor is malformed") from error
-    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
-        raise ValueError("snapshot source descriptor must contain exactly one row")
-    descriptor_row = rows[0]
+    descriptor_row = validate_snapshot_source_descriptor(descriptor_path)
     category, garment, seed = descriptor_row.get("category"), descriptor_row.get("garment"), descriptor_row.get("seed")
-    if (descriptor_row.get("snapshot_source_bootstrap") is not True or descriptor_row.get("recovery_kind") is not None
-            or category not in {"top_long", "top_short", "pant_long", "pant_short"}
-            or not isinstance(garment, str) or not garment
-            or type(seed) is not int or seed < 0 or descriptor_row.get("source_seed") != seed):
-        raise ValueError("snapshot source descriptor lineage is invalid")
     accepted = Path(accepted_root)
     if not accepted.is_absolute() or accepted.is_symlink() or not accepted.is_dir():
         raise ValueError("snapshot source accepted root is unsafe")

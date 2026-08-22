@@ -76,6 +76,8 @@ for row in rows:
         raise SystemExit("success replay matrix row has an unsafe restore snapshot")
     if not isinstance(row.get("restore_snapshot_sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", row["restore_snapshot_sha256"]) is None:
         raise SystemExit("success replay matrix row has an invalid restore digest")
+    if row.get("restore_snapshot_cloth_frame") not in {"usd_local_points_v1", "physx_cloth_view_world_v1"}:
+        raise SystemExit("success replay matrix row has an invalid cloth frame")
     if not isinstance(row.get("parent_episode_id"), str) or not row["parent_episode_id"] or row.get("lineage_id") != row["parent_episode_id"]:
         raise SystemExit("success replay matrix row has inconsistent lineage")
 PY

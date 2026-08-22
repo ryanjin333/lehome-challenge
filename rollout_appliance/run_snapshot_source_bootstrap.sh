@@ -34,6 +34,23 @@ fi
 if [ "$(sha256sum "${DESCRIPTOR}" | awk '{print $1}')" != "${DESCRIPTOR_SHA256}" ]; then
   echo "snapshot source bootstrap descriptor hash changed" >&2; exit 2
 fi
+if ! safe_runtime_source_root "${RUNTIME_SOURCE_ROOT}"; then
+  echo "snapshot source bootstrap packaged runtime source is missing or unsafe" >&2; exit 4
+fi
+if ! docker run --rm --user 1234:1234 --network none -i \
+  -v "${WORKSPACE}:${WORKSPACE}:ro" \
+  -v "${DESCRIPTOR}:${DESCRIPTOR}:ro" \
+  -v "${RUNTIME_SOURCE_ROOT}:${RUNTIME_SOURCE_ROOT}:ro" \
+  -e "PYTHONPATH=${RUNTIME_SOURCE_ROOT}" \
+  --entrypoint /opt/lehome-challenge/.venv/bin/python \
+  "${ROLLOUT_IMAGE}" - "${DESCRIPTOR}" <<'PY'
+import sys
+from lehome.flywheel.recovery_collection import validate_snapshot_source_descriptor
+validate_snapshot_source_descriptor(sys.argv[1])
+PY
+then
+  echo "snapshot source bootstrap descriptor preflight failed" >&2; exit 2
+fi
 INITIAL_GARMENT="$(python3 - "${DESCRIPTOR}" <<'PY'
 import json, re, sys
 from pathlib import Path

@@ -785,6 +785,85 @@ class GarmentEnv(DirectRLEnv):
             raise RuntimeError("garment PhysX cloth positions and velocities must be finite")
         return local_positions.copy(), local_velocities.copy()
 
+    @staticmethod
+    def _flywheel_legacy_local_to_world(
+        positions, velocities, root_position, root_rotation, root_scale
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Convert authenticated legacy USD-local cloth state for PhysX restore."""
+
+        local_positions = np.asarray(positions, dtype=np.float32)
+        local_velocities = np.asarray(velocities, dtype=np.float32)
+        translation = np.asarray(root_position, dtype=np.float32).reshape(-1)
+        rotation = np.asarray(root_rotation, dtype=np.float32)
+        scale_value = root_scale
+        detach = getattr(scale_value, "detach", None)
+        if callable(detach):
+            scale_value = detach()
+            to_cpu = getattr(scale_value, "cpu", None)
+            if callable(to_cpu):
+                scale_value = to_cpu()
+            to_numpy = getattr(scale_value, "numpy", None)
+            if callable(to_numpy):
+                scale_value = to_numpy()
+        scale = np.asarray(scale_value, dtype=np.float32).reshape(-1)
+        if (
+            local_positions.ndim != 2
+            or local_velocities.shape != local_positions.shape
+            or local_positions.shape[1:] != (3,)
+            or translation.shape != (3,)
+            or rotation.shape != (3, 3)
+            or scale.shape != (3,)
+            or not np.isfinite(local_positions).all()
+            or not np.isfinite(local_velocities).all()
+            or not np.isfinite(translation).all()
+            or not np.isfinite(rotation).all()
+            or not np.isfinite(scale).all()
+            or np.any(scale <= 0.0)
+        ):
+            raise ValueError("legacy USD-local cloth transform is invalid")
+        world_positions = (local_positions * scale) @ rotation.T + translation
+        world_velocities = (local_velocities * scale) @ rotation.T
+        return world_positions.astype(np.float32, copy=False), world_velocities.astype(
+            np.float32, copy=False
+        )
+
+    @staticmethod
+    def _flywheel_rebase_world_cloth(
+        positions, velocities, source_position, source_rotation,
+        target_position, target_rotation,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Rigidly move authenticated world cloth with its randomized root pose."""
+
+        world_positions = np.asarray(positions, dtype=np.float32)
+        world_velocities = np.asarray(velocities, dtype=np.float32)
+        source_translation = np.asarray(source_position, dtype=np.float32).reshape(-1)
+        source_matrix = np.asarray(source_rotation, dtype=np.float32)
+        target_translation = np.asarray(target_position, dtype=np.float32).reshape(-1)
+        target_matrix = np.asarray(target_rotation, dtype=np.float32)
+        if (
+            world_positions.ndim != 2
+            or world_velocities.shape != world_positions.shape
+            or world_positions.shape[1:] != (3,)
+            or source_translation.shape != (3,)
+            or target_translation.shape != (3,)
+            or source_matrix.shape != (3, 3)
+            or target_matrix.shape != (3, 3)
+            or not np.isfinite(world_positions).all()
+            or not np.isfinite(world_velocities).all()
+            or not np.isfinite(source_translation).all()
+            or not np.isfinite(target_translation).all()
+            or not np.isfinite(source_matrix).all()
+            or not np.isfinite(target_matrix).all()
+        ):
+            raise ValueError("authenticated world cloth rebase is invalid")
+        local_positions = (world_positions - source_translation) @ source_matrix
+        local_velocities = world_velocities @ source_matrix
+        rebased_positions = local_positions @ target_matrix.T + target_translation
+        rebased_velocities = local_velocities @ target_matrix.T
+        return rebased_positions.astype(np.float32, copy=False), rebased_velocities.astype(
+            np.float32, copy=False
+        )
+
     def _flywheel_legacy_cpu_cloth_attributes(self):
         """Expose USD particles only for restoring pre-PhysX legacy snapshots."""
 
@@ -1067,10 +1146,23 @@ class GarmentEnv(DirectRLEnv):
             raise ValueError("snapshot garment does not match the active environment")
         schema_version = getattr(snapshot, "schema_version", None)
         device_name = str(self.device).lower()
-        legacy_cpu = schema_version == 1 and device_name == "cpu"
+        authority = getattr(snapshot, "cloth_state_authority", None)
+        legacy_local = schema_version == 3 and authority == "usd_local_points_v1"
+        legacy_cpu = device_name == "cpu" and (schema_version == 1 or legacy_local)
         cloth_position, cloth_velocity = self._flywheel_cloth_arrays(
             snapshot.cloth_position, snapshot.cloth_velocity
         )
+        if legacy_local and not legacy_cpu:
+            pose = np.asarray(snapshot.scene_state.get("garment_reset_pose"), dtype=np.float32)
+            if pose.shape != (6,) or not np.isfinite(pose).all():
+                raise ValueError("legacy USD-local cloth restore requires a finite garment reset pose")
+            from isaacsim.core.utils.rotations import euler_angles_to_quat, quat_to_rot_matrix
+
+            rotation = quat_to_rot_matrix(euler_angles_to_quat(pose[3:], degrees=True))
+            scale = self.object.get_world_scale()
+            cloth_position, cloth_velocity = self._flywheel_legacy_local_to_world(
+                cloth_position, cloth_velocity, pose[:3], rotation, scale
+            )
         if legacy_cpu:
             positions_attr, velocities_attr = self._flywheel_legacy_cpu_cloth_attributes()
             if (not callable(getattr(positions_attr, "Set", None))
@@ -1080,6 +1172,10 @@ class GarmentEnv(DirectRLEnv):
         elif schema_version == 1:
             if self._flywheel_cloth_backend() != "physx_cloth_view":
                 raise RuntimeError("legacy CUDA restore requires the live PhysX cloth view")
+            cloth = self._flywheel_physics_cloth_view()
+        elif legacy_local:
+            if self._flywheel_cloth_backend() != "physx_cloth_view":
+                raise RuntimeError("legacy USD-local restore requires the live PhysX cloth view")
             cloth = self._flywheel_physics_cloth_view()
         elif (schema_version == 2
                 and getattr(snapshot, "cloth_state_authority", None) == "physx_cloth_view_world_v1"):
@@ -1135,6 +1231,14 @@ class GarmentEnv(DirectRLEnv):
             and np.allclose(observed_velocity, cloth_velocity, rtol=0.0, atol=1e-6)
         ):
             raise RuntimeError("garment cloth write readback mismatch")
+        restored_pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
+        if restored_pose.shape != (6,) or not np.isfinite(restored_pose).all():
+            raise RuntimeError("garment restored pose readback is invalid")
+        self._flywheel_preserved_restore_for_randomization = {
+            "positions": np.asarray(observed_position, dtype=np.float32).copy(),
+            "velocities": np.asarray(observed_velocity, dtype=np.float32).copy(),
+            "pose": restored_pose.copy(),
+        }
         self._flywheel_randomization_receipt = dict(snapshot.randomization)
 
     def apply_flywheel_randomization(self, randomization) -> dict[str, object]:
@@ -1145,6 +1249,8 @@ class GarmentEnv(DirectRLEnv):
         applied and observed again.
         """
         values = dict(randomization.values if hasattr(randomization, "values") else randomization)
+        preserved_restore = getattr(self, "_flywheel_preserved_restore_for_randomization", None)
+        self._flywheel_preserved_restore_for_randomization = None
         # Canonical is a control, not a randomization strategy.  In particular,
         # do not restore a captured scene here: evaluation calls this after the
         # garment has settled, and scene restoration resets the cloth pose.
@@ -1225,6 +1331,42 @@ class GarmentEnv(DirectRLEnv):
             actual = arm.data.root_pos_w.detach().cpu().numpy()[0]
             if not np.allclose(actual, position.detach().cpu().numpy()[0], atol=1e-5):
                 raise RuntimeError("robot base pose readback did not match requested randomization")
+
+        if preserved_restore is not None:
+            source_pose = np.asarray(preserved_restore["pose"], dtype=np.float32)
+            target_pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
+            if (
+                source_pose.shape != (6,)
+                or target_pose.shape != (6,)
+                or not np.isfinite(source_pose).all()
+                or not np.isfinite(target_pose).all()
+            ):
+                raise RuntimeError("garment randomized pose readback is invalid")
+            from isaacsim.core.utils.rotations import euler_angles_to_quat, quat_to_rot_matrix
+
+            source_rotation = quat_to_rot_matrix(
+                euler_angles_to_quat(source_pose[3:], degrees=True)
+            )
+            target_rotation = quat_to_rot_matrix(
+                euler_angles_to_quat(target_pose[3:], degrees=True)
+            )
+            cloth_position, cloth_velocity = self._flywheel_rebase_world_cloth(
+                preserved_restore["positions"], preserved_restore["velocities"],
+                source_pose[:3], source_rotation, target_pose[:3], target_rotation,
+            )
+            cloth = self._flywheel_physics_cloth_view()
+            cloth.set_world_positions(
+                torch.tensor(cloth_position, dtype=torch.float32, device=self.device).unsqueeze(0)
+            )
+            cloth.set_velocities(
+                torch.tensor(cloth_velocity, dtype=torch.float32, device=self.device).unsqueeze(0)
+            )
+            observed_position, observed_velocity = self._flywheel_physics_cloth_state()
+            if not (
+                np.allclose(observed_position, cloth_position, rtol=0.0, atol=1e-6)
+                and np.allclose(observed_velocity, cloth_velocity, rtol=0.0, atol=1e-6)
+            ):
+                raise RuntimeError("randomized authenticated cloth write readback mismatch")
 
         receipt = {
             "light_intensity_scale": float(intensity_attr.Get()) / float(base_intensity),

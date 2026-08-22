@@ -86,6 +86,46 @@ def test_controlled_replay_is_exact_and_recorder_state_is_after_bootstrap() -> N
     assert perturbed.cloth_position != _snapshot()["cloth_position"]
 
 
+def test_snapshot_source_descriptor_authenticates_an_explicit_legacy_cpu_restore(tmp_path: Path) -> None:
+    from lehome.flywheel.recovery_collection import validate_snapshot_source_descriptor
+
+    reset = tmp_path / "historical-reset.json"
+    reset.write_text(json.dumps({
+        "schema_version": 1,
+        "robot_position": [0.0] * 12,
+        "robot_velocity": [0.0] * 12,
+        "cloth_position": [[0.0, 0.0, 0.0]],
+        "cloth_velocity": [[0.0, 0.0, 0.0]],
+        "rng_state": {},
+        "garment_name": "Pant_Short_Seen_5",
+        "randomization": {"strategy": "canonical"},
+        "scene_state": {"garment_reset_pose": [0.0, 0.0, 0.67, 0.0, 0.0, 90.0]},
+    }), encoding="utf-8")
+    row = {
+        "snapshot_source_bootstrap": True,
+        "category": "pant_short",
+        "garment": "Pant_Short_Seen_5",
+        "seed": 131,
+        "source_seed": 131,
+        "replay_kind": "verified_success_reset_v1",
+        "restore_snapshot": str(reset),
+        "restore_snapshot_sha256": hashlib.sha256(reset.read_bytes()).hexdigest(),
+        "restore_snapshot_cloth_frame": "usd_local_points_v1",
+        "parent_episode_id": "parent-success",
+        "lineage_id": "parent-success",
+    }
+    descriptor = tmp_path / "descriptor.json"
+    descriptor.write_text(json.dumps([row]), encoding="utf-8")
+
+    validated = validate_snapshot_source_descriptor(descriptor)
+
+    assert validated["restore_snapshot_cloth_frame"] == "usd_local_points_v1"
+    row.pop("restore_snapshot_cloth_frame")
+    descriptor.write_text(json.dumps([row]), encoding="utf-8")
+    with pytest.raises(ValueError, match="cloth frame"):
+        validate_snapshot_source_descriptor(descriptor)
+
+
 def test_controlled_recovery_rejects_invalid_actions_and_perturbation_bounds() -> None:
     from lehome.flywheel.recovery_collection import (
         apply_controlled_perturbation, replay_action_prefix,

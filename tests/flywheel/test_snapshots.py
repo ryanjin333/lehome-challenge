@@ -137,3 +137,22 @@ def test_version_two_snapshot_rejects_nonphysics_cloth_authority() -> None:
             randomization={"strategy": "canonical"},
             cloth_state_authority="usd_authored_points_v1",
         )
+
+
+def test_version_three_snapshot_marks_legacy_usd_local_points_explicitly() -> None:
+    from lehome.flywheel.snapshots import LEGACY_USD_LOCAL_CLOTH_AUTHORITY
+
+    snapshot = Snapshot(
+        schema_version=3,
+        robot_position=(0.0,) * 12,
+        robot_velocity=(0.0,) * 12,
+        cloth_position=((0.0, 0.0, 0.0),),
+        cloth_velocity=((0.0, 0.0, 0.0),),
+        rng_state={},
+        garment_name="Pant_Short_Seen_5",
+        randomization={"strategy": "canonical"},
+        scene_state={"garment_reset_pose": [0.0, 0.0, 0.67, 0.0, 0.0, 90.0]},
+        cloth_state_authority=LEGACY_USD_LOCAL_CLOTH_AUTHORITY,
+    )
+
+    assert snapshot.to_dict()["cloth_state_authority"] == "usd_local_points_v1"

@@ -162,6 +162,7 @@ def _run_snapshot_source_bootstrap(
     category: str = "top_long",
     runtime_source_root: Path | None = None,
     clear_pythonpath: bool = False,
+    descriptor_fields: dict[str, object] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     # The contract rejects every symlink ancestor. pytest's ordinary macOS
     # temporary root is addressed through /var, a symlink to /private.
@@ -174,7 +175,9 @@ def _run_snapshot_source_bootstrap(
     elif runtime_source_root is not None and runtime_source_root.is_relative_to("/private"):
         runtime_source_root = Path("/System/Volumes/Data/private") / runtime_source_root.relative_to("/private")
     descriptor = tmp_path / "source-descriptor.json"
-    _write(descriptor, [{"snapshot_source_bootstrap": True, "category": category, "garment": garment, "seed": 50110, "source_seed": 50110}])
+    row = {"snapshot_source_bootstrap": True, "category": category, "garment": garment, "seed": 50110, "source_seed": 50110}
+    row.update(descriptor_fields or {})
+    _write(descriptor, [row])
     digest = hashlib.sha256(descriptor.read_bytes()).hexdigest()
     run_id = hashlib.sha256(f"{tmp_path}:{case}".encode()).hexdigest()[:32]
     identity = hashlib.sha256(f"{run_id}:{digest}".encode("ascii")).hexdigest()[:20]
@@ -185,13 +188,14 @@ def _run_snapshot_source_bootstrap(
     docker.write_text(textwrap.dedent("""\
         #!/usr/bin/env python3
         import os, sys
-        if len(sys.argv) < 4 or sys.argv[1] != "run" or sys.argv[-3] != "-":
+        if len(sys.argv) < 4 or sys.argv[1] != "run" or "-" not in sys.argv[2:]:
             raise SystemExit("unexpected validator docker invocation")
         for index, argument in enumerate(sys.argv[:-1]):
             if argument == "-e":
                 key, value = sys.argv[index + 1].split("=", 1)
                 os.environ[key] = value
-        os.execv(sys.executable, [sys.executable, *sys.argv[-3:]])
+        script_index = max(index for index, value in enumerate(sys.argv) if value == "-")
+        os.execv(sys.executable, [sys.executable, *sys.argv[script_index:]])
     """), encoding="utf-8")
     docker.chmod(0o755)
     env = {**os.environ, "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR": str(descriptor), "LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR_SHA256": digest, "LEHOME_SNAPSHOT_SOURCE_RUN_ID": run_id, "LEHOME_SNAPSHOT_SOURCE_BASE_CAMPAIGN": str(base), "LEHOME_SNAPSHOT_SOURCE_TEST_CASE": case, "LEHOME_SNAPSHOT_SOURCE_RUNTIME_ROOT": str(runtime_source_root or (REPO_ROOT / "source" / "lehome"))}
@@ -553,6 +557,42 @@ def test_snapshot_source_bootstrap_forces_the_cuda_particle_cloth_lane(tmp_path:
     }
 
 
+def test_snapshot_source_bootstrap_preflights_a_verified_legacy_reset_before_launch(tmp_path: Path) -> None:
+    reset = tmp_path / "historical-reset.json"
+    _write(reset, {
+        "schema_version": 1,
+        "robot_position": [0.0] * 12,
+        "robot_velocity": [0.0] * 12,
+        "cloth_position": [[0.0, 0.0, 0.0]],
+        "cloth_velocity": [[0.0, 0.0, 0.0]],
+        "rng_state": {},
+        "garment_name": "Top_Long_Seen_0",
+        "randomization": {"strategy": "canonical"},
+        "scene_state": {"garment_reset_pose": [0.0, 0.0, 0.67, 0.0, 0.0, 90.0]},
+    })
+    fields = {
+        "replay_kind": "verified_success_reset_v1",
+        "restore_snapshot": str(reset),
+        "restore_snapshot_sha256": hashlib.sha256(reset.read_bytes()).hexdigest(),
+        "restore_snapshot_cloth_frame": "usd_local_points_v1",
+        "parent_episode_id": "historical-success",
+        "lineage_id": "historical-success",
+    }
+
+    result, root = _run_snapshot_source_bootstrap(
+        tmp_path / "verified-reset", "rejected", descriptor_fields=fields,
+    )
+
+    assert result.returncode == 3, result.stderr
+    assert (root / "base-launch.json").is_file()
+    fields["restore_snapshot_sha256"] = "0" * 64
+    rejected, rejected_root = _run_snapshot_source_bootstrap(
+        tmp_path / "tampered-reset", "rejected", descriptor_fields=fields,
+    )
+    assert rejected.returncode == 2
+    assert not (rejected_root / "base-launch.json").exists()
+
+
 @pytest.mark.parametrize("case", ["no-h16", "bad-manifest", "receipt-not-readback", "receipt-mismatch", "strict-seal"])
 def test_snapshot_source_bootstrap_fails_closed_after_accepted_terminal(tmp_path: Path, case: str) -> None:
     result, root = _run_snapshot_source_bootstrap(tmp_path / case, case)
@@ -626,7 +666,7 @@ def test_snapshot_source_bootstrap_missing_packaged_runtime_root_is_infrastructu
         tmp_path / "missing", "accepted", runtime_source_root=tmp_path / "missing-package", clear_pythonpath=True,
     )
     assert result.returncode == 4, result.stderr
-    assert "post-acceptance evidence verification failed" in result.stderr
+    assert "packaged runtime source is missing or unsafe" in result.stderr
     assert not (root / "snapshot-source-bootstrap.envelope.json").exists()
 
 

@@ -12,6 +12,7 @@ import numpy as np
 
 
 PHYSX_CLOTH_STATE_AUTHORITY = "physx_cloth_view_world_v1"
+LEGACY_USD_LOCAL_CLOTH_AUTHORITY = "usd_local_points_v1"
 
 
 class SnapshotAdapter(Protocol):
@@ -56,17 +57,21 @@ class Snapshot:
     # Optional for pre-randomization snapshots produced by older callers.
     scene_state: dict[str, object] = field(default_factory=dict)
     # Version 2 snapshots are captured from the live PhysX cloth view in world
-    # coordinates. Version 1 is retained only for unrelated legacy callers and
-    # is never admitted by controlled-recovery v3.
+    # coordinates. Version 1 remains the byte-level legacy input. Version 3 is
+    # an in-memory upgrade that labels authenticated legacy CPU USD-local
+    # points before a backend-aware restore; neither legacy form is admitted by
+    # controlled-recovery v3.
     cloth_state_authority: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version not in (1, 2):
+        if self.schema_version not in (1, 2, 3):
             raise ValueError("unsupported snapshot schema version")
         if self.schema_version == 1 and self.cloth_state_authority is not None:
             raise ValueError("snapshot v1 cannot declare a cloth state authority")
         if self.schema_version == 2 and self.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY:
             raise ValueError("snapshot v2 requires the live PhysX cloth state authority")
+        if self.schema_version == 3 and self.cloth_state_authority != LEGACY_USD_LOCAL_CLOTH_AUTHORITY:
+            raise ValueError("snapshot v3 requires the legacy USD-local cloth state authority")
         if len(self.robot_position) != 12 or len(self.robot_velocity) != 12:
             raise ValueError("snapshot robot vectors must be 12-D")
         if len(self.cloth_position) != len(self.cloth_velocity) or not self.cloth_position:
@@ -94,7 +99,7 @@ class Snapshot:
             "randomization": _json_round_trip(self.randomization),
             "scene_state": _json_round_trip(self.scene_state),
         }
-        if self.schema_version == 2:
+        if self.schema_version in (2, 3):
             payload["cloth_state_authority"] = self.cloth_state_authority
         return payload
 
@@ -155,4 +160,7 @@ def restore_snapshot(adapter: SnapshotAdapter | object, snapshot: Snapshot) -> N
         adapter.scene_state = _json_round_trip(snapshot.scene_state)
 
 
-__all__ = ["PHYSX_CLOTH_STATE_AUTHORITY", "Snapshot", "SnapshotAdapter", "canonical_reset_hash", "capture_snapshot", "restore_snapshot"]
+__all__ = [
+    "LEGACY_USD_LOCAL_CLOTH_AUTHORITY", "PHYSX_CLOTH_STATE_AUTHORITY",
+    "Snapshot", "SnapshotAdapter", "canonical_reset_hash", "capture_snapshot", "restore_snapshot",
+]

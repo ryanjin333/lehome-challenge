@@ -22,6 +22,7 @@ def _matrix() -> list[dict[str, object]]:
             "seed": 50_000 + category_index * 50 + index,
             "strategy": "mild_geometry" if index % 2 == 0 else "strong_geometry",
             "restore_snapshot": "/verified/reset.json", "restore_snapshot_sha256": "a" * 64,
+            "restore_snapshot_cloth_frame": "usd_local_points_v1",
             "parent_episode_id": f"parent-{category}", "lineage_id": f"parent-{category}",
             "replay_kind": "verified_success_reset_v1",
         }
@@ -62,6 +63,33 @@ def test_success_replay_wrapper_fails_closed_for_missing_or_inconsistent_matrix_
     inconsistent = subprocess.run(["bash", str(WRAPPER)], env=environment, capture_output=True, text=True, check=False)
     assert inconsistent.returncode != 0
     assert "mismatch" in inconsistent.stderr
+
+
+def test_success_replay_wrapper_rejects_an_ambiguous_legacy_snapshot_frame(tmp_path: Path) -> None:
+    rows = _matrix()
+    rows[0].pop("restore_snapshot_cloth_frame")
+    matrix = tmp_path / "matrix.json"
+    encoded = (json.dumps(rows, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    matrix.write_bytes(encoded)
+    digest = hashlib.sha256(encoded).hexdigest()
+    (tmp_path / "matrix.json.sha256").write_text(digest + "\n", encoding="ascii")
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER)],
+        env=os.environ | {
+            "LEHOME_SUCCESS_REPLAY_MATRIX": str(matrix),
+            "LEHOME_SUCCESS_REPLAY_MATRIX_SHA256": digest,
+            "LEHOME_WORKSPACE": str(tmp_path),
+            "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "campaign"),
+            "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "cloth frame" in result.stderr
 
 
 def test_success_replay_wrapper_passes_task_ledger_safe_accepted_target_to_12k_appliance(

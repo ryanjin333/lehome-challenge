@@ -10,7 +10,14 @@ import pytest
 CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
 
 
-def _write_success(root: Path, *, attempt_id: str, category: str, garment: str) -> None:
+def _write_success(
+    root: Path,
+    *,
+    attempt_id: str,
+    category: str,
+    garment: str,
+    simulator_device: str = "cpu",
+) -> None:
     episode_root = root / attempt_id
     raw = episode_root / "raw" / attempt_id
     snapshots = raw / "snapshots"
@@ -27,9 +34,11 @@ def _write_success(root: Path, *, attempt_id: str, category: str, garment: str) 
             "release_stage": "seen",
             "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
             "policy_step": 12000,
+            "asset_revision": "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9",
         },
         "provenance": {
-            "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"
+            "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
+            "simulator_device": simulator_device,
         },
     }
     reset = {
@@ -40,6 +49,7 @@ def _write_success(root: Path, *, attempt_id: str, category: str, garment: str) 
         "cloth_position": [[0.0, 0.0, 0.0]],
         "cloth_velocity": [[0.0, 0.0, 0.0]],
         "rng_state": {},
+        "scene_state": {"garment_reset_pose": [0.0, 0.0, 0.67, 0.0, 0.0, 90.0]},
     }
     episode_path = raw / "episode.json"
     reset_path = snapshots / "reset.json"
@@ -85,6 +95,7 @@ def test_builder_creates_balanced_lineage_bound_success_replays(tmp_path: Path) 
     }
     assert all(row["parent_episode_id"] == row["lineage_id"] for row in matrix)
     assert all(row["replay_kind"] == "verified_success_reset_v1" for row in matrix)
+    assert all(row["restore_snapshot_cloth_frame"] == "usd_local_points_v1" for row in matrix)
     assert all(Path(row["restore_snapshot"]).is_absolute() for row in matrix)
     assert all(len(row["restore_snapshot_sha256"]) == 64 for row in matrix)
     assert {row["strategy"] for row in matrix} == {"mild_geometry", "strong_geometry"}
@@ -207,3 +218,59 @@ def test_builder_rejects_a_success_not_from_the_pinned_original_12k_repo(
             output=tmp_path / "matrix.json",
             attempts_per_category=1,
         )
+
+
+def test_builder_rejects_a_legacy_reset_from_a_different_asset_revision(tmp_path: Path) -> None:
+    from scripts.build_success_replay_matrix import build_success_replay_matrix
+
+    accepted = tmp_path / "accepted"
+    for index, category in enumerate(CATEGORIES):
+        _write_success(
+            accepted,
+            attempt_id=f"parent-{category}",
+            category=category,
+            garment=f"Garment_{index}",
+        )
+    episode_root = accepted / "parent-pant_short"
+    episode_path = episode_root / "raw" / "parent-pant_short" / "episode.json"
+    payload = json.loads(episode_path.read_text(encoding="utf-8"))
+    payload["identity"]["asset_revision"] = "0" * 40
+    episode_path.write_text(json.dumps(payload), encoding="utf-8")
+    checksums = json.loads((episode_root / "SHA256SUMS.json").read_text(encoding="utf-8"))
+    checksums["raw/parent-pant_short/episode.json"] = {
+        "sha256": hashlib.sha256(episode_path.read_bytes()).hexdigest(),
+        "size": episode_path.stat().st_size,
+    }
+    (episode_root / "SHA256SUMS.json").write_text(json.dumps(checksums), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="verified 12K"):
+        build_success_replay_matrix(
+            accepted_root=accepted,
+            output=tmp_path / "matrix.json",
+            attempts_per_category=1,
+        )
+
+
+def test_builder_accepts_successes_from_any_cuda_worker_index(tmp_path: Path) -> None:
+    from scripts.build_success_replay_matrix import build_success_replay_matrix
+
+    accepted = tmp_path / "accepted"
+    for index, category in enumerate(CATEGORIES):
+        _write_success(
+            accepted,
+            attempt_id=f"parent-{category}",
+            category=category,
+            garment=f"Garment_{index}",
+            simulator_device=f"cuda:{index}",
+        )
+
+    matrix_path = tmp_path / "matrix.json"
+    build_success_replay_matrix(
+        accepted_root=accepted,
+        output=matrix_path,
+        attempts_per_category=1,
+    )
+
+    matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+    assert len(matrix) == 4
+    assert all(row["restore_snapshot_cloth_frame"] == "physx_cloth_view_world_v1" for row in matrix)

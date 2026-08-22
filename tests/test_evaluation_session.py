@@ -992,6 +992,185 @@ def test_garment_restore_keeps_legacy_cpu_replay_separate_from_controlled_physx_
     assert 'cloth_state_authority", None) == "physx_cloth_view_world_v1"' in method_source
 
 
+def test_legacy_cpu_cloth_snapshot_is_transformed_from_local_to_world_for_cuda() -> None:
+    """Historical CPU snapshots store USD-local points, not PhysX world points."""
+
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    matches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_flywheel_legacy_local_to_world"
+    ]
+    assert len(matches) == 1, "legacy CPU-to-CUDA restore must have one explicit frame conversion"
+    module = ast.Module(body=matches, type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    local_positions = np.asarray([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]], dtype=np.float32)
+    local_velocities = np.asarray([[0.0, 1.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float32)
+    root_position = np.asarray([10.0, 20.0, 30.0], dtype=np.float32)
+    root_scale = np.asarray([0.4, 0.5, 1.0], dtype=np.float32)
+    root_rotation = np.asarray(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32
+    )
+
+    positions, velocities = namespace["_flywheel_legacy_local_to_world"](
+        local_positions, local_velocities, root_position, root_rotation, root_scale
+    )
+
+    np.testing.assert_allclose(
+        positions,
+        np.asarray([[10.0, 20.4, 30.0], [9.0, 20.0, 30.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        velocities,
+        np.asarray([[-0.5, 0.0, 0.0], [0.0, 0.8, 0.0]], dtype=np.float32),
+    )
+
+
+def test_legacy_cpu_cloth_transform_accepts_a_cuda_tensor_backed_world_scale() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_flywheel_legacy_local_to_world"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    class CudaTensorLike:
+        def __init__(self, values):
+            self.values = np.asarray(values, dtype=np.float32)
+
+        def __array__(self, *args, **kwargs):
+            raise TypeError("can't convert cuda tensor to numpy")
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.values
+
+    positions, velocities = namespace["_flywheel_legacy_local_to_world"](
+        np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+        np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+        np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        np.eye(3, dtype=np.float32),
+        CudaTensorLike([0.4, 0.5, 1.0]),
+    )
+
+    np.testing.assert_allclose(positions, [[0.4, 0.0, 0.0]], atol=1e-6)
+    np.testing.assert_allclose(velocities, [[0.4, 0.0, 0.0]], atol=1e-6)
+
+
+def test_legacy_cuda_restore_uses_scene_pose_frame_conversion_before_physx_write() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "flywheel_restore_state"
+    )
+    method_source = ast.get_source_segment(source, method)
+    assert method_source is not None
+    assert "_flywheel_legacy_local_to_world" in method_source
+    assert "garment_reset_pose" in method_source
+    assert "get_world_scale" in method_source
+    assert method_source.index("_flywheel_legacy_local_to_world") < method_source.index(
+        "cloth.set_world_positions"
+    )
+
+
+def test_authenticated_world_cloth_is_rigidly_rebased_across_randomized_garment_pose() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_flywheel_rebase_world_cloth"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    positions, velocities = namespace["_flywheel_rebase_world_cloth"](
+        np.asarray([[11.0, 20.0, 30.0]], dtype=np.float32),
+        np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+        np.asarray([10.0, 20.0, 30.0], dtype=np.float32),
+        np.eye(3, dtype=np.float32),
+        np.asarray([10.0, 20.0, 30.0], dtype=np.float32),
+        np.asarray(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        ),
+    )
+
+    np.testing.assert_allclose(positions, [[10.0, 21.0, 30.0]], atol=1e-6)
+    np.testing.assert_allclose(velocities, [[0.0, 1.0, 0.0]], atol=1e-6)
+
+
+def test_randomization_rewrites_authenticated_cloth_after_every_pose_mutation() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    restore_method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "flywheel_restore_state"
+    )
+    randomize_method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "apply_flywheel_randomization"
+    )
+    restore_source = ast.get_source_segment(source, restore_method)
+    randomize_source = ast.get_source_segment(source, randomize_method)
+    assert restore_source is not None and randomize_source is not None
+    assert "_flywheel_preserved_restore_for_randomization" in restore_source
+    assert "_flywheel_preserved_restore_for_randomization" in randomize_source
+    assert "_flywheel_rebase_world_cloth" in randomize_source
+    assert randomize_source.index("self.object.set_all_pose") < randomize_source.index(
+        "cloth.set_world_positions"
+    )
+    assert randomize_source.index("cloth.set_world_positions") < randomize_source.index(
+        "_flywheel_randomization_receipt = receipt"
+    )
+
+
 def _cloth_evidence(env) -> None:
     if not hasattr(env, "renderer_device"):
         env.renderer_device = "cuda:0"
@@ -1761,7 +1940,11 @@ def test_verified_success_replay_binds_checked_snapshot_and_lineage_to_manifest(
     captured = []
     monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **kwargs: captured.append(kwargs["args"]) or [])
     snapshot = tmp_path / "reset.json"
-    snapshot.write_text(json.dumps({"schema_version": 1, "garment_name": "Top_Long_Seen_0"}), encoding="utf-8")
+    snapshot.write_text(json.dumps({
+        "schema_version": 1,
+        "garment_name": "Top_Long_Seen_0",
+        "scene_state": {"garment_reset_pose": [0.0, 0.0, 0.67, 0.0, 0.0, 90.0]},
+    }), encoding="utf-8")
     digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
     env = types.SimpleNamespace(device="cuda:0", cfg=types.SimpleNamespace())
     args = types.SimpleNamespace(
@@ -1778,18 +1961,41 @@ def test_verified_success_replay_binds_checked_snapshot_and_lineage_to_manifest(
             "replay_kind": "verified_success_reset_v1", "restore_snapshot": str(snapshot),
             "restore_snapshot_sha256": digest, "parent_episode_id": "original-top-long-1",
             "lineage_id": "original-top-long-1",
+            "restore_snapshot_cloth_frame": "usd_local_points_v1",
         },
         policy=object(),
         attempt_output_dir=attempt,
     )
 
-    assert captured[0].restore_snapshot == json.loads(snapshot.read_text(encoding="utf-8"))
+    expected_restore = json.loads(snapshot.read_text(encoding="utf-8"))
+    expected_restore.update({
+        "schema_version": 3,
+        "cloth_state_authority": "usd_local_points_v1",
+    })
+    assert captured[0].restore_snapshot == expected_restore
     manifest = json.loads((attempt / "flywheel-manifest.json").read_text(encoding="utf-8"))
     assert manifest["restore_snapshot"] == str(snapshot)
     assert manifest["restore_snapshot_sha256"] == digest
     assert manifest["parent_episode_id"] == "original-top-long-1"
     assert manifest["lineage_id"] == "original-top-long-1"
     assert manifest["replay_kind"] == "verified_success_reset_v1"
+    assert manifest["restore_snapshot_cloth_frame"] == "usd_local_points_v1"
+
+
+def test_verified_success_replay_rejects_an_ambiguous_legacy_cloth_frame(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    snapshot = tmp_path / "reset.json"
+    snapshot.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+    digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+
+    with __import__("pytest").raises(ValueError, match="cloth frame"):
+        evaluation._verified_restore_assignment({
+            "replay_kind": "verified_success_reset_v1",
+            "restore_snapshot": str(snapshot),
+            "restore_snapshot_sha256": digest,
+            "parent_episode_id": "episode-1",
+            "lineage_id": "episode-1",
+        })
 
 
 def test_verified_success_replay_rejects_a_tampered_snapshot_before_evaluation(monkeypatch, tmp_path) -> None:

@@ -230,7 +230,10 @@ def _verified_restore_assignment(
         raise ValueError("verified replay restore snapshot must contain a JSON object")
     lineage = {
         key: assignment.get(key)
-        for key in ("parent_episode_id", "lineage_id", "replay_kind")
+        for key in (
+            "parent_episode_id", "lineage_id", "replay_kind",
+            "restore_snapshot_cloth_frame",
+        )
         if assignment.get(key) is not None
     }
     if replay_kind == "verified_success_reset_v1":
@@ -241,6 +244,22 @@ def _verified_restore_assignment(
             or lineage["lineage_id"] != lineage["parent_episode_id"]
         ):
             raise ValueError("verified success replay requires matching parent and lineage IDs")
+        cloth_frame = lineage.get("restore_snapshot_cloth_frame")
+        if cloth_frame not in {"usd_local_points_v1", "physx_cloth_view_world_v1"}:
+            raise ValueError("verified success replay requires an explicit legacy cloth frame")
+        schema_version = payload.get("schema_version")
+        authority = payload.get("cloth_state_authority")
+        if cloth_frame == "usd_local_points_v1":
+            if schema_version != 1 or authority is not None:
+                raise ValueError("verified success replay USD-local cloth frame is incompatible")
+            payload = dict(payload)
+            payload["schema_version"] = 3
+            payload["cloth_state_authority"] = "usd_local_points_v1"
+        elif not (
+            (schema_version == 1 and authority is None)
+            or (schema_version == 2 and authority == "physx_cloth_view_world_v1")
+        ):
+            raise ValueError("verified success replay PhysX cloth frame is incompatible")
     return payload, {
         "restore_snapshot": str(path),
         "restore_snapshot_sha256": expected,

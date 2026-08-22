@@ -17,10 +17,12 @@ from typing import Mapping
 CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
 PARENT_POLICY_REPO = "ryanjin333/lehome-groot-n17-models"
 PARENT_REVISION = "30ac1a84da67b099e115ad147bcd61e9d60046d3"
+PARENT_ASSET_REVISION = "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9"
 PARENT_ARTIFACT_SHA256 = (
     "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CUDA_DEVICE = re.compile(r"^cuda:[0-9]+$")
 
 
 def _strict_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -114,6 +116,7 @@ def _successes(accepted_root: Path) -> dict[str, list[dict[str, str]]]:
             raise ValueError("accepted episode identity is malformed")
         category = identity.get("category")
         garment = identity.get("garment_name")
+        simulator_device = provenance.get("simulator_device")
         if (
             episode.get("episode_id") != attempt_id
             or identity.get("episode_id") != attempt_id
@@ -126,17 +129,28 @@ def _successes(accepted_root: Path) -> dict[str, list[dict[str, str]]]:
             or identity.get("policy_repo") != PARENT_POLICY_REPO
             or identity.get("policy_revision") != PARENT_REVISION
             or identity.get("policy_step") != 12_000
+            or identity.get("asset_revision") != PARENT_ASSET_REVISION
             or provenance.get("policy_artifact_sha256") != PARENT_ARTIFACT_SHA256
+            or not (
+                simulator_device == "cpu"
+                or (isinstance(simulator_device, str) and _CUDA_DEVICE.fullmatch(simulator_device))
+            )
             or reset.get("garment_name") != garment
             or reset.get("schema_version") != 1
         ):
             raise ValueError("accepted episode is not a verified 12K seen-garment success")
+        cloth_frame = (
+            "usd_local_points_v1"
+            if simulator_device == "cpu"
+            else "physx_cloth_view_world_v1"
+        )
         grouped[str(category)].append(
             {
                 "parent_episode_id": attempt_id,
                 "garment": garment,
                 "restore_snapshot": str(reset_path),
                 "restore_snapshot_sha256": reset_sha256,
+                "restore_snapshot_cloth_frame": cloth_frame,
             }
         )
     if any(not grouped[category] for category in CATEGORIES):
@@ -225,6 +239,7 @@ def build_success_replay_matrix(
                     "strategy": strategy,
                     "restore_snapshot": parent["restore_snapshot"],
                     "restore_snapshot_sha256": parent["restore_snapshot_sha256"],
+                    "restore_snapshot_cloth_frame": parent["restore_snapshot_cloth_frame"],
                     "parent_episode_id": parent["parent_episode_id"],
                     "lineage_id": parent["parent_episode_id"],
                     "replay_kind": "verified_success_reset_v1",
