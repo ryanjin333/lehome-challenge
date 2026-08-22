@@ -1081,6 +1081,78 @@ def test_legacy_cpu_cloth_transform_accepts_a_cuda_tensor_backed_world_scale() -
     np.testing.assert_allclose(velocities, [[0.4, 0.0, 0.0]], atol=1e-6)
 
 
+def _legacy_topology_projector():
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_flywheel_project_legacy_usd_to_physx"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    return namespace["_flywheel_project_legacy_usd_to_physx"]
+
+
+def test_legacy_usd_snapshot_is_projected_into_live_physx_particle_order() -> None:
+    project = _legacy_topology_projector()
+    asset = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    source_position = np.asarray(
+        [[10.0, 0.0, 0.0], [11.0, 0.0, 0.0], [10.0, 0.0, 0.0], [12.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    source_velocity = np.asarray(
+        [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [1.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    live_rest = np.asarray(
+        [[2.0, 0.0, 0.0], [0.000004, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+
+    positions, velocities = project(
+        source_position, source_velocity, asset, live_rest
+    )
+
+    np.testing.assert_array_equal(positions[:, 0], [12.0, 10.0, 11.0])
+    np.testing.assert_array_equal(velocities[:, 0], [3.0, 1.0, 2.0])
+
+
+def test_legacy_usd_projection_rejects_inconsistent_duplicate_seam_state() -> None:
+    project = _legacy_topology_projector()
+    asset = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    positions = asset.copy()
+    positions[2, 0] = 0.25
+
+    with __import__("pytest").raises(ValueError, match="duplicate seam state"):
+        project(positions, np.zeros_like(positions), asset, asset[:2])
+
+
+def test_legacy_usd_projection_rejects_an_incomplete_or_unmatched_physx_topology() -> None:
+    project = _legacy_topology_projector()
+    asset = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+    for live_rest in (
+        np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        np.asarray([[0.0, 0.0, 0.0], [9.0, 0.0, 0.0]], dtype=np.float32),
+        np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32),
+    ):
+        with __import__("pytest").raises(ValueError, match="topology"):
+            project(asset, np.zeros_like(asset), asset, live_rest)
+
+
 def test_legacy_cuda_restore_uses_scene_pose_frame_conversion_before_physx_write() -> None:
     source_path = (
         Path(__file__).resolve().parents[1]
@@ -1097,8 +1169,12 @@ def test_legacy_cuda_restore_uses_scene_pose_frame_conversion_before_physx_write
     method_source = ast.get_source_segment(source, method)
     assert method_source is not None
     assert "_flywheel_legacy_local_to_world" in method_source
+    assert "_flywheel_project_legacy_usd_to_physx" in method_source
     assert "garment_reset_pose" in method_source
     assert "get_world_scale" in method_source
+    assert method_source.index("_flywheel_project_legacy_usd_to_physx") < method_source.index(
+        "_flywheel_legacy_local_to_world"
+    )
     assert method_source.index("_flywheel_legacy_local_to_world") < method_source.index(
         "cloth.set_world_positions"
     )

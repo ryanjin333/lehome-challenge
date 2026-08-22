@@ -828,6 +828,93 @@ class GarmentEnv(DirectRLEnv):
         )
 
     @staticmethod
+    def _flywheel_project_legacy_usd_to_physx(
+        positions, velocities, asset_positions, live_rest_positions,
+        *, topology_tolerance: float = 1e-5,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Project duplicate USD seam vertices into the live PhysX particle order."""
+
+        source_positions = np.asarray(positions, dtype=np.float32)
+        source_velocities = np.asarray(velocities, dtype=np.float32)
+        asset = np.asarray(asset_positions, dtype=np.float32)
+        live_rest = np.asarray(live_rest_positions, dtype=np.float32)
+        if (
+            source_positions.ndim != 2
+            or source_positions.shape[1:] != (3,)
+            or source_velocities.shape != source_positions.shape
+            or asset.shape != source_positions.shape
+            or live_rest.ndim != 2
+            or live_rest.shape[1:] != (3,)
+            or not np.isfinite(source_positions).all()
+            or not np.isfinite(source_velocities).all()
+            or not np.isfinite(asset).all()
+            or not np.isfinite(live_rest).all()
+            or not np.isfinite(topology_tolerance)
+            or topology_tolerance <= 0.0
+        ):
+            raise ValueError("legacy USD to PhysX cloth topology is invalid")
+
+        normalized_asset = asset.copy()
+        normalized_asset[normalized_asset == 0.0] = 0.0
+        first_by_point: dict[bytes, int] = {}
+        representatives: list[int] = []
+        groups: dict[int, list[int]] = {}
+        for index, point in enumerate(normalized_asset):
+            key = point.tobytes()
+            representative = first_by_point.get(key)
+            if representative is None:
+                first_by_point[key] = index
+                representatives.append(index)
+                groups[index] = [index]
+            else:
+                groups[representative].append(index)
+        representative_indices = np.asarray(representatives, dtype=np.int64)
+        unique_asset = asset[representative_indices]
+        if len(unique_asset) != len(live_rest):
+            raise ValueError("legacy USD and live PhysX cloth topology cardinality mismatch")
+
+        for representative, group in groups.items():
+            if len(group) == 1:
+                continue
+            if not (
+                np.array_equal(
+                    source_positions[group],
+                    np.repeat(source_positions[representative : representative + 1], len(group), axis=0),
+                )
+                and np.array_equal(
+                    source_velocities[group],
+                    np.repeat(source_velocities[representative : representative + 1], len(group), axis=0),
+                )
+            ):
+                raise ValueError("legacy USD duplicate seam state is inconsistent")
+
+        selected_chunks: list[np.ndarray] = []
+        distance_chunks: list[np.ndarray] = []
+        for start in range(0, len(live_rest), 256):
+            delta = live_rest[start : start + 256, None, :] - unique_asset[None, :, :]
+            squared_distance = np.einsum("ijk,ijk->ij", delta, delta)
+            selected = np.argmin(squared_distance, axis=1)
+            selected_chunks.append(selected)
+            distance_chunks.append(
+                np.sqrt(squared_distance[np.arange(len(selected)), selected])
+            )
+        selected_groups = np.concatenate(selected_chunks)
+        selected_distances = np.concatenate(distance_chunks)
+        if (
+            np.max(selected_distances) > topology_tolerance
+            or np.unique(selected_groups).size != len(unique_asset)
+            or not np.array_equal(
+                np.sort(selected_groups), np.arange(len(unique_asset), dtype=selected_groups.dtype)
+            )
+        ):
+            raise ValueError("legacy USD and live PhysX cloth topology do not match")
+        projected_indices = representative_indices[selected_groups]
+        return (
+            source_positions[projected_indices].copy(),
+            source_velocities[projected_indices].copy(),
+        )
+
+    @staticmethod
     def _flywheel_rebase_world_cloth(
         positions, velocities, source_position, source_rotation,
         target_position, target_rotation,
@@ -1160,6 +1247,26 @@ class GarmentEnv(DirectRLEnv):
 
             rotation = quat_to_rot_matrix(euler_angles_to_quat(pose[3:], degrees=True))
             scale = self.object.get_world_scale()
+            def to_numpy(value):
+                return (
+                    value.detach().cpu().numpy()
+                    if callable(getattr(value, "detach", None))
+                    else np.asarray(value)
+                )
+            asset_points = to_numpy(self.object._get_points_pose()).reshape(-1, 3)
+            live_rest_world = to_numpy(self.object.initial_points_positions).reshape(-1, 3)
+            initial_position = to_numpy(self.object.initial_root_position).reshape(3)
+            initial_orientation = to_numpy(self.object.initial_root_orientation).reshape(4)
+            scale_array = to_numpy(scale).reshape(3)
+            initial_rotation = np.asarray(
+                quat_to_rot_matrix(initial_orientation), dtype=np.float32
+            )
+            live_rest_local = (
+                (live_rest_world - initial_position) @ initial_rotation
+            ) / scale_array
+            cloth_position, cloth_velocity = self._flywheel_project_legacy_usd_to_physx(
+                cloth_position, cloth_velocity, asset_points, live_rest_local
+            )
             cloth_position, cloth_velocity = self._flywheel_legacy_local_to_world(
                 cloth_position, cloth_velocity, pose[:3], rotation, scale
             )
