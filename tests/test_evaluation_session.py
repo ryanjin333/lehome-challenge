@@ -1096,13 +1096,14 @@ def _legacy_topology_projector():
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    simulator_error = type("SimulatorNumericalDivergenceError", (ValueError,), {})
+    namespace = {"np": np, "SimulatorNumericalDivergenceError": simulator_error}
     exec(compile(module, str(source_path), "exec"), namespace)
-    return namespace["_flywheel_project_legacy_usd_to_physx"]
+    return namespace["_flywheel_project_legacy_usd_to_physx"], simulator_error
 
 
 def test_legacy_usd_snapshot_is_projected_into_live_physx_particle_order() -> None:
-    project = _legacy_topology_projector()
+    project, _ = _legacy_topology_projector()
     asset = np.asarray(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
         dtype=np.float32,
@@ -1129,7 +1130,7 @@ def test_legacy_usd_snapshot_is_projected_into_live_physx_particle_order() -> No
 
 
 def test_legacy_usd_projection_rejects_inconsistent_duplicate_seam_state() -> None:
-    project = _legacy_topology_projector()
+    project, simulator_error = _legacy_topology_projector()
     asset = np.asarray(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
         dtype=np.float32,
@@ -1137,20 +1138,57 @@ def test_legacy_usd_projection_rejects_inconsistent_duplicate_seam_state() -> No
     positions = asset.copy()
     positions[2, 0] = 0.25
 
-    with __import__("pytest").raises(ValueError, match="duplicate seam state"):
+    with __import__("pytest").raises(
+        simulator_error,
+        match=(
+            r"duplicate seam state is inconsistent: representative_index=0 "
+            r"duplicate_index=2 position_max_abs_delta=0\.25 "
+            r"velocity_max_abs_delta=0"
+        ),
+    ):
         project(positions, np.zeros_like(positions), asset, asset[:2])
 
 
-def test_legacy_usd_projection_rejects_an_incomplete_or_unmatched_physx_topology() -> None:
-    project = _legacy_topology_projector()
+def test_legacy_usd_projection_classifies_cardinality_mismatch_as_simulator_divergence() -> None:
+    project, simulator_error = _legacy_topology_projector()
     asset = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
-    for live_rest in (
-        np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
-        np.asarray([[0.0, 0.0, 0.0], [9.0, 0.0, 0.0]], dtype=np.float32),
-        np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32),
+    with __import__("pytest").raises(
+        simulator_error,
+        match=r"cardinality mismatch: usd_unique_count=2 live_physx_count=1",
     ):
-        with __import__("pytest").raises(ValueError, match="topology"):
-            project(asset, np.zeros_like(asset), asset, live_rest)
+        project(asset, np.zeros_like(asset), asset, asset[:1])
+
+
+def test_legacy_usd_projection_reports_nearest_coordinate_distance_metrics() -> None:
+    project, simulator_error = _legacy_topology_projector()
+    asset = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+    live_rest = np.asarray([[0.0, 0.0, 0.0], [9.0, 0.0, 0.0]], dtype=np.float32)
+
+    with __import__("pytest").raises(
+        simulator_error,
+        match=(
+            r"nearest-coordinate distance mismatch: max_distance=8(?:\.0+)? "
+            r"median_distance=4(?:\.0+)? tolerance=1e-05"
+        ),
+    ):
+        project(asset, np.zeros_like(asset), asset, live_rest)
+
+
+def test_legacy_usd_projection_reports_non_bijective_mapping_metrics() -> None:
+    project, simulator_error = _legacy_topology_projector()
+    asset = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+    live_rest = np.asarray(
+        [[0.0, 0.0, 0.0], [0.000001, 0.0, 0.0]], dtype=np.float32
+    )
+
+    with __import__("pytest").raises(
+        simulator_error,
+        match=(
+            r"non-bijective mapping: mapped_unique_count=1 expected_unique_count=2 "
+            r"missing_unique_count=1"
+        ),
+    ):
+        project(asset, np.zeros_like(asset), asset, live_rest)
 
 
 def test_legacy_cuda_restore_uses_scene_pose_frame_conversion_before_physx_write() -> None:

@@ -24,6 +24,7 @@ from lehome.assets.scenes.bedroom import MARBLE_BEDROOM_CFG
 from lehome.devices.action_process import preprocess_device_action
 from lehome.assets.object.Garment import GarmentObject
 from lehome.assets.collider_audit import audit_current_usd_stage
+from lehome.flywheel.persistent_worker import SimulatorNumericalDivergenceError
 from lehome.tasks.bedroom.challenge_garment_loader import ChallengeGarmentLoader
 from lehome.flywheel.isaac_camera import read_camera_world_pose, write_camera_world_pose
 import logging
@@ -852,7 +853,13 @@ class GarmentEnv(DirectRLEnv):
             or not np.isfinite(topology_tolerance)
             or topology_tolerance <= 0.0
         ):
-            raise ValueError("legacy USD to PhysX cloth topology is invalid")
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD to PhysX cloth topology is invalid"
+            )
+        if len(source_positions) == 0:
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD to PhysX cloth topology is invalid: usd_row_count=0"
+            )
 
         normalized_asset = asset.copy()
         normalized_asset[normalized_asset == 0.0] = 0.0
@@ -871,22 +878,30 @@ class GarmentEnv(DirectRLEnv):
         representative_indices = np.asarray(representatives, dtype=np.int64)
         unique_asset = asset[representative_indices]
         if len(unique_asset) != len(live_rest):
-            raise ValueError("legacy USD and live PhysX cloth topology cardinality mismatch")
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD and live PhysX cloth topology cardinality mismatch: "
+                f"usd_unique_count={len(unique_asset)} live_physx_count={len(live_rest)} "
+                f"usd_row_count={len(asset)} "
+                f"duplicate_seam_row_count={len(asset) - len(unique_asset)}"
+            )
 
         for representative, group in groups.items():
             if len(group) == 1:
                 continue
-            if not (
-                np.array_equal(
-                    source_positions[group],
-                    np.repeat(source_positions[representative : representative + 1], len(group), axis=0),
+            duplicate_indices = np.asarray(group[1:], dtype=np.int64)
+            position_max_abs_delta = float(np.max(np.abs(
+                source_positions[duplicate_indices] - source_positions[representative]
+            )))
+            velocity_max_abs_delta = float(np.max(np.abs(
+                source_velocities[duplicate_indices] - source_velocities[representative]
+            )))
+            if position_max_abs_delta != 0.0 or velocity_max_abs_delta != 0.0:
+                raise SimulatorNumericalDivergenceError(
+                    "legacy USD duplicate seam state is inconsistent: "
+                    f"representative_index={representative} duplicate_index={group[1]} "
+                    f"position_max_abs_delta={position_max_abs_delta:.9g} "
+                    f"velocity_max_abs_delta={velocity_max_abs_delta:.9g}"
                 )
-                and np.array_equal(
-                    source_velocities[group],
-                    np.repeat(source_velocities[representative : representative + 1], len(group), axis=0),
-                )
-            ):
-                raise ValueError("legacy USD duplicate seam state is inconsistent")
 
         selected_chunks: list[np.ndarray] = []
         distance_chunks: list[np.ndarray] = []
@@ -900,14 +915,27 @@ class GarmentEnv(DirectRLEnv):
             )
         selected_groups = np.concatenate(selected_chunks)
         selected_distances = np.concatenate(distance_chunks)
+        max_distance = float(np.max(selected_distances))
+        median_distance = float(np.median(selected_distances))
+        if max_distance > topology_tolerance:
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD and live PhysX cloth topology nearest-coordinate distance mismatch: "
+                f"max_distance={max_distance:.9g} median_distance={median_distance:.9g} "
+                f"tolerance={topology_tolerance:.9g}"
+            )
+        mapped_unique_count = int(np.unique(selected_groups).size)
         if (
-            np.max(selected_distances) > topology_tolerance
-            or np.unique(selected_groups).size != len(unique_asset)
+            mapped_unique_count != len(unique_asset)
             or not np.array_equal(
                 np.sort(selected_groups), np.arange(len(unique_asset), dtype=selected_groups.dtype)
             )
         ):
-            raise ValueError("legacy USD and live PhysX cloth topology do not match")
+            raise SimulatorNumericalDivergenceError(
+                "legacy USD and live PhysX cloth topology non-bijective mapping: "
+                f"mapped_unique_count={mapped_unique_count} "
+                f"expected_unique_count={len(unique_asset)} "
+                f"missing_unique_count={len(unique_asset) - mapped_unique_count}"
+            )
         projected_indices = representative_indices[selected_groups]
         return (
             source_positions[projected_indices].copy(),
