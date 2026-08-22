@@ -129,7 +129,7 @@ def test_evaluation_only_preserves_success_and_failure_as_non_bundle_terminal_ar
     assert failed_result.terminal_dir == run_root / "evaluation-terminal" / failure[1]
 
 
-def test_empty_video_file_is_rejected(tmp_path, ledger):
+def test_empty_video_file_is_an_infrastructure_abort(tmp_path, ledger):
     run_root = tmp_path / "run"
     queue = _queue(tmp_path, ledger)
     worker_id, attempt_id, lease_id, output_dir = handoff_terminal(ledger, run_root, attempt_index=2, corrupt=True)
@@ -137,8 +137,57 @@ def test_empty_video_file_is_rejected(tmp_path, ledger):
     queue.enqueue(worker_id, attempt_id, lease_id, output_dir)
     result = queue.finalize_next()
 
-    assert result.outcome == "rejected"
-    assert ledger.status(attempt_id) == "rejected"
+    assert result.outcome == "infrastructure_abort"
+    assert ledger.status(attempt_id) == "infrastructure_abort"
+
+
+def test_malformed_worker_outcome_is_an_infrastructure_abort(tmp_path, ledger):
+    run_root = tmp_path / "run"
+    queue = _queue(tmp_path, ledger)
+    worker_id, attempt_id, lease_id, output_dir = handoff_terminal(
+        ledger, run_root, attempt_index=0,
+    )
+    receipt = json.loads((output_dir / "worker-receipt.json").read_text())
+    receipt["outcome"] = {"success": "yes"}
+    (output_dir / "worker-receipt.json").write_text(json.dumps(receipt, sort_keys=True))
+
+    queue.enqueue(worker_id, attempt_id, lease_id, output_dir)
+    result = queue.finalize_next()
+
+    assert result is not None and result.outcome == "infrastructure_abort"
+    assert ledger.status(attempt_id) == "infrastructure_abort"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["duplicate", "nonfinite", "boolean-schema", "float-schema", "wrong-worker", "wrong-lease"],
+)
+def test_worker_receipt_identity_and_json_boundary_fail_closed(tmp_path, ledger, fault: str):
+    run_root = tmp_path / "run"
+    queue = _queue(tmp_path, ledger)
+    worker_id, attempt_id, lease_id, output_dir = handoff_terminal(ledger, run_root, attempt_index=0)
+    receipt_path = output_dir / "worker-receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    if fault == "duplicate":
+        receipt_path.write_text('{"schema_version":1,"schema_version":1}')
+    elif fault == "nonfinite":
+        receipt_path.write_text(json.dumps(receipt)[:-1] + ',"probe":NaN}')
+    else:
+        if fault == "boolean-schema":
+            receipt["schema_version"] = True
+        elif fault == "float-schema":
+            receipt["schema_version"] = 1.0
+        elif fault == "wrong-worker":
+            receipt["worker_id"] = "other-worker"
+        else:
+            receipt["lease_id"] = "other-lease"
+        receipt_path.write_text(json.dumps(receipt, sort_keys=True))
+
+    queue.enqueue(worker_id, attempt_id, lease_id, output_dir)
+    result = queue.finalize_next()
+
+    assert result is not None and result.outcome == "infrastructure_abort"
+    assert ledger.status(attempt_id) == "infrastructure_abort"
 
 
 def test_backpressure_refuses_items_beyond_bounds(tmp_path, ledger):

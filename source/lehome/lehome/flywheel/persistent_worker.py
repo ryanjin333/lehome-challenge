@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 from threading import Event, Thread, Timer
+from time import monotonic, sleep
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
@@ -23,6 +24,8 @@ ACTION_HORIZON = 16
 _SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
 _PREPARATION_TIMEOUT_REASON = "preparation_timeout"
 _PREPARATION_TIMEOUT_EXIT_STATUS = 70
+_SOURCE_FINALIZATION_POLL_SECONDS = 1.0
+_DEFAULT_SOURCE_FINALIZATION_TIMEOUT_SECONDS = 300.0
 
 
 class PreparationTimeoutError(RuntimeError):
@@ -47,6 +50,8 @@ class _LeaseController(Protocol):
     def reject_attempt(self, worker_id: str, attempt_id: str, lease_id: str, *, reason: str) -> str: ...
 
     def record_infrastructure_abort(self, worker_id: str, attempt_id: str, lease_id: str, *, reason: str) -> str: ...
+
+    def status(self, attempt_id: str) -> str: ...
 
 
 class _EpisodeSession(Protocol):
@@ -94,6 +99,12 @@ def _assignment_value(assignment: Mapping[str, object], *names: str) -> object:
         if name in assignment:
             return assignment[name]
     raise ValueError(f"attempt assignment requires one of: {', '.join(names)}")
+
+
+def _is_source_discovery_assignment(assignment: Mapping[str, object]) -> bool:
+    """The existing source-bootstrap marker is the worker-side discovery contract."""
+
+    return assignment.get("snapshot_source_bootstrap") is True
 
 
 def _write_receipt(path: Path, receipt: Mapping[str, object]) -> None:
@@ -154,6 +165,7 @@ class PersistentRolloutWorker:
         simulator_device: str | None = None,
         heartbeat_interval_seconds: float = 30.0,
         preparation_timeout_seconds: float = 180.0,
+        source_finalization_timeout_seconds: float = _DEFAULT_SOURCE_FINALIZATION_TIMEOUT_SECONDS,
         hard_exit: Callable[[int], None] = os._exit,
     ) -> None:
         self.identity = WorkerIdentity(worker_id, session_id, renderer_device, policy_device)
@@ -174,10 +186,18 @@ class PersistentRolloutWorker:
             or preparation_timeout_seconds <= 0
         ):
             raise ValueError("preparation_timeout_seconds must be positive")
+        if (
+            isinstance(source_finalization_timeout_seconds, bool)
+            or not isinstance(source_finalization_timeout_seconds, (int, float))
+            or not math.isfinite(source_finalization_timeout_seconds)
+            or source_finalization_timeout_seconds <= 0
+        ):
+            raise ValueError("source_finalization_timeout_seconds must be positive")
         if not callable(hard_exit):
             raise ValueError("hard_exit must be callable")
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._preparation_timeout_seconds = float(preparation_timeout_seconds)
+        self._source_finalization_timeout_seconds = float(source_finalization_timeout_seconds)
         self._hard_exit = hard_exit
 
     @property
@@ -363,6 +383,23 @@ class PersistentRolloutWorker:
         self._episode_generation = reported
         return reported
 
+    def _wait_for_source_finalization(self, *, attempt_id: str) -> str:
+        """Require finalization before this paid source worker can lease again."""
+
+        deadline = monotonic() + self._source_finalization_timeout_seconds
+        while True:
+            status = self._controller.status(attempt_id)
+            if status in {"accepted", "rejected"}:
+                return status
+            if status == "infrastructure_abort":
+                raise RuntimeError("source discovery finalization infrastructure abort")
+            if status != "terminal_pending_validation":
+                raise RuntimeError(f"source discovery finalization reached unexpected state: {status!r}")
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise RuntimeError("source discovery finalization timeout")
+            sleep(min(_SOURCE_FINALIZATION_POLL_SECONDS, remaining))
+
     def run(self, *, max_episodes: int | None = None) -> list[dict[str, object]]:
         """Drain immediately available leases, retaining one simulator instance."""
 
@@ -457,9 +494,22 @@ class PersistentRolloutWorker:
                                 else "runtime_evidence_invalid"
                             ),
                         )
+                        if _is_source_discovery_assignment(assignment):
+                            raise RuntimeError("source discovery infrastructure abort") from error
                         continue
                     restore_failed = "snapshot" in str(error).lower() or "restore" in str(error).lower()
                     if restore_failed:
+                        if _is_source_discovery_assignment(assignment):
+                            abort = getattr(self._controller, "record_infrastructure_abort", None)
+                            if not callable(abort):
+                                raise RuntimeError("controller does not support durable infrastructure abort") from error
+                            abort(
+                                self.identity.worker_id,
+                                attempt_id,
+                                lease_id,
+                                reason="source_snapshot_evidence_invalid",
+                            )
+                            raise RuntimeError("source discovery snapshot evidence is invalid") from error
                         reject = getattr(self._controller, "reject_attempt", None)
                         if callable(reject):
                             reject(self.identity.worker_id, attempt_id, lease_id, reason=type(error).__name__)
@@ -504,6 +554,8 @@ class PersistentRolloutWorker:
                 self._controller.record_terminal(
                     self.identity.worker_id, attempt_id, lease_id, str(output_dir)
                 )
+                if _is_source_discovery_assignment(assignment):
+                    self._wait_for_source_finalization(attempt_id=attempt_id)
                 receipts.append(receipt)
         finally:
             session.close()

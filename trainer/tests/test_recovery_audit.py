@@ -10,6 +10,8 @@ import types
 
 import pytest
 
+from lehome_train.io import canonical_json_sha256
+
 
 def _write(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -229,7 +231,8 @@ def test_source_only_envelope_is_fail_closed_and_not_a_strict_round_seal(tmp_pat
     from lehome_train.groot.recovery_audit import _audit_source_seal
     from lehome_train.groot.rollout_source_adapter import _seal
     assert callable(mutate)
-    body = {"schema_version": 1, "kind": "snapshot_source_bootstrap_envelope", "round_id": "snapshot-source-bootstrap-abc-unsealed-source", "repository": "ryanjin333/lehome-groot-n17-rollouts", "episode_count": 1, "episode_sha256s": {"one": "a" * 64}, "immutable_revisions": {"one": "b" * 40}, "readback_verified": True, "source_only": True}
+    attempt_id = "1" * 64
+    body = {"schema_version": 1, "kind": "snapshot_source_bootstrap_envelope", "round_id": "snapshot-source-bootstrap-abc-unsealed-source", "repository": "ryanjin333/lehome-groot-n17-rollouts", "episode_count": 1, "episode_sha256s": {attempt_id: "a" * 64}, "immutable_revisions": {attempt_id: "b" * 40}, "readback_verified": True, "source_only": True}
     from lehome_train.io import canonical_json_sha256
     mutate(body)
     body["envelope_sha256"] = canonical_json_sha256(body)
@@ -245,15 +248,85 @@ def test_source_only_envelope_rejects_raw_checksum_tampering_but_a_canonical_one
     from lehome_train.groot.rollout_source_adapter import _seal
     from lehome_train.io import canonical_json_sha256
 
-    body = {"schema_version": 1, "kind": "snapshot_source_bootstrap_envelope", "round_id": "snapshot-source-bootstrap-abc-unsealed-source", "repository": "ryanjin333/lehome-groot-n17-rollouts", "episode_count": 1, "episode_sha256s": {"one": "a" * 64}, "immutable_revisions": {"one": "b" * 40}, "readback_verified": True, "source_only": True}
+    attempt_id = "1" * 64
+    body = {"schema_version": 1, "kind": "snapshot_source_bootstrap_envelope", "round_id": "snapshot-source-bootstrap-abc-unsealed-source", "repository": "ryanjin333/lehome-groot-n17-rollouts", "episode_count": 1, "episode_sha256s": {attempt_id: "a" * 64}, "immutable_revisions": {attempt_id: "b" * 40}, "readback_verified": True, "source_only": True}
     body["envelope_sha256"] = canonical_json_sha256(body)
     path = tmp_path / "source-envelope.json"; _write(path, body)
     assert _audit_source_seal(path)["seal_sha256"] == body["envelope_sha256"]
     with pytest.raises(ValueError):
         _seal(path)
-    body["episode_sha256s"]["one"] = "c" * 64
+
+
+@pytest.mark.parametrize("payload", [
+    '{"schema_version":1,"schema_version":1}',
+    '{"schema_version":NaN}',
+])
+def test_source_only_envelope_rejects_duplicate_and_nonfinite_json_before_mapping_access(
+    tmp_path: Path, payload: str,
+) -> None:
+    from lehome_train.groot.recovery_audit import _audit_source_seal
+
+    path = tmp_path / "source-envelope.json"
+    path.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source envelope"):
+        _audit_source_seal(path)
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0])
+def test_source_only_envelope_requires_an_exact_integer_schema_version(
+    tmp_path: Path, schema_version: object,
+) -> None:
+    from lehome_train.groot.recovery_audit import _audit_source_seal
+    from lehome_train.io import canonical_json_sha256
+
+    attempt_id = "1" * 64
+    body = {"schema_version": schema_version, "kind": "snapshot_source_bootstrap_envelope", "round_id": "snapshot-source-bootstrap-abc-unsealed-source", "repository": "ryanjin333/lehome-groot-n17-rollouts", "episode_count": 1, "episode_sha256s": {attempt_id: "a" * 64}, "immutable_revisions": {attempt_id: "b" * 40}, "readback_verified": True, "source_only": True}
+    body["envelope_sha256"] = canonical_json_sha256(body)
+    path = tmp_path / "source-envelope.json"
+    _write(path, body)
+
+    with pytest.raises(ValueError, match="source envelope"):
+        _audit_source_seal(path)
+
+
+def test_source_only_audit_envelope_admits_a_bounded_multi_source_set_but_remains_non_trainable(tmp_path: Path) -> None:
+    from lehome_train.groot.recovery_audit import _audit_source_seal
+    from lehome_train.groot.rollout_source_adapter import _seal
+
+    path = tmp_path / "sources.json"
+    first_id, second_id = "1" * 64, "2" * 64
+    body = {"schema_version": 1, "kind": "snapshot_source_bootstrap_envelope", "round_id": "snapshot-source-bootstrap-abc-unsealed-source", "repository": "ryanjin333/lehome-groot-n17-rollouts", "episode_count": 2, "episode_sha256s": {first_id: "a" * 64, second_id: "b" * 64}, "immutable_revisions": {first_id: "c" * 40, second_id: "d" * 40}, "readback_verified": True, "source_only": True}
+    body["envelope_sha256"] = canonical_json_sha256(body)
+    path.write_text(json.dumps(body), encoding="utf-8")
+
+    assert _audit_source_seal(path)["episode_count"] == 2
+    with pytest.raises(ValueError):
+        _seal(path)
+    body["episode_sha256s"][first_id] = "c" * 64
     _write(path, body)
     with pytest.raises(ValueError, match="checksum"):
+        _audit_source_seal(path)
+
+
+@pytest.mark.parametrize("episode_id", ["not-a-task-ledger-id", "../unsafe", "A" * 64])
+def test_source_only_audit_envelope_requires_canonical_task_ledger_attempt_ids(
+    tmp_path: Path, episode_id: str,
+) -> None:
+    from lehome_train.groot.recovery_audit import _audit_source_seal
+
+    body = {
+        "schema_version": 1, "kind": "snapshot_source_bootstrap_envelope",
+        "round_id": "snapshot-source-bootstrap-abc-unsealed-source",
+        "repository": "ryanjin333/lehome-groot-n17-rollouts", "episode_count": 1,
+        "episode_sha256s": {episode_id: "a" * 64},
+        "immutable_revisions": {episode_id: "b" * 40},
+        "readback_verified": True, "source_only": True,
+    }
+    body["envelope_sha256"] = canonical_json_sha256(body)
+    path = tmp_path / "source-envelope.json"; _write(path, body)
+
+    with pytest.raises(ValueError, match="lineage"):
         _audit_source_seal(path)
 
 
@@ -280,14 +353,15 @@ def test_audit_rejects_duplicate_source_envelope_rounds_and_cross_run_episode_id
     materialize._is_autonomous_policy_success = lambda _: True  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "lehome_train.flywheel.materialize", materialize)
     rewards = [0.0] * 16 + [0.4, 0.1] + [0.1] * 14 + [0.5] * 16
-    root, receipts, strict = _round(tmp_path, round_id="source-round-one", episodes={"shared-attempt": ("top_long", rewards, 1.0)})
+    shared_attempt = "d" * 64
+    root, receipts, strict = _round(tmp_path, round_id="source-round-one", episodes={shared_attempt: ("top_long", rewards, 1.0)})
     envelope = _source_only_envelope(tmp_path / "source-one-envelope.json", strict)
     with pytest.raises(ValueError, match="round seal ID collision"):
         audit_successful_recoveries(
             accepted_roots=(root, root), receipt_roots=(receipts, receipts),
             round_seal_paths=(envelope, envelope), output_path=tmp_path / "duplicate-round.json",
         )
-    second_root, second_receipts, second_strict = _round(tmp_path, round_id="source-round-two", episodes={"shared-attempt": ("top_long", rewards, 2.0)})
+    second_root, second_receipts, second_strict = _round(tmp_path, round_id="source-round-two", episodes={shared_attempt: ("top_long", rewards, 2.0)})
     second_envelope = _source_only_envelope(tmp_path / "source-two-envelope.json", second_strict)
     with pytest.raises(ValueError, match="cross-round episode-ID collision"):
         audit_successful_recoveries(

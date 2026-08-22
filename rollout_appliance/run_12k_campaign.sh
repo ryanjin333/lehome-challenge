@@ -36,6 +36,7 @@ WORKER_COUNT="${LEHOME_WORKER_COUNT:-1}"
 MAX_ATTEMPTS="${LEHOME_MAX_ATTEMPTS:-400}"
 TARGET_ACCEPTED="${LEHOME_TARGET_ACCEPTED:-150}"
 PREPARATION_TIMEOUT_SECONDS="${LEHOME_PREPARATION_TIMEOUT_SECONDS:-180}"
+SOURCE_FINALIZATION_TIMEOUT_SECONDS="${LEHOME_SOURCE_FINALIZATION_TIMEOUT_SECONDS:-300}"
 MAX_WORKER_RESTARTS="${LEHOME_MAX_WORKER_RESTARTS:-2}"
 MAX_STEPS="${LEHOME_MAX_STEPS:-600}"
 INITIAL_GARMENT="${LEHOME_INITIAL_GARMENT:-Top_Long_Seen_0}"
@@ -118,6 +119,19 @@ case "${MAX_STEPS}" in
   ''|*[!0-9]*) echo "LEHOME_MAX_STEPS must be a positive integer" >&2; exit 2 ;;
   0) echo "LEHOME_MAX_STEPS must be a positive integer" >&2; exit 2 ;;
 esac
+if ! python3 - "${SOURCE_FINALIZATION_TIMEOUT_SECONDS}" <<'PY'
+import math
+import sys
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and value > 0 else 1)
+PY
+then
+  echo "LEHOME_SOURCE_FINALIZATION_TIMEOUT_SECONDS must be positive and finite" >&2
+  exit 2
+fi
 if ! [[ "${MATRIX_EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
   echo "LEHOME_ATTEMPT_MATRIX_SHA256 must be a lowercase 64-character SHA-256" >&2
   exit 2
@@ -153,24 +167,57 @@ if [ "${MATRIX_ACTUAL_SHA256}" != "${MATRIX_EXPECTED_SHA256}" ]; then
 fi
 if [ "${SKIP_ROUND_SEAL}" = "1" ] && [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" = "1" ]; then
   if [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || [ "${WORKER_COUNT}" != "1" ] \
-      || [ "${MAX_ATTEMPTS}" != "1" ] || [ "${TARGET_ACCEPTED}" != "1" ] \
       || [ "${ENABLE_HF_UPLOAD}" != "1" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ] \
+      || [ "${MAX_WORKER_RESTARTS}" != "0" ] \
       || ! [[ "${RUN_ID}" =~ ^[0-9a-f]{32}$ ]] \
       || ! [[ "${ROUND_ID}" =~ ^snapshot-source-bootstrap-[0-9a-f]{20}-unsealed-source$ ]]; then
     echo "LEHOME_SKIP_ROUND_SEAL is reserved for the exact snapshot-source bootstrap tuple" >&2
     exit 2
   fi
-  python3 - "${MATRIX}" "${MATRIX_EXPECTED_SHA256}" "${RUN_ID}" "${ROUND_ID}" <<'PY'
+  python3 - "${MATRIX}" "${MATRIX_EXPECTED_SHA256}" "${RUN_ID}" "${ROUND_ID}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" <<'PY'
 import hashlib, json, re, sys
 from pathlib import Path
-path, expected, run_id, round_id = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+path, expected, run_id, round_id, max_attempts, target_accepted = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
 try: rows = json.loads(path.read_text(encoding="utf-8"))
 except (OSError, ValueError) as error: raise SystemExit(f"snapshot source descriptor is malformed: {error}")
-if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict): raise SystemExit("snapshot source descriptor must contain exactly one row")
-row = rows[0]
-if row.get("snapshot_source_bootstrap") is not True or "recovery_kind" in row: raise SystemExit("snapshot source descriptor must be ordinary autonomous collection")
-if type(row.get("source_seed")) is not int or row["source_seed"] < 0 or row.get("seed") != row["source_seed"]: raise SystemExit("snapshot source descriptor seed binding is invalid")
-if row.get("snapshot_source_descriptor_sha256") not in (None, expected): raise SystemExit("snapshot source descriptor hash is invalid")
+try:
+    max_attempts, target_accepted = int(max_attempts), int(target_accepted)
+except ValueError: raise SystemExit("snapshot source discovery attempt bounds are invalid")
+if not isinstance(rows, list) or not 1 <= len(rows) <= 16 or not all(isinstance(row, dict) for row in rows): raise SystemExit("snapshot source descriptor must contain 1..16 rows")
+if max_attempts != len(rows) or not 1 <= target_accepted <= min(4, len(rows)): raise SystemExit("snapshot source discovery attempt bounds are invalid")
+legacy_single = len(rows) == 1 and rows[0].get("replay_kind") == "verified_success_reset_v1"
+if not legacy_single:
+    category, seeds = rows[0].get("category"), set()
+    allowed_fields = {"snapshot_source_bootstrap", "snapshot_source_descriptor_sha256", "category", "garment", "garment_name", "seed", "source_seed"}
+    for row in rows:
+        if (row.get("snapshot_source_bootstrap") is not True or row.get("category") != category
+                or row.get("garment_name") not in (None, row.get("garment"))
+                or any(key not in allowed_fields for key in row)):
+            raise SystemExit("snapshot source descriptor must be ordinary autonomous collection")
+        garment = row.get("garment")
+        canonical_seen = {
+            "top_long": r"Top_Long_Seen_[0-9]+",
+            "top_short": r"Top_Short_Seen_[0-9]+",
+            "pant_long": r"Pant_Long_Seen_[0-9]+",
+            "pant_short": r"Pant_Short_Seen_[0-9]+",
+        }
+        if category not in canonical_seen or not isinstance(garment, str) or re.fullmatch(canonical_seen[category], garment) is None:
+            raise SystemExit("snapshot source descriptor garment identity is not a canonical seen garment")
+        seed, source_seed = row.get("seed"), row.get("source_seed")
+        if (type(seed) is not int or seed < 0 or type(source_seed) is not int
+                or source_seed < 0 or source_seed != seed or seed in seeds):
+            raise SystemExit("snapshot source descriptor seed binding is invalid")
+        seeds.add(seed)
+else:
+    row = rows[0]
+    if row.get("snapshot_source_bootstrap") is not True or row.get("recovery_kind") is not None:
+        raise SystemExit("snapshot source descriptor lineage is invalid")
+    if (type(row.get("seed")) is not int or row["seed"] < 0
+            or type(row.get("source_seed")) is not int or row["source_seed"] < 0
+            or row["seed"] != row["source_seed"]):
+        raise SystemExit("snapshot source descriptor seed binding is invalid")
+for row in rows:
+    if row.get("snapshot_source_descriptor_sha256") not in (None, expected): raise SystemExit("snapshot source descriptor hash is invalid")
 identity = hashlib.sha256(f"{run_id}:{expected}".encode("ascii")).hexdigest()[:20]
 if round_id != f"snapshot-source-bootstrap-{identity}-unsealed-source": raise SystemExit("snapshot source descriptor does not bind the active run identity")
 PY
@@ -529,6 +576,7 @@ launch_worker() {
       --policy-artifact-sha256 "${POLICY_ARTIFACT_SHA256}" \
       --policy-timeout-seconds 180 \
       --preparation-timeout-seconds "${PREPARATION_TIMEOUT_SECONDS}" \
+      --source-finalization-timeout-seconds "${SOURCE_FINALIZATION_TIMEOUT_SECONDS}" \
       --policy-ready-file "${RECEIPT_DIR}/ready.json" \
       --initial-garment "${INITIAL_GARMENT}" \
       --seed 101 \

@@ -28,6 +28,7 @@ _CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
 _HORIZON = 16
 _SOURCE_ROUND_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 _SOURCE_REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_TASK_LEDGER_ATTEMPT_ID = re.compile(r"^[0-9a-f]{64}$")
 _CONTINUATION_CONTRACT = "authenticated_physx_cloth_view_snapshot_at_fresh_h16_next_action_boundary_v1"
 
 
@@ -97,7 +98,7 @@ def _output_path(path: str | Path) -> Path:
 
 
 def _audit_source_seal(path: Path) -> Mapping[str, object]:
-    """Accept a one-episode source envelope only in the recovery-audit lane.
+    """Accept a bounded source envelope only in the recovery-audit lane.
 
     This is intentionally not added to rollout_source_adapter._seal: it is
     non-trainable provenance for fresh snapshot sources, never a strict round
@@ -105,13 +106,26 @@ def _audit_source_seal(path: Path) -> Mapping[str, object]:
     """
 
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        document = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_strict_pairs,
+            parse_constant=_reject_constant,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError("recovery audit source envelope is malformed") from error
+    if not isinstance(document, Mapping):
+        raise ValueError("recovery audit source envelope is invalid")
     if document.get("kind") == "rollout_round_seal":
         return _seal(path)
     required = {"schema_version", "kind", "round_id", "repository", "episode_count", "episode_sha256s", "immutable_revisions", "readback_verified", "source_only", "envelope_sha256"}
-    if not isinstance(document, Mapping) or set(document) != required or document.get("schema_version") != 1 or document.get("kind") != "snapshot_source_bootstrap_envelope" or document.get("source_only") is not True or document.get("readback_verified") is not True or document.get("episode_count") != 1:
+    if (set(document) != required
+            or type(document.get("schema_version")) is not int
+            or document["schema_version"] != 1
+            or document.get("kind") != "snapshot_source_bootstrap_envelope"
+            or document.get("source_only") is not True
+            or document.get("readback_verified") is not True
+            or type(document.get("episode_count")) is not int
+            or not 1 <= document["episode_count"] <= 4):
         raise ValueError("recovery audit source envelope is invalid")
     expected = dict(document); claimed = expected.pop("envelope_sha256")
     if not isinstance(claimed, str) or claimed != canonical_json_sha256(expected):
@@ -120,15 +134,17 @@ def _audit_source_seal(path: Path) -> Mapping[str, object]:
     if (not isinstance(document["round_id"], str) or _SOURCE_ROUND_ID.fullmatch(document["round_id"]) is None
             or not isinstance(document["repository"], str) or _SOURCE_REPOSITORY.fullmatch(document["repository"]) is None
             or not isinstance(episodes, Mapping) or not isinstance(revisions, Mapping)
-            or set(episodes) != set(revisions) or len(episodes) != 1):
+            or set(episodes) != set(revisions)
+            or len(episodes) != document["episode_count"]):
         raise ValueError("recovery audit source envelope lineage is invalid")
-    episode_id = next(iter(episodes))
-    if (not isinstance(episode_id, str) or not episode_id
-            or not isinstance(episodes[episode_id], str) or len(episodes[episode_id]) != 64
-            or any(character not in "0123456789abcdef" for character in episodes[episode_id])
-            or not isinstance(revisions[episode_id], str) or len(revisions[episode_id]) != 40
-            or any(character not in "0123456789abcdef" for character in revisions[episode_id])):
-        raise ValueError("recovery audit source envelope lineage is invalid")
+    for episode_id, digest in episodes.items():
+        revision = revisions[episode_id]
+        if (not isinstance(episode_id, str) or _TASK_LEDGER_ATTEMPT_ID.fullmatch(episode_id) is None
+                or not isinstance(digest, str) or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                or not isinstance(revision, str) or len(revision) != 40
+                or any(character not in "0123456789abcdef" for character in revision)):
+            raise ValueError("recovery audit source envelope lineage is invalid")
     return {**document, "seal_sha256": claimed}
 
 

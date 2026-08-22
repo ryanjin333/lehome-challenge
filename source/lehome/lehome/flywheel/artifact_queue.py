@@ -101,12 +101,47 @@ def _validate_raw_episode(output_dir: Path, attempt_id: str) -> str | None:
     return None
 
 
-def _episode_succeeded(output_dir: Path) -> tuple[bool, str]:
-    receipt = json.loads((output_dir / RECEIPT_NAME).read_text(encoding="utf-8"))
+def _strict_receipt_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    receipt: dict[str, object] = {}
+    for key, value in pairs:
+        if key in receipt:
+            raise ValueError("duplicate worker receipt field")
+        receipt[key] = value
+    return receipt
+
+
+def _reject_receipt_constant(value: str) -> object:
+    raise ValueError(f"non-finite worker receipt constant: {value}")
+
+
+def _episode_succeeded(
+    output_dir: Path, *, worker_id: str, attempt_id: str, lease_id: str,
+) -> tuple[bool | None, str]:
+    try:
+        receipt = json.loads(
+            (output_dir / RECEIPT_NAME).read_text(encoding="utf-8"),
+            object_pairs_hook=_strict_receipt_object,
+            parse_constant=_reject_receipt_constant,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        return None, f"worker receipt is malformed: {error}"
+    if not isinstance(receipt, dict):
+        return None, "worker receipt must be an object"
+    if (
+        type(receipt.get("schema_version")) is not int
+        or receipt["schema_version"] != 1
+        or receipt.get("attempt_id") != attempt_id
+        or receipt.get("worker_id") != worker_id
+        or receipt.get("lease_id") != lease_id
+    ):
+        return None, "worker receipt does not bind the leased identity"
     outcome = receipt.get("outcome")
     if not isinstance(outcome, dict):
-        return False, "worker receipt outcome missing"
-    if outcome.get("success") is True:
+        return None, "worker receipt outcome missing"
+    success = outcome.get("success")
+    if type(success) is not bool:
+        return None, "worker receipt outcome success must be a boolean"
+    if success:
         return True, ""
     return False, "episode outcome is not a success"
 
@@ -190,23 +225,38 @@ class ArtifactFinalizationQueue:
         self._pending_attempts.discard(item.attempt_id)
         self._pending_bytes -= item.byte_size
 
-        reason = _validate_raw_episode(item.output_dir, item.attempt_id)
-        if reason is None:
-            succeeded, success_reason = _episode_succeeded(item.output_dir)
-            if self._evaluation_terminal_root is not None:
-                terminal_dir = self._publish_evaluation_terminal(item)
-                outcome = "accepted" if succeeded else "rejected"
-                self._ledger.validate_terminal(
-                    item.attempt_id, outcome, artifact_id=str(terminal_dir),
-                )
-                return FinalizationResult(
-                    item.attempt_id,
-                    outcome,
-                    "" if succeeded else success_reason,
-                    None,
-                    terminal_dir,
-                )
-            reason = None if succeeded else success_reason
+        validation_reason = _validate_raw_episode(item.output_dir, item.attempt_id)
+        if validation_reason is not None:
+            self._ledger.validate_terminal(item.attempt_id, "infrastructure_abort")
+            return FinalizationResult(
+                item.attempt_id, "infrastructure_abort", validation_reason, None,
+            )
+
+        succeeded, success_reason = _episode_succeeded(
+            item.output_dir,
+            worker_id=item.worker_id,
+            attempt_id=item.attempt_id,
+            lease_id=item.lease_id,
+        )
+        if succeeded is None:
+            self._ledger.validate_terminal(item.attempt_id, "infrastructure_abort")
+            return FinalizationResult(
+                item.attempt_id, "infrastructure_abort", success_reason, None,
+            )
+        if self._evaluation_terminal_root is not None:
+            terminal_dir = self._publish_evaluation_terminal(item)
+            outcome = "accepted" if succeeded else "rejected"
+            self._ledger.validate_terminal(
+                item.attempt_id, outcome, artifact_id=str(terminal_dir),
+            )
+            return FinalizationResult(
+                item.attempt_id,
+                outcome,
+                "" if succeeded else success_reason,
+                None,
+                terminal_dir,
+            )
+        reason: str | None = None if succeeded else success_reason
         if reason is None:
             # Multiple appliance finalizer processes may observe terminal
             # handoffs at once. Serialize the cap check, move, and append-only

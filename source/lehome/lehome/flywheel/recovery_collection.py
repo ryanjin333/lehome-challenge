@@ -25,6 +25,12 @@ from lehome.flywheel.snapshots import (
 RECOVERY_KIND = "controlled_success_recovery_snapshot_v3"
 _SHA256_LENGTH = 64
 _LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CANONICAL_SEEN_GARMENTS = {
+    "top_long": re.compile(r"^Top_Long_Seen_[0-9]+$"),
+    "top_short": re.compile(r"^Top_Short_Seen_[0-9]+$"),
+    "pant_long": re.compile(r"^Pant_Long_Seen_[0-9]+$"),
+    "pant_short": re.compile(r"^Pant_Short_Seen_[0-9]+$"),
+}
 _MAX_CLOTH_DISPLACEMENT_M = 0.01
 _MAX_CLOTH_VELOCITY_MPS = 0.05
 _MAX_GRIPPER_OFFSET_RAD = 0.08
@@ -424,29 +430,34 @@ def _validate_continuation_snapshot_boundary(
         raise ValueError("continuation snapshot randomization does not match the authenticated reset")
 
 
-def validate_snapshot_source_descriptor(descriptor_path: str | Path) -> dict[str, object]:
-    """Validate one source assignment before any simulator is started."""
-
-    descriptor_file = _strict_absolute_regular_file(
-        descriptor_path, field="snapshot source descriptor"
-    )
+def _snapshot_source_descriptor_rows(descriptor_path: str | Path) -> list[dict[str, object]]:
+    descriptor_file = _strict_absolute_regular_file(descriptor_path, field="snapshot source descriptor")
     try:
         rows = _strict_json_value_from_text(
             descriptor_file.read_text(encoding="utf-8"), field="snapshot source descriptor"
         )
     except (OSError, UnicodeError, ValueError) as error:
         raise ValueError("snapshot source descriptor is malformed") from error
-    if not isinstance(rows, list) or len(rows) != 1 or type(rows[0]) is not dict:
-        raise ValueError("snapshot source descriptor must contain exactly one row")
-    row = dict(rows[0])
-    category, garment, seed = row.get("category"), row.get("garment"), row.get("seed")
+    if not isinstance(rows, list) or not all(type(row) is dict for row in rows):
+        raise ValueError("snapshot source descriptor must contain JSON object rows")
+    return [dict(row) for row in rows]
+
+
+def _validate_snapshot_source_row(
+    row: Mapping[str, object], *, allow_legacy_replay: bool,
+) -> dict[str, object]:
+    """Validate source row lineage without accepting unrelated recovery inputs."""
+
+    row = dict(row)
+    category, garment = row.get("category"), row.get("garment")
+    seed, source_seed = row.get("seed"), row.get("source_seed")
     if (
         row.get("snapshot_source_bootstrap") is not True
         or row.get("recovery_kind") is not None
         or category not in {"top_long", "top_short", "pant_long", "pant_short"}
         or not isinstance(garment, str) or not garment
         or type(seed) is not int or seed < 0
-        or row.get("source_seed") != seed
+        or type(source_seed) is not int or source_seed < 0 or source_seed != seed
     ):
         raise ValueError("snapshot source descriptor lineage is invalid")
 
@@ -459,6 +470,8 @@ def validate_snapshot_source_descriptor(descriptor_path: str | Path) -> dict[str
         if any(key in row for key in restore_keys):
             raise ValueError("ordinary snapshot source descriptor cannot carry replay state")
         return row
+    if not allow_legacy_replay:
+        raise ValueError("snapshot source discovery descriptor must be ordinary autonomous collection")
     if replay_kind != "verified_success_reset_v1":
         raise ValueError("snapshot source descriptor replay kind is invalid")
     if row.get("parent_episode_id") != row.get("lineage_id") or not isinstance(
@@ -527,8 +540,56 @@ def validate_snapshot_source_descriptor(descriptor_path: str | Path) -> dict[str
     return row
 
 
+def validate_snapshot_source_descriptor(descriptor_path: str | Path) -> dict[str, object]:
+    """Validate one legacy-compatible source assignment before simulator start."""
+
+    rows = _snapshot_source_descriptor_rows(descriptor_path)
+    if len(rows) != 1:
+        raise ValueError("snapshot source descriptor must contain exactly one row")
+    return _validate_snapshot_source_row(rows[0], allow_legacy_replay=True)
+
+
+def validate_snapshot_source_discovery_descriptor(
+    descriptor_path: str | Path,
+) -> list[dict[str, object]]:
+    """Validate a bounded ordinary source-discovery descriptor.
+
+    Discovery intentionally keeps every attempt in one category so the one
+    long-lived simulator can reuse its garment setup.  Historical replay and
+    controlled-recovery fields are excluded: this creates only fresh,
+    autonomous schema-v2 sources.
+    """
+
+    rows = _snapshot_source_descriptor_rows(descriptor_path)
+    if not 1 <= len(rows) <= 16:
+        raise ValueError("snapshot source discovery descriptor must contain 1..16 rows")
+    validated = [_validate_snapshot_source_row(row, allow_legacy_replay=False) for row in rows]
+    category = validated[0]["category"]
+    seeds: set[int] = set()
+    allowed_fields = {
+        "snapshot_source_bootstrap", "snapshot_source_descriptor_sha256",
+        "category", "garment", "garment_name", "seed", "source_seed",
+    }
+    for row in validated:
+        if row["category"] != category:
+            raise ValueError("snapshot source discovery descriptor must use one category")
+        garment_name = row.get("garment_name")
+        if (garment_name is not None and garment_name != row["garment"]):
+            raise ValueError("snapshot source discovery descriptor garment identity is inconsistent")
+        if _CANONICAL_SEEN_GARMENTS[str(category)].fullmatch(str(row["garment"])) is None:
+            raise ValueError("snapshot source discovery descriptor garment identity is not a canonical seen garment")
+        seed = row["seed"]
+        if seed in seeds:
+            raise ValueError("snapshot source discovery descriptor seeds must be unique")
+        seeds.add(seed)
+        if any(key not in allowed_fields for key in row):
+            raise ValueError("snapshot source discovery descriptor must be ordinary autonomous collection")
+    return validated
+
+
 def validate_snapshot_source_bootstrap_evidence(
-    *, accepted_root: str | Path, descriptor_path: str | Path,
+    *, accepted_root: str | Path, descriptor_path: str | Path | None = None,
+    descriptor_row: Mapping[str, object] | None = None,
 ) -> tuple[int, ...]:
     """Validate one ordinary autonomous source before a source-only envelope.
 
@@ -539,7 +600,13 @@ def validate_snapshot_source_bootstrap_evidence(
     identity.
     """
 
-    descriptor_row = validate_snapshot_source_descriptor(descriptor_path)
+    if (descriptor_path is None) == (descriptor_row is None):
+        raise ValueError("snapshot source evidence requires exactly one descriptor identity")
+    if descriptor_path is not None:
+        descriptor_row = validate_snapshot_source_descriptor(descriptor_path)
+    else:
+        assert descriptor_row is not None
+        descriptor_row = _validate_snapshot_source_row(descriptor_row, allow_legacy_replay=True)
     category, garment, seed = descriptor_row.get("category"), descriptor_row.get("garment"), descriptor_row.get("seed")
     accepted = Path(accepted_root)
     if not accepted.is_absolute() or accepted.is_symlink() or not accepted.is_dir():
@@ -564,7 +631,11 @@ def validate_snapshot_source_bootstrap_evidence(
             or not isinstance(identity, Mapping) or identity.get("category") != category
             or identity.get("garment_name") != garment or identity.get("seed") != seed):
         raise ValueError("snapshot source episode is not an accepted autonomous descriptor-bound success")
-    reset = _strict_snapshot(_strict_json_object(reset_path, field="snapshot source reset"))
+    reset_payload = _strict_json_object(reset_path, field="snapshot source reset")
+    if (reset_payload.get("schema_version") != 2
+            or reset_payload.get("cloth_state_authority") != PHYSX_CLOTH_STATE_AUTHORITY):
+        raise ValueError("snapshot source evidence requires PhysX-authoritative v2 source snapshots")
+    reset = _strict_snapshot(reset_payload)
     if reset.garment_name != garment:
         raise ValueError("snapshot source reset garment does not match the descriptor")
     annotation_rows: list[dict[str, object]] = []
@@ -619,7 +690,11 @@ def validate_snapshot_source_bootstrap_evidence(
         step = int(match.group(1))
         if step <= 0 or step % 16 or step >= first_success or step >= len(annotation_rows):
             raise ValueError("snapshot source continuation boundary is invalid")
-        snapshot = _strict_snapshot(_strict_json_object(strict_path, field="snapshot source continuation"))
+        snapshot_payload = _strict_json_object(strict_path, field="snapshot source continuation")
+        if (snapshot_payload.get("schema_version") != 2
+                or snapshot_payload.get("cloth_state_authority") != PHYSX_CLOTH_STATE_AUTHORITY):
+            raise ValueError("snapshot source evidence requires PhysX-authoritative v2 source snapshots")
+        snapshot = _strict_snapshot(snapshot_payload)
         row = annotation_rows[step]
         state = row.get("state")
         if (row.get("step") != step or row.get("action_source") != "policy" or row.get("policy_chunk_offset") != 0

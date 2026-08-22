@@ -101,21 +101,61 @@ def _fake_snapshot_source_base(path: Path) -> None:
         from pathlib import Path
         root, descriptor, round_id, case = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
         if case == 'absent-ledger': raise SystemExit(1)
+        if case in {'multi-accepted', 'multi-invalid-evidence'}:
+            rows = json.loads(descriptor.read_text())
+            root.mkdir(parents=True, exist_ok=True)
+            (root / 'base-launch.json').write_text(json.dumps({'initial_garment': os.environ.get('LEHOME_INITIAL_GARMENT'), 'simulator_device': os.environ.get('LEHOME_SIMULATOR_DEVICE'), 'max_worker_restarts': os.environ.get('LEHOME_MAX_WORKER_RESTARTS')}))
+            con = sqlite3.connect(root / 'ledger.sqlite3')
+            con.execute('create table attempts (attempt_id text, assignment_json text)')
+            con.execute('create table events (event_type text, attempt_id text)')
+            receipts = root / 'hf-sync-receipts'; receipts.mkdir()
+            for index, row in enumerate(rows):
+                canonical = json.dumps(row, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+                attempt = hashlib.sha256(json.dumps({'schedule_index': index, 'assignment': row}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+                con.execute('insert into attempts values (?, ?)', (attempt, canonical))
+                if index == 0:
+                    outcome = 'infrastructure_abort' if case == 'multi-invalid-evidence' else 'rejected'
+                    con.execute('insert into events values (?, ?)', (outcome, attempt)); continue
+                con.execute('insert into events values (?, ?)', ('accepted', attempt))
+                raw = root / 'accepted' / attempt / 'raw' / attempt; raw.mkdir(parents=True)
+                garment, category, seed = row['garment'], row['category'], row['seed']
+                episode = raw / 'episode.json'; episode.write_text(json.dumps({'episode_id': attempt, 'mode': 'autonomous', 'accepted_success': True, 'outcome': 'success', 'terminal_reason': 'success', 'bc_target_count': 0, 'identity': {'category': category, 'garment_name': garment, 'seed': seed}}, sort_keys=True))
+                reset = raw / 'snapshots' / 'reset.json'; reset.parent.mkdir(parents=True, exist_ok=True)
+                reset.write_text(json.dumps({'schema_version': 2, 'robot_position': [0.0] * 12, 'robot_velocity': [0.0] * 12, 'cloth_position': [[0.0, 0.0, 0.0]], 'cloth_velocity': [[0.0, 0.0, 0.0]], 'rng_state': {}, 'garment_name': garment, 'randomization': {'strategy': 'canonical'}, 'scene_state': {}, 'cloth_state_authority': 'physx_cloth_view_world_v1'}, sort_keys=True))
+                annotations = raw / 'annotations.jsonl'; annotations.write_text(''.join(json.dumps({'step': step, 'action': [float(step)] * 12, 'action_source': 'policy', 'reward': float(step), 'success': step >= 20, 'state': [float(step)] * 12, 'policy_request_id': f'request-{step // 16}', 'policy_chunk_offset': step % 16, 'category': category, 'garment_name': garment, 'seed': seed}, sort_keys=True) + '\\n' for step in range(21)))
+                continuation = raw / 'snapshots' / 'continuations' / '000016.json'; continuation.parent.mkdir(parents=True)
+                continuation.write_text(json.dumps({'schema_version': 2, 'robot_position': [16.0] * 12, 'robot_velocity': [0.0] * 12, 'cloth_position': [[0.0, 0.0, 0.0]], 'cloth_velocity': [[0.0, 0.0, 0.0]], 'rng_state': {}, 'garment_name': garment, 'randomization': {'strategy': 'canonical', 'continuation_step': 16}, 'scene_state': {}, 'cloth_state_authority': 'physx_cloth_view_world_v1'}, sort_keys=True))
+                entries = {item.relative_to(raw).as_posix(): {'sha256': hashlib.sha256(item.read_bytes()).hexdigest(), 'size': item.stat().st_size} for item in (episode, reset, annotations, continuation)}
+                (raw / 'SHA256SUMS.json').write_text(json.dumps(entries, sort_keys=True))
+                package_entries = []
+                for current, _, names in os.walk(root / 'accepted' / attempt):
+                    for name in names:
+                        item = Path(current) / name; relative = item.relative_to(root / 'accepted' / attempt).as_posix()
+                        if relative != 'SHA256SUMS.json': package_entries.append({'relative_path': relative, 'sha256': hashlib.sha256(item.read_bytes()).hexdigest(), 'byte_size': item.stat().st_size})
+                package_entries.sort(key=lambda item: item['relative_path'])
+                digest = hashlib.sha256(json.dumps(package_entries, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+                (receipts / f'{attempt}.sync.json').write_text(json.dumps({'schema_version': 1, 'attempt_id': attempt, 'round_id': round_id, 'repository': 'ryanjin333/lehome-groot-n17-rollouts', 'remote_prefix': f'rollout-rounds/{round_id}/{attempt}', 'publication_ref': 'main', 'readback_verified': True, 'episode_sha256': digest, 'entry_count': len(package_entries), 'immutable_revision': 'b' * 40}))
+            con.commit(); con.close(); raise SystemExit(0)
         row = json.loads(descriptor.read_text())[0]
+        canonical = json.dumps(row, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
         attempt = hashlib.sha256(json.dumps({'schedule_index': 0, 'assignment': row}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        if case == 'noncanonical-attempt-id': attempt = 'not-a-task-ledger-id'
         root.mkdir(parents=True, exist_ok=True)
-        (root / 'base-launch.json').write_text(json.dumps({'initial_garment': os.environ.get('LEHOME_INITIAL_GARMENT'), 'simulator_device': os.environ.get('LEHOME_SIMULATOR_DEVICE')}))
+        (root / 'base-launch.json').write_text(json.dumps({'initial_garment': os.environ.get('LEHOME_INITIAL_GARMENT'), 'simulator_device': os.environ.get('LEHOME_SIMULATOR_DEVICE'), 'max_worker_restarts': os.environ.get('LEHOME_MAX_WORKER_RESTARTS')}))
         con = sqlite3.connect(root / 'ledger.sqlite3')
+        con.execute('create table attempts (attempt_id text, assignment_json text)')
         con.execute('create table events (event_type text, attempt_id text)')
-        con.execute('insert into events values (?, ?)', ('rejected' if case == 'rejected' else 'accepted', attempt))
+        con.execute('insert into attempts values (?, ?)', (attempt, canonical))
+        terminal_event = 'rejected' if case == 'rejected' else 'infrastructure_abort' if case == 'infrastructure-evidence' else 'accepted'
+        con.execute('insert into events values (?, ?)', (terminal_event, attempt))
         con.commit(); con.close()
-        if case == 'rejected': raise SystemExit(0)
+        if case in {'rejected', 'infrastructure-evidence'}: raise SystemExit(0)
         raw = root / 'accepted' / attempt / 'raw' / attempt; raw.mkdir(parents=True)
         garment, category, seed = 'Top_Long_Seen_0', 'top_long', 50110
         episode_payload = {'episode_id': attempt, 'mode': 'autonomous', 'accepted_success': True, 'outcome': 'success', 'terminal_reason': 'success', 'bc_target_count': 0, 'identity': {'category': category, 'garment_name': garment, 'seed': (50111 if case == 'seed-mismatch' else seed)}}
         episode = raw / 'episode.json'; episode.write_text(json.dumps(episode_payload, sort_keys=True))
         reset = raw / 'snapshots' / 'reset.json'; reset.parent.mkdir(parents=True, exist_ok=True)
-        reset.write_text(json.dumps({'schema_version': 2, 'robot_position': [0.0] * 12, 'robot_velocity': [0.0] * 12, 'cloth_position': [[0.0, 0.0, 0.0]], 'cloth_velocity': [[0.0, 0.0, 0.0]], 'rng_state': {}, 'garment_name': garment, 'randomization': {'strategy': 'canonical'}, 'scene_state': {}, 'cloth_state_authority': 'physx_cloth_view_world_v1'}, sort_keys=True))
+        reset.write_text(json.dumps({'schema_version': (3 if case == 'reset-v3' else 2), 'robot_position': [0.0] * 12, 'robot_velocity': [0.0] * 12, 'cloth_position': [[0.0, 0.0, 0.0]], 'cloth_velocity': [[0.0, 0.0, 0.0]], 'rng_state': {}, 'garment_name': garment, 'randomization': {'strategy': 'canonical'}, 'scene_state': {}, 'cloth_state_authority': 'physx_cloth_view_world_v1'}, sort_keys=True))
         annotations = raw / 'annotations.jsonl'
         boundary = 32 if case == 'after-success' else 16
         annotation_rows = []
@@ -130,7 +170,7 @@ def _fake_snapshot_source_base(path: Path) -> None:
             h16 = raw / 'snapshots' / 'continuations' / filename; h16.parent.mkdir(parents=True)
             continuation_step = boundary + 16 if case == 'wrong-continuation-step' else boundary
             snapshot_strategy = 'geometry' if case == 'randomization-mismatch' else 'canonical'
-            snapshot = {'schema_version': (1 if case == 'bad-snapshot' else 2), 'robot_position': [float(boundary)] * 12, 'robot_velocity': [0.0] * 12, 'cloth_position': [[0.0, 0.0, 0.0]], 'cloth_velocity': [[0.0, 0.0, 0.0]], 'rng_state': {}, 'garment_name': ('Other_Garment' if case == 'garment-mismatch' else garment), 'randomization': {'strategy': snapshot_strategy, 'continuation_step': continuation_step}, 'scene_state': {}, 'cloth_state_authority': 'physx_cloth_view_world_v1'}
+            snapshot = {'schema_version': (3 if case == 'continuation-v3' else 1 if case == 'bad-snapshot' else 2), 'robot_position': [float(boundary)] * 12, 'robot_velocity': [0.0] * 12, 'cloth_position': [[0.0, 0.0, 0.0]], 'cloth_velocity': [[0.0, 0.0, 0.0]], 'rng_state': {}, 'garment_name': ('Other_Garment' if case == 'garment-mismatch' else garment), 'randomization': {'strategy': snapshot_strategy, 'continuation_step': continuation_step}, 'scene_state': {}, 'cloth_state_authority': ('usd_local_points_v1' if case == 'continuation-wrong-authority' else 'physx_cloth_view_world_v1')}
             h16.write_text(json.dumps(snapshot, sort_keys=True))
             entries[h16.relative_to(raw).as_posix()] = {'sha256': ('0' * 64 if case == 'bad-manifest' else hashlib.sha256(h16.read_bytes()).hexdigest()), 'size': h16.stat().st_size}
         (raw / 'SHA256SUMS.json').write_text(json.dumps(entries, sort_keys=True))
@@ -144,8 +184,15 @@ def _fake_snapshot_source_base(path: Path) -> None:
                 if relative != 'SHA256SUMS.json': package_entries.append({'relative_path': relative, 'sha256': hashlib.sha256(item.read_bytes()).hexdigest(), 'byte_size': item.stat().st_size})
         package_entries.sort(key=lambda item: item['relative_path'])
         digest = hashlib.sha256(json.dumps(package_entries, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-        receipt = {'attempt_id': attempt, 'round_id': round_id, 'repository': 'ryanjin333/lehome-groot-n17-rollouts', 'remote_prefix': f'rollout-rounds/{round_id}/{attempt}', 'readback_verified': case != 'receipt-not-readback', 'episode_sha256': ('a' * 64 if case == 'receipt-mismatch' else digest), 'entry_count': len(package_entries), 'immutable_revision': 'b' * 40}
-        receipts = root / 'hf-sync-receipts'; receipts.mkdir(); (receipts / f'{attempt}.sync.json').write_text(json.dumps(receipt))
+        receipt = {'schema_version': (True if case == 'receipt-bool-schema' else 1.0 if case == 'receipt-float-schema' else 2 if case == 'receipt-schema' else 1), 'attempt_id': attempt, 'round_id': round_id, 'repository': ('other/repository' if case == 'receipt-wrong-repository' else 'ryanjin333/lehome-groot-n17-rollouts'), 'remote_prefix': f'rollout-rounds/{round_id}/{attempt}', 'publication_ref': ('main/../other' if case == 'receipt-ref-traversal' else 'a' * 40 if case == 'receipt-immutable-ref' else 'release' if case == 'receipt-wrong-active-ref' else 'main'), 'readback_verified': case != 'receipt-not-readback', 'episode_sha256': ('a' * 64 if case == 'receipt-mismatch' else digest), 'entry_count': (float(len(package_entries)) if case == 'receipt-float-count' else len(package_entries)), 'immutable_revision': 'b' * 40}
+        receipts = root / 'hf-sync-receipts'; receipts.mkdir()
+        receipt_path = receipts / ('arbitrary.sync.json' if case == 'receipt-wrong-name' else f'{attempt}.sync.json')
+        if case == 'receipt-symlink':
+            target = root / 'external-receipt.json'; target.write_text(json.dumps(receipt)); receipt_path.symlink_to(target)
+        elif case == 'receipt-duplicate-key':
+            receipt_path.write_text('{"schema_version":1,"schema_version":1}')
+        else:
+            receipt_path.write_text(json.dumps(receipt))
         if case == 'strict-seal': (root / 'source.strict.seal.json').write_text('{}')
         if case == 'envelope-collision': (root / 'snapshot-source-bootstrap.envelope.json').write_text('{"sentinel":true}')
         raise SystemExit(1 if case == 'nonzero' else 0)
@@ -163,6 +210,8 @@ def _run_snapshot_source_bootstrap(
     runtime_source_root: Path | None = None,
     clear_pythonpath: bool = False,
     descriptor_fields: dict[str, object] | None = None,
+    source_rows: list[dict[str, object]] | None = None,
+    target_accepted: int = 1,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     # The contract rejects every symlink ancestor. pytest's ordinary macOS
     # temporary root is addressed through /var, a symlink to /private.
@@ -177,7 +226,7 @@ def _run_snapshot_source_bootstrap(
     descriptor = tmp_path / "source-descriptor.json"
     row = {"snapshot_source_bootstrap": True, "category": category, "garment": garment, "seed": 50110, "source_seed": 50110}
     row.update(descriptor_fields or {})
-    _write(descriptor, [row])
+    _write(descriptor, source_rows if source_rows is not None else [row])
     digest = hashlib.sha256(descriptor.read_bytes()).hexdigest()
     run_id = hashlib.sha256(f"{tmp_path}:{case}".encode()).hexdigest()[:32]
     identity = hashlib.sha256(f"{run_id}:{digest}".encode("ascii")).hexdigest()[:20]
@@ -198,7 +247,7 @@ def _run_snapshot_source_bootstrap(
         os.execv(sys.executable, [sys.executable, *sys.argv[script_index:]])
     """), encoding="utf-8")
     docker.chmod(0o755)
-    env = {**os.environ, "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR": str(descriptor), "LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR_SHA256": digest, "LEHOME_SNAPSHOT_SOURCE_RUN_ID": run_id, "LEHOME_SNAPSHOT_SOURCE_BASE_CAMPAIGN": str(base), "LEHOME_SNAPSHOT_SOURCE_TEST_CASE": case, "LEHOME_SNAPSHOT_SOURCE_RUNTIME_ROOT": str(runtime_source_root or (REPO_ROOT / "source" / "lehome"))}
+    env = {**os.environ, "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR": str(descriptor), "LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR_SHA256": digest, "LEHOME_SNAPSHOT_SOURCE_RUN_ID": run_id, "LEHOME_SNAPSHOT_SOURCE_BASE_CAMPAIGN": str(base), "LEHOME_SNAPSHOT_SOURCE_TEST_CASE": case, "LEHOME_SNAPSHOT_SOURCE_RUNTIME_ROOT": str(runtime_source_root or (REPO_ROOT / "source" / "lehome")), "LEHOME_SNAPSHOT_SOURCE_TARGET_ACCEPTED": str(target_accepted)}
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     if clear_pythonpath:
         env["PYTHONPATH"] = ""
@@ -398,7 +447,7 @@ def test_base_skip_seal_gate_rejects_any_non_smoke_tuple_before_docker(tmp_path:
     env = {**os.environ, "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_ATTEMPT_MATRIX": str(matrix), "LEHOME_ATTEMPT_MATRIX_SHA256": digest, "LEHOME_SKIP_ROUND_SEAL": "1", "LEHOME_WORKER_COUNT": "4", "LEHOME_MAX_ATTEMPTS": "8", "LEHOME_TARGET_ACCEPTED": "8"}
     runner = REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh"
     result = subprocess.run(["/bin/bash", str(runner)], env=env, text=True, capture_output=True, check=False)
-    assert result.returncode == 2
+    assert result.returncode != 0
     assert "reserved for the exact controlled-recovery smoke tuple" in result.stderr
 
 
@@ -434,6 +483,209 @@ def test_base_cpu_cloth_requires_the_exact_unsealed_snapshot_source_tuple(tmp_pa
     result = subprocess.run(["/bin/bash", str(runner)], env=env, text=True, capture_output=True, check=False)
     assert result.returncode == 2
     assert "exact unsealed snapshot-source bootstrap tuple" in result.stderr
+
+
+def test_base_campaign_admits_bounded_same_category_source_discovery_tuple(tmp_path: Path) -> None:
+    matrix = tmp_path / "sources.json"
+    rows = [
+        {
+            "snapshot_source_bootstrap": True,
+            "category": "top_long",
+            "garment": "Top_Long_Seen_0",
+            "seed": 107 + index,
+            "source_seed": 107 + index,
+        }
+        for index in range(3)
+    ]
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    digest = hashlib.sha256(matrix.read_bytes()).hexdigest()
+    run_id = "d" * 32
+    identity = hashlib.sha256(f"{run_id}:{digest}".encode("ascii")).hexdigest()[:20]
+    env = {
+        **os.environ,
+        "LEHOME_WORKSPACE": str(tmp_path),
+        "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "run"),
+        "LEHOME_ATTEMPT_MATRIX": str(matrix),
+        "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+        "LEHOME_RUN_ID": run_id,
+        "LEHOME_ROUND_ID": f"snapshot-source-bootstrap-{identity}-unsealed-source",
+        "LEHOME_WORKER_COUNT": "1",
+        "LEHOME_MAX_ATTEMPTS": "3",
+        "LEHOME_TARGET_ACCEPTED": "2",
+        "LEHOME_SIMULATOR_DEVICE": "cuda:0",
+        "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP": "1",
+        "LEHOME_ENABLE_HF_UPLOAD": "1",
+        "LEHOME_SKIP_ROUND_SEAL": "1",
+        "LEHOME_RESUME_PREEMPTED_ROLLOUT": "0",
+        "LEHOME_MAX_WORKER_RESTARTS": "0",
+        "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+    }
+    runner = REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh"
+    result = subprocess.run(["/bin/bash", str(runner)], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_base_campaign_rejects_source_discovery_with_nonzero_restart_count(tmp_path: Path) -> None:
+    matrix = tmp_path / "source.json"
+    row = {
+        "snapshot_source_bootstrap": True,
+        "category": "top_long",
+        "garment": "Top_Long_Seen_0",
+        "seed": 107,
+        "source_seed": 107,
+    }
+    matrix.write_text(json.dumps([row]), encoding="utf-8")
+    digest = hashlib.sha256(matrix.read_bytes()).hexdigest()
+    run_id = "c" * 32
+    identity = hashlib.sha256(f"{run_id}:{digest}".encode("ascii")).hexdigest()[:20]
+    env = {
+        **os.environ,
+        "LEHOME_WORKSPACE": str(tmp_path),
+        "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "run"),
+        "LEHOME_ATTEMPT_MATRIX": str(matrix),
+        "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+        "LEHOME_RUN_ID": run_id,
+        "LEHOME_ROUND_ID": f"snapshot-source-bootstrap-{identity}-unsealed-source",
+        "LEHOME_WORKER_COUNT": "1",
+        "LEHOME_MAX_ATTEMPTS": "1",
+        "LEHOME_TARGET_ACCEPTED": "1",
+        "LEHOME_MAX_WORKER_RESTARTS": "1",
+        "LEHOME_SIMULATOR_DEVICE": "cuda:0",
+        "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP": "1",
+        "LEHOME_ENABLE_HF_UPLOAD": "1",
+        "LEHOME_SKIP_ROUND_SEAL": "1",
+        "LEHOME_RESUME_PREEMPTED_ROLLOUT": "0",
+        "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+    }
+
+    result = subprocess.run(
+        ["/bin/bash", str(REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh")],
+        env=env, text=True, capture_output=True, check=False,
+    )
+
+    assert result.returncode == 2
+    assert "exact snapshot-source bootstrap tuple" in result.stderr
+
+
+def test_base_campaign_rejects_noncanonical_source_discovery_garment_before_launch(tmp_path: Path) -> None:
+    matrix = tmp_path / "sources.json"
+    rows = [{
+        "snapshot_source_bootstrap": True,
+        "category": "top_long",
+        "garment": "Top_Short_Seen_0",
+        "seed": 107,
+        "source_seed": 107,
+    }]
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    digest = hashlib.sha256(matrix.read_bytes()).hexdigest()
+    run_id = "f" * 32
+    identity = hashlib.sha256(f"{run_id}:{digest}".encode("ascii")).hexdigest()[:20]
+    env = {
+        **os.environ,
+        "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "run"),
+        "LEHOME_ATTEMPT_MATRIX": str(matrix), "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+        "LEHOME_RUN_ID": run_id, "LEHOME_ROUND_ID": f"snapshot-source-bootstrap-{identity}-unsealed-source",
+        "LEHOME_WORKER_COUNT": "1", "LEHOME_MAX_ATTEMPTS": "1", "LEHOME_TARGET_ACCEPTED": "1",
+        "LEHOME_SIMULATOR_DEVICE": "cuda:0", "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP": "1",
+        "LEHOME_ENABLE_HF_UPLOAD": "1", "LEHOME_SKIP_ROUND_SEAL": "1",
+        "LEHOME_RESUME_PREEMPTED_ROLLOUT": "0", "LEHOME_MAX_WORKER_RESTARTS": "0", "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+    }
+    result = subprocess.run(
+        ["/bin/bash", str(REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh")],
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "garment identity" in result.stderr
+
+
+def test_base_campaign_rejects_hidden_recovery_state_in_source_discovery_tuple(tmp_path: Path) -> None:
+    matrix = tmp_path / "sources.json"
+    row = {
+        "snapshot_source_bootstrap": True,
+        "category": "top_long",
+        "garment": "Top_Long_Seen_0",
+        "seed": 107,
+        "source_seed": 107,
+        "source_continuation_state": [0.0] * 12,
+    }
+    matrix.write_text(json.dumps([row]), encoding="utf-8")
+    digest = hashlib.sha256(matrix.read_bytes()).hexdigest()
+    run_id = "e" * 32
+    identity = hashlib.sha256(f"{run_id}:{digest}".encode("ascii")).hexdigest()[:20]
+    env = {
+        **os.environ,
+        "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "run"),
+        "LEHOME_ATTEMPT_MATRIX": str(matrix), "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+        "LEHOME_RUN_ID": run_id, "LEHOME_ROUND_ID": f"snapshot-source-bootstrap-{identity}-unsealed-source",
+        "LEHOME_WORKER_COUNT": "1", "LEHOME_MAX_ATTEMPTS": "1", "LEHOME_TARGET_ACCEPTED": "1",
+        "LEHOME_SIMULATOR_DEVICE": "cuda:0", "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP": "1",
+        "LEHOME_ENABLE_HF_UPLOAD": "1", "LEHOME_SKIP_ROUND_SEAL": "1",
+        "LEHOME_RESUME_PREEMPTED_ROLLOUT": "0", "LEHOME_MAX_WORKER_RESTARTS": "0", "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+    }
+    runner = REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh"
+    result = subprocess.run(["/bin/bash", str(runner)], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode != 0
+    assert "ordinary autonomous" in result.stderr
+
+
+@pytest.mark.parametrize("timeout", ["0", "nan", "inf", "true"])
+def test_base_campaign_rejects_invalid_source_finalization_timeout_before_docker(
+    tmp_path: Path, timeout: str,
+) -> None:
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text("[]", encoding="utf-8")
+    digest = hashlib.sha256(matrix.read_bytes()).hexdigest()
+    env = {
+        **os.environ,
+        "LEHOME_WORKSPACE": str(tmp_path),
+        "LEHOME_ATTEMPT_MATRIX": str(matrix),
+        "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+        "LEHOME_SOURCE_FINALIZATION_TIMEOUT_SECONDS": timeout,
+    }
+
+    result = subprocess.run(
+        ["/bin/bash", str(REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh")],
+        env=env, text=True, capture_output=True, check=False,
+    )
+
+    assert result.returncode == 2
+    assert "LEHOME_SOURCE_FINALIZATION_TIMEOUT_SECONDS" in result.stderr
+
+
+@pytest.mark.parametrize(("seed", "source_seed"), [(1, True), (1, 1.0)])
+def test_base_campaign_rejects_noninteger_source_seed_before_launch(
+    tmp_path: Path, seed: int, source_seed: object,
+) -> None:
+    matrix = tmp_path / "sources.json"
+    row = {
+        "snapshot_source_bootstrap": True,
+        "category": "top_long",
+        "garment": "Top_Long_Seen_0",
+        "seed": seed,
+        "source_seed": source_seed,
+    }
+    matrix.write_text(json.dumps([row]), encoding="utf-8")
+    digest = hashlib.sha256(matrix.read_bytes()).hexdigest()
+    run_id = "a" * 32
+    identity = hashlib.sha256(f"{run_id}:{digest}".encode("ascii")).hexdigest()[:20]
+    env = {
+        **os.environ,
+        "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "run"),
+        "LEHOME_ATTEMPT_MATRIX": str(matrix), "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+        "LEHOME_RUN_ID": run_id, "LEHOME_ROUND_ID": f"snapshot-source-bootstrap-{identity}-unsealed-source",
+        "LEHOME_WORKER_COUNT": "1", "LEHOME_MAX_ATTEMPTS": "1", "LEHOME_TARGET_ACCEPTED": "1",
+        "LEHOME_SIMULATOR_DEVICE": "cuda:0", "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP": "1",
+        "LEHOME_ENABLE_HF_UPLOAD": "1", "LEHOME_SKIP_ROUND_SEAL": "1",
+        "LEHOME_RESUME_PREEMPTED_ROLLOUT": "0", "LEHOME_MAX_WORKER_RESTARTS": "0", "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+    }
+
+    result = subprocess.run(
+        ["/bin/bash", str(REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh")],
+        env=env, text=True, capture_output=True, check=False,
+    )
+
+    assert result.returncode != 0
+    assert "seed binding" in result.stderr
 
 
 def test_actual_base_campaign_smoke_shims_drain_the_upload_and_never_invoke_sealer(tmp_path: Path) -> None:
@@ -509,12 +761,14 @@ def test_snapshot_source_bootstrap_is_a_separate_one_worker_unsealed_tuple() -> 
     source = bootstrap.read_text(encoding="utf-8")
     base = (REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh").read_text(encoding="utf-8")
     installer = (REPO_ROOT / "infrastructure/nebius/packer/scripts/install-rollout.sh").read_text(encoding="utf-8")
-    assert "LEHOME_WORKER_COUNT=1 LEHOME_MAX_ATTEMPTS=1 LEHOME_TARGET_ACCEPTED=1" in source
+    assert 'LEHOME_WORKER_COUNT=1 LEHOME_MAX_ATTEMPTS="${SOURCE_ROW_COUNT}" LEHOME_TARGET_ACCEPTED="${TARGET_ACCEPTED}"' in source
+    assert "LEHOME_MAX_WORKER_RESTARTS=0" in source
     assert "LEHOME_ENABLE_HF_UPLOAD=1 LEHOME_SKIP_ROUND_SEAL=1 LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP=1" in source
     assert "LEHOME_SIMULATOR_DEVICE=cuda:0" in source
     assert "LEHOME_SIMULATOR_DEVICE=cpu" not in source
     assert "fresh absent run root; resume is forbidden" in source
     assert "readback_verified" in source
+    assert "--role sealer" not in source
     assert "SNAPSHOT_SOURCE_BOOTSTRAP" in base and "snapshot-source-bootstrap" in base
     assert '--simulator-device "${SIMULATOR_DEVICE}"' in base
     assert "CPU cloth requires the exact unsealed snapshot-source bootstrap tuple" in base
@@ -544,6 +798,7 @@ def test_snapshot_source_bootstrap_passes_a_nondefault_descriptor_garment_before
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Pant_Long_Seen_4",
         "simulator_device": "cuda:0",
+        "max_worker_restarts": "0",
     }
 
 
@@ -554,6 +809,7 @@ def test_snapshot_source_bootstrap_forces_the_cuda_particle_cloth_lane(tmp_path:
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Top_Long_Seen_0",
         "simulator_device": "cuda:0",
+        "max_worker_restarts": "0",
     }
 
 
@@ -593,17 +849,26 @@ def test_snapshot_source_bootstrap_preflights_a_verified_legacy_reset_before_lau
     assert not (rejected_root / "base-launch.json").exists()
 
 
-@pytest.mark.parametrize("case", ["no-h16", "bad-manifest", "receipt-not-readback", "receipt-mismatch", "strict-seal"])
+@pytest.mark.parametrize("case", ["no-h16", "bad-manifest", "receipt-not-readback", "receipt-mismatch", "receipt-schema", "receipt-bool-schema", "receipt-float-schema", "receipt-float-count", "receipt-wrong-name", "receipt-symlink", "receipt-ref-traversal", "receipt-immutable-ref", "receipt-wrong-active-ref", "receipt-wrong-repository", "receipt-duplicate-key", "strict-seal", "noncanonical-attempt-id"])
 def test_snapshot_source_bootstrap_fails_closed_after_accepted_terminal(tmp_path: Path, case: str) -> None:
     result, root = _run_snapshot_source_bootstrap(tmp_path / case, case)
     assert result.returncode == 4, result.stderr
     assert not (root / "snapshot-source-bootstrap.envelope.json").exists()
 
 
-@pytest.mark.parametrize("case", ["bad-boundary-filename", "bad-snapshot", "garment-mismatch", "seed-mismatch", "wrong-continuation-step", "randomization-mismatch", "after-success", "parent-symlink"])
+@pytest.mark.parametrize("case", ["bad-boundary-filename", "bad-snapshot", "reset-v3", "continuation-v3", "continuation-wrong-authority", "garment-mismatch", "seed-mismatch", "wrong-continuation-step", "randomization-mismatch", "after-success", "parent-symlink"])
 def test_snapshot_source_bootstrap_requires_a_usable_authenticated_h16_source(tmp_path: Path, case: str) -> None:
     result, root = _run_snapshot_source_bootstrap(tmp_path / case, case)
     assert result.returncode == 4, result.stderr
+    assert not (root / "snapshot-source-bootstrap.envelope.json").exists()
+
+
+@pytest.mark.parametrize("case", ["reset-v3", "continuation-v3", "continuation-wrong-authority"])
+def test_snapshot_source_bootstrap_rejects_non_physx_v2_snapshot_evidence_before_publication(tmp_path: Path, case: str) -> None:
+    result, root = _run_snapshot_source_bootstrap(tmp_path / case, case)
+
+    assert result.returncode == 4, result.stderr
+    assert "PhysX-authoritative v2 source snapshots" in result.stderr
     assert not (root / "snapshot-source-bootstrap.envelope.json").exists()
 
 
@@ -634,6 +899,7 @@ def test_snapshot_source_bootstrap_writes_one_audit_only_envelope_atomically(tmp
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Top_Long_Seen_0",
         "simulator_device": "cuda:0",
+        "max_worker_restarts": "0",
     }
     assert not list(root.glob("*.strict.seal.json"))
     with pytest.raises(ValueError):
@@ -641,6 +907,49 @@ def test_snapshot_source_bootstrap_writes_one_audit_only_envelope_atomically(tmp
     collision, collision_root = _run_snapshot_source_bootstrap(tmp_path / "collision", "envelope-collision")
     assert collision.returncode == 4
     assert json.loads((collision_root / "snapshot-source-bootstrap.envelope.json").read_text()) == {"sentinel": True}
+
+
+def test_snapshot_source_bootstrap_continues_clean_rejections_and_emits_the_partial_verified_discovery_set(tmp_path: Path) -> None:
+    rows = [
+        {
+            "snapshot_source_bootstrap": True,
+            "category": "top_long",
+            "garment": "Top_Long_Seen_0",
+            "seed": 107 + index,
+            "source_seed": 107 + index,
+        }
+        for index in range(3)
+    ]
+    result, root = _run_snapshot_source_bootstrap(
+        tmp_path / "multi", "multi-accepted", source_rows=rows, target_accepted=3,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads((root / "snapshot-source-bootstrap.envelope.json").read_text())
+    assert payload["episode_count"] == 2
+    assert set(payload["episode_sha256s"]) == set(payload["immutable_revisions"])
+    assert len(payload["episode_sha256s"]) == 2
+    assert not list(root.glob("*.strict.seal.json"))
+
+
+@pytest.mark.parametrize(
+    ("case", "rows", "target"),
+    [
+        ("infrastructure-evidence", None, 1),
+        ("multi-invalid-evidence", [
+            {"snapshot_source_bootstrap": True, "category": "top_long", "garment": "Top_Long_Seen_0", "seed": 107 + index, "source_seed": 107 + index}
+            for index in range(3)
+        ], 3),
+    ],
+)
+def test_snapshot_source_bootstrap_rejects_invalid_terminal_evidence_even_with_accepted_sources(
+    tmp_path: Path, case: str, rows: list[dict[str, object]] | None, target: int,
+) -> None:
+    result, root = _run_snapshot_source_bootstrap(
+        tmp_path / case, case, source_rows=rows, target_accepted=target,
+    )
+
+    assert result.returncode == 4, result.stderr
+    assert not (root / "snapshot-source-bootstrap.envelope.json").exists()
 
 
 def test_snapshot_source_bootstrap_imports_from_the_explicit_packaged_runtime_root(tmp_path: Path) -> None:

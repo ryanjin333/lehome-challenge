@@ -81,6 +81,201 @@ class FakeSession:
         self.closed = True
 
 
+class SourceController(FakeController):
+    def __init__(self, leases: list[Lease], statuses: dict[str, list[str]]) -> None:
+        super().__init__(leases)
+        self._statuses = {attempt_id: list(values) for attempt_id, values in statuses.items()}
+        self.status_calls: list[str] = []
+        self.infrastructure_aborts: list[tuple[str, str, str, str]] = []
+
+    def status(self, attempt_id: str) -> str:
+        self.status_calls.append(attempt_id)
+        values = self._statuses[attempt_id]
+        return values.pop(0) if len(values) > 1 else values[0]
+
+    def record_infrastructure_abort(self, worker_id: str, attempt_id: str, lease_id: str, *, reason: str) -> str:
+        self.infrastructure_aborts.append((worker_id, attempt_id, lease_id, reason))
+        return "infrastructure_abort"
+
+
+def _source_assignment(seed: int) -> dict[str, object]:
+    return {
+        "snapshot_source_bootstrap": True,
+        "category": "top_long",
+        "garment": "Top_Long_Seen_0",
+        "seed": seed,
+        "source_seed": seed,
+    }
+
+
+def test_source_discovery_waits_for_clean_rejection_then_reuses_the_same_session(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    first = Lease(Attempt("attempt-a", _source_assignment(11)), "lease-a")
+    second = Lease(Attempt("attempt-b", _source_assignment(12)), "lease-b")
+    controller = SourceController([first, second], {
+        "attempt-a": ["terminal_pending_validation", "rejected"],
+        "attempt-b": ["accepted"],
+    })
+    session = FakeSession()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+
+    receipts = worker.run()
+
+    assert [receipt["attempt_id"] for receipt in receipts] == ["attempt-a", "attempt-b"]
+    assert session.runs == ["attempt-a", "attempt-b"]
+    assert controller.status_calls == ["attempt-a", "attempt-a", "attempt-b"]
+
+
+def test_source_discovery_runtime_infrastructure_abort_stops_before_the_second_lease(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    first = Lease(Attempt("attempt-a", _source_assignment(11)), "lease-a")
+    second = Lease(Attempt("attempt-b", _source_assignment(12)), "lease-b")
+    controller = SourceController([first, second], {})
+    class InvalidAfterEpisode(FakeSession):
+        def run_episode(self, **kwargs):
+            result = super().run_episode(**kwargs)
+            self.runtime_receipt["cloth_device"] = "cpu"
+            return result
+
+    session = InvalidAfterEpisode()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+
+    with pytest.raises(RuntimeError, match="source discovery"):
+        worker.run()
+
+    assert controller.infrastructure_aborts == [("worker-0", "attempt-a", "lease-a", "runtime_evidence_invalid")]
+    assert controller._leases == [second]
+
+
+def test_source_discovery_snapshot_failure_is_an_infrastructure_abort_before_the_second_lease(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    first = Lease(Attempt("attempt-a", _source_assignment(11)), "lease-a")
+    second = Lease(Attempt("attempt-b", _source_assignment(12)), "lease-b")
+    controller = SourceController([first, second], {"attempt-b": ["accepted"]})
+
+    class SnapshotFailure(FakeSession):
+        def run_episode(self, *, assignment, **kwargs):
+            self.runs.append(str(assignment["attempt_id"]))
+            raise ValueError("snapshot evidence is missing")
+
+    session = SnapshotFailure()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+
+    with pytest.raises(RuntimeError, match="source discovery"):
+        worker.run()
+
+    assert session.runs == ["attempt-a"]
+    assert controller.infrastructure_aborts == [
+        ("worker-0", "attempt-a", "lease-a", "source_snapshot_evidence_invalid"),
+    ]
+    assert controller._leases == [second]
+
+
+def test_source_discovery_real_finalizer_abort_stops_before_the_second_lease(tmp_path) -> None:
+    from lehome.flywheel.artifact_queue import ArtifactFinalizationQueue
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    ledger = TaskLedger(
+        tmp_path / "ledger.sqlite3",
+        attempt_matrix=[_source_assignment(11), _source_assignment(12)],
+        max_attempts=2,
+        target_accepted=2,
+    )
+    queue = ArtifactFinalizationQueue(
+        run_root=tmp_path / "output", ledger=ledger,
+        max_pending_items=2, max_pending_bytes=1 << 30,
+    )
+
+    class FinalizingController:
+        lease_calls = 0
+
+        def lease_next(self, worker_id: str):
+            self.lease_calls += 1
+            return ledger.lease_next(worker_id, lease_duration_ns=10**18)
+
+        def record_terminal(self, worker_id, attempt_id, lease_id, raw_artifact_id):
+            ledger.record_terminal(worker_id, attempt_id, lease_id, raw_artifact_id)
+            queue.enqueue(worker_id, attempt_id, lease_id, Path(raw_artifact_id))
+            assert queue.finalize_next() is not None
+
+        def status(self, attempt_id: str) -> str:
+            return ledger.status(attempt_id)
+
+        def heartbeat(self, worker_id, attempt_id, lease_id):
+            return ledger.heartbeat(worker_id, attempt_id, lease_id, lease_duration_ns=10**18)
+
+        def record_infrastructure_abort(self, worker_id, attempt_id, lease_id, *, reason: str):
+            return ledger.record_infrastructure_abort(worker_id, attempt_id, lease_id, reason=reason)
+
+    controller = FinalizingController()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=FakeSession, policy=FakePolicy(), output_root=tmp_path / "output",
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="infrastructure abort"):
+            worker.run()
+        first_attempt = ledger.attempts()[0].attempt_id
+        assert ledger.status(first_attempt) == "infrastructure_abort"
+        assert controller.lease_calls == 1
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize("terminal", ["infrastructure_abort", "leased"])
+def test_source_discovery_refuses_to_lease_after_nonfinal_or_infrastructure_finalization(tmp_path, terminal: str) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    first = Lease(Attempt("attempt-a", _source_assignment(11)), "lease-a")
+    second = Lease(Attempt("attempt-b", _source_assignment(12)), "lease-b")
+    controller = SourceController([first, second], {"attempt-a": [terminal]})
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=FakeSession, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+
+    with pytest.raises(RuntimeError, match="source discovery"):
+        worker.run()
+
+    assert controller._leases == [second]
+
+
+def test_source_discovery_finalization_timeout_stops_before_the_second_lease(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    first = Lease(Attempt("attempt-a", _source_assignment(11)), "lease-a")
+    second = Lease(Attempt("attempt-b", _source_assignment(12)), "lease-b")
+    controller = SourceController([first, second], {"attempt-a": ["terminal_pending_validation"]})
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=FakeSession, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0", source_finalization_timeout_seconds=0.001,
+    )
+
+    with pytest.raises(RuntimeError, match="timeout"):
+        worker.run()
+
+    assert controller._leases == [second]
+
+
 def test_worker_reuses_one_cuda_cloth_simulator_and_immediately_leases_next_attempt(tmp_path) -> None:
     from lehome.flywheel.persistent_worker import PersistentRolloutWorker
 

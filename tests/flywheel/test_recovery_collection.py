@@ -126,6 +126,121 @@ def test_snapshot_source_descriptor_authenticates_an_explicit_legacy_cpu_restore
         validate_snapshot_source_descriptor(descriptor)
 
 
+def test_snapshot_source_discovery_descriptor_admits_bounded_same_category_ordinary_rows(tmp_path: Path) -> None:
+    from lehome.flywheel.recovery_collection import validate_snapshot_source_discovery_descriptor
+
+    descriptor = tmp_path / "discovery.json"
+    rows = [
+        {
+            "snapshot_source_bootstrap": True,
+            "category": "top_long",
+            "garment": "Top_Long_Seen_0",
+            "seed": 107 + index,
+            "source_seed": 107 + index,
+        }
+        for index in range(3)
+    ]
+    descriptor.write_text(json.dumps(rows), encoding="utf-8")
+
+    assert validate_snapshot_source_discovery_descriptor(descriptor) == rows
+
+
+def test_snapshot_source_discovery_descriptor_rejects_mixed_or_controlled_rows(tmp_path: Path) -> None:
+    from lehome.flywheel.recovery_collection import validate_snapshot_source_discovery_descriptor
+
+    descriptor = tmp_path / "discovery.json"
+    descriptor.write_text(json.dumps([
+        {"snapshot_source_bootstrap": True, "category": "top_long", "garment": "Top_Long_Seen_0", "seed": 107, "source_seed": 107},
+        {"snapshot_source_bootstrap": True, "category": "top_short", "garment": "Top_Short_Seen_0", "seed": 108, "source_seed": 108, "controlled_smoke": True},
+    ]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="discovery descriptor"):
+        validate_snapshot_source_discovery_descriptor(descriptor)
+
+
+def test_snapshot_source_discovery_descriptor_rejects_hidden_recovery_state(tmp_path: Path) -> None:
+    from lehome.flywheel.recovery_collection import validate_snapshot_source_discovery_descriptor
+
+    descriptor = tmp_path / "discovery.json"
+    descriptor.write_text(json.dumps([{
+        "snapshot_source_bootstrap": True,
+        "category": "top_long",
+        "garment": "Top_Long_Seen_0",
+        "seed": 107,
+        "source_seed": 107,
+        "source_continuation_state": [0.0] * 12,
+    }]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ordinary autonomous"):
+        validate_snapshot_source_discovery_descriptor(descriptor)
+
+
+def test_snapshot_source_discovery_descriptor_rejects_an_inconsistent_garment_alias(tmp_path: Path) -> None:
+    from lehome.flywheel.recovery_collection import validate_snapshot_source_discovery_descriptor
+
+    descriptor = tmp_path / "discovery.json"
+    descriptor.write_text(json.dumps([{
+        "snapshot_source_bootstrap": True,
+        "category": "top_long",
+        "garment": "Top_Long_Seen_0",
+        "garment_name": "Top_Long_Seen_1",
+        "seed": 107,
+        "source_seed": 107,
+    }]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="garment identity"):
+        validate_snapshot_source_discovery_descriptor(descriptor)
+
+
+@pytest.mark.parametrize(("seed", "source_seed"), [(1, True), (1, 1.0)])
+def test_snapshot_source_discovery_descriptor_requires_an_exact_integer_source_seed(
+    tmp_path: Path, seed: int, source_seed: object,
+) -> None:
+    from lehome.flywheel.recovery_collection import validate_snapshot_source_discovery_descriptor
+
+    descriptor = tmp_path / "discovery.json"
+    descriptor.write_text(json.dumps([{
+        "snapshot_source_bootstrap": True,
+        "category": "top_long",
+        "garment": "Top_Long_Seen_0",
+        "seed": seed,
+        "source_seed": source_seed,
+    }]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lineage"):
+        validate_snapshot_source_discovery_descriptor(descriptor)
+
+
+@pytest.mark.parametrize(
+    ("category", "garment"),
+    [
+        ("top_long", "Top_Short_Seen_0"),
+        ("top_short", "Top_Long_Seen_0"),
+        ("pant_long", "Pant_Short_Seen_0"),
+        ("pant_short", "Pant_Long_Seen_0"),
+        ("top_short", "Top_Short_Unseen_0"),
+        ("pant_long", "../Pant_Long_Seen_0"),
+        ("pant_short", "Pant_Short_Seen_-1"),
+    ],
+)
+def test_snapshot_source_discovery_descriptor_requires_a_canonical_seen_garment(
+    tmp_path: Path, category: str, garment: str,
+) -> None:
+    from lehome.flywheel.recovery_collection import validate_snapshot_source_discovery_descriptor
+
+    descriptor = tmp_path / "discovery.json"
+    descriptor.write_text(json.dumps([{
+        "snapshot_source_bootstrap": True,
+        "category": category,
+        "garment": garment,
+        "seed": 107,
+        "source_seed": 107,
+    }]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="garment identity"):
+        validate_snapshot_source_discovery_descriptor(descriptor)
+
+
 def test_controlled_recovery_rejects_invalid_actions_and_perturbation_bounds() -> None:
     from lehome.flywheel.recovery_collection import (
         apply_controlled_perturbation, replay_action_prefix,

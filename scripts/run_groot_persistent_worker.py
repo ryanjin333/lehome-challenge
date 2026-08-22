@@ -43,6 +43,9 @@ class LedgerWorkerController:
     def record_infrastructure_abort(self, worker_id: str, attempt_id: str, lease_id: str, *, reason: str) -> str:
         return self._ledger.record_infrastructure_abort(worker_id, attempt_id, lease_id, reason=reason)
 
+    def status(self, attempt_id: str) -> str:
+        return self._ledger.status(attempt_id)
+
     def heartbeat(self, worker_id: str, attempt_id: str, lease_id: str):
         return self._ledger.heartbeat(worker_id, attempt_id, lease_id, lease_duration_ns=self._lease_duration_ns)
 
@@ -86,6 +89,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--lease-seconds", type=float, default=300.0)
+    parser.add_argument(
+        "--source-finalization-timeout-seconds", type=float, default=300.0,
+        help="bounded wait for accepted or cleanly rejected snapshot-source artifacts",
+    )
     parser.add_argument("--max-attempts", type=int, default=400)
     parser.add_argument("--target-accepted", type=int, default=150)
     parser.add_argument("--renderer-device", required=True, help="physical CUDA device used for renderer/cameras")
@@ -195,6 +202,14 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
         or args.preparation_timeout_seconds <= 0
     ):
         raise ValueError("preparation timeout seconds must be positive")
+    source_finalization_timeout_seconds = getattr(args, "source_finalization_timeout_seconds", 300.0)
+    if (
+        isinstance(source_finalization_timeout_seconds, bool)
+        or not isinstance(source_finalization_timeout_seconds, (int, float))
+        or not math.isfinite(source_finalization_timeout_seconds)
+        or source_finalization_timeout_seconds <= 0
+    ):
+        raise ValueError("source finalization timeout seconds must be positive")
     if args.device != "cpu" and (args.device != args.renderer_device or _CUDA_DEVICE.fullmatch(args.device) is None):
         raise ValueError("persistent worker simulator device is not bound to the requested backend")
     matrix = _load_matrix(args.attempt_matrix)
@@ -247,6 +262,7 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
             renderer_device=args.renderer_device, policy_device=args.policy_device, simulator_device=args.device,
             heartbeat_interval_seconds=max(0.1, args.lease_seconds / 3.0),
             preparation_timeout_seconds=args.preparation_timeout_seconds,
+            source_finalization_timeout_seconds=source_finalization_timeout_seconds,
         )
         return worker.run()
     finally:
