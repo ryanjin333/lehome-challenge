@@ -1677,6 +1677,85 @@ def test_cloth_physical_health_classifies_invalid_physx_readback_as_divergence()
     }
 
 
+def test_physx_cloth_readback_diagnoses_each_bounded_failure_class() -> None:
+    """A source-canary abort must identify the failed PhysX admission, not coordinates."""
+
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    methods = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"_flywheel_cloth_arrays", "_flywheel_physics_cloth_state"}
+    }
+    module = ast.Module(
+        body=[methods["_flywheel_cloth_arrays"], methods["_flywheel_physics_cloth_state"]],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    class Cloth:
+        def __init__(self, positions, velocities) -> None:
+            self.positions = positions
+            self.velocities = velocities
+
+        def get_world_positions(self):
+            if isinstance(self.positions, BaseException):
+                raise self.positions
+            return self.positions
+
+        def get_velocities(self):
+            if isinstance(self.velocities, BaseException):
+                raise self.velocities
+            return self.velocities
+
+    def state(cloth, *, initial_count=2, root_position=(0.0, 0.0, 0.0)):
+        object_state = types.SimpleNamespace(
+            initial_points_positions=np.zeros((1, initial_count, 3), dtype=np.float32),
+            get_world_pose=lambda: (
+                np.asarray(root_position, dtype=np.float32),
+                np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+            ),
+        )
+        return types.SimpleNamespace(
+            object=object_state,
+            _flywheel_physics_cloth_view=lambda: cloth,
+            _flywheel_cloth_arrays=namespace["_flywheel_cloth_arrays"],
+        )
+
+    cases = (
+        (
+            state(Cloth(np.asarray([[np.nan, 0.0, 0.0]], dtype=np.float32), np.zeros((1, 3), dtype=np.float32)), initial_count=1),
+            "positions_nonfinite_count=1 velocities_nonfinite_count=0",
+        ),
+        (
+            state(Cloth(np.zeros((1, 2, 3), dtype=np.float32), np.zeros((1, 3), dtype=np.float32))),
+            "positions_shape=(2, 3) velocities_shape=(1, 3)",
+        ),
+        (
+            state(Cloth(np.zeros((1, 3, 3), dtype=np.float32), np.zeros((1, 3, 3), dtype=np.float32))),
+            "live_particle_count=3 initial_particle_count=2",
+        ),
+        (
+            state(Cloth(RuntimeError("Kit getter failed"), np.zeros((1, 2, 3), dtype=np.float32))),
+            "readback API failure",
+        ),
+        (
+            state(Cloth(np.zeros((1, 2, 3), dtype=np.float32), np.zeros((1, 2, 3), dtype=np.float32)), root_position=(0.0, 0.0)),
+            "root_position_shape=(2,)",
+        ),
+    )
+    for env, diagnostic in cases:
+        with __import__("pytest").raises(RuntimeError, match=__import__("re").escape(diagnostic)):
+            namespace["_flywheel_physics_cloth_state"](env)
+
+
 def test_flywheel_evaluation_checks_physical_health_before_success_or_recording() -> None:
     source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
     source = source_path.read_text(encoding="utf-8")

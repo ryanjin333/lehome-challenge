@@ -773,7 +773,7 @@ class GarmentEnv(DirectRLEnv):
             local_positions = np.asarray(positions, dtype=np.float32)
             local_velocities = np.asarray(velocities, dtype=np.float32)
         except (TypeError, ValueError) as error:
-            raise RuntimeError("garment PhysX cloth state is not numeric") from error
+            raise RuntimeError("garment PhysX cloth readback is not numeric") from error
         if (
             local_positions.ndim != 2
             or local_velocities.ndim != 2
@@ -781,9 +781,19 @@ class GarmentEnv(DirectRLEnv):
             or local_velocities.shape[1:] != (3,)
             or local_positions.shape[0] != local_velocities.shape[0]
         ):
-            raise RuntimeError("garment PhysX cloth positions and velocities must be aligned Nx3 arrays")
-        if not np.isfinite(local_positions).all() or not np.isfinite(local_velocities).all():
-            raise RuntimeError("garment PhysX cloth positions and velocities must be finite")
+            raise RuntimeError(
+                "garment PhysX cloth readback shape mismatch: "
+                f"positions_shape={local_positions.shape} "
+                f"velocities_shape={local_velocities.shape} expected_shape=Nx3"
+            )
+        positions_nonfinite_count = int(np.size(local_positions) - np.isfinite(local_positions).sum())
+        velocities_nonfinite_count = int(np.size(local_velocities) - np.isfinite(local_velocities).sum())
+        if positions_nonfinite_count or velocities_nonfinite_count:
+            raise RuntimeError(
+                "garment PhysX cloth readback is nonfinite: "
+                f"positions_nonfinite_count={positions_nonfinite_count} "
+                f"velocities_nonfinite_count={velocities_nonfinite_count}"
+            )
         return local_positions.copy(), local_velocities.copy()
 
     @staticmethod
@@ -1115,13 +1125,62 @@ class GarmentEnv(DirectRLEnv):
         def _numpy(value):
             return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
 
-        positions = _numpy(cloth.get_world_positions())
-        velocities = _numpy(cloth.get_velocities())
-        if positions.ndim == 3:
+        try:
+            positions = _numpy(cloth.get_world_positions())
+            velocities = _numpy(cloth.get_velocities())
+        except (RuntimeError, TypeError, ValueError, AttributeError) as error:
+            raise RuntimeError("garment PhysX cloth readback API failure") from error
+        if positions.ndim == 3 and positions.shape[0] == 1:
             positions = positions[0]
-        if velocities.ndim == 3:
+        if velocities.ndim == 3 and velocities.shape[0] == 1:
             velocities = velocities[0]
-        return self._flywheel_cloth_arrays(positions, velocities)
+        positions, velocities = self._flywheel_cloth_arrays(positions, velocities)
+
+        initial_positions = getattr(self.object, "initial_points_positions", None)
+        try:
+            initial_positions = _numpy(initial_positions)
+        except (RuntimeError, TypeError, ValueError, AttributeError) as error:
+            raise RuntimeError("garment PhysX cloth topology readback API failure") from error
+        if initial_positions.ndim == 3 and initial_positions.shape[0] == 1:
+            initial_positions = initial_positions[0]
+        if initial_positions.ndim != 2 or initial_positions.shape[1:] != (3,):
+            raise RuntimeError(
+                "garment PhysX cloth topology reference invalid: "
+                f"initial_positions_shape={initial_positions.shape} expected_shape=Nx3"
+            )
+        if positions.shape[0] != initial_positions.shape[0]:
+            raise RuntimeError(
+                "garment PhysX cloth topology mismatch: "
+                f"live_particle_count={positions.shape[0]} "
+                f"initial_particle_count={initial_positions.shape[0]}"
+            )
+
+        try:
+            root_position, root_orientation = self.object.get_world_pose()
+            root_position = _numpy(root_position)
+            root_orientation = _numpy(root_orientation)
+        except (RuntimeError, TypeError, ValueError, AttributeError) as error:
+            raise RuntimeError("garment root transform readback API failure") from error
+        if root_position.ndim == 2 and root_position.shape[0] == 1:
+            root_position = root_position[0]
+        if root_orientation.ndim == 2 and root_orientation.shape[0] == 1:
+            root_orientation = root_orientation[0]
+        if root_position.shape != (3,) or root_orientation.shape != (4,):
+            raise RuntimeError(
+                "garment root transform shape mismatch: "
+                f"root_position_shape={root_position.shape} "
+                f"root_orientation_shape={root_orientation.shape} "
+                "expected_position_shape=(3,) expected_orientation_shape=(4,)"
+            )
+        root_position_nonfinite_count = int(np.size(root_position) - np.isfinite(root_position).sum())
+        root_orientation_nonfinite_count = int(np.size(root_orientation) - np.isfinite(root_orientation).sum())
+        if root_position_nonfinite_count or root_orientation_nonfinite_count:
+            raise RuntimeError(
+                "garment root transform is nonfinite: "
+                f"root_position_nonfinite_count={root_position_nonfinite_count} "
+                f"root_orientation_nonfinite_count={root_orientation_nonfinite_count}"
+            )
+        return positions, velocities
 
     def flywheel_collider_health(self) -> dict[str, object]:
         """Cache a fail-closed audit of live USD collision approximations.
