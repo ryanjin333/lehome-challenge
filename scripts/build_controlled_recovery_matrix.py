@@ -10,7 +10,7 @@ _CATEGORIES = ("pant_long", "top_long", "top_short")
 _CAPS = {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}
 _PROFILE = {"cloth_displacement_m": 0.002, "cloth_velocity_mps": 0.01, "gripper_offset_rad": 0.02}
 _HORIZON = 16
-_CONTINUATION_CONTRACT = "authenticated_physx_cloth_view_snapshot_at_fresh_h16_next_action_boundary_v1"
+_CONTINUATION_CONTRACT = "authenticated_cloth_snapshot_at_fresh_h16_next_action_boundary_v2"
 
 def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
@@ -174,7 +174,7 @@ def _source(row: Mapping[str, object], roots: Sequence[Path]) -> dict[str, objec
     )
     if stop >= first_success:
         raise ValueError("audit continuation must precede the first successful source record")
-    portable = {key: row[key] for key in ("source_round_id", "source_round_ordinal", "source_episode_id", "source_episode_digest", "source_immutable_revision", "source_receipt_file_name", "source_receipt_remote_prefix", "source_receipt_publication_ref", "source_receipt_sha256", "receipt_immutable_revision", "garment", "category") if key in row}
+    portable = {key: row[key] for key in ("source_round_id", "source_round_ordinal", "source_episode_id", "source_episode_digest", "source_immutable_revision", "source_receipt_file_name", "source_receipt_remote_prefix", "source_receipt_publication_ref", "source_receipt_sha256", "receipt_immutable_revision", "source_only_envelope", "garment", "category") if key in row}
     try:
         reset_snapshot = _json(reset, label="accepted reset snapshot")
         snapshot = _json(continuation_snapshot, label="accepted continuation snapshot")
@@ -182,10 +182,28 @@ def _source(row: Mapping[str, object], roots: Sequence[Path]) -> dict[str, objec
         raise ValueError("accepted source snapshot is malformed") from None
     randomization = snapshot.get("randomization")
     reset_randomization = reset_snapshot.get("randomization")
-    if (snapshot.get("schema_version") != 2 or reset_snapshot.get("schema_version") != 2
-            or snapshot.get("cloth_state_authority") != "physx_cloth_view_world_v1"
-            or reset_snapshot.get("cloth_state_authority") != "physx_cloth_view_world_v1"):
-        raise ValueError("accepted source snapshot lacks live PhysX cloth authority")
+    authority = snapshot.get("cloth_state_authority")
+    schema_version = snapshot.get("schema_version")
+    if (
+        (schema_version, authority) not in {
+            (2, "physx_cloth_view_world_v1"),
+            (3, "usd_local_points_v1"),
+        }
+        or (reset_snapshot.get("schema_version"), reset_snapshot.get("cloth_state_authority"))
+        != (schema_version, authority)
+    ):
+        raise ValueError("accepted source snapshot has an invalid or mixed cloth authority")
+    if (
+        evidence.get("snapshot_schema_version") != schema_version
+        or evidence.get("snapshot_cloth_state_authority") != authority
+        or evidence.get("reset_snapshot_schema_version") != schema_version
+        or evidence.get("reset_snapshot_cloth_state_authority") != authority
+    ):
+        raise ValueError("audit continuation snapshot authority is not bound to the source snapshots")
+    if type(row.get("source_only_envelope")) is not bool or (
+        schema_version == 3 and row["source_only_envelope"] is not True
+    ):
+        raise ValueError("audit source envelope does not authorize this snapshot authority")
     if not isinstance(randomization, Mapping) or not isinstance(reset_randomization, Mapping):
         raise ValueError("accepted source snapshot randomization is malformed")
     base_randomization = dict(randomization)
@@ -193,7 +211,7 @@ def _source(row: Mapping[str, object], roots: Sequence[Path]) -> dict[str, objec
     if (snapshot.get("robot_position") != continuation_state or snapshot.get("garment_name") != row.get("garment")
             or continuation_step != stop or base_randomization != dict(reset_randomization)):
         raise ValueError("accepted continuation snapshot does not match audit boundary state")
-    portable.update({"source_artifacts": dict(artifacts), "source_seed": source_seed, "source_continuation_state": continuation_state, "source_state_fingerprint": fingerprint, "source_reset_sha256": _sha256(reset), "source_annotations_sha256": annotation_hash, "source_continuation_snapshot_sha256": _sha256(continuation_snapshot), "source_continuation_snapshot_relative_path": relative, "source_first_success_step": first_success, "prefix_stop": stop})
+    portable.update({"source_artifacts": dict(artifacts), "source_seed": source_seed, "source_continuation_state": continuation_state, "source_state_fingerprint": fingerprint, "source_snapshot_schema_version": schema_version, "source_snapshot_authority": authority, "source_reset_sha256": _sha256(reset), "source_annotations_sha256": annotation_hash, "source_continuation_snapshot_sha256": _sha256(continuation_snapshot), "source_continuation_snapshot_relative_path": relative, "source_first_success_step": first_success, "prefix_stop": stop})
     return {"portable": portable, "source_reset": str(reset), "source_annotations": str(annotations), "source_continuation_snapshot": str(continuation_snapshot)}
 
 def _write_absent(path: Path, payload: bytes) -> None:
@@ -240,7 +258,7 @@ def build_controlled_recovery_matrix(*, audit_path: Path | str, accepted_roots: 
         schedule.append(next(category for category in _CATEGORIES if counts[category] == least_count))
     for index, category in enumerate(schedule):
         source = by_category[category][index % len(by_category[category])]; portable = source["portable"]; seed = 71_000 + index
-        perturbation = hashlib.sha256(_canonical({**_PROFILE, "seed": seed, "source_episode_digest": portable["source_episode_digest"], "continuation_snapshot_sha256": portable["source_continuation_snapshot_sha256"]})).hexdigest()
+        perturbation = hashlib.sha256(_canonical({**_PROFILE, "seed": seed, "source_episode_digest": portable["source_episode_digest"], "continuation_snapshot_sha256": portable["source_continuation_snapshot_sha256"], "source_snapshot_schema_version": portable["source_snapshot_schema_version"], "source_snapshot_authority": portable["source_snapshot_authority"]})).hexdigest()
         source_perturbation = hashlib.sha256(_canonical({"source_state_fingerprint": portable["source_state_fingerprint"], "perturbation_fingerprint": perturbation})).hexdigest()
         attempt_id = f"controlled-{category.replace('_', '-')}-{index:03d}-{perturbation[:16]}"
         row = {"attempt_id": attempt_id, "trial_id": attempt_id, "garment": portable["garment"], "garment_name": portable["garment"], "category": category, "release_stage": "seen", "seed": seed, "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v3", "category_acceptance_cap": _CAPS[category], **portable, "perturbation_profile": dict(_PROFILE), "perturbation_seed": seed, "perturbation_fingerprint": perturbation, "source_state_perturbation_fingerprint": source_perturbation}

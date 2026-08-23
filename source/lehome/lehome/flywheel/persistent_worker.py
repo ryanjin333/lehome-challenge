@@ -214,11 +214,13 @@ class PersistentRolloutWorker:
             or receipt.get("cloth_device") != self._simulator_device
         ):
             raise ValueError("persistent rollout cloth device does not match the assigned simulator device")
-        if receipt.get("cloth_backend") != "physx_cloth_view":
-            raise ValueError("persistent rollout requires the live PhysX cloth backend")
+        expected_backend = "usd_local_points_v1" if self._simulator_device == "cpu" else "physx_cloth_view"
+        if receipt.get("cloth_backend") != expected_backend:
+            expected_name = "USD-local CPU" if self._simulator_device == "cpu" else "live PhysX"
+            raise ValueError(f"persistent rollout requires the {expected_name} cloth backend")
         if require_contact:
             if not isinstance(receipt.get("cloth_readback"), Mapping):
-                raise ValueError("persistent rollout requires observed PhysX cloth readback")
+                raise ValueError("persistent rollout requires observed live cloth readback")
             contact = receipt.get("visible_contact_canary")
             if not isinstance(contact, Mapping) or not isinstance(contact.get("observed"), bool):
                 raise ValueError("persistent rollout requires visible-contact canary evidence")

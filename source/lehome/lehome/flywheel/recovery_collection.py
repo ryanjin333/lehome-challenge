@@ -154,6 +154,59 @@ def _continuation_state(value: object, *, category: object, garment: object, fin
     return state
 
 
+def _source_snapshot_contract(
+    reset_snapshot: Snapshot, continuation_snapshot: Snapshot,
+) -> tuple[int, str]:
+    """Require one exact frame authority across the authenticated source pair."""
+
+    contract = (
+        continuation_snapshot.schema_version,
+        continuation_snapshot.cloth_state_authority,
+    )
+    if contract not in {
+        (2, PHYSX_CLOTH_STATE_AUTHORITY),
+        (3, LEGACY_USD_LOCAL_CLOTH_AUTHORITY),
+    } or (reset_snapshot.schema_version, reset_snapshot.cloth_state_authority) != contract:
+        raise ValueError("controlled recovery source snapshots have an invalid or mixed cloth authority")
+    return contract
+
+
+def _projection_provenance(
+    env: object, recovery: ControlledRecovery, projected: Snapshot,
+) -> Mapping[str, object]:
+    """Bind a legacy source to the exact CUDA PhysX readback it produced."""
+
+    receipt = getattr(env, "_flywheel_legacy_projection_receipt", None)
+    if not isinstance(receipt, Mapping):
+        raise ValueError("controlled recovery legacy USD projection receipt is missing")
+    required = {
+        "source_snapshot_authority", "weld_map_identity",
+        "welded_vertices_remap_to_orig_sha256", "welded_vertices_remap_to_weld_sha256",
+    }
+    if set(receipt) != required or receipt.get("source_snapshot_authority") != LEGACY_USD_LOCAL_CLOTH_AUTHORITY:
+        raise ValueError("controlled recovery legacy USD projection receipt is malformed")
+    if any(not isinstance(receipt[field], str) or _LOWERCASE_SHA256.fullmatch(receipt[field]) is None for field in required - {"source_snapshot_authority"}):
+        raise ValueError("controlled recovery legacy USD projection receipt is malformed")
+    state = {
+        "robot_position": list(projected.robot_position),
+        "robot_velocity": list(projected.robot_velocity),
+        "cloth_position": [list(point) for point in projected.cloth_position],
+        "cloth_velocity": [list(point) for point in projected.cloth_velocity],
+        "cloth_state_authority": projected.cloth_state_authority,
+    }
+    source_sha = recovery.provenance.get("source_continuation_snapshot_sha256")
+    if not isinstance(source_sha, str) or _LOWERCASE_SHA256.fullmatch(source_sha) is None:
+        raise ValueError("controlled recovery legacy source snapshot SHA-256 is invalid")
+    return {
+        "source_snapshot_sha256": source_sha,
+        "source_snapshot_authority": LEGACY_USD_LOCAL_CLOTH_AUTHORITY,
+        **dict(receipt),
+        "projected_schema_version": 2,
+        "projected_cloth_state_authority": PHYSX_CLOTH_STATE_AUTHORITY,
+        "projected_physical_state_sha256": hashlib.sha256(_canonical_bytes(state)).hexdigest(),
+    }
+
+
 def _replay_fidelity(env: object, expected: Snapshot) -> Mapping[str, object]:
     from lehome.flywheel.snapshots import capture_snapshot
 
@@ -262,10 +315,18 @@ def load_controlled_recovery(assignment: Mapping[str, object]) -> ControlledReco
     if not isinstance(snapshot_payload, Mapping):
         raise ValueError("source continuation snapshot must contain a JSON object")
     continuation_snapshot = _snapshot(snapshot_payload)
-    if (reset_snapshot.schema_version != 2 or continuation_snapshot.schema_version != 2
-            or reset_snapshot.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY
-            or continuation_snapshot.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY):
-        raise ValueError("controlled recovery requires PhysX-authoritative v2 source snapshots")
+    source_snapshot_schema_version, source_snapshot_authority = _source_snapshot_contract(
+        reset_snapshot, continuation_snapshot,
+    )
+    if (
+        assignment.get("source_snapshot_schema_version") != source_snapshot_schema_version
+        or assignment.get("source_snapshot_authority") != source_snapshot_authority
+    ):
+        raise ValueError("controlled recovery source snapshot authority is not bound by the assignment")
+    if type(assignment.get("source_only_envelope")) is not bool or (
+        source_snapshot_schema_version == 3 and assignment["source_only_envelope"] is not True
+    ):
+        raise ValueError("controlled recovery source envelope does not authorize this snapshot authority")
     annotations_value = assignment.get("source_annotations")
     if not isinstance(annotations_value, str):
         raise ValueError("source annotations must be an absolute regular file")
@@ -632,9 +693,6 @@ def validate_snapshot_source_bootstrap_evidence(
             or identity.get("garment_name") != garment or identity.get("seed") != seed):
         raise ValueError("snapshot source episode is not an accepted autonomous descriptor-bound success")
     reset_payload = _strict_json_object(reset_path, field="snapshot source reset")
-    if (reset_payload.get("schema_version") != 2
-            or reset_payload.get("cloth_state_authority") != PHYSX_CLOTH_STATE_AUTHORITY):
-        raise ValueError("snapshot source evidence requires PhysX-authoritative v2 source snapshots")
     reset = _strict_snapshot(reset_payload)
     if reset.garment_name != garment:
         raise ValueError("snapshot source reset garment does not match the descriptor")
@@ -691,10 +749,8 @@ def validate_snapshot_source_bootstrap_evidence(
         if step <= 0 or step % 16 or step >= first_success or step >= len(annotation_rows):
             raise ValueError("snapshot source continuation boundary is invalid")
         snapshot_payload = _strict_json_object(strict_path, field="snapshot source continuation")
-        if (snapshot_payload.get("schema_version") != 2
-                or snapshot_payload.get("cloth_state_authority") != PHYSX_CLOTH_STATE_AUTHORITY):
-            raise ValueError("snapshot source evidence requires PhysX-authoritative v2 source snapshots")
         snapshot = _strict_snapshot(snapshot_payload)
+        _source_snapshot_contract(reset, snapshot)
         row = annotation_rows[step]
         state = row.get("state")
         if (row.get("step") != step or row.get("action_source") != "policy" or row.get("policy_chunk_offset") != 0
@@ -786,6 +842,20 @@ def load_attempt_matrix(path_value: str | Path) -> list[Mapping[str, object]]:
         for field in ("source_episode_digest", "source_reset_sha256", "source_annotations_sha256", "source_continuation_snapshot_sha256", "source_state_fingerprint"):
             if not isinstance(row.get(field), str) or _LOWERCASE_SHA256.fullmatch(str(row[field])) is None:
                 raise ValueError("controlled materialization source identity is invalid")
+        if (
+            row.get("source_snapshot_schema_version") not in (2, 3)
+            or row.get("source_snapshot_authority") not in {
+                PHYSX_CLOTH_STATE_AUTHORITY,
+                LEGACY_USD_LOCAL_CLOTH_AUTHORITY,
+            }
+            or (row["source_snapshot_schema_version"] == 2 and row["source_snapshot_authority"] != PHYSX_CLOTH_STATE_AUTHORITY)
+            or (row["source_snapshot_schema_version"] == 3 and row["source_snapshot_authority"] != LEGACY_USD_LOCAL_CLOTH_AUTHORITY)
+        ):
+            raise ValueError("controlled materialization source snapshot authority is invalid")
+        if type(row.get("source_only_envelope")) is not bool or (
+            row["source_snapshot_schema_version"] == 3 and row["source_only_envelope"] is not True
+        ):
+            raise ValueError("controlled materialization source envelope is invalid")
         if type(row.get("source_seed")) is not int or row["source_seed"] < 0:
             raise ValueError("controlled materialization source reset seed is invalid")
         continuation = row.get("source_continuation_state")
@@ -871,14 +941,37 @@ def bootstrap_controlled_recovery(env: object, assignment: Mapping[str, object])
 
     recovery = load_controlled_recovery(assignment)
     restore_snapshot(env, recovery.continuation_snapshot)
-    checks = [_replay_fidelity(env, recovery.continuation_snapshot)]
+    projected = capture_snapshot(
+        env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND},
+    )
+    if projected.schema_version != 2 or projected.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY:
+        raise ValueError("controlled recovery restore did not read back a live CUDA PhysX state")
+    legacy_projection = (
+        _projection_provenance(env, recovery, projected)
+        if recovery.continuation_snapshot.schema_version == 3
+        else None
+    )
+    replay_target = (
+        projected
+        if recovery.continuation_snapshot.schema_version == 3
+        else recovery.continuation_snapshot
+    )
+    checks = [_replay_fidelity(env, replay_target)]
+    if legacy_projection is not None:
+        restore_snapshot(env, recovery.continuation_snapshot)
+        repeated = capture_snapshot(
+            env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND},
+        )
+        if _projection_provenance(env, recovery, repeated) != legacy_projection:
+            raise ValueError("controlled recovery legacy USD projection is not idempotent")
+        checks.append(_replay_fidelity(env, replay_target))
     teacher_provenance: Mapping[str, object] | None = None
     if recovery.teacher_actions:
         replay_action_prefix(env, recovery.teacher_actions)
         if not _teacher_success(env):
             raise ValueError("controlled recovery teacher probe did not reproduce source success")
         restore_snapshot(env, recovery.continuation_snapshot)
-        checks.append(_replay_fidelity(env, recovery.continuation_snapshot))
+        checks.append(_replay_fidelity(env, replay_target))
         teacher_provenance = {"enabled": True, "verified": True, "replayed_action_count": len(recovery.teacher_actions)}
     intermediate = capture_snapshot(env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND})
     perturbed = apply_controlled_perturbation(intermediate, recovery.perturbation_profile, recovery.perturbation_seed)
@@ -888,6 +981,8 @@ def bootstrap_controlled_recovery(env: object, assignment: Mapping[str, object])
     capture_snapshot(env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND})
     provenance = dict(recovery.provenance)
     provenance.update({"replay_fidelity": checks[-1], "replay_fidelity_checks": checks})
+    if legacy_projection is not None:
+        provenance["legacy_usd_projection"] = legacy_projection
     if teacher_provenance is not None:
         provenance["teacher_probe"] = teacher_provenance
     return provenance

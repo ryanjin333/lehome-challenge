@@ -402,6 +402,8 @@ def test_audit_advances_an_adverse_start_inside_a_cached_chunk_to_the_next_fresh
     assert continuation["policy_request_id"] == "request-recover-boundary-2"
     assert continuation["state"] == [3.032] * 12
     assert continuation["snapshot_continuation_step"] == 32
+    assert continuation["snapshot_schema_version"] == 2
+    assert continuation["snapshot_cloth_state_authority"] == "physx_cloth_view_world_v1"
     assert selected[0]["fingerprint"] == continuation["state_fingerprint"]
 
 

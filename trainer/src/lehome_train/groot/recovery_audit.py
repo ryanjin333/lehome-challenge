@@ -19,7 +19,11 @@ import re
 import tempfile
 from typing import Any, Mapping, Sequence
 
-from lehome.flywheel.snapshots import PHYSX_CLOTH_STATE_AUTHORITY, Snapshot
+from lehome.flywheel.snapshots import (
+    LEGACY_USD_LOCAL_CLOTH_AUTHORITY,
+    PHYSX_CLOTH_STATE_AUTHORITY,
+    Snapshot,
+)
 from lehome_train.groot.rollout_source_adapter import _accepted_episode, _seal
 from lehome_train.io import canonical_json_bytes, canonical_json_sha256, sha256_file
 
@@ -29,7 +33,7 @@ _HORIZON = 16
 _SOURCE_ROUND_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 _SOURCE_REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TASK_LEDGER_ATTEMPT_ID = re.compile(r"^[0-9a-f]{64}$")
-_CONTINUATION_CONTRACT = "authenticated_physx_cloth_view_snapshot_at_fresh_h16_next_action_boundary_v1"
+_CONTINUATION_CONTRACT = "authenticated_cloth_snapshot_at_fresh_h16_next_action_boundary_v2"
 
 
 @dataclass(frozen=True)
@@ -295,8 +299,11 @@ def _continuation_start(
         ))
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return None
-    if (reset_snapshot.schema_version != 2
-            or reset_snapshot.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY):
+    reset_contract = (reset_snapshot.schema_version, reset_snapshot.cloth_state_authority)
+    if reset_contract not in {
+        (2, PHYSX_CLOTH_STATE_AUTHORITY),
+        (3, LEGACY_USD_LOCAL_CLOTH_AUTHORITY),
+    }:
         return None
 
     for index in range(event.adverse_start, event.confirmation):
@@ -313,8 +320,7 @@ def _continuation_start(
             snapshot = _snapshot(json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_strict_pairs, parse_constant=_reject_constant))
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
             continue
-        if (snapshot.schema_version != 2
-                or snapshot.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY):
+        if (snapshot.schema_version, snapshot.cloth_state_authority) != reset_contract:
             continue
         randomization = dict(snapshot.randomization)
         continuation_step = randomization.pop("continuation_step", None)
@@ -333,6 +339,10 @@ def _continuation_start(
             "state_fingerprint": _fingerprint(category=category, garment=garment, state=state),
             "snapshot_relative_path": relative,
             "snapshot_sha256": sha256_file(path),
+            "snapshot_schema_version": snapshot.schema_version,
+            "snapshot_cloth_state_authority": snapshot.cloth_state_authority,
+            "reset_snapshot_schema_version": reset_snapshot.schema_version,
+            "reset_snapshot_cloth_state_authority": reset_snapshot.cloth_state_authority,
             "snapshot_continuation_step": continuation_step,
             "snapshot_robot_position": list(snapshot.robot_position),
         }
@@ -519,6 +529,7 @@ def audit_successful_recoveries(
                 "source_receipt_sha256": sha256_file(receipt_root / f"{attempt_id}.sync.json"),
                 "source_receipt_remote_prefix": receipt["remote_prefix"],
                 "source_receipt_publication_ref": receipt["publication_ref"],
+                "source_only_envelope": seal.get("source_only") is True,
                 "source_artifacts": {
                     # Hub packages are authenticated by the seal-bound sync
                     # digest.  They do not carry a top-level SHA256SUMS file;
@@ -559,6 +570,15 @@ def audit_successful_recoveries(
                 exclusions.append({
                     "source_round_id": round_id, "source_episode_id": attempt_id,
                     "reason": "no_authenticated_h16_snapshot_before_recovery_confirmation",
+                })
+                continue
+            if (
+                continuation["snapshot_schema_version"] == 3
+                and seal.get("source_only") is not True
+            ):
+                exclusions.append({
+                    "source_round_id": round_id, "source_episode_id": attempt_id,
+                    "reason": "legacy_usd_local_source_requires_source_only_envelope",
                 })
                 continue
             lineage = _lineage_id({

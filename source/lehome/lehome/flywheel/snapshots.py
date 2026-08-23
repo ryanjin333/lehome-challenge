@@ -121,8 +121,16 @@ def capture_snapshot(adapter: SnapshotAdapter | object, *, randomization: Mappin
         "garment_name": _read(adapter, "garment_name"),
     }
     authority = state.get("cloth_state_authority")
+    if authority is None:
+        schema_version = 1
+    elif authority == PHYSX_CLOTH_STATE_AUTHORITY:
+        schema_version = 2
+    elif authority == LEGACY_USD_LOCAL_CLOTH_AUTHORITY:
+        schema_version = 3
+    else:
+        raise ValueError("snapshot capture has an unsupported cloth state authority")
     return Snapshot(
-        schema_version=2 if authority is not None else 1,
+        schema_version=schema_version,
         robot_position=_finite_tuple(state["robot_position"], name="robot_position"),
         robot_velocity=_finite_tuple(state["robot_velocity"], name="robot_velocity"),
         cloth_position=_finite_xyz(state["cloth_position"], name="cloth_position"),

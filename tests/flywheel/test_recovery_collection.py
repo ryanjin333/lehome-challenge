@@ -38,6 +38,7 @@ def _assignment(tmp_path, *, state: list[float] | None = None, teacher: bool = F
         "perturbation_profile": {"cloth_displacement_m": 0.002, "cloth_velocity_mps": 0.01, "gripper_offset_rad": 0.02}, "perturbation_seed": 7,
         "source_round_id": "round", "source_episode_id": "episode", "source_episode_digest": "a" * 64, "source_immutable_revision": "b" * 40,
         "category": category, "garment": garment, "source_seed": 50110, "source_continuation_state": source_state,
+        "source_snapshot_schema_version": 2, "source_snapshot_authority": "physx_cloth_view_world_v1", "source_only_envelope": False,
         "source_state_fingerprint": _state_fingerprint(category=category, garment=garment, state=source_state), "perturbation_fingerprint": "d" * 64, "source_state_perturbation_fingerprint": "e" * 64,
         **({"controlled_smoke": True, "controlled_smoke_teacher_probe": True} if teacher else {}),
     }
@@ -421,8 +422,88 @@ def test_controlled_recovery_rejects_legacy_usd_snapshots_before_mutation(tmp_pa
         path.write_text(json.dumps(payload), encoding="utf-8")
         assignment[f"{field}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
 
-    with pytest.raises(ValueError, match="PhysX-authoritative"):
+    with pytest.raises(ValueError, match="invalid or mixed cloth authority"):
         load_controlled_recovery(assignment)
+
+
+def test_controlled_recovery_accepts_checksum_bound_usd_local_v3_sources(tmp_path) -> None:
+    from lehome.flywheel.recovery_collection import load_controlled_recovery
+
+    assignment = _assignment(tmp_path)
+    for field in ("source_reset", "source_continuation_snapshot"):
+        path = Path(assignment[field])
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["schema_version"] = 3
+        payload["cloth_state_authority"] = "usd_local_points_v1"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        assignment[f"{field}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    assignment["source_snapshot_schema_version"] = 3
+    assignment["source_snapshot_authority"] = "usd_local_points_v1"
+
+    with pytest.raises(ValueError, match="source envelope"):
+        load_controlled_recovery(assignment)
+    assignment["source_only_envelope"] = True
+
+    recovery = load_controlled_recovery(assignment)
+
+    assert recovery.continuation_snapshot.schema_version == 3
+    assert recovery.provenance["source_snapshot_authority"] == "usd_local_points_v1"
+
+
+def test_cuda_legacy_projection_binds_the_projected_readback_and_is_idempotent(tmp_path) -> None:
+    from lehome.flywheel.recovery_collection import bootstrap_controlled_recovery
+
+    assignment = _assignment(tmp_path, teacher=True)
+    for field in ("source_reset", "source_continuation_snapshot"):
+        path = Path(assignment[field])
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["schema_version"] = 3
+        payload["cloth_state_authority"] = "usd_local_points_v1"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        assignment[f"{field}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    assignment["source_snapshot_schema_version"] = 3
+    assignment["source_snapshot_authority"] = "usd_local_points_v1"
+    assignment["source_only_envelope"] = True
+
+    class Env:
+        def __init__(self) -> None:
+            self.state = _snapshot()
+            self.legacy_restores = 0
+
+        def flywheel_restore_state(self, snapshot) -> None:
+            if snapshot.schema_version == 3:
+                self.legacy_restores += 1
+                self._flywheel_legacy_projection_receipt = {
+                    "source_snapshot_authority": "usd_local_points_v1",
+                    "weld_map_identity": "a" * 64,
+                    "welded_vertices_remap_to_orig_sha256": "b" * 64,
+                    "welded_vertices_remap_to_weld_sha256": "c" * 64,
+                }
+                self.state = _snapshot() | {
+                    "robot_position": list(snapshot.robot_position),
+                    "robot_velocity": list(snapshot.robot_velocity),
+                }
+            else:
+                self.state = snapshot.to_dict()
+
+        def flywheel_capture_state(self):
+            return self.state
+
+        def step(self, _action) -> None:
+            return None
+
+        def _get_success(self) -> bool:
+            return True
+
+    env = Env()
+    provenance = bootstrap_controlled_recovery(env, assignment)
+
+    projected = provenance["legacy_usd_projection"]
+    assert env.legacy_restores == 3
+    assert projected["source_snapshot_sha256"] == assignment["source_continuation_snapshot_sha256"]
+    assert projected["source_snapshot_authority"] == "usd_local_points_v1"
+    assert projected["projected_cloth_state_authority"] == "physx_cloth_view_world_v1"
+    assert projected["projected_physical_state_sha256"] == provenance["replay_fidelity"]["expected_state_sha256"]
 
 
 def test_smoke_teacher_probe_requires_success_then_reconstructs_the_verified_boundary(tmp_path) -> None:
@@ -466,7 +547,7 @@ def test_single_materialization_loader_returns_hydrated_rows_and_rejects_identit
     reset.write_text("{}", encoding="utf-8"); annotations.write_text("", encoding="utf-8"); continuation.write_text("{}", encoding="utf-8")
     categories = ["pant_long"] * 4 + ["top_long"] + ["top_short"] * 3
     caps = {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}
-    rows = [{"attempt_id": f"controlled-{index}", "trial_id": f"controlled-{index}", "category": category, "category_acceptance_cap": caps[category], "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v3", "controlled_matrix_sha256": "a" * 64, "perturbation_seed": index, "perturbation_fingerprint": f"{index + 100:064x}", "source_state_perturbation_fingerprint": f"{index + 200:064x}", "source_seed": 50110, "source_continuation_state": [0.0] * 12, "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round", "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}", "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64, "source_continuation_snapshot_sha256": "c" * 64, "prefix_stop": 16, "source_first_success_step": 19, "source_reset": str(reset), "source_annotations": str(annotations), "source_continuation_snapshot": str(continuation)} for index, category in enumerate(categories)]
+    rows = [{"attempt_id": f"controlled-{index}", "trial_id": f"controlled-{index}", "category": category, "category_acceptance_cap": caps[category], "strategy": "canonical", "recovery_kind": "controlled_success_recovery_snapshot_v3", "controlled_matrix_sha256": "a" * 64, "perturbation_seed": index, "perturbation_fingerprint": f"{index + 100:064x}", "source_state_perturbation_fingerprint": f"{index + 200:064x}", "source_seed": 50110, "source_continuation_state": [0.0] * 12, "source_snapshot_schema_version": 2, "source_snapshot_authority": "physx_cloth_view_world_v1", "source_only_envelope": False, "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round", "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}", "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64, "source_continuation_snapshot_sha256": "c" * 64, "prefix_stop": 16, "source_first_success_step": 19, "source_reset": str(reset), "source_annotations": str(annotations), "source_continuation_snapshot": str(continuation)} for index, category in enumerate(categories)]
     descriptor = tmp_path / "materialization.json"
     payload = {"schema_version": 3, "kind": "controlled_success_recovery_materialization_v3", "matrix_sha256": "a" * 64, "target_accepted": 8, "category_acceptance_caps": caps, "rows": rows}
     descriptor.write_text(json.dumps(payload), encoding="utf-8")
@@ -496,7 +577,7 @@ def test_materialization_loader_rejects_unreachable_or_noncanonical_controlled_s
             "controlled_matrix_sha256": "a" * 64, "perturbation_seed": index,
             "perturbation_fingerprint": f"{index + 100:064x}",
             "source_state_perturbation_fingerprint": f"{index + 200:064x}",
-                "source_seed": 50110, "source_continuation_state": [0.0] * 12, "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round",
+                "source_seed": 50110, "source_continuation_state": [0.0] * 12, "source_snapshot_schema_version": 2, "source_snapshot_authority": "physx_cloth_view_world_v1", "source_only_envelope": False, "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round",
             "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}",
             "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64,
             "source_continuation_snapshot_sha256": "c" * 64, "prefix_stop": 16,

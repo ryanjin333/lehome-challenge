@@ -65,6 +65,14 @@ class PhysicsClothAdapter(SceneStateAdapter):
         }
 
 
+class LegacyUsdLocalClothAdapter(SceneStateAdapter):
+    def flywheel_capture_state(self):
+        return {
+            **super().flywheel_capture_state(),
+            "cloth_state_authority": "usd_local_points_v1",
+        }
+
+
 def test_snapshot_round_trip_restores_every_state_group() -> None:
     env = FakeAdapter()
     snapshot = capture_snapshot(env, randomization={"strategy": "canonical"})
@@ -156,3 +164,12 @@ def test_version_three_snapshot_marks_legacy_usd_local_points_explicitly() -> No
     )
 
     assert snapshot.to_dict()["cloth_state_authority"] == "usd_local_points_v1"
+
+
+def test_capture_snapshot_selects_schema_three_from_the_declared_legacy_authority() -> None:
+    snapshot = capture_snapshot(
+        LegacyUsdLocalClothAdapter(), randomization={"strategy": "canonical"}
+    )
+
+    assert snapshot.schema_version == 3
+    assert snapshot.cloth_state_authority == "usd_local_points_v1"

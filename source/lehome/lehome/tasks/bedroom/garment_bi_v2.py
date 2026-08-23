@@ -2,6 +2,8 @@ from __future__ import annotations
 from typing import Any, Dict, List
 from collections.abc import Sequence
 
+import hashlib
+import json
 import os
 import random
 import numpy as np
@@ -147,6 +149,7 @@ class GarmentEnv(DirectRLEnv):
         # Garment recreation changes the composed stage.  Never reuse collider
         # evidence captured for the previous garment in a persistent worker.
         self._flywheel_collider_health = None
+        self._flywheel_legacy_cpu_reset_state = None
 
         # Create new garment object
         try:
@@ -562,9 +565,13 @@ class GarmentEnv(DirectRLEnv):
             right_joint_pos, joint_ids=None, env_ids=env_ids
         )
 
-        # Reset the garment object
+        # Reset the garment object.  CPU source bootstrap owns USD-local
+        # particles and cannot create a particle-cloth view.
         if self.object is not None:
-            self.object.reset()
+            if str(self.device).lower() == "cpu":
+                self._flywheel_reset_legacy_cpu_garment()
+            else:
+                self.object.reset()
 
         # Apply randomization if enabled in config
         if self.texture_cfg.get("enable", False):
@@ -642,7 +649,71 @@ class GarmentEnv(DirectRLEnv):
         return preprocess_device_action(action, teleop_device)
 
     def initialize_obs(self):
-        self.object.initialize()
+        if str(self.device).lower() == "cpu":
+            self._flywheel_initialize_legacy_cpu_garment()
+        else:
+            self.object.initialize()
+
+    def _flywheel_initialize_legacy_cpu_garment(self) -> None:
+        """Initialize the source-only CPU garment from live USD particles."""
+
+        if self.object is None:
+            raise RuntimeError("cannot initialize an absent CPU source garment")
+        try:
+            self.object.set_world_pose(position=self.object.init_pos, orientation=self.object.init_ori)
+            positions, velocities = self._flywheel_legacy_cpu_cloth_state()
+        except (RuntimeError, TypeError, ValueError, AttributeError) as error:
+            raise RuntimeError("CPU source garment initialization lacks live USD cloth state") from error
+        self._flywheel_legacy_cpu_reset_state = (positions.copy(), velocities.copy())
+
+    def _flywheel_reset_legacy_cpu_garment(self) -> None:
+        """Restore the CPU source reset state through USD, never PhysX."""
+
+        initial = getattr(self, "_flywheel_legacy_cpu_reset_state", None)
+        if not (
+            isinstance(initial, tuple)
+            and len(initial) == 2
+            and all(isinstance(value, np.ndarray) for value in initial)
+        ):
+            raise RuntimeError("CPU source reset has no live USD initialization state")
+        positions, velocities = initial
+        try:
+            positions, velocities = self._flywheel_cloth_arrays(positions, velocities)
+            config_get = getattr(self.object, "_get_config_value", None)
+            if not callable(config_get):
+                raise RuntimeError("CPU source garment reset configuration is unavailable")
+            position_range, _ = config_get("soft_reset_pos_range", "common")
+            orientation_range, _ = config_get("soft_reset_rot_range", "common")
+            position_range = np.asarray(position_range, dtype=np.float32)
+            orientation_range = np.asarray(orientation_range, dtype=np.float32)
+            if (
+                position_range.shape != (6,)
+                or orientation_range.shape != (6,)
+                or not np.isfinite(position_range).all()
+                or not np.isfinite(orientation_range).all()
+            ):
+                raise RuntimeError("CPU source garment reset configuration is invalid")
+            position = self.garment_rng.uniform(position_range[:3], position_range[3:])
+            orientation_degrees = self.garment_rng.uniform(orientation_range[:3], orientation_range[3:])
+            from isaacsim.core.utils.rotations import euler_angles_to_quat
+
+            self.object.set_world_pose(position, euler_angles_to_quat(orientation_degrees, degrees=True))
+            self.object.reset_pose = np.concatenate((position, orientation_degrees)).astype(np.float32)
+            positions_attr, velocities_attr = self._flywheel_legacy_cpu_cloth_attributes()
+            if not callable(getattr(positions_attr, "Set", None)) or not callable(getattr(velocities_attr, "Set", None)):
+                raise RuntimeError("CPU source garment USD attributes are not writable")
+            if positions_attr.Set(self._flywheel_legacy_usd_vec3f_array(positions)) is False:
+                raise RuntimeError("CPU source garment USD points write failed")
+            if velocities_attr.Set(self._flywheel_legacy_usd_vec3f_array(velocities)) is False:
+                raise RuntimeError("CPU source garment USD velocities write failed")
+            observed_positions, observed_velocities = self._flywheel_legacy_cpu_cloth_state()
+        except (RuntimeError, TypeError, ValueError, AttributeError) as error:
+            raise RuntimeError("CPU source garment USD reset readback failed") from error
+        if not (
+            np.allclose(observed_positions, positions, rtol=0.0, atol=1e-6)
+            and np.allclose(observed_velocities, velocities, rtol=0.0, atol=1e-6)
+        ):
+            raise RuntimeError("CPU source garment USD reset readback mismatch")
 
     def get_all_pose(self):
         return self.object.get_all_pose()
@@ -1224,7 +1295,13 @@ class GarmentEnv(DirectRLEnv):
             return collider_health
 
         try:
-            positions, velocities = self._flywheel_physics_cloth_state()
+            if str(getattr(self, "device", "")).lower() == "cpu":
+                # CpuSimulationView cannot create a particle-cloth view.  The
+                # exact source-bootstrap path therefore audits the current
+                # authored USD-local state that it will snapshot.
+                positions, velocities = self._flywheel_legacy_cpu_cloth_state()
+            else:
+                positions, velocities = self._flywheel_physics_cloth_state()
         except (RuntimeError, TypeError, ValueError) as error:
             return {
                 "healthy": False,
@@ -1312,7 +1389,12 @@ class GarmentEnv(DirectRLEnv):
 
     def _flywheel_cloth_backend(self) -> str:
         device = str(self.device).lower()
-        if device == "cpu" or device == "cuda" or (device.startswith("cuda:") and device[5:].isdigit()):
+        if device == "cpu":
+            # Historical source capture on CPU owns only the composed USD
+            # local-particle attributes.  Never construct a PhysX view here:
+            # CpuSimulationView does not provide particle-cloth views.
+            return "usd_local_points_v1"
+        if device == "cuda" or (device.startswith("cuda:") and device[5:].isdigit()):
             self._flywheel_physics_cloth_view()
             return "physx_cloth_view"
         raise RuntimeError(f"flywheel cloth state does not support device {self.device!r}")
@@ -1349,9 +1431,17 @@ class GarmentEnv(DirectRLEnv):
         def _numpy(value):
             return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
 
-        if self._flywheel_cloth_backend() != "physx_cloth_view":
-            raise RuntimeError("controlled snapshots require the live PhysX cloth view")
-        positions, velocities = self._flywheel_physics_cloth_state()
+        if str(self.device).lower() == "cpu":
+            # The historically stable source-only CPU path owns USD-local
+            # particles.  Read the live authored values rather than rest
+            # constants so the schema explicitly records its frame.
+            positions, velocities = self._flywheel_legacy_cpu_cloth_state()
+            cloth_state_authority = "usd_local_points_v1"
+        else:
+            if self._flywheel_cloth_backend() != "physx_cloth_view":
+                raise RuntimeError("controlled snapshots require the live PhysX cloth view")
+            positions, velocities = self._flywheel_physics_cloth_state()
+            cloth_state_authority = "physx_cloth_view_world_v1"
         rng_name, rng_keys, rng_pos, rng_gauss, rng_cached = self.garment_rng.get_state()
         return {
             "robot_position": np.concatenate(
@@ -1372,7 +1462,7 @@ class GarmentEnv(DirectRLEnv):
             },
             "garment_name": self.cfg.garment_name,
             "scene_state": self._flywheel_capture_scene_state(),
-            "cloth_state_authority": "physx_cloth_view_world_v1",
+            "cloth_state_authority": cloth_state_authority,
         }
 
     def flywheel_visible_garment_contact(self) -> dict[str, object]:
@@ -1383,9 +1473,44 @@ class GarmentEnv(DirectRLEnv):
         def _numpy(value):
             return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
 
-        if self._flywheel_cloth_backend() != "physx_cloth_view":
-            raise RuntimeError("visible contact requires the live PhysX cloth view")
-        particle_positions, _ = self._flywheel_physics_cloth_state()
+        if str(self.device).lower() == "cpu":
+            # CPU source snapshots are USD-local.  Contact geometry is
+            # world-space, so transform only the current live local positions
+            # through the garment's current world frame; velocities are not a
+            # contact input and are deliberately not translated.
+            local_positions, _ = self._flywheel_legacy_cpu_cloth_state()
+            try:
+                root_position, root_orientation = self.object.get_world_pose()
+                root_position = _numpy(root_position)
+                root_orientation = _numpy(root_orientation)
+                world_scale = _numpy(self.object.get_world_scale())
+            except (RuntimeError, TypeError, ValueError, AttributeError) as error:
+                raise RuntimeError("garment world transform readback API failure") from error
+            if root_position.ndim == 2 and root_position.shape[0] == 1:
+                root_position = root_position[0]
+            if root_orientation.ndim == 2 and root_orientation.shape[0] == 1:
+                root_orientation = root_orientation[0]
+            if root_position.shape != (3,) or root_orientation.shape != (4,):
+                raise RuntimeError("garment world transform has an unsupported shape")
+            if not np.isfinite(root_position).all() or not np.isfinite(root_orientation).all():
+                raise RuntimeError("garment world transform is nonfinite")
+            try:
+                from isaacsim.core.utils.rotations import quat_to_rot_matrix
+
+                rotation = quat_to_rot_matrix(root_orientation)
+                particle_positions, _ = self._flywheel_legacy_local_to_world(
+                    local_positions,
+                    np.zeros_like(local_positions),
+                    root_position,
+                    rotation,
+                    world_scale,
+                )
+            except (RuntimeError, TypeError, ValueError, AttributeError) as error:
+                raise RuntimeError("legacy CPU garment world transform is unavailable") from error
+        else:
+            if self._flywheel_cloth_backend() != "physx_cloth_view":
+                raise RuntimeError("visible contact requires the live PhysX cloth view")
+            particle_positions, _ = self._flywheel_physics_cloth_state()
         gripper_positions = []
         for arm in (self.left_arm, self.right_arm):
             names = getattr(arm, "body_names", None)
@@ -1414,6 +1539,7 @@ class GarmentEnv(DirectRLEnv):
         authority = getattr(snapshot, "cloth_state_authority", None)
         legacy_local = schema_version == 3 and authority == "usd_local_points_v1"
         legacy_cpu = device_name == "cpu" and (schema_version == 1 or legacy_local)
+        self._flywheel_legacy_projection_receipt = None
         cloth_position, cloth_velocity = self._flywheel_cloth_arrays(
             snapshot.cloth_position, snapshot.cloth_velocity
         )
@@ -1436,6 +1562,22 @@ class GarmentEnv(DirectRLEnv):
             welded_vertices_remap_to_orig, welded_vertices_remap_to_weld = (
                 self._flywheel_physx_weld_maps()
             )
+            def weld_digest(value) -> str:
+                vector = np.asarray(value)
+                if vector.ndim != 1 or vector.dtype.kind not in "iu":
+                    raise SimulatorNumericalDivergenceError(
+                        "legacy USD to PhysX cloth topology map digest is invalid"
+                    )
+                return hashlib.sha256(vector.astype(np.int64, copy=False).tobytes()).hexdigest()
+
+            weld_digests = {
+                "welded_vertices_remap_to_orig_sha256": weld_digest(welded_vertices_remap_to_orig),
+                "welded_vertices_remap_to_weld_sha256": weld_digest(welded_vertices_remap_to_weld),
+            }
+            weld_map_identity = hashlib.sha256(json.dumps({
+                "mesh_prim_path": str(self.object.mesh_prim_path),
+                **weld_digests,
+            }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
             cloth_position, cloth_velocity = self._flywheel_project_legacy_usd_to_physx(
                 cloth_position, cloth_velocity, asset_points, live_rest_world,
                 welded_vertices_remap_to_orig, welded_vertices_remap_to_weld,
@@ -1520,6 +1662,12 @@ class GarmentEnv(DirectRLEnv):
             "pose": restored_pose.copy(),
         }
         self._flywheel_randomization_receipt = dict(snapshot.randomization)
+        if legacy_local and not legacy_cpu:
+            self._flywheel_legacy_projection_receipt = {
+                "source_snapshot_authority": "usd_local_points_v1",
+                "weld_map_identity": weld_map_identity,
+                **weld_digests,
+            }
 
     def apply_flywheel_randomization(self, randomization) -> dict[str, object]:
         """Apply opt-in rollout perturbations and return values read back from Isaac.

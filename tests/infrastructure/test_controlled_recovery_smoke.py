@@ -51,12 +51,40 @@ def _artifacts(tmp_path: Path) -> dict[str, str]:
         garment = f"{category}-seen"
         state = [16.0] * 12
         fingerprint = _state_fingerprint(category=category, garment=garment, state=state)
-        selected.append({"source_round_id": "round", "source_episode_id": episode, "source_episode_digest": digest, "source_immutable_revision": "a" * 40, "category": category, "garment": garment, "fingerprint": fingerprint, "continuation_start": {"annotation_index": 16, "step": 16, "policy_request_id": "request-1", "policy_chunk_offset": 0, "policy_observation_state": state, "state": state, "state_fingerprint": fingerprint, "snapshot_relative_path": "snapshots/continuations/000016.json", "snapshot_sha256": continuation_hash, "snapshot_continuation_step": 16, "snapshot_robot_position": state}, "recovery_event": {"adverse_start": 15, "recovery_confirmation": 18}, "source_artifacts": {"package_sync_digest": digest, "raw_checksum_manifest_sha256": manifest_hash, "episode_manifest_sha256": episode_hash, "annotations_sha256": annotations_hash, "reset_sha256": reset_hash}})
-    audit = {"schema_version": 4, "kind": "lehome_successful_recovery_audit", "continuation_contract": "authenticated_physx_cloth_view_snapshot_at_fresh_h16_next_action_boundary_v1", "semantic_sha256": "", "selected_recoveries": selected, "shortfalls": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}}
+        selected.append({"source_round_id": "round", "source_episode_id": episode, "source_episode_digest": digest, "source_immutable_revision": "a" * 40, "source_only_envelope": False, "category": category, "garment": garment, "fingerprint": fingerprint, "continuation_start": {"annotation_index": 16, "step": 16, "policy_request_id": "request-1", "policy_chunk_offset": 0, "policy_observation_state": state, "state": state, "state_fingerprint": fingerprint, "snapshot_relative_path": "snapshots/continuations/000016.json", "snapshot_sha256": continuation_hash, "snapshot_schema_version": 2, "snapshot_cloth_state_authority": "physx_cloth_view_world_v1", "reset_snapshot_schema_version": 2, "reset_snapshot_cloth_state_authority": "physx_cloth_view_world_v1", "snapshot_continuation_step": 16, "snapshot_robot_position": state}, "recovery_event": {"adverse_start": 15, "recovery_confirmation": 18}, "source_artifacts": {"package_sync_digest": digest, "raw_checksum_manifest_sha256": manifest_hash, "episode_manifest_sha256": episode_hash, "annotations_sha256": annotations_hash, "reset_sha256": reset_hash}})
+    audit = {"schema_version": 4, "kind": "lehome_successful_recovery_audit", "continuation_contract": "authenticated_cloth_snapshot_at_fresh_h16_next_action_boundary_v2", "semantic_sha256": "", "selected_recoveries": selected, "shortfalls": {"pant_long": 4, "top_long": 1, "top_short": 3, "pant_short": 0}}
     audit["semantic_sha256"] = hashlib.sha256(json.dumps({key: value for key, value in audit.items() if key != "semantic_sha256"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     audit_path = tmp_path / "audit.json"; _write(audit_path, audit)
     audit_path.with_suffix(".json.sha256").write_text(hashlib.sha256(audit_path.read_bytes()).hexdigest() + "\n", encoding="ascii")
     return build_controlled_recovery_matrix(audit_path=audit_path, accepted_roots=[accepted], output=tmp_path / "matrix.json", max_attempts=8)
+
+
+def test_builder_rejects_the_legacy_physx_named_audit_contract(tmp_path: Path) -> None:
+    from scripts.build_controlled_recovery_matrix import build_controlled_recovery_matrix
+
+    _artifacts(tmp_path)
+    audit_path = tmp_path / "audit.json"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit["continuation_contract"] = "authenticated_physx_cloth_view_snapshot_at_fresh_h16_next_action_boundary_v1"
+    audit["semantic_sha256"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in audit.items() if key != "semantic_sha256"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    _write(audit_path, audit)
+    audit_path.with_suffix(".json.sha256").write_text(
+        hashlib.sha256(audit_path.read_bytes()).hexdigest() + "\n", encoding="ascii"
+    )
+
+    with pytest.raises(ValueError, match="recovery audit semantic identity mismatch"):
+        build_controlled_recovery_matrix(
+            audit_path=audit_path,
+            accepted_roots=[tmp_path / "accepted"],
+            output=tmp_path / "legacy-contract-matrix.json",
+            max_attempts=8,
+        )
 
 
 def _fake_base(path: Path, *, terminal: str = "accepted", receipt_ok: bool = True) -> None:
@@ -512,7 +540,7 @@ def test_base_campaign_admits_bounded_same_category_source_discovery_tuple(tmp_p
         "LEHOME_WORKER_COUNT": "1",
         "LEHOME_MAX_ATTEMPTS": "3",
         "LEHOME_TARGET_ACCEPTED": "2",
-        "LEHOME_SIMULATOR_DEVICE": "cuda:0",
+        "LEHOME_SIMULATOR_DEVICE": "cpu",
         "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP": "1",
         "LEHOME_ENABLE_HF_UPLOAD": "1",
         "LEHOME_SKIP_ROUND_SEAL": "1",
@@ -523,6 +551,45 @@ def test_base_campaign_admits_bounded_same_category_source_discovery_tuple(tmp_p
     runner = REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh"
     result = subprocess.run(["/bin/bash", str(runner)], env=env, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(("attempts", "target"), [("0", "1"), ("17", "1"), ("3", "0"), ("3", "4")])
+def test_base_campaign_rejects_cpu_source_discovery_outside_bounded_attempt_tuple(
+    tmp_path: Path, attempts: str, target: str,
+) -> None:
+    rows = [
+        {
+            "snapshot_source_bootstrap": True,
+            "category": "top_long",
+            "garment": "Top_Long_Seen_0",
+            "seed": 107 + index,
+            "source_seed": 107 + index,
+        }
+        for index in range(3)
+    ]
+    matrix = tmp_path / "sources.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    digest = hashlib.sha256(matrix.read_bytes()).hexdigest()
+    run_id = "b" * 32
+    identity = hashlib.sha256(f"{run_id}:{digest}".encode("ascii")).hexdigest()[:20]
+    env = {
+        **os.environ,
+        "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "run"),
+        "LEHOME_ATTEMPT_MATRIX": str(matrix), "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+        "LEHOME_RUN_ID": run_id, "LEHOME_ROUND_ID": f"snapshot-source-bootstrap-{identity}-unsealed-source",
+        "LEHOME_WORKER_COUNT": "1", "LEHOME_MAX_ATTEMPTS": attempts, "LEHOME_TARGET_ACCEPTED": target,
+        "LEHOME_SIMULATOR_DEVICE": "cpu", "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP": "1",
+        "LEHOME_ENABLE_HF_UPLOAD": "1", "LEHOME_SKIP_ROUND_SEAL": "1",
+        "LEHOME_RESUME_PREEMPTED_ROLLOUT": "0", "LEHOME_MAX_WORKER_RESTARTS": "0", "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+    }
+
+    result = subprocess.run(
+        ["/bin/bash", str(REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh")],
+        env=env, text=True, capture_output=True, check=False,
+    )
+
+    assert result.returncode == 2
+    assert "CPU cloth requires the exact unsealed snapshot-source bootstrap tuple" in result.stderr
 
 
 def test_base_campaign_rejects_source_discovery_with_nonzero_restart_count(tmp_path: Path) -> None:
@@ -764,8 +831,7 @@ def test_snapshot_source_bootstrap_is_a_separate_one_worker_unsealed_tuple() -> 
     assert 'LEHOME_WORKER_COUNT=1 LEHOME_MAX_ATTEMPTS="${SOURCE_ROW_COUNT}" LEHOME_TARGET_ACCEPTED="${TARGET_ACCEPTED}"' in source
     assert "LEHOME_MAX_WORKER_RESTARTS=0" in source
     assert "LEHOME_ENABLE_HF_UPLOAD=1 LEHOME_SKIP_ROUND_SEAL=1 LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP=1" in source
-    assert "LEHOME_SIMULATOR_DEVICE=cuda:0" in source
-    assert "LEHOME_SIMULATOR_DEVICE=cpu" not in source
+    assert "LEHOME_SIMULATOR_DEVICE=cpu" in source
     assert "fresh absent run root; resume is forbidden" in source
     assert "readback_verified" in source
     assert "--role sealer" not in source
@@ -797,18 +863,18 @@ def test_snapshot_source_bootstrap_passes_a_nondefault_descriptor_garment_before
     assert result.returncode == 3
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Pant_Long_Seen_4",
-        "simulator_device": "cuda:0",
+        "simulator_device": "cpu",
         "max_worker_restarts": "0",
     }
 
 
-def test_snapshot_source_bootstrap_forces_the_cuda_particle_cloth_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_snapshot_source_bootstrap_forces_the_cpu_source_cloth_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LEHOME_SIMULATOR_DEVICE", "cpu")
     result, root = _run_snapshot_source_bootstrap(tmp_path / "cuda-source", "rejected")
     assert result.returncode == 3
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Top_Long_Seen_0",
-        "simulator_device": "cuda:0",
+        "simulator_device": "cpu",
         "max_worker_restarts": "0",
     }
 
@@ -864,11 +930,11 @@ def test_snapshot_source_bootstrap_requires_a_usable_authenticated_h16_source(tm
 
 
 @pytest.mark.parametrize("case", ["reset-v3", "continuation-v3", "continuation-wrong-authority"])
-def test_snapshot_source_bootstrap_rejects_non_physx_v2_snapshot_evidence_before_publication(tmp_path: Path, case: str) -> None:
+def test_snapshot_source_bootstrap_rejects_malformed_or_mixed_snapshot_authority_before_publication(tmp_path: Path, case: str) -> None:
     result, root = _run_snapshot_source_bootstrap(tmp_path / case, case)
 
     assert result.returncode == 4, result.stderr
-    assert "PhysX-authoritative v2 source snapshots" in result.stderr
+    assert "incompatible schema" in result.stderr
     assert not (root / "snapshot-source-bootstrap.envelope.json").exists()
 
 
@@ -898,7 +964,7 @@ def test_snapshot_source_bootstrap_writes_one_audit_only_envelope_atomically(tmp
     assert len(payload["episode_sha256s"]) == len(payload["immutable_revisions"]) == 1
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Top_Long_Seen_0",
-        "simulator_device": "cuda:0",
+        "simulator_device": "cpu",
         "max_worker_restarts": "0",
     }
     assert not list(root.glob("*.strict.seal.json"))

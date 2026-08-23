@@ -420,6 +420,34 @@ def test_worker_refuses_a_cloth_device_that_does_not_match_its_assignment(tmp_pa
         worker.run()
 
 
+def test_cpu_source_worker_accepts_usd_local_receipt_but_cuda_rejects_it(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    cpu_session = FakeSession()
+    cpu_session.runtime_receipt.update({
+        "simulation_device": "cpu",
+        "cloth_device": "cpu",
+        "cloth_backend": "usd_local_points_v1",
+    })
+    cpu_worker = PersistentRolloutWorker(
+        worker_id="worker-cpu", session_id="session-cpu", controller=FakeController([]),
+        simulator_factory=lambda: cpu_session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0", simulator_device="cpu",
+    )
+
+    assert cpu_worker._validate_runtime_receipt(cpu_session)["cloth_backend"] == "usd_local_points_v1"
+
+    cuda_session = FakeSession()
+    cuda_session.runtime_receipt["cloth_backend"] = "usd_local_points_v1"
+    cuda_worker = PersistentRolloutWorker(
+        worker_id="worker-cuda", session_id="session-cuda", controller=FakeController([]),
+        simulator_factory=lambda: cuda_session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+    with pytest.raises(ValueError, match="PhysX cloth backend"):
+        cuda_worker._validate_runtime_receipt(cuda_session)
+
+
 def test_worker_rejects_missing_or_mismatched_actual_policy_device(tmp_path) -> None:
     from lehome.flywheel.persistent_worker import PersistentRolloutWorker
     import pytest
@@ -654,7 +682,7 @@ def test_runtime_rejects_cpu_cloth_for_a_non_source_matrix_before_opening_the_le
         max_attempts=1, target_accepted=1,
     )
 
-    with pytest.raises(ValueError, match="CPU cloth is reserved for one-row snapshot-source bootstrap"):
+    with pytest.raises(ValueError, match="CPU cloth is reserved"):
         run(args, ledger_factory=ledger_factory)
     assert opened_ledger == []
 
@@ -680,9 +708,64 @@ def test_runtime_rejects_a_cpu_source_descriptor_with_mismatched_seed_before_led
         max_attempts=1, target_accepted=1,
     )
 
-    with pytest.raises(ValueError, match="CPU cloth is reserved for one-row snapshot-source bootstrap"):
+    with pytest.raises(ValueError, match="CPU cloth is reserved"):
         run(args, ledger_factory=ledger_factory)
     assert opened_ledger == []
+
+
+def test_runtime_admits_bounded_multirow_cpu_source_discovery_before_ledger(tmp_path) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    rows = [_source_assignment(50_110 + index) for index in range(3)]
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    opened: list[object] = []
+
+    def ledger_factory(*args, **kwargs):
+        opened.append((args, kwargs))
+        raise RuntimeError("ledger reached")
+
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=3, target_accepted=2,
+    )
+
+    with pytest.raises(RuntimeError, match="ledger reached"):
+        run(args, ledger_factory=ledger_factory)
+
+    assert len(opened) == 1
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda rows: rows.__setitem__(1, {**rows[1], "category": "top_short"}),
+    lambda rows: rows.__setitem__(1, {**rows[1], "source_seed": True}),
+    lambda rows: rows.__setitem__(1, {**rows[1], "recovery_kind": "controlled_success_recovery_snapshot_v3"}),
+])
+def test_runtime_rejects_mixed_or_tampered_cpu_source_discovery_before_ledger(tmp_path, mutate) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    rows = [_source_assignment(50_110 + index) for index in range(3)]
+    mutate(rows)
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    opened: list[bool] = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened.append(True)
+        raise AssertionError("invalid CPU source discovery must fail before the ledger opens")
+
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=3, target_accepted=2,
+    )
+
+    with pytest.raises(ValueError):
+        run(args, ledger_factory=ledger_factory)
+    assert opened == []
 
 
 def test_worker_heartbeats_while_an_episode_blocks_and_stops_the_timer(tmp_path) -> None:
@@ -1075,8 +1158,9 @@ def test_runtime_worker_loads_generated_controlled_materialization_shape(tmp_pat
             "perturbation_fingerprint": f"{index + 100:064x}",
             "source_state_perturbation_fingerprint": f"{index + 200:064x}",
             "source_state_fingerprint": f"{index + 300:064x}", "source_round_id": "round",
-            "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}",
-            "source_seed": 50110, "source_continuation_state": [float(index)] * 12,
+                "source_episode_id": f"episode-{index}", "source_episode_digest": f"{index + 400:064x}",
+                "source_seed": 50110, "source_continuation_state": [float(index)] * 12,
+                "source_snapshot_schema_version": 2, "source_snapshot_authority": "physx_cloth_view_world_v1", "source_only_envelope": False,
             "source_immutable_revision": "a" * 40,
             "source_reset_sha256": "a" * 64, "source_annotations_sha256": "b" * 64,
             "source_continuation_snapshot_sha256": "c" * 64, "prefix_stop": 16,

@@ -605,7 +605,7 @@ def _write_persistent_flywheel_manifest(
             "source_annotations", "source_annotations_sha256", "source_first_success_step",
             "source_continuation_snapshot", "source_continuation_snapshot_sha256",
             "source_continuation_snapshot_relative_path", "prefix_stop", "perturbation_profile",
-            "perturbation_seed", "source_seed", "source_continuation_state", "source_state_fingerprint", "perturbation_fingerprint",
+            "perturbation_seed", "source_seed", "source_continuation_state", "source_state_fingerprint", "source_snapshot_schema_version", "source_snapshot_authority", "source_only_envelope", "perturbation_fingerprint",
             "source_state_perturbation_fingerprint", "category_acceptance_cap",
             "controlled_smoke", "controlled_smoke_teacher_probe",
         }
@@ -678,12 +678,15 @@ class EvaluationSession:
         backend = getattr(self.env, "_flywheel_cloth_backend", None)
         if not callable(backend):
             raise ValueError("persistent evaluation cannot observe the cloth backend")
-        if backend() != "physx_cloth_view":
-            raise ValueError("persistent evaluation requires the live PhysX cloth backend")
+        cloth_backend = backend()
+        expected_backend = "usd_local_points_v1" if simulation_device == "cpu" else "physx_cloth_view"
+        if cloth_backend != expected_backend:
+            expected_name = "USD-local CPU" if simulation_device == "cpu" else "live PhysX"
+            raise ValueError(f"persistent evaluation requires the {expected_name} cloth backend")
         receipt = {
             "simulation_device": simulation_device,
             "cloth_device": simulation_device,
-            "cloth_backend": backend(),
+            "cloth_backend": cloth_backend,
             "renderer_device": renderer_device,
             "camera_device": camera_device,
             "policy_device": str(getattr(self.policy, "runtime_device", "")),
@@ -693,16 +696,21 @@ class EvaluationSession:
         # may still own the GPU startup path. Fresh cloth/contact evidence is
         # collected only after the episode reset.
         if getattr(self, "_include_live_runtime_evidence", False):
-            readback = getattr(self.env, "_flywheel_physics_cloth_state", None)
+            readback_name = (
+                "_flywheel_legacy_cpu_cloth_state"
+                if simulation_device == "cpu"
+                else "_flywheel_physics_cloth_state"
+            )
+            readback = getattr(self.env, readback_name, None)
             if not callable(readback):
-                raise ValueError("persistent evaluation cannot observe PhysX cloth readback")
+                raise ValueError("persistent evaluation cannot observe live cloth readback")
             positions, velocities = readback()
             try:
                 position_count, velocity_count = len(positions), len(velocities)
             except TypeError as error:
-                raise ValueError("persistent evaluation PhysX cloth readback is unavailable") from error
+                raise ValueError("persistent evaluation live cloth readback is unavailable") from error
             if position_count <= 0 or velocity_count <= 0 or position_count != velocity_count:
-                raise ValueError("persistent evaluation PhysX cloth readback is invalid")
+                raise ValueError("persistent evaluation live cloth readback is invalid")
             receipt["cloth_readback"] = {"positions": position_count, "velocities": velocity_count}
         if getattr(self, "_include_contact_canary", False):
             canary = getattr(self.env, "flywheel_visible_garment_contact", None)

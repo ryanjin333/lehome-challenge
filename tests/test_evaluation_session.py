@@ -764,7 +764,7 @@ def test_garment_recreation_invalidates_the_composed_stage_collider_audit() -> N
     assert "self._flywheel_collider_health = None" in method_source
 
 
-def test_cpu_visible_contact_uses_the_same_authoritative_physx_readback_as_runtime_evidence() -> None:
+def test_cpu_visible_contact_uses_live_usd_local_particles_without_constructing_a_physx_view() -> None:
     source_path = (
         Path(__file__).resolve().parents[1]
         / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
@@ -779,9 +779,182 @@ def test_cpu_visible_contact_uses_the_same_authoritative_physx_readback_as_runti
     )
     method_source = ast.get_source_segment(source, method)
     assert method_source is not None
-    assert "self._flywheel_physics_cloth_state()" in method_source
-    assert "self._flywheel_cpu_cloth_state()" not in method_source
+    assert 'str(self.device).lower() == "cpu"' in method_source
+    assert "self._flywheel_legacy_cpu_cloth_state()" in method_source
+    assert "self._flywheel_legacy_local_to_world(" in method_source
     assert "get_current_mesh_points" not in method_source
+
+
+def test_cpu_cloth_backend_never_constructs_a_physx_view() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_flywheel_cloth_backend"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace: dict[str, object] = {}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    env = types.SimpleNamespace(
+        device="cpu",
+        _flywheel_physics_cloth_view=lambda: (_ for _ in ()).throw(
+            AssertionError("CPU backend must not create a PhysX cloth view")
+        ),
+    )
+
+    assert namespace["_flywheel_cloth_backend"](env) == "usd_local_points_v1"
+
+
+def test_cpu_initialize_obs_bypasses_the_external_physx_initializer() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "initialize_obs"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace: dict[str, object] = {}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    initialized: list[str] = []
+    env = types.SimpleNamespace(
+        device="cpu",
+        object=types.SimpleNamespace(initialize=lambda: (_ for _ in ()).throw(
+            AssertionError("CPU initialize must not construct a PhysX cloth view")
+        )),
+        _flywheel_initialize_legacy_cpu_garment=lambda: initialized.append("usd-local"),
+    )
+
+    namespace["initialize_obs"](env)
+
+    assert initialized == ["usd-local"]
+
+
+def test_cpu_reset_restores_live_usd_state_without_physx(monkeypatch) -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_flywheel_reset_legacy_cpu_garment"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    isaacsim = types.ModuleType("isaacsim")
+    core = types.ModuleType("isaacsim.core")
+    utils = types.ModuleType("isaacsim.core.utils")
+    rotations = types.ModuleType("isaacsim.core.utils.rotations")
+    rotations.euler_angles_to_quat = lambda _value, **_kwargs: np.asarray([1.0, 0.0, 0.0, 0.0])
+    isaacsim.core, core.utils, utils.rotations = core, utils, rotations
+    for name, value in {
+        "isaacsim": isaacsim,
+        "isaacsim.core": core,
+        "isaacsim.core.utils": utils,
+        "isaacsim.core.utils.rotations": rotations,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, value)
+    state = {
+        "positions": np.zeros((1, 3), dtype=np.float32),
+        "velocities": np.zeros((1, 3), dtype=np.float32),
+    }
+    class Attribute:
+        def __init__(self, key): self.key = key
+        def Set(self, value): state[self.key] = np.asarray(value, dtype=np.float32)
+    pose_writes: list[tuple[np.ndarray, np.ndarray]] = []
+    env = types.SimpleNamespace(
+        _flywheel_legacy_cpu_reset_state=(
+            np.asarray([[0.2, 0.1, 0.7]], dtype=np.float32), np.zeros((1, 3), dtype=np.float32)
+        ),
+        garment_rng=np.random.RandomState(7),
+        object=types.SimpleNamespace(
+            _get_config_value=lambda _key, _source: ([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "config"),
+            set_world_pose=lambda position, orientation: pose_writes.append((position, orientation)),
+            _ensure_physics_cloth_view=lambda: (_ for _ in ()).throw(
+                AssertionError("CPU reset must not construct a PhysX cloth view")
+            ),
+        ),
+        _flywheel_cloth_arrays=lambda positions, velocities: (np.asarray(positions), np.asarray(velocities)),
+        _flywheel_legacy_cpu_cloth_attributes=lambda: (Attribute("positions"), Attribute("velocities")),
+        _flywheel_legacy_usd_vec3f_array=lambda values: values,
+        _flywheel_legacy_cpu_cloth_state=lambda: (state["positions"], state["velocities"]),
+    )
+
+    namespace["_flywheel_reset_legacy_cpu_garment"](env)
+
+    assert pose_writes and np.allclose(state["positions"], [[0.2, 0.1, 0.7]])
+
+
+def test_cpu_visible_contact_transforms_live_usd_local_points_without_physx(monkeypatch) -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "flywheel_visible_garment_contact"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    isaacsim = types.ModuleType("isaacsim")
+    core = types.ModuleType("isaacsim.core")
+    utils = types.ModuleType("isaacsim.core.utils")
+    rotations = types.ModuleType("isaacsim.core.utils.rotations")
+    rotations.quat_to_rot_matrix = lambda _quat: np.eye(3, dtype=np.float32)
+    isaacsim.core, core.utils, utils.rotations = core, utils, rotations
+    monkeypatch.setitem(sys.modules, "isaacsim", isaacsim)
+    monkeypatch.setitem(sys.modules, "isaacsim.core", core)
+    monkeypatch.setitem(sys.modules, "isaacsim.core.utils", utils)
+    monkeypatch.setitem(sys.modules, "isaacsim.core.utils.rotations", rotations)
+    contact = types.ModuleType("lehome.flywheel.contact")
+    contact.visible_contact_from_simulator_geometry = lambda particles, grippers: {
+        "observed": bool(np.allclose(particles, grippers)),
+        "particles": particles.tolist(),
+    }
+    monkeypatch.setitem(sys.modules, "lehome.flywheel.contact", contact)
+
+    env = types.SimpleNamespace(
+        device="cpu",
+        object=types.SimpleNamespace(
+            get_world_pose=lambda: (np.asarray([1.0, 2.0, 3.0]), np.asarray([1.0, 0.0, 0.0, 0.0])),
+            get_world_scale=lambda: np.ones(3),
+        ),
+        left_arm=types.SimpleNamespace(
+            body_names=["left_gripper"],
+            data=types.SimpleNamespace(body_pos_w=np.asarray([[[1.0, 2.0, 3.0]]])),
+        ),
+        right_arm=types.SimpleNamespace(
+            body_names=["right_gripper"],
+            data=types.SimpleNamespace(body_pos_w=np.asarray([[[1.0, 2.0, 3.0]]])),
+        ),
+        _flywheel_legacy_cpu_cloth_state=lambda: (
+            np.zeros((1, 3), dtype=np.float32), np.zeros((1, 3), dtype=np.float32)
+        ),
+        _flywheel_physics_cloth_state=lambda: (_ for _ in ()).throw(
+            AssertionError("CPU contact must not create a PhysX cloth view")
+        ),
+        _flywheel_legacy_local_to_world=lambda points, velocities, position, _rotation, _scale: (
+            points + position, velocities
+        ),
+    )
+
+    evidence = namespace["flywheel_visible_garment_contact"](env)
+
+    assert evidence == {"observed": True, "particles": [[1.0, 2.0, 3.0]]}
 
 
 def test_garment_initializes_the_physx_cloth_view_on_cpu_and_cuda() -> None:
@@ -996,6 +1169,67 @@ def test_garment_restore_keeps_legacy_cpu_replay_separate_from_controlled_physx_
     assert "_flywheel_legacy_cpu_cloth_attributes" in method_source
     assert "schema_version == 2" in method_source
     assert 'cloth_state_authority", None) == "physx_cloth_view_world_v1"' in method_source
+
+
+def test_cpu_source_capture_reads_live_usd_local_points_and_velocities() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "flywheel_capture_state"
+    )
+    method_source = ast.get_source_segment(source, method)
+    assert method_source is not None
+    assert 'str(self.device).lower() == "cpu"' in method_source
+    assert "self._flywheel_legacy_cpu_cloth_state()" in method_source
+    assert 'cloth_state_authority = "usd_local_points_v1"' in method_source
+
+
+def test_cpu_source_reset_and_h16_capture_use_live_usd_local_state_without_physx() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "flywheel_capture_state"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    samples = iter((
+        (np.asarray([[0.1, 0.2, 0.3]], dtype=np.float32), np.zeros((1, 3), dtype=np.float32)),
+        (np.asarray([[0.4, 0.5, 0.6]], dtype=np.float32), np.ones((1, 3), dtype=np.float32)),
+    ))
+    arm = types.SimpleNamespace(data=types.SimpleNamespace(
+        joint_pos=np.zeros((1, 6), dtype=np.float32), joint_vel=np.zeros((1, 6), dtype=np.float32),
+    ))
+    env = types.SimpleNamespace(
+        device="cpu", object=object(), left_arm=arm, right_arm=arm,
+        cfg=types.SimpleNamespace(garment_name="Top_Long_Seen_0"),
+        garment_rng=types.SimpleNamespace(
+            get_state=lambda: ("MT19937", np.asarray([1, 2], dtype=np.uint32), 3, 0, 0.0)
+        ),
+        _flywheel_legacy_cpu_cloth_state=lambda: next(samples),
+        _flywheel_physics_cloth_state=lambda: (_ for _ in ()).throw(
+            AssertionError("CPU capture must not create a PhysX cloth view")
+        ),
+        _flywheel_capture_scene_state=lambda: {"scene": "live"},
+    )
+
+    reset, h16 = namespace["flywheel_capture_state"](env), namespace["flywheel_capture_state"](env)
+
+    assert reset["cloth_state_authority"] == h16["cloth_state_authority"] == "usd_local_points_v1"
+    assert np.allclose(reset["cloth_position"], [[0.1, 0.2, 0.3]])
+    assert np.allclose(h16["cloth_position"], [[0.4, 0.5, 0.6]])
 
 
 def test_legacy_cpu_cloth_snapshot_is_transformed_from_local_to_world_for_cuda() -> None:
@@ -1435,6 +1669,22 @@ def _cloth_evidence(env) -> None:
     env.flywheel_visible_garment_contact = lambda: {"observed": False}
 
 
+def _cpu_cloth_evidence(env) -> None:
+    if not hasattr(env, "renderer_device"):
+        env.renderer_device = "cuda:0"
+    if not hasattr(env, "camera_device"):
+        env.camera_device = env.renderer_device
+    env._flywheel_cloth_backend = lambda: "usd_local_points_v1"
+    env._flywheel_legacy_cpu_cloth_state = lambda: (
+        np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        np.zeros((1, 3), dtype=np.float32),
+    )
+    env._flywheel_physics_cloth_state = lambda: (_ for _ in ()).throw(
+        AssertionError("CPU source evidence must not construct a PhysX cloth view")
+    )
+    env.flywheel_visible_garment_contact = lambda: {"observed": False}
+
+
 def _evaluation(monkeypatch):
     """Load the session boundary without installing Isaac or torch."""
     repository = Path(__file__).resolve().parents[1]
@@ -1584,6 +1834,35 @@ def test_cloth_physical_health_rejects_finite_but_astronomical_state() -> None:
     health = namespace["flywheel_cloth_physical_health"](divergent)
     assert health["healthy"] is False
     assert health["reason"] == "simulator_numerical_divergence"
+
+
+def test_cpu_cloth_health_uses_live_usd_local_state_without_physx() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "flywheel_cloth_physical_health"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    env = types.SimpleNamespace(
+        device="cpu",
+        flywheel_collider_health=lambda: {"healthy": True},
+        _flywheel_legacy_cpu_cloth_state=lambda: (
+            np.asarray([[0.2, 0.1, 0.7], [0.3, 0.1, 0.7]], dtype=np.float32),
+            np.zeros((2, 3), dtype=np.float32),
+        ),
+        _flywheel_physics_cloth_state=lambda: (_ for _ in ()).throw(
+            AssertionError("CPU health must not create a PhysX cloth view")
+        ),
+    )
+
+    assert namespace["flywheel_cloth_physical_health"](env)["healthy"] is True
 
 
 def test_cloth_physical_health_reports_every_exceeded_metric_to_the_admission_gate() -> None:
@@ -1887,16 +2166,31 @@ def test_source_bootstrap_runtime_receipt_preserves_cpu_cloth_with_cuda_renderin
     evaluation = _evaluation(monkeypatch)
 
     env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
-    _cloth_evidence(env)
+    _cpu_cloth_evidence(env)
     args = types.SimpleNamespace(device="cpu", renderer_device="cuda:0", camera_device="cuda:0")
     policy = types.SimpleNamespace(runtime_device="cuda:0")
     session = evaluation.EvaluationSession(args, env=env, policy=policy, env_cfg=env.cfg)
+    session._include_live_runtime_evidence = True
 
     assert session.runtime_receipt["simulation_device"] == "cpu"
     assert session.runtime_receipt["cloth_device"] == "cpu"
+    assert session.runtime_receipt["cloth_backend"] == "usd_local_points_v1"
+    assert session.runtime_receipt["cloth_readback"] == {"positions": 1, "velocities": 1}
     assert session.runtime_receipt["renderer_device"] == "cuda:0"
     assert session.runtime_receipt["camera_device"] == "cuda:0"
     assert session.runtime_receipt["policy_device"] == "cuda:0"
+
+
+def test_cuda_runtime_receipt_rejects_usd_local_backend_mismatch(monkeypatch) -> None:
+    evaluation = _evaluation(monkeypatch)
+    env = types.SimpleNamespace(device="cuda:0", cfg=types.SimpleNamespace())
+    _cpu_cloth_evidence(env)
+    args = types.SimpleNamespace(device="cuda:0", renderer_device="cuda:0", camera_device="cuda:0")
+
+    session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
+
+    with __import__("pytest").raises(ValueError, match="PhysX cloth backend"):
+        session.runtime_receipt
 
 
 def test_cuda_cloth_runtime_receipt_uses_observed_renderer_and_camera_devices(monkeypatch) -> None:
@@ -2176,6 +2470,9 @@ def test_persistent_manifest_hands_controlled_recovery_identity_to_validator(mon
         "source_immutable_revision": "b" * 40,
         "source_seed": 50110,
         "source_continuation_state": continuation_state,
+        "source_snapshot_schema_version": 2,
+        "source_snapshot_authority": "physx_cloth_view_world_v1",
+        "source_only_envelope": False,
         "source_state_fingerprint": state_fingerprint,
         "perturbation_fingerprint": "d" * 64,
         "source_state_perturbation_fingerprint": "e" * 64,
