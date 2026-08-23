@@ -837,6 +837,57 @@ def test_cpu_initialize_obs_bypasses_the_external_physx_initializer() -> None:
     assert initialized == ["usd-local"]
 
 
+def test_cpu_scene_pose_write_never_calls_physx_particle_restore(monkeypatch) -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "set_all_pose"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    isaacsim = types.ModuleType("isaacsim")
+    core = types.ModuleType("isaacsim.core")
+    utils = types.ModuleType("isaacsim.core.utils")
+    rotations = types.ModuleType("isaacsim.core.utils.rotations")
+    rotations.euler_angles_to_quat = lambda value, **_kwargs: np.asarray(
+        [1.0, *np.asarray(value, dtype=np.float32)], dtype=np.float32
+    )
+    isaacsim.core, core.utils, utils.rotations = core, utils, rotations
+    for name, value in {
+        "isaacsim": isaacsim,
+        "isaacsim.core": core,
+        "isaacsim.core.utils": utils,
+        "isaacsim.core.utils.rotations": rotations,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, value)
+
+    writes: list[tuple[np.ndarray, np.ndarray]] = []
+    garment = types.SimpleNamespace(
+        set_all_pose=lambda _pose: (_ for _ in ()).throw(
+            AssertionError("CPU scene pose must not invoke the PhysX reset path")
+        ),
+        set_world_pose=lambda position, orientation: writes.append(
+            (np.asarray(position), np.asarray(orientation))
+        ),
+    )
+    env = types.SimpleNamespace(device="cpu", object=garment)
+    pose = np.asarray([0.1, -0.2, 0.7, 10.0, 20.0, 30.0], dtype=np.float32)
+
+    namespace["set_all_pose"](env, {"Garment": pose})
+
+    assert len(writes) == 1
+    np.testing.assert_array_equal(writes[0][0], pose[:3])
+    np.testing.assert_array_equal(writes[0][1], np.asarray([1.0, 10.0, 20.0, 30.0]))
+    np.testing.assert_array_equal(garment.reset_pose, pose)
+
+
 def test_cpu_reset_restores_live_usd_state_without_physx(monkeypatch) -> None:
     source_path = (
         Path(__file__).resolve().parents[1]
@@ -1651,7 +1702,7 @@ def test_randomization_rewrites_authenticated_cloth_after_every_pose_mutation() 
     assert "_flywheel_preserved_restore_for_randomization" in restore_source
     assert "_flywheel_preserved_restore_for_randomization" in randomize_source
     assert "_flywheel_rebase_world_cloth" in randomize_source
-    assert randomize_source.index("self.object.set_all_pose") < randomize_source.index(
+    assert randomize_source.index("self.set_all_pose") < randomize_source.index(
         "cloth.set_world_positions"
     )
     assert randomize_source.index("cloth.set_world_positions") < randomize_source.index(

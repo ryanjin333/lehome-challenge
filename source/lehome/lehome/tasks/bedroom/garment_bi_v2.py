@@ -719,6 +719,17 @@ class GarmentEnv(DirectRLEnv):
         return self.object.get_all_pose()
 
     def set_all_pose(self, pose):
+        if str(self.device).lower() == "cpu":
+            garment_pose = np.asarray(pose.get("Garment"), dtype=np.float32)
+            if garment_pose.shape != (6,) or not np.isfinite(garment_pose).all():
+                raise ValueError("CPU source garment pose must be a finite xyz-rpy vector")
+            from isaacsim.core.utils.rotations import euler_angles_to_quat
+
+            self.object.set_world_pose(
+                garment_pose[:3], euler_angles_to_quat(garment_pose[3:], degrees=True)
+            )
+            self.object.reset_pose = garment_pose.copy()
+            return
         self.object.set_all_pose(pose)
 
     def _flywheel_capture_scene_state(self) -> dict[str, object]:
@@ -806,7 +817,7 @@ class GarmentEnv(DirectRLEnv):
         intensity_attr.Set(float(scene_state["light_intensity"]))
         color_light_attr.Set(tuple(float(value) for value in scene_state["light_color"]))
         color_attr.Set([tuple(float(value) for value in color) for color in scene_state["garment_display_color"]])
-        self.object.set_all_pose({"Garment": np.asarray(scene_state["garment_reset_pose"], dtype=np.float32)})
+        self.set_all_pose({"Garment": np.asarray(scene_state["garment_reset_pose"], dtype=np.float32)})
         observed = self._flywheel_capture_scene_state()
         if not self._flywheel_scene_state_matches(observed, scene_state):
             raise RuntimeError("flywheel scene snapshot readback mismatch")
@@ -1746,7 +1757,7 @@ class GarmentEnv(DirectRLEnv):
 
         pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
         pose[5] += float(values["garment_yaw_deg"])
-        self.object.set_all_pose({"Garment": pose})
+        self.set_all_pose({"Garment": pose})
         if not np.isclose(float(self.object.reset_pose[5]), float(pose[5]), atol=1e-5):
             raise RuntimeError("garment yaw readback did not match requested randomization")
 
