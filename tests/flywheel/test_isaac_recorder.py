@@ -218,6 +218,31 @@ def test_autonomous_recorder_authenticates_h16_continuation_snapshots(tmp_path) 
         recorder.record_continuation_snapshot(17, boundary)
 
 
+def test_autonomous_recorder_excludes_boundary_snapshot_at_first_success(tmp_path, monkeypatch) -> None:
+    """A boundary immediately before the successful action is not pre-success evidence."""
+
+    recorder = AutonomousRecorder.for_test(tmp_path, policy_revision="a" * 40)
+    boundary = snapshot()
+    for step in range(16):
+        recorder.record_step(
+            observation(), np.ones(12), reward=0.0, success=False,
+            request_id="r0", chunk_offset=step,
+        )
+    recorder.record_continuation_snapshot(16, boundary)
+    recorder.record_step(
+        observation(), np.ones(12), reward=1.0, success=True,
+        request_id="r1", chunk_offset=0,
+    )
+    monkeypatch.setattr(recorder.video_sink, "encode", lambda root, fps=30: _encode_videos(root))
+
+    final = recorder.finish(reason="success", accepted_success=True)
+
+    relative = "snapshots/continuations/000016.json"
+    manifest = json.loads((final.path / "SHA256SUMS.json").read_text(encoding="utf-8"))
+    assert relative not in manifest
+    assert not (final.path / relative).exists()
+
+
 def test_autonomous_recorder_persists_simulator_contact_evidence(tmp_path, monkeypatch) -> None:
     recorder = AutonomousRecorder.for_test(tmp_path, policy_revision="a" * 40)
     recorder.record_step(observation(), np.ones(12), reward=0.0, success=False, request_id="r", chunk_offset=0)

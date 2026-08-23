@@ -164,6 +164,7 @@ class MixedSourceRecorder:
         self._annotations: list[dict[str, object]] = []
         self._frames: list[EpisodeFrame] = []
         self._snapshots: set[str] = set()
+        self._continuation_snapshot_steps: set[int] = set()
         self._reset_hash: str | None = None
         self._expert_started = False
         self._finished = False
@@ -268,6 +269,18 @@ class MixedSourceRecorder:
         if destination.exists():
             raise ValueError("continuation snapshot already exists for this H16 boundary")
         atomic_write_json(destination, snapshot.to_dict())
+        self._continuation_snapshot_steps.add(step)
+
+    def _discard_continuation_snapshots_at_or_after_first_success(self) -> None:
+        first_success = next((frame.step for frame in self._frames if frame.success), None)
+        if first_success is None:
+            raise ValueError("accepted autonomous episode has no successful annotation")
+        directory = self.writer.staging / "snapshots" / "continuations"
+        for step in tuple(self._continuation_snapshot_steps):
+            if step < first_success:
+                continue
+            (directory / f"{step:06d}.json").unlink()
+            self._continuation_snapshot_steps.remove(step)
 
     def _encode_videos(self) -> tuple[str, ...]:
         if any(self.video_sink.count(camera) != self.step for camera in CANONICAL_CAMERA_NAMES):
@@ -363,6 +376,8 @@ class MixedSourceRecorder:
             raise ValueError("recorder has already finished")
         if not reason:
             raise ValueError("terminal reason is required")
+        if accepted_success:
+            self._discard_continuation_snapshots_at_or_after_first_success()
         self._finished = True
         episode = self._base_episode() | {
             "mode": self.mode,
