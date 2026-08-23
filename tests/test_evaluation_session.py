@@ -2577,6 +2577,313 @@ def test_policy_action_diagnostics_label_every_joint_with_limit_and_live_delta()
     }
 
 
+def test_recorder_flywheel_step_projects_raw_policy_targets_and_records_the_applied_action(
+    monkeypatch, tmp_path
+) -> None:
+    """The physical target is bounded, while raw policy-limit evidence remains intact."""
+    evaluation = _evaluation(monkeypatch)
+
+    assert hasattr(evaluation, "_project_flywheel_policy_action_to_live_limits")
+
+    class FakeTensor:
+        def __init__(self, values):
+            self.values = np.asarray(values, dtype=np.float32)
+
+        def float(self):
+            return self
+
+        def to(self, _device):
+            return self
+
+        def unsqueeze(self, axis):
+            return FakeTensor(np.expand_dims(self.values, axis))
+
+        def squeeze(self, axis=None):
+            return self.values.squeeze(axis)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.values
+
+        def clone(self):
+            return FakeTensor(self.values.copy())
+
+        def __setitem__(self, key, value):
+            self.values[key] = value
+
+    class FakeBool:
+        def __init__(self, value):
+            self.value = bool(value)
+
+        def item(self):
+            return self.value
+
+    evaluation.torch = types.SimpleNamespace(
+        Tensor=FakeTensor,
+        from_numpy=lambda values: FakeTensor(values),
+        tensor=lambda value: FakeBool(value),
+    )
+    evaluation.RateLimiter = lambda _step_hz: None
+    manifest = {
+        "_path": tmp_path / "flywheel-manifest.json",
+        "strategy": "canonical",
+        "seed": 1,
+        "policy_revision": "revision",
+        "policy_artifact_sha256": "artifact",
+        "image_identity": "image",
+        "execution_mode": "policy_server",
+        "execution_backend": "policy_server",
+        "simulator_device": "cpu",
+    }
+    monkeypatch.setattr(evaluation, "_load_flywheel_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        evaluation,
+        "_flywheel_identity",
+        lambda _manifest: types.SimpleNamespace(garment_name="Top_Long_Seen_0"),
+    )
+    monkeypatch.setattr(evaluation, "_validate_active_flywheel_garment", lambda *_args: None)
+
+    recorded_actions = []
+
+    class Recorder:
+        def __init__(self, *_args, **_kwargs):
+            self.step = 0
+
+        def record_snapshot(self, *_args, **_kwargs):
+            pass
+
+        def record_step(self, _observation, action, **_kwargs):
+            self.step += 1
+            recorded_actions.append(np.asarray(action, dtype=np.float32).copy())
+
+        def record_continuation_snapshot(self, *_args, **_kwargs):
+            pass
+
+        def finish(self, **_kwargs):
+            pass
+
+    recorder_module = types.ModuleType("lehome.flywheel.isaac_recorder")
+    recorder_module.AutonomousRecorder = Recorder
+    randomization_module = types.ModuleType("lehome.flywheel.randomization")
+    randomization_module.sample_randomization = lambda *_args, **_kwargs: types.SimpleNamespace(values={})
+    randomization_module.validate_randomization_receipt = lambda *_args, **_kwargs: None
+    snapshots_module = types.ModuleType("lehome.flywheel.snapshots")
+    snapshots_module.capture_snapshot = lambda *_args, **_kwargs: {"snapshot": True}
+    monkeypatch.setitem(sys.modules, "lehome.flywheel.isaac_recorder", recorder_module)
+    monkeypatch.setitem(sys.modules, "lehome.flywheel.randomization", randomization_module)
+    monkeypatch.setitem(sys.modules, "lehome.flywheel.snapshots", snapshots_module)
+
+    limits = np.repeat(
+        np.asarray([[[-1.0, 1.0]]], dtype=np.float32), repeats=6, axis=1
+    )
+    stepped_actions = []
+    env = types.SimpleNamespace(
+        left_arm=types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                soft_joint_pos_limits=limits,
+                joint_pos=np.zeros((1, 6), dtype=np.float32),
+            )
+        ),
+        right_arm=types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                soft_joint_pos_limits=limits,
+                joint_pos=np.zeros((1, 6), dtype=np.float32),
+            )
+        ),
+        reset=lambda: None,
+        apply_flywheel_randomization=lambda _sampled: {},
+        flywheel_cloth_physical_health=lambda: {"healthy": True},
+        flywheel_visible_garment_contact=lambda: {
+            "observed": True,
+            "minimum_distance_m": 0.01,
+        },
+        _get_observations=lambda: {"observation.state": np.zeros(12, dtype=np.float32)},
+        _get_success=lambda: FakeBool(False),
+        _get_rewards=lambda: 0.0,
+    )
+    env.step = lambda action: stepped_actions.append(action.detach().cpu().numpy().copy())
+
+    raw_diagnostics = []
+    original_diagnostics = evaluation._flywheel_policy_action_limit_diagnostics
+
+    def capture_raw_diagnostics(step_env, action):
+        diagnostics = original_diagnostics(step_env, action)
+        raw_diagnostics.append(diagnostics)
+        return diagnostics
+
+    monkeypatch.setattr(
+        evaluation, "_flywheel_policy_action_limit_diagnostics", capture_raw_diagnostics
+    )
+    policy = types.SimpleNamespace(
+        reset=lambda: None,
+        select_action_with_provenance=lambda _observation: types.SimpleNamespace(
+            value=np.asarray(
+                [0.25, 0.0, 1.25, 0.0, 0.0, 0.0, 0.0, 0.0, -1.5, 0.0, 0.0, 0.0],
+                dtype=np.float32,
+            ),
+            request_id="request-1",
+            chunk_offset=0,
+        ),
+    )
+    args = types.SimpleNamespace(
+        save_datasets=False,
+        flywheel_manifest="enabled",
+        seed=1,
+        num_episodes=1,
+        step_hz=30,
+        max_steps=1,
+        use_ee_pose=False,
+        device="cpu",
+        save_video=False,
+    )
+
+    evaluation.run_evaluation_loop(env, policy, args, garment_name="Top_Long_Seen_0")
+
+    assert raw_diagnostics[0]["policy_action_outside_live_joint_limit_count"] == 2
+    assert raw_diagnostics[0]["policy_action_joint_diagnostics"]["left_elbow_flex"] == {
+        "target_finite": True,
+        "outside_live_joint_limit": True,
+        "limit_violation_rad": 0.25,
+        "target_to_live_joint_position_delta_rad": 1.25,
+    }
+    assert raw_diagnostics[0]["policy_action_joint_diagnostics"]["right_elbow_flex"] == {
+        "target_finite": True,
+        "outside_live_joint_limit": True,
+        "limit_violation_rad": 0.5,
+        "target_to_live_joint_position_delta_rad": 1.5,
+    }
+    expected = np.asarray(
+        [[0.25, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    np.testing.assert_array_equal(stepped_actions, [expected])
+    np.testing.assert_array_equal(recorded_actions, [expected.squeeze(0)])
+
+
+def test_recorder_flywheel_step_fails_closed_before_env_step_when_live_limits_are_malformed(
+    monkeypatch, tmp_path
+) -> None:
+    evaluation = _evaluation(monkeypatch)
+
+    assert hasattr(evaluation, "_project_flywheel_policy_action_to_live_limits")
+
+    class FakeTensor:
+        def __init__(self, values):
+            self.values = np.asarray(values, dtype=np.float32)
+
+        def float(self):
+            return self
+
+        def to(self, _device):
+            return self
+
+        def unsqueeze(self, axis):
+            return FakeTensor(np.expand_dims(self.values, axis))
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.values
+
+    class FakeBool:
+        def __init__(self, value):
+            self.value = bool(value)
+
+        def item(self):
+            return self.value
+
+    evaluation.torch = types.SimpleNamespace(
+        Tensor=FakeTensor,
+        from_numpy=lambda values: FakeTensor(values),
+        tensor=lambda value: FakeBool(value),
+    )
+    evaluation.RateLimiter = lambda _step_hz: None
+    manifest = {
+        "_path": tmp_path / "flywheel-manifest.json",
+        "strategy": "canonical",
+        "seed": 1,
+        "policy_revision": "revision",
+        "policy_artifact_sha256": "artifact",
+        "image_identity": "image",
+        "execution_mode": "policy_server",
+        "execution_backend": "policy_server",
+        "simulator_device": "cpu",
+    }
+    monkeypatch.setattr(evaluation, "_load_flywheel_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        evaluation,
+        "_flywheel_identity",
+        lambda _manifest: types.SimpleNamespace(garment_name="Top_Long_Seen_0"),
+    )
+    monkeypatch.setattr(evaluation, "_validate_active_flywheel_garment", lambda *_args: None)
+    recorder_module = types.ModuleType("lehome.flywheel.isaac_recorder")
+    recorder_module.AutonomousRecorder = lambda *_args, **_kwargs: types.SimpleNamespace(
+        record_snapshot=lambda *_args, **_kwargs: None,
+    )
+    randomization_module = types.ModuleType("lehome.flywheel.randomization")
+    randomization_module.sample_randomization = lambda *_args, **_kwargs: types.SimpleNamespace(values={})
+    randomization_module.validate_randomization_receipt = lambda *_args, **_kwargs: None
+    snapshots_module = types.ModuleType("lehome.flywheel.snapshots")
+    snapshots_module.capture_snapshot = lambda *_args, **_kwargs: {"snapshot": True}
+    monkeypatch.setitem(sys.modules, "lehome.flywheel.isaac_recorder", recorder_module)
+    monkeypatch.setitem(sys.modules, "lehome.flywheel.randomization", randomization_module)
+    monkeypatch.setitem(sys.modules, "lehome.flywheel.snapshots", snapshots_module)
+
+    stepped_actions = []
+    env = types.SimpleNamespace(
+        left_arm=types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                soft_joint_pos_limits=np.zeros((1, 6, 3), dtype=np.float32),
+                joint_pos=np.zeros((1, 6), dtype=np.float32),
+            )
+        ),
+        right_arm=types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                soft_joint_pos_limits=np.zeros((1, 6, 2), dtype=np.float32),
+                joint_pos=np.zeros((1, 6), dtype=np.float32),
+            )
+        ),
+        reset=lambda: None,
+        apply_flywheel_randomization=lambda _sampled: {},
+        flywheel_cloth_physical_health=lambda: {"healthy": True},
+        _get_observations=lambda: {"observation.state": np.zeros(12, dtype=np.float32)},
+    )
+    env.step = lambda action: stepped_actions.append(action)
+    policy = types.SimpleNamespace(
+        reset=lambda: None,
+        select_action_with_provenance=lambda _observation: types.SimpleNamespace(
+            value=np.zeros(12, dtype=np.float32), request_id="request-1", chunk_offset=0,
+        ),
+    )
+    args = types.SimpleNamespace(
+        save_datasets=False,
+        flywheel_manifest="enabled",
+        seed=1,
+        num_episodes=1,
+        step_hz=30,
+        max_steps=1,
+        use_ee_pose=False,
+        device="cpu",
+        save_video=False,
+    )
+
+    with __import__("pytest").raises(
+        evaluation.SimulatorNumericalDivergenceError, match="live soft joint limits"
+    ):
+        evaluation.run_evaluation_loop(env, policy, args, garment_name="Top_Long_Seen_0")
+
+    assert stepped_actions == []
+
+
 def test_policy_action_diagnostics_use_one_canonical_semantic_joint_order() -> None:
     source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
     source = source_path.read_text(encoding="utf-8")
@@ -2890,6 +3197,65 @@ def test_cloth_failure_includes_bounded_policy_action_history_without_coordinate
         )
 
     assert "[" not in str(raised.value)
+
+
+def test_cloth_failure_includes_bounded_action_projection_history() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    gate = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_require_flywheel_cloth_health"
+    )
+    module = ast.Module(body=[gate], type_ignores=[])
+    ast.fix_missing_locations(module)
+    error_type = type("SimulatorNumericalDivergenceError", (RuntimeError,), {})
+    joint_names = (
+        "left_shoulder_pan", "left_shoulder_lift", "left_elbow_flex",
+        "left_wrist_flex", "left_wrist_roll", "left_gripper",
+        "right_shoulder_pan", "right_shoulder_lift", "right_elbow_flex",
+        "right_wrist_flex", "right_wrist_roll", "right_gripper",
+    )
+    namespace = {
+        "Any": object,
+        "Mapping": Mapping,
+        "SimulatorNumericalDivergenceError": error_type,
+        "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES": joint_names,
+    }
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    with __import__("pytest").raises(error_type) as raised:
+        namespace["_require_flywheel_cloth_health"](
+            types.SimpleNamespace(
+                flywheel_cloth_physical_health=lambda: {
+                    "healthy": False,
+                    "reason": "simulator_numerical_divergence",
+                }
+            ),
+            policy_action_diagnostics={
+                "policy_action_steps_projected": 2,
+                "policy_action_max_simultaneous_projected_joint_count": 2,
+                "policy_action_projected_joint_step_counts": {
+                    name: 2 if name == "left_elbow_flex" else 0
+                    for name in joint_names
+                },
+                "policy_action_max_abs_projection_rad": {
+                    name: 0.25 if name == "left_elbow_flex" else 0.0
+                    for name in joint_names
+                },
+            },
+        )
+
+    message = str(raised.value)
+    assert "policy_action_steps_projected=2" in message
+    assert "policy_action_max_simultaneous_projected_joint_count=2" in message
+    assert (
+        "left_elbow_flex(projected_steps=2,max_abs_projection_rad=0.25)"
+        in message
+    )
+    assert "[" not in message
 
 
 def test_policy_action_diagnostics_are_sampled_before_each_step_and_bound_to_health_failure() -> None:

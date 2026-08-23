@@ -120,6 +120,84 @@ def _flywheel_policy_action_limit_diagnostics(env: Any, action: Any) -> dict[str
     }
 
 
+def _project_flywheel_policy_action_to_live_limits(
+    env: Any, action: Any
+) -> tuple[Any, dict[str, object]]:
+    """Clamp a finite recorder action to the live soft joint-position contract."""
+
+    def numpy_array(value: Any) -> np.ndarray:
+        detach = getattr(value, "detach", None)
+        if callable(detach):
+            value = detach()
+        to_cpu = getattr(value, "cpu", None)
+        if callable(to_cpu):
+            value = to_cpu()
+        to_numpy = getattr(value, "numpy", None)
+        if callable(to_numpy):
+            value = to_numpy()
+        return np.asarray(value, dtype=np.float32)
+
+    try:
+        values = numpy_array(action)
+        left_limits = numpy_array(env.left_arm.data.soft_joint_pos_limits)
+        right_limits = numpy_array(env.right_arm.data.soft_joint_pos_limits)
+    except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+        raise SimulatorNumericalDivergenceError(
+            "flywheel action projection requires readable live soft joint limits"
+        ) from error
+    if (
+        values.shape != (1, 12)
+        or left_limits.shape != (1, 6, 2)
+        or right_limits.shape != (1, 6, 2)
+    ):
+        raise SimulatorNumericalDivergenceError(
+            "flywheel action projection requires shaped live soft joint limits"
+        )
+    limits = np.concatenate((left_limits[0], right_limits[0]), axis=0)
+    if not np.isfinite(limits).all() or np.any(limits[:, 0] > limits[:, 1]):
+        raise SimulatorNumericalDivergenceError(
+            "flywheel action projection requires finite ordered live soft joint limits"
+        )
+    if not np.isfinite(values).all():
+        raise SimulatorNumericalDivergenceError(
+            "flywheel action projection rejects nonfinite raw policy targets"
+        )
+
+    projected = action
+    joint_diagnostics: dict[str, dict[str, bool | float]] = {}
+    projected_count = 0
+    for index, joint_name in enumerate(_FLYWHEEL_POLICY_ACTION_JOINT_NAMES):
+        raw_target = float(values[0, index])
+        lower_limit = float(limits[index, 0])
+        upper_limit = float(limits[index, 1])
+        if raw_target < lower_limit:
+            applied_target = lower_limit
+        elif raw_target > upper_limit:
+            applied_target = upper_limit
+        else:
+            applied_target = raw_target
+        absolute_projection = abs(raw_target - applied_target)
+        was_projected = absolute_projection > 0.0
+        if was_projected:
+            if projected is action:
+                clone = getattr(action, "clone", None)
+                if not callable(clone):
+                    raise SimulatorNumericalDivergenceError(
+                        "flywheel action projection requires a cloneable policy action"
+                    )
+                projected = clone()
+            projected[0, index] = applied_target
+            projected_count += 1
+        joint_diagnostics[joint_name] = {
+            "projected": was_projected,
+            "absolute_projection_rad": round(absolute_projection, 8),
+        }
+    return projected, {
+        "policy_action_projection_count": projected_count,
+        "policy_action_projection_joint_diagnostics": joint_diagnostics,
+    }
+
+
 def _require_flywheel_cloth_health(
     env: Any,
     *,
@@ -185,6 +263,8 @@ def _require_flywheel_cloth_health(
                 "policy_action_steps_outside_live_joint_limits",
                 "policy_action_max_outside_live_joint_limit_count",
                 "policy_action_total_steps",
+                "policy_action_steps_projected",
+                "policy_action_max_simultaneous_projected_joint_count",
             ):
                 value = policy_action_diagnostics.get(field)
                 if type(value) is int and value >= 0:
@@ -222,6 +302,34 @@ def _require_flywheel_cloth_health(
                 if joint_evidence:
                     evidence.append(
                         "policy_action_joint_summary=" + ",".join(joint_evidence)
+                    )
+            projected_steps = policy_action_diagnostics.get(
+                "policy_action_projected_joint_step_counts"
+            )
+            max_projection = policy_action_diagnostics.get(
+                "policy_action_max_abs_projection_rad"
+            )
+            if all(isinstance(values, Mapping) for values in (projected_steps, max_projection)):
+                projection_evidence: list[str] = []
+                for joint_name in _FLYWHEEL_POLICY_ACTION_JOINT_NAMES:
+                    projected_step_count = projected_steps.get(joint_name)
+                    projection = max_projection.get(joint_name)
+                    if (
+                        type(projected_step_count) is not int
+                        or projected_step_count < 0
+                        or type(projection) is not float
+                        or not float("-inf") < projection < float("inf")
+                    ):
+                        projection_evidence = []
+                        break
+                    projection_evidence.append(
+                        f"{joint_name}(projected_steps={projected_step_count},"
+                        f"max_abs_projection_rad={projection})"
+                    )
+                if projection_evidence:
+                    evidence.append(
+                        "policy_action_projection_joint_summary="
+                        + ",".join(projection_evidence)
                     )
         diagnostic_suffix = f" ({'; '.join(evidence)})" if evidence else ""
         raise SimulatorNumericalDivergenceError(
@@ -927,6 +1035,10 @@ def run_evaluation_loop(
         policy_action_outside_live_joint_limit_step_counts: dict[str, int] = {}
         policy_action_max_limit_violation_rad: dict[str, float] = {}
         policy_action_max_target_to_live_joint_position_delta_rad: dict[str, float] = {}
+        policy_action_steps_projected = 0
+        policy_action_max_simultaneous_projected_joint_count = 0
+        policy_action_projected_joint_step_counts: dict[str, int] = {}
+        policy_action_max_abs_projection_rad: dict[str, float] = {}
 
         for st in range(args.max_steps):
             if cancellation_event is not None and cancellation_event.is_set():
@@ -1061,6 +1173,73 @@ def run_evaluation_loop(
                             policy_action_max_target_to_live_joint_position_delta_rad
                         ),
                     }
+                if policy_action_diagnostics.get("policy_action_limits_available") is not True:
+                    raise SimulatorNumericalDivergenceError(
+                        "flywheel action projection requires available live soft joint limits"
+                    )
+                action, projection_diagnostics = (
+                    _project_flywheel_policy_action_to_live_limits(env, action)
+                )
+                projected_count = projection_diagnostics.get(
+                    "policy_action_projection_count"
+                )
+                if type(projected_count) is not int or projected_count < 0:
+                    raise SimulatorNumericalDivergenceError(
+                        "flywheel action projection produced invalid projection evidence"
+                    )
+                if projected_count > 0:
+                    policy_action_steps_projected += 1
+                policy_action_max_simultaneous_projected_joint_count = max(
+                    policy_action_max_simultaneous_projected_joint_count, projected_count
+                )
+                projection_joints = projection_diagnostics.get(
+                    "policy_action_projection_joint_diagnostics"
+                )
+                if not isinstance(projection_joints, Mapping):
+                    raise SimulatorNumericalDivergenceError(
+                        "flywheel action projection produced invalid joint evidence"
+                    )
+                for joint_name in _FLYWHEEL_POLICY_ACTION_JOINT_NAMES:
+                    projection_joint = projection_joints.get(joint_name)
+                    if not isinstance(projection_joint, Mapping):
+                        raise SimulatorNumericalDivergenceError(
+                            "flywheel action projection produced incomplete joint evidence"
+                        )
+                    projected = projection_joint.get("projected")
+                    absolute_projection = projection_joint.get(
+                        "absolute_projection_rad"
+                    )
+                    if (
+                        type(projected) is not bool
+                        or type(absolute_projection) is not float
+                        or not float("-inf") < absolute_projection < float("inf")
+                    ):
+                        raise SimulatorNumericalDivergenceError(
+                            "flywheel action projection produced invalid joint evidence"
+                        )
+                    policy_action_projected_joint_step_counts.setdefault(
+                        joint_name, 0
+                    )
+                    policy_action_max_abs_projection_rad.setdefault(joint_name, 0.0)
+                    if projected:
+                        policy_action_projected_joint_step_counts[joint_name] += 1
+                    policy_action_max_abs_projection_rad[joint_name] = max(
+                        policy_action_max_abs_projection_rad[joint_name],
+                        absolute_projection,
+                    )
+                policy_action_diagnostics = {
+                    **policy_action_diagnostics,
+                    "policy_action_steps_projected": policy_action_steps_projected,
+                    "policy_action_max_simultaneous_projected_joint_count": (
+                        policy_action_max_simultaneous_projected_joint_count
+                    ),
+                    "policy_action_projected_joint_step_counts": (
+                        policy_action_projected_joint_step_counts
+                    ),
+                    "policy_action_max_abs_projection_rad": (
+                        policy_action_max_abs_projection_rad
+                    ),
+                }
             env.step(action)
             if recorder is not None:
                 _require_flywheel_cloth_health(
