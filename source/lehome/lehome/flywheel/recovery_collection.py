@@ -213,8 +213,10 @@ def _replay_fidelity(env: object, expected: Snapshot) -> Mapping[str, object]:
     observed = capture_snapshot(
         env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND},
     )
-    if observed.schema_version != 2 or observed.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY:
-        raise ValueError("controlled recovery replay fidelity lacks PhysX cloth authority")
+    if (observed.schema_version, observed.cloth_state_authority) != (
+        expected.schema_version, expected.cloth_state_authority,
+    ):
+        raise ValueError("controlled recovery replay fidelity lacks the expected cloth authority")
     observed_robot = tuple(observed.robot_position)
     observed_robot_velocity = tuple(observed.robot_velocity)
     if (len(observed_robot) != 12 or len(observed_robot_velocity) != 12
@@ -258,7 +260,7 @@ def _replay_fidelity(env: object, expected: Snapshot) -> Mapping[str, object]:
         "max_abs_cloth_velocity_error_mps": cloth_velocity_error,
         "expected_state_sha256": hashlib.sha256(_canonical_bytes(physical_state(expected))).hexdigest(),
         "observed_state_sha256": hashlib.sha256(_canonical_bytes(physical_state(observed))).hexdigest(),
-        "cloth_state_authority": PHYSX_CLOTH_STATE_AUTHORITY,
+        "cloth_state_authority": observed.cloth_state_authority,
     }
     if robot_error > _REPLAY_FIDELITY_TOLERANCE_RAD:
         raise ValueError("controlled recovery replay fidelity exceeds fixed robot-position tolerance")
@@ -944,11 +946,17 @@ def bootstrap_controlled_recovery(env: object, assignment: Mapping[str, object])
     projected = capture_snapshot(
         env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND},
     )
-    if projected.schema_version != 2 or projected.cloth_state_authority != PHYSX_CLOTH_STATE_AUTHORITY:
-        raise ValueError("controlled recovery restore did not read back a live CUDA PhysX state")
+    if (projected.schema_version, projected.cloth_state_authority) != (
+        recovery.continuation_snapshot.schema_version, recovery.continuation_snapshot.cloth_state_authority,
+    ) and not (
+        recovery.continuation_snapshot.schema_version == 3
+        and projected.schema_version == 2
+        and projected.cloth_state_authority == PHYSX_CLOTH_STATE_AUTHORITY
+    ):
+        raise ValueError("controlled recovery restore did not read back the expected cloth authority")
     legacy_projection = (
         _projection_provenance(env, recovery, projected)
-        if recovery.continuation_snapshot.schema_version == 3
+        if recovery.continuation_snapshot.schema_version == 3 and projected.schema_version == 2
         else None
     )
     replay_target = (

@@ -450,6 +450,25 @@ def test_controlled_recovery_accepts_checksum_bound_usd_local_v3_sources(tmp_pat
     assert recovery.provenance["source_snapshot_authority"] == "usd_local_points_v1"
 
 
+def test_cpu_schema3_restore_replays_with_usd_local_authority(tmp_path) -> None:
+    from lehome.flywheel.recovery_collection import bootstrap_controlled_recovery
+
+    assignment = _assignment(tmp_path, teacher=True)
+    for field in ("source_reset", "source_continuation_snapshot"):
+        path = Path(assignment[field]); payload = json.loads(path.read_text())
+        payload["schema_version"] = 3; payload["cloth_state_authority"] = "usd_local_points_v1"
+        path.write_text(json.dumps(payload)); assignment[f"{field}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    assignment["source_snapshot_schema_version"] = 3; assignment["source_snapshot_authority"] = "usd_local_points_v1"; assignment["source_only_envelope"] = True
+    class Env:
+        def __init__(self): self.state = _snapshot(); self.state["schema_version"] = 3; self.state["cloth_state_authority"] = "usd_local_points_v1"
+        def flywheel_restore_state(self, snapshot): self.state = snapshot.to_dict()
+        def flywheel_capture_state(self): return self.state
+        def step(self, _): pass
+        def _get_success(self): return True
+    provenance = bootstrap_controlled_recovery(Env(), assignment)
+    assert provenance["replay_fidelity"]["cloth_state_authority"] == "usd_local_points_v1"
+
+
 def test_cuda_legacy_projection_binds_the_projected_readback_and_is_idempotent(tmp_path) -> None:
     from lehome.flywheel.recovery_collection import bootstrap_controlled_recovery
 
