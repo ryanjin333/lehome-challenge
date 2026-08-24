@@ -240,6 +240,7 @@ def _run_snapshot_source_bootstrap(
     descriptor_fields: dict[str, object] | None = None,
     source_rows: list[dict[str, object]] | None = None,
     target_accepted: int = 1,
+    simulator_device: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     # The contract rejects every symlink ancestor. pytest's ordinary macOS
     # temporary root is addressed through /var, a symlink to /private.
@@ -277,6 +278,8 @@ def _run_snapshot_source_bootstrap(
     docker.chmod(0o755)
     env = {**os.environ, "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR": str(descriptor), "LEHOME_SNAPSHOT_SOURCE_DESCRIPTOR_SHA256": digest, "LEHOME_SNAPSHOT_SOURCE_RUN_ID": run_id, "LEHOME_SNAPSHOT_SOURCE_BASE_CAMPAIGN": str(base), "LEHOME_SNAPSHOT_SOURCE_TEST_CASE": case, "LEHOME_SNAPSHOT_SOURCE_RUNTIME_ROOT": str(runtime_source_root or (REPO_ROOT / "source" / "lehome")), "LEHOME_SNAPSHOT_SOURCE_TARGET_ACCEPTED": str(target_accepted)}
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    if simulator_device is not None:
+        env["LEHOME_SNAPSHOT_SOURCE_SIMULATOR_DEVICE"] = simulator_device
     if clear_pythonpath:
         env["PYTHONPATH"] = ""
     return subprocess.run(["/bin/bash", str(SNAPSHOT_SOURCE_BOOTSTRAP)], env=env, text=True, capture_output=True, check=False), root
@@ -831,7 +834,8 @@ def test_snapshot_source_bootstrap_is_a_separate_one_worker_unsealed_tuple() -> 
     assert 'LEHOME_WORKER_COUNT=1 LEHOME_MAX_ATTEMPTS="${SOURCE_ROW_COUNT}" LEHOME_TARGET_ACCEPTED="${TARGET_ACCEPTED}"' in source
     assert "LEHOME_MAX_WORKER_RESTARTS=0" in source
     assert "LEHOME_ENABLE_HF_UPLOAD=1 LEHOME_SKIP_ROUND_SEAL=1 LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP=1" in source
-    assert "LEHOME_SIMULATOR_DEVICE=cpu" in source
+    assert 'SNAPSHOT_SOURCE_SIMULATOR_DEVICE="${LEHOME_SNAPSHOT_SOURCE_SIMULATOR_DEVICE-cpu}"' in source
+    assert 'LEHOME_SIMULATOR_DEVICE="${SNAPSHOT_SOURCE_SIMULATOR_DEVICE}"' in source
     assert "fresh absent run root; resume is forbidden" in source
     assert "readback_verified" in source
     assert "--role sealer" not in source
@@ -868,8 +872,9 @@ def test_snapshot_source_bootstrap_passes_a_nondefault_descriptor_garment_before
     }
 
 
-def test_snapshot_source_bootstrap_forces_the_cpu_source_cloth_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LEHOME_SIMULATOR_DEVICE", "cpu")
+def test_snapshot_source_bootstrap_defaults_to_the_cpu_source_cloth_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LEHOME_SIMULATOR_DEVICE", "cuda:0")
+    monkeypatch.delenv("LEHOME_SNAPSHOT_SOURCE_SIMULATOR_DEVICE", raising=False)
     result, root = _run_snapshot_source_bootstrap(tmp_path / "cuda-source", "rejected")
     assert result.returncode == 3
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
@@ -877,6 +882,32 @@ def test_snapshot_source_bootstrap_forces_the_cpu_source_cloth_lane(tmp_path: Pa
         "simulator_device": "cpu",
         "max_worker_restarts": "0",
     }
+
+
+def test_snapshot_source_bootstrap_propagates_explicit_cuda_source_cloth_lane(tmp_path: Path) -> None:
+    result, root = _run_snapshot_source_bootstrap(
+        tmp_path / "cuda-source", "rejected", simulator_device="cuda:0",
+    )
+
+    assert result.returncode == 3
+    assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
+        "initial_garment": "Top_Long_Seen_0",
+        "simulator_device": "cuda:0",
+        "max_worker_restarts": "0",
+    }
+
+
+@pytest.mark.parametrize("simulator_device", ["cuda", "cuda:1", " cuda:0", "cuda:0 ", "true", "False", "gpu", ""])
+def test_snapshot_source_bootstrap_rejects_invalid_simulator_device_before_base_launch(
+    tmp_path: Path, simulator_device: str,
+) -> None:
+    result, root = _run_snapshot_source_bootstrap(
+        tmp_path / "invalid-device", "rejected", simulator_device=simulator_device,
+    )
+
+    assert result.returncode == 2
+    assert "simulator device must be exactly cpu or cuda:0" in result.stderr
+    assert not (root / "base-launch.json").exists()
 
 
 def test_snapshot_source_bootstrap_preflights_a_verified_legacy_reset_before_launch(tmp_path: Path) -> None:

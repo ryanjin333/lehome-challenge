@@ -17,6 +17,9 @@ TARGET_ACCEPTED="${LEHOME_SNAPSHOT_SOURCE_TARGET_ACCEPTED:-1}"
 ROLLOUT_REPOSITORY="${LEHOME_ROLLOUT_REPOSITORY:-ryanjin333/lehome-groot-n17-rollouts}"
 HF_REVISION="${LEHOME_HF_REVISION:-main}"
 SOURCE_FINALIZATION_TIMEOUT_SECONDS="${LEHOME_SOURCE_FINALIZATION_TIMEOUT_SECONDS:-300}"
+# Appliance/operator input only.  Empty is invalid rather than silently
+# defaulting, so an intended CUDA source collection cannot fall back to CPU.
+SNAPSHOT_SOURCE_SIMULATOR_DEVICE="${LEHOME_SNAPSHOT_SOURCE_SIMULATOR_DEVICE-cpu}"
 
 safe_runtime_source_root() {
   local current="$1"
@@ -32,6 +35,10 @@ safe_runtime_source_root() {
 if ! [[ "${RUN_ID}" =~ ^[0-9a-f]{32}$ ]] || ! [[ "${DESCRIPTOR_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
   echo "snapshot source bootstrap requires fixed run and descriptor identities" >&2; exit 2
 fi
+case "${SNAPSHOT_SOURCE_SIMULATOR_DEVICE}" in
+  cpu|cuda:0) ;;
+  *) echo "snapshot source bootstrap simulator device must be exactly cpu or cuda:0" >&2; exit 2 ;;
+esac
 if [[ "${DESCRIPTOR}" != /* ]] || [ -L "${DESCRIPTOR}" ] || [ ! -f "${DESCRIPTOR}" ] || [ ! -x "${BASE}" ]; then
   echo "snapshot source bootstrap input is unsafe" >&2; exit 2
 fi
@@ -121,7 +128,7 @@ env LEHOME_WORKSPACE="${WORKSPACE}" LEHOME_CAMPAIGN_ROOT="${ROOT}" \
   LEHOME_MAX_WORKER_RESTARTS=0 \
   LEHOME_ROLLOUT_REPOSITORY="${ROLLOUT_REPOSITORY}" LEHOME_HF_REVISION="${HF_REVISION}" \
   LEHOME_SOURCE_FINALIZATION_TIMEOUT_SECONDS="${SOURCE_FINALIZATION_TIMEOUT_SECONDS}" \
-  LEHOME_SIMULATOR_DEVICE=cpu \
+  LEHOME_SIMULATOR_DEVICE="${SNAPSHOT_SOURCE_SIMULATOR_DEVICE}" \
   LEHOME_ENABLE_HF_UPLOAD=1 LEHOME_SKIP_ROUND_SEAL=1 LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP=1 \
   LEHOME_CONTROLLED_RECOVERY_SMOKE=0 LEHOME_RESUME_PREEMPTED_ROLLOUT=0 \
   bash "${BASE}"
