@@ -460,6 +460,7 @@ def test_cpu_schema3_restore_replays_with_usd_local_authority(tmp_path) -> None:
         path.write_text(json.dumps(payload)); assignment[f"{field}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     assignment["source_snapshot_schema_version"] = 3; assignment["source_snapshot_authority"] = "usd_local_points_v1"; assignment["source_only_envelope"] = True
     class Env:
+        device = "cpu"
         def __init__(self): self.state = _snapshot(); self.state["schema_version"] = 3; self.state["cloth_state_authority"] = "usd_local_points_v1"
         def flywheel_restore_state(self, snapshot): self.state = snapshot.to_dict()
         def flywheel_capture_state(self): return self.state
@@ -467,6 +468,38 @@ def test_cpu_schema3_restore_replays_with_usd_local_authority(tmp_path) -> None:
         def _get_success(self): return True
     provenance = bootstrap_controlled_recovery(Env(), assignment)
     assert provenance["replay_fidelity"]["cloth_state_authority"] == "usd_local_points_v1"
+
+
+def test_cuda_runtime_rejects_usd_local_schema3_readback(tmp_path) -> None:
+    from lehome.flywheel.recovery_collection import bootstrap_controlled_recovery
+
+    assignment = _assignment(tmp_path)
+    for field in ("source_reset", "source_continuation_snapshot"):
+        path = Path(assignment[field]); payload = json.loads(path.read_text())
+        payload["schema_version"] = 3; payload["cloth_state_authority"] = "usd_local_points_v1"
+        path.write_text(json.dumps(payload)); assignment[f"{field}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    assignment.update(source_snapshot_schema_version=3, source_snapshot_authority="usd_local_points_v1", source_only_envelope=True)
+    class Env:
+        device = "cuda:0"
+        def __init__(self):
+            self.state = _snapshot(); self.state["schema_version"] = 3; self.state["cloth_state_authority"] = "usd_local_points_v1"
+            self._flywheel_legacy_projection_receipt = {"source_snapshot_authority": "usd_local_points_v1", "weld_map_identity": "a" * 64, "welded_vertices_remap_to_orig_sha256": "b" * 64, "welded_vertices_remap_to_weld_sha256": "c" * 64}
+        def flywheel_restore_state(self, snapshot): self.state = snapshot.to_dict(); self.state["schema_version"] = 3; self.state["cloth_state_authority"] = "usd_local_points_v1"
+        def flywheel_capture_state(self): return self.state
+        def step(self, _): pass
+    with pytest.raises(ValueError, match="expected cloth authority"):
+        bootstrap_controlled_recovery(Env(), assignment)
+
+
+def test_controlled_recovery_rejects_unsupported_runtime_device(tmp_path) -> None:
+    from lehome.flywheel.recovery_collection import bootstrap_controlled_recovery
+
+    class Env:
+        device = "mps"
+        def flywheel_restore_state(self, _): pass
+        def flywheel_capture_state(self): return _snapshot()
+    with pytest.raises(ValueError, match="runtime device"):
+        bootstrap_controlled_recovery(Env(), _assignment(tmp_path))
 
 
 def test_cuda_legacy_projection_binds_the_projected_readback_and_is_idempotent(tmp_path) -> None:

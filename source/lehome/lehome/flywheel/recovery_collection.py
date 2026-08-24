@@ -207,15 +207,24 @@ def _projection_provenance(
     }
 
 
+def _runtime_cloth_contract(env: object) -> tuple[int, str]:
+    device = str(getattr(env, "device", "cuda:0"))
+    if device == "cpu":
+        return 3, LEGACY_USD_LOCAL_CLOTH_AUTHORITY
+    if re.fullmatch(r"cuda:[0-9]+", device):
+        return 2, PHYSX_CLOTH_STATE_AUTHORITY
+    raise ValueError("controlled recovery runtime device has no supported cloth authority")
+
+
 def _replay_fidelity(env: object, expected: Snapshot) -> Mapping[str, object]:
     from lehome.flywheel.snapshots import capture_snapshot
 
     observed = capture_snapshot(
         env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND},
     )
-    if (observed.schema_version, observed.cloth_state_authority) != (
-        expected.schema_version, expected.cloth_state_authority,
-    ):
+    contract = _runtime_cloth_contract(env)
+    if ((expected.schema_version, expected.cloth_state_authority) != contract
+            or (observed.schema_version, observed.cloth_state_authority) != contract):
         raise ValueError("controlled recovery replay fidelity lacks the expected cloth authority")
     observed_robot = tuple(observed.robot_position)
     observed_robot_velocity = tuple(observed.robot_velocity)
@@ -946,17 +955,12 @@ def bootstrap_controlled_recovery(env: object, assignment: Mapping[str, object])
     projected = capture_snapshot(
         env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND},
     )
-    if (projected.schema_version, projected.cloth_state_authority) != (
-        recovery.continuation_snapshot.schema_version, recovery.continuation_snapshot.cloth_state_authority,
-    ) and not (
-        recovery.continuation_snapshot.schema_version == 3
-        and projected.schema_version == 2
-        and projected.cloth_state_authority == PHYSX_CLOTH_STATE_AUTHORITY
-    ):
+    runtime_contract = _runtime_cloth_contract(env)
+    if (projected.schema_version, projected.cloth_state_authority) != runtime_contract:
         raise ValueError("controlled recovery restore did not read back the expected cloth authority")
     legacy_projection = (
         _projection_provenance(env, recovery, projected)
-        if recovery.continuation_snapshot.schema_version == 3 and projected.schema_version == 2
+        if recovery.continuation_snapshot.schema_version == 3 and runtime_contract[0] == 2
         else None
     )
     replay_target = (
