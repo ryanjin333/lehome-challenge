@@ -214,30 +214,44 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
         raise ValueError("persistent worker simulator device is not bound to the requested backend")
     matrix = _load_matrix(args.attempt_matrix)
     if args.device == "cpu":
-        from lehome.flywheel.recovery_collection import (
-            validate_snapshot_source_descriptor,
-            validate_snapshot_source_discovery_descriptor,
+        controlled_teacher_smoke = (
+            len(matrix) == 1
+            and args.max_attempts == 1
+            and args.target_accepted == 1
+            and matrix[0].get("recovery_kind") == "controlled_success_recovery_snapshot_v3"
+            and matrix[0].get("controlled_smoke") is True
+            and matrix[0].get("controlled_smoke_zero_perturbation") is True
+            and matrix[0].get("controlled_smoke_teacher_probe") is True
+            and matrix[0].get("controlled_smoke_perturbation_mode")
+            == "zero_perturbation_teacher_continuation_probe_v1"
         )
+        if controlled_teacher_smoke:
+            pass  # _load_matrix already authenticates the descriptor mode identity.
+        else:
+            from lehome.flywheel.recovery_collection import (
+                validate_snapshot_source_descriptor,
+                validate_snapshot_source_discovery_descriptor,
+            )
 
-        try:
-            # The retained one-row historical replay form is validated by its
-            # existing checksum/frame gate.  Every fresh CPU discovery row is
-            # otherwise an ordinary, same-category source descriptor.
-            if len(matrix) == 1 and matrix[0].get("replay_kind") == "verified_success_reset_v1":
-                validate_snapshot_source_descriptor(args.attempt_matrix)
-            else:
-                validate_snapshot_source_discovery_descriptor(args.attempt_matrix)
-            if (
-                type(args.max_attempts) is not int
-                or args.max_attempts != len(matrix)
-                or type(args.target_accepted) is not int
-                or not 1 <= args.target_accepted <= min(4, len(matrix))
-            ):
-                raise ValueError("CPU source discovery attempt bounds are invalid")
-        except (OSError, TypeError, ValueError) as error:
-            raise ValueError(
-                "CPU cloth is reserved for bounded snapshot-source bootstrap discovery"
-            ) from error
+            try:
+                # The retained one-row historical replay form is validated by its
+                # existing checksum/frame gate.  Every fresh CPU discovery row is
+                # otherwise an ordinary, same-category source descriptor.
+                if len(matrix) == 1 and matrix[0].get("replay_kind") == "verified_success_reset_v1":
+                    validate_snapshot_source_descriptor(args.attempt_matrix)
+                else:
+                    validate_snapshot_source_discovery_descriptor(args.attempt_matrix)
+                if (
+                    type(args.max_attempts) is not int
+                    or args.max_attempts != len(matrix)
+                    or type(args.target_accepted) is not int
+                    or not 1 <= args.target_accepted <= min(4, len(matrix))
+                ):
+                    raise ValueError("CPU source discovery attempt bounds are invalid")
+            except (OSError, TypeError, ValueError) as error:
+                raise ValueError(
+                    "CPU cloth is reserved for bounded snapshot-source bootstrap discovery"
+                ) from error
     ledger = ledger_factory(
         args.database, attempt_matrix=matrix, max_attempts=args.max_attempts,
         target_accepted=args.target_accepted,

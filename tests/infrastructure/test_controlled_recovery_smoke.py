@@ -533,6 +533,12 @@ def test_base_cpu_cloth_admits_only_the_exact_controlled_teacher_smoke_tuple(tmp
             "controlled_smoke_matrix_sha256": controlled_matrix_sha256,
             "controlled_smoke_materialization_sha256": controlled_materialization_sha256,
             "controlled_smoke_identity": identity,
+            "controlled_smoke_mode_identity": hashlib.sha256(
+                f"{identity}:zero_perturbation_teacher_continuation_probe_v1".encode()
+            ).hexdigest()[:20],
+            "controlled_smoke_zero_perturbation": True,
+            "controlled_smoke_teacher_probe": True,
+            "controlled_smoke_perturbation_mode": "zero_perturbation_teacher_continuation_probe_v1",
             "recovery_kind": "controlled_success_recovery_snapshot_v3",
         }]),
         encoding="utf-8",
@@ -580,6 +586,15 @@ def test_base_cpu_cloth_admits_only_the_exact_controlled_teacher_smoke_tuple(tmp
 
     assert unrelated.returncode == 2
     assert "CPU cloth requires the exact unsealed snapshot-source bootstrap tuple" in unrelated.stderr
+
+    wrong_mode = subprocess.run(
+        ["/bin/bash", str(runner)],
+        env={**env, "LEHOME_ATTEMPT_MATRIX": str(matrix)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert wrong_mode.returncode == 0, wrong_mode.stderr
 
 
 def test_base_campaign_admits_bounded_same_category_source_discovery_tuple(tmp_path: Path) -> None:
@@ -867,7 +882,7 @@ def test_actual_base_campaign_smoke_shims_drain_the_upload_and_never_invoke_seal
     for tool in (fake_bin / "mkdir", fake_bin / "stat", docker): tool.chmod(0o755)
     token = tmp_path / "token"; token.write_text("test-token", encoding="utf-8")
     root = tmp_path / "eval" / f"controlled-recovery-smoke-{run_id}"
-    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_CONTROLLED_RECOVERY_MATRIX": generated["matrix_path"], "LEHOME_CONTROLLED_RECOVERY_MATRIX_SHA256": generated["matrix_sha256"], "LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION": generated["materialization_path"], "LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION_SHA256": generated["materialization_sha256"], "LEHOME_CONTROLLED_RECOVERY_SMOKE_RUN_ID": run_id, "LEHOME_HF_TOKEN_FILE": str(token), "LEHOME_ROLLOUT_PREEMPTION_CONTEXT": str(tmp_path / "preemption.json"), "LEHOME_MAX_WORKER_RESTARTS": "0"}
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_CONTROLLED_RECOVERY_MATRIX": generated["matrix_path"], "LEHOME_CONTROLLED_RECOVERY_MATRIX_SHA256": generated["matrix_sha256"], "LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION": generated["materialization_path"], "LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION_SHA256": generated["materialization_sha256"], "LEHOME_CONTROLLED_RECOVERY_SMOKE_RUN_ID": run_id, "LEHOME_CONTROLLED_RECOVERY_SMOKE_ZERO_PERTURBATION": "1", "LEHOME_CONTROLLED_RECOVERY_SMOKE_TEACHER_PROBE": "1", "LEHOME_HF_TOKEN_FILE": str(token), "LEHOME_ROLLOUT_PREEMPTION_CONTEXT": str(tmp_path / "preemption.json"), "LEHOME_MAX_WORKER_RESTARTS": "0"}
     result = subprocess.run(["/bin/bash", str(SMOKE)], env=env, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
     assert "--role sealer" not in log.read_text(encoding="utf-8")

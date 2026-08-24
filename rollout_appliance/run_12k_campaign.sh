@@ -250,13 +250,19 @@ row = rows[0]
 for key in ("controlled_smoke", "controlled_smoke_matrix_sha256", "controlled_smoke_materialization_sha256"):
     if key not in row: raise SystemExit("controlled smoke descriptor lineage is incomplete")
 if row.get("controlled_smoke") is not True or row.get("recovery_kind") != "controlled_success_recovery_snapshot_v3": raise SystemExit("controlled smoke descriptor kind is invalid")
+if (row.get("controlled_smoke_zero_perturbation") is not True
+        or row.get("controlled_smoke_teacher_probe") is not True
+        or row.get("controlled_smoke_perturbation_mode") != "zero_perturbation_teacher_continuation_probe_v1"):
+    raise SystemExit("controlled smoke descriptor mode is invalid")
 for key in ("controlled_smoke_matrix_sha256", "controlled_smoke_materialization_sha256"):
     if not isinstance(row.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", row[key]) is None: raise SystemExit("controlled smoke descriptor hash is invalid")
 identity = hashlib.sha256(f"{run_id}:{full_matrix}:{full_materialization}".encode("ascii")).hexdigest()[:20]
+mode_identity = hashlib.sha256(f"{identity}:zero_perturbation_teacher_continuation_probe_v1".encode("ascii")).hexdigest()[:20]
 if (row.get("controlled_smoke_run_id") != run_id or row.get("controlled_smoke_row_index") != int(row_index)
         or row.get("controlled_smoke_matrix_sha256") != full_matrix
         or row.get("controlled_smoke_materialization_sha256") != full_materialization
         or row.get("controlled_smoke_identity") != identity
+        or row.get("controlled_smoke_mode_identity") != mode_identity
         or round_id != f"controlled-recovery-smoke-{identity}-unsealed-staging"):
     raise SystemExit("controlled smoke descriptor does not bind the active run identity")
 if row.get("controlled_smoke_descriptor_sha256") not in (None, expected): raise SystemExit("controlled smoke descriptor hash is invalid")
