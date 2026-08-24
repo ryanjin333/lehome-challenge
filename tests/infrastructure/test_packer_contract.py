@@ -269,13 +269,19 @@ def test_rollout_merge_overlays_the_physx_garment_runtime_used_by_workers():
         "cp -a /opt/lehome/source/lehome/lehome/assets/scenes/bedroom.py "
         "/opt/lehome/merged/lehome/assets/scenes/bedroom.py"
     )
+    patched_success_checker = (
+        "cp -a /opt/lehome/source/lehome/lehome/utils/success_checker_chanllege.py "
+        "/opt/lehome/merged/lehome/utils/success_checker_chanllege.py"
+    )
     assert official_copy in merge
     assert patched_garment in merge
     assert patched_collider_audit in merge
     assert patched_room_cfg in merge
+    assert patched_success_checker in merge
     assert merge.index(official_copy) < merge.index(patched_garment)
     assert merge.index(official_copy) < merge.index(patched_collider_audit)
     assert merge.index(official_copy) < merge.index(patched_room_cfg)
+    assert merge.index(official_copy) < merge.index(patched_success_checker)
 
 
 def test_rollout_image_and_stage_carry_the_success_replay_campaign_tools():
