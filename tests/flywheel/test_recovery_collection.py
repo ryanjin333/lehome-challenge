@@ -465,7 +465,7 @@ def test_cpu_schema3_restore_replays_with_usd_local_authority(tmp_path) -> None:
         def flywheel_restore_state(self, snapshot): self.state = snapshot.to_dict()
         def flywheel_capture_state(self): return self.state
         def step(self, _): pass
-        def _get_success(self): return True
+        def flywheel_check_success_unthrottled(self): return True
     env = Env()
     provenance = bootstrap_controlled_recovery(
         env,
@@ -521,7 +521,7 @@ def test_cpu_schema3_teacher_reconstructs_from_the_authenticated_reset_prefix(tm
             if len(self.actions) in {16, 36}:
                 self.state["robot_position"] = [0.1] * 12
 
-        def _get_success(self) -> bool:
+        def flywheel_check_success_unthrottled(self) -> bool:
             return True
 
     env = Env()
@@ -621,7 +621,7 @@ def test_cuda_legacy_projection_binds_the_projected_readback_and_is_idempotent(t
         def step(self, _action) -> None:
             return None
 
-        def _get_success(self) -> bool:
+        def flywheel_check_success_unthrottled(self) -> bool:
             return True
 
     env = Env()
@@ -645,11 +645,15 @@ def test_smoke_teacher_probe_requires_success_then_reconstructs_the_verified_bou
         def flywheel_capture_state(self): return self.state
         def step(self, action) -> None:
             self.actions.append(action); self.state["robot_position"] = [0.0] * 12
-        def _get_success(self): self.success_checks += 1; return self.teacher_success
+        def _get_success(self): self.success_checks += 1; return False
+        def flywheel_check_success_unthrottled(self):
+            self.success_checks += 1
+            return self.teacher_success
 
     env = Env(True)
     provenance = bootstrap_controlled_recovery(env, _assignment(tmp_path / "teacher", teacher=True))
     assert env.actions == [[16.0] * 12, [17.0] * 12, [18.0] * 12, [19.0] * 12]
+    assert env.success_checks == 1
     assert provenance["teacher_probe"]["verified"] is True
     assert len(provenance["replay_fidelity_checks"]) == 2
     with pytest.raises(ValueError, match="teacher probe"):

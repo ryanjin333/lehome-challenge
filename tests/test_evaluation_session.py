@@ -198,6 +198,66 @@ def test_cpu_success_checkpoints_preserve_authored_mesh_indices(
     assert positions == [[200.0, 0.0, 0.0]]
 
 
+def test_raw_garment_fold_success_bypasses_the_fifty_step_throttle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = _success_checker_module(monkeypatch)
+    points = np.asarray(
+        [
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    garment = types.SimpleNamespace(
+        _device="cpu",
+        check_points=[0, 1, 2, 3, 4, 5],
+        success_distance=[1000.0, 1000.0, 10.0, 10.0],
+        init_scale=[1.0],
+        get_current_mesh_points=lambda: (points, points, None, None),
+    )
+
+    assert all(
+        checker.success_checker_garment_fold(garment, "short-pant") is False
+        for _ in range(49)
+    )
+    raw = checker.success_checker_garment_fold_unthrottled(garment, "short-pant")
+    assert raw["success"] is True
+    assert checker.success_checker_garment_fold(garment, "short-pant") == raw
+
+
+def test_flywheel_unthrottled_success_check_calls_the_raw_checker() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "flywheel_check_success_unthrottled"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    calls: list[tuple[object, str]] = []
+
+    def raw_checker(garment, garment_type):
+        calls.append((garment, garment_type))
+        return {"success": True, "metadata_valid": True}
+
+    namespace = {"success_checker_garment_fold_unthrottled": raw_checker}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    env = types.SimpleNamespace(
+        object=types.SimpleNamespace(_cloth_prim_view=object()),
+        garment_loader=types.SimpleNamespace(get_garment_type=lambda _name: "short-pant"),
+        cfg=types.SimpleNamespace(garment_name="Pant_Short_Seen_0"),
+    )
+
+    assert namespace["flywheel_check_success_unthrottled"](env) is True
+    assert calls == [(env.object, "short-pant")]
+
+
 def test_dynamic_mesh_collider_audit_reports_exact_prim_metric_and_limit() -> None:
     audit = _collider_audit_module()
     link = {

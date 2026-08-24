@@ -20,7 +20,10 @@ from isaacsim.core.utils.prims import is_prim_path_valid
 import isaacsim.core.utils.prims as prims_utils
 
 from lehome.tasks.bedroom.garment_bi_cfg_v2 import GarmentEnvCfg
-from lehome.utils.success_checker_chanllege import success_checker_garment_fold
+from lehome.utils.success_checker_chanllege import (
+    success_checker_garment_fold,
+    success_checker_garment_fold_unthrottled,
+)
 from lehome.utils.depth_to_pointcloud import generate_pointcloud_from_data
 from lehome.assets.scenes.bedroom import MARBLE_BEDROOM_CFG
 from lehome.devices.action_process import preprocess_device_action
@@ -508,6 +511,15 @@ class GarmentEnv(DirectRLEnv):
             return result.get("success", False)
         else:
             return bool(result)
+
+    def flywheel_check_success_unthrottled(self) -> bool:
+        """Return the active garment's immediate physical success result."""
+
+        if self.object is None or not hasattr(self.object, "_cloth_prim_view"):
+            return False
+        garment_type = self.garment_loader.get_garment_type(self.cfg.garment_name)
+        result = success_checker_garment_fold_unthrottled(self.object, garment_type)
+        return result.get("success", False) if isinstance(result, dict) else bool(result)
 
     def _get_success(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.object is None:

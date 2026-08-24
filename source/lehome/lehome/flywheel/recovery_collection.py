@@ -285,14 +285,13 @@ def _replay_fidelity(env: object, expected: Snapshot) -> Mapping[str, object]:
 
 
 def _teacher_success(env: object) -> bool:
-    checker = getattr(env, "_get_success", None)
+    checker = getattr(env, "flywheel_check_success_unthrottled", None)
     if not callable(checker):
-        raise ValueError("controlled recovery teacher probe requires a live success checker")
+        raise ValueError("controlled recovery teacher probe requires an unthrottled live success checker")
     result = checker()
-    try:
-        return bool(result.item()) if hasattr(result, "item") else bool(result)
-    except (TypeError, ValueError) as error:
-        raise ValueError("controlled recovery teacher probe success checker is invalid") from error
+    if type(result) is not bool:
+        raise ValueError("controlled recovery teacher probe success checker is invalid")
+    return result
 
 
 def _profile(value: object) -> dict[str, float]:

@@ -325,8 +325,8 @@ def check_pant_short(p, success_distance):
     }
     return cond1 and cond2 and cond3 and cond4, details
 
-@step_interval(interval=50)
-def success_checker_garment_fold(particle_object, garment_type: str):
+def success_checker_garment_fold_unthrottled(particle_object, garment_type: str):
+    """Evaluate garment-fold success immediately without changing physics."""
     check_point_indices = particle_object.check_points  # list[int]
     raw_success_distance = particle_object.success_distance  # list[int]
     current_scale = float(particle_object.init_scale[0])
@@ -362,6 +362,13 @@ def success_checker_garment_fold(particle_object, garment_type: str):
     }
 
     return result
+
+
+@step_interval(interval=50)
+def success_checker_garment_fold(particle_object, garment_type: str):
+    """Preserve the ordinary evaluation checker cadence."""
+
+    return success_checker_garment_fold_unthrottled(particle_object, garment_type)
 
 
 @step_interval(interval=50)
