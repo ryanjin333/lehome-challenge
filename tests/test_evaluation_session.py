@@ -1409,7 +1409,7 @@ def _physx_weld_map_reader():
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
     simulator_error = type("SimulatorNumericalDivergenceError", (ValueError,), {})
-    namespace = {"SimulatorNumericalDivergenceError": simulator_error}
+    namespace = {"np": np, "SimulatorNumericalDivergenceError": simulator_error}
     exec(compile(module, str(source_path), "exec"), namespace)
     return namespace["_flywheel_physx_weld_maps"], simulator_error
 
@@ -1451,6 +1451,64 @@ def test_physx_weld_map_reader_uses_active_cloth_prim_and_fails_closed() -> None
         read_maps(Environment({
             "physxParticle:weldedVerticesRemapToOrig": Attribute([0]),
         }))
+
+
+def test_physx_weld_map_reader_accepts_proven_unwelded_identity_topology() -> None:
+    read_maps, simulator_error = _physx_weld_map_reader()
+
+    class Prim:
+        def GetAttribute(self, _name):
+            return None
+
+    environment = type(
+        "Environment",
+        (),
+        {"object": type("Object", (), {"_prim": Prim()})()},
+    )()
+    authored = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    live = authored.copy()
+
+    welded_to_orig, orig_to_weld = read_maps(
+        environment,
+        asset_positions=authored,
+        live_positions=live,
+    )
+
+    np.testing.assert_array_equal(welded_to_orig, np.arange(3, dtype=np.int64))
+    np.testing.assert_array_equal(orig_to_weld, np.arange(3, dtype=np.int64))
+
+    with __import__("pytest").raises(
+        simulator_error,
+        match="identity particle order is unproven",
+    ):
+        read_maps(
+            environment,
+            asset_positions=authored,
+            live_positions=live[[1, 0, 2]],
+        )
+
+    with __import__("pytest").raises(
+        simulator_error,
+        match="missing cooked weld maps for non-unique authored vertices",
+    ):
+        read_maps(
+            environment,
+            asset_positions=np.asarray([[0.0, 0.0, 0.0]] * 2, dtype=np.float32),
+            live_positions=np.asarray([[1.0, 0.0, 0.0]] * 2, dtype=np.float32),
+        )
+
+    with __import__("pytest").raises(
+        simulator_error,
+        match="identity cardinality is unproven",
+    ):
+        read_maps(
+            environment,
+            asset_positions=authored,
+            live_positions=live[:2],
+        )
 
 
 def test_legacy_usd_snapshot_is_projected_into_live_physx_particle_order() -> None:
@@ -1635,10 +1693,12 @@ def test_legacy_cuda_restore_uses_scene_pose_frame_conversion_before_physx_write
     assert "_flywheel_project_legacy_usd_to_physx" in method_source
     assert "garment_reset_pose" in method_source
     assert "get_world_scale" in method_source
-    assert method_source.index("_flywheel_project_legacy_usd_to_physx") < method_source.index(
+    assert "initial_root_position" in method_source
+    assert "asset_rest_world" in method_source
+    assert method_source.index("_flywheel_project_legacy_usd_to_physx") < method_source.rindex(
         "_flywheel_legacy_local_to_world"
     )
-    assert method_source.index("_flywheel_legacy_local_to_world") < method_source.index(
+    assert method_source.rindex("_flywheel_legacy_local_to_world") < method_source.index(
         "cloth.set_world_positions"
     )
 

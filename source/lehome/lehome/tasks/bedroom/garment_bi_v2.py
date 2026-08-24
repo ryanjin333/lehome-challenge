@@ -927,9 +927,9 @@ class GarmentEnv(DirectRLEnv):
     ) -> tuple[np.ndarray, np.ndarray]:
         """Project legacy USD state into the cooked PhysX particle order.
 
-        PhysX's cooked weld maps, rather than position proximity, are the only
-        topology identity authority.  The live particle positions can already
-        have moved from authored USD rest points when a restore begins.
+        PhysX's cooked weld maps are authoritative when present.  For meshes
+        without cooked maps, identity is admitted only by an ordered rest-point
+        comparison before this projection runs.
         """
 
         source_positions = np.asarray(positions, dtype=np.float32)
@@ -1144,8 +1144,8 @@ class GarmentEnv(DirectRLEnv):
             raise RuntimeError("legacy CPU garment USD points or velocities are unreadable")
         return positions_attr, velocities_attr
 
-    def _flywheel_physx_weld_maps(self):
-        """Read the cooked topology maps from the active PhysX cloth prim."""
+    def _flywheel_physx_weld_maps(self, *, asset_positions=None, live_positions=None):
+        """Read cooked topology maps, or prove that the live topology is identity."""
 
         prim = getattr(self.object, "_prim", None)
         get_attribute = getattr(prim, "GetAttribute", None)
@@ -1154,13 +1154,11 @@ class GarmentEnv(DirectRLEnv):
                 "live PhysX cloth prim does not expose cooked weld maps"
             )
 
-        def read_map(attribute_name: str):
+        def read_optional_map(attribute_name: str):
             attribute = get_attribute(attribute_name)
             is_valid = getattr(attribute, "IsValid", None)
             if attribute is None or (callable(is_valid) and not is_valid()):
-                raise SimulatorNumericalDivergenceError(
-                    f"live PhysX cloth prim is missing {attribute_name}"
-                )
+                return None
             get_value = getattr(attribute, "Get", None)
             if not callable(get_value):
                 raise SimulatorNumericalDivergenceError(
@@ -1168,15 +1166,74 @@ class GarmentEnv(DirectRLEnv):
                 )
             value = get_value()
             if value is None:
+                return None
+            try:
+                return value if len(value) else None
+            except TypeError as error:
                 raise SimulatorNumericalDivergenceError(
-                    f"live PhysX cloth prim has unset {attribute_name}"
-                )
-            return value
+                    f"live PhysX cloth prim has invalid {attribute_name}"
+                ) from error
 
-        return (
-            read_map("physxParticle:weldedVerticesRemapToOrig"),
-            read_map("physxParticle:weldedVerticesRemapToWeld"),
+        map_names = (
+            "physxParticle:weldedVerticesRemapToOrig",
+            "physxParticle:weldedVerticesRemapToWeld",
         )
+        remap_to_orig, remap_to_weld = (
+            read_optional_map(map_names[0]), read_optional_map(map_names[1])
+        )
+        if remap_to_orig is not None and remap_to_weld is not None:
+            return remap_to_orig, remap_to_weld
+        if (remap_to_orig is None) != (remap_to_weld is None):
+            missing = map_names[0] if remap_to_orig is None else map_names[1]
+            raise SimulatorNumericalDivergenceError(
+                f"live PhysX cloth prim is missing {missing}"
+            )
+
+        # PhysX omits cooked weld arrays for meshes whose authored point order
+        # is already the simulation point order.  NVIDIA's installed schema
+        # converter proves that this weld operation is exact coordinate
+        # deduplication.  Accept identity only when authored and live rest
+        # points prove the same order; ambiguous or actually welded meshes
+        # continue to fail closed.
+        welded_triangles = read_optional_map("physxParticle:weldedTriangleIndices")
+        if welded_triangles is not None:
+            raise SimulatorNumericalDivergenceError(
+                "live PhysX cloth prim has welded triangles without cooked vertex maps"
+            )
+        try:
+            asset = np.asarray(asset_positions, dtype=np.float32)
+            live = np.asarray(live_positions, dtype=np.float32)
+        except (TypeError, ValueError) as error:
+            raise SimulatorNumericalDivergenceError(
+                "live PhysX cloth prim is missing cooked weld maps"
+            ) from error
+        if (
+            asset.ndim != 2
+            or asset.shape[1:] != (3,)
+            or live.ndim != 2
+            or live.shape[1:] != (3,)
+            or len(asset) == 0
+            or len(live) != len(asset)
+            or not np.isfinite(asset).all()
+            or not np.isfinite(live).all()
+        ):
+            raise SimulatorNumericalDivergenceError(
+                "live PhysX cloth prim is missing cooked weld maps and identity cardinality is unproven"
+            )
+        normalized_asset = asset.copy()
+        normalized_asset[normalized_asset == 0.0] = 0.0
+        if len(np.unique(normalized_asset, axis=0)) != len(normalized_asset):
+            raise SimulatorNumericalDivergenceError(
+                "live PhysX cloth prim is missing cooked weld maps for non-unique authored vertices"
+            )
+        if not np.allclose(asset, live, rtol=0.0, atol=1e-6):
+            max_abs_delta = float(np.max(np.abs(asset - live)))
+            raise SimulatorNumericalDivergenceError(
+                "live PhysX cloth prim is missing cooked weld maps and identity particle order "
+                f"is unproven: max_abs_delta={max_abs_delta:.9g}"
+            )
+        identity = np.arange(len(asset), dtype=np.int64)
+        return identity, identity.copy()
 
     def _flywheel_legacy_cpu_cloth_state(self) -> tuple[np.ndarray, np.ndarray]:
         positions_attr, velocities_attr = self._flywheel_legacy_cpu_cloth_attributes()
@@ -1570,8 +1627,21 @@ class GarmentEnv(DirectRLEnv):
                 )
             asset_points = to_numpy(self.object._get_points_pose()).reshape(-1, 3)
             live_rest_world = to_numpy(self.object.initial_points_positions).reshape(-1, 3)
+            initial_root_position = to_numpy(self.object.initial_root_position).reshape(3)
+            initial_root_orientation = to_numpy(self.object.initial_root_orientation).reshape(4)
+            initial_root_rotation = quat_to_rot_matrix(initial_root_orientation)
+            asset_rest_world, _ = self._flywheel_legacy_local_to_world(
+                asset_points,
+                np.zeros_like(asset_points),
+                initial_root_position,
+                initial_root_rotation,
+                scale,
+            )
             welded_vertices_remap_to_orig, welded_vertices_remap_to_weld = (
-                self._flywheel_physx_weld_maps()
+                self._flywheel_physx_weld_maps(
+                    asset_positions=asset_rest_world,
+                    live_positions=live_rest_world,
+                )
             )
             def weld_digest(value) -> str:
                 vector = np.asarray(value)
