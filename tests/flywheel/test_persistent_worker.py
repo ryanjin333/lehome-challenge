@@ -131,6 +131,58 @@ def test_source_discovery_waits_for_clean_rejection_then_reuses_the_same_session
     assert controller.status_calls == ["attempt-a", "attempt-a", "attempt-b"]
 
 
+def test_policy_action_safety_rejection_durably_rejects_source_lease_and_continues(
+    tmp_path,
+) -> None:
+    from lehome.flywheel.persistent_worker import (
+        InfrastructureInvalidAttemptError,
+        PersistentRolloutWorker,
+        PolicyActionSafetyRejectionError,
+    )
+
+    first = Lease(Attempt("attempt-a", _source_assignment(11)), "lease-a")
+    second = Lease(Attempt("attempt-b", _source_assignment(12)), "lease-b")
+
+    class RejectingSourceController(SourceController):
+        def __init__(self) -> None:
+            super().__init__([first, second], {"attempt-b": ["accepted"]})
+            self.rejected: list[tuple[str, str, str, str]] = []
+
+        def reject_attempt(self, worker_id, attempt_id, lease_id, *, reason):
+            self.rejected.append((worker_id, attempt_id, lease_id, reason))
+            return "rejected"
+
+    class PolicyRejectedSession(FakeSession):
+        def run_episode(self, *, assignment, **kwargs):
+            self.runs.append(str(assignment["attempt_id"]))
+            if assignment["attempt_id"] == "attempt-a":
+                raise PolicyActionSafetyRejectionError(
+                    "policy_action_outside_live_joint_limits"
+                )
+            return {"success": True, "output_dir": str(kwargs["attempt_output_dir"])}
+
+    controller = RejectingSourceController()
+    session = PolicyRejectedSession()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+
+    receipts = worker.run()
+
+    assert not issubclass(
+        PolicyActionSafetyRejectionError, InfrastructureInvalidAttemptError
+    )
+    assert controller.rejected == [
+        ("worker-0", "attempt-a", "lease-a", "policy_action_outside_live_joint_limits")
+    ]
+    assert controller.infrastructure_aborts == []
+    assert session.runs == ["attempt-a", "attempt-b"]
+    assert [receipt["attempt_id"] for receipt in receipts] == ["attempt-b"]
+    assert controller.status_calls == ["attempt-b"]
+
+
 def test_source_discovery_runtime_infrastructure_abort_stops_before_the_second_lease(tmp_path) -> None:
     from lehome.flywheel.persistent_worker import PersistentRolloutWorker
 

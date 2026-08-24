@@ -11,6 +11,7 @@ import types
 from collections.abc import Mapping
 
 import numpy as np
+import pytest
 
 
 def _collider_audit_module():
@@ -1830,6 +1831,12 @@ def _evaluation(monkeypatch):
     modules["lehome.flywheel.persistent_worker"].SimulatorNumericalDivergenceError = type(
         "SimulatorNumericalDivergenceError", (ValueError,), {}
     )
+    modules["lehome.flywheel.persistent_worker"].PolicyActionSafetyRejectionError = type(
+        "PolicyActionSafetyRejectionError", (ValueError,), {}
+    )
+    modules["lehome.flywheel.persistent_worker"].POLICY_ACTION_SAFETY_REJECTION_REASON = (
+        "policy_action_outside_live_joint_limits"
+    )
     modules["lehome.flywheel"].__path__ = [
         str(repository / "source" / "lehome" / "lehome" / "flywheel")
     ]
@@ -2981,10 +2988,19 @@ def test_policy_action_diagnostics_label_every_joint_with_limit_and_live_delta()
     }
 
 
-def test_recorder_flywheel_step_projects_raw_policy_targets_and_records_the_applied_action(
+@pytest.mark.parametrize(
+    ("raw_elbow_targets", "rejects_policy"),
+    [
+        ((1.25, -1.5), True),
+        ((1.000004, -1.000004), False),
+    ],
+)
+def test_recorder_flywheel_step_rejects_material_policy_targets_but_projects_tiny_conversion_excess(
+    raw_elbow_targets,
+    rejects_policy,
     monkeypatch, tmp_path
 ) -> None:
-    """The physical target is bounded, while raw policy-limit evidence remains intact."""
+    """Only negligible target conversion error may be projected before physics."""
     evaluation = _evaluation(monkeypatch)
 
     assert hasattr(evaluation, "_project_flywheel_policy_action_to_live_limits")
@@ -3053,6 +3069,7 @@ def test_recorder_flywheel_step_projects_raw_policy_targets_and_records_the_appl
     monkeypatch.setattr(evaluation, "_validate_active_flywheel_garment", lambda *_args: None)
 
     recorded_actions = []
+    finish_calls = []
 
     class Recorder:
         def __init__(self, *_args, **_kwargs):
@@ -3068,8 +3085,8 @@ def test_recorder_flywheel_step_projects_raw_policy_targets_and_records_the_appl
         def record_continuation_snapshot(self, *_args, **_kwargs):
             pass
 
-        def finish(self, **_kwargs):
-            pass
+        def finish(self, **kwargs):
+            finish_calls.append(kwargs)
 
     recorder_module = types.ModuleType("lehome.flywheel.isaac_recorder")
     recorder_module.AutonomousRecorder = Recorder
@@ -3123,11 +3140,22 @@ def test_recorder_flywheel_step_projects_raw_policy_targets_and_records_the_appl
     monkeypatch.setattr(
         evaluation, "_flywheel_policy_action_limit_diagnostics", capture_raw_diagnostics
     )
+    projection_diagnostics = []
+    original_projection = evaluation._project_flywheel_policy_action_to_live_limits
+
+    def capture_projection(step_env, action):
+        projected, diagnostics = original_projection(step_env, action)
+        projection_diagnostics.append(diagnostics)
+        return projected, diagnostics
+
+    monkeypatch.setattr(
+        evaluation, "_project_flywheel_policy_action_to_live_limits", capture_projection
+    )
     policy = types.SimpleNamespace(
         reset=lambda: None,
         select_action_with_provenance=lambda _observation: types.SimpleNamespace(
             value=np.asarray(
-                [0.25, 0.0, 1.25, 0.0, 0.0, 0.0, 0.0, 0.0, -1.5, 0.0, 0.0, 0.0],
+                [0.25, 0.0, raw_elbow_targets[0], 0.0, 0.0, 0.0, 0.0, 0.0, raw_elbow_targets[1], 0.0, 0.0, 0.0],
                 dtype=np.float32,
             ),
             request_id="request-1",
@@ -3146,20 +3174,36 @@ def test_recorder_flywheel_step_projects_raw_policy_targets_and_records_the_appl
         save_video=False,
     )
 
+    if rejects_policy:
+        with pytest.raises(
+            evaluation.PolicyActionSafetyRejectionError,
+            match="policy_action_outside_live_joint_limits",
+        ):
+            evaluation.run_evaluation_loop(
+                env, policy, args, garment_name="Top_Long_Seen_0"
+            )
+
+        assert stepped_actions == []
+        assert recorded_actions == []
+        assert finish_calls == []
+        assert raw_diagnostics[0]["policy_action_outside_live_joint_limit_count"] == 2
+        assert projection_diagnostics == []
+        return
+
     evaluation.run_evaluation_loop(env, policy, args, garment_name="Top_Long_Seen_0")
 
     assert raw_diagnostics[0]["policy_action_outside_live_joint_limit_count"] == 2
     assert raw_diagnostics[0]["policy_action_joint_diagnostics"]["left_elbow_flex"] == {
         "target_finite": True,
         "outside_live_joint_limit": True,
-        "limit_violation_rad": 0.25,
-        "target_to_live_joint_position_delta_rad": 1.25,
+        "limit_violation_rad": pytest.approx(0.000004, abs=0.0000001),
+        "target_to_live_joint_position_delta_rad": pytest.approx(1.000004, abs=0.0000001),
     }
     assert raw_diagnostics[0]["policy_action_joint_diagnostics"]["right_elbow_flex"] == {
         "target_finite": True,
         "outside_live_joint_limit": True,
-        "limit_violation_rad": 0.5,
-        "target_to_live_joint_position_delta_rad": 1.5,
+        "limit_violation_rad": pytest.approx(0.000004, abs=0.0000001),
+        "target_to_live_joint_position_delta_rad": pytest.approx(1.000004, abs=0.0000001),
     }
     expected = np.asarray(
         [[0.25, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0]],
@@ -3167,6 +3211,28 @@ def test_recorder_flywheel_step_projects_raw_policy_targets_and_records_the_appl
     )
     np.testing.assert_array_equal(stepped_actions, [expected])
     np.testing.assert_array_equal(recorded_actions, [expected.squeeze(0)])
+    assert projection_diagnostics == [{
+        "policy_action_projection_count": 2,
+        "policy_action_projection_joint_diagnostics": {
+            name: {
+                "projected": name in {"left_elbow_flex", "right_elbow_flex"},
+                "absolute_projection_rad": (
+                    pytest.approx(0.000004, abs=0.0000001)
+                    if name in {"left_elbow_flex", "right_elbow_flex"}
+                    else 0.0
+                ),
+            }
+            for name in evaluation._FLYWHEEL_POLICY_ACTION_JOINT_NAMES
+        },
+    }]
+    assert finish_calls == [{
+        "reason": "horizon",
+        "accepted_success": False,
+        "visible_contact": {
+            "observed": True,
+            "minimum_distance_m": 0.01,
+        },
+    }]
 
 
 def test_recorder_flywheel_step_fails_closed_before_env_step_when_live_limits_are_malformed(

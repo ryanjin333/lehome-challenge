@@ -26,6 +26,7 @@ _PREPARATION_TIMEOUT_REASON = "preparation_timeout"
 _PREPARATION_TIMEOUT_EXIT_STATUS = 70
 _SOURCE_FINALIZATION_POLL_SECONDS = 1.0
 _DEFAULT_SOURCE_FINALIZATION_TIMEOUT_SECONDS = 300.0
+POLICY_ACTION_SAFETY_REJECTION_REASON = "policy_action_outside_live_joint_limits"
 
 
 class PreparationTimeoutError(RuntimeError):
@@ -34,6 +35,10 @@ class PreparationTimeoutError(RuntimeError):
 
 class InfrastructureInvalidAttemptError(ValueError):
     """An episode cannot be used because runtime evidence is invalid."""
+
+
+class PolicyActionSafetyRejectionError(ValueError):
+    """A raw policy target exceeded the live joint-limit safety tolerance."""
 
 
 class SimulatorNumericalDivergenceError(InfrastructureInvalidAttemptError):
@@ -482,6 +487,19 @@ class PersistentRolloutWorker:
                         # This path exists solely when an injected test exit
                         # hook returns; never append a contradictory retry.
                         raise
+                    if isinstance(error, PolicyActionSafetyRejectionError):
+                        reject = getattr(self._controller, "reject_attempt", None)
+                        if not callable(reject):
+                            raise RuntimeError(
+                                "controller does not support durable policy safety rejection"
+                            ) from error
+                        reject(
+                            self.identity.worker_id,
+                            attempt_id,
+                            lease_id,
+                            reason=POLICY_ACTION_SAFETY_REJECTION_REASON,
+                        )
+                        continue
                     if isinstance(error, InfrastructureInvalidAttemptError):
                         abort = getattr(self._controller, "record_infrastructure_abort", None)
                         if not callable(abort):
@@ -565,7 +583,9 @@ class PersistentRolloutWorker:
 
 
 __all__ = [
-    "ACTION_HORIZON", "InfrastructureInvalidAttemptError", "PreparationTimeoutError",
+    "ACTION_HORIZON", "InfrastructureInvalidAttemptError",
+    "POLICY_ACTION_SAFETY_REJECTION_REASON", "PolicyActionSafetyRejectionError",
+    "PreparationTimeoutError",
     "PersistentRolloutWorker", "WorkerIdentity",
     "SimulatorNumericalDivergenceError",
 ]

@@ -29,7 +29,11 @@ from lehome.utils.record import (
 )
 from .common import stabilize_garment_after_reset
 from lehome.utils.logger import get_logger
-from lehome.flywheel.persistent_worker import SimulatorNumericalDivergenceError
+from lehome.flywheel.persistent_worker import (
+    POLICY_ACTION_SAFETY_REJECTION_REASON,
+    PolicyActionSafetyRejectionError,
+    SimulatorNumericalDivergenceError,
+)
 
 logger = get_logger(__name__)
 
@@ -47,6 +51,7 @@ _FLYWHEEL_POLICY_ACTION_JOINT_NAMES = (
     "right_wrist_roll",
     "right_gripper",
 )
+_FLYWHEEL_POLICY_ACTION_LIMIT_PROJECTION_TOLERANCE_RAD = 1e-5
 
 
 def _flywheel_policy_action_limit_diagnostics(env: Any, action: Any) -> dict[str, object]:
@@ -123,7 +128,7 @@ def _flywheel_policy_action_limit_diagnostics(env: Any, action: Any) -> dict[str
 def _project_flywheel_policy_action_to_live_limits(
     env: Any, action: Any
 ) -> tuple[Any, dict[str, object]]:
-    """Clamp a finite recorder action to the live soft joint-position contract."""
+    """Project only negligible target-conversion error to live joint limits."""
 
     def numpy_array(value: Any) -> np.ndarray:
         detach = getattr(value, "detach", None)
@@ -177,6 +182,10 @@ def _project_flywheel_policy_action_to_live_limits(
         else:
             applied_target = raw_target
         absolute_projection = abs(raw_target - applied_target)
+        if absolute_projection > _FLYWHEEL_POLICY_ACTION_LIMIT_PROJECTION_TOLERANCE_RAD:
+            raise PolicyActionSafetyRejectionError(
+                POLICY_ACTION_SAFETY_REJECTION_REASON
+            )
         was_projected = absolute_projection > 0.0
         if was_projected:
             if projected is action:
