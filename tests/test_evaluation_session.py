@@ -26,6 +26,178 @@ def _collider_audit_module():
     return module
 
 
+def _success_checker_module(monkeypatch: pytest.MonkeyPatch):
+    logger_module = types.ModuleType("lehome.utils.logger")
+    logger_module.get_logger = lambda _name: types.SimpleNamespace(
+        error=lambda _message: None
+    )
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    monkeypatch.setitem(sys.modules, "lehome", types.ModuleType("lehome"))
+    monkeypatch.setitem(sys.modules, "lehome.utils", types.ModuleType("lehome.utils"))
+    monkeypatch.setitem(sys.modules, "lehome.utils.logger", logger_module)
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/utils/success_checker_chanllege.py"
+    )
+    spec = importlib.util.spec_from_file_location("success_checker_test", source_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _SuccessAttribute:
+    def __init__(self, value):
+        self._value = value
+
+    def IsValid(self) -> bool:
+        return True
+
+    def Get(self):
+        return self._value
+
+
+class _SuccessPrim:
+    def __init__(self, attributes):
+        self._attributes = attributes
+
+    def GetAttribute(self, name: str):
+        return self._attributes.get(name)
+
+
+def test_cuda_success_checkpoints_use_cooked_authored_to_welded_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = _success_checker_module(monkeypatch)
+    live_points = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    garment = types.SimpleNamespace(
+        _device="cuda:0",
+        _prim=_SuccessPrim(
+            {
+                "physxParticle:weldedVerticesRemapToOrig": _SuccessAttribute(
+                    [0, 1, 3, 4]
+                ),
+                "physxParticle:weldedVerticesRemapToWeld": _SuccessAttribute(
+                    [0, 1, 1, 2, 3]
+                ),
+            }
+        ),
+        get_current_mesh_points=lambda: (live_points, live_points, None, None),
+    )
+
+    positions = checker.get_object_particle_position(garment, [2, 4])
+
+    assert positions == [[100.0, 0.0, 0.0], [300.0, 0.0, 0.0]]
+
+
+def test_cuda_success_checkpoints_reject_welded_topology_without_maps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = _success_checker_module(monkeypatch)
+    live_points = np.zeros((4, 3), dtype=np.float32)
+    garment = types.SimpleNamespace(
+        _device="cuda:0",
+        _prim=_SuccessPrim(
+            {
+                "physxParticle:weldedTriangleIndices": _SuccessAttribute([0, 1, 2]),
+            }
+        ),
+        get_current_mesh_points=lambda: (live_points, live_points, None, None),
+    )
+
+    with pytest.raises(
+        checker.InvalidCheckpointMetadataError,
+        match="welded topology is missing cooked vertex maps",
+    ):
+        checker.get_object_particle_position(garment, [1])
+
+
+def test_cuda_success_checkpoints_reject_unavailable_topology_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = _success_checker_module(monkeypatch)
+    live_points = np.zeros((4, 3), dtype=np.float32)
+    garment = types.SimpleNamespace(
+        _device="cuda:0",
+        get_current_mesh_points=lambda: (live_points, live_points, None, None),
+    )
+
+    with pytest.raises(
+        checker.InvalidCheckpointMetadataError,
+        match="cannot prove cooked particle identity",
+    ):
+        checker.get_object_particle_position(garment, [1])
+
+
+def test_cuda_success_checkpoints_reject_unproven_no_map_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = _success_checker_module(monkeypatch)
+    live_points = np.zeros((4, 3), dtype=np.float32)
+    garment = types.SimpleNamespace(
+        _device="cuda:0",
+        _prim=_SuccessPrim({}),
+        get_current_mesh_points=lambda: (live_points, live_points, None, None),
+    )
+
+    with pytest.raises(
+        checker.InvalidCheckpointMetadataError,
+        match="cannot prove unwelded identity topology",
+    ):
+        checker.get_object_particle_position(garment, [1])
+
+
+def test_cuda_success_checkpoints_accept_proven_unwelded_identity_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = _success_checker_module(monkeypatch)
+    live_points = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    garment = types.SimpleNamespace(
+        _device="cuda:0",
+        _prim=_SuccessPrim(
+            {
+                "physxParticle:weldedVerticesRemapToOrig": _SuccessAttribute([]),
+                "physxParticle:weldedVerticesRemapToWeld": _SuccessAttribute([]),
+            }
+        ),
+        _get_points_pose=lambda: live_points.copy(),
+        get_current_mesh_points=lambda: (live_points, live_points, None, None),
+    )
+
+    positions = checker.get_object_particle_position(garment, [2])
+
+    assert positions == [[0.0, 100.0, 0.0]]
+
+
+def test_cpu_success_checkpoints_preserve_authored_mesh_indices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = _success_checker_module(monkeypatch)
+    authored_points = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    garment = types.SimpleNamespace(
+        _device="cpu",
+        get_current_mesh_points=lambda: (
+            authored_points,
+            authored_points,
+            None,
+            None,
+        ),
+    )
+
+    positions = checker.get_object_particle_position(garment, [2])
+
+    assert positions == [[200.0, 0.0, 0.0]]
+
+
 def test_dynamic_mesh_collider_audit_reports_exact_prim_metric_and_limit() -> None:
     audit = _collider_audit_module()
     link = {

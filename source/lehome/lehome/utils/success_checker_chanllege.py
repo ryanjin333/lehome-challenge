@@ -39,6 +39,132 @@ def calculate_distance(point_a, point_b):
     return np.linalg.norm(point_a - point_b)
 
 
+def _resolve_particle_indices(particle_object, index_list, mesh_point_count):
+    """Translate authored USD checkpoints into the cooked PhysX particle order."""
+
+    try:
+        authored_indices = np.asarray(index_list)
+    except (TypeError, ValueError) as error:
+        raise InvalidCheckpointMetadataError(
+            "garment checkpoint metadata must be a one-dimensional integer array"
+        ) from error
+    if authored_indices.ndim != 1 or authored_indices.dtype.kind not in "iu":
+        raise InvalidCheckpointMetadataError(
+            "garment checkpoint metadata must be a one-dimensional integer array"
+        )
+    authored_indices = authored_indices.astype(np.int64, copy=False)
+
+    device = str(getattr(particle_object, "_device", "")).lower()
+    if device == "cuda" or (device.startswith("cuda:") and device[5:].isdigit()):
+        prim = getattr(particle_object, "_prim", None)
+        get_attribute = getattr(prim, "GetAttribute", None)
+        if not callable(get_attribute):
+            raise InvalidCheckpointMetadataError(
+                "garment PhysX checkpoint topology cannot prove cooked particle identity"
+            )
+        if callable(get_attribute):
+            def read_map(name):
+                attribute = get_attribute(name)
+                if attribute is None:
+                    return None
+                is_valid = getattr(attribute, "IsValid", None)
+                if callable(is_valid) and not is_valid():
+                    return None
+                get_value = getattr(attribute, "Get", None)
+                value = get_value() if callable(get_value) else None
+                if value is None:
+                    return None
+                vector = np.asarray(value)
+                return None if vector.size == 0 else vector
+
+            remap_to_orig = read_map("physxParticle:weldedVerticesRemapToOrig")
+            remap_to_weld = read_map("physxParticle:weldedVerticesRemapToWeld")
+            if (remap_to_orig is None) != (remap_to_weld is None):
+                raise InvalidCheckpointMetadataError(
+                    "garment PhysX checkpoint topology has an incomplete cooked weld map"
+                )
+            if remap_to_orig is None:
+                welded_triangles = read_map(
+                    "physxParticle:weldedTriangleIndices"
+                )
+                if welded_triangles is not None and welded_triangles.size:
+                    raise InvalidCheckpointMetadataError(
+                        "garment PhysX welded topology is missing cooked vertex maps"
+                    )
+                get_authored_points = getattr(
+                    particle_object, "_get_points_pose", None
+                )
+                try:
+                    authored_points = get_authored_points()
+                    for method_name in ("detach", "cpu", "numpy"):
+                        method = getattr(authored_points, method_name, None)
+                        if callable(method):
+                            authored_points = method()
+                    authored_points = np.asarray(authored_points, dtype=np.float32)
+                except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+                    raise InvalidCheckpointMetadataError(
+                        "garment PhysX checkpoint topology cannot prove unwelded identity topology"
+                    ) from error
+                normalized = authored_points.copy()
+                normalized[normalized == 0.0] = 0.0
+                if (
+                    authored_points.ndim != 2
+                    or authored_points.shape[1:] != (3,)
+                    or len(authored_points) != mesh_point_count
+                    or not np.isfinite(authored_points).all()
+                    or len(np.unique(normalized, axis=0)) != mesh_point_count
+                ):
+                    raise InvalidCheckpointMetadataError(
+                        "garment PhysX checkpoint topology cannot prove unwelded identity topology"
+                    )
+            if remap_to_orig is not None:
+                if (
+                    remap_to_orig.ndim != 1
+                    or remap_to_weld.ndim != 1
+                    or remap_to_orig.dtype.kind not in "iu"
+                    or remap_to_weld.dtype.kind not in "iu"
+                    or len(remap_to_orig) != mesh_point_count
+                ):
+                    raise InvalidCheckpointMetadataError(
+                        "garment PhysX checkpoint topology has an invalid cooked weld map"
+                    )
+                remap_to_orig = remap_to_orig.astype(np.int64, copy=False)
+                remap_to_weld = remap_to_weld.astype(np.int64, copy=False)
+                if (
+                    np.any(remap_to_orig < 0)
+                    or np.any(remap_to_orig >= len(remap_to_weld))
+                    or np.any(remap_to_weld < 0)
+                    or np.any(remap_to_weld >= mesh_point_count)
+                    or not np.array_equal(
+                        remap_to_weld[remap_to_orig],
+                        np.arange(mesh_point_count, dtype=np.int64),
+                    )
+                ):
+                    raise InvalidCheckpointMetadataError(
+                        "garment PhysX checkpoint topology has a non-invertible cooked weld map"
+                    )
+                invalid_authored = authored_indices[
+                    (authored_indices < 0) | (authored_indices >= len(remap_to_weld))
+                ]
+                if invalid_authored.size:
+                    raise InvalidCheckpointMetadataError(
+                        "garment checkpoint metadata references nonexistent authored vertices: "
+                        f"invalid_indices={invalid_authored.tolist()}, "
+                        f"authored_point_count={len(remap_to_weld)}"
+                    )
+                return remap_to_weld[authored_indices]
+
+    invalid_indices = authored_indices[
+        (authored_indices < 0) | (authored_indices >= mesh_point_count)
+    ]
+    if invalid_indices.size:
+        raise InvalidCheckpointMetadataError(
+            "garment checkpoint metadata references nonexistent mesh vertices: "
+            f"invalid_indices={invalid_indices.tolist()}, mesh_point_count={mesh_point_count}"
+        )
+    return authored_indices
+
+
 def get_object_particle_position(particle_object, index_list):
     try:
         transformed_mesh_points, _, _, _ = particle_object.get_current_mesh_points()
@@ -57,16 +183,10 @@ def get_object_particle_position(particle_object, index_list):
             return
 
     mesh_point_count = len(transformed_mesh_points)
-    invalid_indices = [
-        int(index) for index in index_list if index < 0 or index >= mesh_point_count
-    ]
-    if invalid_indices:
-        raise InvalidCheckpointMetadataError(
-            "garment checkpoint metadata references nonexistent mesh vertices: "
-            f"invalid_indices={invalid_indices}, mesh_point_count={mesh_point_count}"
-        )
-
-    positions = (transformed_mesh_points[index_list] * 100).tolist()
+    particle_indices = _resolve_particle_indices(
+        particle_object, index_list, mesh_point_count
+    )
+    positions = (transformed_mesh_points[particle_indices] * 100).tolist()
     return positions
 
 
