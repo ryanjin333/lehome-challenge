@@ -2541,6 +2541,94 @@ def test_evaluation_session_explicit_reset_flag_preserves_legacy_per_episode_res
     assert reset_flags == [True, False]
 
 
+def test_cpu_controlled_recovery_bootstrap_receives_a_source_seeded_reset_callback(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    events: list[object] = []
+    controlled = {"source_seed": 50110}
+    manifest = {
+        "_path": tmp_path / "flywheel-manifest.json",
+        "strategy": "canonical",
+        "seed": 1,
+        "policy_revision": "revision",
+        "policy_artifact_sha256": "artifact",
+        "image_identity": "image",
+        "execution_mode": "policy_server",
+        "execution_backend": "policy_server",
+        "simulator_device": "cpu",
+        "controlled_recovery": controlled,
+    }
+    monkeypatch.setattr(evaluation, "_load_flywheel_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        evaluation, "_flywheel_identity",
+        lambda _manifest: types.SimpleNamespace(garment_name="Top_Long_Seen_0"),
+    )
+    monkeypatch.setattr(evaluation, "_validate_active_flywheel_garment", lambda *_args: None)
+    monkeypatch.setattr(evaluation, "stabilize_garment_after_reset", lambda *_args: events.append("stabilize"))
+    evaluation.RateLimiter = lambda _step_hz: None
+    evaluation.torch = types.SimpleNamespace(tensor=lambda value: value, Tensor=())
+
+    recorder_module = types.ModuleType("lehome.flywheel.isaac_recorder")
+    recorder_module.AutonomousRecorder = lambda *_args, **_kwargs: types.SimpleNamespace(
+        record_snapshot=lambda *_args, **_kwargs: None,
+    )
+    randomization_module = types.ModuleType("lehome.flywheel.randomization")
+    randomization_module.sample_randomization = lambda *_args, **_kwargs: types.SimpleNamespace(values={})
+    randomization_module.validate_randomization_receipt = (
+        lambda values, receipt: events.append(("receipt", values, receipt))
+    )
+    snapshots_module = types.ModuleType("lehome.flywheel.snapshots")
+    snapshots_module.capture_snapshot = lambda *_args, **_kwargs: {"snapshot": True}
+    recovery_module = types.ModuleType("lehome.flywheel.recovery_collection")
+    recovery_module.load_controlled_recovery = lambda _controlled: types.SimpleNamespace(
+        provenance={"source_seed": 50110},
+    )
+
+    class BootstrapComplete(Exception):
+        pass
+
+    def bootstrap(env, _controlled, *, reset_callback):
+        events.append("bootstrap")
+        reset_callback()
+        raise BootstrapComplete
+
+    recovery_module.bootstrap_controlled_recovery = bootstrap
+    monkeypatch.setitem(sys.modules, "lehome.flywheel.isaac_recorder", recorder_module)
+    monkeypatch.setitem(sys.modules, "lehome.flywheel.randomization", randomization_module)
+    monkeypatch.setitem(sys.modules, "lehome.flywheel.snapshots", snapshots_module)
+    monkeypatch.setitem(sys.modules, "lehome.flywheel.recovery_collection", recovery_module)
+
+    env = types.SimpleNamespace(
+        device="cpu",
+        reset=lambda: events.append("reset"),
+        set_seed=lambda seed: events.append(("seed", seed)),
+        apply_flywheel_randomization=lambda _sampled: {},
+        flywheel_cloth_physical_health=lambda: {"healthy": True},
+        _get_observations=lambda: {"observation.state": np.zeros(12, dtype=np.float32)},
+        _get_success=lambda: False,
+        _get_rewards=lambda: 0.0,
+    )
+    policy = types.SimpleNamespace(reset=lambda: None)
+    args = types.SimpleNamespace(
+        save_datasets=False,
+        flywheel_manifest="enabled",
+        seed=1,
+        num_episodes=1,
+        step_hz=30,
+        max_steps=0,
+        use_ee_pose=False,
+        device="cpu",
+        save_video=False,
+    )
+
+    with pytest.raises(BootstrapComplete):
+        evaluation.run_evaluation_loop(env, policy, args, garment_name="Top_Long_Seen_0")
+
+    assert events == [
+        ("seed", 50110), "reset", "stabilize", ("receipt", {}, {}),
+        "bootstrap", ("seed", 50110), "reset", "stabilize", ("receipt", {}, {}),
+    ]
+
+
 def test_persistent_attempt_authors_an_official_flywheel_manifest(monkeypatch, tmp_path) -> None:
     evaluation = _evaluation(monkeypatch)
     captured = []

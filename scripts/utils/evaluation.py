@@ -841,11 +841,32 @@ def run_evaluation_loop(
         _validate_active_flywheel_garment(env, flywheel_identity)
         if garment_name != flywheel_identity.garment_name:
             raise ValueError("evaluation garment does not match immutable flywheel identity")
+    controlled_recovery = (
+        flywheel_manifest.get("controlled_recovery")
+        if flywheel_manifest is not None
+        else None
+    )
+    controlled_source_seed: int | None = None
+    if controlled_recovery is not None and str(getattr(env, "device", "cuda:0")) == "cpu":
+        if not isinstance(controlled_recovery, Mapping) or flywheel_manifest.get("strategy", "canonical") != "canonical":
+            raise ValueError("controlled recovery requires a canonical immutable manifest")
+        from lehome.flywheel.recovery_collection import load_controlled_recovery
+
+        authenticated_recovery = load_controlled_recovery(controlled_recovery)
+        source_seed = authenticated_recovery.provenance.get("source_seed")
+        if type(source_seed) is not int or source_seed < 0:
+            raise ValueError("controlled recovery source reset seed is invalid")
+        controlled_source_seed = source_seed
     logger.info(f"Starting evaluation: {args.num_episodes} episodes")
     rate_limiter = RateLimiter(args.step_hz)
 
     for i in range(args.num_episodes):
         # 1. Reset Environment & Policy
+        if controlled_source_seed is not None:
+            set_seed = getattr(env, "set_seed", None)
+            if not callable(set_seed):
+                raise ValueError("controlled recovery CPU reset-prefix reconstruction requires environment set_seed(seed)")
+            set_seed(controlled_source_seed)
         env.reset()
         stabilize_garment_after_reset(env, args)
         restore = getattr(args, "restore_snapshot", None)
@@ -879,7 +900,7 @@ def run_evaluation_loop(
 
             strategy = flywheel_manifest.get("strategy", "canonical")
             sampled = sample_randomization(strategy, seed=flywheel_manifest.get("seed", args.seed))
-            controlled = flywheel_manifest.get("controlled_recovery")
+            controlled = controlled_recovery
             if controlled is not None:
                 if not isinstance(controlled, Mapping) or strategy != "canonical":
                     raise ValueError("controlled recovery requires a canonical immutable manifest")
@@ -894,7 +915,24 @@ def run_evaluation_loop(
             from lehome.flywheel.randomization import validate_randomization_receipt
             validate_randomization_receipt(dict(sampled.values), dict(randomization_receipt))
             if controlled is not None:
-                controlled_provenance = bootstrap_controlled_recovery(env, controlled)
+                if controlled_source_seed is None:
+                    controlled_provenance = bootstrap_controlled_recovery(env, controlled)
+                else:
+                    def reset_controlled_source() -> None:
+                        set_seed = getattr(env, "set_seed", None)
+                        if not callable(set_seed):
+                            raise ValueError("controlled recovery CPU reset-prefix reconstruction requires environment set_seed(seed)")
+                        set_seed(controlled_source_seed)
+                        env.reset()
+                        stabilize_garment_after_reset(env, args)
+                        reset_receipt = env.apply_flywheel_randomization(sampled)
+                        validate_randomization_receipt(
+                            dict(sampled.values), dict(reset_receipt),
+                        )
+
+                    controlled_provenance = bootstrap_controlled_recovery(
+                        env, controlled, reset_callback=reset_controlled_source,
+                    )
             identity = flywheel_identity
             if identity is None:  # pragma: no cover - guarded above, keeps type flow explicit.
                 raise RuntimeError("missing flywheel identity")

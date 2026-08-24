@@ -1,8 +1,8 @@
 """Verified bootstrap for controlled autonomous success-recovery rollouts.
 
-Version 2 restores a checksum-authenticated physical H=16 continuation
-Snapshot directly.  It never reconstructs that boundary with a long
-open-loop source prefix.
+CUDA restores a checksum-authenticated physical H=16 continuation directly.
+CPU reconstructs an authenticated USD-local source boundary from its reset and
+recorded prefix because a USD snapshot cannot restore hidden solver state.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from pathlib import Path
 import random
 import re
 import stat
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from lehome.flywheel.snapshots import (
     LEGACY_USD_LOCAL_CLOTH_AUTHORITY, PHYSX_CLOTH_STATE_AUTHORITY, Snapshot,
@@ -42,6 +42,8 @@ _CLOTH_VELOCITY_FIDELITY_TOLERANCE_MPS = 1e-5
 
 @dataclass(frozen=True, slots=True)
 class ControlledRecovery:
+    reset_snapshot: Snapshot
+    prefix_actions: tuple[tuple[float, ...], ...]
     continuation_snapshot: Snapshot
     teacher_actions: tuple[tuple[float, ...], ...]
     continuation_state: tuple[float, ...]
@@ -376,7 +378,16 @@ def load_controlled_recovery(assignment: Mapping[str, object]) -> ControlledReco
         raise ValueError("controlled recovery teacher probe is smoke-only")
     provenance = {key: assignment[key] for key in assignment if key.startswith("source_") or key in {"prefix_stop", "perturbation_profile", "perturbation_seed", "perturbation_fingerprint", "recovery_kind", "controlled_smoke_teacher_probe"}}
     provenance.update({"source_continuation_snapshot": str(snapshot_path), "source_annotations": str(Path(annotations_value))})
-    return ControlledRecovery(continuation_snapshot, actions[stop:first_success + 1] if teacher_probe else (), continuation, profile, seed, provenance)
+    return ControlledRecovery(
+        reset_snapshot,
+        actions[:stop],
+        continuation_snapshot,
+        actions[stop:first_success + 1] if teacher_probe else (),
+        continuation,
+        profile,
+        seed,
+        provenance,
+    )
 
 
 def _validate_v2_smoke_descriptor(row: Mapping[str, object]) -> None:
@@ -945,17 +956,69 @@ def apply_controlled_perturbation(snapshot: Mapping[str, object] | Snapshot, pro
     return Snapshot(source.schema_version, tuple(joints), source.robot_velocity, displaced, velocities, source.rng_state, source.garment_name, source.randomization, source.scene_state, source.cloth_state_authority)
 
 
-def bootstrap_controlled_recovery(env: object, assignment: Mapping[str, object]) -> Mapping[str, object]:
-    """Restore an authenticated H16 boundary, teacher-check, then perturb."""
+def bootstrap_controlled_recovery(
+    env: object,
+    assignment: Mapping[str, object],
+    *,
+    reset_callback: Callable[[], None] | None = None,
+) -> Mapping[str, object]:
+    """Authenticate a source H16 boundary, teacher-check, then perturb."""
 
     from lehome.flywheel.snapshots import capture_snapshot, restore_snapshot
 
     recovery = load_controlled_recovery(assignment)
+    runtime_contract = _runtime_cloth_contract(env)
+    if runtime_contract[0] == 3:
+        if not callable(reset_callback):
+            raise ValueError("controlled recovery CPU reset-prefix reconstruction requires a deterministic reset callback")
+        reset_checks = [_replay_fidelity(env, recovery.reset_snapshot)]
+        replay_action_prefix(env, recovery.prefix_actions)
+        h16_checks = [_replay_fidelity(env, recovery.continuation_snapshot)]
+        teacher_provenance: Mapping[str, object] | None = None
+        if recovery.teacher_actions:
+            replay_action_prefix(env, recovery.teacher_actions)
+            if not _teacher_success(env):
+                raise ValueError("controlled recovery teacher probe did not reproduce source success")
+            teacher_provenance = {
+                "enabled": True,
+                "verified": True,
+                "replayed_action_count": len(recovery.teacher_actions),
+            }
+        reset_callback()
+        reset_checks.append(_replay_fidelity(env, recovery.reset_snapshot))
+        replay_action_prefix(env, recovery.prefix_actions)
+        h16_checks.append(_replay_fidelity(env, recovery.continuation_snapshot))
+        intermediate = capture_snapshot(
+            env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND},
+        )
+        perturbed = apply_controlled_perturbation(
+            intermediate, recovery.perturbation_profile, recovery.perturbation_seed,
+        )
+        restore_snapshot(env, perturbed)
+        capture_snapshot(
+            env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND},
+        )
+        provenance = dict(recovery.provenance)
+        provenance.update({
+            "replay_fidelity": h16_checks[-1],
+            "replay_fidelity_checks": [
+                reset_checks[0], h16_checks[0], reset_checks[1], h16_checks[1],
+            ],
+            "cpu_reset_prefix_reconstruction": {
+                "verified": True,
+                "reset_fidelity_checks": reset_checks,
+                "h16_fidelity_checks": h16_checks,
+                "prefix_replayed_action_count": len(recovery.prefix_actions),
+            },
+        })
+        if teacher_provenance is not None:
+            provenance["teacher_probe"] = teacher_provenance
+        return provenance
+
     restore_snapshot(env, recovery.continuation_snapshot)
     projected = capture_snapshot(
         env, randomization={"strategy": "canonical", "recovery_kind": RECOVERY_KIND},
     )
-    runtime_contract = _runtime_cloth_contract(env)
     if (projected.schema_version, projected.cloth_state_authority) != runtime_contract:
         raise ValueError("controlled recovery restore did not read back the expected cloth authority")
     legacy_projection = (

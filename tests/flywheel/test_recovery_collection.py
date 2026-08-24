@@ -466,8 +466,85 @@ def test_cpu_schema3_restore_replays_with_usd_local_authority(tmp_path) -> None:
         def flywheel_capture_state(self): return self.state
         def step(self, _): pass
         def _get_success(self): return True
-    provenance = bootstrap_controlled_recovery(Env(), assignment)
+    env = Env()
+    provenance = bootstrap_controlled_recovery(
+        env,
+        assignment,
+        reset_callback=lambda: setattr(env, "state", _snapshot() | {
+            "schema_version": 3,
+            "cloth_state_authority": "usd_local_points_v1",
+        }),
+    )
     assert provenance["replay_fidelity"]["cloth_state_authority"] == "usd_local_points_v1"
+
+
+def test_cpu_schema3_teacher_reconstructs_from_the_authenticated_reset_prefix(tmp_path) -> None:
+    from lehome.flywheel.recovery_collection import bootstrap_controlled_recovery
+
+    assignment = _assignment(tmp_path, state=[0.1] * 12, teacher=True)
+    for field in ("source_reset", "source_continuation_snapshot"):
+        path = Path(assignment[field])
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["schema_version"] = 3
+        payload["cloth_state_authority"] = "usd_local_points_v1"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        assignment[f"{field}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    assignment.update(
+        source_snapshot_schema_version=3,
+        source_snapshot_authority="usd_local_points_v1",
+        source_only_envelope=True,
+    )
+    reset_state = json.loads(Path(assignment["source_reset"]).read_text(encoding="utf-8"))
+    continuation_state = json.loads(
+        Path(assignment["source_continuation_snapshot"]).read_text(encoding="utf-8")
+    )
+
+    class Env:
+        device = "cpu"
+
+        def __init__(self) -> None:
+            self.state = json.loads(json.dumps(reset_state))
+            self.actions: list[list[float]] = []
+            self.continuation_snapshot_restores = 0
+            self.reset_callbacks = 0
+
+        def flywheel_restore_state(self, snapshot) -> None:
+            if snapshot.to_dict() == continuation_state:
+                self.continuation_snapshot_restores += 1
+            self.state = snapshot.to_dict()
+
+        def flywheel_capture_state(self):
+            return self.state
+
+        def step(self, action) -> None:
+            self.actions.append(action)
+            if len(self.actions) in {16, 36}:
+                self.state["robot_position"] = [0.1] * 12
+
+        def _get_success(self) -> bool:
+            return True
+
+    env = Env()
+
+    def reset_source() -> None:
+        env.reset_callbacks += 1
+        env.state = json.loads(json.dumps(reset_state))
+
+    provenance = bootstrap_controlled_recovery(
+        env, assignment, reset_callback=reset_source,
+    )
+
+    assert env.reset_callbacks == 1
+    assert env.continuation_snapshot_restores == 0
+    assert env.actions == (
+        [[float(step)] * 12 for step in range(16)]
+        + [[float(step)] * 12 for step in range(16, 20)]
+        + [[float(step)] * 12 for step in range(16)]
+    )
+    reconstruction = provenance["cpu_reset_prefix_reconstruction"]
+    assert reconstruction["verified"] is True
+    assert len(reconstruction["reset_fidelity_checks"]) == 2
+    assert len(reconstruction["h16_fidelity_checks"]) == 2
 
 
 def test_cuda_runtime_rejects_usd_local_schema3_readback(tmp_path) -> None:
