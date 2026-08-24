@@ -764,6 +764,33 @@ def test_runtime_admits_the_exact_cpu_zero_teacher_smoke_before_opening_the_ledg
     assert opened == [True]
 
 
+@pytest.mark.parametrize(("zero", "teacher", "mode"), [
+    (True, False, "zero_perturbation_control_v1"),
+    (False, True, "teacher_continuation_probe_v1"),
+])
+def test_runtime_rejects_partial_cpu_teacher_smoke_modes_before_ledger(tmp_path, zero, teacher, mode) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    run_id, matrix_sha, materialization_sha = "c" * 32, "a" * 64, "b" * 64
+    identity = __import__("hashlib").sha256(f"{run_id}:{matrix_sha}:{materialization_sha}".encode()).hexdigest()[:20]
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps([{
+        "recovery_kind": "controlled_success_recovery_snapshot_v3", "controlled_smoke": True,
+        "controlled_smoke_run_id": run_id, "controlled_smoke_row_index": 0,
+        "controlled_smoke_matrix_sha256": matrix_sha, "controlled_smoke_materialization_sha256": materialization_sha,
+        "controlled_matrix_sha256": matrix_sha, "controlled_smoke_identity": identity,
+        "controlled_smoke_perturbation_mode": mode,
+        "controlled_smoke_mode_identity": __import__("hashlib").sha256(f"{identity}:{mode}".encode()).hexdigest()[:20],
+        "controlled_smoke_zero_perturbation": zero, "controlled_smoke_teacher_probe": teacher,
+    }]), encoding="utf-8")
+    opened = []
+    def ledger_factory(*_args, **_kwargs): opened.append(True)
+    args = types.SimpleNamespace(device="cpu", renderer_device="cuda:0", policy_device="cuda:0", lease_seconds=30.0, preparation_timeout_seconds=30.0, attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3", max_attempts=1, target_accepted=1)
+    with pytest.raises(ValueError, match="CPU cloth is reserved"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened == []
+
+
 def test_runtime_rejects_a_cpu_source_descriptor_with_mismatched_seed_before_ledger(tmp_path) -> None:
     from scripts.run_groot_persistent_worker import run
 
