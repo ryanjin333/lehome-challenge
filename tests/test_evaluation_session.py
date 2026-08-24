@@ -1831,12 +1831,6 @@ def _evaluation(monkeypatch):
     modules["lehome.flywheel.persistent_worker"].SimulatorNumericalDivergenceError = type(
         "SimulatorNumericalDivergenceError", (ValueError,), {}
     )
-    modules["lehome.flywheel.persistent_worker"].PolicyActionSafetyRejectionError = type(
-        "PolicyActionSafetyRejectionError", (ValueError,), {}
-    )
-    modules["lehome.flywheel.persistent_worker"].POLICY_ACTION_SAFETY_REJECTION_REASON = (
-        "policy_action_outside_live_joint_limits"
-    )
     modules["lehome.flywheel"].__path__ = [
         str(repository / "source" / "lehome" / "lehome" / "flywheel")
     ]
@@ -2988,22 +2982,11 @@ def test_policy_action_diagnostics_label_every_joint_with_limit_and_live_delta()
     }
 
 
-@pytest.mark.parametrize(
-    ("raw_elbow_targets", "rejects_policy"),
-    [
-        ((1.25, -1.5), True),
-        ((1.000004, -1.000004), False),
-    ],
-)
-def test_recorder_flywheel_step_rejects_material_policy_targets_but_projects_tiny_conversion_excess(
-    raw_elbow_targets,
-    rejects_policy,
+def test_recorder_flywheel_step_forwards_finite_out_of_limit_policy_target_unchanged(
     monkeypatch, tmp_path
 ) -> None:
-    """Only negligible target conversion error may be projected before physics."""
+    """Isaac receives the original finite policy target beyond a live soft limit."""
     evaluation = _evaluation(monkeypatch)
-
-    assert hasattr(evaluation, "_project_flywheel_policy_action_to_live_limits")
 
     class FakeTensor:
         def __init__(self, values):
@@ -3029,12 +3012,6 @@ def test_recorder_flywheel_step_rejects_material_policy_targets_but_projects_tin
 
         def numpy(self):
             return self.values
-
-        def clone(self):
-            return FakeTensor(self.values.copy())
-
-        def __setitem__(self, key, value):
-            self.values[key] = value
 
     class FakeBool:
         def __init__(self, value):
@@ -3140,22 +3117,11 @@ def test_recorder_flywheel_step_rejects_material_policy_targets_but_projects_tin
     monkeypatch.setattr(
         evaluation, "_flywheel_policy_action_limit_diagnostics", capture_raw_diagnostics
     )
-    projection_diagnostics = []
-    original_projection = evaluation._project_flywheel_policy_action_to_live_limits
-
-    def capture_projection(step_env, action):
-        projected, diagnostics = original_projection(step_env, action)
-        projection_diagnostics.append(diagnostics)
-        return projected, diagnostics
-
-    monkeypatch.setattr(
-        evaluation, "_project_flywheel_policy_action_to_live_limits", capture_projection
-    )
     policy = types.SimpleNamespace(
         reset=lambda: None,
         select_action_with_provenance=lambda _observation: types.SimpleNamespace(
             value=np.asarray(
-                [0.25, 0.0, raw_elbow_targets[0], 0.0, 0.0, 0.0, 0.0, 0.0, raw_elbow_targets[1], 0.0, 0.0, 0.0],
+                [0.25, 0.0, 1.25, 0.0, 0.0, 0.0, 0.0, 0.0, -1.5, 0.0, 0.0, 0.0],
                 dtype=np.float32,
             ),
             request_id="request-1",
@@ -3174,57 +3140,27 @@ def test_recorder_flywheel_step_rejects_material_policy_targets_but_projects_tin
         save_video=False,
     )
 
-    if rejects_policy:
-        with pytest.raises(
-            evaluation.PolicyActionSafetyRejectionError,
-            match="policy_action_outside_live_joint_limits",
-        ):
-            evaluation.run_evaluation_loop(
-                env, policy, args, garment_name="Top_Long_Seen_0"
-            )
-
-        assert stepped_actions == []
-        assert recorded_actions == []
-        assert finish_calls == []
-        assert raw_diagnostics[0]["policy_action_outside_live_joint_limit_count"] == 2
-        assert projection_diagnostics == []
-        return
-
     evaluation.run_evaluation_loop(env, policy, args, garment_name="Top_Long_Seen_0")
 
     assert raw_diagnostics[0]["policy_action_outside_live_joint_limit_count"] == 2
     assert raw_diagnostics[0]["policy_action_joint_diagnostics"]["left_elbow_flex"] == {
         "target_finite": True,
         "outside_live_joint_limit": True,
-        "limit_violation_rad": pytest.approx(0.000004, abs=0.0000001),
-        "target_to_live_joint_position_delta_rad": pytest.approx(1.000004, abs=0.0000001),
+        "limit_violation_rad": 0.25,
+        "target_to_live_joint_position_delta_rad": 1.25,
     }
     assert raw_diagnostics[0]["policy_action_joint_diagnostics"]["right_elbow_flex"] == {
         "target_finite": True,
         "outside_live_joint_limit": True,
-        "limit_violation_rad": pytest.approx(0.000004, abs=0.0000001),
-        "target_to_live_joint_position_delta_rad": pytest.approx(1.000004, abs=0.0000001),
+        "limit_violation_rad": 0.5,
+        "target_to_live_joint_position_delta_rad": 1.5,
     }
     expected = np.asarray(
-        [[0.25, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0]],
+        [[0.25, 0.0, 1.25, 0.0, 0.0, 0.0, 0.0, 0.0, -1.5, 0.0, 0.0, 0.0]],
         dtype=np.float32,
     )
     np.testing.assert_array_equal(stepped_actions, [expected])
     np.testing.assert_array_equal(recorded_actions, [expected.squeeze(0)])
-    assert projection_diagnostics == [{
-        "policy_action_projection_count": 2,
-        "policy_action_projection_joint_diagnostics": {
-            name: {
-                "projected": name in {"left_elbow_flex", "right_elbow_flex"},
-                "absolute_projection_rad": (
-                    pytest.approx(0.000004, abs=0.0000001)
-                    if name in {"left_elbow_flex", "right_elbow_flex"}
-                    else 0.0
-                ),
-            }
-            for name in evaluation._FLYWHEEL_POLICY_ACTION_JOINT_NAMES
-        },
-    }]
     assert finish_calls == [{
         "reason": "horizon",
         "accepted_success": False,
@@ -3235,12 +3171,11 @@ def test_recorder_flywheel_step_rejects_material_policy_targets_but_projects_tin
     }]
 
 
-def test_recorder_flywheel_step_fails_closed_before_env_step_when_live_limits_are_malformed(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("failure_case", ["malformed_limits", "nonfinite_action"])
+def test_recorder_flywheel_step_fails_closed_before_env_step_when_action_validation_fails(
+    monkeypatch, tmp_path, failure_case
 ) -> None:
     evaluation = _evaluation(monkeypatch)
-
-    assert hasattr(evaluation, "_project_flywheel_policy_action_to_live_limits")
 
     class FakeTensor:
         def __init__(self, values):
@@ -3328,10 +3263,17 @@ def test_recorder_flywheel_step_fails_closed_before_env_step_when_live_limits_ar
         _get_observations=lambda: {"observation.state": np.zeros(12, dtype=np.float32)},
     )
     env.step = lambda action: stepped_actions.append(action)
+    if failure_case == "nonfinite_action":
+        env.left_arm.data.soft_joint_pos_limits = np.repeat(
+            np.asarray([[[-1.0, 1.0]]], dtype=np.float32), repeats=6, axis=1
+        )
+    policy_value = np.zeros(12, dtype=np.float32)
+    if failure_case == "nonfinite_action":
+        policy_value[5] = np.nan
     policy = types.SimpleNamespace(
         reset=lambda: None,
         select_action_with_provenance=lambda _observation: types.SimpleNamespace(
-            value=np.zeros(12, dtype=np.float32), request_id="request-1", chunk_offset=0,
+            value=policy_value, request_id="request-1", chunk_offset=0,
         ),
     )
     args = types.SimpleNamespace(
@@ -3347,7 +3289,12 @@ def test_recorder_flywheel_step_fails_closed_before_env_step_when_live_limits_ar
     )
 
     with __import__("pytest").raises(
-        evaluation.SimulatorNumericalDivergenceError, match="live soft joint limits"
+        evaluation.SimulatorNumericalDivergenceError,
+        match=(
+            "finite raw policy targets"
+            if failure_case == "nonfinite_action"
+            else "live soft joint limits"
+        ),
     ):
         evaluation.run_evaluation_loop(env, policy, args, garment_name="Top_Long_Seen_0")
 
@@ -3667,65 +3614,6 @@ def test_cloth_failure_includes_bounded_policy_action_history_without_coordinate
         )
 
     assert "[" not in str(raised.value)
-
-
-def test_cloth_failure_includes_bounded_action_projection_history() -> None:
-    source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
-    source = source_path.read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    gate = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "_require_flywheel_cloth_health"
-    )
-    module = ast.Module(body=[gate], type_ignores=[])
-    ast.fix_missing_locations(module)
-    error_type = type("SimulatorNumericalDivergenceError", (RuntimeError,), {})
-    joint_names = (
-        "left_shoulder_pan", "left_shoulder_lift", "left_elbow_flex",
-        "left_wrist_flex", "left_wrist_roll", "left_gripper",
-        "right_shoulder_pan", "right_shoulder_lift", "right_elbow_flex",
-        "right_wrist_flex", "right_wrist_roll", "right_gripper",
-    )
-    namespace = {
-        "Any": object,
-        "Mapping": Mapping,
-        "SimulatorNumericalDivergenceError": error_type,
-        "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES": joint_names,
-    }
-    exec(compile(module, str(source_path), "exec"), namespace)
-
-    with __import__("pytest").raises(error_type) as raised:
-        namespace["_require_flywheel_cloth_health"](
-            types.SimpleNamespace(
-                flywheel_cloth_physical_health=lambda: {
-                    "healthy": False,
-                    "reason": "simulator_numerical_divergence",
-                }
-            ),
-            policy_action_diagnostics={
-                "policy_action_steps_projected": 2,
-                "policy_action_max_simultaneous_projected_joint_count": 2,
-                "policy_action_projected_joint_step_counts": {
-                    name: 2 if name == "left_elbow_flex" else 0
-                    for name in joint_names
-                },
-                "policy_action_max_abs_projection_rad": {
-                    name: 0.25 if name == "left_elbow_flex" else 0.0
-                    for name in joint_names
-                },
-            },
-        )
-
-    message = str(raised.value)
-    assert "policy_action_steps_projected=2" in message
-    assert "policy_action_max_simultaneous_projected_joint_count=2" in message
-    assert (
-        "left_elbow_flex(projected_steps=2,max_abs_projection_rad=0.25)"
-        in message
-    )
-    assert "[" not in message
 
 
 def test_policy_action_diagnostics_are_sampled_before_each_step_and_bound_to_health_failure() -> None:
