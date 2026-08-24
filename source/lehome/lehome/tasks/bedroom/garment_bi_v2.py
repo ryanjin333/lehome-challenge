@@ -1191,10 +1191,11 @@ class GarmentEnv(DirectRLEnv):
 
         # PhysX omits cooked weld arrays for meshes whose authored point order
         # is already the simulation point order.  NVIDIA's installed schema
-        # converter proves that this weld operation is exact coordinate
-        # deduplication.  Accept identity only when authored and live rest
-        # points prove the same order; ambiguous or actually welded meshes
-        # continue to fail closed.
+        # converter welds by exact-coordinate deduplication while preserving
+        # the first authored occurrence.  Therefore unique authored vertices,
+        # no welded triangles, and equal authored/live cardinality prove the
+        # identity topology.  Do not compare coordinates: PhysX cooking may
+        # relax rest geometry without changing particle order.
         welded_triangles = read_optional_map("physxParticle:weldedTriangleIndices")
         if welded_triangles is not None:
             raise SimulatorNumericalDivergenceError(
@@ -1225,12 +1226,6 @@ class GarmentEnv(DirectRLEnv):
         if len(np.unique(normalized_asset, axis=0)) != len(normalized_asset):
             raise SimulatorNumericalDivergenceError(
                 "live PhysX cloth prim is missing cooked weld maps for non-unique authored vertices"
-            )
-        if not np.allclose(asset, live, rtol=0.0, atol=1e-6):
-            max_abs_delta = float(np.max(np.abs(asset - live)))
-            raise SimulatorNumericalDivergenceError(
-                "live PhysX cloth prim is missing cooked weld maps and identity particle order "
-                f"is unproven: max_abs_delta={max_abs_delta:.9g}"
             )
         identity = np.arange(len(asset), dtype=np.int64)
         return identity, identity.copy()

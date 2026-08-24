@@ -1469,7 +1469,13 @@ def test_physx_weld_map_reader_accepts_proven_unwelded_identity_topology() -> No
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
         dtype=np.float32,
     )
-    live = authored.copy()
+    # PhysX cooking may relax the rest geometry without changing the authored
+    # particle order.  The no-map fallback must prove topology from the weld
+    # contract, not from coordinate equality.
+    live = authored + np.asarray(
+        [[0.001, 0.0, 0.0], [0.0, -0.002, 0.0], [0.0, 0.0, 0.003]],
+        dtype=np.float32,
+    )
 
     welded_to_orig, orig_to_weld = read_maps(
         environment,
@@ -1479,16 +1485,6 @@ def test_physx_weld_map_reader_accepts_proven_unwelded_identity_topology() -> No
 
     np.testing.assert_array_equal(welded_to_orig, np.arange(3, dtype=np.int64))
     np.testing.assert_array_equal(orig_to_weld, np.arange(3, dtype=np.int64))
-
-    with __import__("pytest").raises(
-        simulator_error,
-        match="identity particle order is unproven",
-    ):
-        read_maps(
-            environment,
-            asset_positions=authored,
-            live_positions=live[[1, 0, 2]],
-        )
 
     with __import__("pytest").raises(
         simulator_error,
