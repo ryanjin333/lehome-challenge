@@ -516,6 +516,72 @@ def test_base_cpu_cloth_requires_the_exact_unsealed_snapshot_source_tuple(tmp_pa
     assert "exact unsealed snapshot-source bootstrap tuple" in result.stderr
 
 
+def test_base_cpu_cloth_admits_only_the_exact_controlled_teacher_smoke_tuple(tmp_path: Path) -> None:
+    matrix = tmp_path / "controlled-smoke.json"
+    run_id = "c" * 32
+    controlled_matrix_sha256 = "a" * 64
+    controlled_materialization_sha256 = "b" * 64
+    identity = hashlib.sha256(
+        f"{run_id}:{controlled_matrix_sha256}:{controlled_materialization_sha256}".encode()
+    ).hexdigest()[:20]
+    round_id = f"controlled-recovery-smoke-{identity}-unsealed-staging"
+    matrix.write_text(
+        json.dumps([{
+            "controlled_smoke": True,
+            "controlled_smoke_run_id": run_id,
+            "controlled_smoke_row_index": 0,
+            "controlled_smoke_matrix_sha256": controlled_matrix_sha256,
+            "controlled_smoke_materialization_sha256": controlled_materialization_sha256,
+            "controlled_smoke_identity": identity,
+            "recovery_kind": "controlled_success_recovery_snapshot_v3",
+        }]),
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(matrix.read_bytes()).hexdigest()
+    env = {
+        **os.environ,
+        "LEHOME_WORKSPACE": str(tmp_path),
+        "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "run"),
+        "LEHOME_ATTEMPT_MATRIX": str(matrix),
+        "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+        "LEHOME_RUN_ID": run_id,
+        "LEHOME_ROUND_ID": round_id,
+        "LEHOME_WORKER_COUNT": "1",
+        "LEHOME_MAX_ATTEMPTS": "1",
+        "LEHOME_TARGET_ACCEPTED": "1",
+        "LEHOME_SIMULATOR_DEVICE": "cpu",
+        "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP": "0",
+        "LEHOME_ENABLE_HF_UPLOAD": "1",
+        "LEHOME_SKIP_ROUND_SEAL": "1",
+        "LEHOME_RESUME_PREEMPTED_ROLLOUT": "0",
+        "LEHOME_MAX_WORKER_RESTARTS": "0",
+        "LEHOME_CONTROLLED_RECOVERY_SMOKE": "1",
+        "LEHOME_CONTROLLED_RECOVERY_MATRIX_SHA256": controlled_matrix_sha256,
+        "LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION_SHA256": controlled_materialization_sha256,
+        "LEHOME_CONTROLLED_RECOVERY_SMOKE_RUN_ID": run_id,
+        "LEHOME_CONTROLLED_RECOVERY_SMOKE_ROW_INDEX": "0",
+        "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+    }
+    runner = REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh"
+
+    admitted = subprocess.run(
+        ["/bin/bash", str(runner)], env=env, text=True, capture_output=True, check=False,
+    )
+
+    assert admitted.returncode == 0, admitted.stderr
+
+    unrelated = subprocess.run(
+        ["/bin/bash", str(runner)],
+        env={**env, "LEHOME_CONTROLLED_RECOVERY_SMOKE": "0"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert unrelated.returncode == 2
+    assert "CPU cloth requires the exact unsealed snapshot-source bootstrap tuple" in unrelated.stderr
+
+
 def test_base_campaign_admits_bounded_same_category_source_discovery_tuple(tmp_path: Path) -> None:
     matrix = tmp_path / "sources.json"
     rows = [

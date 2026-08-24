@@ -86,7 +86,9 @@ esac
 case "${SIMULATOR_DEVICE}" in
   "cuda:0") ;;
   "cpu")
-    if [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "1" ] || [ "${WORKER_COUNT}" != "1" ] \
+    if [ "${CONTROLLED_RECOVERY_SMOKE}" = "1" ] && [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" = "0" ]; then
+      : # The controlled-smoke allow-list below validates its remaining exact invariants.
+    elif [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "1" ] || [ "${WORKER_COUNT}" != "1" ] \
         || ! [[ "${MAX_ATTEMPTS}" =~ ^([1-9]|1[0-6])$ ]] \
         || ! [[ "${TARGET_ACCEPTED}" =~ ^[1-4]$ ]] \
         || (( 10#${TARGET_ACCEPTED} > 10#${MAX_ATTEMPTS} )) \
