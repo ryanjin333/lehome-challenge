@@ -587,14 +587,29 @@ def test_base_cpu_cloth_admits_only_the_exact_controlled_teacher_smoke_tuple(tmp
     assert unrelated.returncode == 2
     assert "CPU cloth requires the exact unsealed snapshot-source bootstrap tuple" in unrelated.stderr
 
+    wrong_mode_matrix = tmp_path / "wrong-mode.json"
+    wrong_mode_row = json.loads(matrix.read_text(encoding="utf-8"))[0]
+    wrong_mode_row.update({
+        "controlled_smoke_teacher_probe": False,
+        "controlled_smoke_perturbation_mode": "zero_perturbation_control_v1",
+        "controlled_smoke_mode_identity": hashlib.sha256(
+            f"{identity}:zero_perturbation_control_v1".encode()
+        ).hexdigest()[:20],
+    })
+    wrong_mode_matrix.write_text(json.dumps([wrong_mode_row]), encoding="utf-8")
     wrong_mode = subprocess.run(
         ["/bin/bash", str(runner)],
-        env={**env, "LEHOME_ATTEMPT_MATRIX": str(matrix)},
+        env={
+            **env,
+            "LEHOME_ATTEMPT_MATRIX": str(wrong_mode_matrix),
+            "LEHOME_ATTEMPT_MATRIX_SHA256": hashlib.sha256(wrong_mode_matrix.read_bytes()).hexdigest(),
+        },
         text=True,
         capture_output=True,
         check=False,
     )
-    assert wrong_mode.returncode == 0, wrong_mode.stderr
+    assert wrong_mode.returncode != 0
+    assert "controlled smoke descriptor mode is invalid" in wrong_mode.stderr
 
 
 def test_base_campaign_admits_bounded_same_category_source_discovery_tuple(tmp_path: Path) -> None:
