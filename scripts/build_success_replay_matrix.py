@@ -144,6 +144,12 @@ def _successes(accepted_roots: Sequence[Path]) -> dict[str, list[dict[str, objec
             category = identity.get("category")
             garment = identity.get("garment_name")
             simulator_device = provenance.get("simulator_device")
+            cloth_frame = (
+                "usd_local_points_v1"
+                if simulator_device == "cpu"
+                else "physx_cloth_view_world_v1"
+            )
+            expected_schema = 3 if simulator_device == "cpu" else 2
             if (
                 episode.get("episode_id") != attempt_id
                 or identity.get("episode_id") != attempt_id
@@ -163,15 +169,10 @@ def _successes(accepted_roots: Sequence[Path]) -> dict[str, list[dict[str, objec
                     or (isinstance(simulator_device, str) and _CUDA_DEVICE.fullmatch(simulator_device))
                 )
                 or reset.get("garment_name") != garment
-                or reset.get("schema_version") != 1
+                or reset.get("schema_version") != expected_schema
+                or reset.get("cloth_state_authority") != cloth_frame
             ):
                 raise ValueError("accepted episode is not a verified 12K seen-garment success")
-            cloth_frame = (
-                "usd_local_points_v1"
-                if simulator_device == "cpu"
-                else "physx_cloth_view_world_v1"
-            )
-            expected_schema = 3 if simulator_device == "cpu" else 2
             if (
                 continuation.get("schema_version") != expected_schema
                 or continuation.get("cloth_state_authority") != cloth_frame

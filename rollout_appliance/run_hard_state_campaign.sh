@@ -15,6 +15,7 @@ FRESH_LEDGER="${LEHOME_FRESH_LEDGER:-1}"
 CAMPAIGN_ROOT="${LEHOME_CAMPAIGN_ROOT:-${WORKSPACE}/eval/campaign-hard-state-nearmiss-1}"
 ROUND_ID="${LEHOME_ROUND_ID:-hard-state-nearmiss-round-1}"
 RUN_ID="${LEHOME_RUN_ID:-hard-state-nearmiss-run-1}"
+ROLLOUT_IMAGE="${LEHOME_ROLLOUT_IMAGE:-lehome-rollout:build}"
 ORIGINAL_12K_POLICY_SHA256="e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa"
 ORIGINAL_12K_CHECKPOINT="${LEHOME_ORIGINAL_12K_CHECKPOINT:-${WORKSPACE}/eval/policies/original_baseline}"
 
@@ -44,7 +45,12 @@ if [ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ] || [ "${RECEIPT_SHA256}" != "$
   echo "hard-state matrix SHA-256 mismatch" >&2
   exit 2
 fi
-PYTHONPATH="/opt/lehome/source/lehome:/opt/lehome${PYTHONPATH:+:${PYTHONPATH}}" python3 - \
+docker run --rm --user 1234:1234 --network none \
+  -v "${WORKSPACE}:${WORKSPACE}:ro" \
+  -v /opt/lehome/source/lehome:/opt/lehome/source/lehome:ro \
+  -e PYTHONPATH=/opt/lehome/source/lehome:/opt/lehome \
+  --entrypoint /opt/lehome-challenge/.venv/bin/python \
+  "${ROLLOUT_IMAGE}" - \
   "${MATRIX}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" <<'PY'
 import sys
 from pathlib import Path
@@ -79,4 +85,5 @@ exec env \
   LEHOME_TARGET_ACCEPTED="${TARGET_ACCEPTED}" \
   LEHOME_ROUND_ID="${ROUND_ID}" \
   LEHOME_RUN_ID="${RUN_ID}" \
+  LEHOME_ROLLOUT_IMAGE="${ROLLOUT_IMAGE}" \
   bash "${BASE_CAMPAIGN}"

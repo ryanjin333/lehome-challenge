@@ -301,6 +301,19 @@ def test_rollout_image_and_stage_carry_the_success_replay_campaign_tools():
     assert "chmod 0755 /opt/lehome/scripts/build_success_replay_matrix.py" in dockerfile
 
 
+def test_hard_state_preflight_uses_the_rollout_image_python_environment():
+    campaign = (
+        REPO_ROOT / "rollout_appliance" / "run_hard_state_campaign.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'ROLLOUT_IMAGE="${LEHOME_ROLLOUT_IMAGE:-lehome-rollout:build}"' in campaign
+    assert "docker run --rm --user 1234:1234 --network none" in campaign
+    assert '-v "${WORKSPACE}:${WORKSPACE}:ro"' in campaign
+    assert '-v /opt/lehome/source/lehome:/opt/lehome/source/lehome:ro' in campaign
+    assert "--entrypoint /opt/lehome-challenge/.venv/bin/python" in campaign
+    assert 'LEHOME_ROLLOUT_IMAGE="${ROLLOUT_IMAGE}"' in campaign
+
+
 def test_rollout_host_install_carries_the_experiment_evaluator_wrapper():
     install = (SCRIPTS_DIR / "install-rollout.sh").read_text(encoding="utf-8")
     stage = (REPO_ROOT / "infrastructure/nebius/tools/stage-rollout.sh").read_text(encoding="utf-8")

@@ -41,8 +41,15 @@ def _write_success(
             "simulator_device": simulator_device,
         },
     }
+    cloth_state_authority = (
+        "usd_local_points_v1"
+        if simulator_device == "cpu"
+        else "physx_cloth_view_world_v1"
+    )
+    snapshot_schema_version = 3 if simulator_device == "cpu" else 2
     reset = {
-        "schema_version": 1,
+        "schema_version": snapshot_schema_version,
+        "cloth_state_authority": cloth_state_authority,
         "garment_name": garment,
         "robot_position": [0.0] * 12,
         "robot_velocity": [0.0] * 12,
@@ -60,12 +67,6 @@ def _write_success(
     reset_path.write_text(json.dumps(reset), encoding="utf-8")
     continuation = {
         **reset,
-        "schema_version": 3 if simulator_device == "cpu" else 2,
-        "cloth_state_authority": (
-            "usd_local_points_v1"
-            if simulator_device == "cpu"
-            else "physx_cloth_view_world_v1"
-        ),
         "randomization": {**reset["randomization"], "continuation_step": 16},
     }
     continuation_path.write_text(json.dumps(continuation), encoding="utf-8")
