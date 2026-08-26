@@ -160,7 +160,7 @@ def test_rft_materializer_accepts_verified_persistent_collection_success(tmp_pat
     assert report.selected_observations == 30
 
 
-def test_rft_materializer_rejects_cpu_persistent_collection_success(tmp_path: Path) -> None:
+def test_rft_materializer_accepts_cpu_persistent_collection_success(tmp_path: Path) -> None:
     raw = _raw_rft_episode(
         tmp_path,
         parity_stage="persistent_collection",
@@ -168,8 +168,9 @@ def test_rft_materializer_rejects_cpu_persistent_collection_success(tmp_path: Pa
         simulator_device="cpu",
     )
 
-    with pytest.raises(ValueError, match="accepted autonomous success"):
-        materialize_rft_episode(raw, tmp_path / "out")
+    report = materialize_rft_episode(raw, tmp_path / "out")
+
+    assert report.selected_observations == 30
 
 
 @pytest.mark.parametrize("device", ["cuda:²", "cuda:١", "cuda:٠"])

@@ -73,7 +73,10 @@ def _is_autonomous_policy_success(raw: Mapping[str, object]) -> bool:
         and parity_stage in {"server_cpu", "persistent_collection"}
         and (
             (parity_stage == "server_cpu" and simulator_device == "cpu")
-            or (parity_stage == "persistent_collection" and persistent_cuda)
+            or (
+                parity_stage == "persistent_collection"
+                and (simulator_device == "cpu" or persistent_cuda)
+            )
         )
         and canonical_policy
         and isinstance(artifact_sha256, str)
