@@ -238,7 +238,7 @@ def _pending(root: Path) -> dict[str, object]:
             or not isinstance(weights, dict) or not isinstance(quotas, dict)
             or set(weights) != {"bc", "rollout", "dagger"} or set(quotas) != {"bc", "rollout", "dagger"}
             or any(type(weights[kind]) is not int or type(quotas[kind]) is not int for kind in ("bc", "rollout", "dagger"))
-            or weights["bc"] <= 0 or weights["rollout"] <= 0 or weights["dagger"] != 0 or weights["bc"] + weights["rollout"] != 100
+            or weights["bc"] <= 0 or weights["rollout"] < 0 or weights["dagger"] != 0 or weights["bc"] + weights["rollout"] != 100
         ):
             raise ValueError("manifest-bound pending mixture weights are invalid")
         expected = batch64_quotas(weights)

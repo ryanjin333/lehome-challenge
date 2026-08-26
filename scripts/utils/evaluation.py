@@ -348,7 +348,12 @@ def _verified_restore_assignment(
     restore = assignment.get("restore_snapshot") or assignment.get("hard_state_snapshot")
     expected = assignment.get("restore_snapshot_sha256")
     replay_kind = assignment.get("replay_kind")
-    verification_required = replay_kind == "verified_success_reset_v1" or expected is not None
+    success_replay_kinds = {
+        "verified_success_reset_v1", "verified_success_early_snapshot_v1",
+    }
+    hard_state_kinds = {"verified_hard_state_moment_of_ruin_v1"}
+    verified_restore_kinds = success_replay_kinds | hard_state_kinds
+    verification_required = replay_kind in verified_restore_kinds or expected is not None
     if not verification_required:
         return restore, None
     if not isinstance(restore, (str, Path)):
@@ -376,11 +381,11 @@ def _verified_restore_assignment(
         key: assignment.get(key)
         for key in (
             "parent_episode_id", "lineage_id", "replay_kind",
-            "restore_snapshot_cloth_frame",
+            "restore_snapshot_cloth_frame", "restore_snapshot_step",
         )
         if assignment.get(key) is not None
     }
-    if replay_kind == "verified_success_reset_v1":
+    if replay_kind in verified_restore_kinds:
         if (
             not isinstance(lineage.get("parent_episode_id"), str)
             or not lineage["parent_episode_id"]
@@ -390,10 +395,42 @@ def _verified_restore_assignment(
             raise ValueError("verified success replay requires matching parent and lineage IDs")
         cloth_frame = lineage.get("restore_snapshot_cloth_frame")
         if cloth_frame not in {"usd_local_points_v1", "physx_cloth_view_world_v1"}:
-            raise ValueError("verified success replay requires an explicit legacy cloth frame")
+            raise ValueError("verified restore requires an explicit cloth frame")
         schema_version = payload.get("schema_version")
         authority = payload.get("cloth_state_authority")
-        if cloth_frame == "usd_local_points_v1":
+        if replay_kind in {"verified_success_early_snapshot_v1", "verified_hard_state_moment_of_ruin_v1"}:
+            restore_step = lineage.get("restore_snapshot_step")
+            randomization = payload.get("randomization")
+            if (
+                (
+                    restore_step != 16
+                    if replay_kind == "verified_success_early_snapshot_v1"
+                    else type(restore_step) is not int or restore_step <= 0 or restore_step % 16
+                )
+                or not isinstance(randomization, Mapping)
+                or randomization.get("continuation_step") != restore_step
+                or not (
+                    (cloth_frame == "usd_local_points_v1" and schema_version == 3 and authority == cloth_frame)
+                    or (
+                        cloth_frame == "physx_cloth_view_world_v1"
+                        and schema_version == 2
+                        and authority == cloth_frame
+                    )
+                )
+            ):
+                raise ValueError("verified continuation restore snapshot is incompatible")
+            if (
+                replay_kind == "verified_hard_state_moment_of_ruin_v1"
+                and (
+                    cloth_frame != "usd_local_points_v1"
+                    or schema_version != 3
+                    or authority != "usd_local_points_v1"
+                    or payload.get("garment_name")
+                    != assignment.get("garment", assignment.get("garment_name"))
+                )
+            ):
+                raise ValueError("verified hard-state restore requires CPU cloth authority")
+        elif cloth_frame == "usd_local_points_v1":
             if schema_version != 1 or authority is not None:
                 raise ValueError("verified success replay USD-local cloth frame is incompatible")
             payload = dict(payload)

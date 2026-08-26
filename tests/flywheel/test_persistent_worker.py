@@ -696,6 +696,81 @@ def test_launcher_preserves_cpu_cloth_for_the_source_bootstrap_diagnostic(monkey
     assert environment == {"LEHOME_FLYWHEEL_WORKER_GPU": "2"}
 
 
+def test_cpu_cloth_session_disables_the_headless_texture_wait(monkeypatch, tmp_path) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(repository))
+    monkeypatch.syspath_prepend(str(repository / "source" / "lehome"))
+    from scripts import run_groot_persistent_worker as worker_module
+
+    env_cfg = types.SimpleNamespace(
+        sim=types.SimpleNamespace(use_fabric=True),
+        wait_for_textures=True,
+    )
+
+    class FakeEnv:
+        def initialize_obs(self) -> None:
+            pass
+
+    captured: dict[str, object] = {}
+    gym_module = types.ModuleType("gymnasium")
+
+    def make(_task, *, cfg):
+        captured["wait_for_textures"] = cfg.wait_for_textures
+        return types.SimpleNamespace(unwrapped=FakeEnv())
+
+    gym_module.make = make
+    isaaclab_utils = types.ModuleType("isaaclab_tasks.utils")
+    isaaclab_utils.parse_env_cfg = lambda _task, *, device: env_cfg
+    isaaclab_tasks = types.ModuleType("isaaclab_tasks")
+    isaaclab_tasks.__path__ = []
+    isaaclab_tasks.utils = isaaclab_utils
+    bedroom = types.ModuleType("lehome.tasks.bedroom")
+    eval_policy = types.ModuleType("scripts.eval_policy.groot_policy")
+
+    class FakePolicy:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+    eval_policy.SessionPolicyClient = FakePolicy
+    evaluation = types.ModuleType("scripts.utils.evaluation")
+    evaluation.EvaluationSession = lambda *_args, **_kwargs: object()
+    for name, module in {
+        "gymnasium": gym_module,
+        "isaaclab_tasks": isaaclab_tasks,
+        "isaaclab_tasks.utils": isaaclab_utils,
+        "lehome.tasks.bedroom": bedroom,
+        "scripts.eval_policy.groot_policy": eval_policy,
+        "scripts.utils.evaluation": evaluation,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    ready = tmp_path / "ready.json"
+    ready.write_text(json.dumps({
+        "ready": True,
+        "policy_sha256": "a" * 64,
+        "runtime_device": "cuda:0",
+    }))
+    args = types.SimpleNamespace(
+        task="LeHome-BiSO101-Direct-Garment-v2",
+        device="cpu",
+        renderer_device="cuda:0",
+        policy_device="cuda:0",
+        seed=101,
+        garment_cfg_base_path="/garments",
+        particle_cfg_path="/particles",
+        initial_garment="Top_Short_Seen_0",
+        policy_ready_file=ready,
+        policy_sha256="a" * 64,
+        policy_gateway_endpoint="tcp://127.0.0.1:15555",
+        policy_timeout_seconds=30.0,
+        session_id="session-1",
+    )
+
+    worker_module._build_cloth_session(args)
+
+    assert captured["wait_for_textures"] is False
+
+
 def test_launcher_rejects_a_non_cuda_renderer_or_policy() -> None:
     from scripts.run_groot_persistent_worker import prepare_persistent_cloth_launch
 
@@ -739,6 +814,171 @@ def test_runtime_rejects_cpu_cloth_for_a_non_source_matrix_before_opening_the_le
     assert opened_ledger == []
 
 
+@pytest.mark.parametrize("row_count", [20, 80])
+def test_runtime_admits_cpu_terminal_public_unseen_evaluation_before_opening_the_ledger(
+    tmp_path,
+    monkeypatch,
+    row_count: int,
+) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    categories = ("top_long", "top_short", "pant_long", "pant_short")
+    rows = [
+        {
+            "trial_id": f"public-unseen-{index}",
+            "category": categories[index % len(categories)],
+            "garment_name": f"{categories[index % len(categories)]}-unseen-{index // len(categories)}",
+            "release_stage": "public_unseen",
+            "seed": 60_000 + index,
+        }
+        for index in range(row_count)
+    ]
+    matrix = tmp_path / "terminal-evaluation.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    opened: list[bool] = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened.append(True)
+        raise RuntimeError("ledger reached")
+
+    monkeypatch.setenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", "1")
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=row_count, target_accepted=row_count,
+    )
+
+    with pytest.raises(RuntimeError, match="ledger reached"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened == [True]
+
+
+def test_runtime_admits_cpu_terminal_seen_development_evaluation_before_opening_the_ledger(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    payload = json.loads(Path("configs/eval_groot_n17_seen_dev.json").read_text(encoding="utf-8"))
+    rows = [{**row, "release_stage": "seen"} for row in payload["trials"]]
+    matrix = tmp_path / "terminal-seen-development.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    opened: list[bool] = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened.append(True)
+        raise RuntimeError("ledger reached")
+
+    monkeypatch.setenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", "1")
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=24, target_accepted=24,
+    )
+
+    with pytest.raises(RuntimeError, match="ledger reached"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened == [True]
+
+
+def test_runtime_rejects_cpu_terminal_public_unseen_evaluation_without_marker_before_ledger(tmp_path, monkeypatch) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    rows = [
+        {
+            "trial_id": f"public-unseen-{index}",
+            "category": "top_long", "garment_name": f"top-long-unseen-{index}",
+            "release_stage": "public_unseen", "seed": 60_000 + index,
+        }
+        for index in range(20)
+    ]
+    matrix = tmp_path / "terminal-evaluation.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    opened: list[bool] = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened.append(True)
+        raise AssertionError("unmarked CPU evaluation must fail before the ledger opens")
+
+    monkeypatch.delenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", raising=False)
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=20, target_accepted=20,
+    )
+
+    with pytest.raises(ValueError, match="CPU cloth is reserved"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened == []
+
+
+def test_runtime_rejects_cuda_cloth_for_terminal_evaluation_before_opening_the_ledger(tmp_path, monkeypatch) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    rows = [
+        {
+            "trial_id": f"public-unseen-{index}", "category": "top_long",
+            "garment_name": f"top-long-unseen-{index}", "release_stage": "public_unseen",
+            "seed": 60_000 + index,
+        }
+        for index in range(20)
+    ]
+    matrix = tmp_path / "terminal-evaluation.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    opened: list[bool] = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened.append(True)
+        raise AssertionError("CUDA terminal evaluation must fail before the ledger opens")
+
+    monkeypatch.setenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", "1")
+    args = types.SimpleNamespace(
+        device="cuda:0", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=20, target_accepted=20,
+    )
+
+    with pytest.raises(ValueError, match="terminal evaluation requires CPU cloth"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened == []
+
+
+def test_runtime_rejects_nonterminal_cpu_evaluation_size_before_opening_the_ledger(tmp_path, monkeypatch) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    rows = [
+        {
+            "trial_id": f"public-unseen-{index}", "category": "top_long",
+            "garment_name": f"top-long-unseen-{index}", "release_stage": "public_unseen",
+            "seed": 60_000 + index,
+        }
+        for index in range(21)
+    ]
+    matrix = tmp_path / "terminal-evaluation.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    opened: list[bool] = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened.append(True)
+        raise AssertionError("nonterminal CPU evaluation must fail before the ledger opens")
+
+    monkeypatch.setenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", "1")
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=21, target_accepted=21,
+    )
+
+    with pytest.raises(ValueError, match="terminal evaluation matrix is invalid"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened == []
+
+
 def test_runtime_admits_the_exact_cpu_zero_teacher_smoke_before_opening_the_ledger(tmp_path) -> None:
     from scripts.run_groot_persistent_worker import run
 
@@ -759,6 +999,68 @@ def test_runtime_admits_the_exact_cpu_zero_teacher_smoke_before_opening_the_ledg
     def ledger_factory(*_args, **_kwargs):
         opened.append(True); raise RuntimeError("ledger reached")
     args = types.SimpleNamespace(device="cpu", renderer_device="cuda:0", policy_device="cuda:0", lease_seconds=30.0, preparation_timeout_seconds=30.0, attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3", max_attempts=1, target_accepted=1)
+    with pytest.raises(RuntimeError, match="ledger reached"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened == [True]
+
+
+def test_runtime_admits_a_checksum_bound_cpu_hard_state_campaign_before_ledger(tmp_path, monkeypatch) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    restore = tmp_path / "000032.json"
+    restore.write_text(json.dumps({
+        "schema_version": 3,
+        "robot_position": [0.0] * 12,
+        "robot_velocity": [0.0] * 12,
+        "cloth_position": [[0.0, 0.0, 0.0]],
+        "cloth_velocity": [[0.0, 0.0, 0.0]],
+        "rng_state": {},
+        "garment_name": "Top_Short_Seen_0",
+        "randomization": {"strategy": "canonical", "continuation_step": 32},
+        "scene_state": {"garment_reset_pose": [0.0, 0.0, 0.67, 0.0, 0.0, 90.0]},
+        "cloth_state_authority": "usd_local_points_v1",
+    }), encoding="utf-8")
+    row = {
+        "attempt_id": "hard-state-parent-seed-900001",
+        "trial_id": "hard-state-parent-seed-900001",
+        "garment": "Top_Short_Seen_0",
+        "garment_name": "Top_Short_Seen_0",
+        "category": "top_short",
+        "release_stage": "seen",
+        "difficulty": "hard_state",
+        "seed": 900001,
+        "strategy": "canonical",
+        "restore_snapshot": str(restore),
+        "restore_snapshot_sha256": __import__("hashlib").sha256(restore.read_bytes()).hexdigest(),
+        "restore_snapshot_cloth_frame": "usd_local_points_v1",
+        "restore_snapshot_step": 32,
+        "parent_episode_id": "parent-episode",
+        "lineage_id": "parent-episode",
+        "source_episode_id": "parent-episode",
+        "source_episode_path": "/campaign/raw/parent-episode/episode.json",
+        "replay_kind": "verified_hard_state_moment_of_ruin_v1",
+        "category_acceptance_cap": 1,
+        "rank_score": 1.2,
+        "priority_reasons": ["category_gap", "high_progress"],
+        "selection_profile": "moment_of_ruin_reward_drop_v1",
+        "selection_evidence": {"moment_of_ruin": {"restore_step": 32}},
+    }
+    matrix = tmp_path / "hard-state.json"
+    matrix.write_text(json.dumps([row]), encoding="utf-8")
+    opened = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened.append(True)
+        raise RuntimeError("ledger reached")
+
+    monkeypatch.setenv("LEHOME_HARD_STATE_CAMPAIGN", "1")
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=1, target_accepted=1,
+    )
+
     with pytest.raises(RuntimeError, match="ledger reached"):
         run(args, ledger_factory=ledger_factory)
     assert opened == [True]
@@ -870,6 +1172,44 @@ def test_runtime_rejects_mixed_or_tampered_cpu_source_discovery_before_ledger(tm
     with pytest.raises(ValueError):
         run(args, ledger_factory=ledger_factory)
     assert opened == []
+
+
+def test_runtime_admits_four_worker_sized_cpu_source_discovery_before_ledger(tmp_path) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    categories = (
+        ("top_long", "Top_Long_Seen_0"),
+        ("top_short", "Top_Short_Seen_0"),
+        ("pant_long", "Pant_Long_Seen_0"),
+    )
+    rows = [
+        {
+            "snapshot_source_bootstrap": True,
+            "category": categories[index % 3][0],
+            "garment": categories[index % 3][1],
+            "seed": 90_000 + index,
+            "source_seed": 90_000 + index,
+        }
+        for index in range(400)
+    ]
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    opened: list[bool] = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened.append(True)
+        raise RuntimeError("ledger reached")
+
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=400, target_accepted=150,
+    )
+
+    with pytest.raises(RuntimeError, match="ledger reached"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened == [True]
 
 
 def test_worker_heartbeats_while_an_episode_blocks_and_stops_the_timer(tmp_path) -> None:

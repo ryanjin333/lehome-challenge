@@ -49,14 +49,28 @@ def _write_success(
         "cloth_position": [[0.0, 0.0, 0.0]],
         "cloth_velocity": [[0.0, 0.0, 0.0]],
         "rng_state": {},
+        "randomization": {"strategy": "canonical"},
         "scene_state": {"garment_reset_pose": [0.0, 0.0, 0.67, 0.0, 0.0, 90.0]},
     }
     episode_path = raw / "episode.json"
     reset_path = snapshots / "reset.json"
+    continuation_path = snapshots / "continuations" / "000016.json"
+    continuation_path.parent.mkdir()
     episode_path.write_text(json.dumps(episode), encoding="utf-8")
     reset_path.write_text(json.dumps(reset), encoding="utf-8")
+    continuation = {
+        **reset,
+        "schema_version": 3 if simulator_device == "cpu" else 2,
+        "cloth_state_authority": (
+            "usd_local_points_v1"
+            if simulator_device == "cpu"
+            else "physx_cloth_view_world_v1"
+        ),
+        "randomization": {**reset["randomization"], "continuation_step": 16},
+    }
+    continuation_path.write_text(json.dumps(continuation), encoding="utf-8")
     checksums = {}
-    for path in (episode_path, reset_path):
+    for path in (episode_path, reset_path, continuation_path):
         relative = path.relative_to(episode_root).as_posix()
         checksums[relative] = {
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -94,13 +108,76 @@ def test_builder_creates_balanced_lineage_bound_success_replays(tmp_path: Path) 
         category: 5 for category in CATEGORIES
     }
     assert all(row["parent_episode_id"] == row["lineage_id"] for row in matrix)
-    assert all(row["replay_kind"] == "verified_success_reset_v1" for row in matrix)
+    assert all(row["replay_kind"] == "verified_success_early_snapshot_v1" for row in matrix)
+    assert all(row["restore_snapshot_step"] == 16 for row in matrix)
+    assert all(row["restore_snapshot"].endswith("/snapshots/continuations/000016.json") for row in matrix)
     assert all(row["restore_snapshot_cloth_frame"] == "usd_local_points_v1" for row in matrix)
     assert all(Path(row["restore_snapshot"]).is_absolute() for row in matrix)
     assert all(len(row["restore_snapshot_sha256"]) == 64 for row in matrix)
     assert {row["strategy"] for row in matrix} == {"mild_geometry", "strong_geometry"}
     assert receipt["matrix_sha256"] == hashlib.sha256(matrix_path.read_bytes()).hexdigest()
     assert (tmp_path / "matrix.json.sha256").read_text(encoding="ascii") == receipt["matrix_sha256"] + "\n"
+
+
+def test_builder_supports_exact_category_attempts_and_acceptance_caps(tmp_path: Path) -> None:
+    from lehome.flywheel.recovery_collection import (
+        load_attempt_matrix,
+        validate_success_replay_descriptor,
+    )
+    from scripts.build_success_replay_matrix import build_success_replay_matrix
+
+    accepted = tmp_path / "accepted"
+    for index, category in enumerate(CATEGORIES):
+        _write_success(
+            accepted,
+            attempt_id=f"parent-{category}",
+            category=category,
+            garment=f"{category.title().replace('_', '_')}_Seen_{index}",
+        )
+    matrix_path = tmp_path / "matrix.json"
+    attempts = {"top_long": 12, "top_short": 4, "pant_long": 24, "pant_short": 0}
+    caps = {"top_long": 7, "top_short": 3, "pant_long": 9, "pant_short": 0}
+
+    receipt = build_success_replay_matrix(
+        accepted_root=accepted,
+        output=matrix_path,
+        attempts_by_category=attempts,
+        acceptance_caps=caps,
+        seed_base=70_000,
+    )
+
+    matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+    assert len(matrix) == 40
+    assert {
+        category: sum(row["category"] == category for row in matrix)
+        for category in CATEGORIES
+    } == attempts
+    assert all(row["category_acceptance_cap"] == caps[row["category"]] for row in matrix)
+    assert receipt["attempts_by_category"] == attempts
+    assert receipt["acceptance_caps"] == caps
+    assert validate_success_replay_descriptor(matrix_path) == matrix
+    assert load_attempt_matrix(matrix_path) == matrix
+
+
+def test_builder_rejects_caps_without_attempts(tmp_path: Path) -> None:
+    from scripts.build_success_replay_matrix import build_success_replay_matrix
+
+    accepted = tmp_path / "accepted"
+    for index, category in enumerate(CATEGORIES):
+        _write_success(
+            accepted,
+            attempt_id=f"parent-{category}",
+            category=category,
+            garment=f"{category.title().replace('_', '_')}_Seen_{index}",
+        )
+
+    with pytest.raises(ValueError, match="acceptance cap"):
+        build_success_replay_matrix(
+            accepted_root=accepted,
+            output=tmp_path / "matrix.json",
+            attempts_by_category={"top_long": 0, "top_short": 1, "pant_long": 1, "pant_short": 1},
+            acceptance_caps={"top_long": 1, "top_short": 1, "pant_long": 1, "pant_short": 1},
+        )
 
 
 def test_builder_is_deterministic_and_rejects_tampered_or_incomplete_sources(

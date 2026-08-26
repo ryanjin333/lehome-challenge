@@ -57,6 +57,8 @@ CONTROLLED_RECOVERY_SMOKE_MATRIX_SHA256="${LEHOME_CONTROLLED_RECOVERY_MATRIX_SHA
 CONTROLLED_RECOVERY_SMOKE_MATERIALIZATION_SHA256="${LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION_SHA256:-}"
 CONTROLLED_RECOVERY_SMOKE_ROW_INDEX="${LEHOME_CONTROLLED_RECOVERY_SMOKE_ROW_INDEX:-}"
 SNAPSHOT_SOURCE_BOOTSTRAP="${LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP:-0}"
+SUCCESS_REPLAY_CAMPAIGN="${LEHOME_SUCCESS_REPLAY_CAMPAIGN:-0}"
+HARD_STATE_CAMPAIGN="${LEHOME_HARD_STATE_CAMPAIGN:-0}"
 RESUME_PREEMPTED_ROLLOUT="${LEHOME_RESUME_PREEMPTED_ROLLOUT:-0}"
 EVALUATION_TERMINAL_UPLOAD="${LEHOME_EVALUATION_TERMINAL_UPLOAD:-0}"
 
@@ -83,14 +85,53 @@ case "${SNAPSHOT_SOURCE_BOOTSTRAP}" in
   "0"|"1") ;;
   *) echo "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP must be exactly 0 or 1" >&2; exit 2 ;;
 esac
+case "${SUCCESS_REPLAY_CAMPAIGN}" in
+  "0"|"1") ;;
+  *) echo "LEHOME_SUCCESS_REPLAY_CAMPAIGN must be exactly 0 or 1" >&2; exit 2 ;;
+esac
+case "${HARD_STATE_CAMPAIGN}" in
+  "0"|"1") ;;
+  *) echo "LEHOME_HARD_STATE_CAMPAIGN must be exactly 0 or 1" >&2; exit 2 ;;
+esac
+if (( 10#${SUCCESS_REPLAY_CAMPAIGN} + 10#${HARD_STATE_CAMPAIGN} + 10#${EVALUATION_TERMINAL_UPLOAD} > 1 )); then
+  echo "CPU campaign mode markers are mutually exclusive" >&2
+  exit 2
+fi
 case "${SIMULATOR_DEVICE}" in
   "cuda:0") ;;
   "cpu")
-    if [ "${CONTROLLED_RECOVERY_SMOKE}" = "1" ] && [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" = "0" ]; then
+    if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
+      if [ "${WORKER_COUNT}" != "4" ] || [ "${ENABLE_HF_UPLOAD}" != "1" ] \
+          || [ "${SKIP_ROUND_SEAL}" != "0" ] || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] \
+          || [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "0" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ]; then
+        echo "CPU cloth requires the exact terminal-evaluation tuple" >&2
+        exit 2
+      fi
+    elif [ "${SUCCESS_REPLAY_CAMPAIGN}" = "1" ]; then
+      if [ "${WORKER_COUNT}" != "4" ] || [ "${ENABLE_HF_UPLOAD}" != "1" ] \
+          || [ "${SKIP_ROUND_SEAL}" != "0" ] || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] \
+          || [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "0" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ] \
+          || ! [[ "${MAX_ATTEMPTS}" =~ ^([1-9]|[1-9][0-9]|[1-3][0-9][0-9]|400)$ ]] \
+          || ! [[ "${TARGET_ACCEPTED}" =~ ^([1-9]|[1-9][0-9]|1[0-4][0-9]|150)$ ]] \
+          || (( 10#${TARGET_ACCEPTED} > 10#${MAX_ATTEMPTS} )); then
+        echo "CPU cloth requires the exact four-worker success-replay tuple" >&2
+        exit 2
+      fi
+    elif [ "${HARD_STATE_CAMPAIGN}" = "1" ]; then
+      if [ "${WORKER_COUNT}" != "4" ] || [ "${ENABLE_HF_UPLOAD}" != "1" ] \
+          || [ "${SKIP_ROUND_SEAL}" != "0" ] || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] \
+          || [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "0" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ] \
+          || ! [[ "${MAX_ATTEMPTS}" =~ ^([1-9]|[1-9][0-9]|[1-3][0-9][0-9]|400)$ ]] \
+          || ! [[ "${TARGET_ACCEPTED}" =~ ^([1-9]|[1-9][0-9]|1[0-4][0-9]|150)$ ]] \
+          || (( 10#${TARGET_ACCEPTED} > 10#${MAX_ATTEMPTS} )); then
+        echo "CPU cloth requires the exact four-worker hard-state tuple" >&2
+        exit 2
+      fi
+    elif [ "${CONTROLLED_RECOVERY_SMOKE}" = "1" ] && [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" = "0" ]; then
       : # The controlled-smoke allow-list below validates its remaining exact invariants.
-    elif [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "1" ] || [ "${WORKER_COUNT}" != "1" ] \
-        || ! [[ "${MAX_ATTEMPTS}" =~ ^([1-9]|1[0-6])$ ]] \
-        || ! [[ "${TARGET_ACCEPTED}" =~ ^[1-4]$ ]] \
+    elif [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "1" ] || ! [[ "${WORKER_COUNT}" =~ ^(1|4)$ ]] \
+        || ! [[ "${MAX_ATTEMPTS}" =~ ^([1-9]|[1-9][0-9]|[1-3][0-9][0-9]|400)$ ]] \
+        || ! [[ "${TARGET_ACCEPTED}" =~ ^([1-9]|[1-9][0-9]|1[0-4][0-9]|150)$ ]] \
         || (( 10#${TARGET_ACCEPTED} > 10#${MAX_ATTEMPTS} )) \
         || [ "${ENABLE_HF_UPLOAD}" != "1" ] || [ "${SKIP_ROUND_SEAL}" != "1" ] \
         || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ] \
@@ -110,8 +151,13 @@ case "${EVALUATION_TERMINAL_UPLOAD}" in
   *) echo "LEHOME_EVALUATION_TERMINAL_UPLOAD must be exactly 0 or 1" >&2; exit 2 ;;
 esac
 if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
+  if [ "${SIMULATOR_DEVICE}" != "cpu" ]; then
+    echo "terminal evaluation requires LEHOME_SIMULATOR_DEVICE=cpu" >&2
+    exit 2
+  fi
   if [ "${ENABLE_HF_UPLOAD}" != "1" ] || [ "${WORKER_COUNT}" != "4" ] \
-      || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || [ "${SKIP_ROUND_SEAL}" != "0" ]; then
+      || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || [ "${SKIP_ROUND_SEAL}" != "0" ] \
+      || [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "0" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ]; then
     echo "evaluation terminal publication requires the exact four-worker evaluation tuple" >&2
     exit 2
   fi
@@ -170,9 +216,9 @@ if [ "${MATRIX_ACTUAL_SHA256}" != "${MATRIX_EXPECTED_SHA256}" ]; then
   exit 2
 fi
 if [ "${SKIP_ROUND_SEAL}" = "1" ] && [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" = "1" ]; then
-  if [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || [ "${WORKER_COUNT}" != "1" ] \
+  if [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || ! [[ "${WORKER_COUNT}" =~ ^(1|4)$ ]] \
       || [ "${ENABLE_HF_UPLOAD}" != "1" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ] \
-      || [ "${MAX_WORKER_RESTARTS}" != "0" ] \
+      || ! [[ "${MAX_WORKER_RESTARTS}" =~ ^(0|8)$ ]] \
       || ! [[ "${RUN_ID}" =~ ^[0-9a-f]{32}$ ]] \
       || ! [[ "${ROUND_ID}" =~ ^snapshot-source-bootstrap-[0-9a-f]{20}-unsealed-source$ ]]; then
     echo "LEHOME_SKIP_ROUND_SEAL is reserved for the exact snapshot-source bootstrap tuple" >&2
@@ -187,14 +233,17 @@ except (OSError, ValueError) as error: raise SystemExit(f"snapshot source descri
 try:
     max_attempts, target_accepted = int(max_attempts), int(target_accepted)
 except ValueError: raise SystemExit("snapshot source discovery attempt bounds are invalid")
-if not isinstance(rows, list) or not 1 <= len(rows) <= 16 or not all(isinstance(row, dict) for row in rows): raise SystemExit("snapshot source descriptor must contain 1..16 rows")
-if max_attempts != len(rows) or not 1 <= target_accepted <= min(4, len(rows)): raise SystemExit("snapshot source discovery attempt bounds are invalid")
-legacy_single = len(rows) == 1 and rows[0].get("replay_kind") == "verified_success_reset_v1"
+if not isinstance(rows, list) or not 1 <= len(rows) <= 400 or not all(isinstance(row, dict) for row in rows): raise SystemExit("snapshot source descriptor must contain 1..400 rows")
+if max_attempts != len(rows) or not 1 <= target_accepted <= min(150, len(rows)): raise SystemExit("snapshot source discovery attempt bounds are invalid")
+legacy_single = len(rows) == 1 and rows[0].get("replay_kind") in {
+    "verified_success_reset_v1", "verified_success_early_snapshot_v1",
+}
 if not legacy_single:
-    category, seeds = rows[0].get("category"), set()
+    seeds = set()
     allowed_fields = {"snapshot_source_bootstrap", "snapshot_source_descriptor_sha256", "category", "garment", "garment_name", "seed", "source_seed"}
     for row in rows:
-        if (row.get("snapshot_source_bootstrap") is not True or row.get("category") != category
+        category = row.get("category")
+        if (row.get("snapshot_source_bootstrap") is not True
                 or row.get("garment_name") not in (None, row.get("garment"))
                 or any(key not in allowed_fields for key in row)):
             raise SystemExit("snapshot source descriptor must be ordinary autonomous collection")
@@ -566,6 +615,9 @@ launch_worker() {
     -e OMNI_DATA_PATH=/kitcache/ov \
     -e OMNI_USER_DIR=/kitcache/ov \
     -e LEHOME_DISABLE_KEYBOARD=1 \
+    -e LEHOME_EVALUATION_TERMINAL_UPLOAD="${EVALUATION_TERMINAL_UPLOAD}" \
+    -e LEHOME_SUCCESS_REPLAY_CAMPAIGN="${SUCCESS_REPLAY_CAMPAIGN}" \
+    -e LEHOME_HARD_STATE_CAMPAIGN="${HARD_STATE_CAMPAIGN}" \
     --entrypoint /isaac-sim/python.sh \
     "${ROLLOUT_IMAGE}" \
     /opt/lehome/scripts/run_groot_persistent_worker.py \

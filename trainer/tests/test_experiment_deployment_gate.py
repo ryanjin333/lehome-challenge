@@ -63,6 +63,23 @@ def _document() -> dict[str, object]:
     }
 
 
+def _v2_document(*, state: str = "accepted") -> dict[str, object]:
+    document = _document()
+    document["schema_version"] = 2
+    teacher = document.pop("teacher_probe")
+    if state == "accepted":
+        document["recovery_admission"] = {"state": "accepted", "teacher_probe": teacher}
+    elif state == "unavailable":
+        document["recovery_admission"] = {
+            "state": "unavailable",
+            "reason": "cpu_replay_fidelity_failed",
+            "failure_receipt_sha256": "9" * 64,
+        }
+    else:
+        raise AssertionError("unsupported test recovery admission state")
+    return document
+
+
 def _write(path: Path, document: dict[str, object]) -> str:
     payload = json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
     path.write_bytes(payload)
@@ -101,7 +118,43 @@ def test_deployment_gate_binds_exact_images_instances_and_accepted_teacher_probe
     assert gate.rollout_instance_id == "computeinstance-rollout1"
     assert gate.training_oci_digest == "sha256:" + "a" * 64
     assert gate.training_code_revision == "b" * 40
+    assert gate.recovery_collection_admitted is True
     assert gate.teacher_probe_receipt_sha256 == "e" * 64
+    assert gate.recovery_failure_receipt_sha256 is None
+
+
+def test_v2_accepted_recovery_admission_preserves_teacher_rigor(tmp_path: Path) -> None:
+    from lehome_train.groot.experiment_deployment_gate import (
+        load_deployment_gate,
+        require_recovery_collection_admission,
+    )
+
+    path = tmp_path / "deployment-gate.json"
+    digest = _write(path, _v2_document())
+    gate = load_deployment_gate(path, digest)
+
+    assert gate.recovery_collection_admitted is True
+    assert require_recovery_collection_admission(gate) == "e" * 64
+    assert gate.recovery_failure_receipt_sha256 is None
+    assert gate.recovery_unavailable_reason is None
+
+
+def test_v2_unavailable_recovery_admits_ordinary_pool_but_fails_recovery_closed(tmp_path: Path) -> None:
+    from lehome_train.groot.experiment_deployment_gate import (
+        load_deployment_gate,
+        require_recovery_collection_admission,
+    )
+
+    path = tmp_path / "deployment-gate.json"
+    digest = _write(path, _v2_document(state="unavailable"))
+    gate = load_deployment_gate(path, digest)
+
+    assert gate.recovery_collection_admitted is False
+    assert gate.teacher_probe_receipt_sha256 is None
+    assert gate.recovery_failure_receipt_sha256 == "9" * 64
+    assert gate.recovery_unavailable_reason == "cpu_replay_fidelity_failed"
+    with pytest.raises(ValueError, match="recovery collection is not admitted"):
+        require_recovery_collection_admission(gate)
 
 
 @pytest.mark.parametrize(
@@ -131,6 +184,46 @@ def test_deployment_gate_rejects_unverified_or_nonteacher_admission(tmp_path: Pa
         load_deployment_gate(path, digest)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda value: value["recovery_admission"].update(state="pending"),
+        lambda value: value["recovery_admission"].update(reason="unsafe reason"),
+        lambda value: value["recovery_admission"].update(failure_receipt_sha256="a" * 63),
+        lambda value: value["recovery_admission"].update(extra=True),
+        lambda value: value["recovery_admission"].pop("failure_receipt_sha256"),
+    ),
+)
+def test_v2_unavailable_rejects_tampered_recovery_admission(tmp_path: Path, mutation) -> None:
+    from lehome_train.groot.experiment_deployment_gate import load_deployment_gate
+
+    document = _v2_document(state="unavailable")
+    mutation(document)
+    path = tmp_path / "deployment-gate.json"
+    digest = _write(path, document)
+    with pytest.raises(ValueError, match="deployment gate"):
+        load_deployment_gate(path, digest)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda value: value["recovery_admission"]["teacher_probe"].update(accepted=False),
+        lambda value: value["recovery_admission"]["teacher_probe"].update(readback_verified=False),
+        lambda value: value["recovery_admission"].update(extra=True),
+    ),
+)
+def test_v2_accepted_rejects_tampered_teacher_evidence(tmp_path: Path, mutation) -> None:
+    from lehome_train.groot.experiment_deployment_gate import load_deployment_gate
+
+    document = _v2_document()
+    mutation(document)
+    path = tmp_path / "deployment-gate.json"
+    digest = _write(path, document)
+    with pytest.raises(ValueError, match="deployment gate"):
+        load_deployment_gate(path, digest)
+
+
 def test_deployment_gate_rejects_byte_or_digest_tampering(tmp_path: Path) -> None:
     from lehome_train.groot.experiment_deployment_gate import load_deployment_gate
 
@@ -153,7 +246,7 @@ def test_paid_training_identity_requires_the_gate_image_and_baked_oci_manifest(t
     from lehome_train.groot.experiment_job import dump_experiment_job
 
     gate_path = tmp_path / "deployment-gate.json"
-    gate_digest = _write(gate_path, _document())
+    gate_digest = _write(gate_path, _v2_document(state="unavailable"))
     manifest_path = tmp_path / "training-image-manifest.json"
     _training_image_manifest(manifest_path)
     job_document = job_document_template()

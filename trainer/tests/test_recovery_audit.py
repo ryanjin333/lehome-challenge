@@ -309,6 +309,36 @@ def test_source_only_audit_envelope_admits_a_bounded_multi_source_set_but_remain
         _audit_source_seal(path)
 
 
+def test_source_only_audit_envelope_admits_150_sources_but_rejects_151(tmp_path: Path) -> None:
+    from lehome_train.groot.recovery_audit import _audit_source_seal
+    from lehome_train.io import canonical_json_sha256
+
+    episode_ids = [hashlib.sha256(f"episode-{index}".encode()).hexdigest() for index in range(151)]
+    body = {
+        "schema_version": 1,
+        "kind": "snapshot_source_bootstrap_envelope",
+        "round_id": "snapshot-source-bootstrap-abc-unsealed-source",
+        "repository": "ryanjin333/lehome-groot-n17-rollouts",
+        "episode_count": 150,
+        "episode_sha256s": {episode_id: "a" * 64 for episode_id in episode_ids[:150]},
+        "immutable_revisions": {episode_id: "b" * 40 for episode_id in episode_ids[:150]},
+        "readback_verified": True,
+        "source_only": True,
+    }
+    body["envelope_sha256"] = canonical_json_sha256(body)
+    path = tmp_path / "source-envelope.json"
+    path.write_text(json.dumps(body), encoding="utf-8")
+    assert _audit_source_seal(path)["episode_count"] == 150
+
+    body["episode_count"] = 151
+    body["episode_sha256s"][episode_ids[150]] = "a" * 64
+    body["immutable_revisions"][episode_ids[150]] = "b" * 40
+    body["envelope_sha256"] = canonical_json_sha256({key: value for key, value in body.items() if key != "envelope_sha256"})
+    path.write_text(json.dumps(body), encoding="utf-8")
+    with pytest.raises(ValueError, match="source envelope"):
+        _audit_source_seal(path)
+
+
 @pytest.mark.parametrize("episode_id", ["not-a-task-ledger-id", "../unsafe", "A" * 64])
 def test_source_only_audit_envelope_requires_canonical_task_ledger_attempt_ids(
     tmp_path: Path, episode_id: str,

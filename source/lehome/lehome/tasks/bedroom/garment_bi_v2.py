@@ -561,27 +561,43 @@ class GarmentEnv(DirectRLEnv):
         return episode_success
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
+        trace_reset = os.environ.get("LEHOME_REPLAY_FRAME_PROGRESS") == "1"
         if env_ids is None:
             env_ids = self.left_arm._ALL_INDICES
+        if trace_reset:
+            logger.info("[Replay reset trace] Starting base scene reset")
         super()._reset_idx(env_ids)
+        if trace_reset:
+            logger.info("[Replay reset trace] Completed base scene reset")
 
         # Reset cached reward on episode reset
         self._last_computed_reward = 0.0
 
         left_joint_pos = self.left_arm.data.default_joint_pos[env_ids]
         right_joint_pos = self.right_arm.data.default_joint_pos[env_ids]
+        if trace_reset:
+            logger.info("[Replay reset trace] Starting left-arm reset write")
         self.left_arm.write_joint_position_to_sim(
             left_joint_pos, joint_ids=None, env_ids=env_ids
         )
+        if trace_reset:
+            logger.info("[Replay reset trace] Completed left-arm reset write")
+            logger.info("[Replay reset trace] Starting right-arm reset write")
         self.right_arm.write_joint_position_to_sim(
             right_joint_pos, joint_ids=None, env_ids=env_ids
         )
+        if trace_reset:
+            logger.info("[Replay reset trace] Completed right-arm reset write")
 
         # Reset the garment object.  CPU source bootstrap owns USD-local
         # particles and cannot create a particle-cloth view.
         if self.object is not None:
             if str(self.device).lower() == "cpu":
+                if trace_reset:
+                    logger.info("[Replay reset trace] Starting CPU garment reset")
                 self._flywheel_reset_legacy_cpu_garment()
+                if trace_reset:
+                    logger.info("[Replay reset trace] Completed CPU garment reset")
             else:
                 self.object.reset()
 
@@ -591,6 +607,8 @@ class GarmentEnv(DirectRLEnv):
 
         if self.light_cfg.get("enable", False):
             self._randomize_light()
+        if trace_reset:
+            logger.info("[Replay reset trace] Completed environment-specific reset")
 
     def _randomize_table038_texture(self):
         """Randomize Table038 texture based on config."""
@@ -672,7 +690,9 @@ class GarmentEnv(DirectRLEnv):
         if self.object is None:
             raise RuntimeError("cannot initialize an absent CPU source garment")
         try:
-            self.object.set_world_pose(position=self.object.init_pos, orientation=self.object.init_ori)
+            self.object.world_prim.set_world_pose(
+                position=self.object.init_pos, orientation=self.object.init_ori
+            )
             positions, velocities = self._flywheel_legacy_cpu_cloth_state()
         except (RuntimeError, TypeError, ValueError, AttributeError) as error:
             raise RuntimeError("CPU source garment initialization lacks live USD cloth state") from error
@@ -709,7 +729,9 @@ class GarmentEnv(DirectRLEnv):
             orientation_degrees = self.garment_rng.uniform(orientation_range[:3], orientation_range[3:])
             from isaacsim.core.utils.rotations import euler_angles_to_quat
 
-            self.object.set_world_pose(position, euler_angles_to_quat(orientation_degrees, degrees=True))
+            self.object.world_prim.set_world_pose(
+                position, euler_angles_to_quat(orientation_degrees, degrees=True)
+            )
             self.object.reset_pose = np.concatenate((position, orientation_degrees)).astype(np.float32)
             positions_attr, velocities_attr = self._flywheel_legacy_cpu_cloth_attributes()
             if not callable(getattr(positions_attr, "Set", None)) or not callable(getattr(velocities_attr, "Set", None)):
@@ -737,7 +759,7 @@ class GarmentEnv(DirectRLEnv):
                 raise ValueError("CPU source garment pose must be a finite xyz-rpy vector")
             from isaacsim.core.utils.rotations import euler_angles_to_quat
 
-            self.object.set_world_pose(
+            self.object.world_prim.set_world_pose(
                 garment_pose[:3], euler_angles_to_quat(garment_pose[3:], degrees=True)
             )
             self.object.reset_pose = garment_pose.copy()
@@ -1849,35 +1871,46 @@ class GarmentEnv(DirectRLEnv):
                 raise RuntimeError("robot base pose readback did not match requested randomization")
 
         if preserved_restore is not None:
-            source_pose = np.asarray(preserved_restore["pose"], dtype=np.float32)
-            target_pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
-            if (
-                source_pose.shape != (6,)
-                or target_pose.shape != (6,)
-                or not np.isfinite(source_pose).all()
-                or not np.isfinite(target_pose).all()
-            ):
-                raise RuntimeError("garment randomized pose readback is invalid")
-            from isaacsim.core.utils.rotations import euler_angles_to_quat, quat_to_rot_matrix
+            if str(self.device).lower() == "cpu":
+                # Legacy CPU snapshots own USD-local particles. Moving the
+                # garment's parent Xform already applies the randomized pose;
+                # rebasing those local points as world-space data would be
+                # wrong and would also construct the unsupported CPU cloth
+                # tensor view.
+                cloth_position, cloth_velocity = self._flywheel_cloth_arrays(
+                    preserved_restore["positions"], preserved_restore["velocities"]
+                )
+                observed_position, observed_velocity = self._flywheel_legacy_cpu_cloth_state()
+            else:
+                source_pose = np.asarray(preserved_restore["pose"], dtype=np.float32)
+                target_pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
+                if (
+                    source_pose.shape != (6,)
+                    or target_pose.shape != (6,)
+                    or not np.isfinite(source_pose).all()
+                    or not np.isfinite(target_pose).all()
+                ):
+                    raise RuntimeError("garment randomized pose readback is invalid")
+                from isaacsim.core.utils.rotations import euler_angles_to_quat, quat_to_rot_matrix
 
-            source_rotation = quat_to_rot_matrix(
-                euler_angles_to_quat(source_pose[3:], degrees=True)
-            )
-            target_rotation = quat_to_rot_matrix(
-                euler_angles_to_quat(target_pose[3:], degrees=True)
-            )
-            cloth_position, cloth_velocity = self._flywheel_rebase_world_cloth(
-                preserved_restore["positions"], preserved_restore["velocities"],
-                source_pose[:3], source_rotation, target_pose[:3], target_rotation,
-            )
-            cloth = self._flywheel_physics_cloth_view()
-            cloth.set_world_positions(
-                torch.tensor(cloth_position, dtype=torch.float32, device=self.device).unsqueeze(0)
-            )
-            cloth.set_velocities(
-                torch.tensor(cloth_velocity, dtype=torch.float32, device=self.device).unsqueeze(0)
-            )
-            observed_position, observed_velocity = self._flywheel_physics_cloth_state()
+                source_rotation = quat_to_rot_matrix(
+                    euler_angles_to_quat(source_pose[3:], degrees=True)
+                )
+                target_rotation = quat_to_rot_matrix(
+                    euler_angles_to_quat(target_pose[3:], degrees=True)
+                )
+                cloth_position, cloth_velocity = self._flywheel_rebase_world_cloth(
+                    preserved_restore["positions"], preserved_restore["velocities"],
+                    source_pose[:3], source_rotation, target_pose[:3], target_rotation,
+                )
+                cloth = self._flywheel_physics_cloth_view()
+                cloth.set_world_positions(
+                    torch.tensor(cloth_position, dtype=torch.float32, device=self.device).unsqueeze(0)
+                )
+                cloth.set_velocities(
+                    torch.tensor(cloth_velocity, dtype=torch.float32, device=self.device).unsqueeze(0)
+                )
+                observed_position, observed_velocity = self._flywheel_physics_cloth_state()
             if not (
                 np.allclose(observed_position, cloth_position, rtol=0.0, atol=1e-6)
                 and np.allclose(observed_velocity, cloth_velocity, rtol=0.0, atol=1e-6)

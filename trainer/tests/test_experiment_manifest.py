@@ -62,6 +62,18 @@ def test_manifest_change_to_80_20_changes_identity_and_derives_batch64_schedule(
     assert original.identity_sha256 != changed.identity_sha256
 
 
+def test_manifest_admits_the_pure_bc_sweep_control(tmp_path: Path) -> None:
+    from lehome_train.groot.experiment_manifest import load_experiment_manifest
+
+    path = tmp_path / "experiment.json"
+    _write(path, _manifest(bc=100, rollout=0))
+
+    manifest = load_experiment_manifest(path)
+
+    assert manifest.weights == {"bc": 100, "rollout": 0, "dagger": 0}
+    assert manifest.quotas == {"bc": 64, "rollout": 0, "dagger": 0}
+
+
 def test_manifest_accepts_a_fresh_immutable_rollout_round_prefix(tmp_path: Path) -> None:
     from lehome_train.groot.experiment_manifest import load_experiment_manifest
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,40 @@ def _job(tmp_path: Path, name: str):
     path = tmp_path / f"{name}.json"
     path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     return load_experiment_job(path)
+
+
+def _recovery_job_and_receipt(tmp_path: Path, name: str = "recovery-d"):
+    from lehome_train.io import canonical_json_sha256
+
+    source = {
+        "repository": "owner/data",
+        "revision": "b" * 40,
+        "prefix": "recovery",
+        "manifest_sha256": "a" * 64,
+        "tree_sha256": "a" * 64,
+    }
+    receipt = {
+        "schema_version": 1,
+        "kind": "verified_recovery_dependency",
+        "source": source,
+        "readback_verified": True,
+        "trajectories": {
+            category: [category + str(index) for index in range(5)]
+            for category in ("top_long", "top_short", "pant_long", "pant_short")
+        },
+    }
+    document = _document()
+    document["arm"] = name
+    document["publication"]["prefix"] = "experiments/" + name
+    document["data_sources"] = [{"kind": "recovery", **source}]
+    document["mixture"] = {
+        "bc_percent": 95,
+        "added_percent": 5,
+        "batch64_quotas": {"bc": 61, "rollout": 3, "dagger": 0},
+        "sampling_strategy": "unweighted",
+    }
+    document["dependencies"] = [canonical_json_sha256(receipt)]
+    return dump_experiment_job(tmp_path / (name + ".json"), document), receipt
 
 
 def test_two_workers_lease_without_wave_barrier(tmp_path: Path) -> None:
@@ -593,6 +628,432 @@ def test_recovery_receipt_unblocks_only_verified_thresholds(tmp_path: Path) -> N
     assert controller.state(jobs[0].experiment_id) == "READY" and controller.state(jobs[-1].experiment_id) == "BLOCKED_DATA"
 
 
+def test_unavailable_recovery_admission_keeps_valid_dependency_blocked_but_leases_ordinary_work(tmp_path: Path) -> None:
+    from lehome_train.groot.experiment_controller import ExperimentController
+
+    recovery, receipt = _recovery_job_and_receipt(tmp_path)
+    ordinary = _job(tmp_path, "a")
+    controller = ExperimentController(
+        tmp_path / "controller.sqlite3",
+        recovery_collection_admitted=False,
+    )
+    controller.add_jobs([ordinary, recovery])
+
+    assert controller.satisfy_dependency(receipt, 1) == 0
+    assert controller.state(recovery.experiment_id) == "BLOCKED_DATA"
+    lease = controller.lease_next("ordinary", "training", 2, 100)
+    assert lease is not None and lease.experiment_id == ordinary.experiment_id
+
+
+def test_unavailable_recovery_admission_demotes_persisted_ready_job_on_restart(tmp_path: Path) -> None:
+    from lehome_train.groot.experiment_controller import ExperimentController
+
+    database = tmp_path / "controller.sqlite3"
+    recovery, receipt = _recovery_job_and_receipt(tmp_path)
+    admitted = ExperimentController(database, recovery_collection_admitted=True)
+    admitted.add_jobs([recovery])
+    assert admitted.satisfy_dependency(receipt, 1) == 1
+    assert admitted.state(recovery.experiment_id) == "READY"
+    admitted.close()
+
+    restarted = ExperimentController(database, recovery_collection_admitted=False)
+    restarted.add_jobs([recovery])
+    assert restarted.state(recovery.experiment_id) == "BLOCKED_DATA"
+
+
+def test_unavailable_recovery_admission_revokes_stale_admitted_recovery_continuation(
+    tmp_path: Path,
+) -> None:
+    """A historical D--G promotion cannot occupy the ordinary continuation field."""
+    from lehome_train.groot.experiment_controller import ExperimentController
+
+    database = tmp_path / "stale-admitted-recovery.sqlite3"
+    recovery, receipt = _recovery_job_and_receipt(tmp_path, "stale-admitted-recovery")
+    admitted = ExperimentController(database, recovery_collection_admitted=True)
+    admitted.add_jobs([recovery])
+    assert admitted.satisfy_dependency(receipt, 1) == 1
+    lease = admitted.lease_next("recovery-worker", "training", 2, 100)
+    assert lease is not None
+    admitted.complete(lease, "c" * 64, 3)
+    admitted.publication_verified(recovery.experiment_id, _publication(recovery), 4)
+    with admitted._transaction():
+        admitted._connection.execute(
+            "UPDATE jobs SET state='COMPLETED' WHERE experiment_id=?", (recovery.experiment_id,)
+        )
+        admitted._connection.execute(
+            "INSERT INTO evaluations VALUES(?,?,?)",
+            (recovery.experiment_id, json.dumps(_report(recovery), sort_keys=True, separators=(",", ":")), 5),
+        )
+        admitted._candidate(recovery.experiment_id, "step_1000", 6)
+        admitted._materialize_pending_candidates(6)
+    assert admitted._connection.execute(
+        "SELECT state FROM promotion_candidates WHERE parent_experiment_id=? AND kind='step_1000'",
+        (recovery.experiment_id,),
+    ).fetchone()[0] == "ADMITTED"
+    admitted.close()
+
+    restarted = ExperimentController(database, recovery_collection_admitted=False)
+    restarted.add_jobs([recovery])
+    assert restarted._connection.execute(
+        "SELECT state FROM promotion_candidates WHERE parent_experiment_id=? AND kind='step_1000'",
+        (recovery.experiment_id,),
+    ).fetchone()[0] == "REVOKED"
+    assert restarted._candidate_count("step_1000") == 0
+    assert restarted._candidate_parents("step_1000") == set()
+
+
+def test_unavailable_recovery_admission_excludes_historical_terminal_recovery_scores(
+    tmp_path: Path,
+) -> None:
+    """Historical D--G reports cannot rank ahead of ordinary A/B/C evidence."""
+    from lehome_train.groot.experiment_controller import ExperimentController
+
+    ordinary = _job(tmp_path, "ordinary-score")
+    recovery, _receipt = _recovery_job_and_receipt(tmp_path, "recovery-score")
+    controller = ExperimentController(
+        tmp_path / "historical-recovery-score.sqlite3",
+        recovery_collection_admitted=False,
+    )
+    controller.add_jobs([ordinary, recovery])
+    with controller._transaction():
+        for job in (ordinary, recovery):
+            controller._connection.execute(
+                "UPDATE jobs SET state='COMPLETED' WHERE experiment_id=?", (job.experiment_id,)
+            )
+            controller._connection.execute(
+                "INSERT INTO evaluations VALUES(?,?,?)",
+                (job.experiment_id, json.dumps(_report(job), sort_keys=True, separators=(",", ":")), 1),
+            )
+
+    assert [score.experiment_id for score in controller._rung_scores(500)] == [ordinary.experiment_id]
+    assert [score.experiment_id for score in controller._ranked_initial_500()] == [ordinary.experiment_id]
+
+
+def test_unavailable_recovery_admission_closes_the_three_arm_ordinary_field_through_two_k(
+    tmp_path: Path,
+) -> None:
+    """A/B/C continue through 2K even when clean recovery admission is absent."""
+    from lehome_train.groot.experiment_controller import ExperimentController
+
+    controller = ExperimentController(
+        tmp_path / "ordinary-only.sqlite3",
+        recovery_collection_admitted=False,
+    )
+    initial = [_job(tmp_path, name) for name in ("a", "b", "c")]
+    controller.add_jobs(initial)
+    now_ns = 1
+
+    def train_and_publish(*, expected_step: int, expected_kind: str | None = None):
+        nonlocal now_ns
+        lease = controller.lease_next("trainer-" + str(now_ns), "training", now_ns, 100)
+        assert lease is not None and lease.job is not None
+        assert lease.job.training.target_step == expected_step
+        if expected_kind is not None:
+            assert lease.job.admission["kind"] == expected_kind
+        controller.complete(lease, "c" * 64, now_ns + 1)
+        controller.publication_verified(lease.experiment_id, _publication(lease.job), now_ns + 2)
+        now_ns += 3
+        return lease.job
+
+    def evaluate(expected_id: str):
+        nonlocal now_ns
+        lease = controller.lease_next("evaluator-" + str(now_ns), "evaluation", now_ns, 100)
+        assert lease is not None and lease.experiment_id == expected_id and lease.job is not None
+        controller.submit_evaluation(lease, _report(lease.job), now_ns + 1)
+        now_ns += 2
+
+    first = train_and_publish(expected_step=500)
+    evaluate(first.experiment_id)
+    second = train_and_publish(expected_step=500)
+    evaluate(second.experiment_id)
+    first_seed = train_and_publish(expected_step=500, expected_kind="seed_repeat")
+    evaluate(first_seed.experiment_id)
+    second_seed = train_and_publish(expected_step=500, expected_kind="seed_repeat")
+    evaluate(second_seed.experiment_id)
+
+    one_k = train_and_publish(expected_step=1000, expected_kind="continuation")
+    third = train_and_publish(expected_step=500)
+    assert third.experiment_id == initial[2].experiment_id
+    evaluate(one_k.experiment_id)
+    evaluate(third.experiment_id)
+
+    two_k = controller.lease_next("trainer-two-k", "training", now_ns, 100)
+    assert two_k is not None and two_k.job is not None
+    assert two_k.job.training.target_step == 2000
+
+
+def test_unavailable_recovery_admission_cleans_stale_blocked_lease_and_budget_hold(tmp_path: Path) -> None:
+    """A blocked recovery row never retains authority or blocks A/B/C budget."""
+    from lehome_train.groot.experiment_controller import ExperimentController
+
+    recovery, _receipt = _recovery_job_and_receipt(tmp_path)
+    ordinary = _job(tmp_path, "a")
+    controller = ExperimentController(
+        tmp_path / "controller.sqlite3",
+        gradient_step_ceiling=500,
+        recovery_collection_admitted=False,
+    )
+    controller.add_jobs([recovery, ordinary])
+    stale_lease_id = "stale-recovery-lease"
+    with controller._transaction():
+        controller._connection.execute(
+            "INSERT INTO leases VALUES(?,?,?,?,?)",
+            (stale_lease_id, recovery.experiment_id, "stale-worker", "training", 100),
+        )
+        controller._connection.execute(
+            "INSERT INTO budget_reservations VALUES(?,?,?,?,?,?)",
+            (stale_lease_id, recovery.experiment_id, 500, 0.0, 0.0, 0),
+        )
+
+    with pytest.raises(ValueError, match="invalid lease"):
+        controller.lease_for(
+            stale_lease_id,
+            recovery.experiment_id,
+            "stale-worker",
+            now_ns=0,
+        )
+    assert controller._connection.execute(
+        "SELECT COUNT(*) FROM leases WHERE experiment_id=?", (recovery.experiment_id,)
+    ).fetchone()[0] == 0
+    assert controller._connection.execute(
+        "SELECT COUNT(*) FROM budget_reservations WHERE experiment_id=?", (recovery.experiment_id,)
+    ).fetchone()[0] == 0
+    ordinary_lease = controller.lease_next("ordinary-worker", "training", 1, 100)
+    assert ordinary_lease is not None and ordinary_lease.experiment_id == ordinary.experiment_id
+
+
+def test_unavailable_recovery_restart_settles_elapsed_gpu_budget_before_releasing_hold(
+    tmp_path: Path,
+) -> None:
+    """Restart cleanup accounts for paid recovery time before A/B/C can reuse it."""
+    from lehome_train.groot.experiment_controller import ExperimentController
+
+    database = tmp_path / "elapsed-recovery.sqlite3"
+    recovery, receipt = _recovery_job_and_receipt(tmp_path, "elapsed-recovery")
+    started_ns = time.time_ns() - 2_000_000_000
+    admitted = ExperimentController(
+        database,
+        gpu_seconds_ceiling=3.0,
+        spend_ceiling=3.0,
+        estimated_gpu_seconds_per_step=0.001,
+        gpu_price_per_second=1.0,
+        recovery_collection_admitted=True,
+    )
+    admitted.add_jobs([recovery])
+    assert admitted.satisfy_dependency(receipt, started_ns) == 1
+    lease = admitted.lease_next("recovery-worker", "training", started_ns, 1_000_000_000)
+    assert lease is not None
+    admitted.close()
+
+    restarted = ExperimentController(
+        database,
+        gpu_seconds_ceiling=3.0,
+        spend_ceiling=3.0,
+        estimated_gpu_seconds_per_step=0.001,
+        gpu_price_per_second=1.0,
+        recovery_collection_admitted=False,
+    )
+    restarted.add_jobs([recovery])
+    gradient_steps, gpu_seconds, spend = restarted.budget_usage()
+    assert gradient_steps == 0
+    assert gpu_seconds >= 1.0
+    assert spend >= 1.0
+
+
+def test_recovery_lease_defense_demotes_a_stale_ready_job_when_admission_is_unavailable(tmp_path: Path) -> None:
+    from lehome_train.groot.experiment_controller import ExperimentController
+
+    recovery, receipt = _recovery_job_and_receipt(tmp_path)
+    controller = ExperimentController(
+        tmp_path / "controller.sqlite3",
+        recovery_collection_admitted=False,
+    )
+    controller.add_jobs([recovery])
+    assert controller.satisfy_dependency(receipt, 1) == 0
+    # Model a stale persisted state from a prior accepted-gate controller.
+    controller._connection.execute(
+        "UPDATE jobs SET state='READY' WHERE experiment_id=?",
+        (recovery.experiment_id,),
+    )
+    controller._connection.commit()
+
+    assert controller.lease_next("trainer", "training", 2, 100) is None
+    assert controller.state(recovery.experiment_id) == "BLOCKED_DATA"
+
+
+@pytest.mark.parametrize("phase", ("training_leased", "evaluation_ready", "evaluation_leased"))
+def test_unavailable_recovery_gate_revokes_every_stale_nonterminal_phase_on_restart(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    from lehome_train.groot.experiment_controller import ExperimentController
+
+    database = tmp_path / (phase + ".sqlite3")
+    recovery, receipt = _recovery_job_and_receipt(tmp_path, phase)
+    admitted = ExperimentController(database, recovery_collection_admitted=True)
+    admitted.add_jobs([recovery])
+    assert admitted.satisfy_dependency(receipt, 1) == 1
+    training = admitted.lease_next("trainer", "training", 2, 100)
+    assert training is not None
+    stale_lease = training
+    if phase != "training_leased":
+        admitted.complete(training, "c" * 64, 3)
+        assert admitted.publication_verified(recovery.experiment_id, _publication(recovery), 4) == "EVAL_READY"
+        if phase == "evaluation_leased":
+            evaluation = admitted.lease_next("evaluator", "evaluation", 5, 100)
+            assert evaluation is not None
+            stale_lease = evaluation
+    admitted.close()
+
+    restarted = ExperimentController(database, recovery_collection_admitted=False)
+    restarted.add_jobs([recovery])
+    assert restarted.state(recovery.experiment_id) == "BLOCKED_DATA"
+    assert restarted._connection.execute(
+        "SELECT COUNT(*) FROM leases WHERE experiment_id=?", (recovery.experiment_id,)
+    ).fetchone()[0] == 0
+    assert restarted._connection.execute(
+        "SELECT COUNT(*) FROM budget_reservations WHERE experiment_id=?", (recovery.experiment_id,)
+    ).fetchone()[0] == 0
+    with pytest.raises(ValueError, match="invalid lease|does not belong"):
+        restarted.lease_for(
+            stale_lease.lease_id,
+            recovery.experiment_id,
+            stale_lease.worker_id,
+            now_ns=6,
+        )
+    with pytest.raises(ValueError, match="lease does not belong"):
+        restarted.heartbeat(stale_lease.worker_id, stale_lease.lease_id, 6, 100)
+
+
+def test_unavailable_recovery_gate_rejects_stale_publication_transition(tmp_path: Path) -> None:
+    from lehome_train.groot.experiment_controller import ExperimentController
+
+    database = tmp_path / "publishing.sqlite3"
+    recovery, receipt = _recovery_job_and_receipt(tmp_path, "publishing")
+    admitted = ExperimentController(database, recovery_collection_admitted=True)
+    admitted.add_jobs([recovery])
+    assert admitted.satisfy_dependency(receipt, 1) == 1
+    training = admitted.lease_next("trainer", "training", 2, 100)
+    assert training is not None
+    admitted.complete(training, "c" * 64, 3)
+    assert admitted.state(recovery.experiment_id) == "PUBLISHING"
+    admitted.close()
+
+    restarted = ExperimentController(database, recovery_collection_admitted=False)
+    restarted.add_jobs([recovery])
+    assert restarted.state(recovery.experiment_id) == "BLOCKED_DATA"
+    with pytest.raises(ValueError, match="recovery publication is not admitted"):
+        restarted.publication_verified(recovery.experiment_id, _publication(recovery), 4)
+
+
+def test_unavailable_recovery_admission_rejects_completed_recovery_final_winner_on_restart(
+    tmp_path: Path,
+) -> None:
+    """Completed recovery finalists cannot become a winner after gate loss."""
+    from lehome_train.groot.experiment_controller import ExperimentController
+    from lehome_train.groot.experiment_manifest import APPROVED_ORIGINAL_12K_CHECKPOINT
+    from test_experiment_winner import _report as final_report
+
+    database = tmp_path / "completed-finalist.sqlite3"
+    recovery, _receipt = _recovery_job_and_receipt(tmp_path, "completed-finalist")
+    matrix = "f" * 64
+    baseline = final_report(
+        candidate="original-12k",
+        policy=APPROVED_ORIGINAL_12K_CHECKPOINT["artifact_sha256"],
+        matrix=matrix,
+    )
+    report = final_report(
+        candidate=recovery.experiment_id,
+        experiment_id=recovery.experiment_id,
+        matrix=matrix,
+    )
+    admitted = ExperimentController(database, recovery_collection_admitted=True)
+    admitted.add_jobs([recovery])
+    with admitted._transaction():
+        admitted._connection.execute(
+            "UPDATE jobs SET state='COMPLETED' WHERE experiment_id=?", (recovery.experiment_id,)
+        )
+        admitted._connection.execute(
+            "INSERT INTO promotion_candidates VALUES(?,?, 'ADMITTED', ?,0)",
+            (recovery.experiment_id, "step_2000", 1),
+        )
+        admitted._connection.execute(
+            "INSERT INTO promotion_children VALUES(?,?,?)",
+            (recovery.experiment_id, recovery.experiment_id, 0),
+        )
+        admitted._connection.execute(
+            "INSERT INTO final_evaluations VALUES(?,?,?,?,?)",
+            (
+                recovery.experiment_id,
+                matrix,
+                "COMPLETED",
+                json.dumps(report, sort_keys=True, separators=(",", ":")),
+                1,
+            ),
+        )
+    admitted.close()
+
+    restarted = ExperimentController(database, recovery_collection_admitted=False)
+    restarted.add_jobs([recovery])
+    with pytest.raises(ValueError, match="recovery final winner is not admitted"):
+        restarted.final_winner_decision(
+            baseline_report=baseline,
+            matrix_sha256=matrix,
+            now_ns=2,
+        )
+
+
+def test_unavailable_recovery_restart_revokes_pending_recovery_promotion_but_materializes_ordinary(
+    tmp_path: Path,
+) -> None:
+    """A recovery promotion must not roll back ordinary restart reconciliation."""
+    from lehome_train.groot.experiment_controller import ExperimentController
+
+    database = tmp_path / "mixed-promotions.sqlite3"
+    ordinary = _job(tmp_path, "ordinary-parent")
+    recovery, receipt = _recovery_job_and_receipt(tmp_path, "recovery-parent")
+    admitted = ExperimentController(database, recovery_collection_admitted=True)
+    admitted.add_jobs([ordinary, recovery])
+    assert admitted.satisfy_dependency(receipt, 1) == 1
+    first = admitted.lease_next("ordinary-worker", "training", 2, 100)
+    second = admitted.lease_next("recovery-worker", "training", 2, 100)
+    assert first is not None and second is not None
+    leases = {first.experiment_id: first, second.experiment_id: second}
+    assert set(leases) == {ordinary.experiment_id, recovery.experiment_id}
+    for parent in (ordinary, recovery):
+        admitted.complete(leases[parent.experiment_id], "c" * 64, 3)
+        admitted.publication_verified(parent.experiment_id, _publication(parent), 4)
+        with admitted._transaction():
+            admitted._connection.execute(
+                "UPDATE jobs SET state='COMPLETED' WHERE experiment_id=?", (parent.experiment_id,)
+            )
+            admitted._connection.execute(
+                "INSERT INTO evaluations VALUES(?,?,?)",
+                (parent.experiment_id, json.dumps({"verified": True}), 5),
+            )
+            admitted._candidate(parent.experiment_id, "step_1000", 6)
+    admitted.close()
+
+    restarted = ExperimentController(database, recovery_collection_admitted=False)
+    restarted.add_jobs([ordinary, recovery])
+    restarted.reconcile_pending_candidates(7)
+
+    ordinary_child = restarted._connection.execute(
+        "SELECT experiment_id FROM promotion_children WHERE parent_experiment_id=?",
+        (ordinary.experiment_id,),
+    ).fetchone()
+    assert ordinary_child is not None
+    assert restarted._connection.execute(
+        "SELECT state FROM promotion_candidates WHERE parent_experiment_id=? AND kind='step_1000'",
+        (ordinary.experiment_id,),
+    ).fetchone()[0] == "ADMITTED"
+    assert restarted._connection.execute(
+        "SELECT state FROM promotion_candidates WHERE parent_experiment_id=? AND kind='step_1000'",
+        (recovery.experiment_id,),
+    ).fetchone()[0] == "REVOKED"
+    assert restarted.state(recovery.experiment_id) == "COMPLETED"
+
+
 def test_recovery_dependency_requires_its_declared_immutable_receipt_digest(tmp_path: Path) -> None:
     """A matching source alone cannot unlock an arm bound to another receipt."""
     from lehome_train.groot.experiment_controller import ExperimentController
@@ -967,7 +1428,11 @@ def test_tied_runner_8k_campaign_ceiling_is_independent_of_lease_order(tmp_path:
         "INSERT INTO budget_usage VALUES(?,?,?,?)", ("prior-campaign", 6000, 0.0, 0.0)
     )
     controller._connection.execute(
-        "INSERT INTO promotion_children VALUES(?,?,?)", (tied.experiment_id, "parent-tied", 1)
+        "INSERT INTO promotion_candidates VALUES(?,?, 'ADMITTED', ?,1)",
+        (tied.experiment_id, "step_2000", 1),
+    )
+    controller._connection.execute(
+        "INSERT INTO promotion_children VALUES(?,?,?)", (tied.experiment_id, tied.experiment_id, 1)
     )
     controller._connection.execute(
         "INSERT INTO promotion_children VALUES(?,?,?)", (primary.experiment_id, "parent-primary", 0)
@@ -979,6 +1444,52 @@ def test_tied_runner_8k_campaign_ceiling_is_independent_of_lease_order(tmp_path:
 
     assert first is not None and first.experiment_id == tied.experiment_id
     assert second is not None and second.experiment_id == primary.experiment_id
+
+
+def test_revoked_recovery_tied_runner_does_not_extend_any_gradient_budget_ceiling(
+    tmp_path: Path,
+) -> None:
+    """A stale D--G tie cannot spend the extra 1K reserved for a live finalist."""
+    from lehome_train.groot.experiment_controller import ExperimentController
+
+    ordinary = _job(tmp_path, "ordinary-budget")
+    recovery, _receipt = _recovery_job_and_receipt(tmp_path, "recovery-budget")
+    controller = ExperimentController(
+        tmp_path / "revoked-tied.sqlite3",
+        gradient_step_ceiling=7000,
+        tied_runner_gradient_step_ceiling=8000,
+        recovery_collection_admitted=False,
+    )
+    controller.add_jobs([ordinary, recovery])
+    with controller._transaction():
+        controller._connection.execute(
+            "INSERT INTO promotion_candidates VALUES(?,?, 'REVOKED', ?,1)",
+            (recovery.experiment_id, "step_2000", 1),
+        )
+        controller._connection.execute(
+            "INSERT INTO promotion_children VALUES(?,?,?)",
+            (recovery.experiment_id, recovery.experiment_id, 1),
+        )
+        controller._connection.execute(
+            "INSERT INTO budget_usage VALUES(?,?,?,?)", ("prior-budget", 7000, 0.0, 0.0)
+        )
+
+    assert controller._leaseable_training_count() == 0
+    assert controller.lease_next("ordinary-worker", "training", 1, 100) is None
+
+    with controller._transaction():
+        controller._connection.execute("DELETE FROM budget_usage")
+        controller._connection.execute(
+            "INSERT INTO budget_usage VALUES(?,?,?,?)", ("prior-budget", 7000, 0.0, 0.0)
+        )
+        controller._connection.execute(
+            "INSERT INTO budget_reservations VALUES(?,?,?,?,?,?)",
+            ("completion-grace", ordinary.experiment_id, 500, 0.0, 0.0, 0),
+        )
+        with pytest.raises(RuntimeError, match="exceeds the campaign gradient budget"):
+            controller._consume_completion_grace_gradient(
+                "completion-grace", ordinary.experiment_id, 1,
+            )
 
 
 def test_preemption_charges_elapsed_gpu_time_once_without_consuming_gradient_twice(tmp_path: Path) -> None:

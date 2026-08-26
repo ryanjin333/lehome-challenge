@@ -43,11 +43,14 @@ def main():
 
     try:
         import lehome.tasks.bedroom
-        from .utils import dataset_record, dataset_replay
 
         if args.command == "record":
+            from .utils import dataset_record
+
             dataset_record.record_dataset(args, simulation_app)
         elif args.command == "replay":
+            from .utils import dataset_replay
+
             dataset_replay.replay(args)
     except Exception as e:
         logger.error(f"Error during dataset {args.command}: {e}", exc_info=True)

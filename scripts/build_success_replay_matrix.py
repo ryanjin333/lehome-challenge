@@ -85,10 +85,10 @@ def _verified_file(
     return path, str(record["sha256"])
 
 
-def _successes(accepted_root: Path) -> dict[str, list[dict[str, str]]]:
+def _successes(accepted_root: Path) -> dict[str, list[dict[str, object]]]:
     if not accepted_root.is_absolute() or accepted_root.is_symlink() or not accepted_root.is_dir():
         raise ValueError("accepted root must be a real absolute directory")
-    grouped: dict[str, list[dict[str, str]]] = {category: [] for category in CATEGORIES}
+    grouped: dict[str, list[dict[str, object]]] = {category: [] for category in CATEGORIES}
     for episode_root in sorted(accepted_root.iterdir(), key=lambda path: path.name):
         if episode_root.is_symlink():
             raise ValueError("accepted root contains a symlink")
@@ -102,14 +102,21 @@ def _successes(accepted_root: Path) -> dict[str, list[dict[str, str]]]:
         )
         episode_relative = f"raw/{attempt_id}/episode.json"
         reset_relative = f"raw/{attempt_id}/snapshots/reset.json"
+        continuation_relative = f"raw/{attempt_id}/snapshots/continuations/000016.json"
         episode_path, _ = _verified_file(
             episode_root=episode_root, relative=episode_relative, checksums=checksums
         )
-        reset_path, reset_sha256 = _verified_file(
+        reset_path, _ = _verified_file(
             episode_root=episode_root, relative=reset_relative, checksums=checksums
+        )
+        continuation_path, continuation_sha256 = _verified_file(
+            episode_root=episode_root, relative=continuation_relative, checksums=checksums
         )
         episode = _load_json(episode_path, label="accepted episode")
         reset = _load_json(reset_path, label="accepted reset snapshot")
+        continuation = _load_json(
+            continuation_path, label="accepted early continuation snapshot"
+        )
         identity = episode.get("identity")
         provenance = episode.get("provenance")
         if not isinstance(identity, Mapping) or not isinstance(provenance, Mapping):
@@ -144,13 +151,23 @@ def _successes(accepted_root: Path) -> dict[str, list[dict[str, str]]]:
             if simulator_device == "cpu"
             else "physx_cloth_view_world_v1"
         )
+        expected_schema = 3 if simulator_device == "cpu" else 2
+        if (
+            continuation.get("schema_version") != expected_schema
+            or continuation.get("cloth_state_authority") != cloth_frame
+            or continuation.get("garment_name") != garment
+            or not isinstance(continuation.get("randomization"), Mapping)
+            or continuation["randomization"].get("continuation_step") != 16
+        ):
+            raise ValueError("accepted early continuation snapshot is incompatible")
         grouped[str(category)].append(
             {
                 "parent_episode_id": attempt_id,
                 "garment": garment,
-                "restore_snapshot": str(reset_path),
-                "restore_snapshot_sha256": reset_sha256,
+                "restore_snapshot": str(continuation_path),
+                "restore_snapshot_sha256": continuation_sha256,
                 "restore_snapshot_cloth_frame": cloth_frame,
+                "restore_snapshot_step": 16,
             }
         )
     if any(not grouped[category] for category in CATEGORIES):
@@ -203,20 +220,47 @@ def build_success_replay_matrix(
     accepted_root: str | Path,
     output: str | Path,
     attempts_per_category: int = 50,
+    attempts_by_category: Mapping[str, int] | None = None,
+    acceptance_caps: Mapping[str, int] | None = None,
     seed_base: int = 50_000,
 ) -> dict[str, object]:
-    if type(attempts_per_category) is not int or not 1 <= attempts_per_category <= 100:
-        raise ValueError("attempts_per_category must be between 1 and 100")
+    if attempts_by_category is None:
+        if type(attempts_per_category) is not int or not 1 <= attempts_per_category <= 100:
+            raise ValueError("attempts_per_category must be between 1 and 100")
+        attempt_counts = {category: attempts_per_category for category in CATEGORIES}
+    else:
+        if set(attempts_by_category) != set(CATEGORIES):
+            raise ValueError("attempts_by_category must contain every canonical category")
+        attempt_counts = dict(attempts_by_category)
+        if any(type(value) is not int or not 0 <= value <= 400 for value in attempt_counts.values()):
+            raise ValueError("category attempt counts must be integers between 0 and 400")
+        if not 1 <= sum(attempt_counts.values()) <= 400:
+            raise ValueError("total category attempt count must be between 1 and 400")
+    normalized_caps: dict[str, int] | None = None
+    if acceptance_caps is not None:
+        if set(acceptance_caps) != set(CATEGORIES):
+            raise ValueError("acceptance_caps must contain every canonical category")
+        normalized_caps = dict(acceptance_caps)
+        if any(
+            type(normalized_caps[category]) is not int
+            or normalized_caps[category] < 0
+            or normalized_caps[category] > attempt_counts[category]
+            for category in CATEGORIES
+        ):
+            raise ValueError("each acceptance cap must be between zero and its category attempt count")
+        if not 1 <= sum(normalized_caps.values()) <= 150:
+            raise ValueError("total acceptance cap must be between 1 and 150")
     if type(seed_base) is not int or seed_base < 0:
         raise ValueError("seed_base must be nonnegative")
     grouped = _successes(Path(accepted_root))
     rows: list[dict[str, object]] = []
+    seed_offset = 0
     for category_index, category in enumerate(CATEGORIES):
         parents = grouped[category]
-        for index in range(attempts_per_category):
+        for index in range(attempt_counts[category]):
             parent = parents[index % len(parents)]
             strategy = "mild_geometry" if index % 5 < 3 else "strong_geometry"
-            seed = seed_base + category_index * attempts_per_category + index
+            seed = seed_base + seed_offset + index
             replay_identity = {
                 "schema_version": 1,
                 "parent_episode_id": parent["parent_episode_id"],
@@ -226,8 +270,7 @@ def build_success_replay_matrix(
             }
             suffix = hashlib.sha256(_canonical_bytes(replay_identity)).hexdigest()[:16]
             attempt_id = f"replay-{category.replace('_', '-')}-{index:03d}-{suffix}"
-            rows.append(
-                {
+            row: dict[str, object] = {
                     "attempt_id": attempt_id,
                     "trial_id": attempt_id,
                     "garment": parent["garment"],
@@ -240,23 +283,33 @@ def build_success_replay_matrix(
                     "restore_snapshot": parent["restore_snapshot"],
                     "restore_snapshot_sha256": parent["restore_snapshot_sha256"],
                     "restore_snapshot_cloth_frame": parent["restore_snapshot_cloth_frame"],
+                    "restore_snapshot_step": parent["restore_snapshot_step"],
                     "parent_episode_id": parent["parent_episode_id"],
                     "lineage_id": parent["parent_episode_id"],
-                    "replay_kind": "verified_success_reset_v1",
+                    "replay_kind": "verified_success_early_snapshot_v1",
                 }
-            )
+            if normalized_caps is not None:
+                row["category_acceptance_cap"] = normalized_caps[category]
+            rows.append(row)
+        seed_offset += attempt_counts[category]
     payload = _canonical_bytes(rows)
     destination = Path(output)
     _preflight_outputs(destination)
     _write_absent(destination, payload)
     digest = hashlib.sha256(payload).hexdigest()
     _write_absent(Path(str(destination) + ".sha256"), (digest + "\n").encode("ascii"))
-    return {
+    receipt: dict[str, object] = {
         "matrix_path": str(destination),
         "matrix_sha256": digest,
         "attempt_count": len(rows),
-        "attempts_per_category": attempts_per_category,
     }
+    if attempts_by_category is None:
+        receipt["attempts_per_category"] = attempts_per_category
+    else:
+        receipt["attempts_by_category"] = attempt_counts
+    if normalized_caps is not None:
+        receipt["acceptance_caps"] = normalized_caps
+    return receipt
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -264,14 +317,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--accepted-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--attempts-per-category", type=int, default=50)
+    parser.add_argument("--attempts-by-category-json")
+    parser.add_argument("--acceptance-caps-json")
     parser.add_argument("--seed-base", type=int, default=50_000)
     args = parser.parse_args(argv)
+    attempts_by_category = (
+        json.loads(args.attempts_by_category_json)
+        if args.attempts_by_category_json is not None
+        else None
+    )
+    acceptance_caps = (
+        json.loads(args.acceptance_caps_json)
+        if args.acceptance_caps_json is not None
+        else None
+    )
     print(
         json.dumps(
             build_success_replay_matrix(
                 accepted_root=args.accepted_root,
                 output=args.output,
                 attempts_per_category=args.attempts_per_category,
+                attempts_by_category=attempts_by_category,
+                acceptance_caps=acceptance_caps,
                 seed_base=args.seed_base,
             ),
             sort_keys=True,

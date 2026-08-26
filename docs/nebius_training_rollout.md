@@ -298,11 +298,13 @@ and frozen matrix hashes.
 The experiment controller is the single SQLite writer. Before any paid action,
 generate and verify the canonical manifest set, validate the stopped-at-rest
 experiment pool, and run the CPU campaign simulation. The two training workers
-lease independently; the rollout appliance remains the only evaluation GPU and
-does not begin evaluation or recovery collection until the existing final12
-teacher-probe and sealed recovery-data gates pass. Recovery arms remain blocked
-until category caps and Hub readback are verified. Stop idle trainers after ten
-minutes and destroy no protected rollout storage through the experiment root.
+lease independently. With an immutable deployment gate that records recovery
+admission as unavailable, ordinary A/B/C jobs and their normal fixed-matrix
+evaluation may proceed; the rollout appliance must not begin controlled
+recovery collection, and D--G remain blocked. Recovery work is admitted only
+after an accepted teacher probe, category caps, and Hub readback are verified.
+Stop idle trainers after ten minutes and destroy no protected rollout storage
+through the experiment root.
 
 ### Async sweep operator sequence
 
@@ -318,15 +320,17 @@ PYTHONPATH=source/lehome:trainer/src:. uv run --project trainer \
 git diff --check
 ```
 
-Only after all canonical manifests, recovery dependency receipts, request-set
-readbacks, and the final12 one-worker teacher probe are green may the three
-lanes run:
+Only after canonical manifests and request-set readbacks are green may the
+three lanes run for the independent A/B/C arms. A failed or unavailable
+recovery admission does not block those arms, but it does block all
+recovery-dependent D--G work and controlled recovery collection. The final12
+one-worker teacher probe remains mandatory before any recovery work.
 
 | Lane | Machine | What it does | When it stops |
 | --- | --- | --- | --- |
 | Controller | stopped-at-rest CPU VM | SQLite lease writer, budget accounting, promotion, receipt checks | immediately on a bad immutable identity or strict gate |
 | Trainer A/B | two independent preemptible RTX PRO 6000 VMs | 500 → 1K → 2K jobs; each worker immediately leases its next admissible job | ten idle minutes, preemption, budget cap, or controller block |
-| Rollout/evaluator | one preemptible RTX PRO 6000 rollout VM using the protected 500 GiB disk | final12 probe, controlled recovery collection, then fixed-matrix evaluation | any smoke/fidelity/teacher/readback failure; never shares the disk with a trainer |
+| Rollout/evaluator | one preemptible RTX PRO 6000 rollout VM using the protected 500 GiB disk | ordinary fixed-matrix evaluation for A/B/C; final12 probe and controlled recovery collection only after recovery admission | any smoke/fidelity/teacher/readback failure blocks recovery; never shares the disk with a trainer |
 
 There is no wave barrier: a completed training lease publishes and readback
 verifies its checkpoint, then becomes evaluation-ready while the other trainer

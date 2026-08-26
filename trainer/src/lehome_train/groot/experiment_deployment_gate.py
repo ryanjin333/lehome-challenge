@@ -34,7 +34,10 @@ class DeploymentGate:
     training_code_revision: str
     rollout_instance_id: str
     rollout_image_id: str
-    teacher_probe_receipt_sha256: str
+    recovery_collection_admitted: bool
+    teacher_probe_receipt_sha256: str | None
+    recovery_failure_receipt_sha256: str | None
+    recovery_unavailable_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +79,56 @@ def _image_bound(value: object, *, worker: bool) -> tuple[str, str, str | None, 
     return instance_id, image_id, worker_id, slot
 
 
+def _accepted_teacher_probe(value: object) -> str:
+    """Validate the immutable evidence required to admit recovery collection."""
+    teacher = _exact(
+        value,
+        {
+            "kind", "attempt_id", "round_id", "matrix_sha256", "materialization_sha256",
+            "episode_sha256", "sync_receipt_sha256", "immutable_revision", "accepted",
+            "readback_verified", "strict_seal_present",
+        },
+        "teacher probe",
+    )
+    if (
+        teacher["kind"] != "zero_perturbation_teacher_continuation_probe_v1"
+        or teacher["accepted"] is not True
+        or teacher["readback_verified"] is not True
+        or teacher["strict_seal_present"] is not False
+        or type(teacher["round_id"]) is not str
+        or not teacher["round_id"].startswith("controlled-recovery-smoke-")
+        or not teacher["round_id"].endswith("-unsealed-staging")
+    ):
+        raise ValueError("deployment gate teacher probe is not accepted and read-back verified")
+    for field in ("attempt_id", "matrix_sha256", "materialization_sha256", "episode_sha256", "sync_receipt_sha256"):
+        _identity(teacher[field], _SHA256, f"teacher probe {field}")
+    _identity(teacher["immutable_revision"], _COMMIT, "teacher probe revision")
+    return str(teacher["sync_receipt_sha256"])
+
+
+def _recovery_admission(value: object) -> tuple[bool, str | None, str | None, str | None]:
+    """Parse the v2 recovery-only gate without weakening ordinary admission."""
+    if not isinstance(value, Mapping) or type(value.get("state")) is not str:
+        raise ValueError("deployment gate recovery admission is malformed")
+    if value["state"] == "accepted":
+        accepted = _exact(value, {"state", "teacher_probe"}, "recovery admission")
+        return True, _accepted_teacher_probe(accepted["teacher_probe"]), None, None
+    if value["state"] == "unavailable":
+        unavailable = _exact(
+            value,
+            {"state", "reason", "failure_receipt_sha256"},
+            "recovery admission",
+        )
+        reason = _identity(unavailable["reason"], _SAFE, "recovery unavailable reason")
+        failure_receipt = _identity(
+            unavailable["failure_receipt_sha256"],
+            _SHA256,
+            "recovery failure receipt",
+        )
+        return False, None, failure_receipt, reason
+    raise ValueError("deployment gate recovery admission state is invalid")
+
+
 def load_deployment_gate(path: str | Path, expected_sha256: str) -> DeploymentGate:
     source = Path(path)
     if type(expected_sha256) is not str or _SHA256.fullmatch(expected_sha256) is None:
@@ -95,15 +148,30 @@ def load_deployment_gate(path: str | Path, expected_sha256: str) -> DeploymentGa
         document = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("deployment gate JSON is invalid") from error
-    root = _exact(
-        document,
-        {
-            "schema_version", "kind", "controller", "training_workers",
-            "training_oci_digest", "training_code_revision", "rollout_worker", "teacher_probe",
-        },
-        "envelope",
-    )
-    if root["schema_version"] != 1 or root["kind"] != "lehome_experiment_pool_deployment_gate":
+    if not isinstance(document, Mapping) or type(document.get("schema_version")) is not int:
+        raise ValueError("deployment gate schema is unsupported")
+    schema_version = document["schema_version"]
+    envelope_fields = {
+        "schema_version", "kind", "controller", "training_workers",
+        "training_oci_digest", "training_code_revision", "rollout_worker",
+    }
+    if schema_version == 1:
+        root = _exact(document, envelope_fields | {"teacher_probe"}, "envelope")
+        recovery_admitted = True
+        teacher_probe_receipt = _accepted_teacher_probe(root["teacher_probe"])
+        recovery_failure_receipt = None
+        recovery_unavailable_reason = None
+    elif schema_version == 2:
+        root = _exact(document, envelope_fields | {"recovery_admission"}, "envelope")
+        (
+            recovery_admitted,
+            teacher_probe_receipt,
+            recovery_failure_receipt,
+            recovery_unavailable_reason,
+        ) = _recovery_admission(root["recovery_admission"])
+    else:
+        raise ValueError("deployment gate schema is unsupported")
+    if root["kind"] != "lehome_experiment_pool_deployment_gate":
         raise ValueError("deployment gate schema is unsupported")
     training_oci_digest = _identity(root["training_oci_digest"], re.compile(r"sha256:[0-9a-f]{64}"), "training OCI digest")
     training_code_revision = _identity(root["training_code_revision"], _COMMIT, "training code revision")
@@ -128,28 +196,6 @@ def load_deployment_gate(path: str | Path, expected_sha256: str) -> DeploymentGa
         raise ValueError("deployment gate instance identities are duplicated")
     if len({controller_image, parsed[0][1], rollout_image}) != 3:
         raise ValueError("deployment gate role images are not distinct")
-    teacher = _exact(
-        root["teacher_probe"],
-        {
-            "kind", "attempt_id", "round_id", "matrix_sha256", "materialization_sha256",
-            "episode_sha256", "sync_receipt_sha256", "immutable_revision", "accepted",
-            "readback_verified", "strict_seal_present",
-        },
-        "teacher probe",
-    )
-    if (
-        teacher["kind"] != "zero_perturbation_teacher_continuation_probe_v1"
-        or teacher["accepted"] is not True
-        or teacher["readback_verified"] is not True
-        or teacher["strict_seal_present"] is not False
-        or type(teacher["round_id"]) is not str
-        or not teacher["round_id"].startswith("controlled-recovery-smoke-")
-        or not teacher["round_id"].endswith("-unsealed-staging")
-    ):
-        raise ValueError("deployment gate teacher probe is not accepted and read-back verified")
-    for field in ("attempt_id", "matrix_sha256", "materialization_sha256", "episode_sha256", "sync_receipt_sha256"):
-        _identity(teacher[field], _SHA256, f"teacher probe {field}")
-    _identity(teacher["immutable_revision"], _COMMIT, "teacher probe revision")
     return DeploymentGate(
         sha256=observed,
         controller_instance_id=controller_id,
@@ -160,8 +206,18 @@ def load_deployment_gate(path: str | Path, expected_sha256: str) -> DeploymentGa
         training_code_revision=training_code_revision,
         rollout_instance_id=rollout_id,
         rollout_image_id=rollout_image,
-        teacher_probe_receipt_sha256=str(teacher["sync_receipt_sha256"]),
+        recovery_collection_admitted=recovery_admitted,
+        teacher_probe_receipt_sha256=teacher_probe_receipt,
+        recovery_failure_receipt_sha256=recovery_failure_receipt,
+        recovery_unavailable_reason=recovery_unavailable_reason,
     )
+
+
+def require_recovery_collection_admission(deployment: DeploymentGate) -> str:
+    """Return accepted teacher evidence or fail closed for recovery-only work."""
+    if not deployment.recovery_collection_admitted or deployment.teacher_probe_receipt_sha256 is None:
+        raise ValueError("recovery collection is not admitted by the deployment gate")
+    return deployment.teacher_probe_receipt_sha256
 
 
 def load_training_image_manifest(path: str | Path) -> TrainingImageManifest:

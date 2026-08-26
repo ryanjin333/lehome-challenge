@@ -18,6 +18,37 @@ PRODUCTION = REPO_ROOT / "rollout_appliance" / "run_controlled_recovery_campaign
 SNAPSHOT_SOURCE_BOOTSTRAP = REPO_ROOT / "rollout_appliance" / "run_snapshot_source_bootstrap.sh"
 
 
+def _recovery_gate(tmp_path: Path, *, admitted: bool, name: str = "deployment-gate.json") -> tuple[Path, str]:
+    document = {
+        "schema_version": 2,
+        "kind": "lehome_experiment_pool_deployment_gate",
+        "training_oci_digest": "sha256:" + "a" * 64,
+        "training_code_revision": "b" * 40,
+        "controller": {"instance_id": "computeinstance-controller1", "image_id": "computeimage-controller1", "image_status": "READY", "readback_verified": True},
+        "training_workers": [
+            {"slot": 1, "worker_id": "lehome-experiment-training-1", "instance_id": "computeinstance-training1", "image_id": "computeimage-training1", "image_status": "READY", "readback_verified": True},
+            {"slot": 2, "worker_id": "lehome-experiment-training-2", "instance_id": "computeinstance-training2", "image_id": "computeimage-training1", "image_status": "READY", "readback_verified": True},
+        ],
+        "rollout_worker": {"worker_id": "lehome-experiment-evaluator", "instance_id": "computeinstance-rollout1", "image_id": "computeimage-rollout1", "image_status": "READY", "readback_verified": True},
+        "recovery_admission": (
+            {"state": "accepted", "teacher_probe": {"kind": "zero_perturbation_teacher_continuation_probe_v1", "attempt_id": "c" * 64, "round_id": "controlled-recovery-smoke-test-unsealed-staging", "matrix_sha256": "d" * 64, "materialization_sha256": "e" * 64, "episode_sha256": "f" * 64, "sync_receipt_sha256": "1" * 64, "immutable_revision": "2" * 40, "accepted": True, "readback_verified": True, "strict_seal_present": False}}
+            if admitted else {"state": "unavailable", "reason": "cpu_replay_fidelity_failed", "failure_receipt_sha256": "3" * 64}
+        ),
+    }
+    gate = tmp_path / name
+    gate.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    gate.chmod(0o444)
+    return gate, hashlib.sha256(gate.read_bytes()).hexdigest()
+
+
+@pytest.fixture(autouse=True)
+def _accepted_recovery_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gate, digest = _recovery_gate(tmp_path, admitted=True)
+    monkeypatch.setenv("LEHOME_DEPLOYMENT_GATE_PATH", str(gate))
+    monkeypatch.setenv("LEHOME_DEPLOYMENT_GATE_SHA256", digest)
+    monkeypatch.setenv("LEHOME_TRAINER_SRC", str(REPO_ROOT / "trainer" / "src"))
+
+
 def _write(path: Path, payload: object) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
@@ -129,22 +160,23 @@ def _fake_snapshot_source_base(path: Path) -> None:
         from pathlib import Path
         root, descriptor, round_id, case = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
         if case == 'absent-ledger': raise SystemExit(1)
-        if case in {'multi-accepted', 'multi-invalid-evidence'}:
+        if case in {'multi-accepted', 'multi-invalid-evidence', 'multi-numerical-divergence'}:
             rows = json.loads(descriptor.read_text())
             root.mkdir(parents=True, exist_ok=True)
             (root / 'base-launch.json').write_text(json.dumps({'initial_garment': os.environ.get('LEHOME_INITIAL_GARMENT'), 'simulator_device': os.environ.get('LEHOME_SIMULATOR_DEVICE'), 'max_worker_restarts': os.environ.get('LEHOME_MAX_WORKER_RESTARTS')}))
             con = sqlite3.connect(root / 'ledger.sqlite3')
             con.execute('create table attempts (attempt_id text, assignment_json text)')
-            con.execute('create table events (event_type text, attempt_id text)')
+            con.execute('create table events (event_type text, attempt_id text, payload_json text)')
             receipts = root / 'hf-sync-receipts'; receipts.mkdir()
             for index, row in enumerate(rows):
                 canonical = json.dumps(row, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
                 attempt = hashlib.sha256(json.dumps({'schedule_index': index, 'assignment': row}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
                 con.execute('insert into attempts values (?, ?)', (attempt, canonical))
                 if index == 0:
-                    outcome = 'infrastructure_abort' if case == 'multi-invalid-evidence' else 'rejected'
-                    con.execute('insert into events values (?, ?)', (outcome, attempt)); continue
-                con.execute('insert into events values (?, ?)', ('accepted', attempt))
+                    outcome = 'infrastructure_abort' if case in {'multi-invalid-evidence', 'multi-numerical-divergence'} else 'rejected'
+                    reason = 'simulator_numerical_divergence' if case == 'multi-numerical-divergence' else 'runtime_evidence_invalid'
+                    con.execute('insert into events values (?, ?, ?)', (outcome, attempt, json.dumps({'reason': reason}))); continue
+                con.execute('insert into events values (?, ?, ?)', ('accepted', attempt, '{}'))
                 raw = root / 'accepted' / attempt / 'raw' / attempt; raw.mkdir(parents=True)
                 garment, category, seed = row['garment'], row['category'], row['seed']
                 episode = raw / 'episode.json'; episode.write_text(json.dumps({'episode_id': attempt, 'mode': 'autonomous', 'accepted_success': True, 'outcome': 'success', 'terminal_reason': 'success', 'bc_target_count': 0, 'identity': {'category': category, 'garment_name': garment, 'seed': seed}}, sort_keys=True))
@@ -172,10 +204,11 @@ def _fake_snapshot_source_base(path: Path) -> None:
         (root / 'base-launch.json').write_text(json.dumps({'initial_garment': os.environ.get('LEHOME_INITIAL_GARMENT'), 'simulator_device': os.environ.get('LEHOME_SIMULATOR_DEVICE'), 'max_worker_restarts': os.environ.get('LEHOME_MAX_WORKER_RESTARTS')}))
         con = sqlite3.connect(root / 'ledger.sqlite3')
         con.execute('create table attempts (attempt_id text, assignment_json text)')
-        con.execute('create table events (event_type text, attempt_id text)')
+        con.execute('create table events (event_type text, attempt_id text, payload_json text)')
         con.execute('insert into attempts values (?, ?)', (attempt, canonical))
         terminal_event = 'rejected' if case == 'rejected' else 'infrastructure_abort' if case == 'infrastructure-evidence' else 'accepted'
-        con.execute('insert into events values (?, ?)', (terminal_event, attempt))
+        reason = 'runtime_evidence_invalid' if terminal_event == 'infrastructure_abort' else None
+        con.execute('insert into events values (?, ?, ?)', (terminal_event, attempt, json.dumps({'reason': reason}) if reason else '{}'))
         con.commit(); con.close()
         if case in {'rejected', 'infrastructure-evidence'}: raise SystemExit(0)
         raw = root / 'accepted' / attempt / 'raw' / attempt; raw.mkdir(parents=True)
@@ -321,6 +354,59 @@ def _run_with_selected_row_mutation(
     root = tmp_path / "eval" / f"controlled-recovery-smoke-{run_id}"
     env = {**os.environ, "LEHOME_WORKSPACE": str(tmp_path), "LEHOME_CONTROLLED_RECOVERY_MATRIX": str(matrix), "LEHOME_CONTROLLED_RECOVERY_MATRIX_SHA256": matrix_sha256, "LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION": str(materialization), "LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION_SHA256": materialization_sha256, "LEHOME_CONTROLLED_RECOVERY_SMOKE_BASE_CAMPAIGN": str(fake), "LEHOME_CONTROLLED_RECOVERY_SMOKE_RUN_ID": run_id}
     return subprocess.run(["/bin/bash", str(SMOKE)], env=env, text=True, capture_output=True, check=False), root
+
+
+@pytest.mark.parametrize("wrapper", (SMOKE, PRODUCTION), ids=("smoke", "production"))
+@pytest.mark.parametrize("gate_case", ("unavailable", "tampered_digest"))
+def test_recovery_wrappers_fail_closed_before_base_campaign_for_unavailable_or_tampered_gate(
+    tmp_path: Path,
+    wrapper: Path,
+    gate_case: str,
+) -> None:
+    generated = _artifacts(tmp_path / "inputs")
+    gate, digest = _recovery_gate(
+        tmp_path,
+        admitted=gate_case != "unavailable",
+        name="checked-deployment-gate.json",
+    )
+    if gate_case == "tampered_digest":
+        digest = "0" * 64
+    marker = tmp_path / "base-campaign-started"
+    environment = {
+        **os.environ,
+        "LEHOME_WORKSPACE": str(tmp_path),
+        "LEHOME_CONTROLLED_RECOVERY_MATRIX": generated["matrix_path"],
+        "LEHOME_CONTROLLED_RECOVERY_MATRIX_SHA256": generated["matrix_sha256"],
+        "LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION": generated["materialization_path"],
+        "LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION_SHA256": generated["materialization_sha256"],
+        "LEHOME_DEPLOYMENT_GATE_PATH": str(gate),
+        "LEHOME_DEPLOYMENT_GATE_SHA256": digest,
+        "LEHOME_TRAINER_SRC": str(REPO_ROOT / "trainer" / "src"),
+    }
+    if wrapper == SMOKE:
+        fake = tmp_path / "smoke-base.sh"
+        fake.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+        fake.chmod(0o755)
+        environment.update({
+            "LEHOME_CONTROLLED_RECOVERY_SMOKE_BASE_CAMPAIGN": str(fake),
+            "LEHOME_CONTROLLED_RECOVERY_SMOKE_RUN_ID": "a" * 32,
+        })
+    else:
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_bash = fake_bin / "bash"
+        fake_bash.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+        fake_bash.chmod(0o755)
+        environment["PATH"] = f"{fake_bin}:{os.environ['PATH']}"
+        environment["LEHOME_MAX_ATTEMPTS"] = "8"
+
+    result = subprocess.run(["/bin/bash", str(wrapper)], env=environment, text=True, capture_output=True, check=False)
+    assert result.returncode != 0
+    assert not marker.exists()
+    if gate_case == "unavailable":
+        assert "recovery collection is not admitted" in result.stderr
+    else:
+        assert "deployment gate SHA-256 mismatch" in result.stderr
 
 
 def test_smoke_materializes_one_verified_row_and_requires_exact_success_receipt(tmp_path: Path) -> None:
@@ -651,8 +737,17 @@ def test_base_campaign_admits_bounded_same_category_source_discovery_tuple(tmp_p
     result = subprocess.run(["/bin/bash", str(runner)], env=env, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
 
+    restarted = subprocess.run(
+        ["/bin/bash", str(runner)],
+        env={**env, "LEHOME_WORKER_COUNT": "4", "LEHOME_MAX_WORKER_RESTARTS": "8"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert restarted.returncode == 0, restarted.stderr
 
-@pytest.mark.parametrize(("attempts", "target"), [("0", "1"), ("17", "1"), ("3", "0"), ("3", "4")])
+
+@pytest.mark.parametrize(("attempts", "target"), [("0", "1"), ("401", "1"), ("3", "0"), ("3", "4")])
 def test_base_campaign_rejects_cpu_source_discovery_outside_bounded_attempt_tuple(
     tmp_path: Path, attempts: str, target: str,
 ) -> None:
@@ -922,13 +1017,14 @@ def test_rollout_image_packages_the_unconditionally_sourced_worker_supervisor() 
     assert "bash -n /opt/lehome/rollout_appliance/worker_supervisor.sh" in dockerfile
 
 
-def test_snapshot_source_bootstrap_is_a_separate_one_worker_unsealed_tuple() -> None:
+def test_snapshot_source_bootstrap_is_a_separate_four_worker_unsealed_tuple() -> None:
     bootstrap = REPO_ROOT / "rollout_appliance" / "run_snapshot_source_bootstrap.sh"
     source = bootstrap.read_text(encoding="utf-8")
     base = (REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh").read_text(encoding="utf-8")
     installer = (REPO_ROOT / "infrastructure/nebius/packer/scripts/install-rollout.sh").read_text(encoding="utf-8")
-    assert 'LEHOME_WORKER_COUNT=1 LEHOME_MAX_ATTEMPTS="${SOURCE_ROW_COUNT}" LEHOME_TARGET_ACCEPTED="${TARGET_ACCEPTED}"' in source
-    assert "LEHOME_MAX_WORKER_RESTARTS=0" in source
+    assert 'LEHOME_WORKER_COUNT="${WORKER_COUNT}" LEHOME_MAX_ATTEMPTS="${SOURCE_ROW_COUNT}" LEHOME_TARGET_ACCEPTED="${TARGET_ACCEPTED}"' in source
+    assert 'WORKER_COUNT="${LEHOME_SNAPSHOT_SOURCE_WORKER_COUNT:-4}"' in source
+    assert "LEHOME_MAX_WORKER_RESTARTS=8" in source
     assert "LEHOME_ENABLE_HF_UPLOAD=1 LEHOME_SKIP_ROUND_SEAL=1 LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP=1" in source
     assert 'SNAPSHOT_SOURCE_SIMULATOR_DEVICE="${LEHOME_SNAPSHOT_SOURCE_SIMULATOR_DEVICE-cpu}"' in source
     assert 'LEHOME_SIMULATOR_DEVICE="${SNAPSHOT_SOURCE_SIMULATOR_DEVICE}"' in source
@@ -964,7 +1060,7 @@ def test_snapshot_source_bootstrap_passes_a_nondefault_descriptor_garment_before
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Pant_Long_Seen_4",
         "simulator_device": "cpu",
-        "max_worker_restarts": "0",
+        "max_worker_restarts": "8",
     }
 
 
@@ -976,7 +1072,7 @@ def test_snapshot_source_bootstrap_defaults_to_the_cpu_source_cloth_lane(tmp_pat
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Top_Long_Seen_0",
         "simulator_device": "cpu",
-        "max_worker_restarts": "0",
+        "max_worker_restarts": "8",
     }
 
 
@@ -989,7 +1085,7 @@ def test_snapshot_source_bootstrap_propagates_explicit_cuda_source_cloth_lane(tm
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Top_Long_Seen_0",
         "simulator_device": "cuda:0",
-        "max_worker_restarts": "0",
+        "max_worker_restarts": "8",
     }
 
 
@@ -1092,7 +1188,7 @@ def test_snapshot_source_bootstrap_writes_one_audit_only_envelope_atomically(tmp
     assert json.loads((root / "base-launch.json").read_text(encoding="utf-8")) == {
         "initial_garment": "Top_Long_Seen_0",
         "simulator_device": "cpu",
-        "max_worker_restarts": "0",
+        "max_worker_restarts": "8",
     }
     assert not list(root.glob("*.strict.seal.json"))
     with pytest.raises(ValueError):
@@ -1122,6 +1218,29 @@ def test_snapshot_source_bootstrap_continues_clean_rejections_and_emits_the_part
     assert set(payload["episode_sha256s"]) == set(payload["immutable_revisions"])
     assert len(payload["episode_sha256s"]) == 2
     assert not list(root.glob("*.strict.seal.json"))
+
+
+def test_snapshot_source_bootstrap_quarantines_only_per_attempt_numerical_divergence(tmp_path: Path) -> None:
+    rows = [
+        {
+            "snapshot_source_bootstrap": True,
+            "category": "top_long",
+            "garment": "Top_Long_Seen_0",
+            "seed": 207 + index,
+            "source_seed": 207 + index,
+        }
+        for index in range(3)
+    ]
+    result, root = _run_snapshot_source_bootstrap(
+        tmp_path / "numerical-divergence",
+        "multi-numerical-divergence",
+        source_rows=rows,
+        target_accepted=3,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads((root / "snapshot-source-bootstrap.envelope.json").read_text())
+    assert payload["episode_count"] == 2
+    assert json.loads((root / "base-launch.json").read_text())["max_worker_restarts"] == "8"
 
 
 @pytest.mark.parametrize(

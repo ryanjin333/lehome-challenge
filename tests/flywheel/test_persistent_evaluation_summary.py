@@ -207,15 +207,65 @@ def test_build_report_binds_all_80_terminal_artifacts_and_policy_identity(tmp_pa
     assert report["report_sha256"] == module.report_sha256(report)
 
 
-def test_build_report_rejects_a_cpu_cloth_episode_before_scoring(tmp_path: Path) -> None:
+def test_build_report_accepts_cpu_cloth_with_a_canonical_cuda_policy_device(tmp_path: Path) -> None:
+    module = _module()
+    root, matrix, digest = _campaign(tmp_path)
+    for episode_path in root.rglob("episode.json"):
+        episode = json.loads(episode_path.read_text(encoding="utf-8"))
+        episode["provenance"]["simulator_device"] = "cpu"
+        episode["provenance"]["policy_device"] = "cuda:0"
+        episode_path.write_text(json.dumps(episode), encoding="utf-8")
+
+    report = module.build_report(
+        campaign_root=root,
+        matrix_path=matrix,
+        matrix_sha256=digest,
+        candidate_key="new_step_2k",
+        policy_repo="ryanjin333/lehome-groot-n17-models",
+        policy_revision=REVISION,
+        policy_step=2000,
+        policy_artifact_sha256=ARTIFACT,
+    )
+
+    assert report["episodes"] == 80
+
+
+@pytest.mark.parametrize("policy_device", [None, "cpu", "cuda"])
+def test_build_report_rejects_cpu_cloth_without_a_canonical_cuda_policy_device(
+    tmp_path: Path,
+    policy_device: object,
+) -> None:
     module = _module()
     root, matrix, digest = _campaign(tmp_path)
     episode_path = next(root.rglob("episode.json"))
     episode = json.loads(episode_path.read_text(encoding="utf-8"))
     episode["provenance"]["simulator_device"] = "cpu"
+    episode["provenance"]["policy_device"] = policy_device
     episode_path.write_text(json.dumps(episode), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="CUDA cloth"):
+    with pytest.raises(ValueError, match="device provenance"):
+        module.build_report(
+            campaign_root=root,
+            matrix_path=matrix,
+            matrix_sha256=digest,
+            candidate_key="new_step_2k",
+            policy_repo="ryanjin333/lehome-groot-n17-models",
+            policy_revision=REVISION,
+            policy_step=2000,
+            policy_artifact_sha256=ARTIFACT,
+        )
+
+
+def test_build_report_rejects_mismatched_cuda_simulator_and_policy_devices(tmp_path: Path) -> None:
+    module = _module()
+    root, matrix, digest = _campaign(tmp_path)
+    episode_path = next(root.rglob("episode.json"))
+    episode = json.loads(episode_path.read_text(encoding="utf-8"))
+    episode["provenance"]["simulator_device"] = "cuda:0"
+    episode["provenance"]["policy_device"] = "cuda:1"
+    episode_path.write_text(json.dumps(episode), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="device provenance"):
         module.build_report(
             campaign_root=root,
             matrix_path=matrix,
@@ -486,10 +536,20 @@ def test_final_unseen80_e2e_seals_terminal_readback_artifacts_and_reaches_winner
         )
 
 
-def test_final_adapter_mode_emits_the_winner_receipt_instead_of_an_unseen20_promotion_report(tmp_path: Path) -> None:
+def test_final_adapter_mode_emits_the_winner_receipt_instead_of_an_unseen20_promotion_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import importlib.util
 
     module = _module()
+    for name in (
+        "LEHOME_SKIP_ROUND_SEAL",
+        "LEHOME_CONTROLLED_RECOVERY_SMOKE",
+        "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP",
+        "LEHOME_RESUME_PREEMPTED_ROLLOUT",
+    ):
+        monkeypatch.setenv(name, "1")
     root, matrix, digest = _campaign(
         tmp_path, successes={"top_long": 14, "top_short": 14, "pant_long": 14, "pant_short": 14},
     )
@@ -544,3 +604,8 @@ def test_final_adapter_mode_emits_the_winner_receipt_instead_of_an_unseen20_prom
     returned = adapter.run(lease, str(matrix), digest, 4)
     assert returned["kind"] == "lehome_experiment_final_unseen80"
     assert calls[0]["env"]["LEHOME_ENABLE_HF_UPLOAD"] == "1"
+    assert calls[0]["env"]["LEHOME_SIMULATOR_DEVICE"] == "cpu"
+    assert calls[0]["env"]["LEHOME_SKIP_ROUND_SEAL"] == "0"
+    assert calls[0]["env"]["LEHOME_CONTROLLED_RECOVERY_SMOKE"] == "0"
+    assert calls[0]["env"]["LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP"] == "0"
+    assert calls[0]["env"]["LEHOME_RESUME_PREEMPTED_ROLLOUT"] == "0"

@@ -386,12 +386,18 @@ def build_report(
             raise ValueError("evaluation episode identity does not match the frozen assignment")
         simulator_device = provenance.get("simulator_device")
         policy_device = provenance.get("policy_device")
-        if (
-            not isinstance(simulator_device, str)
-            or re.fullmatch(r"cuda:[0-9]+", simulator_device) is None
-            or policy_device != simulator_device
-        ):
-            raise ValueError("evaluation episode does not prove CUDA cloth and GPU policy execution")
+        canonical_policy_device = (
+            isinstance(policy_device, str)
+            and re.fullmatch(r"cuda:[0-9]+", policy_device) is not None
+        )
+        legacy_cuda_pair = (
+            isinstance(simulator_device, str)
+            and re.fullmatch(r"cuda:[0-9]+", simulator_device) is not None
+            and policy_device == simulator_device
+        )
+        cpu_cloth_with_cuda_policy = simulator_device == "cpu" and canonical_policy_device
+        if not (legacy_cuda_pair or cpu_cloth_with_cuda_policy):
+            raise ValueError("evaluation episode device provenance is invalid")
         accepted_success = episode.get("accepted_success")
         official_success = accepted_success is True and episode.get("outcome") == "success"
         if type(accepted_success) is not bool:

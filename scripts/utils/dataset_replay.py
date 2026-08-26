@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
 from typing import Dict, Optional, Tuple, Any
@@ -17,6 +18,13 @@ from lehome.utils.record import get_next_experiment_path_with_gap, RateLimiter
 from lehome.utils.logger import get_logger
 
 from .common import stabilize_garment_after_reset
+from .v21_replay_dataset import (
+    GarmentEpisodeIdentity,
+    PreparedV21ReplayDataset,
+    configure_replay_timing,
+    load_garment_episode_identity,
+    suppress_unused_observations,
+)
 
 logger = get_logger(__name__)
 
@@ -69,7 +77,7 @@ def validate_args(args: argparse.Namespace) -> None:
             )
 
 
-def load_dataset(dataset_root: str) -> LeRobotDataset:
+def load_dataset(dataset_root: str) -> Any:
     """Load the LeRobotDataset from the specified root directory.
 
     Args:
@@ -94,6 +102,13 @@ def load_dataset(dataset_root: str) -> LeRobotDataset:
         )
 
     try:
+        if PreparedV21ReplayDataset.supports(dataset_root):
+            dataset = PreparedV21ReplayDataset(dataset_root)
+            logger.info(
+                "Prepared v2.1 dataset loaded directly: "
+                f"{dataset.num_episodes} episodes, {dataset.num_frames} frames"
+            )
+            return dataset
         dataset = LeRobotDataset(repo_id="replay_source", root=dataset_root)
         logger.info(
             f"Dataset loaded: {dataset.num_episodes} episodes, {dataset.num_frames} frames"
@@ -147,7 +162,12 @@ def get_garment_name_from_json(dataset_root: str) -> str:
 
 
 def load_initial_pose(
-    dataset_root: str, episode_index: int
+    dataset_root: str,
+    episode_index: int,
+    *,
+    garment_name: Optional[str] = None,
+    garment_episode_index: Optional[int] = None,
+    garment_info_path: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Load the initial object pose for a given episode from garment_info.json.
 
@@ -169,7 +189,11 @@ def load_initial_pose(
         Dictionary in format {"Garment": [x, y, z, roll, pitch, yaw]} for use with
         env.set_all_pose(), or None if not found.
     """
-    pose_file = Path(dataset_root) / "meta" / "garment_info.json"
+    pose_file = (
+        Path(garment_info_path)
+        if garment_info_path is not None
+        else Path(dataset_root) / "meta" / "garment_info.json"
+    )
     if not pose_file.exists():
         # Try old JSONL format for backward compatibility
         pose_file_jsonl = Path(dataset_root) / "meta" / "garment_info.jsonl"
@@ -184,7 +208,24 @@ def load_initial_pose(
             data = json.load(f)
 
         # Search through all garments
-        episode_key = str(episode_index)
+        episode_key = str(
+            episode_index if garment_episode_index is None else garment_episode_index
+        )
+        if garment_name is not None:
+            episodes = data.get(garment_name)
+            if not isinstance(episodes, dict):
+                raise KeyError(f"garment metadata does not contain {garment_name}")
+            episode = episodes.get(episode_key)
+            if not isinstance(episode, dict):
+                raise KeyError(
+                    f"garment metadata does not contain {garment_name} episode {episode_key}"
+                )
+            pose_list = episode.get("object_initial_pose")
+            if pose_list is None:
+                raise KeyError(
+                    f"garment metadata is missing the initial pose for {garment_name} episode {episode_key}"
+                )
+            return {"Garment": pose_list}
         for garment_name, episodes in data.items():
             if episode_key in episodes:
                 pose_list = episodes[episode_key].get("object_initial_pose")
@@ -200,8 +241,24 @@ def load_initial_pose(
         return None
 
 
+def load_episode_data(dataset: Any, episode_index: int) -> Any:
+    """Load one episode from either LeRobot v3 or prepared v2.1 storage."""
+
+    if isinstance(dataset, PreparedV21ReplayDataset):
+        return [
+            {
+                "observation.state": torch.as_tensor(row["observation.state"]),
+                "action": torch.as_tensor(row["action"]),
+            }
+            for row in dataset.load_episode_rows(episode_index)
+        ]
+    return dataset.hf_dataset.filter(
+        lambda row: row["episode_index"].item() == episode_index
+    )
+
+
 def create_replay_dataset(
-    args: argparse.Namespace, source_dataset: LeRobotDataset
+    args: argparse.Namespace, source_dataset: Any
 ) -> Tuple[Optional[LeRobotDataset], Optional[Path]]:
     """Create a new dataset for saving replayed episodes.
 
@@ -389,18 +446,32 @@ def replay_episode(
         True if episode was successful, False otherwise.
     """
     try:
+        trace_frames = os.environ.get("LEHOME_REPLAY_FRAME_PROGRESS") == "1"
+
         # Reset environment
-        env.reset()
+        if trace_frames:
+            logger.info("Starting replay environment reset")
+        with suppress_unused_observations(env, enabled=replay_dataset is None):
+            env.reset()
+        if trace_frames:
+            logger.info("Completed replay environment reset")
 
         # Set initial pose from recorded data (critical for reproducibility)
         # This ensures garment starts at the same position as during recording
         if initial_pose is not None:
+            if trace_frames:
+                logger.info("Starting recorded initial pose restore")
             env.set_all_pose(initial_pose)
+            if trace_frames:
+                logger.info("Completed recorded initial pose restore")
             logger.debug(f"Set initial pose from recorded data: {initial_pose}")
         else:
             logger.warning("No initial pose found in recorded data, using default pose")
 
-        stabilize_garment_after_reset(env, args)
+        logger.info("Starting garment stabilization")
+        with suppress_unused_observations(env, enabled=replay_dataset is None):
+            stabilize_garment_after_reset(env, args)
+        logger.info("Completed garment stabilization")
 
         success_achieved = False
 
@@ -428,8 +499,15 @@ def replay_episode(
                 # Directly use action (joint angles)
                 action = episode_data[idx]["action"].to(device).unsqueeze(0)
 
+            if trace_frames:
+                logger.info(f"Entering replay frame {idx + 1}/{len(episode_data)}")
+
             # Step environment
-            env.step(action)
+            with suppress_unused_observations(env, enabled=replay_dataset is None):
+                env.step(action)
+
+            if trace_frames:
+                logger.info(f"Completed replay frame {idx + 1}/{len(episode_data)}")
 
             # If saving, record observations
             if replay_dataset is not None:
@@ -550,10 +628,32 @@ def replay(args: argparse.Namespace) -> None:
 
     logger.info(f"Creating environment: {args.task}")
     env_cfg = parse_env_cfg(args.task, device=device)
+    render_every_actions = getattr(args, "render_every_actions", 1)
+    action_decimation = configure_replay_timing(
+        env_cfg,
+        render_every_actions=render_every_actions,
+        headless=bool(getattr(args, "headless", False)),
+    )
+    logger.info(
+        "Replay timing: "
+        f"dataset_fps={dataset.fps:g}, simulation_dt={env_cfg.sim.dt:g}, "
+        f"physics_ticks_per_action={action_decimation}, "
+        f"render_every_actions={render_every_actions}"
+    )
+
+    garment_index_path = getattr(args, "garment_index_path", None)
+    garment_info_path = getattr(args, "garment_info_path", None)
+    initial_identity: Optional[GarmentEpisodeIdentity] = None
 
     # Set garment configuration
     try:
-        detected_garment_name = get_garment_name_from_json(args.dataset_root)
+        if garment_index_path is not None:
+            initial_identity = load_garment_episode_identity(
+                garment_index_path, args.start_episode
+            )
+            detected_garment_name = initial_identity.garment_name
+        else:
+            detected_garment_name = get_garment_name_from_json(args.dataset_root)
         logger.info(f"Auto-detected garment name from json: {detected_garment_name}")
         env_cfg.garment_name = detected_garment_name
     except Exception as e:
@@ -608,14 +708,30 @@ def replay(args: argparse.Namespace) -> None:
             logger.info(f"Episode {display_episode_num}/{total_episodes}")
             logger.info(f"{'=' * 60}")
 
+            identity = initial_identity
+            if garment_index_path is not None:
+                identity = load_garment_episode_identity(
+                    garment_index_path, episode_idx
+                )
+                if identity.garment_name != detected_garment_name:
+                    raise ValueError(
+                        "one replay invocation cannot span multiple garment assets"
+                    )
+
             # Load initial pose
-            initial_pose = load_initial_pose(args.dataset_root, episode_idx)
+            initial_pose = load_initial_pose(
+                args.dataset_root,
+                episode_idx,
+                garment_name=None if identity is None else identity.garment_name,
+                garment_episode_index=(
+                    None if identity is None else identity.garment_episode_index
+                ),
+                garment_info_path=garment_info_path,
+            )
 
             # Filter episode data
             try:
-                episode_data = dataset.hf_dataset.filter(
-                    lambda x: x["episode_index"].item() == episode_idx
-                )
+                episode_data = load_episode_data(dataset, episode_idx)
             except Exception as e:
                 logger.error(
                     f"Failed to filter episode {display_episode_num} (index {episode_idx}) data: {e}"

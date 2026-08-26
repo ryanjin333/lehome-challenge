@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 from threading import Event, Thread, Timer
 from time import monotonic, sleep
+import traceback
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
@@ -482,6 +483,7 @@ class PersistentRolloutWorker:
                         raise InfrastructureInvalidAttemptError(str(error)) from error
                 except BaseException as error:
                     print(f"persistent worker: episode failed: {type(error).__name__}: {error}", flush=True)
+                    traceback.print_exc()
                     if isinstance(error, PreparationTimeoutError):
                         # In production the watchdog has already hard-exited.
                         # This path exists solely when an injected test exit

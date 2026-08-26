@@ -394,7 +394,7 @@ def _parse_manifest(path: Path) -> MixtureManifest:
         _exact(raw_quotas, {"bc", "rollout", "dagger"}, label="runtime source quotas")
         if any(type(raw_weights[kind]) is not int or type(raw_quotas[kind]) is not int for kind in ("bc", "rollout", "dagger")):
             raise ValueError("runtime weights and quotas must be integers")
-        if raw_weights["bc"] <= 0 or raw_weights["rollout"] <= 0 or raw_weights["dagger"] != 0 or raw_weights["bc"] + raw_weights["rollout"] != 100:
+        if raw_weights["bc"] <= 0 or raw_weights["rollout"] < 0 or raw_weights["dagger"] != 0 or raw_weights["bc"] + raw_weights["rollout"] != 100:
             raise ValueError("runtime weights do not meet campaign constraints")
         expected_quotas = batch64_quotas(raw_weights)
         if cycle_size != 64 or dict(raw_quotas) != expected_quotas or quotas != expected_quotas:

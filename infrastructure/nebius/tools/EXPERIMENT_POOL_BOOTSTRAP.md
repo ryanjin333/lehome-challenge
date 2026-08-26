@@ -64,14 +64,26 @@ the original envelope or the 200 seen rows.
 The deployment gate is a separate immutable, readback-verified admission
 record. It binds the exact READY successor controller, training, and rollout
 image IDs to their already-created instance IDs, the training OCI digest
-baked into both worker images, the exact 40-character training-code revision
-from each root-owned training-image manifest, and the one accepted
-zero-perturbation teacher-continuation probe, its Hub sync receipt, and the
-absence of a strict collection seal. Bootstrap validates this record before
-installing any ready marker. Every marker contains the gate SHA-256, and the
-root-owned capacity configuration rechecks the immutable gate bytes before
-every possible start/stop reconciliation. A missing, mutable, or changed gate
-therefore results in zero provider actions even if queue demand exists.
+baked into both worker images, and the exact 40-character training-code
+revision from each root-owned training-image manifest. Bootstrap validates
+this record before installing any ready marker. Every marker contains the gate
+SHA-256, and the root-owned capacity configuration rechecks the immutable gate
+bytes before every possible start/stop reconciliation. A missing, mutable, or
+changed gate therefore results in zero provider actions even if queue demand
+exists.
+
+Schema v1 additionally requires an accepted zero-perturbation
+teacher-continuation probe and is full recovery admission. Schema v2 separates
+that recovery-only condition: `recovery_admission.accepted` carries the same
+teacher probe, Hub sync receipt, and no-strict-seal proof; alternatively,
+`recovery_admission.unavailable` records a safe reason and immutable failure
+receipt. The latter is sufficient to run the independent ordinary A/B/C
+training and normal fixed-matrix evaluation. It is not permission to run
+controlled recovery collection or any recovery-dependent D--G arm. Those stay
+forbidden until a new immutable v2 gate records accepted recovery admission.
+Bootstrap installs that exact gate on the rollout VM and gives its path and
+SHA-256 to the evaluator environment. The controlled-recovery smoke and
+four-worker campaign wrappers revalidate it before starting a base campaign.
 
 The job manifests, deployment gate, and both baked training-image manifests
 must carry the same code revision. A legacy gate without
@@ -100,8 +112,9 @@ sudo systemctl enable --now lehome-experiment-capacity.service
 # other, so a completed worker can immediately lease the next experiment.
 sudo systemctl enable --now lehome-experiment-worker.service
 
-# On the existing rollout VM, only after the final12 one-worker teacher probe
-# passes and scaled rollout/evaluation is explicitly admitted:
+# On the existing rollout VM, ordinary fixed-matrix evaluation may run for
+# A/B/C under a v2 unavailable-recovery gate. Controlled recovery collection
+# and D--G remain forbidden until recovery admission is accepted:
 sudo systemctl enable --now lehome-experiment-evaluator.service
 ```
 

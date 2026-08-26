@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -93,6 +95,7 @@ def test_dockerfile_entrypoint_and_no_baked_model():
 
 def test_rollout_layer_carries_the_pinned_geometry_pilot_recipe() -> None:
     dockerfile = (APPLIANCE_DIR / "Dockerfile").read_text(encoding="utf-8")
+    campaign = (APPLIANCE_DIR / "run_12k_campaign.sh").read_text(encoding="utf-8")
     for name in (
         "run_12k_campaign.sh",
         "run_randomized_top_short_pilot.sh",
@@ -103,3 +106,68 @@ def test_rollout_layer_carries_the_pinned_geometry_pilot_recipe() -> None:
     assert "build_randomized_pilot_matrix.py" in dockerfile
     assert "build_controlled_recovery_matrix.py" in dockerfile
     assert "run_controlled_recovery_campaign.sh" in dockerfile
+    assert '-e LEHOME_EVALUATION_TERMINAL_UPLOAD="${EVALUATION_TERMINAL_UPLOAD}"' in campaign
+
+
+def _terminal_cpu_evaluation_environment(tmp_path: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update({
+        "LEHOME_WORKSPACE": str(tmp_path / "workspace"),
+        "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "campaign"),
+        "LEHOME_ATTEMPT_MATRIX": str(tmp_path / "missing-matrix.json"),
+        "LEHOME_MATRIX_TEMPLATE": str(tmp_path / "missing-template.json"),
+        "LEHOME_ATTEMPT_MATRIX_SHA256": "0" * 64,
+        "LEHOME_SIMULATOR_DEVICE": "cpu",
+        "LEHOME_EVALUATION_TERMINAL_UPLOAD": "1",
+        "LEHOME_WORKER_COUNT": "4",
+        "LEHOME_ENABLE_HF_UPLOAD": "1",
+        "LEHOME_SKIP_ROUND_SEAL": "0",
+        "LEHOME_CONTROLLED_RECOVERY_SMOKE": "0",
+        "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP": "0",
+        "LEHOME_RESUME_PREEMPTED_ROLLOUT": "0",
+    })
+    return environment
+
+
+def test_campaign_admits_cpu_cloth_for_the_exact_terminal_evaluation_tuple(tmp_path: Path) -> None:
+    result = subprocess.run(
+        ["bash", str(APPLIANCE_DIR / "run_12k_campaign.sh")],
+        env=_terminal_cpu_evaluation_environment(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "missing 400-attempt matrix" in result.stderr
+    assert "CPU cloth requires" not in result.stderr
+
+
+def test_campaign_rejects_cpu_cloth_when_terminal_evaluation_tuple_is_weakened(tmp_path: Path) -> None:
+    environment = _terminal_cpu_evaluation_environment(tmp_path)
+    environment["LEHOME_RESUME_PREEMPTED_ROLLOUT"] = "1"
+    result = subprocess.run(
+        ["bash", str(APPLIANCE_DIR / "run_12k_campaign.sh")],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "CPU cloth requires" in result.stderr
+
+
+def test_campaign_rejects_cuda_cloth_for_terminal_evaluation(tmp_path: Path) -> None:
+    environment = _terminal_cpu_evaluation_environment(tmp_path)
+    environment["LEHOME_SIMULATOR_DEVICE"] = "cuda:0"
+    result = subprocess.run(
+        ["bash", str(APPLIANCE_DIR / "run_12k_campaign.sh")],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "terminal evaluation requires LEHOME_SIMULATOR_DEVICE=cpu" in result.stderr

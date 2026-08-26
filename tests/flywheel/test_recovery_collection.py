@@ -127,6 +127,58 @@ def test_snapshot_source_descriptor_authenticates_an_explicit_legacy_cpu_restore
         validate_snapshot_source_descriptor(descriptor)
 
 
+def test_hard_state_descriptor_authenticates_a_cpu_moment_of_ruin_restore(tmp_path: Path) -> None:
+    from lehome.flywheel.recovery_collection import validate_hard_state_descriptor
+
+    restore = tmp_path / "000032.json"
+    restore.write_text(json.dumps({
+        "schema_version": 3,
+        "robot_position": [0.0] * 12,
+        "robot_velocity": [0.0] * 12,
+        "cloth_position": [[0.0, 0.0, 0.0]],
+        "cloth_velocity": [[0.0, 0.0, 0.0]],
+        "rng_state": {},
+        "garment_name": "Top_Short_Seen_0",
+        "randomization": {"strategy": "canonical", "continuation_step": 32},
+        "scene_state": {"garment_reset_pose": [0.0, 0.0, 0.67, 0.0, 0.0, 90.0]},
+        "cloth_state_authority": "usd_local_points_v1",
+    }), encoding="utf-8")
+    row = {
+        "attempt_id": "hard-state-parent-seed-900001",
+        "trial_id": "hard-state-parent-seed-900001",
+        "garment": "Top_Short_Seen_0",
+        "garment_name": "Top_Short_Seen_0",
+        "category": "top_short",
+        "release_stage": "seen",
+        "difficulty": "hard_state",
+        "seed": 900001,
+        "strategy": "canonical",
+        "restore_snapshot": str(restore),
+        "restore_snapshot_sha256": hashlib.sha256(restore.read_bytes()).hexdigest(),
+        "restore_snapshot_cloth_frame": "usd_local_points_v1",
+        "restore_snapshot_step": 32,
+        "parent_episode_id": "parent-episode",
+        "lineage_id": "parent-episode",
+        "source_episode_id": "parent-episode",
+        "source_episode_path": "/campaign/raw/parent-episode/episode.json",
+        "replay_kind": "verified_hard_state_moment_of_ruin_v1",
+        "category_acceptance_cap": 1,
+        "rank_score": 1.2,
+        "priority_reasons": ["category_gap", "high_progress"],
+        "selection_profile": "moment_of_ruin_reward_drop_v1",
+        "selection_evidence": {"moment_of_ruin": {"restore_step": 32}},
+    }
+    descriptor = tmp_path / "hard-state.json"
+    descriptor.write_text(json.dumps([row]), encoding="utf-8")
+
+    assert validate_hard_state_descriptor(descriptor) == [row]
+
+    row["restore_snapshot_sha256"] = "0" * 64
+    descriptor.write_text(json.dumps([row]), encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        validate_hard_state_descriptor(descriptor)
+
+
 def test_snapshot_source_discovery_descriptor_admits_bounded_same_category_ordinary_rows(tmp_path: Path) -> None:
     from lehome.flywheel.recovery_collection import validate_snapshot_source_discovery_descriptor
 
@@ -146,16 +198,52 @@ def test_snapshot_source_discovery_descriptor_admits_bounded_same_category_ordin
     assert validate_snapshot_source_discovery_descriptor(descriptor) == rows
 
 
-def test_snapshot_source_discovery_descriptor_rejects_mixed_or_controlled_rows(tmp_path: Path) -> None:
+def test_snapshot_source_discovery_descriptor_admits_bounded_mixed_category_rows(tmp_path: Path) -> None:
+    from lehome.flywheel.recovery_collection import validate_snapshot_source_discovery_descriptor
+
+    descriptor = tmp_path / "discovery.json"
+    rows = [
+        {"snapshot_source_bootstrap": True, "category": "top_long", "garment": "Top_Long_Seen_0", "seed": 107, "source_seed": 107},
+        {"snapshot_source_bootstrap": True, "category": "top_short", "garment": "Top_Short_Seen_0", "seed": 108, "source_seed": 108},
+        {"snapshot_source_bootstrap": True, "category": "pant_long", "garment": "Pant_Long_Seen_0", "seed": 109, "source_seed": 109},
+    ]
+    descriptor.write_text(json.dumps(rows), encoding="utf-8")
+
+    assert validate_snapshot_source_discovery_descriptor(descriptor) == rows
+
+
+def test_snapshot_source_discovery_descriptor_rejects_controlled_rows(tmp_path: Path) -> None:
     from lehome.flywheel.recovery_collection import validate_snapshot_source_discovery_descriptor
 
     descriptor = tmp_path / "discovery.json"
     descriptor.write_text(json.dumps([
-        {"snapshot_source_bootstrap": True, "category": "top_long", "garment": "Top_Long_Seen_0", "seed": 107, "source_seed": 107},
         {"snapshot_source_bootstrap": True, "category": "top_short", "garment": "Top_Short_Seen_0", "seed": 108, "source_seed": 108, "controlled_smoke": True},
     ]), encoding="utf-8")
 
     with pytest.raises(ValueError, match="discovery descriptor"):
+        validate_snapshot_source_discovery_descriptor(descriptor)
+
+
+def test_snapshot_source_discovery_descriptor_admits_400_rows_and_rejects_401(tmp_path: Path) -> None:
+    from lehome.flywheel.recovery_collection import validate_snapshot_source_discovery_descriptor
+
+    descriptor = tmp_path / "discovery.json"
+    rows = [
+        {
+            "snapshot_source_bootstrap": True,
+            "category": "pant_long",
+            "garment": f"Pant_Long_Seen_{index % 5}",
+            "seed": 80_000 + index,
+            "source_seed": 80_000 + index,
+        }
+        for index in range(400)
+    ]
+    descriptor.write_text(json.dumps(rows), encoding="utf-8")
+    assert len(validate_snapshot_source_discovery_descriptor(descriptor)) == 400
+
+    rows.append({**rows[-1], "seed": 90_000, "source_seed": 90_000})
+    descriptor.write_text(json.dumps(rows), encoding="utf-8")
+    with pytest.raises(ValueError, match="1..400"):
         validate_snapshot_source_discovery_descriptor(descriptor)
 
 
@@ -505,10 +593,13 @@ def test_cpu_schema3_teacher_reconstructs_from_the_authenticated_reset_prefix(tm
         def __init__(self) -> None:
             self.state = json.loads(json.dumps(reset_state))
             self.actions: list[list[float]] = []
+            self.reset_snapshot_restores = 0
             self.continuation_snapshot_restores = 0
             self.reset_callbacks = 0
 
         def flywheel_restore_state(self, snapshot) -> None:
+            if snapshot.to_dict() == reset_state:
+                self.reset_snapshot_restores += 1
             if snapshot.to_dict() == continuation_state:
                 self.continuation_snapshot_restores += 1
             self.state = snapshot.to_dict()
@@ -535,6 +626,7 @@ def test_cpu_schema3_teacher_reconstructs_from_the_authenticated_reset_prefix(tm
     )
 
     assert env.reset_callbacks == 1
+    assert env.reset_snapshot_restores == 2
     assert env.continuation_snapshot_restores == 0
     assert env.actions == (
         [[float(step)] * 12 for step in range(16)]
@@ -545,6 +637,10 @@ def test_cpu_schema3_teacher_reconstructs_from_the_authenticated_reset_prefix(tm
     assert reconstruction["verified"] is True
     assert len(reconstruction["reset_fidelity_checks"]) == 2
     assert len(reconstruction["h16_fidelity_checks"]) == 2
+    assert reconstruction["authenticated_reset_snapshot_restore"] == {
+        "count": 2,
+        "path": assignment["source_reset"],
+    }
 
 
 def test_cuda_runtime_rejects_usd_local_schema3_readback(tmp_path) -> None:

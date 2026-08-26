@@ -252,6 +252,72 @@ def test_chunk_runtime_wrapper_keeps_guarded_arguments_and_runs_entrypoint_in_pr
     ]]
 
 
+def test_runtime_chunk_consumes_authenticated_resume_flag_before_official_launch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "output"
+    checkpoint = (
+        output / ".runtime-sweep-parent-500-deadbeefdeadbeef"
+        / "run" / "checkpoint-500"
+    )
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "trainer_state.json").write_text(
+        '{"global_step":500}', encoding="utf-8"
+    )
+    forwarded: list[list[str]] = []
+    train_kwargs: list[dict[str, object]] = []
+
+    class Dataset:
+        seed = 17
+
+        def reset_seed(self, _new_seed: int) -> None:
+            pass
+
+    class FakeTrainer:
+        def __init__(self) -> None:
+            self.args = SimpleNamespace(output_dir=str(output / "run"))
+            self.train_dataset = Dataset()
+
+        def add_callback(self, _callback: object) -> None:
+            pass
+
+        def train(self, **kwargs: object) -> None:
+            train_kwargs.append(kwargs)
+
+    def fake_runtime_main(arguments: list[str]) -> int:
+        forwarded.append(list(arguments))
+        FakeTrainer().train(resume_from_checkpoint=True)
+        return 0
+
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(Trainer=FakeTrainer))
+    fake_runtime_module = SimpleNamespace(main=fake_runtime_main)
+    monkeypatch.setitem(
+        sys.modules, "lehome_train.groot.runtime_mixture_entrypoint", fake_runtime_module
+    )
+    import lehome_train.groot as groot_package
+
+    monkeypatch.setattr(
+        groot_package, "runtime_mixture_entrypoint", fake_runtime_module, raising=False
+    )
+    official_launch = str(tmp_path / "gr00t" / "experiment" / "launch_finetune.py")
+    wrapper = [
+        "-m", "lehome_train.groot.runtime_mixture_entrypoint",
+        "--mixture-manifest", "/runtime/mixture.json",
+        "--window-index", "/runtime/windows.json",
+        "--mounts-descriptor", "/runtime/mounts.json",
+        "--official-launch", official_launch,
+        "--", "--output-dir", str(output), "--experiment-name", "run",
+        "--num-gpus", "1", "--global-batch-size", "64",
+        "--resume-from-checkpoint", str(checkpoint),
+    ]
+
+    chunk_launch.main(["--stop-after-step", "1_000", "--", *wrapper])
+
+    forwarded_official = forwarded[0][forwarded[0].index("--") + 1 :]
+    assert "--resume-from-checkpoint" not in forwarded_official
+    assert train_kwargs == [{"resume_from_checkpoint": str(checkpoint)}]
+
+
 def test_runtime_chunk_authenticates_checkpoint_step_before_resetting_dataset_seed(
     tmp_path: Path, monkeypatch
 ) -> None:

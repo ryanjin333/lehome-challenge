@@ -227,8 +227,8 @@ def _weights(value: object) -> tuple[Mapping[str, int], Mapping[str, int]]:
     bc, rollout, dagger = item["bc"], item["rollout"], item["dagger"]
     if type(bc) is not int or type(rollout) is not int or type(dagger) is not int:
         raise ValueError("mixture weights must be integers")
-    if bc <= 0 or rollout <= 0 or dagger != 0 or bc + rollout != 100:
-        raise ValueError("mixture weights must be BC/rollout positive, sum to 100, and DAgger zero")
+    if bc <= 0 or rollout < 0 or dagger != 0 or bc + rollout != 100:
+        raise ValueError("mixture weights must use positive BC, nonnegative rollout, sum to 100, and DAgger zero")
     weights = MappingProxyType({"bc": bc, "rollout": rollout, "dagger": 0})
     quotas = MappingProxyType(batch64_quotas(weights))
     return weights, quotas

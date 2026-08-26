@@ -23,6 +23,10 @@ from lehome.flywheel.snapshots import (
 
 
 RECOVERY_KIND = "controlled_success_recovery_snapshot_v3"
+VERIFIED_SUCCESS_REPLAY_KINDS = frozenset(
+    {"verified_success_reset_v1", "verified_success_early_snapshot_v1"}
+)
+VERIFIED_HARD_STATE_KINDS = frozenset({"verified_hard_state_moment_of_ruin_v1"})
 _SHA256_LENGTH = 64
 _LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CANONICAL_SEEN_GARMENTS = {
@@ -274,13 +278,25 @@ def _replay_fidelity(env: object, expected: Snapshot) -> Mapping[str, object]:
         "cloth_state_authority": observed.cloth_state_authority,
     }
     if robot_error > _REPLAY_FIDELITY_TOLERANCE_RAD:
-        raise ValueError("controlled recovery replay fidelity exceeds fixed robot-position tolerance")
+        raise ValueError(
+            "controlled recovery replay fidelity exceeds fixed robot-position tolerance "
+            f"(observed={robot_error:.9g}, limit={_REPLAY_FIDELITY_TOLERANCE_RAD:.9g})"
+        )
     if robot_velocity_error > _ROBOT_VELOCITY_FIDELITY_TOLERANCE_RADPS:
-        raise ValueError("controlled recovery replay fidelity exceeds fixed robot-velocity tolerance")
+        raise ValueError(
+            "controlled recovery replay fidelity exceeds fixed robot-velocity tolerance "
+            f"(observed={robot_velocity_error:.9g}, limit={_ROBOT_VELOCITY_FIDELITY_TOLERANCE_RADPS:.9g})"
+        )
     if cloth_position_error > _CLOTH_POSITION_FIDELITY_TOLERANCE_M:
-        raise ValueError("controlled recovery replay fidelity exceeds fixed cloth-position tolerance")
+        raise ValueError(
+            "controlled recovery replay fidelity exceeds fixed cloth-position tolerance "
+            f"(observed={cloth_position_error:.9g}, limit={_CLOTH_POSITION_FIDELITY_TOLERANCE_M:.9g})"
+        )
     if cloth_velocity_error > _CLOTH_VELOCITY_FIDELITY_TOLERANCE_MPS:
-        raise ValueError("controlled recovery replay fidelity exceeds fixed cloth-velocity tolerance")
+        raise ValueError(
+            "controlled recovery replay fidelity exceeds fixed cloth-velocity tolerance "
+            f"(observed={cloth_velocity_error:.9g}, limit={_CLOTH_VELOCITY_FIDELITY_TOLERANCE_MPS:.9g})"
+        )
     return result
 
 
@@ -527,6 +543,7 @@ def _snapshot_source_descriptor_rows(descriptor_path: str | Path) -> list[dict[s
 
 def _validate_snapshot_source_row(
     row: Mapping[str, object], *, allow_legacy_replay: bool,
+    require_canonical_restore: bool = True,
 ) -> dict[str, object]:
     """Validate source row lineage without accepting unrelated recovery inputs."""
 
@@ -546,7 +563,7 @@ def _validate_snapshot_source_row(
     replay_kind = row.get("replay_kind")
     restore_keys = {
         "restore_snapshot", "restore_snapshot_sha256", "restore_snapshot_cloth_frame",
-        "parent_episode_id", "lineage_id",
+        "restore_snapshot_step", "parent_episode_id", "lineage_id",
     }
     if replay_kind is None:
         if any(key in row for key in restore_keys):
@@ -554,13 +571,20 @@ def _validate_snapshot_source_row(
         return row
     if not allow_legacy_replay:
         raise ValueError("snapshot source discovery descriptor must be ordinary autonomous collection")
-    if replay_kind != "verified_success_reset_v1":
+    if replay_kind not in VERIFIED_SUCCESS_REPLAY_KINDS:
         raise ValueError("snapshot source descriptor replay kind is invalid")
     if row.get("parent_episode_id") != row.get("lineage_id") or not isinstance(
         row.get("parent_episode_id"), str
     ) or not row["parent_episode_id"]:
         raise ValueError("snapshot source descriptor replay lineage is invalid")
-    if row.get("restore_snapshot_cloth_frame") != LEGACY_USD_LOCAL_CLOTH_AUTHORITY:
+    cloth_frame = row.get("restore_snapshot_cloth_frame")
+    if (
+        cloth_frame != LEGACY_USD_LOCAL_CLOTH_AUTHORITY
+        if replay_kind == "verified_success_reset_v1"
+        else cloth_frame not in {
+            LEGACY_USD_LOCAL_CLOTH_AUTHORITY, PHYSX_CLOTH_STATE_AUTHORITY,
+        }
+    ):
         raise ValueError("snapshot source descriptor cloth frame is invalid")
     restore = _strict_absolute_regular_file(
         row.get("restore_snapshot"), field="snapshot source restore snapshot"
@@ -575,7 +599,29 @@ def _validate_snapshot_source_row(
         "schema_version", "robot_position", "robot_velocity", "cloth_position",
         "cloth_velocity", "rng_state", "garment_name", "randomization", "scene_state",
     }
-    if set(payload) != required or payload.get("schema_version") != 1:
+    if replay_kind == "verified_success_early_snapshot_v1":
+        required.add("cloth_state_authority")
+    schema_version = payload.get("schema_version")
+    expected_schema = (
+        1
+        if replay_kind == "verified_success_reset_v1"
+        else 3 if cloth_frame == LEGACY_USD_LOCAL_CLOTH_AUTHORITY else 2
+    )
+    restore_step = row.get("restore_snapshot_step")
+    if (
+        set(payload) != required
+        or schema_version != expected_schema
+        or (
+            replay_kind == "verified_success_early_snapshot_v1"
+            and (
+                restore_step != 16
+                or not isinstance(payload.get("randomization"), Mapping)
+                or payload["randomization"].get("continuation_step") != restore_step
+                or payload.get("cloth_state_authority") != cloth_frame
+            )
+        )
+        or (replay_kind == "verified_success_reset_v1" and "restore_snapshot_step" in row)
+    ):
         raise ValueError("snapshot source restore snapshot has an incompatible schema")
 
     def vector(value: object, *, size: int, name: str) -> tuple[float, ...]:
@@ -601,20 +647,26 @@ def _validate_snapshot_source_row(
 
     try:
         snapshot = Snapshot(
-            schema_version=1,
+            schema_version=int(schema_version),
             robot_position=vector(payload["robot_position"], size=12, name="robot_position"),
             robot_velocity=vector(payload["robot_velocity"], size=12, name="robot_velocity"),
             cloth_position=cloth(payload["cloth_position"], name="cloth_position"),
             cloth_velocity=cloth(payload["cloth_velocity"], name="cloth_velocity"),
             rng_state=dict(payload["rng_state"]), garment_name=str(payload["garment_name"]),
             randomization=dict(payload["randomization"]), scene_state=dict(payload["scene_state"]),
+            cloth_state_authority=payload.get("cloth_state_authority"),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("snapshot source restore snapshot has an incompatible schema") from error
     pose = snapshot.scene_state.get("garment_reset_pose")
     if (
         snapshot.garment_name != garment
-        or snapshot.randomization.get("strategy") != "canonical"
+        or (
+            snapshot.randomization.get("strategy") != "canonical"
+            if require_canonical_restore
+            else snapshot.randomization.get("strategy")
+            not in {"canonical", "mild_geometry", "strong_geometry"}
+        )
         or not isinstance(pose, list) or len(pose) != 6
         or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in pose)
     ):
@@ -631,30 +683,214 @@ def validate_snapshot_source_descriptor(descriptor_path: str | Path) -> dict[str
     return _validate_snapshot_source_row(rows[0], allow_legacy_replay=True)
 
 
+def validate_success_replay_descriptor(
+    descriptor_path: str | Path,
+) -> list[dict[str, object]]:
+    """Validate one bounded, exact-cap CPU success-replay campaign."""
+
+    rows = _snapshot_source_descriptor_rows(descriptor_path)
+    if not 1 <= len(rows) <= 400:
+        raise ValueError("success replay descriptor must contain 1..400 rows")
+    allowed_fields = {
+        "attempt_id", "trial_id", "garment", "garment_name", "category",
+        "release_stage", "difficulty", "seed", "strategy", "restore_snapshot",
+        "restore_snapshot_sha256", "restore_snapshot_cloth_frame",
+        "parent_episode_id", "lineage_id", "replay_kind",
+        "category_acceptance_cap",
+    }
+    attempt_ids: set[str] = set()
+    seeds: set[int] = set()
+    category_counts: dict[str, int] = {}
+    category_caps: dict[str, int] = {}
+    for row in rows:
+        expected_fields = (
+            allowed_fields | {"restore_snapshot_step"}
+            if row.get("replay_kind") == "verified_success_early_snapshot_v1"
+            else allowed_fields
+        )
+        if set(row) != expected_fields:
+            raise ValueError("success replay descriptor row fields are invalid")
+        category = row.get("category")
+        cap = row.get("category_acceptance_cap")
+        if (
+            row.get("attempt_id") != row.get("trial_id")
+            or not isinstance(row.get("attempt_id"), str)
+            or not row["attempt_id"]
+            or row["attempt_id"] in attempt_ids
+            or row.get("release_stage") != "seen"
+            or row.get("garment_name") != row.get("garment")
+            or type(cap) is not int
+            or not 0 <= cap <= 150
+        ):
+            raise ValueError("success replay descriptor identity or cap is invalid")
+        if category in category_caps and category_caps[str(category)] != cap:
+            raise ValueError("success replay category acceptance cap is inconsistent")
+        category_caps[str(category)] = cap
+        category_counts[str(category)] = category_counts.get(str(category), 0) + 1
+        seed = row.get("seed")
+        if type(seed) is not int or seed in seeds:
+            raise ValueError("success replay descriptor seeds must be unique")
+        verification_row = dict(row)
+        verification_row["snapshot_source_bootstrap"] = True
+        verification_row["source_seed"] = seed
+        _validate_snapshot_source_row(
+            verification_row,
+            allow_legacy_replay=True,
+            require_canonical_restore=False,
+        )
+        attempt_ids.add(str(row["attempt_id"]))
+        seeds.add(seed)
+    if any(category_caps[category] > count for category, count in category_counts.items()):
+        raise ValueError("success replay category acceptance cap exceeds its attempts")
+    if not 1 <= sum(category_caps.values()) <= 150:
+        raise ValueError("success replay total acceptance cap must be in 1..150")
+    return rows
+
+
+def validate_hard_state_descriptor(
+    descriptor_path: str | Path,
+) -> list[dict[str, object]]:
+    """Validate one bounded CPU-only moment-of-ruin recovery campaign."""
+
+    rows = _snapshot_source_descriptor_rows(descriptor_path)
+    if not 1 <= len(rows) <= 400:
+        raise ValueError("hard-state descriptor must contain 1..400 rows")
+    allowed_fields = {
+        "attempt_id", "trial_id", "garment", "garment_name", "category",
+        "release_stage", "difficulty", "seed", "strategy", "restore_snapshot",
+        "restore_snapshot_sha256", "restore_snapshot_cloth_frame",
+        "restore_snapshot_step", "parent_episode_id", "lineage_id",
+        "source_episode_id", "source_episode_path", "replay_kind",
+        "category_acceptance_cap", "rank_score", "priority_reasons",
+        "selection_profile", "selection_evidence",
+    }
+    required_snapshot_fields = {
+        "schema_version", "robot_position", "robot_velocity", "cloth_position",
+        "cloth_velocity", "rng_state", "garment_name", "randomization",
+        "scene_state", "cloth_state_authority",
+    }
+    attempt_ids: set[str] = set()
+    seeds: set[int] = set()
+    category_counts: dict[str, int] = {}
+    category_caps: dict[str, int] = {}
+    for row in rows:
+        if set(row) != allowed_fields:
+            raise ValueError("hard-state descriptor row fields are invalid")
+        category = row.get("category")
+        garment = row.get("garment")
+        attempt_id = row.get("attempt_id")
+        seed = row.get("seed")
+        cap = row.get("category_acceptance_cap")
+        parent = row.get("parent_episode_id")
+        rank_score = row.get("rank_score")
+        if (
+            category not in _CANONICAL_SEEN_GARMENTS
+            or not isinstance(garment, str)
+            or _CANONICAL_SEEN_GARMENTS[str(category)].fullmatch(garment) is None
+            or row.get("garment_name") != garment
+            or row.get("trial_id") != attempt_id
+            or not isinstance(attempt_id, str) or not attempt_id or attempt_id in attempt_ids
+            or type(seed) is not int or seed < 0 or seed in seeds
+            or row.get("release_stage") != "seen"
+            or row.get("difficulty") != "hard_state"
+            or row.get("strategy") != "canonical"
+            or row.get("replay_kind") not in VERIFIED_HARD_STATE_KINDS
+            or not isinstance(parent, str) or not parent
+            or row.get("lineage_id") != parent
+            or row.get("source_episode_id") != parent
+            or not isinstance(row.get("source_episode_path"), str)
+            or not str(row["source_episode_path"]).startswith("/")
+            or type(cap) is not int or not 0 <= cap <= 150
+            or type(rank_score) not in (int, float) or not math.isfinite(float(rank_score))
+            or not isinstance(row.get("priority_reasons"), list)
+            or any(not isinstance(reason, str) or not reason for reason in row["priority_reasons"])
+            or row.get("selection_profile") != "moment_of_ruin_reward_drop_v1"
+            or not isinstance(row.get("selection_evidence"), Mapping)
+        ):
+            raise ValueError("hard-state descriptor identity or evidence is invalid")
+        if category in category_caps and category_caps[str(category)] != cap:
+            raise ValueError("hard-state category acceptance cap is inconsistent")
+
+        restore = _strict_absolute_regular_file(
+            row.get("restore_snapshot"), field="hard-state restore snapshot"
+        )
+        expected = row.get("restore_snapshot_sha256")
+        if not isinstance(expected, str) or _LOWERCASE_SHA256.fullmatch(expected) is None:
+            raise ValueError("hard-state restore snapshot SHA-256 is invalid")
+        if _sha256(restore) != expected:
+            raise ValueError("hard-state restore snapshot SHA-256 mismatch")
+        payload = _strict_json_object(restore, field="hard-state restore snapshot")
+        restore_step = row.get("restore_snapshot_step")
+        randomization = payload.get("randomization")
+        scene_state = payload.get("scene_state")
+        pose = scene_state.get("garment_reset_pose") if isinstance(scene_state, Mapping) else None
+        moment = row["selection_evidence"].get("moment_of_ruin")
+        if (
+            set(payload) != required_snapshot_fields
+            or payload.get("schema_version") != 3
+            or row.get("restore_snapshot_cloth_frame") != LEGACY_USD_LOCAL_CLOTH_AUTHORITY
+            or payload.get("cloth_state_authority") != LEGACY_USD_LOCAL_CLOTH_AUTHORITY
+            or payload.get("garment_name") != garment
+            or type(restore_step) is not int or restore_step <= 0 or restore_step % 16
+            or not isinstance(randomization, Mapping)
+            or randomization.get("strategy") != "canonical"
+            or randomization.get("continuation_step") != restore_step
+            or not isinstance(pose, list) or len(pose) != 6
+            or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in pose)
+            or not isinstance(moment, Mapping)
+            or moment.get("restore_step") != restore_step
+        ):
+            raise ValueError("hard-state restore snapshot has an incompatible CPU schema")
+        for field, size in (("robot_position", 12), ("robot_velocity", 12)):
+            values = payload.get(field)
+            if (
+                not isinstance(values, list) or len(values) != size
+                or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in values)
+            ):
+                raise ValueError(f"hard-state restore snapshot {field} is invalid")
+        for field in ("cloth_position", "cloth_velocity"):
+            values = payload.get(field)
+            if (
+                not isinstance(values, list) or not values
+                or any(
+                    not isinstance(point, list) or len(point) != 3
+                    or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in point)
+                    for point in values
+                )
+            ):
+                raise ValueError(f"hard-state restore snapshot {field} is invalid")
+        attempt_ids.add(attempt_id)
+        seeds.add(seed)
+        category_counts[str(category)] = category_counts.get(str(category), 0) + 1
+        category_caps[str(category)] = cap
+    if any(category_caps[category] > category_counts[category] for category in category_caps):
+        raise ValueError("hard-state category acceptance cap exceeds its attempts")
+    if not 1 <= sum(category_caps.values()) <= 150:
+        raise ValueError("hard-state total acceptance cap must be in 1..150")
+    return rows
+
+
 def validate_snapshot_source_discovery_descriptor(
     descriptor_path: str | Path,
 ) -> list[dict[str, object]]:
     """Validate a bounded ordinary source-discovery descriptor.
 
-    Discovery intentionally keeps every attempt in one category so the one
-    long-lived simulator can reuse its garment setup.  Historical replay and
-    controlled-recovery fields are excluded: this creates only fresh,
-    autonomous schema-v2 sources.
+    Historical replay and controlled-recovery fields are excluded: this creates
+    only fresh, autonomous schema-v2 sources. Mixed categories are allowed so a
+    production four-worker wave can fill exact category deficits in one run.
     """
 
     rows = _snapshot_source_descriptor_rows(descriptor_path)
-    if not 1 <= len(rows) <= 16:
-        raise ValueError("snapshot source discovery descriptor must contain 1..16 rows")
+    if not 1 <= len(rows) <= 400:
+        raise ValueError("snapshot source discovery descriptor must contain 1..400 rows")
     validated = [_validate_snapshot_source_row(row, allow_legacy_replay=False) for row in rows]
-    category = validated[0]["category"]
     seeds: set[int] = set()
     allowed_fields = {
         "snapshot_source_bootstrap", "snapshot_source_descriptor_sha256",
         "category", "garment", "garment_name", "seed", "source_seed",
     }
     for row in validated:
-        if row["category"] != category:
-            raise ValueError("snapshot source discovery descriptor must use one category")
+        category = row["category"]
         garment_name = row.get("garment_name")
         if (garment_name is not None and garment_name != row["garment"]):
             raise ValueError("snapshot source discovery descriptor garment identity is inconsistent")
@@ -811,10 +1047,14 @@ def load_attempt_matrix(path_value: str | Path) -> list[Mapping[str, object]]:
             _validate_v2_smoke_descriptor(v2_rows[0])
             return [dict(v2_rows[0])]
         for row in decoded:
+            capped_verified_replay = (
+                row.get("replay_kind") in VERIFIED_SUCCESS_REPLAY_KINDS | VERIFIED_HARD_STATE_KINDS
+                and "category_acceptance_cap" in row
+            )
             controlled = (
                 "recovery_kind" in row
                 or any(str(key).startswith("source_continuation_") for key in row)
-                or "category_acceptance_cap" in row
+                or ("category_acceptance_cap" in row and not capped_verified_replay)
             )
             if controlled and row.get("recovery_kind") != RECOVERY_KIND:
                 raise ValueError("legacy or incompatible controlled recovery list is forbidden")
@@ -970,6 +1210,7 @@ def bootstrap_controlled_recovery(
     if runtime_contract[0] == 3:
         if not callable(reset_callback):
             raise ValueError("controlled recovery CPU reset-prefix reconstruction requires a deterministic reset callback")
+        restore_snapshot(env, recovery.reset_snapshot)
         reset_checks = [_replay_fidelity(env, recovery.reset_snapshot)]
         replay_action_prefix(env, recovery.prefix_actions)
         h16_checks = [_replay_fidelity(env, recovery.continuation_snapshot)]
@@ -984,6 +1225,7 @@ def bootstrap_controlled_recovery(
                 "replayed_action_count": len(recovery.teacher_actions),
             }
         reset_callback()
+        restore_snapshot(env, recovery.reset_snapshot)
         reset_checks.append(_replay_fidelity(env, recovery.reset_snapshot))
         replay_action_prefix(env, recovery.prefix_actions)
         h16_checks.append(_replay_fidelity(env, recovery.continuation_snapshot))
@@ -1008,6 +1250,10 @@ def bootstrap_controlled_recovery(
                 "reset_fidelity_checks": reset_checks,
                 "h16_fidelity_checks": h16_checks,
                 "prefix_replayed_action_count": len(recovery.prefix_actions),
+                "authenticated_reset_snapshot_restore": {
+                    "count": 2,
+                    "path": recovery.provenance["source_reset"],
+                },
             },
         })
         if teacher_provenance is not None:
@@ -1062,4 +1308,4 @@ def bootstrap_controlled_recovery(
     return provenance
 
 
-__all__ = ["RECOVERY_KIND", "ControlledRecovery", "apply_controlled_perturbation", "bootstrap_controlled_recovery", "load_attempt_matrix", "load_controlled_recovery", "replay_action_prefix"]
+__all__ = ["RECOVERY_KIND", "ControlledRecovery", "apply_controlled_perturbation", "bootstrap_controlled_recovery", "load_attempt_matrix", "load_controlled_recovery", "replay_action_prefix", "validate_hard_state_descriptor"]

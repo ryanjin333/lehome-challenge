@@ -178,10 +178,28 @@ def setup_replay_parser(
         "--step_hz", type=int, default=60, help="Environment stepping rate in Hz."
     )
     parser.add_argument(
+        "--render_every_actions",
+        type=int,
+        default=1,
+        help="Render once per N replay actions; physics still advances every tick.",
+    )
+    parser.add_argument(
         "--dataset_root",
         type=str,
         default="Datasets/record/example/record_top_long_release_10/001",
         help="Root directory of the dataset to replay.",
+    )
+    parser.add_argument(
+        "--garment_index_path",
+        type=str,
+        default=None,
+        help="Authenticated BC episode-to-garment index for prepared datasets.",
+    )
+    parser.add_argument(
+        "--garment_info_path",
+        type=str,
+        default=None,
+        help="Organizer garment_info.json containing reset poses.",
     )
     parser.add_argument(
         "--output_root",

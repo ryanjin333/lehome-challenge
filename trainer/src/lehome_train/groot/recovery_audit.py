@@ -129,7 +129,7 @@ def _audit_source_seal(path: Path) -> Mapping[str, object]:
             or document.get("source_only") is not True
             or document.get("readback_verified") is not True
             or type(document.get("episode_count")) is not int
-            or not 1 <= document["episode_count"] <= 4):
+            or not 1 <= document["episode_count"] <= 150):
         raise ValueError("recovery audit source envelope is invalid")
     expected = dict(document); claimed = expected.pop("envelope_sha256")
     if not isinstance(claimed, str) or claimed != canonical_json_sha256(expected):

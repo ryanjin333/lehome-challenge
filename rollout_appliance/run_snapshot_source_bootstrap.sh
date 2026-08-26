@@ -14,6 +14,7 @@ ROLLOUT_IMAGE="${LEHOME_ROLLOUT_IMAGE:-lehome-rollout:build}"
 # runtime and never inherits the host Python environment.
 RUNTIME_SOURCE_ROOT="${LEHOME_SNAPSHOT_SOURCE_RUNTIME_ROOT:-/opt/lehome/source/lehome}"
 TARGET_ACCEPTED="${LEHOME_SNAPSHOT_SOURCE_TARGET_ACCEPTED:-1}"
+WORKER_COUNT="${LEHOME_SNAPSHOT_SOURCE_WORKER_COUNT:-4}"
 ROLLOUT_REPOSITORY="${LEHOME_ROLLOUT_REPOSITORY:-ryanjin333/lehome-groot-n17-rollouts}"
 HF_REVISION="${LEHOME_HF_REVISION:-main}"
 SOURCE_FINALIZATION_TIMEOUT_SECONDS="${LEHOME_SOURCE_FINALIZATION_TIMEOUT_SECONDS:-300}"
@@ -63,7 +64,9 @@ from lehome.flywheel.recovery_collection import (
     validate_snapshot_source_discovery_descriptor,
 )
 rows = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if len(rows) == 1 and rows[0].get("replay_kind") == "verified_success_reset_v1":
+if len(rows) == 1 and rows[0].get("replay_kind") in {
+    "verified_success_reset_v1", "verified_success_early_snapshot_v1",
+}:
     validate_snapshot_source_descriptor(sys.argv[1])
 else:
     validate_snapshot_source_discovery_descriptor(sys.argv[1])
@@ -79,8 +82,8 @@ try:
     payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 except (OSError, ValueError) as error:
     raise SystemExit(f"snapshot source bootstrap descriptor is unreadable: {error}")
-if not isinstance(payload, list) or not 1 <= len(payload) <= 16 or not isinstance(payload[0], dict):
-    raise SystemExit("snapshot source bootstrap descriptor must contain 1..16 assignments")
+if not isinstance(payload, list) or not 1 <= len(payload) <= 400 or not isinstance(payload[0], dict):
+    raise SystemExit("snapshot source bootstrap descriptor must contain 1..400 assignments")
 row = payload[0]
 garment = row.get("garment")
 if not isinstance(garment, str) or re.fullmatch(r"[A-Za-z0-9_.-]+", garment) is None:
@@ -98,17 +101,21 @@ try:
     rows = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 except (OSError, ValueError) as error:
     raise SystemExit(f"snapshot source bootstrap descriptor is unreadable: {error}")
-if not isinstance(rows, list) or not 1 <= len(rows) <= 16:
-    raise SystemExit("snapshot source bootstrap descriptor must contain 1..16 assignments")
+if not isinstance(rows, list) or not 1 <= len(rows) <= 400:
+    raise SystemExit("snapshot source bootstrap descriptor must contain 1..400 assignments")
 print(len(rows))
 PY
 )" || exit 2
 case "${TARGET_ACCEPTED}" in
   ''|*[!0-9]*) echo "snapshot source discovery target must be a positive integer" >&2; exit 2 ;;
 esac
-if [ "${TARGET_ACCEPTED}" -lt 1 ] || [ "${TARGET_ACCEPTED}" -gt 4 ] || [ "${TARGET_ACCEPTED}" -gt "${SOURCE_ROW_COUNT}" ]; then
-  echo "snapshot source discovery target must be in 1..min(4, rows)" >&2; exit 2
+if [ "${TARGET_ACCEPTED}" -lt 1 ] || [ "${TARGET_ACCEPTED}" -gt 150 ] || [ "${TARGET_ACCEPTED}" -gt "${SOURCE_ROW_COUNT}" ]; then
+  echo "snapshot source discovery target must be in 1..min(150, rows)" >&2; exit 2
 fi
+case "${WORKER_COUNT}" in
+  1|4) ;;
+  *) echo "snapshot source discovery worker count must be 1 or 4" >&2; exit 2 ;;
+esac
 identity="$(python3 - "${RUN_ID}" "${DESCRIPTOR_SHA256}" <<'PY'
 import hashlib, sys
 print(hashlib.sha256(f"{sys.argv[1]}:{sys.argv[2]}".encode("ascii")).hexdigest()[:20])
@@ -123,9 +130,9 @@ set +e
 env LEHOME_WORKSPACE="${WORKSPACE}" LEHOME_CAMPAIGN_ROOT="${ROOT}" \
   LEHOME_ATTEMPT_MATRIX="${DESCRIPTOR}" LEHOME_ATTEMPT_MATRIX_SHA256="${DESCRIPTOR_SHA256}" \
   LEHOME_RUN_ID="${RUN_ID}" LEHOME_ROUND_ID="snapshot-source-bootstrap-${identity}-unsealed-source" \
-  LEHOME_WORKER_COUNT=1 LEHOME_MAX_ATTEMPTS="${SOURCE_ROW_COUNT}" LEHOME_TARGET_ACCEPTED="${TARGET_ACCEPTED}" \
+  LEHOME_WORKER_COUNT="${WORKER_COUNT}" LEHOME_MAX_ATTEMPTS="${SOURCE_ROW_COUNT}" LEHOME_TARGET_ACCEPTED="${TARGET_ACCEPTED}" \
   LEHOME_INITIAL_GARMENT="${INITIAL_GARMENT}" \
-  LEHOME_MAX_WORKER_RESTARTS=0 \
+  LEHOME_MAX_WORKER_RESTARTS=8 \
   LEHOME_ROLLOUT_REPOSITORY="${ROLLOUT_REPOSITORY}" LEHOME_HF_REVISION="${HF_REVISION}" \
   LEHOME_SOURCE_FINALIZATION_TIMEOUT_SECONDS="${SOURCE_FINALIZATION_TIMEOUT_SECONDS}" \
   LEHOME_SIMULATOR_DEVICE="${SNAPSHOT_SOURCE_SIMULATOR_DEVICE}" \
@@ -135,20 +142,30 @@ env LEHOME_WORKSPACE="${WORKSPACE}" LEHOME_CAMPAIGN_ROOT="${ROOT}" \
 status=$?
 set -e
 terminal="$(python3 - "${ROOT}/ledger.sqlite3" "${TARGET_ACCEPTED}" <<'PY'
-import sqlite3, sys
+import json, sqlite3, sys
 from pathlib import Path
 p, target = Path(sys.argv[1]), int(sys.argv[2])
 try:
     if not p.is_file() or p.is_symlink(): raise ValueError("unsafe ledger")
     con=sqlite3.connect(f"{p.as_uri()}?mode=ro", uri=True)
-    rows=list(con.execute("select event_type, attempt_id from events"))
+    rows=list(con.execute("select event_type, attempt_id, payload_json from events"))
 except Exception:
     print("infrastructure")
 else:
     con.close()
     kinds={row[0] for row in rows}
     accepted={row[1] for row in rows if row[0] == "accepted" and isinstance(row[1], str)}
-    if "infrastructure_abort" in kinds or len(accepted) > target:
+    infrastructure=[]
+    for event_type, _, payload_json in rows:
+        if event_type != "infrastructure_abort": continue
+        try: payload=json.loads(payload_json)
+        except (TypeError, ValueError): payload={}
+        infrastructure.append(payload)
+    tolerated_numerical_divergence = all(
+        payload == {"reason": "simulator_numerical_divergence"}
+        for payload in infrastructure
+    )
+    if (infrastructure and not tolerated_numerical_divergence) or len(accepted) > target:
         print("infrastructure")
     elif not accepted and "rejected" in kinds:
         print("rejected")
@@ -191,10 +208,17 @@ con = sqlite3.connect(f"{ledger.as_uri()}?mode=ro", uri=True)
 try:
     accepted_ids = [row[0] for row in con.execute("SELECT DISTINCT attempt_id FROM events WHERE event_type='accepted' ORDER BY attempt_id")]
     attempt_rows = dict(con.execute("SELECT attempt_id, assignment_json FROM attempts"))
-    infrastructure = con.execute("SELECT COUNT(*) FROM events WHERE event_type='infrastructure_abort'").fetchone()[0]
+    infrastructure_payloads = [row[0] for row in con.execute(
+        "SELECT payload_json FROM events WHERE event_type='infrastructure_abort'"
+    )]
 finally: con.close()
 files = sorted(receipts.iterdir())
-if infrastructure or not 1 <= len(accepted_ids) <= target or len(files) != len(accepted_ids): raise SystemExit("snapshot source bootstrap accepted set is invalid")
+for payload_json in infrastructure_payloads:
+    try: payload = json.loads(payload_json)
+    except (TypeError, ValueError): raise SystemExit("snapshot source bootstrap infrastructure evidence is malformed")
+    if payload != {"reason": "simulator_numerical_divergence"}:
+        raise SystemExit("snapshot source bootstrap contains a non-quarantinable infrastructure abort")
+if not 1 <= len(accepted_ids) <= target or len(files) != len(accepted_ids): raise SystemExit("snapshot source bootstrap accepted set is invalid")
 if any(not isinstance(attempt_id, str) or re.fullmatch(r"[0-9a-f]{64}", attempt_id) is None for attempt_id in accepted_ids): raise SystemExit("snapshot source bootstrap accepted attempt identity is invalid")
 if any(path.is_symlink() or not path.is_file() for path in files): raise SystemExit("snapshot source bootstrap receipt path is unsafe")
 try: descriptor_rows = json.loads(descriptor.read_text(encoding="utf-8"))
@@ -204,7 +228,9 @@ from lehome.flywheel.recovery_collection import (
     validate_snapshot_source_descriptor,
     validate_snapshot_source_discovery_descriptor,
 )
-if len(descriptor_rows) == 1 and descriptor_rows[0].get("replay_kind") == "verified_success_reset_v1":
+if len(descriptor_rows) == 1 and descriptor_rows[0].get("replay_kind") in {
+    "verified_success_reset_v1", "verified_success_early_snapshot_v1",
+}:
     descriptor_rows = [validate_snapshot_source_descriptor(descriptor)]
 else:
     descriptor_rows = validate_snapshot_source_discovery_descriptor(descriptor)

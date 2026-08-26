@@ -364,6 +364,13 @@ def main(argv: list[str] | None = None) -> None:
     )
     expected_runtime_step = None if runtime_binding is None else runtime_binding[0]
     selected_runtime_checkpoint = None if runtime_binding is None else runtime_binding[2]
+    if selected_runtime_checkpoint is not None:
+        # This is an authenticated carrier for the in-process Trainer patch,
+        # not an option supported by NVIDIA's pinned Tyro launcher.
+        position = official_arguments.index("--resume-from-checkpoint")
+        official_arguments = [
+            *official_arguments[:position], *official_arguments[position + 2 :]
+        ]
     _configure_rank_device(num_gpus, os.environ)
     official_arguments, canonical_run, metadata_staging = _rank_metadata_staging(
         official_arguments, num_gpus=num_gpus, environment=os.environ

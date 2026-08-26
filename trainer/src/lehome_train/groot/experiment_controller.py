@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from typing import Mapping, Sequence
 
@@ -35,6 +36,7 @@ _PRODUCTION_TRAINING_LEASE_SECONDS = 60.0
 # duplicate run.  This is deliberately controller-owned, not a worker retry
 # timeout, so it survives service/process restarts.
 TERMINAL_RECEIPT_GRACE_NS = 60_000_000_000
+_RECOVERY_TERMINAL_STATES = frozenset({"COMPLETED", "PROMOTED", "REJECTED", "BLOCKED_INFRA"})
 
 
 def validate_production_budget(value: object) -> dict[str, float]:
@@ -69,9 +71,11 @@ class JobLease:
 class ExperimentController:
     """The only SQLite writer; workers can only lease or report transitions."""
 
-    def __init__(self, database: str | Path, *, max_gpu_leases: int = 3, gradient_step_ceiling: int = 7000, tied_runner_gradient_step_ceiling: int = 8000, gpu_seconds_ceiling: float | None = None, spend_ceiling: float | None = None, estimated_gpu_seconds_per_step: float = 0.0, gpu_price_per_second: float = 0.0) -> None:
+    def __init__(self, database: str | Path, *, max_gpu_leases: int = 3, gradient_step_ceiling: int = 7000, tied_runner_gradient_step_ceiling: int = 8000, gpu_seconds_ceiling: float | None = None, spend_ceiling: float | None = None, estimated_gpu_seconds_per_step: float = 0.0, gpu_price_per_second: float = 0.0, recovery_collection_admitted: bool = True) -> None:
         if max_gpu_leases != 3:
             raise ValueError("topology is exactly two trainers plus one evaluator")
+        if type(recovery_collection_admitted) is not bool:
+            raise ValueError("recovery collection admission is invalid")
         if type(gradient_step_ceiling) is not int or type(tied_runner_gradient_step_ceiling) is not int or not 0 < gradient_step_ceiling <= tied_runner_gradient_step_ceiling:
             raise ValueError("gradient budget is invalid")
         if (gpu_seconds_ceiling is None) != (spend_ceiling is None):
@@ -99,6 +103,7 @@ class ExperimentController:
         self.spend_ceiling = None if spend_ceiling is None else float(spend_ceiling)
         self.estimated_gpu_seconds_per_step = float(estimated_gpu_seconds_per_step)
         self.gpu_price_per_second = float(gpu_price_per_second)
+        self.recovery_collection_admitted = recovery_collection_admitted
         self.original_12k_checkpoint_digest = APPROVED_ORIGINAL_12K_CHECKPOINT["artifact_sha256"]
         self._jobs: dict[str, ExperimentJob] = {}
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
@@ -236,6 +241,7 @@ class ExperimentController:
             raise ValueError("capacity snapshot clock is invalid")
         with self._lock, self._transaction():
             self._reconcile_expired_leases(now_ns)
+            self._enforce_recovery_admission(now_ns)
             ready_training = int(self._connection.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('READY','RETRYABLE')").fetchone()[0])
             leaseable_training = self._leaseable_training_count()
             eval_ready = int(self._connection.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('EVAL_READY','EVAL_RETRYABLE')").fetchone()[0])
@@ -311,10 +317,118 @@ class ExperimentController:
                 verified.append(dependency)
         return tuple(sorted(verified))
 
+    @staticmethod
+    def _is_recovery_job(job: ExperimentJob) -> bool:
+        return any(item.kind == "recovery" for item in job.data_sources)
+
+    def _is_admissible_job(self, job: ExperimentJob) -> bool:
+        return self.recovery_collection_admitted or not self._is_recovery_job(job)
+
+    def _enforce_recovery_admission(self, now_ns: int) -> None:
+        """Demote recovery work when the immutable deployment gate forbids it.
+
+        This is intentionally controller-owned rather than a queue convention:
+        a database created under a previously accepted gate may be restarted
+        under an unavailable recovery gate, and a valid dependency receipt
+        must never revive its D--G jobs in that case.
+        """
+        if self.recovery_collection_admitted:
+            return
+        rows = self._connection.execute(
+            "SELECT experiment_id,state FROM jobs ORDER BY created_order"
+        ).fetchall()
+        for experiment_id, state in rows:
+            job = self._job(str(experiment_id))
+            if not self._is_recovery_job(job):
+                continue
+            final = self._connection.execute(
+                "SELECT state FROM final_evaluations WHERE experiment_id=?",
+                (experiment_id,),
+            ).fetchone()
+            block_job = str(state) not in _RECOVERY_TERMINAL_STATES | {"BLOCKED_DATA"}
+            block_final = (
+                final is not None
+                and str(final[0]) not in _RECOVERY_TERMINAL_STATES | {"BLOCKED_DATA"}
+            )
+            # State may already be terminal or BLOCKED_DATA after a prior
+            # controller pass, but neither state makes a stale lease or its
+            # budget reservation safe to retain.  Recovery admission loss
+            # always revokes that authority before any state-specific work.
+            lease_ids = {
+                str(row[0])
+                for row in self._connection.execute(
+                    "SELECT lease_id FROM leases WHERE experiment_id=?",
+                    (experiment_id,),
+                )
+            }
+            lease_ids.update(
+                str(row[0])
+                for row in self._connection.execute(
+                    "SELECT lease_id FROM terminal_handoffs WHERE experiment_id=?",
+                    (experiment_id,),
+                )
+            )
+            lease_ids.update(
+                str(row[0])
+                for row in self._connection.execute(
+                    "SELECT lease_id FROM budget_reservations WHERE experiment_id=?",
+                    (experiment_id,),
+                )
+            )
+            self._connection.execute("DELETE FROM leases WHERE experiment_id=?", (experiment_id,))
+            self._connection.execute("DELETE FROM terminal_handoffs WHERE experiment_id=?", (experiment_id,))
+            for lease_id in lease_ids:
+                self._release_budget(lease_id, now_ns, settle_elapsed=True)
+            if block_job:
+                self._connection.execute(
+                    "UPDATE jobs SET state='BLOCKED_DATA' WHERE experiment_id=?",
+                    (experiment_id,),
+                )
+                self._event(
+                    str(experiment_id),
+                    "BLOCKED_DATA",
+                    None,
+                    now_ns,
+                    "recovery_admission_unavailable:" + str(state),
+                )
+            if block_final:
+                self._connection.execute(
+                    "UPDATE final_evaluations SET state='BLOCKED_DATA' WHERE experiment_id=?",
+                    (experiment_id,),
+                )
+                self._event(
+                    str(experiment_id),
+                    "FINAL_EVAL_BLOCKED_DATA",
+                    None,
+                    now_ns,
+                    "recovery_admission_unavailable:" + str(final[0]),
+                )
+        for parent_id, kind in self._connection.execute(
+            "SELECT parent_experiment_id,kind FROM promotion_candidates "
+            "WHERE state IN ('PENDING','ADMITTED') ORDER BY created_ns,parent_experiment_id,kind"
+        ).fetchall():
+            parent_id, kind = str(parent_id), str(kind)
+            if not self._is_recovery_job(self._job(parent_id)):
+                continue
+            self._connection.execute(
+                "UPDATE promotion_candidates SET state='REVOKED' "
+                "WHERE parent_experiment_id=? AND kind=?",
+                (parent_id, kind),
+            )
+            self._event(
+                parent_id,
+                "PROMOTION_REVOKED",
+                None,
+                now_ns,
+                "recovery_admission_unavailable:" + kind,
+            )
+
     def _initial_state(self, job: ExperimentJob) -> str:
+        if self._is_recovery_job(job) and not self.recovery_collection_admitted:
+            return "BLOCKED_DATA"
         if job.admission.get("kind") == "awr_style_weighted_replay":
             return "PENDING_MATERIALIZATION"
-        if any(item.kind == "recovery" for item in job.data_sources):
+        if self._is_recovery_job(job):
             return "READY" if self._recovery_dependency_digests(job) else "BLOCKED_DATA"
         return "READY"
 
@@ -365,6 +479,24 @@ class ExperimentController:
         reserved = self._connection.execute("SELECT COALESCE(SUM(gradient_steps),0),COALESCE(SUM(gpu_seconds),0),COALESCE(SUM(spend),0) FROM budget_reservations").fetchone()
         return int(used[0]) + int(reserved[0]), float(used[1]) + float(reserved[1]), float(used[2]) + float(reserved[2])
 
+    def _has_admissible_tied_runner(self) -> bool:
+        """Return whether a live, admitted 2K tied finalist owns the 8K cap."""
+        rows = self._connection.execute(
+            "SELECT child.experiment_id,child.parent_experiment_id,candidate.tied_runner "
+            "FROM promotion_children child JOIN promotion_candidates candidate "
+            "ON candidate.parent_experiment_id=child.parent_experiment_id "
+            "AND candidate.kind='step_2000' AND candidate.state='ADMITTED' "
+            "WHERE child.tied_runner=1"
+        ).fetchall()
+        for child_id, parent_id, candidate_tied_runner in rows:
+            if (
+                candidate_tied_runner == 1
+                and self._is_admissible_job(self._job(str(child_id)))
+                and self._is_admissible_job(self._job(str(parent_id)))
+            ):
+                return True
+        return False
+
     def _leaseable_training_count(self) -> int:
         """Count jobs a newly available trainer could lease at this instant.
 
@@ -393,8 +525,10 @@ class ExperimentController:
             ),
         )
         total_steps, total_gpu_seconds, total_spend = self._budget_totals()
-        tied_campaign = self._connection.execute("SELECT 1 FROM promotion_children WHERE tied_runner=1 LIMIT 1").fetchone()
-        ceiling = self.tied_runner_gradient_step_ceiling if tied_campaign is not None else self.gradient_step_ceiling
+        ceiling = (
+            self.tied_runner_gradient_step_ceiling
+            if self._has_admissible_tied_runner() else self.gradient_step_ceiling
+        )
         count = 0
         for experiment_id, _ in rows:
             if count >= available_slots:
@@ -437,10 +571,10 @@ class ExperimentController:
         # Once the controller admits the explicit tied finalist, 8K is the
         # campaign ceiling for both finalists.  Applying that ceiling only to
         # the tied lease makes admission depend on which finalist leases first.
-        tied_campaign = self._connection.execute(
-            "SELECT 1 FROM promotion_children WHERE tied_runner=1 LIMIT 1"
-        ).fetchone()
-        ceiling = self.tied_runner_gradient_step_ceiling if tied_campaign is not None else self.gradient_step_ceiling
+        ceiling = (
+            self.tied_runner_gradient_step_ceiling
+            if self._has_admissible_tied_runner() else self.gradient_step_ceiling
+        )
         if total_steps + steps > ceiling or (self.gpu_seconds_ceiling is not None and total_gpu_seconds + gpu_seconds > self.gpu_seconds_ceiling) or (self.spend_ceiling is not None and total_spend + spend > self.spend_ceiling):
             return False
         self._connection.execute("INSERT INTO budget_reservations VALUES(?,?,?,?,?,?)", (lease_id, job.experiment_id, steps, gpu_seconds, spend, now_ns))
@@ -545,12 +679,9 @@ class ExperimentController:
         ):
             raise RuntimeError("training completion grace budget reservation is invalid")
         total_steps, _total_gpu_seconds, _total_spend = self._budget_totals()
-        tied_campaign = self._connection.execute(
-            "SELECT 1 FROM promotion_children WHERE tied_runner=1 LIMIT 1"
-        ).fetchone()
         ceiling = (
             self.tied_runner_gradient_step_ceiling
-            if tied_campaign is not None else self.gradient_step_ceiling
+            if self._has_admissible_tied_runner() else self.gradient_step_ceiling
         )
         # The retained reservation is already included in ``total_steps``.
         # A breach therefore indicates an inconsistent/legacy ledger rather
@@ -584,6 +715,11 @@ class ExperimentController:
                     row = self._connection.execute("SELECT canonical FROM jobs WHERE experiment_id=?", (job.experiment_id,)).fetchone()
                     if row is None or json.loads(row[0]) != dict(job.raw):
                         raise ValueError("controller bootstrap replay is not identical")
+                # Restarting under an unavailable gate revokes any persisted
+                # recovery lease.  Settle it against the real wall clock so
+                # an already-consumed reservation cannot become free A/B/C
+                # budget merely because this is bootstrap code.
+                self._enforce_recovery_admission(time.time_ns())
                 return
             self._connection.execute("INSERT INTO campaign VALUES(1,?)", (expected,))
             for job in jobs:
@@ -625,6 +761,8 @@ class ExperimentController:
             unblocked = 0
             for (experiment_id,) in self._connection.execute("SELECT experiment_id FROM jobs WHERE state='BLOCKED_DATA' ORDER BY created_order").fetchall():
                 job = self._job(str(experiment_id))
+                if not self.recovery_collection_admitted:
+                    continue
                 sources = [item for item in job.data_sources if item.kind == "recovery"]
                 if len(sources) != 1:
                     continue
@@ -650,6 +788,9 @@ class ExperimentController:
 
         with self._lock, self._transaction():
             job = self._job(experiment_id)
+            self._enforce_recovery_admission(now_ns)
+            if self._is_recovery_job(job) and not self.recovery_collection_admitted:
+                raise ValueError("recovery AWR-style admission is not admitted by the deployment gate")
             receipt_sha = validate_awr_style_materialization_receipt(job, receipt)
             existing = self._connection.execute(
                 "SELECT receipt_sha256 FROM awr_admissions WHERE experiment_id=?",
@@ -747,6 +888,7 @@ class ExperimentController:
         """
         with self._transaction():
             self._reconcile_expired_leases(now_ns)
+            self._enforce_recovery_admission(now_ns)
             row = self._connection.execute(
                 "SELECT worker_id,capability FROM leases WHERE lease_id=? AND experiment_id=?",
                 (lease.lease_id, lease.experiment_id),
@@ -761,6 +903,7 @@ class ExperimentController:
             if manifest_set_sha256 is not None and manifest_set_sha256 != self.manifest_set_sha256():
                 raise ValueError("worker manifest set does not match controller")
             self._reconcile_expired_leases(now_ns)
+            self._enforce_recovery_admission(now_ns)
             existing = self._connection.execute("SELECT lease_id,experiment_id,expires_ns FROM leases WHERE worker_id=? AND capability=?", (worker_id, capability)).fetchone()
             if existing:
                 experiment_id = str(existing[1])
@@ -796,6 +939,17 @@ class ExperimentController:
                 if capability in {"evaluation", "final_evaluation"} and publication is None:
                     raise RuntimeError("evaluation-ready job has no verified publication")
                 job = self._job(experiment_id)
+                if self._is_recovery_job(job) and not self.recovery_collection_admitted:
+                    if capability == "final_evaluation":
+                        self._connection.execute(
+                            "UPDATE final_evaluations SET state='BLOCKED_DATA' WHERE experiment_id=?",
+                            (experiment_id,),
+                        )
+                        self._event(experiment_id, "FINAL_EVAL_BLOCKED_DATA", None, now_ns, "recovery_admission_unavailable:lease")
+                    else:
+                        self._connection.execute("UPDATE jobs SET state='BLOCKED_DATA' WHERE experiment_id=?", (experiment_id,))
+                        self._event(experiment_id, "BLOCKED_DATA", None, now_ns, "recovery_admission_unavailable:lease")
+                    continue
                 lease = JobLease(uuid.uuid4().hex, experiment_id, worker_id, capability, now_ns + lease_ns, job, publication, self._parent_publication(experiment_id) if capability == "training" else None, self._evaluation_matrix(experiment_id, capability))
                 if capability == "training" and not self._reserve_budget(lease.lease_id, lease.job, now_ns, lease_ns):
                     self._connection.execute("UPDATE jobs SET state='BLOCKED_BUDGET' WHERE experiment_id=?", (experiment_id,))
@@ -826,6 +980,7 @@ class ExperimentController:
         with self._lock:
             with self._transaction():
                 self._reconcile_expired_leases(now_ns)
+                self._enforce_recovery_admission(now_ns)
                 row = self._connection.execute("SELECT experiment_id,capability FROM leases WHERE lease_id=? AND worker_id=?", (lease_id, worker_id)).fetchone()
             if row is None:
                 raise ValueError("lease does not belong to worker")
@@ -869,6 +1024,7 @@ class ExperimentController:
         with self._lock:
             with self._transaction():
                 self._reconcile_expired_leases(now_ns)
+                self._enforce_recovery_admission(now_ns)
                 row = self._connection.execute("SELECT capability,expires_ns FROM leases WHERE lease_id=? AND experiment_id=? AND worker_id=?", (lease_id, experiment_id, worker_id)).fetchone()
             if row is None:
                 raise ValueError("invalid lease")
@@ -963,6 +1119,7 @@ class ExperimentController:
             raise ValueError("terminal receipt is invalid")
         with self._lock, self._transaction():
             self._reconcile_expired_leases(now_ns)
+            self._enforce_recovery_admission(now_ns)
             state = self._existing_terminal_receipt_state(
                 lease.lease_id, lease.experiment_id, lease.worker_id, terminal_receipt_sha256,
             )
@@ -1002,6 +1159,7 @@ class ExperimentController:
             raise ValueError("terminal receipt identity is invalid")
         with self._lock, self._transaction():
             self._reconcile_expired_leases(now_ns)
+            self._enforce_recovery_admission(now_ns)
             state = self._existing_terminal_receipt_state(
                 lease_id, experiment_id, worker_id, terminal_receipt_sha256,
             )
@@ -1020,7 +1178,10 @@ class ExperimentController:
 
     def publication_verified(self, experiment_id: str, envelope: Mapping[str, object], now_ns: int) -> str:
         with self._lock, self._transaction():
+            self._enforce_recovery_admission(now_ns)
             job = self._job(experiment_id)
+            if self._is_recovery_job(job) and not self.recovery_collection_admitted:
+                raise ValueError("recovery publication is not admitted by the deployment gate")
             row = self._connection.execute(
                 "SELECT receipt_sha256,publication,verified FROM artifacts WHERE experiment_id=?",
                 (experiment_id,),
@@ -1080,7 +1241,11 @@ class ExperimentController:
         """
         try:
             job = self._job(experiment_id)
-            if job.training.target_step != 2000 or job.admission.get("kind") != "continuation":
+            if (
+                not self._is_admissible_job(job)
+                or job.training.target_step != 2000
+                or job.admission.get("kind") != "continuation"
+            ):
                 return False
             row = self._connection.execute(
                 "SELECT pc.parent_experiment_id FROM promotion_children pc "
@@ -1151,13 +1316,19 @@ class ExperimentController:
         ``tied_runner`` bit is stored both with the candidate and materialized
         child so a partially written or tampered lineage fails closed.
         """
-        rows = self._connection.execute(
+        raw_rows = self._connection.execute(
             "SELECT pc.experiment_id,pc.tied_runner,candidate.tied_runner "
             "FROM promotion_children pc JOIN promotion_candidates candidate "
             "ON candidate.parent_experiment_id=pc.parent_experiment_id "
             "AND candidate.kind='step_2000' AND candidate.state='ADMITTED' "
             "ORDER BY pc.tied_runner,pc.experiment_id"
         ).fetchall()
+        rows = [
+            row for row in raw_rows
+            if self._is_admissible_job(self._job(str(row[0])))
+        ]
+        if not rows and raw_rows and not self.recovery_collection_admitted:
+            raise ValueError("recovery final winner is not admitted by the deployment gate")
         if not rows or len(rows) > 2:
             raise ValueError("controller finalist selection is invalid")
         finalists: dict[int, str] = {}
@@ -1194,7 +1365,13 @@ class ExperimentController:
         ):
             raise ValueError("finalist queue request is invalid")
         with self._lock, self._transaction():
+            self._enforce_recovery_admission(now_ns)
             expected = self._controller_selected_finalist_ids()
+            if (
+                not self.recovery_collection_admitted
+                and any(self._is_recovery_job(self._job(experiment_id)) for experiment_id in expected)
+            ):
+                raise ValueError("recovery final evaluation is not admitted by the deployment gate")
             if set(experiment_ids) != set(expected):
                 raise ValueError("finalist queue must contain the exact controller-selected set")
             if not all(self._is_controller_authorized_finalist(experiment_id) for experiment_id in expected):
@@ -1275,7 +1452,26 @@ class ExperimentController:
         from lehome_train.groot.experiment_winner import select_async_final_winner
 
         with self._lock, self._transaction():
-            expected = self._controller_selected_finalist_ids()
+            self._enforce_recovery_admission(now_ns)
+            try:
+                expected = self._controller_selected_finalist_ids()
+            except ValueError:
+                if (
+                    not self.recovery_collection_admitted
+                    and any(
+                        self._is_recovery_job(self._job(str(experiment_id)))
+                        for (experiment_id,) in self._connection.execute(
+                            "SELECT experiment_id FROM final_evaluations WHERE state='COMPLETED'"
+                        ).fetchall()
+                    )
+                ):
+                    raise ValueError("recovery final winner is not admitted by the deployment gate") from None
+                raise
+            if (
+                not self.recovery_collection_admitted
+                and any(self._is_recovery_job(self._job(experiment_id)) for experiment_id in expected)
+            ):
+                raise ValueError("recovery final winner is not admitted by the deployment gate")
             rows = self._connection.execute(
                 "SELECT experiment_id,matrix_sha256,state,report FROM final_evaluations "
                 "WHERE experiment_id IN (%s) ORDER BY experiment_id"
@@ -1319,9 +1515,16 @@ class ExperimentController:
         return to_evaluation_score(parsed)
 
     def _candidate_count(self, kind: str) -> int:
-        return int(self._connection.execute("SELECT COUNT(*) FROM promotion_candidates WHERE kind=? AND state IN ('PENDING','ADMITTED')", (kind,)).fetchone()[0])
+        rows = self._connection.execute(
+            "SELECT parent_experiment_id FROM promotion_candidates "
+            "WHERE kind=? AND state IN ('PENDING','ADMITTED')",
+            (kind,),
+        ).fetchall()
+        return sum(self._is_admissible_job(self._job(str(row[0]))) for row in rows)
 
     def _candidate(self, parent_id: str, kind: str, now_ns: int, *, tied_runner: bool = False) -> None:
+        if not self._is_admissible_job(self._job(parent_id)):
+            return
         self._connection.execute("INSERT OR IGNORE INTO promotion_candidates(parent_experiment_id,kind,state,created_ns,tied_runner) VALUES(?,?, 'PENDING', ?,?)", (parent_id, kind, now_ns, int(tied_runner)))
         self._event(parent_id, "PENDING_PROMOTION", None, now_ns, kind)
 
@@ -1330,12 +1533,20 @@ class ExperimentController:
         scores: list[EvaluationScore] = []
         for experiment_id, encoded in rows:
             job = self._job(str(experiment_id))
-            if job.training.target_step == target_step:
+            if self._is_admissible_job(job) and job.training.target_step == target_step:
                 scores.append(self._score(str(experiment_id), json.loads(encoded)))
         return scores
 
     def _candidate_parents(self, kind: str) -> set[str]:
-        return {str(row[0]) for row in self._connection.execute("SELECT parent_experiment_id FROM promotion_candidates WHERE kind=? AND state IN ('PENDING','ADMITTED')", (kind,)).fetchall()}
+        return {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT parent_experiment_id FROM promotion_candidates "
+                "WHERE kind=? AND state IN ('PENDING','ADMITTED')",
+                (kind,),
+            ).fetchall()
+            if self._is_admissible_job(self._job(str(row[0])))
+        }
 
     def _ranked_initial_500(self, current: EvaluationScore | None = None) -> list[EvaluationScore]:
         values: list[EvaluationScore] = []
@@ -1345,7 +1556,10 @@ class ExperimentController:
                 values.append(score)
         if current is not None:
             current_job = self._job(current.experiment_id)
-            if current_job.admission.get("kind") != "seed_repeat":
+            if (
+                self._is_admissible_job(current_job)
+                and current_job.admission.get("kind") != "seed_repeat"
+            ):
                 values.append(current)
         return sorted((score for score in values if not score.safety_failure), key=rank_key, reverse=True)
 
@@ -1448,7 +1662,7 @@ class ExperimentController:
         return set(seed_parents) if initial_leader != repeat_leader else {initial_leader}
 
     def _all_admitted_one_k_terminal(self, current_id: str | None = None) -> bool:
-        """Close the 2K rung only after the six-result initial field closes.
+        """Close 2K only after the active initial and 1K fields close.
 
         The 2/4/6 ASHA closures intentionally let 1K continuations start
         early.  Those early results are not, however, a complete finalist
@@ -1456,11 +1670,32 @@ class ExperimentController:
         slot.  The 2K comparison is therefore meaningful only after six valid
         initial evaluations have selected all three continuations.
         """
-        if len(self._ranked_initial_500()) < 6:
-            return False
+        ranked_initial = self._ranked_initial_500()
+        if self.recovery_collection_admitted:
+            if len(ranked_initial) < 6:
+                return False
+        else:
+            ordinary_initial_count = sum(
+                self._is_admissible_job(self._job(str(experiment_id)))
+                and self._job(str(experiment_id)).training.target_step == 500
+                and self._job(str(experiment_id)).admission.get("kind") == "initial"
+                for (experiment_id,) in self._connection.execute("SELECT experiment_id FROM jobs")
+            )
+            if ordinary_initial_count == 0 or len(ranked_initial) < ordinary_initial_count:
+                return False
         rows = self._connection.execute("SELECT pc.experiment_id,j.state FROM promotion_children pc JOIN jobs j ON j.experiment_id=pc.experiment_id WHERE j.capability='training'").fetchall()
-        admitted = [(str(experiment_id), str(state)) for experiment_id, state in rows if self._job(str(experiment_id)).training.target_step == 1000]
-        if len(admitted) != 3:
+        admitted = [
+            (str(experiment_id), str(state))
+            for experiment_id, state in rows
+            if (
+                self._is_admissible_job(self._job(str(experiment_id)))
+                and self._job(str(experiment_id)).training.target_step == 1000
+            )
+        ]
+        if self.recovery_collection_admitted:
+            if len(admitted) != 3:
+                return False
+        elif not admitted:
             return False
         terminal = {"COMPLETED", "PROMOTED", "REJECTED", "BLOCKED_INFRA"}
         return all(experiment_id == current_id or state in terminal for experiment_id, state in admitted)
@@ -1484,6 +1719,7 @@ class ExperimentController:
         """Advance unaffected candidates after a terminal non-report outcome."""
         if job.training.target_step == 500:
             self._admit_ranked_initial_candidates(now_ns)
+            self._admit_closed_two_k_field(None, now_ns)
         elif job.training.target_step == 1000:
             self._admit_closed_two_k_field(None, now_ns)
 
@@ -1549,11 +1785,30 @@ class ExperimentController:
     def _materialize_pending_candidates(self, now_ns: int) -> None:
         rows = self._connection.execute("SELECT parent_experiment_id,kind FROM promotion_candidates WHERE state='PENDING' ORDER BY created_ns,parent_experiment_id,kind").fetchall()
         for parent_id, kind in rows:
-            self.promote(str(parent_id), self._generated_child(str(parent_id), str(kind)), now_ns)
+            parent_id, kind = str(parent_id), str(kind)
+            if (
+                not self.recovery_collection_admitted
+                and self._is_recovery_job(self._job(parent_id))
+            ):
+                self._connection.execute(
+                    "UPDATE promotion_candidates SET state='REVOKED' "
+                    "WHERE parent_experiment_id=? AND kind=?",
+                    (parent_id, kind),
+                )
+                self._event(
+                    parent_id,
+                    "PROMOTION_REVOKED",
+                    None,
+                    now_ns,
+                    "recovery_admission_unavailable:" + kind,
+                )
+                continue
+            self.promote(parent_id, self._generated_child(parent_id, kind), now_ns)
 
     def reconcile_pending_candidates(self, now_ns: int) -> None:
         """Restart repair for a process killed before an older controller commit."""
         with self._lock, self._transaction():
+            self._enforce_recovery_admission(now_ns)
             self._materialize_pending_candidates(now_ns)
 
     def submit_evaluation(self, lease: JobLease, report: Mapping[str, object], now_ns: int) -> None:
@@ -1582,10 +1837,22 @@ class ExperimentController:
                 self._connection.execute("INSERT OR REPLACE INTO evaluations VALUES(?,?,?)", (lease.experiment_id, json.dumps(dict(report), sort_keys=True, separators=(",", ":")), now_ns))
                 state = self._admit_async_candidates(job, score, report, now_ns)
                 self._finish(lease, state, now_ns, "evaluation submitted")
+                if job.training.target_step == 500:
+                    # The final admissible 500-step result can arrive after
+                    # its already-run 1K continuation.  Recheck only after
+                    # this receipt is durable, so a reduced A/B/C field is
+                    # allowed to close without inventing a seventh score.
+                    self._admit_closed_two_k_field(None, now_ns)
                 self._materialize_pending_candidates(now_ns)
 
     def promote(self, parent_experiment_id: str, child: ExperimentJob, now_ns: int) -> None:
         with self._lock, self._maybe_transaction():
+            self._enforce_recovery_admission(now_ns)
+            if (
+                not self.recovery_collection_admitted
+                and (self._is_recovery_job(self._job(parent_experiment_id)) or self._is_recovery_job(child))
+            ):
+                raise ValueError("recovery promotion is not admitted by the deployment gate")
             parent = self._connection.execute("SELECT receipt_sha256 FROM jobs WHERE experiment_id=? AND state IN ('COMPLETED','PROMOTED')", (parent_experiment_id,)).fetchone()
             evaluation = self._connection.execute("SELECT 1 FROM evaluations WHERE experiment_id=?", (parent_experiment_id,)).fetchone()
             if parent is None or evaluation is None or parent_experiment_id not in child.dependencies:

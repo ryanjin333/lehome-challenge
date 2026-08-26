@@ -8,6 +8,9 @@ MATRIX="${LEHOME_CONTROLLED_RECOVERY_MATRIX:-}"
 EXPECTED_SHA256="${LEHOME_CONTROLLED_RECOVERY_MATRIX_SHA256:-}"
 MATERIALIZATION="${LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION:-}"
 MATERIALIZATION_SHA256="${LEHOME_CONTROLLED_RECOVERY_MATERIALIZATION_SHA256:-}"
+DEPLOYMENT_GATE="${LEHOME_DEPLOYMENT_GATE_PATH:-/etc/lehome/experiment-deployment-gate.json}"
+DEPLOYMENT_GATE_SHA256="${LEHOME_DEPLOYMENT_GATE_SHA256:-}"
+TRAINER_SRC="${LEHOME_TRAINER_SRC:-/opt/lehome/trainer/src}"
 WORKER_COUNT="${LEHOME_WORKER_COUNT:-4}"
 MAX_ATTEMPTS="${LEHOME_MAX_ATTEMPTS:-96}"
 TARGET_ACCEPTED="${LEHOME_TARGET_ACCEPTED:-8}"
@@ -25,6 +28,19 @@ if [ "${TARGET_ACCEPTED}" != "8" ]; then echo "LEHOME_TARGET_ACCEPTED must be ex
 if ! [[ "${MAX_ATTEMPTS}" =~ ^([8-9]|[1-8][0-9]|9[0-6])$ ]]; then echo "LEHOME_MAX_ATTEMPTS must be in 8..96" >&2; exit 2; fi
 for path in "${MATRIX}" "${MATERIALIZATION}"; do if [[ "${path}" != /* ]] || [ -L "${path}" ] || [ ! -f "${path}" ] || [ -L "${path}.sha256" ] || [ ! -f "${path}.sha256" ]; then echo "controlled recovery artifact is unsafe" >&2; exit 2; fi; done
 for expected in "${EXPECTED_SHA256}" "${MATERIALIZATION_SHA256}"; do if ! [[ "${expected}" =~ ^[0-9a-f]{64}$ ]]; then echo "controlled recovery SHA-256 is invalid" >&2; exit 2; fi; done
+if [[ "${DEPLOYMENT_GATE}" != /* ]] || [ -L "${DEPLOYMENT_GATE}" ] || [ ! -f "${DEPLOYMENT_GATE}" ] || ! [[ "${DEPLOYMENT_GATE_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "controlled recovery requires an immutable deployment gate path and SHA-256" >&2
+  exit 2
+fi
+PYTHONPATH="${TRAINER_SRC}${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${DEPLOYMENT_GATE}" "${DEPLOYMENT_GATE_SHA256}" <<'PY'
+import sys
+from lehome_train.groot.experiment_deployment_gate import (
+    load_deployment_gate,
+    require_recovery_collection_admission,
+)
+
+require_recovery_collection_admission(load_deployment_gate(sys.argv[1], sys.argv[2]))
+PY
 if [ "$(sha256sum "${MATRIX}" | awk '{print $1}')" != "${EXPECTED_SHA256}" ] || [ "$(tr -d '\r\n' < "${MATRIX}.sha256")" != "${EXPECTED_SHA256}" ] || [ "$(sha256sum "${MATERIALIZATION}" | awk '{print $1}')" != "${MATERIALIZATION_SHA256}" ] || [ "$(tr -d '\r\n' < "${MATERIALIZATION}.sha256")" != "${MATERIALIZATION_SHA256}" ]; then echo "controlled recovery artifact SHA-256 mismatch" >&2; exit 2; fi
 
 python3 - "${MATRIX}" "${MATERIALIZATION}" "${EXPECTED_SHA256}" "${MAX_ATTEMPTS}" <<'PY'

@@ -632,9 +632,26 @@ class GarmentObject(SingleClothPrim):
             ori_world: the current world orientation of the garment (This parameter is suitable for cpu version, which will be set to None in gpu version)
         """
         if self._device == "cpu":
-            pos_world, ori_world = self.get_world_pose()
-            scale_world = self.get_world_scale()
-            mesh_points = self._get_points_pose().detach().cpu().numpy()
+            # ``SingleClothPrim`` pose access delegates to ``ClothPrim`` and
+            # lazily initializes a particle-cloth tensor view while the
+            # timeline is running. CpuSimulationView cannot create that view.
+            # The parent Xform is the authoritative CPU pose and remains a
+            # normal USD prim, so read it directly alongside the USD points.
+            pos_world, ori_world = self.world_prim.get_world_pose()
+            scale_world = self.world_prim.get_world_scale()
+            points_attribute = self._prim.GetAttribute("points")
+            if points_attribute is None or not callable(getattr(points_attribute, "Get", None)):
+                raise RuntimeError("CPU garment USD points are unavailable")
+            points = points_attribute.Get()
+            if points is None:
+                raise RuntimeError("CPU garment USD points are unset")
+            mesh_points = np.asarray(points, dtype=np.float32)
+            if (
+                mesh_points.ndim != 2
+                or mesh_points.shape[1:] != (3,)
+                or not np.isfinite(mesh_points).all()
+            ):
+                raise RuntimeError("CPU garment USD points are invalid")
             transformed_mesh_points = self.transform_points(
                 mesh_points,
                 pos_world.detach().cpu().numpy(),

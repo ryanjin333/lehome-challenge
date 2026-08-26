@@ -1,7 +1,15 @@
+import hashlib
+import json
+
 import pytest
 
 from lehome.flywheel.hard_mining import FailureEvidence, rank_failures
-from scripts.build_hard_state_recovery_matrix import _progress, build_matrix, main as build_matrix_main
+from scripts.build_hard_state_recovery_matrix import (
+    _progress,
+    build_matrix,
+    collect_failures,
+    main as build_matrix_main,
+)
 
 
 def test_near_miss_outranks_dead_terminal_even_with_a_smaller_category_gap() -> None:
@@ -42,7 +50,7 @@ def test_ranking_preserves_an_explicit_official_return_without_diagnostic_substi
     assert ranked[0].diagnostics["max_progress"] == 0.2
 
 
-def test_recovery_matrix_excludes_dead_terminals_and_records_near_miss_evidence() -> None:
+def test_recovery_matrix_excludes_unverified_near_misses_and_dead_terminals() -> None:
     rows = [
         {
             "episode_id": "top-short-near",
@@ -74,13 +82,7 @@ def test_recovery_matrix_excludes_dead_terminals_and_records_near_miss_evidence(
         limit=40,
     )
 
-    assert [row["source_episode_id"] for row in matrix] == ["top-short-near"]
-    assert matrix[0]["selection_profile"] == "near_miss_v1"
-    assert matrix[0]["selection_evidence"] == {
-        "max_progress": 0.7,
-        "stall_fraction": 0.1,
-        "eligible_for_recovery": True,
-    }
+    assert matrix == []
 
 
 def test_matrix_builder_defaults_to_a_new_near_miss_artifact(tmp_path) -> None:
@@ -100,3 +102,135 @@ def test_progress_uses_peak_step_reward_and_counts_only_the_trailing_stall() -> 
     ]
 
     assert _progress({"outcome": "timeout"}, annotations) == (0.70, 2)
+
+
+def test_failure_audit_restores_nearest_snapshot_at_reward_drop_not_terminal(tmp_path) -> None:
+    raw = tmp_path / "campaign" / "worker" / "raw" / "episode-a"
+    continuations = raw / "snapshots" / "continuations"
+    continuations.mkdir(parents=True)
+    (raw / "episode.json").write_text(
+        '{"accepted_success":false,"episode_id":"episode-a","identity":'
+        '{"category":"top_short","garment_name":"Top_Short_Seen_0","seed":7}}\n',
+        encoding="utf-8",
+    )
+    annotations = [
+        {"step": 0, "success": False, "reward": 0.10},
+        {"step": 16, "success": False, "reward": 0.52},
+        {"step": 32, "success": False, "reward": 0.50},
+        {"step": 35, "success": False, "reward": 0.33},
+    ]
+    (raw / "annotations.jsonl").write_text(
+        "".join(f"{__import__('json').dumps(row)}\n" for row in annotations),
+        encoding="utf-8",
+    )
+    (raw / "snapshots" / "terminal.json").write_text("{}\n", encoding="utf-8")
+    for step in (16, 32):
+        (continuations / f"{step:06d}.json").write_text(json.dumps({
+            "schema_version": 3,
+            "robot_position": [0.0] * 12,
+            "robot_velocity": [0.0] * 12,
+            "cloth_position": [[0.0, 0.0, 0.0]],
+            "cloth_velocity": [[0.0, 0.0, 0.0]],
+            "rng_state": {},
+            "garment_name": "Top_Short_Seen_0",
+            "randomization": {"strategy": "canonical", "continuation_step": step},
+            "scene_state": {"garment_reset_pose": [0.0, 0.0, 0.67, 0.0, 0.0, 90.0]},
+            "cloth_state_authority": "usd_local_points_v1",
+        }) + "\n", encoding="utf-8")
+
+    failures = collect_failures(tmp_path / "campaign")
+
+    assert len(failures) == 1
+    assert failures[0]["restore_snapshot"] == str(continuations / "000032.json")
+    assert failures[0]["restore_snapshot_sha256"] == hashlib.sha256(
+        (continuations / "000032.json").read_bytes()
+    ).hexdigest()
+    assert failures[0]["restore_snapshot_cloth_frame"] == "usd_local_points_v1"
+    assert failures[0]["restore_snapshot_step"] == 32
+    assert failures[0]["moment_of_ruin"] == {
+        "signal": "dense_reward_proxy_no_success_head",
+        "peak_progress": 0.52,
+        "peak_step": 16,
+        "detection_step": 35,
+        "restore_step": 32,
+        "progress_drop": pytest.approx(0.19),
+        "drop_threshold": 0.12,
+        "minimum_peak": 0.25,
+    }
+
+
+def test_recovery_matrix_binds_moment_of_ruin_snapshot_and_evidence() -> None:
+    moment = {
+        "signal": "dense_reward_proxy_no_success_head",
+        "peak_progress": 0.7,
+        "peak_step": 32,
+        "detection_step": 47,
+        "restore_step": 32,
+        "progress_drop": 0.2,
+        "drop_threshold": 0.12,
+        "minimum_peak": 0.25,
+    }
+    rows = [{
+        "episode_id": "near-miss",
+        "episode_path": "/campaign/near-miss/episode.json",
+        "terminal_path": "/campaign/near-miss/terminal.json",
+        "restore_snapshot": "/campaign/near-miss/continuations/000032.json",
+        "restore_snapshot_sha256": "a" * 64,
+        "restore_snapshot_cloth_frame": "usd_local_points_v1",
+        "restore_snapshot_step": 32,
+        "moment_of_ruin": moment,
+        "category": "top_short",
+        "garment": "Top_Short_Seen_0",
+        "seed": 11,
+        "max_progress": 0.7,
+        "stalled_steps": 10,
+        "length": 100,
+        "restorable": True,
+    }]
+
+    matrix = build_matrix(rows, category_success={"top_short": 0.25}, limit=1)
+
+    assert matrix[0]["restore_snapshot"] == rows[0]["restore_snapshot"]
+    assert matrix[0]["restore_snapshot_sha256"] == "a" * 64
+    assert matrix[0]["restore_snapshot_cloth_frame"] == "usd_local_points_v1"
+    assert matrix[0]["restore_snapshot_step"] == 32
+    assert matrix[0]["replay_kind"] == "verified_hard_state_moment_of_ruin_v1"
+    assert matrix[0]["parent_episode_id"] == "near-miss"
+    assert matrix[0]["lineage_id"] == "near-miss"
+    assert matrix[0]["selection_profile"] == "moment_of_ruin_reward_drop_v1"
+    assert matrix[0]["selection_evidence"]["moment_of_ruin"] == moment
+
+
+def test_failure_audit_rejects_a_cuda_cloth_restore_for_cpu_only_hard_state_collection(tmp_path) -> None:
+    raw = tmp_path / "campaign" / "worker" / "raw" / "episode-a"
+    continuations = raw / "snapshots" / "continuations"
+    continuations.mkdir(parents=True)
+    (raw / "episode.json").write_text(json.dumps({
+        "accepted_success": False,
+        "episode_id": "episode-a",
+        "identity": {"category": "top_short", "garment_name": "Top_Short_Seen_0", "seed": 7},
+    }) + "\n", encoding="utf-8")
+    (raw / "annotations.jsonl").write_text(
+        json.dumps({"step": 16, "success": False, "reward": 0.5}) + "\n"
+        + json.dumps({"step": 32, "success": False, "reward": 0.2}) + "\n",
+        encoding="utf-8",
+    )
+    (raw / "snapshots" / "terminal.json").write_text("{}\n", encoding="utf-8")
+    (continuations / "000032.json").write_text(json.dumps({
+        "schema_version": 2,
+        "robot_position": [0.0] * 12,
+        "robot_velocity": [0.0] * 12,
+        "cloth_position": [[0.0, 0.0, 0.0]],
+        "cloth_velocity": [[0.0, 0.0, 0.0]],
+        "rng_state": {},
+        "garment_name": "Top_Short_Seen_0",
+        "randomization": {"strategy": "canonical", "continuation_step": 32},
+        "scene_state": {"garment_reset_pose": [0.0, 0.0, 0.67, 0.0, 0.0, 90.0]},
+        "cloth_state_authority": "physx_cloth_view_world_v1",
+    }) + "\n", encoding="utf-8")
+
+    failures = collect_failures(tmp_path / "campaign")
+
+    assert len(failures) == 1
+    assert failures[0]["restorable"] is False
+    assert failures[0]["restore_snapshot"] is None

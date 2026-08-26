@@ -146,6 +146,9 @@ from lehome_train.groot.experiment_deployment_gate import load_deployment_gate
 
 load_deployment_gate(sys.argv[1], sys.argv[2])
 PY
+# A schema-v2 gate may record recovery admission as unavailable after a
+# fidelity failure. That still admits the independent ordinary A/B/C jobs and
+# their normal evaluation; it never admits recovery collection or D--G.
 observed_promotion_sha256="$(python3 - "${PROMOTION_MATRIX}" <<'PY'
 import hashlib
 import pathlib
@@ -450,6 +453,7 @@ copy_rollout "${HF_TOKEN_FILE}" /tmp/lehome-hf-token
 copy_rollout "${PROMOTION_MATRIX}" /tmp/lehome-promotion-matrix.json
 copy_rollout "${FINAL_MATRIX}" /tmp/lehome-final-matrix.json
 copy_rollout "${PROMOTION_BASELINE_EVIDENCE}" /tmp/lehome-promotion-baseline-evidence.json
+copy_rollout "${DEPLOYMENT_GATE}" /tmp/lehome-experiment-deployment-gate.json
 remote_rollout "sudo bash -s -- '${CONTROLLER_IP}' '${TLS_PORT}' '${MANIFEST_SET_SHA256}' '${PROMOTION_MATRIX_SHA256}' '${FINAL_MATRIX_SHA256}' '${PROMOTION_BASELINE_EVIDENCE_SHA256}' '${FINAL_REPORT_REPOSITORY}' '${DEPLOYMENT_GATE_SHA256}'" <<'REMOTE'
 set -euo pipefail
 CONTROLLER_IP="$1"; TLS_PORT="$2"; MANIFEST_SET_SHA256="$3"; PROMOTION_MATRIX_SHA256="$4"; FINAL_MATRIX_SHA256="$5"; PROMOTION_BASELINE_EVIDENCE_SHA256="$6"; FINAL_REPORT_REPOSITORY="$7"; DEPLOYMENT_GATE_SHA256="$8"
@@ -462,10 +466,12 @@ install -m 0644 -o root -g root /tmp/lehome-controller-ca.crt /etc/lehome/tls/co
 install -m 0444 -o root -g root /tmp/lehome-promotion-matrix.json /mnt/lehome/experiment-pool/evaluation/promotion-matrix.json
 install -m 0444 -o root -g root /tmp/lehome-final-matrix.json /mnt/lehome/experiment-pool/evaluation/final-matrix.json
 install -m 0444 -o root -g root /tmp/lehome-promotion-baseline-evidence.json /mnt/lehome/experiment-pool/evaluation/promotion-baseline-evidence.json
-rm -f /tmp/lehome-controller-token /tmp/lehome-hf-token /tmp/lehome-controller-ca.crt /tmp/lehome-promotion-matrix.json /tmp/lehome-final-matrix.json /tmp/lehome-promotion-baseline-evidence.json
+install -m 0444 -o root -g root /tmp/lehome-experiment-deployment-gate.json /etc/lehome/experiment-deployment-gate.json
+rm -f /tmp/lehome-controller-token /tmp/lehome-hf-token /tmp/lehome-controller-ca.crt /tmp/lehome-promotion-matrix.json /tmp/lehome-final-matrix.json /tmp/lehome-promotion-baseline-evidence.json /tmp/lehome-experiment-deployment-gate.json
 printf '%s  %s\n' "${PROMOTION_MATRIX_SHA256}" /mnt/lehome/experiment-pool/evaluation/promotion-matrix.json | sha256sum --check --strict
 printf '%s  %s\n' "${FINAL_MATRIX_SHA256}" /mnt/lehome/experiment-pool/evaluation/final-matrix.json | sha256sum --check --strict
 printf '%s  %s\n' "${PROMOTION_BASELINE_EVIDENCE_SHA256}" /mnt/lehome/experiment-pool/evaluation/promotion-baseline-evidence.json | sha256sum --check --strict
+printf '%s  %s\n' "${DEPLOYMENT_GATE_SHA256}" /etc/lehome/experiment-deployment-gate.json | sha256sum --check --strict
 cat > /etc/lehome/experiment-evaluator.env <<EOF
 LEHOME_CONTROLLER_URL=https://${CONTROLLER_IP}:${TLS_PORT}
 LEHOME_CONTROLLER_CA_FILE=/etc/lehome/tls/controller-ca.crt
@@ -484,6 +490,7 @@ LEHOME_FINAL_REPORT_REPOSITORY=${FINAL_REPORT_REPOSITORY}
 LEHOME_FINAL_REPORT_PREFIX=final-unseen80/
 LEHOME_FINAL_SEEN_REGRESSION_HANDOFF_ROOT=/mnt/lehome/experiment-pool/evaluation/seen-regression-handoffs
 LEHOME_CONTROLLER_TLS_PROXY_REQUIRED=1
+LEHOME_DEPLOYMENT_GATE_PATH=/etc/lehome/experiment-deployment-gate.json
 LEHOME_DEPLOYMENT_GATE_SHA256=${DEPLOYMENT_GATE_SHA256}
 EOF
 chown root:root /etc/lehome/experiment-evaluator.env
@@ -538,10 +545,12 @@ grep -qx "LEHOME_MANIFEST_SET_SHA256=${MANIFEST_SET_SHA256}" /etc/lehome/experim
 grep -qx "LEHOME_PROMOTION_MATRIX_SHA256=${PROMOTION_MATRIX_SHA256}" /etc/lehome/experiment-evaluator.env
 grep -qx "LEHOME_FINAL_MATRIX_SHA256=${FINAL_MATRIX_SHA256}" /etc/lehome/experiment-evaluator.env
 grep -qx "LEHOME_PROMOTION_BASELINE_EVIDENCE_SHA256=${PROMOTION_BASELINE_EVIDENCE_SHA256}" /etc/lehome/experiment-evaluator.env
+grep -qx "LEHOME_DEPLOYMENT_GATE_PATH=/etc/lehome/experiment-deployment-gate.json" /etc/lehome/experiment-evaluator.env
 grep -qx "LEHOME_DEPLOYMENT_GATE_SHA256=${DEPLOYMENT_GATE_SHA256}" /etc/lehome/experiment-evaluator.env
 test "$(stat -c '%a:%u:%g' /etc/lehome/experiment-evaluator.env)" = 600:0:0
 test "$(stat -c '%a:%u:%g' /etc/lehome/private/controller-token)" = 600:0:0
 test "$(stat -c '%a:%u:%g' /etc/lehome/private/hf-token)" = 600:0:0
+test "$(stat -c '%a:%u:%g' /etc/lehome/experiment-deployment-gate.json)" = 444:0:0
 curl --silent --show-error --fail --connect-timeout 10 --cacert /etc/lehome/tls/controller-ca.crt "https://${CONTROLLER_IP}:${TLS_PORT}/health" | grep -qx '{"status":"ok"}'
 systemctl is-enabled lehome-experiment-evaluator.service | grep -qx disabled
 REMOTE

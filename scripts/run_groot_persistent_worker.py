@@ -19,6 +19,8 @@ _CUDA_DEVICE = re.compile(r"^cuda:([0-9]+)$")
 _DEFAULT_POLICY_REPO = "ryanjin333/lehome-groot-n17-models"
 _DEFAULT_POLICY_REVISION = "30ac1a84da67b099e115ad147bcd61e9d60046d3"
 _DEFAULT_POLICY_ARTIFACT_SHA256 = "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"
+_TERMINAL_EVALUATION_CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
+_TERMINAL_EVALUATION_ROW_KEYS = {"trial_id", "category", "garment_name", "release_stage", "seed"}
 
 
 class LedgerWorkerController:
@@ -78,6 +80,75 @@ def _load_matrix(path: Path) -> list[Mapping[str, object]]:
     return load_attempt_matrix(path)
 
 
+def _is_cpu_terminal_evaluation(matrix: list[Mapping[str, object]], args: argparse.Namespace) -> bool:
+    """Accept only the terminal-evaluation contract already admitted by the shell."""
+
+    if (
+        os.environ.get("LEHOME_EVALUATION_TERMINAL_UPLOAD") != "1"
+        or len(matrix) not in {20, 24, 80}
+        or type(args.max_attempts) is not int
+        or args.max_attempts != len(matrix)
+        or type(args.target_accepted) is not int
+        or args.target_accepted != len(matrix)
+    ):
+        return False
+    seen_development = len(matrix) == 24
+    expected_release_stage = "seen" if seen_development else "public_unseen"
+    expected_per_category = len(matrix) // len(_TERMINAL_EVALUATION_CATEGORIES)
+    category_counts = {category: 0 for category in _TERMINAL_EVALUATION_CATEGORIES}
+    trial_ids: set[str] = set()
+    identities: set[tuple[object, ...]] = set()
+    for row in matrix:
+        if set(row) != _TERMINAL_EVALUATION_ROW_KEYS:
+            return False
+        trial_id = row.get("trial_id")
+        category = row.get("category")
+        garment_name = row.get("garment_name")
+        release_stage = row.get("release_stage")
+        seed = row.get("seed")
+        if (
+            type(trial_id) is not str
+            or not trial_id
+            or category not in category_counts
+            or type(garment_name) is not str
+            or not garment_name
+            or release_stage != expected_release_stage
+            or type(seed) is not int
+            or seed < 0
+        ):
+            return False
+        identity = (category, garment_name, seed)
+        if trial_id in trial_ids or identity in identities:
+            return False
+        trial_ids.add(trial_id)
+        identities.add(identity)
+        category_counts[category] += 1
+    if not all(count == expected_per_category for count in category_counts.values()):
+        return False
+    if not seen_development:
+        return True
+    prefixes = {
+        "top_long": "Top_Long", "top_short": "Top_Short",
+        "pant_long": "Pant_Long", "pant_short": "Pant_Short",
+    }
+    expected_rows = {
+        (
+            f"{category.replace('_', '-')}-seen-{garment_index}-seed-{seed}",
+            category,
+            f"{prefixes[category]}_Seen_{garment_index}",
+            "seen",
+            seed,
+        )
+        for category in _TERMINAL_EVALUATION_CATEGORIES
+        for garment_index in range(2)
+        for seed in (42, 43, 44)
+    }
+    return {
+        (row["trial_id"], row["category"], row["garment_name"], row["release_stage"], row["seed"])
+        for row in matrix
+    } == expected_rows
+
+
 def build_parser() -> argparse.ArgumentParser:
     from scripts.utils.parser import setup_eval_parser
 
@@ -99,7 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-device", required=True, help="physical CUDA device used by the policy gateway")
     parser.add_argument(
         "--simulator-device", default=None,
-        help="cloth simulator device; CPU is admitted only for snapshot-source bootstrap diagnostics",
+        help="cloth simulator device; CPU is admitted only for authenticated recovery or terminal evaluation",
     )
     parser.add_argument("--policy-gateway-endpoint", required=True)
     parser.add_argument("--policy-sha256", required=True)
@@ -151,6 +222,8 @@ def _build_cloth_session(args: argparse.Namespace):
     _progress("parse_env_cfg")
     env_cfg = parse_env_cfg(args.task, device=args.device)
     env_cfg.sim.use_fabric = False
+    if args.device == "cpu":
+        env_cfg.wait_for_textures = False
     env_cfg.seed = args.seed
     env_cfg.random_seed = args.seed
     env_cfg.garment_cfg_base_path = args.garment_cfg_base_path
@@ -212,8 +285,18 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
         raise ValueError("source finalization timeout seconds must be positive")
     if args.device != "cpu" and (args.device != args.renderer_device or _CUDA_DEVICE.fullmatch(args.device) is None):
         raise ValueError("persistent worker simulator device is not bound to the requested backend")
+    terminal_evaluation = os.environ.get("LEHOME_EVALUATION_TERMINAL_UPLOAD") == "1"
+    success_replay_campaign = os.environ.get("LEHOME_SUCCESS_REPLAY_CAMPAIGN") == "1"
+    hard_state_campaign = os.environ.get("LEHOME_HARD_STATE_CAMPAIGN") == "1"
+    if sum((terminal_evaluation, success_replay_campaign, hard_state_campaign)) > 1:
+        raise ValueError("persistent CPU campaign mode markers are mutually exclusive")
+    if terminal_evaluation and args.device != "cpu":
+        raise ValueError("terminal evaluation requires CPU cloth")
     matrix = _load_matrix(args.attempt_matrix)
-    if args.device == "cpu":
+    if terminal_evaluation:
+        if not _is_cpu_terminal_evaluation(matrix, args):
+            raise ValueError("terminal evaluation matrix is invalid")
+    elif args.device == "cpu":
         controlled_teacher_smoke = (
             len(matrix) == 1
             and args.max_attempts == 1
@@ -225,8 +308,38 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
             and matrix[0].get("controlled_smoke_perturbation_mode")
             == "zero_perturbation_teacher_continuation_probe_v1"
         )
-        if controlled_teacher_smoke:
+        if success_replay_campaign:
+            from lehome.flywheel.recovery_collection import validate_success_replay_descriptor
+
+            try:
+                validate_success_replay_descriptor(args.attempt_matrix)
+                if (
+                    type(args.max_attempts) is not int
+                    or args.max_attempts != len(matrix)
+                    or type(args.target_accepted) is not int
+                    or not 1 <= args.target_accepted <= min(150, len(matrix))
+                ):
+                    raise ValueError("CPU success replay attempt bounds are invalid")
+            except (OSError, TypeError, ValueError) as error:
+                raise ValueError("CPU success replay campaign is invalid") from error
+        elif hard_state_campaign:
+            from lehome.flywheel.recovery_collection import validate_hard_state_descriptor
+
+            try:
+                validate_hard_state_descriptor(args.attempt_matrix)
+                if (
+                    type(args.max_attempts) is not int
+                    or args.max_attempts != len(matrix)
+                    or type(args.target_accepted) is not int
+                    or not 1 <= args.target_accepted <= min(150, len(matrix))
+                ):
+                    raise ValueError("CPU hard-state attempt bounds are invalid")
+            except (OSError, TypeError, ValueError) as error:
+                raise ValueError("CPU hard-state campaign is invalid") from error
+        elif controlled_teacher_smoke:
             pass  # _load_matrix already authenticates the descriptor mode identity.
+        elif _is_cpu_terminal_evaluation(matrix, args):
+            pass  # The shell marker and frozen public-unseen matrix bind terminal evaluation.
         else:
             from lehome.flywheel.recovery_collection import (
                 validate_snapshot_source_descriptor,
@@ -235,9 +348,11 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
 
             try:
                 # The retained one-row historical replay form is validated by its
-                # existing checksum/frame gate.  Every fresh CPU discovery row is
-                # otherwise an ordinary, same-category source descriptor.
-                if len(matrix) == 1 and matrix[0].get("replay_kind") == "verified_success_reset_v1":
+                # existing checksum/frame gate. Every fresh CPU discovery row is
+                # otherwise an ordinary bounded source descriptor.
+                if len(matrix) == 1 and matrix[0].get("replay_kind") in {
+                    "verified_success_reset_v1", "verified_success_early_snapshot_v1",
+                }:
                     validate_snapshot_source_descriptor(args.attempt_matrix)
                 else:
                     validate_snapshot_source_discovery_descriptor(args.attempt_matrix)
@@ -245,12 +360,12 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
                     type(args.max_attempts) is not int
                     or args.max_attempts != len(matrix)
                     or type(args.target_accepted) is not int
-                    or not 1 <= args.target_accepted <= min(4, len(matrix))
+                    or not 1 <= args.target_accepted <= min(150, len(matrix))
                 ):
                     raise ValueError("CPU source discovery attempt bounds are invalid")
             except (OSError, TypeError, ValueError) as error:
                 raise ValueError(
-                    "CPU cloth is reserved for bounded snapshot-source bootstrap discovery"
+                    "CPU cloth is reserved for bounded snapshot-source bootstrap discovery or terminal public-unseen evaluation"
                 ) from error
     ledger = ledger_factory(
         args.database, attempt_matrix=matrix, max_attempts=args.max_attempts,

@@ -198,6 +198,73 @@ def test_cpu_success_checkpoints_preserve_authored_mesh_indices(
     assert positions == [[200.0, 0.0, 0.0]]
 
 
+def test_cpu_garment_mesh_points_read_usd_without_cloth_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/assets/object/Garment.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "get_current_mesh_points"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    class TensorLike:
+        def __init__(self, value):
+            self.value = np.asarray(value, dtype=np.float32)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.value
+
+    authored_points = [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]]
+    points_attribute = types.SimpleNamespace(Get=lambda: authored_points)
+    garment = types.SimpleNamespace(
+        _device="cpu",
+        _prim=types.SimpleNamespace(GetAttribute=lambda name: points_attribute if name == "points" else None),
+        world_prim=types.SimpleNamespace(
+            get_world_pose=lambda: (TensorLike([10.0, 20.0, 30.0]), TensorLike([1.0, 0.0, 0.0, 0.0])),
+            get_world_scale=lambda: TensorLike([1.0, 1.0, 1.0]),
+        ),
+        _get_points_pose=lambda: (_ for _ in ()).throw(
+            AssertionError("CPU mesh reads must not construct a cloth view")
+        ),
+        get_world_pose=lambda: (_ for _ in ()).throw(
+            AssertionError("CPU mesh pose reads must not use the cloth prim view")
+        ),
+        get_world_scale=lambda: (_ for _ in ()).throw(
+            AssertionError("CPU mesh scale reads must not use the cloth prim view")
+        ),
+        transform_points=lambda points, pos, _ori, scale: points * scale + pos,
+    )
+    fake_open3d = types.SimpleNamespace(
+        geometry=types.SimpleNamespace(PointCloud=lambda: types.SimpleNamespace(points=None)),
+        utility=types.SimpleNamespace(Vector3dVector=lambda value: value),
+        visualization=types.SimpleNamespace(draw_geometries=lambda _items: None),
+        io=types.SimpleNamespace(write_point_cloud=lambda _path, _cloud: None),
+    )
+    monkeypatch.setitem(sys.modules, "open3d", fake_open3d)
+    namespace = {"np": np, "logger": types.SimpleNamespace(debug=lambda _message: None)}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    transformed, local, pos_world, _ = namespace["get_current_mesh_points"](garment)
+
+    assert np.array_equal(local, np.asarray(authored_points, dtype=np.float32))
+    assert np.array_equal(transformed, local + np.asarray([10.0, 20.0, 30.0]))
+    assert np.array_equal(pos_world.numpy(), np.asarray([10.0, 20.0, 30.0]))
+
+
 def test_raw_garment_fold_success_bypasses_the_fifty_step_throttle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1070,6 +1137,47 @@ def test_cpu_initialize_obs_bypasses_the_external_physx_initializer() -> None:
     assert initialized == ["usd-local"]
 
 
+def test_cpu_garment_initialization_uses_the_usd_xform_prim() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_flywheel_initialize_legacy_cpu_garment"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace: dict[str, object] = {}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    pose_writes: list[tuple[object, object]] = []
+    env = types.SimpleNamespace(
+        object=types.SimpleNamespace(
+            init_pos=[0.1, 0.2, 0.3],
+            init_ori=[1.0, 0.0, 0.0, 0.0],
+            set_world_pose=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("CPU initialization must not invoke the cloth prim view")
+            ),
+            world_prim=types.SimpleNamespace(
+                set_world_pose=lambda position, orientation: pose_writes.append(
+                    (position, orientation)
+                )
+            ),
+        ),
+        _flywheel_legacy_cpu_cloth_state=lambda: (
+            np.zeros((1, 3), dtype=np.float32),
+            np.zeros((1, 3), dtype=np.float32),
+        ),
+    )
+
+    namespace["_flywheel_initialize_legacy_cpu_garment"](env)
+
+    assert len(pose_writes) == 1
+    assert env._flywheel_legacy_cpu_reset_state[0].shape == (1, 3)
+
+
 def test_cpu_scene_pose_write_never_calls_physx_particle_restore(monkeypatch) -> None:
     source_path = (
         Path(__file__).resolve().parents[1]
@@ -1106,8 +1214,13 @@ def test_cpu_scene_pose_write_never_calls_physx_particle_restore(monkeypatch) ->
         set_all_pose=lambda _pose: (_ for _ in ()).throw(
             AssertionError("CPU scene pose must not invoke the PhysX reset path")
         ),
-        set_world_pose=lambda position, orientation: writes.append(
-            (np.asarray(position), np.asarray(orientation))
+        set_world_pose=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("CPU scene pose must not invoke the cloth prim view")
+        ),
+        world_prim=types.SimpleNamespace(
+            set_world_pose=lambda position, orientation: writes.append(
+                (np.asarray(position), np.asarray(orientation))
+            )
         ),
     )
     env = types.SimpleNamespace(device="cpu", object=garment)
@@ -1163,7 +1276,12 @@ def test_cpu_reset_restores_live_usd_state_without_physx(monkeypatch) -> None:
         garment_rng=np.random.RandomState(7),
         object=types.SimpleNamespace(
             _get_config_value=lambda _key, _source: ([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "config"),
-            set_world_pose=lambda position, orientation: pose_writes.append((position, orientation)),
+            set_world_pose=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("CPU reset must not invoke the cloth prim view")
+            ),
+            world_prim=types.SimpleNamespace(
+                set_world_pose=lambda position, orientation: pose_writes.append((position, orientation))
+            ),
             _ensure_physics_cloth_view=lambda: (_ for _ in ()).throw(
                 AssertionError("CPU reset must not construct a PhysX cloth view")
             ),
@@ -1997,6 +2115,28 @@ def test_randomization_rewrites_authenticated_cloth_after_every_pose_mutation() 
     assert randomize_source.index("cloth.set_world_positions") < randomize_source.index(
         "_flywheel_randomization_receipt = receipt"
     )
+
+
+def test_cpu_randomization_preserves_usd_local_cloth_without_physx_view() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "apply_flywheel_randomization"
+    )
+    method_source = ast.get_source_segment(source, method)
+    assert method_source is not None
+    assert 'if str(self.device).lower() == "cpu":' in method_source
+    assert "self._flywheel_legacy_cpu_cloth_state()" in method_source
+    cpu_branch = method_source.index('if str(self.device).lower() == "cpu":')
+    physx_write = method_source.index("cloth.set_world_positions")
+    assert cpu_branch < physx_write
 
 
 def _cloth_evidence(env) -> None:
@@ -3060,6 +3200,32 @@ def test_verified_success_replay_rejects_an_ambiguous_legacy_cloth_frame(monkeyp
             "parent_episode_id": "episode-1",
             "lineage_id": "episode-1",
         })
+
+
+def test_verified_success_early_snapshot_preserves_authenticated_h16_state(monkeypatch, tmp_path) -> None:
+    evaluation = _evaluation(monkeypatch)
+    snapshot = tmp_path / "000016.json"
+    payload = {
+        "schema_version": 3,
+        "cloth_state_authority": "usd_local_points_v1",
+        "garment_name": "Top_Long_Seen_0",
+        "randomization": {"strategy": "canonical", "continuation_step": 16},
+    }
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+
+    restored, evidence = evaluation._verified_restore_assignment({
+        "replay_kind": "verified_success_early_snapshot_v1",
+        "restore_snapshot": str(snapshot),
+        "restore_snapshot_sha256": digest,
+        "restore_snapshot_step": 16,
+        "restore_snapshot_cloth_frame": "usd_local_points_v1",
+        "parent_episode_id": "episode-1",
+        "lineage_id": "episode-1",
+    })
+
+    assert restored == payload
+    assert evidence["restore_snapshot_step"] == 16
 
 
 def test_verified_success_replay_rejects_a_tampered_snapshot_before_evaluation(monkeypatch, tmp_path) -> None:

@@ -21,10 +21,11 @@ def _matrix() -> list[dict[str, object]]:
             "category": category, "release_stage": "seen", "difficulty": "randomized",
             "seed": 50_000 + category_index * 50 + index,
             "strategy": "mild_geometry" if index % 2 == 0 else "strong_geometry",
-            "restore_snapshot": "/verified/reset.json", "restore_snapshot_sha256": "a" * 64,
+            "restore_snapshot": "/verified/continuations/000016.json", "restore_snapshot_sha256": "a" * 64,
             "restore_snapshot_cloth_frame": "usd_local_points_v1",
+            "restore_snapshot_step": 16,
             "parent_episode_id": f"parent-{category}", "lineage_id": f"parent-{category}",
-            "replay_kind": "verified_success_reset_v1",
+            "replay_kind": "verified_success_early_snapshot_v1",
         }
         for category_index, category in enumerate(categories)
         for index in range(50)
@@ -140,3 +141,47 @@ def test_success_replay_wrapper_passes_task_ledger_safe_accepted_target_to_12k_a
     )
     assert invalid.returncode != 0
     assert "1..150" in invalid.stderr
+
+
+def test_success_replay_wrapper_runs_an_exact_capped_matrix_with_cpu_cloth(tmp_path: Path) -> None:
+    wrapper = tmp_path / "run_success_replay_campaign.sh"
+    appliance = tmp_path / "run_12k_campaign.sh"
+    shutil.copy2(WRAPPER, wrapper)
+    appliance.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "printf '%s:%s:%s:%s' \"${LEHOME_MAX_ATTEMPTS}\" \"${LEHOME_TARGET_ACCEPTED}\" "
+        "\"${LEHOME_SIMULATOR_DEVICE}\" \"${LEHOME_SUCCESS_REPLAY_CAMPAIGN}\" > \"${LEHOME_CAPTURE}\"\n",
+        encoding="utf-8",
+    )
+    appliance.chmod(0o755)
+    rows = _matrix()[:40]
+    caps = {"top_long": 7, "top_short": 3, "pant_long": 9, "pant_short": 0}
+    # Make this a deliberately asymmetric exact-cap matrix.
+    rows = (
+        [dict(_matrix()[index], category_acceptance_cap=7) for index in range(12)]
+        + [dict(_matrix()[50 + index], category_acceptance_cap=3) for index in range(4)]
+        + [dict(_matrix()[100 + index], category_acceptance_cap=9) for index in range(24)]
+    )
+    matrix = tmp_path / "matrix.json"
+    encoded = (json.dumps(rows, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    matrix.write_bytes(encoded)
+    digest = hashlib.sha256(encoded).hexdigest()
+    (tmp_path / "matrix.json.sha256").write_text(digest + "\n", encoding="ascii")
+    capture = tmp_path / "effective-env.txt"
+
+    result = subprocess.run(
+        ["bash", str(wrapper)],
+        env=os.environ | {
+            "LEHOME_SUCCESS_REPLAY_MATRIX": str(matrix),
+            "LEHOME_SUCCESS_REPLAY_MATRIX_SHA256": digest,
+            "LEHOME_MAX_ATTEMPTS": "40",
+            "LEHOME_TARGET_ACCEPTED": str(sum(caps.values())),
+            "LEHOME_CAPTURE": str(capture),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text(encoding="utf-8") == "40:19:cpu:1"

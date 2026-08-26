@@ -207,6 +207,10 @@ class PersistentFourWorkerAdapter:
             LEHOME_TARGET_ACCEPTED=str(len(rows)),
             LEHOME_ENABLE_HF_UPLOAD="1" if evaluation_terminal_upload else "0",
             LEHOME_EVALUATION_TERMINAL_UPLOAD="1" if evaluation_terminal_upload else "0",
+            LEHOME_SKIP_ROUND_SEAL="0",
+            LEHOME_CONTROLLED_RECOVERY_SMOKE="0",
+            LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP="0",
+            LEHOME_RESUME_PREEMPTED_ROLLOUT="0",
             LEHOME_ATTEMPT_MATRIX=matrix,
             LEHOME_ATTEMPT_MATRIX_SHA256=matrix_sha256,
             LEHOME_CAMPAIGN_ROOT=str(root),
@@ -217,6 +221,9 @@ class PersistentFourWorkerAdapter:
             LEHOME_POLICY_STEP=str(policy["target_step"]),
             LEHOME_POLICY_ARTIFACT_SHA256=str(policy["artifact_sha256"]),
         )
+        if evaluation_terminal_upload:
+            # The policy server still owns CUDA; only cloth simulation is CPU.
+            env["LEHOME_SIMULATOR_DEVICE"] = "cpu"
         if cancellation is not None and cancellation.is_set():
             raise RuntimeError("evaluation cancelled before campaign start")
         if cancellation is not None and self.runner is subprocess.run:

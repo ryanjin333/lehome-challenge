@@ -764,6 +764,39 @@ def test_manifest_bound_pending_artifact_binds_80_20_content_and_final_runtime_c
     assert final["source_quotas"] == {"bc": 51, "rollout": 13, "dagger": 0}
 
 
+def test_manifest_bound_pending_artifact_admits_pure_bc_control(tmp_path: Path) -> None:
+    from lehome_train.groot.runtime_mixture import pending_mixture_id
+    from lehome_train.groot.runtime_mixture_publish import publish_pending_mixture
+
+    pending, _source_mounts = _pending_from_runtime_contract(tmp_path)
+    value = json.loads((pending / "publication-pending.json").read_text(encoding="utf-8"))
+    value.update({
+        "schema_version": 2,
+        "experiment_manifest_sha256": "f" * 64,
+        "mixture_weights": {"bc": 100, "rollout": 0, "dagger": 0},
+        "source_quotas": {"bc": 64, "rollout": 0, "dagger": 0},
+    })
+    value["sources"][0]["quota"] = 64
+    value["sources"][1]["quota"] = 0
+    value.pop("mixture_id")
+    value.pop("prefix")
+    mixture_id = pending_mixture_id(value)
+    _write(
+        pending / "publication-pending.json",
+        {**value, "mixture_id": mixture_id, "prefix": f"mixtures/{mixture_id}"},
+    )
+
+    receipt = publish_pending_mixture(
+        pending_root=pending,
+        revision="draft",
+        receipt_path=tmp_path / "receipt.json",
+        transport=MemoryTransport(),
+    )
+
+    assert receipt["mixture_weights"] == {"bc": 100, "rollout": 0, "dagger": 0}
+    assert receipt["source_quotas"] == {"bc": 64, "rollout": 0, "dagger": 0}
+
+
 @pytest.mark.parametrize("mutation", ["schema-float", "schema-bool", "quota-float", "quota-bool"])
 def test_pending_rejects_noninteger_schema_or_quota_before_hub_access(
     tmp_path: Path, mutation: str,

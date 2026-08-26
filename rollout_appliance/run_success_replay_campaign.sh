@@ -50,28 +50,45 @@ if [ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ] || [ "${RECEIPT_SHA256}" != "$
   echo "success replay matrix SHA-256 mismatch" >&2
   exit 2
 fi
-python3 - "${MATRIX}" <<'PY'
+python3 - "${MATRIX}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" <<'PY'
 import json
 import re
 import sys
 from collections import Counter
 from pathlib import Path
 
-matrix = Path(sys.argv[1])
+matrix, max_attempts, target_accepted = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
 try:
     rows = json.loads(matrix.read_text(encoding="utf-8"))
 except (OSError, ValueError) as error:
     raise SystemExit(f"success replay matrix is malformed: {error}")
 categories = ("top_long", "top_short", "pant_long", "pant_short")
-if not isinstance(rows, list) or len(rows) != 200:
-    raise SystemExit("success replay matrix must contain exactly 200 attempts")
-if Counter(row.get("category") for row in rows if isinstance(row, dict)) != Counter({key: 50 for key in categories}):
-    raise SystemExit("success replay matrix must contain 50 attempts per category")
+if not isinstance(rows, list) or not 1 <= len(rows) <= 400 or len(rows) != max_attempts:
+    raise SystemExit("success replay matrix must match LEHOME_MAX_ATTEMPTS in 1..400")
+counts = Counter(row.get("category") for row in rows if isinstance(row, dict))
+if any(category not in categories for category in counts):
+    raise SystemExit("success replay matrix contains an invalid category")
+has_caps = ["category_acceptance_cap" in row for row in rows if isinstance(row, dict)]
+if any(has_caps) and not all(has_caps):
+    raise SystemExit("success replay matrix category caps must be present on every row")
+cap_mode = all(has_caps)
+if not cap_mode and (len(rows) != 200 or counts != Counter({key: 50 for key in categories})):
+    raise SystemExit("legacy success replay matrix must contain 50 attempts per category")
+caps = {}
 for row in rows:
     if not isinstance(row, dict):
         raise SystemExit("success replay matrix row is malformed")
-    if row.get("replay_kind") != "verified_success_reset_v1":
+    replay_kind = row.get("replay_kind")
+    if replay_kind not in {"verified_success_reset_v1", "verified_success_early_snapshot_v1"}:
         raise SystemExit("success replay matrix row has an invalid replay kind")
+    if (
+        replay_kind == "verified_success_early_snapshot_v1"
+        and row.get("restore_snapshot_step") != 16
+    ) or (
+        replay_kind == "verified_success_reset_v1"
+        and "restore_snapshot_step" in row
+    ):
+        raise SystemExit("success replay matrix row has an invalid restore boundary")
     if not isinstance(row.get("restore_snapshot"), str) or not row["restore_snapshot"].startswith("/"):
         raise SystemExit("success replay matrix row has an unsafe restore snapshot")
     if not isinstance(row.get("restore_snapshot_sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", row["restore_snapshot_sha256"]) is None:
@@ -80,6 +97,14 @@ for row in rows:
         raise SystemExit("success replay matrix row has an invalid cloth frame")
     if not isinstance(row.get("parent_episode_id"), str) or not row["parent_episode_id"] or row.get("lineage_id") != row["parent_episode_id"]:
         raise SystemExit("success replay matrix row has inconsistent lineage")
+    if cap_mode:
+        cap = row.get("category_acceptance_cap")
+        category = row.get("category")
+        if type(cap) is not int or not 0 <= cap <= 150 or (category in caps and caps[category] != cap):
+            raise SystemExit("success replay matrix category cap is invalid")
+        caps[category] = cap
+if cap_mode and (any(caps[category] > counts[category] for category in caps) or sum(caps.values()) != target_accepted):
+    raise SystemExit("success replay matrix caps do not match LEHOME_TARGET_ACCEPTED")
 PY
 
 exec env \
@@ -89,6 +114,8 @@ exec env \
   LEHOME_ATTEMPT_MATRIX="${MATRIX}" \
   LEHOME_ATTEMPT_MATRIX_SHA256="${EXPECTED_SHA256}" \
   LEHOME_WORKER_COUNT="${WORKER_COUNT}" \
+  LEHOME_SIMULATOR_DEVICE="cpu" \
+  LEHOME_SUCCESS_REPLAY_CAMPAIGN="1" \
   LEHOME_MAX_ATTEMPTS="${MAX_ATTEMPTS}" \
   LEHOME_MAX_WORKER_RESTARTS="${MAX_WORKER_RESTARTS}" \
   LEHOME_TARGET_ACCEPTED="${TARGET_ACCEPTED}" \

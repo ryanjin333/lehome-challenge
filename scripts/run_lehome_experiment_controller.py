@@ -112,7 +112,13 @@ def main() -> None:
         training_oci_digest=deployment.training_oci_digest,
         training_code_revision=deployment.training_code_revision,
     )
-    controller = ExperimentController(args.database, gradient_step_ceiling=campaign["gradient_step_ceiling"], tied_runner_gradient_step_ceiling=campaign["tied_runner_gradient_step_ceiling"], **budget)
+    controller = ExperimentController(
+        args.database,
+        gradient_step_ceiling=campaign["gradient_step_ceiling"],
+        tied_runner_gradient_step_ceiling=campaign["tied_runner_gradient_step_ceiling"],
+        recovery_collection_admitted=deployment.recovery_collection_admitted,
+        **budget,
+    )
     controller.add_jobs(jobs, manifest_set_sha256=campaign["manifest_set_sha256"])
     controller.reconcile_pending_candidates(time.time_ns())
     host, port = args.bind.rsplit(":", 1)

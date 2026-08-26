@@ -1,22 +1,30 @@
-"""Rank official failed terminals into a hard-state recovery matrix.
+"""Rank authenticated moment-of-ruin snapshots into a hard-state matrix.
 
-This does not train on failed actions. It only emits restorable fail
-snapshots so a later worker can restore the terminal cloth/robot state
-and keep a successful recovery.
+This does not train on failed actions or terminal states. It emits only
+checksum-bound CPU-cloth continuation snapshots immediately before a verified
+reward drawdown so a later worker can keep a formally successful recovery.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "source" / "lehome"))
 
 from lehome.flywheel.hard_mining import FailureEvidence, rank_failures
+
+
+_DROP_THRESHOLD = 0.12
+_MINIMUM_PEAK = 0.25
+_CPU_CLOTH_AUTHORITY = "usd_local_points_v1"
+_HARD_STATE_REPLAY_KIND = "verified_hard_state_moment_of_ruin_v1"
 
 
 def _load_json(path: Path) -> dict:
@@ -50,6 +58,85 @@ def _progress(episode: dict, annotations: list[dict]) -> tuple[float, int]:
     return max_progress, stalled
 
 
+def _moment_of_ruin(
+    annotations: list[dict], continuation_root: Path
+) -> tuple[Path, dict] | None:
+    available = []
+    if continuation_root.is_dir() and not continuation_root.is_symlink():
+        for path in continuation_root.iterdir():
+            match = re.fullmatch(r"([0-9]{6})\.json", path.name)
+            if match is not None and path.is_file() and not path.is_symlink():
+                available.append((int(match.group(1)), path))
+    if not available:
+        return None
+    available.sort()
+
+    peak_progress = 0.0
+    peak_step = -1
+    for row in annotations:
+        reward, step = row.get("reward"), row.get("step")
+        if (
+            isinstance(reward, bool)
+            or not isinstance(reward, (int, float))
+            or not math.isfinite(reward)
+            or isinstance(step, bool)
+            or not isinstance(step, int)
+            or step < 0
+        ):
+            continue
+        progress = min(max(float(reward), 0.0), 1.0)
+        if progress > peak_progress:
+            peak_progress, peak_step = progress, step
+            continue
+        progress_drop = peak_progress - progress
+        if peak_progress < _MINIMUM_PEAK or progress_drop < _DROP_THRESHOLD:
+            continue
+        candidates = [(snapshot_step, path) for snapshot_step, path in available if snapshot_step <= step]
+        if not candidates:
+            return None
+        restore_step, restore_path = candidates[-1]
+        return restore_path, {
+            "signal": "dense_reward_proxy_no_success_head",
+            "peak_progress": peak_progress,
+            "peak_step": peak_step,
+            "detection_step": step,
+            "restore_step": restore_step,
+            "progress_drop": progress_drop,
+            "drop_threshold": _DROP_THRESHOLD,
+            "minimum_peak": _MINIMUM_PEAK,
+        }
+    return None
+
+
+def _cpu_restore_contract(path: Path, *, restore_step: int, garment: str) -> dict | None:
+    """Authenticate one CPU continuation without accepting CUDA cloth state."""
+
+    if path.is_symlink() or not path.is_file() or restore_step <= 0 or restore_step % 16:
+        return None
+    try:
+        payload_bytes = path.read_bytes()
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    randomization = payload.get("randomization") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 3
+        or payload.get("cloth_state_authority") != _CPU_CLOTH_AUTHORITY
+        or payload.get("garment_name") != garment
+        or not isinstance(randomization, dict)
+        or randomization.get("strategy") != "canonical"
+        or randomization.get("continuation_step") != restore_step
+    ):
+        return None
+    return {
+        "restore_snapshot": str(path),
+        "restore_snapshot_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+        "restore_snapshot_cloth_frame": _CPU_CLOTH_AUTHORITY,
+        "restore_snapshot_step": restore_step,
+    }
+
+
 def collect_failures(campaign_root: Path) -> list[dict]:
     rows: list[dict] = []
     for episode_path in campaign_root.rglob("raw/*/episode.json"):
@@ -70,11 +157,28 @@ def collect_failures(campaign_root: Path) -> list[dict]:
             continue
         annotations = [json.loads(line) for line in annotations_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         max_progress, stalled = _progress(episode, annotations)
+        moment = _moment_of_ruin(annotations, episode_path.parent / "snapshots" / "continuations")
+        restore_contract = (
+            _cpu_restore_contract(moment[0], restore_step=moment[1]["restore_step"], garment=garment)
+            if moment is not None
+            else None
+        )
         rows.append(
             {
                 "episode_id": episode.get("episode_id") or episode_path.parent.name,
                 "episode_path": str(episode_path),
                 "terminal_path": str(terminal),
+                "restore_snapshot": restore_contract["restore_snapshot"] if restore_contract else None,
+                "restore_snapshot_sha256": (
+                    restore_contract["restore_snapshot_sha256"] if restore_contract else None
+                ),
+                "restore_snapshot_cloth_frame": (
+                    restore_contract["restore_snapshot_cloth_frame"] if restore_contract else None
+                ),
+                "restore_snapshot_step": (
+                    restore_contract["restore_snapshot_step"] if restore_contract else None
+                ),
+                "moment_of_ruin": moment[1] if moment is not None else None,
                 "category": category,
                 "garment": garment,
                 "seed": seed,
@@ -83,7 +187,7 @@ def collect_failures(campaign_root: Path) -> list[dict]:
                 "max_progress": max_progress,
                 "stalled_steps": stalled,
                 "length": len(annotations),
-                "restorable": True,
+                "restorable": restore_contract is not None,
             }
         )
     return rows
@@ -98,7 +202,7 @@ def build_matrix(rows: list[dict], *, category_success: dict[str, float], limit:
             float(row["max_progress"]),
             int(row["stalled_steps"]),
             int(row["length"]),
-            True,
+            bool(row.get("restorable", False)),
         )
         for row in rows
     ]
@@ -109,6 +213,16 @@ def build_matrix(rows: list[dict], *, category_success: dict[str, float], limit:
         if len(matrix) >= limit:
             break
         src = by_id[item.episode_id]
+        moment = src.get("moment_of_ruin")
+        if not isinstance(moment, dict):
+            continue
+        selection_evidence = {
+            "max_progress": item.diagnostics["max_progress"],
+            "stall_fraction": item.diagnostics["stall_fraction"],
+            "eligible_for_recovery": item.eligible_for_recovery,
+        }
+        if isinstance(moment, dict):
+            selection_evidence["moment_of_ruin"] = moment
         matrix.append(
             {
                 "attempt_id": f"hard-state-{src['episode_id'][:12]}-seed-{src['seed']}",
@@ -119,17 +233,20 @@ def build_matrix(rows: list[dict], *, category_success: dict[str, float], limit:
                 "release_stage": "seen",
                 "difficulty": "hard_state",
                 "seed": src["seed"],
-                "restore_snapshot": src["terminal_path"],
+                "strategy": "canonical",
+                "restore_snapshot": src["restore_snapshot"],
+                "restore_snapshot_sha256": src["restore_snapshot_sha256"],
+                "restore_snapshot_cloth_frame": src["restore_snapshot_cloth_frame"],
+                "restore_snapshot_step": src["restore_snapshot_step"],
+                "replay_kind": _HARD_STATE_REPLAY_KIND,
+                "parent_episode_id": src["episode_id"],
+                "lineage_id": src["episode_id"],
                 "source_episode_id": src["episode_id"],
                 "source_episode_path": src["episode_path"],
                 "rank_score": item.score,
                 "priority_reasons": list(item.priority_reasons),
-                "selection_profile": "near_miss_v1",
-                "selection_evidence": {
-                    "max_progress": item.diagnostics["max_progress"],
-                    "stall_fraction": item.diagnostics["stall_fraction"],
-                    "eligible_for_recovery": item.eligible_for_recovery,
-                },
+                "selection_profile": "moment_of_ruin_reward_drop_v1",
+                "selection_evidence": selection_evidence,
             }
         )
     return matrix

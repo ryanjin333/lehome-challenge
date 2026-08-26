@@ -13,18 +13,29 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import sys
 import time
 from collections import Counter
 from typing import Mapping
+from uuid import uuid4
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "source" / "lehome"))
 sys.path.insert(0, str(REPO_ROOT / "trainer" / "src"))
 
 from lehome.flywheel.artifact_queue import ArtifactFinalizationQueue, QueueFullError  # noqa: E402
-from lehome.flywheel.hub_sync import HubSyncDaemon, HubSyncError  # noqa: E402
+from lehome.flywheel.hub_sync import (  # noqa: E402
+    REMOTE_ROOT,
+    HubSyncDaemon,
+    HubSyncError,
+    SyncEntry,
+    _collect_entries,
+    _episode_digest,
+    _sha256_file,
+    _write_json_atomic,
+)
 from lehome.flywheel.task_ledger import TaskLedger  # noqa: E402
 from lehome_train.flywheel.publish import RolloutRoundSeal, seal_rollout_round  # noqa: E402
 from lehome_train.hub import HuggingFaceHubTransport  # noqa: E402
@@ -284,6 +295,164 @@ def run_evaluation_uploader_once(
     )
 
 
+def run_evaluation_batch_uploader_once(
+    *,
+    terminal_root: Path,
+    receipts_root: Path,
+    readback_root: Path,
+    repository: str,
+    round_id: str,
+    revision: str,
+    token_file: Path | None = None,
+    immutable_revision: str | None = None,
+) -> int:
+    """Publish a complete evaluation round with one commit and one readback.
+
+    Evaluation campaigns contain many small files per episode. Publishing each
+    episode through a separate Hub commit can exhaust the API request window
+    even though the bytes are modest. This path preserves the normal
+    per-episode receipt schema while binding every receipt to one immutable
+    batch commit and verifying the complete round in one readback.
+    """
+    root = Path(terminal_root)
+    if (
+        not root.is_absolute()
+        or root.name != "evaluation-terminal"
+        or root.is_symlink()
+        or not root.is_dir()
+    ):
+        raise ValueError("evaluation terminal root is unsafe or misclassified")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", round_id):
+        raise ValueError("evaluation round ID is unsafe")
+    if (
+        not isinstance(revision, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", revision)
+        or re.fullmatch(r"[0-9a-f]{40}", revision)
+        or any(component in {"", ".", ".."} for component in revision.split("/"))
+    ):
+        raise ValueError("evaluation publication ref is unsafe")
+
+    token = _load_runtime_token(token_file=token_file)
+    episodes: list[tuple[str, Path, tuple[SyncEntry, ...], str]] = []
+    flattened: list[SyncEntry] = []
+    for child in sorted(root.iterdir()):
+        if child.is_symlink() or not child.is_dir():
+            continue
+        entries = _collect_entries(child)
+        episodes.append((child.name, child, entries, _episode_digest(entries)))
+        flattened.extend(
+            SyncEntry(
+                relative_path=f"{child.name}/{entry.relative_path}",
+                sha256=entry.sha256,
+                byte_size=entry.byte_size,
+            )
+            for entry in entries
+        )
+    if not episodes:
+        raise HubSyncError("evaluation terminal root has no episodes")
+
+    remote_prefix = f"{REMOTE_ROOT}/{round_id}"
+    transport = HuggingFaceHubTransport()
+    if immutable_revision is None:
+        immutable_revision = transport.upload_files(
+            repository=repository,
+            revision=revision,
+            source=root,
+            entries=tuple(flattened),
+            token=token,
+            remote_prefix=remote_prefix,
+        )
+    if not isinstance(immutable_revision, str) or not re.fullmatch(
+        r"[0-9a-f]{40}", immutable_revision,
+    ):
+        raise HubSyncError("evaluation batch upload did not return an immutable commit")
+
+    expected = {entry.relative_path for entry in flattened}
+    observed: set[str] = set()
+    for tree_attempt in range(4):
+        tree = transport.list_tree(
+            repository=repository,
+            revision=immutable_revision,
+            token=token,
+            remote_prefix=remote_prefix,
+        )
+        observed = {
+            entry.relative_path.removeprefix(remote_prefix + "/")
+            for entry in tree
+            if entry.entry_type == "file"
+            and entry.relative_path.startswith(remote_prefix + "/")
+        }
+        if observed == expected:
+            break
+        if tree_attempt < 3:
+            time.sleep(5)
+    if observed != expected:
+        raise HubSyncError(
+            "evaluation batch remote tree does not match: "
+            f"missing {sorted(expected - observed)}, extra {sorted(observed - expected)}"
+        )
+
+    readback = Path(readback_root)
+    readback.mkdir(parents=True, exist_ok=True)
+    destination = readback / f"batch-{uuid4().hex}"
+    try:
+        transport.download_files(
+            repository=repository,
+            revision=immutable_revision,
+            destination=destination,
+            relative_paths=tuple(
+                f"{remote_prefix}/{entry.relative_path}" for entry in flattened
+            ),
+            token=token,
+        )
+        for entry in flattened:
+            path = destination / remote_prefix / entry.relative_path
+            if path.is_symlink() or not path.is_file():
+                raise HubSyncError(
+                    f"evaluation batch readback missing file: {entry.relative_path}"
+                )
+            sha256, byte_size = _sha256_file(path)
+            if sha256 != entry.sha256 or byte_size != entry.byte_size:
+                raise HubSyncError(
+                    f"evaluation batch readback hash mismatch: {entry.relative_path}"
+                )
+    finally:
+        shutil.rmtree(destination, ignore_errors=True)
+
+    receipts = Path(receipts_root)
+    receipts.mkdir(parents=True, exist_ok=True)
+    created = 0
+    for attempt_id, _path, entries, digest in episodes:
+        receipt_path = receipts / f"{attempt_id}.sync.json"
+        if receipt_path.is_symlink():
+            raise HubSyncError("evaluation sync receipt path is unsafe")
+        if receipt_path.is_file():
+            existing = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if (
+                existing.get("episode_sha256") != digest
+                or existing.get("round_id") != round_id
+                or existing.get("readback_verified") is not True
+            ):
+                raise HubSyncError(
+                    "existing evaluation receipt does not match the batch episode"
+                )
+            continue
+        _write_json_atomic(receipt_path, {
+            "schema_version": 1,
+            "attempt_id": attempt_id,
+            "repository": repository,
+            "round_id": round_id,
+            "remote_prefix": f"{remote_prefix}/{attempt_id}",
+            "publication_ref": revision,
+            "immutable_revision": immutable_revision,
+            "entry_count": len(entries),
+            "episode_sha256": digest,
+            "readback_verified": True,
+        })
+        created += 1
+    return created
+
+
 def run_sealer_once(
     *,
     database: Path,
@@ -353,6 +522,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--round-id")
     parser.add_argument("--revision")
     parser.add_argument("--token-file", type=Path)
+    parser.add_argument(
+        "--batch", action="store_true",
+        help="publish one complete evaluation round with one commit/readback",
+    )
+    parser.add_argument(
+        "--batch-revision",
+        help="resume batch verification from an existing immutable commit",
+    )
     parser.add_argument("--seal-receipt", type=Path)
     parser.add_argument(
         "--controlled-recovery-smoke", action="store_true",
@@ -363,6 +540,10 @@ def main(argv: list[str] | None = None) -> int:
         help="retain every valid terminal outcome outside the trainable accepted root",
     )
     args = parser.parse_args(argv)
+    if args.batch and (args.role != "evaluation-uploader" or not args.once):
+        parser.error("--batch requires --role evaluation-uploader --once")
+    if args.batch_revision and not args.batch:
+        parser.error("--batch-revision requires --batch")
 
     while True:
         if args.role == "finalizer":
@@ -391,6 +572,12 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 if args.role == "uploader":
                     run_uploader_once(accepted_root=episode_root, **common)
+                elif args.batch:
+                    run_evaluation_batch_uploader_once(
+                        terminal_root=episode_root,
+                        immutable_revision=args.batch_revision,
+                        **common,
+                    )
                 else:
                     run_evaluation_uploader_once(terminal_root=episode_root, **common)
             except HubSyncError:
