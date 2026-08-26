@@ -119,6 +119,31 @@ def test_builder_creates_balanced_lineage_bound_success_replays(tmp_path: Path) 
     assert (tmp_path / "matrix.json.sha256").read_text(encoding="ascii") == receipt["matrix_sha256"] + "\n"
 
 
+def test_builder_combines_verified_successes_from_multiple_campaign_roots(tmp_path: Path) -> None:
+    from scripts.build_success_replay_matrix import build_success_replay_matrix
+
+    first = tmp_path / "first" / "accepted"
+    second = tmp_path / "second" / "accepted"
+    for index, category in enumerate(CATEGORIES):
+        _write_success(
+            first if index % 2 == 0 else second,
+            attempt_id=f"parent-{category}",
+            category=category,
+            garment=f"Garment_{index}",
+        )
+
+    matrix_path = tmp_path / "matrix.json"
+    build_success_replay_matrix(
+        accepted_roots=(first, second),
+        output=matrix_path,
+        attempts_per_category=1,
+    )
+
+    matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+    assert len(matrix) == 4
+    assert {row["category"] for row in matrix} == set(CATEGORIES)
+
+
 def test_builder_supports_exact_category_attempts_and_acceptance_caps(tmp_path: Path) -> None:
     from lehome.flywheel.recovery_collection import (
         load_attempt_matrix,

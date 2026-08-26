@@ -4,6 +4,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 def _module():
     path = Path(__file__).resolve().parents[2] / "scripts/generate_control_mixture_inputs.py"
@@ -55,3 +57,27 @@ def test_control_lineage_uses_experiment_manifest_field_names() -> None:
     ]
 
     assert set(module.lineage_hashes(selections)) == {"train_sha256", "validation_sha256"}
+
+
+@pytest.mark.parametrize(
+    ("arm", "source_kind"),
+    (("success-replay", "success_replay"), ("hard-state", "hard_state")),
+)
+def test_targeted_arms_are_distinct_90_10_sources(
+    arm: str, source_kind: str,
+) -> None:
+    module = _module()
+
+    assert module.control_schedule(arm) == {
+        "bc_percent": 90,
+        "ordinary_percent": 10,
+        "batch64_quotas": {"bc": 58, "rollout": 6, "dagger": 0},
+    }
+    assert module.arm_source(arm) == source_kind
+
+
+def test_targeted_sources_must_be_selected_explicitly() -> None:
+    module = _module()
+
+    assert module.selected_arms(None) == ("a", "b")
+    assert module.selected_arms(["success-replay"]) == ("success-replay",)

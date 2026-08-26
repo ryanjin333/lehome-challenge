@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate immutable pure-BC and ordinary-success control mixtures."""
+"""Generate immutable control and targeted 90/10 runtime mixtures."""
 
 from __future__ import annotations
 
@@ -16,7 +16,13 @@ from lehome_train.groot.experiment_manifest import (
 from lehome_train.io import canonical_json_bytes, canonical_json_sha256, sha256_file
 
 
-RATIOS = {"a": (100, 0), "b": (95, 5)}
+RATIOS = {
+    "a": (100, 0, "none"),
+    "b": (95, 5, "ordinary_success"),
+    "success-replay": (90, 10, "success_replay"),
+    "hard-state": (90, 10, "hard_state"),
+}
+DEFAULT_ARMS = ("a", "b")
 
 
 def write(path: Path, value: object) -> None:
@@ -34,14 +40,25 @@ def load(path: Path) -> dict[str, object]:
 
 def control_schedule(arm: str) -> dict[str, object]:
     try:
-        bc, ordinary = RATIOS[arm]
+        bc, added, _source = RATIOS[arm]
     except KeyError as error:
         raise ValueError(f"unsupported control arm: {arm}") from error
     return {
         "bc_percent": bc,
-        "ordinary_percent": ordinary,
-        "batch64_quotas": batch64_quotas({"bc": bc, "rollout": ordinary, "dagger": 0}),
+        "ordinary_percent": added,
+        "batch64_quotas": batch64_quotas({"bc": bc, "rollout": added, "dagger": 0}),
     }
+
+
+def arm_source(arm: str) -> str:
+    try:
+        return RATIOS[arm][2]
+    except KeyError as error:
+        raise ValueError(f"unsupported control arm: {arm}") from error
+
+
+def selected_arms(arms: Iterable[str] | None) -> tuple[str, ...]:
+    return tuple(arms) if arms else DEFAULT_ARMS
 
 
 def control_selections(ranges: Iterable[dict[str, object]]) -> list[dict[str, object]]:
@@ -93,13 +110,13 @@ def generate_arm(
 ) -> dict[str, object]:
     schedule = control_schedule(arm)
     bc = int(schedule["bc_percent"])
-    ordinary = int(schedule["ordinary_percent"])
+    added = int(schedule["ordinary_percent"])
     root = output / arm
     selected_path = root / "selected-150.json"
     write(selected_path, selected_document)
 
     experiment = json.loads(json.dumps(base_experiment))
-    experiment["mixture_weights"] = {"bc": bc, "dagger": 0, "rollout": ordinary}
+    experiment["mixture_weights"] = {"bc": bc, "dagger": 0, "rollout": added}
     experiment["lineage"] = dict(lineages)
     experiment["mixture_manifest_sha256"] = "0" * 64
     scratch = root / ".experiment-profile.json"
@@ -119,7 +136,7 @@ def generate_arm(
                 "action_horizon": 16,
                 "batch_size": 64,
                 "bc": bc,
-                "rollout": ordinary,
+                "rollout": added,
             },
         }
     )
@@ -197,10 +214,11 @@ def generate_arm(
     summary = {
         "arm": arm,
         "bc_percent": bc,
-        "ordinary_percent": ordinary,
+        "added_percent": added,
+        "added_source": arm_source(arm),
         "batch64_quotas": schedule["batch64_quotas"],
         "bc_window_count": sum(row.get("source_kind") == "organizer" for row in selections),
-        "ordinary_window_count": sum(row.get("source_kind") == "flywheel" for row in selections),
+        "added_window_count": sum(row.get("source_kind") == "flywheel" for row in selections),
         "plan_sha256": plan_sha256,
         "experiment_manifest_sha256": parsed.identity_sha256,
         "selected_bindings_sha256": sha256_file(selected_path),
@@ -251,7 +269,7 @@ def main() -> None:
             base_experiment=base_experiment,
             output=args.output,
         )
-        for arm in (args.arm or list(RATIOS))
+        for arm in selected_arms(args.arm)
     ]
     write(args.output / "summary.json", {"schema_version": 1, "arms": summaries})
     print(json.dumps({"output": str(args.output), "arms": summaries}, sort_keys=True))

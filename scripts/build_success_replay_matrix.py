@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import stat
 import tempfile
-from typing import Mapping
+from typing import Mapping, Sequence
 
 
 CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
@@ -85,91 +85,111 @@ def _verified_file(
     return path, str(record["sha256"])
 
 
-def _successes(accepted_root: Path) -> dict[str, list[dict[str, object]]]:
-    if not accepted_root.is_absolute() or accepted_root.is_symlink() or not accepted_root.is_dir():
-        raise ValueError("accepted root must be a real absolute directory")
+def _successes(accepted_roots: Sequence[Path]) -> dict[str, list[dict[str, object]]]:
+    if not accepted_roots:
+        raise ValueError("at least one accepted root is required")
     grouped: dict[str, list[dict[str, object]]] = {category: [] for category in CATEGORIES}
-    for episode_root in sorted(accepted_root.iterdir(), key=lambda path: path.name):
-        if episode_root.is_symlink():
-            raise ValueError("accepted root contains a symlink")
-        if not episode_root.is_dir():
-            continue
-        attempt_id = episode_root.name
-        if not attempt_id or "/" in attempt_id or "\\" in attempt_id:
-            raise ValueError("accepted episode ID is unsafe")
-        checksums = _load_json(
-            episode_root / "SHA256SUMS.json", label="accepted episode checksum manifest"
-        )
-        episode_relative = f"raw/{attempt_id}/episode.json"
-        reset_relative = f"raw/{attempt_id}/snapshots/reset.json"
-        continuation_relative = f"raw/{attempt_id}/snapshots/continuations/000016.json"
-        episode_path, _ = _verified_file(
-            episode_root=episode_root, relative=episode_relative, checksums=checksums
-        )
-        reset_path, _ = _verified_file(
-            episode_root=episode_root, relative=reset_relative, checksums=checksums
-        )
-        continuation_path, continuation_sha256 = _verified_file(
-            episode_root=episode_root, relative=continuation_relative, checksums=checksums
-        )
-        episode = _load_json(episode_path, label="accepted episode")
-        reset = _load_json(reset_path, label="accepted reset snapshot")
-        continuation = _load_json(
-            continuation_path, label="accepted early continuation snapshot"
-        )
-        identity = episode.get("identity")
-        provenance = episode.get("provenance")
-        if not isinstance(identity, Mapping) or not isinstance(provenance, Mapping):
-            raise ValueError("accepted episode identity is malformed")
-        category = identity.get("category")
-        garment = identity.get("garment_name")
-        simulator_device = provenance.get("simulator_device")
-        if (
-            episode.get("episode_id") != attempt_id
-            or identity.get("episode_id") != attempt_id
-            or episode.get("accepted_success") is not True
-            or episode.get("outcome") != "success"
-            or category not in CATEGORIES
-            or type(garment) is not str
-            or not garment
-            or identity.get("release_stage") != "seen"
-            or identity.get("policy_repo") != PARENT_POLICY_REPO
-            or identity.get("policy_revision") != PARENT_REVISION
-            or identity.get("policy_step") != 12_000
-            or identity.get("asset_revision") != PARENT_ASSET_REVISION
-            or provenance.get("policy_artifact_sha256") != PARENT_ARTIFACT_SHA256
-            or not (
-                simulator_device == "cpu"
-                or (isinstance(simulator_device, str) and _CUDA_DEVICE.fullmatch(simulator_device))
+    seen_attempt_ids: set[str] = set()
+    seen_roots: list[Path] = []
+    for accepted_root in accepted_roots:
+        if not accepted_root.is_absolute() or accepted_root.is_symlink() or not accepted_root.is_dir():
+            raise ValueError("accepted root must be a real absolute directory")
+        resolved_root = accepted_root.resolve(strict=True)
+        if any(
+            resolved_root == prior
+            or resolved_root.is_relative_to(prior)
+            or prior.is_relative_to(resolved_root)
+            for prior in seen_roots
+        ):
+            raise ValueError("accepted roots overlap")
+        seen_roots.append(resolved_root)
+        for episode_root in sorted(accepted_root.iterdir(), key=lambda path: path.name):
+            if episode_root.is_symlink():
+                raise ValueError("accepted root contains a symlink")
+            if not episode_root.is_dir():
+                continue
+            attempt_id = episode_root.name
+            if (
+                not attempt_id
+                or "/" in attempt_id
+                or "\\" in attempt_id
+                or attempt_id in seen_attempt_ids
+            ):
+                raise ValueError("accepted episode ID is unsafe or duplicated")
+            seen_attempt_ids.add(attempt_id)
+            checksums = _load_json(
+                episode_root / "SHA256SUMS.json", label="accepted episode checksum manifest"
             )
-            or reset.get("garment_name") != garment
-            or reset.get("schema_version") != 1
-        ):
-            raise ValueError("accepted episode is not a verified 12K seen-garment success")
-        cloth_frame = (
-            "usd_local_points_v1"
-            if simulator_device == "cpu"
-            else "physx_cloth_view_world_v1"
-        )
-        expected_schema = 3 if simulator_device == "cpu" else 2
-        if (
-            continuation.get("schema_version") != expected_schema
-            or continuation.get("cloth_state_authority") != cloth_frame
-            or continuation.get("garment_name") != garment
-            or not isinstance(continuation.get("randomization"), Mapping)
-            or continuation["randomization"].get("continuation_step") != 16
-        ):
-            raise ValueError("accepted early continuation snapshot is incompatible")
-        grouped[str(category)].append(
-            {
-                "parent_episode_id": attempt_id,
-                "garment": garment,
-                "restore_snapshot": str(continuation_path),
-                "restore_snapshot_sha256": continuation_sha256,
-                "restore_snapshot_cloth_frame": cloth_frame,
-                "restore_snapshot_step": 16,
-            }
-        )
+            episode_relative = f"raw/{attempt_id}/episode.json"
+            reset_relative = f"raw/{attempt_id}/snapshots/reset.json"
+            continuation_relative = f"raw/{attempt_id}/snapshots/continuations/000016.json"
+            episode_path, _ = _verified_file(
+                episode_root=episode_root, relative=episode_relative, checksums=checksums
+            )
+            reset_path, _ = _verified_file(
+                episode_root=episode_root, relative=reset_relative, checksums=checksums
+            )
+            continuation_path, continuation_sha256 = _verified_file(
+                episode_root=episode_root, relative=continuation_relative, checksums=checksums
+            )
+            episode = _load_json(episode_path, label="accepted episode")
+            reset = _load_json(reset_path, label="accepted reset snapshot")
+            continuation = _load_json(
+                continuation_path, label="accepted early continuation snapshot"
+            )
+            identity = episode.get("identity")
+            provenance = episode.get("provenance")
+            if not isinstance(identity, Mapping) or not isinstance(provenance, Mapping):
+                raise ValueError("accepted episode identity is malformed")
+            category = identity.get("category")
+            garment = identity.get("garment_name")
+            simulator_device = provenance.get("simulator_device")
+            if (
+                episode.get("episode_id") != attempt_id
+                or identity.get("episode_id") != attempt_id
+                or episode.get("accepted_success") is not True
+                or episode.get("outcome") != "success"
+                or category not in CATEGORIES
+                or type(garment) is not str
+                or not garment
+                or identity.get("release_stage") != "seen"
+                or identity.get("policy_repo") != PARENT_POLICY_REPO
+                or identity.get("policy_revision") != PARENT_REVISION
+                or identity.get("policy_step") != 12_000
+                or identity.get("asset_revision") != PARENT_ASSET_REVISION
+                or provenance.get("policy_artifact_sha256") != PARENT_ARTIFACT_SHA256
+                or not (
+                    simulator_device == "cpu"
+                    or (isinstance(simulator_device, str) and _CUDA_DEVICE.fullmatch(simulator_device))
+                )
+                or reset.get("garment_name") != garment
+                or reset.get("schema_version") != 1
+            ):
+                raise ValueError("accepted episode is not a verified 12K seen-garment success")
+            cloth_frame = (
+                "usd_local_points_v1"
+                if simulator_device == "cpu"
+                else "physx_cloth_view_world_v1"
+            )
+            expected_schema = 3 if simulator_device == "cpu" else 2
+            if (
+                continuation.get("schema_version") != expected_schema
+                or continuation.get("cloth_state_authority") != cloth_frame
+                or continuation.get("garment_name") != garment
+                or not isinstance(continuation.get("randomization"), Mapping)
+                or continuation["randomization"].get("continuation_step") != 16
+            ):
+                raise ValueError("accepted early continuation snapshot is incompatible")
+            grouped[str(category)].append(
+                {
+                    "parent_episode_id": attempt_id,
+                    "garment": garment,
+                    "restore_snapshot": str(continuation_path),
+                    "restore_snapshot_sha256": continuation_sha256,
+                    "restore_snapshot_cloth_frame": cloth_frame,
+                    "restore_snapshot_step": 16,
+                }
+            )
     if any(not grouped[category] for category in CATEGORIES):
         raise ValueError("verified successes are required for every category")
     return grouped
@@ -217,8 +237,9 @@ def _preflight_outputs(path: Path) -> None:
 
 def build_success_replay_matrix(
     *,
-    accepted_root: str | Path,
     output: str | Path,
+    accepted_root: str | Path | None = None,
+    accepted_roots: Sequence[str | Path] | None = None,
     attempts_per_category: int = 50,
     attempts_by_category: Mapping[str, int] | None = None,
     acceptance_caps: Mapping[str, int] | None = None,
@@ -252,7 +273,14 @@ def build_success_replay_matrix(
             raise ValueError("total acceptance cap must be between 1 and 150")
     if type(seed_base) is not int or seed_base < 0:
         raise ValueError("seed_base must be nonnegative")
-    grouped = _successes(Path(accepted_root))
+    if (accepted_root is None) == (accepted_roots is None):
+        raise ValueError("provide exactly one accepted root input form")
+    roots = (
+        (Path(accepted_root),)
+        if accepted_root is not None
+        else tuple(Path(root) for root in accepted_roots or ())
+    )
+    grouped = _successes(roots)
     rows: list[dict[str, object]] = []
     seed_offset = 0
     for category_index, category in enumerate(CATEGORIES):
@@ -314,7 +342,7 @@ def build_success_replay_matrix(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--accepted-root", type=Path, required=True)
+    parser.add_argument("--accepted-root", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--attempts-per-category", type=int, default=50)
     parser.add_argument("--attempts-by-category-json")
@@ -334,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         json.dumps(
             build_success_replay_matrix(
-                accepted_root=args.accepted_root,
+                accepted_roots=tuple(args.accepted_root),
                 output=args.output,
                 attempts_per_category=args.attempts_per_category,
                 attempts_by_category=attempts_by_category,

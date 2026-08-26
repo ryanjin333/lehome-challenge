@@ -23,6 +23,7 @@ from lehome.flywheel.hard_mining import FailureEvidence, rank_failures
 
 _DROP_THRESHOLD = 0.12
 _MINIMUM_PEAK = 0.25
+_MINIMUM_RECOVERY_PEAK = 0.35
 _CPU_CLOTH_AUTHORITY = "usd_local_points_v1"
 _HARD_STATE_REPLAY_KIND = "verified_hard_state_moment_of_ruin_v1"
 
@@ -209,17 +210,23 @@ def build_matrix(rows: list[dict], *, category_success: dict[str, float], limit:
     by_id = {row["episode_id"]: row for row in rows}
     ranked = rank_failures(evidence, category_success=category_success)
     matrix = []
-    for item in (ranked_item for ranked_item in ranked if ranked_item.eligible_for_recovery):
-        if len(matrix) >= limit:
-            break
+    for item in ranked:
         src = by_id[item.episode_id]
         moment = src.get("moment_of_ruin")
-        if not isinstance(moment, dict):
+        moment_eligible = (
+            isinstance(moment, dict)
+            and bool(item.diagnostics["restorable"])
+            and float(item.diagnostics["progress"]) >= _MINIMUM_RECOVERY_PEAK
+        )
+        if not moment_eligible:
             continue
+        if len(matrix) >= limit:
+            break
         selection_evidence = {
             "max_progress": item.diagnostics["max_progress"],
             "stall_fraction": item.diagnostics["stall_fraction"],
-            "eligible_for_recovery": item.eligible_for_recovery,
+            "eligible_for_recovery": True,
+            "terminal_near_miss_eligible": item.eligible_for_recovery,
         }
         if isinstance(moment, dict):
             selection_evidence["moment_of_ruin"] = moment
@@ -254,7 +261,7 @@ def build_matrix(rows: list[dict], *, category_success: dict[str, float], limit:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--campaign-root", type=Path, required=True)
+    parser.add_argument("--campaign-root", type=Path, action="append", required=True)
     parser.add_argument(
         "--output",
         type=Path,
@@ -267,12 +274,35 @@ def main(argv: list[str] | None = None) -> int:
         help="comma k=v rates used only to rank which fails to restore first",
     )
     args = parser.parse_args(argv)
-    output = args.output or (args.campaign_root / "hard-state-nearmiss.json")
+    campaign_roots: list[Path] = args.campaign_root
+    if args.output is None and len(campaign_roots) != 1:
+        parser.error("--output is required with multiple campaign roots")
+    output = args.output or (campaign_roots[0] / "hard-state-nearmiss.json")
     category_success = {}
     for part in args.category_success.split(","):
         key, value = part.split("=", 1)
         category_success[key.strip()] = float(value)
-    rows = collect_failures(args.campaign_root)
+    rows: list[dict] = []
+    seen_roots: list[Path] = []
+    seen_episodes: set[str] = set()
+    for campaign_root in campaign_roots:
+        if not campaign_root.is_absolute() or campaign_root.is_symlink() or not campaign_root.is_dir():
+            raise ValueError("campaign root must be a real absolute directory")
+        resolved_root = campaign_root.resolve(strict=True)
+        if any(
+            resolved_root == prior
+            or resolved_root.is_relative_to(prior)
+            or prior.is_relative_to(resolved_root)
+            for prior in seen_roots
+        ):
+            raise ValueError("campaign roots overlap")
+        seen_roots.append(resolved_root)
+        for row in collect_failures(campaign_root):
+            episode_id = str(row["episode_id"])
+            if episode_id in seen_episodes:
+                raise ValueError("campaign roots contain a duplicate episode")
+            seen_episodes.add(episode_id)
+            rows.append(row)
     present = {row["category"] for row in rows}
     # Ranking requires every referenced category; drop unused floors.
     category_success = {key: value for key, value in category_success.items() if key in present}

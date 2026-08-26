@@ -93,6 +93,60 @@ def test_matrix_builder_defaults_to_a_new_near_miss_artifact(tmp_path) -> None:
     assert (campaign_root / "hard-state-nearmiss.json").read_text(encoding="utf-8") == "[]\n"
 
 
+def test_matrix_builder_combines_failures_from_multiple_campaign_roots(tmp_path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    raw = first / "worker" / "raw" / "episode-a"
+    continuations = raw / "snapshots" / "continuations"
+    continuations.mkdir(parents=True)
+    second.mkdir()
+    (raw / "episode.json").write_text(
+        json.dumps({
+            "accepted_success": False,
+            "episode_id": "episode-a",
+            "identity": {
+                "category": "pant_long",
+                "garment_name": "Pant_Long_Seen_4",
+                "seed": 920_094,
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    annotations = [
+        {"step": 0, "success": False, "reward": 0.10},
+        {"step": 16, "success": False, "reward": 0.52},
+        {"step": 32, "success": False, "reward": 0.50},
+        {"step": 35, "success": False, "reward": 0.30},
+    ]
+    (raw / "annotations.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in annotations), encoding="utf-8"
+    )
+    (raw / "snapshots" / "terminal.json").write_text("{}\n", encoding="utf-8")
+    for step in (16, 32):
+        (continuations / f"{step:06d}.json").write_text(json.dumps({
+            "schema_version": 3,
+            "robot_position": [0.0] * 12,
+            "robot_velocity": [0.0] * 12,
+            "cloth_position": [[0.0, 0.0, 0.0]],
+            "cloth_velocity": [[0.0, 0.0, 0.0]],
+            "rng_state": {},
+            "garment_name": "Pant_Long_Seen_4",
+            "randomization": {"strategy": "canonical", "continuation_step": step},
+            "scene_state": {},
+            "cloth_state_authority": "usd_local_points_v1",
+        }) + "\n", encoding="utf-8")
+    output = tmp_path / "combined.json"
+
+    assert build_matrix_main([
+        "--campaign-root", str(first),
+        "--campaign-root", str(second),
+        "--output", str(output),
+        "--category-success", "pant_long=0.0",
+    ]) == 0
+
+    assert len(json.loads(output.read_text(encoding="utf-8"))) == 1
+
+
 def test_progress_uses_peak_step_reward_and_counts_only_the_trailing_stall() -> None:
     annotations = [
         {"step": 0, "success": False, "reward": 0.10},
@@ -199,6 +253,43 @@ def test_recovery_matrix_binds_moment_of_ruin_snapshot_and_evidence() -> None:
     assert matrix[0]["lineage_id"] == "near-miss"
     assert matrix[0]["selection_profile"] == "moment_of_ruin_reward_drop_v1"
     assert matrix[0]["selection_evidence"]["moment_of_ruin"] == moment
+
+
+def test_authenticated_moment_of_ruin_is_not_rejected_by_the_later_terminal_stall() -> None:
+    moment = {
+        "signal": "dense_reward_proxy_no_success_head",
+        "peak_progress": 0.379,
+        "peak_step": 153,
+        "detection_step": 169,
+        "restore_step": 160,
+        "progress_drop": 0.13,
+        "drop_threshold": 0.12,
+        "minimum_peak": 0.25,
+    }
+    rows = [{
+        "episode_id": "early-collapse-long-tail",
+        "episode_path": "/campaign/early-collapse-long-tail/episode.json",
+        "terminal_path": "/campaign/early-collapse-long-tail/terminal.json",
+        "restore_snapshot": "/campaign/early-collapse-long-tail/continuations/000160.json",
+        "restore_snapshot_sha256": "b" * 64,
+        "restore_snapshot_cloth_frame": "usd_local_points_v1",
+        "restore_snapshot_step": 160,
+        "moment_of_ruin": moment,
+        "category": "pant_long",
+        "garment": "Pant_Long_Seen_4",
+        "seed": 920_032,
+        "max_progress": 0.379,
+        "stalled_steps": 446,
+        "length": 600,
+        "restorable": True,
+    }]
+
+    matrix = build_matrix(rows, category_success={"pant_long": 0.0}, limit=1)
+
+    assert len(matrix) == 1
+    assert matrix[0]["restore_snapshot_step"] == 160
+    assert matrix[0]["selection_evidence"]["eligible_for_recovery"] is True
+    assert matrix[0]["selection_evidence"]["terminal_near_miss_eligible"] is False
 
 
 def test_failure_audit_rejects_a_cuda_cloth_restore_for_cpu_only_hard_state_collection(tmp_path) -> None:
