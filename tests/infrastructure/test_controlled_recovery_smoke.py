@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import shutil
+import sqlite3
 import textwrap
 
 import pytest
@@ -16,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SMOKE = REPO_ROOT / "rollout_appliance" / "run_controlled_recovery_smoke.sh"
 PRODUCTION = REPO_ROOT / "rollout_appliance" / "run_controlled_recovery_campaign.sh"
 SNAPSHOT_SOURCE_BOOTSTRAP = REPO_ROOT / "rollout_appliance" / "run_snapshot_source_bootstrap.sh"
+WORKER_SUPERVISOR = REPO_ROOT / "rollout_appliance" / "worker_supervisor.sh"
 
 
 def _recovery_gate(tmp_path: Path, *, admitted: bool, name: str = "deployment-gate.json") -> tuple[Path, str]:
@@ -745,6 +747,66 @@ def test_base_campaign_admits_bounded_same_category_source_discovery_tuple(tmp_p
         check=False,
     )
     assert restarted.returncode == 0, restarted.stderr
+
+
+def test_fresh_garment_worker_exit_is_not_clean_until_its_affinity_is_drained(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "ledger.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY, assignment_json TEXT NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE events (event_id INTEGER PRIMARY KEY, event_type TEXT NOT NULL, "
+        "attempt_id TEXT, worker_id TEXT)"
+    )
+    assignment = json.dumps({"garment": "Top_Long_Seen_0"}, sort_keys=True)
+    connection.executemany(
+        "INSERT INTO attempts VALUES (?, ?)",
+        [("diverged", assignment), ("untouched", assignment)],
+    )
+    connection.execute(
+        "INSERT INTO events VALUES (1, 'infrastructure_abort', 'diverged', 'worker-3')"
+    )
+    connection.commit()
+    connection.close()
+
+    command = (
+        'source "$1"; lehome_worker_affinity_is_drained "$2" "$3"'
+    )
+    not_drained = subprocess.run(
+        [
+            "bash", "-c", command, "bash", str(WORKER_SUPERVISOR),
+            str(database), "Top_Long_Seen_0",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert not_drained.returncode == 1, not_drained.stderr
+
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "INSERT INTO events VALUES (2, 'rejected', 'untouched', 'worker-3')"
+    )
+    connection.commit()
+    connection.close()
+    drained = subprocess.run(
+        [
+            "bash", "-c", command, "bash", str(WORKER_SUPERVISOR),
+            str(database), "Top_Long_Seen_0",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert drained.returncode == 0, drained.stderr
+
+    campaign = (REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'lehome_worker_affinity_is_drained "${LEDGER}" "${worker_garment}"' in campaign
 
 
 @pytest.mark.parametrize("worker_count", ("1", "4"))

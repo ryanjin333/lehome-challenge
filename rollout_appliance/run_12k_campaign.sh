@@ -711,6 +711,11 @@ launch_worker() {
     echo "worker ${index} exited while still owning an active lease" >&2
     return 71
   fi
+  if [ "${FRESH_GARMENT_WAVES}" = "1" ] \
+      && ! lehome_worker_affinity_is_drained "${LEDGER}" "${worker_garment}"; then
+    echo "worker ${index} exited before draining garment ${worker_garment}" >&2
+    return 72
+  fi
   return 0
 }
 

@@ -52,6 +52,34 @@ raise SystemExit(0 if active == 0 else 1)
 PY
 }
 
+lehome_worker_affinity_is_drained() {
+  local database="$1"
+  local garment="$2"
+  python3 - "${database}" "${garment}" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+try:
+    connection.execute("PRAGMA query_only = ON")
+    remaining = connection.execute(
+        "SELECT COUNT(*) FROM attempts AS attempt "
+        "WHERE COALESCE("
+        "json_extract(attempt.assignment_json, '$.garment_name'), "
+        "json_extract(attempt.assignment_json, '$.garment')"
+        ") = ? AND COALESCE(("
+        "SELECT event.event_type FROM events AS event "
+        "WHERE event.attempt_id = attempt.attempt_id "
+        "ORDER BY event.event_id DESC LIMIT 1"
+        "), 'pending') IN ('pending', 'retryable')",
+        (sys.argv[2],),
+    ).fetchone()[0]
+finally:
+    connection.close()
+raise SystemExit(0 if remaining == 0 else 1)
+PY
+}
+
 lehome_cleanup_policy() {
   local policy_pid="$1"
   if [[ "${policy_pid}" =~ ^[0-9]+$ ]]; then
