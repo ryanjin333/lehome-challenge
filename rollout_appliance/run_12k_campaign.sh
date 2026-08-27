@@ -6,12 +6,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=worker_supervisor.sh
-if [ "${LEHOME_SIMPLE_CURRICULUM_COLLECTION:-0}" = "1" ] && [ -n "${LEHOME_HOST_CODE_ROOT:-}" ]; then
-  source "${LEHOME_HOST_CODE_ROOT}/rollout_appliance/worker_supervisor.sh"
-else
-  source "${SCRIPT_DIR}/worker_supervisor.sh"
-fi
 
 WORKSPACE="${LEHOME_WORKSPACE:-/mnt/lehome}"
 POLICY_SHA256="${LEHOME_POLICY_SHA256:-e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa}"
@@ -157,7 +151,7 @@ for ancestor in (requested, *requested.parents):
     if ancestor.is_symlink(): raise SystemExit("simple curriculum host code root contains a symlink ancestor")
 root = requested.resolve(strict=True)
 digest = hashlib.sha256()
-for relative in ("source/lehome", "scripts", "rollout_appliance"):
+for relative in ("source/lehome", "trainer/src", "scripts", "rollout_appliance"):
     tree = root / relative
     if tree.is_symlink() or not tree.is_dir(): raise SystemExit("simple curriculum code root is unsafe")
     for path in sorted(tree.rglob("*")):
@@ -182,6 +176,14 @@ PY
     echo "simple curriculum wrapper is not running from LEHOME_HOST_CODE_ROOT" >&2
     exit 2
   fi
+fi
+# Source only after exact host-root validation, so no caller-controlled shell
+# path is evaluated before its canonical identity is established.
+# shellcheck source=worker_supervisor.sh
+if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
+  source "${HOST_CODE_ROOT}/rollout_appliance/worker_supervisor.sh"
+else
+  source "${SCRIPT_DIR}/worker_supervisor.sh"
 fi
 case "${SIMULATOR_DEVICE}" in
   "cuda:0") ;;
@@ -854,7 +856,7 @@ launch_worker() {
     -e LEHOME_SIMPLE_CURRICULUM_COLLECTION="${SIMPLE_CURRICULUM_COLLECTION}" \
     --entrypoint /isaac-sim/python.sh \
     "${ROLLOUT_IMAGE}" \
-    /opt/lehome/scripts/run_groot_persistent_worker.py \
+    /opt/lehome-challenge/scripts/run_groot_persistent_worker.py \
       --headless \
       --database "${LEDGER}" \
       --attempt-matrix "${MATRIX}" \

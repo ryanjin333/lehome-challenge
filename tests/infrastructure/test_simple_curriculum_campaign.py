@@ -42,7 +42,7 @@ def _rows(partition_id: str, count: int, stage: str) -> list[dict[str, object]]:
 
 def _code_hash() -> str:
     digest = hashlib.sha256()
-    for relative in ("source/lehome", "scripts", "rollout_appliance"):
+    for relative in ("source/lehome", "trainer/src", "scripts", "rollout_appliance"):
         for path in sorted((ROOT / relative).rglob("*")):
             if path.is_file() and not path.is_symlink() and "__pycache__" not in path.parts and path.suffix != ".pyc" and path.name != ".DS_Store":
                 digest.update(path.relative_to(ROOT).as_posix().encode() + b"\0")
