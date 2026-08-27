@@ -63,7 +63,7 @@ SIMPLE_CURRICULUM_COLLECTION="${LEHOME_SIMPLE_CURRICULUM_COLLECTION:-0}"
 COMPLETION_METRIC="${LEHOME_COMPLETION_METRIC:-accepted_successes}"
 PARTITION_ID="${LEHOME_PARTITION_ID:-}"
 PARENT_MATRIX_SHA256="${LEHOME_PARENT_MATRIX_SHA256:-}"
-CODE_ROOT_SHA256="${LEHOME_CODE_ROOT_SHA256:-}"
+CODE_ROOT_SHA256=""
 RESUME_PREEMPTED_ROLLOUT="${LEHOME_RESUME_PREEMPTED_ROLLOUT:-0}"
 EVALUATION_TERMINAL_UPLOAD="${LEHOME_EVALUATION_TERMINAL_UPLOAD:-0}"
 FRESH_GARMENT_WAVES="${LEHOME_FRESH_GARMENT_WAVES:-${EVALUATION_TERMINAL_UPLOAD}}"
@@ -132,10 +132,28 @@ if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
     "calibration-head:150:100"|"calibration-tail:400:300"|"curriculum-a:400:300"|"curriculum-b:400:300") ;;
     *) echo "simple curriculum partition requires an exact row/target/lease tuple" >&2; exit 2 ;;
   esac
-  if ! [[ "${PARENT_MATRIX_SHA256}" =~ ^[0-9a-f]{64}$ ]] || ! [[ "${CODE_ROOT_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
-    echo "simple curriculum partition identity requires parent and code SHA-256 values" >&2
+  if ! [[ "${PARENT_MATRIX_SHA256}" =~ ^[0-9a-f]{64}$ ]] || ! [[ "${ROLLOUT_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+    echo "simple curriculum partition identity requires parent SHA-256 and a pinned rollout image" >&2
     exit 2
   fi
+  CODE_ROOT_SHA256="$(python3 - "${SCRIPT_DIR}/.." <<'PY'
+import hashlib, os, stat, sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve(strict=True)
+digest = hashlib.sha256()
+for relative in ("source/lehome", "scripts", "rollout_appliance"):
+    tree = root / relative
+    if tree.is_symlink() or not tree.is_dir(): raise SystemExit("simple curriculum code root is unsafe")
+    for path in sorted(tree.rglob("*")):
+        if path.is_symlink(): raise SystemExit("simple curriculum code root contains a symlink")
+        if path.is_file():
+            mode = path.stat().st_mode
+            if not stat.S_ISREG(mode): raise SystemExit("simple curriculum code root contains a non-regular file")
+            digest.update(path.relative_to(root).as_posix().encode() + b"\0")
+            digest.update(path.read_bytes())
+print(digest.hexdigest())
+PY
+)" || { echo "simple curriculum code root is unsafe" >&2; exit 2; }
 fi
 case "${SIMULATOR_DEVICE}" in
   "cuda:0") ;;
@@ -662,6 +680,7 @@ docker run --rm --user 1234:1234 --network none \
     --run-root "${CAMPAIGN_ROOT}" \
     --max-attempts "${LEDGER_MAX_ATTEMPTS}" \
     --target-accepted "${TARGET_ACCEPTED}" \
+    --completion-metric "${COMPLETION_METRIC}" \
     "${FINALIZER_SMOKE_FLAG[@]}" \
     "${FINALIZER_EVALUATION_FLAG[@]}" &
 FINALIZER_PID=$!

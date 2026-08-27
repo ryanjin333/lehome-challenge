@@ -146,6 +146,7 @@ def run_finalizer_once(
     max_pending_bytes: int,
     max_attempts: int,
     target_accepted: int,
+    completion_metric: str = "accepted_successes",
     controlled_recovery_smoke: bool = False,
     evaluation_terminal: bool = False,
 ) -> int:
@@ -158,7 +159,7 @@ def run_finalizer_once(
         database, attempt_matrix=_load_attempt_matrix(
             attempt_matrix, controlled_recovery_smoke=controlled_recovery_smoke,
         ),
-        max_attempts=max_attempts, target_accepted=target_accepted,
+        max_attempts=max_attempts, target_accepted=target_accepted, completion_metric=completion_metric,
     )
     queue = ArtifactFinalizationQueue(
         run_root=run_root, ledger=ledger,
@@ -462,6 +463,7 @@ def run_sealer_once(
     seal_receipt_path: Path,
     max_attempts: int,
     target_accepted: int,
+    completion_metric: str = "accepted_successes",
 ) -> RolloutRoundSeal:
     """Seal the exact accepted ledger set after every Hub readback is durable."""
 
@@ -471,7 +473,7 @@ def run_sealer_once(
         database,
         attempt_matrix=matrix,
         max_attempts=max_attempts,
-        target_accepted=target_accepted,
+        target_accepted=target_accepted, completion_metric=completion_metric,
     )
     try:
         accepted_attempts = tuple(
@@ -514,6 +516,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-pending-bytes", type=int, default=16 * 2**30)
     parser.add_argument("--max-attempts", type=int, default=400)
     parser.add_argument("--target-accepted", type=int, default=150)
+    parser.add_argument("--completion-metric", choices=("accepted_successes", "terminal_outcomes"), default="accepted_successes")
     parser.add_argument("--accepted-root", type=Path)
     parser.add_argument("--terminal-root", type=Path)
     parser.add_argument("--receipts-root", type=Path)
@@ -553,6 +556,7 @@ def main(argv: list[str] | None = None) -> int:
                 database=args.database, attempt_matrix=args.attempt_matrix, run_root=args.run_root,
                 max_pending_items=args.max_pending_items, max_pending_bytes=args.max_pending_bytes,
                 max_attempts=args.max_attempts, target_accepted=args.target_accepted,
+                completion_metric=args.completion_metric,
                 controlled_recovery_smoke=args.controlled_recovery_smoke,
                 evaluation_terminal=args.evaluation_terminal,
             )
@@ -602,6 +606,7 @@ def main(argv: list[str] | None = None) -> int:
                 seal_receipt_path=args.seal_receipt,
                 max_attempts=args.max_attempts,
                 target_accepted=args.target_accepted,
+                completion_metric=args.completion_metric,
             )
         if args.once:
             return 0

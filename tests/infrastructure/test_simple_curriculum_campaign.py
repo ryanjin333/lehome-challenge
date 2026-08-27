@@ -40,6 +40,16 @@ def _rows(partition_id: str, count: int, stage: str) -> list[dict[str, object]]:
     ]
 
 
+def _code_hash() -> str:
+    digest = hashlib.sha256()
+    for relative in ("source/lehome", "scripts", "rollout_appliance"):
+        for path in sorted((ROOT / relative).rglob("*")):
+            if path.is_file() and not path.is_symlink():
+                digest.update(path.relative_to(ROOT).as_posix().encode() + b"\0")
+                digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def _environment(tmp_path: Path, partition_id: str) -> dict[str, str]:
     count, target, budget, stage = _TUPLES[partition_id]
     matrix = tmp_path / f"{partition_id}.json"
@@ -53,7 +63,8 @@ def _environment(tmp_path: Path, partition_id: str) -> dict[str, str]:
         "LEHOME_POLICY_STEP": "12000", "LEHOME_COMPLETION_METRIC": "terminal_outcomes",
         "LEHOME_MAX_ATTEMPTS": str(budget), "LEHOME_TARGET_ACCEPTED": str(target),
         "LEHOME_PARTITION_ID": partition_id, "LEHOME_PARENT_MATRIX_SHA256": "a" * 64,
-        "LEHOME_CODE_ROOT_SHA256": "b" * 64, "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+        "LEHOME_ROLLOUT_IMAGE": "ghcr.io/ryanjin333/lehome-rollout@sha256:" + "d" * 64,
+        "LEHOME_VALIDATE_MATRIX_ONLY": "1",
     })
     return environment
 
@@ -124,14 +135,14 @@ def test_exact_simple_curriculum_resume_refuses_active_or_mismatched_descriptor(
     })
     descriptor = {
         "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
-        "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64, "code_root_sha256": "b" * 64,
+        "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64, "code_root_sha256": _code_hash(),
         "attempt_matrix_sha256": environment["LEHOME_ATTEMPT_MATRIX_SHA256"],
         "policy_repo": "ryanjin333/lehome-groot-n17-models", "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
         "policy_step": 12000, "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
         "policy_sha256": "e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa",
         "simulator_device": "cpu", "renderer_device": "cuda:0", "policy_device": "cuda:0",
         "trainer_image": "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746",
-        "rollout_image": "lehome-rollout:build",
+        "rollout_image": environment["LEHOME_ROLLOUT_IMAGE"],
     }
     descriptor.update(descriptor_update)
     context.write_text(json.dumps(descriptor), encoding="utf-8")
@@ -156,14 +167,14 @@ def test_exact_simple_curriculum_resume_resumes_only_a_matching_paused_ledger(tm
     context = tmp_path / "preemption.json"
     context.write_text(json.dumps({
         "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
-        "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64, "code_root_sha256": "b" * 64,
+        "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64, "code_root_sha256": _code_hash(),
         "attempt_matrix_sha256": environment["LEHOME_ATTEMPT_MATRIX_SHA256"],
         "policy_repo": "ryanjin333/lehome-groot-n17-models", "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
         "policy_step": 12000, "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
         "policy_sha256": "e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa",
         "simulator_device": "cpu", "renderer_device": "cuda:0", "policy_device": "cuda:0",
         "trainer_image": "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746",
-        "rollout_image": "lehome-rollout:build",
+        "rollout_image": environment["LEHOME_ROLLOUT_IMAGE"],
     }), encoding="utf-8")
     environment.update({
         "LEHOME_VALIDATE_MATRIX_ONLY": "0", "LEHOME_RESUME_PREEMPTED_ROLLOUT": "1",
@@ -196,14 +207,14 @@ def test_exact_simple_curriculum_resume_refuses_a_terminal_ledger(tmp_path: Path
     context = tmp_path / "preemption.json"
     context.write_text(json.dumps({
         "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
-        "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64, "code_root_sha256": "b" * 64,
+        "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64, "code_root_sha256": _code_hash(),
         "attempt_matrix_sha256": environment["LEHOME_ATTEMPT_MATRIX_SHA256"],
         "policy_repo": "ryanjin333/lehome-groot-n17-models", "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
         "policy_step": 12000, "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
         "policy_sha256": "e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa",
         "simulator_device": "cpu", "renderer_device": "cuda:0", "policy_device": "cuda:0",
         "trainer_image": "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746",
-        "rollout_image": "lehome-rollout:build",
+        "rollout_image": environment["LEHOME_ROLLOUT_IMAGE"],
     }), encoding="utf-8")
     environment.update({
         "LEHOME_VALIDATE_MATRIX_ONLY": "0", "LEHOME_RESUME_PREEMPTED_ROLLOUT": "1",

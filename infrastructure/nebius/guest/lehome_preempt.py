@@ -85,6 +85,21 @@ class RolloutPreemptionContext:
     attempt_matrix_sha256: str
     max_attempts: int
     target_accepted: int
+    campaign_mode: str = "legacy"
+    completion_metric: str = "accepted_successes"
+    partition_id: str | None = None
+    parent_matrix_sha256: str | None = None
+    code_root_sha256: str | None = None
+    policy_repo: str | None = None
+    policy_revision: str | None = None
+    policy_step: int | None = None
+    policy_artifact_sha256: str | None = None
+    policy_sha256: str | None = None
+    simulator_device: str | None = None
+    renderer_device: str | None = None
+    policy_device: str | None = None
+    trainer_image: str | None = None
+    rollout_image: str | None = None
     controlled_recovery_smoke: bool = False
     controlled_recovery_smoke_run_id: str | None = None
     controlled_recovery_smoke_matrix_sha256: str | None = None
@@ -102,8 +117,30 @@ class RolloutPreemptionContext:
             raise PreemptionError("rollout preemption context matrix digest is invalid")
         if type(self.max_attempts) is not int or not 1 <= self.max_attempts <= 400:
             raise PreemptionError("rollout preemption context max_attempts must be in 1..400")
-        if type(self.target_accepted) is not int or not 1 <= self.target_accepted <= 150:
-            raise PreemptionError("rollout preemption context target_accepted must be in 1..150")
+        exact = self.campaign_mode == "simple_curriculum_collection"
+        target_cap = 300 if exact else 150
+        if type(self.target_accepted) is not int or not 1 <= self.target_accepted <= target_cap:
+            raise PreemptionError(f"rollout preemption context target_accepted must be in 1..{target_cap}")
+        if exact:
+            contracts = {
+                "calibration-head": (100, 100, 150), "calibration-tail": (300, 300, 400),
+                "curriculum-a": (300, 300, 400), "curriculum-b": (300, 300, 400),
+            }
+            if (self.completion_metric != "terminal_outcomes"
+                    or self.partition_id not in contracts
+                    or (self.target_accepted, self.max_attempts) != contracts[self.partition_id][1:]
+                    or any(not isinstance(value, str) or _LOWERCASE_SHA256.fullmatch(value) is None for value in (
+                        self.parent_matrix_sha256, self.code_root_sha256, self.policy_artifact_sha256, self.policy_sha256,
+                    ))
+                    or not isinstance(self.policy_repo, str) or not self.policy_repo
+                    or not isinstance(self.policy_revision, str) or __import__("re").fullmatch(r"[0-9a-f]{40}", self.policy_revision) is None
+                    or self.policy_step != 12000 or self.simulator_device != "cpu"
+                    or self.renderer_device != "cuda:0" or self.policy_device != "cuda:0"
+                    or not isinstance(self.trainer_image, str) or not self.trainer_image
+                    or not isinstance(self.rollout_image, str) or not self.rollout_image):
+                raise PreemptionError("simple curriculum preemption context is not an exact immutable partition")
+        elif self.campaign_mode != "legacy" or self.completion_metric != "accepted_successes":
+            raise PreemptionError("normal rollout preemption context has an invalid completion mode")
         if self.controlled_recovery_smoke:
             if self.max_attempts != 1 or self.target_accepted != 1:
                 raise PreemptionError("controlled smoke preemption context must be exactly 1/1")
@@ -145,6 +182,11 @@ def load_rollout_preemption_context(
         "schema_version", "kind", "active", "run_id", "run_root", "database",
         "attempt_matrix", "attempt_matrix_sha256", "max_attempts", "target_accepted",
     }
+    exact_fields = {
+        "campaign_mode", "completion_metric", "partition_id", "parent_matrix_sha256", "code_root_sha256",
+        "policy_repo", "policy_revision", "policy_step", "policy_artifact_sha256", "policy_sha256",
+        "simulator_device", "renderer_device", "policy_device", "trainer_image", "rollout_image",
+    }
     smoke_fields = {
         "controlled_recovery_smoke", "controlled_recovery_smoke_run_id",
         "controlled_recovery_smoke_matrix_sha256", "controlled_recovery_smoke_materialization_sha256",
@@ -152,6 +194,8 @@ def load_rollout_preemption_context(
     }
     if isinstance(payload, dict) and payload.get("controlled_recovery_smoke") is True:
         expected |= smoke_fields
+    if isinstance(payload, dict) and payload.get("campaign_mode") == "simple_curriculum_collection":
+        expected |= exact_fields
     if (
         not isinstance(payload, dict)
         or set(payload) != expected
@@ -169,6 +213,14 @@ def load_rollout_preemption_context(
             attempt_matrix_sha256=payload["attempt_matrix_sha256"],
             max_attempts=payload["max_attempts"],
             target_accepted=payload["target_accepted"],
+            campaign_mode=payload.get("campaign_mode", "legacy"),
+            completion_metric=payload.get("completion_metric", "accepted_successes"),
+            partition_id=payload.get("partition_id"), parent_matrix_sha256=payload.get("parent_matrix_sha256"),
+            code_root_sha256=payload.get("code_root_sha256"), policy_repo=payload.get("policy_repo"),
+            policy_revision=payload.get("policy_revision"), policy_step=payload.get("policy_step"),
+            policy_artifact_sha256=payload.get("policy_artifact_sha256"), policy_sha256=payload.get("policy_sha256"),
+            simulator_device=payload.get("simulator_device"), renderer_device=payload.get("renderer_device"),
+            policy_device=payload.get("policy_device"), trainer_image=payload.get("trainer_image"), rollout_image=payload.get("rollout_image"),
             controlled_recovery_smoke=payload.get("controlled_recovery_smoke", False),
             controlled_recovery_smoke_run_id=payload.get("controlled_recovery_smoke_run_id"),
             controlled_recovery_smoke_matrix_sha256=payload.get("controlled_recovery_smoke_matrix_sha256"),
@@ -187,6 +239,22 @@ def load_rollout_preemption_context(
     _regular_file(context.attempt_matrix, "rollout attempt matrix")
     if hashlib.sha256(context.attempt_matrix.read_bytes()).hexdigest() != context.attempt_matrix_sha256:
         raise PreemptionError("rollout attempt matrix SHA-256 mismatch")
+    if context.campaign_mode == "simple_curriculum_collection":
+        rows = _attempt_matrix(context.attempt_matrix)
+        expected_rows = {
+            "calibration-head": (100, "calibration"), "calibration-tail": (300, "calibration"),
+            "curriculum-a": (300, "curriculum"), "curriculum-b": (300, "curriculum"),
+        }
+        count, stage = expected_rows[context.partition_id]
+        if len(rows) != count or any(
+            row.get("campaign_kind") != "simple_curriculum_source_v1"
+            or row.get("logical_stage") != stage
+            or row.get("partition_id") != context.partition_id
+            or row.get("parent_matrix_sha256") != context.parent_matrix_sha256
+            or row.get("strategy") != "canonical"
+            for row in rows
+        ):
+            raise PreemptionError("simple curriculum matrix does not bind the exact partition context")
     return context
 
 
@@ -246,6 +314,7 @@ def build_rollout_preemption_hooks(
             attempt_matrix=matrix,
             max_attempts=context.max_attempts,
             target_accepted=context.target_accepted,
+            completion_metric=context.completion_metric,
         )
 
     def stop_leases() -> Mapping[str, object]:
@@ -292,6 +361,7 @@ def build_rollout_preemption_hooks(
             max_pending_bytes=16 * 2**30,
             max_attempts=context.max_attempts,
             target_accepted=context.target_accepted,
+            completion_metric=context.completion_metric,
             controlled_recovery_smoke=context.controlled_recovery_smoke,
         )
         _checkpoint_and_fsync(context.database)
@@ -311,6 +381,29 @@ def _directory_fsync(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def write_inactive_exact_resume_descriptor(path: Path, context: RolloutPreemptionContext) -> None:
+    """Atomically replace the active exact context after a successful pause."""
+
+    if context.campaign_mode != "simple_curriculum_collection":
+        return
+    payload = {
+        "schema_version": 1, "kind": "lehome_rollout_preemption_context", "active": False,
+        "run_id": context.run_id, "run_root": str(context.run_root), "database": str(context.database),
+        "attempt_matrix": str(context.attempt_matrix), "attempt_matrix_sha256": context.attempt_matrix_sha256,
+        "max_attempts": context.max_attempts, "target_accepted": context.target_accepted,
+        "campaign_mode": context.campaign_mode, "completion_metric": context.completion_metric,
+        "partition_id": context.partition_id, "parent_matrix_sha256": context.parent_matrix_sha256,
+        "code_root_sha256": context.code_root_sha256, "policy_repo": context.policy_repo,
+        "policy_revision": context.policy_revision, "policy_step": context.policy_step,
+        "policy_artifact_sha256": context.policy_artifact_sha256, "policy_sha256": context.policy_sha256,
+        "simulator_device": context.simulator_device, "renderer_device": context.renderer_device,
+        "policy_device": context.policy_device, "trainer_image": context.trainer_image,
+        "rollout_image": context.rollout_image,
+    }
+    write_manifest_atomic(path, payload)
+    _directory_fsync(path.parent)
 
 
 def _remaining(deadline_seconds: float, clock: ClockSeconds) -> float:
@@ -482,6 +575,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     required = {"stop_leases", "mark_interrupted", "flush_ledgers", "close_terminal_artifacts"}
     if result.receipt.get("errors") or not required.issubset(result.completed_steps):
         raise PreemptionError("preemption shutdown was incomplete; inspect the durable receipt")
+    if rollout_context is not None:
+        write_inactive_exact_resume_descriptor(args.rollout_context, rollout_context)
     return 0
 
 

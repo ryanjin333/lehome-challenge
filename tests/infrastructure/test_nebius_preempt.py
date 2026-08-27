@@ -23,6 +23,7 @@ from lehome_preempt import (  # noqa: E402
     RolloutPreemptionContext,
     build_rollout_preemption_hooks,
     handle_preemption,
+    load_rollout_preemption_context,
     main,
 )
 
@@ -376,6 +377,44 @@ def test_rollout_preempt_main_refuses_missing_context_without_receipt(tmp_path):
             "--workspace-root", str(tmp_path / "workspace"),
         ])
     assert not receipts.exists()
+
+
+def test_preempt_consumes_exact_simple_curriculum_context_and_rejects_tampering(tmp_path):
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    root = tmp_path / "workspace" / "campaign"; root.mkdir(parents=True)
+    categories = (("top_long", "Top_Long"), ("top_short", "Top_Short"), ("pant_long", "Pant_Long"), ("pant_short", "Pant_Short"))
+    rows = [
+        {"campaign_kind": "simple_curriculum_source_v1", "logical_stage": "calibration", "strategy": "canonical",
+         "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64,
+         "category": categories[index % 4][0], "garment": f"{categories[index % 4][1]}_Seen_{index % 10}",
+         "garment_name": f"{categories[index % 4][1]}_Seen_{index % 10}", "seed": index, "source_seed": index,
+         "attempt_id": f"head-{index}", "trial_id": f"head-trial-{index}", "release_stage": "seen"}
+        for index in range(100)
+    ]
+    matrix = root / "matrix.json"; matrix.write_text(json.dumps(rows), encoding="utf-8")
+    database = root / "ledger.sqlite3"
+    TaskLedger(database, attempt_matrix=rows, max_attempts=150, target_accepted=100, completion_metric="terminal_outcomes").close()
+    context = root / "rollout-preemption.json"
+    payload = {
+        "schema_version": 1, "kind": "lehome_rollout_preemption_context", "active": True, "run_id": "exact",
+        "run_root": str(root), "database": str(database), "attempt_matrix": str(matrix),
+        "attempt_matrix_sha256": hashlib.sha256(matrix.read_bytes()).hexdigest(), "max_attempts": 150, "target_accepted": 100,
+        "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
+        "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64, "code_root_sha256": "b" * 64,
+        "policy_repo": "repo", "policy_revision": "c" * 40, "policy_step": 12000,
+        "policy_artifact_sha256": "d" * 64, "policy_sha256": "e" * 64, "simulator_device": "cpu",
+        "renderer_device": "cuda:0", "policy_device": "cuda:0", "trainer_image": "trainer@sha256:" + "f" * 64,
+        "rollout_image": "rollout@sha256:" + "1" * 64,
+    }
+    context.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_rollout_preemption_context(context, workspace_root=tmp_path / "workspace")
+    assert loaded.completion_metric == "terminal_outcomes"
+    payload["policy_step"] = 11999
+    context.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(PreemptionError, match="exact immutable partition"):
+        load_rollout_preemption_context(context, workspace_root=tmp_path / "workspace")
 
 
 def _write_active_rollout_context(tmp_path: Path, *, run_id: str) -> tuple[Path, Path]:

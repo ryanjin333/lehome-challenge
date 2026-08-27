@@ -64,7 +64,7 @@ def test_terminal_outcome_completion_counts_policy_rejections_but_not_infrastruc
         max_attempts=5, target_accepted=3, completion_metric="terminal_outcomes", clock_ns=lambda: 1,
     )
     try:
-        first = ledger.lease_next("worker-a", lease_duration_ns=100)
+        first = ledger.lease_next("worker-a", lease_duration_ns=10**18)
         assert first is not None
         assert ledger.record_interrupted("worker-a", first.attempt.attempt_id, first.lease_id, "isaac_restart") == "retryable"
         retry = ledger.lease_next("worker-b", lease_duration_ns=100)
@@ -120,6 +120,75 @@ def test_legacy_accepted_success_completion_cap_is_unchanged(tmp_path) -> None:
 
     with pytest.raises(ValueError, match=str(MAX_ACCEPTED_EPISODES)):
         TaskLedger(tmp_path / "legacy-cap.sqlite3", attempt_matrix=_matrix(1), target_accepted=151)
+
+
+def test_legacy_metadata_backfills_only_accepted_successes_metric(tmp_path) -> None:
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    database = tmp_path / "legacy.sqlite3"
+    ledger = TaskLedger(database, attempt_matrix=_matrix(1), max_attempts=1, target_accepted=1)
+    ledger.close()
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TRIGGER metadata_never_delete")
+    connection.execute("DELETE FROM metadata WHERE key = 'completion_metric'")
+    connection.execute("CREATE TRIGGER metadata_never_delete BEFORE DELETE ON metadata BEGIN SELECT RAISE(ABORT, 'campaign metadata is immutable'); END;")
+    connection.commit()
+    connection.close()
+
+    reopened = TaskLedger(database, attempt_matrix=_matrix(1), max_attempts=1, target_accepted=1)
+    try:
+        assert reopened.completion_metric() == "accepted_successes"
+    finally:
+        reopened.close()
+    with pytest.raises(ValueError, match="immutable"):
+        TaskLedger(
+            database, attempt_matrix=_matrix(1), max_attempts=1, target_accepted=1,
+            completion_metric="terminal_outcomes",
+        )
+
+
+def test_exact_terminal_handoff_with_malformed_artifact_retries_the_same_assignment(tmp_path) -> None:
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    ledger = TaskLedger(
+        tmp_path / "exact-retry.sqlite3", attempt_matrix=_matrix(1), max_attempts=2,
+        target_accepted=1, completion_metric="terminal_outcomes",
+    )
+    try:
+        first = ledger.lease_next("worker-a", lease_duration_ns=10**18)
+        assert first is not None
+        assert ledger.record_terminal("worker-a", first.attempt.attempt_id, first.lease_id, "raw-a") == "terminal_pending_validation"
+        assert ledger.retry_terminal_infrastructure(first.attempt.attempt_id, reason="malformed_artifact") == "retryable"
+        retry = ledger.lease_next("worker-b", lease_duration_ns=10**18)
+        assert retry is not None and retry.attempt == first.attempt
+        assert ledger.completion_count == 0
+        assert len([event for event in ledger.events() if event.event_type == "leased"]) == 2
+    finally:
+        ledger.close()
+
+
+def test_exact_fidelity_abort_never_retries_or_counts_as_a_terminal_outcome(tmp_path) -> None:
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    ledger = TaskLedger(
+        tmp_path / "fidelity-stop.sqlite3", attempt_matrix=_matrix(1), max_attempts=2,
+        target_accepted=1, completion_metric="terminal_outcomes", clock_ns=lambda: 1,
+    )
+    try:
+        lease = ledger.lease_next("worker", lease_duration_ns=100)
+        assert lease is not None
+        assert ledger.record_fidelity_abort(
+            "worker", lease.attempt.attempt_id, lease.lease_id, session_id="session", generation=1,
+            fidelity_code="missing_cloth",
+            fidelity={"missing_cloth": True, "cloth_flight": False, "nonfinite_cloth_state": False,
+                      "safety_failure": False, "monitor_active": True, "monitor_observed": True},
+            runtime={"simulation_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0",
+                     "camera_device": "cuda:0", "policy_device": "cuda:0"},
+        ) == "infrastructure_abort"
+        assert ledger.completion_count == 0
+        assert ledger.lease_next("retry-worker", lease_duration_ns=100) is None
+    finally:
+        ledger.close()
 
 
 @pytest.mark.parametrize("target", [100, 300])

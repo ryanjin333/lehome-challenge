@@ -701,6 +701,16 @@ class TaskLedger:
                     "INSERT INTO metadata(key, value) VALUES ('matrix_bootstrap_complete', 'true')"
                 )
                 return
+            legacy_expected = dict(expected)
+            legacy_expected.pop("completion_metric")
+            if completion_metric == "accepted_successes" and metadata == legacy_expected:
+                # Pre-metric ledgers had only accepted-success semantics. Add
+                # that immutable fact in the same transaction, but never
+                # reinterpret an old campaign as exact terminal outcomes.
+                self._connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES ('completion_metric', 'accepted_successes')"
+                )
+                metadata["completion_metric"] = "accepted_successes"
             if metadata != expected:
                 raise ValueError("attempt matrix or campaign limits are immutable")
             stored = self.attempts()
@@ -844,6 +854,28 @@ class TaskLedger:
             and self._campaign_state() == "active"
         ):
             self._append_event("campaign_ended", payload={"reason": "completion_target_reached"}, at_ns=at_ns)
+
+    def retry_terminal_infrastructure(self, attempt_id: str, *, reason: str) -> str:
+        """Requeue an exact-mode raw handoff that failed finalizer validation.
+
+        A malformed or missing artifact is not a policy outcome. Its original
+        assignment remains immutable and the next lease consumes the existing
+        lease budget; legacy campaigns retain their terminal-abort behavior.
+        """
+
+        _require_identifier(attempt_id, field="attempt_id")
+        reason = _require_identifier(reason, field="reason")
+        with self._write():
+            state = self._state_for_attempt(attempt_id)
+            if state.status != "terminal_pending_validation":
+                raise ValueError("attempt is not pending terminal validation")
+            if self._completion_metric() != "terminal_outcomes":
+                raise ValueError("terminal infrastructure retry is reserved for exact outcome campaigns")
+            self._append_event(
+                "retryable", attempt_id=attempt_id,
+                payload={"reason": f"finalizer_infrastructure_retry:{reason}"}, at_ns=self._now(),
+            )
+            return "retryable"
 
     def _max_attempts(self) -> int:
         return int(self._connection.execute("SELECT value FROM metadata WHERE key = 'max_attempts'").fetchone()[0])

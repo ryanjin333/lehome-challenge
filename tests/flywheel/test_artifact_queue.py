@@ -141,6 +141,29 @@ def test_empty_video_file_is_an_infrastructure_abort(tmp_path, ledger):
     assert ledger.status(attempt_id) == "infrastructure_abort"
 
 
+def test_exact_partition_requeues_malformed_artifact_without_replacing_its_assignment(tmp_path):
+    matrix = ({"episode": "episode-001", "category": "top-long"},)
+    ledger = TaskLedger(
+        tmp_path / "exact.db", attempt_matrix=matrix, max_attempts=2, target_accepted=1,
+        completion_metric="terminal_outcomes",
+    )
+    try:
+        run_root = tmp_path / "run"
+        queue = _queue(tmp_path, ledger)
+        worker_id, attempt_id, lease_id, output_dir = handoff_terminal(ledger, run_root, attempt_index=0, corrupt=True)
+        original = ledger.attempts()[0]
+        queue.enqueue(worker_id, attempt_id, lease_id, output_dir)
+
+        result = queue.finalize_next()
+        retry = ledger.lease_next("retry-worker", lease_duration_ns=LEASE_NS)
+
+        assert result is not None and result.outcome == "retryable"
+        assert retry is not None and retry.attempt == original
+        assert ledger.completion_count == 0
+    finally:
+        ledger.close()
+
+
 def test_malformed_worker_outcome_is_an_infrastructure_abort(tmp_path, ledger):
     run_root = tmp_path / "run"
     queue = _queue(tmp_path, ledger)

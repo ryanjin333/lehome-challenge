@@ -227,9 +227,9 @@ class ArtifactFinalizationQueue:
 
         validation_reason = _validate_raw_episode(item.output_dir, item.attempt_id)
         if validation_reason is not None:
-            self._ledger.validate_terminal(item.attempt_id, "infrastructure_abort")
+            outcome = self._settle_infrastructure_invalid(item.attempt_id, validation_reason)
             return FinalizationResult(
-                item.attempt_id, "infrastructure_abort", validation_reason, None,
+                item.attempt_id, outcome, validation_reason, None,
             )
 
         succeeded, success_reason = _episode_succeeded(
@@ -239,9 +239,9 @@ class ArtifactFinalizationQueue:
             lease_id=item.lease_id,
         )
         if succeeded is None:
-            self._ledger.validate_terminal(item.attempt_id, "infrastructure_abort")
+            outcome = self._settle_infrastructure_invalid(item.attempt_id, success_reason)
             return FinalizationResult(
-                item.attempt_id, "infrastructure_abort", success_reason, None,
+                item.attempt_id, outcome, success_reason, None,
             )
         if self._evaluation_terminal_root is not None:
             terminal_dir = self._publish_evaluation_terminal(item)
@@ -274,6 +274,12 @@ class ArtifactFinalizationQueue:
 
         self._ledger.validate_terminal(item.attempt_id, "rejected")
         return FinalizationResult(item.attempt_id, "rejected", reason, None)
+
+    def _settle_infrastructure_invalid(self, attempt_id: str, reason: str) -> str:
+        metric = getattr(self._ledger, "completion_metric", lambda: "accepted_successes")()
+        if metric == "terminal_outcomes":
+            return self._ledger.retry_terminal_infrastructure(attempt_id, reason=reason)
+        return self._ledger.validate_terminal(attempt_id, "infrastructure_abort")
 
     def _controlled_category_full(self, attempt_id: str) -> bool:
         assignment = next(
