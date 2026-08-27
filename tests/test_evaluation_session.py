@@ -2427,6 +2427,13 @@ def _evaluation(monkeypatch):
     return importlib.import_module("scripts.utils.evaluation")
 
 
+def test_official_success_on_horizon_uses_success_terminal_reason(monkeypatch) -> None:
+    evaluation = _evaluation(monkeypatch)
+
+    assert evaluation._coherent_terminal_reason("horizon", is_success=True) == "success"
+    assert evaluation._coherent_terminal_reason("horizon", is_success=False) == "horizon"
+
+
 def test_evaluation_session_switches_garments_without_recreating_a_switchable_environment(monkeypatch) -> None:
     evaluation = _evaluation(monkeypatch)
 

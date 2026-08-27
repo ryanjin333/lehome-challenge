@@ -51,6 +51,12 @@ _FLYWHEEL_POLICY_ACTION_JOINT_NAMES = (
 )
 
 
+def _coherent_terminal_reason(reason: str, *, is_success: bool) -> str:
+    if is_success and reason == "horizon":
+        return "success"
+    return reason
+
+
 def _flywheel_policy_action_limit_diagnostics(env: Any, action: Any) -> dict[str, object]:
     """Return bounded target-limit and live-position diagnostics for flywheel steps."""
 
@@ -1242,6 +1248,9 @@ def run_evaluation_loop(
 
         # --- End of Episode Handling ---
         is_success = success.item() if success_flag else False
+        terminal_reason = _coherent_terminal_reason(
+            terminal_reason, is_success=bool(is_success)
+        )
 
         if recorder is not None:
             from lehome.flywheel.snapshots import capture_snapshot
