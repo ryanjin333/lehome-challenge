@@ -29,6 +29,7 @@ from lehome.assets.scenes.bedroom import MARBLE_BEDROOM_CFG
 from lehome.devices.action_process import preprocess_device_action
 from lehome.assets.object.Garment import GarmentObject
 from lehome.assets.collider_audit import audit_current_usd_stage
+from lehome.flywheel.fidelity import ClothFidelityError
 from lehome.flywheel.persistent_worker import SimulatorNumericalDivergenceError
 from lehome.tasks.bedroom.challenge_garment_loader import ChallengeGarmentLoader
 from lehome.flywheel.isaac_camera import read_camera_world_pose, write_camera_world_pose
@@ -973,20 +974,31 @@ class GarmentEnv(DirectRLEnv):
                 f"velocities_shape={local_velocities.shape} expected_shape=Nx3"
             )
         if local_positions.shape[0] == 0:
-            error = RuntimeError("garment PhysX cloth readback has no particles")
-            error.category = "missing_cloth"  # type: ignore[attr-defined]
-            raise error
+            raise ClothFidelityError(
+                "missing_cloth",
+                {
+                    "missing_cloth": True, "cloth_flight": False,
+                    "nonfinite_cloth_state": False, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+                detail="garment PhysX cloth readback has no particles",
+            )
         positions_nonfinite_count = int(np.size(local_positions) - np.isfinite(local_positions).sum())
         velocities_nonfinite_count = int(np.size(local_velocities) - np.isfinite(local_velocities).sum())
         if positions_nonfinite_count or velocities_nonfinite_count:
-            error = RuntimeError(
-                "garment PhysX cloth readback is nonfinite: "
-                f"positions_nonfinite_count={positions_nonfinite_count} "
-                f"velocities_nonfinite_count={velocities_nonfinite_count}"
+            raise ClothFidelityError(
+                "nonfinite_cloth_state",
+                {
+                    "missing_cloth": False, "cloth_flight": False,
+                    "nonfinite_cloth_state": True, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+                detail=(
+                    "garment PhysX cloth readback is nonfinite: "
+                    f"positions_nonfinite_count={positions_nonfinite_count} "
+                    f"velocities_nonfinite_count={velocities_nonfinite_count}"
+                ),
             )
-            error.category = "nonfinite_cloth_state"  # type: ignore[attr-defined]
-            error.nonfinite_count = positions_nonfinite_count + velocities_nonfinite_count  # type: ignore[attr-defined]
-            raise error
         return local_positions.copy(), local_velocities.copy()
 
     @staticmethod
@@ -1465,15 +1477,16 @@ class GarmentEnv(DirectRLEnv):
         """Fail closed when live cloth state is numerically outside this scene's scale."""
 
         def receipt(*, missing: bool = False, flight: bool = False, nonfinite: bool = False,
-                    observed: bool = True, **values: object) -> dict[str, object]:
+                    **values: object) -> dict[str, object]:
             return {
                 **values,
                 "fidelity": {
                     "missing_cloth": missing,
                     "cloth_flight": flight,
                     "nonfinite_cloth_state": nonfinite,
+                    "safety_failure": False,
                     "monitor_active": True,
-                    "monitor_observed": observed,
+                    "monitor_observed": True,
                 },
             }
 
@@ -1485,7 +1498,7 @@ class GarmentEnv(DirectRLEnv):
 
         collider_health = self.flywheel_collider_health()
         if collider_health.get("healthy") is not True:
-            return receipt(observed=False, **collider_health)
+            return receipt(**collider_health)
 
         try:
             if str(getattr(self, "device", "")).lower() == "cpu":
@@ -1495,19 +1508,16 @@ class GarmentEnv(DirectRLEnv):
                 positions, velocities = self._flywheel_legacy_cpu_cloth_state()
             else:
                 positions, velocities = self._flywheel_physics_cloth_state()
-        except (RuntimeError, TypeError, ValueError) as error:
-            category = getattr(error, "category", None)
-            if category in {"missing_cloth", "nonfinite_cloth_state"}:
-                nonfinite_count = getattr(error, "nonfinite_count", 0)
-                return receipt(
-                    missing=category == "missing_cloth",
-                    nonfinite=category == "nonfinite_cloth_state",
-                    healthy=False, reason=category, metric_name="cloth_state_readback",
-                    metric_value=nonfinite_count if nonfinite_count else category,
-                    metric_limit="nonempty_finite_aligned_nx3",
-                )
+        except ClothFidelityError as error:
             return receipt(
-                observed=False, healthy=False, reason="simulator_numerical_divergence",
+                missing=error.code == "missing_cloth",
+                nonfinite=error.code == "nonfinite_cloth_state",
+                healthy=False, reason=error.code, metric_name="cloth_state_readback",
+                metric_value=error.code, metric_limit="nonempty_finite_aligned_nx3",
+            )
+        except (RuntimeError, TypeError, ValueError) as error:
+            return receipt(
+                healthy=False, reason="simulator_numerical_divergence",
                 metric_name="cloth_state_readback", metric_value=str(error) or type(error).__name__,
                 metric_limit="finite_aligned_nx3",
             )
@@ -1541,7 +1551,7 @@ class GarmentEnv(DirectRLEnv):
             or not np.isfinite(configured_max_velocity_mps)
             or configured_max_velocity_mps <= 0.0
         ):
-            return receipt(observed=False, healthy=False, reason="cloth_health_configuration_unavailable")
+            return receipt(healthy=False, reason="cloth_health_configuration_unavailable")
         # The reset configuration locates the garment and its existing scale
         # bounds its authored local mesh. This is an admission envelope only;
         # it does not alter PhysX settings or policy actions.

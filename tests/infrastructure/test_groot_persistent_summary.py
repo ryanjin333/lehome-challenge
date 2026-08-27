@@ -57,6 +57,22 @@ def test_report_preserves_legacy_fields_and_adds_first_hundred_gate_metrics(tmp_
     assert len(report["runtime_identities"][0]) == 64
 
 
+def test_simple_summary_rejects_a_symlinked_campaign_root_ancestor(tmp_path: Path) -> None:
+    summary = _module()
+    materialized_parent = tmp_path / "materialized"
+    materialized_parent.mkdir()
+    root, matrix, _rows, _ledger_ids = _simple_campaign(materialized_parent)
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(materialized_parent, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="ancestor"):
+        summary.build_report(
+            campaign_root=alias_parent / root.name,
+            matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+            candidate_key="original_baseline", **POLICY,
+        )
+
+
 POLICY = {
     "policy_repo": "owner/policy", "policy_revision": "e" * 40,
     "policy_step": 12000, "policy_artifact_sha256": "b" * 64,

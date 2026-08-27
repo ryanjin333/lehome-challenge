@@ -13,8 +13,11 @@ from pathlib import Path
 from pathlib import PurePosixPath
 import re
 import sqlite3
+import stat
 from typing import Mapping
 from urllib.parse import quote
+
+from lehome.flywheel.fidelity import FIDELITY_CODES, validate_fidelity
 
 
 _CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
@@ -87,16 +90,10 @@ def _augment_first_hundred_metrics(report: Mapping[str, object]) -> dict[str, ob
                 or not isinstance(identity, Mapping) or not isinstance(provenance, Mapping)
                 or not isinstance(fidelity, Mapping)):
             raise ValueError("first-100 gate trial is invalid")
-        fidelity_fields = {
-            "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure",
-            "monitor_active", "monitor_observed",
-        }
-        if (
-            set(fidelity) != fidelity_fields
-            or any(type(fidelity.get(field)) is not bool for field in fidelity_fields)
-            or fidelity["monitor_active"] is not True or fidelity["monitor_observed"] is not True
-        ):
-            raise ValueError("first-100 fidelity evidence is invalid")
+        try:
+            validate_fidelity(fidelity)
+        except ValueError as error:
+            raise ValueError("first-100 fidelity evidence is invalid") from error
         assignment_ids.append(attempt_id)
         identities.add(_runtime_identity_digest(identity, provenance))
     if len(set(assignment_ids)) != len(assignment_ids):
@@ -256,20 +253,14 @@ def _verify_simple_finalized_manifest(destination: Path, *, campaign_root: Path)
 
 def _simple_fidelity(episode: Mapping[str, object]) -> dict[str, bool]:
     fidelity = episode.get("fidelity")
-    fields = (
-        "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure",
-        "monitor_active", "monitor_observed",
-    )
-    if (
-        not isinstance(fidelity, Mapping) or set(fidelity) != set(fields)
-        or any(type(fidelity.get(field)) is not bool for field in fields)
-        or fidelity["monitor_active"] is not True or fidelity["monitor_observed"] is not True
-    ):
-        raise ValueError("simple curriculum episode fidelity evidence is invalid")
+    try:
+        validated = validate_fidelity(fidelity)
+    except ValueError as error:
+        raise ValueError("simple curriculum episode fidelity evidence is invalid") from error
     aggregate = episode.get("safety_failure")
     if type(aggregate) is not bool or aggregate is not fidelity["safety_failure"]:
         raise ValueError("simple curriculum safety evidence is contradictory")
-    return {field: fidelity[field] for field in fields}
+    return validated
 
 
 def _simple_finalized_paths(
@@ -354,10 +345,6 @@ def _build_simple_first_hundred_report(
                         "failure_class", "fidelity_code", "fidelity", "lease_id", "worker_id",
                         "session_id", "generation", "runtime",
                     }
-                    fidelity_fields = {
-                        "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure",
-                        "monitor_active", "monitor_observed",
-                    }
                     runtime_fields = {
                         "simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device",
                     }
@@ -366,19 +353,19 @@ def _build_simple_first_hundred_report(
                         and isinstance(ledger_id, str) and ledger_id in assignments
                         and payload.get("failure_class") == "fidelity"
                         and isinstance(payload.get("fidelity_code"), str)
-                        and payload["fidelity_code"] in fidelity_fields
+                        and payload["fidelity_code"] in FIDELITY_CODES
                         and payload.get("lease_id") == event["lease_id"]
                         and payload.get("worker_id") == event["worker_id"]
                         and isinstance(payload.get("session_id"), str) and payload["session_id"]
                         and type(payload.get("generation")) is int and payload["generation"] >= 1
-                        and isinstance(payload.get("fidelity"), dict) and set(payload["fidelity"]) == fidelity_fields
-                        and all(type(payload["fidelity"][field]) is bool for field in fidelity_fields)
-                        and payload["fidelity"][payload["fidelity_code"]] is True
-                        and payload["fidelity"]["monitor_active"] is True
-                        and payload["fidelity"]["monitor_observed"] is True
+                        and isinstance(payload.get("fidelity"), dict)
                         and isinstance(payload.get("runtime"), dict) and set(payload["runtime"]) == runtime_fields
                         and all(isinstance(payload["runtime"][field], str) and payload["runtime"][field] for field in runtime_fields)
                     ):
+                        try:
+                            validate_fidelity(payload["fidelity"], code=payload["fidelity_code"])
+                        except ValueError:
+                            continue
                         gate_fidelity_failures.append({
                             "assignment_id": assignments[ledger_id]["attempt_id"],
                             "ledger_id": ledger_id,
@@ -872,7 +859,20 @@ def build_report(
 
     _validate_policy_inputs(candidate_key, policy_repo, policy_revision, policy_step, policy_artifact_sha256)
     root = Path(campaign_root)
-    if root.is_symlink() or not root.is_dir():
+    if not root.is_absolute():
+        raise ValueError("campaign root must be absolute")
+    current = root
+    while True:
+        try:
+            mode = os.lstat(current).st_mode
+        except OSError as error:
+            raise ValueError("campaign root is unavailable") from error
+        if stat.S_ISLNK(mode):
+            raise ValueError("campaign root has a symlink ancestor")
+        if current.parent == current:
+            break
+        current = current.parent
+    if not root.is_dir():
         raise ValueError("campaign root must be a materialized directory")
     rows = _load_matrix(Path(matrix_path), matrix_sha256)
     simple_first_hundred = (

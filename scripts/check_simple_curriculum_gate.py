@@ -15,6 +15,11 @@ import stat
 import tempfile
 from typing import Mapping
 
+from lehome.flywheel.fidelity import (
+    FIDELITY_CODES,
+    validate_fidelity,
+)
+
 from lehome.flywheel.simple_curriculum import build_calibration_rows
 
 
@@ -28,8 +33,7 @@ _ALLOWED_PAIRS = frozenset({
     ("fidelity_stop", "mixed_runtime_identity"),
     ("insufficient_source_stop", "official_success_floor"),
 })
-_FIDELITY_FIELDS = ("missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure")
-_FIDELITY_MONITOR_FIELDS = _FIDELITY_FIELDS + ("monitor_active", "monitor_observed")
+_FIDELITY_FIELDS = tuple(sorted(FIDELITY_CODES))
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SIMULATOR_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}$")
@@ -63,15 +67,11 @@ def _has_typed_fidelity_failure(report: Mapping[str, object]) -> bool:
         if not isinstance(failure, Mapping):
             raise ValueError("gate fidelity failure is invalid")
         code, fidelity = failure.get("fidelity_code"), failure.get("fidelity")
-        if (
-            code not in _FIDELITY_FIELDS
-            or not isinstance(fidelity, Mapping)
-            or set(fidelity) != set(_FIDELITY_MONITOR_FIELDS)
-            or any(type(fidelity[field]) is not bool for field in _FIDELITY_MONITOR_FIELDS)
-            or fidelity[code] is not True
-            or fidelity["monitor_active"] is not True
-            or fidelity["monitor_observed"] is not True
-        ):
+        try:
+            validate_fidelity(fidelity, code=code if isinstance(code, str) else None)
+        except ValueError as error:
+            raise ValueError("gate fidelity failure is invalid") from error
+        if code not in _FIDELITY_FIELDS:
             raise ValueError("gate fidelity failure is invalid")
     return bool(failures)
 
@@ -102,13 +102,11 @@ def evaluate_gate(report: Mapping[str, object]) -> GateDecision:
         if not isinstance(trial, Mapping):
             raise ValueError("trial is invalid")
         fidelity = trial.get("fidelity")
-        if (
-            not isinstance(fidelity, Mapping) or set(fidelity) != set(_FIDELITY_MONITOR_FIELDS)
-            or any(type(fidelity.get(field)) is not bool for field in _FIDELITY_MONITOR_FIELDS)
-            or fidelity["monitor_active"] is not True or fidelity["monitor_observed"] is not True
-        ):
-            raise ValueError("trial fidelity is invalid")
-        if any(fidelity[field] for field in _FIDELITY_FIELDS):
+        try:
+            validated_fidelity = validate_fidelity(fidelity)
+        except ValueError as error:
+            raise ValueError("trial fidelity is invalid") from error
+        if any(validated_fidelity[field] for field in _FIDELITY_FIELDS):
             return GateDecision("fidelity_stop", "episode_fidelity")
     if executions == 0:
         raise ValueError("execution_count is invalid")
@@ -253,7 +251,6 @@ def _validate_gate_fidelity_failures(value: object, *, expected_assignment_ids: 
         "assignment_id", "ledger_id", "lease_id", "worker_id", "session_id", "generation",
         "fidelity_code", "fidelity", "runtime",
     }
-    fidelity_fields = set(_FIDELITY_MONITOR_FIELDS)
     runtime_fields = {"simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device"}
     seen: set[tuple[str, str, int]] = set()
     validated: list[dict[str, object]] = []
@@ -271,15 +268,16 @@ def _validate_gate_fidelity_failures(value: object, *, expected_assignment_ids: 
             or not isinstance(session_id, str) or not session_id or any(char.isspace() for char in session_id)
             or type(generation) is not int or generation < 1
             or code not in _FIDELITY_FIELDS
-            or not isinstance(fidelity, Mapping) or set(fidelity) != fidelity_fields
-            or any(type(fidelity[field]) is not bool for field in fidelity_fields)
-            or fidelity[code] is not True or fidelity["monitor_active"] is not True or fidelity["monitor_observed"] is not True
             or not isinstance(runtime, Mapping) or set(runtime) != runtime_fields
             or runtime["simulation_device"] != "cpu" or runtime["cloth_device"] != "cpu"
             or not all(isinstance(runtime[field], str) and re.fullmatch(r"cuda:[0-9]+", runtime[field]) for field in ("renderer_device", "camera_device", "policy_device"))
             or len({runtime["renderer_device"], runtime["camera_device"], runtime["policy_device"]}) != 1
         ):
             raise ValueError("report gate fidelity failure is invalid")
+        try:
+            validate_fidelity(fidelity, code=code)
+        except ValueError as error:
+            raise ValueError("report gate fidelity failure is invalid") from error
         key = (ledger_id, lease_id, generation)
         if key in seen:
             raise ValueError("report gate fidelity failure is duplicated")
@@ -351,12 +349,10 @@ def _authenticate_report(report: object, *, report_bytes: bytes, matrix_rows: li
                 or not all(isinstance(device, str) and re.fullmatch(r"cuda:[0-9]+", device) for device in (renderer, camera, policy_device))
                 or len({renderer, camera, policy_device}) != 1):
             raise ValueError("report device provenance is invalid")
-        if (
-            set(fidelity) != set(_FIDELITY_MONITOR_FIELDS)
-            or any(type(fidelity.get(key)) is not bool for key in _FIDELITY_MONITOR_FIELDS)
-            or fidelity["monitor_active"] is not True or fidelity["monitor_observed"] is not True
-        ):
-            raise ValueError("report fidelity evidence is invalid")
+        try:
+            validate_fidelity(fidelity)
+        except ValueError as error:
+            raise ValueError("report fidelity evidence is invalid") from error
         by_id[assignment_id] = trial
         runtime.add(_runtime_identity(identity, provenance))
         successes += int(official_success)

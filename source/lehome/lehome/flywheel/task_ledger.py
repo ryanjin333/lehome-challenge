@@ -18,6 +18,8 @@ from threading import RLock
 from time import time_ns
 from typing import Any, Callable, Iterator, Mapping
 
+from .fidelity import FIDELITY_CODES, validate_fidelity
+
 
 MAX_CAMPAIGN_ATTEMPTS = 400
 MAX_ACCEPTED_EPISODES = 150
@@ -363,18 +365,12 @@ class TaskLedger:
         attempt_id = _require_identifier(attempt_id, field="attempt_id")
         lease_id = _require_identifier(lease_id, field="lease_id")
         session_id = _require_identifier(session_id, field="session_id")
-        fields = {
-            "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure",
-            "monitor_active", "monitor_observed",
-        }
-        if (fidelity_code not in {"missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure"}
-                or type(generation) is not int or generation < 1
-                or not isinstance(fidelity, Mapping) or set(fidelity) != fields
-                or any(type(fidelity[field]) is not bool for field in fields)
-                or fidelity[fidelity_code] is not True
-                or fidelity["monitor_active"] is not True
-                or fidelity["monitor_observed"] is not True):
+        if fidelity_code not in FIDELITY_CODES or type(generation) is not int or generation < 1:
             raise ValueError("fidelity abort evidence is invalid")
+        try:
+            validated_fidelity = validate_fidelity(fidelity, code=fidelity_code)
+        except ValueError as error:
+            raise ValueError("fidelity abort evidence is invalid") from error
         runtime_fields = {"simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device"}
         if (
             not isinstance(runtime, Mapping)
@@ -384,7 +380,7 @@ class TaskLedger:
             raise ValueError("fidelity abort runtime is invalid")
         payload = {
             "failure_class": "fidelity", "fidelity_code": fidelity_code,
-            "fidelity": dict(fidelity), "lease_id": lease_id, "worker_id": worker_id,
+            "fidelity": validated_fidelity, "lease_id": lease_id, "worker_id": worker_id,
             "session_id": session_id, "generation": generation, "runtime": dict(runtime),
         }
         with self._write():

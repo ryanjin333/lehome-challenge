@@ -20,6 +20,8 @@ import traceback
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
+from .fidelity import FIDELITY_CODES, validate_fidelity
+
 
 ACTION_HORIZON = 16
 _SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -49,21 +51,15 @@ class SimulatorNumericalDivergenceError(InfrastructureInvalidAttemptError):
 class FidelityFailureError(InfrastructureInvalidAttemptError):
     """A typed pre-frame physical or safety fidelity failure."""
 
-    _CODES = {"missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure"}
-    _FIELDS = _CODES | {"monitor_active", "monitor_observed"}
-
     def __init__(self, fidelity_code: str, fidelity: Mapping[str, object]) -> None:
-        if (
-            fidelity_code not in self._CODES
-            or set(fidelity) != self._FIELDS
-            or any(type(fidelity[field]) is not bool for field in self._FIELDS)
-            or fidelity[fidelity_code] is not True
-            or fidelity["monitor_active"] is not True
-            or fidelity["monitor_observed"] is not True
-        ):
+        if fidelity_code not in FIDELITY_CODES:
             raise ValueError("fidelity failure evidence is invalid")
+        try:
+            validated = validate_fidelity(fidelity, code=fidelity_code)
+        except ValueError as error:
+            raise ValueError("fidelity failure evidence is invalid") from error
         self.fidelity_code = fidelity_code
-        self.fidelity = dict(fidelity)
+        self.fidelity = validated
         super().__init__(fidelity_code)
 
 

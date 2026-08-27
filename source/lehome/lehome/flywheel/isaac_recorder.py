@@ -14,6 +14,7 @@ import numpy as np
 
 from .artifacts import EpisodeArtifactWriter, atomic_write_json
 from .export import ExpertWindow, SelectionReport, build_selection_report, select_expert_windows
+from .fidelity import validate_fidelity
 from .models import ActionSource, EpisodeFrame, EpisodeIdentity, EpisodeOutcome, QualityGrade
 from .snapshots import Snapshot, canonical_reset_hash
 
@@ -118,17 +119,10 @@ def _identity_payload(identity: EpisodeIdentity) -> dict[str, object]:
 
 
 def _validated_simple_curriculum_fidelity(fidelity: Mapping[str, object] | None) -> dict[str, bool]:
-    fields = {
-        "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure",
-        "monitor_active", "monitor_observed",
-    }
-    if not isinstance(fidelity, Mapping) or set(fidelity) != fields:
-        raise ValueError("simple curriculum fidelity evidence is incomplete")
-    if any(type(fidelity[field]) is not bool for field in fields):
-        raise ValueError("simple curriculum fidelity evidence must be boolean")
-    if fidelity["monitor_active"] is not True or fidelity["monitor_observed"] is not True:
-        raise ValueError("simple curriculum fidelity monitors must be active and observed")
-    return {field: fidelity[field] for field in sorted(fields)}
+    try:
+        return validate_fidelity(fidelity)
+    except ValueError as error:
+        raise ValueError("simple curriculum fidelity evidence is invalid") from error
 
 
 class MixedSourceRecorder:

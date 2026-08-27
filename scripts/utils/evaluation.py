@@ -33,6 +33,7 @@ from lehome.flywheel.persistent_worker import (
     FidelityFailureError,
     SimulatorNumericalDivergenceError,
 )
+from lehome.flywheel.fidelity import CLOTH_FIDELITY_CODES, FIDELITY_FIELDS, validate_fidelity
 
 logger = get_logger(__name__)
 
@@ -145,26 +146,18 @@ def _require_flywheel_cloth_health(
             "simulator_numerical_divergence: cloth health readback unavailable"
         )
     health = check()
-    if isinstance(health, Mapping):
-        fidelity = health.get("fidelity")
-        required = {
-            "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "monitor_active", "monitor_observed",
-        }
-        if (
-            simple_curriculum_collection and isinstance(fidelity, Mapping)
-            and set(fidelity) == required
-            and all(type(fidelity[field]) is bool for field in required)
-            and fidelity["monitor_active"] is True
-            and fidelity["monitor_observed"] is True
-        ):
-            typed = {
-                "missing_cloth": fidelity["missing_cloth"], "cloth_flight": fidelity["cloth_flight"],
-                "nonfinite_cloth_state": fidelity["nonfinite_cloth_state"], "safety_failure": False,
-                "monitor_active": fidelity["monitor_active"], "monitor_observed": fidelity["monitor_observed"],
-            }
-            for code in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state"):
-                if typed[code]:
-                    raise FidelityFailureError(code, typed)
+    if simple_curriculum_collection:
+        try:
+            cloth_fidelity = validate_fidelity(
+                health.get("fidelity") if isinstance(health, Mapping) else None,
+            )
+        except ValueError as error:
+            raise SimulatorNumericalDivergenceError(
+                "flywheel cloth fidelity evidence is invalid"
+            ) from error
+        for code in CLOTH_FIDELITY_CODES:
+            if cloth_fidelity[code]:
+                raise FidelityFailureError(code, cloth_fidelity)
     if not isinstance(health, Mapping) or health.get("healthy") is not True:
         reason = (
             health.get("reason", "simulator_numerical_divergence")
@@ -1053,19 +1046,15 @@ def run_evaluation_loop(
         policy_action_outside_live_joint_limit_step_counts: dict[str, int] = {}
         policy_action_max_limit_violation_rad: dict[str, float] = {}
         policy_action_max_target_to_live_joint_position_delta_rad: dict[str, float] = {}
-        fidelity = {
-            "missing_cloth": False, "cloth_flight": False,
-            "nonfinite_cloth_state": False, "safety_failure": False,
-            "monitor_active": simple_curriculum_collection,
-            "monitor_observed": False,
-        }
+        fidelity = {field: False for field in FIDELITY_FIELDS}
         if simple_curriculum_collection and recorder is not None:
-            reset_fidelity = reset_cloth_health.get("fidelity")
-            if not isinstance(reset_fidelity, Mapping):
-                raise SimulatorNumericalDivergenceError("flywheel cloth fidelity monitor evidence is missing")
-            for field in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state"):
-                if type(reset_fidelity.get(field)) is not bool:
-                    raise SimulatorNumericalDivergenceError("flywheel cloth fidelity evidence is invalid")
+            try:
+                reset_fidelity = validate_fidelity(reset_cloth_health.get("fidelity"))
+            except ValueError as error:
+                raise SimulatorNumericalDivergenceError(
+                    "flywheel cloth fidelity evidence is invalid"
+                ) from error
+            for field in FIDELITY_FIELDS:
                 fidelity[field] = fidelity[field] or reset_fidelity[field]
 
         for st in range(args.max_steps):
@@ -1213,7 +1202,6 @@ def run_evaluation_loop(
                         "flywheel action validation requires finite raw policy targets"
                     )
                 if simple_curriculum_collection:
-                    fidelity["monitor_observed"] = True
                     outside_count = policy_action_diagnostics.get("policy_action_outside_live_joint_limit_count")
                     if type(outside_count) is not int:
                         raise SimulatorNumericalDivergenceError("flywheel safety monitor evidence is invalid")
@@ -1225,12 +1213,13 @@ def run_evaluation_loop(
                     simple_curriculum_collection=simple_curriculum_collection,
                 )
                 if simple_curriculum_collection:
-                    cloth_fidelity = cloth_health.get("fidelity")
-                    if not isinstance(cloth_fidelity, Mapping):
-                        raise SimulatorNumericalDivergenceError("flywheel cloth fidelity monitor evidence is missing")
-                    for field in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state"):
-                        if type(cloth_fidelity.get(field)) is not bool:
-                            raise SimulatorNumericalDivergenceError("flywheel cloth fidelity evidence is invalid")
+                    try:
+                        cloth_fidelity = validate_fidelity(cloth_health.get("fidelity"))
+                    except ValueError as error:
+                        raise SimulatorNumericalDivergenceError(
+                            "flywheel cloth fidelity evidence is invalid"
+                        ) from error
+                    for field in FIDELITY_FIELDS:
                         fidelity[field] = fidelity[field] or cloth_fidelity[field]
             if recorder is not None:
                 current_contact = env.flywheel_visible_garment_contact()

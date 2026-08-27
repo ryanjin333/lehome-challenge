@@ -969,7 +969,12 @@ def test_collider_health_and_admission_gate_fail_closed_with_live_evidence() -> 
             }
         ],
     }
-    namespace = {"np": np, "audit_current_usd_stage": lambda: collision_health}
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    namespace = {
+        "np": np, "audit_current_usd_stage": lambda: collision_health,
+        "ClothFidelityError": ClothFidelityError,
+    }
     exec(compile(env_module, str(env_source_path), "exec"), namespace)
     env = types.SimpleNamespace(_flywheel_collider_health=None)
     env.flywheel_collider_health = types.MethodType(namespace["flywheel_collider_health"], env)
@@ -977,7 +982,8 @@ def test_collider_health_and_admission_gate_fail_closed_with_live_evidence() -> 
     assert {key: health[key] for key in collision_health} == collision_health
     assert health["fidelity"] == {
         "missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False,
-        "monitor_active": True, "monitor_observed": False,
+        "safety_failure": False,
+        "monitor_active": True, "monitor_observed": True,
     }
 
     evaluation_source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
@@ -2550,7 +2556,16 @@ def test_cloth_physical_health_rejects_finite_but_astronomical_state() -> None:
         )
     )
 
-    assert namespace["flywheel_cloth_physical_health"](normal)["healthy"] is True
+    healthy = namespace["flywheel_cloth_physical_health"](normal)
+    assert healthy["healthy"] is True
+    assert healthy["fidelity"] == {
+        "missing_cloth": False,
+        "cloth_flight": False,
+        "nonfinite_cloth_state": False,
+        "safety_failure": False,
+        "monitor_active": True,
+        "monitor_observed": True,
+    }
     health = namespace["flywheel_cloth_physical_health"](divergent)
     assert health["healthy"] is False
     assert health["reason"] == "simulator_numerical_divergence"
@@ -2704,7 +2719,9 @@ def test_cloth_physical_health_classifies_invalid_physx_readback_as_divergence()
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     invalid = types.SimpleNamespace(
@@ -2728,8 +2745,9 @@ def test_cloth_physical_health_classifies_invalid_physx_readback_as_divergence()
         "missing_cloth": False,
         "cloth_flight": False,
         "nonfinite_cloth_state": False,
+        "safety_failure": False,
         "monitor_active": True,
-        "monitor_observed": False,
+        "monitor_observed": True,
     }
 
 
@@ -2753,7 +2771,9 @@ def test_physx_cloth_readback_diagnoses_each_bounded_failure_class() -> None:
         type_ignores=[],
     )
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     class Cloth:
@@ -3052,7 +3072,8 @@ def test_structured_cloth_failure_uses_typed_semantics_only_for_simple_curriculu
         "healthy": False,
         "fidelity": {
             "missing_cloth": True, "cloth_flight": False,
-            "nonfinite_cloth_state": False, "monitor_active": True, "monitor_observed": True,
+            "nonfinite_cloth_state": False, "safety_failure": False,
+            "monitor_active": True, "monitor_observed": True,
         },
     }
     env = types.SimpleNamespace(flywheel_cloth_physical_health=lambda: health)
@@ -3074,6 +3095,23 @@ def test_simple_curriculum_cloth_failure_with_unobserved_monitor_is_generic_infr
     })
 
     with pytest.raises(evaluation.SimulatorNumericalDivergenceError):
+        evaluation._require_flywheel_cloth_health(env, simple_curriculum_collection=True)
+
+
+@pytest.mark.parametrize("field", ["monitor_active", "monitor_observed"])
+def test_simple_curriculum_healthy_cloth_receipt_requires_observed_monitors(monkeypatch, field: str) -> None:
+    evaluation = _evaluation(monkeypatch)
+    fidelity = {
+        "missing_cloth": False, "cloth_flight": False,
+        "nonfinite_cloth_state": False, "safety_failure": False,
+        "monitor_active": True, "monitor_observed": True,
+    }
+    fidelity[field] = False
+    env = types.SimpleNamespace(flywheel_cloth_physical_health=lambda: {
+        "healthy": True, "fidelity": fidelity,
+    })
+
+    with pytest.raises(evaluation.SimulatorNumericalDivergenceError, match="fidelity evidence"):
         evaluation._require_flywheel_cloth_health(env, simple_curriculum_collection=True)
 
 
@@ -3138,7 +3176,14 @@ def test_cpu_controlled_recovery_bootstrap_receives_a_source_seeded_reset_callba
         reset=lambda: events.append("reset"),
         set_seed=lambda seed: events.append(("seed", seed)),
         apply_flywheel_randomization=lambda _sampled: {},
-        flywheel_cloth_physical_health=lambda: {"healthy": True},
+        flywheel_cloth_physical_health=lambda: {
+            "healthy": True,
+            "fidelity": {
+                "missing_cloth": False, "cloth_flight": False,
+                "nonfinite_cloth_state": False, "safety_failure": False,
+                "monitor_active": True, "monitor_observed": True,
+            },
+        },
         _get_observations=lambda: {"observation.state": np.zeros(12, dtype=np.float32)},
         _get_success=lambda: False,
         _get_rewards=lambda: 0.0,
@@ -3917,7 +3962,14 @@ def test_recorder_flywheel_step_forwards_finite_out_of_limit_policy_target_uncha
         ),
         reset=lambda: None,
         apply_flywheel_randomization=lambda _sampled: {},
-        flywheel_cloth_physical_health=lambda: {"healthy": True},
+        flywheel_cloth_physical_health=lambda: {
+            "healthy": True,
+            "fidelity": {
+                "missing_cloth": False, "cloth_flight": False,
+                "nonfinite_cloth_state": False, "safety_failure": False,
+                "monitor_active": True, "monitor_observed": True,
+            },
+        },
         flywheel_visible_garment_contact=lambda: {
             "observed": True,
             "minimum_distance_m": 0.01,
@@ -3962,7 +4014,10 @@ def test_recorder_flywheel_step_forwards_finite_out_of_limit_policy_target_uncha
         save_video=False,
     )
 
-    evaluation.run_evaluation_loop(env, policy, args, garment_name="Top_Long_Seen_0")
+    evaluation.run_evaluation_loop(
+        env, policy, args, garment_name="Top_Long_Seen_0",
+        simple_curriculum_collection=True,
+    )
 
     assert raw_diagnostics[0]["policy_action_outside_live_joint_limit_count"] == 2
     assert raw_diagnostics[0]["policy_action_joint_diagnostics"]["left_elbow_flex"] == {
@@ -3989,6 +4044,11 @@ def test_recorder_flywheel_step_forwards_finite_out_of_limit_policy_target_uncha
         "visible_contact": {
             "observed": True,
             "minimum_distance_m": 0.01,
+        },
+        "fidelity": {
+            "missing_cloth": False, "cloth_flight": False,
+            "nonfinite_cloth_state": False, "safety_failure": True,
+            "monitor_active": True, "monitor_observed": True,
         },
     }]
 
