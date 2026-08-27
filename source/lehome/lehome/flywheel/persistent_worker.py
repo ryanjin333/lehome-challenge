@@ -430,7 +430,7 @@ class PersistentRolloutWorker:
             status = self._controller.status(attempt_id)
             if status in {"accepted", "rejected"}:
                 return status
-            if status == "retryable" and allow_retryable:
+            if status in {"retryable", "leased"} and allow_retryable:
                 return status
             if status == "infrastructure_abort":
                 raise RuntimeError(f"{context} finalization infrastructure abort")
@@ -673,7 +673,7 @@ class PersistentRolloutWorker:
                         attempt_id=attempt_id,
                         allow_retryable=self._simple_curriculum_collection,
                     )
-                    if finalization_status == "retryable":
+                    if finalization_status in {"retryable", "leased"}:
                         continue
                 receipts.append(receipt)
         finally:

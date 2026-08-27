@@ -204,6 +204,75 @@ def test_exact_partition_redrains_a_row_retried_by_the_late_finalizer(tmp_path) 
         ledger.close()
 
 
+def test_exact_partition_accepts_a_late_retry_claimed_by_another_worker(tmp_path) -> None:
+    """A finalizer retry leased elsewhere is progress, not a worker-A crash."""
+
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    ledger = TaskLedger(
+        tmp_path / "ledger.sqlite3",
+        attempt_matrix=[{"garment": "Top_Long_Seen_0", "seed": 11}],
+        max_attempts=2,
+        target_accepted=1,
+        completion_metric="terminal_outcomes",
+        clock_ns=lambda: 1,
+    )
+    transferred_lease = None
+
+    class OwnershipTransferController:
+        def __init__(self) -> None:
+            self.status_calls = 0
+
+        def lease_next(self, worker_id: str):
+            return ledger.lease_next(worker_id, lease_duration_ns=10**18)
+
+        def heartbeat(self, worker_id: str, attempt_id: str, lease_id: str):
+            return ledger.heartbeat(
+                worker_id, attempt_id, lease_id, lease_duration_ns=10**18,
+            )
+
+        def record_terminal(
+            self, worker_id: str, attempt_id: str, lease_id: str, raw_artifact_id: str,
+        ):
+            return ledger.record_terminal(worker_id, attempt_id, lease_id, raw_artifact_id)
+
+        def status(self, attempt_id: str) -> str:
+            nonlocal transferred_lease
+            self.status_calls += 1
+            if self.status_calls == 1:
+                return ledger.status(attempt_id)
+            ledger.retry_terminal_infrastructure(
+                attempt_id, reason="malformed_handoff",
+            )
+            transferred_lease = ledger.lease_next(
+                "worker-1", lease_duration_ns=10**18,
+            )
+            assert transferred_lease is not None
+            return ledger.status(attempt_id)
+
+    controller = OwnershipTransferController()
+    session = FakeSession()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+        simple_curriculum_collection=True,
+    )
+
+    try:
+        assert worker.run() == []
+        assert len(session.runs) == 1
+        assert transferred_lease is not None
+        assert transferred_lease.worker_id == "worker-1"
+        assert ledger.status(transferred_lease.attempt.attempt_id) == "leased"
+        assert [event.event_type for event in ledger.events()] == [
+            "leased", "terminal_pending_validation", "retryable", "leased",
+        ]
+    finally:
+        ledger.close()
+
+
 def test_policy_action_safety_rejection_durably_rejects_source_lease_and_continues(
     tmp_path,
 ) -> None:
