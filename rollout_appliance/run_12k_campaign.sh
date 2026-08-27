@@ -59,6 +59,11 @@ CONTROLLED_RECOVERY_SMOKE_ROW_INDEX="${LEHOME_CONTROLLED_RECOVERY_SMOKE_ROW_INDE
 SNAPSHOT_SOURCE_BOOTSTRAP="${LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP:-0}"
 SUCCESS_REPLAY_CAMPAIGN="${LEHOME_SUCCESS_REPLAY_CAMPAIGN:-0}"
 HARD_STATE_CAMPAIGN="${LEHOME_HARD_STATE_CAMPAIGN:-0}"
+SIMPLE_CURRICULUM_COLLECTION="${LEHOME_SIMPLE_CURRICULUM_COLLECTION:-0}"
+COMPLETION_METRIC="${LEHOME_COMPLETION_METRIC:-accepted_successes}"
+PARTITION_ID="${LEHOME_PARTITION_ID:-}"
+PARENT_MATRIX_SHA256="${LEHOME_PARENT_MATRIX_SHA256:-}"
+CODE_ROOT_SHA256="${LEHOME_CODE_ROOT_SHA256:-}"
 RESUME_PREEMPTED_ROLLOUT="${LEHOME_RESUME_PREEMPTED_ROLLOUT:-0}"
 EVALUATION_TERMINAL_UPLOAD="${LEHOME_EVALUATION_TERMINAL_UPLOAD:-0}"
 FRESH_GARMENT_WAVES="${LEHOME_FRESH_GARMENT_WAVES:-${EVALUATION_TERMINAL_UPLOAD}}"
@@ -101,14 +106,43 @@ case "${HARD_STATE_CAMPAIGN}" in
   "0"|"1") ;;
   *) echo "LEHOME_HARD_STATE_CAMPAIGN must be exactly 0 or 1" >&2; exit 2 ;;
 esac
-if (( 10#${SUCCESS_REPLAY_CAMPAIGN} + 10#${HARD_STATE_CAMPAIGN} + 10#${EVALUATION_TERMINAL_UPLOAD} > 1 )); then
+case "${SIMPLE_CURRICULUM_COLLECTION}" in
+  "0"|"1") ;;
+  *) echo "LEHOME_SIMPLE_CURRICULUM_COLLECTION must be exactly 0 or 1" >&2; exit 2 ;;
+esac
+case "${COMPLETION_METRIC}" in
+  "accepted_successes"|"terminal_outcomes") ;;
+  *) echo "LEHOME_COMPLETION_METRIC must be accepted_successes or terminal_outcomes" >&2; exit 2 ;;
+esac
+if (( 10#${SUCCESS_REPLAY_CAMPAIGN} + 10#${HARD_STATE_CAMPAIGN} + 10#${EVALUATION_TERMINAL_UPLOAD} + 10#${SIMPLE_CURRICULUM_COLLECTION} > 1 )); then
   echo "CPU campaign mode markers are mutually exclusive" >&2
   exit 2
+fi
+if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
+  if [ "${SIMULATOR_DEVICE}" != "cpu" ] || [ "${WORKER_COUNT}" != "4" ] \
+      || [ "${ENABLE_HF_UPLOAD}" != "1" ] || [ "${SKIP_ROUND_SEAL}" != "1" ] \
+      || [ "${POLICY_STEP}" != "12000" ] || [ "${COMPLETION_METRIC}" != "terminal_outcomes" ] \
+      || [ "${EVALUATION_TERMINAL_UPLOAD}" != "0" ] || [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "0" ] \
+      || [ "${SUCCESS_REPLAY_CAMPAIGN}" != "0" ] || [ "${HARD_STATE_CAMPAIGN}" != "0" ] \
+      || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || [ "${FRESH_GARMENT_WAVES}" != "0" ]; then
+    echo "simple curriculum requires the exact CPU fresh-outcome tuple" >&2
+    exit 2
+  fi
+  case "${PARTITION_ID}:${MAX_ATTEMPTS}:${TARGET_ACCEPTED}" in
+    "calibration-head:150:100"|"calibration-tail:400:300"|"curriculum-a:400:300"|"curriculum-b:400:300") ;;
+    *) echo "simple curriculum partition requires an exact row/target/lease tuple" >&2; exit 2 ;;
+  esac
+  if ! [[ "${PARENT_MATRIX_SHA256}" =~ ^[0-9a-f]{64}$ ]] || ! [[ "${CODE_ROOT_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "simple curriculum partition identity requires parent and code SHA-256 values" >&2
+    exit 2
+  fi
 fi
 case "${SIMULATOR_DEVICE}" in
   "cuda:0") ;;
   "cpu")
-    if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
+    if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
+      : # Exact tuple and immutable row contract are checked below.
+    elif [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
       if [ "${WORKER_COUNT}" != "4" ] || [ "${ENABLE_HF_UPLOAD}" != "1" ] \
           || [ "${SKIP_ROUND_SEAL}" != "0" ] || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] \
           || [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "0" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ]; then
@@ -236,7 +270,48 @@ if [ "${MATRIX_ACTUAL_SHA256}" != "${MATRIX_EXPECTED_SHA256}" ]; then
   echo "attempt matrix SHA-256 mismatch: expected ${MATRIX_EXPECTED_SHA256}, got ${MATRIX_ACTUAL_SHA256}" >&2
   exit 2
 fi
-if [ "${SKIP_ROUND_SEAL}" = "1" ] && [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" = "1" ]; then
+if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
+  python3 - "${MATRIX}" "${PARTITION_ID}" "${PARENT_MATRIX_SHA256}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" <<'PY'
+import json, re, sys
+from pathlib import Path
+
+path, partition_id, parent_sha, lease_budget, target = Path(sys.argv[1]), *sys.argv[2:]
+try:
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    lease_budget, target = int(lease_budget), int(target)
+except (OSError, ValueError) as error:
+    raise SystemExit(f"simple curriculum matrix is malformed: {error}")
+contracts = {
+    "calibration-head": (100, 100, 150, "calibration"),
+    "calibration-tail": (300, 300, 400, "calibration"),
+    "curriculum-a": (300, 300, 400, "curriculum"),
+    "curriculum-b": (300, 300, 400, "curriculum"),
+}
+expected = contracts.get(partition_id)
+if expected is None or not isinstance(rows, list) or (len(rows), target, lease_budget) != expected[:3]:
+    raise SystemExit("simple curriculum partition row/target/lease tuple is invalid")
+expected_stage = contracts[partition_id][3]
+categories = {
+    "top_long": r"Top_Long_Seen_[0-9]", "top_short": r"Top_Short_Seen_[0-9]",
+    "pant_long": r"Pant_Long_Seen_[0-9]", "pant_short": r"Pant_Short_Seen_[0-9]",
+}
+attempt_ids, trial_ids, seeds = set(), set(), set()
+for row in rows:
+    if not isinstance(row, dict): raise SystemExit("simple curriculum matrix row is invalid")
+    attempt_id, trial_id, seed = row.get("attempt_id"), row.get("trial_id"), row.get("seed")
+    category, garment = row.get("category"), row.get("garment")
+    if (row.get("campaign_kind") != "simple_curriculum_source_v1" or row.get("logical_stage") != expected_stage
+            or row.get("strategy") != "canonical" or row.get("release_stage") != "seen"
+            or row.get("partition_id") != partition_id or row.get("parent_matrix_sha256") != parent_sha
+            or not isinstance(attempt_id, str) or not attempt_id or not isinstance(trial_id, str) or not trial_id
+            or type(seed) is not int or not 0 <= seed < 2**32 or row.get("source_seed") != seed
+            or category not in categories or not isinstance(garment, str)
+            or row.get("garment_name") != garment or re.fullmatch(categories[category], garment) is None
+            or attempt_id in attempt_ids or trial_id in trial_ids or seed in seeds):
+        raise SystemExit("simple curriculum matrix identity or fresh canonical row is invalid")
+    attempt_ids.add(attempt_id); trial_ids.add(trial_id); seeds.add(seed)
+PY
+elif [ "${SKIP_ROUND_SEAL}" = "1" ] && [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" = "1" ]; then
   if [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || ! [[ "${WORKER_COUNT}" =~ ^(1|4)$ ]] \
       || [ "${ENABLE_HF_UPLOAD}" != "1" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ] \
       || ! [[ "${MAX_WORKER_RESTARTS}" =~ ^(0|8)$ ]] \
@@ -341,7 +416,8 @@ elif [ "${CONTROLLED_RECOVERY_SMOKE}" = "1" ]; then
   echo "LEHOME_CONTROLLED_RECOVERY_SMOKE requires LEHOME_SKIP_ROUND_SEAL=1" >&2
   exit 2
 fi
-if [ "${RESUME_PREEMPTED_ROLLOUT}" = "1" ] && [ "${CONTROLLED_RECOVERY_SMOKE}" != "1" ]; then
+if [ "${RESUME_PREEMPTED_ROLLOUT}" = "1" ] && [ "${CONTROLLED_RECOVERY_SMOKE}" != "1" ] \
+    && [ "${SIMPLE_CURRICULUM_COLLECTION}" != "1" ]; then
   echo "preemption resume is reserved for the exact controlled-recovery smoke tuple" >&2
   exit 2
 fi
@@ -374,22 +450,42 @@ PY
     exit 2
   fi
 fi
+case "${LEHOME_VALIDATE_MATRIX_ONLY:-0}" in
+  "0"|"1") ;;
+  *) echo "LEHOME_VALIDATE_MATRIX_ONLY must be exactly 0 or 1" >&2; exit 2 ;;
+esac
 if [ "${LEHOME_VALIDATE_MATRIX_ONLY:-0}" = "1" ]; then
   exit 0
 fi
 
 if [ "${RESUME_PREEMPTED_ROLLOUT}" = "1" ]; then
-  PYTHONPATH="/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${LEDGER}" "${MATRIX}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" <<'PY'
+  PYTHONPATH="/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${LEDGER}" "${MATRIX}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" "${COMPLETION_METRIC}" "${PREEMPTION_CONTEXT}" "${SIMPLE_CURRICULUM_COLLECTION}" "${PARTITION_ID}" "${PARENT_MATRIX_SHA256}" "${CODE_ROOT_SHA256}" "${MATRIX_ACTUAL_SHA256}" "${POLICY_REPO}" "${POLICY_REVISION}" "${POLICY_STEP}" "${POLICY_ARTIFACT_SHA256}" "${POLICY_SHA256}" "${SIMULATOR_DEVICE}" "${TRAINER_IMAGE}" "${ROLLOUT_IMAGE}" <<'PY'
+import json
 import sys
 from pathlib import Path
 from lehome.flywheel.recovery_collection import load_attempt_matrix
 from lehome.flywheel.task_ledger import TaskLedger
 database, matrix = Path(sys.argv[1]), Path(sys.argv[2])
-if database.is_symlink() or not database.is_file(): raise SystemExit("controlled smoke resume ledger is missing or unsafe")
-ledger = TaskLedger(database, attempt_matrix=load_attempt_matrix(matrix), max_attempts=int(sys.argv[3]), target_accepted=int(sys.argv[4]))
+metric, descriptor_path, simple = sys.argv[5], Path(sys.argv[6]), sys.argv[7]
+if database.is_symlink() or not database.is_file(): raise SystemExit("resume ledger is missing or unsafe")
+if simple == "1":
+    if descriptor_path.is_symlink() or not descriptor_path.is_file(): raise SystemExit("simple curriculum resume descriptor is missing or unsafe")
+    try: descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error: raise SystemExit(f"simple curriculum resume descriptor is malformed: {error}")
+    expected = {
+        "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
+        "partition_id": sys.argv[8], "parent_matrix_sha256": sys.argv[9], "code_root_sha256": sys.argv[10],
+        "attempt_matrix_sha256": sys.argv[11], "policy_repo": sys.argv[12], "policy_revision": sys.argv[13],
+        "policy_step": int(sys.argv[14]), "policy_artifact_sha256": sys.argv[15], "policy_sha256": sys.argv[16],
+        "simulator_device": sys.argv[17], "renderer_device": "cuda:0", "policy_device": "cuda:0",
+        "trainer_image": sys.argv[18], "rollout_image": sys.argv[19],
+    }
+    if not isinstance(descriptor, dict) or any(descriptor.get(key) != value for key, value in expected.items()):
+        raise SystemExit("simple curriculum resume descriptor does not bind this immutable partition")
+ledger = TaskLedger(database, attempt_matrix=load_attempt_matrix(matrix), max_attempts=int(sys.argv[3]), target_accepted=int(sys.argv[4]), completion_metric=metric)
 try:
-    if ledger.is_terminal: raise SystemExit("controlled smoke resume refuses an already terminal campaign")
-    ledger.resume_after_preemption("explicit-controlled-recovery-smoke-resume")
+    if ledger.is_terminal: raise SystemExit("resume refuses an already terminal campaign")
+    ledger.resume_after_preemption("explicit-simple-curriculum-resume" if simple == "1" else "explicit-controlled-recovery-smoke-resume")
 finally:
     ledger.close()
 PY
@@ -407,7 +503,10 @@ write_preemption_context() {
     "${MATRIX}" "${MATRIX_ACTUAL_SHA256}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" "${active}" \
     "${CONTROLLED_RECOVERY_SMOKE}" "${CONTROLLED_RECOVERY_SMOKE_RUN_ID}" \
     "${CONTROLLED_RECOVERY_SMOKE_MATRIX_SHA256}" "${CONTROLLED_RECOVERY_SMOKE_MATERIALIZATION_SHA256}" \
-    "${CONTROLLED_RECOVERY_SMOKE_ROW_INDEX}" <<'PY'
+    "${CONTROLLED_RECOVERY_SMOKE_ROW_INDEX}" "${SIMPLE_CURRICULUM_COLLECTION}" "${COMPLETION_METRIC}" \
+    "${PARTITION_ID}" "${PARENT_MATRIX_SHA256}" "${CODE_ROOT_SHA256}" "${POLICY_REPO}" "${POLICY_REVISION}" \
+    "${POLICY_STEP}" "${POLICY_ARTIFACT_SHA256}" "${POLICY_SHA256}" "${SIMULATOR_DEVICE}" \
+    "${TRAINER_IMAGE}" "${ROLLOUT_IMAGE}" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -434,6 +533,24 @@ if sys.argv[10] == "1":
         "controlled_recovery_smoke_matrix_sha256": sys.argv[12],
         "controlled_recovery_smoke_materialization_sha256": sys.argv[13],
         "controlled_recovery_smoke_row_index": int(sys.argv[14]),
+    })
+if sys.argv[15] == "1":
+    payload.update({
+        "campaign_mode": "simple_curriculum_collection",
+        "completion_metric": sys.argv[16],
+        "partition_id": sys.argv[17],
+        "parent_matrix_sha256": sys.argv[18],
+        "code_root_sha256": sys.argv[19],
+        "policy_repo": sys.argv[20],
+        "policy_revision": sys.argv[21],
+        "policy_step": int(sys.argv[22]),
+        "policy_artifact_sha256": sys.argv[23],
+        "policy_sha256": sys.argv[24],
+        "simulator_device": sys.argv[25],
+        "renderer_device": "cuda:0",
+        "policy_device": "cuda:0",
+        "trainer_image": sys.argv[26],
+        "rollout_image": sys.argv[27],
     })
 temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
 descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -673,6 +790,7 @@ launch_worker() {
     -e LEHOME_EVALUATION_GARMENT_AFFINITY="${FRESH_GARMENT_WAVES}" \
     -e LEHOME_SUCCESS_REPLAY_CAMPAIGN="${SUCCESS_REPLAY_CAMPAIGN}" \
     -e LEHOME_HARD_STATE_CAMPAIGN="${HARD_STATE_CAMPAIGN}" \
+    -e LEHOME_SIMPLE_CURRICULUM_COLLECTION="${SIMPLE_CURRICULUM_COLLECTION}" \
     --entrypoint /isaac-sim/python.sh \
     "${ROLLOUT_IMAGE}" \
     /opt/lehome/scripts/run_groot_persistent_worker.py \
@@ -701,6 +819,7 @@ launch_worker() {
       --max_steps "${MAX_STEPS}" \
       --max-attempts "${MAX_ATTEMPTS}" \
       --target-accepted "${TARGET_ACCEPTED}" \
+      --completion-metric "${COMPLETION_METRIC}" \
       --save_video || docker_status=$?
   if [ "${docker_status}" -ne 0 ]; then
     return "${docker_status}"

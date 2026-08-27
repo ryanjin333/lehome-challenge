@@ -230,6 +230,55 @@ def _is_cpu_terminal_evaluation(matrix: list[Mapping[str, object]], args: argpar
     } == expected_rows
 
 
+def _is_exact_simple_curriculum_partition(matrix: list[Mapping[str, object]], args: argparse.Namespace) -> bool:
+    """Admit only one frozen physical partition of the fresh source matrices."""
+
+    contracts = {
+        "calibration-head": (100, 100, 150, "calibration"),
+        "calibration-tail": (300, 300, 400, "calibration"),
+        "curriculum-a": (300, 300, 400, "curriculum"),
+        "curriculum-b": (300, 300, 400, "curriculum"),
+    }
+    if args.device != "cpu" or getattr(args, "completion_metric", "accepted_successes") != "terminal_outcomes" or not matrix:
+        return False
+    partition_ids = {row.get("partition_id") for row in matrix}
+    parent_hashes = {row.get("parent_matrix_sha256") for row in matrix}
+    if len(partition_ids) != 1 or len(parent_hashes) != 1:
+        return False
+    partition_id = next(iter(partition_ids))
+    parent_sha = next(iter(parent_hashes))
+    contract = contracts.get(partition_id)
+    if (
+        contract is None or not isinstance(parent_sha, str) or re.fullmatch(r"[0-9a-f]{64}", parent_sha) is None
+        or (len(matrix), args.target_accepted, args.max_attempts) != contract[:3]
+    ):
+        return False
+    patterns = {
+        "top_long": r"Top_Long_Seen_[0-9]", "top_short": r"Top_Short_Seen_[0-9]",
+        "pant_long": r"Pant_Long_Seen_[0-9]", "pant_short": r"Pant_Short_Seen_[0-9]",
+    }
+    attempt_ids: set[str] = set()
+    trial_ids: set[str] = set()
+    seeds: set[int] = set()
+    for row in matrix:
+        attempt_id, trial_id, seed = row.get("attempt_id"), row.get("trial_id"), row.get("seed")
+        category, garment = row.get("category"), row.get("garment")
+        if (
+            row.get("campaign_kind") != "simple_curriculum_source_v1" or row.get("logical_stage") != contract[3]
+            or row.get("strategy") != "canonical" or row.get("release_stage") != "seen"
+            or not isinstance(attempt_id, str) or not attempt_id or not isinstance(trial_id, str) or not trial_id
+            or type(seed) is not int or not 0 <= seed < 2**32 or row.get("source_seed") != seed
+            or category not in patterns or not isinstance(garment, str) or row.get("garment_name") != garment
+            or re.fullmatch(patterns[category], garment) is None
+            or attempt_id in attempt_ids or trial_id in trial_ids or seed in seeds
+        ):
+            return False
+        attempt_ids.add(attempt_id)
+        trial_ids.add(trial_id)
+        seeds.add(seed)
+    return True
+
+
 def build_parser() -> argparse.ArgumentParser:
     from scripts.utils.parser import setup_eval_parser
 
@@ -247,6 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-attempts", type=int, default=400)
     parser.add_argument("--target-accepted", type=int, default=150)
+    parser.add_argument("--completion-metric", choices=("accepted_successes", "terminal_outcomes"), default="accepted_successes")
     parser.add_argument("--renderer-device", required=True, help="physical CUDA device used for renderer/cameras")
     parser.add_argument("--policy-device", required=True, help="physical CUDA device used by the policy gateway")
     parser.add_argument(
@@ -373,7 +423,10 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
     garment_affinity = affinity_value == "1"
     success_replay_campaign = os.environ.get("LEHOME_SUCCESS_REPLAY_CAMPAIGN") == "1"
     hard_state_campaign = os.environ.get("LEHOME_HARD_STATE_CAMPAIGN") == "1"
-    if sum((terminal_evaluation, success_replay_campaign, hard_state_campaign)) > 1:
+    simple_curriculum_collection = getattr(args, "simple_curriculum_collection", False)
+    if type(simple_curriculum_collection) is not bool:
+        raise ValueError("simple_curriculum_collection must be a boolean")
+    if sum((terminal_evaluation, success_replay_campaign, hard_state_campaign, simple_curriculum_collection)) > 1:
         raise ValueError("persistent CPU campaign mode markers are mutually exclusive")
     if terminal_evaluation and args.device != "cpu":
         raise ValueError("terminal evaluation requires CPU cloth")
@@ -385,7 +438,10 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
         raise ValueError("terminal CPU evaluation requires garment affinity")
     if garment_affinity and not (terminal_evaluation or source_discovery):
         raise ValueError("garment affinity is reserved for terminal CPU evaluation or source discovery")
-    if terminal_evaluation:
+    if simple_curriculum_collection:
+        if not _is_exact_simple_curriculum_partition(matrix, args):
+            raise ValueError("simple curriculum CPU partition is invalid")
+    elif terminal_evaluation:
         if not _is_cpu_terminal_evaluation(matrix, args):
             raise ValueError("terminal evaluation matrix is invalid")
         if garment_affinity and not any(
@@ -472,6 +528,7 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
         args.database, attempt_matrix=matrix,
         max_attempts=MAX_CAMPAIGN_ATTEMPTS if terminal_evaluation else args.max_attempts,
         target_accepted=args.target_accepted,
+        completion_metric=getattr(args, "completion_metric", "accepted_successes"),
     )
     try:
         factory = session_factory or (lambda: _build_cloth_session(args))
@@ -502,7 +559,7 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
             controller=LedgerWorkerController(
                 ledger,
                 lease_duration_ns=round(args.lease_seconds * 1_000_000_000),
-                retry_infrastructure_aborts=terminal_evaluation,
+                retry_infrastructure_aborts=terminal_evaluation or simple_curriculum_collection,
                 assignment_filter=(
                     {
                         "garment" if source_discovery else "garment_name":

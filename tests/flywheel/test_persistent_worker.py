@@ -866,6 +866,54 @@ def test_simple_curriculum_collection_marker_defaults_false_and_accepts_exact_va
         sys.path.remove(str(repository))
 
 
+def test_exact_simple_curriculum_partition_opens_terminal_outcome_ledger_and_retries_invalid_execution(tmp_path, monkeypatch) -> None:
+    from scripts.run_groot_persistent_worker import LedgerWorkerController, run
+
+    prefixes = ("Top_Long", "Top_Short", "Pant_Long", "Pant_Short")
+    categories = ("top_long", "top_short", "pant_long", "pant_short")
+    rows = [
+        {
+            "campaign_kind": "simple_curriculum_source_v1", "logical_stage": "calibration",
+            "attempt_id": f"head-{index}", "trial_id": f"head-trial-{index}",
+            "garment": f"{prefixes[index % 4]}_Seen_{index % 10}",
+            "garment_name": f"{prefixes[index % 4]}_Seen_{index % 10}", "category": categories[index % 4],
+            "release_stage": "seen", "seed": 90_000 + index, "source_seed": 90_000 + index,
+            "strategy": "canonical", "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64,
+        }
+        for index in range(100)
+    ]
+    matrix = tmp_path / "head.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    opened: list[dict[str, object]] = []
+
+    def ledger_factory(*_args, **kwargs):
+        opened.append(kwargs)
+        raise RuntimeError("ledger reached")
+
+    monkeypatch.delenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", raising=False)
+    monkeypatch.delenv("LEHOME_SUCCESS_REPLAY_CAMPAIGN", raising=False)
+    monkeypatch.delenv("LEHOME_HARD_STATE_CAMPAIGN", raising=False)
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0", lease_seconds=30.0,
+        preparation_timeout_seconds=30.0, attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=150, target_accepted=100, completion_metric="terminal_outcomes",
+        simple_curriculum_collection=True,
+    )
+
+    with pytest.raises(RuntimeError, match="ledger reached"):
+        run(args, ledger_factory=ledger_factory)
+
+    assert opened == [{"attempt_matrix": rows, "max_attempts": 150, "target_accepted": 100, "completion_metric": "terminal_outcomes"}]
+    # The exact worker controller turns an invalid execution into a retry,
+    # leaving the immutable row/seed available under the same lease budget.
+    class RetryLedger:
+        def record_interrupted(self, *_args): return "retryable"
+
+    assert LedgerWorkerController(RetryLedger(), lease_duration_ns=1, retry_infrastructure_aborts=True).record_infrastructure_abort(
+        "worker", "attempt", "lease", reason="isaac_timeout"
+    ) == "retryable"
+
+
 def test_parsed_default_simulator_inherits_a_nonzero_renderer_gpu(monkeypatch, tmp_path) -> None:
     repository = Path(__file__).resolve().parents[2]
     monkeypatch.syspath_prepend(str(repository))

@@ -55,6 +55,97 @@ def test_creates_deterministic_immutable_attempt_matrix_in_wal_mode(tmp_path) ->
         second.close()
 
 
+def test_terminal_outcome_completion_counts_policy_rejections_but_not_infrastructure_retries(tmp_path) -> None:
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    rows = _matrix(4)
+    ledger = TaskLedger(
+        tmp_path / "terminal-outcomes.sqlite3", attempt_matrix=rows,
+        max_attempts=5, target_accepted=3, completion_metric="terminal_outcomes", clock_ns=lambda: 1,
+    )
+    try:
+        first = ledger.lease_next("worker-a", lease_duration_ns=100)
+        assert first is not None
+        assert ledger.record_interrupted("worker-a", first.attempt.attempt_id, first.lease_id, "isaac_restart") == "retryable"
+        retry = ledger.lease_next("worker-b", lease_duration_ns=100)
+        assert retry is not None
+        assert retry.attempt == first.attempt
+        assert retry.attempt.assignment == rows[0]
+        assert ledger.completion_count == 0
+
+        assert ledger.reject_attempt("worker-b", retry.attempt.attempt_id, retry.lease_id, reason="policy_failure") == "rejected"
+        second = ledger.lease_next("worker-c", lease_duration_ns=100)
+        assert second is not None
+        assert ledger.record_infrastructure_abort("worker-c", second.attempt.attempt_id, second.lease_id, reason="isaac_timeout") == "infrastructure_abort"
+        assert ledger.completion_count == 1
+        third = ledger.lease_next("worker-d", lease_duration_ns=100)
+        assert third is not None
+        assert ledger.record_terminal("worker-d", third.attempt.attempt_id, third.lease_id, "raw-third") == "terminal_pending_validation"
+        assert ledger.validate_terminal(third.attempt.attempt_id, "accepted", artifact_id="accepted-third") == "accepted"
+        fourth = ledger.lease_next("worker-e", lease_duration_ns=100)
+        assert fourth is not None
+        assert ledger.reject_attempt("worker-e", fourth.attempt.attempt_id, fourth.lease_id, reason="policy_failure") == "rejected"
+
+        assert ledger.accepted_count() == 1
+        assert ledger.terminal_outcome_count() == 3
+        assert ledger.completion_count == 3
+        assert ledger.is_terminal
+        assert ledger.lease_next("worker-e", lease_duration_ns=100) is None
+    finally:
+        ledger.close()
+
+
+def test_completion_metric_and_all_immutable_metadata_reject_mismatched_reopen(tmp_path) -> None:
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    database = tmp_path / "immutable-metadata.sqlite3"
+    first = TaskLedger(
+        database, attempt_matrix=_matrix(3), max_attempts=4, target_accepted=3,
+        completion_metric="terminal_outcomes", clock_ns=lambda: 1,
+    )
+    first.close()
+    for kwargs in (
+        {"completion_metric": "accepted_successes"},
+        {"max_attempts": 3},
+        {"target_accepted": 2},
+    ):
+        options = {"max_attempts": 4, "target_accepted": 3, "completion_metric": "terminal_outcomes"}
+        options.update(kwargs)
+        with pytest.raises(ValueError, match="immutable"):
+            TaskLedger(database, attempt_matrix=_matrix(3), clock_ns=lambda: 1, **options)
+
+
+def test_legacy_accepted_success_completion_cap_is_unchanged(tmp_path) -> None:
+    from lehome.flywheel.task_ledger import MAX_ACCEPTED_EPISODES, TaskLedger
+
+    with pytest.raises(ValueError, match=str(MAX_ACCEPTED_EPISODES)):
+        TaskLedger(tmp_path / "legacy-cap.sqlite3", attempt_matrix=_matrix(1), target_accepted=151)
+
+
+@pytest.mark.parametrize("target", [100, 300])
+def test_terminal_outcome_partitions_complete_on_a_mix_of_successes_and_policy_failures(tmp_path, target: int) -> None:
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    ledger = TaskLedger(
+        tmp_path / f"terminal-{target}.sqlite3", attempt_matrix=_matrix(target), max_attempts=target,
+        target_accepted=target, completion_metric="terminal_outcomes", clock_ns=lambda: 1,
+    )
+    try:
+        for index in range(target):
+            lease = ledger.lease_next(f"worker-{index}", lease_duration_ns=100)
+            assert lease is not None
+            if index % 2:
+                assert ledger.reject_attempt(f"worker-{index}", lease.attempt.attempt_id, lease.lease_id, reason="policy_failure") == "rejected"
+            else:
+                assert ledger.record_terminal(f"worker-{index}", lease.attempt.attempt_id, lease.lease_id, f"raw-{index}") == "terminal_pending_validation"
+                assert ledger.validate_terminal(lease.attempt.attempt_id, "accepted", artifact_id=f"accepted-{index}") == "accepted"
+        assert ledger.completion_count == target
+        assert ledger.terminal_outcome_count() == target
+        assert ledger.is_terminal
+    finally:
+        ledger.close()
+
+
 def test_lease_immediately_assigns_next_pending_attempt_without_wave_barrier(ledger) -> None:
     first = ledger.lease_next("worker-a", lease_duration_ns=100)
     second = ledger.lease_next("worker-b", lease_duration_ns=100)

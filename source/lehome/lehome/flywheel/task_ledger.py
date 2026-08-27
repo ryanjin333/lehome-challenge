@@ -16,14 +16,16 @@ from pathlib import Path
 import sqlite3
 from threading import RLock
 from time import time_ns
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Literal, Mapping
 
 from .fidelity import FIDELITY_CODES, validate_fidelity
 
 
 MAX_CAMPAIGN_ATTEMPTS = 400
 MAX_ACCEPTED_EPISODES = 150
+MAX_TERMINAL_OUTCOMES = 300
 MAX_SQLITE_INTEGER = 2**63 - 1
+CompletionMetric = Literal["accepted_successes", "terminal_outcomes"]
 _TERMINAL_STATUSES = frozenset({"accepted", "rejected", "infrastructure_abort"})
 _LEASED_STATES = frozenset({"leased"})
 _STATE_EVENTS = frozenset({
@@ -103,12 +105,16 @@ class TaskLedger:
         attempt_matrix: list[Mapping[str, object]] | tuple[Mapping[str, object], ...],
         max_attempts: int = MAX_CAMPAIGN_ATTEMPTS,
         target_accepted: int = MAX_ACCEPTED_EPISODES,
+        completion_metric: CompletionMetric = "accepted_successes",
         clock_ns: Callable[[], int] = time_ns,
     ) -> None:
         if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or not 1 <= max_attempts <= MAX_CAMPAIGN_ATTEMPTS:
             raise ValueError(f"max_attempts must be in 1..{MAX_CAMPAIGN_ATTEMPTS}")
-        if not isinstance(target_accepted, int) or isinstance(target_accepted, bool) or not 1 <= target_accepted <= MAX_ACCEPTED_EPISODES:
-            raise ValueError(f"target_accepted must be in 1..{MAX_ACCEPTED_EPISODES}")
+        if completion_metric not in {"accepted_successes", "terminal_outcomes"}:
+            raise ValueError("completion_metric must be accepted_successes or terminal_outcomes")
+        target_ceiling = MAX_ACCEPTED_EPISODES if completion_metric == "accepted_successes" else MAX_TERMINAL_OUTCOMES
+        if not isinstance(target_accepted, int) or isinstance(target_accepted, bool) or not 1 <= target_accepted <= target_ceiling:
+            raise ValueError(f"target_accepted must be in 1..{target_ceiling}")
         if len(attempt_matrix) > max_attempts:
             raise ValueError(f"attempt matrix exceeds max_attempts ({max_attempts}, never above {MAX_CAMPAIGN_ATTEMPTS})")
         self._clock_ns = clock_ns
@@ -126,7 +132,9 @@ class TaskLedger:
         self._create_schema()
         self._matrix = self._normalize_matrix(attempt_matrix)
         self._matrix_sha256 = sha256(_canonical_json([attempt.assignment for attempt in self._matrix]).encode("utf-8")).hexdigest()
-        self._initialize_or_verify(max_attempts=max_attempts, target_accepted=target_accepted)
+        self._initialize_or_verify(
+            max_attempts=max_attempts, target_accepted=target_accepted, completion_metric=completion_metric,
+        )
 
     @property
     def is_stopped(self) -> bool:
@@ -192,6 +200,25 @@ class TaskLedger:
         with self._lock:
             return self._accepted_count()
 
+    def terminal_outcome_count(self) -> int:
+        """Return accepted/rejected policy outcomes, excluding invalid execution aborts."""
+
+        with self._lock:
+            return self._terminal_outcome_count()
+
+    @property
+    def completion_count(self) -> int:
+        """Return the one immutable metric that controls campaign dispatch."""
+
+        with self._lock:
+            return self._completion_count()
+
+    def completion_metric(self) -> CompletionMetric:
+        """Return the immutable completion metric for this ledger."""
+
+        with self._lock:
+            return self._completion_metric()
+
     def target_accepted(self) -> int:
         """Return the immutable accepted-episode campaign cap."""
 
@@ -235,7 +262,7 @@ class TaskLedger:
                 ):
                     raise ValueError("worker already owns a lease outside assignment_filter")
                 return existing
-            if self._accepted_count() >= self._target_accepted() or self._issued_lease_count() >= self._max_attempts():
+            if self._completion_count() >= self._target_accepted() or self._issued_lease_count() >= self._max_attempts():
                 return None
             for attempt in self.attempts():
                 if assignment_filter is not None and any(
@@ -320,6 +347,7 @@ class TaskLedger:
                 "rejected", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
                 payload={"reason": reason}, at_ns=now_ns,
             )
+            self._end_exact_campaign_if_complete(at_ns=now_ns)
             return "rejected"
 
     def record_infrastructure_abort(
@@ -456,7 +484,7 @@ class TaskLedger:
             if state.status != "terminal_pending_validation":
                 raise ValueError("attempt is not pending terminal validation")
             if outcome == "accepted":
-                if self._accepted_count() >= self._target_accepted():
+                if self._completion_count() >= self._target_accepted():
                     raise ValueError("accepted episode target already reached")
                 existing = self._connection.execute(
                     "SELECT attempt_id FROM events WHERE event_type = 'accepted' "
@@ -464,7 +492,9 @@ class TaskLedger:
                 ).fetchone()
                 if existing is not None:
                     raise ValueError("artifact is already accepted")
-            self._append_event(outcome, attempt_id=attempt_id, payload=payload, at_ns=self._now())
+            now_ns = self._now()
+            self._append_event(outcome, attempt_id=attempt_id, payload=payload, at_ns=now_ns)
+            self._end_exact_campaign_if_complete(at_ns=now_ns)
             return outcome
 
     def stop_for_preemption(self, reason: str) -> None:
@@ -645,7 +675,9 @@ class TaskLedger:
             attempts.append(Attempt(attempt_id, index, assignment_data))
         return tuple(attempts)
 
-    def _initialize_or_verify(self, *, max_attempts: int, target_accepted: int) -> None:
+    def _initialize_or_verify(
+        self, *, max_attempts: int, target_accepted: int, completion_metric: CompletionMetric,
+    ) -> None:
         with self._write():
             rows = self._connection.execute("SELECT key, value FROM metadata").fetchall()
             metadata = {row["key"]: row["value"] for row in rows}
@@ -653,6 +685,7 @@ class TaskLedger:
                 "matrix_sha256": self._matrix_sha256,
                 "max_attempts": str(max_attempts),
                 "target_accepted": str(target_accepted),
+                "completion_metric": completion_metric,
                 "matrix_bootstrap_complete": "true",
             }
             if not metadata:
@@ -779,6 +812,38 @@ class TaskLedger:
 
     def _accepted_count(self) -> int:
         return int(self._connection.execute("SELECT COUNT(*) FROM events WHERE event_type = 'accepted'").fetchone()[0])
+
+    def _terminal_outcome_count(self) -> int:
+        return int(self._connection.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type IN ('accepted', 'rejected')"
+        ).fetchone()[0])
+
+    def _completion_metric(self) -> CompletionMetric:
+        metric = str(self._connection.execute(
+            "SELECT value FROM metadata WHERE key = 'completion_metric'"
+        ).fetchone()[0])
+        if metric not in {"accepted_successes", "terminal_outcomes"}:
+            raise RuntimeError("stored completion metric is invalid")
+        return metric  # type: ignore[return-value]
+
+    def _completion_count(self) -> int:
+        if self._completion_metric() == "terminal_outcomes":
+            return self._terminal_outcome_count()
+        return self._accepted_count()
+
+    def _end_exact_campaign_if_complete(self, *, at_ns: int) -> None:
+        """Seal only exact-outcome partitions once their terminal quota is met.
+
+        Legacy accepted-success campaigns retain their established external
+        end-of-campaign behavior and are merely prevented from new leases.
+        """
+
+        if (
+            self._completion_metric() == "terminal_outcomes"
+            and self._completion_count() >= self._target_accepted()
+            and self._campaign_state() == "active"
+        ):
+            self._append_event("campaign_ended", payload={"reason": "completion_target_reached"}, at_ns=at_ns)
 
     def _max_attempts(self) -> int:
         return int(self._connection.execute("SELECT value FROM metadata WHERE key = 'max_attempts'").fetchone()[0])
