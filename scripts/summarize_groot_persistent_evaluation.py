@@ -20,6 +20,7 @@ _CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SIMULATOR_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}$")
+_SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
 _CANDIDATES = ("original_baseline", "new_step_2k")
 _PAIRING_UNAVAILABLE = {"status": "baseline_evaluation_required"}
 _PAIRING_AVAILABLE_FIELDS = {
@@ -138,6 +139,35 @@ def _simple_fidelity(episode: Mapping[str, object]) -> dict[str, bool]:
     return {field: bool(fidelity[field]) for field in fields}
 
 
+def _simple_finalized_paths(
+    campaign_root: Path, ledger_id: str, terminal_event: str, terminal_payload: Mapping[str, object],
+) -> tuple[Path, Path]:
+    """Return an exact allow-listed finalizer destination for first-100 evidence."""
+    destinations = [campaign_root / "evaluation-terminal" / ledger_id]
+    if terminal_event == "accepted":
+        destinations.append(campaign_root / "accepted" / ledger_id)
+    destination = next(
+        (candidate for candidate in destinations if terminal_payload == {"artifact_id": str(candidate)}),
+        None,
+    )
+    if destination is None:
+        raise ValueError("simple curriculum terminal artifact is not the finalized destination")
+    return destination / "raw" / ledger_id / "episode.json", destination / "worker-receipt.json"
+
+
+def _simple_raw_output_path(
+    campaign_root: Path, *, worker_id: object, session_id: object, ledger_id: str,
+    lease_id: object, generation: object,
+) -> Path:
+    """Reconstruct the immutable persistent-worker output location from its receipt."""
+    components = (worker_id, session_id, ledger_id, lease_id)
+    if (any(not isinstance(component, str) or _SAFE_PATH_COMPONENT.fullmatch(component) is None
+            or component in {".", ".."} for component in components)
+            or type(generation) is not int or generation < 1):
+        raise ValueError("simple curriculum receipt raw output identity is invalid")
+    return campaign_root.joinpath(*components, f"generation-{generation}")
+
+
 def _build_simple_first_hundred_report(
     *, campaign_root: Path, rows: list[dict[str, object]], matrix_sha256: str, candidate_key: str,
     policy_repo: str, policy_revision: str, policy_step: int, policy_artifact_sha256: str,
@@ -161,11 +191,14 @@ def _build_simple_first_hundred_report(
         pending: dict[str, tuple[str, str, str]] = {}
         completed_at_ns = 0
         invalid_executions: set[tuple[object, object]] = set()
+        infrastructure_attempts: set[str] = set()
         for event in ledger.execute("SELECT event_id, at_ns, event_type, attempt_id, lease_id, worker_id, payload_json FROM events ORDER BY event_id"):
             event_type = event["event_type"]
             ledger_id = event["attempt_id"]
             if event_type in {"infrastructure_abort", "retryable", "lease_expired", "preempted", "interrupted"}:
                 invalid_executions.add((ledger_id, event["lease_id"] or event["event_id"]))
+                if isinstance(ledger_id, str):
+                    infrastructure_attempts.add(ledger_id)
             elif event_type == "terminal_pending_validation":
                 try:
                     payload = json.loads(event["payload_json"])
@@ -190,12 +223,16 @@ def _build_simple_first_hundred_report(
                 completed_at_ns = max(completed_at_ns, int(event["at_ns"]))
     episodes, invalid_episode_evidence = _simple_evidence_index(campaign_root, "episode.json", "episode_id")
     receipts, invalid_receipt_evidence = _simple_evidence_index(campaign_root, "worker-receipt.json", "attempt_id")
-    invalid_executions.update(("evidence", identity) for identity in invalid_episode_evidence | invalid_receipt_evidence)
+    invalid_evidence = invalid_episode_evidence | invalid_receipt_evidence
+    invalid_executions.update(
+        ("evidence", identity) for identity in invalid_evidence
+        if not any(ledger_id in identity for ledger_id in infrastructure_attempts)
+    )
     invalid_executions.update(("unbound-episode", ledger_id) for ledger_id in episodes if ledger_id not in assignments)
     invalid_executions.update(("unbound-receipt", ledger_id) for ledger_id in receipts if ledger_id not in assignments)
     invalid_evidence_by_ledger = {
         ledger_id for ledger_id in assignments
-        if any(ledger_id in evidence for evidence in invalid_episode_evidence | invalid_receipt_evidence)
+        if any(ledger_id in evidence for evidence in invalid_evidence)
     }
     gate_trials: list[dict[str, object]] = []
     trials: list[dict[str, object]] = []
@@ -206,17 +243,19 @@ def _build_simple_first_hundred_report(
     for ledger_id, assignment in assignments.items():
         terminal_evidence = terminal.get(ledger_id)
         pending_evidence = pending.get(ledger_id)
-        episode_entry = episodes.get(ledger_id)
-        receipt_entry = receipts.get(ledger_id)
-        if terminal_evidence is None or pending_evidence is None or episode_entry is None or receipt_entry is None:
-            if ledger_id not in invalid_evidence_by_ledger:
+        if terminal_evidence is None or pending_evidence is None:
+            if ledger_id not in invalid_evidence_by_ledger and ledger_id not in infrastructure_attempts:
                 invalid_executions.add(("incomplete-terminal", ledger_id))
             continue
-        episode_path, episode = episode_entry
-        receipt_path, receipt = receipt_entry
         try:
             event, terminal_payload = terminal_evidence
             terminal_lease, terminal_worker, raw_artifact_id = pending_evidence
+            expected_episode_path, expected_receipt_path = _simple_finalized_paths(
+                campaign_root, ledger_id, event, terminal_payload,
+            )
+            episode = _json_object(expected_episode_path, "episode.json")
+            receipt = _json_object(expected_receipt_path, "worker-receipt.json")
+            episode_path, receipt_path = expected_episode_path, expected_receipt_path
             identity = episode.get("identity")
             provenance = episode.get("provenance")
             if not isinstance(identity, Mapping) or not isinstance(provenance, Mapping):
@@ -236,10 +275,13 @@ def _build_simple_first_hundred_report(
                     or receipt.get("lease_id") != terminal_lease or receipt.get("worker_id") != terminal_worker
                     or not isinstance(receipt.get("session_id"), str) or not receipt["session_id"]
                     or receipt.get("seed") != assignment.get("seed") or receipt.get("garment") != assignment.get("garment_name")
-                    or type(receipt.get("episode_generation")) is not int or receipt["episode_generation"] < 1
-                    or receipt.get("output_dir") != str(receipt_path.parent) or raw_artifact_id != receipt.get("output_dir")
-                    or (official_success and terminal_payload.get("artifact_id") != raw_artifact_id)
-                    or (not official_success and terminal_payload != {})
+                    or episode_path != expected_episode_path or receipt_path != expected_receipt_path
+                    or receipt.get("output_dir") != str(_simple_raw_output_path(
+                        campaign_root, worker_id=terminal_worker, session_id=receipt.get("session_id"),
+                        ledger_id=ledger_id, lease_id=terminal_lease,
+                        generation=receipt.get("episode_generation"),
+                    ))
+                    or raw_artifact_id != receipt.get("output_dir")
                     or not isinstance(receipt_outcome, Mapping) or receipt_outcome.get("success") is not official_success
                     or episode.get("accepted_success") is not official_success
                     or (episode.get("outcome") == "success") is not official_success):
@@ -275,7 +317,8 @@ def _build_simple_first_hundred_report(
             }
             _runtime_identity_digest(gate_identity, gate_provenance)
         except (TypeError, ValueError):
-            invalid_executions.add(("invalid-terminal-evidence", ledger_id))
+            if ledger_id not in infrastructure_attempts:
+                invalid_executions.add(("invalid-terminal-evidence", ledger_id))
             continue
         category = str(assignment["category"]); garment = str(assignment["garment_name"])
         category_scores[category]["episodes"] += 1; garment_scores[garment]["episodes"] += 1

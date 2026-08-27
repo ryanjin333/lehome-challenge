@@ -76,7 +76,8 @@ def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
 
 
-def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malformed_receipt: int | None = None, retry_then_valid: int | None = None, contradictory_safety: int | None = None, episode_mutator=None, receipt_mutator=None) -> tuple[Path, Path, list[dict[str, object]], dict[str, str]]:
+def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malformed_receipt: int | None = None, retry_then_valid: int | None = None, contradictory_safety: int | None = None, all_success: bool = False, evaluation_terminal: bool = True, episode_mutator=None, receipt_mutator=None) -> tuple[Path, Path, list[dict[str, object]], dict[str, str]]:
+    from lehome.flywheel.artifact_queue import ArtifactFinalizationQueue
     from lehome.flywheel.simple_curriculum import build_calibration_rows
     from lehome.flywheel.task_ledger import TaskLedger
 
@@ -84,6 +85,10 @@ def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malf
     root = tmp_path / "campaign"; root.mkdir()
     matrix = tmp_path / "matrix.json"; matrix.write_bytes(_canonical(rows))
     ledger = TaskLedger(root / "ledger.sqlite3", attempt_matrix=rows, max_attempts=101 if retry_then_valid is not None else 100, target_accepted=100)
+    finalizer = ArtifactFinalizationQueue(
+        run_root=root, ledger=ledger, max_pending_items=1, max_pending_bytes=1 << 30,
+        evaluation_only=evaluation_terminal,
+    )
     ledger_ids: dict[str, str] = {}
     for index, row in enumerate(rows):
         lease = ledger.lease_next("worker", lease_duration_ns=1_000_000_000)
@@ -93,10 +98,10 @@ def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malf
             lease = ledger.lease_next("worker", lease_duration_ns=1_000_000_000)
             assert lease is not None
         ledger_id = lease.attempt.attempt_id
-        output = root / "worker" / ledger_id / "generation-1"; raw = output / "raw" / ledger_id; raw.mkdir(parents=True)
+        output = root / "worker" / "session" / ledger_id / lease.lease_id / f"generation-{index + 1}"
+        raw = output / "raw" / ledger_id; raw.mkdir(parents=True)
+        videos = output / "videos"; videos.mkdir(); (videos / "top.mp4").write_bytes(b"video")
         ledger_ids[str(row["attempt_id"])] = ledger_id
-        ledger.record_terminal("worker", ledger_id, lease.lease_id, str(output))
-        ledger.validate_terminal(ledger_id, "accepted" if index < 5 else "rejected", artifact_id=str(output) if index < 5 else None)
         episode = {
             "episode_id": ledger_id,
             "identity": {
@@ -106,7 +111,7 @@ def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malf
                 "release_stage": row["release_stage"], "seed": row["seed"],
             },
             "provenance": {"policy_artifact_sha256": POLICY["policy_artifact_sha256"], "simulator_device": "cpu", "policy_device": "cuda:0", "image_identity": "sha256:" + "d" * 64},
-            "outcome": "success" if index < 5 else "timeout", "accepted_success": index < 5,
+            "outcome": "success" if all_success or index < 5 else "timeout", "accepted_success": all_success or index < 5,
             "safety_failure": index == contradictory_safety,
             "fidelity": {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False},
         }
@@ -116,8 +121,8 @@ def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malf
         receipt = {
             "schema_version": 1, "attempt_id": ledger_id, "lease_id": lease.lease_id,
             "worker_id": "worker", "session_id": "session", "seed": row["seed"], "garment": row["garment_name"],
-            "episode_generation": 1, "output_dir": str(output), "action_horizon": 250,
-            "outcome": {"success": index < 5, "metrics": []}, "simulation_device": "cpu", "cloth_device": "cpu",
+            "episode_generation": index + 1, "output_dir": str(output), "action_horizon": 250,
+            "outcome": {"success": all_success or index < 5, "metrics": []}, "simulation_device": "cpu", "cloth_device": "cpu",
             "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0",
             "runtime": {"simulation_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0"},
         }
@@ -126,6 +131,14 @@ def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malf
         receipt_path = output / "worker-receipt.json"
         if index != missing_receipt:
             receipt_path.write_bytes(b"{broken" if index == malformed_receipt else _canonical(receipt))
+        ledger.record_terminal("worker", ledger_id, lease.lease_id, str(output))
+        finalizer.enqueue("worker", ledger_id, lease.lease_id, output)
+        result = finalizer.finalize_next()
+        assert result is not None
+        if index == 0:
+            assert result.outcome == "accepted"
+        if index == 5 and not all_success:
+            assert result.outcome == "rejected"
     ledger.close()
     return root, matrix, rows, ledger_ids
 
@@ -156,6 +169,72 @@ def test_simple_summary_uses_external_matrix_assignment_ids_and_passes_gate_dire
         trusted_policy=POLICY, policy_bytes=_canonical(POLICY), catalog=_catalog(), catalog_bytes=_canonical(_catalog()),
     )
     assert receipt["decision"] == "continue"
+
+
+def test_simple_summary_authenticates_accepted_finalizer_destination(tmp_path: Path) -> None:
+    summary = _module()
+    root, matrix, _rows, _ledger_ids = _simple_campaign(
+        tmp_path, all_success=True, evaluation_terminal=False,
+    )
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 100
+    assert report["infrastructure_invalid_executions"] == 0
+
+
+def test_simple_summary_rejects_forged_finalized_artifact_destination(tmp_path: Path) -> None:
+    summary = _module()
+    root, matrix, rows, ledger_ids = _simple_campaign(tmp_path)
+    ledger_id = ledger_ids[str(rows[3]["attempt_id"])]
+    destination = root / "evaluation-terminal" / ledger_id
+    destination.rename(root / "evaluation-terminal" / f"forged-{ledger_id}")
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 99
+    assert report["infrastructure_invalid_executions"] == 1
+
+
+def test_simple_summary_rejects_receipt_raw_output_path_not_bound_to_worker_lease(tmp_path: Path) -> None:
+    summary = _module()
+    root, matrix, rows, ledger_ids = _simple_campaign(tmp_path)
+    ledger_id = ledger_ids[str(rows[3]["attempt_id"])]
+    receipt_path = root / "evaluation-terminal" / ledger_id / "worker-receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["output_dir"] = str(root / "worker" / "session" / ledger_id / "forged-lease" / "generation-4")
+    receipt_path.write_bytes(_canonical(receipt))
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 99
+    assert report["infrastructure_invalid_executions"] == 1
+
+
+def test_simple_summary_rejects_stale_receipt_copied_into_another_finalized_artifact(tmp_path: Path) -> None:
+    summary = _module()
+    root, matrix, rows, ledger_ids = _simple_campaign(tmp_path)
+    target = ledger_ids[str(rows[3]["attempt_id"])]
+    source = ledger_ids[str(rows[4]["attempt_id"])]
+    target_receipt = root / "evaluation-terminal" / target / "worker-receipt.json"
+    target_receipt.write_bytes((root / "evaluation-terminal" / source / "worker-receipt.json").read_bytes())
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] < 100
+    assert report["infrastructure_invalid_executions"] >= 1
 
 
 @pytest.mark.parametrize("kind", ["missing", "malformed"])
