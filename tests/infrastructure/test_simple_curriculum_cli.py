@@ -232,3 +232,23 @@ def test_cli_rejects_output_receipt_alias_without_creating_an_artifact(tmp_path:
     assert result.returncode != 0
     assert "distinct" in result.stderr
     assert not shared.exists()
+
+
+def test_cli_rejects_duplicate_json_keys_without_creating_outputs(tmp_path: Path) -> None:
+    catalog = tmp_path / "catalog.json"
+    output = tmp_path / "matrix.json"
+    receipt = tmp_path / "receipt.json"
+    catalog.write_text(
+        '{"top_long":[],"top_long":[],"top_short":[],"pant_long":[],"pant_short":[]}',
+        encoding="utf-8",
+    )
+
+    result = _run(
+        "build-calibration", "--catalog", str(catalog), "--seed-base", "1",
+        "--output", str(output), "--receipt", str(receipt),
+    )
+
+    assert result.returncode != 0
+    assert "catalog is malformed" in result.stderr
+    assert not output.exists()
+    assert not receipt.exists()
