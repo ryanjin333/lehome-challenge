@@ -5,13 +5,15 @@ lehome_supervise_worker() {
   local index="$1"
   local max_restarts="$2"
   local launch_function="$3"
+  shift 3
+  local launch_args=("$@")
   local restarts=0
   local retry_delay_seconds="${LEHOME_WORKER_RESTART_DELAY_SECONDS:-2}"
 
   while true; do
     # A zero exit means lease_next() found no eligible work.  It is a clean
     # drain, never a restart condition.
-    if "${launch_function}" "${index}"; then
+    if "${launch_function}" "${index}" "${launch_args[@]}"; then
       return 0
     fi
     if (( restarts >= max_restarts )); then

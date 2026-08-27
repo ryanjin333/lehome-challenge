@@ -1097,7 +1097,7 @@ def test_cpu_cloth_backend_never_constructs_a_physx_view() -> None:
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace: dict[str, object] = {}
+    namespace: dict[str, object] = {"np": np}
     exec(compile(module, str(source_path), "exec"), namespace)
     env = types.SimpleNamespace(
         device="cpu",
@@ -1137,7 +1137,7 @@ def test_cpu_initialize_obs_bypasses_the_external_physx_initializer() -> None:
     assert initialized == ["usd-local"]
 
 
-def test_cpu_garment_initialization_uses_the_usd_xform_prim() -> None:
+def test_cpu_garment_initialization_uses_the_cloth_aware_pose_setter() -> None:
     source_path = (
         Path(__file__).resolve().parents[1]
         / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
@@ -1150,25 +1150,51 @@ def test_cpu_garment_initialization_uses_the_usd_xform_prim() -> None:
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace: dict[str, object] = {}
+    namespace: dict[str, object] = {"np": np}
     exec(compile(module, str(source_path), "exec"), namespace)
     pose_writes: list[tuple[object, object]] = []
+    state = {
+        "positions": np.zeros((1, 3), dtype=np.float32),
+        "velocities": None,
+    }
+
+    class Attribute:
+        def __init__(self, key: str):
+            self.key = key
+
+        def Get(self):
+            return state[self.key]
+
+        def Set(self, value):
+            state[self.key] = np.asarray(value, dtype=np.float32)
+            return True
+
     env = types.SimpleNamespace(
         object=types.SimpleNamespace(
             init_pos=[0.1, 0.2, 0.3],
             init_ori=[1.0, 0.0, 0.0, 0.0],
-            set_world_pose=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                AssertionError("CPU initialization must not invoke the cloth prim view")
+            set_world_pose=lambda position, orientation: pose_writes.append(
+                (position, orientation)
             ),
             world_prim=types.SimpleNamespace(
-                set_world_pose=lambda position, orientation: pose_writes.append(
-                    (position, orientation)
+                set_world_pose=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError(
+                        "CPU initialization must not bypass the cloth-aware pose setter"
+                    )
                 )
             ),
         ),
+        _flywheel_legacy_cpu_cloth_attributes=lambda: (
+            Attribute("positions"), Attribute("velocities")
+        ),
+        _flywheel_legacy_usd_vec3f_array=lambda values: values,
+        _flywheel_cloth_arrays=lambda positions, velocities: (
+            np.asarray(positions, dtype=np.float32),
+            np.asarray(velocities, dtype=np.float32),
+        ),
         _flywheel_legacy_cpu_cloth_state=lambda: (
-            np.zeros((1, 3), dtype=np.float32),
-            np.zeros((1, 3), dtype=np.float32),
+            np.asarray(state["positions"], dtype=np.float32),
+            np.asarray(state["velocities"], dtype=np.float32),
         ),
     )
 
@@ -1178,7 +1204,156 @@ def test_cpu_garment_initialization_uses_the_usd_xform_prim() -> None:
     assert env._flywheel_legacy_cpu_reset_state[0].shape == (1, 3)
 
 
-def test_cpu_scene_pose_write_never_calls_physx_particle_restore(monkeypatch) -> None:
+def test_cpu_garment_initialization_authors_zero_velocity_when_usd_velocity_is_unset() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_flywheel_initialize_legacy_cpu_garment"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    points = np.asarray([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=np.float32)
+    state = {"points": points.copy(), "velocities": None}
+
+    class Attribute:
+        def __init__(self, key: str):
+            self.key = key
+
+        def Get(self):
+            return state[self.key]
+
+        def Set(self, value):
+            state[self.key] = np.asarray(value, dtype=np.float32)
+            return True
+
+    env = types.SimpleNamespace(
+        object=types.SimpleNamespace(
+            init_pos=[0.1, 0.2, 0.3],
+            init_ori=[1.0, 0.0, 0.0, 0.0],
+            set_world_pose=lambda **_kwargs: None,
+            world_prim=types.SimpleNamespace(
+                set_world_pose=lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError(
+                        "CPU initialization must not bypass the cloth-aware pose setter"
+                    )
+                )
+            ),
+        ),
+        _flywheel_legacy_cpu_cloth_attributes=lambda: (
+            Attribute("points"), Attribute("velocities")
+        ),
+        _flywheel_legacy_usd_vec3f_array=lambda values: values,
+        _flywheel_cloth_arrays=lambda positions, velocities: (
+            np.asarray(positions, dtype=np.float32),
+            np.asarray(velocities, dtype=np.float32),
+        ),
+        _flywheel_legacy_cpu_cloth_state=lambda: (
+            np.asarray(state["points"], dtype=np.float32),
+            np.asarray(state["velocities"], dtype=np.float32),
+        ),
+    )
+
+    namespace["_flywheel_initialize_legacy_cpu_garment"](env)
+
+    np.testing.assert_array_equal(state["points"], points)
+    np.testing.assert_array_equal(state["velocities"], np.zeros_like(points))
+    np.testing.assert_array_equal(env._flywheel_legacy_cpu_reset_state[0], points)
+    np.testing.assert_array_equal(
+        env._flywheel_legacy_cpu_reset_state[1], np.zeros_like(points)
+    )
+
+
+def test_cpu_garment_initialization_preserves_registered_live_velocity() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_flywheel_initialize_legacy_cpu_garment"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    points = np.asarray([[0.1, 0.2, 0.3]], dtype=np.float32)
+    live_velocity = np.asarray([[0.2, 0.0, 0.0]], dtype=np.float32)
+    writes: list[np.ndarray] = []
+
+    class Attribute:
+        def __init__(self, value):
+            self.value = value
+
+        def Get(self):
+            return self.value
+
+        def Set(self, value):
+            writes.append(np.asarray(value, dtype=np.float32))
+            return True
+
+
+    env = types.SimpleNamespace(
+        object=types.SimpleNamespace(
+            init_pos=[0.1, 0.2, 0.3],
+            init_ori=[1.0, 0.0, 0.0, 0.0],
+            set_world_pose=lambda **_kwargs: None,
+            world_prim=types.SimpleNamespace(
+                set_world_pose=lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError(
+                        "CPU initialization must not bypass the cloth-aware pose setter"
+                    )
+                )
+            ),
+        ),
+        _flywheel_legacy_cpu_cloth_attributes=lambda: (
+            Attribute(points), Attribute(live_velocity)
+        ),
+        _flywheel_legacy_usd_vec3f_array=lambda values: values,
+        _flywheel_cloth_arrays=lambda positions, velocities: (
+            np.asarray(positions, dtype=np.float32),
+            np.asarray(velocities, dtype=np.float32),
+        ),
+        _flywheel_legacy_cpu_cloth_state=lambda: (points, live_velocity),
+    )
+
+    namespace["_flywheel_initialize_legacy_cpu_garment"](env)
+
+    assert writes == []
+    np.testing.assert_array_equal(env._flywheel_legacy_cpu_reset_state[0], points)
+    np.testing.assert_array_equal(env._flywheel_legacy_cpu_reset_state[1], live_velocity)
+
+
+def test_cpu_hot_switch_is_rejected_before_deleting_the_live_garment() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "switch_garment"
+    )
+    method_source = ast.get_source_segment(source, method)
+    assert method_source is not None
+    cpu_guard = method_source.index('str(self.device).lower() == "cpu"')
+    rejected = method_source.index("raise RuntimeError", cpu_guard)
+    deleted = method_source.index("self._delete_garment_object()")
+
+    assert cpu_guard < rejected < deleted
+
+
+def test_cpu_scene_pose_write_uses_cloth_aware_root_without_particle_restore(monkeypatch) -> None:
     source_path = (
         Path(__file__).resolve().parents[1]
         / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
@@ -1214,12 +1389,14 @@ def test_cpu_scene_pose_write_never_calls_physx_particle_restore(monkeypatch) ->
         set_all_pose=lambda _pose: (_ for _ in ()).throw(
             AssertionError("CPU scene pose must not invoke the PhysX reset path")
         ),
-        set_world_pose=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("CPU scene pose must not invoke the cloth prim view")
+        set_world_pose=lambda position, orientation: writes.append(
+            (np.asarray(position), np.asarray(orientation))
         ),
         world_prim=types.SimpleNamespace(
-            set_world_pose=lambda position, orientation: writes.append(
-                (np.asarray(position), np.asarray(orientation))
+            set_world_pose=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(
+                    "CPU scene pose must not bypass the cloth-aware pose setter"
+                )
             )
         ),
     )
@@ -1271,16 +1448,22 @@ def test_cpu_reset_restores_live_usd_state_without_physx(monkeypatch) -> None:
     pose_writes: list[tuple[np.ndarray, np.ndarray]] = []
     env = types.SimpleNamespace(
         _flywheel_legacy_cpu_reset_state=(
-            np.asarray([[0.2, 0.1, 0.7]], dtype=np.float32), np.zeros((1, 3), dtype=np.float32)
+            np.asarray([[0.2, 0.1, 0.7]], dtype=np.float32),
+            np.asarray([[0.2, 0.0, 0.0]], dtype=np.float32),
         ),
+        particle_config={"objects": {"particle_system": {"max_velocity": 5.0}}},
         garment_rng=np.random.RandomState(7),
         object=types.SimpleNamespace(
             _get_config_value=lambda _key, _source: ([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "config"),
-            set_world_pose=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                AssertionError("CPU reset must not invoke the cloth prim view")
+            set_world_pose=lambda position, orientation: pose_writes.append(
+                (position, orientation)
             ),
             world_prim=types.SimpleNamespace(
-                set_world_pose=lambda position, orientation: pose_writes.append((position, orientation))
+                set_world_pose=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError(
+                        "CPU reset must not bypass the cloth-aware pose setter"
+                    )
+                )
             ),
             _ensure_physics_cloth_view=lambda: (_ for _ in ()).throw(
                 AssertionError("CPU reset must not construct a PhysX cloth view")
@@ -1295,6 +1478,38 @@ def test_cpu_reset_restores_live_usd_state_without_physx(monkeypatch) -> None:
     namespace["_flywheel_reset_legacy_cpu_garment"](env)
 
     assert pose_writes and np.allclose(state["positions"], [[0.2, 0.1, 0.7]])
+    assert np.allclose(state["velocities"], [[0.2, 0.0, 0.0]])
+
+
+def test_cpu_reset_rejects_a_velocity_saturated_initial_state() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_flywheel_reset_legacy_cpu_garment"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    env = types.SimpleNamespace(
+        _flywheel_legacy_cpu_reset_state=(
+            np.asarray([[0.2, 0.1, 0.7]], dtype=np.float32),
+            np.asarray([[5.0, 0.0, 0.0]], dtype=np.float32),
+        ),
+        particle_config={"objects": {"particle_system": {"max_velocity": 5.0}}},
+        _flywheel_cloth_arrays=lambda positions, velocities: (
+            np.asarray(positions, dtype=np.float32),
+            np.asarray(velocities, dtype=np.float32),
+        ),
+        object=types.SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="saturated velocity"):
+        namespace["_flywheel_reset_legacy_cpu_garment"](env)
 
 
 def test_cpu_visible_contact_transforms_live_usd_local_points_without_physx(monkeypatch) -> None:
@@ -2218,7 +2433,13 @@ def test_evaluation_session_switches_garments_without_recreating_a_switchable_en
     calls: list[object] = []
 
     class Environment:
-        cfg = types.SimpleNamespace(garment_name="Top_Long_Seen_0", garment_version="Release", seed=None, random_seed=None)
+        device = "cpu"
+        cfg = types.SimpleNamespace(
+            garment_name="Top_Long_Seen_0",
+            garment_version="Release",
+            seed=None,
+            random_seed=None,
+        )
 
         def switch_garment(self, name, stage):
             calls.append(("switch", name, stage))
@@ -2235,9 +2456,14 @@ def test_evaluation_session_switches_garments_without_recreating_a_switchable_en
         def reset(self):
             calls.append("reset")
 
-    args = types.SimpleNamespace(seed=0, num_episodes=1)
+    args = types.SimpleNamespace(seed=0, num_episodes=1, device="cpu")
     env = Environment()
-    session = evaluation.EvaluationSession(args, env=env, policy=Policy(), env_cfg=env.cfg)
+    session = evaluation.EvaluationSession(
+        args,
+        env=env,
+        policy=Policy(),
+        env_cfg=env.cfg,
+    )
     session.prepare_episode(garment_name="Top_Long_Seen_1", garment_stage="Release", seed=42, episode_generation=1)
 
     assert calls == [("seed", 42), ("switch", "Top_Long_Seen_1", "Release"), "reset"]
@@ -2375,7 +2601,7 @@ def test_cloth_physical_health_reports_every_exceeded_metric_to_the_admission_ga
     assert health["exceeded_metrics"] == [
         {"metric_name": "max_position_m", "metric_value": 10.0, "metric_limit": 2.0},
         {"metric_name": "max_extent_m", "metric_value": 20.0, "metric_limit": 4.0},
-        {"metric_name": "max_velocity_mps", "metric_value": 6.0, "metric_limit": 5.0001},
+        {"metric_name": "max_velocity_mps", "metric_value": 6.0, "metric_limit": 4.75},
     ]
 
     evaluation_source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
@@ -2406,12 +2632,48 @@ def test_cloth_physical_health_reports_every_exceeded_metric_to_the_admission_ga
         error_type,
         match=(
             r"max_position_m=10.0 limit=2.0; max_extent_m=20.0 limit=4.0; "
-            r"max_velocity_mps=6.0 limit=5.0001"
+            r"max_velocity_mps=6.0 limit=4.75"
         ),
     ):
         gate_namespace["_require_flywheel_cloth_health"](
             types.SimpleNamespace(flywheel_cloth_physical_health=lambda: health)
         )
+
+
+def test_cloth_physical_health_rejects_velocity_saturated_at_the_simulator_cap() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "flywheel_cloth_physical_health"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    env = types.SimpleNamespace(
+        flywheel_collider_health=lambda: {"healthy": True},
+        _flywheel_physics_cloth_state=lambda: (
+            np.asarray([[0.2, 0.1, 0.7], [0.3, 0.1, 0.7]], dtype=np.float32),
+            np.asarray([[5.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32),
+        ),
+        particle_config={"objects": {"particle_system": {"max_velocity": 5.0}}},
+    )
+
+    health = namespace["flywheel_cloth_physical_health"](env)
+
+    assert health["healthy"] is False
+    assert any(
+        metric["metric_name"] == "max_velocity_mps"
+        and metric["metric_value"] == 5.0
+        and metric["metric_limit"] < 5.0
+        for metric in health["exceeded_metrics"]
+    )
 
 
 def test_cloth_physical_health_classifies_invalid_physx_readback_as_divergence() -> None:

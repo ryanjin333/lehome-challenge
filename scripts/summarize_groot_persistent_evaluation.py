@@ -1,4 +1,4 @@
-"""Seal one completed persistent-worker unseen-80 evaluation report."""
+"""Seal one completed persistent-worker seen-80 or unseen-80 report."""
 
 from __future__ import annotations
 
@@ -73,8 +73,9 @@ def _load_matrix(path: Path, expected_sha256: str) -> list[dict[str, object]]:
     trial_ids = [item.get("trial_id") for item in rows]
     if not all(isinstance(item, str) and item for item in trial_ids) or len(set(trial_ids)) != len(rows):
         raise ValueError("evaluation matrix trial IDs are invalid")
-    if any(item.get("release_stage") != "public_unseen" for item in rows):
-        raise ValueError("evaluation matrix must be public-unseen only")
+    release_stages = {item.get("release_stage") for item in rows}
+    if len(release_stages) != 1 or not release_stages <= {"seen", "public_unseen"}:
+        raise ValueError("evaluation matrix must use one supported release stage")
     return rows
 
 
@@ -456,9 +457,15 @@ def build_report(
             raise ValueError("evaluation runtime identity is inconsistent")
 
     successes = sum(item["official_successes"] for item in category_scores.values())
+    release_stage = str(rows[0]["release_stage"])
     report: dict[str, object] = {
         "schema_version": 1,
-        "kind": "lehome_groot_persistent_unseen80_evaluation",
+        "kind": (
+            "lehome_groot_persistent_seen80_evaluation"
+            if release_stage == "seen"
+            else "lehome_groot_persistent_unseen80_evaluation"
+        ),
+        "release_stage": release_stage,
         "candidate_key": candidate_key,
         "identity": {
             "policy_repo": policy_repo,
@@ -535,6 +542,8 @@ def build_experiment_report(
         policy_step=publication.target_step,
         policy_artifact_sha256=publication.artifact_sha256,
     )
+    if legacy.get("release_stage") != "public_unseen":
+        raise ValueError("promotion report requires public-unseen evaluation")
     per_category = legacy["per_category"]
     if not isinstance(per_category, dict) or set(per_category) != set(_CATEGORIES):
         raise ValueError("strict report is missing category evidence")
@@ -692,7 +701,11 @@ def build_final_unseen80_report(
     if type(candidate_id) is not str or not candidate_id:
         raise ValueError("final evaluation candidate ID is invalid")
     rows = _load_matrix(Path(matrix_path), matrix_sha256)
-    if len(rows) != 80 or any(sum(item.get("category") == category for item in rows) != 20 for category in _CATEGORIES):
+    if (
+        len(rows) != 80
+        or any(item.get("release_stage") != "public_unseen" for item in rows)
+        or any(sum(item.get("category") == category for item in rows) != 20 for category in _CATEGORIES)
+    ):
         raise ValueError("final evaluation requires the exact frozen unseen-80 matrix")
     legacy = build_report(
         campaign_root=campaign_root,

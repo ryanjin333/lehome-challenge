@@ -506,7 +506,7 @@ class PersistentRolloutWorker:
                         abort = getattr(self._controller, "record_infrastructure_abort", None)
                         if not callable(abort):
                             raise RuntimeError("controller does not support durable infrastructure abort") from error
-                        abort(
+                        abort_status = abort(
                             self.identity.worker_id,
                             attempt_id,
                             lease_id,
@@ -516,6 +516,10 @@ class PersistentRolloutWorker:
                                 else "runtime_evidence_invalid"
                             ),
                         )
+                        if abort_status == "retryable":
+                            raise RuntimeError(
+                                "infrastructure-invalid attempt was requeued; requesting clean worker restart"
+                            ) from error
                         if _is_source_discovery_assignment(assignment):
                             raise RuntimeError("source discovery infrastructure abort") from error
                         continue

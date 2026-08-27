@@ -181,6 +181,39 @@ def test_campaign_stops_leasing_after_target_or_maximum_attempts(tmp_path) -> No
         TaskLedger(tmp_path / "too-many.sqlite3", attempt_matrix=_matrix(401), clock_ns=lambda: 1)
 
 
+def test_lease_next_can_bind_a_fresh_worker_to_one_garment(tmp_path) -> None:
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    matrix = [
+        {"attempt_id": "top-0-a", "garment_name": "Top_Long_Seen_0", "seed": 1},
+        {"attempt_id": "top-1-a", "garment_name": "Top_Long_Seen_1", "seed": 2},
+        {"attempt_id": "top-0-b", "garment_name": "Top_Long_Seen_0", "seed": 3},
+    ]
+    ledger = TaskLedger(
+        tmp_path / "garment-affinity.sqlite3",
+        attempt_matrix=matrix,
+        max_attempts=3,
+        target_accepted=3,
+        clock_ns=lambda: 1,
+    )
+    try:
+        first = ledger.lease_next(
+            "garment-0-worker",
+            lease_duration_ns=10,
+            assignment_filter={"garment_name": "Top_Long_Seen_0"},
+        )
+        second = ledger.lease_next(
+            "garment-1-worker",
+            lease_duration_ns=10,
+            assignment_filter={"garment_name": "Top_Long_Seen_1"},
+        )
+
+        assert first is not None and first.attempt.assignment["attempt_id"] == "top-0-a"
+        assert second is not None and second.attempt.assignment["attempt_id"] == "top-1-a"
+    finally:
+        ledger.close()
+
+
 def test_validation_cannot_overshoot_the_accepted_episode_target(tmp_path) -> None:
     from lehome.flywheel.task_ledger import TaskLedger
 

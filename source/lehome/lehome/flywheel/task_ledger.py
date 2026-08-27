@@ -196,11 +196,29 @@ class TaskLedger:
         with self._lock:
             return self._target_accepted()
 
-    def lease_next(self, worker_id: str, *, lease_duration_ns: int) -> Lease | None:
-        """Give a free worker the earliest retryable/pending schedule entry."""
+    def lease_next(
+        self,
+        worker_id: str,
+        *,
+        lease_duration_ns: int,
+        assignment_filter: Mapping[str, object] | None = None,
+    ) -> Lease | None:
+        """Give a free worker the earliest eligible schedule entry.
+
+        ``assignment_filter`` is an exact-match affinity used by CPU-cloth
+        evaluation workers that boot one immutable garment per Isaac process.
+        It leaves the shared frozen matrix and ledger intact while preventing
+        a worker from leasing a row for a different garment.
+        """
 
         worker_id = _require_identifier(worker_id, field="worker_id")
         self._require_duration(lease_duration_ns)
+        if assignment_filter is not None:
+            if not isinstance(assignment_filter, Mapping) or not assignment_filter:
+                raise ValueError("assignment_filter must be a non-empty mapping")
+            for key in assignment_filter:
+                _require_identifier(key, field="assignment_filter key")
+            _canonical_json(dict(assignment_filter))
         with self._write():
             now_ns = self._now()
             expires_at_ns = self._expires_at(now_ns, lease_duration_ns)
@@ -209,10 +227,20 @@ class TaskLedger:
             self._expire_leases(now_ns)
             existing = self._active_lease_for_worker(worker_id)
             if existing is not None:
+                if assignment_filter is not None and any(
+                    existing.attempt.assignment.get(key) != value
+                    for key, value in assignment_filter.items()
+                ):
+                    raise ValueError("worker already owns a lease outside assignment_filter")
                 return existing
             if self._accepted_count() >= self._target_accepted() or self._issued_lease_count() >= self._max_attempts():
                 return None
             for attempt in self.attempts():
+                if assignment_filter is not None and any(
+                    attempt.assignment.get(key) != value
+                    for key, value in assignment_filter.items()
+                ):
+                    continue
                 state = self._state_for_attempt(attempt.attempt_id)
                 if state.status not in {"retryable", "pending"}:
                     continue

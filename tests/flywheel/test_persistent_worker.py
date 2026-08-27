@@ -835,23 +835,27 @@ def test_runtime_admits_cpu_terminal_public_unseen_evaluation_before_opening_the
     ]
     matrix = tmp_path / "terminal-evaluation.json"
     matrix.write_text(json.dumps(rows), encoding="utf-8")
-    opened: list[bool] = []
+    opened: list[dict[str, object]] = []
 
-    def ledger_factory(*_args, **_kwargs):
-        opened.append(True)
+    def ledger_factory(*_args, **kwargs):
+        opened.append(kwargs)
         raise RuntimeError("ledger reached")
 
     monkeypatch.setenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", "1")
+    monkeypatch.setenv("LEHOME_EVALUATION_GARMENT_AFFINITY", "1")
     args = types.SimpleNamespace(
         device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
         lease_seconds=30.0, preparation_timeout_seconds=30.0,
         attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
         max_attempts=row_count, target_accepted=row_count,
+        initial_garment=rows[0]["garment_name"],
     )
 
     with pytest.raises(RuntimeError, match="ledger reached"):
         run(args, ledger_factory=ledger_factory)
-    assert opened == [True]
+    assert len(opened) == 1
+    assert opened[0]["max_attempts"] == 400
+    assert opened[0]["target_accepted"] == row_count
 
 
 def test_runtime_admits_cpu_terminal_seen_development_evaluation_before_opening_the_ledger(
@@ -871,16 +875,108 @@ def test_runtime_admits_cpu_terminal_seen_development_evaluation_before_opening_
         raise RuntimeError("ledger reached")
 
     monkeypatch.setenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", "1")
+    monkeypatch.setenv("LEHOME_EVALUATION_GARMENT_AFFINITY", "1")
     args = types.SimpleNamespace(
         device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
         lease_seconds=30.0, preparation_timeout_seconds=30.0,
         attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
         max_attempts=24, target_accepted=24,
+        initial_garment=rows[0]["garment_name"],
     )
 
     with pytest.raises(RuntimeError, match="ledger reached"):
         run(args, ledger_factory=ledger_factory)
     assert opened == [True]
+
+
+def test_runtime_admits_exact_cpu_terminal_seen80_evaluation_before_opening_the_ledger(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    categories = (
+        ("top_long", "Top_Long", 970_000),
+        ("top_short", "Top_Short", 971_000),
+        ("pant_long", "Pant_Long", 972_000),
+        ("pant_short", "Pant_Short", 973_000),
+    )
+    rows = []
+    for category, garment_prefix, seed_base in categories:
+        for garment_index in range(10):
+            garment = f"{garment_prefix}_Seen_{garment_index}"
+            for seed in range(seed_base + garment_index * 2, seed_base + garment_index * 2 + 2):
+                trial_id = f"{category.replace('_', '-')}-seen-{garment_index}-seed-{seed}"
+                rows.append({
+                    "attempt_id": trial_id,
+                    "trial_id": trial_id,
+                    "category": category,
+                    "garment": garment,
+                    "garment_name": garment,
+                    "release_stage": "seen",
+                    "seed": seed,
+                })
+    matrix = tmp_path / "terminal-seen80.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    opened: list[bool] = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened.append(True)
+        raise RuntimeError("ledger reached")
+
+    monkeypatch.setenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", "1")
+    monkeypatch.setenv("LEHOME_EVALUATION_GARMENT_AFFINITY", "1")
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=80, target_accepted=80,
+        initial_garment=rows[0]["garment_name"],
+    )
+
+    with pytest.raises(RuntimeError, match="ledger reached"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened == [True]
+
+
+def test_runtime_rejects_cpu_terminal_evaluation_without_garment_affinity_before_ledger(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from scripts.run_groot_persistent_worker import run
+
+    categories = ("top_long", "top_short", "pant_long", "pant_short")
+    rows = [
+        {
+            "trial_id": f"public-unseen-{index}",
+            "category": categories[index % len(categories)],
+            "garment_name": f"{categories[index % len(categories)]}-unseen-{index // len(categories)}",
+            "release_stage": "public_unseen",
+            "seed": 60_000 + index,
+        }
+        for index in range(20)
+    ]
+    matrix = tmp_path / "terminal-evaluation.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    opened: list[bool] = []
+
+    def ledger_factory(*_args, **_kwargs):
+        opened.append(True)
+        raise AssertionError("unaffined terminal evaluation must fail before the ledger opens")
+
+    monkeypatch.setenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", "1")
+    monkeypatch.delenv("LEHOME_EVALUATION_GARMENT_AFFINITY", raising=False)
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=20, target_accepted=20,
+        initial_garment=rows[0]["garment_name"],
+    )
+
+    with pytest.raises(ValueError, match="terminal CPU evaluation requires garment affinity"):
+        run(args, ledger_factory=ledger_factory)
+    assert opened == []
 
 
 def test_runtime_rejects_cpu_terminal_public_unseen_evaluation_without_marker_before_ledger(tmp_path, monkeypatch) -> None:
@@ -967,11 +1063,13 @@ def test_runtime_rejects_nonterminal_cpu_evaluation_size_before_opening_the_ledg
         raise AssertionError("nonterminal CPU evaluation must fail before the ledger opens")
 
     monkeypatch.setenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", "1")
+    monkeypatch.setenv("LEHOME_EVALUATION_GARMENT_AFFINITY", "1")
     args = types.SimpleNamespace(
         device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
         lease_seconds=30.0, preparation_timeout_seconds=30.0,
         attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
         max_attempts=21, target_accepted=21,
+        initial_garment=rows[0]["garment_name"],
     )
 
     with pytest.raises(ValueError, match="terminal evaluation matrix is invalid"):
@@ -1142,6 +1240,44 @@ def test_runtime_admits_bounded_multirow_cpu_source_discovery_before_ledger(tmp_
         run(args, ledger_factory=ledger_factory)
 
     assert len(opened) == 1
+
+
+def test_runtime_source_affinity_accepts_the_primary_garment_field_before_ledger(
+    tmp_path, monkeypatch,
+) -> None:
+    import scripts.run_groot_persistent_worker as worker_module
+
+    row = _source_assignment(50_110)
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps([row]), encoding="utf-8")
+    captured_filters: list[dict[str, object] | None] = []
+
+    class FakeLedger:
+        def close(self) -> None:
+            pass
+
+    class FakeWorker:
+        def __init__(self, **kwargs):
+            captured_filters.append(kwargs["controller"]._assignment_filter)
+
+        def run(self):
+            return []
+
+    monkeypatch.setattr(worker_module, "PersistentRolloutWorker", FakeWorker)
+
+    monkeypatch.setenv("LEHOME_EVALUATION_GARMENT_AFFINITY", "1")
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0",
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=1, target_accepted=1,
+        initial_garment=row["garment"],
+        worker_id="worker-1", session_id="session-1",
+        output_root=tmp_path / "output",
+    )
+
+    assert worker_module.run(args, ledger_factory=lambda *_args, **_kwargs: FakeLedger()) == []
+    assert captured_filters == [{"garment": row["garment"]}]
 
 
 @pytest.mark.parametrize("mutate", [
@@ -1379,6 +1515,109 @@ def test_worker_classifies_cloth_numerical_divergence_as_infrastructure_invalid(
     assert controller.aborted == [
         ("worker-0", "attempt-a", "lease-a", "simulator_numerical_divergence")
     ]
+
+
+def test_worker_requests_clean_restart_when_controller_requeues_infrastructure_abort(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import (
+        PersistentRolloutWorker,
+        SimulatorNumericalDivergenceError,
+    )
+
+    first = Lease(Attempt("attempt-a", {"garment": "Top_Long_Seen_0", "seed": 11}), "lease-a")
+    second = Lease(Attempt("attempt-b", {"garment": "Top_Long_Seen_1", "seed": 12}), "lease-b")
+
+    class DivergentSession(FakeSession):
+        def run_episode(self, *, assignment, attempt_output_dir, policy, cancellation_event):
+            self.runs.append(str(assignment["attempt_id"]))
+            raise SimulatorNumericalDivergenceError(
+                "simulator_numerical_divergence: cloth physical-health admission failed"
+            )
+
+    class RetryController(FakeController):
+        def __init__(self):
+            super().__init__([first, second])
+            self.aborted = []
+
+        def record_infrastructure_abort(self, worker_id, attempt_id, lease_id, *, reason):
+            self.aborted.append((worker_id, attempt_id, lease_id, reason))
+            return "retryable"
+
+    controller = RetryController()
+    session = DivergentSession()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+
+    with pytest.raises(RuntimeError, match="clean worker restart"):
+        worker.run()
+
+    assert session.runs == ["attempt-a"]
+    assert controller._leases == [second]
+    assert session.closed is True
+
+
+def test_terminal_evaluation_controller_requeues_infrastructure_abort_for_a_fresh_lease(tmp_path) -> None:
+    from lehome.flywheel.task_ledger import TaskLedger
+    from scripts.run_groot_persistent_worker import LedgerWorkerController
+
+    ledger = TaskLedger(
+        tmp_path / "ledger.sqlite3",
+        attempt_matrix=[{"attempt_id": "trial-a", "garment": "Top_Long_Seen_0", "seed": 11}],
+        max_attempts=400,
+        target_accepted=1,
+    )
+    try:
+        controller = LedgerWorkerController(
+            ledger,
+            lease_duration_ns=10**18,
+            retry_infrastructure_aborts=True,
+        )
+        first = controller.lease_next("worker-1")
+        assert first is not None
+
+        status = controller.record_infrastructure_abort(
+            "worker-1", first.attempt.attempt_id, first.lease_id,
+            reason="simulator_numerical_divergence",
+        )
+
+        assert status == "retryable"
+        assert ledger.status(first.attempt.attempt_id) == "retryable"
+        second = controller.lease_next("worker-2")
+        assert second is not None
+        assert second.attempt.attempt_id == first.attempt.attempt_id
+        assert second.lease_id != first.lease_id
+    finally:
+        ledger.close()
+
+
+def test_terminal_evaluation_controller_leases_only_its_boot_garment(tmp_path) -> None:
+    from lehome.flywheel.task_ledger import TaskLedger
+    from scripts.run_groot_persistent_worker import LedgerWorkerController
+
+    ledger = TaskLedger(
+        tmp_path / "ledger.sqlite3",
+        attempt_matrix=[
+            {"attempt_id": "trial-a", "garment_name": "Top_Long_Seen_0", "seed": 11},
+            {"attempt_id": "trial-b", "garment_name": "Top_Long_Seen_1", "seed": 12},
+        ],
+        max_attempts=2,
+        target_accepted=2,
+    )
+    try:
+        controller = LedgerWorkerController(
+            ledger,
+            lease_duration_ns=10**18,
+            assignment_filter={"garment_name": "Top_Long_Seen_1"},
+        )
+
+        lease = controller.lease_next("worker-top-long-1")
+
+        assert lease is not None
+        assert lease.attempt.assignment["garment_name"] == "Top_Long_Seen_1"
+    finally:
+        ledger.close()
 
 
 def test_worker_continues_after_a_single_episode_runtime_error(tmp_path) -> None:

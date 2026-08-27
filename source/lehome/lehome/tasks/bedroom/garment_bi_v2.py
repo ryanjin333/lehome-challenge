@@ -685,18 +685,66 @@ class GarmentEnv(DirectRLEnv):
             self.object.initialize()
 
     def _flywheel_initialize_legacy_cpu_garment(self) -> None:
-        """Initialize the source-only CPU garment from live USD particles."""
+        """Initialize the source-only CPU garment from authored USD particles.
+
+        A newly hot-switched mesh has authored ``points`` immediately, while
+        its ``velocities`` attribute may remain unset until PhysX advances the
+        scene.  Advancing first is unsafe: an overlapping cloth can reach the
+        configured velocity ceiling before its reset state is captured.  Make
+        the authored points plus explicit zero velocity the reset authority
+        only while the attribute is unset. A registered initial garment keeps
+        its small live solver velocity because rewriting it destabilizes this
+        legacy CPU pipeline.
+        """
 
         if self.object is None:
             raise RuntimeError("cannot initialize an absent CPU source garment")
         try:
-            self.object.world_prim.set_world_pose(
+            # Use SingleClothPrim's cloth-aware root setter. Moving only the
+            # parent Xform leaves registered particles in the previous solver
+            # frame and can launch the garment at the velocity ceiling.
+            self.object.set_world_pose(
                 position=self.object.init_pos, orientation=self.object.init_ori
             )
-            positions, velocities = self._flywheel_legacy_cpu_cloth_state()
+            positions_attr, velocities_attr = self._flywheel_legacy_cpu_cloth_attributes()
+            positions = positions_attr.Get()
+            live_velocities = velocities_attr.Get()
+            if positions is None:
+                raise RuntimeError("CPU source garment USD points are unset")
+            positions_array = np.asarray(positions, dtype=np.float32)
+            positions_array, zero_velocities = self._flywheel_cloth_arrays(
+                positions_array, np.zeros_like(positions_array)
+            )
+            if live_velocities is None:
+                if not callable(getattr(velocities_attr, "Set", None)):
+                    raise RuntimeError("CPU source garment USD velocities are not writable")
+                if velocities_attr.Set(
+                    self._flywheel_legacy_usd_vec3f_array(zero_velocities)
+                ) is False:
+                    raise RuntimeError("CPU source garment USD zero-velocity write failed")
+                observed_positions, observed_velocities = (
+                    self._flywheel_legacy_cpu_cloth_state()
+                )
+                if not (
+                    np.allclose(observed_positions, positions_array, rtol=0.0, atol=1e-6)
+                    and np.allclose(
+                        observed_velocities, zero_velocities, rtol=0.0, atol=1e-6
+                    )
+                ):
+                    raise RuntimeError("CPU source garment initialization readback mismatch")
+                reset_velocities = zero_velocities
+            else:
+                # The initial scene garment is already registered.  Validate
+                # its state but do not re-author a live physics attribute;
+                # doing so can stall the subsequent garment deletion.
+                positions_array, reset_velocities = self._flywheel_cloth_arrays(
+                    positions_array, live_velocities
+                )
         except (RuntimeError, TypeError, ValueError, AttributeError) as error:
             raise RuntimeError("CPU source garment initialization lacks live USD cloth state") from error
-        self._flywheel_legacy_cpu_reset_state = (positions.copy(), velocities.copy())
+        self._flywheel_legacy_cpu_reset_state = (
+            positions_array.copy(), reset_velocities.copy()
+        )
 
     def _flywheel_reset_legacy_cpu_garment(self) -> None:
         """Restore the CPU source reset state through USD, never PhysX."""
@@ -711,6 +759,28 @@ class GarmentEnv(DirectRLEnv):
         positions, velocities = initial
         try:
             positions, velocities = self._flywheel_cloth_arrays(positions, velocities)
+        except (RuntimeError, TypeError, ValueError, AttributeError) as error:
+            raise RuntimeError("CPU source garment USD reset readback failed") from error
+        particle_objects = self.particle_config.get("objects", {})
+        particle_system = particle_objects.get("particle_system", {})
+        configured_max_velocity_mps = float(
+            particle_system.get("max_velocity", 5.0)
+        )
+        initial_max_velocity_mps = (
+            float(np.max(np.linalg.norm(velocities, axis=1)))
+            if velocities.size else float("inf")
+        )
+        if (
+            not np.isfinite(configured_max_velocity_mps)
+            or configured_max_velocity_mps <= 0.0
+            or initial_max_velocity_mps >= configured_max_velocity_mps * 0.95
+        ):
+            raise RuntimeError(
+                "CPU source reset has saturated velocity: "
+                f"observed={initial_max_velocity_mps} "
+                f"limit={configured_max_velocity_mps * 0.95}"
+            )
+        try:
             config_get = getattr(self.object, "_get_config_value", None)
             if not callable(config_get):
                 raise RuntimeError("CPU source garment reset configuration is unavailable")
@@ -729,7 +799,7 @@ class GarmentEnv(DirectRLEnv):
             orientation_degrees = self.garment_rng.uniform(orientation_range[:3], orientation_range[3:])
             from isaacsim.core.utils.rotations import euler_angles_to_quat
 
-            self.object.world_prim.set_world_pose(
+            self.object.set_world_pose(
                 position, euler_angles_to_quat(orientation_degrees, degrees=True)
             )
             self.object.reset_pose = np.concatenate((position, orientation_degrees)).astype(np.float32)
@@ -759,7 +829,7 @@ class GarmentEnv(DirectRLEnv):
                 raise ValueError("CPU source garment pose must be a finite xyz-rpy vector")
             from isaacsim.core.utils.rotations import euler_angles_to_quat
 
-            self.object.world_prim.set_world_pose(
+            self.object.set_world_pose(
                 garment_pose[:3], euler_angles_to_quat(garment_pose[3:], degrees=True)
             )
             self.object.reset_pose = garment_pose.copy()
@@ -1447,7 +1517,10 @@ class GarmentEnv(DirectRLEnv):
         garment_scale_envelope_m = float(np.max(np.abs(scale)))
         max_position_limit_m = reset_position_envelope_m + 2.0 * garment_scale_envelope_m
         max_extent_limit_m = 4.0 * garment_scale_envelope_m
-        max_velocity_limit_mps = configured_max_velocity_mps + 1e-4
+        # A particle reading exactly at PhysX's configured velocity ceiling is
+        # saturated, not healthy motion. Keep a small admission margin so a
+        # reset-time cloth launch is quarantined before policy inference.
+        max_velocity_limit_mps = configured_max_velocity_mps * 0.95
         max_position_m = float(np.max(np.abs(positions))) if positions.size else float("inf")
         max_extent_m = float(np.max(np.ptp(positions, axis=0))) if positions.size else float("inf")
         max_velocity_mps = float(np.max(np.linalg.norm(velocities, axis=1))) if velocities.size else float("inf")
@@ -1954,6 +2027,16 @@ class GarmentEnv(DirectRLEnv):
         if garment_version is None:
             garment_version = self.cfg.garment_version
 
+        # Live particle-cloth replacement is not stable on the legacy CPU
+        # pipeline: both authored and solver-registered reset variants reached
+        # the velocity ceiling within two steps. Start a fresh worker with the
+        # assigned garment instead, and fail before deleting the healthy scene.
+        if str(self.device).lower() == "cpu":
+            raise RuntimeError(
+                "CPU cloth hot-switch is unsupported; restart the worker with "
+                f"initial garment {garment_name}"
+            )
+
         # Validate the replacement while the current garment is still intact.
         # Bad assets must fail without destroying the usable scene.
         next_garment_config = self.garment_loader.load_garment_config(
@@ -1997,6 +2080,7 @@ class GarmentEnv(DirectRLEnv):
         # create new garment object
         self._create_garment_object()
         logger.debug(f"[GarmentEnv] New garment object created for {garment_name}")
+        cpu_source = str(self.device).lower() == "cpu"
         logger.debug(
             f"[GarmentEnv] Running initial physics steps to register prim in stage..."
         )
@@ -2019,25 +2103,35 @@ class GarmentEnv(DirectRLEnv):
                     f"[GarmentEnv] Error during render after initial steps: {e}"
                 )
 
-        try:
+        if cpu_source:
+            # Capture the solver-registered geometry, which is the only safe
+            # reset authority after a live hot-swap. The CPU initializer
+            # deliberately caches zero velocity instead of the registration
+            # velocity so subsequent resets cannot relaunch the cloth.
             self.initialize_obs()
             logger.debug(
-                f"[GarmentEnv] Observation system initialized for {garment_name}"
+                f"[GarmentEnv] CPU observation system initialized for {garment_name}"
             )
-            if hasattr(self, "render"):
-                try:
-                    self.render()
-                    logger.debug(
-                        f"[GarmentEnv] Render called after observation initialization"
-                    )
-                except Exception as e:
-                    logger.debug(
-                        f"[GarmentEnv] Error during render after observation init: {e}"
-                    )
-        except Exception as e:
-            logger.warning(
-                f"[GarmentEnv] Failed to initialize observations (may be expected): {e}"
-            )
+        else:
+            try:
+                self.initialize_obs()
+                logger.debug(
+                    f"[GarmentEnv] Observation system initialized for {garment_name}"
+                )
+                if hasattr(self, "render"):
+                    try:
+                        self.render()
+                        logger.debug(
+                            f"[GarmentEnv] Render called after observation initialization"
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"[GarmentEnv] Error during render after observation init: {e}"
+                        )
+            except Exception as e:
+                logger.warning(
+                    f"[GarmentEnv] Failed to initialize observations (may be expected): {e}"
+                )
 
     def cleanup(self):
         """Cleanup method (defensive programming).

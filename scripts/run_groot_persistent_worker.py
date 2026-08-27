@@ -12,7 +12,7 @@ import sys
 from typing import Any, Mapping, MutableMapping
 
 from lehome.flywheel.persistent_worker import PersistentRolloutWorker
-from lehome.flywheel.task_ledger import TaskLedger
+from lehome.flywheel.task_ledger import MAX_CAMPAIGN_ATTEMPTS, TaskLedger
 
 
 _CUDA_DEVICE = re.compile(r"^cuda:([0-9]+)$")
@@ -21,17 +21,30 @@ _DEFAULT_POLICY_REVISION = "30ac1a84da67b099e115ad147bcd61e9d60046d3"
 _DEFAULT_POLICY_ARTIFACT_SHA256 = "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"
 _TERMINAL_EVALUATION_CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
 _TERMINAL_EVALUATION_ROW_KEYS = {"trial_id", "category", "garment_name", "release_stage", "seed"}
+_TERMINAL_80_ALIAS_KEYS = {"attempt_id", "garment"}
 
 
 class LedgerWorkerController:
     """Give a worker the small controller surface without a second scheduler."""
 
-    def __init__(self, ledger: TaskLedger, *, lease_duration_ns: int) -> None:
+    def __init__(
+        self,
+        ledger: TaskLedger,
+        *,
+        lease_duration_ns: int,
+        retry_infrastructure_aborts: bool = False,
+        assignment_filter: Mapping[str, object] | None = None,
+    ) -> None:
         self._ledger = ledger
         self._lease_duration_ns = lease_duration_ns
+        self._retry_infrastructure_aborts = retry_infrastructure_aborts
+        self._assignment_filter = assignment_filter
 
     def lease_next(self, worker_id: str):
-        return self._ledger.lease_next(worker_id, lease_duration_ns=self._lease_duration_ns)
+        kwargs: dict[str, object] = {"lease_duration_ns": self._lease_duration_ns}
+        if self._assignment_filter is not None:
+            kwargs["assignment_filter"] = self._assignment_filter
+        return self._ledger.lease_next(worker_id, **kwargs)
 
     def record_terminal(self, worker_id: str, attempt_id: str, lease_id: str, raw_artifact_id: str):
         return self._ledger.record_terminal(worker_id, attempt_id, lease_id, raw_artifact_id)
@@ -43,6 +56,13 @@ class LedgerWorkerController:
         return self._ledger.reject_attempt(worker_id, attempt_id, lease_id, reason=reason)
 
     def record_infrastructure_abort(self, worker_id: str, attempt_id: str, lease_id: str, *, reason: str) -> str:
+        if self._retry_infrastructure_aborts:
+            return self._ledger.record_interrupted(
+                worker_id,
+                attempt_id,
+                lease_id,
+                f"infrastructure_retry:{reason}",
+            )
         return self._ledger.record_infrastructure_abort(worker_id, attempt_id, lease_id, reason=reason)
 
     def status(self, attempt_id: str) -> str:
@@ -93,14 +113,20 @@ def _is_cpu_terminal_evaluation(matrix: list[Mapping[str, object]], args: argpar
     ):
         return False
     seen_development = len(matrix) == 24
-    expected_release_stage = "seen" if seen_development else "public_unseen"
+    seen80 = len(matrix) == 80 and all(row.get("release_stage") == "seen" for row in matrix)
+    expected_release_stage = "seen" if seen_development or seen80 else "public_unseen"
+    exact_eighty = len(matrix) == 80
+    base_row_keys = _TERMINAL_EVALUATION_ROW_KEYS
+    aliased_row_keys = base_row_keys | _TERMINAL_80_ALIAS_KEYS
+    row_key_shapes = {frozenset(row) for row in matrix}
+    if row_key_shapes not in ({frozenset(base_row_keys)}, {frozenset(aliased_row_keys)}):
+        return False
+    has_aliases = row_key_shapes == {frozenset(aliased_row_keys)}
     expected_per_category = len(matrix) // len(_TERMINAL_EVALUATION_CATEGORIES)
     category_counts = {category: 0 for category in _TERMINAL_EVALUATION_CATEGORIES}
     trial_ids: set[str] = set()
     identities: set[tuple[object, ...]] = set()
     for row in matrix:
-        if set(row) != _TERMINAL_EVALUATION_ROW_KEYS:
-            return False
         trial_id = row.get("trial_id")
         category = row.get("category")
         garment_name = row.get("garment_name")
@@ -117,6 +143,8 @@ def _is_cpu_terminal_evaluation(matrix: list[Mapping[str, object]], args: argpar
             or seed < 0
         ):
             return False
+        if has_aliases and (row.get("attempt_id") != trial_id or row.get("garment") != garment_name):
+            return False
         identity = (category, garment_name, seed)
         if trial_id in trial_ids or identity in identities:
             return False
@@ -125,24 +153,45 @@ def _is_cpu_terminal_evaluation(matrix: list[Mapping[str, object]], args: argpar
         category_counts[category] += 1
     if not all(count == expected_per_category for count in category_counts.values()):
         return False
-    if not seen_development:
+    if not seen_development and not seen80:
         return True
     prefixes = {
         "top_long": "Top_Long", "top_short": "Top_Short",
         "pant_long": "Pant_Long", "pant_short": "Pant_Short",
     }
-    expected_rows = {
-        (
-            f"{category.replace('_', '-')}-seen-{garment_index}-seed-{seed}",
-            category,
-            f"{prefixes[category]}_Seen_{garment_index}",
-            "seen",
-            seed,
-        )
-        for category in _TERMINAL_EVALUATION_CATEGORIES
-        for garment_index in range(2)
-        for seed in (42, 43, 44)
-    }
+    if seen_development:
+        expected_rows = {
+            (
+                f"{category.replace('_', '-')}-seen-{garment_index}-seed-{seed}",
+                category,
+                f"{prefixes[category]}_Seen_{garment_index}",
+                "seen",
+                seed,
+            )
+            for category in _TERMINAL_EVALUATION_CATEGORIES
+            for garment_index in range(2)
+            for seed in (42, 43, 44)
+        }
+    else:
+        seed_bases = {
+            "top_long": 970_000, "top_short": 971_000,
+            "pant_long": 972_000, "pant_short": 973_000,
+        }
+        expected_rows = {
+            (
+                f"{category.replace('_', '-')}-seen-{garment_index}-seed-{seed}",
+                category,
+                f"{prefixes[category]}_Seen_{garment_index}",
+                "seen",
+                seed,
+            )
+            for category in _TERMINAL_EVALUATION_CATEGORIES
+            for garment_index in range(10)
+            for seed in range(
+                seed_bases[category] + garment_index * 2,
+                seed_bases[category] + garment_index * 2 + 2,
+            )
+        }
     return {
         (row["trial_id"], row["category"], row["garment_name"], row["release_stage"], row["seed"])
         for row in matrix
@@ -286,6 +335,10 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
     if args.device != "cpu" and (args.device != args.renderer_device or _CUDA_DEVICE.fullmatch(args.device) is None):
         raise ValueError("persistent worker simulator device is not bound to the requested backend")
     terminal_evaluation = os.environ.get("LEHOME_EVALUATION_TERMINAL_UPLOAD") == "1"
+    affinity_value = os.environ.get("LEHOME_EVALUATION_GARMENT_AFFINITY", "0")
+    if affinity_value not in {"0", "1"}:
+        raise ValueError("LEHOME_EVALUATION_GARMENT_AFFINITY must be exactly 0 or 1")
+    garment_affinity = affinity_value == "1"
     success_replay_campaign = os.environ.get("LEHOME_SUCCESS_REPLAY_CAMPAIGN") == "1"
     hard_state_campaign = os.environ.get("LEHOME_HARD_STATE_CAMPAIGN") == "1"
     if sum((terminal_evaluation, success_replay_campaign, hard_state_campaign)) > 1:
@@ -293,9 +346,25 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
     if terminal_evaluation and args.device != "cpu":
         raise ValueError("terminal evaluation requires CPU cloth")
     matrix = _load_matrix(args.attempt_matrix)
+    source_discovery = bool(matrix) and all(
+        row.get("snapshot_source_bootstrap") is True for row in matrix
+    )
+    if terminal_evaluation and not garment_affinity:
+        raise ValueError("terminal CPU evaluation requires garment affinity")
+    if garment_affinity and not (terminal_evaluation or source_discovery):
+        raise ValueError("garment affinity is reserved for terminal CPU evaluation or source discovery")
     if terminal_evaluation:
         if not _is_cpu_terminal_evaluation(matrix, args):
             raise ValueError("terminal evaluation matrix is invalid")
+        if garment_affinity and not any(
+            row.get("garment_name") == args.initial_garment for row in matrix
+        ):
+            raise ValueError("garment affinity is absent from the terminal evaluation matrix")
+    elif source_discovery and garment_affinity and not any(
+        (row.get("garment_name") or row.get("garment")) == args.initial_garment
+        for row in matrix
+    ):
+        raise ValueError("garment affinity is absent from the source discovery matrix")
     elif args.device == "cpu":
         controlled_teacher_smoke = (
             len(matrix) == 1
@@ -368,7 +437,8 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
                     "CPU cloth is reserved for bounded snapshot-source bootstrap discovery or terminal public-unseen evaluation"
                 ) from error
     ledger = ledger_factory(
-        args.database, attempt_matrix=matrix, max_attempts=args.max_attempts,
+        args.database, attempt_matrix=matrix,
+        max_attempts=MAX_CAMPAIGN_ATTEMPTS if terminal_evaluation else args.max_attempts,
         target_accepted=args.target_accepted,
     )
     try:
@@ -397,7 +467,18 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
 
         worker = PersistentRolloutWorker(
             worker_id=args.worker_id, session_id=args.session_id,
-            controller=LedgerWorkerController(ledger, lease_duration_ns=round(args.lease_seconds * 1_000_000_000)),
+            controller=LedgerWorkerController(
+                ledger,
+                lease_duration_ns=round(args.lease_seconds * 1_000_000_000),
+                retry_infrastructure_aborts=terminal_evaluation,
+                assignment_filter=(
+                    {
+                        "garment" if source_discovery else "garment_name":
+                            args.initial_garment
+                    }
+                    if garment_affinity else None
+                ),
+            ),
             simulator_factory=simulator_factory, policy=_PolicyProxy(), output_root=args.output_root,
             renderer_device=args.renderer_device, policy_device=args.policy_device, simulator_device=args.device,
             heartbeat_interval_seconds=max(0.1, args.lease_seconds / 3.0),

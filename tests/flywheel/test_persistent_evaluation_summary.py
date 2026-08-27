@@ -207,6 +207,75 @@ def test_build_report_binds_all_80_terminal_artifacts_and_policy_identity(tmp_pa
     assert report["report_sha256"] == module.report_sha256(report)
 
 
+def test_build_report_labels_a_homogeneous_seen80_matrix(tmp_path: Path) -> None:
+    module = _module()
+    root, matrix, _ = _campaign(tmp_path)
+    rows = json.loads(matrix.read_text(encoding="utf-8"))
+    database = sqlite3.connect(root / "ledger.sqlite3")
+    for row in rows:
+        row["release_stage"] = "seen"
+        attempt_id = hashlib.sha256(row["trial_id"].encode()).hexdigest()
+        database.execute(
+            "UPDATE attempts SET assignment_json = ? WHERE attempt_id = ?",
+            (json.dumps(row, sort_keys=True, separators=(",", ":")), attempt_id),
+        )
+    database.commit()
+    database.close()
+    for episode_path in root.rglob("episode.json"):
+        episode = json.loads(episode_path.read_text(encoding="utf-8"))
+        episode["identity"]["release_stage"] = "seen"
+        episode_path.write_text(json.dumps(episode), encoding="utf-8")
+    encoded = (json.dumps(rows, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    matrix.write_bytes(encoded)
+
+    report = module.build_report(
+        campaign_root=root,
+        matrix_path=matrix,
+        matrix_sha256=hashlib.sha256(encoded).hexdigest(),
+        candidate_key="new_step_2k",
+        policy_repo="ryanjin333/lehome-groot-n17-models",
+        policy_revision=REVISION,
+        policy_step=2000,
+        policy_artifact_sha256=ARTIFACT,
+    )
+
+    assert report["kind"] == "lehome_groot_persistent_seen80_evaluation"
+    assert report["release_stage"] == "seen"
+
+
+def test_experiment_promotion_report_rejects_seen_matrix(tmp_path: Path) -> None:
+    module = _module()
+    root, matrix, _ = _campaign(tmp_path)
+    rows = json.loads(matrix.read_text(encoding="utf-8"))
+    database = sqlite3.connect(root / "ledger.sqlite3")
+    for row in rows:
+        row["release_stage"] = "seen"
+        attempt_id = hashlib.sha256(row["trial_id"].encode()).hexdigest()
+        database.execute(
+            "UPDATE attempts SET assignment_json = ? WHERE attempt_id = ?",
+            (json.dumps(row, sort_keys=True, separators=(",", ":")), attempt_id),
+        )
+    database.commit()
+    database.close()
+    for episode_path in root.rglob("episode.json"):
+        episode = json.loads(episode_path.read_text(encoding="utf-8"))
+        episode["identity"]["release_stage"] = "seen"
+        episode_path.write_text(json.dumps(episode), encoding="utf-8")
+    encoded = (json.dumps(rows, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    matrix.write_bytes(encoded)
+    digest = hashlib.sha256(encoded).hexdigest()
+    job, publication = _job_and_publication(digest=digest)
+
+    with pytest.raises(ValueError, match="promotion report requires public-unseen evaluation"):
+        module.build_experiment_report(
+            experiment_job=job,
+            checkpoint_publication=publication,
+            campaign_root=root,
+            matrix_path=matrix,
+            matrix_sha256=digest,
+        )
+
+
 def test_build_report_accepts_cpu_cloth_with_a_canonical_cuda_policy_device(tmp_path: Path) -> None:
     module = _module()
     root, matrix, digest = _campaign(tmp_path)

@@ -61,6 +61,14 @@ SUCCESS_REPLAY_CAMPAIGN="${LEHOME_SUCCESS_REPLAY_CAMPAIGN:-0}"
 HARD_STATE_CAMPAIGN="${LEHOME_HARD_STATE_CAMPAIGN:-0}"
 RESUME_PREEMPTED_ROLLOUT="${LEHOME_RESUME_PREEMPTED_ROLLOUT:-0}"
 EVALUATION_TERMINAL_UPLOAD="${LEHOME_EVALUATION_TERMINAL_UPLOAD:-0}"
+FRESH_GARMENT_WAVES="${LEHOME_FRESH_GARMENT_WAVES:-${EVALUATION_TERMINAL_UPLOAD}}"
+LEDGER_MAX_ATTEMPTS="${MAX_ATTEMPTS}"
+if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
+  # The frozen evaluation still contains exactly MAX_ATTEMPTS distinct rows.
+  # Extra ledger lease capacity exists only so an infrastructure-invalid row
+  # can be retried from a clean Isaac process without dropping it from the 80.
+  LEDGER_MAX_ATTEMPTS=400
+fi
 
 case "${WORKER_COUNT}" in
   "1"|"4") ;;
@@ -150,6 +158,10 @@ case "${EVALUATION_TERMINAL_UPLOAD}" in
   "0"|"1") ;;
   *) echo "LEHOME_EVALUATION_TERMINAL_UPLOAD must be exactly 0 or 1" >&2; exit 2 ;;
 esac
+case "${FRESH_GARMENT_WAVES}" in
+  "0"|"1") ;;
+  *) echo "LEHOME_FRESH_GARMENT_WAVES must be exactly 0 or 1" >&2; exit 2 ;;
+esac
 if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
   if [ "${SIMULATOR_DEVICE}" != "cpu" ]; then
     echo "terminal evaluation requires LEHOME_SIMULATOR_DEVICE=cpu" >&2
@@ -157,8 +169,17 @@ if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
   fi
   if [ "${ENABLE_HF_UPLOAD}" != "1" ] || [ "${WORKER_COUNT}" != "4" ] \
       || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || [ "${SKIP_ROUND_SEAL}" != "0" ] \
-      || [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "0" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ]; then
+      || [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "0" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ] \
+      || [ "${FRESH_GARMENT_WAVES}" != "1" ]; then
     echo "evaluation terminal publication requires the exact four-worker evaluation tuple" >&2
+    exit 2
+  fi
+fi
+if [ "${FRESH_GARMENT_WAVES}" = "1" ]; then
+  if [ "${SIMULATOR_DEVICE}" != "cpu" ] \
+      || { [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ] && [ "${WORKER_COUNT}" != "4" ]; } \
+      || { [ "${EVALUATION_TERMINAL_UPLOAD}" != "1" ] && [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "1" ]; }; then
+    echo "fresh garment waves require four-worker terminal evaluation or one/four-worker snapshot-source discovery on CPU" >&2
     exit 2
   fi
 fi
@@ -325,6 +346,34 @@ if [ "${RESUME_PREEMPTED_ROLLOUT}" = "1" ] && [ "${CONTROLLED_RECOVERY_SMOKE}" !
   exit 2
 fi
 mkdir -p "${CAMPAIGN_ROOT}"
+evaluation_garments=()
+if [ "${FRESH_GARMENT_WAVES}" = "1" ]; then
+  while IFS= read -r garment; do
+    evaluation_garments+=("${garment}")
+  done < <(python3 - "${MATRIX}" <<'PY'
+import json
+import sys
+
+rows = json.load(open(sys.argv[1], encoding="utf-8"))
+seen = set()
+for row in rows:
+    garment = row.get("garment_name") or row.get("garment")
+    if not isinstance(garment, str) or not garment:
+        raise SystemExit("terminal evaluation garment identity is invalid")
+    if garment not in seen:
+        print(garment)
+        seen.add(garment)
+PY
+  )
+  if [ "${#evaluation_garments[@]}" -eq 0 ]; then
+    echo "fresh garment evaluation requires at least one garment" >&2
+    exit 2
+  fi
+  if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ] && [ $(( ${#evaluation_garments[@]} % 4 )) -ne 0 ]; then
+    echo "terminal fresh garment evaluation requires a multiple of four garments" >&2
+    exit 2
+  fi
+fi
 if [ "${LEHOME_VALIDATE_MATRIX_ONLY:-0}" = "1" ]; then
   exit 0
 fi
@@ -494,7 +543,7 @@ docker run --rm --user 1234:1234 --network none \
     --database "${LEDGER}" \
     --attempt-matrix "${MATRIX}" \
     --run-root "${CAMPAIGN_ROOT}" \
-    --max-attempts "${MAX_ATTEMPTS}" \
+    --max-attempts "${LEDGER_MAX_ATTEMPTS}" \
     --target-accepted "${TARGET_ACCEPTED}" \
     "${FINALIZER_SMOKE_FLAG[@]}" \
     "${FINALIZER_EVALUATION_FLAG[@]}" &
@@ -537,6 +586,9 @@ fi
 
 # Policy server owns CUDA. Staged gateway evicts idle leftover sessions.
 docker rm -f lehome-12k-policy >/dev/null 2>&1 || true
+# A resumed campaign must never admit workers against the prior gateway's
+# readiness receipt. The immutable policy.jsonl history remains preserved.
+rm -f "${RECEIPT_DIR}/ready.json" "${RECEIPT_DIR}/metrics.json"
 docker run --rm --gpus all --user 10001:10001 --network host --ipc=host \
   --name lehome-12k-policy \
   -w /cache/models \
@@ -577,6 +629,8 @@ chmod 0755 "${RECEIPT_DIR}" || true
 
 launch_worker() {
   local index="$1"
+  local worker_garment="${2:-${INITIAL_GARMENT}}"
+  local worker_identity="${3:-worker-${index}}"
   local session_id="camp12k-w${index}-$(uuidgen | tr '[:upper:]' '[:lower:]')"
   local kit="/kitcache/w${index}"
   mkdir -p "${kit}/home" "${kit}/tmp" "${kit}/xdg" "${kit}/config" "${kit}/ov"
@@ -616,6 +670,7 @@ launch_worker() {
     -e OMNI_USER_DIR=/kitcache/ov \
     -e LEHOME_DISABLE_KEYBOARD=1 \
     -e LEHOME_EVALUATION_TERMINAL_UPLOAD="${EVALUATION_TERMINAL_UPLOAD}" \
+    -e LEHOME_EVALUATION_GARMENT_AFFINITY="${FRESH_GARMENT_WAVES}" \
     -e LEHOME_SUCCESS_REPLAY_CAMPAIGN="${SUCCESS_REPLAY_CAMPAIGN}" \
     -e LEHOME_HARD_STATE_CAMPAIGN="${HARD_STATE_CAMPAIGN}" \
     --entrypoint /isaac-sim/python.sh \
@@ -624,9 +679,9 @@ launch_worker() {
       --headless \
       --database "${LEDGER}" \
       --attempt-matrix "${MATRIX}" \
-      --worker-id "worker-${index}" \
+      --worker-id "${worker_identity}" \
       --session-id "${session_id}" \
-      --output-root "${CAMPAIGN_ROOT}/worker-${index}" \
+      --output-root "${CAMPAIGN_ROOT}/${worker_identity}" \
       --renderer-device cuda:0 \
       --policy-device cuda:0 \
       --simulator-device "${SIMULATOR_DEVICE}" \
@@ -640,7 +695,7 @@ launch_worker() {
       --preparation-timeout-seconds "${PREPARATION_TIMEOUT_SECONDS}" \
       --source-finalization-timeout-seconds "${SOURCE_FINALIZATION_TIMEOUT_SECONDS}" \
       --policy-ready-file "${RECEIPT_DIR}/ready.json" \
-      --initial-garment "${INITIAL_GARMENT}" \
+      --initial-garment "${worker_garment}" \
       --seed 101 \
       --garment_name Top_Long_Seen_0 \
       --max_steps "${MAX_STEPS}" \
@@ -652,7 +707,7 @@ launch_worker() {
   fi
   # Isaac's outer launcher has occasionally returned zero after an inner
   # exception. A process exit is clean only when it left no live lease behind.
-  if ! lehome_worker_exit_is_clean "${LEDGER}" "worker-${index}"; then
+  if ! lehome_worker_exit_is_clean "${LEDGER}" "${worker_identity}"; then
     echo "worker ${index} exited while still owning an active lease" >&2
     return 71
   fi
@@ -660,17 +715,45 @@ launch_worker() {
 }
 
 # Production remains exactly four workers; lower width is an explicit smoke.
-worker_pids=()
-for index in $(seq 1 "${WORKER_COUNT}"); do
-  lehome_supervise_worker "${index}" "${MAX_WORKER_RESTARTS}" launch_worker &
-  worker_pids+=("$!")
-done
 worker_status=0
-for worker_pid in "${worker_pids[@]}"; do
-  if ! wait "${worker_pid}"; then
-    worker_status=1
-  fi
-done
+if [ "${FRESH_GARMENT_WAVES}" = "1" ]; then
+  run_garment_slot() {
+    local index="$1"
+    local garment_index=$((index - 1))
+    local worker_identity
+    while [ "${garment_index}" -lt "${#evaluation_garments[@]}" ]; do
+      worker_identity="worker-$((garment_index + 1))-${index}"
+      lehome_supervise_worker "${index}" "${MAX_WORKER_RESTARTS}" launch_worker \
+        "${evaluation_garments[${garment_index}]}" "${worker_identity}" &
+      local supervised_pid="$!"
+      if ! wait "${supervised_pid}"; then
+        return 1
+      fi
+      garment_index=$((garment_index + WORKER_COUNT))
+    done
+  }
+  worker_pids=()
+  for index in $(seq 1 "${WORKER_COUNT}"); do
+    run_garment_slot "${index}" &
+    worker_pids+=("$!")
+  done
+  for worker_pid in "${worker_pids[@]}"; do
+    if ! wait "${worker_pid}"; then
+      worker_status=1
+    fi
+  done
+else
+  worker_pids=()
+  for index in $(seq 1 "${WORKER_COUNT}"); do
+    lehome_supervise_worker "${index}" "${MAX_WORKER_RESTARTS}" launch_worker &
+    worker_pids+=("$!")
+  done
+  for worker_pid in "${worker_pids[@]}"; do
+    if ! wait "${worker_pid}"; then
+      worker_status=1
+    fi
+  done
+fi
 
 pending_terminal_count() {
   python3 - "${LEDGER}" <<'PY'

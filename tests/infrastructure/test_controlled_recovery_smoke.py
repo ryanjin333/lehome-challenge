@@ -163,7 +163,7 @@ def _fake_snapshot_source_base(path: Path) -> None:
         if case in {'multi-accepted', 'multi-invalid-evidence', 'multi-numerical-divergence'}:
             rows = json.loads(descriptor.read_text())
             root.mkdir(parents=True, exist_ok=True)
-            (root / 'base-launch.json').write_text(json.dumps({'initial_garment': os.environ.get('LEHOME_INITIAL_GARMENT'), 'simulator_device': os.environ.get('LEHOME_SIMULATOR_DEVICE'), 'max_worker_restarts': os.environ.get('LEHOME_MAX_WORKER_RESTARTS')}))
+            (root / 'base-launch.json').write_text(json.dumps({'initial_garment': os.environ.get('LEHOME_INITIAL_GARMENT'), 'simulator_device': os.environ.get('LEHOME_SIMULATOR_DEVICE'), 'max_worker_restarts': os.environ.get('LEHOME_MAX_WORKER_RESTARTS'), 'fresh_garment_waves': os.environ.get('LEHOME_FRESH_GARMENT_WAVES')}))
             con = sqlite3.connect(root / 'ledger.sqlite3')
             con.execute('create table attempts (attempt_id text, assignment_json text)')
             con.execute('create table events (event_type text, attempt_id text, payload_json text)')
@@ -201,7 +201,7 @@ def _fake_snapshot_source_base(path: Path) -> None:
         attempt = hashlib.sha256(json.dumps({'schedule_index': 0, 'assignment': row}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         if case == 'noncanonical-attempt-id': attempt = 'not-a-task-ledger-id'
         root.mkdir(parents=True, exist_ok=True)
-        (root / 'base-launch.json').write_text(json.dumps({'initial_garment': os.environ.get('LEHOME_INITIAL_GARMENT'), 'simulator_device': os.environ.get('LEHOME_SIMULATOR_DEVICE'), 'max_worker_restarts': os.environ.get('LEHOME_MAX_WORKER_RESTARTS')}))
+        (root / 'base-launch.json').write_text(json.dumps({'initial_garment': os.environ.get('LEHOME_INITIAL_GARMENT'), 'simulator_device': os.environ.get('LEHOME_SIMULATOR_DEVICE'), 'max_worker_restarts': os.environ.get('LEHOME_MAX_WORKER_RESTARTS'), 'fresh_garment_waves': os.environ.get('LEHOME_FRESH_GARMENT_WAVES')}))
         con = sqlite3.connect(root / 'ledger.sqlite3')
         con.execute('create table attempts (attempt_id text, assignment_json text)')
         con.execute('create table events (event_type text, attempt_id text, payload_json text)')
@@ -747,6 +747,112 @@ def test_base_campaign_admits_bounded_same_category_source_discovery_tuple(tmp_p
     assert restarted.returncode == 0, restarted.stderr
 
 
+@pytest.mark.parametrize("worker_count", ("1", "4"))
+@pytest.mark.parametrize("garment_count", (1, 3, 4, 5))
+def test_base_campaign_admits_fresh_garment_waves_for_cpu_source_discovery(
+    tmp_path: Path, worker_count: str, garment_count: int,
+) -> None:
+    matrix = tmp_path / "sources.json"
+    rows = [
+        {
+            "snapshot_source_bootstrap": True,
+            "category": "top_long",
+            "garment": f"Top_Long_Seen_{index}",
+            "seed": 107 + index,
+            "source_seed": 107 + index,
+        }
+        for index in range(garment_count)
+    ]
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    digest = hashlib.sha256(matrix.read_bytes()).hexdigest()
+    run_id = "9" * 32
+    identity = hashlib.sha256(f"{run_id}:{digest}".encode("ascii")).hexdigest()[:20]
+    env = {
+        **os.environ,
+        "LEHOME_WORKSPACE": str(tmp_path),
+        "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "run"),
+        "LEHOME_ATTEMPT_MATRIX": str(matrix),
+        "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+        "LEHOME_RUN_ID": run_id,
+        "LEHOME_ROUND_ID": f"snapshot-source-bootstrap-{identity}-unsealed-source",
+        "LEHOME_WORKER_COUNT": worker_count,
+        "LEHOME_MAX_ATTEMPTS": str(garment_count),
+        "LEHOME_TARGET_ACCEPTED": str(garment_count),
+        "LEHOME_SIMULATOR_DEVICE": "cpu",
+        "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP": "1",
+        "LEHOME_ENABLE_HF_UPLOAD": "1",
+        "LEHOME_SKIP_ROUND_SEAL": "1",
+        "LEHOME_RESUME_PREEMPTED_ROLLOUT": "0",
+        "LEHOME_MAX_WORKER_RESTARTS": "8",
+        "LEHOME_FRESH_GARMENT_WAVES": "1",
+        "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+    }
+
+    runner = REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh"
+    source = runner.read_text(encoding="utf-8")
+    assert source.index("evaluation_garments=()") < source.index(
+        'if [ "${LEHOME_VALIDATE_MATRIX_ONLY:-0}" = "1" ]; then'
+    )
+    result = subprocess.run(
+        ["/bin/bash", str(runner)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_base_campaign_rejects_terminal_cpu_evaluation_without_fresh_garment_waves(
+    tmp_path: Path,
+) -> None:
+    categories = ("top_long", "top_short", "pant_long", "pant_short")
+    rows = [
+        {
+            "trial_id": f"public-unseen-{index}",
+            "category": categories[index % 4],
+            "garment_name": f"{categories[index % 4]}-unseen-{index // 4}",
+            "release_stage": "public_unseen",
+            "seed": 60_000 + index,
+        }
+        for index in range(20)
+    ]
+    matrix = tmp_path / "terminal.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    digest = hashlib.sha256(matrix.read_bytes()).hexdigest()
+    env = {
+        **os.environ,
+        "LEHOME_WORKSPACE": str(tmp_path),
+        "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "run"),
+        "LEHOME_ATTEMPT_MATRIX": str(matrix),
+        "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+        "LEHOME_WORKER_COUNT": "4",
+        "LEHOME_MAX_ATTEMPTS": "20",
+        "LEHOME_TARGET_ACCEPTED": "20",
+        "LEHOME_SIMULATOR_DEVICE": "cpu",
+        "LEHOME_EVALUATION_TERMINAL_UPLOAD": "1",
+        "LEHOME_FRESH_GARMENT_WAVES": "0",
+        "LEHOME_ENABLE_HF_UPLOAD": "1",
+        "LEHOME_SKIP_ROUND_SEAL": "0",
+        "LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP": "0",
+        "LEHOME_RESUME_PREEMPTED_ROLLOUT": "0",
+        "LEHOME_CONTROLLED_RECOVERY_SMOKE": "0",
+        "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+    }
+
+    result = subprocess.run(
+        ["/bin/bash", str(REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "exact four-worker evaluation tuple" in result.stderr
+
+
 @pytest.mark.parametrize(("attempts", "target"), [("0", "1"), ("401", "1"), ("3", "0"), ("3", "4")])
 def test_base_campaign_rejects_cpu_source_discovery_outside_bounded_attempt_tuple(
     tmp_path: Path, attempts: str, target: str,
@@ -1010,6 +1116,20 @@ def test_production_wrapper_remains_the_strict_four_worker_eight_target_contract
     assert "LEHOME_CONTROLLED_RECOVERY_SMOKE_TEACHER_PROBE" not in source
 
 
+def test_terminal_evaluation_can_boot_four_fresh_garments_per_wave() -> None:
+    source = (REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh").read_text(encoding="utf-8")
+
+    assert 'FRESH_GARMENT_WAVES="${LEHOME_FRESH_GARMENT_WAVES:-${EVALUATION_TERMINAL_UPLOAD}}"' in source
+    assert 'LEHOME_EVALUATION_GARMENT_AFFINITY="${FRESH_GARMENT_WAVES}"' in source
+    assert '--initial-garment "${worker_garment}"' in source
+    assert 'worker-$((garment_index + 1))-${index}' in source
+    assert 'garment_index=$((index - 1))' in source
+    assert 'garment_index=$((garment_index + WORKER_COUNT))' in source
+    assert 'run_garment_slot "${index}" &' in source
+    assert 'for index in $(seq 1 "${WORKER_COUNT}"); do' in source
+    assert 'rm -f "${RECEIPT_DIR}/ready.json" "${RECEIPT_DIR}/metrics.json"' in source
+
+
 def test_rollout_image_packages_the_unconditionally_sourced_worker_supervisor() -> None:
     dockerfile = (REPO_ROOT / "rollout_appliance" / "Dockerfile").read_text(encoding="utf-8")
     assert "rollout_appliance/worker_supervisor.sh" in dockerfile
@@ -1061,6 +1181,7 @@ def test_snapshot_source_bootstrap_passes_a_nondefault_descriptor_garment_before
         "initial_garment": "Pant_Long_Seen_4",
         "simulator_device": "cpu",
         "max_worker_restarts": "8",
+        "fresh_garment_waves": "1",
     }
 
 
@@ -1073,6 +1194,7 @@ def test_snapshot_source_bootstrap_defaults_to_the_cpu_source_cloth_lane(tmp_pat
         "initial_garment": "Top_Long_Seen_0",
         "simulator_device": "cpu",
         "max_worker_restarts": "8",
+        "fresh_garment_waves": "1",
     }
 
 
@@ -1086,6 +1208,7 @@ def test_snapshot_source_bootstrap_propagates_explicit_cuda_source_cloth_lane(tm
         "initial_garment": "Top_Long_Seen_0",
         "simulator_device": "cuda:0",
         "max_worker_restarts": "8",
+        "fresh_garment_waves": "0",
     }
 
 
@@ -1189,6 +1312,7 @@ def test_snapshot_source_bootstrap_writes_one_audit_only_envelope_atomically(tmp
         "initial_garment": "Top_Long_Seen_0",
         "simulator_device": "cpu",
         "max_worker_restarts": "8",
+        "fresh_garment_waves": "1",
     }
     assert not list(root.glob("*.strict.seal.json"))
     with pytest.raises(ValueError):
