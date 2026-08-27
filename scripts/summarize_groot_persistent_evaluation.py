@@ -109,7 +109,7 @@ def _simple_evidence_index(root: Path, name: str, identity_key: str) -> tuple[di
             invalid.add(f"unsafe:{name}:{path.relative_to(root)}")
             continue
         try:
-            payload = _json_object(path, name)
+            payload = _simple_json_object(path, name, campaign_root=root)
         except ValueError:
             invalid.add(f"malformed:{name}:{path.relative_to(root)}")
             continue
@@ -126,6 +126,60 @@ def _simple_evidence_index(root: Path, name: str, identity_key: str) -> tuple[di
             continue
         indexed[identity] = (path, payload)
     return indexed, invalid
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_json(value: object) -> None:
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _reject_nonfinite_json(item)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_nonfinite_json(item)
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("non-finite JSON number")
+
+
+def _simple_evidence_file(path: Path, *, campaign_root: Path, label: str) -> None:
+    """Require a regular selected artifact without resolving away symlinks."""
+    root = campaign_root.absolute()
+    candidate = path.absolute()
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"{label} escapes campaign root") from error
+    current = root
+    if current.is_symlink() or not current.is_dir():
+        raise ValueError(f"{label} campaign root is unsafe")
+    for component in relative.parts:
+        current = current / component
+        if current.is_symlink():
+            raise ValueError(f"{label} has a symlink ancestor")
+    if not current.is_file():
+        raise ValueError(f"{label} must be a regular file")
+
+
+def _simple_json_object(path: Path, label: str, *, campaign_root: Path) -> dict[str, object]:
+    _simple_evidence_file(path, campaign_root=campaign_root, label=label)
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=lambda constant: (_ for _ in ()).throw(ValueError(f"non-finite JSON constant: {constant}")),
+        )
+        _reject_nonfinite_json(value)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError(f"{label} is invalid") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
 
 
 def _simple_fidelity(episode: Mapping[str, object]) -> dict[str, bool]:
@@ -166,6 +220,11 @@ def _simple_raw_output_path(
             or type(generation) is not int or generation < 1):
         raise ValueError("simple curriculum receipt raw output identity is invalid")
     return campaign_root.joinpath(*components, f"generation-{generation}")
+
+
+def _terminal_invalid_key(ledger_id: str, pending_evidence: tuple[str, str, str]) -> tuple[str, str, str, str]:
+    lease_id, _worker_id, raw_artifact_id = pending_evidence
+    return ("terminal-evidence", ledger_id, lease_id, raw_artifact_id)
 
 
 def _build_simple_first_hundred_report(
@@ -224,9 +283,28 @@ def _build_simple_first_hundred_report(
     episodes, invalid_episode_evidence = _simple_evidence_index(campaign_root, "episode.json", "episode_id")
     receipts, invalid_receipt_evidence = _simple_evidence_index(campaign_root, "worker-receipt.json", "attempt_id")
     invalid_evidence = invalid_episode_evidence | invalid_receipt_evidence
+    finalized_evidence_keys: dict[str, tuple[str, str, str, str]] = {}
+    for ledger_id, pending_evidence in pending.items():
+        terminal_evidence = terminal.get(ledger_id)
+        if terminal_evidence is None:
+            continue
+        try:
+            episode_path, receipt_path = _simple_finalized_paths(
+                campaign_root, ledger_id, terminal_evidence[0], terminal_evidence[1],
+            )
+        except ValueError:
+            continue
+        key = _terminal_invalid_key(ledger_id, pending_evidence)
+        finalized_evidence_keys[f"episode.json:{episode_path.relative_to(campaign_root)}"] = key
+        finalized_evidence_keys[f"worker-receipt.json:{receipt_path.relative_to(campaign_root)}"] = key
     invalid_executions.update(
         ("evidence", identity) for identity in invalid_evidence
         if not any(ledger_id in identity for ledger_id in infrastructure_attempts)
+        and not any(identity.endswith(f":{path}") for path in finalized_evidence_keys)
+    )
+    invalid_executions.update(
+        key for path, key in finalized_evidence_keys.items()
+        if any(identity.endswith(f":{path}") for identity in invalid_evidence)
     )
     invalid_executions.update(("unbound-episode", ledger_id) for ledger_id in episodes if ledger_id not in assignments)
     invalid_executions.update(("unbound-receipt", ledger_id) for ledger_id in receipts if ledger_id not in assignments)
@@ -253,8 +331,8 @@ def _build_simple_first_hundred_report(
             expected_episode_path, expected_receipt_path = _simple_finalized_paths(
                 campaign_root, ledger_id, event, terminal_payload,
             )
-            episode = _json_object(expected_episode_path, "episode.json")
-            receipt = _json_object(expected_receipt_path, "worker-receipt.json")
+            episode = _simple_json_object(expected_episode_path, "episode.json", campaign_root=campaign_root)
+            receipt = _simple_json_object(expected_receipt_path, "worker-receipt.json", campaign_root=campaign_root)
             episode_path, receipt_path = expected_episode_path, expected_receipt_path
             identity = episode.get("identity")
             provenance = episode.get("provenance")
@@ -318,7 +396,7 @@ def _build_simple_first_hundred_report(
             _runtime_identity_digest(gate_identity, gate_provenance)
         except (TypeError, ValueError):
             if ledger_id not in infrastructure_attempts:
-                invalid_executions.add(("invalid-terminal-evidence", ledger_id))
+                invalid_executions.add(_terminal_invalid_key(ledger_id, pending_evidence))
             continue
         category = str(assignment["category"]); garment = str(assignment["garment_name"])
         category_scores[category]["episodes"] += 1; garment_scores[garment]["episodes"] += 1

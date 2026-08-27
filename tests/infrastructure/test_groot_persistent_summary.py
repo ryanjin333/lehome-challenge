@@ -237,6 +237,64 @@ def test_simple_summary_rejects_stale_receipt_copied_into_another_finalized_arti
     assert report["infrastructure_invalid_executions"] >= 1
 
 
+def test_simple_summary_rejects_symlinked_finalized_artifact_ancestor(tmp_path: Path) -> None:
+    summary = _module()
+    root, matrix, rows, ledger_ids = _simple_campaign(tmp_path)
+    ledger_id = ledger_ids[str(rows[3]["attempt_id"])]
+    destination = root / "evaluation-terminal" / ledger_id
+    outside = tmp_path / "outside" / ledger_id; outside.parent.mkdir()
+    destination.rename(outside)
+    destination.symlink_to(outside, target_is_directory=True)
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 99
+    assert report["infrastructure_invalid_executions"] == 1
+
+
+@pytest.mark.parametrize("fault", ["duplicate", "nonfinite"])
+def test_simple_summary_rejects_non_strict_finalized_episode_json(tmp_path: Path, fault: str) -> None:
+    summary = _module()
+    root, matrix, rows, ledger_ids = _simple_campaign(tmp_path)
+    ledger_id = ledger_ids[str(rows[3]["attempt_id"])]
+    path = root / "evaluation-terminal" / ledger_id / "raw" / ledger_id / "episode.json"
+    episode = json.loads(path.read_text())
+    if fault == "duplicate":
+        episode.pop("accepted_success")
+        path.write_text(json.dumps(episode, sort_keys=True)[:-1] + ',"accepted_success":false,"accepted_success":true}')
+    else:
+        path.write_text(json.dumps(episode, sort_keys=True)[:-1] + ',"probe":NaN}')
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 99
+    assert report["infrastructure_invalid_executions"] == 1
+    assert report["execution_count"] == 100
+
+
+def test_simple_summary_deduplicates_malformed_finalized_episode_execution(tmp_path: Path) -> None:
+    summary = _module()
+    root, matrix, rows, ledger_ids = _simple_campaign(tmp_path)
+    ledger_id = ledger_ids[str(rows[3]["attempt_id"])]
+    path = root / "evaluation-terminal" / ledger_id / "raw" / ledger_id / "episode.json"
+    path.write_bytes(b"{broken")
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 99
+    assert report["infrastructure_invalid_executions"] == 1
+    assert report["execution_count"] == 100
+
+
 @pytest.mark.parametrize("kind", ["missing", "malformed"])
 def test_simple_summary_counts_incomplete_receipts_as_invalid_executions(tmp_path: Path, kind: str) -> None:
     summary = _module()
