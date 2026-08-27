@@ -19,6 +19,7 @@ from urllib.parse import quote
 _CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SIMULATOR_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}$")
 _CANDIDATES = ("original_baseline", "new_step_2k")
 _PAIRING_UNAVAILABLE = {"status": "baseline_evaluation_required"}
 _PAIRING_AVAILABLE_FIELDS = {
@@ -50,7 +51,15 @@ def _runtime_identity_digest(identity: Mapping[str, object], provenance: Mapping
         "camera_device": provenance.get("camera_device"),
         "policy_device": provenance.get("policy_device"),
     }
-    if any(value is None for value in fields.values()):
+    if (not isinstance(fields["policy_repo"], str) or not fields["policy_repo"] or any(character.isspace() for character in fields["policy_repo"])
+            or not isinstance(fields["policy_revision"], str) or _COMMIT.fullmatch(fields["policy_revision"]) is None
+            or type(fields["policy_step"]) is not int or fields["policy_step"] != 12000
+            or not isinstance(fields["policy_artifact_sha256"], str) or _SHA256.fullmatch(fields["policy_artifact_sha256"]) is None
+            or not isinstance(fields["code_revision"], str) or _COMMIT.fullmatch(fields["code_revision"]) is None
+            or not isinstance(fields["asset_revision"], str) or _COMMIT.fullmatch(fields["asset_revision"]) is None
+            or not isinstance(fields["simulator_version"], str) or _SIMULATOR_VERSION.fullmatch(fields["simulator_version"]) is None
+            or not isinstance(fields["image_identity"], str) or re.fullmatch(r"sha256:[0-9a-f]{64}", fields["image_identity"]) is None
+            or any(not isinstance(fields[key], str) or not fields[key] for key in ("simulator_device", "cloth_device", "renderer_device", "camera_device", "policy_device"))):
         raise ValueError("evaluation runtime identity is incomplete")
     return hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")).hexdigest()
 
@@ -90,25 +99,32 @@ def _augment_first_hundred_metrics(report: Mapping[str, object]) -> dict[str, ob
     return result
 
 
-def _simple_evidence_index(root: Path, name: str, identity_key: str) -> tuple[dict[str, tuple[Path, dict[str, object]]], int]:
+def _simple_evidence_index(root: Path, name: str, identity_key: str) -> tuple[dict[str, tuple[Path, dict[str, object]]], set[str]]:
     """Index simple-curriculum evidence, retaining malformed files as invalid work."""
     indexed: dict[str, tuple[Path, dict[str, object]]] = {}
-    malformed = 0
+    invalid: set[str] = set()
     for path in root.rglob(name):
         if path.is_symlink() or not path.is_file():
-            malformed += 1
+            invalid.add(f"unsafe:{name}:{path.relative_to(root)}")
             continue
         try:
             payload = _json_object(path, name)
         except ValueError:
-            malformed += 1
+            invalid.add(f"malformed:{name}:{path.relative_to(root)}")
             continue
         identity = payload.get(identity_key)
-        if not isinstance(identity, str) or not identity or identity in indexed:
-            malformed += 1
+        if not isinstance(identity, str) or not identity:
+            invalid.add(f"identity:{name}:{identity!r}:{path.relative_to(root)}")
+            continue
+        if identity in indexed:
+            invalid.add(f"duplicate:{name}:{identity}")
+            prior_path, prior_payload = indexed[identity]
+            if (name == "worker-receipt.json" and payload.get("output_dir") == str(path.parent)
+                    and prior_payload.get("output_dir") != str(prior_path.parent)):
+                indexed[identity] = (path, payload)
             continue
         indexed[identity] = (path, payload)
-    return indexed, malformed
+    return indexed, invalid
 
 
 def _simple_fidelity(episode: Mapping[str, object]) -> dict[str, bool]:
@@ -141,36 +157,66 @@ def _build_simple_first_hundred_report(
             if attempt["schedule_index"] != index or assignment != expected:
                 raise ValueError("evaluation ledger assignments do not match the frozen matrix")
             assignments[str(attempt["attempt_id"])] = assignment
-        terminal: dict[str, str] = {}
+        terminal: dict[str, tuple[str, dict[str, object]]] = {}
+        pending: dict[str, tuple[str, str, str]] = {}
         completed_at_ns = 0
         invalid_executions: set[tuple[object, object]] = set()
-        for event in ledger.execute("SELECT event_id, at_ns, event_type, attempt_id, lease_id FROM events ORDER BY event_id"):
+        for event in ledger.execute("SELECT event_id, at_ns, event_type, attempt_id, lease_id, worker_id, payload_json FROM events ORDER BY event_id"):
             event_type = event["event_type"]
             ledger_id = event["attempt_id"]
             if event_type in {"infrastructure_abort", "retryable", "lease_expired", "preempted", "interrupted"}:
                 invalid_executions.add((ledger_id, event["lease_id"] or event["event_id"]))
+            elif event_type == "terminal_pending_validation":
+                try:
+                    payload = json.loads(event["payload_json"])
+                except (TypeError, json.JSONDecodeError) as error:
+                    raise ValueError("evaluation terminal payload is invalid") from error
+                if (ledger_id not in assignments or ledger_id in pending or not isinstance(payload, dict)
+                        or not isinstance(payload.get("raw_artifact_id"), str) or not payload["raw_artifact_id"]
+                        or not isinstance(event["lease_id"], str) or not event["lease_id"]
+                        or not isinstance(event["worker_id"], str) or not event["worker_id"]):
+                    raise ValueError("evaluation terminal evidence is ambiguous")
+                pending[str(ledger_id)] = (str(event["lease_id"]), str(event["worker_id"]), payload["raw_artifact_id"])
             elif event_type in {"accepted", "rejected"}:
                 if ledger_id not in assignments or ledger_id in terminal:
                     raise ValueError("evaluation ledger contains ambiguous terminal outcomes")
-                terminal[str(ledger_id)] = str(event_type)
+                try:
+                    payload = json.loads(event["payload_json"])
+                except (TypeError, json.JSONDecodeError) as error:
+                    raise ValueError("evaluation terminal payload is invalid") from error
+                if not isinstance(payload, dict):
+                    raise ValueError("evaluation terminal payload is invalid")
+                terminal[str(ledger_id)] = (str(event_type), payload)
                 completed_at_ns = max(completed_at_ns, int(event["at_ns"]))
-    episodes, _malformed_episodes = _simple_evidence_index(campaign_root, "episode.json", "episode_id")
-    receipts, _malformed_receipts = _simple_evidence_index(campaign_root, "worker-receipt.json", "attempt_id")
+    episodes, invalid_episode_evidence = _simple_evidence_index(campaign_root, "episode.json", "episode_id")
+    receipts, invalid_receipt_evidence = _simple_evidence_index(campaign_root, "worker-receipt.json", "attempt_id")
+    invalid_executions.update(("evidence", identity) for identity in invalid_episode_evidence | invalid_receipt_evidence)
+    invalid_executions.update(("unbound-episode", ledger_id) for ledger_id in episodes if ledger_id not in assignments)
+    invalid_executions.update(("unbound-receipt", ledger_id) for ledger_id in receipts if ledger_id not in assignments)
+    invalid_evidence_by_ledger = {
+        ledger_id for ledger_id in assignments
+        if any(ledger_id in evidence for evidence in invalid_episode_evidence | invalid_receipt_evidence)
+    }
     gate_trials: list[dict[str, object]] = []
     trials: list[dict[str, object]] = []
     category_scores = {category: {"episodes": 0, "official_successes": 0} for category in _CATEGORIES}
     garment_scores: dict[str, dict[str, int]] = defaultdict(lambda: {"episodes": 0, "official_successes": 0})
     safety_failure = False
+    worker_sessions: dict[str, str] = {}
     for ledger_id, assignment in assignments.items():
-        event = terminal.get(ledger_id)
+        terminal_evidence = terminal.get(ledger_id)
+        pending_evidence = pending.get(ledger_id)
         episode_entry = episodes.get(ledger_id)
         receipt_entry = receipts.get(ledger_id)
-        if event not in {"accepted", "rejected"} or episode_entry is None or receipt_entry is None:
-            invalid_executions.add(("incomplete-terminal", ledger_id))
+        if terminal_evidence is None or pending_evidence is None or episode_entry is None or receipt_entry is None:
+            if ledger_id not in invalid_evidence_by_ledger:
+                invalid_executions.add(("incomplete-terminal", ledger_id))
             continue
         episode_path, episode = episode_entry
         receipt_path, receipt = receipt_entry
         try:
+            event, terminal_payload = terminal_evidence
+            terminal_lease, terminal_worker, raw_artifact_id = pending_evidence
             identity = episode.get("identity")
             provenance = episode.get("provenance")
             if not isinstance(identity, Mapping) or not isinstance(provenance, Mapping):
@@ -186,18 +232,35 @@ def _build_simple_first_hundred_report(
             fidelity = _simple_fidelity(episode)
             receipt_outcome = receipt.get("outcome")
             official_success = event == "accepted"
-            if (not isinstance(receipt_outcome, Mapping) or receipt_outcome.get("success") is not official_success
+            if (receipt.get("schema_version") != 1 or receipt.get("attempt_id") != ledger_id
+                    or receipt.get("lease_id") != terminal_lease or receipt.get("worker_id") != terminal_worker
+                    or not isinstance(receipt.get("session_id"), str) or not receipt["session_id"]
+                    or receipt.get("seed") != assignment.get("seed") or receipt.get("garment") != assignment.get("garment_name")
+                    or type(receipt.get("episode_generation")) is not int or receipt["episode_generation"] < 1
+                    or receipt.get("output_dir") != str(receipt_path.parent) or raw_artifact_id != receipt.get("output_dir")
+                    or (official_success and terminal_payload.get("artifact_id") != raw_artifact_id)
+                    or (not official_success and terminal_payload != {})
+                    or not isinstance(receipt_outcome, Mapping) or receipt_outcome.get("success") is not official_success
                     or episode.get("accepted_success") is not official_success
                     or (episode.get("outcome") == "success") is not official_success):
                 raise ValueError("outcome")
+            prior_session = worker_sessions.setdefault(terminal_worker, receipt["session_id"])
+            if prior_session != receipt["session_id"]:
+                raise ValueError("session")
             simulator_device = receipt.get("simulation_device", provenance.get("simulator_device"))
             cloth_device = receipt.get("cloth_device")
             renderer_device = receipt.get("renderer_device")
             camera_device = receipt.get("camera_device")
             policy_device = receipt.get("policy_device", provenance.get("policy_device"))
+            runtime = receipt.get("runtime")
             if (simulator_device != "cpu" or cloth_device != "cpu"
                     or not all(isinstance(device, str) and re.fullmatch(r"cuda:[0-9]+", device) for device in (renderer_device, camera_device, policy_device))
-                    or len({renderer_device, camera_device, policy_device}) != 1):
+                    or len({renderer_device, camera_device, policy_device}) != 1
+                    or not isinstance(runtime, Mapping)
+                    or any(runtime.get(key) != value for key, value in {
+                        "simulation_device": simulator_device, "cloth_device": cloth_device, "renderer_device": renderer_device,
+                        "camera_device": camera_device, "policy_device": policy_device,
+                    }.items())):
                 raise ValueError("devices")
             gate_identity = {
                 "policy_repo": policy_repo, "policy_revision": policy_revision, "policy_step": policy_step,

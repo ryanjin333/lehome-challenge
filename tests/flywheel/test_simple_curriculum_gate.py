@@ -261,6 +261,17 @@ def test_cli_rejects_aggregate_safety_that_disagrees_with_gate_trials(tmp_path: 
     assert _run_gate(*paths).returncode != 0
 
 
+@pytest.mark.parametrize("field", ["code_revision", "asset_revision", "simulator_version", "image_identity"])
+@pytest.mark.parametrize("value", ["", " ", True, 1, "not-a-digest"])
+def test_gate_rejects_noncanonical_runtime_identity_fields(tmp_path: Path, field: str, value: object) -> None:
+    rows = _matrix(); report = _authenticated_report(rows); paths = _write_inputs(tmp_path, report, rows)
+    target = report["gate_trials"][0]["identity"] if field in {"code_revision", "asset_revision", "simulator_version"} else report["gate_trials"][0]["provenance"]
+    target[field] = value
+    report["report_sha256"] = _report_digest(report); paths[0].write_bytes(_canonical(report))
+
+    assert _run_gate(*paths).returncode != 0
+
+
 @pytest.mark.parametrize("raw", ['{"x":1,"x":2}', '{"x":NaN}'])
 def test_cli_rejects_duplicate_key_and_nonfinite_json(tmp_path: Path, raw: str) -> None:
     rows = _matrix(); report = _authenticated_report(rows); paths = _write_inputs(tmp_path, report, rows)

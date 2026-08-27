@@ -76,7 +76,7 @@ def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
 
 
-def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malformed_receipt: int | None = None, retry_then_valid: int | None = None, contradictory_safety: int | None = None) -> tuple[Path, Path, list[dict[str, object]], dict[str, str]]:
+def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malformed_receipt: int | None = None, retry_then_valid: int | None = None, contradictory_safety: int | None = None, episode_mutator=None, receipt_mutator=None) -> tuple[Path, Path, list[dict[str, object]], dict[str, str]]:
     from lehome.flywheel.simple_curriculum import build_calibration_rows
     from lehome.flywheel.task_ledger import TaskLedger
 
@@ -93,10 +93,10 @@ def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malf
             lease = ledger.lease_next("worker", lease_duration_ns=1_000_000_000)
             assert lease is not None
         ledger_id = lease.attempt.attempt_id
-        ledger_ids[str(row["attempt_id"])] = ledger_id
-        ledger.record_terminal("worker", ledger_id, lease.lease_id, f"artifact-{index}")
-        ledger.validate_terminal(ledger_id, "accepted" if index < 5 else "rejected", artifact_id=f"artifact-{index}" if index < 5 else None)
         output = root / "worker" / ledger_id / "generation-1"; raw = output / "raw" / ledger_id; raw.mkdir(parents=True)
+        ledger_ids[str(row["attempt_id"])] = ledger_id
+        ledger.record_terminal("worker", ledger_id, lease.lease_id, str(output))
+        ledger.validate_terminal(ledger_id, "accepted" if index < 5 else "rejected", artifact_id=str(output) if index < 5 else None)
         episode = {
             "episode_id": ledger_id,
             "identity": {
@@ -110,12 +110,19 @@ def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malf
             "safety_failure": index == contradictory_safety,
             "fidelity": {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False},
         }
+        if episode_mutator is not None:
+            episode_mutator(episode, index)
         (raw / "episode.json").write_bytes(_canonical(episode))
         receipt = {
-            "schema_version": 1, "attempt_id": ledger_id,
-            "outcome": {"success": index < 5}, "simulation_device": "cpu", "cloth_device": "cpu",
+            "schema_version": 1, "attempt_id": ledger_id, "lease_id": lease.lease_id,
+            "worker_id": "worker", "session_id": "session", "seed": row["seed"], "garment": row["garment_name"],
+            "episode_generation": 1, "output_dir": str(output), "action_horizon": 250,
+            "outcome": {"success": index < 5, "metrics": []}, "simulation_device": "cpu", "cloth_device": "cpu",
             "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0",
+            "runtime": {"simulation_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0"},
         }
+        if receipt_mutator is not None:
+            receipt_mutator(receipt, index)
         receipt_path = output / "worker-receipt.json"
         if index != missing_receipt:
             receipt_path.write_bytes(b"{broken" if index == malformed_receipt else _canonical(receipt))
@@ -193,3 +200,60 @@ def test_simple_summary_does_not_allow_aggregate_safety_to_disagree_with_gate_fi
 
     assert report["valid_outcomes"] == 99
     assert report["safety_failure"] is False
+
+
+@pytest.mark.parametrize("evidence_name,identity_key", [("worker-receipt.json", "attempt_id"), ("episode.json", "episode_id")])
+@pytest.mark.parametrize("kind", ["malformed", "unsafe", "duplicate", "unbound"])
+def test_simple_summary_counts_each_stray_evidence_file_once(tmp_path: Path, evidence_name: str, identity_key: str, kind: str) -> None:
+    summary = _module()
+    root, matrix, _rows, ledger_ids = _simple_campaign(tmp_path)
+    stray = root / "stray"; stray.mkdir()
+    if kind == "malformed":
+        (stray / evidence_name).write_bytes(b"{broken")
+    elif kind == "unsafe":
+        (stray / evidence_name).symlink_to(next(root.rglob(evidence_name)))
+    elif kind == "duplicate":
+        original = next(root.rglob(evidence_name)); duplicate = json.loads(original.read_text())
+        assert duplicate[identity_key] in ledger_ids.values()
+        (stray / evidence_name).write_bytes(_canonical(duplicate))
+    else:
+        evidence = json.loads(next(root.rglob(evidence_name)).read_text()); evidence[identity_key] = "unbound-ledger-id"
+        (stray / evidence_name).write_bytes(_canonical(evidence))
+
+    report = summary.build_report(campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(), candidate_key="original_baseline", **POLICY)
+
+    assert report["valid_outcomes"] == 100
+    assert report["infrastructure_invalid_executions"] == 1
+    assert report["execution_count"] == 101
+
+
+@pytest.mark.parametrize("field", ["lease_id", "worker_id", "session_id", "episode_generation", "output_dir", "runtime"])
+def test_simple_summary_rejects_receipt_not_bound_to_ledger_terminal_artifact_or_runtime(tmp_path: Path, field: str) -> None:
+    summary = _module()
+
+    def mutate(receipt, index):
+        if index == 3:
+            receipt[field] = {**receipt["runtime"], "camera_device": "cuda:1"} if field == "runtime" else "mismatch"
+    root, matrix, _rows, _ledger_ids = _simple_campaign(tmp_path, receipt_mutator=mutate)
+
+    report = summary.build_report(campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(), candidate_key="original_baseline", **POLICY)
+
+    assert report["valid_outcomes"] == 99
+    assert report["infrastructure_invalid_executions"] == 1
+
+
+@pytest.mark.parametrize("field", ["code_revision", "asset_revision", "simulator_version", "image_identity"])
+@pytest.mark.parametrize("value", ["", " ", True, 1, "not-a-digest"])
+def test_simple_summary_rejects_noncanonical_runtime_identity_values(tmp_path: Path, field: str, value: object) -> None:
+    summary = _module()
+
+    def mutate(episode, index):
+        if index == 3:
+            target = episode["provenance"] if field == "image_identity" else episode["identity"]
+            target[field] = value
+    root, matrix, _rows, _ledger_ids = _simple_campaign(tmp_path, episode_mutator=mutate)
+
+    report = summary.build_report(campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(), candidate_key="original_baseline", **POLICY)
+
+    assert report["valid_outcomes"] == 99
+    assert report["infrastructure_invalid_executions"] == 1

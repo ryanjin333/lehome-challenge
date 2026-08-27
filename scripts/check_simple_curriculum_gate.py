@@ -30,6 +30,8 @@ _ALLOWED_PAIRS = frozenset({
 })
 _FIDELITY_FIELDS = ("missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_SIMULATOR_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,8 +189,8 @@ def _policy_identity(value: object) -> dict[str, object]:
     required = {"policy_repo", "policy_revision", "policy_step", "policy_artifact_sha256"}
     if not isinstance(value, Mapping) or set(value) != required:
         raise ValueError("policy identity is invalid")
-    if (not isinstance(value["policy_repo"], str) or not value["policy_repo"]
-            or not isinstance(value["policy_revision"], str) or len(value["policy_revision"]) != 40
+    if (not isinstance(value["policy_repo"], str) or not value["policy_repo"] or any(character.isspace() for character in value["policy_repo"])
+            or not isinstance(value["policy_revision"], str) or _COMMIT.fullmatch(value["policy_revision"]) is None
             or type(value["policy_step"]) is not int or value["policy_step"] != 12000
             or not isinstance(value["policy_artifact_sha256"], str) or _SHA256.fullmatch(value["policy_artifact_sha256"]) is None):
         raise ValueError("policy identity is invalid")
@@ -205,7 +207,11 @@ def _runtime_identity(identity: Mapping[str, object], provenance: Mapping[str, o
         "renderer_device": provenance.get("renderer_device"), "camera_device": provenance.get("camera_device"),
         "policy_device": provenance.get("policy_device"),
     }
-    if any(not isinstance(value, (str, int)) for value in fields.values()):
+    if (not isinstance(fields["code_revision"], str) or _COMMIT.fullmatch(fields["code_revision"]) is None
+            or not isinstance(fields["asset_revision"], str) or _COMMIT.fullmatch(fields["asset_revision"]) is None
+            or not isinstance(fields["simulator_version"], str) or _SIMULATOR_VERSION.fullmatch(fields["simulator_version"]) is None
+            or not isinstance(fields["image_identity"], str) or re.fullmatch(r"sha256:[0-9a-f]{64}", fields["image_identity"]) is None
+            or any(not isinstance(fields[key], str) or not fields[key] for key in ("simulator_device", "cloth_device", "renderer_device", "camera_device", "policy_device"))):
         raise ValueError("runtime identity is incomplete")
     return hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
