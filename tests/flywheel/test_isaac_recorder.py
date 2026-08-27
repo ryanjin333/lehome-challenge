@@ -154,6 +154,39 @@ def test_autonomous_timeout_publishes_every_canonical_video_for_campaign_complet
     assert all((result.path / "videos" / filename).is_file() for filename in CANONICAL_VIDEO_FILENAMES)
 
 
+def test_simple_curriculum_recorder_requires_and_persists_complete_fidelity(tmp_path, monkeypatch) -> None:
+    recorder = AutonomousRecorder.for_test(
+        tmp_path, policy_revision="a" * 40, simple_curriculum_collection=True,
+    )
+    recorder.record_step(observation(), np.ones(12), reward=0.0, success=False, request_id="r1", chunk_offset=0)
+
+    def encode(root, *, fps=30):
+        videos = root / "videos"
+        videos.mkdir()
+        for filename in CANONICAL_VIDEO_FILENAMES:
+            (videos / filename).write_bytes(b"video")
+        return CANONICAL_VIDEO_FILENAMES
+
+    monkeypatch.setattr(recorder.video_sink, "encode", encode)
+    with pytest.raises(ValueError, match="fidelity"):
+        recorder.finish(reason="horizon", accepted_success=False)
+
+    recorder = AutonomousRecorder.for_test(
+        tmp_path / "second", policy_revision="b" * 40, simple_curriculum_collection=True,
+    )
+    recorder.record_step(observation(), np.ones(12), reward=0.0, success=False, request_id="r1", chunk_offset=0)
+    monkeypatch.setattr(recorder.video_sink, "encode", encode)
+    fidelity = {
+        "missing_cloth": False, "cloth_flight": False,
+        "nonfinite_cloth_state": False, "safety_failure": True,
+        "monitor_active": True, "monitor_observed": True,
+    }
+    result = recorder.finish(reason="horizon", accepted_success=False, fidelity=fidelity)
+
+    assert result.episode["fidelity"] == fidelity
+    assert result.episode["safety_failure"] is True
+
+
 def test_mixed_recorder_transport_rejection_cannot_be_trainable(tmp_path, monkeypatch) -> None:
     recorder = MixedSourceRecorder(tmp_path, identity=identity("transport"), mode="expert", horizon=1)
     fake_encoder(monkeypatch, recorder)

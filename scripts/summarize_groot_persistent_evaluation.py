@@ -269,6 +269,7 @@ def _build_simple_first_hundred_report(
         invalid_executions: set[tuple[object, ...]] = set()
         infrastructure_by_lease: dict[tuple[str, str], set[tuple[object, ...]]] = defaultdict(set)
         infrastructure_without_lease: list[tuple[str, tuple[object, ...]]] = []
+        gate_fidelity_failures: list[dict[str, object]] = []
         for event in ledger.execute("SELECT event_id, at_ns, event_type, attempt_id, lease_id, worker_id, payload_json FROM events ORDER BY event_id"):
             event_type = event["event_type"]
             ledger_id = event["attempt_id"]
@@ -282,6 +283,48 @@ def _build_simple_first_hundred_report(
                     infrastructure_by_lease[(ledger_id, event["lease_id"])].add(key)
                 elif isinstance(ledger_id, str):
                     infrastructure_without_lease.append((ledger_id, key))
+                if event_type == "infrastructure_abort":
+                    try:
+                        payload = json.loads(event["payload_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        payload = None
+                    fields = {
+                        "failure_class", "fidelity_code", "fidelity", "lease_id", "worker_id",
+                        "session_id", "generation", "runtime",
+                    }
+                    fidelity_fields = {
+                        "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure",
+                        "monitor_active", "monitor_observed",
+                    }
+                    runtime_fields = {
+                        "simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device",
+                    }
+                    if (
+                        isinstance(payload, dict) and set(payload) == fields
+                        and isinstance(ledger_id, str) and ledger_id in assignments
+                        and payload.get("failure_class") == "fidelity"
+                        and isinstance(payload.get("fidelity_code"), str)
+                        and payload["fidelity_code"] in fidelity_fields
+                        and payload.get("lease_id") == event["lease_id"]
+                        and payload.get("worker_id") == event["worker_id"]
+                        and isinstance(payload.get("session_id"), str) and payload["session_id"]
+                        and type(payload.get("generation")) is int and payload["generation"] >= 1
+                        and isinstance(payload.get("fidelity"), dict) and set(payload["fidelity"]) == fidelity_fields
+                        and all(type(payload["fidelity"][field]) is bool for field in fidelity_fields)
+                        and payload["fidelity"][payload["fidelity_code"]] is True
+                        and payload["fidelity"]["monitor_active"] is True
+                        and payload["fidelity"]["monitor_observed"] is True
+                        and isinstance(payload.get("runtime"), dict) and set(payload["runtime"]) == runtime_fields
+                        and all(isinstance(payload["runtime"][field], str) and payload["runtime"][field] for field in runtime_fields)
+                    ):
+                        gate_fidelity_failures.append({
+                            "assignment_id": assignments[ledger_id]["attempt_id"],
+                            "ledger_id": ledger_id,
+                            "lease_id": payload["lease_id"], "worker_id": payload["worker_id"],
+                            "session_id": payload["session_id"], "generation": payload["generation"],
+                            "fidelity_code": payload["fidelity_code"], "fidelity": payload["fidelity"],
+                            "runtime": payload["runtime"],
+                        })
             elif event_type == "terminal_pending_validation":
                 try:
                     payload = json.loads(event["payload_json"])
@@ -365,7 +408,6 @@ def _build_simple_first_hundred_report(
     category_scores = {category: {"episodes": 0, "official_successes": 0} for category in _CATEGORIES}
     garment_scores: dict[str, dict[str, int]] = defaultdict(lambda: {"episodes": 0, "official_successes": 0})
     safety_failure = False
-    worker_sessions: dict[str, str] = {}
     for ledger_id, assignment in assignments.items():
         terminal_evidence = terminal.get(ledger_id)
         pending_evidence = pending.get(ledger_id)
@@ -416,9 +458,6 @@ def _build_simple_first_hundred_report(
                     or episode.get("accepted_success") is not official_success
                     or (episode.get("outcome") == "success") is not official_success):
                 raise ValueError("outcome")
-            prior_session = worker_sessions.setdefault(terminal_worker, receipt["session_id"])
-            if prior_session != receipt["session_id"]:
-                raise ValueError("session")
             simulator_device = receipt.get("simulation_device", provenance.get("simulator_device"))
             cloth_device = receipt.get("cloth_device")
             renderer_device = receipt.get("renderer_device")
@@ -480,6 +519,9 @@ def _build_simple_first_hundred_report(
         "infrastructure_retry_count": len(invalid_executions), "gpu_seconds": 0.0,
         "progress": {"observed_episodes": 0, "mean_terminal_progress": 0.0}, "recovery": {"recovery_attempts": 0, "successful_recoveries": 0},
         "safety_failure": safety_failure, "trials": trials, "gate_trials": gate_trials,
+        "gate_fidelity_failures": sorted(gate_fidelity_failures, key=lambda item: (
+            str(item["assignment_id"]), str(item["lease_id"]), int(item["generation"]),
+        )),
         "infrastructure_invalid_executions": len(invalid_executions),
     }
     report = _augment_first_hundred_metrics(report)

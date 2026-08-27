@@ -30,6 +30,7 @@ from lehome.utils.record import (
 from .common import stabilize_garment_after_reset
 from lehome.utils.logger import get_logger
 from lehome.flywheel.persistent_worker import (
+    FidelityFailureError,
     SimulatorNumericalDivergenceError,
 )
 
@@ -132,7 +133,7 @@ def _require_flywheel_cloth_health(
     env: Any,
     *,
     policy_action_diagnostics: Mapping[str, object] | None = None,
-) -> None:
+) -> Mapping[str, object]:
     """Stop a recording before numerical cloth divergence can become data."""
 
     check = getattr(env, "flywheel_cloth_physical_health", None)
@@ -141,6 +142,20 @@ def _require_flywheel_cloth_health(
             "simulator_numerical_divergence: cloth health readback unavailable"
         )
     health = check()
+    if isinstance(health, Mapping):
+        fidelity = health.get("fidelity")
+        required = {
+            "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "monitor_active", "monitor_observed",
+        }
+        if isinstance(fidelity, Mapping) and set(fidelity) == required and all(type(fidelity[field]) is bool for field in required):
+            typed = {
+                "missing_cloth": fidelity["missing_cloth"], "cloth_flight": fidelity["cloth_flight"],
+                "nonfinite_cloth_state": fidelity["nonfinite_cloth_state"], "safety_failure": False,
+                "monitor_active": fidelity["monitor_active"], "monitor_observed": fidelity["monitor_observed"],
+            }
+            for code in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state"):
+                if typed[code]:
+                    raise FidelityFailureError(code, typed)
     if not isinstance(health, Mapping) or health.get("healthy") is not True:
         reason = (
             health.get("reason", "simulator_numerical_divergence")
@@ -235,6 +250,7 @@ def _require_flywheel_cloth_health(
         raise SimulatorNumericalDivergenceError(
             f"{reason}: cloth physical-health admission failed{diagnostic_suffix}"
         )
+    return health
 
 _LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LOWERCASE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -748,6 +764,9 @@ class EvaluationSession:
         garment_name = assignment.get("garment", assignment.get("garment_name"))
         if not isinstance(garment_name, str) or not garment_name:
             raise ValueError("assignment requires garment")
+        simple_curriculum_collection = assignment.get("simple_curriculum_collection", False)
+        if type(simple_curriculum_collection) is not bool:
+            raise ValueError("simple_curriculum_collection must be a boolean")
         restore, verified_restore = _verified_restore_assignment(assignment)
         if restore is not None:
             self._pending_restore_snapshot = restore
@@ -985,8 +1004,9 @@ def run_evaluation_loop(
                 episode_id=flywheel_manifest.get("episode_id"),
                 identity=identity,
                 provenance={"policy_artifact_sha256": flywheel_manifest["policy_artifact_sha256"], "image_identity": flywheel_manifest["image_identity"], "execution_mode": flywheel_manifest["execution_mode"], "execution_backend": flywheel_manifest["execution_backend"], "simulator_device": flywheel_manifest["simulator_device"], "policy_device": flywheel_manifest.get("policy_device"), "parity_stage": flywheel_manifest.get("parity_stage"), "strategy_sampled": dict(sampled.values), "strategy_receipt": dict(randomization_receipt), **({"controlled_recovery": dict(controlled_provenance)} if controlled_provenance is not None else {})},
+                simple_curriculum_collection=simple_curriculum_collection,
             )
-            _require_flywheel_cloth_health(env)
+            reset_cloth_health = _require_flywheel_cloth_health(env)
             reset_snapshot = capture_snapshot(env, randomization={"strategy": strategy, "sampled": dict(sampled.values), "receipt": dict(randomization_receipt)})
             recorder.record_snapshot("reset", reset_snapshot)
         if reset_policy:
@@ -1018,6 +1038,20 @@ def run_evaluation_loop(
         policy_action_outside_live_joint_limit_step_counts: dict[str, int] = {}
         policy_action_max_limit_violation_rad: dict[str, float] = {}
         policy_action_max_target_to_live_joint_position_delta_rad: dict[str, float] = {}
+        fidelity = {
+            "missing_cloth": False, "cloth_flight": False,
+            "nonfinite_cloth_state": False, "safety_failure": False,
+            "monitor_active": simple_curriculum_collection,
+            "monitor_observed": False,
+        }
+        if simple_curriculum_collection and recorder is not None:
+            reset_fidelity = reset_cloth_health.get("fidelity")
+            if not isinstance(reset_fidelity, Mapping):
+                raise SimulatorNumericalDivergenceError("flywheel cloth fidelity monitor evidence is missing")
+            for field in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state"):
+                if type(reset_fidelity.get(field)) is not bool:
+                    raise SimulatorNumericalDivergenceError("flywheel cloth fidelity evidence is invalid")
+                fidelity[field] = fidelity[field] or reset_fidelity[field]
 
         for st in range(args.max_steps):
             if cancellation_event is not None and cancellation_event.is_set():
@@ -1163,11 +1197,25 @@ def run_evaluation_loop(
                     raise SimulatorNumericalDivergenceError(
                         "flywheel action validation requires finite raw policy targets"
                     )
+                if simple_curriculum_collection:
+                    fidelity["monitor_observed"] = True
+                    outside_count = policy_action_diagnostics.get("policy_action_outside_live_joint_limit_count")
+                    if type(outside_count) is not int:
+                        raise SimulatorNumericalDivergenceError("flywheel safety monitor evidence is invalid")
+                    fidelity["safety_failure"] = fidelity["safety_failure"] or outside_count > 0
             env.step(action)
             if recorder is not None:
-                _require_flywheel_cloth_health(
+                cloth_health = _require_flywheel_cloth_health(
                     env, policy_action_diagnostics=policy_action_diagnostics
                 )
+                if simple_curriculum_collection:
+                    cloth_fidelity = cloth_health.get("fidelity")
+                    if not isinstance(cloth_fidelity, Mapping):
+                        raise SimulatorNumericalDivergenceError("flywheel cloth fidelity monitor evidence is missing")
+                    for field in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state"):
+                        if type(cloth_fidelity.get(field)) is not bool:
+                            raise SimulatorNumericalDivergenceError("flywheel cloth fidelity evidence is invalid")
+                        fidelity[field] = fidelity[field] or cloth_fidelity[field]
             if recorder is not None:
                 current_contact = env.flywheel_visible_garment_contact()
                 if visible_contact is None or current_contact["minimum_distance_m"] < visible_contact["minimum_distance_m"]:
@@ -1261,6 +1309,7 @@ def run_evaluation_loop(
                 reason=terminal_reason,
                 accepted_success=bool(is_success),
                 visible_contact=visible_contact,
+                fidelity=fidelity if simple_curriculum_collection else None,
             )
 
         # Save Datasets

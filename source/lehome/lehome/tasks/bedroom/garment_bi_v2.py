@@ -39,6 +39,15 @@ from lehome.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+class _ClothHealthReadbackError(RuntimeError):
+    """Carries a measured cloth-health category without parsing exception text."""
+
+    def __init__(self, category: str, *, nonfinite_count: int = 0) -> None:
+        super().__init__(category)
+        self.category = category
+        self.nonfinite_count = nonfinite_count
+
+
 class GarmentEnv(DirectRLEnv):
     cfg: GarmentEnvCfg
 
@@ -972,13 +981,14 @@ class GarmentEnv(DirectRLEnv):
                 f"positions_shape={local_positions.shape} "
                 f"velocities_shape={local_velocities.shape} expected_shape=Nx3"
             )
+        if local_positions.shape[0] == 0:
+            raise _ClothHealthReadbackError("missing_cloth")
         positions_nonfinite_count = int(np.size(local_positions) - np.isfinite(local_positions).sum())
         velocities_nonfinite_count = int(np.size(local_velocities) - np.isfinite(local_velocities).sum())
         if positions_nonfinite_count or velocities_nonfinite_count:
-            raise RuntimeError(
-                "garment PhysX cloth readback is nonfinite: "
-                f"positions_nonfinite_count={positions_nonfinite_count} "
-                f"velocities_nonfinite_count={velocities_nonfinite_count}"
+            raise _ClothHealthReadbackError(
+                "nonfinite_cloth_state",
+                nonfinite_count=positions_nonfinite_count + velocities_nonfinite_count,
             )
         return local_positions.copy(), local_velocities.copy()
 
@@ -1457,9 +1467,28 @@ class GarmentEnv(DirectRLEnv):
     def flywheel_cloth_physical_health(self) -> dict[str, object]:
         """Fail closed when live cloth state is numerically outside this scene's scale."""
 
+        def receipt(*, missing: bool = False, flight: bool = False, nonfinite: bool = False,
+                    observed: bool = True, **values: object) -> dict[str, object]:
+            return {
+                **values,
+                "fidelity": {
+                    "missing_cloth": missing,
+                    "cloth_flight": flight,
+                    "nonfinite_cloth_state": nonfinite,
+                    "monitor_active": True,
+                    "monitor_observed": observed,
+                },
+            }
+
+        if self.object is None:
+            return receipt(
+                missing=True, healthy=False, reason="cloth_physical_state_unavailable",
+                metric_name="cloth_prim", metric_value="missing", metric_limit="present",
+            )
+
         collider_health = self.flywheel_collider_health()
         if collider_health.get("healthy") is not True:
-            return collider_health
+            return receipt(observed=False, **collider_health)
 
         try:
             if str(getattr(self, "device", "")).lower() == "cpu":
@@ -1469,16 +1498,20 @@ class GarmentEnv(DirectRLEnv):
                 positions, velocities = self._flywheel_legacy_cpu_cloth_state()
             else:
                 positions, velocities = self._flywheel_physics_cloth_state()
+        except _ClothHealthReadbackError as error:
+            return receipt(
+                missing=error.category == "missing_cloth",
+                nonfinite=error.category == "nonfinite_cloth_state",
+                healthy=False, reason=error.category, metric_name="cloth_state_readback",
+                metric_value=error.nonfinite_count if error.nonfinite_count else error.category,
+                metric_limit="nonempty_finite_aligned_nx3",
+            )
         except (RuntimeError, TypeError, ValueError) as error:
-            return {
-                "healthy": False,
-                "reason": "simulator_numerical_divergence",
-                "metric_name": "cloth_state_readback",
-                "metric_value": str(error) or type(error).__name__,
-                "metric_limit": "finite_aligned_nx3",
-            }
-        if not np.isfinite(positions).all() or not np.isfinite(velocities).all():
-            return {"healthy": False, "reason": "simulator_numerical_divergence"}
+            return receipt(
+                observed=False, healthy=False, reason="cloth_state_readback_unavailable",
+                metric_name="cloth_state_readback", metric_value=type(error).__name__,
+                metric_limit="observable",
+            )
 
         def _config_get(value, key, default):
             getter = getattr(value, "get", None)
@@ -1509,7 +1542,7 @@ class GarmentEnv(DirectRLEnv):
             or not np.isfinite(configured_max_velocity_mps)
             or configured_max_velocity_mps <= 0.0
         ):
-            return {"healthy": False, "reason": "simulator_numerical_divergence"}
+            return receipt(observed=False, healthy=False, reason="cloth_health_configuration_unavailable")
         # The reset configuration locates the garment and its existing scale
         # bounds its authored local mesh. This is an admission envelope only;
         # it does not alter PhysX settings or policy actions.
@@ -1539,23 +1572,17 @@ class GarmentEnv(DirectRLEnv):
                     }
                 )
         if exceeded_metrics:
-            return {
-                "healthy": False,
-                "reason": "simulator_numerical_divergence",
-                "max_position_m": max_position_m,
-                "max_extent_m": max_extent_m,
-                "max_velocity_mps": max_velocity_mps,
-                "max_position_limit_m": max_position_limit_m,
-                "max_extent_limit_m": max_extent_limit_m,
-                "max_velocity_limit_mps": max_velocity_limit_mps,
-                "exceeded_metrics": exceeded_metrics,
-            }
-        return {
-            "healthy": True,
-            "max_position_m": max_position_m,
-            "max_extent_m": max_extent_m,
-            "max_velocity_mps": max_velocity_mps,
-        }
+            return receipt(
+                flight=True,
+                healthy=False, reason="cloth_flight", max_position_m=max_position_m,
+                max_extent_m=max_extent_m, max_velocity_mps=max_velocity_mps,
+                max_position_limit_m=max_position_limit_m, max_extent_limit_m=max_extent_limit_m,
+                max_velocity_limit_mps=max_velocity_limit_mps, exceeded_metrics=exceeded_metrics,
+            )
+        return receipt(
+            healthy=True, max_position_m=max_position_m,
+            max_extent_m=max_extent_m, max_velocity_mps=max_velocity_mps,
+        )
 
     def _flywheel_cloth_backend(self) -> str:
         device = str(self.device).lower()

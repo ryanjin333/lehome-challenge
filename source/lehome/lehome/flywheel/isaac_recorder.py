@@ -117,6 +117,20 @@ def _identity_payload(identity: EpisodeIdentity) -> dict[str, object]:
     }
 
 
+def _validated_simple_curriculum_fidelity(fidelity: Mapping[str, object] | None) -> dict[str, bool]:
+    fields = {
+        "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure",
+        "monitor_active", "monitor_observed",
+    }
+    if not isinstance(fidelity, Mapping) or set(fidelity) != fields:
+        raise ValueError("simple curriculum fidelity evidence is incomplete")
+    if any(type(fidelity[field]) is not bool for field in fields):
+        raise ValueError("simple curriculum fidelity evidence must be boolean")
+    if fidelity["monitor_active"] is not True or fidelity["monitor_observed"] is not True:
+        raise ValueError("simple curriculum fidelity monitors must be active and observed")
+    return {field: fidelity[field] for field in sorted(fields)}
+
+
 class MixedSourceRecorder:
     """Atomic raw recorder for policy, expert, and hold action-source segments."""
 
@@ -132,6 +146,7 @@ class MixedSourceRecorder:
         horizon: int = 16,
         max_expert_sample_age_ms: float | None = None,
         require_identity: bool = True,
+        simple_curriculum_collection: bool = False,
     ) -> None:
         if mode not in {"autonomous", "practice", "expert", "dagger"}:
             raise ValueError("recorder mode is unsupported")
@@ -168,6 +183,9 @@ class MixedSourceRecorder:
         self._reset_hash: str | None = None
         self._expert_started = False
         self._finished = False
+        if type(simple_curriculum_collection) is not bool:
+            raise ValueError("simple_curriculum_collection must be a boolean")
+        self._simple_curriculum_collection = simple_curriculum_collection
 
     def record_step(
         self,
@@ -370,6 +388,7 @@ class MixedSourceRecorder:
         reason: str,
         accepted_success: bool,
         visible_contact: Mapping[str, object] | None = None,
+        fidelity: Mapping[str, object] | None = None,
     ) -> RecordedEpisode:
         """Compatibility finalizer preserving autonomous diagnostic semantics."""
         if self._finished:
@@ -388,6 +407,10 @@ class MixedSourceRecorder:
         }
         if visible_contact is not None:
             episode["visible_contact"] = _validate_visible_contact(visible_contact)
+        if self._simple_curriculum_collection:
+            verified_fidelity = _validated_simple_curriculum_fidelity(fidelity)
+            episode["fidelity"] = verified_fidelity
+            episode["safety_failure"] = verified_fidelity["safety_failure"]
         required_videos = self._encode_videos()
         path = self.writer.finalize(episode, required_videos=required_videos)
         return RecordedEpisode(path=path, episode=episode | {"episode_id": path.name}, annotations=tuple(self._annotations))
@@ -396,7 +419,7 @@ class MixedSourceRecorder:
 class AutonomousRecorder:
     """Compatibility facade delegating atomic capture to :class:`MixedSourceRecorder`."""
 
-    def __init__(self, run_root: Path, *, policy_revision: str, episode_id: str | None = None, identity: EpisodeIdentity | None = None, provenance: Mapping[str, object] | None = None) -> None:
+    def __init__(self, run_root: Path, *, policy_revision: str, episode_id: str | None = None, identity: EpisodeIdentity | None = None, provenance: Mapping[str, object] | None = None, simple_curriculum_collection: bool = False) -> None:
         self._recorder = MixedSourceRecorder(
             run_root,
             policy_revision=policy_revision,
@@ -405,6 +428,7 @@ class AutonomousRecorder:
             provenance=provenance,
             mode="autonomous",
             require_identity=False,
+            simple_curriculum_collection=simple_curriculum_collection,
         )
         self.writer = self._recorder.writer
         self.policy_revision = self._recorder.policy_revision
@@ -417,8 +441,8 @@ class AutonomousRecorder:
         return self._recorder.step
 
     @classmethod
-    def for_test(cls, run_root: Path, *, policy_revision: str) -> "AutonomousRecorder":
-        return cls(run_root, policy_revision=policy_revision, episode_id="episode-test")
+    def for_test(cls, run_root: Path, *, policy_revision: str, simple_curriculum_collection: bool = False) -> "AutonomousRecorder":
+        return cls(run_root, policy_revision=policy_revision, episode_id="episode-test", simple_curriculum_collection=simple_curriculum_collection)
 
     def record_step(self, observation: Mapping[str, object], action: object, *, reward: float, success: bool, request_id: str, chunk_offset: int) -> None:
         self._recorder.record_step(
@@ -440,11 +464,13 @@ class AutonomousRecorder:
         reason: str,
         accepted_success: bool,
         visible_contact: Mapping[str, object] | None = None,
+        fidelity: Mapping[str, object] | None = None,
     ) -> RecordedEpisode:
         return self._recorder.finish_autonomous(
             reason=reason,
             accepted_success=accepted_success,
             visible_contact=visible_contact,
+            fidelity=fidelity,
         )
 
 

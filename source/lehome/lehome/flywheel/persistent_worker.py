@@ -46,6 +46,25 @@ class SimulatorNumericalDivergenceError(InfrastructureInvalidAttemptError):
     """Live simulator state became nonphysical and must not enter the ledger."""
 
 
+class FidelityFailureError(InfrastructureInvalidAttemptError):
+    """A typed pre-frame physical or safety fidelity failure."""
+
+    _CODES = {"missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure"}
+    _FIELDS = _CODES | {"monitor_active", "monitor_observed"}
+
+    def __init__(self, fidelity_code: str, fidelity: Mapping[str, object]) -> None:
+        if (
+            fidelity_code not in self._CODES
+            or set(fidelity) != self._FIELDS
+            or any(type(fidelity[field]) is not bool for field in self._FIELDS)
+            or fidelity[fidelity_code] is not True
+        ):
+            raise ValueError("fidelity failure evidence is invalid")
+        self.fidelity_code = fidelity_code
+        self.fidelity = dict(fidelity)
+        super().__init__(fidelity_code)
+
+
 class _LeaseController(Protocol):
     def lease_next(self, worker_id: str) -> Any | None: ...
 
@@ -172,6 +191,7 @@ class PersistentRolloutWorker:
         heartbeat_interval_seconds: float = 30.0,
         preparation_timeout_seconds: float = 180.0,
         source_finalization_timeout_seconds: float = _DEFAULT_SOURCE_FINALIZATION_TIMEOUT_SECONDS,
+        simple_curriculum_collection: bool = False,
         hard_exit: Callable[[int], None] = os._exit,
     ) -> None:
         self.identity = WorkerIdentity(worker_id, session_id, renderer_device, policy_device)
@@ -183,6 +203,9 @@ class PersistentRolloutWorker:
         self._policy = policy
         self._output_root = Path(output_root)
         self._episode_generation = 0
+        if type(simple_curriculum_collection) is not bool:
+            raise ValueError("simple_curriculum_collection must be a boolean")
+        self._simple_curriculum_collection = simple_curriculum_collection
         if heartbeat_interval_seconds <= 0:
             raise ValueError("heartbeat_interval_seconds must be positive")
         if (
@@ -362,8 +385,10 @@ class PersistentRolloutWorker:
                     f"preparation exceeded {self._preparation_timeout_seconds:g}s "
                     f"({_PREPARATION_TIMEOUT_REASON})"
                 )
+            scoped_assignment = dict(assignment)
+            scoped_assignment["simple_curriculum_collection"] = self._simple_curriculum_collection
             outcome = session.run_episode(
-                assignment=assignment, attempt_output_dir=output_dir, policy=self._policy,
+                assignment=scoped_assignment, attempt_output_dir=output_dir, policy=self._policy,
                 cancellation_event=stop,
             )
         finally:
@@ -490,6 +515,27 @@ class PersistentRolloutWorker:
                         # hook returns; never append a contradictory retry.
                         raise
                     if isinstance(error, PolicyActionSafetyRejectionError):
+                        if self._simple_curriculum_collection:
+                            abort = getattr(self._controller, "record_fidelity_abort", None)
+                            if not callable(abort):
+                                raise RuntimeError("controller does not support durable fidelity abort") from error
+                            abort(
+                                self.identity.worker_id, attempt_id, lease_id,
+                                session_id=self.identity.session_id, generation=generation,
+                                fidelity_code="safety_failure",
+                                fidelity={
+                                    "missing_cloth": False, "cloth_flight": False,
+                                    "nonfinite_cloth_state": False, "safety_failure": True,
+                                    "monitor_active": True, "monitor_observed": True,
+                                },
+                                runtime={
+                                    key: runtime_receipt[key]
+                                    for key in ("simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device")
+                                },
+                            )
+                            if _is_source_discovery_assignment(assignment):
+                                raise RuntimeError("source discovery fidelity abort") from error
+                            continue
                         reject = getattr(self._controller, "reject_attempt", None)
                         if not callable(reject):
                             raise RuntimeError(
@@ -501,6 +547,30 @@ class PersistentRolloutWorker:
                             lease_id,
                             reason=POLICY_ACTION_SAFETY_REJECTION_REASON,
                         )
+                        continue
+                    if isinstance(error, FidelityFailureError):
+                        abort = getattr(self._controller, "record_fidelity_abort", None)
+                        if not callable(abort):
+                            raise RuntimeError("controller does not support durable fidelity abort") from error
+                        abort_status = abort(
+                            self.identity.worker_id,
+                            attempt_id,
+                            lease_id,
+                            session_id=self.identity.session_id,
+                            generation=generation,
+                            fidelity_code=error.fidelity_code,
+                            fidelity=error.fidelity,
+                            runtime={
+                                key: runtime_receipt[key]
+                                for key in ("simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device")
+                            },
+                        )
+                        if abort_status == "retryable":
+                            raise RuntimeError(
+                                "fidelity-invalid attempt was requeued; requesting clean worker restart"
+                            ) from error
+                        if _is_source_discovery_assignment(assignment):
+                            raise RuntimeError("source discovery fidelity abort") from error
                         continue
                     if isinstance(error, InfrastructureInvalidAttemptError):
                         abort = getattr(self._controller, "record_infrastructure_abort", None)

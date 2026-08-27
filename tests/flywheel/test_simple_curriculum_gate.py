@@ -72,6 +72,23 @@ def test_gate_stops_for_authenticated_aggregate_safety_failure() -> None:
     assert gate.evaluate_gate(report).as_dict() == {"decision": "fidelity_stop", "reason": "episode_fidelity"}
 
 
+def test_gate_stops_fidelity_first_for_typed_preframe_failure() -> None:
+    gate = _module()
+    report = _report(valid_outcomes=0)
+    report["gate_fidelity_failures"] = [{
+        "fidelity_code": "missing_cloth",
+        "fidelity": {
+            "missing_cloth": True, "cloth_flight": False,
+            "nonfinite_cloth_state": False, "safety_failure": False,
+            "monitor_active": True, "monitor_observed": True,
+        },
+    }]
+
+    assert gate.evaluate_gate(report).as_dict() == {
+        "decision": "fidelity_stop", "reason": "episode_fidelity",
+    }
+
+
 @pytest.mark.parametrize(
     ("invalid", "decision", "reason"),
     [(0, "continue", "passed"), (2, "continue", "passed"), (3, "infrastructure_stop", "invalid_ratio")],
@@ -154,7 +171,7 @@ def _authenticated_report(rows: list[dict[str, object]], *, invalid: int = 0, su
         "matrix_sha256": _digest(rows), "identity": POLICY,
         "valid_outcomes": 100, "infrastructure_invalid_executions": invalid,
         "execution_count": 100 + invalid, "official_successes": successes,
-        "safety_failure": False,
+        "safety_failure": False, "gate_fidelity_failures": [],
         "runtime_identities": [runtime], "fresh_assignment_ids": sorted(str(row["attempt_id"]) for row in rows),
         "trials": [],
         "gate_trials": [
@@ -199,12 +216,49 @@ def test_cli_authenticates_the_exact_calibration_head_and_writes_deterministic_i
     assert receipt["decision"] == "continue" and receipt["reason"] == "passed"
     assert receipt["report_sha256"] == hashlib.sha256(report_path.read_bytes()).hexdigest()
     assert receipt["matrix_sha256"] == hashlib.sha256(matrix_path.read_bytes()).hexdigest()
-
     duplicate = tmp_path / "two"; duplicate.mkdir()
     second = _write_inputs(duplicate, report, rows)
     assert _run_gate(*second).returncode == 0
     assert output.read_bytes() == second[-1].read_bytes()
 
+
+def test_cli_authenticates_typed_preframe_fidelity_failure_before_outcome_count(tmp_path: Path) -> None:
+    rows = _matrix(); report = _authenticated_report(rows)
+    report["valid_outcomes"] = 99
+    report["execution_count"] = 100
+    report["infrastructure_invalid_executions"] = 1
+    report["fresh_assignment_ids"] = report["fresh_assignment_ids"][:-1]
+    report["gate_trials"] = report["gate_trials"][:-1]
+    report["runtime_identities"] = [report["runtime_identities"][0]]
+    report["gate_fidelity_failures"] = [{
+        "assignment_id": rows[-1]["attempt_id"], "ledger_id": "a" * 64,
+        "lease_id": "b" * 64, "worker_id": "worker-0", "session_id": "session-0", "generation": 1,
+        "fidelity_code": "missing_cloth",
+        "fidelity": {"missing_cloth": True, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": True, "monitor_observed": True},
+        "runtime": {"simulation_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0"},
+    }]
+    report["report_sha256"] = _report_digest(report)
+    paths = _write_inputs(tmp_path, report, rows)
+
+    result = _run_gate(*paths)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(paths[-1].read_text(encoding="utf-8"))["decision"] == "fidelity_stop"
+
+
+def test_cli_rejects_untrusted_typed_preframe_fidelity_runtime(tmp_path: Path) -> None:
+    rows = _matrix(); report = _authenticated_report(rows)
+    report["gate_fidelity_failures"] = [{
+        "assignment_id": rows[-1]["attempt_id"], "ledger_id": "a" * 64,
+        "lease_id": "b" * 64, "worker_id": "worker-0", "session_id": "session-0", "generation": 1,
+        "fidelity_code": "missing_cloth",
+        "fidelity": {"missing_cloth": True, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": True, "monitor_observed": True},
+        "runtime": {"simulation_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:bogus", "camera_device": "cuda:0", "policy_device": "cuda:0"},
+    }]
+    report["report_sha256"] = _report_digest(report)
+    paths = _write_inputs(tmp_path, report, rows)
+
+    assert _run_gate(*paths).returncode != 0
 
 @pytest.mark.parametrize("mutator", [
     lambda report, rows: report.update(fresh_assignment_ids=report["fresh_assignment_ids"][:-1]),

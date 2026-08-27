@@ -183,6 +183,48 @@ def test_policy_action_safety_rejection_durably_rejects_source_lease_and_continu
     assert controller.status_calls == ["attempt-b"]
 
 
+def test_preframe_fidelity_failure_is_a_typed_ledger_abort(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import FidelityFailureError, PersistentRolloutWorker
+
+    class FidelityController(FakeController):
+        def __init__(self) -> None:
+            super().__init__([Lease(Attempt("attempt-a", _source_assignment(11)), "lease-a")])
+            self.fidelity_aborts: list[tuple[object, ...]] = []
+
+        def record_fidelity_abort(self, worker_id, attempt_id, lease_id, *, session_id, generation, fidelity_code, fidelity, runtime):
+            self.fidelity_aborts.append((worker_id, attempt_id, lease_id, session_id, generation, fidelity_code, fidelity, runtime))
+            return "infrastructure_abort"
+
+    class MissingClothSession(FakeSession):
+        def run_episode(self, **kwargs):
+            raise FidelityFailureError(
+                "missing_cloth",
+                {
+                    "missing_cloth": True, "cloth_flight": False,
+                    "nonfinite_cloth_state": False, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+            )
+
+    controller = FidelityController()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=MissingClothSession, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0", simple_curriculum_collection=True,
+    )
+
+    with pytest.raises(RuntimeError, match="source discovery fidelity abort"):
+        worker.run()
+
+    assert controller.fidelity_aborts == [
+        ("worker-0", "attempt-a", "lease-a", "session-0", 1, "missing_cloth", {
+            "missing_cloth": True, "cloth_flight": False,
+            "nonfinite_cloth_state": False, "safety_failure": False,
+            "monitor_active": True, "monitor_observed": True,
+        }, {"simulation_device": "cuda:0", "cloth_device": "cuda:0", "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0"}),
+    ]
+
+
 def test_source_discovery_runtime_infrastructure_abort_stops_before_the_second_lease(tmp_path) -> None:
     from lehome.flywheel.persistent_worker import PersistentRolloutWorker
 
@@ -644,6 +686,32 @@ def test_launcher_binds_cloth_physics_to_the_renderer_cuda_device(monkeypatch) -
     assert args.device == "cuda:2"
     assert args.camera_device == "cuda:2"
     assert environment == {"LEHOME_FLYWHEEL_WORKER_GPU": "2"}
+
+
+@pytest.mark.parametrize("value", ["", "true", "False", "2", " 1"])
+def test_simple_curriculum_collection_marker_is_strict(value: str) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repository))
+    try:
+        from scripts.run_groot_persistent_worker import simple_curriculum_collection_from_environ
+
+        with pytest.raises(ValueError, match="LEHOME_SIMPLE_CURRICULUM_COLLECTION"):
+            simple_curriculum_collection_from_environ({"LEHOME_SIMPLE_CURRICULUM_COLLECTION": value})
+    finally:
+        sys.path.remove(str(repository))
+
+
+def test_simple_curriculum_collection_marker_defaults_false_and_accepts_exact_values() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repository))
+    try:
+        from scripts.run_groot_persistent_worker import simple_curriculum_collection_from_environ
+
+        assert simple_curriculum_collection_from_environ({}) is False
+        assert simple_curriculum_collection_from_environ({"LEHOME_SIMPLE_CURRICULUM_COLLECTION": "0"}) is False
+        assert simple_curriculum_collection_from_environ({"LEHOME_SIMPLE_CURRICULUM_COLLECTION": "1"}) is True
+    finally:
+        sys.path.remove(str(repository))
 
 
 def test_parsed_default_simulator_inherits_a_nonzero_renderer_gpu(monkeypatch, tmp_path) -> None:

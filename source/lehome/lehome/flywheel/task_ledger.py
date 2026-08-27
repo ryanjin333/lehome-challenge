@@ -354,6 +354,56 @@ class TaskLedger:
             )
             return "infrastructure_abort"
 
+    def record_fidelity_abort(
+        self, worker_id: str, attempt_id: str, lease_id: str, *, session_id: str,
+        generation: int, fidelity_code: str, fidelity: Mapping[str, object], runtime: Mapping[str, object],
+    ) -> str:
+        """Terminalize one observed physical/safety fidelity failure immutably."""
+        worker_id = _require_identifier(worker_id, field="worker_id")
+        attempt_id = _require_identifier(attempt_id, field="attempt_id")
+        lease_id = _require_identifier(lease_id, field="lease_id")
+        session_id = _require_identifier(session_id, field="session_id")
+        fields = {
+            "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure",
+            "monitor_active", "monitor_observed",
+        }
+        if (fidelity_code not in {"missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure"}
+                or type(generation) is not int or generation < 1
+                or not isinstance(fidelity, Mapping) or set(fidelity) != fields
+                or any(type(fidelity[field]) is not bool for field in fields)
+                or fidelity[fidelity_code] is not True):
+            raise ValueError("fidelity abort evidence is invalid")
+        runtime_fields = {"simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device"}
+        if (
+            not isinstance(runtime, Mapping)
+            or set(runtime) != runtime_fields
+            or any(not isinstance(runtime[field], str) or not runtime[field] for field in runtime_fields)
+        ):
+            raise ValueError("fidelity abort runtime is invalid")
+        payload = {
+            "failure_class": "fidelity", "fidelity_code": fidelity_code,
+            "fidelity": dict(fidelity), "lease_id": lease_id, "worker_id": worker_id,
+            "session_id": session_id, "generation": generation, "runtime": dict(runtime),
+        }
+        with self._write():
+            now_ns = self._now()
+            self._expire_leases(now_ns)
+            state = self._state_for_attempt(attempt_id)
+            self._require_active_lease(state, worker_id, lease_id)
+            self._append_event(
+                "interrupted", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
+                payload={"reason": "fidelity_abort"}, at_ns=now_ns,
+            )
+            self._append_event(
+                "terminal_pending_validation", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
+                payload={"raw_artifact_id": f"fidelity_abort:{fidelity_code}"}, at_ns=now_ns,
+            )
+            self._append_event(
+                "infrastructure_abort", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
+                payload=payload, at_ns=now_ns,
+            )
+            return "infrastructure_abort"
+
     def record_terminal(self, worker_id: str, attempt_id: str, lease_id: str, raw_artifact_id: str) -> str:
         """Close worker execution before asynchronous validation begins."""
 

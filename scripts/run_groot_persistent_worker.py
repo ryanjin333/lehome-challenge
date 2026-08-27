@@ -24,6 +24,15 @@ _TERMINAL_EVALUATION_ROW_KEYS = {"trial_id", "category", "garment_name", "releas
 _TERMINAL_80_ALIAS_KEYS = {"attempt_id", "garment"}
 
 
+def simple_curriculum_collection_from_environ(environ: Mapping[str, str]) -> bool:
+    """Parse the one outer-process marker without leaking environment reads inward."""
+
+    value = environ.get("LEHOME_SIMPLE_CURRICULUM_COLLECTION", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("LEHOME_SIMPLE_CURRICULUM_COLLECTION must be exactly 0 or 1")
+    return value == "1"
+
+
 class LedgerWorkerController:
     """Give a worker the small controller surface without a second scheduler."""
 
@@ -64,6 +73,29 @@ class LedgerWorkerController:
                 f"infrastructure_retry:{reason}",
             )
         return self._ledger.record_infrastructure_abort(worker_id, attempt_id, lease_id, reason=reason)
+
+    def record_fidelity_abort(
+        self,
+        worker_id: str,
+        attempt_id: str,
+        lease_id: str,
+        *,
+        session_id: str,
+        generation: int,
+        fidelity_code: str,
+        fidelity: Mapping[str, object],
+        runtime: Mapping[str, object],
+    ) -> str:
+        return self._ledger.record_fidelity_abort(
+            worker_id,
+            attempt_id,
+            lease_id,
+            session_id=session_id,
+            generation=generation,
+            fidelity_code=fidelity_code,
+            fidelity=fidelity,
+            runtime=runtime,
+        )
 
     def status(self, attempt_id: str) -> str:
         return self._ledger.status(attempt_id)
@@ -484,6 +516,7 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
             heartbeat_interval_seconds=max(0.1, args.lease_seconds / 3.0),
             preparation_timeout_seconds=args.preparation_timeout_seconds,
             source_finalization_timeout_seconds=source_finalization_timeout_seconds,
+            simple_curriculum_collection=getattr(args, "simple_curriculum_collection", False),
         )
         return worker.run()
     finally:
@@ -498,6 +531,7 @@ def main(argv: list[str] | None = None) -> int:
 
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args(argv)
+    args.simple_curriculum_collection = simple_curriculum_collection_from_environ(os.environ)
     prepare_persistent_cloth_launch(args)
     simulation_app = launch_app_from_args(args)
     _progress("kit launched")

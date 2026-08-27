@@ -90,6 +90,31 @@ def test_heartbeat_renews_matching_worker_lease_with_injected_clock(ledger, cloc
         ledger.heartbeat("worker-b", lease.attempt.attempt_id, lease.lease_id, lease_duration_ns=100)
 
 
+def test_record_fidelity_abort_writes_typed_terminal_payload(ledger) -> None:
+    lease = ledger.lease_next("worker-a", lease_duration_ns=100)
+    assert lease is not None
+    fidelity = {
+        "missing_cloth": True, "cloth_flight": False,
+        "nonfinite_cloth_state": False, "safety_failure": False,
+        "monitor_active": True, "monitor_observed": True,
+    }
+
+    assert ledger.record_fidelity_abort(
+        "worker-a", lease.attempt.attempt_id, lease.lease_id,
+        session_id="session-a", generation=3, fidelity_code="missing_cloth", fidelity=fidelity,
+        runtime={"simulation_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0"},
+    ) == "infrastructure_abort"
+
+    event = ledger.events(lease.attempt.attempt_id)[-1]
+    assert event.event_type == "infrastructure_abort"
+    assert event.payload == {
+        "failure_class": "fidelity", "fidelity_code": "missing_cloth", "fidelity": fidelity,
+        "lease_id": lease.lease_id, "worker_id": "worker-a",
+        "session_id": "session-a", "generation": 3,
+        "runtime": {"simulation_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0"},
+    }
+
+
 def test_lease_and_heartbeat_reject_expiry_past_sqlite_signed_integer_without_writing_events(tmp_path) -> None:
     from lehome.flywheel.task_ledger import TaskLedger
 
