@@ -58,7 +58,7 @@ def _runtime_identity_digest(identity: Mapping[str, object], provenance: Mapping
 def _augment_first_hundred_metrics(report: Mapping[str, object]) -> dict[str, object]:
     """Add immutable first-100 fields without changing legacy report fields."""
     result = dict(report)
-    trials = result.get("trials")
+    trials = result.get("gate_trials")
     invalid = result.get("infrastructure_invalid_executions", 0)
     if not isinstance(trials, list) or type(invalid) is not int or invalid < 0:
         raise ValueError("first-100 report evidence is invalid")
@@ -66,8 +66,8 @@ def _augment_first_hundred_metrics(report: Mapping[str, object]) -> dict[str, ob
     identities: set[str] = set()
     for trial in trials:
         if not isinstance(trial, Mapping):
-            raise ValueError("first-100 trial is invalid")
-        attempt_id = trial.get("attempt_id")
+            raise ValueError("first-100 gate trial is invalid")
+        attempt_id = trial.get("assignment_id")
         terminal = trial.get("terminal_event")
         identity = trial.get("identity")
         provenance = trial.get("provenance")
@@ -75,7 +75,7 @@ def _augment_first_hundred_metrics(report: Mapping[str, object]) -> dict[str, ob
         if (not isinstance(attempt_id, str) or not attempt_id or terminal not in {"accepted", "rejected"}
                 or not isinstance(identity, Mapping) or not isinstance(provenance, Mapping)
                 or not isinstance(fidelity, Mapping)):
-            raise ValueError("first-100 trial is invalid")
+            raise ValueError("first-100 gate trial is invalid")
         if any(type(fidelity.get(field)) is not bool for field in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure")):
             raise ValueError("first-100 fidelity evidence is invalid")
         assignment_ids.append(attempt_id)
@@ -88,6 +88,168 @@ def _augment_first_hundred_metrics(report: Mapping[str, object]) -> dict[str, ob
     result["runtime_identities"] = sorted(identities)
     result["fresh_assignment_ids"] = sorted(assignment_ids)
     return result
+
+
+def _simple_evidence_index(root: Path, name: str, identity_key: str) -> tuple[dict[str, tuple[Path, dict[str, object]]], int]:
+    """Index simple-curriculum evidence, retaining malformed files as invalid work."""
+    indexed: dict[str, tuple[Path, dict[str, object]]] = {}
+    malformed = 0
+    for path in root.rglob(name):
+        if path.is_symlink() or not path.is_file():
+            malformed += 1
+            continue
+        try:
+            payload = _json_object(path, name)
+        except ValueError:
+            malformed += 1
+            continue
+        identity = payload.get(identity_key)
+        if not isinstance(identity, str) or not identity or identity in indexed:
+            malformed += 1
+            continue
+        indexed[identity] = (path, payload)
+    return indexed, malformed
+
+
+def _simple_fidelity(episode: Mapping[str, object]) -> dict[str, bool]:
+    fidelity = episode.get("fidelity")
+    fields = ("missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure")
+    if not isinstance(fidelity, Mapping) or any(type(fidelity.get(field)) is not bool for field in fields):
+        raise ValueError("simple curriculum episode fidelity evidence is invalid")
+    aggregate = episode.get("safety_failure")
+    if type(aggregate) is not bool or aggregate is not fidelity["safety_failure"]:
+        raise ValueError("simple curriculum safety evidence is contradictory")
+    return {field: bool(fidelity[field]) for field in fields}
+
+
+def _build_simple_first_hundred_report(
+    *, campaign_root: Path, rows: list[dict[str, object]], matrix_sha256: str, candidate_key: str,
+    policy_repo: str, policy_revision: str, policy_step: int, policy_artifact_sha256: str,
+) -> dict[str, object]:
+    """Summarize only terminal evidence that can authenticate the 100-row gate."""
+    ledger_path = campaign_root / "ledger.sqlite3"
+    with _open_ledger(ledger_path) as ledger:
+        attempts = list(ledger.execute("SELECT attempt_id, schedule_index, assignment_json FROM attempts ORDER BY schedule_index"))
+        if len(attempts) != len(rows):
+            raise ValueError("evaluation ledger does not contain exactly the frozen-matrix attempts")
+        assignments: dict[str, dict[str, object]] = {}
+        for index, (attempt, expected) in enumerate(zip(attempts, rows)):
+            try:
+                assignment = json.loads(attempt["assignment_json"])
+            except (TypeError, json.JSONDecodeError) as error:
+                raise ValueError("evaluation ledger assignment is invalid") from error
+            if attempt["schedule_index"] != index or assignment != expected:
+                raise ValueError("evaluation ledger assignments do not match the frozen matrix")
+            assignments[str(attempt["attempt_id"])] = assignment
+        terminal: dict[str, str] = {}
+        completed_at_ns = 0
+        invalid_executions: set[tuple[object, object]] = set()
+        for event in ledger.execute("SELECT event_id, at_ns, event_type, attempt_id, lease_id FROM events ORDER BY event_id"):
+            event_type = event["event_type"]
+            ledger_id = event["attempt_id"]
+            if event_type in {"infrastructure_abort", "retryable", "lease_expired", "preempted", "interrupted"}:
+                invalid_executions.add((ledger_id, event["lease_id"] or event["event_id"]))
+            elif event_type in {"accepted", "rejected"}:
+                if ledger_id not in assignments or ledger_id in terminal:
+                    raise ValueError("evaluation ledger contains ambiguous terminal outcomes")
+                terminal[str(ledger_id)] = str(event_type)
+                completed_at_ns = max(completed_at_ns, int(event["at_ns"]))
+    episodes, _malformed_episodes = _simple_evidence_index(campaign_root, "episode.json", "episode_id")
+    receipts, _malformed_receipts = _simple_evidence_index(campaign_root, "worker-receipt.json", "attempt_id")
+    gate_trials: list[dict[str, object]] = []
+    trials: list[dict[str, object]] = []
+    category_scores = {category: {"episodes": 0, "official_successes": 0} for category in _CATEGORIES}
+    garment_scores: dict[str, dict[str, int]] = defaultdict(lambda: {"episodes": 0, "official_successes": 0})
+    safety_failure = False
+    for ledger_id, assignment in assignments.items():
+        event = terminal.get(ledger_id)
+        episode_entry = episodes.get(ledger_id)
+        receipt_entry = receipts.get(ledger_id)
+        if event not in {"accepted", "rejected"} or episode_entry is None or receipt_entry is None:
+            invalid_executions.add(("incomplete-terminal", ledger_id))
+            continue
+        episode_path, episode = episode_entry
+        receipt_path, receipt = receipt_entry
+        try:
+            identity = episode.get("identity")
+            provenance = episode.get("provenance")
+            if not isinstance(identity, Mapping) or not isinstance(provenance, Mapping):
+                raise ValueError("identity")
+            if ({key: identity.get(key) for key in ("policy_repo", "policy_revision", "policy_step")} != {
+                    "policy_repo": policy_repo, "policy_revision": policy_revision, "policy_step": policy_step}
+                    or provenance.get("policy_artifact_sha256") != policy_artifact_sha256):
+                raise ValueError("policy")
+            if (identity.get("episode_id") != ledger_id or identity.get("garment_name") != assignment.get("garment_name")
+                    or identity.get("category") != assignment.get("category") or identity.get("release_stage") != assignment.get("release_stage")
+                    or identity.get("seed") != assignment.get("seed")):
+                raise ValueError("assignment")
+            fidelity = _simple_fidelity(episode)
+            receipt_outcome = receipt.get("outcome")
+            official_success = event == "accepted"
+            if (not isinstance(receipt_outcome, Mapping) or receipt_outcome.get("success") is not official_success
+                    or episode.get("accepted_success") is not official_success
+                    or (episode.get("outcome") == "success") is not official_success):
+                raise ValueError("outcome")
+            simulator_device = receipt.get("simulation_device", provenance.get("simulator_device"))
+            cloth_device = receipt.get("cloth_device")
+            renderer_device = receipt.get("renderer_device")
+            camera_device = receipt.get("camera_device")
+            policy_device = receipt.get("policy_device", provenance.get("policy_device"))
+            if (simulator_device != "cpu" or cloth_device != "cpu"
+                    or not all(isinstance(device, str) and re.fullmatch(r"cuda:[0-9]+", device) for device in (renderer_device, camera_device, policy_device))
+                    or len({renderer_device, camera_device, policy_device}) != 1):
+                raise ValueError("devices")
+            gate_identity = {
+                "policy_repo": policy_repo, "policy_revision": policy_revision, "policy_step": policy_step,
+                "policy_artifact_sha256": policy_artifact_sha256, "code_revision": identity.get("code_revision"),
+                "asset_revision": identity.get("asset_revision"), "simulator_version": identity.get("simulator_version"),
+            }
+            gate_provenance = {
+                "policy_repo": policy_repo, "policy_revision": policy_revision, "policy_step": policy_step,
+                "policy_artifact_sha256": policy_artifact_sha256, "image_identity": provenance.get("image_identity"),
+                "simulator_device": simulator_device, "cloth_device": cloth_device, "renderer_device": renderer_device,
+                "camera_device": camera_device, "policy_device": policy_device,
+            }
+            _runtime_identity_digest(gate_identity, gate_provenance)
+        except (TypeError, ValueError):
+            invalid_executions.add(("invalid-terminal-evidence", ledger_id))
+            continue
+        category = str(assignment["category"]); garment = str(assignment["garment_name"])
+        category_scores[category]["episodes"] += 1; garment_scores[garment]["episodes"] += 1
+        if official_success:
+            category_scores[category]["official_successes"] += 1; garment_scores[garment]["official_successes"] += 1
+        safety_failure = safety_failure or fidelity["safety_failure"]
+        trials.append({
+            "schedule_index": len(trials), "trial_id": assignment["trial_id"], "attempt_id": ledger_id,
+            "category": category, "garment": garment, "seed": assignment["seed"],
+            "official_success": int(official_success), "terminal_event": event,
+            "episode_sha256": _sha256_file(episode_path), "worker_receipt_sha256": _sha256_file(receipt_path),
+        })
+        gate_trials.append({
+            "assignment_id": assignment["attempt_id"], "trial_id": assignment["trial_id"], "terminal_event": event,
+            "official_success": official_success, "episode_sha256": _sha256_file(episode_path),
+            "worker_receipt_sha256": _sha256_file(receipt_path), "identity": gate_identity,
+            "provenance": gate_provenance, "fidelity": fidelity,
+        })
+    successes = sum(values["official_successes"] for values in category_scores.values())
+    report: dict[str, object] = {
+        "schema_version": 1, "kind": "lehome_simple_curriculum_first100_report_v1",
+        "release_stage": "seen", "candidate_key": candidate_key,
+        "identity": {"policy_repo": policy_repo, "policy_revision": policy_revision, "policy_step": policy_step, "policy_artifact_sha256": policy_artifact_sha256},
+        "campaign_kind": "simple_curriculum_source_v1", "logical_stage": "calibration_head",
+        "matrix_sha256": matrix_sha256, "ledger_sha256": _sha256_file(ledger_path), "completed_at_ns": completed_at_ns,
+        "episodes": len(rows), "official_successes": successes, "success_rate": successes / len(gate_trials) if gate_trials else 0.0,
+        "per_category": {category: {**values, "success_rate": values["official_successes"] / values["episodes"] if values["episodes"] else 0.0} for category, values in category_scores.items()},
+        "per_garment": {garment: {**values, "success_rate": values["official_successes"] / values["episodes"] if values["episodes"] else 0.0} for garment, values in sorted(garment_scores.items())},
+        "gates": {"overall_ge_70": False, "each_category_ge_60": False}, "safety": {"evaluated": False, "physical_approval": False},
+        "infrastructure_retry_count": len(invalid_executions), "gpu_seconds": 0.0,
+        "progress": {"observed_episodes": 0, "mean_terminal_progress": 0.0}, "recovery": {"recovery_attempts": 0, "successful_recoveries": 0},
+        "safety_failure": safety_failure, "trials": trials, "gate_trials": gate_trials,
+        "infrastructure_invalid_executions": len(invalid_executions),
+    }
+    report = _augment_first_hundred_metrics(report)
+    report["report_sha256"] = report_sha256(report)
+    return report
 
 
 def _sha256_file(path: Path) -> str:
@@ -369,6 +531,12 @@ def build_report(
         and all(row.get("campaign_kind") == "simple_curriculum_source_v1" for row in rows)
         and all(row.get("logical_stage") == "calibration" for row in rows)
     )
+    if simple_first_hundred:
+        return _build_simple_first_hundred_report(
+            campaign_root=root, rows=rows, matrix_sha256=matrix_sha256,
+            candidate_key=candidate_key, policy_repo=policy_repo, policy_revision=policy_revision,
+            policy_step=policy_step, policy_artifact_sha256=policy_artifact_sha256,
+        )
     ledger_path = root / "ledger.sqlite3"
     with _open_ledger(ledger_path) as ledger:
         attempts = list(ledger.execute("SELECT attempt_id, schedule_index, assignment_json FROM attempts ORDER BY schedule_index"))
@@ -387,11 +555,9 @@ def build_report(
         terminal_at_ns: dict[str, int] = {}
         infrastructure_retry_count = 0
         gpu_seconds = 0.0
-        invalid_execution_ids: set[tuple[object, object]] = set()
-        for event in ledger.execute("SELECT event_id, at_ns, event_type, attempt_id, lease_id, payload_json FROM events ORDER BY event_id"):
+        for event in ledger.execute("SELECT at_ns, event_type, attempt_id, payload_json FROM events ORDER BY event_id"):
             if event["event_type"] in {"infrastructure_abort", "retryable", "lease_expired", "preempted"}:
                 infrastructure_retry_count += 1
-                invalid_execution_ids.add((event["attempt_id"], event["lease_id"] or event["event_id"]))
                 try:
                     payload = json.loads(event["payload_json"] or "{}")
                 except (TypeError, json.JSONDecodeError) as error:
@@ -504,13 +670,6 @@ def build_report(
         asset_revisions.add(str(identity.get("asset_revision")))
         simulator_versions.add(str(identity.get("simulator_version")))
         image_identities.add(str(provenance.get("image_identity")))
-        raw_fidelity = episode.get("fidelity")
-        if isinstance(raw_fidelity, Mapping) and all(type(raw_fidelity.get(field)) is bool for field in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure")):
-            fidelity = {field: bool(raw_fidelity[field]) for field in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure")}
-        elif simple_first_hundred:
-            raise ValueError("simple curriculum episode fidelity evidence is missing or malformed")
-        else:
-            fidelity = {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": episode_safety}
         trials.append({
             "schedule_index": len(trials),
             "trial_id": assignment["trial_id"],
@@ -522,22 +681,9 @@ def build_report(
             "terminal_event": expected_terminal,
             "episode_sha256": _sha256_file(episode_path),
             "worker_receipt_sha256": _sha256_file(receipt_path),
-            "identity": {
-                "policy_repo": identity.get("policy_repo"), "policy_revision": identity.get("policy_revision"),
-                "policy_step": identity.get("policy_step"), "code_revision": identity.get("code_revision"),
-                "asset_revision": identity.get("asset_revision"), "simulator_version": identity.get("simulator_version"),
-            },
-            "provenance": {
-                "policy_repo": identity.get("policy_repo"), "policy_revision": identity.get("policy_revision"),
-                "policy_step": identity.get("policy_step"), "policy_artifact_sha256": provenance.get("policy_artifact_sha256"),
-                "image_identity": provenance.get("image_identity"), "simulator_device": receipt.get("simulation_device", simulator_device),
-                "cloth_device": receipt.get("cloth_device"), "renderer_device": receipt.get("renderer_device"),
-                "camera_device": receipt.get("camera_device"), "policy_device": receipt.get("policy_device", policy_device),
-            },
-            "fidelity": fidelity,
         })
     for values in (code_revisions, asset_revisions, simulator_versions, image_identities):
-        if not values or "None" in values or (not simple_first_hundred and len(values) != 1):
+        if len(values) != 1 or "None" in values:
             raise ValueError("evaluation runtime identity is inconsistent")
 
     successes = sum(item["official_successes"] for item in category_scores.values())
@@ -587,18 +733,6 @@ def build_report(
         "safety_failure": safety_failure,
         "trials": trials,
     }
-    if simple_first_hundred:
-        report.update({
-            "kind": "lehome_simple_curriculum_first100_report_v1",
-            "campaign_kind": "simple_curriculum_source_v1",
-            "logical_stage": "calibration_head",
-            "identity": {
-                "policy_repo": policy_repo, "policy_revision": policy_revision,
-                "policy_step": policy_step, "policy_artifact_sha256": policy_artifact_sha256,
-            },
-            "infrastructure_invalid_executions": len(invalid_execution_ids),
-        })
-        report = _augment_first_hundred_metrics(report)
     report["report_sha256"] = report_sha256(report)
     return report
 

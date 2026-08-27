@@ -32,7 +32,8 @@ def _report(*, valid_outcomes: int = 100, invalid: int = 0, successes: int = 5,
         "execution_count": valid_outcomes + invalid,
         "official_successes": successes,
         "runtime_identities": list(runtime_identities),
-        "trials": [{"fidelity": fidelity or {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False}}],
+        "gate_trials": [{"fidelity": fidelity or {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False}}],
+        "safety_failure": False,
     }
 
 
@@ -62,6 +63,13 @@ def test_gate_stops_for_every_episode_fidelity_failure(field: str) -> None:
     decision = gate.evaluate_gate(_report(fidelity=fidelity))
 
     assert decision.as_dict() == {"decision": "fidelity_stop", "reason": "episode_fidelity"}
+
+
+def test_gate_stops_for_authenticated_aggregate_safety_failure() -> None:
+    gate = _module()
+    report = _report(); report["safety_failure"] = True
+
+    assert gate.evaluate_gate(report).as_dict() == {"decision": "fidelity_stop", "reason": "episode_fidelity"}
 
 
 @pytest.mark.parametrize(
@@ -146,10 +154,12 @@ def _authenticated_report(rows: list[dict[str, object]], *, invalid: int = 0, su
         "matrix_sha256": _digest(rows), "identity": POLICY,
         "valid_outcomes": 100, "infrastructure_invalid_executions": invalid,
         "execution_count": 100 + invalid, "official_successes": successes,
+        "safety_failure": False,
         "runtime_identities": [runtime], "fresh_assignment_ids": sorted(str(row["attempt_id"]) for row in rows),
-        "trials": [
+        "trials": [],
+        "gate_trials": [
             {
-                "attempt_id": row["attempt_id"], "trial_id": row["trial_id"],
+                "assignment_id": row["attempt_id"], "trial_id": row["trial_id"],
                 "terminal_event": "accepted" if index < successes else "rejected",
                 "official_success": index < successes,
                 "identity": {**POLICY, "code_revision": "c" * 40, "asset_revision": "a" * 40, "simulator_version": "5.1.0.0"},
@@ -200,7 +210,7 @@ def test_cli_authenticates_the_exact_calibration_head_and_writes_deterministic_i
     lambda report, rows: report.update(fresh_assignment_ids=report["fresh_assignment_ids"][:-1]),
     lambda report, rows: report.update(fresh_assignment_ids=[*report["fresh_assignment_ids"], "extra"]),
     lambda report, rows: report.update(fresh_assignment_ids=[*report["fresh_assignment_ids"][:-1], report["fresh_assignment_ids"][0]]),
-    lambda report, rows: report["trials"].__setitem__(0, {**report["trials"][0], "attempt_id": "wrong"}),
+    lambda report, rows: report["gate_trials"].__setitem__(0, {**report["gate_trials"][0], "assignment_id": "wrong"}),
 ])
 def test_cli_rejects_missing_extra_duplicate_or_mismatched_assignment_identities(tmp_path: Path, mutator) -> None:
     rows = _matrix(); report = _authenticated_report(rows); mutator(report, rows); report["report_sha256"] = _report_digest(report)
@@ -220,7 +230,7 @@ def test_cli_fails_closed_on_untrusted_or_wrong_identity_inputs(tmp_path: Path, 
     elif mutation == "catalog":
         catalog = _catalog(); catalog["top_long"] = list(reversed(catalog["top_long"])); paths[3].write_bytes(_canonical(catalog))
     elif mutation == "provenance":
-        report["trials"][0]["provenance"]["camera_device"] = "cpu"; report["report_sha256"] = _report_digest(report); paths[0].write_bytes(_canonical(report))
+        report["gate_trials"][0]["provenance"]["camera_device"] = "cpu"; report["report_sha256"] = _report_digest(report); paths[0].write_bytes(_canonical(report))
     elif mutation == "campaign":
         report["campaign_kind"] = "wrong"; report["report_sha256"] = _report_digest(report); paths[0].write_bytes(_canonical(report))
     elif mutation == "matrix":
@@ -230,6 +240,25 @@ def test_cli_fails_closed_on_untrusted_or_wrong_identity_inputs(tmp_path: Path, 
 
     assert _run_gate(*paths).returncode != 0
     assert not paths[-1].exists()
+
+
+@pytest.mark.parametrize("mutation", ["logical_stage", "cuda_bogus"])
+def test_cli_rejects_wrong_stage_and_noncanonical_cuda_provenance(tmp_path: Path, mutation: str) -> None:
+    rows = _matrix(); report = _authenticated_report(rows); paths = _write_inputs(tmp_path, report, rows)
+    if mutation == "logical_stage":
+        report["logical_stage"] = "curriculum"
+    else:
+        report["gate_trials"][0]["provenance"]["policy_device"] = "cuda:bogus"
+    report["report_sha256"] = _report_digest(report); paths[0].write_bytes(_canonical(report))
+
+    assert _run_gate(*paths).returncode != 0
+
+
+def test_cli_rejects_aggregate_safety_that_disagrees_with_gate_trials(tmp_path: Path) -> None:
+    rows = _matrix(); report = _authenticated_report(rows); paths = _write_inputs(tmp_path, report, rows)
+    report["safety_failure"] = True; report["report_sha256"] = _report_digest(report); paths[0].write_bytes(_canonical(report))
+
+    assert _run_gate(*paths).returncode != 0
 
 
 @pytest.mark.parametrize("raw", ['{"x":1,"x":2}', '{"x":NaN}'])

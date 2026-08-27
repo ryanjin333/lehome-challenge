@@ -64,9 +64,14 @@ def evaluate_gate(report: Mapping[str, object]) -> GateDecision:
         raise ValueError("execution_count is invalid")
     if valid_outcomes != 100:
         return GateDecision("infrastructure_stop", "valid_outcome_count")
-    trials = report.get("trials")
+    trials = report.get("gate_trials")
     if not isinstance(trials, list):
-        raise ValueError("trials are invalid")
+        raise ValueError("gate_trials are invalid")
+    aggregate_safety = report.get("safety_failure")
+    if type(aggregate_safety) is not bool:
+        raise ValueError("safety_failure is invalid")
+    if aggregate_safety:
+        return GateDecision("fidelity_stop", "episode_fidelity")
     for trial in trials:
         if not isinstance(trial, Mapping):
             raise ValueError("trial is invalid")
@@ -232,20 +237,21 @@ def _authenticate_report(report: object, *, report_bytes: bytes, matrix_rows: li
         raise ValueError("matrix SHA-256 mismatch")
     if _policy_identity(data.get("identity")) != policy:
         raise ValueError("report policy identity mismatch")
-    expected_ids = [str(row["attempt_id"]) for row in matrix_rows]
+    expected_ids = {str(row["attempt_id"]) for row in matrix_rows}
     fresh = data.get("fresh_assignment_ids")
     if (not isinstance(fresh, list) or any(not isinstance(item, str) for item in fresh)
-            or fresh != sorted(fresh) or len(set(fresh)) != len(fresh) or fresh != sorted(expected_ids)):
+            or fresh != sorted(fresh) or len(set(fresh)) != len(fresh) or not set(fresh).issubset(expected_ids)):
         raise ValueError("report fresh assignment identities do not match matrix")
-    trials = data.get("trials")
-    if not isinstance(trials, list) or len(trials) != len(expected_ids):
-        raise ValueError("report trials are invalid")
+    trials = data.get("gate_trials")
+    if not isinstance(trials, list) or len(trials) != len(fresh):
+        raise ValueError("report gate_trials are invalid")
     by_id: dict[str, Mapping[str, object]] = {}
     runtime: set[str] = set()
     successes = 0
-    for row in matrix_rows:
-        attempt_id = str(row["attempt_id"])
-        matches = [trial for trial in trials if isinstance(trial, Mapping) and trial.get("attempt_id") == attempt_id]
+    rows_by_id = {str(row["attempt_id"]): row for row in matrix_rows}
+    for assignment_id in fresh:
+        row = rows_by_id[assignment_id]
+        matches = [trial for trial in trials if isinstance(trial, Mapping) and trial.get("assignment_id") == assignment_id]
         if len(matches) != 1:
             raise ValueError("report trial assignment identities do not match matrix")
         trial = matches[0]
@@ -259,21 +265,30 @@ def _authenticate_report(report: object, *, report_bytes: bytes, matrix_rows: li
             raise ValueError("report trial provenance is invalid")
         if _policy_identity({key: identity.get(key) for key in policy}) != policy or _policy_identity({key: provenance.get(key) for key in policy}) != policy:
             raise ValueError("report trial policy identity mismatch")
+        renderer = provenance.get("renderer_device")
+        camera = provenance.get("camera_device")
+        policy_device = provenance.get("policy_device")
         if (provenance.get("simulator_device") != "cpu" or provenance.get("cloth_device") != "cpu"
-                or not all(isinstance(provenance.get(key), str) and provenance[key].startswith("cuda:") for key in ("renderer_device", "camera_device", "policy_device"))):
+                or not all(isinstance(device, str) and re.fullmatch(r"cuda:[0-9]+", device) for device in (renderer, camera, policy_device))
+                or len({renderer, camera, policy_device}) != 1):
             raise ValueError("report device provenance is invalid")
         if any(type(fidelity.get(key)) is not bool for key in _FIDELITY_FIELDS):
             raise ValueError("report fidelity evidence is invalid")
-        by_id[attempt_id] = trial
+        by_id[assignment_id] = trial
         runtime.add(_runtime_identity(identity, provenance))
         successes += int(official_success)
     if data.get("runtime_identities") != sorted(runtime):
         raise ValueError("report runtime identity digest mismatch")
-    if _count(data, "valid_outcomes") != len(expected_ids) or _count(data, "official_successes") != successes:
+    if _count(data, "valid_outcomes") != len(fresh) or _count(data, "official_successes") != successes:
         raise ValueError("report metrics do not match terminal evidence")
     invalid = _count(data, "infrastructure_invalid_executions")
-    if _count(data, "execution_count") != len(expected_ids) + invalid:
+    if _count(data, "execution_count") != len(fresh) + invalid:
         raise ValueError("report execution count is invalid")
+    aggregate_safety = data.get("safety_failure")
+    if type(aggregate_safety) is not bool or aggregate_safety != any(
+        bool(trial["fidelity"]["safety_failure"]) for trial in by_id.values()
+    ):
+        raise ValueError("report safety evidence is invalid")
     return data
 
 
