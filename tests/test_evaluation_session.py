@@ -1214,6 +1214,29 @@ def test_cpu_garment_initialization_uses_the_cloth_aware_pose_setter() -> None:
     assert env._flywheel_legacy_cpu_reset_state[0].shape == (1, 3)
 
 
+def test_cpu_garment_initialization_preserves_missing_cloth_as_typed_evidence() -> None:
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    source_path = Path(__file__).resolve().parents[1] / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_flywheel_initialize_legacy_cpu_garment"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    with pytest.raises(ClothFidelityError) as captured:
+        namespace["_flywheel_initialize_legacy_cpu_garment"](
+            types.SimpleNamespace(object=None)
+        )
+
+    assert captured.value.code == "missing_cloth"
+
+
 def test_cpu_garment_initialization_authors_zero_velocity_when_usd_velocity_is_unset() -> None:
     source_path = (
         Path(__file__).resolve().parents[1]
@@ -1227,7 +1250,9 @@ def test_cpu_garment_initialization_authors_zero_velocity_when_usd_velocity_is_u
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
     exec(compile(module, str(source_path), "exec"), namespace)
     points = np.asarray([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=np.float32)
     state = {"points": points.copy(), "velocities": None}
@@ -1293,7 +1318,9 @@ def test_cpu_garment_initialization_preserves_registered_live_velocity() -> None
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
     exec(compile(module, str(source_path), "exec"), namespace)
     points = np.asarray([[0.1, 0.2, 0.3]], dtype=np.float32)
     live_velocity = np.asarray([[0.2, 0.0, 0.0]], dtype=np.float32)
@@ -1503,7 +1530,9 @@ def test_cpu_reset_rejects_a_velocity_saturated_initial_state() -> None:
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
     exec(compile(module, str(source_path), "exec"), namespace)
     env = types.SimpleNamespace(
         _flywheel_legacy_cpu_reset_state=(
@@ -1520,6 +1549,60 @@ def test_cpu_reset_rejects_a_velocity_saturated_initial_state() -> None:
 
     with pytest.raises(RuntimeError, match="saturated velocity"):
         namespace["_flywheel_reset_legacy_cpu_garment"](env)
+
+
+def test_cpu_reset_post_write_readback_failure_is_typed_cloth_evidence(monkeypatch) -> None:
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    source_path = Path(__file__).resolve().parents[1] / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_flywheel_reset_legacy_cpu_garment"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    isaacsim = types.ModuleType("isaacsim")
+    core = types.ModuleType("isaacsim.core")
+    utils = types.ModuleType("isaacsim.core.utils")
+    rotations = types.ModuleType("isaacsim.core.utils.rotations")
+    rotations.euler_angles_to_quat = lambda _value, **_kwargs: np.asarray([1.0, 0.0, 0.0, 0.0])
+    isaacsim.core, core.utils, utils.rotations = core, utils, rotations
+    for name, value in {
+        "isaacsim": isaacsim, "isaacsim.core": core,
+        "isaacsim.core.utils": utils, "isaacsim.core.utils.rotations": rotations,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, value)
+
+    class Attribute:
+        def Set(self, _value):
+            return True
+
+    env = types.SimpleNamespace(
+        _flywheel_legacy_cpu_reset_state=(
+            np.asarray([[0.2, 0.1, 0.7]], dtype=np.float32),
+            np.zeros((1, 3), dtype=np.float32),
+        ),
+        particle_config={"objects": {"particle_system": {"max_velocity": 5.0}}},
+        garment_rng=np.random.RandomState(7),
+        object=types.SimpleNamespace(
+            _get_config_value=lambda _key, _source: ([0.0] * 6, "config"),
+            set_world_pose=lambda *_args: None,
+        ),
+        _flywheel_cloth_arrays=lambda positions, velocities: (np.asarray(positions), np.asarray(velocities)),
+        _flywheel_legacy_cpu_cloth_attributes=lambda: (Attribute(), Attribute()),
+        _flywheel_legacy_usd_vec3f_array=lambda values: values,
+        _flywheel_legacy_cpu_cloth_state=lambda: (
+            np.zeros((1, 3), dtype=np.float32), np.zeros((1, 3), dtype=np.float32),
+        ),
+    )
+
+    with pytest.raises(ClothFidelityError, match="readback mismatch") as captured:
+        namespace["_flywheel_reset_legacy_cpu_garment"](env)
+
+    assert captured.value.code == "cloth_flight"
 
 
 def test_cpu_visible_contact_transforms_live_usd_local_points_without_physx(monkeypatch) -> None:
@@ -2538,7 +2621,9 @@ def test_cloth_physical_health_rejects_finite_but_astronomical_state() -> None:
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     normal = types.SimpleNamespace(
@@ -2566,9 +2651,56 @@ def test_cloth_physical_health_rejects_finite_but_astronomical_state() -> None:
         "monitor_active": True,
         "monitor_observed": True,
     }
-    health = namespace["flywheel_cloth_physical_health"](divergent)
-    assert health["healthy"] is False
-    assert health["reason"] == "simulator_numerical_divergence"
+    with pytest.raises(ClothFidelityError, match="cloth_flight"):
+        namespace["flywheel_cloth_physical_health"](divergent)
+
+
+def test_cloth_health_preserves_finite_flight_as_typed_evidence() -> None:
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    source_path = Path(__file__).resolve().parents[1] / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "flywheel_cloth_physical_health"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    env = types.SimpleNamespace(
+        flywheel_collider_health=lambda: {"healthy": True},
+        _flywheel_physics_cloth_state=lambda: (
+            np.asarray([[10.0, 0.0, 0.0]], dtype=np.float32),
+            np.zeros((1, 3), dtype=np.float32),
+        ),
+    )
+
+    with pytest.raises(ClothFidelityError) as captured:
+        namespace["flywheel_cloth_physical_health"](env)
+
+    assert captured.value.code == "cloth_flight"
+    assert captured.value.fidelity["cloth_flight"] is True
+
+
+def test_cloth_health_preserves_missing_cloth_as_typed_evidence() -> None:
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    source_path = Path(__file__).resolve().parents[1] / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "flywheel_cloth_physical_health"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    with pytest.raises(ClothFidelityError) as captured:
+        namespace["flywheel_cloth_physical_health"](types.SimpleNamespace(object=None))
+
+    assert captured.value.code == "missing_cloth"
 
 
 def test_cpu_cloth_health_uses_live_usd_local_state_without_physx() -> None:
@@ -2614,7 +2746,9 @@ def test_cloth_physical_health_reports_every_exceeded_metric_to_the_admission_ga
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
     exec(compile(module, str(source_path), "exec"), namespace)
     env = types.SimpleNamespace(
         flywheel_collider_health=lambda: {"healthy": True},
@@ -2624,49 +2758,11 @@ def test_cloth_physical_health_reports_every_exceeded_metric_to_the_admission_ga
         ),
     )
 
-    health = namespace["flywheel_cloth_physical_health"](env)
+    with pytest.raises(ClothFidelityError) as captured:
+        namespace["flywheel_cloth_physical_health"](env)
 
-    assert health["healthy"] is False
-    assert health["exceeded_metrics"] == [
-        {"metric_name": "max_position_m", "metric_value": 10.0, "metric_limit": 2.0},
-        {"metric_name": "max_extent_m", "metric_value": 20.0, "metric_limit": 4.0},
-        {"metric_name": "max_velocity_mps", "metric_value": 6.0, "metric_limit": 4.75},
-    ]
-
-    evaluation_source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
-    evaluation_tree = ast.parse(evaluation_source_path.read_text(encoding="utf-8"))
-    gate = next(
-        node
-        for node in ast.walk(evaluation_tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "_require_flywheel_cloth_health"
-    )
-    gate_module = ast.Module(body=[gate], type_ignores=[])
-    ast.fix_missing_locations(gate_module)
-    error_type = type("SimulatorNumericalDivergenceError", (RuntimeError,), {})
-    gate_namespace = {
-        "Any": object,
-        "Mapping": Mapping,
-        "SimulatorNumericalDivergenceError": error_type,
-        "_FLYWHEEL_POLICY_ACTION_JOINT_NAMES": (
-            "left_shoulder_pan", "left_shoulder_lift", "left_elbow_flex",
-            "left_wrist_flex", "left_wrist_roll", "left_gripper",
-            "right_shoulder_pan", "right_shoulder_lift", "right_elbow_flex",
-            "right_wrist_flex", "right_wrist_roll", "right_gripper",
-        ),
-    }
-    exec(compile(gate_module, str(evaluation_source_path), "exec"), gate_namespace)
-
-    with __import__("pytest").raises(
-        error_type,
-        match=(
-            r"max_position_m=10.0 limit=2.0; max_extent_m=20.0 limit=4.0; "
-            r"max_velocity_mps=6.0 limit=4.75"
-        ),
-    ):
-        gate_namespace["_require_flywheel_cloth_health"](
-            types.SimpleNamespace(flywheel_cloth_physical_health=lambda: health)
-        )
+    assert captured.value.code == "cloth_flight"
+    assert captured.value.fidelity["cloth_flight"] is True
 
 
 def test_cloth_physical_health_rejects_velocity_saturated_at_the_simulator_cap() -> None:
@@ -2683,7 +2779,9 @@ def test_cloth_physical_health_rejects_velocity_saturated_at_the_simulator_cap()
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
     exec(compile(module, str(source_path), "exec"), namespace)
     env = types.SimpleNamespace(
         flywheel_collider_health=lambda: {"healthy": True},
@@ -2694,15 +2792,10 @@ def test_cloth_physical_health_rejects_velocity_saturated_at_the_simulator_cap()
         particle_config={"objects": {"particle_system": {"max_velocity": 5.0}}},
     )
 
-    health = namespace["flywheel_cloth_physical_health"](env)
+    with pytest.raises(ClothFidelityError) as captured:
+        namespace["flywheel_cloth_physical_health"](env)
 
-    assert health["healthy"] is False
-    assert any(
-        metric["metric_name"] == "max_velocity_mps"
-        and metric["metric_value"] == 5.0
-        and metric["metric_limit"] < 5.0
-        for metric in health["exceeded_metrics"]
-    )
+    assert captured.value.code == "cloth_flight"
 
 
 def test_cloth_physical_health_classifies_invalid_physx_readback_as_divergence() -> None:
@@ -2830,6 +2923,44 @@ def test_physx_cloth_readback_diagnoses_each_bounded_failure_class() -> None:
     for env, diagnostic in cases:
         with __import__("pytest").raises(RuntimeError, match=__import__("re").escape(diagnostic)):
             namespace["_flywheel_physics_cloth_state"](env)
+
+
+@pytest.mark.parametrize(
+    ("positions", "velocities", "code"),
+    [
+        (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.float32),
+            "missing_cloth",
+        ),
+        (
+            np.asarray([[np.nan, 0.0, 0.0]], dtype=np.float32),
+            np.zeros((1, 3), dtype=np.float32),
+            "nonfinite_cloth_state",
+        ),
+    ],
+)
+def test_physx_cloth_array_failures_keep_their_typed_receipt(
+    positions: np.ndarray, velocities: np.ndarray, code: str,
+) -> None:
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    source_path = Path(__file__).resolve().parents[1] / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_flywheel_cloth_arrays"
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    exec(compile(module, str(source_path), "exec"), namespace)
+
+    with pytest.raises(ClothFidelityError) as captured:
+        namespace["_flywheel_cloth_arrays"](positions, velocities)
+
+    assert captured.value.code == code
+    assert captured.value.fidelity[code] is True
 
 
 def test_flywheel_evaluation_checks_physical_health_before_success_or_recording() -> None:
@@ -3113,6 +3244,35 @@ def test_simple_curriculum_healthy_cloth_receipt_requires_observed_monitors(monk
 
     with pytest.raises(evaluation.SimulatorNumericalDivergenceError, match="fidelity evidence"):
         evaluation._require_flywheel_cloth_health(env, simple_curriculum_collection=True)
+
+
+@pytest.mark.parametrize(
+    ("simple_curriculum_collection", "error_name"),
+    [(True, "FidelityFailureError"), (False, "SimulatorNumericalDivergenceError")],
+)
+def test_reset_cloth_failure_uses_mode_aware_fidelity_translation(
+    monkeypatch, simple_curriculum_collection: bool, error_name: str,
+) -> None:
+    from lehome.flywheel.fidelity import ClothFidelityError
+
+    evaluation = _evaluation(monkeypatch)
+    evaluation.RateLimiter = lambda _step_hz: None
+    failure = ClothFidelityError(
+        "nonfinite_cloth_state",
+        {
+            "missing_cloth": False, "cloth_flight": False,
+            "nonfinite_cloth_state": True, "safety_failure": False,
+            "monitor_active": True, "monitor_observed": True,
+        },
+    )
+    env = types.SimpleNamespace(reset=lambda: (_ for _ in ()).throw(failure))
+    args = types.SimpleNamespace(save_datasets=False, num_episodes=1, step_hz=30)
+
+    with pytest.raises(getattr(evaluation, error_name)):
+        evaluation.run_evaluation_loop(
+            env, object(), args,
+            simple_curriculum_collection=simple_curriculum_collection,
+        )
 
 
 def test_cpu_controlled_recovery_bootstrap_receives_a_source_seeded_reset_callback(monkeypatch, tmp_path) -> None:

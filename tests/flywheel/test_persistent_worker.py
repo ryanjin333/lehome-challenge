@@ -183,7 +183,7 @@ def test_policy_action_safety_rejection_durably_rejects_source_lease_and_continu
     assert controller.status_calls == ["attempt-b"]
 
 
-def test_preframe_fidelity_failure_is_a_typed_ledger_abort(tmp_path) -> None:
+def test_true_mode_reset_fidelity_failure_is_a_typed_ledger_abort(tmp_path) -> None:
     from lehome.flywheel.persistent_worker import FidelityFailureError, PersistentRolloutWorker
 
     class FidelityController(FakeController):
@@ -196,7 +196,7 @@ def test_preframe_fidelity_failure_is_a_typed_ledger_abort(tmp_path) -> None:
             return "infrastructure_abort"
 
     class MissingClothSession(FakeSession):
-        def run_episode(self, **kwargs):
+        def reset(self) -> None:
             raise FidelityFailureError(
                 "missing_cloth",
                 {
@@ -205,6 +205,9 @@ def test_preframe_fidelity_failure_is_a_typed_ledger_abort(tmp_path) -> None:
                     "monitor_active": True, "monitor_observed": True,
                 },
             )
+
+        def run_episode(self, **kwargs):
+            self.reset()
 
     controller = FidelityController()
     worker = PersistentRolloutWorker(
@@ -229,7 +232,7 @@ def test_marker_false_downgrades_a_structured_fidelity_error_to_generic_infrastr
     from lehome.flywheel.persistent_worker import FidelityFailureError, PersistentRolloutWorker
 
     class MissingClothSession(FakeSession):
-        def run_episode(self, **kwargs):
+        def reset(self) -> None:
             raise FidelityFailureError(
                 "missing_cloth",
                 {
@@ -238,6 +241,9 @@ def test_marker_false_downgrades_a_structured_fidelity_error_to_generic_infrastr
                     "monitor_active": True, "monitor_observed": True,
                 },
             )
+
+        def run_episode(self, **kwargs):
+            self.reset()
 
     controller = SourceController(
         [Lease(Attempt("attempt-a", _source_assignment(11)), "lease-a")], {},

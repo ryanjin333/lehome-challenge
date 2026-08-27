@@ -33,9 +33,35 @@ from lehome.flywheel.persistent_worker import (
     FidelityFailureError,
     SimulatorNumericalDivergenceError,
 )
-from lehome.flywheel.fidelity import CLOTH_FIDELITY_CODES, FIDELITY_FIELDS, validate_fidelity
+from lehome.flywheel.fidelity import (
+    CLOTH_FIDELITY_CODES,
+    ClothFidelityError,
+    FIDELITY_FIELDS,
+    validate_fidelity,
+)
 
 logger = get_logger(__name__)
+
+
+def _translate_cloth_fidelity_failure(
+    error: ClothFidelityError, *, simple_curriculum_collection: bool,
+) -> None:
+    """Translate a physical reset failure at the mode boundary."""
+
+    if simple_curriculum_collection:
+        raise FidelityFailureError(error.code, error.fidelity) from error
+    raise SimulatorNumericalDivergenceError(str(error)) from error
+
+
+def _run_reset_preparation(operation, *, simple_curriculum_collection: bool):
+    """Run reset/readback work without losing typed cloth evidence."""
+
+    try:
+        return operation()
+    except ClothFidelityError as error:
+        _translate_cloth_fidelity_failure(
+            error, simple_curriculum_collection=simple_curriculum_collection,
+        )
 
 _FLYWHEEL_POLICY_ACTION_JOINT_NAMES = (
     "left_shoulder_pan",
@@ -145,7 +171,12 @@ def _require_flywheel_cloth_health(
         raise SimulatorNumericalDivergenceError(
             "simulator_numerical_divergence: cloth health readback unavailable"
         )
-    health = check()
+    try:
+        health = check()
+    except ClothFidelityError as error:
+        _translate_cloth_fidelity_failure(
+            error, simple_curriculum_collection=simple_curriculum_collection,
+        )
     if simple_curriculum_collection:
         try:
             cloth_fidelity = validate_fidelity(
@@ -935,8 +966,13 @@ def run_evaluation_loop(
             if not callable(set_seed):
                 raise ValueError("controlled recovery CPU reset-prefix reconstruction requires environment set_seed(seed)")
             set_seed(controlled_source_seed)
-        env.reset()
-        stabilize_garment_after_reset(env, args)
+        _run_reset_preparation(
+            env.reset, simple_curriculum_collection=simple_curriculum_collection,
+        )
+        _run_reset_preparation(
+            lambda: stabilize_garment_after_reset(env, args),
+            simple_curriculum_collection=simple_curriculum_collection,
+        )
         restore = getattr(args, "restore_snapshot", None)
         if restore is not None:
             from lehome.flywheel.snapshots import Snapshot, restore_snapshot
@@ -953,7 +989,10 @@ def run_evaluation_loop(
                 scene_state=dict(payload.get("scene_state") or {}),
                 cloth_state_authority=payload.get("cloth_state_authority"),
             )
-            restore_snapshot(env, snapshot)
+            _run_reset_preparation(
+                lambda: restore_snapshot(env, snapshot),
+                simple_curriculum_collection=simple_curriculum_collection,
+            )
             args.restore_snapshot = None
 
         recorder = None
@@ -979,27 +1018,44 @@ def run_evaluation_loop(
                 # readback to defend against input replacement in between.
                 from lehome.flywheel.recovery_collection import bootstrap_controlled_recovery, load_controlled_recovery
                 load_controlled_recovery(controlled)
-            randomization_receipt = env.apply_flywheel_randomization(sampled)
+            randomization_receipt = _run_reset_preparation(
+                lambda: env.apply_flywheel_randomization(sampled),
+                simple_curriculum_collection=simple_curriculum_collection,
+            )
             from lehome.flywheel.randomization import validate_randomization_receipt
             validate_randomization_receipt(dict(sampled.values), dict(randomization_receipt))
             if controlled is not None:
                 if controlled_source_seed is None:
-                    controlled_provenance = bootstrap_controlled_recovery(env, controlled)
+                    controlled_provenance = _run_reset_preparation(
+                        lambda: bootstrap_controlled_recovery(env, controlled),
+                        simple_curriculum_collection=simple_curriculum_collection,
+                    )
                 else:
                     def reset_controlled_source() -> None:
                         set_seed = getattr(env, "set_seed", None)
                         if not callable(set_seed):
                             raise ValueError("controlled recovery CPU reset-prefix reconstruction requires environment set_seed(seed)")
                         set_seed(controlled_source_seed)
-                        env.reset()
-                        stabilize_garment_after_reset(env, args)
-                        reset_receipt = env.apply_flywheel_randomization(sampled)
+                        _run_reset_preparation(
+                            env.reset, simple_curriculum_collection=simple_curriculum_collection,
+                        )
+                        _run_reset_preparation(
+                            lambda: stabilize_garment_after_reset(env, args),
+                            simple_curriculum_collection=simple_curriculum_collection,
+                        )
+                        reset_receipt = _run_reset_preparation(
+                            lambda: env.apply_flywheel_randomization(sampled),
+                            simple_curriculum_collection=simple_curriculum_collection,
+                        )
                         validate_randomization_receipt(
                             dict(sampled.values), dict(reset_receipt),
                         )
 
-                    controlled_provenance = bootstrap_controlled_recovery(
-                        env, controlled, reset_callback=reset_controlled_source,
+                    controlled_provenance = _run_reset_preparation(
+                        lambda: bootstrap_controlled_recovery(
+                            env, controlled, reset_callback=reset_controlled_source,
+                        ),
+                        simple_curriculum_collection=simple_curriculum_collection,
                     )
             identity = flywheel_identity
             if identity is None:  # pragma: no cover - guarded above, keeps type flow explicit.
@@ -1015,7 +1071,17 @@ def run_evaluation_loop(
             reset_cloth_health = _require_flywheel_cloth_health(
                 env, simple_curriculum_collection=simple_curriculum_collection,
             )
-            reset_snapshot = capture_snapshot(env, randomization={"strategy": strategy, "sampled": dict(sampled.values), "receipt": dict(randomization_receipt)})
+            reset_snapshot = _run_reset_preparation(
+                lambda: capture_snapshot(
+                    env,
+                    randomization={
+                        "strategy": strategy,
+                        "sampled": dict(sampled.values),
+                        "receipt": dict(randomization_receipt),
+                    },
+                ),
+                simple_curriculum_collection=simple_curriculum_collection,
+            )
             recorder.record_snapshot("reset", reset_snapshot)
         if reset_policy:
             # Controlled recovery must reset its temporal policy state only

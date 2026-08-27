@@ -699,7 +699,15 @@ class GarmentEnv(DirectRLEnv):
         """
 
         if self.object is None:
-            raise RuntimeError("cannot initialize an absent CPU source garment")
+            raise ClothFidelityError(
+                "missing_cloth",
+                {
+                    "missing_cloth": True, "cloth_flight": False,
+                    "nonfinite_cloth_state": False, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+                detail="cannot initialize an absent CPU source garment",
+            )
         try:
             # Use SingleClothPrim's cloth-aware root setter. Moving only the
             # parent Xform leaves registered particles in the previous solver
@@ -711,7 +719,15 @@ class GarmentEnv(DirectRLEnv):
             positions = positions_attr.Get()
             live_velocities = velocities_attr.Get()
             if positions is None:
-                raise RuntimeError("CPU source garment USD points are unset")
+                raise ClothFidelityError(
+                    "missing_cloth",
+                    {
+                        "missing_cloth": True, "cloth_flight": False,
+                        "nonfinite_cloth_state": False, "safety_failure": False,
+                        "monitor_active": True, "monitor_observed": True,
+                    },
+                    detail="CPU source garment USD points are unset",
+                )
             positions_array = np.asarray(positions, dtype=np.float32)
             positions_array, zero_velocities = self._flywheel_cloth_arrays(
                 positions_array, np.zeros_like(positions_array)
@@ -732,7 +748,15 @@ class GarmentEnv(DirectRLEnv):
                         observed_velocities, zero_velocities, rtol=0.0, atol=1e-6
                     )
                 ):
-                    raise RuntimeError("CPU source garment initialization readback mismatch")
+                    raise ClothFidelityError(
+                        "cloth_flight",
+                        {
+                            "missing_cloth": False, "cloth_flight": True,
+                            "nonfinite_cloth_state": False, "safety_failure": False,
+                            "monitor_active": True, "monitor_observed": True,
+                        },
+                        detail="CPU source garment initialization readback mismatch",
+                    )
                 reset_velocities = zero_velocities
             else:
                 # The initial scene garment is already registered.  Validate
@@ -741,6 +765,8 @@ class GarmentEnv(DirectRLEnv):
                 positions_array, reset_velocities = self._flywheel_cloth_arrays(
                     positions_array, live_velocities
                 )
+        except ClothFidelityError:
+            raise
         except (RuntimeError, TypeError, ValueError, AttributeError) as error:
             raise RuntimeError("CPU source garment initialization lacks live USD cloth state") from error
         self._flywheel_legacy_cpu_reset_state = (
@@ -760,6 +786,8 @@ class GarmentEnv(DirectRLEnv):
         positions, velocities = initial
         try:
             positions, velocities = self._flywheel_cloth_arrays(positions, velocities)
+        except ClothFidelityError:
+            raise
         except (RuntimeError, TypeError, ValueError, AttributeError) as error:
             raise RuntimeError("CPU source garment USD reset readback failed") from error
         particle_objects = self.particle_config.get("objects", {})
@@ -776,10 +804,18 @@ class GarmentEnv(DirectRLEnv):
             or configured_max_velocity_mps <= 0.0
             or initial_max_velocity_mps >= configured_max_velocity_mps * 0.95
         ):
-            raise RuntimeError(
-                "CPU source reset has saturated velocity: "
-                f"observed={initial_max_velocity_mps} "
-                f"limit={configured_max_velocity_mps * 0.95}"
+            raise ClothFidelityError(
+                "cloth_flight",
+                {
+                    "missing_cloth": False, "cloth_flight": True,
+                    "nonfinite_cloth_state": False, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+                detail=(
+                    "CPU source reset has saturated velocity: "
+                    f"observed={initial_max_velocity_mps} "
+                    f"limit={configured_max_velocity_mps * 0.95}"
+                ),
             )
         try:
             config_get = getattr(self.object, "_get_config_value", None)
@@ -812,13 +848,23 @@ class GarmentEnv(DirectRLEnv):
             if velocities_attr.Set(self._flywheel_legacy_usd_vec3f_array(velocities)) is False:
                 raise RuntimeError("CPU source garment USD velocities write failed")
             observed_positions, observed_velocities = self._flywheel_legacy_cpu_cloth_state()
+        except ClothFidelityError:
+            raise
         except (RuntimeError, TypeError, ValueError, AttributeError) as error:
             raise RuntimeError("CPU source garment USD reset readback failed") from error
         if not (
             np.allclose(observed_positions, positions, rtol=0.0, atol=1e-6)
             and np.allclose(observed_velocities, velocities, rtol=0.0, atol=1e-6)
         ):
-            raise RuntimeError("CPU source garment USD reset readback mismatch")
+            raise ClothFidelityError(
+                "cloth_flight",
+                {
+                    "missing_cloth": False, "cloth_flight": True,
+                    "nonfinite_cloth_state": False, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+                detail="CPU source garment USD reset readback mismatch",
+            )
 
     def get_all_pose(self):
         return self.object.get_all_pose()
@@ -1257,14 +1303,38 @@ class GarmentEnv(DirectRLEnv):
         prim = getattr(self.object, "_prim", None)
         get_attribute = getattr(prim, "GetAttribute", None)
         if not callable(get_attribute):
-            raise RuntimeError("legacy CPU garment does not expose a USD prim for cloth state")
+            raise ClothFidelityError(
+                "missing_cloth",
+                {
+                    "missing_cloth": True, "cloth_flight": False,
+                    "nonfinite_cloth_state": False, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+                detail="legacy CPU garment does not expose a USD prim for cloth state",
+            )
         positions_attr = get_attribute("points")
         velocities_attr = get_attribute("velocities")
         if positions_attr is None or velocities_attr is None:
-            raise RuntimeError("legacy CPU garment USD prim is missing points or velocities")
+            raise ClothFidelityError(
+                "missing_cloth",
+                {
+                    "missing_cloth": True, "cloth_flight": False,
+                    "nonfinite_cloth_state": False, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+                detail="legacy CPU garment USD prim is missing points or velocities",
+            )
         if (not callable(getattr(positions_attr, "Get", None))
                 or not callable(getattr(velocities_attr, "Get", None))):
-            raise RuntimeError("legacy CPU garment USD points or velocities are unreadable")
+            raise ClothFidelityError(
+                "missing_cloth",
+                {
+                    "missing_cloth": True, "cloth_flight": False,
+                    "nonfinite_cloth_state": False, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+                detail="legacy CPU garment USD points or velocities are unreadable",
+            )
         return positions_attr, velocities_attr
 
     def _flywheel_physx_weld_maps(self, *, asset_positions=None, live_positions=None):
@@ -1357,7 +1427,15 @@ class GarmentEnv(DirectRLEnv):
         positions_attr, velocities_attr = self._flywheel_legacy_cpu_cloth_attributes()
         positions, velocities = positions_attr.Get(), velocities_attr.Get()
         if positions is None or velocities is None:
-            raise RuntimeError("legacy CPU garment USD points or velocities are unset")
+            raise ClothFidelityError(
+                "missing_cloth",
+                {
+                    "missing_cloth": True, "cloth_flight": False,
+                    "nonfinite_cloth_state": False, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+                detail="legacy CPU garment USD points or velocities are unset",
+            )
         return self._flywheel_cloth_arrays(positions, velocities)
 
     @staticmethod
@@ -1491,10 +1569,11 @@ class GarmentEnv(DirectRLEnv):
             }
 
         if hasattr(self, "object") and self.object is None:
-            return receipt(
+            failure = receipt(
                 missing=True, healthy=False, reason="cloth_physical_state_unavailable",
                 metric_name="cloth_prim", metric_value="missing", metric_limit="present",
             )
+            raise ClothFidelityError("missing_cloth", failure["fidelity"])
 
         collider_health = self.flywheel_collider_health()
         if collider_health.get("healthy") is not True:
@@ -1508,13 +1587,8 @@ class GarmentEnv(DirectRLEnv):
                 positions, velocities = self._flywheel_legacy_cpu_cloth_state()
             else:
                 positions, velocities = self._flywheel_physics_cloth_state()
-        except ClothFidelityError as error:
-            return receipt(
-                missing=error.code == "missing_cloth",
-                nonfinite=error.code == "nonfinite_cloth_state",
-                healthy=False, reason=error.code, metric_name="cloth_state_readback",
-                metric_value=error.code, metric_limit="nonempty_finite_aligned_nx3",
-            )
+        except ClothFidelityError:
+            raise
         except (RuntimeError, TypeError, ValueError) as error:
             return receipt(
                 healthy=False, reason="simulator_numerical_divergence",
@@ -1581,13 +1655,14 @@ class GarmentEnv(DirectRLEnv):
                     }
                 )
         if exceeded_metrics:
-            return receipt(
-                flight=True,
-                healthy=False, reason="simulator_numerical_divergence", max_position_m=max_position_m,
-                max_extent_m=max_extent_m, max_velocity_mps=max_velocity_mps,
-                max_position_limit_m=max_position_limit_m, max_extent_limit_m=max_extent_limit_m,
-                max_velocity_limit_mps=max_velocity_limit_mps, exceeded_metrics=exceeded_metrics,
+            failure = receipt(
+                flight=True, healthy=False, reason="simulator_numerical_divergence",
+                max_position_m=max_position_m, max_extent_m=max_extent_m,
+                max_velocity_mps=max_velocity_mps, max_position_limit_m=max_position_limit_m,
+                max_extent_limit_m=max_extent_limit_m, max_velocity_limit_mps=max_velocity_limit_mps,
+                exceeded_metrics=exceeded_metrics,
             )
+            raise ClothFidelityError("cloth_flight", failure["fidelity"])
         return receipt(
             healthy=True, max_position_m=max_position_m,
             max_extent_m=max_extent_m, max_velocity_mps=max_velocity_mps,
@@ -1871,7 +1946,15 @@ class GarmentEnv(DirectRLEnv):
             np.allclose(observed_position, cloth_position, rtol=0.0, atol=1e-6)
             and np.allclose(observed_velocity, cloth_velocity, rtol=0.0, atol=1e-6)
         ):
-            raise RuntimeError("garment cloth write readback mismatch")
+            raise ClothFidelityError(
+                "cloth_flight",
+                {
+                    "missing_cloth": False, "cloth_flight": True,
+                    "nonfinite_cloth_state": False, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+                detail="garment cloth write readback mismatch",
+            )
         restored_pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
         if restored_pose.shape != (6,) or not np.isfinite(restored_pose).all():
             raise RuntimeError("garment restored pose readback is invalid")
