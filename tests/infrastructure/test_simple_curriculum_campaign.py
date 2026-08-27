@@ -91,6 +91,27 @@ def test_exact_simple_curriculum_rejects_weakened_or_conflicting_tuple_before_do
     assert "docker" not in result.stdout.lower() + result.stderr.lower()
 
 
+@pytest.mark.parametrize("field,value", [
+    ("LEHOME_ROLLOUT_IMAGE", "lehome-rollout:build"),
+    ("LEHOME_TRAINER_IMAGE", "trainer:latest"),
+])
+def test_exact_simple_curriculum_rejects_mutable_runtime_images_before_docker(tmp_path: Path, field: str, value: str) -> None:
+    environment = _environment(tmp_path, "calibration-head")
+    environment[field] = value
+    result = subprocess.run(["bash", str(SCRIPT)], env=environment, capture_output=True, text=True, check=False)
+    assert result.returncode == 2
+    assert "pinned" in result.stderr
+
+
+def test_exact_resume_refuses_missing_matrix_before_template_materialization(tmp_path: Path) -> None:
+    environment = _environment(tmp_path, "calibration-head")
+    Path(environment["LEHOME_ATTEMPT_MATRIX"]).unlink()
+    environment.update({"LEHOME_VALIDATE_MATRIX_ONLY": "0", "LEHOME_RESUME_PREEMPTED_ROLLOUT": "1"})
+    result = subprocess.run(["bash", str(SCRIPT)], env=environment, capture_output=True, text=True, check=False)
+    assert result.returncode == 2
+    assert "resume matrix is missing or unsafe" in result.stderr
+
+
 @pytest.mark.parametrize("mutate", [
     lambda row: row.update(campaign_kind="other"), lambda row: row.update(logical_stage="curriculum"),
     lambda row: row.update(strategy="mild"), lambda row: row.update(garment="Top_Long_Unseen_0"),
@@ -135,6 +156,9 @@ def test_exact_simple_curriculum_resume_refuses_active_or_mismatched_descriptor(
     })
     descriptor = {
         "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
+        "run_id": environment.get("LEHOME_RUN_ID", "lehome-rft-70-30-v1"), "run_root": environment["LEHOME_CAMPAIGN_ROOT"],
+        "database": str(Path(environment["LEHOME_CAMPAIGN_ROOT"]) / "ledger.sqlite3"), "attempt_matrix": environment["LEHOME_ATTEMPT_MATRIX"],
+        "max_attempts": 150, "target_accepted": 100,
         "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64, "code_root_sha256": _code_hash(),
         "attempt_matrix_sha256": environment["LEHOME_ATTEMPT_MATRIX_SHA256"],
         "policy_repo": "ryanjin333/lehome-groot-n17-models", "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
@@ -167,6 +191,9 @@ def test_exact_simple_curriculum_resume_resumes_only_a_matching_paused_ledger(tm
     context = tmp_path / "preemption.json"
     context.write_text(json.dumps({
         "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
+        "run_id": environment.get("LEHOME_RUN_ID", "lehome-rft-70-30-v1"), "run_root": environment["LEHOME_CAMPAIGN_ROOT"],
+        "database": str(Path(environment["LEHOME_CAMPAIGN_ROOT"]) / "ledger.sqlite3"), "attempt_matrix": environment["LEHOME_ATTEMPT_MATRIX"],
+        "max_attempts": 150, "target_accepted": 100,
         "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64, "code_root_sha256": _code_hash(),
         "attempt_matrix_sha256": environment["LEHOME_ATTEMPT_MATRIX_SHA256"],
         "policy_repo": "ryanjin333/lehome-groot-n17-models", "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
@@ -207,6 +234,9 @@ def test_exact_simple_curriculum_resume_refuses_a_terminal_ledger(tmp_path: Path
     context = tmp_path / "preemption.json"
     context.write_text(json.dumps({
         "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
+        "run_id": environment.get("LEHOME_RUN_ID", "lehome-rft-70-30-v1"), "run_root": environment["LEHOME_CAMPAIGN_ROOT"],
+        "database": str(Path(environment["LEHOME_CAMPAIGN_ROOT"]) / "ledger.sqlite3"), "attempt_matrix": environment["LEHOME_ATTEMPT_MATRIX"],
+        "max_attempts": 150, "target_accepted": 100,
         "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64, "code_root_sha256": _code_hash(),
         "attempt_matrix_sha256": environment["LEHOME_ATTEMPT_MATRIX_SHA256"],
         "policy_repo": "ryanjin333/lehome-groot-n17-models", "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",

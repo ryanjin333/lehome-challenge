@@ -136,8 +136,8 @@ class RolloutPreemptionContext:
                     or not isinstance(self.policy_revision, str) or __import__("re").fullmatch(r"[0-9a-f]{40}", self.policy_revision) is None
                     or self.policy_step != 12000 or self.simulator_device != "cpu"
                     or self.renderer_device != "cuda:0" or self.policy_device != "cuda:0"
-                    or not isinstance(self.trainer_image, str) or not self.trainer_image
-                    or not isinstance(self.rollout_image, str) or not self.rollout_image):
+                    or not isinstance(self.trainer_image, str) or __import__("re").search(r"@sha256:[0-9a-f]{64}$", self.trainer_image) is None
+                    or not isinstance(self.rollout_image, str) or __import__("re").search(r"@sha256:[0-9a-f]{64}$", self.rollout_image) is None):
                 raise PreemptionError("simple curriculum preemption context is not an exact immutable partition")
         elif self.campaign_mode != "legacy" or self.completion_metric != "accepted_successes":
             raise PreemptionError("normal rollout preemption context has an invalid completion mode")

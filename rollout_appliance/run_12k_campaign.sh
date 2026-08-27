@@ -132,8 +132,9 @@ if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
     "calibration-head:150:100"|"calibration-tail:400:300"|"curriculum-a:400:300"|"curriculum-b:400:300") ;;
     *) echo "simple curriculum partition requires an exact row/target/lease tuple" >&2; exit 2 ;;
   esac
-  if ! [[ "${PARENT_MATRIX_SHA256}" =~ ^[0-9a-f]{64}$ ]] || ! [[ "${ROLLOUT_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
-    echo "simple curriculum partition identity requires parent SHA-256 and a pinned rollout image" >&2
+  if ! [[ "${PARENT_MATRIX_SHA256}" =~ ^[0-9a-f]{64}$ ]] || ! [[ "${ROLLOUT_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]] \
+      || ! [[ "${TRAINER_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+    echo "simple curriculum partition identity requires parent SHA-256 and pinned runtime images" >&2
     exit 2
   fi
   CODE_ROOT_SHA256="$(python3 - "${SCRIPT_DIR}/.." <<'PY'
@@ -275,6 +276,10 @@ case "${POLICY_STEP}" in
 esac
 if ! [[ "${POLICY_ARTIFACT_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
   echo "LEHOME_POLICY_ARTIFACT_SHA256 must be a lowercase 64-character SHA-256" >&2
+  exit 2
+fi
+if [ "${RESUME_PREEMPTED_ROLLOUT}" = "1" ] && { [ -L "${MATRIX}" ] || [ ! -f "${MATRIX}" ]; }; then
+  echo "resume matrix is missing or unsafe" >&2
   exit 2
 fi
 if [ ! -f "${MATRIX}" ]; then
@@ -479,7 +484,7 @@ if [ "${LEHOME_VALIDATE_MATRIX_ONLY:-0}" = "1" ]; then
 fi
 
 if [ "${RESUME_PREEMPTED_ROLLOUT}" = "1" ]; then
-  PYTHONPATH="/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${LEDGER}" "${MATRIX}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" "${COMPLETION_METRIC}" "${PREEMPTION_CONTEXT}" "${SIMPLE_CURRICULUM_COLLECTION}" "${PARTITION_ID}" "${PARENT_MATRIX_SHA256}" "${CODE_ROOT_SHA256}" "${MATRIX_ACTUAL_SHA256}" "${POLICY_REPO}" "${POLICY_REVISION}" "${POLICY_STEP}" "${POLICY_ARTIFACT_SHA256}" "${POLICY_SHA256}" "${SIMULATOR_DEVICE}" "${TRAINER_IMAGE}" "${ROLLOUT_IMAGE}" <<'PY'
+  PYTHONPATH="/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${LEDGER}" "${MATRIX}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" "${COMPLETION_METRIC}" "${PREEMPTION_CONTEXT}" "${SIMPLE_CURRICULUM_COLLECTION}" "${PARTITION_ID}" "${PARENT_MATRIX_SHA256}" "${CODE_ROOT_SHA256}" "${MATRIX_ACTUAL_SHA256}" "${POLICY_REPO}" "${POLICY_REVISION}" "${POLICY_STEP}" "${POLICY_ARTIFACT_SHA256}" "${POLICY_SHA256}" "${SIMULATOR_DEVICE}" "${TRAINER_IMAGE}" "${ROLLOUT_IMAGE}" "${RUN_ID}" "${CAMPAIGN_ROOT}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -499,6 +504,8 @@ if simple == "1":
         "policy_step": int(sys.argv[14]), "policy_artifact_sha256": sys.argv[15], "policy_sha256": sys.argv[16],
         "simulator_device": sys.argv[17], "renderer_device": "cuda:0", "policy_device": "cuda:0",
         "trainer_image": sys.argv[18], "rollout_image": sys.argv[19],
+        "run_id": sys.argv[20], "run_root": sys.argv[21], "database": str(database),
+        "attempt_matrix": str(matrix), "max_attempts": int(sys.argv[3]), "target_accepted": int(sys.argv[4]),
     }
     if not isinstance(descriptor, dict) or any(descriptor.get(key) != value for key, value in expected.items()):
         raise SystemExit("simple curriculum resume descriptor does not bind this immutable partition")
@@ -1026,4 +1033,27 @@ if [[ "${FINALIZER_PID}" =~ ^[0-9]+$ ]]; then
 fi
 FINALIZER_PID=""
 write_preemption_context false
+if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ] && [ "${worker_status}" = "0" ]; then
+  PYTHONPATH="/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${LEDGER}" "${MATRIX}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" <<'PY'
+import sys
+from pathlib import Path
+from lehome.flywheel.recovery_collection import load_attempt_matrix
+from lehome.flywheel.task_ledger import TaskLedger
+
+ledger = TaskLedger(Path(sys.argv[1]), attempt_matrix=load_attempt_matrix(Path(sys.argv[2])),
+                    max_attempts=int(sys.argv[3]), target_accepted=int(sys.argv[4]), completion_metric="terminal_outcomes")
+try:
+    fidelity = any(event.event_type == "infrastructure_abort" and event.payload.get("failure_class") == "fidelity" for event in ledger.events())
+    if fidelity:
+        raise SystemExit("simple curriculum fidelity failure prevents partition completion")
+    if any(event.event_type == "infrastructure_abort" for event in ledger.events()):
+        raise SystemExit("simple curriculum unresolved infrastructure evidence prevents partition completion")
+    if ledger.completion_count != int(sys.argv[4]) or not ledger.is_terminal or any(
+        ledger.status(attempt.attempt_id) == "leased" for attempt in ledger.attempts()
+    ):
+        raise SystemExit("simple curriculum partition is incomplete")
+finally:
+    ledger.close()
+PY
+fi
 exit "${worker_status}"
