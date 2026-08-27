@@ -7,7 +7,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=worker_supervisor.sh
-source "${SCRIPT_DIR}/worker_supervisor.sh"
+if [ "${LEHOME_SIMPLE_CURRICULUM_COLLECTION:-0}" = "1" ] && [ -n "${LEHOME_HOST_CODE_ROOT:-}" ]; then
+  source "${LEHOME_HOST_CODE_ROOT}/rollout_appliance/worker_supervisor.sh"
+else
+  source "${SCRIPT_DIR}/worker_supervisor.sh"
+fi
 
 WORKSPACE="${LEHOME_WORKSPACE:-/mnt/lehome}"
 POLICY_SHA256="${LEHOME_POLICY_SHA256:-e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa}"
@@ -69,6 +73,8 @@ SOURCE_HOST_MOUNT="/opt/lehome/source/lehome"
 SCRIPTS_HOST_MOUNT="/opt/lehome/scripts"
 APPLIANCE_HOST_MOUNT="/opt/lehome/rollout_appliance"
 WORKER_LEHOME_HOST_MOUNT="/opt/lehome/merged/lehome"
+TRAINER_HOST_MOUNT="/opt/lehome/trainer/src"
+PYTHONPATH_HOST="/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome"
 RESUME_PREEMPTED_ROLLOUT="${LEHOME_RESUME_PREEMPTED_ROLLOUT:-0}"
 EVALUATION_TERMINAL_UPLOAD="${LEHOME_EVALUATION_TERMINAL_UPLOAD:-0}"
 FRESH_GARMENT_WAVES="${LEHOME_FRESH_GARMENT_WAVES:-${EVALUATION_TERMINAL_UPLOAD}}"
@@ -170,6 +176,12 @@ PY
   SCRIPTS_HOST_MOUNT="${HOST_CODE_ROOT}/scripts"
   APPLIANCE_HOST_MOUNT="${HOST_CODE_ROOT}/rollout_appliance"
   WORKER_LEHOME_HOST_MOUNT="${HOST_CODE_ROOT}/source/lehome/lehome"
+  TRAINER_HOST_MOUNT="${HOST_CODE_ROOT}/trainer/src"
+  PYTHONPATH_HOST="${HOST_CODE_ROOT}/source/lehome:${HOST_CODE_ROOT}/trainer/src:${HOST_CODE_ROOT}"
+  if [ "${SCRIPT_DIR}" != "${HOST_CODE_ROOT}/rollout_appliance" ]; then
+    echo "simple curriculum wrapper is not running from LEHOME_HOST_CODE_ROOT" >&2
+    exit 2
+  fi
 fi
 case "${SIMULATOR_DEVICE}" in
   "cuda:0") ;;
@@ -497,7 +509,7 @@ if [ "${LEHOME_VALIDATE_MATRIX_ONLY:-0}" = "1" ]; then
 fi
 
 if [ "${RESUME_PREEMPTED_ROLLOUT}" = "1" ]; then
-  PYTHONPATH="/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${LEDGER}" "${MATRIX}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" "${COMPLETION_METRIC}" "${PREEMPTION_CONTEXT}" "${SIMPLE_CURRICULUM_COLLECTION}" "${PARTITION_ID}" "${PARENT_MATRIX_SHA256}" "${CODE_ROOT_SHA256}" "${MATRIX_ACTUAL_SHA256}" "${POLICY_REPO}" "${POLICY_REVISION}" "${POLICY_STEP}" "${POLICY_ARTIFACT_SHA256}" "${POLICY_SHA256}" "${SIMULATOR_DEVICE}" "${TRAINER_IMAGE}" "${ROLLOUT_IMAGE}" "${RUN_ID}" "${CAMPAIGN_ROOT}" <<'PY'
+  PYTHONPATH="${PYTHONPATH_HOST}${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${LEDGER}" "${MATRIX}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" "${COMPLETION_METRIC}" "${PREEMPTION_CONTEXT}" "${SIMPLE_CURRICULUM_COLLECTION}" "${PARTITION_ID}" "${PARENT_MATRIX_SHA256}" "${CODE_ROOT_SHA256}" "${MATRIX_ACTUAL_SHA256}" "${POLICY_REPO}" "${POLICY_REVISION}" "${POLICY_STEP}" "${POLICY_ARTIFACT_SHA256}" "${POLICY_SHA256}" "${SIMULATOR_DEVICE}" "${TRAINER_IMAGE}" "${ROLLOUT_IMAGE}" "${RUN_ID}" "${CAMPAIGN_ROOT}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -521,9 +533,13 @@ if simple == "1":
         "attempt_matrix": str(matrix), "max_attempts": int(sys.argv[3]), "target_accepted": int(sys.argv[4]),
     }
     schema = {"schema_version": 1, "kind": "lehome_rollout_preemption_context", "active": False}
+    numeric = ("schema_version", "policy_step", "max_attempts", "target_accepted")
+    strings = tuple(key for key in expected if key not in numeric and key != "active")
     if (not isinstance(descriptor, dict) or set(descriptor) != set(expected) | set(schema)
             or type(descriptor.get("schema_version")) is not int or descriptor.get("schema_version") != 1
             or type(descriptor.get("active")) is not bool or descriptor.get("active") is not False
+            or any(type(descriptor.get(key)) is not int for key in numeric)
+            or any(not isinstance(descriptor.get(key), str) or not descriptor[key] for key in strings)
             or any(descriptor.get(key) != value for key, value in {**expected, **schema}.items())):
         raise SystemExit("simple curriculum resume descriptor does not bind this immutable partition")
 ledger = TaskLedger(database, attempt_matrix=load_attempt_matrix(matrix), max_attempts=int(sys.argv[3]), target_accepted=int(sys.argv[4]), completion_metric=metric)
@@ -1051,7 +1067,7 @@ fi
 FINALIZER_PID=""
 write_preemption_context false
 if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ] && [ "${worker_status}" = "0" ]; then
-  PYTHONPATH="/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${LEDGER}" "${MATRIX}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" <<'PY'
+  PYTHONPATH="${PYTHONPATH_HOST}${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${LEDGER}" "${MATRIX}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" <<'PY'
 import sys
 from pathlib import Path
 from lehome.flywheel.recovery_collection import load_attempt_matrix
