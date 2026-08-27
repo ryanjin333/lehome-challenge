@@ -33,6 +33,63 @@ _BASELINE_FIELDS = {
 _BASELINE_ARTIFACT_FIELDS = {"trial_id", "official_success", "episode_sha256", "worker_receipt_sha256"}
 
 
+def _runtime_identity_digest(identity: Mapping[str, object], provenance: Mapping[str, object]) -> str:
+    """Digest the complete immutable runtime tuple used by the 100-outcome gate."""
+    fields = {
+        "policy_repo": provenance.get("policy_repo"),
+        "policy_revision": provenance.get("policy_revision"),
+        "policy_step": provenance.get("policy_step"),
+        "policy_artifact_sha256": provenance.get("policy_artifact_sha256"),
+        "code_revision": identity.get("code_revision"),
+        "asset_revision": identity.get("asset_revision"),
+        "simulator_version": identity.get("simulator_version"),
+        "image_identity": provenance.get("image_identity"),
+        "simulator_device": provenance.get("simulator_device"),
+        "cloth_device": provenance.get("cloth_device"),
+        "renderer_device": provenance.get("renderer_device"),
+        "camera_device": provenance.get("camera_device"),
+        "policy_device": provenance.get("policy_device"),
+    }
+    if any(value is None for value in fields.values()):
+        raise ValueError("evaluation runtime identity is incomplete")
+    return hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")).hexdigest()
+
+
+def _augment_first_hundred_metrics(report: Mapping[str, object]) -> dict[str, object]:
+    """Add immutable first-100 fields without changing legacy report fields."""
+    result = dict(report)
+    trials = result.get("trials")
+    invalid = result.get("infrastructure_invalid_executions", 0)
+    if not isinstance(trials, list) or type(invalid) is not int or invalid < 0:
+        raise ValueError("first-100 report evidence is invalid")
+    assignment_ids: list[str] = []
+    identities: set[str] = set()
+    for trial in trials:
+        if not isinstance(trial, Mapping):
+            raise ValueError("first-100 trial is invalid")
+        attempt_id = trial.get("attempt_id")
+        terminal = trial.get("terminal_event")
+        identity = trial.get("identity")
+        provenance = trial.get("provenance")
+        fidelity = trial.get("fidelity")
+        if (not isinstance(attempt_id, str) or not attempt_id or terminal not in {"accepted", "rejected"}
+                or not isinstance(identity, Mapping) or not isinstance(provenance, Mapping)
+                or not isinstance(fidelity, Mapping)):
+            raise ValueError("first-100 trial is invalid")
+        if any(type(fidelity.get(field)) is not bool for field in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure")):
+            raise ValueError("first-100 fidelity evidence is invalid")
+        assignment_ids.append(attempt_id)
+        identities.add(_runtime_identity_digest(identity, provenance))
+    if len(set(assignment_ids)) != len(assignment_ids):
+        raise ValueError("first-100 assignment identities are duplicated")
+    result["valid_outcomes"] = len(assignment_ids)
+    result["infrastructure_invalid_executions"] = invalid
+    result["execution_count"] = len(assignment_ids) + invalid
+    result["runtime_identities"] = sorted(identities)
+    result["fresh_assignment_ids"] = sorted(assignment_ids)
+    return result
+
+
 def _sha256_file(path: Path) -> str:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"evaluation evidence must be a regular file: {path}")
@@ -307,6 +364,11 @@ def build_report(
     if root.is_symlink() or not root.is_dir():
         raise ValueError("campaign root must be a materialized directory")
     rows = _load_matrix(Path(matrix_path), matrix_sha256)
+    simple_first_hundred = (
+        len(rows) == 100
+        and all(row.get("campaign_kind") == "simple_curriculum_source_v1" for row in rows)
+        and all(row.get("logical_stage") == "calibration" for row in rows)
+    )
     ledger_path = root / "ledger.sqlite3"
     with _open_ledger(ledger_path) as ledger:
         attempts = list(ledger.execute("SELECT attempt_id, schedule_index, assignment_json FROM attempts ORDER BY schedule_index"))
@@ -325,9 +387,11 @@ def build_report(
         terminal_at_ns: dict[str, int] = {}
         infrastructure_retry_count = 0
         gpu_seconds = 0.0
-        for event in ledger.execute("SELECT at_ns, event_type, attempt_id, payload_json FROM events ORDER BY event_id"):
+        invalid_execution_ids: set[tuple[object, object]] = set()
+        for event in ledger.execute("SELECT event_id, at_ns, event_type, attempt_id, lease_id, payload_json FROM events ORDER BY event_id"):
             if event["event_type"] in {"infrastructure_abort", "retryable", "lease_expired", "preempted"}:
                 infrastructure_retry_count += 1
+                invalid_execution_ids.add((event["attempt_id"], event["lease_id"] or event["event_id"]))
                 try:
                     payload = json.loads(event["payload_json"] or "{}")
                 except (TypeError, json.JSONDecodeError) as error:
@@ -440,6 +504,13 @@ def build_report(
         asset_revisions.add(str(identity.get("asset_revision")))
         simulator_versions.add(str(identity.get("simulator_version")))
         image_identities.add(str(provenance.get("image_identity")))
+        raw_fidelity = episode.get("fidelity")
+        if isinstance(raw_fidelity, Mapping) and all(type(raw_fidelity.get(field)) is bool for field in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure")):
+            fidelity = {field: bool(raw_fidelity[field]) for field in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure")}
+        elif simple_first_hundred:
+            raise ValueError("simple curriculum episode fidelity evidence is missing or malformed")
+        else:
+            fidelity = {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": episode_safety}
         trials.append({
             "schedule_index": len(trials),
             "trial_id": assignment["trial_id"],
@@ -451,9 +522,22 @@ def build_report(
             "terminal_event": expected_terminal,
             "episode_sha256": _sha256_file(episode_path),
             "worker_receipt_sha256": _sha256_file(receipt_path),
+            "identity": {
+                "policy_repo": identity.get("policy_repo"), "policy_revision": identity.get("policy_revision"),
+                "policy_step": identity.get("policy_step"), "code_revision": identity.get("code_revision"),
+                "asset_revision": identity.get("asset_revision"), "simulator_version": identity.get("simulator_version"),
+            },
+            "provenance": {
+                "policy_repo": identity.get("policy_repo"), "policy_revision": identity.get("policy_revision"),
+                "policy_step": identity.get("policy_step"), "policy_artifact_sha256": provenance.get("policy_artifact_sha256"),
+                "image_identity": provenance.get("image_identity"), "simulator_device": receipt.get("simulation_device", simulator_device),
+                "cloth_device": receipt.get("cloth_device"), "renderer_device": receipt.get("renderer_device"),
+                "camera_device": receipt.get("camera_device"), "policy_device": receipt.get("policy_device", policy_device),
+            },
+            "fidelity": fidelity,
         })
     for values in (code_revisions, asset_revisions, simulator_versions, image_identities):
-        if len(values) != 1 or "None" in values:
+        if not values or "None" in values or (not simple_first_hundred and len(values) != 1):
             raise ValueError("evaluation runtime identity is inconsistent")
 
     successes = sum(item["official_successes"] for item in category_scores.values())
@@ -503,6 +587,18 @@ def build_report(
         "safety_failure": safety_failure,
         "trials": trials,
     }
+    if simple_first_hundred:
+        report.update({
+            "kind": "lehome_simple_curriculum_first100_report_v1",
+            "campaign_kind": "simple_curriculum_source_v1",
+            "logical_stage": "calibration_head",
+            "identity": {
+                "policy_repo": policy_repo, "policy_revision": policy_revision,
+                "policy_step": policy_step, "policy_artifact_sha256": policy_artifact_sha256,
+            },
+            "infrastructure_invalid_executions": len(invalid_execution_ids),
+        })
+        report = _augment_first_hundred_metrics(report)
     report["report_sha256"] = report_sha256(report)
     return report
 
