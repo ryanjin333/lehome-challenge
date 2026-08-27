@@ -76,7 +76,7 @@ def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
 
 
-def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malformed_receipt: int | None = None, retry_then_valid: int | None = None, contradictory_safety: int | None = None, all_success: bool = False, evaluation_terminal: bool = True, episode_mutator=None, receipt_mutator=None) -> tuple[Path, Path, list[dict[str, object]], dict[str, str]]:
+def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malformed_receipt: int | None = None, retry_then_valid: int | None = None, contradictory_safety: int | None = None, all_success: bool = False, evaluation_terminal: bool = True, episode_mutator=None, receipt_mutator=None, session_for_index=None) -> tuple[Path, Path, list[dict[str, object]], dict[str, str]]:
     from lehome.flywheel.artifact_queue import ArtifactFinalizationQueue
     from lehome.flywheel.simple_curriculum import build_calibration_rows
     from lehome.flywheel.task_ledger import TaskLedger
@@ -98,7 +98,8 @@ def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malf
             lease = ledger.lease_next("worker", lease_duration_ns=1_000_000_000)
             assert lease is not None
         ledger_id = lease.attempt.attempt_id
-        output = root / "worker" / "session" / ledger_id / lease.lease_id / f"generation-{index + 1}"
+        session_id = session_for_index(index) if session_for_index is not None else "session"
+        output = root / "worker" / session_id / ledger_id / lease.lease_id / f"generation-{index + 1}"
         raw = output / "raw" / ledger_id; raw.mkdir(parents=True)
         videos = output / "videos"; videos.mkdir(); (videos / "top.mp4").write_bytes(b"video")
         ledger_ids[str(row["attempt_id"])] = ledger_id
@@ -120,7 +121,7 @@ def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malf
         (raw / "episode.json").write_bytes(_canonical(episode))
         receipt = {
             "schema_version": 1, "attempt_id": ledger_id, "lease_id": lease.lease_id,
-            "worker_id": "worker", "session_id": "session", "seed": row["seed"], "garment": row["garment_name"],
+            "worker_id": "worker", "session_id": session_id, "seed": row["seed"], "garment": row["garment_name"],
             "episode_generation": index + 1, "output_dir": str(output), "action_horizon": 250,
             "outcome": {"success": all_success or index < 5, "metrics": []}, "simulation_device": "cpu", "cloth_device": "cpu",
             "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0",
@@ -186,6 +187,21 @@ def test_simple_summary_authenticates_accepted_finalizer_destination(tmp_path: P
     assert report["infrastructure_invalid_executions"] == 0
 
 
+def test_simple_summary_admits_worker_restart_with_a_fresh_session(tmp_path: Path) -> None:
+    summary = _module()
+    root, matrix, _rows, _ledger_ids = _simple_campaign(
+        tmp_path, session_for_index=lambda index: "session-after-restart" if index >= 50 else "session-before-restart",
+    )
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 100
+    assert report["infrastructure_invalid_executions"] == 0
+
+
 def test_simple_summary_rejects_forged_finalized_artifact_destination(tmp_path: Path) -> None:
     summary = _module()
     root, matrix, rows, ledger_ids = _simple_campaign(tmp_path)
@@ -235,6 +251,66 @@ def test_simple_summary_rejects_stale_receipt_copied_into_another_finalized_arti
 
     assert report["valid_outcomes"] < 100
     assert report["infrastructure_invalid_executions"] >= 1
+
+
+def test_simple_summary_rejects_semantically_valid_finalized_episode_with_stale_manifest(tmp_path: Path) -> None:
+    summary = _module()
+    root, matrix, rows, ledger_ids = _simple_campaign(tmp_path)
+    ledger_id = ledger_ids[str(rows[3]["attempt_id"])]
+    episode_path = root / "evaluation-terminal" / ledger_id / "raw" / ledger_id / "episode.json"
+    episode = json.loads(episode_path.read_text(encoding="utf-8"))
+    episode["audit_note"] = "tampered-after-finalization"
+    episode_path.write_bytes(_canonical(episode))
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 99
+    assert report["infrastructure_invalid_executions"] == 1
+
+
+@pytest.mark.parametrize("case", [
+    "missing", "malformed", "duplicate", "nonfinite", "noncanonical_hash", "traversal",
+    "missing_entry", "extra_file", "symlink",
+])
+def test_simple_summary_rejects_invalid_finalized_checksum_manifest(tmp_path: Path, case: str) -> None:
+    summary = _module()
+    root, matrix, rows, ledger_ids = _simple_campaign(tmp_path)
+    ledger_id = ledger_ids[str(rows[3]["attempt_id"])]
+    destination = root / "evaluation-terminal" / ledger_id
+    manifest_path = destination / "SHA256SUMS.json"
+    if case == "missing":
+        manifest_path.unlink()
+    elif case == "malformed":
+        manifest_path.write_text("{broken", encoding="utf-8")
+    elif case == "duplicate":
+        manifest_path.write_text('{"worker-receipt.json":{},"worker-receipt.json":{}}', encoding="utf-8")
+    elif case == "nonfinite":
+        manifest_path.write_text('{"worker-receipt.json":{"sha256":NaN,"size":1}}', encoding="utf-8")
+    elif case == "noncanonical_hash":
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["worker-receipt.json"]["sha256"] = "A" * 64
+        manifest_path.write_bytes(_canonical(manifest))
+    elif case == "traversal":
+        manifest_path.write_text('{"../worker-receipt.json":{"sha256":"' + "a" * 64 + '","size":1}}', encoding="utf-8")
+    elif case == "missing_entry":
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.pop("worker-receipt.json")
+        manifest_path.write_bytes(_canonical(manifest))
+    elif case == "extra_file":
+        (destination / "extra-evidence.bin").write_bytes(b"unexpected")
+    else:
+        (destination / "unsafe-evidence").symlink_to(destination / "worker-receipt.json")
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 99
+    assert report["infrastructure_invalid_executions"] == 1
 
 
 def test_simple_summary_rejects_symlinked_finalized_artifact_ancestor(tmp_path: Path) -> None:

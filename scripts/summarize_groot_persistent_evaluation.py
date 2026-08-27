@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import sqlite3
 from typing import Mapping
@@ -197,6 +198,52 @@ def _simple_json_object(path: Path, label: str, *, campaign_root: Path) -> dict[
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
     return value
+
+
+def _verify_simple_finalized_manifest(destination: Path, *, campaign_root: Path) -> None:
+    """Verify the complete JSON checksum manifest emitted by ArtifactFinalizationQueue."""
+
+    manifest_name = "SHA256SUMS.json"
+    manifest_path = destination / manifest_name
+    manifest = _simple_json_object(manifest_path, manifest_name, campaign_root=campaign_root)
+    actual: dict[str, Path] = {}
+    pending = [destination]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            raise ValueError("finalized artifact directory is unreadable") from error
+        for entry in entries:
+            path = Path(entry.path)
+            if entry.is_symlink():
+                raise ValueError("finalized artifact contains a symlink")
+            relative = path.relative_to(destination).as_posix()
+            if entry.is_dir(follow_symlinks=False):
+                pending.append(path)
+            elif entry.is_file(follow_symlinks=False):
+                if relative != manifest_name:
+                    actual[relative] = path
+            else:
+                raise ValueError("finalized artifact contains non-regular evidence")
+    expected: dict[str, tuple[str, int]] = {}
+    for relative, entry in manifest.items():
+        path = PurePosixPath(relative) if isinstance(relative, str) else None
+        if (
+            path is None or not relative or path.is_absolute() or "." in path.parts or ".." in path.parts
+            or relative == manifest_name or not isinstance(entry, Mapping) or set(entry) != {"sha256", "size"}
+            or not isinstance(entry["sha256"], str) or _SHA256.fullmatch(entry["sha256"]) is None
+            or type(entry["size"]) is not int or entry["size"] < 0
+        ):
+            raise ValueError("finalized artifact manifest entry is invalid")
+        expected[relative] = (entry["sha256"], entry["size"])
+    if set(expected) != set(actual):
+        raise ValueError("finalized artifact manifest coverage is invalid")
+    for relative, path in actual.items():
+        digest, size = expected[relative]
+        _simple_evidence_file(path, campaign_root=campaign_root, label="finalized manifest evidence")
+        if path.stat().st_size != size or _sha256_file(path) != digest:
+            raise ValueError("finalized artifact manifest hash mismatch")
 
 
 def _simple_fidelity(episode: Mapping[str, object]) -> dict[str, bool]:
@@ -392,9 +439,16 @@ def _build_simple_first_hundred_report(
         register_evidence_path(episode_path.parent.parent, key)
         register_evidence_path(episode_path, key)
         register_evidence_path(receipt_path, key)
+    def invalid_evidence_key(reason: str, relative: str) -> tuple[object, ...]:
+        parts = PurePosixPath(relative).parts
+        for length in range(len(parts), 0, -1):
+            bound = evidence_execution_keys.get(PurePosixPath(*parts[:length]).as_posix())
+            if bound is not None:
+                return bound
+        return ("evidence", reason, relative)
+
     invalid_evidence_keys = {
-        evidence_execution_keys.get(relative, ("evidence", reason, relative))
-        for reason, relative in invalid_evidence
+        invalid_evidence_key(reason, relative) for reason, relative in invalid_evidence
     }
     invalid_executions.update(invalid_evidence_keys)
     invalid_executions.update(("unbound-episode", ledger_id) for ledger_id in episodes if ledger_id not in assignments)
@@ -424,6 +478,9 @@ def _build_simple_first_hundred_report(
             terminal_lease, terminal_worker, raw_artifact_id = pending_evidence
             expected_episode_path, expected_receipt_path = _simple_finalized_paths(
                 campaign_root, ledger_id, event, terminal_payload,
+            )
+            _verify_simple_finalized_manifest(
+                expected_episode_path.parents[2], campaign_root=campaign_root,
             )
             episode = _simple_json_object(expected_episode_path, "episode.json", campaign_root=campaign_root)
             receipt = _simple_json_object(expected_receipt_path, "worker-receipt.json", campaign_root=campaign_root)
