@@ -145,6 +145,8 @@ for relative in ("source/lehome", "scripts", "rollout_appliance"):
     tree = root / relative
     if tree.is_symlink() or not tree.is_dir(): raise SystemExit("simple curriculum code root is unsafe")
     for path in sorted(tree.rglob("*")):
+        if "__pycache__" in path.parts or path.suffix == ".pyc" or path.name == ".DS_Store":
+            continue
         if path.is_symlink(): raise SystemExit("simple curriculum code root contains a symlink")
         if path.is_file():
             mode = path.stat().st_mode
