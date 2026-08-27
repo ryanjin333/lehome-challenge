@@ -419,21 +419,26 @@ class PersistentRolloutWorker:
         self._episode_generation = reported
         return reported
 
-    def _wait_for_source_finalization(self, *, attempt_id: str) -> str:
-        """Require finalization before this paid source worker can lease again."""
+    def _wait_for_terminal_finalization(
+        self, *, attempt_id: str, allow_retryable: bool,
+    ) -> str:
+        """Require finalization before a gated worker can lease again."""
 
         deadline = monotonic() + self._source_finalization_timeout_seconds
+        context = "exact partition" if allow_retryable else "source discovery"
         while True:
             status = self._controller.status(attempt_id)
             if status in {"accepted", "rejected"}:
                 return status
+            if status == "retryable" and allow_retryable:
+                return status
             if status == "infrastructure_abort":
-                raise RuntimeError("source discovery finalization infrastructure abort")
+                raise RuntimeError(f"{context} finalization infrastructure abort")
             if status != "terminal_pending_validation":
-                raise RuntimeError(f"source discovery finalization reached unexpected state: {status!r}")
+                raise RuntimeError(f"{context} finalization reached unexpected state: {status!r}")
             remaining = deadline - monotonic()
             if remaining <= 0:
-                raise RuntimeError("source discovery finalization timeout")
+                raise RuntimeError(f"{context} finalization timeout")
             sleep(min(_SOURCE_FINALIZATION_POLL_SECONDS, remaining))
 
     def run(self, *, max_episodes: int | None = None) -> list[dict[str, object]]:
@@ -663,8 +668,13 @@ class PersistentRolloutWorker:
                 self._controller.record_terminal(
                     self.identity.worker_id, attempt_id, lease_id, str(output_dir)
                 )
-                if _is_source_discovery_assignment(assignment):
-                    self._wait_for_source_finalization(attempt_id=attempt_id)
+                if _is_source_discovery_assignment(assignment) or self._simple_curriculum_collection:
+                    finalization_status = self._wait_for_terminal_finalization(
+                        attempt_id=attempt_id,
+                        allow_retryable=self._simple_curriculum_collection,
+                    )
+                    if finalization_status == "retryable":
+                        continue
                 receipts.append(receipt)
         finally:
             session.close()

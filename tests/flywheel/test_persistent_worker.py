@@ -131,6 +131,79 @@ def test_source_discovery_waits_for_clean_rejection_then_reuses_the_same_session
     assert controller.status_calls == ["attempt-a", "attempt-a", "attempt-b"]
 
 
+def test_exact_partition_redrains_a_row_retried_by_the_late_finalizer(tmp_path) -> None:
+    """A worker must not exit while its exact-mode handoff can still be requeued."""
+
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    ledger = TaskLedger(
+        tmp_path / "ledger.sqlite3",
+        attempt_matrix=[{
+            "attempt_id": "attempt-a", "garment": "Top_Long_Seen_0", "seed": 11,
+        }],
+        max_attempts=2,
+        target_accepted=1,
+        completion_metric="terminal_outcomes",
+        clock_ns=lambda: 1,
+    )
+
+    class LateFinalizerRetryController:
+        def __init__(self) -> None:
+            self.status_calls: list[str] = []
+            self.completed: list[tuple[str, str, str, str]] = []
+
+        def lease_next(self, worker_id: str):
+            return ledger.lease_next(worker_id, lease_duration_ns=10**18)
+
+        def heartbeat(self, worker_id: str, attempt_id: str, lease_id: str):
+            return ledger.heartbeat(
+                worker_id, attempt_id, lease_id, lease_duration_ns=10**18,
+            )
+
+        def record_terminal(
+            self, worker_id: str, attempt_id: str, lease_id: str, raw_artifact_id: str,
+        ):
+            self.completed.append((worker_id, attempt_id, lease_id, raw_artifact_id))
+            return ledger.record_terminal(worker_id, attempt_id, lease_id, raw_artifact_id)
+
+        def status(self, attempt_id: str) -> str:
+            self.status_calls.append(attempt_id)
+            if len(self.status_calls) == 1:
+                return ledger.status(attempt_id)
+            if len(self.status_calls) == 2:
+                return ledger.retry_terminal_infrastructure(
+                    attempt_id, reason="malformed_handoff",
+                )
+            return ledger.validate_terminal(attempt_id, "rejected")
+
+    controller = LateFinalizerRetryController()
+    session = FakeSession()
+    immutable_attempt_id = ledger.attempts()[0].attempt_id
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+        simple_curriculum_collection=True,
+    )
+
+    try:
+        receipts = worker.run()
+
+        assert session.runs == [immutable_attempt_id, immutable_attempt_id]
+        assert len({item[2] for item in controller.completed}) == 2
+        assert controller.status_calls == [immutable_attempt_id] * 3
+        assert [receipt["lease_id"] for receipt in receipts] == [controller.completed[1][2]]
+        assert [event.event_type for event in ledger.events()] == [
+            "leased", "terminal_pending_validation", "retryable",
+            "leased", "terminal_pending_validation", "rejected", "campaign_ended",
+        ]
+        assert ledger.completion_count == 1
+        assert ledger.is_terminal is True
+    finally:
+        ledger.close()
+
+
 def test_policy_action_safety_rejection_durably_rejects_source_lease_and_continues(
     tmp_path,
 ) -> None:
