@@ -98,6 +98,8 @@ def _atomic_write(path: Path, payload: bytes) -> None:
 def _emit(*, output: Path, receipt: Path, rows: list[dict[str, object]], parameters: Mapping[str, object]) -> None:
     _safe_absent(output, label="output")
     _safe_absent(receipt, label="receipt")
+    if output.resolve(strict=False) == receipt.resolve(strict=False):
+        raise ValueError("output and receipt paths must be distinct")
     output_payload = _canonical_bytes(rows)
     receipt_payload = _canonical_bytes({
         "schema_version": 1,
@@ -121,6 +123,8 @@ def _parser() -> argparse.ArgumentParser:
     curriculum = commands.add_parser("build-curriculum")
     curriculum.add_argument("--report", type=Path, required=True)
     curriculum.add_argument("--calibration-matrix", type=Path, required=True)
+    curriculum.add_argument("--approved-catalog", type=Path, required=True)
+    curriculum.add_argument("--policy-identity", type=Path, required=True)
     curriculum.add_argument("--rng-seed", type=int, required=True)
     curriculum.add_argument("--output", type=Path, required=True)
     curriculum.add_argument("--receipt", type=Path, required=True)
@@ -139,11 +143,18 @@ def main(argv: list[str] | None = None) -> int:
         else:
             report = _strict_json(args.report, label="report")
             calibration = _strict_json(args.calibration_matrix, label="calibration matrix")
-            rows = build_curriculum_rows(report, calibration_rows=calibration, count=600, rng_seed=args.rng_seed)
+            approved_catalog = _strict_json(args.approved_catalog, label="approved catalog")
+            policy_identity = _strict_json(args.policy_identity, label="policy identity")
+            rows = build_curriculum_rows(
+                report, calibration_rows=calibration, count=600, rng_seed=args.rng_seed,
+                policy_identity=policy_identity, catalog=approved_catalog,
+            )
             _emit(output=args.output, receipt=args.receipt, rows=rows, parameters={
                 "command": args.command,
                 "report_sha256": sha256(_canonical_bytes(report)).hexdigest(),
                 "calibration_matrix_sha256": sha256(_canonical_bytes(calibration)).hexdigest(),
+                "approved_catalog": approved_catalog,
+                "policy_identity": policy_identity,
                 "rng_seed": args.rng_seed,
                 "count": 600,
             })

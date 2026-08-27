@@ -27,10 +27,10 @@ POLICY_IDENTITY = {
 
 def _catalog() -> dict[str, list[str]]:
     return {
-        "top_long": [f"Top_Long_Seen_{index}" for index in range(1, 11)],
-        "top_short": [f"Top_Short_Seen_{index}" for index in range(1, 11)],
-        "pant_long": [f"Pant_Long_Seen_{index}" for index in range(1, 11)],
-        "pant_short": [f"Pant_Short_Seen_{index}" for index in range(1, 11)],
+        "top_long": [f"Top_Long_Seen_{index}" for index in range(10)],
+        "top_short": [f"Top_Short_Seen_{index}" for index in range(10)],
+        "pant_long": [f"Pant_Long_Seen_{index}" for index in range(10)],
+        "pant_short": [f"Pant_Short_Seen_{index}" for index in range(10)],
     }
 
 
@@ -99,10 +99,16 @@ def test_curriculum_builder_authenticates_and_samples_deterministically() -> Non
         policy_identity=POLICY_IDENTITY,
         catalog=_catalog(),
     )
-    rows = build_curriculum_rows(report, calibration_rows=calibration, count=600, rng_seed=1234)
+    rows = build_curriculum_rows(
+        report, calibration_rows=calibration, count=600, rng_seed=1234,
+        policy_identity=POLICY_IDENTITY, catalog=_catalog(),
+    )
 
     assert len(rows) == 600
-    assert rows == build_curriculum_rows(report, calibration_rows=calibration, count=600, rng_seed=1234)
+    assert rows == build_curriculum_rows(
+        report, calibration_rows=calibration, count=600, rng_seed=1234,
+        policy_identity=POLICY_IDENTITY, catalog=_catalog(),
+    )
     assert len({row["attempt_id"] for row in rows}) == 600
     assert len({row["trial_id"] for row in rows}) == 600
     assert len({row["seed"] for row in rows}) == 600
@@ -138,3 +144,69 @@ def test_calibration_report_fails_closed_on_bad_authentication(mutator, message:
             policy_identity=POLICY_IDENTITY,
             catalog=_catalog(),
         )
+
+
+def test_catalog_accepts_seen_zero_and_rejects_seen_ten() -> None:
+    assert build_calibration_rows(_catalog(), seed_base=1)[0]["garment"] == "Top_Long_Seen_0"
+    invalid = _catalog()
+    invalid["top_long"][-1] = "Top_Long_Seen_10"
+
+    with pytest.raises(ValueError, match="unapproved"):
+        build_calibration_rows(invalid, seed_base=1)
+
+
+def test_curriculum_requires_externally_trusted_policy_and_catalog() -> None:
+    catalog = _catalog()
+    calibration = build_calibration_rows(catalog, seed_base=90_000)
+    forged_policy = {**POLICY_IDENTITY, "policy_artifact_sha256": "c" * 64}
+    forged_report = _report(calibration)
+    forged_report["policy_identity"] = forged_policy
+    forged_report["authenticated_policy_identity"] = forged_policy
+    forged_catalog = _catalog()
+    forged_catalog["top_long"] = list(reversed(forged_catalog["top_long"]))
+    forged_calibration = build_calibration_rows(forged_catalog, seed_base=90_000)
+    forged_catalog_report = _report(forged_calibration, catalog=forged_catalog)
+
+    with pytest.raises(ValueError, match="policy identity"):
+        build_curriculum_rows(
+            forged_report, calibration_rows=calibration, count=600, rng_seed=3,
+            policy_identity=POLICY_IDENTITY, catalog=catalog,
+        )
+    with pytest.raises(ValueError, match="catalog"):
+        build_curriculum_rows(
+            forged_catalog_report, calibration_rows=forged_calibration, count=600, rng_seed=3,
+            policy_identity=POLICY_IDENTITY, catalog=catalog,
+        )
+
+
+class _ScriptedRng:
+    def __init__(self, values: list[int], *, pick_last: bool = False) -> None:
+        self.values = iter(values)
+        self.pick_last = pick_last
+        self.choice_calls: list[tuple[tuple[object, ...], tuple[float, ...]]] = []
+
+    def choices(self, population, *, weights, k):  # type: ignore[no-untyped-def]
+        assert k == 1
+        self.choice_calls.append((tuple(population), tuple(weights)))
+        return [population[-1] if self.pick_last else population[0]]
+
+    def randrange(self, _start, _stop):  # type: ignore[no-untyped-def]
+        return next(self.values)
+
+
+def test_curriculum_redraws_duplicate_seed_and_selects_category_then_garment() -> None:
+    catalog = _catalog()
+    calibration = build_calibration_rows(catalog, seed_base=90_000)
+    report = _report(calibration)
+    scripted = _ScriptedRng([0, 0, 1], pick_last=True)
+
+    rows = build_curriculum_rows(
+        report, calibration_rows=calibration, count=2, rng_seed=1,
+        policy_identity=POLICY_IDENTITY, catalog=catalog, rng_factory=lambda _seed: scripted,
+    )
+
+    assert [row["seed"] for row in rows] == [(1 << 63), (1 << 63) + 1]
+    assert len({row["seed"] for row in rows}) == 2
+    assert scripted.choice_calls[0][0] == ("top_long", "top_short", "pant_long", "pant_short")
+    assert scripted.choice_calls[1][0] == tuple(catalog["pant_short"])
+    assert scripted.choice_calls[0][1] != scripted.choice_calls[1][1]

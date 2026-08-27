@@ -15,10 +15,10 @@ SCRIPT = ROOT / "scripts" / "build_simple_curriculum_matrix.py"
 
 def _catalog() -> dict[str, list[str]]:
     return {
-        "top_long": [f"Top_Long_Seen_{index}" for index in range(1, 11)],
-        "top_short": [f"Top_Short_Seen_{index}" for index in range(1, 11)],
-        "pant_long": [f"Pant_Long_Seen_{index}" for index in range(1, 11)],
-        "pant_short": [f"Pant_Short_Seen_{index}" for index in range(1, 11)],
+        "top_long": [f"Top_Long_Seen_{index}" for index in range(10)],
+        "top_short": [f"Top_Short_Seen_{index}" for index in range(10)],
+        "pant_long": [f"Pant_Long_Seen_{index}" for index in range(10)],
+        "pant_short": [f"Pant_Short_Seen_{index}" for index in range(10)],
     }
 
 
@@ -139,12 +139,96 @@ def test_cli_rejects_nonfinite_json_before_curriculum_validation(tmp_path: Path)
     }
     report_path = tmp_path / "report.json"
     report_path.write_text(json.dumps(report, sort_keys=True, separators=(",", ":"))[:-1] + ",\"ignored_nonfinite\":1e999}\n", encoding="utf-8")
+    approved_catalog = tmp_path / "approved-catalog.json"
+    policy_identity = tmp_path / "policy-identity.json"
+    approved_catalog.write_text(json.dumps(catalog), encoding="utf-8")
+    policy_identity.write_text(json.dumps(_policy_identity()), encoding="utf-8")
 
     result = _run(
         "build-curriculum", "--report", str(report_path), "--calibration-matrix", str(calibration_path),
+        "--approved-catalog", str(approved_catalog), "--policy-identity", str(policy_identity),
         "--rng-seed", "4", "--output", str(tmp_path / "curriculum.json"),
         "--receipt", str(tmp_path / "curriculum.receipt.json"),
     )
 
     assert result.returncode != 0
     assert "malformed" in result.stderr
+
+
+def _policy_identity() -> dict[str, object]:
+    return {
+        "policy_repo": "ryanjin333/lehome-groot-n17-models",
+        "policy_revision": "a" * 40,
+        "policy_step": 12000,
+        "policy_artifact_sha256": "b" * 64,
+    }
+
+
+def _report(calibration: list[dict[str, object]], catalog: dict[str, list[str]]) -> dict[str, object]:
+    payload = (json.dumps(calibration, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    return {
+        "schema_version": 1,
+        "kind": "lehome_simple_curriculum_calibration_report_v1",
+        "authenticated": True,
+        "calibration_matrix_sha256": hashlib.sha256(payload).hexdigest(),
+        "policy_identity": _policy_identity(),
+        "authenticated_policy_identity": _policy_identity(),
+        "provenance": {"simulator_device": "cpu", "policy_device": "cuda:0"},
+        "catalog": catalog,
+        "outcomes": [
+            {"attempt_id": row["attempt_id"], "trial_id": row["trial_id"], "success": index % 2 == 0}
+            for index, row in enumerate(calibration)
+        ],
+    }
+
+
+def test_cli_builds_authenticated_curriculum_and_receipt(tmp_path: Path) -> None:
+    catalog = _catalog()
+    calibration = build_calibration_rows(catalog, seed_base=90_000)
+    calibration_path = tmp_path / "calibration.json"
+    report_path = tmp_path / "report.json"
+    approved_catalog = tmp_path / "approved-catalog.json"
+    policy_identity = tmp_path / "policy-identity.json"
+    output = tmp_path / "curriculum.json"
+    receipt = tmp_path / "curriculum.receipt.json"
+    calibration_payload = (json.dumps(calibration, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    calibration_path.write_bytes(calibration_payload)
+    report_path.write_text(json.dumps(_report(calibration, catalog)), encoding="utf-8")
+    approved_catalog.write_text(json.dumps(catalog), encoding="utf-8")
+    policy_identity.write_text(json.dumps(_policy_identity()), encoding="utf-8")
+
+    result = _run(
+        "build-curriculum", "--report", str(report_path), "--calibration-matrix", str(calibration_path),
+        "--approved-catalog", str(approved_catalog), "--policy-identity", str(policy_identity),
+        "--rng-seed", "4", "--output", str(output), "--receipt", str(receipt),
+    )
+
+    assert result.returncode == 0, result.stderr
+    output_payload = output.read_bytes()
+    bound_receipt = json.loads(receipt.read_text(encoding="utf-8"))
+    assert len(json.loads(output_payload)) == 600
+    assert bound_receipt["output_sha256"] == hashlib.sha256(output_payload).hexdigest()
+    assert bound_receipt["parameters"] == {
+        "calibration_matrix_sha256": hashlib.sha256(calibration_payload).hexdigest(),
+        "approved_catalog": catalog,
+        "command": "build-curriculum",
+        "count": 600,
+        "policy_identity": _policy_identity(),
+        "report_sha256": hashlib.sha256((json.dumps(_report(calibration, catalog), sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest(),
+        "rng_seed": 4,
+    }
+
+
+def test_cli_rejects_output_receipt_alias_without_creating_an_artifact(tmp_path: Path) -> None:
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(json.dumps(_catalog()), encoding="utf-8")
+    shared = tmp_path / "shared.json"
+
+    result = _run(
+        "build-calibration", "--catalog", str(catalog), "--seed-base", "1",
+        "--output", str(shared), "--receipt", str(shared),
+    )
+
+    assert result.returncode != 0
+    assert "distinct" in result.stderr
+    assert not shared.exists()

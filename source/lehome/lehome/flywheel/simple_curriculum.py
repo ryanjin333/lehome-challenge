@@ -8,16 +8,16 @@ import json
 import math
 import random
 import re
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 
 SIGMA = 0.233
 _CATEGORIES = ("top_long", "top_short", "pant_long", "pant_short")
 _GARMENT_PATTERNS = {
-    "top_long": re.compile(r"^Top_Long_Seen_[1-9][0-9]*$"),
-    "top_short": re.compile(r"^Top_Short_Seen_[1-9][0-9]*$"),
-    "pant_long": re.compile(r"^Pant_Long_Seen_[1-9][0-9]*$"),
-    "pant_short": re.compile(r"^Pant_Short_Seen_[1-9][0-9]*$"),
+    "top_long": re.compile(r"^Top_Long_Seen_[0-9]$"),
+    "top_short": re.compile(r"^Top_Short_Seen_[0-9]$"),
+    "pant_long": re.compile(r"^Pant_Long_Seen_[0-9]$"),
+    "pant_short": re.compile(r"^Pant_Short_Seen_[0-9]$"),
 }
 _MAX_SEED = 2**63 - 1
 
@@ -195,29 +195,58 @@ def _calibration_index(rows: object, *, catalog: tuple[tuple[str, tuple[str, ...
     return {str(row["attempt_id"]): row for row in expected}
 
 
+def _choose_weighted(items: Sequence[str], weights: Sequence[float], generator: object) -> str:
+    if not items or len(items) != len(weights) or any(not math.isfinite(weight) or weight <= 0 for weight in weights):
+        raise ValueError("weighted selection inputs are invalid")
+    choice = getattr(generator, "choices", None)
+    if not callable(choice):
+        raise ValueError("curriculum RNG is invalid")
+    selected = choice(items, weights=weights, k=1)
+    if not isinstance(selected, Sequence) or len(selected) != 1 or selected[0] not in items:
+        raise ValueError("curriculum RNG returned an invalid choice")
+    return str(selected[0])
+
+
+def _draw_unique_seed(generator: object, used: set[int], *, max_draws: int = 10_000) -> int:
+    draw = getattr(generator, "randrange", None)
+    if not callable(draw):
+        raise ValueError("curriculum RNG is invalid")
+    for _ in range(max_draws):
+        raw = draw(0, 1 << 63)
+        if type(raw) is not int or not 0 <= raw < 1 << 63:
+            raise ValueError("curriculum RNG returned an invalid seed")
+        seed = (1 << 63) + raw
+        if seed not in used:
+            used.add(seed)
+            return seed
+    raise ValueError("curriculum seed space exhausted")
+
+
 def build_curriculum_rows(
     report: object,
     *,
     calibration_rows: object,
     count: int,
     rng_seed: int,
+    policy_identity: object,
+    catalog: object,
+    rng_factory: Callable[[int], object] = random.Random,
 ) -> list[dict[str, object]]:
     """Sample an authenticated 600-row curriculum with an injected RNG seed."""
 
     if type(count) is not int or count < 1:
         raise ValueError("curriculum count must be a positive integer")
     rng_seed = _require_seed(rng_seed, field="rng_seed")
-    if not isinstance(report, Mapping):
-        raise ValueError("calibration report is invalid")
-    report_catalog = _catalog(report.get("catalog"))
-    calibration = _calibration_index(calibration_rows, catalog=report_catalog)
+    expected_catalog = _catalog(catalog)
+    expected_policy = _require_policy_identity(policy_identity)
     matrix_sha = _matrix_sha256(calibration_rows)
     validated = validate_calibration_report(
         report,
         matrix_sha256=matrix_sha,
-        policy_identity=report.get("policy_identity"),
-        catalog=_catalog_document(report_catalog),
+        policy_identity=expected_policy,
+        catalog=_catalog_document(expected_catalog),
     )
+    calibration = _calibration_index(calibration_rows, catalog=expected_catalog)
     outcomes = validated["outcomes"]
     assert isinstance(outcomes, list)
     outcome_by_attempt = {str(outcome["attempt_id"]): outcome for outcome in outcomes}
@@ -232,19 +261,20 @@ def build_curriculum_rows(
         category_successes[str(row["category"])].append(success)
     garment_rates = {garment: sum(values) / len(values) for garment, values in successes.items()}
     category_rates = {category: sum(values) / len(values) for category, values in category_successes.items()}
-    catalog_by_category = dict(report_catalog)
+    catalog_by_category = dict(expected_catalog)
     category_weights = [type_weight(category_rates[category]) for category in _CATEGORIES]
-    generator = random.Random(rng_seed)
+    generator = rng_factory(rng_seed)
     calibration_attempt_ids = set(calibration)
     calibration_trial_ids = {str(row["trial_id"]) for row in calibration.values()}
     calibration_seeds = {int(row["seed"]) for row in calibration.values()}
+    used_seeds = set(calibration_seeds)
     rows: list[dict[str, object]] = []
     for index in range(count):
-        category = generator.choices(_CATEGORIES, weights=category_weights, k=1)[0]
+        category = _choose_weighted(_CATEGORIES, category_weights, generator)
         garments = catalog_by_category[category]
         garment_weights = [garment_weight(garment_rates[garment]) for garment in garments]
-        garment = generator.choices(garments, weights=garment_weights, k=1)[0]
-        seed = (1 << 63) + generator.randrange(0, 1 << 63)
+        garment = _choose_weighted(garments, garment_weights, generator)
+        seed = _draw_unique_seed(generator, used_seeds)
         attempt_id = f"curriculum-{index:04d}"
         trial_id = f"curriculum-trial-{index:04d}"
         if attempt_id in calibration_attempt_ids or trial_id in calibration_trial_ids or seed in calibration_seeds:
