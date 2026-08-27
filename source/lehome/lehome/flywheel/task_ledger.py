@@ -371,7 +371,9 @@ class TaskLedger:
                 or type(generation) is not int or generation < 1
                 or not isinstance(fidelity, Mapping) or set(fidelity) != fields
                 or any(type(fidelity[field]) is not bool for field in fields)
-                or fidelity[fidelity_code] is not True):
+                or fidelity[fidelity_code] is not True
+                or fidelity["monitor_active"] is not True
+                or fidelity["monitor_observed"] is not True):
             raise ValueError("fidelity abort evidence is invalid")
         runtime_fields = {"simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device"}
         if (

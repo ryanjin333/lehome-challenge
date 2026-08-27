@@ -102,7 +102,11 @@ def evaluate_gate(report: Mapping[str, object]) -> GateDecision:
         if not isinstance(trial, Mapping):
             raise ValueError("trial is invalid")
         fidelity = trial.get("fidelity")
-        if not isinstance(fidelity, Mapping) or any(type(fidelity.get(field)) is not bool for field in _FIDELITY_FIELDS):
+        if (
+            not isinstance(fidelity, Mapping) or set(fidelity) != set(_FIDELITY_MONITOR_FIELDS)
+            or any(type(fidelity.get(field)) is not bool for field in _FIDELITY_MONITOR_FIELDS)
+            or fidelity["monitor_active"] is not True or fidelity["monitor_observed"] is not True
+        ):
             raise ValueError("trial fidelity is invalid")
         if any(fidelity[field] for field in _FIDELITY_FIELDS):
             return GateDecision("fidelity_stop", "episode_fidelity")
@@ -347,7 +351,11 @@ def _authenticate_report(report: object, *, report_bytes: bytes, matrix_rows: li
                 or not all(isinstance(device, str) and re.fullmatch(r"cuda:[0-9]+", device) for device in (renderer, camera, policy_device))
                 or len({renderer, camera, policy_device}) != 1):
             raise ValueError("report device provenance is invalid")
-        if any(type(fidelity.get(key)) is not bool for key in _FIDELITY_FIELDS):
+        if (
+            set(fidelity) != set(_FIDELITY_MONITOR_FIELDS)
+            or any(type(fidelity.get(key)) is not bool for key in _FIDELITY_MONITOR_FIELDS)
+            or fidelity["monitor_active"] is not True or fidelity["monitor_observed"] is not True
+        ):
             raise ValueError("report fidelity evidence is invalid")
         by_id[assignment_id] = trial
         runtime.add(_runtime_identity(identity, provenance))

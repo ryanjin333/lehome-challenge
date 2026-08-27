@@ -32,7 +32,7 @@ def _report(*, valid_outcomes: int = 100, invalid: int = 0, successes: int = 5,
         "execution_count": valid_outcomes + invalid,
         "official_successes": successes,
         "runtime_identities": list(runtime_identities),
-        "gate_trials": [{"fidelity": fidelity or {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False}}],
+        "gate_trials": [{"fidelity": fidelity or {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": True, "monitor_observed": True}}],
         "safety_failure": False,
     }
 
@@ -57,7 +57,7 @@ def test_decision_model_refuses_unapproved_decision_reason_pairs() -> None:
 @pytest.mark.parametrize("field", ["missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure"])
 def test_gate_stops_for_every_episode_fidelity_failure(field: str) -> None:
     gate = _module()
-    fidelity = {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False}
+    fidelity = {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": True, "monitor_observed": True}
     fidelity[field] = True
 
     decision = gate.evaluate_gate(_report(fidelity=fidelity))
@@ -70,6 +70,17 @@ def test_gate_stops_for_authenticated_aggregate_safety_failure() -> None:
     report = _report(); report["safety_failure"] = True
 
     assert gate.evaluate_gate(report).as_dict() == {"decision": "fidelity_stop", "reason": "episode_fidelity"}
+
+
+@pytest.mark.parametrize("fidelity", [
+    {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": True},
+    {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": False, "monitor_observed": True},
+])
+def test_gate_rejects_incomplete_or_unobserved_terminal_fidelity(fidelity: dict[str, bool]) -> None:
+    gate = _module()
+
+    with pytest.raises(ValueError, match="fidelity"):
+        gate.evaluate_gate(_report(fidelity=fidelity))
 
 
 def test_gate_stops_fidelity_first_for_typed_preframe_failure() -> None:
@@ -181,7 +192,7 @@ def _authenticated_report(rows: list[dict[str, object]], *, invalid: int = 0, su
                 "official_success": index < successes,
                 "identity": {**POLICY, "code_revision": "c" * 40, "asset_revision": "a" * 40, "simulator_version": "5.1.0.0"},
                 "provenance": provenance,
-                "fidelity": {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False},
+                "fidelity": {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": True, "monitor_observed": True},
             }
             for index, row in enumerate(rows)
         ],

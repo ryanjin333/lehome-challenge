@@ -98,7 +98,6 @@ def test_record_fidelity_abort_writes_typed_terminal_payload(ledger) -> None:
         "nonfinite_cloth_state": False, "safety_failure": False,
         "monitor_active": True, "monitor_observed": True,
     }
-
     assert ledger.record_fidelity_abort(
         "worker-a", lease.attempt.attempt_id, lease.lease_id,
         session_id="session-a", generation=3, fidelity_code="missing_cloth", fidelity=fidelity,
@@ -114,6 +113,27 @@ def test_record_fidelity_abort_writes_typed_terminal_payload(ledger) -> None:
         "runtime": {"simulation_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0"},
     }
 
+
+@pytest.mark.parametrize("field", ["monitor_active", "monitor_observed"])
+def test_record_fidelity_abort_refuses_unobserved_monitors_without_writing(ledger, field: str) -> None:
+    lease = ledger.lease_next("worker-a", lease_duration_ns=100)
+    assert lease is not None
+    fidelity = {
+        "missing_cloth": True, "cloth_flight": False,
+        "nonfinite_cloth_state": False, "safety_failure": False,
+        "monitor_active": True, "monitor_observed": True,
+    }
+    fidelity[field] = False
+    before = ledger.events(lease.attempt.attempt_id)
+
+    with pytest.raises(ValueError, match="fidelity"):
+        ledger.record_fidelity_abort(
+            "worker-a", lease.attempt.attempt_id, lease.lease_id,
+            session_id="session-a", generation=1, fidelity_code="missing_cloth", fidelity=fidelity,
+            runtime={"simulation_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0"},
+        )
+
+    assert ledger.events(lease.attempt.attempt_id) == before
 
 def test_lease_and_heartbeat_reject_expiry_past_sqlite_signed_integer_without_writing_events(tmp_path) -> None:
     from lehome.flywheel.task_ledger import TaskLedger

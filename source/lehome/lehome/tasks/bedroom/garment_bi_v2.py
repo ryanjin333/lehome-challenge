@@ -39,15 +39,6 @@ from lehome.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-class _ClothHealthReadbackError(RuntimeError):
-    """Carries a measured cloth-health category without parsing exception text."""
-
-    def __init__(self, category: str, *, nonfinite_count: int = 0) -> None:
-        super().__init__(category)
-        self.category = category
-        self.nonfinite_count = nonfinite_count
-
-
 class GarmentEnv(DirectRLEnv):
     cfg: GarmentEnvCfg
 
@@ -982,14 +973,20 @@ class GarmentEnv(DirectRLEnv):
                 f"velocities_shape={local_velocities.shape} expected_shape=Nx3"
             )
         if local_positions.shape[0] == 0:
-            raise _ClothHealthReadbackError("missing_cloth")
+            error = RuntimeError("garment PhysX cloth readback has no particles")
+            error.category = "missing_cloth"  # type: ignore[attr-defined]
+            raise error
         positions_nonfinite_count = int(np.size(local_positions) - np.isfinite(local_positions).sum())
         velocities_nonfinite_count = int(np.size(local_velocities) - np.isfinite(local_velocities).sum())
         if positions_nonfinite_count or velocities_nonfinite_count:
-            raise _ClothHealthReadbackError(
-                "nonfinite_cloth_state",
-                nonfinite_count=positions_nonfinite_count + velocities_nonfinite_count,
+            error = RuntimeError(
+                "garment PhysX cloth readback is nonfinite: "
+                f"positions_nonfinite_count={positions_nonfinite_count} "
+                f"velocities_nonfinite_count={velocities_nonfinite_count}"
             )
+            error.category = "nonfinite_cloth_state"  # type: ignore[attr-defined]
+            error.nonfinite_count = positions_nonfinite_count + velocities_nonfinite_count  # type: ignore[attr-defined]
+            raise error
         return local_positions.copy(), local_velocities.copy()
 
     @staticmethod
@@ -1480,7 +1477,7 @@ class GarmentEnv(DirectRLEnv):
                 },
             }
 
-        if self.object is None:
+        if hasattr(self, "object") and self.object is None:
             return receipt(
                 missing=True, healthy=False, reason="cloth_physical_state_unavailable",
                 metric_name="cloth_prim", metric_value="missing", metric_limit="present",
@@ -1498,19 +1495,21 @@ class GarmentEnv(DirectRLEnv):
                 positions, velocities = self._flywheel_legacy_cpu_cloth_state()
             else:
                 positions, velocities = self._flywheel_physics_cloth_state()
-        except _ClothHealthReadbackError as error:
-            return receipt(
-                missing=error.category == "missing_cloth",
-                nonfinite=error.category == "nonfinite_cloth_state",
-                healthy=False, reason=error.category, metric_name="cloth_state_readback",
-                metric_value=error.nonfinite_count if error.nonfinite_count else error.category,
-                metric_limit="nonempty_finite_aligned_nx3",
-            )
         except (RuntimeError, TypeError, ValueError) as error:
+            category = getattr(error, "category", None)
+            if category in {"missing_cloth", "nonfinite_cloth_state"}:
+                nonfinite_count = getattr(error, "nonfinite_count", 0)
+                return receipt(
+                    missing=category == "missing_cloth",
+                    nonfinite=category == "nonfinite_cloth_state",
+                    healthy=False, reason=category, metric_name="cloth_state_readback",
+                    metric_value=nonfinite_count if nonfinite_count else category,
+                    metric_limit="nonempty_finite_aligned_nx3",
+                )
             return receipt(
-                observed=False, healthy=False, reason="cloth_state_readback_unavailable",
-                metric_name="cloth_state_readback", metric_value=type(error).__name__,
-                metric_limit="observable",
+                observed=False, healthy=False, reason="simulator_numerical_divergence",
+                metric_name="cloth_state_readback", metric_value=str(error) or type(error).__name__,
+                metric_limit="finite_aligned_nx3",
             )
 
         def _config_get(value, key, default):
@@ -1574,7 +1573,7 @@ class GarmentEnv(DirectRLEnv):
         if exceeded_metrics:
             return receipt(
                 flight=True,
-                healthy=False, reason="cloth_flight", max_position_m=max_position_m,
+                healthy=False, reason="simulator_numerical_divergence", max_position_m=max_position_m,
                 max_extent_m=max_extent_m, max_velocity_mps=max_velocity_mps,
                 max_position_limit_m=max_position_limit_m, max_extent_limit_m=max_extent_limit_m,
                 max_velocity_limit_mps=max_velocity_limit_mps, exceeded_metrics=exceeded_metrics,

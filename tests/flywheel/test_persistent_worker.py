@@ -225,6 +225,52 @@ def test_preframe_fidelity_failure_is_a_typed_ledger_abort(tmp_path) -> None:
     ]
 
 
+def test_marker_false_downgrades_a_structured_fidelity_error_to_generic_infrastructure_abort(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import FidelityFailureError, PersistentRolloutWorker
+
+    class MissingClothSession(FakeSession):
+        def run_episode(self, **kwargs):
+            raise FidelityFailureError(
+                "missing_cloth",
+                {
+                    "missing_cloth": True, "cloth_flight": False,
+                    "nonfinite_cloth_state": False, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+            )
+
+    controller = SourceController(
+        [Lease(Attempt("attempt-a", _source_assignment(11)), "lease-a")], {},
+    )
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=MissingClothSession, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0", simple_curriculum_collection=False,
+    )
+
+    with pytest.raises(RuntimeError, match="source discovery infrastructure abort"):
+        worker.run()
+
+    assert controller.infrastructure_aborts == [
+        ("worker-0", "attempt-a", "lease-a", "runtime_evidence_invalid"),
+    ]
+
+
+@pytest.mark.parametrize("field", ["monitor_active", "monitor_observed"])
+def test_fidelity_failure_error_refuses_unobserved_monitors(field: str) -> None:
+    from lehome.flywheel.persistent_worker import FidelityFailureError
+
+    fidelity = {
+        "missing_cloth": True, "cloth_flight": False,
+        "nonfinite_cloth_state": False, "safety_failure": False,
+        "monitor_active": True, "monitor_observed": True,
+    }
+    fidelity[field] = False
+
+    with pytest.raises(ValueError, match="fidelity failure evidence"):
+        FidelityFailureError("missing_cloth", fidelity)
+
+
 def test_source_discovery_runtime_infrastructure_abort_stops_before_the_second_lease(tmp_path) -> None:
     from lehome.flywheel.persistent_worker import PersistentRolloutWorker
 

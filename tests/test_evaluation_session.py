@@ -974,7 +974,11 @@ def test_collider_health_and_admission_gate_fail_closed_with_live_evidence() -> 
     env = types.SimpleNamespace(_flywheel_collider_health=None)
     env.flywheel_collider_health = types.MethodType(namespace["flywheel_collider_health"], env)
     health = namespace["flywheel_cloth_physical_health"](env)
-    assert health is collision_health
+    assert {key: health[key] for key in collision_health} == collision_health
+    assert health["fidelity"] == {
+        "missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False,
+        "monitor_active": True, "monitor_observed": False,
+    }
 
     evaluation_source_path = Path(__file__).resolve().parents[1] / "scripts/utils/evaluation.py"
     evaluation_tree = ast.parse(evaluation_source_path.read_text(encoding="utf-8"))
@@ -2418,6 +2422,9 @@ def _evaluation(monkeypatch):
     modules["lehome.flywheel.persistent_worker"].SimulatorNumericalDivergenceError = type(
         "SimulatorNumericalDivergenceError", (ValueError,), {}
     )
+    modules["lehome.flywheel.persistent_worker"].FidelityFailureError = type(
+        "FidelityFailureError", (ValueError,), {}
+    )
     modules["lehome.flywheel"].__path__ = [
         str(repository / "source" / "lehome" / "lehome" / "flywheel")
     ]
@@ -2708,12 +2715,21 @@ def test_cloth_physical_health_classifies_invalid_physx_readback_as_divergence()
     )
 
     health = namespace["flywheel_cloth_physical_health"](invalid)
-    assert health == {
+    assert {key: health[key] for key in (
+        "healthy", "reason", "metric_name", "metric_value", "metric_limit",
+    )} == {
         "healthy": False,
         "reason": "simulator_numerical_divergence",
         "metric_name": "cloth_state_readback",
         "metric_value": "garment PhysX cloth positions and velocities must be finite",
         "metric_limit": "finite_aligned_nx3",
+    }
+    assert health["fidelity"] == {
+        "missing_cloth": False,
+        "cloth_flight": False,
+        "nonfinite_cloth_state": False,
+        "monitor_active": True,
+        "monitor_observed": False,
     }
 
 
@@ -2807,7 +2823,7 @@ def test_flywheel_evaluation_checks_physical_health_before_success_or_recording(
     )
     loop_source = ast.get_source_segment(source, loop)
     assert loop_source is not None
-    health_index = loop_source.index("_require_flywheel_cloth_health(env)")
+    health_index = loop_source.index("_require_flywheel_cloth_health(")
     assert health_index > loop_source.index("stabilize_garment_after_reset(env, args)")
     assert health_index < loop_source.index("observation_dict = env._get_observations()")
     assert health_index < loop_source.index("env._get_success()")
@@ -3008,6 +3024,57 @@ def test_evaluation_session_explicit_reset_flag_preserves_legacy_per_episode_res
     session.run_episode(assignment={"garment": "shirt"}, policy=object(), reset_policy=False)
 
     assert reset_flags == [True, False]
+
+
+@pytest.mark.parametrize("marker", [False, True])
+def test_persistent_session_passes_simple_curriculum_marker_to_evaluation_loop(monkeypatch, marker: bool) -> None:
+    evaluation = _evaluation(monkeypatch)
+    captured = []
+    monkeypatch.setattr(evaluation, "run_evaluation_loop", lambda **kwargs: captured.append(kwargs) or [])
+    env = types.SimpleNamespace(device="cpu", cfg=types.SimpleNamespace())
+    args = types.SimpleNamespace(task="task", video_dir="video", eval_dataset_path="dataset")
+    session = evaluation.EvaluationSession(args, env=env, policy=object(), env_cfg=env.cfg)
+
+    session.run_episode(
+        assignment={"garment": "shirt", "simple_curriculum_collection": marker}, policy=object(),
+    )
+
+    assert captured[0]["simple_curriculum_collection"] is marker
+
+
+@pytest.mark.parametrize(
+    ("marker", "error_name"),
+    [(False, "SimulatorNumericalDivergenceError"), (True, "FidelityFailureError")],
+)
+def test_structured_cloth_failure_uses_typed_semantics_only_for_simple_curriculum(monkeypatch, marker: bool, error_name: str) -> None:
+    evaluation = _evaluation(monkeypatch)
+    health = {
+        "healthy": False,
+        "fidelity": {
+            "missing_cloth": True, "cloth_flight": False,
+            "nonfinite_cloth_state": False, "monitor_active": True, "monitor_observed": True,
+        },
+    }
+    env = types.SimpleNamespace(flywheel_cloth_physical_health=lambda: health)
+
+    with pytest.raises(getattr(evaluation, error_name)):
+        evaluation._require_flywheel_cloth_health(env, simple_curriculum_collection=marker)
+
+
+@pytest.mark.parametrize("field", ["monitor_active", "monitor_observed"])
+def test_simple_curriculum_cloth_failure_with_unobserved_monitor_is_generic_infrastructure(monkeypatch, field: str) -> None:
+    evaluation = _evaluation(monkeypatch)
+    fidelity = {
+        "missing_cloth": True, "cloth_flight": False,
+        "nonfinite_cloth_state": False, "monitor_active": True, "monitor_observed": True,
+    }
+    fidelity[field] = False
+    env = types.SimpleNamespace(flywheel_cloth_physical_health=lambda: {
+        "healthy": False, "fidelity": fidelity,
+    })
+
+    with pytest.raises(evaluation.SimulatorNumericalDivergenceError):
+        evaluation._require_flywheel_cloth_health(env, simple_curriculum_collection=True)
 
 
 def test_cpu_controlled_recovery_bootstrap_receives_a_source_seeded_reset_callback(monkeypatch, tmp_path) -> None:
@@ -4386,7 +4453,7 @@ def test_policy_action_diagnostics_are_sampled_before_each_step_and_bound_to_hea
     diagnostic_index = loop_source.index("_flywheel_policy_action_limit_diagnostics(env, action)")
     step_index = loop_source.index("env.step(action)")
     health_index = loop_source.index(
-        "_require_flywheel_cloth_health(\n                    env, policy_action_diagnostics=policy_action_diagnostics\n                )"
+        "_require_flywheel_cloth_health(\n                    env, policy_action_diagnostics=policy_action_diagnostics,\n                    simple_curriculum_collection=simple_curriculum_collection,\n                )"
     )
     assert diagnostic_index < step_index < health_index
 

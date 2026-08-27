@@ -133,9 +133,12 @@ def _require_flywheel_cloth_health(
     env: Any,
     *,
     policy_action_diagnostics: Mapping[str, object] | None = None,
+    simple_curriculum_collection: bool = False,
 ) -> Mapping[str, object]:
     """Stop a recording before numerical cloth divergence can become data."""
 
+    if type(simple_curriculum_collection) is not bool:
+        raise ValueError("simple_curriculum_collection must be a boolean")
     check = getattr(env, "flywheel_cloth_physical_health", None)
     if not callable(check):
         raise SimulatorNumericalDivergenceError(
@@ -147,7 +150,13 @@ def _require_flywheel_cloth_health(
         required = {
             "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "monitor_active", "monitor_observed",
         }
-        if isinstance(fidelity, Mapping) and set(fidelity) == required and all(type(fidelity[field]) is bool for field in required):
+        if (
+            simple_curriculum_collection and isinstance(fidelity, Mapping)
+            and set(fidelity) == required
+            and all(type(fidelity[field]) is bool for field in required)
+            and fidelity["monitor_active"] is True
+            and fidelity["monitor_observed"] is True
+        ):
             typed = {
                 "missing_cloth": fidelity["missing_cloth"], "cloth_flight": fidelity["cloth_flight"],
                 "nonfinite_cloth_state": fidelity["nonfinite_cloth_state"], "safety_failure": False,
@@ -802,6 +811,7 @@ class EvaluationSession:
             env=self.env, policy=self.policy, args=episode_args, ee_solver=self.ee_solver,
             is_bimanual=self.is_bimanual, garment_name=garment_name, reset_policy=reset_policy,
             cancellation_event=cancellation_event,
+            simple_curriculum_collection=simple_curriculum_collection,
         )
         if attempt_output_dir is not None:
             # The persistent worker validates this property immediately after
@@ -832,11 +842,14 @@ def run_evaluation_loop(
     garment_name: Optional[str] = None,
     reset_policy: bool = True,
     cancellation_event: Any = None,
+    simple_curriculum_collection: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Core evaluation loop.
     Refactored to be agnostic of specific model implementations.
     """
+    if type(simple_curriculum_collection) is not bool:
+        raise ValueError("simple_curriculum_collection must be a boolean")
 
     # --- Dataset Recording Setup (Optional) ---
     eval_dataset = None
@@ -1006,7 +1019,9 @@ def run_evaluation_loop(
                 provenance={"policy_artifact_sha256": flywheel_manifest["policy_artifact_sha256"], "image_identity": flywheel_manifest["image_identity"], "execution_mode": flywheel_manifest["execution_mode"], "execution_backend": flywheel_manifest["execution_backend"], "simulator_device": flywheel_manifest["simulator_device"], "policy_device": flywheel_manifest.get("policy_device"), "parity_stage": flywheel_manifest.get("parity_stage"), "strategy_sampled": dict(sampled.values), "strategy_receipt": dict(randomization_receipt), **({"controlled_recovery": dict(controlled_provenance)} if controlled_provenance is not None else {})},
                 simple_curriculum_collection=simple_curriculum_collection,
             )
-            reset_cloth_health = _require_flywheel_cloth_health(env)
+            reset_cloth_health = _require_flywheel_cloth_health(
+                env, simple_curriculum_collection=simple_curriculum_collection,
+            )
             reset_snapshot = capture_snapshot(env, randomization={"strategy": strategy, "sampled": dict(sampled.values), "receipt": dict(randomization_receipt)})
             recorder.record_snapshot("reset", reset_snapshot)
         if reset_policy:
@@ -1206,7 +1221,8 @@ def run_evaluation_loop(
             env.step(action)
             if recorder is not None:
                 cloth_health = _require_flywheel_cloth_health(
-                    env, policy_action_diagnostics=policy_action_diagnostics
+                    env, policy_action_diagnostics=policy_action_diagnostics,
+                    simple_curriculum_collection=simple_curriculum_collection,
                 )
                 if simple_curriculum_collection:
                     cloth_fidelity = cloth_health.get("fidelity")
@@ -1305,12 +1321,14 @@ def run_evaluation_loop(
             recorder.record_snapshot("terminal", capture_snapshot(env, randomization={"receipt": dict(randomization_receipt)}))
             if visible_contact is None:
                 raise RuntimeError("flywheel trial did not record simulator robot-garment contact evidence")
-            recorder.finish(
-                reason=terminal_reason,
-                accepted_success=bool(is_success),
-                visible_contact=visible_contact,
-                fidelity=fidelity if simple_curriculum_collection else None,
-            )
+            finish_kwargs = {
+                "reason": terminal_reason,
+                "accepted_success": bool(is_success),
+                "visible_contact": visible_contact,
+            }
+            if simple_curriculum_collection:
+                finish_kwargs["fidelity"] = fidelity
+            recorder.finish(**finish_kwargs)
 
         # Save Datasets
         if args.save_datasets:

@@ -58,6 +58,8 @@ class FidelityFailureError(InfrastructureInvalidAttemptError):
             or set(fidelity) != self._FIELDS
             or any(type(fidelity[field]) is not bool for field in self._FIELDS)
             or fidelity[fidelity_code] is not True
+            or fidelity["monitor_active"] is not True
+            or fidelity["monitor_observed"] is not True
         ):
             raise ValueError("fidelity failure evidence is invalid")
         self.fidelity_code = fidelity_code
@@ -548,7 +550,7 @@ class PersistentRolloutWorker:
                             reason=POLICY_ACTION_SAFETY_REJECTION_REASON,
                         )
                         continue
-                    if isinstance(error, FidelityFailureError):
+                    if isinstance(error, FidelityFailureError) and self._simple_curriculum_collection:
                         abort = getattr(self._controller, "record_fidelity_abort", None)
                         if not callable(abort):
                             raise RuntimeError("controller does not support durable fidelity abort") from error

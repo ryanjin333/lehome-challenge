@@ -40,7 +40,7 @@ def test_report_preserves_legacy_fields_and_adds_first_hundred_gate_metrics(tmp_
                     "simulator_device": "cpu", "cloth_device": "cpu",
                     "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0",
                 },
-                "fidelity": {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False},
+                "fidelity": {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": True, "monitor_observed": True},
             }
             for index in range(100)
         ],
@@ -114,7 +114,7 @@ def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malf
             "provenance": {"policy_artifact_sha256": POLICY["policy_artifact_sha256"], "simulator_device": "cpu", "policy_device": "cuda:0", "image_identity": "sha256:" + "d" * 64},
             "outcome": "success" if all_success or index < 5 else "timeout", "accepted_success": all_success or index < 5,
             "safety_failure": index == contradictory_safety,
-            "fidelity": {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False},
+            "fidelity": {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": True, "monitor_observed": True},
         }
         if episode_mutator is not None:
             episode_mutator(episode, index)
@@ -200,6 +200,28 @@ def test_simple_summary_admits_worker_restart_with_a_fresh_session(tmp_path: Pat
 
     assert report["valid_outcomes"] == 100
     assert report["infrastructure_invalid_executions"] == 0
+
+
+@pytest.mark.parametrize("fidelity", [
+    {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": False, "monitor_observed": True},
+    {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": True, "monitor_observed": False},
+    {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": True},
+])
+def test_simple_summary_rejects_incomplete_or_unobserved_terminal_fidelity(tmp_path: Path, fidelity: dict[str, bool]) -> None:
+    summary = _module()
+
+    def mutate(episode, index):
+        if index == 3:
+            episode["fidelity"] = fidelity
+    root, matrix, _rows, _ledger_ids = _simple_campaign(tmp_path, episode_mutator=mutate)
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 99
+    assert report["infrastructure_invalid_executions"] == 1
 
 
 def test_simple_summary_rejects_forged_finalized_artifact_destination(tmp_path: Path) -> None:

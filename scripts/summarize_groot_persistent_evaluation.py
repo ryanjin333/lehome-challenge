@@ -87,7 +87,15 @@ def _augment_first_hundred_metrics(report: Mapping[str, object]) -> dict[str, ob
                 or not isinstance(identity, Mapping) or not isinstance(provenance, Mapping)
                 or not isinstance(fidelity, Mapping)):
             raise ValueError("first-100 gate trial is invalid")
-        if any(type(fidelity.get(field)) is not bool for field in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure")):
+        fidelity_fields = {
+            "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure",
+            "monitor_active", "monitor_observed",
+        }
+        if (
+            set(fidelity) != fidelity_fields
+            or any(type(fidelity.get(field)) is not bool for field in fidelity_fields)
+            or fidelity["monitor_active"] is not True or fidelity["monitor_observed"] is not True
+        ):
             raise ValueError("first-100 fidelity evidence is invalid")
         assignment_ids.append(attempt_id)
         identities.add(_runtime_identity_digest(identity, provenance))
@@ -248,13 +256,20 @@ def _verify_simple_finalized_manifest(destination: Path, *, campaign_root: Path)
 
 def _simple_fidelity(episode: Mapping[str, object]) -> dict[str, bool]:
     fidelity = episode.get("fidelity")
-    fields = ("missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure")
-    if not isinstance(fidelity, Mapping) or any(type(fidelity.get(field)) is not bool for field in fields):
+    fields = (
+        "missing_cloth", "cloth_flight", "nonfinite_cloth_state", "safety_failure",
+        "monitor_active", "monitor_observed",
+    )
+    if (
+        not isinstance(fidelity, Mapping) or set(fidelity) != set(fields)
+        or any(type(fidelity.get(field)) is not bool for field in fields)
+        or fidelity["monitor_active"] is not True or fidelity["monitor_observed"] is not True
+    ):
         raise ValueError("simple curriculum episode fidelity evidence is invalid")
     aggregate = episode.get("safety_failure")
     if type(aggregate) is not bool or aggregate is not fidelity["safety_failure"]:
         raise ValueError("simple curriculum safety evidence is contradictory")
-    return {field: bool(fidelity[field]) for field in fields}
+    return {field: fidelity[field] for field in fields}
 
 
 def _simple_finalized_paths(
