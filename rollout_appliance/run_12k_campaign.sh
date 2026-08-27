@@ -712,7 +712,7 @@ docker run --rm --user 1234:1234 --network none \
   -v "${WORKSPACE}:/mnt/lehome" \
   -v "${SCRIPTS_HOST_MOUNT}:/opt/lehome/scripts:ro" \
   -v "${SOURCE_HOST_MOUNT}:/opt/lehome/source/lehome:ro" \
-  -v /opt/lehome/trainer/src:/opt/lehome/trainer/src:ro \
+  -v "${TRAINER_HOST_MOUNT}:/opt/lehome/trainer/src:ro" \
   -v "${APPLIANCE_HOST_MOUNT}:/opt/lehome/rollout_appliance:ro" \
   -e PYTHONPATH=/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome \
   --entrypoint /opt/lehome-challenge/.venv/bin/python \
@@ -742,7 +742,7 @@ if [ "${ENABLE_HF_UPLOAD}" = "1" ]; then
     -v "${WORKSPACE}:/mnt/lehome" \
     -v "${SCRIPTS_HOST_MOUNT}:/opt/lehome/scripts:ro" \
     -v "${SOURCE_HOST_MOUNT}:/opt/lehome/source/lehome:ro" \
-    -v /opt/lehome/trainer/src:/opt/lehome/trainer/src:ro \
+    -v "${TRAINER_HOST_MOUNT}:/opt/lehome/trainer/src:ro" \
     -v "${HF_TOKEN_FILE}:/run/secrets/hf_token:ro" \
     -e PYTHONPATH=/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome \
     -e "HOME=${CAMPAIGN_ROOT}/hf-cache" \
