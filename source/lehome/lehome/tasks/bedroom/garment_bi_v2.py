@@ -29,7 +29,7 @@ from lehome.assets.scenes.bedroom import MARBLE_BEDROOM_CFG
 from lehome.devices.action_process import preprocess_device_action
 from lehome.assets.object.Garment import GarmentObject
 from lehome.assets.collider_audit import audit_current_usd_stage
-from lehome.flywheel.fidelity import ClothFidelityError
+from lehome.flywheel.fidelity import ClothFidelityError, fidelity_receipt
 from lehome.flywheel.persistent_worker import SimulatorNumericalDivergenceError
 from lehome.tasks.bedroom.challenge_garment_loader import ChallengeGarmentLoader
 from lehome.flywheel.isaac_camera import read_camera_world_pose, write_camera_world_pose
@@ -701,11 +701,11 @@ class GarmentEnv(DirectRLEnv):
         if self.object is None:
             raise ClothFidelityError(
                 "missing_cloth",
-                {
-                    "missing_cloth": True, "cloth_flight": False,
-                    "nonfinite_cloth_state": False, "safety_failure": False,
-                    "monitor_active": True, "monitor_observed": True,
-                },
+                fidelity_receipt(
+                    missing_cloth=True, cloth_flight=False,
+                    nonfinite_cloth_state=False, safety_failure=False,
+                    monitor_active=True, monitor_observed=True,
+                ),
                 detail="cannot initialize an absent CPU source garment",
             )
         try:
@@ -721,11 +721,11 @@ class GarmentEnv(DirectRLEnv):
             if positions is None:
                 raise ClothFidelityError(
                     "missing_cloth",
-                    {
-                        "missing_cloth": True, "cloth_flight": False,
-                        "nonfinite_cloth_state": False, "safety_failure": False,
-                        "monitor_active": True, "monitor_observed": True,
-                    },
+                    fidelity_receipt(
+                        missing_cloth=True, cloth_flight=False,
+                        nonfinite_cloth_state=False, safety_failure=False,
+                        monitor_active=True, monitor_observed=True,
+                    ),
                     detail="CPU source garment USD points are unset",
                 )
             positions_array = np.asarray(positions, dtype=np.float32)
@@ -750,11 +750,11 @@ class GarmentEnv(DirectRLEnv):
                 ):
                     raise ClothFidelityError(
                         "cloth_flight",
-                        {
-                            "missing_cloth": False, "cloth_flight": True,
-                            "nonfinite_cloth_state": False, "safety_failure": False,
-                            "monitor_active": True, "monitor_observed": True,
-                        },
+                        fidelity_receipt(
+                            missing_cloth=False, cloth_flight=True,
+                            nonfinite_cloth_state=False, safety_failure=False,
+                            monitor_active=True, monitor_observed=True,
+                        ),
                         detail="CPU source garment initialization readback mismatch",
                     )
                 reset_velocities = zero_velocities
@@ -806,11 +806,11 @@ class GarmentEnv(DirectRLEnv):
         ):
             raise ClothFidelityError(
                 "cloth_flight",
-                {
-                    "missing_cloth": False, "cloth_flight": True,
-                    "nonfinite_cloth_state": False, "safety_failure": False,
-                    "monitor_active": True, "monitor_observed": True,
-                },
+                fidelity_receipt(
+                    missing_cloth=False, cloth_flight=True,
+                    nonfinite_cloth_state=False, safety_failure=False,
+                    monitor_active=True, monitor_observed=True,
+                ),
                 detail=(
                     "CPU source reset has saturated velocity: "
                     f"observed={initial_max_velocity_mps} "
@@ -858,11 +858,11 @@ class GarmentEnv(DirectRLEnv):
         ):
             raise ClothFidelityError(
                 "cloth_flight",
-                {
-                    "missing_cloth": False, "cloth_flight": True,
-                    "nonfinite_cloth_state": False, "safety_failure": False,
-                    "monitor_active": True, "monitor_observed": True,
-                },
+                fidelity_receipt(
+                    missing_cloth=False, cloth_flight=True,
+                    nonfinite_cloth_state=False, safety_failure=False,
+                    monitor_active=True, monitor_observed=True,
+                ),
                 detail="CPU source garment USD reset readback mismatch",
             )
 
@@ -1022,11 +1022,11 @@ class GarmentEnv(DirectRLEnv):
         if local_positions.shape[0] == 0:
             raise ClothFidelityError(
                 "missing_cloth",
-                {
-                    "missing_cloth": True, "cloth_flight": False,
-                    "nonfinite_cloth_state": False, "safety_failure": False,
-                    "monitor_active": True, "monitor_observed": True,
-                },
+                fidelity_receipt(
+                    missing_cloth=True, cloth_flight=False,
+                    nonfinite_cloth_state=False, safety_failure=False,
+                    monitor_active=True, monitor_observed=True,
+                ),
                 detail="garment PhysX cloth readback has no particles",
             )
         positions_nonfinite_count = int(np.size(local_positions) - np.isfinite(local_positions).sum())
@@ -1034,11 +1034,11 @@ class GarmentEnv(DirectRLEnv):
         if positions_nonfinite_count or velocities_nonfinite_count:
             raise ClothFidelityError(
                 "nonfinite_cloth_state",
-                {
-                    "missing_cloth": False, "cloth_flight": False,
-                    "nonfinite_cloth_state": True, "safety_failure": False,
-                    "monitor_active": True, "monitor_observed": True,
-                },
+                fidelity_receipt(
+                    missing_cloth=False, cloth_flight=False,
+                    nonfinite_cloth_state=True, safety_failure=False,
+                    monitor_active=True, monitor_observed=True,
+                ),
                 detail=(
                     "garment PhysX cloth readback is nonfinite: "
                     f"positions_nonfinite_count={positions_nonfinite_count} "
@@ -1305,11 +1305,11 @@ class GarmentEnv(DirectRLEnv):
         if not callable(get_attribute):
             raise ClothFidelityError(
                 "missing_cloth",
-                {
-                    "missing_cloth": True, "cloth_flight": False,
-                    "nonfinite_cloth_state": False, "safety_failure": False,
-                    "monitor_active": True, "monitor_observed": True,
-                },
+                fidelity_receipt(
+                    missing_cloth=True, cloth_flight=False,
+                    nonfinite_cloth_state=False, safety_failure=False,
+                    monitor_active=True, monitor_observed=True,
+                ),
                 detail="legacy CPU garment does not expose a USD prim for cloth state",
             )
         positions_attr = get_attribute("points")
@@ -1317,22 +1317,22 @@ class GarmentEnv(DirectRLEnv):
         if positions_attr is None or velocities_attr is None:
             raise ClothFidelityError(
                 "missing_cloth",
-                {
-                    "missing_cloth": True, "cloth_flight": False,
-                    "nonfinite_cloth_state": False, "safety_failure": False,
-                    "monitor_active": True, "monitor_observed": True,
-                },
+                fidelity_receipt(
+                    missing_cloth=True, cloth_flight=False,
+                    nonfinite_cloth_state=False, safety_failure=False,
+                    monitor_active=True, monitor_observed=True,
+                ),
                 detail="legacy CPU garment USD prim is missing points or velocities",
             )
         if (not callable(getattr(positions_attr, "Get", None))
                 or not callable(getattr(velocities_attr, "Get", None))):
             raise ClothFidelityError(
                 "missing_cloth",
-                {
-                    "missing_cloth": True, "cloth_flight": False,
-                    "nonfinite_cloth_state": False, "safety_failure": False,
-                    "monitor_active": True, "monitor_observed": True,
-                },
+                fidelity_receipt(
+                    missing_cloth=True, cloth_flight=False,
+                    nonfinite_cloth_state=False, safety_failure=False,
+                    monitor_active=True, monitor_observed=True,
+                ),
                 detail="legacy CPU garment USD points or velocities are unreadable",
             )
         return positions_attr, velocities_attr
@@ -1429,11 +1429,11 @@ class GarmentEnv(DirectRLEnv):
         if positions is None or velocities is None:
             raise ClothFidelityError(
                 "missing_cloth",
-                {
-                    "missing_cloth": True, "cloth_flight": False,
-                    "nonfinite_cloth_state": False, "safety_failure": False,
-                    "monitor_active": True, "monitor_observed": True,
-                },
+                fidelity_receipt(
+                    missing_cloth=True, cloth_flight=False,
+                    nonfinite_cloth_state=False, safety_failure=False,
+                    monitor_active=True, monitor_observed=True,
+                ),
                 detail="legacy CPU garment USD points or velocities are unset",
             )
         return self._flywheel_cloth_arrays(positions, velocities)
@@ -1558,14 +1558,11 @@ class GarmentEnv(DirectRLEnv):
                     **values: object) -> dict[str, object]:
             return {
                 **values,
-                "fidelity": {
-                    "missing_cloth": missing,
-                    "cloth_flight": flight,
-                    "nonfinite_cloth_state": nonfinite,
-                    "safety_failure": False,
-                    "monitor_active": True,
-                    "monitor_observed": True,
-                },
+                "fidelity": fidelity_receipt(
+                    missing_cloth=missing, cloth_flight=flight,
+                    nonfinite_cloth_state=nonfinite, safety_failure=False,
+                    monitor_active=True, monitor_observed=True,
+                ),
             }
 
         if hasattr(self, "object") and self.object is None:
@@ -1948,11 +1945,11 @@ class GarmentEnv(DirectRLEnv):
         ):
             raise ClothFidelityError(
                 "cloth_flight",
-                {
-                    "missing_cloth": False, "cloth_flight": True,
-                    "nonfinite_cloth_state": False, "safety_failure": False,
-                    "monitor_active": True, "monitor_observed": True,
-                },
+                fidelity_receipt(
+                    missing_cloth=False, cloth_flight=True,
+                    nonfinite_cloth_state=False, safety_failure=False,
+                    monitor_active=True, monitor_observed=True,
+                ),
                 detail="garment cloth write readback mismatch",
             )
         restored_pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)

@@ -20,7 +20,12 @@ import traceback
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
-from .fidelity import FIDELITY_CODES, validate_fidelity
+from .fidelity import (
+    FIDELITY_CODES,
+    ClothFidelityError,
+    fidelity_receipt,
+    validate_fidelity,
+)
 
 
 ACTION_HORIZON = 16
@@ -507,6 +512,16 @@ class PersistentRolloutWorker:
                 except BaseException as error:
                     print(f"persistent worker: episode failed: {type(error).__name__}: {error}", flush=True)
                     traceback.print_exc()
+                    # Evaluation translates reset-time physical faults, but
+                    # later preparation, readback, snapshot, and runtime
+                    # paths can still emit the producer's typed receipt.
+                    # Normalize it here before any generic error policy.
+                    if isinstance(error, ClothFidelityError):
+                        error = (
+                            FidelityFailureError(error.code, error.fidelity)
+                            if self._simple_curriculum_collection
+                            else SimulatorNumericalDivergenceError(str(error))
+                        )
                     if isinstance(error, PreparationTimeoutError):
                         # In production the watchdog has already hard-exited.
                         # This path exists solely when an injected test exit
@@ -521,11 +536,11 @@ class PersistentRolloutWorker:
                                 self.identity.worker_id, attempt_id, lease_id,
                                 session_id=self.identity.session_id, generation=generation,
                                 fidelity_code="safety_failure",
-                                fidelity={
-                                    "missing_cloth": False, "cloth_flight": False,
-                                    "nonfinite_cloth_state": False, "safety_failure": True,
-                                    "monitor_active": True, "monitor_observed": True,
-                                },
+                                fidelity=fidelity_receipt(
+                                    missing_cloth=False, cloth_flight=False,
+                                    nonfinite_cloth_state=False, safety_failure=True,
+                                    monitor_active=True, monitor_observed=True,
+                                ),
                                 runtime={
                                     key: runtime_receipt[key]
                                     for key in ("simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device")

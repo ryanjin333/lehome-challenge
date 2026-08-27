@@ -25,6 +25,33 @@ def test_validate_fidelity_requires_the_exact_observed_six_field_receipt() -> No
         validate_fidelity(_fidelity(monitor_active=False))
 
 
+def test_fidelity_receipt_factory_returns_only_the_validated_six_fields() -> None:
+    from lehome.flywheel.fidelity import fidelity_receipt
+
+    assert fidelity_receipt(
+        missing_cloth=False,
+        cloth_flight=True,
+        nonfinite_cloth_state=False,
+        safety_failure=False,
+        monitor_active=True,
+        monitor_observed=True,
+    ) == _fidelity(cloth_flight=True)
+
+
+def test_fidelity_receipt_factory_rejects_inactive_monitors() -> None:
+    from lehome.flywheel.fidelity import fidelity_receipt
+
+    with pytest.raises(ValueError, match="monitor"):
+        fidelity_receipt(
+            missing_cloth=True,
+            cloth_flight=False,
+            nonfinite_cloth_state=False,
+            safety_failure=False,
+            monitor_active=False,
+            monitor_observed=True,
+        )
+
+
 def test_cloth_fidelity_error_carries_only_a_validated_cloth_failure() -> None:
     from lehome.flywheel.fidelity import ClothFidelityError
 

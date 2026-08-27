@@ -12,6 +12,27 @@ FIDELITY_CODES = frozenset(CLOTH_FIDELITY_CODES) | {"safety_failure"}
 FIDELITY_FIELDS = FIDELITY_CODES | {"monitor_active", "monitor_observed"}
 
 
+def fidelity_receipt(
+    *,
+    missing_cloth: bool,
+    cloth_flight: bool,
+    nonfinite_cloth_state: bool,
+    safety_failure: bool,
+    monitor_active: bool,
+    monitor_observed: bool,
+) -> dict[str, bool]:
+    """Build the sole exact, monitored six-field fidelity receipt."""
+
+    return validate_fidelity({
+        "missing_cloth": missing_cloth,
+        "cloth_flight": cloth_flight,
+        "nonfinite_cloth_state": nonfinite_cloth_state,
+        "safety_failure": safety_failure,
+        "monitor_active": monitor_active,
+        "monitor_observed": monitor_observed,
+    })
+
+
 def validate_fidelity(
     fidelity: object,
     *,

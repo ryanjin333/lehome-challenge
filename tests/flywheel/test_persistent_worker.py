@@ -262,6 +262,106 @@ def test_marker_false_downgrades_a_structured_fidelity_error_to_generic_infrastr
     ]
 
 
+@pytest.mark.parametrize("failure_site", ["prepare", "contact", "snapshot", "post_runtime"])
+@pytest.mark.parametrize("simple_curriculum_collection", [False, True])
+def test_worker_translates_raw_cloth_fidelity_errors_at_every_episode_boundary(
+    tmp_path, failure_site: str, simple_curriculum_collection: bool,
+) -> None:
+    from lehome.flywheel.fidelity import ClothFidelityError
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    fidelity = {
+        "missing_cloth": failure_site == "prepare",
+        "cloth_flight": failure_site == "contact",
+        "nonfinite_cloth_state": failure_site in {"snapshot", "post_runtime"},
+        "safety_failure": False,
+        "monitor_active": True,
+        "monitor_observed": True,
+    }
+    code = next(key for key in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state") if fidelity[key])
+
+    class BoundaryController(FakeController):
+        def __init__(self) -> None:
+            super().__init__([
+                Lease(Attempt("attempt-a", {"garment": "Top_Long_Seen_0", "seed": 11}), "lease-a"),
+            ])
+            self.fidelity_aborts: list[tuple[object, ...]] = []
+            self.infrastructure_aborts: list[tuple[object, ...]] = []
+
+        def record_fidelity_abort(self, worker_id, attempt_id, lease_id, **kwargs):
+            self.fidelity_aborts.append((worker_id, attempt_id, lease_id, kwargs))
+            return "infrastructure_abort"
+
+        def record_infrastructure_abort(self, worker_id, attempt_id, lease_id, *, reason):
+            self.infrastructure_aborts.append((worker_id, attempt_id, lease_id, reason))
+            return "infrastructure_abort"
+
+    class BoundarySession(FakeSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.runtime_reads = 0
+            if failure_site == "post_runtime":
+                self.runtime_receipt = self._runtime_receipt
+
+        def _runtime_receipt(self):
+            self.runtime_reads += 1
+            if self.runtime_reads == 2:
+                raise ClothFidelityError(code, fidelity)
+            return {
+                "simulation_device": "cuda:0", "cloth_device": "cuda:0",
+                "renderer_device": "cuda:0", "camera_device": "cuda:0",
+                "cloth_backend": "physx_cloth_view",
+                "cloth_readback": {"positions": 1, "velocities": 1},
+                "visible_contact_canary": {"observed": True}, "policy_device": "cuda:0",
+            }
+
+        def prepare_episode(self, **kwargs):
+            if failure_site == "prepare":
+                raise ClothFidelityError(code, fidelity)
+            return super().prepare_episode(**kwargs)
+
+        def read_contact(self) -> None:
+            if failure_site == "contact":
+                raise ClothFidelityError(code, fidelity)
+
+        def capture_terminal_snapshot(self) -> None:
+            if failure_site == "snapshot":
+                raise ClothFidelityError(code, fidelity)
+
+        def run_episode(self, **kwargs):
+            self.read_contact()
+            self.capture_terminal_snapshot()
+            return super().run_episode(**kwargs)
+
+    controller = BoundaryController()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=BoundarySession, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+        simple_curriculum_collection=simple_curriculum_collection,
+    )
+
+    assert worker.run() == []
+    if simple_curriculum_collection:
+        assert controller.infrastructure_aborts == []
+        assert controller.fidelity_aborts == [
+            ("worker-0", "attempt-a", "lease-a", {
+                "session_id": "session-0", "generation": 1,
+                "fidelity_code": code, "fidelity": fidelity,
+                "runtime": {
+                    "simulation_device": "cuda:0", "cloth_device": "cuda:0",
+                    "renderer_device": "cuda:0", "camera_device": "cuda:0",
+                    "policy_device": "cuda:0",
+                },
+            }),
+        ]
+    else:
+        assert controller.fidelity_aborts == []
+        assert controller.infrastructure_aborts == [
+            ("worker-0", "attempt-a", "lease-a", "simulator_numerical_divergence"),
+        ]
+
+
 @pytest.mark.parametrize("field", ["monitor_active", "monitor_observed"])
 def test_fidelity_failure_error_refuses_unobserved_monitors(field: str) -> None:
     from lehome.flywheel.persistent_worker import FidelityFailureError

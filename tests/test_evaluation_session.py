@@ -13,6 +13,8 @@ from collections.abc import Mapping
 import numpy as np
 import pytest
 
+from lehome.flywheel.fidelity import fidelity_receipt
+
 
 def _collider_audit_module():
     source_path = (
@@ -974,6 +976,7 @@ def test_collider_health_and_admission_gate_fail_closed_with_live_evidence() -> 
     namespace = {
         "np": np, "audit_current_usd_stage": lambda: collision_health,
         "ClothFidelityError": ClothFidelityError,
+        "fidelity_receipt": fidelity_receipt,
     }
     exec(compile(env_module, str(env_source_path), "exec"), namespace)
     env = types.SimpleNamespace(_flywheel_collider_health=None)
@@ -1226,7 +1229,7 @@ def test_cpu_garment_initialization_preserves_missing_cloth_as_typed_evidence() 
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     with pytest.raises(ClothFidelityError) as captured:
@@ -1252,7 +1255,7 @@ def test_cpu_garment_initialization_authors_zero_velocity_when_usd_velocity_is_u
     ast.fix_missing_locations(module)
     from lehome.flywheel.fidelity import ClothFidelityError
 
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
     points = np.asarray([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=np.float32)
     state = {"points": points.copy(), "velocities": None}
@@ -1320,7 +1323,7 @@ def test_cpu_garment_initialization_preserves_registered_live_velocity() -> None
     ast.fix_missing_locations(module)
     from lehome.flywheel.fidelity import ClothFidelityError
 
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
     points = np.asarray([[0.1, 0.2, 0.3]], dtype=np.float32)
     live_velocity = np.asarray([[0.2, 0.0, 0.0]], dtype=np.float32)
@@ -1402,7 +1405,7 @@ def test_cpu_scene_pose_write_uses_cloth_aware_root_without_particle_restore(mon
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    namespace = {"np": np, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     isaacsim = types.ModuleType("isaacsim")
@@ -1460,7 +1463,7 @@ def test_cpu_reset_restores_live_usd_state_without_physx(monkeypatch) -> None:
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    namespace = {"np": np, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
     isaacsim = types.ModuleType("isaacsim")
     core = types.ModuleType("isaacsim.core")
@@ -1532,7 +1535,7 @@ def test_cpu_reset_rejects_a_velocity_saturated_initial_state() -> None:
     ast.fix_missing_locations(module)
     from lehome.flywheel.fidelity import ClothFidelityError
 
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
     env = types.SimpleNamespace(
         _flywheel_legacy_cpu_reset_state=(
@@ -1562,7 +1565,7 @@ def test_cpu_reset_post_write_readback_failure_is_typed_cloth_evidence(monkeypat
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
     isaacsim = types.ModuleType("isaacsim")
     core = types.ModuleType("isaacsim.core")
@@ -1617,7 +1620,7 @@ def test_cpu_visible_contact_transforms_live_usd_local_points_without_physx(monk
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    namespace = {"np": np, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     isaacsim = types.ModuleType("isaacsim")
@@ -1913,7 +1916,7 @@ def test_cpu_source_reset_and_h16_capture_use_live_usd_local_state_without_physx
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    namespace = {"np": np, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
     samples = iter((
         (np.asarray([[0.1, 0.2, 0.3]], dtype=np.float32), np.zeros((1, 3), dtype=np.float32)),
@@ -1960,7 +1963,7 @@ def test_legacy_cpu_cloth_snapshot_is_transformed_from_local_to_world_for_cuda()
     assert len(matches) == 1, "legacy CPU-to-CUDA restore must have one explicit frame conversion"
     module = ast.Module(body=matches, type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    namespace = {"np": np, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     local_positions = np.asarray([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]], dtype=np.float32)
@@ -2000,7 +2003,7 @@ def test_legacy_cpu_cloth_transform_accepts_a_cuda_tensor_backed_world_scale() -
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    namespace = {"np": np, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     class CudaTensorLike:
@@ -2373,7 +2376,7 @@ def test_authenticated_world_cloth_is_rigidly_rebased_across_randomized_garment_
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    namespace = {"np": np, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     positions, velocities = namespace["_flywheel_rebase_world_cloth"](
@@ -2587,7 +2590,7 @@ def test_garment_environment_set_seed_rebinds_the_active_object_rng() -> None:
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    namespace = {"np": np, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     first_object = types.SimpleNamespace(rng=None)
@@ -2623,7 +2626,7 @@ def test_cloth_physical_health_rejects_finite_but_astronomical_state() -> None:
     ast.fix_missing_locations(module)
     from lehome.flywheel.fidelity import ClothFidelityError
 
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     normal = types.SimpleNamespace(
@@ -2666,7 +2669,7 @@ def test_cloth_health_preserves_finite_flight_as_typed_evidence() -> None:
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
     env = types.SimpleNamespace(
         flywheel_collider_health=lambda: {"healthy": True},
@@ -2694,7 +2697,7 @@ def test_cloth_health_preserves_missing_cloth_as_typed_evidence() -> None:
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     with pytest.raises(ClothFidelityError) as captured:
@@ -2715,7 +2718,7 @@ def test_cpu_cloth_health_uses_live_usd_local_state_without_physx() -> None:
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    namespace = {"np": np, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
     env = types.SimpleNamespace(
         device="cpu",
@@ -2748,7 +2751,7 @@ def test_cloth_physical_health_reports_every_exceeded_metric_to_the_admission_ga
     ast.fix_missing_locations(module)
     from lehome.flywheel.fidelity import ClothFidelityError
 
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
     env = types.SimpleNamespace(
         flywheel_collider_health=lambda: {"healthy": True},
@@ -2781,7 +2784,7 @@ def test_cloth_physical_health_rejects_velocity_saturated_at_the_simulator_cap()
     ast.fix_missing_locations(module)
     from lehome.flywheel.fidelity import ClothFidelityError
 
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
     env = types.SimpleNamespace(
         flywheel_collider_health=lambda: {"healthy": True},
@@ -2814,7 +2817,7 @@ def test_cloth_physical_health_classifies_invalid_physx_readback_as_divergence()
     ast.fix_missing_locations(module)
     from lehome.flywheel.fidelity import ClothFidelityError
 
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     invalid = types.SimpleNamespace(
@@ -2866,7 +2869,7 @@ def test_physx_cloth_readback_diagnoses_each_bounded_failure_class() -> None:
     ast.fix_missing_locations(module)
     from lehome.flywheel.fidelity import ClothFidelityError
 
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     class Cloth:
@@ -2953,7 +2956,7 @@ def test_physx_cloth_array_failures_keep_their_typed_receipt(
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np, "ClothFidelityError": ClothFidelityError}
+    namespace = {"np": np, "ClothFidelityError": ClothFidelityError, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     with pytest.raises(ClothFidelityError) as captured:
@@ -3038,7 +3041,7 @@ def test_cloth_physical_health_uses_garment_specific_scale_and_reset_overrides()
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"np": np}
+    namespace = {"np": np, "fidelity_receipt": fidelity_receipt}
     exec(compile(module, str(source_path), "exec"), namespace)
 
     env = types.SimpleNamespace(
