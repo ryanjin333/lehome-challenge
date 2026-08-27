@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
 import sys
+
+import pytest
 
 from lehome.flywheel.simple_curriculum import build_calibration_rows
 
@@ -252,3 +255,21 @@ def test_cli_rejects_duplicate_json_keys_without_creating_outputs(tmp_path: Path
     assert "catalog is malformed" in result.stderr
     assert not output.exists()
     assert not receipt.exists()
+
+
+def test_atomic_publication_never_overwrites_a_competing_file(tmp_path: Path) -> None:
+    spec = importlib.util.spec_from_file_location("simple_curriculum_cli", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    output = tmp_path / "matrix.json"
+    competitor_payload = b"competitor\n"
+
+    def publish_competitor() -> None:
+        output.write_bytes(competitor_payload)
+
+    with pytest.raises(FileExistsError):
+        module._atomic_write(output, b"ours\n", before_publish=publish_competitor)
+
+    assert output.read_bytes() == competitor_payload
+    assert not list(tmp_path.glob(".*.tmp"))

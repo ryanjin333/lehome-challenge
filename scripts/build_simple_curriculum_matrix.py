@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-from typing import Mapping
+from typing import Callable, Mapping
 
 from lehome.flywheel.simple_curriculum import build_calibration_rows, build_curriculum_rows
 
@@ -76,7 +76,7 @@ def _safe_absent(path: Path, *, label: str) -> None:
         raise ValueError(f"{label} parent is unsafe")
 
 
-def _atomic_write(path: Path, payload: bytes) -> None:
+def _atomic_write(path: Path, payload: bytes, *, before_publish: Callable[[], None] | None = None) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
     try:
@@ -85,7 +85,9 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             stream.flush()
             os.fchmod(stream.fileno(), 0o644)
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        if before_publish is not None:
+            before_publish()
+        os.link(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory)

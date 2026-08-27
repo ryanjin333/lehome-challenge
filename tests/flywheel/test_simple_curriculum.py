@@ -5,6 +5,7 @@ import json
 import math
 from collections import Counter
 
+import numpy as np
 import pytest
 
 from lehome.flywheel.simple_curriculum import (
@@ -73,10 +74,11 @@ def test_calibration_builder_is_uniform_and_canonical() -> None:
         "campaign_kind", "logical_stage", "attempt_id", "trial_id", "garment", "garment_name",
         "category", "release_stage", "seed", "source_seed", "strategy",
     } <= set(rows[0])
-    assert {row["campaign_kind"] for row in rows} == {"calibration"}
+    assert {row["campaign_kind"] for row in rows} == {"simple_curriculum_source_v1"}
     assert {row["logical_stage"] for row in rows} == {"calibration"}
     assert {row["release_stage"] for row in rows} == {"seen"}
     assert {row["strategy"] for row in rows} == {"canonical"}
+    assert all(row["source_seed"] == row["seed"] for row in rows)
 
 
 def test_weights_follow_the_approved_formula() -> None:
@@ -120,6 +122,11 @@ def test_curriculum_builder_authenticates_and_samples_deterministically() -> Non
     assert all(row["calibration_matrix_sha256"] == _matrix_sha(calibration) for row in rows)
     assert all(row["sampled_category_weight"] > 0 for row in rows)
     assert all(row["sampled_garment_weight"] > 0 for row in rows)
+    assert {row["campaign_kind"] for row in rows} == {"simple_curriculum_source_v1"}
+    assert all(row["source_seed"] == row["seed"] for row in rows)
+    for row in [*calibration, *rows]:
+        assert 0 <= row["seed"] < 2**32
+        np.random.RandomState(row["seed"])
 
 
 @pytest.mark.parametrize(
@@ -205,8 +212,26 @@ def test_curriculum_redraws_duplicate_seed_and_selects_category_then_garment() -
         policy_identity=POLICY_IDENTITY, catalog=catalog, rng_factory=lambda _seed: scripted,
     )
 
-    assert [row["seed"] for row in rows] == [(1 << 63), (1 << 63) + 1]
+    assert [row["seed"] for row in rows] == [0, 1]
     assert len({row["seed"] for row in rows}) == 2
     assert scripted.choice_calls[0][0] == ("top_long", "top_short", "pant_long", "pant_short")
     assert scripted.choice_calls[1][0] == tuple(catalog["pant_short"])
     assert scripted.choice_calls[0][1] != scripted.choice_calls[1][1]
+
+
+def test_calibration_seed_range_includes_boundaries_and_rejects_overflow() -> None:
+    catalog = _catalog()
+    lower_rows = build_calibration_rows(catalog, seed_base=0)
+    rows = build_calibration_rows(catalog, seed_base=2**32 - 400)
+
+    assert lower_rows[0]["seed"] == 0
+    assert lower_rows[-1]["seed"] == 399
+    assert rows[0]["seed"] == 2**32 - 400
+    assert rows[-1]["seed"] == 2**32 - 1
+    assert all(0 <= row["seed"] < 2**32 for row in rows)
+    for row in rows:
+        np.random.RandomState(row["seed"])
+    with pytest.raises(ValueError, match="seed_base"):
+        build_calibration_rows(catalog, seed_base=-1)
+    with pytest.raises(ValueError, match="seed_base"):
+        build_calibration_rows(catalog, seed_base=2**32 - 399)

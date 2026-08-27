@@ -19,7 +19,7 @@ _GARMENT_PATTERNS = {
     "pant_long": re.compile(r"^Pant_Long_Seen_[0-9]$"),
     "pant_short": re.compile(r"^Pant_Short_Seen_[0-9]$"),
 }
-_MAX_SEED = 2**63 - 1
+_MAX_SEED = 2**32 - 1
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -91,7 +91,7 @@ def build_calibration_rows(catalog: object, *, seed_base: int) -> list[dict[str,
         garment = by_category[category][category_index % 10]
         seed = seed_base + index
         rows.append({
-            "campaign_kind": "calibration",
+            "campaign_kind": "simple_curriculum_source_v1",
             "logical_stage": "calibration",
             "attempt_id": f"calibration-{index:04d}",
             "trial_id": f"calibration-trial-{index:04d}",
@@ -212,10 +212,9 @@ def _draw_unique_seed(generator: object, used: set[int], *, max_draws: int = 10_
     if not callable(draw):
         raise ValueError("curriculum RNG is invalid")
     for _ in range(max_draws):
-        raw = draw(0, 1 << 63)
-        if type(raw) is not int or not 0 <= raw < 1 << 63:
+        seed = draw(0, 1 << 32)
+        if type(seed) is not int or not 0 <= seed < 1 << 32:
             raise ValueError("curriculum RNG returned an invalid seed")
-        seed = (1 << 63) + raw
         if seed not in used:
             used.add(seed)
             return seed
@@ -280,7 +279,7 @@ def build_curriculum_rows(
         if attempt_id in calibration_attempt_ids or trial_id in calibration_trial_ids or seed in calibration_seeds:
             raise AssertionError("curriculum identity collision")
         rows.append({
-            "campaign_kind": "curriculum",
+            "campaign_kind": "simple_curriculum_source_v1",
             "logical_stage": "curriculum",
             "attempt_id": attempt_id,
             "trial_id": trial_id,
@@ -289,7 +288,7 @@ def build_curriculum_rows(
             "category": category,
             "release_stage": "seen",
             "seed": seed,
-            "source_seed": next(int(row["seed"]) for row in calibration.values() if row["garment"] == garment),
+            "source_seed": seed,
             "strategy": "canonical",
             "builder_rng_seed": rng_seed,
             "calibration_matrix_sha256": matrix_sha,
