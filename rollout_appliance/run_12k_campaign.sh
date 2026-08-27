@@ -64,6 +64,11 @@ COMPLETION_METRIC="${LEHOME_COMPLETION_METRIC:-accepted_successes}"
 PARTITION_ID="${LEHOME_PARTITION_ID:-}"
 PARENT_MATRIX_SHA256="${LEHOME_PARENT_MATRIX_SHA256:-}"
 CODE_ROOT_SHA256=""
+HOST_CODE_ROOT="${LEHOME_HOST_CODE_ROOT:-}"
+SOURCE_HOST_MOUNT="/opt/lehome/source/lehome"
+SCRIPTS_HOST_MOUNT="/opt/lehome/scripts"
+APPLIANCE_HOST_MOUNT="/opt/lehome/rollout_appliance"
+WORKER_LEHOME_HOST_MOUNT="/opt/lehome/merged/lehome"
 RESUME_PREEMPTED_ROLLOUT="${LEHOME_RESUME_PREEMPTED_ROLLOUT:-0}"
 EVALUATION_TERMINAL_UPLOAD="${LEHOME_EVALUATION_TERMINAL_UPLOAD:-0}"
 FRESH_GARMENT_WAVES="${LEHOME_FRESH_GARMENT_WAVES:-${EVALUATION_TERMINAL_UPLOAD}}"
@@ -137,10 +142,14 @@ if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
     echo "simple curriculum partition identity requires parent SHA-256 and pinned runtime images" >&2
     exit 2
   fi
-  CODE_ROOT_SHA256="$(python3 - "${SCRIPT_DIR}/.." <<'PY'
+  CODE_ROOT_SHA256="$(python3 - "${HOST_CODE_ROOT}" <<'PY'
 import hashlib, os, stat, sys
 from pathlib import Path
-root = Path(sys.argv[1]).resolve(strict=True)
+requested = Path(sys.argv[1])
+if not requested.is_absolute() or requested.is_symlink(): raise SystemExit("simple curriculum host code root is unsafe")
+for ancestor in (requested, *requested.parents):
+    if ancestor.is_symlink(): raise SystemExit("simple curriculum host code root contains a symlink ancestor")
+root = requested.resolve(strict=True)
 digest = hashlib.sha256()
 for relative in ("source/lehome", "scripts", "rollout_appliance"):
     tree = root / relative
@@ -157,6 +166,10 @@ for relative in ("source/lehome", "scripts", "rollout_appliance"):
 print(digest.hexdigest())
 PY
 )" || { echo "simple curriculum code root is unsafe" >&2; exit 2; }
+  SOURCE_HOST_MOUNT="${HOST_CODE_ROOT}/source/lehome"
+  SCRIPTS_HOST_MOUNT="${HOST_CODE_ROOT}/scripts"
+  APPLIANCE_HOST_MOUNT="${HOST_CODE_ROOT}/rollout_appliance"
+  WORKER_LEHOME_HOST_MOUNT="${HOST_CODE_ROOT}/source/lehome/lehome"
 fi
 case "${SIMULATOR_DEVICE}" in
   "cuda:0") ;;
@@ -507,7 +520,11 @@ if simple == "1":
         "run_id": sys.argv[20], "run_root": sys.argv[21], "database": str(database),
         "attempt_matrix": str(matrix), "max_attempts": int(sys.argv[3]), "target_accepted": int(sys.argv[4]),
     }
-    if not isinstance(descriptor, dict) or any(descriptor.get(key) != value for key, value in expected.items()):
+    schema = {"schema_version": 1, "kind": "lehome_rollout_preemption_context", "active": False}
+    if (not isinstance(descriptor, dict) or set(descriptor) != set(expected) | set(schema)
+            or type(descriptor.get("schema_version")) is not int or descriptor.get("schema_version") != 1
+            or type(descriptor.get("active")) is not bool or descriptor.get("active") is not False
+            or any(descriptor.get(key) != value for key, value in {**expected, **schema}.items())):
         raise SystemExit("simple curriculum resume descriptor does not bind this immutable partition")
 ledger = TaskLedger(database, attempt_matrix=load_attempt_matrix(matrix), max_attempts=int(sys.argv[3]), target_accepted=int(sys.argv[4]), completion_metric=metric)
 try:
@@ -632,7 +649,7 @@ if [ ! -e /kitcache/home/.nvidia-omniverse ] && [ -d "${KIT_SEED}" ]; then
   if [ -d "${KIT_SEED}/config" ]; then cp -a "${KIT_SEED}/config/." /kitcache/config/; fi
   if [ -d "${KIT_SEED}/data" ]; then cp -a "${KIT_SEED}/data/." /kitcache/ov/; fi
 fi
-if [ -x /opt/lehome/rollout_appliance/prepare-merged-lehome.sh ]; then
+if [ "${SIMPLE_CURRICULUM_COLLECTION}" != "1" ] && [ -x /opt/lehome/rollout_appliance/prepare-merged-lehome.sh ]; then
   /opt/lehome/rollout_appliance/prepare-merged-lehome.sh || true
 fi
 chown -R 1234:1234 "${CAMPAIGN_ROOT}" /eval/logs /kitcache || true
@@ -675,10 +692,10 @@ fi
 docker run --rm --user 1234:1234 --network none \
   --name "${FINALIZER_NAME}" \
   -v "${WORKSPACE}:/mnt/lehome" \
-  -v /opt/lehome/scripts:/opt/lehome/scripts:ro \
-  -v /opt/lehome/source/lehome:/opt/lehome/source/lehome:ro \
+  -v "${SCRIPTS_HOST_MOUNT}:/opt/lehome/scripts:ro" \
+  -v "${SOURCE_HOST_MOUNT}:/opt/lehome/source/lehome:ro" \
   -v /opt/lehome/trainer/src:/opt/lehome/trainer/src:ro \
-  -v /opt/lehome/rollout_appliance:/opt/lehome/rollout_appliance:ro \
+  -v "${APPLIANCE_HOST_MOUNT}:/opt/lehome/rollout_appliance:ro" \
   -e PYTHONPATH=/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome \
   --entrypoint /opt/lehome-challenge/.venv/bin/python \
   "${ROLLOUT_IMAGE}" \
@@ -705,8 +722,8 @@ if [ "${ENABLE_HF_UPLOAD}" = "1" ]; then
   docker run --rm --user 1234:1234 \
     --name "${UPLOADER_NAME}" \
     -v "${WORKSPACE}:/mnt/lehome" \
-    -v /opt/lehome/scripts:/opt/lehome/scripts:ro \
-    -v /opt/lehome/source/lehome:/opt/lehome/source/lehome:ro \
+    -v "${SCRIPTS_HOST_MOUNT}:/opt/lehome/scripts:ro" \
+    -v "${SOURCE_HOST_MOUNT}:/opt/lehome/source/lehome:ro" \
     -v /opt/lehome/trainer/src:/opt/lehome/trainer/src:ro \
     -v "${HF_TOKEN_FILE}:/run/secrets/hf_token:ro" \
     -e PYTHONPATH=/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome \
@@ -738,8 +755,8 @@ docker run --rm --gpus all --user 10001:10001 --network host --ipc=host \
   --name lehome-12k-policy \
   -w /cache/models \
   -v "${CHECKPOINT_DIR}:/policy:ro" \
-  -v /opt/lehome/scripts:/opt/lehome/scripts:ro \
-  -v /opt/lehome/source/lehome:/opt/lehome-src:ro \
+  -v "${SCRIPTS_HOST_MOUNT}:/opt/lehome/scripts:ro" \
+  -v "${SOURCE_HOST_MOUNT}:/opt/lehome-src:ro" \
   -v "${RECEIPT_DIR}:/receipts" \
   -v "${WORKSPACE}/cache:/cache" \
   -v "${WORKSPACE}/cache/isaac-groot-overlay/nvidia:/opt/isaac-groot/nvidia:ro" \
@@ -798,8 +815,8 @@ launch_worker() {
     -v "${WORKSPACE}:/mnt/lehome" \
     -v "${WORKSPACE}/eval/assets:/opt/lehome-challenge/Assets:ro" \
     -v /opt/lehome:/opt/lehome:ro \
-    -v /opt/lehome/merged/lehome:/opt/lehome-challenge/source/lehome/lehome:ro \
-    -v /opt/lehome/scripts:/opt/lehome-challenge/scripts:ro \
+    -v "${WORKER_LEHOME_HOST_MOUNT}:/opt/lehome-challenge/source/lehome/lehome:ro" \
+    -v "${SCRIPTS_HOST_MOUNT}:/opt/lehome-challenge/scripts:ro" \
     -v /opt/lehome/pydeps:/pydeps:ro \
     -v /eval/logs:/eval/logs \
     -v /eval/logs:/opt/lehome-challenge/logs \
@@ -1007,10 +1024,10 @@ if [ "${ENABLE_HF_UPLOAD}" = "1" ]; then
       && [ "${EVALUATION_TERMINAL_UPLOAD}" = "0" ]; then
     docker run --rm --user 1234:1234 --network none \
       -v "${WORKSPACE}:/mnt/lehome" \
-      -v /opt/lehome/scripts:/opt/lehome/scripts:ro \
-      -v /opt/lehome/source/lehome:/opt/lehome/source/lehome:ro \
+      -v "${SCRIPTS_HOST_MOUNT}:/opt/lehome/scripts:ro" \
+      -v "${SOURCE_HOST_MOUNT}:/opt/lehome/source/lehome:ro" \
       -v /opt/lehome/trainer/src:/opt/lehome/trainer/src:ro \
-      -v /opt/lehome/rollout_appliance:/opt/lehome/rollout_appliance:ro \
+      -v "${APPLIANCE_HOST_MOUNT}:/opt/lehome/rollout_appliance:ro" \
       -e PYTHONPATH=/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome \
       --entrypoint /opt/lehome-challenge/.venv/bin/python \
       "${ROLLOUT_IMAGE}" \

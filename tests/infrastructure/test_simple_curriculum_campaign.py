@@ -64,6 +64,7 @@ def _environment(tmp_path: Path, partition_id: str) -> dict[str, str]:
         "LEHOME_MAX_ATTEMPTS": str(budget), "LEHOME_TARGET_ACCEPTED": str(target),
         "LEHOME_PARTITION_ID": partition_id, "LEHOME_PARENT_MATRIX_SHA256": "a" * 64,
         "LEHOME_ROLLOUT_IMAGE": "ghcr.io/ryanjin333/lehome-rollout@sha256:" + "d" * 64,
+        "LEHOME_HOST_CODE_ROOT": str(ROOT),
         "LEHOME_VALIDATE_MATRIX_ONLY": "1",
     })
     return environment
@@ -155,7 +156,7 @@ def test_exact_simple_curriculum_resume_refuses_active_or_mismatched_descriptor(
         "LEHOME_ROLLOUT_PREEMPTION_CONTEXT": str(context), "PYTHONPATH": str(ROOT / "source" / "lehome"),
     })
     descriptor = {
-        "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
+        "schema_version": 1, "kind": "lehome_rollout_preemption_context", "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
         "run_id": environment.get("LEHOME_RUN_ID", "lehome-rft-70-30-v1"), "run_root": environment["LEHOME_CAMPAIGN_ROOT"],
         "database": str(Path(environment["LEHOME_CAMPAIGN_ROOT"]) / "ledger.sqlite3"), "attempt_matrix": environment["LEHOME_ATTEMPT_MATRIX"],
         "max_attempts": 150, "target_accepted": 100,
@@ -190,7 +191,7 @@ def test_exact_simple_curriculum_resume_resumes_only_a_matching_paused_ledger(tm
     ledger.close()
     context = tmp_path / "preemption.json"
     context.write_text(json.dumps({
-        "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
+        "schema_version": 1, "kind": "lehome_rollout_preemption_context", "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
         "run_id": environment.get("LEHOME_RUN_ID", "lehome-rft-70-30-v1"), "run_root": environment["LEHOME_CAMPAIGN_ROOT"],
         "database": str(Path(environment["LEHOME_CAMPAIGN_ROOT"]) / "ledger.sqlite3"), "attempt_matrix": environment["LEHOME_ATTEMPT_MATRIX"],
         "max_attempts": 150, "target_accepted": 100,
@@ -233,7 +234,7 @@ def test_exact_simple_curriculum_resume_refuses_a_terminal_ledger(tmp_path: Path
     ledger.close()
     context = tmp_path / "preemption.json"
     context.write_text(json.dumps({
-        "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
+        "schema_version": 1, "kind": "lehome_rollout_preemption_context", "active": False, "campaign_mode": "simple_curriculum_collection", "completion_metric": "terminal_outcomes",
         "run_id": environment.get("LEHOME_RUN_ID", "lehome-rft-70-30-v1"), "run_root": environment["LEHOME_CAMPAIGN_ROOT"],
         "database": str(Path(environment["LEHOME_CAMPAIGN_ROOT"]) / "ledger.sqlite3"), "attempt_matrix": environment["LEHOME_ATTEMPT_MATRIX"],
         "max_attempts": 150, "target_accepted": 100,
