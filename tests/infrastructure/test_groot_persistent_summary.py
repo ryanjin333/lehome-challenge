@@ -326,6 +326,60 @@ def test_simple_summary_counts_retry_then_valid_as_one_invalid_execution(tmp_pat
     assert report["execution_count"] == 101
 
 
+def test_simple_summary_counts_retry_and_later_invalid_terminal_as_distinct_executions(tmp_path: Path) -> None:
+    summary = _module()
+
+    def mutate(receipt, index):
+        if index == 3:
+            receipt["runtime"] = {**receipt["runtime"], "camera_device": "cuda:1"}
+    root, matrix, _rows, _ledger_ids = _simple_campaign(
+        tmp_path, retry_then_valid=3, receipt_mutator=mutate,
+    )
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 99
+    assert report["infrastructure_invalid_executions"] == 2
+    assert report["execution_count"] == 101
+
+
+def test_simple_summary_counts_stray_evidence_with_retried_ledger_id_separately(tmp_path: Path) -> None:
+    summary = _module()
+    root, matrix, rows, ledger_ids = _simple_campaign(tmp_path, retry_then_valid=3)
+    ledger_id = ledger_ids[str(rows[3]["attempt_id"])]
+    stray = root / f"stray-{ledger_id}"; stray.mkdir()
+    (stray / "episode.json").write_bytes(b"{broken")
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 100
+    assert report["infrastructure_invalid_executions"] == 2
+    assert report["execution_count"] == 102
+
+
+def test_simple_summary_counts_untraversed_symlink_directory_as_unsafe_evidence(tmp_path: Path) -> None:
+    summary = _module()
+    root, matrix, _rows, _ledger_ids = _simple_campaign(tmp_path)
+    outside = tmp_path / "outside"; outside.mkdir()
+    (outside / "episode.json").write_text("{}")
+    (root / "stray-evidence").symlink_to(outside, target_is_directory=True)
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    assert report["valid_outcomes"] == 100
+    assert report["infrastructure_invalid_executions"] == 1
+    assert report["execution_count"] == 101
+
+
 def test_simple_summary_does_not_allow_aggregate_safety_to_disagree_with_gate_fidelity(tmp_path: Path) -> None:
     summary = _module()
     root, matrix, _rows, _ledger_ids = _simple_campaign(tmp_path, contradictory_safety=3)

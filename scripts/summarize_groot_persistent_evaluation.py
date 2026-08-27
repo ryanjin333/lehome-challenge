@@ -100,32 +100,49 @@ def _augment_first_hundred_metrics(report: Mapping[str, object]) -> dict[str, ob
     return result
 
 
-def _simple_evidence_index(root: Path, name: str, identity_key: str) -> tuple[dict[str, tuple[Path, dict[str, object]]], set[str]]:
-    """Index simple-curriculum evidence, retaining malformed files as invalid work."""
-    indexed: dict[str, tuple[Path, dict[str, object]]] = {}
-    invalid: set[str] = set()
-    for path in root.rglob(name):
-        if path.is_symlink() or not path.is_file():
-            invalid.add(f"unsafe:{name}:{path.relative_to(root)}")
-            continue
+def _simple_evidence_indexes(
+    root: Path,
+) -> tuple[dict[str, tuple[Path, dict[str, object]]], dict[str, tuple[Path, dict[str, object]]], set[tuple[str, str]]]:
+    """Index gate evidence without following symlinked files or directories."""
+    indexed = {"episode.json": {}, "worker-receipt.json": {}}
+    identity_keys = {"episode.json": "episode_id", "worker-receipt.json": "attempt_id"}
+    invalid: set[tuple[str, str]] = set()
+    pending = [root]
+    while pending:
+        directory = pending.pop()
         try:
-            payload = _simple_json_object(path, name, campaign_root=root)
-        except ValueError:
-            invalid.add(f"malformed:{name}:{path.relative_to(root)}")
-            continue
-        identity = payload.get(identity_key)
-        if not isinstance(identity, str) or not identity:
-            invalid.add(f"identity:{name}:{identity!r}:{path.relative_to(root)}")
-            continue
-        if identity in indexed:
-            invalid.add(f"duplicate:{name}:{identity}")
-            prior_path, prior_payload = indexed[identity]
-            if (name == "worker-receipt.json" and payload.get("output_dir") == str(path.parent)
-                    and prior_payload.get("output_dir") != str(prior_path.parent)):
-                indexed[identity] = (path, payload)
-            continue
-        indexed[identity] = (path, payload)
-    return indexed, invalid
+            with os.scandir(directory) as entries:
+                for entry in sorted(entries, key=lambda item: item.name):
+                    path = Path(entry.path)
+                    relative = path.relative_to(root).as_posix()
+                    if entry.is_symlink():
+                        invalid.add(("unsafe", relative))
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(path)
+                        continue
+                    if entry.name not in indexed:
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        invalid.add(("unsafe", relative))
+                        continue
+                    try:
+                        payload = _simple_json_object(path, entry.name, campaign_root=root)
+                    except ValueError:
+                        invalid.add(("malformed", relative))
+                        continue
+                    identity = payload.get(identity_keys[entry.name])
+                    if not isinstance(identity, str) or not identity:
+                        invalid.add(("identity", relative))
+                        continue
+                    target = indexed[entry.name]
+                    if identity in target:
+                        invalid.add(("duplicate", relative))
+                        continue
+                    target[identity] = (path, payload)
+        except OSError:
+            invalid.add(("unsafe", directory.relative_to(root).as_posix()))
+    return indexed["episode.json"], indexed["worker-receipt.json"], invalid
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -249,15 +266,22 @@ def _build_simple_first_hundred_report(
         terminal: dict[str, tuple[str, dict[str, object]]] = {}
         pending: dict[str, tuple[str, str, str]] = {}
         completed_at_ns = 0
-        invalid_executions: set[tuple[object, object]] = set()
-        infrastructure_attempts: set[str] = set()
+        invalid_executions: set[tuple[object, ...]] = set()
+        infrastructure_by_lease: dict[tuple[str, str], set[tuple[object, ...]]] = defaultdict(set)
+        infrastructure_without_lease: list[tuple[str, tuple[object, ...]]] = []
         for event in ledger.execute("SELECT event_id, at_ns, event_type, attempt_id, lease_id, worker_id, payload_json FROM events ORDER BY event_id"):
             event_type = event["event_type"]
             ledger_id = event["attempt_id"]
             if event_type in {"infrastructure_abort", "retryable", "lease_expired", "preempted", "interrupted"}:
-                invalid_executions.add((ledger_id, event["lease_id"] or event["event_id"]))
-                if isinstance(ledger_id, str):
-                    infrastructure_attempts.add(ledger_id)
+                key = (
+                    "infrastructure-execution", ledger_id,
+                    event["lease_id"] if isinstance(event["lease_id"], str) else event["event_id"],
+                )
+                invalid_executions.add(key)
+                if isinstance(ledger_id, str) and isinstance(event["lease_id"], str):
+                    infrastructure_by_lease[(ledger_id, event["lease_id"])].add(key)
+                elif isinstance(ledger_id, str):
+                    infrastructure_without_lease.append((ledger_id, key))
             elif event_type == "terminal_pending_validation":
                 try:
                     payload = json.loads(event["payload_json"])
@@ -280,11 +304,36 @@ def _build_simple_first_hundred_report(
                     raise ValueError("evaluation terminal payload is invalid")
                 terminal[str(ledger_id)] = (str(event_type), payload)
                 completed_at_ns = max(completed_at_ns, int(event["at_ns"]))
-    episodes, invalid_episode_evidence = _simple_evidence_index(campaign_root, "episode.json", "episode_id")
-    receipts, invalid_receipt_evidence = _simple_evidence_index(campaign_root, "worker-receipt.json", "attempt_id")
-    invalid_evidence = invalid_episode_evidence | invalid_receipt_evidence
-    finalized_evidence_keys: dict[str, tuple[str, str, str, str]] = {}
+        for ledger_id, key in infrastructure_without_lease:
+            pending_evidence = pending.get(ledger_id)
+            if pending_evidence is not None:
+                infrastructure_by_lease[(ledger_id, pending_evidence[0])].add(key)
+    episodes, receipts, invalid_evidence = _simple_evidence_indexes(campaign_root)
+    evidence_execution_keys: dict[str, tuple[object, ...]] = {}
+
+    def evidence_key_for_pending(ledger_id: str, pending_evidence: tuple[str, str, str]) -> tuple[object, ...]:
+        matching = infrastructure_by_lease.get((ledger_id, pending_evidence[0]), set())
+        if len(matching) == 1:
+            return next(iter(matching))
+        return _terminal_invalid_key(ledger_id, pending_evidence)
+
+    def register_evidence_path(path: Path, key: tuple[object, ...]) -> None:
+        try:
+            relative = path.absolute().relative_to(campaign_root.absolute())
+        except ValueError:
+            return
+        if any(component in {".", ".."} for component in relative.parts):
+            return
+        evidence_execution_keys[relative.as_posix()] = key
+
     for ledger_id, pending_evidence in pending.items():
+        raw_root = Path(pending_evidence[2])
+        pending_key = evidence_key_for_pending(ledger_id, pending_evidence)
+        register_evidence_path(raw_root, pending_key)
+        register_evidence_path(raw_root / "worker-receipt.json", pending_key)
+        register_evidence_path(raw_root / "raw", pending_key)
+        register_evidence_path(raw_root / "raw" / ledger_id, pending_key)
+        register_evidence_path(raw_root / "raw" / ledger_id / "episode.json", pending_key)
         terminal_evidence = terminal.get(ledger_id)
         if terminal_evidence is None:
             continue
@@ -295,22 +344,21 @@ def _build_simple_first_hundred_report(
         except ValueError:
             continue
         key = _terminal_invalid_key(ledger_id, pending_evidence)
-        finalized_evidence_keys[f"episode.json:{episode_path.relative_to(campaign_root)}"] = key
-        finalized_evidence_keys[f"worker-receipt.json:{receipt_path.relative_to(campaign_root)}"] = key
-    invalid_executions.update(
-        ("evidence", identity) for identity in invalid_evidence
-        if not any(ledger_id in identity for ledger_id in infrastructure_attempts)
-        and not any(identity.endswith(f":{path}") for path in finalized_evidence_keys)
-    )
-    invalid_executions.update(
-        key for path, key in finalized_evidence_keys.items()
-        if any(identity.endswith(f":{path}") for identity in invalid_evidence)
-    )
+        register_evidence_path(receipt_path.parent, key)
+        register_evidence_path(episode_path.parent, key)
+        register_evidence_path(episode_path.parent.parent, key)
+        register_evidence_path(episode_path, key)
+        register_evidence_path(receipt_path, key)
+    invalid_evidence_keys = {
+        evidence_execution_keys.get(relative, ("evidence", reason, relative))
+        for reason, relative in invalid_evidence
+    }
+    invalid_executions.update(invalid_evidence_keys)
     invalid_executions.update(("unbound-episode", ledger_id) for ledger_id in episodes if ledger_id not in assignments)
     invalid_executions.update(("unbound-receipt", ledger_id) for ledger_id in receipts if ledger_id not in assignments)
-    invalid_evidence_by_ledger = {
-        ledger_id for ledger_id in assignments
-        if any(ledger_id in evidence for evidence in invalid_evidence)
+    invalid_terminal_attempts = {
+        key[1] for key in invalid_evidence_keys
+        if len(key) >= 2 and key[0] == "terminal-evidence" and isinstance(key[1], str)
     }
     gate_trials: list[dict[str, object]] = []
     trials: list[dict[str, object]] = []
@@ -322,7 +370,11 @@ def _build_simple_first_hundred_report(
         terminal_evidence = terminal.get(ledger_id)
         pending_evidence = pending.get(ledger_id)
         if terminal_evidence is None or pending_evidence is None:
-            if ledger_id not in invalid_evidence_by_ledger and ledger_id not in infrastructure_attempts:
+            has_infrastructure_event = (
+                pending_evidence is not None
+                and bool(infrastructure_by_lease.get((ledger_id, pending_evidence[0])))
+            )
+            if ledger_id not in invalid_terminal_attempts and not has_infrastructure_event:
                 invalid_executions.add(("incomplete-terminal", ledger_id))
             continue
         try:
@@ -395,8 +447,7 @@ def _build_simple_first_hundred_report(
             }
             _runtime_identity_digest(gate_identity, gate_provenance)
         except (TypeError, ValueError):
-            if ledger_id not in infrastructure_attempts:
-                invalid_executions.add(_terminal_invalid_key(ledger_id, pending_evidence))
+            invalid_executions.add(_terminal_invalid_key(ledger_id, pending_evidence))
             continue
         category = str(assignment["category"]); garment = str(assignment["garment_name"])
         category_scores[category]["episodes"] += 1; garment_scores[garment]["episodes"] += 1
