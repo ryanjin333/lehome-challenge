@@ -81,11 +81,20 @@ pass.
 
 ```bash
 LEHOME_REVIEWED_REVISION="$(git rev-parse HEAD)"
+ssh -o ClearAllForwardings=yes "${LEHOME_VM_SSH_TARGET:?set approved SSH target}" 'mountpoint -q /mnt/lehome'
 ./scripts/stage_simple_curriculum_runtime_code.sh --ssh-target "${LEHOME_VM_SSH_TARGET:?set approved SSH target}"
 printf 'staged reviewed revision: %s\n' "$LEHOME_REVIEWED_REVISION"
 ```
 
-Then log in to that same approved VM and run:
+Carry that exact revision into every remote shell explicitly; do not recompute it
+on the VM:
+
+```bash
+ssh -o ClearAllForwardings=yes "${LEHOME_VM_SSH_TARGET:?set approved SSH target}" \
+  "LEHOME_REVIEWED_REVISION='$LEHOME_REVIEWED_REVISION' bash -lc 'test -n \"\$LEHOME_REVIEWED_REVISION\"'"
+```
+
+Then log in to that same approved VM with that exported value and run:
 
 ```bash
 set -euo pipefail
