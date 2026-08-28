@@ -47,6 +47,7 @@ _ORIGINAL_12K = {
 }
 _RUNTIME_KEYS = frozenset(_ORIGINAL_12K) | frozenset({"rollout_image", "trainer_image"})
 _TRUSTED_GPU_STOP = "/usr/local/libexec/lehome-stop-gpu"
+_EXACT_ROLLOUT_INSTANCE_ID = "computeinstance-u00t6xfqhadrcmssa2"
 _STAGE_ARTIFACTS = {
     "calibration-matrix": frozenset({"matrix", "matrix_receipt"}),
     "calibration-head": frozenset({"matrix", "manifest", "ledger"}),
@@ -779,6 +780,7 @@ class CollectionConfig:
     gpu_stop_command: str | None
     runtime_identity: Mapping[str, object]
     spend_observer: Path | None = None
+    rollout_instance_id: str = _EXACT_ROLLOUT_INSTANCE_ID
 
     def validate(self, *, require_git: bool = False) -> None:
         _safe_directory(self.host_code_root, must_exist=True)
@@ -796,6 +798,8 @@ class CollectionConfig:
                 raise ValueError(f"{label} must be finite, positive, and bounded")
         if self.paid and self.gpu_stop_command != _TRUSTED_GPU_STOP:
             raise ValueError("paid collection requires the fixed trusted GPU stop hook")
+        if self.rollout_instance_id != _EXACT_ROLLOUT_INSTANCE_ID:
+            raise ValueError("collection is pinned to the one approved rollout VM")
         if self.paid and self.spend_observer is None:
             raise ValueError("paid collection requires a typed spend observer")
         if not isinstance(self.runtime_identity, Mapping) or not self.runtime_identity:
@@ -819,6 +823,7 @@ class CollectionConfig:
             "runtime_identity": dict(self.runtime_identity),
             "max_wall_seconds": self.max_wall_seconds, "max_spend_usd": self.max_spend_usd,
             "spend_observer": str(self.spend_observer) if self.spend_observer else None,
+            "rollout_instance_id": self.rollout_instance_id,
         }
 
 
@@ -879,6 +884,18 @@ class CommandRunner:
                 "LEHOME_ENABLE_HF_UPLOAD": "1", "LEHOME_SKIP_ROUND_SEAL": "1",
                 "LEHOME_FRESH_SOURCE_REPORTS_JSON": json.dumps([{"path": str(reports), "sha256": _file_sha(reports)}]),
                 "LEHOME_FRESH_SOURCE_MATRICES_JSON": json.dumps([{"path": str(matrices), "sha256": _file_sha(matrices)}]),
+            })
+            return environment
+        if stage == "final-publication":
+            if set(inputs) != {"terminal_outcome"} or not isinstance(inputs.get("terminal_outcome"), str):
+                raise ValueError("final publication inputs are invalid")
+            environment.update({
+                "LEHOME_CAMPAIGN_ROOT": str(root), "LEHOME_RUN_ID": config.run_id,
+                "LEHOME_ROUND_ID": config.round_id, "LEHOME_TERMINAL_OUTCOME": str(inputs["terminal_outcome"]),
+                "LEHOME_ROLLOUT_INSTANCE_ID": config.rollout_instance_id,
+                "LEHOME_HF_TOKEN_FILE": "/mnt/lehome/secrets/hf_token",
+                "LEHOME_ROLLOUT_REPOSITORY": "ryanjin333/lehome-groot-n17-rollouts",
+                "LEHOME_HF_REVISION": "main",
             })
             return environment
         if stage not in {"calibration-head", "calibration-tail", "curriculum-a", "curriculum-b"}:
@@ -1002,6 +1019,9 @@ class CommandRunner:
             "success-replay": (
                 root / "replay/replay.json", root / "replay/ledger.sqlite3",
                 root / "replay/success-replay-readback-seal.json",
+            ),
+            "final-publication": (
+                root / "reports/final-publication.json", root / "reports/final-publication-readback.json",
             ),
         }
         if stage in {"calibration-head", "calibration-tail", "curriculum-a", "curriculum-b"}:
@@ -1164,12 +1184,28 @@ class CommandRunner:
             if not isinstance(seal, Path):
                 raise ReceiptMismatchError("success replay readback seal is missing")
             return {"artifacts": _descriptors(root, matrix=matrix, ledger=ledger, readback_seal=seal), "result": "complete"}
+        if stage == "final-publication":
+            receipt = root / "reports/final-publication.json"
+            readback = root / "reports/final-publication-readback.json"
+            _validate_final_publication_artifacts(config, receipt=receipt, readback=readback, inputs=inputs)
+            return {"artifacts": _descriptors(root, publication_receipt=receipt, publication_readback=readback)}
         raise RuntimeError(f"fixed {stage} adapter has no canonical output discovery")
 
     def stop_gpu(self, command: str) -> None:
         if command != _TRUSTED_GPU_STOP:
             raise ValueError("GPU stop hook must be the fixed trusted executable")
-        subprocess.run((_TRUSTED_GPU_STOP,), check=True)
+        config = self._require_config()
+        evidence = _canonical_root(config) / "stage-receipts" / "gpu-stop-observation.json"
+        evidence.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            (_TRUSTED_GPU_STOP, "--instance-id", config.rollout_instance_id, "--evidence-path", str(evidence)),
+            check=True,
+            env={
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "LC_ALL": "C", "LEHOME_GPU_STOP_INSTANCE_ID": config.rollout_instance_id,
+                "LEHOME_GPU_STOP_EVIDENCE_PATH": str(evidence),
+            },
+        )
 
 
 def partition_rows(rows: Sequence[Mapping[str, object]], *, parent_matrix_sha256: str, partition_id: str, start: int, end: int) -> tuple[list[dict[str, object]], dict[str, object]]:
@@ -1249,16 +1285,80 @@ def _canonical_root(config: CollectionConfig) -> Path:
     return config.campaign_root.resolve(strict=False)
 
 
+def _verified_stop_observation(config: CollectionConfig) -> tuple[Path, str]:
+    """Require a trusted Nebius API observation, not merely stop dispatch."""
+    path = _canonical_root(config) / "stage-receipts" / "gpu-stop-observation.json"
+    payload = _strict_json_object(path, label="GPU stop observation")
+    required = {
+        "schema_version", "kind", "provider", "instance_id", "state", "verified",
+        "observed_at_utc", "provider_response_sha256",
+    }
+    if (
+        set(payload) != required or payload.get("schema_version") != 1
+        or payload.get("kind") != "lehome_simple_curriculum_verified_gpu_stop_v1"
+        or payload.get("provider") != "nebius_compute_api"
+        or payload.get("instance_id") != config.rollout_instance_id
+        or payload.get("state") != "STOPPED" or payload.get("verified") is not True
+        or not isinstance(payload.get("observed_at_utc"), str)
+        or not isinstance(payload.get("provider_response_sha256"), str)
+        or _HEX.fullmatch(str(payload.get("provider_response_sha256"))) is None
+    ):
+        raise ReceiptMismatchError("GPU stop lacks an authoritative exact-VM STOPPED observation")
+    return path, _file_sha(path)
+
+
+def _validate_final_publication_artifacts(
+    config: CollectionConfig, *, receipt: Path, readback: Path, inputs: Mapping[str, object] | None = None,
+) -> None:
+    published = _strict_json_object(receipt, label="final publication receipt")
+    required = {
+        "schema_version", "kind", "run_id", "round_id", "terminal_outcome", "repository", "remote_prefix",
+        "immutable_revision", "entry_count", "bundle_sha256", "final_seal_sha256", "readback_verified",
+        "public_readback_verified",
+    }
+    if (
+        set(published) != required or published.get("schema_version") != 1
+        or published.get("kind") != "lehome_simple_curriculum_publication_receipt_v1"
+        or published.get("run_id") != config.run_id or published.get("round_id") != config.round_id
+        or published.get("repository") != "ryanjin333/lehome-groot-n17-rollouts"
+        or published.get("remote_prefix") != f"collection-rounds/{config.run_id}"
+        or not isinstance(published.get("immutable_revision"), str) or re.fullmatch(r"[0-9a-f]{40}", published["immutable_revision"]) is None
+        or type(published.get("entry_count")) is not int or int(published["entry_count"]) < 1
+        or any(not isinstance(published.get(key), str) or _HEX.fullmatch(str(published.get(key))) is None for key in ("bundle_sha256", "final_seal_sha256"))
+        or published.get("readback_verified") is not True or published.get("public_readback_verified") is not True
+    ):
+        raise ReceiptMismatchError("final publication receipt is malformed or incomplete")
+    if inputs is not None and published.get("terminal_outcome") != inputs.get("terminal_outcome"):
+        raise ReceiptMismatchError("final publication receipt terminal outcome mismatch")
+    public = _strict_json_object(readback, label="final publication public readback receipt")
+    expected = {
+        "schema_version": 1, "kind": "lehome_simple_curriculum_public_readback_receipt_v1",
+        "publication_receipt_sha256": _file_sha(receipt), "repository": published["repository"],
+        "immutable_revision": published["immutable_revision"], "remote_prefix": published["remote_prefix"],
+        "bundle_sha256": published["bundle_sha256"], "authenticated_readback_verified": True,
+        "anonymous_readback_verified": True,
+    }
+    if public != expected:
+        raise ReceiptMismatchError("final publication public readback receipt is malformed")
+
+
 def _authenticated_output(
     stage: str, output: Mapping[str, object], *, config: CollectionConfig, deep: bool = False,
 ) -> dict[str, object]:
     """Accept only a bounded stage result and hash every referenced byte now."""
     if stage == "gpu-stop":
-        allowed = {"terminal_outcome", "stop_status", "stop_error_type"}
+        allowed = {"terminal_outcome", "stop_status", "stop_error_type", "rollout_instance_id", "verified_stopped", "stop_observation_sha256"}
         if set(output) - allowed or output.get("stop_status") not in {"not_required", "pending", "succeeded", "failed"}:
             raise ReceiptMismatchError("GPU stop state is invalid")
         if not isinstance(output.get("terminal_outcome"), str): raise ReceiptMismatchError("GPU stop state is invalid")
         if "stop_error_type" in output and not isinstance(output["stop_error_type"], str): raise ReceiptMismatchError("GPU stop state is invalid")
+        if output.get("stop_status") == "succeeded" and config.paid:
+            if (
+                output.get("rollout_instance_id") != config.rollout_instance_id
+                or output.get("verified_stopped") is not True
+                or output.get("stop_observation_sha256") != _verified_stop_observation(config)[1]
+            ):
+                raise ReceiptMismatchError("GPU stop receipt lacks verified stopped-state evidence")
         return dict(output)
     required = _STAGE_ARTIFACTS.get(stage, frozenset())
     allowed = {"artifacts"}
@@ -1325,6 +1425,16 @@ def _authenticated_output(
             )
         except (ValueError, OSError) as error:
             raise ReceiptMismatchError("fresh report deep authentication failed") from error
+    if deep and stage == "final-publication":
+        expected = {
+            "publication_receipt": "reports/final-publication.json",
+            "publication_readback": "reports/final-publication-readback.json",
+        }
+        if {name: item["path"] for name, item in checked.items()} != expected:
+            raise ReceiptMismatchError("final publication stage output is not canonical")
+        _validate_final_publication_artifacts(
+            config, receipt=root / expected["publication_receipt"], readback=root / expected["publication_readback"],
+        )
     return result
 
 
@@ -1510,22 +1620,40 @@ def _stop_terminal(journal: StageJournal, runner: Runner, config: CollectionConf
     try:
         assert config.gpu_stop_command is not None
         runner.stop_gpu(config.gpu_stop_command)
+        _observation, observation_sha = _verified_stop_observation(config)
     except Exception as error:
         journal.write_stop_state(predecessor, outcome, "failed")
         journal.complete("gpu-stop", predecessor, {"terminal_outcome": outcome, "stop_status": "failed", "stop_error_type": type(error).__name__}, inputs=stop_inputs)
         return "infrastructure_stop_failure"
     journal.write_stop_state(predecessor, outcome, "succeeded")
-    journal.complete("gpu-stop", predecessor, {"terminal_outcome": outcome, "stop_status": "succeeded"}, inputs=stop_inputs)
+    journal.complete("gpu-stop", predecessor, {
+        "terminal_outcome": outcome, "stop_status": "succeeded",
+        "rollout_instance_id": config.rollout_instance_id, "verified_stopped": True,
+        "stop_observation_sha256": observation_sha,
+    }, inputs=stop_inputs)
     return str(outcome)
 
 
-def _attempt_terminal_publication(journal: StageJournal, runner: Runner, predecessor: str | None, outcome: str) -> str | None:
-    """Publication is best effort on an abort; stop remains mandatory without it."""
-    try:
-        _, receipt = _stage(journal, runner, "final-publication", predecessor, terminal_outcome=outcome)
-    except Exception:
-        return None
-    return receipt
+def _stop_then_publish(journal: StageJournal, runner: Runner, config: CollectionConfig, *, predecessor: str | None, outcome: str) -> str:
+    """Stop before final publication; never turn a failed publisher into success.
+
+    The public complete seal must bind authoritative stopped-state evidence,
+    so final publication is intentionally downstream of the durable stop
+    receipt.  A restart can retry only this publication boundary, never the
+    paid collection or stop hook.
+    """
+    final_outcome = _stop_terminal(journal, runner, config, predecessor=predecessor, outcome=outcome)
+    raw_stop = _strict_json_object(journal.path("gpu-stop"), label="GPU stop receipt")
+    stop_receipt = raw_stop.get("receipt_sha256")
+    if not isinstance(stop_receipt, str) or _HEX.fullmatch(stop_receipt) is None:
+        raise ReceiptMismatchError("GPU stop receipt is missing its immutable digest")
+    if final_outcome != outcome:
+        # A failed/ambiguous stop is itself the terminal infrastructure result.
+        # Its public seal cannot claim verified stop; do not publish a false
+        # completion receipt.
+        return final_outcome
+    _stage(journal, runner, "final-publication", stop_receipt, terminal_outcome=final_outcome)
+    return final_outcome
 
 
 def _existing_terminal_outcome(journal: StageJournal) -> str | None:
@@ -1575,6 +1703,17 @@ def run_collection(config: CollectionConfig, *, runner: Runner) -> str:
         runner.budget_check = journal.check_budget
     existing_terminal = _existing_terminal_outcome(journal)
     if existing_terminal is not None:
+        # A post-stop process crash can leave the only safe retryable boundary
+        # (public readback) unfinished.  Never re-enter collection or stop.
+        if existing_terminal == "infrastructure_stop_failure" and not journal.path("gpu-stop").is_file():
+            return existing_terminal
+        raw_stop = _strict_json_object(journal.path("gpu-stop"), label="GPU stop receipt")
+        stop_receipt = raw_stop.get("receipt_sha256")
+        if not isinstance(stop_receipt, str) or _HEX.fullmatch(stop_receipt) is None:
+            raise ReceiptMismatchError("GPU stop receipt is missing its immutable digest")
+        final = journal._read("final-publication", stop_receipt, {"terminal_outcome": existing_terminal})
+        if final is None:
+            _stage(journal, runner, "final-publication", stop_receipt, terminal_outcome=existing_terminal)
         return existing_terminal
     try:
         calibration_matrix, predecessor = _stage(journal, runner, "calibration-matrix", predecessor)
@@ -1604,14 +1743,11 @@ def run_collection(config: CollectionConfig, *, runner: Runner) -> str:
         else:
             outcome = str(decision)
     except ReceiptMismatchError:
-        predecessor = _attempt_terminal_publication(journal, runner, predecessor, "infrastructure_stop_failure") or predecessor
-        _stop_terminal(journal, runner, config, predecessor=predecessor, outcome="infrastructure_stop_failure")
+        _stop_then_publish(journal, runner, config, predecessor=predecessor, outcome="infrastructure_stop_failure")
         raise
     except Exception:
-        predecessor = _attempt_terminal_publication(journal, runner, predecessor, "infrastructure_stop_failure") or predecessor
-        return _stop_terminal(journal, runner, config, predecessor=predecessor, outcome="infrastructure_stop_failure")
-    predecessor = _attempt_terminal_publication(journal, runner, predecessor, outcome) or predecessor
-    return _stop_terminal(journal, runner, config, predecessor=predecessor, outcome=str(outcome))
+        return _stop_then_publish(journal, runner, config, predecessor=predecessor, outcome="infrastructure_stop_failure")
+    return _stop_then_publish(journal, runner, config, predecessor=predecessor, outcome=str(outcome))
 
 
 def _parser() -> argparse.ArgumentParser:

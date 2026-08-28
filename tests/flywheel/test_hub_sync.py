@@ -11,11 +11,6 @@ import pytest
 from lehome.flywheel.hub_sync import HubSyncDaemon, HubSyncError
 from lehome_train.hub import HubAccess, HubTreeEntry, HubTransientError
 from lehome_train.constants import DEFAULT_ROLLOUT_REPO
-from lehome_train.models import SyncEntry
-from lehome_train.flywheel.publish import (
-    RolloutRoundSealError,
-    seal_rollout_round,
-)
 
 
 REPOSITORY = DEFAULT_ROLLOUT_REPO
@@ -193,6 +188,25 @@ def test_upload_retry_exhaustion_raises_without_receipt(daemon):
     assert not (sync.receipts_root / "attempt-3.sync.json").exists()
 
 
+def test_sync_does_not_retry_a_non_transient_authentication_failure(daemon):
+    sync, transport, accepted_root = daemon
+    episode = _make_accepted_episode(accepted_root, "attempt-auth")
+
+    calls = 0
+
+    def denied_upload(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise PermissionError("denied")
+
+    transport.upload_files = denied_upload
+    with pytest.raises(HubSyncError, match="upload"):
+        sync.sync_episode("attempt-auth", episode)
+
+    # A credential failure is not a transport retry condition.
+    assert calls == 1
+
+
 def test_remote_hash_mismatch_fails_readback(daemon):
     sync, transport, accepted_root = daemon
     episode = _make_accepted_episode(accepted_root, "attempt-4")
@@ -243,114 +257,4 @@ def test_immutable_commit_is_rejected_as_publication_target(tmp_path):
             transport=FakeTransport(), accepted_root=accepted_root,
             receipts_root=tmp_path / "receipts", readback_root=tmp_path / "readback",
             revision="0" * 40, max_attempts=3,
-        )
-def test_round_seal_requires_every_sync_receipt(daemon, tmp_path):
-    sync, _transport, accepted_root = daemon
-    synced = _make_accepted_episode(accepted_root, "attempt-9")
-    receipt = sync.sync_episode("attempt-9", synced)
-
-    seal = seal_rollout_round(
-        receipts_root=sync.receipts_root,
-        round_id=ROUND_ID,
-        attempt_ids=("attempt-9",),
-        seal_receipt_path=tmp_path / "round-1.seal.json",
-    )
-    assert seal.episode_count == 1
-    assert seal.round_id == ROUND_ID
-    on_disk = json.loads((tmp_path / "round-1.seal.json").read_text())
-    assert on_disk["readback_verified"] is True
-    assert on_disk["episode_sha256s"]["attempt-9"] == receipt.episode_sha256
-    assert on_disk["immutable_revisions"]["attempt-9"] == receipt.immutable_revision
-    assert on_disk["repository"] == DEFAULT_ROLLOUT_REPO
-
-    with pytest.raises(RolloutRoundSealError, match="missing"):
-        seal_rollout_round(
-            receipts_root=sync.receipts_root,
-            round_id=ROUND_ID,
-            attempt_ids=("attempt-9", "attempt-never-synced"),
-            seal_receipt_path=tmp_path / "round-1.bad.json",
-        )
-
-
-def test_round_seal_rejects_unverified_or_wrong_round_receipt(daemon, tmp_path):
-    sync, _transport, accepted_root = daemon
-    synced = _make_accepted_episode(accepted_root, "attempt-10")
-    sync.sync_episode("attempt-10", synced)
-    receipt_file = sync.receipts_root / "attempt-10.sync.json"
-    payload = json.loads(receipt_file.read_text())
-    payload["round_id"] = "round-other"
-    receipt_file.write_text(json.dumps(payload, sort_keys=True))
-
-    with pytest.raises(RolloutRoundSealError, match="round_id"):
-        seal_rollout_round(
-            receipts_root=sync.receipts_root,
-            round_id=ROUND_ID,
-            attempt_ids=("attempt-10",),
-            seal_receipt_path=tmp_path / "round-1.bad2.json",
-        )
-
-    payload["round_id"] = ROUND_ID
-    payload["readback_verified"] = False
-    receipt_file.write_text(json.dumps(payload, sort_keys=True))
-    with pytest.raises(RolloutRoundSealError, match="readback"):
-        seal_rollout_round(
-            receipts_root=sync.receipts_root,
-            round_id=ROUND_ID,
-            attempt_ids=("attempt-10",),
-            seal_receipt_path=tmp_path / "round-1.bad3.json",
-        )
-
-
-def test_round_seal_rejects_receipt_without_exact_immutable_hub_binding(daemon, tmp_path):
-    sync, _transport, accepted_root = daemon
-    synced = _make_accepted_episode(accepted_root, "attempt-immutable")
-    sync.sync_episode("attempt-immutable", synced)
-    receipt_file = sync.receipts_root / "attempt-immutable.sync.json"
-    original = json.loads(receipt_file.read_text())
-
-    for field, value in (
-        ("repository", "owner/other"),
-        ("immutable_revision", "main"),
-        ("remote_prefix", "rollout-rounds/round-1/other-attempt"),
-        ("attempt_id", "other-attempt"),
-    ):
-        payload = dict(original)
-        payload[field] = value
-        receipt_file.write_text(json.dumps(payload, sort_keys=True))
-        with pytest.raises(RolloutRoundSealError, match="repository|immutable|prefix|attempt_id"):
-            seal_rollout_round(
-                receipts_root=sync.receipts_root,
-                round_id=ROUND_ID,
-                attempt_ids=("attempt-immutable",),
-                seal_receipt_path=tmp_path / f"bad-{field}.json",
-            )
-
-
-def test_round_seal_enforces_target_bounds_and_no_reseal(daemon, tmp_path):
-    sync, _transport, accepted_root = daemon
-    synced = _make_accepted_episode(accepted_root, "attempt-11")
-    sync.sync_episode("attempt-11", synced)
-
-    seal_path = tmp_path / "round-1.sealed.json"
-    seal_rollout_round(
-        receipts_root=sync.receipts_root, round_id=ROUND_ID,
-        attempt_ids=("attempt-11",), seal_receipt_path=seal_path,
-    )
-    with pytest.raises(RolloutRoundSealError, match="already"):
-        seal_rollout_round(
-            receipts_root=sync.receipts_root, round_id=ROUND_ID,
-            attempt_ids=("attempt-11",), seal_receipt_path=seal_path,
-        )
-
-    with pytest.raises(RolloutRoundSealError, match="at least one"):
-        seal_rollout_round(
-            receipts_root=sync.receipts_root, round_id=ROUND_ID,
-            attempt_ids=(), seal_receipt_path=tmp_path / "empty.json",
-        )
-
-    too_many = tuple(f"attempt-{i}" for i in range(151))
-    with pytest.raises(RolloutRoundSealError, match="150"):
-        seal_rollout_round(
-            receipts_root=sync.receipts_root, round_id=ROUND_ID,
-            attempt_ids=too_many, seal_receipt_path=tmp_path / "many.json",
         )

@@ -34,6 +34,18 @@ class HubSyncError(RuntimeError):
     """Publication or readback failed; no receipt may be claimed."""
 
 
+def _is_transient_transport_error(error: BaseException) -> bool:
+    """Keep credential/validation failures fail-closed and single-shot.
+
+    ``hub_sync`` intentionally does not import the trainer runtime: it is
+    also used by the rollout appliance's lightweight finalizer.  The shared
+    transport exposes its only retryable failures under these two canonical
+    class names.
+    """
+
+    return type(error).__name__ in {"HubTransientError", "HubRateLimitError"}
+
+
 @dataclass(frozen=True, slots=True)
 class SyncEntry:
     """One accepted-episode file selected for immutable publication."""
@@ -244,6 +256,8 @@ class HubSyncDaemon:
                 return operation()
             except Exception as error:  # noqa: BLE001 - transport errors are heterogeneous
                 last_error = error
+                if not _is_transient_transport_error(error):
+                    break
         raise HubSyncError(f"{label} failed after {self._max_attempts} attempts: {last_error}") from last_error
 
     def sync_episode(self, attempt_id: str, episode_dir: Path) -> SyncReceipt:

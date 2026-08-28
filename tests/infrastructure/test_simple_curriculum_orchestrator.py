@@ -44,13 +44,37 @@ class FakeRunner:
         if stage == self.fail_stage: raise RuntimeError("preempted")
         if self.root is None:
             return {"stage": stage}
+        if stage == "final-publication":
+            terminal_outcome = _kwargs["terminal_outcome"]
+            receipt = self.root / "reports" / "final-publication.json"
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            receipt.write_text(json.dumps({
+                "schema_version": 1, "kind": "lehome_simple_curriculum_publication_receipt_v1",
+                "run_id": "fresh-run-20260828", "round_id": "fresh-12k-20260828",
+                "terminal_outcome": terminal_outcome, "repository": "ryanjin333/lehome-groot-n17-rollouts",
+                "remote_prefix": "collection-rounds/fresh-run-20260828", "immutable_revision": "a" * 40,
+                "entry_count": 1, "bundle_sha256": "b" * 64, "final_seal_sha256": "c" * 64,
+                "readback_verified": True, "public_readback_verified": True,
+            }, sort_keys=True), encoding="utf-8")
+            readback = self.root / "reports" / "final-publication-readback.json"
+            readback.write_text(json.dumps({
+                "schema_version": 1, "kind": "lehome_simple_curriculum_public_readback_receipt_v1",
+                "publication_receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+                "repository": "ryanjin333/lehome-groot-n17-rollouts", "immutable_revision": "a" * 40,
+                "remote_prefix": "collection-rounds/fresh-run-20260828", "bundle_sha256": "b" * 64,
+                "authenticated_readback_verified": True, "anonymous_readback_verified": True,
+            }, sort_keys=True), encoding="utf-8")
+            return {"artifacts": {
+                "publication_receipt": {"path": receipt.relative_to(self.root).as_posix(), "sha256": hashlib.sha256(receipt.read_bytes()).hexdigest()},
+                "publication_readback": {"path": readback.relative_to(self.root).as_posix(), "sha256": hashlib.sha256(readback.read_bytes()).hexdigest()},
+            }}
         names = {
             "calibration-matrix": ("matrix", "matrix_receipt"), "calibration-head": ("matrix", "manifest", "ledger"),
             "first-100-gate": ("report", "gate_receipt"), "calibration-tail": ("matrix", "manifest", "ledger"),
             "calibration-report": ("report",), "curriculum-matrix": ("matrix", "matrix_receipt"),
             "curriculum-a": ("matrix", "manifest", "ledger"), "curriculum-b": ("matrix", "manifest", "ledger"),
             "fresh-report": ("report", "matrix", "terminal_artifact_manifest"), "replay-matrix": ("matrix", "matrix_receipt"),
-            "success-replay": ("matrix", "ledger", "readback_seal"), "final-publication": ("publication_receipt", "publication_readback"),
+            "success-replay": ("matrix", "ledger", "readback_seal"),
         }[stage]
         artifacts = {}
         for name in names:
@@ -69,6 +93,16 @@ class FakeRunner:
     def stop_gpu(self, _command: str) -> None:
         self.stops += 1
         if self.fail_stop: raise RuntimeError("stop unavailable")
+        if self.root is not None:
+            observation = {
+                "schema_version": 1, "kind": "lehome_simple_curriculum_verified_gpu_stop_v1",
+                "provider": "nebius_compute_api", "instance_id": "computeinstance-u00t6xfqhadrcmssa2",
+                "state": "STOPPED", "verified": True, "observed_at_utc": "2026-08-28T00:00:00Z",
+                "provider_response_sha256": "c" * 64,
+            }
+            path = self.root / "stage-receipts" / "gpu-stop-observation.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(observation, sort_keys=True), encoding="utf-8")
 
 
 def _config(module, tmp_path: Path):
@@ -173,6 +207,27 @@ def test_continue_uses_the_exact_order_and_reports_replay_shortage(tmp_path: Pat
         "fresh-report", "replay-matrix", "success-replay", "final-publication",
     ]
     assert runner.stops == 1
+
+
+def test_final_publication_runs_only_after_the_terminal_gpu_stop(tmp_path: Path) -> None:
+    module = _module(); config = _config(module, tmp_path)
+
+    class OrderedRunner(FakeRunner):
+        def __init__(self):
+            super().__init__(config.campaign_root)
+            self.events: list[str] = []
+
+        def run(self, stage: str, **kwargs):
+            self.events.append(stage)
+            return super().run(stage, **kwargs)
+
+        def stop_gpu(self, command: str) -> None:
+            self.events.append("gpu-stop")
+            super().stop_gpu(command)
+
+    runner = OrderedRunner()
+    assert module.run_collection(config, runner=runner) == "complete"
+    assert runner.events.index("gpu-stop") < runner.events.index("final-publication")
 
 
 def test_restart_validates_receipts_without_repeating_terminal_stages(tmp_path: Path) -> None:
