@@ -24,6 +24,33 @@ _TERMINAL_EVALUATION_ROW_KEYS = {"trial_id", "category", "garment_name", "releas
 _TERMINAL_80_ALIAS_KEYS = {"attempt_id", "garment"}
 
 
+def _has_valid_success_replay_attempt_bounds(
+    matrix: list[Mapping[str, object]], args: argparse.Namespace,
+) -> bool:
+    """Admit the legacy 150 ceiling or the one reviewed fresh 200 tuple.
+
+    ``validate_success_replay_descriptor`` authenticates the matrix before this
+    predicate runs.  In particular, its only 200-cap form is the fresh 4x100
+    visual-only source with four 50-success category caps.  Keep the worker's
+    local boundary just as narrow, so an ordinary replay cannot inherit the
+    higher TaskLedger ceiling merely by setting a numeric target.
+    """
+
+    if (
+        type(args.max_attempts) is not int
+        or args.max_attempts != len(matrix)
+        or type(args.target_accepted) is not int
+    ):
+        return False
+    if 1 <= args.target_accepted <= min(150, len(matrix)):
+        return True
+    return (
+        args.max_attempts == 400
+        and len(matrix) == 400
+        and args.target_accepted == 200
+    )
+
+
 def simple_curriculum_collection_from_environ(environ: Mapping[str, str]) -> bool:
     """Parse the one outer-process marker without leaking environment reads inward."""
 
@@ -529,12 +556,7 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
 
             try:
                 validate_success_replay_descriptor(args.attempt_matrix)
-                if (
-                    type(args.max_attempts) is not int
-                    or args.max_attempts != len(matrix)
-                    or type(args.target_accepted) is not int
-                    or not 1 <= args.target_accepted <= min(150, len(matrix))
-                ):
+                if not _has_valid_success_replay_attempt_bounds(matrix, args):
                     raise ValueError("CPU success replay attempt bounds are invalid")
             except (OSError, TypeError, ValueError) as error:
                 raise ValueError("CPU success replay campaign is invalid") from error

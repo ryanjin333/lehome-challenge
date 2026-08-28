@@ -406,6 +406,11 @@ class PersistentRolloutWorker:
                     f"({_PREPARATION_TIMEOUT_REASON})"
                 )
             scoped_assignment = dict(assignment)
+            # TaskLedger derives the durable attempt identifier from the
+            # immutable logical assignment.  Recorder artifacts, receipts,
+            # and finalization all bind to that ledger identifier, never the
+            # caller-facing logical label inside the matrix.
+            scoped_assignment["attempt_id"] = attempt_id
             scoped_assignment["simple_curriculum_collection"] = (
                 self._simple_curriculum_collection or self._fidelity_diagnostic
             )

@@ -618,10 +618,21 @@ def _build_simple_first_hundred_report(
             "episode_sha256": _sha256_file(episode_path), "worker_receipt_sha256": _sha256_file(receipt_path),
         }
         if include_logical_assignment:
+            # The durable receipt retains post-reset health observations
+            # (cloth readback/contact canary).  A partition report exposes
+            # only the reviewed five-device tuple; its downstream fresh-source
+            # contract deliberately rejects optional runtime diagnostics.
+            report_runtime = {
+                key: runtime[key]
+                for key in (
+                    "simulation_device", "cloth_device", "renderer_device",
+                    "camera_device", "policy_device",
+                )
+            }
             trial.update({
                 "assignment_id": assignment["attempt_id"],
                 "finalized_artifact_root": str(expected_episode_path.parents[2]),
-                "runtime": dict(runtime),
+                "runtime": report_runtime,
                 "fidelity": dict(fidelity),
                 "accepted_success": official_success,
                 "outcome": "success" if official_success else "failure",

@@ -8,6 +8,7 @@ import sqlite3
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from lehome.flywheel.simple_curriculum import build_calibration_rows
@@ -231,6 +232,243 @@ def _simple_campaign(tmp_path: Path, *, rows: list[dict[str, object]] | None = N
     return root, matrix, rows, ledger_ids
 
 
+def _real_persistent_campaign(
+    tmp_path: Path,
+    *,
+    rows: list[dict[str, object]],
+    campaign_root: Path,
+    matrix_path: Path,
+    policy: dict[str, object],
+    campaign_round_id: str,
+    campaign_run_id: str,
+) -> tuple[Path, Path, list[dict[str, object]]]:
+    """Drive terminal evidence through the real worker/manifest/recorder seam.
+
+    Isaac itself is intentionally absent on the controller host.  This local
+    session is the same narrow seam used by the persistent worker: it authors
+    the real attempt manifest, reloads its immutable identity, records the
+    episode with ``AutonomousRecorder``, then lets ``PersistentRolloutWorker``
+    author the worker receipt and the real finalizer settle the ledger.  It
+    deliberately does not handwrite any reviewed terminal evidence.
+    """
+
+    from lehome.flywheel.artifact_queue import ArtifactFinalizationQueue
+    from lehome.flywheel.fidelity import fidelity_receipt
+    from lehome.flywheel.isaac_recorder import AutonomousRecorder, CANONICAL_VIDEO_FILENAMES
+    from lehome.flywheel.models import EpisodeIdentity
+    from lehome.flywheel.persistent_manifest import write_persistent_flywheel_manifest
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+    from lehome.flywheel.snapshots import Snapshot
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    campaign_root.mkdir(parents=True, exist_ok=False)
+    matrix_path.parent.mkdir(parents=True, exist_ok=True)
+    matrix_path.write_bytes(_canonical(rows))
+    ledger = TaskLedger(
+        campaign_root / "ledger.sqlite3", attempt_matrix=rows,
+        max_attempts=len(rows), target_accepted=len(rows),
+        completion_metric="terminal_outcomes",
+    )
+    finalizer = ArtifactFinalizationQueue(
+        run_root=campaign_root, ledger=ledger, max_pending_items=1,
+        max_pending_bytes=1 << 30, evaluation_only=True,
+    )
+
+    class _FinalizingController:
+        def lease_next(self, worker_id: str):
+            return ledger.lease_next(worker_id, lease_duration_ns=1_000_000_000)
+
+        def record_terminal(self, worker_id: str, attempt_id: str, lease_id: str, raw_artifact_id: str):
+            ledger.record_terminal(worker_id, attempt_id, lease_id, raw_artifact_id)
+            finalizer.enqueue(worker_id, attempt_id, lease_id, Path(raw_artifact_id))
+            result = finalizer.finalize_next()
+            assert result is not None
+            if result.outcome not in {"accepted", "rejected"}:
+                raise AssertionError(f"real terminal finalization failed: {result.reason}")
+            return result
+
+        def status(self, attempt_id: str) -> str:
+            return ledger.status(attempt_id)
+
+        def heartbeat(self, worker_id: str, attempt_id: str, lease_id: str):
+            return ledger.heartbeat(worker_id, attempt_id, lease_id, lease_duration_ns=1_000_000_000)
+
+    class _Policy:
+        action_horizon = 16
+
+        def reset(self) -> None:
+            pass
+
+    successful_seeds = {int(row["seed"]) for row in rows[:5]}
+    manifest_args = SimpleNamespace(
+        policy_repo=policy["policy_repo"], policy_revision=policy["policy_revision"],
+        policy_step=policy["policy_step"], policy_artifact_sha256=policy["policy_artifact_sha256"],
+        campaign_round_id=campaign_round_id, campaign_run_id=campaign_run_id,
+        device="cpu", policy_device="cuda:0",
+    )
+
+    class _ManifestRecorderSession:
+        runtime_receipt = {
+            "simulation_device": "cpu", "cloth_device": "cpu",
+            "cloth_backend": "usd_local_points_v1", "cloth_readback": {"observed": True},
+            "visible_contact_canary": {"observed": True},
+            "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0",
+        }
+
+        def prepare_episode(self, **_kwargs) -> None:
+            pass
+
+        def run_episode(self, *, assignment, attempt_output_dir: Path, **_kwargs):
+            manifest_path = write_persistent_flywheel_manifest(
+                attempt_output_dir, assignment, manifest_args,
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            identity = EpisodeIdentity(**manifest["identity"])
+            recorder = AutonomousRecorder(
+                attempt_output_dir, policy_revision=str(manifest["policy_revision"]),
+                episode_id=str(manifest["episode_id"]), identity=identity,
+                provenance={
+                    "policy_artifact_sha256": manifest["policy_artifact_sha256"],
+                    "image_identity": manifest["image_identity"],
+                    "simulator_device": manifest["simulator_device"],
+                    "policy_device": manifest["policy_device"],
+                },
+                simple_curriculum_collection=True,
+            )
+
+            def encode(root: Path, *, fps: int = 30) -> tuple[str, ...]:
+                del fps
+                videos = root / "videos"
+                videos.mkdir(exist_ok=True)
+                for filename in CANONICAL_VIDEO_FILENAMES:
+                    (videos / filename).write_bytes(b"recorded-video")
+                return CANONICAL_VIDEO_FILENAMES
+
+            recorder.video_sink.encode = encode
+            # ``EvaluationSession`` writes its rollout gallery videos at the
+            # attempt root after the recorder seals its immutable raw
+            # episode.  The queue validates that production handoff layout,
+            # while ``encode`` above proves the actual recorder path too.
+            encode(attempt_output_dir)
+            snapshot = Snapshot(
+                3, (0.0,) * 12, (0.0,) * 12,
+                ((0.0, 0.0, 0.0),), ((0.0, 0.0, 0.0),),
+                {"seed": identity.seed}, identity.garment_name, {"strategy": "canonical"},
+                cloth_state_authority="usd_local_points_v1",
+            )
+            observation = {
+                "observation.state": np.zeros(12, dtype=np.float32),
+                "observation.images.top_rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+                "observation.images.left_rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+                "observation.images.right_rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+            }
+            succeeded = identity.seed in successful_seeds
+            recorder.record_snapshot("reset", snapshot)
+            recorder.record_step(
+                observation, np.zeros(12, dtype=np.float32), reward=1.0 if succeeded else 0.0,
+                success=succeeded, request_id=f"request-{identity.episode_id}", chunk_offset=0,
+            )
+            recorder.record_snapshot("terminal", snapshot)
+            recorded = recorder.finish(
+                reason="success" if succeeded else "horizon", accepted_success=succeeded,
+                visible_contact={
+                    "observed": True, "source": "simulator_particle_to_gripper_distance",
+                    "minimum_distance_m": 0.001,
+                },
+                fidelity=fidelity_receipt(
+                    missing_cloth=False, cloth_flight=False, nonfinite_cloth_state=False,
+                    safety_failure=False, monitor_active=True, monitor_observed=True,
+                ),
+            )
+            recorded_episode = json.loads((recorded.path / "episode.json").read_text(encoding="utf-8"))
+            assert recorded_episode["identity"] == manifest["identity"]
+            assert recorded_episode["identity"]["episode_id"] == assignment["attempt_id"]
+            assert recorded_episode["provenance"]["policy_artifact_sha256"] == manifest["policy_artifact_sha256"]
+            assert recorded_episode["fidelity"]["monitor_observed"] is True
+            return {"success": succeeded, "metrics": []}
+
+        def close(self) -> None:
+            pass
+
+    try:
+        worker = PersistentRolloutWorker(
+            worker_id="worker", session_id="session", controller=_FinalizingController(),
+            simulator_factory=_ManifestRecorderSession, policy=_Policy(),
+            output_root=campaign_root, renderer_device="cuda:0", policy_device="cuda:0",
+            simulator_device="cpu", heartbeat_interval_seconds=100.0,
+            simple_curriculum_collection=True,
+        )
+        worker.run()
+    finally:
+        ledger.close()
+    return campaign_root, matrix_path, rows
+
+
+def test_real_persistent_launcher_admits_only_the_exact_200_success_replay_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The executable worker must carry the reviewed 4x100/200 tuple intact.
+
+    This calls the production ``run`` boundary rather than settling a ledger
+    fixture by hand.  Descriptor authentication is a separately exhaustive
+    recovery-collection contract; the spy proves this launcher invokes it
+    before constructing the exact 400/200 TaskLedger tuple.
+    """
+
+    import scripts.run_groot_persistent_worker as worker_module
+    import lehome.flywheel.recovery_collection as recovery_collection
+
+    matrix_path = tmp_path / "fresh-replay.json"
+    matrix_path.write_text("[]", encoding="utf-8")
+    matrix = [{"attempt_id": f"fresh-{index}"} for index in range(400)]
+    descriptor_calls: list[Path] = []
+    captured: dict[str, object] = {}
+
+    def validate_descriptor(path: Path) -> list[dict[str, object]]:
+        descriptor_calls.append(Path(path))
+        return matrix
+
+    class _Ledger:
+        def close(self) -> None:
+            pass
+
+    def ledger_factory(_database, **kwargs):
+        captured["ledger"] = kwargs
+        return _Ledger()
+
+    class _Worker:
+        def __init__(self, **kwargs) -> None:
+            captured["worker"] = kwargs
+
+        def run(self) -> list[dict[str, object]]:
+            return []
+
+    monkeypatch.setattr(recovery_collection, "validate_success_replay_descriptor", validate_descriptor)
+    monkeypatch.setattr(worker_module, "_load_matrix", lambda _path: matrix)
+    monkeypatch.setattr(worker_module, "PersistentRolloutWorker", _Worker)
+    monkeypatch.setenv("LEHOME_SUCCESS_REPLAY_CAMPAIGN", "1")
+    args = SimpleNamespace(
+        lease_seconds=30.0, preparation_timeout_seconds=30.0,
+        source_finalization_timeout_seconds=30.0, device="cpu",
+        renderer_device="cuda:0", policy_device="cuda:0", database=tmp_path / "ledger.sqlite3",
+        attempt_matrix=matrix_path, max_attempts=400, target_accepted=200,
+        completion_metric="accepted_successes", simple_curriculum_collection=False,
+        fidelity_diagnostic=False, worker_id="worker", session_id="session",
+        output_root=tmp_path / "output", initial_garment="Top_Long_Seen_0",
+    )
+
+    assert worker_module.run(args, ledger_factory=ledger_factory) == []
+    assert descriptor_calls == [matrix_path]
+    assert captured["ledger"] == {
+        "attempt_matrix": matrix, "max_attempts": 400,
+        "target_accepted": 200, "completion_metric": "accepted_successes",
+    }
+
+    args.target_accepted = 199
+    with pytest.raises(ValueError, match="CPU success replay campaign is invalid"):
+        worker_module.run(args, ledger_factory=ledger_factory)
+
+
 def test_simple_summary_uses_external_matrix_assignment_ids_and_passes_gate_directly(tmp_path: Path) -> None:
     summary = _module()
     root, matrix, rows, ledger_ids = _simple_campaign(tmp_path)
@@ -287,7 +525,9 @@ def test_simple_partition_report_authenticates_an_unequal_weighted_split(tmp_pat
     }
 
 
-def test_fresh_source_adoption_rehashes_actual_terminal_artifacts_for_all_four_partitions(tmp_path: Path) -> None:
+def test_fresh_source_adoption_rehashes_actual_terminal_artifacts_for_all_four_partitions(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
     """The 1,000-row fresh-source receipt is rooted in real terminal artifacts."""
     from lehome.flywheel.fresh_replay_evidence import (
         PARENT_ARTIFACT_SHA256,
@@ -338,25 +578,21 @@ def test_fresh_source_adoption_rehashes_actual_terminal_artifacts_for_all_four_p
         "curriculum-b": curriculum[300:],
     }
 
-    def canonical_episode(episode: dict[str, object], _index: int) -> None:
-        identity = episode["identity"]
-        provenance = episode["provenance"]
-        assert isinstance(identity, dict) and isinstance(provenance, dict)
-        provenance.update(cloth_device="cpu", renderer_device="cuda:0", camera_device="cuda:0")
-        episode["randomization"] = {"strategy": "canonical"}
-
     for partition, rows in partitions.items():
         partition_root = campaign / "fresh" / partition
         matrix = campaign / "partitions" / f"{partition}.json"
-        root, physical_matrix, _rows, _ledger_ids = _simple_campaign(
+        root, physical_matrix, _rows = _real_persistent_campaign(
             tmp_path, rows=rows, campaign_root=partition_root, matrix_path=matrix,
             policy=policy, campaign_round_id=round_id, campaign_run_id=run_id,
-            episode_mutator=canonical_episode,
         )
+        capsys.readouterr()
         report = summary.build_simple_partition_report(
             campaign_root=root, matrix_path=physical_matrix,
             matrix_sha256=hashlib.sha256(physical_matrix.read_bytes()).hexdigest(), **policy,
         )
+        assert len(report["trials"]) == len(rows)
+        assert {trial["terminal_event"] for trial in report["trials"]} == {"accepted", "rejected"}
+        assert sum(trial["terminal_event"] == "accepted" for trial in report["trials"]) == 5
         report_path = campaign / "reports" / "partitions" / f"{partition}.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_bytes(_canonical(report))

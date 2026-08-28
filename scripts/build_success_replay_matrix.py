@@ -105,9 +105,15 @@ def _episode_artifact_sha256(episode_root: Path) -> str:
     for path in sorted(episode_root.rglob("*"), key=lambda candidate: candidate.as_posix()):
         if path.is_symlink():
             raise ValueError("accepted episode artifact contains a symlink")
-        if not path.is_file() or path.name == "SHA256SUMS.json":
+        if not path.is_file():
             continue
         relative = path.relative_to(episode_root).as_posix()
+        # HubSyncDaemon excludes only the artifact-root index.  Nested raw
+        # recorder manifests are immutable evidence and must stay in the
+        # digest, otherwise a real recorder tree cannot match its readback
+        # receipt.
+        if relative == "SHA256SUMS.json":
+            continue
         entries.append(
             {
                 "relative_path": relative,
