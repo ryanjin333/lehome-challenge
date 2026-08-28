@@ -1149,6 +1149,140 @@ def test_simple_curriculum_collection_marker_defaults_false_and_accepts_exact_va
         sys.path.remove(str(repository))
 
 
+@pytest.mark.parametrize("value", ["", "true", "False", "2", " 1"])
+def test_fidelity_diagnostic_marker_is_strict(value: str) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repository))
+    try:
+        from scripts.run_groot_persistent_worker import fidelity_diagnostic_from_environ
+
+        with pytest.raises(ValueError, match="LEHOME_FIDELITY_DIAGNOSTIC"):
+            fidelity_diagnostic_from_environ({"LEHOME_FIDELITY_DIAGNOSTIC": value})
+    finally:
+        sys.path.remove(str(repository))
+
+
+def test_fidelity_diagnostic_runs_three_generations_in_one_persistent_session(tmp_path, monkeypatch) -> None:
+    """Stage B is one Isaac process/session, not three independent launches."""
+
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    leases = [
+        Lease(Attempt(f"diagnostic-b-{index}", {
+            "campaign_kind": "fidelity_diagnostic_v1",
+            "diagnostic_stage": "B",
+            "garment": "Top_Short_Seen_2",
+            "garment_name": "Top_Short_Seen_2",
+            "category": "top_short",
+            "release_stage": "seen",
+            "seed": seed,
+            "source_seed": seed,
+            "strategy": "canonical",
+        }), f"lease-{index}")
+        for index, seed in enumerate((2026082709, 2026082749, 2026082789), start=1)
+    ]
+    controller = SourceController(
+        leases,
+        {lease.attempt.attempt_id: ["rejected"] for lease in leases},
+    )
+    session = FakeSession()
+    factory_calls = 0
+
+    def session_factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        return session
+
+    worker = PersistentRolloutWorker(
+        worker_id="fidelity-diagnostic", session_id="diagnostic-session",
+        controller=controller, simulator_factory=session_factory, policy=FakePolicy(),
+        output_root=tmp_path, renderer_device="cuda:0", policy_device="cuda:0",
+        simulator_device="cpu", fidelity_diagnostic=True,
+    )
+    session.runtime_receipt = {
+        **session.runtime_receipt,
+        "simulation_device": "cpu", "cloth_device": "cpu",
+        "cloth_backend": "usd_local_points_v1",
+    }
+
+    receipts = worker.run()
+
+    assert factory_calls == 1
+    assert session.prepared == [
+        ("Top_Short_Seen_2", 2026082709, 1),
+        ("Top_Short_Seen_2", 2026082749, 2),
+        ("Top_Short_Seen_2", 2026082789, 3),
+    ]
+    assert [receipt["episode_generation"] for receipt in receipts] == [1, 2, 3]
+    assert session.closed is True
+
+
+def test_worker_cli_admits_only_the_exact_ordered_fidelity_diagnostic_descriptor() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repository))
+    try:
+        from scripts.run_groot_persistent_worker import _is_exact_fidelity_diagnostic
+
+        rows = [
+            {
+                "campaign_kind": "fidelity_diagnostic_v1", "diagnostic_stage": "B",
+                "attempt_id": f"fidelity-diagnostic-b-{index}",
+                "trial_id": f"fidelity-diagnostic-b-{index}",
+                "garment": "Top_Short_Seen_2", "garment_name": "Top_Short_Seen_2",
+                "category": "top_short", "release_stage": "seen", "seed": seed,
+                "source_seed": seed, "strategy": "canonical",
+            }
+            for index, seed in enumerate((2026082709, 2026082749, 2026082789), start=1)
+        ]
+        args = types.SimpleNamespace(
+            device="cpu", completion_metric="terminal_outcomes",
+            max_attempts=3, target_accepted=3, fidelity_diagnostic_stage="B",
+        )
+
+        assert _is_exact_fidelity_diagnostic(rows, args) is True
+        assert _is_exact_fidelity_diagnostic(list(reversed(rows)), args) is False
+        assert _is_exact_fidelity_diagnostic([{**rows[0], "extra": True}, *rows[1:]], args) is False
+    finally:
+        sys.path.remove(str(repository))
+
+
+def test_fidelity_diagnostic_infrastructure_abort_stops_before_second_lease(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import (
+        InfrastructureInvalidAttemptError,
+        PersistentRolloutWorker,
+    )
+
+    class AbortController(FakeController):
+        def __init__(self) -> None:
+            super().__init__([
+                Lease(Attempt("diagnostic-a", {"garment": "Top_Short_Seen_2", "seed": 2026082789}), "lease-a"),
+                Lease(Attempt("must-not-run", {"garment": "Top_Short_Seen_2", "seed": 2026082709}), "lease-b"),
+            ])
+            self.aborts: list[str] = []
+
+        def record_infrastructure_abort(self, *_args, reason: str) -> str:
+            self.aborts.append(reason)
+            return "infrastructure_abort"
+
+    class FailingSession(FakeSession):
+        def prepare_episode(self, **kwargs):
+            raise InfrastructureInvalidAttemptError("runtime evidence invalid")
+
+    controller = AbortController()
+    worker = PersistentRolloutWorker(
+        worker_id="fidelity-diagnostic", session_id="diagnostic-session",
+        controller=controller, simulator_factory=FailingSession, policy=FakePolicy(),
+        output_root=tmp_path, renderer_device="cuda:0", policy_device="cuda:0",
+        fidelity_diagnostic=True,
+    )
+
+    with pytest.raises(RuntimeError, match="diagnostic infrastructure abort"):
+        worker.run()
+
+    assert controller.aborts == ["runtime_evidence_invalid"]
+    assert len(controller._leases) == 1
+
+
 def test_exact_simple_curriculum_partition_opens_terminal_outcome_ledger_and_retries_invalid_execution(tmp_path, monkeypatch) -> None:
     from scripts.run_groot_persistent_worker import LedgerWorkerController, run
 

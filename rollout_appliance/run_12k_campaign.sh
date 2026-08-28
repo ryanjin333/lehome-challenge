@@ -58,6 +58,8 @@ SNAPSHOT_SOURCE_BOOTSTRAP="${LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP:-0}"
 SUCCESS_REPLAY_CAMPAIGN="${LEHOME_SUCCESS_REPLAY_CAMPAIGN:-0}"
 HARD_STATE_CAMPAIGN="${LEHOME_HARD_STATE_CAMPAIGN:-0}"
 SIMPLE_CURRICULUM_COLLECTION="${LEHOME_SIMPLE_CURRICULUM_COLLECTION:-0}"
+FIDELITY_DIAGNOSTIC="${LEHOME_FIDELITY_DIAGNOSTIC:-0}"
+FIDELITY_DIAGNOSTIC_STAGE="${LEHOME_FIDELITY_DIAGNOSTIC_STAGE:-}"
 COMPLETION_METRIC="${LEHOME_COMPLETION_METRIC:-accepted_successes}"
 PARTITION_ID="${LEHOME_PARTITION_ID:-}"
 PARENT_MATRIX_SHA256="${LEHOME_PARENT_MATRIX_SHA256:-}"
@@ -122,13 +124,43 @@ case "${SIMPLE_CURRICULUM_COLLECTION}" in
   "0"|"1") ;;
   *) echo "LEHOME_SIMPLE_CURRICULUM_COLLECTION must be exactly 0 or 1" >&2; exit 2 ;;
 esac
+case "${FIDELITY_DIAGNOSTIC}" in
+  "0"|"1") ;;
+  *) echo "LEHOME_FIDELITY_DIAGNOSTIC must be exactly 0 or 1" >&2; exit 2 ;;
+esac
 case "${COMPLETION_METRIC}" in
   "accepted_successes"|"terminal_outcomes") ;;
   *) echo "LEHOME_COMPLETION_METRIC must be accepted_successes or terminal_outcomes" >&2; exit 2 ;;
 esac
-if (( 10#${SUCCESS_REPLAY_CAMPAIGN} + 10#${HARD_STATE_CAMPAIGN} + 10#${EVALUATION_TERMINAL_UPLOAD} + 10#${SIMPLE_CURRICULUM_COLLECTION} > 1 )); then
+if (( 10#${SUCCESS_REPLAY_CAMPAIGN} + 10#${HARD_STATE_CAMPAIGN} + 10#${EVALUATION_TERMINAL_UPLOAD} + 10#${SIMPLE_CURRICULUM_COLLECTION} + 10#${FIDELITY_DIAGNOSTIC} > 1 )); then
   echo "CPU campaign mode markers are mutually exclusive" >&2
   exit 2
+fi
+if [ "${FIDELITY_DIAGNOSTIC}" = "1" ]; then
+  if [ "${SIMULATOR_DEVICE}" != "cpu" ] || [ "${WORKER_COUNT}" != "1" ] \
+      || [ "${ENABLE_HF_UPLOAD}" != "0" ] || [ "${SKIP_ROUND_SEAL}" != "1" ] \
+      || [ "${MAX_WORKER_RESTARTS}" != "0" ] || [ "${POLICY_STEP}" != "12000" ] \
+      || [ "${COMPLETION_METRIC}" != "terminal_outcomes" ] \
+      || [ "${EVALUATION_TERMINAL_UPLOAD}" != "0" ] || [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "0" ] \
+      || [ "${SUCCESS_REPLAY_CAMPAIGN}" != "0" ] || [ "${HARD_STATE_CAMPAIGN}" != "0" ] \
+      || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || [ "${FRESH_GARMENT_WAVES}" != "0" ] \
+      || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ] \
+      || [ "${POLICY_SHA256}" != "e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa" ] \
+      || [ "${POLICY_REPO}" != "ryanjin333/lehome-groot-n17-models" ] \
+      || [ "${POLICY_REVISION}" != "30ac1a84da67b099e115ad147bcd61e9d60046d3" ] \
+      || [ "${POLICY_ARTIFACT_SHA256}" != "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06" ]; then
+    echo "fidelity diagnostic requires the exact isolated original-12K CPU tuple" >&2
+    exit 2
+  fi
+  case "${FIDELITY_DIAGNOSTIC_STAGE}:${PARTITION_ID}:${MAX_ATTEMPTS}:${TARGET_ACCEPTED}" in
+    "A:fidelity-diagnostic-a:1:1"|"B:fidelity-diagnostic-b:3:3") ;;
+    *) echo "fidelity diagnostic requires the exact stage descriptor tuple" >&2; exit 2 ;;
+  esac
+  if ! [[ "${ROLLOUT_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]] \
+      || [ "${TRAINER_IMAGE}" != "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746" ]; then
+    echo "fidelity diagnostic requires pinned reviewed runtime images" >&2
+    exit 2
+  fi
 fi
 if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
   if [ "${SIMULATOR_DEVICE}" != "cpu" ] || [ "${WORKER_COUNT}" != "4" ] \
@@ -149,30 +181,32 @@ if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
     echo "simple curriculum partition identity requires parent SHA-256 and pinned runtime images" >&2
     exit 2
   fi
+fi
+if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ] || [ "${FIDELITY_DIAGNOSTIC}" = "1" ]; then
   CODE_ROOT_SHA256="$(python3 - "${HOST_CODE_ROOT}" <<'PY'
 import hashlib, os, stat, sys
 from pathlib import Path
 requested = Path(sys.argv[1])
-if not requested.is_absolute() or requested.is_symlink(): raise SystemExit("simple curriculum host code root is unsafe")
+if not requested.is_absolute() or requested.is_symlink(): raise SystemExit("reviewed host code root is unsafe")
 for ancestor in (requested, *requested.parents):
-    if ancestor.is_symlink(): raise SystemExit("simple curriculum host code root contains a symlink ancestor")
+    if ancestor.is_symlink(): raise SystemExit("reviewed host code root contains a symlink ancestor")
 root = requested.resolve(strict=True)
 digest = hashlib.sha256()
 for relative in ("source/lehome", "trainer/src", "scripts", "rollout_appliance"):
     tree = root / relative
-    if tree.is_symlink() or not tree.is_dir(): raise SystemExit("simple curriculum code root is unsafe")
+    if tree.is_symlink() or not tree.is_dir(): raise SystemExit("reviewed code root is unsafe")
     for path in sorted(tree.rglob("*")):
         if "__pycache__" in path.parts or path.suffix == ".pyc" or path.name == ".DS_Store":
             continue
-        if path.is_symlink(): raise SystemExit("simple curriculum code root contains a symlink")
+        if path.is_symlink(): raise SystemExit("reviewed code root contains a symlink")
         if path.is_file():
             mode = path.stat().st_mode
-            if not stat.S_ISREG(mode): raise SystemExit("simple curriculum code root contains a non-regular file")
+            if not stat.S_ISREG(mode): raise SystemExit("reviewed code root contains a non-regular file")
             digest.update(path.relative_to(root).as_posix().encode() + b"\0")
             digest.update(path.read_bytes())
 print(digest.hexdigest())
 PY
-)" || { echo "simple curriculum code root is unsafe" >&2; exit 2; }
+)" || { echo "reviewed host code root is unsafe" >&2; exit 2; }
   SOURCE_HOST_MOUNT="${HOST_CODE_ROOT}/source/lehome"
   SCRIPTS_HOST_MOUNT="${HOST_CODE_ROOT}/scripts"
   APPLIANCE_HOST_MOUNT="${HOST_CODE_ROOT}/rollout_appliance"
@@ -180,14 +214,14 @@ PY
   TRAINER_HOST_MOUNT="${HOST_CODE_ROOT}/trainer/src"
   PYTHONPATH_HOST="${HOST_CODE_ROOT}/source/lehome:${HOST_CODE_ROOT}/trainer/src:${HOST_CODE_ROOT}"
   if [ "${SCRIPT_DIR}" != "${HOST_CODE_ROOT}/rollout_appliance" ]; then
-    echo "simple curriculum wrapper is not running from LEHOME_HOST_CODE_ROOT" >&2
+    echo "reviewed wrapper is not running from LEHOME_HOST_CODE_ROOT" >&2
     exit 2
   fi
 fi
 # Source only after exact host-root validation, so no caller-controlled shell
 # path is evaluated before its canonical identity is established.
 # shellcheck source=worker_supervisor.sh
-if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
+if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ] || [ "${FIDELITY_DIAGNOSTIC}" = "1" ]; then
   source "${HOST_CODE_ROOT}/rollout_appliance/worker_supervisor.sh"
 else
   source "${SCRIPT_DIR}/worker_supervisor.sh"
@@ -195,7 +229,7 @@ fi
 case "${SIMULATOR_DEVICE}" in
   "cuda:0") ;;
   "cpu")
-    if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
+    if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ] || [ "${FIDELITY_DIAGNOSTIC}" = "1" ]; then
       : # Exact tuple and immutable row contract are checked below.
     elif [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
       if [ "${WORKER_COUNT}" != "4" ] || [ "${ENABLE_HF_UPLOAD}" != "1" ] \
@@ -329,7 +363,46 @@ if [ "${MATRIX_ACTUAL_SHA256}" != "${MATRIX_EXPECTED_SHA256}" ]; then
   echo "attempt matrix SHA-256 mismatch: expected ${MATRIX_EXPECTED_SHA256}, got ${MATRIX_ACTUAL_SHA256}" >&2
   exit 2
 fi
-if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
+if [ "${FIDELITY_DIAGNOSTIC}" = "1" ]; then
+  python3 - "${MATRIX}" "${FIDELITY_DIAGNOSTIC_STAGE}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" <<'PY' || exit 2
+import json
+import sys
+from pathlib import Path
+
+path, stage = Path(sys.argv[1]), sys.argv[2]
+try:
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    max_attempts, target = int(sys.argv[3]), int(sys.argv[4])
+except (OSError, ValueError) as error:
+    raise SystemExit(f"fidelity diagnostic descriptor is malformed: {error}")
+contracts = {
+    "A": (2026082789,),
+    "B": (2026082709, 2026082749, 2026082789),
+}
+expected_seeds = contracts.get(stage)
+if expected_seeds is None or not isinstance(rows, list) or (len(rows), max_attempts, target) != (
+    len(expected_seeds), len(expected_seeds), len(expected_seeds),
+):
+    raise SystemExit("fidelity diagnostic stage shape is invalid")
+expected_keys = {
+    "campaign_kind", "diagnostic_stage", "attempt_id", "trial_id", "garment",
+    "garment_name", "category", "release_stage", "seed", "source_seed", "strategy",
+}
+for index, (row, seed) in enumerate(zip(rows, expected_seeds, strict=True), start=1):
+    expected_id = f"fidelity-diagnostic-{stage.lower()}-{index}"
+    if (
+        not isinstance(row, dict) or set(row) != expected_keys
+        or row.get("campaign_kind") != "fidelity_diagnostic_v1"
+        or row.get("diagnostic_stage") != stage
+        or row.get("attempt_id") != expected_id or row.get("trial_id") != expected_id
+        or row.get("garment") != "Top_Short_Seen_2" or row.get("garment_name") != "Top_Short_Seen_2"
+        or row.get("category") != "top_short" or row.get("release_stage") != "seen"
+        or row.get("seed") != seed or row.get("source_seed") != seed
+        or row.get("strategy") != "canonical"
+    ):
+        raise SystemExit("fidelity diagnostic descriptor row is invalid")
+PY
+elif [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
   python3 - "${MATRIX}" "${PARTITION_ID}" "${PARENT_MATRIX_SHA256}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" <<'PY'
 import json, re, sys
 from pathlib import Path
@@ -429,7 +502,7 @@ for row in rows:
 identity = hashlib.sha256(f"{run_id}:{expected}".encode("ascii")).hexdigest()[:20]
 if round_id != f"snapshot-source-bootstrap-{identity}-unsealed-source": raise SystemExit("snapshot source descriptor does not bind the active run identity")
 PY
-elif [ "${SKIP_ROUND_SEAL}" = "1" ]; then
+elif [ "${SKIP_ROUND_SEAL}" = "1" ] && [ "${FIDELITY_DIAGNOSTIC}" != "1" ]; then
   # This is intentionally an allow-list, not a general skip switch.  A
   # staging smoke has one attempt and never creates a trainable round seal.
   if [ "${CONTROLLED_RECOVERY_SMOKE}" != "1" ] || [ "${WORKER_COUNT}" != "1" ] \
@@ -733,7 +806,7 @@ if [ "${CONTROLLED_RECOVERY_SMOKE}" = "1" ]; then
   FINALIZER_SMOKE_FLAG=(--controlled-recovery-smoke)
 fi
 FINALIZER_EVALUATION_FLAG=()
-if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
+if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ] || [ "${FIDELITY_DIAGNOSTIC}" = "1" ]; then
   FINALIZER_EVALUATION_FLAG=(--evaluation-terminal)
 fi
 docker run --rm --user 1234:1234 --network none \
@@ -883,6 +956,8 @@ launch_worker() {
     -e LEHOME_SUCCESS_REPLAY_CAMPAIGN="${SUCCESS_REPLAY_CAMPAIGN}" \
     -e LEHOME_HARD_STATE_CAMPAIGN="${HARD_STATE_CAMPAIGN}" \
     -e LEHOME_SIMPLE_CURRICULUM_COLLECTION="${SIMPLE_CURRICULUM_COLLECTION}" \
+    -e LEHOME_FIDELITY_DIAGNOSTIC="${FIDELITY_DIAGNOSTIC}" \
+    -e LEHOME_FIDELITY_DIAGNOSTIC_STAGE="${FIDELITY_DIAGNOSTIC_STAGE}" \
     --entrypoint /isaac-sim/python.sh \
     "${ROLLOUT_IMAGE}" \
     /opt/lehome-challenge/scripts/run_groot_persistent_worker.py \
@@ -933,7 +1008,7 @@ launch_worker() {
 # Production remains exactly four workers; lower width is an explicit smoke.
 worker_status=0
 campaign_has_infrastructure_abort() {
-  if [ "${SIMPLE_CURRICULUM_COLLECTION}" != "1" ]; then
+  if [ "${SIMPLE_CURRICULUM_COLLECTION}" != "1" ] && [ "${FIDELITY_DIAGNOSTIC}" != "1" ]; then
     return 1
   fi
   python3 - "${LEDGER}" <<'PY'
@@ -1156,7 +1231,8 @@ if [[ "${FINALIZER_PID}" =~ ^[0-9]+$ ]]; then
 fi
 FINALIZER_PID=""
 write_preemption_context false
-if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ] && [ "${worker_status}" = "0" ]; then
+if { [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ] || [ "${FIDELITY_DIAGNOSTIC}" = "1" ]; } \
+    && [ "${worker_status}" = "0" ]; then
   PYTHONPATH="${PYTHONPATH_HOST}${PYTHONPATH:+:${PYTHONPATH}}" python3 - "${LEDGER}" "${MATRIX}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" <<'PY'
 import sys
 from pathlib import Path
@@ -1167,14 +1243,17 @@ ledger = TaskLedger(Path(sys.argv[1]), attempt_matrix=load_attempt_matrix(Path(s
                     max_attempts=int(sys.argv[3]), target_accepted=int(sys.argv[4]), completion_metric="terminal_outcomes")
 try:
     fidelity = any(event.event_type == "infrastructure_abort" and event.payload.get("failure_class") == "fidelity" for event in ledger.events())
+    mode = "fidelity diagnostic" if any(
+        attempt.assignment.get("campaign_kind") == "fidelity_diagnostic_v1" for attempt in ledger.attempts()
+    ) else "simple curriculum"
     if fidelity:
-        raise SystemExit("simple curriculum fidelity failure prevents partition completion")
+        raise SystemExit(f"{mode} fidelity failure prevents partition completion")
     if any(event.event_type == "infrastructure_abort" for event in ledger.events()):
-        raise SystemExit("simple curriculum unresolved infrastructure evidence prevents partition completion")
+        raise SystemExit(f"{mode} unresolved infrastructure evidence prevents partition completion")
     if ledger.completion_count != int(sys.argv[4]) or not ledger.is_terminal or any(
         ledger.status(attempt.attempt_id) == "leased" for attempt in ledger.attempts()
     ):
-        raise SystemExit("simple curriculum partition is incomplete")
+        raise SystemExit(f"{mode} partition is incomplete")
 finally:
     ledger.close()
 PY

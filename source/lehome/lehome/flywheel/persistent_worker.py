@@ -206,6 +206,7 @@ class PersistentRolloutWorker:
         preparation_timeout_seconds: float = 180.0,
         source_finalization_timeout_seconds: float = _DEFAULT_SOURCE_FINALIZATION_TIMEOUT_SECONDS,
         simple_curriculum_collection: bool = False,
+        fidelity_diagnostic: bool = False,
         hard_exit: Callable[[int], None] = os._exit,
     ) -> None:
         self.identity = WorkerIdentity(worker_id, session_id, renderer_device, policy_device)
@@ -219,7 +220,12 @@ class PersistentRolloutWorker:
         self._episode_generation = 0
         if type(simple_curriculum_collection) is not bool:
             raise ValueError("simple_curriculum_collection must be a boolean")
+        if type(fidelity_diagnostic) is not bool:
+            raise ValueError("fidelity_diagnostic must be a boolean")
+        if simple_curriculum_collection and fidelity_diagnostic:
+            raise ValueError("fidelity diagnostic and simple curriculum modes are mutually exclusive")
         self._simple_curriculum_collection = simple_curriculum_collection
+        self._fidelity_diagnostic = fidelity_diagnostic
         if heartbeat_interval_seconds <= 0:
             raise ValueError("heartbeat_interval_seconds must be positive")
         if (
@@ -400,7 +406,9 @@ class PersistentRolloutWorker:
                     f"({_PREPARATION_TIMEOUT_REASON})"
                 )
             scoped_assignment = dict(assignment)
-            scoped_assignment["simple_curriculum_collection"] = self._simple_curriculum_collection
+            scoped_assignment["simple_curriculum_collection"] = (
+                self._simple_curriculum_collection or self._fidelity_diagnostic
+            )
             outcome = session.run_episode(
                 assignment=scoped_assignment, attempt_output_dir=output_dir, policy=self._policy,
                 cancellation_event=stop,
@@ -537,7 +545,7 @@ class PersistentRolloutWorker:
                             FidelityFailureError(
                                 error.code, error.fidelity, diagnostic=error.diagnostic,
                             )
-                            if self._simple_curriculum_collection
+                            if self._simple_curriculum_collection or self._fidelity_diagnostic
                             else SimulatorNumericalDivergenceError(str(error))
                         )
                     if isinstance(error, PreparationTimeoutError):
@@ -546,7 +554,7 @@ class PersistentRolloutWorker:
                         # hook returns; never append a contradictory retry.
                         raise
                     if isinstance(error, PolicyActionSafetyRejectionError):
-                        if self._simple_curriculum_collection:
+                        if self._simple_curriculum_collection or self._fidelity_diagnostic:
                             abort = getattr(self._controller, "record_fidelity_abort", None)
                             if not callable(abort):
                                 raise RuntimeError("controller does not support durable fidelity abort") from error
@@ -566,7 +574,8 @@ class PersistentRolloutWorker:
                             )
                             if _is_source_discovery_assignment(assignment):
                                 raise RuntimeError("source discovery fidelity abort") from error
-                            raise RuntimeError("simple curriculum campaign fidelity abort") from error
+                            mode = "fidelity diagnostic" if self._fidelity_diagnostic else "simple curriculum campaign"
+                            raise RuntimeError(f"{mode} fidelity abort") from error
                         reject = getattr(self._controller, "reject_attempt", None)
                         if not callable(reject):
                             raise RuntimeError(
@@ -579,7 +588,9 @@ class PersistentRolloutWorker:
                             reason=POLICY_ACTION_SAFETY_REJECTION_REASON,
                         )
                         continue
-                    if isinstance(error, FidelityFailureError) and self._simple_curriculum_collection:
+                    if isinstance(error, FidelityFailureError) and (
+                        self._simple_curriculum_collection or self._fidelity_diagnostic
+                    ):
                         abort = getattr(self._controller, "record_fidelity_abort", None)
                         if not callable(abort):
                             raise RuntimeError("controller does not support durable fidelity abort") from error
@@ -607,7 +618,8 @@ class PersistentRolloutWorker:
                             ) from error
                         if _is_source_discovery_assignment(assignment):
                             raise RuntimeError("source discovery fidelity abort") from error
-                        raise RuntimeError("simple curriculum campaign fidelity abort") from error
+                        mode = "fidelity diagnostic" if self._fidelity_diagnostic else "simple curriculum campaign"
+                        raise RuntimeError(f"{mode} fidelity abort") from error
                     if isinstance(error, InfrastructureInvalidAttemptError):
                         abort = getattr(self._controller, "record_infrastructure_abort", None)
                         if not callable(abort):
@@ -628,6 +640,8 @@ class PersistentRolloutWorker:
                             ) from error
                         if _is_source_discovery_assignment(assignment):
                             raise RuntimeError("source discovery infrastructure abort") from error
+                        if self._fidelity_diagnostic:
+                            raise RuntimeError("fidelity diagnostic infrastructure abort") from error
                         continue
                     restore_failed = "snapshot" in str(error).lower() or "restore" in str(error).lower()
                     if restore_failed:
@@ -686,7 +700,11 @@ class PersistentRolloutWorker:
                 self._controller.record_terminal(
                     self.identity.worker_id, attempt_id, lease_id, str(output_dir)
                 )
-                if _is_source_discovery_assignment(assignment) or self._simple_curriculum_collection:
+                if (
+                    _is_source_discovery_assignment(assignment)
+                    or self._simple_curriculum_collection
+                    or self._fidelity_diagnostic
+                ):
                     finalization_status = self._wait_for_terminal_finalization(
                         attempt_id=attempt_id,
                         allow_retryable=self._simple_curriculum_collection,

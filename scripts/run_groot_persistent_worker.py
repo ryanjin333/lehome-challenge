@@ -33,6 +33,15 @@ def simple_curriculum_collection_from_environ(environ: Mapping[str, str]) -> boo
     return value == "1"
 
 
+def fidelity_diagnostic_from_environ(environ: Mapping[str, str]) -> bool:
+    """Parse the isolated fidelity diagnostic marker exactly."""
+
+    value = environ.get("LEHOME_FIDELITY_DIAGNOSTIC", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("LEHOME_FIDELITY_DIAGNOSTIC must be exactly 0 or 1")
+    return value == "1"
+
+
 class LedgerWorkerController:
     """Give a worker the small controller surface without a second scheduler."""
 
@@ -281,6 +290,42 @@ def _is_exact_simple_curriculum_partition(matrix: list[Mapping[str, object]], ar
     return True
 
 
+def _is_exact_fidelity_diagnostic(matrix: list[Mapping[str, object]], args: argparse.Namespace) -> bool:
+    """Admit only the reviewed Top_Short_Seen_2 one-plus-three diagnostic."""
+
+    stage = getattr(args, "fidelity_diagnostic_stage", None)
+    expected_seeds = {
+        "A": (2026082789,),
+        "B": (2026082709, 2026082749, 2026082789),
+    }.get(stage)
+    if (
+        args.device != "cpu"
+        or getattr(args, "completion_metric", "accepted_successes") != "terminal_outcomes"
+        or expected_seeds is None
+        or (len(matrix), args.max_attempts, args.target_accepted)
+        != (len(expected_seeds), len(expected_seeds), len(expected_seeds))
+    ):
+        return False
+    expected_keys = {
+        "campaign_kind", "diagnostic_stage", "attempt_id", "trial_id", "garment",
+        "garment_name", "category", "release_stage", "seed", "source_seed", "strategy",
+    }
+    for index, (row, seed) in enumerate(zip(matrix, expected_seeds, strict=True), start=1):
+        expected_id = f"fidelity-diagnostic-{stage.lower()}-{index}"
+        if (
+            set(row) != expected_keys
+            or row.get("campaign_kind") != "fidelity_diagnostic_v1"
+            or row.get("diagnostic_stage") != stage
+            or row.get("attempt_id") != expected_id or row.get("trial_id") != expected_id
+            or row.get("garment") != "Top_Short_Seen_2" or row.get("garment_name") != "Top_Short_Seen_2"
+            or row.get("category") != "top_short" or row.get("release_stage") != "seen"
+            or row.get("seed") != seed or row.get("source_seed") != seed
+            or row.get("strategy") != "canonical"
+        ):
+            return False
+    return True
+
+
 def build_parser() -> argparse.ArgumentParser:
     from scripts.utils.parser import setup_eval_parser
 
@@ -426,9 +471,12 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
     success_replay_campaign = os.environ.get("LEHOME_SUCCESS_REPLAY_CAMPAIGN") == "1"
     hard_state_campaign = os.environ.get("LEHOME_HARD_STATE_CAMPAIGN") == "1"
     simple_curriculum_collection = getattr(args, "simple_curriculum_collection", False)
+    fidelity_diagnostic = getattr(args, "fidelity_diagnostic", False)
     if type(simple_curriculum_collection) is not bool:
         raise ValueError("simple_curriculum_collection must be a boolean")
-    if sum((terminal_evaluation, success_replay_campaign, hard_state_campaign, simple_curriculum_collection)) > 1:
+    if type(fidelity_diagnostic) is not bool:
+        raise ValueError("fidelity_diagnostic must be a boolean")
+    if sum((terminal_evaluation, success_replay_campaign, hard_state_campaign, simple_curriculum_collection, fidelity_diagnostic)) > 1:
         raise ValueError("persistent CPU campaign mode markers are mutually exclusive")
     if terminal_evaluation and args.device != "cpu":
         raise ValueError("terminal evaluation requires CPU cloth")
@@ -442,7 +490,10 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
         raise ValueError("simple curriculum CPU collection requires garment affinity")
     if garment_affinity and not (terminal_evaluation or source_discovery or simple_curriculum_collection):
         raise ValueError("garment affinity is reserved for terminal CPU evaluation, source discovery, or simple curriculum collection")
-    if simple_curriculum_collection:
+    if fidelity_diagnostic:
+        if not _is_exact_fidelity_diagnostic(matrix, args):
+            raise ValueError("fidelity diagnostic matrix is invalid")
+    elif simple_curriculum_collection:
         if not _is_exact_simple_curriculum_partition(matrix, args):
             raise ValueError("simple curriculum CPU partition is invalid")
         if not any(row.get("garment_name") == args.initial_garment for row in matrix):
@@ -580,6 +631,7 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
             preparation_timeout_seconds=args.preparation_timeout_seconds,
             source_finalization_timeout_seconds=source_finalization_timeout_seconds,
             simple_curriculum_collection=getattr(args, "simple_curriculum_collection", False),
+            fidelity_diagnostic=fidelity_diagnostic,
         )
         return worker.run()
     finally:
@@ -595,6 +647,8 @@ def main(argv: list[str] | None = None) -> int:
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args(argv)
     args.simple_curriculum_collection = simple_curriculum_collection_from_environ(os.environ)
+    args.fidelity_diagnostic = fidelity_diagnostic_from_environ(os.environ)
+    args.fidelity_diagnostic_stage = os.environ.get("LEHOME_FIDELITY_DIAGNOSTIC_STAGE")
     prepare_persistent_cloth_launch(args)
     simulation_app = launch_app_from_args(args)
     _progress("kit launched")
