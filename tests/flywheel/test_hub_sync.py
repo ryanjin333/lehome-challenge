@@ -127,6 +127,37 @@ def test_sync_uploads_immutable_path_and_verifies_readback(daemon):
     assert on_disk["repository"] == DEFAULT_ROLLOUT_REPO
 
 
+def test_fresh_sync_receipt_binds_run_id_and_rejects_a_stale_receipt(tmp_path):
+    accepted_root = tmp_path / "accepted"; accepted_root.mkdir()
+    sync = HubSyncDaemon(
+        repository=REPOSITORY, round_id="fresh-12k-source", run_id="fresh-run-source",
+        token="token", transport=FakeTransport(), accepted_root=accepted_root,
+        receipts_root=tmp_path / "receipts", readback_root=tmp_path / "readback",
+        revision=PUBLICATION_REF,
+    )
+    episode = _make_accepted_episode(accepted_root, "attempt-fresh")
+    receipt = sync.sync_episode("attempt-fresh", episode)
+    assert receipt.run_id == "fresh-run-source"
+    payload = json.loads(receipt.receipt_path.read_text(encoding="utf-8"))
+    assert payload["run_id"] == "fresh-run-source"
+
+    payload["run_id"] = "fresh-run-other"
+    receipt.receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(HubSyncError, match="existing sync receipt"):
+        sync.sync_episode("attempt-fresh", episode)
+
+
+def test_fresh_sync_refuses_to_start_without_a_run_id(tmp_path):
+    accepted_root = tmp_path / "accepted"; accepted_root.mkdir()
+    with pytest.raises(HubSyncError, match="fresh run_id"):
+        HubSyncDaemon(
+            repository=REPOSITORY, round_id="fresh-12k-source", token="token",
+            transport=FakeTransport(), accepted_root=accepted_root,
+            receipts_root=tmp_path / "receipts", readback_root=tmp_path / "readback",
+            revision=PUBLICATION_REF,
+        )
+
+
 def test_duplicate_sync_returns_existing_receipt_without_reupload(daemon):
     sync, transport, accepted_root = daemon
     episode = _make_accepted_episode(accepted_root, "attempt-1")

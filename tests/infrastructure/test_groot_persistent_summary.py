@@ -6,10 +6,12 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from lehome.flywheel.simple_curriculum import build_calibration_rows
+from lehome.flywheel.hub_sync import HubSyncDaemon
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -104,7 +106,34 @@ def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
 
 
-def _simple_campaign(tmp_path: Path, *, rows: list[dict[str, object]] | None = None, campaign_root: Path | None = None, matrix_path: Path | None = None, policy: dict[str, object] | None = None, missing_receipt: int | None = None, malformed_receipt: int | None = None, retry_then_valid: int | None = None, contradictory_safety: int | None = None, all_success: bool = False, evaluation_terminal: bool = True, episode_mutator=None, receipt_mutator=None, session_for_index=None) -> tuple[Path, Path, list[dict[str, object]], dict[str, str]]:
+class _ReceiptTransport:
+    """Minimal in-memory transport used to exercise the real receipt producer."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, dict[str, bytes]] = {}
+
+    def upload_files(self, *, source, entries, remote_prefix, **_kwargs):
+        bucket = self.store.setdefault(str(remote_prefix), {})
+        for entry in entries:
+            bucket[entry.relative_path] = (Path(source) / entry.relative_path).read_bytes()
+        return "c" * 40
+
+    def download_files(self, *, destination, relative_paths, remote_prefix, **_kwargs):
+        bucket = self.store[str(remote_prefix)]
+        for relative in relative_paths:
+            target = Path(destination) / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(bucket[relative])
+        return "c" * 40
+
+    def list_tree(self, *, remote_prefix, **_kwargs):
+        return tuple(
+            SimpleNamespace(relative_path=f"{remote_prefix}/{relative}", entry_type="file")
+            for relative in self.store[str(remote_prefix)]
+        )
+
+
+def _simple_campaign(tmp_path: Path, *, rows: list[dict[str, object]] | None = None, campaign_root: Path | None = None, matrix_path: Path | None = None, policy: dict[str, object] | None = None, campaign_round_id: str | None = None, campaign_run_id: str | None = None, missing_receipt: int | None = None, malformed_receipt: int | None = None, retry_then_valid: int | None = None, contradictory_safety: int | None = None, all_success: bool = False, evaluation_terminal: bool = True, episode_mutator=None, receipt_mutator=None, session_for_index=None) -> tuple[Path, Path, list[dict[str, object]], dict[str, str]]:
     from lehome.flywheel.artifact_queue import ArtifactFinalizationQueue
     from lehome.flywheel.simple_curriculum import build_calibration_rows
     from lehome.flywheel.task_ledger import TaskLedger
@@ -113,6 +142,8 @@ def _simple_campaign(tmp_path: Path, *, rows: list[dict[str, object]] | None = N
     root = campaign_root or tmp_path / "campaign"; root.mkdir(parents=True, exist_ok=False)
     matrix = matrix_path or tmp_path / "matrix.json"; matrix.parent.mkdir(parents=True, exist_ok=True); matrix.write_bytes(_canonical(rows))
     policy = policy or POLICY
+    if (campaign_round_id is None) != (campaign_run_id is None):
+        raise ValueError("test campaign provenance requires both run and round ids")
     target = len(rows)
     ledger = TaskLedger(
         root / "ledger.sqlite3", attempt_matrix=rows,
@@ -148,6 +179,10 @@ def _simple_campaign(tmp_path: Path, *, rows: list[dict[str, object]] | None = N
                 "asset_revision": "a" * 40, "simulator_version": "5.1.0.0",
                 "garment_name": assignment["garment_name"], "category": assignment["category"],
                 "release_stage": assignment["release_stage"], "seed": assignment["seed"],
+                **(
+                    {"campaign_round_id": campaign_round_id, "campaign_run_id": campaign_run_id}
+                    if campaign_round_id is not None else {}
+                ),
             },
             "provenance": {"policy_artifact_sha256": policy["policy_artifact_sha256"], "simulator_device": "cpu", "policy_device": "cuda:0", "image_identity": "sha256:" + "d" * 64},
             "outcome": "success" if all_success or index < 5 else "timeout", "accepted_success": all_success or index < 5,
@@ -244,7 +279,6 @@ def test_fresh_source_adoption_rehashes_actual_terminal_artifacts_for_all_four_p
         PARENT_ARTIFACT_SHA256,
         PARENT_POLICY_REPO,
         PARENT_REVISION,
-        _episode_artifact_sha256,
         authenticate_fresh_source_contract,
     )
 
@@ -269,7 +303,7 @@ def test_fresh_source_adoption_rehashes_actual_terminal_artifacts_for_all_four_p
         "observed_at_utc": "2026-08-28T00:00:00Z", "spent_usd": 0.0,
     }), encoding="utf-8")
     config = controller.CollectionConfig(
-        campaign_root=campaign, host_code_root=tmp_path, run_id=run_id, round_id=round_id,
+        campaign_root=campaign, host_code_root=ROOT, run_id=run_id, round_id=round_id,
         max_wall_seconds=3600.0, max_spend_usd=99.0, paid=False, gpu_stop_command=None,
         runtime_identity=runtime, spend_observer=observer,
     )
@@ -294,7 +328,6 @@ def test_fresh_source_adoption_rehashes_actual_terminal_artifacts_for_all_four_p
         identity = episode["identity"]
         provenance = episode["provenance"]
         assert isinstance(identity, dict) and isinstance(provenance, dict)
-        identity.update(campaign_round_id=round_id, campaign_run_id=run_id)
         provenance.update(cloth_device="cpu", renderer_device="cuda:0", camera_device="cuda:0")
         episode["randomization"] = {"strategy": "canonical"}
 
@@ -303,7 +336,8 @@ def test_fresh_source_adoption_rehashes_actual_terminal_artifacts_for_all_four_p
         matrix = campaign / "partitions" / f"{partition}.json"
         root, physical_matrix, _rows, _ledger_ids = _simple_campaign(
             tmp_path, rows=rows, campaign_root=partition_root, matrix_path=matrix,
-            policy=policy, episode_mutator=canonical_episode,
+            policy=policy, campaign_round_id=round_id, campaign_run_id=run_id,
+            episode_mutator=canonical_episode,
         )
         report = summary.build_simple_partition_report(
             campaign_root=root, matrix_path=physical_matrix,
@@ -312,18 +346,23 @@ def test_fresh_source_adoption_rehashes_actual_terminal_artifacts_for_all_four_p
         report_path = campaign / "reports" / "partitions" / f"{partition}.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_bytes(_canonical(report))
+        terminal_root = partition_root / "evaluation-terminal"
+        sync = HubSyncDaemon(
+            repository="ryanjin333/lehome-groot-n17-rollouts",
+            round_id=round_id,
+            run_id=run_id,
+            token="fixture-token",
+            transport=_ReceiptTransport(),
+            accepted_root=terminal_root,
+            receipts_root=partition_root / "hf-sync-receipts",
+            readback_root=partition_root / "hf-readback",
+            revision="main",
+        )
         for trial in report["trials"]:
-            if trial["terminal_event"] != "accepted":
-                continue
             attempt = str(trial["attempt_id"])
             artifact = Path(str(trial["finalized_artifact_root"]))
-            receipt = partition_root / "hf-sync-receipts" / f"{attempt}.sync.json"
-            receipt.parent.mkdir(exist_ok=True)
-            receipt.write_bytes(_canonical({
-                "readback_verified": True, "attempt_id": attempt, "round_id": round_id, "run_id": run_id,
-                "remote_prefix": f"rollout-rounds/{round_id}/{attempt}",
-                "episode_sha256": _episode_artifact_sha256(artifact), "immutable_revision": "c" * 40,
-            }))
+            assert artifact.parent == terminal_root
+            sync.sync_episode(attempt, artifact)
 
     controller._build_fresh_source_report(config)
     report_path = campaign / "reports" / "fresh-source-report.json"
@@ -331,6 +370,30 @@ def test_fresh_source_adoption_rehashes_actual_terminal_artifacts_for_all_four_p
     assert len(authenticate_fresh_source_contract((report_path,), (matrix_path,))) == 1_000
     terminal_manifest = json.loads((campaign / "reports" / "fresh-terminal-artifacts.json").read_text(encoding="utf-8"))
     assert len(terminal_manifest["entries"]) == 1_000
+
+    # Complete the actual journal stage from the actual producer output.
+    # Resume must re-open both rejected terminal evidence and accepted Hub
+    # receipts rather than trusting the top-level stage hashes.
+    journal = controller.StageJournal(config)
+    fresh_output = controller.CommandRunner(config)._discover("fresh-report", {})
+    journal.complete("fresh-report", None, fresh_output, inputs={})
+
+    rejected = next(entry for entry in terminal_manifest["entries"] if entry["terminal_event"] == "rejected")
+    rejected_receipt = Path(str(rejected["finalized_artifact_root"])) / "worker-receipt.json"
+    rejected_bytes = rejected_receipt.read_bytes()
+    rejected_receipt.write_bytes(b'{"tampered":true}\n')
+    with pytest.raises(controller.ReceiptMismatchError, match="fresh terminal"):
+        journal._read("fresh-report", None, {})
+    rejected_receipt.write_bytes(rejected_bytes)
+
+    accepted_entry = next(entry for entry in terminal_manifest["entries"] if entry["terminal_event"] == "accepted")
+    accepted_receipt = (
+        Path(str(accepted_entry["finalized_artifact_root"])).parent.parent
+        / "hf-sync-receipts" / f"{accepted_entry['attempt_id']}.sync.json"
+    )
+    accepted_receipt.unlink()
+    with pytest.raises(controller.ReceiptMismatchError, match="fresh Hub readback receipt|fresh terminal"):
+        journal._read("fresh-report", None, {})
 
     accepted = next(entry for entry in terminal_manifest["entries"] if entry["terminal_event"] == "accepted")
     episode_path = Path(str(accepted["finalized_artifact_root"])) / "raw" / str(accepted["attempt_id"]) / "episode.json"

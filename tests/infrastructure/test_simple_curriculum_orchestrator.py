@@ -125,10 +125,11 @@ def test_continue_uses_the_exact_order_and_reports_replay_shortage(tmp_path: Pat
 
 def test_restart_validates_receipts_without_repeating_terminal_stages(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path)
-    first = FakeRunner(config.campaign_root); assert module.run_collection(config, runner=first) == "complete"
-    second = FakeRunner(config.campaign_root)
+    first = FakeRunner(config.campaign_root, gate_decision="fidelity_stop")
+    assert module.run_collection(config, runner=first) == "fidelity_stop"
+    second = FakeRunner(config.campaign_root, gate_decision="fidelity_stop")
 
-    assert module.run_collection(config, runner=second) == "complete"
+    assert module.run_collection(config, runner=second) == "fidelity_stop"
     assert second.calls == []
     assert second.stops == 0
 
@@ -243,7 +244,7 @@ def test_resume_rehashes_stage_artifacts_and_refuses_mutated_matrix(tmp_path: Pa
 
 
 def test_failed_stop_is_durable_and_restart_returns_infrastructure_stop_failure(tmp_path: Path) -> None:
-    module = _module(); config = _config(module, tmp_path); runner = FakeRunner(config.campaign_root, fail_stop=True)
+    module = _module(); config = _config(module, tmp_path); runner = FakeRunner(config.campaign_root, gate_decision="fidelity_stop", fail_stop=True)
     assert module.run_collection(config, runner=runner) == "infrastructure_stop_failure"
     assert runner.stops == 1
 
@@ -326,6 +327,18 @@ def test_inflight_budget_watchdog_terminates_a_clean_child_before_returning(tmp_
 
     assert observations >= 2
     assert time.monotonic() - started < 3
+
+
+def test_watchdog_drains_a_verbose_child_without_pipe_buffer_deadlock(tmp_path: Path) -> None:
+    module = _module(); runner = module.CommandRunner(_config(module, tmp_path))
+    started = time.monotonic()
+
+    runner._invoke(
+        (sys.executable, "-c", "import sys; sys.stdout.write('x' * (2 * 1024 * 1024)); sys.stderr.write('y' * (2 * 1024 * 1024))"),
+        stage="watchdog", inputs={},
+    )
+
+    assert time.monotonic() - started < 5
 
 
 def test_paid_simple_wrapper_contract_requires_one_vm_marker() -> None:

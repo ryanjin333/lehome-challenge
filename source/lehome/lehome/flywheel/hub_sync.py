@@ -22,6 +22,8 @@ from uuid import uuid4
 
 
 _ROUND_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+_FRESH_ROUND_ID_PATTERN = re.compile(r"^fresh-12k-[a-z0-9-]{1,112}$")
+_FRESH_RUN_ID_PATTERN = re.compile(r"^fresh-run-[a-z0-9-]{1,112}$")
 _REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _PUBLICATION_REF_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 MANIFEST_NAME = "SHA256SUMS.json"
@@ -48,6 +50,7 @@ class SyncReceipt:
     attempt_id: str
     repository: str
     round_id: str
+    run_id: str | None
     remote_prefix: str
     immutable_revision: str
     entry_count: int
@@ -159,10 +162,14 @@ def _collect_entries(episode_dir: Path) -> tuple[SyncEntry, ...]:
 
 
 def _episode_digest(entries: Sequence[SyncEntry]) -> str:
+    # This is deliberately byte-for-byte the same canonical tree digest used
+    # by fresh replay admission (`build_success_replay_matrix`).  A receipt
+    # that calls the same artifact by a different digest is not usable as
+    # immutable source evidence.
     canonical = json.dumps(
         [{"relative_path": e.relative_path, "sha256": e.sha256, "byte_size": e.byte_size} for e in entries],
         sort_keys=True, separators=(",", ":"),
-    )
+    ) + "\n"
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -174,6 +181,7 @@ class HubSyncDaemon:
         *,
         repository: str,
         round_id: str,
+        run_id: str | None = None,
         token: str,
         transport: HubTransportLike,
         accepted_root: Path,
@@ -186,6 +194,18 @@ class HubSyncDaemon:
             raise HubSyncError("repository must be a non-empty string")
         if not _ROUND_ID_PATTERN.match(round_id):
             raise HubSyncError(f"round_id must be path-safe lowercase, got {round_id!r}")
+        if run_id is not None and (
+            not isinstance(run_id, str)
+            or not run_id
+            or "/" in run_id
+            or "\\" in run_id
+            or run_id in {".", ".."}
+        ):
+            raise HubSyncError("run_id must be a non-empty path-safe string when supplied")
+        if _FRESH_ROUND_ID_PATTERN.fullmatch(round_id) is not None and (
+            not isinstance(run_id, str) or _FRESH_RUN_ID_PATTERN.fullmatch(run_id) is None
+        ):
+            raise HubSyncError("fresh simple collection sync requires its exact fresh run_id")
         if not isinstance(token, str) or not token:
             raise HubSyncError("token must be a non-empty string")
         if (
@@ -199,6 +219,7 @@ class HubSyncDaemon:
             raise HubSyncError("max_attempts must be a positive integer")
         self.repository = repository
         self.round_id = round_id
+        self.run_id = run_id
         self._token = token
         self._transport = transport
         self._accepted_root = Path(accepted_root).resolve()
@@ -238,7 +259,12 @@ class HubSyncDaemon:
 
         if receipt_path.is_file() and not receipt_path.is_symlink():
             existing = json.loads(receipt_path.read_text(encoding="utf-8"))
-            if existing.get("episode_sha256") != digest or existing.get("readback_verified") is not True:
+            if (
+                existing.get("episode_sha256") != digest
+                or existing.get("readback_verified") is not True
+                or existing.get("round_id") != self.round_id
+                or (self.run_id is not None and existing.get("run_id") != self.run_id)
+            ):
                 raise HubSyncError("existing sync receipt does not match the current accepted episode")
             return self._receipt_from_payload(existing, receipt_path)
         if receipt_path.is_symlink():
@@ -306,6 +332,8 @@ class HubSyncDaemon:
             "episode_sha256": digest,
             "readback_verified": True,
         }
+        if self.run_id is not None:
+            payload["run_id"] = self.run_id
         _write_json_atomic(receipt_path, payload)
         return self._receipt_from_payload(payload, receipt_path)
 
@@ -318,7 +346,11 @@ class HubSyncDaemon:
                 pending.append(attempt_id)
                 continue
             payload = json.loads(receipt_path.read_text(encoding="utf-8"))
-            if payload.get("readback_verified") is not True or payload.get("round_id") != self.round_id:
+            if (
+                payload.get("readback_verified") is not True
+                or payload.get("round_id") != self.round_id
+                or (self.run_id is not None and payload.get("run_id") != self.run_id)
+            ):
                 pending.append(attempt_id)
         return tuple(pending)
 
@@ -331,6 +363,7 @@ class HubSyncDaemon:
             attempt_id=str(payload["attempt_id"]),
             repository=str(payload["repository"]),
             round_id=str(payload["round_id"]),
+            run_id=str(payload["run_id"]) if isinstance(payload.get("run_id"), str) else None,
             remote_prefix=str(payload["remote_prefix"]),
             immutable_revision=str(payload["immutable_revision"]),
             entry_count=int(payload["entry_count"]),  # type: ignore[arg-type]

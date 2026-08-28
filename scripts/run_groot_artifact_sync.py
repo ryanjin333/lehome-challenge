@@ -215,13 +215,14 @@ def _run_episode_uploader_once(
     readback_root: Path,
     repository: str,
     round_id: str,
+    run_id: str | None = None,
     revision: str,
     token_file: Path | None = None,
 ) -> int:
     """Publish one episode lacking a verified receipt from a bounded root."""
     token = _load_runtime_token(token_file=token_file)
     daemon = HubSyncDaemon(
-        repository=repository, round_id=round_id, token=token,
+        repository=repository, round_id=round_id, run_id=run_id, token=token,
         transport=HuggingFaceHubTransport(), accepted_root=episode_root,
         receipts_root=receipts_root, readback_root=readback_root, revision=revision,
     )
@@ -248,6 +249,7 @@ def run_uploader_once(
     readback_root: Path,
     repository: str,
     round_id: str,
+    run_id: str | None = None,
     revision: str,
     token_file: Path | None = None,
 ) -> int:
@@ -258,6 +260,7 @@ def run_uploader_once(
         readback_root=readback_root,
         repository=repository,
         round_id=round_id,
+        run_id=run_id,
         revision=revision,
         token_file=token_file,
     )
@@ -270,6 +273,7 @@ def run_evaluation_uploader_once(
     readback_root: Path,
     repository: str,
     round_id: str,
+    run_id: str | None = None,
     revision: str,
     token_file: Path | None = None,
 ) -> int:
@@ -291,6 +295,7 @@ def run_evaluation_uploader_once(
         readback_root=readback_root,
         repository=repository,
         round_id=round_id,
+        run_id=run_id,
         revision=revision,
         token_file=token_file,
     )
@@ -303,6 +308,7 @@ def run_evaluation_batch_uploader_once(
     readback_root: Path,
     repository: str,
     round_id: str,
+    run_id: str | None = None,
     revision: str,
     token_file: Path | None = None,
     immutable_revision: str | None = None,
@@ -433,12 +439,13 @@ def run_evaluation_batch_uploader_once(
                 existing.get("episode_sha256") != digest
                 or existing.get("round_id") != round_id
                 or existing.get("readback_verified") is not True
+                or (run_id is not None and existing.get("run_id") != run_id)
             ):
                 raise HubSyncError(
                     "existing evaluation receipt does not match the batch episode"
                 )
             continue
-        _write_json_atomic(receipt_path, {
+        payload: dict[str, object] = {
             "schema_version": 1,
             "attempt_id": attempt_id,
             "repository": repository,
@@ -449,7 +456,10 @@ def run_evaluation_batch_uploader_once(
             "entry_count": len(entries),
             "episode_sha256": digest,
             "readback_verified": True,
-        })
+        }
+        if run_id is not None:
+            payload["run_id"] = run_id
+        _write_json_atomic(receipt_path, payload)
         created += 1
     return created
 
@@ -523,6 +533,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--readback-root", type=Path)
     parser.add_argument("--repository")
     parser.add_argument("--round-id")
+    parser.add_argument("--run-id")
     parser.add_argument("--revision")
     parser.add_argument("--token-file", type=Path)
     parser.add_argument(
@@ -571,6 +582,7 @@ def main(argv: list[str] | None = None) -> int:
                     "readback_root": args.readback_root,
                     "repository": args.repository,
                     "round_id": args.round_id,
+                    "run_id": args.run_id,
                     "revision": args.revision,
                     "token_file": args.token_file,
                 }

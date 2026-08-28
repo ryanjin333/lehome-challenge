@@ -19,10 +19,12 @@ def observation() -> dict[str, np.ndarray]:
     }
 
 
-def identity(episode_id: str) -> EpisodeIdentity:
+def identity(episode_id: str, *, campaign: bool = False) -> EpisodeIdentity:
     return EpisodeIdentity(
         episode_id, "repo", "a" * 40, 1, "b" * 40, "c" * 40, "isaac",
         "Pant_Long_Seen_0", "pant_long", "seen", 1, "fold the garment", "canonical",
+        campaign_round_id="fresh-12k-recorder" if campaign else None,
+        campaign_run_id="fresh-run-recorder" if campaign else None,
     )
 
 
@@ -64,6 +66,38 @@ def test_mixed_recorder_selects_only_complete_post_takeover_expert_windows(tmp_p
     assert final.annotations[0]["category"] == "pant_long"
     assert final.annotations[0]["garment_name"] == "Pant_Long_Seen_0"
     assert final.annotations[0]["seed"] == 1
+
+
+def test_real_recorder_episode_identity_persists_v2_campaign_provenance(tmp_path, monkeypatch) -> None:
+    recorder = MixedSourceRecorder(tmp_path, identity=identity("campaign-v2", campaign=True), mode="expert", horizon=1)
+    fake_encoder(monkeypatch, recorder)
+    recorder.record_snapshot("reset", snapshot())
+    recorder.record_step(
+        observation(), np.ones(12), reward=1.0, success=True,
+        action_source=ActionSource.EXPERT, segment=1, expert_sequence=0, expert_sample_age_ms=0.0,
+    )
+    recorder.record_snapshot("terminal", snapshot())
+    result = recorder.finish(outcome=accepted_outcome(), controls=("a",))
+
+    stored = json.loads((result.path / "episode.json").read_text(encoding="utf-8"))
+    assert stored["identity"]["campaign_round_id"] == "fresh-12k-recorder"
+    assert stored["identity"]["campaign_run_id"] == "fresh-run-recorder"
+
+
+def test_real_recorder_keeps_v1_identity_payload_readable(tmp_path, monkeypatch) -> None:
+    recorder = MixedSourceRecorder(tmp_path, identity=identity("archive-v1"), mode="expert", horizon=1)
+    fake_encoder(monkeypatch, recorder)
+    recorder.record_snapshot("reset", snapshot())
+    recorder.record_step(
+        observation(), np.ones(12), reward=1.0, success=True,
+        action_source=ActionSource.EXPERT, segment=1, expert_sequence=0, expert_sample_age_ms=0.0,
+    )
+    recorder.record_snapshot("terminal", snapshot())
+    result = recorder.finish(outcome=accepted_outcome(), controls=("a",))
+
+    stored = json.loads((result.path / "episode.json").read_text(encoding="utf-8"))
+    assert "campaign_round_id" not in stored["identity"]
+    assert "campaign_run_id" not in stored["identity"]
 
 
 def test_mixed_recorder_enforces_source_specific_provenance_and_hold_exclusion(tmp_path) -> None:

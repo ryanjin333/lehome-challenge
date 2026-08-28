@@ -911,6 +911,7 @@ if [ "${ENABLE_HF_UPLOAD}" = "1" ]; then
       --readback-root "${CAMPAIGN_ROOT}/hf-readback" \
       --repository "${ROLLOUT_REPOSITORY}" \
       --round-id "${ROUND_ID}" \
+      --run-id "${RUN_ID}" \
       --revision "${HF_REVISION}" \
       --token-file /run/secrets/hf_token \
       --poll-seconds 10 \

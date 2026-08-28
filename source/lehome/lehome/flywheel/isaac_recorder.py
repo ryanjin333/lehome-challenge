@@ -107,7 +107,7 @@ def _validate_visible_contact(value: Mapping[str, object]) -> dict[str, object]:
 
 
 def _identity_payload(identity: EpisodeIdentity) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "episode_id": identity.episode_id,
         "policy_repo": identity.policy_repo, "policy_revision": identity.policy_revision,
         "policy_step": identity.policy_step, "code_revision": identity.code_revision,
@@ -116,6 +116,15 @@ def _identity_payload(identity: EpisodeIdentity) -> dict[str, object]:
         "release_stage": identity.release_stage, "seed": identity.seed,
         "instruction": identity.instruction, "strategy": identity.strategy,
     }
+    # The archived v1 identity remains exactly readable.  New campaign-owned
+    # recordings must however preserve both sides of the launcher identity;
+    # fresh-source authentication intentionally rejects a missing pair.
+    if identity.campaign_round_id is not None:
+        payload.update(
+            campaign_round_id=identity.campaign_round_id,
+            campaign_run_id=identity.campaign_run_id,
+        )
+    return payload
 
 
 def _validated_simple_curriculum_fidelity(fidelity: Mapping[str, object] | None) -> dict[str, bool]:

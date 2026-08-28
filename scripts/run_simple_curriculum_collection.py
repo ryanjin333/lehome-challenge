@@ -22,6 +22,7 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -72,6 +73,45 @@ class StopHookError(RuntimeError):
 
 class BudgetLimitError(ReceiptMismatchError):
     """A portable paid-run walltime or spend limit was reached."""
+
+
+class _PipeTail:
+    """Continuously drain one child pipe while retaining only diagnostics."""
+
+    _LIMIT = 64 * 1024
+
+    def __init__(self, stream: object) -> None:
+        self._stream = stream
+        self._chunks: list[str] = []
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def drain(self) -> None:
+        reader = getattr(self._stream, "read", None)
+        if not callable(reader):
+            return
+        while True:
+            chunk = reader(4096)
+            if not chunk:
+                return
+            if not isinstance(chunk, str):
+                chunk = str(chunk)
+            with self._lock:
+                self._chunks.append(chunk)
+                self._size += len(chunk)
+                while self._size > self._LIMIT and self._chunks:
+                    excess = self._size - self._LIMIT
+                    first = self._chunks[0]
+                    if len(first) <= excess:
+                        self._chunks.pop(0)
+                        self._size -= len(first)
+                    else:
+                        self._chunks[0] = first[excess:]
+                        self._size -= excess
+
+    def text(self) -> str:
+        with self._lock:
+            return "".join(self._chunks)
 
 
 def _canonical(value: object) -> bytes:
@@ -377,6 +417,10 @@ def _fresh_trial_from_terminal_report(
         "safety_failure": False, "numerical_failure": False, "cloth_failure": False,
         "remote_prefix": f"rollout-rounds/{config.round_id}/{attempt}",
         "campaign_round_id": config.round_id, "campaign_run_id": config.run_id,
+        # Keep the terminal hashes in the report as well as the aggregate
+        # manifest.  Resume can then cross-bind both independent receipts.
+        "episode_sha256": terminal.get("episode_sha256"),
+        "worker_receipt_sha256": terminal.get("worker_receipt_sha256"),
     }
     source = {
         "attempt_id": attempt, "trial_id": attempt, "logical_attempt_id": assignment,
@@ -390,26 +434,28 @@ def _fresh_trial_from_terminal_report(
         "worker_receipt_sha256": terminal.get("worker_receipt_sha256"),
         "finalized_artifact_root": artifact_root,
     }
-    if success:
-        from build_success_replay_matrix import _episode_artifact_sha256
+    from build_success_replay_matrix import _episode_artifact_sha256
 
-        episode_root = Path(artifact_root)
-        receipt = root / "fresh" / partition / "hf-sync-receipts" / f"{attempt}.sync.json"
+    episode_root = Path(artifact_root)
+    receipt = root / "fresh" / partition / "hf-sync-receipts" / f"{attempt}.sync.json"
+    sync = _strict_json_object(receipt, label="fresh Hub readback receipt")
+    artifact_sha = _episode_artifact_sha256(episode_root)
+    if (
+        sync.get("readback_verified") is not True or sync.get("attempt_id") != attempt
+        or sync.get("round_id") != config.round_id or sync.get("run_id") != config.run_id
+        or sync.get("remote_prefix") != trial["remote_prefix"]
+        or sync.get("episode_sha256") != artifact_sha
+    ):
+        raise ReceiptMismatchError("fresh terminal lacks actual campaign-bound Hub readback evidence")
+    if success:
         episode = _strict_json_object(episode_root / "raw" / attempt / "episode.json", label="fresh accepted episode")
         identity = episode.get("identity")
-        sync = _strict_json_object(receipt, label="fresh Hub readback receipt")
         if (
             not isinstance(identity, Mapping)
             or identity.get("campaign_round_id") != config.round_id or identity.get("campaign_run_id") != config.run_id
             or episode.get("accepted_success") is not True or episode.get("outcome") != "success"
-            or sync.get("readback_verified") is not True or sync.get("attempt_id") != attempt
-            or sync.get("round_id") != config.round_id or sync.get("run_id") != config.run_id
-            or sync.get("remote_prefix") != trial["remote_prefix"]
         ):
-            raise ReceiptMismatchError("fresh success lacks actual campaign-bound Hub readback evidence")
-        artifact_sha = _episode_artifact_sha256(episode_root)
-        if sync.get("episode_sha256") != artifact_sha:
-            raise ReceiptMismatchError("fresh success receipt does not bind accepted artifact")
+            raise ReceiptMismatchError("fresh success lacks actual campaign-bound episode evidence")
         trial.update(artifact_sha256=artifact_sha, hub_sync_receipt_sha256=_file_sha(receipt))
         aggregate["hub_sync_receipt_sha256"] = _file_sha(receipt)
         aggregate["artifact_sha256"] = artifact_sha
@@ -522,7 +568,7 @@ def _validate_fresh_terminal_artifact_manifest(
             or entry.get("worker_receipt_sha256") != trial.get("worker_receipt_sha256")
             or not isinstance(entry.get("finalized_artifact_root"), str)
         ):
-            raise ReceiptMismatchError("fresh terminal artifact manifest does not bind report identities")
+            raise ReceiptMismatchError(f"fresh terminal artifact manifest does not bind report identities: {attempt}")
         artifact_root = Path(str(entry["finalized_artifact_root"]))
         try:
             relative = artifact_root.relative_to(root)
@@ -539,19 +585,22 @@ def _validate_fresh_terminal_artifact_manifest(
         worker_receipt = artifact_root / "worker-receipt.json"
         if _file_sha(episode) != entry["terminal_report_sha256"] or _file_sha(worker_receipt) != entry["worker_receipt_sha256"]:
             raise ReceiptMismatchError("fresh terminal artifact bytes no longer match report evidence")
-        if event != "accepted":
-            continue
         artifact_sha = _episode_artifact_sha256(artifact_root)
         receipt = artifact_root.parent.parent / "hf-sync-receipts" / f"{attempt}.sync.json"
         sync = _strict_json_object(receipt, label="fresh Hub readback receipt")
         if (
-            artifact_sha != entry.get("artifact_sha256") or artifact_sha != trial.get("artifact_sha256")
-            or _file_sha(receipt) != entry.get("hub_sync_receipt_sha256")
-            or _file_sha(receipt) != trial.get("hub_sync_receipt_sha256")
-            or sync.get("readback_verified") is not True or sync.get("attempt_id") != attempt
+            sync.get("readback_verified") is not True or sync.get("attempt_id") != attempt
             or sync.get("round_id") != config.round_id or sync.get("run_id") != config.run_id
             or sync.get("remote_prefix") != f"rollout-rounds/{config.round_id}/{attempt}"
             or sync.get("episode_sha256") != artifact_sha
+        ):
+            raise ReceiptMismatchError("fresh terminal artifact lacks a matching Hub readback")
+        if event != "accepted":
+            continue
+        if (
+            artifact_sha != entry.get("artifact_sha256") or artifact_sha != trial.get("artifact_sha256")
+            or _file_sha(receipt) != entry.get("hub_sync_receipt_sha256")
+            or _file_sha(receipt) != trial.get("hub_sync_receipt_sha256")
         ):
             raise ReceiptMismatchError("fresh terminal accepted artifact lacks a matching Hub readback")
 
@@ -989,20 +1038,32 @@ class CommandRunner:
             argv, cwd=config.host_code_root, env=self.environment_for(stage if inputs is not None else "summary", inputs or {}),
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        while process.poll() is None:
-            if self.budget_check is not None:
-                try:
-                    self.budget_check()
-                except Exception:
-                    process.terminate()
+        stdout_tail, stderr_tail = _PipeTail(process.stdout), _PipeTail(process.stderr)
+        drainers = tuple(
+            threading.Thread(target=tail.drain, name=f"lehome-{stage}-pipe", daemon=True)
+            for tail in (stdout_tail, stderr_tail)
+        )
+        for drainer in drainers:
+            drainer.start()
+        try:
+            while process.poll() is None:
+                if self.budget_check is not None:
                     try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill(); process.wait(timeout=10)
-                    raise
-            time.sleep(0.1)
-        stdout, stderr = process.communicate()
-        completed = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+                        self.budget_check()
+                    except Exception:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill(); process.wait(timeout=10)
+                        raise
+                time.sleep(0.1)
+        finally:
+            # Draining prevents a verbose child from wedging on the OS pipe
+            # buffer.  Tails are bounded and are only used in typed errors.
+            for drainer in drainers:
+                drainer.join(timeout=10)
+        completed = subprocess.CompletedProcess(argv, process.returncode, stdout_tail.text(), stderr_tail.text())
         if completed.returncode:
             raise RuntimeError(f"fixed {stage} adapter failed: {completed.returncode}: {completed.stderr.strip()}")
 
@@ -1148,7 +1209,9 @@ def _canonical_root(config: CollectionConfig) -> Path:
     return config.campaign_root.resolve(strict=False)
 
 
-def _authenticated_output(stage: str, output: Mapping[str, object], *, config: CollectionConfig) -> dict[str, object]:
+def _authenticated_output(
+    stage: str, output: Mapping[str, object], *, config: CollectionConfig, deep: bool = False,
+) -> dict[str, object]:
     """Accept only a bounded stage result and hash every referenced byte now."""
     if stage == "gpu-stop":
         allowed = {"terminal_outcome", "stop_status", "stop_error_type"}
@@ -1197,6 +1260,31 @@ def _authenticated_output(stage: str, output: Mapping[str, object], *, config: C
         if output["result"] != "replay_shortage":
             raise ReceiptMismatchError("replay matrix result is invalid")
         result["result"] = "replay_shortage"
+    if deep and stage == "fresh-report":
+        # A journal receipt for fresh source evidence is not an authority on
+        # its own.  Re-run the canonical report/matrix traversal and then
+        # reopen all 1,000 terminal artifacts and their accepted Hub receipts
+        # before allowing a stopped campaign to resume.
+        expected = {
+            "report": "reports/fresh-source-report.json",
+            "matrix": "reports/fresh-source-matrix.json",
+            "terminal_artifact_manifest": "reports/fresh-terminal-artifacts.json",
+        }
+        if {name: item["path"] for name, item in checked.items()} != expected:
+            raise ReceiptMismatchError("fresh report stage output is not canonical")
+        try:
+            authenticated = _validate_fresh_source_outputs(
+                config,
+                report=root / expected["report"],
+                matrix=root / expected["matrix"],
+            )
+            _validate_fresh_terminal_artifact_manifest(
+                config,
+                authenticated=authenticated,
+                manifest=root / expected["terminal_artifact_manifest"],
+            )
+        except (ValueError, OSError) as error:
+            raise ReceiptMismatchError("fresh report deep authentication failed") from error
     return result
 
 
@@ -1204,7 +1292,7 @@ def _verify_authenticated_output(stage: str, output: Mapping[str, object], *, co
     # Re-run validation against the actual bytes on every restart.  The
     # descriptor itself is part of the receipt hash; this catches deletion,
     # rewrites, root swaps, and changed ledgers without trusting old JSON.
-    if _authenticated_output(stage, output, config=config) != output:
+    if _authenticated_output(stage, output, config=config, deep=True) != output:
         raise ReceiptMismatchError("stage output authentication changed")
 
 
