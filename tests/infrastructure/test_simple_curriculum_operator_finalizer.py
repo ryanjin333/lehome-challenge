@@ -267,6 +267,41 @@ def test_handoff_outcome_stage_sets_and_digests_are_fail_closed() -> None:
             finalizer.validate_handoff(handoff)
 
 
+def test_v2_provisional_readbacks_are_independent_and_pinned(tmp_path: Path) -> None:
+    """A public read cannot overwrite/authenticate the private readback tree."""
+    finalizer = _module()
+    spec = importlib.util.spec_from_file_location("publisher_for_v2_readback", ROOT / "scripts/publish_simple_curriculum_collection.py")
+    assert spec and spec.loader
+    publisher = importlib.util.module_from_spec(spec); sys.modules[spec.name] = publisher; spec.loader.exec_module(publisher)
+    run_id = "fresh-run-20260828-v2readback"; round_id = "fresh-12k-20260828-v2readback"
+    files = (
+        "manifests/provisional/evidence-manifest.json", "manifests/provisional/task6-validation.json",
+        "manifests/provisional/hub-artifact-references.json",
+    )
+    task = {"schema_version": 1, "kind": "lehome_simple_curriculum_task6_validation_v1", "terminal_outcome": "infrastructure_stop", "result": "not_complete", "fresh_reference_count": 0, "replay_accepted_reference_count": 0}
+    refs = {"schema_version": 1, "kind": "lehome_simple_curriculum_hub_artifact_references_v1", "fresh": [], "success_replay": []}
+    manifest = {"schema_version": 1, "kind": "lehome_simple_curriculum_provisional_evidence_manifest_v1", "run_id": run_id, "round_id": round_id, "instance_id": finalizer.EXACT_INSTANCE_ID, "campaign_root": f"/mnt/lehome/eval/{run_id}", "terminal_outcome": "infrastructure_stop", "reachable_stages": [], "stage_receipts": [], "terminal_chain_head": None, "first_100_receipt_sha256": None, "task6_validation_sha256": publisher.hashlib.sha256(publisher._canonical(task)).hexdigest(), "hub_artifact_references_sha256": publisher.hashlib.sha256(publisher._canonical(refs)).hexdigest(), "completion_claim": "none", "gpu_stop_verified": False}
+    payloads = {files[0]: publisher._canonical(manifest), files[1]: publisher._canonical(task), files[2]: publisher._canonical(refs)}
+    for relative, payload in payloads.items():
+        target = tmp_path / relative; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(payload)
+    entries = publisher._collect_entries(publisher.CollectionPublicationBundle(tmp_path, run_id, "ryanjin333/lehome-groot-n17-rollouts", "main", files))
+    provisional = {"immutable_revision": "a" * 40, "bundle_sha256": publisher._entry_digest(entries), "manifest_sha256": publisher.hashlib.sha256(payloads[files[0]]).hexdigest(), "receipt_sha256": "b" * 64, "repository": "ryanjin333/lehome-groot-n17-rollouts", "remote_prefix": f"collection-rounds/{run_id}/manifests/provisional"}
+    handoff = {"schema_version": 2, "kind": "lehome_simple_curriculum_operator_stop_handoff_v2", "run_id": run_id, "round_id": round_id, "instance_id": finalizer.EXACT_INSTANCE_ID, "terminal_outcome": "infrastructure_stop", "predecessor_receipt_sha256": None, "code_revision": "c" * 40, "code_tree_sha256": "d" * 64, "runtime_identity": {"mode": "test"}, "runtime_identity_sha256": finalizer._digest({"mode": "test"}), "first_100_receipt_sha256": None, "evidence": [], "provisional_publication": provisional}
+    handoff["handoff_sha256"] = finalizer._digest(handoff)
+    class Transport:
+        destinations = []
+        def list_tree(self, *, remote_prefix, **_kwargs): return tuple(SimpleNamespace(relative_path=f"{remote_prefix}/{name}", entry_type="file") for name in files)
+        def download_files(self, *, destination, relative_paths, token, **_kwargs):
+            self.destinations.append(destination)
+            for relative in relative_paths:
+                target = destination / relative; target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payloads[relative] if token is not None else payloads[relative])
+            return "a" * 40
+    transport = Transport()
+    finalizer.HfFinalizerPublisher(tmp_path / "token", module=publisher, transport=transport)._verify_provisional(module=publisher, transport=transport, root=tmp_path, token="token", handoff=handoff)
+    assert len({str(path) for path in transport.destinations}) == 2
+
+
 def test_stop_times_out_after_exact_id_validation() -> None:
     finalizer = _module()
     class Provider:

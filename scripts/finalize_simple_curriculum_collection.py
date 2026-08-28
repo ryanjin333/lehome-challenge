@@ -412,12 +412,22 @@ class HfFinalizerPublisher:
                 prefix=base_prefix,
             )
             if observed != set(files): raise FinalizationError("provisional tree is not exact")
+            # Authenticated and anonymous reads use wholly separate trees.
+            # Neither path may overwrite the other before their bytes and
+            # returned immutable revision have independently been checked.
+            with tempfile.TemporaryDirectory(prefix="lehome-provisional-auth-", dir=root) as auth_dir, tempfile.TemporaryDirectory(prefix="lehome-provisional-public-", dir=root) as public_dir:
+                destinations = ((Path(auth_dir), token), (Path(public_dir), None))
+                for destination, auth in destinations:
+                    observed_revision = transport.download_files(repository=self.repository, revision=revision, destination=destination, relative_paths=files, token=auth, remote_prefix=base_prefix)
+                    if observed_revision != revision:
+                        raise FinalizationError("provisional readback did not return pinned revision")
+                for relative in files:
+                    authenticated = Path(auth_dir) / relative
+                    anonymous = Path(public_dir) / relative
+                    if not authenticated.is_file() or not anonymous.is_file() or authenticated.read_bytes() != anonymous.read_bytes():
+                        raise FinalizationError("authenticated and anonymous provisional bytes differ")
+                    local = root / relative; local.parent.mkdir(parents=True, exist_ok=True); local.write_bytes(anonymous.read_bytes())
             bundle = module.CollectionPublicationBundle(root=root, run_id=handoff["run_id"], repository=self.repository, revision="main", files=files)
-            entries = module._collect_entries(bundle) if all((root / item).is_file() for item in files) else None
-            # The file list comes only from the signed handoff; downloads are
-            # compact manifests/receipts, never rollout media or episodes.
-            for auth in (token, None):
-                transport.download_files(repository=self.repository, revision=revision, destination=root, relative_paths=files, token=auth, remote_prefix=base_prefix)
             entries = module._collect_entries(bundle)
             if module._entry_digest(entries) != provisional["bundle_sha256"]:
                 raise FinalizationError("provisional bundle bytes do not bind handoff")
