@@ -4,29 +4,25 @@
 # runs on EXIT, including a remote/controller/handoff-write failure.
 set -euo pipefail
 
-for required in LEHOME_OPERATOR_SSH_TARGET LEHOME_OPERATOR_CAMPAIGN_ROOT LEHOME_OPERATOR_RUN_ID LEHOME_OPERATOR_ROUND_ID LEHOME_OPERATOR_REVIEWED_REVISION LEHOME_OPERATOR_HF_TOKEN_FILE; do
-  test -n "${!required:-}" || { echo "${required} is required" >&2; exit 2; }
-done
-[[ "$LEHOME_OPERATOR_RUN_ID" =~ ^fresh-run-[a-z0-9-]{1,112}$ ]] || { echo "invalid operator run ID" >&2; exit 2; }
-[[ "$LEHOME_OPERATOR_ROUND_ID" =~ ^fresh-12k-[a-z0-9-]{1,112}$ ]] || { echo "invalid operator round ID" >&2; exit 2; }
-[[ "$LEHOME_OPERATOR_REVIEWED_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid reviewed revision" >&2; exit 2; }
-[[ "$LEHOME_OPERATOR_CAMPAIGN_ROOT" == /mnt/lehome/eval/fresh-run-* ]] || { echo "invalid campaign root" >&2; exit 2; }
-[[ "$LEHOME_OPERATOR_SSH_TARGET" =~ ^[A-Za-z_][A-Za-z0-9_.-]{0,63}@[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?([.][A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]] || { echo "invalid operator SSH target" >&2; exit 2; }
-LEHOME_OPERATOR_SSH_PORT="${LEHOME_OPERATOR_SSH_PORT:-22}"
-[[ "$LEHOME_OPERATOR_SSH_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( LEHOME_OPERATOR_SSH_PORT <= 65535 )) || { echo "invalid operator SSH port" >&2; exit 2; }
-test -f "$LEHOME_OPERATOR_HF_TOKEN_FILE" && test ! -L "$LEHOME_OPERATOR_HF_TOKEN_FILE" && test -s "$LEHOME_OPERATOR_HF_TOKEN_FILE"
-test "$(stat -f '%u' "$LEHOME_OPERATOR_HF_TOKEN_FILE")" = "$(id -u)"
-test "$(stat -f '%Lp' "$LEHOME_OPERATOR_HF_TOKEN_FILE")" = 600
-
 controller_status=0
 finalizer_status=0
+validated=0
+# This known-good fallback is deliberately independent of all operator input:
+# malformed metadata must never strand the exact billed VM before the wrapper
+# can reach the local exact-ID stop adapter.
+emergency_stop_timeout=300
 finalize() {
   set +e
-  uv run --project trainer python3 scripts/finalize_simple_curriculum_collection.py \
-    --ssh-target "$LEHOME_OPERATOR_SSH_TARGET" --ssh-port "$LEHOME_OPERATOR_SSH_PORT" \
-    --remote-campaign-root "$LEHOME_OPERATOR_CAMPAIGN_ROOT" \
-    --run-id "$LEHOME_OPERATOR_RUN_ID" --round-id "$LEHOME_OPERATOR_ROUND_ID" \
-    --hf-token-file "$LEHOME_OPERATOR_HF_TOKEN_FILE" --stop-timeout-seconds "${LEHOME_OPERATOR_STOP_TIMEOUT_SECONDS:-300}"
+  if [ "$validated" -eq 1 ]; then
+    uv run --project trainer python3 scripts/finalize_simple_curriculum_collection.py \
+      --ssh-target "$LEHOME_OPERATOR_SSH_TARGET" --ssh-port "$LEHOME_OPERATOR_SSH_PORT" \
+      --remote-campaign-root "$LEHOME_OPERATOR_CAMPAIGN_ROOT" \
+      --run-id "$LEHOME_OPERATOR_RUN_ID" --round-id "$LEHOME_OPERATOR_ROUND_ID" \
+      --hf-token-file "$LEHOME_OPERATOR_HF_TOKEN_FILE" --stop-timeout-seconds "$LEHOME_OPERATOR_STOP_TIMEOUT_SECONDS"
+  else
+    uv run --project trainer python3 scripts/finalize_simple_curriculum_collection.py \
+      --emergency-stop-only --stop-timeout-seconds "$emergency_stop_timeout"
+  fi
   finalizer_status=$?
   set -e
 }
@@ -36,6 +32,30 @@ finish() {
   if [ "$controller_status" -ne 0 ] || [ "$finalizer_status" -ne 0 ]; then exit 1; fi
 }
 trap finish EXIT
+reject() {
+  controller_status=1
+  echo "$1" >&2
+  exit 2
+}
+
+for required in LEHOME_OPERATOR_SSH_TARGET LEHOME_OPERATOR_CAMPAIGN_ROOT LEHOME_OPERATOR_RUN_ID LEHOME_OPERATOR_ROUND_ID LEHOME_OPERATOR_REVIEWED_REVISION LEHOME_OPERATOR_HF_TOKEN_FILE; do
+  [[ -n "${!required:-}" ]] || reject "${required} is required"
+done
+[[ "$LEHOME_OPERATOR_RUN_ID" =~ ^fresh-run-[a-z0-9-]{1,112}$ ]] || reject "invalid operator run ID"
+[[ "$LEHOME_OPERATOR_ROUND_ID" =~ ^fresh-12k-[a-z0-9-]{1,112}$ ]] || reject "invalid operator round ID"
+[[ "$LEHOME_OPERATOR_REVIEWED_REVISION" =~ ^[0-9a-f]{40}$ ]] || reject "invalid reviewed revision"
+[[ "$LEHOME_OPERATOR_CAMPAIGN_ROOT" == /mnt/lehome/eval/fresh-run-* ]] || reject "invalid campaign root"
+[[ "$LEHOME_OPERATOR_SSH_TARGET" =~ ^[A-Za-z_][A-Za-z0-9_.-]{0,63}@[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?([.][A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]] || reject "invalid operator SSH target"
+LEHOME_OPERATOR_SSH_PORT="${LEHOME_OPERATOR_SSH_PORT:-22}"
+[[ "$LEHOME_OPERATOR_SSH_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( LEHOME_OPERATOR_SSH_PORT <= 65535 )) || reject "invalid operator SSH port"
+LEHOME_OPERATOR_STOP_TIMEOUT_SECONDS="${LEHOME_OPERATOR_STOP_TIMEOUT_SECONDS:-300}"
+[[ "$LEHOME_OPERATOR_STOP_TIMEOUT_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v value="$LEHOME_OPERATOR_STOP_TIMEOUT_SECONDS" 'BEGIN { exit !(value > 0 && value <= 600) }' || reject "invalid stop timeout"
+test -f "$LEHOME_OPERATOR_HF_TOKEN_FILE" || reject "operator HF token file is unavailable"
+test ! -L "$LEHOME_OPERATOR_HF_TOKEN_FILE" || reject "operator HF token file must not be a symlink"
+test -s "$LEHOME_OPERATOR_HF_TOKEN_FILE" || reject "operator HF token file is empty"
+test "$(stat -f '%u' "$LEHOME_OPERATOR_HF_TOKEN_FILE")" = "$(id -u)" || reject "operator HF token file owner is invalid"
+test "$(stat -f '%Lp' "$LEHOME_OPERATOR_HF_TOKEN_FILE")" = 600 || reject "operator HF token file mode is invalid"
+validated=1
 # The persisted remote invocation record is the only remote shell input. It
 # must exactly match validated local IDs/revision/root before fixed controller
 # argv execution; no operator-provided remote command is accepted.

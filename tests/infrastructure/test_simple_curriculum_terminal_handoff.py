@@ -140,3 +140,48 @@ def test_operator_wrapper_runs_one_finalizer_and_aggregates_all_exit_statuses(tm
         )
         assert result.returncode == expected, result.stderr
         assert log.read_text(encoding="utf-8").splitlines() == ["controller", "finalizer"]
+
+
+def test_operator_wrapper_emergency_finalizes_every_precontroller_rejection(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir(); log = tmp_path / "log"
+    def executable(name: str, text: str) -> None:
+        path = fake_bin / name; path.write_text("#!/bin/sh\n" + text, encoding="utf-8"); path.chmod(0o755)
+    executable("stat", "case \"$1:$2\" in -f:%u) if [ \"${TOKEN_OWNER:-self}\" = self ]; then /usr/bin/id -u; else echo 99999; fi;; -f:%Lp) echo \"${TOKEN_MODE:-600}\";; *) exit 9;; esac")
+    executable("uv", f"echo \"$*\" >> {log}; exit 0")
+    executable("ssh", "echo controller-must-not-run >&2; exit 97")
+    token = tmp_path / "token"; token.write_text("token", encoding="utf-8")
+    link = tmp_path / "token-link"; link.symlink_to(token)
+    revision = "a" * 40; run_id = "fresh-run-20260828123456-01"; round_id = "fresh-12k-20260828123456-01"
+    campaign = f"/mnt/lehome/eval/{run_id}"
+    base = {
+        "LEHOME_OPERATOR_SSH_TARGET": "operator@host", "LEHOME_OPERATOR_SSH_PORT": "22",
+        "LEHOME_OPERATOR_CAMPAIGN_ROOT": campaign, "LEHOME_OPERATOR_RUN_ID": run_id,
+        "LEHOME_OPERATOR_ROUND_ID": round_id, "LEHOME_OPERATOR_REVIEWED_REVISION": revision,
+        "LEHOME_OPERATOR_HF_TOKEN_FILE": str(token),
+    }
+    invalid_cases = (
+        {"LEHOME_OPERATOR_SSH_TARGET": ""},
+        {"LEHOME_OPERATOR_RUN_ID": "bad"},
+        {"LEHOME_OPERATOR_ROUND_ID": "bad"},
+        {"LEHOME_OPERATOR_REVIEWED_REVISION": "bad"},
+        {"LEHOME_OPERATOR_CAMPAIGN_ROOT": "/tmp/bad"},
+        {"LEHOME_OPERATOR_SSH_TARGET": "-Ffile@host"},
+        {"LEHOME_OPERATOR_SSH_PORT": "70000"},
+        {"LEHOME_OPERATOR_HF_TOKEN_FILE": str(tmp_path / "missing")},
+        {"LEHOME_OPERATOR_HF_TOKEN_FILE": str(link)},
+        {"TOKEN_OWNER": "other"},
+        {"TOKEN_MODE": "644"},
+        {"LEHOME_OPERATOR_HF_TOKEN_FILE": str(tmp_path / "empty")},
+        {"LEHOME_OPERATOR_STOP_TIMEOUT_SECONDS": "zero"},
+    )
+    (tmp_path / "empty").write_text("", encoding="utf-8")
+    for invalid in invalid_cases:
+        if log.exists(): log.unlink()
+        environment = {**base, **invalid}
+        result = subprocess.run(
+            ("env", "-i", f"PATH={fake_bin}:/usr/bin:/bin", *(f"{key}={value}" for key, value in environment.items()), "/bin/bash", str(ROOT / "scripts/run_simple_curriculum_with_finalizer.sh")),
+            text=True, capture_output=True,
+        )
+        assert result.returncode != 0, (invalid, result.stderr)
+        calls = log.read_text(encoding="utf-8").splitlines()
+        assert len(calls) == 1 and "--emergency-stop-only" in calls[0], (invalid, calls)

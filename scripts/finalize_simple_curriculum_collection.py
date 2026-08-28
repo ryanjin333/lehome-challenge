@@ -27,6 +27,15 @@ EXACT_INSTANCE_NAME = "lehome-rollout"
 PROTECTED_DISK_ID = "computedisk-u00pbe55crxy7jr56x"
 EXACT_IMAGE_ID = "computeimage-u00zf6w3yf72gakhcy"
 TERMINAL_OUTCOMES = frozenset({"complete", "replay_shortage", "fidelity_stop", "infrastructure_stop", "insufficient_source_stop", "infrastructure_stop_failure"})
+_COLLECTION_STAGES = (
+    "calibration-matrix", "calibration-head", "first-100-gate",
+    "calibration-tail", "calibration-report", "curriculum-matrix",
+    "curriculum-a", "curriculum-b", "fresh-report", "replay-matrix",
+    "success-replay",
+)
+_GATE_STAGES = _COLLECTION_STAGES[:3]
+_REPLAY_SHORTAGE_STAGES = _COLLECTION_STAGES[:-1]
+_STOP_OUTCOMES = frozenset({"infrastructure_stop", "infrastructure_stop_failure"})
 _SSH_TARGET = re.compile(
     r"[A-Za-z_][A-Za-z0-9_.-]{0,63}@"
     r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*"
@@ -163,18 +172,38 @@ def validate_handoff(raw: Mapping[str, object]) -> dict[str, object]:
         raise FinalizationError("operator handoff runtime identity is invalid")
     if not isinstance(payload["evidence"], list):
         raise FinalizationError("operator handoff evidence is invalid")
-    stages: set[str] = set()
+    stages: list[str] = []
+    receipts: list[str] = []
     for item in payload["evidence"]:
         if not isinstance(item, Mapping) or set(item) != {"stage", "receipt_sha256", "file_sha256"} or not isinstance(item["stage"], str) or not _hex(item["receipt_sha256"], 64) or not _hex(item["file_sha256"], 64):
             raise FinalizationError("operator handoff evidence is invalid")
-        stages.add(item["stage"])
+        stages.append(item["stage"])
+        receipts.append(item["receipt_sha256"])
     outcome = payload["terminal_outcome"]
-    if outcome == "complete" and not {"calibration-matrix", "calibration-head", "first-100-gate", "fresh-report", "replay-matrix", "success-replay"}.issubset(stages):
-        raise FinalizationError("complete handoff lacks required authenticated evidence")
-    if outcome == "replay_shortage" and not {"fresh-report", "replay-matrix"}.issubset(stages):
-        raise FinalizationError("replay shortage handoff lacks required evidence")
-    if outcome in {"fidelity_stop", "insufficient_source_stop"} and "first-100-gate" not in stages:
-        raise FinalizationError("terminal handoff lacks required gate evidence")
+    actual_stages = tuple(stages)
+    if outcome == "complete":
+        expected = _COLLECTION_STAGES
+    elif outcome == "replay_shortage":
+        expected = _REPLAY_SHORTAGE_STAGES
+    elif outcome in {"fidelity_stop", "insufficient_source_stop"}:
+        expected = _GATE_STAGES
+    elif outcome in _STOP_OUTCOMES:
+        expected = None
+        if actual_stages not in tuple(_COLLECTION_STAGES[:index] for index in range(len(_COLLECTION_STAGES) + 1)):
+            raise FinalizationError("stop handoff evidence is not a reachable stage prefix")
+    else:  # guarded above; retained as an explicit fail-closed boundary.
+        raise FinalizationError("operator handoff outcome is invalid")
+    if expected is not None and actual_stages != expected:
+        raise FinalizationError("terminal handoff does not have the exact required evidence stages")
+    predecessor = payload["predecessor_receipt_sha256"]
+    if actual_stages:
+        if not _hex(predecessor, 64) or predecessor != receipts[-1]:
+            raise FinalizationError("operator handoff predecessor is not bound to final evidence")
+    elif predecessor is not None:
+        raise FinalizationError("empty stop handoff must have an explicit null predecessor")
+    first_gate = next((receipt for stage, receipt in zip(stages, receipts, strict=True) if stage == "first-100-gate"), None)
+    if payload["first_100_receipt_sha256"] != first_gate:
+        raise FinalizationError("operator handoff first-100 receipt is not bound to gate evidence")
     return dict(raw)
 
 
@@ -200,15 +229,10 @@ def _validate_instance(raw: Mapping[str, object]) -> dict[str, object]:
         managed = boot.get("managed_disk") if isinstance(boot, Mapping) else None
         boot_spec = managed.get("spec") if isinstance(managed, Mapping) else None
         image = boot_spec.get("source_image_id") if isinstance(boot_spec, Mapping) else None
-        if metadata.get("id") != EXACT_INSTANCE_ID or metadata.get("name") != EXACT_INSTANCE_NAME or status.get("state") not in {"RUNNING", "STOPPED"} or found != [PROTECTED_DISK_ID] or image != EXACT_IMAGE_ID:
+        if metadata.get("id") != EXACT_INSTANCE_ID or metadata.get("name") != EXACT_INSTANCE_NAME or status.get("state") not in {"RUNNING", "STOPPING", "STOPPED"} or found != [PROTECTED_DISK_ID] or image != EXACT_IMAGE_ID:
             raise FinalizationError("provider response is not the exact protected rollout VM")
         return {"state": status["state"], "raw": value}
-    disks = value.get("disks")
-    if value.get("id") != EXACT_INSTANCE_ID or value.get("name") != EXACT_INSTANCE_NAME or not isinstance(disks, list) or disks != [PROTECTED_DISK_ID]:
-        raise FinalizationError("provider response is not the exact protected rollout VM")
-    if value.get("state") not in {"RUNNING", "STOPPED"}:
-        raise FinalizationError("provider response has an unsafe VM state")
-    return value
+    raise FinalizationError("provider response is not the real nested Nebius instance shape")
 
 
 def stop_exact_instance(provider: Provider, *, timeout_seconds: float) -> dict[str, object]:
@@ -501,12 +525,23 @@ def finalize_operator_handoff(handoff: Mapping[str, object], *, provider: Provid
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ssh-target", required=True); parser.add_argument("--ssh-port", type=int, required=True)
-    parser.add_argument("--remote-campaign-root", required=True); parser.add_argument("--run-id", required=True); parser.add_argument("--round-id", required=True); parser.add_argument("--hf-token-file", type=Path, required=True)
-    parser.add_argument("--stop-timeout-seconds", type=float, required=True)
+    parser.add_argument("--ssh-target"); parser.add_argument("--ssh-port", type=int)
+    parser.add_argument("--remote-campaign-root"); parser.add_argument("--run-id"); parser.add_argument("--round-id"); parser.add_argument("--hf-token-file", type=Path)
+    parser.add_argument("--stop-timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--emergency-stop-only", action="store_true")
     args = parser.parse_args(argv)
     provider = SubprocessNebiusProvider()
+    if args.emergency_stop_only:
+        try:
+            stop_exact_instance(provider, timeout_seconds=args.stop_timeout_seconds)
+        except (FinalizationError, OSError, subprocess.SubprocessError, ValueError) as error:
+            print(json.dumps({"result": "infrastructure_stop_failure", "error": str(error)}, sort_keys=True))
+            return 2
+        print(json.dumps({"result": "emergency_stopped"}, sort_keys=True))
+        return 0
     try:
+        if any(value is None for value in (args.ssh_target, args.ssh_port, args.remote_campaign_root, args.run_id, args.round_id, args.hf_token_file)):
+            raise FinalizationError("normal finalization requires complete operator metadata")
         with tempfile.TemporaryDirectory(prefix="lehome-finalizer-fetch-") as temporary:
             handoff = fetch_remote_handoff(ssh_target=args.ssh_target, port=args.ssh_port, campaign_root=args.remote_campaign_root, destination=Path(temporary) / "handoff.json")
             if handoff.get("run_id") != args.run_id or handoff.get("round_id") != args.round_id:

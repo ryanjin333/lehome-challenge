@@ -21,17 +21,35 @@ def _module():
     return module
 
 
+def _instance(module, state: str = "RUNNING", *, disks: list[object] | None = None) -> dict[str, object]:
+    return {
+        "metadata": {"id": module.EXACT_INSTANCE_ID, "name": module.EXACT_INSTANCE_NAME},
+        "status": {"state": state},
+        "spec": {
+            "boot_disk": {"managed_disk": {"spec": {"source_image_id": module.EXACT_IMAGE_ID}}},
+            "secondary_disks": disks if disks is not None else [
+                {"existing_disk": {"id": module.PROTECTED_DISK_ID}},
+            ],
+        },
+    }
+
+
 def _handoff(module):
     body = {
         "schema_version": 1, "kind": "lehome_simple_curriculum_operator_stop_handoff_v1",
         "run_id": "fresh-run-20260828-finalizer", "round_id": "fresh-12k-20260828-finalizer",
         "instance_id": "computeinstance-u00t6xfqhadrcmssa2", "terminal_outcome": "complete",
-        "predecessor_receipt_sha256": None, "code_revision": "a" * 40, "code_tree_sha256": "b" * 64,
+        "predecessor_receipt_sha256": "c" * 64, "code_revision": "a" * 40, "code_tree_sha256": "b" * 64,
         "runtime_identity": {"mode": "test"}, "runtime_identity_sha256": module._digest({"mode": "test"}),
         "first_100_receipt_sha256": "c" * 64,
         "evidence": [
             {"stage": stage, "receipt_sha256": "c" * 64, "file_sha256": "d" * 64}
-            for stage in ("calibration-matrix", "calibration-head", "first-100-gate", "fresh-report", "replay-matrix", "success-replay")
+            for stage in (
+                "calibration-matrix", "calibration-head", "first-100-gate",
+                "calibration-tail", "calibration-report", "curriculum-matrix",
+                "curriculum-a", "curriculum-b", "fresh-report", "replay-matrix",
+                "success-replay",
+            )
         ],
     }
     return {**body, "handoff_sha256": module._digest(body)}
@@ -58,8 +76,7 @@ def test_finalizer_stops_exact_vm_before_publishing_and_is_idempotent(tmp_path: 
         state = "RUNNING"
         def get(self, instance_id):
             calls.append("get")
-            return {"id": instance_id, "name": "lehome-rollout", "state": self.state,
-                    "disks": ["computedisk-u00pbe55crxy7jr56x"]}
+            return _instance(finalizer, self.state)
         def stop(self, instance_id):
             calls.append("stop"); self.state = "STOPPED"
     class Publisher:
@@ -77,8 +94,7 @@ def test_finalizer_stops_even_when_handoff_is_invalid_and_never_publishes(tmp_pa
         state = "RUNNING"
         def get(self, instance_id):
             calls.append("get")
-            return {"id": instance_id, "name": "lehome-rollout", "state": self.state,
-                    "disks": ["computedisk-u00pbe55crxy7jr56x"]}
+            return _instance(finalizer, self.state)
         def stop(self, instance_id): calls.append("stop"); self.state = "STOPPED"
     class Publisher:
         def publish(self, *args, **kwargs): raise AssertionError("invalid handoff must not publish")
@@ -177,10 +193,87 @@ def test_finalizer_rejects_unknown_or_unproven_complete_handoff() -> None:
         finalizer.validate_handoff(incomplete)
 
 
+def test_handoff_requires_exact_stage_chain_and_authenticated_links() -> None:
+    finalizer = _module()
+
+    def resign(payload):
+        body = dict(payload); body.pop("handoff_sha256", None)
+        payload["handoff_sha256"] = finalizer._digest(body)
+
+    for mutate in (
+        lambda value: value["evidence"].pop(),
+        lambda value: value["evidence"].append(dict(value["evidence"][-1])),
+        lambda value: value["evidence"].__setitem__(0, {**value["evidence"][0], "stage": "unknown"}),
+        lambda value: value.__setitem__("first_100_receipt_sha256", "e" * 64),
+        lambda value: value.__setitem__("predecessor_receipt_sha256", "not-a-digest"),
+    ):
+        handoff = _handoff(finalizer)
+        mutate(handoff); resign(handoff)
+        with __import__("pytest").raises(finalizer.FinalizationError):
+            finalizer.validate_handoff(handoff)
+
+
+def test_handoff_allows_only_real_reachable_stop_prefixes() -> None:
+    finalizer = _module()
+
+    def resign(payload):
+        body = dict(payload); body.pop("handoff_sha256", None)
+        payload["handoff_sha256"] = finalizer._digest(body)
+
+    valid = _handoff(finalizer)
+    valid["terminal_outcome"] = "infrastructure_stop_failure"
+    valid["evidence"] = []
+    valid["predecessor_receipt_sha256"] = None
+    valid["first_100_receipt_sha256"] = None
+    resign(valid)
+    finalizer.validate_handoff(valid)
+
+    invalid = _handoff(finalizer)
+    invalid["terminal_outcome"] = "fidelity_stop"
+    invalid["evidence"] = invalid["evidence"][:2]
+    invalid["predecessor_receipt_sha256"] = invalid["evidence"][-1]["receipt_sha256"]
+    invalid["first_100_receipt_sha256"] = None
+    resign(invalid)
+    with __import__("pytest").raises(finalizer.FinalizationError):
+        finalizer.validate_handoff(invalid)
+
+
+def test_handoff_outcome_stage_sets_and_digests_are_fail_closed() -> None:
+    finalizer = _module()
+
+    def resign(payload):
+        body = dict(payload); body.pop("handoff_sha256", None)
+        payload["handoff_sha256"] = finalizer._digest(body)
+
+    expected_lengths = {
+        "complete": 11, "replay_shortage": 10,
+        "fidelity_stop": 3, "insufficient_source_stop": 3,
+        "infrastructure_stop": 0, "infrastructure_stop_failure": 0,
+    }
+    for outcome, length in expected_lengths.items():
+        handoff = _handoff(finalizer)
+        handoff["terminal_outcome"] = outcome
+        handoff["evidence"] = handoff["evidence"][:length]
+        handoff["predecessor_receipt_sha256"] = handoff["evidence"][-1]["receipt_sha256"] if length else None
+        handoff["first_100_receipt_sha256"] = "c" * 64 if length >= 3 else None
+        resign(handoff)
+        finalizer.validate_handoff(handoff)
+
+    for field in ("receipt_sha256", "file_sha256"):
+        handoff = _handoff(finalizer)
+        handoff["evidence"][0][field] = "bad"
+        resign(handoff)
+        with __import__("pytest").raises(finalizer.FinalizationError):
+            finalizer.validate_handoff(handoff)
+
+
 def test_stop_times_out_after_exact_id_validation() -> None:
     finalizer = _module()
     class Provider:
-        def get(self, instance_id): return {"id": instance_id, "name": "lehome-rollout", "state": "RUNNING", "disks": ["computedisk-u00pbe55crxy7jr56x"]}
+        calls = 0
+        def get(self, instance_id):
+            self.calls += 1
+            return _instance(finalizer, "RUNNING" if self.calls == 1 else "STOPPING")
         def stop(self, instance_id): return None
     with __import__("pytest").raises(finalizer.FinalizationError, match="STOPPED"):
         finalizer.stop_exact_instance(Provider(), timeout_seconds=0.0001)
@@ -189,7 +282,7 @@ def test_stop_times_out_after_exact_id_validation() -> None:
 def test_finalizer_rejects_missing_protected_disk_before_stop_dispatch() -> None:
     finalizer = _module(); calls: list[str] = []
     class Provider:
-        def get(self, instance_id): calls.append("get"); return {"id": instance_id, "name": "lehome-rollout", "state": "RUNNING", "disks": []}
+        def get(self, instance_id): calls.append("get"); return _instance(finalizer, "RUNNING", disks=[])
         def stop(self, instance_id): calls.append("stop")
     with __import__("pytest").raises(finalizer.FinalizationError):
         finalizer.stop_exact_instance(Provider(), timeout_seconds=1)
@@ -204,6 +297,29 @@ def test_provider_validator_accepts_only_real_nested_nebius_identity_shape() -> 
     with __import__("pytest").raises(finalizer.FinalizationError): finalizer._validate_instance(raw)
     raw["spec"]["secondary_disks"] = [{"managed_disk": {"name": "extra"}}]
     with __import__("pytest").raises(finalizer.FinalizationError): finalizer._validate_instance(raw)
+
+
+def test_provider_validator_rejects_legacy_flat_shape_and_stop_polls_stopping() -> None:
+    finalizer = _module()
+    with __import__("pytest").raises(finalizer.FinalizationError):
+        finalizer._validate_instance({"id": finalizer.EXACT_INSTANCE_ID, "name": finalizer.EXACT_INSTANCE_NAME, "state": "STOPPED", "disks": [finalizer.PROTECTED_DISK_ID]})
+
+    class Provider:
+        states = iter(("RUNNING", "STOPPING", "STOPPED"))
+        def get(self, instance_id): return _instance(finalizer, next(self.states))
+        def stop(self, instance_id): return None
+
+    assert finalizer.stop_exact_instance(Provider(), timeout_seconds=1)["state"] == "STOPPED"
+    for unsafe in ("STARTING", "RESTARTING"):
+        with __import__("pytest").raises(finalizer.FinalizationError):
+            finalizer._validate_instance(_instance(finalizer, unsafe))
+
+
+def test_emergency_cli_stops_exact_vm_without_any_operator_metadata(monkeypatch) -> None:
+    finalizer = _module(); stopped: list[object] = []
+    monkeypatch.setattr(finalizer, "stop_exact_instance", lambda provider, **_kwargs: stopped.append(provider) or {})
+    assert finalizer.main(["--emergency-stop-only"]) == 0
+    assert len(stopped) == 1
 
 
 def test_hf_finalizer_reconciles_lost_receipt_response_without_second_upload(tmp_path: Path) -> None:
