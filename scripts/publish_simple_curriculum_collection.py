@@ -22,7 +22,7 @@ import stat
 import sys
 import tempfile
 import time
-from typing import Mapping, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -370,13 +370,29 @@ def _is_transient(error: BaseException) -> bool:
     }
 
 
-def _retry(operation, *, label: str, max_attempts: int):
+def _deadline_guard(
+    *, deadline: float | None, monotonic: Callable[[], float], label: str,
+) -> None:
+    if deadline is not None and monotonic() > deadline:
+        raise CollectionPublicationError(f"{label} timeout")
+
+
+def _retry(
+    operation, *, label: str, max_attempts: int, deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic, deadline_label: str = "publication",
+):
     if type(max_attempts) is not int or not 1 <= max_attempts <= 3:
         raise CollectionPublicationError("publication retry limit is invalid")
     for attempt in range(max_attempts):
+        _deadline_guard(deadline=deadline, monotonic=monotonic, label=deadline_label)
         try:
-            return operation()
+            result = operation()
+            _deadline_guard(deadline=deadline, monotonic=monotonic, label=deadline_label)
+            return result
         except Exception as error:  # noqa: BLE001 - transport boundary is intentionally narrow below
+            if isinstance(error, CollectionPublicationError):
+                raise
+            _deadline_guard(deadline=deadline, monotonic=monotonic, label=deadline_label)
             if not _is_transient(error) or attempt + 1 == max_attempts:
                 raise CollectionPublicationError(f"{label} failed") from None
     raise AssertionError("retry loop is exhausted")
@@ -402,6 +418,8 @@ def _tree_files(tree: Sequence[object], *, prefix: str) -> set[str]:
 def _verify_download(
     *, transport: PublicCollectionTransport, bundle: CollectionPublicationBundle,
     revision: str, prefix: str, entries: tuple[PublicationEntry, ...], token: str | None,
+    deadline: float | None = None, monotonic: Callable[[], float] = time.monotonic,
+    deadline_label: str = "publication",
 ) -> None:
     destination = Path(tempfile.mkdtemp(prefix="lehome-curriculum-readback-", dir=bundle.root.parent))
     try:
@@ -412,6 +430,7 @@ def _verify_download(
                 remote_prefix=prefix,
             ),
             label="public readback" if token is None else "readback", max_attempts=3,
+            deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
         )
         if observed != revision:
             raise CollectionPublicationError("readback did not bind the immutable revision")
@@ -426,6 +445,8 @@ def _verify_download(
 def publish_collection_bundle(
     bundle: CollectionPublicationBundle, *, token: str, transport: PublicCollectionTransport,
     max_attempts: int = 3, remote_prefix: str | None = None,
+    deadline: float | None = None, monotonic: Callable[[], float] = time.monotonic,
+    deadline_label: str = "publication",
 ) -> CollectionPublicationResult:
     """Upload one collection tree then prove authenticated and public readback.
 
@@ -439,13 +460,16 @@ def publish_collection_bundle(
     with _stage_descriptor_safe_bundle(bundle, entries) as staged:
         return _publish_staged_collection_bundle(
             staged, entries=entries, token=token, transport=transport, max_attempts=max_attempts,
-            remote_prefix=remote_prefix,
+            remote_prefix=remote_prefix, deadline=deadline, monotonic=monotonic,
+            deadline_label=deadline_label,
         )
 
 
 def _publish_staged_collection_bundle(
     bundle: CollectionPublicationBundle, *, entries: tuple[PublicationEntry], token: str,
     transport: PublicCollectionTransport, max_attempts: int, remote_prefix: str | None = None,
+    deadline: float | None = None, monotonic: Callable[[], float] = time.monotonic,
+    deadline_label: str = "publication",
 ) -> CollectionPublicationResult:
     """Publish bytes copied from descriptor-verified staging only."""
 
@@ -456,6 +480,7 @@ def _publish_staged_collection_bundle(
     head = _retry(
         lambda: transport.resolve_approved_ref(repository=bundle.repository, ref=bundle.revision, token=token),
         label="publication ref resolution", max_attempts=max_attempts,
+        deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
     )
     if not isinstance(head, str) or not _COMMIT.fullmatch(head):
         raise CollectionPublicationError("publication ref did not resolve to an immutable commit")
@@ -463,6 +488,7 @@ def _publish_staged_collection_bundle(
         _retry(
             lambda: transport.list_tree(repository=bundle.repository, revision=head, token=token, remote_prefix=prefix),
             label="collection collision check", max_attempts=max_attempts,
+            deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
         ),
         prefix=prefix,
     )
@@ -475,7 +501,8 @@ def _publish_staged_collection_bundle(
             # only when the already-published bytes are identical.
             _verify_download(
                 transport=transport, bundle=bundle, revision=revision, prefix=prefix,
-                entries=entries, token=token,
+                entries=entries, token=token, deadline=deadline, monotonic=monotonic,
+                deadline_label=deadline_label,
             )
         except CollectionPublicationError as error:
             raise CollectionPublicationError("immutable collection collision") from error
@@ -487,6 +514,7 @@ def _publish_staged_collection_bundle(
                     entries=entries, token=token, remote_prefix=prefix, parent_commit=head,
                 ),
                 label="collection upload", max_attempts=max_attempts,
+                deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
             )
         except CollectionPublicationError as upload_error:
             # A lost response or a concurrent branch update is ambiguous.  Do
@@ -497,6 +525,7 @@ def _publish_staged_collection_bundle(
                     repository=bundle.repository, ref=bundle.revision, token=token,
                 ),
                 label="publication ref reconciliation", max_attempts=max_attempts,
+                deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
             )
             if not isinstance(current_head, str) or _COMMIT.fullmatch(current_head) is None:
                 raise CollectionPublicationError("publication ref reconciliation did not resolve an immutable commit") from None
@@ -506,6 +535,7 @@ def _publish_staged_collection_bundle(
                         repository=bundle.repository, revision=current_head, token=token, remote_prefix=prefix,
                     ),
                     label="collection collision reconciliation", max_attempts=max_attempts,
+                    deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
                 ),
                 prefix=prefix,
             )
@@ -516,7 +546,8 @@ def _publish_staged_collection_bundle(
             try:
                 _verify_download(
                     transport=transport, bundle=bundle, revision=current_head, prefix=prefix,
-                    entries=entries, token=token,
+                    entries=entries, token=token, deadline=deadline, monotonic=monotonic,
+                    deadline_label=deadline_label,
                 )
             except CollectionPublicationError as error:
                 raise CollectionPublicationError("immutable collection collision") from error
@@ -527,6 +558,7 @@ def _publish_staged_collection_bundle(
             _retry(
                 lambda: transport.list_tree(repository=bundle.repository, revision=revision, token=token, remote_prefix=prefix),
                 label="collection tree verification", max_attempts=max_attempts,
+                deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
             ),
             prefix=prefix,
         )
@@ -534,9 +566,13 @@ def _publish_staged_collection_bundle(
             raise CollectionPublicationError("remote collection tree does not match the immutable bundle")
         _verify_download(
             transport=transport, bundle=bundle, revision=revision, prefix=prefix,
-            entries=entries, token=token,
+            entries=entries, token=token, deadline=deadline, monotonic=monotonic,
+            deadline_label=deadline_label,
         )
-    _verify_download(transport=transport, bundle=bundle, revision=revision, prefix=prefix, entries=entries, token=None)
+    _verify_download(
+        transport=transport, bundle=bundle, revision=revision, prefix=prefix, entries=entries, token=None,
+        deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
+    )
     return CollectionPublicationResult(
         repository=bundle.repository, remote_prefix=prefix, immutable_revision=revision,
         entries=entries, readback_verified=True, public_readback_verified=True,
@@ -1018,10 +1054,11 @@ def _provisional_stages(root: Path, outcome: str) -> tuple[str, ...]:
         "curriculum-a", "curriculum-b", "fresh-report", "replay-matrix",
         "success-replay",
     )
-    if outcome == "complete": return all_stages
-    if outcome == "replay_shortage": return all_stages
-    if outcome in {"fidelity_stop", "insufficient_source_stop"}: return all_stages[:3]
-    if outcome in {"infrastructure_stop", "infrastructure_stop_failure"}:
+    if outcome in {"complete", "replay_shortage"}:
+        return all_stages
+    if outcome in {
+        "fidelity_stop", "insufficient_source_stop", "infrastructure_stop", "infrastructure_stop_failure",
+    }:
         # Infrastructure may interrupt after any completed stage.  Preserve
         # the whole reachable prefix rather than collapsing it to an empty
         # handoff and losing predecessor evidence.
@@ -1087,7 +1124,9 @@ def _provisional_hub_references(root: Path, *, run_id: str, round_id: str, outco
             "immutable_revision": revision, "episode_sha256": sync.get("episode_sha256"),
             "local_sync_receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
         }
-        if (reference["repository"] != "ryanjin333/lehome-groot-n17-rollouts" or not isinstance(reference["prefix"], str)
+        if (sync.get("attempt_id") != attempt or sync.get("run_id") != run_id or sync.get("round_id") != round_id
+                or sync.get("readback_verified") is not True
+                or reference["repository"] != "ryanjin333/lehome-groot-n17-rollouts" or reference["prefix"] != f"rollout-rounds/{round_id}/{attempt}"
                 or not isinstance(revision, str) or _COMMIT.fullmatch(revision) is None
                 or not isinstance(reference["episode_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", reference["episode_sha256"])):
             raise CollectionPublicationError("fresh artifact reference does not bind immutable Hub data")
@@ -1101,30 +1140,54 @@ def _provisional_hub_references(root: Path, *, run_id: str, round_id: str, outco
     if not isinstance(source, Mapping): raise CollectionPublicationError("success replay references are malformed")
     for attempt, item in source.items():
         if not isinstance(attempt, str) or not isinstance(item, Mapping): raise CollectionPublicationError("success replay reference is malformed")
-        replay.append({"attempt_id": attempt, "repository": "ryanjin333/lehome-groot-n17-rollouts", "prefix": f"rollout-rounds/{round_id}-replay/{attempt}", "immutable_revision": item.get("immutable_revision"), "episode_sha256": item.get("episode_sha256"), "local_sync_receipt_sha256": item.get("receipt_sha256")})
+        receipt = root / "replay" / "hf-sync-receipts" / f"{attempt}.sync.json"
+        sync = _json_object(receipt, label="success replay Hub sync receipt")
+        reference = {"attempt_id": attempt, "repository": "ryanjin333/lehome-groot-n17-rollouts", "prefix": f"rollout-rounds/{round_id}-replay/{attempt}", "immutable_revision": item.get("immutable_revision"), "episode_sha256": item.get("episode_sha256"), "local_sync_receipt_sha256": item.get("receipt_sha256")}
+        if (
+            sync.get("attempt_id") != attempt or sync.get("run_id") != run_id or sync.get("round_id") != f"{round_id}-replay"
+            or sync.get("readback_verified") is not True or sync.get("repository") != reference["repository"]
+            or sync.get("remote_prefix") != reference["prefix"] or sync.get("immutable_revision") != reference["immutable_revision"]
+            or sync.get("episode_sha256") != reference["episode_sha256"]
+            or reference["local_sync_receipt_sha256"] != hashlib.sha256(receipt.read_bytes()).hexdigest()
+            or not isinstance(reference["immutable_revision"], str) or _COMMIT.fullmatch(reference["immutable_revision"]) is None
+            or not isinstance(reference["episode_sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", reference["episode_sha256"]) is None
+        ):
+            raise CollectionPublicationError("success replay reference does not bind immutable Hub data")
+        replay.append(reference)
     if outcome == "complete" and len(replay) != 200: raise CollectionPublicationError("provisional evidence lacks exactly 200 accepted replay references")
     return {"schema_version": 1, "kind": "lehome_simple_curriculum_hub_artifact_references_v1", "fresh": fresh, "success_replay": replay}
+
+
+def _provisional_campaign_root(run_id: str) -> Path:
+    return Path("/mnt/lehome/eval") / run_id
 
 
 def publish_provisional_collection(
     campaign_root: Path, *, run_id: str, round_id: str, terminal_outcome: str,
     rollout_instance_id: str, repository: str, revision: str, token: str,
     transport: PublicCollectionTransport, timeout_seconds: float = 90.0,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
     """Stage the immutable pre-stop JSON evidence bundle while the VM runs."""
     root = _safe_bundle_root(Path(campaign_root))
     if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 120:
         raise CollectionPublicationError("provisional publication timeout is invalid")
-    deadline = time.monotonic() + float(timeout_seconds)
+    deadline = monotonic() + float(timeout_seconds)
     if _RUN_ID.fullmatch(run_id) is None or re.fullmatch(r"^fresh-12k-[a-z0-9-]{1,112}$", round_id) is None:
         raise CollectionPublicationError("provisional collection identity is invalid")
-    if root != Path("/mnt/lehome/eval") / run_id:
+    if root != _provisional_campaign_root(run_id):
         raise CollectionPublicationError("provisional campaign root is not exact")
     stages = _provisional_stages(root, terminal_outcome)
     stage_receipts, files = _provisional_stage_receipts(root, stages=stages)
     task6: dict[str, object] = {"schema_version": 1, "kind": "lehome_simple_curriculum_task6_validation_v1", "terminal_outcome": terminal_outcome, "result": "not_complete"}
     if terminal_outcome == "complete":
         fresh_total, fresh_successes, replay_attempts, replay_successes, categories = _authenticate_complete_task6_evidence(root, run_id=run_id, round_id=round_id)
+        expected_categories = {"pant_long": 50, "pant_short": 50, "top_long": 50, "top_short": 50}
+        if (
+            fresh_total != 1000 or not isinstance(fresh_successes, int) or not 0 <= fresh_successes <= fresh_total
+            or replay_attempts != 400 or replay_successes != 200 or categories != expected_categories
+        ):
+            raise CollectionPublicationError("authoritative Task 6 counts do not meet the complete contract")
         task6.update(result="complete", fresh_valid_outcomes=fresh_total, fresh_official_successes=fresh_successes, replay_attempts=replay_attempts, replay_accepted_successes=replay_successes, replay_accepted_by_category=categories)
     references = _provisional_hub_references(root, run_id=run_id, round_id=round_id, outcome=terminal_outcome)
     if terminal_outcome != "complete":
@@ -1153,8 +1216,11 @@ def publish_provisional_collection(
         for relative, raw in files.items():
             path = staging / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(raw)
         bundle = CollectionPublicationBundle(staging, run_id, repository, revision, tuple(sorted(files)))
-        result = publish_collection_bundle(bundle, token=token, transport=transport)
-        if time.monotonic() > deadline:
+        result = publish_collection_bundle(
+            bundle, token=token, transport=transport, deadline=deadline, monotonic=monotonic,
+            deadline_label="provisional publication", remote_prefix=f"collection-rounds/{run_id}/manifests/provisional",
+        )
+        if monotonic() > deadline:
             raise CollectionPublicationError("provisional publication timeout")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
