@@ -14,11 +14,36 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_paid_terminal_handoff_requires_a_pinned_provisional_bundle_before_stop(tmp_path: Path) -> None:
+    """The controller may hand off only evidence it has durably staged while running."""
+    module = _module()
+    run_id = "fresh-run-20260828-provisional"
+    root = tmp_path / run_id; root.mkdir()
+    config = _config(module, root, run_id=run_id)
+    with __import__("pytest").raises(module.ReceiptMismatchError, match="provisional"):
+        module._provisional_receipt(config)
+
+
+def test_paid_handoff_rejects_an_unsafe_campaign_root_before_any_staging(tmp_path: Path) -> None:
+    module = _module()
+    config = _config(module, tmp_path / "not-the-run-id", run_id="fresh-run-20260828-root")
+    with __import__("pytest").raises(module.ReceiptMismatchError, match="campaign root"):
+        module.require_operator_campaign_root(config)
+
+
 def _module():
     spec = importlib.util.spec_from_file_location("terminal_handoff_controller", ROOT / "scripts" / "run_simple_curriculum_collection.py")
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec); sys.modules[spec.name] = module; spec.loader.exec_module(module)
     return module
+
+
+def _config(module, root: Path, *, run_id: str):
+    return module.CollectionConfig(
+        root, ROOT, run_id, "fresh-12k-20260828-provisional", 3600.0, 99.0, True, None,
+        {**module._ORIGINAL_12K, "rollout_image": "repo/r@sha256:" + "a" * 64,
+         "trainer_image": "repo/t@sha256:" + "b" * 64}, root / "spend.json",
+    )
 
 
 def test_paid_terminal_writes_handoff_without_self_stop_or_publication(tmp_path: Path) -> None:

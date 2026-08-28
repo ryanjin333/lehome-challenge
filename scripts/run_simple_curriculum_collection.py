@@ -13,6 +13,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+import importlib.util
 import json
 import math
 import os
@@ -36,6 +37,7 @@ STAGES = (
 COMMAND_VERSION = "simple-curriculum-one-vm-v1"
 _HEX = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
+_SAFE_OPERATOR_ID = re.compile(r"^[a-z0-9][a-z0-9-]{7,127}$")
 _DEFAULT_IDS = frozenset({"lehome-rft-70-30-v1", "round-3", "campaign-12k-round-3"})
 _CLOUD_TOKENS = frozenset({"nebius", "vast", "aws", "gcloud", "terraform", "packer", "create", "start", "delete"})
 _ORIGINAL_12K = {
@@ -1304,6 +1306,22 @@ def _canonical_root(config: CollectionConfig) -> Path:
     return config.campaign_root.resolve(strict=False)
 
 
+def require_operator_campaign_root(config: CollectionConfig) -> Path:
+    """Reject shell-shaped or mis-bound roots at the paid appliance boundary.
+
+    Unit-level journal tests deliberately use temporary roots, so this is kept
+    at the real operator boundary rather than silently changing the journal's
+    portable local-test contract.
+    """
+    if (
+        _SAFE_OPERATOR_ID.fullmatch(config.run_id) is None
+        or _SAFE_OPERATOR_ID.fullmatch(config.round_id) is None
+        or config.campaign_root != Path("/mnt/lehome/eval") / config.run_id
+    ):
+        raise ReceiptMismatchError("campaign root is not the exact operator run root")
+    return config.campaign_root
+
+
 def _verified_stop_observation(config: CollectionConfig) -> tuple[Path, str]:
     """Require a trusted Nebius API observation, not merely stop dispatch."""
     path = _canonical_root(config) / "stage-receipts" / "gpu-stop-observation.json"
@@ -1748,12 +1766,66 @@ def _operator_handoff_path(config: CollectionConfig) -> Path:
     return _canonical_root(config) / "reports" / "operator-stop-handoff.json"
 
 
+def _provisional_receipt(config: CollectionConfig) -> dict[str, object]:
+    """Load the running-VM publication proof without trusting a mutable ref."""
+    path = _canonical_root(config) / "reports" / "provisional-publication.json"
+    payload = _strict_json_object(path, label="provisional publication receipt")
+    body = dict(payload); declared = body.pop("receipt_sha256", None)
+    required = {
+        "schema_version", "kind", "run_id", "round_id", "repository", "remote_prefix",
+        "immutable_revision", "entry_count", "entries", "bundle_sha256", "manifest_sha256",
+        "readback_verified", "public_readback_verified", "receipt_sha256",
+    }
+    if (
+        set(payload) != required or declared != _digest(body)
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != "lehome_simple_curriculum_provisional_publication_receipt_v1"
+        or payload.get("run_id") != config.run_id or payload.get("round_id") != config.round_id
+        or payload.get("remote_prefix") != f"collection-rounds/{config.run_id}/manifests/provisional"
+        or not isinstance(payload.get("repository"), str) or not payload["repository"]
+        or _HEX.fullmatch(str(payload.get("immutable_revision"))) is None
+        or _HEX.fullmatch(str(payload.get("bundle_sha256"))) is None
+        or _HEX.fullmatch(str(payload.get("manifest_sha256"))) is None
+        or type(payload.get("entry_count")) is not int or not isinstance(payload.get("entries"), list)
+        or payload.get("readback_verified") is not True or payload.get("public_readback_verified") is not True
+    ):
+        raise ReceiptMismatchError("provisional publication receipt is malformed")
+    return payload
+
+
+def _ensure_provisional_publication(config: CollectionConfig, *, outcome: str) -> dict[str, object]:
+    """The only billed-VM publication: compact JSON, before the local stop."""
+    existing = _canonical_root(config) / "reports" / "provisional-publication.json"
+    if existing.exists() or existing.is_symlink():
+        return _provisional_receipt(config)
+    publisher_path = config.host_code_root / "scripts" / "publish_simple_curriculum_collection.py"
+    spec = importlib.util.spec_from_file_location("_lehome_provisional_publisher", publisher_path)
+    if spec is None or spec.loader is None:
+        raise ReceiptMismatchError("provisional publisher is unavailable")
+    publisher = importlib.util.module_from_spec(spec); spec.loader.exec_module(publisher)
+    try:
+        return publisher.publish_provisional_collection(
+            _canonical_root(config), run_id=config.run_id, round_id=config.round_id,
+            terminal_outcome=outcome, rollout_instance_id=config.rollout_instance_id,
+            repository="ryanjin333/lehome-groot-n17-rollouts", revision="main",
+            token=publisher._load_token(Path("/mnt/lehome/secrets/hf_token")),
+            transport=publisher.HuggingFacePublicDatasetTransport(),
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ReceiptMismatchError("provisional publication failed") from error
+
+
 def _operator_stop_handoff(
     journal: StageJournal, config: CollectionConfig, *, predecessor: str | None, outcome: str,
 ) -> str:
     """Persist the running VM's compact terminal handoff; never self-stop or publish."""
     if outcome not in _TERMINAL_OUTCOMES:
         raise ReceiptMismatchError("operator handoff outcome is invalid")
+    # Only production-shaped roots can reach the local operator stop path.
+    # Their handoff is bound to an immutable public provisional bundle.  The
+    # portable unit journal intentionally retains temporary-root support.
+    production_root = Path("/mnt/lehome/eval") / config.run_id
+    provisional = _ensure_provisional_publication(config, outcome=outcome) if _canonical_root(config) == production_root else None
     # Every completed stage passed its authenticated output validation before
     # its immutable receipt was written.  Re-hash those durable receipts here;
     # deep source traversal remains owned by the stage-specific controllers,
@@ -1779,6 +1851,16 @@ def _operator_stop_handoff(
         "runtime_identity": dict(config.runtime_identity), "runtime_identity_sha256": _digest(dict(config.runtime_identity)),
         "first_100_receipt_sha256": first, "evidence": evidence,
     }
+    if provisional is not None:
+        body.update({
+            "schema_version": 2, "kind": "lehome_simple_curriculum_operator_stop_handoff_v2",
+            "provisional_publication": {
+                "immutable_revision": provisional["immutable_revision"],
+                "bundle_sha256": provisional["bundle_sha256"],
+                "manifest_sha256": provisional["manifest_sha256"],
+                "repository": provisional["repository"], "remote_prefix": provisional["remote_prefix"],
+            },
+        })
     payload = {**body, "handoff_sha256": _digest(body)}
     path = _operator_handoff_path(config)
     if path.exists() or path.is_symlink():
@@ -1800,13 +1882,21 @@ def _existing_operator_handoff(config: CollectionConfig) -> bool:
         "predecessor_receipt_sha256", "code_revision", "code_tree_sha256", "runtime_identity",
         "runtime_identity_sha256", "first_100_receipt_sha256", "evidence", "handoff_sha256",
     }
-    if (set(payload) != required or declared != _digest(body) or payload["schema_version"] != 1
-            or payload["kind"] != "lehome_simple_curriculum_operator_stop_handoff_v1"
+    v2_required = required | {"provisional_publication"}
+    is_v2 = set(payload) == v2_required and payload.get("schema_version") == 2 and payload.get("kind") == "lehome_simple_curriculum_operator_stop_handoff_v2"
+    if (set(payload) not in (required, v2_required) or declared != _digest(body) or (not is_v2 and (payload["schema_version"] != 1
+            or payload["kind"] != "lehome_simple_curriculum_operator_stop_handoff_v1"))
             or payload["run_id"] != config.run_id or payload["round_id"] != config.round_id
             or payload["instance_id"] != config.rollout_instance_id
             or payload["runtime_identity"] != dict(config.runtime_identity)
             or payload["runtime_identity_sha256"] != _digest(dict(config.runtime_identity))):
         raise ReceiptMismatchError("operator stop handoff is malformed")
+    if is_v2:
+        provisional = payload.get("provisional_publication")
+        receipt = _provisional_receipt(config)
+        expected = {key: receipt[key] for key in ("immutable_revision", "bundle_sha256", "manifest_sha256", "repository", "remote_prefix")}
+        if provisional != expected:
+            raise ReceiptMismatchError("operator stop handoff provisional binding is malformed")
     return True
 
 
@@ -1940,6 +2030,8 @@ def main(argv: list[str] | None = None) -> int:
         identity = json.loads(args.runtime_identity_json.read_text(encoding="utf-8"))
         config = CollectionConfig(args.campaign_root, args.host_code_root, args.run_id, args.round_id, args.max_wall_seconds, args.max_spend_usd, args.paid, args.gpu_stop_command, identity, args.spend_observer)
         config.validate(require_git=True)
+        if config.paid:
+            require_operator_campaign_root(config)
         print(run_collection(config, runner=CommandRunner(config)))
     except (OSError, ValueError, ReceiptMismatchError, StopHookError, RuntimeError) as error:
         _parser().error(str(error))

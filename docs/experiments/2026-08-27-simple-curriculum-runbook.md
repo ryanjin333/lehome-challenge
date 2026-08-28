@@ -304,15 +304,19 @@ PYTHONPATH=.:source/lehome:trainer/src pytest -q \
   tests/infrastructure/test_simple_curriculum_campaign.py \
   tests/infrastructure/test_simple_curriculum_orchestrator.py \
   tests/infrastructure/test_simple_curriculum_publication.py \
+  tests/infrastructure/test_simple_curriculum_terminal_handoff.py \
+  tests/infrastructure/test_simple_curriculum_operator_finalizer.py \
   tests/infrastructure/test_success_replay_campaign.py \
   tests/infrastructure/test_rollout_container.py \
   tests/infrastructure/test_simple_curriculum_runbook.py
 bash -n rollout_appliance/run_12k_campaign.sh
 bash -n rollout_appliance/run_success_replay_campaign.sh
 bash -n rollout_appliance/run_simple_curriculum_collection.sh
+bash -n scripts/run_simple_curriculum_with_finalizer.sh
 python3 -m py_compile scripts/build_simple_curriculum_matrix.py \
   scripts/check_simple_curriculum_gate.py scripts/build_success_replay_matrix.py \
-  scripts/run_simple_curriculum_collection.py scripts/publish_simple_curriculum_collection.py
+  scripts/run_simple_curriculum_collection.py scripts/publish_simple_curriculum_collection.py \
+  scripts/finalize_simple_curriculum_collection.py
 env -i PATH="$PATH" PYTHONPATH="$PWD:$PWD/source/lehome:$PWD/trainer/src" \
   python3 scripts/run_simple_curriculum_collection.py --help
 git diff --check
@@ -362,8 +366,10 @@ invalid ratio no greater than 2%, and at least five official successes.
   infrastructure outcome, never a data success.
 
 The controller polls the typed spend receipt before and after every paid stage
-and while a child runs. It writes durable budget state and never publishes on
-the VM; only the post-return local finalizer may publish after STOPPED.
+and while a child runs. Once a terminal outcome is known, while the VM is
+still running it publishes only a compact immutable provisional JSON evidence
+bundle (never rollout media) and records its pinned revision. The local
+finalizer may promote/seal only after authoritative STOPPED.
 
 ## 7. Fresh terminal evidence, replay, and publication
 
@@ -371,8 +377,10 @@ When the paid controller returns `operator_stop_required`, do **not** run it
 again, SSH for raw rollouts, or attempt publication from the VM. Section 5's
 wrapper already invokes the local finalizer once with the persisted IDs. Its
 safety trap means an SSH/controller failure cannot skip the exact-VM stop; the
-finalizer fetches only the compact handoff into a temporary directory and
-always calls exact-ID Compute `get`/`stop`/`get` before any Hub upload.
+finalizer fetches only the compact handoff into a temporary directory, then
+downloads only the pinned provisional JSON bundle from Hub (never raw campaign
+bytes or rollout media), and always calls exact-ID Compute `get`/`stop`/`get`
+before any promotion upload.
 
 The local finalizer pins `computeinstance-u00t6xfqhadrcmssa2`, name
 `lehome-rollout`, and attached protected disk

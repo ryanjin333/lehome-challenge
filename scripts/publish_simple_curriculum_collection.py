@@ -424,7 +424,7 @@ def _verify_download(
 
 def publish_collection_bundle(
     bundle: CollectionPublicationBundle, *, token: str, transport: PublicCollectionTransport,
-    max_attempts: int = 3,
+    max_attempts: int = 3, remote_prefix: str | None = None,
 ) -> CollectionPublicationResult:
     """Upload one collection tree then prove authenticated and public readback.
 
@@ -438,16 +438,19 @@ def publish_collection_bundle(
     with _stage_descriptor_safe_bundle(bundle, entries) as staged:
         return _publish_staged_collection_bundle(
             staged, entries=entries, token=token, transport=transport, max_attempts=max_attempts,
+            remote_prefix=remote_prefix,
         )
 
 
 def _publish_staged_collection_bundle(
     bundle: CollectionPublicationBundle, *, entries: tuple[PublicationEntry], token: str,
-    transport: PublicCollectionTransport, max_attempts: int,
+    transport: PublicCollectionTransport, max_attempts: int, remote_prefix: str | None = None,
 ) -> CollectionPublicationResult:
     """Publish bytes copied from descriptor-verified staging only."""
 
-    prefix = f"{_PUBLICATION_ROOT}/{bundle.run_id}"
+    prefix = remote_prefix or f"{_PUBLICATION_ROOT}/{bundle.run_id}"
+    if not re.fullmatch(rf"{_PUBLICATION_ROOT}/{re.escape(bundle.run_id)}(?:/[a-z0-9][a-z0-9._/-]*)?", prefix):
+        raise CollectionPublicationError("collection publication prefix is invalid")
     expected = {entry.relative_path for entry in entries}
     head = _retry(
         lambda: transport.resolve_approved_ref(repository=bundle.repository, ref=bundle.revision, token=token),
@@ -1005,6 +1008,154 @@ def _stage_collection_bundle(root: Path, *, seal_path: Path, run_id: str, reposi
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
+
+
+def _provisional_stages(root: Path, outcome: str) -> tuple[str, ...]:
+    all_stages = (
+        "calibration-matrix", "calibration-head", "first-100-gate",
+        "calibration-tail", "calibration-report", "curriculum-matrix",
+        "curriculum-a", "curriculum-b", "fresh-report", "replay-matrix",
+        "success-replay",
+    )
+    if outcome == "complete": return all_stages
+    if outcome == "replay_shortage": return all_stages[:-1]
+    if outcome in {"fidelity_stop", "insufficient_source_stop"}: return all_stages[:3]
+    if outcome in {"infrastructure_stop", "infrastructure_stop_failure"}:
+        # Infrastructure may interrupt after any completed stage.  Preserve
+        # the whole reachable prefix rather than collapsing it to an empty
+        # handoff and losing predecessor evidence.
+        prefix: list[str] = []
+        for stage in all_stages:
+            if (root / "stage-receipts" / f"{stage}.json").is_file(): prefix.append(stage)
+            else: break
+        if any((root / "stage-receipts" / f"{stage}.json").exists() for stage in all_stages[len(prefix):]):
+            raise CollectionPublicationError("infrastructure provisional stage receipts are not a reachable prefix")
+        return tuple(prefix)
+    raise CollectionPublicationError("terminal outcome has no provisional evidence shape")
+
+
+def _provisional_stage_receipts(root: Path, *, stages: Sequence[str]) -> tuple[list[dict[str, object]], dict[str, bytes]]:
+    """Copy complete original receipt bodies and prove their actual chain."""
+    receipts: list[dict[str, object]] = []
+    files: dict[str, bytes] = {}
+    predecessor: str | None = None
+    common_identity: object | None = None
+    for stage in stages:
+        relative = f"stage-receipts/{stage}.json"
+        path = root / relative
+        body = _json_object(path, label="provisional stage receipt")
+        claimed = body.get("receipt_sha256")
+        unsigned = dict(body); unsigned.pop("receipt_sha256", None)
+        if (
+            not isinstance(claimed, str) or not re.fullmatch(r"[0-9a-f]{64}", claimed)
+            or claimed != hashlib.sha256(_canonical(unsigned)).hexdigest()
+            or body.get("stage") != stage or body.get("predecessor_receipt_sha256") != predecessor
+            or not isinstance(body.get("runtime_identity"), Mapping)
+        ):
+            raise CollectionPublicationError("provisional stage receipt chain is malformed")
+        identity = body.get("runtime_identity")
+        if common_identity is None: common_identity = identity
+        elif identity != common_identity: raise CollectionPublicationError("provisional stage receipts have divergent identity")
+        raw = path.read_bytes()
+        file_sha = hashlib.sha256(raw).hexdigest()
+        receipts.append({"stage": stage, "receipt_sha256": claimed, "file_sha256": file_sha, "predecessor_receipt_sha256": predecessor})
+        files[f"manifests/provisional/{relative}"] = raw
+        predecessor = claimed
+    return receipts, files
+
+
+def _provisional_hub_references(root: Path, *, run_id: str, round_id: str, outcome: str) -> dict[str, object]:
+    """Compact immutable references, never episode/media bytes.
+
+    Task 6 already authenticates every fresh terminal root while the VM is
+    running.  We preserve just enough signed reference metadata for a later
+    local finalizer to check closure without re-reading the campaign tree.
+    """
+    if outcome != "complete":
+        return {"schema_version": 1, "kind": "lehome_simple_curriculum_hub_artifact_references_v1", "fresh": [], "success_replay": []}
+    manifest = _json_object(root / "reports/fresh-terminal-artifacts.json", label="fresh terminal artifact manifest")
+    fresh: list[dict[str, object]] = []
+    for entry in manifest.get("entries", []):
+        if not isinstance(entry, Mapping): raise CollectionPublicationError("fresh artifact reference is malformed")
+        attempt = entry.get("attempt_id"); artifact_root = entry.get("finalized_artifact_root")
+        if not isinstance(attempt, str) or not isinstance(artifact_root, str): raise CollectionPublicationError("fresh artifact reference is malformed")
+        receipt = Path(artifact_root).parent.parent / "hf-sync-receipts" / f"{attempt}.sync.json"
+        sync = _json_object(receipt, label="fresh Hub sync receipt")
+        revision = sync.get("immutable_revision")
+        reference = {
+            "attempt_id": attempt, "repository": sync.get("repository"), "prefix": sync.get("remote_prefix"),
+            "immutable_revision": revision, "episode_sha256": sync.get("episode_sha256"),
+            "local_sync_receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+        }
+        if (reference["repository"] != "ryanjin333/lehome-groot-n17-rollouts" or not isinstance(reference["prefix"], str)
+                or not isinstance(revision, str) or _COMMIT.fullmatch(revision) is None
+                or not isinstance(reference["episode_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", reference["episode_sha256"])):
+            raise CollectionPublicationError("fresh artifact reference does not bind immutable Hub data")
+        fresh.append(reference)
+    if len(fresh) != 1000 or len({item["attempt_id"] for item in fresh}) != 1000:
+        raise CollectionPublicationError("provisional evidence lacks exactly 1,000 fresh Hub references")
+    replay_seal = _json_object(root / "replay/success-replay-readback-seal.json", label="success replay readback seal")
+    replay: list[dict[str, object]] = []
+    source = replay_seal.get("readback_receipts")
+    if not isinstance(source, Mapping): raise CollectionPublicationError("success replay references are malformed")
+    for attempt, item in source.items():
+        if not isinstance(attempt, str) or not isinstance(item, Mapping): raise CollectionPublicationError("success replay reference is malformed")
+        replay.append({"attempt_id": attempt, "repository": "ryanjin333/lehome-groot-n17-rollouts", "prefix": f"rollout-rounds/{round_id}-replay/{attempt}", "immutable_revision": item.get("immutable_revision"), "episode_sha256": item.get("episode_sha256"), "local_sync_receipt_sha256": item.get("receipt_sha256")})
+    if len(replay) != 200: raise CollectionPublicationError("provisional evidence lacks exactly 200 accepted replay references")
+    return {"schema_version": 1, "kind": "lehome_simple_curriculum_hub_artifact_references_v1", "fresh": fresh, "success_replay": replay}
+
+
+def publish_provisional_collection(
+    campaign_root: Path, *, run_id: str, round_id: str, terminal_outcome: str,
+    rollout_instance_id: str, repository: str, revision: str, token: str,
+    transport: PublicCollectionTransport,
+) -> dict[str, object]:
+    """Stage the immutable pre-stop JSON evidence bundle while the VM runs."""
+    root = _safe_bundle_root(Path(campaign_root))
+    if _RUN_ID.fullmatch(run_id) is None or re.fullmatch(r"^fresh-12k-[a-z0-9-]{1,112}$", round_id) is None:
+        raise CollectionPublicationError("provisional collection identity is invalid")
+    if root != Path("/mnt/lehome/eval") / run_id:
+        raise CollectionPublicationError("provisional campaign root is not exact")
+    stages = _provisional_stages(root, terminal_outcome)
+    stage_receipts, files = _provisional_stage_receipts(root, stages=stages)
+    task6: dict[str, object] = {"schema_version": 1, "kind": "lehome_simple_curriculum_task6_validation_v1", "terminal_outcome": terminal_outcome, "result": "not_complete"}
+    if terminal_outcome == "complete":
+        fresh_total, fresh_successes, replay_attempts, replay_successes, categories = _authenticate_complete_task6_evidence(root, run_id=run_id, round_id=round_id)
+        task6.update(result="complete", fresh_valid_outcomes=fresh_total, fresh_official_successes=fresh_successes, replay_attempts=replay_attempts, replay_accepted_successes=replay_successes, replay_accepted_by_category=categories)
+    references = _provisional_hub_references(root, run_id=run_id, round_id=round_id, outcome=terminal_outcome)
+    evidence: dict[str, object] = {
+        "schema_version": 1, "kind": "lehome_simple_curriculum_provisional_evidence_manifest_v1",
+        "run_id": run_id, "round_id": round_id, "instance_id": rollout_instance_id,
+        "campaign_root": str(root), "terminal_outcome": terminal_outcome,
+        "reachable_stages": list(stages), "stage_receipts": stage_receipts,
+        "terminal_chain_head": stage_receipts[-1]["receipt_sha256"] if stage_receipts else None,
+        "first_100_receipt_sha256": next((item["receipt_sha256"] for item in stage_receipts if item["stage"] == "first-100-gate"), None),
+        "task6_validation_sha256": hashlib.sha256(_canonical(task6)).hexdigest(),
+        "hub_artifact_references_sha256": hashlib.sha256(_canonical(references)).hexdigest(),
+        "completion_claim": "none", "gpu_stop_verified": False,
+    }
+    files["manifests/provisional/task6-validation.json"] = _canonical(task6)
+    files["manifests/provisional/hub-artifact-references.json"] = _canonical(references)
+    files["manifests/provisional/evidence-manifest.json"] = _canonical(evidence)
+    staging = Path(tempfile.mkdtemp(prefix="lehome-provisional-", dir=root))
+    try:
+        for relative, raw in files.items():
+            path = staging / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(raw)
+        bundle = CollectionPublicationBundle(staging, run_id, repository, revision, tuple(sorted(files)))
+        result = publish_collection_bundle(bundle, token=token, transport=transport)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    receipt_body = {
+        "schema_version": 1, "kind": "lehome_simple_curriculum_provisional_publication_receipt_v1",
+        "run_id": run_id, "round_id": round_id, "repository": result.repository,
+        "remote_prefix": f"collection-rounds/{run_id}/manifests/provisional", "immutable_revision": result.immutable_revision,
+        "entry_count": len(result.entries), "entries": [{"relative_path": item.relative_path, "sha256": item.sha256, "byte_size": item.byte_size} for item in result.entries],
+        "bundle_sha256": result.bundle_sha256, "manifest_sha256": hashlib.sha256(_canonical(evidence)).hexdigest(),
+        "readback_verified": result.readback_verified, "public_readback_verified": result.public_readback_verified,
+    }
+    receipt = {**receipt_body, "receipt_sha256": hashlib.sha256(_canonical(receipt_body)).hexdigest()}
+    _write_immutable_json(root / "reports/provisional-publication.json", receipt)
+    return receipt
 
 
 class HuggingFacePublicDatasetTransport:

@@ -8,6 +8,7 @@ It has no create/start/delete operation.
 from __future__ import annotations
 
 from hashlib import sha256
+import hashlib
 import argparse
 import json
 import os
@@ -40,6 +41,8 @@ _SSH_TARGET = re.compile(
     r"[A-Za-z_][A-Za-z0-9_.-]{0,63}@"
     r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*"
 )
+_RUN_ID = re.compile(r"^fresh-run-[a-z0-9-]{1,112}$")
+_ROUND_ID = re.compile(r"^fresh-12k-[a-z0-9-]{1,112}$")
 
 
 class FinalizationError(RuntimeError):
@@ -158,12 +161,27 @@ def validate_finalization_receipt(
 def validate_handoff(raw: Mapping[str, object]) -> dict[str, object]:
     payload = dict(raw); declared = payload.pop("handoff_sha256", None)
     required = {"schema_version", "kind", "run_id", "round_id", "instance_id", "terminal_outcome", "predecessor_receipt_sha256", "code_revision", "code_tree_sha256", "runtime_identity", "runtime_identity_sha256", "first_100_receipt_sha256", "evidence", "handoff_sha256"}
-    if set(raw) != required or declared != _digest(payload):
+    v2_required = required | {"provisional_publication"}
+    if (set(raw) != required and set(raw) != v2_required) or declared != _digest(payload):
         raise FinalizationError("operator handoff is malformed")
-    if payload["schema_version"] != 1 or payload["kind"] != "lehome_simple_curriculum_operator_stop_handoff_v1":
+    legacy = set(raw) == required
+    if (legacy and (payload["schema_version"] != 1 or payload["kind"] != "lehome_simple_curriculum_operator_stop_handoff_v1")) or (
+        not legacy and (payload["schema_version"] != 2 or payload["kind"] != "lehome_simple_curriculum_operator_stop_handoff_v2")
+    ):
         raise FinalizationError("operator handoff kind is invalid")
-    if payload["instance_id"] != EXACT_INSTANCE_ID or not isinstance(payload["run_id"], str) or not isinstance(payload["round_id"], str):
+    if payload["instance_id"] != EXACT_INSTANCE_ID or not isinstance(payload["run_id"], str) or not isinstance(payload["round_id"], str) or _RUN_ID.fullmatch(payload["run_id"]) is None or _ROUND_ID.fullmatch(payload["round_id"]) is None:
         raise FinalizationError("operator handoff is not bound to the approved VM")
+    if not legacy:
+        provisional = payload.get("provisional_publication")
+        if (
+            not isinstance(provisional, Mapping)
+            or set(provisional) != {"immutable_revision", "bundle_sha256", "manifest_sha256", "repository", "remote_prefix"}
+            or provisional.get("repository") != "ryanjin333/lehome-groot-n17-rollouts"
+            or provisional.get("remote_prefix") != f"collection-rounds/{payload['run_id']}/manifests/provisional"
+            or not _hex(provisional.get("immutable_revision"), 40) or not _hex(provisional.get("bundle_sha256"), 64)
+            or not _hex(provisional.get("manifest_sha256"), 64)
+        ):
+            raise FinalizationError("operator handoff provisional binding is invalid")
     if payload["terminal_outcome"] not in TERMINAL_OUTCOMES:
         raise FinalizationError("operator handoff outcome is invalid")
     if not _hex(payload["code_revision"], 40) or not _hex(payload["code_tree_sha256"], 64):
@@ -264,8 +282,11 @@ def _seal(handoff: Mapping[str, object], stopped: Mapping[str, object]) -> dict[
     outcome = handoff["terminal_outcome"]
     # The remote handoff must have a separately validated exact-cap report;
     # without it terminal claims remain intentionally non-complete.
-    complete = outcome == "complete" and any(item.get("stage") == "success-replay" for item in handoff["evidence"])
-    body = {"schema_version": 1, "kind": "lehome_simple_curriculum_final_seal_v1", "run_id": handoff["run_id"], "round_id": handoff["round_id"], "terminal_outcome": outcome, "completion_claim": "caps_unverified" if complete else "not_complete", "handoff_sha256": handoff["handoff_sha256"], "stopped_observation_sha256": stopped["observation_sha256"]}
+    complete = outcome == "complete" and handoff.get("schema_version") == 2
+    if outcome == "complete": claim = "collection_complete" if complete else "caps_unverified"
+    elif outcome in {"replay_shortage", "insufficient_source_stop"}: claim = "insufficient_fresh_source"
+    else: claim = "fidelity_infrastructure_stop"
+    body = {"schema_version": 1, "kind": "lehome_simple_curriculum_final_seal_v1", "run_id": handoff["run_id"], "round_id": handoff["round_id"], "terminal_outcome": outcome, "completion_claim": claim, "gpu_stop_verified": True, "handoff_sha256": handoff["handoff_sha256"], "stopped_observation_sha256": stopped["observation_sha256"]}
     return {**body, "seal_sha256": _digest(body)}
 
 
@@ -364,6 +385,84 @@ class HfFinalizerPublisher:
     def __init__(self, token_path: Path, *, module: object | None = None, transport: object | None = None) -> None:
         self.token_path = token_path; self._module = module; self._transport = transport
 
+    def _verify_provisional(self, *, module: object, transport: object, root: Path, token: str, handoff: Mapping[str, object]) -> None:
+        """Fetch only the pinned compact JSON bundle; never SSH campaign bytes."""
+        provisional = handoff.get("provisional_publication")
+        if not isinstance(provisional, Mapping):
+            return  # v1 is retained solely for old offline receipt fixtures.
+        revision = str(provisional["immutable_revision"])
+        prefix = str(provisional["remote_prefix"])
+        stages = tuple(str(item["stage"]) for item in handoff["evidence"])
+        files = (
+            "manifests/provisional/evidence-manifest.json",
+            "manifests/provisional/task6-validation.json",
+            "manifests/provisional/hub-artifact-references.json",
+            *(f"manifests/provisional/stage-receipts/{stage}.json" for stage in stages),
+        )
+        base_prefix = f"collection-rounds/{handoff['run_id']}"
+        try:
+            observed = module._tree_files(
+                transport.list_tree(repository=self.repository, revision=revision, token=token, remote_prefix=base_prefix),
+                prefix=base_prefix,
+            )
+            if observed != set(files): raise FinalizationError("provisional tree is not exact")
+            bundle = module.CollectionPublicationBundle(root=root, run_id=handoff["run_id"], repository=self.repository, revision="main", files=files)
+            entries = module._collect_entries(bundle) if all((root / item).is_file() for item in files) else None
+            # The file list comes only from the signed handoff; downloads are
+            # compact manifests/receipts, never rollout media or episodes.
+            for auth in (token, None):
+                transport.download_files(repository=self.repository, revision=revision, destination=root, relative_paths=files, token=auth, remote_prefix=base_prefix)
+            entries = module._collect_entries(bundle)
+            if module._entry_digest(entries) != provisional["bundle_sha256"]:
+                raise FinalizationError("provisional bundle bytes do not bind handoff")
+            manifest = _json_object(root / files[0], label="provisional evidence manifest")
+            if hashlib.sha256(_canonical(manifest)).hexdigest() != provisional["manifest_sha256"]:
+                raise FinalizationError("provisional manifest bytes do not bind handoff")
+            if (manifest.get("run_id") != handoff.get("run_id") or manifest.get("round_id") != handoff.get("round_id")
+                    or manifest.get("instance_id") != EXACT_INSTANCE_ID or manifest.get("completion_claim") != "none"
+                    or manifest.get("gpu_stop_verified") is not False):
+                raise FinalizationError("provisional manifest identity is invalid")
+            listed = manifest.get("stage_receipts")
+            if not isinstance(listed, list) or [item.get("stage") for item in listed if isinstance(item, Mapping)] != list(stages):
+                raise FinalizationError("provisional stage chain is invalid")
+            predecessor: str | None = None
+            identity: object | None = None
+            for item in listed:
+                if not isinstance(item, Mapping): raise FinalizationError("provisional stage chain is invalid")
+                receipt = _json_object(root / f"manifests/provisional/stage-receipts/{item['stage']}.json", label="provisional receipt")
+                unsigned = dict(receipt); claimed = unsigned.pop("receipt_sha256", None)
+                if (claimed != _digest(unsigned) or claimed != item.get("receipt_sha256")
+                        or receipt.get("predecessor_receipt_sha256") != predecessor
+                        or item.get("predecessor_receipt_sha256") != predecessor
+                        or hashlib.sha256(_canonical(receipt)).hexdigest() != item.get("file_sha256")
+                        or not isinstance(receipt.get("runtime_identity"), Mapping)):
+                    raise FinalizationError("provisional receipt chain is invalid")
+                if identity is None: identity = receipt["runtime_identity"]
+                elif identity != receipt["runtime_identity"]: raise FinalizationError("provisional receipt identity diverged")
+                predecessor = claimed
+            task6 = _json_object(root / files[1], label="provisional Task-6 validation")
+            references = _json_object(root / files[2], label="provisional Hub references")
+            if (hashlib.sha256(_canonical(task6)).hexdigest() != manifest.get("task6_validation_sha256")
+                    or hashlib.sha256(_canonical(references)).hexdigest() != manifest.get("hub_artifact_references_sha256")):
+                raise FinalizationError("provisional validation hashes are invalid")
+            if handoff.get("terminal_outcome") == "complete":
+                expected_counts = {"fresh_valid_outcomes": 1000, "replay_attempts": 400, "replay_accepted_successes": 200,
+                                   "replay_accepted_by_category": {"pant_long": 50, "pant_short": 50, "top_long": 50, "top_short": 50}}
+                if task6.get("result") != "complete" or any(task6.get(key) != value for key, value in expected_counts.items()):
+                    raise FinalizationError("provisional Task-6 caps are invalid")
+                fresh, replay = references.get("fresh"), references.get("success_replay")
+                if not isinstance(fresh, list) or not isinstance(replay, list) or len(fresh) != 1000 or len(replay) != 200:
+                    raise FinalizationError("provisional Hub-reference closure is invalid")
+                for reference in (*fresh, *replay):
+                    if (not isinstance(reference, Mapping) or reference.get("repository") != self.repository
+                            or not isinstance(reference.get("prefix"), str) or not _hex(reference.get("immutable_revision"), 40)
+                            or not _hex(reference.get("episode_sha256"), 64) or not _hex(reference.get("local_sync_receipt_sha256"), 64)):
+                        raise FinalizationError("provisional Hub reference is invalid")
+        except FinalizationError:
+            raise
+        except Exception as error:
+            raise FinalizationError("provisional immutable readback failed") from error
+
     def _stage_and_validate_remote_receipt(
         self, *, module: object, transport: object, root: Path, prefix: str,
         revision: str, token: str, handoff: Mapping[str, object], seal: Mapping[str, object],
@@ -449,13 +548,17 @@ class HfFinalizerPublisher:
             token = module._load_token(self.token_path)
         except Exception as error:
             raise FinalizationError("operator HF token file is invalid") from error
+        self._verify_provisional(module=module, transport=self._transport or module.HuggingFacePublicDatasetTransport(), root=root, token=token, handoff=handoff)
         _atomic_json(root / "reports" / "operator-stop-handoff.json", handoff)
         _atomic_json(root / "reports" / "stopped-observation.json", stop_observation)
         _atomic_json(root / "seals" / "final-seal.json", seal)
         files = ("reports/operator-stop-handoff.json", "reports/stopped-observation.json", "seals/final-seal.json")
         bundle = module.CollectionPublicationBundle(root=root, run_id=handoff["run_id"], repository=self.repository, revision="main", files=files)
         transport = self._transport or module.HuggingFacePublicDatasetTransport()
-        prefix = f"collection-rounds/{handoff['run_id']}"
+        # Provisional evidence occupies its own immutable subtree.  Promotion
+        # gets a sibling subtree so a known-good provisional bundle can never
+        # be overwritten or mistaken for the final marker.
+        prefix = f"collection-rounds/{handoff['run_id']}/manifests/promotion" if handoff.get("schema_version") == 2 else f"collection-rounds/{handoff['run_id']}"
         head = transport.resolve_approved_ref(repository=self.repository, ref="main", token=token)
         existing = module._tree_files(transport.list_tree(repository=self.repository, revision=head, token=token, remote_prefix=prefix), prefix=prefix)
         final_name = "reports/final-publication.json"
@@ -471,7 +574,7 @@ class HfFinalizerPublisher:
             return {"immutable_revision": head, "readback_verified": True, "public_readback_verified": True}
         if set(existing) - evidence_names:
             raise FinalizationError("immutable finalization prefix collision")
-        evidence = module.publish_collection_bundle(bundle, token=token, transport=transport)
+        evidence = module.publish_collection_bundle(bundle, token=token, transport=transport, remote_prefix=prefix)
         receipt_body = {"schema_version": 1, "kind": "lehome_simple_curriculum_operator_finalization_receipt_v1", "run_id": handoff["run_id"], "round_id": handoff["round_id"], "evidence_revision": evidence.immutable_revision, "evidence_bundle_sha256": evidence.bundle_sha256, "final_seal_sha256": seal["seal_sha256"], "readback_verified": True, "public_readback_verified": True}
         receipt = {**receipt_body, "receipt_sha256": _digest(receipt_body)}
         validate_finalization_receipt(

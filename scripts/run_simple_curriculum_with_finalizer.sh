@@ -44,7 +44,7 @@ done
 [[ "$LEHOME_OPERATOR_RUN_ID" =~ ^fresh-run-[a-z0-9-]{1,112}$ ]] || reject "invalid operator run ID"
 [[ "$LEHOME_OPERATOR_ROUND_ID" =~ ^fresh-12k-[a-z0-9-]{1,112}$ ]] || reject "invalid operator round ID"
 [[ "$LEHOME_OPERATOR_REVIEWED_REVISION" =~ ^[0-9a-f]{40}$ ]] || reject "invalid reviewed revision"
-[[ "$LEHOME_OPERATOR_CAMPAIGN_ROOT" == /mnt/lehome/eval/fresh-run-* ]] || reject "invalid campaign root"
+[[ "$LEHOME_OPERATOR_CAMPAIGN_ROOT" == "/mnt/lehome/eval/$LEHOME_OPERATOR_RUN_ID" ]] || reject "invalid campaign root"
 [[ "$LEHOME_OPERATOR_SSH_TARGET" =~ ^[A-Za-z_][A-Za-z0-9_.-]{0,63}@[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?([.][A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]] || reject "invalid operator SSH target"
 LEHOME_OPERATOR_SSH_PORT="${LEHOME_OPERATOR_SSH_PORT:-22}"
 [[ "$LEHOME_OPERATOR_SSH_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( LEHOME_OPERATOR_SSH_PORT <= 65535 )) || reject "invalid operator SSH port"
