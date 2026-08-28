@@ -53,7 +53,9 @@ identity; they do not substitute for the post-start host checks below.
    rather than this one-time provider observation, writes the current typed
    receipt at `/mnt/lehome/operator/spend-observation.json` with only
    `schema_version`, `kind`, `observer`, `observed_at_utc`, and `spent_usd`.
-   Confirm the trusted exact-VM stop hook is `/usr/local/libexec/lehome-stop-gpu`.
+   Do not install or invoke a stop hook on the VM. Terminal stopping and
+   final publication are performed by the local operator finalizer in Section
+   7 after the remote controller returns its handoff.
 
 Stop and report if the exact ID, image, disk, state, public destination, or
 budget evidence differs. Do not attempt the post-start checks on a stopped VM.
@@ -110,7 +112,6 @@ test "$(git -C "$LEHOME_HOST_CODE_ROOT" rev-parse HEAD)" = "$LEHOME_REVIEWED_REV
 git -C "$LEHOME_HOST_CODE_ROOT" diff --quiet
 test -d "$LEHOME_HOST_CODE_ROOT/source/lehome" && test ! -L "$LEHOME_HOST_CODE_ROOT/source/lehome"
 test -d "$LEHOME_HOST_CODE_ROOT/trainer/src" && test ! -L "$LEHOME_HOST_CODE_ROOT/trainer/src"
-test -x /usr/local/libexec/lehome-stop-gpu
 test -f /mnt/lehome/secrets/hf_token && test ! -L /mnt/lehome/secrets/hf_token
 test "$(stat -c '%u' /mnt/lehome/secrets/hf_token)" = 0
 test "$(stat -c '%a' /mnt/lehome/secrets/hf_token)" = 600
@@ -314,7 +315,6 @@ sudo env -i \
   PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   PYTHONPATH="$LEHOME_HOST_CODE_ROOT:$LEHOME_HOST_CODE_ROOT/source/lehome:$LEHOME_HOST_CODE_ROOT/trainer/src" \
   LEHOME_PAID_COLLECTION=1 \
-  LEHOME_GPU_STOP_COMMAND=/usr/local/libexec/lehome-stop-gpu \
   LEHOME_HOST_CODE_ROOT="$LEHOME_HOST_CODE_ROOT" \
   LEHOME_CAMPAIGN_ROOT="$LEHOME_CAMPAIGN_ROOT" \
   LEHOME_RUN_ID="$LEHOME_RUN_ID" \
@@ -326,9 +326,10 @@ sudo env -i \
   "$LEHOME_HOST_CODE_ROOT/rollout_appliance/run_simple_curriculum_collection.sh"
 ```
 
-The wrapper admits no provider lifecycle command. It delegates the trusted
-exact-VM stop to the fixed hook only after a terminal outcome. No secret is
-passed on the command line.
+The wrapper admits no provider lifecycle command. A terminal return is
+`operator_stop_required` and leaves a compact immutable handoff at
+`$LEHOME_CAMPAIGN_ROOT/reports/operator-stop-handoff.json`; it neither stops
+the VM nor publishes. No secret is passed on the command line.
 
 ## 6. State machine and immediate stops
 
@@ -353,6 +354,36 @@ budget check to final public publication because the VM is already verified
 stopped at that point.
 
 ## 7. Fresh terminal evidence, replay, and publication
+
+When the paid controller returns `operator_stop_required`, do **not** run it
+again, SSH for raw rollouts, or attempt publication from the VM. From the
+operator machine, invoke the finalizer once with the already-persisted IDs.
+The safety trap means an SSH/controller failure cannot skip the exact-VM stop;
+the finalizer fetches only the compact handoff into a temporary directory and
+always calls exact-ID Compute `get`/`stop`/`get` before any Hub upload.
+
+```bash
+set -euo pipefail
+finalize_lehome() {
+  uv run --project trainer python3 scripts/finalize_simple_curriculum_collection.py \
+    --ssh-target "$LEHOME_VM_SSH_TARGET" --ssh-port "${LEHOME_VM_SSH_PORT:-22}" \
+    --remote-campaign-root "$LEHOME_CAMPAIGN_ROOT" \
+    --run-id "$LEHOME_RUN_ID" --round-id "$LEHOME_ROUND_ID" \
+    --hf-token-file /mnt/lehome/secrets/hf_token --stop-timeout-seconds 300
+}
+trap 'finalize_lehome' EXIT
+# Run the Section 5 remote controller command once; retain its terminal
+# handoff result.  The EXIT trap invokes the local finalizer even on error.
+```
+
+The local finalizer pins `computeinstance-u00t6xfqhadrcmssa2`, name
+`lehome-rollout`, and attached protected disk
+`computedisk-u00pbe55crxy7jr56x`; it has no create/start/delete/list path. A
+handoff validation failure still stops that exact VM and reports
+`infrastructure_stop_failure`; an HF failure after STOPPED leaves it stopped
+and is a zero-compute publication retry. The token file must be regular,
+non-symlink, root-owned, mode `0600`, and nonempty; it is never included in
+arguments or receipts.
 
 Every fresh success **and failure** remains terminal evidence. Success replay
 is built only after all 1,000 fresh outcomes plus their receipts are

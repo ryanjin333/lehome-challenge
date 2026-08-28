@@ -30,7 +30,7 @@ def test_simple_curriculum_runbook_covers_the_exact_paid_boundary_without_lifecy
         "four persistent workers", "CPU cloth", "CUDA policy", "$100", "first-100",
         "collection-rounds/<run-id>", "authenticated", "anonymous", "--reconcile",
         "fidelity_infrastructure_stop", "insufficient_fresh_source", "collection_complete",
-        "/usr/local/libexec/lehome-stop-gpu", "LEHOME_PAID_COLLECTION=1",
+            "operator-stop-handoff.json", "finalize_simple_curriculum_collection.py", "LEHOME_PAID_COLLECTION=1",
     )
     assert all(value in text for value in required)
     assert "A-500" in text and "hard-state" in text and "old rollout" in text

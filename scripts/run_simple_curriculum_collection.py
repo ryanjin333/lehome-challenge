@@ -796,8 +796,6 @@ class CollectionConfig:
         for value, label, ceiling in ((self.max_wall_seconds, "max wall time", 86_400.0), (self.max_spend_usd, "max spend", 100.0)):
             if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0 or value >= ceiling:
                 raise ValueError(f"{label} must be finite, positive, and bounded")
-        if self.paid and self.gpu_stop_command != _TRUSTED_GPU_STOP:
-            raise ValueError("paid collection requires the fixed trusted GPU stop hook")
         if self.rollout_instance_id != _EXACT_ROLLOUT_INSTANCE_ID:
             raise ValueError("collection is pinned to the one approved rollout VM")
         if self.paid and self.spend_observer is None:
@@ -1745,6 +1743,71 @@ def _existing_terminal_outcome(journal: StageJournal) -> str | None:
     return str(output["terminal_outcome"])
 
 
+def _operator_handoff_path(config: CollectionConfig) -> Path:
+    return _canonical_root(config) / "reports" / "operator-stop-handoff.json"
+
+
+def _operator_stop_handoff(
+    journal: StageJournal, config: CollectionConfig, *, predecessor: str | None, outcome: str,
+) -> str:
+    """Persist the running VM's compact terminal handoff; never self-stop or publish."""
+    root = _canonical_root(config)
+    # Re-validate every durable stage before we bind it into the handoff.  The
+    # finalizer is intentionally allowed to fetch only this compact manifest,
+    # so it must not become a way to bless stale or tampered stage evidence.
+    _rehash_terminal_journal(journal)
+    evidence: list[dict[str, str]] = []
+    for stage in STAGES:
+        if stage in {"gpu-stop", "final-publication"}:
+            continue
+        path = journal.path(stage)
+        if not path.exists():
+            continue
+        receipt = _strict_json_object(path, label="terminal stage receipt")
+        body = dict(receipt); receipt_sha = body.pop("receipt_sha256", None)
+        if receipt_sha != _digest(body) or not isinstance(receipt_sha, str) or _HEX.fullmatch(receipt_sha) is None:
+            raise ReceiptMismatchError("terminal handoff evidence is malformed")
+        evidence.append({"stage": stage, "receipt_sha256": receipt_sha, "file_sha256": _file_sha(path)})
+    first = next((entry["receipt_sha256"] for entry in evidence if entry["stage"] == "first-100-gate"), None)
+    body: dict[str, object] = {
+        "schema_version": 1, "kind": "lehome_simple_curriculum_operator_stop_handoff_v1",
+        "run_id": config.run_id, "round_id": config.round_id, "instance_id": config.rollout_instance_id,
+        "terminal_outcome": outcome, "predecessor_receipt_sha256": predecessor,
+        "code_revision": _git_revision(config.host_code_root), "code_tree_sha256": _tree_sha(config.host_code_root),
+        "runtime_identity": dict(config.runtime_identity), "runtime_identity_sha256": _digest(dict(config.runtime_identity)),
+        "first_100_receipt_sha256": first, "evidence": evidence,
+    }
+    payload = {**body, "handoff_sha256": _digest(body)}
+    path = _operator_handoff_path(config)
+    if path.exists() or path.is_symlink():
+        if _strict_json_object(path, label="operator stop handoff") != payload:
+            raise ReceiptMismatchError("operator stop handoff collision")
+    else:
+        _write_immutable_json(path, payload)
+    return "operator_stop_required"
+
+
+def _existing_operator_handoff(config: CollectionConfig) -> bool:
+    path = _operator_handoff_path(config)
+    if not path.exists() and not path.is_symlink():
+        return False
+    payload = _strict_json_object(path, label="operator stop handoff")
+    body = dict(payload); declared = body.pop("handoff_sha256", None)
+    required = {
+        "schema_version", "kind", "run_id", "round_id", "instance_id", "terminal_outcome",
+        "predecessor_receipt_sha256", "code_revision", "code_tree_sha256", "runtime_identity",
+        "runtime_identity_sha256", "first_100_receipt_sha256", "evidence", "handoff_sha256",
+    }
+    if (set(payload) != required or declared != _digest(body) or payload["schema_version"] != 1
+            or payload["kind"] != "lehome_simple_curriculum_operator_stop_handoff_v1"
+            or payload["run_id"] != config.run_id or payload["round_id"] != config.round_id
+            or payload["instance_id"] != config.rollout_instance_id
+            or payload["runtime_identity"] != dict(config.runtime_identity)
+            or payload["runtime_identity_sha256"] != _digest(dict(config.runtime_identity))):
+        raise ReceiptMismatchError("operator stop handoff is malformed")
+    return True
+
+
 def _rehash_terminal_journal(journal: StageJournal) -> None:
     """A stopped run is resumable only while every immutable output still hashes."""
     for stage in STAGES:
@@ -1766,7 +1829,12 @@ def run_collection(config: CollectionConfig, *, runner: Runner) -> str:
     journal = StageJournal(config); predecessor: str | None = None
     if isinstance(runner, CommandRunner):
         runner.budget_check = journal.check_budget
-    existing_terminal = _existing_terminal_outcome(journal)
+    # The controller runs *inside* the billed VM.  A paid restart after a
+    # terminal handoff is therefore deliberately inert: only the local
+    # finalizer may observe and stop this VM, then publish the compact seal.
+    if config.paid and _existing_operator_handoff(config):
+        return "operator_stop_required"
+    existing_terminal = None if config.paid else _existing_terminal_outcome(journal)
     if existing_terminal is not None:
         # A post-stop process crash can leave the only safe retryable boundary
         # (public readback) unfinished.  Never re-enter collection or stop.
@@ -1820,15 +1888,26 @@ def run_collection(config: CollectionConfig, *, runner: Runner) -> str:
         # check and no paid command surface).  Do not re-raise here: doing so
         # used to strand an already-running VM on a pre-stage/in-flight spend
         # breach.
-        return _stop_then_publish(
-            journal, runner, config, predecessor=predecessor,
-            outcome="infrastructure_stop",
-        )
+        if config.paid:
+            return _operator_stop_handoff(
+                journal, config, predecessor=predecessor, outcome="infrastructure_stop",
+            )
+        return _stop_then_publish(journal, runner, config, predecessor=predecessor, outcome="infrastructure_stop")
     except ReceiptMismatchError:
+        if config.paid:
+            return _operator_stop_handoff(
+                journal, config, predecessor=predecessor, outcome="infrastructure_stop_failure",
+            )
         _stop_then_publish(journal, runner, config, predecessor=predecessor, outcome="infrastructure_stop_failure")
         raise
     except Exception:
+        if config.paid:
+            return _operator_stop_handoff(
+                journal, config, predecessor=predecessor, outcome="infrastructure_stop_failure",
+            )
         return _stop_then_publish(journal, runner, config, predecessor=predecessor, outcome="infrastructure_stop_failure")
+    if config.paid:
+        return _operator_stop_handoff(journal, config, predecessor=predecessor, outcome=str(outcome))
     return _stop_then_publish(journal, runner, config, predecessor=predecessor, outcome=str(outcome))
 
 

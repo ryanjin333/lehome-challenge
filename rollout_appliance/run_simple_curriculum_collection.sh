@@ -1,16 +1,11 @@
 #!/usr/bin/env bash
 # Fail-closed launcher for the reviewed, one-VM simple-curriculum journal.
-# It intentionally delegates only to the local host orchestrator; provider
-# lifecycle actions belong to an explicitly supplied stop hook outside here.
+# It intentionally delegates only to the remote controller.  Provider
+# lifecycle belongs to the local post-return finalizer, never this VM.
 set -euo pipefail
 
 PAID_COLLECTION="${LEHOME_PAID_COLLECTION:-0}"
 case "${PAID_COLLECTION}" in 0|1) ;; *) echo "LEHOME_PAID_COLLECTION must be 0 or 1" >&2; exit 2 ;; esac
-TRUSTED_GPU_STOP="/usr/local/libexec/lehome-stop-gpu"
-if [ "${PAID_COLLECTION}" = "1" ] && [ "${LEHOME_GPU_STOP_COMMAND:-}" != "${TRUSTED_GPU_STOP}" ]; then
-  echo "paid collection requires LEHOME_GPU_STOP_COMMAND=${TRUSTED_GPU_STOP}" >&2
-  exit 2
-fi
 
 HOST_ROOT="${LEHOME_HOST_CODE_ROOT:-}"
 if [ -z "${HOST_ROOT}" ] || [[ "${HOST_ROOT}" != /* ]] || [ -L "${HOST_ROOT}" ] || [ ! -d "${HOST_ROOT}" ]; then
@@ -49,7 +44,7 @@ if [ "${PAID_COLLECTION}" = "1" ]; then
     echo "paid collection requires an absolute LEHOME_SPEND_OBSERVER" >&2
     exit 2
   fi
-  arguments+=(--paid --gpu-stop-command "${TRUSTED_GPU_STOP}" --spend-observer "${LEHOME_SPEND_OBSERVER}")
+  arguments+=(--paid --spend-observer "${LEHOME_SPEND_OBSERVER}")
 fi
 
 exec python3 "${HOST_ROOT}/scripts/run_simple_curriculum_collection.py" "${arguments[@]}"
