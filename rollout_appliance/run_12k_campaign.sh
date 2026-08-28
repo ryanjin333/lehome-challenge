@@ -184,6 +184,15 @@ if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
     exit 2
   fi
 fi
+# Simple curriculum counts clean policy failures as valid first-100 outcomes,
+# but keeps them out of trainable/accepted data. Reuse the already-audited
+# evaluation-terminal lane so both outcomes receive manifests and optional
+# upload/readback receipts without changing the public mode marker passed to
+# the worker.
+TERMINAL_EVIDENCE_UPLOAD=0
+if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ] || [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
+  TERMINAL_EVIDENCE_UPLOAD=1
+fi
 if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ] || [ "${FIDELITY_DIAGNOSTIC}" = "1" ]; then
   CODE_ROOT_SHA256="$(python3 - "${HOST_CODE_ROOT}" <<'PY'
 import hashlib, os, stat, sys
@@ -748,7 +757,7 @@ fi
 mkdir -p "${RECEIPT_DIR}" /eval/logs /kitcache
 if [ "${ENABLE_HF_UPLOAD}" = "1" ]; then
   mkdir -p "${CAMPAIGN_ROOT}/accepted" "${CAMPAIGN_ROOT}/hf-sync-receipts" "${CAMPAIGN_ROOT}/hf-readback"
-  if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
+  if [ "${TERMINAL_EVIDENCE_UPLOAD}" = "1" ]; then
     mkdir -p "${CAMPAIGN_ROOT}/evaluation-terminal"
   fi
   mkdir -p "${CAMPAIGN_ROOT}/hf-cache"
@@ -826,7 +835,7 @@ if [ "${CONTROLLED_RECOVERY_SMOKE}" = "1" ]; then
   FINALIZER_SMOKE_FLAG=(--controlled-recovery-smoke)
 fi
 FINALIZER_EVALUATION_FLAG=()
-if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ] || [ "${FIDELITY_DIAGNOSTIC}" = "1" ]; then
+if [ "${TERMINAL_EVIDENCE_UPLOAD}" = "1" ] || [ "${FIDELITY_DIAGNOSTIC}" = "1" ]; then
   FINALIZER_EVALUATION_FLAG=(--evaluation-terminal)
 fi
 docker run --rm --user 1234:1234 --network none \
@@ -854,7 +863,7 @@ FINALIZER_PID=$!
 if [ "${ENABLE_HF_UPLOAD}" = "1" ]; then
   UPLOADER_ROLE="uploader"
   UPLOADER_ROOT_FLAG=(--accepted-root "${CAMPAIGN_ROOT}/accepted")
-  if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
+  if [ "${TERMINAL_EVIDENCE_UPLOAD}" = "1" ]; then
     UPLOADER_ROLE="evaluation-uploader"
     UPLOADER_ROOT_FLAG=(--terminal-root "${CAMPAIGN_ROOT}/evaluation-terminal")
   fi
@@ -1167,7 +1176,7 @@ fi
 
 pending_upload_count() {
   local episode_root="${CAMPAIGN_ROOT}/accepted"
-  if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
+  if [ "${TERMINAL_EVIDENCE_UPLOAD}" = "1" ]; then
     episode_root="${CAMPAIGN_ROOT}/evaluation-terminal"
   fi
   python3 - "${episode_root}" "${CAMPAIGN_ROOT}/hf-sync-receipts" <<'PY'
@@ -1222,7 +1231,7 @@ if [ "${ENABLE_HF_UPLOAD}" = "1" ]; then
   # before tearing down the CPU control plane so no manual post-run step can
   # accidentally select a partial or different episode set.
   if [ "${worker_status}" = "0" ] && [ "${SKIP_ROUND_SEAL}" = "0" ] \
-      && [ "${EVALUATION_TERMINAL_UPLOAD}" = "0" ]; then
+      && [ "${TERMINAL_EVIDENCE_UPLOAD}" = "0" ]; then
     docker run --rm --user 1234:1234 --network none \
       -v "${WORKSPACE}:/mnt/lehome" \
       -v "${SCRIPTS_HOST_MOUNT}:/opt/lehome/scripts:ro" \

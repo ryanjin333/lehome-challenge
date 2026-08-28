@@ -1,0 +1,158 @@
+"""Offline contract tests for the one-VM simple-curriculum orchestrator."""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "scripts" / "run_simple_curriculum_collection.py"
+WRAPPER = ROOT / "rollout_appliance" / "run_simple_curriculum_collection.sh"
+
+
+def _module():
+    spec = importlib.util.spec_from_file_location("simple_curriculum_orchestrator", SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class FakeRunner:
+    def __init__(self, *, gate_decision: str = "continue", replay_result: str = "complete") -> None:
+        self.gate_decision = gate_decision
+        self.replay_result = replay_result
+        self.calls: list[str] = []
+        self.stops = 0
+
+    def run(self, stage: str, **_kwargs):
+        self.calls.append(stage)
+        if stage == "first-100-gate":
+            return {"decision": self.gate_decision}
+        if stage == "success-replay":
+            return {"result": self.replay_result}
+        return {"stage": stage}
+
+    def stop_gpu(self, _command: str) -> None:
+        self.stops += 1
+
+
+def _config(module, tmp_path: Path):
+    host = tmp_path / "reviewed"; host.mkdir()
+    for relative in ("source/lehome", "trainer/src", "scripts", "rollout_appliance"):
+        (host / relative).mkdir(parents=True)
+    return module.CollectionConfig(
+        campaign_root=tmp_path / "campaign",
+        host_code_root=host,
+        run_id="fresh-run-20260828",
+        round_id="fresh-round-20260828",
+        max_wall_seconds=3600.0,
+        max_spend_usd=100.0,
+        paid=True,
+        gpu_stop_command="fake-stop",
+        runtime_identity={
+            "rollout_image": "repo/rollout@sha256:" + "a" * 64,
+            "trainer_image": "repo/trainer@sha256:" + "b" * 64,
+            "policy_repo": "ryanjin333/lehome-groot-n17-models",
+            "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
+            "policy_step": 12000,
+            "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
+            "simulator_device": "cpu", "cloth_device": "cpu", "policy_device": "cuda:0", "worker_count": 4,
+        },
+    )
+
+
+def test_gate_failure_never_launches_later_stages_and_stops_once(tmp_path: Path) -> None:
+    module = _module(); runner = FakeRunner(gate_decision="fidelity_stop")
+
+    result = module.run_collection(_config(module, tmp_path), runner=runner)
+
+    assert result == "fidelity_stop"
+    assert runner.calls == ["calibration-matrix", "calibration-head", "first-100-gate", "final-publication"]
+    assert runner.stops == 1
+
+
+def test_continue_uses_the_exact_order_and_reports_replay_shortage(tmp_path: Path) -> None:
+    module = _module(); runner = FakeRunner(replay_result="replay_shortage")
+
+    result = module.run_collection(_config(module, tmp_path), runner=runner)
+
+    assert result == "replay_shortage"
+    assert runner.calls == [
+        "calibration-matrix", "calibration-head", "first-100-gate", "calibration-tail",
+        "calibration-report", "curriculum-matrix", "curriculum-a", "curriculum-b",
+        "fresh-report", "replay-matrix", "success-replay", "final-publication",
+    ]
+    assert runner.stops == 1
+
+
+def test_restart_validates_receipts_without_repeating_terminal_stages(tmp_path: Path) -> None:
+    module = _module(); config = _config(module, tmp_path)
+    first = FakeRunner(); assert module.run_collection(config, runner=first) == "complete"
+    second = FakeRunner()
+
+    assert module.run_collection(config, runner=second) == "complete"
+    assert second.calls == []
+    assert second.stops == 0
+
+
+def test_receipt_collision_is_fatal(tmp_path: Path) -> None:
+    module = _module(); config = _config(module, tmp_path)
+    root = config.campaign_root / "stage-receipts"; root.mkdir(parents=True)
+    (root / "calibration-matrix.json").write_text('{"bad": true}\n', encoding="utf-8")
+
+    try:
+        module.run_collection(config, runner=FakeRunner())
+    except module.ReceiptMismatchError:
+        pass
+    else:
+        raise AssertionError("receipt collision must be fatal")
+
+
+def test_partition_only_adds_required_identity_fields(tmp_path: Path) -> None:
+    module = _module()
+    rows = [{"attempt_id": "a", "seed": 1}, {"attempt_id": "b", "seed": 2}]
+
+    partition, manifest = module.partition_rows(rows, parent_matrix_sha256="c" * 64, partition_id="calibration-head", start=0, end=1)
+
+    assert partition == [{"attempt_id": "a", "seed": 1, "partition_id": "calibration-head", "parent_matrix_sha256": "c" * 64}]
+    assert manifest["row_start"] == 0 and manifest["row_end"] == 1
+    assert rows[0] == {"attempt_id": "a", "seed": 1}
+
+
+def test_wrapper_requires_paid_stop_hook_and_has_no_cloud_lifecycle_command(tmp_path: Path) -> None:
+    result = subprocess.run(["bash", str(WRAPPER)], cwd=ROOT, text=True, capture_output=True, env={**os.environ, "LEHOME_PAID_COLLECTION": "1"})
+
+    assert result.returncode != 0
+    assert "LEHOME_GPU_STOP_COMMAND" in result.stderr
+    text = WRAPPER.read_text(encoding="utf-8").lower()
+    assert all(token not in text for token in ("nebius", "terraform", "packer", " instance create", " instance start", " instance delete"))
+
+
+def test_simple_partitions_publish_mixed_policy_outcomes_through_terminal_evidence_lane() -> None:
+    campaign = (ROOT / "rollout_appliance" / "run_12k_campaign.sh").read_text(encoding="utf-8")
+
+    assert '[ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ] || [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]' in campaign
+    assert 'UPLOADER_ROLE="evaluation-uploader"' in campaign
+    assert 'UPLOADER_ROOT_FLAG=(--terminal-root "${CAMPAIGN_ROOT}/evaluation-terminal")' in campaign
+
+
+def test_configuration_rejects_unpinned_or_noncanonical_runtime_tuple(tmp_path: Path) -> None:
+    module = _module(); config = _config(module, tmp_path)
+    bad_identity = dict(config.runtime_identity); bad_identity["worker_count"] = 1
+    invalid = module.CollectionConfig(
+        config.campaign_root, config.host_code_root, config.run_id, config.round_id,
+        config.max_wall_seconds, config.max_spend_usd, config.paid, config.gpu_stop_command, bad_identity,
+    )
+
+    try:
+        invalid.validate()
+    except ValueError as error:
+        assert "runtime tuple" in str(error)
+    else:
+        raise AssertionError("noncanonical runtime tuple must fail closed")

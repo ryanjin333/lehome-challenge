@@ -188,6 +188,27 @@ def test_simple_summary_uses_external_matrix_assignment_ids_and_passes_gate_dire
     assert receipt["decision"] == "continue"
 
 
+def test_simple_head_retains_mixed_policy_failures_as_authenticated_terminal_evidence(tmp_path: Path) -> None:
+    summary = _module()
+    root, matrix, rows, ledger_ids = _simple_campaign(tmp_path)
+
+    report = summary.build_report(
+        campaign_root=root, matrix_path=matrix, matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(),
+        candidate_key="original_baseline", **POLICY,
+    )
+
+    rejected_assignment = rows[5]
+    rejected_id = ledger_ids[str(rejected_assignment["attempt_id"])]
+    terminal = root / "evaluation-terminal" / rejected_id
+    assert (terminal / "raw" / rejected_id / "episode.json").is_file()
+    assert (terminal / "worker-receipt.json").is_file()
+    assert (terminal / "SHA256SUMS.json").is_file()
+    rejected_trial = next(trial for trial in report["trials"] if trial["attempt_id"] == rejected_id)
+    assert rejected_trial["terminal_event"] == "rejected"
+    assert rejected_trial["official_success"] == 0
+    assert report["valid_outcomes"] == 100
+
+
 def test_simple_summary_authenticates_accepted_finalizer_destination(tmp_path: Path) -> None:
     summary = _module()
     root, matrix, _rows, _ledger_ids = _simple_campaign(
