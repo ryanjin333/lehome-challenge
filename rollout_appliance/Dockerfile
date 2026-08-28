@@ -33,6 +33,7 @@ COPY trainer/pyproject.toml /opt/lehome/trainer/pyproject.toml
 COPY rollout_appliance/entrypoint.sh /usr/local/bin/lehome-rollout-entrypoint
 COPY rollout_appliance/smoke_one_episode.sh \
      rollout_appliance/one_episode_smoke.py \
+     rollout_appliance/validate_fresh_replay_evidence.py \
      rollout_appliance/run_12k_campaign.sh \
      rollout_appliance/run_success_replay_campaign.sh \
      rollout_appliance/run_controlled_recovery_campaign.sh \
@@ -48,6 +49,7 @@ RUN chmod 0755 /usr/local/bin/lehome-rollout-entrypoint \
     && chmod 0755 /opt/lehome/scripts/build_success_replay_matrix.py \
     && bash -n /usr/local/bin/lehome-rollout-entrypoint \
     && chmod 0755 /opt/lehome/rollout_appliance/smoke_one_episode.sh \
+                  /opt/lehome/rollout_appliance/validate_fresh_replay_evidence.py \
                   /opt/lehome/rollout_appliance/run_12k_campaign.sh \
                   /opt/lehome/rollout_appliance/run_success_replay_campaign.sh \
                   /opt/lehome/rollout_appliance/run_controlled_recovery_campaign.sh \
@@ -71,9 +73,11 @@ RUN chmod 0755 /usr/local/bin/lehome-rollout-entrypoint \
       /opt/lehome/scripts/build_randomized_pilot_matrix.py \
       /opt/lehome/scripts/build_controlled_recovery_matrix.py \
       /opt/lehome/scripts/build_success_replay_matrix.py \
+      /opt/lehome/source/lehome/lehome/flywheel/fresh_replay_evidence.py \
       /opt/lehome/scripts/eval_policy/groot_policy.py \
       /opt/lehome/scripts/utils/evaluation.py \
-      /opt/lehome/rollout_appliance/one_episode_smoke.py
+      /opt/lehome/rollout_appliance/one_episode_smoke.py \
+      /opt/lehome/rollout_appliance/validate_fresh_replay_evidence.py
 
 ENV LEHOME_APPLIANCE_ROOT=/opt/lehome \
     PYTHONPATH=/opt/lehome/source/lehome:/opt/lehome/trainer/src \

@@ -79,6 +79,7 @@ install -d -m 0755 /opt/lehome/rollout_appliance
 for artifact in \
   smoke_one_episode.sh \
   one_episode_smoke.py \
+  validate_fresh_replay_evidence.py \
   prepare-merged-lehome.sh \
   run_12k_campaign.sh \
   run_success_replay_campaign.sh \
@@ -101,6 +102,7 @@ chmod 0755 \
   /opt/lehome/scripts/summarize_groot_persistent_evaluation.py \
   /opt/lehome/scripts/build_success_replay_matrix.py \
   /opt/lehome/rollout_appliance/smoke_one_episode.sh \
+  /opt/lehome/rollout_appliance/validate_fresh_replay_evidence.py \
   /opt/lehome/rollout_appliance/prepare-merged-lehome.sh \
   /opt/lehome/rollout_appliance/run_12k_campaign.sh \
   /opt/lehome/rollout_appliance/run_success_replay_campaign.sh \
@@ -115,6 +117,9 @@ systemctl daemon-reload
 systemctl disable lehome-experiment-evaluator.service >/dev/null 2>&1 || true
 bash -n /opt/lehome/rollout_appliance/run_success_replay_campaign.sh
 bash -n /opt/lehome/rollout_appliance/run_snapshot_source_bootstrap.sh
+python3 -m py_compile \
+  /opt/lehome/rollout_appliance/validate_fresh_replay_evidence.py \
+  /opt/lehome/source/lehome/lehome/flywheel/fresh_replay_evidence.py
 
 # 7. Worker-side Linux wheels. Isaac's 3.11 venv has no pip; keep msgpack and
 # pyzmq on PYTHONPATH so the session gateway can talk to the policy server.

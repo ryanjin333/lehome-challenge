@@ -301,6 +301,25 @@ def test_rollout_image_and_stage_carry_the_success_replay_campaign_tools():
     assert "chmod 0755 /opt/lehome/scripts/build_success_replay_matrix.py" in dockerfile
 
 
+def test_fresh_replay_evidence_validator_is_packaged_with_its_shared_module():
+    install = (SCRIPTS_DIR / "install-rollout.sh").read_text(encoding="utf-8")
+    dockerfile = (REPO_ROOT / "rollout_appliance" / "Dockerfile").read_text(encoding="utf-8")
+    cli = REPO_ROOT / "rollout_appliance" / "validate_fresh_replay_evidence.py"
+    module = REPO_ROOT / "source/lehome/lehome/flywheel/fresh_replay_evidence.py"
+
+    assert cli.is_file()
+    assert module.is_file()
+    for content in (install, dockerfile):
+        assert "validate_fresh_replay_evidence.py" in content
+        assert "fresh_replay_evidence.py" in content
+        assert "chmod 0755" in content
+        assert "py_compile" in content
+    assert "/opt/lehome/rollout_appliance/validate_fresh_replay_evidence.py" in install
+    assert "/opt/lehome/source/lehome/lehome/flywheel/fresh_replay_evidence.py" in install
+    assert "/opt/lehome/rollout_appliance/validate_fresh_replay_evidence.py" in dockerfile
+    assert "/opt/lehome/source/lehome/lehome/flywheel/fresh_replay_evidence.py" in dockerfile
+
+
 def test_hard_state_preflight_uses_the_rollout_image_python_environment():
     campaign = (
         REPO_ROOT / "rollout_appliance" / "run_hard_state_campaign.sh"
