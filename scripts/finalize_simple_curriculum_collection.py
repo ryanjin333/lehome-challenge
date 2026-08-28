@@ -18,12 +18,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import re
 from typing import Mapping, Protocol
 
 
 EXACT_INSTANCE_ID = "computeinstance-u00t6xfqhadrcmssa2"
 EXACT_INSTANCE_NAME = "lehome-rollout"
 PROTECTED_DISK_ID = "computedisk-u00pbe55crxy7jr56x"
+EXACT_IMAGE_ID = "computeimage-u00zf6w3yf72gakhcy"
 TERMINAL_OUTCOMES = frozenset({"complete", "replay_shortage", "fidelity_stop", "infrastructure_stop", "insufficient_source_stop", "infrastructure_stop_failure"})
 
 
@@ -93,8 +95,25 @@ def validate_handoff(raw: Mapping[str, object]) -> dict[str, object]:
 
 def _validate_instance(raw: Mapping[str, object]) -> dict[str, object]:
     value = dict(raw)
+    # Nebius CLI/API's authoritative instance representation is nested. Keep
+    # the old flat shape only for existing offline controller seams.
+    if all(key in value for key in ("metadata", "status", "spec")):
+        metadata, status, spec = value["metadata"], value["status"], value["spec"]
+        if not isinstance(metadata, Mapping) or not isinstance(status, Mapping) or not isinstance(spec, Mapping):
+            raise FinalizationError("provider response is not the exact protected rollout VM")
+        disks = spec.get("secondary_disks")
+        found = []
+        if isinstance(disks, list):
+            for disk in disks:
+                existing = disk.get("existing_disk") if isinstance(disk, Mapping) else None
+                if isinstance(existing, Mapping) and isinstance(existing.get("id"), str): found.append(existing["id"])
+        boot = spec.get("boot_disk")
+        image = boot.get("source_image_id") if isinstance(boot, Mapping) else None
+        if metadata.get("id") != EXACT_INSTANCE_ID or metadata.get("name") != EXACT_INSTANCE_NAME or status.get("state") not in {"RUNNING", "STOPPED"} or found != [PROTECTED_DISK_ID] or image != EXACT_IMAGE_ID:
+            raise FinalizationError("provider response is not the exact protected rollout VM")
+        return {"state": status["state"], "raw": value}
     disks = value.get("disks")
-    if value.get("id") != EXACT_INSTANCE_ID or value.get("name") != EXACT_INSTANCE_NAME or not isinstance(disks, list) or PROTECTED_DISK_ID not in disks:
+    if value.get("id") != EXACT_INSTANCE_ID or value.get("name") != EXACT_INSTANCE_NAME or not isinstance(disks, list) or disks != [PROTECTED_DISK_ID]:
         raise FinalizationError("provider response is not the exact protected rollout VM")
     if value.get("state") not in {"RUNNING", "STOPPED"}:
         raise FinalizationError("provider response has an unsafe VM state")
@@ -111,7 +130,7 @@ def stop_exact_instance(provider: Provider, *, timeout_seconds: float) -> dict[s
     while True:
         observed = _validate_instance(provider.get(EXACT_INSTANCE_ID))
         if observed["state"] == "STOPPED":
-            body = {"schema_version": 1, "kind": "lehome_simple_curriculum_stopped_observation_v1", "instance_id": EXACT_INSTANCE_ID, "instance_name": EXACT_INSTANCE_NAME, "protected_disk_id": PROTECTED_DISK_ID, "state": "STOPPED", "provider_response_sha256": _digest(observed)}
+            body = {"schema_version": 1, "kind": "lehome_simple_curriculum_stopped_observation_v1", "instance_id": EXACT_INSTANCE_ID, "instance_name": EXACT_INSTANCE_NAME, "protected_disk_id": PROTECTED_DISK_ID, "state": "STOPPED", "provider_response_sha256": _digest(observed.get("raw", observed))}
             return {**body, "observation_sha256": _digest(body)}
         if time.monotonic() >= deadline:
             raise FinalizationError("provider did not report STOPPED before timeout")
@@ -163,11 +182,14 @@ class SubprocessNebiusProvider:
 def fetch_remote_handoff(*, ssh_target: str, port: int, campaign_root: str, destination: Path) -> dict[str, object]:
     """Fetch only the compact handoff over noninteractive SSH into temp storage."""
     root = _checked_absolute(campaign_root, label="remote campaign root")
-    if not isinstance(port, int) or not 1 <= port <= 65535 or not ssh_target or any(c.isspace() for c in ssh_target):
+    if not isinstance(port, int) or not 1 <= port <= 65535 or re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9.-]+", ssh_target or "") is None:
         raise FinalizationError("SSH target or port is invalid")
     remote = str(root / "reports" / "operator-stop-handoff.json")
-    command = ("ssh", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-p", str(port), ssh_target, "cat", "--", remote)
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    command = ("ssh", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "-p", str(port), ssh_target, "cat", "--", remote)
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=20)
+    except subprocess.TimeoutExpired as error:
+        raise FinalizationError("remote handoff fetch timed out") from error
     if result.returncode: raise FinalizationError("remote handoff fetch failed")
     if destination.exists() or destination.is_symlink(): raise FinalizationError("handoff destination is unsafe")
     descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -209,8 +231,11 @@ class HfFinalizerPublisher:
             # A prior receipt upload may have succeeded while the caller lost
             # its response.  Reconcile its bytes at the current immutable
             # revision instead of attempting a second mutable upload.
-            entry = module._collect_entries(module.CollectionPublicationBundle(root=root, run_id=handoff["run_id"], repository=self.repository, revision="main", files=(final_name,)))[0]
-            all_entries = tuple(module._collect_entries(bundle)) + (entry,)
+            # The local temporary staging root is new on every finalizer
+            # invocation. Reconstruct the durable remote receipt before the
+            # descriptor-safe collector hashes it for reconciliation.
+            transport.download_files(repository=self.repository, revision=head, destination=root, relative_paths=(final_name,), token=token, remote_prefix=prefix)
+            all_entries = module._collect_entries(module.CollectionPublicationBundle(root=root, run_id=handoff["run_id"], repository=self.repository, revision="main", files=files + (final_name,)))
             for auth in (token, None): module._verify_download(transport=transport, bundle=bundle, revision=head, prefix=prefix, entries=all_entries, token=auth)
             return {"immutable_revision": head, "readback_verified": True, "public_readback_verified": True}
         if set(existing) - evidence_names:

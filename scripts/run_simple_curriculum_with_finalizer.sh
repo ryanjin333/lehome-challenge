@@ -12,26 +12,44 @@ done
 [[ "$LEHOME_OPERATOR_REVIEWED_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid reviewed revision" >&2; exit 2; }
 [[ "$LEHOME_OPERATOR_CAMPAIGN_ROOT" == /mnt/lehome/eval/fresh-run-* ]] || { echo "invalid campaign root" >&2; exit 2; }
 test -f "$LEHOME_OPERATOR_HF_TOKEN_FILE" && test ! -L "$LEHOME_OPERATOR_HF_TOKEN_FILE" && test -s "$LEHOME_OPERATOR_HF_TOKEN_FILE"
-test "$(stat -f '%u %Lp' "$LEHOME_OPERATOR_HF_TOKEN_FILE")" = "0 600"
+test "$(stat -f '%u' "$LEHOME_OPERATOR_HF_TOKEN_FILE")" = "$(id -u)"
+test "$(stat -f '%Lp' "$LEHOME_OPERATOR_HF_TOKEN_FILE")" = 600
 
+controller_status=0
+finalizer_status=0
 finalize() {
+  set +e
   uv run --project trainer python3 scripts/finalize_simple_curriculum_collection.py \
     --ssh-target "$LEHOME_OPERATOR_SSH_TARGET" --ssh-port "${LEHOME_OPERATOR_SSH_PORT:-22}" \
     --remote-campaign-root "$LEHOME_OPERATOR_CAMPAIGN_ROOT" \
     --run-id "$LEHOME_OPERATOR_RUN_ID" --round-id "$LEHOME_OPERATOR_ROUND_ID" \
     --hf-token-file "$LEHOME_OPERATOR_HF_TOKEN_FILE" --stop-timeout-seconds "${LEHOME_OPERATOR_STOP_TIMEOUT_SECONDS:-300}"
+  finalizer_status=$?
+  set -e
 }
-trap finalize EXIT
+finish() {
+  trap - EXIT
+  finalize
+  if [ "$controller_status" -ne 0 ] || [ "$finalizer_status" -ne 0 ]; then exit 1; fi
+}
+trap finish EXIT
 # The persisted remote invocation record is the only remote shell input. It
 # must exactly match validated local IDs/revision/root before fixed controller
 # argv execution; no operator-provided remote command is accepted.
 read -r -d '' REMOTE_SCRIPT <<'SH' || true
 set -eu
-. /mnt/lehome/operator/simple-curriculum-invocation.env
-test "$LEHOME_REVIEWED_REVISION" = "$1"
-test "$LEHOME_RUN_ID" = "$2"
-test "$LEHOME_ROUND_ID" = "$3"
-test "$LEHOME_CAMPAIGN_ROOT" = "$4"
+record=/mnt/lehome/operator/simple-curriculum-invocation.env
+test -f "$record" && test ! -L "$record"
+test "$(stat -c '%a' "$record")" = 600
+awk -F= 'BEGIN { split("LEHOME_REVIEWED_REVISION LEHOME_CAMPAIGN_ROOT LEHOME_RUN_ID LEHOME_ROUND_ID LEHOME_SPEND_BASELINE_USD LEHOME_SPEND_BASELINE_AT_UTC LEHOME_MAX_HOURLY_BURN_USD LEHOME_SPEND_OBSERVER_COMMAND", a, " "); for (i in a) ok[a[i]]=1 } /^[A-Z_]+=[A-Za-z0-9._:\/+-]+$/ { if (!ok[$1] || seen[$1]++) exit 1; next } { exit 1 } END { for (i in ok) if (!seen[i]) exit 1 }' "$record"
+revision=$(sed -n 's/^LEHOME_REVIEWED_REVISION=//p' "$record")
+campaign=$(sed -n 's/^LEHOME_CAMPAIGN_ROOT=//p' "$record")
+run=$(sed -n 's/^LEHOME_RUN_ID=//p' "$record")
+round=$(sed -n 's/^LEHOME_ROUND_ID=//p' "$record")
+test "$revision" = "$1" || exit 1
+test "$run" = "$2" || exit 1
+test "$round" = "$3" || exit 1
+test "$campaign" = "$4" || exit 1
 host=/mnt/lehome/runtime-code/$1
 test -d "$host" && test ! -L "$host"
 exec sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -42,6 +60,8 @@ exec sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/b
   LEHOME_SPEND_OBSERVER=/mnt/lehome/operator/spend-observation.json \
   "$host/rollout_appliance/run_simple_curriculum_collection.sh"
 SH
-printf '%s\n' "$REMOTE_SCRIPT" | ssh -o ClearAllForwardings=yes -o BatchMode=yes -p "${LEHOME_OPERATOR_SSH_PORT:-22}" \
+if ! printf '%s\n' "$REMOTE_SCRIPT" | ssh -o ClearAllForwardings=yes -o BatchMode=yes -p "${LEHOME_OPERATOR_SSH_PORT:-22}" \
   "$LEHOME_OPERATOR_SSH_TARGET" sh -s -- \
-  "$LEHOME_OPERATOR_REVIEWED_REVISION" "$LEHOME_OPERATOR_RUN_ID" "$LEHOME_OPERATOR_ROUND_ID" "$LEHOME_OPERATOR_CAMPAIGN_ROOT"
+  "$LEHOME_OPERATOR_REVIEWED_REVISION" "$LEHOME_OPERATOR_RUN_ID" "$LEHOME_OPERATOR_ROUND_ID" "$LEHOME_OPERATOR_CAMPAIGN_ROOT"; then
+  controller_status=1
+fi

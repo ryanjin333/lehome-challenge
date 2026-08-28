@@ -69,7 +69,7 @@ def test_operator_wrapper_traps_even_an_unpersistable_handoff_for_local_finaliza
     with __import__("pytest").raises(OSError, match="disk failure"):
         controller.run_collection(config, runner=Runner())
     wrapper = (ROOT / "scripts/run_simple_curriculum_with_finalizer.sh").read_text(encoding="utf-8")
-    assert "trap finalize EXIT" in wrapper and "finalize_simple_curriculum_collection.py" in wrapper
+    assert "trap finish EXIT" in wrapper and "finalize_simple_curriculum_collection.py" in wrapper
     assert "LEHOME_REMOTE_CONTROLLER_COMMAND" not in wrapper
     assert "/mnt/lehome/operator/simple-curriculum-invocation.env" in wrapper
     assert "LEHOME_OPERATOR_REVIEWED_REVISION" in wrapper
@@ -94,11 +94,12 @@ def test_operator_wrapper_executes_fixed_remote_argv_over_stdin_with_clean_envir
     fake_bin = tmp_path / "bin"; fake_bin.mkdir(); remote = tmp_path / "remote"
     revision = "a" * 40; run_id = "fresh-run-20260828123456-01"; round_id = "fresh-12k-20260828123456-01"; campaign = f"/mnt/lehome/eval/{run_id}"
     (remote / "operator").mkdir(parents=True); (remote / "runtime-code" / revision / "rollout_appliance").mkdir(parents=True)
-    (remote / "operator/simple-curriculum-invocation.env").write_text(f"LEHOME_REVIEWED_REVISION={revision}\nLEHOME_RUN_ID={run_id}\nLEHOME_ROUND_ID={round_id}\nLEHOME_CAMPAIGN_ROOT={campaign}\n", encoding="utf-8")
+    record = f"LEHOME_REVIEWED_REVISION={revision}\nLEHOME_CAMPAIGN_ROOT={campaign}\nLEHOME_RUN_ID={run_id}\nLEHOME_ROUND_ID={round_id}\nLEHOME_SPEND_BASELINE_USD=20.25\nLEHOME_SPEND_BASELINE_AT_UTC=2026-08-28T14:25:00Z\nLEHOME_MAX_HOURLY_BURN_USD=1.50\nLEHOME_SPEND_OBSERVER_COMMAND=/mnt/lehome/runtime-code/{revision}/scripts/run_conservative_spend_observer.py\n"
+    (remote / "operator/simple-curriculum-invocation.env").write_text(record, encoding="utf-8")
     log = tmp_path / "log"
     def executable(name: str, text: str) -> None:
         path = fake_bin / name; path.write_text("#!/bin/sh\n" + text, encoding="utf-8"); path.chmod(0o755)
-    executable("stat", "echo '0 600'")
+    executable("stat", "case \"$1:$2\" in -c:*) echo 600;; -f:%u) /usr/bin/id -u;; -f:%Lp) echo 600;; *) echo 600;; esac")
     executable("uv", f"echo finalizer >> {log}; exit 0")
     executable("sudo", "exec \"$@\"")
     executable("ssh", "target=\"$REMOTE_ROOT\"; while [ \"$1\" != sh ]; do shift; done; shift; shift; shift; sed \"s|/mnt/lehome|$target|g\" | /bin/sh -s -- \"$@\"")
@@ -109,7 +110,7 @@ def test_operator_wrapper_executes_fixed_remote_argv_over_stdin_with_clean_envir
     assert result.returncode == 0, result.stderr
     assert log.read_text(encoding="utf-8").splitlines() == ["controller", "finalizer"]
     log.unlink()
-    (remote / "operator/simple-curriculum-invocation.env").write_text(f"LEHOME_REVIEWED_REVISION={'b' * 40}\nLEHOME_RUN_ID={run_id}\nLEHOME_ROUND_ID={round_id}\nLEHOME_CAMPAIGN_ROOT={campaign}\n", encoding="utf-8")
+    (remote / "operator/simple-curriculum-invocation.env").write_text(record.replace(revision, "b" * 40), encoding="utf-8")
     mismatch = subprocess.run(("env", "-i", f"PATH={fake_bin}:/usr/bin:/bin", "REMOTE_ROOT=" + str(remote), "LOG=" + str(log), "LEHOME_OPERATOR_SSH_TARGET=fake", "LEHOME_OPERATOR_CAMPAIGN_ROOT=" + campaign, "LEHOME_OPERATOR_RUN_ID=" + run_id, "LEHOME_OPERATOR_ROUND_ID=" + round_id, "LEHOME_OPERATOR_REVIEWED_REVISION=" + revision, "LEHOME_OPERATOR_HF_TOKEN_FILE=" + str(token), "/bin/bash", str(ROOT / "scripts/run_simple_curriculum_with_finalizer.sh")), text=True, capture_output=True)
     assert "controller" not in (log.read_text(encoding="utf-8") if log.exists() else "")
     assert "finalizer" in (log.read_text(encoding="utf-8") if log.exists() else "")

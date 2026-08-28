@@ -374,15 +374,8 @@ OPERATOR_SSH_TARGET="${LEHOME_VM_SSH_TARGET:?approved SSH target}"
 OPERATOR_HF_TOKEN_FILE="${LEHOME_OPERATOR_HF_TOKEN_FILE:?local root-owned 0600 token path}"
 OPERATOR_REVIEWED_REVISION="${LEHOME_REVIEWED_REVISION:?persisted reviewed 40-hex revision}"
 test -f "$OPERATOR_HF_TOKEN_FILE" && test ! -L "$OPERATOR_HF_TOKEN_FILE" && test -s "$OPERATOR_HF_TOKEN_FILE"
-test "$(stat -f '%u %Lp' "$OPERATOR_HF_TOKEN_FILE")" = "0 600"
-finalize_lehome() {
-  uv run --project trainer python3 scripts/finalize_simple_curriculum_collection.py \
-    --ssh-target "$OPERATOR_SSH_TARGET" --ssh-port "${LEHOME_VM_SSH_PORT:-22}" \
-    --remote-campaign-root "$OPERATOR_CAMPAIGN_ROOT" \
-    --run-id "$OPERATOR_RUN_ID" --round-id "$OPERATOR_ROUND_ID" \
-    --hf-token-file "$OPERATOR_HF_TOKEN_FILE" --stop-timeout-seconds 300
-}
-trap 'finalize_lehome' EXIT
+test "$(stat -f '%u' "$OPERATOR_HF_TOKEN_FILE")" = "$(id -u)"
+test "$(stat -f '%Lp' "$OPERATOR_HF_TOKEN_FILE")" = 600
 # Use the reviewed wrapper for the actual remote command. Its EXIT trap invokes
 # the local finalizer even if controller preparation or handoff persistence
 # fails, so a billed VM cannot be stranded without a fetchable handoff.
@@ -397,10 +390,12 @@ LEHOME_OPERATOR_HF_TOKEN_FILE="$OPERATOR_HF_TOKEN_FILE" \
 The local finalizer pins `computeinstance-u00t6xfqhadrcmssa2`, name
 `lehome-rollout`, and attached protected disk
 `computedisk-u00pbe55crxy7jr56x`; it has no create/start/delete/list path. A
+The wrapper invokes `scripts/finalize_simple_curriculum_collection.py` after
+the remote controller returns or fails.
 handoff validation failure still stops that exact VM and reports
 `infrastructure_stop_failure`; an HF failure after STOPPED leaves it stopped
 and is a zero-compute publication retry. The token file must be regular,
-non-symlink, root-owned, mode `0600`, and nonempty; it is never included in
+non-symlink, owned by the effective operator UID, mode `0600`, and nonempty; it is never included in
 arguments or receipts.
 
 Every fresh success **and failure** remains terminal evidence. Success replay
