@@ -1107,7 +1107,11 @@ class CommandRunner:
             drainer.start()
         try:
             while process.poll() is None:
-                if self.budget_check is not None:
+                # Final publication/readback runs only after the exact VM has
+                # been authoritatively stopped.  It is a zero-compute retry
+                # boundary, so an exhausted paid budget must not strand
+                # already-collected evidence on the local disk.
+                if self.budget_check is not None and stage != "final-publication":
                     try:
                         self.budget_check()
                     except Exception:
@@ -1652,8 +1656,30 @@ def _stop_then_publish(journal: StageJournal, runner: Runner, config: Collection
         # Its public seal cannot claim verified stop; do not publish a false
         # completion receipt.
         return final_outcome
-    _stage(journal, runner, "final-publication", stop_receipt, terminal_outcome=final_outcome)
+    _post_stop_publication(
+        journal, runner, predecessor=stop_receipt, terminal_outcome=final_outcome,
+    )
     return final_outcome
+
+
+def _post_stop_publication(
+    journal: StageJournal, runner: Runner, *, predecessor: str, terminal_outcome: str,
+) -> None:
+    """Run only the zero-compute final-publication boundary after STOPPED.
+
+    This intentionally bypasses ``check_budget``.  The caller has already
+    written and authenticated the one VM's stop receipt, while the stage
+    itself is limited to local sealing plus public Hub upload/readback.  It
+    cannot reach a collection, replay, or provider-start command.
+    """
+
+    inputs = {"terminal_outcome": terminal_outcome}
+    if journal._read("final-publication", predecessor, inputs) is not None:
+        return
+    output = runner.run("final-publication", **inputs)
+    if not isinstance(output, Mapping):
+        raise ValueError("stage runner output is invalid")
+    journal.complete("final-publication", predecessor, output, inputs=inputs)
 
 
 def _existing_terminal_outcome(journal: StageJournal) -> str | None:
@@ -1713,7 +1739,9 @@ def run_collection(config: CollectionConfig, *, runner: Runner) -> str:
             raise ReceiptMismatchError("GPU stop receipt is missing its immutable digest")
         final = journal._read("final-publication", stop_receipt, {"terminal_outcome": existing_terminal})
         if final is None:
-            _stage(journal, runner, "final-publication", stop_receipt, terminal_outcome=existing_terminal)
+            _post_stop_publication(
+                journal, runner, predecessor=stop_receipt, terminal_outcome=existing_terminal,
+            )
         return existing_terminal
     try:
         calibration_matrix, predecessor = _stage(journal, runner, "calibration-matrix", predecessor)
@@ -1742,6 +1770,11 @@ def run_collection(config: CollectionConfig, *, runner: Runner) -> str:
             if outcome not in {"complete", "replay_shortage"}: raise ReceiptMismatchError("replay result is invalid")
         else:
             outcome = str(decision)
+    except BudgetLimitError:
+        # No paid adapter ran, so there is no VM action to stop and no
+        # post-stop publication authority.  A pre-stage budget rejection is
+        # intentionally a clean no-op.
+        raise
     except ReceiptMismatchError:
         _stop_then_publish(journal, runner, config, predecessor=predecessor, outcome="infrastructure_stop_failure")
         raise

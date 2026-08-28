@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -20,7 +21,10 @@ import stat
 import sys
 import tempfile
 from typing import Mapping, Protocol, Sequence
+from types import SimpleNamespace
 from uuid import uuid4
+
+from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout as RequestsTimeout
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -93,7 +97,7 @@ class PublicCollectionTransport(Protocol):
 
     def upload_files(
         self, *, repository: str, revision: str, source: Path, entries: Sequence[PublicationEntry],
-        token: str, remote_prefix: str | None = None,
+        token: str, remote_prefix: str | None = None, parent_commit: str | None = None,
     ) -> str: ...
 
     def download_files(
@@ -162,7 +166,9 @@ def _collect_entries(bundle: CollectionPublicationBundle) -> tuple[PublicationEn
 def _is_transient(error: BaseException) -> bool:
     """Only the canonical Hub retry categories are retryable."""
 
-    return type(error).__name__ in {"HubTransientError", "HubRateLimitError"}
+    return isinstance(error, (RequestsConnectionError, RequestsTimeout)) or type(error).__name__ in {
+        "HubTransientError", "HubRateLimitError",
+    }
 
 
 def _retry(operation, *, label: str, max_attempts: int):
@@ -260,13 +266,47 @@ def publish_collection_bundle(
         except CollectionPublicationError as error:
             raise CollectionPublicationError("immutable collection collision") from error
     else:
-        revision = _retry(
-            lambda: transport.upload_files(
-                repository=bundle.repository, revision=bundle.revision, source=bundle.root,
-                entries=entries, token=token, remote_prefix=prefix,
-            ),
-            label="collection upload", max_attempts=max_attempts,
-        )
+        try:
+            revision = _retry(
+                lambda: transport.upload_files(
+                    repository=bundle.repository, revision=bundle.revision, source=bundle.root,
+                    entries=entries, token=token, remote_prefix=prefix, parent_commit=head,
+                ),
+                label="collection upload", max_attempts=max_attempts,
+            )
+        except CollectionPublicationError as upload_error:
+            # A lost response or a concurrent branch update is ambiguous.  Do
+            # not retry a mutable upload blind: re-open the current immutable
+            # tree and allow only the exact byte-identical prefix to resume.
+            current_head = _retry(
+                lambda: transport.resolve_approved_ref(
+                    repository=bundle.repository, ref=bundle.revision, token=token,
+                ),
+                label="publication ref reconciliation", max_attempts=max_attempts,
+            )
+            if not isinstance(current_head, str) or _COMMIT.fullmatch(current_head) is None:
+                raise CollectionPublicationError("publication ref reconciliation did not resolve an immutable commit") from None
+            current = _tree_files(
+                _retry(
+                    lambda: transport.list_tree(
+                        repository=bundle.repository, revision=current_head, token=token, remote_prefix=prefix,
+                    ),
+                    label="collection collision reconciliation", max_attempts=max_attempts,
+                ),
+                prefix=prefix,
+            )
+            if current != expected:
+                if current:
+                    raise CollectionPublicationError("immutable collection collision") from None
+                raise upload_error
+            try:
+                _verify_download(
+                    transport=transport, bundle=bundle, revision=current_head, prefix=prefix,
+                    entries=entries, token=token,
+                )
+            except CollectionPublicationError as error:
+                raise CollectionPublicationError("immutable collection collision") from error
+            revision = current_head
         if not isinstance(revision, str) or not _COMMIT.fullmatch(revision):
             raise CollectionPublicationError("collection upload did not return an immutable commit")
         observed = _tree_files(
@@ -336,82 +376,90 @@ def _verified_gpu_stop(
     return observation
 
 
-def _complete_fresh_counts(root: Path, *, run_id: str, round_id: str) -> tuple[int, int]:
-    report = _json_object(root / "reports" / "fresh-source-report.json", label="fresh source report")
-    matrix = _json_object_or_list(root / "reports" / "fresh-source-matrix.json", label="fresh source matrix")
-    terminal = _json_object(root / "reports" / "fresh-terminal-artifacts.json", label="fresh terminal manifest")
-    trials = report.get("trials")
-    entries = terminal.get("entries")
-    if (
-        report.get("run_id") != run_id or report.get("round_id") != round_id
-        or not isinstance(matrix, list) or not isinstance(trials, list) or not isinstance(entries, list)
-    ):
-        raise CollectionPublicationError("fresh source evidence is malformed")
-    source_ids = {row.get("attempt_id") for row in matrix if isinstance(row, Mapping)}
-    trial_ids = {row.get("attempt_id") for row in trials if isinstance(row, Mapping)}
-    terminal_ids = {row.get("attempt_id") for row in entries if isinstance(row, Mapping)}
-    if (
-        len(matrix) != 1000 or len(trials) != 1000 or len(entries) != 1000
-        or len(source_ids) != 1000 or source_ids != trial_ids or source_ids != terminal_ids
-        or any(not isinstance(item, str) or not item for item in source_ids)
-    ):
-        raise CollectionPublicationError("collection complete requires exactly 1,000 fresh terminal outcomes")
-    successes = sum(1 for trial in trials if isinstance(trial, Mapping) and trial.get("accepted_success") is True)
-    return 1000, successes
+def _task6_controller_module():
+    """Load the one canonical producer verifier without duplicating its rules."""
+
+    name = "_lehome_simple_curriculum_task6_verifier"
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    script = REPO_ROOT / "scripts" / "run_simple_curriculum_collection.py"
+    if not script.is_file():
+        raise CollectionPublicationError("Task 6 canonical evidence verifier is unavailable")
+    scripts_directory = str(script.parent)
+    if scripts_directory not in sys.path:
+        sys.path.insert(0, scripts_directory)
+    spec = importlib.util.spec_from_file_location(name, script)
+    if spec is None or spec.loader is None:
+        raise CollectionPublicationError("Task 6 canonical evidence verifier is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-def _json_object_or_list(path: Path, *, label: str) -> object:
-    if path.is_symlink() or not path.is_file():
-        raise CollectionPublicationError(f"{label} is missing or unsafe")
+def _authenticate_complete_task6_evidence(
+    root: Path, *, run_id: str, round_id: str,
+) -> tuple[int, int, int, int, dict[str, int]]:
+    """Re-open the exact Task 6 evidence chain before sealing completion.
+
+    Completion never trusts summary IDs.  The Task 6 validator replays the
+    report/matrix joins, all 1,000 terminal artifact and receipt bindings, the
+    physical partition ledgers, and the exact 400-row visual-only replay
+    ledger.  This publisher intentionally consumes that same authority rather
+    than carrying a weaker copy of its schema.
+    """
+
+    controller = _task6_controller_module()
+    # These three attributes are the only collection configuration fields used
+    # by the canonical fresh/replay evidence validators.  They are explicit so
+    # a publisher cannot manufacture a new policy/runtime identity.
+    config = SimpleNamespace(campaign_root=root, run_id=run_id, round_id=round_id)
+    report_path = root / "reports" / "fresh-source-report.json"
+    matrix_path = root / "reports" / "fresh-source-matrix.json"
+    manifest_path = root / "reports" / "fresh-terminal-artifacts.json"
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        raise CollectionPublicationError(f"{label} is malformed") from None
-
-
-def _complete_replay_counts(root: Path) -> tuple[int, int, dict[str, int]]:
-    seal = _json_object(root / "replay" / "success-replay-readback-seal.json", label="success replay readback seal")
-    categories = {"pant_long", "pant_short", "top_long", "top_short"}
-    accepted = seal.get("accepted_attempt_ids")
-    by_category = seal.get("accepted_by_category")
-    receipts = seal.get("readback_receipts")
-    if (
-        seal.get("kind") != "lehome_success_replay_readback_seal_v1"
-        or seal.get("outcome") != "complete" or seal.get("readback_verified") is not True
-        or not isinstance(accepted, list) or not isinstance(by_category, Mapping) or not isinstance(receipts, Mapping)
-        or len(accepted) != 200 or len(set(accepted)) != 200
-        or set(by_category) != categories or any(by_category.get(category) != 50 for category in categories)
-        or set(receipts) != set(accepted)
-        or any(
-            not isinstance(value, Mapping)
-            or set(value) != {"receipt_sha256", "episode_sha256", "immutable_revision"}
-            or any(
-                not isinstance(value.get(field), str)
-                or re.fullmatch(r"[0-9a-f]{64}", str(value.get(field))) is None
-                for field in ("receipt_sha256", "episode_sha256")
-            )
-            or not isinstance(value.get("immutable_revision"), str)
-            or _COMMIT.fullmatch(str(value.get("immutable_revision"))) is None
-            for value in receipts.values()
+        authenticated = controller._validate_fresh_source_outputs(
+            config, report=report_path, matrix=matrix_path,
         )
-    ):
-        raise CollectionPublicationError("collection complete requires the exact accepted replay set and readbacks")
-    for attempt in accepted:
-        if not isinstance(attempt, str):
-            raise CollectionPublicationError("collection complete replay attempt identity is invalid")
-        artifact = root / "replay" / "accepted" / attempt
-        receipt_path = root / "replay" / "hf-sync-receipts" / f"{attempt}.sync.json"
-        if artifact.is_symlink() or not artifact.is_dir() or not _iter_regular_files(artifact):
-            raise CollectionPublicationError("collection complete replay artifact is missing")
-        receipt = _json_object(receipt_path, label="success replay Hub readback receipt")
-        binding = receipts[attempt]
-        assert isinstance(binding, Mapping)
-        if (
-            receipt.get("attempt_id") != attempt or receipt.get("readback_verified") is not True
-            or _sha256(receipt_path)[0] != binding.get("receipt_sha256")
+        controller._validate_fresh_terminal_artifact_manifest(
+            config, authenticated=authenticated, manifest=manifest_path,
+        )
+        # The source aggregate is not sufficient alone: every physical
+        # partition matrix/manifest/ledger must still be exact at publication.
+        for partition, start, end, target, lease_budget in (
+            ("calibration-head", 0, 100, 100, 150),
+            ("calibration-tail", 100, 400, 300, 400),
+            ("curriculum-a", 0, 300, 300, 400),
+            ("curriculum-b", 300, 600, 300, 400),
         ):
-            raise CollectionPublicationError("collection complete replay receipt is not readback verified")
-    return 400, 200, {category: 50 for category in sorted(categories)}
+            matrix = root / "partitions" / f"{partition}.json"
+            manifest = root / "partitions" / f"{partition}.manifest.json"
+            controller._validate_partition_manifest(
+                manifest, matrix=matrix, partition_id=partition,
+                inputs={
+                    "partition_id": partition, "row_start": start, "row_end": end,
+                    "target": target, "lease_budget": lease_budget,
+                },
+            )
+            controller._validate_partition_ledger(
+                root / "fresh" / partition / "ledger.sqlite3", matrix=matrix,
+                max_attempts=lease_budget, target=target,
+            )
+        replay = controller._discover_success_replay(
+            config, matrix=root / "replay" / "replay.json", ledger=root / "replay" / "ledger.sqlite3",
+        )
+        if replay.get("result") != "complete":
+            raise ValueError("success replay did not meet the exact complete contract")
+    except (OSError, ValueError, RuntimeError) as error:
+        raise CollectionPublicationError("collection complete requires authoritative Task 6 evidence") from error
+    fresh_successes = sum(
+        1 for context in authenticated.values()
+        if isinstance(context.get("trial"), Mapping) and context["trial"].get("accepted_success") is True
+    )
+    return 1000, fresh_successes, 400, 200, {
+        "pant_long": 50, "pant_short": 50, "top_long": 50, "top_short": 50,
+    }
 
 
 def _complete_stage_chain_is_clean(root: Path) -> None:
@@ -467,8 +515,9 @@ def build_final_seal(
     }
     if kind == "collection_complete":
         _complete_stage_chain_is_clean(root)
-        fresh_total, fresh_successes = _complete_fresh_counts(root, run_id=run_id, round_id=round_id)
-        replay_attempts, replay_successes, replay_categories = _complete_replay_counts(root)
+        (
+            fresh_total, fresh_successes, replay_attempts, replay_successes, replay_categories,
+        ) = _authenticate_complete_task6_evidence(root, run_id=run_id, round_id=round_id)
         body.update(
             fresh_valid_outcomes=fresh_total,
             fresh_official_successes=fresh_successes,
@@ -537,11 +586,96 @@ def _copy_to_staging(*, source: Path, root: Path, staging: Path, remote: str) ->
         raise CollectionPublicationError("staged collection bytes differ from the source")
 
 
+def _complete_reviewed_paths(root: Path, *, seal_path: Path) -> tuple[Path, ...]:
+    """Return the exact reviewed source files for a complete collection.
+
+    A complete public bundle is deliberately not a recursive campaign-root
+    upload.  Every source file must either be a fixed Task 6 receipt/input or
+    be reachable from the already-revalidated fresh/replay artifact chains.
+    """
+
+    static = {
+        "inputs/policy-identity.json", "inputs/seen-catalog.json",
+        "matrices/calibration.json", "matrices/calibration.receipt.json",
+        "matrices/curriculum.json", "matrices/curriculum.receipt.json",
+        "reports/calibration-head.json", "reports/first-100-gate.json",
+        "reports/calibration-tail.json", "reports/calibration.json",
+        "reports/fresh-source-report.json", "reports/fresh-source-matrix.json",
+        "reports/fresh-terminal-artifacts.json", "replay/replay.json",
+        "replay/replay.json.sha256", "replay/ledger.sqlite3",
+        "replay/success-replay-readback-seal.json",
+        "stage-receipts/budget-state.json", "stage-receipts/gpu-stop-state.json",
+        "stage-receipts/gpu-stop-observation.json",
+    }
+    for partition in ("calibration-head", "calibration-tail", "curriculum-a", "curriculum-b"):
+        static.update({
+            f"partitions/{partition}.json", f"partitions/{partition}.manifest.json",
+            f"fresh/{partition}/ledger.sqlite3", f"reports/partitions/{partition}.json",
+        })
+    for stage in (
+        "calibration-matrix", "calibration-head", "first-100-gate", "calibration-tail",
+        "calibration-report", "curriculum-matrix", "curriculum-a", "curriculum-b",
+        "fresh-report", "replay-matrix", "success-replay", "gpu-stop",
+    ):
+        static.add(f"stage-receipts/{stage}.json")
+    manifest = _json_object(root / "reports" / "fresh-terminal-artifacts.json", label="fresh terminal artifact manifest")
+    entries = manifest.get("entries")
+    if not isinstance(entries, list):
+        raise CollectionPublicationError("collection complete source manifest is malformed")
+    for entry in entries:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("attempt_id"), str) or not isinstance(entry.get("finalized_artifact_root"), str):
+            raise CollectionPublicationError("collection complete source manifest is malformed")
+        artifact = Path(entry["finalized_artifact_root"])
+        try:
+            relative_artifact = artifact.relative_to(root)
+        except ValueError as error:
+            raise CollectionPublicationError("collection complete artifact escapes root") from error
+        static.update(path.relative_to(root).as_posix() for path in _iter_regular_files(artifact))
+        receipt = artifact.parent.parent / "hf-sync-receipts" / f"{entry['attempt_id']}.sync.json"
+        static.add(receipt.relative_to(root).as_posix())
+    replay_seal = _json_object(root / "replay" / "success-replay-readback-seal.json", label="success replay readback seal")
+    accepted = replay_seal.get("accepted_attempt_ids")
+    if not isinstance(accepted, list) or len(accepted) != 200:
+        raise CollectionPublicationError("collection complete replay source manifest is malformed")
+    for attempt in accepted:
+        if not isinstance(attempt, str):
+            raise CollectionPublicationError("collection complete replay source manifest is malformed")
+        artifact = root / "replay" / "accepted" / attempt
+        static.update(path.relative_to(root).as_posix() for path in _iter_regular_files(artifact))
+        static.add(f"replay/hf-sync-receipts/{attempt}.sync.json")
+    static.add(seal_path.relative_to(root).as_posix())
+    allowed = {Path(relative) for relative in static}
+    source_areas = ("inputs", "matrices", "partitions", "stage-receipts", "reports", "seals", "fresh", "replay")
+    observed: set[Path] = set()
+    for area in source_areas:
+        candidate = root / area
+        if candidate.exists() or candidate.is_symlink():
+            observed.update(path.relative_to(root) for path in _iter_regular_files(candidate))
+    # Post-readback local receipts intentionally never enter the immutable
+    # bundle.  They are written after publication and are not source evidence.
+    observed.discard(Path("reports/final-publication.json"))
+    observed.discard(Path("reports/final-publication-readback.json"))
+    if observed != allowed:
+        raise CollectionPublicationError("collection complete has missing or unreviewed source files")
+    return tuple(root / path for path in sorted(allowed))
+
+
 def _stage_collection_bundle(root: Path, *, seal_path: Path, run_id: str, repository: str, revision: str) -> CollectionPublicationBundle:
     """Map only reviewed campaign evidence into the five canonical sections."""
 
     staging = Path(tempfile.mkdtemp(prefix="lehome-curriculum-publication-", dir=root))
     try:
+        seal = _json_object(seal_path, label="final seal")
+        if seal.get("kind") == "lehome_simple_curriculum_collection_complete_seal_v1":
+            for source in _complete_reviewed_paths(root, seal_path=seal_path):
+                relative = source.relative_to(root).as_posix()
+                if relative.startswith(("inputs/", "matrices/", "partitions/", "stage-receipts/")):
+                    remote = f"manifests/{relative}"
+                else:
+                    remote = relative
+                _copy_to_staging(source=source, root=root, staging=staging, remote=remote)
+            files = tuple(path.relative_to(staging).as_posix() for path in _iter_regular_files(staging))
+            return CollectionPublicationBundle(staging, run_id, repository, revision, files)
         for directory in ("inputs", "matrices", "partitions", "stage-receipts"):
             source_root = root / directory
             if not source_root.exists() and not source_root.is_symlink():
@@ -623,9 +757,22 @@ class HuggingFacePublicDatasetTransport:
         status = getattr(getattr(error, "response", None), "status_code", None) or getattr(error, "status_code", None)
         if status == 429:
             raise HubRateLimitError("public Hub rate limit") from None
-        if isinstance(error, (ConnectionError, TimeoutError)):
+        if isinstance(error, (ConnectionError, TimeoutError, RequestsConnectionError, RequestsTimeout)):
             raise HubTransientError("public Hub transport interruption") from None
         raise error
+
+    @staticmethod
+    def _is_missing_tree_prefix(error: Exception) -> bool:
+        """Recognize only huggingface_hub's 404 for this requested folder.
+
+        ``list_repo_tree(path_in_repo=...)`` in huggingface_hub 0.36 raises
+        EntryNotFoundError for an absent folder instead of returning an empty
+        iterator.  Authentication and access errors can reuse related error
+        classes, so both the exact class name and the HTTP 404 are required.
+        """
+
+        status = getattr(getattr(error, "response", None), "status_code", None) or getattr(error, "status_code", None)
+        return type(error).__name__ == "EntryNotFoundError" and status == 404
 
     def _api(self, token: str | bool):
         return self._library().HfApi(token=token)
@@ -663,16 +810,19 @@ class HuggingFacePublicDatasetTransport:
         except CollectionPublicationError:
             raise
         except Exception as error:  # noqa: BLE001
+            if self._is_missing_tree_prefix(error):
+                return ()
             self._raise_transport(error)
             raise AssertionError("unreachable")
 
-    def upload_files(self, *, repository: str, revision: str, source: Path, entries: Sequence[PublicationEntry], token: str, remote_prefix: str | None = None) -> str:
-        if not remote_prefix:
+    def upload_files(self, *, repository: str, revision: str, source: Path, entries: Sequence[PublicationEntry], token: str, remote_prefix: str | None = None, parent_commit: str | None = None) -> str:
+        if not remote_prefix or _COMMIT.fullmatch(parent_commit or "") is None:
             raise CollectionPublicationError("public upload prefix is missing")
         try:
             result = self._api(token).upload_folder(
                 repo_id=repository, repo_type="dataset", revision=revision, folder_path=str(source),
                 allow_patterns=[entry.relative_path for entry in entries], path_in_repo=remote_prefix, token=token,
+                parent_commit=parent_commit,
             )
             return self._revision(result)
         except Exception as error:  # noqa: BLE001

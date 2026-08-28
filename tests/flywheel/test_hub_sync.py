@@ -7,8 +7,10 @@ import json
 from pathlib import Path
 
 import pytest
+from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout as RequestsTimeout
 
 from lehome.flywheel.hub_sync import HubSyncDaemon, HubSyncError
+from lehome_train.flywheel.rollout_round_seal import RolloutRoundSealError, seal_rollout_round
 from lehome_train.hub import HubAccess, HubTreeEntry, HubTransientError
 from lehome_train.constants import DEFAULT_ROLLOUT_REPO
 
@@ -176,6 +178,25 @@ def test_upload_retry_succeeds_after_transient_failures(daemon):
     assert len(transport.uploads) == 3
 
 
+@pytest.mark.parametrize("failure", [RequestsConnectionError("network"), RequestsTimeout("slow")])
+def test_upload_retries_real_requests_transport_errors(daemon, failure):
+    sync, transport, accepted_root = daemon
+    episode = _make_accepted_episode(accepted_root, "attempt-requests")
+    original = transport.upload_files
+    calls = 0
+
+    def flaky_upload(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise failure
+        return original(**kwargs)
+
+    transport.upload_files = flaky_upload
+    assert sync.sync_episode("attempt-requests", episode).readback_verified is True
+    assert calls == 3
+
+
 def test_upload_retry_exhaustion_raises_without_receipt(daemon):
     sync, transport, accepted_root = daemon
     transport.upload_failures = 99
@@ -248,6 +269,31 @@ def test_round_pending_reports_unsynced_episodes(daemon):
     assert pending == ("attempt-7",)
     assert not sync.round_sealable(("attempt-7", "attempt-8"))
     assert sync.round_sealable(("attempt-8",))
+
+
+def test_seal_rollout_round_requires_each_readback_verified_sync_receipt(daemon, tmp_path):
+    """Round sealing remains independently fail-closed after sync changes."""
+    sync, _transport, accepted_root = daemon
+    episode = _make_accepted_episode(accepted_root, "attempt-seal")
+    sync.sync_episode("attempt-seal", episode)
+
+    seal = seal_rollout_round(
+        receipts_root=sync.receipts_root, round_id=ROUND_ID, attempt_ids=("attempt-seal",),
+        seal_receipt_path=tmp_path / "seals" / "round.json",
+    )
+    assert seal.episode_count == 1
+    assert seal.seal_receipt_path.is_file()
+
+    with pytest.raises(RolloutRoundSealError, match="already exists"):
+        seal_rollout_round(
+            receipts_root=sync.receipts_root, round_id=ROUND_ID, attempt_ids=("attempt-seal",),
+            seal_receipt_path=seal.seal_receipt_path,
+        )
+    with pytest.raises(RolloutRoundSealError, match="missing"):
+        seal_rollout_round(
+            receipts_root=sync.receipts_root, round_id=ROUND_ID, attempt_ids=("attempt-missing",),
+            seal_receipt_path=tmp_path / "seals" / "missing.json",
+        )
 def test_immutable_commit_is_rejected_as_publication_target(tmp_path):
     accepted_root = tmp_path / "accepted"
     accepted_root.mkdir()

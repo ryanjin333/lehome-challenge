@@ -20,6 +20,8 @@ import shutil
 from typing import Callable, Mapping, Protocol, Sequence
 from uuid import uuid4
 
+from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout as RequestsTimeout
+
 
 _ROUND_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _FRESH_ROUND_ID_PATTERN = re.compile(r"^fresh-12k-[a-z0-9-]{1,112}$")
@@ -43,7 +45,9 @@ def _is_transient_transport_error(error: BaseException) -> bool:
     class names.
     """
 
-    return type(error).__name__ in {"HubTransientError", "HubRateLimitError"}
+    return isinstance(error, (RequestsConnectionError, RequestsTimeout)) or type(error).__name__ in {
+        "HubTransientError", "HubRateLimitError",
+    }
 
 
 @dataclass(frozen=True, slots=True)

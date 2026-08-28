@@ -9,6 +9,8 @@ from pathlib import Path
 import sys
 
 import pytest
+from requests import Response
+from requests.exceptions import ConnectionError as RequestsConnectionError, HTTPError
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +48,7 @@ class FakePublicTransport:
         self.transient_uploads = 0
         self.fail_access = False
         self.fail_public_read = False
+        self.parent_commits: list[str | None] = []
 
     def resolve_approved_ref(self, *, repository, ref, token):
         assert repository == "owner/public-dataset" and ref == "main" and token == "token"
@@ -56,8 +59,9 @@ class FakePublicTransport:
         bucket = self.store.get(str(remote_prefix), {})
         return tuple(_Entry(f"{remote_prefix}/{path}") for path in sorted(bucket))
 
-    def upload_files(self, *, repository, revision, source, entries, token, remote_prefix=None):
+    def upload_files(self, *, repository, revision, source, entries, token, remote_prefix=None, parent_commit=None):
         self.upload_calls += 1
+        self.parent_commits.append(parent_commit)
         if self.transient_uploads:
             self.transient_uploads -= 1
             raise HubTransientError("simulated transport reset")
@@ -112,6 +116,7 @@ def test_collection_bundle_uses_immutable_layout_and_fresh_authenticated_and_ano
     assert transport.authenticated_downloads == 1
     assert transport.anonymous_downloads == 1
     assert {entry.relative_path for entry in result.entries} == {"manifests/matrix.json", "seals/final.json"}
+    assert transport.parent_commits == [COMMIT]
 
 
 def test_collection_bundle_identical_resume_still_performs_both_readbacks_without_reupload(tmp_path: Path) -> None:
@@ -153,6 +158,88 @@ def test_collection_bundle_retries_only_classified_transient_transport_failures(
 
     assert result.readback_verified is True
     assert transport.upload_calls == 3
+
+
+def test_collection_bundle_retries_real_requests_connection_error(tmp_path: Path) -> None:
+    module = _module()
+
+    class FlakyTransport(FakePublicTransport):
+        def upload_files(self, **kwargs):
+            if self.upload_calls < 2:
+                self.upload_calls += 1
+                self.parent_commits.append(kwargs.get("parent_commit"))
+                raise RequestsConnectionError("network reset")
+            return super().upload_files(**kwargs)
+
+    transport = FlakyTransport()
+    assert module.publish_collection_bundle(_bundle(module, tmp_path), token="token", transport=transport).readback_verified
+    assert transport.upload_calls == 3
+
+
+def test_collection_bundle_uses_captured_head_as_compare_and_commit_parent(tmp_path: Path) -> None:
+    """A concurrent branch writer must make this immutable publication fail closed."""
+    module = _module()
+
+    class ConcurrentWriter(FakePublicTransport):
+        def upload_files(self, **kwargs):
+            assert kwargs["parent_commit"] == COMMIT
+            self.store[str(kwargs["remote_prefix"])] = {"manifests/other.json": b"other"}
+            raise RuntimeError("parent commit changed")
+
+    transport = ConcurrentWriter()
+    with pytest.raises(module.CollectionPublicationError, match="collision"):
+        module.publish_collection_bundle(_bundle(module, tmp_path), token="token", transport=transport)
+    assert transport.upload_calls == 0
+
+
+def test_collection_bundle_reconciles_lost_upload_response_only_when_bytes_match(tmp_path: Path) -> None:
+    module = _module()
+
+    class LostResponse(FakePublicTransport):
+        def upload_files(self, **kwargs):
+            self.upload_calls += 1
+            self.parent_commits.append(kwargs.get("parent_commit"))
+            bucket = self.store.setdefault(str(kwargs["remote_prefix"]), {})
+            for entry in kwargs["entries"]:
+                bucket[entry.relative_path] = (Path(kwargs["source"]) / entry.relative_path).read_bytes()
+            raise RuntimeError("connection outcome unknown")
+
+    transport = LostResponse()
+    result = module.publish_collection_bundle(_bundle(module, tmp_path), token="token", transport=transport)
+    assert result.readback_verified and result.public_readback_verified
+    assert transport.upload_calls == 1
+
+
+def test_huggingface_transport_treats_only_missing_prefix_entry_as_empty_tree(monkeypatch) -> None:
+    """huggingface_hub 0.36 raises on a missing path rather than yielding []."""
+    module = _module()
+
+    class EntryNotFoundError(HTTPError):
+        pass
+
+    response = Response(); response.status_code = 404
+    missing = EntryNotFoundError("Entry Not Found"); missing.response = response
+
+    class Api:
+        def list_repo_tree(self, **_kwargs):
+            raise missing
+
+    transport = module.HuggingFacePublicDatasetTransport()
+    monkeypatch.setattr(transport, "_api", lambda _token: Api())
+    assert transport.list_tree(
+        repository="owner/public-dataset", revision=COMMIT, token="token",
+        remote_prefix="collection-rounds/fresh-run-publication-test",
+    ) == ()
+
+    denied = EntryNotFoundError("Entry Not Found"); denied.response = Response(); denied.response.status_code = 401
+    monkeypatch.setattr(transport, "_api", lambda _token: type("DeniedApi", (), {
+        "list_repo_tree": staticmethod(lambda **_kwargs: (_ for _ in ()).throw(denied)),
+    })())
+    with pytest.raises(EntryNotFoundError):
+        transport.list_tree(
+            repository="owner/public-dataset", revision=COMMIT, token="token",
+            remote_prefix="collection-rounds/fresh-run-publication-test",
+        )
 
 
 def test_collection_bundle_fails_authentication_without_retry_or_receipt(tmp_path: Path) -> None:
@@ -233,14 +320,11 @@ def test_final_seals_are_distinct_and_complete_requires_exact_fresh_replay_and_v
     root = tmp_path / "campaign"
     _complete_campaign(root)
 
-    complete = module.build_final_seal(
-        root, run_id="fresh-run-publication-test", round_id="fresh-12k-publication-test",
-        terminal_outcome="complete", rollout_instance_id="computeinstance-u00t6xfqhadrcmssa2",
-    )
-    assert complete["kind"] == "lehome_simple_curriculum_collection_complete_seal_v1"
-    assert complete["fresh_valid_outcomes"] == 1000
-    assert complete["replay_accepted_successes"] == 200
-    assert complete["gpu_stop_verified"] is True
+    with pytest.raises(module.CollectionPublicationError, match="authoritative"):
+        module.build_final_seal(
+            root, run_id="fresh-run-publication-test", round_id="fresh-12k-publication-test",
+            terminal_outcome="complete", rollout_instance_id="computeinstance-u00t6xfqhadrcmssa2",
+        )
 
     observation_path = root / "stage-receipts/gpu-stop-observation.json"
     observation_sha = hashlib.sha256(observation_path.read_bytes()).hexdigest()
@@ -266,7 +350,20 @@ def test_final_seals_are_distinct_and_complete_requires_exact_fresh_replay_and_v
     assert shortage["kind"] == "lehome_simple_curriculum_insufficient_fresh_source_seal_v1"
 
     _complete_campaign(root, count=999)
-    with pytest.raises(module.CollectionPublicationError, match="exactly 1,000"):
+    with pytest.raises(module.CollectionPublicationError, match="authoritative"):
+        module.build_final_seal(
+            root, run_id="fresh-run-publication-test", round_id="fresh-12k-publication-test",
+            terminal_outcome="complete", rollout_instance_id="computeinstance-u00t6xfqhadrcmssa2",
+        )
+
+
+def test_complete_seal_rejects_id_lists_that_are_not_task6_authenticated_evidence(tmp_path: Path) -> None:
+    """A minimal 1,000-row JSON fixture is not production completion proof."""
+    module = _module()
+    root = tmp_path / "campaign"
+    _complete_campaign(root)
+
+    with pytest.raises(module.CollectionPublicationError, match="authoritative"):
         module.build_final_seal(
             root, run_id="fresh-run-publication-test", round_id="fresh-12k-publication-test",
             terminal_outcome="complete", rollout_instance_id="computeinstance-u00t6xfqhadrcmssa2",
@@ -289,10 +386,16 @@ def test_high_level_publication_resume_does_not_add_its_local_receipts_to_the_re
     module = _module()
     root = tmp_path / "campaign"
     _complete_campaign(root)
+    observation_path = root / "stage-receipts/gpu-stop-observation.json"
+    _write_json(root / "stage-receipts/gpu-stop.json", {"output": {
+        "terminal_outcome": "fidelity_stop", "stop_status": "succeeded",
+        "rollout_instance_id": "computeinstance-u00t6xfqhadrcmssa2", "verified_stopped": True,
+        "stop_observation_sha256": hashlib.sha256(observation_path.read_bytes()).hexdigest(),
+    }})
     transport = FakePublicTransport()
     kwargs = {
         "run_id": "fresh-run-publication-test", "round_id": "fresh-12k-publication-test",
-        "terminal_outcome": "complete", "rollout_instance_id": "computeinstance-u00t6xfqhadrcmssa2",
+        "terminal_outcome": "fidelity_stop", "rollout_instance_id": "computeinstance-u00t6xfqhadrcmssa2",
         "repository": "owner/public-dataset", "revision": "main", "token": "token", "transport": transport,
     }
 

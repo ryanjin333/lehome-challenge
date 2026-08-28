@@ -413,6 +413,24 @@ def test_paid_budget_gate_fails_before_runner_at_exact_spend_boundary(tmp_path: 
     assert runner.calls == []
 
 
+def test_budget_exhausted_stopped_campaign_can_publish_without_reentering_paid_work(tmp_path: Path) -> None:
+    """The only post-stop retry is zero-cost publication/readback, not collection."""
+    module = _module(); config = _config(module, tmp_path); assert config.spend_observer is not None
+    observed = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    config.spend_observer.write_text(json.dumps({
+        "schema_version": 1, "kind": "lehome_spend_observation_v1", "observer": "test-meter",
+        "observed_at_utc": observed, "spent_usd": 99.0,
+    }), encoding="utf-8")
+    journal = module.StageJournal(config)
+    runner = FakeRunner(config.campaign_root)
+
+    assert module._stop_then_publish(
+        journal, runner, config, predecessor=None, outcome="complete",
+    ) == "complete"
+    assert runner.calls == ["final-publication"]
+    assert runner.stops == 1
+
+
 def test_inflight_budget_watchdog_terminates_a_clean_child_before_returning(tmp_path: Path) -> None:
     """A live paid adapter cannot outlive a newly observed budget breach."""
     module = _module(); runner = module.CommandRunner(_config(module, tmp_path))
