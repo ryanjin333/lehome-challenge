@@ -99,18 +99,44 @@ def test_operator_wrapper_executes_fixed_remote_argv_over_stdin_with_clean_envir
     log = tmp_path / "log"
     def executable(name: str, text: str) -> None:
         path = fake_bin / name; path.write_text("#!/bin/sh\n" + text, encoding="utf-8"); path.chmod(0o755)
-    executable("stat", "case \"$1:$2\" in -c:*) echo 600;; -f:%u) /usr/bin/id -u;; -f:%Lp) echo 600;; *) echo 600;; esac")
+    executable("stat", "case \"$1:$2\" in -c:%u) /usr/bin/id -u;; -c:*) echo 600;; -f:%u) /usr/bin/id -u;; -f:%Lp) echo 600;; *) echo 600;; esac")
     executable("uv", f"echo finalizer >> {log}; exit 0")
     executable("sudo", "exec \"$@\"")
     executable("ssh", "target=\"$REMOTE_ROOT\"; while [ \"$1\" != sh ]; do shift; done; shift; shift; shift; sed \"s|/mnt/lehome|$target|g\" | /bin/sh -s -- \"$@\"")
     (remote / "runtime-code" / revision / "rollout_appliance/run_simple_curriculum_collection.sh").write_text(f"#!/bin/sh\necho controller >> {log}\n", encoding="utf-8")
     (remote / "runtime-code" / revision / "rollout_appliance/run_simple_curriculum_collection.sh").chmod(0o755)
     token = tmp_path / "token"; token.write_text("not-printed", encoding="utf-8")
-    result = subprocess.run(("env", "-i", f"PATH={fake_bin}:/usr/bin:/bin", "REMOTE_ROOT=" + str(remote), "LOG=" + str(log), "LEHOME_OPERATOR_SSH_TARGET=fake", "LEHOME_OPERATOR_CAMPAIGN_ROOT=" + campaign, "LEHOME_OPERATOR_RUN_ID=" + run_id, "LEHOME_OPERATOR_ROUND_ID=" + round_id, "LEHOME_OPERATOR_REVIEWED_REVISION=" + revision, "LEHOME_OPERATOR_HF_TOKEN_FILE=" + str(token), "/bin/bash", str(ROOT / "scripts/run_simple_curriculum_with_finalizer.sh")), text=True, capture_output=True)
+    result = subprocess.run(("env", "-i", f"PATH={fake_bin}:/usr/bin:/bin", "REMOTE_ROOT=" + str(remote), "LOG=" + str(log), "LEHOME_OPERATOR_SSH_TARGET=operator@host", "LEHOME_OPERATOR_CAMPAIGN_ROOT=" + campaign, "LEHOME_OPERATOR_RUN_ID=" + run_id, "LEHOME_OPERATOR_ROUND_ID=" + round_id, "LEHOME_OPERATOR_REVIEWED_REVISION=" + revision, "LEHOME_OPERATOR_HF_TOKEN_FILE=" + str(token), "/bin/bash", str(ROOT / "scripts/run_simple_curriculum_with_finalizer.sh")), text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     assert log.read_text(encoding="utf-8").splitlines() == ["controller", "finalizer"]
     log.unlink()
     (remote / "operator/simple-curriculum-invocation.env").write_text(record.replace(revision, "b" * 40), encoding="utf-8")
-    mismatch = subprocess.run(("env", "-i", f"PATH={fake_bin}:/usr/bin:/bin", "REMOTE_ROOT=" + str(remote), "LOG=" + str(log), "LEHOME_OPERATOR_SSH_TARGET=fake", "LEHOME_OPERATOR_CAMPAIGN_ROOT=" + campaign, "LEHOME_OPERATOR_RUN_ID=" + run_id, "LEHOME_OPERATOR_ROUND_ID=" + round_id, "LEHOME_OPERATOR_REVIEWED_REVISION=" + revision, "LEHOME_OPERATOR_HF_TOKEN_FILE=" + str(token), "/bin/bash", str(ROOT / "scripts/run_simple_curriculum_with_finalizer.sh")), text=True, capture_output=True)
+    mismatch = subprocess.run(("env", "-i", f"PATH={fake_bin}:/usr/bin:/bin", "REMOTE_ROOT=" + str(remote), "LOG=" + str(log), "LEHOME_OPERATOR_SSH_TARGET=operator@host", "LEHOME_OPERATOR_CAMPAIGN_ROOT=" + campaign, "LEHOME_OPERATOR_RUN_ID=" + run_id, "LEHOME_OPERATOR_ROUND_ID=" + round_id, "LEHOME_OPERATOR_REVIEWED_REVISION=" + revision, "LEHOME_OPERATOR_HF_TOKEN_FILE=" + str(token), "/bin/bash", str(ROOT / "scripts/run_simple_curriculum_with_finalizer.sh")), text=True, capture_output=True)
     assert "controller" not in (log.read_text(encoding="utf-8") if log.exists() else "")
     assert "finalizer" in (log.read_text(encoding="utf-8") if log.exists() else "")
+
+
+def test_operator_wrapper_runs_one_finalizer_and_aggregates_all_exit_statuses(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir(); log = tmp_path / "log"
+    def executable(name: str, text: str) -> None:
+        path = fake_bin / name; path.write_text("#!/bin/sh\n" + text, encoding="utf-8"); path.chmod(0o755)
+    executable("stat", "case \"$1:$2\" in -f:%u) /usr/bin/id -u;; -f:%Lp) echo 600;; *) exit 9;; esac")
+    executable("uv", f"echo finalizer >> {log}; exit \"${{FINALIZER_STATUS:-0}}\"")
+    executable("ssh", f"cat >/dev/null; echo controller >> {log}; exit \"${{CONTROLLER_STATUS:-0}}\"")
+    token = tmp_path / "token"; token.write_text("not-printed", encoding="utf-8")
+    revision = "a" * 40; run_id = "fresh-run-20260828123456-01"; round_id = "fresh-12k-20260828123456-01"
+    campaign = f"/mnt/lehome/eval/{run_id}"
+    base = (
+        "env", "-i", f"PATH={fake_bin}:/usr/bin:/bin", "LEHOME_OPERATOR_SSH_TARGET=operator@host",
+        "LEHOME_OPERATOR_CAMPAIGN_ROOT=" + campaign, "LEHOME_OPERATOR_RUN_ID=" + run_id,
+        "LEHOME_OPERATOR_ROUND_ID=" + round_id, "LEHOME_OPERATOR_REVIEWED_REVISION=" + revision,
+        "LEHOME_OPERATOR_HF_TOKEN_FILE=" + str(token),
+    )
+    for controller_status, finalizer_status, expected in ((0, 0, 0), (1, 0, 1), (0, 1, 1), (1, 1, 1)):
+        if log.exists(): log.unlink()
+        result = subprocess.run(
+            base + (f"CONTROLLER_STATUS={controller_status}", f"FINALIZER_STATUS={finalizer_status}", "/bin/bash", str(ROOT / "scripts/run_simple_curriculum_with_finalizer.sh")),
+            text=True, capture_output=True,
+        )
+        assert result.returncode == expected, result.stderr
+        assert log.read_text(encoding="utf-8").splitlines() == ["controller", "finalizer"]

@@ -30,7 +30,7 @@ def test_simple_curriculum_runbook_covers_the_exact_paid_boundary_without_lifecy
         "four persistent workers", "CPU cloth", "CUDA policy", "$100", "first-100",
         "collection-rounds/<run-id>", "authenticated", "anonymous", "OPERATOR_HF_TOKEN_FILE",
         "fidelity_infrastructure_stop", "insufficient_fresh_source", "collection_complete",
-            "operator-stop-handoff.json", "finalize_simple_curriculum_collection.py", "LEHOME_PAID_COLLECTION=1",
+            "operator-stop-handoff.json", "run_simple_curriculum_with_finalizer.sh", "operator-owned local 0600 token path",
     )
     assert all(value in text for value in required)
     assert "A-500" in text and "hard-state" in text and "old rollout" in text
@@ -51,10 +51,11 @@ def test_simple_curriculum_runbook_has_clean_environment_and_staged_catalog_cont
     text = RUNBOOK.read_text(encoding="utf-8")
     paid = _paid_command(text)
 
-    assert "PYTHONPATH=\"$LEHOME_HOST_CODE_ROOT:$LEHOME_HOST_CODE_ROOT/source/lehome:$LEHOME_HOST_CODE_ROOT/trainer/src\"" in paid
+    assert "LEHOME_OPERATOR_SSH_TARGET=" in paid
+    assert "LEHOME_OPERATOR_REVIEWED_REVISION=" in paid
     assert "<" not in paid and ">" not in paid
-    assert 'LEHOME_RUN_ID="$LEHOME_RUN_ID"' in paid
-    assert 'LEHOME_ROUND_ID="$LEHOME_ROUND_ID"' in paid
+    assert 'LEHOME_OPERATOR_RUN_ID="$LEHOME_RUN_ID"' in paid
+    assert 'LEHOME_OPERATOR_ROUND_ID="$LEHOME_ROUND_ID"' in paid
     assert 'test ! -e "$LEHOME_CAMPAIGN_ROOT"' in text
     assert "configs/eval_groot_n17_public_280.json" in text
     assert "catalog-source.sha256" in text and "seen-catalog.sha256" in text
@@ -70,15 +71,27 @@ def test_simple_curriculum_runbook_has_clean_environment_and_staged_catalog_cont
     assert "LEHOME_SPEND_OBSERVER_COMMAND" in text
     assert "--interval-seconds 30" in text
     assert "trap cleanup_spend_observer EXIT INT TERM" in text
-    assert 'LEHOME_SPEND_OBSERVER="$LEHOME_SPEND_OBSERVER"' in paid
+    assert "LEHOME_OPERATOR_HF_TOKEN_FILE=" in paid
 
 
-def test_simple_curriculum_runbook_requires_root_owned_token_for_root_paid_process() -> None:
+def test_runbook_executes_the_paid_controller_only_through_the_operator_wrapper() -> None:
     text = RUNBOOK.read_text(encoding="utf-8")
     paid = _paid_command(text)
+    section_seven = text.split("## 7. Fresh terminal evidence, replay, and publication", 1)[1]
 
-    assert "sudo env -i" in paid
-    assert "publisher runs as root through `sudo env -i`" in text
+    assert "./scripts/run_simple_curriculum_with_finalizer.sh" in paid
+    assert "sudo env -i" not in paid
+    assert "run_simple_curriculum_collection.sh" not in paid
+    assert "finalize_simple_curriculum_collection.py" not in section_seven
+    assert "trap 'finalize" not in section_seven
+    assert ". \"$LEHOME_INVOCATION_FILE\"" not in text
+
+
+def test_simple_curriculum_runbook_separates_remote_root_token_from_local_operator_token() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+
+    assert "per-episode sync" in text
+    assert "local operator finalizer" in text
     assert "test -f /mnt/lehome/secrets/hf_token && test ! -L /mnt/lehome/secrets/hf_token" in text
     assert "test \"$(stat -c '%u' /mnt/lehome/secrets/hf_token)\" = 0" in text
     assert "test \"$(stat -c '%a' /mnt/lehome/secrets/hf_token)\" = 600" in text

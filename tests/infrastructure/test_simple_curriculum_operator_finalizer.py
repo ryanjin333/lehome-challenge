@@ -5,7 +5,9 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 
@@ -33,6 +35,21 @@ def _handoff(module):
         ],
     }
     return {**body, "handoff_sha256": module._digest(body)}
+
+
+def _final_receipt(module, handoff, seal, *, revision="a" * 40, bundle="b" * 64):
+    body = {
+        "schema_version": 1,
+        "kind": "lehome_simple_curriculum_operator_finalization_receipt_v1",
+        "run_id": handoff["run_id"],
+        "round_id": handoff["round_id"],
+        "evidence_revision": revision,
+        "evidence_bundle_sha256": bundle,
+        "final_seal_sha256": seal["seal_sha256"],
+        "readback_verified": True,
+        "public_readback_verified": True,
+    }
+    return {**body, "receipt_sha256": module._digest(body)}
 
 
 def test_finalizer_stops_exact_vm_before_publishing_and_is_idempotent(tmp_path: Path) -> None:
@@ -88,6 +105,52 @@ def test_restricted_adapters_fetch_only_handoff_and_never_offer_lifecycle_create
     assert not any(word in {"create", "start", "delete", "list"} for word in calls[0])
 
 
+def test_restricted_ssh_adapter_rejects_option_like_target(tmp_path: Path) -> None:
+    finalizer = _module()
+    with __import__("pytest").raises(finalizer.FinalizationError, match="SSH target"):
+        finalizer.fetch_remote_handoff(
+            ssh_target="-Ffile@host", port=22, campaign_root="/mnt/lehome/campaign", destination=tmp_path / "handoff.json"
+        )
+
+
+def test_nebius_adapter_turns_command_timeout_into_finalization_failure(monkeypatch) -> None:
+    finalizer = _module()
+    monkeypatch.setattr(finalizer.subprocess, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("nebius", 1)))
+    with __import__("pytest").raises(finalizer.FinalizationError, match="timed out"):
+        finalizer.SubprocessNebiusProvider().get("computeinstance-u00t6xfqhadrcmssa2")
+
+
+def test_nebius_adapter_uses_explicit_noninteractive_deadline_bounded_flags(monkeypatch) -> None:
+    finalizer = _module(); calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    fixture = json.loads((ROOT / "infrastructure/nebius/.tools/cpu-only-v7-vm-before-start.json").read_text())
+
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps(fixture)
+
+    def run(command, **kwargs):
+        calls.append((tuple(command), kwargs))
+        return Result()
+
+    monkeypatch.setattr(finalizer.subprocess, "run", run)
+    provider = finalizer.SubprocessNebiusProvider()
+    provider.set_stop_deadline(time.monotonic() + 3.0)
+    provider.get(finalizer.EXACT_INSTANCE_ID)
+    provider.stop(finalizer.EXACT_INSTANCE_ID)
+
+    assert len(calls) == 2
+    for command, kwargs in calls:
+        assert "--no-browser" in command
+        assert "--no-progress" in command
+        assert "--no-check-update" in command
+        assert "--auth-timeout" in command
+        assert "--per-retry-timeout" in command
+        assert "--timeout" in command
+        assert "--retries" in command
+        assert kwargs["timeout"] <= 3.0
+
+
 def test_cli_stops_exact_vm_when_ssh_handoff_fetch_fails(monkeypatch, tmp_path: Path) -> None:
     finalizer = _module(); stopped: list[object] = []
     monkeypatch.setattr(finalizer, "fetch_remote_handoff", lambda **_kwargs: (_ for _ in ()).throw(finalizer.FinalizationError("fetch failed")))
@@ -135,37 +198,63 @@ def test_finalizer_rejects_missing_protected_disk_before_stop_dispatch() -> None
 
 def test_provider_validator_accepts_only_real_nested_nebius_identity_shape() -> None:
     finalizer = _module()
-    raw = {"metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"}, "status": {"state": "STOPPED"}, "spec": {"boot_disk": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}]}}
+    raw = json.loads((ROOT / "infrastructure/nebius/.tools/cpu-only-v7-vm-before-start.json").read_text())
     assert finalizer._validate_instance(raw)["state"] == "STOPPED"
     raw["spec"]["secondary_disks"].append({"existing_disk": {"id": "computedisk-other"}})
+    with __import__("pytest").raises(finalizer.FinalizationError): finalizer._validate_instance(raw)
+    raw["spec"]["secondary_disks"] = [{"managed_disk": {"name": "extra"}}]
     with __import__("pytest").raises(finalizer.FinalizationError): finalizer._validate_instance(raw)
 
 
 def test_hf_finalizer_reconciles_lost_receipt_response_without_second_upload(tmp_path: Path) -> None:
     finalizer = _module(); calls: list[object] = []
     class Entry:
-        relative_path = "reports/final-publication.json"
+        def __init__(self, relative_path: str) -> None:
+            self.relative_path = relative_path
+            self.sha256 = "a" * 64
+            self.byte_size = 1
+    handoff = _handoff(finalizer); stopped = {"observation_sha256": "e" * 64}; seal = {"seal_sha256": "f" * 64}
+    evidence_files = ("reports/operator-stop-handoff.json", "reports/stopped-observation.json", "seals/final-seal.json")
+    receipt = _final_receipt(
+        finalizer, handoff, seal, revision="b" * 40,
+        bundle=finalizer._entry_digest(tuple(Entry(name) for name in evidence_files)),
+    )
+    token = tmp_path / "token"; token.write_text("token", encoding="utf-8"); token.chmod(0o600)
     class Transport:
         def resolve_approved_ref(self, **_kwargs): return "a" * 40
-        def list_tree(self, **_kwargs):
-            return ("reports/operator-stop-handoff.json", "reports/stopped-observation.json", "seals/final-seal.json", "reports/final-publication.json")
+        def list_tree(self, *, revision, **_kwargs):
+            return evidence_files if revision == "b" * 40 else evidence_files + ("reports/final-publication.json",)
         def upload_files(self, **_kwargs): raise AssertionError("lost response retry must not upload again")
         def download_files(self, *, destination, relative_paths, **_kwargs):
             for relative in relative_paths:
-                path = destination / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_text("{}\n", encoding="utf-8")
+                path = destination / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
             return "a" * 40
     module = SimpleNamespace(
         _load_token=lambda _path: "token",
         CollectionPublicationBundle=lambda **kwargs: SimpleNamespace(**kwargs),
-        _collect_entries=lambda bundle: (Entry(),) if bundle.files == ("reports/final-publication.json",) else (Entry(), Entry(), Entry()),
+        _collect_entries=lambda bundle: tuple(Entry(name) for name in bundle.files),
         _tree_files=lambda entries, **_kwargs: set(entries),
         _verify_download=lambda **kwargs: calls.append(kwargs["token"]),
         HuggingFacePublicDatasetTransport=lambda: Transport(),
     )
-    handoff = _handoff(finalizer); stopped = {"observation_sha256": "e" * 64}; seal = {"seal_sha256": "f" * 64}
-    result = finalizer.HfFinalizerPublisher(tmp_path / "token", module=module, transport=Transport()).publish(tmp_path, handoff=handoff, stop_observation=stopped, seal=seal)
+    result = finalizer.HfFinalizerPublisher(token, module=module, transport=Transport()).publish(tmp_path, handoff=handoff, stop_observation=stopped, seal=seal)
     assert result["immutable_revision"] == "a" * 40
-    assert calls == ["token", None]
+    assert calls == ["token", None, "token", None]
+
+
+def test_finalization_receipt_requires_exact_hash_and_binds_evidence(tmp_path: Path) -> None:
+    finalizer = _module(); handoff = _handoff(finalizer); seal = {"seal_sha256": "f" * 64}
+    good = _final_receipt(finalizer, handoff, seal)
+    finalizer.validate_finalization_receipt(
+        good, handoff=handoff, evidence_revision="a" * 40,
+        evidence_bundle_sha256="b" * 64, seal=seal,
+    )
+    stale = dict(good); stale["round_id"] = "fresh-12k-stale"
+    with __import__("pytest").raises(finalizer.FinalizationError, match="receipt"):
+        finalizer.validate_finalization_receipt(
+            stale, handoff=handoff, evidence_revision="a" * 40,
+            evidence_bundle_sha256="b" * 64, seal=seal,
+        )
 
 
 def test_hf_lost_response_reconcile_stages_real_receipt_for_actual_collector(tmp_path: Path) -> None:
@@ -173,33 +262,60 @@ def test_hf_lost_response_reconcile_stages_real_receipt_for_actual_collector(tmp
     spec = importlib.util.spec_from_file_location("real_publisher_for_finalizer", source); assert spec and spec.loader
     publisher_module = importlib.util.module_from_spec(spec); sys.modules[spec.name] = publisher_module; spec.loader.exec_module(publisher_module)
     token = tmp_path / "token"; token.write_text("hf_fake_token", encoding="utf-8"); token.chmod(0o600)
-    handoff = _handoff(finalizer); stopped = {"observation_sha256": "e" * 64}; seal = {"seal_sha256": "f" * 64}; calls: list[object] = []; remote_bytes: dict[str, bytes] = {}
+    handoff = _handoff(finalizer); stopped = {"observation_sha256": "e" * 64}; seal = {"seal_sha256": "f" * 64}; calls: list[object] = []; remote_bytes: dict[str, bytes] = {}; uploads: list[object] = []
+    receipt: dict[str, object] = {}
     class Transport:
         def resolve_approved_ref(self, **_kwargs): return "a" * 40
-        def list_tree(self, *, remote_prefix, **_kwargs):
+        def list_tree(self, *, remote_prefix, revision, **_kwargs):
+            nonlocal receipt
             if not remote_bytes:
                 for path in ("reports/operator-stop-handoff.json", "reports/stopped-observation.json", "seals/final-seal.json"):
                     remote_bytes[path] = (tmp_path / path).read_bytes()
-                remote_bytes["reports/final-publication.json"] = b"{}\n"
-            return tuple(SimpleNamespace(relative_path=f"{remote_prefix}/{path}", entry_type="file") for path in ("reports/operator-stop-handoff.json", "reports/stopped-observation.json", "seals/final-seal.json", "reports/final-publication.json"))
-        def upload_files(self, **_kwargs): raise AssertionError("exact receipt prefix must reconcile without upload")
-        def download_files(self, *, destination, relative_paths, token, **_kwargs):
+                evidence_entries = publisher_module._collect_entries(publisher_module.CollectionPublicationBundle(
+                    root=tmp_path, run_id=handoff["run_id"], repository="ryanjin333/lehome-groot-n17-rollouts",
+                    revision="main", files=("reports/operator-stop-handoff.json", "reports/stopped-observation.json", "seals/final-seal.json"),
+                ))
+                receipt = _final_receipt(
+                    finalizer, handoff, seal, revision="b" * 40,
+                    bundle=publisher_module._entry_digest(evidence_entries),
+                )
+                remote_bytes["reports/final-publication.json"] = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            names = ("reports/operator-stop-handoff.json", "reports/stopped-observation.json", "seals/final-seal.json")
+            if revision != "b" * 40:
+                names += ("reports/final-publication.json",)
+            return tuple(SimpleNamespace(relative_path=f"{remote_prefix}/{path}", entry_type="file") for path in names)
+        def upload_files(self, **kwargs): uploads.append(kwargs); raise AssertionError("exact receipt prefix must reconcile without upload")
+        def download_files(self, *, destination, relative_paths, token, revision, **_kwargs):
             calls.append(token)
             for relative in relative_paths:
-                source_path = tmp_path / relative; source_path.parent.mkdir(parents=True, exist_ok=True)
-                if not source_path.exists(): source_path.write_bytes(b"{}\n")
-            if len(calls) == 2:
-                remote_bytes.update({path.relative_to(tmp_path).as_posix(): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file() and path.name != "token"})
-            for relative in relative_paths:
                 target = destination / relative; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(remote_bytes[relative])
-            return "a" * 40
-    # The first authenticated fetch materializes the remote receipt at the
-    # temporary root before the repository's descriptor-safe collector opens
-    # it. This is the crash-recovery staging invariant.
-    finalizer._atomic_json(tmp_path / "reports/operator-stop-handoff.json", handoff)
-    finalizer._atomic_json(tmp_path / "reports/stopped-observation.json", stopped)
-    finalizer._atomic_json(tmp_path / "seals/final-seal.json", seal)
-    transport = Transport(); transport.list_tree(remote_prefix=f"collection-rounds/{handoff['run_id']}")
-    transport.download_files(destination=tmp_path, relative_paths=("reports/final-publication.json",), token="hf_fake_token")
-    entries = publisher_module._collect_entries(publisher_module.CollectionPublicationBundle(root=tmp_path, run_id=handoff["run_id"], repository="ryanjin333/lehome-groot-n17-rollouts", revision="main", files=("reports/final-publication.json",)))
-    assert entries[0].relative_path == "reports/final-publication.json" and calls == ["hf_fake_token"]
+            return revision
+    result = finalizer.HfFinalizerPublisher(token, module=publisher_module, transport=Transport()).publish(
+        tmp_path, handoff=handoff, stop_observation=stopped, seal=seal
+    )
+    assert result["immutable_revision"] == "a" * 40
+    assert uploads == []
+    # One receipt staging download, then authenticated + anonymous readback of
+    # the actual descriptor-collected four-file bundle.
+    assert calls == ["hf_fake_token", "hf_fake_token", None, "hf_fake_token", None]
+
+
+def test_hf_finalizer_rejects_malformed_or_mismatched_existing_receipt(tmp_path: Path) -> None:
+    finalizer = _module(); handoff = _handoff(finalizer); stopped = {"observation_sha256": "e" * 64}; seal = {"seal_sha256": "f" * 64}
+    token = tmp_path / "token"; token.write_text("token", encoding="utf-8"); token.chmod(0o600)
+    bad_receipts = ({}, {**_final_receipt(finalizer, handoff, seal), "run_id": "fresh-run-stale"})
+    for bad in bad_receipts:
+        class Transport:
+            def resolve_approved_ref(self, **_kwargs): return "a" * 40
+            def list_tree(self, **_kwargs): return ("reports/operator-stop-handoff.json", "reports/stopped-observation.json", "seals/final-seal.json", "reports/final-publication.json")
+            def upload_files(self, **_kwargs): raise AssertionError("malformed existing receipt must fail closed")
+            def download_files(self, *, destination, relative_paths, **_kwargs):
+                for relative in relative_paths:
+                    path = destination / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(bad), encoding="utf-8")
+        module = SimpleNamespace(
+            _load_token=lambda _path: "token", CollectionPublicationBundle=lambda **kwargs: SimpleNamespace(**kwargs),
+            _tree_files=lambda entries, **_kwargs: set(entries), _collect_entries=lambda _bundle: (_ for _ in ()).throw(AssertionError("receipt must validate before collection")),
+            _verify_download=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("receipt must validate before readback")),
+        )
+        with __import__("pytest").raises(finalizer.FinalizationError, match="receipt"):
+            finalizer.HfFinalizerPublisher(token, module=module, transport=Transport()).publish(tmp_path / str(len(str(bad))), handoff=handoff, stop_observation=stopped, seal=seal)

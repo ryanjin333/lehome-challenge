@@ -110,6 +110,19 @@ def _bundle(module, tmp_path: Path):
     )
 
 
+def test_collection_entry_manifest_hashes_nonempty_descriptor_bytes(tmp_path: Path) -> None:
+    module = _module()
+    bundle = _bundle(module, tmp_path)
+
+    entries = {entry.relative_path: entry for entry in module._collect_entries(bundle)}
+
+    for relative in bundle.files:
+        source = bundle.root / relative
+        assert (entries[relative].sha256, entries[relative].byte_size) == (
+            hashlib.sha256(source.read_bytes()).hexdigest(), source.stat().st_size,
+        )
+
+
 def test_collection_bundle_uses_immutable_layout_and_fresh_authenticated_and_anonymous_readbacks(tmp_path: Path) -> None:
     module = _module()
     transport = FakePublicTransport()

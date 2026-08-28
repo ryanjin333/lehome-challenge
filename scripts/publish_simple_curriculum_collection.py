@@ -210,10 +210,14 @@ def _open_bundle_entry(root: Path, relative: str) -> tuple[int, os.stat_result]:
 def _sha256_descriptor(descriptor: int) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
-    with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
-        while chunk := handle.read(1 << 20):
-            digest.update(chunk)
-            size += len(chunk)
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
+            while chunk := handle.read(1 << 20):
+                digest.update(chunk)
+                size += len(chunk)
+    except OSError as error:
+        raise CollectionPublicationError("publication source is unreadable") from error
     return digest.hexdigest(), size
 
 
@@ -223,12 +227,14 @@ def _scan_publication_descriptor_and_content_fd(descriptor: int, relative: str) 
     if any(_SENSITIVE_PATH.search(part) for part in PurePosixPath(relative).parts):
         raise CollectionPublicationError("publication source includes a credential-like descriptor")
     try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
         tail = b""
         with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
             while chunk := handle.read(1 << 20):
                 if _SENSITIVE_CONTENT.search(tail + chunk):
                     raise CollectionPublicationError("publication source includes credential-like content")
                 tail = (tail + chunk)[-256:]
+        os.lseek(descriptor, 0, os.SEEK_SET)
     except OSError as error:
         raise CollectionPublicationError("publication source is unreadable") from error
 
