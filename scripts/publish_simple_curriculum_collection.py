@@ -21,6 +21,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 from typing import Mapping, Protocol, Sequence
 from types import SimpleNamespace
 from uuid import uuid4
@@ -1018,7 +1019,7 @@ def _provisional_stages(root: Path, outcome: str) -> tuple[str, ...]:
         "success-replay",
     )
     if outcome == "complete": return all_stages
-    if outcome == "replay_shortage": return all_stages[:-1]
+    if outcome == "replay_shortage": return all_stages
     if outcome in {"fidelity_stop", "insufficient_source_stop"}: return all_stages[:3]
     if outcome in {"infrastructure_stop", "infrastructure_stop_failure"}:
         # Infrastructure may interrupt after any completed stage.  Preserve
@@ -1071,10 +1072,9 @@ def _provisional_hub_references(root: Path, *, run_id: str, round_id: str, outco
     running.  We preserve just enough signed reference metadata for a later
     local finalizer to check closure without re-reading the campaign tree.
     """
-    if outcome != "complete":
-        return {"schema_version": 1, "kind": "lehome_simple_curriculum_hub_artifact_references_v1", "fresh": [], "success_replay": []}
-    manifest = _json_object(root / "reports/fresh-terminal-artifacts.json", label="fresh terminal artifact manifest")
     fresh: list[dict[str, object]] = []
+    manifest_path = root / "reports/fresh-terminal-artifacts.json"
+    manifest = _json_object(manifest_path, label="fresh terminal artifact manifest") if manifest_path.is_file() else {"entries": []}
     for entry in manifest.get("entries", []):
         if not isinstance(entry, Mapping): raise CollectionPublicationError("fresh artifact reference is malformed")
         attempt = entry.get("attempt_id"); artifact_root = entry.get("finalized_artifact_root")
@@ -1092,26 +1092,30 @@ def _provisional_hub_references(root: Path, *, run_id: str, round_id: str, outco
                 or not isinstance(reference["episode_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", reference["episode_sha256"])):
             raise CollectionPublicationError("fresh artifact reference does not bind immutable Hub data")
         fresh.append(reference)
-    if len(fresh) != 1000 or len({item["attempt_id"] for item in fresh}) != 1000:
+    if outcome == "complete" and (len(fresh) != 1000 or len({item["attempt_id"] for item in fresh}) != 1000):
         raise CollectionPublicationError("provisional evidence lacks exactly 1,000 fresh Hub references")
-    replay_seal = _json_object(root / "replay/success-replay-readback-seal.json", label="success replay readback seal")
     replay: list[dict[str, object]] = []
+    replay_path = root / "replay/success-replay-readback-seal.json"
+    replay_seal = _json_object(replay_path, label="success replay readback seal") if replay_path.is_file() else {"readback_receipts": {}}
     source = replay_seal.get("readback_receipts")
     if not isinstance(source, Mapping): raise CollectionPublicationError("success replay references are malformed")
     for attempt, item in source.items():
         if not isinstance(attempt, str) or not isinstance(item, Mapping): raise CollectionPublicationError("success replay reference is malformed")
         replay.append({"attempt_id": attempt, "repository": "ryanjin333/lehome-groot-n17-rollouts", "prefix": f"rollout-rounds/{round_id}-replay/{attempt}", "immutable_revision": item.get("immutable_revision"), "episode_sha256": item.get("episode_sha256"), "local_sync_receipt_sha256": item.get("receipt_sha256")})
-    if len(replay) != 200: raise CollectionPublicationError("provisional evidence lacks exactly 200 accepted replay references")
+    if outcome == "complete" and len(replay) != 200: raise CollectionPublicationError("provisional evidence lacks exactly 200 accepted replay references")
     return {"schema_version": 1, "kind": "lehome_simple_curriculum_hub_artifact_references_v1", "fresh": fresh, "success_replay": replay}
 
 
 def publish_provisional_collection(
     campaign_root: Path, *, run_id: str, round_id: str, terminal_outcome: str,
     rollout_instance_id: str, repository: str, revision: str, token: str,
-    transport: PublicCollectionTransport,
+    transport: PublicCollectionTransport, timeout_seconds: float = 90.0,
 ) -> dict[str, object]:
     """Stage the immutable pre-stop JSON evidence bundle while the VM runs."""
     root = _safe_bundle_root(Path(campaign_root))
+    if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 120:
+        raise CollectionPublicationError("provisional publication timeout is invalid")
+    deadline = time.monotonic() + float(timeout_seconds)
     if _RUN_ID.fullmatch(run_id) is None or re.fullmatch(r"^fresh-12k-[a-z0-9-]{1,112}$", round_id) is None:
         raise CollectionPublicationError("provisional collection identity is invalid")
     if root != Path("/mnt/lehome/eval") / run_id:
@@ -1123,6 +1127,13 @@ def publish_provisional_collection(
         fresh_total, fresh_successes, replay_attempts, replay_successes, categories = _authenticate_complete_task6_evidence(root, run_id=run_id, round_id=round_id)
         task6.update(result="complete", fresh_valid_outcomes=fresh_total, fresh_official_successes=fresh_successes, replay_attempts=replay_attempts, replay_accepted_successes=replay_successes, replay_accepted_by_category=categories)
     references = _provisional_hub_references(root, run_id=run_id, round_id=round_id, outcome=terminal_outcome)
+    if terminal_outcome != "complete":
+        # A shortage/stop does not manufacture caps: it records precisely the
+        # compact Hub closure that exists at its reachable terminal boundary.
+        task6.update(
+            fresh_reference_count=len(references["fresh"]),
+            replay_accepted_reference_count=len(references["success_replay"]),
+        )
     evidence: dict[str, object] = {
         "schema_version": 1, "kind": "lehome_simple_curriculum_provisional_evidence_manifest_v1",
         "run_id": run_id, "round_id": round_id, "instance_id": rollout_instance_id,
@@ -1143,6 +1154,8 @@ def publish_provisional_collection(
             path = staging / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(raw)
         bundle = CollectionPublicationBundle(staging, run_id, repository, revision, tuple(sorted(files)))
         result = publish_collection_bundle(bundle, token=token, transport=transport)
+        if time.monotonic() > deadline:
+            raise CollectionPublicationError("provisional publication timeout")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     receipt_body = {

@@ -1858,6 +1858,7 @@ def _operator_stop_handoff(
                 "immutable_revision": provisional["immutable_revision"],
                 "bundle_sha256": provisional["bundle_sha256"],
                 "manifest_sha256": provisional["manifest_sha256"],
+                "receipt_sha256": provisional["receipt_sha256"],
                 "repository": provisional["repository"], "remote_prefix": provisional["remote_prefix"],
             },
         })
@@ -1894,7 +1895,7 @@ def _existing_operator_handoff(config: CollectionConfig) -> bool:
     if is_v2:
         provisional = payload.get("provisional_publication")
         receipt = _provisional_receipt(config)
-        expected = {key: receipt[key] for key in ("immutable_revision", "bundle_sha256", "manifest_sha256", "repository", "remote_prefix")}
+        expected = {key: receipt[key] for key in ("immutable_revision", "bundle_sha256", "manifest_sha256", "receipt_sha256", "repository", "remote_prefix")}
         if provisional != expected:
             raise ReceiptMismatchError("operator stop handoff provisional binding is malformed")
     return True

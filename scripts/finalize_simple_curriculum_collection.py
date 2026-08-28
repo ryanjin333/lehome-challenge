@@ -35,7 +35,7 @@ _COLLECTION_STAGES = (
     "success-replay",
 )
 _GATE_STAGES = _COLLECTION_STAGES[:3]
-_REPLAY_SHORTAGE_STAGES = _COLLECTION_STAGES[:-1]
+_REPLAY_SHORTAGE_STAGES = _COLLECTION_STAGES
 _STOP_OUTCOMES = frozenset({"infrastructure_stop", "infrastructure_stop_failure"})
 _SSH_TARGET = re.compile(
     r"[A-Za-z_][A-Za-z0-9_.-]{0,63}@"
@@ -175,11 +175,11 @@ def validate_handoff(raw: Mapping[str, object]) -> dict[str, object]:
         provisional = payload.get("provisional_publication")
         if (
             not isinstance(provisional, Mapping)
-            or set(provisional) != {"immutable_revision", "bundle_sha256", "manifest_sha256", "repository", "remote_prefix"}
+            or set(provisional) != {"immutable_revision", "bundle_sha256", "manifest_sha256", "receipt_sha256", "repository", "remote_prefix"}
             or provisional.get("repository") != "ryanjin333/lehome-groot-n17-rollouts"
             or provisional.get("remote_prefix") != f"collection-rounds/{payload['run_id']}/manifests/provisional"
             or not _hex(provisional.get("immutable_revision"), 40) or not _hex(provisional.get("bundle_sha256"), 64)
-            or not _hex(provisional.get("manifest_sha256"), 64)
+            or not _hex(provisional.get("manifest_sha256"), 64) or not _hex(provisional.get("receipt_sha256"), 64)
         ):
             raise FinalizationError("operator handoff provisional binding is invalid")
     if payload["terminal_outcome"] not in TERMINAL_OUTCOMES:
@@ -379,6 +379,12 @@ def fetch_remote_handoff(*, ssh_target: str, port: int, campaign_root: str, dest
     return value
 
 
+def _durable_handoff_path(run_id: str) -> Path:
+    if _RUN_ID.fullmatch(run_id) is None:
+        raise FinalizationError("operator handoff run ID is invalid")
+    return Path(tempfile.gettempdir()) / "lehome-simple-curriculum-finalizer" / f"{run_id}.handoff.json"
+
+
 class HfFinalizerPublisher:
     """Compact two-phase public finalization using the reviewed transport."""
     repository = "ryanjin333/lehome-groot-n17-rollouts"
@@ -458,6 +464,12 @@ class HfFinalizerPublisher:
                             or not isinstance(reference.get("prefix"), str) or not _hex(reference.get("immutable_revision"), 40)
                             or not _hex(reference.get("episode_sha256"), 64) or not _hex(reference.get("local_sync_receipt_sha256"), 64)):
                         raise FinalizationError("provisional Hub reference is invalid")
+            else:
+                fresh, replay = references.get("fresh"), references.get("success_replay")
+                if (not isinstance(fresh, list) or not isinstance(replay, list)
+                        or task6.get("fresh_reference_count") != len(fresh)
+                        or task6.get("replay_accepted_reference_count") != len(replay)):
+                    raise FinalizationError("provisional non-complete evidence is invalid")
         except FinalizationError:
             raise
         except Exception as error:
@@ -645,11 +657,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if any(value is None for value in (args.ssh_target, args.ssh_port, args.remote_campaign_root, args.run_id, args.round_id, args.hf_token_file)):
             raise FinalizationError("normal finalization requires complete operator metadata")
-        with tempfile.TemporaryDirectory(prefix="lehome-finalizer-fetch-") as temporary:
-            handoff = fetch_remote_handoff(ssh_target=args.ssh_target, port=args.ssh_port, campaign_root=args.remote_campaign_root, destination=Path(temporary) / "handoff.json")
-            if handoff.get("run_id") != args.run_id or handoff.get("round_id") != args.round_id:
-                raise FinalizationError("remote handoff does not match explicit invocation IDs")
-            result = finalize_operator_handoff(handoff, provider=provider, publisher=HfFinalizerPublisher(args.hf_token_file), staging_parent=Path(temporary), stop_timeout_seconds=args.stop_timeout_seconds)
+        durable_handoff = _durable_handoff_path(args.run_id)
+        if durable_handoff.exists() or durable_handoff.is_symlink():
+            handoff = _json_object(durable_handoff, label="durable operator handoff")
+        else:
+            durable_handoff.parent.mkdir(parents=True, exist_ok=True)
+            handoff = fetch_remote_handoff(
+                ssh_target=args.ssh_target, port=args.ssh_port,
+                campaign_root=args.remote_campaign_root, destination=durable_handoff,
+            )
+        if handoff.get("run_id") != args.run_id or handoff.get("round_id") != args.round_id:
+            raise FinalizationError("remote handoff does not match explicit invocation IDs")
+        result = finalize_operator_handoff(
+            handoff, provider=provider, publisher=HfFinalizerPublisher(args.hf_token_file),
+            staging_parent=durable_handoff.parent, stop_timeout_seconds=args.stop_timeout_seconds,
+        )
         print(json.dumps({"result": result["result"], "immutable_revision": result["publication"]["immutable_revision"]}, sort_keys=True))
         return 0
     except (FinalizationError, OSError, subprocess.SubprocessError, ValueError) as error:

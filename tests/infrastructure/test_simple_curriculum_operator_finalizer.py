@@ -246,7 +246,7 @@ def test_handoff_outcome_stage_sets_and_digests_are_fail_closed() -> None:
         payload["handoff_sha256"] = finalizer._digest(body)
 
     expected_lengths = {
-        "complete": 11, "replay_shortage": 10,
+        "complete": 11, "replay_shortage": 11,
         "fidelity_stop": 3, "insufficient_source_stop": 3,
         "infrastructure_stop": 0, "infrastructure_stop_failure": 0,
     }
