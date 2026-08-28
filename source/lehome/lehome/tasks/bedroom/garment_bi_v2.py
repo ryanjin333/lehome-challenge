@@ -31,7 +31,6 @@ from lehome.assets.object.Garment import GarmentObject
 from lehome.assets.collider_audit import audit_current_usd_stage
 from lehome.flywheel.fidelity import ClothFidelityError, fidelity_receipt
 from lehome.flywheel.persistent_worker import (
-    FidelityFailureError,
     SimulatorNumericalDivergenceError,
 )
 from lehome.tasks.bedroom.challenge_garment_loader import ChallengeGarmentLoader
@@ -2047,131 +2046,100 @@ class GarmentEnv(DirectRLEnv):
         expected: tuple[np.ndarray, np.ndarray, np.ndarray],
     ) -> None:
         """Fail closed if a visual-only mutation changed physical replay state."""
-        observed = self._flywheel_capture_visual_replay_state()
-        if not all(
-            np.array_equal(actual, target)
-            for actual, target in zip(observed, expected, strict=True)
-        ):
-            expected_positions, expected_velocities, expected_pose = expected
-            observed_positions, observed_velocities, observed_pose = observed
+        from lehome.flywheel.randomization import verify_visual_replay_state
 
-            def max_delta(actual: np.ndarray, target: np.ndarray) -> float:
-                if actual.shape != target.shape:
-                    return float(np.finfo(np.float32).max)
-                values = np.abs(actual - target)
-                if not np.isfinite(values).all():
-                    return float(np.finfo(np.float32).max)
-                return float(np.max(values)) if values.size else 0.0
-
-            raise FidelityFailureError(
-                "safety_failure",
-                fidelity_receipt(
-                    missing_cloth=False, cloth_flight=False,
-                    nonfinite_cloth_state=False, safety_failure=True,
-                    monitor_active=True, monitor_observed=True,
-                ),
-                diagnostic={
-                    "stage": "reset_write_readback",
-                    "write_readback": {
-                        "max_position_delta_m": max_delta(
-                            observed_positions, expected_positions,
-                        ),
-                        "max_velocity_delta_mps": max_delta(
-                            observed_velocities, expected_velocities,
-                        ),
-                    },
-                    "visual_replay": {
-                        "max_cloth_position_delta_m": max_delta(
-                            observed_positions, expected_positions,
-                        ),
-                        "max_cloth_velocity_delta_mps": max_delta(
-                            observed_velocities, expected_velocities,
-                        ),
-                        "max_garment_translation_delta_m": max_delta(
-                            observed_pose[:3], expected_pose[:3],
-                        ),
-                        "max_garment_rotation_delta_deg": max_delta(
-                            observed_pose[3:], expected_pose[3:],
-                        ),
-                    },
-                },
-            )
+        verify_visual_replay_state(
+            expected, self._flywheel_capture_visual_replay_state(),
+        )
 
     def _apply_flywheel_visual_mutations(
-        self, values: dict[str, object], *, materials_enabled: bool,
+        self, values: dict[str, object],
     ) -> dict[str, object]:
         """Apply and read back the only mutations permitted in visual replay."""
         if self.object is None:
             raise RuntimeError("cannot randomize an uninitialized garment")
         stage = self.scene.stage
-        table_input = None
-        read_color = None
-        if materials_enabled:
-            texture_folder = self.texture_cfg.get("folder", "")
-            if not os.path.isabs(texture_folder):
-                texture_folder = os.path.join(os.getcwd(), texture_folder)
-            texture_path = os.path.join(texture_folder, f"{int(values['table_texture_id'])}.png")
-            if not os.path.isfile(texture_path):
-                raise RuntimeError("flywheel table texture asset is missing")
-            table_prim = stage.GetPrimAtPath(self.texture_cfg.get("prim_path", ""))
-            if not table_prim.IsValid():
-                raise RuntimeError("flywheel table shader prim is missing")
-            table_shader = UsdShade.Shader(table_prim)
-            table_input = table_shader.GetInput("file") or table_shader.GetInput("diffuse_texture")
-            if not table_input:
-                raise RuntimeError("flywheel table shader input is missing")
-            table_input.Set(Sdf.AssetPath(texture_path))
-            if str(table_input.Get().path) != texture_path:
-                raise RuntimeError("flywheel table shader readback mismatch")
-            mesh = stage.GetPrimAtPath(self.object.mesh_prim_path)
-            color_attr = mesh.GetAttribute("primvars:displayColor")
-            color = tuple(float(value) for value in values["garment_display_color"])
-            if not mesh.IsValid() or not color_attr.IsValid():
-                raise RuntimeError("flywheel garment displayColor is missing")
-            color_attr.Set([color])
-            read_color = tuple(float(value) for value in color_attr.Get()[0])
-            if not np.allclose(read_color, color, atol=1e-6):
-                raise RuntimeError("flywheel garment displayColor readback mismatch")
-        camera_delta = np.asarray(values["camera_translation_m"], dtype=np.float32)
-        if camera_delta.shape != (3,):
-            raise ValueError("flywheel translation randomization must be 3-D")
-        light_path = self.flywheel_randomization_cfg.get("light_prim_path", "/World/Light")
-        light = stage.GetPrimAtPath(light_path)
-        if not light.IsValid():
-            raise RuntimeError(f"flywheel light prim is missing: {light_path}")
-        intensity_attr = light.GetAttribute("inputs:intensity")
-        base_intensity = intensity_attr.Get()
-        if base_intensity is None:
-            raise RuntimeError("flywheel light intensity is unreadable")
-        intensity_attr.Set(float(base_intensity) * float(values["light_intensity_scale"]))
 
-        observed_camera_deltas = []
-        for camera in (self.top_camera, self.left_camera, self.right_camera):
-            current_positions, current_orientations = read_camera_world_pose(camera)
-            positions = current_positions + torch.tensor(camera_delta, device=self.device).unsqueeze(0)
-            write_camera_world_pose(camera, positions, current_orientations)
-            observed_positions, _ = read_camera_world_pose(camera)
-            observed_delta = (
-                observed_positions - current_positions
-            ).detach().cpu().numpy()[0]
-            if not np.allclose(observed_delta, camera_delta, rtol=0.0, atol=1e-5):
-                raise RuntimeError("camera pose readback did not match requested randomization")
-            observed_camera_deltas.append(observed_delta)
+        class IsaacVisualMutationAdapter:
+            def set_table_texture(_, texture_id: int) -> tuple[str, str]:
+                texture_folder = self.texture_cfg.get("folder", "")
+                if not os.path.isabs(texture_folder):
+                    texture_folder = os.path.join(os.getcwd(), texture_folder)
+                texture_path = os.path.join(texture_folder, f"{texture_id}.png")
+                if not os.path.isfile(texture_path):
+                    raise RuntimeError("flywheel table texture asset is missing")
+                table_prim = stage.GetPrimAtPath(self.texture_cfg.get("prim_path", ""))
+                if not table_prim.IsValid():
+                    raise RuntimeError("flywheel table shader prim is missing")
+                table_input = UsdShade.Shader(table_prim).GetInput("file")
+                table_input = table_input or UsdShade.Shader(table_prim).GetInput(
+                    "diffuse_texture",
+                )
+                if not table_input:
+                    raise RuntimeError("flywheel table shader input is missing")
+                table_input.Set(Sdf.AssetPath(texture_path))
+                if str(table_input.Get().path) != texture_path:
+                    raise RuntimeError("flywheel table shader readback mismatch")
+                return texture_path, table_input.GetBaseName()
 
-        receipt = {
-            "light_intensity_scale": float(intensity_attr.Get()) / float(base_intensity),
-            "camera_translation_m": tuple(
-                float(value) for value in observed_camera_deltas[0]
-            ),
-        }
-        if materials_enabled:
-            receipt.update({
-                "table_texture_id": int(values["table_texture_id"]),
-                "table_texture_path": str(table_input.Get().path),
-                "table_shader_input": table_input.GetBaseName(),
-                "garment_display_color": read_color,
-            })
-        return receipt
+            def set_garment_display_color(
+                _, color: tuple[float, float, float],
+            ) -> tuple[float, float, float]:
+                mesh = stage.GetPrimAtPath(self.object.mesh_prim_path)
+                color_attr = mesh.GetAttribute("primvars:displayColor")
+                if not mesh.IsValid() or not color_attr.IsValid():
+                    raise RuntimeError("flywheel garment displayColor is missing")
+                color_attr.Set([color])
+                read_color = tuple(float(value) for value in color_attr.Get()[0])
+                if not np.allclose(read_color, color, atol=1e-6):
+                    raise RuntimeError(
+                        "flywheel garment displayColor readback mismatch",
+                    )
+                return read_color
+
+            def scale_light_intensity(_, scale: float) -> float:
+                light_path = self.flywheel_randomization_cfg.get(
+                    "light_prim_path", "/World/Light",
+                )
+                light = stage.GetPrimAtPath(light_path)
+                if not light.IsValid():
+                    raise RuntimeError(f"flywheel light prim is missing: {light_path}")
+                intensity_attr = light.GetAttribute("inputs:intensity")
+                base_intensity = intensity_attr.Get()
+                if base_intensity is None:
+                    raise RuntimeError("flywheel light intensity is unreadable")
+                intensity_attr.Set(float(base_intensity) * scale)
+                return float(intensity_attr.Get()) / float(base_intensity)
+
+            def translate_cameras(
+                _, translation: tuple[float, float, float],
+            ) -> tuple[float, float, float]:
+                camera_delta = np.asarray(translation, dtype=np.float32)
+                observed_camera_deltas = []
+                for camera in (
+                    self.top_camera, self.left_camera, self.right_camera,
+                ):
+                    current_positions, current_orientations = read_camera_world_pose(camera)
+                    positions = current_positions + torch.tensor(
+                        camera_delta, device=self.device,
+                    ).unsqueeze(0)
+                    write_camera_world_pose(camera, positions, current_orientations)
+                    observed_positions, _ = read_camera_world_pose(camera)
+                    observed_delta = (
+                        observed_positions - current_positions
+                    ).detach().cpu().numpy()[0]
+                    if not np.allclose(
+                        observed_delta, camera_delta, rtol=0.0, atol=1e-5,
+                    ):
+                        raise RuntimeError(
+                            "camera pose readback did not match requested randomization",
+                        )
+                    observed_camera_deltas.append(observed_delta)
+                return tuple(float(value) for value in observed_camera_deltas[0])
+
+        from lehome.flywheel.randomization import apply_visual_mutations
+
+        return apply_visual_mutations(values, adapter=IsaacVisualMutationAdapter())
 
     def apply_flywheel_randomization(self, randomization) -> dict[str, object]:
         """Apply opt-in rollout perturbations and return values read back from Isaac.
@@ -2192,7 +2160,6 @@ class GarmentEnv(DirectRLEnv):
         from lehome.flywheel.randomization import (
             VISUAL_ONLY_FIELDS,
             orchestrate_visual_only_replay,
-            randomization_materials_enabled,
             validate_randomization_receipt,
         )
 
@@ -2200,16 +2167,13 @@ class GarmentEnv(DirectRLEnv):
             receipt = orchestrate_visual_only_replay(
                 values,
                 capture_state=self._flywheel_capture_visual_replay_state,
-                apply_visual_mutations=lambda: self._apply_flywheel_visual_mutations(
-                    values, materials_enabled=True,
-                ),
+                apply_visual_mutations=lambda: self._apply_flywheel_visual_mutations(values),
                 verify_state=self._flywheel_verify_visual_replay_state,
             )
             validate_randomization_receipt(values, receipt)
             self._flywheel_randomization_receipt = receipt
             return receipt
 
-        materials_enabled = randomization_materials_enabled(values)
         if self.object is None:
             raise RuntimeError("cannot randomize an uninitialized garment")
         baseline = getattr(self, "_flywheel_randomization_baseline", None)
@@ -2217,9 +2181,7 @@ class GarmentEnv(DirectRLEnv):
             baseline = self._flywheel_capture_scene_state()
             self._flywheel_randomization_baseline = baseline
         self._flywheel_restore_scene_state(baseline)
-        receipt = self._apply_flywheel_visual_mutations(
-            values, materials_enabled=materials_enabled,
-        )
+        receipt = self._apply_flywheel_visual_mutations(values)
         base_delta = (
             np.asarray(values["robot_base_translation_m"], dtype=np.float32)
         )

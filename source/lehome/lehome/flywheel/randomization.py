@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, TypeVar
+from typing import Callable, Protocol, TypeVar
 
 import numpy as np
 
@@ -12,6 +12,26 @@ from .models import RandomizationRecord
 
 StateT = TypeVar("StateT")
 ResultT = TypeVar("ResultT")
+
+
+class VisualMutationAdapter(Protocol):
+    """Isaac-facing operations that are allowed during a visual-only replay.
+
+    Keeping this boundary small makes the replay sequence executable on
+    controller-only hosts while leaving USD and camera bindings in the task.
+    """
+
+    def set_table_texture(self, texture_id: int) -> tuple[str, str]: ...
+
+    def set_garment_display_color(
+        self, color: tuple[float, float, float],
+    ) -> tuple[float, float, float]: ...
+
+    def scale_light_intensity(self, scale: float) -> float: ...
+
+    def translate_cameras(
+        self, translation: tuple[float, float, float],
+    ) -> tuple[float, float, float]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +186,97 @@ def orchestrate_visual_only_replay(
     return result
 
 
+def apply_visual_mutations(
+    sampled: dict[str, object], *, adapter: VisualMutationAdapter,
+) -> dict[str, object]:
+    """Apply the bounded visual fields through an Isaac-free adapter seam."""
+    materials_enabled = randomization_materials_enabled(sampled)
+    receipt: dict[str, object] = {}
+    if materials_enabled:
+        texture_id = int(sampled["table_texture_id"])
+        color = tuple(float(value) for value in sampled["garment_display_color"])
+        if len(color) != 3:
+            raise ValueError("flywheel garment display color must be RGB")
+        texture_path, shader_input = adapter.set_table_texture(texture_id)
+        receipt.update({
+            "table_texture_id": texture_id,
+            "table_texture_path": texture_path,
+            "table_shader_input": shader_input,
+            "garment_display_color": adapter.set_garment_display_color(color),
+        })
+
+    receipt["light_intensity_scale"] = adapter.scale_light_intensity(
+        float(sampled["light_intensity_scale"]),
+    )
+    translation = tuple(float(value) for value in sampled["camera_translation_m"])
+    if len(translation) != 3:
+        raise ValueError("flywheel translation randomization must be 3-D")
+    receipt["camera_translation_m"] = adapter.translate_cameras(translation)
+    return receipt
+
+
+def verify_visual_replay_state(
+    expected: tuple[np.ndarray, np.ndarray, np.ndarray],
+    observed: tuple[np.ndarray, np.ndarray, np.ndarray],
+) -> None:
+    """Terminalize visual replay when any cloth or garment state drifted."""
+    if all(
+        np.array_equal(actual, target)
+        for actual, target in zip(observed, expected, strict=True)
+    ):
+        return
+
+    expected_positions, expected_velocities, expected_pose = expected
+    observed_positions, observed_velocities, observed_pose = observed
+
+    def max_delta(actual: np.ndarray, target: np.ndarray) -> float:
+        if actual.shape != target.shape:
+            return float(np.finfo(np.float32).max)
+        values = np.abs(actual - target)
+        if not np.isfinite(values).all():
+            return float(np.finfo(np.float32).max)
+        return float(np.max(values)) if values.size else 0.0
+
+    # These imports remain here so the sampling module stays lightweight for
+    # callers that only need deterministic randomization records.
+    from .fidelity import fidelity_receipt
+    from .persistent_worker import FidelityFailureError
+
+    raise FidelityFailureError(
+        "safety_failure",
+        fidelity_receipt(
+            missing_cloth=False, cloth_flight=False,
+            nonfinite_cloth_state=False, safety_failure=True,
+            monitor_active=True, monitor_observed=True,
+        ),
+        diagnostic={
+            "stage": "reset_write_readback",
+            "write_readback": {
+                "max_position_delta_m": max_delta(
+                    observed_positions, expected_positions,
+                ),
+                "max_velocity_delta_mps": max_delta(
+                    observed_velocities, expected_velocities,
+                ),
+            },
+            "visual_replay": {
+                "max_cloth_position_delta_m": max_delta(
+                    observed_positions, expected_positions,
+                ),
+                "max_cloth_velocity_delta_mps": max_delta(
+                    observed_velocities, expected_velocities,
+                ),
+                "max_garment_translation_delta_m": max_delta(
+                    observed_pose[:3], expected_pose[:3],
+                ),
+                "max_garment_rotation_delta_deg": max_delta(
+                    observed_pose[3:], expected_pose[3:],
+                ),
+            },
+        },
+    )
+
+
 def validate_randomization_receipt(sampled: dict[str, object], receipt: dict[str, object]) -> None:
     """Require every sampled value and only the defined USD proof metadata."""
     sampled_fields = set(sampled)
@@ -193,10 +304,13 @@ __all__ = [
     "PHYSICS_AFFECTING_FIELDS",
     "RandomizationBounds",
     "VISUAL_ONLY_FIELDS",
+    "VisualMutationAdapter",
+    "apply_visual_mutations",
     "read_or_author_garment_display_color",
     "orchestrate_visual_only_replay",
     "randomization_materials_enabled",
     "sample_randomization",
     "validate_material_receipt",
     "validate_randomization_receipt",
+    "verify_visual_replay_state",
 ]
