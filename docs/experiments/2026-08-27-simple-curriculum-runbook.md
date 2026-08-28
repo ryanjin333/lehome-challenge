@@ -1,8 +1,8 @@
 # Original-12K simple-curriculum collection runbook
 
 This is the only operator handoff for the approved paid collection. It is not
-authorization to run it. All implementation checks may run while every GPU is
-stopped; a paid start requires a separate explicit authorization.
+authorization to run it. Offline checks may run while every GPU is stopped; a
+paid start requires separate explicit authorization.
 
 ## Fixed boundary
 
@@ -15,79 +15,171 @@ stopped; a paid start requires a separate explicit authorization.
   pant-short. CPU cloth; CUDA policy and render only.
 - Collect 400 uniform fresh outcomes, then 600 frozen curriculum fresh
   outcomes. Success replay only follows those fresh sources: at most 400 replay
-  attempts and 200 accepted, with at most 100 attempts and 50 accepted
-  per category.
+  attempts and 200 accepted, with at most 100 attempts and 50 accepted per
+  category.
 - Exclude A-500, hard-state mining, old rollout inputs, training, geometry or
   physics perturbation, and any automatic next experiment.
 - The hard ceiling is $100. The controller uses `99.00` as its strict internal
   cutoff so it cannot cross that ceiling.
 
-No secret value belongs in this runbook. Keep all token paths, not token
-contents, in the operator-only environment.
+No secret value belongs in this runbook. Keep token paths, not token contents,
+in the operator-only environment.
 
-## 1. Read-only preflight
+## 1. Provider preflight while stopped
 
-Do all of these before a paid start. Stop if any check differs.
+Do these **before** starting anything. They prove only provider state and
+identity; they do not substitute for the post-start host checks below.
 
-1. With the existing approved Nebius CLI profile, issue this read-only lookup:
+1. With the approved Nebius CLI profile, issue this read-only lookup:
 
    ```bash
    nebius compute instance get computeinstance-u00t6xfqhadrcmssa2
    ```
 
    Record the returned ID, name, image, attached-disk IDs, and `STOPPED`
-   state. It must be the only rollout VM. Do not use a create, delete,
-   replacement, or broad-list command. Confirm manually that no other GPU VM
-   is running.
+   state. The result must identify `lehome-rollout` and the approved attached
+   workspace. Do not use a create, delete, replacement, or broad-list command.
 
-2. On the stopped VM's mounted reviewed checkout, verify the exact committed
-   source and its clean state, without checking out another revision:
+2. Confirm the public destination is `ryanjin333/lehome-groot-n17-rollouts`
+   and that anonymous access works for a harmless existing public object. The
+   new immutable prefix will be `collection-rounds/<run-id>` and must not
+   already exist. Check the token path, not its contents: it must be a regular
+   non-symlink `0600`, nonempty file at `/mnt/lehome/secrets/hf_token` once the
+   workspace is mounted.
 
-   ```bash
-   git -C /mnt/lehome/lehome-challenge rev-parse HEAD
-   git -C /mnt/lehome/lehome-challenge status --porcelain
-   ```
+3. Confirm the provider spend view is below $99.00 and prepare a current typed
+   spend receipt at `/mnt/lehome/operator/spend-observation.json`. The receipt
+   contains only `schema_version`, `kind`, `observer`, `observed_at_utc`, and
+   `spent_usd`; its timestamp must be under five minutes old. Confirm the
+   trusted exact-VM stop hook is `/usr/local/libexec/lehome-stop-gpu`.
 
-   The first value must be the reviewed commit and the second must be empty.
-   Set `LEHOME_HOST_CODE_ROOT` to this absolute non-symlink checkout; the
-   mounted code is used directly—there is no image rebuild.
+Stop and report if the exact ID, image, disk, state, public destination, or
+budget evidence differs. Do not attempt the post-start checks on a stopped VM.
 
-3. Prepare a **new empty absolute** root such as
-   `/mnt/lehome/eval/fresh-run-YYYYMMDD-01`. It must not be a symlink and must
-   not contain an old campaign, receipt, ledger, or matrix. Use matching fresh
-   identities `fresh-run-YYYYMMDD-01` and `fresh-12k-YYYYMMDD-01`; never reuse
-   an ID or output root after a terminal outcome.
+## 2. Start exactly the approved VM
 
-4. Prepare an owner-only, regular runtime-identity JSON file outside the
-   public bundle. It must have exactly these fields: `policy_repo`,
-   `policy_revision`, `policy_step`, `policy_artifact_sha256`,
-   `simulator_device`, `cloth_device`, `policy_device`, `worker_count`,
-   `rollout_image`, and `trainer_image`. The first eight bind the values above,
-   `cpu`, `cpu`, `cuda:0`, and `4`. The two image values must be the exact
-   current VM runtime strings, each digest-pinned as `@sha256:<64 lowercase
-   hex>`; do not invent or replace them.
+Only after Section 1 passes and explicit authorization is present, use the
+approved operator control to start **only**
+`computeinstance-u00t6xfqhadrcmssa2`. Wait for the provider to report
+`RUNNING`, then repeat the same read-only lookup and verify the exact ID,
+image, and attached workspace before logging in. Do not start a second worker
+host or training VM.
 
-5. Check every path without printing secret bytes. The HF token file must be
-   a non-symlink regular file, owner-only (`0600`), and nonempty. The spend
-   observer is a current, typed JSON receipt with only
-   `schema_version`, `kind`, `observer`, `observed_at_utc`, and `spent_usd`;
-   its timestamp must be under five minutes old and spend must be below 99.00.
-   The trusted stop hook must be exactly
-   `/usr/local/libexec/lehome-stop-gpu`.
+## 3. Post-start checkpoint and immutable input staging
 
-   ```bash
-   test -f /mnt/lehome/secrets/hf_token && test ! -L /mnt/lehome/secrets/hf_token
-   test "$(stat -c '%a' /mnt/lehome/secrets/hf_token)" = 600
-   test -s /mnt/lehome/secrets/hf_token
-   test -x /usr/local/libexec/lehome-stop-gpu
-   ```
+These are required **after** `RUNNING` and before the collection command. A
+cloud-init, mount, GPU, original-12K, CPU-cloth, image, or content mismatch is
+an infrastructure stop: stop the exact VM through the trusted hook, report,
+and do not launch collection.
 
-6. Confirm the public destination is
-   `ryanjin333/lehome-groot-n17-rollouts`, and that anonymous access is
-   possible to a harmless existing public object. The new immutable prefix
-   will be `collection-rounds/<run-id>`; it must not already exist.
+```bash
+set -euo pipefail
+LEHOME_HOST_CODE_ROOT=/mnt/lehome/lehome-challenge
+test -d "$LEHOME_HOST_CODE_ROOT" && test ! -L "$LEHOME_HOST_CODE_ROOT"
+cloud-init status --wait
+mountpoint -q /mnt/lehome
+nvidia-smi --query-gpu=name,uuid,driver_version --format=csv,noheader
+git -C "$LEHOME_HOST_CODE_ROOT" rev-parse HEAD
+git -C "$LEHOME_HOST_CODE_ROOT" diff --quiet
+test -d "$LEHOME_HOST_CODE_ROOT/source/lehome" && test ! -L "$LEHOME_HOST_CODE_ROOT/source/lehome"
+test -d "$LEHOME_HOST_CODE_ROOT/trainer/src" && test ! -L "$LEHOME_HOST_CODE_ROOT/trainer/src"
+test -x /usr/local/libexec/lehome-stop-gpu
+test -f /mnt/lehome/secrets/hf_token && test ! -L /mnt/lehome/secrets/hf_token
+test "$(stat -c '%a' /mnt/lehome/secrets/hf_token)" = 600
+test -s /mnt/lehome/secrets/hf_token
+```
 
-## 2. Offline dry run
+Read the runtime-identity JSON from
+`/mnt/lehome/operator/runtime-identity.json` without changing it. It must have
+exactly `policy_repo`, `policy_revision`, `policy_step`,
+`policy_artifact_sha256`, `simulator_device`, `cloth_device`, `policy_device`,
+`worker_count`, `rollout_image`, and `trainer_image`. Its policy fields must
+match the revision, step, and SHA-256 in Fixed boundary; devices must be `cpu`,
+`cpu`, and `cuda:0`; worker count must be `4`; both actual current image
+strings must be digest-pinned as `@sha256:<64 lowercase hex>`. This binds the
+mounted image/content and proves CPU cloth plus CUDA policy/render before any
+collection.
+
+### Create or reuse the one invocation identity
+
+Run this once after the post-start checks. It creates an owner-only,
+non-secret identity record. On a retry it reads and validates that record, so
+the same IDs and exact command are reused rather than regenerated.
+
+```bash
+set -euo pipefail
+LEHOME_HOST_CODE_ROOT=/mnt/lehome/lehome-challenge
+LEHOME_INVOCATION_FILE=/mnt/lehome/operator/simple-curriculum-invocation.env
+if test -e "$LEHOME_INVOCATION_FILE"; then
+  test -f "$LEHOME_INVOCATION_FILE" && test ! -L "$LEHOME_INVOCATION_FILE"
+  test "$(stat -c '%a' "$LEHOME_INVOCATION_FILE")" = 600
+  . "$LEHOME_INVOCATION_FILE"
+else
+  LEHOME_RUN_ID="fresh-run-$(date -u +%Y%m%d%H%M%S)-01"
+  LEHOME_ROUND_ID="fresh-12k-${LEHOME_RUN_ID#fresh-run-}"
+  LEHOME_CAMPAIGN_ROOT="/mnt/lehome/eval/$LEHOME_RUN_ID"
+  test ! -e "$LEHOME_CAMPAIGN_ROOT"
+  umask 077
+  printf 'LEHOME_RUN_ID=%q\nLEHOME_ROUND_ID=%q\n' "$LEHOME_RUN_ID" "$LEHOME_ROUND_ID" > "$LEHOME_INVOCATION_FILE"
+fi
+case "$LEHOME_RUN_ID" in fresh-run-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-01) ;; *) exit 2;; esac
+case "$LEHOME_ROUND_ID" in fresh-12k-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-01) ;; *) exit 2;; esac
+LEHOME_CAMPAIGN_ROOT="/mnt/lehome/eval/$LEHOME_RUN_ID"
+export LEHOME_HOST_CODE_ROOT LEHOME_RUN_ID LEHOME_ROUND_ID LEHOME_CAMPAIGN_ROOT
+```
+
+For an initial invocation, that campaign root must not exist before this
+section. Create only its `inputs` directory; it is not completely empty
+because the immutable reviewed catalog is staged before controller-generated
+files. On a preemption/resume, reuse the existing root and the record above;
+do not copy an old rollout input or create a new identity.
+
+The authoritative source is the reviewed checkout's
+`configs/eval_groot_n17_public_280.json`, not either historical rollout
+campaign file. The following first-stage command extracts only its `seen`
+trials, rejects anything except 40 unique garments/10 per category, writes a
+canonical catalog, records source provenance/hash, and reads both hashes back.
+
+```bash
+set -euo pipefail
+CATALOG_SOURCE="$LEHOME_HOST_CODE_ROOT/configs/eval_groot_n17_public_280.json"
+CATALOG_DIR="$LEHOME_CAMPAIGN_ROOT/inputs"
+CATALOG="$CATALOG_DIR/seen-catalog.json"
+if test ! -e "$LEHOME_CAMPAIGN_ROOT"; then
+  mkdir -p "$CATALOG_DIR"
+  python3 - "$CATALOG_SOURCE" "$CATALOG" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source, destination = map(Path, sys.argv[1:])
+payload = json.loads(source.read_text(encoding="utf-8"))
+expected = {"top_long", "top_short", "pant_long", "pant_short"}
+catalog = {category: set() for category in expected}
+for trial in payload["trials"]:
+    if trial.get("release_stage") == "seen" and trial.get("category") in expected:
+        catalog[trial["category"]].add(trial["garment_name"])
+if set(catalog) != expected or sum(map(len, catalog.values())) != 40 or any(len(items) != 10 for items in catalog.values()):
+    raise SystemExit("expected exactly 40 unique seen garments, 10 per category")
+destination.write_text(json.dumps({key: sorted(value) for key, value in sorted(catalog.items())}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+PY
+  (cd "$LEHOME_HOST_CODE_ROOT" && sha256sum configs/eval_groot_n17_public_280.json) > "$CATALOG_DIR/catalog-source.sha256"
+  (cd "$CATALOG_DIR" && sha256sum seen-catalog.json) > seen-catalog.sha256
+fi
+test -f "$CATALOG" && test ! -L "$CATALOG"
+(cd "$LEHOME_HOST_CODE_ROOT" && sha256sum --check "$CATALOG_DIR/catalog-source.sha256")
+(cd "$CATALOG_DIR" && sha256sum --check seen-catalog.sha256)
+python3 - "$CATALOG" <<'PY'
+import json
+import sys
+catalog = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = {"top_long", "top_short", "pant_long", "pant_short"}
+if set(catalog) != expected or sum(map(len, catalog.values())) != 40 or any(len(set(items)) != 10 for items in catalog.values()):
+    raise SystemExit("staged catalog is not exactly 40 unique seen garments, 10 per category")
+PY
+```
+
+## 4. Offline dry run
 
 Run this from the reviewed checkout before any paid start. It performs no
 Nebius, Docker, Isaac, rollout, or Hub action.
@@ -115,25 +207,27 @@ bash -n rollout_appliance/run_simple_curriculum_collection.sh
 python3 -m py_compile scripts/build_simple_curriculum_matrix.py \
   scripts/check_simple_curriculum_gate.py scripts/build_success_replay_matrix.py \
   scripts/run_simple_curriculum_collection.py scripts/publish_simple_curriculum_collection.py
+env -i PATH="$PATH" PYTHONPATH="$PWD:$PWD/source/lehome:$PWD/trainer/src" \
+  python3 scripts/run_simple_curriculum_collection.py --help
 git diff --check
 ```
 
-## 3. One paid command
+## 5. One paid command
 
-After explicit authorization, start **that exact stopped VM once** through the
-approved operator path, wait for `RUNNING`, recheck its ID and mounted
-checkout, then run only this command on it. Values in angle brackets are
-operator-selected paths/identities, never secret contents.
+After Sections 1–3 pass, run this exact command on the already-running exact
+VM. It uses the exported identities from Section 3; retry the same command
+with the same `LEHOME_INVOCATION_FILE`, never a regenerated ID.
 
 ```bash
 sudo env -i \
   PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  PYTHONPATH="$LEHOME_HOST_CODE_ROOT:$LEHOME_HOST_CODE_ROOT/source/lehome:$LEHOME_HOST_CODE_ROOT/trainer/src" \
   LEHOME_PAID_COLLECTION=1 \
   LEHOME_GPU_STOP_COMMAND=/usr/local/libexec/lehome-stop-gpu \
-  LEHOME_HOST_CODE_ROOT=/mnt/lehome/lehome-challenge \
-  LEHOME_CAMPAIGN_ROOT=/mnt/lehome/eval/<fresh-run-id> \
-  LEHOME_RUN_ID=<fresh-run-id> \
-  LEHOME_ROUND_ID=<fresh-12k-id> \
+  LEHOME_HOST_CODE_ROOT="$LEHOME_HOST_CODE_ROOT" \
+  LEHOME_CAMPAIGN_ROOT="$LEHOME_CAMPAIGN_ROOT" \
+  LEHOME_RUN_ID="$LEHOME_RUN_ID" \
+  LEHOME_ROUND_ID="$LEHOME_ROUND_ID" \
   LEHOME_MAX_WALL_SECONDS=86399 \
   LEHOME_MAX_SPEND_USD=99.00 \
   LEHOME_RUNTIME_IDENTITY_JSON=/mnt/lehome/operator/runtime-identity.json \
@@ -142,10 +236,10 @@ sudo env -i \
 ```
 
 The wrapper admits no provider lifecycle command. It delegates the trusted
-exact-VM stop to the fixed hook only after a terminal outcome. Do not start a
-second worker host or training VM.
+exact-VM stop to the fixed hook only after a terminal outcome. No secret is
+passed on the command line.
 
-## 4. State machine and immediate stops
+## 6. State machine and immediate stops
 
 `calibration-matrix` freezes 400 assignments. `calibration-head` settles the
 first 100 (25/category), then `first-100-gate` checks typed cloth/safety
@@ -167,7 +261,7 @@ and while a child runs. It writes durable budget state. It does not pass the
 budget check to final public publication because the VM is already verified
 stopped at that point.
 
-## 5. Fresh terminal evidence, replay, and publication
+## 7. Fresh terminal evidence, replay, and publication
 
 Every fresh success **and failure** remains terminal evidence. Success replay
 is built only after all 1,000 fresh outcomes plus their receipts are
@@ -191,24 +285,25 @@ The exact VM must have a durable Nebius Compute `STOPPED` observation before
 any final seal or collection completion claim. Report publication and readback
 separately: an upload alone is not completion.
 
-## 6. Preemption and crash recovery
+## 8. Preemption and crash recovery
 
-Preemption resumes only the same immutable partition matrix and same task
-ledger. It may retry incomplete leases; it may not create a seed, duplicate a
-terminal assignment, alter a frozen matrix, or create another VM.
+Preemption resumes only the same immutable partition matrix, task ledger,
+campaign root, and invocation IDs. It may retry incomplete leases; it may not
+create a seed, duplicate a terminal assignment, alter a frozen matrix, or
+create another VM.
 
 After any terminal stop, budget, fidelity, or infrastructure gate, there is no
 automatic paid restart. The only retryable boundary is zero-compute final
 publication after a verified stop. If a process crashed after the durable
-`final-publication.json` but before its local readback receipt, rerun the
-same controller against the same root. It invokes the publisher
-`--reconcile` path: it pins the recorded immutable revision and manifest,
-downloads all files authenticated and anonymously again, and writes only the
-missing `final-publication-readback.json`. A malformed receipt, changed remote
-byte, missing file, or non-public readback fails closed; it must not upload or
-use a mutable branch head.
+`final-publication.json` but before its local readback receipt, rerun the same
+controller against the same root. It invokes the publisher `--reconcile` path:
+it pins the recorded immutable revision and manifest, downloads all files
+authenticated and anonymously again, and writes only the missing
+`final-publication-readback.json`. A malformed receipt, changed remote byte,
+missing file, or non-public readback fails closed; it must not upload or use a
+mutable branch head.
 
-## 7. Status and cleanup checklist
+## 9. Status and cleanup checklist
 
 Report these independently at every stop or operator handoff:
 
