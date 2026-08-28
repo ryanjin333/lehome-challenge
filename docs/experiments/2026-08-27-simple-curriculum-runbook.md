@@ -73,7 +73,8 @@ host or training VM.
 
 These are required **after** `RUNNING` and before the collection command. A
 cloud-init, mount, GPU, original-12K, CPU-cloth, image, or content mismatch is
-an infrastructure stop: stop the exact VM through the trusted hook, report,
+an infrastructure stop: return the terminal handoff, then let the
+operator-local finalizer stop the exact VM, report,
 and do not launch collection.
 
 Run this operator-side command against the already-approved RUNNING VM. It
@@ -232,7 +233,7 @@ past the $99 controller cutoff.
 Run this after catalog readback and immediately before the paid controller. It
 persists the PID beside the invocation record, waits for a fresh receipt, and
 terminates the local observer whenever the controller exits (including after a
-trusted terminal GPU stop). Do not run the paid controller if any command
+terminal handoff). Do not run the paid controller if any command
 below fails.
 
 ```bash
@@ -345,13 +346,12 @@ invalid ratio no greater than 2%, and at least five official successes.
   do not run the remaining 300+600. Stop/report immediately.
 - A stale, malformed, regressing, or >=99.00 spend observation; wall-time
   limit; failed identity/receipt; preemption ambiguity; worker/process error;
-  or stop-hook failure is fail closed. The status is reported as an
+  or finalizer stop failure is fail closed. The status is reported as an
   infrastructure outcome, never a data success.
 
 The controller polls the typed spend receipt before and after every paid stage
-and while a child runs. It writes durable budget state. It does not pass the
-budget check to final public publication because the VM is already verified
-stopped at that point.
+and while a child runs. It writes durable budget state and never publishes on
+the VM; only the post-return local finalizer may publish after STOPPED.
 
 ## 7. Fresh terminal evidence, replay, and publication
 
@@ -381,8 +381,15 @@ finalize_lehome() {
     --hf-token-file "$OPERATOR_HF_TOKEN_FILE" --stop-timeout-seconds 300
 }
 trap 'finalize_lehome' EXIT
-# Run the Section 5 remote controller command once; retain its terminal
-# handoff result.  The EXIT trap invokes the local finalizer even on error.
+# Use the reviewed wrapper for the actual remote command. Its EXIT trap invokes
+# the local finalizer even if controller preparation or handoff persistence
+# fails, so a billed VM cannot be stranded without a fetchable handoff.
+LEHOME_OPERATOR_SSH_TARGET="$OPERATOR_SSH_TARGET" \
+LEHOME_OPERATOR_CAMPAIGN_ROOT="$OPERATOR_CAMPAIGN_ROOT" \
+LEHOME_OPERATOR_RUN_ID="$OPERATOR_RUN_ID" LEHOME_OPERATOR_ROUND_ID="$OPERATOR_ROUND_ID" \
+LEHOME_OPERATOR_HF_TOKEN_FILE="$OPERATOR_HF_TOKEN_FILE" \
+LEHOME_REMOTE_CONTROLLER_COMMAND='sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LEHOME_PAID_COLLECTION=1 LEHOME_HOST_CODE_ROOT=/mnt/lehome/runtime-code/$LEHOME_REVIEWED_REVISION LEHOME_CAMPAIGN_ROOT=/mnt/lehome/campaigns/$LEHOME_RUN_ID LEHOME_RUN_ID=$LEHOME_RUN_ID LEHOME_ROUND_ID=$LEHOME_ROUND_ID LEHOME_MAX_WALL_SECONDS=86399 LEHOME_MAX_SPEND_USD=99.00 LEHOME_RUNTIME_IDENTITY_JSON=/mnt/lehome/operator/runtime-identity.json LEHOME_SPEND_OBSERVER=/mnt/lehome/operator/spend-observation.json /mnt/lehome/runtime-code/$LEHOME_REVIEWED_REVISION/rollout_appliance/run_simple_curriculum_collection.sh' \
+./scripts/run_simple_curriculum_with_finalizer.sh
 ```
 
 The local finalizer pins `computeinstance-u00t6xfqhadrcmssa2`, name

@@ -34,8 +34,15 @@ def test_simple_curriculum_runbook_covers_the_exact_paid_boundary_without_lifecy
     )
     assert all(value in text for value in required)
     assert "A-500" in text and "hard-state" in text and "old rollout" in text
-    assert "never create an image or VM" in text
-    assert "No secret value belongs in this runbook" in text
+
+
+def test_runbook_has_no_removed_remote_stop_hook_or_controller_publication_language() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8").lower()
+    for stale in ("trusted hook", "trusted terminal gpu stop", "stop-hook failure", "controller polls the typed spend receipt before and after every paid stage\nand while a child runs. it writes durable budget state. it does not pass the\nbudget check to final public publication"):
+        assert stale not in text
+    assert "run_simple_curriculum_with_finalizer.sh" in text
+    assert "never create an image or vm" in text
+    assert "no secret value belongs in this runbook" in text
     assert not re.search(r"(?:hf_|api_|access_)?token\s*=\s*['\"][^<'\"\s]{8,}", text, re.I)
     assert not re.search(r"(?:nebius|terraform).*\b(?:create|delete|destroy|start)\b", text, re.I)
 

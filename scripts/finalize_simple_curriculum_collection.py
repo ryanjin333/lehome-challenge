@@ -181,20 +181,23 @@ def fetch_remote_handoff(*, ssh_target: str, port: int, campaign_root: str, dest
 class HfFinalizerPublisher:
     """Compact two-phase public finalization using the reviewed transport."""
     repository = "ryanjin333/lehome-groot-n17-rollouts"
-    def __init__(self, token_path: Path) -> None: self.token_path = token_path
+    def __init__(self, token_path: Path, *, module: object | None = None, transport: object | None = None) -> None:
+        self.token_path = token_path; self._module = module; self._transport = transport
     def publish(self, root: Path, *, handoff: Mapping[str, object], stop_observation: Mapping[str, object], seal: Mapping[str, object]) -> Mapping[str, object]:
-        import importlib.util
-        source = Path(__file__).with_name("publish_simple_curriculum_collection.py")
-        spec = importlib.util.spec_from_file_location("simple_curriculum_publisher", source)
-        assert spec and spec.loader
-        module = importlib.util.module_from_spec(spec); sys.modules[spec.name] = module; spec.loader.exec_module(module)
+        module = self._module
+        if module is None:
+            import importlib.util
+            source = Path(__file__).with_name("publish_simple_curriculum_collection.py")
+            spec = importlib.util.spec_from_file_location("simple_curriculum_publisher", source)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec); sys.modules[spec.name] = module; spec.loader.exec_module(module)
         token = module._load_token(self.token_path)
         _atomic_json(root / "reports" / "operator-stop-handoff.json", handoff)
         _atomic_json(root / "reports" / "stopped-observation.json", stop_observation)
         _atomic_json(root / "seals" / "final-seal.json", seal)
         files = ("reports/operator-stop-handoff.json", "reports/stopped-observation.json", "seals/final-seal.json")
         bundle = module.CollectionPublicationBundle(root=root, run_id=handoff["run_id"], repository=self.repository, revision="main", files=files)
-        transport = module.HuggingFacePublicDatasetTransport()
+        transport = self._transport or module.HuggingFacePublicDatasetTransport()
         prefix = f"collection-rounds/{handoff['run_id']}"
         head = transport.resolve_approved_ref(repository=self.repository, ref="main", token=token)
         existing = module._tree_files(transport.list_tree(repository=self.repository, revision=head, token=token, remote_prefix=prefix), prefix=prefix)

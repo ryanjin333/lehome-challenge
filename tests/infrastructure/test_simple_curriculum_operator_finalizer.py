@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -122,3 +123,26 @@ def test_finalizer_rejects_missing_protected_disk_before_stop_dispatch() -> None
     with __import__("pytest").raises(finalizer.FinalizationError):
         finalizer.stop_exact_instance(Provider(), timeout_seconds=1)
     assert calls == ["get"]
+
+
+def test_hf_finalizer_reconciles_lost_receipt_response_without_second_upload(tmp_path: Path) -> None:
+    finalizer = _module(); calls: list[object] = []
+    class Entry:
+        relative_path = "reports/final-publication.json"
+    class Transport:
+        def resolve_approved_ref(self, **_kwargs): return "a" * 40
+        def list_tree(self, **_kwargs):
+            return ("reports/operator-stop-handoff.json", "reports/stopped-observation.json", "seals/final-seal.json", "reports/final-publication.json")
+        def upload_files(self, **_kwargs): raise AssertionError("lost response retry must not upload again")
+    module = SimpleNamespace(
+        _load_token=lambda _path: "token",
+        CollectionPublicationBundle=lambda **kwargs: SimpleNamespace(**kwargs),
+        _collect_entries=lambda bundle: (Entry(),) if bundle.files == ("reports/final-publication.json",) else (Entry(), Entry(), Entry()),
+        _tree_files=lambda entries, **_kwargs: set(entries),
+        _verify_download=lambda **kwargs: calls.append(kwargs["token"]),
+        HuggingFacePublicDatasetTransport=lambda: Transport(),
+    )
+    handoff = _handoff(finalizer); stopped = {"observation_sha256": "e" * 64}; seal = {"seal_sha256": "f" * 64}
+    result = finalizer.HfFinalizerPublisher(tmp_path / "token", module=module, transport=Transport()).publish(tmp_path, handoff=handoff, stop_observation=stopped, seal=seal)
+    assert result["immutable_revision"] == "a" * 40
+    assert calls == ["token", None]
