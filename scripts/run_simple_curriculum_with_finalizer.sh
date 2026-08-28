@@ -10,7 +10,7 @@ done
 [[ "$LEHOME_OPERATOR_RUN_ID" =~ ^fresh-run-[a-z0-9-]{1,112}$ ]] || { echo "invalid operator run ID" >&2; exit 2; }
 [[ "$LEHOME_OPERATOR_ROUND_ID" =~ ^fresh-12k-[a-z0-9-]{1,112}$ ]] || { echo "invalid operator round ID" >&2; exit 2; }
 [[ "$LEHOME_OPERATOR_REVIEWED_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid reviewed revision" >&2; exit 2; }
-[[ "$LEHOME_OPERATOR_CAMPAIGN_ROOT" == /mnt/lehome/campaigns/* ]] || { echo "invalid campaign root" >&2; exit 2; }
+[[ "$LEHOME_OPERATOR_CAMPAIGN_ROOT" == /mnt/lehome/eval/fresh-run-* ]] || { echo "invalid campaign root" >&2; exit 2; }
 test -f "$LEHOME_OPERATOR_HF_TOKEN_FILE" && test ! -L "$LEHOME_OPERATOR_HF_TOKEN_FILE" && test -s "$LEHOME_OPERATOR_HF_TOKEN_FILE"
 test "$(stat -f '%u %Lp' "$LEHOME_OPERATOR_HF_TOKEN_FILE")" = "0 600"
 
@@ -42,6 +42,6 @@ exec sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/b
   LEHOME_SPEND_OBSERVER=/mnt/lehome/operator/spend-observation.json \
   "$host/rollout_appliance/run_simple_curriculum_collection.sh"
 SH
-ssh -o ClearAllForwardings=yes -o BatchMode=yes -p "${LEHOME_OPERATOR_SSH_PORT:-22}" \
-  "$LEHOME_OPERATOR_SSH_TARGET" sh -lc "$REMOTE_SCRIPT" sh \
+printf '%s\n' "$REMOTE_SCRIPT" | ssh -o ClearAllForwardings=yes -o BatchMode=yes -p "${LEHOME_OPERATOR_SSH_PORT:-22}" \
+  "$LEHOME_OPERATOR_SSH_TARGET" sh -s -- \
   "$LEHOME_OPERATOR_REVIEWED_REVISION" "$LEHOME_OPERATOR_RUN_ID" "$LEHOME_OPERATOR_ROUND_ID" "$LEHOME_OPERATOR_CAMPAIGN_ROOT"

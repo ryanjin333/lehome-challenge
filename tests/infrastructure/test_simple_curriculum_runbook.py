@@ -58,6 +58,8 @@ def test_simple_curriculum_runbook_has_clean_environment_and_staged_catalog_cont
     assert 'test ! -e "$LEHOME_CAMPAIGN_ROOT"' in text
     assert "configs/eval_groot_n17_public_280.json" in text
     assert "catalog-source.sha256" in text and "seen-catalog.sha256" in text
+    assert "LEHOME_REVIEWED_REVISION=%q" in text and "LEHOME_CAMPAIGN_ROOT=%q" in text
+    assert 'test "${LEHOME_CAMPAIGN_ROOT:-}" = "/mnt/lehome/eval/$LEHOME_RUN_ID"' in text
     assert "40 unique seen garments, 10 per category" in text
     assert "do not copy an old rollout input" in text
     assert "same IDs and exact command are reused rather than regenerated" in text
