@@ -80,20 +80,22 @@ creates `/mnt/lehome/runtime-code/<reviewed-revision>` after all remote checks
 pass.
 
 ```bash
+LEHOME_REVIEWED_REVISION="$(git rev-parse HEAD)"
 ./scripts/stage_simple_curriculum_runtime_code.sh --ssh-target "${LEHOME_VM_SSH_TARGET:?set approved SSH target}"
+printf 'staged reviewed revision: %s\n' "$LEHOME_REVIEWED_REVISION"
 ```
 
 Then log in to that same approved VM and run:
 
 ```bash
 set -euo pipefail
-LEHOME_REVIEWED_REVISION=551a85e2105003365a7c33a26af1d5f5924181d7
+LEHOME_REVIEWED_REVISION="${LEHOME_REVIEWED_REVISION:?carry the staged revision from the operator command}"
 LEHOME_HOST_CODE_ROOT="/mnt/lehome/runtime-code/$LEHOME_REVIEWED_REVISION"
 test -d "$LEHOME_HOST_CODE_ROOT" && test ! -L "$LEHOME_HOST_CODE_ROOT"
 cloud-init status --wait
 mountpoint -q /mnt/lehome
 nvidia-smi --query-gpu=name,uuid,driver_version --format=csv,noheader
-git -C "$LEHOME_HOST_CODE_ROOT" rev-parse HEAD
+test "$(git -C "$LEHOME_HOST_CODE_ROOT" rev-parse HEAD)" = "$LEHOME_REVIEWED_REVISION"
 git -C "$LEHOME_HOST_CODE_ROOT" diff --quiet
 test -d "$LEHOME_HOST_CODE_ROOT/source/lehome" && test ! -L "$LEHOME_HOST_CODE_ROOT/source/lehome"
 test -d "$LEHOME_HOST_CODE_ROOT/trainer/src" && test ! -L "$LEHOME_HOST_CODE_ROOT/trainer/src"
@@ -123,7 +125,7 @@ the same IDs and exact command are reused rather than regenerated.
 
 ```bash
 set -euo pipefail
-LEHOME_REVIEWED_REVISION=551a85e2105003365a7c33a26af1d5f5924181d7
+LEHOME_REVIEWED_REVISION="${LEHOME_REVIEWED_REVISION:?carry the staged revision from the operator command}"
 LEHOME_HOST_CODE_ROOT="/mnt/lehome/runtime-code/$LEHOME_REVIEWED_REVISION"
 LEHOME_INVOCATION_FILE=/mnt/lehome/operator/simple-curriculum-invocation.env
 if test -e "$LEHOME_INVOCATION_FILE"; then
