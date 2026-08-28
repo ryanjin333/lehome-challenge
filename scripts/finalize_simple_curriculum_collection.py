@@ -24,6 +24,7 @@ from typing import Mapping, Protocol
 EXACT_INSTANCE_ID = "computeinstance-u00t6xfqhadrcmssa2"
 EXACT_INSTANCE_NAME = "lehome-rollout"
 PROTECTED_DISK_ID = "computedisk-u00pbe55crxy7jr56x"
+TERMINAL_OUTCOMES = frozenset({"complete", "replay_shortage", "fidelity_stop", "infrastructure_stop", "insufficient_source_stop", "infrastructure_stop_failure"})
 
 
 class FinalizationError(RuntimeError):
@@ -67,15 +68,26 @@ def validate_handoff(raw: Mapping[str, object]) -> dict[str, object]:
         raise FinalizationError("operator handoff kind is invalid")
     if payload["instance_id"] != EXACT_INSTANCE_ID or not isinstance(payload["run_id"], str) or not isinstance(payload["round_id"], str):
         raise FinalizationError("operator handoff is not bound to the approved VM")
+    if payload["terminal_outcome"] not in TERMINAL_OUTCOMES:
+        raise FinalizationError("operator handoff outcome is invalid")
     if not _hex(payload["code_revision"], 40) or not _hex(payload["code_tree_sha256"], 64):
         raise FinalizationError("operator handoff code identity is invalid")
     if not isinstance(payload["runtime_identity"], Mapping) or payload["runtime_identity_sha256"] != _digest(dict(payload["runtime_identity"])):
         raise FinalizationError("operator handoff runtime identity is invalid")
     if not isinstance(payload["evidence"], list):
         raise FinalizationError("operator handoff evidence is invalid")
+    stages: set[str] = set()
     for item in payload["evidence"]:
         if not isinstance(item, Mapping) or set(item) != {"stage", "receipt_sha256", "file_sha256"} or not isinstance(item["stage"], str) or not _hex(item["receipt_sha256"], 64) or not _hex(item["file_sha256"], 64):
             raise FinalizationError("operator handoff evidence is invalid")
+        stages.add(item["stage"])
+    outcome = payload["terminal_outcome"]
+    if outcome == "complete" and not {"calibration-matrix", "calibration-head", "first-100-gate", "fresh-report", "replay-matrix", "success-replay"}.issubset(stages):
+        raise FinalizationError("complete handoff lacks required authenticated evidence")
+    if outcome == "replay_shortage" and not {"fresh-report", "replay-matrix"}.issubset(stages):
+        raise FinalizationError("replay shortage handoff lacks required evidence")
+    if outcome in {"fidelity_stop", "insufficient_source_stop"} and "first-100-gate" not in stages:
+        raise FinalizationError("terminal handoff lacks required gate evidence")
     return dict(raw)
 
 
@@ -183,11 +195,37 @@ class HfFinalizerPublisher:
         files = ("reports/operator-stop-handoff.json", "reports/stopped-observation.json", "seals/final-seal.json")
         bundle = module.CollectionPublicationBundle(root=root, run_id=handoff["run_id"], repository=self.repository, revision="main", files=files)
         transport = module.HuggingFacePublicDatasetTransport()
+        prefix = f"collection-rounds/{handoff['run_id']}"
+        head = transport.resolve_approved_ref(repository=self.repository, ref="main", token=token)
+        existing = module._tree_files(transport.list_tree(repository=self.repository, revision=head, token=token, remote_prefix=prefix), prefix=prefix)
+        final_name = "reports/final-publication.json"
+        evidence_names = set(files)
+        if final_name in existing:
+            if set(existing) != evidence_names | {final_name}:
+                raise FinalizationError("immutable finalization prefix collision")
+            # A prior receipt upload may have succeeded while the caller lost
+            # its response.  Reconcile its bytes at the current immutable
+            # revision instead of attempting a second mutable upload.
+            entry = module._collect_entries(module.CollectionPublicationBundle(root=root, run_id=handoff["run_id"], repository=self.repository, revision="main", files=(final_name,)))[0]
+            all_entries = tuple(module._collect_entries(bundle)) + (entry,)
+            for auth in (token, None): module._verify_download(transport=transport, bundle=bundle, revision=head, prefix=prefix, entries=all_entries, token=auth)
+            return {"immutable_revision": head, "readback_verified": True, "public_readback_verified": True}
+        if set(existing) - evidence_names:
+            raise FinalizationError("immutable finalization prefix collision")
         evidence = module.publish_collection_bundle(bundle, token=token, transport=transport)
         receipt = {"schema_version": 1, "kind": "lehome_simple_curriculum_operator_finalization_receipt_v1", "run_id": handoff["run_id"], "round_id": handoff["round_id"], "evidence_revision": evidence.immutable_revision, "evidence_bundle_sha256": evidence.bundle_sha256, "final_seal_sha256": seal["seal_sha256"], "readback_verified": True, "public_readback_verified": True}
         _atomic_json(root / "reports" / "final-publication.json", receipt)
         entry = module._collect_entries(module.CollectionPublicationBundle(root=root, run_id=handoff["run_id"], repository=self.repository, revision="main", files=("reports/final-publication.json",)))[0]
         head = transport.resolve_approved_ref(repository=self.repository, ref="main", token=token)
+        present = module._tree_files(transport.list_tree(repository=self.repository, revision=head, token=token, remote_prefix=evidence.remote_prefix), prefix=evidence.remote_prefix)
+        if final_name in present:
+            if set(present) != evidence_names | {final_name}:
+                raise FinalizationError("immutable finalization prefix collision")
+            all_entries = tuple(evidence.entries) + (entry,)
+            for auth in (token, None): module._verify_download(transport=transport, bundle=bundle, revision=head, prefix=evidence.remote_prefix, entries=all_entries, token=auth)
+            return {"immutable_revision": head, "readback_verified": True, "public_readback_verified": True}
+        if set(present) != evidence_names:
+            raise FinalizationError("immutable finalization prefix collision")
         revision = transport.upload_files(repository=self.repository, revision="main", source=root, entries=(entry,), token=token, remote_prefix=evidence.remote_prefix, parent_commit=head)
         all_entries = tuple(evidence.entries) + (entry,)
         for auth in (token, None): module._verify_download(transport=transport, bundle=bundle, revision=revision, prefix=evidence.remote_prefix, entries=all_entries, token=auth)

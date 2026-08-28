@@ -28,7 +28,7 @@ def test_simple_curriculum_runbook_covers_the_exact_paid_boundary_without_lifecy
         "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
         "40 seen garments", "10 per category", "400", "600", "400 replay", "200 accepted",
         "four persistent workers", "CPU cloth", "CUDA policy", "$100", "first-100",
-        "collection-rounds/<run-id>", "authenticated", "anonymous", "--reconcile",
+        "collection-rounds/<run-id>", "authenticated", "anonymous", "OPERATOR_HF_TOKEN_FILE",
         "fidelity_infrastructure_stop", "insufficient_fresh_source", "collection_complete",
             "operator-stop-handoff.json", "finalize_simple_curriculum_collection.py", "LEHOME_PAID_COLLECTION=1",
     )

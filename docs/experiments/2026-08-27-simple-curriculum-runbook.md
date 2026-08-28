@@ -363,13 +363,22 @@ the finalizer fetches only the compact handoff into a temporary directory and
 always calls exact-ID Compute `get`/`stop`/`get` before any Hub upload.
 
 ```bash
+# Run this block on the operator machine, not inside the VM.  These are
+# operator-local values persisted before starting the one approved VM.
 set -euo pipefail
+OPERATOR_RUN_ID="${LEHOME_RUN_ID:?persisted fresh run ID}"
+OPERATOR_ROUND_ID="${LEHOME_ROUND_ID:?persisted fresh 12K round ID}"
+OPERATOR_CAMPAIGN_ROOT="${LEHOME_CAMPAIGN_ROOT:?persisted remote campaign root}"
+OPERATOR_SSH_TARGET="${LEHOME_VM_SSH_TARGET:?approved SSH target}"
+OPERATOR_HF_TOKEN_FILE="${LEHOME_OPERATOR_HF_TOKEN_FILE:?local root-owned 0600 token path}"
+test -f "$OPERATOR_HF_TOKEN_FILE" && test ! -L "$OPERATOR_HF_TOKEN_FILE" && test -s "$OPERATOR_HF_TOKEN_FILE"
+test "$(stat -f '%u %Lp' "$OPERATOR_HF_TOKEN_FILE")" = "0 600"
 finalize_lehome() {
   uv run --project trainer python3 scripts/finalize_simple_curriculum_collection.py \
-    --ssh-target "$LEHOME_VM_SSH_TARGET" --ssh-port "${LEHOME_VM_SSH_PORT:-22}" \
-    --remote-campaign-root "$LEHOME_CAMPAIGN_ROOT" \
-    --run-id "$LEHOME_RUN_ID" --round-id "$LEHOME_ROUND_ID" \
-    --hf-token-file /mnt/lehome/secrets/hf_token --stop-timeout-seconds 300
+    --ssh-target "$OPERATOR_SSH_TARGET" --ssh-port "${LEHOME_VM_SSH_PORT:-22}" \
+    --remote-campaign-root "$OPERATOR_CAMPAIGN_ROOT" \
+    --run-id "$OPERATOR_RUN_ID" --round-id "$OPERATOR_ROUND_ID" \
+    --hf-token-file "$OPERATOR_HF_TOKEN_FILE" --stop-timeout-seconds 300
 }
 trap 'finalize_lehome' EXIT
 # Run the Section 5 remote controller command once; retain its terminal
@@ -415,15 +424,14 @@ create a seed, duplicate a terminal assignment, alter a frozen matrix, or
 create another VM.
 
 After any terminal stop, budget, fidelity, or infrastructure gate, there is no
-automatic paid restart. The only retryable boundary is zero-compute final
-publication after a verified stop. If a process crashed after the durable
-`final-publication.json` but before its local readback receipt, rerun the same
-controller against the same root. It invokes the publisher `--reconcile` path:
-it pins the recorded immutable revision and manifest, downloads all files
-authenticated and anonymously again, and writes only the missing
-`final-publication-readback.json`. A malformed receipt, changed remote byte,
-missing file, or non-public readback fails closed; it must not upload or use a
-mutable branch head.
+automatic paid restart. The only retryable boundary is the local finalizer's
+zero-compute public readback after verified stop. If it crashes or loses the
+response after uploading `final-publication.json`, rerun the same local
+finalizer with the same persisted operator variables. It pins and re-reads the
+existing immutable prefix authenticated and anonymously; it never reruns the
+controller, creates compute, or uses a different run/round. A malformed
+receipt, changed remote byte, missing file, or non-public readback fails
+closed and leaves the VM stopped.
 
 ## 9. Status and cleanup checklist
 

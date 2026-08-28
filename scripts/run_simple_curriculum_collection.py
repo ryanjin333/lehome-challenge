@@ -47,6 +47,7 @@ _ORIGINAL_12K = {
 }
 _RUNTIME_KEYS = frozenset(_ORIGINAL_12K) | frozenset({"rollout_image", "trainer_image"})
 _TRUSTED_GPU_STOP = "/usr/local/libexec/lehome-stop-gpu"
+_TERMINAL_OUTCOMES = frozenset({"complete", "replay_shortage", "fidelity_stop", "infrastructure_stop", "insufficient_source_stop", "infrastructure_stop_failure"})
 _EXACT_ROLLOUT_INSTANCE_ID = "computeinstance-u00t6xfqhadrcmssa2"
 _STAGE_ARTIFACTS = {
     "calibration-matrix": frozenset({"matrix", "matrix_receipt"}),
@@ -1751,7 +1752,8 @@ def _operator_stop_handoff(
     journal: StageJournal, config: CollectionConfig, *, predecessor: str | None, outcome: str,
 ) -> str:
     """Persist the running VM's compact terminal handoff; never self-stop or publish."""
-    root = _canonical_root(config)
+    if outcome not in _TERMINAL_OUTCOMES:
+        raise ReceiptMismatchError("operator handoff outcome is invalid")
     # Every completed stage passed its authenticated output validation before
     # its immutable receipt was written.  Re-hash those durable receipts here;
     # deep source traversal remains owned by the stage-specific controllers,
@@ -1824,8 +1826,6 @@ def _rehash_terminal_journal(journal: StageJournal) -> None:
 def run_collection(config: CollectionConfig, *, runner: Runner) -> str:
     """Run/recover the only permitted state machine; returns its data outcome."""
     config.validate()
-    if isinstance(runner, CommandRunner):
-        _prepare_controller_inputs(config)
     journal = StageJournal(config); predecessor: str | None = None
     if isinstance(runner, CommandRunner):
         runner.budget_check = journal.check_budget
@@ -1850,6 +1850,17 @@ def run_collection(config: CollectionConfig, *, runner: Runner) -> str:
                 journal, runner, predecessor=stop_receipt, terminal_outcome=existing_terminal,
             )
         return existing_terminal
+    if isinstance(runner, CommandRunner):
+        # Paid in-VM preparation can fail after the VM is already billed.  It
+        # is part of the terminal safety boundary, never an unguarded prelude.
+        try:
+            _prepare_controller_inputs(config)
+        except Exception:
+            if config.paid:
+                return _operator_stop_handoff(
+                    journal, config, predecessor=None, outcome="infrastructure_stop_failure",
+                )
+            raise
     try:
         calibration_matrix, predecessor = _stage(journal, runner, "calibration-matrix", predecessor)
         calibration_partition = _partition_from_stage(config, calibration_matrix["output"], partition_id="calibration-head", start=0, end=100)
