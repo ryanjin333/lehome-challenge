@@ -228,6 +228,14 @@ def _successes(
                     or (isinstance(simulator_device, str) and _CUDA_DEVICE.fullmatch(simulator_device))
                 )
                 or (require_cpu and simulator_device != "cpu")
+                or (
+                    require_annotations
+                    and episode.get("randomization") != {"strategy": "canonical"}
+                )
+                or (
+                    require_annotations
+                    and reset.get("randomization") != {"strategy": "canonical"}
+                )
                 or reset.get("garment_name") != garment
                 or reset.get("schema_version") != expected_schema
                 or reset.get("cloth_state_authority") != cloth_frame
@@ -239,6 +247,11 @@ def _successes(
                 or continuation.get("garment_name") != garment
                 or not isinstance(continuation.get("randomization"), Mapping)
                 or continuation["randomization"].get("continuation_step") != 16
+                or (
+                    require_annotations
+                    and continuation.get("randomization")
+                    != {"strategy": "canonical", "continuation_step": 16}
+                )
             ):
                 raise ValueError("accepted early continuation snapshot is incompatible")
             grouped[str(category)].append(
@@ -251,6 +264,7 @@ def _successes(
                     "restore_snapshot_step": 16,
                     "accepted_root": accepted_root,
                     "episode_root": episode_root,
+                    "episode_path": episode_path,
                     "episode_sha256": _episode_artifact_sha256(episode_root)
                     if require_annotations else None,
                     "reset_sha256": _sha256(reset_path) if require_annotations else None,
@@ -310,6 +324,8 @@ def _fresh_source_parents(
                 or row.get("category") not in CATEGORIES
                 or not isinstance(row.get("garment_name"), str) or not row["garment_name"]
                 or row.get("release_stage") != "seen"
+                or not isinstance(row.get("campaign_round_id"), str)
+                or not isinstance(row.get("campaign_run_id"), str)
             ):
                 raise ValueError("fresh source matrix identity is invalid")
             matrix_attempts.add(attempt_id)
@@ -326,7 +342,7 @@ def _fresh_source_parents(
         if (
             set(report) != {
                 "schema_version", "kind", "campaign_kind", "round_id", "matrix_sha256",
-                "identity", "trials", "safety_failure", "report_sha256",
+                "identity", "trials", "safety_failure", "report_sha256", "run_id",
             }
             or declared != hashlib.sha256(_canonical_bytes(body)).hexdigest()
             or report.get("schema_version") != 1
@@ -334,6 +350,8 @@ def _fresh_source_parents(
             or report.get("campaign_kind") != "fresh_12k_success_source_v1"
             or not isinstance(report.get("round_id"), str)
             or re.fullmatch(r"fresh-12k-[a-z0-9-]{1,112}", report["round_id"]) is None
+            or not isinstance(report.get("run_id"), str)
+            or re.fullmatch(r"fresh-run-[a-z0-9-]{1,112}", report["run_id"]) is None
             or report.get("safety_failure") is not False
             or not isinstance(report.get("identity"), Mapping)
             or report["identity"] != {
@@ -370,13 +388,18 @@ def _fresh_source_parents(
                 or not isinstance(trial.get("hub_sync_receipt_sha256"), str)
                 or _SHA256.fullmatch(trial["hub_sync_receipt_sha256"]) is None
                 or trial.get("remote_prefix") != f"rollout-rounds/{report['round_id']}/{attempt_id}"
+                or trial.get("campaign_round_id") != report["round_id"]
+                or trial.get("campaign_run_id") != report["run_id"]
             ):
                 raise ValueError("fresh source report trial is not an eligible CPU source")
             report_trials[attempt_id] = (trial, report, report_sha256)
             report_context[attempt_id] = {
+                "source_report_path": str(path),
                 "source_report_sha256": report_sha256,
+                "source_matrix_path": str(matrices[report["matrix_sha256"]][0]),
                 "source_matrix_sha256": report["matrix_sha256"],
                 "source_round_id": report["round_id"],
+                "source_run_id": report["run_id"],
             }
     if set(report_trials) != matrix_attempts:
         raise ValueError("every fresh source must appear in exactly one report and source matrix")
@@ -411,6 +434,8 @@ def _fresh_source_parents(
             )
             or trial.get("garment_name") != parent["garment"]
             or trial.get("artifact_sha256") != parent["episode_sha256"]
+            or matrix_rows[attempt_id].get("campaign_round_id") != report["round_id"]
+            or matrix_rows[attempt_id].get("campaign_run_id") != report["run_id"]
         ):
             raise ValueError("fresh source success identity is not authenticated")
         receipt_path = Path(parent["accepted_root"]).parent / "hf-sync-receipts" / f"{attempt_id}.sync.json"
@@ -420,8 +445,15 @@ def _fresh_source_parents(
             or receipt.get("readback_verified") is not True
             or receipt.get("attempt_id") != attempt_id
             or receipt.get("round_id") != report["round_id"]
+            or receipt.get("run_id") != report["run_id"]
             or receipt.get("remote_prefix") != trial.get("remote_prefix")
             or receipt.get("episode_sha256") != parent["episode_sha256"]
+            or not isinstance((episode := _load_json(
+                Path(parent["episode_root"]) / "raw" / attempt_id / "episode.json",
+                label="fresh source episode",
+            )).get("identity"), Mapping)
+            or episode["identity"].get("campaign_round_id") != report["round_id"]
+            or episode["identity"].get("campaign_run_id") != report["run_id"]
             or not isinstance(receipt.get("immutable_revision"), str)
             or re.fullmatch(r"[0-9a-f]{40}", receipt["immutable_revision"]) is None
         ):
@@ -430,8 +462,10 @@ def _fresh_source_parents(
             {
                 **report_context[attempt_id],
                 "source_receipt_sha256": _sha256(receipt_path),
+                "source_receipt_path": str(receipt_path),
                 "source_remote_prefix": receipt["remote_prefix"],
                 "source_immutable_revision": receipt["immutable_revision"],
+                "source_run_id": report["run_id"],
                 "fresh_success_rate": fresh_rates[(str(trial["category"]), str(trial["garment_name"]))][0]
                 / fresh_rates[(str(trial["category"]), str(trial["garment_name"]))][1],
             }
@@ -614,16 +648,21 @@ def build_success_replay_matrix(
                 row.update(
                     {
                         "source_episode_sha256": parent["episode_sha256"],
+                        "source_episode_path": str(parent["episode_path"]),
                         "source_reset_sha256": parent["reset_sha256"],
                         "source_annotations_sha256": parent["annotations_sha256"],
                         "source_continuation_snapshot_sha256": parent["restore_snapshot_sha256"],
                         "source_state_fingerprint": parent["continuation_state_fingerprint"],
                         "source_report_sha256": parent["source_report_sha256"],
+                        "source_report_path": parent["source_report_path"],
                         "source_matrix_sha256": parent["source_matrix_sha256"],
+                        "source_matrix_path": parent["source_matrix_path"],
                         "source_receipt_sha256": parent["source_receipt_sha256"],
+                        "source_receipt_path": parent["source_receipt_path"],
                         "source_remote_prefix": parent["source_remote_prefix"],
                         "source_immutable_revision": parent["source_immutable_revision"],
                         "source_round_id": parent["source_round_id"],
+                        "source_run_id": parent["source_run_id"],
                     }
                 )
             rows.append(row)

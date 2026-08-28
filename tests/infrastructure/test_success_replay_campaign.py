@@ -53,10 +53,121 @@ def _fresh_visual_only_matrix() -> list[dict[str, object]]:
             "source_remote_prefix": f"rollout-rounds/fresh-12k-source-20260827/parent-{category}",
             "source_immutable_revision": "a" * 40,
             "source_round_id": "fresh-12k-source-20260827",
+            "source_run_id": "fresh-run-20260827-a",
         }
         for category_index, category in enumerate(("top_long", "top_short", "pant_long", "pant_short"))
         for index in range(100)
     ]
+
+
+def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dict[str, str]]:
+    """Create actual report/matrix bytes bound to the fresh replay rows."""
+
+    rows = _fresh_visual_only_matrix()
+    source_rows = [
+        {
+            "attempt_id": f"parent-{category}",
+            "trial_id": f"parent-{category}",
+            "category": category,
+            "garment_name": f"{category}-garment",
+            "release_stage": "seen",
+            "campaign_round_id": "fresh-12k-source-20260827",
+            "campaign_run_id": "fresh-run-20260827-a",
+        }
+        for category in ("top_long", "top_short", "pant_long", "pant_short")
+    ]
+    source_matrix = tmp_path / "fresh-source-matrix.json"
+    source_matrix_bytes = (json.dumps(source_rows, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    source_matrix.write_bytes(source_matrix_bytes)
+    source_matrix_sha = hashlib.sha256(source_matrix_bytes).hexdigest()
+    source_episodes: dict[str, Path] = {}
+    source_snapshots: dict[str, Path] = {}
+    source_receipts: dict[str, Path] = {}
+    for category in ("top_long", "top_short", "pant_long", "pant_short"):
+        episode = tmp_path / f"parent-{category}.episode.json"
+        episode.write_text(
+            json.dumps(
+                {
+                    "identity": {
+                        "campaign_round_id": "fresh-12k-source-20260827",
+                        "campaign_run_id": "fresh-run-20260827-a",
+                    },
+                    "randomization": {"strategy": "canonical"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        snapshot = tmp_path / f"parent-{category}.000016.json"
+        snapshot.write_text(
+            json.dumps({"randomization": {"strategy": "canonical", "continuation_step": 16}}),
+            encoding="utf-8",
+        )
+        source_episodes[category], source_snapshots[category] = episode, snapshot
+        receipt = tmp_path / f"parent-{category}.sync.json"
+        receipt.write_text(
+            json.dumps(
+                {
+                    "readback_verified": True,
+                    "round_id": "fresh-12k-source-20260827",
+                    "run_id": "fresh-run-20260827-a",
+                    "episode_sha256": "b" * 64,
+                    "remote_prefix": f"rollout-rounds/fresh-12k-source-20260827/parent-{category}",
+                }
+            ),
+            encoding="utf-8",
+        )
+        source_receipts[category] = receipt
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "lehome_fresh_12k_success_source_report_v1",
+        "campaign_kind": "fresh_12k_success_source_v1",
+        "round_id": "fresh-12k-source-20260827",
+        "run_id": "fresh-run-20260827-a",
+        "matrix_sha256": source_matrix_sha,
+        "identity": {
+            "policy_repo": "ryanjin333/lehome-groot-n17-models",
+            "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
+            "policy_step": 12000,
+            "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
+        },
+        "trials": [
+            {
+                "attempt_id": f"parent-{category}", "category": category,
+                "garment_name": f"{category}-garment", "accepted_success": True,
+                "outcome": "success", "simulator_device": "cpu", "cloth_device": "cpu",
+                "safety_failure": False, "numerical_failure": False, "cloth_failure": False,
+                "artifact_sha256": "b" * 64,
+                "hub_sync_receipt_sha256": hashlib.sha256(source_receipts[category].read_bytes()).hexdigest(),
+                "remote_prefix": f"rollout-rounds/fresh-12k-source-20260827/parent-{category}",
+                "campaign_round_id": "fresh-12k-source-20260827",
+                "campaign_run_id": "fresh-run-20260827-a",
+            }
+            for category in ("top_long", "top_short", "pant_long", "pant_short")
+        ],
+        "safety_failure": False,
+    }
+    body = json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
+    report["report_sha256"] = hashlib.sha256(body.encode()).hexdigest()
+    source_report = tmp_path / "fresh-source-report.json"
+    source_report_bytes = (json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    source_report.write_bytes(source_report_bytes)
+    source_report_sha = hashlib.sha256(source_report_bytes).hexdigest()
+    for row in rows:
+        category = str(row["category"])
+        row["source_report_path"] = str(source_report)
+        row["source_matrix_path"] = str(source_matrix)
+        row["source_report_sha256"] = source_report_sha
+        row["source_matrix_sha256"] = source_matrix_sha
+        row["source_episode_path"] = str(source_episodes[category])
+        row["restore_snapshot"] = str(source_snapshots[category])
+        row["restore_snapshot_sha256"] = hashlib.sha256(source_snapshots[category].read_bytes()).hexdigest()
+        row["source_continuation_snapshot_sha256"] = row["restore_snapshot_sha256"]
+        row["source_receipt_path"] = str(source_receipts[category])
+        row["source_receipt_sha256"] = hashlib.sha256(source_receipts[category].read_bytes()).hexdigest()
+    return rows, {
+        "LEHOME_FRESH_SOURCE_REPORTS_JSON": json.dumps([{"path": str(source_report), "sha256": source_report_sha}]),
+        "LEHOME_FRESH_SOURCE_MATRICES_JSON": json.dumps([{"path": str(source_matrix), "sha256": source_matrix_sha}]),
+    }
 
 
 def test_success_replay_wrapper_is_pinned_to_the_four_worker_original_12k_campaign() -> None:
@@ -227,10 +338,9 @@ def test_success_replay_wrapper_admits_200_only_for_exact_fresh_visual_only_tupl
         encoding="utf-8",
     )
     appliance.chmod(0o755)
+    rows, source_environment = _fresh_evidence_matrix(tmp_path)
     matrix = tmp_path / "fresh-matrix.json"
-    encoded = _canonical_matrix = (
-        json.dumps(_fresh_visual_only_matrix(), sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode("utf-8")
+    encoded = (json.dumps(rows, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     matrix.write_bytes(encoded)
     digest = hashlib.sha256(encoded).hexdigest()
     (tmp_path / "fresh-matrix.json.sha256").write_text(digest + "\n", encoding="ascii")
@@ -241,6 +351,7 @@ def test_success_replay_wrapper_admits_200_only_for_exact_fresh_visual_only_tupl
         "LEHOME_MAX_ATTEMPTS": "400",
         "LEHOME_TARGET_ACCEPTED": "200",
         "LEHOME_CAPTURE": str(capture),
+        **source_environment,
     }
 
     accepted = subprocess.run(["bash", str(wrapper)], env=environment, capture_output=True, text=True, check=False)
@@ -266,6 +377,41 @@ def test_success_replay_wrapper_admits_200_only_for_exact_fresh_visual_only_tupl
         check=False,
     )
     assert base_only.returncode == 0, base_only.stderr
+
+    report = Path(json.loads(source_environment["LEHOME_FRESH_SOURCE_REPORTS_JSON"])[0]["path"])
+    original_report = report.read_bytes()
+    report.write_text("{}", encoding="utf-8")
+    tampered = subprocess.run(
+        ["bash", str(wrapper)], env=environment, capture_output=True, text=True, check=False
+    )
+    assert tampered.returncode != 0
+    assert "source report" in tampered.stderr
+    direct_tampered = subprocess.run(
+        ["bash", str(BASE_CAMPAIGN)],
+        env=environment | {
+            "LEHOME_ATTEMPT_MATRIX": str(matrix),
+            "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+            "LEHOME_WORKER_COUNT": "4",
+            "LEHOME_ENABLE_HF_UPLOAD": "1",
+            "LEHOME_SIMULATOR_DEVICE": "cpu",
+            "LEHOME_SUCCESS_REPLAY_CAMPAIGN": "1",
+            "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+            "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "base-campaign-tampered"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert direct_tampered.returncode != 0
+    assert "source report" in direct_tampered.stderr
+    report.write_bytes(original_report)
+    source_matrix = Path(json.loads(source_environment["LEHOME_FRESH_SOURCE_MATRICES_JSON"])[0]["path"])
+    source_matrix.write_text("[]", encoding="utf-8")
+    matrix_tampered = subprocess.run(
+        ["bash", str(wrapper)], env=environment, capture_output=True, text=True, check=False
+    )
+    assert matrix_tampered.returncode != 0
+    assert "source matrix" in matrix_tampered.stderr
 
     rejected = subprocess.run(
         ["bash", str(wrapper)],

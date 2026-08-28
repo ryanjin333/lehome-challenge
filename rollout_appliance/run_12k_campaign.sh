@@ -56,6 +56,8 @@ CONTROLLED_RECOVERY_SMOKE_MATERIALIZATION_SHA256="${LEHOME_CONTROLLED_RECOVERY_M
 CONTROLLED_RECOVERY_SMOKE_ROW_INDEX="${LEHOME_CONTROLLED_RECOVERY_SMOKE_ROW_INDEX:-}"
 SNAPSHOT_SOURCE_BOOTSTRAP="${LEHOME_SNAPSHOT_SOURCE_BOOTSTRAP:-0}"
 SUCCESS_REPLAY_CAMPAIGN="${LEHOME_SUCCESS_REPLAY_CAMPAIGN:-0}"
+FRESH_SOURCE_REPORTS="${LEHOME_FRESH_SOURCE_REPORTS_JSON:-}"
+FRESH_SOURCE_MATRICES="${LEHOME_FRESH_SOURCE_MATRICES_JSON:-}"
 HARD_STATE_CAMPAIGN="${LEHOME_HARD_STATE_CAMPAIGN:-0}"
 SIMPLE_CURRICULUM_COLLECTION="${LEHOME_SIMPLE_CURRICULUM_COLLECTION:-0}"
 FIDELITY_DIAGNOSTIC="${LEHOME_FIDELITY_DIAGNOSTIC:-0}"
@@ -457,22 +459,24 @@ for row in rows:
     attempt_ids.add(attempt_id); trial_ids.add(trial_id); seeds.add(seed)
 PY
 elif [ "${SUCCESS_REPLAY_CAMPAIGN}" = "1" ] && [ "${TARGET_ACCEPTED}" = "200" ]; then
-  python3 - "${MATRIX}" "${MAX_ATTEMPTS}" <<'PY'
+  python3 - "${MATRIX}" "${MAX_ATTEMPTS}" "${FRESH_SOURCE_REPORTS}" "${FRESH_SOURCE_MATRICES}" <<'PY'
 import json, re, sys
 from collections import Counter
 from pathlib import Path
 
 path, max_attempts = Path(sys.argv[1]), int(sys.argv[2])
+report_evidence, matrix_evidence = sys.argv[3], sys.argv[4]
 try:
     rows = json.loads(path.read_text(encoding="utf-8"))
 except (OSError, ValueError) as error:
     raise SystemExit(f"fresh visual-only replay matrix is malformed: {error}")
 categories = ("top_long", "top_short", "pant_long", "pant_short")
 fresh = {
-    "source_episode_sha256", "source_reset_sha256", "source_annotations_sha256",
+    "source_episode_sha256", "source_episode_path", "source_reset_sha256", "source_annotations_sha256",
     "source_continuation_snapshot_sha256", "source_state_fingerprint",
-    "source_report_sha256", "source_matrix_sha256", "source_receipt_sha256",
-    "source_remote_prefix", "source_immutable_revision", "source_round_id",
+    "source_report_sha256", "source_matrix_sha256", "source_receipt_sha256", "source_receipt_path",
+    "source_remote_prefix", "source_immutable_revision", "source_round_id", "source_run_id",
+    "source_report_path", "source_matrix_path",
 }
 if not isinstance(rows, list) or (len(rows), max_attempts) != (400, 400):
     raise SystemExit("fresh visual-only replay requires exactly 400 rows")
@@ -492,10 +496,12 @@ for row in rows:
         or not fresh <= set(row)
         or any(
             not isinstance(row[field], str) or re.fullmatch(r"[0-9a-f]{64}", row[field]) is None
-            for field in fresh - {"source_remote_prefix", "source_immutable_revision", "source_round_id"}
+            for field in fresh - {"source_episode_path", "source_report_path", "source_matrix_path", "source_receipt_path", "source_remote_prefix", "source_immutable_revision", "source_round_id", "source_run_id"}
         )
         or not isinstance(row.get("source_round_id"), str)
         or re.fullmatch(r"fresh-12k-[a-z0-9-]{1,112}", row["source_round_id"]) is None
+        or not isinstance(row.get("source_run_id"), str)
+        or re.fullmatch(r"fresh-run-[a-z0-9-]{1,112}", row["source_run_id"]) is None
         or row.get("source_remote_prefix")
         != f"rollout-rounds/{row['source_round_id']}/{row.get('parent_episode_id')}"
         or not isinstance(row.get("source_immutable_revision"), str)
@@ -505,6 +511,82 @@ for row in rows:
     attempts.add(attempt_id); seeds.add(seed); counts[category] += 1
 if counts != Counter({category: 100 for category in categories}):
     raise SystemExit("fresh visual-only replay requires at most 100 rows per category")
+def strict_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value: raise ValueError("duplicate JSON field")
+        value[key] = item
+    return value
+def evidence(raw, label):
+    try: values = json.loads(raw, object_pairs_hook=strict_pairs)
+    except ValueError as error: raise SystemExit(f"fresh {label} evidence is malformed: {error}")
+    if not isinstance(values, list) or not values: raise SystemExit(f"fresh {label} evidence is required")
+    found = {}
+    for item in values:
+        if not isinstance(item, dict) or set(item) != {"path", "sha256"}: raise SystemExit(f"fresh {label} evidence is malformed")
+        item_path, digest = Path(item.get("path", "")), item.get("sha256")
+        if (not item_path.is_absolute() or item_path.is_symlink() or not item_path.is_file() or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or __import__("hashlib").sha256(item_path.read_bytes()).hexdigest() != digest
+                or str(item_path) in found): raise SystemExit(f"fresh {label} evidence is missing or tampered")
+        found[str(item_path)] = (digest, item_path)
+    return found
+reports, matrices = evidence(report_evidence, "source report"), evidence(matrix_evidence, "source matrix")
+parsed_matrices, parsed_reports = {}, {}
+for item_path, (_, file_path) in matrices.items():
+    try: source_rows = json.loads(file_path.read_text(encoding="utf-8"), object_pairs_hook=strict_pairs)
+    except ValueError as error: raise SystemExit(f"fresh source matrix is malformed: {error}")
+    if not isinstance(source_rows, list): raise SystemExit("fresh source matrix is malformed")
+    parsed_matrices[item_path] = {row.get("attempt_id"): row for row in source_rows if isinstance(row, dict)}
+for item_path, (_, file_path) in reports.items():
+    try: report = json.loads(file_path.read_text(encoding="utf-8"), object_pairs_hook=strict_pairs)
+    except ValueError as error: raise SystemExit(f"fresh source report is malformed: {error}")
+    if not isinstance(report, dict): raise SystemExit("fresh source report is malformed")
+    body = dict(report); declared = body.pop("report_sha256", None)
+    if declared != __import__("hashlib").sha256((json.dumps(body, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest(): raise SystemExit("fresh source report authentication failed")
+    parsed_reports[item_path] = report
+for row in rows:
+    report_path, matrix_path = row.get("source_report_path"), row.get("source_matrix_path")
+    if (not isinstance(report_path, str) or not isinstance(matrix_path, str)
+            or report_path not in reports or matrix_path not in matrices
+            or row.get("source_report_sha256") != reports[report_path][0]
+            or row.get("source_matrix_sha256") != matrices[matrix_path][0]): raise SystemExit("fresh source report or matrix binding is invalid")
+    report, source_row = parsed_reports[report_path], parsed_matrices[matrix_path].get(row.get("parent_episode_id"))
+    trials = report.get("trials") if isinstance(report.get("trials"), list) else []
+    trial = next((item for item in trials if isinstance(item, dict) and item.get("attempt_id") == row.get("parent_episode_id")), None)
+    if (
+        report.get("matrix_sha256") != row.get("source_matrix_sha256")
+        or report.get("round_id") != row.get("source_round_id") or report.get("run_id") != row.get("source_run_id")
+        or not isinstance(source_row, dict) or source_row.get("category") != row.get("category")
+        or source_row.get("garment_name") != row.get("garment")
+        or source_row.get("campaign_round_id") != row.get("source_round_id")
+        or source_row.get("campaign_run_id") != row.get("source_run_id")
+        or not isinstance(trial, dict) or trial.get("accepted_success") is not True or trial.get("outcome") != "success"
+        or trial.get("artifact_sha256") != row.get("source_episode_sha256")
+        or trial.get("campaign_round_id") != row.get("source_round_id") or trial.get("campaign_run_id") != row.get("source_run_id")
+    ): raise SystemExit("fresh source report/matrix row is not authenticated")
+    episode, snapshot, receipt = Path(row.get("source_episode_path", "")), Path(row.get("restore_snapshot", "")), Path(row.get("source_receipt_path", ""))
+    if (not episode.is_absolute() or episode.is_symlink() or not episode.is_file()
+            or not snapshot.is_absolute() or snapshot.is_symlink() or not snapshot.is_file()
+            or not receipt.is_absolute() or receipt.is_symlink() or not receipt.is_file()): raise SystemExit("fresh source episode, snapshot, or receipt is missing")
+    if (__import__("hashlib").sha256(snapshot.read_bytes()).hexdigest() != row.get("restore_snapshot_sha256")
+            or row.get("restore_snapshot_sha256") != row.get("source_continuation_snapshot_sha256")):
+        raise SystemExit("fresh source continuation snapshot binding is invalid")
+    try:
+        episode_json = json.loads(episode.read_text(encoding="utf-8"), object_pairs_hook=strict_pairs)
+        snapshot_json = json.loads(snapshot.read_text(encoding="utf-8"), object_pairs_hook=strict_pairs)
+    except ValueError as error: raise SystemExit(f"fresh source episode or snapshot is malformed: {error}")
+    try: receipt_json = json.loads(receipt.read_text(encoding="utf-8"), object_pairs_hook=strict_pairs)
+    except ValueError as error: raise SystemExit(f"fresh source receipt is malformed: {error}")
+    identity = episode_json.get("identity") if isinstance(episode_json, dict) else None
+    if (not isinstance(identity, dict) or episode_json.get("randomization") != {"strategy": "canonical"}
+            or identity.get("campaign_round_id") != row.get("source_round_id") or identity.get("campaign_run_id") != row.get("source_run_id")
+            or snapshot_json.get("randomization") != {"strategy": "canonical", "continuation_step": 16}
+            or __import__("hashlib").sha256(receipt.read_bytes()).hexdigest() != row.get("source_receipt_sha256")
+            or not isinstance(receipt_json, dict) or receipt_json.get("readback_verified") is not True
+            or receipt_json.get("round_id") != row.get("source_round_id") or receipt_json.get("run_id") != row.get("source_run_id")
+            or receipt_json.get("episode_sha256") != row.get("source_episode_sha256")
+            or receipt_json.get("remote_prefix") != row.get("source_remote_prefix")): raise SystemExit("fresh source canonical replay boundary is invalid")
 PY
 elif [ "${SKIP_ROUND_SEAL}" = "1" ] && [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" = "1" ]; then
   if [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || ! [[ "${WORKER_COUNT}" =~ ^(1|4)$ ]] \

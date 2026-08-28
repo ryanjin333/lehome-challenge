@@ -35,7 +35,10 @@ def _write_success(
             "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
             "policy_step": 12000,
             "asset_revision": "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9",
+            "campaign_round_id": "fresh-12k-source-20260827",
+            "campaign_run_id": "fresh-run-20260827-a",
         },
+        "randomization": {"strategy": "canonical"},
         "provenance": {
             "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
             "simulator_device": simulator_device,
@@ -116,6 +119,13 @@ def _artifact_digest(episode_root: Path) -> str:
     return hashlib.sha256(_canonical(entries)).hexdigest()
 
 
+def _refresh_checksum(episode_root: Path, relative: str) -> None:
+    path = episode_root / relative
+    checksums = json.loads((episode_root / "SHA256SUMS.json").read_text(encoding="utf-8"))
+    checksums[relative] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "size": path.stat().st_size}
+    (episode_root / "SHA256SUMS.json").write_bytes(_canonical(checksums))
+
+
 def _write_fresh_sources(accepted: Path) -> tuple[Path, Path]:
     """Write the authenticated source-evidence shape consumed by fresh mode."""
 
@@ -137,6 +147,8 @@ def _write_fresh_sources(accepted: Path) -> tuple[Path, Path]:
                 "garment_name": identity["garment_name"],
                 "release_stage": "seen",
                 "strategy": "canonical",
+                "campaign_round_id": identity["campaign_round_id"],
+                "campaign_run_id": identity["campaign_run_id"],
             }
         )
     matrix_path = accepted.parent / "fresh-source-matrix.json"
@@ -154,6 +166,7 @@ def _write_fresh_sources(accepted: Path) -> tuple[Path, Path]:
             "attempt_id": attempt_id,
             "repository": "ryanjin333/lehome-groot-n17-rollouts",
             "round_id": "fresh-12k-source-20260827",
+            "run_id": "fresh-run-20260827-a",
             "remote_prefix": f"rollout-rounds/fresh-12k-source-20260827/{attempt_id}",
             "publication_ref": "main",
             "immutable_revision": "a" * 40,
@@ -178,6 +191,8 @@ def _write_fresh_sources(accepted: Path) -> tuple[Path, Path]:
                 "artifact_sha256": artifact_sha256,
                 "hub_sync_receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
                 "remote_prefix": receipt["remote_prefix"],
+                "campaign_round_id": "fresh-12k-source-20260827",
+                "campaign_run_id": "fresh-run-20260827-a",
             }
         )
     report: dict[str, object] = {
@@ -185,6 +200,7 @@ def _write_fresh_sources(accepted: Path) -> tuple[Path, Path]:
         "kind": "lehome_fresh_12k_success_source_report_v1",
         "campaign_kind": "fresh_12k_success_source_v1",
         "round_id": "fresh-12k-source-20260827",
+        "run_id": "fresh-run-20260827-a",
         "matrix_sha256": matrix_sha256,
         "identity": {
             "policy_repo": "ryanjin333/lehome-groot-n17-models",
@@ -575,6 +591,9 @@ def test_fresh_visual_only_mode_binds_authenticated_cpu_sources_and_is_determini
         "wrong-policy",
         "cuda-cloth",
         "missing-step-16",
+        "noncanonical-parent",
+        "noncanonical-step-16",
+        "old-episode-relabel",
         "safety",
         "numerical",
         "cloth",
@@ -621,6 +640,22 @@ def test_fresh_visual_only_mode_rejects_every_untrusted_source_boundary(
     elif mutation == "missing-step-16":
         continuation = episode_root / "raw" / trial["attempt_id"] / "snapshots" / "continuations" / "000016.json"
         continuation.unlink()
+    elif mutation == "noncanonical-parent":
+        episode = json.loads(episode_path.read_text(encoding="utf-8"))
+        episode["randomization"] = {"strategy": "mild_geometry"}
+        episode_path.write_bytes(_canonical(episode))
+        _refresh_checksum(episode_root, f"raw/{trial['attempt_id']}/episode.json")
+    elif mutation == "noncanonical-step-16":
+        continuation = episode_root / "raw" / trial["attempt_id"] / "snapshots" / "continuations" / "000016.json"
+        payload = json.loads(continuation.read_text(encoding="utf-8"))
+        payload["randomization"] = {"strategy": "strong_geometry", "continuation_step": 16}
+        continuation.write_bytes(_canonical(payload))
+        _refresh_checksum(episode_root, f"raw/{trial['attempt_id']}/snapshots/continuations/000016.json")
+    elif mutation == "old-episode-relabel":
+        episode = json.loads(episode_path.read_text(encoding="utf-8"))
+        episode["identity"]["campaign_round_id"] = "success-replay-12k-round-1"
+        episode_path.write_bytes(_canonical(episode))
+        _refresh_checksum(episode_root, f"raw/{trial['attempt_id']}/episode.json")
     elif mutation in {"safety", "numerical", "cloth"}:
         trial[f"{mutation}_failure"] = True
     elif mutation == "mixed-garment":

@@ -703,10 +703,11 @@ def validate_success_replay_descriptor(
         "category_acceptance_cap",
     }
     fresh_provenance_fields = {
-        "source_episode_sha256", "source_reset_sha256", "source_annotations_sha256",
+        "source_episode_sha256", "source_episode_path", "source_reset_sha256", "source_annotations_sha256",
         "source_continuation_snapshot_sha256", "source_state_fingerprint",
-        "source_report_sha256", "source_matrix_sha256", "source_receipt_sha256",
-        "source_remote_prefix", "source_immutable_revision", "source_round_id",
+        "source_report_sha256", "source_matrix_sha256", "source_receipt_sha256", "source_receipt_path",
+        "source_remote_prefix", "source_immutable_revision", "source_round_id", "source_run_id",
+        "source_report_path", "source_matrix_path",
     }
     attempt_ids: set[str] = set()
     seeds: set[int] = set()
@@ -745,10 +746,23 @@ def validate_success_replay_descriptor(
                     not isinstance(row[field], str)
                     or _LOWERCASE_SHA256.fullmatch(row[field]) is None
                     for field in fresh_provenance_fields
-                    - {"source_remote_prefix", "source_immutable_revision", "source_round_id"}
+                    - {
+                        "source_episode_path", "source_report_path", "source_matrix_path", "source_receipt_path",
+                        "source_remote_prefix", "source_immutable_revision", "source_round_id", "source_run_id",
+                    }
                 )
                 or not isinstance(row.get("source_round_id"), str)
                 or re.fullmatch(r"fresh-12k-[a-z0-9-]{1,112}", row["source_round_id"]) is None
+                or not isinstance(row.get("source_run_id"), str)
+                or re.fullmatch(r"fresh-run-[a-z0-9-]{1,112}", row["source_run_id"]) is None
+                or not isinstance(row.get("source_report_path"), str)
+                or not Path(row["source_report_path"]).is_absolute()
+                or not isinstance(row.get("source_matrix_path"), str)
+                or not Path(row["source_matrix_path"]).is_absolute()
+                or not isinstance(row.get("source_episode_path"), str)
+                or not Path(row["source_episode_path"]).is_absolute()
+                or not isinstance(row.get("source_receipt_path"), str)
+                or not Path(row["source_receipt_path"]).is_absolute()
                 or row.get("source_remote_prefix")
                 != f"rollout-rounds/{row['source_round_id']}/{row['parent_episode_id']}"
                 or not isinstance(row.get("source_immutable_revision"), str)
@@ -769,7 +783,7 @@ def validate_success_replay_descriptor(
         _validate_snapshot_source_row(
             verification_row,
             allow_legacy_replay=True,
-            require_canonical_restore=False,
+            require_canonical_restore=is_fresh,
         )
         attempt_ids.add(str(row["attempt_id"]))
         seeds.add(seed)
