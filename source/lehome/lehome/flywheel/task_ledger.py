@@ -9,6 +9,7 @@ entry.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections import Counter
 from dataclasses import dataclass
 from hashlib import sha256
 import json
@@ -24,6 +25,7 @@ from .fidelity import FIDELITY_CODES, validate_fidelity, validate_fidelity_diagn
 MAX_CAMPAIGN_ATTEMPTS = 400
 MAX_ACCEPTED_EPISODES = 150
 MAX_TERMINAL_OUTCOMES = 300
+MAX_FRESH_VISUAL_ACCEPTED_EPISODES = 200
 MAX_SQLITE_INTEGER = 2**63 - 1
 CompletionMetric = Literal["accepted_successes", "terminal_outcomes"]
 _TERMINAL_STATUSES = frozenset({"accepted", "rejected", "infrastructure_abort"})
@@ -32,6 +34,34 @@ _STATE_EVENTS = frozenset({
     "leased", "lease_expired", "retryable", "interrupted", "terminal_pending_validation",
     "accepted", "rejected", "infrastructure_abort",
 })
+
+
+def _is_exact_fresh_visual_replay(
+    attempt_matrix: list[Mapping[str, object]] | tuple[Mapping[str, object], ...], *, max_attempts: int,
+) -> bool:
+    """The sole accepted-success cap exemption is the reviewed 4x100/4x50 replay.
+
+    This is intentionally enforced by the durable ledger rather than only by
+    the shell wrapper, so a direct caller cannot turn a generic rollout into a
+    200-acceptance campaign.
+    """
+    categories = ("top_long", "top_short", "pant_long", "pant_short")
+    if max_attempts != 400 or len(attempt_matrix) != 400:
+        return False
+    counts: Counter[str] = Counter()
+    for assignment in attempt_matrix:
+        if not isinstance(assignment, Mapping):
+            return False
+        category = assignment.get("category")
+        if (
+            category not in categories or assignment.get("strategy") != "visual_only"
+            or type(assignment.get("category_acceptance_cap")) is not int
+            or assignment.get("category_acceptance_cap") != 50
+        ):
+            return False
+        assert isinstance(category, str)
+        counts[category] += 1
+    return counts == Counter({category: 100 for category in categories})
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +143,10 @@ class TaskLedger:
         if completion_metric not in {"accepted_successes", "terminal_outcomes"}:
             raise ValueError("completion_metric must be accepted_successes or terminal_outcomes")
         target_ceiling = MAX_ACCEPTED_EPISODES if completion_metric == "accepted_successes" else MAX_TERMINAL_OUTCOMES
+        if completion_metric == "accepted_successes" and target_accepted == MAX_FRESH_VISUAL_ACCEPTED_EPISODES:
+            if not _is_exact_fresh_visual_replay(attempt_matrix, max_attempts=max_attempts):
+                raise ValueError("200 accepted successes require the exact fresh visual replay tuple")
+            target_ceiling = MAX_FRESH_VISUAL_ACCEPTED_EPISODES
         if not isinstance(target_accepted, int) or isinstance(target_accepted, bool) or not 1 <= target_accepted <= target_ceiling:
             raise ValueError(f"target_accepted must be in 1..{target_ceiling}")
         if len(attempt_matrix) > max_attempts:

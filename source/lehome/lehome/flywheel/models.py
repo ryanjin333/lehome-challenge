@@ -73,6 +73,10 @@ class EpisodeIdentity:
     seed: int
     instruction: str
     strategy: str
+    # v2 persistent manifests carry the immutable campaign identity authored by
+    # the launcher.  Keep these optional so v1 archive readers stay compatible.
+    campaign_round_id: str | None = None
+    campaign_run_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("policy_revision", "code_revision", "asset_revision"):
@@ -94,6 +98,11 @@ class EpisodeIdentity:
             raise ValueError("unsupported release stage")
         if self.strategy not in STRATEGIES:
             raise ValueError("unsupported collection strategy")
+        if (self.campaign_round_id is None) != (self.campaign_run_id is None):
+            raise ValueError("campaign provenance requires both run and round ids")
+        if self.campaign_round_id is not None:
+            if not self.campaign_round_id or not self.campaign_run_id:
+                raise ValueError("campaign provenance ids must be non-empty")
 
 
 @dataclass(frozen=True, slots=True)

@@ -300,6 +300,9 @@ def _terminal_invalid_key(ledger_id: str, pending_evidence: tuple[str, str, str]
 def _build_simple_first_hundred_report(
     *, campaign_root: Path, rows: list[dict[str, object]], matrix_sha256: str, candidate_key: str,
     policy_repo: str, policy_revision: str, policy_step: int, policy_artifact_sha256: str,
+    report_kind: str = "lehome_simple_curriculum_first100_report_v1",
+    logical_stage: str = "calibration_head", include_gate_fields: bool = True,
+    include_logical_assignment: bool = False,
 ) -> dict[str, object]:
     """Summarize only terminal evidence that can authenticate the 100-row gate."""
     ledger_path = campaign_root / "ledger.sqlite3"
@@ -318,6 +321,11 @@ def _build_simple_first_hundred_report(
             assignments[str(attempt["attempt_id"])] = assignment
         terminal: dict[str, tuple[str, dict[str, object]]] = {}
         pending: dict[str, tuple[str, str, str]] = {}
+        retired_pending: list[tuple[str, tuple[str, str, str]]] = []
+        # A terminal handoff can be corrupted after the ledger has recorded
+        # the execution.  It is evidence of one invalid execution, not a
+        # reason to synthesize a terminal result or abandon the aggregate.
+        invalid_pending_attempts: set[str] = set()
         completed_at_ns = 0
         invalid_executions: set[tuple[object, ...]] = set()
         infrastructure_by_lease: dict[tuple[str, str], set[tuple[object, ...]]] = defaultdict(set)
@@ -377,13 +385,36 @@ def _build_simple_first_hundred_report(
             elif event_type == "terminal_pending_validation":
                 try:
                     payload = json.loads(event["payload_json"])
-                except (TypeError, json.JSONDecodeError) as error:
-                    raise ValueError("evaluation terminal payload is invalid") from error
-                if (ledger_id not in assignments or ledger_id in pending or not isinstance(payload, dict)
+                except (TypeError, json.JSONDecodeError):
+                    payload = None
+                if (not isinstance(ledger_id, str) or ledger_id not in assignments
+                        or not isinstance(payload, dict)
                         or not isinstance(payload.get("raw_artifact_id"), str) or not payload["raw_artifact_id"]
                         or not isinstance(event["lease_id"], str) or not event["lease_id"]
                         or not isinstance(event["worker_id"], str) or not event["worker_id"]):
-                    raise ValueError("evaluation terminal evidence is ambiguous")
+                    if isinstance(ledger_id, str) and ledger_id in assignments:
+                        invalid_pending_attempts.add(ledger_id)
+                        invalid_executions.add(("invalid-terminal-pending", ledger_id, event["event_id"]))
+                        continue
+                    invalid_executions.add(("unbound-terminal-pending", event["event_id"]))
+                    continue
+                if ledger_id in pending:
+                    # A finalizer may record an explicit retry after finding
+                    # broken raw evidence, then lease the same durable ledger
+                    # entry again.  The later pending event is the only
+                    # terminal candidate; the retry itself remains one
+                    # infrastructure-invalid execution.
+                    prior_lease = pending[ledger_id][0]
+                    if (
+                        infrastructure_by_lease.get((ledger_id, prior_lease))
+                        or any(candidate == ledger_id for candidate, _key in infrastructure_without_lease)
+                    ):
+                        retired_pending.append((ledger_id, pending[ledger_id]))
+                        pending[ledger_id] = (str(event["lease_id"]), str(event["worker_id"]), payload["raw_artifact_id"])
+                        continue
+                    invalid_pending_attempts.add(ledger_id)
+                    invalid_executions.add(("invalid-terminal-pending", ledger_id, event["event_id"]))
+                    continue
                 pending[str(ledger_id)] = (str(event["lease_id"]), str(event["worker_id"]), payload["raw_artifact_id"])
             elif event_type in {"accepted", "rejected"}:
                 if ledger_id not in assignments or ledger_id in terminal:
@@ -418,14 +449,19 @@ def _build_simple_first_hundred_report(
             return
         evidence_execution_keys[relative.as_posix()] = key
 
-    for ledger_id, pending_evidence in pending.items():
+    def register_pending_evidence(
+        ledger_id: str, pending_evidence: tuple[str, str, str], key: tuple[object, ...],
+    ) -> None:
         raw_root = Path(pending_evidence[2])
+        register_evidence_path(raw_root, key)
+        register_evidence_path(raw_root / "worker-receipt.json", key)
+        register_evidence_path(raw_root / "raw", key)
+        register_evidence_path(raw_root / "raw" / ledger_id, key)
+        register_evidence_path(raw_root / "raw" / ledger_id / "episode.json", key)
+
+    for ledger_id, pending_evidence in pending.items():
         pending_key = evidence_key_for_pending(ledger_id, pending_evidence)
-        register_evidence_path(raw_root, pending_key)
-        register_evidence_path(raw_root / "worker-receipt.json", pending_key)
-        register_evidence_path(raw_root / "raw", pending_key)
-        register_evidence_path(raw_root / "raw" / ledger_id, pending_key)
-        register_evidence_path(raw_root / "raw" / ledger_id / "episode.json", pending_key)
+        register_pending_evidence(ledger_id, pending_evidence, pending_key)
         terminal_evidence = terminal.get(ledger_id)
         if terminal_evidence is None:
             continue
@@ -435,18 +471,33 @@ def _build_simple_first_hundred_report(
             )
         except ValueError:
             continue
-        key = _terminal_invalid_key(ledger_id, pending_evidence)
+        # The finalized location is also where a retry can leave duplicate
+        # evidence.  Keep it attached to the retry execution when present,
+        # rather than charging the same physical retry a second time.
+        key = pending_key
         register_evidence_path(receipt_path.parent, key)
         register_evidence_path(episode_path.parent, key)
         register_evidence_path(episode_path.parent.parent, key)
         register_evidence_path(episode_path, key)
         register_evidence_path(receipt_path, key)
+    for ledger_id, pending_evidence in retired_pending:
+        retry_keys = {key for candidate, key in infrastructure_without_lease if candidate == ledger_id}
+        pending_key = next(iter(retry_keys)) if len(retry_keys) == 1 else evidence_key_for_pending(ledger_id, pending_evidence)
+        register_pending_evidence(ledger_id, pending_evidence, pending_key)
     def invalid_evidence_key(reason: str, relative: str) -> tuple[object, ...]:
         parts = PurePosixPath(relative).parts
         for length in range(len(parts), 0, -1):
             bound = evidence_execution_keys.get(PurePosixPath(*parts[:length]).as_posix())
             if bound is not None:
                 return bound
+        # The finalizer's immutable destination has no worker lease in its
+        # path.  If this ledger entry has one explicit lease-less retry,
+        # duplicate/malformed evidence beneath that destination belongs to
+        # that retry rather than becoming a second synthetic execution.
+        if len(parts) >= 2 and parts[0] == "evaluation-terminal":
+            retry_keys = {key for candidate, key in infrastructure_without_lease if candidate == parts[1]}
+            if len(retry_keys) == 1:
+                return next(iter(retry_keys))
         return ("evidence", reason, relative)
 
     invalid_evidence_keys = {
@@ -467,7 +518,15 @@ def _build_simple_first_hundred_report(
     for ledger_id, assignment in assignments.items():
         terminal_evidence = terminal.get(ledger_id)
         pending_evidence = pending.get(ledger_id)
+        if ledger_id in invalid_pending_attempts:
+            continue
         if terminal_evidence is None or pending_evidence is None:
+            # A not-yet-leased schedule row is not an execution.  In a
+            # bounded partition a prior retry may consume the final lease;
+            # count that recorded retry, but never invent a second failure
+            # for an assignment that never began.
+            if terminal_evidence is None and pending_evidence is None:
+                continue
             has_infrastructure_event = (
                 pending_evidence is not None
                 and bool(infrastructure_by_lease.get((ledger_id, pending_evidence[0])))
@@ -552,12 +611,22 @@ def _build_simple_first_hundred_report(
         if official_success:
             category_scores[category]["official_successes"] += 1; garment_scores[garment]["official_successes"] += 1
         safety_failure = safety_failure or fidelity["safety_failure"]
-        trials.append({
+        trial = {
             "schedule_index": len(trials), "trial_id": assignment["trial_id"], "attempt_id": ledger_id,
             "category": category, "garment": garment, "seed": assignment["seed"],
             "official_success": int(official_success), "terminal_event": event,
             "episode_sha256": _sha256_file(episode_path), "worker_receipt_sha256": _sha256_file(receipt_path),
-        })
+        }
+        if include_logical_assignment:
+            trial.update({
+                "assignment_id": assignment["attempt_id"],
+                "finalized_artifact_root": str(expected_episode_path.parents[2]),
+                "runtime": dict(runtime),
+                "fidelity": dict(fidelity),
+                "accepted_success": official_success,
+                "outcome": "success" if official_success else "failure",
+            })
+        trials.append(trial)
         gate_trials.append({
             "assignment_id": assignment["attempt_id"], "trial_id": assignment["trial_id"], "terminal_event": event,
             "official_success": official_success, "episode_sha256": _sha256_file(episode_path),
@@ -566,10 +635,10 @@ def _build_simple_first_hundred_report(
         })
     successes = sum(values["official_successes"] for values in category_scores.values())
     report: dict[str, object] = {
-        "schema_version": 1, "kind": "lehome_simple_curriculum_first100_report_v1",
+        "schema_version": 1, "kind": report_kind,
         "release_stage": "seen", "candidate_key": candidate_key,
         "identity": {"policy_repo": policy_repo, "policy_revision": policy_revision, "policy_step": policy_step, "policy_artifact_sha256": policy_artifact_sha256},
-        "campaign_kind": "simple_curriculum_source_v1", "logical_stage": "calibration_head",
+        "campaign_kind": "simple_curriculum_source_v1", "logical_stage": logical_stage,
         "matrix_sha256": matrix_sha256, "ledger_sha256": _sha256_file(ledger_path), "completed_at_ns": completed_at_ns,
         "episodes": len(rows), "official_successes": successes, "success_rate": successes / len(gate_trials) if gate_trials else 0.0,
         "per_category": {category: {**values, "success_rate": values["official_successes"] / values["episodes"] if values["episodes"] else 0.0} for category, values in category_scores.items()},
@@ -583,9 +652,58 @@ def _build_simple_first_hundred_report(
         )),
         "infrastructure_invalid_executions": len(invalid_executions),
     }
-    report = _augment_first_hundred_metrics(report)
+    if include_gate_fields:
+        report = _augment_first_hundred_metrics(report)
     report["report_sha256"] = report_sha256(report)
     return report
+
+
+def _load_simple_partition_matrix(path: Path, expected_sha256: str) -> list[dict[str, object]]:
+    """Load an exact simple-curriculum partition without seen-80 balancing."""
+    if not isinstance(expected_sha256, str) or _SHA256.fullmatch(expected_sha256) is None:
+        raise ValueError("matrix SHA-256 is invalid")
+    if _sha256_file(path) != expected_sha256:
+        raise ValueError("matrix SHA-256 mismatch")
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("simple curriculum matrix is invalid") from error
+    if not isinstance(rows, list) or not rows or not all(isinstance(row, dict) for row in rows):
+        raise ValueError("simple curriculum matrix is invalid")
+    logical_stages = {row.get("logical_stage") for row in rows}
+    if (
+        len(logical_stages) != 1 or logical_stages not in ({"calibration"}, {"curriculum"})
+        or any(row.get("campaign_kind") != "simple_curriculum_source_v1" for row in rows)
+    ):
+        raise ValueError("simple curriculum matrix stage is invalid")
+    return [dict(row) for row in rows]
+
+
+def build_simple_partition_report(
+    *, campaign_root: Path, matrix_path: Path, matrix_sha256: str,
+    policy_repo: str, policy_revision: str, policy_step: int, policy_artifact_sha256: str,
+) -> dict[str, object]:
+    """Authenticate any completed simple physical partition, including weighted splits."""
+    _validate_policy_inputs("original_baseline", policy_repo, policy_revision, policy_step, policy_artifact_sha256)
+    root = Path(campaign_root)
+    if not root.is_absolute() or not root.is_dir():
+        raise ValueError("campaign root must be a materialized directory")
+    current = root
+    while True:
+        if stat.S_ISLNK(os.lstat(current).st_mode):
+            raise ValueError("campaign root has a symlink ancestor")
+        if current.parent == current:
+            break
+        current = current.parent
+    rows = _load_simple_partition_matrix(Path(matrix_path), matrix_sha256)
+    stage = next(iter({str(row["logical_stage"]) for row in rows}))
+    return _build_simple_first_hundred_report(
+        campaign_root=root, rows=rows, matrix_sha256=matrix_sha256,
+        candidate_key="original_baseline", policy_repo=policy_repo, policy_revision=policy_revision,
+        policy_step=policy_step, policy_artifact_sha256=policy_artifact_sha256,
+        report_kind="lehome_simple_curriculum_partition_report_v1", logical_stage=stage,
+        include_gate_fields=False, include_logical_assignment=True,
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -1436,21 +1554,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-step", type=int, required=True)
     parser.add_argument("--policy-artifact-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--simple-partition", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    report = build_report(
-        campaign_root=args.campaign_root,
-        matrix_path=args.matrix,
-        matrix_sha256=args.matrix_sha256,
-        candidate_key=args.candidate_key,
-        policy_repo=args.policy_repo,
-        policy_revision=args.policy_revision,
-        policy_step=args.policy_step,
-        policy_artifact_sha256=args.policy_artifact_sha256,
-    )
+    if args.simple_partition:
+        if args.candidate_key != "original_baseline":
+            parser.error("simple partitions require the original baseline")
+        report = build_simple_partition_report(
+            campaign_root=args.campaign_root, matrix_path=args.matrix, matrix_sha256=args.matrix_sha256,
+            policy_repo=args.policy_repo, policy_revision=args.policy_revision, policy_step=args.policy_step,
+            policy_artifact_sha256=args.policy_artifact_sha256,
+        )
+    else:
+        report = build_report(
+            campaign_root=args.campaign_root,
+            matrix_path=args.matrix,
+            matrix_sha256=args.matrix_sha256,
+            candidate_key=args.candidate_key,
+            policy_repo=args.policy_repo,
+            policy_revision=args.policy_revision,
+            policy_step=args.policy_step,
+            policy_artifact_sha256=args.policy_artifact_sha256,
+        )
     write_report(args.output, report)
     print(report["report_sha256"])
     return 0

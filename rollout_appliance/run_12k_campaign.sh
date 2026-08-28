@@ -206,7 +206,7 @@ TERMINAL_EVIDENCE_UPLOAD=0
 if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ] || [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
   TERMINAL_EVIDENCE_UPLOAD=1
 fi
-if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ] || [ "${FIDELITY_DIAGNOSTIC}" = "1" ]; then
+if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ] || [ "${FIDELITY_DIAGNOSTIC}" = "1" ] || [ "${ONE_VM_ORCHESTRATOR}" = "1" ]; then
   CODE_ROOT_SHA256="$(python3 - "${HOST_CODE_ROOT}" <<'PY'
 import hashlib, os, stat, sys
 from pathlib import Path
@@ -264,7 +264,8 @@ case "${SIMULATOR_DEVICE}" in
       fi
     elif [ "${SUCCESS_REPLAY_CAMPAIGN}" = "1" ]; then
       if [ "${WORKER_COUNT}" != "4" ] || [ "${ENABLE_HF_UPLOAD}" != "1" ] \
-          || [ "${SKIP_ROUND_SEAL}" != "0" ] || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] \
+          || { [ "${SKIP_ROUND_SEAL}" != "0" ] && { [ "${TARGET_ACCEPTED}" != "200" ] || [ "${ONE_VM_ORCHESTRATOR}" != "1" ]; }; } \
+          || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] \
           || [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "0" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ] \
           || ! [[ "${MAX_ATTEMPTS}" =~ ^([1-9]|[1-9][0-9]|[1-3][0-9][0-9]|400)$ ]] \
           || (( 10#${TARGET_ACCEPTED} > 10#${MAX_ATTEMPTS} )); then
@@ -798,7 +799,7 @@ if [ ! -e /kitcache/home/.nvidia-omniverse ] && [ -d "${KIT_SEED}" ]; then
   if [ -d "${KIT_SEED}/config" ]; then cp -a "${KIT_SEED}/config/." /kitcache/config/; fi
   if [ -d "${KIT_SEED}/data" ]; then cp -a "${KIT_SEED}/data/." /kitcache/ov/; fi
 fi
-if [ "${SIMPLE_CURRICULUM_COLLECTION}" != "1" ] && [ -x /opt/lehome/rollout_appliance/prepare-merged-lehome.sh ]; then
+if [ "${SIMPLE_CURRICULUM_COLLECTION}" != "1" ] && [ "${ONE_VM_ORCHESTRATOR}" != "1" ] && [ -x /opt/lehome/rollout_appliance/prepare-merged-lehome.sh ]; then
   /opt/lehome/rollout_appliance/prepare-merged-lehome.sh || true
 fi
 chown -R 1234:1234 "${CAMPAIGN_ROOT}" /eval/logs /kitcache || true
@@ -1031,6 +1032,10 @@ launch_worker() {
       --preparation-timeout-seconds "${PREPARATION_TIMEOUT_SECONDS}" \
       --source-finalization-timeout-seconds "${SOURCE_FINALIZATION_TIMEOUT_SECONDS}" \
       --policy-ready-file "${RECEIPT_DIR}/ready.json" \
+      --campaign-round-id "${ROUND_ID}" \
+      --campaign-run-id "${RUN_ID}" \
+      --simple-partition-id "${PARTITION_ID}" \
+      --simple-parent-matrix-sha256 "${PARENT_MATRIX_SHA256}" \
       --initial-garment "${worker_garment}" \
       --seed 101 \
       --garment_name Top_Long_Seen_0 \

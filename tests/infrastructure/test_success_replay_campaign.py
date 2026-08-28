@@ -608,6 +608,7 @@ def test_success_replay_wrapper_admits_200_only_for_exact_fresh_visual_only_tupl
     )
     assert direct_tampered.returncode != 0
     assert "source report" in direct_tampered.stderr
+
     report.write_bytes(original_report)
     source_matrix = Path(json.loads(source_environment["LEHOME_FRESH_SOURCE_MATRICES_JSON"])[0]["path"])
     source_matrix.write_text("[]", encoding="utf-8")
@@ -626,6 +627,22 @@ def test_success_replay_wrapper_admits_200_only_for_exact_fresh_visual_only_tupl
     )
     assert rejected.returncode != 0
     assert "exact" in rejected.stderr
+
+
+def test_exact_orchestrated_200_replay_defers_the_legacy_150_episode_strict_seal(tmp_path: Path) -> None:
+    """The controller owns the 200-receipt aggregate seal after the appliance exits."""
+    rows, source_environment = _fresh_evidence_matrix(tmp_path)
+    _write_exact_matrix(tmp_path, rows, source_environment)
+    result = _run_exact_path(
+        BASE_CAMPAIGN,
+        source_environment | {
+            "LEHOME_ONE_VM_ORCHESTRATOR": "1", "LEHOME_SKIP_ROUND_SEAL": "1",
+            "LEHOME_WORKSPACE": str(tmp_path / "workspace"),
+            "LEHOME_HOST_CODE_ROOT": str(REPO_ROOT),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_both_exact_200_paths_admit_authenticated_unselected_policy_failures(tmp_path: Path) -> None:

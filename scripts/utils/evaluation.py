@@ -586,6 +586,15 @@ def _write_persistent_flywheel_manifest(
     if not isinstance(attempt_id, str) or not attempt_id:
         raise ValueError("persistent flywheel assignment requires an attempt id")
     policy_repo, policy_revision, policy_step, policy_artifact_sha256 = _persistent_policy_identity(args)
+    campaign_round_id = getattr(args, "campaign_round_id", None)
+    campaign_run_id = getattr(args, "campaign_run_id", None)
+    if (campaign_round_id is None) != (campaign_run_id is None):
+        raise ValueError("persistent flywheel assignment requires paired campaign provenance")
+    if campaign_round_id is not None and (
+        not isinstance(campaign_round_id, str) or not campaign_round_id
+        or not isinstance(campaign_run_id, str) or not campaign_run_id
+    ):
+        raise ValueError("persistent flywheel campaign provenance is invalid")
     # The material path remains disabled on this Isaac build because its USD
     # displayColor readback is unstable. Geometry-only profiles retain strict
     # readback while varying the scene properties that transfer to unseen tops.
@@ -604,13 +613,15 @@ def _write_persistent_flywheel_manifest(
         seed=seed,
         instruction="fold the garment on the table",
         strategy=strategy,
+        campaign_round_id=campaign_round_id,
+        campaign_run_id=campaign_run_id,
     )
     simulator_device = str(getattr(args, "device", "")).lower()
     if simulator_device != "cpu" and re.fullmatch(r"cuda:[0-9]+", simulator_device) is None:
         raise ValueError("persistent flywheel assignment requires cpu or a canonical CUDA simulator device")
     path = attempt_output_dir / "flywheel-manifest.json"
     payload = {
-        "schema_version": 1,
+        "schema_version": 2 if campaign_round_id is not None else 1,
         "policy_revision": identity.policy_revision,
         "seed": identity.seed,
         "garment": identity.garment_name,
@@ -639,6 +650,11 @@ def _write_persistent_flywheel_manifest(
         "policy_device": str(getattr(args, "policy_device", "cuda:0")),
         "parity_stage": "server_cpu" if simulator_device == "cpu" else "persistent_collection",
     }
+    if campaign_round_id is not None:
+        payload["identity"].update({
+            "campaign_round_id": campaign_round_id,
+            "campaign_run_id": campaign_run_id,
+        })
     if verified_restore is not None:
         payload.update(verified_restore)
     if assignment.get("recovery_kind") == "controlled_success_recovery_snapshot_v3":

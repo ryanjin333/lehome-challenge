@@ -9,6 +9,7 @@ preemption can resume the same matrices and ledgers without inventing work.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -54,9 +55,9 @@ _STAGE_ARTIFACTS = {
     "curriculum-matrix": frozenset({"matrix", "matrix_receipt"}),
     "curriculum-a": frozenset({"matrix", "manifest", "ledger"}),
     "curriculum-b": frozenset({"matrix", "manifest", "ledger"}),
-    "fresh-report": frozenset({"report"}),
+    "fresh-report": frozenset({"report", "matrix", "terminal_artifact_manifest"}),
     "replay-matrix": frozenset({"matrix", "matrix_receipt"}),
-    "success-replay": frozenset({"matrix", "ledger"}),
+    "success-replay": frozenset({"matrix", "ledger", "readback_seal"}),
     "final-publication": frozenset({"publication_receipt", "publication_readback"}),
 }
 
@@ -282,7 +283,9 @@ def _build_calibration_report(config: CollectionConfig) -> None:
             raise ReceiptMismatchError("head report cannot form calibration outcome")
         outcomes[attempt] = {"attempt_id": attempt, "trial_id": trial_id, "success": success}
     for trial in tail:
-        attempt, trial_id = trial.get("attempt_id"), trial.get("trial_id")
+        # Generic partition reports expose both the durable TaskLedger id and
+        # the logical assignment id.  Calibration rows are keyed by the latter.
+        attempt, trial_id = trial.get("assignment_id"), trial.get("trial_id")
         success = trial.get("official_success")
         if not isinstance(attempt, str) or not isinstance(trial_id, str) or type(success) is not int or success not in {0, 1} or attempt in outcomes:
             raise ReceiptMismatchError("tail report cannot form calibration outcome")
@@ -314,76 +317,128 @@ def _validate_calibration_report_artifact(config: CollectionConfig, report: Path
         raise ReceiptMismatchError("calibration report is not canonical curriculum evidence") from error
 
 
-def _fresh_trial_for_assignment(config: CollectionConfig, *, partition: str, row: Mapping[str, object], terminal_event: str) -> dict[str, object]:
-    root = _canonical_root(config); attempt = row.get("attempt_id")
-    if not isinstance(attempt, str) or terminal_event not in {"accepted", "rejected"}:
-        raise ReceiptMismatchError("fresh partition has an invalid terminal assignment")
-    success = terminal_event == "accepted"
+def _fresh_trial_from_terminal_report(
+    config: CollectionConfig, *, partition: str, terminal: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    """Translate an authenticated terminal report, never a bare ledger row.
+
+    ``attempt_id`` below is the durable TaskLedger ID.  The logical source ID
+    stays only as audit metadata; replay contracts intentionally use the
+    durable ID for both attempt and trial identity.
+    """
+    root = _canonical_root(config)
+    attempt = terminal.get("attempt_id")
+    assignment = terminal.get("assignment_id")
+    category = terminal.get("category")
+    garment = terminal.get("garment")
+    event = terminal.get("terminal_event")
+    runtime = terminal.get("runtime")
+    fidelity = terminal.get("fidelity")
+    artifact_root = terminal.get("finalized_artifact_root")
+    if (
+        not isinstance(attempt, str) or not isinstance(assignment, str)
+        or not isinstance(category, str) or not isinstance(garment, str)
+        or event not in {"accepted", "rejected"} or not isinstance(runtime, Mapping)
+        or not isinstance(fidelity, Mapping) or not isinstance(artifact_root, str)
+    ):
+        raise ReceiptMismatchError("fresh terminal report has no typed terminal handoff")
+    required_runtime = {"simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device"}
+    if set(runtime) != required_runtime or runtime.get("simulation_device") != "cpu" or runtime.get("cloth_device") != "cpu":
+        raise ReceiptMismatchError("fresh terminal runtime is not the reviewed CPU tuple")
+    if any(not isinstance(runtime.get(key), str) for key in ("renderer_device", "camera_device", "policy_device")):
+        raise ReceiptMismatchError("fresh terminal runtime is malformed")
+    # Partition reports carry the canonical persistent-worker fidelity schema,
+    # while fresh-replay evidence has its own three aggregate failure fields.
+    # Translate only after requiring every primitive monitor to be present and
+    # clean; never manufacture a clean result from an incomplete report.
+    required_fidelity = {
+        "missing_cloth", "cloth_flight", "nonfinite_cloth_state",
+        "safety_failure", "monitor_active", "monitor_observed",
+    }
+    if set(fidelity) != required_fidelity or any(type(fidelity.get(key)) is not bool for key in required_fidelity):
+        raise ReceiptMismatchError("fresh terminal fidelity evidence is malformed")
+    if (
+        fidelity["missing_cloth"] or fidelity["cloth_flight"] or fidelity["nonfinite_cloth_state"]
+        or fidelity["safety_failure"] or not fidelity["monitor_active"] or not fidelity["monitor_observed"]
+    ):
+        raise ReceiptMismatchError("fresh terminal fidelity gate did not pass")
+    success = event == "accepted"
+    if terminal.get("accepted_success") is not success or terminal.get("outcome") != ("success" if success else "failure"):
+        raise ReceiptMismatchError("fresh terminal outcome disagrees with finalized evidence")
     trial: dict[str, object] = {
-        "attempt_id": attempt, "category": row.get("category"), "garment_name": row.get("garment_name"),
-        "accepted_success": success, "official_success": success, "outcome": "success" if success else "failure",
-        "simulator_device": "cpu", "cloth_device": "cpu", "renderer_device": str(config.runtime_identity["policy_device"]),
-        "camera_device": str(config.runtime_identity["policy_device"]), "policy_device": str(config.runtime_identity["policy_device"]),
+        "attempt_id": attempt, "category": category, "garment_name": garment,
+        "accepted_success": success, "official_success": success,
+        "outcome": "success" if success else "failure",
+        "simulator_device": runtime["simulation_device"], "cloth_device": runtime["cloth_device"],
+        "renderer_device": runtime["renderer_device"], "camera_device": runtime["camera_device"],
+        "policy_device": runtime["policy_device"],
+        # The primitive fidelity evidence above was fully observed and clean.
+        # These fields are the immutable fresh-source contract's aggregates.
         "safety_failure": False, "numerical_failure": False, "cloth_failure": False,
-        "remote_prefix": f"rollout-rounds/{config.round_id}/{attempt}", "campaign_round_id": config.round_id,
-        "campaign_run_id": config.run_id,
+        "remote_prefix": f"rollout-rounds/{config.round_id}/{attempt}",
+        "campaign_round_id": config.round_id, "campaign_run_id": config.run_id,
+    }
+    source = {
+        "attempt_id": attempt, "trial_id": attempt, "logical_attempt_id": assignment,
+        "category": category, "garment_name": garment, "release_stage": "seen", "strategy": "canonical",
+        "campaign_kind": "fresh_12k_success_source_v1", "logical_stage": "fresh_success_source",
+        "campaign_round_id": config.round_id, "campaign_run_id": config.run_id,
+    }
+    aggregate = {
+        "attempt_id": attempt, "terminal_event": event,
+        "logical_attempt_id": assignment, "terminal_report_sha256": terminal.get("episode_sha256"),
+        "worker_receipt_sha256": terminal.get("worker_receipt_sha256"),
+        "finalized_artifact_root": artifact_root,
     }
     if success:
         from build_success_replay_matrix import _episode_artifact_sha256
 
-        stage_root = root / "fresh" / partition
-        episode_root = stage_root / "accepted" / attempt
-        receipt = stage_root / "hf-sync-receipts" / f"{attempt}.sync.json"
+        episode_root = Path(artifact_root)
+        receipt = root / "fresh" / partition / "hf-sync-receipts" / f"{attempt}.sync.json"
         episode = _strict_json_object(episode_root / "raw" / attempt / "episode.json", label="fresh accepted episode")
+        identity = episode.get("identity")
         sync = _strict_json_object(receipt, label="fresh Hub readback receipt")
-        if (episode.get("accepted_success") is not True or episode.get("outcome") != "success"
-                or sync.get("readback_verified") is not True or sync.get("attempt_id") != attempt
-                or sync.get("round_id") != config.round_id or sync.get("run_id") != config.run_id
-                or sync.get("remote_prefix") != trial["remote_prefix"]):
-            raise ReceiptMismatchError("fresh success lacks canonical Hub readback evidence")
+        if (
+            not isinstance(identity, Mapping)
+            or identity.get("campaign_round_id") != config.round_id or identity.get("campaign_run_id") != config.run_id
+            or episode.get("accepted_success") is not True or episode.get("outcome") != "success"
+            or sync.get("readback_verified") is not True or sync.get("attempt_id") != attempt
+            or sync.get("round_id") != config.round_id or sync.get("run_id") != config.run_id
+            or sync.get("remote_prefix") != trial["remote_prefix"]
+        ):
+            raise ReceiptMismatchError("fresh success lacks actual campaign-bound Hub readback evidence")
         artifact_sha = _episode_artifact_sha256(episode_root)
         if sync.get("episode_sha256") != artifact_sha:
             raise ReceiptMismatchError("fresh success receipt does not bind accepted artifact")
         trial.update(artifact_sha256=artifact_sha, hub_sync_receipt_sha256=_file_sha(receipt))
-    return trial
+        aggregate["hub_sync_receipt_sha256"] = _file_sha(receipt)
+        aggregate["artifact_sha256"] = artifact_sha
+    return source, trial, aggregate
 
 
 def _build_fresh_source_report(config: CollectionConfig) -> None:
     root = _canonical_root(config)
     if re.fullmatch(r"fresh-12k-[a-z0-9-]{1,112}", config.round_id) is None or re.fullmatch(r"fresh-run-[a-z0-9-]{1,112}", config.run_id) is None:
         raise ReceiptMismatchError("fresh report requires fresh 12K run and round identities")
-    source_rows: list[dict[str, object]] = []; trials: list[dict[str, object]] = []
+    source_rows: list[dict[str, object]] = []; trials: list[dict[str, object]] = []; aggregate: list[dict[str, object]] = []
     for partition in ("calibration-head", "calibration-tail", "curriculum-a", "curriculum-b"):
-        matrix = _load_json_list(root / "partitions" / f"{partition}.json", label="partition matrix")
-        ledger = root / "fresh" / partition / "ledger.sqlite3"
-        try:
-            connection = sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)
-            try:
-                events = {
-                    str(attempt): str(event) for attempt, event in connection.execute(
-                        "SELECT attempt_id, event_type FROM events WHERE event_type IN ('accepted', 'rejected')"
-                    )
-                }
-            finally:
-                connection.close()
-        except sqlite3.Error as error:
-            raise ReceiptMismatchError("fresh source ledger is unreadable") from error
-        if len(events) != len(matrix):
-            raise ReceiptMismatchError("fresh source ledger does not have exact terminal outcomes")
-        for row in matrix:
-            attempt = row.get("attempt_id")
-            if not isinstance(attempt, str) or attempt not in events:
-                raise ReceiptMismatchError("fresh source matrix has no terminal outcome")
-            source_rows.append({
-                "attempt_id": attempt, "trial_id": row.get("trial_id"), "category": row.get("category"),
-                "garment_name": row.get("garment_name"), "release_stage": "seen", "strategy": "canonical",
-                "campaign_kind": "fresh_12k_success_source_v1", "logical_stage": "fresh_success_source",
-                "campaign_round_id": config.round_id, "campaign_run_id": config.run_id,
-            })
-            trials.append(_fresh_trial_for_assignment(config, partition=partition, row=row, terminal_event=events[attempt]))
+        report_path = root / "reports" / "partitions" / f"{partition}.json"
+        report = _strict_json_object(report_path, label="fresh partition terminal report")
+        if report.get("kind") != "lehome_simple_curriculum_partition_report_v1":
+            raise ReceiptMismatchError("fresh source must be constructed from a canonical partition report")
+        terminal_trials = report.get("trials")
+        if not isinstance(terminal_trials, list):
+            raise ReceiptMismatchError("fresh partition report has no terminal evidence")
+        for terminal in terminal_trials:
+            if not isinstance(terminal, Mapping):
+                raise ReceiptMismatchError("fresh partition terminal evidence is malformed")
+            source, trial, evidence = _fresh_trial_from_terminal_report(config, partition=partition, terminal=terminal)
+            source_rows.append(source); trials.append(trial); aggregate.append(evidence)
     if len(source_rows) != 1000 or len({str(row["attempt_id"]) for row in source_rows}) != 1000:
         raise ReceiptMismatchError("fresh source matrix must contain exactly 1,000 distinct outcomes")
     matrix = root / "reports/fresh-source-matrix.json"; _write_immutable_json(matrix, source_rows)
+    terminal_manifest = root / "reports/fresh-terminal-artifacts.json"
+    _write_immutable_json(terminal_manifest, {"schema_version": 1, "kind": "lehome_fresh_terminal_artifact_manifest_v1", "entries": aggregate})
     report: dict[str, object] = {
         "schema_version": 1, "kind": "lehome_fresh_12k_success_source_report_v1",
         "campaign_kind": "fresh_12k_success_source_v1", "logical_stage": "fresh_success_source",
@@ -394,7 +449,7 @@ def _build_fresh_source_report(config: CollectionConfig) -> None:
     _write_immutable_json(root / "reports/fresh-source-report.json", report)
 
 
-def _validate_fresh_source_outputs(config: CollectionConfig, *, report: Path, matrix: Path) -> None:
+def _validate_fresh_source_outputs(config: CollectionConfig, *, report: Path, matrix: Path) -> dict[str, dict[str, object]]:
     from lehome.flywheel.fresh_replay_evidence import authenticate_fresh_source_contract
 
     try:
@@ -403,6 +458,102 @@ def _validate_fresh_source_outputs(config: CollectionConfig, *, report: Path, ma
         raise ReceiptMismatchError("fresh source report is not eligible replay evidence") from error
     if len(authenticated) != 1000:
         raise ReceiptMismatchError("fresh source report has an incorrect terminal outcome count")
+    return authenticated
+
+
+def _validate_fresh_terminal_artifact_manifest(
+    config: CollectionConfig, *, authenticated: Mapping[str, Mapping[str, object]], manifest: Path,
+) -> None:
+    """Re-open every reported terminal root before adopting a fresh-source report.
+
+    The fresh source report is deliberately compact, but it is only useful if
+    the terminal artifacts and Hub receipts it was built from still bind the
+    exact durable TaskLedger identifiers.  This makes a pre-journal crash
+    adoption safe: a complete-looking report cannot mask a changed artifact,
+    a swapped logical assignment, or a local-only accepted result.
+    """
+    from build_success_replay_matrix import _episode_artifact_sha256
+
+    root = _canonical_root(config)
+    payload = _strict_json_object(manifest, label="fresh terminal artifact manifest")
+    if (
+        set(payload) != {"schema_version", "kind", "entries"}
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != "lehome_fresh_terminal_artifact_manifest_v1"
+        or not isinstance(payload.get("entries"), list)
+    ):
+        raise ReceiptMismatchError("fresh terminal artifact manifest is invalid")
+    entries = payload["entries"]
+    if len(entries) != 1000:
+        raise ReceiptMismatchError("fresh terminal artifact manifest has an incorrect outcome count")
+    by_attempt: dict[str, Mapping[str, object]] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("attempt_id"), str):
+            raise ReceiptMismatchError("fresh terminal artifact manifest entry is malformed")
+        attempt = str(entry["attempt_id"])
+        if attempt in by_attempt or attempt not in authenticated:
+            raise ReceiptMismatchError("fresh terminal artifact manifest has an unknown or duplicate attempt")
+        by_attempt[attempt] = entry
+    if set(by_attempt) != set(authenticated):
+        raise ReceiptMismatchError("fresh terminal artifact manifest does not cover the source matrix")
+
+    for attempt, context in authenticated.items():
+        trial = context.get("trial")
+        rows = context.get("source_matrix_rows")
+        entry = by_attempt[attempt]
+        if not isinstance(trial, Mapping) or not isinstance(rows, Mapping):
+            raise ReceiptMismatchError("fresh terminal source context is malformed")
+        row = rows.get(attempt)
+        if not isinstance(row, Mapping):
+            raise ReceiptMismatchError("fresh terminal source matrix is malformed")
+        event = "accepted" if trial.get("accepted_success") is True else "rejected"
+        required = {
+            "attempt_id", "terminal_event", "logical_attempt_id", "terminal_report_sha256",
+            "worker_receipt_sha256", "finalized_artifact_root",
+        }
+        if event == "accepted":
+            required |= {"hub_sync_receipt_sha256", "artifact_sha256"}
+        if set(entry) != required:
+            raise ReceiptMismatchError("fresh terminal artifact manifest entry has an unexpected schema")
+        if (
+            entry.get("terminal_event") != event
+            or entry.get("logical_attempt_id") != row.get("logical_attempt_id")
+            or entry.get("terminal_report_sha256") != trial.get("episode_sha256")
+            or entry.get("worker_receipt_sha256") != trial.get("worker_receipt_sha256")
+            or not isinstance(entry.get("finalized_artifact_root"), str)
+        ):
+            raise ReceiptMismatchError("fresh terminal artifact manifest does not bind report identities")
+        artifact_root = Path(str(entry["finalized_artifact_root"]))
+        try:
+            relative = artifact_root.relative_to(root)
+        except ValueError as error:
+            raise ReceiptMismatchError("fresh terminal artifact root escapes collection") from error
+        if (
+            artifact_root.is_symlink() or not artifact_root.is_dir()
+            or len(relative.parts) != 4 or relative.parts[0] != "fresh"
+            or relative.parts[2] not in {"accepted", "evaluation-terminal"}
+            or relative.parts[3] != attempt
+        ):
+            raise ReceiptMismatchError("fresh terminal artifact root is not canonical")
+        episode = artifact_root / "raw" / attempt / "episode.json"
+        worker_receipt = artifact_root / "worker-receipt.json"
+        if _file_sha(episode) != entry["terminal_report_sha256"] or _file_sha(worker_receipt) != entry["worker_receipt_sha256"]:
+            raise ReceiptMismatchError("fresh terminal artifact bytes no longer match report evidence")
+        if event != "accepted":
+            continue
+        artifact_sha = _episode_artifact_sha256(artifact_root)
+        receipt = artifact_root.parent.parent / "hf-sync-receipts" / f"{attempt}.sync.json"
+        sync = _strict_json_object(receipt, label="fresh Hub readback receipt")
+        if (
+            artifact_sha != entry.get("artifact_sha256") or artifact_sha != trial.get("artifact_sha256")
+            or _file_sha(receipt) != entry.get("hub_sync_receipt_sha256")
+            or _file_sha(receipt) != trial.get("hub_sync_receipt_sha256")
+            or sync.get("readback_verified") is not True or sync.get("attempt_id") != attempt
+            or sync.get("round_id") != config.round_id or sync.get("run_id") != config.run_id
+            or sync.get("remote_prefix") != f"rollout-rounds/{config.round_id}/{attempt}"
+            or sync.get("episode_sha256") != artifact_sha
+        ):
+            raise ReceiptMismatchError("fresh terminal accepted artifact lacks a matching Hub readback")
 
 
 def _validate_replay_matrix_receipt(matrix: Path, receipt: Path) -> int:
@@ -417,6 +568,91 @@ def _validate_replay_matrix_receipt(matrix: Path, receipt: Path) -> int:
             or not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows) or len(rows) > 400):
         raise ReceiptMismatchError("success replay matrix receipt is invalid")
     return len(rows)
+
+
+def _discover_success_replay(config: CollectionConfig, *, matrix: Path, ledger: Path) -> Mapping[str, object]:
+    """Authenticate the exact 4x100/4x50 visual replay terminal boundary.
+
+    A 400-attempt campaign is successful only when its ledger has exactly 50
+    accepted outcomes in every category and every one of those artifacts has
+    a readback-verified Hub receipt.  If all 400 rows finished but any cap is
+    short, preserve that as the explicit data outcome ``replay_shortage``.
+    """
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    root = _canonical_root(config)
+    rows = _load_json_list(matrix, label="success replay matrix")
+    expected_categories = Counter({"top_long": 100, "top_short": 100, "pant_long": 100, "pant_short": 100})
+    if len(rows) != 400 or Counter(row.get("category") for row in rows) != expected_categories:
+        raise ReceiptMismatchError("success replay matrix does not have the exact four-category attempt caps")
+    if any(row.get("strategy") != "visual_only" or row.get("category_acceptance_cap") != 50 for row in rows):
+        raise ReceiptMismatchError("success replay matrix does not bind the exact visual acceptance caps")
+    try:
+        task_ledger = TaskLedger(ledger, attempt_matrix=rows, max_attempts=400, target_accepted=200)
+        try:
+            attempts = task_ledger.attempts()
+            statuses = {attempt.attempt_id: task_ledger.status(attempt.attempt_id) for attempt in attempts}
+        finally:
+            task_ledger.close()
+    except (OSError, ValueError, sqlite3.Error) as error:
+        raise ReceiptMismatchError("success replay ledger is malformed") from error
+    if len(attempts) != 400 or any(status == "infrastructure_abort" for status in statuses.values()):
+        raise ReceiptMismatchError("success replay contains unresolved infrastructure evidence")
+    accepted = tuple(attempt for attempt in attempts if statuses.get(attempt.attempt_id) == "accepted")
+    accepted_categories = Counter(str(attempt.assignment.get("category")) for attempt in accepted)
+    if len(accepted) > 200 or any(accepted_categories[category] > 50 for category in expected_categories):
+        raise ReceiptMismatchError("success replay ledger exceeds an immutable acceptance cap")
+    seal = root / "replay" / "success-replay-readback-seal.json"
+    if len(accepted) < 200:
+        if all(status in {"accepted", "rejected"} for status in statuses.values()):
+            shortage_body: dict[str, object] = {
+                "schema_version": 1, "kind": "lehome_success_replay_readback_seal_v1",
+                "round_id": config.round_id + "-replay", "run_id": config.run_id,
+                "matrix_sha256": _file_sha(matrix),
+                "accepted_attempt_ids": [attempt.attempt_id for attempt in accepted],
+                "accepted_by_category": dict(sorted(accepted_categories.items())),
+                "readback_receipts": {}, "readback_verified": False, "outcome": "replay_shortage",
+            }
+            _write_immutable_json(seal, {**shortage_body, "seal_sha256": _digest(shortage_body)})
+            return {"result": "replay_shortage", "readback_seal": seal}
+        raise ReceiptMismatchError("success replay is incomplete before a declared source shortage")
+    if accepted_categories != Counter({category: 50 for category in expected_categories}):
+        raise ReceiptMismatchError("success replay accepted terminal category counts are not exact")
+
+    round_id = config.round_id + "-replay"
+    from build_success_replay_matrix import _episode_artifact_sha256
+
+    receipts: dict[str, dict[str, str]] = {}
+    for attempt in accepted:
+        attempt_id = attempt.attempt_id
+        artifact = root / "replay" / "accepted" / attempt_id
+        receipt_path = root / "replay" / "hf-sync-receipts" / f"{attempt_id}.sync.json"
+        artifact_sha = _episode_artifact_sha256(artifact)
+        receipt = _strict_json_object(receipt_path, label="success replay Hub readback receipt")
+        immutable_revision = receipt.get("immutable_revision")
+        if (
+            receipt.get("schema_version") != 1 or receipt.get("attempt_id") != attempt_id
+            or receipt.get("repository") != "ryanjin333/lehome-groot-n17-rollouts"
+            or receipt.get("round_id") != round_id
+            or receipt.get("remote_prefix") != f"rollout-rounds/{round_id}/{attempt_id}"
+            or receipt.get("readback_verified") is not True or receipt.get("episode_sha256") != artifact_sha
+            or not isinstance(immutable_revision, str) or re.fullmatch(r"[0-9a-f]{40}", immutable_revision) is None
+        ):
+            raise ReceiptMismatchError("success replay accepted artifact lacks a matching Hub readback receipt")
+        receipts[attempt_id] = {
+            "receipt_sha256": _file_sha(receipt_path), "episode_sha256": artifact_sha,
+            "immutable_revision": immutable_revision,
+        }
+    body: dict[str, object] = {
+        "schema_version": 1, "kind": "lehome_success_replay_readback_seal_v1",
+        "round_id": round_id, "run_id": config.run_id, "matrix_sha256": _file_sha(matrix),
+        "accepted_attempt_ids": [attempt.attempt_id for attempt in accepted],
+        "accepted_by_category": dict(sorted(accepted_categories.items())),
+        "readback_receipts": receipts, "readback_verified": True,
+    }
+    payload = {**body, "seal_sha256": _digest(body)}
+    _write_immutable_json(seal, payload)
+    return {"result": "complete", "readback_seal": seal}
 
 
 def _safe_directory(path: Path, *, must_exist: bool) -> None:
@@ -480,6 +716,11 @@ class CollectionConfig:
         for identifier in (self.run_id, self.round_id):
             if identifier in _DEFAULT_IDS or _SAFE_ID.fullmatch(identifier) is None:
                 raise ValueError("fresh caller-supplied run and round IDs are required")
+        if self.paid and (
+            re.fullmatch(r"fresh-run-[a-z0-9-]{1,112}", self.run_id) is None
+            or re.fullmatch(r"fresh-12k-[a-z0-9-]{1,112}", self.round_id) is None
+        ):
+            raise ValueError("paid collection requires fresh-run and fresh-12k identities before spending")
         for value, label, ceiling in ((self.max_wall_seconds, "max wall time", 86_400.0), (self.max_spend_usd, "max spend", 100.0)):
             if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0 or value >= ceiling:
                 raise ValueError(f"{label} must be finite, positive, and bounded")
@@ -519,7 +760,9 @@ class Runner(Protocol):
 class CommandRunner:
     """Fixed reviewed stage adapter; no caller-provided command surface exists."""
 
-    def __init__(self, config: CollectionConfig | None = None) -> None: self.config = config
+    def __init__(self, config: CollectionConfig | None = None) -> None:
+        self.config = config
+        self.budget_check: Any = None
 
     def _require_config(self) -> CollectionConfig:
         if self.config is None:
@@ -550,14 +793,20 @@ class CommandRunner:
             environment.update({
                 "LEHOME_HOST_CODE_ROOT": str(config.host_code_root),
                 "LEHOME_SIMPLE_CURRICULUM_COLLECTION": "0",
-                "LEHOME_ONE_VM_ORCHESTRATOR": "0",
-                "LEHOME_PAID_COLLECTION": "0",
+                # Replay is still a paid one-VM continuation.  Only the CPU
+                # mode marker changes; clearing these selected baked code in
+                # the wrapper and bypassed the journaled path.
+                "LEHOME_ONE_VM_ORCHESTRATOR": "1",
+                "LEHOME_PAID_COLLECTION": "1" if config.paid else "0",
                 "LEHOME_SUCCESS_REPLAY_MATRIX": str(replay),
                 "LEHOME_SUCCESS_REPLAY_MATRIX_SHA256": _file_sha(replay),
                 "LEHOME_CAMPAIGN_ROOT": str(root / "replay"),
                 "LEHOME_WORKSPACE": "/mnt/lehome",
                 "LEHOME_WORKER_COUNT": "4", "LEHOME_MAX_ATTEMPTS": "400", "LEHOME_TARGET_ACCEPTED": "200",
                 "LEHOME_RUN_ID": config.run_id, "LEHOME_ROUND_ID": config.round_id + "-replay",
+                "LEHOME_ROLLOUT_IMAGE": str(config.runtime_identity["rollout_image"]),
+                "LEHOME_TRAINER_IMAGE": str(config.runtime_identity["trainer_image"]),
+                "LEHOME_ENABLE_HF_UPLOAD": "1", "LEHOME_SKIP_ROUND_SEAL": "1",
                 "LEHOME_FRESH_SOURCE_REPORTS_JSON": json.dumps([{"path": str(reports), "sha256": _file_sha(reports)}]),
                 "LEHOME_FRESH_SOURCE_MATRICES_JSON": json.dumps([{"path": str(matrices), "sha256": _file_sha(matrices)}]),
             })
@@ -576,6 +825,10 @@ class CommandRunner:
         if matrix_sha != inputs["partition_sha256"]:
             raise ReceiptMismatchError("partition adapter matrix hash mismatch")
         stage_root = root / "fresh" / partition
+        resume_context = stage_root / "rollout-preemption.json"
+        ledger_exists = (stage_root / "ledger.sqlite3").is_file()
+        if ledger_exists and (resume_context.is_symlink() or not resume_context.is_file()):
+            raise ReceiptMismatchError("resumed partition is missing its durable preemption context")
         runtime = config.runtime_identity
         environment.update({
             "LEHOME_HOST_CODE_ROOT": str(config.host_code_root),
@@ -604,6 +857,8 @@ class CommandRunner:
             "LEHOME_HF_TOKEN_FILE": "/mnt/lehome/secrets/hf_token",
             "LEHOME_ROLLOUT_REPOSITORY": "ryanjin333/lehome-groot-n17-rollouts",
             "LEHOME_HF_REVISION": "main",
+            "LEHOME_RESUME_PREEMPTED_ROLLOUT": "1" if ledger_exists else "0",
+            "LEHOME_ROLLOUT_PREEMPTION_CONTEXT": str(resume_context),
         })
         return environment
 
@@ -622,8 +877,8 @@ class CommandRunner:
             "--approved-garment-catalog", str(root / "inputs/seen-catalog.json"),
             "--output", str(root / "reports/first-100-gate.json"),
         )
-        if stage == "calibration-report": return self._summary_argv("calibration-tail", root / "reports/calibration-tail.json")
-        if stage == "fresh-report": return self._summary_argv("curriculum-b", root / "reports/curriculum-b.json")
+        if stage == "calibration-report": return self._summary_argv("calibration-tail", root / "reports/calibration-tail.json", simple_partition=True)
+        if stage == "fresh-report": return self._summary_argv("curriculum-b", root / "reports" / "partitions" / "curriculum-b.json", simple_partition=True)
         if stage == "curriculum-matrix": return (
             py, str(scripts / "build_simple_curriculum_matrix.py"), "build-curriculum",
             "--report", str(root / "reports/calibration.json"),
@@ -651,9 +906,9 @@ class CommandRunner:
             return (py, str(publisher))
         raise ValueError("unknown fixed stage")
 
-    def _summary_argv(self, partition: str, output: Path) -> tuple[str, ...]:
+    def _summary_argv(self, partition: str, output: Path, *, simple_partition: bool = False) -> tuple[str, ...]:
         config = self._require_config(); root = _canonical_root(config); runtime = config.runtime_identity
-        return (
+        argv = (
             str(Path(os.sys.executable).resolve()), str(config.host_code_root / "scripts" / "summarize_groot_persistent_evaluation.py"),
             "--campaign-root", str(root / "fresh" / partition),
             "--matrix", str(root / "partitions" / f"{partition}.json"),
@@ -662,6 +917,34 @@ class CommandRunner:
             "--policy-revision", str(runtime["policy_revision"]), "--policy-step", str(runtime["policy_step"]),
             "--policy-artifact-sha256", str(runtime["policy_artifact_sha256"]), "--output", str(output),
         )
+        return argv + (("--simple-partition",) if simple_partition else ())
+
+    def _output_paths(self, stage: str, inputs: Mapping[str, object]) -> tuple[Path, ...]:
+        """Fixed canonical paths used to adopt a post-crash completed stage."""
+        root = _canonical_root(self._require_config())
+        paths = {
+            "calibration-matrix": (root / "matrices/calibration.json", root / "matrices/calibration.receipt.json"),
+            "first-100-gate": (root / "reports/calibration-head.json", root / "reports/first-100-gate.json"),
+            "calibration-report": (root / "reports/calibration-tail.json", root / "reports/calibration.json"),
+            "curriculum-matrix": (root / "matrices/curriculum.json", root / "matrices/curriculum.receipt.json"),
+            "fresh-report": (root / "reports/fresh-source-report.json", root / "reports/fresh-source-matrix.json", root / "reports/fresh-terminal-artifacts.json"),
+            "replay-matrix": (root / "replay/replay.json", root / "replay/replay.json.sha256"),
+            "success-replay": (
+                root / "replay/replay.json", root / "replay/ledger.sqlite3",
+                root / "replay/success-replay-readback-seal.json",
+            ),
+        }
+        if stage in {"calibration-head", "calibration-tail", "curriculum-a", "curriculum-b"}:
+            partition = str(inputs["partition_id"])
+            return (root / str(inputs["partition_matrix"]), root / str(inputs["partition_manifest"]), root / "fresh" / partition / "ledger.sqlite3")
+        return paths.get(stage, ())
+
+    def _invoke_if_absent(self, argv: tuple[str, ...], *, stage: str, output: Path, inputs: Mapping[str, object] | None = None) -> None:
+        if output.exists() or output.is_symlink():
+            if output.is_symlink() or not output.is_file():
+                raise ReceiptMismatchError("post-crash stage output is unsafe")
+            return
+        self._invoke(argv, stage=stage, inputs=inputs)
 
     def run(self, stage: str, **kwargs: object) -> Mapping[str, object]:
         config = self._require_config()
@@ -672,12 +955,28 @@ class CommandRunner:
             (root / "reports").mkdir(parents=True, exist_ok=True)
         if stage == "replay-matrix":
             (root / "replay").mkdir(parents=True, exist_ok=True)
+        output_paths = self._output_paths(stage, kwargs)
+        if output_paths and any(path.exists() or path.is_symlink() for path in output_paths):
+            # A completed output is adopted only after deep stage validation.
+            # A partial/mismatched output is never overwritten or rerun.
+            return self._discover(stage, kwargs)
         if stage == "first-100-gate":
-            self._invoke(self._summary_argv("calibration-head", root / "reports/calibration-head.json"), stage="calibration-head-summary")
+            self._invoke_if_absent(self._summary_argv("calibration-head", root / "reports/calibration-head.json"), stage="calibration-head-summary", output=root / "reports/calibration-head.json")
         elif stage == "fresh-report":
-            self._invoke(self._summary_argv("curriculum-a", root / "reports/curriculum-a.json"), stage="curriculum-a-summary")
+            for partition in ("calibration-head", "calibration-tail", "curriculum-a"):
+                output = root / "reports" / "partitions" / f"{partition}.json"
+                self._invoke_if_absent(
+                    self._summary_argv(partition, root / "reports" / "partitions" / f"{partition}.json", simple_partition=True),
+                    stage=f"{partition}-summary",
+                    output=output,
+                )
         argv = self.argv_for(stage, kwargs)
-        self._invoke(argv, stage=stage, inputs=kwargs)
+        if stage == "calibration-report":
+            self._invoke_if_absent(argv, stage=stage, output=root / "reports/calibration-tail.json")
+        elif stage == "fresh-report":
+            self._invoke_if_absent(argv, stage=stage, output=root / "reports/partitions/curriculum-b.json")
+        else:
+            self._invoke(argv, stage=stage, inputs=kwargs)
         if stage == "calibration-report":
             _build_calibration_report(config)
         elif stage == "fresh-report":
@@ -686,10 +985,24 @@ class CommandRunner:
 
     def _invoke(self, argv: tuple[str, ...], *, stage: str, inputs: Mapping[str, object] | None = None) -> None:
         config = self._require_config()
-        completed = subprocess.run(
+        process = subprocess.Popen(
             argv, cwd=config.host_code_root, env=self.environment_for(stage if inputs is not None else "summary", inputs or {}),
-            text=True, capture_output=True, check=False,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
+        while process.poll() is None:
+            if self.budget_check is not None:
+                try:
+                    self.budget_check()
+                except Exception:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill(); process.wait(timeout=10)
+                    raise
+            time.sleep(0.1)
+        stdout, stderr = process.communicate()
+        completed = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
         if completed.returncode:
             raise RuntimeError(f"fixed {stage} adapter failed: {completed.returncode}: {completed.stderr.strip()}")
 
@@ -725,8 +1038,10 @@ class CommandRunner:
             return {"artifacts": _descriptors(root, matrix=matrix, matrix_receipt=receipt)}
         if stage == "fresh-report":
             report = root / "reports/fresh-source-report.json"; matrix = root / "reports/fresh-source-matrix.json"
-            _validate_fresh_source_outputs(config, report=report, matrix=matrix)
-            return {"artifacts": _descriptors(root, report=report)}
+            manifest = root / "reports/fresh-terminal-artifacts.json"
+            authenticated = _validate_fresh_source_outputs(config, report=report, matrix=matrix)
+            _validate_fresh_terminal_artifact_manifest(config, authenticated=authenticated, manifest=manifest)
+            return {"artifacts": _descriptors(root, report=report, matrix=matrix, terminal_artifact_manifest=manifest)}
         if stage == "replay-matrix":
             matrix = root / "replay/replay.json"; receipt = root / "replay/replay.json.sha256"
             if not matrix.exists():
@@ -738,10 +1053,16 @@ class CommandRunner:
             return output
         if stage == "success-replay":
             ledger = root / "replay" / "ledger.sqlite3"; matrix = root / "replay/replay.json"
-            _validate_partition_ledger(
-                ledger, matrix=matrix, max_attempts=400, target=200, completion_metric="accepted_successes",
-            )
-            return {"artifacts": _descriptors(root, matrix=matrix, ledger=ledger), "result": "complete"}
+            result = _discover_success_replay(config, matrix=matrix, ledger=ledger)
+            if result["result"] == "replay_shortage":
+                seal = result.get("readback_seal")
+                if not isinstance(seal, Path):
+                    raise ReceiptMismatchError("success replay shortage seal is missing")
+                return {"artifacts": _descriptors(root, matrix=matrix, ledger=ledger, readback_seal=seal), "result": "replay_shortage"}
+            seal = result.get("readback_seal")
+            if not isinstance(seal, Path):
+                raise ReceiptMismatchError("success replay readback seal is missing")
+            return {"artifacts": _descriptors(root, matrix=matrix, ledger=ledger, readback_seal=seal), "result": "complete"}
         raise RuntimeError(f"fixed {stage} adapter has no canonical output discovery")
 
     def stop_gpu(self, command: str) -> None:
@@ -1122,6 +1443,8 @@ def run_collection(config: CollectionConfig, *, runner: Runner) -> str:
     if isinstance(runner, CommandRunner):
         _prepare_controller_inputs(config)
     journal = StageJournal(config); predecessor: str | None = None
+    if isinstance(runner, CommandRunner):
+        runner.budget_check = journal.check_budget
     existing_terminal = _existing_terminal_outcome(journal)
     if existing_terminal is not None:
         return existing_terminal

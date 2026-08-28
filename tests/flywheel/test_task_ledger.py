@@ -122,6 +122,32 @@ def test_legacy_accepted_success_completion_cap_is_unchanged(tmp_path) -> None:
         TaskLedger(tmp_path / "legacy-cap.sqlite3", attempt_matrix=_matrix(1), target_accepted=151)
 
 
+def test_exact_fresh_visual_replay_is_the_only_200_accepted_ledger_tuple(tmp_path) -> None:
+    """A 200-target exemption cannot silently expand ordinary rollout caps."""
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    rows = [
+        {
+            "attempt_id": f"fresh-{category}-{index}", "trial_id": f"fresh-{category}-{index}",
+            "category": category, "strategy": "visual_only", "category_acceptance_cap": 50,
+        }
+        for category in ("top_long", "top_short", "pant_long", "pant_short")
+        for index in range(100)
+    ]
+    ledger = TaskLedger(
+        tmp_path / "fresh-visual.sqlite3", attempt_matrix=rows, max_attempts=400, target_accepted=200,
+    )
+    try:
+        assert ledger.target_accepted() == 200
+    finally:
+        ledger.close()
+
+    invalid = [dict(row) for row in rows]
+    invalid[0]["category_acceptance_cap"] = 49
+    with pytest.raises(ValueError, match="exact fresh visual"):
+        TaskLedger(tmp_path / "invalid-fresh-visual.sqlite3", attempt_matrix=invalid, max_attempts=400, target_accepted=200)
+
+
 def test_legacy_metadata_backfills_only_accepted_successes_metric(tmp_path) -> None:
     from lehome.flywheel.task_ledger import TaskLedger
 

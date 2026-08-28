@@ -252,12 +252,10 @@ def _is_exact_simple_curriculum_partition(matrix: list[Mapping[str, object]], ar
     }
     if args.device != "cpu" or getattr(args, "completion_metric", "accepted_successes") != "terminal_outcomes" or not matrix:
         return False
-    partition_ids = {row.get("partition_id") for row in matrix}
-    parent_hashes = {row.get("parent_matrix_sha256") for row in matrix}
-    if len(partition_ids) != 1 or len(parent_hashes) != 1:
-        return False
-    partition_id = next(iter(partition_ids))
-    parent_sha = next(iter(parent_hashes))
+    # The matrix is deliberately a verbatim logical slice.  Partition identity
+    # is external and immutable, so adding it to rows would change their hash.
+    partition_id = getattr(args, "simple_partition_id", None)
+    parent_sha = getattr(args, "simple_parent_matrix_sha256", None)
     contract = contracts.get(partition_id)
     if (
         contract is None or not isinstance(parent_sha, str) or re.fullmatch(r"[0-9a-f]{64}", parent_sha) is None
@@ -365,6 +363,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--policy-ready-file", type=Path, required=True)
     parser.add_argument("--initial-garment", required=True)
+    parser.add_argument("--campaign-round-id", default=None)
+    parser.add_argument("--campaign-run-id", default=None)
+    parser.add_argument("--simple-partition-id", default=None)
+    parser.add_argument("--simple-parent-matrix-sha256", default=None)
     return parser
 
 

@@ -1361,7 +1361,7 @@ def test_exact_simple_curriculum_partition_opens_terminal_outcome_ledger_and_ret
             "garment": f"{prefixes[index % 4]}_Seen_{(index // 4) % 10}",
             "garment_name": f"{prefixes[index % 4]}_Seen_{(index // 4) % 10}", "category": categories[index % 4],
             "release_stage": "seen", "seed": 90_000 + index, "source_seed": 90_000 + index,
-            "strategy": "canonical", "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64,
+            "strategy": "canonical",
         }
         for index in range(100)
     ]
@@ -1382,6 +1382,7 @@ def test_exact_simple_curriculum_partition_opens_terminal_outcome_ledger_and_ret
         preparation_timeout_seconds=30.0, attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
         max_attempts=150, target_accepted=100, completion_metric="terminal_outcomes",
         simple_curriculum_collection=True, initial_garment="Top_Long_Seen_0",
+        simple_partition_id="calibration-head", simple_parent_matrix_sha256="a" * 64,
     )
 
     with pytest.raises(RuntimeError, match="ledger reached"):
@@ -1413,7 +1414,7 @@ def test_exact_simple_curriculum_worker_affinity_filters_its_boot_garment(tmp_pa
             "garment": f"{prefixes[index % 4]}_Seen_{(index // 4) % 10}",
             "garment_name": f"{prefixes[index % 4]}_Seen_{(index // 4) % 10}", "category": categories[index % 4],
             "release_stage": "seen", "seed": 90_000 + index, "source_seed": 90_000 + index,
-            "strategy": "canonical", "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64,
+            "strategy": "canonical",
         }
         for index in range(100)
     ]
@@ -1442,6 +1443,7 @@ def test_exact_simple_curriculum_worker_affinity_filters_its_boot_garment(tmp_pa
         max_attempts=150, target_accepted=100, completion_metric="terminal_outcomes",
         simple_curriculum_collection=True, initial_garment="Top_Short_Seen_1",
         worker_id="worker-2", session_id="session-2", output_root=tmp_path / "output",
+        simple_partition_id="calibration-head", simple_parent_matrix_sha256="a" * 64,
     )
 
     def ledger_factory(*ledger_args, **ledger_kwargs):

@@ -9,6 +9,8 @@ import sys
 
 import pytest
 
+from lehome.flywheel.simple_curriculum import build_calibration_rows
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "summarize_groot_persistent_evaluation.py"
@@ -16,6 +18,16 @@ SCRIPT = ROOT / "scripts" / "summarize_groot_persistent_evaluation.py"
 
 def _module():
     spec = importlib.util.spec_from_file_location("persistent_summary_first100", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _orchestrator_module():
+    path = ROOT / "scripts" / "run_simple_curriculum_collection.py"
+    spec = importlib.util.spec_from_file_location("simple_curriculum_orchestrator", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -92,15 +104,21 @@ def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
 
 
-def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malformed_receipt: int | None = None, retry_then_valid: int | None = None, contradictory_safety: int | None = None, all_success: bool = False, evaluation_terminal: bool = True, episode_mutator=None, receipt_mutator=None, session_for_index=None) -> tuple[Path, Path, list[dict[str, object]], dict[str, str]]:
+def _simple_campaign(tmp_path: Path, *, rows: list[dict[str, object]] | None = None, campaign_root: Path | None = None, matrix_path: Path | None = None, policy: dict[str, object] | None = None, missing_receipt: int | None = None, malformed_receipt: int | None = None, retry_then_valid: int | None = None, contradictory_safety: int | None = None, all_success: bool = False, evaluation_terminal: bool = True, episode_mutator=None, receipt_mutator=None, session_for_index=None) -> tuple[Path, Path, list[dict[str, object]], dict[str, str]]:
     from lehome.flywheel.artifact_queue import ArtifactFinalizationQueue
     from lehome.flywheel.simple_curriculum import build_calibration_rows
     from lehome.flywheel.task_ledger import TaskLedger
 
-    rows = build_calibration_rows(_catalog(), seed_base=900)[:100]
-    root = tmp_path / "campaign"; root.mkdir()
-    matrix = tmp_path / "matrix.json"; matrix.write_bytes(_canonical(rows))
-    ledger = TaskLedger(root / "ledger.sqlite3", attempt_matrix=rows, max_attempts=101 if retry_then_valid is not None else 100, target_accepted=100)
+    rows = rows or build_calibration_rows(_catalog(), seed_base=900)[:100]
+    root = campaign_root or tmp_path / "campaign"; root.mkdir(parents=True, exist_ok=False)
+    matrix = matrix_path or tmp_path / "matrix.json"; matrix.parent.mkdir(parents=True, exist_ok=True); matrix.write_bytes(_canonical(rows))
+    policy = policy or POLICY
+    target = len(rows)
+    ledger = TaskLedger(
+        root / "ledger.sqlite3", attempt_matrix=rows,
+        max_attempts=target + int(retry_then_valid is not None), target_accepted=target,
+        completion_metric="terminal_outcomes",
+    )
     finalizer = ArtifactFinalizationQueue(
         run_root=root, ledger=ledger, max_pending_items=1, max_pending_bytes=1 << 30,
         evaluation_only=evaluation_terminal,
@@ -114,20 +132,24 @@ def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malf
             lease = ledger.lease_next("worker", lease_duration_ns=1_000_000_000)
             assert lease is not None
         ledger_id = lease.attempt.attempt_id
+        # A retried lease can be a different logical schedule row than this
+        # fixture loop index.  Production workers must bind their episode to
+        # the durable leased assignment, never to a local loop counter.
+        assignment = dict(lease.attempt.assignment)
         session_id = session_for_index(index) if session_for_index is not None else "session"
         output = root / "worker" / session_id / ledger_id / lease.lease_id / f"generation-{index + 1}"
         raw = output / "raw" / ledger_id; raw.mkdir(parents=True)
         videos = output / "videos"; videos.mkdir(); (videos / "top.mp4").write_bytes(b"video")
-        ledger_ids[str(row["attempt_id"])] = ledger_id
+        ledger_ids[str(assignment["attempt_id"])] = ledger_id
         episode = {
             "episode_id": ledger_id,
             "identity": {
-                **POLICY, "episode_id": ledger_id, "code_revision": "c" * 40,
+                **policy, "episode_id": ledger_id, "code_revision": "c" * 40,
                 "asset_revision": "a" * 40, "simulator_version": "5.1.0.0",
-                "garment_name": row["garment_name"], "category": row["category"],
-                "release_stage": row["release_stage"], "seed": row["seed"],
+                "garment_name": assignment["garment_name"], "category": assignment["category"],
+                "release_stage": assignment["release_stage"], "seed": assignment["seed"],
             },
-            "provenance": {"policy_artifact_sha256": POLICY["policy_artifact_sha256"], "simulator_device": "cpu", "policy_device": "cuda:0", "image_identity": "sha256:" + "d" * 64},
+            "provenance": {"policy_artifact_sha256": policy["policy_artifact_sha256"], "simulator_device": "cpu", "policy_device": "cuda:0", "image_identity": "sha256:" + "d" * 64},
             "outcome": "success" if all_success or index < 5 else "timeout", "accepted_success": all_success or index < 5,
             "safety_failure": index == contradictory_safety,
             "fidelity": {"missing_cloth": False, "cloth_flight": False, "nonfinite_cloth_state": False, "safety_failure": False, "monitor_active": True, "monitor_observed": True},
@@ -137,7 +159,7 @@ def _simple_campaign(tmp_path: Path, *, missing_receipt: int | None = None, malf
         (raw / "episode.json").write_bytes(_canonical(episode))
         receipt = {
             "schema_version": 1, "attempt_id": ledger_id, "lease_id": lease.lease_id,
-            "worker_id": "worker", "session_id": session_id, "seed": row["seed"], "garment": row["garment_name"],
+            "worker_id": "worker", "session_id": session_id, "seed": assignment["seed"], "garment": assignment["garment_name"],
             "episode_generation": index + 1, "output_dir": str(output), "action_horizon": 250,
             "outcome": {"success": all_success or index < 5, "metrics": []}, "simulation_device": "cpu", "cloth_device": "cpu",
             "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0",
@@ -186,6 +208,138 @@ def test_simple_summary_uses_external_matrix_assignment_ids_and_passes_gate_dire
         trusted_policy=POLICY, policy_bytes=_canonical(POLICY), catalog=_catalog(), catalog_bytes=_canonical(_catalog()),
     )
     assert receipt["decision"] == "continue"
+
+
+def test_simple_partition_report_authenticates_an_unequal_weighted_split(tmp_path: Path) -> None:
+    """The 300-row curriculum physical split is deliberately not balanced."""
+    summary = _module()
+    base = build_calibration_rows(_catalog(), seed_base=900)
+    quotas = {"top_long": 78, "top_short": 77, "pant_long": 77, "pant_short": 68}
+    rows = [row for category, quota in quotas.items() for row in [entry for entry in base if entry["category"] == category][:quota]]
+    # Give every selected row a new unique logical identity while preserving
+    # the canonical physical fields required by the terminal evidence path.
+    rows = [{**row, "attempt_id": f"curriculum-{index:03d}", "trial_id": f"curriculum-{index:03d}", "logical_stage": "curriculum"} for index, row in enumerate(rows)]
+    root, matrix, expected, ledger_ids = _simple_campaign(tmp_path, rows=rows)
+
+    report = summary.build_simple_partition_report(
+        campaign_root=root, matrix_path=matrix,
+        matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(), **POLICY,
+    )
+
+    assert report["episodes"] == 300
+    assert report["kind"] == "lehome_simple_curriculum_partition_report_v1"
+    assert report["logical_stage"] == "curriculum"
+    assert report["trials"][0]["attempt_id"] == ledger_ids[str(expected[0]["attempt_id"])]
+    assert report["trials"][0]["assignment_id"] == expected[0]["attempt_id"]
+    assert report["trials"][0]["finalized_artifact_root"].endswith(report["trials"][0]["attempt_id"])
+    assert report["trials"][0]["runtime"] == {
+        "simulation_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0",
+        "camera_device": "cuda:0", "policy_device": "cuda:0",
+    }
+
+
+def test_fresh_source_adoption_rehashes_actual_terminal_artifacts_for_all_four_partitions(tmp_path: Path) -> None:
+    """The 1,000-row fresh-source receipt is rooted in real terminal artifacts."""
+    from lehome.flywheel.fresh_replay_evidence import (
+        PARENT_ARTIFACT_SHA256,
+        PARENT_POLICY_REPO,
+        PARENT_REVISION,
+        _episode_artifact_sha256,
+        authenticate_fresh_source_contract,
+    )
+
+    summary, controller = _module(), _orchestrator_module()
+    campaign = tmp_path / "collection"
+    round_id, run_id = "fresh-12k-integration", "fresh-run-integration"
+    policy = {
+        "policy_repo": PARENT_POLICY_REPO,
+        "policy_revision": PARENT_REVISION,
+        "policy_step": 12_000,
+        "policy_artifact_sha256": PARENT_ARTIFACT_SHA256,
+    }
+    runtime = {
+        **policy,
+        "rollout_image": "repo/rollout@sha256:" + "a" * 64,
+        "trainer_image": "repo/trainer@sha256:" + "b" * 64,
+        "simulator_device": "cpu", "cloth_device": "cpu", "policy_device": "cuda:0", "worker_count": 4,
+    }
+    observer = tmp_path / "observer.json"
+    observer.write_text(json.dumps({
+        "schema_version": 1, "kind": "lehome_spend_observation_v1", "observer": "fixture",
+        "observed_at_utc": "2026-08-28T00:00:00Z", "spent_usd": 0.0,
+    }), encoding="utf-8")
+    config = controller.CollectionConfig(
+        campaign_root=campaign, host_code_root=tmp_path, run_id=run_id, round_id=round_id,
+        max_wall_seconds=3600.0, max_spend_usd=99.0, paid=False, gpu_stop_command=None,
+        runtime_identity=runtime, spend_observer=observer,
+    )
+
+    calibration = build_calibration_rows(_catalog(), seed_base=910)
+    curriculum = [
+        {
+            **calibration[index % len(calibration)],
+            "attempt_id": f"curriculum-{index:04d}", "trial_id": f"curriculum-{index:04d}",
+            "seed": 2_000_000 + index, "source_seed": 2_000_000 + index, "logical_stage": "curriculum",
+        }
+        for index in range(600)
+    ]
+    partitions = {
+        "calibration-head": calibration[:100],
+        "calibration-tail": calibration[100:],
+        "curriculum-a": curriculum[:300],
+        "curriculum-b": curriculum[300:],
+    }
+
+    def canonical_episode(episode: dict[str, object], _index: int) -> None:
+        identity = episode["identity"]
+        provenance = episode["provenance"]
+        assert isinstance(identity, dict) and isinstance(provenance, dict)
+        identity.update(campaign_round_id=round_id, campaign_run_id=run_id)
+        provenance.update(cloth_device="cpu", renderer_device="cuda:0", camera_device="cuda:0")
+        episode["randomization"] = {"strategy": "canonical"}
+
+    for partition, rows in partitions.items():
+        partition_root = campaign / "fresh" / partition
+        matrix = campaign / "partitions" / f"{partition}.json"
+        root, physical_matrix, _rows, _ledger_ids = _simple_campaign(
+            tmp_path, rows=rows, campaign_root=partition_root, matrix_path=matrix,
+            policy=policy, episode_mutator=canonical_episode,
+        )
+        report = summary.build_simple_partition_report(
+            campaign_root=root, matrix_path=physical_matrix,
+            matrix_sha256=hashlib.sha256(physical_matrix.read_bytes()).hexdigest(), **policy,
+        )
+        report_path = campaign / "reports" / "partitions" / f"{partition}.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_bytes(_canonical(report))
+        for trial in report["trials"]:
+            if trial["terminal_event"] != "accepted":
+                continue
+            attempt = str(trial["attempt_id"])
+            artifact = Path(str(trial["finalized_artifact_root"]))
+            receipt = partition_root / "hf-sync-receipts" / f"{attempt}.sync.json"
+            receipt.parent.mkdir(exist_ok=True)
+            receipt.write_bytes(_canonical({
+                "readback_verified": True, "attempt_id": attempt, "round_id": round_id, "run_id": run_id,
+                "remote_prefix": f"rollout-rounds/{round_id}/{attempt}",
+                "episode_sha256": _episode_artifact_sha256(artifact), "immutable_revision": "c" * 40,
+            }))
+
+    controller._build_fresh_source_report(config)
+    report_path = campaign / "reports" / "fresh-source-report.json"
+    matrix_path = campaign / "reports" / "fresh-source-matrix.json"
+    assert len(authenticate_fresh_source_contract((report_path,), (matrix_path,))) == 1_000
+    terminal_manifest = json.loads((campaign / "reports" / "fresh-terminal-artifacts.json").read_text(encoding="utf-8"))
+    assert len(terminal_manifest["entries"]) == 1_000
+
+    accepted = next(entry for entry in terminal_manifest["entries"] if entry["terminal_event"] == "accepted")
+    episode_path = Path(str(accepted["finalized_artifact_root"])) / "raw" / str(accepted["attempt_id"]) / "episode.json"
+    payload = json.loads(episode_path.read_text(encoding="utf-8"))
+    payload["post_receipt_mutation"] = True
+    episode_path.write_bytes(_canonical(payload))
+
+    with pytest.raises(controller.ReceiptMismatchError, match="fresh terminal"):
+        controller.CommandRunner(config)._discover("fresh-report", {})
 
 
 def test_simple_head_retains_mixed_policy_failures_as_authenticated_terminal_evidence(tmp_path: Path) -> None:

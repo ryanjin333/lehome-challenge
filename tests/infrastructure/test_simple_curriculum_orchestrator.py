@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -48,8 +49,8 @@ class FakeRunner:
             "first-100-gate": ("report", "gate_receipt"), "calibration-tail": ("matrix", "manifest", "ledger"),
             "calibration-report": ("report",), "curriculum-matrix": ("matrix", "matrix_receipt"),
             "curriculum-a": ("matrix", "manifest", "ledger"), "curriculum-b": ("matrix", "manifest", "ledger"),
-            "fresh-report": ("report",), "replay-matrix": ("matrix", "matrix_receipt"),
-            "success-replay": ("matrix", "ledger"), "final-publication": ("publication_receipt", "publication_readback"),
+            "fresh-report": ("report", "matrix", "terminal_artifact_manifest"), "replay-matrix": ("matrix", "matrix_receipt"),
+            "success-replay": ("matrix", "ledger", "readback_seal"), "final-publication": ("publication_receipt", "publication_readback"),
         }[stage]
         artifacts = {}
         for name in names:
@@ -80,7 +81,7 @@ def _config(module, tmp_path: Path):
         campaign_root=tmp_path / "campaign",
         host_code_root=host,
         run_id="fresh-run-20260828",
-        round_id="fresh-round-20260828",
+        round_id="fresh-12k-20260828",
         max_wall_seconds=3600.0,
         max_spend_usd=99.0,
         paid=True,
@@ -304,6 +305,29 @@ def test_paid_budget_gate_fails_before_runner_at_exact_spend_boundary(tmp_path: 
     assert runner.calls == []
 
 
+def test_inflight_budget_watchdog_terminates_a_clean_child_before_returning(tmp_path: Path) -> None:
+    """A live paid adapter cannot outlive a newly observed budget breach."""
+    module = _module(); runner = module.CommandRunner(_config(module, tmp_path))
+    observations = 0
+
+    def observe_then_breach() -> None:
+        nonlocal observations
+        observations += 1
+        if observations >= 2:
+            raise module.BudgetLimitError("paid budget or wall-time limit reached")
+
+    runner.budget_check = observe_then_breach
+    started = time.monotonic()
+    with pytest.raises(module.BudgetLimitError, match="budget"):
+        runner._invoke(
+            (sys.executable, "-c", "import time; time.sleep(30)"),
+            stage="watchdog", inputs={},
+        )
+
+    assert observations >= 2
+    assert time.monotonic() - started < 3
+
+
 def test_paid_simple_wrapper_contract_requires_one_vm_marker() -> None:
     text = (ROOT / "rollout_appliance" / "run_12k_campaign.sh").read_text(encoding="utf-8")
     assert 'paid simple curriculum requires LEHOME_ONE_VM_ORCHESTRATOR=1' in text
@@ -349,6 +373,15 @@ def test_fixed_adapter_executes_real_matrix_cli_with_clean_typed_handoff(tmp_pat
     assert len(json.loads(matrix.read_text(encoding="utf-8"))) == 400
     assert json.loads(receipt.read_text(encoding="utf-8"))["output_sha256"] == result["artifacts"]["matrix"]["sha256"]
 
+    def must_not_reinvoke(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a completed matrix must be adopted without rerunning its producer")
+
+    monkeypatch.setattr(runner, "_invoke", must_not_reinvoke)
+    assert runner.run("calibration-matrix") == result
+    receipt.unlink()
+    with pytest.raises(module.ReceiptMismatchError, match="receipt"):
+        runner.run("calibration-matrix")
+
 
 def test_existing_stop_state_without_immutable_stop_receipt_never_retries_stop(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path); runner = FakeRunner(config.campaign_root)
@@ -386,10 +419,30 @@ def test_partition_adapter_passes_exact_one_vm_tuple_without_inherited_lehome_en
     assert environment["LEHOME_SIMPLE_CURRICULUM_COLLECTION"] == "1"
     assert environment["LEHOME_ONE_VM_ORCHESTRATOR"] == "1"
     assert environment["LEHOME_PAID_COLLECTION"] == "1"
+    assert environment["LEHOME_RESUME_PREEMPTED_ROLLOUT"] == "0"
+    assert environment["LEHOME_ROLLOUT_PREEMPTION_CONTEXT"] == str(config.campaign_root / "fresh" / "calibration-head" / "rollout-preemption.json")
     assert set(key for key in environment if key.startswith("LEHOME_")) >= {
         "LEHOME_POLICY_REPO", "LEHOME_POLICY_REVISION", "LEHOME_POLICY_ARTIFACT_SHA256",
         "LEHOME_ROLLOUT_IMAGE", "LEHOME_TRAINER_IMAGE", "LEHOME_RUN_ID", "LEHOME_ROUND_ID",
     }
+
+
+def test_partition_adapter_exports_durable_preemption_contract(tmp_path: Path) -> None:
+    module = _module(); config = _config(module, tmp_path)
+    root = config.campaign_root
+    matrix = root / "partitions/calibration-head.json"; matrix.parent.mkdir(parents=True)
+    matrix.write_text("[]", encoding="utf-8")
+    manifest = root / "partitions/calibration-head.manifest.json"
+    manifest.write_text(json.dumps({"parent_matrix_sha256": "a" * 64}), encoding="utf-8")
+    stage = root / "fresh/calibration-head"; stage.mkdir(parents=True)
+    (stage / "ledger.sqlite3").write_bytes(b"sqlite")
+    context = stage / "rollout-preemption.json"; context.write_text("{}", encoding="utf-8")
+    inputs = {"partition_id": "calibration-head", "partition_matrix": "partitions/calibration-head.json", "partition_manifest": "partitions/calibration-head.manifest.json", "partition_sha256": hashlib.sha256(matrix.read_bytes()).hexdigest(), "row_start": 0, "row_end": 100, "target": 100, "lease_budget": 150}
+
+    environment = module.CommandRunner(config).environment_for("calibration-head", inputs)
+
+    assert environment["LEHOME_RESUME_PREEMPTED_ROLLOUT"] == "1"
+    assert environment["LEHOME_ROLLOUT_PREEMPTION_CONTEXT"] == str(context)
 
 
 def test_paid_spend_observer_rejects_stale_or_different_meter_receipts(tmp_path: Path) -> None:
@@ -407,3 +460,84 @@ def test_paid_spend_observer_rejects_stale_or_different_meter_receipts(tmp_path:
 
     with pytest.raises(module.ReceiptMismatchError, match="observer"):
         journal.check_budget()
+
+
+def test_exhausted_visual_replay_with_a_category_shortage_is_a_data_outcome(tmp_path: Path) -> None:
+    """All 400 rejected parents are a replay shortage, never a fake success."""
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    module = _module(); config = _config(module, tmp_path)
+    rows = [
+        {
+            "attempt_id": f"replay-{category}-{index}", "trial_id": f"replay-{category}-{index}",
+            "category": category, "strategy": "visual_only", "category_acceptance_cap": 50,
+        }
+        for category in ("top_long", "top_short", "pant_long", "pant_short")
+        for index in range(100)
+    ]
+    replay = config.campaign_root / "replay" / "replay.json"; replay.parent.mkdir(parents=True)
+    encoded = json.dumps(rows, sort_keys=True, separators=(",", ":")) + "\n"
+    replay.write_text(encoded, encoding="utf-8")
+    (replay.with_suffix(".json.sha256")).write_text(hashlib.sha256(encoded.encode()).hexdigest() + "\n", encoding="ascii")
+    ledger = TaskLedger(config.campaign_root / "replay" / "ledger.sqlite3", attempt_matrix=rows, max_attempts=400, target_accepted=200)
+    try:
+        for index in range(400):
+            lease = ledger.lease_next(f"worker-{index % 4}", lease_duration_ns=10**15)
+            assert lease is not None
+            ledger.record_terminal(lease.worker_id, lease.attempt.attempt_id, lease.lease_id, f"raw-{index}")
+            assert ledger.validate_terminal(lease.attempt.attempt_id, "rejected") == "rejected"
+    finally:
+        ledger.close()
+
+    discovered = module.CommandRunner(config)._discover("success-replay", {})
+
+    assert discovered["result"] == "replay_shortage"
+
+
+def test_exact_visual_replay_seals_only_the_200_readback_verified_category_capped_successes(tmp_path: Path) -> None:
+    from lehome.flywheel.fresh_replay_evidence import _episode_artifact_sha256
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    module = _module(); config = _config(module, tmp_path)
+    categories = ("top_long", "top_short", "pant_long", "pant_short")
+    rows = [
+        {
+            "attempt_id": f"replay-{category}-{index}", "trial_id": f"replay-{category}-{index}",
+            "category": category, "strategy": "visual_only", "category_acceptance_cap": 50,
+        }
+        for index in range(100) for category in categories
+    ]
+    replay = config.campaign_root / "replay" / "replay.json"; replay.parent.mkdir(parents=True)
+    encoded = json.dumps(rows, sort_keys=True, separators=(",", ":")) + "\n"
+    replay.write_text(encoded, encoding="utf-8")
+    (replay.with_suffix(".json.sha256")).write_text(hashlib.sha256(encoded.encode()).hexdigest() + "\n", encoding="ascii")
+    ledger = TaskLedger(config.campaign_root / "replay" / "ledger.sqlite3", attempt_matrix=rows, max_attempts=400, target_accepted=200)
+    try:
+        for index in range(200):
+            lease = ledger.lease_next(f"worker-{index % 4}", lease_duration_ns=10**15)
+            assert lease is not None
+            artifact = config.campaign_root / "replay" / "accepted" / lease.attempt.attempt_id
+            artifact.mkdir(parents=True); (artifact / "rollout.json").write_text("{}\n", encoding="utf-8")
+            digest = _episode_artifact_sha256(artifact)
+            receipt = config.campaign_root / "replay" / "hf-sync-receipts" / f"{lease.attempt.attempt_id}.sync.json"
+            receipt.parent.mkdir(exist_ok=True)
+            receipt.write_bytes((json.dumps({
+                "schema_version": 1, "attempt_id": lease.attempt.attempt_id,
+                "repository": "ryanjin333/lehome-groot-n17-rollouts",
+                "round_id": config.round_id + "-replay",
+                "remote_prefix": f"rollout-rounds/{config.round_id}-replay/{lease.attempt.attempt_id}",
+                "readback_verified": True, "episode_sha256": digest, "immutable_revision": "c" * 40,
+            }, sort_keys=True, separators=(",", ":")) + "\n").encode())
+            ledger.record_terminal(lease.worker_id, lease.attempt.attempt_id, lease.lease_id, str(artifact))
+            assert ledger.validate_terminal(lease.attempt.attempt_id, "accepted", artifact_id=str(artifact)) == "accepted"
+    finally:
+        ledger.close()
+
+    discovered = module.CommandRunner(config)._discover("success-replay", {})
+
+    assert discovered["result"] == "complete"
+    seal = config.campaign_root / discovered["artifacts"]["readback_seal"]["path"]
+    payload = json.loads(seal.read_text(encoding="utf-8"))
+    assert payload["readback_verified"] is True
+    assert payload["accepted_by_category"] == {category: 50 for category in categories}
+    assert len(payload["accepted_attempt_ids"]) == 200
