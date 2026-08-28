@@ -336,6 +336,38 @@ def _write_exact_matrix(
     })
 
 
+def _append_runtime_policy_failure(rows: list[dict[str, object]], environment: dict[str, str]) -> None:
+    matrix_path = Path(json.loads(environment["LEHOME_FRESH_SOURCE_MATRICES_JSON"])[0]["path"])
+    report_path = Path(json.loads(environment["LEHOME_FRESH_SOURCE_REPORTS_JSON"])[0]["path"])
+    matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    attempt = "failed-top-long-0"
+    matrix.append({
+        "attempt_id": attempt, "trial_id": attempt, "category": "top_long",
+        "garment_name": "top_long-garment", "release_stage": "seen", "strategy": "canonical",
+        "campaign_kind": "fresh_12k_success_source_v1", "logical_stage": "fresh_success_source",
+        "campaign_round_id": report["round_id"], "campaign_run_id": report["run_id"],
+    })
+    matrix_bytes = (json.dumps(matrix, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    matrix_path.write_bytes(matrix_bytes)
+    matrix_sha = hashlib.sha256(matrix_bytes).hexdigest()
+    environment["LEHOME_FRESH_SOURCE_MATRICES_JSON"] = json.dumps([{"path": str(matrix_path), "sha256": matrix_sha}])
+    for row in rows:
+        row["source_matrix_sha256"] = matrix_sha
+    report["matrix_sha256"] = matrix_sha
+    report["trials"].append({
+        "attempt_id": attempt, "category": "top_long", "garment_name": "top_long-garment",
+        "accepted_success": False, "official_success": False, "outcome": "failure",
+        "simulator_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0",
+        "camera_device": "cuda:0", "policy_device": "cuda:0",
+        "safety_failure": False, "numerical_failure": False, "cloth_failure": False,
+        "remote_prefix": f"rollout-rounds/{report['round_id']}/{attempt}",
+        "campaign_round_id": report["round_id"], "campaign_run_id": report["run_id"],
+    })
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    _rewrite_fresh_report(rows, environment)
+
+
 def _run_exact_path(path: Path, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["bash", str(path)], env=os.environ | environment, capture_output=True, text=True, check=False)
 
@@ -596,11 +628,21 @@ def test_success_replay_wrapper_admits_200_only_for_exact_fresh_visual_only_tupl
     assert "exact" in rejected.stderr
 
 
+def test_both_exact_200_paths_admit_authenticated_unselected_policy_failures(tmp_path: Path) -> None:
+    rows, environment = _fresh_evidence_matrix(tmp_path)
+    _append_runtime_policy_failure(rows, environment)
+    _write_exact_matrix(tmp_path, rows, environment)
+
+    for path in (WRAPPER, BASE_CAMPAIGN):
+        result = _run_exact_path(path, environment)
+        assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
         "wrong-policy", "wrong-campaign-kind", "wrong-logical-stage", "non-cpu",
-        "safety-failure", "numerical-failure", "cloth-failure", "mild-reset",
+        "safety-failure", "numerical-failure", "cloth-failure", "failed-parent", "mild-reset",
         "nan-h16", "infinite-h16",
     ],
 )
@@ -623,6 +665,8 @@ def test_both_exact_200_paths_reject_self_consistent_untrusted_source_contracts(
         trial["simulator_device"] = "cuda:0"
     elif mutation in {"safety-failure", "numerical-failure", "cloth-failure"}:
         trial[mutation.replace("-", "_")] = True
+    elif mutation == "failed-parent":
+        trial.update(accepted_success=False, official_success=False, outcome="failure")
     elif mutation == "mild-reset":
         reset = Path(str(next(row for row in rows if row["category"] == category)["source_episode_root"])) / "raw" / str(trial["attempt_id"]) / "snapshots" / "reset.json"
         payload = json.loads(reset.read_text(encoding="utf-8"))

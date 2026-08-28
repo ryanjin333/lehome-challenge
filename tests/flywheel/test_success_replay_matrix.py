@@ -228,6 +228,40 @@ def _write_fresh_sources(accepted: Path) -> tuple[Path, Path]:
     return report_path, matrix_path
 
 
+def _append_authenticated_policy_failures(
+    report_path: Path, matrix_path: Path, *, category: str, garment: str, count: int,
+) -> None:
+    """Add valid policy failures: they affect rate weighting but have no parent artifacts."""
+
+    matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    for index in range(count):
+        attempt_id = f"failed-{category}-{index}"
+        matrix.append(
+            {
+                "attempt_id": attempt_id, "trial_id": attempt_id, "category": category,
+                "garment_name": garment, "release_stage": "seen", "strategy": "canonical",
+                "campaign_kind": "fresh_12k_success_source_v1", "logical_stage": "fresh_success_source",
+                "campaign_round_id": report["round_id"], "campaign_run_id": report["run_id"],
+            }
+        )
+        report["trials"].append(
+            {
+                "attempt_id": attempt_id, "category": category, "garment_name": garment,
+                "accepted_success": False, "official_success": False, "outcome": "failure",
+                "simulator_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0",
+                "camera_device": "cuda:0", "policy_device": "cuda:0",
+                "safety_failure": False, "numerical_failure": False, "cloth_failure": False,
+                "remote_prefix": f"rollout-rounds/{report['round_id']}/{attempt_id}",
+                "campaign_round_id": report["round_id"], "campaign_run_id": report["run_id"],
+            }
+        )
+    matrix_path.write_bytes(_canonical(matrix))
+    report["matrix_sha256"] = hashlib.sha256(matrix_path.read_bytes()).hexdigest()
+    report["report_sha256"] = _report_digest(report)
+    report_path.write_bytes(_canonical(report))
+
+
 def test_builder_creates_balanced_lineage_bound_success_replays(tmp_path: Path) -> None:
     from scripts.build_success_replay_matrix import build_success_replay_matrix
 
@@ -589,6 +623,44 @@ def test_fresh_visual_only_mode_binds_authenticated_cpu_sources_and_is_determini
                 "source_receipt_sha256",
             )
         ) <= set(row)
+
+
+def test_fresh_visual_only_sampling_uses_all_authenticated_policy_outcomes_for_garment_weights(
+    tmp_path: Path,
+) -> None:
+    from scripts.build_success_replay_matrix import _fresh_source_parents, build_success_replay_matrix
+
+    accepted = tmp_path / "accepted"
+    _write_success(accepted, attempt_id="fresh-top-long-low", category="top_long", garment="Top_Long_Seen_0")
+    _write_success(accepted, attempt_id="fresh-top-long-high", category="top_long", garment="Top_Long_Seen_1")
+    for index, category in enumerate(CATEGORIES[1:], start=2):
+        _write_success(accepted, attempt_id=f"fresh-{category}", category=category, garment=f"{category.title().replace('_', '_')}_Seen_{index}")
+    report, source_matrix = _write_fresh_sources(accepted)
+    _append_authenticated_policy_failures(
+        report, source_matrix, category="top_long", garment="Top_Long_Seen_0", count=3,
+    )
+
+    grouped, _ = _fresh_source_parents(
+        accepted_roots=(accepted,), source_reports=(report,), source_matrices=(source_matrix,),
+    )
+    rates = {str(parent["garment"]): float(parent["fresh_success_rate"]) for parent in grouped["top_long"]}
+    assert rates == {"Top_Long_Seen_0": 0.25, "Top_Long_Seen_1": 1.0}
+    assert {garment: max(1 - rate, 0.01) for garment, rate in rates.items()} == {
+        "Top_Long_Seen_0": 0.75, "Top_Long_Seen_1": 0.01,
+    }
+
+    first, second = tmp_path / "first.json", tmp_path / "second.json"
+    for output in (first, second):
+        build_success_replay_matrix(
+            accepted_root=accepted, output=output, source_reports=(report,), source_matrices=(source_matrix,),
+            strategy="visual_only", attempt_cap_per_category=100, acceptance_cap_per_category=50,
+            max_attempts=400, target_accepted=200, rng_seed=20260827400,
+        )
+    rows = json.loads(first.read_text(encoding="utf-8"))
+    top_long_parents = [row["parent_episode_id"] for row in rows if row["category"] == "top_long"]
+    assert first.read_bytes() == second.read_bytes()
+    assert top_long_parents.count("fresh-top-long-low") == 99
+    assert top_long_parents.count("fresh-top-long-high") == 1
 
 
 @pytest.mark.parametrize(

@@ -463,15 +463,24 @@ def _fresh_source_parents(
                 raise ValueError("fresh source report trial is malformed")
             attempt_id = trial.get("attempt_id")
             matrix_row = matrix_rows.get(attempt_id) if isinstance(attempt_id, str) else None
+            is_success = (
+                trial.get("accepted_success") is True
+                and trial.get("official_success") is True
+                and trial.get("outcome") == "success"
+            )
+            is_policy_failure = (
+                trial.get("accepted_success") is False
+                and trial.get("official_success") is False
+                and trial.get("outcome") == "failure"
+            )
             if (
                 attempt_id in report_trials
                 or matrix_row is None
                 or trial.get("category") != matrix_row.get("category")
                 or trial.get("garment_name") != matrix_row.get("garment_name")
                 or type(trial.get("accepted_success")) is not bool
-                or trial.get("accepted_success") is not True
-                or trial.get("official_success") is not True
-                or trial.get("outcome") != "success"
+                or type(trial.get("official_success")) is not bool
+                or not (is_success or is_policy_failure)
                 or trial.get("simulator_device") != "cpu"
                 or trial.get("cloth_device") != "cpu"
                 or any(
@@ -483,10 +492,14 @@ def _fresh_source_parents(
                 or any(trial.get(field) is not False for field in (
                     "safety_failure", "numerical_failure", "cloth_failure",
                 ))
-                or not isinstance(trial.get("artifact_sha256"), str)
-                or _SHA256.fullmatch(trial["artifact_sha256"]) is None
-                or not isinstance(trial.get("hub_sync_receipt_sha256"), str)
-                or _SHA256.fullmatch(trial["hub_sync_receipt_sha256"]) is None
+                or (
+                    is_success and (
+                        not isinstance(trial.get("artifact_sha256"), str)
+                        or _SHA256.fullmatch(trial["artifact_sha256"]) is None
+                        or not isinstance(trial.get("hub_sync_receipt_sha256"), str)
+                        or _SHA256.fullmatch(trial["hub_sync_receipt_sha256"]) is None
+                    )
+                )
                 or trial.get("remote_prefix") != f"rollout-rounds/{report['round_id']}/{attempt_id}"
                 or trial.get("campaign_round_id") != report["round_id"]
                 or trial.get("campaign_run_id") != report["run_id"]
@@ -520,7 +533,11 @@ def _fresh_source_parents(
         key = (str(trial["category"]), str(trial["garment_name"]))
         successes, total = fresh_rates.get(key, (0, 0))
         fresh_rates[key] = (
-            successes + int(trial.get("accepted_success") is True and trial.get("outcome") == "success"),
+            successes + int(
+                trial.get("accepted_success") is True
+                and trial.get("official_success") is True
+                and trial.get("outcome") == "success"
+            ),
             total + 1,
         )
 
@@ -531,6 +548,7 @@ def _fresh_source_parents(
             raise ValueError("fresh source report matrix binding is malformed")
         if (
             trial.get("accepted_success") is not True
+            or trial.get("official_success") is not True
             or trial.get("outcome") != "success"
             or trial.get("category") not in CATEGORIES
             or trial.get("category") != next(

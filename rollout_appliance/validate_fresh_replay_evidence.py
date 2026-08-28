@@ -281,18 +281,32 @@ def _validate_report(
         attempt = str(trial["attempt_id"])
         matrix_row = matrix_rows.get(attempt)
         devices = (trial.get("renderer_device"), trial.get("camera_device"), trial.get("policy_device"))
+        is_success = (
+            trial.get("accepted_success") is True
+            and trial.get("official_success") is True
+            and trial.get("outcome") == "success"
+        )
+        is_policy_failure = (
+            trial.get("accepted_success") is False
+            and trial.get("official_success") is False
+            and trial.get("outcome") == "failure"
+        )
         if (
             attempt in trials or matrix_row is None
             or trial.get("category") != matrix_row.get("category")
             or trial.get("garment_name") != matrix_row.get("garment_name")
-            or trial.get("accepted_success") is not True or trial.get("official_success") is not True
-            or trial.get("outcome") != "success" or trial.get("simulator_device") != "cpu"
+            or type(trial.get("accepted_success")) is not bool or type(trial.get("official_success")) is not bool
+            or not (is_success or is_policy_failure) or trial.get("simulator_device") != "cpu"
             or trial.get("cloth_device") != "cpu"
             or any(not isinstance(value, str) or _CUDA_DEVICE.fullmatch(value) is None for value in devices)
             or len(set(devices)) != 1
             or any(trial.get(field) is not False for field in ("safety_failure", "numerical_failure", "cloth_failure"))
-            or _hash_text_field(trial.get("artifact_sha256"), label="fresh source artifact digest") != trial.get("artifact_sha256")
-            or _hash_text_field(trial.get("hub_sync_receipt_sha256"), label="fresh source receipt digest") != trial.get("hub_sync_receipt_sha256")
+            or (
+                is_success and (
+                    _hash_text_field(trial.get("artifact_sha256"), label="fresh source artifact digest") != trial.get("artifact_sha256")
+                    or _hash_text_field(trial.get("hub_sync_receipt_sha256"), label="fresh source receipt digest") != trial.get("hub_sync_receipt_sha256")
+                )
+            )
             or trial.get("remote_prefix") != f"rollout-rounds/{round_id}/{attempt}"
             or trial.get("campaign_round_id") != round_id or trial.get("campaign_run_id") != run_id
         ):
@@ -396,7 +410,10 @@ def validate_exact_fresh_visual_only(
             or not isinstance(source_row, Mapping) or source_row.get("category") != category
             or source_row.get("garment_name") != row.get("garment")
             or source_row.get("campaign_round_id") != round_id or source_row.get("campaign_run_id") != run_id
+            or trial.get("accepted_success") is not True or trial.get("official_success") is not True
+            or trial.get("outcome") != "success"
             or trial.get("artifact_sha256") != row.get("source_episode_sha256")
+            or trial.get("hub_sync_receipt_sha256") != row.get("source_receipt_sha256")
         ):
             raise ValueError("fresh source report/matrix row is not authenticated")
 
