@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 
@@ -20,7 +21,6 @@ ATTEMPT_MATRIX = (
     {"episode": "episode-003", "category": "pant-short"},
 )
 LEASE_NS = 10**18
-WORKERS = ("worker-1", "worker-2", "worker-3")
 
 
 @pytest.fixture()
@@ -45,7 +45,7 @@ def handoff_terminal(
             continue
         filler = ledger.lease_next(f"filler-{filler_index}", lease_duration_ns=LEASE_NS)
         assert filler is not None and filler.attempt.schedule_index == filler_index
-    worker_id = WORKERS[attempt_index]
+    worker_id = f"worker-{attempt_index + 1}"
     lease = ledger.lease_next(worker_id, lease_duration_ns=LEASE_NS)
     assert lease is not None
     assert lease.attempt.schedule_index == attempt_index
@@ -307,6 +307,172 @@ def test_controlled_matrix_category_cap_rejects_extra_successes_while_legacy_is_
     assert rejected.reason == "controlled recovery category acceptance cap already reached"
     assert queue.finalize_next().outcome == "accepted"
     ledger.close()
+
+
+def test_visual_only_replay_caps_fill_every_category_before_the_global_target(tmp_path) -> None:
+    categories = ("top_long", "top_long", "top_short", "pant_long", "pant_short")
+    matrix = tuple(
+        {
+            "episode": f"episode-{index}",
+            "category": category,
+            "strategy": "visual_only",
+            "category_acceptance_cap": 1,
+        }
+        for index, category in enumerate(categories)
+    )
+    ledger = TaskLedger(
+        tmp_path / "visual-caps.db", attempt_matrix=matrix, max_attempts=5, target_accepted=4,
+    )
+    run_root = tmp_path / "run"
+    queue = ArtifactFinalizationQueue(
+        run_root=run_root, ledger=ledger, max_pending_items=5, max_pending_bytes=1 << 30,
+    )
+    try:
+        for index in range(5):
+            handoff = handoff_terminal(ledger, run_root, attempt_index=index)
+            queue.enqueue(*handoff[:3], handoff[3])
+
+        results = [queue.finalize_next() for _ in range(5)]
+
+        assert [result.outcome for result in results if result is not None] == [
+            "accepted", "rejected", "accepted", "accepted", "accepted",
+        ]
+        assert results[1] is not None
+        assert results[1].reason == "visual-only replay category acceptance cap already reached"
+        accepted_categories = {
+            attempt.assignment["category"]
+            for attempt in ledger.attempts()
+            if ledger.status(attempt.attempt_id) == "accepted"
+        }
+        assert accepted_categories == {"top_long", "top_short", "pant_long", "pant_short"}
+        assert ledger.accepted_count() == 4
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        {"category": "top_long", "strategy": "visual_only"},
+        {"category": "top_long", "strategy": "visual_only", "category_acceptance_cap": True},
+        {"category": "top_long", "strategy": "visual_only", "category_acceptance_cap": -1},
+        {"category": "", "strategy": "visual_only", "category_acceptance_cap": 1},
+        {"category": "top-long", "strategy": "visual_only", "category_acceptance_cap": 1},
+        {"category": 7, "strategy": "visual_only", "category_acceptance_cap": 1},
+    ],
+)
+def test_malformed_visual_only_category_caps_are_infrastructure_failures(
+    tmp_path, assignment: dict[str, object],
+) -> None:
+    ledger = TaskLedger(
+        tmp_path / "malformed-visual.db", attempt_matrix=(assignment,),
+        max_attempts=1, target_accepted=1,
+    )
+    run_root = tmp_path / "run"
+    queue = ArtifactFinalizationQueue(
+        run_root=run_root, ledger=ledger, max_pending_items=1, max_pending_bytes=1 << 30,
+    )
+    try:
+        handoff = handoff_terminal(ledger, run_root, attempt_index=0)
+        queue.enqueue(*handoff[:3], handoff[3])
+
+        result = queue.finalize_next()
+
+        assert result is not None and result.outcome == "infrastructure_abort"
+        assert result.reason == "visual-only replay assignment has an invalid category cap"
+        assert ledger.status(handoff[1]) == "infrastructure_abort"
+        assert not (run_root / "accepted").exists()
+    finally:
+        ledger.close()
+
+
+def test_inconsistent_visual_only_caps_are_infrastructure_failures(tmp_path) -> None:
+    matrix = (
+        {"episode": "episode-001", "category": "top_long", "strategy": "visual_only", "category_acceptance_cap": 1},
+        {"episode": "episode-002", "category": "top_long", "strategy": "visual_only", "category_acceptance_cap": 2},
+    )
+    ledger = TaskLedger(
+        tmp_path / "inconsistent-visual.db", attempt_matrix=matrix,
+        max_attempts=2, target_accepted=2,
+    )
+    run_root = tmp_path / "run"
+    queue = ArtifactFinalizationQueue(
+        run_root=run_root, ledger=ledger, max_pending_items=2, max_pending_bytes=1 << 30,
+    )
+    try:
+        handoff = handoff_terminal(ledger, run_root, attempt_index=0)
+        queue.enqueue(*handoff[:3], handoff[3])
+
+        result = queue.finalize_next()
+
+        assert result is not None and result.outcome == "infrastructure_abort"
+        assert result.reason == "visual-only replay assignment has an inconsistent category cap"
+        assert ledger.status(handoff[1]) == "infrastructure_abort"
+    finally:
+        ledger.close()
+
+
+def test_exhausted_visual_only_attempt_is_a_category_shortage_not_infrastructure_failure(tmp_path) -> None:
+    matrix = (
+        {
+            "episode": "episode-001", "category": "pant_long",
+            "strategy": "visual_only", "category_acceptance_cap": 1,
+        },
+    )
+    ledger = TaskLedger(
+        tmp_path / "visual-shortage.db", attempt_matrix=matrix,
+        max_attempts=1, target_accepted=1,
+    )
+    run_root = tmp_path / "run"
+    queue = ArtifactFinalizationQueue(
+        run_root=run_root, ledger=ledger, max_pending_items=1, max_pending_bytes=1 << 30,
+    )
+    try:
+        handoff = handoff_terminal(ledger, run_root, attempt_index=0, success=False)
+        queue.enqueue(*handoff[:3], handoff[3])
+
+        result = queue.finalize_next()
+
+        assert result is not None and result.outcome == "rejected"
+        assert result.reason == "episode outcome is not a success"
+        assert ledger.status(handoff[1]) == "rejected"
+        assert not any(event.event_type == "infrastructure_abort" for event in ledger.events(handoff[1]))
+    finally:
+        ledger.close()
+
+
+def test_visual_only_cap_is_safe_across_concurrent_finalizer_instances(tmp_path) -> None:
+    matrix = (
+        {"episode": "episode-001", "category": "top_long", "strategy": "visual_only", "category_acceptance_cap": 1},
+        {"episode": "episode-002", "category": "top_long", "strategy": "visual_only", "category_acceptance_cap": 1},
+    )
+    database = tmp_path / "concurrent-visual.db"
+    first_ledger = TaskLedger(database, attempt_matrix=matrix, max_attempts=2, target_accepted=2)
+    second_ledger = TaskLedger(database, attempt_matrix=matrix, max_attempts=2, target_accepted=2)
+    run_root = tmp_path / "run"
+    first_queue = ArtifactFinalizationQueue(
+        run_root=run_root, ledger=first_ledger, max_pending_items=1, max_pending_bytes=1 << 30,
+    )
+    second_queue = ArtifactFinalizationQueue(
+        run_root=run_root, ledger=second_ledger, max_pending_items=1, max_pending_bytes=1 << 30,
+    )
+    try:
+        first = handoff_terminal(first_ledger, run_root, attempt_index=0)
+        second = handoff_terminal(second_ledger, run_root, attempt_index=1)
+        first_queue.enqueue(*first[:3], first[3])
+        second_queue.enqueue(*second[:3], second[3])
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(executor.map(lambda queue: queue.finalize_next(), (first_queue, second_queue)))
+
+        assert sorted(result.outcome for result in results if result is not None) == ["accepted", "rejected"]
+        rejected = next(result for result in results if result is not None and result.outcome == "rejected")
+        assert rejected.reason == "visual-only replay category acceptance cap already reached"
+        assert first_ledger.accepted_count() == second_ledger.accepted_count() == 1
+        assert len(tuple((run_root / "accepted").iterdir())) == 1
+    finally:
+        second_ledger.close()
+        first_ledger.close()
 
 
 def test_enqueue_rejects_artifact_outside_run_root(tmp_path, ledger):

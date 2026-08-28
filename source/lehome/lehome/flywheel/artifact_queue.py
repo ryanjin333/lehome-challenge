@@ -27,6 +27,9 @@ from lehome.flywheel.artifacts import atomic_write_json, build_sha256_manifest
 
 RECEIPT_NAME = "worker-receipt.json"
 MANIFEST_NAME = "SHA256SUMS.json"
+_VISUAL_ONLY_CATEGORIES = frozenset({"top_long", "top_short", "pant_long", "pant_short"})
+_VISUAL_ONLY_INVALID_CAP = "visual-only replay assignment has an invalid category cap"
+_VISUAL_ONLY_INCONSISTENT_CAP = "visual-only replay assignment has an inconsistent category cap"
 
 
 class QueueFullError(RuntimeError):
@@ -243,6 +246,12 @@ class ArtifactFinalizationQueue:
             return FinalizationResult(
                 item.attempt_id, outcome, success_reason, None,
             )
+        visual_assignment_error = self._visual_only_assignment_error(item.attempt_id)
+        if visual_assignment_error is not None:
+            outcome = self._settle_infrastructure_invalid(item.attempt_id, visual_assignment_error)
+            return FinalizationResult(
+                item.attempt_id, outcome, visual_assignment_error, None,
+            )
         if self._evaluation_terminal_root is not None:
             terminal_dir = self._publish_evaluation_terminal(item)
             outcome = "accepted" if succeeded else "rejected"
@@ -265,6 +274,8 @@ class ArtifactFinalizationQueue:
             with self._admission_lock():
                 if self._controlled_category_full(item.attempt_id):
                     reason = "controlled recovery category acceptance cap already reached"
+                elif self._visual_only_category_full(item.attempt_id):
+                    reason = "visual-only replay category acceptance cap already reached"
                 elif self._ledger.accepted_count() >= self._ledger.target_accepted():
                     reason = "accepted episode target already reached"
                 else:
@@ -299,6 +310,61 @@ class ArtifactFinalizationQueue:
                     and candidate.get("category") == category
                     and self._ledger.status(attempt.attempt_id) == "accepted"):
                 accepted += 1
+        return accepted >= cap
+
+    def _visual_only_assignment_error(self, attempt_id: str) -> str | None:
+        """Fail closed on malformed or contradictory visual-replay quotas.
+
+        The full visual-only matrix is immutable in the ledger.  Checking the
+        cohort, rather than only the current row, prevents one finalizer from
+        admitting against a permissive cap while another sees a stricter cap
+        for the same category.
+        """
+
+        attempts = self._ledger.attempts()
+        assignment = next(
+            (attempt.assignment for attempt in attempts if attempt.attempt_id == attempt_id),
+            None,
+        )
+        if not isinstance(assignment, dict) or assignment.get("strategy") != "visual_only":
+            return None
+
+        category_caps: dict[str, int] = {}
+        category_attempts: dict[str, int] = {}
+        for attempt in attempts:
+            candidate = attempt.assignment
+            if candidate.get("strategy") != "visual_only":
+                continue
+            category = candidate.get("category")
+            cap = candidate.get("category_acceptance_cap")
+            if category not in _VISUAL_ONLY_CATEGORIES or type(cap) is not int or cap < 0:
+                return _VISUAL_ONLY_INVALID_CAP
+            assert isinstance(category, str)
+            previous = category_caps.get(category)
+            if previous is not None and previous != cap:
+                return _VISUAL_ONLY_INCONSISTENT_CAP
+            category_caps[category] = cap
+            category_attempts[category] = category_attempts.get(category, 0) + 1
+        if any(category_caps[category] > count for category, count in category_attempts.items()):
+            return _VISUAL_ONLY_INVALID_CAP
+        return None
+
+    def _visual_only_category_full(self, attempt_id: str) -> bool:
+        assignment = next(
+            (attempt.assignment for attempt in self._ledger.attempts() if attempt.attempt_id == attempt_id),
+            None,
+        )
+        if not isinstance(assignment, dict) or assignment.get("strategy") != "visual_only":
+            return False
+        category = assignment["category"]
+        cap = assignment["category_acceptance_cap"]
+        accepted = sum(
+            1
+            for attempt in self._ledger.attempts()
+            if attempt.assignment.get("strategy") == "visual_only"
+            and attempt.assignment.get("category") == category
+            and self._ledger.status(attempt.attempt_id) == "accepted"
+        )
         return accepted >= cap
 
     @contextmanager
