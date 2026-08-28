@@ -73,6 +73,7 @@ def _config(module, tmp_path: Path):
     host = tmp_path / "reviewed"; host.mkdir()
     for relative in ("source/lehome", "trainer/src", "scripts", "rollout_appliance"):
         (host / relative).mkdir(parents=True)
+    observer = tmp_path / "spend.json"; observer.write_text('{"schema_version":1,"spent_usd":0.0,"observed_monotonic_ns":1}', encoding="utf-8")
     return module.CollectionConfig(
         campaign_root=tmp_path / "campaign",
         host_code_root=host,
@@ -91,6 +92,7 @@ def _config(module, tmp_path: Path):
             "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
             "simulator_device": "cpu", "cloth_device": "cpu", "policy_device": "cuda:0", "worker_count": 4,
         },
+        spend_observer=observer,
     )
 
 
@@ -175,7 +177,7 @@ def test_configuration_rejects_unpinned_or_noncanonical_runtime_tuple(tmp_path: 
     bad_identity = dict(config.runtime_identity); bad_identity["worker_count"] = 1
     invalid = module.CollectionConfig(
         config.campaign_root, config.host_code_root, config.run_id, config.round_id,
-        config.max_wall_seconds, config.max_spend_usd, config.paid, config.gpu_stop_command, bad_identity,
+        config.max_wall_seconds, config.max_spend_usd, config.paid, config.gpu_stop_command, bad_identity, config.spend_observer,
     )
 
     try:
@@ -190,7 +192,7 @@ def test_configuration_rejects_the_hard_cap_itself(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path)
     capped = module.CollectionConfig(
         config.campaign_root, config.host_code_root, config.run_id, config.round_id,
-        config.max_wall_seconds, 100.0, config.paid, config.gpu_stop_command, config.runtime_identity,
+        config.max_wall_seconds, 100.0, config.paid, config.gpu_stop_command, config.runtime_identity, config.spend_observer,
     )
 
     with pytest.raises(ValueError, match="max spend"):
@@ -210,6 +212,17 @@ def test_command_runner_rejects_env_command_and_shell_bypass(monkeypatch: pytest
 
     with pytest.raises(ValueError, match="fixed"):
         module.CommandRunner().run("calibration-matrix")
+
+
+def test_fixed_adapter_has_a_canonical_non_shell_argv_for_every_paid_stage(tmp_path: Path) -> None:
+    module = _module(); runner = module.CommandRunner(_config(module, tmp_path))
+    for stage in module.STAGES[:-1]:
+        if stage == "final-publication":
+            with pytest.raises(RuntimeError, match="Task 7 publisher"):
+                runner.argv_for(stage, {})
+            continue
+        argv = runner.argv_for(stage, {})
+        assert argv and all(token not in {"sh", "bash", "-c"} for token in argv)
 
 
 def test_resume_rehashes_stage_artifacts_and_refuses_mutated_matrix(tmp_path: Path) -> None:
@@ -233,7 +246,7 @@ def test_failed_stop_is_durable_and_restart_returns_infrastructure_stop_failure(
 
 def test_runtime_identity_rejects_extra_or_secret_like_keys(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path); identity = dict(config.runtime_identity); identity["api_token"] = "never-store"
-    invalid = module.CollectionConfig(config.campaign_root, config.host_code_root, config.run_id, config.round_id, config.max_wall_seconds, config.max_spend_usd, config.paid, config.gpu_stop_command, identity)
+    invalid = module.CollectionConfig(config.campaign_root, config.host_code_root, config.run_id, config.round_id, config.max_wall_seconds, config.max_spend_usd, config.paid, config.gpu_stop_command, identity, config.spend_observer)
 
     with pytest.raises(ValueError, match="excludes secrets"):
         invalid.validate()
@@ -268,7 +281,23 @@ def test_resume_rehashes_the_physical_ledger_and_rejects_changed_bytes(tmp_path:
 
 def test_campaign_root_symlink_is_rejected_before_journal_creation(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path); real = tmp_path / "real"; real.mkdir(); alias = tmp_path / "campaign-alias"; alias.symlink_to(real, target_is_directory=True)
-    invalid = module.CollectionConfig(alias, config.host_code_root, config.run_id, config.round_id, config.max_wall_seconds, config.max_spend_usd, config.paid, config.gpu_stop_command, config.runtime_identity)
+    invalid = module.CollectionConfig(alias, config.host_code_root, config.run_id, config.round_id, config.max_wall_seconds, config.max_spend_usd, config.paid, config.gpu_stop_command, config.runtime_identity, config.spend_observer)
 
     with pytest.raises(ValueError, match="symlink"):
         invalid.validate()
+
+
+def test_paid_budget_gate_fails_before_runner_at_exact_spend_boundary(tmp_path: Path) -> None:
+    module = _module(); config = _config(module, tmp_path)
+    assert config.spend_observer is not None
+    config.spend_observer.write_text('{"schema_version":1,"spent_usd":99.0,"observed_monotonic_ns":2}', encoding="utf-8")
+    runner = FakeRunner(config.campaign_root)
+
+    with pytest.raises(module.ReceiptMismatchError, match="budget"):
+        module.run_collection(config, runner=runner)
+    assert runner.calls == []
+
+
+def test_paid_simple_wrapper_contract_requires_one_vm_marker() -> None:
+    text = (ROOT / "rollout_appliance" / "run_12k_campaign.sh").read_text(encoding="utf-8")
+    assert 'paid simple curriculum requires LEHOME_ONE_VM_ORCHESTRATOR=1' in text

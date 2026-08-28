@@ -67,6 +67,7 @@ PARTITION_ID="${LEHOME_PARTITION_ID:-}"
 PARENT_MATRIX_SHA256="${LEHOME_PARENT_MATRIX_SHA256:-}"
 PARTITION_MANIFEST="${LEHOME_PARTITION_MANIFEST:-}"
 ONE_VM_ORCHESTRATOR="${LEHOME_ONE_VM_ORCHESTRATOR:-0}"
+PAID_COLLECTION="${LEHOME_PAID_COLLECTION:-0}"
 CODE_ROOT_SHA256=""
 HOST_CODE_ROOT="${LEHOME_HOST_CODE_ROOT:-}"
 SOURCE_HOST_MOUNT="/opt/lehome/source/lehome"
@@ -129,6 +130,7 @@ case "${SIMPLE_CURRICULUM_COLLECTION}" in
   *) echo "LEHOME_SIMPLE_CURRICULUM_COLLECTION must be exactly 0 or 1" >&2; exit 2 ;;
 esac
 case "${ONE_VM_ORCHESTRATOR}" in 0|1) ;; *) echo "LEHOME_ONE_VM_ORCHESTRATOR must be exactly 0 or 1" >&2; exit 2 ;; esac
+case "${PAID_COLLECTION}" in 0|1) ;; *) echo "LEHOME_PAID_COLLECTION must be exactly 0 or 1" >&2; exit 2 ;; esac
 case "${FIDELITY_DIAGNOSTIC}" in
   "0"|"1") ;;
   *) echo "LEHOME_FIDELITY_DIAGNOSTIC must be exactly 0 or 1" >&2; exit 2 ;;
@@ -168,6 +170,10 @@ if [ "${FIDELITY_DIAGNOSTIC}" = "1" ]; then
   fi
 fi
 if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
+  if [ "${PAID_COLLECTION}" = "1" ] && [ "${ONE_VM_ORCHESTRATOR}" != "1" ]; then
+    echo "paid simple curriculum requires LEHOME_ONE_VM_ORCHESTRATOR=1" >&2
+    exit 2
+  fi
   if [ "${SIMULATOR_DEVICE}" != "cpu" ] || [ "${WORKER_COUNT}" != "4" ] \
       || [ "${ENABLE_HF_UPLOAD}" != "1" ] || [ "${SKIP_ROUND_SEAL}" != "1" ] \
       || [ "${POLICY_STEP}" != "12000" ] || [ "${COMPLETION_METRIC}" != "terminal_outcomes" ] \

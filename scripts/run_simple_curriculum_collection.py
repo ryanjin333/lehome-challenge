@@ -16,10 +16,10 @@ import math
 import os
 from pathlib import Path
 import re
-import shlex
 import stat
 import subprocess
 import tempfile
+import time
 from typing import Any, Mapping, Protocol, Sequence
 
 
@@ -134,6 +134,7 @@ class CollectionConfig:
     paid: bool
     gpu_stop_command: str | None
     runtime_identity: Mapping[str, object]
+    spend_observer: Path | None = None
 
     def validate(self, *, require_git: bool = False) -> None:
         _safe_directory(self.host_code_root, must_exist=True)
@@ -146,6 +147,8 @@ class CollectionConfig:
                 raise ValueError(f"{label} must be finite, positive, and bounded")
         if self.paid and self.gpu_stop_command != _TRUSTED_GPU_STOP:
             raise ValueError("paid collection requires the fixed trusted GPU stop hook")
+        if self.paid and self.spend_observer is None:
+            raise ValueError("paid collection requires a typed spend observer")
         if not isinstance(self.runtime_identity, Mapping) or not self.runtime_identity:
             raise ValueError("pinned runtime identity is required")
         if set(self.runtime_identity) != _RUNTIME_KEYS or any(re.search(r"(?:token|secret|password|credential|api[_-]?key)", str(key), re.I) for key in self.runtime_identity):
@@ -166,6 +169,7 @@ class CollectionConfig:
             "code_tree_sha256": _tree_sha(self.host_code_root),
             "runtime_identity": dict(self.runtime_identity),
             "max_wall_seconds": self.max_wall_seconds, "max_spend_usd": self.max_spend_usd,
+            "spend_observer": str(self.spend_observer) if self.spend_observer else None,
         }
 
 
@@ -175,7 +179,27 @@ class Runner(Protocol):
 
 
 class CommandRunner:
-    """Runs only explicitly configured local/appliance commands, never cloud CLIs."""
+    """Fixed reviewed stage adapter; no caller-provided command surface exists."""
+
+    def __init__(self, config: CollectionConfig | None = None) -> None: self.config = config
+
+    def argv_for(self, stage: str, inputs: Mapping[str, object]) -> tuple[str, ...]:
+        if self.config is None: raise ValueError("fixed adapter requires collection config")
+        root, code = _canonical_root(self.config), self.config.host_code_root
+        py = str(Path(os.sys.executable).resolve())
+        scripts = code / "scripts"; appliance = code / "rollout_appliance"
+        if stage == "calibration-matrix": return (py, str(scripts / "build_simple_curriculum_matrix.py"), "build-calibration", "--catalog", str(root / "inputs/seen-catalog.json"), "--seed-base", "2026082801", "--output", str(root / "matrices/calibration.json"), "--receipt", str(root / "matrices/calibration.receipt.json"))
+        if stage in {"calibration-head", "calibration-tail", "curriculum-a", "curriculum-b"}: return (str(appliance / "run_12k_campaign.sh"),)
+        if stage == "first-100-gate": return (py, str(scripts / "check_simple_curriculum_gate.py"))
+        if stage in {"calibration-report", "fresh-report"}: return (py, str(scripts / "summarize_groot_persistent_evaluation.py"))
+        if stage == "curriculum-matrix": return (py, str(scripts / "build_simple_curriculum_matrix.py"), "build-curriculum")
+        if stage == "replay-matrix": return (py, str(scripts / "build_success_replay_matrix.py"))
+        if stage == "success-replay": return (str(appliance / "run_success_replay_campaign.sh"),)
+        if stage == "final-publication":
+            publisher = scripts / "publish_simple_curriculum_collection.py"
+            if not publisher.is_file(): raise RuntimeError("canonical Task 7 publisher adapter is not available")
+            return (py, str(publisher))
+        raise ValueError("unknown fixed stage")
 
     def run(self, stage: str, **kwargs: object) -> Mapping[str, object]:
         # No command is accepted from the environment. A paid deployment must
@@ -183,7 +207,13 @@ class CommandRunner:
         # failing here is safer than turning this host process into a shell.
         if any(name.startswith("LEHOME_ORCHESTRATOR_") and name.endswith("_COMMAND") for name in os.environ):
             raise ValueError("stage commands must use a fixed reviewed adapter, never environment commands")
-        raise RuntimeError(f"no fixed reviewed adapter is installed for {stage}")
+        argv = self.argv_for(stage, kwargs)
+        completed = subprocess.run(argv, cwd=self.config.host_code_root if self.config else None, text=True, capture_output=True, check=False)
+        if completed.returncode: raise RuntimeError(f"fixed {stage} adapter failed: {completed.returncode}")
+        # The concrete adapter writes the canonical handoff files; StageJournal
+        # immediately rejects this empty marker unless those typed handoffs are
+        # materialized by the reviewed deployment integration.
+        return {"artifacts": {}}
 
     def stop_gpu(self, command: str) -> None:
         if command != _TRUSTED_GPU_STOP:
@@ -335,6 +365,32 @@ class StageJournal:
     @property
     def stop_state_path(self) -> Path: return self.directory / "gpu-stop-state.json"
 
+    @property
+    def budget_state_path(self) -> Path: return self.directory / "budget-state.json"
+
+    def check_budget(self) -> None:
+        if not self.config.paid: return
+        observer = self.config.spend_observer
+        if observer is None or not observer.is_absolute() or observer.is_symlink() or not observer.is_file():
+            raise ReceiptMismatchError("paid spend observer is unavailable")
+        try: payload = json.loads(observer.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error: raise ReceiptMismatchError("paid spend observer is malformed") from error
+        if (not isinstance(payload, dict) or set(payload) != {"schema_version", "spent_usd", "observed_monotonic_ns"}
+                or payload.get("schema_version") != 1 or type(payload.get("spent_usd")) not in {int, float}
+                or not math.isfinite(float(payload["spent_usd"])) or float(payload["spent_usd"]) < 0
+                or type(payload.get("observed_monotonic_ns")) is not int or payload["observed_monotonic_ns"] < 0):
+            raise ReceiptMismatchError("paid spend observer is malformed")
+        now = time.monotonic_ns(); state = {"started_monotonic_ns": now, "last_spent_usd": float(payload["spent_usd"]), "last_observed_monotonic_ns": payload["observed_monotonic_ns"]}
+        if self.budget_state_path.exists():
+            try: state = json.loads(self.budget_state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error: raise ReceiptMismatchError("budget state is malformed") from error
+            if not isinstance(state, dict) or set(state) != {"started_monotonic_ns", "last_spent_usd", "last_observed_monotonic_ns"}: raise ReceiptMismatchError("budget state is malformed")
+            if payload["observed_monotonic_ns"] < state["last_observed_monotonic_ns"] or float(payload["spent_usd"]) < float(state["last_spent_usd"]): raise ReceiptMismatchError("spend observer regressed")
+            state.update(last_spent_usd=float(payload["spent_usd"]), last_observed_monotonic_ns=payload["observed_monotonic_ns"])
+        if now - state["started_monotonic_ns"] >= int(self.config.max_wall_seconds * 1e9) or float(payload["spent_usd"]) >= self.config.max_spend_usd:
+            raise ReceiptMismatchError("paid budget or wall-time limit reached")
+        _replace_durable(self.budget_state_path, _canonical(state))
+
     def stop_state(self, predecessor: str, outcome: str) -> dict[str, object] | None:
         path = self.stop_state_path
         if not path.exists(): return None
@@ -392,12 +448,14 @@ class StageJournal:
 
 
 def _stage(journal: StageJournal, runner: Runner, stage: str, predecessor: str | None, **kwargs: object) -> tuple[dict[str, object], str]:
+    journal.check_budget()
     existing = journal._read(stage, predecessor, kwargs)
     if existing is not None:
         return existing, str(existing["receipt_sha256"])
     output = runner.run(stage, **kwargs)
     if not isinstance(output, Mapping): raise ValueError("stage runner output is invalid")
     receipt = journal.complete(stage, predecessor, output, inputs=kwargs)
+    journal.check_budget()
     return receipt, str(receipt["receipt_sha256"])
 
 
@@ -482,6 +540,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", required=True); parser.add_argument("--round-id", required=True)
     parser.add_argument("--max-wall-seconds", type=float, required=True); parser.add_argument("--max-spend-usd", type=float, required=True)
     parser.add_argument("--paid", action="store_true"); parser.add_argument("--gpu-stop-command")
+    parser.add_argument("--spend-observer", type=Path)
     parser.add_argument("--runtime-identity-json", required=True, type=Path)
     return parser
 
@@ -490,9 +549,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         identity = json.loads(args.runtime_identity_json.read_text(encoding="utf-8"))
-        config = CollectionConfig(args.campaign_root, args.host_code_root, args.run_id, args.round_id, args.max_wall_seconds, args.max_spend_usd, args.paid, args.gpu_stop_command, identity)
+        config = CollectionConfig(args.campaign_root, args.host_code_root, args.run_id, args.round_id, args.max_wall_seconds, args.max_spend_usd, args.paid, args.gpu_stop_command, identity, args.spend_observer)
         config.validate(require_git=True)
-        print(run_collection(config, runner=CommandRunner()))
+        print(run_collection(config, runner=CommandRunner(config)))
     except (OSError, ValueError, ReceiptMismatchError, StopHookError, RuntimeError) as error:
         _parser().error(str(error))
     return 0

@@ -45,7 +45,11 @@ arguments=(
   --runtime-identity-json "${LEHOME_RUNTIME_IDENTITY_JSON}"
 )
 if [ "${PAID_COLLECTION}" = "1" ]; then
-  arguments+=(--paid --gpu-stop-command "${TRUSTED_GPU_STOP}")
+  if [ -z "${LEHOME_SPEND_OBSERVER:-}" ] || [[ "${LEHOME_SPEND_OBSERVER}" != /* ]]; then
+    echo "paid collection requires an absolute LEHOME_SPEND_OBSERVER" >&2
+    exit 2
+  fi
+  arguments+=(--paid --gpu-stop-command "${TRUSTED_GPU_STOP}" --spend-observer "${LEHOME_SPEND_OBSERVER}")
 fi
 
 exec python3 "${HOST_ROOT}/scripts/run_simple_curriculum_collection.py" "${arguments[@]}"
