@@ -6,8 +6,9 @@ set -euo pipefail
 
 PAID_COLLECTION="${LEHOME_PAID_COLLECTION:-0}"
 case "${PAID_COLLECTION}" in 0|1) ;; *) echo "LEHOME_PAID_COLLECTION must be 0 or 1" >&2; exit 2 ;; esac
-if [ "${PAID_COLLECTION}" = "1" ] && [ -z "${LEHOME_GPU_STOP_COMMAND:-}" ]; then
-  echo "paid collection requires LEHOME_GPU_STOP_COMMAND" >&2
+TRUSTED_GPU_STOP="/usr/local/libexec/lehome-stop-gpu"
+if [ "${PAID_COLLECTION}" = "1" ] && [ "${LEHOME_GPU_STOP_COMMAND:-}" != "${TRUSTED_GPU_STOP}" ]; then
+  echo "paid collection requires LEHOME_GPU_STOP_COMMAND=${TRUSTED_GPU_STOP}" >&2
   exit 2
 fi
 
@@ -44,7 +45,7 @@ arguments=(
   --runtime-identity-json "${LEHOME_RUNTIME_IDENTITY_JSON}"
 )
 if [ "${PAID_COLLECTION}" = "1" ]; then
-  arguments+=(--paid --gpu-stop-command "${LEHOME_GPU_STOP_COMMAND}")
+  arguments+=(--paid --gpu-stop-command "${TRUSTED_GPU_STOP}")
 fi
 
 exec python3 "${HOST_ROOT}/scripts/run_simple_curriculum_collection.py" "${arguments[@]}"

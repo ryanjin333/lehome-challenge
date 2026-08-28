@@ -41,6 +41,22 @@ _ORIGINAL_12K = {
     "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
     "simulator_device": "cpu", "cloth_device": "cpu", "policy_device": "cuda:0", "worker_count": 4,
 }
+_RUNTIME_KEYS = frozenset(_ORIGINAL_12K) | frozenset({"rollout_image", "trainer_image"})
+_TRUSTED_GPU_STOP = "/usr/local/libexec/lehome-stop-gpu"
+_STAGE_ARTIFACTS = {
+    "calibration-matrix": frozenset({"matrix"}),
+    "calibration-head": frozenset({"matrix", "manifest", "ledger"}),
+    "first-100-gate": frozenset({"report", "gate_receipt"}),
+    "calibration-tail": frozenset({"matrix", "manifest", "ledger"}),
+    "calibration-report": frozenset({"report"}),
+    "curriculum-matrix": frozenset({"matrix"}),
+    "curriculum-a": frozenset({"matrix", "manifest", "ledger"}),
+    "curriculum-b": frozenset({"matrix", "manifest", "ledger"}),
+    "fresh-report": frozenset({"report"}),
+    "replay-matrix": frozenset({"matrix"}),
+    "success-replay": frozenset({"matrix", "ledger"}),
+    "final-publication": frozenset({"publication_receipt", "publication_readback"}),
+}
 
 
 class ReceiptMismatchError(RuntimeError):
@@ -126,12 +142,14 @@ class CollectionConfig:
             if identifier in _DEFAULT_IDS or _SAFE_ID.fullmatch(identifier) is None:
                 raise ValueError("fresh caller-supplied run and round IDs are required")
         for value, label, ceiling in ((self.max_wall_seconds, "max wall time", 86_400.0), (self.max_spend_usd, "max spend", 100.0)):
-            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0 or value > ceiling:
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0 or value >= ceiling:
                 raise ValueError(f"{label} must be finite, positive, and bounded")
-        if self.paid and (not isinstance(self.gpu_stop_command, str) or not self.gpu_stop_command.strip()):
-            raise ValueError("paid collection requires LEHOME_GPU_STOP_COMMAND")
+        if self.paid and self.gpu_stop_command != _TRUSTED_GPU_STOP:
+            raise ValueError("paid collection requires the fixed trusted GPU stop hook")
         if not isinstance(self.runtime_identity, Mapping) or not self.runtime_identity:
             raise ValueError("pinned runtime identity is required")
+        if set(self.runtime_identity) != _RUNTIME_KEYS or any(re.search(r"(?:token|secret|password|credential|api[_-]?key)", str(key), re.I) for key in self.runtime_identity):
+            raise ValueError("runtime identity schema is exact and excludes secrets")
         for key in ("rollout_image", "trainer_image"):
             value = self.runtime_identity.get(key)
             if not isinstance(value, str) or re.search(r"@sha256:[0-9a-f]{64}$", value) is None:
@@ -143,7 +161,7 @@ class CollectionConfig:
 
     def identity(self) -> dict[str, object]:
         return {
-            "run_id": self.run_id, "round_id": self.round_id,
+            "campaign_root": str(_canonical_root(self)), "run_id": self.run_id, "round_id": self.round_id,
             "host_code_root": str(self.host_code_root), "code_revision": _git_revision(self.host_code_root),
             "code_tree_sha256": _tree_sha(self.host_code_root),
             "runtime_identity": dict(self.runtime_identity),
@@ -160,42 +178,24 @@ class CommandRunner:
     """Runs only explicitly configured local/appliance commands, never cloud CLIs."""
 
     def run(self, stage: str, **kwargs: object) -> Mapping[str, object]:
-        variable = "LEHOME_ORCHESTRATOR_" + stage.upper().replace("-", "_") + "_COMMAND"
-        command = os.environ.get(variable)
-        if not command:
-            raise RuntimeError(f"missing configured command for {stage}")
-        argv = shlex.split(command)
-        if not argv or any(token.lower() in _CLOUD_TOKENS for token in argv):
-            raise ValueError("orchestrator commands may not create or manage cloud resources")
-        completed = subprocess.run(
-            argv, text=True, capture_output=True, check=False,
-            env={
-                **os.environ, "LEHOME_ORCHESTRATOR_STAGE": stage,
-                "LEHOME_ORCHESTRATOR_STAGE_INPUTS_JSON": _canonical(dict(kwargs)).decode("utf-8").strip(),
-            },
-        )
-        if completed.returncode:
-            raise RuntimeError(f"{stage} command failed: {completed.returncode}")
-        try:
-            reported = json.loads(completed.stdout) if completed.stdout.strip() else {}
-        except json.JSONDecodeError as error:
-            raise RuntimeError(f"{stage} command did not emit a JSON result") from error
-        if not isinstance(reported, dict):
-            raise RuntimeError(f"{stage} command result must be a JSON object")
-        return {"command_sha256": sha256(command.encode()).hexdigest(), "stdout_sha256": sha256(completed.stdout.encode()).hexdigest(), **reported}
+        # No command is accepted from the environment. A paid deployment must
+        # install a reviewed adapter with a fixed argv contract; until then,
+        # failing here is safer than turning this host process into a shell.
+        if any(name.startswith("LEHOME_ORCHESTRATOR_") and name.endswith("_COMMAND") for name in os.environ):
+            raise ValueError("stage commands must use a fixed reviewed adapter, never environment commands")
+        raise RuntimeError(f"no fixed reviewed adapter is installed for {stage}")
 
     def stop_gpu(self, command: str) -> None:
-        argv = shlex.split(command)
-        if not argv or any(token.lower() in {"create", "start", "delete"} for token in argv):
-            raise ValueError("GPU stop hook may not create, start, or delete resources")
-        subprocess.run(argv, check=True)
+        if command != _TRUSTED_GPU_STOP:
+            raise ValueError("GPU stop hook must be the fixed trusted executable")
+        subprocess.run((_TRUSTED_GPU_STOP,), check=True)
 
 
 def partition_rows(rows: Sequence[Mapping[str, object]], *, parent_matrix_sha256: str, partition_id: str, start: int, end: int) -> tuple[list[dict[str, object]], dict[str, object]]:
-    """Slice a frozen logical matrix, changing only mandatory partition fields."""
+    """Slice frozen logical rows verbatim; partition metadata is external."""
     if _HEX.fullmatch(parent_matrix_sha256) is None or not 0 <= start < end <= len(rows):
         raise ValueError("partition bounds or parent matrix hash are invalid")
-    partition = [{**dict(row), "partition_id": partition_id, "parent_matrix_sha256": parent_matrix_sha256} for row in rows[start:end]]
+    partition = [dict(row) for row in rows[start:end]]
     manifest = {
         "schema_version": 1, "kind": "lehome_simple_curriculum_partition_manifest_v1",
         "partition_id": partition_id, "parent_matrix_sha256": parent_matrix_sha256,
@@ -250,6 +250,79 @@ def _write_absent(path: Path, payload: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _replace_durable(path: Path, payload: bytes) -> None:
+    if path.is_symlink() or not path.parent.is_dir(): raise ReceiptMismatchError("durable state path is unsafe")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload); stream.flush(); os.fchmod(stream.fileno(), 0o600); os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try: os.fsync(directory)
+        finally: os.close(directory)
+    finally: temporary.unlink(missing_ok=True)
+
+
+def _canonical_root(config: CollectionConfig) -> Path:
+    return config.campaign_root.resolve(strict=False)
+
+
+def _authenticated_output(stage: str, output: Mapping[str, object], *, config: CollectionConfig) -> dict[str, object]:
+    """Accept only a bounded stage result and hash every referenced byte now."""
+    if stage == "gpu-stop":
+        allowed = {"terminal_outcome", "stop_status", "stop_error_type"}
+        if set(output) - allowed or output.get("stop_status") not in {"not_required", "pending", "succeeded", "failed"}:
+            raise ReceiptMismatchError("GPU stop state is invalid")
+        if not isinstance(output.get("terminal_outcome"), str): raise ReceiptMismatchError("GPU stop state is invalid")
+        if "stop_error_type" in output and not isinstance(output["stop_error_type"], str): raise ReceiptMismatchError("GPU stop state is invalid")
+        return dict(output)
+    required = _STAGE_ARTIFACTS.get(stage, frozenset())
+    allowed = {"artifacts"}
+    if stage == "first-100-gate": allowed.add("decision")
+    if stage == "success-replay": allowed.add("result")
+    if set(output) - allowed or "artifacts" not in output or not isinstance(output["artifacts"], Mapping):
+        raise ReceiptMismatchError("stage artifact output schema is invalid")
+    artifacts = output["artifacts"]
+    if set(artifacts) != required:
+        raise ReceiptMismatchError("stage output artifacts are missing or unexpected")
+    root = _canonical_root(config)
+    checked: dict[str, dict[str, str]] = {}
+    for name, descriptor in artifacts.items():
+        if not isinstance(descriptor, Mapping) or set(descriptor) != {"path", "sha256"}:
+            raise ReceiptMismatchError("stage artifact descriptor is invalid")
+        path, claimed = descriptor["path"], descriptor["sha256"]
+        if not isinstance(path, str) or not isinstance(claimed, str) or _HEX.fullmatch(claimed) is None:
+            raise ReceiptMismatchError("stage artifact descriptor is invalid")
+        candidate = (root / path).resolve(strict=False)
+        if not candidate.is_relative_to(root) or candidate.is_symlink() or not candidate.is_file():
+            raise ReceiptMismatchError("stage artifact is missing or unsafe")
+        actual = _file_sha(candidate)
+        if actual != claimed:
+            raise ReceiptMismatchError("stage artifact hash mismatch")
+        checked[str(name)] = {"path": candidate.relative_to(root).as_posix(), "sha256": actual}
+    result: dict[str, object] = {"artifacts": checked}
+    if stage == "first-100-gate":
+        decision = output.get("decision")
+        if decision not in {"continue", "fidelity_stop", "infrastructure_stop", "insufficient_source_stop"}:
+            raise ReceiptMismatchError("first-100 gate receipt has no valid decision")
+        result["decision"] = decision
+    if stage == "success-replay":
+        replay = output.get("result")
+        if replay not in {"complete", "replay_shortage"}:
+            raise ReceiptMismatchError("replay result is invalid")
+        result["result"] = replay
+    return result
+
+
+def _verify_authenticated_output(stage: str, output: Mapping[str, object], *, config: CollectionConfig) -> None:
+    # Re-run validation against the actual bytes on every restart.  The
+    # descriptor itself is part of the receipt hash; this catches deletion,
+    # rewrites, root swaps, and changed ledgers without trusting old JSON.
+    if _authenticated_output(stage, output, config=config) != output:
+        raise ReceiptMismatchError("stage output authentication changed")
+
+
 class StageJournal:
     def __init__(self, config: CollectionConfig) -> None:
         self.config, self.directory = config, config.campaign_root / "stage-receipts"
@@ -258,6 +331,25 @@ class StageJournal:
     def path(self, stage: str) -> Path:
         if stage not in STAGES: raise ValueError("unknown stage")
         return self.directory / f"{stage}.json"
+
+    @property
+    def stop_state_path(self) -> Path: return self.directory / "gpu-stop-state.json"
+
+    def stop_state(self, predecessor: str, outcome: str) -> dict[str, object] | None:
+        path = self.stop_state_path
+        if not path.exists(): return None
+        try: state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error: raise ReceiptMismatchError("GPU stop state is malformed") from error
+        expected = {"schema_version": 1, "kind": "lehome_simple_curriculum_gpu_stop_state_v1", "campaign_root": str(_canonical_root(self.config)), "predecessor_receipt_sha256": predecessor, "terminal_outcome": outcome}
+        if (not isinstance(state, dict) or set(state) != set(expected) | {"status"}
+                or any(state.get(key) != value for key, value in expected.items())
+                or state.get("status") not in {"pending", "succeeded", "failed"}):
+            raise ReceiptMismatchError("GPU stop state does not bind this terminal collection")
+        return state
+
+    def write_stop_state(self, predecessor: str, outcome: str, status: str) -> None:
+        if status not in {"pending", "succeeded", "failed"}: raise ValueError("GPU stop status is invalid")
+        _replace_durable(self.stop_state_path, _canonical({"schema_version": 1, "kind": "lehome_simple_curriculum_gpu_stop_state_v1", "campaign_root": str(_canonical_root(self.config)), "predecessor_receipt_sha256": predecessor, "terminal_outcome": outcome, "status": status}))
 
     def _read(self, stage: str, predecessor: str | None, inputs: Mapping[str, object]) -> dict[str, object] | None:
         path = self.path(stage)
@@ -279,12 +371,15 @@ class StageJournal:
             "stage_inputs": _digest(dict(inputs)),
         }:
             raise ReceiptMismatchError("stage receipt input binding mismatch")
+        _verify_authenticated_output(stage, receipt["output"], config=self.config)
+        if receipt["output_hashes"] != {"output": _digest(receipt["output"])}:
+            raise ReceiptMismatchError("stage receipt output hash mismatch")
         return receipt
 
     def complete(self, stage: str, predecessor: str | None, output: Mapping[str, object], *, inputs: Mapping[str, object]) -> dict[str, object]:
         existing = self._read(stage, predecessor, inputs)
         if existing is not None: return existing
-        safe_output = dict(output)
+        safe_output = _authenticated_output(stage, output, config=self.config)
         body: dict[str, object] = {
             "schema_version": 1, "kind": "lehome_simple_curriculum_stage_receipt_v1", "stage": stage,
             "predecessor_receipt_sha256": predecessor, "command_version": COMMAND_VERSION,
@@ -309,16 +404,17 @@ def _stage(journal: StageJournal, runner: Runner, stage: str, predecessor: str |
 def _partition_from_stage(config: CollectionConfig, stage_output: Mapping[str, object], *, partition_id: str,
                           start: int, end: int) -> dict[str, object]:
     """Use a written logical matrix when the producer exposes its immutable bytes."""
-    path, digest = stage_output.get("matrix_path"), stage_output.get("matrix_sha256")
-    if path is None and digest is None:
-        return {}
-    if not isinstance(path, str) or not isinstance(digest, str):
-        raise ReceiptMismatchError("logical matrix stage did not bind a path and hash")
+    artifacts = stage_output.get("artifacts")
+    if not isinstance(artifacts, Mapping) or not isinstance(artifacts.get("matrix"), Mapping):
+        raise ReceiptMismatchError("logical matrix stage did not bind a matrix artifact")
+    path, digest = artifacts["matrix"].get("path"), artifacts["matrix"].get("sha256")
+    if not isinstance(path, str) or not isinstance(digest, str): raise ReceiptMismatchError("logical matrix stage did not bind a path and hash")
     matrix, manifest, details = materialize_partition(
-        parent_matrix=Path(path), parent_matrix_sha256=digest,
+        parent_matrix=_canonical_root(config) / path, parent_matrix_sha256=digest,
         output_directory=config.campaign_root / "partitions", partition_id=partition_id, start=start, end=end,
     )
-    return {"partition_matrix": str(matrix), "partition_manifest": str(manifest), "partition_sha256": details["partition_sha256"]}
+    root = _canonical_root(config)
+    return {"partition_matrix": matrix.relative_to(root).as_posix(), "partition_manifest": manifest.relative_to(root).as_posix(), "partition_sha256": details["partition_sha256"]}
 
 
 def run_collection(config: CollectionConfig, *, runner: Runner) -> str:
@@ -351,18 +447,31 @@ def run_collection(config: CollectionConfig, *, runner: Runner) -> str:
     _, predecessor = _stage(journal, runner, "final-publication", predecessor, terminal_outcome=outcome)
     stop_inputs = {"terminal_outcome": outcome}
     existing = journal._read("gpu-stop", predecessor, stop_inputs)
-    if existing is None:
-        stop_output: dict[str, object] = {"terminal_outcome": outcome, "stop_status": "not_required"}
-        if config.paid:
-            try:
-                assert config.gpu_stop_command is not None
-                runner.stop_gpu(config.gpu_stop_command)
-                stop_output["stop_status"] = "invoked_once"
-            except Exception as error:  # preserve the evidence before surfacing stop failure
-                stop_output["stop_status"] = "failed"; stop_output["stop_error_type"] = type(error).__name__
-                journal.complete("gpu-stop", predecessor, stop_output, inputs=stop_inputs)
-                raise StopHookError("GPU stop hook failed; data outcome is recorded separately") from error
-        journal.complete("gpu-stop", predecessor, stop_output, inputs=stop_inputs)
+    state = journal.stop_state(predecessor, outcome)
+    if state is not None and state["status"] != "succeeded":
+        # Never retry after a crash/failure: the process could have died after
+        # sending the external stop but before recording it. Retrying would
+        # break exactly-once; a separate provider audit is required instead.
+        return "infrastructure_stop_failure"
+    if existing is not None:
+        if not config.paid and existing["output"].get("stop_status") == "not_required":
+            return str(outcome)
+        if state is None:
+            return "infrastructure_stop_failure"
+        return str(outcome)
+    if not config.paid:
+        journal.complete("gpu-stop", predecessor, {"terminal_outcome": outcome, "stop_status": "not_required"}, inputs=stop_inputs)
+        return str(outcome)
+    journal.write_stop_state(predecessor, outcome, "pending")
+    try:
+        assert config.gpu_stop_command is not None
+        runner.stop_gpu(config.gpu_stop_command)
+    except Exception as error:
+        journal.write_stop_state(predecessor, outcome, "failed")
+        journal.complete("gpu-stop", predecessor, {"terminal_outcome": outcome, "stop_status": "failed", "stop_error_type": type(error).__name__}, inputs=stop_inputs)
+        return "infrastructure_stop_failure"
+    journal.write_stop_state(predecessor, outcome, "succeeded")
+    journal.complete("gpu-stop", predecessor, {"terminal_outcome": outcome, "stop_status": "succeeded"}, inputs=stop_inputs)
     return str(outcome)
 
 

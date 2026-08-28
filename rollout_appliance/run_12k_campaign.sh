@@ -65,6 +65,8 @@ FIDELITY_DIAGNOSTIC_STAGE="${LEHOME_FIDELITY_DIAGNOSTIC_STAGE:-}"
 COMPLETION_METRIC="${LEHOME_COMPLETION_METRIC:-accepted_successes}"
 PARTITION_ID="${LEHOME_PARTITION_ID:-}"
 PARENT_MATRIX_SHA256="${LEHOME_PARENT_MATRIX_SHA256:-}"
+PARTITION_MANIFEST="${LEHOME_PARTITION_MANIFEST:-}"
+ONE_VM_ORCHESTRATOR="${LEHOME_ONE_VM_ORCHESTRATOR:-0}"
 CODE_ROOT_SHA256=""
 HOST_CODE_ROOT="${LEHOME_HOST_CODE_ROOT:-}"
 SOURCE_HOST_MOUNT="/opt/lehome/source/lehome"
@@ -126,6 +128,7 @@ case "${SIMPLE_CURRICULUM_COLLECTION}" in
   "0"|"1") ;;
   *) echo "LEHOME_SIMPLE_CURRICULUM_COLLECTION must be exactly 0 or 1" >&2; exit 2 ;;
 esac
+case "${ONE_VM_ORCHESTRATOR}" in 0|1) ;; *) echo "LEHOME_ONE_VM_ORCHESTRATOR must be exactly 0 or 1" >&2; exit 2 ;; esac
 case "${FIDELITY_DIAGNOSTIC}" in
   "0"|"1") ;;
   *) echo "LEHOME_FIDELITY_DIAGNOSTIC must be exactly 0 or 1" >&2; exit 2 ;;
@@ -172,6 +175,10 @@ if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
       || [ "${SUCCESS_REPLAY_CAMPAIGN}" != "0" ] || [ "${HARD_STATE_CAMPAIGN}" != "0" ] \
       || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || [ "${FRESH_GARMENT_WAVES}" != "0" ]; then
     echo "simple curriculum requires the exact CPU fresh-outcome tuple" >&2
+    exit 2
+  fi
+  if [ "${ONE_VM_ORCHESTRATOR}" = "1" ] && { [ -z "${PARTITION_MANIFEST}" ] || [ -L "${PARTITION_MANIFEST}" ] || [ ! -f "${PARTITION_MANIFEST}" ]; }; then
+    echo "one-VM simple curriculum requires an immutable partition manifest" >&2
     exit 2
   fi
   case "${PARTITION_ID}:${MAX_ATTEMPTS}:${TARGET_ACCEPTED}" in
@@ -427,11 +434,11 @@ for index, (row, seed) in enumerate(zip(rows, expected_seeds, strict=True), star
         raise SystemExit("fidelity diagnostic descriptor row is invalid")
 PY
 elif [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
-  python3 - "${MATRIX}" "${PARTITION_ID}" "${PARENT_MATRIX_SHA256}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" <<'PY'
+  python3 - "${MATRIX}" "${PARTITION_ID}" "${PARENT_MATRIX_SHA256}" "${MAX_ATTEMPTS}" "${TARGET_ACCEPTED}" "${ONE_VM_ORCHESTRATOR}" "${PARTITION_MANIFEST}" <<'PY'
 import json, re, sys
 from pathlib import Path
 
-path, partition_id, parent_sha, lease_budget, target = Path(sys.argv[1]), *sys.argv[2:]
+path, partition_id, parent_sha, lease_budget, target, orchestrated, manifest_path = Path(sys.argv[1]), *sys.argv[2:]
 try:
     rows = json.loads(path.read_text(encoding="utf-8"))
     lease_budget, target = int(lease_budget), int(target)
@@ -447,6 +454,14 @@ expected = contracts.get(partition_id)
 if expected is None or not isinstance(rows, list) or (len(rows), target, lease_budget) != expected[:3]:
     raise SystemExit("simple curriculum partition row/target/lease tuple is invalid")
 expected_stage = contracts[partition_id][3]
+if orchestrated == "1":
+    try: manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error: raise SystemExit(f"simple curriculum partition manifest is malformed: {error}")
+    ranges = {"calibration-head": (0, 100), "calibration-tail": (100, 400), "curriculum-a": (0, 300), "curriculum-b": (300, 600)}
+    if (not isinstance(manifest, dict) or manifest.get("partition_id") != partition_id
+            or manifest.get("parent_matrix_sha256") != parent_sha
+            or (manifest.get("row_start"), manifest.get("row_end"), manifest.get("row_count")) != (*ranges[partition_id], len(rows))):
+        raise SystemExit("simple curriculum partition manifest does not bind the physical matrix")
 categories = {
     "top_long": r"Top_Long_Seen_[0-9]", "top_short": r"Top_Short_Seen_[0-9]",
     "pant_long": r"Pant_Long_Seen_[0-9]", "pant_short": r"Pant_Short_Seen_[0-9]",
@@ -458,7 +473,8 @@ for row in rows:
     category, garment = row.get("category"), row.get("garment")
     if (row.get("campaign_kind") != "simple_curriculum_source_v1" or row.get("logical_stage") != expected_stage
             or row.get("strategy") != "canonical" or row.get("release_stage") != "seen"
-            or row.get("partition_id") != partition_id or row.get("parent_matrix_sha256") != parent_sha
+            or (orchestrated == "1" and ("partition_id" in row or "parent_matrix_sha256" in row))
+            or (orchestrated != "1" and (row.get("partition_id") != partition_id or row.get("parent_matrix_sha256") != parent_sha))
             or not isinstance(attempt_id, str) or not attempt_id or not isinstance(trial_id, str) or not trial_id
             or type(seed) is not int or not 0 <= seed < 2**32 or row.get("source_seed") != seed
             or category not in categories or not isinstance(garment, str)
