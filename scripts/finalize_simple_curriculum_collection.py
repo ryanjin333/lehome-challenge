@@ -273,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
             result = finalize_operator_handoff(handoff, provider=provider, publisher=HfFinalizerPublisher(args.hf_token_file), staging_parent=Path(temporary), stop_timeout_seconds=args.stop_timeout_seconds)
         print(json.dumps({"result": result["result"], "immutable_revision": result["publication"]["immutable_revision"]}, sort_keys=True))
         return 0
-    except FinalizationError as error:
+    except (FinalizationError, OSError, subprocess.SubprocessError, ValueError) as error:
         # Handoff fetch/validation is inside the safety boundary too.  The
         # remote process may be dead or its disk evidence corrupt, but it is
         # never a reason to leave this exact billed VM running.

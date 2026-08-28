@@ -68,6 +68,10 @@ def test_operator_wrapper_traps_even_an_unpersistable_handoff_for_local_finaliza
         controller.run_collection(config, runner=Runner())
     wrapper = (ROOT / "scripts/run_simple_curriculum_with_finalizer.sh").read_text(encoding="utf-8")
     assert "trap finalize EXIT" in wrapper and "finalize_simple_curriculum_collection.py" in wrapper
+    assert "LEHOME_REMOTE_CONTROLLER_COMMAND" not in wrapper
+    assert "/mnt/lehome/operator/simple-curriculum-invocation.env" in wrapper
+    assert "LEHOME_OPERATOR_REVIEWED_REVISION" in wrapper
+    assert "LEHOME_PAID_COLLECTION=1" in wrapper
 
 
 def test_command_runner_preparation_failure_writes_handoff_and_restart_is_inert(monkeypatch, tmp_path: Path) -> None:

@@ -371,6 +371,7 @@ OPERATOR_ROUND_ID="${LEHOME_ROUND_ID:?persisted fresh 12K round ID}"
 OPERATOR_CAMPAIGN_ROOT="${LEHOME_CAMPAIGN_ROOT:?persisted remote campaign root}"
 OPERATOR_SSH_TARGET="${LEHOME_VM_SSH_TARGET:?approved SSH target}"
 OPERATOR_HF_TOKEN_FILE="${LEHOME_OPERATOR_HF_TOKEN_FILE:?local root-owned 0600 token path}"
+OPERATOR_REVIEWED_REVISION="${LEHOME_REVIEWED_REVISION:?persisted reviewed 40-hex revision}"
 test -f "$OPERATOR_HF_TOKEN_FILE" && test ! -L "$OPERATOR_HF_TOKEN_FILE" && test -s "$OPERATOR_HF_TOKEN_FILE"
 test "$(stat -f '%u %Lp' "$OPERATOR_HF_TOKEN_FILE")" = "0 600"
 finalize_lehome() {
@@ -387,8 +388,8 @@ trap 'finalize_lehome' EXIT
 LEHOME_OPERATOR_SSH_TARGET="$OPERATOR_SSH_TARGET" \
 LEHOME_OPERATOR_CAMPAIGN_ROOT="$OPERATOR_CAMPAIGN_ROOT" \
 LEHOME_OPERATOR_RUN_ID="$OPERATOR_RUN_ID" LEHOME_OPERATOR_ROUND_ID="$OPERATOR_ROUND_ID" \
+LEHOME_OPERATOR_REVIEWED_REVISION="$OPERATOR_REVIEWED_REVISION" \
 LEHOME_OPERATOR_HF_TOKEN_FILE="$OPERATOR_HF_TOKEN_FILE" \
-LEHOME_REMOTE_CONTROLLER_COMMAND='sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LEHOME_PAID_COLLECTION=1 LEHOME_HOST_CODE_ROOT=/mnt/lehome/runtime-code/$LEHOME_REVIEWED_REVISION LEHOME_CAMPAIGN_ROOT=/mnt/lehome/campaigns/$LEHOME_RUN_ID LEHOME_RUN_ID=$LEHOME_RUN_ID LEHOME_ROUND_ID=$LEHOME_ROUND_ID LEHOME_MAX_WALL_SECONDS=86399 LEHOME_MAX_SPEND_USD=99.00 LEHOME_RUNTIME_IDENTITY_JSON=/mnt/lehome/operator/runtime-identity.json LEHOME_SPEND_OBSERVER=/mnt/lehome/operator/spend-observation.json /mnt/lehome/runtime-code/$LEHOME_REVIEWED_REVISION/rollout_appliance/run_simple_curriculum_collection.sh' \
 ./scripts/run_simple_curriculum_with_finalizer.sh
 ```
 

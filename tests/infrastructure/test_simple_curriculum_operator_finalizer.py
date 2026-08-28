@@ -96,6 +96,14 @@ def test_cli_stops_exact_vm_when_ssh_handoff_fetch_fails(monkeypatch, tmp_path: 
     assert len(stopped) == 1
 
 
+def test_cli_stops_exact_vm_when_fetch_raises_raw_oserror(monkeypatch, tmp_path: Path) -> None:
+    finalizer = _module(); stopped: list[object] = []
+    monkeypatch.setattr(finalizer, "fetch_remote_handoff", lambda **_kwargs: (_ for _ in ()).throw(OSError("temporary disk error")))
+    monkeypatch.setattr(finalizer, "stop_exact_instance", lambda provider, **_kwargs: stopped.append(provider) or {})
+    assert finalizer.main(["--ssh-target", "operator@host", "--ssh-port", "22", "--remote-campaign-root", "/mnt/lehome/campaign", "--run-id", "fresh-run-20260828-finalizer", "--round-id", "fresh-12k-20260828-finalizer", "--hf-token-file", str(tmp_path / "token"), "--stop-timeout-seconds", "2"]) == 2
+    assert len(stopped) == 1
+
+
 def test_finalizer_rejects_unknown_or_unproven_complete_handoff() -> None:
     finalizer = _module()
     unknown = _handoff(finalizer); unknown["terminal_outcome"] = "anything"; body = dict(unknown); body.pop("handoff_sha256"); unknown["handoff_sha256"] = finalizer._digest(body)
