@@ -28,6 +28,7 @@ STRATEGIES = frozenset({
     "strong",
     "mild_geometry",
     "strong_geometry",
+    "visual_only",
 })
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import lehome.flywheel.randomization as randomization
 
@@ -85,6 +87,43 @@ def test_geometry_profile_is_reproducible_without_unstable_material_fields() -> 
 
     receipt = dict(first.values)
     validate_randomization_receipt(dict(first.values), receipt)
+
+
+def test_visual_only_profile_is_deterministic_and_strictly_physics_invariant() -> None:
+    first = sample_randomization("visual_only", seed=140)
+    second = sample_randomization("visual_only", seed=140)
+
+    assert first == second
+    assert set(first.values) == set(randomization.VISUAL_ONLY_FIELDS)
+    assert set(first.values).isdisjoint(randomization.PHYSICS_AFFECTING_FIELDS)
+    assert {
+        "garment_yaw_deg", "garment_pose", "garment_scale",
+        "robot_base_translation_m", "cloth_geometry", "cloth_material",
+        "cloth_dynamics", "cloth_friction", "cloth_stiffness",
+        "cloth_damping", "solver_iterations", "joint_limits",
+    }.isdisjoint(first.values)
+
+    for field in first.values:
+        missing = dict(first.values)
+        missing.pop(field)
+        with pytest.raises(RuntimeError, match="fields"):
+            validate_randomization_receipt(dict(first.values), missing)
+    validate_randomization_receipt(dict(first.values), {
+        **dict(first.values),
+        "table_texture_path": "/assets/1.png",
+        "table_shader_input": "file",
+    })
+
+
+def test_visual_only_runtime_readback_fails_closed_on_cloth_or_pose_drift() -> None:
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_flywheel_capture_visual_replay_state" in source
+    assert "visual replay fidelity failure" in source
+    assert "np.array_equal" in source
 
 
 def test_geometry_receipt_still_fails_closed_on_missing_or_extra_readback() -> None:

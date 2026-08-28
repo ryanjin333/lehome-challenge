@@ -413,11 +413,18 @@ def _persistent_assignment_is_complete(assignment: Mapping[str, Any]) -> bool:
 
 
 def _persistent_collection_strategy(assignment: Mapping[str, Any]) -> str:
-    """Resolve the recorded strategy without enabling unstable material edits."""
+    """Resolve the recorded strategy without widening source collection scope."""
 
     explicit = assignment.get("strategy")
     if explicit is None:
         return "mild_geometry" if assignment.get("difficulty") == "randomized" else "canonical"
+    if explicit == "visual_only":
+        if os.environ.get("LEHOME_SUCCESS_REPLAY_CAMPAIGN") != "1":
+            raise ValueError("visual-only randomization requires a success replay campaign")
+        from lehome.flywheel.recovery_collection import validate_success_replay_descriptor
+
+        validate_success_replay_descriptor(assignment)
+        return "visual_only"
     if explicit in {"mild", "strong"}:
         raise ValueError("persistent collection only supports geometry-only randomization")
     if explicit not in {"canonical", "mild_geometry", "strong_geometry"}:

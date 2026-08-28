@@ -684,11 +684,15 @@ def validate_snapshot_source_descriptor(descriptor_path: str | Path) -> dict[str
 
 
 def validate_success_replay_descriptor(
-    descriptor_path: str | Path,
+    descriptor_path: str | Path | Mapping[str, object],
 ) -> list[dict[str, object]]:
-    """Validate one bounded, exact-cap CPU success-replay campaign."""
+    """Validate one bounded, exact-cap CPU success-replay campaign or row."""
 
-    rows = _snapshot_source_descriptor_rows(descriptor_path)
+    rows = (
+        [dict(descriptor_path)]
+        if isinstance(descriptor_path, Mapping)
+        else _snapshot_source_descriptor_rows(descriptor_path)
+    )
     if not 1 <= len(rows) <= 400:
         raise ValueError("success replay descriptor must contain 1..400 rows")
     allowed_fields = {

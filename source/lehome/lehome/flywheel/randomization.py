@@ -31,6 +31,29 @@ GEOMETRY_FIELDS = frozenset({
 MATERIAL_FIELDS = frozenset({"table_texture_id", "garment_display_color"})
 FULL_RANDOMIZATION_FIELDS = GEOMETRY_FIELDS | MATERIAL_FIELDS
 GEOMETRY_STRATEGIES = frozenset({"mild_geometry", "strong_geometry"})
+VISUAL_ONLY_FIELDS = frozenset({
+    "light_intensity_scale",
+    "camera_translation_m",
+    "table_texture_id",
+    "garment_display_color",
+})
+# Keep the replay contract explicit: no field in a visual-only sample may alter
+# cloth state, garment/robot pose, solver behavior, or the action envelope.
+PHYSICS_AFFECTING_FIELDS = frozenset({
+    "garment_yaw_deg",
+    "garment_pose",
+    "garment_translation_m",
+    "garment_scale",
+    "robot_base_translation_m",
+    "cloth_geometry",
+    "cloth_material",
+    "cloth_dynamics",
+    "cloth_friction",
+    "cloth_stiffness",
+    "cloth_damping",
+    "solver_iterations",
+    "joint_limits",
+})
 
 
 def read_or_author_garment_display_color(attribute) -> list[list[float]]:
@@ -63,6 +86,20 @@ def sample_randomization(strategy: str, *, seed: int) -> RandomizationRecord:
         raise ValueError("randomization seed must be a non-negative integer")
     if strategy == "canonical":
         return RandomizationRecord(strategy, {})
+    if strategy == "visual_only":
+        bounds = BOUNDS["mild"]
+        rng = np.random.default_rng(seed)
+        return RandomizationRecord(strategy, {
+            "light_intensity_scale": float(rng.uniform(*bounds.light)),
+            "camera_translation_m": tuple(
+                float(value)
+                for value in rng.uniform(-bounds.camera_m, bounds.camera_m, 3)
+            ),
+            "table_texture_id": int(rng.integers(1, 101)),
+            "garment_display_color": tuple(
+                float(value) for value in rng.uniform(0.65, 1.0, 3)
+            ),
+        })
     bounds_name = strategy.removesuffix("_geometry")
     try:
         bounds = BOUNDS[bounds_name]
@@ -103,7 +140,7 @@ def randomization_materials_enabled(sampled: dict[str, object]) -> bool:
     sampled_fields = set(sampled)
     if sampled_fields == set(GEOMETRY_FIELDS):
         return False
-    if sampled_fields == set(FULL_RANDOMIZATION_FIELDS):
+    if sampled_fields == set(FULL_RANDOMIZATION_FIELDS) or sampled_fields == set(VISUAL_ONLY_FIELDS):
         return True
     raise RuntimeError("flywheel randomization sample fields are unsupported")
 
@@ -132,7 +169,9 @@ __all__ = [
     "GEOMETRY_FIELDS",
     "GEOMETRY_STRATEGIES",
     "MATERIAL_FIELDS",
+    "PHYSICS_AFFECTING_FIELDS",
     "RandomizationBounds",
+    "VISUAL_ONLY_FIELDS",
     "read_or_author_garment_display_color",
     "randomization_materials_enabled",
     "sample_randomization",

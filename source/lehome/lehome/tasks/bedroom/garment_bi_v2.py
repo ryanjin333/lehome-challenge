@@ -2024,6 +2024,35 @@ class GarmentEnv(DirectRLEnv):
                 **weld_digests,
             }
 
+    def _flywheel_capture_visual_replay_state(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read the physical state that visual replay is forbidden to change."""
+        if self.object is None:
+            raise RuntimeError("cannot read visual replay state without a garment")
+        if str(self.device).lower() == "cpu":
+            positions, velocities = self._flywheel_legacy_cpu_cloth_state()
+        else:
+            positions, velocities = self._flywheel_physics_cloth_state()
+        pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
+        if pose.shape != (6,) or not np.isfinite(pose).all():
+            raise RuntimeError("visual replay garment pose readback is invalid")
+        return positions.copy(), velocities.copy(), pose.copy()
+
+    def _flywheel_verify_visual_replay_state(
+        self,
+        expected: tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> None:
+        """Fail closed if a visual-only mutation changed physical replay state."""
+        observed = self._flywheel_capture_visual_replay_state()
+        if not all(
+            np.array_equal(actual, target)
+            for actual, target in zip(observed, expected, strict=True)
+        ):
+            raise SimulatorNumericalDivergenceError(
+                "visual replay fidelity failure: cloth state or garment pose changed"
+            )
+
     def apply_flywheel_randomization(self, randomization) -> dict[str, object]:
         """Apply opt-in rollout perturbations and return values read back from Isaac.
 
@@ -2046,11 +2075,18 @@ class GarmentEnv(DirectRLEnv):
             self._flywheel_randomization_baseline = baseline
         # Every non-canonical strategy starts from the same exact scene.
         self._flywheel_restore_scene_state(baseline)
-        from lehome.flywheel.randomization import randomization_materials_enabled
+        from lehome.flywheel.randomization import (
+            VISUAL_ONLY_FIELDS,
+            randomization_materials_enabled,
+        )
 
         materials_enabled = randomization_materials_enabled(values)
+        visual_only = set(values) == set(VISUAL_ONLY_FIELDS)
         if self.object is None:
             raise RuntimeError("cannot randomize an uninitialized garment")
+        visual_replay_state = (
+            self._flywheel_capture_visual_replay_state() if visual_only else None
+        )
         stage = self.scene.stage
         table_input = None
         read_color = None
@@ -2081,8 +2117,11 @@ class GarmentEnv(DirectRLEnv):
             if not np.allclose(read_color, color, atol=1e-6):
                 raise RuntimeError("flywheel garment displayColor readback mismatch")
         camera_delta = np.asarray(values["camera_translation_m"], dtype=np.float32)
-        base_delta = np.asarray(values["robot_base_translation_m"], dtype=np.float32)
-        if camera_delta.shape != (3,) or base_delta.shape != (3,):
+        base_delta = (
+            None if visual_only
+            else np.asarray(values["robot_base_translation_m"], dtype=np.float32)
+        )
+        if camera_delta.shape != (3,) or (base_delta is not None and base_delta.shape != (3,)):
             raise ValueError("flywheel translation randomization must be 3-D")
         light_path = self.flywheel_randomization_cfg.get("light_prim_path", "/World/Light")
         light = stage.GetPrimAtPath(light_path)
@@ -2094,28 +2133,38 @@ class GarmentEnv(DirectRLEnv):
             raise RuntimeError("flywheel light intensity is unreadable")
         intensity_attr.Set(float(base_intensity) * float(values["light_intensity_scale"]))
 
+        observed_camera_deltas = []
         for camera in (self.top_camera, self.left_camera, self.right_camera):
             current_positions, current_orientations = read_camera_world_pose(camera)
             positions = current_positions + torch.tensor(camera_delta, device=self.device).unsqueeze(0)
             write_camera_world_pose(camera, positions, current_orientations)
+            observed_positions, _ = read_camera_world_pose(camera)
+            observed_delta = (
+                observed_positions - current_positions
+            ).detach().cpu().numpy()[0]
+            if not np.allclose(observed_delta, camera_delta, rtol=0.0, atol=1e-5):
+                raise RuntimeError("camera pose readback did not match requested randomization")
+            observed_camera_deltas.append(observed_delta)
 
-        pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
-        pose[5] += float(values["garment_yaw_deg"])
-        self.set_all_pose({"Garment": pose})
-        if not np.isclose(float(self.object.reset_pose[5]), float(pose[5]), atol=1e-5):
-            raise RuntimeError("garment yaw readback did not match requested randomization")
+        pose = None
+        if not visual_only:
+            pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
+            pose[5] += float(values["garment_yaw_deg"])
+            self.set_all_pose({"Garment": pose})
+            if not np.isclose(float(self.object.reset_pose[5]), float(pose[5]), atol=1e-5):
+                raise RuntimeError("garment yaw readback did not match requested randomization")
 
-        for arm in (self.left_arm, self.right_arm):
-            if not hasattr(arm, "write_root_pose_to_sim") or not hasattr(arm.data, "root_pos_w"):
-                raise RuntimeError("Isaac robot base does not expose restorable world pose")
-            position = arm.data.root_pos_w + torch.tensor(base_delta, device=self.device).unsqueeze(0)
-            root_pose = torch.cat((position, arm.data.root_quat_w), dim=-1)
-            arm.write_root_pose_to_sim(root_pose)
-            actual = arm.data.root_pos_w.detach().cpu().numpy()[0]
-            if not np.allclose(actual, position.detach().cpu().numpy()[0], atol=1e-5):
-                raise RuntimeError("robot base pose readback did not match requested randomization")
+            for arm in (self.left_arm, self.right_arm):
+                if not hasattr(arm, "write_root_pose_to_sim") or not hasattr(arm.data, "root_pos_w"):
+                    raise RuntimeError("Isaac robot base does not expose restorable world pose")
+                position = arm.data.root_pos_w + torch.tensor(base_delta, device=self.device).unsqueeze(0)
+                root_pose = torch.cat((position, arm.data.root_quat_w), dim=-1)
+                arm.write_root_pose_to_sim(root_pose)
+                actual = arm.data.root_pos_w.detach().cpu().numpy()[0]
+                if not np.allclose(actual, position.detach().cpu().numpy()[0], atol=1e-5):
+                    raise RuntimeError("robot base pose readback did not match requested randomization")
 
-        if preserved_restore is not None:
+        if preserved_restore is not None and not visual_only:
             if str(self.device).lower() == "cpu":
                 # Legacy CPU snapshots own USD-local particles. Moving the
                 # garment's parent Xform already applies the randomized pose;
@@ -2164,10 +2213,15 @@ class GarmentEnv(DirectRLEnv):
 
         receipt = {
             "light_intensity_scale": float(intensity_attr.Get()) / float(base_intensity),
-            "camera_translation_m": tuple(float(value) for value in camera_delta),
-            "garment_yaw_deg": float(self.object.reset_pose[5] - (pose[5] - float(values["garment_yaw_deg"]))),
-            "robot_base_translation_m": tuple(float(value) for value in base_delta),
+            "camera_translation_m": tuple(
+                float(value) for value in observed_camera_deltas[0]
+            ),
         }
+        if not visual_only:
+            receipt.update({
+                "garment_yaw_deg": float(self.object.reset_pose[5] - (pose[5] - float(values["garment_yaw_deg"]))),
+                "robot_base_translation_m": tuple(float(value) for value in base_delta),
+            })
         if materials_enabled:
             receipt.update({
                 "table_texture_id": int(values["table_texture_id"]),
@@ -2175,6 +2229,8 @@ class GarmentEnv(DirectRLEnv):
                 "table_shader_input": table_input.GetBaseName(),
                 "garment_display_color": read_color,
             })
+        if visual_replay_state is not None:
+            self._flywheel_verify_visual_replay_state(visual_replay_state)
         from lehome.flywheel.randomization import validate_randomization_receipt
 
         validate_randomization_receipt(values, receipt)

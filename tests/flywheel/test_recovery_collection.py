@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -125,6 +127,79 @@ def test_snapshot_source_descriptor_authenticates_an_explicit_legacy_cpu_restore
     descriptor.write_text(json.dumps([row]), encoding="utf-8")
     with pytest.raises(ValueError, match="cloth frame"):
         validate_snapshot_source_descriptor(descriptor)
+
+
+def test_success_replay_descriptor_validates_one_visual_only_assignment(tmp_path: Path) -> None:
+    from lehome.flywheel.recovery_collection import validate_success_replay_descriptor
+
+    restore = tmp_path / "success-reset.json"
+    restore.write_text(json.dumps({
+        "schema_version": 1,
+        "robot_position": [0.0] * 12,
+        "robot_velocity": [0.0] * 12,
+        "cloth_position": [[0.0, 0.0, 0.0]],
+        "cloth_velocity": [[0.0, 0.0, 0.0]],
+        "rng_state": {},
+        "garment_name": "Top_Long_Seen_0",
+        "randomization": {"strategy": "canonical"},
+        "scene_state": {"garment_reset_pose": [0.0, 0.0, 0.67, 0.0, 0.0, 90.0]},
+    }), encoding="utf-8")
+    row = {
+        "attempt_id": "visual-success-replay-1",
+        "trial_id": "visual-success-replay-1",
+        "garment": "Top_Long_Seen_0",
+        "garment_name": "Top_Long_Seen_0",
+        "category": "top_long",
+        "release_stage": "seen",
+        "difficulty": "success_replay",
+        "seed": 901,
+        "strategy": "visual_only",
+        "restore_snapshot": str(restore),
+        "restore_snapshot_sha256": hashlib.sha256(restore.read_bytes()).hexdigest(),
+        "restore_snapshot_cloth_frame": "usd_local_points_v1",
+        "parent_episode_id": "parent-success-1",
+        "lineage_id": "parent-success-1",
+        "replay_kind": "verified_success_reset_v1",
+        "category_acceptance_cap": 1,
+    }
+
+    assert validate_success_replay_descriptor(row) == [row]
+    with pytest.raises(ValueError, match="fields"):
+        validate_success_replay_descriptor({**row, "unexpected": True})
+
+
+def test_persistent_visual_only_requires_campaign_flag_and_validated_source_row(monkeypatch) -> None:
+    import lehome.flywheel.recovery_collection as recovery_collection
+
+    source_path = Path(__file__).resolve().parents[2] / "scripts/utils/evaluation.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    strategy_node = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_persistent_collection_strategy"
+    )
+    isolated = ast.Module(body=[strategy_node], type_ignores=[])
+    ast.fix_missing_locations(isolated)
+    namespace = {"os": os, "Mapping": dict, "Any": object}
+    exec(compile(isolated, str(source_path), "exec"), namespace)
+    strategy = namespace["_persistent_collection_strategy"]
+
+    assignment = {"strategy": "visual_only", "attempt_id": "source-row"}
+    monkeypatch.delenv("LEHOME_SUCCESS_REPLAY_CAMPAIGN", raising=False)
+    with pytest.raises(ValueError, match="success replay campaign"):
+        strategy(assignment)
+
+    validated: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        recovery_collection,
+        "validate_success_replay_descriptor",
+        lambda row: validated.append(dict(row)) or [dict(row)],
+    )
+    monkeypatch.setenv("LEHOME_SUCCESS_REPLAY_CAMPAIGN", "1")
+    assert strategy(assignment) == "visual_only"
+    assert validated == [assignment]
+    with pytest.raises(ValueError, match="geometry-only"):
+        strategy({"strategy": "mild"})
 
 
 def test_hard_state_descriptor_authenticates_a_cpu_moment_of_ruin_restore(tmp_path: Path) -> None:
