@@ -18,7 +18,7 @@ from threading import RLock
 from time import time_ns
 from typing import Any, Callable, Iterator, Literal, Mapping
 
-from .fidelity import FIDELITY_CODES, validate_fidelity
+from .fidelity import FIDELITY_CODES, validate_fidelity, validate_fidelity_diagnostic
 
 
 MAX_CAMPAIGN_ATTEMPTS = 400
@@ -387,6 +387,7 @@ class TaskLedger:
     def record_fidelity_abort(
         self, worker_id: str, attempt_id: str, lease_id: str, *, session_id: str,
         generation: int, fidelity_code: str, fidelity: Mapping[str, object], runtime: Mapping[str, object],
+        diagnostic: Mapping[str, object] | None = None,
     ) -> str:
         """Terminalize one fidelity failure and atomically end its campaign."""
         worker_id = _require_identifier(worker_id, field="worker_id")
@@ -399,6 +400,13 @@ class TaskLedger:
             validated_fidelity = validate_fidelity(fidelity, code=fidelity_code)
         except ValueError as error:
             raise ValueError("fidelity abort evidence is invalid") from error
+        try:
+            validated_diagnostic = (
+                validate_fidelity_diagnostic(diagnostic)
+                if diagnostic is not None else None
+            )
+        except ValueError as error:
+            raise ValueError("fidelity abort diagnostic is invalid") from error
         runtime_fields = {"simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device"}
         if (
             not isinstance(runtime, Mapping)
@@ -411,6 +419,8 @@ class TaskLedger:
             "fidelity": validated_fidelity, "lease_id": lease_id, "worker_id": worker_id,
             "session_id": session_id, "generation": generation, "runtime": dict(runtime),
         }
+        if validated_diagnostic is not None:
+            payload["diagnostic"] = validated_diagnostic
         with self._write():
             now_ns = self._now()
             self._expire_leases(now_ns)
@@ -441,16 +451,19 @@ class TaskLedger:
                     },
                     at_ns=now_ns,
                 )
+            campaign_payload = {
+                "reason": "fidelity_abort", "failure_class": "fidelity",
+                "fidelity_code": fidelity_code, "attempt_id": attempt_id,
+                "lease_id": lease_id, "worker_id": worker_id,
+                "session_id": session_id, "generation": generation,
+                "fidelity": validated_fidelity,
+                "runtime": dict(runtime),
+            }
+            if validated_diagnostic is not None:
+                campaign_payload["diagnostic"] = validated_diagnostic
             self._append_event(
                 "campaign_ended",
-                payload={
-                    "reason": "fidelity_abort", "failure_class": "fidelity",
-                    "fidelity_code": fidelity_code, "attempt_id": attempt_id,
-                    "lease_id": lease_id, "worker_id": worker_id,
-                    "session_id": session_id, "generation": generation,
-                    "fidelity": validated_fidelity,
-                    "runtime": dict(runtime),
-                },
+                payload=campaign_payload,
                 at_ns=now_ns,
             )
             return "infrastructure_abort"

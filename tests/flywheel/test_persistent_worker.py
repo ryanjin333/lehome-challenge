@@ -370,6 +370,52 @@ def test_true_mode_reset_fidelity_failure_is_a_typed_ledger_abort(tmp_path) -> N
     ]
 
 
+def test_fidelity_diagnostic_survives_worker_translation_to_controller(tmp_path) -> None:
+    from lehome.flywheel.fidelity import ClothFidelityError
+    from lehome.flywheel.persistent_worker import PersistentRolloutWorker
+
+    diagnostic = {
+        "stage": "reset_write_readback",
+        "write_readback": {
+            "max_position_delta_m": 0.0002,
+            "max_velocity_delta_mps": 0.003,
+        },
+    }
+
+    class FidelityController(FakeController):
+        def __init__(self) -> None:
+            super().__init__([Lease(Attempt("attempt-a", _source_assignment(11)), "lease-a")])
+            self.diagnostics = []
+
+        def record_fidelity_abort(self, worker_id, attempt_id, lease_id, **kwargs):
+            self.diagnostics.append(kwargs["diagnostic"])
+            return "infrastructure_abort"
+
+    class ResetMismatchSession(FakeSession):
+        def prepare_episode(self, **kwargs):
+            raise ClothFidelityError(
+                "cloth_flight",
+                {
+                    "missing_cloth": False, "cloth_flight": True,
+                    "nonfinite_cloth_state": False, "safety_failure": False,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+                diagnostic=diagnostic,
+            )
+
+    controller = FidelityController()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=ResetMismatchSession, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0", simple_curriculum_collection=True,
+    )
+
+    with pytest.raises(RuntimeError, match="source discovery fidelity abort"):
+        worker.run()
+
+    assert controller.diagnostics == [diagnostic]
+
+
 def test_simple_curriculum_fidelity_abort_stops_before_a_second_lease(tmp_path) -> None:
     from lehome.flywheel.persistent_worker import FidelityFailureError, PersistentRolloutWorker
 

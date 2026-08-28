@@ -1550,8 +1550,16 @@ def test_cpu_reset_rejects_a_velocity_saturated_initial_state() -> None:
         object=types.SimpleNamespace(),
     )
 
-    with pytest.raises(RuntimeError, match="saturated velocity"):
+    with pytest.raises(RuntimeError, match="saturated velocity") as captured:
         namespace["_flywheel_reset_legacy_cpu_garment"](env)
+
+    assert captured.value.diagnostic == {
+        "stage": "cached_reset_velocity",
+        "cached_reset_velocity": {
+            "max_velocity_mps": 5.0,
+            "max_velocity_limit_mps": 4.75,
+        },
+    }
 
 
 def test_cpu_reset_post_write_readback_failure_is_typed_cloth_evidence(monkeypatch) -> None:
@@ -1606,6 +1614,11 @@ def test_cpu_reset_post_write_readback_failure_is_typed_cloth_evidence(monkeypat
         namespace["_flywheel_reset_legacy_cpu_garment"](env)
 
     assert captured.value.code == "cloth_flight"
+    assert captured.value.diagnostic["stage"] == "reset_write_readback"
+    assert captured.value.diagnostic["write_readback"] == pytest.approx({
+        "max_position_delta_m": 0.7,
+        "max_velocity_delta_mps": 0.0,
+    })
 
 
 def test_cpu_visible_contact_transforms_live_usd_local_points_without_physx(monkeypatch) -> None:
@@ -2514,9 +2527,14 @@ def _evaluation(monkeypatch):
     modules["lehome.flywheel.persistent_worker"].SimulatorNumericalDivergenceError = type(
         "SimulatorNumericalDivergenceError", (ValueError,), {}
     )
-    modules["lehome.flywheel.persistent_worker"].FidelityFailureError = type(
-        "FidelityFailureError", (ValueError,), {}
-    )
+    class FidelityFailureError(ValueError):
+        def __init__(self, fidelity_code, fidelity, *, diagnostic=None):
+            self.fidelity_code = fidelity_code
+            self.fidelity = fidelity
+            self.diagnostic = diagnostic
+            super().__init__(fidelity_code)
+
+    modules["lehome.flywheel.persistent_worker"].FidelityFailureError = FidelityFailureError
     modules["lehome.flywheel"].__path__ = [
         str(repository / "source" / "lehome" / "lehome" / "flywheel")
     ]
@@ -2684,6 +2702,18 @@ def test_cloth_health_preserves_finite_flight_as_typed_evidence() -> None:
 
     assert captured.value.code == "cloth_flight"
     assert captured.value.fidelity["cloth_flight"] is True
+    assert captured.value.diagnostic == {
+        "stage": "post_stabilization",
+        "physical_health": {
+            "max_position_m": 10.0,
+            "max_extent_m": 0.0,
+            "max_velocity_mps": 0.0,
+            "max_position_limit_m": 2.0,
+            "max_extent_limit_m": 4.0,
+            "max_velocity_limit_mps": 4.75,
+            "exceeded_metrics": ["max_position_m"],
+        },
+    }
 
 
 def test_cloth_health_preserves_missing_cloth_as_typed_evidence() -> None:
@@ -3276,6 +3306,86 @@ def test_reset_cloth_failure_uses_mode_aware_fidelity_translation(
             env, object(), args,
             simple_curriculum_collection=simple_curriculum_collection,
         )
+
+
+def test_cloth_diagnostic_survives_evaluation_translation(monkeypatch) -> None:
+    from lehome.flywheel.fidelity import ClothFidelityError
+    from lehome.flywheel.persistent_worker import FidelityFailureError
+
+    evaluation = _evaluation(monkeypatch)
+    evaluation.FidelityFailureError = FidelityFailureError
+    diagnostic = {
+        "stage": "initialization_write_readback",
+        "write_readback": {
+            "max_position_delta_m": 0.0002,
+            "max_velocity_delta_mps": 0.003,
+        },
+    }
+    error = ClothFidelityError(
+        "cloth_flight",
+        {
+            "missing_cloth": False, "cloth_flight": True,
+            "nonfinite_cloth_state": False, "safety_failure": False,
+            "monitor_active": True, "monitor_observed": True,
+        },
+        diagnostic=diagnostic,
+    )
+
+    with pytest.raises(evaluation.FidelityFailureError) as captured:
+        evaluation._translate_cloth_fidelity_failure(
+            error, simple_curriculum_collection=True,
+            stage="reset_write_readback",
+        )
+
+    assert captured.value.diagnostic == diagnostic
+
+
+def test_policy_step_physical_failure_keeps_bounded_metrics_and_action_context(monkeypatch) -> None:
+    from lehome.flywheel.persistent_worker import FidelityFailureError
+
+    evaluation = _evaluation(monkeypatch)
+    evaluation.FidelityFailureError = FidelityFailureError
+    health = {
+        "healthy": False,
+        "fidelity": {
+            "missing_cloth": False, "cloth_flight": True,
+            "nonfinite_cloth_state": False, "safety_failure": False,
+            "monitor_active": True, "monitor_observed": True,
+        },
+        "max_position_m": 1.7, "max_extent_m": 1.2,
+        "max_velocity_mps": 4.9, "max_position_limit_m": 1.57,
+        "max_extent_limit_m": 1.8, "max_velocity_limit_mps": 4.75,
+        "exceeded_metrics": [
+            {"metric_name": "max_position_m", "metric_value": 1.7, "metric_limit": 1.57},
+            {"metric_name": "max_velocity_mps", "metric_value": 4.9, "metric_limit": 4.75},
+        ],
+    }
+    env = types.SimpleNamespace(flywheel_cloth_physical_health=lambda: health)
+    action = {
+        "policy_action_limits_available": True,
+        "policy_action_dimension": 12,
+        "policy_action_nonfinite_count": 0,
+        "policy_action_outside_live_joint_limit_count": 2,
+        "policy_action_total_steps": 204,
+    }
+
+    with pytest.raises(evaluation.FidelityFailureError) as captured:
+        evaluation._require_flywheel_cloth_health(
+            env, policy_action_diagnostics=action,
+            simple_curriculum_collection=True,
+            stage="policy_step", step_index=203,
+        )
+
+    assert captured.value.diagnostic == {
+        "stage": "policy_step", "step_index": 203,
+        "physical_health": {
+            "max_position_m": 1.7, "max_extent_m": 1.2,
+            "max_velocity_mps": 4.9, "max_position_limit_m": 1.57,
+            "max_extent_limit_m": 1.8, "max_velocity_limit_mps": 4.75,
+            "exceeded_metrics": ["max_position_m", "max_velocity_mps"],
+        },
+        "policy_action": action,
+    }
 
 
 def test_cpu_controlled_recovery_bootstrap_receives_a_source_seeded_reset_callback(monkeypatch, tmp_path) -> None:
@@ -4676,7 +4786,7 @@ def test_policy_action_diagnostics_are_sampled_before_each_step_and_bound_to_hea
     diagnostic_index = loop_source.index("_flywheel_policy_action_limit_diagnostics(env, action)")
     step_index = loop_source.index("env.step(action)")
     health_index = loop_source.index(
-        "_require_flywheel_cloth_health(\n                    env, policy_action_diagnostics=policy_action_diagnostics,\n                    simple_curriculum_collection=simple_curriculum_collection,\n                )"
+        "_require_flywheel_cloth_health(\n                    env, policy_action_diagnostics=policy_action_diagnostics,\n                    simple_curriculum_collection=simple_curriculum_collection,\n                    stage=\"policy_step\", step_index=st,\n                )"
     )
     assert diagnostic_index < step_index < health_index
 

@@ -25,6 +25,7 @@ from .fidelity import (
     ClothFidelityError,
     fidelity_receipt,
     validate_fidelity,
+    validate_fidelity_diagnostic,
 )
 
 
@@ -56,7 +57,10 @@ class SimulatorNumericalDivergenceError(InfrastructureInvalidAttemptError):
 class FidelityFailureError(InfrastructureInvalidAttemptError):
     """A typed pre-frame physical or safety fidelity failure."""
 
-    def __init__(self, fidelity_code: str, fidelity: Mapping[str, object]) -> None:
+    def __init__(
+        self, fidelity_code: str, fidelity: Mapping[str, object], *,
+        diagnostic: Mapping[str, object] | None = None,
+    ) -> None:
         if fidelity_code not in FIDELITY_CODES:
             raise ValueError("fidelity failure evidence is invalid")
         try:
@@ -65,6 +69,13 @@ class FidelityFailureError(InfrastructureInvalidAttemptError):
             raise ValueError("fidelity failure evidence is invalid") from error
         self.fidelity_code = fidelity_code
         self.fidelity = validated
+        try:
+            self.diagnostic = (
+                validate_fidelity_diagnostic(diagnostic)
+                if diagnostic is not None else None
+            )
+        except ValueError as error:
+            raise ValueError("fidelity failure diagnostic is invalid") from error
         super().__init__(fidelity_code)
 
 
@@ -523,7 +534,9 @@ class PersistentRolloutWorker:
                     # Normalize it here before any generic error policy.
                     if isinstance(error, ClothFidelityError):
                         error = (
-                            FidelityFailureError(error.code, error.fidelity)
+                            FidelityFailureError(
+                                error.code, error.fidelity, diagnostic=error.diagnostic,
+                            )
                             if self._simple_curriculum_collection
                             else SimulatorNumericalDivergenceError(str(error))
                         )
@@ -570,18 +583,23 @@ class PersistentRolloutWorker:
                         abort = getattr(self._controller, "record_fidelity_abort", None)
                         if not callable(abort):
                             raise RuntimeError("controller does not support durable fidelity abort") from error
+                        abort_kwargs = {
+                            "session_id": self.identity.session_id,
+                            "generation": generation,
+                            "fidelity_code": error.fidelity_code,
+                            "fidelity": error.fidelity,
+                            "runtime": {
+                                key: runtime_receipt[key]
+                                for key in ("simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device")
+                            },
+                        }
+                        if error.diagnostic is not None:
+                            abort_kwargs["diagnostic"] = error.diagnostic
                         abort_status = abort(
                             self.identity.worker_id,
                             attempt_id,
                             lease_id,
-                            session_id=self.identity.session_id,
-                            generation=generation,
-                            fidelity_code=error.fidelity_code,
-                            fidelity=error.fidelity,
-                            runtime={
-                                key: runtime_receipt[key]
-                                for key in ("simulation_device", "cloth_device", "renderer_device", "camera_device", "policy_device")
-                            },
+                            **abort_kwargs,
                         )
                         if abort_status == "retryable":
                             raise RuntimeError(

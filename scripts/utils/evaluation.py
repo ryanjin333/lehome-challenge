@@ -45,15 +45,31 @@ logger = get_logger(__name__)
 
 def _translate_cloth_fidelity_failure(
     error: ClothFidelityError, *, simple_curriculum_collection: bool,
+    stage: str | None = None, step_index: int | None = None,
+    policy_action_diagnostics: Mapping[str, object] | None = None,
 ) -> None:
     """Translate a physical reset failure at the mode boundary."""
 
     if simple_curriculum_collection:
-        raise FidelityFailureError(error.code, error.fidelity) from error
+        diagnostic = dict(error.diagnostic or {})
+        if stage is not None and (not diagnostic or stage == "policy_step"):
+            diagnostic["stage"] = stage
+            if stage == "policy_step":
+                diagnostic["step_index"] = step_index
+            else:
+                diagnostic.pop("step_index", None)
+        if policy_action_diagnostics is not None:
+            diagnostic["policy_action"] = dict(policy_action_diagnostics)
+        raise FidelityFailureError(
+            error.code, error.fidelity,
+            diagnostic=diagnostic or None,
+        ) from error
     raise SimulatorNumericalDivergenceError(str(error)) from error
 
 
-def _run_reset_preparation(operation, *, simple_curriculum_collection: bool):
+def _run_reset_preparation(
+    operation, *, simple_curriculum_collection: bool, stage: str,
+):
     """Run reset/readback work without losing typed cloth evidence."""
 
     try:
@@ -61,6 +77,7 @@ def _run_reset_preparation(operation, *, simple_curriculum_collection: bool):
     except ClothFidelityError as error:
         _translate_cloth_fidelity_failure(
             error, simple_curriculum_collection=simple_curriculum_collection,
+            stage=stage,
         )
 
 _FLYWHEEL_POLICY_ACTION_JOINT_NAMES = (
@@ -161,6 +178,8 @@ def _require_flywheel_cloth_health(
     *,
     policy_action_diagnostics: Mapping[str, object] | None = None,
     simple_curriculum_collection: bool = False,
+    stage: str = "post_stabilization",
+    step_index: int | None = None,
 ) -> Mapping[str, object]:
     """Stop a recording before numerical cloth divergence can become data."""
 
@@ -176,6 +195,8 @@ def _require_flywheel_cloth_health(
     except ClothFidelityError as error:
         _translate_cloth_fidelity_failure(
             error, simple_curriculum_collection=simple_curriculum_collection,
+            stage=stage, step_index=step_index,
+            policy_action_diagnostics=policy_action_diagnostics,
         )
     if simple_curriculum_collection:
         try:
@@ -188,7 +209,36 @@ def _require_flywheel_cloth_health(
             ) from error
         for code in CLOTH_FIDELITY_CODES:
             if cloth_fidelity[code]:
-                raise FidelityFailureError(code, cloth_fidelity)
+                diagnostic: dict[str, object] = {"stage": stage}
+                if stage == "policy_step":
+                    diagnostic["step_index"] = step_index
+                physical_fields = (
+                    "max_position_m", "max_extent_m", "max_velocity_mps",
+                    "max_position_limit_m", "max_extent_limit_m",
+                    "max_velocity_limit_mps",
+                )
+                exceeded = health.get("exceeded_metrics")
+                if (
+                    all(type(health.get(field)) is float for field in physical_fields)
+                    and isinstance(exceeded, (list, tuple))
+                ):
+                    exceeded_names = [
+                        item.get("metric_name") for item in exceeded
+                        if isinstance(item, Mapping)
+                        and item.get("metric_name") in {
+                            "max_position_m", "max_extent_m", "max_velocity_mps",
+                        }
+                    ]
+                    if exceeded_names:
+                        diagnostic["physical_health"] = {
+                            **{field: health[field] for field in physical_fields},
+                            "exceeded_metrics": exceeded_names,
+                        }
+                if policy_action_diagnostics is not None:
+                    diagnostic["policy_action"] = dict(policy_action_diagnostics)
+                raise FidelityFailureError(
+                    code, cloth_fidelity, diagnostic=diagnostic,
+                )
     if not isinstance(health, Mapping) or health.get("healthy") is not True:
         reason = (
             health.get("reason", "simulator_numerical_divergence")
@@ -968,10 +1018,12 @@ def run_evaluation_loop(
             set_seed(controlled_source_seed)
         _run_reset_preparation(
             env.reset, simple_curriculum_collection=simple_curriculum_collection,
+            stage="reset_write_readback",
         )
         _run_reset_preparation(
             lambda: stabilize_garment_after_reset(env, args),
             simple_curriculum_collection=simple_curriculum_collection,
+            stage="post_stabilization",
         )
         restore = getattr(args, "restore_snapshot", None)
         if restore is not None:
@@ -992,6 +1044,7 @@ def run_evaluation_loop(
             _run_reset_preparation(
                 lambda: restore_snapshot(env, snapshot),
                 simple_curriculum_collection=simple_curriculum_collection,
+                stage="reset_write_readback",
             )
             args.restore_snapshot = None
 
@@ -1021,6 +1074,7 @@ def run_evaluation_loop(
             randomization_receipt = _run_reset_preparation(
                 lambda: env.apply_flywheel_randomization(sampled),
                 simple_curriculum_collection=simple_curriculum_collection,
+                stage="reset_write_readback",
             )
             from lehome.flywheel.randomization import validate_randomization_receipt
             validate_randomization_receipt(dict(sampled.values), dict(randomization_receipt))
@@ -1029,6 +1083,7 @@ def run_evaluation_loop(
                     controlled_provenance = _run_reset_preparation(
                         lambda: bootstrap_controlled_recovery(env, controlled),
                         simple_curriculum_collection=simple_curriculum_collection,
+                        stage="reset_write_readback",
                     )
                 else:
                     def reset_controlled_source() -> None:
@@ -1038,14 +1093,17 @@ def run_evaluation_loop(
                         set_seed(controlled_source_seed)
                         _run_reset_preparation(
                             env.reset, simple_curriculum_collection=simple_curriculum_collection,
+                            stage="reset_write_readback",
                         )
                         _run_reset_preparation(
                             lambda: stabilize_garment_after_reset(env, args),
                             simple_curriculum_collection=simple_curriculum_collection,
+                            stage="post_stabilization",
                         )
                         reset_receipt = _run_reset_preparation(
                             lambda: env.apply_flywheel_randomization(sampled),
                             simple_curriculum_collection=simple_curriculum_collection,
+                            stage="reset_write_readback",
                         )
                         validate_randomization_receipt(
                             dict(sampled.values), dict(reset_receipt),
@@ -1056,6 +1114,7 @@ def run_evaluation_loop(
                             env, controlled, reset_callback=reset_controlled_source,
                         ),
                         simple_curriculum_collection=simple_curriculum_collection,
+                        stage="reset_write_readback",
                     )
             identity = flywheel_identity
             if identity is None:  # pragma: no cover - guarded above, keeps type flow explicit.
@@ -1081,6 +1140,7 @@ def run_evaluation_loop(
                     },
                 ),
                 simple_curriculum_collection=simple_curriculum_collection,
+                stage="reset_write_readback",
             )
             recorder.record_snapshot("reset", reset_snapshot)
         if reset_policy:
@@ -1277,6 +1337,7 @@ def run_evaluation_loop(
                 cloth_health = _require_flywheel_cloth_health(
                     env, policy_action_diagnostics=policy_action_diagnostics,
                     simple_curriculum_collection=simple_curriculum_collection,
+                    stage="policy_step", step_index=st,
                 )
                 if simple_curriculum_collection:
                     try:

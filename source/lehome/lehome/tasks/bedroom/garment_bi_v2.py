@@ -707,6 +707,7 @@ class GarmentEnv(DirectRLEnv):
                     monitor_active=True, monitor_observed=True,
                 ),
                 detail="cannot initialize an absent CPU source garment",
+                diagnostic={"stage": "initialization_write_readback"},
             )
         try:
             # Use SingleClothPrim's cloth-aware root setter. Moving only the
@@ -727,6 +728,7 @@ class GarmentEnv(DirectRLEnv):
                         monitor_active=True, monitor_observed=True,
                     ),
                     detail="CPU source garment USD points are unset",
+                    diagnostic={"stage": "initialization_write_readback"},
                 )
             positions_array = np.asarray(positions, dtype=np.float32)
             positions_array, zero_velocities = self._flywheel_cloth_arrays(
@@ -756,6 +758,13 @@ class GarmentEnv(DirectRLEnv):
                             monitor_active=True, monitor_observed=True,
                         ),
                         detail="CPU source garment initialization readback mismatch",
+                        diagnostic={
+                            "stage": "initialization_write_readback",
+                            "write_readback": {
+                                "max_position_delta_m": float(np.max(np.abs(observed_positions - positions_array))) if observed_positions.size else 0.0,
+                                "max_velocity_delta_mps": float(np.max(np.abs(observed_velocities - zero_velocities))) if observed_velocities.size else 0.0,
+                            },
+                        },
                     )
                 reset_velocities = zero_velocities
             else:
@@ -816,6 +825,13 @@ class GarmentEnv(DirectRLEnv):
                     f"observed={initial_max_velocity_mps} "
                     f"limit={configured_max_velocity_mps * 0.95}"
                 ),
+                diagnostic={
+                    "stage": "cached_reset_velocity",
+                    "cached_reset_velocity": {
+                        "max_velocity_mps": initial_max_velocity_mps,
+                        "max_velocity_limit_mps": configured_max_velocity_mps * 0.95,
+                    },
+                },
             )
         try:
             config_get = getattr(self.object, "_get_config_value", None)
@@ -864,6 +880,13 @@ class GarmentEnv(DirectRLEnv):
                     monitor_active=True, monitor_observed=True,
                 ),
                 detail="CPU source garment USD reset readback mismatch",
+                diagnostic={
+                    "stage": "reset_write_readback",
+                    "write_readback": {
+                        "max_position_delta_m": float(np.max(np.abs(observed_positions - positions))) if observed_positions.size else 0.0,
+                        "max_velocity_delta_mps": float(np.max(np.abs(observed_velocities - velocities))) if observed_velocities.size else 0.0,
+                    },
+                },
             )
 
     def get_all_pose(self):
@@ -1659,7 +1682,23 @@ class GarmentEnv(DirectRLEnv):
                 max_extent_limit_m=max_extent_limit_m, max_velocity_limit_mps=max_velocity_limit_mps,
                 exceeded_metrics=exceeded_metrics,
             )
-            raise ClothFidelityError("cloth_flight", failure["fidelity"])
+            raise ClothFidelityError(
+                "cloth_flight", failure["fidelity"],
+                diagnostic={
+                    "stage": "post_stabilization",
+                    "physical_health": {
+                        "max_position_m": max_position_m,
+                        "max_extent_m": max_extent_m,
+                        "max_velocity_mps": max_velocity_mps,
+                        "max_position_limit_m": max_position_limit_m,
+                        "max_extent_limit_m": max_extent_limit_m,
+                        "max_velocity_limit_mps": max_velocity_limit_mps,
+                        "exceeded_metrics": [
+                            metric["metric_name"] for metric in exceeded_metrics
+                        ],
+                    },
+                },
+            )
         return receipt(
             healthy=True, max_position_m=max_position_m,
             max_extent_m=max_extent_m, max_velocity_mps=max_velocity_mps,
@@ -1951,6 +1990,13 @@ class GarmentEnv(DirectRLEnv):
                     monitor_active=True, monitor_observed=True,
                 ),
                 detail="garment cloth write readback mismatch",
+                diagnostic={
+                    "stage": "reset_write_readback",
+                    "write_readback": {
+                        "max_position_delta_m": float(np.max(np.abs(observed_position - cloth_position))) if observed_position.size else 0.0,
+                        "max_velocity_delta_mps": float(np.max(np.abs(observed_velocity - cloth_velocity))) if observed_velocity.size else 0.0,
+                    },
+                },
             )
         restored_pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
         if restored_pose.shape != (6,) or not np.isfinite(restored_pose).all():

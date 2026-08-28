@@ -344,6 +344,56 @@ def test_record_fidelity_abort_writes_typed_terminal_payload(ledger) -> None:
     }
 
 
+def test_record_fidelity_abort_persists_diagnostic_in_abort_and_campaign_end(ledger) -> None:
+    lease = ledger.lease_next("worker-a", lease_duration_ns=100)
+    assert lease is not None
+    fidelity = {
+        "missing_cloth": False, "cloth_flight": True,
+        "nonfinite_cloth_state": False, "safety_failure": False,
+        "monitor_active": True, "monitor_observed": True,
+    }
+    diagnostic = {
+        "stage": "post_stabilization",
+        "physical_health": {
+            "max_position_m": 1.7, "max_extent_m": 1.2,
+            "max_velocity_mps": 4.9, "max_position_limit_m": 1.57,
+            "max_extent_limit_m": 1.8, "max_velocity_limit_mps": 4.75,
+            "exceeded_metrics": ["max_position_m", "max_velocity_mps"],
+        },
+    }
+    ledger.record_fidelity_abort(
+        "worker-a", lease.attempt.attempt_id, lease.lease_id,
+        session_id="session-a", generation=3, fidelity_code="cloth_flight",
+        fidelity=fidelity, diagnostic=diagnostic,
+        runtime={"simulation_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0"},
+    )
+
+    events = ledger.events()
+    assert next(event for event in events if event.event_type == "infrastructure_abort").payload["diagnostic"] == diagnostic
+    assert next(event for event in events if event.event_type == "campaign_ended").payload["diagnostic"] == diagnostic
+
+
+def test_record_fidelity_abort_rejects_malformed_diagnostic_without_writing(ledger) -> None:
+    lease = ledger.lease_next("worker-a", lease_duration_ns=100)
+    assert lease is not None
+    before = ledger.events()
+
+    with pytest.raises(ValueError, match="diagnostic"):
+        ledger.record_fidelity_abort(
+            "worker-a", lease.attempt.attempt_id, lease.lease_id,
+            session_id="session-a", generation=3, fidelity_code="cloth_flight",
+            fidelity={
+                "missing_cloth": False, "cloth_flight": True,
+                "nonfinite_cloth_state": False, "safety_failure": False,
+                "monitor_active": True, "monitor_observed": True,
+            },
+            diagnostic={"stage": "policy_step", "step_index": 0, "detail": "x" * 10_000},
+            runtime={"simulation_device": "cpu", "cloth_device": "cpu", "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0"},
+        )
+
+    assert ledger.events() == before
+
+
 @pytest.mark.parametrize("field", ["monitor_active", "monitor_observed"])
 def test_record_fidelity_abort_refuses_unobserved_monitors_without_writing(ledger, field: str) -> None:
     lease = ledger.lease_next("worker-a", lease_duration_ns=100)
