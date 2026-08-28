@@ -2042,23 +2042,6 @@ class GarmentEnv(DirectRLEnv):
             raise RuntimeError("visual replay garment pose readback is invalid")
         return positions.copy(), velocities.copy(), pose.copy()
 
-    def _flywheel_prepare_randomization(
-        self, values: dict[str, object],
-    ) -> tuple[bool, tuple[np.ndarray, np.ndarray, np.ndarray] | None]:
-        """Capture visual replay before any scene mutation; restore only physical modes."""
-        from lehome.flywheel.randomization import VISUAL_ONLY_FIELDS
-
-        if set(values) == set(VISUAL_ONLY_FIELDS):
-            return True, self._flywheel_capture_visual_replay_state()
-        baseline = getattr(self, "_flywheel_randomization_baseline", None)
-        if baseline is None:
-            baseline = self._flywheel_capture_scene_state()
-            self._flywheel_randomization_baseline = baseline
-        # Physical randomization starts from a common canonical scene.  This is
-        # deliberately forbidden for exact visual success replay.
-        self._flywheel_restore_scene_state(baseline)
-        return False, None
-
     def _flywheel_verify_visual_replay_state(
         self,
         expected: tuple[np.ndarray, np.ndarray, np.ndarray],
@@ -2114,30 +2097,12 @@ class GarmentEnv(DirectRLEnv):
                 },
             )
 
-    def apply_flywheel_randomization(self, randomization) -> dict[str, object]:
-        """Apply opt-in rollout perturbations and return values read back from Isaac.
-
-        This method is intentionally fail-closed: a caller must not write a
-        randomized manifest when any configured simulator property cannot be
-        applied and observed again.
-        """
-        values = dict(randomization.values if hasattr(randomization, "values") else randomization)
-        preserved_restore = getattr(self, "_flywheel_preserved_restore_for_randomization", None)
-        self._flywheel_preserved_restore_for_randomization = None
-        # Canonical is a control, not a randomization strategy.  In particular,
-        # do not restore a captured scene here: evaluation calls this after the
-        # garment has settled, and scene restoration resets the cloth pose.
-        if not values:
-            self._flywheel_randomization_receipt = {}
-            return {}
-        from lehome.flywheel.randomization import randomization_materials_enabled
-
-        materials_enabled = randomization_materials_enabled(values)
+    def _apply_flywheel_visual_mutations(
+        self, values: dict[str, object], *, materials_enabled: bool,
+    ) -> dict[str, object]:
+        """Apply and read back the only mutations permitted in visual replay."""
         if self.object is None:
             raise RuntimeError("cannot randomize an uninitialized garment")
-        visual_only, visual_replay_state = self._flywheel_prepare_randomization(
-            values,
-        )
         stage = self.scene.stage
         table_input = None
         read_color = None
@@ -2168,11 +2133,7 @@ class GarmentEnv(DirectRLEnv):
             if not np.allclose(read_color, color, atol=1e-6):
                 raise RuntimeError("flywheel garment displayColor readback mismatch")
         camera_delta = np.asarray(values["camera_translation_m"], dtype=np.float32)
-        base_delta = (
-            None if visual_only
-            else np.asarray(values["robot_base_translation_m"], dtype=np.float32)
-        )
-        if camera_delta.shape != (3,) or (base_delta is not None and base_delta.shape != (3,)):
+        if camera_delta.shape != (3,):
             raise ValueError("flywheel translation randomization must be 3-D")
         light_path = self.flywheel_randomization_cfg.get("light_prim_path", "/World/Light")
         light = stage.GetPrimAtPath(light_path)
@@ -2197,25 +2158,90 @@ class GarmentEnv(DirectRLEnv):
                 raise RuntimeError("camera pose readback did not match requested randomization")
             observed_camera_deltas.append(observed_delta)
 
-        pose = None
-        if not visual_only:
-            pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
-            pose[5] += float(values["garment_yaw_deg"])
-            self.set_all_pose({"Garment": pose})
-            if not np.isclose(float(self.object.reset_pose[5]), float(pose[5]), atol=1e-5):
-                raise RuntimeError("garment yaw readback did not match requested randomization")
+        receipt = {
+            "light_intensity_scale": float(intensity_attr.Get()) / float(base_intensity),
+            "camera_translation_m": tuple(
+                float(value) for value in observed_camera_deltas[0]
+            ),
+        }
+        if materials_enabled:
+            receipt.update({
+                "table_texture_id": int(values["table_texture_id"]),
+                "table_texture_path": str(table_input.Get().path),
+                "table_shader_input": table_input.GetBaseName(),
+                "garment_display_color": read_color,
+            })
+        return receipt
 
-            for arm in (self.left_arm, self.right_arm):
-                if not hasattr(arm, "write_root_pose_to_sim") or not hasattr(arm.data, "root_pos_w"):
-                    raise RuntimeError("Isaac robot base does not expose restorable world pose")
-                position = arm.data.root_pos_w + torch.tensor(base_delta, device=self.device).unsqueeze(0)
-                root_pose = torch.cat((position, arm.data.root_quat_w), dim=-1)
-                arm.write_root_pose_to_sim(root_pose)
-                actual = arm.data.root_pos_w.detach().cpu().numpy()[0]
-                if not np.allclose(actual, position.detach().cpu().numpy()[0], atol=1e-5):
-                    raise RuntimeError("robot base pose readback did not match requested randomization")
+    def apply_flywheel_randomization(self, randomization) -> dict[str, object]:
+        """Apply opt-in rollout perturbations and return values read back from Isaac.
 
-        if preserved_restore is not None and not visual_only:
+        This method is intentionally fail-closed: a caller must not write a
+        randomized manifest when any configured simulator property cannot be
+        applied and observed again.
+        """
+        values = dict(randomization.values if hasattr(randomization, "values") else randomization)
+        preserved_restore = getattr(self, "_flywheel_preserved_restore_for_randomization", None)
+        self._flywheel_preserved_restore_for_randomization = None
+        # Canonical is a control, not a randomization strategy.  In particular,
+        # do not restore a captured scene here: evaluation calls this after the
+        # garment has settled, and scene restoration resets the cloth pose.
+        if not values:
+            self._flywheel_randomization_receipt = {}
+            return {}
+        from lehome.flywheel.randomization import (
+            VISUAL_ONLY_FIELDS,
+            orchestrate_visual_only_replay,
+            randomization_materials_enabled,
+            validate_randomization_receipt,
+        )
+
+        if set(values) == set(VISUAL_ONLY_FIELDS):
+            receipt = orchestrate_visual_only_replay(
+                values,
+                capture_state=self._flywheel_capture_visual_replay_state,
+                apply_visual_mutations=lambda: self._apply_flywheel_visual_mutations(
+                    values, materials_enabled=True,
+                ),
+                verify_state=self._flywheel_verify_visual_replay_state,
+            )
+            validate_randomization_receipt(values, receipt)
+            self._flywheel_randomization_receipt = receipt
+            return receipt
+
+        materials_enabled = randomization_materials_enabled(values)
+        if self.object is None:
+            raise RuntimeError("cannot randomize an uninitialized garment")
+        baseline = getattr(self, "_flywheel_randomization_baseline", None)
+        if baseline is None:
+            baseline = self._flywheel_capture_scene_state()
+            self._flywheel_randomization_baseline = baseline
+        self._flywheel_restore_scene_state(baseline)
+        receipt = self._apply_flywheel_visual_mutations(
+            values, materials_enabled=materials_enabled,
+        )
+        base_delta = (
+            np.asarray(values["robot_base_translation_m"], dtype=np.float32)
+        )
+        if base_delta.shape != (3,):
+            raise ValueError("flywheel translation randomization must be 3-D")
+        pose = np.asarray(self.object.get_all_pose()["Garment"], dtype=np.float32)
+        pose[5] += float(values["garment_yaw_deg"])
+        self.set_all_pose({"Garment": pose})
+        if not np.isclose(float(self.object.reset_pose[5]), float(pose[5]), atol=1e-5):
+            raise RuntimeError("garment yaw readback did not match requested randomization")
+
+        for arm in (self.left_arm, self.right_arm):
+            if not hasattr(arm, "write_root_pose_to_sim") or not hasattr(arm.data, "root_pos_w"):
+                raise RuntimeError("Isaac robot base does not expose restorable world pose")
+            position = arm.data.root_pos_w + torch.tensor(base_delta, device=self.device).unsqueeze(0)
+            root_pose = torch.cat((position, arm.data.root_quat_w), dim=-1)
+            arm.write_root_pose_to_sim(root_pose)
+            actual = arm.data.root_pos_w.detach().cpu().numpy()[0]
+            if not np.allclose(actual, position.detach().cpu().numpy()[0], atol=1e-5):
+                raise RuntimeError("robot base pose readback did not match requested randomization")
+
+        if preserved_restore is not None:
             if str(self.device).lower() == "cpu":
                 # Legacy CPU snapshots own USD-local particles. Moving the
                 # garment's parent Xform already applies the randomized pose;
@@ -2262,28 +2288,10 @@ class GarmentEnv(DirectRLEnv):
             ):
                 raise RuntimeError("randomized authenticated cloth write readback mismatch")
 
-        receipt = {
-            "light_intensity_scale": float(intensity_attr.Get()) / float(base_intensity),
-            "camera_translation_m": tuple(
-                float(value) for value in observed_camera_deltas[0]
-            ),
-        }
-        if not visual_only:
-            receipt.update({
-                "garment_yaw_deg": float(self.object.reset_pose[5] - (pose[5] - float(values["garment_yaw_deg"]))),
-                "robot_base_translation_m": tuple(float(value) for value in base_delta),
-            })
-        if materials_enabled:
-            receipt.update({
-                "table_texture_id": int(values["table_texture_id"]),
-                "table_texture_path": str(table_input.Get().path),
-                "table_shader_input": table_input.GetBaseName(),
-                "garment_display_color": read_color,
-            })
-        if visual_replay_state is not None:
-            self._flywheel_verify_visual_replay_state(visual_replay_state)
-        from lehome.flywheel.randomization import validate_randomization_receipt
-
+        receipt.update({
+            "garment_yaw_deg": float(self.object.reset_pose[5] - (pose[5] - float(values["garment_yaw_deg"]))),
+            "robot_base_translation_m": tuple(float(value) for value in base_delta),
+        })
         validate_randomization_receipt(values, receipt)
         self._flywheel_randomization_receipt = receipt
         return receipt

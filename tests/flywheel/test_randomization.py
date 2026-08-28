@@ -117,27 +117,23 @@ def test_visual_only_profile_is_deterministic_and_strictly_physics_invariant() -
     })
 
 
-def _visual_replay_methods() -> dict[str, object]:
+def _garment_methods(*names: str) -> dict[str, object]:
     source = (
         Path(__file__).resolve().parents[2]
         / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
     ).read_text(encoding="utf-8")
     tree = ast.parse(source)
-    names = {
-        "_flywheel_capture_visual_replay_state",
-        "_flywheel_prepare_randomization",
-        "_flywheel_verify_visual_replay_state",
-    }
+    required = set(names)
     garment_env = next(
         node for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "GarmentEnv"
     )
     methods = [
         node for node in garment_env.body
-        if isinstance(node, ast.FunctionDef) and node.name in names
+        if isinstance(node, ast.FunctionDef) and node.name in required
     ]
-    if {method.name for method in methods} != names:
-        pytest.fail("visual replay helpers are missing")
+    if {method.name for method in methods} != required:
+        pytest.fail("visual replay production methods are missing")
     from lehome.flywheel.fidelity import fidelity_receipt
     from lehome.flywheel.persistent_worker import FidelityFailureError
 
@@ -152,55 +148,77 @@ def _visual_replay_methods() -> dict[str, object]:
     return namespace
 
 
-def test_visual_only_captures_before_scene_writes_and_preserves_physical_state() -> None:
-    methods = _visual_replay_methods()
+def test_visual_only_orchestration_orders_capture_visual_mutation_and_verification() -> None:
+    orchestrate = getattr(randomization, "orchestrate_visual_only_replay", None)
+    if not callable(orchestrate):
+        pytest.fail("visual replay orchestration seam is missing")
 
-    class Object:
-        def __init__(self, env) -> None:
-            self.env = env
+    events: list[str] = []
+    receipt = orchestrate(
+        dict(sample_randomization("visual_only", seed=140).values),
+        capture_state=lambda: events.append("capture") or {"cloth": "exact"},
+        apply_visual_mutations=lambda: events.extend([
+            "light", "camera", "texture", "color",
+        ]) or {"receipt": "visual"},
+        verify_state=lambda state: events.append(f"verify:{state['cloth']}"),
+    )
 
-        def get_all_pose(self):
-            self.env.events.append("pose_read")
-            return {"Garment": self.env.pose.copy()}
+    assert receipt == {"receipt": "visual"}
+    assert events == ["capture", "light", "camera", "texture", "color", "verify:exact"]
+
+
+def test_real_visual_only_apply_orchestrates_only_visual_mutations_in_order() -> None:
+    orchestrate = getattr(randomization, "orchestrate_visual_only_replay", None)
+    if not callable(orchestrate):
+        pytest.fail("visual replay orchestration seam is missing")
+    methods = _garment_methods("apply_flywheel_randomization")
 
     class Env:
-        _flywheel_capture_visual_replay_state = methods["_flywheel_capture_visual_replay_state"]
-        _flywheel_prepare_randomization = methods["_flywheel_prepare_randomization"]
-        _flywheel_verify_visual_replay_state = methods["_flywheel_verify_visual_replay_state"]
+        apply_flywheel_randomization = methods["apply_flywheel_randomization"]
 
         def __init__(self) -> None:
-            self.device = "cpu"
             self.events: list[str] = []
-            self.positions = np.array([[0.1, 0.2, 0.3]], dtype=np.float32)
-            self.velocities = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
-            self.pose = np.array([0.0, 0.0, 0.67, 0.0, 0.0, 90.0], dtype=np.float32)
-            self.object = Object(self)
+            self.object = object()
+            self._flywheel_preserved_restore_for_randomization = {"physical": "state"}
 
-        def _flywheel_legacy_cpu_cloth_state(self):
-            self.events.append("cloth_read")
-            return self.positions.copy(), self.velocities.copy()
+        def _flywheel_capture_visual_replay_state(self):
+            self.events.append("capture")
+            return {"cloth": "exact"}
 
-        def _flywheel_capture_scene_state(self):
-            self.events.append("scene_capture")
-            return {"baseline": True}
+        def _apply_flywheel_visual_mutations(self, values, *, materials_enabled):
+            assert materials_enabled is True
+            assert set(values) == set(randomization.VISUAL_ONLY_FIELDS)
+            self.events.extend(["texture", "color", "light", "camera"])
+            return {
+                **values,
+                "table_texture_path": "/assets/37.png",
+                "table_shader_input": "file",
+            }
 
-        def _flywheel_restore_scene_state(self, _baseline):
-            self.events.append("scene_restore")
+        def _flywheel_verify_visual_replay_state(self, state):
+            assert state == {"cloth": "exact"}
+            self.events.append("verify")
+
+        def __getattr__(self, name):
+            if name.startswith("_flywheel_") or name in {"left_arm", "right_arm", "scene"}:
+                raise AssertionError(f"visual replay reached a physical path: {name}")
+            raise AttributeError(name)
 
     env = Env()
-    sampled = dict(sample_randomization("visual_only", seed=140).values)
-    visual_only, pre_randomization = env._flywheel_prepare_randomization(sampled)
+    sampled = sample_randomization("visual_only", seed=140)
+    receipt = env.apply_flywheel_randomization(sampled)
 
-    assert visual_only is True
-    assert pre_randomization is not None
-    assert env.events == ["cloth_read", "pose_read"]
-    env.events.append("visual_mutation")
-    env._flywheel_verify_visual_replay_state(pre_randomization)
-    assert env.events == ["cloth_read", "pose_read", "visual_mutation", "cloth_read", "pose_read"]
+    assert receipt["table_texture_id"] == sampled.values["table_texture_id"]
+    assert env._flywheel_randomization_receipt == receipt
+    assert env.events == ["capture", "texture", "color", "light", "camera", "verify"]
+    assert env._flywheel_preserved_restore_for_randomization is None
 
 
 def test_visual_only_drift_raises_typed_fidelity_failure_with_bounded_readback() -> None:
-    methods = _visual_replay_methods()
+    methods = _garment_methods(
+        "_flywheel_capture_visual_replay_state",
+        "_flywheel_verify_visual_replay_state",
+    )
     from lehome.flywheel.persistent_worker import FidelityFailureError
 
     class Object:

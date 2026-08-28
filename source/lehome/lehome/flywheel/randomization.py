@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable, TypeVar
 
 import numpy as np
 
 from .models import RandomizationRecord
+
+
+StateT = TypeVar("StateT")
+ResultT = TypeVar("ResultT")
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +150,22 @@ def randomization_materials_enabled(sampled: dict[str, object]) -> bool:
     raise RuntimeError("flywheel randomization sample fields are unsupported")
 
 
+def orchestrate_visual_only_replay(
+    sampled: dict[str, object],
+    *,
+    capture_state: Callable[[], StateT],
+    apply_visual_mutations: Callable[[], ResultT],
+    verify_state: Callable[[StateT], None],
+) -> ResultT:
+    """Run the visual replay sequence without admitting a physical mutation."""
+    if set(sampled) != set(VISUAL_ONLY_FIELDS):
+        raise RuntimeError("visual replay sample fields are unsupported")
+    state = capture_state()
+    result = apply_visual_mutations()
+    verify_state(state)
+    return result
+
+
 def validate_randomization_receipt(sampled: dict[str, object], receipt: dict[str, object]) -> None:
     """Require every sampled value and only the defined USD proof metadata."""
     sampled_fields = set(sampled)
@@ -173,6 +194,7 @@ __all__ = [
     "RandomizationBounds",
     "VISUAL_ONLY_FIELDS",
     "read_or_author_garment_display_color",
+    "orchestrate_visual_only_replay",
     "randomization_materials_enabled",
     "sample_randomization",
     "validate_material_receipt",
