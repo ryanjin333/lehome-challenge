@@ -48,12 +48,16 @@ class FakeRunner:
             terminal_outcome = _kwargs["terminal_outcome"]
             receipt = self.root / "reports" / "final-publication.json"
             receipt.parent.mkdir(parents=True, exist_ok=True)
+            entries = [{"relative_path": "manifests/test.json", "sha256": "d" * 64, "byte_size": 1}]
+            bundle_sha = hashlib.sha256(
+                (json.dumps(entries, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            ).hexdigest()
             receipt.write_text(json.dumps({
                 "schema_version": 1, "kind": "lehome_simple_curriculum_publication_receipt_v1",
                 "run_id": "fresh-run-20260828", "round_id": "fresh-12k-20260828",
                 "terminal_outcome": terminal_outcome, "repository": "ryanjin333/lehome-groot-n17-rollouts",
                 "remote_prefix": "collection-rounds/fresh-run-20260828", "immutable_revision": "a" * 40,
-                "entry_count": 1, "bundle_sha256": "b" * 64, "final_seal_sha256": "c" * 64,
+                "entry_count": 1, "entries": entries, "bundle_sha256": bundle_sha, "final_seal_sha256": "c" * 64,
                 "readback_verified": True, "public_readback_verified": True,
             }, sort_keys=True), encoding="utf-8")
             readback = self.root / "reports" / "final-publication-readback.json"
@@ -61,7 +65,7 @@ class FakeRunner:
                 "schema_version": 1, "kind": "lehome_simple_curriculum_public_readback_receipt_v1",
                 "publication_receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
                 "repository": "ryanjin333/lehome-groot-n17-rollouts", "immutable_revision": "a" * 40,
-                "remote_prefix": "collection-rounds/fresh-run-20260828", "bundle_sha256": "b" * 64,
+                "remote_prefix": "collection-rounds/fresh-run-20260828", "bundle_sha256": bundle_sha,
                 "authenticated_readback_verified": True, "anonymous_readback_verified": True,
             }, sort_keys=True), encoding="utf-8")
             return {"artifacts": {
@@ -239,6 +243,53 @@ def test_restart_validates_receipts_without_repeating_terminal_stages(tmp_path: 
     assert module.run_collection(config, runner=second) == "fidelity_stop"
     assert second.calls == []
     assert second.stops == 0
+
+
+def test_command_runner_receipt_only_crash_uses_only_the_pinned_reconcile_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing readback receipt cannot re-enter any paid or mutable upload path."""
+    module = _module(); initial = _config(module, tmp_path)
+    config = module.CollectionConfig(
+        initial.campaign_root, ROOT, initial.run_id, initial.round_id,
+        initial.max_wall_seconds, initial.max_spend_usd, initial.paid,
+        initial.gpu_stop_command, initial.runtime_identity, initial.spend_observer,
+    )
+    runner = module.CommandRunner(config)
+    reports = config.campaign_root / "reports"; reports.mkdir(parents=True)
+    entries = [{"relative_path": "manifests/test.json", "sha256": "d" * 64, "byte_size": 1}]
+    bundle_sha = hashlib.sha256((json.dumps(entries, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest()
+    receipt = reports / "final-publication.json"
+    receipt.write_text(json.dumps({
+        "schema_version": 1, "kind": "lehome_simple_curriculum_publication_receipt_v1",
+        "run_id": config.run_id, "round_id": config.round_id, "terminal_outcome": "fidelity_stop",
+        "repository": "ryanjin333/lehome-groot-n17-rollouts", "remote_prefix": f"collection-rounds/{config.run_id}",
+        "immutable_revision": "a" * 40, "entry_count": 1, "entries": entries,
+        "bundle_sha256": bundle_sha, "final_seal_sha256": "c" * 64,
+        "readback_verified": True, "public_readback_verified": True,
+    }, sort_keys=True), encoding="utf-8")
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def reconcile_only(argv: tuple[str, ...], *, stage: str, inputs=None) -> None:
+        calls.append((stage, argv))
+        assert stage == "final-publication" and argv[-1] == "--reconcile"
+        assert inputs == {"terminal_outcome": "fidelity_stop"}
+        (reports / "final-publication-readback.json").write_text(json.dumps({
+            "schema_version": 1, "kind": "lehome_simple_curriculum_public_readback_receipt_v1",
+            "publication_receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+            "repository": "ryanjin333/lehome-groot-n17-rollouts", "immutable_revision": "a" * 40,
+            "remote_prefix": f"collection-rounds/{config.run_id}", "bundle_sha256": bundle_sha,
+            "authenticated_readback_verified": True, "anonymous_readback_verified": True,
+        }, sort_keys=True), encoding="utf-8")
+
+    monkeypatch.setattr(runner, "_invoke", reconcile_only)
+    output = runner.run("final-publication", terminal_outcome="fidelity_stop")
+
+    assert list(output["artifacts"]) == ["publication_receipt", "publication_readback"]
+    assert len(calls) == 1
+    # A later restart adopts the completed local pair without any more command.
+    assert runner.run("final-publication", terminal_outcome="fidelity_stop") == output
+    assert len(calls) == 1
 
 
 def test_receipt_collision_is_fatal(tmp_path: Path) -> None:

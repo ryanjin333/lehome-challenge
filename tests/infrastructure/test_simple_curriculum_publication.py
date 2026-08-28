@@ -52,6 +52,8 @@ class FakePublicTransport:
         self.fail_access = False
         self.fail_public_read = False
         self.parent_commits: list[str | None] = []
+        self.list_revisions: list[str] = []
+        self.download_revisions: list[str] = []
 
     def resolve_approved_ref(self, *, repository, ref, token):
         assert repository == "owner/public-dataset" and ref == "main" and token == "token"
@@ -59,6 +61,7 @@ class FakePublicTransport:
 
     def list_tree(self, *, repository, revision, token, remote_prefix=None):
         assert repository == "owner/public-dataset" and revision == COMMIT
+        self.list_revisions.append(revision)
         bucket = self.store.get(str(remote_prefix), {})
         return tuple(_Entry(f"{remote_prefix}/{path}") for path in sorted(bucket))
 
@@ -77,6 +80,7 @@ class FakePublicTransport:
 
     def download_files(self, *, repository, revision, destination, relative_paths, token, remote_prefix=None):
         assert repository == "owner/public-dataset" and revision == COMMIT
+        self.download_revisions.append(revision)
         if token is None:
             self.anonymous_downloads += 1
             if self.fail_public_read:
@@ -120,6 +124,48 @@ def test_collection_bundle_uses_immutable_layout_and_fresh_authenticated_and_ano
     assert transport.anonymous_downloads == 1
     assert {entry.relative_path for entry in result.entries} == {"manifests/matrix.json", "seals/final.json"}
     assert transport.parent_commits == [COMMIT]
+
+
+@pytest.mark.parametrize("shape", ("root", "ancestor", "leaf", "escape"))
+def test_collection_bundle_rejects_any_symlink_before_transport(shape: str, tmp_path: Path) -> None:
+    """Publication must never traverse a symlinked raw bundle path."""
+    module = _module()
+    real = tmp_path / "real"
+    bundle = _bundle(module, real)
+    if shape == "root":
+        alias = tmp_path / "bundle-alias"
+        alias.symlink_to(bundle.root, target_is_directory=True)
+        bundle = module.CollectionPublicationBundle(
+            root=alias, run_id=bundle.run_id, repository=bundle.repository,
+            revision=bundle.revision, files=bundle.files,
+        )
+    elif shape == "ancestor":
+        outer = tmp_path / "outer"; outer.mkdir()
+        alias = outer / "nested-alias"
+        alias.symlink_to(real, target_is_directory=True)
+        bundle = module.CollectionPublicationBundle(
+            root=alias / "bundle", run_id=bundle.run_id, repository=bundle.repository,
+            revision=bundle.revision, files=bundle.files,
+        )
+    else:
+        target = tmp_path / "outside.json" if shape == "escape" else bundle.root / "manifests" / "target.json"
+        target.write_bytes(b'{"outside":true}\n')
+        leaf = bundle.root / "manifests" / ("escaped.json" if shape == "escape" else "matrix.json")
+        if leaf.exists():
+            leaf.unlink()
+        leaf.symlink_to(target)
+        files = ("manifests/escaped.json", "seals/final.json") if shape == "escape" else bundle.files
+        bundle = module.CollectionPublicationBundle(
+            root=bundle.root, run_id=bundle.run_id, repository=bundle.repository,
+            revision=bundle.revision, files=files,
+        )
+
+    class NoTransport(FakePublicTransport):
+        def resolve_approved_ref(self, **_kwargs):
+            raise AssertionError("unsafe local bundle reached transport")
+
+    with pytest.raises(module.CollectionPublicationError, match="unsafe|symlink"):
+        module.publish_collection_bundle(bundle, token="token", transport=NoTransport())
 
 
 def test_collection_bundle_identical_resume_still_performs_both_readbacks_without_reupload(tmp_path: Path) -> None:
@@ -408,6 +454,90 @@ def test_high_level_publication_resume_does_not_add_its_local_receipts_to_the_re
     assert receipt.is_file() and readback.is_file()
     assert first.immutable_revision == second.immutable_revision
     assert transport.upload_calls == 1
+
+
+def test_crash_window_reconciles_only_missing_readback_at_the_recorded_immutable_revision(tmp_path: Path) -> None:
+    """A receipt-only crash never replays paid work or republishes mutable main."""
+    module = _module()
+    root = tmp_path / "campaign"
+    _complete_campaign(root)
+    observation_path = root / "stage-receipts/gpu-stop-observation.json"
+    _write_json(root / "stage-receipts/gpu-stop.json", {"output": {
+        "terminal_outcome": "fidelity_stop", "stop_status": "succeeded",
+        "rollout_instance_id": "computeinstance-u00t6xfqhadrcmssa2", "verified_stopped": True,
+        "stop_observation_sha256": hashlib.sha256(observation_path.read_bytes()).hexdigest(),
+    }})
+    transport = FakePublicTransport()
+    kwargs = {
+        "run_id": "fresh-run-publication-test", "round_id": "fresh-12k-publication-test",
+        "terminal_outcome": "fidelity_stop", "rollout_instance_id": "computeinstance-u00t6xfqhadrcmssa2",
+        "repository": "owner/public-dataset", "revision": "main", "token": "token", "transport": transport,
+    }
+    _, receipt, readback = module.publish_collection(root, **kwargs)
+    readback.unlink()  # Crash after receipt fsync, before the local readback receipt.
+    transport.upload_calls = 0
+    transport.authenticated_downloads = 0
+    transport.anonymous_downloads = 0
+    transport.download_revisions.clear()
+    transport.list_revisions.clear()
+
+    result, recovered = module.reconcile_collection_publication(
+        root, run_id=kwargs["run_id"], round_id=kwargs["round_id"],
+        terminal_outcome=kwargs["terminal_outcome"], token="token", transport=transport,
+    )
+
+    assert recovered == readback and recovered.is_file()
+    assert result.immutable_revision == COMMIT
+    assert transport.upload_calls == 0
+    assert transport.authenticated_downloads == 1 and transport.anonymous_downloads == 1
+    assert transport.list_revisions == [COMMIT]
+    assert transport.download_revisions == [COMMIT, COMMIT]
+    # A later controller restart adopts the durable pair instead of making
+    # another network call or running any stage.
+    module.reconcile_collection_publication(
+        root, run_id=kwargs["run_id"], round_id=kwargs["round_id"],
+        terminal_outcome=kwargs["terminal_outcome"], token="token", transport=transport,
+    )
+    assert transport.upload_calls == 0
+    assert transport.download_revisions == [COMMIT, COMMIT]
+    assert receipt.is_file()
+
+
+@pytest.mark.parametrize("fault", ("malformed-receipt", "missing-remote", "public-denied"))
+def test_crash_window_reconcile_fails_closed_for_bad_durable_or_remote_evidence(fault: str, tmp_path: Path) -> None:
+    module = _module()
+    root = tmp_path / "campaign"
+    _complete_campaign(root)
+    observation_path = root / "stage-receipts/gpu-stop-observation.json"
+    _write_json(root / "stage-receipts/gpu-stop.json", {"output": {
+        "terminal_outcome": "fidelity_stop", "stop_status": "succeeded",
+        "rollout_instance_id": "computeinstance-u00t6xfqhadrcmssa2", "verified_stopped": True,
+        "stop_observation_sha256": hashlib.sha256(observation_path.read_bytes()).hexdigest(),
+    }})
+    transport = FakePublicTransport()
+    kwargs = {
+        "run_id": "fresh-run-publication-test", "round_id": "fresh-12k-publication-test",
+        "terminal_outcome": "fidelity_stop", "rollout_instance_id": "computeinstance-u00t6xfqhadrcmssa2",
+        "repository": "owner/public-dataset", "revision": "main", "token": "token", "transport": transport,
+    }
+    _, receipt, readback = module.publish_collection(root, **kwargs)
+    readback.unlink()
+    if fault == "malformed-receipt":
+        receipt.write_text("{}\n", encoding="utf-8")
+    elif fault == "missing-remote":
+        remote = transport.store["collection-rounds/fresh-run-publication-test"]
+        remote.pop(next(path for path in remote if path.startswith("seals/")))
+    else:
+        transport.fail_public_read = True
+    transport.upload_calls = 0
+
+    with pytest.raises(module.CollectionPublicationError):
+        module.reconcile_collection_publication(
+            root, run_id=kwargs["run_id"], round_id=kwargs["round_id"],
+            terminal_outcome=kwargs["terminal_outcome"], token="token", transport=transport,
+        )
+    assert transport.upload_calls == 0
+    assert not readback.exists()
 
 
 def test_failure_staging_uses_a_fixed_evidence_allowlist_and_never_uploads_debug_files(tmp_path: Path) -> None:

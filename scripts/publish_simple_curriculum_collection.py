@@ -10,6 +10,7 @@ after both authenticated and anonymous fresh downloads match every byte.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -128,6 +129,110 @@ def _sha256(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _lexical_absolute(path: Path) -> Path:
+    """Make an absolute pathname without resolving any symlink."""
+
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _reject_symlink_components(path: Path) -> Path:
+    """Reject every existing lexical component rather than resolving it.
+
+    ``Path.resolve`` is deliberately unsuitable at this boundary: it turns a
+    symlinked publication root into an apparently ordinary directory.  The
+    caller-provided raw tree is instead checked component-by-component before
+    any walk, copy, hash, or content scan touches it.
+    """
+
+    absolute = _lexical_absolute(path)
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        try:
+            metadata = os.lstat(current)
+        except OSError as error:
+            raise CollectionPublicationError("publication source path is unavailable") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise CollectionPublicationError("publication source path contains a symlink")
+    return absolute
+
+
+def _safe_bundle_root(path: Path) -> Path:
+    root = _reject_symlink_components(Path(path))
+    try:
+        metadata = os.lstat(root)
+    except OSError as error:
+        raise CollectionPublicationError("publication root is missing or unsafe") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise CollectionPublicationError("publication root is missing or unsafe")
+    return root
+
+
+def _open_bundle_entry(root: Path, relative: str) -> tuple[int, os.stat_result]:
+    """Open one allowed entry through no-follow descriptors only.
+
+    The directory descriptor pins the already-checked root.  Each component
+    is opened with ``O_NOFOLLOW`` and then type-checked, preventing a path
+    swap from escaping the bundle between validation and copy/hash/scan.
+    """
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_fd = os.open(root, flags)
+    except OSError as error:
+        raise CollectionPublicationError("publication root is missing or unsafe") from error
+    current_fd = root_fd
+    try:
+        root_stat = os.fstat(current_fd)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise CollectionPublicationError("publication root is missing or unsafe")
+        parts = PurePosixPath(relative).parts
+        for index, part in enumerate(parts):
+            final = index + 1 == len(parts)
+            entry_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            if not final:
+                entry_flags |= getattr(os, "O_DIRECTORY", 0)
+            try:
+                next_fd = os.open(part, entry_flags, dir_fd=current_fd)
+            except OSError as error:
+                raise CollectionPublicationError("publication source contains an unsafe path") from error
+            os.close(current_fd)
+            current_fd = next_fd
+            metadata = os.fstat(current_fd)
+            if (not final and not stat.S_ISDIR(metadata.st_mode)) or (final and not stat.S_ISREG(metadata.st_mode)):
+                raise CollectionPublicationError("publication source contains an unsafe path")
+        return current_fd, os.fstat(current_fd)
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _sha256_descriptor(descriptor: int) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
+        while chunk := handle.read(1 << 20):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
+def _scan_publication_descriptor_and_content_fd(descriptor: int, relative: str) -> None:
+    """Scan a descriptor already opened below the pinned bundle root."""
+
+    if any(_SENSITIVE_PATH.search(part) for part in PurePosixPath(relative).parts):
+        raise CollectionPublicationError("publication source includes a credential-like descriptor")
+    try:
+        tail = b""
+        with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
+            while chunk := handle.read(1 << 20):
+                if _SENSITIVE_CONTENT.search(tail + chunk):
+                    raise CollectionPublicationError("publication source includes credential-like content")
+                tail = (tail + chunk)[-256:]
+    except OSError as error:
+        raise CollectionPublicationError("publication source is unreadable") from error
+
+
 def _scan_publication_descriptor_and_content(path: Path) -> None:
     """Reject credential-bearing descriptors/content before public staging.
 
@@ -178,9 +283,7 @@ def _safe_relative(value: object) -> str:
 
 
 def _collect_entries(bundle: CollectionPublicationBundle) -> tuple[PublicationEntry, ...]:
-    root = Path(bundle.root).resolve()
-    if root.is_symlink() or not root.is_dir():
-        raise CollectionPublicationError("publication root is missing or unsafe")
+    root = _safe_bundle_root(Path(bundle.root))
     if not _RUN_ID.fullmatch(bundle.run_id):
         raise CollectionPublicationError("publication requires a fresh run ID")
     if not isinstance(bundle.repository, str) or "/" not in bundle.repository or not bundle.repository.strip():
@@ -194,13 +297,62 @@ def _collect_entries(bundle: CollectionPublicationBundle) -> tuple[PublicationEn
         relative = _safe_relative(raw)
         if relative.split("/", 1)[0] not in {"manifests", "fresh", "replay", "reports", "seals"}:
             raise CollectionPublicationError("publication path is outside the canonical collection layout")
-        path = (root / relative).resolve(strict=False)
-        if not path.is_relative_to(root):
-            raise CollectionPublicationError("publication path escapes bundle root")
-        _scan_publication_descriptor_and_content(path)
-        sha256, byte_size = _sha256(path)
+        descriptor, before = _open_bundle_entry(root, relative)
+        try:
+            _scan_publication_descriptor_and_content_fd(descriptor, relative)
+            sha256, byte_size = _sha256_descriptor(descriptor)
+            after = os.fstat(descriptor)
+            if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size):
+                raise CollectionPublicationError("publication source changed while being inspected")
+        finally:
+            os.close(descriptor)
         entries.append(PublicationEntry(relative, sha256, byte_size))
     return tuple(sorted(entries, key=lambda item: item.relative_path))
+
+
+@contextmanager
+def _stage_descriptor_safe_bundle(
+    bundle: CollectionPublicationBundle, entries: tuple[PublicationEntry, ...],
+):
+    """Copy verified raw bytes to a private staging tree before transport.
+
+    A transport such as ``upload_folder`` walks a pathname later.  Publishing
+    from a descriptor-copied staging tree closes the practical local TOCTOU
+    gap between raw-tree validation and that later library traversal.
+    """
+
+    root = _safe_bundle_root(Path(bundle.root))
+    staging = Path(tempfile.mkdtemp(prefix="lehome-curriculum-raw-stage-", dir=root.parent))
+    try:
+        for entry in entries:
+            descriptor, before = _open_bundle_entry(root, entry.relative_path)
+            target = staging / entry.relative_path
+            try:
+                _scan_publication_descriptor_and_content_fd(descriptor, entry.relative_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                digest = hashlib.sha256()
+                size = 0
+                with os.fdopen(os.dup(descriptor), "rb", closefd=True) as source, target.open("xb") as destination:
+                    while chunk := source.read(1 << 20):
+                        digest.update(chunk)
+                        size += len(chunk)
+                        destination.write(chunk)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                after = os.fstat(descriptor)
+                if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size):
+                    raise CollectionPublicationError("publication source changed while being staged")
+                if (digest.hexdigest(), size) != (entry.sha256, entry.byte_size):
+                    raise CollectionPublicationError("publication source changed after validation")
+                _scan_publication_descriptor_and_content(target)
+            finally:
+                os.close(descriptor)
+        yield CollectionPublicationBundle(
+            root=staging, run_id=bundle.run_id, repository=bundle.repository,
+            revision=bundle.revision, files=tuple(entry.relative_path for entry in entries),
+        )
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _is_transient(error: BaseException) -> bool:
@@ -277,6 +429,18 @@ def publish_collection_bundle(
     if not isinstance(token, str) or not token or any(character.isspace() for character in token):
         raise CollectionPublicationError("Hub token is unavailable")
     entries = _collect_entries(bundle)
+    with _stage_descriptor_safe_bundle(bundle, entries) as staged:
+        return _publish_staged_collection_bundle(
+            staged, entries=entries, token=token, transport=transport, max_attempts=max_attempts,
+        )
+
+
+def _publish_staged_collection_bundle(
+    bundle: CollectionPublicationBundle, *, entries: tuple[PublicationEntry], token: str,
+    transport: PublicCollectionTransport, max_attempts: int,
+) -> CollectionPublicationResult:
+    """Publish bytes copied from descriptor-verified staging only."""
+
     prefix = f"{_PUBLICATION_ROOT}/{bundle.run_id}"
     expected = {entry.relative_path for entry in entries}
     head = _retry(
@@ -536,8 +700,8 @@ def build_final_seal(
 ) -> dict[str, object]:
     """Build an honest terminal seal; complete is deliberately hardest to claim."""
 
-    root = Path(campaign_root).resolve()
-    if root.is_symlink() or not root.is_dir() or not _RUN_ID.fullmatch(run_id):
+    root = _safe_bundle_root(Path(campaign_root))
+    if not _RUN_ID.fullmatch(run_id):
         raise CollectionPublicationError("final seal collection identity is invalid")
     kind = _seal_kind(terminal_outcome)
     observation = _verified_gpu_stop(
@@ -596,8 +760,7 @@ def _write_immutable_json(path: Path, payload: Mapping[str, object]) -> None:
 
 
 def _iter_regular_files(root: Path) -> tuple[Path, ...]:
-    if root.is_symlink() or not root.is_dir():
-        raise CollectionPublicationError("publication source directory is missing or unsafe")
+    root = _safe_bundle_root(root)
     files: list[Path] = []
     for current, directories, names in os.walk(root, followlinks=False):
         current_path = Path(current)
@@ -613,27 +776,46 @@ def _iter_regular_files(root: Path) -> tuple[Path, ...]:
 
 def _copy_to_staging(*, source: Path, root: Path, staging: Path, remote: str) -> None:
     _safe_relative(remote)
-    if source.is_symlink() or not source.is_file() or not source.is_relative_to(root):
+    root = _safe_bundle_root(root)
+    if not source.is_absolute() or not source.is_relative_to(root):
         raise CollectionPublicationError("publication source file is unsafe")
-    _scan_publication_descriptor_and_content(source)
+    relative = source.relative_to(root).as_posix()
+    descriptor, before = _open_bundle_entry(root, relative)
     target = staging / remote
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists() or target.is_symlink():
-        raise CollectionPublicationError("duplicate staged collection path")
-    shutil.copyfile(source, target, follow_symlinks=False)
-    _scan_publication_descriptor_and_content(target)
-    if _sha256(source) != _sha256(target):
-        raise CollectionPublicationError("staged collection bytes differ from the source")
+    try:
+        _scan_publication_descriptor_and_content_fd(descriptor, relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            raise CollectionPublicationError("duplicate staged collection path")
+        digest = hashlib.sha256()
+        size = 0
+        with os.fdopen(os.dup(descriptor), "rb", closefd=True) as input_handle, target.open("xb") as output_handle:
+            while chunk := input_handle.read(1 << 20):
+                digest.update(chunk)
+                size += len(chunk)
+                output_handle.write(chunk)
+            output_handle.flush()
+            os.fsync(output_handle.fileno())
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size):
+            raise CollectionPublicationError("publication source changed while being staged")
+        if _sha256(target) != (digest.hexdigest(), size):
+            raise CollectionPublicationError("staged collection bytes differ from the source")
+        _scan_publication_descriptor_and_content(target)
+    finally:
+        os.close(descriptor)
 
 
 def _existing_regular(root: Path, relative: str) -> Path | None:
     """Return one reviewed optional file, rejecting unsafe lookalikes."""
 
+    root = _safe_bundle_root(root)
+    relative = _safe_relative(relative)
     path = root / relative
     if not path.exists() and not path.is_symlink():
         return None
-    if path.is_symlink() or not path.is_file():
-        raise CollectionPublicationError("reviewed publication evidence is missing or unsafe")
+    descriptor, _metadata = _open_bundle_entry(root, relative)
+    os.close(descriptor)
     return path
 
 
@@ -962,6 +1144,146 @@ def _load_token(token_file: Path) -> str:
     return token
 
 
+def _publication_receipt_payload(
+    *, result: CollectionPublicationResult, run_id: str, round_id: str,
+    terminal_outcome: str, final_seal_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1, "kind": "lehome_simple_curriculum_publication_receipt_v1",
+        "run_id": run_id, "round_id": round_id, "terminal_outcome": terminal_outcome,
+        "repository": result.repository, "remote_prefix": result.remote_prefix,
+        "immutable_revision": result.immutable_revision, "entry_count": len(result.entries),
+        "entries": [
+            {"relative_path": entry.relative_path, "sha256": entry.sha256, "byte_size": entry.byte_size}
+            for entry in result.entries
+        ],
+        "bundle_sha256": result.bundle_sha256, "final_seal_sha256": final_seal_sha256,
+        "readback_verified": result.readback_verified, "public_readback_verified": result.public_readback_verified,
+    }
+
+
+def _parse_publication_receipt(
+    root: Path, *, run_id: str, round_id: str, terminal_outcome: str,
+) -> tuple[CollectionPublicationResult, Path]:
+    """Authenticate the immutable receipt and its exact remote manifest."""
+
+    safe_root = _safe_bundle_root(root)
+    receipt_path = safe_root / "reports" / "final-publication.json"
+    published = _json_object(receipt_path, label="final publication receipt")
+    required = {
+        "schema_version", "kind", "run_id", "round_id", "terminal_outcome", "repository", "remote_prefix",
+        "immutable_revision", "entry_count", "entries", "bundle_sha256", "final_seal_sha256",
+        "readback_verified", "public_readback_verified",
+    }
+    if (
+        set(published) != required or published.get("schema_version") != 1
+        or published.get("kind") != "lehome_simple_curriculum_publication_receipt_v1"
+        or published.get("run_id") != run_id or published.get("round_id") != round_id
+        or published.get("terminal_outcome") != terminal_outcome
+        or not isinstance(published.get("repository"), str) or not published["repository"].strip()
+        or published.get("remote_prefix") != f"{_PUBLICATION_ROOT}/{run_id}"
+        or not isinstance(published.get("immutable_revision"), str)
+        or _COMMIT.fullmatch(str(published.get("immutable_revision"))) is None
+        or type(published.get("entry_count")) is not int or int(published["entry_count"]) < 1
+        or not isinstance(published.get("entries"), list)
+        or any(
+            not isinstance(published.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", str(published.get(key))) is None
+            for key in ("bundle_sha256", "final_seal_sha256")
+        )
+        or published.get("readback_verified") is not True or published.get("public_readback_verified") is not True
+    ):
+        raise CollectionPublicationError("final publication receipt is malformed or incomplete")
+    entries: list[PublicationEntry] = []
+    for raw in published["entries"]:
+        if not isinstance(raw, Mapping) or set(raw) != {"relative_path", "sha256", "byte_size"}:
+            raise CollectionPublicationError("final publication receipt manifest is malformed")
+        relative = _safe_relative(raw.get("relative_path"))
+        if relative.split("/", 1)[0] not in {"manifests", "fresh", "replay", "reports", "seals"}:
+            raise CollectionPublicationError("final publication receipt manifest is malformed")
+        sha256, byte_size = raw.get("sha256"), raw.get("byte_size")
+        if not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None or type(byte_size) is not int or byte_size < 0:
+            raise CollectionPublicationError("final publication receipt manifest is malformed")
+        entries.append(PublicationEntry(relative, sha256, byte_size))
+    ordered = tuple(sorted(entries, key=lambda entry: entry.relative_path))
+    if tuple(entries) != ordered or len({entry.relative_path for entry in ordered}) != len(ordered):
+        raise CollectionPublicationError("final publication receipt manifest is malformed")
+    if int(published["entry_count"]) != len(ordered) or _entry_digest(ordered) != published["bundle_sha256"]:
+        raise CollectionPublicationError("final publication receipt manifest does not match its immutable digest")
+    return CollectionPublicationResult(
+        repository=str(published["repository"]), remote_prefix=str(published["remote_prefix"]),
+        immutable_revision=str(published["immutable_revision"]), entries=ordered,
+        readback_verified=True, public_readback_verified=True, bundle_sha256=str(published["bundle_sha256"]),
+    ), receipt_path
+
+
+def _readback_receipt_payload(*, receipt_path: Path, result: CollectionPublicationResult) -> dict[str, object]:
+    return {
+        "schema_version": 1, "kind": "lehome_simple_curriculum_public_readback_receipt_v1",
+        "publication_receipt_sha256": _sha256(receipt_path)[0], "repository": result.repository,
+        "immutable_revision": result.immutable_revision, "remote_prefix": result.remote_prefix,
+        "bundle_sha256": result.bundle_sha256, "authenticated_readback_verified": True,
+        "anonymous_readback_verified": True,
+    }
+
+
+def _validate_readback_receipt(path: Path, *, receipt_path: Path, result: CollectionPublicationResult) -> None:
+    if _json_object(path, label="final publication public readback receipt") != _readback_receipt_payload(
+        receipt_path=receipt_path, result=result,
+    ):
+        raise CollectionPublicationError("final publication public readback receipt is malformed")
+
+
+def reconcile_collection_publication(
+    campaign_root: Path, *, run_id: str, round_id: str, terminal_outcome: str,
+    token: str, transport: PublicCollectionTransport,
+) -> tuple[CollectionPublicationResult, Path]:
+    """Recover only a missing local public-readback receipt after a crash.
+
+    This deliberately never resolves a mutable ref or uploads.  It uses the
+    publication receipt's immutable commit and exact manifest to perform new
+    authenticated and anonymous downloads, then atomically fills the one
+    absent receipt.  A malformed existing readback receipt is immutable
+    evidence of corruption and fails closed rather than being overwritten.
+    """
+
+    if not isinstance(token, str) or not token or any(character.isspace() for character in token):
+        raise CollectionPublicationError("Hub token is unavailable")
+    root = _safe_bundle_root(Path(campaign_root))
+    result, receipt_path = _parse_publication_receipt(
+        root, run_id=run_id, round_id=round_id, terminal_outcome=terminal_outcome,
+    )
+    readback_path = root / "reports" / "final-publication-readback.json"
+    if readback_path.exists() or readback_path.is_symlink():
+        _validate_readback_receipt(readback_path, receipt_path=receipt_path, result=result)
+        return result, readback_path
+    observed = _tree_files(
+        _retry(
+            lambda: transport.list_tree(
+                repository=result.repository, revision=result.immutable_revision, token=token,
+                remote_prefix=result.remote_prefix,
+            ),
+            label="publication resume manifest readback", max_attempts=3,
+        ),
+        prefix=result.remote_prefix,
+    )
+    if observed != {entry.relative_path for entry in result.entries}:
+        raise CollectionPublicationError("publication resume immutable manifest differs from durable receipt")
+    pinned = CollectionPublicationBundle(
+        root=root, run_id=run_id, repository=result.repository,
+        revision=result.immutable_revision, files=tuple(entry.relative_path for entry in result.entries),
+    )
+    _verify_download(
+        transport=transport, bundle=pinned, revision=result.immutable_revision,
+        prefix=result.remote_prefix, entries=result.entries, token=token,
+    )
+    _verify_download(
+        transport=transport, bundle=pinned, revision=result.immutable_revision,
+        prefix=result.remote_prefix, entries=result.entries, token=None,
+    )
+    _write_immutable_json(readback_path, _readback_receipt_payload(receipt_path=receipt_path, result=result))
+    return result, readback_path
+
+
 def publish_collection(
     campaign_root: Path, *, run_id: str, round_id: str, terminal_outcome: str,
     rollout_instance_id: str, repository: str, revision: str, token: str,
@@ -969,7 +1291,7 @@ def publish_collection(
 ) -> tuple[CollectionPublicationResult, Path, Path]:
     """Build the content-addressed seal, publish it, and persist local receipts."""
 
-    root = Path(campaign_root).resolve()
+    root = _safe_bundle_root(Path(campaign_root))
     seal = build_final_seal(
         root, run_id=run_id, round_id=round_id, terminal_outcome=terminal_outcome,
         rollout_instance_id=rollout_instance_id,
@@ -985,22 +1307,12 @@ def publish_collection(
         shutil.rmtree(bundle.root, ignore_errors=True)
     receipt_path = root / "reports" / "final-publication.json"
     readback_path = root / "reports" / "final-publication-readback.json"
-    receipt = {
-        "schema_version": 1, "kind": "lehome_simple_curriculum_publication_receipt_v1",
-        "run_id": run_id, "round_id": round_id, "terminal_outcome": terminal_outcome,
-        "repository": result.repository, "remote_prefix": result.remote_prefix,
-        "immutable_revision": result.immutable_revision, "entry_count": len(result.entries),
-        "bundle_sha256": result.bundle_sha256, "final_seal_sha256": seal["seal_sha256"],
-        "readback_verified": result.readback_verified, "public_readback_verified": result.public_readback_verified,
-    }
+    receipt = _publication_receipt_payload(
+        result=result, run_id=run_id, round_id=round_id,
+        terminal_outcome=terminal_outcome, final_seal_sha256=str(seal["seal_sha256"]),
+    )
     _write_immutable_json(receipt_path, receipt)
-    _write_immutable_json(readback_path, {
-        "schema_version": 1, "kind": "lehome_simple_curriculum_public_readback_receipt_v1",
-        "publication_receipt_sha256": _sha256(receipt_path)[0], "repository": result.repository,
-        "immutable_revision": result.immutable_revision, "remote_prefix": result.remote_prefix,
-        "bundle_sha256": result.bundle_sha256, "authenticated_readback_verified": True,
-        "anonymous_readback_verified": True,
-    })
+    _write_immutable_json(readback_path, _readback_receipt_payload(receipt_path=receipt_path, result=result))
     return result, receipt_path, readback_path
 
 
@@ -1014,21 +1326,30 @@ def _required_environment(name: str) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run only inside the controller's sealed final-publication stage."""
 
-    if argv:
-        raise CollectionPublicationError("publisher accepts controller environment only")
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments not in ([], ["--reconcile"]):
+        raise CollectionPublicationError("publisher accepts only the controller --reconcile mode")
     campaign_root = Path(_required_environment("LEHOME_CAMPAIGN_ROOT"))
     token = _load_token(Path(_required_environment("LEHOME_HF_TOKEN_FILE")))
-    result, receipt, readback = publish_collection(
-        campaign_root,
-        run_id=_required_environment("LEHOME_RUN_ID"),
-        round_id=_required_environment("LEHOME_ROUND_ID"),
-        terminal_outcome=_required_environment("LEHOME_TERMINAL_OUTCOME"),
-        rollout_instance_id=_required_environment("LEHOME_ROLLOUT_INSTANCE_ID"),
-        repository=_required_environment("LEHOME_ROLLOUT_REPOSITORY"),
-        revision=_required_environment("LEHOME_HF_REVISION"),
-        token=token,
-        transport=HuggingFacePublicDatasetTransport(),
-    )
+    run_id = _required_environment("LEHOME_RUN_ID")
+    round_id = _required_environment("LEHOME_ROUND_ID")
+    outcome = _required_environment("LEHOME_TERMINAL_OUTCOME")
+    if arguments == ["--reconcile"]:
+        result, readback = reconcile_collection_publication(
+            campaign_root, run_id=run_id, round_id=round_id, terminal_outcome=outcome,
+            token=token, transport=HuggingFacePublicDatasetTransport(),
+        )
+        receipt = _safe_bundle_root(campaign_root) / "reports" / "final-publication.json"
+    else:
+        result, receipt, readback = publish_collection(
+            campaign_root,
+            run_id=run_id, round_id=round_id, terminal_outcome=outcome,
+            rollout_instance_id=_required_environment("LEHOME_ROLLOUT_INSTANCE_ID"),
+            repository=_required_environment("LEHOME_ROLLOUT_REPOSITORY"),
+            revision=_required_environment("LEHOME_HF_REVISION"),
+            token=token,
+            transport=HuggingFacePublicDatasetTransport(),
+        )
     # All user-visible output is non-sensitive evidence; token values never
     # reach arguments, files, JSON, or stdout.
     print(json.dumps({
@@ -1043,7 +1364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = (
     "CollectionPublicationBundle", "CollectionPublicationError", "CollectionPublicationResult",
     "PublicationEntry", "PublicCollectionTransport", "build_final_seal", "publish_collection",
-    "publish_collection_bundle",
+    "publish_collection_bundle", "reconcile_collection_publication",
 )
 
 

@@ -1064,6 +1064,22 @@ class CommandRunner:
                     return self._discover(stage, kwargs)
             self._invoke(self.argv_for(stage, kwargs), stage=stage, inputs=kwargs)
             return self._discover(stage, kwargs)
+        if stage == "final-publication":
+            receipt, readback = self._output_paths(stage, kwargs)
+            # A crash can land after the publisher durably fsyncs the immutable
+            # receipt but before it writes the local readback receipt.  Never
+            # treat that as a completed stage and never invoke the normal
+            # mutable-ref upload path again.  The publisher's explicit
+            # reconcile mode pins the receipt's commit/manifest and performs
+            # fresh authenticated plus anonymous downloads only.
+            if receipt.exists() or receipt.is_symlink():
+                if readback.exists() or readback.is_symlink():
+                    return self._discover(stage, kwargs)
+                self._invoke(
+                    self.argv_for(stage, kwargs) + ("--reconcile",),
+                    stage=stage, inputs=kwargs,
+                )
+                return self._discover(stage, kwargs)
         output_paths = self._output_paths(stage, kwargs)
         if output_paths and any(path.exists() or path.is_symlink() for path in output_paths):
             # A completed output is adopted only after deep stage validation.
@@ -1317,7 +1333,7 @@ def _validate_final_publication_artifacts(
     published = _strict_json_object(receipt, label="final publication receipt")
     required = {
         "schema_version", "kind", "run_id", "round_id", "terminal_outcome", "repository", "remote_prefix",
-        "immutable_revision", "entry_count", "bundle_sha256", "final_seal_sha256", "readback_verified",
+        "immutable_revision", "entry_count", "entries", "bundle_sha256", "final_seal_sha256", "readback_verified",
         "public_readback_verified",
     }
     if (
@@ -1328,10 +1344,33 @@ def _validate_final_publication_artifacts(
         or published.get("remote_prefix") != f"collection-rounds/{config.run_id}"
         or not isinstance(published.get("immutable_revision"), str) or re.fullmatch(r"[0-9a-f]{40}", published["immutable_revision"]) is None
         or type(published.get("entry_count")) is not int or int(published["entry_count"]) < 1
+        or not isinstance(published.get("entries"), list) or len(published["entries"]) != int(published["entry_count"])
         or any(not isinstance(published.get(key), str) or _HEX.fullmatch(str(published.get(key))) is None for key in ("bundle_sha256", "final_seal_sha256"))
         or published.get("readback_verified") is not True or published.get("public_readback_verified") is not True
     ):
         raise ReceiptMismatchError("final publication receipt is malformed or incomplete")
+    manifest: list[tuple[str, str, int]] = []
+    for raw in published["entries"]:
+        if not isinstance(raw, Mapping) or set(raw) != {"relative_path", "sha256", "byte_size"}:
+            raise ReceiptMismatchError("final publication receipt manifest is malformed")
+        relative, sha256, byte_size = raw.get("relative_path"), raw.get("sha256"), raw.get("byte_size")
+        if (
+            not isinstance(relative, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,511}", relative)
+            or any(part in {"", ".", ".."} or part.startswith(".") for part in Path(relative).parts)
+            or relative.split("/", 1)[0] not in {"manifests", "fresh", "replay", "reports", "seals"}
+            or not isinstance(sha256, str) or _HEX.fullmatch(sha256) is None
+            or type(byte_size) is not int or byte_size < 0
+        ):
+            raise ReceiptMismatchError("final publication receipt manifest is malformed")
+        manifest.append((relative, sha256, byte_size))
+    if manifest != sorted(manifest) or len({relative for relative, _sha, _size in manifest}) != len(manifest):
+        raise ReceiptMismatchError("final publication receipt manifest is malformed")
+    manifest_payload = [
+        {"relative_path": relative, "sha256": sha256, "byte_size": byte_size}
+        for relative, sha256, byte_size in manifest
+    ]
+    if _digest(manifest_payload) != published["bundle_sha256"]:
+        raise ReceiptMismatchError("final publication receipt manifest digest mismatch")
     if inputs is not None and published.get("terminal_outcome") != inputs.get("terminal_outcome"):
         raise ReceiptMismatchError("final publication receipt terminal outcome mismatch")
     public = _strict_json_object(readback, label="final publication public readback receipt")
