@@ -70,8 +70,16 @@ def _write_success(
         "randomization": {**reset["randomization"], "continuation_step": 16},
     }
     continuation_path.write_text(json.dumps(continuation), encoding="utf-8")
+    annotations_path = raw / "annotations.jsonl"
+    annotations_path.write_text(
+        "".join(
+            json.dumps({"step": step, "action": [0.0] * 12, "success": step == 19}) + "\n"
+            for step in range(20)
+        ),
+        encoding="utf-8",
+    )
     checksums = {}
-    for path in (episode_path, reset_path, continuation_path):
+    for path in (episode_path, reset_path, continuation_path, annotations_path):
         relative = path.relative_to(episode_root).as_posix()
         checksums[relative] = {
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -80,6 +88,117 @@ def _write_success(
     (episode_root / "SHA256SUMS.json").write_text(
         json.dumps(checksums), encoding="utf-8"
     )
+
+
+def _canonical(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode(
+        "utf-8"
+    )
+
+
+def _report_digest(report: dict[str, object]) -> str:
+    body = dict(report)
+    body.pop("report_sha256", None)
+    return hashlib.sha256(_canonical(body)).hexdigest()
+
+
+def _artifact_digest(episode_root: Path) -> str:
+    entries = []
+    for path in sorted(episode_root.rglob("*")):
+        if path.is_file() and path.name != "SHA256SUMS.json":
+            entries.append(
+                {
+                    "relative_path": path.relative_to(episode_root).as_posix(),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "byte_size": path.stat().st_size,
+                }
+            )
+    return hashlib.sha256(_canonical(entries)).hexdigest()
+
+
+def _write_fresh_sources(accepted: Path) -> tuple[Path, Path]:
+    """Write the authenticated source-evidence shape consumed by fresh mode."""
+
+    matrix_rows = []
+    receipt_root = accepted.parent / "hf-sync-receipts"
+    receipt_root.mkdir()
+    source_trials = []
+    for episode_root in sorted(accepted.iterdir()):
+        attempt_id = episode_root.name
+        episode = json.loads(
+            (episode_root / "raw" / attempt_id / "episode.json").read_text(encoding="utf-8")
+        )
+        identity = episode["identity"]
+        matrix_rows.append(
+            {
+                "attempt_id": attempt_id,
+                "trial_id": attempt_id,
+                "category": identity["category"],
+                "garment_name": identity["garment_name"],
+                "release_stage": "seen",
+                "strategy": "canonical",
+            }
+        )
+    matrix_path = accepted.parent / "fresh-source-matrix.json"
+    matrix_path.write_bytes(_canonical(matrix_rows))
+    matrix_sha256 = hashlib.sha256(matrix_path.read_bytes()).hexdigest()
+    for episode_root in sorted(accepted.iterdir()):
+        attempt_id = episode_root.name
+        episode = json.loads(
+            (episode_root / "raw" / attempt_id / "episode.json").read_text(encoding="utf-8")
+        )
+        identity = episode["identity"]
+        artifact_sha256 = _artifact_digest(episode_root)
+        receipt = {
+            "schema_version": 1,
+            "attempt_id": attempt_id,
+            "repository": "ryanjin333/lehome-groot-n17-rollouts",
+            "round_id": "fresh-12k-source-20260827",
+            "remote_prefix": f"rollout-rounds/fresh-12k-source-20260827/{attempt_id}",
+            "publication_ref": "main",
+            "immutable_revision": "a" * 40,
+            "entry_count": len(list(episode_root.rglob("*"))),
+            "episode_sha256": artifact_sha256,
+            "readback_verified": True,
+        }
+        receipt_path = receipt_root / f"{attempt_id}.sync.json"
+        receipt_path.write_bytes(_canonical(receipt))
+        source_trials.append(
+            {
+                "attempt_id": attempt_id,
+                "category": identity["category"],
+                "garment_name": identity["garment_name"],
+                "accepted_success": True,
+                "outcome": "success",
+                "simulator_device": "cpu",
+                "cloth_device": "cpu",
+                "safety_failure": False,
+                "numerical_failure": False,
+                "cloth_failure": False,
+                "artifact_sha256": artifact_sha256,
+                "hub_sync_receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                "remote_prefix": receipt["remote_prefix"],
+            }
+        )
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "lehome_fresh_12k_success_source_report_v1",
+        "campaign_kind": "fresh_12k_success_source_v1",
+        "round_id": "fresh-12k-source-20260827",
+        "matrix_sha256": matrix_sha256,
+        "identity": {
+            "policy_repo": "ryanjin333/lehome-groot-n17-models",
+            "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
+            "policy_step": 12000,
+            "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
+        },
+        "trials": source_trials,
+        "safety_failure": False,
+    }
+    report["report_sha256"] = _report_digest(report)
+    report_path = accepted.parent / "fresh-source-report.json"
+    report_path.write_bytes(_canonical(report))
+    return report_path, matrix_path
 
 
 def test_builder_creates_balanced_lineage_bound_success_replays(tmp_path: Path) -> None:
@@ -377,3 +496,184 @@ def test_builder_accepts_successes_from_any_cuda_worker_index(tmp_path: Path) ->
     matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
     assert len(matrix) == 4
     assert all(row["restore_snapshot_cloth_frame"] == "physx_cloth_view_world_v1" for row in matrix)
+
+
+def test_fresh_visual_only_mode_binds_authenticated_cpu_sources_and_is_deterministic(
+    tmp_path: Path,
+) -> None:
+    from lehome.flywheel.recovery_collection import validate_success_replay_descriptor
+    from scripts.build_success_replay_matrix import build_success_replay_matrix
+
+    accepted = tmp_path / "accepted"
+    for index, category in enumerate(CATEGORIES):
+        _write_success(
+            accepted,
+            attempt_id=f"fresh-{category}",
+            category=category,
+            garment=f"{category.title().replace('_', '_')}_Seen_{index}",
+        )
+    report, source_matrix = _write_fresh_sources(accepted)
+    first, second = tmp_path / "first.json", tmp_path / "second.json"
+
+    receipt = build_success_replay_matrix(
+        accepted_root=accepted,
+        output=first,
+        source_reports=(report,),
+        source_matrices=(source_matrix,),
+        strategy="visual_only",
+        attempt_cap_per_category=100,
+        acceptance_cap_per_category=50,
+        max_attempts=400,
+        target_accepted=200,
+        rng_seed=20260827400,
+    )
+    build_success_replay_matrix(
+        accepted_root=accepted,
+        output=second,
+        source_reports=(report,),
+        source_matrices=(source_matrix,),
+        strategy="visual_only",
+        attempt_cap_per_category=100,
+        acceptance_cap_per_category=50,
+        max_attempts=400,
+        target_accepted=200,
+        rng_seed=20260827400,
+    )
+
+    rows = json.loads(first.read_text(encoding="utf-8"))
+    assert first.read_bytes() == second.read_bytes()
+    assert len(rows) == 400
+    assert receipt["shortages"] == []
+    assert {row["strategy"] for row in rows} == {"visual_only"}
+    assert {row["category_acceptance_cap"] for row in rows} == {50}
+    assert {row["category"] for row in rows} == set(CATEGORIES)
+    assert validate_success_replay_descriptor(first) == rows
+    assert all(row["restore_snapshot_step"] == 16 for row in rows)
+    for row in rows:
+        assert set(
+            (
+                "source_episode_sha256",
+                "source_reset_sha256",
+                "source_annotations_sha256",
+                "source_continuation_snapshot_sha256",
+                "source_state_fingerprint",
+                "source_report_sha256",
+                "source_matrix_sha256",
+                "source_receipt_sha256",
+            )
+        ) <= set(row)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "old-round",
+        "wrong-matrix",
+        "not-success",
+        "missing-receipt",
+        "receipt-mismatch",
+        "wrong-policy",
+        "cuda-cloth",
+        "missing-step-16",
+        "safety",
+        "numerical",
+        "cloth",
+        "mixed-garment",
+        "unreported-success",
+    ],
+)
+def test_fresh_visual_only_mode_rejects_every_untrusted_source_boundary(
+    tmp_path: Path, mutation: str
+) -> None:
+    from scripts.build_success_replay_matrix import build_success_replay_matrix
+
+    accepted = tmp_path / "accepted"
+    for index, category in enumerate(CATEGORIES):
+        _write_success(
+            accepted,
+            attempt_id=f"fresh-{category}",
+            category=category,
+            garment=f"{category.title().replace('_', '_')}_Seen_{index}",
+        )
+    report_path, matrix_path = _write_fresh_sources(accepted)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    trial = report["trials"][0]
+    episode_root = accepted / trial["attempt_id"]
+    episode_path = episode_root / "raw" / trial["attempt_id"] / "episode.json"
+
+    if mutation == "old-round":
+        report["round_id"] = "success-replay-12k-round-1"
+    elif mutation == "wrong-matrix":
+        report["matrix_sha256"] = "0" * 64
+    elif mutation == "not-success":
+        trial["accepted_success"] = False
+    elif mutation == "missing-receipt":
+        (accepted.parent / "hf-sync-receipts" / f"{trial['attempt_id']}.sync.json").unlink()
+    elif mutation == "receipt-mismatch":
+        receipt = accepted.parent / "hf-sync-receipts" / f"{trial['attempt_id']}.sync.json"
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        payload["episode_sha256"] = "0" * 64
+        receipt.write_bytes(_canonical(payload))
+    elif mutation == "wrong-policy":
+        report["identity"]["policy_revision"] = "0" * 40
+    elif mutation == "cuda-cloth":
+        trial["simulator_device"] = "cuda:0"
+    elif mutation == "missing-step-16":
+        continuation = episode_root / "raw" / trial["attempt_id"] / "snapshots" / "continuations" / "000016.json"
+        continuation.unlink()
+    elif mutation in {"safety", "numerical", "cloth"}:
+        trial[f"{mutation}_failure"] = True
+    elif mutation == "mixed-garment":
+        trial["garment_name"] = "Top_Long_Seen_999"
+    elif mutation == "unreported-success":
+        report["trials"] = report["trials"][1:]
+    report["report_sha256"] = _report_digest(report)
+    report_path.write_bytes(_canonical(report))
+
+    with pytest.raises(ValueError):
+        build_success_replay_matrix(
+            accepted_root=accepted,
+            output=tmp_path / "matrix.json",
+            source_reports=(report_path,),
+            source_matrices=(matrix_path,),
+            strategy="visual_only",
+            attempt_cap_per_category=100,
+            acceptance_cap_per_category=50,
+            max_attempts=400,
+            target_accepted=200,
+            rng_seed=20260827400,
+        )
+
+
+def test_fresh_visual_only_mode_emits_a_category_shortage_without_borrowing_source(
+    tmp_path: Path,
+) -> None:
+    from scripts.build_success_replay_matrix import build_success_replay_matrix
+
+    accepted = tmp_path / "accepted"
+    for index, category in enumerate(CATEGORIES[:-1]):
+        _write_success(
+            accepted,
+            attempt_id=f"fresh-{category}",
+            category=category,
+            garment=f"{category.title().replace('_', '_')}_Seen_{index}",
+        )
+    report, source_matrix = _write_fresh_sources(accepted)
+    output = tmp_path / "matrix.json"
+    receipt = build_success_replay_matrix(
+        accepted_root=accepted,
+        output=output,
+        source_reports=(report,),
+        source_matrices=(source_matrix,),
+        strategy="visual_only",
+        attempt_cap_per_category=100,
+        acceptance_cap_per_category=50,
+        max_attempts=400,
+        target_accepted=200,
+        rng_seed=20260827400,
+    )
+
+    rows = json.loads(output.read_text(encoding="utf-8"))
+    assert len(rows) == 300
+    assert all(row["category"] != "pant_short" for row in rows)
+    assert receipt["shortages"] == [{"category": "pant_short", "reason": "no_eligible_source"}]

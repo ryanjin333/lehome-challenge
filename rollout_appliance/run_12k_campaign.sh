@@ -243,9 +243,22 @@ case "${SIMULATOR_DEVICE}" in
           || [ "${SKIP_ROUND_SEAL}" != "0" ] || [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] \
           || [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" != "0" ] || [ "${RESUME_PREEMPTED_ROLLOUT}" != "0" ] \
           || ! [[ "${MAX_ATTEMPTS}" =~ ^([1-9]|[1-9][0-9]|[1-3][0-9][0-9]|400)$ ]] \
-          || ! [[ "${TARGET_ACCEPTED}" =~ ^([1-9]|[1-9][0-9]|1[0-4][0-9]|150)$ ]] \
           || (( 10#${TARGET_ACCEPTED} > 10#${MAX_ATTEMPTS} )); then
         echo "CPU cloth requires the exact four-worker success-replay tuple" >&2
+        exit 2
+      fi
+      if [ "${TARGET_ACCEPTED}" = "200" ]; then
+        if [ "${MAX_ATTEMPTS}" != "400" ] \
+            || [ "${POLICY_SHA256}" != "e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa" ] \
+            || [ "${POLICY_REPO}" != "ryanjin333/lehome-groot-n17-models" ] \
+            || [ "${POLICY_REVISION}" != "30ac1a84da67b099e115ad147bcd61e9d60046d3" ] \
+            || [ "${POLICY_STEP}" != "12000" ] \
+            || [ "${POLICY_ARTIFACT_SHA256}" != "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06" ]; then
+          echo "200 accepted success replay requires the exact original-12K identity" >&2
+          exit 2
+        fi
+      elif ! [[ "${TARGET_ACCEPTED}" =~ ^([1-9]|[1-9][0-9]|1[0-4][0-9]|150)$ ]]; then
+        echo "success replay targets above 150 require the exact fresh visual-only tuple" >&2
         exit 2
       fi
     elif [ "${HARD_STATE_CAMPAIGN}" = "1" ]; then
@@ -442,6 +455,56 @@ for row in rows:
             or attempt_id in attempt_ids or trial_id in trial_ids or seed in seeds):
         raise SystemExit("simple curriculum matrix identity or fresh canonical row is invalid")
     attempt_ids.add(attempt_id); trial_ids.add(trial_id); seeds.add(seed)
+PY
+elif [ "${SUCCESS_REPLAY_CAMPAIGN}" = "1" ] && [ "${TARGET_ACCEPTED}" = "200" ]; then
+  python3 - "${MATRIX}" "${MAX_ATTEMPTS}" <<'PY'
+import json, re, sys
+from collections import Counter
+from pathlib import Path
+
+path, max_attempts = Path(sys.argv[1]), int(sys.argv[2])
+try:
+    rows = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, ValueError) as error:
+    raise SystemExit(f"fresh visual-only replay matrix is malformed: {error}")
+categories = ("top_long", "top_short", "pant_long", "pant_short")
+fresh = {
+    "source_episode_sha256", "source_reset_sha256", "source_annotations_sha256",
+    "source_continuation_snapshot_sha256", "source_state_fingerprint",
+    "source_report_sha256", "source_matrix_sha256", "source_receipt_sha256",
+    "source_remote_prefix", "source_immutable_revision", "source_round_id",
+}
+if not isinstance(rows, list) or (len(rows), max_attempts) != (400, 400):
+    raise SystemExit("fresh visual-only replay requires exactly 400 rows")
+counts = Counter()
+attempts, seeds = set(), set()
+for row in rows:
+    if not isinstance(row, dict):
+        raise SystemExit("fresh visual-only replay row is malformed")
+    category, attempt_id, seed = row.get("category"), row.get("attempt_id"), row.get("seed")
+    if (
+        category not in categories or row.get("trial_id") != attempt_id
+        or not isinstance(attempt_id, str) or not attempt_id or attempt_id in attempts
+        or type(seed) is not int or seed in seeds
+        or row.get("strategy") != "visual_only" or row.get("category_acceptance_cap") != 50
+        or row.get("replay_kind") != "verified_success_early_snapshot_v1"
+        or row.get("restore_snapshot_step") != 16
+        or not fresh <= set(row)
+        or any(
+            not isinstance(row[field], str) or re.fullmatch(r"[0-9a-f]{64}", row[field]) is None
+            for field in fresh - {"source_remote_prefix", "source_immutable_revision", "source_round_id"}
+        )
+        or not isinstance(row.get("source_round_id"), str)
+        or re.fullmatch(r"fresh-12k-[a-z0-9-]{1,112}", row["source_round_id"]) is None
+        or row.get("source_remote_prefix")
+        != f"rollout-rounds/{row['source_round_id']}/{row.get('parent_episode_id')}"
+        or not isinstance(row.get("source_immutable_revision"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", row["source_immutable_revision"]) is None
+    ):
+        raise SystemExit("fresh visual-only replay row is not fully bound")
+    attempts.add(attempt_id); seeds.add(seed); counts[category] += 1
+if counts != Counter({category: 100 for category in categories}):
+    raise SystemExit("fresh visual-only replay requires at most 100 rows per category")
 PY
 elif [ "${SKIP_ROUND_SEAL}" = "1" ] && [ "${SNAPSHOT_SOURCE_BOOTSTRAP}" = "1" ]; then
   if [ "${CONTROLLED_RECOVERY_SMOKE}" != "0" ] || ! [[ "${WORKER_COUNT}" =~ ^(1|4)$ ]] \

@@ -702,16 +702,26 @@ def validate_success_replay_descriptor(
         "parent_episode_id", "lineage_id", "replay_kind",
         "category_acceptance_cap",
     }
+    fresh_provenance_fields = {
+        "source_episode_sha256", "source_reset_sha256", "source_annotations_sha256",
+        "source_continuation_snapshot_sha256", "source_state_fingerprint",
+        "source_report_sha256", "source_matrix_sha256", "source_receipt_sha256",
+        "source_remote_prefix", "source_immutable_revision", "source_round_id",
+    }
     attempt_ids: set[str] = set()
     seeds: set[int] = set()
     category_counts: dict[str, int] = {}
     category_caps: dict[str, int] = {}
+    fresh_rows = True
     for row in rows:
+        is_fresh = fresh_provenance_fields <= set(row)
         expected_fields = (
             allowed_fields | {"restore_snapshot_step"}
             if row.get("replay_kind") == "verified_success_early_snapshot_v1"
             else allowed_fields
         )
+        if is_fresh:
+            expected_fields |= fresh_provenance_fields
         if set(row) != expected_fields:
             raise ValueError("success replay descriptor row fields are invalid")
         category = row.get("category")
@@ -727,6 +737,25 @@ def validate_success_replay_descriptor(
             or not 0 <= cap <= 150
         ):
             raise ValueError("success replay descriptor identity or cap is invalid")
+        if is_fresh:
+            if (
+                row.get("strategy") != "visual_only"
+                or cap != 50
+                or any(
+                    not isinstance(row[field], str)
+                    or _LOWERCASE_SHA256.fullmatch(row[field]) is None
+                    for field in fresh_provenance_fields
+                    - {"source_remote_prefix", "source_immutable_revision", "source_round_id"}
+                )
+                or not isinstance(row.get("source_round_id"), str)
+                or re.fullmatch(r"fresh-12k-[a-z0-9-]{1,112}", row["source_round_id"]) is None
+                or row.get("source_remote_prefix")
+                != f"rollout-rounds/{row['source_round_id']}/{row['parent_episode_id']}"
+                or not isinstance(row.get("source_immutable_revision"), str)
+                or re.fullmatch(r"[0-9a-f]{40}", row["source_immutable_revision"]) is None
+            ):
+                raise ValueError("fresh visual-only replay provenance is invalid")
+        fresh_rows = fresh_rows and is_fresh
         if category in category_caps and category_caps[str(category)] != cap:
             raise ValueError("success replay category acceptance cap is inconsistent")
         category_caps[str(category)] = cap
@@ -746,7 +775,16 @@ def validate_success_replay_descriptor(
         seeds.add(seed)
     if any(category_caps[category] > count for category, count in category_counts.items()):
         raise ValueError("success replay category acceptance cap exceeds its attempts")
-    if not 1 <= sum(category_caps.values()) <= 150:
+    if fresh_rows:
+        if (
+            len(rows) > 400
+            or set(category_caps) != set(_CANONICAL_SEEN_GARMENTS)
+            or any(category_caps[category] != 50 for category in _CANONICAL_SEEN_GARMENTS)
+            or any(category_counts[category] > 100 for category in _CANONICAL_SEEN_GARMENTS)
+            or sum(category_caps.values()) != 200
+        ):
+            raise ValueError("fresh visual-only replay caps must be the exact bounded 200 tuple")
+    elif not 1 <= sum(category_caps.values()) <= 150:
         raise ValueError("success replay total acceptance cap must be in 1..150")
     return rows
 
