@@ -209,10 +209,10 @@ def _validate_partition_manifest(manifest: Path, *, matrix: Path, partition_id: 
     _partition_parent_sha(manifest)
 
 
-def _validate_partition_ledger(
+def _partition_ledger_terminal_count(
     ledger: Path, *, matrix: Path, max_attempts: int, target: int,
     completion_metric: str = "terminal_outcomes",
-) -> None:
+) -> int:
     """Re-open the canonical ledger against its exact physical matrix."""
     if ledger.is_symlink() or not ledger.is_file():
         raise ReceiptMismatchError("partition ledger is missing or unsafe")
@@ -239,6 +239,19 @@ def _validate_partition_ledger(
             task_ledger.close()
     except (OSError, ValueError, json.JSONDecodeError, sqlite3.Error) as error:
         raise ReceiptMismatchError("partition ledger is malformed") from error
+    if completed < 0 or completed > target:
+        raise ReceiptMismatchError("partition ledger terminal count is invalid")
+    return completed
+
+
+def _validate_partition_ledger(
+    ledger: Path, *, matrix: Path, max_attempts: int, target: int,
+    completion_metric: str = "terminal_outcomes",
+) -> None:
+    completed = _partition_ledger_terminal_count(
+        ledger, matrix=matrix, max_attempts=max_attempts, target=target,
+        completion_metric=completion_metric,
+    )
     if completed != target:
         raise ReceiptMismatchError("partition ledger terminal count is not exact")
 
@@ -437,6 +450,21 @@ def _fresh_trial_from_terminal_report(
     from build_success_replay_matrix import _episode_artifact_sha256
 
     episode_root = Path(artifact_root)
+    episode = _strict_json_object(
+        episode_root / "raw" / attempt / "episode.json",
+        label="fresh terminal episode",
+    )
+    identity = episode.get("identity")
+    raw_outcome = episode.get("outcome")
+    if (
+        not isinstance(identity, Mapping)
+        or identity.get("campaign_round_id") != config.round_id
+        or identity.get("campaign_run_id") != config.run_id
+        or episode.get("accepted_success") is not success
+        or not isinstance(raw_outcome, str)
+        or (raw_outcome == "success") is not success
+    ):
+        raise ReceiptMismatchError("fresh terminal lacks actual campaign-bound episode evidence")
     receipt = root / "fresh" / partition / "hf-sync-receipts" / f"{attempt}.sync.json"
     sync = _strict_json_object(receipt, label="fresh Hub readback receipt")
     artifact_sha = _episode_artifact_sha256(episode_root)
@@ -448,14 +476,6 @@ def _fresh_trial_from_terminal_report(
     ):
         raise ReceiptMismatchError("fresh terminal lacks actual campaign-bound Hub readback evidence")
     if success:
-        episode = _strict_json_object(episode_root / "raw" / attempt / "episode.json", label="fresh accepted episode")
-        identity = episode.get("identity")
-        if (
-            not isinstance(identity, Mapping)
-            or identity.get("campaign_round_id") != config.round_id or identity.get("campaign_run_id") != config.run_id
-            or episode.get("accepted_success") is not True or episode.get("outcome") != "success"
-        ):
-            raise ReceiptMismatchError("fresh success lacks actual campaign-bound episode evidence")
         trial.update(artifact_sha256=artifact_sha, hub_sync_receipt_sha256=_file_sha(receipt))
         aggregate["hub_sync_receipt_sha256"] = _file_sha(receipt)
         aggregate["artifact_sha256"] = artifact_sha
@@ -683,6 +703,7 @@ def _discover_success_replay(config: CollectionConfig, *, matrix: Path, ledger: 
             receipt.get("schema_version") != 1 or receipt.get("attempt_id") != attempt_id
             or receipt.get("repository") != "ryanjin333/lehome-groot-n17-rollouts"
             or receipt.get("round_id") != round_id
+            or receipt.get("run_id") != config.run_id
             or receipt.get("remote_prefix") != f"rollout-rounds/{round_id}/{attempt_id}"
             or receipt.get("readback_verified") is not True or receipt.get("episode_sha256") != artifact_sha
             or not isinstance(immutable_revision, str) or re.fullmatch(r"[0-9a-f]{40}", immutable_revision) is None
@@ -1004,6 +1025,25 @@ class CommandRunner:
             (root / "reports").mkdir(parents=True, exist_ok=True)
         if stage == "replay-matrix":
             (root / "replay").mkdir(parents=True, exist_ok=True)
+        partition_stage = stage in {"calibration-head", "calibration-tail", "curriculum-a", "curriculum-b"}
+        if partition_stage:
+            # The matrix and manifest are immutable *inputs*, materialized by
+            # the controller before the appliance starts.  Only the ledger is
+            # a completion output.  A valid partial ledger is resumed through
+            # its durable preemption context; it is never mis-adopted.
+            partition = str(kwargs["partition_id"])
+            matrix = root / str(kwargs["partition_matrix"])
+            manifest = root / str(kwargs["partition_manifest"])
+            ledger = root / "fresh" / partition / "ledger.sqlite3"
+            _validate_partition_manifest(manifest, matrix=matrix, partition_id=partition, inputs=kwargs)
+            if ledger.exists() or ledger.is_symlink():
+                completed = _partition_ledger_terminal_count(
+                    ledger, matrix=matrix, max_attempts=int(kwargs["lease_budget"]), target=int(kwargs["target"]),
+                )
+                if completed == int(kwargs["target"]):
+                    return self._discover(stage, kwargs)
+            self._invoke(self.argv_for(stage, kwargs), stage=stage, inputs=kwargs)
+            return self._discover(stage, kwargs)
         output_paths = self._output_paths(stage, kwargs)
         if output_paths and any(path.exists() or path.is_symlink() for path in output_paths):
             # A completed output is adopted only after deep stage validation.

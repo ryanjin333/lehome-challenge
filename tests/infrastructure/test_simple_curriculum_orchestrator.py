@@ -99,6 +99,58 @@ def _config(module, tmp_path: Path):
     )
 
 
+def _partition_inputs(module, config, *, partition: str = "calibration-head"):
+    """Materialize the same immutable inputs the controller hands the appliance."""
+    rows = [
+        {"attempt_id": f"calibration-{index:04d}", "trial_id": f"trial-{index:04d}", "seed": index}
+        for index in range(400)
+    ]
+    logical = config.campaign_root / "matrices" / "calibration.json"
+    logical.parent.mkdir(parents=True, exist_ok=True)
+    logical.write_bytes((json.dumps(rows, sort_keys=True, separators=(",", ":")) + "\n").encode())
+    matrix, manifest, details = module.materialize_partition(
+        parent_matrix=logical,
+        parent_matrix_sha256=hashlib.sha256(logical.read_bytes()).hexdigest(),
+        output_directory=config.campaign_root / "partitions",
+        partition_id=partition,
+        start=0,
+        end=100,
+    )
+    inputs = {
+        "partition_id": partition,
+        "partition_matrix": matrix.relative_to(config.campaign_root).as_posix(),
+        "partition_manifest": manifest.relative_to(config.campaign_root).as_posix(),
+        "partition_sha256": details["partition_sha256"],
+        "row_start": 0,
+        "row_end": 100,
+        "target": 100,
+        "lease_budget": 150,
+    }
+    return matrix, inputs
+
+
+def _settle_partition_ledger(path: Path, rows: list[dict[str, object]], *, count: int) -> None:
+    """Create real durable state, rather than a made-up completed output."""
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ledger = TaskLedger(
+        path, attempt_matrix=rows, max_attempts=150, target_accepted=100,
+        completion_metric="terminal_outcomes",
+    )
+    try:
+        while ledger.terminal_outcome_count() < count:
+            lease = ledger.lease_next("partition-test", lease_duration_ns=10**15)
+            assert lease is not None
+            ledger.record_terminal(
+                lease.worker_id, lease.attempt.attempt_id, lease.lease_id,
+                f"raw-{lease.attempt.attempt_id}",
+            )
+            assert ledger.validate_terminal(lease.attempt.attempt_id, "rejected") == "rejected"
+    finally:
+        ledger.close()
+
+
 def test_gate_failure_never_launches_later_stages_and_stops_once(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path); runner = FakeRunner(config.campaign_root, gate_decision="fidelity_stop")
 
@@ -458,6 +510,84 @@ def test_partition_adapter_exports_durable_preemption_contract(tmp_path: Path) -
     assert environment["LEHOME_ROLLOUT_PREEMPTION_CONTEXT"] == str(context)
 
 
+def test_partition_inputs_without_a_ledger_invoke_the_real_adapter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Immutable matrix inputs are not proof that the appliance has run."""
+    module = _module(); config = _config(module, tmp_path)
+    matrix, inputs = _partition_inputs(module, config)
+    rows = json.loads(matrix.read_text(encoding="utf-8"))
+    runner = module.CommandRunner(config)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def appliance(_argv, *, stage, inputs):
+        calls.append((stage, dict(inputs)))
+        _settle_partition_ledger(config.campaign_root / "fresh" / "calibration-head" / "ledger.sqlite3", rows, count=100)
+
+    monkeypatch.setattr(runner, "_invoke", appliance)
+    result = runner.run("calibration-head", **inputs)
+
+    assert calls == [("calibration-head", inputs)]
+    assert "ledger" in result["artifacts"]
+
+
+def test_partial_partition_ledger_resumes_the_same_real_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); config = _config(module, tmp_path)
+    matrix, inputs = _partition_inputs(module, config)
+    rows = json.loads(matrix.read_text(encoding="utf-8"))
+    ledger_path = config.campaign_root / "fresh" / "calibration-head" / "ledger.sqlite3"
+    ledger_path.parent.mkdir(parents=True)
+    _settle_partition_ledger(ledger_path, rows, count=1)
+    context = ledger_path.parent / "rollout-preemption.json"; context.write_text("{}", encoding="utf-8")
+    runner = module.CommandRunner(config)
+    environments: list[dict[str, str]] = []
+
+    def appliance(_argv, *, stage, inputs):
+        environments.append(runner.environment_for(stage, inputs))
+        _settle_partition_ledger(ledger_path, rows, count=100)
+
+    monkeypatch.setattr(runner, "_invoke", appliance)
+    runner.run("calibration-head", **inputs)
+
+    assert len(environments) == 1
+    assert environments[0]["LEHOME_RESUME_PREEMPTED_ROLLOUT"] == "1"
+    assert environments[0]["LEHOME_CAMPAIGN_ROOT"] == str(ledger_path.parent)
+    assert module._partition_ledger_terminal_count(ledger_path, matrix=matrix, max_attempts=150, target=100) == 100
+
+
+def test_completed_partition_ledger_is_adopted_without_invoking(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); config = _config(module, tmp_path)
+    matrix, inputs = _partition_inputs(module, config)
+    rows = json.loads(matrix.read_text(encoding="utf-8"))
+    ledger_path = config.campaign_root / "fresh" / "calibration-head" / "ledger.sqlite3"
+    ledger_path.parent.mkdir(parents=True)
+    _settle_partition_ledger(ledger_path, rows, count=100)
+    runner = module.CommandRunner(config)
+
+    def must_not_invoke(*_args, **_kwargs):
+        raise AssertionError("a complete partition ledger must be adopted")
+
+    monkeypatch.setattr(runner, "_invoke", must_not_invoke)
+    result = runner.run("calibration-head", **inputs)
+
+    assert result["artifacts"]["ledger"]["path"] == "fresh/calibration-head/ledger.sqlite3"
+
+
+def test_mismatched_partial_partition_ledger_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); config = _config(module, tmp_path)
+    _matrix, inputs = _partition_inputs(module, config)
+    ledger_path = config.campaign_root / "fresh" / "calibration-head" / "ledger.sqlite3"
+    ledger_path.parent.mkdir(parents=True)
+    _settle_partition_ledger(ledger_path, [{"attempt_id": "wrong", "trial_id": "wrong", "seed": 99}], count=1)
+    (ledger_path.parent / "rollout-preemption.json").write_text("{}", encoding="utf-8")
+    runner = module.CommandRunner(config)
+
+    def must_not_invoke(*_args, **_kwargs):
+        raise AssertionError("a mismatched partial ledger must fail before the appliance runs")
+
+    monkeypatch.setattr(runner, "_invoke", must_not_invoke)
+    with pytest.raises(module.ReceiptMismatchError, match="partition ledger"):
+        runner.run("calibration-head", **inputs)
+
+
 def test_paid_spend_observer_rejects_stale_or_different_meter_receipts(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path); journal = module.StageJournal(config)
     journal.check_budget()
@@ -538,6 +668,7 @@ def test_exact_visual_replay_seals_only_the_200_readback_verified_category_cappe
                 "schema_version": 1, "attempt_id": lease.attempt.attempt_id,
                 "repository": "ryanjin333/lehome-groot-n17-rollouts",
                 "round_id": config.round_id + "-replay",
+                "run_id": config.run_id,
                 "remote_prefix": f"rollout-rounds/{config.round_id}-replay/{lease.attempt.attempt_id}",
                 "readback_verified": True, "episode_sha256": digest, "immutable_revision": "c" * 40,
             }, sort_keys=True, separators=(",", ":")) + "\n").encode())
@@ -554,3 +685,10 @@ def test_exact_visual_replay_seals_only_the_200_readback_verified_category_cappe
     assert payload["readback_verified"] is True
     assert payload["accepted_by_category"] == {category: 50 for category in categories}
     assert len(payload["accepted_attempt_ids"]) == 200
+
+    receipt_path = next((config.campaign_root / "replay" / "hf-sync-receipts").glob("*.sync.json"))
+    receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt_payload.pop("run_id")
+    receipt_path.write_text(json.dumps(receipt_payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    with pytest.raises(module.ReceiptMismatchError, match="Hub readback receipt"):
+        module.CommandRunner(config)._discover("success-replay", {})

@@ -135,6 +135,8 @@ class _ReceiptTransport:
 
 def _simple_campaign(tmp_path: Path, *, rows: list[dict[str, object]] | None = None, campaign_root: Path | None = None, matrix_path: Path | None = None, policy: dict[str, object] | None = None, campaign_round_id: str | None = None, campaign_run_id: str | None = None, missing_receipt: int | None = None, malformed_receipt: int | None = None, retry_then_valid: int | None = None, contradictory_safety: int | None = None, all_success: bool = False, evaluation_terminal: bool = True, episode_mutator=None, receipt_mutator=None, session_for_index=None) -> tuple[Path, Path, list[dict[str, object]], dict[str, str]]:
     from lehome.flywheel.artifact_queue import ArtifactFinalizationQueue
+    from lehome.flywheel.isaac_recorder import _identity_payload
+    from lehome.flywheel.models import EpisodeIdentity
     from lehome.flywheel.simple_curriculum import build_calibration_rows
     from lehome.flywheel.task_ledger import TaskLedger
 
@@ -172,18 +174,30 @@ def _simple_campaign(tmp_path: Path, *, rows: list[dict[str, object]] | None = N
         raw = output / "raw" / ledger_id; raw.mkdir(parents=True)
         videos = output / "videos"; videos.mkdir(); (videos / "top.mp4").write_bytes(b"video")
         ledger_ids[str(assignment["attempt_id"])] = ledger_id
+        identity = EpisodeIdentity(
+            episode_id=ledger_id,
+            policy_repo=str(policy["policy_repo"]),
+            policy_revision=str(policy["policy_revision"]),
+            policy_step=int(policy["policy_step"]),
+            code_revision="c" * 40,
+            asset_revision="a" * 40,
+            simulator_version="5.1.0.0",
+            garment_name=str(assignment["garment_name"]),
+            category=str(assignment["category"]),
+            release_stage=str(assignment["release_stage"]),
+            seed=int(assignment["seed"]),
+            instruction="fold the garment",
+            strategy="canonical",
+            campaign_round_id=campaign_round_id,
+            campaign_run_id=campaign_run_id,
+        )
+        # The regular summary fixtures only need the canonical identity
+        # producer.  The 1,000-terminal producer-path integration below also
+        # supplies complete recorder-authored episode documents.
+        recorded_identity = _identity_payload(identity)
         episode = {
             "episode_id": ledger_id,
-            "identity": {
-                **policy, "episode_id": ledger_id, "code_revision": "c" * 40,
-                "asset_revision": "a" * 40, "simulator_version": "5.1.0.0",
-                "garment_name": assignment["garment_name"], "category": assignment["category"],
-                "release_stage": assignment["release_stage"], "seed": assignment["seed"],
-                **(
-                    {"campaign_round_id": campaign_round_id, "campaign_run_id": campaign_run_id}
-                    if campaign_round_id is not None else {}
-                ),
-            },
+            "identity": recorded_identity,
             "provenance": {"policy_artifact_sha256": policy["policy_artifact_sha256"], "simulator_device": "cpu", "policy_device": "cuda:0", "image_identity": "sha256:" + "d" * 64},
             "outcome": "success" if all_success or index < 5 else "timeout", "accepted_success": all_success or index < 5,
             "safety_failure": index == contradictory_safety,
@@ -363,6 +377,22 @@ def test_fresh_source_adoption_rehashes_actual_terminal_artifacts_for_all_four_p
             artifact = Path(str(trial["finalized_artifact_root"]))
             assert artifact.parent == terminal_root
             sync.sync_episode(attempt, artifact)
+
+    # Rejected outcomes carry the same recorder-authored campaign identity as
+    # accepted ones.  The controller must not fill it in from config.
+    rejected_partition = campaign / "fresh" / "calibration-head" / "evaluation-terminal"
+    rejected_episode = next(
+        path / "raw" / path.name / "episode.json"
+        for path in rejected_partition.iterdir()
+        if json.loads((path / "raw" / path.name / "episode.json").read_text(encoding="utf-8"))["accepted_success"] is False
+    )
+    rejected_payload = json.loads(rejected_episode.read_text(encoding="utf-8"))
+    rejected_payload["identity"]["campaign_run_id"] = "fresh-run-wrong"
+    rejected_episode.write_bytes(_canonical(rejected_payload))
+    with pytest.raises(controller.ReceiptMismatchError, match="campaign-bound episode"):
+        controller._build_fresh_source_report(config)
+    rejected_payload["identity"]["campaign_run_id"] = run_id
+    rejected_episode.write_bytes(_canonical(rejected_payload))
 
     controller._build_fresh_source_report(config)
     report_path = campaign / "reports" / "fresh-source-report.json"
