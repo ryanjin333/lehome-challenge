@@ -85,6 +85,7 @@ class LedgerWorkerController:
         fidelity_code: str,
         fidelity: Mapping[str, object],
         runtime: Mapping[str, object],
+        diagnostic: Mapping[str, object] | None = None,
     ) -> str:
         return self._ledger.record_fidelity_abort(
             worker_id,
@@ -95,6 +96,7 @@ class LedgerWorkerController:
             fidelity_code=fidelity_code,
             fidelity=fidelity,
             runtime=runtime,
+            diagnostic=diagnostic,
         )
 
     def status(self, attempt_id: str) -> str:
