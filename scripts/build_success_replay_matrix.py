@@ -23,6 +23,9 @@ PARENT_ASSET_REVISION = "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9"
 PARENT_ARTIFACT_SHA256 = (
     "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06"
 )
+FRESH_SOURCE_REPORT_KIND = "lehome_fresh_12k_success_source_report_v1"
+FRESH_SOURCE_CAMPAIGN_KIND = "fresh_12k_success_source_v1"
+FRESH_SOURCE_LOGICAL_STAGE = "fresh_success_source"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CUDA_DEVICE = re.compile(r"^cuda:[0-9]+$")
 
@@ -36,12 +39,19 @@ def _strict_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _reject_nonfinite_json(token: str) -> None:
+    raise ValueError(f"non-finite JSON value {token}")
+
+
 def _load_json(path: Path, *, label: str) -> dict[str, object]:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"{label} is missing or unsafe")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_strict_pairs)
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        value = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_strict_pairs,
+            parse_constant=_reject_nonfinite_json,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError(f"{label} is malformed") from error
     if not isinstance(value, dict):
         raise ValueError(f"{label} is malformed")
@@ -131,6 +141,64 @@ def _state_fingerprint(*, category: str, garment: str, continuation: Mapping[str
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+_CPU_SNAPSHOT_FIELDS = {
+    "schema_version", "robot_position", "robot_velocity", "cloth_position",
+    "cloth_velocity", "rng_state", "garment_name", "randomization", "scene_state",
+    "cloth_state_authority",
+}
+
+
+def _finite_snapshot_values(value: object) -> bool:
+    if type(value) in (int, float):
+        return math.isfinite(float(value))
+    if isinstance(value, list):
+        return all(_finite_snapshot_values(item) for item in value)
+    if isinstance(value, Mapping):
+        return all(_finite_snapshot_values(item) for item in value.values())
+    return True
+
+
+def _finite_number(value: object) -> bool:
+    return type(value) in (int, float) and math.isfinite(float(value))
+
+
+def _canonical_cpu_snapshot(
+    snapshot: Mapping[str, object], *, garment: str, continuation: bool,
+) -> bool:
+    randomization = snapshot.get("randomization")
+    scene_state = snapshot.get("scene_state")
+    pose = scene_state.get("garment_reset_pose") if isinstance(scene_state, Mapping) else None
+    expected_randomization = (
+        {"strategy": "canonical", "continuation_step": 16}
+        if continuation else {"strategy": "canonical"}
+    )
+    return (
+        set(snapshot) == _CPU_SNAPSHOT_FIELDS
+        and snapshot.get("schema_version") == 3
+        and snapshot.get("cloth_state_authority") == "usd_local_points_v1"
+        and snapshot.get("garment_name") == garment
+        and randomization == expected_randomization
+        and isinstance(snapshot.get("rng_state"), Mapping)
+        and isinstance(pose, list) and len(pose) == 6
+        and all(_finite_number(value) for value in pose)
+        and all(
+            isinstance(snapshot.get(field), list) and len(snapshot[field]) == 12
+            and all(_finite_number(value) for value in snapshot[field])
+            for field in ("robot_position", "robot_velocity")
+        )
+        and all(
+            isinstance(snapshot.get(field), list) and snapshot[field]
+            and all(
+                isinstance(point, list) and len(point) == 3
+                and all(_finite_number(value) for value in point)
+                for point in snapshot[field]
+            )
+            for field in ("cloth_position", "cloth_velocity")
+        )
+        and _finite_snapshot_values(snapshot)
+    )
 
 
 def _successes(
@@ -234,11 +302,27 @@ def _successes(
                 )
                 or (
                     require_annotations
+                    and (
+                        provenance.get("cloth_device") != "cpu"
+                        or any(
+                            not isinstance(provenance.get(field), str)
+                            or _CUDA_DEVICE.fullmatch(str(provenance[field])) is None
+                            for field in ("renderer_device", "camera_device", "policy_device")
+                        )
+                        or len({provenance.get("renderer_device"), provenance.get("camera_device"), provenance.get("policy_device")}) != 1
+                    )
+                )
+                or (
+                    require_annotations
                     and reset.get("randomization") != {"strategy": "canonical"}
                 )
                 or reset.get("garment_name") != garment
                 or reset.get("schema_version") != expected_schema
                 or reset.get("cloth_state_authority") != cloth_frame
+                or (
+                    require_annotations
+                    and not _canonical_cpu_snapshot(reset, garment=garment, continuation=False)
+                )
             ):
                 raise ValueError("accepted episode is not a verified 12K seen-garment success")
             if (
@@ -251,6 +335,10 @@ def _successes(
                     require_annotations
                     and continuation.get("randomization")
                     != {"strategy": "canonical", "continuation_step": 16}
+                )
+                or (
+                    require_annotations
+                    and not _canonical_cpu_snapshot(continuation, garment=garment, continuation=True)
                 )
             ):
                 raise ValueError("accepted early continuation snapshot is incompatible")
@@ -324,6 +412,9 @@ def _fresh_source_parents(
                 or row.get("category") not in CATEGORIES
                 or not isinstance(row.get("garment_name"), str) or not row["garment_name"]
                 or row.get("release_stage") != "seen"
+                or row.get("strategy") != "canonical"
+                or row.get("campaign_kind") != FRESH_SOURCE_CAMPAIGN_KIND
+                or row.get("logical_stage") != FRESH_SOURCE_LOGICAL_STAGE
                 or not isinstance(row.get("campaign_round_id"), str)
                 or not isinstance(row.get("campaign_run_id"), str)
             ):
@@ -341,13 +432,14 @@ def _fresh_source_parents(
         declared = body.pop("report_sha256", None)
         if (
             set(report) != {
-                "schema_version", "kind", "campaign_kind", "round_id", "matrix_sha256",
+                "schema_version", "kind", "campaign_kind", "logical_stage", "round_id", "matrix_sha256",
                 "identity", "trials", "safety_failure", "report_sha256", "run_id",
             }
             or declared != hashlib.sha256(_canonical_bytes(body)).hexdigest()
             or report.get("schema_version") != 1
-            or report.get("kind") != "lehome_fresh_12k_success_source_report_v1"
-            or report.get("campaign_kind") != "fresh_12k_success_source_v1"
+            or report.get("kind") != FRESH_SOURCE_REPORT_KIND
+            or report.get("campaign_kind") != FRESH_SOURCE_CAMPAIGN_KIND
+            or report.get("logical_stage") != FRESH_SOURCE_LOGICAL_STAGE
             or not isinstance(report.get("round_id"), str)
             or re.fullmatch(r"fresh-12k-[a-z0-9-]{1,112}", report["round_id"]) is None
             or not isinstance(report.get("run_id"), str)
@@ -377,9 +469,17 @@ def _fresh_source_parents(
                 or trial.get("category") != matrix_row.get("category")
                 or trial.get("garment_name") != matrix_row.get("garment_name")
                 or type(trial.get("accepted_success")) is not bool
-                or trial.get("outcome") not in {"success", "failure"}
+                or trial.get("accepted_success") is not True
+                or trial.get("official_success") is not True
+                or trial.get("outcome") != "success"
                 or trial.get("simulator_device") != "cpu"
                 or trial.get("cloth_device") != "cpu"
+                or any(
+                    not isinstance(trial.get(field), str)
+                    or _CUDA_DEVICE.fullmatch(str(trial[field])) is None
+                    for field in ("renderer_device", "camera_device", "policy_device")
+                )
+                or len({trial.get("renderer_device"), trial.get("camera_device"), trial.get("policy_device")}) != 1
                 or any(trial.get(field) is not False for field in (
                     "safety_failure", "numerical_failure", "cloth_failure",
                 ))

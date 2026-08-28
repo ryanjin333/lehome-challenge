@@ -7,6 +7,8 @@ from pathlib import Path
 import shutil
 import subprocess
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WRAPPER = REPO_ROOT / "rollout_appliance" / "run_success_replay_campaign.sh"
@@ -71,8 +73,11 @@ def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dic
             "category": category,
             "garment_name": f"{category}-garment",
             "release_stage": "seen",
+            "strategy": "canonical",
             "campaign_round_id": "fresh-12k-source-20260827",
             "campaign_run_id": "fresh-run-20260827-a",
+            "campaign_kind": "fresh_12k_success_source_v1",
+            "logical_stage": "fresh_success_source",
         }
         for category in ("top_long", "top_short", "pant_long", "pant_short")
     ]
@@ -95,9 +100,25 @@ def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dic
         episode.write_text(
             json.dumps(
                 {
+                    "episode_id": attempt,
+                    "accepted_success": True,
+                    "outcome": "success",
                     "identity": {
+                        "episode_id": attempt,
+                        "category": category,
+                        "garment_name": f"{category}-garment",
+                        "release_stage": "seen",
+                        "policy_repo": "ryanjin333/lehome-groot-n17-models",
+                        "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
+                        "policy_step": 12000,
+                        "asset_revision": "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9",
                         "campaign_round_id": "fresh-12k-source-20260827",
                         "campaign_run_id": "fresh-run-20260827-a",
+                    },
+                    "provenance": {
+                        "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
+                        "simulator_device": "cpu", "cloth_device": "cpu",
+                        "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0",
                     },
                     "randomization": {"strategy": "canonical"},
                 }
@@ -105,13 +126,21 @@ def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dic
             encoding="utf-8",
         )
         reset = snapshots / "reset.json"
-        reset.write_text(json.dumps({"randomization": {"strategy": "canonical"}}), encoding="utf-8")
+        reset_payload = {
+            "schema_version": 3, "cloth_state_authority": "usd_local_points_v1",
+            "garment_name": f"{category}-garment", "robot_position": [0.0] * 12,
+            "robot_velocity": [0.0] * 12, "cloth_position": [[0.0, 0.0, 0.0]],
+            "cloth_velocity": [[0.0, 0.0, 0.0]], "rng_state": {},
+            "randomization": {"strategy": "canonical"},
+            "scene_state": {"garment_reset_pose": [0.0, 0.0, 0.67, 0.0, 0.0, 90.0]},
+        }
+        reset.write_text(json.dumps(reset_payload), encoding="utf-8")
         annotations = raw / "annotations.jsonl"
         annotations.write_text('{"step":0,"action":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"success":true}\n', encoding="utf-8")
         snapshot = snapshots / "continuations" / "000016.json"
         snapshot.parent.mkdir()
         snapshot.write_text(
-            json.dumps({"robot_position": [0.0] * 12, "randomization": {"strategy": "canonical", "continuation_step": 16}}),
+            json.dumps({**reset_payload, "randomization": {"strategy": "canonical", "continuation_step": 16}}),
             encoding="utf-8",
         )
         checksums = {}
@@ -128,6 +157,7 @@ def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dic
         receipt.write_text(
             json.dumps(
                 {
+                    "attempt_id": attempt,
                     "readback_verified": True,
                     "round_id": "fresh-12k-source-20260827",
                     "run_id": "fresh-run-20260827-a",
@@ -143,6 +173,7 @@ def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dic
         "schema_version": 1,
         "kind": "lehome_fresh_12k_success_source_report_v1",
         "campaign_kind": "fresh_12k_success_source_v1",
+        "logical_stage": "fresh_success_source",
         "round_id": "fresh-12k-source-20260827",
         "run_id": "fresh-run-20260827-a",
         "matrix_sha256": source_matrix_sha,
@@ -156,7 +187,8 @@ def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dic
             {
                 "attempt_id": f"parent-{category}", "category": category,
                 "garment_name": f"{category}-garment", "accepted_success": True,
-                "outcome": "success", "simulator_device": "cpu", "cloth_device": "cpu",
+                "official_success": True, "outcome": "success", "simulator_device": "cpu", "cloth_device": "cpu",
+                "renderer_device": "cuda:0", "camera_device": "cuda:0", "policy_device": "cuda:0",
                 "safety_failure": False, "numerical_failure": False, "cloth_failure": False,
                 "artifact_sha256": source_digests[category],
                 "hub_sync_receipt_sha256": hashlib.sha256(source_receipts[category].read_bytes()).hexdigest(),
@@ -195,6 +227,117 @@ def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dic
         "LEHOME_FRESH_SOURCE_REPORTS_JSON": json.dumps([{"path": str(source_report), "sha256": source_report_sha}]),
         "LEHOME_FRESH_SOURCE_MATRICES_JSON": json.dumps([{"path": str(source_matrix), "sha256": source_matrix_sha}]),
     }
+
+
+def _rewrite_fresh_report(rows: list[dict[str, object]], environment: dict[str, str]) -> None:
+    """Re-sign the local report fixture after an intentional contract mutation."""
+
+    report_path = Path(json.loads(environment["LEHOME_FRESH_SOURCE_REPORTS_JSON"])[0]["path"])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report.pop("report_sha256", None)
+    report["report_sha256"] = hashlib.sha256(
+        (json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    ).hexdigest()
+    payload = (json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    report_path.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    environment["LEHOME_FRESH_SOURCE_REPORTS_JSON"] = json.dumps([{"path": str(report_path), "sha256": digest}])
+    for row in rows:
+        row["source_report_sha256"] = digest
+
+
+def _refresh_fresh_artifact(
+    rows: list[dict[str, object]], environment: dict[str, str], *, category: str,
+) -> None:
+    """Keep every local checksum/receipt binding genuine for a source mutation."""
+
+    row = next(item for item in rows if item["category"] == category)
+    root = Path(str(row["source_episode_root"]))
+    attempt = str(row["parent_episode_id"])
+    required = [
+        root / "raw" / attempt / "episode.json",
+        root / "raw" / attempt / "snapshots" / "reset.json",
+        root / "raw" / attempt / "annotations.jsonl",
+        root / "raw" / attempt / "snapshots" / "continuations" / "000016.json",
+    ]
+    manifest = {
+        item.relative_to(root).as_posix(): {
+            "sha256": hashlib.sha256(item.read_bytes()).hexdigest(), "size": item.stat().st_size,
+        }
+        for item in required
+    }
+    (root / "SHA256SUMS.json").write_text(json.dumps(manifest), encoding="utf-8")
+    entries = [
+        {
+            "relative_path": item.relative_to(root).as_posix(),
+            "sha256": hashlib.sha256(item.read_bytes()).hexdigest(),
+            "byte_size": item.stat().st_size,
+        }
+        for item in sorted(required)
+    ]
+    artifact = hashlib.sha256(
+        (json.dumps(entries, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    ).hexdigest()
+    reset, annotations, snapshot = required[1:]
+    snapshot_payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    state = snapshot_payload["robot_position"]
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "category": category, "garment": row["garment"], "state_rounding": "fixed_6dp",
+                "state": ["0.000000" if float(value) == 0 else format(float(value), ".6f") for value in state],
+            }, sort_keys=True, separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    receipt_path = Path(str(row["source_receipt_path"]))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["episode_sha256"] = artifact
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    receipt_sha = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    report_path = Path(json.loads(environment["LEHOME_FRESH_SOURCE_REPORTS_JSON"])[0]["path"])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    trial = next(item for item in report["trials"] if item["attempt_id"] == attempt)
+    trial["artifact_sha256"] = artifact
+    trial["hub_sync_receipt_sha256"] = receipt_sha
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    _rewrite_fresh_report(rows, environment)
+    for item in rows:
+        if item["category"] == category:
+            item["source_episode_sha256"] = artifact
+            item["source_reset_sha256"] = manifest[reset.relative_to(root).as_posix()]["sha256"]
+            item["source_annotations_sha256"] = manifest[annotations.relative_to(root).as_posix()]["sha256"]
+            item["source_continuation_snapshot_sha256"] = manifest[snapshot.relative_to(root).as_posix()]["sha256"]
+            item["restore_snapshot_sha256"] = item["source_continuation_snapshot_sha256"]
+            item["source_state_fingerprint"] = fingerprint
+            item["source_receipt_sha256"] = receipt_sha
+
+
+def _write_exact_matrix(
+    tmp_path: Path, rows: list[dict[str, object]], environment: dict[str, str],
+) -> None:
+    matrix = tmp_path / "fresh-matrix.json"
+    encoded = (json.dumps(rows, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    matrix.write_bytes(encoded)
+    digest = hashlib.sha256(encoded).hexdigest()
+    (tmp_path / "fresh-matrix.json.sha256").write_text(digest + "\n", encoding="ascii")
+    environment.update({
+        "LEHOME_SUCCESS_REPLAY_MATRIX": str(matrix),
+        "LEHOME_SUCCESS_REPLAY_MATRIX_SHA256": digest,
+        "LEHOME_ATTEMPT_MATRIX": str(matrix),
+        "LEHOME_ATTEMPT_MATRIX_SHA256": digest,
+        "LEHOME_MAX_ATTEMPTS": "400",
+        "LEHOME_TARGET_ACCEPTED": "200",
+        "LEHOME_WORKER_COUNT": "4",
+        "LEHOME_ENABLE_HF_UPLOAD": "1",
+        "LEHOME_SIMULATOR_DEVICE": "cpu",
+        "LEHOME_SUCCESS_REPLAY_CAMPAIGN": "1",
+        "LEHOME_VALIDATE_MATRIX_ONLY": "1",
+        "LEHOME_CAMPAIGN_ROOT": str(tmp_path / "base-campaign"),
+    })
+
+
+def _run_exact_path(path: Path, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["bash", str(path)], env=os.environ | environment, capture_output=True, text=True, check=False)
 
 
 def test_success_replay_wrapper_is_pinned_to_the_four_worker_original_12k_campaign() -> None:
@@ -358,6 +501,7 @@ def test_success_replay_wrapper_admits_200_only_for_exact_fresh_visual_only_tupl
     wrapper = tmp_path / "run_success_replay_campaign.sh"
     appliance = tmp_path / "run_12k_campaign.sh"
     shutil.copy2(WRAPPER, wrapper)
+    shutil.copy2(REPO_ROOT / "rollout_appliance" / "validate_fresh_replay_evidence.py", tmp_path / "validate_fresh_replay_evidence.py")
     appliance.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         "printf '%s:%s:%s:%s:%s' \"${LEHOME_MAX_ATTEMPTS}\" \"${LEHOME_TARGET_ACCEPTED}\" "
@@ -378,6 +522,7 @@ def test_success_replay_wrapper_admits_200_only_for_exact_fresh_visual_only_tupl
         "LEHOME_MAX_ATTEMPTS": "400",
         "LEHOME_TARGET_ACCEPTED": "200",
         "LEHOME_CAPTURE": str(capture),
+        "PYTHONPATH": str(REPO_ROOT / "scripts"),
         **source_environment,
     }
 
@@ -449,3 +594,53 @@ def test_success_replay_wrapper_admits_200_only_for_exact_fresh_visual_only_tupl
     )
     assert rejected.returncode != 0
     assert "exact" in rejected.stderr
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong-policy", "wrong-campaign-kind", "wrong-logical-stage", "non-cpu",
+        "safety-failure", "numerical-failure", "cloth-failure", "mild-reset",
+        "nan-h16", "infinite-h16",
+    ],
+)
+def test_both_exact_200_paths_reject_self_consistent_untrusted_source_contracts(
+    tmp_path: Path, mutation: str,
+) -> None:
+    rows, environment = _fresh_evidence_matrix(tmp_path)
+    report_path = Path(json.loads(environment["LEHOME_FRESH_SOURCE_REPORTS_JSON"])[0]["path"])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    trial = report["trials"][0]
+    category = str(trial["category"])
+
+    if mutation == "wrong-policy":
+        report["identity"]["policy_revision"] = "0" * 40
+    elif mutation == "wrong-campaign-kind":
+        report["campaign_kind"] = "other_campaign_v1"
+    elif mutation == "wrong-logical-stage":
+        report["logical_stage"] = "other_stage"
+    elif mutation == "non-cpu":
+        trial["simulator_device"] = "cuda:0"
+    elif mutation in {"safety-failure", "numerical-failure", "cloth-failure"}:
+        trial[mutation.replace("-", "_")] = True
+    elif mutation == "mild-reset":
+        reset = Path(str(next(row for row in rows if row["category"] == category)["source_episode_root"])) / "raw" / str(trial["attempt_id"]) / "snapshots" / "reset.json"
+        payload = json.loads(reset.read_text(encoding="utf-8"))
+        payload["randomization"] = {"strategy": "mild_geometry"}
+        reset.write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        snapshot = Path(str(next(row for row in rows if row["category"] == category)["restore_snapshot"]))
+        payload = json.loads(snapshot.read_text(encoding="utf-8"))
+        payload["cloth_position"][0][0] = float("nan") if mutation == "nan-h16" else float("inf")
+        snapshot.write_text(json.dumps(payload), encoding="utf-8")
+
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    if mutation in {"mild-reset", "nan-h16", "infinite-h16"}:
+        _refresh_fresh_artifact(rows, environment, category=category)
+    else:
+        _rewrite_fresh_report(rows, environment)
+    _write_exact_matrix(tmp_path, rows, environment)
+
+    for path in (WRAPPER, BASE_CAMPAIGN):
+        result = _run_exact_path(path, environment)
+        assert result.returncode != 0, f"{path.name} accepted {mutation}: {result.stderr}"

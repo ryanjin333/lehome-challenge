@@ -42,6 +42,10 @@ def _write_success(
         "provenance": {
             "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
             "simulator_device": simulator_device,
+            "cloth_device": simulator_device,
+            "renderer_device": "cuda:0",
+            "camera_device": "cuda:0",
+            "policy_device": "cuda:0",
         },
     }
     cloth_state_authority = (
@@ -147,6 +151,8 @@ def _write_fresh_sources(accepted: Path) -> tuple[Path, Path]:
                 "garment_name": identity["garment_name"],
                 "release_stage": "seen",
                 "strategy": "canonical",
+                "campaign_kind": "fresh_12k_success_source_v1",
+                "logical_stage": "fresh_success_source",
                 "campaign_round_id": identity["campaign_round_id"],
                 "campaign_run_id": identity["campaign_run_id"],
             }
@@ -182,9 +188,13 @@ def _write_fresh_sources(accepted: Path) -> tuple[Path, Path]:
                 "category": identity["category"],
                 "garment_name": identity["garment_name"],
                 "accepted_success": True,
+                "official_success": True,
                 "outcome": "success",
                 "simulator_device": "cpu",
                 "cloth_device": "cpu",
+                "renderer_device": "cuda:0",
+                "camera_device": "cuda:0",
+                "policy_device": "cuda:0",
                 "safety_failure": False,
                 "numerical_failure": False,
                 "cloth_failure": False,
@@ -199,6 +209,7 @@ def _write_fresh_sources(accepted: Path) -> tuple[Path, Path]:
         "schema_version": 1,
         "kind": "lehome_fresh_12k_success_source_report_v1",
         "campaign_kind": "fresh_12k_success_source_v1",
+        "logical_stage": "fresh_success_source",
         "round_id": "fresh-12k-source-20260827",
         "run_id": "fresh-run-20260827-a",
         "matrix_sha256": matrix_sha256,
@@ -589,6 +600,8 @@ def test_fresh_visual_only_mode_binds_authenticated_cpu_sources_and_is_determini
         "missing-receipt",
         "receipt-mismatch",
         "wrong-policy",
+        "wrong-campaign-kind",
+        "wrong-logical-stage",
         "cuda-cloth",
         "missing-step-16",
         "noncanonical-parent",
@@ -635,6 +648,10 @@ def test_fresh_visual_only_mode_rejects_every_untrusted_source_boundary(
         receipt.write_bytes(_canonical(payload))
     elif mutation == "wrong-policy":
         report["identity"]["policy_revision"] = "0" * 40
+    elif mutation == "wrong-campaign-kind":
+        report["campaign_kind"] = "other_campaign_v1"
+    elif mutation == "wrong-logical-stage":
+        report["logical_stage"] = "other_stage"
     elif mutation == "cuda-cloth":
         trial["simulator_device"] = "cuda:0"
     elif mutation == "missing-step-16":
