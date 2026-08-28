@@ -294,6 +294,69 @@ def test_seal_rollout_round_requires_each_readback_verified_sync_receipt(daemon,
             receipts_root=sync.receipts_root, round_id=ROUND_ID, attempt_ids=("attempt-missing",),
             seal_receipt_path=tmp_path / "seals" / "missing.json",
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("round_id", "other-round", "round_id"),
+        ("readback_verified", False, "readback"),
+        ("repository", "unapproved/repository", "repository"),
+        ("immutable_revision", "not-a-commit", "immutable revision"),
+        ("remote_prefix", "rollout-rounds/other-round/attempt-contract", "prefix"),
+        ("attempt_id", "other-attempt", "attempt_id"),
+    ),
+)
+def test_round_seal_rejects_every_mismatched_sync_receipt_binding(daemon, tmp_path, field, value, message):
+    """The round seal is a second independent verifier of HubSync receipts."""
+    sync, _transport, accepted_root = daemon
+    episode = _make_accepted_episode(accepted_root, "attempt-contract")
+    receipt = sync.sync_episode("attempt-contract", episode)
+    payload = json.loads(receipt.receipt_path.read_text(encoding="utf-8"))
+    payload[field] = value
+    receipt.receipt_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(RolloutRoundSealError, match=message):
+        seal_rollout_round(
+            receipts_root=sync.receipts_root, round_id=ROUND_ID, attempt_ids=("attempt-contract",),
+            seal_receipt_path=tmp_path / "seals" / f"{field}.json",
+        )
+
+
+def test_round_seal_rejects_empty_duplicate_and_over_150_inputs(daemon, tmp_path):
+    sync, _transport, accepted_root = daemon
+    episode = _make_accepted_episode(accepted_root, "attempt-bounded")
+    sync.sync_episode("attempt-bounded", episode)
+
+    with pytest.raises(RolloutRoundSealError, match="at least one"):
+        seal_rollout_round(receipts_root=sync.receipts_root, round_id=ROUND_ID, attempt_ids=(), seal_receipt_path=tmp_path / "empty.json")
+    with pytest.raises(RolloutRoundSealError, match="duplicates"):
+        seal_rollout_round(receipts_root=sync.receipts_root, round_id=ROUND_ID, attempt_ids=("attempt-bounded", "attempt-bounded"), seal_receipt_path=tmp_path / "duplicate.json")
+    with pytest.raises(RolloutRoundSealError, match="exceed 150"):
+        seal_rollout_round(
+            receipts_root=sync.receipts_root, round_id=ROUND_ID,
+            attempt_ids=tuple(f"attempt-{index}" for index in range(151)), seal_receipt_path=tmp_path / "over.json",
+        )
+
+
+def test_round_seal_is_immutable_and_binds_the_exact_receipt_hashes(daemon, tmp_path):
+    sync, _transport, accepted_root = daemon
+    episode = _make_accepted_episode(accepted_root, "attempt-binding")
+    receipt = sync.sync_episode("attempt-binding", episode)
+    target = tmp_path / "seals" / "bound.json"
+    seal = seal_rollout_round(
+        receipts_root=sync.receipts_root, round_id=ROUND_ID, attempt_ids=("attempt-binding",), seal_receipt_path=target,
+    )
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    original = json.loads(receipt.receipt_path.read_text(encoding="utf-8"))
+    assert payload["episode_sha256s"] == {"attempt-binding": original["episode_sha256"]}
+    assert payload["immutable_revisions"] == {"attempt-binding": original["immutable_revision"]}
+    assert seal.episode_sha256s == payload["episode_sha256s"]
+
+    with pytest.raises(RolloutRoundSealError, match="already exists"):
+        seal_rollout_round(
+            receipts_root=sync.receipts_root, round_id=ROUND_ID, attempt_ids=("attempt-binding",), seal_receipt_path=target,
+        )
 def test_immutable_commit_is_rejected_as_publication_target(tmp_path):
     accepted_root = tmp_path / "accepted"
     accepted_root.mkdir()

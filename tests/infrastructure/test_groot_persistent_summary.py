@@ -241,6 +241,7 @@ def _real_persistent_campaign(
     policy: dict[str, object],
     campaign_round_id: str,
     campaign_run_id: str,
+    max_attempts: int | None = None,
 ) -> tuple[Path, Path, list[dict[str, object]]]:
     """Drive terminal evidence through the real worker/manifest/recorder seam.
 
@@ -263,10 +264,15 @@ def _real_persistent_campaign(
 
     campaign_root.mkdir(parents=True, exist_ok=False)
     matrix_path.parent.mkdir(parents=True, exist_ok=True)
-    matrix_path.write_bytes(_canonical(rows))
+    encoded_matrix = _canonical(rows)
+    if matrix_path.exists() or matrix_path.is_symlink():
+        if matrix_path.is_symlink() or not matrix_path.is_file() or matrix_path.read_bytes() != encoded_matrix:
+            raise ValueError("real producer fixture matrix does not match its immutable parent partition")
+    else:
+        matrix_path.write_bytes(encoded_matrix)
     ledger = TaskLedger(
         campaign_root / "ledger.sqlite3", attempt_matrix=rows,
-        max_attempts=len(rows), target_accepted=len(rows),
+        max_attempts=max_attempts if max_attempts is not None else len(rows), target_accepted=len(rows),
         completion_metric="terminal_outcomes",
     )
     finalizer = ArtifactFinalizationQueue(

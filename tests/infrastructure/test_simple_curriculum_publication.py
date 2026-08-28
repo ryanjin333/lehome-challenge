@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import hashlib
+import io
 import json
 from pathlib import Path
+import shutil
 import sys
 
 import pytest
@@ -405,3 +408,254 @@ def test_high_level_publication_resume_does_not_add_its_local_receipts_to_the_re
     assert receipt.is_file() and readback.is_file()
     assert first.immutable_revision == second.immutable_revision
     assert transport.upload_calls == 1
+
+
+def test_failure_staging_uses_a_fixed_evidence_allowlist_and_never_uploads_debug_files(tmp_path: Path) -> None:
+    module = _module()
+    root = tmp_path / "campaign"
+    _complete_campaign(root)
+    observation = root / "stage-receipts/gpu-stop-observation.json"
+    _write_json(root / "stage-receipts/gpu-stop.json", {"output": {
+        "terminal_outcome": "fidelity_stop", "stop_status": "succeeded",
+        "rollout_instance_id": "computeinstance-u00t6xfqhadrcmssa2", "verified_stopped": True,
+        "stop_observation_sha256": hashlib.sha256(observation.read_bytes()).hexdigest(),
+    }})
+    seal = module.build_final_seal(
+        root, run_id="fresh-run-publication-test", round_id="fresh-12k-publication-test",
+        terminal_outcome="fidelity_stop", rollout_instance_id="computeinstance-u00t6xfqhadrcmssa2",
+    )
+    seal_path = root / "seals" / "fidelity.json"
+    module._write_immutable_json(seal_path, seal)
+    # Neither ordinary forgotten diagnostics nor credential-bearing debug
+    # content belongs in a terminal failure bundle.
+    (root / "reports/debug.json").write_text('{"why":"investigate"}', encoding="utf-8")
+    (root / "reports/debug-token.json").write_text('{"token":"super-secret-value-123"}', encoding="utf-8")
+
+    bundle = module._stage_collection_bundle(
+        root, seal_path=seal_path, run_id="fresh-run-publication-test",
+        repository="owner/public-dataset", revision="main",
+    )
+    try:
+        assert "reports/debug.json" not in bundle.files
+        assert "reports/debug-token.json" not in bundle.files
+        assert "seals/fidelity.json" in bundle.files
+        assert all("debug" not in path for path in bundle.files)
+    finally:
+        __import__("shutil").rmtree(bundle.root, ignore_errors=True)
+
+
+def test_known_failure_evidence_with_a_secret_is_rejected_before_public_staging(tmp_path: Path) -> None:
+    module = _module()
+    root = tmp_path / "campaign"
+    _complete_campaign(root)
+    observation = root / "stage-receipts/gpu-stop-observation.json"
+    _write_json(root / "stage-receipts/gpu-stop.json", {"output": {
+        "terminal_outcome": "fidelity_stop", "stop_status": "succeeded",
+        "rollout_instance_id": "computeinstance-u00t6xfqhadrcmssa2", "verified_stopped": True,
+        "stop_observation_sha256": hashlib.sha256(observation.read_bytes()).hexdigest(),
+    }})
+    _write_json(root / "reports/first-100-gate.json", {"token": "super-secret-value-123"})
+    seal = module.build_final_seal(
+        root, run_id="fresh-run-publication-test", round_id="fresh-12k-publication-test",
+        terminal_outcome="fidelity_stop", rollout_instance_id="computeinstance-u00t6xfqhadrcmssa2",
+    )
+    seal_path = root / "seals" / "fidelity.json"
+    module._write_immutable_json(seal_path, seal)
+
+    with pytest.raises(module.CollectionPublicationError, match="credential-like content"):
+        module._stage_collection_bundle(
+            root, seal_path=seal_path, run_id="fresh-run-publication-test",
+            repository="owner/public-dataset", revision="main",
+        )
+
+
+def test_complete_publication_stages_real_task6_recorder_finalizer_and_hub_sync_evidence(tmp_path: Path) -> None:
+    """Exercise the accepted production evidence path, not a hand-written seal.
+
+    This reuses the real persistent-worker/AutonomousRecorder/finalizer test
+    seam for all 1,000 fresh terminal outcomes.  It then uses the real
+    HubSyncDaemon receipts for both fresh and visual-only replay before the
+    Task-7 publisher re-authenticates and public-readback publishes the tree.
+    """
+    module = _module()
+    producer_spec = importlib.util.spec_from_file_location(
+        "task7_real_producer_fixture", ROOT / "tests/infrastructure/test_groot_persistent_summary.py",
+    )
+    assert producer_spec and producer_spec.loader
+    producer = importlib.util.module_from_spec(producer_spec)
+    sys.modules[producer_spec.name] = producer
+    producer_spec.loader.exec_module(producer)
+
+    from lehome.flywheel.hub_sync import HubSyncDaemon
+    from lehome.flywheel.simple_curriculum import build_calibration_rows
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    controller = module._task6_controller_module()
+    root = tmp_path / "campaign"
+    run_id, round_id = "fresh-run-publication-real", "fresh-12k-publication-real"
+    policy = {
+        "policy_repo": "ryanjin333/lehome-groot-n17-models",
+        "policy_revision": "30ac1a84da67b099e115ad147bcd61e9d60046d3",
+        "policy_step": 12_000,
+        "policy_artifact_sha256": "3fadfea79b662a8b8e10fe3cae284c6a49d66a9855ed540d6e4d97d66a0f9f06",
+    }
+    runtime = {
+        **policy,
+        "rollout_image": "repo/rollout@sha256:" + "a" * 64,
+        "trainer_image": "repo/trainer@sha256:" + "b" * 64,
+        "simulator_device": "cpu", "cloth_device": "cpu", "policy_device": "cuda:0", "worker_count": 4,
+    }
+    config = controller.CollectionConfig(
+        campaign_root=root, host_code_root=ROOT, run_id=run_id, round_id=round_id,
+        max_wall_seconds=3600.0, max_spend_usd=99.0, paid=False, gpu_stop_command=None,
+        runtime_identity=runtime,
+    )
+    catalog = producer._catalog()
+    calibration = build_calibration_rows(catalog, seed_base=91_000)
+    by_category = {category: [row for row in calibration if row["category"] == category] for category in catalog}
+    # Arrange the first five in each physical partition to give the real
+    # recorder/finalizer seam accepted source evidence for every category.
+    calibration_rows = by_category["top_long"] + by_category["top_short"] + by_category["pant_long"] + by_category["pant_short"]
+    curriculum_rows = [
+        {
+            **row,
+            "attempt_id": f"curriculum-{index:04d}", "trial_id": f"curriculum-{index:04d}",
+            "seed": int(row["seed"]) + 1_000_000, "source_seed": int(row["seed"]) + 1_000_000,
+            "logical_stage": "curriculum",
+        }
+        for index, row in enumerate((
+            by_category["pant_long"] * 3 + by_category["pant_short"] * 3
+        )[:600])
+    ]
+    # Keep every fresh matrix row unique even though the curriculum's category
+    # distribution is intentionally ordered for this producer-path fixture.
+    assert len(calibration_rows) == 400 and len(curriculum_rows) == 600
+    for parent_name, rows, partitions in (
+        ("calibration", calibration_rows, (("calibration-head", 0, 100, 100, 150), ("calibration-tail", 100, 400, 300, 400))),
+        ("curriculum", curriculum_rows, (("curriculum-a", 0, 300, 300, 400), ("curriculum-b", 300, 600, 300, 400))),
+    ):
+        logical = root / "matrices" / f"{parent_name}.json"
+        logical.parent.mkdir(parents=True, exist_ok=True)
+        logical.write_bytes(producer._canonical(rows))
+        for partition, start, end, target, lease_budget in partitions:
+            physical, _manifest, _details = controller.materialize_partition(
+                parent_matrix=logical, parent_matrix_sha256=hashlib.sha256(logical.read_bytes()).hexdigest(),
+                output_directory=root / "partitions", partition_id=partition, start=start, end=end,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                partition_root, matrix, partition_rows = producer._real_persistent_campaign(
+                    tmp_path, rows=json.loads(physical.read_text(encoding="utf-8")),
+                    campaign_root=root / "fresh" / partition, matrix_path=physical, policy=policy,
+                    campaign_round_id=round_id, campaign_run_id=run_id, max_attempts=lease_budget,
+                )
+            # This controller state is intentionally retained locally but is
+            # explicitly excluded from the public complete bundle.
+            (partition_root / "rollout-preemption.json").write_text("{}\n", encoding="utf-8")
+            report = producer._module().build_simple_partition_report(
+                campaign_root=partition_root, matrix_path=matrix,
+                matrix_sha256=hashlib.sha256(matrix.read_bytes()).hexdigest(), **policy,
+            )
+            report_path = root / "reports" / "partitions" / f"{partition}.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_bytes(producer._canonical(report))
+            sync = HubSyncDaemon(
+                repository="ryanjin333/lehome-groot-n17-rollouts", round_id=round_id, run_id=run_id,
+                token="fixture-token", transport=producer._ReceiptTransport(),
+                accepted_root=partition_root / "evaluation-terminal",
+                receipts_root=partition_root / "hf-sync-receipts", readback_root=partition_root / "hf-readback",
+                revision="main",
+            )
+            for trial in report["trials"]:
+                attempt = str(trial["attempt_id"])
+                sync.sync_episode(attempt, partition_root / "evaluation-terminal" / attempt)
+
+    controller._build_fresh_source_report(config)
+    fresh = controller.CommandRunner(config)._discover("fresh-report", {})
+    assert set(fresh["artifacts"]) == {"report", "matrix", "terminal_artifact_manifest"}
+
+    # The replay ledger has the exact 4x100/4x50 contract.  Replayed artifact
+    # bytes come from recorder/finalizer-authenticated fresh terminals and are
+    # then independently published by the real HubSync receipt producer.
+    source_by_category: dict[str, Path] = {}
+    for entry in json.loads((root / "reports/fresh-terminal-artifacts.json").read_text(encoding="utf-8"))["entries"]:
+        artifact = Path(str(entry["finalized_artifact_root"]))
+        episode = json.loads((artifact / "raw" / str(entry["attempt_id"]) / "episode.json").read_text(encoding="utf-8"))
+        category = str(episode["identity"]["category"])
+        if entry["terminal_event"] == "accepted" and category not in source_by_category:
+            source_by_category[category] = artifact
+    assert set(source_by_category) == {"top_long", "top_short", "pant_long", "pant_short"}
+    replay_rows = [
+        {
+            "attempt_id": f"replay-{category}-{index:03d}", "trial_id": f"replay-{category}-{index:03d}",
+            "category": category, "strategy": "visual_only", "category_acceptance_cap": 50,
+        }
+        for category in ("top_long", "top_short", "pant_long", "pant_short") for index in range(100)
+    ]
+    replay_path = root / "replay" / "replay.json"; replay_path.parent.mkdir(parents=True)
+    replay_path.write_bytes(producer._canonical(replay_rows))
+    (root / "replay/replay.json.sha256").write_text(hashlib.sha256(replay_path.read_bytes()).hexdigest() + "\n", encoding="ascii")
+    replay_ledger = TaskLedger(root / "replay" / "ledger.sqlite3", attempt_matrix=replay_rows, max_attempts=400, target_accepted=200)
+    (root / "replay" / "accepted").mkdir()
+    replay_sync = HubSyncDaemon(
+        repository="ryanjin333/lehome-groot-n17-rollouts", round_id=round_id + "-replay", run_id=run_id,
+        token="fixture-token", transport=producer._ReceiptTransport(), accepted_root=root / "replay" / "accepted",
+        receipts_root=root / "replay" / "hf-sync-receipts", readback_root=root / "replay" / "hf-readback", revision="main",
+    )
+    try:
+        for index in range(400):
+            lease = replay_ledger.lease_next("replay-worker", lease_duration_ns=10**15)
+            assert lease is not None
+            category = str(lease.attempt.assignment["category"])
+            # Reject the first half in every category, then accept the second
+            # half.  The real ledger stops dispatch at its 200-accepted cap,
+            # so this order proves all 400 terminal rows settle first.
+            if int(str(lease.attempt.assignment["attempt_id"]).rsplit("-", 1)[1]) >= 50:
+                artifact = root / "replay" / "accepted" / lease.attempt.attempt_id
+                shutil.copytree(source_by_category[category], artifact)
+                replay_sync.sync_episode(lease.attempt.attempt_id, artifact)
+                replay_ledger.record_terminal("replay-worker", lease.attempt.attempt_id, lease.lease_id, str(artifact))
+                assert replay_ledger.validate_terminal(lease.attempt.attempt_id, "accepted", artifact_id=str(artifact)) == "accepted"
+            else:
+                replay_ledger.record_terminal(
+                    "replay-worker", lease.attempt.attempt_id, lease.lease_id,
+                    f"rejected-{lease.attempt.attempt_id}",
+                )
+                assert replay_ledger.validate_terminal(lease.attempt.attempt_id, "rejected") == "rejected"
+    finally:
+        replay_ledger.close()
+    assert controller._discover_success_replay(config, matrix=replay_path, ledger=root / "replay" / "ledger.sqlite3")["result"] == "complete"
+
+    observation = {
+        "schema_version": 1, "kind": "lehome_simple_curriculum_verified_gpu_stop_v1",
+        "provider": "nebius_compute_api", "instance_id": "computeinstance-u00t6xfqhadrcmssa2",
+        "state": "STOPPED", "verified": True, "observed_at_utc": "2026-08-28T00:00:00Z",
+        "provider_response_sha256": "c" * 64,
+    }
+    observation_path = root / "stage-receipts/gpu-stop-observation.json"
+    _write_json(observation_path, observation)
+    _write_json(root / "stage-receipts/gpu-stop.json", {"output": {
+        "terminal_outcome": "complete", "stop_status": "succeeded",
+        "rollout_instance_id": observation["instance_id"], "verified_stopped": True,
+        "stop_observation_sha256": hashlib.sha256(observation_path.read_bytes()).hexdigest(),
+    }})
+    # A root runtime cache is real-but-private controller state; its presence
+    # cannot be a completion requirement or accidentally public evidence.
+    (root / "hf-cache").mkdir()
+    (root / "hf-cache" / "runtime.json").write_text('{"cache":"private"}\n', encoding="utf-8")
+    # Conversely an unfamiliar byte in a public evidence area must fail
+    # closed.  That proves the complete bundle is an allowlist, not a walk.
+    unreviewed = root / "reports" / "unreviewed-debug.json"
+    unreviewed.write_text('{"why":"not reviewed"}\n', encoding="utf-8")
+    with pytest.raises(module.CollectionPublicationError, match="unreviewed"):
+        module.publish_collection(
+            root, run_id=run_id, round_id=round_id, terminal_outcome="complete",
+            rollout_instance_id=observation["instance_id"], repository="owner/public-dataset",
+            revision="main", token="token", transport=FakePublicTransport(),
+        )
+    unreviewed.unlink()
+    published, _receipt, _readback = module.publish_collection(
+        root, run_id=run_id, round_id=round_id, terminal_outcome="complete",
+        rollout_instance_id=observation["instance_id"], repository="owner/public-dataset",
+        revision="main", token="token", transport=FakePublicTransport(),
+    )
+    assert published.public_readback_verified is True

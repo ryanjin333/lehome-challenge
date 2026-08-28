@@ -1771,10 +1771,20 @@ def run_collection(config: CollectionConfig, *, runner: Runner) -> str:
         else:
             outcome = str(decision)
     except BudgetLimitError:
-        # No paid adapter ran, so there is no VM action to stop and no
-        # post-stop publication authority.  A pre-stage budget rejection is
-        # intentionally a clean no-op.
-        raise
+        # A budget observer can fire before the first adapter, between two
+        # adapters, while CommandRunner is terminating a live child, or in
+        # the post-adapter observation in ``_stage``.  In every paid case the
+        # exact rollout VM may therefore still be consuming compute.  Treat
+        # this as a terminal infrastructure outcome: dispatch the *trusted*
+        # exact-VM stop, require the provider STOPPED observation, and then
+        # permit only final-publication (which deliberately has no budget
+        # check and no paid command surface).  Do not re-raise here: doing so
+        # used to strand an already-running VM on a pre-stage/in-flight spend
+        # breach.
+        return _stop_then_publish(
+            journal, runner, config, predecessor=predecessor,
+            outcome="infrastructure_stop",
+        )
     except ReceiptMismatchError:
         _stop_then_publish(journal, runner, config, predecessor=predecessor, outcome="infrastructure_stop_failure")
         raise

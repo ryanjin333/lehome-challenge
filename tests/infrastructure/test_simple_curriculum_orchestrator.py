@@ -401,16 +401,26 @@ def test_campaign_root_symlink_is_rejected_before_journal_creation(tmp_path: Pat
         invalid.validate()
 
 
-def test_paid_budget_gate_fails_before_runner_at_exact_spend_boundary(tmp_path: Path) -> None:
+def test_paid_budget_gate_stops_the_exact_vm_and_allows_only_publication_at_exact_spend_boundary(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path)
     assert config.spend_observer is not None
     observed = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     config.spend_observer.write_text(json.dumps({"schema_version": 1, "kind": "lehome_spend_observation_v1", "observer": "test-meter", "observed_at_utc": observed, "spent_usd": 99.0}), encoding="utf-8")
     runner = FakeRunner(config.campaign_root)
 
-    with pytest.raises(module.ReceiptMismatchError, match="budget"):
-        module.run_collection(config, runner=runner)
-    assert runner.calls == []
+    assert module.run_collection(config, runner=runner) == "infrastructure_stop"
+    # A first-stage budget breach is still ambiguous about provider state, so
+    # the trusted stop runs before the one zero-compute publication boundary.
+    assert runner.calls == ["final-publication"]
+    assert runner.stops == 1
+    observation = json.loads((config.campaign_root / "stage-receipts" / "gpu-stop-observation.json").read_text())
+    assert observation["instance_id"] == "computeinstance-u00t6xfqhadrcmssa2"
+    assert observation["state"] == "STOPPED"
+
+    resumed = FakeRunner(config.campaign_root)
+    assert module.run_collection(config, runner=resumed) == "infrastructure_stop"
+    assert resumed.calls == []
+    assert resumed.stops == 0
 
 
 def test_budget_exhausted_stopped_campaign_can_publish_without_reentering_paid_work(tmp_path: Path) -> None:
@@ -429,6 +439,29 @@ def test_budget_exhausted_stopped_campaign_can_publish_without_reentering_paid_w
     ) == "complete"
     assert runner.calls == ["final-publication"]
     assert runner.stops == 1
+
+
+def test_post_adapter_budget_breach_stops_once_and_never_starts_the_next_paid_stage(tmp_path: Path) -> None:
+    """The finally-budget check covers a stage that just returned normally."""
+    module = _module(); config = _config(module, tmp_path)
+    assert config.spend_observer is not None
+
+    class BreachingRunner(FakeRunner):
+        def run(self, stage: str, **kwargs):
+            result = super().run(stage, **kwargs)
+            if stage == "calibration-matrix":
+                observed = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                config.spend_observer.write_text(json.dumps({
+                    "schema_version": 1, "kind": "lehome_spend_observation_v1", "observer": "test-meter",
+                    "observed_at_utc": observed, "spent_usd": 99.0,
+                }), encoding="utf-8")
+            return result
+
+    runner = BreachingRunner(config.campaign_root)
+    assert module.run_collection(config, runner=runner) == "infrastructure_stop"
+    assert runner.calls == ["calibration-matrix", "final-publication"]
+    assert runner.stops == 1
+    assert not (config.campaign_root / "stage-receipts" / "calibration-head.json").exists()
 
 
 def test_inflight_budget_watchdog_terminates_a_clean_child_before_returning(tmp_path: Path) -> None:

@@ -32,11 +32,17 @@ for _path in (REPO_ROOT / "source" / "lehome", REPO_ROOT / "trainer" / "src"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+from lehome_train.redaction import ArtifactRejected, generate_upload_allowlist
+
 
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _RUN_ID = re.compile(r"^fresh-run-[a-z0-9-]{1,112}$")
 _SAFE_RELATIVE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,511}$")
 _PUBLICATION_ROOT = "collection-rounds"
+_SENSITIVE_PATH = re.compile(r"(?:token|secret|credential|password|api[_-]?key)", re.I)
+_SENSITIVE_CONTENT = re.compile(
+    rb"(?i)(?:bearer\s+[a-z0-9._-]{12,}|(?:token|secret|credential|password|(?:hf|sk|api|access|auth)[_-]?(?:token|key))\s*['\"]?\s*[:=]\s*['\"]?[a-z0-9._-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
+)
 
 
 class CollectionPublicationError(RuntimeError):
@@ -122,6 +128,39 @@ def _sha256(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _scan_publication_descriptor_and_content(path: Path) -> None:
+    """Reject credential-bearing descriptors/content before public staging.
+
+    Task-6 recorder/finalizer artifacts intentionally contain no credentials,
+    but the collection root also hosts controller caches and debugging output.
+    Check both the descriptor (path/name) and the bytes for *every* file that
+    can enter the public bundle.  This is kept dependency-free because it is
+    also the last local guard before anonymous Hub readback.
+    """
+
+    # Use the repository-wide, descriptor-safe uploader policy first.  It
+    # opens the file beneath its parent with O_NOFOLLOW, checks canonical
+    # relative paths and provider-token content, and re-stats the descriptor
+    # after reading.  The small local policy below remains intentionally more
+    # conservative for this anonymous public collection: controller debug
+    # blobs that spell out a generic token/secret also never leave the host.
+    try:
+        generate_upload_allowlist(path.parent, (path.name,))
+    except ArtifactRejected as error:
+        raise CollectionPublicationError("publication source violates the canonical upload policy") from error
+    if path.is_symlink() or not path.is_file() or _SENSITIVE_PATH.search(path.name):
+        raise CollectionPublicationError("publication source includes a credential-like descriptor")
+    try:
+        tail = b""
+        with path.open("rb") as handle:
+            while chunk := handle.read(1 << 20):
+                if _SENSITIVE_CONTENT.search(tail + chunk):
+                    raise CollectionPublicationError("publication source includes credential-like content")
+                tail = (tail + chunk)[-256:]
+    except OSError as error:
+        raise CollectionPublicationError("publication source is unreadable") from error
+
+
 def _entry_digest(entries: Sequence[PublicationEntry]) -> str:
     return hashlib.sha256(_canonical([
         {"relative_path": item.relative_path, "sha256": item.sha256, "byte_size": item.byte_size}
@@ -158,6 +197,7 @@ def _collect_entries(bundle: CollectionPublicationBundle) -> tuple[PublicationEn
         path = (root / relative).resolve(strict=False)
         if not path.is_relative_to(root):
             raise CollectionPublicationError("publication path escapes bundle root")
+        _scan_publication_descriptor_and_content(path)
         sha256, byte_size = _sha256(path)
         entries.append(PublicationEntry(relative, sha256, byte_size))
     return tuple(sorted(entries, key=lambda item: item.relative_path))
@@ -567,8 +607,6 @@ def _iter_regular_files(root: Path) -> tuple[Path, ...]:
             path = current_path / name
             if path.is_symlink() or not path.is_file():
                 raise CollectionPublicationError("publication source contains an unsafe file")
-            if re.search(r"(?:token|secret|credential|password|api[_-]?key)", path.name, re.I):
-                raise CollectionPublicationError("publication source includes a credential-like path")
             files.append(path)
     return tuple(sorted(files))
 
@@ -577,13 +615,64 @@ def _copy_to_staging(*, source: Path, root: Path, staging: Path, remote: str) ->
     _safe_relative(remote)
     if source.is_symlink() or not source.is_file() or not source.is_relative_to(root):
         raise CollectionPublicationError("publication source file is unsafe")
+    _scan_publication_descriptor_and_content(source)
     target = staging / remote
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() or target.is_symlink():
         raise CollectionPublicationError("duplicate staged collection path")
     shutil.copyfile(source, target, follow_symlinks=False)
+    _scan_publication_descriptor_and_content(target)
     if _sha256(source) != _sha256(target):
         raise CollectionPublicationError("staged collection bytes differ from the source")
+
+
+def _existing_regular(root: Path, relative: str) -> Path | None:
+    """Return one reviewed optional file, rejecting unsafe lookalikes."""
+
+    path = root / relative
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise CollectionPublicationError("reviewed publication evidence is missing or unsafe")
+    return path
+
+
+def _safe_nonpublic_runtime_directory(path: Path) -> set[Path]:
+    """Recognize an explicitly private runtime cache without staging it."""
+
+    if not path.exists() and not path.is_symlink():
+        return set()
+    if path.is_symlink() or not path.is_dir():
+        raise CollectionPublicationError("nonpublic runtime state is unsafe")
+    # Traverse solely for path safety.  These cache bytes are intentionally
+    # neither required as evidence nor copied to public storage.
+    return set(_iter_regular_files(path))
+
+
+def _complete_nonpublic_paths(root: Path) -> set[Path]:
+    """Approved controller/runtime state that deliberately stays private."""
+
+    ignored: set[Path] = set()
+    for relative in (
+        "reports/final-publication.json", "reports/final-publication-readback.json",
+        "replay/ledger.sqlite3-wal", "replay/ledger.sqlite3-shm",
+    ):
+        path = _existing_regular(root, relative)
+        if path is not None:
+            ignored.add(path.relative_to(root))
+    for partition in ("calibration-head", "calibration-tail", "curriculum-a", "curriculum-b"):
+        partition_root = root / "fresh" / partition
+        for name in ("rollout-preemption.json", "ledger.sqlite3-wal", "ledger.sqlite3-shm"):
+            path = _existing_regular(root, f"fresh/{partition}/{name}")
+            if path is not None:
+                ignored.add(path.relative_to(root))
+        cache = partition_root / "hf-readback"
+        ignored.update(path.relative_to(root) for path in _safe_nonpublic_runtime_directory(cache))
+    # The appliance deliberately keeps a private HF/runtime cache at the
+    # campaign root.  It is not input evidence and must never be a condition
+    # of collection completion or public staging.
+    ignored.update(path.relative_to(root) for path in _safe_nonpublic_runtime_directory(root / "hf-cache"))
+    return ignored
 
 
 def _complete_reviewed_paths(root: Path, *, seal_path: Path) -> tuple[Path, ...]:
@@ -645,19 +734,62 @@ def _complete_reviewed_paths(root: Path, *, seal_path: Path) -> tuple[Path, ...]
         static.add(f"replay/hf-sync-receipts/{attempt}.sync.json")
     static.add(seal_path.relative_to(root).as_posix())
     allowed = {Path(relative) for relative in static}
+    # Controller receipts/inputs are useful when present but are not producer
+    # completion proof.  Do not reject a real Task-6 output merely because a
+    # cache was absent or a post-crash stage receipt was never written.
+    allowed = {path for path in allowed if _existing_regular(root, path.as_posix()) is not None}
+    if seal_path.is_symlink() or not seal_path.is_file() or not seal_path.is_relative_to(root / "seals"):
+        raise CollectionPublicationError("final seal is outside the canonical seals directory")
+    allowed.add(seal_path.relative_to(root))
     source_areas = ("inputs", "matrices", "partitions", "stage-receipts", "reports", "seals", "fresh", "replay")
     observed: set[Path] = set()
     for area in source_areas:
         candidate = root / area
         if candidate.exists() or candidate.is_symlink():
             observed.update(path.relative_to(root) for path in _iter_regular_files(candidate))
-    # Post-readback local receipts intentionally never enter the immutable
-    # bundle.  They are written after publication and are not source evidence.
-    observed.discard(Path("reports/final-publication.json"))
-    observed.discard(Path("reports/final-publication-readback.json"))
+    # Explicitly exclude only known controller/runtime state.  Any other
+    # byte in a reviewed source area is an unknown artifact and makes a
+    # complete seal fail closed rather than silently publishing it.
+    observed -= _complete_nonpublic_paths(root)
     if observed != allowed:
         raise CollectionPublicationError("collection complete has missing or unreviewed source files")
     return tuple(root / path for path in sorted(allowed))
+
+
+_FAILURE_EVIDENCE: Mapping[str, tuple[str, ...]] = {
+    "lehome_simple_curriculum_fidelity_infrastructure_stop_seal_v1": (
+        "stage-receipts/budget-state.json", "stage-receipts/gpu-stop-state.json",
+        "stage-receipts/gpu-stop.json", "stage-receipts/gpu-stop-observation.json",
+        "stage-receipts/calibration-matrix.json", "stage-receipts/calibration-head.json",
+        "stage-receipts/first-100-gate.json", "reports/calibration-head.json",
+        "reports/first-100-gate.json",
+    ),
+    "lehome_simple_curriculum_insufficient_fresh_source_seal_v1": (
+        "stage-receipts/budget-state.json", "stage-receipts/gpu-stop-state.json",
+        "stage-receipts/gpu-stop.json", "stage-receipts/gpu-stop-observation.json",
+        "stage-receipts/fresh-report.json", "stage-receipts/replay-matrix.json",
+        "stage-receipts/success-replay.json", "reports/fresh-source-report.json",
+        "reports/fresh-source-matrix.json", "replay/replay.json",
+        "replay/replay.json.sha256", "replay/success-replay-readback-seal.json",
+    ),
+}
+
+
+def _failure_reviewed_paths(root: Path, *, seal_path: Path, kind: str) -> tuple[Path, ...]:
+    """Stage only concise, fixed diagnostic evidence for non-complete seals."""
+
+    try:
+        candidates = _FAILURE_EVIDENCE[kind]
+    except KeyError as error:
+        raise CollectionPublicationError("final seal kind has no fixed evidence allowlist") from error
+    if seal_path.is_symlink() or not seal_path.is_file() or not seal_path.is_relative_to(root / "seals"):
+        raise CollectionPublicationError("final seal is outside the canonical seals directory")
+    paths = [seal_path]
+    for relative in candidates:
+        source = _existing_regular(root, relative)
+        if source is not None:
+            paths.append(source)
+    return tuple(sorted(set(paths)))
 
 
 def _stage_collection_bundle(root: Path, *, seal_path: Path, run_id: str, repository: str, revision: str) -> CollectionPublicationBundle:
@@ -676,53 +808,10 @@ def _stage_collection_bundle(root: Path, *, seal_path: Path, run_id: str, reposi
                 _copy_to_staging(source=source, root=root, staging=staging, remote=remote)
             files = tuple(path.relative_to(staging).as_posix() for path in _iter_regular_files(staging))
             return CollectionPublicationBundle(staging, run_id, repository, revision, files)
-        for directory in ("inputs", "matrices", "partitions", "stage-receipts"):
-            source_root = root / directory
-            if not source_root.exists() and not source_root.is_symlink():
-                continue
-            for source in _iter_regular_files(source_root):
-                _copy_to_staging(
-                    source=source, root=root, staging=staging,
-                    remote=f"manifests/{directory}/{source.relative_to(source_root).as_posix()}",
-                )
-        for directory in ("reports", "seals"):
-            source_root = root / directory
-            if not source_root.exists() and not source_root.is_symlink():
-                continue
-            for source in _iter_regular_files(source_root):
-                if directory == "reports" and source.name in {
-                    "final-publication.json", "final-publication-readback.json",
-                }:
-                    # These are local post-readback receipts.  Including them
-                    # would change the immutable upload on a safe resume.
-                    continue
-                _copy_to_staging(
-                    source=source, root=root, staging=staging,
-                    remote=f"{directory}/{source.relative_to(source_root).as_posix()}",
-                )
-        if seal_path.is_relative_to(root / "seals") is False:
-            raise CollectionPublicationError("final seal is outside the canonical seals directory")
-        for partition in ("calibration-head", "calibration-tail", "curriculum-a", "curriculum-b"):
-            partition_root = root / "fresh" / partition
-            for name in ("accepted", "evaluation-terminal", "hf-sync-receipts"):
-                candidate = partition_root / name
-                if candidate.exists() or candidate.is_symlink():
-                    for source in _iter_regular_files(candidate):
-                        _copy_to_staging(
-                            source=source, root=root, staging=staging,
-                            remote=f"fresh/{partition}/{name}/{source.relative_to(candidate).as_posix()}",
-                        )
-        replay = root / "replay"
-        if replay.exists() or replay.is_symlink():
-            for source in _iter_regular_files(replay):
-                # SQLite journals are local controller implementation state;
-                # terminal artifacts and immutable replay evidence are public.
-                if source.name in {"ledger.sqlite3", "ledger.sqlite3-shm", "ledger.sqlite3-wal"}:
-                    continue
-                _copy_to_staging(
-                    source=source, root=root, staging=staging,
-                    remote=f"replay/{source.relative_to(replay).as_posix()}",
-                )
+        for source in _failure_reviewed_paths(root, seal_path=seal_path, kind=str(seal.get("kind"))):
+            relative = source.relative_to(root).as_posix()
+            remote = f"manifests/{relative}" if relative.startswith(("inputs/", "matrices/", "partitions/", "stage-receipts/")) else relative
+            _copy_to_staging(source=source, root=root, staging=staging, remote=remote)
         files = tuple(path.relative_to(staging).as_posix() for path in _iter_regular_files(staging))
         return CollectionPublicationBundle(staging, run_id, repository, revision, files)
     except BaseException:
