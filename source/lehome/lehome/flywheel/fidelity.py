@@ -119,7 +119,7 @@ def _validate_policy_action(value: object) -> dict[str, object]:
     return {field: result[field] for field in sorted(result)}
 
 
-def validate_fidelity_diagnostic(diagnostic: object) -> dict[str, object]:
+def _validate_fidelity_diagnostic(diagnostic: object) -> dict[str, object]:
     """Validate the small closed schema allowed in durable fidelity events."""
 
     allowed = {"stage", "step_index", "physical_health", "write_readback", "cached_reset_velocity", "policy_action"}
@@ -187,6 +187,17 @@ def validate_fidelity_diagnostic(diagnostic: object) -> dict[str, object]:
     if "policy_action" in diagnostic:
         result["policy_action"] = _validate_policy_action(diagnostic["policy_action"])
     return result
+
+
+def validate_fidelity_diagnostic(diagnostic: object) -> dict[str, object]:
+    """Validate a diagnostic and totalize malformed schema values to ValueError."""
+
+    try:
+        return _validate_fidelity_diagnostic(diagnostic)
+    except ValueError:
+        raise
+    except (AttributeError, KeyError, OverflowError, TypeError) as error:
+        raise ValueError("fidelity diagnostic is malformed") from error
 
 
 def fidelity_receipt(

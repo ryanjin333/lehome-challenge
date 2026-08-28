@@ -808,11 +808,27 @@ class GarmentEnv(DirectRLEnv):
             float(np.max(np.linalg.norm(velocities, axis=1)))
             if velocities.size else float("inf")
         )
-        if (
-            not np.isfinite(configured_max_velocity_mps)
-            or configured_max_velocity_mps <= 0.0
-            or initial_max_velocity_mps >= configured_max_velocity_mps * 0.95
-        ):
+        configured_velocity_valid = (
+            np.isfinite(configured_max_velocity_mps)
+            and configured_max_velocity_mps > 0.0
+        )
+        max_velocity_limit_mps = (
+            configured_max_velocity_mps * 0.95
+            if configured_velocity_valid else None
+        )
+        velocity_saturated = (
+            max_velocity_limit_mps is not None
+            and initial_max_velocity_mps >= max_velocity_limit_mps
+        )
+        if not configured_velocity_valid or velocity_saturated:
+            diagnostic: dict[str, object] = {
+                "stage": "cached_reset_velocity",
+            }
+            if max_velocity_limit_mps is not None:
+                diagnostic["cached_reset_velocity"] = {
+                    "max_velocity_mps": initial_max_velocity_mps,
+                    "max_velocity_limit_mps": max_velocity_limit_mps,
+                }
             raise ClothFidelityError(
                 "cloth_flight",
                 fidelity_receipt(
@@ -823,15 +839,9 @@ class GarmentEnv(DirectRLEnv):
                 detail=(
                     "CPU source reset has saturated velocity: "
                     f"observed={initial_max_velocity_mps} "
-                    f"limit={configured_max_velocity_mps * 0.95}"
+                    f"limit={max_velocity_limit_mps}"
                 ),
-                diagnostic={
-                    "stage": "cached_reset_velocity",
-                    "cached_reset_velocity": {
-                        "max_velocity_mps": initial_max_velocity_mps,
-                        "max_velocity_limit_mps": configured_max_velocity_mps * 0.95,
-                    },
-                },
+                diagnostic=diagnostic,
             )
         try:
             config_get = getattr(self.object, "_get_config_value", None)

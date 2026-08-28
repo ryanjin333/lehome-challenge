@@ -140,6 +140,33 @@ def test_fidelity_diagnostic_rejects_malformed_or_unbounded_evidence(diagnostic)
         validate_fidelity_diagnostic(diagnostic)
 
 
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        {"stage": []},
+        {
+            "stage": "post_stabilization",
+            "physical_health": {
+                "max_position_m": 1.0,
+                "max_extent_m": 1.0,
+                "max_velocity_mps": 1.0,
+                "max_position_limit_m": 1.0,
+                "max_extent_limit_m": 1.0,
+                "max_velocity_limit_mps": 1.0,
+                "exceeded_metrics": [[]],
+            },
+        },
+    ],
+)
+def test_fidelity_diagnostic_totalizes_unhashable_schema_values_to_value_error(
+    diagnostic,
+) -> None:
+    from lehome.flywheel.fidelity import validate_fidelity_diagnostic
+
+    with pytest.raises(ValueError, match="diagnostic"):
+        validate_fidelity_diagnostic(diagnostic)
+
+
 def test_cloth_fidelity_error_keeps_optional_diagnostic_and_legacy_constructor() -> None:
     from lehome.flywheel.fidelity import ClothFidelityError
 
