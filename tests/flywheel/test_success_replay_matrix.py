@@ -562,6 +562,7 @@ def test_builder_accepts_successes_from_any_cuda_worker_index(tmp_path: Path) ->
 def test_fresh_visual_only_mode_binds_authenticated_cpu_sources_and_is_deterministic(
     tmp_path: Path,
 ) -> None:
+    from lehome.flywheel.fresh_replay_evidence import validate_exact_fresh_visual_only
     from lehome.flywheel.recovery_collection import validate_success_replay_descriptor
     from scripts.build_success_replay_matrix import build_success_replay_matrix
 
@@ -609,6 +610,16 @@ def test_fresh_visual_only_mode_binds_authenticated_cpu_sources_and_is_determini
     assert {row["category_acceptance_cap"] for row in rows} == {50}
     assert {row["category"] for row in rows} == set(CATEGORIES)
     assert validate_success_replay_descriptor(first) == rows
+    validate_exact_fresh_visual_only(
+        matrix_path=first,
+        max_attempts=400,
+        source_reports_json=json.dumps([{
+            "path": str(report), "sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+        }]),
+        source_matrices_json=json.dumps([{
+            "path": str(source_matrix), "sha256": hashlib.sha256(source_matrix.read_bytes()).hexdigest(),
+        }]),
+    )
     assert all(row["restore_snapshot_step"] == 16 for row in rows)
     for row in rows:
         assert set(
@@ -661,6 +672,34 @@ def test_fresh_visual_only_sampling_uses_all_authenticated_policy_outcomes_for_g
     assert first.read_bytes() == second.read_bytes()
     assert top_long_parents.count("fresh-top-long-low") == 99
     assert top_long_parents.count("fresh-top-long-high") == 1
+
+
+@pytest.mark.parametrize("unsafe", ["relative", "symlink"])
+def test_fresh_visual_only_mode_rejects_noncanonical_source_evidence_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe: str,
+) -> None:
+    from scripts.build_success_replay_matrix import build_success_replay_matrix
+
+    accepted = tmp_path / "accepted"
+    for index, category in enumerate(CATEGORIES):
+        _write_success(accepted, attempt_id=f"fresh-{category}", category=category, garment=f"{category.title().replace('_', '_')}_Seen_{index}")
+    report, source_matrix = _write_fresh_sources(accepted)
+    if unsafe == "relative":
+        monkeypatch.chdir(tmp_path)
+        reports, matrices = (Path(report.name),), (Path(source_matrix.name),)
+    else:
+        report_link, matrix_link = tmp_path / "report-link.json", tmp_path / "matrix-link.json"
+        report_link.symlink_to(report)
+        matrix_link.symlink_to(source_matrix)
+        reports, matrices = (report_link,), (matrix_link,)
+
+    with pytest.raises(ValueError, match="source (report|matrix).*(unsafe|absolute)"):
+        build_success_replay_matrix(
+            accepted_root=accepted, output=tmp_path / "matrix.json", source_reports=reports,
+            source_matrices=matrices, strategy="visual_only", attempt_cap_per_category=100,
+            acceptance_cap_per_category=50, max_attempts=400, target_accepted=200,
+            rng_seed=20260827400,
+        )
 
 
 @pytest.mark.parametrize(

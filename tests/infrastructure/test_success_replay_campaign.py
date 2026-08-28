@@ -554,7 +554,7 @@ def test_success_replay_wrapper_admits_200_only_for_exact_fresh_visual_only_tupl
         "LEHOME_MAX_ATTEMPTS": "400",
         "LEHOME_TARGET_ACCEPTED": "200",
         "LEHOME_CAPTURE": str(capture),
-        "PYTHONPATH": str(REPO_ROOT / "scripts"),
+        "PYTHONPATH": os.pathsep.join((str(REPO_ROOT / "source" / "lehome"), str(REPO_ROOT / "scripts"))),
         **source_environment,
     }
 

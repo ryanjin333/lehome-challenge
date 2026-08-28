@@ -12,6 +12,7 @@ from pathlib import Path
 import random
 import re
 import stat
+import sys
 import tempfile
 from typing import Mapping, Sequence
 
@@ -383,143 +384,24 @@ def _fresh_source_parents(
     visual replay may only be built from a fully bound source campaign.
     """
 
-    if not source_reports or not source_matrices:
-        raise ValueError("fresh visual-only replay requires source reports and source matrices")
-    matrices: dict[str, tuple[Path, dict[str, Mapping[str, object]]]] = {}
-    matrix_attempts: set[str] = set()
-    for path in source_matrices:
-        # Matrices are immutable JSON arrays, unlike reports.
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("fresh source matrix is missing or unsafe")
-        try:
-            rows = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_strict_pairs)
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise ValueError("fresh source matrix is malformed") from error
-        if not isinstance(rows, list) or not rows:
-            raise ValueError("fresh source matrix is malformed")
-        digest = _sha256(path)
-        if digest in matrices:
-            raise ValueError("fresh source matrix is duplicated")
-        by_attempt: dict[str, Mapping[str, object]] = {}
-        for row in rows:
-            if not isinstance(row, Mapping):
-                raise ValueError("fresh source matrix row is malformed")
-            attempt_id = row.get("attempt_id")
-            if (
-                not isinstance(attempt_id, str) or not attempt_id
-                or attempt_id in matrix_attempts
-                or row.get("trial_id") != attempt_id
-                or row.get("category") not in CATEGORIES
-                or not isinstance(row.get("garment_name"), str) or not row["garment_name"]
-                or row.get("release_stage") != "seen"
-                or row.get("strategy") != "canonical"
-                or row.get("campaign_kind") != FRESH_SOURCE_CAMPAIGN_KIND
-                or row.get("logical_stage") != FRESH_SOURCE_LOGICAL_STAGE
-                or not isinstance(row.get("campaign_round_id"), str)
-                or not isinstance(row.get("campaign_run_id"), str)
-            ):
-                raise ValueError("fresh source matrix identity is invalid")
-            matrix_attempts.add(attempt_id)
-            by_attempt[attempt_id] = row
-        matrices[digest] = (path, by_attempt)
+    source_root = Path(__file__).resolve().parents[1] / "source" / "lehome"
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    from lehome.flywheel.fresh_replay_evidence import (
+        authenticate_fresh_source_contract,
+        authenticate_selected_fresh_source_artifacts,
+    )
 
-    report_trials: dict[str, tuple[Mapping[str, object], Mapping[str, object], str]] = {}
-    report_context: dict[str, object] = {}
-    for path in source_reports:
-        report = _load_json(path, label="fresh source report")
-        report_sha256 = _sha256(path)
-        body = dict(report)
-        declared = body.pop("report_sha256", None)
-        if (
-            set(report) != {
-                "schema_version", "kind", "campaign_kind", "logical_stage", "round_id", "matrix_sha256",
-                "identity", "trials", "safety_failure", "report_sha256", "run_id",
-            }
-            or declared != hashlib.sha256(_canonical_bytes(body)).hexdigest()
-            or report.get("schema_version") != 1
-            or report.get("kind") != FRESH_SOURCE_REPORT_KIND
-            or report.get("campaign_kind") != FRESH_SOURCE_CAMPAIGN_KIND
-            or report.get("logical_stage") != FRESH_SOURCE_LOGICAL_STAGE
-            or not isinstance(report.get("round_id"), str)
-            or re.fullmatch(r"fresh-12k-[a-z0-9-]{1,112}", report["round_id"]) is None
-            or not isinstance(report.get("run_id"), str)
-            or re.fullmatch(r"fresh-run-[a-z0-9-]{1,112}", report["run_id"]) is None
-            or report.get("safety_failure") is not False
-            or not isinstance(report.get("identity"), Mapping)
-            or report["identity"] != {
-                "policy_repo": PARENT_POLICY_REPO,
-                "policy_revision": PARENT_REVISION,
-                "policy_step": 12_000,
-                "policy_artifact_sha256": PARENT_ARTIFACT_SHA256,
-            }
-            or not isinstance(report.get("matrix_sha256"), str)
-            or report["matrix_sha256"] not in matrices
-            or not isinstance(report.get("trials"), list)
-        ):
-            raise ValueError("fresh source report is not authenticated for the exact 12K policy")
-        matrix_rows = matrices[report["matrix_sha256"]][1]
-        for trial in report["trials"]:
-            if not isinstance(trial, Mapping):
-                raise ValueError("fresh source report trial is malformed")
-            attempt_id = trial.get("attempt_id")
-            matrix_row = matrix_rows.get(attempt_id) if isinstance(attempt_id, str) else None
-            is_success = (
-                trial.get("accepted_success") is True
-                and trial.get("official_success") is True
-                and trial.get("outcome") == "success"
-            )
-            is_policy_failure = (
-                trial.get("accepted_success") is False
-                and trial.get("official_success") is False
-                and trial.get("outcome") == "failure"
-            )
-            if (
-                attempt_id in report_trials
-                or matrix_row is None
-                or trial.get("category") != matrix_row.get("category")
-                or trial.get("garment_name") != matrix_row.get("garment_name")
-                or type(trial.get("accepted_success")) is not bool
-                or type(trial.get("official_success")) is not bool
-                or not (is_success or is_policy_failure)
-                or trial.get("simulator_device") != "cpu"
-                or trial.get("cloth_device") != "cpu"
-                or any(
-                    not isinstance(trial.get(field), str)
-                    or _CUDA_DEVICE.fullmatch(str(trial[field])) is None
-                    for field in ("renderer_device", "camera_device", "policy_device")
-                )
-                or len({trial.get("renderer_device"), trial.get("camera_device"), trial.get("policy_device")}) != 1
-                or any(trial.get(field) is not False for field in (
-                    "safety_failure", "numerical_failure", "cloth_failure",
-                ))
-                or (
-                    is_success and (
-                        not isinstance(trial.get("artifact_sha256"), str)
-                        or _SHA256.fullmatch(trial["artifact_sha256"]) is None
-                        or not isinstance(trial.get("hub_sync_receipt_sha256"), str)
-                        or _SHA256.fullmatch(trial["hub_sync_receipt_sha256"]) is None
-                    )
-                )
-                or trial.get("remote_prefix") != f"rollout-rounds/{report['round_id']}/{attempt_id}"
-                or trial.get("campaign_round_id") != report["round_id"]
-                or trial.get("campaign_run_id") != report["run_id"]
-            ):
-                raise ValueError("fresh source report trial is not an eligible CPU source")
-            report_trials[attempt_id] = (trial, report, report_sha256)
-            report_context[attempt_id] = {
-                "source_report_path": str(path),
-                "source_report_sha256": report_sha256,
-                "source_matrix_path": str(matrices[report["matrix_sha256"]][0]),
-                "source_matrix_sha256": report["matrix_sha256"],
-                "source_matrix_rows": matrix_rows,
-                "source_round_id": report["round_id"],
-                "source_run_id": report["run_id"],
-            }
-    if set(report_trials) != matrix_attempts:
-        raise ValueError("every fresh source must appear in exactly one report and source matrix")
+    report_context = authenticate_fresh_source_contract(source_reports, source_matrices)
+    report_trials = {
+        attempt_id: (
+            context["trial"], context["report"], context["source_report_sha256"],
+        )
+        for attempt_id, context in report_context.items()
+    }
 
     grouped = _successes(
-        accepted_roots, require_every_category=False, require_cpu=True, require_annotations=True
+        accepted_roots, require_every_category=False, require_cpu=True, require_annotations=False
     )
     parents_by_attempt = {
         str(parent["parent_episode_id"]): parent
@@ -555,38 +437,21 @@ def _fresh_source_parents(
                 category for category in CATEGORIES if parent in grouped[category]
             )
             or trial.get("garment_name") != parent["garment"]
-            or trial.get("artifact_sha256") != parent["episode_sha256"]
             or source_matrix_rows[attempt_id].get("campaign_round_id") != report["round_id"]
             or source_matrix_rows[attempt_id].get("campaign_run_id") != report["run_id"]
         ):
             raise ValueError("fresh source success identity is not authenticated")
         receipt_path = Path(parent["accepted_root"]).parent / "hf-sync-receipts" / f"{attempt_id}.sync.json"
-        receipt = _load_json(receipt_path, label="fresh source Hub sync receipt")
-        if (
-            _sha256(receipt_path) != trial.get("hub_sync_receipt_sha256")
-            or receipt.get("readback_verified") is not True
-            or receipt.get("attempt_id") != attempt_id
-            or receipt.get("round_id") != report["round_id"]
-            or receipt.get("run_id") != report["run_id"]
-            or receipt.get("remote_prefix") != trial.get("remote_prefix")
-            or receipt.get("episode_sha256") != parent["episode_sha256"]
-            or not isinstance((episode := _load_json(
-                Path(parent["episode_root"]) / "raw" / attempt_id / "episode.json",
-                label="fresh source episode",
-            )).get("identity"), Mapping)
-            or episode["identity"].get("campaign_round_id") != report["round_id"]
-            or episode["identity"].get("campaign_run_id") != report["run_id"]
-            or not isinstance(receipt.get("immutable_revision"), str)
-            or re.fullmatch(r"[0-9a-f]{40}", receipt["immutable_revision"]) is None
-        ):
-            raise ValueError("fresh source Hub receipt does not bind the immutable artifact")
+        authenticated = authenticate_selected_fresh_source_artifacts(
+            episode_root=Path(parent["episode_root"]), receipt_path=receipt_path,
+            attempt_id=attempt_id,
+            category=next(category for category in CATEGORIES if parent in grouped[category]),
+            garment=str(parent["garment"]), trial=trial, report=report,
+        )
         parent.update(
             {
                 **report_context[attempt_id],
-                "source_receipt_sha256": _sha256(receipt_path),
-                "source_receipt_path": str(receipt_path),
-                "source_remote_prefix": receipt["remote_prefix"],
-                "source_immutable_revision": receipt["immutable_revision"],
+                **authenticated,
                 "source_run_id": report["run_id"],
                 "fresh_success_rate": fresh_rates[(str(trial["category"]), str(trial["garment_name"]))][0]
                 / fresh_rates[(str(trial["category"]), str(trial["garment_name"]))][1],
@@ -769,13 +634,13 @@ def build_success_replay_matrix(
             if fresh_mode:
                 row.update(
                     {
-                        "source_episode_sha256": parent["episode_sha256"],
-                        "source_episode_root": str(parent["episode_root"]),
-                        "source_episode_path": str(parent["episode_path"]),
-                        "source_reset_sha256": parent["reset_sha256"],
-                        "source_annotations_sha256": parent["annotations_sha256"],
-                        "source_continuation_snapshot_sha256": parent["restore_snapshot_sha256"],
-                        "source_state_fingerprint": parent["continuation_state_fingerprint"],
+                        "source_episode_sha256": parent["source_episode_sha256"],
+                        "source_episode_root": parent["source_episode_root"],
+                        "source_episode_path": parent["source_episode_path"],
+                        "source_reset_sha256": parent["source_reset_sha256"],
+                        "source_annotations_sha256": parent["source_annotations_sha256"],
+                        "source_continuation_snapshot_sha256": parent["source_continuation_snapshot_sha256"],
+                        "source_state_fingerprint": parent["source_state_fingerprint"],
                         "source_report_sha256": parent["source_report_sha256"],
                         "source_report_path": parent["source_report_path"],
                         "source_matrix_sha256": parent["source_matrix_sha256"],
