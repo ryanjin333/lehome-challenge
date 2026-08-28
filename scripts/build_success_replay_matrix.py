@@ -398,6 +398,7 @@ def _fresh_source_parents(
                 "source_report_sha256": report_sha256,
                 "source_matrix_path": str(matrices[report["matrix_sha256"]][0]),
                 "source_matrix_sha256": report["matrix_sha256"],
+                "source_matrix_rows": matrix_rows,
                 "source_round_id": report["round_id"],
                 "source_run_id": report["run_id"],
             }
@@ -425,6 +426,9 @@ def _fresh_source_parents(
 
     for attempt_id, parent in parents_by_attempt.items():
         trial, report, report_sha256 = report_trials[attempt_id]
+        source_matrix_rows = report_context[attempt_id]["source_matrix_rows"]
+        if not isinstance(source_matrix_rows, Mapping):
+            raise ValueError("fresh source report matrix binding is malformed")
         if (
             trial.get("accepted_success") is not True
             or trial.get("outcome") != "success"
@@ -434,8 +438,8 @@ def _fresh_source_parents(
             )
             or trial.get("garment_name") != parent["garment"]
             or trial.get("artifact_sha256") != parent["episode_sha256"]
-            or matrix_rows[attempt_id].get("campaign_round_id") != report["round_id"]
-            or matrix_rows[attempt_id].get("campaign_run_id") != report["run_id"]
+            or source_matrix_rows[attempt_id].get("campaign_round_id") != report["round_id"]
+            or source_matrix_rows[attempt_id].get("campaign_run_id") != report["run_id"]
         ):
             raise ValueError("fresh source success identity is not authenticated")
         receipt_path = Path(parent["accepted_root"]).parent / "hf-sync-receipts" / f"{attempt_id}.sync.json"
@@ -648,6 +652,7 @@ def build_success_replay_matrix(
                 row.update(
                     {
                         "source_episode_sha256": parent["episode_sha256"],
+                        "source_episode_root": str(parent["episode_root"]),
                         "source_episode_path": str(parent["episode_path"]),
                         "source_reset_sha256": parent["reset_sha256"],
                         "source_annotations_sha256": parent["annotations_sha256"],

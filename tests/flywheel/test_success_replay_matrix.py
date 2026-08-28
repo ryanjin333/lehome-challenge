@@ -712,3 +712,26 @@ def test_fresh_visual_only_mode_emits_a_category_shortage_without_borrowing_sour
     assert len(rows) == 300
     assert all(row["category"] != "pant_short" for row in rows)
     assert receipt["shortages"] == [{"category": "pant_short", "reason": "no_eligible_source"}]
+
+
+def test_fresh_visual_only_mode_binds_each_parent_to_its_own_report_matrix_pair(tmp_path: Path) -> None:
+    from scripts.build_success_replay_matrix import build_success_replay_matrix
+
+    first, second = tmp_path / "one" / "accepted", tmp_path / "two" / "accepted"
+    for index, category in enumerate(CATEGORIES):
+        root = first if index < 2 else second
+        _write_success(root, attempt_id=f"fresh-{category}", category=category, garment=f"{category.title().replace('_', '_')}_Seen_{index}")
+    first_report, first_matrix = _write_fresh_sources(first)
+    second_report, second_matrix = _write_fresh_sources(second)
+
+    output = tmp_path / "matrix.json"
+    build_success_replay_matrix(
+        accepted_roots=(first, second), output=output,
+        source_reports=(first_report, second_report), source_matrices=(first_matrix, second_matrix),
+        strategy="visual_only", attempt_cap_per_category=100, acceptance_cap_per_category=50,
+        max_attempts=400, target_accepted=200, rng_seed=20260827400,
+    )
+
+    rows = json.loads(output.read_text(encoding="utf-8"))
+    assert {row["source_report_path"] for row in rows} == {str(first_report), str(second_report)}
+    assert {row["source_matrix_path"] for row in rows} == {str(first_matrix), str(second_matrix)}

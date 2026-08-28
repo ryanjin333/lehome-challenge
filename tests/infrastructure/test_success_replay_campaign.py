@@ -83,8 +83,15 @@ def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dic
     source_episodes: dict[str, Path] = {}
     source_snapshots: dict[str, Path] = {}
     source_receipts: dict[str, Path] = {}
+    source_roots: dict[str, Path] = {}
+    source_digests: dict[str, str] = {}
     for category in ("top_long", "top_short", "pant_long", "pant_short"):
-        episode = tmp_path / f"parent-{category}.episode.json"
+        attempt = f"parent-{category}"
+        root = tmp_path / f"accepted-{category}"
+        raw = root / "raw" / attempt
+        snapshots = raw / "snapshots"
+        snapshots.mkdir(parents=True)
+        episode = raw / "episode.json"
         episode.write_text(
             json.dumps(
                 {
@@ -97,12 +104,26 @@ def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dic
             ),
             encoding="utf-8",
         )
-        snapshot = tmp_path / f"parent-{category}.000016.json"
+        reset = snapshots / "reset.json"
+        reset.write_text(json.dumps({"randomization": {"strategy": "canonical"}}), encoding="utf-8")
+        annotations = raw / "annotations.jsonl"
+        annotations.write_text('{"step":0,"action":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"success":true}\n', encoding="utf-8")
+        snapshot = snapshots / "continuations" / "000016.json"
+        snapshot.parent.mkdir()
         snapshot.write_text(
-            json.dumps({"randomization": {"strategy": "canonical", "continuation_step": 16}}),
+            json.dumps({"robot_position": [0.0] * 12, "randomization": {"strategy": "canonical", "continuation_step": 16}}),
             encoding="utf-8",
         )
-        source_episodes[category], source_snapshots[category] = episode, snapshot
+        checksums = {}
+        for item in (episode, reset, annotations, snapshot):
+            checksums[item.relative_to(root).as_posix()] = {"sha256": hashlib.sha256(item.read_bytes()).hexdigest(), "size": item.stat().st_size}
+        (root / "SHA256SUMS.json").write_text(json.dumps(checksums), encoding="utf-8")
+        entries = [
+            {"relative_path": item.relative_to(root).as_posix(), "sha256": hashlib.sha256(item.read_bytes()).hexdigest(), "byte_size": item.stat().st_size}
+            for item in sorted((episode, reset, annotations, snapshot))
+        ]
+        source_digests[category] = hashlib.sha256((json.dumps(entries, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest()
+        source_episodes[category], source_snapshots[category], source_roots[category] = episode, snapshot, root
         receipt = tmp_path / f"parent-{category}.sync.json"
         receipt.write_text(
             json.dumps(
@@ -110,8 +131,9 @@ def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dic
                     "readback_verified": True,
                     "round_id": "fresh-12k-source-20260827",
                     "run_id": "fresh-run-20260827-a",
-                    "episode_sha256": "b" * 64,
+                    "episode_sha256": source_digests[category],
                     "remote_prefix": f"rollout-rounds/fresh-12k-source-20260827/parent-{category}",
+                    "immutable_revision": "a" * 40,
                 }
             ),
             encoding="utf-8",
@@ -136,7 +158,7 @@ def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dic
                 "garment_name": f"{category}-garment", "accepted_success": True,
                 "outcome": "success", "simulator_device": "cpu", "cloth_device": "cpu",
                 "safety_failure": False, "numerical_failure": False, "cloth_failure": False,
-                "artifact_sha256": "b" * 64,
+                "artifact_sha256": source_digests[category],
                 "hub_sync_receipt_sha256": hashlib.sha256(source_receipts[category].read_bytes()).hexdigest(),
                 "remote_prefix": f"rollout-rounds/fresh-12k-source-20260827/parent-{category}",
                 "campaign_round_id": "fresh-12k-source-20260827",
@@ -159,11 +181,16 @@ def _fresh_evidence_matrix(tmp_path: Path) -> tuple[list[dict[str, object]], dic
         row["source_report_sha256"] = source_report_sha
         row["source_matrix_sha256"] = source_matrix_sha
         row["source_episode_path"] = str(source_episodes[category])
+        row["source_episode_root"] = str(source_roots[category])
         row["restore_snapshot"] = str(source_snapshots[category])
         row["restore_snapshot_sha256"] = hashlib.sha256(source_snapshots[category].read_bytes()).hexdigest()
         row["source_continuation_snapshot_sha256"] = row["restore_snapshot_sha256"]
         row["source_receipt_path"] = str(source_receipts[category])
         row["source_receipt_sha256"] = hashlib.sha256(source_receipts[category].read_bytes()).hexdigest()
+        row["source_episode_sha256"] = source_digests[category]
+        row["source_reset_sha256"] = hashlib.sha256((source_roots[category] / "raw" / f"parent-{category}" / "snapshots" / "reset.json").read_bytes()).hexdigest()
+        row["source_annotations_sha256"] = hashlib.sha256((source_roots[category] / "raw" / f"parent-{category}" / "annotations.jsonl").read_bytes()).hexdigest()
+        row["source_state_fingerprint"] = hashlib.sha256(json.dumps({"category": category, "garment": f"{category}-garment", "state_rounding": "fixed_6dp", "state": ["0.000000"] * 12}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return rows, {
         "LEHOME_FRESH_SOURCE_REPORTS_JSON": json.dumps([{"path": str(source_report), "sha256": source_report_sha}]),
         "LEHOME_FRESH_SOURCE_MATRICES_JSON": json.dumps([{"path": str(source_matrix), "sha256": source_matrix_sha}]),

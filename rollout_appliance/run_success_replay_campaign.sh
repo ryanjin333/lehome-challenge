@@ -86,7 +86,7 @@ if not cap_mode and (len(rows) != 200 or counts != Counter({key: 50 for key in c
     raise SystemExit("legacy success replay matrix must contain 50 attempts per category")
 caps = {}
 fresh_fields = {
-    "source_episode_sha256", "source_episode_path", "source_reset_sha256", "source_annotations_sha256",
+    "source_episode_sha256", "source_episode_root", "source_episode_path", "source_reset_sha256", "source_annotations_sha256",
     "source_continuation_snapshot_sha256", "source_state_fingerprint",
     "source_report_sha256", "source_matrix_sha256", "source_receipt_sha256", "source_receipt_path",
     "source_remote_prefix", "source_immutable_revision", "source_round_id", "source_run_id",
@@ -133,7 +133,7 @@ if target_accepted == 200:
     for row in rows:
         if not fresh_fields <= set(row):
             raise SystemExit("200 accepted requires bound fresh-source provenance")
-        if any(not isinstance(row[field], str) or re.fullmatch(r"[0-9a-f]{64}", row[field]) is None for field in fresh_fields - {"source_episode_path", "source_report_path", "source_matrix_path", "source_receipt_path", "source_remote_prefix", "source_immutable_revision", "source_round_id", "source_run_id"}):
+        if any(not isinstance(row[field], str) or re.fullmatch(r"[0-9a-f]{64}", row[field]) is None for field in fresh_fields - {"source_episode_root", "source_episode_path", "source_report_path", "source_matrix_path", "source_receipt_path", "source_remote_prefix", "source_immutable_revision", "source_round_id", "source_run_id"}):
             raise SystemExit("200 accepted fresh-source hashes are invalid")
         if (
             not isinstance(row["source_round_id"], str)
@@ -203,6 +203,31 @@ if target_accepted == 200:
         if (not episode.is_absolute() or episode.is_symlink() or not episode.is_file()
                 or not snapshot.is_absolute() or snapshot.is_symlink() or not snapshot.is_file()
                 or not receipt.is_absolute() or receipt.is_symlink() or not receipt.is_file()): raise SystemExit("fresh source episode, snapshot, or receipt is missing")
+        root = Path(row.get("source_episode_root", "")); attempt = row.get("parent_episode_id")
+        if not root.is_absolute() or root.is_symlink() or not root.is_dir() or not isinstance(attempt, str): raise SystemExit("fresh source artifact root is missing")
+        reset = root / "raw" / attempt / "snapshots" / "reset.json"
+        annotations = root / "raw" / attempt / "annotations.jsonl"
+        expected_paths = {"episode": root / "raw" / attempt / "episode.json", "reset": reset, "annotations": annotations, "h16": snapshot}
+        manifest = root / "SHA256SUMS.json"
+        try: manifest_rows = json.loads(manifest.read_text(encoding="utf-8"), object_pairs_hook=strict_pairs)
+        except (OSError, ValueError) as error: raise SystemExit(f"fresh source checksum manifest is malformed: {error}")
+        if episode != expected_paths["episode"] or not isinstance(manifest_rows, dict): raise SystemExit("fresh source episode path is not canonical")
+        checked = {}
+        for name, item_path in expected_paths.items():
+            relative = item_path.relative_to(root).as_posix(); record = manifest_rows.get(relative)
+            if (item_path.is_symlink() or not item_path.is_file() or not isinstance(record, dict)
+                    or set(record) != {"sha256", "size"} or record.get("sha256") != __import__("hashlib").sha256(item_path.read_bytes()).hexdigest()
+                    or record.get("size") != item_path.stat().st_size): raise SystemExit("fresh source checksum manifest does not bind required evidence")
+            checked[name] = record["sha256"]
+        entries = []
+        for item_path in sorted(root.rglob("*")):
+            if item_path.is_symlink(): raise SystemExit("fresh source artifact contains a symlink")
+            if item_path.is_file() and item_path.name != "SHA256SUMS.json":
+                entries.append({"relative_path": item_path.relative_to(root).as_posix(), "sha256": __import__("hashlib").sha256(item_path.read_bytes()).hexdigest(), "byte_size": item_path.stat().st_size})
+        artifact = __import__("hashlib").sha256((json.dumps(entries, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest()
+        if (artifact != row.get("source_episode_sha256") or checked["reset"] != row.get("source_reset_sha256")
+                or checked["annotations"] != row.get("source_annotations_sha256") or checked["h16"] != row.get("source_continuation_snapshot_sha256")):
+            raise SystemExit("fresh source artifact hashes are not authenticated")
         if (__import__("hashlib").sha256(snapshot.read_bytes()).hexdigest() != row.get("restore_snapshot_sha256")
                 or row.get("restore_snapshot_sha256") != row.get("source_continuation_snapshot_sha256")):
             raise SystemExit("fresh source continuation snapshot binding is invalid")
@@ -213,6 +238,11 @@ if target_accepted == 200:
         try: receipt_json = json.loads(receipt.read_text(encoding="utf-8"), object_pairs_hook=strict_pairs)
         except ValueError as error: raise SystemExit(f"fresh source receipt is malformed: {error}")
         identity = episode_json.get("identity") if isinstance(episode_json, dict) else None
+        state = snapshot_json.get("robot_position") if isinstance(snapshot_json, dict) else None
+        if (not isinstance(state, list) or len(state) != 12
+                or any(type(value) not in (int, float) for value in state)):
+            raise SystemExit("fresh source continuation state is invalid")
+        state_fingerprint = __import__("hashlib").sha256(json.dumps({"category": row.get("category"), "garment": row.get("garment"), "state_rounding": "fixed_6dp", "state": ["0.000000" if float(value) == 0 else format(float(value), ".6f") for value in state]}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         if (not isinstance(identity, dict) or episode_json.get("randomization") != {"strategy": "canonical"}
             or identity.get("campaign_round_id") != row.get("source_round_id") or identity.get("campaign_run_id") != row.get("source_run_id")
             or snapshot_json.get("randomization") != {"strategy": "canonical", "continuation_step": 16}
@@ -220,7 +250,9 @@ if target_accepted == 200:
             or not isinstance(receipt_json, dict) or receipt_json.get("readback_verified") is not True
             or receipt_json.get("round_id") != row.get("source_round_id") or receipt_json.get("run_id") != row.get("source_run_id")
             or receipt_json.get("episode_sha256") != row.get("source_episode_sha256")
-            or receipt_json.get("remote_prefix") != row.get("source_remote_prefix")): raise SystemExit("fresh source canonical replay boundary is invalid")
+            or receipt_json.get("remote_prefix") != row.get("source_remote_prefix")
+            or receipt_json.get("immutable_revision") != row.get("source_immutable_revision")
+            or state_fingerprint != row.get("source_state_fingerprint")): raise SystemExit("fresh source canonical replay boundary is invalid")
 PY
 
 exec env \

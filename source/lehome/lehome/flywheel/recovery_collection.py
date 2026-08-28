@@ -703,7 +703,7 @@ def validate_success_replay_descriptor(
         "category_acceptance_cap",
     }
     fresh_provenance_fields = {
-        "source_episode_sha256", "source_episode_path", "source_reset_sha256", "source_annotations_sha256",
+        "source_episode_sha256", "source_episode_root", "source_episode_path", "source_reset_sha256", "source_annotations_sha256",
         "source_continuation_snapshot_sha256", "source_state_fingerprint",
         "source_report_sha256", "source_matrix_sha256", "source_receipt_sha256", "source_receipt_path",
         "source_remote_prefix", "source_immutable_revision", "source_round_id", "source_run_id",
@@ -747,7 +747,7 @@ def validate_success_replay_descriptor(
                     or _LOWERCASE_SHA256.fullmatch(row[field]) is None
                     for field in fresh_provenance_fields
                     - {
-                        "source_episode_path", "source_report_path", "source_matrix_path", "source_receipt_path",
+                        "source_episode_root", "source_episode_path", "source_report_path", "source_matrix_path", "source_receipt_path",
                         "source_remote_prefix", "source_immutable_revision", "source_round_id", "source_run_id",
                     }
                 )
@@ -761,6 +761,8 @@ def validate_success_replay_descriptor(
                 or not Path(row["source_matrix_path"]).is_absolute()
                 or not isinstance(row.get("source_episode_path"), str)
                 or not Path(row["source_episode_path"]).is_absolute()
+                or not isinstance(row.get("source_episode_root"), str)
+                or not Path(row["source_episode_root"]).is_absolute()
                 or not isinstance(row.get("source_receipt_path"), str)
                 or not Path(row["source_receipt_path"]).is_absolute()
                 or row.get("source_remote_prefix")
