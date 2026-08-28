@@ -30,7 +30,10 @@ from lehome.devices.action_process import preprocess_device_action
 from lehome.assets.object.Garment import GarmentObject
 from lehome.assets.collider_audit import audit_current_usd_stage
 from lehome.flywheel.fidelity import ClothFidelityError, fidelity_receipt
-from lehome.flywheel.persistent_worker import SimulatorNumericalDivergenceError
+from lehome.flywheel.persistent_worker import (
+    FidelityFailureError,
+    SimulatorNumericalDivergenceError,
+)
 from lehome.tasks.bedroom.challenge_garment_loader import ChallengeGarmentLoader
 from lehome.flywheel.isaac_camera import read_camera_world_pose, write_camera_world_pose
 import logging
@@ -2039,6 +2042,23 @@ class GarmentEnv(DirectRLEnv):
             raise RuntimeError("visual replay garment pose readback is invalid")
         return positions.copy(), velocities.copy(), pose.copy()
 
+    def _flywheel_prepare_randomization(
+        self, values: dict[str, object],
+    ) -> tuple[bool, tuple[np.ndarray, np.ndarray, np.ndarray] | None]:
+        """Capture visual replay before any scene mutation; restore only physical modes."""
+        from lehome.flywheel.randomization import VISUAL_ONLY_FIELDS
+
+        if set(values) == set(VISUAL_ONLY_FIELDS):
+            return True, self._flywheel_capture_visual_replay_state()
+        baseline = getattr(self, "_flywheel_randomization_baseline", None)
+        if baseline is None:
+            baseline = self._flywheel_capture_scene_state()
+            self._flywheel_randomization_baseline = baseline
+        # Physical randomization starts from a common canonical scene.  This is
+        # deliberately forbidden for exact visual success replay.
+        self._flywheel_restore_scene_state(baseline)
+        return False, None
+
     def _flywheel_verify_visual_replay_state(
         self,
         expected: tuple[np.ndarray, np.ndarray, np.ndarray],
@@ -2049,8 +2069,49 @@ class GarmentEnv(DirectRLEnv):
             np.array_equal(actual, target)
             for actual, target in zip(observed, expected, strict=True)
         ):
-            raise SimulatorNumericalDivergenceError(
-                "visual replay fidelity failure: cloth state or garment pose changed"
+            expected_positions, expected_velocities, expected_pose = expected
+            observed_positions, observed_velocities, observed_pose = observed
+
+            def max_delta(actual: np.ndarray, target: np.ndarray) -> float:
+                if actual.shape != target.shape:
+                    return float(np.finfo(np.float32).max)
+                values = np.abs(actual - target)
+                if not np.isfinite(values).all():
+                    return float(np.finfo(np.float32).max)
+                return float(np.max(values)) if values.size else 0.0
+
+            raise FidelityFailureError(
+                "safety_failure",
+                fidelity_receipt(
+                    missing_cloth=False, cloth_flight=False,
+                    nonfinite_cloth_state=False, safety_failure=True,
+                    monitor_active=True, monitor_observed=True,
+                ),
+                diagnostic={
+                    "stage": "reset_write_readback",
+                    "write_readback": {
+                        "max_position_delta_m": max_delta(
+                            observed_positions, expected_positions,
+                        ),
+                        "max_velocity_delta_mps": max_delta(
+                            observed_velocities, expected_velocities,
+                        ),
+                    },
+                    "visual_replay": {
+                        "max_cloth_position_delta_m": max_delta(
+                            observed_positions, expected_positions,
+                        ),
+                        "max_cloth_velocity_delta_mps": max_delta(
+                            observed_velocities, expected_velocities,
+                        ),
+                        "max_garment_translation_delta_m": max_delta(
+                            observed_pose[:3], expected_pose[:3],
+                        ),
+                        "max_garment_rotation_delta_deg": max_delta(
+                            observed_pose[3:], expected_pose[3:],
+                        ),
+                    },
+                },
             )
 
     def apply_flywheel_randomization(self, randomization) -> dict[str, object]:
@@ -2069,23 +2130,13 @@ class GarmentEnv(DirectRLEnv):
         if not values:
             self._flywheel_randomization_receipt = {}
             return {}
-        baseline = getattr(self, "_flywheel_randomization_baseline", None)
-        if baseline is None:
-            baseline = self._flywheel_capture_scene_state()
-            self._flywheel_randomization_baseline = baseline
-        # Every non-canonical strategy starts from the same exact scene.
-        self._flywheel_restore_scene_state(baseline)
-        from lehome.flywheel.randomization import (
-            VISUAL_ONLY_FIELDS,
-            randomization_materials_enabled,
-        )
+        from lehome.flywheel.randomization import randomization_materials_enabled
 
         materials_enabled = randomization_materials_enabled(values)
-        visual_only = set(values) == set(VISUAL_ONLY_FIELDS)
         if self.object is None:
             raise RuntimeError("cannot randomize an uninitialized garment")
-        visual_replay_state = (
-            self._flywheel_capture_visual_replay_state() if visual_only else None
+        visual_only, visual_replay_state = self._flywheel_prepare_randomization(
+            values,
         )
         stage = self.scene.stage
         table_input = None

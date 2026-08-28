@@ -122,7 +122,10 @@ def _validate_policy_action(value: object) -> dict[str, object]:
 def _validate_fidelity_diagnostic(diagnostic: object) -> dict[str, object]:
     """Validate the small closed schema allowed in durable fidelity events."""
 
-    allowed = {"stage", "step_index", "physical_health", "write_readback", "cached_reset_velocity", "policy_action"}
+    allowed = {
+        "stage", "step_index", "physical_health", "write_readback",
+        "cached_reset_velocity", "policy_action", "visual_replay",
+    }
     if not isinstance(diagnostic, Mapping) or not set(diagnostic) <= allowed:
         raise ValueError("fidelity diagnostic has invalid fields")
     stage = diagnostic.get("stage")
@@ -141,6 +144,8 @@ def _validate_fidelity_diagnostic(diagnostic: object) -> dict[str, object]:
         raise ValueError("fidelity diagnostic cached reset stage is invalid")
     if "policy_action" in diagnostic and stage != "policy_step":
         raise ValueError("fidelity diagnostic policy action stage is invalid")
+    if "visual_replay" in diagnostic and stage != "reset_write_readback":
+        raise ValueError("fidelity diagnostic visual replay stage is invalid")
 
     result: dict[str, object] = {"stage": stage}
     if "step_index" in diagnostic:
@@ -183,6 +188,18 @@ def _validate_fidelity_diagnostic(diagnostic: object) -> dict[str, object]:
             raise ValueError("fidelity diagnostic cached reset velocity has invalid fields")
         result["cached_reset_velocity"] = {
             field: _finite_float(cached[field], field=field) for field in sorted(expected)
+        }
+    if "visual_replay" in diagnostic:
+        visual_replay = diagnostic["visual_replay"]
+        expected = {
+            "max_cloth_position_delta_m", "max_cloth_velocity_delta_mps",
+            "max_garment_translation_delta_m", "max_garment_rotation_delta_deg",
+        }
+        if not isinstance(visual_replay, Mapping) or set(visual_replay) != expected:
+            raise ValueError("fidelity diagnostic visual replay has invalid fields")
+        result["visual_replay"] = {
+            field: _finite_float(visual_replay[field], field=field)
+            for field in sorted(expected)
         }
     if "policy_action" in diagnostic:
         result["policy_action"] = _validate_policy_action(diagnostic["policy_action"])

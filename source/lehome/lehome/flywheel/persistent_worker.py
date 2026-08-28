@@ -588,8 +588,11 @@ class PersistentRolloutWorker:
                             reason=POLICY_ACTION_SAFETY_REJECTION_REASON,
                         )
                         continue
+                    visual_replay = assignment.get("strategy") == "visual_only"
                     if isinstance(error, FidelityFailureError) and (
-                        self._simple_curriculum_collection or self._fidelity_diagnostic
+                        self._simple_curriculum_collection
+                        or self._fidelity_diagnostic
+                        or visual_replay
                     ):
                         abort = getattr(self._controller, "record_fidelity_abort", None)
                         if not callable(abort):
@@ -618,6 +621,8 @@ class PersistentRolloutWorker:
                             ) from error
                         if _is_source_discovery_assignment(assignment):
                             raise RuntimeError("source discovery fidelity abort") from error
+                        if visual_replay:
+                            raise RuntimeError("visual replay fidelity abort") from error
                         mode = "fidelity diagnostic" if self._fidelity_diagnostic else "simple curriculum campaign"
                         raise RuntimeError(f"{mode} fidelity abort") from error
                     if isinstance(error, InfrastructureInvalidAttemptError):

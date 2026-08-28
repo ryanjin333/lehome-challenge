@@ -541,6 +541,72 @@ def test_marker_false_downgrades_a_structured_fidelity_error_to_generic_infrastr
     ]
 
 
+def test_visual_only_fidelity_failure_terminalizes_the_campaign_without_retrying(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import FidelityFailureError, PersistentRolloutWorker
+
+    class FidelityController(FakeController):
+        def __init__(self) -> None:
+            super().__init__([
+                Lease(Attempt("attempt-a", {
+                    "garment": "Top_Long_Seen_0", "seed": 11,
+                    "strategy": "visual_only",
+                }), "lease-a"),
+                Lease(Attempt("attempt-b", {
+                    "garment": "Top_Long_Seen_1", "seed": 12,
+                    "strategy": "visual_only",
+                }), "lease-b"),
+            ])
+            self.fidelity_aborts: list[dict[str, object]] = []
+            self.infrastructure_aborts: list[str] = []
+
+        def record_fidelity_abort(self, _worker_id, _attempt_id, _lease_id, **kwargs):
+            self.fidelity_aborts.append(kwargs)
+            return "infrastructure_abort"
+
+        def record_infrastructure_abort(self, _worker_id, _attempt_id, _lease_id, *, reason):
+            self.infrastructure_aborts.append(reason)
+            return "infrastructure_abort"
+
+    class DriftingVisualReplaySession(FakeSession):
+        def run_episode(self, **_kwargs):
+            raise FidelityFailureError(
+                "safety_failure",
+                {
+                    "missing_cloth": False, "cloth_flight": False,
+                    "nonfinite_cloth_state": False, "safety_failure": True,
+                    "monitor_active": True, "monitor_observed": True,
+                },
+                diagnostic={
+                    "stage": "reset_write_readback",
+                    "write_readback": {
+                        "max_position_delta_m": 0.25,
+                        "max_velocity_delta_mps": 0.5,
+                    },
+                    "visual_replay": {
+                        "max_cloth_position_delta_m": 0.25,
+                        "max_cloth_velocity_delta_mps": 0.5,
+                        "max_garment_translation_delta_m": 0.0,
+                        "max_garment_rotation_delta_deg": 2.0,
+                    },
+                },
+            )
+
+    controller = FidelityController()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=DriftingVisualReplaySession, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+    )
+
+    with pytest.raises(RuntimeError, match="visual replay fidelity abort"):
+        worker.run()
+
+    assert len(controller.fidelity_aborts) == 1
+    assert controller.fidelity_aborts[0]["fidelity_code"] == "safety_failure"
+    assert controller.infrastructure_aborts == []
+    assert len(controller._leases) == 1
+
+
 @pytest.mark.parametrize("failure_site", ["prepare", "contact", "snapshot", "post_runtime"])
 @pytest.mark.parametrize("simple_curriculum_collection", [False, True])
 def test_worker_translates_raw_cloth_fidelity_errors_at_every_episode_boundary(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
+import numpy as np
 import pytest
 import lehome.flywheel.randomization as randomization
 
@@ -115,15 +117,135 @@ def test_visual_only_profile_is_deterministic_and_strictly_physics_invariant() -
     })
 
 
-def test_visual_only_runtime_readback_fails_closed_on_cloth_or_pose_drift() -> None:
+def _visual_replay_methods() -> dict[str, object]:
     source = (
         Path(__file__).resolve().parents[2]
         / "source/lehome/lehome/tasks/bedroom/garment_bi_v2.py"
     ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    names = {
+        "_flywheel_capture_visual_replay_state",
+        "_flywheel_prepare_randomization",
+        "_flywheel_verify_visual_replay_state",
+    }
+    garment_env = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "GarmentEnv"
+    )
+    methods = [
+        node for node in garment_env.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    if {method.name for method in methods} != names:
+        pytest.fail("visual replay helpers are missing")
+    from lehome.flywheel.fidelity import fidelity_receipt
+    from lehome.flywheel.persistent_worker import FidelityFailureError
 
-    assert "_flywheel_capture_visual_replay_state" in source
-    assert "visual replay fidelity failure" in source
-    assert "np.array_equal" in source
+    module = ast.Module(body=methods, type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {
+        "np": np,
+        "FidelityFailureError": FidelityFailureError,
+        "fidelity_receipt": fidelity_receipt,
+    }
+    exec(compile(module, str(Path(__file__)), "exec"), namespace)
+    return namespace
+
+
+def test_visual_only_captures_before_scene_writes_and_preserves_physical_state() -> None:
+    methods = _visual_replay_methods()
+
+    class Object:
+        def __init__(self, env) -> None:
+            self.env = env
+
+        def get_all_pose(self):
+            self.env.events.append("pose_read")
+            return {"Garment": self.env.pose.copy()}
+
+    class Env:
+        _flywheel_capture_visual_replay_state = methods["_flywheel_capture_visual_replay_state"]
+        _flywheel_prepare_randomization = methods["_flywheel_prepare_randomization"]
+        _flywheel_verify_visual_replay_state = methods["_flywheel_verify_visual_replay_state"]
+
+        def __init__(self) -> None:
+            self.device = "cpu"
+            self.events: list[str] = []
+            self.positions = np.array([[0.1, 0.2, 0.3]], dtype=np.float32)
+            self.velocities = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+            self.pose = np.array([0.0, 0.0, 0.67, 0.0, 0.0, 90.0], dtype=np.float32)
+            self.object = Object(self)
+
+        def _flywheel_legacy_cpu_cloth_state(self):
+            self.events.append("cloth_read")
+            return self.positions.copy(), self.velocities.copy()
+
+        def _flywheel_capture_scene_state(self):
+            self.events.append("scene_capture")
+            return {"baseline": True}
+
+        def _flywheel_restore_scene_state(self, _baseline):
+            self.events.append("scene_restore")
+
+    env = Env()
+    sampled = dict(sample_randomization("visual_only", seed=140).values)
+    visual_only, pre_randomization = env._flywheel_prepare_randomization(sampled)
+
+    assert visual_only is True
+    assert pre_randomization is not None
+    assert env.events == ["cloth_read", "pose_read"]
+    env.events.append("visual_mutation")
+    env._flywheel_verify_visual_replay_state(pre_randomization)
+    assert env.events == ["cloth_read", "pose_read", "visual_mutation", "cloth_read", "pose_read"]
+
+
+def test_visual_only_drift_raises_typed_fidelity_failure_with_bounded_readback() -> None:
+    methods = _visual_replay_methods()
+    from lehome.flywheel.persistent_worker import FidelityFailureError
+
+    class Object:
+        def __init__(self, env) -> None:
+            self.env = env
+
+        def get_all_pose(self):
+            return {"Garment": self.env.pose.copy()}
+
+    class Env:
+        _flywheel_capture_visual_replay_state = methods["_flywheel_capture_visual_replay_state"]
+        _flywheel_verify_visual_replay_state = methods["_flywheel_verify_visual_replay_state"]
+
+        def __init__(self) -> None:
+            self.device = "cpu"
+            self.positions = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+            self.velocities = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+            self.pose = np.array([0.0, 0.0, 0.67, 0.0, 0.0, 90.0], dtype=np.float32)
+            self.object = Object(self)
+
+        def _flywheel_legacy_cpu_cloth_state(self):
+            return self.positions.copy(), self.velocities.copy()
+
+    env = Env()
+    pre_randomization = env._flywheel_capture_visual_replay_state()
+    env.positions[0, 0] = 0.25
+    env.velocities[0, 1] = 0.5
+    env.pose[5] += 2.0
+
+    with pytest.raises(FidelityFailureError) as error:
+        env._flywheel_verify_visual_replay_state(pre_randomization)
+    assert error.value.fidelity_code == "safety_failure"
+    assert error.value.diagnostic == {
+        "stage": "reset_write_readback",
+        "write_readback": {
+            "max_position_delta_m": 0.25,
+            "max_velocity_delta_mps": 0.5,
+        },
+        "visual_replay": {
+            "max_cloth_position_delta_m": 0.25,
+            "max_cloth_velocity_delta_mps": 0.5,
+            "max_garment_translation_delta_m": 0.0,
+            "max_garment_rotation_delta_deg": 2.0,
+        },
+    }
 
 
 def test_geometry_receipt_still_fails_closed_on_missing_or_extra_readback() -> None:
