@@ -86,15 +86,17 @@ ssh -o ClearAllForwardings=yes "${LEHOME_VM_SSH_TARGET:?set approved SSH target}
 printf 'staged reviewed revision: %s\n' "$LEHOME_REVIEWED_REVISION"
 ```
 
-Carry that exact revision into every remote shell explicitly; do not recompute it
-on the VM:
+Open one persistent remote shell with that exact revision exported; run every
+remaining Section 3 block and the paid command in this same shell until the
+collection reaches its terminal outcome. Do not recompute the revision on the
+VM or open a fresh unparameterized shell:
 
 ```bash
-ssh -o ClearAllForwardings=yes "${LEHOME_VM_SSH_TARGET:?set approved SSH target}" \
-  "LEHOME_REVIEWED_REVISION='$LEHOME_REVIEWED_REVISION' bash -lc 'test -n \"\$LEHOME_REVIEWED_REVISION\"'"
+ssh -tt -o ClearAllForwardings=yes "${LEHOME_VM_SSH_TARGET:?set approved SSH target}" \
+  "export LEHOME_REVIEWED_REVISION='$LEHOME_REVIEWED_REVISION'; exec bash -l"
 ```
 
-Then log in to that same approved VM with that exported value and run:
+In that same remote shell, run:
 
 ```bash
 set -euo pipefail

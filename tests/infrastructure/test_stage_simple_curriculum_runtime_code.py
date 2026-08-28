@@ -161,6 +161,7 @@ def test_runbook_carries_the_current_staged_revision_without_a_pinned_literal() 
     text = (ROOT / "docs/experiments/2026-08-27-simple-curriculum-runbook.md").read_text(encoding="utf-8")
     assert 'LEHOME_REVIEWED_REVISION="$(git rev-parse HEAD)"' in text
     assert '"${LEHOME_REVIEWED_REVISION:?carry the staged revision from the operator command}"' in text
-    assert "LEHOME_REVIEWED_REVISION='$LEHOME_REVIEWED_REVISION' bash -lc" in text
+    assert "export LEHOME_REVIEWED_REVISION='$LEHOME_REVIEWED_REVISION'; exec bash -l" in text
+    assert "remaining Section 3 block and the paid command in this same shell" in text
     assert text.index("mountpoint -q /mnt/lehome") < text.index("stage_simple_curriculum_runtime_code.sh")
     assert "551a85e2105003365a7c33a26af1d5f5924181d7" not in text
