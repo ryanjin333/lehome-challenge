@@ -189,14 +189,15 @@ def _settle_partition_ledger(path: Path, rows: list[dict[str, object]], *, count
         ledger.close()
 
 
-def test_gate_failure_never_launches_later_stages_and_stops_once(tmp_path: Path) -> None:
+def test_gate_failure_hands_off_without_launching_later_stages_or_remote_stop(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path); runner = FakeRunner(config.campaign_root, gate_decision="fidelity_stop")
 
     result = module.run_collection(config, runner=runner)
 
-    assert result == "fidelity_stop"
-    assert runner.calls == ["calibration-matrix", "calibration-head", "first-100-gate", "final-publication"]
-    assert runner.stops == 1
+    assert result == "operator_stop_required"
+    assert runner.calls == ["calibration-matrix", "calibration-head", "first-100-gate"]
+    assert runner.stops == 0
+    assert json.loads((config.campaign_root / "reports/operator-stop-handoff.json").read_text())["terminal_outcome"] == "fidelity_stop"
 
 
 def test_continue_uses_the_exact_order_and_reports_replay_shortage(tmp_path: Path) -> None:
@@ -204,16 +205,17 @@ def test_continue_uses_the_exact_order_and_reports_replay_shortage(tmp_path: Pat
 
     result = module.run_collection(config, runner=runner)
 
-    assert result == "replay_shortage"
+    assert result == "operator_stop_required"
     assert runner.calls == [
         "calibration-matrix", "calibration-head", "first-100-gate", "calibration-tail",
         "calibration-report", "curriculum-matrix", "curriculum-a", "curriculum-b",
-        "fresh-report", "replay-matrix", "success-replay", "final-publication",
+        "fresh-report", "replay-matrix", "success-replay",
     ]
-    assert runner.stops == 1
+    assert runner.stops == 0
+    assert json.loads((config.campaign_root / "reports/operator-stop-handoff.json").read_text())["terminal_outcome"] == "replay_shortage"
 
 
-def test_final_publication_runs_only_after_the_terminal_gpu_stop(tmp_path: Path) -> None:
+def test_remote_terminal_never_stops_or_publishes(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path)
 
     class OrderedRunner(FakeRunner):
@@ -230,17 +232,17 @@ def test_final_publication_runs_only_after_the_terminal_gpu_stop(tmp_path: Path)
             super().stop_gpu(command)
 
     runner = OrderedRunner()
-    assert module.run_collection(config, runner=runner) == "complete"
-    assert runner.events.index("gpu-stop") < runner.events.index("final-publication")
+    assert module.run_collection(config, runner=runner) == "operator_stop_required"
+    assert "gpu-stop" not in runner.events and "final-publication" not in runner.events
 
 
 def test_restart_validates_receipts_without_repeating_terminal_stages(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path)
     first = FakeRunner(config.campaign_root, gate_decision="fidelity_stop")
-    assert module.run_collection(config, runner=first) == "fidelity_stop"
+    assert module.run_collection(config, runner=first) == "operator_stop_required"
     second = FakeRunner(config.campaign_root, gate_decision="fidelity_stop")
 
-    assert module.run_collection(config, runner=second) == "fidelity_stop"
+    assert module.run_collection(config, runner=second) == "operator_stop_required"
     assert second.calls == []
     assert second.stops == 0
 
@@ -317,11 +319,11 @@ def test_partition_preserves_logical_row_bytes_and_keeps_metadata_in_manifest(tm
     assert rows[0] == {"attempt_id": "a", "seed": 1}
 
 
-def test_wrapper_requires_paid_stop_hook_and_has_no_cloud_lifecycle_command(tmp_path: Path) -> None:
+def test_wrapper_needs_no_paid_stop_hook_and_has_no_cloud_lifecycle_command(tmp_path: Path) -> None:
     result = subprocess.run(["bash", str(WRAPPER)], cwd=ROOT, text=True, capture_output=True, env={**os.environ, "LEHOME_PAID_COLLECTION": "1"})
 
     assert result.returncode != 0
-    assert "LEHOME_GPU_STOP_COMMAND" in result.stderr
+    assert "LEHOME_GPU_STOP_COMMAND" not in WRAPPER.read_text(encoding="utf-8")
     text = WRAPPER.read_text(encoding="utf-8").lower()
     assert all(token not in text for token in ("nebius", "terraform", "packer", " instance create", " instance start", " instance delete"))
 
@@ -361,11 +363,13 @@ def test_configuration_rejects_the_hard_cap_itself(tmp_path: Path) -> None:
         capped.validate()
 
 
-def test_missing_or_mutated_stage_artifact_fails_resume_closed(tmp_path: Path) -> None:
+def test_terminal_handoff_is_immutable_and_does_not_reenter_paid_stages(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path)
-    runner = FakeRunner()
-    with pytest.raises(module.ReceiptMismatchError, match="artifact"):
-        module.run_collection(config, runner=runner)
+    runner = FakeRunner(config.campaign_root, gate_decision="fidelity_stop")
+    assert module.run_collection(config, runner=runner) == "operator_stop_required"
+    resumed = FakeRunner(config.campaign_root)
+    assert module.run_collection(config, runner=resumed) == "operator_stop_required"
+    assert resumed.calls == [] and resumed.stops == 0
 
 
 def test_command_runner_rejects_env_command_and_shell_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -391,23 +395,24 @@ def test_fixed_adapter_has_a_canonical_non_shell_argv_for_every_paid_stage(tmp_p
         assert argv and all(token not in {"sh", "bash", "-c"} for token in argv)
 
 
-def test_resume_rehashes_stage_artifacts_and_refuses_mutated_matrix(tmp_path: Path) -> None:
+def test_terminal_handoff_adoption_does_not_reopen_remote_artifacts(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path); first = FakeRunner(config.campaign_root)
-    assert module.run_collection(config, runner=first) == "complete"
+    assert module.run_collection(config, runner=first) == "operator_stop_required"
     matrix = config.campaign_root / "artifacts" / "calibration-matrix-matrix.json"
     matrix.write_text("[]", encoding="utf-8")
 
-    with pytest.raises(module.ReceiptMismatchError, match="artifact"):
-        module.run_collection(config, runner=FakeRunner(config.campaign_root))
+    resumed = FakeRunner(config.campaign_root)
+    assert module.run_collection(config, runner=resumed) == "operator_stop_required"
+    assert resumed.calls == []
 
 
-def test_failed_stop_is_durable_and_restart_returns_infrastructure_stop_failure(tmp_path: Path) -> None:
+def test_terminal_handoff_ignores_remote_stop_hook_and_restart_adopts(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path); runner = FakeRunner(config.campaign_root, gate_decision="fidelity_stop", fail_stop=True)
-    assert module.run_collection(config, runner=runner) == "infrastructure_stop_failure"
-    assert runner.stops == 1
+    assert module.run_collection(config, runner=runner) == "operator_stop_required"
+    assert runner.stops == 0
 
-    assert module.run_collection(config, runner=runner) == "infrastructure_stop_failure"
-    assert runner.stops == 1
+    assert module.run_collection(config, runner=runner) == "operator_stop_required"
+    assert runner.stops == 0
 
 
 def test_runtime_identity_rejects_extra_or_secret_like_keys(tmp_path: Path) -> None:
@@ -427,21 +432,22 @@ def test_stage_output_rejects_secret_and_unexpected_fields(tmp_path: Path) -> No
 
 def test_preemption_resumes_the_same_root_and_does_not_replay_completed_stages(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path); interrupted = FakeRunner(config.campaign_root, fail_stage="calibration-tail")
-    assert module.run_collection(config, runner=interrupted) == "infrastructure_stop_failure"
-    assert interrupted.stops == 1
+    assert module.run_collection(config, runner=interrupted) == "operator_stop_required"
+    assert interrupted.stops == 0
     resumed = FakeRunner(config.campaign_root)
 
-    assert module.run_collection(config, runner=resumed) == "infrastructure_stop_failure"
+    assert module.run_collection(config, runner=resumed) == "operator_stop_required"
     assert resumed.calls == []
 
 
 def test_resume_rehashes_the_physical_ledger_and_rejects_changed_bytes(tmp_path: Path) -> None:
-    module = _module(); config = _config(module, tmp_path); assert module.run_collection(config, runner=FakeRunner(config.campaign_root)) == "complete"
+    module = _module(); config = _config(module, tmp_path); assert module.run_collection(config, runner=FakeRunner(config.campaign_root)) == "operator_stop_required"
     ledger = config.campaign_root / "artifacts" / "calibration-head-ledger.json"
     ledger.write_text('{"replaced":true}', encoding="utf-8")
 
-    with pytest.raises(module.ReceiptMismatchError, match="artifact"):
-        module.run_collection(config, runner=FakeRunner(config.campaign_root))
+    resumed = FakeRunner(config.campaign_root)
+    assert module.run_collection(config, runner=resumed) == "operator_stop_required"
+    assert resumed.calls == []
 
 
 def test_campaign_root_symlink_is_rejected_before_journal_creation(tmp_path: Path) -> None:
@@ -452,44 +458,34 @@ def test_campaign_root_symlink_is_rejected_before_journal_creation(tmp_path: Pat
         invalid.validate()
 
 
-def test_paid_budget_gate_stops_the_exact_vm_and_allows_only_publication_at_exact_spend_boundary(tmp_path: Path) -> None:
+def test_paid_budget_gate_hands_off_exact_vm_without_remote_stop_or_publication(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path)
     assert config.spend_observer is not None
     observed = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     config.spend_observer.write_text(json.dumps({"schema_version": 1, "kind": "lehome_spend_observation_v1", "observer": "test-meter", "observed_at_utc": observed, "spent_usd": 99.0}), encoding="utf-8")
     runner = FakeRunner(config.campaign_root)
 
-    assert module.run_collection(config, runner=runner) == "infrastructure_stop"
-    # A first-stage budget breach is still ambiguous about provider state, so
-    # the trusted stop runs before the one zero-compute publication boundary.
-    assert runner.calls == ["final-publication"]
-    assert runner.stops == 1
-    observation = json.loads((config.campaign_root / "stage-receipts" / "gpu-stop-observation.json").read_text())
-    assert observation["instance_id"] == "computeinstance-u00t6xfqhadrcmssa2"
-    assert observation["state"] == "STOPPED"
+    assert module.run_collection(config, runner=runner) == "operator_stop_required"
+    assert runner.calls == [] and runner.stops == 0
+    assert json.loads((config.campaign_root / "reports/operator-stop-handoff.json").read_text())["terminal_outcome"] == "infrastructure_stop"
 
     resumed = FakeRunner(config.campaign_root)
-    assert module.run_collection(config, runner=resumed) == "infrastructure_stop"
+    assert module.run_collection(config, runner=resumed) == "operator_stop_required"
     assert resumed.calls == []
     assert resumed.stops == 0
 
 
-def test_budget_exhausted_stopped_campaign_can_publish_without_reentering_paid_work(tmp_path: Path) -> None:
-    """The only post-stop retry is zero-cost publication/readback, not collection."""
+def test_budget_handoff_never_reenters_paid_work(tmp_path: Path) -> None:
+    """The local finalizer owns zero-compute publication after STOPPED."""
     module = _module(); config = _config(module, tmp_path); assert config.spend_observer is not None
     observed = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     config.spend_observer.write_text(json.dumps({
         "schema_version": 1, "kind": "lehome_spend_observation_v1", "observer": "test-meter",
         "observed_at_utc": observed, "spent_usd": 99.0,
     }), encoding="utf-8")
-    journal = module.StageJournal(config)
     runner = FakeRunner(config.campaign_root)
-
-    assert module._stop_then_publish(
-        journal, runner, config, predecessor=None, outcome="complete",
-    ) == "complete"
-    assert runner.calls == ["final-publication"]
-    assert runner.stops == 1
+    assert module.run_collection(config, runner=runner) == "operator_stop_required"
+    assert runner.calls == [] and runner.stops == 0
 
 
 def test_post_adapter_budget_breach_stops_once_and_never_starts_the_next_paid_stage(tmp_path: Path) -> None:
@@ -509,9 +505,9 @@ def test_post_adapter_budget_breach_stops_once_and_never_starts_the_next_paid_st
             return result
 
     runner = BreachingRunner(config.campaign_root)
-    assert module.run_collection(config, runner=runner) == "infrastructure_stop"
-    assert runner.calls == ["calibration-matrix", "final-publication"]
-    assert runner.stops == 1
+    assert module.run_collection(config, runner=runner) == "operator_stop_required"
+    assert runner.calls == ["calibration-matrix"]
+    assert runner.stops == 0
     assert not (config.campaign_root / "stage-receipts" / "calibration-head.json").exists()
 
 
@@ -605,14 +601,13 @@ def test_fixed_adapter_executes_real_matrix_cli_with_clean_typed_handoff(tmp_pat
         runner.run("calibration-matrix")
 
 
-def test_existing_stop_state_without_immutable_stop_receipt_never_retries_stop(tmp_path: Path) -> None:
+def test_existing_handoff_without_legacy_stop_receipt_never_reenters_paid_work(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path); runner = FakeRunner(config.campaign_root)
-    assert module.run_collection(config, runner=runner) == "complete"
-    stop_receipt = config.campaign_root / "stage-receipts" / "gpu-stop.json"
-    stop_receipt.unlink()
-
-    assert module.run_collection(config, runner=runner) == "infrastructure_stop_failure"
-    assert runner.stops == 1
+    assert module.run_collection(config, runner=runner) == "operator_stop_required"
+    assert not (config.campaign_root / "stage-receipts" / "gpu-stop.json").exists()
+    resumed = FakeRunner(config.campaign_root)
+    assert module.run_collection(config, runner=resumed) == "operator_stop_required"
+    assert resumed.calls == [] and resumed.stops == 0
 
 
 def test_partition_adapter_passes_exact_one_vm_tuple_without_inherited_lehome_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

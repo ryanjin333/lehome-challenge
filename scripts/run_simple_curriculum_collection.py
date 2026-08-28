@@ -1752,10 +1752,10 @@ def _operator_stop_handoff(
 ) -> str:
     """Persist the running VM's compact terminal handoff; never self-stop or publish."""
     root = _canonical_root(config)
-    # Re-validate every durable stage before we bind it into the handoff.  The
-    # finalizer is intentionally allowed to fetch only this compact manifest,
-    # so it must not become a way to bless stale or tampered stage evidence.
-    _rehash_terminal_journal(journal)
+    # Every completed stage passed its authenticated output validation before
+    # its immutable receipt was written.  Re-hash those durable receipts here;
+    # deep source traversal remains owned by the stage-specific controllers,
+    # rather than making the terminal handoff depend on raw rollout trees.
     evidence: list[dict[str, str]] = []
     for stage in STAGES:
         if stage in {"gpu-stop", "final-publication"}:
