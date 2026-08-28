@@ -62,8 +62,10 @@ def test_simple_curriculum_runbook_requires_root_owned_token_for_root_paid_proce
 
     assert "sudo env -i" in paid
     assert "publisher runs as root through `sudo env -i`" in text
+    assert "test -f /mnt/lehome/secrets/hf_token && test ! -L /mnt/lehome/secrets/hf_token" in text
     assert "test \"$(stat -c '%u' /mnt/lehome/secrets/hf_token)\" = 0" in text
     assert "test \"$(stat -c '%a' /mnt/lehome/secrets/hf_token)\" = 600" in text
+    assert "test -s /mnt/lehome/secrets/hf_token" in text
 
 
 def test_simple_curriculum_runbook_orders_provider_start_and_post_start_checkpoints() -> None:
