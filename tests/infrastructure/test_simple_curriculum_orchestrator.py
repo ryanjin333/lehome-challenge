@@ -6,6 +6,7 @@ import importlib.util
 import hashlib
 import json
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import subprocess
 import sys
@@ -43,11 +44,11 @@ class FakeRunner:
         if self.root is None:
             return {"stage": stage}
         names = {
-            "calibration-matrix": ("matrix",), "calibration-head": ("matrix", "manifest", "ledger"),
+            "calibration-matrix": ("matrix", "matrix_receipt"), "calibration-head": ("matrix", "manifest", "ledger"),
             "first-100-gate": ("report", "gate_receipt"), "calibration-tail": ("matrix", "manifest", "ledger"),
-            "calibration-report": ("report",), "curriculum-matrix": ("matrix",),
+            "calibration-report": ("report",), "curriculum-matrix": ("matrix", "matrix_receipt"),
             "curriculum-a": ("matrix", "manifest", "ledger"), "curriculum-b": ("matrix", "manifest", "ledger"),
-            "fresh-report": ("report",), "replay-matrix": ("matrix",),
+            "fresh-report": ("report",), "replay-matrix": ("matrix", "matrix_receipt"),
             "success-replay": ("matrix", "ledger"), "final-publication": ("publication_receipt", "publication_readback"),
         }[stage]
         artifacts = {}
@@ -73,7 +74,8 @@ def _config(module, tmp_path: Path):
     host = tmp_path / "reviewed"; host.mkdir()
     for relative in ("source/lehome", "trainer/src", "scripts", "rollout_appliance"):
         (host / relative).mkdir(parents=True)
-    observer = tmp_path / "spend.json"; observer.write_text('{"schema_version":1,"spent_usd":0.0,"observed_monotonic_ns":1}', encoding="utf-8")
+    observed = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    observer = tmp_path / "spend.json"; observer.write_text(json.dumps({"schema_version": 1, "kind": "lehome_spend_observation_v1", "observer": "test-meter", "observed_at_utc": observed, "spent_usd": 0.0}), encoding="utf-8")
     return module.CollectionConfig(
         campaign_root=tmp_path / "campaign",
         host_code_root=host,
@@ -216,6 +218,10 @@ def test_command_runner_rejects_env_command_and_shell_bypass(monkeypatch: pytest
 
 def test_fixed_adapter_has_a_canonical_non_shell_argv_for_every_paid_stage(tmp_path: Path) -> None:
     module = _module(); runner = module.CommandRunner(_config(module, tmp_path))
+    root = runner.config.campaign_root
+    (root / "partitions").mkdir(parents=True)
+    for partition in ("calibration-head", "calibration-tail", "curriculum-a", "curriculum-b"):
+        (root / "partitions" / f"{partition}.json").write_text("[]", encoding="utf-8")
     for stage in module.STAGES[:-1]:
         if stage == "final-publication":
             with pytest.raises(RuntimeError, match="Task 7 publisher"):
@@ -261,13 +267,12 @@ def test_stage_output_rejects_secret_and_unexpected_fields(tmp_path: Path) -> No
 
 def test_preemption_resumes_the_same_root_and_does_not_replay_completed_stages(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path); interrupted = FakeRunner(config.campaign_root, fail_stage="calibration-tail")
-    with pytest.raises(RuntimeError, match="preempted"):
-        module.run_collection(config, runner=interrupted)
+    assert module.run_collection(config, runner=interrupted) == "infrastructure_stop_failure"
+    assert interrupted.stops == 1
     resumed = FakeRunner(config.campaign_root)
 
-    assert module.run_collection(config, runner=resumed) == "complete"
-    assert resumed.calls[0] == "calibration-tail"
-    assert "calibration-head" not in resumed.calls
+    assert module.run_collection(config, runner=resumed) == "infrastructure_stop_failure"
+    assert resumed.calls == []
 
 
 def test_resume_rehashes_the_physical_ledger_and_rejects_changed_bytes(tmp_path: Path) -> None:
@@ -290,7 +295,8 @@ def test_campaign_root_symlink_is_rejected_before_journal_creation(tmp_path: Pat
 def test_paid_budget_gate_fails_before_runner_at_exact_spend_boundary(tmp_path: Path) -> None:
     module = _module(); config = _config(module, tmp_path)
     assert config.spend_observer is not None
-    config.spend_observer.write_text('{"schema_version":1,"spent_usd":99.0,"observed_monotonic_ns":2}', encoding="utf-8")
+    observed = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    config.spend_observer.write_text(json.dumps({"schema_version": 1, "kind": "lehome_spend_observation_v1", "observer": "test-meter", "observed_at_utc": observed, "spent_usd": 99.0}), encoding="utf-8")
     runner = FakeRunner(config.campaign_root)
 
     with pytest.raises(module.ReceiptMismatchError, match="budget"):
@@ -301,3 +307,103 @@ def test_paid_budget_gate_fails_before_runner_at_exact_spend_boundary(tmp_path: 
 def test_paid_simple_wrapper_contract_requires_one_vm_marker() -> None:
     text = (ROOT / "rollout_appliance" / "run_12k_campaign.sh").read_text(encoding="utf-8")
     assert 'paid simple curriculum requires LEHOME_ONE_VM_ORCHESTRATOR=1' in text
+
+
+def test_fixed_adapter_executes_real_matrix_cli_with_clean_typed_handoff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The production adapter must create a real canonical output, not a marker."""
+    module = _module()
+    config = _config(module, tmp_path)
+    config = module.CollectionConfig(
+        campaign_root=config.campaign_root,
+        host_code_root=ROOT,
+        run_id=config.run_id,
+        round_id=config.round_id,
+        max_wall_seconds=config.max_wall_seconds,
+        max_spend_usd=config.max_spend_usd,
+        paid=config.paid,
+        gpu_stop_command=config.gpu_stop_command,
+        runtime_identity=config.runtime_identity,
+        spend_observer=config.spend_observer,
+    )
+    catalog = config.campaign_root / "inputs" / "seen-catalog.json"
+    catalog.parent.mkdir(parents=True)
+    catalog.write_text(json.dumps({
+        "top_long": [f"Top_Long_Seen_{index}" for index in range(10)],
+        "top_short": [f"Top_Short_Seen_{index}" for index in range(10)],
+        "pant_long": [f"Pant_Long_Seen_{index}" for index in range(10)],
+        "pant_short": [f"Pant_Short_Seen_{index}" for index in range(10)],
+    }), encoding="utf-8")
+    monkeypatch.setenv("LEHOME_ORCHESTRATOR_CALIBRATION_MATRIX_COMMAND", "/bin/false")
+    runner = module.CommandRunner(config)
+    clean = runner.environment_for("calibration-matrix", {})
+    assert clean["PYTHONPATH"] == str(ROOT / "source" / "lehome")
+    assert clean["LEHOME_SIMPLE_CURRICULUM_COLLECTION"] == "1"
+    assert clean["LEHOME_ONE_VM_ORCHESTRATOR"] == "1"
+    assert clean["LEHOME_PAID_COLLECTION"] == "1"
+    assert "LEHOME_ORCHESTRATOR_CALIBRATION_MATRIX_COMMAND" not in clean
+
+    result = runner.run("calibration-matrix")
+
+    matrix = config.campaign_root / result["artifacts"]["matrix"]["path"]
+    receipt = config.campaign_root / result["artifacts"]["matrix_receipt"]["path"]
+    assert len(json.loads(matrix.read_text(encoding="utf-8"))) == 400
+    assert json.loads(receipt.read_text(encoding="utf-8"))["output_sha256"] == result["artifacts"]["matrix"]["sha256"]
+
+
+def test_existing_stop_state_without_immutable_stop_receipt_never_retries_stop(tmp_path: Path) -> None:
+    module = _module(); config = _config(module, tmp_path); runner = FakeRunner(config.campaign_root)
+    assert module.run_collection(config, runner=runner) == "complete"
+    stop_receipt = config.campaign_root / "stage-receipts" / "gpu-stop.json"
+    stop_receipt.unlink()
+
+    assert module.run_collection(config, runner=runner) == "infrastructure_stop_failure"
+    assert runner.stops == 1
+
+
+def test_partition_adapter_passes_exact_one_vm_tuple_without_inherited_lehome_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); config = _config(module, tmp_path)
+    rows = [{"attempt_id": f"calibration-{index:04d}", "trial_id": f"trial-{index:04d}", "seed": index} for index in range(400)]
+    logical = config.campaign_root / "matrices" / "calibration.json"; logical.parent.mkdir(parents=True)
+    logical.write_bytes((json.dumps(rows, sort_keys=True, separators=(",", ":")) + "\n").encode())
+    matrix, manifest, details = module.materialize_partition(
+        parent_matrix=logical, parent_matrix_sha256=hashlib.sha256(logical.read_bytes()).hexdigest(),
+        output_directory=config.campaign_root / "partitions", partition_id="calibration-head", start=0, end=100,
+    )
+    monkeypatch.setenv("LEHOME_WORKER_COUNT", "1")
+    runner = module.CommandRunner(config)
+    inputs = {
+        "partition_id": "calibration-head", "partition_matrix": matrix.relative_to(config.campaign_root).as_posix(),
+        "partition_manifest": manifest.relative_to(config.campaign_root).as_posix(), "partition_sha256": details["partition_sha256"],
+        "row_start": 0, "row_end": 100, "target": 100, "lease_budget": 150,
+    }
+
+    environment = runner.environment_for("calibration-head", inputs)
+
+    assert runner.argv_for("calibration-head", inputs) == (str(config.host_code_root / "rollout_appliance" / "run_12k_campaign.sh"),)
+    assert environment["LEHOME_ATTEMPT_MATRIX"] == str(matrix)
+    assert environment["LEHOME_PARTITION_MANIFEST"] == str(manifest)
+    assert environment["LEHOME_WORKER_COUNT"] == "4"
+    assert environment["LEHOME_SIMPLE_CURRICULUM_COLLECTION"] == "1"
+    assert environment["LEHOME_ONE_VM_ORCHESTRATOR"] == "1"
+    assert environment["LEHOME_PAID_COLLECTION"] == "1"
+    assert set(key for key in environment if key.startswith("LEHOME_")) >= {
+        "LEHOME_POLICY_REPO", "LEHOME_POLICY_REVISION", "LEHOME_POLICY_ARTIFACT_SHA256",
+        "LEHOME_ROLLOUT_IMAGE", "LEHOME_TRAINER_IMAGE", "LEHOME_RUN_ID", "LEHOME_ROUND_ID",
+    }
+
+
+def test_paid_spend_observer_rejects_stale_or_different_meter_receipts(tmp_path: Path) -> None:
+    module = _module(); config = _config(module, tmp_path); journal = module.StageJournal(config)
+    journal.check_budget()
+    assert config.spend_observer is not None
+    observed = (datetime.now(UTC) - timedelta(minutes=6)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    config.spend_observer.write_text(json.dumps({"schema_version": 1, "kind": "lehome_spend_observation_v1", "observer": "test-meter", "observed_at_utc": observed, "spent_usd": 0.0}), encoding="utf-8")
+
+    with pytest.raises(module.ReceiptMismatchError, match="stale"):
+        journal.check_budget()
+
+    observed = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    config.spend_observer.write_text(json.dumps({"schema_version": 1, "kind": "lehome_spend_observation_v1", "observer": "other-meter", "observed_at_utc": observed, "spent_usd": 0.0}), encoding="utf-8")
+
+    with pytest.raises(module.ReceiptMismatchError, match="observer"):
+        journal.check_budget()
