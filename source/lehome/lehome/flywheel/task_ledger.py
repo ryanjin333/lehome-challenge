@@ -388,7 +388,7 @@ class TaskLedger:
         self, worker_id: str, attempt_id: str, lease_id: str, *, session_id: str,
         generation: int, fidelity_code: str, fidelity: Mapping[str, object], runtime: Mapping[str, object],
     ) -> str:
-        """Terminalize one observed physical/safety fidelity failure immutably."""
+        """Terminalize one fidelity failure and atomically end its campaign."""
         worker_id = _require_identifier(worker_id, field="worker_id")
         attempt_id = _require_identifier(attempt_id, field="attempt_id")
         lease_id = _require_identifier(lease_id, field="lease_id")
@@ -427,6 +427,31 @@ class TaskLedger:
             self._append_event(
                 "infrastructure_abort", attempt_id=attempt_id, lease_id=lease_id, worker_id=worker_id,
                 payload=payload, at_ns=now_ns,
+            )
+            for peer_attempt in self.attempts():
+                peer_state = self._state_for_attempt(peer_attempt.attempt_id)
+                if peer_state.status not in _LEASED_STATES or peer_state.lease is None:
+                    continue
+                self._append_event(
+                    "interrupted", attempt_id=peer_attempt.attempt_id,
+                    lease_id=peer_state.lease.lease_id, worker_id=peer_state.lease.worker_id,
+                    payload={
+                        "reason": "campaign_fidelity_abort",
+                        "fidelity_attempt_id": attempt_id,
+                    },
+                    at_ns=now_ns,
+                )
+            self._append_event(
+                "campaign_ended",
+                payload={
+                    "reason": "fidelity_abort", "failure_class": "fidelity",
+                    "fidelity_code": fidelity_code, "attempt_id": attempt_id,
+                    "lease_id": lease_id, "worker_id": worker_id,
+                    "session_id": session_id, "generation": generation,
+                    "fidelity": validated_fidelity,
+                    "runtime": dict(runtime),
+                },
+                at_ns=now_ns,
             )
             return "infrastructure_abort"
 

@@ -691,8 +691,30 @@ UPLOADER_NAME="lehome-campaign-uploader"
 FINALIZER_PID=""
 UPLOADER_PID=""
 POLICY_PID=""
+worker_pids=()
+
+terminate_worker_group() {
+  local worker_pid index
+  for worker_pid in "${worker_pids[@]:-}"; do
+    if [[ "${worker_pid}" =~ ^[0-9]+$ ]]; then
+      kill "${worker_pid}" 2>/dev/null || true
+    fi
+  done
+  # Stopping the parent shell alone does not guarantee that its synchronous
+  # `docker run` child has exited. Remove every fixed worker container too.
+  for index in $(seq 1 "${WORKER_COUNT}"); do
+    docker rm -f "lehome-camp12k-w${index}" >/dev/null 2>&1 || true
+  done
+  for worker_pid in "${worker_pids[@]:-}"; do
+    if [[ "${worker_pid}" =~ ^[0-9]+$ ]]; then
+      wait "${worker_pid}" 2>/dev/null || true
+    fi
+  done
+  worker_pids=()
+}
 
 cleanup_campaign() {
+  terminate_worker_group
   if [[ "${FINALIZER_PID:-}" =~ ^[0-9]+$ ]]; then
     kill "${FINALIZER_PID}" 2>/dev/null || true
   fi
@@ -910,43 +932,102 @@ launch_worker() {
 
 # Production remains exactly four workers; lower width is an explicit smoke.
 worker_status=0
+campaign_has_infrastructure_abort() {
+  if [ "${SIMPLE_CURRICULUM_COLLECTION}" != "1" ]; then
+    return 1
+  fi
+  python3 - "${LEDGER}" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+try:
+    connection.execute("PRAGMA query_only = ON")
+    aborted = connection.execute(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE event_type = 'infrastructure_abort')"
+    ).fetchone()[0]
+finally:
+    connection.close()
+raise SystemExit(0 if aborted else 1)
+PY
+}
+
+wait_for_worker_group() {
+  local active_pids=("${worker_pids[@]}")
+  local next_pids=() worker_pid
+  while [ "${#active_pids[@]}" -gt 0 ]; do
+    if campaign_has_infrastructure_abort; then
+      echo "campaign infrastructure abort detected; terminating paid sibling workers" >&2
+      terminate_worker_group
+      return 1
+    fi
+    next_pids=()
+    for worker_pid in "${active_pids[@]}"; do
+      if kill -0 "${worker_pid}" 2>/dev/null; then
+        next_pids+=("${worker_pid}")
+        continue
+      fi
+      if ! wait "${worker_pid}"; then
+        echo "worker supervisor failed; terminating paid sibling workers" >&2
+        terminate_worker_group
+        return 1
+      fi
+    done
+    active_pids=("${next_pids[@]}")
+    if [ "${#active_pids[@]}" -gt 0 ]; then
+      sleep 1
+    fi
+  done
+  worker_pids=()
+  return 0
+}
+
 if [ "${GARMENT_AFFINITY}" = "1" ]; then
   run_garment_slot() {
     local index="$1"
     local garment_index=$((index - 1))
     local worker_identity
+    local supervised_pid=""
+    cleanup_garment_slot() {
+      if [[ "${supervised_pid}" =~ ^[0-9]+$ ]]; then
+        kill "${supervised_pid}" 2>/dev/null || true
+      fi
+      docker rm -f "lehome-camp12k-w${index}" >/dev/null 2>&1 || true
+      if [[ "${supervised_pid}" =~ ^[0-9]+$ ]]; then
+        wait "${supervised_pid}" 2>/dev/null || true
+      fi
+    }
+    trap 'cleanup_garment_slot; exit 143' TERM INT
     while [ "${garment_index}" -lt "${#evaluation_garments[@]}" ]; do
       worker_identity="worker-$((garment_index + 1))-${index}"
       lehome_supervise_worker "${index}" "${MAX_WORKER_RESTARTS}" launch_worker \
         "${evaluation_garments[${garment_index}]}" "${worker_identity}" &
-      local supervised_pid="$!"
+      supervised_pid="$!"
       if ! wait "${supervised_pid}"; then
+        supervised_pid=""
         return 1
       fi
+      supervised_pid=""
       garment_index=$((garment_index + WORKER_COUNT))
     done
+    trap - TERM INT
   }
-  worker_pids=()
   for index in $(seq 1 "${WORKER_COUNT}"); do
     run_garment_slot "${index}" &
     worker_pids+=("$!")
   done
-  for worker_pid in "${worker_pids[@]}"; do
-    if ! wait "${worker_pid}"; then
-      worker_status=1
-    fi
-  done
 else
-  worker_pids=()
   for index in $(seq 1 "${WORKER_COUNT}"); do
     lehome_supervise_worker "${index}" "${MAX_WORKER_RESTARTS}" launch_worker &
     worker_pids+=("$!")
   done
-  for worker_pid in "${worker_pids[@]}"; do
-    if ! wait "${worker_pid}"; then
-      worker_status=1
-    fi
-  done
+fi
+if ! wait_for_worker_group; then
+  worker_status=1
+fi
+if [ "${worker_status}" -ne 0 ]; then
+  write_preemption_context false
+  exit "${worker_status}"
 fi
 
 pending_terminal_count() {

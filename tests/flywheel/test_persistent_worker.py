@@ -370,6 +370,97 @@ def test_true_mode_reset_fidelity_failure_is_a_typed_ledger_abort(tmp_path) -> N
     ]
 
 
+def test_simple_curriculum_fidelity_abort_stops_before_a_second_lease(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import FidelityFailureError, PersistentRolloutWorker
+
+    class FidelityController(FakeController):
+        def __init__(self) -> None:
+            super().__init__([
+                Lease(Attempt("attempt-a", {"garment": "Top_Long_Seen_0", "seed": 11}), "lease-a"),
+                Lease(Attempt("attempt-b", {"garment": "Top_Long_Seen_1", "seed": 12}), "lease-b"),
+            ])
+            self.fidelity_aborts: list[tuple[str, str, str]] = []
+
+        def record_fidelity_abort(self, worker_id, attempt_id, lease_id, **kwargs):
+            self.fidelity_aborts.append((worker_id, attempt_id, lease_id))
+            return "infrastructure_abort"
+
+    class FirstAttemptFliesAway(FakeSession):
+        def prepare_episode(self, **kwargs):
+            if not self.prepared:
+                super().prepare_episode(**kwargs)
+                raise FidelityFailureError(
+                    "cloth_flight",
+                    {
+                        "missing_cloth": False, "cloth_flight": True,
+                        "nonfinite_cloth_state": False, "safety_failure": False,
+                        "monitor_active": True, "monitor_observed": True,
+                    },
+                )
+            return super().prepare_episode(**kwargs)
+
+    controller = FidelityController()
+    session = FirstAttemptFliesAway()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+        simple_curriculum_collection=True,
+    )
+
+    with pytest.raises(RuntimeError, match="campaign fidelity abort"):
+        worker.run()
+
+    assert controller.fidelity_aborts == [("worker-0", "attempt-a", "lease-a")]
+    assert session.prepared == [("Top_Long_Seen_0", 11, 1)]
+    assert session.runs == []
+    assert len(controller._leases) == 1
+
+
+def test_simple_curriculum_policy_safety_abort_stops_before_a_second_lease(tmp_path) -> None:
+    from lehome.flywheel.persistent_worker import (
+        PersistentRolloutWorker,
+        PolicyActionSafetyRejectionError,
+    )
+
+    class FidelityController(FakeController):
+        def __init__(self) -> None:
+            super().__init__([
+                Lease(Attempt("attempt-a", {"garment": "Top_Long_Seen_0", "seed": 11}), "lease-a"),
+                Lease(Attempt("attempt-b", {"garment": "Top_Long_Seen_1", "seed": 12}), "lease-b"),
+            ])
+            self.fidelity_codes: list[str] = []
+
+        def record_fidelity_abort(self, worker_id, attempt_id, lease_id, **kwargs):
+            self.fidelity_codes.append(kwargs["fidelity_code"])
+            return "infrastructure_abort"
+
+    class FirstAttemptViolatesJointLimits(FakeSession):
+        def run_episode(self, *, assignment, **kwargs):
+            self.runs.append(str(assignment["attempt_id"]))
+            if assignment["attempt_id"] == "attempt-a":
+                raise PolicyActionSafetyRejectionError(
+                    "policy_action_outside_live_joint_limits"
+                )
+            return {"success": True, "output_dir": str(kwargs["attempt_output_dir"])}
+
+    controller = FidelityController()
+    session = FirstAttemptViolatesJointLimits()
+    worker = PersistentRolloutWorker(
+        worker_id="worker-0", session_id="session-0", controller=controller,
+        simulator_factory=lambda: session, policy=FakePolicy(), output_root=tmp_path,
+        renderer_device="cuda:0", policy_device="cuda:0",
+        simple_curriculum_collection=True,
+    )
+
+    with pytest.raises(RuntimeError, match="campaign fidelity abort"):
+        worker.run()
+
+    assert controller.fidelity_codes == ["safety_failure"]
+    assert session.runs == ["attempt-a"]
+    assert len(controller._leases) == 1
+
+
 def test_marker_false_downgrades_a_structured_fidelity_error_to_generic_infrastructure_abort(tmp_path) -> None:
     from lehome.flywheel.persistent_worker import FidelityFailureError, PersistentRolloutWorker
 
@@ -483,7 +574,11 @@ def test_worker_translates_raw_cloth_fidelity_errors_at_every_episode_boundary(
         simple_curriculum_collection=simple_curriculum_collection,
     )
 
-    assert worker.run() == []
+    if simple_curriculum_collection:
+        with pytest.raises(RuntimeError, match="campaign fidelity abort"):
+            worker.run()
+    else:
+        assert worker.run() == []
     if simple_curriculum_collection:
         assert controller.infrastructure_aborts == []
         assert controller.fidelity_aborts == [

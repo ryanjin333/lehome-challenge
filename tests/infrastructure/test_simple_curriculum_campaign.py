@@ -171,6 +171,124 @@ def test_exact_simple_curriculum_uses_affined_four_slot_garment_waves_with_fresh
     assert {slot: slots.count(slot) for slot in set(slots)} == {str(slot): 10 for slot in range(1, 5)}
 
 
+def test_exact_campaign_fidelity_abort_terminates_paid_sibling_workers_and_fails(tmp_path: Path) -> None:
+    environment = _environment(tmp_path, "calibration-head")
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    rows = _rows("calibration-head", 100, "calibration")
+    campaign_root = Path(environment["LEHOME_CAMPAIGN_ROOT"])
+    campaign_root.mkdir()
+    ledger = TaskLedger(
+        campaign_root / "ledger.sqlite3", attempt_matrix=rows,
+        max_attempts=150, target_accepted=100, completion_metric="terminal_outcomes",
+    )
+    ledger.close()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    killed = tmp_path / "killed-workers.txt"
+    token = tmp_path / "hf-token"
+    token.write_text("test-token", encoding="utf-8")
+    (fake_bin / "mkdir").write_text(textwrap.dedent("""\
+        #!/bin/sh
+        args=''
+        has_path=0
+        for arg in "$@"; do
+          case "$arg" in
+            /eval*|/kitcache*) ;;
+            -*) args="$args '$arg'" ;;
+            *) args="$args '$arg'"; has_path=1 ;;
+          esac
+        done
+        [ "$has_path" = 1 ] || exit 0
+        eval /bin/mkdir "$args"
+    """), encoding="utf-8")
+    (fake_bin / "stat").write_text(
+        "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then echo 1234:600; else exec /usr/bin/stat \"$@\"; fi\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "docker").write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        set -euo pipefail
+        command_name="${{1:-}}"
+        if [ "$command_name" = "rm" ]; then
+          target="${{@: -1}}"
+          pid_file={str(tmp_path)!r}/"$target.pid"
+          if [ -f "$pid_file" ]; then kill "$(cat "$pid_file")" 2>/dev/null || true; fi
+          exit 0
+        fi
+        [ "$command_name" = "run" ] || exit 0
+        name=""; garment=""; worker_id=""; previous=""
+        for arg in "$@"; do
+          case "$previous" in
+            --name) name="$arg" ;;
+            --initial-garment) garment="$arg" ;;
+            --worker-id) worker_id="$arg" ;;
+          esac
+          previous="$arg"
+        done
+        if [ "$name" = "lehome-12k-policy" ]; then
+          mkdir -p "$LEHOME_CAMPAIGN_ROOT/policy-receipts"
+          printf '%s' '{{"ready":true,"policy_sha256":"e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa","runtime_device":"cuda:0"}}' > "$LEHOME_CAMPAIGN_ROOT/policy-receipts/ready.json"
+          exit 0
+        fi
+        [[ "$name" = lehome-camp12k-w* ]] || exit 0
+        echo $$ > {str(tmp_path)!r}/"$name.pid"
+        if [ "$name" = "lehome-camp12k-w1" ]; then
+          PYTHONPATH={str(ROOT / 'source' / 'lehome')!r} python3 - "$LEHOME_CAMPAIGN_ROOT" "$LEHOME_ATTEMPT_MATRIX" "$garment" "$worker_id" <<'PY'
+        import sys
+        from pathlib import Path
+        from lehome.flywheel.recovery_collection import load_attempt_matrix
+        from lehome.flywheel.task_ledger import TaskLedger
+
+        root, matrix_path, garment, worker_id = sys.argv[1:]
+        rows = load_attempt_matrix(Path(matrix_path))
+        ledger = TaskLedger(Path(root) / "ledger.sqlite3", attempt_matrix=rows,
+                            max_attempts=150, target_accepted=100,
+                            completion_metric="terminal_outcomes")
+        try:
+            lease = ledger.lease_next(worker_id, lease_duration_ns=10**18,
+                                      assignment_filter={{"garment_name": garment}})
+            assert lease is not None
+            ledger.record_fidelity_abort(
+                worker_id, lease.attempt.attempt_id, lease.lease_id,
+                session_id="failing-session", generation=1,
+                fidelity_code="cloth_flight",
+                fidelity={{"missing_cloth": False, "cloth_flight": True,
+                          "nonfinite_cloth_state": False, "safety_failure": False,
+                          "monitor_active": True, "monitor_observed": True}},
+                runtime={{"simulation_device": "cpu", "cloth_device": "cpu",
+                         "renderer_device": "cuda:0", "camera_device": "cuda:0",
+                         "policy_device": "cuda:0"}},
+            )
+        finally:
+            ledger.close()
+        PY
+          exit 73
+        fi
+        trap 'printf "%s\\n" "$name" >> {str(killed)!r}; exit 143' TERM INT
+        while :; do sleep 1; done
+    """), encoding="utf-8")
+    for tool in fake_bin.iterdir():
+        tool.chmod(0o755)
+    environment.update({
+        "PATH": f"{fake_bin}:{os.environ['PATH']}", "LEHOME_VALIDATE_MATRIX_ONLY": "0",
+        "LEHOME_FRESH_GARMENT_WAVES": "0", "LEHOME_HF_TOKEN_FILE": str(token),
+        "LEHOME_ROLLOUT_PREEMPTION_CONTEXT": str(tmp_path / "preemption.json"),
+        "LEHOME_MAX_WORKER_RESTARTS": "0", "PYTHONPATH": str(ROOT / "source" / "lehome"),
+    })
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)], env=environment, capture_output=True, text=True,
+        check=False, timeout=20,
+    )
+
+    assert result.returncode != 0
+    assert "campaign infrastructure abort" in result.stderr
+    assert set(killed.read_text(encoding="utf-8").splitlines()) >= {
+        "lehome-camp12k-w2", "lehome-camp12k-w3", "lehome-camp12k-w4",
+    }
+
+
 @pytest.mark.parametrize("field,value", [
     ("LEHOME_MAX_ATTEMPTS", "151"), ("LEHOME_TARGET_ACCEPTED", "99"),
     ("LEHOME_WORKER_COUNT", "1"), ("LEHOME_ENABLE_HF_UPLOAD", "0"),

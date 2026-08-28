@@ -553,7 +553,7 @@ class PersistentRolloutWorker:
                             )
                             if _is_source_discovery_assignment(assignment):
                                 raise RuntimeError("source discovery fidelity abort") from error
-                            continue
+                            raise RuntimeError("simple curriculum campaign fidelity abort") from error
                         reject = getattr(self._controller, "reject_attempt", None)
                         if not callable(reject):
                             raise RuntimeError(
@@ -589,7 +589,7 @@ class PersistentRolloutWorker:
                             ) from error
                         if _is_source_discovery_assignment(assignment):
                             raise RuntimeError("source discovery fidelity abort") from error
-                        continue
+                        raise RuntimeError("simple curriculum campaign fidelity abort") from error
                     if isinstance(error, InfrastructureInvalidAttemptError):
                         abort = getattr(self._controller, "record_infrastructure_abort", None)
                         if not callable(abort):

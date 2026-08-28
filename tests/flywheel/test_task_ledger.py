@@ -191,6 +191,76 @@ def test_exact_fidelity_abort_never_retries_or_counts_as_a_terminal_outcome(tmp_
         ledger.close()
 
 
+def test_exact_fidelity_abort_atomically_ends_campaign_and_interrupts_peer_leases(tmp_path) -> None:
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    ledger = TaskLedger(
+        tmp_path / "fidelity-campaign-stop.sqlite3", attempt_matrix=_matrix(3),
+        max_attempts=3, target_accepted=3, completion_metric="terminal_outcomes",
+        clock_ns=lambda: 1,
+    )
+    try:
+        failed = ledger.lease_next("worker-a", lease_duration_ns=100)
+        peer = ledger.lease_next("worker-b", lease_duration_ns=100)
+        assert failed is not None and peer is not None
+        fidelity = {
+            "missing_cloth": False, "cloth_flight": True,
+            "nonfinite_cloth_state": False, "safety_failure": False,
+            "monitor_active": True, "monitor_observed": True,
+        }
+        runtime = {
+            "simulation_device": "cpu", "cloth_device": "cpu",
+            "renderer_device": "cuda:0", "camera_device": "cuda:0",
+            "policy_device": "cuda:0",
+        }
+
+        assert ledger.record_fidelity_abort(
+            "worker-a", failed.attempt.attempt_id, failed.lease_id,
+            session_id="session-a", generation=7, fidelity_code="cloth_flight",
+            fidelity=fidelity, runtime=runtime,
+        ) == "infrastructure_abort"
+
+        assert ledger.is_terminal
+        assert ledger.status(failed.attempt.attempt_id) == "infrastructure_abort"
+        assert ledger.status(peer.attempt.attempt_id) == "interrupted"
+        assert ledger.status(ledger.attempts()[2].attempt_id) == "pending"
+        assert ledger.lease_next("worker-c", lease_duration_ns=100) is None
+        with pytest.raises(ValueError, match="active lease"):
+            ledger.heartbeat(
+                "worker-b", peer.attempt.attempt_id, peer.lease_id,
+                lease_duration_ns=100,
+            )
+        with pytest.raises(ValueError, match="terminal campaign"):
+            ledger.resume_after_preemption("replacement-vm")
+
+        events = ledger.events()
+        assert [event.event_type for event in events] == [
+            "leased", "leased",
+            "interrupted", "terminal_pending_validation", "infrastructure_abort",
+            "interrupted", "campaign_ended",
+        ]
+        assert not any(event.event_type in {"retryable", "campaign_paused"} for event in events)
+        assert events[-2].attempt_id == peer.attempt.attempt_id
+        assert events[-2].payload == {
+            "reason": "campaign_fidelity_abort",
+            "fidelity_attempt_id": failed.attempt.attempt_id,
+        }
+        assert events[-1].payload == {
+            "reason": "fidelity_abort",
+            "failure_class": "fidelity",
+            "fidelity_code": "cloth_flight",
+            "attempt_id": failed.attempt.attempt_id,
+            "lease_id": failed.lease_id,
+            "worker_id": "worker-a",
+            "session_id": "session-a",
+            "generation": 7,
+            "fidelity": fidelity,
+            "runtime": runtime,
+        }
+    finally:
+        ledger.close()
+
+
 @pytest.mark.parametrize("target", [100, 300])
 def test_terminal_outcome_partitions_complete_on_a_mix_of_successes_and_policy_failures(tmp_path, target: int) -> None:
     from lehome.flywheel.task_ledger import TaskLedger
