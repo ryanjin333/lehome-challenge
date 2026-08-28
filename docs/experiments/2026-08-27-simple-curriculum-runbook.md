@@ -48,11 +48,12 @@ identity; they do not substitute for the post-start host checks below.
    regular non-symlink `0600`, nonempty file at
    `/mnt/lehome/secrets/hf_token` once the workspace is mounted.
 
-3. Confirm the provider spend view is below $99.00 and prepare a current typed
-   spend receipt at `/mnt/lehome/operator/spend-observation.json`. The receipt
-   contains only `schema_version`, `kind`, `observer`, `observed_at_utc`, and
-   `spent_usd`; its timestamp must be under five minutes old. Confirm the
-   trusted exact-VM stop hook is `/usr/local/libexec/lehome-stop-gpu`.
+3. Confirm the provider spend view is below $99.00 and preserve its signed-in
+   baseline observation for the local observer in Section 3. The observer,
+   rather than this one-time provider observation, writes the current typed
+   receipt at `/mnt/lehome/operator/spend-observation.json` with only
+   `schema_version`, `kind`, `observer`, `observed_at_utc`, and `spent_usd`.
+   Confirm the trusted exact-VM stop hook is `/usr/local/libexec/lehome-stop-gpu`.
 
 Stop and report if the exact ID, image, disk, state, public destination, or
 budget evidence differs. Do not attempt the post-start checks on a stopped VM.
@@ -119,15 +120,24 @@ if test -e "$LEHOME_INVOCATION_FILE"; then
 else
   LEHOME_RUN_ID="fresh-run-$(date -u +%Y%m%d%H%M%S)-01"
   LEHOME_ROUND_ID="fresh-12k-${LEHOME_RUN_ID#fresh-run-}"
+  LEHOME_SPEND_BASELINE_USD=20.25
+  LEHOME_SPEND_BASELINE_AT_UTC=2026-08-28T14:25:00Z
+  LEHOME_MAX_HOURLY_BURN_USD=1.50
+  LEHOME_SPEND_OBSERVER_COMMAND="$LEHOME_HOST_CODE_ROOT/scripts/run_conservative_spend_observer.py"
   LEHOME_CAMPAIGN_ROOT="/mnt/lehome/eval/$LEHOME_RUN_ID"
   test ! -e "$LEHOME_CAMPAIGN_ROOT"
   umask 077
-  printf 'LEHOME_RUN_ID=%q\nLEHOME_ROUND_ID=%q\n' "$LEHOME_RUN_ID" "$LEHOME_ROUND_ID" > "$LEHOME_INVOCATION_FILE"
+  printf 'LEHOME_RUN_ID=%q\nLEHOME_ROUND_ID=%q\nLEHOME_SPEND_BASELINE_USD=%q\nLEHOME_SPEND_BASELINE_AT_UTC=%q\nLEHOME_MAX_HOURLY_BURN_USD=%q\nLEHOME_SPEND_OBSERVER_COMMAND=%q\n' \
+    "$LEHOME_RUN_ID" "$LEHOME_ROUND_ID" "$LEHOME_SPEND_BASELINE_USD" "$LEHOME_SPEND_BASELINE_AT_UTC" "$LEHOME_MAX_HOURLY_BURN_USD" "$LEHOME_SPEND_OBSERVER_COMMAND" > "$LEHOME_INVOCATION_FILE"
 fi
 case "$LEHOME_RUN_ID" in fresh-run-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-01) ;; *) exit 2;; esac
 case "$LEHOME_ROUND_ID" in fresh-12k-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-01) ;; *) exit 2;; esac
+test "${LEHOME_SPEND_BASELINE_USD:-}" = 20.25
+test "${LEHOME_SPEND_BASELINE_AT_UTC:-}" = 2026-08-28T14:25:00Z
+test "${LEHOME_MAX_HOURLY_BURN_USD:-}" = 1.50
+test "${LEHOME_SPEND_OBSERVER_COMMAND:-}" = "$LEHOME_HOST_CODE_ROOT/scripts/run_conservative_spend_observer.py"
 LEHOME_CAMPAIGN_ROOT="/mnt/lehome/eval/$LEHOME_RUN_ID"
-export LEHOME_HOST_CODE_ROOT LEHOME_RUN_ID LEHOME_ROUND_ID LEHOME_CAMPAIGN_ROOT
+export LEHOME_HOST_CODE_ROOT LEHOME_RUN_ID LEHOME_ROUND_ID LEHOME_CAMPAIGN_ROOT LEHOME_SPEND_BASELINE_USD LEHOME_SPEND_BASELINE_AT_UTC LEHOME_MAX_HOURLY_BURN_USD LEHOME_SPEND_OBSERVER_COMMAND
 ```
 
 For an initial invocation, that campaign root must not exist before this
@@ -179,6 +189,59 @@ expected = {"top_long", "top_short", "pant_long", "pant_short"}
 if set(catalog) != expected or sum(map(len, catalog.values())) != 40 or any(len(set(items)) != 10 for items in catalog.values()):
     raise SystemExit("staged catalog is not exactly 40 unique seen garments, 10 per category")
 PY
+```
+
+### Start the conservative local spend observer
+
+The signed-in billing observation for Aug 27–28 was $20.25, last updated at
+`2026-08-28T14:25:00Z`. The invocation record above pins that amount and a
+conservative $1.50/hour upper-bound burn rate; never replace either on retry
+with a lower value. The observer makes **no** provider or Hub request. It
+writes the controller's exact `lehome_spend_observation_v1` schema every 30
+seconds and rounds the elapsed-time estimate upward with extra headroom. This
+is deliberately an upper bound: it may stop early, but cannot silently spend
+past the $99 controller cutoff.
+
+Run this after catalog readback and immediately before the paid controller. It
+persists the PID beside the invocation record, waits for a fresh receipt, and
+terminates the local observer whenever the controller exits (including after a
+trusted terminal GPU stop). Do not run the paid controller if any command
+below fails.
+
+```bash
+set -euo pipefail
+LEHOME_SPEND_OBSERVER=/mnt/lehome/operator/spend-observation.json
+LEHOME_SPEND_OBSERVER_PID_FILE="${LEHOME_INVOCATION_FILE}.spend-observer.pid"
+python3 "$LEHOME_SPEND_OBSERVER_COMMAND" \
+  --output "$LEHOME_SPEND_OBSERVER" \
+  --baseline-usd "$LEHOME_SPEND_BASELINE_USD" \
+  --baseline-observed-at-utc "$LEHOME_SPEND_BASELINE_AT_UTC" \
+  --max-hourly-burn-usd "$LEHOME_MAX_HOURLY_BURN_USD" \
+  --interval-seconds 30 \
+  --observer lehome-conservative-local-upper-bound-v1 &
+LEHOME_SPEND_OBSERVER_PID=$!
+kill -0 "$LEHOME_SPEND_OBSERVER_PID"
+(umask 077; printf '%s\n' "$LEHOME_SPEND_OBSERVER_PID" > "$LEHOME_SPEND_OBSERVER_PID_FILE")
+for _ in 1 2 3 4 5; do test -s "$LEHOME_SPEND_OBSERVER" && break; sleep 1; done
+python3 - "$LEHOME_SPEND_OBSERVER" <<'PY'
+import json
+import sys
+from datetime import UTC, datetime, timedelta
+
+receipt = json.load(open(sys.argv[1], encoding="utf-8"))
+required = {"schema_version", "kind", "observer", "observed_at_utc", "spent_usd"}
+observed = datetime.fromisoformat(receipt["observed_at_utc"].replace("Z", "+00:00"))
+if set(receipt) != required or receipt["kind"] != "lehome_spend_observation_v1" or observed < datetime.now(UTC) - timedelta(seconds=60):
+    raise SystemExit("spend observer receipt is missing, stale, or malformed")
+PY
+cleanup_spend_observer() {
+  if kill -0 "$LEHOME_SPEND_OBSERVER_PID" 2>/dev/null; then
+    kill -TERM "$LEHOME_SPEND_OBSERVER_PID"
+    wait "$LEHOME_SPEND_OBSERVER_PID" || true
+  fi
+}
+trap cleanup_spend_observer EXIT INT TERM
+export LEHOME_SPEND_OBSERVER
 ```
 
 ## 4. Offline dry run
@@ -233,7 +296,7 @@ sudo env -i \
   LEHOME_MAX_WALL_SECONDS=86399 \
   LEHOME_MAX_SPEND_USD=99.00 \
   LEHOME_RUNTIME_IDENTITY_JSON=/mnt/lehome/operator/runtime-identity.json \
-  LEHOME_SPEND_OBSERVER=/mnt/lehome/operator/spend-observation.json \
+  LEHOME_SPEND_OBSERVER="$LEHOME_SPEND_OBSERVER" \
   /mnt/lehome/lehome-challenge/rollout_appliance/run_simple_curriculum_collection.sh
 ```
 

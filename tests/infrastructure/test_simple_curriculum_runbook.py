@@ -54,6 +54,14 @@ def test_simple_curriculum_runbook_has_clean_environment_and_staged_catalog_cont
     assert "40 unique seen garments, 10 per category" in text
     assert "do not copy an old rollout input" in text
     assert "same IDs and exact command are reused rather than regenerated" in text
+    assert "run_conservative_spend_observer.py" in text
+    assert "LEHOME_SPEND_BASELINE_USD=20.25" in text
+    assert "LEHOME_SPEND_BASELINE_AT_UTC=2026-08-28T14:25:00Z" in text
+    assert "LEHOME_MAX_HOURLY_BURN_USD=1.50" in text
+    assert "LEHOME_SPEND_OBSERVER_COMMAND" in text
+    assert "--interval-seconds 30" in text
+    assert "trap cleanup_spend_observer EXIT INT TERM" in text
+    assert 'LEHOME_SPEND_OBSERVER="$LEHOME_SPEND_OBSERVER"' in paid
 
 
 def test_simple_curriculum_runbook_requires_root_owned_token_for_root_paid_process() -> None:
