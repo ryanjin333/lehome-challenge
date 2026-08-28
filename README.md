@@ -111,6 +111,9 @@ one RTX PRO 6000 role at a time, and the winner gate), see the
 [Nebius training and rollout runbook](docs/nebius_training_rollout.md) and
 [infrastructure/nebius/README.md](infrastructure/nebius/README.md).
 
+For the approved original-12K one-VM simple-curriculum collection, use the
+[operator handoff](docs/experiments/2026-08-27-simple-curriculum-runbook.md).
+
 #### Quick Start
 
 Train using one of the pre-configured training files:
