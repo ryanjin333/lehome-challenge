@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import textwrap
 
 import pytest
 
@@ -29,8 +30,8 @@ def _rows(partition_id: str, count: int, stage: str) -> list[dict[str, object]]:
         {
             "campaign_kind": "simple_curriculum_source_v1", "logical_stage": stage,
             "attempt_id": f"{partition_id}-{index:03d}", "trial_id": f"trial-{partition_id}-{index:03d}",
-            "garment": f"{prefixes[index % 4]}_Seen_{index % 10}",
-            "garment_name": f"{prefixes[index % 4]}_Seen_{index % 10}",
+            "garment": f"{prefixes[index % 4]}_Seen_{(index // 4) % 10}",
+            "garment_name": f"{prefixes[index % 4]}_Seen_{(index // 4) % 10}",
             "category": ("top_long", "top_short", "pant_long", "pant_short")[index % 4],
             "release_stage": "seen", "seed": 1_000_000 + index,
             "source_seed": 1_000_000 + index, "strategy": "canonical",
@@ -75,6 +76,99 @@ def test_exact_simple_curriculum_partitions_admit_validation_only_before_docker(
     result = subprocess.run(["bash", str(SCRIPT)], env=_environment(tmp_path, partition_id), capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     assert "docker" not in result.stdout.lower() + result.stderr.lower()
+
+
+def test_exact_simple_curriculum_uses_affined_four_slot_garment_waves_with_fresh_waves_disabled(tmp_path: Path) -> None:
+    environment = _environment(tmp_path, "calibration-head")
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    rows = _rows("calibration-head", 100, "calibration")
+    Path(environment["LEHOME_CAMPAIGN_ROOT"]).mkdir()
+    ledger = TaskLedger(
+        Path(environment["LEHOME_CAMPAIGN_ROOT"]) / "ledger.sqlite3", attempt_matrix=rows,
+        max_attempts=150, target_accepted=100, completion_metric="terminal_outcomes",
+    )
+    ledger.close()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    launches = tmp_path / "worker-launches.tsv"
+    token = tmp_path / "hf-token"
+    token.write_text("test-token", encoding="utf-8")
+    (fake_bin / "mkdir").write_text(textwrap.dedent("""\
+        #!/bin/sh
+        args=''
+        has_path=0
+        for arg in "$@"; do
+          case "$arg" in
+            /eval*|/kitcache*) ;;
+            -*) args="$args '$arg'" ;;
+            *) args="$args '$arg'"; has_path=1 ;;
+          esac
+        done
+        [ "$has_path" = 1 ] || exit 0
+        eval /bin/mkdir "$args"
+    """), encoding="utf-8")
+    (fake_bin / "stat").write_text("#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then echo 1234:600; else exec /usr/bin/stat \"$@\"; fi\n", encoding="utf-8")
+    (fake_bin / "docker").write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        set -euo pipefail
+        name=""; affinity=""; garment=""; worker_id=""; previous=""
+        for arg in "$@"; do
+          case "$previous" in
+            --name) name="$arg" ;;
+            -e) case "$arg" in LEHOME_EVALUATION_GARMENT_AFFINITY=*) affinity="${{arg#*=}}" ;; esac ;;
+            --initial-garment) garment="$arg" ;;
+            --worker-id) worker_id="$arg" ;;
+          esac
+          previous="$arg"
+        done
+        if [ "$name" = "lehome-12k-policy" ]; then
+          mkdir -p "$LEHOME_CAMPAIGN_ROOT/policy-receipts"
+          printf '%s' '{{"ready":true,"policy_sha256":"e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa","runtime_device":"cuda:0"}}' > "$LEHOME_CAMPAIGN_ROOT/policy-receipts/ready.json"
+        elif [[ "$name" = lehome-camp12k-w* ]]; then
+          printf '%s\\t%s\\t%s\\n' "$affinity" "$garment" "$worker_id" >> {str(launches)!r}
+          PYTHONPATH={str(ROOT / 'source' / 'lehome')!r} python3 - "$LEHOME_CAMPAIGN_ROOT" "$LEHOME_ATTEMPT_MATRIX" "$garment" "$worker_id" <<'PY'
+        import sys
+        from pathlib import Path
+        from lehome.flywheel.recovery_collection import load_attempt_matrix
+        from lehome.flywheel.task_ledger import TaskLedger
+
+        root, matrix_path, garment, worker_id = sys.argv[1:]
+        rows = load_attempt_matrix(Path(matrix_path))
+        ledger = TaskLedger(Path(root) / "ledger.sqlite3", attempt_matrix=rows,
+                            max_attempts=150, target_accepted=100, completion_metric="terminal_outcomes")
+        try:
+            while lease := ledger.lease_next(worker_id, lease_duration_ns=10**12,
+                                             assignment_filter={{"garment_name": garment}}):
+                ledger.record_terminal(worker_id, lease.attempt.attempt_id, lease.lease_id,
+                                       f"raw-{{worker_id}}-{{lease.attempt.attempt_id}}")
+                ledger.validate_terminal(lease.attempt.attempt_id, "rejected")
+        finally:
+            ledger.close()
+        PY
+        fi
+    """), encoding="utf-8")
+    for tool in fake_bin.iterdir():
+        tool.chmod(0o755)
+    environment.update({
+        "PATH": f"{fake_bin}:{os.environ['PATH']}", "LEHOME_VALIDATE_MATRIX_ONLY": "0",
+        "LEHOME_FRESH_GARMENT_WAVES": "0", "LEHOME_HF_TOKEN_FILE": str(token),
+        "LEHOME_ROLLOUT_PREEMPTION_CONTEXT": str(tmp_path / "preemption.json"),
+        "LEHOME_MAX_WORKER_RESTARTS": "0", "PYTHONPATH": str(ROOT / "source" / "lehome"),
+    })
+
+    result = subprocess.run(["bash", str(SCRIPT)], env=environment, capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert environment["LEHOME_FRESH_GARMENT_WAVES"] == "0"
+    observed = [line.split("\t") for line in launches.read_text(encoding="utf-8").splitlines()]
+    expected_garments = {str(row["garment_name"]) for row in rows}
+    assert len(expected_garments) == 40
+    assert len(observed) == len(expected_garments)
+    assert {affinity for affinity, _, _ in observed} == {"1"}
+    assert {garment for _, garment, _ in observed} == expected_garments
+    slots = [worker_id.rsplit("-", 1)[1] for _, _, worker_id in observed]
+    assert {slot: slots.count(slot) for slot in set(slots)} == {str(slot): 10 for slot in range(1, 5)}
 
 
 @pytest.mark.parametrize("field,value", [

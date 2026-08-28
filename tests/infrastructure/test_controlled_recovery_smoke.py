@@ -1182,7 +1182,10 @@ def test_terminal_evaluation_can_boot_four_fresh_garments_per_wave() -> None:
     source = (REPO_ROOT / "rollout_appliance" / "run_12k_campaign.sh").read_text(encoding="utf-8")
 
     assert 'FRESH_GARMENT_WAVES="${LEHOME_FRESH_GARMENT_WAVES:-${EVALUATION_TERMINAL_UPLOAD}}"' in source
-    assert 'LEHOME_EVALUATION_GARMENT_AFFINITY="${FRESH_GARMENT_WAVES}"' in source
+    assert 'GARMENT_AFFINITY="${FRESH_GARMENT_WAVES}"' in source
+    assert 'if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then' in source
+    assert "GARMENT_AFFINITY=1" in source
+    assert 'LEHOME_EVALUATION_GARMENT_AFFINITY="${GARMENT_AFFINITY}"' in source
     assert '--initial-garment "${worker_garment}"' in source
     assert 'worker-$((garment_index + 1))-${index}' in source
     assert 'garment_index=$((index - 1))' in source

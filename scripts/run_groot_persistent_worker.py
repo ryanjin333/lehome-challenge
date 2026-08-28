@@ -436,11 +436,15 @@ def run(args: argparse.Namespace, *, session_factory: Any = None, ledger_factory
     )
     if terminal_evaluation and not garment_affinity:
         raise ValueError("terminal CPU evaluation requires garment affinity")
-    if garment_affinity and not (terminal_evaluation or source_discovery):
-        raise ValueError("garment affinity is reserved for terminal CPU evaluation or source discovery")
+    if simple_curriculum_collection and not garment_affinity:
+        raise ValueError("simple curriculum CPU collection requires garment affinity")
+    if garment_affinity and not (terminal_evaluation or source_discovery or simple_curriculum_collection):
+        raise ValueError("garment affinity is reserved for terminal CPU evaluation, source discovery, or simple curriculum collection")
     if simple_curriculum_collection:
         if not _is_exact_simple_curriculum_partition(matrix, args):
             raise ValueError("simple curriculum CPU partition is invalid")
+        if not any(row.get("garment_name") == args.initial_garment for row in matrix):
+            raise ValueError("garment affinity is absent from the simple curriculum matrix")
     elif terminal_evaluation:
         if not _is_cpu_terminal_evaluation(matrix, args):
             raise ValueError("terminal evaluation matrix is invalid")

@@ -1017,8 +1017,8 @@ def test_exact_simple_curriculum_partition_opens_terminal_outcome_ledger_and_ret
         {
             "campaign_kind": "simple_curriculum_source_v1", "logical_stage": "calibration",
             "attempt_id": f"head-{index}", "trial_id": f"head-trial-{index}",
-            "garment": f"{prefixes[index % 4]}_Seen_{index % 10}",
-            "garment_name": f"{prefixes[index % 4]}_Seen_{index % 10}", "category": categories[index % 4],
+            "garment": f"{prefixes[index % 4]}_Seen_{(index // 4) % 10}",
+            "garment_name": f"{prefixes[index % 4]}_Seen_{(index // 4) % 10}", "category": categories[index % 4],
             "release_stage": "seen", "seed": 90_000 + index, "source_seed": 90_000 + index,
             "strategy": "canonical", "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64,
         }
@@ -1035,11 +1035,12 @@ def test_exact_simple_curriculum_partition_opens_terminal_outcome_ledger_and_ret
     monkeypatch.delenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", raising=False)
     monkeypatch.delenv("LEHOME_SUCCESS_REPLAY_CAMPAIGN", raising=False)
     monkeypatch.delenv("LEHOME_HARD_STATE_CAMPAIGN", raising=False)
+    monkeypatch.setenv("LEHOME_EVALUATION_GARMENT_AFFINITY", "1")
     args = types.SimpleNamespace(
         device="cpu", renderer_device="cuda:0", policy_device="cuda:0", lease_seconds=30.0,
         preparation_timeout_seconds=30.0, attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
         max_attempts=150, target_accepted=100, completion_metric="terminal_outcomes",
-        simple_curriculum_collection=True,
+        simple_curriculum_collection=True, initial_garment="Top_Long_Seen_0",
     )
 
     with pytest.raises(RuntimeError, match="ledger reached"):
@@ -1054,6 +1055,74 @@ def test_exact_simple_curriculum_partition_opens_terminal_outcome_ledger_and_ret
     assert LedgerWorkerController(RetryLedger(), lease_duration_ns=1, retry_infrastructure_aborts=True).record_infrastructure_abort(
         "worker", "attempt", "lease", reason="isaac_timeout"
     ) == "retryable"
+
+
+def test_exact_simple_curriculum_worker_affinity_filters_its_boot_garment(tmp_path, monkeypatch) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(repository / "source" / "lehome"))
+    monkeypatch.syspath_prepend(str(repository))
+    import scripts.run_groot_persistent_worker as worker_module
+
+    prefixes = ("Top_Long", "Top_Short", "Pant_Long", "Pant_Short")
+    categories = ("top_long", "top_short", "pant_long", "pant_short")
+    rows = [
+        {
+            "campaign_kind": "simple_curriculum_source_v1", "logical_stage": "calibration",
+            "attempt_id": f"head-{index}", "trial_id": f"head-trial-{index}",
+            "garment": f"{prefixes[index % 4]}_Seen_{(index // 4) % 10}",
+            "garment_name": f"{prefixes[index % 4]}_Seen_{(index // 4) % 10}", "category": categories[index % 4],
+            "release_stage": "seen", "seed": 90_000 + index, "source_seed": 90_000 + index,
+            "strategy": "canonical", "partition_id": "calibration-head", "parent_matrix_sha256": "a" * 64,
+        }
+        for index in range(100)
+    ]
+    matrix = tmp_path / "head.json"
+    matrix.write_text(json.dumps(rows), encoding="utf-8")
+    assert len({row["garment_name"] for row in rows}) == 40
+    leased_garments: list[str] = []
+
+    class FakeWorker:
+        def __init__(self, **kwargs):
+            self.controller = kwargs["controller"]
+
+        def run(self):
+            while lease := self.controller.lease_next(f"worker-2-{len(leased_garments)}"):
+                leased_garments.append(str(lease.attempt.assignment["garment_name"]))
+            return []
+
+    monkeypatch.setattr(worker_module, "PersistentRolloutWorker", FakeWorker)
+    monkeypatch.setenv("LEHOME_EVALUATION_GARMENT_AFFINITY", "1")
+    monkeypatch.delenv("LEHOME_EVALUATION_TERMINAL_UPLOAD", raising=False)
+    monkeypatch.delenv("LEHOME_SUCCESS_REPLAY_CAMPAIGN", raising=False)
+    monkeypatch.delenv("LEHOME_HARD_STATE_CAMPAIGN", raising=False)
+    args = types.SimpleNamespace(
+        device="cpu", renderer_device="cuda:0", policy_device="cuda:0", lease_seconds=30.0,
+        preparation_timeout_seconds=30.0, attempt_matrix=matrix, database=tmp_path / "ledger.sqlite3",
+        max_attempts=150, target_accepted=100, completion_metric="terminal_outcomes",
+        simple_curriculum_collection=True, initial_garment="Top_Short_Seen_1",
+        worker_id="worker-2", session_id="session-2", output_root=tmp_path / "output",
+    )
+
+    def ledger_factory(*ledger_args, **ledger_kwargs):
+        from lehome.flywheel.task_ledger import TaskLedger
+
+        return TaskLedger(*ledger_args, **ledger_kwargs)
+
+    assert worker_module.run(args, ledger_factory=ledger_factory) == []
+    assert leased_garments
+    assert set(leased_garments) == {"Top_Short_Seen_1"}
+
+    from lehome.flywheel.task_ledger import TaskLedger
+
+    ledger = TaskLedger(args.database, attempt_matrix=rows, max_attempts=150,
+                        target_accepted=100, completion_metric="terminal_outcomes")
+    try:
+        assert all(ledger.status(attempt.attempt_id) == "leased"
+                   for attempt in ledger.attempts() if attempt.assignment["garment_name"] == "Top_Short_Seen_1")
+        assert all(ledger.status(attempt.attempt_id) == "pending"
+                   for attempt in ledger.attempts() if attempt.assignment["garment_name"] != "Top_Short_Seen_1")
+    finally:
+        ledger.close()
 
 
 def test_parsed_default_simulator_inherits_a_nonzero_renderer_gpu(monkeypatch, tmp_path) -> None:

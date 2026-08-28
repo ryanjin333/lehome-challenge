@@ -72,6 +72,13 @@ PYTHONPATH_HOST="/opt/lehome/source/lehome:/opt/lehome/trainer/src:/opt/lehome"
 RESUME_PREEMPTED_ROLLOUT="${LEHOME_RESUME_PREEMPTED_ROLLOUT:-0}"
 EVALUATION_TERMINAL_UPLOAD="${LEHOME_EVALUATION_TERMINAL_UPLOAD:-0}"
 FRESH_GARMENT_WAVES="${LEHOME_FRESH_GARMENT_WAVES:-${EVALUATION_TERMINAL_UPLOAD}}"
+GARMENT_AFFINITY="${FRESH_GARMENT_WAVES}"
+if [ "${SIMPLE_CURRICULUM_COLLECTION}" = "1" ]; then
+  # CPU cloth cannot hot-switch the immutable garment cache between leases.
+  # This exact collection mode keeps its external fresh-wave flag at 0 while
+  # using the same per-garment slot scheduling as terminal evaluation.
+  GARMENT_AFFINITY=1
+fi
 LEDGER_MAX_ATTEMPTS="${MAX_ATTEMPTS}"
 if [ "${EVALUATION_TERMINAL_UPLOAD}" = "1" ]; then
   # The frozen evaluation still contains exactly MAX_ATTEMPTS distinct rows.
@@ -475,7 +482,7 @@ if [ "${RESUME_PREEMPTED_ROLLOUT}" = "1" ] && [ "${CONTROLLED_RECOVERY_SMOKE}" !
 fi
 mkdir -p "${CAMPAIGN_ROOT}"
 evaluation_garments=()
-if [ "${FRESH_GARMENT_WAVES}" = "1" ]; then
+if [ "${GARMENT_AFFINITY}" = "1" ]; then
   while IFS= read -r garment; do
     evaluation_garments+=("${garment}")
   done < <(python3 - "${MATRIX}" <<'PY'
@@ -487,7 +494,7 @@ seen = set()
 for row in rows:
     garment = row.get("garment_name") or row.get("garment")
     if not isinstance(garment, str) or not garment:
-        raise SystemExit("terminal evaluation garment identity is invalid")
+        raise SystemExit("garment affinity identity is invalid")
     if garment not in seen:
         print(garment)
         seen.add(garment)
@@ -850,7 +857,7 @@ launch_worker() {
     -e OMNI_USER_DIR=/kitcache/ov \
     -e LEHOME_DISABLE_KEYBOARD=1 \
     -e LEHOME_EVALUATION_TERMINAL_UPLOAD="${EVALUATION_TERMINAL_UPLOAD}" \
-    -e LEHOME_EVALUATION_GARMENT_AFFINITY="${FRESH_GARMENT_WAVES}" \
+    -e LEHOME_EVALUATION_GARMENT_AFFINITY="${GARMENT_AFFINITY}" \
     -e LEHOME_SUCCESS_REPLAY_CAMPAIGN="${SUCCESS_REPLAY_CAMPAIGN}" \
     -e LEHOME_HARD_STATE_CAMPAIGN="${HARD_STATE_CAMPAIGN}" \
     -e LEHOME_SIMPLE_CURRICULUM_COLLECTION="${SIMPLE_CURRICULUM_COLLECTION}" \
@@ -893,7 +900,7 @@ launch_worker() {
     echo "worker ${index} exited while still owning an active lease" >&2
     return 71
   fi
-  if [ "${FRESH_GARMENT_WAVES}" = "1" ] \
+  if [ "${GARMENT_AFFINITY}" = "1" ] \
       && ! lehome_worker_affinity_is_drained "${LEDGER}" "${worker_garment}"; then
     echo "worker ${index} exited before draining garment ${worker_garment}" >&2
     return 72
@@ -903,7 +910,7 @@ launch_worker() {
 
 # Production remains exactly four workers; lower width is an explicit smoke.
 worker_status=0
-if [ "${FRESH_GARMENT_WAVES}" = "1" ]; then
+if [ "${GARMENT_AFFINITY}" = "1" ]; then
   run_garment_slot() {
     local index="$1"
     local garment_index=$((index - 1))
