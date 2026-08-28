@@ -56,6 +56,16 @@ def test_simple_curriculum_runbook_has_clean_environment_and_staged_catalog_cont
     assert "same IDs and exact command are reused rather than regenerated" in text
 
 
+def test_simple_curriculum_runbook_requires_root_owned_token_for_root_paid_process() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    paid = _paid_command(text)
+
+    assert "sudo env -i" in paid
+    assert "publisher runs as root through `sudo env -i`" in text
+    assert "test \"$(stat -c '%u' /mnt/lehome/secrets/hf_token)\" = 0" in text
+    assert "test \"$(stat -c '%a' /mnt/lehome/secrets/hf_token)\" = 600" in text
+
+
 def test_simple_curriculum_runbook_orders_provider_start_and_post_start_checkpoints() -> None:
     text = RUNBOOK.read_text(encoding="utf-8")
 

@@ -43,9 +43,10 @@ identity; they do not substitute for the post-start host checks below.
 2. Confirm the public destination is `ryanjin333/lehome-groot-n17-rollouts`
    and that anonymous access works for a harmless existing public object. The
    new immutable prefix will be `collection-rounds/<run-id>` and must not
-   already exist. Check the token path, not its contents: it must be a regular
-   non-symlink `0600`, nonempty file at `/mnt/lehome/secrets/hf_token` once the
-   workspace is mounted.
+   already exist. Check the token path, not its contents: because the paid
+   publisher runs as root through `sudo env -i`, it must be a root-owned,
+   regular non-symlink `0600`, nonempty file at
+   `/mnt/lehome/secrets/hf_token` once the workspace is mounted.
 
 3. Confirm the provider spend view is below $99.00 and prepare a current typed
    spend receipt at `/mnt/lehome/operator/spend-observation.json`. The receipt
@@ -85,6 +86,7 @@ test -d "$LEHOME_HOST_CODE_ROOT/source/lehome" && test ! -L "$LEHOME_HOST_CODE_R
 test -d "$LEHOME_HOST_CODE_ROOT/trainer/src" && test ! -L "$LEHOME_HOST_CODE_ROOT/trainer/src"
 test -x /usr/local/libexec/lehome-stop-gpu
 test -f /mnt/lehome/secrets/hf_token && test ! -L /mnt/lehome/secrets/hf_token
+test "$(stat -c '%u' /mnt/lehome/secrets/hf_token)" = 0
 test "$(stat -c '%a' /mnt/lehome/secrets/hf_token)" = 600
 test -s /mnt/lehome/secrets/hf_token
 ```
