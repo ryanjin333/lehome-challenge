@@ -74,9 +74,21 @@ cloud-init, mount, GPU, original-12K, CPU-cloth, image, or content mismatch is
 an infrastructure stop: stop the exact VM through the trusted hook, report,
 and do not launch collection.
 
+Run this operator-side command against the already-approved RUNNING VM. It
+prints a non-secret JSON receipt; it stages no provider resource and only
+creates `/mnt/lehome/runtime-code/<reviewed-revision>` after all remote checks
+pass.
+
+```bash
+./scripts/stage_simple_curriculum_runtime_code.sh --ssh-target "${LEHOME_VM_SSH_TARGET:?set approved SSH target}"
+```
+
+Then log in to that same approved VM and run:
+
 ```bash
 set -euo pipefail
-LEHOME_HOST_CODE_ROOT=/mnt/lehome/lehome-challenge
+LEHOME_REVIEWED_REVISION=551a85e2105003365a7c33a26af1d5f5924181d7
+LEHOME_HOST_CODE_ROOT="/mnt/lehome/runtime-code/$LEHOME_REVIEWED_REVISION"
 test -d "$LEHOME_HOST_CODE_ROOT" && test ! -L "$LEHOME_HOST_CODE_ROOT"
 cloud-init status --wait
 mountpoint -q /mnt/lehome
@@ -111,7 +123,8 @@ the same IDs and exact command are reused rather than regenerated.
 
 ```bash
 set -euo pipefail
-LEHOME_HOST_CODE_ROOT=/mnt/lehome/lehome-challenge
+LEHOME_REVIEWED_REVISION=551a85e2105003365a7c33a26af1d5f5924181d7
+LEHOME_HOST_CODE_ROOT="/mnt/lehome/runtime-code/$LEHOME_REVIEWED_REVISION"
 LEHOME_INVOCATION_FILE=/mnt/lehome/operator/simple-curriculum-invocation.env
 if test -e "$LEHOME_INVOCATION_FILE"; then
   test -f "$LEHOME_INVOCATION_FILE" && test ! -L "$LEHOME_INVOCATION_FILE"
@@ -297,7 +310,7 @@ sudo env -i \
   LEHOME_MAX_SPEND_USD=99.00 \
   LEHOME_RUNTIME_IDENTITY_JSON=/mnt/lehome/operator/runtime-identity.json \
   LEHOME_SPEND_OBSERVER="$LEHOME_SPEND_OBSERVER" \
-  /mnt/lehome/lehome-challenge/rollout_appliance/run_simple_curriculum_collection.sh
+  "$LEHOME_HOST_CODE_ROOT/rollout_appliance/run_simple_curriculum_collection.sh"
 ```
 
 The wrapper admits no provider lifecycle command. It delegates the trusted
