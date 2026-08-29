@@ -20,6 +20,7 @@ from scripts.eval_groot_n17_public96 import (
     load_frozen_matrix,
     run,
     tree_sha256,
+    validate_policy_server_startup_timeout,
     validate_checkpoint_identity,
     validate_output_path,
     verify_result,
@@ -476,6 +477,16 @@ def test_real_video_filename_contract_uses_saver_dot_replacement() -> None:
         video_filename_for_key(0, "observation.top_rgb")
 
 
+def test_policy_server_startup_timeout_uses_a_large_model_safe_default() -> None:
+    assert validate_policy_server_startup_timeout(180.0) == 180.0
+
+
+@pytest.mark.parametrize("timeout", (29.0, 601.0, 0.0, True, "180"))
+def test_policy_server_startup_timeout_rejects_unsafe_values(timeout: object) -> None:
+    with pytest.raises(Public96ContractError, match="startup timeout"):
+        validate_policy_server_startup_timeout(timeout)
+
+
 def test_authenticated_readiness_uses_a_real_token_checked_loopback_socket(monkeypatch: pytest.MonkeyPatch) -> None:
     zmq = pytest.importorskip("zmq")
     if "torch" not in sys.modules:
@@ -606,7 +617,17 @@ def test_synthetic_successful_run_writes_complete_result_and_verifier_receipt(tm
         def wait(self, timeout=None): return 0
         def kill(self): pass
 
+    stage_commands: list[list[str]] = []
+    readiness_receipt: Path | None = None
+    readiness_probe_passed = False
+    sleep_calls = 0
+
+    def readiness_payload() -> dict[str, object]:
+        return {"kind": "lehome_groot_n17_public96_policy_server_readiness_v1", "artifact_sha256": CHECKPOINT["artifact_sha256"], "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"], "model_path": str(policy.resolve()), "device": "cuda:0", "adapter": "nvidia_gr00t_policy_server_public96_v1", "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}}
+
     def fake_run(command, *, cwd, text, stdout, stderr, check):
+        assert readiness_probe_passed
+        stage_commands.append(command)
         stage_root = Path(command[command.index("--video_dir") + 1]).parent
         output = []
         for episode_index, success in ((1, True), (2, False)):
@@ -619,17 +640,33 @@ def test_synthetic_successful_run_writes_complete_result_and_verifier_receipt(tm
         return SimpleNamespace(returncode=0, stdout="\n".join(output))
 
     def fake_popen(command, *args, **kwargs):
-        receipt = Path(command[command.index("--readiness-receipt") + 1])
-        receipt.write_text(json.dumps({"kind": "lehome_groot_n17_public96_policy_server_readiness_v1", "artifact_sha256": CHECKPOINT["artifact_sha256"], "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"], "model_path": str(policy.resolve()), "device": "cuda:0", "adapter": "nvidia_gr00t_policy_server_public96_v1", "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}}), encoding="utf-8")
+        nonlocal readiness_receipt
+        readiness_receipt = Path(command[command.index("--readiness-receipt") + 1])
         return Server()
+
+    def delayed_readiness_sleep(_: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        assert stage_commands == []
+        if sleep_calls == 25:
+            assert readiness_receipt is not None
+            readiness_receipt.write_text(json.dumps(readiness_payload()), encoding="utf-8")
+
+    def fake_authenticated_readiness(**_: object) -> None:
+        nonlocal readiness_probe_passed
+        assert readiness_receipt is not None and readiness_receipt.is_file()
+        assert sleep_calls == 25
+        readiness_probe_passed = True
+
     monkeypatch.setattr(evaluator.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(evaluator.subprocess, "run", fake_run)
-    monkeypatch.setattr(evaluator, "await_authenticated_policy_server_ready", lambda **_: None)
-    monkeypatch.setattr(evaluator.time, "sleep", lambda _: None)
+    monkeypatch.setattr(evaluator, "await_authenticated_policy_server_ready", fake_authenticated_readiness)
+    monkeypatch.setattr(evaluator.time, "sleep", delayed_readiness_sleep)
     monkeypatch.setenv("LEHOME_GROOT_N17_PUBLIC96_POLICY_TOKEN", "x" * 32)
     output_root = tmp_path / "run"
     result = run(SimpleNamespace(matrix=MATRIX, matrix_sha256=MATRIX_SHA256, policy_path=policy, checkpoint_identity_receipt=identity, asset_root=tmp_path / "assets", output_root=output_root, policy_server_port=9117, policy_server_token_env="LEHOME_GROOT_N17_PUBLIC96_POLICY_TOKEN", dry_run=False))
     assert len(result["episodes"]) == 96
+    assert len(stage_commands) == 48 and sleep_calls == 25 and readiness_probe_passed
     assert (output_root / "result.json").is_file()
     assert (output_root / "verifier-receipt.json").is_file()
 

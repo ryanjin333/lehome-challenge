@@ -42,6 +42,12 @@ second (`mesh_points`) value from `get_current_mesh_points()`, finite validated
 indices, and the raw `success_distance` values with no `init_scale` multiplier.
 It has no transformed-point fallback.
 
+The policy-server receipt is written only after the loaded server accepts an
+authenticated loopback ping. Its model-startup wait defaults to 180 seconds
+and is bounded to 30–600 seconds through `--policy-server-startup-timeout`.
+Use the default unless the provider logs show a legitimately slower cold model
+load; this setting does not start CUDA during `--dry-run`.
+
 Each valid clean policy failure remains a scored failure. Any missing video,
 log, stage receipt, malformed metrics, policy-server failure, or cloth/fidelity
 invalid makes the run invalid rather than reducing the denominator. The final

@@ -42,6 +42,9 @@ CHECKPOINT = {
 }
 _HEX = re.compile(r"^[0-9a-f]{64}$")
 _EPISODE = re.compile(r"Episode\s+(?P<index>[12])/2:\s+Return=(?P<return>[-+]?\d+(?:\.\d+)?),\s+Length=(?P<length>\d+),\s+Success=(?P<success>True|False)")
+_POLICY_SERVER_STARTUP_TIMEOUT_DEFAULT_SECONDS = 180.0
+_POLICY_SERVER_STARTUP_TIMEOUT_MIN_SECONDS = 30.0
+_POLICY_SERVER_STARTUP_TIMEOUT_MAX_SECONDS = 600.0
 
 
 class Public96ContractError(ValueError):
@@ -50,6 +53,16 @@ class Public96ContractError(ValueError):
 
 class CheckpointIdentityError(Public96ContractError):
     """The checked N1.7 cache is not the immutable 12K policy."""
+
+
+def validate_policy_server_startup_timeout(value: object) -> float:
+    """Keep GPU model initialization bounded without treating it as a 2s probe."""
+    if type(value) not in {int, float}:
+        raise Public96ContractError("policy server startup timeout must be a number of seconds")
+    timeout = float(value)
+    if not _POLICY_SERVER_STARTUP_TIMEOUT_MIN_SECONDS <= timeout <= _POLICY_SERVER_STARTUP_TIMEOUT_MAX_SECONDS:
+        raise Public96ContractError("policy server startup timeout must be between 30 and 600 seconds")
+    return timeout
 
 
 def video_filename_for_key(source_index: int, key: str) -> str:
@@ -556,6 +569,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-path", type=Path, required=True); parser.add_argument("--checkpoint-identity-receipt", type=Path, required=True)
     parser.add_argument("--asset-root", type=Path, required=True); parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--policy-server-port", type=int, default=9117); parser.add_argument("--policy-server-token-env", default="LEHOME_GROOT_N17_PUBLIC96_POLICY_TOKEN")
+    parser.add_argument("--policy-server-startup-timeout", type=validate_policy_server_startup_timeout, default=_POLICY_SERVER_STARTUP_TIMEOUT_DEFAULT_SECONDS)
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -594,6 +608,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     stages = load_frozen_matrix(args.matrix, args.matrix_sha256); matrix_digest = _matrix_digest(args.matrix, args.matrix_sha256)
     identity = validate_checkpoint_identity(_read_json(args.checkpoint_identity_receipt, "checkpoint identity receipt"), args.policy_path)
     validate_release_assets(args.asset_root, stages)
+    startup_timeout = validate_policy_server_startup_timeout(getattr(args, "policy_server_startup_timeout", _POLICY_SERVER_STARTUP_TIMEOUT_DEFAULT_SECONDS))
     if not args.output_root.is_absolute() or args.output_root.exists() or args.output_root.is_symlink() or not args.output_root.parent.is_dir():
         raise Public96ContractError("output root must be a new absolute path beneath an existing safe parent")
     args.output_root.mkdir(); output_root = args.output_root.resolve(strict=True)
@@ -601,7 +616,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     policy_command = build_policy_server_command(policy_path=args.policy_path, port=args.policy_server_port, token_env=args.policy_server_token_env, readiness_receipt=readiness_receipt)
     stage_commands = [build_stage_command(stage, repo_root=Path.cwd(), policy_path=args.policy_path, output_root=output_root, policy_server_port=args.policy_server_port, token_env=args.policy_server_token_env) for stage in stages]
     assignments = [{"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_indices": list(stage.episode_indices), "overlay_path": str(_stage_dir(output_root, stage) / "garment-config"), "command": command} for stage, command in zip(stages, stage_commands, strict=True)]
-    base = {"kind": "lehome_groot_n17_public96_validation_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "policy_server_command": policy_command, "stage_commands": stage_commands, "assignments": assignments, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
+    base = {"kind": "lehome_groot_n17_public96_validation_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "policy_server_command": policy_command, "policy_server_startup_timeout_seconds": startup_timeout, "stage_commands": stage_commands, "assignments": assignments, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
     if args.dry_run:
         _write_new_json(output_root / "validation-only-receipt.json", base)
         return base
@@ -620,10 +635,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             startup_failure = Public96ContractError(f"policy server startup failed: {error}")
         if startup_failure is None:
             try:
-                for _ in range(20):
-                    if readiness_receipt.is_file(): break
-                    if server.poll() is not None: break
-                    time.sleep(0.1)
+                deadline = time.monotonic() + startup_timeout
+                delay = 0.1
+                while not readiness_receipt.is_file() and server.poll() is None:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        raise Public96ContractError("N1.7 policy server did not produce readiness before the startup timeout")
+                    time.sleep(min(delay, max(0.0, deadline - now)))
+                    delay = min(delay * 2, 1.0)
                 if server.poll() is not None or not readiness_receipt.is_file():
                     raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
                 readiness = _validate_readiness_payload(_read_json(readiness_receipt, "policy server readiness"), policy_root=args.policy_path)
