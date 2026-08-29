@@ -23,6 +23,7 @@ MANIFEST_FILENAME = "reference-checkpoint-view.json"
 
 _CONFIG_FILENAME = "config.json"
 _SCHEMA_VERSION = 1
+_VIEW_MODE = 0o755
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
 _REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -135,10 +136,13 @@ def _validate_trust_inputs(
 def _validate_expected_artifacts(
     expected_artifacts: Mapping[str, Mapping[str, object]],
 ) -> dict[str, dict[str, object]]:
-    if type(expected_artifacts) is not dict or not expected_artifacts:
+    if not isinstance(expected_artifacts, Mapping) or not expected_artifacts:
         raise ValueError("expected artifacts must be a nonempty JSON object")
+    names = list(expected_artifacts.keys())
+    if any(type(name) is not str for name in names):
+        raise ValueError("expected artifacts contain an invalid name type")
     normalized: dict[str, dict[str, object]] = {}
-    for name in sorted(expected_artifacts):
+    for name in sorted(names):
         value = expected_artifacts[name]
         if (
             type(name) is not str
@@ -146,10 +150,13 @@ def _validate_expected_artifacts(
             or name in {_CONFIG_FILENAME, MANIFEST_FILENAME}
         ):
             raise ValueError("expected artifacts contain an unsafe name")
-        if type(value) is not dict or set(value) != {"size", "sha256"}:
+        if not isinstance(value, Mapping):
             raise ValueError(f"expected artifacts entry {name} has an invalid schema")
-        size = value.get("size")
-        digest = value.get("sha256")
+        entry = dict(value)
+        if any(type(key) is not str for key in entry) or set(entry) != {"size", "sha256"}:
+            raise ValueError(f"expected artifacts entry {name} has an invalid schema")
+        size = entry.get("size")
+        digest = entry.get("sha256")
         if type(size) is not int or size < 0:
             raise ValueError(f"expected artifacts entry {name} has an invalid size")
         if type(digest) is not str or _SHA256.fullmatch(digest) is None:
@@ -594,6 +601,8 @@ def verify_reference_checkpoint(
     symlink_snapshots: list[_SymlinkSnapshot] = []
     try:
         view_directory = _open_directory_snapshot(destination, "destination view directory")
+        if stat.S_IMODE(view_directory.initial_metadata.st_mode) != _VIEW_MODE:
+            raise ValueError("destination view mode must be exactly 0755")
         expected_source_names = {_CONFIG_FILENAME, *normalized_expected_artifacts}
         expected_view_names = {_CONFIG_FILENAME, MANIFEST_FILENAME, *normalized_expected_artifacts}
         if source_directory.initial_entries != expected_source_names:
@@ -721,6 +730,7 @@ def prepare_reference_checkpoint(
         for row in artifact_rows:
             (temporary / row["relative_name"]).symlink_to(row["absolute_target"])
         _write_exclusive(temporary / MANIFEST_FILENAME, _canonical_json(manifest))
+        os.chmod(temporary, _VIEW_MODE)
         _fsync_directory(temporary)
         temporary_metadata = temporary.lstat()
         _publish_directory_exclusively(temporary, destination)
@@ -782,4 +792,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        raise SystemExit(2) from None

@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
+from types import MappingProxyType
 
 import pytest
 
@@ -96,6 +98,9 @@ def test_prepare_creates_canonical_provenance_bound_no_copy_view(tmp_path: Path)
 
     manifest = _prepare(source, destination, digest)
 
+    mode = stat.S_IMODE(destination.stat().st_mode)
+    assert mode == 0o755
+    assert mode & 0o055 == 0o055
     adapted = json.loads((destination / "config.json").read_text(encoding="utf-8"))
     expected_adapted = {
         key: value
@@ -113,6 +118,7 @@ def test_prepare_creates_canonical_provenance_bound_no_copy_view(tmp_path: Path)
         json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
     ).encode("ascii")
     assert _verify(source, destination, digest) == manifest
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o755
 
     artifact_names = sorted(path.name for path in source.iterdir() if path.name != "config.json")
     assert [row["relative_name"] for row in manifest["linked_artifacts"]] == artifact_names
@@ -347,6 +353,33 @@ def test_verify_rejects_source_config_mutation(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
         _verify(source, destination, digest)
+
+
+def test_verify_rejects_untraversable_view_mode(tmp_path: Path) -> None:
+    source, digest, _ = _source(tmp_path)
+    expected_artifacts = _expected_artifacts(source)
+    destination = tmp_path / "view"
+    _prepare(source, destination, digest, expected_artifacts)
+    destination.chmod(0o700)
+
+    with pytest.raises(ValueError, match="mode.*0755"):
+        _verify(source, destination, digest, expected_artifacts)
+
+
+def test_artifact_trust_anchor_accepts_mapping_and_rejects_mixed_key_types(tmp_path: Path) -> None:
+    source, digest, _ = _source(tmp_path)
+    expected_artifacts = _expected_artifacts(source)
+    readonly_mapping = MappingProxyType(
+        {name: MappingProxyType(value) for name, value in expected_artifacts.items()},
+    )
+    destination = tmp_path / "view"
+    _prepare(source, destination, digest, readonly_mapping)
+    assert _verify(source, destination, digest, readonly_mapping)["schema_version"] == 1
+
+    invalid = dict(expected_artifacts)
+    invalid[1] = {"size": 1, "sha256": "0" * 64}
+    with pytest.raises(ValueError, match="expected artifacts.*name"):
+        _verify(source, destination, digest, invalid)
 
 
 def test_cli_create_and_verify_modes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
