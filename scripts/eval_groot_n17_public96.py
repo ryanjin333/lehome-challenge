@@ -93,6 +93,15 @@ def tree_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
+def canonical_policy_artifact_sha256(policy_root: Path) -> str:
+    """Use the established rollout verifier, never a caller-provided digest."""
+    try:
+        from scripts.run_groot_flywheel_trial import policy_artifact_sha256
+        return policy_artifact_sha256(policy_root)
+    except (ImportError, ValueError) as error:
+        raise CheckpointIdentityError("checkpoint artifact cannot be proven by the canonical verifier") from error
+
+
 def _read_json(path: Path, label: str) -> Mapping[str, Any]:
     if path.is_symlink() or not path.is_file():
         raise Public96ContractError(f"{label} is missing or unsafe")
@@ -138,7 +147,7 @@ def load_frozen_matrix(path: Path, checksum_path: Path) -> tuple[Stage, ...]:
             raise Public96ContractError(f"stage {index} fields are invalid") from error
         if (not isinstance(stage.stage_id, str) or not stage.stage_id or stage.category not in CATEGORIES
                 or stage.release_stage not in {"seen", "unseen"} or type(stage.seed) is not int or stage.seed != 42
-                or stage.episode_indices != (0, 1)):
+                or stage.episode_indices != (1, 2)):
             raise Public96ContractError(f"stage {index} violates the sequential two-episode contract")
         expected_garment = f"{CATEGORY_PREFIX[stage.category]}_{'Seen' if stage.release_stage == 'seen' else 'Unseen'}_"
         if not isinstance(stage.garment_name, str) or not stage.garment_name.startswith(expected_garment):
@@ -168,6 +177,9 @@ def validate_checkpoint_identity(receipt: Mapping[str, object], policy_root: Pat
             label = "runtime policy" if name == "runtime_policy_sha256" else name.replace("_", " ")
             raise CheckpointIdentityError(f"checkpoint {label} identity mismatch")
     root = policy_root.resolve(strict=True)
+    artifact = canonical_policy_artifact_sha256(root)
+    if artifact != CHECKPOINT["artifact_sha256"]:
+        raise CheckpointIdentityError("checkpoint artifact SHA-256 mismatch")
     if receipt.get("cache_path") != str(root) or receipt.get("cache_tree_sha256") != tree_sha256(root):
         raise CheckpointIdentityError("checkpoint immutable cache identity mismatch")
     return dict(receipt)
@@ -230,8 +242,8 @@ def _make_overlay(asset_root: Path, stage_root: Path, garment_name: str) -> None
 def _parse_stage_metrics(log: str) -> list[dict[str, object]]:
     records = []
     for match in _EPISODE.finditer(log):
-        records.append({"episode_index": int(match.group("index")) - 1, "return": float(match.group("return")), "length": int(match.group("length")), "success": match.group("success") == "True"})
-    if len(records) != 2 or [record["episode_index"] for record in records] != [0, 1]:
+        records.append({"episode_index": int(match.group("index")), "return": float(match.group("return")), "length": int(match.group("length")), "success": match.group("success") == "True"})
+    if len(records) != 2 or [record["episode_index"] for record in records] != [1, 2]:
         raise Public96ContractError("stage did not emit exactly two sequential episode metrics")
     return records
 
@@ -249,12 +261,26 @@ def _write_new_json(path: Path, value: Mapping[str, object]) -> None:
     path.write_text(json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def verify_result(result: Mapping[str, object], *, stages: Sequence[Stage], matrix_sha256: str) -> dict[str, object]:
+def _verified_artifact(value: object, *, root: Path, expected_path: str | None = None) -> None:
+    if not isinstance(value, Mapping) or set(value) != {"relative_path", "sha256"}:
+        raise Public96ContractError("artifact descriptor is invalid")
+    relative, digest = value.get("relative_path"), value.get("sha256")
+    if not isinstance(relative, str) or not _HEX.fullmatch(digest if isinstance(digest, str) else ""):
+        raise Public96ContractError("artifact descriptor is invalid")
+    if expected_path is not None and relative != expected_path:
+        raise Public96ContractError("artifact relative path does not bind its episode")
+    path = validate_output_path(root, root / relative)
+    if path != root / relative or sha256_file(path) != digest:
+        raise Public96ContractError("artifact file digest mismatch")
+
+
+def verify_result(result: Mapping[str, object], *, stages: Sequence[Stage], matrix_sha256: str, output_root: Path) -> dict[str, object]:
     if result.get("kind") != "lehome_groot_n17_public96_result_v1" or result.get("matrix_sha256") != matrix_sha256:
         raise Public96ContractError("public96 result identity is invalid")
     checkpoint = result.get("checkpoint")
     episodes = result.get("episodes")
-    if not isinstance(checkpoint, Mapping) or checkpoint.get("runtime_policy_sha256") != CHECKPOINT["runtime_policy_sha256"] or not isinstance(episodes, list) or len(episodes) != 96:
+    overlay = result.get("raw_checker_overlay")
+    if not isinstance(checkpoint, Mapping) or dict(checkpoint) != CHECKPOINT or not isinstance(overlay, Mapping) or dict(overlay) != {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()} or not isinstance(episodes, list) or len(episodes) != 96:
         raise Public96ContractError("public96 result must contain exactly 96 episodes and the pinned runtime policy")
     expected = {(stage.stage_id, stage.episode_indices[index]): stage for stage in stages for index in range(2)}
     seen: set[tuple[str, int]] = set(); categories: dict[str, Counter[str]] = {category: Counter() for category in CATEGORIES}
@@ -271,8 +297,23 @@ def verify_result(result: Mapping[str, object], *, stages: Sequence[Stage], matr
         if outcome not in {"success", "policy_failure"} or success != (outcome == "success"):
             raise Public96ContractError("infrastructure/fidelity invalid episode cannot enter the public96 denominator")
         artifacts = episode.get("artifacts")
-        if not isinstance(artifacts, Mapping) or set(artifacts) != {"log", "video", "receipt"}:
+        if not isinstance(artifacts, Mapping) or set(artifacts) != {"log", "videos", "receipt"}:
             raise Public96ContractError("public96 episode lacks required result/video/log/receipt artifacts")
+        _verified_artifact(artifacts["log"], root=output_root, expected_path=f"{stage.stage_id}/stage.log")
+        _verified_artifact(artifacts["receipt"], root=output_root, expected_path=f"{stage.stage_id}/stage-receipt.json")
+        if not isinstance(artifacts["videos"], Mapping) or set(artifacts["videos"]) != {"top_rgb", "left_rgb", "right_rgb"}:
+            raise Public96ContractError("episode lacks its exact three camera videos")
+        source_index = int(episode["episode_index"]) - 1
+        folder = "success" if success else "failure"
+        for camera, descriptor in artifacts["videos"].items():
+            _verified_artifact(descriptor, root=output_root, expected_path=f"{stage.stage_id}/videos/{folder}/episode{source_index}_observation_{camera}.mp4")
+        receipt_path = output_root / str(artifacts["receipt"]["relative_path"])
+        receipt_payload = _read_json(receipt_path, "stage receipt")
+        receipt_episodes = receipt_payload.get("episodes")
+        if (receipt_payload.get("kind") != "lehome_groot_n17_public96_stage_receipt_v1" or receipt_payload.get("stage_id") != stage.stage_id
+                or receipt_payload.get("raw_checker_overlay") != {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}
+                or not isinstance(receipt_episodes, list) or not any(item.get("episode_index") == episode.get("episode_index") and item.get("videos") == artifacts.get("videos") for item in receipt_episodes if isinstance(item, Mapping))):
+            raise Public96ContractError("stage receipt does not bind the expected stage")
         seen.add(identity); categories[stage.category]["episodes"] += 1; categories[stage.category]["successes"] += int(success); categories[stage.category]["policy_failures"] += int(not success)
     if len(seen) != 96:
         raise Public96ContractError("public96 result has missing episodes")
@@ -317,21 +358,26 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if server.poll() is not None:
             raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
         for stage, command in zip(stages, stage_commands, strict=True):
-            stage_root = _stage_dir(output_root, stage); stage_root.mkdir(); _make_overlay(args.asset_root, stage_root, stage.garment_name)
-            log = stage_root / "stage.log"; completed = subprocess.run(command, cwd=Path.cwd(), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
-            log.write_text(completed.stdout, encoding="utf-8")
+            stage_root = _stage_dir(output_root, stage)
             try:
+                stage_root.mkdir(); _make_overlay(args.asset_root, stage_root, stage.garment_name)
+                log = stage_root / "stage.log"; completed = subprocess.run(command, cwd=Path.cwd(), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+                log.write_text(completed.stdout, encoding="utf-8")
                 metrics = _parse_stage_metrics(completed.stdout)
-                if completed.returncode != 0:
+                if completed.returncode != 0 or "PUBLIC96_STAGE_COMPLETE" not in completed.stdout or "Traceback" in completed.stdout:
                     raise Public96ContractError("stage process exited nonzero after metrics")
-                videos = sorted((stage_root / "videos").glob("*.mp4"))
-                if len(videos) != 2:
-                    raise Public96ContractError("stage did not produce two video artifacts")
-                stage_receipt = {"kind": "lehome_groot_n17_public96_stage_receipt_v1", "stage_id": stage.stage_id, "command": command, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "log": _artifact(log, output_root), "videos": [_artifact(video, output_root) for video in videos]}
+                episode_videos = []
+                for metric in metrics:
+                    folder = "success" if metric["success"] else "failure"
+                    source_index = int(metric["episode_index"]) - 1
+                    cameras = {camera: stage_root / "videos" / folder / f"episode{source_index}_observation_{camera}.mp4" for camera in ("top_rgb", "left_rgb", "right_rgb")}
+                    episode_videos.append(cameras)
+                    for video in cameras.values(): _artifact(video, output_root)
+                stage_receipt = {"kind": "lehome_groot_n17_public96_stage_receipt_v1", "stage_id": stage.stage_id, "command": command, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "log": _artifact(log, output_root), "episodes": [{"episode_index": metric["episode_index"], "videos": {camera: _artifact(video, output_root) for camera, video in cameras.items()}} for metric, cameras in zip(metrics, episode_videos, strict=True)]}
                 receipt_path = stage_root / "stage-receipt.json"; _write_new_json(receipt_path, stage_receipt)
-                for metric, video in zip(metrics, videos, strict=True):
-                    episodes.append({"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_index": metric["episode_index"], "outcome": "success" if metric["success"] else "policy_failure", "success": metric["success"], "return": metric["return"], "length": metric["length"], "artifacts": {"log": _artifact(log, output_root), "video": _artifact(video, output_root), "receipt": _artifact(receipt_path, output_root)}})
-            except Public96ContractError as error:
+                for metric, cameras in zip(metrics, episode_videos, strict=True):
+                    episodes.append({"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_index": metric["episode_index"], "outcome": "success" if metric["success"] else "policy_failure", "success": metric["success"], "return": metric["return"], "length": metric["length"], "artifacts": {"log": _artifact(log, output_root), "videos": {camera: _artifact(video, output_root) for camera, video in cameras.items()}, "receipt": _artifact(receipt_path, output_root)}})
+            except (OSError, subprocess.SubprocessError, Public96ContractError) as error:
                 invalids.append({"stage_id": stage.stage_id, "reason": str(error)})
     finally:
         server.terminate()
