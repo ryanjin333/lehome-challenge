@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
 import sys
+import tempfile
 import time
 from typing import Mapping, Sequence
 from urllib.request import urlopen
@@ -36,6 +39,13 @@ PROVIDER_SOURCE_IMAGE_ID = "computeimage-u00zf6w3yf72gakhcy"
 
 class NativeReferenceGateError(ValueError):
     """Raised when evidence cannot prove a safe native-reference result."""
+
+
+@dataclass(frozen=True)
+class NativePublicationEntry:
+    relative_path: str
+    sha256: str
+    byte_size: int
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -77,10 +87,10 @@ def fetch_public_cache_manifest(
     except (UnicodeError, json.JSONDecodeError, NativeReferenceGateError) as error:
         raise NativeReferenceGateError("immutable cache manifest is invalid") from error
     expected = {
-        "schema_version", "kind", "source_repository", "immutable_revision", "path",
+        "schema_version", "kind", "source_repository", "path",
         "checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256",
     }
-    if set(manifest) != expected or manifest.get("schema_version") != 1 or manifest.get("kind") != "lehome_native_reference_cache_trust_manifest_v2" or manifest.get("source_repository") != PUBLIC_CACHE_REPOSITORY or manifest.get("immutable_revision") != revision or manifest.get("path") != relative:
+    if set(manifest) != expected or manifest.get("schema_version") != 1 or manifest.get("kind") != "lehome_native_reference_cache_trust_manifest_v2" or manifest.get("source_repository") != PUBLIC_CACHE_REPOSITORY or manifest.get("path") != relative:
         raise NativeReferenceGateError("immutable cache manifest identity is invalid")
     for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256"):
         _digest(manifest.get(key), f"cache manifest {key}")
@@ -91,6 +101,110 @@ def validate_public_cache_bindings(manifest: Mapping[str, object], *, checkpoint
     expected = (checkpoint_tree_sha256, metadata_tree_sha256, assets_tree_sha256)
     if any(_HEX.fullmatch(value) is None for value in expected) or tuple(manifest.get(key) for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256")) != expected:
         raise NativeReferenceGateError("immutable cache manifest does not bind observed caches")
+
+
+def _collect_native_bundle_entries(root: Path) -> tuple[NativePublicationEntry, ...]:
+    try:
+        metadata = root.lstat()
+    except OSError as error:
+        raise NativeReferenceGateError("native publication bundle is unavailable") from error
+    if root.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise NativeReferenceGateError("native publication bundle is unsafe")
+    entries: list[NativePublicationEntry] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            continue
+        relative = path.relative_to(root)
+        if path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode):
+            raise NativeReferenceGateError("native publication bundle has an unsafe entry")
+        descriptor = _artifact_from_file(root, relative)
+        entries.append(NativePublicationEntry(descriptor["path"], descriptor["sha256"], descriptor["size"]))
+    if not entries:
+        raise NativeReferenceGateError("native publication bundle is empty")
+    return tuple(entries)
+
+
+def _native_manifest_digest(entries: Sequence[NativePublicationEntry]) -> str:
+    return canonical_sha256([
+        {"relative_path": item.relative_path, "sha256": item.sha256, "byte_size": item.byte_size}
+        for item in entries
+    ])
+
+
+def publish_native_reference_bundle(
+    bundle_root: Path,
+    execution: Mapping[str, object],
+    *,
+    token: str,
+    transport: object,
+    now: object = time.time,
+) -> dict[str, object]:
+    """Publish and anonymously read back one closed, immutable native bundle."""
+    if not isinstance(token, str) or not token or any(part.isspace() for part in token):
+        raise NativeReferenceGateError("HF token is unavailable")
+    execution_receipt = _object(execution, "execution receipt")
+    if execution_receipt.get("status") != "oracle_matched_pending_finalization":
+        raise NativeReferenceGateError("only an oracle-matched execution may be published")
+    root = Path(bundle_root).resolve(strict=True)
+    manifest_path = root / "bundle-manifest.json"
+    if manifest_path.exists() or manifest_path.is_symlink():
+        raise NativeReferenceGateError("native bundle manifest already exists")
+    preliminary = _collect_native_bundle_entries(root)
+    _write_bytes_exclusive(manifest_path, _canonical_bytes({
+        "schema_version": 1,
+        "kind": "lehome_native_reference_bundle_manifest_v1",
+        "entries": [{"relative_path": item.relative_path, "sha256": item.sha256, "byte_size": item.byte_size} for item in preliminary],
+    }))
+    entries = _collect_native_bundle_entries(root)
+    execution_sha = canonical_sha256(execution_receipt)
+    prefix = f"reference-checks/native-{execution_sha[:16]}"
+    try:
+        head = transport.resolve_approved_ref(repository=PUBLIC_CACHE_REPOSITORY, ref="main", token=token)
+        if not isinstance(head, str) or _COMMIT.fullmatch(head) is None:
+            raise NativeReferenceGateError("publication ref is not immutable")
+        existing = tuple(transport.list_tree(repository=PUBLIC_CACHE_REPOSITORY, revision=head, token=token, remote_prefix=prefix))
+        if existing:
+            raise NativeReferenceGateError("native publication prefix already exists")
+        revision = transport.upload_files(repository=PUBLIC_CACHE_REPOSITORY, revision="main", source=root, entries=entries, token=token, remote_prefix=prefix, parent_commit=head)
+        if not isinstance(revision, str) or _COMMIT.fullmatch(revision) is None:
+            raise NativeReferenceGateError("native publication did not return an immutable revision")
+        remote = tuple(transport.list_tree(repository=PUBLIC_CACHE_REPOSITORY, revision=revision, token=token, remote_prefix=prefix))
+        expected = {item.relative_path for item in entries}
+        actual = {
+            str(getattr(item, "relative_path", "")).removeprefix(prefix + "/")
+            for item in remote if getattr(item, "entry_type", None) == "file"
+        }
+        if actual != expected:
+            raise NativeReferenceGateError("native publication tree does not match bundle")
+        destination = Path(tempfile.mkdtemp(prefix="native-reference-readback-", dir=root.parent))
+        try:
+            observed = transport.download_files(repository=PUBLIC_CACHE_REPOSITORY, revision=revision, destination=destination, relative_paths=tuple(sorted(expected)), token=None, remote_prefix=prefix)
+            if observed != revision:
+                raise NativeReferenceGateError("anonymous native readback revision mismatch")
+            for entry in entries:
+                artifact = _artifact_from_file(destination, Path(entry.relative_path))
+                if artifact["sha256"] != entry.sha256 or artifact["size"] != entry.byte_size:
+                    raise NativeReferenceGateError("anonymous native readback bytes mismatch")
+        finally:
+            shutil.rmtree(destination, ignore_errors=True)
+    except NativeReferenceGateError:
+        raise
+    except Exception as error:
+        raise NativeReferenceGateError("native publication/readback failed") from error
+    published = now()  # type: ignore[operator]
+    if type(published) not in (int, float) or published <= 0:
+        raise NativeReferenceGateError("publication clock is invalid")
+    return {
+        "schema_version": 2,
+        "kind": "lehome_native_reference_hf_readback_v2",
+        "execution_receipt_sha256": execution_sha,
+        "repository": PUBLIC_CACHE_REPOSITORY,
+        "remote_prefix": prefix,
+        "immutable_revision": revision,
+        "bundle_manifest_sha256": _native_manifest_digest(entries),
+        "published_unix_seconds": int(published),
+        "readback_verified": True,
+    }
 
 
 def capture_provider_observation(provider: object, *, expected_state: str) -> dict[str, object]:
@@ -202,7 +316,7 @@ def oracle_attempts() -> tuple[dict[str, object], ...]:
 def _validate_identity(value: object) -> dict[str, object]:
     identity = _object(value, "identity")
     fixed = {"source_repository": SOURCE_REPOSITORY, "source_revision": SOURCE_REVISION, "source_tree_sha256": SOURCE_TREE_SHA256, "lerobot_version": LEROBOT_VERSION, "policy_class": POLICY_CLASS, "policy_device": "cuda:0", "simulator_device": "cpu", "task_description": TASK_DESCRIPTION, "action_horizon": 16, "action_dimension": 12, "success_checker": SUCCESS_CHECKER, "cuda_available": True}
-    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "image"}
+    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id"}
     if set(identity) != {*fixed, *variable}:
         raise NativeReferenceGateError("identity has an unexpected schema")
     for key, expected in fixed.items():
@@ -217,8 +331,6 @@ def _validate_identity(value: object) -> dict[str, object]:
         raise NativeReferenceGateError("identity VM ID is invalid")
     if not isinstance(identity["disk_id"], str) or _DISK.fullmatch(identity["disk_id"]) is None:
         raise NativeReferenceGateError("identity disk ID is invalid")
-    if not isinstance(identity["image"], str) or _IMAGE.fullmatch(identity["image"]) is None:
-        raise NativeReferenceGateError("identity image is not digest pinned")
     if identity["provider_source_image_id"] != PROVIDER_SOURCE_IMAGE_ID:
         raise NativeReferenceGateError("identity provider source image does not match the protected VM")
     return identity
@@ -345,12 +457,18 @@ def finalize_native_reference_gate(execution: object, fidelity: object, publicat
         if not isinstance(expected_evidence, dict) or row.get("evidence_sha256") != expected_evidence.get(row.get("attempt_id")):
             raise NativeReferenceGateError("fidelity review evidence is not bound to execution artifacts")
     publication = _object(publication, "publication receipt")
-    if set(publication) != {"schema_version", "kind", "execution_receipt_sha256", "immutable_revision", "bundle_manifest_sha256", "readback_verified"} or publication.get("schema_version") != 1 or publication.get("kind") != "lehome_native_reference_hf_readback_v1" or publication.get("execution_receipt_sha256") != execution_sha or publication.get("readback_verified") is not True or not isinstance(publication.get("immutable_revision"), str) or _COMMIT.fullmatch(publication["immutable_revision"]) is None: raise NativeReferenceGateError("publication receipt is not a readback-verified immutable upload")
+    if set(publication) != {"schema_version", "kind", "execution_receipt_sha256", "repository", "remote_prefix", "immutable_revision", "bundle_manifest_sha256", "published_unix_seconds", "readback_verified"} or publication.get("schema_version") != 2 or publication.get("kind") != "lehome_native_reference_hf_readback_v2" or publication.get("execution_receipt_sha256") != execution_sha or publication.get("repository") != PUBLIC_CACHE_REPOSITORY or not isinstance(publication.get("remote_prefix"), str) or re.fullmatch(r"reference-checks/native-[0-9a-f]{16}", publication["remote_prefix"]) is None or publication.get("readback_verified") is not True or not isinstance(publication.get("immutable_revision"), str) or _COMMIT.fullmatch(publication["immutable_revision"]) is None or type(publication.get("published_unix_seconds")) is not int or publication["published_unix_seconds"] <= 0: raise NativeReferenceGateError("publication receipt is not a readback-verified immutable upload")
     _digest(publication.get("bundle_manifest_sha256"), "publication bundle manifest")
     stopped = _object(stopped, "stopped VM receipt")
     stopped = validate_provider_observation(stopped, expected_state="STOPPED")
     if stopped.get("vm_id") != identity["vm_id"] or stopped.get("disk_id") != identity["disk_id"] or stopped.get("provider_source_image_id") != identity["provider_source_image_id"]:
         raise NativeReferenceGateError("stopped VM receipt is not bound to the execution identity")
+    captured = stopped["captured_unix_seconds"]
+    published = publication["published_unix_seconds"]
+    if captured < published:
+        raise NativeReferenceGateError("stopped VM receipt is not post-publication")
+    if not 0 <= time.time() - captured <= 900:
+        raise NativeReferenceGateError("stopped VM receipt is not fresh")
     return {"schema_version": 1, "kind": "lehome_native_reference_gate_final_receipt_v1", "status": "passed", "execution_receipt_sha256": execution_sha, "fidelity_review_sha256": canonical_sha256(fidelity), "publication_receipt_sha256": canonical_sha256(publication), "stopped_vm_receipt_sha256": canonical_sha256(stopped), "identity": identity}
 
 
@@ -369,6 +487,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     provider = commands.add_parser("capture-provider"); provider.add_argument("--state", choices=("RUNNING", "STOPPED"), required=True); provider.add_argument("--receipt", type=Path, required=True)
     bind_provider = commands.add_parser("bind-provider-receipt"); bind_provider.add_argument("--state", choices=("RUNNING", "STOPPED"), required=True); bind_provider.add_argument("--input", type=Path, required=True); bind_provider.add_argument("--receipt", type=Path, required=True)
     cache = commands.add_parser("fetch-cache-manifest"); cache.add_argument("--revision", required=True); cache.add_argument("--path", required=True); cache.add_argument("--receipt", type=Path); cache.add_argument("--checkpoint-tree-sha256"); cache.add_argument("--metadata-tree-sha256"); cache.add_argument("--assets-tree-sha256")
+    publish = commands.add_parser("publish-bundle"); publish.add_argument("--bundle-root", type=Path, required=True); publish.add_argument("--execution", type=Path, required=True); publish.add_argument("--token-file", type=Path, required=True); publish.add_argument("--receipt", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "compile-stage": receipt = compile_native_stage(args.bundle_root, stage=args.stage, category=args.category, garment=args.garment, identity=_read_json(args.identity, "identity"))
@@ -379,6 +498,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             receipt = capture_provider_observation(SubprocessNebiusProvider(), expected_state=args.state); _write_exclusive(args.receipt, receipt)
         elif args.command == "bind-provider-receipt":
             raw = args.input.read_bytes(); receipt = validate_provider_observation(_read_json(args.input, "provider observation"), expected_state=args.state); _write_bytes_exclusive(args.receipt, raw)
+        elif args.command == "publish-bundle":
+            from scripts.publish_simple_curriculum_collection import HuggingFacePublicDatasetTransport, _load_token
+            receipt = publish_native_reference_bundle(args.bundle_root, _read_json(args.execution, "execution receipt"), token=_load_token(args.token_file), transport=HuggingFacePublicDatasetTransport()); _write_exclusive(args.receipt, receipt)
         else:
             receipt, raw = fetch_public_cache_manifest(args.revision, args.path)
             bindings = (args.checkpoint_tree_sha256, args.metadata_tree_sha256, args.assets_tree_sha256)

@@ -36,7 +36,6 @@ def _identity() -> dict[str, object]:
         "cuda_runtime": "12.8",
         "vm_id": "computeinstance-u00t6xfqhadrcmssa2",
         "disk_id": "computedisk-u00pbe55crxy7jr56x",
-        "image": "ghcr.io/example/lehome@sha256:" + "f" * 64,
         "simulator_device": "cpu",
         "task_description": "fold the garment on the table",
         "action_horizon": 16,
@@ -162,7 +161,6 @@ def _launcher_environment(tmp_path: Path) -> dict[str, str]:
         "LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY": "1",
         "LEHOME_NATIVE_REFERENCE_VM_ID": "computeinstance-u00t6xfqhadrcmssa2",
         "LEHOME_NATIVE_REFERENCE_DISK_ID": "computedisk-u00pbe55crxy7jr56x",
-        "LEHOME_NATIVE_REFERENCE_IMAGE": "ghcr.io/example/lehome@sha256:" + "d" * 64,
         "LEHOME_NATIVE_REFERENCE_SOURCE_ROOT": str(source),
         "LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT": str(checkpoint),
         "LEHOME_NATIVE_REFERENCE_METADATA_ROOT": str(metadata),
@@ -320,7 +318,7 @@ def test_native_finalization_requires_fidelity_publication_and_stopped_vm_receip
         "schema_version": 1, "kind": "lehome_native_reference_fidelity_review_v1", "execution_receipt_sha256": execution_sha,
         "review_method": "manual_video_audit", "attempts": [{"attempt_id": row["attempt_id"], "cloth_present": True, "cloth_flight": False, "nonfinite": False, "safety_failure": False, "evidence_sha256": execution["attempt_evidence_sha256"][row["attempt_id"]]} for row in _attempts()],
     }
-    publication = {"schema_version": 1, "kind": "lehome_native_reference_hf_readback_v1", "execution_receipt_sha256": execution_sha, "immutable_revision": "b" * 40, "bundle_manifest_sha256": "c" * 64, "readback_verified": True}
+    publication = {"schema_version": 2, "kind": "lehome_native_reference_hf_readback_v2", "execution_receipt_sha256": execution_sha, "repository": "ryanjin333/lehome-groot-n17-rollouts", "remote_prefix": "reference-checks/native-" + "a" * 16, "immutable_revision": "b" * 40, "bundle_manifest_sha256": "c" * 64, "published_unix_seconds": int(time.time()), "readback_verified": True}
     stopped = {"schema_version": 1, "kind": "lehome_native_reference_provider_observation_v1", "vm_id": _identity()["vm_id"], "vm_name": "lehome-rollout", "disk_id": _identity()["disk_id"], "provider_source_image_id": _identity()["provider_source_image_id"], "state": "STOPPED", "captured_unix_seconds": int(time.time()), "provider_response_sha256": "f" * 64}
 
     final = finalize_native_reference_gate(execution, fidelity, publication, stopped)
@@ -330,13 +328,17 @@ def test_native_finalization_requires_fidelity_publication_and_stopped_vm_receip
     with pytest.raises(NativeReferenceGateError, match="evidence"):
         finalize_native_reference_gate(execution, fidelity, publication, stopped)
 
+    stopped["captured_unix_seconds"] = publication["published_unix_seconds"] - 1
+    with pytest.raises(NativeReferenceGateError, match="post-publication"):
+        finalize_native_reference_gate(execution, fidelity | {"attempts": [{**row, "evidence_sha256": execution["attempt_evidence_sha256"][row["attempt_id"]]} for row in fidelity["attempts"]]}, publication, stopped)
+
 
 def test_public_cache_manifest_must_be_read_back_from_fixed_hf_repo() -> None:
     from scripts.verify_native_reference_evaluator_gate import fetch_public_cache_manifest
 
     manifest = {
         "schema_version": 1, "kind": "lehome_native_reference_cache_trust_manifest_v2",
-        "source_repository": "ryanjin333/lehome-groot-n17-rollouts", "immutable_revision": "a" * 40,
+        "source_repository": "ryanjin333/lehome-groot-n17-rollouts",
         "path": "reference-checks/native/cache-trust-manifest.json",
         "checkpoint_tree_sha256": "b" * 64, "metadata_tree_sha256": "c" * 64, "assets_tree_sha256": "d" * 64,
     }
@@ -348,6 +350,34 @@ def test_public_cache_manifest_must_be_read_back_from_fixed_hf_repo() -> None:
     assert observed == manifest
     assert raw == downloader(calls[0])
     assert "/datasets/ryanjin333/lehome-groot-n17-rollouts/resolve/" in calls[0]
+
+
+def test_publish_native_bundle_uploads_and_anonymously_readbacks_every_file(tmp_path: Path) -> None:
+    from scripts.verify_native_reference_evaluator_gate import publish_native_reference_bundle, verify_native_reference_result
+
+    document = _bundle(); _materialize_artifacts(tmp_path, document)
+    (tmp_path / "result.json").write_text(json.dumps(document), encoding="utf-8")
+    execution = verify_native_reference_result(document, bundle_root=tmp_path)
+    (tmp_path / "execution-receipt.json").write_text(json.dumps(execution), encoding="utf-8")
+    uploaded: dict[str, bytes] = {}
+    class Transport:
+        def resolve_approved_ref(self, **_kwargs): return "a" * 40
+        def list_tree(self, **kwargs):
+            prefix = kwargs["remote_prefix"]
+            return [type("Entry", (), {"relative_path": f"{prefix}/{path}", "entry_type": "file"}) for path in uploaded]
+        def upload_files(self, **kwargs):
+            root = kwargs["source"]
+            for entry in kwargs["entries"]: uploaded[entry.relative_path] = (root / entry.relative_path).read_bytes()
+            return "b" * 40
+        def download_files(self, **kwargs):
+            for path in kwargs["relative_paths"]:
+                destination = kwargs["destination"] / path; destination.parent.mkdir(parents=True, exist_ok=True); destination.write_bytes(uploaded[path])
+            return kwargs["revision"]
+
+    receipt = publish_native_reference_bundle(tmp_path, execution, token="test-token", transport=Transport(), now=lambda: 1000)
+    assert receipt["kind"] == "lehome_native_reference_hf_readback_v2"
+    assert receipt["readback_verified"] is True
+    assert "bundle-manifest.json" in uploaded
 
 
 def test_provider_observation_uses_exact_adapter_shape_and_state() -> None:
@@ -375,3 +405,5 @@ def test_native_gate_runbook_preserves_the_no_collection_admission_boundary() ->
     assert "7/8" in text
     assert "Do not start collection or training" in text
     assert "Hugging Face" in text
+    assert "scp" in text
+    assert "LEHOME_NATIVE_REFERENCE_IMAGE" not in text

@@ -40,8 +40,9 @@ delete provider resources, build an image, or upload to any service.
 
 The operator must provide all inputs explicitly. Cache roots are on the VM
 disk, never the local Mac. The provider's RUNNING/attached-disk state is an
-external read-only gate; this launcher records the supplied VM, disk, and
-digest-pinned image identity but never asks the provider to change state.
+external read-only gate; this launcher records the actual provider source-image
+identity plus host-Python/LeRobot/CUDA facts, and never asks the provider to
+change state.
 
 First stage only the public evaluator source into an empty source root. This
 uses sparse Git with `GIT_LFS_SKIP_SMUDGE=1`, so it fetches no checkpoint
@@ -61,13 +62,15 @@ manifest bytes anonymously and directly from the fixed public dataset
 digest. The manifest kind is
 `lehome_native_reference_cache_trust_manifest_v2` and it binds that public
 repository/revision/path plus the observed checkpoint, metadata, and assets
-tree digests. If this exact readback does not yet exist, stop for the
+tree digests. The checkpoint digest is a logical file-name/SHA manifest: the
+large model is fully SHA-256 verified once at preflight, then its stable
+device/inode/size/mtime snapshot is checked before each stage while the small
+checkpoint files remain fully hashed. If this exact readback does not yet exist, stop for the
 read-only cache inventory and publication rather than inventing a manifest.
 
 ```bash
 export LEHOME_NATIVE_REFERENCE_VM_ID=computeinstance-u00t6xfqhadrcmssa2
 export LEHOME_NATIVE_REFERENCE_DISK_ID=computedisk-u00pbe55crxy7jr56x
-export LEHOME_NATIVE_REFERENCE_IMAGE='registry/example@sha256:<64-lowercase-hex>'
 export LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=/mnt/lehome/reference-native/source
 export LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT=/mnt/lehome/reference-native/pretrained_model
 export LEHOME_NATIVE_REFERENCE_METADATA_ROOT=/mnt/lehome/reference-native/dataset_meta
@@ -85,18 +88,24 @@ operator uses the restricted exact-instance Nebius adapter to capture a fresh
 Nebius credentials: it validates and copies that operator receipt into the
 evidence bundle. The observation validates the pinned VM name/ID, protected
 disk, and provider source-image ID, then records the nested CLI response hash.
-The runtime container image digest is separately bound in identity. It also
-proves `torch.cuda.is_available()`, records CUDA runtime/device count, and
+It also proves `torch.cuda.is_available()`, records CUDA runtime/device count, and
 binds all identities to `identity.json` and `preflight.json`. Simulation remains
 CPU-only.
 
-Run validation first:
+Capture RUNNING locally, validate the target VM path, then transfer the exact
+receipt before VM-local validation. Do not write an operator-local command
+directly to `/mnt/lehome`.
 
 ```bash
+operator_receipt="$(mktemp -d)/provider-running-receipt.json"
 python3 scripts/verify_native_reference_evaluator_gate.py capture-provider \
   --state RUNNING \
-  --receipt /mnt/lehome/reference-native/provider-running-receipt.json
+  --receipt "$operator_receipt"
+scp -o ClearAllForwardings=yes -o BatchMode=yes -- "$operator_receipt" \
+  operator@validated-rollout-host:/mnt/lehome/reference-native/provider-running-receipt.json
 ```
+
+Run validation first:
 
 ```bash
 LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY=1 \
@@ -143,28 +152,45 @@ receipt SHA-256:
    no cloth flight, non-finite state, or safety failure occurred. Include a
    digest of the exact per-attempt receipt/log/three-video manifest from the
    execution receipt for every attempt; arbitrary audit digests are rejected.
-2. `lehome_native_reference_hf_readback_v1`: immutable Hugging Face revision,
-   entire-bundle manifest digest, and successful readback.
+2. `lehome_native_reference_hf_readback_v2`: produced only by the Hugging Face
+   publication command after it uploads the closed bundle to a new
+   `reference-checks/native-...` prefix and anonymously lists/downloads every
+   entry at the returned immutable revision. It records that revision, manifest
+   digest, and publication time.
 3. `lehome_native_reference_provider_observation_v1`: run the provided
    read-only command after stopping the VM to obtain an actual Nebius CLI
    `STOPPED` observation. It must bind the exact VM/disk/provider-source-image
    identity and nested provider-response hash. Do not hand-author this JSON.
 
+First publish/read back from the operator host after it has received the
+complete execution bundle and holds its owner-only HF token file:
+
+```bash
+python3 scripts/verify_native_reference_evaluator_gate.py publish-bundle \
+  --bundle-root /operator/received/native-reference-YYYYMMDDHHMMSS \
+  --execution /operator/received/native-reference-YYYYMMDDHHMMSS/execution-receipt.json \
+  --token-file /operator/secrets/hf-token \
+  --receipt /operator/received/publication-readback.json
+```
+
+Only after that successful readback, stop the VM and capture STOPPED locally;
+the receipt must be newer than publication and no more than 15 minutes old:
+
 ```bash
 python3 scripts/verify_native_reference_evaluator_gate.py capture-provider \
   --state STOPPED \
-  --receipt /mnt/lehome/reference-native/provider-stopped-receipt.json
+  --receipt /operator/received/provider-stopped-receipt.json
 ```
 
-Then run the pure local finalizer (it uploads nothing):
+Then run the pure local finalizer:
 
 ```bash
 python3 scripts/verify_native_reference_evaluator_gate.py finalize \
-  --execution /mnt/lehome/reference-native/native-reference-YYYYMMDDHHMMSS/execution-receipt.json \
-  --fidelity /mnt/lehome/reference-native/fidelity-review.json \
-  --publication /mnt/lehome/reference-native/hf-readback.json \
-  --stopped /mnt/lehome/reference-native/vm-stopped.json \
-  --receipt /mnt/lehome/reference-native/final-gate-receipt.json
+  --execution /operator/received/native-reference-YYYYMMDDHHMMSS/execution-receipt.json \
+  --fidelity /operator/received/fidelity-review.json \
+  --publication /operator/received/publication-readback.json \
+  --stopped /operator/received/provider-stopped-receipt.json \
+  --receipt /operator/received/final-gate-receipt.json
 ```
 
 Only that receipt can have `status: passed`.
