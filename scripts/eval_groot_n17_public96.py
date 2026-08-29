@@ -221,9 +221,9 @@ def build_stage_command(stage: Stage, *, repo_root: Path, policy_path: Path, out
     ]
 
 
-def build_policy_server_command(*, policy_path: Path, port: int, token_env: str) -> list[str]:
-    return [sys.executable, "-m", "scripts.run_groot_policy_server", "--model-path", str(policy_path.resolve()),
-            "--host", "127.0.0.1", "--port", str(port), "--api-token-env", token_env, "--device", "cuda:0", "--seed", "42", "--policy-sha256", CHECKPOINT["runtime_policy_sha256"]]
+def build_policy_server_command(*, policy_path: Path, port: int, token_env: str, readiness_receipt: Path = Path("policy-server-readiness.json")) -> list[str]:
+    return [sys.executable, "-m", "scripts.run_groot_n17_public96_policy_server", "--model-path", str(policy_path.resolve()),
+            "--host", "127.0.0.1", "--port", str(port), "--api-token-env", token_env, "--device", "cuda:0", "--seed", "42", "--readiness-receipt", str(readiness_receipt)]
 
 
 def _make_overlay(asset_root: Path, stage_root: Path, garment_name: str) -> None:
@@ -363,7 +363,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if not args.output_root.is_absolute() or args.output_root.exists() or args.output_root.is_symlink() or not args.output_root.parent.is_dir():
         raise Public96ContractError("output root must be a new absolute path beneath an existing safe parent")
     args.output_root.mkdir(); output_root = args.output_root.resolve(strict=True)
-    policy_command = build_policy_server_command(policy_path=args.policy_path, port=args.policy_server_port, token_env=args.policy_server_token_env)
+    readiness_receipt = output_root / "policy-server-readiness.json"
+    policy_command = build_policy_server_command(policy_path=args.policy_path, port=args.policy_server_port, token_env=args.policy_server_token_env, readiness_receipt=readiness_receipt)
     stage_commands = [build_stage_command(stage, repo_root=Path.cwd(), policy_path=args.policy_path, output_root=output_root, policy_server_port=args.policy_server_port, token_env=args.policy_server_token_env) for stage in stages]
     base = {"kind": "lehome_groot_n17_public96_validation_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "policy_server_command": policy_command, "stage_commands": stage_commands, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
     if args.dry_run:
@@ -377,9 +378,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     episodes: list[dict[str, object]] = []
     invalids: list[dict[str, str]] = []
     try:
-        time.sleep(2.0)
-        if server.poll() is not None:
+        for _ in range(20):
+            if readiness_receipt.is_file(): break
+            if server.poll() is not None: break
+            time.sleep(0.1)
+        if server.poll() is not None or not readiness_receipt.is_file():
             raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
+        readiness = _read_json(readiness_receipt, "policy server readiness")
+        if readiness.get("artifact_sha256") != CHECKPOINT["artifact_sha256"] or readiness.get("runtime_policy_sha256") != CHECKPOINT["runtime_policy_sha256"] or readiness.get("model_path") != str(args.policy_path.resolve()) or readiness.get("device") != "cuda:0":
+            raise Public96ContractError("policy server readiness does not bind the pinned N1.7 policy")
         for stage, command in zip(stages, stage_commands, strict=True):
             stage_root = _stage_dir(output_root, stage)
             try:

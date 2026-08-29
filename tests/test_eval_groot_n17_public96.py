@@ -324,7 +324,11 @@ def test_synthetic_successful_run_writes_complete_result_and_verifier_receipt(tm
         output.append("PUBLIC96_STAGE_COMPLETE " + json.dumps({"raw_checker_overlay": {"overlay_id": RAW_CHECKER_OVERLAY_ID, "overlay_sha256": overlay_sha256()}, "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"]}, sort_keys=True))
         return SimpleNamespace(returncode=0, stdout="\n".join(output))
 
-    monkeypatch.setattr(evaluator.subprocess, "Popen", lambda *args, **kwargs: Server())
+    def fake_popen(command, *args, **kwargs):
+        receipt = Path(command[command.index("--readiness-receipt") + 1])
+        receipt.write_text(json.dumps({"artifact_sha256": CHECKPOINT["artifact_sha256"], "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"], "model_path": str(policy.resolve()), "device": "cuda:0"}), encoding="utf-8")
+        return Server()
+    monkeypatch.setattr(evaluator.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(evaluator.subprocess, "run", fake_run)
     monkeypatch.setattr(evaluator.time, "sleep", lambda _: None)
     monkeypatch.setenv("LEHOME_GROOT_N17_PUBLIC96_POLICY_TOKEN", "x" * 32)
