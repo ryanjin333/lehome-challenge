@@ -97,6 +97,23 @@ def _runtime_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, output_n
     )
 
 
+def _external_readiness_payload(policy_root: Path) -> dict[str, object]:
+    return {
+        "kind": "lehome_groot_n17_public96_policy_server_readiness_v1",
+        "artifact_sha256": CHECKPOINT["artifact_sha256"],
+        "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"],
+        "model_path": str(policy_root.resolve()),
+        "device": "cuda:0",
+        "adapter": "nvidia_gr00t_policy_server_public96_v1",
+        "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
+    }
+
+
+def _write_external_readiness_receipt(path: Path, policy_root: Path) -> Path:
+    path.write_text(json.dumps(_external_readiness_payload(policy_root), indent=1), encoding="utf-8")
+    return path
+
+
 def _assert_pre_stage_invalid_evidence(output_root: Path, identity: dict[str, object], reason: str) -> None:
     stages = load_frozen_matrix(MATRIX, MATRIX_SHA256)
     result_path = output_root / "result.json"
@@ -500,6 +517,165 @@ def test_parser_accepts_literal_numeric_policy_server_startup_timeout() -> None:
     ])
 
     assert args.policy_server_startup_timeout == 180.0
+
+
+def test_parser_accepts_external_policy_server_readiness_receipt() -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    receipt = Path("/tmp/external-policy-server-readiness.json")
+    args = evaluator._parser().parse_args([
+        "--matrix", "/tmp/matrix.json", "--matrix-sha256", "/tmp/matrix.sha256",
+        "--policy-path", "/tmp/policy", "--checkpoint-identity-receipt", "/tmp/identity.json",
+        "--asset-root", "/tmp/assets", "--output-root", "/tmp/output",
+        "--external-policy-server-readiness-receipt", str(receipt),
+    ])
+
+    assert args.external_policy_server_readiness_receipt == receipt
+
+
+@pytest.mark.parametrize("mode", ("relative", "missing", "symlink"))
+def test_external_readiness_receipt_must_be_absolute_existing_and_not_a_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    args, _, _ = _runtime_inputs(tmp_path, monkeypatch, output_name=f"unsafe-external-{mode}")
+    if mode == "relative":
+        receipt = Path("relative-readiness.json")
+    elif mode == "missing":
+        receipt = tmp_path / "missing-readiness.json"
+    else:
+        target = _write_external_readiness_receipt(tmp_path / "readiness.json", args.policy_path)
+        receipt = tmp_path / "readiness-link.json"
+        receipt.symlink_to(target)
+    args.external_policy_server_readiness_receipt = receipt
+    monkeypatch.setattr(evaluator.subprocess, "Popen", lambda *_, **__: (_ for _ in ()).throw(AssertionError("external mode must not start a child server")))
+
+    with pytest.raises(Public96ContractError, match="external policy server readiness receipt"):
+        run(args)
+
+
+def test_external_readiness_receipt_must_bind_the_resolved_policy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    args, _, _ = _runtime_inputs(tmp_path, monkeypatch, output_name="external-bad-binding")
+    receipt = _write_external_readiness_receipt(tmp_path / "readiness.json", args.policy_path)
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["model_path"] = "/different/policy"
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+    args.external_policy_server_readiness_receipt = receipt
+    monkeypatch.setattr(evaluator.subprocess, "Popen", lambda *_, **__: (_ for _ in ()).throw(AssertionError("external mode must not start a child server")))
+
+    with pytest.raises(Public96ContractError, match="readiness does not bind"):
+        run(args)
+
+
+def test_external_dry_run_validates_and_copies_the_readiness_receipt_without_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    args, output_root, _ = _runtime_inputs(tmp_path, monkeypatch, output_name="external-dry-run")
+    source = _write_external_readiness_receipt(tmp_path / "external-readiness.json", args.policy_path)
+    args.external_policy_server_readiness_receipt = source
+    args.dry_run = True
+    monkeypatch.setattr(evaluator.subprocess, "Popen", lambda *_, **__: (_ for _ in ()).throw(AssertionError("dry run must not start a child server")))
+    monkeypatch.setattr(evaluator, "await_authenticated_policy_server_ready", lambda **_: (_ for _ in ()).throw(AssertionError("dry run must not ping")))
+
+    result = run(args)
+
+    assert result["policy_server_mode"] == "external"
+    assert result["policy_server_command"] is None
+    assert result["external_policy_server_readiness_receipt_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert (output_root / "policy-server-readiness.json").read_bytes() == source.read_bytes()
+    assert (output_root / "validation-only-receipt.json").is_file()
+
+
+def _successful_external_stage(command: list[str]) -> SimpleNamespace:
+    stage_root = Path(command[command.index("--video_dir") + 1]).parent
+    output = []
+    for episode_index, success in ((1, True), (2, False)):
+        folder = "success" if success else "failure"
+        for camera in ("top_rgb", "left_rgb", "right_rgb"):
+            video = stage_root / "videos" / folder / f"episode{episode_index - 1}_observation_images_{camera}.mp4"
+            video.parent.mkdir(parents=True, exist_ok=True)
+            video.write_bytes(f"{episode_index}:{camera}".encode())
+        output.append(f"Episode {episode_index}/2: Return={1.0 if success else 0.0:.2f}, Length=600, Success={success}")
+    output.append("PUBLIC96_STAGE_COMPLETE " + json.dumps({"raw_checker_overlay": {"overlay_id": RAW_CHECKER_OVERLAY_ID, "overlay_sha256": overlay_sha256()}, "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"]}, sort_keys=True))
+    return SimpleNamespace(returncode=0, stdout="\n".join(output))
+
+
+def test_external_mode_requires_authenticated_admission_and_reprobes_before_every_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    args, output_root, _ = _runtime_inputs(tmp_path, monkeypatch, output_name="external-success")
+    source = _write_external_readiness_receipt(tmp_path / "external-readiness.json", args.policy_path)
+    args.external_policy_server_readiness_receipt = source
+    probes: list[dict[str, object]] = []
+    stage_commands: list[list[str]] = []
+
+    monkeypatch.setattr(evaluator.subprocess, "Popen", lambda *_, **__: (_ for _ in ()).throw(AssertionError("external mode must not start a child server")))
+    monkeypatch.setattr(evaluator, "await_authenticated_policy_server_ready", lambda **kwargs: probes.append(kwargs))
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        assert len(probes) == len(stage_commands) + 2
+        stage_commands.append(command)
+        return _successful_external_stage(command)
+
+    monkeypatch.setattr(evaluator.subprocess, "run", fake_run)
+
+    result = run(args)
+
+    assert len(stage_commands) == 48
+    assert len(probes) == 49  # admission plus an immediate probe before every Isaac stage
+    assert all(probe["process"] is None for probe in probes)
+    assert result["status"] == "valid"
+    log = (output_root / "policy-server.log").read_text(encoding="utf-8")
+    assert "source_mode=external" in log
+    assert hashlib.sha256(source.read_bytes()).hexdigest() in log
+    assert "sidecar process log" not in log
+
+
+def test_external_mid_run_probe_failure_stops_later_stages_and_emits_complete_invalid_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    args, output_root, identity = _runtime_inputs(tmp_path, monkeypatch, output_name="external-probe-failure")
+    args.external_policy_server_readiness_receipt = _write_external_readiness_receipt(tmp_path / "external-readiness.json", args.policy_path)
+    probe_count = 0
+    stage_commands: list[list[str]] = []
+
+    monkeypatch.setattr(evaluator.subprocess, "Popen", lambda *_, **__: (_ for _ in ()).throw(AssertionError("external mode must not start a child server")))
+
+    def fake_probe(**_: object) -> None:
+        nonlocal probe_count
+        probe_count += 1
+        if probe_count == 3:
+            raise Public96ContractError("external policy server did not pass token-bound readiness")
+
+    monkeypatch.setattr(evaluator, "await_authenticated_policy_server_ready", fake_probe)
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        stage_commands.append(command)
+        return _successful_external_stage(command)
+
+    monkeypatch.setattr(evaluator.subprocess, "run", fake_run)
+
+    with pytest.raises(Public96ContractError, match="infrastructure/fidelity invalid"):
+        run(args)
+
+    assert len(stage_commands) == 1
+    result = json.loads((output_root / "result.json").read_text(encoding="utf-8"))
+    assert result["checkpoint"] == identity
+    assert result["status"] == "invalid"
+    assert len(result["episodes"]) == 96
+    assert result["summary"]["overall"]["scored_episodes"] == 2
+    assert result["summary"]["overall"]["infrastructure_invalid"] == 94
+    assert result["summary"]["overall"]["success_rate"] is None
+    assert len(result["invalid_stages"]) == 47
 
 
 def test_authenticated_readiness_uses_a_real_token_checked_loopback_socket(monkeypatch: pytest.MonkeyPatch) -> None:

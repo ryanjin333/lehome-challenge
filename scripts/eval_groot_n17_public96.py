@@ -330,10 +330,19 @@ def _video_artifact(path: Path, root: Path) -> dict[str, str]:
 
 
 def _write_new_json(path: Path, value: Mapping[str, object]) -> None:
+    _write_new_bytes(path, (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8"))
+
+
+def _write_new_bytes(path: Path, contents: bytes) -> None:
+    """Write evaluator evidence once, without a check-then-overwrite race."""
     if path.exists() or path.is_symlink():
         raise Public96ContractError("public96 output path already exists or is unsafe")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    try:
+        with path.open("xb") as handle:
+            handle.write(contents)
+    except FileExistsError as error:
+        raise Public96ContractError("public96 output path already exists or is unsafe") from error
 
 
 def _infrastructure_invalid_episode(stage: Stage, episode_index: int, reason: str) -> dict[str, object]:
@@ -434,6 +443,24 @@ def _validate_readiness_payload(readiness: object, *, policy_root: Path) -> dict
     if not isinstance(readiness, Mapping) or set(readiness) != required or dict(readiness) != expected:
         raise Public96ContractError("policy server readiness does not bind the pinned N1.7 policy")
     return expected
+
+
+def _load_external_readiness_receipt(path: Path, *, policy_root: Path) -> tuple[dict[str, object], bytes, str]:
+    """Read a sidecar-owned readiness receipt once before copying its attestation."""
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise Public96ContractError("external policy server readiness receipt is missing or unsafe")
+    try:
+        contents = path.read_bytes()
+        payload = json.loads(contents.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise Public96ContractError("external policy server readiness receipt is invalid JSON") from error
+    return _validate_readiness_payload(payload, policy_root=policy_root), contents, hashlib.sha256(contents).hexdigest()
+
+
+def _append_external_policy_server_event(path: Path, event: str) -> None:
+    """Record evaluator-owned external-server admission evidence without process output."""
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"event={event}\n")
 
 
 def _validate_stage_receipt(
@@ -578,6 +605,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--asset-root", type=Path, required=True); parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--policy-server-port", type=int, default=9117); parser.add_argument("--policy-server-token-env", default="LEHOME_GROOT_N17_PUBLIC96_POLICY_TOKEN")
     parser.add_argument("--policy-server-startup-timeout", type=validate_policy_server_startup_timeout, default=_POLICY_SERVER_STARTUP_TIMEOUT_DEFAULT_SECONDS)
+    parser.add_argument("--external-policy-server-readiness-receipt", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -617,51 +645,98 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     identity = validate_checkpoint_identity(_read_json(args.checkpoint_identity_receipt, "checkpoint identity receipt"), args.policy_path)
     validate_release_assets(args.asset_root, stages)
     startup_timeout = validate_policy_server_startup_timeout(getattr(args, "policy_server_startup_timeout", _POLICY_SERVER_STARTUP_TIMEOUT_DEFAULT_SECONDS))
+    external_receipt_path = getattr(args, "external_policy_server_readiness_receipt", None)
+    external_readiness: dict[str, object] | None = None
+    external_readiness_contents: bytes | None = None
+    external_readiness_sha256: str | None = None
+    if external_receipt_path is not None:
+        external_readiness, external_readiness_contents, external_readiness_sha256 = _load_external_readiness_receipt(
+            Path(external_receipt_path), policy_root=args.policy_path,
+        )
     if not args.output_root.is_absolute() or args.output_root.exists() or args.output_root.is_symlink() or not args.output_root.parent.is_dir():
         raise Public96ContractError("output root must be a new absolute path beneath an existing safe parent")
     args.output_root.mkdir(); output_root = args.output_root.resolve(strict=True)
     readiness_receipt = output_root / "policy-server-readiness.json"
     policy_command = build_policy_server_command(policy_path=args.policy_path, port=args.policy_server_port, token_env=args.policy_server_token_env, readiness_receipt=readiness_receipt)
+    if external_readiness_contents is not None:
+        _write_new_bytes(readiness_receipt, external_readiness_contents)
     stage_commands = [build_stage_command(stage, repo_root=Path.cwd(), policy_path=args.policy_path, output_root=output_root, policy_server_port=args.policy_server_port, token_env=args.policy_server_token_env) for stage in stages]
     assignments = [{"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_indices": list(stage.episode_indices), "overlay_path": str(_stage_dir(output_root, stage) / "garment-config"), "command": command} for stage, command in zip(stages, stage_commands, strict=True)]
-    base = {"kind": "lehome_groot_n17_public96_validation_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "policy_server_command": policy_command, "policy_server_startup_timeout_seconds": startup_timeout, "stage_commands": stage_commands, "assignments": assignments, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
+    base = {"kind": "lehome_groot_n17_public96_validation_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "policy_server_mode": "external" if external_readiness is not None else "local_child", "policy_server_command": None if external_readiness is not None else policy_command, "policy_server_startup_timeout_seconds": startup_timeout, "stage_commands": stage_commands, "assignments": assignments, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
+    if external_readiness_sha256 is not None:
+        base["external_policy_server_readiness_receipt_sha256"] = external_readiness_sha256
     if args.dry_run:
         _write_new_json(output_root / "validation-only-receipt.json", base)
         return base
     token = os.environ.get(args.policy_server_token_env, "")
     if len(token) < 32:
         raise Public96ContractError("policy-server token is missing; evaluation was not started")
-    server_log = output_root / "policy-server.log"; server_handle = server_log.open("x", encoding="utf-8")
+    server_log = output_root / "policy-server.log"
+    server_handle = None
+    if external_readiness is not None:
+        _write_new_bytes(
+            server_log,
+            f"source_mode=external\nexternal_readiness_receipt_sha256={external_readiness_sha256}\nevent=readiness_receipt_validated\n".encode("ascii"),
+        )
+    else:
+        server_handle = server_log.open("x", encoding="utf-8")
     episodes: list[dict[str, object]] = []
     invalids: list[dict[str, str]] = []
     server: subprocess.Popen[str] | None = None
     startup_failure: Public96ContractError | None = None
+    readiness: dict[str, object] = external_readiness if external_readiness is not None else {}
     try:
-        try:
-            server = subprocess.Popen(policy_command, stdout=server_handle, stderr=subprocess.STDOUT, text=True)
-        except (OSError, subprocess.SubprocessError) as error:
-            startup_failure = Public96ContractError(f"policy server startup failed: {error}")
-        if startup_failure is None:
+        if external_readiness is not None:
             try:
-                deadline = time.monotonic() + startup_timeout
-                delay = 0.1
-                while not readiness_receipt.is_file() and server.poll() is None:
-                    now = time.monotonic()
-                    if now >= deadline:
-                        raise Public96ContractError("N1.7 policy server did not produce readiness before the startup timeout")
-                    time.sleep(min(delay, max(0.0, deadline - now)))
-                    delay = min(delay * 2, 1.0)
-                if server.poll() is not None or not readiness_receipt.is_file():
-                    raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
-                readiness = _validate_readiness_payload(_read_json(readiness_receipt, "policy server readiness"), policy_root=args.policy_path)
                 await_authenticated_policy_server_ready(
                     port=args.policy_server_port, token=token, readiness_timeout=10.0,
-                    request_timeout=1.0, process=server,
+                    request_timeout=1.0, process=None,
                 )
+                _append_external_policy_server_event(server_log, "authenticated_admission_passed")
             except Public96ContractError as error:
                 startup_failure = error
+                _append_external_policy_server_event(server_log, "authenticated_admission_failed")
+        else:
+            try:
+                server = subprocess.Popen(policy_command, stdout=server_handle, stderr=subprocess.STDOUT, text=True)
+            except (OSError, subprocess.SubprocessError) as error:
+                startup_failure = Public96ContractError(f"policy server startup failed: {error}")
+            if startup_failure is None:
+                try:
+                    deadline = time.monotonic() + startup_timeout
+                    delay = 0.1
+                    while not readiness_receipt.is_file() and server.poll() is None:
+                        now = time.monotonic()
+                        if now >= deadline:
+                            raise Public96ContractError("N1.7 policy server did not produce readiness before the startup timeout")
+                        time.sleep(min(delay, max(0.0, deadline - now)))
+                        delay = min(delay * 2, 1.0)
+                    if server.poll() is not None or not readiness_receipt.is_file():
+                        raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
+                    readiness = _validate_readiness_payload(_read_json(readiness_receipt, "policy server readiness"), policy_root=args.policy_path)
+                    await_authenticated_policy_server_ready(
+                        port=args.policy_server_port, token=token, readiness_timeout=10.0,
+                        request_timeout=1.0, process=server,
+                    )
+                except Public96ContractError as error:
+                    startup_failure = error
         if startup_failure is None:
-            for stage, command in zip(stages, stage_commands, strict=True):
+            for stage_index, (stage, command) in enumerate(zip(stages, stage_commands, strict=True)):
+                if external_readiness is not None:
+                    try:
+                        await_authenticated_policy_server_ready(
+                            port=args.policy_server_port, token=token, readiness_timeout=10.0,
+                            request_timeout=1.0, process=None,
+                        )
+                        _append_external_policy_server_event(server_log, f"authenticated_pre_stage_passed stage_id={stage.stage_id}")
+                    except Public96ContractError as error:
+                        reason = str(error)
+                        _append_external_policy_server_event(server_log, f"authenticated_pre_stage_failed stage_id={stage.stage_id}")
+                        for remaining in stages[stage_index:]:
+                            invalids.append({"stage_id": remaining.stage_id, "reason": reason})
+                            for episode_index in remaining.episode_indices:
+                                episodes.append(_infrastructure_invalid_episode(remaining, episode_index, reason))
+                        break
                 stage_root = _stage_dir(output_root, stage)
                 try:
                     stage_root.mkdir(); _make_overlay(args.asset_root, stage_root, stage.garment_name)
@@ -703,7 +778,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             server.terminate()
             try: server.wait(timeout=20)
             except subprocess.TimeoutExpired: server.kill(); server.wait()
-        server_handle.close()
+        if server_handle is not None:
+            server_handle.close()
     if startup_failure is not None:
         reason = str(startup_failure)
         invalids = [{"stage_id": stage.stage_id, "reason": reason} for stage in stages]
