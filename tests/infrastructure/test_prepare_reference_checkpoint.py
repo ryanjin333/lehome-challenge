@@ -36,7 +36,20 @@ def _source(tmp_path: Path) -> tuple[Path, str, dict[str, object]]:
     return source, _sha256(source / "config.json"), config
 
 
-def _prepare(source: Path, destination: Path, digest: str) -> dict[str, object]:
+def _expected_artifacts(source: Path) -> dict[str, dict[str, object]]:
+    return {
+        path.name: {"size": path.stat().st_size, "sha256": _sha256(path)}
+        for path in sorted(source.iterdir())
+        if path.name != "config.json"
+    }
+
+
+def _prepare(
+    source: Path,
+    destination: Path,
+    digest: str,
+    expected_artifacts: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
     from scripts.prepare_reference_checkpoint import prepare_reference_checkpoint
 
     return prepare_reference_checkpoint(
@@ -45,10 +58,20 @@ def _prepare(source: Path, destination: Path, digest: str) -> dict[str, object]:
         expected_source_config_sha256=digest,
         source_repository=REPOSITORY,
         source_revision=REVISION,
+        expected_artifacts=(
+            expected_artifacts
+            if expected_artifacts is not None
+            else _expected_artifacts(source)
+        ),
     )
 
 
-def _verify(source: Path, destination: Path, digest: str) -> dict[str, object]:
+def _verify(
+    source: Path,
+    destination: Path,
+    digest: str,
+    expected_artifacts: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
     from scripts.prepare_reference_checkpoint import verify_reference_checkpoint
 
     return verify_reference_checkpoint(
@@ -57,6 +80,11 @@ def _verify(source: Path, destination: Path, digest: str) -> dict[str, object]:
         expected_source_config_sha256=digest,
         source_repository=REPOSITORY,
         source_revision=REVISION,
+        expected_artifacts=(
+            expected_artifacts
+            if expected_artifacts is not None
+            else _expected_artifacts(source)
+        ),
     )
 
 
@@ -182,25 +210,27 @@ def test_prepare_rejects_source_symlinks(tmp_path: Path, symlink_name: str) -> N
 
 def test_prepare_rejects_nested_and_unsafe_source_entries(tmp_path: Path) -> None:
     source, digest, _ = _source(tmp_path)
+    expected_artifacts = _expected_artifacts(source)
     (source / "nested-directory").mkdir()
     with pytest.raises(ValueError, match="regular file"):
-        _prepare(source, tmp_path / "nested-view", digest)
+        _prepare(source, tmp_path / "nested-view", digest, expected_artifacts)
 
     (source / "nested-directory").rmdir()
     (source / ".hidden-weight").write_bytes(b"hidden")
     with pytest.raises(ValueError, match="unsafe artifact name"):
-        _prepare(source, tmp_path / "unsafe-view", digest)
+        _prepare(source, tmp_path / "unsafe-view", digest, expected_artifacts)
 
 
 def test_verify_rejects_source_artifact_mutation(tmp_path: Path) -> None:
     source, digest, _ = _source(tmp_path)
+    expected_artifacts = _expected_artifacts(source)
     destination = tmp_path / "view"
-    _prepare(source, destination, digest)
+    _prepare(source, destination, digest, expected_artifacts)
     artifact = source / "model-00001-of-00002.safetensors"
     artifact.write_bytes(b"other-weight-shard")
 
-    with pytest.raises(ValueError, match="SHA-256"):
-        _verify(source, destination, digest)
+    with pytest.raises(ValueError, match="trust input"):
+        _verify(source, destination, digest, expected_artifacts)
 
 
 def test_verify_rejects_swapped_symlink(tmp_path: Path) -> None:
@@ -323,6 +353,7 @@ def test_cli_create_and_verify_modes(tmp_path: Path, capsys: pytest.CaptureFixtu
     from scripts.prepare_reference_checkpoint import main
 
     source, digest, _ = _source(tmp_path)
+    expected_artifacts = _expected_artifacts(source)
     destination = tmp_path / "view"
     shared = [
         "--source-pretrained-model", str(source),
@@ -330,6 +361,8 @@ def test_cli_create_and_verify_modes(tmp_path: Path, capsys: pytest.CaptureFixtu
         "--expected-source-config-sha256", digest,
         "--source-repository", REPOSITORY,
         "--source-revision", REVISION,
+        "--expected-artifacts-json",
+        json.dumps(expected_artifacts, sort_keys=True, separators=(",", ":")),
     ]
     assert main(["create", *shared]) == 0
     create_output = json.loads(capsys.readouterr().out)
@@ -337,3 +370,156 @@ def test_cli_create_and_verify_modes(tmp_path: Path, capsys: pytest.CaptureFixtu
     assert main(["verify", *shared]) == 0
     verify_output = json.loads(capsys.readouterr().out)
     assert verify_output == create_output
+
+    noncanonical = list(shared)
+    noncanonical[-1] = json.dumps(expected_artifacts, indent=2)
+    with pytest.raises(ValueError, match="canonical strict JSON"):
+        main(["verify", *noncanonical])
+
+
+@pytest.mark.parametrize(
+    "expected_artifacts",
+    [
+        {},
+        {"unsafe/name": {"size": 1, "sha256": "0" * 64}},
+        {"weight": {"size": True, "sha256": "0" * 64}},
+        {"weight": {"size": 1, "sha256": "A" * 64}},
+        {"weight": {"size": 1, "sha256": "0" * 64, "extra": 1}},
+    ],
+)
+def test_prepare_rejects_invalid_artifact_trust_anchor(
+    tmp_path: Path,
+    expected_artifacts: dict[str, dict[str, object]],
+) -> None:
+    source, digest, _ = _source(tmp_path)
+    with pytest.raises(ValueError, match="expected artifacts"):
+        _prepare(source, tmp_path / "view", digest, expected_artifacts)
+
+
+def test_verify_rejects_joint_source_and_manifest_artifact_rewrite(tmp_path: Path) -> None:
+    from scripts.prepare_reference_checkpoint import MANIFEST_FILENAME
+
+    source, digest, _ = _source(tmp_path)
+    expected_artifacts = _expected_artifacts(source)
+    destination = tmp_path / "view"
+    manifest = _prepare(source, destination, digest, expected_artifacts)
+    artifact_name = "model-00001-of-00002.safetensors"
+    artifact = source / artifact_name
+    artifact.write_bytes(b"other-weight-shard")
+    for row in manifest["linked_artifacts"]:
+        if row["relative_name"] == artifact_name:
+            row["sha256"] = _sha256(artifact)
+    manifest_path = destination / MANIFEST_FILENAME
+    manifest_path.chmod(0o644)
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
+
+    with pytest.raises(ValueError, match="trust input|expected artifacts"):
+        _verify(source, destination, digest, expected_artifacts)
+
+
+def test_verify_detects_previously_checked_artifact_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.prepare_reference_checkpoint as utility
+
+    source, digest, _ = _source(tmp_path)
+    expected_artifacts = _expected_artifacts(source)
+    destination = tmp_path / "view"
+    _prepare(source, destination, digest, expected_artifacts)
+    first = source / "model-00001-of-00002.safetensors"
+    original_open = utility._open_regular_snapshot
+    mutated = False
+
+    def mutate_after_first(path: Path, label: str):
+        nonlocal mutated
+        if path.name == "model-00002-of-00002.safetensors" and not mutated:
+            first.write_bytes(b"other-weight-shard")
+            mutated = True
+        return original_open(path, label)
+
+    monkeypatch.setattr(utility, "_open_regular_snapshot", mutate_after_first)
+    with pytest.raises(ValueError, match="changed during verification"):
+        _verify(source, destination, digest, expected_artifacts)
+
+
+def test_verify_detects_previously_checked_symlink_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.prepare_reference_checkpoint as utility
+
+    source, digest, _ = _source(tmp_path)
+    expected_artifacts = _expected_artifacts(source)
+    destination = tmp_path / "view"
+    _prepare(source, destination, digest, expected_artifacts)
+    first = destination / "model-00001-of-00002.safetensors"
+    original_readlink = utility.os.readlink
+    calls = 0
+
+    def swap_first_after_check(path: Path) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            first.unlink()
+            first.symlink_to((source / "model-00002-of-00002.safetensors").resolve())
+        return original_readlink(path)
+
+    monkeypatch.setattr(utility.os, "readlink", swap_first_after_check)
+    with pytest.raises(ValueError, match="symlink.*changed during verification"):
+        _verify(source, destination, digest, expected_artifacts)
+
+
+def test_prepare_removes_publication_when_final_verify_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.prepare_reference_checkpoint as utility
+
+    source, digest, _ = _source(tmp_path)
+    expected_artifacts = _expected_artifacts(source)
+    destination = tmp_path / "view"
+    neighbor = tmp_path / "neighbor"
+    neighbor.write_text("preserve", encoding="utf-8")
+    original_publish = utility._publish_directory_exclusively
+
+    def publish_then_mutate(temporary: Path, published: Path) -> None:
+        original_publish(temporary, published)
+        (source / "model-00001-of-00002.safetensors").write_bytes(b"other-weight-shard")
+
+    monkeypatch.setattr(utility, "_publish_directory_exclusively", publish_then_mutate)
+    with pytest.raises(ValueError, match="trust input|changed"):
+        _prepare(source, destination, digest, expected_artifacts)
+    assert not destination.exists()
+    assert neighbor.read_text(encoding="utf-8") == "preserve"
+
+
+def test_prepare_removes_publication_when_parent_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.prepare_reference_checkpoint as utility
+
+    source, digest, _ = _source(tmp_path)
+    expected_artifacts = _expected_artifacts(source)
+    destination = tmp_path / "view"
+    neighbor = tmp_path / "neighbor"
+    neighbor.write_text("preserve", encoding="utf-8")
+    original_fsync = utility._fsync_directory
+    failed = False
+
+    def fail_first_parent_fsync(path: Path) -> None:
+        nonlocal failed
+        if path == destination.parent and not failed:
+            failed = True
+            raise OSError("injected parent fsync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(utility, "_fsync_directory", fail_first_parent_fsync)
+    with pytest.raises(OSError, match="injected parent fsync failure"):
+        _prepare(source, destination, digest, expected_artifacts)
+    assert not destination.exists()
+    assert neighbor.read_text(encoding="utf-8") == "preserve"
