@@ -172,7 +172,7 @@ def _materialize_artifacts(root: Path, bundle: dict[str, object]) -> None:
                 "wheel_url": "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl",
                 "wheel_size": 256027206,
                 "wheel_sha256": "cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af",
-                "distribution_name": "flash-attn",
+                "distribution_name": "flash_attn",
                 "flash_attn_version": "2.8.3",
                 "wheel_tag": "cp311-cp311-linux_x86_64",
             },
@@ -2041,13 +2041,14 @@ def _write_flash_attention_overlay_wheel(
     *,
     tag: str = "cp311-cp311-linux_x86_64",
     version: str = "2.8.3",
+    distribution_name: str = "flash_attn",
     unsafe_member: str | None = None,
 ) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("flash_attn/__init__.py", f"__version__ = {version!r}\n")
         archive.writestr(
             "flash_attn-2.8.3.dist-info/METADATA",
-            f"Metadata-Version: 2.1\nName: flash-attn\nVersion: {version}\n",
+            f"Metadata-Version: 2.1\nName: {distribution_name}\nVersion: {version}\n",
         )
         archive.writestr(
             "flash_attn-2.8.3.dist-info/WHEEL",
@@ -2097,6 +2098,11 @@ def test_flash_attention_overlay_rejects_bad_wheel_identity_metadata_and_tag(
     _write_flash_attention_overlay_wheel(wheel, unsafe_member="../escape.py")
     _configure_flash_attention_overlay_constants(monkeypatch, wheel)
     with pytest.raises(gate.NativeReferenceGateError, match="unsafe FlashAttention wheel member"):
+        gate.inspect_flash_attention_overlay()
+
+    _write_flash_attention_overlay_wheel(wheel, distribution_name="flash-attn")
+    _configure_flash_attention_overlay_constants(monkeypatch, wheel)
+    with pytest.raises(gate.NativeReferenceGateError, match="metadata"):
         gate.inspect_flash_attention_overlay()
 
 

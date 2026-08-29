@@ -237,7 +237,7 @@ def _flash_attention_wheel_members(wheel: Path) -> None:
         if ":" in line:
             key, value = line.split(":", 1)
             fields.setdefault(key, value.strip())
-    if fields.get("Name") != "flash-attn" or fields.get("Version") != FLASH_ATTENTION_VERSION:
+    if fields.get("Name") != "flash_attn" or fields.get("Version") != FLASH_ATTENTION_VERSION:
         raise NativeReferenceGateError("FlashAttention wheel metadata is not the exact official distribution")
     wheel_fields: dict[str, list[str]] = {}
     for line in wheel_metadata.splitlines():
@@ -278,7 +278,7 @@ def inspect_flash_attention_overlay() -> dict[str, object]:
         "wheel_url": FLASH_ATTENTION_WHEEL_URL,
         "wheel_size": FLASH_ATTENTION_WHEEL_SIZE,
         "wheel_sha256": FLASH_ATTENTION_WHEEL_SHA256,
-        "distribution_name": "flash-attn",
+        "distribution_name": "flash_attn",
         "flash_attn_version": FLASH_ATTENTION_VERSION,
         "wheel_tag": FLASH_ATTENTION_WHEEL_TAG,
     }
@@ -1377,7 +1377,7 @@ def _validate_flash_attention_overlay_receipt(document: object) -> dict[str, obj
         "wheel_url": FLASH_ATTENTION_WHEEL_URL,
         "wheel_size": FLASH_ATTENTION_WHEEL_SIZE,
         "wheel_sha256": FLASH_ATTENTION_WHEEL_SHA256,
-        "distribution_name": "flash-attn",
+        "distribution_name": "flash_attn",
         "flash_attn_version": FLASH_ATTENTION_VERSION,
         "wheel_tag": FLASH_ATTENTION_WHEEL_TAG,
     }

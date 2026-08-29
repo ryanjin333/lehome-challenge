@@ -52,7 +52,8 @@ published `7/8` oracle and its result has been published and read back.
   `cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af`, from
   `https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl`.
   Validation is offline and rejects any wrong name, size, digest, unsafe ZIP
-  member, metadata, or `cp311-cp311-linux_x86_64` platform tag. At execution
+  member, metadata (the real wheel records `Name: flash_attn`), or
+  `cp311-cp311-linux_x86_64` platform tag. At execution
   the wrapper bind-mounts that exact wheel read-only into the ephemeral
   container; `uv pip install --offline --no-deps --python
   /opt/lehome-challenge/.venv/bin/python <mounted-wheel>` prevents that
