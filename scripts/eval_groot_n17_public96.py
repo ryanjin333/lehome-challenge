@@ -14,6 +14,7 @@ from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -45,6 +46,7 @@ _EPISODE = re.compile(r"Episode\s+(?P<index>[12])/2:\s+Return=(?P<return>[-+]?\d
 _POLICY_SERVER_STARTUP_TIMEOUT_DEFAULT_SECONDS = 180.0
 _POLICY_SERVER_STARTUP_TIMEOUT_MIN_SECONDS = 30.0
 _POLICY_SERVER_STARTUP_TIMEOUT_MAX_SECONDS = 600.0
+_CANONICAL_DECIMAL_SECONDS = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 
 
 class Public96ContractError(ValueError):
@@ -57,10 +59,16 @@ class CheckpointIdentityError(Public96ContractError):
 
 def validate_policy_server_startup_timeout(value: object) -> float:
     """Keep GPU model initialization bounded without treating it as a 2s probe."""
-    if type(value) not in {int, float}:
+    if type(value) is str:
+        if not _CANONICAL_DECIMAL_SECONDS.fullmatch(value):
+            raise Public96ContractError("policy server startup timeout must be a finite number of seconds")
+    elif type(value) not in {int, float}:
         raise Public96ContractError("policy server startup timeout must be a number of seconds")
-    timeout = float(value)
-    if not _POLICY_SERVER_STARTUP_TIMEOUT_MIN_SECONDS <= timeout <= _POLICY_SERVER_STARTUP_TIMEOUT_MAX_SECONDS:
+    try:
+        timeout = float(value)
+    except (OverflowError, ValueError) as error:
+        raise Public96ContractError("policy server startup timeout must be a finite number of seconds") from error
+    if not math.isfinite(timeout) or not _POLICY_SERVER_STARTUP_TIMEOUT_MIN_SECONDS <= timeout <= _POLICY_SERVER_STARTUP_TIMEOUT_MAX_SECONDS:
         raise Public96ContractError("policy server startup timeout must be between 30 and 600 seconds")
     return timeout
 

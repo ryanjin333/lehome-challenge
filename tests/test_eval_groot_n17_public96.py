@@ -479,12 +479,27 @@ def test_real_video_filename_contract_uses_saver_dot_replacement() -> None:
 
 def test_policy_server_startup_timeout_uses_a_large_model_safe_default() -> None:
     assert validate_policy_server_startup_timeout(180.0) == 180.0
+    assert validate_policy_server_startup_timeout("180") == 180.0
+    assert validate_policy_server_startup_timeout("180.0") == 180.0
 
 
-@pytest.mark.parametrize("timeout", (29.0, 601.0, 0.0, True, "180"))
+@pytest.mark.parametrize("timeout", (29.0, 601.0, 0.0, True, float("nan"), float("inf"), "NaN", "inf", "180 seconds", ""))
 def test_policy_server_startup_timeout_rejects_unsafe_values(timeout: object) -> None:
     with pytest.raises(Public96ContractError, match="startup timeout"):
         validate_policy_server_startup_timeout(timeout)
+
+
+def test_parser_accepts_literal_numeric_policy_server_startup_timeout() -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    args = evaluator._parser().parse_args([
+        "--matrix", "/tmp/matrix.json", "--matrix-sha256", "/tmp/matrix.sha256",
+        "--policy-path", "/tmp/policy", "--checkpoint-identity-receipt", "/tmp/identity.json",
+        "--asset-root", "/tmp/assets", "--output-root", "/tmp/output",
+        "--policy-server-startup-timeout", "180",
+    ])
+
+    assert args.policy_server_startup_timeout == 180.0
 
 
 def test_authenticated_readiness_uses_a_real_token_checked_loopback_socket(monkeypatch: pytest.MonkeyPatch) -> None:
