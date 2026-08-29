@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -599,6 +600,41 @@ def test_external_readiness_receipt_rejects_a_path_swapped_to_a_symlink_before_o
     assert open_flags and open_flags[0] & getattr(evaluator.os, "O_NOFOLLOW", 0)
 
 
+def test_external_readiness_receipt_opens_a_fifo_nonblocking_then_rejects_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO support is unavailable")
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    fifo = tmp_path / "readiness.fifo"
+    os.mkfifo(fifo)
+    real_open = evaluator.os.open
+
+    def assert_nonblocking_open(path: str | bytes | int, flags: int, *args: object) -> int:
+        assert flags & evaluator.os.O_NONBLOCK
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(evaluator.os, "open", assert_nonblocking_open)
+
+    with pytest.raises(Public96ContractError, match="external policy server readiness receipt is missing or unsafe"):
+        evaluator._load_external_readiness_receipt(fifo, policy_root=policy)
+
+
+def test_external_readiness_receipt_rejects_oversized_regular_file(tmp_path: Path) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    receipt = tmp_path / "oversized-readiness.json"
+    receipt.write_bytes(b"x" * ((64 * 1024) + 1))
+
+    with pytest.raises(Public96ContractError, match="external policy server readiness receipt is missing or unsafe"):
+        evaluator._load_external_readiness_receipt(receipt, policy_root=policy)
+
+
 def test_external_dry_run_validates_and_copies_the_readiness_receipt_without_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -665,6 +701,33 @@ def test_external_mode_requires_authenticated_admission_and_reprobes_before_ever
     assert "source_mode=external" in log
     assert hashlib.sha256(source.read_bytes()).hexdigest() in log
     assert "sidecar process log" not in log
+
+
+def test_external_initial_admission_failure_starts_no_stages_and_writes_complete_invalid_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    args, output_root, identity = _runtime_inputs(tmp_path, monkeypatch, output_name="external-admission-failure")
+    args.external_policy_server_readiness_receipt = _write_external_readiness_receipt(tmp_path / "external-readiness.json", args.policy_path)
+    stage_commands: list[list[str]] = []
+    reason = "external policy server did not pass token-bound readiness"
+
+    monkeypatch.setattr(evaluator.subprocess, "Popen", lambda *_, **__: (_ for _ in ()).throw(AssertionError("external mode must not start a child server")))
+    monkeypatch.setattr(evaluator, "await_authenticated_policy_server_ready", lambda **_: (_ for _ in ()).throw(Public96ContractError(reason)))
+
+    def no_stage(command: list[str], **_: object) -> object:
+        stage_commands.append(command)
+        raise AssertionError("failed external admission must not launch an Isaac stage")
+
+    monkeypatch.setattr(evaluator.subprocess, "run", no_stage)
+
+    with pytest.raises(Public96ContractError, match=reason):
+        run(args)
+
+    assert stage_commands == []
+    _assert_pre_stage_invalid_evidence(output_root, identity, reason)
+    assert "event=authenticated_admission_failed" in (output_root / "policy-server.log").read_text(encoding="utf-8")
 
 
 def test_external_mid_run_probe_failure_stops_later_stages_and_emits_complete_invalid_evidence(
@@ -810,6 +873,12 @@ def test_validation_only_emits_all_48_n17_stage_assignments_without_runtime(tmp_
     ))
 
     assert result["kind"] == "lehome_groot_n17_public96_validation_v1"
+    assert set(result) == {
+        "kind", "matrix_sha256", "checkpoint", "raw_checker_overlay",
+        "policy_server_command", "policy_server_startup_timeout_seconds",
+        "stage_commands", "assignments", "publication",
+    }
+    assert isinstance(result["policy_server_command"], list)
     assert len(result["stage_commands"]) == 48
     assert (output_root / "validation-only-receipt.json").is_file()
 

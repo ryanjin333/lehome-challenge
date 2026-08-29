@@ -35,9 +35,10 @@ validation receipt is not an evaluation result.
 
 Only after separate provider admission and an explicit paid-run decision, omit
 `--dry-run` and provide the already-present policy-server token environment
-variable. The evaluator starts one pinned N1.7 GR00T PolicyServer on CUDA and
-runs one CPU-cloth Isaac process at a time. Before the stage entrypoint imports
-the evaluator task it installs the scoped raw-checker overlay: it requires the
+variable. In the default legacy mode (with no external receipt argument), the
+evaluator owns one pinned N1.7 GR00T PolicyServer child on CUDA and runs one
+CPU-cloth Isaac process at a time. Before the stage entrypoint imports the
+evaluator task it installs the scoped raw-checker overlay: it requires the
 second (`mesh_points`) value from `get_current_mesh_points()`, finite validated
 indices, and the raw `success_distance` values with no `init_scale` multiplier.
 It has no transformed-point fallback.
@@ -47,6 +48,24 @@ authenticated loopback ping. Its model-startup wait defaults to 180 seconds
 and is bounded to 30–600 seconds through `--policy-server-startup-timeout`.
 Use the default unless the provider logs show a legitimately slower cold model
 load; this setting does not start CUDA during `--dry-run`.
+
+## Prestarted external policy server
+
+External mode is only for a PolicyServer sidecar already running in the pinned
+trainer image while the evaluator runs the CPU-cloth Isaac stages elsewhere.
+The sidecar's model cache must be mounted at the exact same absolute
+`--policy-path` in both environments. Supply its completed, pinned readiness
+receipt with:
+
+```text
+--external-policy-server-readiness-receipt /absolute/path/policy-server-readiness.json
+```
+
+The evaluator validates and records that receipt, requires a token-bound
+authenticated admission ping before any Isaac work, and repeats the same ping
+immediately before every stage. In this mode it never starts, owns, terminates,
+or claims the sidecar process log; the operator must stop the sidecar separately
+after evaluation.
 
 Each valid clean policy failure remains a scored failure. Any missing video,
 log, stage receipt, malformed metrics, policy-server failure, or cloth/fidelity

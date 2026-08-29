@@ -47,6 +47,7 @@ _EPISODE = re.compile(r"Episode\s+(?P<index>[12])/2:\s+Return=(?P<return>[-+]?\d
 _POLICY_SERVER_STARTUP_TIMEOUT_DEFAULT_SECONDS = 180.0
 _POLICY_SERVER_STARTUP_TIMEOUT_MIN_SECONDS = 30.0
 _POLICY_SERVER_STARTUP_TIMEOUT_MAX_SECONDS = 600.0
+_MAX_EXTERNAL_POLICY_SERVER_READINESS_RECEIPT_BYTES = 64 * 1024
 _CANONICAL_DECIMAL_SECONDS = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 
 
@@ -453,20 +454,28 @@ def _load_external_readiness_receipt(path: Path, *, policy_root: Path) -> tuple[
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if type(no_follow) is not int or not no_follow:
         raise Public96ContractError("external policy server readiness receipt is missing or unsafe")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow
+    non_block = getattr(os, "O_NONBLOCK", None)
+    if type(non_block) is not int or not non_block:
+        raise Public96ContractError("external policy server readiness receipt is missing or unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow | non_block
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
         raise Public96ContractError("external policy server readiness receipt is missing or unsafe") from error
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or not 1 <= metadata.st_size <= _MAX_EXTERNAL_POLICY_SERVER_READINESS_RECEIPT_BYTES:
             raise Public96ContractError("external policy server readiness receipt is missing or unsafe")
         chunks: list[bytes] = []
+        total = 0
         while True:
-            block = os.read(descriptor, 1024 * 1024)
+            block = os.read(descriptor, min(64 * 1024, (_MAX_EXTERNAL_POLICY_SERVER_READINESS_RECEIPT_BYTES + 1) - total))
             if not block:
                 break
             chunks.append(block)
+            total += len(block)
+            if total > _MAX_EXTERNAL_POLICY_SERVER_READINESS_RECEIPT_BYTES:
+                raise Public96ContractError("external policy server readiness receipt is missing or unsafe")
         contents = b"".join(chunks)
     except OSError as error:
         raise Public96ContractError("external policy server readiness receipt is invalid JSON") from error
@@ -684,8 +693,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         _write_new_bytes(readiness_receipt, external_readiness_contents)
     stage_commands = [build_stage_command(stage, repo_root=Path.cwd(), policy_path=args.policy_path, output_root=output_root, policy_server_port=args.policy_server_port, token_env=args.policy_server_token_env) for stage in stages]
     assignments = [{"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_indices": list(stage.episode_indices), "overlay_path": str(_stage_dir(output_root, stage) / "garment-config"), "command": command} for stage, command in zip(stages, stage_commands, strict=True)]
-    base = {"kind": "lehome_groot_n17_public96_validation_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "policy_server_mode": "external" if external_readiness is not None else "local_child", "policy_server_command": None if external_readiness is not None else policy_command, "policy_server_startup_timeout_seconds": startup_timeout, "stage_commands": stage_commands, "assignments": assignments, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
+    base = {"kind": "lehome_groot_n17_public96_validation_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "policy_server_command": policy_command, "policy_server_startup_timeout_seconds": startup_timeout, "stage_commands": stage_commands, "assignments": assignments, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
     if external_readiness_sha256 is not None:
+        base["policy_server_mode"] = "external"
+        base["policy_server_command"] = None
         base["external_policy_server_readiness_receipt_sha256"] = external_readiness_sha256
     if args.dry_run:
         _write_new_json(output_root / "validation-only-receipt.json", base)
