@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import importlib
+import importlib.metadata
 import importlib.util
 import json
 import os
@@ -47,6 +48,12 @@ ASSETS_REVISION = "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9"
 ASSETS_RUNTIME_ROOTS = ("objects", "robots", "scenes", "textures")
 RUNTIME_IMAGE_REFERENCE = "lehome-rollout:build"
 RUNTIME_IMAGE_ID = "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
+CHECKPOINT_CONFIG_SHA256 = "b7c385bc57456eae603e929b84defb7e991194aade2aad70785e21991e37614c"
+LEROBOT_WHEEL_SHA256 = "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c"
+CHECKPOINT_COMPATIBILITY_FIELDS = {
+    "decay_lr_ratio": 0.1,
+    "num_decay_steps": 4000,
+}
 
 
 class NativeReferenceGateError(ValueError):
@@ -355,6 +362,101 @@ def prepare_runtime_asset_mountpoints(runtime_root: Path) -> dict[str, object]:
         "runtime_revision": root.name,
         "mountpoints": mountpoints,
     }
+
+
+def prepare_checkpoint_compatibility(
+    checkpoint_root: Path,
+    sanitized_config_root: Path,
+    receipt_path: Path,
+) -> dict[str, object]:
+    """Build one exclusive inference-only config view without changing the checkpoint."""
+    checkpoint = Path(checkpoint_root).resolve(strict=True)
+    config_path = checkpoint / "config.json"
+    raw = _read_regular_bytes(config_path, "checkpoint config")
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    if raw_sha256 != CHECKPOINT_CONFIG_SHA256:
+        raise NativeReferenceGateError("checkpoint compatibility config digest mismatch")
+    try:
+        values = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise NativeReferenceGateError("checkpoint compatibility config is invalid") from error
+    if type(values) is not dict:
+        raise NativeReferenceGateError("checkpoint compatibility config must be an object")
+    if set(CHECKPOINT_COMPATIBILITY_FIELDS) - set(values):
+        raise NativeReferenceGateError("checkpoint compatibility fields are incomplete")
+    if (
+        type(values["num_decay_steps"]) is not int
+        or values["num_decay_steps"] != 4000
+        or type(values["decay_lr_ratio"]) is not float
+        or values["decay_lr_ratio"] != 0.1
+    ):
+        raise NativeReferenceGateError("checkpoint compatibility field values changed")
+
+    try:
+        from lerobot.policies.groot.configuration_groot import GrootConfig
+    except Exception as error:
+        raise NativeReferenceGateError("official GrootConfig is unavailable") from error
+    fields = getattr(GrootConfig, "__dataclass_fields__", None)
+    if (
+        GrootConfig.__name__ != "GrootConfig"
+        or GrootConfig.__module__ != "lerobot.policies.groot.configuration_groot"
+        or not isinstance(fields, dict)
+        or any(name in fields for name in CHECKPOINT_COMPATIBILITY_FIELDS)
+    ):
+        raise NativeReferenceGateError("official GrootConfig field mismatch is not exact")
+    try:
+        lerobot_version = importlib.metadata.version("lerobot")
+        config_module = importlib.import_module(GrootConfig.__module__)
+        groot_origin = Path(config_module.__file__).resolve(strict=True)
+    except Exception as error:
+        raise NativeReferenceGateError("official LeRobot wheel identity is unavailable") from error
+    if lerobot_version != LEROBOT_VERSION:
+        raise NativeReferenceGateError("official LeRobot wheel version changed")
+
+    sanitized_values = dict(values)
+    removed = [
+        {"key": key, "value": sanitized_values.pop(key)}
+        for key in sorted(CHECKPOINT_COMPATIBILITY_FIELDS)
+    ]
+    if set(values) - set(sanitized_values) != set(CHECKPOINT_COMPATIBILITY_FIELDS):
+        raise NativeReferenceGateError("checkpoint compatibility removed an unexpected field")
+    sanitized_raw = _canonical_bytes(sanitized_values)
+    sanitized_root = Path(sanitized_config_root)
+    if sanitized_root.is_symlink() or sanitized_root.exists():
+        raise NativeReferenceGateError("sanitized checkpoint config root already exists")
+    try:
+        sanitized_root.mkdir(mode=0o700)
+        sanitized_root = sanitized_root.resolve(strict=True)
+        descriptor = os.open(
+            sanitized_root / "config.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(sanitized_raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as error:
+        raise NativeReferenceGateError("sanitized checkpoint config could not be created") from error
+    if config_path.read_bytes() != raw:
+        raise NativeReferenceGateError("original checkpoint config changed during normalization")
+    receipt = {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_checkpoint_compatibility_v1",
+        "checkpoint_root": str(checkpoint),
+        "raw_config_sha256": raw_sha256,
+        "sanitized_config_root": str(sanitized_root),
+        "sanitized_config_sha256": hashlib.sha256(sanitized_raw).hexdigest(),
+        "removed_fields": removed,
+        "lerobot_distribution": "lerobot",
+        "lerobot_version": lerobot_version,
+        "lerobot_wheel_filename": "lerobot-0.4.3-py3-none-any.whl",
+        "lerobot_wheel_sha256": LEROBOT_WHEEL_SHA256,
+        "groot_config_origin": str(groot_origin),
+        "groot_config_missing_fields": sorted(CHECKPOINT_COMPATIBILITY_FIELDS),
+        "rationale": "inference_only_remove_unsupported_training_scheduler_fields",
+        "original_checkpoint_unchanged": True,
+    }
+    _write_exclusive(Path(receipt_path), receipt)
+    return receipt
 
 
 def validate_runtime_image_observation(document: object) -> dict[str, object]:
@@ -850,7 +952,7 @@ def oracle_attempts() -> tuple[dict[str, object], ...]:
 def _validate_identity(value: object) -> dict[str, object]:
     identity = _object(value, "identity")
     fixed = {"source_repository": SOURCE_REPOSITORY, "source_revision": SOURCE_REVISION, "source_tree_sha256": SOURCE_TREE_SHA256, "lerobot_version": LEROBOT_VERSION, "policy_class": POLICY_CLASS, "policy_device": "cuda:0", "simulator_device": "cpu", "task_description": TASK_DESCRIPTION, "action_horizon": 16, "action_dimension": 12, "success_checker": SUCCESS_CHECKER, "cuda_available": True, "runtime_image_reference": RUNTIME_IMAGE_REFERENCE, "runtime_image_id": RUNTIME_IMAGE_ID}
-    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "source_root", "python_executable", "python_version", "torch_version", "lerobot_origin", "scripts_eval_origin", "lehome_origin"}
+    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "source_root", "python_executable", "python_version", "torch_version", "lerobot_origin", "scripts_eval_origin", "lehome_origin"}
     if set(identity) != {*fixed, *variable}:
         raise NativeReferenceGateError("identity has an unexpected schema")
     for key, expected in fixed.items():
@@ -863,7 +965,7 @@ def _validate_identity(value: object) -> dict[str, object]:
                 else key
             )
             raise NativeReferenceGateError(f"identity {label} does not match the native contract")
-    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256"):
+    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256"):
         _digest(identity.get(key), f"identity {key}")
     if type(identity["cuda_device_count"]) is not int or identity["cuda_device_count"] < 1 or not isinstance(identity["cuda_runtime"], str) or not identity["cuda_runtime"]:
         raise NativeReferenceGateError("identity does not prove CUDA availability")
@@ -895,6 +997,50 @@ def _absolute_identity_path(value: object, label: str) -> str:
     return path.as_posix()
 
 
+def _validate_checkpoint_compatibility_receipt(
+    document: object, *, bundle_root: Path
+) -> dict[str, object]:
+    receipt = _object(document, "checkpoint compatibility receipt")
+    expected_keys = {
+        "schema_version", "kind", "checkpoint_root", "raw_config_sha256",
+        "sanitized_config_root", "sanitized_config_sha256", "removed_fields",
+        "lerobot_distribution", "lerobot_version", "lerobot_wheel_filename",
+        "lerobot_wheel_sha256", "groot_config_origin", "groot_config_missing_fields",
+        "rationale", "original_checkpoint_unchanged",
+    }
+    fixed = {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_checkpoint_compatibility_v1",
+        "raw_config_sha256": CHECKPOINT_CONFIG_SHA256,
+        "removed_fields": [
+            {"key": key, "value": CHECKPOINT_COMPATIBILITY_FIELDS[key]}
+            for key in sorted(CHECKPOINT_COMPATIBILITY_FIELDS)
+        ],
+        "lerobot_distribution": "lerobot",
+        "lerobot_version": LEROBOT_VERSION,
+        "lerobot_wheel_filename": "lerobot-0.4.3-py3-none-any.whl",
+        "lerobot_wheel_sha256": LEROBOT_WHEEL_SHA256,
+        "groot_config_missing_fields": sorted(CHECKPOINT_COMPATIBILITY_FIELDS),
+        "rationale": "inference_only_remove_unsupported_training_scheduler_fields",
+        "original_checkpoint_unchanged": True,
+    }
+    if set(receipt) != expected_keys or any(receipt.get(key) != value for key, value in fixed.items()):
+        raise NativeReferenceGateError("checkpoint compatibility receipt contract is invalid")
+    _absolute_identity_path(receipt.get("checkpoint_root"), "compatibility checkpoint root")
+    _absolute_identity_path(receipt.get("groot_config_origin"), "compatibility GrootConfig origin")
+    _digest(receipt.get("sanitized_config_sha256"), "sanitized checkpoint config")
+    sanitized_root = _absolute_identity_path(
+        receipt.get("sanitized_config_root"), "sanitized config root"
+    )
+    expected_root = str((bundle_root / "checkpoint-config-view").resolve(strict=True))
+    if sanitized_root != expected_root:
+        raise NativeReferenceGateError("sanitized config root escapes the execution bundle")
+    sanitized = _artifact_from_file(bundle_root, Path("checkpoint-config-view/config.json"))
+    if sanitized["sha256"] != receipt["sanitized_config_sha256"]:
+        raise NativeReferenceGateError("sanitized checkpoint config changed after receipt creation")
+    return receipt
+
+
 def _validate_attempt(value: object, expected: Mapping[str, object], root: Path | None) -> dict[str, object]:
     attempt = _object(value, "attempt")
     if set(attempt) != {*expected, "success", "videos", "log", "receipt"}:
@@ -924,9 +1070,14 @@ def verify_native_reference_result(document: object, *, bundle_root: Path | None
         cache = _artifact_from_file(bundle_root, Path("evidence/cache-trust-manifest.json"))
         running = _artifact_from_file(bundle_root, Path("evidence/provider-running-receipt.json"))
         runtime_image = _artifact_from_file(bundle_root, Path("evidence/runtime-image-receipt.json"))
-        if cache["sha256"] != identity["cache_trust_manifest_sha256"] or running["sha256"] != identity["provider_running_receipt_sha256"] or runtime_image["sha256"] != identity["runtime_image_receipt_sha256"]:
+        compatibility = _artifact_from_file(bundle_root, Path("evidence/checkpoint-compatibility-receipt.json"))
+        _validate_checkpoint_compatibility_receipt(
+            _read_json(bundle_root / "evidence/checkpoint-compatibility-receipt.json", "checkpoint compatibility receipt"),
+            bundle_root=bundle_root,
+        )
+        if cache["sha256"] != identity["cache_trust_manifest_sha256"] or running["sha256"] != identity["provider_running_receipt_sha256"] or runtime_image["sha256"] != identity["runtime_image_receipt_sha256"] or compatibility["sha256"] != identity["checkpoint_compatibility_receipt_sha256"]:
             raise NativeReferenceGateError("execution bundle support evidence is not bound to identity")
-        supporting_artifacts = {"cache_trust_manifest": cache, "provider_running_receipt": running, "runtime_image_receipt": runtime_image}
+        supporting_artifacts = {"cache_trust_manifest": cache, "provider_running_receipt": running, "runtime_image_receipt": runtime_image, "checkpoint_compatibility_receipt": compatibility}
     rows = result.get("attempts")
     if type(rows) is not list or len(rows) not in {2, 8}:
         raise NativeReferenceGateError("native reference result must contain either the two-attempt admission stop or all eight attempts")
@@ -1050,6 +1201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     bind_runtime_image = commands.add_parser("bind-runtime-image-receipt"); bind_runtime_image.add_argument("--input", type=Path, required=True); bind_runtime_image.add_argument("--receipt", type=Path, required=True)
     asset_bindings = commands.add_parser("validate-asset-bindings"); asset_bindings.add_argument("--assets-root", type=Path, required=True); asset_bindings.add_argument("--runtime-repo-root", type=Path, required=True)
     prepare_mountpoints = commands.add_parser("prepare-runtime-mountpoints"); prepare_mountpoints.add_argument("--runtime-root", type=Path, required=True)
+    compatibility = commands.add_parser("prepare-checkpoint-compatibility"); compatibility.add_argument("--checkpoint-root", type=Path, required=True); compatibility.add_argument("--sanitized-config-root", type=Path, required=True); compatibility.add_argument("--receipt", type=Path, required=True)
     cache = commands.add_parser("fetch-cache-manifest"); cache.add_argument("--revision", required=True); cache.add_argument("--path", required=True); cache.add_argument("--receipt", type=Path); cache.add_argument("--checkpoint-tree-sha256"); cache.add_argument("--metadata-tree-sha256"); cache.add_argument("--assets-tree-sha256")
     publish = commands.add_parser("publish-bundle"); publish.add_argument("--bundle-root", type=Path, required=True); publish.add_argument("--execution", type=Path, required=True); publish.add_argument("--token-file", type=Path, required=True); publish.add_argument("--receipt", type=Path, required=True)
     publish_cache = commands.add_parser("publish-cache-manifest"); publish_cache.add_argument("--manifest", type=Path, required=True); publish_cache.add_argument("--token-file", type=Path, required=True); publish_cache.add_argument("--receipt", type=Path, required=True)
@@ -1077,6 +1229,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             receipt = validate_runtime_asset_bindings(args.assets_root, args.runtime_repo_root)
         elif args.command == "prepare-runtime-mountpoints":
             receipt = prepare_runtime_asset_mountpoints(args.runtime_root)
+        elif args.command == "prepare-checkpoint-compatibility":
+            receipt = prepare_checkpoint_compatibility(args.checkpoint_root, args.sanitized_config_root, args.receipt)
         elif args.command == "publish-bundle":
             with _repository_package_imports():
                 from scripts.publish_simple_curriculum_collection import HuggingFacePublicDatasetTransport, _load_token

@@ -178,6 +178,21 @@ the pinned evaluator/LeHome origins, and binds the torch/CUDA probe before any
 stage can run. The public evaluator still receives `--device cpu`; CUDA remains
 policy-only.
 
+The pinned public checkpoint's `config.json` has two training-only scheduler
+keys that official LeRobot 0.4.3 `GrootConfig` lacks:
+`num_decay_steps=4000` and `decay_lr_ratio=0.1`. The checkpoint and pinned
+source remain byte-immutable. After exact raw-config, official field-set, and
+official wheel-hash validation, the launcher creates an exclusive ephemeral
+config view outside both roots and removes exactly those keys. Reviewed
+`sitecustomize` wraps only the one exact
+`PreTrainedConfig.from_pretrained(original_checkpoint)` call to parse the view.
+The public adapter then restores `pretrained_path` to the original checkpoint;
+`make_policy`, weights, and processors remain original-path consumers. A
+strict compatibility receipt binds raw and sanitized hashes, removed
+key-values, official wheel identity/hash, and the inference-only rationale into
+identity/preflight/execution/final evidence. Any second call or different
+path, digest, field, value, or parse failure is fatal before episode 1.
+
 ## Decision after the gate
 
 - Pass: run the local 12K checkpoint on the same native evaluator boundary.

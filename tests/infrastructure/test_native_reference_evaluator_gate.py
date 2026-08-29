@@ -8,6 +8,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import hashlib
+import sys
 import time
 
 import pytest
@@ -17,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "rollout_appliance" / "run_native_reference_evaluator_gate.sh"
 CONTAINER_WRAPPER = ROOT / "rollout_appliance" / "run_native_reference_evaluator_container.sh"
 NATIVE_SITE_CUSTOMIZE = ROOT / "rollout_appliance" / "native_reference_site" / "sitecustomize.py"
+CHECKPOINT_COMPATIBILITY_SHIM = NATIVE_SITE_CUSTOMIZE.parent / "checkpoint_compatibility.py"
 RUNBOOK = ROOT / "docs" / "experiments" / "2026-08-28-native-reference-evaluator-gate-runbook.md"
 CANONICAL_CACHE_MANIFEST = ROOT / "rollout_appliance" / "native_reference_canonical_cache_manifest.json"
 
@@ -32,6 +34,7 @@ def _identity() -> dict[str, object]:
         "cache_trust_manifest_sha256": hashlib.sha256(b"cache").hexdigest(),
         "provider_running_receipt_sha256": hashlib.sha256(b"running").hexdigest(),
         "runtime_image_receipt_sha256": hashlib.sha256(b"runtime-image").hexdigest(),
+        "checkpoint_compatibility_receipt_sha256": hashlib.sha256(b"compatibility").hexdigest(),
         "provider_source_image_id": "computeimage-u00zf6w3yf72gakhcy",
         "runtime_image_reference": "lehome-rollout:build",
         "runtime_image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
@@ -94,6 +97,38 @@ def _materialize_artifacts(root: Path, bundle: dict[str, object]) -> None:
     (root / "evidence/cache-trust-manifest.json").write_bytes(b"cache")
     (root / "evidence/provider-running-receipt.json").write_bytes(b"running")
     (root / "evidence/runtime-image-receipt.json").write_bytes(b"runtime-image")
+    sanitized = b"{}\n"
+    (root / "checkpoint-config-view").mkdir()
+    (root / "checkpoint-config-view/config.json").write_bytes(sanitized)
+    compatibility = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "lehome_native_reference_checkpoint_compatibility_v1",
+                "checkpoint_root": "/mnt/lehome/cache/reference-theo-d384fe0/repo/pretrained_model",
+                "raw_config_sha256": "b7c385bc57456eae603e929b84defb7e991194aade2aad70785e21991e37614c",
+                "sanitized_config_root": str((root / "checkpoint-config-view").resolve()),
+                "sanitized_config_sha256": hashlib.sha256(sanitized).hexdigest(),
+                "removed_fields": [
+                    {"key": "decay_lr_ratio", "value": 0.1},
+                    {"key": "num_decay_steps", "value": 4000},
+                ],
+                "lerobot_distribution": "lerobot",
+                "lerobot_version": "0.4.3",
+                "lerobot_wheel_filename": "lerobot-0.4.3-py3-none-any.whl",
+                "lerobot_wheel_sha256": "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c",
+                "groot_config_origin": "/opt/python/lerobot/policies/groot/configuration_groot.py",
+                "groot_config_missing_fields": ["decay_lr_ratio", "num_decay_steps"],
+                "rationale": "inference_only_remove_unsupported_training_scheduler_fields",
+                "original_checkpoint_unchanged": True,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    (root / "evidence/checkpoint-compatibility-receipt.json").write_bytes(compatibility)
+    bundle["identity"]["checkpoint_compatibility_receipt_sha256"] = hashlib.sha256(compatibility).hexdigest()  # type: ignore[index]
     for attempt in bundle["attempts"]:  # type: ignore[index]
         for artifact in [attempt["log"], attempt["receipt"], *attempt["videos"]]:  # type: ignore[index]
             path = root / artifact["path"]  # type: ignore[index]
@@ -322,6 +357,8 @@ def test_native_run_stage_binds_arguments_before_expanding_stage_log(tmp_path: P
         "ASSETS_ROOT=/assets\n"
         "ISAACLAB_ROOT=/isaaclab\n"
         "ISAACLAB_TASKS_ROOT=/isaaclab_tasks\n"
+        "SANITIZED_CONFIG_ROOT=/sanitized\n"
+        "CHECKPOINT_COMPATIBILITY_RECEIPT=/compatibility.json\n"
         "validate_stage_integrity() { :; }\n"
         f"run_stage() {{{run_stage}\n}}\n"
         "run_stage 1 top_long Top_Long_Seen_0\n",
@@ -948,6 +985,9 @@ def test_runtime_image_receipt_is_bound_before_cuda_and_final_identity_validatio
     execution = text[text.index('mkdir --mode=0700 -- "$OUTPUT_ROOT"') :]
     assert execution.index("bind-runtime-image-receipt") < execution.index("probe_cuda;")
     assert execution.index("validate_runtime_image_binding") < execution.index("probe_cuda;")
+    assert execution.index("prepare-checkpoint-compatibility") < execution.index("probe_cuda;")
+    assert "CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256" in execution
+    assert "checkpoint_compatibility_receipt_sha256" in text
 
     bundle = _bundle()
     assert verify_native_reference_result(bundle)["identity"]["runtime_image_reference"] == "lehome-rollout:build"
@@ -1345,3 +1385,212 @@ def test_two_pinned_module_invocations_redirect_logs_and_leave_source_immutable(
     ) == ""
     assert (external_project / "logs" / "top_long" / "eval.log").read_text(encoding="utf-8") == "PINNED\nPINNED\n"
     assert not any(source.rglob("__pycache__"))
+
+
+def test_checkpoint_compatibility_shim_sanitizes_only_training_fields_and_preserves_load_paths(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    sanitized = tmp_path / "sanitized"
+    fake_packages = tmp_path / "fake-packages"
+    checkpoint.mkdir()
+    sanitized.mkdir()
+    raw_config = {
+        "type": "groot",
+        "num_decay_steps": 4000,
+        "decay_lr_ratio": 0.1,
+    }
+    raw = json.dumps(raw_config, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    (checkpoint / "config.json").write_bytes(raw)
+    sanitized_payload = json.dumps(
+        {"type": "groot"}, sort_keys=True, separators=(",", ":")
+    ).encode() + b"\n"
+    (sanitized / "config.json").write_bytes(sanitized_payload)
+    receipt = tmp_path / "compatibility.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "lehome_native_reference_checkpoint_compatibility_v1",
+                "checkpoint_root": str(checkpoint.resolve()),
+                "raw_config_sha256": hashlib.sha256(raw).hexdigest(),
+                "sanitized_config_root": str(sanitized.resolve()),
+                "sanitized_config_sha256": hashlib.sha256(sanitized_payload).hexdigest(),
+                "removed_fields": [
+                    {"key": "decay_lr_ratio", "value": 0.1},
+                    {"key": "num_decay_steps", "value": 4000},
+                ],
+                "lerobot_distribution": "lerobot",
+                "lerobot_version": "0.4.3",
+                "lerobot_wheel_filename": "lerobot-0.4.3-py3-none-any.whl",
+                "lerobot_wheel_sha256": "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c",
+                "groot_config_origin": str(
+                    (fake_packages / "lerobot/policies/groot/configuration_groot.py").resolve()
+                ),
+                "groot_config_missing_fields": ["decay_lr_ratio", "num_decay_steps"],
+                "rationale": "inference_only_remove_unsupported_training_scheduler_fields",
+                "original_checkpoint_unchanged": True,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    for package in (
+        fake_packages / "lerobot",
+        fake_packages / "lerobot/configs",
+        fake_packages / "lerobot/policies",
+        fake_packages / "lerobot/policies/groot",
+    ):
+        package.mkdir(parents=True, exist_ok=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+    (fake_packages / "lerobot/policies/groot/configuration_groot.py").write_text(
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class GrootConfig:\n"
+        "    type: str = 'groot'\n"
+        "    pretrained_path: str | None = None\n",
+        encoding="utf-8",
+    )
+    (fake_packages / "lerobot/configs/policies.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n"
+        "from lerobot.policies.groot.configuration_groot import GrootConfig\n"
+        "class PreTrainedConfig:\n"
+        "    @classmethod\n"
+        "    def from_pretrained(cls, path, cli_overrides=None):\n"
+        "        values=json.loads((Path(path)/'config.json').read_text())\n"
+        "        extra=set(values)-set(GrootConfig.__dataclass_fields__)\n"
+        "        if extra: raise TypeError(f'unexpected fields: {sorted(extra)}')\n"
+        "        return GrootConfig(**values)\n",
+        encoding="utf-8",
+    )
+    driver = tmp_path / "driver.py"
+    driver.write_text(
+        "import json,sys\n"
+        "from pathlib import Path\n"
+        "from checkpoint_compatibility import install_checkpoint_config_view\n"
+        "checkpoint=Path(sys.argv[1]); sanitized=Path(sys.argv[2]); receipt=Path(sys.argv[3])\n"
+        "original=checkpoint.joinpath('config.json').read_bytes()\n"
+        f"install_checkpoint_config_view(checkpoint, sanitized, receipt, expected_config_sha256={hashlib.sha256(raw).hexdigest()!r})\n"
+        "from lerobot.configs.policies import PreTrainedConfig\n"
+        "try: PreTrainedConfig.from_pretrained(checkpoint.parent,cli_overrides={})\n"
+        "except RuntimeError as error: wrong_path='unexpected path' in str(error)\n"
+        "else: wrong_path=False\n"
+        "cfg=PreTrainedConfig.from_pretrained(checkpoint, cli_overrides={})\n"
+        "try: PreTrainedConfig.from_pretrained(checkpoint,cli_overrides={})\n"
+        "except RuntimeError as error: repeated='more than once' in str(error)\n"
+        "else: repeated=False\n"
+        "cfg.pretrained_path=str(checkpoint)\n"
+        "def make_policy(policy_cfg): return policy_cfg.pretrained_path\n"
+        "def make_processors(*, policy_cfg, pretrained_path): return policy_cfg.pretrained_path,pretrained_path\n"
+        "weights=make_policy(cfg); processors=make_processors(policy_cfg=cfg,pretrained_path=str(checkpoint))\n"
+        "assert checkpoint.joinpath('config.json').read_bytes()==original\n"
+        "print(json.dumps({'weights':weights,'processors':processors,'config':cfg.type,'wrong_path':wrong_path,'repeated':repeated}))\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            "-S",
+            "-P",
+            str(driver),
+            str(checkpoint),
+            str(sanitized),
+            str(receipt),
+        ],
+        env={
+            **os.environ,
+            "PYTHONPATH": f"{fake_packages}:{CHECKPOINT_COMPATIBILITY_SHIM.parent}",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    loaded = json.loads(result.stdout)
+    assert loaded["weights"] == str(checkpoint)
+    assert loaded["processors"] == [str(checkpoint), str(checkpoint)]
+    assert loaded["wrong_path"] is True
+    assert loaded["repeated"] is True
+    assert json.loads((sanitized / "config.json").read_text()) == {"type": "groot"}
+    assert json.loads((checkpoint / "config.json").read_text()) == raw_config
+
+
+def test_final_execution_verifier_rejects_tampered_compatibility_receipt(tmp_path: Path) -> None:
+    from scripts.verify_native_reference_evaluator_gate import (
+        NativeReferenceGateError,
+        verify_native_reference_result,
+    )
+
+    bundle = _bundle()
+    _materialize_artifacts(tmp_path, bundle)
+    path = tmp_path / "evidence/checkpoint-compatibility-receipt.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["removed_fields"][0]["value"] = 0.2
+    raw = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    path.write_bytes(raw)
+    bundle["identity"]["checkpoint_compatibility_receipt_sha256"] = hashlib.sha256(raw).hexdigest()  # type: ignore[index]
+
+    with pytest.raises(NativeReferenceGateError, match="compatibility receipt contract"):
+        verify_native_reference_result(bundle, bundle_root=tmp_path)
+
+
+def test_prepare_checkpoint_compatibility_creates_one_exclusive_exact_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    values = {
+        "type": "groot",
+        "hidden_size": 1024,
+        "num_decay_steps": 4000,
+        "decay_lr_ratio": 0.1,
+    }
+    raw = json.dumps(values, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    (checkpoint / "config.json").write_bytes(raw)
+    package_root = tmp_path / "packages"
+    module_root = package_root / "lerobot/policies/groot"
+    module_root.mkdir(parents=True)
+    for package in (
+        package_root / "lerobot",
+        package_root / "lerobot/policies",
+        module_root,
+    ):
+        (package / "__init__.py").write_text("", encoding="utf-8")
+    (module_root / "configuration_groot.py").write_text(
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class GrootConfig:\n"
+        "    type: str = 'groot'\n"
+        "    hidden_size: int = 1024\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(package_root))
+    for name in tuple(sys.modules):
+        if name == "lerobot" or name.startswith("lerobot."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(gate, "CHECKPOINT_CONFIG_SHA256", hashlib.sha256(raw).hexdigest())
+    monkeypatch.setattr(gate.importlib.metadata, "version", lambda name: "0.4.3")
+    sanitized = tmp_path / "view"
+    receipt_path = tmp_path / "compatibility.json"
+
+    receipt = gate.prepare_checkpoint_compatibility(checkpoint, sanitized, receipt_path)
+
+    assert (checkpoint / "config.json").read_bytes() == raw
+    assert json.loads((sanitized / "config.json").read_text()) == {
+        "type": "groot",
+        "hidden_size": 1024,
+    }
+    assert receipt["removed_fields"] == [
+        {"key": "decay_lr_ratio", "value": 0.1},
+        {"key": "num_decay_steps", "value": 4000},
+    ]
+    assert receipt["lerobot_wheel_sha256"] == "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c"
+    with pytest.raises(gate.NativeReferenceGateError, match="already exists"):
+        gate.prepare_checkpoint_compatibility(checkpoint, sanitized, tmp_path / "second.json")

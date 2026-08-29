@@ -41,3 +41,24 @@ def _external_project_root() -> Path:
 
 
 _lehome_logger.get_project_root = _external_project_root
+
+
+raw_checkpoint_root = os.environ.get("LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT", "")
+raw_sanitized_root = os.environ.get("LEHOME_NATIVE_REFERENCE_SANITIZED_CONFIG_ROOT", "")
+raw_compatibility_receipt = os.environ.get(
+    "LEHOME_NATIVE_REFERENCE_CHECKPOINT_COMPATIBILITY_RECEIPT", ""
+)
+compatibility_values = (raw_checkpoint_root, raw_sanitized_root, raw_compatibility_receipt)
+if any(compatibility_values) and not all(compatibility_values):
+    _fatal("checkpoint compatibility environment is incomplete")
+if all(compatibility_values):
+    try:
+        from checkpoint_compatibility import install_checkpoint_config_view
+
+        install_checkpoint_config_view(
+            Path(raw_checkpoint_root),
+            Path(raw_sanitized_root),
+            Path(raw_compatibility_receipt),
+        )
+    except Exception as error:
+        _fatal(f"checkpoint compatibility loader failed: {error}")
