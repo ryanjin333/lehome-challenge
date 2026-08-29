@@ -8,6 +8,7 @@ set -euo pipefail
 readonly SOURCE_REPOSITORY="theo-zhou/lehome-groot-submission-4"
 readonly SOURCE_REVISION="d384fe00508acd96ab1c3c5dc265e08261f94b3b"
 readonly EXPECTED_SOURCE_TREE_SHA256="eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2"
+readonly EXPECTED_PYPROJECT_SHA256="b83ecf7af081c6c6a60073a854be3b63b66bbb0dbe021a4683dc5428d0f360d8"
 readonly EXPECTED_LEROBOT_VERSION="0.4.3"
 readonly EXACT_VM_ID="computeinstance-u00t6xfqhadrcmssa2"
 readonly PROTECTED_DISK_ID="computedisk-u00pbe55crxy7jr56x"
@@ -20,6 +21,8 @@ readonly NATIVE_SITE_ROOT="$RUNTIME_REPO_ROOT/rollout_appliance/native_reference
 readonly ISAACLAB_ROOT="/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab"
 readonly ISAACLAB_TASKS_ROOT="/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab_tasks"
 readonly CANONICAL_CACHE_MANIFEST="$SCRIPT_DIR/native_reference_canonical_cache_manifest.json"
+readonly PEFT_WHEEL_PATH="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"
+readonly PEFT_WHEEL_SHA256="0bf06847a3551e3019fc58c440cffc9a6b73e6e2962c95b52e224f77bbdb50f1"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
 sha256_file() { sha256sum -- "$1" | awk '{print $1}'; }
@@ -118,8 +121,12 @@ validate_stage_integrity() {
   validate_runtime_support
   authenticate_canonical_caches
   validate_runtime_asset_bindings
+  "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" validate-peft-overlay >/dev/null \
+    || fail "PEFT wheel overlay changed during evaluation"
   [[ "$(sha256_file "$CHECKPOINT_COMPATIBILITY_RECEIPT")" == "$CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256" ]] \
     || fail "checkpoint compatibility receipt changed during evaluation"
+  [[ "$(sha256_file "$PEFT_OVERLAY_RECEIPT")" == "$PEFT_OVERLAY_RECEIPT_SHA256" ]] \
+    || fail "PEFT overlay receipt changed during evaluation"
   [[ "$AUTHENTICATED_METADATA_TREE_SHA256" == "$METADATA_TREE_SHA256" ]] || fail "native reference metadata tree changed during evaluation"
   [[ "$AUTHENTICATED_ASSETS_TREE_SHA256" == "$ASSETS_TREE_SHA256" ]] || fail "native reference assets tree changed during evaluation"
 }
@@ -174,6 +181,8 @@ validate_source_runtime() {
   git -C "$SOURCE_ROOT" diff --quiet || fail "native reference source checkout is modified"
   [[ -z "$(git -C "$SOURCE_ROOT" status --porcelain --untracked-files=all)" ]] || fail "native reference source checkout has untrusted files"
   [[ "$(tree_sha256 "$SOURCE_ROOT")" == "$EXPECTED_SOURCE_TREE_SHA256" ]] || fail "native reference source tree digest mismatch"
+  [[ "$(git -C "$SOURCE_ROOT" show "$SOURCE_REVISION:pyproject.toml" | sha256sum | awk '{print $1}')" == "$EXPECTED_PYPROJECT_SHA256" ]] \
+    || fail "native reference pyproject dependency contract mismatch"
   local found
   found="$(PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT" "$PYTHON_BIN" -c 'import lerobot; print(getattr(lerobot, "__version__", ""))')"
   [[ "$found" == "$EXPECTED_LEROBOT_VERSION" ]] || fail "native reference requires LeRobot $EXPECTED_LEROBOT_VERSION, found ${found:-missing}"
@@ -233,7 +242,7 @@ PY
 }
 
 probe_host_runtime() {
-  (cd -- "$RUNTIME_REPO_ROOT" && PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT" \
+  (cd -- "$RUNTIME_REPO_ROOT" && PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PYTHONPATH="$PEFT_WHEEL_PATH:$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT" \
     "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" probe-host-runtime \
       --source-root "$SOURCE_ROOT" --isaaclab-root "$ISAACLAB_ROOT" \
       --receipt "$OUTPUT_ROOT/host-runtime.json" >/dev/null) \
@@ -241,14 +250,14 @@ probe_host_runtime() {
 }
 
 write_identity_and_preflight() {
-  "$PYTHON_BIN" - "$OUTPUT_ROOT/identity.json" "$OUTPUT_ROOT/preflight.json" "$OUTPUT_ROOT/cuda-runtime.json" "$OUTPUT_ROOT/host-runtime.json" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" "$CACHE_TRUST_MANIFEST_SHA256" "$PROVIDER_RUNNING_RECEIPT_SHA256" "$RUNTIME_IMAGE_RECEIPT_SHA256" "$CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256" "$VM_ID" "$DISK_ID" "$RUNTIME_IMAGE_REFERENCE" "$RUNTIME_IMAGE_ID" <<'PY'
+  "$PYTHON_BIN" - "$OUTPUT_ROOT/identity.json" "$OUTPUT_ROOT/preflight.json" "$OUTPUT_ROOT/cuda-runtime.json" "$OUTPUT_ROOT/host-runtime.json" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" "$CACHE_TRUST_MANIFEST_SHA256" "$PROVIDER_RUNNING_RECEIPT_SHA256" "$RUNTIME_IMAGE_RECEIPT_SHA256" "$CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256" "$VM_ID" "$DISK_ID" "$RUNTIME_IMAGE_REFERENCE" "$RUNTIME_IMAGE_ID" "$PEFT_WHEEL_SHA256" "$PEFT_OVERLAY_RECEIPT_SHA256" <<'PY'
 import hashlib, json, os, sys
 from pathlib import Path
 identity_path, preflight_path, cuda_path, host_path = map(Path, sys.argv[1:5]); cuda=json.loads(cuda_path.read_text()); host=json.loads(host_path.read_text())
 expected_host={"schema_version","kind","source_root","python_executable","python_version","torch_version","lerobot_version","lerobot_origin","scripts_eval_origin","lehome_origin","isaaclab_app_origin","app_launcher_class"}
 if set(host) != expected_host or host.get("schema_version") != 1 or host.get("kind") != "lehome_native_reference_host_runtime_v1" or host.get("lerobot_version") != "0.4.3" or host.get("app_launcher_class") != "isaaclab.app.AppLauncher" or not str(host.get("isaaclab_app_origin","")).startswith("/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab/"): raise SystemExit("native reference host runtime is invalid")
-identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[5],"metadata_tree_sha256":sys.argv[6],"assets_tree_sha256":sys.argv[7],"cache_trust_manifest_sha256":sys.argv[8],"provider_running_receipt_sha256":sys.argv[9],"runtime_image_receipt_sha256":sys.argv[10],"checkpoint_compatibility_receipt_sha256":sys.argv[11],"provider_source_image_id":"computeimage-u00zf6w3yf72gakhcy","runtime_image_reference":sys.argv[14],"runtime_image_id":sys.argv[15],"lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[12],"disk_id":sys.argv[13],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points",**{key:host[key] for key in ("source_root","python_executable","python_version","torch_version","lerobot_origin","scripts_eval_origin","lehome_origin")}}
-preflight={"schema_version":2,"kind":"lehome_native_reference_preflight_v2","identity":identity,"cuda_probe_sha256":hashlib.sha256(cuda_path.read_bytes()).hexdigest(),"host_runtime_sha256":hashlib.sha256(host_path.read_bytes()).hexdigest(),"runtime_image_receipt_sha256":sys.argv[10],"checkpoint_compatibility_receipt_sha256":sys.argv[11]}
+identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[5],"metadata_tree_sha256":sys.argv[6],"assets_tree_sha256":sys.argv[7],"cache_trust_manifest_sha256":sys.argv[8],"provider_running_receipt_sha256":sys.argv[9],"runtime_image_receipt_sha256":sys.argv[10],"checkpoint_compatibility_receipt_sha256":sys.argv[11],"provider_source_image_id":"computeimage-u00zf6w3yf72gakhcy","runtime_image_reference":sys.argv[14],"runtime_image_id":sys.argv[15],"peft_wheel_sha256":sys.argv[16],"peft_overlay_receipt_sha256":sys.argv[17],"lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[12],"disk_id":sys.argv[13],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points",**{key:host[key] for key in ("source_root","python_executable","python_version","torch_version","lerobot_origin","scripts_eval_origin","lehome_origin")}}
+preflight={"schema_version":2,"kind":"lehome_native_reference_preflight_v2","identity":identity,"cuda_probe_sha256":hashlib.sha256(cuda_path.read_bytes()).hexdigest(),"host_runtime_sha256":hashlib.sha256(host_path.read_bytes()).hexdigest(),"runtime_image_receipt_sha256":sys.argv[10],"checkpoint_compatibility_receipt_sha256":sys.argv[11],"peft_overlay_receipt_sha256":sys.argv[17]}
 for path,document in ((identity_path,identity),(preflight_path,preflight)):
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o444)
     with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(document,stream,sort_keys=True,separators=(",",":")); stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
@@ -292,6 +301,8 @@ fi
 [[ "$DISK_ID" == "$PROTECTED_DISK_ID" ]] || fail "LEHOME_NATIVE_REFERENCE_DISK_ID is not the protected shared disk"
 require_new_output "$OUTPUT_ROOT"
 validate_cache_trust_manifest
+"$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" validate-peft-overlay >/dev/null \
+  || fail "PEFT wheel overlay preflight failed"
 if [[ "$MODE" == validate-only ]]; then printf '%s\n' '{"status":"validated","mode":"no-execution"}'; exit 0; fi
 [[ "$PROVIDER_RUNNING_RECEIPT" == /* && "$PROVIDER_RUNNING_RECEIPT" != *".."* && -f "$PROVIDER_RUNNING_RECEIPT" && ! -L "$PROVIDER_RUNNING_RECEIPT" ]] || fail "provider RUNNING receipt is unavailable or unsafe"
 
@@ -301,11 +312,14 @@ mkdir --mode=0700 -- "$OUTPUT_ROOT"; mkdir --mode=0700 -- "$OUTPUT_ROOT/logs" "$
 "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" bind-runtime-image-receipt --input "$RUNTIME_IMAGE_RECEIPT" --receipt "$OUTPUT_ROOT/evidence/runtime-image-receipt.json" >/dev/null
 SANITIZED_CONFIG_ROOT="$OUTPUT_ROOT/checkpoint-config-view"
 CHECKPOINT_COMPATIBILITY_RECEIPT="$OUTPUT_ROOT/evidence/checkpoint-compatibility-receipt.json"
+PEFT_OVERLAY_RECEIPT="$OUTPUT_ROOT/evidence/peft-overlay-receipt.json"
+"$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" prepare-peft-overlay --receipt "$PEFT_OVERLAY_RECEIPT" >/dev/null
 PYTHONPATH="$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT" "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" prepare-checkpoint-compatibility --checkpoint-root "$CHECKPOINT_ROOT" --sanitized-config-root "$SANITIZED_CONFIG_ROOT" --receipt "$CHECKPOINT_COMPATIBILITY_RECEIPT" >/dev/null
 CACHE_TRUST_MANIFEST_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/cache-trust-manifest.json")"
 PROVIDER_RUNNING_RECEIPT_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/provider-running-receipt.json")"
 RUNTIME_IMAGE_RECEIPT_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/runtime-image-receipt.json")"
 CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256="$(sha256_file "$CHECKPOINT_COMPATIBILITY_RECEIPT")"
+PEFT_OVERLAY_RECEIPT_SHA256="$(sha256_file "$PEFT_OVERLAY_RECEIPT")"
 validate_running_provider_binding
 validate_runtime_image_binding
 probe_cuda; probe_host_runtime; write_identity_and_preflight
@@ -323,7 +337,7 @@ run_stage() {
     LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT="$CHECKPOINT_ROOT" \
     LEHOME_NATIVE_REFERENCE_SANITIZED_CONFIG_ROOT="$SANITIZED_CONFIG_ROOT" \
     LEHOME_NATIVE_REFERENCE_CHECKPOINT_COMPATIBILITY_RECEIPT="$CHECKPOINT_COMPATIBILITY_RECEIPT" \
-    PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT:$NATIVE_SITE_ROOT" \
+    PYTHONPATH="$PEFT_WHEEL_PATH:$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT:$NATIVE_SITE_ROOT" \
     "${command[@]}") >"$log" 2>&1 || fail "native reference stage $stage failed; inspect $log"
   "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" compile-stage --bundle-root "$OUTPUT_ROOT" --stage "$stage" --category "$category" --garment "$garment" --identity "$OUTPUT_ROOT/identity.json" >/dev/null
 }

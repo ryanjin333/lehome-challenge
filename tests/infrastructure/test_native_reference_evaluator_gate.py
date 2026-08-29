@@ -10,6 +10,7 @@ import subprocess
 import hashlib
 import sys
 import time
+import zipfile
 
 import pytest
 
@@ -35,6 +36,8 @@ def _identity() -> dict[str, object]:
         "provider_running_receipt_sha256": hashlib.sha256(b"running").hexdigest(),
         "runtime_image_receipt_sha256": hashlib.sha256(b"runtime-image").hexdigest(),
         "checkpoint_compatibility_receipt_sha256": hashlib.sha256(b"compatibility").hexdigest(),
+        "peft_wheel_sha256": "0bf06847a3551e3019fc58c440cffc9a6b73e6e2962c95b52e224f77bbdb50f1",
+        "peft_overlay_receipt_sha256": hashlib.sha256(b"peft-overlay").hexdigest(),
         "provider_source_image_id": "computeimage-u00zf6w3yf72gakhcy",
         "runtime_image_reference": "lehome-rollout:build",
         "runtime_image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
@@ -134,6 +137,28 @@ def _materialize_artifacts(root: Path, bundle: dict[str, object]) -> None:
     ).encode()
     (root / "evidence/checkpoint-compatibility-receipt.json").write_bytes(compatibility)
     bundle["identity"]["checkpoint_compatibility_receipt_sha256"] = hashlib.sha256(compatibility).hexdigest()  # type: ignore[index]
+    peft_overlay = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "lehome_native_reference_peft_overlay_v1",
+                "wheel_path": "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl",
+                "wheel_filename": "peft-0.18.1-py3-none-any.whl",
+                "wheel_url": "https://files.pythonhosted.org/packages/b3/14/b4e3f574acf349ae6f61f9c000a77f97a3b315b4bb6ad03791e79ae4a568/peft-0.18.1-py3-none-any.whl",
+                "wheel_size": 556960,
+                "wheel_sha256": "0bf06847a3551e3019fc58c440cffc9a6b73e6e2962c95b52e224f77bbdb50f1",
+                "distribution_name": "peft",
+                "peft_version": "0.18.1",
+                "peft_origin": "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl/peft/__init__.py",
+                "required_symbols": ["LoraConfig", "get_peft_model"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    (root / "evidence/peft-overlay-receipt.json").write_bytes(peft_overlay)
+    bundle["identity"]["peft_overlay_receipt_sha256"] = hashlib.sha256(peft_overlay).hexdigest()  # type: ignore[index]
     for attempt in bundle["attempts"]:  # type: ignore[index]
         for artifact in [attempt["log"], attempt["receipt"], *attempt["videos"]]:  # type: ignore[index]
             path = root / artifact["path"]  # type: ignore[index]
@@ -287,6 +312,8 @@ def test_native_launcher_isolated_contract_never_creates_resources_or_uses_n17_g
     assert "nebius compute instance start" not in text
     assert "docker build" not in text
     assert "filter.lfs.smudge" in text
+    assert "b83ecf7af081c6c6a60073a854be3b63b66bbb0dbe021a4683dc5428d0f360d8" in text
+    assert 'show "$SOURCE_REVISION:pyproject.toml"' in text
 
 
 def test_native_launcher_module_invocation_supports_relative_imports_and_pinned_source_wins(
@@ -324,7 +351,7 @@ def test_native_launcher_module_invocation_supports_relative_imports_and_pinned_
     assert '"$PYTHON_BIN" -P -m scripts.eval' in text
     assert 'cd -- "$RUNTIME_REPO_ROOT"' in text
     assert 'PYTHONSAFEPATH=1' in text
-    assert 'PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT"' in text
+    assert 'PYTHONPATH="$PEFT_WHEEL_PATH:$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT"' in text
     assert '"$PYTHON_BIN" "$SOURCE_ROOT/scripts/eval.py"' not in text
     assert '--ee_urdf_path "$ASSETS_ROOT/robots/so101_new_calib.urdf"' in text
 
@@ -364,6 +391,9 @@ def test_native_run_stage_binds_arguments_before_expanding_stage_log(tmp_path: P
         "ISAACLAB_TASKS_ROOT=/isaaclab_tasks\n"
         "SANITIZED_CONFIG_ROOT=/sanitized\n"
         "CHECKPOINT_COMPATIBILITY_RECEIPT=/compatibility.json\n"
+        "PEFT_WHEEL_PATH=/peft-wheel\n"
+        "PEFT_OVERLAY_RECEIPT=/peft-overlay.json\n"
+        "PEFT_OVERLAY_RECEIPT_SHA256=" + "0" * 64 + "\n"
         "validate_stage_integrity() { :; }\n"
         f"run_stage() {{{run_stage}\n}}\n"
         "run_stage 1 top_long Top_Long_Seen_0\n",
@@ -1771,3 +1801,175 @@ def test_prepare_checkpoint_compatibility_rejects_same_version_tampered_distribu
         gate.prepare_checkpoint_compatibility(
             checkpoint, tmp_path / "view", tmp_path / "compatibility.json"
         )
+
+
+def _write_peft_overlay_wheel(
+    path: Path,
+    *,
+    version: str = "0.18.1",
+    include_symbols: bool = True,
+    unsafe_member: str | None = None,
+    spoof_origin: bool = False,
+) -> None:
+    init = ""
+    if include_symbols:
+        init = "class LoraConfig: pass\ndef get_peft_model(*args, **kwargs): return args\n"
+    if spoof_origin:
+        init += "__file__ = '/untrusted/peft/__init__.py'\n"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("peft/__init__.py", init)
+        archive.writestr(
+            "peft-0.18.1.dist-info/METADATA",
+            f"Metadata-Version: 2.1\nName: peft\nVersion: {version}\n",
+        )
+        if unsafe_member is not None:
+            archive.writestr(unsafe_member, b"unsafe")
+
+
+def _configure_peft_overlay_constants(
+    monkeypatch: pytest.MonkeyPatch, wheel: Path
+) -> None:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    monkeypatch.setattr(gate, "PEFT_WHEEL_PATH", wheel.resolve())
+    if wheel.exists():
+        monkeypatch.setattr(gate, "PEFT_WHEEL_SIZE", wheel.stat().st_size)
+        monkeypatch.setattr(
+            gate, "PEFT_WHEEL_SHA256", hashlib.sha256(wheel.read_bytes()).hexdigest()
+        )
+
+
+def test_prepare_peft_overlay_rejects_absent_wrong_and_tampered_wheels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    missing = tmp_path / "peft-0.18.1-py3-none-any.whl"
+    _configure_peft_overlay_constants(monkeypatch, missing)
+    with pytest.raises(gate.NativeReferenceGateError, match="PEFT wheel is unavailable"):
+        gate.prepare_peft_overlay(tmp_path / "missing-receipt.json")
+
+    wrong = tmp_path / "wrong-name.whl"
+    _write_peft_overlay_wheel(wrong)
+    _configure_peft_overlay_constants(monkeypatch, wrong)
+    with pytest.raises(gate.NativeReferenceGateError, match="filename"):
+        gate.prepare_peft_overlay(tmp_path / "wrong-receipt.json")
+
+    wheel = tmp_path / "peft-0.18.1-py3-none-any.whl"
+    _write_peft_overlay_wheel(wheel)
+    _configure_peft_overlay_constants(monkeypatch, wheel)
+    tampered = bytearray(wheel.read_bytes())
+    tampered[20] ^= 1
+    wheel.write_bytes(tampered)
+    with pytest.raises(gate.NativeReferenceGateError, match="digest"):
+        gate.prepare_peft_overlay(tmp_path / "tampered-receipt.json")
+
+
+def test_prepare_peft_overlay_rejects_unsafe_wheel_members(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    wheel = tmp_path / "peft-0.18.1-py3-none-any.whl"
+    _write_peft_overlay_wheel(wheel, unsafe_member="../escape.py")
+    _configure_peft_overlay_constants(monkeypatch, wheel)
+
+    with pytest.raises(gate.NativeReferenceGateError, match="unsafe PEFT wheel member"):
+        gate.prepare_peft_overlay(tmp_path / "receipt.json")
+
+
+@pytest.mark.parametrize(
+    ("version", "include_symbols", "message"),
+    [
+        ("0.18.0", True, "metadata"),
+        ("0.18.1", False, "symbols"),
+    ],
+)
+def test_prepare_peft_overlay_rejects_wrong_metadata_or_symbols(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: str,
+    include_symbols: bool,
+    message: str,
+) -> None:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    wheel = tmp_path / "peft-0.18.1-py3-none-any.whl"
+    _write_peft_overlay_wheel(wheel, version=version, include_symbols=include_symbols)
+    _configure_peft_overlay_constants(monkeypatch, wheel)
+
+    with pytest.raises(gate.NativeReferenceGateError, match=message):
+        gate.prepare_peft_overlay(tmp_path / "receipt.json")
+
+
+def test_prepare_peft_overlay_rejects_wrong_zipimport_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    wheel = tmp_path / "peft-0.18.1-py3-none-any.whl"
+    _write_peft_overlay_wheel(wheel, spoof_origin=True)
+    _configure_peft_overlay_constants(monkeypatch, wheel)
+
+    with pytest.raises(gate.NativeReferenceGateError, match="origin"):
+        gate.prepare_peft_overlay(tmp_path / "receipt.json")
+
+
+def test_prepare_peft_overlay_records_exact_zipimport_origin_and_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    wheel = tmp_path / "peft-0.18.1-py3-none-any.whl"
+    receipt_path = tmp_path / "receipt.json"
+    _write_peft_overlay_wheel(wheel)
+    _configure_peft_overlay_constants(monkeypatch, wheel)
+
+    receipt = gate.prepare_peft_overlay(receipt_path)
+
+    assert receipt["wheel_path"] == str(wheel.resolve())
+    assert receipt["peft_origin"] == f"{wheel.resolve()}/peft/__init__.py"
+    assert receipt["peft_version"] == "0.18.1"
+    assert receipt_path.read_bytes() == (
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+
+
+def test_execution_verifier_rejects_tampered_or_missing_peft_overlay_evidence(
+    tmp_path: Path,
+) -> None:
+    from scripts.verify_native_reference_evaluator_gate import (
+        NativeReferenceGateError,
+        verify_native_reference_result,
+    )
+
+    document = _bundle()
+    _materialize_artifacts(tmp_path, document)
+    peft_receipt = {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_peft_overlay_v1",
+        "wheel_path": "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl",
+        "wheel_filename": "peft-0.18.1-py3-none-any.whl",
+        "wheel_url": "https://files.pythonhosted.org/packages/b3/14/b4e3f574acf349ae6f61f9c000a77f97a3b315b4bb6ad03791e79ae4a568/peft-0.18.1-py3-none-any.whl",
+        "wheel_size": 556960,
+        "wheel_sha256": "0bf06847a3551e3019fc58c440cffc9a6b73e6e2962c95b52e224f77bbdb50f1",
+        "distribution_name": "peft",
+        "peft_version": "0.18.1",
+        "peft_origin": "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl/peft/__init__.py",
+        "required_symbols": ["LoraConfig", "get_peft_model"],
+    }
+    path = tmp_path / "evidence/peft-overlay-receipt.json"
+    raw = (json.dumps(peft_receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    path.write_bytes(raw)
+    identity = document["identity"]
+    identity["peft_wheel_sha256"] = peft_receipt["wheel_sha256"]  # type: ignore[index]
+    identity["peft_overlay_receipt_sha256"] = hashlib.sha256(raw).hexdigest()  # type: ignore[index]
+    assert verify_native_reference_result(document, bundle_root=tmp_path)["status"] == "oracle_matched_pending_finalization"
+
+    path.write_bytes(raw.replace(b"0.18.1", b"0.18.0", 1))
+    with pytest.raises(NativeReferenceGateError, match="PEFT overlay"):
+        verify_native_reference_result(document, bundle_root=tmp_path)
+
+    path.unlink()
+    with pytest.raises(NativeReferenceGateError, match="missing required artifact"):
+        verify_native_reference_result(document, bundle_root=tmp_path)

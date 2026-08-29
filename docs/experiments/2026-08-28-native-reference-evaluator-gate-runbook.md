@@ -26,12 +26,23 @@ published `7/8` oracle and its result has been published and read back.
   `sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7`.
   Its `/isaac-sim/python.sh` initializes the Isaac runtime while `PYTHONEXE`
   selects `/opt/lehome-challenge/.venv/bin/python`, which supplies Python 3.11,
-  LeRobot 0.4.3, and torch/CUDA. The pinned public source stays first on
-  `PYTHONPATH`, followed by only the image's reviewed IsaacLab and
+  LeRobot 0.4.3, and torch/CUDA. The pinned public source stays first among
+  source roots on `PYTHONPATH`, followed by only the image's reviewed IsaacLab and
   `isaaclab_tasks` source roots; the reviewed logging `sitecustomize` remains
   present for evaluator stages. Simulation remains CPU-only and policy
   inference remains on CUDA. The saved processor must prove a 16-action
   horizon and 12-D absolute bimanual action output.
+- PEFT overlay: before validation, the operator separately places only the
+  official `peft-0.18.1-py3-none-any.whl` at
+  `/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl`.
+  The public revision's `pyproject.toml` is SHA-256
+  `b83ecf7af081c6c6a60073a854be3b63b66bbb0dbe021a4683dc5428d0f360d8` and
+  pins `peft==0.18.1`; the required wheel is exactly 556960 bytes with SHA-256
+  `0bf06847a3551e3019fc58c440cffc9a6b73e6e2962c95b52e224f77bbdb50f1` from
+  `https://files.pythonhosted.org/packages/b3/14/b4e3f574acf349ae6f61f9c000a77f97a3b315b4bb6ad03791e79ae4a568/peft-0.18.1-py3-none-any.whl`.
+  The gate only zipimports this read-only wheel; it never downloads, installs,
+  extracts, or otherwise mutates it. It records the validated wheel's exact
+  import origin, version, and required symbols before a simulator episode.
 - There are eight sequential 600-step episodes, all at seed 42:
   `Top_Long_Seen_0` twice, `Top_Short_Seen_0` twice,
   `Pant_Long_Seen_0` twice, then `Pant_Short_Seen_0` twice. The required

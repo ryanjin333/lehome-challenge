@@ -206,6 +206,21 @@ identity/preflight/execution/final evidence. Any second call or different
 path, digest, field, value, package tree, or parse failure is fatal before
 episode 1.
 
+The immutable runtime image does not contain the public evaluator's pinned
+`peft==0.18.1`. Before any validation or episode, the operator separately
+places the exact official wheel at the fixed protected-disk path
+`/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl`.
+The gate never downloads, installs, or extracts it: it proves a regular,
+non-symlink file has the exact official filename, 556960-byte size, and
+`0bf06847a3551e3019fc58c440cffc9a6b73e6e2962c95b52e224f77bbdb50f1` SHA-256,
+rejects unsafe ZIP entries, checks exact PEFT METADATA, and imports the required
+`LoraConfig` and `get_peft_model` directly from the wheel. The wheel is
+prepended only as a zipimport `PYTHONPATH` overlay for the zero-episode probe
+and public evaluator; LeRobot's verified package tree and import-origin checks
+remain unchanged. Its immutable receipt and SHA-256 are bound to preflight,
+identity, execution evidence, final verification, and every stage's integrity
+check.
+
 ## Decision after the gate
 
 - Pass: run the local 12K checkpoint on the same native evaluator boundary.
