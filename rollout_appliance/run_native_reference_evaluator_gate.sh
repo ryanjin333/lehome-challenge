@@ -25,6 +25,12 @@ readonly PEFT_WHEEL_PATH="/mnt/lehome/reference-native/dependencies/peft-0.18.1-
 readonly PEFT_WHEEL_SHA256="0bf06847a3551e3019fc58c440cffc9a6b73e6e2962c95b52e224f77bbdb50f1"
 readonly FLASH_ATTENTION_WHEEL_PATH="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
 readonly FLASH_ATTENTION_WHEEL_SHA256="cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af"
+readonly DM_TREE_WHEEL_PATH="/mnt/lehome/reference-native/dependencies/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+readonly DM_TREE_WHEEL_SHA256="294dc1cecf87552a45cdd5ddb215e7f5295a5a47c46f1f0a0463c3dd02a527d7"
+readonly QWEN_VL_UTILS_WHEEL_PATH="/mnt/lehome/reference-native/dependencies/qwen_vl_utils-0.0.14-py3-none-any.whl"
+readonly QWEN_VL_UTILS_WHEEL_SHA256="5e28657bfd031e56bd447c5901b58ddfc3835285ed100f4c56580e0ade054e96"
+readonly TORCHDIFFEQ_WHEEL_PATH="/mnt/lehome/reference-native/dependencies/torchdiffeq-0.2.5-py3-none-any.whl"
+readonly TORCHDIFFEQ_WHEEL_SHA256="aa1db4bed13bd04952f28a53cdf4336d1ab60417c1d9698d7a239fec1cf2bcf8"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
 sha256_file() { sha256sum -- "$1" | awk '{print $1}'; }
@@ -127,6 +133,8 @@ validate_stage_integrity() {
     || fail "PEFT wheel overlay changed during evaluation"
   "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" validate-flash-attention-overlay >/dev/null \
     || fail "FlashAttention wheel overlay changed during evaluation"
+  "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" validate-public-pyproject-dependencies-overlay >/dev/null \
+    || fail "public pyproject dependency wheel overlay changed during evaluation"
   [[ "$(sha256_file "$CHECKPOINT_COMPATIBILITY_RECEIPT")" == "$CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256" ]] \
     || fail "checkpoint compatibility receipt changed during evaluation"
   [[ "$(sha256_file "$PEFT_OVERLAY_RECEIPT")" == "$PEFT_OVERLAY_RECEIPT_SHA256" ]] \
@@ -135,6 +143,10 @@ validate_stage_integrity() {
     || fail "FlashAttention overlay receipt changed during evaluation"
   [[ "$(sha256_file "$FLASH_ATTENTION_RUNTIME_RECEIPT")" == "$FLASH_ATTENTION_RUNTIME_RECEIPT_SHA256" ]] \
     || fail "FlashAttention runtime receipt changed during evaluation"
+  [[ "$(sha256_file "$PUBLIC_PYPROJECT_DEPENDENCIES_OVERLAY_RECEIPT")" == "$PUBLIC_PYPROJECT_DEPENDENCIES_OVERLAY_RECEIPT_SHA256" ]] \
+    || fail "public pyproject dependency overlay receipt changed during evaluation"
+  [[ "$(sha256_file "$PUBLIC_PYPROJECT_DEPENDENCIES_RUNTIME_RECEIPT")" == "$PUBLIC_PYPROJECT_DEPENDENCIES_RUNTIME_RECEIPT_SHA256" ]] \
+    || fail "public pyproject dependency runtime receipt changed during evaluation"
   [[ "$(sha256_file "$PYNPUT_BACKEND_RECEIPT")" == "$PYNPUT_BACKEND_RECEIPT_SHA256" ]] \
     || fail "pynput dummy backend receipt changed during evaluation"
   [[ "$AUTHENTICATED_METADATA_TREE_SHA256" == "$METADATA_TREE_SHA256" ]] || fail "native reference metadata tree changed during evaluation"
@@ -279,6 +291,42 @@ with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(payload,stream,sort
 PY
 }
 
+probe_public_pyproject_dependencies_runtime() {
+  # Install the exact three missing direct public-pyproject requirements as one
+  # offline/no-deps transaction into this disposable container only.
+  uv pip install --offline --no-deps --reinstall --python /opt/lehome-challenge/.venv/bin/python \
+    "$DM_TREE_WHEEL_PATH" "$QWEN_VL_UTILS_WHEEL_PATH" "$TORCHDIFFEQ_WHEEL_PATH" >/dev/null \
+    || fail "public pyproject dependency ephemeral overlay install failed"
+  "$PYTHON_BIN" - "$OUTPUT_ROOT/evidence/public-pyproject-dependencies-runtime-receipt.json" <<'PY'
+import importlib.metadata, json, os, sys
+from pathlib import Path
+import tree, qwen_vl_utils, torchdiffeq
+from lerobot.policies.groot import groot_n1
+root = "/opt/lehome-challenge/.venv/lib/python3.11/site-packages"
+expected = {
+    "tree": ("dm-tree", "0.1.9", f"{root}/tree/__init__.py"),
+    "qwen_vl_utils": ("qwen-vl-utils", "0.0.14", f"{root}/qwen_vl_utils/__init__.py"),
+    "torchdiffeq": ("torchdiffeq", "0.2.5", f"{root}/torchdiffeq/__init__.py"),
+}
+modules = {"tree": tree, "qwen_vl_utils": qwen_vl_utils, "torchdiffeq": torchdiffeq}
+for module_name, (distribution, version, origin) in expected.items():
+    module = modules[module_name]
+    if importlib.metadata.version(distribution) != version or str(Path(module.__file__).resolve()) != origin:
+        raise SystemExit(f"public pyproject dependency runtime identity is invalid: {distribution}")
+if tree.map_structure(lambda left, right: left + right, {"joint": 1}, {"joint": 2}) != {"joint": 3}:
+    raise SystemExit("dm-tree map_structure runtime probe failed")
+if not callable(getattr(qwen_vl_utils, "process_vision_info", None)):
+    raise SystemExit("qwen-vl-utils API runtime probe failed")
+if not callable(getattr(torchdiffeq, "odeint", None)):
+    raise SystemExit("torchdiffeq API runtime probe failed")
+if groot_n1.tree is not tree:
+    raise SystemExit("LeRobot GR00T did not import the verified dm-tree module")
+payload={"schema_version":1,"kind":"lehome_native_reference_public_pyproject_dependencies_runtime_v1","tree_version":"0.1.9","tree_origin":expected["tree"][2],"tree_map_structure":True,"qwen_vl_utils_version":"0.0.14","qwen_vl_utils_origin":expected["qwen_vl_utils"][2],"qwen_vl_utils_process_vision_info":True,"torchdiffeq_version":"0.2.5","torchdiffeq_origin":expected["torchdiffeq"][2],"torchdiffeq_odeint":True,"groot_tree_origin":expected["tree"][2],"groot_tree_is_tree_module":True}
+target=Path(sys.argv[1]); fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o444)
+with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(payload,stream,sort_keys=True,separators=(",",":")); stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
+PY
+}
+
 probe_pynput_dummy_backend() {
   # The public evaluator runs headlessly under xvfb. This image intentionally
   # has no X server, so make pynput's documented inert backend explicit only
@@ -308,14 +356,14 @@ probe_host_runtime() {
 }
 
 write_identity_and_preflight() {
-  "$PYTHON_BIN" - "$OUTPUT_ROOT/identity.json" "$OUTPUT_ROOT/preflight.json" "$OUTPUT_ROOT/cuda-runtime.json" "$OUTPUT_ROOT/host-runtime.json" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" "$CACHE_TRUST_MANIFEST_SHA256" "$PROVIDER_RUNNING_RECEIPT_SHA256" "$RUNTIME_IMAGE_RECEIPT_SHA256" "$CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256" "$VM_ID" "$DISK_ID" "$RUNTIME_IMAGE_REFERENCE" "$RUNTIME_IMAGE_ID" "$PEFT_WHEEL_SHA256" "$PEFT_OVERLAY_RECEIPT_SHA256" "$FLASH_ATTENTION_WHEEL_SHA256" "$FLASH_ATTENTION_OVERLAY_RECEIPT_SHA256" "$FLASH_ATTENTION_RUNTIME_RECEIPT_SHA256" "$PYNPUT_BACKEND_RECEIPT_SHA256" <<'PY'
+  "$PYTHON_BIN" - "$OUTPUT_ROOT/identity.json" "$OUTPUT_ROOT/preflight.json" "$OUTPUT_ROOT/cuda-runtime.json" "$OUTPUT_ROOT/host-runtime.json" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" "$CACHE_TRUST_MANIFEST_SHA256" "$PROVIDER_RUNNING_RECEIPT_SHA256" "$RUNTIME_IMAGE_RECEIPT_SHA256" "$CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256" "$VM_ID" "$DISK_ID" "$RUNTIME_IMAGE_REFERENCE" "$RUNTIME_IMAGE_ID" "$PEFT_WHEEL_SHA256" "$PEFT_OVERLAY_RECEIPT_SHA256" "$FLASH_ATTENTION_WHEEL_SHA256" "$FLASH_ATTENTION_OVERLAY_RECEIPT_SHA256" "$FLASH_ATTENTION_RUNTIME_RECEIPT_SHA256" "$PUBLIC_PYPROJECT_DEPENDENCIES_OVERLAY_RECEIPT_SHA256" "$PUBLIC_PYPROJECT_DEPENDENCIES_RUNTIME_RECEIPT_SHA256" "$PYNPUT_BACKEND_RECEIPT_SHA256" <<'PY'
 import hashlib, json, os, sys
 from pathlib import Path
 identity_path, preflight_path, cuda_path, host_path = map(Path, sys.argv[1:5]); cuda=json.loads(cuda_path.read_text()); host=json.loads(host_path.read_text())
 expected_host={"schema_version","kind","source_root","python_executable","python_version","torch_version","lerobot_version","lerobot_origin","scripts_eval_origin","lehome_origin","isaaclab_app_origin","app_launcher_class"}
 if set(host) != expected_host or host.get("schema_version") != 1 or host.get("kind") != "lehome_native_reference_host_runtime_v1" or host.get("lerobot_version") != "0.4.3" or host.get("app_launcher_class") != "isaaclab.app.AppLauncher" or not str(host.get("isaaclab_app_origin","")).startswith("/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab/"): raise SystemExit("native reference host runtime is invalid")
-identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[5],"metadata_tree_sha256":sys.argv[6],"assets_tree_sha256":sys.argv[7],"cache_trust_manifest_sha256":sys.argv[8],"provider_running_receipt_sha256":sys.argv[9],"runtime_image_receipt_sha256":sys.argv[10],"checkpoint_compatibility_receipt_sha256":sys.argv[11],"provider_source_image_id":"computeimage-u00zf6w3yf72gakhcy","runtime_image_reference":sys.argv[14],"runtime_image_id":sys.argv[15],"peft_wheel_sha256":sys.argv[16],"peft_overlay_receipt_sha256":sys.argv[17],"flash_attention_wheel_sha256":sys.argv[18],"flash_attention_overlay_receipt_sha256":sys.argv[19],"flash_attention_runtime_receipt_sha256":sys.argv[20],"pynput_backend":"dummy","pynput_backend_receipt_sha256":sys.argv[21],"lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[12],"disk_id":sys.argv[13],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points",**{key:host[key] for key in ("source_root","python_executable","python_version","torch_version","lerobot_origin","scripts_eval_origin","lehome_origin")}}
-preflight={"schema_version":2,"kind":"lehome_native_reference_preflight_v2","identity":identity,"cuda_probe_sha256":hashlib.sha256(cuda_path.read_bytes()).hexdigest(),"host_runtime_sha256":hashlib.sha256(host_path.read_bytes()).hexdigest(),"runtime_image_receipt_sha256":sys.argv[10],"checkpoint_compatibility_receipt_sha256":sys.argv[11],"peft_overlay_receipt_sha256":sys.argv[17],"flash_attention_overlay_receipt_sha256":sys.argv[19],"flash_attention_runtime_receipt_sha256":sys.argv[20],"pynput_backend_receipt_sha256":sys.argv[21]}
+identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[5],"metadata_tree_sha256":sys.argv[6],"assets_tree_sha256":sys.argv[7],"cache_trust_manifest_sha256":sys.argv[8],"provider_running_receipt_sha256":sys.argv[9],"runtime_image_receipt_sha256":sys.argv[10],"checkpoint_compatibility_receipt_sha256":sys.argv[11],"provider_source_image_id":"computeimage-u00zf6w3yf72gakhcy","runtime_image_reference":sys.argv[14],"runtime_image_id":sys.argv[15],"peft_wheel_sha256":sys.argv[16],"peft_overlay_receipt_sha256":sys.argv[17],"flash_attention_wheel_sha256":sys.argv[18],"flash_attention_overlay_receipt_sha256":sys.argv[19],"flash_attention_runtime_receipt_sha256":sys.argv[20],"public_pyproject_dependencies_overlay_receipt_sha256":sys.argv[21],"public_pyproject_dependencies_runtime_receipt_sha256":sys.argv[22],"pynput_backend":"dummy","pynput_backend_receipt_sha256":sys.argv[23],"lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[12],"disk_id":sys.argv[13],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points",**{key:host[key] for key in ("source_root","python_executable","python_version","torch_version","lerobot_origin","scripts_eval_origin","lehome_origin")}}
+preflight={"schema_version":2,"kind":"lehome_native_reference_preflight_v2","identity":identity,"cuda_probe_sha256":hashlib.sha256(cuda_path.read_bytes()).hexdigest(),"host_runtime_sha256":hashlib.sha256(host_path.read_bytes()).hexdigest(),"runtime_image_receipt_sha256":sys.argv[10],"checkpoint_compatibility_receipt_sha256":sys.argv[11],"peft_overlay_receipt_sha256":sys.argv[17],"flash_attention_overlay_receipt_sha256":sys.argv[19],"flash_attention_runtime_receipt_sha256":sys.argv[20],"public_pyproject_dependencies_overlay_receipt_sha256":sys.argv[21],"public_pyproject_dependencies_runtime_receipt_sha256":sys.argv[22],"pynput_backend_receipt_sha256":sys.argv[23]}
 for path,document in ((identity_path,identity),(preflight_path,preflight)):
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o444)
     with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(document,stream,sort_keys=True,separators=(",",":")); stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
@@ -362,6 +410,8 @@ require_new_output "$OUTPUT_ROOT"
   || fail "PEFT wheel overlay preflight failed"
 "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" validate-flash-attention-overlay >/dev/null \
   || fail "FlashAttention wheel overlay preflight failed"
+"$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" validate-public-pyproject-dependencies-overlay >/dev/null \
+  || fail "public pyproject dependency wheel overlay preflight failed"
 if [[ "$MODE" == validate-only ]]; then printf '%s\n' '{"status":"validated","mode":"no-execution"}'; exit 0; fi
 validate_cache_trust_manifest
 [[ "$PROVIDER_RUNNING_RECEIPT" == /* && "$PROVIDER_RUNNING_RECEIPT" != *".."* && -f "$PROVIDER_RUNNING_RECEIPT" && ! -L "$PROVIDER_RUNNING_RECEIPT" ]] || fail "provider RUNNING receipt is unavailable or unsafe"
@@ -375,9 +425,12 @@ CHECKPOINT_COMPATIBILITY_RECEIPT="$OUTPUT_ROOT/evidence/checkpoint-compatibility
 PEFT_OVERLAY_RECEIPT="$OUTPUT_ROOT/evidence/peft-overlay-receipt.json"
 FLASH_ATTENTION_OVERLAY_RECEIPT="$OUTPUT_ROOT/evidence/flash-attention-overlay-receipt.json"
 FLASH_ATTENTION_RUNTIME_RECEIPT="$OUTPUT_ROOT/evidence/flash-attention-runtime-receipt.json"
+PUBLIC_PYPROJECT_DEPENDENCIES_OVERLAY_RECEIPT="$OUTPUT_ROOT/evidence/public-pyproject-dependencies-overlay-receipt.json"
+PUBLIC_PYPROJECT_DEPENDENCIES_RUNTIME_RECEIPT="$OUTPUT_ROOT/evidence/public-pyproject-dependencies-runtime-receipt.json"
 PYNPUT_BACKEND_RECEIPT="$OUTPUT_ROOT/evidence/pynput-backend-receipt.json"
 "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" prepare-peft-overlay --receipt "$PEFT_OVERLAY_RECEIPT" >/dev/null
 "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" prepare-flash-attention-overlay --receipt "$FLASH_ATTENTION_OVERLAY_RECEIPT" >/dev/null
+"$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" prepare-public-pyproject-dependencies-overlay --receipt "$PUBLIC_PYPROJECT_DEPENDENCIES_OVERLAY_RECEIPT" >/dev/null
 PYTHONPATH="$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT" "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" prepare-checkpoint-compatibility --checkpoint-root "$CHECKPOINT_ROOT" --sanitized-config-root "$SANITIZED_CONFIG_ROOT" --receipt "$CHECKPOINT_COMPATIBILITY_RECEIPT" >/dev/null
 CACHE_TRUST_MANIFEST_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/cache-trust-manifest.json")"
 PROVIDER_RUNNING_RECEIPT_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/provider-running-receipt.json")"
@@ -385,10 +438,12 @@ RUNTIME_IMAGE_RECEIPT_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/runtime-image
 CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256="$(sha256_file "$CHECKPOINT_COMPATIBILITY_RECEIPT")"
 PEFT_OVERLAY_RECEIPT_SHA256="$(sha256_file "$PEFT_OVERLAY_RECEIPT")"
 FLASH_ATTENTION_OVERLAY_RECEIPT_SHA256="$(sha256_file "$FLASH_ATTENTION_OVERLAY_RECEIPT")"
+PUBLIC_PYPROJECT_DEPENDENCIES_OVERLAY_RECEIPT_SHA256="$(sha256_file "$PUBLIC_PYPROJECT_DEPENDENCIES_OVERLAY_RECEIPT")"
 validate_running_provider_binding
 validate_runtime_image_binding
-probe_cuda; probe_host_runtime; probe_flash_attention_runtime; probe_pynput_dummy_backend
+probe_cuda; probe_host_runtime; probe_flash_attention_runtime; probe_public_pyproject_dependencies_runtime; probe_pynput_dummy_backend
 FLASH_ATTENTION_RUNTIME_RECEIPT_SHA256="$(sha256_file "$FLASH_ATTENTION_RUNTIME_RECEIPT")"
+PUBLIC_PYPROJECT_DEPENDENCIES_RUNTIME_RECEIPT_SHA256="$(sha256_file "$PUBLIC_PYPROJECT_DEPENDENCIES_RUNTIME_RECEIPT")"
 PYNPUT_BACKEND_RECEIPT_SHA256="$(sha256_file "$PYNPUT_BACKEND_RECEIPT")"
 write_identity_and_preflight
 run_stage() {

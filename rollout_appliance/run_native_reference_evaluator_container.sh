@@ -11,6 +11,12 @@ readonly ASSET_SOURCE_ROOT="$WORKSPACE_ROOT/eval/assets"
 readonly CANONICAL_ASSETS_ROOT="$WORKSPACE_ROOT/reference-native/assets"
 readonly FLASH_ATTENTION_WHEEL="$WORKSPACE_ROOT/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
 readonly FLASH_ATTENTION_WHEEL_SHA256="cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af"
+readonly DM_TREE_WHEEL="$WORKSPACE_ROOT/reference-native/dependencies/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+readonly DM_TREE_WHEEL_SHA256="294dc1cecf87552a45cdd5ddb215e7f5295a5a47c46f1f0a0463c3dd02a527d7"
+readonly QWEN_VL_UTILS_WHEEL="$WORKSPACE_ROOT/reference-native/dependencies/qwen_vl_utils-0.0.14-py3-none-any.whl"
+readonly QWEN_VL_UTILS_WHEEL_SHA256="5e28657bfd031e56bd447c5901b58ddfc3835285ed100f4c56580e0ade054e96"
+readonly TORCHDIFFEQ_WHEEL="$WORKSPACE_ROOT/reference-native/dependencies/torchdiffeq-0.2.5-py3-none-any.whl"
+readonly TORCHDIFFEQ_WHEEL_SHA256="aa1db4bed13bd04952f28a53cdf4336d1ab60417c1d9698d7a239fec1cf2bcf8"
 readonly RUNTIME_REVISION="${LEHOME_NATIVE_REFERENCE_RUNTIME_REVISION:-}"
 readonly RUNTIME_REPO_ROOT="$WORKSPACE_ROOT/runtime-code/$RUNTIME_REVISION"
 readonly LAUNCHER="$RUNTIME_REPO_ROOT/rollout_appliance/run_native_reference_evaluator_gate.sh"
@@ -29,6 +35,9 @@ declare -a command=(docker run --rm --pull never --gpus all --init --network hos
 command+=(--mount "type=bind,src=$WORKSPACE_ROOT,dst=$WORKSPACE_ROOT")
 command+=(--mount "type=bind,src=$RUNTIME_REPO_ROOT,dst=$RUNTIME_REPO_ROOT,readonly")
 command+=(--mount "type=bind,src=$FLASH_ATTENTION_WHEEL,dst=$FLASH_ATTENTION_WHEEL,readonly")
+command+=(--mount "type=bind,src=$DM_TREE_WHEEL,dst=$DM_TREE_WHEEL,readonly")
+command+=(--mount "type=bind,src=$QWEN_VL_UTILS_WHEEL,dst=$QWEN_VL_UTILS_WHEEL,readonly")
+command+=(--mount "type=bind,src=$TORCHDIFFEQ_WHEEL,dst=$TORCHDIFFEQ_WHEEL,readonly")
 for root in objects robots scenes textures; do
   command+=(--mount "type=bind,src=$ASSET_SOURCE_ROOT/$root,dst=$CANONICAL_ASSETS_ROOT/$root,readonly")
   command+=(--mount "type=bind,src=$ASSET_SOURCE_ROOT/$root,dst=$RUNTIME_REPO_ROOT/Assets/$root,readonly")
@@ -93,6 +102,12 @@ command -v docker >/dev/null 2>&1 || fail "docker is unavailable"
 [[ -f "$FLASH_ATTENTION_WHEEL" && ! -L "$FLASH_ATTENTION_WHEEL" ]] || fail "fixed FlashAttention wheel is unavailable or unsafe"
 [[ "$(sha256sum -- "$FLASH_ATTENTION_WHEEL" | awk '{print $1}')" == "$FLASH_ATTENTION_WHEEL_SHA256" ]] \
   || fail "fixed FlashAttention wheel digest is invalid"
+for wheel_and_digest in "$DM_TREE_WHEEL:$DM_TREE_WHEEL_SHA256" "$QWEN_VL_UTILS_WHEEL:$QWEN_VL_UTILS_WHEEL_SHA256" "$TORCHDIFFEQ_WHEEL:$TORCHDIFFEQ_WHEEL_SHA256"; do
+  wheel="${wheel_and_digest%%:*}"; digest="${wheel_and_digest##*:}"
+  [[ -f "$wheel" && ! -L "$wheel" ]] || fail "fixed public pyproject dependency wheel is unavailable or unsafe"
+  [[ "$(sha256sum -- "$wheel" | awk '{print $1}')" == "$digest" ]] \
+    || fail "fixed public pyproject dependency wheel digest is invalid"
+done
 python3 "$RUNTIME_VERIFIER" prepare-runtime-mountpoints --runtime-root "$RUNTIME_REPO_ROOT" >/dev/null \
   || fail "reviewed runtime asset mountpoints could not be prepared safely"
 for root in objects robots scenes textures; do

@@ -83,6 +83,41 @@ FLASH_ATTENTION_WHEEL_SIZE = 256027206
 FLASH_ATTENTION_VERSION = "2.8.3"
 FLASH_ATTENTION_WHEEL_TAG = "cp311-cp311-linux_x86_64"
 FLASH_ATTENTION_INSTALL_ROOT = "/opt/lehome-challenge/.venv/lib/python3.11/site-packages/flash_attn"
+PUBLIC_PYPROJECT_DEPENDENCY_WHEELS: tuple[dict[str, object], ...] = (
+    {
+        "distribution_name": "dm-tree",
+        "wheel_path": Path("/mnt/lehome/reference-native/dependencies/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+        "wheel_filename": "dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "wheel_size": 152851,
+        "wheel_sha256": "294dc1cecf87552a45cdd5ddb215e7f5295a5a47c46f1f0a0463c3dd02a527d7",
+        "version": "0.1.9",
+        "package": "tree",
+        "wheel_tags": (
+            "cp311-cp311-manylinux_2_17_x86_64",
+            "cp311-cp311-manylinux2014_x86_64",
+        ),
+    },
+    {
+        "distribution_name": "qwen-vl-utils",
+        "wheel_path": Path("/mnt/lehome/reference-native/dependencies/qwen_vl_utils-0.0.14-py3-none-any.whl"),
+        "wheel_filename": "qwen_vl_utils-0.0.14-py3-none-any.whl",
+        "wheel_size": 8120,
+        "wheel_sha256": "5e28657bfd031e56bd447c5901b58ddfc3835285ed100f4c56580e0ade054e96",
+        "version": "0.0.14",
+        "package": "qwen_vl_utils",
+        "wheel_tags": ("py3-none-any",),
+    },
+    {
+        "distribution_name": "torchdiffeq",
+        "wheel_path": Path("/mnt/lehome/reference-native/dependencies/torchdiffeq-0.2.5-py3-none-any.whl"),
+        "wheel_filename": "torchdiffeq-0.2.5-py3-none-any.whl",
+        "wheel_size": 32902,
+        "wheel_sha256": "aa1db4bed13bd04952f28a53cdf4336d1ab60417c1d9698d7a239fec1cf2bcf8",
+        "version": "0.2.5",
+        "package": "torchdiffeq",
+        "wheel_tags": ("py3-none-any",),
+    },
+)
 
 
 class NativeReferenceGateError(ValueError):
@@ -286,6 +321,113 @@ def inspect_flash_attention_overlay() -> dict[str, object]:
 
 def prepare_flash_attention_overlay(receipt_path: Path) -> dict[str, object]:
     receipt = inspect_flash_attention_overlay()
+    _write_exclusive(Path(receipt_path), receipt)
+    return receipt
+
+
+def _public_pyproject_dependency_wheel_members(specification: Mapping[str, object]) -> None:
+    """Validate one direct public-pyproject wheel without network or install side effects."""
+    distribution = specification["distribution_name"]
+    package = specification["package"]
+    version = specification["version"]
+    wheel = Path(specification["wheel_path"])
+    if not all(isinstance(value, str) and value for value in (distribution, package, version)):
+        raise NativeReferenceGateError("public pyproject dependency specification is invalid")
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            members = archive.infolist()
+            names: set[str] = set()
+            for member in members:
+                name = member.filename
+                path = PurePosixPath(name)
+                mode = member.external_attr >> 16
+                if (
+                    not name
+                    or name in names
+                    or "\\" in name
+                    or path.is_absolute()
+                    or ".." in path.parts
+                    or stat.S_ISLNK(mode)
+                    or member.flag_bits & 0x1
+                ):
+                    raise NativeReferenceGateError("unsafe public pyproject dependency wheel member")
+                names.add(name)
+            normalized = distribution.replace("-", "_")
+            metadata_name = f"{normalized}-{version}.dist-info/METADATA"
+            wheel_name = f"{normalized}-{version}.dist-info/WHEEL"
+            if f"{package}/__init__.py" not in names or metadata_name not in names or wheel_name not in names:
+                raise NativeReferenceGateError("public pyproject dependency wheel package metadata is incomplete")
+            try:
+                metadata = archive.read(metadata_name).decode("utf-8", errors="strict")
+                wheel_metadata = archive.read(wheel_name).decode("utf-8", errors="strict")
+            except (KeyError, UnicodeError) as error:
+                raise NativeReferenceGateError("public pyproject dependency wheel metadata is unreadable") from error
+    except zipfile.BadZipFile as error:
+        raise NativeReferenceGateError("public pyproject dependency wheel is not a valid ZIP archive") from error
+    fields: dict[str, str] = {}
+    for line in metadata.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            fields.setdefault(key, value.strip())
+    if fields.get("Name") != distribution or fields.get("Version") != version:
+        raise NativeReferenceGateError("public pyproject dependency wheel metadata is not exact")
+    observed_tags = tuple(
+        line.split(":", 1)[1].strip()
+        for line in wheel_metadata.splitlines()
+        if line.startswith("Tag:")
+    )
+    expected_tags = tuple(specification.get("wheel_tags", (specification.get("wheel_tag"),)))
+    if not expected_tags or any(not isinstance(tag, str) or not tag for tag in expected_tags) or observed_tags != expected_tags:
+        raise NativeReferenceGateError("public pyproject dependency wheel platform tag is not exact")
+
+
+def inspect_public_pyproject_dependencies_overlay() -> dict[str, object]:
+    """Authenticate all omitted direct public-pyproject wheels as one atomic overlay."""
+    entries: list[dict[str, object]] = []
+    expected_distributions = ("dm-tree", "qwen-vl-utils", "torchdiffeq")
+    if tuple(item.get("distribution_name") for item in PUBLIC_PYPROJECT_DEPENDENCY_WHEELS) != expected_distributions:
+        raise NativeReferenceGateError("public pyproject dependency set is not exact")
+    for specification in PUBLIC_PYPROJECT_DEPENDENCY_WHEELS:
+        wheel = Path(specification["wheel_path"])
+        filename = specification.get("wheel_filename")
+        size = specification.get("wheel_size")
+        digest = specification.get("wheel_sha256")
+        if not wheel.is_absolute() or ".." in wheel.parts or not isinstance(filename, str) or wheel.name != filename:
+            raise NativeReferenceGateError("public pyproject dependency wheel fixed path is invalid")
+        if type(size) is not int or size <= 0 or not isinstance(digest, str) or _HEX.fullmatch(digest) is None:
+            raise NativeReferenceGateError("public pyproject dependency specification is invalid")
+        try:
+            metadata = wheel.lstat()
+        except OSError as error:
+            raise NativeReferenceGateError("public pyproject dependency wheel is unavailable or unsafe") from error
+        if wheel.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            raise NativeReferenceGateError("public pyproject dependency wheel is unavailable or unsafe")
+        if metadata.st_size != size:
+            raise NativeReferenceGateError("public pyproject dependency wheel size does not match the exact official wheel")
+        if hashlib.sha256(_read_regular_bytes(wheel, "public pyproject dependency wheel")).hexdigest() != digest:
+            raise NativeReferenceGateError("public pyproject dependency wheel digest does not match the exact official wheel")
+        _public_pyproject_dependency_wheel_members(specification)
+        entries.append(
+            {
+                "distribution_name": specification["distribution_name"],
+                "wheel_path": str(wheel.resolve(strict=True)),
+                "wheel_filename": filename,
+                "wheel_size": size,
+                "wheel_sha256": digest,
+                "version": specification["version"],
+                "package": specification["package"],
+                "wheel_tags": list(specification.get("wheel_tags", (specification.get("wheel_tag"),))),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_public_pyproject_dependencies_overlay_v1",
+        "wheels": entries,
+    }
+
+
+def prepare_public_pyproject_dependencies_overlay(receipt_path: Path) -> dict[str, object]:
+    receipt = inspect_public_pyproject_dependencies_overlay()
     _write_exclusive(Path(receipt_path), receipt)
     return receipt
 
@@ -1248,7 +1390,7 @@ def oracle_attempts() -> tuple[dict[str, object], ...]:
 def _validate_identity(value: object) -> dict[str, object]:
     identity = _object(value, "identity")
     fixed = {"source_repository": SOURCE_REPOSITORY, "source_revision": SOURCE_REVISION, "source_tree_sha256": SOURCE_TREE_SHA256, "lerobot_version": LEROBOT_VERSION, "policy_class": POLICY_CLASS, "policy_device": "cuda:0", "simulator_device": "cpu", "task_description": TASK_DESCRIPTION, "action_horizon": 16, "action_dimension": 12, "success_checker": SUCCESS_CHECKER, "cuda_available": True, "runtime_image_reference": RUNTIME_IMAGE_REFERENCE, "runtime_image_id": RUNTIME_IMAGE_ID, "peft_wheel_sha256": PEFT_WHEEL_SHA256, "flash_attention_wheel_sha256": FLASH_ATTENTION_WHEEL_SHA256, "pynput_backend": "dummy"}
-    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256", "flash_attention_runtime_receipt_sha256", "pynput_backend_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "source_root", "python_executable", "python_version", "torch_version", "lerobot_origin", "scripts_eval_origin", "lehome_origin"}
+    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256", "flash_attention_runtime_receipt_sha256", "public_pyproject_dependencies_overlay_receipt_sha256", "public_pyproject_dependencies_runtime_receipt_sha256", "pynput_backend_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "source_root", "python_executable", "python_version", "torch_version", "lerobot_origin", "scripts_eval_origin", "lehome_origin"}
     if set(identity) != {*fixed, *variable}:
         raise NativeReferenceGateError("identity has an unexpected schema")
     for key, expected in fixed.items():
@@ -1261,7 +1403,7 @@ def _validate_identity(value: object) -> dict[str, object]:
                 else key
             )
             raise NativeReferenceGateError(f"identity {label} does not match the native contract")
-    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256", "flash_attention_runtime_receipt_sha256", "pynput_backend_receipt_sha256"):
+    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256", "flash_attention_runtime_receipt_sha256", "public_pyproject_dependencies_overlay_receipt_sha256", "public_pyproject_dependencies_runtime_receipt_sha256", "pynput_backend_receipt_sha256"):
         _digest(identity.get(key), f"identity {key}")
     if type(identity["cuda_device_count"]) is not int or identity["cuda_device_count"] < 1 or not isinstance(identity["cuda_runtime"], str) or not identity["cuda_runtime"]:
         raise NativeReferenceGateError("identity does not prove CUDA availability")
@@ -1410,6 +1552,57 @@ def _validate_flash_attention_runtime_receipt(document: object) -> dict[str, obj
     return receipt
 
 
+def _public_pyproject_dependency_receipt_wheels() -> list[dict[str, object]]:
+    return [
+        {
+            "distribution_name": item["distribution_name"],
+            "wheel_path": str(item["wheel_path"]),
+            "wheel_filename": item["wheel_filename"],
+            "wheel_size": item["wheel_size"],
+            "wheel_sha256": item["wheel_sha256"],
+            "version": item["version"],
+            "package": item["package"],
+            "wheel_tags": list(item["wheel_tags"]),
+        }
+        for item in PUBLIC_PYPROJECT_DEPENDENCY_WHEELS
+    ]
+
+
+def _validate_public_pyproject_dependencies_overlay_receipt(document: object) -> dict[str, object]:
+    receipt = _object(document, "public pyproject dependency overlay receipt")
+    expected = {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_public_pyproject_dependencies_overlay_v1",
+        "wheels": _public_pyproject_dependency_receipt_wheels(),
+    }
+    if set(receipt) != set(expected) or any(receipt.get(key) != value for key, value in expected.items()):
+        raise NativeReferenceGateError("public pyproject dependency overlay receipt contract is invalid")
+    return receipt
+
+
+def _validate_public_pyproject_dependencies_runtime_receipt(document: object) -> dict[str, object]:
+    receipt = _object(document, "public pyproject dependency runtime receipt")
+    root = "/opt/lehome-challenge/.venv/lib/python3.11/site-packages"
+    expected = {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_public_pyproject_dependencies_runtime_v1",
+        "tree_version": "0.1.9",
+        "tree_origin": f"{root}/tree/__init__.py",
+        "tree_map_structure": True,
+        "qwen_vl_utils_version": "0.0.14",
+        "qwen_vl_utils_origin": f"{root}/qwen_vl_utils/__init__.py",
+        "qwen_vl_utils_process_vision_info": True,
+        "torchdiffeq_version": "0.2.5",
+        "torchdiffeq_origin": f"{root}/torchdiffeq/__init__.py",
+        "torchdiffeq_odeint": True,
+        "groot_tree_origin": f"{root}/tree/__init__.py",
+        "groot_tree_is_tree_module": True,
+    }
+    if set(receipt) != set(expected) or any(receipt.get(key) != value for key, value in expected.items()):
+        raise NativeReferenceGateError("public pyproject dependency runtime receipt contract is invalid")
+    return receipt
+
+
 def _validate_pynput_backend_receipt(document: object) -> dict[str, object]:
     receipt = _object(document, "pynput backend receipt")
     expected = {
@@ -1433,7 +1626,10 @@ def _validate_preflight(document: object, identity: Mapping[str, object]) -> dic
         "host_runtime_sha256", "runtime_image_receipt_sha256",
         "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256",
         "flash_attention_overlay_receipt_sha256",
-        "flash_attention_runtime_receipt_sha256", "pynput_backend_receipt_sha256",
+        "flash_attention_runtime_receipt_sha256",
+        "public_pyproject_dependencies_overlay_receipt_sha256",
+        "public_pyproject_dependencies_runtime_receipt_sha256",
+        "pynput_backend_receipt_sha256",
     }
     if (
         set(preflight) != expected_keys
@@ -1446,13 +1642,19 @@ def _validate_preflight(document: object, identity: Mapping[str, object]) -> dic
         "cuda_probe_sha256", "host_runtime_sha256", "runtime_image_receipt_sha256",
         "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256",
         "flash_attention_overlay_receipt_sha256",
-        "flash_attention_runtime_receipt_sha256", "pynput_backend_receipt_sha256",
+        "flash_attention_runtime_receipt_sha256",
+        "public_pyproject_dependencies_overlay_receipt_sha256",
+        "public_pyproject_dependencies_runtime_receipt_sha256",
+        "pynput_backend_receipt_sha256",
     ):
         _digest(preflight.get(key), f"native reference preflight {key}")
     for key in (
         "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256",
         "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256",
-        "flash_attention_runtime_receipt_sha256", "pynput_backend_receipt_sha256",
+        "flash_attention_runtime_receipt_sha256",
+        "public_pyproject_dependencies_overlay_receipt_sha256",
+        "public_pyproject_dependencies_runtime_receipt_sha256",
+        "pynput_backend_receipt_sha256",
     ):
         if preflight[key] != identity[key]:
             raise NativeReferenceGateError("native reference preflight is not bound to identity")
@@ -1493,6 +1695,8 @@ def verify_native_reference_result(document: object, *, bundle_root: Path | None
         peft_overlay = _artifact_from_file(bundle_root, Path("evidence/peft-overlay-receipt.json"))
         flash_overlay = _artifact_from_file(bundle_root, Path("evidence/flash-attention-overlay-receipt.json"))
         flash_runtime = _artifact_from_file(bundle_root, Path("evidence/flash-attention-runtime-receipt.json"))
+        public_pyproject_overlay = _artifact_from_file(bundle_root, Path("evidence/public-pyproject-dependencies-overlay-receipt.json"))
+        public_pyproject_runtime = _artifact_from_file(bundle_root, Path("evidence/public-pyproject-dependencies-runtime-receipt.json"))
         pynput_backend = _artifact_from_file(bundle_root, Path("evidence/pynput-backend-receipt.json"))
         _validate_checkpoint_compatibility_receipt(
             _read_json(bundle_root / "evidence/checkpoint-compatibility-receipt.json", "checkpoint compatibility receipt"),
@@ -1507,15 +1711,21 @@ def verify_native_reference_result(document: object, *, bundle_root: Path | None
         _validate_flash_attention_runtime_receipt(
             _read_json(bundle_root / "evidence/flash-attention-runtime-receipt.json", "FlashAttention runtime receipt")
         )
+        _validate_public_pyproject_dependencies_overlay_receipt(
+            _read_json(bundle_root / "evidence/public-pyproject-dependencies-overlay-receipt.json", "public pyproject dependency overlay receipt")
+        )
+        _validate_public_pyproject_dependencies_runtime_receipt(
+            _read_json(bundle_root / "evidence/public-pyproject-dependencies-runtime-receipt.json", "public pyproject dependency runtime receipt")
+        )
         _validate_pynput_backend_receipt(
             _read_json(bundle_root / "evidence/pynput-backend-receipt.json", "pynput backend receipt")
         )
         _validate_preflight(
             _read_json(bundle_root / "preflight.json", "native reference preflight"), identity
         )
-        if cache["sha256"] != identity["cache_trust_manifest_sha256"] or running["sha256"] != identity["provider_running_receipt_sha256"] or runtime_image["sha256"] != identity["runtime_image_receipt_sha256"] or compatibility["sha256"] != identity["checkpoint_compatibility_receipt_sha256"] or peft_overlay["sha256"] != identity["peft_overlay_receipt_sha256"] or flash_overlay["sha256"] != identity["flash_attention_overlay_receipt_sha256"] or flash_runtime["sha256"] != identity["flash_attention_runtime_receipt_sha256"] or pynput_backend["sha256"] != identity["pynput_backend_receipt_sha256"]:
+        if cache["sha256"] != identity["cache_trust_manifest_sha256"] or running["sha256"] != identity["provider_running_receipt_sha256"] or runtime_image["sha256"] != identity["runtime_image_receipt_sha256"] or compatibility["sha256"] != identity["checkpoint_compatibility_receipt_sha256"] or peft_overlay["sha256"] != identity["peft_overlay_receipt_sha256"] or flash_overlay["sha256"] != identity["flash_attention_overlay_receipt_sha256"] or flash_runtime["sha256"] != identity["flash_attention_runtime_receipt_sha256"] or public_pyproject_overlay["sha256"] != identity["public_pyproject_dependencies_overlay_receipt_sha256"] or public_pyproject_runtime["sha256"] != identity["public_pyproject_dependencies_runtime_receipt_sha256"] or pynput_backend["sha256"] != identity["pynput_backend_receipt_sha256"]:
             raise NativeReferenceGateError("execution bundle support evidence is not bound to identity")
-        supporting_artifacts = {"preflight": preflight, "cache_trust_manifest": cache, "provider_running_receipt": running, "runtime_image_receipt": runtime_image, "checkpoint_compatibility_receipt": compatibility, "peft_overlay_receipt": peft_overlay, "flash_attention_overlay_receipt": flash_overlay, "flash_attention_runtime_receipt": flash_runtime, "pynput_backend_receipt": pynput_backend}
+        supporting_artifacts = {"preflight": preflight, "cache_trust_manifest": cache, "provider_running_receipt": running, "runtime_image_receipt": runtime_image, "checkpoint_compatibility_receipt": compatibility, "peft_overlay_receipt": peft_overlay, "flash_attention_overlay_receipt": flash_overlay, "flash_attention_runtime_receipt": flash_runtime, "public_pyproject_dependencies_overlay_receipt": public_pyproject_overlay, "public_pyproject_dependencies_runtime_receipt": public_pyproject_runtime, "pynput_backend_receipt": pynput_backend}
     rows = result.get("attempts")
     if type(rows) is not list or len(rows) not in {2, 8}:
         raise NativeReferenceGateError("native reference result must contain either the two-attempt admission stop or all eight attempts")
@@ -1644,6 +1854,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare_peft = commands.add_parser("prepare-peft-overlay"); prepare_peft.add_argument("--receipt", type=Path, required=True)
     flash_attention_overlay = commands.add_parser("validate-flash-attention-overlay")
     prepare_flash_attention = commands.add_parser("prepare-flash-attention-overlay"); prepare_flash_attention.add_argument("--receipt", type=Path, required=True)
+    public_pyproject_dependencies_overlay = commands.add_parser("validate-public-pyproject-dependencies-overlay")
+    prepare_public_pyproject_dependencies = commands.add_parser("prepare-public-pyproject-dependencies-overlay"); prepare_public_pyproject_dependencies.add_argument("--receipt", type=Path, required=True)
     cache = commands.add_parser("fetch-cache-manifest"); cache.add_argument("--revision", required=True); cache.add_argument("--path", required=True); cache.add_argument("--receipt", type=Path); cache.add_argument("--checkpoint-tree-sha256"); cache.add_argument("--metadata-tree-sha256"); cache.add_argument("--assets-tree-sha256")
     publish = commands.add_parser("publish-bundle"); publish.add_argument("--bundle-root", type=Path, required=True); publish.add_argument("--execution", type=Path, required=True); publish.add_argument("--token-file", type=Path, required=True); publish.add_argument("--receipt", type=Path, required=True)
     publish_cache = commands.add_parser("publish-cache-manifest"); publish_cache.add_argument("--manifest", type=Path, required=True); publish_cache.add_argument("--token-file", type=Path, required=True); publish_cache.add_argument("--receipt", type=Path, required=True)
@@ -1681,6 +1893,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             receipt = inspect_flash_attention_overlay()
         elif args.command == "prepare-flash-attention-overlay":
             receipt = prepare_flash_attention_overlay(args.receipt)
+        elif args.command == "validate-public-pyproject-dependencies-overlay":
+            receipt = inspect_public_pyproject_dependencies_overlay()
+        elif args.command == "prepare-public-pyproject-dependencies-overlay":
+            receipt = prepare_public_pyproject_dependencies_overlay(args.receipt)
         elif args.command == "publish-bundle":
             with _repository_package_imports():
                 from scripts.publish_simple_curriculum_collection import HuggingFacePublicDatasetTransport, _load_token

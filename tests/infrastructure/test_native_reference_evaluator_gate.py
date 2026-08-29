@@ -41,6 +41,8 @@ def _identity() -> dict[str, object]:
         "flash_attention_wheel_sha256": "cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af",
         "flash_attention_overlay_receipt_sha256": hashlib.sha256(b"flash-overlay").hexdigest(),
         "flash_attention_runtime_receipt_sha256": hashlib.sha256(b"flash-runtime").hexdigest(),
+        "public_pyproject_dependencies_overlay_receipt_sha256": hashlib.sha256(b"public-pyproject-overlay").hexdigest(),
+        "public_pyproject_dependencies_runtime_receipt_sha256": hashlib.sha256(b"public-pyproject-runtime").hexdigest(),
         "pynput_backend": "dummy",
         "pynput_backend_receipt_sha256": hashlib.sha256(b"pynput-backend").hexdigest(),
         "provider_source_image_id": "computeimage-u00zf6w3yf72gakhcy",
@@ -205,6 +207,34 @@ def _materialize_artifacts(root: Path, bundle: dict[str, object]) -> None:
     ).encode()
     (root / "evidence/flash-attention-runtime-receipt.json").write_bytes(flash_runtime)
     bundle["identity"]["flash_attention_runtime_receipt_sha256"] = hashlib.sha256(flash_runtime).hexdigest()  # type: ignore[index]
+    public_pyproject_overlay = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "lehome_native_reference_public_pyproject_dependencies_overlay_v1",
+                "wheels": [
+                    {"distribution_name": "dm-tree", "wheel_path": "/mnt/lehome/reference-native/dependencies/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", "wheel_filename": "dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", "wheel_size": 152851, "wheel_sha256": "294dc1cecf87552a45cdd5ddb215e7f5295a5a47c46f1f0a0463c3dd02a527d7", "version": "0.1.9", "package": "tree", "wheel_tags": ["cp311-cp311-manylinux_2_17_x86_64", "cp311-cp311-manylinux2014_x86_64"]},
+                    {"distribution_name": "qwen-vl-utils", "wheel_path": "/mnt/lehome/reference-native/dependencies/qwen_vl_utils-0.0.14-py3-none-any.whl", "wheel_filename": "qwen_vl_utils-0.0.14-py3-none-any.whl", "wheel_size": 8120, "wheel_sha256": "5e28657bfd031e56bd447c5901b58ddfc3835285ed100f4c56580e0ade054e96", "version": "0.0.14", "package": "qwen_vl_utils", "wheel_tags": ["py3-none-any"]},
+                    {"distribution_name": "torchdiffeq", "wheel_path": "/mnt/lehome/reference-native/dependencies/torchdiffeq-0.2.5-py3-none-any.whl", "wheel_filename": "torchdiffeq-0.2.5-py3-none-any.whl", "wheel_size": 32902, "wheel_sha256": "aa1db4bed13bd04952f28a53cdf4336d1ab60417c1d9698d7a239fec1cf2bcf8", "version": "0.2.5", "package": "torchdiffeq", "wheel_tags": ["py3-none-any"]},
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    (root / "evidence/public-pyproject-dependencies-overlay-receipt.json").write_bytes(public_pyproject_overlay)
+    bundle["identity"]["public_pyproject_dependencies_overlay_receipt_sha256"] = hashlib.sha256(public_pyproject_overlay).hexdigest()  # type: ignore[index]
+    public_pyproject_runtime = (
+        json.dumps(
+            {"schema_version": 1, "kind": "lehome_native_reference_public_pyproject_dependencies_runtime_v1", "tree_version": "0.1.9", "tree_origin": "/opt/lehome-challenge/.venv/lib/python3.11/site-packages/tree/__init__.py", "tree_map_structure": True, "qwen_vl_utils_version": "0.0.14", "qwen_vl_utils_origin": "/opt/lehome-challenge/.venv/lib/python3.11/site-packages/qwen_vl_utils/__init__.py", "qwen_vl_utils_process_vision_info": True, "torchdiffeq_version": "0.2.5", "torchdiffeq_origin": "/opt/lehome-challenge/.venv/lib/python3.11/site-packages/torchdiffeq/__init__.py", "torchdiffeq_odeint": True, "groot_tree_origin": "/opt/lehome-challenge/.venv/lib/python3.11/site-packages/tree/__init__.py", "groot_tree_is_tree_module": True},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    (root / "evidence/public-pyproject-dependencies-runtime-receipt.json").write_bytes(public_pyproject_runtime)
+    bundle["identity"]["public_pyproject_dependencies_runtime_receipt_sha256"] = hashlib.sha256(public_pyproject_runtime).hexdigest()  # type: ignore[index]
     pynput_backend = (
         json.dumps(
             {
@@ -234,6 +264,8 @@ def _materialize_artifacts(root: Path, bundle: dict[str, object]) -> None:
         "peft_overlay_receipt_sha256": bundle["identity"]["peft_overlay_receipt_sha256"],
         "flash_attention_overlay_receipt_sha256": bundle["identity"]["flash_attention_overlay_receipt_sha256"],
         "flash_attention_runtime_receipt_sha256": bundle["identity"]["flash_attention_runtime_receipt_sha256"],
+        "public_pyproject_dependencies_overlay_receipt_sha256": bundle["identity"]["public_pyproject_dependencies_overlay_receipt_sha256"],
+        "public_pyproject_dependencies_runtime_receipt_sha256": bundle["identity"]["public_pyproject_dependencies_runtime_receipt_sha256"],
         "pynput_backend_receipt_sha256": bundle["identity"]["pynput_backend_receipt_sha256"],
     }
     (root / "preflight.json").write_text(
@@ -2168,6 +2200,64 @@ def test_flash_attention_preflight_binding_is_checked_at_final_execution_verific
     (tmp_path / "preflight.json").write_text(json.dumps(preflight), encoding="utf-8")
     with pytest.raises(NativeReferenceGateError, match="preflight"):
         verify_native_reference_result(document, bundle_root=tmp_path)
+
+
+def test_public_pyproject_overlay_rejects_wrong_wheel_metadata_and_records_all_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The public submission's three omitted direct requirements are one atomic gate."""
+    monkeypatch.syspath_prepend(str(ROOT))
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    wheels = {
+        "dm-tree": ("dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", "tree", "0.1.9", "cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64"),
+        "qwen-vl-utils": ("qwen_vl_utils-0.0.14-py3-none-any.whl", "qwen_vl_utils", "0.0.14", "py3-none-any"),
+        "torchdiffeq": ("torchdiffeq-0.2.5-py3-none-any.whl", "torchdiffeq", "0.2.5", "py3-none-any"),
+    }
+    paths: dict[str, Path] = {}
+    for distribution, (filename, package, version, tag) in wheels.items():
+        path = tmp_path / filename
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr(f"{package}/__init__.py", "\n")
+            normalized = distribution.replace("-", "_")
+            archive.writestr(
+                f"{normalized}-{version}.dist-info/METADATA",
+                f"Metadata-Version: 2.1\nName: {distribution}\nVersion: {version}\n",
+            )
+            archive.writestr(
+                f"{normalized}-{version}.dist-info/WHEEL",
+                f"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: {tag}\n",
+            )
+        paths[distribution] = path
+
+    monkeypatch.setattr(
+        gate,
+        "PUBLIC_PYPROJECT_DEPENDENCY_WHEELS",
+        tuple(
+            {
+                "distribution_name": distribution,
+                "wheel_path": path,
+                "wheel_filename": path.name,
+                "wheel_size": path.stat().st_size,
+                "wheel_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "version": wheels[distribution][2],
+                "wheel_tag": wheels[distribution][3],
+                "package": wheels[distribution][1],
+            }
+            for distribution, path in paths.items()
+        ),
+        raising=False,
+    )
+
+    receipt = gate.prepare_public_pyproject_dependencies_overlay(tmp_path / "receipt.json")
+
+    assert receipt["kind"] == "lehome_native_reference_public_pyproject_dependencies_overlay_v1"
+    assert [row["distribution_name"] for row in receipt["wheels"]] == list(wheels)
+    assert receipt["wheels"][0]["wheel_tags"] == [wheels["dm-tree"][3]]
+
+    paths["torchdiffeq"].write_bytes(paths["torchdiffeq"].read_bytes() + b"tamper")
+    with pytest.raises(gate.NativeReferenceGateError, match="size|digest"):
+        gate.inspect_public_pyproject_dependencies_overlay()
 
 
 def test_pynput_dummy_backend_is_preflight_bound_and_rejects_any_x11_or_control_drift(
