@@ -508,5 +508,25 @@ def setup_eval_parser() -> argparse.ArgumentParser:
         default="http://localhost:8080",
         help="URL of the Docker policy server (used when --policy_type docker).",
     )
+    # The N1.7 PolicyServer adapter deliberately keeps model construction out
+    # of Isaac.  These are inert for every other policy type.
+    parser.add_argument(
+        "--policy_server_endpoint",
+        type=str,
+        default=None,
+        help="Loopback NVIDIA GR00T PolicyServer endpoint (groot_server only).",
+    )
+    parser.add_argument(
+        "--policy_server_token_env",
+        type=str,
+        default=None,
+        help="Environment variable containing the GR00T PolicyServer token (groot_server only).",
+    )
+    parser.add_argument(
+        "--policy_server_request_timeout",
+        type=float,
+        default=None,
+        help="GR00T PolicyServer request timeout in seconds (groot_server only).",
+    )
 
     return parser
