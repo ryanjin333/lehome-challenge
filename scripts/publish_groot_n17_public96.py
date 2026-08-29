@@ -16,14 +16,21 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import shutil
 import stat
 import sys
 import tempfile
+import time
 from typing import Mapping, Sequence
 
 from scripts import eval_groot_n17_public96 as evaluator
-from scripts.publish_simple_curriculum_collection import HuggingFacePublicDatasetTransport
+from scripts.publish_simple_curriculum_collection import (
+    CollectionPublicationError,
+    HuggingFacePublicDatasetTransport,
+    _retry as _canonical_retry,
+    _scan_publication_descriptor_and_content_fd as _canonical_scan_descriptor,
+)
 
 
 _HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -131,6 +138,10 @@ def _open_entry(root: Path, relative: str) -> tuple[int, os.stat_result]:
 def _read_descriptor(root: Path, relative: str) -> tuple[bytes, str, int]:
     fd, before = _open_entry(root, _safe_relative(relative))
     try:
+        try:
+            _canonical_scan_descriptor(fd, relative)
+        except CollectionPublicationError as error:
+            raise Public96PublicationError("publication source violates the canonical credential policy") from error
         with os.fdopen(os.dup(fd), "rb", closefd=True) as handle:
             contents = handle.read()
         after = os.fstat(fd)
@@ -305,11 +316,17 @@ def _stage(root: Path, entries: Sequence[PublicationEntry], root_snapshots: Mapp
             target = staging / entry.relative_path; target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("xb") as handle:
                 handle.write(contents); handle.flush(); os.fsync(handle.fileno())
+            staged_contents, staged_digest, staged_size = _read_descriptor(staging, entry.relative_path)
+            if (staged_contents, staged_digest, staged_size) != (contents, entry.sha256, entry.byte_size):
+                raise Public96PublicationError("publication staging bytes changed")
         manifest = _canonical([{"path": entry.relative_path, "sha256": entry.sha256, "byte_size": entry.byte_size} for entry in entries])
         manifest_path = staging / _MANIFEST
         with manifest_path.open("xb") as handle:
             handle.write(manifest); handle.flush(); os.fsync(handle.fileno())
-        manifest_entry = PublicationEntry(_MANIFEST, _digest_bytes(manifest), len(manifest))
+        _, manifest_digest, manifest_size = _read_descriptor(staging, _MANIFEST)
+        if (manifest_digest, manifest_size) != (_digest_bytes(manifest), len(manifest)):
+            raise Public96PublicationError("publication manifest staging bytes changed")
+        manifest_entry = PublicationEntry(_MANIFEST, manifest_digest, manifest_size)
         return staging, tuple((*entries, manifest_entry)), manifest_entry.sha256
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
@@ -332,10 +349,32 @@ def _tree_files(tree: Sequence[object], prefix: str) -> set[str]:
     return observed
 
 
-def _verify_download(transport, *, repository: str, revision: str, prefix: str, entries: Sequence[PublicationEntry], token: str | None, staging: Path) -> None:
+def _transport_retry(operation, *, label: str, deadline: float, monotonic) -> object:
+    """Use the repository's bounded Hub retry/deadline policy verbatim."""
+    try:
+        return _canonical_retry(
+            operation, label=label, max_attempts=3, deadline=deadline,
+            monotonic=monotonic, deadline_label="public96 publication",
+        )
+    except CollectionPublicationError as error:
+        raise Public96PublicationError(f"{label} failed") from error
+
+
+def _verify_download(
+    transport, *, repository: str, revision: str, prefix: str, entries: Sequence[PublicationEntry],
+    token: str | None, staging: Path, deadline: float, monotonic,
+) -> None:
     destination = Path(tempfile.mkdtemp(prefix="lehome-public96-readback-", dir=staging.parent))
     try:
-        observed = transport.download_files(repository=repository, revision=revision, destination=destination, relative_paths=tuple(entry.relative_path for entry in entries), token=token, remote_prefix=prefix)
+        observed = _transport_retry(
+            lambda budget: transport.download_files(
+                repository=repository, revision=revision, destination=destination,
+                relative_paths=tuple(entry.relative_path for entry in entries), token=token,
+                remote_prefix=prefix, timeout_seconds=budget,
+            ),
+            label="anonymous readback" if token is None else "authenticated readback",
+            deadline=deadline, monotonic=monotonic,
+        )
         if observed != revision:
             raise Public96PublicationError("readback did not bind the immutable revision")
         for entry in entries:
@@ -344,6 +383,91 @@ def _verify_download(transport, *, repository: str, revision: str, prefix: str, 
                 raise Public96PublicationError("authenticated readback bytes mismatch" if token is not None else "anonymous readback bytes mismatch")
     finally:
         shutil.rmtree(destination, ignore_errors=True)
+
+
+def _open_receipt_parent(path: Path) -> tuple[str, int]:
+    """Pin a non-symlink receipt parent before inspecting or creating a file."""
+    absolute = _absolute_without_resolution(path)
+    parent = absolute.parent
+    current = Path(parent.anchor)
+    for part in parent.parts[1:]:
+        current /= part
+        try:
+            metadata = os.lstat(current)
+        except OSError as error:
+            raise Public96PublicationError("receipt parent is unavailable") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise Public96PublicationError("receipt parent contains a symlink")
+    try:
+        descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise Public96PublicationError("receipt parent is unavailable") from error
+    if not path.name or path.name in {".", ".."}:
+        os.close(descriptor)
+        raise Public96PublicationError("receipt path is invalid")
+    return path.name, descriptor
+
+
+def _read_existing_receipt(path: Path) -> bytes | None:
+    name, parent = _open_receipt_parent(path)
+    try:
+        try:
+            descriptor = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise Public96PublicationError("publication receipt already exists or is unsafe") from error
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise Public96PublicationError("publication receipt already exists or is unsafe")
+            with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
+                contents = handle.read()
+            after = os.fstat(descriptor)
+            if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size):
+                raise Public96PublicationError("publication receipt already exists or is unsafe")
+            return contents
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent)
+
+
+def _write_new_receipt(path: Path, contents: bytes) -> None:
+    name, parent = _open_receipt_parent(path)
+    temporary = f".{name}.{secrets.token_hex(16)}.tmp"
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=parent)
+            total = 0
+            while total < len(contents):
+                total += os.write(descriptor, contents[total:])
+            os.fsync(descriptor)
+        except OSError as error:
+            raise Public96PublicationError("publication receipt could not be durably written") from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        try:
+            # link(2) is an atomic no-replace promotion in the same pinned
+            # directory; rename would permit replacing another writer's receipt.
+            os.link(temporary, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+        except FileExistsError as error:
+            raise Public96PublicationError("publication receipt already exists") from error
+        except OSError as error:
+            raise Public96PublicationError("publication receipt could not be atomically promoted") from error
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+        try:
+            os.fsync(parent)
+        except OSError as error:
+            raise Public96PublicationError("publication receipt directory fsync failed") from error
+    finally:
+        os.close(parent)
 
 
 def _write_or_validate_receipt(path: Path, payload: Mapping[str, object]) -> None:
@@ -381,28 +505,29 @@ def _write_or_validate_receipt(path: Path, payload: Mapping[str, object]) -> Non
 
     if not valid(payload):
         raise Public96PublicationError("publication receipt payload is invalid")
-    if path.exists() or path.is_symlink():
-        if path.is_symlink() or not path.is_file(): raise Public96PublicationError("publication receipt already exists or is unsafe")
-        try: existing = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error: raise Public96PublicationError("publication receipt already exists or is unsafe") from error
+    existing_contents = _read_existing_receipt(path)
+    if existing_contents is not None:
+        try: existing = json.loads(existing_contents.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error: raise Public96PublicationError("publication receipt already exists or is unsafe") from error
         stable = {key: value for key, value in payload.items() if key != "published_at_utc"}
         if not valid(existing) or {key: existing.get(key) for key in stable} != stable:
             raise Public96PublicationError("publication receipt already exists and differs")
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with path.open("xb") as handle:
-            handle.write((json.dumps(payload, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")); handle.flush(); os.fsync(handle.fileno())
-    except FileExistsError as error:
-        raise Public96PublicationError("publication receipt already exists") from error
+    _write_new_receipt(path, (json.dumps(payload, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8"))
 
 
-def publish_public96(run_root: Path, *, matrix: Path, matrix_sha256_path: Path, token: str, transport, repository: str = _REPOSITORY, ref: str = "main", receipt_output: Path | None = None) -> Public96PublicationResult:
+def publish_public96(
+    run_root: Path, *, matrix: Path, matrix_sha256_path: Path, token: str, transport,
+    repository: str = _REPOSITORY, ref: str = "main", receipt_output: Path | None = None,
+    timeout_seconds: float = 300.0, monotonic=time.monotonic,
+) -> Public96PublicationResult:
     """Verify a closed run, publish only its exact evidence, then read it twice."""
     if not isinstance(token, str) or not token or any(character.isspace() for character in token):
         raise Public96PublicationError("HF token is unavailable")
     if not isinstance(repository, str) or "/" not in repository or not repository.strip() or not isinstance(ref, str) or not ref or _COMMIT.fullmatch(ref):
         raise Public96PublicationError("publication repository or mutable ref is invalid")
+    if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 900 or not callable(monotonic):
+        raise Public96PublicationError("publication timeout is invalid")
     root = _safe_root(Path(run_root))
     result, result_snapshot = _json_descriptor(root, "result.json", "result")
     result_sha256 = result_snapshot.sha256
@@ -418,24 +543,59 @@ def publish_public96(run_root: Path, *, matrix: Path, matrix_sha256_path: Path, 
     raw_entries = _collect_entries(root, result, root_snapshots)
     staging, entries, manifest_sha256 = _stage(root, raw_entries, root_snapshots)
     prefix = f"public96/results/{matrix_digest[:16]}-{result_sha256[:16]}"
+    deadline = monotonic() + float(timeout_seconds)
+
+    def resolve_head() -> str:
+        head = _transport_retry(
+            lambda budget: transport.resolve_approved_ref(repository=repository, ref=ref, token=token, timeout_seconds=budget),
+            label="publication ref resolution", deadline=deadline, monotonic=monotonic,
+        )
+        if not isinstance(head, str) or not _COMMIT.fullmatch(head):
+            raise Public96PublicationError("publication ref did not resolve to an immutable revision")
+        return head
+
+    def list_prefix(revision: str):
+        return _tree_files(_transport_retry(
+            lambda budget: transport.list_tree(repository=repository, revision=revision, token=token, remote_prefix=prefix, timeout_seconds=budget),
+            label="immutable prefix listing", deadline=deadline, monotonic=monotonic,
+        ), prefix)
+
     try:
         try:
-            head = transport.resolve_approved_ref(repository=repository, ref=ref, token=token)
-            if not isinstance(head, str) or not _COMMIT.fullmatch(head): raise Public96PublicationError("publication ref did not resolve to an immutable revision")
+            head = resolve_head()
             expected = {entry.relative_path for entry in entries}
-            existing = _tree_files(transport.list_tree(repository=repository, revision=head, token=token, remote_prefix=prefix), prefix)
+            existing = list_prefix(head)
             if existing and existing != expected: raise Public96PublicationError("immutable public96 prefix collision")
             if existing:
                 revision = head
-                try: _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=token, staging=staging)
+                try: _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=token, staging=staging, deadline=deadline, monotonic=monotonic)
                 except Public96PublicationError as error: raise Public96PublicationError("immutable public96 prefix collision") from error
             else:
-                revision = transport.upload_files(repository=repository, revision=ref, source=staging, entries=entries, token=token, remote_prefix=prefix, parent_commit=head)
+                try:
+                    revision = _canonical_retry(
+                        lambda budget: transport.upload_files(
+                            repository=repository, revision=ref, source=staging, entries=entries, token=token,
+                            remote_prefix=prefix, parent_commit=head, timeout_seconds=budget,
+                        ),
+                        label="public96 upload", max_attempts=3, deadline=deadline, monotonic=monotonic,
+                        deadline_label="public96 publication", reconcile_ambiguous=True,
+                    )
+                except CollectionPublicationError:
+                    # A disconnected write can have committed.  Reconcile the
+                    # current mutable head to this exact content-addressed
+                    # prefix; never issue another blind mutable upload.
+                    revision = resolve_head()
+                    if list_prefix(revision) != expected:
+                        raise Public96PublicationError("ambiguous upload did not reconcile to the exact immutable tree") from None
+                    try:
+                        _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=token, staging=staging, deadline=deadline, monotonic=monotonic)
+                    except Public96PublicationError as error:
+                        raise Public96PublicationError("ambiguous upload did not reconcile to exact authenticated bytes") from error
                 if not isinstance(revision, str) or not _COMMIT.fullmatch(revision): raise Public96PublicationError("upload did not return an immutable revision")
-            remote = _tree_files(transport.list_tree(repository=repository, revision=revision, token=token, remote_prefix=prefix), prefix)
+            remote = list_prefix(revision)
             if remote != expected: raise Public96PublicationError("immutable remote tree does not match the staged allowlist")
-            _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=token, staging=staging)
-            _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=None, staging=staging)
+            _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=token, staging=staging, deadline=deadline, monotonic=monotonic)
+            _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=None, staging=staging, deadline=deadline, monotonic=monotonic)
         except Public96PublicationError:
             raise
         except Exception as error:

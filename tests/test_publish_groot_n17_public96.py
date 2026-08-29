@@ -43,6 +43,10 @@ class Entry:
         self.entry_type = entry_type
 
 
+class HubTransientError(RuntimeError):
+    """Named for the canonical bounded-retry classifier."""
+
+
 class Transport:
     def __init__(self) -> None:
         self.store: dict[str, dict[str, bytes]] = {}
@@ -52,13 +56,23 @@ class Transport:
         self.download_revisions: list[str] = []
         self.mutate_authenticated = False
         self.mutate_anonymous = False
+        self.transient: dict[str, int] = {}
+        self.lost_upload_response = False
+        self.ambiguous_upload_mismatch = False
+
+    def _transient(self, operation: str) -> None:
+        if self.transient.get(operation, 0):
+            self.transient[operation] -= 1
+            raise HubTransientError(f"transient {operation}")
 
     def resolve_approved_ref(self, *, repository, ref, token, **_kwargs):
         assert repository == "owner/public96" and ref == "main" and token == "token"
+        self._transient("resolve")
         return COMMIT
 
     def list_tree(self, *, repository, revision, token, remote_prefix=None, **_kwargs):
         assert repository == "owner/public96" and revision == COMMIT and token == "token"
+        self._transient("list")
         return tuple(Entry(path) for path in sorted(self.store.get(str(remote_prefix), {})))
 
     def upload_files(self, *, repository, revision, source, entries, token, remote_prefix=None, parent_commit=None, **_kwargs):
@@ -67,6 +81,12 @@ class Transport:
         bucket = self.store.setdefault(str(remote_prefix), {})
         for entry in entries:
             bucket[f"{remote_prefix}/{entry.relative_path}"] = (Path(source) / entry.relative_path).read_bytes()
+        if self.ambiguous_upload_mismatch:
+            bucket[f"{remote_prefix}/result.json"] = b"different"
+            raise ConnectionError("unknown upload result")
+        if self.lost_upload_response:
+            self.lost_upload_response = False
+            raise ConnectionError("unknown upload result")
         return COMMIT
 
     def download_files(self, *, repository, revision, destination, relative_paths, token, remote_prefix=None, **_kwargs):
@@ -74,8 +94,10 @@ class Transport:
         self.download_revisions.append(revision)
         if token is None:
             self.anonymous_downloads += 1
+            self._transient("anonymous_download")
         else:
             self.authenticated_downloads += 1
+            self._transient("authenticated_download")
         bucket = self.store[str(remote_prefix)]
         for relative in relative_paths:
             raw = bucket[f"{remote_prefix}/{relative}"]
@@ -210,6 +232,37 @@ def test_publisher_binds_every_remote_operation_to_returned_immutable_revision(t
     assert transport.download_revisions == [result.immutable_revision, result.immutable_revision]
 
 
+@pytest.mark.parametrize("operation", ("resolve", "list", "authenticated_download", "anonymous_download"))
+def test_publisher_retries_bounded_transient_transport_operations(operation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); root = _fixture(module, tmp_path, monkeypatch); transport = Transport(); transport.transient[operation] = 1
+    result = _publish(module, root, transport)
+    assert result.immutable_revision == COMMIT and transport.transient[operation] == 0
+
+
+def test_publisher_reconciles_lost_upload_response_only_after_exact_immutable_readback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); root = _fixture(module, tmp_path, monkeypatch); transport = Transport(); transport.lost_upload_response = True
+    result = _publish(module, root, transport)
+    assert result.immutable_revision == COMMIT and transport.upload_calls == 1 and transport.authenticated_downloads >= 2
+
+
+def test_publisher_rejects_mismatching_ambiguous_upload_without_reupload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); root = _fixture(module, tmp_path, monkeypatch); transport = Transport(); transport.ambiguous_upload_mismatch = True
+    with pytest.raises(module.Public96PublicationError, match="ambiguous upload"):
+        _publish(module, root, transport)
+    assert transport.upload_calls == 1 and not (root / "public96-publication-receipt.json").exists()
+
+
+@pytest.mark.parametrize("relative", ("top-long-seen-0/stage.log", "top-long-seen-0/videos/success/episode0_observation_images_top_rgb.mp4"))
+def test_publisher_rejects_credential_shaped_public_bytes_before_transport(relative: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    module = _module(); root = _fixture(module, tmp_path, monkeypatch); transport = Transport()
+    (root / relative).write_bytes(b"credential=secretvalue123")
+    monkeypatch.setattr(module.evaluator, "verify_result", lambda result, **_kwargs: result["summary"])
+    with pytest.raises(module.Public96PublicationError, match="credential|publication source") as error:
+        _publish(module, root, transport)
+    assert "secretvalue123" not in str(error.value) + capsys.readouterr().out + capsys.readouterr().err
+    assert transport.upload_calls == 0
+
+
 def test_publisher_rejects_root_artifact_mutation_after_verification_before_upload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     module = _module(); root = _fixture(module, tmp_path, monkeypatch); transport = Transport()
     original = module._verify_verifier_receipt
@@ -266,6 +319,30 @@ def test_existing_publication_receipt_requires_exact_schema_and_timestamp(tmp_pa
     receipt.pop("unexpected"); receipt["published_at_utc"] = "not-a-rfc3339-time"
     _write_json(receipt_path, receipt)
     with pytest.raises(module.Public96PublicationError, match="already exists"):
+        _publish(module, root, transport)
+
+
+def test_receipt_rejects_symlinked_parent_and_never_overwrites_race(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); root = _fixture(module, tmp_path, monkeypatch); transport = Transport()
+    real_parent = tmp_path / "real"; real_parent.mkdir(); alias = tmp_path / "alias"; alias.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(module.Public96PublicationError, match="receipt.*symlink|receipt parent"):
+        _publish(module, root, transport, receipt_output=alias / "receipt.json")
+    target = real_parent / "receipt.json"; target.write_text("other process receipt", encoding="utf-8")
+    with pytest.raises(module.Public96PublicationError, match="already exists"):
+        _publish(module, root, transport, receipt_output=target)
+    assert target.read_text(encoding="utf-8") == "other process receipt"
+
+
+def test_receipt_directory_fsync_failure_is_not_reported_as_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); root = _fixture(module, tmp_path, monkeypatch); transport = Transport()
+    original_fsync = module.os.fsync
+    def fail_parent_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(module.os, "fsync", fail_parent_fsync)
+    with pytest.raises(module.Public96PublicationError, match="receipt"):
         _publish(module, root, transport)
 
 
