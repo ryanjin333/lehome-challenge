@@ -121,6 +121,11 @@ def _materialize_artifacts(root: Path, bundle: dict[str, object]) -> None:
                 "groot_config_missing_fields": ["decay_lr_ratio", "num_decay_steps"],
                 "rationale": "inference_only_remove_unsupported_training_scheduler_fields",
                 "original_checkpoint_unchanged": True,
+                "installed_lerobot_package_root": "/opt/python/lerobot",
+                "expected_lerobot_package_tree_sha256": "db3b4e18b166d4bb7fb4354cec82a7fbd15bb24230f9d71269a017c774e0852f",
+                "expected_lerobot_package_file_count": 289,
+                "installed_lerobot_package_tree_sha256": "db3b4e18b166d4bb7fb4354cec82a7fbd15bb24230f9d71269a017c774e0852f",
+                "installed_lerobot_package_file_count": 289,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1430,6 +1435,11 @@ def test_checkpoint_compatibility_shim_sanitizes_only_training_fields_and_preser
                 "groot_config_missing_fields": ["decay_lr_ratio", "num_decay_steps"],
                 "rationale": "inference_only_remove_unsupported_training_scheduler_fields",
                 "original_checkpoint_unchanged": True,
+                "installed_lerobot_package_root": str((fake_packages / "lerobot").resolve()),
+                "expected_lerobot_package_tree_sha256": "",
+                "expected_lerobot_package_file_count": 0,
+                "installed_lerobot_package_tree_sha256": "",
+                "installed_lerobot_package_file_count": 0,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1466,6 +1476,37 @@ def test_checkpoint_compatibility_shim_sanitizes_only_training_fields_and_preser
         "        return GrootConfig(**values)\n",
         encoding="utf-8",
     )
+    dist_info = fake_packages / "lerobot-0.4.3.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: lerobot\nVersion: 0.4.3\n", encoding="utf-8"
+    )
+    package_digest = hashlib.sha256()
+    package_files = sorted(
+        path for path in (fake_packages / "lerobot").rglob("*") if path.is_file()
+    )
+    for path in package_files:
+        relative = path.relative_to(fake_packages / "lerobot").as_posix()
+        package_digest.update(
+            relative.encode()
+            + b"\0"
+            + hashlib.sha256(path.read_bytes()).hexdigest().encode()
+            + b"\n"
+        )
+    package_tree_sha256 = package_digest.hexdigest()
+    receipt_document = json.loads(receipt.read_text(encoding="utf-8"))
+    receipt_document.update(
+        {
+            "expected_lerobot_package_tree_sha256": package_tree_sha256,
+            "expected_lerobot_package_file_count": len(package_files),
+            "installed_lerobot_package_tree_sha256": package_tree_sha256,
+            "installed_lerobot_package_file_count": len(package_files),
+        }
+    )
+    receipt.write_text(
+        json.dumps(receipt_document, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
     driver = tmp_path / "driver.py"
     driver.write_text(
         "import json,sys\n"
@@ -1473,7 +1514,11 @@ def test_checkpoint_compatibility_shim_sanitizes_only_training_fields_and_preser
         "from checkpoint_compatibility import install_checkpoint_config_view\n"
         "checkpoint=Path(sys.argv[1]); sanitized=Path(sys.argv[2]); receipt=Path(sys.argv[3])\n"
         "original=checkpoint.joinpath('config.json').read_bytes()\n"
-        f"install_checkpoint_config_view(checkpoint, sanitized, receipt, expected_config_sha256={hashlib.sha256(raw).hexdigest()!r})\n"
+        "install_checkpoint_config_view("
+        "checkpoint, sanitized, receipt, "
+        f"expected_config_sha256={hashlib.sha256(raw).hexdigest()!r}, "
+        f"expected_package_tree_sha256={package_tree_sha256!r}, "
+        f"expected_package_file_count={len(package_files)!r})\n"
         "from lerobot.configs.policies import PreTrainedConfig\n"
         "try: PreTrainedConfig.from_pretrained(checkpoint.parent,cli_overrides={})\n"
         "except RuntimeError as error: wrong_path='unexpected path' in str(error)\n"
@@ -1571,12 +1616,34 @@ def test_prepare_checkpoint_compatibility_creates_one_exclusive_exact_view(
         "    hidden_size: int = 1024\n",
         encoding="utf-8",
     )
+    digest = hashlib.sha256()
+    package_files = sorted(
+        path for path in (package_root / "lerobot").rglob("*") if path.is_file()
+    )
+    for path in package_files:
+        relative = path.relative_to(package_root / "lerobot").as_posix()
+        digest.update(
+            relative.encode()
+            + b"\0"
+            + hashlib.sha256(path.read_bytes()).hexdigest().encode()
+            + b"\n"
+        )
+
+    class FakeDistribution:
+        version = "0.4.3"
+
+        @staticmethod
+        def locate_file(path: object) -> Path:
+            return package_root / str(path)
+
     monkeypatch.syspath_prepend(str(package_root))
     for name in tuple(sys.modules):
         if name == "lerobot" or name.startswith("lerobot."):
             monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.setattr(gate, "CHECKPOINT_CONFIG_SHA256", hashlib.sha256(raw).hexdigest())
-    monkeypatch.setattr(gate.importlib.metadata, "version", lambda name: "0.4.3")
+    monkeypatch.setattr(gate, "LEROBOT_PACKAGE_TREE_SHA256", digest.hexdigest())
+    monkeypatch.setattr(gate, "LEROBOT_PACKAGE_FILE_COUNT", len(package_files))
+    monkeypatch.setattr(gate.importlib.metadata, "distribution", lambda name: FakeDistribution())
     sanitized = tmp_path / "view"
     receipt_path = tmp_path / "compatibility.json"
 
@@ -1592,5 +1659,87 @@ def test_prepare_checkpoint_compatibility_creates_one_exclusive_exact_view(
         {"key": "num_decay_steps", "value": 4000},
     ]
     assert receipt["lerobot_wheel_sha256"] == "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c"
+    assert receipt["installed_lerobot_package_tree_sha256"] == digest.hexdigest()
+    assert receipt["installed_lerobot_package_file_count"] == len(package_files)
     with pytest.raises(gate.NativeReferenceGateError, match="already exists"):
         gate.prepare_checkpoint_compatibility(checkpoint, sanitized, tmp_path / "second.json")
+
+
+@pytest.mark.parametrize("mutation", ("modified", "extra"))
+def test_prepare_checkpoint_compatibility_rejects_same_version_tampered_distribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    values = {
+        "type": "groot",
+        "num_decay_steps": 4000,
+        "decay_lr_ratio": 0.1,
+    }
+    raw = json.dumps(values, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    (checkpoint / "config.json").write_bytes(raw)
+    distribution_root = tmp_path / "site-packages"
+    module_root = distribution_root / "lerobot/policies/groot"
+    module_root.mkdir(parents=True)
+    for package in (
+        distribution_root / "lerobot",
+        distribution_root / "lerobot/policies",
+        module_root,
+    ):
+        (package / "__init__.py").write_text("", encoding="utf-8")
+    config_module = module_root / "configuration_groot.py"
+    config_module.write_text(
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class GrootConfig:\n"
+        "    type: str = 'groot'\n",
+        encoding="utf-8",
+    )
+
+    def manifest() -> tuple[str, int]:
+        digest = hashlib.sha256()
+        files = sorted(
+            path
+            for path in (distribution_root / "lerobot").rglob("*")
+            if path.is_file()
+        )
+        for path in files:
+            relative = path.relative_to(distribution_root / "lerobot").as_posix()
+            digest.update(
+                relative.encode()
+                + b"\0"
+                + hashlib.sha256(path.read_bytes()).hexdigest().encode()
+                + b"\n"
+            )
+        return digest.hexdigest(), len(files)
+
+    expected_digest, expected_count = manifest()
+    if mutation == "modified":
+        config_module.write_text(config_module.read_text() + "TAMPERED = True\n", encoding="utf-8")
+    else:
+        (distribution_root / "lerobot/unexpected_plugin.py").write_text(
+            "IMPORTABLE = True\n", encoding="utf-8"
+        )
+    monkeypatch.syspath_prepend(str(distribution_root))
+    for name in tuple(sys.modules):
+        if name == "lerobot" or name.startswith("lerobot."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(gate, "CHECKPOINT_CONFIG_SHA256", hashlib.sha256(raw).hexdigest())
+    monkeypatch.setattr(gate, "LEROBOT_PACKAGE_TREE_SHA256", expected_digest, raising=False)
+    monkeypatch.setattr(gate, "LEROBOT_PACKAGE_FILE_COUNT", expected_count, raising=False)
+
+    class FakeDistribution:
+        version = "0.4.3"
+
+        @staticmethod
+        def locate_file(path: object) -> Path:
+            return distribution_root / str(path)
+
+    monkeypatch.setattr(gate.importlib.metadata, "distribution", lambda name: FakeDistribution())
+
+    with pytest.raises(gate.NativeReferenceGateError, match="installed LeRobot package tree"):
+        gate.prepare_checkpoint_compatibility(
+            checkpoint, tmp_path / "view", tmp_path / "compatibility.json"
+        )

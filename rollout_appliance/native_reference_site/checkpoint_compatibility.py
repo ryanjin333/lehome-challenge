@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
+import importlib.metadata
 import json
 from pathlib import Path
+import stat
 from typing import Any
 
 
 EXPECTED_CONFIG_SHA256 = "b7c385bc57456eae603e929b84defb7e991194aade2aad70785e21991e37614c"
 LEROBOT_WHEEL_SHA256 = "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c"
+# Canonical manifest of the exact verified wheel's sorted lerobot/ regular
+# files: relative path, NUL, SHA-256 of real bytes, LF. Runtime-only
+# __pycache__ directories and .pyc files are the sole exclusions.
+LEROBOT_PACKAGE_TREE_SHA256 = "db3b4e18b166d4bb7fb4354cec82a7fbd15bb24230f9d71269a017c774e0852f"
+LEROBOT_PACKAGE_FILE_COUNT = 289
 REMOVED_FIELDS = (
     {"key": "decay_lr_ratio", "value": 0.1},
     {"key": "num_decay_steps", "value": 4000},
@@ -28,12 +36,53 @@ def _resolved_directory(path: Path, label: str) -> Path:
     return path.resolve(strict=True)
 
 
+def _installed_lerobot_identity() -> tuple[Path, str, int]:
+    try:
+        distribution = importlib.metadata.distribution("lerobot")
+        if distribution.version != "0.4.3":
+            raise RuntimeError("installed LeRobot version mismatch")
+        requested_init = Path(distribution.locate_file("lerobot/__init__.py"))
+        if requested_init.is_symlink() or requested_init.parent.is_symlink():
+            raise RuntimeError("installed LeRobot distribution path is unsafe")
+        distribution_init = requested_init.resolve(strict=True)
+    except Exception as error:
+        raise RuntimeError("installed LeRobot distribution identity is unavailable") from error
+    package_root = _resolved_directory(distribution_init.parent, "installed LeRobot package root")
+    digest = hashlib.sha256()
+    count = 0
+    for path in sorted(package_root.rglob("*")):
+        relative = path.relative_to(package_root)
+        metadata = path.lstat()
+        if path.is_symlink():
+            raise RuntimeError("installed LeRobot package tree contains a symlink")
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("installed LeRobot package tree contains an unsafe entry")
+        if "__pycache__" in relative.parts or relative.suffix == ".pyc":
+            continue
+        file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest.update(
+            relative.as_posix().encode("utf-8")
+            + b"\0"
+            + file_sha256.encode("ascii")
+            + b"\n"
+        )
+        count += 1
+    lerobot = importlib.import_module("lerobot")
+    if Path(lerobot.__file__).resolve(strict=True) != distribution_init:
+        raise RuntimeError("imported LeRobot package and distribution are incoherent")
+    return package_root, digest.hexdigest(), count
+
+
 def install_checkpoint_config_view(
     checkpoint_root: Path,
     sanitized_config_root: Path,
     receipt_path: Path,
     *,
     expected_config_sha256: str = EXPECTED_CONFIG_SHA256,
+    expected_package_tree_sha256: str = LEROBOT_PACKAGE_TREE_SHA256,
+    expected_package_file_count: int = LEROBOT_PACKAGE_FILE_COUNT,
 ) -> None:
     """Patch one exact config load while preserving every downstream original path."""
     checkpoint = _resolved_directory(Path(checkpoint_root), "checkpoint root")
@@ -56,11 +105,17 @@ def install_checkpoint_config_view(
         "groot_config_missing_fields",
         "rationale",
         "original_checkpoint_unchanged",
+        "installed_lerobot_package_root",
+        "expected_lerobot_package_tree_sha256",
+        "expected_lerobot_package_file_count",
+        "installed_lerobot_package_tree_sha256",
+        "installed_lerobot_package_file_count",
     }
     if not isinstance(receipt, dict) or set(receipt) != expected_keys:
         raise RuntimeError("compatibility receipt has an unexpected schema")
     raw = _regular_bytes(checkpoint / "config.json", "raw checkpoint config")
     sanitized_raw = _regular_bytes(sanitized / "config.json", "sanitized checkpoint config")
+    package_root, installed_tree_sha256, installed_file_count = _installed_lerobot_identity()
     expected = {
         "schema_version": 1,
         "kind": "lehome_native_reference_checkpoint_compatibility_v1",
@@ -76,11 +131,21 @@ def install_checkpoint_config_view(
         "groot_config_missing_fields": ["decay_lr_ratio", "num_decay_steps"],
         "rationale": "inference_only_remove_unsupported_training_scheduler_fields",
         "original_checkpoint_unchanged": True,
+        "installed_lerobot_package_root": str(package_root),
+        "expected_lerobot_package_tree_sha256": expected_package_tree_sha256,
+        "expected_lerobot_package_file_count": expected_package_file_count,
+        "installed_lerobot_package_tree_sha256": installed_tree_sha256,
+        "installed_lerobot_package_file_count": installed_file_count,
     }
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise RuntimeError("compatibility receipt does not bind the exact config view")
     if receipt["raw_config_sha256"] != expected_config_sha256:
         raise RuntimeError("raw checkpoint config digest is not approved")
+    if (
+        installed_tree_sha256 != expected_package_tree_sha256
+        or installed_file_count != expected_package_file_count
+    ):
+        raise RuntimeError("installed LeRobot package tree does not match official wheel")
 
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.groot.configuration_groot import GrootConfig

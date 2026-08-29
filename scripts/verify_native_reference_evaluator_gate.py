@@ -50,6 +50,11 @@ RUNTIME_IMAGE_REFERENCE = "lehome-rollout:build"
 RUNTIME_IMAGE_ID = "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
 CHECKPOINT_CONFIG_SHA256 = "b7c385bc57456eae603e929b84defb7e991194aade2aad70785e21991e37614c"
 LEROBOT_WHEEL_SHA256 = "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c"
+# Derived from the verified wheel's sorted lerobot/ regular files as
+# ``relative_path + NUL + sha256(file_bytes) + LF``. Only __pycache__ and .pyc
+# are excluded when applying the same manifest algorithm to an installation.
+LEROBOT_PACKAGE_TREE_SHA256 = "db3b4e18b166d4bb7fb4354cec82a7fbd15bb24230f9d71269a017c774e0852f"
+LEROBOT_PACKAGE_FILE_COUNT = 289
 CHECKPOINT_COMPATIBILITY_FIELDS = {
     "decay_lr_ratio": 0.1,
     "num_decay_steps": 4000,
@@ -58,6 +63,74 @@ CHECKPOINT_COMPATIBILITY_FIELDS = {
 
 class NativeReferenceGateError(ValueError):
     """Raised when evidence cannot prove a safe native-reference result."""
+
+
+def _canonical_lerobot_package_tree(root: Path) -> tuple[str, int]:
+    """Hash every package file except inert bytecode/cache artifacts."""
+    requested = Path(root)
+    if requested.is_symlink():
+        raise NativeReferenceGateError("installed LeRobot package tree root is unsafe")
+    package_root = requested.resolve(strict=True)
+    digest = hashlib.sha256()
+    count = 0
+    for path in sorted(package_root.rglob("*")):
+        relative = path.relative_to(package_root)
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise NativeReferenceGateError("installed LeRobot package tree is unreadable") from error
+        if path.is_symlink():
+            raise NativeReferenceGateError("installed LeRobot package tree contains a symlink")
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise NativeReferenceGateError("installed LeRobot package tree contains an unsafe entry")
+        if "__pycache__" in relative.parts or relative.suffix == ".pyc":
+            continue
+        file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest.update(
+            relative.as_posix().encode("utf-8")
+            + b"\0"
+            + file_sha256.encode("ascii")
+            + b"\n"
+        )
+        count += 1
+    return digest.hexdigest(), count
+
+
+def _validate_installed_lerobot_package() -> dict[str, object]:
+    try:
+        distribution = importlib.metadata.distribution("lerobot")
+        version = distribution.version
+        requested_init = Path(distribution.locate_file("lerobot/__init__.py"))
+        if requested_init.is_symlink() or requested_init.parent.is_symlink():
+            raise NativeReferenceGateError("installed LeRobot distribution path is unsafe")
+        distribution_init = requested_init.resolve(strict=True)
+    except Exception as error:
+        raise NativeReferenceGateError("installed LeRobot distribution identity is unavailable") from error
+    if version != LEROBOT_VERSION:
+        raise NativeReferenceGateError("official LeRobot wheel version changed")
+    package_root = distribution_init.parent
+    observed_sha256, observed_count = _canonical_lerobot_package_tree(package_root)
+    if (
+        observed_sha256 != LEROBOT_PACKAGE_TREE_SHA256
+        or observed_count != LEROBOT_PACKAGE_FILE_COUNT
+    ):
+        raise NativeReferenceGateError("installed LeRobot package tree does not match official wheel")
+    try:
+        lerobot = importlib.import_module("lerobot")
+        imported_init = Path(lerobot.__file__).resolve(strict=True)
+    except Exception as error:
+        raise NativeReferenceGateError("installed LeRobot import identity is unavailable") from error
+    if imported_init != distribution_init:
+        raise NativeReferenceGateError("imported LeRobot package and distribution are incoherent")
+    return {
+        "installed_lerobot_package_root": str(package_root),
+        "expected_lerobot_package_tree_sha256": LEROBOT_PACKAGE_TREE_SHA256,
+        "expected_lerobot_package_file_count": LEROBOT_PACKAGE_FILE_COUNT,
+        "installed_lerobot_package_tree_sha256": observed_sha256,
+        "installed_lerobot_package_file_count": observed_count,
+    }
 
 
 @contextmanager
@@ -392,6 +465,7 @@ def prepare_checkpoint_compatibility(
     ):
         raise NativeReferenceGateError("checkpoint compatibility field values changed")
 
+    package_identity = _validate_installed_lerobot_package()
     try:
         from lerobot.policies.groot.configuration_groot import GrootConfig
     except Exception as error:
@@ -405,14 +479,10 @@ def prepare_checkpoint_compatibility(
     ):
         raise NativeReferenceGateError("official GrootConfig field mismatch is not exact")
     try:
-        lerobot_version = importlib.metadata.version("lerobot")
         config_module = importlib.import_module(GrootConfig.__module__)
         groot_origin = Path(config_module.__file__).resolve(strict=True)
     except Exception as error:
         raise NativeReferenceGateError("official LeRobot wheel identity is unavailable") from error
-    if lerobot_version != LEROBOT_VERSION:
-        raise NativeReferenceGateError("official LeRobot wheel version changed")
-
     sanitized_values = dict(values)
     removed = [
         {"key": key, "value": sanitized_values.pop(key)}
@@ -447,13 +517,14 @@ def prepare_checkpoint_compatibility(
         "sanitized_config_sha256": hashlib.sha256(sanitized_raw).hexdigest(),
         "removed_fields": removed,
         "lerobot_distribution": "lerobot",
-        "lerobot_version": lerobot_version,
+        "lerobot_version": LEROBOT_VERSION,
         "lerobot_wheel_filename": "lerobot-0.4.3-py3-none-any.whl",
         "lerobot_wheel_sha256": LEROBOT_WHEEL_SHA256,
         "groot_config_origin": str(groot_origin),
         "groot_config_missing_fields": sorted(CHECKPOINT_COMPATIBILITY_FIELDS),
         "rationale": "inference_only_remove_unsupported_training_scheduler_fields",
         "original_checkpoint_unchanged": True,
+        **package_identity,
     }
     _write_exclusive(Path(receipt_path), receipt)
     return receipt
@@ -1007,6 +1078,9 @@ def _validate_checkpoint_compatibility_receipt(
         "lerobot_distribution", "lerobot_version", "lerobot_wheel_filename",
         "lerobot_wheel_sha256", "groot_config_origin", "groot_config_missing_fields",
         "rationale", "original_checkpoint_unchanged",
+        "installed_lerobot_package_root", "expected_lerobot_package_tree_sha256",
+        "expected_lerobot_package_file_count", "installed_lerobot_package_tree_sha256",
+        "installed_lerobot_package_file_count",
     }
     fixed = {
         "schema_version": 1,
@@ -1023,11 +1097,18 @@ def _validate_checkpoint_compatibility_receipt(
         "groot_config_missing_fields": sorted(CHECKPOINT_COMPATIBILITY_FIELDS),
         "rationale": "inference_only_remove_unsupported_training_scheduler_fields",
         "original_checkpoint_unchanged": True,
+        "expected_lerobot_package_tree_sha256": LEROBOT_PACKAGE_TREE_SHA256,
+        "expected_lerobot_package_file_count": LEROBOT_PACKAGE_FILE_COUNT,
+        "installed_lerobot_package_tree_sha256": LEROBOT_PACKAGE_TREE_SHA256,
+        "installed_lerobot_package_file_count": LEROBOT_PACKAGE_FILE_COUNT,
     }
     if set(receipt) != expected_keys or any(receipt.get(key) != value for key, value in fixed.items()):
         raise NativeReferenceGateError("checkpoint compatibility receipt contract is invalid")
     _absolute_identity_path(receipt.get("checkpoint_root"), "compatibility checkpoint root")
     _absolute_identity_path(receipt.get("groot_config_origin"), "compatibility GrootConfig origin")
+    _absolute_identity_path(
+        receipt.get("installed_lerobot_package_root"), "installed LeRobot package root"
+    )
     _digest(receipt.get("sanitized_config_sha256"), "sanitized checkpoint config")
     sanitized_root = _absolute_identity_path(
         receipt.get("sanitized_config_root"), "sanitized config root"

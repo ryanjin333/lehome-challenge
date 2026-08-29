@@ -259,15 +259,27 @@ mismatch, not permission to edit the seven checkpoint files. After verifying
 the exact pinned raw `config.json` SHA-256, official GrootConfig field set, and
 official `lerobot-0.4.3-py3-none-any.whl` SHA-256
 `b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c`,
-the launcher creates one exclusive ephemeral config view outside both source
-and checkpoint. It removes exactly those two inference-irrelevant scheduler
-keys. A reviewed loader shim uses that view only for the single
+the launcher verifies the installed `lerobot/` package against a canonical
+manifest derived from those exact wheel bytes: 289 files and tree SHA-256
+`db3b4e18b166d4bb7fb4354cec82a7fbd15bb24230f9d71269a017c774e0852f`.
+The manifest sorts relative paths and hashes `path + NUL + file-SHA-256 + LF`.
+It hashes real installed bytes rather than trusting wheel `RECORD`, includes
+all importable source and package data, and ignores exactly runtime-only
+`__pycache__` entries and `.pyc` files. Missing, modified, extra, symlinked, or
+otherwise unsafe package entries fail closed, as does disagreement between the
+installed distribution root and the imported `lerobot` root.
+
+Only after that full-tree check passes does the launcher create one exclusive
+ephemeral config view outside both source and checkpoint. It removes exactly
+those two inference-irrelevant scheduler keys. A reviewed loader shim repeats
+the installed-tree check and uses that view only for the single
 `PreTrainedConfig.from_pretrained` parse; public code resets `pretrained_path`
 to the original checkpoint, and policy weights plus processor sidecars still
 load from the original checkpoint. The immutable compatibility receipt and its
-SHA-256 are bound into preflight, execution evidence, and final verification.
-Any other path, digest, field, value, repeated load, or sanitized parse failure
-stops before an episode.
+SHA-256 bind both expected and observed package-tree digest/count into
+preflight, execution evidence, and final verification. Any other path, digest,
+field, value, package tree, repeated load, or sanitized parse failure stops
+before an episode.
 
 ## After execution
 
