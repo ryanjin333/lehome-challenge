@@ -14,9 +14,13 @@ published `7/8` oracle and its result has been published and read back.
   `d384fe00508acd96ab1c3c5dc265e08261f94b3b`.
 - Source byte-tree SHA-256:
   `eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2`.
-- Policy path: the cached, unmodified `pretrained_model/`.  Its config and
-  primary model digests are verified by the launcher. Do not use the adapted
-  reference-checkpoint view, edit `config.json`, or re-download model weights.
+- Policy path: the cached, unmodified `pretrained_model/`. The launcher pins
+  the exact seven-file set: `config.json`, `model.safetensors`, both processor
+  JSON files, both processor sidecars, and `train_config.json`. It verifies
+  every SHA-256 (including model
+  `d8d91b6c11cb5aa18fe9a48e7da88eae0ec7e5a227a315ba67ee167d645cde76`),
+  rejects extra files and symlinks, and never downloads weights. Do not use an
+  adapted checkpoint view or edit any checkpoint file.
 - Runtime: CPU simulation and CUDA policy inference on the one existing
   rollout VM. The saved processor must prove a 16-action horizon and 12-D
   absolute bimanual action output.
@@ -35,8 +39,30 @@ protected disk. The launcher itself does not create, start, stop, resize, or
 delete provider resources, build an image, or upload to any service.
 
 The operator must provide all inputs explicitly. Cache roots are on the VM
-disk, never the local Mac. `SOURCE_ROOT` may be empty for the initial source
-stage; the other three roots must already contain trusted caches.
+disk, never the local Mac. The provider's RUNNING/attached-disk state is an
+external read-only gate; this launcher records the supplied VM, disk, and
+digest-pinned image identity but never asks the provider to change state.
+
+First stage only the public evaluator source into an empty source root. This
+uses sparse Git with `GIT_LFS_SKIP_SMUDGE=1`, so it fetches no checkpoint
+weight or simulator run:
+
+```bash
+export LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=/mnt/lehome/reference-native/source
+LEHOME_NATIVE_REFERENCE_MODE=source-stage \
+  bash rollout_appliance/run_native_reference_evaluator_gate.sh
+```
+
+Before validation/execution, create and independently preserve an immutable
+cache-trust manifest from a stopped-disk, read-only inventory. This is a
+required fail-closed input, not a digest typed into the command line. The
+manifest has kind `lehome_native_reference_cache_trust_manifest_v1`, binds the
+revision and the observed checkpoint/metadata/assets tree digests, and names
+the SHA-256 of an origin receipt. That origin receipt has kind
+`lehome_native_reference_cache_trust_origin_v1`, binds the manifest SHA-256,
+and records an immutable revision and successful readback. Commit/publish the
+pair before execution; if their exact values do not yet exist, stop for the
+read-only cache inventory rather than inventing a manifest.
 
 ```bash
 export LEHOME_NATIVE_REFERENCE_VM_ID=computeinstance-u00t6xfqhadrcmssa2
@@ -47,16 +73,17 @@ export LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT=/mnt/lehome/reference-native/pret
 export LEHOME_NATIVE_REFERENCE_METADATA_ROOT=/mnt/lehome/reference-native/dataset_meta
 export LEHOME_NATIVE_REFERENCE_ASSETS_ROOT=/mnt/lehome/challenge-assets/Assets
 export LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT=/mnt/lehome/reference-native/native-reference-YYYYMMDDHHMMSS
-export LEHOME_NATIVE_REFERENCE_SOURCE_TREE_SHA256=eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2
-export LEHOME_NATIVE_REFERENCE_CHECKPOINT_TREE_SHA256='<trusted 64-char digest>'
-export LEHOME_NATIVE_REFERENCE_METADATA_TREE_SHA256='<trusted 64-char digest>'
-export LEHOME_NATIVE_REFERENCE_ASSETS_TREE_SHA256='<trusted 64-char digest>'
+export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST=/mnt/lehome/reference-native/cache-trust-manifest.json
+export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_SHA256='<published 64-char digest>'
+export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_ORIGIN_RECEIPT=/mnt/lehome/reference-native/cache-trust-origin.json
 ```
 
-The three non-source tree digests must come from previously recorded trusted
-cache manifests, not a value invented during this invocation. Checkpoint
-preflight verifies the fixed public `config.json`, `model.safetensors`, saved
-preprocessor, saved postprocessor, and processor schema independently.
+The launcher computes cache digests itself and compares them to the immutable
+manifest; it does not trust caller-provided cache-digest environment values.
+It also proves `torch.cuda.is_available()`, records CUDA runtime/device count,
+and binds the exact VM ID, disk ID, image digest, LeRobot version, and policy
+device (`cuda:0`) to `identity.json` and `preflight.json`. Simulation remains
+CPU-only.
 
 Run validation first:
 
@@ -65,10 +92,11 @@ LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY=1 \
   bash rollout_appliance/run_native_reference_evaluator_gate.sh
 ```
 
-Validation refuses missing caches, an unpinned source checkout, changed source
-files, wrong LeRobot version, non-CPU simulation, non-CUDA policy, a stale
-digest, unsafe paths, or an existing output root. It performs no source
-download in validation-only mode.
+Validation refuses missing caches, an unpinned or changed source checkout,
+wrong LeRobot version, a stale cache trust receipt, non-CPU simulation,
+non-CUDA policy, unsafe paths, or an existing output root. It performs no
+source download, simulator execution, CUDA probe, or external write in
+validation-only mode.
 
 ## Approved execution only
 
@@ -80,19 +108,42 @@ LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY=0 \
   bash rollout_appliance/run_native_reference_evaluator_gate.sh
 ```
 
-The initial execution can sparse-checkout only missing public source/config
-files at the pinned revision with `GIT_LFS_SKIP_SMUDGE=1`; it never requests
-`pretrained_model` weights. It records stage logs, videos, per-attempt
-immutable receipts, preflight evidence, `result.json`, and `gate-receipt.json`
-under the new output root. It does not invoke the ordinary N1.7 gateway.
+Execution writes every raw stage log, each expected video, and every
+per-attempt receipt as regular immutable files. The result verifier SHA-256s
+and sizes each of those files before it emits `execution-receipt.json`. Native
+exceptions, known non-finite/cloth-flight/missing-cloth/safety text, an absent
+video, or any changed artifact fail immediately. The public log parser accepts
+the canonical `Episode 1/2: ... Success=True` lines only. It does not invoke
+the ordinary N1.7 gateway.
 
 ## After execution
 
-For a `passed` receipt, publish the entire untouched output directory below a
-new immutable `reference-checks/native-...` prefix on Hugging Face, then
-independently read back every file and record the immutable revision and
-readback receipt. Only after that receipt exists should the operator stop the
-exact rollout VM and record the stopped provider state.
+An exact local `7/8` result is only
+`oracle_matched_pending_finalization`, never final `passed`. Before finalizing,
+produce three independently reviewed JSON receipts, all bound to the execution
+receipt SHA-256:
+
+1. `lehome_native_reference_fidelity_review_v1`: explicit review for all eight
+   attempts (manual video audit is acceptable) that cloth was present and that
+   no cloth flight, non-finite state, or safety failure occurred. Include a
+   digest of the evidence for every attempt.
+2. `lehome_native_reference_hf_readback_v1`: immutable Hugging Face revision,
+   entire-bundle manifest digest, and successful readback.
+3. `lehome_native_reference_vm_stopped_v1`: exact VM/disk/image identity,
+   `STOPPED` state, and the expected attached protected disk.
+
+Then run the pure local finalizer (it uploads nothing):
+
+```bash
+python3 scripts/verify_native_reference_evaluator_gate.py finalize \
+  --execution /mnt/lehome/reference-native/native-reference-YYYYMMDDHHMMSS/execution-receipt.json \
+  --fidelity /mnt/lehome/reference-native/fidelity-review.json \
+  --publication /mnt/lehome/reference-native/hf-readback.json \
+  --stopped /mnt/lehome/reference-native/vm-stopped.json \
+  --receipt /mnt/lehome/reference-native/final-gate-receipt.json
+```
+
+Only that receipt can have `status: passed`.
 
 Any typed stop, missing artifact, mismatch, invalid physics outcome, failed
 readback, or provider discrepancy keeps curriculum collection, success replay,
