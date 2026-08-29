@@ -13,7 +13,7 @@ import sys
 
 import pytest
 from requests import Response
-from requests.exceptions import ConnectionError as RequestsConnectionError, HTTPError
+from requests.exceptions import ConnectionError as RequestsConnectionError, HTTPError, Timeout as RequestsTimeout
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,6 +23,10 @@ COMMIT = "a" * 40
 
 class HubTransientError(RuntimeError):
     """Named exactly like the canonical transport's retryable error."""
+
+
+class HubRateLimitError(RuntimeError):
+    """A known pre-commit response that remains safe to retry."""
 
 
 def _module():
@@ -54,32 +58,37 @@ class FakePublicTransport:
         self.parent_commits: list[str | None] = []
         self.list_revisions: list[str] = []
         self.download_revisions: list[str] = []
+        self.timeout_budgets: list[tuple[str, float | None]] = []
 
-    def resolve_approved_ref(self, *, repository, ref, token):
+    def resolve_approved_ref(self, *, repository, ref, token, timeout_seconds=None):
         assert repository == "owner/public-dataset" and ref == "main" and token == "token"
+        self.timeout_budgets.append(("resolve", timeout_seconds))
         return COMMIT
 
-    def list_tree(self, *, repository, revision, token, remote_prefix=None):
+    def list_tree(self, *, repository, revision, token, remote_prefix=None, timeout_seconds=None):
         assert repository == "owner/public-dataset" and revision == COMMIT
+        self.timeout_budgets.append(("list", timeout_seconds))
         self.list_revisions.append(revision)
         bucket = self.store.get(str(remote_prefix), {})
-        return tuple(_Entry(f"{remote_prefix}/{path}") for path in sorted(bucket))
+        return tuple(_Entry(path) for path in sorted(bucket))
 
-    def upload_files(self, *, repository, revision, source, entries, token, remote_prefix=None, parent_commit=None):
+    def upload_files(self, *, repository, revision, source, entries, token, remote_prefix=None, parent_commit=None, timeout_seconds=None):
         self.upload_calls += 1
+        self.timeout_budgets.append(("upload", timeout_seconds))
         self.parent_commits.append(parent_commit)
         if self.transient_uploads:
             self.transient_uploads -= 1
-            raise HubTransientError("simulated transport reset")
+            raise HubRateLimitError("simulated rate limit")
         if self.fail_access:
             raise PermissionError("bad token")
         bucket = self.store.setdefault(str(remote_prefix), {})
         for entry in entries:
-            bucket[entry.relative_path] = (Path(source) / entry.relative_path).read_bytes()
+            bucket[f"{remote_prefix}/{entry.relative_path}"] = (Path(source) / entry.relative_path).read_bytes()
         return COMMIT
 
-    def download_files(self, *, repository, revision, destination, relative_paths, token, remote_prefix=None):
+    def download_files(self, *, repository, revision, destination, relative_paths, token, remote_prefix=None, timeout_seconds=None):
         assert repository == "owner/public-dataset" and revision == COMMIT
+        self.timeout_budgets.append(("download", timeout_seconds))
         self.download_revisions.append(revision)
         if token is None:
             self.anonymous_downloads += 1
@@ -91,7 +100,7 @@ class FakePublicTransport:
         for path in relative_paths:
             target = Path(destination) / path
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(bucket[path])
+            target.write_bytes(bucket[f"{remote_prefix}/{path}"])
         return COMMIT
 
 
@@ -171,6 +180,11 @@ def _publish_provisional(
         repository="owner/public-dataset", revision="main", token="token", transport=transport,
         **kwargs,
     )
+
+
+def _remote_payloads(transport: FakePublicTransport, prefix: str) -> dict[str, bytes]:
+    base = prefix.removesuffix("/manifests/provisional")
+    return {path.removeprefix(prefix + "/"): payload for path, payload in transport.store[base].items()}
 
 def _bundle(module, tmp_path: Path):
     root = tmp_path / "bundle"
@@ -278,8 +292,8 @@ def test_collection_bundle_rejects_existing_different_bytes_before_upload(tmp_pa
     bundle = _bundle(module, tmp_path)
     prefix = "collection-rounds/fresh-run-publication-test"
     transport.store[prefix] = {
-        "manifests/matrix.json": b"different\n",
-        "seals/final.json": (bundle.root / "seals/final.json").read_bytes(),
+        f"{prefix}/manifests/matrix.json": b"different\n",
+        f"{prefix}/seals/final.json": (bundle.root / "seals/final.json").read_bytes(),
     }
 
     with pytest.raises(module.CollectionPublicationError, match="collision"):
@@ -299,7 +313,8 @@ def test_collection_bundle_retries_only_classified_transient_transport_failures(
     assert transport.upload_calls == 3
 
 
-def test_collection_bundle_retries_real_requests_connection_error(tmp_path: Path) -> None:
+@pytest.mark.parametrize("error_type", (RequestsConnectionError, RequestsTimeout))
+def test_collection_bundle_does_not_retry_an_ambiguous_requests_upload(error_type, tmp_path: Path) -> None:
     module = _module()
 
     class FlakyTransport(FakePublicTransport):
@@ -307,12 +322,13 @@ def test_collection_bundle_retries_real_requests_connection_error(tmp_path: Path
             if self.upload_calls < 2:
                 self.upload_calls += 1
                 self.parent_commits.append(kwargs.get("parent_commit"))
-                raise RequestsConnectionError("network reset")
+                raise error_type("network outcome unknown")
             return super().upload_files(**kwargs)
 
     transport = FlakyTransport()
-    assert module.publish_collection_bundle(_bundle(module, tmp_path), token="token", transport=transport).readback_verified
-    assert transport.upload_calls == 3
+    with pytest.raises(module.CollectionPublicationError, match="upload"):
+        module.publish_collection_bundle(_bundle(module, tmp_path), token="token", transport=transport)
+    assert transport.upload_calls == 1
 
 
 def test_collection_bundle_uses_captured_head_as_compare_and_commit_parent(tmp_path: Path) -> None:
@@ -322,7 +338,8 @@ def test_collection_bundle_uses_captured_head_as_compare_and_commit_parent(tmp_p
     class ConcurrentWriter(FakePublicTransport):
         def upload_files(self, **kwargs):
             assert kwargs["parent_commit"] == COMMIT
-            self.store[str(kwargs["remote_prefix"])] = {"manifests/other.json": b"other"}
+            prefix = str(kwargs["remote_prefix"])
+            self.store[prefix] = {f"{prefix}/manifests/other.json": b"other"}
             raise RuntimeError("parent commit changed")
 
     transport = ConcurrentWriter()
@@ -338,10 +355,11 @@ def test_collection_bundle_reconciles_lost_upload_response_only_when_bytes_match
         def upload_files(self, **kwargs):
             self.upload_calls += 1
             self.parent_commits.append(kwargs.get("parent_commit"))
-            bucket = self.store.setdefault(str(kwargs["remote_prefix"]), {})
+            prefix = str(kwargs["remote_prefix"])
+            bucket = self.store.setdefault(prefix, {})
             for entry in kwargs["entries"]:
-                bucket[entry.relative_path] = (Path(kwargs["source"]) / entry.relative_path).read_bytes()
-            raise RuntimeError("connection outcome unknown")
+                bucket[f"{prefix}/{entry.relative_path}"] = (Path(kwargs["source"]) / entry.relative_path).read_bytes()
+            raise RequestsConnectionError("connection outcome unknown")
 
     transport = LostResponse()
     result = module.publish_collection_bundle(_bundle(module, tmp_path), token="token", transport=transport)
@@ -616,7 +634,7 @@ def test_crash_window_reconcile_fails_closed_for_bad_durable_or_remote_evidence(
         receipt.write_text("{}\n", encoding="utf-8")
     elif fault == "missing-remote":
         remote = transport.store["collection-rounds/fresh-run-publication-test"]
-        remote.pop(next(path for path in remote if path.startswith("seals/")))
+        remote.pop(next(path for path in remote if "/seals/" in path))
     else:
         transport.fail_public_read = True
     transport.upload_calls = 0
@@ -844,6 +862,12 @@ def test_complete_publication_stages_real_task6_recorder_finalizer_and_hub_sync_
     finally:
         replay_ledger.close()
     assert controller._discover_success_replay(config, matrix=replay_path, ledger=root / "replay" / "ledger.sqlite3")["result"] == "complete"
+    task6 = module._authenticate_complete_task6_evidence(root, run_id=run_id, round_id=round_id)
+    assert task6[0] == 1000 and 0 < task6[1] <= 1000
+    assert task6[2:] == (
+        400, 200,
+        {"pant_long": 50, "pant_short": 50, "top_long": 50, "top_short": 50},
+    )
 
     observation = {
         "schema_version": 1, "kind": "lehome_simple_curriculum_verified_gpu_stop_v1",
@@ -897,17 +921,31 @@ def test_provisional_complete_publishes_the_exact_authoritative_pre_stop_matrix(
     receipt = _publish_provisional(module, monkeypatch, root, run_id, round_id, "complete", transport)
 
     prefix = f"collection-rounds/{run_id}/manifests/provisional"
+    receipt_body = dict(receipt)
+    receipt_sha256 = receipt_body.pop("receipt_sha256")
     assert receipt["remote_prefix"] == prefix
+    assert receipt_sha256 == hashlib.sha256(module._canonical(receipt_body)).hexdigest()
     assert receipt["immutable_revision"] == COMMIT
     assert receipt["entry_count"] == len(receipt["entries"])
     assert receipt["readback_verified"] is True and receipt["public_readback_verified"] is True
-    payloads = transport.store[prefix]
-    evidence = json.loads(payloads["manifests/provisional/evidence-manifest.json"])
-    task6 = json.loads(payloads["manifests/provisional/task6-validation.json"])
-    references = json.loads(payloads["manifests/provisional/hub-artifact-references.json"])
+    payloads = _remote_payloads(transport, prefix)
+    published_entries = tuple(
+        module.PublicationEntry(item["relative_path"], item["sha256"], item["byte_size"])
+        for item in receipt["entries"]
+    )
+    assert receipt["bundle_sha256"] == module._entry_digest(published_entries)
+    for item in receipt["entries"]:
+        relative = str(item["relative_path"])
+        raw = transport.store[f"collection-rounds/{run_id}"][f"collection-rounds/{run_id}/{relative}"]
+        assert item["sha256"] == hashlib.sha256(raw).hexdigest()
+        assert item["byte_size"] == len(raw)
+    evidence = json.loads(payloads["evidence-manifest.json"])
+    task6 = json.loads(payloads["task6-validation.json"])
+    references = json.loads(payloads["hub-artifact-references.json"])
     assert evidence["reachable_stages"] == list(PROVISIONAL_STAGES)
     assert evidence["completion_claim"] == "none" and evidence["gpu_stop_verified"] is False
     assert evidence["terminal_chain_head"] == evidence["stage_receipts"][-1]["receipt_sha256"]
+    assert receipt["manifest_sha256"] == hashlib.sha256(module._canonical(evidence)).hexdigest()
     assert task6 == {
         "schema_version": 1, "kind": "lehome_simple_curriculum_task6_validation_v1",
         "terminal_outcome": "complete", "result": "complete", "fresh_valid_outcomes": 1000,
@@ -922,17 +960,18 @@ def test_provisional_complete_publishes_the_exact_authoritative_pre_stop_matrix(
 def test_provisional_shortages_preserve_only_the_reachable_authoritative_evidence(monkeypatch, tmp_path: Path) -> None:
     module = _module()
     fresh_root, fresh_run, fresh_round = _provisional_campaign(
-        module, tmp_path / "fresh", stages=PROVISIONAL_STAGES[:6], fresh=37, replay=0,
+        module, tmp_path / "fresh", stages=PROVISIONAL_STAGES[:3], fresh=37, replay=0,
     )
     fresh_transport = FakePublicTransport()
     fresh = _publish_provisional(
         module, monkeypatch, fresh_root, fresh_run, fresh_round, "insufficient_source_stop", fresh_transport,
     )
     fresh_prefix = str(fresh["remote_prefix"])
-    fresh_evidence = json.loads(fresh_transport.store[fresh_prefix]["manifests/provisional/evidence-manifest.json"])
-    fresh_task6 = json.loads(fresh_transport.store[fresh_prefix]["manifests/provisional/task6-validation.json"])
-    fresh_refs = json.loads(fresh_transport.store[fresh_prefix]["manifests/provisional/hub-artifact-references.json"])
-    assert fresh_evidence["reachable_stages"] == list(PROVISIONAL_STAGES[:6])
+    fresh_payloads = _remote_payloads(fresh_transport, fresh_prefix)
+    fresh_evidence = json.loads(fresh_payloads["evidence-manifest.json"])
+    fresh_task6 = json.loads(fresh_payloads["task6-validation.json"])
+    fresh_refs = json.loads(fresh_payloads["hub-artifact-references.json"])
+    assert fresh_evidence["reachable_stages"] == list(PROVISIONAL_STAGES[:3])
     assert fresh_task6["result"] == "not_complete"
     assert fresh_task6["fresh_reference_count"] == 37 and fresh_task6["replay_accepted_reference_count"] == 0
     assert len(fresh_refs["fresh"]) == 37 and fresh_refs["success_replay"] == []
@@ -940,14 +979,18 @@ def test_provisional_shortages_preserve_only_the_reachable_authoritative_evidenc
     replay_root, replay_run, replay_round = _provisional_campaign(
         module, tmp_path / "replay", stages=PROVISIONAL_STAGES, fresh=1000, replay=73,
     )
+    replay_seal = replay_root / "replay/success-replay-readback-seal.json"
+    replay_payload = json.loads(replay_seal.read_text(encoding="utf-8"))
+    replay_payload["readback_receipts"] = {}
+    _write_json(replay_seal, replay_payload)
     replay_transport = FakePublicTransport()
     replay = _publish_provisional(
         module, monkeypatch, replay_root, replay_run, replay_round, "replay_shortage", replay_transport,
     )
-    replay_payloads = replay_transport.store[str(replay["remote_prefix"])]
-    replay_evidence = json.loads(replay_payloads["manifests/provisional/evidence-manifest.json"])
-    replay_task6 = json.loads(replay_payloads["manifests/provisional/task6-validation.json"])
-    replay_refs = json.loads(replay_payloads["manifests/provisional/hub-artifact-references.json"])
+    replay_payloads = _remote_payloads(replay_transport, str(replay["remote_prefix"]))
+    replay_evidence = json.loads(replay_payloads["evidence-manifest.json"])
+    replay_task6 = json.loads(replay_payloads["task6-validation.json"])
+    replay_refs = json.loads(replay_payloads["hub-artifact-references.json"])
     assert replay_evidence["reachable_stages"] == list(PROVISIONAL_STAGES)
     assert replay_task6["fresh_reference_count"] == 1000
     assert replay_task6["replay_accepted_reference_count"] == 73
@@ -960,14 +1003,29 @@ def test_provisional_shortages_preserve_only_the_reachable_authoritative_evidenc
     fidelity = _publish_provisional(
         module, monkeypatch, fidelity_root, fidelity_run, fidelity_round, "fidelity_stop", fidelity_transport,
     )
-    fidelity_payloads = fidelity_transport.store[str(fidelity["remote_prefix"])]
-    fidelity_evidence = json.loads(fidelity_payloads["manifests/provisional/evidence-manifest.json"])
-    fidelity_refs = json.loads(fidelity_payloads["manifests/provisional/hub-artifact-references.json"])
+    fidelity_payloads = _remote_payloads(fidelity_transport, str(fidelity["remote_prefix"]))
+    fidelity_evidence = json.loads(fidelity_payloads["evidence-manifest.json"])
+    fidelity_refs = json.loads(fidelity_payloads["hub-artifact-references.json"])
     assert fidelity_evidence["reachable_stages"] == list(PROVISIONAL_STAGES[:3])
     assert len(fidelity_refs["fresh"]) == 4 and fidelity_refs["success_replay"] == []
 
 
-@pytest.mark.parametrize("length", (0, 1, 3, 7, 11))
+@pytest.mark.parametrize("length", (10, 11))
+def test_provisional_replay_shortage_accepts_each_real_terminal_prefix(monkeypatch, tmp_path: Path, length: int) -> None:
+    module = _module()
+    root, run_id, round_id = _provisional_campaign(
+        module, tmp_path, stages=PROVISIONAL_STAGES[:length], fresh=2, replay=1,
+    )
+    if length == 10:
+        (root / "replay/success-replay-readback-seal.json").unlink()
+        shutil.rmtree(root / "replay/hf-sync-receipts")
+    receipt = _publish_provisional(
+        module, monkeypatch, root, run_id, round_id, "replay_shortage", FakePublicTransport(),
+    )
+    assert receipt["readback_verified"] is True
+
+
+@pytest.mark.parametrize("length", range(12))
 def test_provisional_infrastructure_stops_preserve_each_real_stage_prefix(monkeypatch, tmp_path: Path, length: int) -> None:
     module = _module()
     root, run_id, round_id = _provisional_campaign(
@@ -977,16 +1035,19 @@ def test_provisional_infrastructure_stops_preserve_each_real_stage_prefix(monkey
 
     receipt = _publish_provisional(module, monkeypatch, root, run_id, round_id, "infrastructure_stop", transport)
 
-    payloads = transport.store[str(receipt["remote_prefix"])]
-    evidence = json.loads(payloads["manifests/provisional/evidence-manifest.json"])
-    task6 = json.loads(payloads["manifests/provisional/task6-validation.json"])
-    references = json.loads(payloads["manifests/provisional/hub-artifact-references.json"])
+    payloads = _remote_payloads(transport, str(receipt["remote_prefix"]))
+    evidence = json.loads(payloads["evidence-manifest.json"])
+    task6 = json.loads(payloads["task6-validation.json"])
+    references = json.loads(payloads["hub-artifact-references.json"])
     assert evidence["reachable_stages"] == list(PROVISIONAL_STAGES[:length])
     assert task6["fresh_reference_count"] == 2 and task6["replay_accepted_reference_count"] == 1
     assert len(references["fresh"]) == 2 and len(references["success_replay"]) == 1
 
 
-@pytest.mark.parametrize("tamper", ("body", "predecessor", "task6-count", "fresh-reference", "replay-reference"))
+@pytest.mark.parametrize(
+    "tamper",
+    ("body", "predecessor", "task6-count", "fresh-reference", "replay-reference", "replay-accepted-ids"),
+)
 def test_provisional_fails_closed_for_tampered_authoritative_evidence(monkeypatch, tmp_path: Path, tamper: str) -> None:
     module = _module()
     root, run_id, round_id = _provisional_campaign(
@@ -1008,12 +1069,18 @@ def test_provisional_fails_closed_for_tampered_authoritative_evidence(monkeypatc
     elif tamper == "replay-reference":
         path = root / "replay/success-replay-readback-seal.json"
         payload = json.loads(path.read_text(encoding="utf-8")); payload["readback_receipts"]["replay-0000"]["receipt_sha256"] = "bad"; _write_json(path, payload)
+    elif tamper == "replay-accepted-ids":
+        path = root / "replay/success-replay-readback-seal.json"
+        payload = json.loads(path.read_text(encoding="utf-8")); payload["accepted_attempt_ids"][0] = "different-attempt"; _write_json(path, payload)
 
     with pytest.raises(module.CollectionPublicationError):
         _publish_provisional(module, monkeypatch, root, run_id, round_id, "complete", FakePublicTransport())
 
 
-@pytest.mark.parametrize("fault", ("extra", "missing", "changed-readback", "returned-revision", "lost-response"))
+@pytest.mark.parametrize(
+    "fault",
+    ("extra", "missing", "changed-readback", "returned-revision", "readback-revision", "lost-response"),
+)
 def test_provisional_fails_closed_for_non_identical_or_unpinned_remote_state(monkeypatch, tmp_path: Path, fault: str) -> None:
     module = _module()
     root, run_id, round_id = _provisional_campaign(module, tmp_path, stages=(), fresh=0, replay=0)
@@ -1028,6 +1095,10 @@ def test_provisional_fails_closed_for_non_identical_or_unpinned_remote_state(mon
             if fault == "lost-response": raise RuntimeError("connection outcome unknown")
             return "main" if fault == "returned-revision" else response
 
+        def download_files(self, **kwargs):
+            response = super().download_files(**kwargs)
+            return "b" * 40 if fault == "readback-revision" else response
+
     transport = FaultyTransport()
     if fault == "lost-response":
         # The publisher may reconcile an ambiguous upload only when the
@@ -1036,6 +1107,21 @@ def test_provisional_fails_closed_for_non_identical_or_unpinned_remote_state(mon
     else:
         with pytest.raises(module.CollectionPublicationError):
             _publish_provisional(module, monkeypatch, root, run_id, round_id, "infrastructure_stop", transport)
+
+
+@pytest.mark.parametrize("field", ("receipt_sha256", "bundle_sha256", "manifest_sha256"))
+def test_provisional_local_receipt_is_immutable_and_rejects_tampering(monkeypatch, tmp_path: Path, field: str) -> None:
+    module = _module()
+    root, run_id, round_id = _provisional_campaign(module, tmp_path, stages=(), fresh=0, replay=0)
+    transport = FakePublicTransport()
+    _publish_provisional(module, monkeypatch, root, run_id, round_id, "infrastructure_stop", transport)
+    receipt_path = root / "reports/provisional-publication.json"
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    payload[field] = "f" * 64
+    _write_json(receipt_path, payload)
+
+    with pytest.raises(module.CollectionPublicationError, match="collision"):
+        _publish_provisional(module, monkeypatch, root, run_id, round_id, "infrastructure_stop", transport)
 
 
 @pytest.mark.parametrize("phase", ("upload", "authenticated-readback", "anonymous-readback", "retry"))
@@ -1064,3 +1150,64 @@ def test_provisional_deadline_bounds_upload_readback_and_retries(monkeypatch, tm
             module, monkeypatch, root, run_id, round_id, "infrastructure_stop", ExpiringTransport(),
             timeout_seconds=1.0, monotonic=lambda: now[0],
         )
+
+
+def test_provisional_passes_only_the_remaining_budget_to_each_transport_operation(monkeypatch, tmp_path: Path) -> None:
+    module = _module()
+    root, run_id, round_id = _provisional_campaign(module, tmp_path, stages=(), fresh=0, replay=0)
+    now = [2.0]
+
+    class BudgetTransport(FakePublicTransport):
+        def _advance(self, result):
+            now[0] += 0.1
+            return result
+
+        def resolve_approved_ref(self, **kwargs):
+            return self._advance(super().resolve_approved_ref(**kwargs))
+
+        def list_tree(self, **kwargs):
+            return self._advance(super().list_tree(**kwargs))
+
+        def upload_files(self, **kwargs):
+            return self._advance(super().upload_files(**kwargs))
+
+        def download_files(self, **kwargs):
+            return self._advance(super().download_files(**kwargs))
+
+    transport = BudgetTransport()
+    _publish_provisional(
+        module, monkeypatch, root, run_id, round_id, "infrastructure_stop", transport,
+        timeout_seconds=1.0, monotonic=lambda: now[0],
+    )
+
+    budgets = [budget for _operation, budget in transport.timeout_budgets]
+    assert budgets
+    assert all(isinstance(budget, float) and 0 < budget <= 1.0 for budget in budgets)
+    assert budgets == sorted(budgets, reverse=True)
+
+
+def test_huggingface_readback_recomputes_remaining_budget_before_every_file(monkeypatch, tmp_path: Path) -> None:
+    module = _module()
+    now = [10.0]
+    observed_budgets: list[float] = []
+
+    class FakeLibrary:
+        @staticmethod
+        def hf_hub_download(**kwargs):
+            observed_budgets.append(kwargs["etag_timeout"])
+            now[0] += 0.4
+            destination = Path(kwargs["local_dir"]) / kwargs["filename"]
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"fixture")
+            return str(destination)
+
+    transport = module.HuggingFacePublicDatasetTransport(timeout_seconds=30.0, monotonic=lambda: now[0])
+    monkeypatch.setattr(transport, "_library", lambda: FakeLibrary())
+    with pytest.raises(module.CollectionPublicationError, match="timeout"):
+        transport.download_files(
+            repository="owner/public-dataset", revision=COMMIT, destination=tmp_path,
+            relative_paths=("one.json", "two.json", "three.json", "four.json"), token="token",
+            remote_prefix="collection-rounds/fresh-run-publication-test", timeout_seconds=1.0,
+        )
+
+    assert observed_budgets == pytest.approx([1.0, 0.6, 0.2])

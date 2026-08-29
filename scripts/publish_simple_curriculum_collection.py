@@ -97,20 +97,26 @@ class _RemoteEntry:
 class PublicCollectionTransport(Protocol):
     """Small deterministic seam for public collection upload/readback."""
 
-    def resolve_approved_ref(self, *, repository: str, ref: str, token: str) -> str: ...
+    def resolve_approved_ref(
+        self, *, repository: str, ref: str, token: str,
+        timeout_seconds: float | None = None,
+    ) -> str: ...
 
     def list_tree(
-        self, *, repository: str, revision: str, token: str, remote_prefix: str | None = None,
+        self, *, repository: str, revision: str, token: str,
+        remote_prefix: str | None = None, timeout_seconds: float | None = None,
     ) -> Sequence[object]: ...
 
     def upload_files(
         self, *, repository: str, revision: str, source: Path, entries: Sequence[PublicationEntry],
         token: str, remote_prefix: str | None = None, parent_commit: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> str: ...
 
     def download_files(
         self, *, repository: str, revision: str, destination: Path, relative_paths: Sequence[str],
         token: str | None, remote_prefix: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> str: ...
 
 
@@ -377,22 +383,41 @@ def _deadline_guard(
         raise CollectionPublicationError(f"{label} timeout")
 
 
+def _remaining_seconds(*, deadline: float | None, monotonic: Callable[[], float], label: str) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise CollectionPublicationError(f"{label} timeout")
+    return remaining
+
+
 def _retry(
     operation, *, label: str, max_attempts: int, deadline: float | None = None,
     monotonic: Callable[[], float] = time.monotonic, deadline_label: str = "publication",
+    reconcile_ambiguous: bool = False,
 ):
     if type(max_attempts) is not int or not 1 <= max_attempts <= 3:
         raise CollectionPublicationError("publication retry limit is invalid")
     for attempt in range(max_attempts):
         _deadline_guard(deadline=deadline, monotonic=monotonic, label=deadline_label)
         try:
-            result = operation()
+            budget = _remaining_seconds(deadline=deadline, monotonic=monotonic, label=deadline_label)
+            result = operation(budget) if budget is not None else operation()
             _deadline_guard(deadline=deadline, monotonic=monotonic, label=deadline_label)
             return result
         except Exception as error:  # noqa: BLE001 - transport boundary is intentionally narrow below
             if isinstance(error, CollectionPublicationError):
                 raise
             _deadline_guard(deadline=deadline, monotonic=monotonic, label=deadline_label)
+            if reconcile_ambiguous and not (
+                isinstance(error, HubRateLimitError) or type(error).__name__ == "HubRateLimitError"
+            ):
+                # Any transport reset may have happened after the commit was
+                # accepted.  Only an explicit 429 is known to be pre-commit;
+                # every other upload error is reconciled against a newly
+                # resolved immutable tree before another write is considered.
+                raise CollectionPublicationError(f"{label} failed") from None
             if not _is_transient(error) or attempt + 1 == max_attempts:
                 raise CollectionPublicationError(f"{label} failed") from None
     raise AssertionError("retry loop is exhausted")
@@ -424,10 +449,10 @@ def _verify_download(
     destination = Path(tempfile.mkdtemp(prefix="lehome-curriculum-readback-", dir=bundle.root.parent))
     try:
         observed = _retry(
-            lambda: transport.download_files(
+            lambda budget=None: transport.download_files(
                 repository=bundle.repository, revision=revision, destination=destination,
                 relative_paths=tuple(item.relative_path for item in entries), token=token,
-                remote_prefix=prefix,
+                remote_prefix=prefix, **({"timeout_seconds": budget} if budget is not None else {}),
             ),
             label="public readback" if token is None else "readback", max_attempts=3,
             deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
@@ -478,7 +503,10 @@ def _publish_staged_collection_bundle(
         raise CollectionPublicationError("collection publication prefix is invalid")
     expected = {entry.relative_path for entry in entries}
     head = _retry(
-        lambda: transport.resolve_approved_ref(repository=bundle.repository, ref=bundle.revision, token=token),
+        lambda budget=None: transport.resolve_approved_ref(
+            repository=bundle.repository, ref=bundle.revision, token=token,
+            **({"timeout_seconds": budget} if budget is not None else {}),
+        ),
         label="publication ref resolution", max_attempts=max_attempts,
         deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
     )
@@ -486,7 +514,10 @@ def _publish_staged_collection_bundle(
         raise CollectionPublicationError("publication ref did not resolve to an immutable commit")
     existing = _tree_files(
         _retry(
-            lambda: transport.list_tree(repository=bundle.repository, revision=head, token=token, remote_prefix=prefix),
+            lambda budget=None: transport.list_tree(
+                repository=bundle.repository, revision=head, token=token, remote_prefix=prefix,
+                **({"timeout_seconds": budget} if budget is not None else {}),
+            ),
             label="collection collision check", max_attempts=max_attempts,
             deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
         ),
@@ -509,20 +540,23 @@ def _publish_staged_collection_bundle(
     else:
         try:
             revision = _retry(
-                lambda: transport.upload_files(
+                lambda budget=None: transport.upload_files(
                     repository=bundle.repository, revision=bundle.revision, source=bundle.root,
                     entries=entries, token=token, remote_prefix=prefix, parent_commit=head,
+                    **({"timeout_seconds": budget} if budget is not None else {}),
                 ),
                 label="collection upload", max_attempts=max_attempts,
                 deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
+                reconcile_ambiguous=True,
             )
         except CollectionPublicationError as upload_error:
             # A lost response or a concurrent branch update is ambiguous.  Do
             # not retry a mutable upload blind: re-open the current immutable
             # tree and allow only the exact byte-identical prefix to resume.
             current_head = _retry(
-                lambda: transport.resolve_approved_ref(
+                lambda budget=None: transport.resolve_approved_ref(
                     repository=bundle.repository, ref=bundle.revision, token=token,
+                    **({"timeout_seconds": budget} if budget is not None else {}),
                 ),
                 label="publication ref reconciliation", max_attempts=max_attempts,
                 deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
@@ -531,8 +565,10 @@ def _publish_staged_collection_bundle(
                 raise CollectionPublicationError("publication ref reconciliation did not resolve an immutable commit") from None
             current = _tree_files(
                 _retry(
-                    lambda: transport.list_tree(
-                        repository=bundle.repository, revision=current_head, token=token, remote_prefix=prefix,
+                    lambda budget=None: transport.list_tree(
+                        repository=bundle.repository, revision=current_head, token=token,
+                        remote_prefix=prefix,
+                        **({"timeout_seconds": budget} if budget is not None else {}),
                     ),
                     label="collection collision reconciliation", max_attempts=max_attempts,
                     deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
@@ -556,7 +592,11 @@ def _publish_staged_collection_bundle(
             raise CollectionPublicationError("collection upload did not return an immutable commit")
         observed = _tree_files(
             _retry(
-                lambda: transport.list_tree(repository=bundle.repository, revision=revision, token=token, remote_prefix=prefix),
+                lambda budget=None: transport.list_tree(
+                    repository=bundle.repository, revision=revision, token=token,
+                    remote_prefix=prefix,
+                    **({"timeout_seconds": budget} if budget is not None else {}),
+                ),
                 label="collection tree verification", max_attempts=max_attempts,
                 deadline=deadline, monotonic=monotonic, deadline_label=deadline_label,
             ),
@@ -1054,11 +1094,34 @@ def _provisional_stages(root: Path, outcome: str) -> tuple[str, ...]:
         "curriculum-a", "curriculum-b", "fresh-report", "replay-matrix",
         "success-replay",
     )
-    if outcome in {"complete", "replay_shortage"}:
+    def present(stage: str) -> bool:
+        path = root / "stage-receipts" / f"{stage}.json"
+        return path.exists() or path.is_symlink()
+
+    if outcome == "complete":
         return all_stages
-    if outcome in {
-        "fidelity_stop", "insufficient_source_stop", "infrastructure_stop", "infrastructure_stop_failure",
-    }:
+    if outcome == "replay_shortage":
+        # The real producer can terminate at replay-matrix when fewer than 400
+        # rows are materialized, or at success-replay after all 400 attempts
+        # settle below the 200-accepted cap.  Those are the only two honest
+        # replay-shortage prefixes.
+        prefix: list[str] = []
+        for stage in all_stages:
+            if (root / "stage-receipts" / f"{stage}.json").is_file():
+                prefix.append(stage)
+            else:
+                break
+        if len(prefix) not in {10, 11} or any(present(stage) for stage in all_stages[len(prefix):]):
+            raise CollectionPublicationError("replay-shortage provisional evidence has no reachable terminal prefix")
+        return tuple(prefix)
+    if outcome in {"fidelity_stop", "insufficient_source_stop"}:
+        required = all_stages[:3]
+        if any(not (root / "stage-receipts" / f"{stage}.json").is_file() for stage in required):
+            raise CollectionPublicationError("terminal provisional evidence lacks the first-100 stage prefix")
+        if any(present(stage) for stage in all_stages[3:]):
+            raise CollectionPublicationError("terminal provisional stage receipts extend beyond the first-100 prefix")
+        return required
+    if outcome in {"infrastructure_stop", "infrastructure_stop_failure"}:
         # Infrastructure may interrupt after any completed stage.  Preserve
         # the whole reachable prefix rather than collapsing it to an empty
         # handoff and losing predecessor evidence.
@@ -1066,7 +1129,7 @@ def _provisional_stages(root: Path, outcome: str) -> tuple[str, ...]:
         for stage in all_stages:
             if (root / "stage-receipts" / f"{stage}.json").is_file(): prefix.append(stage)
             else: break
-        if any((root / "stage-receipts" / f"{stage}.json").exists() for stage in all_stages[len(prefix):]):
+        if any(present(stage) for stage in all_stages[len(prefix):]):
             raise CollectionPublicationError("infrastructure provisional stage receipts are not a reachable prefix")
         return tuple(prefix)
     raise CollectionPublicationError("terminal outcome has no provisional evidence shape")
@@ -1111,7 +1174,9 @@ def _provisional_hub_references(root: Path, *, run_id: str, round_id: str, outco
     """
     fresh: list[dict[str, object]] = []
     manifest_path = root / "reports/fresh-terminal-artifacts.json"
-    manifest = _json_object(manifest_path, label="fresh terminal artifact manifest") if manifest_path.is_file() else {"entries": []}
+    manifest = _json_object(manifest_path, label="fresh terminal artifact manifest") if (
+        manifest_path.exists() or manifest_path.is_symlink()
+    ) else {"entries": []}
     for entry in manifest.get("entries", []):
         if not isinstance(entry, Mapping): raise CollectionPublicationError("fresh artifact reference is malformed")
         attempt = entry.get("attempt_id"); artifact_root = entry.get("finalized_artifact_root")
@@ -1135,20 +1200,40 @@ def _provisional_hub_references(root: Path, *, run_id: str, round_id: str, outco
         raise CollectionPublicationError("provisional evidence lacks exactly 1,000 fresh Hub references")
     replay: list[dict[str, object]] = []
     replay_path = root / "replay/success-replay-readback-seal.json"
-    replay_seal = _json_object(replay_path, label="success replay readback seal") if replay_path.is_file() else {"readback_receipts": {}}
+    replay_seal = _json_object(replay_path, label="success replay readback seal") if (
+        replay_path.exists() or replay_path.is_symlink()
+    ) else {
+        "accepted_attempt_ids": [], "readback_receipts": {},
+    }
     source = replay_seal.get("readback_receipts")
-    if not isinstance(source, Mapping): raise CollectionPublicationError("success replay references are malformed")
-    for attempt, item in source.items():
-        if not isinstance(attempt, str) or not isinstance(item, Mapping): raise CollectionPublicationError("success replay reference is malformed")
+    accepted = replay_seal.get("accepted_attempt_ids")
+    if not isinstance(source, Mapping) or not isinstance(accepted, list) or any(not isinstance(item, str) for item in accepted):
+        raise CollectionPublicationError("success replay references are malformed")
+    attempts = tuple(accepted)
+    if len(set(attempts)) != len(attempts):
+        raise CollectionPublicationError("success replay references are duplicated")
+    if source and set(source) != set(attempts):
+        raise CollectionPublicationError("success replay receipt map does not match accepted attempts")
+    for attempt in attempts:
+        item = source.get(attempt, {})
+        if not isinstance(item, Mapping): raise CollectionPublicationError("success replay reference is malformed")
         receipt = root / "replay" / "hf-sync-receipts" / f"{attempt}.sync.json"
         sync = _json_object(receipt, label="success replay Hub sync receipt")
-        reference = {"attempt_id": attempt, "repository": "ryanjin333/lehome-groot-n17-rollouts", "prefix": f"rollout-rounds/{round_id}-replay/{attempt}", "immutable_revision": item.get("immutable_revision"), "episode_sha256": item.get("episode_sha256"), "local_sync_receipt_sha256": item.get("receipt_sha256")}
+        reference = {
+            "attempt_id": attempt,
+            "repository": "ryanjin333/lehome-groot-n17-rollouts",
+            "prefix": f"rollout-rounds/{round_id}-replay/{attempt}",
+            "immutable_revision": sync.get("immutable_revision"),
+            "episode_sha256": sync.get("episode_sha256"),
+            "local_sync_receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+        }
         if (
             sync.get("attempt_id") != attempt or sync.get("run_id") != run_id or sync.get("round_id") != f"{round_id}-replay"
             or sync.get("readback_verified") is not True or sync.get("repository") != reference["repository"]
-            or sync.get("remote_prefix") != reference["prefix"] or sync.get("immutable_revision") != reference["immutable_revision"]
-            or sync.get("episode_sha256") != reference["episode_sha256"]
-            or reference["local_sync_receipt_sha256"] != hashlib.sha256(receipt.read_bytes()).hexdigest()
+            or sync.get("remote_prefix") != reference["prefix"]
+            or (source and (item.get("immutable_revision") != reference["immutable_revision"]
+                           or item.get("episode_sha256") != reference["episode_sha256"]
+                           or item.get("receipt_sha256") != reference["local_sync_receipt_sha256"]))
             or not isinstance(reference["immutable_revision"], str) or _COMMIT.fullmatch(reference["immutable_revision"]) is None
             or not isinstance(reference["episode_sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", reference["episode_sha256"]) is None
         ):
@@ -1218,7 +1303,7 @@ def publish_provisional_collection(
         bundle = CollectionPublicationBundle(staging, run_id, repository, revision, tuple(sorted(files)))
         result = publish_collection_bundle(
             bundle, token=token, transport=transport, deadline=deadline, monotonic=monotonic,
-            deadline_label="provisional publication", remote_prefix=f"collection-rounds/{run_id}/manifests/provisional",
+            deadline_label="provisional publication", remote_prefix=f"collection-rounds/{run_id}",
         )
         if monotonic() > deadline:
             raise CollectionPublicationError("provisional publication timeout")
@@ -1240,10 +1325,35 @@ def publish_provisional_collection(
 class HuggingFacePublicDatasetTransport:
     """Lazy public-dataset transport; anonymous readback is a separate path."""
 
-    def __init__(self, *, timeout_seconds: float = 30.0) -> None:
+    def __init__(
+        self, *, timeout_seconds: float = 30.0,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         if type(timeout_seconds) not in (int, float) or timeout_seconds <= 0:
             raise ValueError("Hub timeout is invalid")
+        if not callable(monotonic):
+            raise ValueError("Hub monotonic clock is invalid")
         self.timeout_seconds = float(timeout_seconds)
+        self._monotonic = monotonic
+
+    def _operation_deadline(self, timeout_seconds: float | None) -> float | None:
+        if timeout_seconds is None:
+            return None
+        if type(timeout_seconds) not in (int, float) or timeout_seconds <= 0:
+            raise CollectionPublicationError("public Hub operation timeout is exhausted")
+        return self._monotonic() + float(timeout_seconds)
+
+    def _call_timeout(self, deadline: float | None) -> float:
+        if deadline is None:
+            return self.timeout_seconds
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise CollectionPublicationError("public Hub operation timeout is exhausted")
+        return min(self.timeout_seconds, remaining)
+
+    def _operation_complete(self, deadline: float | None) -> None:
+        if deadline is not None and self._monotonic() > deadline:
+            raise CollectionPublicationError("public Hub operation timeout is exhausted")
 
     def _library(self):
         try:
@@ -1284,19 +1394,25 @@ class HuggingFacePublicDatasetTransport:
     def _api(self, token: str | bool):
         return self._library().HfApi(token=token)
 
-    def resolve_approved_ref(self, *, repository: str, ref: str, token: str) -> str:
+    def resolve_approved_ref(self, *, repository: str, ref: str, token: str, timeout_seconds: float | None = None) -> str:
+        deadline = self._operation_deadline(timeout_seconds)
         try:
-            return self._revision(self._api(token).repo_info(
-                repo_id=repository, repo_type="dataset", revision=ref, token=token, timeout=self.timeout_seconds,
+            revision = self._revision(self._api(token).repo_info(
+                repo_id=repository, repo_type="dataset", revision=ref, token=token,
+                timeout=self._call_timeout(deadline),
             ))
+            self._operation_complete(deadline)
+            return revision
         except Exception as error:  # noqa: BLE001 - normalized at boundary
             self._raise_transport(error)
             raise AssertionError("unreachable")
 
-    def list_tree(self, *, repository: str, revision: str, token: str, remote_prefix: str | None = None) -> tuple[_RemoteEntry, ...]:
+    def list_tree(self, *, repository: str, revision: str, token: str, remote_prefix: str | None = None, timeout_seconds: float | None = None) -> tuple[_RemoteEntry, ...]:
         if _COMMIT.fullmatch(revision) is None or not remote_prefix:
             raise CollectionPublicationError("public tree request is not immutable and bounded")
+        deadline = self._operation_deadline(timeout_seconds)
         try:
+            self._call_timeout(deadline)
             entries = self._api(token).list_repo_tree(
                 repo_id=repository, repo_type="dataset", revision=revision, token=token,
                 path_in_repo=remote_prefix, recursive=True, expand=False,
@@ -1313,6 +1429,8 @@ class HuggingFacePublicDatasetTransport:
                 else:
                     raise CollectionPublicationError("public Hub tree entry is invalid")
                 result.append(_RemoteEntry(path, entry_type))
+                self._call_timeout(deadline)
+            self._operation_complete(deadline)
             return tuple(result)
         except CollectionPublicationError:
             raise
@@ -1322,33 +1440,45 @@ class HuggingFacePublicDatasetTransport:
             self._raise_transport(error)
             raise AssertionError("unreachable")
 
-    def upload_files(self, *, repository: str, revision: str, source: Path, entries: Sequence[PublicationEntry], token: str, remote_prefix: str | None = None, parent_commit: str | None = None) -> str:
+    def upload_files(self, *, repository: str, revision: str, source: Path, entries: Sequence[PublicationEntry], token: str, remote_prefix: str | None = None, parent_commit: str | None = None, timeout_seconds: float | None = None) -> str:
         if not remote_prefix or _COMMIT.fullmatch(parent_commit or "") is None:
             raise CollectionPublicationError("public upload prefix is missing")
+        deadline = self._operation_deadline(timeout_seconds)
         try:
+            self._call_timeout(deadline)
             result = self._api(token).upload_folder(
                 repo_id=repository, repo_type="dataset", revision=revision, folder_path=str(source),
                 allow_patterns=[entry.relative_path for entry in entries], path_in_repo=remote_prefix, token=token,
                 parent_commit=parent_commit,
             )
-            return self._revision(result)
+            immutable_revision = self._revision(result)
+            self._operation_complete(deadline)
+            return immutable_revision
         except Exception as error:  # noqa: BLE001
             self._raise_transport(error)
             raise AssertionError("unreachable")
 
-    def download_files(self, *, repository: str, revision: str, destination: Path, relative_paths: Sequence[str], token: str | None, remote_prefix: str | None = None) -> str:
+    def download_files(self, *, repository: str, revision: str, destination: Path, relative_paths: Sequence[str], token: str | None, remote_prefix: str | None = None, timeout_seconds: float | None = None) -> str:
         if _COMMIT.fullmatch(revision) is None or not remote_prefix:
             raise CollectionPublicationError("public download request is not immutable and bounded")
         library = self._library()
         hub_token: str | bool = token if token is not None else False
+        deadline = self._operation_deadline(timeout_seconds)
         try:
             for relative in relative_paths:
                 remote = f"{remote_prefix}/{relative}"
+                # One readback contains one network transaction per file.  A
+                # single fixed timeout here would multiply the caller's total
+                # deadline by the entry count, so recompute the shrinking
+                # budget before every transaction and fail before the next one
+                # once it is exhausted.
+                call_timeout = self._call_timeout(deadline)
                 downloaded = Path(library.hf_hub_download(
                     repo_id=repository, repo_type="dataset", revision=revision, filename=remote,
                     token=hub_token, local_dir=destination, local_dir_use_symlinks=False,
-                    etag_timeout=self.timeout_seconds,
+                    etag_timeout=call_timeout,
                 ))
+                self._operation_complete(deadline)
                 source = destination / remote
                 target = destination / relative
                 if downloaded != source or source.is_symlink() or not source.is_file():
