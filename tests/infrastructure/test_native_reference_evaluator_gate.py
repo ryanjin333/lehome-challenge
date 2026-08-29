@@ -318,8 +318,20 @@ def test_host_runtime_probe_ignores_shadow_scripts_package_in_caller_cwd(tmp_pat
         (package / "__init__.py").write_text(body, encoding="utf-8")
     (source / "scripts" / "eval.py").write_text("PINNED = True\n", encoding="utf-8")
     (shadow / "scripts" / "eval.py").write_text("SHADOW = True\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-qm", "pinned"], check=True)
+    tree_before = hashlib.sha256(
+        b"".join(path.read_bytes() for path in sorted(source.rglob("*")) if path.is_file() and ".git" not in path.parts)
+    ).hexdigest()
     receipt = tmp_path / "host-runtime.json"
-    environment = {**os.environ, "PYTHONPATH": str(shadow)}
+    environment = {
+        **os.environ,
+        "PYTHONPATH": str(shadow),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
 
     result = subprocess.run(
         [
@@ -342,6 +354,19 @@ def test_host_runtime_probe_ignores_shadow_scripts_package_in_caller_cwd(tmp_pat
     runtime = json.loads(receipt.read_text(encoding="utf-8"))
     assert Path(runtime["scripts_eval_origin"]) == (source / "scripts" / "eval.py").resolve()
     assert shadow.resolve() not in Path(runtime["scripts_eval_origin"]).parents
+    tree_after = hashlib.sha256(
+        b"".join(path.read_bytes() for path in sorted(source.rglob("*")) if path.is_file() and ".git" not in path.parts)
+    ).hexdigest()
+    assert tree_after == tree_before
+    assert subprocess.check_output(
+        ["git", "-C", str(source), "status", "--porcelain", "--untracked-files=all"],
+        text=True,
+    ) == ""
+    assert not any(source.rglob("__pycache__"))
+    probe_launcher = LAUNCHER.read_text(encoding="utf-8").split(
+        "probe_host_runtime() {", 1
+    )[1].split("\n}", 1)[0]
+    assert "PYTHONDONTWRITEBYTECODE=1" in probe_launcher
 
 
 def _write_test_canonical_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, Path]:

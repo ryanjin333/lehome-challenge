@@ -225,7 +225,7 @@ PY
 }
 
 probe_host_runtime() {
-  (cd -- "$RUNTIME_REPO_ROOT" && PYTHONSAFEPATH=1 PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT" \
+  (cd -- "$RUNTIME_REPO_ROOT" && PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT" \
     "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" probe-host-runtime \
       --source-root "$SOURCE_ROOT" --receipt "$OUTPUT_ROOT/host-runtime.json" >/dev/null) \
     || fail "native reference host runtime probe failed"
