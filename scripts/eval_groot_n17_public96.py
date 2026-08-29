@@ -301,6 +301,13 @@ def _artifact(path: Path, root: Path) -> dict[str, str]:
     return {"relative_path": path.relative_to(root).as_posix(), "sha256": sha256_file(path)}
 
 
+def _video_artifact(path: Path, root: Path) -> dict[str, str]:
+    """Describe a rendered video only after proving it is a material file."""
+    if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+        raise Public96ContractError("required public96 video is missing, unsafe, or empty")
+    return _artifact(path, root)
+
+
 def _write_new_json(path: Path, value: Mapping[str, object]) -> None:
     if path.exists() or path.is_symlink():
         raise Public96ContractError("public96 output path already exists or is unsafe")
@@ -359,7 +366,9 @@ def _write_invalid_evidence(*, output_root: Path, stages: Sequence[Stage], matri
     _write_new_json(output_root / "verifier-receipt.json", receipt)
 
 
-def _verified_artifact(value: object, *, root: Path, expected_path: str | None = None) -> None:
+def _verified_artifact(
+    value: object, *, root: Path, expected_path: str | None = None, require_nonempty: bool = False,
+) -> None:
     if not isinstance(value, Mapping) or set(value) != {"relative_path", "sha256"}:
         raise Public96ContractError("artifact descriptor is invalid")
     relative, digest = value.get("relative_path"), value.get("sha256")
@@ -373,6 +382,8 @@ def _verified_artifact(value: object, *, root: Path, expected_path: str | None =
         raise Public96ContractError("artifact relative path does not bind its episode")
     candidate = root.joinpath(*relative_path.parts)
     path = validate_output_path(root, candidate)
+    if require_nonempty and path.stat().st_size <= 0:
+        raise Public96ContractError("artifact video is empty")
     if path != candidate or sha256_file(path) != digest:
         raise Public96ContractError("artifact file digest mismatch")
 
@@ -446,7 +457,7 @@ def _summary_from_episodes(episodes: Sequence[Mapping[str, object]], *, assigned
     def finalize(counts: Counter[str]) -> dict[str, object]:
         scored = counts["successes"] + counts["policy_failures"]
         invalid = counts["infrastructure_invalid"] + counts["fidelity_invalid"]
-        return {"episodes": counts["episodes"], "successes": counts["successes"], "policy_failures": counts["policy_failures"], "infrastructure_invalid": counts["infrastructure_invalid"], "fidelity_invalid": counts["fidelity_invalid"], "invalid_episodes": invalid, "scored_episodes": scored, "success_rate": (counts["successes"] / scored if scored else None)}
+        return {"episodes": counts["episodes"], "successes": counts["successes"], "policy_failures": counts["policy_failures"], "infrastructure_invalid": counts["infrastructure_invalid"], "fidelity_invalid": counts["fidelity_invalid"], "invalid_episodes": invalid, "scored_episodes": scored, "success_rate": (None if status == "invalid" else (counts["successes"] / scored if scored else None))}
     summarized = {category: finalize(categories[category]) for category in CATEGORIES}
     overall_counts = Counter()
     for counts in categories.values(): overall_counts.update(counts)
@@ -508,7 +519,7 @@ def verify_result(
         folder = "success" if success else "failure"
         for camera, descriptor in artifacts["videos"].items():
             key = f"observation.images.{camera}"
-            _verified_artifact(descriptor, root=output_root, expected_path=f"{stage.stage_id}/videos/{folder}/{video_filename_for_key(source_index, key)}")
+            _verified_artifact(descriptor, root=output_root, expected_path=f"{stage.stage_id}/videos/{folder}/{video_filename_for_key(source_index, key)}", require_nonempty=True)
         evidence = stage_evidence.setdefault(stage.stage_id, {"log": artifacts["log"], "receipt": artifacts["receipt"], "episodes": {}})
         if evidence["log"] != artifacts["log"] or evidence["receipt"] != artifacts["receipt"]:
             raise Public96ContractError("stage result artifacts disagree between sequential episodes")
@@ -549,6 +560,36 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def await_authenticated_policy_server_ready(
+    *, port: int, token: str, readiness_timeout: float, request_timeout: float,
+    process: subprocess.Popen[str] | None = None,
+) -> None:
+    """Require a token-bound policy ping before an Isaac stage may start."""
+    if not 1 <= port <= 65535 or len(token) < 32 or readiness_timeout <= 0 or request_timeout <= 0:
+        raise Public96ContractError("policy server readiness arguments are invalid")
+    from scripts.eval_policy.groot_policy import PolicyServerClient
+
+    deadline = time.monotonic() + readiness_timeout
+    delay = 0.05
+    while True:
+        if process is not None and process.poll() is not None:
+            raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
+        client = PolicyServerClient(f"tcp://127.0.0.1:{port}", token, request_timeout)
+        try:
+            client.ping()
+            if process is None or process.poll() is None:
+                return
+        except Exception:
+            pass
+        finally:
+            client.close()
+        now = time.monotonic()
+        if now >= deadline:
+            raise Public96ContractError("N1.7 policy server did not pass token-bound readiness")
+        time.sleep(min(delay, max(0.0, deadline - now)))
+        delay = min(delay * 2, 0.5)
+
+
 def run(args: argparse.Namespace) -> dict[str, object]:
     stages = load_frozen_matrix(args.matrix, args.matrix_sha256); matrix_digest = _matrix_digest(args.matrix, args.matrix_sha256)
     identity = validate_checkpoint_identity(_read_json(args.checkpoint_identity_receipt, "checkpoint identity receipt"), args.policy_path)
@@ -586,8 +627,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 if server.poll() is not None or not readiness_receipt.is_file():
                     raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
                 readiness = _validate_readiness_payload(_read_json(readiness_receipt, "policy server readiness"), policy_root=args.policy_path)
-                if server.poll() is not None:
-                    raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
+                await_authenticated_policy_server_ready(
+                    port=args.policy_server_port, token=token, readiness_timeout=10.0,
+                    request_timeout=1.0, process=server,
+                )
             except Public96ContractError as error:
                 startup_failure = error
         if startup_failure is None:
@@ -613,17 +656,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         source_index = int(metric["episode_index"]) - 1
                         cameras = {camera: stage_root / "videos" / folder / video_filename_for_key(source_index, f"observation.images.{camera}") for camera in ("top_rgb", "left_rgb", "right_rgb")}
                         episode_videos.append(cameras)
-                        for video in cameras.values(): _artifact(video, output_root)
+                        for video in cameras.values(): _video_artifact(video, output_root)
                     stage_receipt = {
                         "kind": "lehome_groot_n17_public96_stage_receipt_v1", "schema_version": 1,
                         "stage": _stage_identity(stage), "command": command,
                         "child_completion_sentinel": child, "log": _artifact(log, output_root),
-                        "episodes": [{"episode_index": metric["episode_index"], "videos": {camera: _artifact(video, output_root) for camera, video in cameras.items()}} for metric, cameras in zip(metrics, episode_videos, strict=True)],
+                        "episodes": [{"episode_index": metric["episode_index"], "videos": {camera: _video_artifact(video, output_root) for camera, video in cameras.items()}} for metric, cameras in zip(metrics, episode_videos, strict=True)],
                         "policy_server_readiness": {"artifact": _artifact(readiness_receipt, output_root), "binding": readiness},
                     }
                     receipt_path = stage_root / "stage-receipt.json"; _write_new_json(receipt_path, stage_receipt)
                     for metric, cameras in zip(metrics, episode_videos, strict=True):
-                        episodes.append({"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_index": metric["episode_index"], "outcome": "success" if metric["success"] else "policy_failure", "success": metric["success"], "return": metric["return"], "length": metric["length"], "artifacts": {"log": _artifact(log, output_root), "videos": {camera: _artifact(video, output_root) for camera, video in cameras.items()}, "receipt": _artifact(receipt_path, output_root)}})
+                        episodes.append({"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_index": metric["episode_index"], "outcome": "success" if metric["success"] else "policy_failure", "success": metric["success"], "return": metric["return"], "length": metric["length"], "artifacts": {"log": _artifact(log, output_root), "videos": {camera: _video_artifact(video, output_root) for camera, video in cameras.items()}, "receipt": _artifact(receipt_path, output_root)}})
                 except (OSError, subprocess.SubprocessError, Public96ContractError) as error:
                     invalids.append({"stage_id": stage.stage_id, "reason": str(error)})
                     for episode_index in stage.episode_indices:

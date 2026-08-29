@@ -5,14 +5,17 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
 
 from scripts.eval_groot_n17_public96 import (
+    CATEGORIES,
     CHECKPOINT,
     CheckpointIdentityError,
     Public96ContractError,
+    await_authenticated_policy_server_ready,
     build_stage_command,
     load_frozen_matrix,
     run,
@@ -304,8 +307,9 @@ def test_invalid_summary_counts_partial_rows_and_has_no_startup_score() -> None:
         {"category": "top_long", "outcome": "fidelity_invalid"},
     ]
     summary = _summary_from_episodes(episodes, assigned_episodes=96, status="invalid")
-    assert summary["overall"] == {"episodes": 4, "successes": 1, "policy_failures": 1, "infrastructure_invalid": 1, "fidelity_invalid": 1, "invalid_episodes": 2, "scored_episodes": 2, "success_rate": 0.5}
+    assert summary["overall"] == {"episodes": 4, "successes": 1, "policy_failures": 1, "infrastructure_invalid": 1, "fidelity_invalid": 1, "invalid_episodes": 2, "scored_episodes": 2, "success_rate": None}
     assert summary["categories"]["top_long"] == summary["overall"]
+    assert all(summary["categories"][category]["success_rate"] is None for category in CATEGORIES)
     assert summary["assigned_episodes"] == 96 and summary["status"] == "invalid"
 
 
@@ -339,6 +343,25 @@ def test_result_verification_rejects_mutated_real_camera_artifact(tmp_path: Path
     first_video = tmp_path / result["episodes"][0]["artifacts"]["videos"]["top_rgb"]["relative_path"]
     first_video.write_bytes(b"tampered")
     with pytest.raises(Public96ContractError, match="digest"):
+        verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path, policy_artifact_verifier=lambda _: CHECKPOINT["artifact_sha256"])
+
+
+def test_result_verification_rejects_zero_byte_camera_even_when_its_digest_is_rebound(tmp_path: Path) -> None:
+    stages = load_frozen_matrix(MATRIX, MATRIX_SHA256)
+    policy_root = _policy_root_with_canonical_artifact(tmp_path)
+    result = _valid_result(stages, tmp_path, policy_root)
+    descriptor = result["episodes"][0]["artifacts"]["videos"]["top_rgb"]
+    video = tmp_path / descriptor["relative_path"]
+    video.write_bytes(b"")
+    descriptor["sha256"] = hashlib.sha256(b"").hexdigest()
+
+    _rewrite_stage_receipt(
+        result,
+        tmp_path,
+        lambda receipt: receipt["episodes"][0]["videos"]["top_rgb"].update(sha256=descriptor["sha256"]),
+    )
+
+    with pytest.raises(Public96ContractError, match="empty"):
         verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path, policy_artifact_verifier=lambda _: CHECKPOINT["artifact_sha256"])
 
 
@@ -453,6 +476,43 @@ def test_real_video_filename_contract_uses_saver_dot_replacement() -> None:
         video_filename_for_key(0, "observation.top_rgb")
 
 
+def test_authenticated_readiness_uses_a_real_token_checked_loopback_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    zmq = pytest.importorskip("zmq")
+    if "torch" not in sys.modules:
+        torch_stub = SimpleNamespace(Tensor=object)
+        monkeypatch.setitem(sys.modules, "torch", torch_stub)
+    from scripts.eval_policy.groot_policy import pack_policy_server_message, unpack_policy_server_message
+
+    context = zmq.Context()
+    server = context.socket(zmq.REP)
+    server.linger = 0
+    server.bind("tcp://127.0.0.1:*")
+    endpoint = server.getsockopt_string(zmq.LAST_ENDPOINT)
+    port = int(endpoint.rsplit(":", 1)[1])
+    token = "t" * 48
+    received: list[object] = []
+
+    def serve_one_ping() -> None:
+        try:
+            message = unpack_policy_server_message(server.recv())
+            received.append(message)
+            assert message == {"endpoint": "ping", "data": {}, "api_token": token}
+            server.send(pack_policy_server_message({"status": "ok", "message": "Server is running"}))
+        finally:
+            server.close()
+            context.term()
+
+    thread = threading.Thread(target=serve_one_ping)
+    thread.start()
+    try:
+        await_authenticated_policy_server_ready(port=port, token=token, readiness_timeout=2.0, request_timeout=1.0)
+    finally:
+        thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert received == [{"endpoint": "ping", "data": {}, "api_token": token}]
+
+
 def test_raw_checker_uses_untransformed_mesh_and_unscaled_thresholds() -> None:
     transformed = [[0.0, 0.0, 0.0]] * 6
     raw = [[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [200.0, 0.0, 0.0], [300.0, 0.0, 0.0], [400.0, 0.0, 0.0], [500.0, 0.0, 0.0]]
@@ -564,6 +624,7 @@ def test_synthetic_successful_run_writes_complete_result_and_verifier_receipt(tm
         return Server()
     monkeypatch.setattr(evaluator.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(evaluator.subprocess, "run", fake_run)
+    monkeypatch.setattr(evaluator, "await_authenticated_policy_server_ready", lambda **_: None)
     monkeypatch.setattr(evaluator.time, "sleep", lambda _: None)
     monkeypatch.setenv("LEHOME_GROOT_N17_PUBLIC96_POLICY_TOKEN", "x" * 32)
     output_root = tmp_path / "run"
@@ -571,6 +632,53 @@ def test_synthetic_successful_run_writes_complete_result_and_verifier_receipt(tm
     assert len(result["episodes"]) == 96
     assert (output_root / "result.json").is_file()
     assert (output_root / "verifier-receipt.json").is_file()
+
+
+def test_run_blocks_all_stages_when_authenticated_readiness_probe_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    args, output_root, identity = _runtime_inputs(tmp_path, monkeypatch, output_name="probe-failure")
+    stage_commands: list[list[str]] = []
+
+    class Server:
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            pass
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def kill(self) -> None:
+            pass
+
+    def fake_popen(command: list[str], *popen_args: object, **kwargs: object) -> Server:
+        receipt = Path(command[command.index("--readiness-receipt") + 1])
+        receipt.write_text(json.dumps({
+            "kind": "lehome_groot_n17_public96_policy_server_readiness_v1",
+            "artifact_sha256": CHECKPOINT["artifact_sha256"],
+            "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"],
+            "model_path": str(args.policy_path.resolve()), "device": "cuda:0",
+            "adapter": "nvidia_gr00t_policy_server_public96_v1",
+            "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
+        }), encoding="utf-8")
+        return Server()
+
+    def no_stage(command: list[str], **kwargs: object) -> object:
+        stage_commands.append(command)
+        raise AssertionError("a failed authenticated readiness probe must not launch a stage")
+
+    reason = "N1.7 policy server did not pass token-bound readiness"
+    monkeypatch.setattr(evaluator.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(evaluator.subprocess, "run", no_stage)
+    monkeypatch.setattr(evaluator, "await_authenticated_policy_server_ready", lambda **_: (_ for _ in ()).throw(Public96ContractError(reason)))
+
+    with pytest.raises(Public96ContractError, match=reason):
+        run(args)
+
+    assert stage_commands == []
+    _assert_pre_stage_invalid_evidence(output_root, identity, reason)
 
 
 def test_policy_server_construction_failure_emits_all_unstarted_invalid_assignments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -629,6 +737,7 @@ def test_policy_server_pre_stage_failure_emits_all_unstarted_invalid_assignments
 
     monkeypatch.setattr(evaluator.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(evaluator.subprocess, "run", no_stage)
+    monkeypatch.setattr(evaluator, "await_authenticated_policy_server_ready", lambda **_: None)
     monkeypatch.setattr(evaluator.time, "sleep", lambda _: None)
 
     reason = "N1.7 policy server exited before public96 evaluation" if mode == "exited" else "policy server readiness does not bind the pinned N1.7 policy"
