@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import hashlib
 import importlib.util
 import json
@@ -7,7 +8,7 @@ import os
 from pathlib import Path
 import sys
 import threading
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -38,6 +39,89 @@ from scripts.groot_n17_public96_raw_checker import (
 ROOT = Path(__file__).parents[1]
 MATRIX = ROOT / "configs" / "eval_groot_n17_public96_reference.json"
 MATRIX_SHA256 = ROOT / "configs" / "eval_groot_n17_public96_reference.json.sha256"
+
+
+def test_public96_stage_launches_simulation_before_task_and_evaluation_imports(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Warp-backed evaluation may only import after Isaac has booted."""
+    import scripts.eval_groot_n17_public96_stage as stage
+
+    stage = importlib.reload(stage)
+    events: list[str] = []
+    launched = False
+
+    class Parser:
+        def set_defaults(self, **kwargs: object) -> None:
+            events.append(f"defaults:{kwargs['policy_server_endpoint']}")
+
+        def parse_args(self, argv: list[str]) -> SimpleNamespace:
+            events.append(f"parse:{' '.join(argv)}")
+            return SimpleNamespace(headless=True)
+
+    parser = Parser()
+
+    def launch(_: object) -> object:
+        nonlocal launched
+        launched = True
+        events.append("launch")
+        return object()
+
+    evaluator = ModuleType("scripts.eval")
+    evaluator.setup_eval_parser = lambda: parser
+    evaluator.AppLauncher = SimpleNamespace(add_app_launcher_args=lambda value: events.append("launcher-args"))
+    evaluator.launch_app_from_args = launch
+    evaluator.common = SimpleNamespace(close_app=lambda _: events.append("close"))
+    monkeypatch.setitem(sys.modules, "scripts.eval", evaluator)
+
+    evaluation = ModuleType("scripts.utils.evaluation")
+
+    def evaluate(args: object, simulation_app: object) -> None:
+        assert launched
+        assert getattr(args, "headless") is True
+        assert simulation_app is not None
+        events.append("evaluate")
+
+    evaluation.eval = evaluate
+    utilities = ModuleType("scripts.utils")
+    utilities.evaluation = evaluation
+    monkeypatch.setitem(sys.modules, "scripts.utils", utilities)
+    monkeypatch.setitem(sys.modules, "scripts.utils.evaluation", evaluation)
+
+    bedroom = ModuleType("lehome.tasks.bedroom")
+    tasks = ModuleType("lehome.tasks")
+    tasks.bedroom = bedroom
+    lehome = ModuleType("lehome")
+    lehome.tasks = tasks
+    monkeypatch.setitem(sys.modules, "lehome", lehome)
+    monkeypatch.setitem(sys.modules, "lehome.tasks", tasks)
+    monkeypatch.setitem(sys.modules, "lehome.tasks.bedroom", bedroom)
+    monkeypatch.setattr(stage, "install_raw_checker_overlay", lambda: events.append("overlay") or {"overlay_id": stage.RAW_CHECKER_OVERLAY_ID})
+
+    original_import = builtins.__import__
+
+    def guarded_import(name: str, globals=None, locals=None, fromlist=(), level: int = 0):
+        if name == "lehome.tasks.bedroom" or (name == "scripts.utils" and "evaluation" in fromlist):
+            assert launched, f"{name} imported before SimulationApp launch"
+            events.append(f"import:{name}")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    assert stage.main([
+        "--public96_raw_checker_overlay", stage.RAW_CHECKER_OVERLAY_ID,
+        "--policy_server_endpoint", "http://127.0.0.1:9117",
+        "--policy_server_token_env", "PUBLIC96_TOKEN",
+        "--policy_server_request_timeout", "5",
+        "--public96_runtime_policy_sha256", "e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa",
+        "--headless",
+    ]) == 0
+
+    assert events == [
+        "overlay", "launcher-args", "defaults:http://127.0.0.1:9117", "parse:--headless", "launch",
+        "import:lehome.tasks.bedroom", "import:scripts.utils", "evaluate", "close",
+    ]
+    assert "PUBLIC96_STAGE_COMPLETE" in capsys.readouterr().out
 
 
 def _identity_receipt(policy_root: Path) -> dict[str, object]:
