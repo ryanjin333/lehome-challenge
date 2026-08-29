@@ -11,7 +11,9 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import sys
+import time
 from typing import Mapping, Sequence
+from urllib.request import urlopen
 
 
 SOURCE_REPOSITORY = "theo-zhou/lehome-groot-submission-4"
@@ -28,6 +30,8 @@ _DISK = re.compile(r"^computedisk-[a-z0-9]+$")
 _IMAGE = re.compile(r"^[^\s]+@sha256:[0-9a-f]{64}$")
 _EPISODE_LINE = re.compile(r"Episode\s+(\d+)/2:.*?Success=(True|False)")
 _KNOWN_INVALID = re.compile(r"(?:traceback|non[- ]?finite|cloth[ _-]?flight|missing cloth|safety failure|cuda error)", re.IGNORECASE)
+PUBLIC_CACHE_REPOSITORY = "ryanjin333/lehome-groot-n17-rollouts"
+PROVIDER_SOURCE_IMAGE_ID = "computeimage-u00zf6w3yf72gakhcy"
 
 
 class NativeReferenceGateError(ValueError):
@@ -43,6 +47,98 @@ def _canonical_bytes(value: object) -> bytes:
 
 def canonical_sha256(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def fetch_public_cache_manifest(
+    revision: str,
+    path: str,
+    *,
+    downloader: object | None = None,
+) -> tuple[dict[str, object], bytes]:
+    """Read the exact cache manifest anonymously from its immutable HF path."""
+    if _COMMIT.fullmatch(revision) is None:
+        raise NativeReferenceGateError("cache manifest revision is not immutable")
+    relative = _safe_path(path, "cache manifest path")
+    if not relative.startswith("reference-checks/"):
+        raise NativeReferenceGateError("cache manifest path is outside reference-checks")
+    url = f"https://huggingface.co/datasets/{PUBLIC_CACHE_REPOSITORY}/resolve/{revision}/{relative}?download=true"
+    try:
+        if downloader is None:
+            with urlopen(url, timeout=30) as response:
+                raw = response.read()
+        else:
+            raw = downloader(url)  # type: ignore[operator]
+    except Exception as error:
+        raise NativeReferenceGateError("immutable cache manifest readback failed") from error
+    if not isinstance(raw, bytes):
+        raise NativeReferenceGateError("immutable cache manifest readback is not bytes")
+    try:
+        manifest = _object(json.loads(raw), "cache manifest")
+    except (UnicodeError, json.JSONDecodeError, NativeReferenceGateError) as error:
+        raise NativeReferenceGateError("immutable cache manifest is invalid") from error
+    expected = {
+        "schema_version", "kind", "source_repository", "immutable_revision", "path",
+        "checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256",
+    }
+    if set(manifest) != expected or manifest.get("schema_version") != 1 or manifest.get("kind") != "lehome_native_reference_cache_trust_manifest_v2" or manifest.get("source_repository") != PUBLIC_CACHE_REPOSITORY or manifest.get("immutable_revision") != revision or manifest.get("path") != relative:
+        raise NativeReferenceGateError("immutable cache manifest identity is invalid")
+    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256"):
+        _digest(manifest.get(key), f"cache manifest {key}")
+    return manifest, raw
+
+
+def validate_public_cache_bindings(manifest: Mapping[str, object], *, checkpoint_tree_sha256: str, metadata_tree_sha256: str, assets_tree_sha256: str) -> None:
+    expected = (checkpoint_tree_sha256, metadata_tree_sha256, assets_tree_sha256)
+    if any(_HEX.fullmatch(value) is None for value in expected) or tuple(manifest.get(key) for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256")) != expected:
+        raise NativeReferenceGateError("immutable cache manifest does not bind observed caches")
+
+
+def capture_provider_observation(provider: object, *, expected_state: str) -> dict[str, object]:
+    """Capture only an exact existing Nebius instance observation."""
+    if expected_state not in {"RUNNING", "STOPPED"}:
+        raise NativeReferenceGateError("provider evidence state is invalid")
+    try:
+        from scripts.finalize_simple_curriculum_collection import (
+            EXACT_IMAGE_ID,
+            EXACT_INSTANCE_ID,
+            EXACT_INSTANCE_NAME,
+            PROTECTED_DISK_ID,
+            _validate_instance,
+        )
+        raw = provider.get(EXACT_INSTANCE_ID)  # type: ignore[attr-defined]
+        observed = _validate_instance(raw)
+    except Exception as error:
+        raise NativeReferenceGateError("provider exact-instance readback failed") from error
+    if observed.get("state") != expected_state:
+        raise NativeReferenceGateError("provider observation has the wrong instance state")
+    body = {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_provider_observation_v1",
+        "vm_id": EXACT_INSTANCE_ID,
+        "vm_name": EXACT_INSTANCE_NAME,
+        "disk_id": PROTECTED_DISK_ID,
+        "provider_source_image_id": EXACT_IMAGE_ID,
+        "state": expected_state,
+        "captured_unix_seconds": int(time.time()),
+        "provider_response_sha256": canonical_sha256(observed["raw"]),
+    }
+    return validate_provider_observation(body, expected_state=expected_state)
+
+
+def validate_provider_observation(document: object, *, expected_state: str) -> dict[str, object]:
+    if expected_state not in {"RUNNING", "STOPPED"}:
+        raise NativeReferenceGateError("provider evidence state is invalid")
+    receipt = _object(document, "provider observation")
+    expected = {"schema_version", "kind", "vm_id", "vm_name", "disk_id", "provider_source_image_id", "state", "captured_unix_seconds", "provider_response_sha256"}
+    if set(receipt) != expected or receipt.get("schema_version") != 1 or receipt.get("kind") != "lehome_native_reference_provider_observation_v1" or receipt.get("vm_id") != "computeinstance-u00t6xfqhadrcmssa2" or receipt.get("vm_name") != "lehome-rollout" or receipt.get("disk_id") != "computedisk-u00pbe55crxy7jr56x" or receipt.get("provider_source_image_id") != PROVIDER_SOURCE_IMAGE_ID or receipt.get("state") != expected_state:
+        raise NativeReferenceGateError("provider observation is not the exact protected VM state")
+    _digest(receipt.get("provider_response_sha256"), "provider response")
+    captured = receipt.get("captured_unix_seconds")
+    if type(captured) is not int or captured <= 0:
+        raise NativeReferenceGateError("provider observation capture time is invalid")
+    if expected_state == "RUNNING" and not 0 <= time.time() - captured <= 900:
+        raise NativeReferenceGateError("provider RUNNING observation is not fresh")
+    return receipt
 
 
 def _object(value: object, label: str) -> dict[str, object]:
@@ -106,14 +202,14 @@ def oracle_attempts() -> tuple[dict[str, object], ...]:
 def _validate_identity(value: object) -> dict[str, object]:
     identity = _object(value, "identity")
     fixed = {"source_repository": SOURCE_REPOSITORY, "source_revision": SOURCE_REVISION, "source_tree_sha256": SOURCE_TREE_SHA256, "lerobot_version": LEROBOT_VERSION, "policy_class": POLICY_CLASS, "policy_device": "cuda:0", "simulator_device": "cpu", "task_description": TASK_DESCRIPTION, "action_horizon": 16, "action_dimension": 12, "success_checker": SUCCESS_CHECKER, "cuda_available": True}
-    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "image"}
+    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "image"}
     if set(identity) != {*fixed, *variable}:
         raise NativeReferenceGateError("identity has an unexpected schema")
     for key, expected in fixed.items():
         if identity.get(key) != expected:
             label = "LeRobot" if key == "lerobot_version" else key
             raise NativeReferenceGateError(f"identity {label} does not match the native contract")
-    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256"):
+    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256"):
         _digest(identity.get(key), f"identity {key}")
     if type(identity["cuda_device_count"]) is not int or identity["cuda_device_count"] < 1 or not isinstance(identity["cuda_runtime"], str) or not identity["cuda_runtime"]:
         raise NativeReferenceGateError("identity does not prove CUDA availability")
@@ -123,6 +219,8 @@ def _validate_identity(value: object) -> dict[str, object]:
         raise NativeReferenceGateError("identity disk ID is invalid")
     if not isinstance(identity["image"], str) or _IMAGE.fullmatch(identity["image"]) is None:
         raise NativeReferenceGateError("identity image is not digest pinned")
+    if identity["provider_source_image_id"] != PROVIDER_SOURCE_IMAGE_ID:
+        raise NativeReferenceGateError("identity provider source image does not match the protected VM")
     return identity
 
 
@@ -132,11 +230,15 @@ def _validate_attempt(value: object, expected: Mapping[str, object], root: Path 
         raise NativeReferenceGateError("attempt has an unexpected schema")
     if any(attempt.get(key) != item for key, item in expected.items()) or type(attempt.get("success")) is not bool:
         raise NativeReferenceGateError("attempt sequence does not match the native oracle")
-    if type(attempt["videos"]) is not list or not attempt["videos"]:
-        raise NativeReferenceGateError("attempt must enumerate at least one video")
+    if type(attempt["videos"]) is not list or len(attempt["videos"]) != 3:
+        raise NativeReferenceGateError("attempt must enumerate exactly three RGB videos")
     parser = _verify_artifact if root is not None else lambda _root, item, label: _artifact(item, label)
     base = root if root is not None else Path(".")
     videos = [parser(base, item, "attempt video") for item in attempt["videos"]]
+    expected_views = {"left", "right", "top"}
+    observed_views = {str(video["path"]).rsplit("_", 2)[-2] for video in videos if str(video["path"]).endswith("_rgb.mp4")}
+    if observed_views != expected_views:
+        raise NativeReferenceGateError("attempt videos must be left/right/top RGB")
     return {**{key: attempt[key] for key in expected}, "success": attempt["success"], "videos": videos, "log": parser(base, attempt["log"], "attempt log"), "receipt": parser(base, attempt["receipt"], "attempt receipt")}
 
 
@@ -146,19 +248,27 @@ def verify_native_reference_result(document: object, *, bundle_root: Path | None
     if set(result) != {"schema_version", "kind", "identity", "attempts"} or result.get("schema_version") != 2 or result.get("kind") != "lehome_native_reference_execution_result_v2":
         raise NativeReferenceGateError("native reference result kind is invalid")
     identity = _validate_identity(result.get("identity"))
+    supporting_artifacts: dict[str, object] = {}
+    if bundle_root is not None:
+        cache = _artifact_from_file(bundle_root, Path("evidence/cache-trust-manifest.json"))
+        running = _artifact_from_file(bundle_root, Path("evidence/provider-running-receipt.json"))
+        if cache["sha256"] != identity["cache_trust_manifest_sha256"] or running["sha256"] != identity["provider_running_receipt_sha256"]:
+            raise NativeReferenceGateError("execution bundle support evidence is not bound to identity")
+        supporting_artifacts = {"cache_trust_manifest": cache, "provider_running_receipt": running}
     rows = result.get("attempts")
     if type(rows) is not list or len(rows) not in {2, 8}:
         raise NativeReferenceGateError("native reference result must contain either the two-attempt admission stop or all eight attempts")
     oracle = oracle_attempts(); attempts = [_validate_attempt(row, oracle[index], bundle_root) for index, row in enumerate(rows)]
     first = [row["success"] for row in attempts[:2]]
+    evidence = {row["attempt_id"]: canonical_sha256({"attempt_receipt": row["receipt"], "log": row["log"], "videos": row["videos"]}) for row in attempts}
     if first != [True, True]:
         if len(attempts) != 2: raise NativeReferenceGateError("failed Top_Long admission must fail fast before later attempts")
-        return {"schema_version": 1, "kind": "lehome_native_reference_execution_receipt_v2", "status": "evaluator_compatibility_stop", "reason": "top_long_admission_failed", "attempt_count": 2, "successes": sum(first), "oracle_vector": [row["expected_success"] for row in oracle], "identity": identity, "result_sha256": canonical_sha256(result)}
+        return {"schema_version": 1, "kind": "lehome_native_reference_execution_receipt_v2", "status": "evaluator_compatibility_stop", "reason": "top_long_admission_failed", "attempt_count": 2, "successes": sum(first), "oracle_vector": [row["expected_success"] for row in oracle], "attempt_evidence_sha256": evidence, "supporting_artifacts": supporting_artifacts, "identity": identity, "result_sha256": canonical_sha256(result)}
     if len(attempts) != 8: raise NativeReferenceGateError("passing Top_Long admission requires all eight sequential attempts")
     observed, expected = [row["success"] for row in attempts], [row["expected_success"] for row in oracle]
     if observed != expected:
-        return {"schema_version": 1, "kind": "lehome_native_reference_execution_receipt_v2", "status": "evaluator_compatibility_stop", "reason": "oracle_outcome_mismatch", "attempt_count": 8, "successes": sum(observed), "oracle_vector": expected, "observed_vector": observed, "identity": identity, "result_sha256": canonical_sha256(result)}
-    return {"schema_version": 1, "kind": "lehome_native_reference_execution_receipt_v2", "status": "oracle_matched_pending_finalization", "attempt_count": 8, "successes": 7, "oracle_vector": expected, "identity": identity, "result_sha256": canonical_sha256(result)}
+        return {"schema_version": 1, "kind": "lehome_native_reference_execution_receipt_v2", "status": "evaluator_compatibility_stop", "reason": "oracle_outcome_mismatch", "attempt_count": 8, "successes": sum(observed), "oracle_vector": expected, "observed_vector": observed, "attempt_evidence_sha256": evidence, "supporting_artifacts": supporting_artifacts, "identity": identity, "result_sha256": canonical_sha256(result)}
+    return {"schema_version": 1, "kind": "lehome_native_reference_execution_receipt_v2", "status": "oracle_matched_pending_finalization", "attempt_count": 8, "successes": 7, "oracle_vector": expected, "attempt_evidence_sha256": evidence, "supporting_artifacts": supporting_artifacts, "identity": identity, "result_sha256": canonical_sha256(result)}
 
 
 def _write_exclusive(path: Path, value: Mapping[str, object]) -> None:
@@ -166,6 +276,15 @@ def _write_exclusive(path: Path, value: Mapping[str, object]) -> None:
     try: descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
     except FileExistsError as error: raise NativeReferenceGateError("native reference receipt already exists") from error
     with os.fdopen(descriptor, "wb") as stream: stream.write(payload); stream.flush(); os.fsync(stream.fileno())
+
+
+def _write_bytes_exclusive(path: Path, payload: bytes) -> None:
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    except FileExistsError as error:
+        raise NativeReferenceGateError("native reference receipt already exists") from error
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(payload); stream.flush(); os.fsync(stream.fileno())
 
 
 def _write_result(path: Path, value: Mapping[str, object]) -> None:
@@ -197,8 +316,16 @@ def compile_native_stage(bundle_root: Path, *, stage: int, category: str, garmen
         raise NativeReferenceGateError("native stage result is not an append-only oracle prefix")
     receipts = root / "receipts"; receipts.mkdir(mode=0o700, exist_ok=True)
     for row, (_, outcome) in zip(expected_rows, matches, strict=True):
-        candidates = sorted((root / "videos" / f"stage-{stage}").glob(f"**/episode{int(row['episode']) - 1}_*.mp4"))
-        if not candidates: raise NativeReferenceGateError(f"native evaluator is missing videos for {row['attempt_id']}")
+        outcome_directory = "success" if outcome == "True" else "failure"
+        video_root = root / "videos" / f"stage-{stage}"
+        expected_paths = [
+            video_root / outcome_directory / f"episode{int(row['episode']) - 1}_observation_images_{view}_rgb.mp4"
+            for view in ("left", "right", "top")
+        ]
+        episode_files = sorted(video_root.glob(f"**/episode{int(row['episode']) - 1}_*_rgb.mp4"))
+        if set(episode_files) != set(expected_paths):
+            raise NativeReferenceGateError(f"native evaluator has missing, extra, or wrong-directory videos for {row['attempt_id']}")
+        candidates = expected_paths
         videos = [_artifact_from_file(root, path.relative_to(root)) for path in candidates]; receipt_relative = Path("receipts") / f"{row['attempt_id']}.json"; receipt_path = root / receipt_relative
         body = {"schema_version": 1, "kind": "lehome_native_reference_attempt_receipt_v1", "attempt_id": row["attempt_id"], "stage": stage, "category": category, "garment": garment, "episode": row["episode"], "success": outcome == "True", "log": log, "videos": videos}
         _write_exclusive(receipt_path, body); result["attempts"].append({**row, "success": outcome == "True", "videos": videos, "log": log, "receipt": _artifact_from_file(root, receipt_relative)})
@@ -214,12 +341,16 @@ def finalize_native_reference_gate(execution: object, fidelity: object, publicat
     if type(reviewed) is not list or [row.get("attempt_id") if isinstance(row, dict) else None for row in reviewed] != ids: raise NativeReferenceGateError("fidelity review does not cover every attempt")
     for row in reviewed:
         if set(row) != {"attempt_id", "cloth_present", "cloth_flight", "nonfinite", "safety_failure", "evidence_sha256"} or row.get("cloth_present") is not True or any(row.get(key) is not False for key in ("cloth_flight", "nonfinite", "safety_failure")): raise NativeReferenceGateError("fidelity review contains an invalid outcome")
-        _digest(row.get("evidence_sha256"), "fidelity review evidence")
+        expected_evidence = execution.get("attempt_evidence_sha256")
+        if not isinstance(expected_evidence, dict) or row.get("evidence_sha256") != expected_evidence.get(row.get("attempt_id")):
+            raise NativeReferenceGateError("fidelity review evidence is not bound to execution artifacts")
     publication = _object(publication, "publication receipt")
     if set(publication) != {"schema_version", "kind", "execution_receipt_sha256", "immutable_revision", "bundle_manifest_sha256", "readback_verified"} or publication.get("schema_version") != 1 or publication.get("kind") != "lehome_native_reference_hf_readback_v1" or publication.get("execution_receipt_sha256") != execution_sha or publication.get("readback_verified") is not True or not isinstance(publication.get("immutable_revision"), str) or _COMMIT.fullmatch(publication["immutable_revision"]) is None: raise NativeReferenceGateError("publication receipt is not a readback-verified immutable upload")
     _digest(publication.get("bundle_manifest_sha256"), "publication bundle manifest")
     stopped = _object(stopped, "stopped VM receipt")
-    if set(stopped) != {"schema_version", "kind", "execution_receipt_sha256", "vm_id", "disk_id", "image", "state", "attached_disk_ids"} or stopped.get("schema_version") != 1 or stopped.get("kind") != "lehome_native_reference_vm_stopped_v1" or stopped.get("execution_receipt_sha256") != execution_sha or stopped.get("vm_id") != identity["vm_id"] or stopped.get("disk_id") != identity["disk_id"] or stopped.get("image") != identity["image"] or stopped.get("state") != "STOPPED" or stopped.get("attached_disk_ids") != [identity["disk_id"]]: raise NativeReferenceGateError("stopped VM receipt is not bound to the execution identity")
+    stopped = validate_provider_observation(stopped, expected_state="STOPPED")
+    if stopped.get("vm_id") != identity["vm_id"] or stopped.get("disk_id") != identity["disk_id"] or stopped.get("provider_source_image_id") != identity["provider_source_image_id"]:
+        raise NativeReferenceGateError("stopped VM receipt is not bound to the execution identity")
     return {"schema_version": 1, "kind": "lehome_native_reference_gate_final_receipt_v1", "status": "passed", "execution_receipt_sha256": execution_sha, "fidelity_review_sha256": canonical_sha256(fidelity), "publication_receipt_sha256": canonical_sha256(publication), "stopped_vm_receipt_sha256": canonical_sha256(stopped), "identity": identity}
 
 
@@ -235,15 +366,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify = commands.add_parser("verify-execution"); verify.add_argument("--result", type=Path, required=True); verify.add_argument("--bundle-root", type=Path, required=True); verify.add_argument("--receipt", type=Path, required=True)
     compile_stage = commands.add_parser("compile-stage"); compile_stage.add_argument("--bundle-root", type=Path, required=True); compile_stage.add_argument("--stage", type=int, required=True); compile_stage.add_argument("--category", required=True); compile_stage.add_argument("--garment", required=True); compile_stage.add_argument("--identity", type=Path, required=True)
     finalize = commands.add_parser("finalize"); finalize.add_argument("--execution", type=Path, required=True); finalize.add_argument("--fidelity", type=Path, required=True); finalize.add_argument("--publication", type=Path, required=True); finalize.add_argument("--stopped", type=Path, required=True); finalize.add_argument("--receipt", type=Path, required=True)
+    provider = commands.add_parser("capture-provider"); provider.add_argument("--state", choices=("RUNNING", "STOPPED"), required=True); provider.add_argument("--receipt", type=Path, required=True)
+    bind_provider = commands.add_parser("bind-provider-receipt"); bind_provider.add_argument("--state", choices=("RUNNING", "STOPPED"), required=True); bind_provider.add_argument("--input", type=Path, required=True); bind_provider.add_argument("--receipt", type=Path, required=True)
+    cache = commands.add_parser("fetch-cache-manifest"); cache.add_argument("--revision", required=True); cache.add_argument("--path", required=True); cache.add_argument("--receipt", type=Path); cache.add_argument("--checkpoint-tree-sha256"); cache.add_argument("--metadata-tree-sha256"); cache.add_argument("--assets-tree-sha256")
     args = parser.parse_args(argv)
     try:
         if args.command == "compile-stage": receipt = compile_native_stage(args.bundle_root, stage=args.stage, category=args.category, garment=args.garment, identity=_read_json(args.identity, "identity"))
         elif args.command == "verify-execution": receipt = verify_native_reference_result(_read_json(args.result, "result"), bundle_root=args.bundle_root); _write_exclusive(args.receipt, receipt)
-        else: receipt = finalize_native_reference_gate(_read_json(args.execution, "execution receipt"), _read_json(args.fidelity, "fidelity review"), _read_json(args.publication, "publication receipt"), _read_json(args.stopped, "stopped VM receipt")); _write_exclusive(args.receipt, receipt)
+        elif args.command == "finalize": receipt = finalize_native_reference_gate(_read_json(args.execution, "execution receipt"), _read_json(args.fidelity, "fidelity review"), _read_json(args.publication, "publication receipt"), _read_json(args.stopped, "stopped VM receipt")); _write_exclusive(args.receipt, receipt)
+        elif args.command == "capture-provider":
+            from scripts.finalize_simple_curriculum_collection import SubprocessNebiusProvider
+            receipt = capture_provider_observation(SubprocessNebiusProvider(), expected_state=args.state); _write_exclusive(args.receipt, receipt)
+        elif args.command == "bind-provider-receipt":
+            raw = args.input.read_bytes(); receipt = validate_provider_observation(_read_json(args.input, "provider observation"), expected_state=args.state); _write_bytes_exclusive(args.receipt, raw)
+        else:
+            receipt, raw = fetch_public_cache_manifest(args.revision, args.path)
+            bindings = (args.checkpoint_tree_sha256, args.metadata_tree_sha256, args.assets_tree_sha256)
+            if any(value is not None for value in bindings):
+                if any(value is None for value in bindings): raise NativeReferenceGateError("cache manifest bindings must be complete")
+                validate_public_cache_bindings(receipt, checkpoint_tree_sha256=args.checkpoint_tree_sha256, metadata_tree_sha256=args.metadata_tree_sha256, assets_tree_sha256=args.assets_tree_sha256)
+            if args.receipt is not None: _write_bytes_exclusive(args.receipt, raw)
     except NativeReferenceGateError as error:
         if argv is not None: raise SystemExit(str(error)) from None
         print(f"error: {error}", file=sys.stderr); return 2
-    print(json.dumps(receipt, sort_keys=True, separators=(",", ":"))); return 0
+    print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    return 3 if args.command == "verify-execution" and receipt.get("status") == "evaluator_compatibility_stop" else 0
 
 
 if __name__ == "__main__": raise SystemExit(main())

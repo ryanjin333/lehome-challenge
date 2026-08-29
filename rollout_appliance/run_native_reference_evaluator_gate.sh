@@ -47,7 +47,7 @@ expected_checkpoint_digest() {
     model.safetensors) echo d8d91b6c11cb5aa18fe9a48e7da88eae0ec7e5a227a315ba67ee167d645cde76 ;;
     policy_preprocessor.json) echo a258dac8fa4e4e138990776e156cae36ae6cf172504a8c9e5f2d5864c9126009 ;;
     policy_postprocessor.json) echo f9e18fa7da47e2b6d7ba3459236b140e28f834ce5640ba199be1412d50672fa7 ;;
-    policy_preprocessor_step_2_groot_pack_inputs_v3.safetensors|policy_postprocessor_step_0_groot_action_unpack_unnormalize_v1) echo 74dcbba5d152b7e07c239d8cd66b19b1fd08aa37ff930aa5f2e94cd772a4a912 ;;
+    policy_preprocessor_step_2_groot_pack_inputs_v3.safetensors|policy_postprocessor_step_0_groot_action_unpack_unnormalize_v1.safetensors) echo 74dcbba5d152b7e07c239d8cd66b19b1fd08aa37ff930aa5f2e94cd772a4a912 ;;
     train_config.json) echo 81cd0cfe2b2f70dbf55bc7739f9a1f248aebd0e281994f415964d9d0f6e3c118 ;;
     *) return 1 ;;
   esac
@@ -61,7 +61,7 @@ validate_checkpoint() {
     [[ -f "$CHECKPOINT_ROOT/$item" && ! -L "$CHECKPOINT_ROOT/$item" ]] || fail "native reference checkpoint cache is incomplete: $item"
     [[ "$(sha256_file "$CHECKPOINT_ROOT/$item")" == "$(expected_checkpoint_digest "$item")" ]] || fail "native reference checkpoint digest mismatch: $item"
   done
-  observed="$(find "$CHECKPOINT_ROOT" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+  observed="$(find "$CHECKPOINT_ROOT" -mindepth 1 -maxdepth 1 -type f -exec basename -- {} \; | LC_ALL=C sort)"
   expected="$(printf '%s\n' "${required[@]}" | LC_ALL=C sort)"
   [[ "$observed" == "$expected" ]] || fail "native reference checkpoint has an unexpected file set"
   "$PYTHON_BIN" - "$CHECKPOINT_ROOT/policy_preprocessor.json" "$CHECKPOINT_ROOT/policy_postprocessor.json" <<'PY'
@@ -103,20 +103,11 @@ validate_source_runtime() {
 }
 
 validate_cache_trust_manifest() {
-  [[ -f "$CACHE_TRUST_MANIFEST" && ! -L "$CACHE_TRUST_MANIFEST" ]] || fail "cache trust manifest is unavailable or unsafe"
-  [[ -f "$CACHE_TRUST_ORIGIN_RECEIPT" && ! -L "$CACHE_TRUST_ORIGIN_RECEIPT" ]] || fail "cache trust origin receipt is unavailable or unsafe"
-  [[ "$(sha256_file "$CACHE_TRUST_MANIFEST")" == "$CACHE_TRUST_MANIFEST_SHA256" ]] || fail "cache trust manifest digest mismatch"
-  "$PYTHON_BIN" - "$CACHE_TRUST_MANIFEST" "$CACHE_TRUST_MANIFEST_SHA256" "$CACHE_TRUST_ORIGIN_RECEIPT" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" <<'PY'
-import hashlib, json, re, sys
-from pathlib import Path
-manifest_path, manifest_sha, origin_path, checkpoint_sha, metadata_sha, assets_sha = sys.argv[1:]
-try: manifest, origin = json.loads(Path(manifest_path).read_text()), json.loads(Path(origin_path).read_text())
-except (OSError, UnicodeError, json.JSONDecodeError) as error: raise SystemExit("cache trust evidence is not valid JSON") from error
-if set(manifest) != {"schema_version","kind","source_revision","checkpoint_tree_sha256","metadata_tree_sha256","assets_tree_sha256","origin_receipt_sha256"} or manifest.get("schema_version") != 1 or manifest.get("kind") != "lehome_native_reference_cache_trust_manifest_v1" or manifest.get("source_revision") != "d384fe00508acd96ab1c3c5dc265e08261f94b3b": raise SystemExit("cache trust manifest schema is invalid")
-if [manifest.get(key) for key in ("checkpoint_tree_sha256","metadata_tree_sha256","assets_tree_sha256")] != [checkpoint_sha, metadata_sha, assets_sha]: raise SystemExit("cache trust manifest does not bind observed caches")
-if manifest.get("origin_receipt_sha256") != hashlib.sha256(Path(origin_path).read_bytes()).hexdigest(): raise SystemExit("cache trust manifest is not bound to its immutable origin receipt")
-if set(origin) != {"schema_version","kind","cache_trust_manifest_sha256","immutable_revision","readback_verified"} or origin.get("schema_version") != 1 or origin.get("kind") != "lehome_native_reference_cache_trust_origin_v1" or origin.get("cache_trust_manifest_sha256") != manifest_sha or origin.get("readback_verified") is not True or not isinstance(origin.get("immutable_revision"), str) or re.fullmatch(r"[0-9a-f]{40}", origin["immutable_revision"]) is None: raise SystemExit("cache trust origin receipt is not an immutable readback receipt")
-PY
+  "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" fetch-cache-manifest \
+    --revision "$CACHE_TRUST_MANIFEST_REVISION" --path "$CACHE_TRUST_MANIFEST_PATH" \
+    --checkpoint-tree-sha256 "$CHECKPOINT_TREE_SHA256" \
+    --metadata-tree-sha256 "$METADATA_TREE_SHA256" \
+    --assets-tree-sha256 "$ASSETS_TREE_SHA256" >/dev/null || fail "immutable cache manifest readback failed"
 }
 
 probe_cuda() {
@@ -132,11 +123,11 @@ PY
 }
 
 write_identity_and_preflight() {
-  "$PYTHON_BIN" - "$OUTPUT_ROOT/identity.json" "$OUTPUT_ROOT/preflight.json" "$OUTPUT_ROOT/cuda-runtime.json" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" "$CACHE_TRUST_MANIFEST_SHA256" "$VM_ID" "$DISK_ID" "$IMAGE" <<'PY'
+  "$PYTHON_BIN" - "$OUTPUT_ROOT/identity.json" "$OUTPUT_ROOT/preflight.json" "$OUTPUT_ROOT/cuda-runtime.json" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" "$CACHE_TRUST_MANIFEST_SHA256" "$PROVIDER_RUNNING_RECEIPT_SHA256" "$VM_ID" "$DISK_ID" "$IMAGE" <<'PY'
 import hashlib, json, os, sys
 from pathlib import Path
 identity_path, preflight_path, cuda_path = map(Path, sys.argv[1:4]); cuda=json.loads(cuda_path.read_text())
-identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[4],"metadata_tree_sha256":sys.argv[5],"assets_tree_sha256":sys.argv[6],"cache_trust_manifest_sha256":sys.argv[7],"lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[8],"disk_id":sys.argv[9],"image":sys.argv[10],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points"}
+identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[4],"metadata_tree_sha256":sys.argv[5],"assets_tree_sha256":sys.argv[6],"cache_trust_manifest_sha256":sys.argv[7],"provider_running_receipt_sha256":sys.argv[8],"provider_source_image_id":"computeimage-u00zf6w3yf72gakhcy","lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[9],"disk_id":sys.argv[10],"image":sys.argv[11],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points"}
 preflight={"schema_version":2,"kind":"lehome_native_reference_preflight_v2","identity":identity,"cuda_probe_sha256":hashlib.sha256(cuda_path.read_bytes()).hexdigest()}
 for path,document in ((identity_path,identity),(preflight_path,preflight)):
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o444)
@@ -159,18 +150,22 @@ if [[ "$MODE" == source-stage ]]; then stage_native_source; exit 0; fi
 
 VM_ID="${LEHOME_NATIVE_REFERENCE_VM_ID:-}"; DISK_ID="${LEHOME_NATIVE_REFERENCE_DISK_ID:-}"; IMAGE="${LEHOME_NATIVE_REFERENCE_IMAGE:-}"
 CHECKPOINT_ROOT="${LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT:-}"; METADATA_ROOT="${LEHOME_NATIVE_REFERENCE_METADATA_ROOT:-}"; ASSETS_ROOT="${LEHOME_NATIVE_REFERENCE_ASSETS_ROOT:-}"; OUTPUT_ROOT="${LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT:-}"
-CACHE_TRUST_MANIFEST="${LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST:-}"; CACHE_TRUST_MANIFEST_SHA256="${LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_SHA256:-}"; CACHE_TRUST_ORIGIN_RECEIPT="${LEHOME_NATIVE_REFERENCE_CACHE_TRUST_ORIGIN_RECEIPT:-}"
+CACHE_TRUST_MANIFEST_REVISION="${LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION:-}"; CACHE_TRUST_MANIFEST_PATH="${LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH:-}"; PROVIDER_RUNNING_RECEIPT="${LEHOME_NATIVE_REFERENCE_PROVIDER_RUNNING_RECEIPT:-}"
 [[ "$VM_ID" =~ ^computeinstance-[a-z0-9]+$ ]] || fail "LEHOME_NATIVE_REFERENCE_VM_ID is invalid"
 [[ "$DISK_ID" =~ ^computedisk-[a-z0-9]+$ ]] || fail "LEHOME_NATIVE_REFERENCE_DISK_ID is invalid"
 [[ "$IMAGE" =~ ^[^[:space:]]+@sha256:[0-9a-f]{64}$ ]] || fail "LEHOME_NATIVE_REFERENCE_IMAGE must be digest pinned"
 require_absolute_directory "$CHECKPOINT_ROOT" "native reference checkpoint cache"; require_absolute_directory "$METADATA_ROOT" "native reference metadata cache"; require_absolute_directory "$ASSETS_ROOT" "native reference challenge assets"; require_new_output "$OUTPUT_ROOT"
 validate_checkpoint; validate_source_runtime
 CHECKPOINT_TREE_SHA256="$(tree_sha256 "$CHECKPOINT_ROOT")"; METADATA_TREE_SHA256="$(tree_sha256 "$METADATA_ROOT")"; ASSETS_TREE_SHA256="$(tree_sha256 "$ASSETS_ROOT")"
-require_digest "$CACHE_TRUST_MANIFEST_SHA256" "cache trust manifest digest"
 validate_cache_trust_manifest
 if [[ "$MODE" == validate-only ]]; then printf '%s\n' '{"status":"validated","mode":"no-execution"}'; exit 0; fi
+[[ "$PROVIDER_RUNNING_RECEIPT" == /* && "$PROVIDER_RUNNING_RECEIPT" != *".."* && -f "$PROVIDER_RUNNING_RECEIPT" && ! -L "$PROVIDER_RUNNING_RECEIPT" ]] || fail "provider RUNNING receipt is unavailable or unsafe"
 
-mkdir --mode=0700 -- "$OUTPUT_ROOT"; mkdir --mode=0700 -- "$OUTPUT_ROOT/logs" "$OUTPUT_ROOT/videos" "$OUTPUT_ROOT/receipts"
+mkdir --mode=0700 -- "$OUTPUT_ROOT"; mkdir --mode=0700 -- "$OUTPUT_ROOT/logs" "$OUTPUT_ROOT/videos" "$OUTPUT_ROOT/receipts" "$OUTPUT_ROOT/evidence"
+"$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" fetch-cache-manifest --revision "$CACHE_TRUST_MANIFEST_REVISION" --path "$CACHE_TRUST_MANIFEST_PATH" --checkpoint-tree-sha256 "$CHECKPOINT_TREE_SHA256" --metadata-tree-sha256 "$METADATA_TREE_SHA256" --assets-tree-sha256 "$ASSETS_TREE_SHA256" --receipt "$OUTPUT_ROOT/evidence/cache-trust-manifest.json" >/dev/null
+"$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" bind-provider-receipt --state RUNNING --input "$PROVIDER_RUNNING_RECEIPT" --receipt "$OUTPUT_ROOT/evidence/provider-running-receipt.json" >/dev/null
+CACHE_TRUST_MANIFEST_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/cache-trust-manifest.json")"
+PROVIDER_RUNNING_RECEIPT_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/provider-running-receipt.json")"
 probe_cuda; write_identity_and_preflight
 run_stage() {
   local stage="$1" category="$2" garment="$3" log="$OUTPUT_ROOT/logs/stage-${stage}.log"

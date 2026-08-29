@@ -53,16 +53,16 @@ LEHOME_NATIVE_REFERENCE_MODE=source-stage \
   bash rollout_appliance/run_native_reference_evaluator_gate.sh
 ```
 
-Before validation/execution, create and independently preserve an immutable
-cache-trust manifest from a stopped-disk, read-only inventory. This is a
-required fail-closed input, not a digest typed into the command line. The
-manifest has kind `lehome_native_reference_cache_trust_manifest_v1`, binds the
-revision and the observed checkpoint/metadata/assets tree digests, and names
-the SHA-256 of an origin receipt. That origin receipt has kind
-`lehome_native_reference_cache_trust_origin_v1`, binds the manifest SHA-256,
-and records an immutable revision and successful readback. Commit/publish the
-pair before execution; if their exact values do not yet exist, stop for the
-read-only cache inventory rather than inventing a manifest.
+Before validation/execution, create and publish one immutable cache-trust
+manifest from a stopped-disk, read-only inventory. The launcher reads the
+manifest bytes anonymously and directly from the fixed public dataset
+`ryanjin333/lehome-groot-n17-rollouts` at an immutable 40-hex revision and a
+`reference-checks/...` path; it does not trust a local copy or a caller-supplied
+digest. The manifest kind is
+`lehome_native_reference_cache_trust_manifest_v2` and it binds that public
+repository/revision/path plus the observed checkpoint, metadata, and assets
+tree digests. If this exact readback does not yet exist, stop for the
+read-only cache inventory and publication rather than inventing a manifest.
 
 ```bash
 export LEHOME_NATIVE_REFERENCE_VM_ID=computeinstance-u00t6xfqhadrcmssa2
@@ -73,19 +73,30 @@ export LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT=/mnt/lehome/reference-native/pret
 export LEHOME_NATIVE_REFERENCE_METADATA_ROOT=/mnt/lehome/reference-native/dataset_meta
 export LEHOME_NATIVE_REFERENCE_ASSETS_ROOT=/mnt/lehome/challenge-assets/Assets
 export LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT=/mnt/lehome/reference-native/native-reference-YYYYMMDDHHMMSS
-export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST=/mnt/lehome/reference-native/cache-trust-manifest.json
-export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_SHA256='<published 64-char digest>'
-export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_ORIGIN_RECEIPT=/mnt/lehome/reference-native/cache-trust-origin.json
+export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION='<published 40-char revision>'
+export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH='reference-checks/native/cache-trust-manifest.json'
+export LEHOME_NATIVE_REFERENCE_PROVIDER_RUNNING_RECEIPT=/mnt/lehome/reference-native/provider-running-receipt.json
 ```
 
-The launcher computes cache digests itself and compares them to the immutable
-manifest; it does not trust caller-provided cache-digest environment values.
-It also proves `torch.cuda.is_available()`, records CUDA runtime/device count,
-and binds the exact VM ID, disk ID, image digest, LeRobot version, and policy
-device (`cuda:0`) to `identity.json` and `preflight.json`. Simulation remains
+The launcher computes cache digests itself and compares them to that immutable
+public readback; it does not trust caller-provided cache-digest values. The
+operator uses the restricted exact-instance Nebius adapter to capture a fresh
+`RUNNING` observation before VM-local validation. The launcher never needs
+Nebius credentials: it validates and copies that operator receipt into the
+evidence bundle. The observation validates the pinned VM name/ID, protected
+disk, and provider source-image ID, then records the nested CLI response hash.
+The runtime container image digest is separately bound in identity. It also
+proves `torch.cuda.is_available()`, records CUDA runtime/device count, and
+binds all identities to `identity.json` and `preflight.json`. Simulation remains
 CPU-only.
 
 Run validation first:
+
+```bash
+python3 scripts/verify_native_reference_evaluator_gate.py capture-provider \
+  --state RUNNING \
+  --receipt /mnt/lehome/reference-native/provider-running-receipt.json
+```
 
 ```bash
 LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY=1 \
@@ -108,13 +119,17 @@ LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY=0 \
   bash rollout_appliance/run_native_reference_evaluator_gate.sh
 ```
 
-Execution writes every raw stage log, each expected video, and every
+Execution copies the exact public cache-manifest bytes and fresh provider
+`RUNNING` receipt into `evidence/`, then writes every raw stage log, exactly
+three expected RGB videos (`left`, `right`, `top`) per episode in the matching
+`success` or `failure` directory, and every
 per-attempt receipt as regular immutable files. The result verifier SHA-256s
 and sizes each of those files before it emits `execution-receipt.json`. Native
 exceptions, known non-finite/cloth-flight/missing-cloth/safety text, an absent
-video, or any changed artifact fail immediately. The public log parser accepts
-the canonical `Episode 1/2: ... Success=True` lines only. It does not invoke
-the ordinary N1.7 gateway.
+video, a wrong/extra video directory, or any changed artifact fail immediately.
+The public log parser accepts the canonical `Episode 1/2: ... Success=True`
+lines only. A typed top-long or oracle-mismatch stop still writes its receipt,
+then exits with status `3`. It does not invoke the ordinary N1.7 gateway.
 
 ## After execution
 
@@ -126,11 +141,20 @@ receipt SHA-256:
 1. `lehome_native_reference_fidelity_review_v1`: explicit review for all eight
    attempts (manual video audit is acceptable) that cloth was present and that
    no cloth flight, non-finite state, or safety failure occurred. Include a
-   digest of the evidence for every attempt.
+   digest of the exact per-attempt receipt/log/three-video manifest from the
+   execution receipt for every attempt; arbitrary audit digests are rejected.
 2. `lehome_native_reference_hf_readback_v1`: immutable Hugging Face revision,
    entire-bundle manifest digest, and successful readback.
-3. `lehome_native_reference_vm_stopped_v1`: exact VM/disk/image identity,
-   `STOPPED` state, and the expected attached protected disk.
+3. `lehome_native_reference_provider_observation_v1`: run the provided
+   read-only command after stopping the VM to obtain an actual Nebius CLI
+   `STOPPED` observation. It must bind the exact VM/disk/provider-source-image
+   identity and nested provider-response hash. Do not hand-author this JSON.
+
+```bash
+python3 scripts/verify_native_reference_evaluator_gate.py capture-provider \
+  --state STOPPED \
+  --receipt /mnt/lehome/reference-native/provider-stopped-receipt.json
+```
 
 Then run the pure local finalizer (it uploads nothing):
 
