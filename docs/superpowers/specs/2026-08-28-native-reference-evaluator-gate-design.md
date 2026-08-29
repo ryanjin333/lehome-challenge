@@ -125,14 +125,20 @@ does not admit training or collection.
 The exact outer container shape is owned by the executable host wrapper
 `rollout_appliance/run_native_reference_evaluator_container.sh`. No operator
 command may invoke the VM-local launcher on the bare host. The wrapper fixes
-the `/mnt/lehome` and reviewed-checkout mounts, both read-only mounts for every
+the `/mnt/lehome` mount and exact staged runtime root
+`/mnt/lehome/runtime-code/<exact-reviewed-40-hex-revision>`, both read-only mounts for every
 authenticated asset root, `--gpus all`, `--entrypoint bash`, and immutable
 image ID. It explicitly inserts all fixed and mode-specific environment
-arguments before the image argument.
+arguments before the image argument. Before Docker, it proves the staged root's
+directory name equals its clean Git `HEAD` and safely creates only the four
+ignored runtime `Assets/` mountpoint directories. It binds the admitted live
+checkpoint and metadata roots at
+`/mnt/lehome/cache/reference-theo-d384fe0/repo/{pretrained_model,dataset_meta}`.
 
 The four canonical invocations are:
 
 ```bash
+export LEHOME_NATIVE_REFERENCE_RUNTIME_REVISION='<exact-reviewed-40-hex-revision>'
 bash rollout_appliance/run_native_reference_evaluator_container.sh source-stage
 
 LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_OUTPUT=/mnt/lehome/reference-native/cache-trust-manifest.json \
@@ -157,6 +163,12 @@ paths. The launcher passes `--device cpu` to the pinned public `scripts.eval`
 module; the wrapper's `--gpus all` exposes CUDA only for policy use. The host
 inspects the fixed tag but the wrapper launches the exact inspected image ID,
 avoiding a tag-retargeting gap between receipt capture and container creation.
+Pinned imports remain first on `PYTHONPATH`, `PYTHONSAFEPATH=1` remains set,
+and the evaluator is invoked with `-P -m scripts.eval` from the runtime root.
+`PYTHONDONTWRITEBYTECODE=1` prevents pycache writes. Reviewed runtime
+`sitecustomize` redirects the pinned logger's project root to
+`OUTPUT_ROOT/public-runtime/stage-N`, outside the pinned source; the source
+tree is therefore unchanged across all stage rehashes.
 
 ## Decision after the gate
 

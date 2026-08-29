@@ -287,6 +287,76 @@ def validate_runtime_asset_bindings(
     }
 
 
+def prepare_runtime_asset_mountpoints(runtime_root: Path) -> dict[str, object]:
+    """Create only ignored asset mountpoints in an exact clean staged revision."""
+    requested_root = Path(runtime_root)
+    if requested_root.is_symlink():
+        raise NativeReferenceGateError("staged runtime root is a symlink")
+    root = requested_root.resolve(strict=True)
+    if _COMMIT.fullmatch(root.name) is None:
+        raise NativeReferenceGateError("staged runtime root is not revision-addressed")
+
+    def git(*arguments: str) -> str:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(root), *arguments],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise NativeReferenceGateError("staged runtime Git validation failed") from error
+        if completed.returncode != 0:
+            raise NativeReferenceGateError("staged runtime Git validation failed")
+        return completed.stdout.strip()
+
+    if Path(git("rev-parse", "--show-toplevel")).resolve(strict=True) != root:
+        raise NativeReferenceGateError("staged runtime root is not the Git worktree root")
+    if git("rev-parse", "HEAD") != root.name:
+        raise NativeReferenceGateError("staged runtime revision does not match its path")
+    if git("status", "--porcelain", "--untracked-files=all"):
+        raise NativeReferenceGateError("staged runtime checkout is not clean")
+    assets = root / "Assets"
+    marker = assets / ".gitignore"
+    if git("ls-files", "--error-unmatch", "Assets/.gitignore") != "Assets/.gitignore":
+        raise NativeReferenceGateError("staged runtime Assets marker is not tracked")
+    try:
+        assets_metadata = assets.lstat()
+        marker_metadata = marker.lstat()
+    except OSError as error:
+        raise NativeReferenceGateError("staged runtime Assets root is incomplete") from error
+    if (
+        assets.is_symlink()
+        or marker.is_symlink()
+        or not stat.S_ISDIR(assets_metadata.st_mode)
+        or not stat.S_ISREG(marker_metadata.st_mode)
+    ):
+        raise NativeReferenceGateError("staged runtime Assets root is unsafe")
+
+    mountpoints: list[dict[str, object]] = []
+    for name in ASSETS_RUNTIME_ROOTS:
+        path = assets / name
+        try:
+            path.mkdir(mode=0o755)
+        except FileExistsError:
+            pass
+        metadata = path.lstat()
+        if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+            raise NativeReferenceGateError(f"staged runtime asset mountpoint is unsafe: {name}")
+        mountpoints.append({"root": name, "path": str(path)})
+    if git("status", "--porcelain", "--untracked-files=all"):
+        raise NativeReferenceGateError("asset mountpoint preparation dirtied staged runtime")
+    return {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_runtime_mountpoints_v1",
+        "runtime_root": str(root),
+        "runtime_revision": root.name,
+        "mountpoints": mountpoints,
+    }
+
+
 def validate_runtime_image_observation(document: object) -> dict[str, object]:
     receipt = _object(document, "runtime image observation")
     expected = {
@@ -954,6 +1024,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_image = commands.add_parser("capture-runtime-image"); runtime_image.add_argument("--receipt", type=Path, required=True)
     bind_runtime_image = commands.add_parser("bind-runtime-image-receipt"); bind_runtime_image.add_argument("--input", type=Path, required=True); bind_runtime_image.add_argument("--receipt", type=Path, required=True)
     asset_bindings = commands.add_parser("validate-asset-bindings"); asset_bindings.add_argument("--assets-root", type=Path, required=True); asset_bindings.add_argument("--runtime-repo-root", type=Path, required=True)
+    prepare_mountpoints = commands.add_parser("prepare-runtime-mountpoints"); prepare_mountpoints.add_argument("--runtime-root", type=Path, required=True)
     cache = commands.add_parser("fetch-cache-manifest"); cache.add_argument("--revision", required=True); cache.add_argument("--path", required=True); cache.add_argument("--receipt", type=Path); cache.add_argument("--checkpoint-tree-sha256"); cache.add_argument("--metadata-tree-sha256"); cache.add_argument("--assets-tree-sha256")
     publish = commands.add_parser("publish-bundle"); publish.add_argument("--bundle-root", type=Path, required=True); publish.add_argument("--execution", type=Path, required=True); publish.add_argument("--token-file", type=Path, required=True); publish.add_argument("--receipt", type=Path, required=True)
     publish_cache = commands.add_parser("publish-cache-manifest"); publish_cache.add_argument("--manifest", type=Path, required=True); publish_cache.add_argument("--token-file", type=Path, required=True); publish_cache.add_argument("--receipt", type=Path, required=True)
@@ -979,6 +1050,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_bytes_exclusive(args.receipt, raw)
         elif args.command == "validate-asset-bindings":
             receipt = validate_runtime_asset_bindings(args.assets_root, args.runtime_repo_root)
+        elif args.command == "prepare-runtime-mountpoints":
+            receipt = prepare_runtime_asset_mountpoints(args.runtime_root)
         elif args.command == "publish-bundle":
             with _repository_package_imports():
                 from scripts.publish_simple_curriculum_collection import HuggingFacePublicDatasetTransport, _load_token

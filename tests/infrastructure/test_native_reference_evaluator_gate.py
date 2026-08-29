@@ -16,6 +16,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "rollout_appliance" / "run_native_reference_evaluator_gate.sh"
 CONTAINER_WRAPPER = ROOT / "rollout_appliance" / "run_native_reference_evaluator_container.sh"
+NATIVE_SITE_CUSTOMIZE = ROOT / "rollout_appliance" / "native_reference_site" / "sitecustomize.py"
 RUNBOOK = ROOT / "docs" / "experiments" / "2026-08-28-native-reference-evaluator-gate-runbook.md"
 CANONICAL_CACHE_MANIFEST = ROOT / "rollout_appliance" / "native_reference_canonical_cache_manifest.json"
 
@@ -1072,9 +1073,14 @@ def test_native_container_wrapper_builds_complete_exact_command_per_mode(
     mode: str,
     mode_environment: dict[str, str],
 ) -> None:
+    revision = "1" * 40
     result = subprocess.run(
         ["bash", str(CONTAINER_WRAPPER), mode, "--print-command"],
-        env={**os.environ, **mode_environment},
+        env={
+            **os.environ,
+            "LEHOME_NATIVE_REFERENCE_RUNTIME_REVISION": revision,
+            **mode_environment,
+        },
         text=True,
         capture_output=True,
         check=False,
@@ -1095,8 +1101,9 @@ def test_native_container_wrapper_builds_complete_exact_command_per_mode(
     ]
     assert tokens[tokens.index("--entrypoint") + 1] == "bash"
     assert tokens.index("--entrypoint") < image_index
+    runtime_root = Path("/mnt/lehome/runtime-code") / revision
     assert tokens[image_index + 1] == str(
-        CONTAINER_WRAPPER.parent.parent
+        runtime_root
         / "rollout_appliance"
         / "run_native_reference_evaluator_gate.sh"
     )
@@ -1112,8 +1119,8 @@ def test_native_container_wrapper_builds_complete_exact_command_per_mode(
         "LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY": "1" if mode == "validate-only" else "0",
         "LEHOME_NATIVE_REFERENCE_PYTHON": "/opt/lehome-challenge/.venv/bin/python",
         "LEHOME_NATIVE_REFERENCE_SOURCE_ROOT": "/mnt/lehome/reference-native/source",
-        "LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT": "/mnt/lehome/reference-native/pretrained_model",
-        "LEHOME_NATIVE_REFERENCE_METADATA_ROOT": "/mnt/lehome/reference-native/dataset_meta",
+        "LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT": "/mnt/lehome/cache/reference-theo-d384fe0/repo/pretrained_model",
+        "LEHOME_NATIVE_REFERENCE_METADATA_ROOT": "/mnt/lehome/cache/reference-theo-d384fe0/repo/dataset_meta",
         "LEHOME_NATIVE_REFERENCE_ASSETS_ROOT": "/mnt/lehome/reference-native/assets",
         "LEHOME_NATIVE_REFERENCE_VM_ID": "computeinstance-u00t6xfqhadrcmssa2",
         "LEHOME_NATIVE_REFERENCE_DISK_ID": "computedisk-u00pbe55crxy7jr56x",
@@ -1122,6 +1129,7 @@ def test_native_container_wrapper_builds_complete_exact_command_per_mode(
 
     mounts = [tokens[index + 1] for index, token in enumerate(tokens) if token == "--mount"]
     assert "type=bind,src=/mnt/lehome,dst=/mnt/lehome" in mounts
+    assert f"type=bind,src={runtime_root},dst={runtime_root},readonly" in mounts
     for root in ("objects", "robots", "scenes", "textures"):
         assert any(
             mount.startswith(f"type=bind,src=/mnt/lehome/eval/assets/{root},")
@@ -1132,3 +1140,112 @@ def test_native_container_wrapper_builds_complete_exact_command_per_mode(
             f"type=bind,src=/mnt/lehome/eval/assets/{root},"
             f"dst=/mnt/lehome/reference-native/assets/{root},readonly"
         ) in mounts
+
+
+def test_prepare_runtime_mountpoints_models_a_fresh_revision_staged_tree(tmp_path: Path) -> None:
+    from scripts.verify_native_reference_evaluator_gate import prepare_runtime_asset_mountpoints
+
+    seed = tmp_path / "seed"
+    (seed / "Assets").mkdir(parents=True)
+    (seed / "Assets" / ".gitignore").write_text("*\n!.gitignore\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(seed)], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(seed), "add", "Assets/.gitignore"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-qm", "stage"], check=True)
+    revision = subprocess.check_output(
+        ["git", "-C", str(seed), "rev-parse", "HEAD"], text=True
+    ).strip()
+    staged = tmp_path / "runtime-code" / revision
+    staged.parent.mkdir()
+    seed.rename(staged)
+
+    receipt = prepare_runtime_asset_mountpoints(staged)
+
+    assert receipt["runtime_revision"] == revision
+    assert receipt["runtime_root"] == str(staged.resolve())
+    assert [row["root"] for row in receipt["mountpoints"]] == [
+        "objects",
+        "robots",
+        "scenes",
+        "textures",
+    ]
+    assert all((staged / "Assets" / root).is_dir() for root in ("objects", "robots", "scenes", "textures"))
+    assert subprocess.check_output(
+        ["git", "-C", str(staged), "status", "--porcelain", "--untracked-files=all"],
+        text=True,
+    ) == ""
+
+
+def test_two_pinned_module_invocations_redirect_logs_and_leave_source_immutable(tmp_path: Path) -> None:
+    source = tmp_path / "pinned-source"
+    package_root = source / "source" / "lehome"
+    runtime_root = tmp_path / "runtime"
+    external_project = tmp_path / "external-project"
+    (source / "scripts").mkdir(parents=True)
+    (package_root / "lehome" / "utils").mkdir(parents=True)
+    runtime_root.mkdir()
+    for path in (
+        source / "scripts" / "__init__.py",
+        package_root / "lehome" / "__init__.py",
+        package_root / "lehome" / "utils" / "__init__.py",
+    ):
+        path.write_text("", encoding="utf-8")
+    (package_root / "lehome" / "utils" / "logger.py").write_text(
+        "from pathlib import Path\n"
+        f"def get_project_root(): return Path({str(source)!r})\n",
+        encoding="utf-8",
+    )
+    (source / "scripts" / "helper.py").write_text("VALUE = 'PINNED'\n", encoding="utf-8")
+    (source / "scripts" / "eval.py").write_text(
+        "from pathlib import Path\n"
+        "from .helper import VALUE\n"
+        "from lehome.utils.logger import get_project_root\n"
+        "target=get_project_root()/'logs'/'top_long'\n"
+        "target.mkdir(parents=True,exist_ok=True)\n"
+        "(target/'eval.log').open('a').write(VALUE+'\\n')\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-qm", "pinned"], check=True)
+    before = subprocess.check_output(
+        ["git", "-C", str(source), "status", "--porcelain", "--untracked-files=all"],
+        text=True,
+    )
+    tree_before = hashlib.sha256(
+        b"".join(path.read_bytes() for path in sorted(source.rglob("*")) if path.is_file() and ".git" not in path.parts)
+    ).hexdigest()
+    environment = {
+        **os.environ,
+        "PYTHONPATH": f"{package_root}:{source}:{NATIVE_SITE_CUSTOMIZE.parent}",
+        "PYTHONSAFEPATH": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "LEHOME_NATIVE_REFERENCE_LOG_PROJECT_ROOT": str(external_project),
+        "LEHOME_NATIVE_REFERENCE_SOURCE_ROOT": str(source),
+    }
+
+    for _ in range(2):
+        result = subprocess.run(
+            [os.sys.executable, "-P", "-m", "scripts.eval"],
+            cwd=runtime_root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+    tree_after = hashlib.sha256(
+        b"".join(path.read_bytes() for path in sorted(source.rglob("*")) if path.is_file() and ".git" not in path.parts)
+    ).hexdigest()
+    assert before == ""
+    assert tree_after == tree_before
+    assert subprocess.check_output(
+        ["git", "-C", str(source), "status", "--porcelain", "--untracked-files=all"],
+        text=True,
+    ) == ""
+    assert (external_project / "logs" / "top_long" / "eval.log").read_text(encoding="utf-8") == "PINNED\nPINNED\n"
+    assert not any(source.rglob("__pycache__"))

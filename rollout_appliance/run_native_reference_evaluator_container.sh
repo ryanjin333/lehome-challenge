@@ -5,12 +5,14 @@ set -euo pipefail
 readonly MODE="${1:-}"
 readonly OUTPUT_MODE="${2:-}"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly RUNTIME_REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
-readonly LAUNCHER="$SCRIPT_DIR/run_native_reference_evaluator_gate.sh"
 readonly RUNTIME_IMAGE_ID="sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
 readonly WORKSPACE_ROOT="/mnt/lehome"
 readonly ASSET_SOURCE_ROOT="$WORKSPACE_ROOT/eval/assets"
 readonly CANONICAL_ASSETS_ROOT="$WORKSPACE_ROOT/reference-native/assets"
+readonly RUNTIME_REVISION="${LEHOME_NATIVE_REFERENCE_RUNTIME_REVISION:-}"
+readonly RUNTIME_REPO_ROOT="$WORKSPACE_ROOT/runtime-code/$RUNTIME_REVISION"
+readonly LAUNCHER="$RUNTIME_REPO_ROOT/rollout_appliance/run_native_reference_evaluator_gate.sh"
+readonly RUNTIME_VERIFIER="$RUNTIME_REPO_ROOT/scripts/verify_native_reference_evaluator_gate.py"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
 [[ "$MODE" == source-stage || "$MODE" == inventory-cache || "$MODE" == validate-only || "$MODE" == execute ]] \
@@ -18,6 +20,8 @@ fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
 [[ -z "$OUTPUT_MODE" || "$OUTPUT_MODE" == --print-command ]] \
   || fail "the only optional argument is --print-command"
 [[ $# -le 2 ]] || fail "unexpected arguments"
+[[ "$RUNTIME_REVISION" =~ ^[0-9a-f]{40}$ ]] \
+  || fail "LEHOME_NATIVE_REFERENCE_RUNTIME_REVISION must be an exact 40-character lowercase Git revision"
 
 declare -a command=(docker run --rm --pull never --gpus all --init --network host --shm-size=8g)
 command+=(--mount "type=bind,src=$WORKSPACE_ROOT,dst=$WORKSPACE_ROOT")
@@ -43,8 +47,8 @@ append_environment LEHOME_NATIVE_REFERENCE_MODE "$MODE"
 append_environment LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY "$([[ "$MODE" == validate-only ]] && printf 1 || printf 0)"
 append_environment LEHOME_NATIVE_REFERENCE_PYTHON /opt/lehome-challenge/.venv/bin/python
 append_environment LEHOME_NATIVE_REFERENCE_SOURCE_ROOT "$WORKSPACE_ROOT/reference-native/source"
-append_environment LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT "$WORKSPACE_ROOT/reference-native/pretrained_model"
-append_environment LEHOME_NATIVE_REFERENCE_METADATA_ROOT "$WORKSPACE_ROOT/reference-native/dataset_meta"
+append_environment LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT "$WORKSPACE_ROOT/cache/reference-theo-d384fe0/repo/pretrained_model"
+append_environment LEHOME_NATIVE_REFERENCE_METADATA_ROOT "$WORKSPACE_ROOT/cache/reference-theo-d384fe0/repo/dataset_meta"
 append_environment LEHOME_NATIVE_REFERENCE_ASSETS_ROOT "$CANONICAL_ASSETS_ROOT"
 append_environment LEHOME_NATIVE_REFERENCE_VM_ID computeinstance-u00t6xfqhadrcmssa2
 append_environment LEHOME_NATIVE_REFERENCE_DISK_ID computedisk-u00pbe55crxy7jr56x
@@ -81,6 +85,9 @@ fi
 command -v docker >/dev/null 2>&1 || fail "docker is unavailable"
 [[ -d "$WORKSPACE_ROOT" && ! -L "$WORKSPACE_ROOT" ]] || fail "workspace mount root is unavailable or unsafe"
 [[ -f "$LAUNCHER" && ! -L "$LAUNCHER" ]] || fail "reviewed native reference launcher is unavailable or unsafe"
+[[ -f "$RUNTIME_VERIFIER" && ! -L "$RUNTIME_VERIFIER" ]] || fail "reviewed native reference verifier is unavailable or unsafe"
+python3 "$RUNTIME_VERIFIER" prepare-runtime-mountpoints --runtime-root "$RUNTIME_REPO_ROOT" >/dev/null \
+  || fail "reviewed runtime asset mountpoints could not be prepared safely"
 for root in objects robots scenes textures; do
   [[ -d "$ASSET_SOURCE_ROOT/$root" && ! -L "$ASSET_SOURCE_ROOT/$root" ]] \
     || fail "authenticated asset source is unavailable or unsafe: $root"

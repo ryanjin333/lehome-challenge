@@ -16,6 +16,7 @@ readonly RUNTIME_IMAGE_REFERENCE="lehome-rollout:build"
 readonly RUNTIME_IMAGE_ID="sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly RUNTIME_REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+readonly NATIVE_SITE_ROOT="$RUNTIME_REPO_ROOT/rollout_appliance/native_reference_site"
 readonly CANONICAL_CACHE_MANIFEST="$SCRIPT_DIR/native_reference_canonical_cache_manifest.json"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
@@ -112,10 +113,18 @@ validate_stage_integrity() {
   # simulator stage. A metadata snapshot is not sufficient evidence here.
   validate_checkpoint full
   validate_source_runtime
+  validate_runtime_support
   authenticate_canonical_caches
   validate_runtime_asset_bindings
   [[ "$AUTHENTICATED_METADATA_TREE_SHA256" == "$METADATA_TREE_SHA256" ]] || fail "native reference metadata tree changed during evaluation"
   [[ "$AUTHENTICATED_ASSETS_TREE_SHA256" == "$ASSETS_TREE_SHA256" ]] || fail "native reference assets tree changed during evaluation"
+}
+
+validate_runtime_support() {
+  [[ -d "$NATIVE_SITE_ROOT" && ! -L "$NATIVE_SITE_ROOT" ]] \
+    || fail "reviewed native reference site support is unavailable or unsafe"
+  [[ -f "$NATIVE_SITE_ROOT/sitecustomize.py" && ! -L "$NATIVE_SITE_ROOT/sitecustomize.py" ]] \
+    || fail "reviewed native reference sitecustomize is unavailable or unsafe"
 }
 
 validate_runtime_asset_bindings() {
@@ -258,7 +267,7 @@ VM_ID="${LEHOME_NATIVE_REFERENCE_VM_ID:-}"; DISK_ID="${LEHOME_NATIVE_REFERENCE_D
 CHECKPOINT_ROOT="${LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT:-}"; METADATA_ROOT="${LEHOME_NATIVE_REFERENCE_METADATA_ROOT:-}"; ASSETS_ROOT="${LEHOME_NATIVE_REFERENCE_ASSETS_ROOT:-}"; OUTPUT_ROOT="${LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT:-}"
 CACHE_TRUST_MANIFEST_REVISION="${LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION:-}"; CACHE_TRUST_MANIFEST_PATH="${LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH:-}"; PROVIDER_RUNNING_RECEIPT="${LEHOME_NATIVE_REFERENCE_PROVIDER_RUNNING_RECEIPT:-}"
 require_absolute_directory "$CHECKPOINT_ROOT" "native reference checkpoint cache"; require_absolute_directory "$METADATA_ROOT" "native reference metadata cache"; require_absolute_directory "$ASSETS_ROOT" "native reference challenge assets"
-validate_checkpoint full; validate_source_runtime
+validate_checkpoint full; validate_source_runtime; validate_runtime_support
 authenticate_canonical_caches
 validate_runtime_asset_bindings
 CHECKPOINT_TREE_SHA256="$(checkpoint_tree_sha256)"; METADATA_TREE_SHA256="$AUTHENTICATED_METADATA_TREE_SHA256"; ASSETS_TREE_SHA256="$AUTHENTICATED_ASSETS_TREE_SHA256"
@@ -289,9 +298,16 @@ validate_runtime_image_binding
 probe_cuda; probe_host_runtime; write_identity_and_preflight
 run_stage() {
   local stage="$1" category="$2" garment="$3" log="$OUTPUT_ROOT/logs/stage-${stage}.log"
+  local public_log_root="$OUTPUT_ROOT/public-runtime/stage-${stage}"
   validate_stage_integrity
   local -a command=("$PYTHON_BIN" -P -m scripts.eval --headless --device cpu --task "LeHome-BiSO101-Direct-Garment-v2" --policy_type lerobot --policy_path "$CHECKPOINT_ROOT" --dataset_root "$METADATA_ROOT/${category}_merged" --task_description "fold the garment on the table" --garment_type "$category" --garment_filter "$garment" --num_episodes 2 --max_steps 600 --seed 42 --save_video --video_dir "$OUTPUT_ROOT/videos/stage-${stage}" --garment_cfg_base_path "$ASSETS_ROOT/objects/Challenge_Garment" --particle_cfg_path "$SOURCE_ROOT/source/lehome/lehome/tasks/bedroom/config_file/particle_garment_cfg.yaml" --ee_urdf_path "$ASSETS_ROOT/robots/so101_new_calib.urdf")
-  (cd -- "$RUNTIME_REPO_ROOT" && PYTHONSAFEPATH=1 PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT" "${command[@]}") >"$log" 2>&1 || fail "native reference stage $stage failed; inspect $log"
+  (cd -- "$RUNTIME_REPO_ROOT" && \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONSAFEPATH=1 \
+    LEHOME_NATIVE_REFERENCE_LOG_PROJECT_ROOT="$public_log_root" \
+    LEHOME_NATIVE_REFERENCE_SOURCE_ROOT="$SOURCE_ROOT" \
+    PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$NATIVE_SITE_ROOT" \
+    "${command[@]}") >"$log" 2>&1 || fail "native reference stage $stage failed; inspect $log"
   "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" compile-stage --bundle-root "$OUTPUT_ROOT" --stage "$stage" --category "$category" --garment "$garment" --identity "$OUTPUT_ROOT/identity.json" >/dev/null
 }
 run_stage 1 top_long Top_Long_Seen_0

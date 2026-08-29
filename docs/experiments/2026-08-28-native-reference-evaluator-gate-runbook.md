@@ -65,9 +65,12 @@ with `--pull never` and `--gpus all`. The launcher still owns `--device cpu`, so
 CUDA is used only for policy inference. Do not build or pull an image and do
 not run another Isaac container in parallel.
 
-Set `reviewed_runtime_checkout` to the exact reviewed checkout on the protected
-disk. Mount it read-only at the same path inside the container so the launcher's
-parent remains the reviewed runtime repository. The image's existing virtual
+Stage the exact reviewed Git revision at
+`/mnt/lehome/runtime-code/<exact-reviewed-40-hex-revision>` on the protected
+disk and export that revision to the wrapper. The wrapper validates that the
+directory name equals `HEAD`, requires a clean tree, safely creates only the
+four ignored `Assets/` mountpoint directories, and mounts the whole revision
+read-only at the same path inside the container. The image's existing virtual
 environment remains visible at `/opt/lehome-challenge/.venv/bin/python`.
 Mount each canonical asset source directory read-only twice: once beneath the
 canonical cache root and once beneath the reviewed runtime repository's
@@ -77,9 +80,9 @@ preflight and before every simulator stage.
 Capture the local image receipt on the VM host before any container execution:
 
 ```bash
-reviewed_runtime_checkout=/mnt/lehome/reference-native/reviewed-runtime
+export LEHOME_NATIVE_REFERENCE_RUNTIME_REVISION='<exact-reviewed-40-hex-revision>'
+reviewed_runtime_checkout="/mnt/lehome/runtime-code/$LEHOME_NATIVE_REFERENCE_RUNTIME_REVISION"
 runtime_image_receipt=/mnt/lehome/reference-native/runtime-image-receipt.json
-install -d "$reviewed_runtime_checkout/Assets"/{objects,robots,scenes,textures}
 python3 "$reviewed_runtime_checkout/scripts/verify_native_reference_evaluator_gate.py" \
   capture-runtime-image --receipt "$runtime_image_receipt"
 ```
@@ -93,6 +96,11 @@ entrypoint with `bash`, and invokes the VM-local launcher only inside the
 container. Do not invoke `run_native_reference_evaluator_gate.sh` on the bare
 host. `--print-command` displays the exact shell-escaped argv without running
 Docker.
+
+The admitted checkpoint and metadata roots are the already-staged live cache
+paths `/mnt/lehome/cache/reference-theo-d384fe0/repo/pretrained_model` and
+`/mnt/lehome/cache/reference-theo-d384fe0/repo/dataset_meta`. The wrapper does
+not substitute empty `reference-native` paths or download either cache.
 
 Inspecting the fixed tag proves the operator's expected reference still names
 that image; the wrapper launches by immutable ID to close the gap between
@@ -230,6 +238,11 @@ video, a wrong/extra video directory, or any changed artifact fail immediately.
 The public log parser accepts the canonical `Episode 1/2: ... Success=True`
 lines only. A typed top-long or oracle-mismatch stop still writes its receipt,
 then exits with status `3`. It does not invoke the ordinary N1.7 gateway.
+The public evaluator runs as the pinned `scripts.eval` module from the reviewed
+runtime working directory. `PYTHONDONTWRITEBYTECODE=1` prevents source-tree
+bytecode, while reviewed `sitecustomize` redirects the evaluator's project logs
+to `OUTPUT_ROOT/public-runtime/stage-N`; the complete pinned source is rehashed
+before every stage and after stage 4.
 
 ## After execution
 
