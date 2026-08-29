@@ -283,6 +283,57 @@ def test_native_launcher_module_invocation_supports_relative_imports_and_pinned_
     assert '--ee_urdf_path "$ASSETS_ROOT/robots/so101_new_calib.urdf"' in text
 
 
+def test_native_run_stage_binds_arguments_before_expanding_stage_log(tmp_path: Path) -> None:
+    launcher_text = LAUNCHER.read_text(encoding="utf-8")
+    run_stage = launcher_text.split("run_stage() {", 1)[1].split("\n}", 1)[0]
+    fake_python = tmp_path / "fake-python"
+    trace = tmp_path / "python-invocations.txt"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$*\" >> \"$TRACE\"\n"
+        "if [[ \" $* \" == *' -m scripts.eval '* ]]; then\n"
+        "  printf '%s\\n' 'Episode 1/2: Return=1.00, Success=True'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    output_root = tmp_path / "output"
+    runtime_root = tmp_path / "runtime"
+    source_root = tmp_path / "source"
+    for path in (output_root / "logs", runtime_root, source_root):
+        path.mkdir(parents=True)
+    script = tmp_path / "exercise-run-stage.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        f"OUTPUT_ROOT={str(output_root)!r}\n"
+        f"RUNTIME_REPO_ROOT={str(runtime_root)!r}\n"
+        f"SOURCE_ROOT={str(source_root)!r}\n"
+        f"PYTHON_BIN={str(fake_python)!r}\n"
+        f"SCRIPT_DIR={str(LAUNCHER.parent)!r}\n"
+        f"NATIVE_SITE_ROOT={str(LAUNCHER.parent / 'native_reference_site')!r}\n"
+        "CHECKPOINT_ROOT=/checkpoint\n"
+        "METADATA_ROOT=/metadata\n"
+        "ASSETS_ROOT=/assets\n"
+        "validate_stage_integrity() { :; }\n"
+        f"run_stage() {{{run_stage}\n}}\n"
+        "run_stage 1 top_long Top_Long_Seen_0\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        env={**os.environ, "TRACE": str(trace)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    invocations = trace.read_text(encoding="utf-8")
+    assert "-m scripts.eval" in invocations
+    assert "compile-stage" in invocations
+
+
 def test_runtime_asset_bindings_require_the_same_device_and_inode(tmp_path: Path) -> None:
     from scripts.verify_native_reference_evaluator_gate import (
         NativeReferenceGateError,
