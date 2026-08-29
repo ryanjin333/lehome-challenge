@@ -299,7 +299,10 @@ def verify_result(result: Mapping[str, object], *, stages: Sequence[Stage], matr
     checkpoint = result.get("checkpoint")
     episodes = result.get("episodes")
     overlay = result.get("raw_checker_overlay")
-    if not isinstance(checkpoint, Mapping) or dict(checkpoint) != CHECKPOINT or not isinstance(overlay, Mapping) or dict(overlay) != {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()} or not isinstance(episodes, list) or len(episodes) != 96:
+    checkpoint_keys = {"kind", *CHECKPOINT, "cache_path", "cache_tree_sha256"}
+    if (not isinstance(checkpoint, Mapping) or set(checkpoint) != checkpoint_keys or any(checkpoint.get(name) != expected for name, expected in CHECKPOINT.items())
+            or checkpoint.get("kind") != "lehome_groot_n17_checkpoint_identity_v1" or not isinstance(checkpoint.get("cache_path"), str) or not _HEX.fullmatch(str(checkpoint.get("cache_tree_sha256")))
+            or not isinstance(overlay, Mapping) or dict(overlay) != {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()} or not isinstance(episodes, list) or len(episodes) != 96):
         raise Public96ContractError("public96 result must contain exactly 96 episodes and the pinned runtime policy")
     expected = {(stage.stage_id, stage.episode_indices[index]): stage for stage in stages for index in range(2)}
     seen: set[tuple[str, int]] = set(); categories: dict[str, Counter[str]] = {category: Counter() for category in CATEGORIES}

@@ -55,6 +55,10 @@ def _policy_root_with_canonical_artifact(tmp_path: Path) -> Path:
     return policy_root
 
 
+def _result_identity() -> dict[str, object]:
+    return {"kind": "lehome_groot_n17_checkpoint_identity_v1", **CHECKPOINT, "cache_path": "/verified/cache", "cache_tree_sha256": "a" * 64}
+
+
 def _outcomes(stages: tuple[object, ...], root: Path) -> list[dict[str, object]]:
     outcomes: list[dict[str, object]] = []
     for stage in stages:
@@ -161,7 +165,7 @@ def test_result_verification_counts_clean_failures_and_categories(tmp_path: Path
     result = {
         "kind": "lehome_groot_n17_public96_result_v1",
         "matrix_sha256": hashlib.sha256(MATRIX.read_bytes()).hexdigest(),
-        "checkpoint": dict(CHECKPOINT), "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
+        "checkpoint": _result_identity(), "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
         "episodes": _outcomes(stages, tmp_path),
     }
 
@@ -175,7 +179,7 @@ def test_result_verification_rejects_invalid_or_missing_episode(tmp_path: Path) 
     result = {
         "kind": "lehome_groot_n17_public96_result_v1",
         "matrix_sha256": hashlib.sha256(MATRIX.read_bytes()).hexdigest(),
-        "checkpoint": dict(CHECKPOINT), "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
+        "checkpoint": _result_identity(), "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
         "episodes": _outcomes(stages, tmp_path),
     }
     result["episodes"][0]["outcome"] = "infrastructure_invalid"
@@ -189,7 +193,7 @@ def test_result_verification_rejects_invalid_or_missing_episode(tmp_path: Path) 
 
 def test_result_verification_rejects_mutated_real_camera_artifact(tmp_path: Path) -> None:
     stages = load_frozen_matrix(MATRIX, MATRIX_SHA256)
-    result = {"kind": "lehome_groot_n17_public96_result_v1", "matrix_sha256": hashlib.sha256(MATRIX.read_bytes()).hexdigest(), "checkpoint": dict(CHECKPOINT), "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "episodes": _outcomes(stages, tmp_path)}
+    result = {"kind": "lehome_groot_n17_public96_result_v1", "matrix_sha256": hashlib.sha256(MATRIX.read_bytes()).hexdigest(), "checkpoint": _result_identity(), "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "episodes": _outcomes(stages, tmp_path)}
     first_video = tmp_path / result["episodes"][0]["artifacts"]["videos"]["top_rgb"]["relative_path"]
     first_video.write_bytes(b"tampered")
     with pytest.raises(Public96ContractError, match="digest"):
@@ -291,3 +295,41 @@ def test_validation_only_rejects_missing_release_assets(tmp_path: Path, monkeypa
     monkeypatch.setattr(evaluator, "canonical_policy_artifact_sha256", lambda _: CHECKPOINT["artifact_sha256"])
     with pytest.raises(Public96ContractError, match="Release"):
         run(SimpleNamespace(matrix=MATRIX, matrix_sha256=MATRIX_SHA256, policy_path=policy, checkpoint_identity_receipt=identity, asset_root=tmp_path / "missing", output_root=tmp_path / "out", policy_server_port=9117, policy_server_token_env="TOKEN", dry_run=True))
+
+
+def test_synthetic_successful_run_writes_complete_result_and_verifier_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+    policy = _policy_root_with_canonical_artifact(tmp_path); identity = tmp_path / "identity.json"; identity.write_text(json.dumps(_identity_receipt(policy)), encoding="utf-8")
+    release = tmp_path / "assets" / "Release"
+    for prefix in ("Top_Long", "Top_Short", "Pant_Long", "Pant_Short"):
+        directory = release / prefix; directory.mkdir(parents=True)
+        directory.joinpath(f"{prefix}.txt").write_text("\n".join([f"{prefix}_Seen_{index}" for index in range(10)] + [f"{prefix}_Unseen_{index}" for index in range(2)]), encoding="utf-8")
+    monkeypatch.setattr(evaluator, "canonical_policy_artifact_sha256", lambda _: CHECKPOINT["artifact_sha256"])
+
+    class Server:
+        def poll(self): return None
+        def terminate(self): pass
+        def wait(self, timeout=None): return 0
+        def kill(self): pass
+
+    def fake_run(command, *, cwd, text, stdout, stderr, check):
+        stage_root = Path(command[command.index("--video_dir") + 1]).parent
+        output = []
+        for episode_index, success in ((1, True), (2, False)):
+            folder = "success" if success else "failure"
+            for camera in ("top_rgb", "left_rgb", "right_rgb"):
+                video = stage_root / "videos" / folder / f"episode{episode_index - 1}_observation_{camera}.mp4"
+                video.parent.mkdir(parents=True, exist_ok=True); video.write_bytes(f"{episode_index}:{camera}".encode())
+            output.append(f"Episode {episode_index}/2: Return={1.0 if success else 0.0:.2f}, Length=600, Success={success}")
+        output.append("PUBLIC96_STAGE_COMPLETE " + json.dumps({"raw_checker_overlay": {"overlay_id": RAW_CHECKER_OVERLAY_ID, "overlay_sha256": overlay_sha256()}, "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"]}, sort_keys=True))
+        return SimpleNamespace(returncode=0, stdout="\n".join(output))
+
+    monkeypatch.setattr(evaluator.subprocess, "Popen", lambda *args, **kwargs: Server())
+    monkeypatch.setattr(evaluator.subprocess, "run", fake_run)
+    monkeypatch.setattr(evaluator.time, "sleep", lambda _: None)
+    monkeypatch.setenv("LEHOME_GROOT_N17_PUBLIC96_POLICY_TOKEN", "x" * 32)
+    output_root = tmp_path / "run"
+    result = run(SimpleNamespace(matrix=MATRIX, matrix_sha256=MATRIX_SHA256, policy_path=policy, checkpoint_identity_receipt=identity, asset_root=tmp_path / "assets", output_root=output_root, policy_server_port=9117, policy_server_token_env="LEHOME_GROOT_N17_PUBLIC96_POLICY_TOKEN", dry_run=False))
+    assert len(result["episodes"]) == 96
+    assert (output_root / "result.json").is_file()
+    assert (output_root / "verifier-receipt.json").is_file()
