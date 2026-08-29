@@ -350,6 +350,7 @@ def test_native_launcher_validate_only_refuses_unprepared_caches_without_cloud_a
 
 def test_native_launcher_isolated_contract_never_creates_resources_or_uses_n17_gateway() -> None:
     text = LAUNCHER.read_text(encoding="utf-8")
+    run_stage = text.split("run_stage() {", 1)[1].split("\n}", 1)[0]
 
     assert "LEHOME_NATIVE_REFERENCE_VM_ID" in text
     assert "LEHOME_NATIVE_REFERENCE_DISK_ID" in text
@@ -395,6 +396,8 @@ def test_native_launcher_isolated_contract_never_creates_resources_or_uses_n17_g
     assert "filter.lfs.smudge" in text
     assert "b83ecf7af081c6c6a60073a854be3b63b66bbb0dbe021a4683dc5428d0f360d8" in text
     assert 'show "$SOURCE_REVISION:pyproject.toml"' in text
+    assert run_stage.count("--enable_cameras") == 1
+    assert "--headless --enable_cameras --device cpu" in run_stage
 
 
 def test_native_launcher_module_invocation_supports_relative_imports_and_pinned_source_wins(
@@ -494,6 +497,8 @@ def test_native_run_stage_binds_arguments_before_expanding_stage_log(tmp_path: P
     assert result.returncode == 0, result.stderr
     invocations = trace.read_text(encoding="utf-8")
     assert "-m scripts.eval" in invocations
+    assert invocations.count("--enable_cameras") == 1
+    assert "-m scripts.eval --headless --enable_cameras --device cpu" in invocations
     assert "compile-stage" in invocations
     assert backend_trace.read_text(encoding="utf-8") == "dummy\n"
 

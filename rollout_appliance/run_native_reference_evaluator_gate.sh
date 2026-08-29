@@ -396,7 +396,7 @@ run_stage() {
   local log="$OUTPUT_ROOT/logs/stage-${stage}.log"
   local public_log_root="$OUTPUT_ROOT/public-runtime/stage-${stage}"
   validate_stage_integrity
-  local -a command=("$PYTHON_BIN" -P -m scripts.eval --headless --device cpu --task "LeHome-BiSO101-Direct-Garment-v2" --policy_type lerobot --policy_path "$CHECKPOINT_ROOT" --dataset_root "$METADATA_ROOT/${category}_merged" --task_description "fold the garment on the table" --garment_type "$category" --garment_filter "$garment" --num_episodes 2 --max_steps 600 --seed 42 --save_video --video_dir "$OUTPUT_ROOT/videos/stage-${stage}" --garment_cfg_base_path "$ASSETS_ROOT/objects/Challenge_Garment" --particle_cfg_path "$SOURCE_ROOT/source/lehome/lehome/tasks/bedroom/config_file/particle_garment_cfg.yaml" --ee_urdf_path "$ASSETS_ROOT/robots/so101_new_calib.urdf")
+  local -a command=("$PYTHON_BIN" -P -m scripts.eval --headless --enable_cameras --device cpu --task "LeHome-BiSO101-Direct-Garment-v2" --policy_type lerobot --policy_path "$CHECKPOINT_ROOT" --dataset_root "$METADATA_ROOT/${category}_merged" --task_description "fold the garment on the table" --garment_type "$category" --garment_filter "$garment" --num_episodes 2 --max_steps 600 --seed 42 --save_video --video_dir "$OUTPUT_ROOT/videos/stage-${stage}" --garment_cfg_base_path "$ASSETS_ROOT/objects/Challenge_Garment" --particle_cfg_path "$SOURCE_ROOT/source/lehome/lehome/tasks/bedroom/config_file/particle_garment_cfg.yaml" --ee_urdf_path "$ASSETS_ROOT/robots/so101_new_calib.urdf")
   (cd -- "$RUNTIME_REPO_ROOT" && \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONSAFEPATH=1 \
