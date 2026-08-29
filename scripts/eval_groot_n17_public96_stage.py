@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+import traceback
 
 from scripts.groot_n17_public96_raw_checker import RAW_CHECKER_OVERLAY_ID, install_raw_checker_overlay
 
@@ -34,13 +36,29 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(remaining)
     simulation_app = evaluator.launch_app_from_args(args)
     try:
-        import lehome.tasks.bedroom
-        from scripts.utils import evaluation as evaluation_module
+        try:
+            import lehome.tasks.bedroom
+            from scripts.utils import evaluation as evaluation_module
 
-        if getattr(args, "headless", False):
-            os.environ["LEHOME_DISABLE_KEYBOARD"] = "1"
-        evaluation_module.eval(args, simulation_app)
-        print("PUBLIC96_STAGE_COMPLETE " + json.dumps({"raw_checker_overlay": installed, "runtime_policy_sha256": parsed.public96_runtime_policy_sha256}, sort_keys=True))
+            if getattr(args, "headless", False):
+                os.environ["LEHOME_DISABLE_KEYBOARD"] = "1"
+            evaluation_module.eval(args, simulation_app)
+            print(
+                "PUBLIC96_STAGE_COMPLETE "
+                + json.dumps(
+                    {
+                        "raw_checker_overlay": installed,
+                        "runtime_policy_sha256": parsed.public96_runtime_policy_sha256,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        except BaseException:
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            raise
     finally:
         evaluator.common.close_app(simulation_app)
     return 0

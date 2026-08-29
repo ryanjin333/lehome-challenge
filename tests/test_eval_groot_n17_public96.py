@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -122,6 +123,141 @@ def test_public96_stage_launches_simulation_before_task_and_evaluation_imports(
         "import:lehome.tasks.bedroom", "import:scripts.utils", "evaluate", "close",
     ]
     assert "PUBLIC96_STAGE_COMPLETE" in capsys.readouterr().out
+
+
+def test_public96_stage_emits_and_flushes_failure_before_closing_simulation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live-stage exception must survive the Kit shutdown boundary in stderr."""
+    import scripts.eval_groot_n17_public96_stage as stage
+
+    stage = importlib.reload(stage)
+    events: list[str] = []
+
+    class Parser:
+        def set_defaults(self, **_kwargs: object) -> None:
+            return None
+
+        def parse_args(self, _argv: list[str]) -> SimpleNamespace:
+            return SimpleNamespace(headless=True)
+
+    class RecordingStream(io.StringIO):
+        def flush(self) -> None:
+            events.append(f"flush:{'stdout' if self is stdout else 'stderr'}")
+            super().flush()
+
+    parser = Parser()
+    evaluator = ModuleType("scripts.eval")
+    evaluator.setup_eval_parser = lambda: parser
+    evaluator.AppLauncher = SimpleNamespace(add_app_launcher_args=lambda _value: None)
+    evaluator.launch_app_from_args = lambda _args: object()
+    evaluator.common = SimpleNamespace(close_app=lambda _app: events.append("close"))
+    monkeypatch.setitem(sys.modules, "scripts.eval", evaluator)
+
+    evaluation = ModuleType("scripts.utils.evaluation")
+
+    def evaluate(_args: object, _simulation_app: object) -> None:
+        events.append("evaluate")
+        raise ValueError("cloth state became non-finite")
+
+    evaluation.eval = evaluate
+    utilities = ModuleType("scripts.utils")
+    utilities.evaluation = evaluation
+    monkeypatch.setitem(sys.modules, "scripts.utils", utilities)
+    monkeypatch.setitem(sys.modules, "scripts.utils.evaluation", evaluation)
+
+    bedroom = ModuleType("lehome.tasks.bedroom")
+    tasks = ModuleType("lehome.tasks")
+    tasks.bedroom = bedroom
+    lehome = ModuleType("lehome")
+    lehome.tasks = tasks
+    monkeypatch.setitem(sys.modules, "lehome", lehome)
+    monkeypatch.setitem(sys.modules, "lehome.tasks", tasks)
+    monkeypatch.setitem(sys.modules, "lehome.tasks.bedroom", bedroom)
+    monkeypatch.setattr(stage, "install_raw_checker_overlay", lambda: {"overlay_id": stage.RAW_CHECKER_OVERLAY_ID})
+
+    stdout = RecordingStream()
+    stderr = RecordingStream()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    with pytest.raises(ValueError, match="cloth state became non-finite"):
+        stage.main([
+            "--public96_raw_checker_overlay", stage.RAW_CHECKER_OVERLAY_ID,
+            "--policy_server_endpoint", "http://127.0.0.1:9117",
+            "--policy_server_token_env", "PUBLIC96_TOKEN",
+            "--policy_server_request_timeout", "5",
+            "--public96_runtime_policy_sha256", "e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa",
+            "--headless",
+        ])
+
+    assert "ValueError: cloth state became non-finite" in stderr.getvalue()
+    assert "PUBLIC96_STAGE_COMPLETE" not in stdout.getvalue()
+    assert events == ["evaluate", "flush:stdout", "flush:stderr", "close"]
+
+
+def test_public96_stage_flushes_completion_before_closing_simulation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The success receipt must reach the scheduler before Kit can exit."""
+    import scripts.eval_groot_n17_public96_stage as stage
+
+    stage = importlib.reload(stage)
+    events: list[str] = []
+
+    class Parser:
+        def set_defaults(self, **_kwargs: object) -> None:
+            return None
+
+        def parse_args(self, _argv: list[str]) -> SimpleNamespace:
+            return SimpleNamespace(headless=True)
+
+    class RecordingStdout(io.StringIO):
+        def write(self, value: str) -> int:
+            if value.startswith("PUBLIC96_STAGE_COMPLETE "):
+                events.append("marker")
+            return super().write(value)
+
+        def flush(self) -> None:
+            events.append("flush")
+            super().flush()
+
+    parser = Parser()
+    evaluator = ModuleType("scripts.eval")
+    evaluator.setup_eval_parser = lambda: parser
+    evaluator.AppLauncher = SimpleNamespace(add_app_launcher_args=lambda _value: None)
+    evaluator.launch_app_from_args = lambda _args: object()
+    evaluator.common = SimpleNamespace(close_app=lambda _app: events.append("close"))
+    monkeypatch.setitem(sys.modules, "scripts.eval", evaluator)
+
+    evaluation = ModuleType("scripts.utils.evaluation")
+    evaluation.eval = lambda _args, _simulation_app: events.append("evaluate")
+    utilities = ModuleType("scripts.utils")
+    utilities.evaluation = evaluation
+    monkeypatch.setitem(sys.modules, "scripts.utils", utilities)
+    monkeypatch.setitem(sys.modules, "scripts.utils.evaluation", evaluation)
+
+    bedroom = ModuleType("lehome.tasks.bedroom")
+    tasks = ModuleType("lehome.tasks")
+    tasks.bedroom = bedroom
+    lehome = ModuleType("lehome")
+    lehome.tasks = tasks
+    monkeypatch.setitem(sys.modules, "lehome", lehome)
+    monkeypatch.setitem(sys.modules, "lehome.tasks", tasks)
+    monkeypatch.setitem(sys.modules, "lehome.tasks.bedroom", bedroom)
+    monkeypatch.setattr(stage, "install_raw_checker_overlay", lambda: {"overlay_id": stage.RAW_CHECKER_OVERLAY_ID})
+    monkeypatch.setattr(sys, "stdout", RecordingStdout())
+
+    assert stage.main([
+        "--public96_raw_checker_overlay", stage.RAW_CHECKER_OVERLAY_ID,
+        "--policy_server_endpoint", "http://127.0.0.1:9117",
+        "--policy_server_token_env", "PUBLIC96_TOKEN",
+        "--policy_server_request_timeout", "5",
+        "--public96_runtime_policy_sha256", "e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa",
+        "--headless",
+    ]) == 0
+
+    assert events == ["evaluate", "marker", "flush", "close"]
 
 
 def _identity_receipt(policy_root: Path) -> dict[str, object]:
