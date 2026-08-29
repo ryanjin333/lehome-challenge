@@ -55,6 +55,91 @@ def _policy_root_with_canonical_artifact(tmp_path: Path) -> Path:
     return policy_root
 
 
+def _runtime_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, output_name: str) -> tuple[SimpleNamespace, Path, dict[str, object]]:
+    """Build CPU-safe public96 runner inputs without importing a policy runtime."""
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    policy = _policy_root_with_canonical_artifact(tmp_path)
+    identity = tmp_path / "identity.json"
+    identity_value = _identity_receipt(policy)
+    identity.write_text(json.dumps(identity_value), encoding="utf-8")
+    release = tmp_path / "assets" / "Release"
+    for prefix in ("Top_Long", "Top_Short", "Pant_Long", "Pant_Short"):
+        directory = release / prefix
+        directory.mkdir(parents=True)
+        directory.joinpath(f"{prefix}.txt").write_text(
+            "\n".join([f"{prefix}_Seen_{index}" for index in range(10)] + [f"{prefix}_Unseen_{index}" for index in range(2)]),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(evaluator, "canonical_policy_artifact_sha256", lambda _: CHECKPOINT["artifact_sha256"])
+    monkeypatch.setenv("LEHOME_GROOT_N17_PUBLIC96_POLICY_TOKEN", "x" * 32)
+    output_root = tmp_path / output_name
+    return (
+        SimpleNamespace(
+            matrix=MATRIX,
+            matrix_sha256=MATRIX_SHA256,
+            policy_path=policy,
+            checkpoint_identity_receipt=identity,
+            asset_root=tmp_path / "assets",
+            output_root=output_root,
+            policy_server_port=9117,
+            policy_server_token_env="LEHOME_GROOT_N17_PUBLIC96_POLICY_TOKEN",
+            dry_run=False,
+        ),
+        output_root,
+        identity_value,
+    )
+
+
+def _assert_pre_stage_invalid_evidence(output_root: Path, identity: dict[str, object], reason: str) -> None:
+    stages = load_frozen_matrix(MATRIX, MATRIX_SHA256)
+    result_path = output_root / "result.json"
+    receipt_path = output_root / "verifier-receipt.json"
+    server_log = output_root / "policy-server.log"
+    assert result_path.is_file() and receipt_path.is_file() and server_log.is_file()
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["kind"] == "lehome_groot_n17_public96_result_v1"
+    assert result["matrix_sha256"] == hashlib.sha256(MATRIX.read_bytes()).hexdigest()
+    assert result["checkpoint"] == identity
+    assert result["raw_checker_overlay"] == {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}
+    assert result["status"] == "invalid"
+    assert result["failure_reason"] == reason
+    assert result["summary"] == {"status": "invalid", "assigned_episodes": 96, "invalid_episodes": 96}
+    assert not {"overall", "categories", "success_rate", "scored_episodes"} & set(result["summary"])
+    assert result["publication"] == {"status": "not_attempted", "vm_stop": "not_attempted"}
+    assert result["invalid_stages"] == [{"stage_id": stage.stage_id, "reason": reason} for stage in stages]
+    assert result["episodes"] == [
+        {
+            "stage_id": stage.stage_id,
+            "category": stage.category,
+            "garment_name": stage.garment_name,
+            "release_stage": stage.release_stage,
+            "seed": stage.seed,
+            "episode_index": episode_index,
+            "outcome": "infrastructure_invalid",
+            "success": False,
+            "invalid_reason": reason,
+            "artifacts": {},
+        }
+        for stage in stages
+        for episode_index in stage.episode_indices
+    ]
+    assert not any((output_root / stage.stage_id).exists() for stage in stages)
+
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["kind"] == "lehome_groot_n17_public96_verifier_receipt_v1"
+    assert receipt["status"] == "invalid"
+    assert receipt["failure_reason"] == reason
+    assert receipt["invalid_stages"] == result["invalid_stages"]
+    assert receipt["matrix_sha256"] == result["matrix_sha256"]
+    assert receipt["checkpoint"] == identity
+    assert receipt["raw_checker_overlay"] == result["raw_checker_overlay"]
+    assert receipt["publication"] == {"status": "not_attempted", "vm_stop": "not_attempted"}
+    assert receipt["result"] == {"relative_path": "result.json", "sha256": hashlib.sha256(result_path.read_bytes()).hexdigest()}
+    assert receipt["policy_server_log"] == {"relative_path": "policy-server.log", "sha256": hashlib.sha256(server_log.read_bytes()).hexdigest()}
+
+
 def _result_identity() -> dict[str, object]:
     return {"kind": "lehome_groot_n17_checkpoint_identity_v1", **CHECKPOINT, "cache_path": "/verified/cache", "cache_tree_sha256": "a" * 64}
 
@@ -337,3 +422,69 @@ def test_synthetic_successful_run_writes_complete_result_and_verifier_receipt(tm
     assert len(result["episodes"]) == 96
     assert (output_root / "result.json").is_file()
     assert (output_root / "verifier-receipt.json").is_file()
+
+
+def test_policy_server_construction_failure_emits_all_unstarted_invalid_assignments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    args, output_root, identity = _runtime_inputs(tmp_path, monkeypatch, output_name="popen-failure")
+    stage_commands: list[list[str]] = []
+
+    def fail_to_start(*args: object, **kwargs: object) -> object:
+        raise OSError("policy server launch denied")
+
+    def no_stage(command: list[str], **kwargs: object) -> object:
+        stage_commands.append(command)
+        raise AssertionError("startup failure must not launch a public96 stage")
+
+    monkeypatch.setattr(evaluator.subprocess, "Popen", fail_to_start)
+    monkeypatch.setattr(evaluator.subprocess, "run", no_stage)
+
+    reason = "policy server startup failed: policy server launch denied"
+    with pytest.raises(Public96ContractError, match=reason):
+        run(args)
+
+    assert stage_commands == []
+    _assert_pre_stage_invalid_evidence(output_root, identity, reason)
+
+
+@pytest.mark.parametrize("mode", ("exited", "invalid_readiness"))
+def test_policy_server_pre_stage_failure_emits_all_unstarted_invalid_assignments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    args, output_root, identity = _runtime_inputs(tmp_path, monkeypatch, output_name=f"server-{mode}")
+    stage_commands: list[list[str]] = []
+
+    class Server:
+        def poll(self) -> int | None:
+            return 1 if mode == "exited" else None
+
+        def terminate(self) -> None:
+            pass
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def kill(self) -> None:
+            pass
+
+    def fake_popen(command: list[str], *args: object, **kwargs: object) -> Server:
+        if mode == "invalid_readiness":
+            readiness = Path(command[command.index("--readiness-receipt") + 1])
+            readiness.write_text(json.dumps({"artifact_sha256": "not-the-pinned-policy"}), encoding="utf-8")
+        return Server()
+
+    def no_stage(command: list[str], **kwargs: object) -> object:
+        stage_commands.append(command)
+        raise AssertionError("pre-stage server failure must not launch a public96 stage")
+
+    monkeypatch.setattr(evaluator.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(evaluator.subprocess, "run", no_stage)
+    monkeypatch.setattr(evaluator.time, "sleep", lambda _: None)
+
+    reason = "N1.7 policy server exited before public96 evaluation" if mode == "exited" else "policy server readiness does not bind the pinned N1.7 policy"
+    with pytest.raises(Public96ContractError, match=reason):
+        run(args)
+
+    assert stage_commands == []
+    _assert_pre_stage_invalid_evidence(output_root, identity, reason)

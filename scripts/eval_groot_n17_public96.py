@@ -280,6 +280,59 @@ def _write_new_json(path: Path, value: Mapping[str, object]) -> None:
     path.write_text(json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def _infrastructure_invalid_episode(stage: Stage, episode_index: int, reason: str) -> dict[str, object]:
+    return {
+        "stage_id": stage.stage_id,
+        "category": stage.category,
+        "garment_name": stage.garment_name,
+        "release_stage": stage.release_stage,
+        "seed": stage.seed,
+        "episode_index": episode_index,
+        "outcome": "infrastructure_invalid",
+        "success": False,
+        "invalid_reason": reason,
+        "artifacts": {},
+    }
+
+
+def _write_invalid_evidence(*, output_root: Path, stages: Sequence[Stage], matrix_digest: str, identity: Mapping[str, object], server_log: Path | None, invalids: Sequence[Mapping[str, str]], episodes: Sequence[Mapping[str, object]], failure_reason: str | None = None) -> None:
+    """Persist an unscored, fully assigned result without inventing stage evidence."""
+    result: dict[str, object] = {
+        "kind": "lehome_groot_n17_public96_result_v1",
+        "matrix_sha256": matrix_digest,
+        "checkpoint": dict(identity),
+        "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
+        "episodes": list(episodes),
+        "invalid_stages": [dict(item) for item in invalids],
+        "status": "invalid",
+        "summary": {
+            "status": "invalid",
+            "assigned_episodes": sum(len(stage.episode_indices) for stage in stages),
+            "invalid_episodes": len(episodes),
+        },
+        "publication": {"status": "not_attempted", "vm_stop": "not_attempted"},
+    }
+    if failure_reason is not None:
+        result["failure_reason"] = failure_reason
+    _write_new_json(output_root / "result.json", result)
+
+    receipt: dict[str, object] = {
+        "kind": "lehome_groot_n17_public96_verifier_receipt_v1",
+        "status": "invalid",
+        "invalid_stages": [dict(item) for item in invalids],
+        "result": _artifact(output_root / "result.json", output_root),
+        "matrix_sha256": matrix_digest,
+        "checkpoint": dict(identity),
+        "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
+        "publication": {"status": "not_attempted", "vm_stop": "not_attempted"},
+    }
+    if server_log is not None and server_log.is_file():
+        receipt["policy_server_log"] = _artifact(server_log, output_root)
+    if failure_reason is not None:
+        receipt["failure_reason"] = failure_reason
+    _write_new_json(output_root / "verifier-receipt.json", receipt)
+
+
 def _verified_artifact(value: object, *, root: Path, expected_path: str | None = None) -> None:
     if not isinstance(value, Mapping) or set(value) != {"relative_path", "sha256"}:
         raise Public96ContractError("artifact descriptor is invalid")
@@ -375,67 +428,81 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if len(token) < 32:
         raise Public96ContractError("policy-server token is missing; evaluation was not started")
     server_log = output_root / "policy-server.log"; server_handle = server_log.open("x", encoding="utf-8")
-    server = subprocess.Popen(policy_command, stdout=server_handle, stderr=subprocess.STDOUT, text=True)
     episodes: list[dict[str, object]] = []
     invalids: list[dict[str, str]] = []
+    server: subprocess.Popen[str] | None = None
+    startup_failure: Public96ContractError | None = None
     try:
-        for _ in range(20):
-            if readiness_receipt.is_file(): break
-            if server.poll() is not None: break
-            time.sleep(0.1)
-        if server.poll() is not None or not readiness_receipt.is_file():
-            raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
-        readiness = _read_json(readiness_receipt, "policy server readiness")
-        if readiness.get("artifact_sha256") != CHECKPOINT["artifact_sha256"] or readiness.get("runtime_policy_sha256") != CHECKPOINT["runtime_policy_sha256"] or readiness.get("model_path") != str(args.policy_path.resolve()) or readiness.get("device") != "cuda:0":
-            raise Public96ContractError("policy server readiness does not bind the pinned N1.7 policy")
-        for stage, command in zip(stages, stage_commands, strict=True):
-            stage_root = _stage_dir(output_root, stage)
+        try:
+            server = subprocess.Popen(policy_command, stdout=server_handle, stderr=subprocess.STDOUT, text=True)
+        except (OSError, subprocess.SubprocessError) as error:
+            startup_failure = Public96ContractError(f"policy server startup failed: {error}")
+        if startup_failure is None:
             try:
-                stage_root.mkdir(); _make_overlay(args.asset_root, stage_root, stage.garment_name)
-                log = stage_root / "stage.log"; completed = subprocess.run(command, cwd=Path.cwd(), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
-                log.write_text(completed.stdout, encoding="utf-8")
-                metrics = _parse_stage_metrics(completed.stdout)
-                marker = [line for line in completed.stdout.splitlines() if line.startswith("PUBLIC96_STAGE_COMPLETE ")]
-                if completed.returncode != 0 or len(marker) != 1 or "Traceback" in completed.stdout:
-                    raise Public96ContractError("stage process exited nonzero after metrics")
+                for _ in range(20):
+                    if readiness_receipt.is_file(): break
+                    if server.poll() is not None: break
+                    time.sleep(0.1)
+                if server.poll() is not None or not readiness_receipt.is_file():
+                    raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
+                readiness = _read_json(readiness_receipt, "policy server readiness")
+                if readiness.get("artifact_sha256") != CHECKPOINT["artifact_sha256"] or readiness.get("runtime_policy_sha256") != CHECKPOINT["runtime_policy_sha256"] or readiness.get("model_path") != str(args.policy_path.resolve()) or readiness.get("device") != "cuda:0":
+                    raise Public96ContractError("policy server readiness does not bind the pinned N1.7 policy")
+                if server.poll() is not None:
+                    raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
+            except Public96ContractError as error:
+                startup_failure = error
+        if startup_failure is None:
+            for stage, command in zip(stages, stage_commands, strict=True):
+                stage_root = _stage_dir(output_root, stage)
                 try:
-                    child = json.loads(marker[0].removeprefix("PUBLIC96_STAGE_COMPLETE "))
-                except json.JSONDecodeError as error:
-                    raise Public96ContractError("stage completion sentinel is invalid") from error
-                if child != {"raw_checker_overlay": {"overlay_id": RAW_CHECKER_OVERLAY_ID, "overlay_sha256": overlay_sha256()}, "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"]}:
-                    raise Public96ContractError("stage completion sentinel does not attest the pinned runtime and overlay")
-                episode_videos = []
-                for metric in metrics:
-                    folder = "success" if metric["success"] else "failure"
-                    source_index = int(metric["episode_index"]) - 1
-                    cameras = {camera: stage_root / "videos" / folder / f"episode{source_index}_observation_{camera}.mp4" for camera in ("top_rgb", "left_rgb", "right_rgb")}
-                    episode_videos.append(cameras)
-                    for video in cameras.values(): _artifact(video, output_root)
-                stage_receipt = {"kind": "lehome_groot_n17_public96_stage_receipt_v1", "stage_id": stage.stage_id, "command": command, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "log": _artifact(log, output_root), "episodes": [{"episode_index": metric["episode_index"], "videos": {camera: _artifact(video, output_root) for camera, video in cameras.items()}} for metric, cameras in zip(metrics, episode_videos, strict=True)]}
-                receipt_path = stage_root / "stage-receipt.json"; _write_new_json(receipt_path, stage_receipt)
-                for metric, cameras in zip(metrics, episode_videos, strict=True):
-                    episodes.append({"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_index": metric["episode_index"], "outcome": "success" if metric["success"] else "policy_failure", "success": metric["success"], "return": metric["return"], "length": metric["length"], "artifacts": {"log": _artifact(log, output_root), "videos": {camera: _artifact(video, output_root) for camera, video in cameras.items()}, "receipt": _artifact(receipt_path, output_root)}})
-            except (OSError, subprocess.SubprocessError, Public96ContractError) as error:
-                invalids.append({"stage_id": stage.stage_id, "reason": str(error)})
-                for episode_index in stage.episode_indices:
-                    episodes.append({"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_index": episode_index, "outcome": "infrastructure_invalid", "success": False, "invalid_reason": str(error), "artifacts": {}})
+                    stage_root.mkdir(); _make_overlay(args.asset_root, stage_root, stage.garment_name)
+                    log = stage_root / "stage.log"; completed = subprocess.run(command, cwd=Path.cwd(), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+                    log.write_text(completed.stdout, encoding="utf-8")
+                    metrics = _parse_stage_metrics(completed.stdout)
+                    marker = [line for line in completed.stdout.splitlines() if line.startswith("PUBLIC96_STAGE_COMPLETE ")]
+                    if completed.returncode != 0 or len(marker) != 1 or "Traceback" in completed.stdout:
+                        raise Public96ContractError("stage process exited nonzero after metrics")
+                    try:
+                        child = json.loads(marker[0].removeprefix("PUBLIC96_STAGE_COMPLETE "))
+                    except json.JSONDecodeError as error:
+                        raise Public96ContractError("stage completion sentinel is invalid") from error
+                    if child != {"raw_checker_overlay": {"overlay_id": RAW_CHECKER_OVERLAY_ID, "overlay_sha256": overlay_sha256()}, "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"]}:
+                        raise Public96ContractError("stage completion sentinel does not attest the pinned runtime and overlay")
+                    episode_videos = []
+                    for metric in metrics:
+                        folder = "success" if metric["success"] else "failure"
+                        source_index = int(metric["episode_index"]) - 1
+                        cameras = {camera: stage_root / "videos" / folder / f"episode{source_index}_observation_{camera}.mp4" for camera in ("top_rgb", "left_rgb", "right_rgb")}
+                        episode_videos.append(cameras)
+                        for video in cameras.values(): _artifact(video, output_root)
+                    stage_receipt = {"kind": "lehome_groot_n17_public96_stage_receipt_v1", "stage_id": stage.stage_id, "command": command, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "log": _artifact(log, output_root), "episodes": [{"episode_index": metric["episode_index"], "videos": {camera: _artifact(video, output_root) for camera, video in cameras.items()}} for metric, cameras in zip(metrics, episode_videos, strict=True)]}
+                    receipt_path = stage_root / "stage-receipt.json"; _write_new_json(receipt_path, stage_receipt)
+                    for metric, cameras in zip(metrics, episode_videos, strict=True):
+                        episodes.append({"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_index": metric["episode_index"], "outcome": "success" if metric["success"] else "policy_failure", "success": metric["success"], "return": metric["return"], "length": metric["length"], "artifacts": {"log": _artifact(log, output_root), "videos": {camera: _artifact(video, output_root) for camera, video in cameras.items()}, "receipt": _artifact(receipt_path, output_root)}})
+                except (OSError, subprocess.SubprocessError, Public96ContractError) as error:
+                    invalids.append({"stage_id": stage.stage_id, "reason": str(error)})
+                    for episode_index in stage.episode_indices:
+                        episodes.append(_infrastructure_invalid_episode(stage, episode_index, str(error)))
     finally:
-        server.terminate()
-        try: server.wait(timeout=20)
-        except subprocess.TimeoutExpired: server.kill(); server.wait()
+        if server is not None:
+            server.terminate()
+            try: server.wait(timeout=20)
+            except subprocess.TimeoutExpired: server.kill(); server.wait()
         server_handle.close()
-    result = {"kind": "lehome_groot_n17_public96_result_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "episodes": episodes, "invalid_stages": invalids, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
-    _write_new_json(output_root / "result.json", result)
+    if startup_failure is not None:
+        reason = str(startup_failure)
+        invalids = [{"stage_id": stage.stage_id, "reason": reason} for stage in stages]
+        episodes = [_infrastructure_invalid_episode(stage, episode_index, reason) for stage in stages for episode_index in stage.episode_indices]
+        _write_invalid_evidence(output_root=output_root, stages=stages, matrix_digest=matrix_digest, identity=identity, server_log=server_log, invalids=invalids, episodes=episodes, failure_reason=reason)
+        raise startup_failure
     if invalids:
-        result["status"] = "invalid"
-        result["summary"] = {"status": "invalid", "assigned_episodes": 96, "invalid_episodes": len([episode for episode in episodes if episode.get("outcome") == "infrastructure_invalid"])}
-        (output_root / "result.json").unlink(); _write_new_json(output_root / "result.json", result)
-        _write_new_json(output_root / "verifier-receipt.json", {"kind": "lehome_groot_n17_public96_verifier_receipt_v1", "status": "invalid", "invalid_stages": invalids, "result": _artifact(output_root / "result.json", output_root), "policy_server_log": _artifact(server_log, output_root), "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}})
+        _write_invalid_evidence(output_root=output_root, stages=stages, matrix_digest=matrix_digest, identity=identity, server_log=server_log, invalids=invalids, episodes=episodes)
         raise Public96ContractError("public96 run contains infrastructure/fidelity invalid stages")
+    result = {"kind": "lehome_groot_n17_public96_result_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "episodes": episodes, "invalid_stages": invalids, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
     summary = verify_result(result, stages=stages, matrix_sha256=matrix_digest, output_root=output_root)
     result["status"] = "valid"
     result["summary"] = summary
-    (output_root / "result.json").unlink()
     _write_new_json(output_root / "result.json", result)
     receipt = {"kind": "lehome_groot_n17_public96_verifier_receipt_v1", "result": _artifact(output_root / "result.json", output_root), "policy_server_log": _artifact(server_log, output_root), "summary": summary, "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
     _write_new_json(output_root / "verifier-receipt.json", receipt)
