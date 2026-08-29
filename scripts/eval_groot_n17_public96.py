@@ -18,6 +18,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -447,12 +448,33 @@ def _validate_readiness_payload(readiness: object, *, policy_root: Path) -> dict
 
 def _load_external_readiness_receipt(path: Path, *, policy_root: Path) -> tuple[dict[str, object], bytes, str]:
     """Read a sidecar-owned readiness receipt once before copying its attestation."""
-    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+    if not path.is_absolute():
         raise Public96ContractError("external policy server readiness receipt is missing or unsafe")
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if type(no_follow) is not int or not no_follow:
+        raise Public96ContractError("external policy server readiness receipt is missing or unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow
     try:
-        contents = path.read_bytes()
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise Public96ContractError("external policy server readiness receipt is missing or unsafe") from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise Public96ContractError("external policy server readiness receipt is missing or unsafe")
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        contents = b"".join(chunks)
+    except OSError as error:
+        raise Public96ContractError("external policy server readiness receipt is invalid JSON") from error
+    finally:
+        os.close(descriptor)
+    try:
         payload = json.loads(contents.decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    except (UnicodeError, json.JSONDecodeError) as error:
         raise Public96ContractError("external policy server readiness receipt is invalid JSON") from error
     return _validate_readiness_payload(payload, policy_root=policy_root), contents, hashlib.sha256(contents).hexdigest()
 

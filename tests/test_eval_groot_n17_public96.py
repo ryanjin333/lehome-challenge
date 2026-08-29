@@ -570,6 +570,35 @@ def test_external_readiness_receipt_must_bind_the_resolved_policy_path(tmp_path:
         run(args)
 
 
+def test_external_readiness_receipt_rejects_a_path_swapped_to_a_symlink_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    policy = tmp_path / "policy"
+    policy.mkdir()
+    source = _write_external_readiness_receipt(tmp_path / "readiness.json", policy)
+    replacement = _write_external_readiness_receipt(tmp_path / "replacement.json", policy)
+    replacement.write_text(json.dumps(_external_readiness_payload(policy), indent=4), encoding="utf-8")
+    real_open = evaluator.os.open
+    open_flags: list[int] = []
+
+    def swap_then_open(path: str | bytes | int, flags: int, *args: object) -> int:
+        open_flags.append(flags)
+        if Path(path) == source:
+            source.unlink()
+            source.symlink_to(replacement)
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(evaluator.os, "open", swap_then_open)
+
+    with pytest.raises(Public96ContractError, match="external policy server readiness receipt"):
+        evaluator._load_external_readiness_receipt(source, policy_root=policy)
+
+    assert source.is_symlink()
+    assert open_flags and open_flags[0] & getattr(evaluator.os, "O_NOFOLLOW", 0)
+
+
 def test_external_dry_run_validates_and_copies_the_readiness_receipt_without_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
