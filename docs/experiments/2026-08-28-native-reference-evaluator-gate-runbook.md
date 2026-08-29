@@ -84,38 +84,19 @@ python3 "$reviewed_runtime_checkout/scripts/verify_native_reference_evaluator_ga
   capture-runtime-image --receipt "$runtime_image_receipt"
 ```
 
-Use this exact outer boundary for each launcher mode (append the mode-specific
-environment values shown below):
-
-```bash
-docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
-  --mount type=bind,src=/mnt/lehome,dst=/mnt/lehome \
-  --mount type=bind,src="$reviewed_runtime_checkout",dst="$reviewed_runtime_checkout",readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/objects,dst=/mnt/lehome/reference-native/assets/objects,readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/objects,dst="$reviewed_runtime_checkout/Assets/objects",readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/robots,dst=/mnt/lehome/reference-native/assets/robots,readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/robots,dst="$reviewed_runtime_checkout/Assets/robots",readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/scenes,dst=/mnt/lehome/reference-native/assets/scenes,readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/scenes,dst="$reviewed_runtime_checkout/Assets/scenes",readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/textures,dst=/mnt/lehome/reference-native/assets/textures,readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/textures,dst="$reviewed_runtime_checkout/Assets/textures",readonly \
-  --workdir "$reviewed_runtime_checkout" \
-  --env LEHOME_NATIVE_REFERENCE_PYTHON=/opt/lehome-challenge/.venv/bin/python \
-  --env LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=/mnt/lehome/reference-native/source \
-  --env LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT=/mnt/lehome/reference-native/pretrained_model \
-  --env LEHOME_NATIVE_REFERENCE_METADATA_ROOT=/mnt/lehome/reference-native/dataset_meta \
-  --env LEHOME_NATIVE_REFERENCE_ASSETS_ROOT=/mnt/lehome/reference-native/assets \
-  --env LEHOME_NATIVE_REFERENCE_VM_ID=computeinstance-u00t6xfqhadrcmssa2 \
-  --env LEHOME_NATIVE_REFERENCE_DISK_ID=computedisk-u00pbe55crxy7jr56x \
-  --env LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT="$runtime_image_receipt" \
-  --entrypoint bash \
-  sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7 \
-  "$reviewed_runtime_checkout/rollout_appliance/run_native_reference_evaluator_gate.sh"
-```
+Use only the executable host wrapper
+`rollout_appliance/run_native_reference_evaluator_container.sh` for all four
+modes. It constructs the complete Docker argv, explicitly places every
+mode-specific `--env KEY=value` before the immutable image ID, applies the
+reviewed runtime and dual authenticated-asset mounts, overrides the image
+entrypoint with `bash`, and invokes the VM-local launcher only inside the
+container. Do not invoke `run_native_reference_evaluator_gate.sh` on the bare
+host. `--print-command` displays the exact shell-escaped argv without running
+Docker.
 
 Inspecting the fixed tag proves the operator's expected reference still names
-that image; launching by immutable ID closes the gap between inspection and
-container creation.
+that image; the wrapper launches by immutable ID to close the gap between
+inspection and container creation.
 
 The image receipt is required only for execution. `source-stage`,
 `inventory-cache`, and validation-only remain zero-evaluation paths and do not
@@ -127,9 +108,7 @@ uses sparse Git with `GIT_LFS_SKIP_SMUDGE=1`, so it fetches no checkpoint
 weight or simulator run:
 
 ```bash
-export LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=/mnt/lehome/reference-native/source
-LEHOME_NATIVE_REFERENCE_MODE=source-stage \
-  bash rollout_appliance/run_native_reference_evaluator_gate.sh
+bash rollout_appliance/run_native_reference_evaluator_container.sh source-stage
 ```
 
 Before validation/execution, create and publish one immutable cache-trust
@@ -148,12 +127,6 @@ exist, create it with the zero-evaluation `inventory-cache` mode and publish
 that one manifest rather than inventing a caller-supplied trust value.
 
 ```bash
-export LEHOME_NATIVE_REFERENCE_VM_ID=computeinstance-u00t6xfqhadrcmssa2
-export LEHOME_NATIVE_REFERENCE_DISK_ID=computedisk-u00pbe55crxy7jr56x
-export LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=/mnt/lehome/reference-native/source
-export LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT=/mnt/lehome/reference-native/pretrained_model
-export LEHOME_NATIVE_REFERENCE_METADATA_ROOT=/mnt/lehome/reference-native/dataset_meta
-export LEHOME_NATIVE_REFERENCE_ASSETS_ROOT=/mnt/lehome/reference-native/assets
 export LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT=/mnt/lehome/reference-native/native-reference-YYYYMMDDHHMMSS
 export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION='<published 40-char revision>'
 export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH='reference-checks/native-cache-YYYYMMDDHHMMSS/cache-trust-manifest.json'
@@ -175,8 +148,7 @@ be a new `native-cache-*` prefix so the public manifest is immutable.
 ```bash
 export LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_OUTPUT=/mnt/lehome/reference-native/cache-trust-manifest.json
 export LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_PATH='reference-checks/native-cache-YYYYMMDDHHMMSS/cache-trust-manifest.json'
-LEHOME_NATIVE_REFERENCE_MODE=inventory-cache \
-  bash rollout_appliance/run_native_reference_evaluator_gate.sh
+bash rollout_appliance/run_native_reference_evaluator_container.sh inventory-cache
 ```
 
 Copy that one manifest to the operator host through a validated target, then
@@ -227,8 +199,7 @@ scp -o ClearAllForwardings=yes -o BatchMode=yes -- "$operator_receipt" \
 Run validation first:
 
 ```bash
-LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY=1 \
-  bash rollout_appliance/run_native_reference_evaluator_gate.sh
+bash rollout_appliance/run_native_reference_evaluator_container.sh validate-only
 ```
 
 Validation refuses missing caches, an unpinned or changed source checkout,
@@ -243,8 +214,7 @@ After the provider reports the exact VM running and the validation result is
 clean, execute only on that VM:
 
 ```bash
-LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY=0 \
-  bash rollout_appliance/run_native_reference_evaluator_gate.sh
+bash rollout_appliance/run_native_reference_evaluator_container.sh execute
 ```
 
 Execution copies the exact public cache-manifest bytes, fresh provider

@@ -122,41 +122,41 @@ does not admit training or collection.
 - Publish under a new immutable `reference-checks/native-...` prefix; never
   overwrite the earlier invalid-compatibility diagnostic.
 
-The exact outer container shape is fixed. Here `reviewed_runtime_checkout` is
-the reviewed checkout on `/mnt/lehome`; the host captures the runtime receipt
-before this command and the launcher mode supplies the remaining environment:
+The exact outer container shape is owned by the executable host wrapper
+`rollout_appliance/run_native_reference_evaluator_container.sh`. No operator
+command may invoke the VM-local launcher on the bare host. The wrapper fixes
+the `/mnt/lehome` and reviewed-checkout mounts, both read-only mounts for every
+authenticated asset root, `--gpus all`, `--entrypoint bash`, and immutable
+image ID. It explicitly inserts all fixed and mode-specific environment
+arguments before the image argument.
+
+The four canonical invocations are:
 
 ```bash
-docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
-  --mount type=bind,src=/mnt/lehome,dst=/mnt/lehome \
-  --mount type=bind,src="$reviewed_runtime_checkout",dst="$reviewed_runtime_checkout",readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/objects,dst=/mnt/lehome/reference-native/assets/objects,readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/objects,dst="$reviewed_runtime_checkout/Assets/objects",readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/robots,dst=/mnt/lehome/reference-native/assets/robots,readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/robots,dst="$reviewed_runtime_checkout/Assets/robots",readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/scenes,dst=/mnt/lehome/reference-native/assets/scenes,readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/scenes,dst="$reviewed_runtime_checkout/Assets/scenes",readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/textures,dst=/mnt/lehome/reference-native/assets/textures,readonly \
-  --mount type=bind,src=/mnt/lehome/eval/assets/textures,dst="$reviewed_runtime_checkout/Assets/textures",readonly \
-  --workdir "$reviewed_runtime_checkout" \
-  --env LEHOME_NATIVE_REFERENCE_PYTHON=/opt/lehome-challenge/.venv/bin/python \
-  --env LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=/mnt/lehome/reference-native/source \
-  --env LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT=/mnt/lehome/reference-native/pretrained_model \
-  --env LEHOME_NATIVE_REFERENCE_METADATA_ROOT=/mnt/lehome/reference-native/dataset_meta \
-  --env LEHOME_NATIVE_REFERENCE_ASSETS_ROOT=/mnt/lehome/reference-native/assets \
-  --env LEHOME_NATIVE_REFERENCE_VM_ID=computeinstance-u00t6xfqhadrcmssa2 \
-  --env LEHOME_NATIVE_REFERENCE_DISK_ID=computedisk-u00pbe55crxy7jr56x \
-  --env LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT=/mnt/lehome/reference-native/runtime-image-receipt.json \
-  --entrypoint bash \
-  sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7 \
-  "$reviewed_runtime_checkout/rollout_appliance/run_native_reference_evaluator_gate.sh"
+bash rollout_appliance/run_native_reference_evaluator_container.sh source-stage
+
+LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_OUTPUT=/mnt/lehome/reference-native/cache-trust-manifest.json \
+LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_PATH=reference-checks/native-cache-YYYYMMDDHHMMSS/cache-trust-manifest.json \
+  bash rollout_appliance/run_native_reference_evaluator_container.sh inventory-cache
+
+LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT=/mnt/lehome/reference-native/native-reference-YYYYMMDDHHMMSS \
+LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION='<immutable 40-hex revision>' \
+LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH=reference-checks/native-cache-YYYYMMDDHHMMSS/cache-trust-manifest.json \
+  bash rollout_appliance/run_native_reference_evaluator_container.sh validate-only
+
+LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT=/mnt/lehome/reference-native/native-reference-YYYYMMDDHHMMSS \
+LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION='<immutable 40-hex revision>' \
+LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH=reference-checks/native-cache-YYYYMMDDHHMMSS/cache-trust-manifest.json \
+LEHOME_NATIVE_REFERENCE_PROVIDER_RUNNING_RECEIPT=/mnt/lehome/reference-native/provider-running-receipt.json \
+LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT=/mnt/lehome/reference-native/runtime-image-receipt.json \
+  bash rollout_appliance/run_native_reference_evaluator_container.sh execute
 ```
 
 The four read-only asset source mounts appear at both canonical and runtime
 paths. The launcher passes `--device cpu` to the pinned public `scripts.eval`
-module; the outer `--gpus all` exposes CUDA only for policy use. The
-host inspects the fixed tag but launches the exact inspected image ID, avoiding
-a tag-retargeting gap between receipt capture and container creation.
+module; the wrapper's `--gpus all` exposes CUDA only for policy use. The host
+inspects the fixed tag but the wrapper launches the exact inspected image ID,
+avoiding a tag-retargeting gap between receipt capture and container creation.
 
 ## Decision after the gate
 

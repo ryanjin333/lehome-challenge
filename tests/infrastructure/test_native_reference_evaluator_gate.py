@@ -15,6 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "rollout_appliance" / "run_native_reference_evaluator_gate.sh"
+CONTAINER_WRAPPER = ROOT / "rollout_appliance" / "run_native_reference_evaluator_container.sh"
 RUNBOOK = ROOT / "docs" / "experiments" / "2026-08-28-native-reference-evaluator-gate-runbook.md"
 CANONICAL_CACHE_MANIFEST = ROOT / "rollout_appliance" / "native_reference_canonical_cache_manifest.json"
 
@@ -1017,28 +1018,117 @@ def test_native_gate_runbook_preserves_the_no_collection_admission_boundary() ->
     assert "LEHOME_NATIVE_REFERENCE_IMAGE" not in text
     assert "inventory-cache" in text
     assert "publish-cache-manifest" in text
-    assert "docker run --rm --pull never --gpus all" in text
+    assert text.count("bash rollout_appliance/run_native_reference_evaluator_container.sh") == 4
+    assert "bash rollout_appliance/run_native_reference_evaluator_gate.sh" not in text
     assert "capture-runtime-image" in text
     assert "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7" in text
-    assert "launching by immutable ID" in text
-    assert text.count("/mnt/lehome/eval/assets/objects") == 2
+    assert "wrapper launches by immutable ID" in text
+    assert "dual authenticated-asset mounts" in text
     assert "/mnt/lehome/challenge-assets/Assets" not in text
     assert "LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT" in text
     assert "Do not build or pull an image" in text
 
 
-def test_runbook_docker_command_overrides_entrypoint_before_immutable_image() -> None:
+def test_runbook_uses_only_the_canonical_host_container_wrapper() -> None:
     text = RUNBOOK.read_text(encoding="utf-8")
-    start = text.index("docker run --rm --pull never --gpus all")
-    end = text.index("\n```", start)
-    tokens = shlex.split(text[start:end].replace("\\\n", " "))
-    image = "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
 
-    entrypoint_index = tokens.index("--entrypoint")
-    image_index = tokens.index(image)
-    assert tokens[entrypoint_index + 1] == "bash"
-    assert entrypoint_index < image_index
-    assert tokens[image_index + 1] == (
-        "$reviewed_runtime_checkout/rollout_appliance/run_native_reference_evaluator_gate.sh"
+    for mode in ("source-stage", "inventory-cache", "validate-only", "execute"):
+        assert f"run_native_reference_evaluator_container.sh {mode}" in text
+    assert "Do not invoke `run_native_reference_evaluator_gate.sh` on the bare" in text
+
+
+@pytest.mark.parametrize(
+    ("mode", "mode_environment"),
+    (
+        ("source-stage", {}),
+        (
+            "inventory-cache",
+            {
+                "LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_OUTPUT": "/mnt/lehome/reference-native/cache-trust-manifest.json",
+                "LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_PATH": "reference-checks/native-cache-test/cache-trust-manifest.json",
+            },
+        ),
+        (
+            "validate-only",
+            {
+                "LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT": "/mnt/lehome/reference-native/native-reference-202608290001",
+                "LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION": "a" * 40,
+                "LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH": "reference-checks/native-cache-test/cache-trust-manifest.json",
+            },
+        ),
+        (
+            "execute",
+            {
+                "LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT": "/mnt/lehome/reference-native/native-reference-202608290001",
+                "LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION": "a" * 40,
+                "LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH": "reference-checks/native-cache-test/cache-trust-manifest.json",
+                "LEHOME_NATIVE_REFERENCE_PROVIDER_RUNNING_RECEIPT": "/mnt/lehome/reference-native/provider-running-receipt.json",
+                "LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT": "/mnt/lehome/reference-native/runtime-image-receipt.json",
+            },
+        ),
+    ),
+)
+def test_native_container_wrapper_builds_complete_exact_command_per_mode(
+    mode: str,
+    mode_environment: dict[str, str],
+) -> None:
+    result = subprocess.run(
+        ["bash", str(CONTAINER_WRAPPER), mode, "--print-command"],
+        env={**os.environ, **mode_environment},
+        text=True,
+        capture_output=True,
+        check=False,
     )
-    assert "bash" not in tokens[image_index + 1 :]
+
+    assert result.returncode == 0, result.stderr
+    tokens = shlex.split(result.stdout)
+    image = "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
+    image_index = tokens.index(image)
+    assert tokens[:7] == [
+        "docker",
+        "run",
+        "--rm",
+        "--pull",
+        "never",
+        "--gpus",
+        "all",
+    ]
+    assert tokens[tokens.index("--entrypoint") + 1] == "bash"
+    assert tokens.index("--entrypoint") < image_index
+    assert tokens[image_index + 1] == str(
+        CONTAINER_WRAPPER.parent.parent
+        / "rollout_appliance"
+        / "run_native_reference_evaluator_gate.sh"
+    )
+    assert all(index < image_index for index, token in enumerate(tokens) if token == "--env")
+
+    forwarded: dict[str, str] = {}
+    for index, token in enumerate(tokens):
+        if token == "--env":
+            key, value = tokens[index + 1].split("=", 1)
+            forwarded[key] = value
+    common = {
+        "LEHOME_NATIVE_REFERENCE_MODE": mode,
+        "LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY": "1" if mode == "validate-only" else "0",
+        "LEHOME_NATIVE_REFERENCE_PYTHON": "/opt/lehome-challenge/.venv/bin/python",
+        "LEHOME_NATIVE_REFERENCE_SOURCE_ROOT": "/mnt/lehome/reference-native/source",
+        "LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT": "/mnt/lehome/reference-native/pretrained_model",
+        "LEHOME_NATIVE_REFERENCE_METADATA_ROOT": "/mnt/lehome/reference-native/dataset_meta",
+        "LEHOME_NATIVE_REFERENCE_ASSETS_ROOT": "/mnt/lehome/reference-native/assets",
+        "LEHOME_NATIVE_REFERENCE_VM_ID": "computeinstance-u00t6xfqhadrcmssa2",
+        "LEHOME_NATIVE_REFERENCE_DISK_ID": "computedisk-u00pbe55crxy7jr56x",
+    }
+    assert forwarded == {**common, **mode_environment}
+
+    mounts = [tokens[index + 1] for index, token in enumerate(tokens) if token == "--mount"]
+    assert "type=bind,src=/mnt/lehome,dst=/mnt/lehome" in mounts
+    for root in ("objects", "robots", "scenes", "textures"):
+        assert any(
+            mount.startswith(f"type=bind,src=/mnt/lehome/eval/assets/{root},")
+            and mount.endswith(f"/Assets/{root},readonly")
+            for mount in mounts
+        )
+        assert (
+            f"type=bind,src=/mnt/lehome/eval/assets/{root},"
+            f"dst=/mnt/lehome/reference-native/assets/{root},readonly"
+        ) in mounts
