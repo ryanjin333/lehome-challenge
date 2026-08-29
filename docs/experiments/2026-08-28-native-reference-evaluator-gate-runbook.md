@@ -108,8 +108,9 @@ docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
   --env LEHOME_NATIVE_REFERENCE_VM_ID=computeinstance-u00t6xfqhadrcmssa2 \
   --env LEHOME_NATIVE_REFERENCE_DISK_ID=computedisk-u00pbe55crxy7jr56x \
   --env LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT="$runtime_image_receipt" \
+  --entrypoint bash \
   sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7 \
-  bash "$reviewed_runtime_checkout/rollout_appliance/run_native_reference_evaluator_gate.sh"
+  "$reviewed_runtime_checkout/rollout_appliance/run_native_reference_evaluator_gate.sh"
 ```
 
 Inspecting the fixed tag proves the operator's expected reference still names

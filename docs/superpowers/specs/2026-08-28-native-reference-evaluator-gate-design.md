@@ -39,10 +39,12 @@ receipt, image reference, immutable image ID, and raw-inspect SHA-256 into the
 preflight, execution, and final identities. Inventory and validation-only do
 not require the receipt and never probe CUDA or launch the simulator.
 
-The public evaluator runs by absolute pinned path, while its working directory
-is the reviewed runtime repository (the launcher parent). `PYTHONSAFEPATH=1`
-and a pinned-source-first `PYTHONPATH` prevent a local `scripts.eval` from
-winning import resolution. The public `lehome.utils.constant.ASSETS_ROOT`
+The public evaluator runs as the pinned `scripts.eval` module so its relative
+imports remain valid, while its working directory is the reviewed runtime
+repository (the launcher parent). Python safe-path mode (`-P` and
+`PYTHONSAFEPATH=1`) plus a pinned-source-first `PYTHONPATH` prevent a local
+`scripts.eval` from winning import resolution. The public
+`lehome.utils.constant.ASSETS_ROOT`
 therefore resolves to `<reviewed-runtime>/Assets`. For each of `objects`,
 `robots`, `scenes`, and `textures`, that directory and the corresponding
 canonical cache directory must have the same device and inode before preflight
@@ -145,13 +147,14 @@ docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
   --env LEHOME_NATIVE_REFERENCE_VM_ID=computeinstance-u00t6xfqhadrcmssa2 \
   --env LEHOME_NATIVE_REFERENCE_DISK_ID=computedisk-u00pbe55crxy7jr56x \
   --env LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT=/mnt/lehome/reference-native/runtime-image-receipt.json \
+  --entrypoint bash \
   sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7 \
-  bash "$reviewed_runtime_checkout/rollout_appliance/run_native_reference_evaluator_gate.sh"
+  "$reviewed_runtime_checkout/rollout_appliance/run_native_reference_evaluator_gate.sh"
 ```
 
 The four read-only asset source mounts appear at both canonical and runtime
-paths. The launcher passes `--device cpu` to the absolute pinned public
-`scripts/eval.py`; the outer `--gpus all` exposes CUDA only for policy use. The
+paths. The launcher passes `--device cpu` to the pinned public `scripts.eval`
+module; the outer `--gpus all` exposes CUDA only for policy use. The
 host inspects the fixed tag but launches the exact inspected image ID, avoiding
 a tag-retargeting gap between receipt capture and container creation.
 

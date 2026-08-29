@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import hashlib
 import time
@@ -240,15 +241,43 @@ def test_native_launcher_isolated_contract_never_creates_resources_or_uses_n17_g
     assert "filter.lfs.smudge" in text
 
 
-def test_native_launcher_executes_absolute_pinned_eval_from_reviewed_runtime_root() -> None:
+def test_native_launcher_module_invocation_supports_relative_imports_and_pinned_source_wins(
+    tmp_path: Path,
+) -> None:
     text = LAUNCHER.read_text(encoding="utf-8")
+    pinned = tmp_path / "pinned"
+    shadow = tmp_path / "runtime"
+    for root, marker in ((pinned, "PINNED"), (shadow, "SHADOW")):
+        package = root / "scripts"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "origin.py").write_text(f'VALUE = "{marker}"\n', encoding="utf-8")
+        (package / "eval.py").write_text(
+            "from .origin import VALUE\nprint(VALUE)\n",
+            encoding="utf-8",
+        )
 
+    result = subprocess.run(
+        [os.sys.executable, "-P", "-m", "scripts.eval"],
+        cwd=shadow,
+        env={
+            **os.environ,
+            "PYTHONSAFEPATH": "1",
+            "PYTHONPATH": f"{pinned}:{shadow}",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "PINNED"
     assert 'readonly RUNTIME_REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"' in text
-    assert '"$PYTHON_BIN" "$SOURCE_ROOT/scripts/eval.py"' in text
+    assert '"$PYTHON_BIN" -P -m scripts.eval' in text
     assert 'cd -- "$RUNTIME_REPO_ROOT"' in text
     assert 'PYTHONSAFEPATH=1' in text
     assert 'PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT"' in text
-    assert "-m scripts.eval" not in text
+    assert '"$PYTHON_BIN" "$SOURCE_ROOT/scripts/eval.py"' not in text
     assert '--ee_urdf_path "$ASSETS_ROOT/robots/so101_new_calib.urdf"' in text
 
 
@@ -996,3 +1025,20 @@ def test_native_gate_runbook_preserves_the_no_collection_admission_boundary() ->
     assert "/mnt/lehome/challenge-assets/Assets" not in text
     assert "LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT" in text
     assert "Do not build or pull an image" in text
+
+
+def test_runbook_docker_command_overrides_entrypoint_before_immutable_image() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    start = text.index("docker run --rm --pull never --gpus all")
+    end = text.index("\n```", start)
+    tokens = shlex.split(text[start:end].replace("\\\n", " "))
+    image = "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
+
+    entrypoint_index = tokens.index("--entrypoint")
+    image_index = tokens.index(image)
+    assert tokens[entrypoint_index + 1] == "bash"
+    assert entrypoint_index < image_index
+    assert tokens[image_index + 1] == (
+        "$reviewed_runtime_checkout/rollout_appliance/run_native_reference_evaluator_gate.sh"
+    )
+    assert "bash" not in tokens[image_index + 1 :]
