@@ -28,7 +28,10 @@ def _identity() -> dict[str, object]:
         "assets_tree_sha256": "d" * 64,
         "cache_trust_manifest_sha256": hashlib.sha256(b"cache").hexdigest(),
         "provider_running_receipt_sha256": hashlib.sha256(b"running").hexdigest(),
+        "runtime_image_receipt_sha256": hashlib.sha256(b"runtime-image").hexdigest(),
         "provider_source_image_id": "computeimage-u00zf6w3yf72gakhcy",
+        "runtime_image_reference": "lehome-rollout:build",
+        "runtime_image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
         "lerobot_version": "0.4.3",
         "policy_class": "scripts.eval_policy.lerobot_policy.LeRobotPolicy",
         "policy_device": "cuda:0",
@@ -87,6 +90,7 @@ def _materialize_artifacts(root: Path, bundle: dict[str, object]) -> None:
     (root / "evidence").mkdir(parents=True, exist_ok=True)
     (root / "evidence/cache-trust-manifest.json").write_bytes(b"cache")
     (root / "evidence/provider-running-receipt.json").write_bytes(b"running")
+    (root / "evidence/runtime-image-receipt.json").write_bytes(b"runtime-image")
     for attempt in bundle["attempts"]:  # type: ignore[index]
         for artifact in [attempt["log"], attempt["receipt"], *attempt["videos"]]:  # type: ignore[index]
             path = root / artifact["path"]  # type: ignore[index]
@@ -214,12 +218,15 @@ def test_native_launcher_isolated_contract_never_creates_resources_or_uses_n17_g
     assert "fetch-cache-manifest" in text
     assert "bind-provider-receipt --state RUNNING" in text
     assert "LEHOME_NATIVE_REFERENCE_PROVIDER_RUNNING_RECEIPT" in text
+    assert "LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT" in text
+    assert "bind-runtime-image-receipt" in text
     assert "torch.cuda.is_available" in text
     assert 'EXACT_VM_ID="computeinstance-u00t6xfqhadrcmssa2"' in text
     assert 'PROTECTED_DISK_ID="computedisk-u00pbe55crxy7jr56x"' in text
     assert "validate_running_provider_binding" in text
     assert text.count("validate_checkpoint full") >= 2
     assert "probe_host_runtime" in text
+    assert "validate_runtime_asset_bindings" in text
     assert "verify-execution" in text
     assert "compile-stage" in text
     assert "invalid_reason" not in text
@@ -231,6 +238,38 @@ def test_native_launcher_isolated_contract_never_creates_resources_or_uses_n17_g
     assert "nebius compute instance start" not in text
     assert "docker build" not in text
     assert "filter.lfs.smudge" in text
+
+
+def test_native_launcher_executes_absolute_pinned_eval_from_reviewed_runtime_root() -> None:
+    text = LAUNCHER.read_text(encoding="utf-8")
+
+    assert 'readonly RUNTIME_REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"' in text
+    assert '"$PYTHON_BIN" "$SOURCE_ROOT/scripts/eval.py"' in text
+    assert 'cd -- "$RUNTIME_REPO_ROOT"' in text
+    assert 'PYTHONSAFEPATH=1' in text
+    assert 'PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT"' in text
+    assert "-m scripts.eval" not in text
+    assert '--ee_urdf_path "$ASSETS_ROOT/robots/so101_new_calib.urdf"' in text
+
+
+def test_runtime_asset_bindings_require_the_same_device_and_inode(tmp_path: Path) -> None:
+    from scripts.verify_native_reference_evaluator_gate import (
+        NativeReferenceGateError,
+        validate_runtime_asset_bindings,
+    )
+
+    canonical = tmp_path / "runtime" / "Assets"
+    for root in ("objects", "robots", "scenes", "textures"):
+        (canonical / root).mkdir(parents=True)
+
+    receipt = validate_runtime_asset_bindings(canonical, canonical.parent)
+    assert receipt["runtime_assets_root"] == str(canonical.resolve())
+
+    other_runtime = tmp_path / "other-runtime"
+    for root in ("objects", "robots", "scenes", "textures"):
+        (other_runtime / "Assets" / root).mkdir(parents=True)
+    with pytest.raises(NativeReferenceGateError, match="device/inode"):
+        validate_runtime_asset_bindings(canonical, other_runtime)
 
 
 def test_host_runtime_probe_ignores_shadow_scripts_package_in_caller_cwd(tmp_path: Path) -> None:
@@ -640,6 +679,176 @@ def test_capture_provider_direct_script_entrypoint_resolves_repository_package(t
     assert json.loads(receipt.read_text(encoding="utf-8"))["state"] == "RUNNING"
 
 
+def test_capture_runtime_image_direct_cli_inspects_only_the_approved_local_reference(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "docker-calls.json"
+    raw = [
+        {
+            "Id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
+            "RepoTags": ["lehome-rollout:build"],
+        }
+    ]
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        f"pathlib.Path({str(calls)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+        f"print(json.dumps({raw!r}, sort_keys=True, separators=(',', ':')))\n",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    receipt = tmp_path / "runtime-image.json"
+
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            str(ROOT / "scripts" / "verify_native_reference_evaluator_gate.py"),
+            "capture-runtime-image",
+            "--receipt",
+            str(receipt),
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "PYTHONPATH": ""},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(calls.read_text(encoding="utf-8")) == [
+        "image",
+        "inspect",
+        "--",
+        "lehome-rollout:build",
+    ]
+    document = json.loads(receipt.read_text(encoding="utf-8"))
+    assert document["runtime_image_reference"] == "lehome-rollout:build"
+    assert document["runtime_image_id"] == raw[0]["Id"]
+    expected_raw = (json.dumps(raw, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    assert document["docker_inspect_sha256"] == hashlib.sha256(expected_raw).hexdigest()
+
+
+def test_capture_runtime_image_rejects_inspect_without_approved_tag(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "print(json.dumps([{'Id':'sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7','RepoTags':['other:tag']}]))\n",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    receipt = tmp_path / "runtime-image.json"
+
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            str(ROOT / "scripts" / "verify_native_reference_evaluator_gate.py"),
+            "capture-runtime-image",
+            "--receipt",
+            str(receipt),
+        ],
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "PYTHONPATH": ""},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "image ID/tag is invalid" in result.stderr
+    assert not receipt.exists()
+
+
+def test_runtime_image_receipt_rejects_wrong_id_or_missing_tag() -> None:
+    from scripts.verify_native_reference_evaluator_gate import (
+        NativeReferenceGateError,
+        validate_runtime_image_observation,
+    )
+
+    receipt = {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_runtime_image_observation_v1",
+        "runtime_image_reference": "lehome-rollout:build",
+        "runtime_image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
+        "captured_unix_seconds": int(time.time()),
+        "docker_inspect_sha256": "f" * 64,
+    }
+    assert validate_runtime_image_observation(receipt) == receipt
+
+    with pytest.raises(NativeReferenceGateError, match="runtime image"):
+        validate_runtime_image_observation({**receipt, "runtime_image_id": "sha256:" + "0" * 64})
+    with pytest.raises(NativeReferenceGateError, match="runtime image"):
+        validate_runtime_image_observation({key: value for key, value in receipt.items() if key != "runtime_image_reference"})
+
+
+def test_bind_runtime_image_receipt_copies_exact_validated_bytes(tmp_path: Path) -> None:
+    source = tmp_path / "runtime-source.json"
+    target = tmp_path / "runtime-bound.json"
+    document = {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_runtime_image_observation_v1",
+        "runtime_image_reference": "lehome-rollout:build",
+        "runtime_image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
+        "captured_unix_seconds": int(time.time()),
+        "docker_inspect_sha256": "f" * 64,
+    }
+    source.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            str(ROOT / "scripts" / "verify_native_reference_evaluator_gate.py"),
+            "bind-runtime-image-receipt",
+            "--input",
+            str(source),
+            "--receipt",
+            str(target),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert target.read_bytes() == source.read_bytes()
+
+
+def test_runtime_image_receipt_is_bound_before_cuda_and_final_identity_validation() -> None:
+    from scripts.verify_native_reference_evaluator_gate import NativeReferenceGateError, verify_native_reference_result
+
+    text = LAUNCHER.read_text(encoding="utf-8")
+    execution = text[text.index('mkdir --mode=0700 -- "$OUTPUT_ROOT"') :]
+    assert execution.index("bind-runtime-image-receipt") < execution.index("probe_cuda;")
+    assert execution.index("validate_runtime_image_binding") < execution.index("probe_cuda;")
+
+    bundle = _bundle()
+    assert verify_native_reference_result(bundle)["identity"]["runtime_image_reference"] == "lehome-rollout:build"
+    bundle["identity"] = {**bundle["identity"], "runtime_image_id": "sha256:" + "0" * 64}
+    with pytest.raises(NativeReferenceGateError, match="runtime image"):
+        verify_native_reference_result(bundle)
+
+
+def test_execute_mode_requires_runtime_image_receipt_before_cache_or_cuda_work(tmp_path: Path) -> None:
+    environment = _launcher_environment(tmp_path)
+    environment.pop("LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY")
+    environment["LEHOME_NATIVE_REFERENCE_MODE"] = "execute"
+
+    result = subprocess.run(
+        ["bash", str(LAUNCHER)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "error: runtime image receipt is unavailable or unsafe"
+    assert "checkpoint" not in result.stderr
+    assert not (tmp_path / "native-reference-202608290001").exists()
+
+
 def _write_fake_huggingface_hub(import_root: Path) -> Path:
     module = import_root / "huggingface_hub.py"
     module.write_text(
@@ -779,3 +988,10 @@ def test_native_gate_runbook_preserves_the_no_collection_admission_boundary() ->
     assert "LEHOME_NATIVE_REFERENCE_IMAGE" not in text
     assert "inventory-cache" in text
     assert "publish-cache-manifest" in text
+    assert "docker run --rm --pull never --gpus all" in text
+    assert "capture-runtime-image" in text
+    assert "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7" in text
+    assert "launching by immutable ID" in text
+    assert text.count("/mnt/lehome/challenge-assets/Assets/objects") == 2
+    assert "LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT" in text
+    assert "Do not build or pull an image" in text

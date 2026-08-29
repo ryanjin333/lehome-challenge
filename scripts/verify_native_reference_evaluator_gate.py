@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -44,6 +45,8 @@ METADATA_REVISION = SOURCE_REVISION
 ASSETS_REPOSITORY = "lehome/asset_challenge"
 ASSETS_REVISION = "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9"
 ASSETS_RUNTIME_ROOTS = ("objects", "robots", "scenes", "textures")
+RUNTIME_IMAGE_REFERENCE = "lehome-rollout:build"
+RUNTIME_IMAGE_ID = "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
 
 
 class NativeReferenceGateError(ValueError):
@@ -234,6 +237,124 @@ def authenticate_canonical_caches(
             assets_root, section="assets", manifest_path=manifest_path
         ),
     }
+
+
+def validate_runtime_asset_bindings(
+    canonical_assets_root: Path,
+    runtime_repository_root: Path,
+) -> dict[str, object]:
+    """Prove that both evaluator-visible asset paths are the same bind mounts."""
+    canonical_root = Path(canonical_assets_root).resolve(strict=True)
+    repository_root = Path(runtime_repository_root).resolve(strict=True)
+    runtime_assets_root = repository_root / "Assets"
+    bindings: list[dict[str, object]] = []
+    for name in ASSETS_RUNTIME_ROOTS:
+        canonical = canonical_root / name
+        runtime = runtime_assets_root / name
+        try:
+            canonical_metadata = canonical.lstat()
+            runtime_metadata = runtime.lstat()
+        except OSError as error:
+            raise NativeReferenceGateError(
+                f"native runtime asset binding is unavailable: {name}"
+            ) from error
+        if (
+            canonical.is_symlink()
+            or runtime.is_symlink()
+            or not stat.S_ISDIR(canonical_metadata.st_mode)
+            or not stat.S_ISDIR(runtime_metadata.st_mode)
+        ):
+            raise NativeReferenceGateError(f"native runtime asset binding is unsafe: {name}")
+        canonical_identity = (canonical_metadata.st_dev, canonical_metadata.st_ino)
+        runtime_identity = (runtime_metadata.st_dev, runtime_metadata.st_ino)
+        if canonical_identity != runtime_identity:
+            raise NativeReferenceGateError(
+                f"native runtime asset binding device/inode mismatch: {name}"
+            )
+        bindings.append(
+            {
+                "root": name,
+                "device": canonical_metadata.st_dev,
+                "inode": canonical_metadata.st_ino,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_runtime_asset_bindings_v1",
+        "canonical_assets_root": str(canonical_root),
+        "runtime_assets_root": str(runtime_assets_root.resolve(strict=True)),
+        "bindings": bindings,
+    }
+
+
+def validate_runtime_image_observation(document: object) -> dict[str, object]:
+    receipt = _object(document, "runtime image observation")
+    expected = {
+        "schema_version",
+        "kind",
+        "runtime_image_reference",
+        "runtime_image_id",
+        "captured_unix_seconds",
+        "docker_inspect_sha256",
+    }
+    if (
+        set(receipt) != expected
+        or receipt.get("schema_version") != 1
+        or receipt.get("kind")
+        != "lehome_native_reference_runtime_image_observation_v1"
+        or receipt.get("runtime_image_reference") != RUNTIME_IMAGE_REFERENCE
+        or receipt.get("runtime_image_id") != RUNTIME_IMAGE_ID
+    ):
+        raise NativeReferenceGateError("runtime image observation is not the approved local image")
+    _digest(receipt.get("docker_inspect_sha256"), "Docker inspect response")
+    captured = receipt.get("captured_unix_seconds")
+    if type(captured) is not int or captured <= 0:
+        raise NativeReferenceGateError("runtime image observation capture time is invalid")
+    if not 0 <= time.time() - captured <= 900:
+        raise NativeReferenceGateError("runtime image observation is not fresh")
+    return receipt
+
+
+def capture_runtime_image_observation() -> dict[str, object]:
+    """Inspect the one approved local image without allowing a caller reference."""
+    command = ["docker", "image", "inspect", "--", RUNTIME_IMAGE_REFERENCE]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise NativeReferenceGateError("approved runtime image inspection failed") from error
+    if completed.returncode != 0 or not completed.stdout:
+        raise NativeReferenceGateError("approved runtime image inspection failed")
+    try:
+        rows = json.loads(completed.stdout)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise NativeReferenceGateError("approved runtime image inspection is invalid") from error
+    if type(rows) is not list or len(rows) != 1 or type(rows[0]) is not dict:
+        raise NativeReferenceGateError("approved runtime image inspection is invalid")
+    row = rows[0]
+    tags = row.get("RepoTags")
+    if (
+        row.get("Id") != RUNTIME_IMAGE_ID
+        or type(tags) is not list
+        or RUNTIME_IMAGE_REFERENCE not in tags
+        or any(not isinstance(tag, str) for tag in tags)
+    ):
+        raise NativeReferenceGateError("approved runtime image ID/tag is invalid")
+    return validate_runtime_image_observation(
+        {
+            "schema_version": 1,
+            "kind": "lehome_native_reference_runtime_image_observation_v1",
+            "runtime_image_reference": RUNTIME_IMAGE_REFERENCE,
+            "runtime_image_id": RUNTIME_IMAGE_ID,
+            "captured_unix_seconds": int(time.time()),
+            "docker_inspect_sha256": hashlib.sha256(completed.stdout).hexdigest(),
+        }
+    )
 
 
 def capture_host_runtime(source_root: Path) -> dict[str, object]:
@@ -633,15 +754,21 @@ def oracle_attempts() -> tuple[dict[str, object], ...]:
 
 def _validate_identity(value: object) -> dict[str, object]:
     identity = _object(value, "identity")
-    fixed = {"source_repository": SOURCE_REPOSITORY, "source_revision": SOURCE_REVISION, "source_tree_sha256": SOURCE_TREE_SHA256, "lerobot_version": LEROBOT_VERSION, "policy_class": POLICY_CLASS, "policy_device": "cuda:0", "simulator_device": "cpu", "task_description": TASK_DESCRIPTION, "action_horizon": 16, "action_dimension": 12, "success_checker": SUCCESS_CHECKER, "cuda_available": True}
-    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "source_root", "python_executable", "python_version", "torch_version", "lerobot_origin", "scripts_eval_origin", "lehome_origin"}
+    fixed = {"source_repository": SOURCE_REPOSITORY, "source_revision": SOURCE_REVISION, "source_tree_sha256": SOURCE_TREE_SHA256, "lerobot_version": LEROBOT_VERSION, "policy_class": POLICY_CLASS, "policy_device": "cuda:0", "simulator_device": "cpu", "task_description": TASK_DESCRIPTION, "action_horizon": 16, "action_dimension": 12, "success_checker": SUCCESS_CHECKER, "cuda_available": True, "runtime_image_reference": RUNTIME_IMAGE_REFERENCE, "runtime_image_id": RUNTIME_IMAGE_ID}
+    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "source_root", "python_executable", "python_version", "torch_version", "lerobot_origin", "scripts_eval_origin", "lehome_origin"}
     if set(identity) != {*fixed, *variable}:
         raise NativeReferenceGateError("identity has an unexpected schema")
     for key, expected in fixed.items():
         if identity.get(key) != expected:
-            label = "LeRobot" if key == "lerobot_version" else key
+            label = (
+                "LeRobot"
+                if key == "lerobot_version"
+                else "runtime image"
+                if key in {"runtime_image_reference", "runtime_image_id"}
+                else key
+            )
             raise NativeReferenceGateError(f"identity {label} does not match the native contract")
-    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256"):
+    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256"):
         _digest(identity.get(key), f"identity {key}")
     if type(identity["cuda_device_count"]) is not int or identity["cuda_device_count"] < 1 or not isinstance(identity["cuda_runtime"], str) or not identity["cuda_runtime"]:
         raise NativeReferenceGateError("identity does not prove CUDA availability")
@@ -701,9 +828,10 @@ def verify_native_reference_result(document: object, *, bundle_root: Path | None
     if bundle_root is not None:
         cache = _artifact_from_file(bundle_root, Path("evidence/cache-trust-manifest.json"))
         running = _artifact_from_file(bundle_root, Path("evidence/provider-running-receipt.json"))
-        if cache["sha256"] != identity["cache_trust_manifest_sha256"] or running["sha256"] != identity["provider_running_receipt_sha256"]:
+        runtime_image = _artifact_from_file(bundle_root, Path("evidence/runtime-image-receipt.json"))
+        if cache["sha256"] != identity["cache_trust_manifest_sha256"] or running["sha256"] != identity["provider_running_receipt_sha256"] or runtime_image["sha256"] != identity["runtime_image_receipt_sha256"]:
             raise NativeReferenceGateError("execution bundle support evidence is not bound to identity")
-        supporting_artifacts = {"cache_trust_manifest": cache, "provider_running_receipt": running}
+        supporting_artifacts = {"cache_trust_manifest": cache, "provider_running_receipt": running, "runtime_image_receipt": runtime_image}
     rows = result.get("attempts")
     if type(rows) is not list or len(rows) not in {2, 8}:
         raise NativeReferenceGateError("native reference result must contain either the two-attempt admission stop or all eight attempts")
@@ -823,6 +951,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     finalize = commands.add_parser("finalize"); finalize.add_argument("--execution", type=Path, required=True); finalize.add_argument("--fidelity", type=Path, required=True); finalize.add_argument("--publication", type=Path, required=True); finalize.add_argument("--stopped", type=Path, required=True); finalize.add_argument("--receipt", type=Path, required=True)
     provider = commands.add_parser("capture-provider"); provider.add_argument("--state", choices=("RUNNING", "STOPPED"), required=True); provider.add_argument("--receipt", type=Path, required=True)
     bind_provider = commands.add_parser("bind-provider-receipt"); bind_provider.add_argument("--state", choices=("RUNNING", "STOPPED"), required=True); bind_provider.add_argument("--input", type=Path, required=True); bind_provider.add_argument("--receipt", type=Path, required=True)
+    runtime_image = commands.add_parser("capture-runtime-image"); runtime_image.add_argument("--receipt", type=Path, required=True)
+    bind_runtime_image = commands.add_parser("bind-runtime-image-receipt"); bind_runtime_image.add_argument("--input", type=Path, required=True); bind_runtime_image.add_argument("--receipt", type=Path, required=True)
+    asset_bindings = commands.add_parser("validate-asset-bindings"); asset_bindings.add_argument("--assets-root", type=Path, required=True); asset_bindings.add_argument("--runtime-repo-root", type=Path, required=True)
     cache = commands.add_parser("fetch-cache-manifest"); cache.add_argument("--revision", required=True); cache.add_argument("--path", required=True); cache.add_argument("--receipt", type=Path); cache.add_argument("--checkpoint-tree-sha256"); cache.add_argument("--metadata-tree-sha256"); cache.add_argument("--assets-tree-sha256")
     publish = commands.add_parser("publish-bundle"); publish.add_argument("--bundle-root", type=Path, required=True); publish.add_argument("--execution", type=Path, required=True); publish.add_argument("--token-file", type=Path, required=True); publish.add_argument("--receipt", type=Path, required=True)
     publish_cache = commands.add_parser("publish-cache-manifest"); publish_cache.add_argument("--manifest", type=Path, required=True); publish_cache.add_argument("--token-file", type=Path, required=True); publish_cache.add_argument("--receipt", type=Path, required=True)
@@ -840,6 +971,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_exclusive(args.receipt, receipt)
         elif args.command == "bind-provider-receipt":
             raw = args.input.read_bytes(); receipt = validate_provider_observation(_read_json(args.input, "provider observation"), expected_state=args.state); _write_bytes_exclusive(args.receipt, raw)
+        elif args.command == "capture-runtime-image":
+            receipt = capture_runtime_image_observation(); _write_exclusive(args.receipt, receipt)
+        elif args.command == "bind-runtime-image-receipt":
+            raw = _read_regular_bytes(args.input, "runtime image observation")
+            receipt = validate_runtime_image_observation(_read_json(args.input, "runtime image observation"))
+            _write_bytes_exclusive(args.receipt, raw)
+        elif args.command == "validate-asset-bindings":
+            receipt = validate_runtime_asset_bindings(args.assets_root, args.runtime_repo_root)
         elif args.command == "publish-bundle":
             with _repository_package_imports():
                 from scripts.publish_simple_curriculum_collection import HuggingFacePublicDatasetTransport, _load_token

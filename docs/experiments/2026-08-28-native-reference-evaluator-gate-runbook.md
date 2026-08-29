@@ -21,9 +21,13 @@ published `7/8` oracle and its result has been published and read back.
   `d8d91b6c11cb5aa18fe9a48e7da88eae0ec7e5a227a315ba67ee167d645cde76`),
   rejects extra files and symlinks, and never downloads weights. Do not use an
   adapted checkpoint view or edit any checkpoint file.
-- Runtime: CPU simulation and CUDA policy inference on the one existing
-  rollout VM. The saved processor must prove a 16-action horizon and 12-D
-  absolute bimanual action output.
+- Runtime: the existing local `lehome-rollout:build` image, whose inspected
+  immutable ID must be
+  `sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7`.
+  Its `/opt/lehome-challenge/.venv/bin/python` supplies Python 3.11, LeRobot
+  0.4.3, torch/CUDA, CPU simulation, and CUDA policy inference on the one
+  existing rollout VM. The saved processor must prove a 16-action horizon and
+  12-D absolute bimanual action output.
 - There are eight sequential 600-step episodes, all at seed 42:
   `Top_Long_Seen_0` twice, `Top_Short_Seen_0` twice,
   `Pant_Long_Seen_0` twice, then `Pant_Short_Seen_0` twice. The required
@@ -50,8 +54,71 @@ failure.
 The operator must provide all inputs explicitly. Cache roots are on the VM
 disk, never the local Mac. The provider's RUNNING/attached-disk state is an
 external read-only gate; this launcher records the actual provider source-image
-identity plus host-Python/LeRobot/CUDA facts, and never asks the provider to
-change state.
+identity, inspected local runtime-image identity, and container
+Python/LeRobot/CUDA facts, and never asks the provider to change state.
+
+## Exact reviewed container boundary
+
+Do not run the launcher on the bare VM host: that host has no admissible
+LeRobot/Isaac runtime. Run the reviewed checkout inside the already-built image
+with `--pull never` and `--gpus all`. The launcher still owns `--device cpu`, so
+CUDA is used only for policy inference. Do not build or pull an image and do
+not run another Isaac container in parallel.
+
+Set `reviewed_runtime_checkout` to the exact reviewed checkout on the protected
+disk. Mount it read-only at the same path inside the container so the launcher's
+parent remains the reviewed runtime repository. The image's existing virtual
+environment remains visible at `/opt/lehome-challenge/.venv/bin/python`.
+Mount each canonical asset source directory read-only twice: once beneath the
+canonical cache root and once beneath the reviewed runtime repository's
+`Assets/`. The launcher proves each pair has the same device and inode before
+preflight and before every simulator stage.
+
+Capture the local image receipt on the VM host before any container execution:
+
+```bash
+reviewed_runtime_checkout=/mnt/lehome/reference-native/reviewed-runtime
+runtime_image_receipt=/mnt/lehome/reference-native/runtime-image-receipt.json
+install -d "$reviewed_runtime_checkout/Assets"/{objects,robots,scenes,textures}
+python3 "$reviewed_runtime_checkout/scripts/verify_native_reference_evaluator_gate.py" \
+  capture-runtime-image --receipt "$runtime_image_receipt"
+```
+
+Use this exact outer boundary for each launcher mode (append the mode-specific
+environment values shown below):
+
+```bash
+docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
+  --mount type=bind,src=/mnt/lehome,dst=/mnt/lehome \
+  --mount type=bind,src="$reviewed_runtime_checkout",dst="$reviewed_runtime_checkout",readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/objects,dst=/mnt/lehome/reference-native/assets/objects,readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/objects,dst="$reviewed_runtime_checkout/Assets/objects",readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/robots,dst=/mnt/lehome/reference-native/assets/robots,readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/robots,dst="$reviewed_runtime_checkout/Assets/robots",readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/scenes,dst=/mnt/lehome/reference-native/assets/scenes,readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/scenes,dst="$reviewed_runtime_checkout/Assets/scenes",readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/textures,dst=/mnt/lehome/reference-native/assets/textures,readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/textures,dst="$reviewed_runtime_checkout/Assets/textures",readonly \
+  --workdir "$reviewed_runtime_checkout" \
+  --env LEHOME_NATIVE_REFERENCE_PYTHON=/opt/lehome-challenge/.venv/bin/python \
+  --env LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=/mnt/lehome/reference-native/source \
+  --env LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT=/mnt/lehome/reference-native/pretrained_model \
+  --env LEHOME_NATIVE_REFERENCE_METADATA_ROOT=/mnt/lehome/reference-native/dataset_meta \
+  --env LEHOME_NATIVE_REFERENCE_ASSETS_ROOT=/mnt/lehome/reference-native/assets \
+  --env LEHOME_NATIVE_REFERENCE_VM_ID=computeinstance-u00t6xfqhadrcmssa2 \
+  --env LEHOME_NATIVE_REFERENCE_DISK_ID=computedisk-u00pbe55crxy7jr56x \
+  --env LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT="$runtime_image_receipt" \
+  sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7 \
+  bash "$reviewed_runtime_checkout/rollout_appliance/run_native_reference_evaluator_gate.sh"
+```
+
+Inspecting the fixed tag proves the operator's expected reference still names
+that image; launching by immutable ID closes the gap between inspection and
+container creation.
+
+The image receipt is required only for execution. `source-stage`,
+`inventory-cache`, and validation-only remain zero-evaluation paths and do not
+require that receipt, probe CUDA, or launch simulation.
 
 Once the exact VM is running, first stage only the public evaluator source
 into an empty source root. This
@@ -85,11 +152,12 @@ export LEHOME_NATIVE_REFERENCE_DISK_ID=computedisk-u00pbe55crxy7jr56x
 export LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=/mnt/lehome/reference-native/source
 export LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT=/mnt/lehome/reference-native/pretrained_model
 export LEHOME_NATIVE_REFERENCE_METADATA_ROOT=/mnt/lehome/reference-native/dataset_meta
-export LEHOME_NATIVE_REFERENCE_ASSETS_ROOT=/mnt/lehome/challenge-assets/Assets
+export LEHOME_NATIVE_REFERENCE_ASSETS_ROOT=/mnt/lehome/reference-native/assets
 export LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT=/mnt/lehome/reference-native/native-reference-YYYYMMDDHHMMSS
 export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION='<published 40-char revision>'
 export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH='reference-checks/native-cache-YYYYMMDDHHMMSS/cache-trust-manifest.json'
 export LEHOME_NATIVE_REFERENCE_PROVIDER_RUNNING_RECEIPT=/mnt/lehome/reference-native/provider-running-receipt.json
+export LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT=/mnt/lehome/reference-native/runtime-image-receipt.json
 ```
 
 ### Cache inventory and immutable publication
@@ -178,8 +246,10 @@ LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY=0 \
   bash rollout_appliance/run_native_reference_evaluator_gate.sh
 ```
 
-Execution copies the exact public cache-manifest bytes and fresh provider
-`RUNNING` receipt into `evidence/`, then writes every raw stage log, exactly
+Execution copies the exact public cache-manifest bytes, fresh provider
+`RUNNING` receipt, and fresh host-captured runtime-image receipt into
+`evidence/`. It cross-checks the exact `lehome-rollout:build` reference and
+immutable image ID before CUDA or simulator access, then writes every raw stage log, exactly
 three expected RGB videos (`left`, `right`, `top`) per episode in the matching
 `success` or `failure` directory, and every
 per-attempt receipt as regular immutable files. The result verifier SHA-256s

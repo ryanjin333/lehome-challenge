@@ -12,7 +12,10 @@ readonly EXPECTED_LEROBOT_VERSION="0.4.3"
 readonly EXACT_VM_ID="computeinstance-u00t6xfqhadrcmssa2"
 readonly PROTECTED_DISK_ID="computedisk-u00pbe55crxy7jr56x"
 readonly PROVIDER_SOURCE_IMAGE_ID="computeimage-u00zf6w3yf72gakhcy"
+readonly RUNTIME_IMAGE_REFERENCE="lehome-rollout:build"
+readonly RUNTIME_IMAGE_ID="sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly RUNTIME_REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 readonly CANONICAL_CACHE_MANIFEST="$SCRIPT_DIR/native_reference_canonical_cache_manifest.json"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
@@ -110,8 +113,16 @@ validate_stage_integrity() {
   validate_checkpoint full
   validate_source_runtime
   authenticate_canonical_caches
+  validate_runtime_asset_bindings
   [[ "$AUTHENTICATED_METADATA_TREE_SHA256" == "$METADATA_TREE_SHA256" ]] || fail "native reference metadata tree changed during evaluation"
   [[ "$AUTHENTICATED_ASSETS_TREE_SHA256" == "$ASSETS_TREE_SHA256" ]] || fail "native reference assets tree changed during evaluation"
+}
+
+validate_runtime_asset_bindings() {
+  PYTHONSAFEPATH=1 "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" \
+    validate-asset-bindings --assets-root "$ASSETS_ROOT" \
+    --runtime-repo-root "$RUNTIME_REPO_ROOT" >/dev/null \
+    || fail "native runtime asset bind mounts do not share canonical device/inode identities"
 }
 
 authenticate_canonical_caches() {
@@ -181,6 +192,17 @@ if any(receipt.get(key) != value for key,value in expected.items()):
 PY
 }
 
+validate_runtime_image_binding() {
+  "$PYTHON_BIN" - "$OUTPUT_ROOT/evidence/runtime-image-receipt.json" "$RUNTIME_IMAGE_REFERENCE" "$RUNTIME_IMAGE_ID" <<'PY'
+import json, sys
+from pathlib import Path
+receipt=json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected={"runtime_image_reference":sys.argv[2],"runtime_image_id":sys.argv[3]}
+if any(receipt.get(key) != value for key,value in expected.items()):
+    raise SystemExit("runtime image receipt does not bind the approved local image")
+PY
+}
+
 probe_cuda() {
   "$PYTHON_BIN" - "$OUTPUT_ROOT/cuda-runtime.json" <<'PY'
 import json, os, sys
@@ -194,21 +216,21 @@ PY
 }
 
 probe_host_runtime() {
-  (cd -- "$SOURCE_ROOT" && PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT" \
+  (cd -- "$RUNTIME_REPO_ROOT" && PYTHONSAFEPATH=1 PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT" \
     "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" probe-host-runtime \
       --source-root "$SOURCE_ROOT" --receipt "$OUTPUT_ROOT/host-runtime.json" >/dev/null) \
     || fail "native reference host runtime probe failed"
 }
 
 write_identity_and_preflight() {
-  "$PYTHON_BIN" - "$OUTPUT_ROOT/identity.json" "$OUTPUT_ROOT/preflight.json" "$OUTPUT_ROOT/cuda-runtime.json" "$OUTPUT_ROOT/host-runtime.json" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" "$CACHE_TRUST_MANIFEST_SHA256" "$PROVIDER_RUNNING_RECEIPT_SHA256" "$VM_ID" "$DISK_ID" <<'PY'
+  "$PYTHON_BIN" - "$OUTPUT_ROOT/identity.json" "$OUTPUT_ROOT/preflight.json" "$OUTPUT_ROOT/cuda-runtime.json" "$OUTPUT_ROOT/host-runtime.json" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" "$CACHE_TRUST_MANIFEST_SHA256" "$PROVIDER_RUNNING_RECEIPT_SHA256" "$RUNTIME_IMAGE_RECEIPT_SHA256" "$VM_ID" "$DISK_ID" "$RUNTIME_IMAGE_REFERENCE" "$RUNTIME_IMAGE_ID" <<'PY'
 import hashlib, json, os, sys
 from pathlib import Path
 identity_path, preflight_path, cuda_path, host_path = map(Path, sys.argv[1:5]); cuda=json.loads(cuda_path.read_text()); host=json.loads(host_path.read_text())
 expected_host={"schema_version","kind","source_root","python_executable","python_version","torch_version","lerobot_version","lerobot_origin","scripts_eval_origin","lehome_origin"}
 if set(host) != expected_host or host.get("schema_version") != 1 or host.get("kind") != "lehome_native_reference_host_runtime_v1" or host.get("lerobot_version") != "0.4.3": raise SystemExit("native reference host runtime is invalid")
-identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[5],"metadata_tree_sha256":sys.argv[6],"assets_tree_sha256":sys.argv[7],"cache_trust_manifest_sha256":sys.argv[8],"provider_running_receipt_sha256":sys.argv[9],"provider_source_image_id":"computeimage-u00zf6w3yf72gakhcy","lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[10],"disk_id":sys.argv[11],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points",**{key:host[key] for key in ("source_root","python_executable","python_version","torch_version","lerobot_origin","scripts_eval_origin","lehome_origin")}}
-preflight={"schema_version":2,"kind":"lehome_native_reference_preflight_v2","identity":identity,"cuda_probe_sha256":hashlib.sha256(cuda_path.read_bytes()).hexdigest(),"host_runtime_sha256":hashlib.sha256(host_path.read_bytes()).hexdigest()}
+identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[5],"metadata_tree_sha256":sys.argv[6],"assets_tree_sha256":sys.argv[7],"cache_trust_manifest_sha256":sys.argv[8],"provider_running_receipt_sha256":sys.argv[9],"runtime_image_receipt_sha256":sys.argv[10],"provider_source_image_id":"computeimage-u00zf6w3yf72gakhcy","runtime_image_reference":sys.argv[13],"runtime_image_id":sys.argv[14],"lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[11],"disk_id":sys.argv[12],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points",**{key:host[key] for key in ("source_root","python_executable","python_version","torch_version","lerobot_origin","scripts_eval_origin","lehome_origin")}}
+preflight={"schema_version":2,"kind":"lehome_native_reference_preflight_v2","identity":identity,"cuda_probe_sha256":hashlib.sha256(cuda_path.read_bytes()).hexdigest(),"host_runtime_sha256":hashlib.sha256(host_path.read_bytes()).hexdigest(),"runtime_image_receipt_sha256":sys.argv[10]}
 for path,document in ((identity_path,identity),(preflight_path,preflight)):
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o444)
     with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(document,stream,sort_keys=True,separators=(",",":")); stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
@@ -227,6 +249,10 @@ SOURCE_ROOT="${LEHOME_NATIVE_REFERENCE_SOURCE_ROOT:-}"
 PYTHON_BIN="${LEHOME_NATIVE_REFERENCE_PYTHON:-python3}"
 require_absolute_directory "$SOURCE_ROOT" "native reference source cache"
 if [[ "$MODE" == source-stage ]]; then stage_native_source; exit 0; fi
+RUNTIME_IMAGE_RECEIPT="${LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT:-}"
+if [[ "$MODE" == execute ]]; then
+  [[ "$RUNTIME_IMAGE_RECEIPT" == /* && "$RUNTIME_IMAGE_RECEIPT" != *".."* && -f "$RUNTIME_IMAGE_RECEIPT" && ! -L "$RUNTIME_IMAGE_RECEIPT" ]] || fail "runtime image receipt is unavailable or unsafe"
+fi
 
 VM_ID="${LEHOME_NATIVE_REFERENCE_VM_ID:-}"; DISK_ID="${LEHOME_NATIVE_REFERENCE_DISK_ID:-}"
 CHECKPOINT_ROOT="${LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT:-}"; METADATA_ROOT="${LEHOME_NATIVE_REFERENCE_METADATA_ROOT:-}"; ASSETS_ROOT="${LEHOME_NATIVE_REFERENCE_ASSETS_ROOT:-}"; OUTPUT_ROOT="${LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT:-}"
@@ -234,6 +260,7 @@ CACHE_TRUST_MANIFEST_REVISION="${LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_RE
 require_absolute_directory "$CHECKPOINT_ROOT" "native reference checkpoint cache"; require_absolute_directory "$METADATA_ROOT" "native reference metadata cache"; require_absolute_directory "$ASSETS_ROOT" "native reference challenge assets"
 validate_checkpoint full; validate_source_runtime
 authenticate_canonical_caches
+validate_runtime_asset_bindings
 CHECKPOINT_TREE_SHA256="$(checkpoint_tree_sha256)"; METADATA_TREE_SHA256="$AUTHENTICATED_METADATA_TREE_SHA256"; ASSETS_TREE_SHA256="$AUTHENTICATED_ASSETS_TREE_SHA256"
 CACHE_INVENTORY_OUTPUT="${LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_OUTPUT:-}"; CACHE_INVENTORY_REMOTE_PATH="${LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_PATH:-}"
 if [[ "$MODE" == inventory-cache ]]; then
@@ -253,15 +280,18 @@ if [[ "$MODE" == validate-only ]]; then printf '%s\n' '{"status":"validated","mo
 mkdir --mode=0700 -- "$OUTPUT_ROOT"; mkdir --mode=0700 -- "$OUTPUT_ROOT/logs" "$OUTPUT_ROOT/videos" "$OUTPUT_ROOT/receipts" "$OUTPUT_ROOT/evidence"
 "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" fetch-cache-manifest --revision "$CACHE_TRUST_MANIFEST_REVISION" --path "$CACHE_TRUST_MANIFEST_PATH" --checkpoint-tree-sha256 "$CHECKPOINT_TREE_SHA256" --metadata-tree-sha256 "$METADATA_TREE_SHA256" --assets-tree-sha256 "$ASSETS_TREE_SHA256" --receipt "$OUTPUT_ROOT/evidence/cache-trust-manifest.json" >/dev/null
 "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" bind-provider-receipt --state RUNNING --input "$PROVIDER_RUNNING_RECEIPT" --receipt "$OUTPUT_ROOT/evidence/provider-running-receipt.json" >/dev/null
+"$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" bind-runtime-image-receipt --input "$RUNTIME_IMAGE_RECEIPT" --receipt "$OUTPUT_ROOT/evidence/runtime-image-receipt.json" >/dev/null
 CACHE_TRUST_MANIFEST_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/cache-trust-manifest.json")"
 PROVIDER_RUNNING_RECEIPT_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/provider-running-receipt.json")"
+RUNTIME_IMAGE_RECEIPT_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/runtime-image-receipt.json")"
 validate_running_provider_binding
+validate_runtime_image_binding
 probe_cuda; probe_host_runtime; write_identity_and_preflight
 run_stage() {
   local stage="$1" category="$2" garment="$3" log="$OUTPUT_ROOT/logs/stage-${stage}.log"
   validate_stage_integrity
-  local -a command=("$PYTHON_BIN" -m scripts.eval --headless --device cpu --task "LeHome-BiSO101-Direct-Garment-v2" --policy_type lerobot --policy_path "$CHECKPOINT_ROOT" --dataset_root "$METADATA_ROOT/${category}_merged" --task_description "fold the garment on the table" --garment_type "$category" --garment_filter "$garment" --num_episodes 2 --max_steps 600 --seed 42 --save_video --video_dir "$OUTPUT_ROOT/videos/stage-${stage}" --garment_cfg_base_path "$ASSETS_ROOT/objects/Challenge_Garment" --particle_cfg_path "$SOURCE_ROOT/source/lehome/lehome/tasks/bedroom/config_file/particle_garment_cfg.yaml")
-  (cd -- "$SOURCE_ROOT" && PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT" "${command[@]}") >"$log" 2>&1 || fail "native reference stage $stage failed; inspect $log"
+  local -a command=("$PYTHON_BIN" "$SOURCE_ROOT/scripts/eval.py" --headless --device cpu --task "LeHome-BiSO101-Direct-Garment-v2" --policy_type lerobot --policy_path "$CHECKPOINT_ROOT" --dataset_root "$METADATA_ROOT/${category}_merged" --task_description "fold the garment on the table" --garment_type "$category" --garment_filter "$garment" --num_episodes 2 --max_steps 600 --seed 42 --save_video --video_dir "$OUTPUT_ROOT/videos/stage-${stage}" --garment_cfg_base_path "$ASSETS_ROOT/objects/Challenge_Garment" --particle_cfg_path "$SOURCE_ROOT/source/lehome/lehome/tasks/bedroom/config_file/particle_garment_cfg.yaml" --ee_urdf_path "$ASSETS_ROOT/robots/so101_new_calib.urdf")
+  (cd -- "$RUNTIME_REPO_ROOT" && PYTHONSAFEPATH=1 PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT" "${command[@]}") >"$log" 2>&1 || fail "native reference stage $stage failed; inspect $log"
   "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" compile-stage --bundle-root "$OUTPUT_ROOT" --stage "$stage" --category "$category" --garment "$garment" --identity "$OUTPUT_ROOT/identity.json" >/dev/null
 }
 run_stage 1 top_long Top_Long_Seen_0

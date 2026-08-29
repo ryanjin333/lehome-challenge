@@ -18,6 +18,9 @@ admitted until this gate passes.
 - Revision: `d384fe00508acd96ab1c3c5dc265e08261f94b3b`
 - Policy implementation: the pinned submission's `scripts.eval_policy.lerobot_policy.LeRobotPolicy`
 - Runtime family: LeRobot `0.4.3`, GR00T N1.5
+- Runtime image: existing local tag `lehome-rollout:build`, required to inspect
+  as immutable image ID
+  `sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7`
 - Checkpoint directory: the pinned submission's unmodified `pretrained_model/`
 - Dataset metadata: the pinned submission's per-category `dataset_meta/<category>_merged/meta/`
 - Simulation: CPU
@@ -29,6 +32,22 @@ The gate must verify the exact source revision and trusted byte digests before
 launch.  It must not rewrite `config.json`, remove fields, translate the flat
 LeRobot observation into the GR00T N1.7 nested schema, or replace the saved
 preprocessor/postprocessor.
+
+The host captures a fresh, read-only `docker image inspect` receipt for only
+`lehome-rollout:build` before container launch. Execution must bind that
+receipt, image reference, immutable image ID, and raw-inspect SHA-256 into the
+preflight, execution, and final identities. Inventory and validation-only do
+not require the receipt and never probe CUDA or launch the simulator.
+
+The public evaluator runs by absolute pinned path, while its working directory
+is the reviewed runtime repository (the launcher parent). `PYTHONSAFEPATH=1`
+and a pinned-source-first `PYTHONPATH` prevent a local `scripts.eval` from
+winning import resolution. The public `lehome.utils.constant.ASSETS_ROOT`
+therefore resolves to `<reviewed-runtime>/Assets`. For each of `objects`,
+`robots`, `scenes`, and `textures`, that directory and the corresponding
+canonical cache directory must have the same device and inode before preflight
+and again before every stage. The operator supplies this by mounting each
+canonical host asset root read-only at both paths; pinned source is not edited.
 
 ## Native policy contract
 
@@ -92,12 +111,49 @@ does not admit training or collection.
 - Use only the existing rollout VM and protected disk.
 - Never run Isaac processes in parallel for this gate.
 - Never create a replacement VM or image for the gate.
+- Run only the inspected existing `lehome-rollout:build` image; do not rebuild,
+  pull, or run a second Isaac container in parallel.
 - Do not download checkpoint weights again when the pinned, verified cache is
   already present.
 - Keep model weights and rollout artifacts off the local Mac.
 - Keep total remaining-work spend below the existing `$100` cap.
 - Publish under a new immutable `reference-checks/native-...` prefix; never
   overwrite the earlier invalid-compatibility diagnostic.
+
+The exact outer container shape is fixed. Here `reviewed_runtime_checkout` is
+the reviewed checkout on `/mnt/lehome`; the host captures the runtime receipt
+before this command and the launcher mode supplies the remaining environment:
+
+```bash
+docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
+  --mount type=bind,src=/mnt/lehome,dst=/mnt/lehome \
+  --mount type=bind,src="$reviewed_runtime_checkout",dst="$reviewed_runtime_checkout",readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/objects,dst=/mnt/lehome/reference-native/assets/objects,readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/objects,dst="$reviewed_runtime_checkout/Assets/objects",readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/robots,dst=/mnt/lehome/reference-native/assets/robots,readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/robots,dst="$reviewed_runtime_checkout/Assets/robots",readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/scenes,dst=/mnt/lehome/reference-native/assets/scenes,readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/scenes,dst="$reviewed_runtime_checkout/Assets/scenes",readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/textures,dst=/mnt/lehome/reference-native/assets/textures,readonly \
+  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/textures,dst="$reviewed_runtime_checkout/Assets/textures",readonly \
+  --workdir "$reviewed_runtime_checkout" \
+  --env LEHOME_NATIVE_REFERENCE_PYTHON=/opt/lehome-challenge/.venv/bin/python \
+  --env LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=/mnt/lehome/reference-native/source \
+  --env LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT=/mnt/lehome/reference-native/pretrained_model \
+  --env LEHOME_NATIVE_REFERENCE_METADATA_ROOT=/mnt/lehome/reference-native/dataset_meta \
+  --env LEHOME_NATIVE_REFERENCE_ASSETS_ROOT=/mnt/lehome/reference-native/assets \
+  --env LEHOME_NATIVE_REFERENCE_VM_ID=computeinstance-u00t6xfqhadrcmssa2 \
+  --env LEHOME_NATIVE_REFERENCE_DISK_ID=computedisk-u00pbe55crxy7jr56x \
+  --env LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT=/mnt/lehome/reference-native/runtime-image-receipt.json \
+  sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7 \
+  bash "$reviewed_runtime_checkout/rollout_appliance/run_native_reference_evaluator_gate.sh"
+```
+
+The four read-only asset source mounts appear at both canonical and runtime
+paths. The launcher passes `--device cpu` to the absolute pinned public
+`scripts/eval.py`; the outer `--gpus all` exposes CUDA only for policy use. The
+host inspects the fixed tag but launches the exact inspected image ID, avoiding
+a tag-retargeting gap between receipt capture and container creation.
 
 ## Decision after the gate
 
