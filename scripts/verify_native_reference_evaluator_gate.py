@@ -68,6 +68,21 @@ PEFT_WHEEL_URL = "https://files.pythonhosted.org/packages/b3/14/b4e3f574acf349ae
 PEFT_WHEEL_SHA256 = "0bf06847a3551e3019fc58c440cffc9a6b73e6e2962c95b52e224f77bbdb50f1"
 PEFT_WHEEL_SIZE = 556960
 PEFT_VERSION = "0.18.1"
+FLASH_ATTENTION_WHEEL_PATH = Path(
+    "/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+)
+FLASH_ATTENTION_WHEEL_FILENAME = (
+    "flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+)
+FLASH_ATTENTION_WHEEL_URL = (
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/"
+    "flash_attn-2.8.3%2Bcu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+)
+FLASH_ATTENTION_WHEEL_SHA256 = "cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af"
+FLASH_ATTENTION_WHEEL_SIZE = 256027206
+FLASH_ATTENTION_VERSION = "2.8.3"
+FLASH_ATTENTION_WHEEL_TAG = "cp311-cp311-linux_x86_64"
+FLASH_ATTENTION_INSTALL_ROOT = "/opt/lehome-challenge/.venv/lib/python3.11/site-packages/flash_attn"
 
 
 class NativeReferenceGateError(ValueError):
@@ -177,6 +192,100 @@ def inspect_peft_overlay() -> dict[str, object]:
 
 def prepare_peft_overlay(receipt_path: Path) -> dict[str, object]:
     receipt = inspect_peft_overlay()
+    _write_exclusive(Path(receipt_path), receipt)
+    return receipt
+
+
+def _flash_attention_wheel_members(wheel: Path) -> None:
+    """Reject an unsafe or non-native exact FlashAttention wheel offline."""
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            members = archive.infolist()
+            names: set[str] = set()
+            for member in members:
+                name = member.filename
+                path = PurePosixPath(name)
+                mode = member.external_attr >> 16
+                if (
+                    not name
+                    or name in names
+                    or "\\" in name
+                    or path.is_absolute()
+                    or ".." in path.parts
+                    or stat.S_ISLNK(mode)
+                    or member.flag_bits & 0x1
+                ):
+                    raise NativeReferenceGateError("unsafe FlashAttention wheel member")
+                names.add(name)
+            metadata_name = f"flash_attn-{FLASH_ATTENTION_VERSION}.dist-info/METADATA"
+            wheel_name = f"flash_attn-{FLASH_ATTENTION_VERSION}.dist-info/WHEEL"
+            if (
+                "flash_attn/__init__.py" not in names
+                or metadata_name not in names
+                or wheel_name not in names
+            ):
+                raise NativeReferenceGateError("FlashAttention wheel package metadata is incomplete")
+            try:
+                metadata = archive.read(metadata_name).decode("utf-8", errors="strict")
+                wheel_metadata = archive.read(wheel_name).decode("utf-8", errors="strict")
+            except (KeyError, UnicodeError) as error:
+                raise NativeReferenceGateError("FlashAttention wheel metadata is unreadable") from error
+    except zipfile.BadZipFile as error:
+        raise NativeReferenceGateError("FlashAttention wheel is not a valid ZIP archive") from error
+    fields: dict[str, str] = {}
+    for line in metadata.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            fields.setdefault(key, value.strip())
+    if fields.get("Name") != "flash-attn" or fields.get("Version") != FLASH_ATTENTION_VERSION:
+        raise NativeReferenceGateError("FlashAttention wheel metadata is not the exact official distribution")
+    wheel_fields: dict[str, list[str]] = {}
+    for line in wheel_metadata.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            wheel_fields.setdefault(key, []).append(value.strip())
+    if (
+        wheel_fields.get("Root-Is-Purelib") != ["false"]
+        or wheel_fields.get("Tag") != [FLASH_ATTENTION_WHEEL_TAG]
+    ):
+        raise NativeReferenceGateError("FlashAttention wheel platform tag is not exact")
+
+
+def inspect_flash_attention_overlay() -> dict[str, object]:
+    """Validate the fixed compiled wheel without importing it or touching CUDA."""
+    wheel = Path(FLASH_ATTENTION_WHEEL_PATH)
+    if not wheel.is_absolute() or ".." in wheel.parts:
+        raise NativeReferenceGateError("FlashAttention wheel fixed path is invalid")
+    if wheel.name != FLASH_ATTENTION_WHEEL_FILENAME:
+        raise NativeReferenceGateError("FlashAttention wheel filename is not exact")
+    try:
+        metadata = wheel.lstat()
+    except OSError as error:
+        raise NativeReferenceGateError("FlashAttention wheel is unavailable or unsafe") from error
+    if wheel.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise NativeReferenceGateError("FlashAttention wheel is unavailable or unsafe")
+    if metadata.st_size != FLASH_ATTENTION_WHEEL_SIZE:
+        raise NativeReferenceGateError("FlashAttention wheel size does not match the exact official wheel")
+    raw = _read_regular_bytes(wheel, "FlashAttention wheel")
+    if hashlib.sha256(raw).hexdigest() != FLASH_ATTENTION_WHEEL_SHA256:
+        raise NativeReferenceGateError("FlashAttention wheel digest does not match the exact official wheel")
+    _flash_attention_wheel_members(wheel)
+    return {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_flash_attention_overlay_v1",
+        "wheel_path": str(wheel.resolve(strict=True)),
+        "wheel_filename": FLASH_ATTENTION_WHEEL_FILENAME,
+        "wheel_url": FLASH_ATTENTION_WHEEL_URL,
+        "wheel_size": FLASH_ATTENTION_WHEEL_SIZE,
+        "wheel_sha256": FLASH_ATTENTION_WHEEL_SHA256,
+        "distribution_name": "flash-attn",
+        "flash_attn_version": FLASH_ATTENTION_VERSION,
+        "wheel_tag": FLASH_ATTENTION_WHEEL_TAG,
+    }
+
+
+def prepare_flash_attention_overlay(receipt_path: Path) -> dict[str, object]:
+    receipt = inspect_flash_attention_overlay()
     _write_exclusive(Path(receipt_path), receipt)
     return receipt
 
@@ -1138,8 +1247,8 @@ def oracle_attempts() -> tuple[dict[str, object], ...]:
 
 def _validate_identity(value: object) -> dict[str, object]:
     identity = _object(value, "identity")
-    fixed = {"source_repository": SOURCE_REPOSITORY, "source_revision": SOURCE_REVISION, "source_tree_sha256": SOURCE_TREE_SHA256, "lerobot_version": LEROBOT_VERSION, "policy_class": POLICY_CLASS, "policy_device": "cuda:0", "simulator_device": "cpu", "task_description": TASK_DESCRIPTION, "action_horizon": 16, "action_dimension": 12, "success_checker": SUCCESS_CHECKER, "cuda_available": True, "runtime_image_reference": RUNTIME_IMAGE_REFERENCE, "runtime_image_id": RUNTIME_IMAGE_ID, "peft_wheel_sha256": PEFT_WHEEL_SHA256}
-    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "source_root", "python_executable", "python_version", "torch_version", "lerobot_origin", "scripts_eval_origin", "lehome_origin"}
+    fixed = {"source_repository": SOURCE_REPOSITORY, "source_revision": SOURCE_REVISION, "source_tree_sha256": SOURCE_TREE_SHA256, "lerobot_version": LEROBOT_VERSION, "policy_class": POLICY_CLASS, "policy_device": "cuda:0", "simulator_device": "cpu", "task_description": TASK_DESCRIPTION, "action_horizon": 16, "action_dimension": 12, "success_checker": SUCCESS_CHECKER, "cuda_available": True, "runtime_image_reference": RUNTIME_IMAGE_REFERENCE, "runtime_image_id": RUNTIME_IMAGE_ID, "peft_wheel_sha256": PEFT_WHEEL_SHA256, "flash_attention_wheel_sha256": FLASH_ATTENTION_WHEEL_SHA256}
+    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256", "flash_attention_runtime_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "source_root", "python_executable", "python_version", "torch_version", "lerobot_origin", "scripts_eval_origin", "lehome_origin"}
     if set(identity) != {*fixed, *variable}:
         raise NativeReferenceGateError("identity has an unexpected schema")
     for key, expected in fixed.items():
@@ -1152,7 +1261,7 @@ def _validate_identity(value: object) -> dict[str, object]:
                 else key
             )
             raise NativeReferenceGateError(f"identity {label} does not match the native contract")
-    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256"):
+    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256", "flash_attention_runtime_receipt_sha256"):
         _digest(identity.get(key), f"identity {key}")
     if type(identity["cuda_device_count"]) is not int or identity["cuda_device_count"] < 1 or not isinstance(identity["cuda_runtime"], str) or not identity["cuda_runtime"]:
         raise NativeReferenceGateError("identity does not prove CUDA availability")
@@ -1258,6 +1367,82 @@ def _validate_peft_overlay_receipt(document: object) -> dict[str, object]:
     return receipt
 
 
+def _validate_flash_attention_overlay_receipt(document: object) -> dict[str, object]:
+    receipt = _object(document, "FlashAttention overlay receipt")
+    expected = {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_flash_attention_overlay_v1",
+        "wheel_path": str(FLASH_ATTENTION_WHEEL_PATH),
+        "wheel_filename": FLASH_ATTENTION_WHEEL_FILENAME,
+        "wheel_url": FLASH_ATTENTION_WHEEL_URL,
+        "wheel_size": FLASH_ATTENTION_WHEEL_SIZE,
+        "wheel_sha256": FLASH_ATTENTION_WHEEL_SHA256,
+        "distribution_name": "flash-attn",
+        "flash_attn_version": FLASH_ATTENTION_VERSION,
+        "wheel_tag": FLASH_ATTENTION_WHEEL_TAG,
+    }
+    if set(receipt) != set(expected) or any(receipt.get(key) != value for key, value in expected.items()):
+        raise NativeReferenceGateError("FlashAttention overlay receipt contract is invalid")
+    return receipt
+
+
+def _validate_flash_attention_runtime_receipt(document: object) -> dict[str, object]:
+    receipt = _object(document, "FlashAttention runtime receipt")
+    expected_keys = {
+        "schema_version", "kind", "torch_version", "torch_cuda_version",
+        "torch_cxx11_abi", "cuda_capability", "flash_attn_version",
+        "flash_attn_origin", "kernel",
+    }
+    if set(receipt) != expected_keys or receipt.get("schema_version") != 1 or receipt.get("kind") != "lehome_native_reference_flash_attention_runtime_v1":
+        raise NativeReferenceGateError("FlashAttention runtime receipt contract is invalid")
+    if receipt.get("torch_version") != "2.7.0+cu128" or receipt.get("torch_cuda_version") != "12.8" or receipt.get("torch_cxx11_abi") is not True:
+        raise NativeReferenceGateError("FlashAttention runtime receipt has an incompatible torch build")
+    if receipt.get("cuda_capability") != [12, 0]:
+        raise NativeReferenceGateError("FlashAttention runtime receipt has an incompatible CUDA capability")
+    if receipt.get("flash_attn_version") != FLASH_ATTENTION_VERSION:
+        raise NativeReferenceGateError("FlashAttention runtime receipt version is not exact")
+    origin = _absolute_identity_path(receipt.get("flash_attn_origin"), "FlashAttention origin")
+    if origin != f"{FLASH_ATTENTION_INSTALL_ROOT}/__init__.py":
+        raise NativeReferenceGateError("FlashAttention runtime receipt origin is not the ephemeral overlay")
+    kernel = _object(receipt.get("kernel"), "FlashAttention kernel probe")
+    if set(kernel) != {"shape", "dtype", "finite"} or kernel.get("shape") != [1, 2, 4, 64] or kernel.get("dtype") != "float16" or kernel.get("finite") is not True:
+        raise NativeReferenceGateError("FlashAttention runtime receipt does not prove a finite kernel")
+    return receipt
+
+
+def _validate_preflight(document: object, identity: Mapping[str, object]) -> dict[str, object]:
+    preflight = _object(document, "native reference preflight")
+    expected_keys = {
+        "schema_version", "kind", "identity", "cuda_probe_sha256",
+        "host_runtime_sha256", "runtime_image_receipt_sha256",
+        "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256",
+        "flash_attention_overlay_receipt_sha256",
+        "flash_attention_runtime_receipt_sha256",
+    }
+    if (
+        set(preflight) != expected_keys
+        or preflight.get("schema_version") != 2
+        or preflight.get("kind") != "lehome_native_reference_preflight_v2"
+        or preflight.get("identity") != dict(identity)
+    ):
+        raise NativeReferenceGateError("native reference preflight contract is invalid")
+    for key in (
+        "cuda_probe_sha256", "host_runtime_sha256", "runtime_image_receipt_sha256",
+        "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256",
+        "flash_attention_overlay_receipt_sha256",
+        "flash_attention_runtime_receipt_sha256",
+    ):
+        _digest(preflight.get(key), f"native reference preflight {key}")
+    for key in (
+        "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256",
+        "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256",
+        "flash_attention_runtime_receipt_sha256",
+    ):
+        if preflight[key] != identity[key]:
+            raise NativeReferenceGateError("native reference preflight is not bound to identity")
+    return preflight
+
+
 def _validate_attempt(value: object, expected: Mapping[str, object], root: Path | None) -> dict[str, object]:
     attempt = _object(value, "attempt")
     if set(attempt) != {*expected, "success", "videos", "log", "receipt"}:
@@ -1284,11 +1469,14 @@ def verify_native_reference_result(document: object, *, bundle_root: Path | None
     identity = _validate_identity(result.get("identity"))
     supporting_artifacts: dict[str, object] = {}
     if bundle_root is not None:
+        preflight = _artifact_from_file(bundle_root, Path("preflight.json"))
         cache = _artifact_from_file(bundle_root, Path("evidence/cache-trust-manifest.json"))
         running = _artifact_from_file(bundle_root, Path("evidence/provider-running-receipt.json"))
         runtime_image = _artifact_from_file(bundle_root, Path("evidence/runtime-image-receipt.json"))
         compatibility = _artifact_from_file(bundle_root, Path("evidence/checkpoint-compatibility-receipt.json"))
         peft_overlay = _artifact_from_file(bundle_root, Path("evidence/peft-overlay-receipt.json"))
+        flash_overlay = _artifact_from_file(bundle_root, Path("evidence/flash-attention-overlay-receipt.json"))
+        flash_runtime = _artifact_from_file(bundle_root, Path("evidence/flash-attention-runtime-receipt.json"))
         _validate_checkpoint_compatibility_receipt(
             _read_json(bundle_root / "evidence/checkpoint-compatibility-receipt.json", "checkpoint compatibility receipt"),
             bundle_root=bundle_root,
@@ -1296,9 +1484,18 @@ def verify_native_reference_result(document: object, *, bundle_root: Path | None
         _validate_peft_overlay_receipt(
             _read_json(bundle_root / "evidence/peft-overlay-receipt.json", "PEFT overlay receipt")
         )
-        if cache["sha256"] != identity["cache_trust_manifest_sha256"] or running["sha256"] != identity["provider_running_receipt_sha256"] or runtime_image["sha256"] != identity["runtime_image_receipt_sha256"] or compatibility["sha256"] != identity["checkpoint_compatibility_receipt_sha256"] or peft_overlay["sha256"] != identity["peft_overlay_receipt_sha256"]:
+        _validate_flash_attention_overlay_receipt(
+            _read_json(bundle_root / "evidence/flash-attention-overlay-receipt.json", "FlashAttention overlay receipt")
+        )
+        _validate_flash_attention_runtime_receipt(
+            _read_json(bundle_root / "evidence/flash-attention-runtime-receipt.json", "FlashAttention runtime receipt")
+        )
+        _validate_preflight(
+            _read_json(bundle_root / "preflight.json", "native reference preflight"), identity
+        )
+        if cache["sha256"] != identity["cache_trust_manifest_sha256"] or running["sha256"] != identity["provider_running_receipt_sha256"] or runtime_image["sha256"] != identity["runtime_image_receipt_sha256"] or compatibility["sha256"] != identity["checkpoint_compatibility_receipt_sha256"] or peft_overlay["sha256"] != identity["peft_overlay_receipt_sha256"] or flash_overlay["sha256"] != identity["flash_attention_overlay_receipt_sha256"] or flash_runtime["sha256"] != identity["flash_attention_runtime_receipt_sha256"]:
             raise NativeReferenceGateError("execution bundle support evidence is not bound to identity")
-        supporting_artifacts = {"cache_trust_manifest": cache, "provider_running_receipt": running, "runtime_image_receipt": runtime_image, "checkpoint_compatibility_receipt": compatibility, "peft_overlay_receipt": peft_overlay}
+        supporting_artifacts = {"preflight": preflight, "cache_trust_manifest": cache, "provider_running_receipt": running, "runtime_image_receipt": runtime_image, "checkpoint_compatibility_receipt": compatibility, "peft_overlay_receipt": peft_overlay, "flash_attention_overlay_receipt": flash_overlay, "flash_attention_runtime_receipt": flash_runtime}
     rows = result.get("attempts")
     if type(rows) is not list or len(rows) not in {2, 8}:
         raise NativeReferenceGateError("native reference result must contain either the two-attempt admission stop or all eight attempts")
@@ -1425,6 +1622,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     compatibility = commands.add_parser("prepare-checkpoint-compatibility"); compatibility.add_argument("--checkpoint-root", type=Path, required=True); compatibility.add_argument("--sanitized-config-root", type=Path, required=True); compatibility.add_argument("--receipt", type=Path, required=True)
     peft_overlay = commands.add_parser("validate-peft-overlay")
     prepare_peft = commands.add_parser("prepare-peft-overlay"); prepare_peft.add_argument("--receipt", type=Path, required=True)
+    flash_attention_overlay = commands.add_parser("validate-flash-attention-overlay")
+    prepare_flash_attention = commands.add_parser("prepare-flash-attention-overlay"); prepare_flash_attention.add_argument("--receipt", type=Path, required=True)
     cache = commands.add_parser("fetch-cache-manifest"); cache.add_argument("--revision", required=True); cache.add_argument("--path", required=True); cache.add_argument("--receipt", type=Path); cache.add_argument("--checkpoint-tree-sha256"); cache.add_argument("--metadata-tree-sha256"); cache.add_argument("--assets-tree-sha256")
     publish = commands.add_parser("publish-bundle"); publish.add_argument("--bundle-root", type=Path, required=True); publish.add_argument("--execution", type=Path, required=True); publish.add_argument("--token-file", type=Path, required=True); publish.add_argument("--receipt", type=Path, required=True)
     publish_cache = commands.add_parser("publish-cache-manifest"); publish_cache.add_argument("--manifest", type=Path, required=True); publish_cache.add_argument("--token-file", type=Path, required=True); publish_cache.add_argument("--receipt", type=Path, required=True)
@@ -1458,6 +1657,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             receipt = inspect_peft_overlay()
         elif args.command == "prepare-peft-overlay":
             receipt = prepare_peft_overlay(args.receipt)
+        elif args.command == "validate-flash-attention-overlay":
+            receipt = inspect_flash_attention_overlay()
+        elif args.command == "prepare-flash-attention-overlay":
+            receipt = prepare_flash_attention_overlay(args.receipt)
         elif args.command == "publish-bundle":
             with _repository_package_imports():
                 from scripts.publish_simple_curriculum_collection import HuggingFacePublicDatasetTransport, _load_token

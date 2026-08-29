@@ -43,6 +43,26 @@ published `7/8` oracle and its result has been published and read back.
   The gate only zipimports this read-only wheel; it never downloads, installs,
   extracts, or otherwise mutates it. It records the validated wheel's exact
   import origin, version, and required symbols before a simulator episode.
+- FlashAttention overlay: the public LeRobot 0.4.3 GR00T code hard-codes
+  `flash_attention_2`; do not substitute eager or SDPA attention. Before
+  validation, place only the official Dao-AILab release wheel
+  `flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl` at
+  `/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl`.
+  It is exactly 256027206 bytes with SHA-256
+  `cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af`, from
+  `https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl`.
+  Validation is offline and rejects any wrong name, size, digest, unsafe ZIP
+  member, metadata, or `cp311-cp311-linux_x86_64` platform tag. At execution
+  the wrapper bind-mounts that exact wheel read-only into the ephemeral
+  container; `uv pip install --offline --no-deps --python
+  /opt/lehome-challenge/.venv/bin/python <mounted-wheel>` prevents that
+  installation from resolving or downloading dependencies, while the existing
+  evaluator container network remains available for immutable cache-manifest
+  readback. The package installs only in that container. Before GR00T construction, a receipt proves torch
+  `2.7.0+cu128`, CUDA `12.8`, CXX11 ABI true, capability `[12,0]`, the installed
+  FlashAttention origin/version, and a finite tiny `flash_attn_func` CUDA
+  kernel. The overlay and runtime receipts are bound to preflight, identity,
+  every stage revalidation, execution evidence, and final verification.
 - There are eight sequential 600-step episodes, all at seed 42:
   `Top_Long_Seen_0` twice, `Top_Short_Seen_0` twice,
   `Pant_Long_Seen_0` twice, then `Pant_Short_Seen_0` twice. The required
@@ -124,6 +144,10 @@ inspection and container creation.
 The image receipt is required only for execution. `source-stage`,
 `inventory-cache`, and validation-only remain zero-evaluation paths and do not
 require that receipt, probe CUDA, or launch simulation.
+Validation-only performs no remote cache-manifest readback: it validates the
+local wheel, wheel metadata, checkpoint/cache layout, and CPU simulation
+contract, but deliberately does not install the compiled overlay, probe CUDA,
+or construct GR00T.
 
 Once the exact VM is running, first stage only the public evaluator source
 into an empty source root. This

@@ -23,6 +23,8 @@ readonly ISAACLAB_TASKS_ROOT="/opt/lehome-challenge/third_party/IsaacLab/source/
 readonly CANONICAL_CACHE_MANIFEST="$SCRIPT_DIR/native_reference_canonical_cache_manifest.json"
 readonly PEFT_WHEEL_PATH="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"
 readonly PEFT_WHEEL_SHA256="0bf06847a3551e3019fc58c440cffc9a6b73e6e2962c95b52e224f77bbdb50f1"
+readonly FLASH_ATTENTION_WHEEL_PATH="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+readonly FLASH_ATTENTION_WHEEL_SHA256="cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
 sha256_file() { sha256sum -- "$1" | awk '{print $1}'; }
@@ -123,10 +125,16 @@ validate_stage_integrity() {
   validate_runtime_asset_bindings
   "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" validate-peft-overlay >/dev/null \
     || fail "PEFT wheel overlay changed during evaluation"
+  "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" validate-flash-attention-overlay >/dev/null \
+    || fail "FlashAttention wheel overlay changed during evaluation"
   [[ "$(sha256_file "$CHECKPOINT_COMPATIBILITY_RECEIPT")" == "$CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256" ]] \
     || fail "checkpoint compatibility receipt changed during evaluation"
   [[ "$(sha256_file "$PEFT_OVERLAY_RECEIPT")" == "$PEFT_OVERLAY_RECEIPT_SHA256" ]] \
     || fail "PEFT overlay receipt changed during evaluation"
+  [[ "$(sha256_file "$FLASH_ATTENTION_OVERLAY_RECEIPT")" == "$FLASH_ATTENTION_OVERLAY_RECEIPT_SHA256" ]] \
+    || fail "FlashAttention overlay receipt changed during evaluation"
+  [[ "$(sha256_file "$FLASH_ATTENTION_RUNTIME_RECEIPT")" == "$FLASH_ATTENTION_RUNTIME_RECEIPT_SHA256" ]] \
+    || fail "FlashAttention runtime receipt changed during evaluation"
   [[ "$AUTHENTICATED_METADATA_TREE_SHA256" == "$METADATA_TREE_SHA256" ]] || fail "native reference metadata tree changed during evaluation"
   [[ "$AUTHENTICATED_ASSETS_TREE_SHA256" == "$ASSETS_TREE_SHA256" ]] || fail "native reference assets tree changed during evaluation"
 }
@@ -241,6 +249,34 @@ with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(payload,stream,sort
 PY
 }
 
+probe_flash_attention_runtime() {
+  # This is intentionally a fresh, ephemeral-container install. The direct
+  # wheel bind is read-only and the wrapper disables networking, so no package
+  # index, dependency resolution, image mutation, or host mutation is possible.
+  uv pip install --offline --no-deps --python /opt/lehome-challenge/.venv/bin/python "$FLASH_ATTENTION_WHEEL_PATH" >/dev/null \
+    || fail "FlashAttention ephemeral overlay install failed"
+  "$PYTHON_BIN" - "$OUTPUT_ROOT/evidence/flash-attention-runtime-receipt.json" <<'PY'
+import json, os, sys
+from pathlib import Path
+import flash_attn, torch
+from flash_attn import flash_attn_func
+if torch.__version__ != "2.7.0+cu128": raise SystemExit("FlashAttention requires torch 2.7.0+cu128")
+if torch.version.cuda != "12.8": raise SystemExit("FlashAttention requires CUDA 12.8")
+if bool(torch._C._GLIBCXX_USE_CXX11_ABI) is not True: raise SystemExit("FlashAttention requires CXX11 ABI true")
+if not torch.cuda.is_available() or list(torch.cuda.get_device_capability(0)) != [12, 0]: raise SystemExit("FlashAttention requires CUDA capability [12,0]")
+origin = str(Path(flash_attn.__file__).resolve())
+expected = "/opt/lehome-challenge/.venv/lib/python3.11/site-packages/flash_attn/__init__.py"
+if origin != expected or str(flash_attn.__version__) != "2.8.3": raise SystemExit("FlashAttention installed overlay identity is invalid")
+query = torch.randn((1, 2, 4, 64), dtype=torch.float16, device="cuda")
+output = flash_attn_func(query, query, query, causal=False)
+torch.cuda.synchronize()
+if not bool(torch.isfinite(output).all().item()): raise SystemExit("FlashAttention CUDA kernel returned non-finite values")
+payload={"schema_version":1,"kind":"lehome_native_reference_flash_attention_runtime_v1","torch_version":str(torch.__version__),"torch_cuda_version":torch.version.cuda,"torch_cxx11_abi":bool(torch._C._GLIBCXX_USE_CXX11_ABI),"cuda_capability":list(torch.cuda.get_device_capability(0)),"flash_attn_version":str(flash_attn.__version__),"flash_attn_origin":origin,"kernel":{"shape":[1,2,4,64],"dtype":"float16","finite":True}}
+target=Path(sys.argv[1]); fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o444)
+with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(payload,stream,sort_keys=True,separators=(",",":")); stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
+PY
+}
+
 probe_host_runtime() {
   (cd -- "$RUNTIME_REPO_ROOT" && PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PYTHONPATH="$PEFT_WHEEL_PATH:$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT" \
     "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" probe-host-runtime \
@@ -250,14 +286,14 @@ probe_host_runtime() {
 }
 
 write_identity_and_preflight() {
-  "$PYTHON_BIN" - "$OUTPUT_ROOT/identity.json" "$OUTPUT_ROOT/preflight.json" "$OUTPUT_ROOT/cuda-runtime.json" "$OUTPUT_ROOT/host-runtime.json" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" "$CACHE_TRUST_MANIFEST_SHA256" "$PROVIDER_RUNNING_RECEIPT_SHA256" "$RUNTIME_IMAGE_RECEIPT_SHA256" "$CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256" "$VM_ID" "$DISK_ID" "$RUNTIME_IMAGE_REFERENCE" "$RUNTIME_IMAGE_ID" "$PEFT_WHEEL_SHA256" "$PEFT_OVERLAY_RECEIPT_SHA256" <<'PY'
+  "$PYTHON_BIN" - "$OUTPUT_ROOT/identity.json" "$OUTPUT_ROOT/preflight.json" "$OUTPUT_ROOT/cuda-runtime.json" "$OUTPUT_ROOT/host-runtime.json" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" "$CACHE_TRUST_MANIFEST_SHA256" "$PROVIDER_RUNNING_RECEIPT_SHA256" "$RUNTIME_IMAGE_RECEIPT_SHA256" "$CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256" "$VM_ID" "$DISK_ID" "$RUNTIME_IMAGE_REFERENCE" "$RUNTIME_IMAGE_ID" "$PEFT_WHEEL_SHA256" "$PEFT_OVERLAY_RECEIPT_SHA256" "$FLASH_ATTENTION_WHEEL_SHA256" "$FLASH_ATTENTION_OVERLAY_RECEIPT_SHA256" "$FLASH_ATTENTION_RUNTIME_RECEIPT_SHA256" <<'PY'
 import hashlib, json, os, sys
 from pathlib import Path
 identity_path, preflight_path, cuda_path, host_path = map(Path, sys.argv[1:5]); cuda=json.loads(cuda_path.read_text()); host=json.loads(host_path.read_text())
 expected_host={"schema_version","kind","source_root","python_executable","python_version","torch_version","lerobot_version","lerobot_origin","scripts_eval_origin","lehome_origin","isaaclab_app_origin","app_launcher_class"}
 if set(host) != expected_host or host.get("schema_version") != 1 or host.get("kind") != "lehome_native_reference_host_runtime_v1" or host.get("lerobot_version") != "0.4.3" or host.get("app_launcher_class") != "isaaclab.app.AppLauncher" or not str(host.get("isaaclab_app_origin","")).startswith("/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab/"): raise SystemExit("native reference host runtime is invalid")
-identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[5],"metadata_tree_sha256":sys.argv[6],"assets_tree_sha256":sys.argv[7],"cache_trust_manifest_sha256":sys.argv[8],"provider_running_receipt_sha256":sys.argv[9],"runtime_image_receipt_sha256":sys.argv[10],"checkpoint_compatibility_receipt_sha256":sys.argv[11],"provider_source_image_id":"computeimage-u00zf6w3yf72gakhcy","runtime_image_reference":sys.argv[14],"runtime_image_id":sys.argv[15],"peft_wheel_sha256":sys.argv[16],"peft_overlay_receipt_sha256":sys.argv[17],"lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[12],"disk_id":sys.argv[13],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points",**{key:host[key] for key in ("source_root","python_executable","python_version","torch_version","lerobot_origin","scripts_eval_origin","lehome_origin")}}
-preflight={"schema_version":2,"kind":"lehome_native_reference_preflight_v2","identity":identity,"cuda_probe_sha256":hashlib.sha256(cuda_path.read_bytes()).hexdigest(),"host_runtime_sha256":hashlib.sha256(host_path.read_bytes()).hexdigest(),"runtime_image_receipt_sha256":sys.argv[10],"checkpoint_compatibility_receipt_sha256":sys.argv[11],"peft_overlay_receipt_sha256":sys.argv[17]}
+identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[5],"metadata_tree_sha256":sys.argv[6],"assets_tree_sha256":sys.argv[7],"cache_trust_manifest_sha256":sys.argv[8],"provider_running_receipt_sha256":sys.argv[9],"runtime_image_receipt_sha256":sys.argv[10],"checkpoint_compatibility_receipt_sha256":sys.argv[11],"provider_source_image_id":"computeimage-u00zf6w3yf72gakhcy","runtime_image_reference":sys.argv[14],"runtime_image_id":sys.argv[15],"peft_wheel_sha256":sys.argv[16],"peft_overlay_receipt_sha256":sys.argv[17],"flash_attention_wheel_sha256":sys.argv[18],"flash_attention_overlay_receipt_sha256":sys.argv[19],"flash_attention_runtime_receipt_sha256":sys.argv[20],"lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[12],"disk_id":sys.argv[13],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points",**{key:host[key] for key in ("source_root","python_executable","python_version","torch_version","lerobot_origin","scripts_eval_origin","lehome_origin")}}
+preflight={"schema_version":2,"kind":"lehome_native_reference_preflight_v2","identity":identity,"cuda_probe_sha256":hashlib.sha256(cuda_path.read_bytes()).hexdigest(),"host_runtime_sha256":hashlib.sha256(host_path.read_bytes()).hexdigest(),"runtime_image_receipt_sha256":sys.argv[10],"checkpoint_compatibility_receipt_sha256":sys.argv[11],"peft_overlay_receipt_sha256":sys.argv[17],"flash_attention_overlay_receipt_sha256":sys.argv[19],"flash_attention_runtime_receipt_sha256":sys.argv[20]}
 for path,document in ((identity_path,identity),(preflight_path,preflight)):
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o444)
     with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(document,stream,sort_keys=True,separators=(",",":")); stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
@@ -300,10 +336,12 @@ fi
 [[ "$VM_ID" == "$EXACT_VM_ID" ]] || fail "LEHOME_NATIVE_REFERENCE_VM_ID is not the exact rollout VM"
 [[ "$DISK_ID" == "$PROTECTED_DISK_ID" ]] || fail "LEHOME_NATIVE_REFERENCE_DISK_ID is not the protected shared disk"
 require_new_output "$OUTPUT_ROOT"
-validate_cache_trust_manifest
 "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" validate-peft-overlay >/dev/null \
   || fail "PEFT wheel overlay preflight failed"
+"$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" validate-flash-attention-overlay >/dev/null \
+  || fail "FlashAttention wheel overlay preflight failed"
 if [[ "$MODE" == validate-only ]]; then printf '%s\n' '{"status":"validated","mode":"no-execution"}'; exit 0; fi
+validate_cache_trust_manifest
 [[ "$PROVIDER_RUNNING_RECEIPT" == /* && "$PROVIDER_RUNNING_RECEIPT" != *".."* && -f "$PROVIDER_RUNNING_RECEIPT" && ! -L "$PROVIDER_RUNNING_RECEIPT" ]] || fail "provider RUNNING receipt is unavailable or unsafe"
 
 mkdir --mode=0700 -- "$OUTPUT_ROOT"; mkdir --mode=0700 -- "$OUTPUT_ROOT/logs" "$OUTPUT_ROOT/videos" "$OUTPUT_ROOT/receipts" "$OUTPUT_ROOT/evidence"
@@ -313,16 +351,22 @@ mkdir --mode=0700 -- "$OUTPUT_ROOT"; mkdir --mode=0700 -- "$OUTPUT_ROOT/logs" "$
 SANITIZED_CONFIG_ROOT="$OUTPUT_ROOT/checkpoint-config-view"
 CHECKPOINT_COMPATIBILITY_RECEIPT="$OUTPUT_ROOT/evidence/checkpoint-compatibility-receipt.json"
 PEFT_OVERLAY_RECEIPT="$OUTPUT_ROOT/evidence/peft-overlay-receipt.json"
+FLASH_ATTENTION_OVERLAY_RECEIPT="$OUTPUT_ROOT/evidence/flash-attention-overlay-receipt.json"
+FLASH_ATTENTION_RUNTIME_RECEIPT="$OUTPUT_ROOT/evidence/flash-attention-runtime-receipt.json"
 "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" prepare-peft-overlay --receipt "$PEFT_OVERLAY_RECEIPT" >/dev/null
+"$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" prepare-flash-attention-overlay --receipt "$FLASH_ATTENTION_OVERLAY_RECEIPT" >/dev/null
 PYTHONPATH="$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT" "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" prepare-checkpoint-compatibility --checkpoint-root "$CHECKPOINT_ROOT" --sanitized-config-root "$SANITIZED_CONFIG_ROOT" --receipt "$CHECKPOINT_COMPATIBILITY_RECEIPT" >/dev/null
 CACHE_TRUST_MANIFEST_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/cache-trust-manifest.json")"
 PROVIDER_RUNNING_RECEIPT_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/provider-running-receipt.json")"
 RUNTIME_IMAGE_RECEIPT_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/runtime-image-receipt.json")"
 CHECKPOINT_COMPATIBILITY_RECEIPT_SHA256="$(sha256_file "$CHECKPOINT_COMPATIBILITY_RECEIPT")"
 PEFT_OVERLAY_RECEIPT_SHA256="$(sha256_file "$PEFT_OVERLAY_RECEIPT")"
+FLASH_ATTENTION_OVERLAY_RECEIPT_SHA256="$(sha256_file "$FLASH_ATTENTION_OVERLAY_RECEIPT")"
 validate_running_provider_binding
 validate_runtime_image_binding
-probe_cuda; probe_host_runtime; write_identity_and_preflight
+probe_cuda; probe_host_runtime; probe_flash_attention_runtime
+FLASH_ATTENTION_RUNTIME_RECEIPT_SHA256="$(sha256_file "$FLASH_ATTENTION_RUNTIME_RECEIPT")"
+write_identity_and_preflight
 run_stage() {
   local stage="$1" category="$2" garment="$3"
   local log="$OUTPUT_ROOT/logs/stage-${stage}.log"

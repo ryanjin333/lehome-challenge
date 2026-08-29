@@ -38,6 +38,9 @@ def _identity() -> dict[str, object]:
         "checkpoint_compatibility_receipt_sha256": hashlib.sha256(b"compatibility").hexdigest(),
         "peft_wheel_sha256": "0bf06847a3551e3019fc58c440cffc9a6b73e6e2962c95b52e224f77bbdb50f1",
         "peft_overlay_receipt_sha256": hashlib.sha256(b"peft-overlay").hexdigest(),
+        "flash_attention_wheel_sha256": "cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af",
+        "flash_attention_overlay_receipt_sha256": hashlib.sha256(b"flash-overlay").hexdigest(),
+        "flash_attention_runtime_receipt_sha256": hashlib.sha256(b"flash-runtime").hexdigest(),
         "provider_source_image_id": "computeimage-u00zf6w3yf72gakhcy",
         "runtime_image_reference": "lehome-rollout:build",
         "runtime_image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
@@ -159,6 +162,63 @@ def _materialize_artifacts(root: Path, bundle: dict[str, object]) -> None:
     ).encode()
     (root / "evidence/peft-overlay-receipt.json").write_bytes(peft_overlay)
     bundle["identity"]["peft_overlay_receipt_sha256"] = hashlib.sha256(peft_overlay).hexdigest()  # type: ignore[index]
+    flash_overlay = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "lehome_native_reference_flash_attention_overlay_v1",
+                "wheel_path": "/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl",
+                "wheel_filename": "flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl",
+                "wheel_url": "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl",
+                "wheel_size": 256027206,
+                "wheel_sha256": "cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af",
+                "distribution_name": "flash-attn",
+                "flash_attn_version": "2.8.3",
+                "wheel_tag": "cp311-cp311-linux_x86_64",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    (root / "evidence/flash-attention-overlay-receipt.json").write_bytes(flash_overlay)
+    bundle["identity"]["flash_attention_overlay_receipt_sha256"] = hashlib.sha256(flash_overlay).hexdigest()  # type: ignore[index]
+    flash_runtime = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "lehome_native_reference_flash_attention_runtime_v1",
+                "torch_version": "2.7.0+cu128",
+                "torch_cuda_version": "12.8",
+                "torch_cxx11_abi": True,
+                "cuda_capability": [12, 0],
+                "flash_attn_version": "2.8.3",
+                "flash_attn_origin": "/opt/lehome-challenge/.venv/lib/python3.11/site-packages/flash_attn/__init__.py",
+                "kernel": {"shape": [1, 2, 4, 64], "dtype": "float16", "finite": True},
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    (root / "evidence/flash-attention-runtime-receipt.json").write_bytes(flash_runtime)
+    bundle["identity"]["flash_attention_runtime_receipt_sha256"] = hashlib.sha256(flash_runtime).hexdigest()  # type: ignore[index]
+    preflight = {
+        "schema_version": 2,
+        "kind": "lehome_native_reference_preflight_v2",
+        "identity": bundle["identity"],
+        "cuda_probe_sha256": "a" * 64,
+        "host_runtime_sha256": "b" * 64,
+        "runtime_image_receipt_sha256": bundle["identity"]["runtime_image_receipt_sha256"],
+        "checkpoint_compatibility_receipt_sha256": bundle["identity"]["checkpoint_compatibility_receipt_sha256"],
+        "peft_overlay_receipt_sha256": bundle["identity"]["peft_overlay_receipt_sha256"],
+        "flash_attention_overlay_receipt_sha256": bundle["identity"]["flash_attention_overlay_receipt_sha256"],
+        "flash_attention_runtime_receipt_sha256": bundle["identity"]["flash_attention_runtime_receipt_sha256"],
+    }
+    (root / "preflight.json").write_text(
+        json.dumps(preflight, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
     for attempt in bundle["attempts"]:  # type: ignore[index]
         for artifact in [attempt["log"], attempt["receipt"], *attempt["videos"]]:  # type: ignore[index]
             path = root / artifact["path"]  # type: ignore[index]
@@ -1269,6 +1329,7 @@ def test_native_container_wrapper_builds_complete_exact_command_per_mode(
         "--gpus",
         "all",
     ]
+    assert tokens[tokens.index("--network") + 1] == "host"
     assert tokens[tokens.index("--entrypoint") + 1] == "bash"
     assert tokens.index("--entrypoint") < image_index
     runtime_root = Path("/mnt/lehome/runtime-code") / revision
@@ -1973,3 +2034,123 @@ def test_execution_verifier_rejects_tampered_or_missing_peft_overlay_evidence(
     path.unlink()
     with pytest.raises(NativeReferenceGateError, match="missing required artifact"):
         verify_native_reference_result(document, bundle_root=tmp_path)
+
+
+def _write_flash_attention_overlay_wheel(
+    path: Path,
+    *,
+    tag: str = "cp311-cp311-linux_x86_64",
+    version: str = "2.8.3",
+    unsafe_member: str | None = None,
+) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("flash_attn/__init__.py", f"__version__ = {version!r}\n")
+        archive.writestr(
+            "flash_attn-2.8.3.dist-info/METADATA",
+            f"Metadata-Version: 2.1\nName: flash-attn\nVersion: {version}\n",
+        )
+        archive.writestr(
+            "flash_attn-2.8.3.dist-info/WHEEL",
+            f"Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: {tag}\n",
+        )
+        if unsafe_member is not None:
+            archive.writestr(unsafe_member, b"unsafe")
+
+
+def _configure_flash_attention_overlay_constants(
+    monkeypatch: pytest.MonkeyPatch, wheel: Path
+) -> None:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    monkeypatch.setattr(gate, "FLASH_ATTENTION_WHEEL_PATH", wheel.resolve())
+    if wheel.exists():
+        monkeypatch.setattr(gate, "FLASH_ATTENTION_WHEEL_SIZE", wheel.stat().st_size)
+        monkeypatch.setattr(
+            gate,
+            "FLASH_ATTENTION_WHEEL_SHA256",
+            hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        )
+
+
+def test_flash_attention_overlay_rejects_bad_wheel_identity_metadata_and_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    missing = tmp_path / "flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+    _configure_flash_attention_overlay_constants(monkeypatch, missing)
+    with pytest.raises(gate.NativeReferenceGateError, match="FlashAttention wheel is unavailable"):
+        gate.inspect_flash_attention_overlay()
+
+    wrong = tmp_path / "wrong.whl"
+    _write_flash_attention_overlay_wheel(wrong)
+    _configure_flash_attention_overlay_constants(monkeypatch, wrong)
+    with pytest.raises(gate.NativeReferenceGateError, match="filename"):
+        gate.inspect_flash_attention_overlay()
+
+    wheel = tmp_path / "flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+    _write_flash_attention_overlay_wheel(wheel, tag="cp311-cp311-manylinux_2_28_x86_64")
+    _configure_flash_attention_overlay_constants(monkeypatch, wheel)
+    with pytest.raises(gate.NativeReferenceGateError, match="platform tag"):
+        gate.inspect_flash_attention_overlay()
+
+    _write_flash_attention_overlay_wheel(wheel, unsafe_member="../escape.py")
+    _configure_flash_attention_overlay_constants(monkeypatch, wheel)
+    with pytest.raises(gate.NativeReferenceGateError, match="unsafe FlashAttention wheel member"):
+        gate.inspect_flash_attention_overlay()
+
+
+def test_flash_attention_overlay_receipt_and_execution_evidence_are_identity_bound(
+    tmp_path: Path,
+) -> None:
+    from scripts.verify_native_reference_evaluator_gate import (
+        NativeReferenceGateError,
+        verify_native_reference_result,
+    )
+
+    document = _bundle()
+    _materialize_artifacts(tmp_path, document)
+    assert verify_native_reference_result(document, bundle_root=tmp_path)["status"] == "oracle_matched_pending_finalization"
+
+    path = tmp_path / "evidence" / "flash-attention-runtime-receipt.json"
+    path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(NativeReferenceGateError, match="FlashAttention"):
+        verify_native_reference_result(document, bundle_root=tmp_path)
+
+
+def test_flash_attention_preflight_binding_is_checked_at_final_execution_verification(
+    tmp_path: Path,
+) -> None:
+    from scripts.verify_native_reference_evaluator_gate import (
+        NativeReferenceGateError,
+        verify_native_reference_result,
+    )
+
+    document = _bundle()
+    _materialize_artifacts(tmp_path, document)
+    preflight = json.loads((tmp_path / "preflight.json").read_text(encoding="utf-8"))
+    preflight["flash_attention_runtime_receipt_sha256"] = "0" * 64
+    (tmp_path / "preflight.json").write_text(json.dumps(preflight), encoding="utf-8")
+    with pytest.raises(NativeReferenceGateError, match="preflight"):
+        verify_native_reference_result(document, bundle_root=tmp_path)
+
+
+def test_native_flash_attention_contract_is_read_only_offline_then_installed_before_model_construction() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    wrapper = CONTAINER_WRAPPER.read_text(encoding="utf-8")
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    wheel = "flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+
+    for text in (launcher, wrapper, runbook):
+        assert wheel in text
+        assert "cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af" in text
+    assert "validate-flash-attention-overlay" in launcher
+    assert "prepare-flash-attention-overlay" in launcher
+    assert "probe_flash_attention_runtime" in launcher
+    assert launcher.index("probe_flash_attention_runtime") < launcher.index("run_stage 1")
+    assert launcher.count("validate-flash-attention-overlay") >= 2
+    assert "uv pip install --offline --no-deps --python /opt/lehome-challenge/.venv/bin/python" in launcher
+    assert "--network host" in wrapper
+    assert "--network none" not in wrapper
+    assert "readonly" in wrapper
+    assert "Dao-AILab/flash-attention/releases" in runbook
