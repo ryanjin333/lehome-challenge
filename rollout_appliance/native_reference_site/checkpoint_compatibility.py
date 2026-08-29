@@ -14,8 +14,8 @@ from typing import Any
 EXPECTED_CONFIG_SHA256 = "b7c385bc57456eae603e929b84defb7e991194aade2aad70785e21991e37614c"
 LEROBOT_WHEEL_SHA256 = "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c"
 # Canonical manifest of the exact verified wheel's sorted lerobot/ regular
-# files: relative path, NUL, SHA-256 of real bytes, LF. Runtime-only
-# __pycache__ directories and .pyc files are the sole exclusions.
+# files: relative path, NUL, SHA-256 of real bytes, LF. Regular .pyc files are
+# the sole runtime exclusion.
 LEROBOT_PACKAGE_TREE_SHA256 = "db3b4e18b166d4bb7fb4354cec82a7fbd15bb24230f9d71269a017c774e0852f"
 LEROBOT_PACKAGE_FILE_COUNT = 289
 REMOVED_FIELDS = (
@@ -59,7 +59,7 @@ def _installed_lerobot_identity() -> tuple[Path, str, int]:
             continue
         if not stat.S_ISREG(metadata.st_mode):
             raise RuntimeError("installed LeRobot package tree contains an unsafe entry")
-        if "__pycache__" in relative.parts or relative.suffix == ".pyc":
+        if relative.suffix == ".pyc":
             continue
         file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
         digest.update(

@@ -187,10 +187,11 @@ official wheel-hash validation, the launcher compares the complete installed
 289 files and SHA-256
 `db3b4e18b166d4bb7fb4354cec82a7fbd15bb24230f9d71269a017c774e0852f`.
 The canonical stream is each sorted relative path, NUL, its real-byte SHA-256,
-and LF. Only `__pycache__` and `.pyc` runtime artifacts are excluded; all
-source and package data are included without trusting `RECORD`. Missing,
-modified, extra, symlinked, or unsafe entries and incoherent distribution/import
-roots fail before the config view exists.
+and LF. Only regular `.pyc` runtime artifacts are excluded; a non-`.pyc` file
+under `__pycache__/` is still included. All source and package data are covered
+without trusting `RECORD`. Missing, modified, extra, symlinked, or unsafe
+entries and incoherent distribution/import roots fail before the config view
+exists.
 
 After that full-tree proof, the launcher creates an exclusive ephemeral config
 view outside both roots and removes exactly those keys. Reviewed

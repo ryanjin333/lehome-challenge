@@ -51,7 +51,7 @@ RUNTIME_IMAGE_ID = "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d
 CHECKPOINT_CONFIG_SHA256 = "b7c385bc57456eae603e929b84defb7e991194aade2aad70785e21991e37614c"
 LEROBOT_WHEEL_SHA256 = "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c"
 # Derived from the verified wheel's sorted lerobot/ regular files as
-# ``relative_path + NUL + sha256(file_bytes) + LF``. Only __pycache__ and .pyc
+# ``relative_path + NUL + sha256(file_bytes) + LF``. Only regular .pyc files
 # are excluded when applying the same manifest algorithm to an installation.
 LEROBOT_PACKAGE_TREE_SHA256 = "db3b4e18b166d4bb7fb4354cec82a7fbd15bb24230f9d71269a017c774e0852f"
 LEROBOT_PACKAGE_FILE_COUNT = 289
@@ -85,7 +85,7 @@ def _canonical_lerobot_package_tree(root: Path) -> tuple[str, int]:
             continue
         if not stat.S_ISREG(metadata.st_mode):
             raise NativeReferenceGateError("installed LeRobot package tree contains an unsafe entry")
-        if "__pycache__" in relative.parts or relative.suffix == ".pyc":
+        if relative.suffix == ".pyc":
             continue
         file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
         digest.update(

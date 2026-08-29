@@ -1564,6 +1564,30 @@ def test_checkpoint_compatibility_shim_sanitizes_only_training_fields_and_preser
     assert json.loads((sanitized / "config.json").read_text()) == {"type": "groot"}
     assert json.loads((checkpoint / "config.json").read_text()) == raw_config
 
+    cache_directory = fake_packages / "lerobot/__pycache__"
+    cache_directory.mkdir(exist_ok=True)
+    (cache_directory / "unexpected-package-data.json").write_text("{}\n", encoding="utf-8")
+    tampered = subprocess.run(
+        [
+            os.sys.executable,
+            "-S",
+            "-P",
+            str(driver),
+            str(checkpoint),
+            str(sanitized),
+            str(receipt),
+        ],
+        env={
+            **os.environ,
+            "PYTHONPATH": f"{fake_packages}:{CHECKPOINT_COMPATIBILITY_SHIM.parent}",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert tampered.returncode != 0
+    assert "compatibility receipt does not bind the exact config view" in tampered.stderr
+
 
 def test_final_execution_verifier_rejects_tampered_compatibility_receipt(tmp_path: Path) -> None:
     from scripts.verify_native_reference_evaluator_gate import (
@@ -1665,7 +1689,7 @@ def test_prepare_checkpoint_compatibility_creates_one_exclusive_exact_view(
         gate.prepare_checkpoint_compatibility(checkpoint, sanitized, tmp_path / "second.json")
 
 
-@pytest.mark.parametrize("mutation", ("modified", "extra"))
+@pytest.mark.parametrize("mutation", ("modified", "extra", "pycache_extra"))
 def test_prepare_checkpoint_compatibility_rejects_same_version_tampered_distribution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
@@ -1718,10 +1742,14 @@ def test_prepare_checkpoint_compatibility_rejects_same_version_tampered_distribu
     expected_digest, expected_count = manifest()
     if mutation == "modified":
         config_module.write_text(config_module.read_text() + "TAMPERED = True\n", encoding="utf-8")
-    else:
+    elif mutation == "extra":
         (distribution_root / "lerobot/unexpected_plugin.py").write_text(
             "IMPORTABLE = True\n", encoding="utf-8"
         )
+    else:
+        cache_directory = distribution_root / "lerobot/__pycache__"
+        cache_directory.mkdir()
+        (cache_directory / "unexpected-package-data.json").write_text("{}\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(distribution_root))
     for name in tuple(sys.modules):
         if name == "lerobot" or name.startswith("lerobot."):

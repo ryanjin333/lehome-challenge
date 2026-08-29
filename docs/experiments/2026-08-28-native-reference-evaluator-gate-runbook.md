@@ -265,7 +265,8 @@ manifest derived from those exact wheel bytes: 289 files and tree SHA-256
 The manifest sorts relative paths and hashes `path + NUL + file-SHA-256 + LF`.
 It hashes real installed bytes rather than trusting wheel `RECORD`, includes
 all importable source and package data, and ignores exactly runtime-only
-`__pycache__` entries and `.pyc` files. Missing, modified, extra, symlinked, or
+regular `.pyc` files. A non-`.pyc` file remains covered even when it is under
+`__pycache__/`. Missing, modified, extra, symlinked, or
 otherwise unsafe package entries fail closed, as does disagreement between the
 installed distribution root and the imported `lerobot` root.
 
