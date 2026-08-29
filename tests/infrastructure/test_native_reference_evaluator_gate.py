@@ -599,6 +599,174 @@ def test_provider_observation_uses_exact_adapter_shape_and_state() -> None:
     assert receipt["provider_response_sha256"] == hashlib.sha256(json.dumps(raw, sort_keys=True, separators=(",", ":")).encode() + b"\n").hexdigest()
 
 
+def test_capture_provider_direct_script_entrypoint_resolves_repository_package(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    raw = {
+        "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
+        "status": {"state": "RUNNING"},
+        "spec": {
+            "boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}},
+            "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}],
+        },
+    }
+    nebius = fake_bin / "nebius"
+    nebius.write_text(
+        "#!/usr/bin/env python3\nimport json\nprint(json.dumps(" + repr(raw) + "))\n",
+        encoding="utf-8",
+    )
+    nebius.chmod(0o755)
+    receipt = tmp_path / "provider.json"
+    environment = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "PYTHONPATH": ""}
+
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            str(ROOT / "scripts" / "verify_native_reference_evaluator_gate.py"),
+            "capture-provider",
+            "--state",
+            "RUNNING",
+            "--receipt",
+            str(receipt),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(receipt.read_text(encoding="utf-8"))["state"] == "RUNNING"
+
+
+def _write_fake_huggingface_hub(import_root: Path) -> Path:
+    module = import_root / "huggingface_hub.py"
+    module.write_text(
+        """from pathlib import Path
+from types import SimpleNamespace
+
+_FILES = {}
+
+class RepoFile:
+    def __init__(self, path):
+        self.path = path
+
+class HfApi:
+    def __init__(self, token=None):
+        self.token = token
+
+    def repo_info(self, **kwargs):
+        return SimpleNamespace(oid="a" * 40)
+
+    def list_repo_tree(self, revision, path_in_repo, **kwargs):
+        if revision == "a" * 40:
+            return []
+        return [RepoFile(path) for path in sorted(_FILES) if path.startswith(path_in_repo + "/")]
+
+    def upload_folder(self, folder_path, allow_patterns, path_in_repo, **kwargs):
+        root = Path(folder_path)
+        for relative in allow_patterns:
+            _FILES[f"{path_in_repo}/{relative}"] = (root / relative).read_bytes()
+        return SimpleNamespace(oid="b" * 40)
+
+def hf_hub_download(filename, local_dir, **kwargs):
+    target = Path(local_dir) / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(_FILES[filename])
+    return str(target)
+""",
+        encoding="utf-8",
+    )
+    return module
+
+
+def _direct_publisher_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    import_root = tmp_path / "fake-imports"
+    import_root.mkdir()
+    _write_fake_huggingface_hub(import_root)
+    token = tmp_path / "hf-token"
+    token.write_text("test-token", encoding="utf-8")
+    token.chmod(0o600)
+    return {**os.environ, "PYTHONPATH": str(import_root)}, token
+
+
+def test_publish_bundle_direct_script_entrypoint_resolves_repository_package(tmp_path: Path) -> None:
+    environment, token = _direct_publisher_environment(tmp_path)
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "artifact.txt").write_text("artifact", encoding="utf-8")
+    execution = tmp_path / "execution.json"
+    execution.write_text(json.dumps({"status": "oracle_matched_pending_finalization"}), encoding="utf-8")
+    receipt = tmp_path / "publication.json"
+
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            str(ROOT / "scripts" / "verify_native_reference_evaluator_gate.py"),
+            "publish-bundle",
+            "--bundle-root",
+            str(bundle),
+            "--execution",
+            str(execution),
+            "--token-file",
+            str(token),
+            "--receipt",
+            str(receipt),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(receipt.read_text(encoding="utf-8"))["readback_verified"] is True
+
+
+def test_publish_cache_manifest_direct_script_entrypoint_resolves_repository_package(tmp_path: Path) -> None:
+    environment, token = _direct_publisher_environment(tmp_path)
+    manifest = tmp_path / "cache-trust-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "kind": "lehome_native_reference_cache_trust_manifest_v2",
+                "source_repository": "ryanjin333/lehome-groot-n17-rollouts",
+                "path": "reference-checks/native-cache-direct-cli/cache-trust-manifest.json",
+                "checkpoint_tree_sha256": "b" * 64,
+                "metadata_tree_sha256": "c" * 64,
+                "assets_tree_sha256": "d" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    receipt = tmp_path / "cache-publication.json"
+
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            str(ROOT / "scripts" / "verify_native_reference_evaluator_gate.py"),
+            "publish-cache-manifest",
+            "--manifest",
+            str(manifest),
+            "--token-file",
+            str(token),
+            "--receipt",
+            str(receipt),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(receipt.read_text(encoding="utf-8"))["readback_verified"] is True
+
+
 def test_native_gate_runbook_preserves_the_no_collection_admission_boundary() -> None:
     text = RUNBOOK.read_text(encoding="utf-8")
 

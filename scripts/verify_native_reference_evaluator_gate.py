@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import importlib
@@ -47,6 +48,33 @@ ASSETS_RUNTIME_ROOTS = ("objects", "robots", "scenes", "textures")
 
 class NativeReferenceGateError(ValueError):
     """Raised when evidence cannot prove a safe native-reference result."""
+
+
+@contextmanager
+def _repository_package_imports():
+    """Expose this checkout only while importing sibling operator modules.
+
+    Direct script execution puts ``scripts/`` rather than the repository root
+    on ``sys.path``, so absolute ``scripts.*`` imports otherwise fail.  Keep
+    this bootstrap scoped to the three operator branches; the native runtime
+    probe continues to construct and validate its own pinned import path.
+    """
+    repository_root = Path(__file__).resolve().parents[1]
+    package_marker = repository_root / "scripts" / "__init__.py"
+    if not package_marker.is_file() or package_marker.is_symlink():
+        raise NativeReferenceGateError("repository scripts package is unavailable or unsafe")
+    root = str(repository_root)
+    inserted = root not in sys.path
+    if inserted:
+        sys.path.insert(0, root)
+    try:
+        yield
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(root)
+            except ValueError:
+                pass
 
 
 @dataclass(frozen=True)
@@ -806,16 +834,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "verify-execution": receipt = verify_native_reference_result(_read_json(args.result, "result"), bundle_root=args.bundle_root); _write_exclusive(args.receipt, receipt)
         elif args.command == "finalize": receipt = finalize_native_reference_gate(_read_json(args.execution, "execution receipt"), _read_json(args.fidelity, "fidelity review"), _read_json(args.publication, "publication receipt"), _read_json(args.stopped, "stopped VM receipt")); _write_exclusive(args.receipt, receipt)
         elif args.command == "capture-provider":
-            from scripts.finalize_simple_curriculum_collection import SubprocessNebiusProvider
-            receipt = capture_provider_observation(SubprocessNebiusProvider(), expected_state=args.state); _write_exclusive(args.receipt, receipt)
+            with _repository_package_imports():
+                from scripts.finalize_simple_curriculum_collection import SubprocessNebiusProvider
+                receipt = capture_provider_observation(SubprocessNebiusProvider(), expected_state=args.state)
+            _write_exclusive(args.receipt, receipt)
         elif args.command == "bind-provider-receipt":
             raw = args.input.read_bytes(); receipt = validate_provider_observation(_read_json(args.input, "provider observation"), expected_state=args.state); _write_bytes_exclusive(args.receipt, raw)
         elif args.command == "publish-bundle":
-            from scripts.publish_simple_curriculum_collection import HuggingFacePublicDatasetTransport, _load_token
-            receipt = publish_native_reference_bundle(args.bundle_root, _read_json(args.execution, "execution receipt"), token=_load_token(args.token_file), transport=HuggingFacePublicDatasetTransport()); _write_exclusive(args.receipt, receipt)
+            with _repository_package_imports():
+                from scripts.publish_simple_curriculum_collection import HuggingFacePublicDatasetTransport, _load_token
+                receipt = publish_native_reference_bundle(args.bundle_root, _read_json(args.execution, "execution receipt"), token=_load_token(args.token_file), transport=HuggingFacePublicDatasetTransport())
+            _write_exclusive(args.receipt, receipt)
         elif args.command == "publish-cache-manifest":
-            from scripts.publish_simple_curriculum_collection import HuggingFacePublicDatasetTransport, _load_token
-            receipt = publish_cache_manifest(args.manifest, token=_load_token(args.token_file), transport=HuggingFacePublicDatasetTransport()); _write_exclusive(args.receipt, receipt)
+            with _repository_package_imports():
+                from scripts.publish_simple_curriculum_collection import HuggingFacePublicDatasetTransport, _load_token
+                receipt = publish_cache_manifest(args.manifest, token=_load_token(args.token_file), transport=HuggingFacePublicDatasetTransport())
+            _write_exclusive(args.receipt, receipt)
         elif args.command == "authenticate-cache":
             receipt = authenticate_canonical_caches(args.metadata_root, args.assets_root, manifest_path=args.manifest)
         elif args.command == "probe-host-runtime":
