@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
+import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -35,6 +37,12 @@ _EPISODE_LINE = re.compile(r"Episode\s+(\d+)/2:.*?Success=(True|False)")
 _KNOWN_INVALID = re.compile(r"(?:traceback|non[- ]?finite|cloth[ _-]?flight|missing cloth|safety failure|cuda error)", re.IGNORECASE)
 PUBLIC_CACHE_REPOSITORY = "ryanjin333/lehome-groot-n17-rollouts"
 PROVIDER_SOURCE_IMAGE_ID = "computeimage-u00zf6w3yf72gakhcy"
+CANONICAL_CACHE_MANIFEST_SHA256 = "c27b2be5d5f055fafb462294d242d42853ac6cace5a867e5b9d7a159421643de"
+METADATA_REPOSITORY = SOURCE_REPOSITORY
+METADATA_REVISION = SOURCE_REVISION
+ASSETS_REPOSITORY = "lehome/asset_challenge"
+ASSETS_REVISION = "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9"
+ASSETS_RUNTIME_ROOTS = ("objects", "robots", "scenes", "textures")
 
 
 class NativeReferenceGateError(ValueError):
@@ -57,6 +65,203 @@ def _canonical_bytes(value: object) -> bytes:
 
 def canonical_sha256(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _canonical_cache_section(
+    manifest: Mapping[str, object], section: str
+) -> tuple[dict[str, tuple[int, str]], tuple[str, ...]]:
+    expected_top = {"schema_version", "kind", "metadata", "assets"}
+    if (
+        set(manifest) != expected_top
+        or manifest.get("schema_version") != 1
+        or manifest.get("kind") != "lehome_native_reference_canonical_cache_manifest_v1"
+    ):
+        raise NativeReferenceGateError("canonical cache manifest identity is invalid")
+    document = _object(manifest.get(section), f"canonical {section} manifest")
+    if section == "metadata":
+        expected_identity = {
+            "repository_type": "model",
+            "repository": METADATA_REPOSITORY,
+            "revision": METADATA_REVISION,
+            "root": "dataset_meta",
+        }
+        expected_keys = {*expected_identity, "files"}
+        roots: tuple[str, ...] = ()
+    elif section == "assets":
+        expected_identity = {
+            "repository_type": "dataset",
+            "repository": ASSETS_REPOSITORY,
+            "revision": ASSETS_REVISION,
+            "runtime_roots": list(ASSETS_RUNTIME_ROOTS),
+        }
+        expected_keys = {*expected_identity, "files"}
+        roots = ASSETS_RUNTIME_ROOTS
+    else:
+        raise NativeReferenceGateError("canonical cache section is invalid")
+    if set(document) != expected_keys or any(document.get(key) != value for key, value in expected_identity.items()):
+        raise NativeReferenceGateError(f"canonical {section} provenance is invalid")
+    rows = document.get("files")
+    if not isinstance(rows, list) or not rows:
+        raise NativeReferenceGateError(f"canonical {section} file manifest is empty")
+    files: dict[str, tuple[int, str]] = {}
+    for row_value in rows:
+        row = _object(row_value, f"canonical {section} file")
+        if set(row) != {"path", "size", "sha256"}:
+            raise NativeReferenceGateError(f"canonical {section} file schema is invalid")
+        path = _safe_path(row.get("path"), f"canonical {section} file path")
+        size, digest = row.get("size"), row.get("sha256")
+        if type(size) is not int or size < 0:
+            raise NativeReferenceGateError(f"canonical {section} file size is invalid")
+        _digest(digest, f"canonical {section} file")
+        if path in files:
+            raise NativeReferenceGateError(f"canonical {section} file path is duplicated")
+        if roots and PurePosixPath(path).parts[0] not in roots:
+            raise NativeReferenceGateError("canonical assets file escapes the runtime roots")
+        files[path] = (size, str(digest))
+    return files, roots
+
+
+def validate_canonical_cache_tree(
+    root: Path,
+    *,
+    section: str,
+    manifest_path: Path,
+) -> str:
+    """Authenticate one offline cache tree against the committed public-revision manifest."""
+    raw = _read_regular_bytes(Path(manifest_path), "canonical cache manifest")
+    if hashlib.sha256(raw).hexdigest() != CANONICAL_CACHE_MANIFEST_SHA256:
+        raise NativeReferenceGateError("canonical cache manifest digest is invalid")
+    try:
+        manifest = _object(json.loads(raw), "canonical cache manifest")
+    except (UnicodeError, json.JSONDecodeError, NativeReferenceGateError) as error:
+        raise NativeReferenceGateError("canonical cache manifest is invalid") from error
+    expected, _ = _canonical_cache_section(manifest, section)
+    cache_root = Path(root)
+    try:
+        root_metadata = cache_root.lstat()
+    except OSError as error:
+        raise NativeReferenceGateError(f"canonical {section} cache is unavailable") from error
+    if cache_root.is_symlink() or not stat.S_ISDIR(root_metadata.st_mode):
+        raise NativeReferenceGateError(f"canonical {section} cache root is unsafe")
+
+    observed_files: dict[str, Path] = {}
+    observed_directories: set[str] = set()
+    for path in sorted(cache_root.rglob("*")):
+        relative = path.relative_to(cache_root).as_posix()
+        metadata = path.lstat()
+        if path.is_symlink():
+            raise NativeReferenceGateError(f"canonical {section} cache contains a symlink")
+        if stat.S_ISDIR(metadata.st_mode):
+            observed_directories.add(relative)
+        elif stat.S_ISREG(metadata.st_mode):
+            observed_files[relative] = path
+        else:
+            raise NativeReferenceGateError(f"canonical {section} cache contains an unsafe entry")
+    if set(observed_files) != set(expected):
+        raise NativeReferenceGateError(f"canonical {section} cache file set is not exact")
+    expected_directories = {
+        parent.as_posix()
+        for relative in expected
+        for parent in PurePosixPath(relative).parents
+        if parent.as_posix() != "."
+    }
+    if observed_directories != expected_directories:
+        raise NativeReferenceGateError(f"canonical {section} cache directory set is not exact")
+
+    tree_digest = hashlib.sha256()
+    for relative in sorted(expected):
+        path = observed_files[relative]
+        expected_size, expected_sha256 = expected[relative]
+        if path.stat().st_size != expected_size:
+            raise NativeReferenceGateError(f"canonical {section} cache size mismatch: {relative}")
+        file_digest = hashlib.sha256()
+        tree_digest.update(relative.encode("utf-8") + b"\0")
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                file_digest.update(block)
+                tree_digest.update(block)
+        if file_digest.hexdigest() != expected_sha256:
+            raise NativeReferenceGateError(f"canonical {section} cache digest mismatch: {relative}")
+    return tree_digest.hexdigest()
+
+
+def authenticate_canonical_caches(
+    metadata_root: Path,
+    assets_root: Path,
+    *,
+    manifest_path: Path,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_canonical_cache_authentication_v1",
+        "canonical_manifest_sha256": CANONICAL_CACHE_MANIFEST_SHA256,
+        "metadata_repository": METADATA_REPOSITORY,
+        "metadata_revision": METADATA_REVISION,
+        "metadata_tree_sha256": validate_canonical_cache_tree(
+            metadata_root, section="metadata", manifest_path=manifest_path
+        ),
+        "assets_repository": ASSETS_REPOSITORY,
+        "assets_revision": ASSETS_REVISION,
+        "assets_tree_sha256": validate_canonical_cache_tree(
+            assets_root, section="assets", manifest_path=manifest_path
+        ),
+    }
+
+
+def capture_host_runtime(source_root: Path) -> dict[str, object]:
+    """Resolve imports with pinned source paths before caller-controlled paths."""
+    root = Path(source_root).resolve(strict=True)
+    source_package_root = (root / "source" / "lehome").resolve(strict=True)
+    original_path = list(sys.path)
+    caller_directory = Path.cwd().resolve()
+    retained: list[str] = []
+    for value in original_path:
+        if not value:
+            continue
+        try:
+            if Path(value).resolve() == caller_directory:
+                continue
+        except OSError:
+            continue
+        retained.append(value)
+    sys.path[:] = [str(source_package_root), str(root), *retained]
+    for name in ("scripts.eval", "scripts", "lehome", "lerobot", "torch"):
+        sys.modules.pop(name, None)
+    try:
+        lerobot = importlib.import_module("lerobot")
+        torch = importlib.import_module("torch")
+
+        def pinned_origin(name: str) -> str:
+            spec = importlib.util.find_spec(name)
+            value = None if spec is None else spec.origin
+            if not isinstance(value, str) or not value:
+                raise NativeReferenceGateError(f"native reference cannot resolve {name} origin")
+            path = Path(value).resolve(strict=True)
+            try:
+                path.relative_to(root)
+            except ValueError as error:
+                raise NativeReferenceGateError(
+                    f"native reference {name} origin escapes pinned source"
+                ) from error
+            return str(path)
+
+        lerobot_origin = getattr(lerobot, "__file__", None)
+        if not isinstance(lerobot_origin, str) or not lerobot_origin:
+            raise NativeReferenceGateError("native reference cannot resolve lerobot origin")
+        return {
+            "schema_version": 1,
+            "kind": "lehome_native_reference_host_runtime_v1",
+            "source_root": str(root),
+            "python_executable": str(Path(sys.executable).resolve()),
+            "python_version": sys.version,
+            "torch_version": str(torch.__version__),
+            "lerobot_version": str(getattr(lerobot, "__version__", "")),
+            "lerobot_origin": str(Path(lerobot_origin).resolve()),
+            "scripts_eval_origin": pinned_origin("scripts.eval"),
+            "lehome_origin": pinned_origin("lehome"),
+        }
+    finally:
+        sys.path[:] = original_path
 
 
 def fetch_public_cache_manifest(
@@ -593,6 +798,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     cache = commands.add_parser("fetch-cache-manifest"); cache.add_argument("--revision", required=True); cache.add_argument("--path", required=True); cache.add_argument("--receipt", type=Path); cache.add_argument("--checkpoint-tree-sha256"); cache.add_argument("--metadata-tree-sha256"); cache.add_argument("--assets-tree-sha256")
     publish = commands.add_parser("publish-bundle"); publish.add_argument("--bundle-root", type=Path, required=True); publish.add_argument("--execution", type=Path, required=True); publish.add_argument("--token-file", type=Path, required=True); publish.add_argument("--receipt", type=Path, required=True)
     publish_cache = commands.add_parser("publish-cache-manifest"); publish_cache.add_argument("--manifest", type=Path, required=True); publish_cache.add_argument("--token-file", type=Path, required=True); publish_cache.add_argument("--receipt", type=Path, required=True)
+    cache_auth = commands.add_parser("authenticate-cache"); cache_auth.add_argument("--metadata-root", type=Path, required=True); cache_auth.add_argument("--assets-root", type=Path, required=True); cache_auth.add_argument("--manifest", type=Path, required=True)
+    host_runtime = commands.add_parser("probe-host-runtime"); host_runtime.add_argument("--source-root", type=Path, required=True); host_runtime.add_argument("--receipt", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "compile-stage": receipt = compile_native_stage(args.bundle_root, stage=args.stage, category=args.category, garment=args.garment, identity=_read_json(args.identity, "identity"))
@@ -609,6 +816,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "publish-cache-manifest":
             from scripts.publish_simple_curriculum_collection import HuggingFacePublicDatasetTransport, _load_token
             receipt = publish_cache_manifest(args.manifest, token=_load_token(args.token_file), transport=HuggingFacePublicDatasetTransport()); _write_exclusive(args.receipt, receipt)
+        elif args.command == "authenticate-cache":
+            receipt = authenticate_canonical_caches(args.metadata_root, args.assets_root, manifest_path=args.manifest)
+        elif args.command == "probe-host-runtime":
+            receipt = capture_host_runtime(args.source_root); _write_exclusive(args.receipt, receipt)
         else:
             receipt, raw = fetch_public_cache_manifest(args.revision, args.path)
             bindings = (args.checkpoint_tree_sha256, args.metadata_tree_sha256, args.assets_tree_sha256)

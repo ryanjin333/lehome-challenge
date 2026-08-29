@@ -13,6 +13,7 @@ readonly EXACT_VM_ID="computeinstance-u00t6xfqhadrcmssa2"
 readonly PROTECTED_DISK_ID="computedisk-u00pbe55crxy7jr56x"
 readonly PROVIDER_SOURCE_IMAGE_ID="computeimage-u00zf6w3yf72gakhcy"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly CANONICAL_CACHE_MANIFEST="$SCRIPT_DIR/native_reference_canonical_cache_manifest.json"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
 sha256_file() { sha256sum -- "$1" | awk '{print $1}'; }
@@ -108,8 +109,18 @@ validate_stage_integrity() {
   # simulator stage. A metadata snapshot is not sufficient evidence here.
   validate_checkpoint full
   validate_source_runtime
-  [[ "$(tree_sha256 "$METADATA_ROOT")" == "$METADATA_TREE_SHA256" ]] || fail "native reference metadata tree changed during evaluation"
-  [[ "$(tree_sha256 "$ASSETS_ROOT")" == "$ASSETS_TREE_SHA256" ]] || fail "native reference assets tree changed during evaluation"
+  authenticate_canonical_caches
+  [[ "$AUTHENTICATED_METADATA_TREE_SHA256" == "$METADATA_TREE_SHA256" ]] || fail "native reference metadata tree changed during evaluation"
+  [[ "$AUTHENTICATED_ASSETS_TREE_SHA256" == "$ASSETS_TREE_SHA256" ]] || fail "native reference assets tree changed during evaluation"
+}
+
+authenticate_canonical_caches() {
+  local receipt
+  receipt="$("$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" authenticate-cache \
+    --metadata-root "$METADATA_ROOT" --assets-root "$ASSETS_ROOT" \
+    --manifest "$CANONICAL_CACHE_MANIFEST")" || fail "canonical metadata/assets authentication failed"
+  AUTHENTICATED_METADATA_TREE_SHA256="$(printf '%s' "$receipt" | "$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["metadata_tree_sha256"])')" || fail "canonical metadata authentication receipt is invalid"
+  AUTHENTICATED_ASSETS_TREE_SHA256="$(printf '%s' "$receipt" | "$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["assets_tree_sha256"])')" || fail "canonical assets authentication receipt is invalid"
 }
 
 stage_native_source() {
@@ -183,27 +194,10 @@ PY
 }
 
 probe_host_runtime() {
-  PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT" "$PYTHON_BIN" - "$OUTPUT_ROOT/host-runtime.json" "$SOURCE_ROOT" <<'PY'
-import importlib.util, json, os, sys
-from pathlib import Path
-import lerobot, torch
-output, root = Path(sys.argv[1]), Path(sys.argv[2]).resolve(strict=True)
-def origin(name):
-    spec = importlib.util.find_spec(name)
-    value = None if spec is None else spec.origin
-    if not isinstance(value, str) or not value:
-        raise SystemExit(f"native reference cannot resolve {name} origin")
-    path = Path(value).resolve(strict=True)
-    try: path.relative_to(root)
-    except ValueError: raise SystemExit(f"native reference {name} origin escapes pinned source") from None
-    return str(path)
-lerobot_origin = getattr(lerobot, "__file__", None)
-if not isinstance(lerobot_origin, str) or not lerobot_origin:
-    raise SystemExit("native reference cannot resolve lerobot origin")
-payload = {"schema_version":1,"kind":"lehome_native_reference_host_runtime_v1","source_root":str(root),"python_executable":str(Path(sys.executable).resolve()),"python_version":sys.version,"torch_version":str(torch.__version__),"lerobot_version":str(getattr(lerobot,"__version__","")),"lerobot_origin":str(Path(lerobot_origin).resolve()),"scripts_eval_origin":origin("scripts.eval"),"lehome_origin":origin("lehome")}
-fd=os.open(output, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o444)
-with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(payload,stream,sort_keys=True,separators=(",",":")); stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
-PY
+  (cd -- "$SOURCE_ROOT" && PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT" \
+    "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" probe-host-runtime \
+      --source-root "$SOURCE_ROOT" --receipt "$OUTPUT_ROOT/host-runtime.json" >/dev/null) \
+    || fail "native reference host runtime probe failed"
 }
 
 write_identity_and_preflight() {
@@ -239,7 +233,8 @@ CHECKPOINT_ROOT="${LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT:-}"; METADATA_ROOT="$
 CACHE_TRUST_MANIFEST_REVISION="${LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION:-}"; CACHE_TRUST_MANIFEST_PATH="${LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH:-}"; PROVIDER_RUNNING_RECEIPT="${LEHOME_NATIVE_REFERENCE_PROVIDER_RUNNING_RECEIPT:-}"
 require_absolute_directory "$CHECKPOINT_ROOT" "native reference checkpoint cache"; require_absolute_directory "$METADATA_ROOT" "native reference metadata cache"; require_absolute_directory "$ASSETS_ROOT" "native reference challenge assets"
 validate_checkpoint full; validate_source_runtime
-CHECKPOINT_TREE_SHA256="$(checkpoint_tree_sha256)"; METADATA_TREE_SHA256="$(tree_sha256 "$METADATA_ROOT")"; ASSETS_TREE_SHA256="$(tree_sha256 "$ASSETS_ROOT")"
+authenticate_canonical_caches
+CHECKPOINT_TREE_SHA256="$(checkpoint_tree_sha256)"; METADATA_TREE_SHA256="$AUTHENTICATED_METADATA_TREE_SHA256"; ASSETS_TREE_SHA256="$AUTHENTICATED_ASSETS_TREE_SHA256"
 CACHE_INVENTORY_OUTPUT="${LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_OUTPUT:-}"; CACHE_INVENTORY_REMOTE_PATH="${LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_PATH:-}"
 if [[ "$MODE" == inventory-cache ]]; then
   require_new_file "$CACHE_INVENTORY_OUTPUT" "cache inventory manifest"

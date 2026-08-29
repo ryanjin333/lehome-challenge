@@ -32,11 +32,20 @@ published `7/8` oracle and its result has been published and read back.
   two. That is a typed evaluator-compatibility stop, not an admission to run
   the other six attempts.
 
-## Preflight while stopped
+## Read-only identity check, then start the exact VM
 
 Use read-only provider checks to confirm the exact existing rollout VM and
 protected disk. The launcher itself does not create, start, stop, resize, or
 delete provider resources, build an image, or upload to any service.
+
+After that read-only identity check passes, the operator starts exactly
+`computeinstance-u00t6xfqhadrcmssa2`; do not create a replacement or second
+VM. Only after that exact VM reaches `RUNNING` may the operator stage source
+and run cache inventory on it. Both operations are zero-evaluation admission
+steps: they happen before the CUDA probe, simulator launch, or first episode.
+This keeps the paid boundary to one existing VM and only the time needed for
+the bounded gate; stop that exact VM after publication/readback or any gate
+failure.
 
 The operator must provide all inputs explicitly. Cache roots are on the VM
 disk, never the local Mac. The provider's RUNNING/attached-disk state is an
@@ -44,7 +53,8 @@ external read-only gate; this launcher records the actual provider source-image
 identity plus host-Python/LeRobot/CUDA facts, and never asks the provider to
 change state.
 
-First stage only the public evaluator source into an empty source root. This
+Once the exact VM is running, first stage only the public evaluator source
+into an empty source root. This
 uses sparse Git with `GIT_LFS_SKIP_SMUDGE=1`, so it fetches no checkpoint
 weight or simulator run:
 
@@ -55,8 +65,8 @@ LEHOME_NATIVE_REFERENCE_MODE=source-stage \
 ```
 
 Before validation/execution, create and publish one immutable cache-trust
-manifest from a stopped-disk, read-only inventory. The launcher reads the
-manifest bytes anonymously and directly from the fixed public dataset
+manifest from a zero-evaluation inventory on that running exact VM. The
+launcher reads the manifest bytes anonymously and directly from the fixed public dataset
 `ryanjin333/lehome-groot-n17-rollouts` at an immutable 40-hex revision and a
 `reference-checks/...` path; it does not trust a local copy or a caller-supplied
 digest. The manifest kind is
@@ -84,8 +94,12 @@ export LEHOME_NATIVE_REFERENCE_PROVIDER_RUNNING_RECEIPT=/mnt/lehome/reference-na
 
 ### Cache inventory and immutable publication
 
-On the stopped rollout VM, inventory only the already-cached source,
-checkpoint, metadata, and assets. This mode does not probe CUDA, launch the
+On the now-running exact rollout VM, inventory only the already-cached source,
+checkpoint, metadata, and assets. Before emitting any inventory digest, the
+launcher authenticates every metadata file against the pinned public model
+revision and every file under `objects/`, `robots/`, `scenes/`, and `textures/`
+against the pinned public asset-dataset revision. This offline check rejects
+mutations, extras, and symlinks. Inventory mode does not probe CUDA, launch the
 simulator, or run an episode. The output path must be new; the remote path must
 be a new `native-cache-*` prefix so the public manifest is immutable.
 

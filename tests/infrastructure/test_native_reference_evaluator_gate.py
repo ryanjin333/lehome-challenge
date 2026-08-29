@@ -15,6 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "rollout_appliance" / "run_native_reference_evaluator_gate.sh"
 RUNBOOK = ROOT / "docs" / "experiments" / "2026-08-28-native-reference-evaluator-gate-runbook.md"
+CANONICAL_CACHE_MANIFEST = ROOT / "rollout_appliance" / "native_reference_canonical_cache_manifest.json"
 
 
 def _identity() -> dict[str, object]:
@@ -230,6 +231,147 @@ def test_native_launcher_isolated_contract_never_creates_resources_or_uses_n17_g
     assert "nebius compute instance start" not in text
     assert "docker build" not in text
     assert "filter.lfs.smudge" in text
+
+
+def test_host_runtime_probe_ignores_shadow_scripts_package_in_caller_cwd(tmp_path: Path) -> None:
+    source = tmp_path / "pinned-source"
+    package_root = source / "source" / "lehome"
+    shadow = tmp_path / "shadow-cwd"
+    for package, body in (
+        (source / "scripts", ""),
+        (package_root / "lehome", ""),
+        (package_root / "lerobot", '__version__ = "0.4.3"\n'),
+        (package_root / "torch", '__version__ = "test-torch"\n'),
+        (shadow / "scripts", ""),
+    ):
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(body, encoding="utf-8")
+    (source / "scripts" / "eval.py").write_text("PINNED = True\n", encoding="utf-8")
+    (shadow / "scripts" / "eval.py").write_text("SHADOW = True\n", encoding="utf-8")
+    receipt = tmp_path / "host-runtime.json"
+    environment = {**os.environ, "PYTHONPATH": str(shadow)}
+
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            str(ROOT / "scripts" / "verify_native_reference_evaluator_gate.py"),
+            "probe-host-runtime",
+            "--source-root",
+            str(source),
+            "--receipt",
+            str(receipt),
+        ],
+        cwd=shadow,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    runtime = json.loads(receipt.read_text(encoding="utf-8"))
+    assert Path(runtime["scripts_eval_origin"]) == (source / "scripts" / "eval.py").resolve()
+    assert shadow.resolve() not in Path(runtime["scripts_eval_origin"]).parents
+
+
+def _write_test_canonical_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, Path]:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    metadata = tmp_path / "metadata"
+    assets = tmp_path / "assets"
+    metadata_file = metadata / "top_long_merged" / "meta" / "info.json"
+    metadata_file.parent.mkdir(parents=True)
+    metadata_file.write_bytes(b"metadata")
+    asset_paths = [assets / root / "pinned.bin" for root in gate.ASSETS_RUNTIME_ROOTS]
+    for index, path in enumerate(asset_paths):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(f"asset-{index}".encode())
+
+    def row(path: Path, root: Path) -> dict[str, object]:
+        raw = path.read_bytes()
+        return {
+            "path": path.relative_to(root).as_posix(),
+            "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
+    manifest = {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_canonical_cache_manifest_v1",
+        "metadata": {
+            "repository_type": "model",
+            "repository": gate.METADATA_REPOSITORY,
+            "revision": gate.METADATA_REVISION,
+            "root": "dataset_meta",
+            "files": [row(metadata_file, metadata)],
+        },
+        "assets": {
+            "repository_type": "dataset",
+            "repository": gate.ASSETS_REPOSITORY,
+            "revision": gate.ASSETS_REVISION,
+            "runtime_roots": list(gate.ASSETS_RUNTIME_ROOTS),
+            "files": [row(path, assets) for path in asset_paths],
+        },
+    }
+    manifest_path = tmp_path / "canonical.json"
+    raw = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    manifest_path.write_bytes(raw)
+    monkeypatch.setattr(gate, "CANONICAL_CACHE_MANIFEST_SHA256", hashlib.sha256(raw).hexdigest())
+    return manifest_path, metadata, assets
+
+
+def test_canonical_metadata_cache_rejects_mutation_and_extra_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    manifest, metadata, _ = _write_test_canonical_manifest(tmp_path, monkeypatch)
+    assert gate.validate_canonical_cache_tree(metadata, section="metadata", manifest_path=manifest)
+    target = next(path for path in metadata.rglob("*") if path.is_file())
+    target.write_bytes(b"mutated!")
+    with pytest.raises(gate.NativeReferenceGateError, match="digest mismatch"):
+        gate.validate_canonical_cache_tree(metadata, section="metadata", manifest_path=manifest)
+    target.write_bytes(b"metadata")
+    (metadata / "extra.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(gate.NativeReferenceGateError, match="file set is not exact"):
+        gate.validate_canonical_cache_tree(metadata, section="metadata", manifest_path=manifest)
+
+
+def test_canonical_assets_cache_rejects_mutation_and_extra_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.verify_native_reference_evaluator_gate as gate
+
+    manifest, _, assets = _write_test_canonical_manifest(tmp_path, monkeypatch)
+    assert gate.validate_canonical_cache_tree(assets, section="assets", manifest_path=manifest)
+    target = assets / "objects" / "pinned.bin"
+    target.write_bytes(b"mutated")
+    with pytest.raises(gate.NativeReferenceGateError, match="digest mismatch"):
+        gate.validate_canonical_cache_tree(assets, section="assets", manifest_path=manifest)
+    target.write_bytes(b"asset-0")
+    (assets / "textures" / "extra.bin").write_bytes(b"extra")
+    with pytest.raises(gate.NativeReferenceGateError, match="file set is not exact"):
+        gate.validate_canonical_cache_tree(assets, section="assets", manifest_path=manifest)
+
+
+def test_committed_canonical_manifest_pins_public_provenance_and_runtime_roots() -> None:
+    from scripts.verify_native_reference_evaluator_gate import CANONICAL_CACHE_MANIFEST_SHA256
+
+    raw = CANONICAL_CACHE_MANIFEST.read_bytes()
+    manifest = json.loads(raw)
+    assert hashlib.sha256(raw).hexdigest() == CANONICAL_CACHE_MANIFEST_SHA256
+    assert manifest["metadata"] | {"files": None} == {
+        "repository_type": "model",
+        "repository": "theo-zhou/lehome-groot-submission-4",
+        "revision": "d384fe00508acd96ab1c3c5dc265e08261f94b3b",
+        "root": "dataset_meta",
+        "files": None,
+    }
+    assert manifest["assets"] | {"files": None} == {
+        "repository_type": "dataset",
+        "repository": "lehome/asset_challenge",
+        "revision": "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9",
+        "runtime_roots": ["objects", "robots", "scenes", "textures"],
+        "files": None,
+    }
+    assert len(manifest["metadata"]["files"]) == 20
+    assert len(manifest["assets"]["files"]) == 445
 
 
 def test_native_launcher_pins_every_checkpoint_file_and_requires_exact_set() -> None:
