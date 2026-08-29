@@ -333,6 +333,36 @@ def test_receipt_rejects_symlinked_parent_and_never_overwrites_race(tmp_path: Pa
     assert target.read_text(encoding="utf-8") == "other process receipt"
 
 
+def test_receipt_parent_fd_cannot_escape_when_an_ancestor_is_swapped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); root = _fixture(module, tmp_path, monkeypatch); transport = Transport()
+    ancestor = tmp_path / "receipt-ancestor"; parent = ancestor / "out"; parent.mkdir(parents=True)
+    outside = tmp_path / "outside"; (outside / "out").mkdir(parents=True)
+    moved = tmp_path / "moved-ancestor"; receipt = parent / "receipt.json"
+    real_open = module.os.open; swapped = False; parent_opens = 0
+
+    def swap_before_parent_open(path, flags, *args, **kwargs):
+        nonlocal swapped, parent_opens
+        # The old implementation re-opened the full parent path after its
+        # lstat walk. The fixed one opens `out` under a pinned ancestor fd.
+        if Path(path) == parent and "dir_fd" not in kwargs:
+            parent_opens += 1
+            if parent_opens == 2:
+                os.replace(ancestor, moved); ancestor.symlink_to(outside, target_is_directory=True); swapped = True
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if path == "out" and "dir_fd" in kwargs:
+            parent_opens += 1
+            if parent_opens == 2:
+                os.replace(ancestor, moved); ancestor.symlink_to(outside, target_is_directory=True); swapped = True
+        return descriptor
+
+    monkeypatch.setattr(module.os, "open", swap_before_parent_open)
+    try:
+        _publish(module, root, transport, receipt_output=receipt)
+    except module.Public96PublicationError:
+        pass
+    assert swapped and not (outside / "out" / "receipt.json").exists()
+
+
 def test_receipt_directory_fsync_failure_is_not_reported_as_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     module = _module(); root = _fixture(module, tmp_path, monkeypatch); transport = Transport()
     original_fsync = module.os.fsync

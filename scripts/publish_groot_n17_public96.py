@@ -389,23 +389,29 @@ def _open_receipt_parent(path: Path) -> tuple[str, int]:
     """Pin a non-symlink receipt parent before inspecting or creating a file."""
     absolute = _absolute_without_resolution(path)
     parent = absolute.parent
-    current = Path(parent.anchor)
-    for part in parent.parts[1:]:
-        current /= part
-        try:
-            metadata = os.lstat(current)
-        except OSError as error:
-            raise Public96PublicationError("receipt parent is unavailable") from error
-        if stat.S_ISLNK(metadata.st_mode):
-            raise Public96PublicationError("receipt parent contains a symlink")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        current = os.open(parent.anchor, flags)
     except OSError as error:
         raise Public96PublicationError("receipt parent is unavailable") from error
+    try:
+        for part in parent.parts[1:]:
+            try:
+                next_descriptor = os.open(part, flags, dir_fd=current)
+            except OSError as error:
+                raise Public96PublicationError("receipt parent is unavailable or unsafe") from error
+            os.close(current)
+            current = next_descriptor
+        metadata = os.fstat(current)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise Public96PublicationError("receipt parent is unavailable or unsafe")
+    except BaseException:
+        os.close(current)
+        raise
     if not path.name or path.name in {".", ".."}:
-        os.close(descriptor)
+        os.close(current)
         raise Public96PublicationError("receipt path is invalid")
-    return path.name, descriptor
+    return path.name, current
 
 
 def _read_existing_receipt(path: Path) -> bytes | None:
