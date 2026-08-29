@@ -466,16 +466,6 @@ run_stage() {
   "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" compile-stage --bundle-root "$OUTPUT_ROOT" --stage "$stage" --category "$category" --garment "$garment" --identity "$OUTPUT_ROOT/identity.json" >/dev/null
 }
 run_stage 1 top_long Top_Long_Seen_0
-if ! "$PYTHON_BIN" - "$OUTPUT_ROOT/result.json" <<'PY'
-import json, sys
-from pathlib import Path
-rows=json.loads(Path(sys.argv[1]).read_text()).get("attempts")
-raise SystemExit(0 if isinstance(rows,list) and len(rows)==2 and [row.get("success") for row in rows]==[True,True] else 1)
-PY
-then
-  "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" verify-execution --result "$OUTPUT_ROOT/result.json" --bundle-root "$OUTPUT_ROOT" --receipt "$OUTPUT_ROOT/execution-receipt.json" >/dev/null
-  exit 0
-fi
 run_stage 2 top_short Top_Short_Seen_0; run_stage 3 pant_long Pant_Long_Seen_0; run_stage 4 pant_short Pant_Short_Seen_0
 validate_stage_integrity
 "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" verify-execution --result "$OUTPUT_ROOT/result.json" --bundle-root "$OUTPUT_ROOT" --receipt "$OUTPUT_ROOT/execution-receipt.json" >/dev/null

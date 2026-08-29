@@ -32,6 +32,9 @@ LEROBOT_VERSION = "0.4.3"
 POLICY_CLASS = "scripts.eval_policy.lerobot_policy.LeRobotPolicy"
 TASK_DESCRIPTION = "fold the garment on the table"
 SUCCESS_CHECKER = "pinned_raw_success_distance_second_mesh_points"
+REFERENCE_SUCCESS_RATE = 0.7292
+AGGREGATE_SUCCESS_THRESHOLD = 4
+REFERENCE_LOWER_TAIL_PROBABILITY = 0.03814
 _HEX = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _VM = re.compile(r"^computeinstance-[a-z0-9]+$")
@@ -1206,8 +1209,8 @@ def publish_native_reference_bundle(
     if not isinstance(token, str) or not token or any(part.isspace() for part in token):
         raise NativeReferenceGateError("HF token is unavailable")
     execution_receipt = _object(execution, "execution receipt")
-    if execution_receipt.get("status") != "oracle_matched_pending_finalization":
-        raise NativeReferenceGateError("only an oracle-matched execution may be published")
+    if execution_receipt.get("status") != "aggregate_threshold_met_pending_finalization":
+        raise NativeReferenceGateError("only an aggregate-accepted execution may be published")
     root = Path(bundle_root).resolve(strict=True)
     manifest_path = root / "bundle-manifest.json"
     if manifest_path.exists() or manifest_path.is_symlink():
@@ -1680,7 +1683,7 @@ def _validate_attempt(value: object, expected: Mapping[str, object], root: Path 
 
 
 def verify_native_reference_result(document: object, *, bundle_root: Path | None = None) -> dict[str, object]:
-    """Assess execution only. A local oracle match never claims final passage."""
+    """Assess execution only. Aggregate acceptance never claims final passage."""
     result = _object(document, "native reference result")
     if set(result) != {"schema_version", "kind", "identity", "attempts"} or result.get("schema_version") != 2 or result.get("kind") != "lehome_native_reference_execution_result_v2":
         raise NativeReferenceGateError("native reference result kind is invalid")
@@ -1727,19 +1730,16 @@ def verify_native_reference_result(document: object, *, bundle_root: Path | None
             raise NativeReferenceGateError("execution bundle support evidence is not bound to identity")
         supporting_artifacts = {"preflight": preflight, "cache_trust_manifest": cache, "provider_running_receipt": running, "runtime_image_receipt": runtime_image, "checkpoint_compatibility_receipt": compatibility, "peft_overlay_receipt": peft_overlay, "flash_attention_overlay_receipt": flash_overlay, "flash_attention_runtime_receipt": flash_runtime, "public_pyproject_dependencies_overlay_receipt": public_pyproject_overlay, "public_pyproject_dependencies_runtime_receipt": public_pyproject_runtime, "pynput_backend_receipt": pynput_backend}
     rows = result.get("attempts")
-    if type(rows) is not list or len(rows) not in {2, 8}:
-        raise NativeReferenceGateError("native reference result must contain either the two-attempt admission stop or all eight attempts")
+    if type(rows) is not list or len(rows) != 8:
+        raise NativeReferenceGateError("native reference result must contain all eight fixed attempts")
     oracle = oracle_attempts(); attempts = [_validate_attempt(row, oracle[index], bundle_root) for index, row in enumerate(rows)]
-    first = [row["success"] for row in attempts[:2]]
     evidence = {row["attempt_id"]: canonical_sha256({"attempt_receipt": row["receipt"], "log": row["log"], "videos": row["videos"]}) for row in attempts}
-    if first != [True, True]:
-        if len(attempts) != 2: raise NativeReferenceGateError("failed Top_Long admission must fail fast before later attempts")
-        return {"schema_version": 1, "kind": "lehome_native_reference_execution_receipt_v2", "status": "evaluator_compatibility_stop", "reason": "top_long_admission_failed", "attempt_count": 2, "successes": sum(first), "oracle_vector": [row["expected_success"] for row in oracle], "attempt_evidence_sha256": evidence, "supporting_artifacts": supporting_artifacts, "identity": identity, "result_sha256": canonical_sha256(result)}
-    if len(attempts) != 8: raise NativeReferenceGateError("passing Top_Long admission requires all eight sequential attempts")
     observed, expected = [row["success"] for row in attempts], [row["expected_success"] for row in oracle]
-    if observed != expected:
-        return {"schema_version": 1, "kind": "lehome_native_reference_execution_receipt_v2", "status": "evaluator_compatibility_stop", "reason": "oracle_outcome_mismatch", "attempt_count": 8, "successes": sum(observed), "oracle_vector": expected, "observed_vector": observed, "attempt_evidence_sha256": evidence, "supporting_artifacts": supporting_artifacts, "identity": identity, "result_sha256": canonical_sha256(result)}
-    return {"schema_version": 1, "kind": "lehome_native_reference_execution_receipt_v2", "status": "oracle_matched_pending_finalization", "attempt_count": 8, "successes": 7, "oracle_vector": expected, "attempt_evidence_sha256": evidence, "supporting_artifacts": supporting_artifacts, "identity": identity, "result_sha256": canonical_sha256(result)}
+    successes = sum(observed)
+    receipt = {"schema_version": 1, "kind": "lehome_native_reference_execution_receipt_v2", "attempt_count": 8, "successes": successes, "aggregate_success_threshold": AGGREGATE_SUCCESS_THRESHOLD, "reference_success_rate": REFERENCE_SUCCESS_RATE, "reference_lower_tail_probability": REFERENCE_LOWER_TAIL_PROBABILITY, "oracle_vector": expected, "observed_vector": observed, "attempt_evidence_sha256": evidence, "supporting_artifacts": supporting_artifacts, "identity": identity, "result_sha256": canonical_sha256(result)}
+    if successes < AGGREGATE_SUCCESS_THRESHOLD:
+        return {**receipt, "status": "evaluator_compatibility_stop", "reason": "aggregate_success_threshold_not_met"}
+    return {**receipt, "status": "aggregate_threshold_met_pending_finalization"}
 
 
 def _write_exclusive(path: Path, value: Mapping[str, object]) -> None:
@@ -1805,7 +1805,7 @@ def compile_native_stage(bundle_root: Path, *, stage: int, category: str, garmen
 
 def finalize_native_reference_gate(execution: object, fidelity: object, publication: object, stopped: object) -> dict[str, object]:
     execution = _object(execution, "execution receipt")
-    if execution.get("kind") != "lehome_native_reference_execution_receipt_v2" or execution.get("status") != "oracle_matched_pending_finalization": raise NativeReferenceGateError("execution receipt is not an oracle-matched pending result")
+    if execution.get("kind") != "lehome_native_reference_execution_receipt_v2" or execution.get("status") != "aggregate_threshold_met_pending_finalization": raise NativeReferenceGateError("execution receipt is not an aggregate-accepted pending result")
     identity = _validate_identity(execution.get("identity")); execution_sha = canonical_sha256(execution); fidelity = _object(fidelity, "fidelity review")
     if set(fidelity) != {"schema_version", "kind", "execution_receipt_sha256", "review_method", "attempts"} or fidelity.get("schema_version") != 1 or fidelity.get("kind") != "lehome_native_reference_fidelity_review_v1" or fidelity.get("execution_receipt_sha256") != execution_sha or fidelity.get("review_method") != "manual_video_audit": raise NativeReferenceGateError("fidelity review is not bound to the execution receipt")
     reviewed, ids = fidelity.get("attempts"), [row["attempt_id"] for row in oracle_attempts()]

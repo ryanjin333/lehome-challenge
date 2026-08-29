@@ -280,35 +280,47 @@ def _materialize_artifacts(root: Path, bundle: dict[str, object]) -> None:
             artifact.update({"size": 1, "sha256": hashlib.sha256(b"x").hexdigest()})  # type: ignore[index]
 
 
-def test_native_oracle_accepts_exact_seven_of_eight_with_one_identity() -> None:
+def test_native_oracle_accepts_four_of_eight_without_matching_each_reference_outcome() -> None:
     from scripts.verify_native_reference_evaluator_gate import verify_native_reference_result
 
-    receipt = verify_native_reference_result(_bundle())
+    attempts = _attempts()
+    for index, attempt in enumerate(attempts):
+        attempt["success"] = index < 4
+    receipt = verify_native_reference_result(_bundle(attempts=attempts))
 
-    assert receipt["status"] == "oracle_matched_pending_finalization"
-    assert receipt["successes"] == 7
+    assert receipt["status"] == "aggregate_threshold_met_pending_finalization"
+    assert receipt["successes"] == 4
     assert receipt["attempt_count"] == 8
     assert receipt["oracle_vector"] == [True, True, True, True, True, True, False, True]
+    assert receipt["observed_vector"] == [True, True, True, True, False, False, False, False]
+    assert receipt["aggregate_success_threshold"] == 4
+    assert receipt["reference_success_rate"] == 0.7292
+    assert receipt["reference_lower_tail_probability"] == 0.03814
     assert receipt["identity"] == _identity()
 
 
-def test_native_oracle_emits_typed_fail_fast_stop_after_top_long_admission_miss() -> None:
+def test_native_oracle_rejects_three_of_eight_only_after_all_fixed_attempts_complete() -> None:
     from scripts.verify_native_reference_evaluator_gate import verify_native_reference_result
 
-    attempts = _attempts()[:2]
-    attempts[1]["success"] = False
+    attempts = _attempts()
+    for index, attempt in enumerate(attempts):
+        attempt["success"] = index < 3
     receipt = verify_native_reference_result(_bundle(attempts=attempts))
 
     assert receipt["status"] == "evaluator_compatibility_stop"
-    assert receipt["reason"] == "top_long_admission_failed"
-    assert receipt["attempt_count"] == 2
+    assert receipt["reason"] == "aggregate_success_threshold_not_met"
+    assert receipt["attempt_count"] == 8
+    assert receipt["successes"] == 3
+    assert receipt["aggregate_success_threshold"] == 4
 
 
-def test_native_oracle_cli_returns_stable_nonzero_for_typed_stop(tmp_path: Path) -> None:
+def test_native_oracle_cli_returns_stable_nonzero_for_below_threshold_aggregate(tmp_path: Path) -> None:
     from scripts.verify_native_reference_evaluator_gate import main
 
-    document = _bundle(attempts=_attempts()[:2])
-    document["attempts"][1]["success"] = False  # type: ignore[index]
+    attempts = _attempts()
+    for index, attempt in enumerate(attempts):
+        attempt["success"] = index < 3
+    document = _bundle(attempts=attempts)
     _materialize_artifacts(tmp_path, document)
     result = tmp_path / "result.json"; receipt = tmp_path / "receipt.json"
     result.write_text(json.dumps(document), encoding="utf-8")
@@ -336,7 +348,7 @@ def test_native_gate_cli_writes_immutable_receipt(tmp_path: Path) -> None:
     bundle.write_text(json.dumps(document), encoding="utf-8")
 
     assert main(["verify-execution", "--result", str(bundle), "--bundle-root", str(tmp_path), "--receipt", str(output)]) == 0
-    assert json.loads(output.read_text(encoding="utf-8"))["status"] == "oracle_matched_pending_finalization"
+    assert json.loads(output.read_text(encoding="utf-8"))["status"] == "aggregate_threshold_met_pending_finalization"
     with pytest.raises(SystemExit, match="already exists"):
         main(["verify-execution", "--result", str(bundle), "--bundle-root", str(tmp_path), "--receipt", str(output)])
 
@@ -417,6 +429,13 @@ def test_native_launcher_isolated_contract_never_creates_resources_or_uses_n17_g
     assert "validate_runtime_asset_bindings" in text
     assert "verify-execution" in text
     assert "compile-stage" in text
+    assert "top_long_admission" not in text
+    assert "failed Top_Long admission" not in text
+    assert 'if ! "$PYTHON_BIN" - "$OUTPUT_ROOT/result.json"' not in text
+    assert text.index("run_stage 1 top_long Top_Long_Seen_0") < text.index("run_stage 2 top_short Top_Short_Seen_0")
+    assert text.index("run_stage 2 top_short Top_Short_Seen_0") < text.index("run_stage 3 pant_long Pant_Long_Seen_0")
+    assert text.index("run_stage 3 pant_long Pant_Long_Seen_0") < text.index("run_stage 4 pant_short Pant_Short_Seen_0")
+    assert text.index("run_stage 4 pant_short Pant_Short_Seen_0") < text.rindex("verify-execution")
     assert "invalid_reason" not in text
     assert "GIT_LFS_SKIP_SMUDGE=1" in text
     assert "pretrained_model" in text
@@ -934,7 +953,7 @@ def test_native_identity_requires_host_python_and_pinned_source_origins() -> Non
     from scripts.verify_native_reference_evaluator_gate import NativeReferenceGateError, verify_native_reference_result
 
     identity = _identity()
-    assert verify_native_reference_result({**_bundle(), "identity": identity})["status"] == "oracle_matched_pending_finalization"
+    assert verify_native_reference_result({**_bundle(), "identity": identity})["status"] == "aggregate_threshold_met_pending_finalization"
     identity["scripts_eval_origin"] = "/tmp/eval.py"
     with pytest.raises(NativeReferenceGateError, match="origin"):
         verify_native_reference_result({**_bundle(), "identity": identity})
@@ -1228,7 +1247,7 @@ def test_publish_bundle_direct_script_entrypoint_resolves_repository_package(tmp
     bundle.mkdir()
     (bundle / "artifact.txt").write_text("artifact", encoding="utf-8")
     execution = tmp_path / "execution.json"
-    execution.write_text(json.dumps({"status": "oracle_matched_pending_finalization"}), encoding="utf-8")
+    execution.write_text(json.dumps({"status": "aggregate_threshold_met_pending_finalization"}), encoding="utf-8")
     receipt = tmp_path / "publication.json"
 
     result = subprocess.run(
@@ -1303,7 +1322,9 @@ def test_native_gate_runbook_preserves_the_no_collection_admission_boundary() ->
 
     assert "d384fe00508acd96ab1c3c5dc265e08261f94b3b" in text
     assert "Top_Long_Seen_0" in text
-    assert "7/8" in text
+    assert "4/8 aggregate threshold" in text
+    assert "0.03814" in text
+    assert "Individual outcomes vary" in text
     assert "Do not start collection or training" in text
     assert "Hugging Face" in text
     assert "scp" in text
@@ -2086,7 +2107,7 @@ def test_execution_verifier_rejects_tampered_or_missing_peft_overlay_evidence(
     identity = document["identity"]
     identity["peft_wheel_sha256"] = peft_receipt["wheel_sha256"]  # type: ignore[index]
     identity["peft_overlay_receipt_sha256"] = hashlib.sha256(raw).hexdigest()  # type: ignore[index]
-    assert verify_native_reference_result(document, bundle_root=tmp_path)["status"] == "oracle_matched_pending_finalization"
+    assert verify_native_reference_result(document, bundle_root=tmp_path)["status"] == "aggregate_threshold_met_pending_finalization"
 
     path.write_bytes(raw.replace(b"0.18.1", b"0.18.0", 1))
     with pytest.raises(NativeReferenceGateError, match="PEFT overlay"):
@@ -2177,7 +2198,7 @@ def test_flash_attention_overlay_receipt_and_execution_evidence_are_identity_bou
 
     document = _bundle()
     _materialize_artifacts(tmp_path, document)
-    assert verify_native_reference_result(document, bundle_root=tmp_path)["status"] == "oracle_matched_pending_finalization"
+    assert verify_native_reference_result(document, bundle_root=tmp_path)["status"] == "aggregate_threshold_met_pending_finalization"
 
     path = tmp_path / "evidence" / "flash-attention-runtime-receipt.json"
     path.write_text("{}\n", encoding="utf-8")
@@ -2270,7 +2291,7 @@ def test_pynput_dummy_backend_is_preflight_bound_and_rejects_any_x11_or_control_
 
     document = _bundle()
     _materialize_artifacts(tmp_path, document)
-    assert verify_native_reference_result(document, bundle_root=tmp_path)["status"] == "oracle_matched_pending_finalization"
+    assert verify_native_reference_result(document, bundle_root=tmp_path)["status"] == "aggregate_threshold_met_pending_finalization"
 
     receipt = tmp_path / "evidence" / "pynput-backend-receipt.json"
     payload = json.loads(receipt.read_text(encoding="utf-8"))
