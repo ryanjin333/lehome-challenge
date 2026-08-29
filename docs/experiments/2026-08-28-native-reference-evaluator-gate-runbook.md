@@ -32,6 +32,16 @@ published `7/8` oracle and its result has been published and read back.
   present for evaluator stages. Simulation remains CPU-only and policy
   inference remains on CUDA. The saved processor must prove a 16-action
   horizon and 12-D absolute bimanual action output.
+- Headless input backend: the public `shs/evals/eval_groot.sh` uses an Xvfb
+  wrapper for its headless evaluator. This immutable image intentionally has
+  neither Xvfb nor an X server, and the task imports `pynput.keyboard` before
+  its later keyboard-disable flag. The evaluator subprocess alone therefore
+  sets `PYNPUT_BACKEND=dummy`; no model or host-runtime probe inherits it. A
+  zero-episode receipt proves the fixed backend, the inert
+  `pynput.keyboard._base` listener/key classes, no loaded X11 module, and no
+  keyboard-control call. This preserves the public command's headless intent
+  without installing GUI packages, changing evaluator arguments, or mutating
+  public source.
 - PEFT overlay: before validation, the operator separately places only the
   official `peft-0.18.1-py3-none-any.whl` at
   `/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl`.

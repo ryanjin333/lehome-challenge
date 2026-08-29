@@ -1247,8 +1247,8 @@ def oracle_attempts() -> tuple[dict[str, object], ...]:
 
 def _validate_identity(value: object) -> dict[str, object]:
     identity = _object(value, "identity")
-    fixed = {"source_repository": SOURCE_REPOSITORY, "source_revision": SOURCE_REVISION, "source_tree_sha256": SOURCE_TREE_SHA256, "lerobot_version": LEROBOT_VERSION, "policy_class": POLICY_CLASS, "policy_device": "cuda:0", "simulator_device": "cpu", "task_description": TASK_DESCRIPTION, "action_horizon": 16, "action_dimension": 12, "success_checker": SUCCESS_CHECKER, "cuda_available": True, "runtime_image_reference": RUNTIME_IMAGE_REFERENCE, "runtime_image_id": RUNTIME_IMAGE_ID, "peft_wheel_sha256": PEFT_WHEEL_SHA256, "flash_attention_wheel_sha256": FLASH_ATTENTION_WHEEL_SHA256}
-    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256", "flash_attention_runtime_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "source_root", "python_executable", "python_version", "torch_version", "lerobot_origin", "scripts_eval_origin", "lehome_origin"}
+    fixed = {"source_repository": SOURCE_REPOSITORY, "source_revision": SOURCE_REVISION, "source_tree_sha256": SOURCE_TREE_SHA256, "lerobot_version": LEROBOT_VERSION, "policy_class": POLICY_CLASS, "policy_device": "cuda:0", "simulator_device": "cpu", "task_description": TASK_DESCRIPTION, "action_horizon": 16, "action_dimension": 12, "success_checker": SUCCESS_CHECKER, "cuda_available": True, "runtime_image_reference": RUNTIME_IMAGE_REFERENCE, "runtime_image_id": RUNTIME_IMAGE_ID, "peft_wheel_sha256": PEFT_WHEEL_SHA256, "flash_attention_wheel_sha256": FLASH_ATTENTION_WHEEL_SHA256, "pynput_backend": "dummy"}
+    variable = {"checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256", "flash_attention_runtime_receipt_sha256", "pynput_backend_receipt_sha256", "provider_source_image_id", "cuda_runtime", "cuda_device_count", "vm_id", "disk_id", "source_root", "python_executable", "python_version", "torch_version", "lerobot_origin", "scripts_eval_origin", "lehome_origin"}
     if set(identity) != {*fixed, *variable}:
         raise NativeReferenceGateError("identity has an unexpected schema")
     for key, expected in fixed.items():
@@ -1261,7 +1261,7 @@ def _validate_identity(value: object) -> dict[str, object]:
                 else key
             )
             raise NativeReferenceGateError(f"identity {label} does not match the native contract")
-    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256", "flash_attention_runtime_receipt_sha256"):
+    for key in ("checkpoint_tree_sha256", "metadata_tree_sha256", "assets_tree_sha256", "cache_trust_manifest_sha256", "provider_running_receipt_sha256", "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256", "flash_attention_runtime_receipt_sha256", "pynput_backend_receipt_sha256"):
         _digest(identity.get(key), f"identity {key}")
     if type(identity["cuda_device_count"]) is not int or identity["cuda_device_count"] < 1 or not isinstance(identity["cuda_runtime"], str) or not identity["cuda_runtime"]:
         raise NativeReferenceGateError("identity does not prove CUDA availability")
@@ -1410,6 +1410,22 @@ def _validate_flash_attention_runtime_receipt(document: object) -> dict[str, obj
     return receipt
 
 
+def _validate_pynput_backend_receipt(document: object) -> dict[str, object]:
+    receipt = _object(document, "pynput backend receipt")
+    expected = {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_pynput_backend_v1",
+        "pynput_backend": "dummy",
+        "keyboard_listener_module": "pynput.keyboard._base",
+        "keyboard_key_module": "pynput.keyboard._base",
+        "x11_modules_loaded": False,
+        "keyboard_control_started": False,
+    }
+    if set(receipt) != set(expected) or any(receipt.get(key) != value for key, value in expected.items()):
+        raise NativeReferenceGateError("pynput backend receipt contract is invalid")
+    return receipt
+
+
 def _validate_preflight(document: object, identity: Mapping[str, object]) -> dict[str, object]:
     preflight = _object(document, "native reference preflight")
     expected_keys = {
@@ -1417,7 +1433,7 @@ def _validate_preflight(document: object, identity: Mapping[str, object]) -> dic
         "host_runtime_sha256", "runtime_image_receipt_sha256",
         "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256",
         "flash_attention_overlay_receipt_sha256",
-        "flash_attention_runtime_receipt_sha256",
+        "flash_attention_runtime_receipt_sha256", "pynput_backend_receipt_sha256",
     }
     if (
         set(preflight) != expected_keys
@@ -1430,13 +1446,13 @@ def _validate_preflight(document: object, identity: Mapping[str, object]) -> dic
         "cuda_probe_sha256", "host_runtime_sha256", "runtime_image_receipt_sha256",
         "checkpoint_compatibility_receipt_sha256", "peft_overlay_receipt_sha256",
         "flash_attention_overlay_receipt_sha256",
-        "flash_attention_runtime_receipt_sha256",
+        "flash_attention_runtime_receipt_sha256", "pynput_backend_receipt_sha256",
     ):
         _digest(preflight.get(key), f"native reference preflight {key}")
     for key in (
         "runtime_image_receipt_sha256", "checkpoint_compatibility_receipt_sha256",
         "peft_overlay_receipt_sha256", "flash_attention_overlay_receipt_sha256",
-        "flash_attention_runtime_receipt_sha256",
+        "flash_attention_runtime_receipt_sha256", "pynput_backend_receipt_sha256",
     ):
         if preflight[key] != identity[key]:
             raise NativeReferenceGateError("native reference preflight is not bound to identity")
@@ -1477,6 +1493,7 @@ def verify_native_reference_result(document: object, *, bundle_root: Path | None
         peft_overlay = _artifact_from_file(bundle_root, Path("evidence/peft-overlay-receipt.json"))
         flash_overlay = _artifact_from_file(bundle_root, Path("evidence/flash-attention-overlay-receipt.json"))
         flash_runtime = _artifact_from_file(bundle_root, Path("evidence/flash-attention-runtime-receipt.json"))
+        pynput_backend = _artifact_from_file(bundle_root, Path("evidence/pynput-backend-receipt.json"))
         _validate_checkpoint_compatibility_receipt(
             _read_json(bundle_root / "evidence/checkpoint-compatibility-receipt.json", "checkpoint compatibility receipt"),
             bundle_root=bundle_root,
@@ -1490,12 +1507,15 @@ def verify_native_reference_result(document: object, *, bundle_root: Path | None
         _validate_flash_attention_runtime_receipt(
             _read_json(bundle_root / "evidence/flash-attention-runtime-receipt.json", "FlashAttention runtime receipt")
         )
+        _validate_pynput_backend_receipt(
+            _read_json(bundle_root / "evidence/pynput-backend-receipt.json", "pynput backend receipt")
+        )
         _validate_preflight(
             _read_json(bundle_root / "preflight.json", "native reference preflight"), identity
         )
-        if cache["sha256"] != identity["cache_trust_manifest_sha256"] or running["sha256"] != identity["provider_running_receipt_sha256"] or runtime_image["sha256"] != identity["runtime_image_receipt_sha256"] or compatibility["sha256"] != identity["checkpoint_compatibility_receipt_sha256"] or peft_overlay["sha256"] != identity["peft_overlay_receipt_sha256"] or flash_overlay["sha256"] != identity["flash_attention_overlay_receipt_sha256"] or flash_runtime["sha256"] != identity["flash_attention_runtime_receipt_sha256"]:
+        if cache["sha256"] != identity["cache_trust_manifest_sha256"] or running["sha256"] != identity["provider_running_receipt_sha256"] or runtime_image["sha256"] != identity["runtime_image_receipt_sha256"] or compatibility["sha256"] != identity["checkpoint_compatibility_receipt_sha256"] or peft_overlay["sha256"] != identity["peft_overlay_receipt_sha256"] or flash_overlay["sha256"] != identity["flash_attention_overlay_receipt_sha256"] or flash_runtime["sha256"] != identity["flash_attention_runtime_receipt_sha256"] or pynput_backend["sha256"] != identity["pynput_backend_receipt_sha256"]:
             raise NativeReferenceGateError("execution bundle support evidence is not bound to identity")
-        supporting_artifacts = {"preflight": preflight, "cache_trust_manifest": cache, "provider_running_receipt": running, "runtime_image_receipt": runtime_image, "checkpoint_compatibility_receipt": compatibility, "peft_overlay_receipt": peft_overlay, "flash_attention_overlay_receipt": flash_overlay, "flash_attention_runtime_receipt": flash_runtime}
+        supporting_artifacts = {"preflight": preflight, "cache_trust_manifest": cache, "provider_running_receipt": running, "runtime_image_receipt": runtime_image, "checkpoint_compatibility_receipt": compatibility, "peft_overlay_receipt": peft_overlay, "flash_attention_overlay_receipt": flash_overlay, "flash_attention_runtime_receipt": flash_runtime, "pynput_backend_receipt": pynput_backend}
     rows = result.get("attempts")
     if type(rows) is not list or len(rows) not in {2, 8}:
         raise NativeReferenceGateError("native reference result must contain either the two-attempt admission stop or all eight attempts")

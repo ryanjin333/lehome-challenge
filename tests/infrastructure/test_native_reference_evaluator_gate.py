@@ -41,6 +41,8 @@ def _identity() -> dict[str, object]:
         "flash_attention_wheel_sha256": "cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af",
         "flash_attention_overlay_receipt_sha256": hashlib.sha256(b"flash-overlay").hexdigest(),
         "flash_attention_runtime_receipt_sha256": hashlib.sha256(b"flash-runtime").hexdigest(),
+        "pynput_backend": "dummy",
+        "pynput_backend_receipt_sha256": hashlib.sha256(b"pynput-backend").hexdigest(),
         "provider_source_image_id": "computeimage-u00zf6w3yf72gakhcy",
         "runtime_image_reference": "lehome-rollout:build",
         "runtime_image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
@@ -203,6 +205,24 @@ def _materialize_artifacts(root: Path, bundle: dict[str, object]) -> None:
     ).encode()
     (root / "evidence/flash-attention-runtime-receipt.json").write_bytes(flash_runtime)
     bundle["identity"]["flash_attention_runtime_receipt_sha256"] = hashlib.sha256(flash_runtime).hexdigest()  # type: ignore[index]
+    pynput_backend = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "lehome_native_reference_pynput_backend_v1",
+                "pynput_backend": "dummy",
+                "keyboard_listener_module": "pynput.keyboard._base",
+                "keyboard_key_module": "pynput.keyboard._base",
+                "x11_modules_loaded": False,
+                "keyboard_control_started": False,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    (root / "evidence/pynput-backend-receipt.json").write_bytes(pynput_backend)
+    bundle["identity"]["pynput_backend_receipt_sha256"] = hashlib.sha256(pynput_backend).hexdigest()  # type: ignore[index]
     preflight = {
         "schema_version": 2,
         "kind": "lehome_native_reference_preflight_v2",
@@ -214,6 +234,7 @@ def _materialize_artifacts(root: Path, bundle: dict[str, object]) -> None:
         "peft_overlay_receipt_sha256": bundle["identity"]["peft_overlay_receipt_sha256"],
         "flash_attention_overlay_receipt_sha256": bundle["identity"]["flash_attention_overlay_receipt_sha256"],
         "flash_attention_runtime_receipt_sha256": bundle["identity"]["flash_attention_runtime_receipt_sha256"],
+        "pynput_backend_receipt_sha256": bundle["identity"]["pynput_backend_receipt_sha256"],
     }
     (root / "preflight.json").write_text(
         json.dumps(preflight, sort_keys=True, separators=(",", ":")) + "\n",
@@ -421,10 +442,12 @@ def test_native_run_stage_binds_arguments_before_expanding_stage_log(tmp_path: P
     run_stage = launcher_text.split("run_stage() {", 1)[1].split("\n}", 1)[0]
     fake_python = tmp_path / "fake-python"
     trace = tmp_path / "python-invocations.txt"
+    backend_trace = tmp_path / "evaluator-pynput-backend.txt"
     fake_python.write_text(
         "#!/usr/bin/env bash\n"
         "printf '%s\\n' \"$*\" >> \"$TRACE\"\n"
         "if [[ \" $* \" == *' -m scripts.eval '* ]]; then\n"
+        "  printf '%s\\n' \"${PYNPUT_BACKEND-unset}\" >> \"$BACKEND_TRACE\"\n"
         "  printf '%s\\n' 'Episode 1/2: Return=1.00, Success=True'\n"
         "fi\n",
         encoding="utf-8",
@@ -462,7 +485,7 @@ def test_native_run_stage_binds_arguments_before_expanding_stage_log(tmp_path: P
 
     result = subprocess.run(
         ["bash", str(script)],
-        env={**os.environ, "TRACE": str(trace)},
+        env={**os.environ, "TRACE": str(trace), "BACKEND_TRACE": str(backend_trace)},
         text=True,
         capture_output=True,
         check=False,
@@ -472,6 +495,7 @@ def test_native_run_stage_binds_arguments_before_expanding_stage_log(tmp_path: P
     invocations = trace.read_text(encoding="utf-8")
     assert "-m scripts.eval" in invocations
     assert "compile-stage" in invocations
+    assert backend_trace.read_text(encoding="utf-8") == "dummy\n"
 
 
 def test_runtime_asset_bindings_require_the_same_device_and_inode(tmp_path: Path) -> None:
@@ -2139,6 +2163,38 @@ def test_flash_attention_preflight_binding_is_checked_at_final_execution_verific
     (tmp_path / "preflight.json").write_text(json.dumps(preflight), encoding="utf-8")
     with pytest.raises(NativeReferenceGateError, match="preflight"):
         verify_native_reference_result(document, bundle_root=tmp_path)
+
+
+def test_pynput_dummy_backend_is_preflight_bound_and_rejects_any_x11_or_control_drift(
+    tmp_path: Path,
+) -> None:
+    from scripts.verify_native_reference_evaluator_gate import (
+        NativeReferenceGateError,
+        verify_native_reference_result,
+    )
+
+    document = _bundle()
+    _materialize_artifacts(tmp_path, document)
+    assert verify_native_reference_result(document, bundle_root=tmp_path)["status"] == "oracle_matched_pending_finalization"
+
+    receipt = tmp_path / "evidence" / "pynput-backend-receipt.json"
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["keyboard_control_started"] = True
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(NativeReferenceGateError, match="pynput"):
+        verify_native_reference_result(document, bundle_root=tmp_path)
+
+
+def test_native_evaluator_uses_only_dummy_pynput_backend_without_xvfb_or_gui_install() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    run_stage = launcher.split("run_stage() {", 1)[1].split("\n}", 1)[0]
+
+    assert "probe_pynput_dummy_backend" in launcher
+    assert launcher.index("probe_pynput_dummy_backend") < launcher.index("run_stage 1")
+    assert run_stage.count("PYNPUT_BACKEND=dummy") == 1
+    assert "xvfb-run" not in launcher
+    assert "Xvfb" not in launcher
+    assert "apt-get" not in launcher
 
 
 def test_native_flash_attention_contract_is_read_only_offline_then_installed_before_model_construction() -> None:
