@@ -36,6 +36,13 @@ def _identity() -> dict[str, object]:
         "cuda_runtime": "12.8",
         "vm_id": "computeinstance-u00t6xfqhadrcmssa2",
         "disk_id": "computedisk-u00pbe55crxy7jr56x",
+        "source_root": "/mnt/lehome/reference-native/source",
+        "python_executable": "/usr/bin/python3",
+        "python_version": "3.12.0",
+        "torch_version": "2.7.0",
+        "lerobot_origin": "/opt/python/lerobot/__init__.py",
+        "scripts_eval_origin": "/mnt/lehome/reference-native/source/scripts/eval.py",
+        "lehome_origin": "/mnt/lehome/reference-native/source/source/lehome/lehome/__init__.py",
         "simulator_device": "cpu",
         "task_description": "fold the garment on the table",
         "action_horizon": 16,
@@ -200,11 +207,18 @@ def test_native_launcher_isolated_contract_never_creates_resources_or_uses_n17_g
     assert "LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY" in text
     assert "LEHOME_NATIVE_REFERENCE_MODE" in text
     assert "source-stage" in text
+    assert "inventory-cache" in text
+    assert "write_cache_inventory_manifest" in text
     assert "CACHE_TRUST_MANIFEST" in text
     assert "fetch-cache-manifest" in text
     assert "bind-provider-receipt --state RUNNING" in text
     assert "LEHOME_NATIVE_REFERENCE_PROVIDER_RUNNING_RECEIPT" in text
     assert "torch.cuda.is_available" in text
+    assert 'EXACT_VM_ID="computeinstance-u00t6xfqhadrcmssa2"' in text
+    assert 'PROTECTED_DISK_ID="computedisk-u00pbe55crxy7jr56x"' in text
+    assert "validate_running_provider_binding" in text
+    assert text.count("validate_checkpoint full") >= 2
+    assert "probe_host_runtime" in text
     assert "verify-execution" in text
     assert "compile-stage" in text
     assert "invalid_reason" not in text
@@ -337,7 +351,7 @@ def test_public_cache_manifest_must_be_read_back_from_fixed_hf_repo() -> None:
     from scripts.verify_native_reference_evaluator_gate import fetch_public_cache_manifest
 
     manifest = {
-        "schema_version": 1, "kind": "lehome_native_reference_cache_trust_manifest_v2",
+        "schema_version": 2, "kind": "lehome_native_reference_cache_trust_manifest_v2",
         "source_repository": "ryanjin333/lehome-groot-n17-rollouts",
         "path": "reference-checks/native/cache-trust-manifest.json",
         "checkpoint_tree_sha256": "b" * 64, "metadata_tree_sha256": "c" * 64, "assets_tree_sha256": "d" * 64,
@@ -380,6 +394,52 @@ def test_publish_native_bundle_uploads_and_anonymously_readbacks_every_file(tmp_
     assert "bundle-manifest.json" in uploaded
 
 
+def test_publish_cache_manifest_uploads_one_immutable_file_and_returns_launcher_inputs(tmp_path: Path) -> None:
+    from scripts.verify_native_reference_evaluator_gate import publish_cache_manifest
+
+    manifest = {
+        "schema_version": 2, "kind": "lehome_native_reference_cache_trust_manifest_v2",
+        "source_repository": "ryanjin333/lehome-groot-n17-rollouts",
+        "path": "reference-checks/native-cache-20260828/cache-trust-manifest.json",
+        "checkpoint_tree_sha256": "b" * 64, "metadata_tree_sha256": "c" * 64, "assets_tree_sha256": "d" * 64,
+    }
+    path = tmp_path / "cache-trust-manifest.json"; path.write_text(json.dumps(manifest), encoding="utf-8")
+    uploaded: dict[str, bytes] = {}
+    class Transport:
+        def resolve_approved_ref(self, **_kwargs): return "a" * 40
+        def list_tree(self, **kwargs):
+            prefix = kwargs["remote_prefix"]
+            return [type("Entry", (), {"relative_path": f"{prefix}/{name}", "entry_type": "file"}) for name in uploaded]
+        def upload_files(self, **kwargs):
+            for entry in kwargs["entries"]: uploaded[entry.relative_path] = (kwargs["source"] / entry.relative_path).read_bytes()
+            return "b" * 40
+        def download_files(self, **kwargs):
+            for name in kwargs["relative_paths"]:
+                target = kwargs["destination"] / name; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(uploaded[name])
+            return kwargs["revision"]
+
+    receipt = publish_cache_manifest(path, token="test-token", transport=Transport())
+    assert receipt == {
+        "schema_version": 1,
+        "kind": "lehome_native_reference_cache_manifest_readback_v1",
+        "repository": "ryanjin333/lehome-groot-n17-rollouts",
+        "immutable_revision": "b" * 40,
+        "path": manifest["path"],
+        "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "readback_verified": True,
+    }
+
+
+def test_native_identity_requires_host_python_and_pinned_source_origins() -> None:
+    from scripts.verify_native_reference_evaluator_gate import NativeReferenceGateError, verify_native_reference_result
+
+    identity = _identity()
+    assert verify_native_reference_result({**_bundle(), "identity": identity})["status"] == "oracle_matched_pending_finalization"
+    identity["scripts_eval_origin"] = "/tmp/eval.py"
+    with pytest.raises(NativeReferenceGateError, match="origin"):
+        verify_native_reference_result({**_bundle(), "identity": identity})
+
+
 def test_provider_observation_uses_exact_adapter_shape_and_state() -> None:
     from scripts.verify_native_reference_evaluator_gate import capture_provider_observation
 
@@ -407,3 +467,5 @@ def test_native_gate_runbook_preserves_the_no_collection_admission_boundary() ->
     assert "Hugging Face" in text
     assert "scp" in text
     assert "LEHOME_NATIVE_REFERENCE_IMAGE" not in text
+    assert "inventory-cache" in text
+    assert "publish-cache-manifest" in text

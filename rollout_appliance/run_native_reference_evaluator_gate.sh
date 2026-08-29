@@ -9,6 +9,9 @@ readonly SOURCE_REPOSITORY="theo-zhou/lehome-groot-submission-4"
 readonly SOURCE_REVISION="d384fe00508acd96ab1c3c5dc265e08261f94b3b"
 readonly EXPECTED_SOURCE_TREE_SHA256="eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2"
 readonly EXPECTED_LEROBOT_VERSION="0.4.3"
+readonly EXACT_VM_ID="computeinstance-u00t6xfqhadrcmssa2"
+readonly PROTECTED_DISK_ID="computedisk-u00pbe55crxy7jr56x"
+readonly PROVIDER_SOURCE_IMAGE_ID="computeimage-u00zf6w3yf72gakhcy"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
@@ -22,6 +25,11 @@ require_new_output() {
   [[ "$1" == /* && "$1" != *".."* ]] || fail "native reference output root is unsafe"
   [[ "$(basename -- "$1")" =~ ^native-reference-[0-9]{12,14}$ ]] || fail "native reference output root must have a new native-reference timestamp name"
   [[ ! -e "$1" && ! -L "$1" ]] || fail "native reference output root already exists"
+}
+require_new_file() {
+  [[ "$1" == /* && "$1" != *".."* ]] || fail "$2 is unsafe"
+  [[ ! -e "$1" && ! -L "$1" ]] || fail "$2 already exists"
+  require_absolute_directory "$(dirname -- "$1")" "$2 parent"
 }
 
 tree_sha256() {
@@ -95,19 +103,10 @@ print(digest.hexdigest())
 PY
 }
 
-model_snapshot() {
-  "$PYTHON_BIN" - "$CHECKPOINT_ROOT/model.safetensors" <<'PY'
-import stat, sys
-from pathlib import Path
-path = Path(sys.argv[1]); metadata = path.lstat()
-if path.is_symlink() or not stat.S_ISREG(metadata.st_mode): raise SystemExit("checkpoint model is unsafe")
-print(f"{metadata.st_dev}:{metadata.st_ino}:{metadata.st_size}:{metadata.st_mtime_ns}")
-PY
-}
-
 validate_stage_integrity() {
-  validate_checkpoint snapshot
-  [[ "$(model_snapshot)" == "$CHECKPOINT_MODEL_SNAPSHOT" ]] || fail "native reference checkpoint model changed after full preflight hash"
+  # Rehash the complete checkpoint, including the model, before every paid
+  # simulator stage. A metadata snapshot is not sufficient evidence here.
+  validate_checkpoint full
   validate_source_runtime
   [[ "$(tree_sha256 "$METADATA_ROOT")" == "$METADATA_TREE_SHA256" ]] || fail "native reference metadata tree changed during evaluation"
   [[ "$(tree_sha256 "$ASSETS_ROOT")" == "$ASSETS_TREE_SHA256" ]] || fail "native reference assets tree changed during evaluation"
@@ -149,6 +148,28 @@ validate_cache_trust_manifest() {
     --assets-tree-sha256 "$ASSETS_TREE_SHA256" >/dev/null || fail "immutable cache manifest readback failed"
 }
 
+write_cache_inventory_manifest() {
+  "$PYTHON_BIN" - "$CACHE_INVENTORY_OUTPUT" "$CACHE_INVENTORY_REMOTE_PATH" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" <<'PY'
+import json, os, sys
+from pathlib import Path
+output = Path(sys.argv[1])
+payload = {"schema_version":2,"kind":"lehome_native_reference_cache_trust_manifest_v2","source_repository":"ryanjin333/lehome-groot-n17-rollouts","path":sys.argv[2],"checkpoint_tree_sha256":sys.argv[3],"metadata_tree_sha256":sys.argv[4],"assets_tree_sha256":sys.argv[5]}
+fd=os.open(output, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o444)
+with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(payload,stream,sort_keys=True,separators=(",",":")); stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
+PY
+}
+
+validate_running_provider_binding() {
+  "$PYTHON_BIN" - "$OUTPUT_ROOT/evidence/provider-running-receipt.json" "$VM_ID" "$DISK_ID" "$PROVIDER_SOURCE_IMAGE_ID" <<'PY'
+import json, sys
+from pathlib import Path
+receipt=json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected={"vm_id":sys.argv[2],"disk_id":sys.argv[3],"provider_source_image_id":sys.argv[4],"state":"RUNNING"}
+if any(receipt.get(key) != value for key,value in expected.items()):
+    raise SystemExit("provider RUNNING receipt does not bind the pinned VM/disk/source image")
+PY
+}
+
 probe_cuda() {
   "$PYTHON_BIN" - "$OUTPUT_ROOT/cuda-runtime.json" <<'PY'
 import json, os, sys
@@ -161,13 +182,39 @@ with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(payload,stream,sort
 PY
 }
 
+probe_host_runtime() {
+  PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT" "$PYTHON_BIN" - "$OUTPUT_ROOT/host-runtime.json" "$SOURCE_ROOT" <<'PY'
+import importlib.util, json, os, sys
+from pathlib import Path
+import lerobot, torch
+output, root = Path(sys.argv[1]), Path(sys.argv[2]).resolve(strict=True)
+def origin(name):
+    spec = importlib.util.find_spec(name)
+    value = None if spec is None else spec.origin
+    if not isinstance(value, str) or not value:
+        raise SystemExit(f"native reference cannot resolve {name} origin")
+    path = Path(value).resolve(strict=True)
+    try: path.relative_to(root)
+    except ValueError: raise SystemExit(f"native reference {name} origin escapes pinned source") from None
+    return str(path)
+lerobot_origin = getattr(lerobot, "__file__", None)
+if not isinstance(lerobot_origin, str) or not lerobot_origin:
+    raise SystemExit("native reference cannot resolve lerobot origin")
+payload = {"schema_version":1,"kind":"lehome_native_reference_host_runtime_v1","source_root":str(root),"python_executable":str(Path(sys.executable).resolve()),"python_version":sys.version,"torch_version":str(torch.__version__),"lerobot_version":str(getattr(lerobot,"__version__","")),"lerobot_origin":str(Path(lerobot_origin).resolve()),"scripts_eval_origin":origin("scripts.eval"),"lehome_origin":origin("lehome")}
+fd=os.open(output, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o444)
+with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(payload,stream,sort_keys=True,separators=(",",":")); stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
+PY
+}
+
 write_identity_and_preflight() {
-  "$PYTHON_BIN" - "$OUTPUT_ROOT/identity.json" "$OUTPUT_ROOT/preflight.json" "$OUTPUT_ROOT/cuda-runtime.json" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" "$CACHE_TRUST_MANIFEST_SHA256" "$PROVIDER_RUNNING_RECEIPT_SHA256" "$VM_ID" "$DISK_ID" <<'PY'
+  "$PYTHON_BIN" - "$OUTPUT_ROOT/identity.json" "$OUTPUT_ROOT/preflight.json" "$OUTPUT_ROOT/cuda-runtime.json" "$OUTPUT_ROOT/host-runtime.json" "$CHECKPOINT_TREE_SHA256" "$METADATA_TREE_SHA256" "$ASSETS_TREE_SHA256" "$CACHE_TRUST_MANIFEST_SHA256" "$PROVIDER_RUNNING_RECEIPT_SHA256" "$VM_ID" "$DISK_ID" <<'PY'
 import hashlib, json, os, sys
 from pathlib import Path
-identity_path, preflight_path, cuda_path = map(Path, sys.argv[1:4]); cuda=json.loads(cuda_path.read_text())
-identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[4],"metadata_tree_sha256":sys.argv[5],"assets_tree_sha256":sys.argv[6],"cache_trust_manifest_sha256":sys.argv[7],"provider_running_receipt_sha256":sys.argv[8],"provider_source_image_id":"computeimage-u00zf6w3yf72gakhcy","lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[9],"disk_id":sys.argv[10],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points"}
-preflight={"schema_version":2,"kind":"lehome_native_reference_preflight_v2","identity":identity,"cuda_probe_sha256":hashlib.sha256(cuda_path.read_bytes()).hexdigest()}
+identity_path, preflight_path, cuda_path, host_path = map(Path, sys.argv[1:5]); cuda=json.loads(cuda_path.read_text()); host=json.loads(host_path.read_text())
+expected_host={"schema_version","kind","source_root","python_executable","python_version","torch_version","lerobot_version","lerobot_origin","scripts_eval_origin","lehome_origin"}
+if set(host) != expected_host or host.get("schema_version") != 1 or host.get("kind") != "lehome_native_reference_host_runtime_v1" or host.get("lerobot_version") != "0.4.3": raise SystemExit("native reference host runtime is invalid")
+identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[5],"metadata_tree_sha256":sys.argv[6],"assets_tree_sha256":sys.argv[7],"cache_trust_manifest_sha256":sys.argv[8],"provider_running_receipt_sha256":sys.argv[9],"provider_source_image_id":"computeimage-u00zf6w3yf72gakhcy","lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[10],"disk_id":sys.argv[11],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points",**{key:host[key] for key in ("source_root","python_executable","python_version","torch_version","lerobot_origin","scripts_eval_origin","lehome_origin")}}
+preflight={"schema_version":2,"kind":"lehome_native_reference_preflight_v2","identity":identity,"cuda_probe_sha256":hashlib.sha256(cuda_path.read_bytes()).hexdigest(),"host_runtime_sha256":hashlib.sha256(host_path.read_bytes()).hexdigest()}
 for path,document in ((identity_path,identity),(preflight_path,preflight)):
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o444)
     with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(document,stream,sort_keys=True,separators=(",",":")); stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
@@ -180,7 +227,7 @@ PY
 MODE="${LEHOME_NATIVE_REFERENCE_MODE:-}"
 VALIDATE_ONLY="${LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY:-0}"
 if [[ -z "$MODE" ]]; then MODE=$([[ "$VALIDATE_ONLY" == 1 ]] && printf validate-only || printf execute); fi
-[[ "$MODE" == source-stage || "$MODE" == validate-only || "$MODE" == execute ]] || fail "LEHOME_NATIVE_REFERENCE_MODE must be source-stage, validate-only, or execute"
+[[ "$MODE" == source-stage || "$MODE" == inventory-cache || "$MODE" == validate-only || "$MODE" == execute ]] || fail "LEHOME_NATIVE_REFERENCE_MODE must be source-stage, inventory-cache, validate-only, or execute"
 [[ "$VALIDATE_ONLY" == 0 || "$VALIDATE_ONLY" == 1 ]] || fail "LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY must be exactly 0 or 1"
 SOURCE_ROOT="${LEHOME_NATIVE_REFERENCE_SOURCE_ROOT:-}"
 PYTHON_BIN="${LEHOME_NATIVE_REFERENCE_PYTHON:-python3}"
@@ -190,12 +237,20 @@ if [[ "$MODE" == source-stage ]]; then stage_native_source; exit 0; fi
 VM_ID="${LEHOME_NATIVE_REFERENCE_VM_ID:-}"; DISK_ID="${LEHOME_NATIVE_REFERENCE_DISK_ID:-}"
 CHECKPOINT_ROOT="${LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT:-}"; METADATA_ROOT="${LEHOME_NATIVE_REFERENCE_METADATA_ROOT:-}"; ASSETS_ROOT="${LEHOME_NATIVE_REFERENCE_ASSETS_ROOT:-}"; OUTPUT_ROOT="${LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT:-}"
 CACHE_TRUST_MANIFEST_REVISION="${LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION:-}"; CACHE_TRUST_MANIFEST_PATH="${LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH:-}"; PROVIDER_RUNNING_RECEIPT="${LEHOME_NATIVE_REFERENCE_PROVIDER_RUNNING_RECEIPT:-}"
-[[ "$VM_ID" =~ ^computeinstance-[a-z0-9]+$ ]] || fail "LEHOME_NATIVE_REFERENCE_VM_ID is invalid"
-[[ "$DISK_ID" =~ ^computedisk-[a-z0-9]+$ ]] || fail "LEHOME_NATIVE_REFERENCE_DISK_ID is invalid"
-require_absolute_directory "$CHECKPOINT_ROOT" "native reference checkpoint cache"; require_absolute_directory "$METADATA_ROOT" "native reference metadata cache"; require_absolute_directory "$ASSETS_ROOT" "native reference challenge assets"; require_new_output "$OUTPUT_ROOT"
+require_absolute_directory "$CHECKPOINT_ROOT" "native reference checkpoint cache"; require_absolute_directory "$METADATA_ROOT" "native reference metadata cache"; require_absolute_directory "$ASSETS_ROOT" "native reference challenge assets"
 validate_checkpoint full; validate_source_runtime
 CHECKPOINT_TREE_SHA256="$(checkpoint_tree_sha256)"; METADATA_TREE_SHA256="$(tree_sha256 "$METADATA_ROOT")"; ASSETS_TREE_SHA256="$(tree_sha256 "$ASSETS_ROOT")"
-CHECKPOINT_MODEL_SNAPSHOT="$(model_snapshot)"
+CACHE_INVENTORY_OUTPUT="${LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_OUTPUT:-}"; CACHE_INVENTORY_REMOTE_PATH="${LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_PATH:-}"
+if [[ "$MODE" == inventory-cache ]]; then
+  require_new_file "$CACHE_INVENTORY_OUTPUT" "cache inventory manifest"
+  [[ "$CACHE_INVENTORY_REMOTE_PATH" =~ ^reference-checks/native-cache-[a-z0-9][a-z0-9.-]{0,63}/cache-trust-manifest\.json$ ]] || fail "cache inventory manifest remote path is invalid"
+  write_cache_inventory_manifest
+  printf '%s\n' '{"status":"inventory_complete","mode":"zero-evaluation"}'
+  exit 0
+fi
+[[ "$VM_ID" == "$EXACT_VM_ID" ]] || fail "LEHOME_NATIVE_REFERENCE_VM_ID is not the exact rollout VM"
+[[ "$DISK_ID" == "$PROTECTED_DISK_ID" ]] || fail "LEHOME_NATIVE_REFERENCE_DISK_ID is not the protected shared disk"
+require_new_output "$OUTPUT_ROOT"
 validate_cache_trust_manifest
 if [[ "$MODE" == validate-only ]]; then printf '%s\n' '{"status":"validated","mode":"no-execution"}'; exit 0; fi
 [[ "$PROVIDER_RUNNING_RECEIPT" == /* && "$PROVIDER_RUNNING_RECEIPT" != *".."* && -f "$PROVIDER_RUNNING_RECEIPT" && ! -L "$PROVIDER_RUNNING_RECEIPT" ]] || fail "provider RUNNING receipt is unavailable or unsafe"
@@ -205,7 +260,8 @@ mkdir --mode=0700 -- "$OUTPUT_ROOT"; mkdir --mode=0700 -- "$OUTPUT_ROOT/logs" "$
 "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" bind-provider-receipt --state RUNNING --input "$PROVIDER_RUNNING_RECEIPT" --receipt "$OUTPUT_ROOT/evidence/provider-running-receipt.json" >/dev/null
 CACHE_TRUST_MANIFEST_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/cache-trust-manifest.json")"
 PROVIDER_RUNNING_RECEIPT_SHA256="$(sha256_file "$OUTPUT_ROOT/evidence/provider-running-receipt.json")"
-probe_cuda; write_identity_and_preflight
+validate_running_provider_binding
+probe_cuda; probe_host_runtime; write_identity_and_preflight
 run_stage() {
   local stage="$1" category="$2" garment="$3" log="$OUTPUT_ROOT/logs/stage-${stage}.log"
   validate_stage_integrity

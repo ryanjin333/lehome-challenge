@@ -60,13 +60,14 @@ manifest bytes anonymously and directly from the fixed public dataset
 `ryanjin333/lehome-groot-n17-rollouts` at an immutable 40-hex revision and a
 `reference-checks/...` path; it does not trust a local copy or a caller-supplied
 digest. The manifest kind is
-`lehome_native_reference_cache_trust_manifest_v2` and it binds that public
-repository/revision/path plus the observed checkpoint, metadata, and assets
-tree digests. The checkpoint digest is a logical file-name/SHA manifest: the
-large model is fully SHA-256 verified once at preflight, then its stable
-device/inode/size/mtime snapshot is checked before each stage while the small
-checkpoint files remain fully hashed. If this exact readback does not yet exist, stop for the
-read-only cache inventory and publication rather than inventing a manifest.
+`lehome_native_reference_cache_trust_manifest_v2` and it binds the public
+repository/path plus the observed checkpoint, metadata, and assets tree digests;
+the immutable fetch URL itself binds the 40-hex revision. The checkpoint digest
+is a logical file-name/SHA manifest: the
+large model is fully SHA-256 verified at preflight, before every one of the
+four stages, and once more after stage 4. If this exact readback does not yet
+exist, create it with the zero-evaluation `inventory-cache` mode and publish
+that one manifest rather than inventing a caller-supplied trust value.
 
 ```bash
 export LEHOME_NATIVE_REFERENCE_VM_ID=computeinstance-u00t6xfqhadrcmssa2
@@ -77,9 +78,44 @@ export LEHOME_NATIVE_REFERENCE_METADATA_ROOT=/mnt/lehome/reference-native/datase
 export LEHOME_NATIVE_REFERENCE_ASSETS_ROOT=/mnt/lehome/challenge-assets/Assets
 export LEHOME_NATIVE_REFERENCE_OUTPUT_ROOT=/mnt/lehome/reference-native/native-reference-YYYYMMDDHHMMSS
 export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION='<published 40-char revision>'
-export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH='reference-checks/native/cache-trust-manifest.json'
+export LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH='reference-checks/native-cache-YYYYMMDDHHMMSS/cache-trust-manifest.json'
 export LEHOME_NATIVE_REFERENCE_PROVIDER_RUNNING_RECEIPT=/mnt/lehome/reference-native/provider-running-receipt.json
 ```
+
+### Cache inventory and immutable publication
+
+On the stopped rollout VM, inventory only the already-cached source,
+checkpoint, metadata, and assets. This mode does not probe CUDA, launch the
+simulator, or run an episode. The output path must be new; the remote path must
+be a new `native-cache-*` prefix so the public manifest is immutable.
+
+```bash
+export LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_OUTPUT=/mnt/lehome/reference-native/cache-trust-manifest.json
+export LEHOME_NATIVE_REFERENCE_CACHE_MANIFEST_PATH='reference-checks/native-cache-YYYYMMDDHHMMSS/cache-trust-manifest.json'
+LEHOME_NATIVE_REFERENCE_MODE=inventory-cache \
+  bash rollout_appliance/run_native_reference_evaluator_gate.sh
+```
+
+Copy that one manifest to the operator host through a validated target, then
+publish it there. The command uploads only this manifest, obtains the returned
+immutable revision, and anonymously fetches its exact bytes before writing the
+readback receipt.
+
+```bash
+scp -o ClearAllForwardings=yes -o BatchMode=yes -- \
+  operator@validated-rollout-host:/mnt/lehome/reference-native/cache-trust-manifest.json \
+  /operator/received/cache-trust-manifest.json
+python3 scripts/verify_native_reference_evaluator_gate.py publish-cache-manifest \
+  --manifest /operator/received/cache-trust-manifest.json \
+  --token-file /operator/secrets/hf-token \
+  --receipt /operator/received/cache-manifest-readback.json
+```
+
+Use `immutable_revision` and `path` from that receipt as
+`LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_REVISION` and
+`LEHOME_NATIVE_REFERENCE_CACHE_TRUST_MANIFEST_PATH` for validation/execution.
+The launcher anonymously fetches those bytes again; it does not accept the
+operator's local manifest or readback receipt as cache trust.
 
 The launcher computes cache digests itself and compares them to that immutable
 public readback; it does not trust caller-provided cache-digest values. The
