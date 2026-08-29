@@ -427,10 +427,11 @@ def capture_runtime_image_observation() -> dict[str, object]:
     )
 
 
-def capture_host_runtime(source_root: Path) -> dict[str, object]:
+def capture_host_runtime(source_root: Path, isaaclab_root: Path) -> dict[str, object]:
     """Resolve imports with pinned source paths before caller-controlled paths."""
     root = Path(source_root).resolve(strict=True)
     source_package_root = (root / "source" / "lehome").resolve(strict=True)
+    trusted_isaaclab_root = Path(isaaclab_root).resolve(strict=True)
     original_path = list(sys.path)
     caller_directory = Path.cwd().resolve()
     retained: list[str] = []
@@ -444,11 +445,17 @@ def capture_host_runtime(source_root: Path) -> dict[str, object]:
             continue
         retained.append(value)
     sys.path[:] = [str(source_package_root), str(root), *retained]
-    for name in ("scripts.eval", "scripts", "lehome", "lerobot", "torch"):
+    for name in ("scripts.eval", "scripts", "lehome", "lerobot", "torch", "isaaclab.app", "isaaclab"):
         sys.modules.pop(name, None)
     try:
         lerobot = importlib.import_module("lerobot")
         torch = importlib.import_module("torch")
+        try:
+            from isaaclab.app import AppLauncher
+        except Exception as error:
+            raise NativeReferenceGateError(
+                "native reference cannot import isaaclab.app.AppLauncher"
+            ) from error
 
         def pinned_origin(name: str) -> str:
             spec = importlib.util.find_spec(name)
@@ -467,6 +474,22 @@ def capture_host_runtime(source_root: Path) -> dict[str, object]:
         lerobot_origin = getattr(lerobot, "__file__", None)
         if not isinstance(lerobot_origin, str) or not lerobot_origin:
             raise NativeReferenceGateError("native reference cannot resolve lerobot origin")
+        isaaclab_app_spec = importlib.util.find_spec("isaaclab.app")
+        isaaclab_app_value = None if isaaclab_app_spec is None else isaaclab_app_spec.origin
+        if not isinstance(isaaclab_app_value, str) or not isaaclab_app_value:
+            raise NativeReferenceGateError("native reference cannot resolve isaaclab.app origin")
+        isaaclab_app_origin = Path(isaaclab_app_value).resolve(strict=True)
+        try:
+            isaaclab_app_origin.relative_to(trusted_isaaclab_root)
+        except ValueError as error:
+            raise NativeReferenceGateError(
+                "native reference isaaclab.app origin escapes trusted IsaacLab source"
+            ) from error
+        if (
+            AppLauncher.__name__ != "AppLauncher"
+            or not AppLauncher.__module__.startswith("isaaclab.app")
+        ):
+            raise NativeReferenceGateError("native reference AppLauncher class identity is invalid")
         return {
             "schema_version": 1,
             "kind": "lehome_native_reference_host_runtime_v1",
@@ -478,6 +501,8 @@ def capture_host_runtime(source_root: Path) -> dict[str, object]:
             "lerobot_origin": str(Path(lerobot_origin).resolve()),
             "scripts_eval_origin": pinned_origin("scripts.eval"),
             "lehome_origin": pinned_origin("lehome"),
+            "isaaclab_app_origin": str(isaaclab_app_origin),
+            "app_launcher_class": "isaaclab.app.AppLauncher",
         }
     finally:
         sys.path[:] = original_path
@@ -1029,7 +1054,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     publish = commands.add_parser("publish-bundle"); publish.add_argument("--bundle-root", type=Path, required=True); publish.add_argument("--execution", type=Path, required=True); publish.add_argument("--token-file", type=Path, required=True); publish.add_argument("--receipt", type=Path, required=True)
     publish_cache = commands.add_parser("publish-cache-manifest"); publish_cache.add_argument("--manifest", type=Path, required=True); publish_cache.add_argument("--token-file", type=Path, required=True); publish_cache.add_argument("--receipt", type=Path, required=True)
     cache_auth = commands.add_parser("authenticate-cache"); cache_auth.add_argument("--metadata-root", type=Path, required=True); cache_auth.add_argument("--assets-root", type=Path, required=True); cache_auth.add_argument("--manifest", type=Path, required=True)
-    host_runtime = commands.add_parser("probe-host-runtime"); host_runtime.add_argument("--source-root", type=Path, required=True); host_runtime.add_argument("--receipt", type=Path, required=True)
+    host_runtime = commands.add_parser("probe-host-runtime"); host_runtime.add_argument("--source-root", type=Path, required=True); host_runtime.add_argument("--isaaclab-root", type=Path, required=True); host_runtime.add_argument("--receipt", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "compile-stage": receipt = compile_native_stage(args.bundle_root, stage=args.stage, category=args.category, garment=args.garment, identity=_read_json(args.identity, "identity"))
@@ -1065,7 +1090,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "authenticate-cache":
             receipt = authenticate_canonical_caches(args.metadata_root, args.assets_root, manifest_path=args.manifest)
         elif args.command == "probe-host-runtime":
-            receipt = capture_host_runtime(args.source_root); _write_exclusive(args.receipt, receipt)
+            receipt = capture_host_runtime(args.source_root, args.isaaclab_root); _write_exclusive(args.receipt, receipt)
         else:
             receipt, raw = fetch_public_cache_manifest(args.revision, args.path)
             bindings = (args.checkpoint_tree_sha256, args.metadata_tree_sha256, args.assets_tree_sha256)

@@ -24,10 +24,14 @@ published `7/8` oracle and its result has been published and read back.
 - Runtime: the existing local `lehome-rollout:build` image, whose inspected
   immutable ID must be
   `sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7`.
-  Its `/opt/lehome-challenge/.venv/bin/python` supplies Python 3.11, LeRobot
-  0.4.3, torch/CUDA, CPU simulation, and CUDA policy inference on the one
-  existing rollout VM. The saved processor must prove a 16-action horizon and
-  12-D absolute bimanual action output.
+  Its `/isaac-sim/python.sh` initializes the Isaac runtime while `PYTHONEXE`
+  selects `/opt/lehome-challenge/.venv/bin/python`, which supplies Python 3.11,
+  LeRobot 0.4.3, and torch/CUDA. The pinned public source stays first on
+  `PYTHONPATH`, followed by only the image's reviewed IsaacLab and
+  `isaaclab_tasks` source roots; the reviewed logging `sitecustomize` remains
+  present for evaluator stages. Simulation remains CPU-only and policy
+  inference remains on CUDA. The saved processor must prove a 16-action
+  horizon and 12-D absolute bimanual action output.
 - There are eight sequential 600-step episodes, all at seed 42:
   `Top_Long_Seen_0` twice, `Top_Short_Seen_0` twice,
   `Pant_Long_Seen_0` twice, then `Pant_Short_Seen_0` twice. The required
@@ -243,6 +247,10 @@ runtime working directory. `PYTHONDONTWRITEBYTECODE=1` prevents source-tree
 bytecode, while reviewed `sitecustomize` redirects the evaluator's project logs
 to `OUTPUT_ROOT/public-runtime/stage-N`; the complete pinned source is rehashed
 before every stage and after stage 4.
+Before `run_stage`, a zero-episode runtime probe imports
+`isaaclab.app.AppLauncher`, proves LeRobot 0.4.3 and pinned `scripts.eval` and
+`lehome` origins, and binds the existing torch/CUDA probe. Any import or CUDA
+failure stops before simulation.
 
 ## After execution
 

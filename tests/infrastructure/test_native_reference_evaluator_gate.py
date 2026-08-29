@@ -229,6 +229,12 @@ def test_native_launcher_isolated_contract_never_creates_resources_or_uses_n17_g
     assert "validate_running_provider_binding" in text
     assert text.count("validate_checkpoint full") >= 2
     assert "probe_host_runtime" in text
+    assert 'from isaaclab.app import AppLauncher' in (
+        ROOT / "scripts" / "verify_native_reference_evaluator_gate.py"
+    ).read_text(encoding="utf-8")
+    assert "/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab" in text
+    assert "/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab_tasks" in text
+    assert text.index("probe_cuda; probe_host_runtime") < text.index("run_stage 1")
     assert "validate_runtime_asset_bindings" in text
     assert "verify-execution" in text
     assert "compile-stage" in text
@@ -278,7 +284,7 @@ def test_native_launcher_module_invocation_supports_relative_imports_and_pinned_
     assert '"$PYTHON_BIN" -P -m scripts.eval' in text
     assert 'cd -- "$RUNTIME_REPO_ROOT"' in text
     assert 'PYTHONSAFEPATH=1' in text
-    assert 'PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT"' in text
+    assert 'PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT"' in text
     assert '"$PYTHON_BIN" "$SOURCE_ROOT/scripts/eval.py"' not in text
     assert '--ee_urdf_path "$ASSETS_ROOT/robots/so101_new_calib.urdf"' in text
 
@@ -314,6 +320,8 @@ def test_native_run_stage_binds_arguments_before_expanding_stage_log(tmp_path: P
         "CHECKPOINT_ROOT=/checkpoint\n"
         "METADATA_ROOT=/metadata\n"
         "ASSETS_ROOT=/assets\n"
+        "ISAACLAB_ROOT=/isaaclab\n"
+        "ISAACLAB_TASKS_ROOT=/isaaclab_tasks\n"
         "validate_stage_integrity() { :; }\n"
         f"run_stage() {{{run_stage}\n}}\n"
         "run_stage 1 top_long Top_Long_Seen_0\n",
@@ -357,13 +365,18 @@ def test_runtime_asset_bindings_require_the_same_device_and_inode(tmp_path: Path
 def test_host_runtime_probe_ignores_shadow_scripts_package_in_caller_cwd(tmp_path: Path) -> None:
     source = tmp_path / "pinned-source"
     package_root = source / "source" / "lehome"
+    trusted_isaaclab = tmp_path / "trusted-isaaclab"
     shadow = tmp_path / "shadow-cwd"
     for package, body in (
         (source / "scripts", ""),
         (package_root / "lehome", ""),
         (package_root / "lerobot", '__version__ = "0.4.3"\n'),
         (package_root / "torch", '__version__ = "test-torch"\n'),
+        (trusted_isaaclab / "isaaclab", ""),
+        (trusted_isaaclab / "isaaclab" / "app", "class AppLauncher: pass\n"),
         (shadow / "scripts", ""),
+        (shadow / "isaaclab", ""),
+        (shadow / "isaaclab" / "app", "class AppLauncher: pass\n"),
     ):
         package.mkdir(parents=True)
         (package / "__init__.py").write_text(body, encoding="utf-8")
@@ -380,7 +393,7 @@ def test_host_runtime_probe_ignores_shadow_scripts_package_in_caller_cwd(tmp_pat
     receipt = tmp_path / "host-runtime.json"
     environment = {
         **os.environ,
-        "PYTHONPATH": str(shadow),
+        "PYTHONPATH": f"{package_root}:{source}:{trusted_isaaclab}:{shadow}",
         "PYTHONDONTWRITEBYTECODE": "1",
     }
 
@@ -391,6 +404,8 @@ def test_host_runtime_probe_ignores_shadow_scripts_package_in_caller_cwd(tmp_pat
             "probe-host-runtime",
             "--source-root",
             str(source),
+            "--isaaclab-root",
+            str(trusted_isaaclab),
             "--receipt",
             str(receipt),
         ],
@@ -405,6 +420,10 @@ def test_host_runtime_probe_ignores_shadow_scripts_package_in_caller_cwd(tmp_pat
     runtime = json.loads(receipt.read_text(encoding="utf-8"))
     assert Path(runtime["scripts_eval_origin"]) == (source / "scripts" / "eval.py").resolve()
     assert shadow.resolve() not in Path(runtime["scripts_eval_origin"]).parents
+    assert Path(runtime["isaaclab_app_origin"]) == (
+        trusted_isaaclab / "isaaclab" / "app" / "__init__.py"
+    ).resolve()
+    assert runtime["app_launcher_class"] == "isaaclab.app.AppLauncher"
     tree_after = hashlib.sha256(
         b"".join(path.read_bytes() for path in sorted(source.rglob("*")) if path.is_file() and ".git" not in path.parts)
     ).hexdigest()
@@ -1193,7 +1212,8 @@ def test_native_container_wrapper_builds_complete_exact_command_per_mode(
     common = {
         "LEHOME_NATIVE_REFERENCE_MODE": mode,
         "LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY": "1" if mode == "validate-only" else "0",
-        "LEHOME_NATIVE_REFERENCE_PYTHON": "/opt/lehome-challenge/.venv/bin/python",
+        "LEHOME_NATIVE_REFERENCE_PYTHON": "/isaac-sim/python.sh",
+        "PYTHONEXE": "/opt/lehome-challenge/.venv/bin/python",
         "LEHOME_NATIVE_REFERENCE_SOURCE_ROOT": "/mnt/lehome/reference-native/source",
         "LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT": "/mnt/lehome/cache/reference-theo-d384fe0/repo/pretrained_model",
         "LEHOME_NATIVE_REFERENCE_METADATA_ROOT": "/mnt/lehome/cache/reference-theo-d384fe0/repo/dataset_meta",

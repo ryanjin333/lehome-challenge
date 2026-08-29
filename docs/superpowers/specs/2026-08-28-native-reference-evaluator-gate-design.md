@@ -165,10 +165,18 @@ inspects the fixed tag but the wrapper launches the exact inspected image ID,
 avoiding a tag-retargeting gap between receipt capture and container creation.
 Pinned imports remain first on `PYTHONPATH`, `PYTHONSAFEPATH=1` remains set,
 and the evaluator is invoked with `-P -m scripts.eval` from the runtime root.
+`/isaac-sim/python.sh` initializes the Isaac runtime with
+`PYTHONEXE=/opt/lehome-challenge/.venv/bin/python`; only the reviewed
+`IsaacLab/source/isaaclab` and `isaaclab_tasks` roots follow the pinned public
+source on `PYTHONPATH`.
 `PYTHONDONTWRITEBYTECODE=1` prevents pycache writes. Reviewed runtime
 `sitecustomize` redirects the pinned logger's project root to
 `OUTPUT_ROOT/public-runtime/stage-N`, outside the pinned source; the source
-tree is therefore unchanged across all stage rehashes.
+tree is therefore unchanged across all stage rehashes. A zero-episode
+pre-stage probe imports `isaaclab.app.AppLauncher`, proves LeRobot 0.4.3 and
+the pinned evaluator/LeHome origins, and binds the torch/CUDA probe before any
+stage can run. The public evaluator still receives `--device cpu`; CUDA remains
+policy-only.
 
 ## Decision after the gate
 

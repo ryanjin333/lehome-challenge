@@ -45,7 +45,8 @@ append_required_environment() {
 
 append_environment LEHOME_NATIVE_REFERENCE_MODE "$MODE"
 append_environment LEHOME_NATIVE_REFERENCE_VALIDATE_ONLY "$([[ "$MODE" == validate-only ]] && printf 1 || printf 0)"
-append_environment LEHOME_NATIVE_REFERENCE_PYTHON /opt/lehome-challenge/.venv/bin/python
+append_environment LEHOME_NATIVE_REFERENCE_PYTHON /isaac-sim/python.sh
+append_environment PYTHONEXE /opt/lehome-challenge/.venv/bin/python
 append_environment LEHOME_NATIVE_REFERENCE_SOURCE_ROOT "$WORKSPACE_ROOT/reference-native/source"
 append_environment LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT "$WORKSPACE_ROOT/cache/reference-theo-d384fe0/repo/pretrained_model"
 append_environment LEHOME_NATIVE_REFERENCE_METADATA_ROOT "$WORKSPACE_ROOT/cache/reference-theo-d384fe0/repo/dataset_meta"

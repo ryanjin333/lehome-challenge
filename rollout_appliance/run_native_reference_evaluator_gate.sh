@@ -17,6 +17,8 @@ readonly RUNTIME_IMAGE_ID="sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc4
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly RUNTIME_REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 readonly NATIVE_SITE_ROOT="$RUNTIME_REPO_ROOT/rollout_appliance/native_reference_site"
+readonly ISAACLAB_ROOT="/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab"
+readonly ISAACLAB_TASKS_ROOT="/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab_tasks"
 readonly CANONICAL_CACHE_MANIFEST="$SCRIPT_DIR/native_reference_canonical_cache_manifest.json"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
@@ -125,6 +127,8 @@ validate_runtime_support() {
     || fail "reviewed native reference site support is unavailable or unsafe"
   [[ -f "$NATIVE_SITE_ROOT/sitecustomize.py" && ! -L "$NATIVE_SITE_ROOT/sitecustomize.py" ]] \
     || fail "reviewed native reference sitecustomize is unavailable or unsafe"
+  require_absolute_directory "$ISAACLAB_ROOT" "trusted IsaacLab source"
+  require_absolute_directory "$ISAACLAB_TASKS_ROOT" "trusted IsaacLab tasks source"
 }
 
 validate_runtime_asset_bindings() {
@@ -167,7 +171,7 @@ validate_source_runtime() {
   [[ -z "$(git -C "$SOURCE_ROOT" status --porcelain --untracked-files=all)" ]] || fail "native reference source checkout has untrusted files"
   [[ "$(tree_sha256 "$SOURCE_ROOT")" == "$EXPECTED_SOURCE_TREE_SHA256" ]] || fail "native reference source tree digest mismatch"
   local found
-  found="$(PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT" "$PYTHON_BIN" -c 'import lerobot; print(getattr(lerobot, "__version__", ""))')"
+  found="$(PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT" "$PYTHON_BIN" -c 'import lerobot; print(getattr(lerobot, "__version__", ""))')"
   [[ "$found" == "$EXPECTED_LEROBOT_VERSION" ]] || fail "native reference requires LeRobot $EXPECTED_LEROBOT_VERSION, found ${found:-missing}"
 }
 
@@ -225,9 +229,10 @@ PY
 }
 
 probe_host_runtime() {
-  (cd -- "$RUNTIME_REPO_ROOT" && PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT" \
+  (cd -- "$RUNTIME_REPO_ROOT" && PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT" \
     "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" probe-host-runtime \
-      --source-root "$SOURCE_ROOT" --receipt "$OUTPUT_ROOT/host-runtime.json" >/dev/null) \
+      --source-root "$SOURCE_ROOT" --isaaclab-root "$ISAACLAB_ROOT" \
+      --receipt "$OUTPUT_ROOT/host-runtime.json" >/dev/null) \
     || fail "native reference host runtime probe failed"
 }
 
@@ -236,8 +241,8 @@ write_identity_and_preflight() {
 import hashlib, json, os, sys
 from pathlib import Path
 identity_path, preflight_path, cuda_path, host_path = map(Path, sys.argv[1:5]); cuda=json.loads(cuda_path.read_text()); host=json.loads(host_path.read_text())
-expected_host={"schema_version","kind","source_root","python_executable","python_version","torch_version","lerobot_version","lerobot_origin","scripts_eval_origin","lehome_origin"}
-if set(host) != expected_host or host.get("schema_version") != 1 or host.get("kind") != "lehome_native_reference_host_runtime_v1" or host.get("lerobot_version") != "0.4.3": raise SystemExit("native reference host runtime is invalid")
+expected_host={"schema_version","kind","source_root","python_executable","python_version","torch_version","lerobot_version","lerobot_origin","scripts_eval_origin","lehome_origin","isaaclab_app_origin","app_launcher_class"}
+if set(host) != expected_host or host.get("schema_version") != 1 or host.get("kind") != "lehome_native_reference_host_runtime_v1" or host.get("lerobot_version") != "0.4.3" or host.get("app_launcher_class") != "isaaclab.app.AppLauncher" or not str(host.get("isaaclab_app_origin","")).startswith("/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab/"): raise SystemExit("native reference host runtime is invalid")
 identity={"source_repository":"theo-zhou/lehome-groot-submission-4","source_revision":"d384fe00508acd96ab1c3c5dc265e08261f94b3b","source_tree_sha256":"eada9f80b0dda1428177fe4551efa8059fe85845d4db5b32bb673f88a50c6bb2","checkpoint_tree_sha256":sys.argv[5],"metadata_tree_sha256":sys.argv[6],"assets_tree_sha256":sys.argv[7],"cache_trust_manifest_sha256":sys.argv[8],"provider_running_receipt_sha256":sys.argv[9],"runtime_image_receipt_sha256":sys.argv[10],"provider_source_image_id":"computeimage-u00zf6w3yf72gakhcy","runtime_image_reference":sys.argv[13],"runtime_image_id":sys.argv[14],"lerobot_version":"0.4.3","policy_class":"scripts.eval_policy.lerobot_policy.LeRobotPolicy","policy_device":"cuda:0","cuda_available":cuda["cuda_available"],"cuda_device_count":cuda["cuda_device_count"],"cuda_runtime":cuda["cuda_runtime"],"vm_id":sys.argv[11],"disk_id":sys.argv[12],"simulator_device":"cpu","task_description":"fold the garment on the table","action_horizon":16,"action_dimension":12,"success_checker":"pinned_raw_success_distance_second_mesh_points",**{key:host[key] for key in ("source_root","python_executable","python_version","torch_version","lerobot_origin","scripts_eval_origin","lehome_origin")}}
 preflight={"schema_version":2,"kind":"lehome_native_reference_preflight_v2","identity":identity,"cuda_probe_sha256":hashlib.sha256(cuda_path.read_bytes()).hexdigest(),"host_runtime_sha256":hashlib.sha256(host_path.read_bytes()).hexdigest(),"runtime_image_receipt_sha256":sys.argv[10]}
 for path,document in ((identity_path,identity),(preflight_path,preflight)):
@@ -307,7 +312,7 @@ run_stage() {
     PYTHONSAFEPATH=1 \
     LEHOME_NATIVE_REFERENCE_LOG_PROJECT_ROOT="$public_log_root" \
     LEHOME_NATIVE_REFERENCE_SOURCE_ROOT="$SOURCE_ROOT" \
-    PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$NATIVE_SITE_ROOT" \
+    PYTHONPATH="$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:$ISAACLAB_ROOT:$ISAACLAB_TASKS_ROOT:$NATIVE_SITE_ROOT" \
     "${command[@]}") >"$log" 2>&1 || fail "native reference stage $stage failed; inspect $log"
   "$PYTHON_BIN" "$SCRIPT_DIR/../scripts/verify_native_reference_evaluator_gate.py" compile-stage --bundle-root "$OUTPUT_ROOT" --stage "$stage" --category "$category" --garment "$garment" --identity "$OUTPUT_ROOT/identity.json" >/dev/null
 }
