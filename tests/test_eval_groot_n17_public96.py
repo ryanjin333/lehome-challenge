@@ -268,6 +268,10 @@ def test_validation_only_emits_all_48_n17_stage_assignments_without_runtime(tmp_
     identity.write_text(json.dumps(_identity_receipt(policy_root)), encoding="utf-8")
     output_root = tmp_path / "validation-only"
     monkeypatch.setattr(evaluator, "canonical_policy_artifact_sha256", lambda _: CHECKPOINT["artifact_sha256"])
+    release = tmp_path / "assets" / "Release"
+    for prefix in ("Top_Long", "Top_Short", "Pant_Long", "Pant_Short"):
+        directory = release / prefix; directory.mkdir(parents=True)
+        directory.joinpath(f"{prefix}.txt").write_text("\n".join([f"{prefix}_Seen_{index}" for index in range(10)] + [f"{prefix}_Unseen_{index}" for index in range(2)]), encoding="utf-8")
 
     result = run(SimpleNamespace(
         matrix=MATRIX, matrix_sha256=MATRIX_SHA256, policy_path=policy_root,
@@ -279,3 +283,11 @@ def test_validation_only_emits_all_48_n17_stage_assignments_without_runtime(tmp_
     assert result["kind"] == "lehome_groot_n17_public96_validation_v1"
     assert len(result["stage_commands"]) == 48
     assert (output_root / "validation-only-receipt.json").is_file()
+
+
+def test_validation_only_rejects_missing_release_assets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+    policy = _policy_root_with_canonical_artifact(tmp_path); identity = tmp_path / "identity.json"; identity.write_text(json.dumps(_identity_receipt(policy)), encoding="utf-8")
+    monkeypatch.setattr(evaluator, "canonical_policy_artifact_sha256", lambda _: CHECKPOINT["artifact_sha256"])
+    with pytest.raises(Public96ContractError, match="Release"):
+        run(SimpleNamespace(matrix=MATRIX, matrix_sha256=MATRIX_SHA256, policy_path=policy, checkpoint_identity_receipt=identity, asset_root=tmp_path / "missing", output_root=tmp_path / "out", policy_server_port=9117, policy_server_token_env="TOKEN", dry_run=True))

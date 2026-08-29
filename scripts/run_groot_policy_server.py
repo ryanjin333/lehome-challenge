@@ -25,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-token-env", required=True)
     parser.add_argument("--device", choices=("cpu", "cuda:0"), required=True)
     parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--policy-sha256", required=True)
     return parser
 
 
@@ -47,6 +48,8 @@ def run(args: argparse.Namespace) -> int:
     unblock_termination_signals()
     if args.host != "127.0.0.1":
         raise ValueError("GR00T policy server must bind only 127.0.0.1")
+    if args.policy_sha256 != "e8531e9477b68ac8f7d9fc9564bb66ebfae51f828b44599c4777bd2eb3b72efa":
+        raise ValueError("GR00T policy server runtime policy identity is invalid")
     if not 1 <= args.port <= 65535:
         raise ValueError("GR00T policy server port must be in 1..65535")
     if args.model_path.is_symlink() or not args.model_path.is_dir():

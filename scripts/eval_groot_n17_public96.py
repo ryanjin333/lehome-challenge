@@ -210,6 +210,7 @@ def build_stage_command(stage: Stage, *, repo_root: Path, policy_path: Path, out
     return [
         sys.executable, "-m", "scripts.eval_groot_n17_public96_stage",
         "--public96_raw_checker_overlay", RAW_CHECKER_OVERLAY_ID,
+        "--public96_runtime_policy_sha256", CHECKPOINT["runtime_policy_sha256"],
         "--policy_type", "groot_server", "--policy_path", str(policy_path.resolve()),
         "--policy_server_endpoint", f"tcp://127.0.0.1:{policy_server_port}",
         "--policy_server_token_env", token_env, "--policy_server_request_timeout", "600",
@@ -222,7 +223,7 @@ def build_stage_command(stage: Stage, *, repo_root: Path, policy_path: Path, out
 
 def build_policy_server_command(*, policy_path: Path, port: int, token_env: str) -> list[str]:
     return [sys.executable, "-m", "scripts.run_groot_policy_server", "--model-path", str(policy_path.resolve()),
-            "--host", "127.0.0.1", "--port", str(port), "--api-token-env", token_env, "--device", "cuda:0", "--seed", "42"]
+            "--host", "127.0.0.1", "--port", str(port), "--api-token-env", token_env, "--device", "cuda:0", "--seed", "42", "--policy-sha256", CHECKPOINT["runtime_policy_sha256"]]
 
 
 def _make_overlay(asset_root: Path, stage_root: Path, garment_name: str) -> None:
@@ -237,6 +238,24 @@ def _make_overlay(asset_root: Path, stage_root: Path, garment_name: str) -> None
             raise Public96ContractError("public Release category is unavailable or unsafe")
         (overlay / prefix).symlink_to(source, target_is_directory=True)
     (overlay / "Release_test_list.txt").write_text(garment_name + "\n", encoding="utf-8")
+
+
+def validate_release_assets(asset_root: Path, stages: Sequence[Stage]) -> None:
+    try:
+        release = asset_root.resolve(strict=True) / "Release"
+    except OSError as error:
+        raise Public96ContractError("public Release asset root is unavailable or unsafe") from error
+    if asset_root.is_symlink() or release.is_symlink() or not release.is_dir():
+        raise Public96ContractError("public Release asset root is unavailable or unsafe")
+    expected = {stage.garment_name for stage in stages}
+    found: set[str] = set()
+    for prefix in CATEGORY_PREFIX.values():
+        directory, listing = release / prefix, release / prefix / f"{prefix}.txt"
+        if directory.is_symlink() or listing.is_symlink() or not directory.is_dir() or not listing.is_file():
+            raise Public96ContractError("public Release list/directory is unavailable or unsafe")
+        found.update(line.strip() for line in listing.read_text(encoding="utf-8").splitlines() if line.strip())
+    if not expected <= found:
+        raise Public96ContractError("public Release lists do not contain the frozen public96 garments")
 
 
 def _parse_stage_metrics(log: str) -> list[dict[str, object]]:
@@ -337,6 +356,7 @@ def _parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> dict[str, object]:
     stages = load_frozen_matrix(args.matrix, args.matrix_sha256); matrix_digest = _matrix_digest(args.matrix, args.matrix_sha256)
     identity = validate_checkpoint_identity(_read_json(args.checkpoint_identity_receipt, "checkpoint identity receipt"), args.policy_path)
+    validate_release_assets(args.asset_root, stages)
     if not args.output_root.is_absolute() or args.output_root.exists() or args.output_root.is_symlink() or not args.output_root.parent.is_dir():
         raise Public96ContractError("output root must be a new absolute path beneath an existing safe parent")
     args.output_root.mkdir(); output_root = args.output_root.resolve(strict=True)
@@ -364,8 +384,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 log = stage_root / "stage.log"; completed = subprocess.run(command, cwd=Path.cwd(), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
                 log.write_text(completed.stdout, encoding="utf-8")
                 metrics = _parse_stage_metrics(completed.stdout)
-                if completed.returncode != 0 or "PUBLIC96_STAGE_COMPLETE" not in completed.stdout or "Traceback" in completed.stdout:
+                marker = [line for line in completed.stdout.splitlines() if line.startswith("PUBLIC96_STAGE_COMPLETE ")]
+                if completed.returncode != 0 or len(marker) != 1 or "Traceback" in completed.stdout:
                     raise Public96ContractError("stage process exited nonzero after metrics")
+                try:
+                    child = json.loads(marker[0].removeprefix("PUBLIC96_STAGE_COMPLETE "))
+                except json.JSONDecodeError as error:
+                    raise Public96ContractError("stage completion sentinel is invalid") from error
+                if child != {"raw_checker_overlay": {"overlay_id": RAW_CHECKER_OVERLAY_ID, "overlay_sha256": overlay_sha256()}, "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"]}:
+                    raise Public96ContractError("stage completion sentinel does not attest the pinned runtime and overlay")
                 episode_videos = []
                 for metric in metrics:
                     folder = "success" if metric["success"] else "failure"
@@ -379,6 +406,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     episodes.append({"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_index": metric["episode_index"], "outcome": "success" if metric["success"] else "policy_failure", "success": metric["success"], "return": metric["return"], "length": metric["length"], "artifacts": {"log": _artifact(log, output_root), "videos": {camera: _artifact(video, output_root) for camera, video in cameras.items()}, "receipt": _artifact(receipt_path, output_root)}})
             except (OSError, subprocess.SubprocessError, Public96ContractError) as error:
                 invalids.append({"stage_id": stage.stage_id, "reason": str(error)})
+                for episode_index in stage.episode_indices:
+                    episodes.append({"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_index": episode_index, "outcome": "infrastructure_invalid", "success": False, "invalid_reason": str(error), "artifacts": {}})
     finally:
         server.terminate()
         try: server.wait(timeout=20)
@@ -389,7 +418,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if invalids:
         _write_new_json(output_root / "verifier-receipt.json", {"kind": "lehome_groot_n17_public96_verifier_receipt_v1", "status": "invalid", "invalid_stages": invalids, "result": _artifact(output_root / "result.json", output_root), "policy_server_log": _artifact(server_log, output_root), "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}})
         raise Public96ContractError("public96 run contains infrastructure/fidelity invalid stages")
-    summary = verify_result(result, stages=stages, matrix_sha256=matrix_digest)
+    summary = verify_result(result, stages=stages, matrix_sha256=matrix_digest, output_root=output_root)
     receipt = {"kind": "lehome_groot_n17_public96_verifier_receipt_v1", "result": _artifact(output_root / "result.json", output_root), "policy_server_log": _artifact(server_log, output_root), "summary": summary, "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
     _write_new_json(output_root / "verifier-receipt.json", receipt)
     return result
