@@ -140,17 +140,30 @@ def _assert_pre_stage_invalid_evidence(output_root: Path, identity: dict[str, ob
     assert receipt["policy_server_log"] == {"relative_path": "policy-server.log", "sha256": hashlib.sha256(server_log.read_bytes()).hexdigest()}
 
 
-def _result_identity() -> dict[str, object]:
-    return {"kind": "lehome_groot_n17_checkpoint_identity_v1", **CHECKPOINT, "cache_path": "/verified/cache", "cache_tree_sha256": "a" * 64}
+def _result_identity(policy_root: Path) -> dict[str, object]:
+    return {"kind": "lehome_groot_n17_checkpoint_identity_v1", **CHECKPOINT, "cache_path": str(policy_root.resolve()), "cache_tree_sha256": tree_sha256(policy_root)}
 
 
-def _outcomes(stages: tuple[object, ...], root: Path) -> list[dict[str, object]]:
+def _artifact(path: Path, root: Path) -> dict[str, str]:
+    return {"relative_path": path.relative_to(root).as_posix(), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _outcomes(stages: tuple[object, ...], root: Path, policy_root: Path) -> list[dict[str, object]]:
     outcomes: list[dict[str, object]] = []
+    root.mkdir(parents=True, exist_ok=True)
+    readiness = root / "policy-server-readiness.json"
+    readiness_payload = {
+        "kind": "lehome_groot_n17_public96_policy_server_readiness_v1",
+        "artifact_sha256": CHECKPOINT["artifact_sha256"], "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"],
+        "model_path": str(policy_root.resolve()), "device": "cuda:0",
+        "adapter": "nvidia_gr00t_policy_server_public96_v1",
+        "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
+    }
+    readiness.write_text(json.dumps(readiness_payload, sort_keys=True), encoding="utf-8")
     for stage in stages:
         stage_root = root / stage.stage_id
         stage_root.mkdir(parents=True, exist_ok=True)
         log = stage_root / "stage.log"; log.write_text("complete\n", encoding="utf-8")
-        receipt = stage_root / "stage-receipt.json"
         stage_entries = []
         for episode_index in stage.episode_indices:
             videos = {}
@@ -161,7 +174,17 @@ def _outcomes(stages: tuple[object, ...], root: Path) -> list[dict[str, object]]
                 video.write_bytes(f"{stage.stage_id}:{episode_index}:{camera}".encode())
                 videos[camera] = {"relative_path": video.relative_to(root).as_posix(), "sha256": hashlib.sha256(video.read_bytes()).hexdigest()}
             stage_entries.append((episode_index, videos))
-        receipt.write_text(json.dumps({"kind": "lehome_groot_n17_public96_stage_receipt_v1", "stage_id": stage.stage_id, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "episodes": [{"episode_index": episode_index, "videos": videos} for episode_index, videos in stage_entries]}), encoding="utf-8")
+        receipt = stage_root / "stage-receipt.json"
+        command = build_stage_command(stage, repo_root=ROOT, policy_path=policy_root, output_root=root, policy_server_port=9117, token_env="LEHOME_GROOT_N17_PUBLIC96_POLICY_TOKEN")
+        receipt.write_text(json.dumps({
+            "kind": "lehome_groot_n17_public96_stage_receipt_v1", "schema_version": 1,
+            "stage": {"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_indices": [1, 2]},
+            "command": command,
+            "child_completion_sentinel": {"raw_checker_overlay": {"overlay_id": RAW_CHECKER_OVERLAY_ID, "overlay_sha256": overlay_sha256()}, "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"]},
+            "log": _artifact(log, root),
+            "episodes": [{"episode_index": episode_index, "videos": videos} for episode_index, videos in stage_entries],
+            "policy_server_readiness": {"artifact": _artifact(readiness, root), "binding": readiness_payload},
+        }, sort_keys=True), encoding="utf-8")
         for episode_index, videos in stage_entries:
             outcomes.append(
                 {
@@ -183,6 +206,16 @@ def _outcomes(stages: tuple[object, ...], root: Path) -> list[dict[str, object]]
                 }
             )
     return outcomes
+
+
+def _valid_result(stages: tuple[object, ...], root: Path, policy_root: Path) -> dict[str, object]:
+    return {
+        "kind": "lehome_groot_n17_public96_result_v1", "matrix_sha256": hashlib.sha256(MATRIX.read_bytes()).hexdigest(),
+        "checkpoint": _result_identity(policy_root), "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
+        "episodes": _outcomes(stages, root, policy_root), "invalid_stages": [],
+        "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}, "status": "valid",
+        "summary": {"overall": {"episodes": 96, "successes": 48, "policy_failures": 48}, "categories": {category: {"episodes": 24, "successes": 12, "policy_failures": 12} for category in ("top_long", "top_short", "pant_long", "pant_short")}},
+    }
 
 
 def test_frozen_matrix_has_public_96_order_and_two_sequential_episodes() -> None:
@@ -239,50 +272,141 @@ def test_checkpoint_identity_rejects_caller_self_attested_one_file_cache(tmp_pat
 def test_safe_output_path_rejects_escape(tmp_path: Path) -> None:
     root = tmp_path / "result"
     root.mkdir()
+    safe = root / "stage-001" / "stage.log"
+    safe.parent.mkdir(); safe.write_text("log", encoding="utf-8")
+    outside = tmp_path / "outside.json"; outside.write_text("outside", encoding="utf-8")
 
-    assert validate_output_path(root, root / "stage-001" / "stage.log") == root / "stage-001" / "stage.log"
+    assert validate_output_path(root, safe) == safe
     with pytest.raises(Public96ContractError, match="escapes"):
-        validate_output_path(root, tmp_path / "outside.json")
+        validate_output_path(root, outside)
 
 
 def test_result_verification_counts_clean_failures_and_categories(tmp_path: Path) -> None:
     stages = load_frozen_matrix(MATRIX, MATRIX_SHA256)
-    result = {
-        "kind": "lehome_groot_n17_public96_result_v1",
-        "matrix_sha256": hashlib.sha256(MATRIX.read_bytes()).hexdigest(),
-        "checkpoint": _result_identity(), "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
-        "episodes": _outcomes(stages, tmp_path),
-    }
+    policy_root = _policy_root_with_canonical_artifact(tmp_path)
+    result = _valid_result(stages, tmp_path, policy_root)
 
-    verified = verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path)
+    verified = verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path, policy_artifact_verifier=lambda _: CHECKPOINT["artifact_sha256"])
     assert verified["overall"] == {"episodes": 96, "successes": 48, "policy_failures": 48}
     assert verified["categories"]["top_long"] == {"episodes": 24, "successes": 12, "policy_failures": 12}
 
 
+def test_result_verification_rejects_fabricated_policy_cache_path(tmp_path: Path) -> None:
+    stages = load_frozen_matrix(MATRIX, MATRIX_SHA256)
+    policy_root = _policy_root_with_canonical_artifact(tmp_path)
+    result = _valid_result(stages, tmp_path, policy_root)
+    result["checkpoint"] = {**result["checkpoint"], "cache_path": "/verified/cache", "cache_tree_sha256": "a" * 64}
+
+    with pytest.raises(Public96ContractError, match="cache"):
+        verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path)
+
+
 def test_result_verification_rejects_invalid_or_missing_episode(tmp_path: Path) -> None:
     stages = load_frozen_matrix(MATRIX, MATRIX_SHA256)
-    result = {
-        "kind": "lehome_groot_n17_public96_result_v1",
-        "matrix_sha256": hashlib.sha256(MATRIX.read_bytes()).hexdigest(),
-        "checkpoint": _result_identity(), "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
-        "episodes": _outcomes(stages, tmp_path),
-    }
+    policy_root = _policy_root_with_canonical_artifact(tmp_path)
+    result = _valid_result(stages, tmp_path, policy_root)
     result["episodes"][0]["outcome"] = "infrastructure_invalid"
     with pytest.raises(Public96ContractError, match="invalid"):
-        verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path)
+        verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path, policy_artifact_verifier=lambda _: CHECKPOINT["artifact_sha256"])
 
     result["episodes"] = result["episodes"][:-1]
     with pytest.raises(Public96ContractError, match="96"):
-        verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path)
+        verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path, policy_artifact_verifier=lambda _: CHECKPOINT["artifact_sha256"])
 
 
 def test_result_verification_rejects_mutated_real_camera_artifact(tmp_path: Path) -> None:
     stages = load_frozen_matrix(MATRIX, MATRIX_SHA256)
-    result = {"kind": "lehome_groot_n17_public96_result_v1", "matrix_sha256": hashlib.sha256(MATRIX.read_bytes()).hexdigest(), "checkpoint": _result_identity(), "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "episodes": _outcomes(stages, tmp_path)}
+    policy_root = _policy_root_with_canonical_artifact(tmp_path)
+    result = _valid_result(stages, tmp_path, policy_root)
     first_video = tmp_path / result["episodes"][0]["artifacts"]["videos"]["top_rgb"]["relative_path"]
     first_video.write_bytes(b"tampered")
     with pytest.raises(Public96ContractError, match="digest"):
+        verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path, policy_artifact_verifier=lambda _: CHECKPOINT["artifact_sha256"])
+
+
+def test_result_verification_calls_the_production_canonical_verifier_and_rejects_its_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.eval_groot_n17_public96 as evaluator
+
+    stages = load_frozen_matrix(MATRIX, MATRIX_SHA256)
+    policy_root = _policy_root_with_canonical_artifact(tmp_path)
+    result = _valid_result(stages, tmp_path, policy_root)
+    called: list[Path] = []
+
+    def mismatched_canonical_verifier(path: Path) -> str:
+        called.append(path)
+        return "0" * 64
+
+    monkeypatch.setattr(evaluator, "canonical_policy_artifact_sha256", mismatched_canonical_verifier)
+    with pytest.raises(Public96ContractError, match="cache"):
         verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path)
+    assert called == [policy_root.resolve()]
+
+
+def _rewrite_stage_receipt(result: dict[str, object], root: Path, mutate) -> None:
+    receipt_path = root / "top-long-seen-0" / "stage-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    mutate(receipt)
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+    descriptor = _artifact(receipt_path, root)
+    for episode in result["episodes"]:
+        if episode["stage_id"] == "top-long-seen-0":
+            episode["artifacts"]["receipt"] = descriptor
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda receipt: receipt["command"].append("--tampered"),
+    lambda receipt: receipt["log"].update(sha256="0" * 64),
+    lambda receipt: receipt["episodes"][0]["videos"]["top_rgb"].update(relative_path="top-long-seen-0/videos/failure/episode0_observation_top_rgb.mp4"),
+    lambda receipt: receipt["child_completion_sentinel"].update(runtime_policy_sha256="0" * 64),
+    lambda receipt: receipt["policy_server_readiness"]["binding"].update(device="cpu"),
+    lambda receipt: receipt.update(unexpected=True),
+    lambda receipt: receipt.pop("log"),
+])
+def test_result_verification_rejects_mutated_stage_receipt_contract(tmp_path: Path, mutation) -> None:
+    stages = load_frozen_matrix(MATRIX, MATRIX_SHA256)
+    policy_root = _policy_root_with_canonical_artifact(tmp_path)
+    result = _valid_result(stages, tmp_path, policy_root)
+    _rewrite_stage_receipt(result, tmp_path, mutation)
+
+    with pytest.raises(Public96ContractError):
+        verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path, policy_artifact_verifier=lambda _: CHECKPOINT["artifact_sha256"])
+
+
+def test_result_verification_rejects_checkpoint_digest_and_summary_mutations(tmp_path: Path) -> None:
+    stages = load_frozen_matrix(MATRIX, MATRIX_SHA256)
+    policy_root = _policy_root_with_canonical_artifact(tmp_path)
+    result = _valid_result(stages, tmp_path, policy_root)
+    result["checkpoint"]["artifact_sha256"] = "0" * 64
+    with pytest.raises(Public96ContractError):
+        verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path, policy_artifact_verifier=lambda _: CHECKPOINT["artifact_sha256"])
+
+    result = _valid_result(stages, tmp_path / "second", policy_root)
+    result["summary"]["overall"]["successes"] = 47
+    with pytest.raises(Public96ContractError, match="summary"):
+        verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path / "second", policy_artifact_verifier=lambda _: CHECKPOINT["artifact_sha256"])
+
+
+@pytest.mark.parametrize("mutation", ("escape", "missing", "symlink"))
+def test_result_verification_rejects_unsafe_artifact_paths(tmp_path: Path, mutation: str) -> None:
+    stages = load_frozen_matrix(MATRIX, MATRIX_SHA256)
+    policy_root = _policy_root_with_canonical_artifact(tmp_path)
+    result = _valid_result(stages, tmp_path, policy_root)
+    descriptor = result["episodes"][0]["artifacts"]["videos"]["top_rgb"]
+    video = tmp_path / descriptor["relative_path"]
+    if mutation == "escape":
+        outside = tmp_path.parent / "public96-outside.mp4"
+        outside.write_bytes(video.read_bytes())
+        descriptor["relative_path"] = "../public96-outside.mp4"
+        descriptor["sha256"] = hashlib.sha256(outside.read_bytes()).hexdigest()
+    elif mutation == "missing":
+        video.unlink()
+    else:
+        outside = tmp_path / "outside.mp4"
+        outside.write_bytes(video.read_bytes())
+        video.unlink(); video.symlink_to(outside)
+
+    with pytest.raises(Public96ContractError):
+        verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path, policy_artifact_verifier=lambda _: CHECKPOINT["artifact_sha256"])
 
 
 def test_dry_run_command_selects_groot_server_not_lerobot(tmp_path: Path) -> None:
@@ -411,7 +535,7 @@ def test_synthetic_successful_run_writes_complete_result_and_verifier_receipt(tm
 
     def fake_popen(command, *args, **kwargs):
         receipt = Path(command[command.index("--readiness-receipt") + 1])
-        receipt.write_text(json.dumps({"artifact_sha256": CHECKPOINT["artifact_sha256"], "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"], "model_path": str(policy.resolve()), "device": "cuda:0"}), encoding="utf-8")
+        receipt.write_text(json.dumps({"kind": "lehome_groot_n17_public96_policy_server_readiness_v1", "artifact_sha256": CHECKPOINT["artifact_sha256"], "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"], "model_path": str(policy.resolve()), "device": "cuda:0", "adapter": "nvidia_gr00t_policy_server_public96_v1", "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}}), encoding="utf-8")
         return Server()
     monkeypatch.setattr(evaluator.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(evaluator.subprocess, "run", fake_run)

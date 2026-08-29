@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
@@ -168,7 +168,9 @@ def load_frozen_matrix(path: Path, checksum_path: Path) -> tuple[Stage, ...]:
     return tuple(stages)
 
 
-def validate_checkpoint_identity(receipt: Mapping[str, object], policy_root: Path) -> dict[str, object]:
+def validate_checkpoint_identity(
+    receipt: Mapping[str, object], policy_root: Path, *, policy_artifact_verifier=None,
+) -> dict[str, object]:
     required = {"kind", *CHECKPOINT, "cache_path", "cache_tree_sha256"}
     if set(receipt) != required or receipt.get("kind") != "lehome_groot_n17_checkpoint_identity_v1":
         raise CheckpointIdentityError("checkpoint identity receipt schema is invalid")
@@ -176,8 +178,13 @@ def validate_checkpoint_identity(receipt: Mapping[str, object], policy_root: Pat
         if receipt.get(name) != expected:
             label = "runtime policy" if name == "runtime_policy_sha256" else name.replace("_", " ")
             raise CheckpointIdentityError(f"checkpoint {label} identity mismatch")
-    root = policy_root.resolve(strict=True)
-    artifact = canonical_policy_artifact_sha256(root)
+    if policy_root.is_symlink() or not policy_root.is_dir():
+        raise CheckpointIdentityError("policy cache must be an existing non-symlink directory")
+    try:
+        root = policy_root.resolve(strict=True)
+    except OSError as error:
+        raise CheckpointIdentityError("policy cache must be an existing non-symlink directory") from error
+    artifact = (canonical_policy_artifact_sha256 if policy_artifact_verifier is None else policy_artifact_verifier)(root)
     if artifact != CHECKPOINT["artifact_sha256"]:
         raise CheckpointIdentityError("checkpoint artifact SHA-256 mismatch")
     if receipt.get("cache_path") != str(root) or receipt.get("cache_tree_sha256") != tree_sha256(root):
@@ -188,10 +195,22 @@ def validate_checkpoint_identity(receipt: Mapping[str, object], policy_root: Pat
 def validate_output_path(output_root: Path, candidate: Path) -> Path:
     if output_root.is_symlink():
         raise Public96ContractError("output root is unsafe")
-    root = output_root.resolve(strict=True)
+    try:
+        root = output_root.resolve(strict=True)
+    except OSError as error:
+        raise Public96ContractError("output root is unsafe") from error
     if not root.is_dir():
         raise Public96ContractError("output root is unsafe")
-    resolved = candidate.resolve()
+    if candidate.is_symlink() or not candidate.is_file():
+        raise Public96ContractError("output artifact is missing, non-regular, or a symlink")
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as error:
+        raise Public96ContractError("output artifact path escapes run root") from error
+    for part in relative.parts:
+        if (root / part).is_symlink():
+            raise Public96ContractError("output artifact path contains a symlink")
+    resolved = candidate.resolve(strict=True)
     try:
         resolved.relative_to(root)
     except ValueError as error:
@@ -339,15 +358,93 @@ def _verified_artifact(value: object, *, root: Path, expected_path: str | None =
     relative, digest = value.get("relative_path"), value.get("sha256")
     if not isinstance(relative, str) or not _HEX.fullmatch(digest if isinstance(digest, str) else ""):
         raise Public96ContractError("artifact descriptor is invalid")
+    relative_path = PurePosixPath(relative)
+    if (relative_path.is_absolute() or not relative_path.parts or any(part in {".", ".."} for part in relative_path.parts)
+            or relative_path.as_posix() != relative):
+        raise Public96ContractError("artifact path must be a safe relative path")
     if expected_path is not None and relative != expected_path:
         raise Public96ContractError("artifact relative path does not bind its episode")
-    path = validate_output_path(root, root / relative)
-    if path != root / relative or sha256_file(path) != digest:
+    candidate = root.joinpath(*relative_path.parts)
+    path = validate_output_path(root, candidate)
+    if path != candidate or sha256_file(path) != digest:
         raise Public96ContractError("artifact file digest mismatch")
 
 
-def verify_result(result: Mapping[str, object], *, stages: Sequence[Stage], matrix_sha256: str, output_root: Path) -> dict[str, object]:
-    if result.get("kind") != "lehome_groot_n17_public96_result_v1" or result.get("matrix_sha256") != matrix_sha256:
+def _stage_identity(stage: Stage) -> dict[str, object]:
+    return {
+        "stage_id": stage.stage_id,
+        "category": stage.category,
+        "garment_name": stage.garment_name,
+        "release_stage": stage.release_stage,
+        "seed": stage.seed,
+        "episode_indices": list(stage.episode_indices),
+    }
+
+
+def _validate_readiness_payload(readiness: object, *, policy_root: Path) -> dict[str, object]:
+    required = {"kind", "artifact_sha256", "runtime_policy_sha256", "model_path", "device", "adapter", "raw_checker_overlay"}
+    expected = {
+        "kind": "lehome_groot_n17_public96_policy_server_readiness_v1",
+        "artifact_sha256": CHECKPOINT["artifact_sha256"],
+        "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"],
+        "model_path": str(policy_root.resolve(strict=True)),
+        "device": "cuda:0",
+        "adapter": "nvidia_gr00t_policy_server_public96_v1",
+        "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
+    }
+    if not isinstance(readiness, Mapping) or set(readiness) != required or dict(readiness) != expected:
+        raise Public96ContractError("policy server readiness does not bind the pinned N1.7 policy")
+    return expected
+
+
+def _validate_stage_receipt(
+    receipt: object, *, stage: Stage, command: Sequence[str], episode_artifacts: Mapping[int, Mapping[str, object]],
+    log: object, readiness: Mapping[str, object], policy_root: Path, output_root: Path,
+) -> None:
+    required = {"kind", "schema_version", "stage", "command", "child_completion_sentinel", "log", "episodes", "policy_server_readiness"}
+    sentinel = {"raw_checker_overlay": {"overlay_id": RAW_CHECKER_OVERLAY_ID, "overlay_sha256": overlay_sha256()}, "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"]}
+    if not isinstance(receipt, Mapping) or set(receipt) != required:
+        raise Public96ContractError("stage receipt schema is invalid")
+    if (receipt.get("kind") != "lehome_groot_n17_public96_stage_receipt_v1" or receipt.get("schema_version") != 1
+            or receipt.get("stage") != _stage_identity(stage) or receipt.get("command") != list(command)
+            or receipt.get("child_completion_sentinel") != sentinel or receipt.get("log") != log):
+        raise Public96ContractError("stage receipt does not bind the frozen stage, command, log, and sentinel")
+    readiness_binding = receipt.get("policy_server_readiness")
+    if not isinstance(readiness_binding, Mapping) or set(readiness_binding) != {"artifact", "binding"}:
+        raise Public96ContractError("stage receipt policy readiness binding is invalid")
+    _verified_artifact(readiness_binding["artifact"], root=output_root, expected_path="policy-server-readiness.json")
+    readiness_path = output_root / "policy-server-readiness.json"
+    if _read_json(readiness_path, "policy server readiness") != readiness_binding["binding"] or readiness_binding["binding"] != readiness:
+        raise Public96ContractError("stage receipt policy readiness binding is invalid")
+    _validate_readiness_payload(readiness_binding["binding"], policy_root=policy_root)
+    episodes = receipt.get("episodes")
+    if not isinstance(episodes, list) or len(episodes) != 2:
+        raise Public96ContractError("stage receipt must contain exactly two episode video records")
+    expected_episodes = [{"episode_index": index, "videos": dict(episode_artifacts[index])} for index in stage.episode_indices]
+    if episodes != expected_episodes:
+        raise Public96ContractError("stage receipt video artifacts do not exactly bind both episodes")
+
+
+def _summary_from_episodes(episodes: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    categories: dict[str, Counter[str]] = {category: Counter() for category in CATEGORIES}
+    for episode in episodes:
+        category = episode.get("category")
+        if category in categories:
+            categories[category]["episodes"] += 1
+            categories[category]["successes"] += int(episode.get("success") is True)
+            categories[category]["policy_failures"] += int(episode.get("outcome") == "policy_failure")
+    summarized = {category: dict(categories[category]) for category in CATEGORIES}
+    overall = {key: sum(summary.get(key, 0) for summary in summarized.values()) for key in ("episodes", "successes", "policy_failures")}
+    return {"overall": overall, "categories": summarized}
+
+
+def verify_result(
+    result: Mapping[str, object], *, stages: Sequence[Stage], matrix_sha256: str, output_root: Path,
+    policy_artifact_verifier=None, policy_server_port: int = 9117,
+    policy_server_token_env: str = "LEHOME_GROOT_N17_PUBLIC96_POLICY_TOKEN",
+) -> dict[str, object]:
+    result_keys = {"kind", "matrix_sha256", "checkpoint", "raw_checker_overlay", "episodes", "invalid_stages", "publication", "status", "summary"}
+    if set(result) != result_keys or result.get("kind") != "lehome_groot_n17_public96_result_v1" or result.get("matrix_sha256") != matrix_sha256:
         raise Public96ContractError("public96 result identity is invalid")
     checkpoint = result.get("checkpoint")
     episodes = result.get("episodes")
@@ -357,8 +454,18 @@ def verify_result(result: Mapping[str, object], *, stages: Sequence[Stage], matr
             or checkpoint.get("kind") != "lehome_groot_n17_checkpoint_identity_v1" or not isinstance(checkpoint.get("cache_path"), str) or not _HEX.fullmatch(str(checkpoint.get("cache_tree_sha256")))
             or not isinstance(overlay, Mapping) or dict(overlay) != {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()} or not isinstance(episodes, list) or len(episodes) != 96):
         raise Public96ContractError("public96 result must contain exactly 96 episodes and the pinned runtime policy")
+    if result.get("status") != "valid" or result.get("invalid_stages") != [] or result.get("publication") != {"status": "not_attempted", "vm_stop": "not_attempted"}:
+        raise Public96ContractError("public96 result is not a complete valid unscored publication result")
+    try:
+        policy_root = Path(checkpoint["cache_path"])
+        validate_checkpoint_identity(checkpoint, policy_root, policy_artifact_verifier=policy_artifact_verifier)
+    except (OSError, TypeError, ValueError, CheckpointIdentityError) as error:
+        raise Public96ContractError("public96 result policy cache identity is invalid") from error
+    readiness_path = output_root / "policy-server-readiness.json"
+    readiness = _validate_readiness_payload(_read_json(readiness_path, "policy server readiness"), policy_root=policy_root)
     expected = {(stage.stage_id, stage.episode_indices[index]): stage for stage in stages for index in range(2)}
     seen: set[tuple[str, int]] = set(); categories: dict[str, Counter[str]] = {category: Counter() for category in CATEGORIES}
+    stage_evidence: dict[str, dict[str, object]] = {}
     for episode in episodes:
         if not isinstance(episode, Mapping):
             raise Public96ContractError("public96 episode is invalid")
@@ -382,21 +489,35 @@ def verify_result(result: Mapping[str, object], *, stages: Sequence[Stage], matr
         folder = "success" if success else "failure"
         for camera, descriptor in artifacts["videos"].items():
             _verified_artifact(descriptor, root=output_root, expected_path=f"{stage.stage_id}/videos/{folder}/episode{source_index}_observation_{camera}.mp4")
-        receipt_path = output_root / str(artifacts["receipt"]["relative_path"])
-        receipt_payload = _read_json(receipt_path, "stage receipt")
-        receipt_episodes = receipt_payload.get("episodes")
-        if (receipt_payload.get("kind") != "lehome_groot_n17_public96_stage_receipt_v1" or receipt_payload.get("stage_id") != stage.stage_id
-                or receipt_payload.get("raw_checker_overlay") != {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}
-                or not isinstance(receipt_episodes, list) or not any(item.get("episode_index") == episode.get("episode_index") and item.get("videos") == artifacts.get("videos") for item in receipt_episodes if isinstance(item, Mapping))):
-            raise Public96ContractError("stage receipt does not bind the expected stage")
+        evidence = stage_evidence.setdefault(stage.stage_id, {"log": artifacts["log"], "receipt": artifacts["receipt"], "episodes": {}})
+        if evidence["log"] != artifacts["log"] or evidence["receipt"] != artifacts["receipt"]:
+            raise Public96ContractError("stage result artifacts disagree between sequential episodes")
+        evidence["episodes"][int(episode["episode_index"])] = artifacts["videos"]
         seen.add(identity); categories[stage.category]["episodes"] += 1; categories[stage.category]["successes"] += int(success); categories[stage.category]["policy_failures"] += int(not success)
     if len(seen) != 96:
         raise Public96ContractError("public96 result has missing episodes")
+    for stage in stages:
+        evidence = stage_evidence.get(stage.stage_id)
+        if not isinstance(evidence, Mapping) or set(evidence.get("episodes", {})) != {1, 2}:
+            raise Public96ContractError("stage receipt is missing sequential episode evidence")
+        receipt_path = output_root / str(evidence["receipt"]["relative_path"])
+        receipt_payload = _read_json(receipt_path, "stage receipt")
+        expected_command = build_stage_command(
+            stage, repo_root=Path.cwd(), policy_path=policy_root, output_root=output_root,
+            policy_server_port=policy_server_port, token_env=policy_server_token_env,
+        )
+        _validate_stage_receipt(
+            receipt_payload, stage=stage, command=expected_command, episode_artifacts=evidence["episodes"],
+            log=evidence["log"], readiness=readiness, policy_root=policy_root, output_root=output_root,
+        )
     summarized = {category: dict(categories[category]) for category in CATEGORIES}
     if any(summary.get("episodes") != 24 for summary in summarized.values()):
         raise Public96ContractError("public96 result is not category complete")
     overall = {key: sum(summary.get(key, 0) for summary in summarized.values()) for key in ("episodes", "successes", "policy_failures")}
-    return {"overall": overall, "categories": summarized}
+    summary = {"overall": overall, "categories": summarized}
+    if result.get("summary") != summary:
+        raise Public96ContractError("public96 result summary does not exactly match verified episodes")
+    return summary
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -445,9 +566,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     time.sleep(0.1)
                 if server.poll() is not None or not readiness_receipt.is_file():
                     raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
-                readiness = _read_json(readiness_receipt, "policy server readiness")
-                if readiness.get("artifact_sha256") != CHECKPOINT["artifact_sha256"] or readiness.get("runtime_policy_sha256") != CHECKPOINT["runtime_policy_sha256"] or readiness.get("model_path") != str(args.policy_path.resolve()) or readiness.get("device") != "cuda:0":
-                    raise Public96ContractError("policy server readiness does not bind the pinned N1.7 policy")
+                readiness = _validate_readiness_payload(_read_json(readiness_receipt, "policy server readiness"), policy_root=args.policy_path)
                 if server.poll() is not None:
                     raise Public96ContractError("N1.7 policy server exited before public96 evaluation")
             except Public96ContractError as error:
@@ -476,7 +595,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         cameras = {camera: stage_root / "videos" / folder / f"episode{source_index}_observation_{camera}.mp4" for camera in ("top_rgb", "left_rgb", "right_rgb")}
                         episode_videos.append(cameras)
                         for video in cameras.values(): _artifact(video, output_root)
-                    stage_receipt = {"kind": "lehome_groot_n17_public96_stage_receipt_v1", "stage_id": stage.stage_id, "command": command, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "log": _artifact(log, output_root), "episodes": [{"episode_index": metric["episode_index"], "videos": {camera: _artifact(video, output_root) for camera, video in cameras.items()}} for metric, cameras in zip(metrics, episode_videos, strict=True)]}
+                    stage_receipt = {
+                        "kind": "lehome_groot_n17_public96_stage_receipt_v1", "schema_version": 1,
+                        "stage": _stage_identity(stage), "command": command,
+                        "child_completion_sentinel": child, "log": _artifact(log, output_root),
+                        "episodes": [{"episode_index": metric["episode_index"], "videos": {camera: _artifact(video, output_root) for camera, video in cameras.items()}} for metric, cameras in zip(metrics, episode_videos, strict=True)],
+                        "policy_server_readiness": {"artifact": _artifact(readiness_receipt, output_root), "binding": readiness},
+                    }
                     receipt_path = stage_root / "stage-receipt.json"; _write_new_json(receipt_path, stage_receipt)
                     for metric, cameras in zip(metrics, episode_videos, strict=True):
                         episodes.append({"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_index": metric["episode_index"], "outcome": "success" if metric["success"] else "policy_failure", "success": metric["success"], "return": metric["return"], "length": metric["length"], "artifacts": {"log": _artifact(log, output_root), "videos": {camera: _artifact(video, output_root) for camera, video in cameras.items()}, "receipt": _artifact(receipt_path, output_root)}})
@@ -499,10 +624,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if invalids:
         _write_invalid_evidence(output_root=output_root, stages=stages, matrix_digest=matrix_digest, identity=identity, server_log=server_log, invalids=invalids, episodes=episodes)
         raise Public96ContractError("public96 run contains infrastructure/fidelity invalid stages")
-    result = {"kind": "lehome_groot_n17_public96_result_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "episodes": episodes, "invalid_stages": invalids, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
-    summary = verify_result(result, stages=stages, matrix_sha256=matrix_digest, output_root=output_root)
-    result["status"] = "valid"
-    result["summary"] = summary
+    result = {"kind": "lehome_groot_n17_public96_result_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "episodes": episodes, "invalid_stages": invalids, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}, "status": "valid", "summary": _summary_from_episodes(episodes)}
+    summary = verify_result(result, stages=stages, matrix_sha256=matrix_digest, output_root=output_root, policy_server_port=args.policy_server_port, policy_server_token_env=args.policy_server_token_env)
     _write_new_json(output_root / "result.json", result)
     receipt = {"kind": "lehome_groot_n17_public96_verifier_receipt_v1", "result": _artifact(output_root / "result.json", output_root), "policy_server_log": _artifact(server_log, output_root), "summary": summary, "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
     _write_new_json(output_root / "verifier-receipt.json", receipt)
