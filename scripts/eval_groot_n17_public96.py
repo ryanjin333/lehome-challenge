@@ -366,7 +366,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     readiness_receipt = output_root / "policy-server-readiness.json"
     policy_command = build_policy_server_command(policy_path=args.policy_path, port=args.policy_server_port, token_env=args.policy_server_token_env, readiness_receipt=readiness_receipt)
     stage_commands = [build_stage_command(stage, repo_root=Path.cwd(), policy_path=args.policy_path, output_root=output_root, policy_server_port=args.policy_server_port, token_env=args.policy_server_token_env) for stage in stages]
-    base = {"kind": "lehome_groot_n17_public96_validation_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "policy_server_command": policy_command, "stage_commands": stage_commands, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
+    assignments = [{"stage_id": stage.stage_id, "category": stage.category, "garment_name": stage.garment_name, "release_stage": stage.release_stage, "seed": stage.seed, "episode_indices": list(stage.episode_indices), "overlay_path": str(_stage_dir(output_root, stage) / "garment-config"), "command": command} for stage, command in zip(stages, stage_commands, strict=True)]
+    base = {"kind": "lehome_groot_n17_public96_validation_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "policy_server_command": policy_command, "stage_commands": stage_commands, "assignments": assignments, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
     if args.dry_run:
         _write_new_json(output_root / "validation-only-receipt.json", base)
         return base
@@ -426,9 +427,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     result = {"kind": "lehome_groot_n17_public96_result_v1", "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "episodes": episodes, "invalid_stages": invalids, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
     _write_new_json(output_root / "result.json", result)
     if invalids:
+        result["status"] = "invalid"
+        result["summary"] = {"status": "invalid", "assigned_episodes": 96, "invalid_episodes": len([episode for episode in episodes if episode.get("outcome") == "infrastructure_invalid"])}
+        (output_root / "result.json").unlink(); _write_new_json(output_root / "result.json", result)
         _write_new_json(output_root / "verifier-receipt.json", {"kind": "lehome_groot_n17_public96_verifier_receipt_v1", "status": "invalid", "invalid_stages": invalids, "result": _artifact(output_root / "result.json", output_root), "policy_server_log": _artifact(server_log, output_root), "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}})
         raise Public96ContractError("public96 run contains infrastructure/fidelity invalid stages")
     summary = verify_result(result, stages=stages, matrix_sha256=matrix_digest, output_root=output_root)
+    result["status"] = "valid"
+    result["summary"] = summary
+    (output_root / "result.json").unlink()
+    _write_new_json(output_root / "result.json", result)
     receipt = {"kind": "lehome_groot_n17_public96_verifier_receipt_v1", "result": _artifact(output_root / "result.json", output_root), "policy_server_log": _artifact(server_log, output_root), "summary": summary, "matrix_sha256": matrix_digest, "checkpoint": identity, "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}, "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}}
     _write_new_json(output_root / "verifier-receipt.json", receipt)
     return result
