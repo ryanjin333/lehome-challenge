@@ -35,7 +35,7 @@ _COLLECTION_STAGES = (
     "success-replay",
 )
 _GATE_STAGES = _COLLECTION_STAGES[:3]
-_REPLAY_SHORTAGE_STAGES = _COLLECTION_STAGES
+_REPLAY_SHORTAGE_STAGE_SETS = (_COLLECTION_STAGES[:10], _COLLECTION_STAGES)
 _STOP_OUTCOMES = frozenset({"infrastructure_stop", "infrastructure_stop_failure"})
 _SSH_TARGET = re.compile(
     r"[A-Za-z_][A-Za-z0-9_.-]{0,63}@"
@@ -90,6 +90,14 @@ def _entry_digest(entries: object) -> str:
 
 
 def _json_object(path: Path, *, label: str) -> dict[str, object]:
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise FinalizationError(f"{label} is malformed") from error
+    return _json_bytes_object(raw, label=label)
+
+
+def _json_bytes_object(raw: bytes, *, label: str) -> dict[str, object]:
     def reject_duplicate_keys(pairs: list[tuple[object, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
         for key, value in pairs:
@@ -99,12 +107,12 @@ def _json_object(path: Path, *, label: str) -> dict[str, object]:
         return result
 
     try:
-        raw = json.loads(path.read_bytes(), object_pairs_hook=reject_duplicate_keys)
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        value = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise FinalizationError(f"{label} is malformed") from error
-    if not isinstance(raw, dict):
+    if not isinstance(value, dict):
         raise FinalizationError(f"{label} is malformed")
-    return raw
+    return value
 
 
 def _load_operator_token(path: Path) -> str:
@@ -202,7 +210,9 @@ def validate_handoff(raw: Mapping[str, object]) -> dict[str, object]:
     if outcome == "complete":
         expected = _COLLECTION_STAGES
     elif outcome == "replay_shortage":
-        expected = _REPLAY_SHORTAGE_STAGES
+        expected = None
+        if actual_stages not in _REPLAY_SHORTAGE_STAGE_SETS:
+            raise FinalizationError("replay-shortage handoff is not at a reachable terminal boundary")
     elif outcome in {"fidelity_stop", "insufficient_source_stop"}:
         expected = _GATE_STAGES
     elif outcome in _STOP_OUTCOMES:
@@ -358,6 +368,133 @@ class SubprocessNebiusProvider:
         self._json(("compute", "instance", "stop", instance_id))
 
 
+def _owned_directory_fd(path: Path, *, create: bool) -> int:
+    """Open one operator-owned directory without following its final component."""
+    if not path.is_absolute() or path.name in {"", ".", ".."}:
+        raise FinalizationError("durable handoff directory is unsafe")
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        if not create:
+            raise FinalizationError("durable handoff directory is unavailable")
+        parent = path.parent
+        try:
+            parent_metadata = parent.lstat()
+        except OSError as error:
+            raise FinalizationError("durable handoff parent is unsafe") from error
+        trusted_owner = parent_metadata.st_uid == os.geteuid()
+        trusted_sticky_root = (
+            parent_metadata.st_uid == 0
+            and bool(parent_metadata.st_mode & stat.S_ISVTX)
+        )
+        if (not stat.S_ISDIR(parent_metadata.st_mode)
+                or not (trusted_owner or trusted_sticky_root)
+                or parent.is_symlink()):
+            raise FinalizationError("durable handoff parent is unsafe")
+        parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            parent_fd = os.open(parent, parent_flags)
+        except OSError as error:
+            raise FinalizationError("durable handoff parent is unsafe") from error
+        try:
+            os.mkdir(path.name, mode=0o700, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise FinalizationError("durable handoff directory cannot be created") from error
+        finally:
+            os.close(parent_fd)
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise FinalizationError("durable handoff directory is unsafe") from error
+    except OSError as error:
+        raise FinalizationError("durable handoff directory is unsafe") from error
+    if (path.is_symlink() or not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o022):
+        raise FinalizationError("durable handoff directory is unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise FinalizationError("durable handoff directory is unsafe") from error
+    opened = os.fstat(descriptor)
+    if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.geteuid()
+            or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)):
+        os.close(descriptor)
+        raise FinalizationError("durable handoff directory changed while opening")
+    return descriptor
+
+
+def _persist_durable_bytes(destination: Path, payload: bytes) -> None:
+    if not destination.is_absolute() or destination.name in {"", ".", ".."}:
+        raise FinalizationError("handoff destination is unsafe")
+    parent_fd = _owned_directory_fd(destination.parent, create=True)
+    temporary_name = f".{destination.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+    temporary_created = False
+    try:
+        try:
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FinalizationError("handoff destination is unsafe")
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+        temporary_created = True
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary_name, destination.name,
+            src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+        )
+        temporary_created = False
+        os.fsync(parent_fd)
+        persisted = os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (not stat.S_ISREG(persisted.st_mode) or persisted.st_uid != os.geteuid()
+                or stat.S_IMODE(persisted.st_mode) != 0o600):
+            raise FinalizationError("durable handoff file is unsafe")
+    except FinalizationError:
+        raise
+    except OSError as error:
+        raise FinalizationError("durable handoff persistence failed") from error
+    finally:
+        if temporary_created:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        os.close(parent_fd)
+
+
+def _persist_durable_json(destination: Path, value: Mapping[str, object]) -> None:
+    _persist_durable_bytes(destination, _canonical(value))
+
+
+def _read_durable_handoff(path: Path) -> dict[str, object]:
+    if not path.is_absolute() or path.name in {"", ".", ".."}:
+        raise FinalizationError("durable operator handoff is unsafe")
+    parent_fd = _owned_directory_fd(path.parent, create=False)
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path.name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            raise FinalizationError("durable operator handoff is unsafe") from error
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            metadata = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o600):
+                raise FinalizationError("durable operator handoff is unsafe")
+            payload = handle.read()
+    finally:
+        os.close(parent_fd)
+    return _json_bytes_object(payload, label="durable operator handoff")
+
+
 def fetch_remote_handoff(*, ssh_target: str, port: int, campaign_root: str, destination: Path) -> dict[str, object]:
     """Fetch only the compact handoff over noninteractive SSH into temp storage."""
     root = _checked_absolute(campaign_root, label="remote campaign root")
@@ -370,12 +507,8 @@ def fetch_remote_handoff(*, ssh_target: str, port: int, campaign_root: str, dest
     except subprocess.TimeoutExpired as error:
         raise FinalizationError("remote handoff fetch timed out") from error
     if result.returncode: raise FinalizationError("remote handoff fetch failed")
-    if destination.exists() or destination.is_symlink(): raise FinalizationError("handoff destination is unsafe")
-    descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(descriptor, "wb", closefd=True) as handle: handle.write(result.stdout); handle.flush(); os.fsync(handle.fileno())
-    try: value = json.loads(result.stdout)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error: raise FinalizationError("remote handoff is not JSON") from error
-    if not isinstance(value, dict): raise FinalizationError("remote handoff is invalid")
+    value = _json_bytes_object(result.stdout, label="remote handoff")
+    _persist_durable_bytes(destination, result.stdout)
     return value
 
 
@@ -431,23 +564,75 @@ class HfFinalizerPublisher:
             entries = module._collect_entries(bundle)
             if module._entry_digest(entries) != provisional["bundle_sha256"]:
                 raise FinalizationError("provisional bundle bytes do not bind handoff")
+            receipt_body = {
+                "schema_version": 1,
+                "kind": "lehome_simple_curriculum_provisional_publication_receipt_v1",
+                "run_id": handoff["run_id"],
+                "round_id": handoff["round_id"],
+                "repository": self.repository,
+                "remote_prefix": prefix,
+                "immutable_revision": revision,
+                "entry_count": len(entries),
+                "entries": [
+                    {
+                        "relative_path": entry.relative_path,
+                        "sha256": entry.sha256,
+                        "byte_size": entry.byte_size,
+                    }
+                    for entry in entries
+                ],
+                "bundle_sha256": module._entry_digest(entries),
+                "manifest_sha256": provisional["manifest_sha256"],
+                "readback_verified": True,
+                "public_readback_verified": True,
+            }
+            if _digest(receipt_body) != provisional["receipt_sha256"]:
+                raise FinalizationError("provisional receipt does not bind verified bundle")
             manifest = _json_object(root / files[0], label="provisional evidence manifest")
             if hashlib.sha256(_canonical(manifest)).hexdigest() != provisional["manifest_sha256"]:
                 raise FinalizationError("provisional manifest bytes do not bind handoff")
-            if (manifest.get("run_id") != handoff.get("run_id") or manifest.get("round_id") != handoff.get("round_id")
-                    or manifest.get("instance_id") != EXACT_INSTANCE_ID or manifest.get("completion_claim") != "none"
+            manifest_fields = {
+                "schema_version", "kind", "run_id", "round_id", "instance_id", "campaign_root",
+                "terminal_outcome", "reachable_stages", "stage_receipts", "terminal_chain_head",
+                "first_100_receipt_sha256", "task6_validation_sha256",
+                "hub_artifact_references_sha256", "completion_claim", "gpu_stop_verified",
+            }
+            if (set(manifest) != manifest_fields
+                    or manifest.get("schema_version") != 1
+                    or manifest.get("kind") != "lehome_simple_curriculum_provisional_evidence_manifest_v1"
+                    or manifest.get("run_id") != handoff.get("run_id") or manifest.get("round_id") != handoff.get("round_id")
+                    or manifest.get("instance_id") != EXACT_INSTANCE_ID
+                    or manifest.get("campaign_root") != f"/mnt/lehome/eval/{handoff['run_id']}"
+                    or manifest.get("terminal_outcome") != handoff.get("terminal_outcome")
+                    or manifest.get("reachable_stages") != list(stages)
+                    or manifest.get("completion_claim") != "none"
                     or manifest.get("gpu_stop_verified") is not False):
                 raise FinalizationError("provisional manifest identity is invalid")
             listed = manifest.get("stage_receipts")
-            if not isinstance(listed, list) or [item.get("stage") for item in listed if isinstance(item, Mapping)] != list(stages):
+            if not isinstance(listed, list) or len(listed) != len(stages):
                 raise FinalizationError("provisional stage chain is invalid")
             predecessor: str | None = None
             identity: object | None = None
-            for item in listed:
-                if not isinstance(item, Mapping): raise FinalizationError("provisional stage chain is invalid")
+            handoff_evidence = handoff.get("evidence")
+            if not isinstance(handoff_evidence, list) or len(handoff_evidence) != len(stages):
+                raise FinalizationError("provisional stage chain is invalid")
+            for index, item in enumerate(listed):
+                if not isinstance(item, Mapping) or set(item) != {
+                    "stage", "receipt_sha256", "file_sha256", "predecessor_receipt_sha256",
+                }:
+                    raise FinalizationError("provisional stage chain is invalid")
+                handoff_item = handoff_evidence[index]
+                if (not isinstance(handoff_item, Mapping)
+                        or item.get("stage") != stages[index]
+                        or item.get("stage") != handoff_item.get("stage")
+                        or item.get("receipt_sha256") != handoff_item.get("receipt_sha256")
+                        or item.get("file_sha256") != handoff_item.get("file_sha256")
+                        or item.get("predecessor_receipt_sha256") != predecessor):
+                    raise FinalizationError("provisional stage chain does not bind handoff")
                 receipt = _json_object(root / f"manifests/provisional/stage-receipts/{item['stage']}.json", label="provisional receipt")
                 unsigned = dict(receipt); claimed = unsigned.pop("receipt_sha256", None)
                 if (claimed != _digest(unsigned) or claimed != item.get("receipt_sha256")
+                        or receipt.get("stage") != item.get("stage")
                         or receipt.get("predecessor_receipt_sha256") != predecessor
                         or item.get("predecessor_receipt_sha256") != predecessor
                         or hashlib.sha256(_canonical(receipt)).hexdigest() != item.get("file_sha256")
@@ -455,28 +640,92 @@ class HfFinalizerPublisher:
                     raise FinalizationError("provisional receipt chain is invalid")
                 if identity is None: identity = receipt["runtime_identity"]
                 elif identity != receipt["runtime_identity"]: raise FinalizationError("provisional receipt identity diverged")
+                if receipt["runtime_identity"] != handoff.get("runtime_identity"):
+                    raise FinalizationError("provisional receipt identity does not bind handoff")
                 predecessor = claimed
+            observed_first = next(
+                (
+                    item.get("receipt_sha256")
+                    for item in listed
+                    if isinstance(item, Mapping) and item.get("stage") == "first-100-gate"
+                ),
+                None,
+            )
+            expected_first = handoff.get("first_100_receipt_sha256")
+            if (manifest.get("terminal_chain_head") != predecessor
+                    or predecessor != handoff.get("predecessor_receipt_sha256")
+                    or manifest.get("first_100_receipt_sha256") != observed_first
+                    or observed_first != expected_first):
+                raise FinalizationError("provisional terminal chain does not bind handoff")
             task6 = _json_object(root / files[1], label="provisional Task-6 validation")
             references = _json_object(root / files[2], label="provisional Hub references")
             if (hashlib.sha256(_canonical(task6)).hexdigest() != manifest.get("task6_validation_sha256")
                     or hashlib.sha256(_canonical(references)).hexdigest() != manifest.get("hub_artifact_references_sha256")):
                 raise FinalizationError("provisional validation hashes are invalid")
-            if handoff.get("terminal_outcome") == "complete":
+            outcome = handoff.get("terminal_outcome")
+            common_task6 = {
+                "schema_version", "kind", "terminal_outcome", "result",
+            }
+            if (task6.get("schema_version") != 1
+                    or task6.get("kind") != "lehome_simple_curriculum_task6_validation_v1"
+                    or task6.get("terminal_outcome") != outcome):
+                raise FinalizationError("provisional Task-6 identity is invalid")
+            if (set(references) != {"schema_version", "kind", "fresh", "success_replay"}
+                    or references.get("schema_version") != 1
+                    or references.get("kind") != "lehome_simple_curriculum_hub_artifact_references_v1"):
+                raise FinalizationError("provisional Hub references are malformed")
+            fresh, replay = references.get("fresh"), references.get("success_replay")
+            if not isinstance(fresh, list) or not isinstance(replay, list):
+                raise FinalizationError("provisional Hub references are malformed")
+
+            identities: set[str] = set()
+            prefixes: set[str] = set()
+            reference_fields = {
+                "attempt_id", "repository", "prefix", "immutable_revision",
+                "episode_sha256", "local_sync_receipt_sha256",
+            }
+            for source, source_round, values in (
+                ("fresh", str(handoff["round_id"]), fresh),
+                ("success_replay", f"{handoff['round_id']}-replay", replay),
+            ):
+                for reference in values:
+                    if not isinstance(reference, Mapping) or set(reference) != reference_fields:
+                        raise FinalizationError("provisional Hub reference is invalid")
+                    attempt_id = reference.get("attempt_id")
+                    expected_prefix = f"rollout-rounds/{source_round}/{attempt_id}"
+                    if (not isinstance(attempt_id, str)
+                            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", attempt_id) is None
+                            or attempt_id in identities or reference.get("prefix") in prefixes
+                            or reference.get("repository") != self.repository
+                            or reference.get("prefix") != expected_prefix
+                            or not _hex(reference.get("immutable_revision"), 40)
+                            or not _hex(reference.get("episode_sha256"), 64)
+                            or not _hex(reference.get("local_sync_receipt_sha256"), 64)):
+                        raise FinalizationError(f"provisional {source} Hub reference is invalid")
+                    identities.add(attempt_id); prefixes.add(expected_prefix)
+
+            if outcome == "complete":
                 expected_counts = {"fresh_valid_outcomes": 1000, "replay_attempts": 400, "replay_accepted_successes": 200,
                                    "replay_accepted_by_category": {"pant_long": 50, "pant_short": 50, "top_long": 50, "top_short": 50}}
-                if task6.get("result") != "complete" or any(task6.get(key) != value for key, value in expected_counts.items()):
+                complete_fields = common_task6 | {
+                    "fresh_valid_outcomes", "fresh_official_successes", "replay_attempts",
+                    "replay_accepted_successes", "replay_accepted_by_category",
+                }
+                if (set(task6) != complete_fields or task6.get("result") != "complete"
+                        or type(task6.get("fresh_official_successes")) is not int
+                        or not 0 <= task6["fresh_official_successes"] <= 1000
+                        or any(task6.get(key) != value for key, value in expected_counts.items())):
                     raise FinalizationError("provisional Task-6 caps are invalid")
-                fresh, replay = references.get("fresh"), references.get("success_replay")
-                if not isinstance(fresh, list) or not isinstance(replay, list) or len(fresh) != 1000 or len(replay) != 200:
+                if len(fresh) != 1000 or len(replay) != 200:
                     raise FinalizationError("provisional Hub-reference closure is invalid")
-                for reference in (*fresh, *replay):
-                    if (not isinstance(reference, Mapping) or reference.get("repository") != self.repository
-                            or not isinstance(reference.get("prefix"), str) or not _hex(reference.get("immutable_revision"), 40)
-                            or not _hex(reference.get("episode_sha256"), 64) or not _hex(reference.get("local_sync_receipt_sha256"), 64)):
-                        raise FinalizationError("provisional Hub reference is invalid")
             else:
-                fresh, replay = references.get("fresh"), references.get("success_replay")
-                if (not isinstance(fresh, list) or not isinstance(replay, list)
+                noncomplete_fields = common_task6 | {
+                    "fresh_reference_count", "replay_accepted_reference_count",
+                }
+                if (set(task6) != noncomplete_fields or task6.get("result") != "not_complete"
+                        or type(task6.get("fresh_reference_count")) is not int
+                        or type(task6.get("replay_accepted_reference_count")) is not int
+                        or task6["fresh_reference_count"] < 0 or task6["replay_accepted_reference_count"] < 0
                         or task6.get("fresh_reference_count") != len(fresh)
                         or task6.get("replay_accepted_reference_count") != len(replay)):
                     raise FinalizationError("provisional non-complete evidence is invalid")
@@ -619,7 +868,44 @@ class HfFinalizerPublisher:
             return {"immutable_revision": head, "readback_verified": True, "public_readback_verified": True}
         if set(present) != evidence_names:
             raise FinalizationError("immutable finalization prefix collision")
-        revision = transport.upload_files(repository=self.repository, revision="main", source=root, entries=(entry,), token=token, remote_prefix=evidence.remote_prefix, parent_commit=head)
+        try:
+            revision = transport.upload_files(
+                repository=self.repository, revision="main", source=root,
+                entries=(entry,), token=token, remote_prefix=evidence.remote_prefix,
+                parent_commit=head,
+            )
+        except Exception as _upload_error:
+            # The server may have committed the one immutable receipt before
+            # the response was lost.  Reconcile that exact tree now; never
+            # issue a second mutable upload from this call.
+            try:
+                reconciled_head = transport.resolve_approved_ref(
+                    repository=self.repository, ref="main", token=token,
+                )
+                reconciled = module._tree_files(
+                    transport.list_tree(
+                        repository=self.repository, revision=reconciled_head,
+                        token=token, remote_prefix=evidence.remote_prefix,
+                    ),
+                    prefix=evidence.remote_prefix,
+                )
+                if set(reconciled) != evidence_names | {final_name}:
+                    raise FinalizationError("ambiguous final receipt upload did not produce the exact tree")
+                self._stage_and_validate_remote_receipt(
+                    module=module, transport=transport, root=root,
+                    prefix=evidence.remote_prefix, revision=reconciled_head,
+                    token=token, handoff=handoff, seal=seal,
+                    evidence_files=files,
+                )
+                return {
+                    "immutable_revision": reconciled_head,
+                    "readback_verified": True,
+                    "public_readback_verified": True,
+                }
+            except FinalizationError:
+                raise
+            except Exception as reconcile_error:
+                raise FinalizationError("ambiguous final receipt upload reconciliation failed") from reconcile_error
         all_entries = tuple(evidence.entries) + (entry,)
         for auth in (token, None): module._verify_download(transport=transport, bundle=bundle, revision=revision, prefix=evidence.remote_prefix, entries=all_entries, token=auth)
         return {"immutable_revision": revision, "readback_verified": True, "public_readback_verified": True}
@@ -669,9 +955,8 @@ def main(argv: list[str] | None = None) -> int:
             raise FinalizationError("normal finalization requires complete operator metadata")
         durable_handoff = _durable_handoff_path(args.run_id)
         if durable_handoff.exists() or durable_handoff.is_symlink():
-            handoff = _json_object(durable_handoff, label="durable operator handoff")
+            handoff = _read_durable_handoff(durable_handoff)
         else:
-            durable_handoff.parent.mkdir(parents=True, exist_ok=True)
             handoff = fetch_remote_handoff(
                 ssh_target=args.ssh_target, port=args.ssh_port,
                 campaign_root=args.remote_campaign_root, destination=durable_handoff,

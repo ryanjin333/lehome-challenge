@@ -50,6 +50,11 @@ LEHOME_OPERATOR_SSH_PORT="${LEHOME_OPERATOR_SSH_PORT:-22}"
 [[ "$LEHOME_OPERATOR_SSH_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( LEHOME_OPERATOR_SSH_PORT <= 65535 )) || reject "invalid operator SSH port"
 LEHOME_OPERATOR_STOP_TIMEOUT_SECONDS="${LEHOME_OPERATOR_STOP_TIMEOUT_SECONDS:-300}"
 [[ "$LEHOME_OPERATOR_STOP_TIMEOUT_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v value="$LEHOME_OPERATOR_STOP_TIMEOUT_SECONDS" 'BEGIN { exit !(value > 0 && value <= 600) }' || reject "invalid stop timeout"
+# The remote controller itself is capped at 86,399 seconds.  Give SSH one
+# bounded minute of teardown margin, while keeping the local EXIT finalizer
+# reachable even if an established session remains alive but never returns.
+LEHOME_OPERATOR_SSH_SESSION_TIMEOUT_SECONDS="${LEHOME_OPERATOR_SSH_SESSION_TIMEOUT_SECONDS:-86460}"
+[[ "$LEHOME_OPERATOR_SSH_SESSION_TIMEOUT_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v value="$LEHOME_OPERATOR_SSH_SESSION_TIMEOUT_SECONDS" 'BEGIN { exit !(value > 0 && value <= 86520) }' || reject "invalid SSH session timeout"
 test -f "$LEHOME_OPERATOR_HF_TOKEN_FILE" || reject "operator HF token file is unavailable"
 test ! -L "$LEHOME_OPERATOR_HF_TOKEN_FILE" || reject "operator HF token file must not be a symlink"
 test -s "$LEHOME_OPERATOR_HF_TOKEN_FILE" || reject "operator HF token file is empty"
@@ -84,7 +89,21 @@ exec sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/b
   LEHOME_SPEND_OBSERVER=/mnt/lehome/operator/spend-observation.json \
   "$host/rollout_appliance/run_simple_curriculum_collection.sh"
 SH
-if ! printf '%s\n' "$REMOTE_SCRIPT" | ssh -o ClearAllForwardings=yes -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+if ! printf '%s\n' "$REMOTE_SCRIPT" | python3 -c '
+import subprocess
+import sys
+
+try:
+    completed = subprocess.run(
+        sys.argv[2:], stdin=sys.stdin.buffer, check=False,
+        timeout=float(sys.argv[1]),
+    )
+except subprocess.TimeoutExpired:
+    raise SystemExit(124)
+raise SystemExit(completed.returncode)
+' "$LEHOME_OPERATOR_SSH_SESSION_TIMEOUT_SECONDS" \
+  ssh -o ClearAllForwardings=yes -o BatchMode=yes -o IdentitiesOnly=yes \
+  -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
   -p "$LEHOME_OPERATOR_SSH_PORT" -- "$LEHOME_OPERATOR_SSH_TARGET" sh -s -- \
   "$LEHOME_OPERATOR_REVIEWED_REVISION" "$LEHOME_OPERATOR_RUN_ID" "$LEHOME_OPERATOR_ROUND_ID" "$LEHOME_OPERATOR_CAMPAIGN_ROOT"; then
   controller_status=1

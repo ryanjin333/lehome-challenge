@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -122,3 +123,43 @@ def test_controller_help_imports_under_clean_environment() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "--campaign-root" in result.stdout
+
+
+def test_operator_wrapper_bounds_established_ssh_session_before_exit_finalizer() -> None:
+    wrapper = (ROOT / "scripts" / "run_simple_curriculum_with_finalizer.sh").read_text(encoding="utf-8")
+
+    assert "ServerAliveInterval=" in wrapper
+    assert "ServerAliveCountMax=" in wrapper
+    assert "LEHOME_OPERATOR_SSH_SESSION_TIMEOUT_SECONDS" in wrapper
+    assert "subprocess.run" in wrapper and "timeout=" in wrapper
+
+
+def test_operator_wrapper_session_deadline_reaches_exit_finalizer(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir(); log = tmp_path / "log"
+    for name, body in {
+        "stat": "case \"$1:$2\" in -f:%u) /usr/bin/id -u;; -f:%Lp) echo 600;; *) exit 9;; esac",
+        "uv": f"echo finalizer >> {log}; exit 0",
+        "ssh": "sleep 10",
+    }.items():
+        executable = fake_bin / name
+        executable.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
+        executable.chmod(0o755)
+    token = tmp_path / "token"; token.write_text("token", encoding="utf-8")
+    run_id = "fresh-run-20260828123456-timeout"; round_id = "fresh-12k-20260828123456-timeout"
+    started = time.monotonic()
+    result = subprocess.run(
+        (
+            "env", "-i", f"PATH={fake_bin}:/usr/bin:/bin",
+            "LEHOME_OPERATOR_SSH_TARGET=operator@host",
+            f"LEHOME_OPERATOR_CAMPAIGN_ROOT=/mnt/lehome/eval/{run_id}",
+            f"LEHOME_OPERATOR_RUN_ID={run_id}", f"LEHOME_OPERATOR_ROUND_ID={round_id}",
+            f"LEHOME_OPERATOR_REVIEWED_REVISION={'a' * 40}",
+            f"LEHOME_OPERATOR_HF_TOKEN_FILE={token}",
+            "LEHOME_OPERATOR_SSH_SESSION_TIMEOUT_SECONDS=0.1",
+            "/bin/bash", str(ROOT / "scripts/run_simple_curriculum_with_finalizer.sh"),
+        ),
+        text=True, capture_output=True, timeout=5,
+    )
+    assert result.returncode == 1
+    assert time.monotonic() - started < 3
+    assert log.read_text(encoding="utf-8").splitlines() == ["finalizer"]
