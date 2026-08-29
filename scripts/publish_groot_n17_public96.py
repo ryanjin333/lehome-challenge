@@ -31,6 +31,7 @@ _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,511}$")
 _MANIFEST = "SHA256SUMS.json"
 _REPOSITORY = "ryanjin333/lehome-groot-n17-rollouts"
+_RFC3339_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 class Public96PublicationError(RuntimeError):
@@ -40,6 +41,13 @@ class Public96PublicationError(RuntimeError):
 @dataclass(frozen=True)
 class PublicationEntry:
     relative_path: str
+    sha256: str
+    byte_size: int
+
+
+@dataclass(frozen=True)
+class _ArtifactSnapshot:
+    contents: bytes
     sha256: str
     byte_size: int
 
@@ -135,70 +143,110 @@ def _read_descriptor(root: Path, relative: str) -> tuple[bytes, str, int]:
         os.close(fd)
 
 
-def _json_descriptor(root: Path, relative: str, label: str) -> tuple[dict[str, object], str]:
-    contents, digest, _ = _read_descriptor(root, relative)
+def _json_descriptor(root: Path, relative: str, label: str) -> tuple[dict[str, object], _ArtifactSnapshot]:
+    contents, digest, size = _read_descriptor(root, relative)
     try:
         value = json.loads(contents.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
         raise Public96PublicationError(f"{label} is invalid JSON") from error
     if not isinstance(value, dict):
         raise Public96PublicationError(f"{label} must be an object")
-    return value, digest
+    return value, _ArtifactSnapshot(contents, digest, size)
 
 
 def load_token(token_file: Path) -> str:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if type(no_follow) is not int or not no_follow:
+        raise Public96PublicationError("HF token file is unavailable")
     try:
-        metadata = token_file.lstat()
+        descriptor = os.open(token_file, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow)
     except OSError:
         raise Public96PublicationError("HF token file is unavailable") from None
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077 or metadata.st_uid != os.geteuid():
-        raise Public96PublicationError("HF token file must be owner-only and regular")
     try:
-        token = token_file.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o077 or before.st_uid != os.geteuid() or not 1 <= before.st_size <= 64 * 1024:
+            raise Public96PublicationError("HF token file must be owner-only and regular")
+        with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
+            raw = handle.read((64 * 1024) + 1)
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size) or len(raw) != before.st_size:
+            raise Public96PublicationError("HF token file changed while being read")
+        token = raw.decode("utf-8").strip()
+    except UnicodeError:
         raise Public96PublicationError("HF token file is unreadable") from None
+    finally:
+        os.close(descriptor)
     if not token or any(character.isspace() for character in token):
         raise Public96PublicationError("HF token is unavailable")
     return token
 
 
-def _artifact_matches(root: Path, descriptor: object, expected: str, label: str) -> str:
+def _artifact_matches(root: Path, descriptor: object, expected: str, label: str) -> _ArtifactSnapshot:
     if not isinstance(descriptor, Mapping) or set(descriptor) != {"relative_path", "sha256"}:
         raise Public96PublicationError(f"{label} descriptor is invalid")
     if descriptor.get("relative_path") != expected or not isinstance(descriptor.get("sha256"), str):
         raise Public96PublicationError(f"{label} descriptor does not bind the expected artifact")
-    _, actual, _ = _read_descriptor(root, expected)
+    contents, actual, size = _read_descriptor(root, expected)
     if descriptor["sha256"] != actual:
         raise Public96PublicationError(f"{label} descriptor digest mismatch")
-    return actual
+    return _ArtifactSnapshot(contents, actual, size)
 
 
-def _verify_verifier_receipt(root: Path, result: Mapping[str, object], result_sha256: str, matrix_sha256: str) -> str:
-    receipt, receipt_sha256 = _json_descriptor(root, "verifier-receipt.json", "verifier receipt")
+def _verify_readiness_snapshot(root: Path, result: Mapping[str, object], snapshot: _ArtifactSnapshot) -> None:
+    """Rebind readiness to a result-descriptor-verified stage receipt."""
+    episodes = result.get("episodes")
+    if not isinstance(episodes, list) or not episodes:
+        raise Public96PublicationError("result episode artifacts are invalid")
+    artifacts = episodes[0].get("artifacts") if isinstance(episodes[0], Mapping) else None
+    receipt_descriptor = artifacts.get("receipt") if isinstance(artifacts, Mapping) else None
+    if not isinstance(receipt_descriptor, Mapping) or not isinstance(receipt_descriptor.get("relative_path"), str):
+        raise Public96PublicationError("result stage artifact descriptor is invalid")
+    relative = str(receipt_descriptor["relative_path"])
+    receipt_snapshot = _entry_from_descriptor(root, relative, receipt_descriptor)
+    try:
+        stage_receipt = json.loads(receipt_snapshot.contents.decode("utf-8"))
+        readiness = stage_receipt["policy_server_readiness"]["artifact"]
+    except (UnicodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise Public96PublicationError("stage receipt readiness binding is invalid") from error
+    if not isinstance(readiness, Mapping) or readiness.get("relative_path") != "policy-server-readiness.json" or readiness.get("sha256") != snapshot.sha256:
+        raise Public96PublicationError("stage receipt readiness binding changed")
+
+
+def _verify_verifier_receipt(root: Path, result: Mapping[str, object], result_sha256: str, matrix_sha256: str) -> tuple[str, dict[str, _ArtifactSnapshot]]:
+    receipt, receipt_snapshot = _json_descriptor(root, "verifier-receipt.json", "verifier receipt")
     required = {"kind", "result", "policy_server_log", "summary", "matrix_sha256", "checkpoint", "raw_checker_overlay", "publication"}
     if set(receipt) != required or receipt.get("kind") != "lehome_groot_n17_public96_verifier_receipt_v1":
         raise Public96PublicationError("verifier receipt schema is invalid")
-    if _artifact_matches(root, receipt.get("result"), "result.json", "verifier receipt result") != result_sha256:
+    result_snapshot = _artifact_matches(root, receipt.get("result"), "result.json", "verifier receipt result")
+    if result_snapshot.sha256 != result_sha256:
         raise Public96PublicationError("verifier receipt result digest mismatch")
-    _artifact_matches(root, receipt.get("policy_server_log"), "policy-server.log", "verifier receipt policy log")
+    log_snapshot = _artifact_matches(root, receipt.get("policy_server_log"), "policy-server.log", "verifier receipt policy log")
     for field in ("summary", "matrix_sha256", "checkpoint", "raw_checker_overlay", "publication"):
         if receipt.get(field) != result.get(field):
             raise Public96PublicationError("verifier receipt does not bind the current result")
     if receipt["matrix_sha256"] != matrix_sha256:
         raise Public96PublicationError("verifier receipt matrix digest mismatch")
-    return receipt_sha256
+    readiness_contents, readiness_sha256, readiness_size = _read_descriptor(root, "policy-server-readiness.json")
+    readiness_snapshot = _ArtifactSnapshot(readiness_contents, readiness_sha256, readiness_size)
+    _verify_readiness_snapshot(root, result, readiness_snapshot)
+    return receipt_snapshot.sha256, {
+        "result.json": result_snapshot,
+        "verifier-receipt.json": receipt_snapshot,
+        "policy-server-readiness.json": readiness_snapshot,
+        "policy-server.log": log_snapshot,
+    }
 
 
-def _entry_from_descriptor(root: Path, relative: str, descriptor: object) -> PublicationEntry:
+def _entry_from_descriptor(root: Path, relative: str, descriptor: object) -> _ArtifactSnapshot:
     if not isinstance(descriptor, Mapping) or set(descriptor) != {"relative_path", "sha256"} or descriptor.get("relative_path") != relative:
         raise Public96PublicationError("result artifact descriptor is invalid")
-    _, digest, size = _read_descriptor(root, relative)
+    contents, digest, size = _read_descriptor(root, relative)
     if descriptor.get("sha256") != digest:
         raise Public96PublicationError("result artifact descriptor digest mismatch")
-    return PublicationEntry(relative, digest, size)
+    return _ArtifactSnapshot(contents, digest, size)
 
 
-def _collect_entries(root: Path, result: Mapping[str, object]) -> tuple[PublicationEntry, ...]:
+def _collect_entries(root: Path, result: Mapping[str, object], root_snapshots: Mapping[str, _ArtifactSnapshot]) -> tuple[PublicationEntry, ...]:
     entries: dict[str, PublicationEntry] = {}
 
     def add(entry: PublicationEntry) -> None:
@@ -207,8 +255,13 @@ def _collect_entries(root: Path, result: Mapping[str, object]) -> tuple[Publicat
             raise Public96PublicationError("duplicate result artifact paths disagree")
 
     for relative in ("result.json", "verifier-receipt.json", "policy-server-readiness.json", "policy-server.log"):
+        expected = root_snapshots.get(relative)
+        if expected is None:
+            raise Public96PublicationError("verified root artifact snapshot is missing")
         _, digest, size = _read_descriptor(root, relative)
-        add(PublicationEntry(relative, digest, size))
+        if (digest, size) != (expected.sha256, expected.byte_size):
+            raise Public96PublicationError("verified root artifact changed before staging")
+        add(PublicationEntry(relative, expected.sha256, expected.byte_size))
     episodes = result.get("episodes")
     if not isinstance(episodes, list) or len(episodes) != 96:
         raise Public96PublicationError("result does not contain exactly 96 episodes")
@@ -221,14 +274,14 @@ def _collect_entries(root: Path, result: Mapping[str, object]) -> tuple[Publicat
             descriptor = artifacts.get(key)
             if not isinstance(descriptor, Mapping) or not isinstance(descriptor.get("relative_path"), str):
                 raise Public96PublicationError("result stage artifact descriptor is invalid")
-            relative = str(descriptor["relative_path"]); seen.add(relative); add(_entry_from_descriptor(root, relative, descriptor))
+            relative = str(descriptor["relative_path"]); seen.add(relative); snapshot = _entry_from_descriptor(root, relative, descriptor); add(PublicationEntry(relative, snapshot.sha256, snapshot.byte_size))
         videos_map = artifacts.get("videos")
         if not isinstance(videos_map, Mapping) or set(videos_map) != {"top_rgb", "left_rgb", "right_rgb"}:
             raise Public96PublicationError("result video artifact descriptors are invalid")
         for descriptor in videos_map.values():
             if not isinstance(descriptor, Mapping) or not isinstance(descriptor.get("relative_path"), str):
                 raise Public96PublicationError("result video artifact descriptor is invalid")
-            relative = str(descriptor["relative_path"]); videos.add(relative); add(_entry_from_descriptor(root, relative, descriptor))
+            relative = str(descriptor["relative_path"]); videos.add(relative); snapshot = _entry_from_descriptor(root, relative, descriptor); add(PublicationEntry(relative, snapshot.sha256, snapshot.byte_size))
     if len(stage_logs) != 48 or len(stage_receipts) != 48 or len(videos) != 288 or len(entries) != 388:
         raise Public96PublicationError("public96 allowlist does not contain exactly 48 stages and 288 videos")
     return tuple(sorted(entries.values(), key=lambda item: item.relative_path))
@@ -238,11 +291,15 @@ def _entry_digest(entries: Sequence[PublicationEntry]) -> str:
     return _digest_bytes(_canonical([{"relative_path": entry.relative_path, "sha256": entry.sha256, "byte_size": entry.byte_size} for entry in entries]))
 
 
-def _stage(root: Path, entries: Sequence[PublicationEntry]) -> tuple[Path, tuple[PublicationEntry, ...], str]:
+def _stage(root: Path, entries: Sequence[PublicationEntry], root_snapshots: Mapping[str, _ArtifactSnapshot]) -> tuple[Path, tuple[PublicationEntry, ...], str]:
     staging = Path(tempfile.mkdtemp(prefix="lehome-public96-stage-", dir=root.parent))
     try:
         for entry in entries:
-            contents, digest, size = _read_descriptor(root, entry.relative_path)
+            snapshot = root_snapshots.get(entry.relative_path)
+            if snapshot is None:
+                contents, digest, size = _read_descriptor(root, entry.relative_path)
+            else:
+                contents, digest, size = snapshot.contents, snapshot.sha256, snapshot.byte_size
             if (digest, size) != (entry.sha256, entry.byte_size):
                 raise Public96PublicationError("publication source changed after validation")
             target = staging / entry.relative_path; target.parent.mkdir(parents=True, exist_ok=True)
@@ -290,12 +347,46 @@ def _verify_download(transport, *, repository: str, revision: str, prefix: str, 
 
 
 def _write_or_validate_receipt(path: Path, payload: Mapping[str, object]) -> None:
+    required = {
+        "schema_version", "kind", "repository", "mutable_ref", "remote_prefix", "immutable_revision",
+        "matrix_sha256", "result_sha256", "verifier_receipt_sha256", "manifest_sha256", "entry_count",
+        "tree_sha256", "authenticated_readback_verified", "anonymous_readback_verified", "published_at_utc",
+    }
+
+    def valid(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != required:
+            return False
+        if value.get("schema_version") != 1 or type(value.get("schema_version")) is not int or value.get("kind") != "lehome_groot_n17_public96_publication_receipt_v1":
+            return False
+        if not all(isinstance(value.get(field), str) and value[field] for field in ("repository", "mutable_ref", "remote_prefix")):
+            return False
+        if not re.fullmatch(r"public96/results/[0-9a-f]{16}-[0-9a-f]{16}", str(value.get("remote_prefix"))):
+            return False
+        if not isinstance(value.get("immutable_revision"), str) or _COMMIT.fullmatch(value["immutable_revision"]) is None:
+            return False
+        if any(not isinstance(value.get(field), str) or _HEX.fullmatch(value[field]) is None for field in ("matrix_sha256", "result_sha256", "verifier_receipt_sha256", "manifest_sha256", "tree_sha256")):
+            return False
+        if type(value.get("entry_count")) is not int or value["entry_count"] < 1:
+            return False
+        if value.get("authenticated_readback_verified") is not True or value.get("anonymous_readback_verified") is not True:
+            return False
+        timestamp = value.get("published_at_utc")
+        if not isinstance(timestamp, str) or _RFC3339_UTC.fullmatch(timestamp) is None:
+            return False
+        try:
+            datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            return False
+        return True
+
+    if not valid(payload):
+        raise Public96PublicationError("publication receipt payload is invalid")
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_file(): raise Public96PublicationError("publication receipt already exists or is unsafe")
         try: existing = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error: raise Public96PublicationError("publication receipt already exists or is unsafe") from error
         stable = {key: value for key, value in payload.items() if key != "published_at_utc"}
-        if not isinstance(existing, Mapping) or {key: existing.get(key) for key in stable} != stable or not isinstance(existing.get("published_at_utc"), str):
+        if not valid(existing) or {key: existing.get(key) for key in stable} != stable:
             raise Public96PublicationError("publication receipt already exists and differs")
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -313,7 +404,8 @@ def publish_public96(run_root: Path, *, matrix: Path, matrix_sha256_path: Path, 
     if not isinstance(repository, str) or "/" not in repository or not repository.strip() or not isinstance(ref, str) or not ref or _COMMIT.fullmatch(ref):
         raise Public96PublicationError("publication repository or mutable ref is invalid")
     root = _safe_root(Path(run_root))
-    result, result_sha256 = _json_descriptor(root, "result.json", "result")
+    result, result_snapshot = _json_descriptor(root, "result.json", "result")
+    result_sha256 = result_snapshot.sha256
     try:
         stages = evaluator.load_frozen_matrix(matrix, matrix_sha256_path)
         matrix_digest = evaluator._matrix_digest(matrix, matrix_sha256_path)
@@ -322,27 +414,32 @@ def publish_public96(run_root: Path, *, matrix: Path, matrix_sha256_path: Path, 
         raise Public96PublicationError("result verifier rejected the closed run") from error
     if summary != result.get("summary"):
         raise Public96PublicationError("result verifier summary mismatch")
-    verifier_receipt_sha256 = _verify_verifier_receipt(root, result, result_sha256, matrix_digest)
-    raw_entries = _collect_entries(root, result)
-    staging, entries, manifest_sha256 = _stage(root, raw_entries)
+    verifier_receipt_sha256, root_snapshots = _verify_verifier_receipt(root, result, result_sha256, matrix_digest)
+    raw_entries = _collect_entries(root, result, root_snapshots)
+    staging, entries, manifest_sha256 = _stage(root, raw_entries, root_snapshots)
     prefix = f"public96/results/{matrix_digest[:16]}-{result_sha256[:16]}"
     try:
-        head = transport.resolve_approved_ref(repository=repository, ref=ref, token=token)
-        if not isinstance(head, str) or not _COMMIT.fullmatch(head): raise Public96PublicationError("publication ref did not resolve to an immutable revision")
-        expected = {entry.relative_path for entry in entries}
-        existing = _tree_files(transport.list_tree(repository=repository, revision=head, token=token, remote_prefix=prefix), prefix)
-        if existing and existing != expected: raise Public96PublicationError("immutable public96 prefix collision")
-        if existing:
-            revision = head
-            try: _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=token, staging=staging)
-            except Public96PublicationError as error: raise Public96PublicationError("immutable public96 prefix collision") from error
-        else:
-            revision = transport.upload_files(repository=repository, revision=ref, source=staging, entries=entries, token=token, remote_prefix=prefix, parent_commit=head)
-            if not isinstance(revision, str) or not _COMMIT.fullmatch(revision): raise Public96PublicationError("upload did not return an immutable revision")
-        remote = _tree_files(transport.list_tree(repository=repository, revision=revision, token=token, remote_prefix=prefix), prefix)
-        if remote != expected: raise Public96PublicationError("immutable remote tree does not match the staged allowlist")
-        _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=token, staging=staging)
-        _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=None, staging=staging)
+        try:
+            head = transport.resolve_approved_ref(repository=repository, ref=ref, token=token)
+            if not isinstance(head, str) or not _COMMIT.fullmatch(head): raise Public96PublicationError("publication ref did not resolve to an immutable revision")
+            expected = {entry.relative_path for entry in entries}
+            existing = _tree_files(transport.list_tree(repository=repository, revision=head, token=token, remote_prefix=prefix), prefix)
+            if existing and existing != expected: raise Public96PublicationError("immutable public96 prefix collision")
+            if existing:
+                revision = head
+                try: _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=token, staging=staging)
+                except Public96PublicationError as error: raise Public96PublicationError("immutable public96 prefix collision") from error
+            else:
+                revision = transport.upload_files(repository=repository, revision=ref, source=staging, entries=entries, token=token, remote_prefix=prefix, parent_commit=head)
+                if not isinstance(revision, str) or not _COMMIT.fullmatch(revision): raise Public96PublicationError("upload did not return an immutable revision")
+            remote = _tree_files(transport.list_tree(repository=repository, revision=revision, token=token, remote_prefix=prefix), prefix)
+            if remote != expected: raise Public96PublicationError("immutable remote tree does not match the staged allowlist")
+            _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=token, staging=staging)
+            _verify_download(transport, repository=repository, revision=revision, prefix=prefix, entries=entries, token=None, staging=staging)
+        except Public96PublicationError:
+            raise
+        except Exception as error:
+            raise Public96PublicationError("Hub transport/readback failed") from error
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     tree_sha256 = _entry_digest(entries)
@@ -361,6 +458,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = publish_public96(args.run_root, matrix=args.matrix, matrix_sha256_path=args.matrix_sha256, token=load_token(args.token_file), repository=args.repository, ref=args.ref, receipt_output=args.receipt_output, transport=HuggingFacePublicDatasetTransport())
     except Public96PublicationError as error:
         print(f"public96 publication failed: {error}", file=sys.stderr); return 2
+    except Exception:
+        print("public96 publication failed: transport or dependency error", file=sys.stderr); return 2
     print(json.dumps({"immutable_revision": result.immutable_revision, "remote_prefix": result.remote_prefix, "entry_count": result.entry_count}, sort_keys=True))
     return 0
 

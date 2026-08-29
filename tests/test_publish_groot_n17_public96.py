@@ -135,8 +135,18 @@ def test_publisher_stages_exact_allowlist_manifest_and_two_readbacks(tmp_path: P
 
     assert result.entry_count == 389  # 4 root artifacts + 48 logs + 48 receipts + 288 videos + manifest
     assert result.remote_prefix == f"public96/results/{result.matrix_sha256[:16]}-{result.result_sha256[:16]}"
-    assert "garment-config" not in {entry.relative_path for entry in result.entries}
-    assert "SHA256SUMS.json" in {entry.relative_path for entry in result.entries}
+    published_paths = {entry.relative_path for entry in result.entries}
+    result_body = json.loads((root / "result.json").read_text(encoding="utf-8"))
+    expected_paths = {"result.json", "verifier-receipt.json", "policy-server-readiness.json", "policy-server.log", "SHA256SUMS.json"}
+    expected_paths.update(f"{stage['stage_id']}/stage.log" for stage in result_body["episodes"][::2])
+    expected_paths.update(f"{stage['stage_id']}/stage-receipt.json" for stage in result_body["episodes"][::2])
+    expected_paths.update(
+        descriptor["relative_path"]
+        for episode in result_body["episodes"]
+        for descriptor in episode["artifacts"]["videos"].values()
+    )
+    assert published_paths == expected_paths and len(expected_paths) == 389
+    assert "garment-config" not in published_paths
     assert transport.upload_calls == 1 and transport.authenticated_downloads == 1 and transport.anonymous_downloads == 1
     receipt = json.loads((root / "public96-publication-receipt.json").read_text(encoding="utf-8"))
     assert receipt["immutable_revision"] == COMMIT
@@ -200,15 +210,71 @@ def test_publisher_binds_every_remote_operation_to_returned_immutable_revision(t
     assert transport.download_revisions == [result.immutable_revision, result.immutable_revision]
 
 
-def test_token_file_requires_owner_only_regular_file(tmp_path: Path) -> None:
+def test_publisher_rejects_root_artifact_mutation_after_verification_before_upload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); root = _fixture(module, tmp_path, monkeypatch); transport = Transport()
+    original = module._verify_verifier_receipt
+
+    def mutate_after_receipt(*args, **kwargs):
+        verified = original(*args, **kwargs)
+        (root / "policy-server.log").write_text("mutated after verification\n", encoding="utf-8")
+        return verified
+
+    monkeypatch.setattr(module, "_verify_verifier_receipt", mutate_after_receipt)
+    with pytest.raises(module.Public96PublicationError, match="changed|descriptor"):
+        _publish(module, root, transport)
+    assert transport.upload_calls == 0 and not (root / "public96-publication-receipt.json").exists()
+
+
+def test_token_file_requires_owner_only_regular_file_and_descriptor_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     module = _module(); token = tmp_path / "token"; token.write_text("token", encoding="utf-8"); token.chmod(0o644)
     with pytest.raises(module.Public96PublicationError, match="owner-only"):
         module.load_token(token)
     token.chmod(0o600)
+    monkeypatch.setattr(Path, "read_text", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("token must be read from an opened descriptor")))
     assert module.load_token(token) == "token"
     token.unlink(); token.symlink_to(tmp_path / "replacement")
     with pytest.raises(module.Public96PublicationError, match="owner-only|unavailable"):
         module.load_token(token)
+
+
+def test_token_load_keeps_open_descriptor_when_name_is_replaced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); token = tmp_path / "token"; token.write_text("original", encoding="utf-8"); token.chmod(0o600)
+    replacement = tmp_path / "replacement"; replacement.write_text("replacement", encoding="utf-8"); replacement.chmod(0o600)
+    real_open = module.os.open
+    opened = False
+
+    def open_then_replace(path, flags, *args, **kwargs):
+        nonlocal opened
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == token:
+            opened = True
+            os.replace(replacement, token)
+        return descriptor
+
+    monkeypatch.setattr(module.os, "open", open_then_replace)
+    assert module.load_token(token) == "original" and opened
+
+
+def test_existing_publication_receipt_requires_exact_schema_and_timestamp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module(); root = _fixture(module, tmp_path, monkeypatch); transport = Transport()
+    _publish(module, root, transport)
+    receipt_path = root / "public96-publication-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8")); receipt["unexpected"] = True
+    _write_json(receipt_path, receipt)
+    with pytest.raises(module.Public96PublicationError, match="already exists"):
+        _publish(module, root, transport)
+    receipt.pop("unexpected"); receipt["published_at_utc"] = "not-a-rfc3339-time"
+    _write_json(receipt_path, receipt)
+    with pytest.raises(module.Public96PublicationError, match="already exists"):
+        _publish(module, root, transport)
+
+
+def test_cli_normalizes_transport_or_dependency_exceptions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    module = _module(); token = tmp_path / "token"; token.write_text("secret-token", encoding="utf-8"); token.chmod(0o600)
+    monkeypatch.setattr(module, "publish_public96", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("network secret-token detail")))
+    assert module.main(["--run-root", str(tmp_path), "--matrix", str(MATRIX), "--matrix-sha256", str(MATRIX_SHA256), "--token-file", str(token)]) == 2
+    output = capsys.readouterr()
+    assert output.out == "" and output.err == "public96 publication failed: transport or dependency error\n"
 
 
 def test_publication_receipt_never_overwrites_and_identical_resume_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
