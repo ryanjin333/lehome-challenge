@@ -91,14 +91,14 @@ environment values shown below):
 docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
   --mount type=bind,src=/mnt/lehome,dst=/mnt/lehome \
   --mount type=bind,src="$reviewed_runtime_checkout",dst="$reviewed_runtime_checkout",readonly \
-  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/objects,dst=/mnt/lehome/reference-native/assets/objects,readonly \
-  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/objects,dst="$reviewed_runtime_checkout/Assets/objects",readonly \
-  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/robots,dst=/mnt/lehome/reference-native/assets/robots,readonly \
-  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/robots,dst="$reviewed_runtime_checkout/Assets/robots",readonly \
-  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/scenes,dst=/mnt/lehome/reference-native/assets/scenes,readonly \
-  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/scenes,dst="$reviewed_runtime_checkout/Assets/scenes",readonly \
-  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/textures,dst=/mnt/lehome/reference-native/assets/textures,readonly \
-  --mount type=bind,src=/mnt/lehome/challenge-assets/Assets/textures,dst="$reviewed_runtime_checkout/Assets/textures",readonly \
+  --mount type=bind,src=/mnt/lehome/eval/assets/objects,dst=/mnt/lehome/reference-native/assets/objects,readonly \
+  --mount type=bind,src=/mnt/lehome/eval/assets/objects,dst="$reviewed_runtime_checkout/Assets/objects",readonly \
+  --mount type=bind,src=/mnt/lehome/eval/assets/robots,dst=/mnt/lehome/reference-native/assets/robots,readonly \
+  --mount type=bind,src=/mnt/lehome/eval/assets/robots,dst="$reviewed_runtime_checkout/Assets/robots",readonly \
+  --mount type=bind,src=/mnt/lehome/eval/assets/scenes,dst=/mnt/lehome/reference-native/assets/scenes,readonly \
+  --mount type=bind,src=/mnt/lehome/eval/assets/scenes,dst="$reviewed_runtime_checkout/Assets/scenes",readonly \
+  --mount type=bind,src=/mnt/lehome/eval/assets/textures,dst=/mnt/lehome/reference-native/assets/textures,readonly \
+  --mount type=bind,src=/mnt/lehome/eval/assets/textures,dst="$reviewed_runtime_checkout/Assets/textures",readonly \
   --workdir "$reviewed_runtime_checkout" \
   --env LEHOME_NATIVE_REFERENCE_PYTHON=/opt/lehome-challenge/.venv/bin/python \
   --env LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=/mnt/lehome/reference-native/source \

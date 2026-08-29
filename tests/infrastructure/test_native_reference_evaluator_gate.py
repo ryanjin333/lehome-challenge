@@ -992,6 +992,7 @@ def test_native_gate_runbook_preserves_the_no_collection_admission_boundary() ->
     assert "capture-runtime-image" in text
     assert "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7" in text
     assert "launching by immutable ID" in text
-    assert text.count("/mnt/lehome/challenge-assets/Assets/objects") == 2
+    assert text.count("/mnt/lehome/eval/assets/objects") == 2
+    assert "/mnt/lehome/challenge-assets/Assets" not in text
     assert "LEHOME_NATIVE_REFERENCE_RUNTIME_IMAGE_RECEIPT" in text
     assert "Do not build or pull an image" in text
