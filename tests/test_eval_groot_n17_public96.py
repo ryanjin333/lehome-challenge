@@ -20,6 +20,8 @@ from scripts.eval_groot_n17_public96 import (
     validate_checkpoint_identity,
     validate_output_path,
     verify_result,
+    video_filename_for_key,
+    _summary_from_episodes,
 )
 from scripts.groot_n17_public96_raw_checker import (
     RAW_CHECKER_OVERLAY_ID,
@@ -105,8 +107,9 @@ def _assert_pre_stage_invalid_evidence(output_root: Path, identity: dict[str, ob
     assert result["raw_checker_overlay"] == {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()}
     assert result["status"] == "invalid"
     assert result["failure_reason"] == reason
-    assert result["summary"] == {"status": "invalid", "assigned_episodes": 96, "invalid_episodes": 96}
-    assert not {"overall", "categories", "success_rate", "scored_episodes"} & set(result["summary"])
+    assert result["summary"] == _summary_from_episodes(result["episodes"], assigned_episodes=96, status="invalid")
+    assert result["summary"]["overall"]["scored_episodes"] == 0
+    assert result["summary"]["overall"]["success_rate"] is None
     assert result["publication"] == {"status": "not_attempted", "vm_stop": "not_attempted"}
     assert result["invalid_stages"] == [{"stage_id": stage.stage_id, "reason": reason} for stage in stages]
     assert result["episodes"] == [
@@ -135,6 +138,7 @@ def _assert_pre_stage_invalid_evidence(output_root: Path, identity: dict[str, ob
     assert receipt["matrix_sha256"] == result["matrix_sha256"]
     assert receipt["checkpoint"] == identity
     assert receipt["raw_checker_overlay"] == result["raw_checker_overlay"]
+    assert receipt["summary"] == result["summary"]
     assert receipt["publication"] == {"status": "not_attempted", "vm_stop": "not_attempted"}
     assert receipt["result"] == {"relative_path": "result.json", "sha256": hashlib.sha256(result_path.read_bytes()).hexdigest()}
     assert receipt["policy_server_log"] == {"relative_path": "policy-server.log", "sha256": hashlib.sha256(server_log.read_bytes()).hexdigest()}
@@ -170,7 +174,7 @@ def _outcomes(stages: tuple[object, ...], root: Path, policy_root: Path) -> list
             directory = stage_root / "videos" / ("success" if episode_index == 1 else "failure")
             directory.mkdir(parents=True, exist_ok=True)
             for camera in ("top_rgb", "left_rgb", "right_rgb"):
-                video = directory / f"episode{episode_index - 1}_observation_{camera}.mp4"
+                video = directory / f"episode{episode_index - 1}_observation_images_{camera}.mp4"
                 video.write_bytes(f"{stage.stage_id}:{episode_index}:{camera}".encode())
                 videos[camera] = {"relative_path": video.relative_to(root).as_posix(), "sha256": hashlib.sha256(video.read_bytes()).hexdigest()}
             stage_entries.append((episode_index, videos))
@@ -209,12 +213,13 @@ def _outcomes(stages: tuple[object, ...], root: Path, policy_root: Path) -> list
 
 
 def _valid_result(stages: tuple[object, ...], root: Path, policy_root: Path) -> dict[str, object]:
+    episodes = _outcomes(stages, root, policy_root)
     return {
         "kind": "lehome_groot_n17_public96_result_v1", "matrix_sha256": hashlib.sha256(MATRIX.read_bytes()).hexdigest(),
         "checkpoint": _result_identity(policy_root), "raw_checker_overlay": {"id": RAW_CHECKER_OVERLAY_ID, "sha256": overlay_sha256()},
-        "episodes": _outcomes(stages, root, policy_root), "invalid_stages": [],
+        "episodes": episodes, "invalid_stages": [],
         "publication": {"status": "not_attempted", "vm_stop": "not_attempted"}, "status": "valid",
-        "summary": {"overall": {"episodes": 96, "successes": 48, "policy_failures": 48}, "categories": {category: {"episodes": 24, "successes": 12, "policy_failures": 12} for category in ("top_long", "top_short", "pant_long", "pant_short")}},
+        "summary": _summary_from_episodes(episodes),
     }
 
 
@@ -287,8 +292,21 @@ def test_result_verification_counts_clean_failures_and_categories(tmp_path: Path
     result = _valid_result(stages, tmp_path, policy_root)
 
     verified = verify_result(result, stages=stages, matrix_sha256=result["matrix_sha256"], output_root=tmp_path, policy_artifact_verifier=lambda _: CHECKPOINT["artifact_sha256"])
-    assert verified["overall"] == {"episodes": 96, "successes": 48, "policy_failures": 48}
-    assert verified["categories"]["top_long"] == {"episodes": 24, "successes": 12, "policy_failures": 12}
+    assert verified["overall"] == {"episodes": 96, "successes": 48, "policy_failures": 48, "infrastructure_invalid": 0, "fidelity_invalid": 0, "invalid_episodes": 0, "scored_episodes": 96, "success_rate": 0.5}
+    assert verified["categories"]["top_long"] == {"episodes": 24, "successes": 12, "policy_failures": 12, "infrastructure_invalid": 0, "fidelity_invalid": 0, "invalid_episodes": 0, "scored_episodes": 24, "success_rate": 0.5}
+
+
+def test_invalid_summary_counts_partial_rows_and_has_no_startup_score() -> None:
+    episodes = [
+        {"category": "top_long", "outcome": "success"},
+        {"category": "top_long", "outcome": "policy_failure"},
+        {"category": "top_long", "outcome": "infrastructure_invalid"},
+        {"category": "top_long", "outcome": "fidelity_invalid"},
+    ]
+    summary = _summary_from_episodes(episodes, assigned_episodes=96, status="invalid")
+    assert summary["overall"] == {"episodes": 4, "successes": 1, "policy_failures": 1, "infrastructure_invalid": 1, "fidelity_invalid": 1, "invalid_episodes": 2, "scored_episodes": 2, "success_rate": 0.5}
+    assert summary["categories"]["top_long"] == summary["overall"]
+    assert summary["assigned_episodes"] == 96 and summary["status"] == "invalid"
 
 
 def test_result_verification_rejects_fabricated_policy_cache_path(tmp_path: Path) -> None:
@@ -356,7 +374,7 @@ def _rewrite_stage_receipt(result: dict[str, object], root: Path, mutate) -> Non
 @pytest.mark.parametrize("mutation", [
     lambda receipt: receipt["command"].append("--tampered"),
     lambda receipt: receipt["log"].update(sha256="0" * 64),
-    lambda receipt: receipt["episodes"][0]["videos"]["top_rgb"].update(relative_path="top-long-seen-0/videos/failure/episode0_observation_top_rgb.mp4"),
+    lambda receipt: receipt["episodes"][0]["videos"]["top_rgb"].update(relative_path="top-long-seen-0/videos/failure/episode0_observation_images_top_rgb.mp4"),
     lambda receipt: receipt["child_completion_sentinel"].update(runtime_policy_sha256="0" * 64),
     lambda receipt: receipt["policy_server_readiness"]["binding"].update(device="cpu"),
     lambda receipt: receipt.update(unexpected=True),
@@ -426,6 +444,13 @@ def test_dry_run_command_selects_groot_server_not_lerobot(tmp_path: Path) -> Non
     assert command[command.index("--device") + 1] == "cpu"
     assert command[command.index("--policy_server_endpoint") + 1] == "tcp://127.0.0.1:9117"
     assert command[command.index("--public96_raw_checker_overlay") + 1] == RAW_CHECKER_OVERLAY_ID
+
+
+def test_real_video_filename_contract_uses_saver_dot_replacement() -> None:
+    assert video_filename_for_key(0, "observation.images.top_rgb") == "episode0_observation_images_top_rgb.mp4"
+    assert video_filename_for_key(1, "observation.images.left_rgb") == "episode1_observation_images_left_rgb.mp4"
+    with pytest.raises(Public96ContractError):
+        video_filename_for_key(0, "observation.top_rgb")
 
 
 def test_raw_checker_uses_untransformed_mesh_and_unscaled_thresholds() -> None:
@@ -527,7 +552,7 @@ def test_synthetic_successful_run_writes_complete_result_and_verifier_receipt(tm
         for episode_index, success in ((1, True), (2, False)):
             folder = "success" if success else "failure"
             for camera in ("top_rgb", "left_rgb", "right_rgb"):
-                video = stage_root / "videos" / folder / f"episode{episode_index - 1}_observation_{camera}.mp4"
+                video = stage_root / "videos" / folder / f"episode{episode_index - 1}_observation_images_{camera}.mp4"
                 video.parent.mkdir(parents=True, exist_ok=True); video.write_bytes(f"{episode_index}:{camera}".encode())
             output.append(f"Episode {episode_index}/2: Return={1.0 if success else 0.0:.2f}, Length=600, Success={success}")
         output.append("PUBLIC96_STAGE_COMPLETE " + json.dumps({"raw_checker_overlay": {"overlay_id": RAW_CHECKER_OVERLAY_ID, "overlay_sha256": overlay_sha256()}, "runtime_policy_sha256": CHECKPOINT["runtime_policy_sha256"]}, sort_keys=True))

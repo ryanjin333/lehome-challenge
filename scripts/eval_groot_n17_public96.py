@@ -52,6 +52,15 @@ class CheckpointIdentityError(Public96ContractError):
     """The checked N1.7 cache is not the immutable 12K policy."""
 
 
+def video_filename_for_key(source_index: int, key: str) -> str:
+    """Return the filename emitted by the video saver for an observation key."""
+    if type(source_index) is not int or source_index < 0:
+        raise Public96ContractError("video source index is invalid")
+    if key not in {"observation.images.top_rgb", "observation.images.left_rgb", "observation.images.right_rgb"}:
+        raise Public96ContractError("video observation key is invalid")
+    return f"episode{source_index}_{key.replace('.', '_')}.mp4"
+
+
 @dataclass(frozen=True)
 class Stage:
     stage_id: str
@@ -316,6 +325,7 @@ def _infrastructure_invalid_episode(stage: Stage, episode_index: int, reason: st
 
 def _write_invalid_evidence(*, output_root: Path, stages: Sequence[Stage], matrix_digest: str, identity: Mapping[str, object], server_log: Path | None, invalids: Sequence[Mapping[str, str]], episodes: Sequence[Mapping[str, object]], failure_reason: str | None = None) -> None:
     """Persist an unscored, fully assigned result without inventing stage evidence."""
+    summary = _summary_from_episodes(episodes, assigned_episodes=sum(len(stage.episode_indices) for stage in stages), status="invalid")
     result: dict[str, object] = {
         "kind": "lehome_groot_n17_public96_result_v1",
         "matrix_sha256": matrix_digest,
@@ -324,11 +334,7 @@ def _write_invalid_evidence(*, output_root: Path, stages: Sequence[Stage], matri
         "episodes": list(episodes),
         "invalid_stages": [dict(item) for item in invalids],
         "status": "invalid",
-        "summary": {
-            "status": "invalid",
-            "assigned_episodes": sum(len(stage.episode_indices) for stage in stages),
-            "invalid_episodes": len(episodes),
-        },
+        "summary": summary,
         "publication": {"status": "not_attempted", "vm_stop": "not_attempted"},
     }
     if failure_reason is not None:
@@ -339,6 +345,7 @@ def _write_invalid_evidence(*, output_root: Path, stages: Sequence[Stage], matri
         "kind": "lehome_groot_n17_public96_verifier_receipt_v1",
         "status": "invalid",
         "invalid_stages": [dict(item) for item in invalids],
+        "summary": summary,
         "result": _artifact(output_root / "result.json", output_root),
         "matrix_sha256": matrix_digest,
         "checkpoint": dict(identity),
@@ -425,17 +432,29 @@ def _validate_stage_receipt(
         raise Public96ContractError("stage receipt video artifacts do not exactly bind both episodes")
 
 
-def _summary_from_episodes(episodes: Sequence[Mapping[str, object]]) -> dict[str, object]:
+def _summary_from_episodes(episodes: Sequence[Mapping[str, object]], *, assigned_episodes: int | None = None, status: str | None = None) -> dict[str, object]:
     categories: dict[str, Counter[str]] = {category: Counter() for category in CATEGORIES}
     for episode in episodes:
         category = episode.get("category")
         if category in categories:
             categories[category]["episodes"] += 1
-            categories[category]["successes"] += int(episode.get("success") is True)
-            categories[category]["policy_failures"] += int(episode.get("outcome") == "policy_failure")
-    summarized = {category: dict(categories[category]) for category in CATEGORIES}
-    overall = {key: sum(summary.get(key, 0) for summary in summarized.values()) for key in ("episodes", "successes", "policy_failures")}
-    return {"overall": overall, "categories": summarized}
+            outcome = episode.get("outcome")
+            categories[category]["successes"] += int(outcome == "success")
+            categories[category]["policy_failures"] += int(outcome == "policy_failure")
+            categories[category]["infrastructure_invalid"] += int(outcome == "infrastructure_invalid")
+            categories[category]["fidelity_invalid"] += int(isinstance(outcome, str) and outcome.endswith("_invalid") and outcome != "infrastructure_invalid")
+    def finalize(counts: Counter[str]) -> dict[str, object]:
+        scored = counts["successes"] + counts["policy_failures"]
+        invalid = counts["infrastructure_invalid"] + counts["fidelity_invalid"]
+        return {"episodes": counts["episodes"], "successes": counts["successes"], "policy_failures": counts["policy_failures"], "infrastructure_invalid": counts["infrastructure_invalid"], "fidelity_invalid": counts["fidelity_invalid"], "invalid_episodes": invalid, "scored_episodes": scored, "success_rate": (counts["successes"] / scored if scored else None)}
+    summarized = {category: finalize(categories[category]) for category in CATEGORIES}
+    overall_counts = Counter()
+    for counts in categories.values(): overall_counts.update(counts)
+    overall = finalize(overall_counts)
+    summary: dict[str, object] = {"overall": overall, "categories": summarized}
+    if assigned_episodes is not None: summary["assigned_episodes"] = assigned_episodes
+    if status is not None: summary["status"] = status
+    return summary
 
 
 def verify_result(
@@ -488,7 +507,8 @@ def verify_result(
         source_index = int(episode["episode_index"]) - 1
         folder = "success" if success else "failure"
         for camera, descriptor in artifacts["videos"].items():
-            _verified_artifact(descriptor, root=output_root, expected_path=f"{stage.stage_id}/videos/{folder}/episode{source_index}_observation_{camera}.mp4")
+            key = f"observation.images.{camera}"
+            _verified_artifact(descriptor, root=output_root, expected_path=f"{stage.stage_id}/videos/{folder}/{video_filename_for_key(source_index, key)}")
         evidence = stage_evidence.setdefault(stage.stage_id, {"log": artifacts["log"], "receipt": artifacts["receipt"], "episodes": {}})
         if evidence["log"] != artifacts["log"] or evidence["receipt"] != artifacts["receipt"]:
             raise Public96ContractError("stage result artifacts disagree between sequential episodes")
@@ -513,8 +533,7 @@ def verify_result(
     summarized = {category: dict(categories[category]) for category in CATEGORIES}
     if any(summary.get("episodes") != 24 for summary in summarized.values()):
         raise Public96ContractError("public96 result is not category complete")
-    overall = {key: sum(summary.get(key, 0) for summary in summarized.values()) for key in ("episodes", "successes", "policy_failures")}
-    summary = {"overall": overall, "categories": summarized}
+    summary = _summary_from_episodes(episodes)
     if result.get("summary") != summary:
         raise Public96ContractError("public96 result summary does not exactly match verified episodes")
     return summary
@@ -592,7 +611,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     for metric in metrics:
                         folder = "success" if metric["success"] else "failure"
                         source_index = int(metric["episode_index"]) - 1
-                        cameras = {camera: stage_root / "videos" / folder / f"episode{source_index}_observation_{camera}.mp4" for camera in ("top_rgb", "left_rgb", "right_rgb")}
+                        cameras = {camera: stage_root / "videos" / folder / video_filename_for_key(source_index, f"observation.images.{camera}") for camera in ("top_rgb", "left_rgb", "right_rgb")}
                         episode_videos.append(cameras)
                         for video in cameras.values(): _artifact(video, output_root)
                     stage_receipt = {
