@@ -32,6 +32,7 @@ def test_container_wrapper_binds_reviewed_runtime_images_and_real_policy_readine
     assert "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7" in text
     assert "ghcr.io/ryanjin333/lehome-groot-n17-trainer@sha256:b56c16c259b7eda99294f2069e976b53395e665aaf68174d5b13ba458a93b746" in text
     assert "run_groot_n17_public96_policy_server" in text
+    assert "PYTHONPATH=/runtime/source/lehome:/runtime:/opt/isaac-groot" in text
     assert "policy-server-readiness.json" in text
     assert "policy-server-startup.log" in text
     assert "cuda-runtime.json" in text

@@ -151,7 +151,7 @@ docker run --rm --detach --pull never --gpus all --init --network host \
   --mount "type=bind,src=$REPO_ROOT,dst=/runtime,readonly" \
   --mount "type=bind,src=$EVIDENCE_ROOT,dst=/evidence" \
   --env "$POLICY_TOKEN_ENV=$POLICY_TOKEN" \
-  --env PYTHONPATH=/runtime/source/lehome:/runtime \
+  --env PYTHONPATH=/runtime/source/lehome:/runtime:/opt/isaac-groot \
   --entrypoint /opt/runtime/bin/python \
   "$POLICY_IMAGE_ID" \
   -m scripts.run_groot_n17_public96_policy_server \
