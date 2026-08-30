@@ -36,6 +36,7 @@ def test_container_wrapper_binds_reviewed_runtime_images_and_real_policy_readine
     assert "N17_BASE_MODEL_ROOT" in text
     assert "7de1838c87a5349b016c26a1c3f7d2bc400a3d485f95ef39a7059ffd734977a0" in text
     assert 'dst=/cache/models/nvidia/Cosmos-Reason2-2B,readonly' in text
+    assert "--workdir /cache/models" in text
     assert "TRANSFORMERS_OFFLINE=1" in text
     assert "policy-server-readiness.json" in text
     assert "policy-server-startup.log" in text

@@ -162,6 +162,7 @@ capture_image_receipt "$POLICY_IMAGE_ID" "$EVIDENCE_ROOT/policy-image.json" poli
 
 docker run --rm --detach --pull never --gpus all --init --network host \
   --name "$POLICY_CONTAINER" \
+  --workdir /cache/models \
   --mount "type=bind,src=$N17_CHECKPOINT_ROOT,dst=$N17_CHECKPOINT_ROOT,readonly" \
   --mount "type=bind,src=$N17_BASE_MODEL_ROOT,dst=/cache/models/nvidia/Cosmos-Reason2-2B,readonly" \
   --mount "type=bind,src=$REPO_ROOT,dst=/runtime,readonly" \
