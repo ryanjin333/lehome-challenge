@@ -1013,8 +1013,6 @@ def _execution_env(
         str(isaaclab_tasks_root),
         str(native_site_root),
     ]
-    if env.get("PYTHONPATH"):
-        python_path.append(env["PYTHONPATH"])
     env.update(
         {
             "PYTHONDONTWRITEBYTECODE": "1",

@@ -31,6 +31,7 @@ from scripts.run_official_lehome_comparison import (
     deterministic_remote_prefix,
     publish_comparison,
     _command_parity,
+    _execution_env,
     load_release_matrix,
 )
 
@@ -41,6 +42,33 @@ CATEGORIES = {
     "pant_long": "Pant_Long",
     "pant_short": "Pant_Short",
 }
+
+
+def test_execution_env_does_not_inherit_runtime_pythonpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "official-source"
+    log_root = tmp_path / "logs"
+    isaaclab_root = tmp_path / "isaaclab"
+    isaaclab_tasks_root = tmp_path / "isaaclab-tasks"
+    native_site_root = tmp_path / "native-site"
+    monkeypatch.setenv("PYTHONPATH", "/runtime/source/lehome:/runtime")
+
+    env = _execution_env(
+        source_root=source_root,
+        log_root=log_root,
+        isaaclab_root=isaaclab_root,
+        isaaclab_tasks_root=isaaclab_tasks_root,
+        native_site_root=native_site_root,
+        policy=PolicyDefinition("ours-12k", "docker", docker_url="http://127.0.0.1:8080"),
+        sanitized_config_root=None,
+        compatibility_receipt=None,
+    )
+
+    paths = env["PYTHONPATH"].split(":")
+    assert paths[:2] == [str(source_root / "source/lehome"), str(source_root)]
+    assert "/runtime" not in paths
+    assert "/runtime/source/lehome" not in paths
 
 
 def _assets(root: Path) -> Path:
