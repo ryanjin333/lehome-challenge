@@ -79,6 +79,11 @@ def test_container_wrapper_redirects_bridge_logs_off_read_only_runtime() -> None
     assert "/runtime/rollout_appliance/native_reference_site" in bridge_command
 
 
+def test_container_wrapper_marks_exact_official_checkout_safe_for_git_identity() -> None:
+    text = WRAPPER.read_text(encoding="utf-8")
+    assert "git config --global --add safe.directory /official/lehome" in text
+
+
 def test_full_requires_smoke_receipt_and_smoke_rejects_one() -> None:
     text = WRAPPER.read_text(encoding="utf-8")
     assert "LEHOME_OFFICIAL_SMOKE_RECEIPT" in text
