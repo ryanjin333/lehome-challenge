@@ -288,24 +288,25 @@ with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(payload,stream,sort
 PY
 chmod 0444 "$COMPETITOR_EVIDENCE"/*.json
 mkdir -p /official/bridge-log
+PYTHONPATH=/runtime/source/lehome:/runtime "$PYTHON_BIN" -m scripts.serve_official_docker_policy_bridge \
+  --listen-host 127.0.0.1 --listen-port '"$BRIDGE_PORT"' \
+  --policy-server-endpoint tcp://127.0.0.1:'"$POLICY_PORT"' \
+  --policy-server-token-env '"$POLICY_TOKEN_ENV"' \
+  --policy-server-request-timeout 600 >/official/bridge-log/bridge.log 2>&1 &
+bridge_pid=$!
+bridge_ready=""
 for _ in $(seq 1 180); do
-  PYTHONPATH=/runtime/source/lehome:/runtime "$PYTHON_BIN" -m scripts.serve_official_docker_policy_bridge \
-    --listen-host 127.0.0.1 --listen-port '"$BRIDGE_PORT"' \
-    --policy-server-endpoint tcp://127.0.0.1:'"$POLICY_PORT"' \
-    --policy-server-token-env '"$POLICY_TOKEN_ENV"' \
-    --policy-server-request-timeout 600 >/official/bridge-log/bridge.log 2>&1 &
-  bridge_pid=$!
-  sleep 1
+  kill -0 "$bridge_pid" >/dev/null 2>&1 || { cat /official/bridge-log/bridge.log >&2; exit 2; }
   if kill -0 "$bridge_pid" >/dev/null 2>&1 && "$PYTHON_BIN" - <<'"'"'PY'"'"'
 import json, urllib.request
 request=urllib.request.Request("http://127.0.0.1:'"$BRIDGE_PORT"'/reset",data=b"{}",headers={"Content-Type":"application/json"},method="POST")
 with urllib.request.urlopen(request, timeout=2) as response:
     assert json.load(response) == {"status":"ok"}
 PY
-  then break; fi
-  kill "$bridge_pid" >/dev/null 2>&1 || true; wait "$bridge_pid" >/dev/null 2>&1 || true; bridge_pid=""; sleep 1
+  then bridge_ready=1; break; fi
+  sleep 1
 done
-[[ -n "$bridge_pid" ]] || { echo "bridge failed readiness" >&2; exit 2; }
+[[ "$bridge_ready" == 1 ]] || { cat /official/bridge-log/bridge.log >&2; echo "bridge failed readiness" >&2; exit 2; }
 PYTHONPATH=/runtime/source/lehome:/runtime /isaac-sim/python.sh -m scripts.run_official_lehome_comparison run \
   --mode '"$MODE"' \
   --source-root /official/lehome \
