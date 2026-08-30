@@ -4,6 +4,7 @@ import hashlib
 import json
 import argparse
 from pathlib import Path
+import subprocess
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -32,6 +33,7 @@ from scripts.run_official_lehome_comparison import (
     publish_comparison,
     _command_parity,
     _execution_env,
+    checkout_identity,
     load_release_matrix,
 )
 
@@ -69,6 +71,46 @@ def test_execution_env_does_not_inherit_runtime_pythonpath(
     assert paths[:2] == [str(source_root / "source/lehome"), str(source_root)]
     assert "/runtime" not in paths
     assert "/runtime/source/lehome" not in paths
+
+
+def test_checkout_identity_excludes_only_independently_verified_assets_mount(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
+    (source / "code.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (source / "Assets").mkdir()
+    (source / "Assets/.gitignore").write_text("*\n!.gitignore\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(source), "add", "code.py", "Assets/.gitignore"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-qm", "fixture"], check=True)
+    revision = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    before = checkout_identity(
+        source,
+        revision,
+        label="official source",
+        exclude_assets_mount=True,
+    )
+
+    (source / "Assets/.gitignore").unlink()
+    (source / "Assets/external.bin").write_bytes(b"verified-separately")
+    after = checkout_identity(
+        source,
+        revision,
+        label="official source",
+        exclude_assets_mount=True,
+    )
+
+    assert after == before
+    with pytest.raises(ComparisonError, match="checkout is modified"):
+        checkout_identity(source, revision, label="official source")
 
 
 def _assets(root: Path) -> Path:

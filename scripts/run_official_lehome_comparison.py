@@ -143,10 +143,12 @@ def _load_json_object(path: Path, label: str) -> dict[str, object]:
     return value
 
 
-def _tree_sha256(root: Path) -> str:
+def _tree_sha256(root: Path, *, exclude_assets_mount: bool = False) -> str:
     digest = hashlib.sha256()
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
+        if exclude_assets_mount and relative.parts and relative.parts[0] == "Assets":
+            continue
         if ".git" in relative.parts or path.is_dir():
             continue
         metadata = path.lstat()
@@ -173,7 +175,13 @@ def _git_output(root: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
-def checkout_identity(root: Path, expected_revision: str, *, label: str) -> dict[str, str]:
+def checkout_identity(
+    root: Path,
+    expected_revision: str,
+    *,
+    label: str,
+    exclude_assets_mount: bool = False,
+) -> dict[str, str]:
     candidate = Path(root)
     if candidate.is_symlink() or not candidate.is_dir() or _HEX40.fullmatch(expected_revision) is None:
         raise ComparisonError(f"{label} checkout path or revision is invalid")
@@ -181,9 +189,15 @@ def checkout_identity(root: Path, expected_revision: str, *, label: str) -> dict
     revision = _git_output(root, "rev-parse", "HEAD")
     if revision != expected_revision:
         raise ComparisonError(f"{label} revision drift: {revision}")
-    if _git_output(root, "status", "--porcelain", "--untracked-files=all"):
+    status_arguments = ["status", "--porcelain", "--untracked-files=all"]
+    if exclude_assets_mount:
+        status_arguments.extend(["--", ".", ":(exclude)Assets"])
+    if _git_output(root, *status_arguments):
         raise ComparisonError(f"{label} checkout is modified")
-    return {"revision": revision, "tree_sha256": _tree_sha256(root)}
+    return {
+        "revision": revision,
+        "tree_sha256": _tree_sha256(root, exclude_assets_mount=exclude_assets_mount),
+    }
 
 
 def validate_evaluation_assets(canonical_root: Path, evaluation_root: Path, *, mode: str) -> None:
@@ -1051,7 +1065,12 @@ def execute_comparison(args: argparse.Namespace) -> Path:
     output_root.mkdir(parents=True, mode=0o700)
     args._official_output_created = True
     status_path = output_root / "status.json"
-    source_before = checkout_identity(source_root, SOURCE_REVISION, label="official source")
+    source_before = checkout_identity(
+        source_root,
+        SOURCE_REVISION,
+        label="official source",
+        exclude_assets_mount=True,
+    )
     assets_before = checkout_identity(canonical_assets_root, ASSET_REVISION, label="canonical assets")
     runtime_root = args.runtime_root.resolve(strict=True)
     runtime_before = {"revision": args.runtime_revision, "tree_sha256": _tree_sha256(runtime_root)}
@@ -1210,7 +1229,12 @@ def execute_comparison(args: argparse.Namespace) -> Path:
             )
             for policy in policies
         ]
-        source_after = checkout_identity(source_root, SOURCE_REVISION, label="official source")
+        source_after = checkout_identity(
+            source_root,
+            SOURCE_REVISION,
+            label="official source",
+            exclude_assets_mount=True,
+        )
         assets_after = checkout_identity(canonical_assets_root, ASSET_REVISION, label="canonical assets")
         runtime_after = {"revision": args.runtime_revision, "tree_sha256": _tree_sha256(runtime_root)}
         adapters_after = runtime_adapter_identities(runtime_root)
