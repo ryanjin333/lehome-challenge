@@ -13,6 +13,7 @@ readonly OFFICIAL_ASSETS_ROOT="${LEHOME_OFFICIAL_ASSETS_ROOT:-}"
 readonly METADATA_ROOT="${LEHOME_OFFICIAL_METADATA_ROOT:-}"
 readonly N17_CHECKPOINT_ROOT="${LEHOME_OFFICIAL_N17_CHECKPOINT_ROOT:-}"
 readonly N17_IDENTITY_RECEIPT="${LEHOME_OFFICIAL_N17_IDENTITY_RECEIPT:-}"
+readonly N17_BASE_MODEL_ROOT="/mnt/lehome/cache/models/nvidia/Cosmos-Reason2-2B"
 readonly COMPETITOR_CHECKPOINT_ROOT="${LEHOME_OFFICIAL_COMPETITOR_CHECKPOINT_ROOT:-}"
 readonly SANITIZED_CONFIG_ROOT="${LEHOME_OFFICIAL_SANITIZED_CONFIG_ROOT:-}"
 readonly COMPATIBILITY_RECEIPT="${LEHOME_OFFICIAL_COMPATIBILITY_RECEIPT:-}"
@@ -72,6 +73,20 @@ require_directory "$OFFICIAL_ASSETS_ROOT" "official asset checkout"
 require_directory "$METADATA_ROOT" "policy metadata root"
 require_directory "$N17_CHECKPOINT_ROOT" "N1.7 checkpoint"
 require_file "$N17_IDENTITY_RECEIPT" "N1.7 checkpoint identity receipt"
+require_directory "$N17_BASE_MODEL_ROOT" "N1.7 base model"
+for base_model_file_and_digest in \
+  "model.safetensors:7de1838c87a5349b016c26a1c3f7d2bc400a3d485f95ef39a7059ffd734977a0" \
+  "config.json:bec4b3d446efa05807365c9e1cec03ac590836879d02f3a6da879971154bdd3b" \
+  "preprocessor_config.json:27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516" \
+  "tokenizer.json:a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7" \
+  "tokenizer_config.json:c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399" \
+  "chat_template.json:6f8a6a55027e3da5160105556cda5dd69f6423f1c32645f6730d32de7773d0c4"; do
+  base_model_file="${base_model_file_and_digest%%:*}"
+  base_model_digest="${base_model_file_and_digest##*:}"
+  require_file "$N17_BASE_MODEL_ROOT/$base_model_file" "N1.7 base-model file"
+  [[ "$(sha256sum -- "$N17_BASE_MODEL_ROOT/$base_model_file" | awk '{print $1}')" == "$base_model_digest" ]] \
+    || fail "N1.7 base-model file digest mismatch"
+done
 require_directory "$COMPETITOR_CHECKPOINT_ROOT" "competitor checkpoint"
 require_directory "$SANITIZED_CONFIG_ROOT" "competitor sanitized config view"
 require_file "$COMPATIBILITY_RECEIPT" "competitor compatibility receipt"
@@ -148,10 +163,13 @@ capture_image_receipt "$POLICY_IMAGE_ID" "$EVIDENCE_ROOT/policy-image.json" poli
 docker run --rm --detach --pull never --gpus all --init --network host \
   --name "$POLICY_CONTAINER" \
   --mount "type=bind,src=$N17_CHECKPOINT_ROOT,dst=$N17_CHECKPOINT_ROOT,readonly" \
+  --mount "type=bind,src=$N17_BASE_MODEL_ROOT,dst=/cache/models/nvidia/Cosmos-Reason2-2B,readonly" \
   --mount "type=bind,src=$REPO_ROOT,dst=/runtime,readonly" \
   --mount "type=bind,src=$EVIDENCE_ROOT,dst=/evidence" \
   --env "$POLICY_TOKEN_ENV=$POLICY_TOKEN" \
   --env PYTHONPATH=/runtime/source/lehome:/runtime:/opt/isaac-groot \
+  --env HF_HUB_OFFLINE=1 \
+  --env TRANSFORMERS_OFFLINE=1 \
   --entrypoint /opt/runtime/bin/python \
   "$POLICY_IMAGE_ID" \
   -m scripts.run_groot_n17_public96_policy_server \
