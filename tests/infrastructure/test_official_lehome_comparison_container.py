@@ -69,6 +69,16 @@ def test_container_wrapper_reuses_exact_native_reference_dependency_boundary() -
     assert "third_party/IsaacLab/source/isaaclab_tasks" in text
 
 
+def test_container_wrapper_redirects_bridge_logs_off_read_only_runtime() -> None:
+    text = WRAPPER.read_text(encoding="utf-8")
+    assert "LEHOME_NATIVE_REFERENCE_LOG_PROJECT_ROOT=/official/bridge-log" in text
+    assert "LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=/official/lehome" in text
+    bridge_command = text.split(
+        "/isaac-sim/python.sh -m scripts.serve_official_docker_policy_bridge", 1
+    )[0].splitlines()[-1]
+    assert "/runtime/rollout_appliance/native_reference_site" in bridge_command
+
+
 def test_full_requires_smoke_receipt_and_smoke_rejects_one() -> None:
     text = WRAPPER.read_text(encoding="utf-8")
     assert "LEHOME_OFFICIAL_SMOKE_RECEIPT" in text

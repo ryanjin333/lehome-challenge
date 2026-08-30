@@ -296,7 +296,7 @@ if msgpack.__version__ != "1.1.0" or zmq.__version__ != "27.0.1":
     raise SystemExit("controller wire dependency identity mismatch")
 PY
 mkdir -p /official/bridge-log
-PYTHONPATH=/official/wire:/runtime/source/lehome:/runtime:/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab:/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab_tasks /isaac-sim/python.sh -m scripts.serve_official_docker_policy_bridge \
+LEHOME_NATIVE_REFERENCE_LOG_PROJECT_ROOT=/official/bridge-log LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=/official/lehome PYTHONPATH=/runtime/rollout_appliance/native_reference_site:/official/wire:/runtime/source/lehome:/runtime:/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab:/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab_tasks /isaac-sim/python.sh -m scripts.serve_official_docker_policy_bridge \
   --listen-host 127.0.0.1 --listen-port '"$BRIDGE_PORT"' \
   --policy-server-endpoint tcp://127.0.0.1:'"$POLICY_PORT"' \
   --policy-server-token-env '"$POLICY_TOKEN_ENV"' \
