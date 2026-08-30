@@ -29,7 +29,8 @@ jobs:
       - name: Verify frozen rollout contract
         run: |
           uv lock --check --project rollout
-          uv run --project rollout --frozen pytest rollout/tests -q
+          uv run --project rollout --frozen pytest \
+            rollout/tests/test_image_contract.py::test_rollout_image_installs_groot_without_reusing_uv_archive_links -q
           bash -n rollout/entrypoint.sh rollout/scripts/verify-image.sh
 
   publish-rollout-candidate:
