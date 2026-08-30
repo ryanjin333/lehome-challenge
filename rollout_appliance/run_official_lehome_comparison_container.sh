@@ -112,7 +112,14 @@ for cached_file_and_digest in \
   "$COMPETITOR_BASE_MODEL_SNAPSHOT/config.json:6159de1bea27399cb4d5d8f2ad79bdfbaf9f7646dc83786dd186cd291a4f201b" \
   "$COMPETITOR_TOKENIZER_SNAPSHOT/processor_config.json:bef09de1f7e4ba975911576028a174d7a49b4e1c2e4a2d5f6d5f400ac4631ae5" \
   "$COMPETITOR_TOKENIZER_SNAPSHOT/tokenizer_config.json:88cfe3a9605b59cfa6757797f66085f958b4cd81820781ea1a48c5ae690b8232" \
-  "$COMPETITOR_TOKENIZER_SNAPSHOT/vocab.json:87a257b04b17642a0688c98cd1df89c398bda4fee532d6f88b38a659ecb4ac8d"; do
+  "$COMPETITOR_TOKENIZER_SNAPSHOT/vocab.json:87a257b04b17642a0688c98cd1df89c398bda4fee532d6f88b38a659ecb4ac8d" \
+  "$COMPETITOR_TOKENIZER_SNAPSHOT/merges.txt:8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5" \
+  "$COMPETITOR_TOKENIZER_SNAPSHOT/added_tokens.json:4dd6146d2eccfb4a5c8e147df8876eb92be19ed60a3e65aab4d5d3e9f51f6d6a" \
+  "$COMPETITOR_TOKENIZER_SNAPSHOT/chat_template.json:f4a71030443c5d03a0ef0abb9bef5c9110cacf852ddc49710b22fa2a2bd7a3b9" \
+  "$COMPETITOR_TOKENIZER_SNAPSHOT/special_tokens_map.json:1f7a26d4bd862741d920097c370aaac4010b483c0dec3c85e2b42954cd8ea342" \
+  "$COMPETITOR_TOKENIZER_SNAPSHOT/config.json:c178f5b4fb451131094d0292dcbbc78aaa458a992e5bc9302d56e033d2a3de10" \
+  "$COMPETITOR_TOKENIZER_SNAPSHOT/generation_config.json:f15f5de33244a61325923e99bad2c061029acb8d6dd5c57f8458b3949ddd8f97" \
+  "$COMPETITOR_TOKENIZER_SNAPSHOT/preprocessor_config.json:b37b7dcf753d6a4c52357c208e2d60cfeb9216681fc301b21bee65da201d2d5c"; do
   cached_file="${cached_file_and_digest%%:*}"
   cached_digest="${cached_file_and_digest##*:}"
   [[ -f "$cached_file" ]] || fail "competitor cache file is unavailable"
@@ -274,9 +281,13 @@ cleanup_inner() { if [[ -n "$bridge_pid" ]]; then kill "$bridge_pid" >/dev/null 
 trap cleanup_inner EXIT INT TERM
 readonly PYTHON_BIN=/opt/lehome-challenge/.venv/bin/python
 readonly COMPETITOR_EVIDENCE=/official/evidence/competitor-runtime
+readonly COMPETITOR_TOKENIZER_SNAPSHOT=/official/reference-hf-cache/hub/models--lerobot--eagle2hg-processor-groot-n1p5/snapshots/baf604d8a5caf26fda5cc545f141bc1814156237
+readonly EAGLE_CACHE=/tmp/lehome-reference-hf-home/lerobot/lerobot/eagle2hg-processor-groot-n1p5
 smoke_args=()
 if [[ '"$MODE"' == full ]]; then smoke_args=(--smoke-receipt "$LEHOME_OFFICIAL_SMOKE_RECEIPT"); fi
 mkdir --mode=0700 -- "$COMPETITOR_EVIDENCE"
+mkdir -p -- "$EAGLE_CACHE"
+cp -L -- "$COMPETITOR_TOKENIZER_SNAPSHOT"/{vocab.json,merges.txt,added_tokens.json,chat_template.json,special_tokens_map.json,config.json,generation_config.json,preprocessor_config.json,processor_config.json,tokenizer_config.json} "$EAGLE_CACHE/"
 git config --global --add safe.directory /official/lehome
 git config --global --add safe.directory /official/assets
 PYTHONSAFEPATH=1 "$PYTHON_BIN" /runtime/scripts/verify_native_reference_evaluator_gate.py validate-peft-overlay >/dev/null

@@ -85,6 +85,10 @@ def test_container_wrapper_mounts_pinned_competitor_cache_read_only_and_offline(
     assert "HF_DATASETS_CACHE=/tmp/lehome-reference-datasets-cache" in text
     assert "HF_HUB_OFFLINE=1" in text
     assert "TRANSFORMERS_OFFLINE=1" in text
+    assert "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5" in text
+    assert "c178f5b4fb451131094d0292dcbbc78aaa458a992e5bc9302d56e033d2a3de10" in text
+    assert "generation_config.json" in text
+    assert "cp -L -- \"$COMPETITOR_TOKENIZER_SNAPSHOT\"/" in text
 
 
 def test_container_wrapper_redirects_bridge_logs_off_read_only_runtime() -> None:
