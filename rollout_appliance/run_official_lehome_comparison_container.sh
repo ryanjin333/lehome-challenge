@@ -244,6 +244,7 @@ smoke_args=()
 if [[ '"$MODE"' == full ]]; then smoke_args=(--smoke-receipt "$LEHOME_OFFICIAL_SMOKE_RECEIPT"); fi
 mkdir --mode=0700 -- "$COMPETITOR_EVIDENCE"
 git config --global --add safe.directory /official/lehome
+git config --global --add safe.directory /official/assets
 PYTHONSAFEPATH=1 "$PYTHON_BIN" /runtime/scripts/verify_native_reference_evaluator_gate.py validate-peft-overlay >/dev/null
 PYTHONSAFEPATH=1 "$PYTHON_BIN" /runtime/scripts/verify_native_reference_evaluator_gate.py validate-flash-attention-overlay >/dev/null
 PYTHONSAFEPATH=1 "$PYTHON_BIN" /runtime/scripts/verify_native_reference_evaluator_gate.py validate-public-pyproject-dependencies-overlay >/dev/null
