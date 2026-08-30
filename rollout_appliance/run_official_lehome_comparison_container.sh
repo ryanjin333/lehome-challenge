@@ -386,9 +386,9 @@ docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
   "${mounts[@]}" \
   --env "$POLICY_TOKEN_ENV=$POLICY_TOKEN" \
   --env PYTHONEXE=/opt/lehome-challenge/.venv/bin/python \
-  --env HF_HOME=/official/reference-hf-cache \
+  --env HF_HOME=/tmp/lehome-reference-hf-home \
   --env HF_HUB_CACHE=/official/reference-hf-cache/hub \
-  --env HF_XET_CACHE=/official/reference-hf-cache/xet \
+  --env HF_XET_CACHE=/tmp/lehome-reference-hf-home/xet \
   --env HF_DATASETS_CACHE=/tmp/lehome-reference-datasets-cache \
   --env HF_HUB_OFFLINE=1 \
   --env TRANSFORMERS_OFFLINE=1 \

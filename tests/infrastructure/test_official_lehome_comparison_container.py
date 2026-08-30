@@ -79,8 +79,9 @@ def test_container_wrapper_mounts_pinned_competitor_cache_read_only_and_offline(
     assert "03ba0f11339d5ed24920582781c7352e308eb4eb78067c128bd8516b146656c8" in text
     assert "1f572eb204d7afe3ddbfb890ca56eac1a9bafbdce51ed6fd3ba314dc4298d565" in text
     assert 'src=$COMPETITOR_HF_CACHE_ROOT,dst=/official/reference-hf-cache,readonly' in text
-    assert "HF_HOME=/official/reference-hf-cache" in text
+    assert "HF_HOME=/tmp/lehome-reference-hf-home" in text
     assert "HF_HUB_CACHE=/official/reference-hf-cache/hub" in text
+    assert "HF_XET_CACHE=/tmp/lehome-reference-hf-home/xet" in text
     assert "HF_DATASETS_CACHE=/tmp/lehome-reference-datasets-cache" in text
     assert "HF_HUB_OFFLINE=1" in text
     assert "TRANSFORMERS_OFFLINE=1" in text
