@@ -203,6 +203,7 @@ chmod 0444 "$EVIDENCE_ROOT/policy-server-readiness.json" "$EVIDENCE_ROOT/policy-
 declare -a mounts=(
   --mount "type=bind,src=$OFFICIAL_SOURCE_ROOT,dst=/official/lehome,readonly"
   --mount "type=bind,src=$OFFICIAL_ASSETS_ROOT,dst=/official/assets,readonly"
+  --mount "type=bind,src=$OFFICIAL_ASSETS_ROOT,dst=/official/lehome/Assets,readonly"
   --mount "type=bind,src=$OFFICIAL_ASSETS_ROOT,dst=/official/assets-view,readonly"
   --mount "type=bind,src=$METADATA_ROOT,dst=/official/metadata,readonly"
   --mount "type=bind,src=$N17_CHECKPOINT_ROOT,dst=$N17_CHECKPOINT_ROOT,readonly"

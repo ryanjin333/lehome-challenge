@@ -14,6 +14,7 @@ def test_container_wrapper_mounts_official_source_and_assets_read_only() -> None
     assert "bea65fd960ad5a1bb3bd3fa77164b28001c08ef9" in text
     assert 'src=$OFFICIAL_SOURCE_ROOT,dst=/official/lehome,readonly' in text
     assert 'src=$OFFICIAL_ASSETS_ROOT,dst=/official/assets,readonly' in text
+    assert 'src=$OFFICIAL_ASSETS_ROOT,dst=/official/lehome/Assets,readonly' in text
     assert "--device cpu" in text
     assert "--gpus all" in text
     assert "--seed 42" in text
