@@ -16,6 +16,9 @@ readonly N17_IDENTITY_RECEIPT="${LEHOME_OFFICIAL_N17_IDENTITY_RECEIPT:-}"
 readonly N17_BASE_MODEL_ROOT="/mnt/lehome/cache/models/nvidia/Cosmos-Reason2-2B"
 readonly CONTROLLER_WIRE_ROOT="/mnt/lehome/eval/pydeps"
 readonly COMPETITOR_CHECKPOINT_ROOT="${LEHOME_OFFICIAL_COMPETITOR_CHECKPOINT_ROOT:-}"
+readonly COMPETITOR_HF_CACHE_ROOT="${LEHOME_OFFICIAL_COMPETITOR_HF_CACHE_ROOT:-/mnt/lehome/cache/reference-base-n15-hf}"
+readonly COMPETITOR_BASE_MODEL_REVISION="869830fc749c35f34771aa5209f923ac57e4564e"
+readonly COMPETITOR_TOKENIZER_REVISION="baf604d8a5caf26fda5cc545f141bc1814156237"
 readonly SANITIZED_CONFIG_ROOT="${LEHOME_OFFICIAL_SANITIZED_CONFIG_ROOT:-}"
 readonly COMPATIBILITY_RECEIPT="${LEHOME_OFFICIAL_COMPATIBILITY_RECEIPT:-}"
 readonly SMOKE_RECEIPT="${LEHOME_OFFICIAL_SMOKE_RECEIPT:-}"
@@ -90,6 +93,35 @@ for base_model_file_and_digest in \
     || fail "N1.7 base-model file digest mismatch"
 done
 require_directory "$COMPETITOR_CHECKPOINT_ROOT" "competitor checkpoint"
+require_directory "$COMPETITOR_HF_CACHE_ROOT" "competitor Hugging Face cache"
+readonly COMPETITOR_BASE_MODEL_SNAPSHOT="$COMPETITOR_HF_CACHE_ROOT/hub/models--nvidia--GR00T-N1.5-3B/snapshots/$COMPETITOR_BASE_MODEL_REVISION"
+readonly COMPETITOR_TOKENIZER_SNAPSHOT="$COMPETITOR_HF_CACHE_ROOT/hub/models--lerobot--eagle2hg-processor-groot-n1p5/snapshots/$COMPETITOR_TOKENIZER_REVISION"
+require_directory "$COMPETITOR_BASE_MODEL_SNAPSHOT" "competitor base-model snapshot"
+require_directory "$COMPETITOR_TOKENIZER_SNAPSHOT" "competitor tokenizer snapshot"
+require_file "$COMPETITOR_HF_CACHE_ROOT/hub/models--nvidia--GR00T-N1.5-3B/refs/main" "competitor base-model cache ref"
+require_file "$COMPETITOR_HF_CACHE_ROOT/hub/models--lerobot--eagle2hg-processor-groot-n1p5/refs/main" "competitor tokenizer cache ref"
+[[ "$(<"$COMPETITOR_HF_CACHE_ROOT/hub/models--nvidia--GR00T-N1.5-3B/refs/main")" == "$COMPETITOR_BASE_MODEL_REVISION" ]] \
+  || fail "competitor base-model cache revision mismatch"
+[[ "$(<"$COMPETITOR_HF_CACHE_ROOT/hub/models--lerobot--eagle2hg-processor-groot-n1p5/refs/main")" == "$COMPETITOR_TOKENIZER_REVISION" ]] \
+  || fail "competitor tokenizer cache revision mismatch"
+for cached_file_and_digest in \
+  "$COMPETITOR_BASE_MODEL_SNAPSHOT/model-00001-of-00003.safetensors:4d5e8e2a81a4b25084965ae87b8257a87ebe2f3b6656f83bbb15ba13675940b6" \
+  "$COMPETITOR_BASE_MODEL_SNAPSHOT/model-00002-of-00003.safetensors:03ba0f11339d5ed24920582781c7352e308eb4eb78067c128bd8516b146656c8" \
+  "$COMPETITOR_BASE_MODEL_SNAPSHOT/model-00003-of-00003.safetensors:1f572eb204d7afe3ddbfb890ca56eac1a9bafbdce51ed6fd3ba314dc4298d565" \
+  "$COMPETITOR_BASE_MODEL_SNAPSHOT/model.safetensors.index.json:c631078eb34b96026e1e6afa3050e1e13651d06a943853ae9f2c99cac65704c8" \
+  "$COMPETITOR_BASE_MODEL_SNAPSHOT/config.json:6159de1bea27399cb4d5d8f2ad79bdfbaf9f7646dc83786dd186cd291a4f201b" \
+  "$COMPETITOR_TOKENIZER_SNAPSHOT/processor_config.json:bef09de1f7e4ba975911576028a174d7a49b4e1c2e4a2d5f6d5f400ac4631ae5" \
+  "$COMPETITOR_TOKENIZER_SNAPSHOT/tokenizer_config.json:88cfe3a9605b59cfa6757797f66085f958b4cd81820781ea1a48c5ae690b8232" \
+  "$COMPETITOR_TOKENIZER_SNAPSHOT/vocab.json:87a257b04b17642a0688c98cd1df89c398bda4fee532d6f88b38a659ecb4ac8d"; do
+  cached_file="${cached_file_and_digest%%:*}"
+  cached_digest="${cached_file_and_digest##*:}"
+  [[ -f "$cached_file" ]] || fail "competitor cache file is unavailable"
+  resolved_cached_file="$(realpath -e -- "$cached_file")"
+  [[ "$resolved_cached_file" == "$COMPETITOR_HF_CACHE_ROOT/hub/"* && -f "$resolved_cached_file" && ! -L "$resolved_cached_file" ]] \
+    || fail "competitor cache file resolves outside the pinned cache"
+  [[ "$(sha256sum -- "$resolved_cached_file" | awk '{print $1}')" == "$cached_digest" ]] \
+    || fail "competitor cache file digest mismatch"
+done
 require_directory "$SANITIZED_CONFIG_ROOT" "competitor sanitized config view"
 require_file "$COMPATIBILITY_RECEIPT" "competitor compatibility receipt"
 if [[ "$MODE" == full ]]; then
@@ -209,6 +241,7 @@ declare -a mounts=(
   --mount "type=bind,src=$N17_CHECKPOINT_ROOT,dst=$N17_CHECKPOINT_ROOT,readonly"
   --mount "type=bind,src=$N17_IDENTITY_RECEIPT,dst=$N17_IDENTITY_RECEIPT,readonly"
   --mount "type=bind,src=$COMPETITOR_CHECKPOINT_ROOT,dst=$COMPETITOR_CHECKPOINT_ROOT,readonly"
+  --mount "type=bind,src=$COMPETITOR_HF_CACHE_ROOT,dst=/official/reference-hf-cache,readonly"
   --mount "type=bind,src=$SANITIZED_CONFIG_ROOT,dst=$SANITIZED_CONFIG_ROOT,readonly"
   --mount "type=bind,src=$COMPATIBILITY_RECEIPT,dst=$COMPATIBILITY_RECEIPT,readonly"
   --mount "type=bind,src=$EVIDENCE_ROOT,dst=/official/evidence"
@@ -353,6 +386,11 @@ docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
   "${mounts[@]}" \
   --env "$POLICY_TOKEN_ENV=$POLICY_TOKEN" \
   --env PYTHONEXE=/opt/lehome-challenge/.venv/bin/python \
+  --env HF_HOME=/official/reference-hf-cache \
+  --env HF_HUB_CACHE=/official/reference-hf-cache/hub \
+  --env HF_XET_CACHE=/official/reference-hf-cache/xet \
+  --env HF_HUB_OFFLINE=1 \
+  --env TRANSFORMERS_OFFLINE=1 \
   --env "LEHOME_OFFICIAL_SMOKE_RECEIPT=$SMOKE_RECEIPT" \
   --entrypoint bash \
   "$ROLLOUT_IMAGE_ID" -lc "$CONTAINER_SCRIPT"

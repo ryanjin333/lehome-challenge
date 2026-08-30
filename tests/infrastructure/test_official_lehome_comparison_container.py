@@ -70,6 +70,21 @@ def test_container_wrapper_reuses_exact_native_reference_dependency_boundary() -
     assert "third_party/IsaacLab/source/isaaclab_tasks" in text
 
 
+def test_container_wrapper_mounts_pinned_competitor_cache_read_only_and_offline() -> None:
+    text = WRAPPER.read_text(encoding="utf-8")
+    assert "LEHOME_OFFICIAL_COMPETITOR_HF_CACHE_ROOT" in text
+    assert "869830fc749c35f34771aa5209f923ac57e4564e" in text
+    assert "baf604d8a5caf26fda5cc545f141bc1814156237" in text
+    assert "4d5e8e2a81a4b25084965ae87b8257a87ebe2f3b6656f83bbb15ba13675940b6" in text
+    assert "03ba0f11339d5ed24920582781c7352e308eb4eb78067c128bd8516b146656c8" in text
+    assert "1f572eb204d7afe3ddbfb890ca56eac1a9bafbdce51ed6fd3ba314dc4298d565" in text
+    assert 'src=$COMPETITOR_HF_CACHE_ROOT,dst=/official/reference-hf-cache,readonly' in text
+    assert "HF_HOME=/official/reference-hf-cache" in text
+    assert "HF_HUB_CACHE=/official/reference-hf-cache/hub" in text
+    assert "HF_HUB_OFFLINE=1" in text
+    assert "TRANSFORMERS_OFFLINE=1" in text
+
+
 def test_container_wrapper_redirects_bridge_logs_off_read_only_runtime() -> None:
     text = WRAPPER.read_text(encoding="utf-8")
     assert "LEHOME_NATIVE_REFERENCE_LOG_PROJECT_ROOT=/official/bridge-log" in text
