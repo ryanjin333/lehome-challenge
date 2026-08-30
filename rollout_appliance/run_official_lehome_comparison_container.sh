@@ -289,14 +289,14 @@ PY
 chmod 0444 "$COMPETITOR_EVIDENCE"/*.json
 mkdir -p /official/bridge-log
 for _ in $(seq 1 180); do
-  PYTHONPATH=/runtime/source/lehome:/runtime /isaac-sim/python.sh -m scripts.serve_official_docker_policy_bridge \
+  PYTHONPATH=/runtime/source/lehome:/runtime "$PYTHON_BIN" -m scripts.serve_official_docker_policy_bridge \
     --listen-host 127.0.0.1 --listen-port '"$BRIDGE_PORT"' \
     --policy-server-endpoint tcp://127.0.0.1:'"$POLICY_PORT"' \
     --policy-server-token-env '"$POLICY_TOKEN_ENV"' \
     --policy-server-request-timeout 600 >/official/bridge-log/bridge.log 2>&1 &
   bridge_pid=$!
   sleep 1
-  if kill -0 "$bridge_pid" >/dev/null 2>&1 && /isaac-sim/python.sh - <<'"'"'PY'"'"'
+  if kill -0 "$bridge_pid" >/dev/null 2>&1 && "$PYTHON_BIN" - <<'"'"'PY'"'"'
 import json, urllib.request
 request=urllib.request.Request("http://127.0.0.1:'"$BRIDGE_PORT"'/reset",data=b"{}",headers={"Content-Type":"application/json"},method="POST")
 with urllib.request.urlopen(request, timeout=2) as response:

@@ -61,6 +61,8 @@ def test_container_wrapper_reuses_exact_native_reference_dependency_boundary() -
     assert "PYTHONEXE=/opt/lehome-challenge/.venv/bin/python" in text
     assert "--python-bin /opt/lehome-challenge/.venv/bin/python" in text
     assert "--competitor-runtime-evidence-root" in text
+    assert '"$PYTHON_BIN" -m scripts.serve_official_docker_policy_bridge' in text
+    assert "/isaac-sim/python.sh -m scripts.serve_official_docker_policy_bridge" not in text
 
 
 def test_full_requires_smoke_receipt_and_smoke_rejects_one() -> None:
