@@ -1,0 +1,89 @@
+{
+  "action": {
+    "dimension": 12,
+    "groot_transform": [
+      {
+        "group": "left_arm",
+        "indices": [0, 1, 2, 3, 4],
+        "mode": "relative"
+      },
+      {
+        "group": "left_gripper",
+        "indices": [5],
+        "mode": "absolute"
+      },
+      {
+        "group": "right_arm",
+        "indices": [6, 7, 8, 9, 10],
+        "mode": "relative"
+      },
+      {
+        "group": "right_gripper",
+        "indices": [11],
+        "mode": "absolute"
+      }
+    ],
+    "names": [
+      "left_shoulder_pan",
+      "left_shoulder_lift",
+      "left_elbow_flex",
+      "left_wrist_flex",
+      "left_wrist_roll",
+      "left_gripper",
+      "right_shoulder_pan",
+      "right_shoulder_lift",
+      "right_elbow_flex",
+      "right_wrist_flex",
+      "right_wrist_roll",
+      "right_gripper"
+    ],
+    "source_key": "action",
+    "storage": "absolute",
+    "target_key": "action"
+  },
+  "cameras": [
+    {
+      "source_key": "observation.images.top_rgb",
+      "target_modality": "top_rgb"
+    },
+    {
+      "source_key": "observation.images.left_rgb",
+      "target_modality": "left_rgb"
+    },
+    {
+      "source_key": "observation.images.right_rgb",
+      "target_modality": "right_rgb"
+    }
+  ],
+  "future_actions": {
+    "horizon": 16,
+    "loader_allow_padding": false,
+    "materialized_windows": false,
+    "tail_convention": "drop_incomplete_windows"
+  },
+  "language": {
+    "instruction": "fold the garment on the table",
+    "target_modality": "annotation.human.task_description"
+  },
+  "schema_version": 1,
+  "source_dataset": "four_types_merged",
+  "state": {
+    "dimension": 12,
+    "names": [
+      "left_shoulder_pan",
+      "left_shoulder_lift",
+      "left_elbow_flex",
+      "left_wrist_flex",
+      "left_wrist_roll",
+      "left_gripper",
+      "right_shoulder_pan",
+      "right_shoulder_lift",
+      "right_elbow_flex",
+      "right_wrist_flex",
+      "right_wrist_roll",
+      "right_gripper"
+    ],
+    "source_key": "observation.state",
+    "target_key": "observation.state"
+  }
+}

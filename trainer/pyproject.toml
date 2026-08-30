@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lehome-train"
+version = "0.1.0"
+description = "Portable GR00T N1.7 training tools for LeHome"
+requires-python = "==3.10.18"
+dependencies = [
+    "click==8.1.8",
+    "huggingface-hub==0.36.2",
+    "pyarrow==23.0.1",
+    "typer==0.16.1",
+]
+
+[project.scripts]
+lehome-train = "lehome_train.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.1",
+]
+
+# Keep every runtime package shared with the pinned Isaac-GR00T lock at the
+# same version so installing the trainer cannot mutate upstream's environment.
+[tool.uv]
+constraint-dependencies = [
+    "certifi==2026.2.25",
+    "charset-normalizer==3.4.6",
+    "filelock==3.25.2",
+    "fsspec==2025.3.0",
+    "hf-xet==1.4.2",
+    "idna==3.11",
+    "markdown-it-py==4.0.0",
+    "packaging==26.0",
+    "pygments==2.19.2",
+    "requests==2.32.5",
+    "rich==14.3.3",
+    "tomli==2.4.0",
+    "tqdm==4.67.3",
+    "typing-extensions==4.15.0",
+    "urllib3==2.6.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lehome_train"]

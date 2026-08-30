@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "b1k-deploy"
+version = "0.1.0"
+description = "Capped external deployment controls for BEHAVIOR-1K smokes"
+requires-python = ">=3.10,<3.14"
+dependencies = ["b1k-rollout", "huggingface_hub==0.36.2"]
+
+[tool.uv.sources]
+b1k-rollout = { path = "../rollout", editable = false }
+
+[project.scripts]
+b1k-deploy = "b1k_deploy.cli:main"
+
+[dependency-groups]
+dev = ["pytest==8.4.1"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/b1k_deploy"]

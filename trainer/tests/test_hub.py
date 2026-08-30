@@ -1,0 +1,520 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import lehome_train.hub as hub_module
+from lehome_train.hub import (
+    HubAccess,
+    HuggingFaceHubTransport,
+    HubTransientError,
+    download_files,
+    ensure_approved_private_repository,
+    require_access,
+    upload_files,
+)
+from lehome_train.models import SyncEntry
+
+
+class FakeTransport:
+    def __init__(self) -> None:
+        self.access = HubAccess(can_read=True, can_write=True)
+        self.upload_calls: list[dict[str, object]] = []
+        self.upload_failures = 0
+        self.download_calls: list[dict[str, object]] = []
+        self.list_calls: list[dict[str, object]] = []
+
+    def check_access(self, *, repository: str, token: str) -> HubAccess:
+        return self.access
+
+    def upload_files(
+        self,
+        *,
+        repository: str,
+        revision: str,
+        source: Path,
+        entries: tuple[SyncEntry, ...],
+        token: str,
+    ) -> str:
+        self.upload_calls.append(
+            {
+                "repository": repository,
+                "revision": revision,
+                "source": source,
+                "entries": entries,
+                "token": token,
+            }
+        )
+        if self.upload_failures:
+            self.upload_failures -= 1
+            raise HubTransientError("hf_sensitive_retry_token transport detail")
+        return "a" * 40
+
+    def download_files(
+        self,
+        *,
+        repository: str,
+        revision: str,
+        destination: Path,
+        relative_paths: tuple[str, ...],
+        token: str,
+    ) -> str:
+        self.download_calls.append(
+            {
+                "repository": repository,
+                "revision": revision,
+                "destination": destination,
+                "relative_paths": relative_paths,
+                "token": token,
+            }
+        )
+        return revision
+
+    def list_tree(
+        self,
+        *,
+        repository: str,
+        revision: str,
+        token: str,
+    ) -> tuple[hub_module.HubTreeEntry, ...]:
+        self.list_calls.append(
+            {
+                "repository": repository,
+                "revision": revision,
+                "token": token,
+            }
+        )
+        return (hub_module.HubTreeEntry("payload.bin", "file"),)
+
+
+class FakeRepositoryTransport(FakeTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ensure_calls: list[dict[str, object]] = []
+
+    def ensure_private_repository(
+        self,
+        *,
+        repository: str,
+        repo_type: str,
+        token: str,
+        create: bool,
+        timeout_seconds: float,
+    ) -> HubAccess:
+        self.ensure_calls.append(
+            {
+                "repository": repository,
+                "repo_type": repo_type,
+                "token": token,
+                "create": create,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return HubAccess(can_read=True, can_write=True, private_repository=True)
+
+
+def test_upload_requires_process_token_and_passes_it_explicitly(tmp_path: Path) -> None:
+    transport = FakeTransport()
+    entry = SyncEntry("payload.bin", "0" * 64, 0)
+
+    resolved = upload_files(
+        transport=transport,
+        repository="owner/private-data",
+        revision="prepared-v1",
+        source=tmp_path,
+        entries=(entry,),
+        environ={"HF_TOKEN": "hf_process_memory_only"},
+    )
+
+    assert resolved == "a" * 40
+    assert transport.upload_calls == [
+        {
+            "repository": "owner/private-data",
+            "revision": "prepared-v1",
+            "source": tmp_path,
+            "entries": (entry,),
+            "token": "hf_process_memory_only",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="HF_TOKEN"):
+        upload_files(
+            transport=transport,
+            repository="owner/private-data",
+            revision="prepared-v1",
+            source=tmp_path,
+            entries=(entry,),
+            environ={},
+        )
+
+
+@pytest.mark.parametrize(
+    ("access", "read", "write", "message"),
+    [
+        (HubAccess(can_read=False, can_write=True), True, False, "read"),
+        (HubAccess(can_read=True, can_write=False), False, True, "write"),
+    ],
+)
+def test_permission_failures_are_fail_closed_and_redacted(
+    access: HubAccess,
+    read: bool,
+    write: bool,
+    message: str,
+) -> None:
+    transport = FakeTransport()
+    transport.access = access
+    token = "hf_sensitive_permission_token"
+
+    with pytest.raises(PermissionError, match=message) as error:
+        require_access(
+            transport=transport,
+            repository="owner/private-data",
+            read=read,
+            write=write,
+            environ={"HF_TOKEN": token},
+        )
+
+    assert token not in str(error.value)
+
+
+def test_hub_private_repo_without_permission_metadata_requires_token_write_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(private=True),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_api",
+        lambda _token: SimpleNamespace(
+            whoami=lambda **_kwargs: {
+                "name": "RyanJin333",
+                "auth": {"accessToken": {"role": "write"}}
+            }
+        ),
+    )
+
+    access = transport.check_access(
+        repository="ryanjin333/lehome-groot-n17-models",
+        token="hf_explicit_permission_probe",
+    )
+
+    assert access.can_read is True
+    assert access.can_write is True
+    assert access.private_repository is True
+
+
+@pytest.mark.parametrize(
+    ("identity", "expected_write"),
+    [
+        (
+            {
+                "name": "ryanjin333",
+                "auth": {"accessToken": {"role": "write"}},
+            },
+            True,
+        ),
+        (
+            {
+                "name": "someone-else",
+                "auth": {"accessToken": {"role": "write"}},
+            },
+            False,
+        ),
+        ({"auth": {"accessToken": {"role": "write"}}}, False),
+        (
+            {
+                "name": "ryanjin333",
+                "auth": {"accessToken": {"role": "read"}},
+            },
+            False,
+        ),
+        ({}, False),
+        ({"auth": None}, False),
+        ({"auth": {"accessToken": "malformed"}}, False),
+        ({"auth": {"accessToken": {"role": ["write"]}}}, False),
+    ],
+)
+def test_hub_token_capability_is_explicit_and_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    identity: object,
+    expected_write: bool,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(private=True),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_api",
+        lambda _token: SimpleNamespace(whoami=lambda **_kwargs: identity),
+    )
+
+    access = transport.check_access(
+        repository="ryanjin333/lehome-groot-n17-models",
+        token="hf_explicit_capability_probe",
+    )
+
+    assert access.can_read is True
+    assert access.can_write is expected_write
+
+
+def test_hub_token_capability_failure_is_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = HuggingFaceHubTransport()
+    token = "hf_sensitive_capability_token"
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(private=True),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_api",
+        lambda _token: SimpleNamespace(
+            whoami=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError(token))
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="access check failed") as error:
+        transport.check_access(
+            repository="ryanjin333/lehome-groot-n17-models",
+            token=token,
+        )
+
+    assert token not in str(error.value)
+    assert error.value.__cause__ is None
+
+
+def test_upload_retries_only_to_the_explicit_limit_and_redacts_failures(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport()
+    transport.upload_failures = 4
+    token = "hf_sensitive_retry_token"
+
+    with pytest.raises(RuntimeError, match="3 attempts") as error:
+        upload_files(
+            transport=transport,
+            repository="owner/private-data",
+            revision="prepared-v1",
+            source=tmp_path,
+            entries=(SyncEntry("payload.bin", "0" * 64, 0),),
+            environ={"HF_TOKEN": token},
+            max_attempts=3,
+        )
+
+    assert len(transport.upload_calls) == 3
+    assert token not in str(error.value)
+
+
+def test_retry_backoff_is_bounded_and_uses_the_injected_sleeper(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport()
+    transport.upload_failures = 2
+    observed_delays: list[float] = []
+
+    resolved = upload_files(
+        transport=transport,
+        repository="owner/private-data",
+        revision="prepared-v1",
+        source=tmp_path,
+        entries=(SyncEntry("payload.bin", "0" * 64, 0),),
+        environ={"HF_TOKEN": "hf_retry_process_token"},
+        max_attempts=3,
+        sleeper=observed_delays.append,
+    )
+
+    assert resolved == "a" * 40
+    assert observed_delays == [0.25, 0.5]
+    assert len(transport.upload_calls) == 3
+
+
+def test_download_requires_and_preserves_an_explicit_immutable_revision(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport()
+    revision = "b" * 40
+
+    observed = download_files(
+        transport=transport,
+        repository="owner/private-data",
+        revision=revision,
+        destination=tmp_path,
+        relative_paths=("manifest.json",),
+        environ={"HF_TOKEN": "hf_download_process_token"},
+    )
+
+    assert observed == revision
+    assert transport.download_calls[0]["revision"] == revision
+    assert transport.download_calls[0]["token"] == "hf_download_process_token"
+
+    with pytest.raises(ValueError, match="immutable"):
+        download_files(
+            transport=transport,
+            repository="owner/private-data",
+            revision="prepared-v1",
+            destination=tmp_path,
+            relative_paths=("manifest.json",),
+            environ={"HF_TOKEN": "hf_download_process_token"},
+        )
+    assert len(transport.download_calls) == 1
+
+
+def test_tree_listing_requires_and_preserves_an_explicit_immutable_revision() -> None:
+    transport = FakeTransport()
+    revision = "c" * 40
+
+    observed = hub_module.list_repository_tree(
+        transport=transport,
+        repository="owner/private-data",
+        revision=revision,
+        environ={"HF_TOKEN": "hf_tree_process_token"},
+    )
+
+    assert observed == (hub_module.HubTreeEntry("payload.bin", "file"),)
+    assert transport.list_calls == [
+        {
+            "repository": "owner/private-data",
+            "revision": revision,
+            "token": "hf_tree_process_token",
+        }
+    ]
+    with pytest.raises(ValueError, match="immutable"):
+        hub_module.list_repository_tree(
+            transport=transport,
+            repository="owner/private-data",
+            revision="mutable-branch",
+            environ={"HF_TOKEN": "hf_tree_process_token"},
+        )
+    assert len(transport.list_calls) == 1
+
+
+def test_approved_private_repository_creation_is_explicit_and_never_public() -> None:
+    transport = FakeRepositoryTransport()
+
+    ensure_approved_private_repository(
+        transport=transport,
+        repository="ryanjin333/lehome-groot-n17-data",
+        create=True,
+        environ={"HF_TOKEN": "hf_process_memory_only"},
+        timeout_seconds=12.0,
+    )
+
+    assert transport.ensure_calls == [
+        {
+            "repository": "ryanjin333/lehome-groot-n17-data",
+            "repo_type": "dataset",
+            "token": "hf_process_memory_only",
+            "create": True,
+            "timeout_seconds": 12.0,
+        }
+    ]
+    with pytest.raises(ValueError, match="approved"):
+        ensure_approved_private_repository(
+            transport=transport,
+            repository="owner/public-or-unapproved",
+            create=True,
+            environ={"HF_TOKEN": "hf_process_memory_only"},
+        )
+
+
+def test_real_transport_is_lazy_and_requires_finite_timeout() -> None:
+    transport = HuggingFaceHubTransport(timeout_seconds=15.0)
+
+    assert transport.timeout_seconds == 15.0
+    with pytest.raises(ValueError, match="finite positive"):
+        HuggingFaceHubTransport(timeout_seconds=float("inf"))
+
+
+def test_real_transport_configures_a_finite_default_for_every_http_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured: list[object] = []
+
+    class FakeSession:
+        def request(self, method: str, url: str, **kwargs: object) -> object:
+            return kwargs["timeout"]
+
+    fake_hub = SimpleNamespace(
+        configure_http_backend=lambda *, backend_factory: configured.append(
+            backend_factory
+        )
+    )
+
+    def fake_import(name: str) -> object:
+        if name == "huggingface_hub":
+            return fake_hub
+        if name == "requests":
+            return SimpleNamespace(Session=FakeSession)
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr("lehome_train.hub.importlib.import_module", fake_import)
+    transport = HuggingFaceHubTransport(timeout_seconds=17.0)
+
+    assert transport._library() is fake_hub
+    session = configured[0]()
+    assert session.request("GET", "https://example.invalid") == 17.0
+    assert session.request("GET", "https://example.invalid", timeout=None) == 17.0
+    assert session.request("GET", "https://example.invalid", timeout=3.0) == 3.0
+
+
+def test_real_transport_lists_complete_tree_at_explicit_commit_with_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revision = "d" * 40
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeApi:
+        def list_repo_tree(self, **kwargs: object) -> list[object]:
+            calls.append(("tree", kwargs))
+            return [
+                SimpleNamespace(path="experiments", tree_id="tree-root"),
+                SimpleNamespace(
+                    path="experiments/run/payload.bin",
+                    size=7,
+                    blob_id="blob",
+                ),
+            ]
+
+        def list_repo_files(self, **kwargs: object) -> list[str]:
+            calls.append(("files", kwargs))
+            return ["experiments/run/payload.bin"]
+
+    transport = HuggingFaceHubTransport(timeout_seconds=19.0)
+    monkeypatch.setattr(transport, "_api", lambda token: FakeApi())
+    monkeypatch.setattr(
+        transport,
+        "_repo_info",
+        lambda **_kwargs: SimpleNamespace(sha=revision),
+    )
+
+    observed = transport.list_tree(
+        repository="ryanjin333/lehome-groot-n17-models",
+        revision=revision,
+        token="hf_explicit_tree_token",
+    )
+
+    assert observed == (
+        hub_module.HubTreeEntry("experiments", "directory"),
+        hub_module.HubTreeEntry("experiments/run/payload.bin", "file"),
+    )
+    expected_common = {
+        "repo_id": "ryanjin333/lehome-groot-n17-models",
+        "repo_type": "model",
+        "revision": revision,
+        "token": "hf_explicit_tree_token",
+    }
+    assert calls == [
+        ("tree", {**expected_common, "recursive": True, "expand": True}),
+        ("files", expected_common),
+    ]

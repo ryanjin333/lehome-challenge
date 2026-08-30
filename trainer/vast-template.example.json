@@ -1,0 +1,27 @@
+{
+  "env": "--user root --ipc=host --shm-size=64g --ulimit memlock=-1 --ulimit stack=67108864 -e AUTO_DESTROY=0 -e RUN_ID=b1k-template-schema -e CYCLE_ID=b1k-template-schema-cycle -e CONTAINER_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000 -e B1K_HF_TOKEN_FILE=/workspace/.cache/huggingface/token -e HF_DATASET_REPO=behavior-1k/2026-challenge-demos -e HF_MODEL_REPO=ryanjin333/behavior1k-groot-n17-models -e HF_CHECKPOINT_BUCKET=ryanjin333/behavior1k-groot-n17-checkpoints -e DATASET_REVISION=4f50b44796641a4d526a19d9aeadc8aa51e2f2c2 -e GROOT_REVISION=ace36d935b376fbf25cd56371e23877b95407c40 -e TRAIN_STEPS=15000 -e SAVE_STEPS=1000 -e CHECKPOINT_KEEP=2 -e RESUME_POLICY=auto -e BASE_MODEL_REVISION=2fc962b973bccdd5d8ce4f67cc63b264d6886495 -e COSMOS_REPOSITORY=nvidia/Cosmos-Reason2-2B -e COSMOS_REVISION=9ce19a195e423419c349abfc86fd07178b230561 -e EXPERIMENT_NAME=b1k-template-schema",
+  "extra_filters": {
+    "cpu_cores_effective": {"gte": 24},
+    "cpu_ram": {"gte": 128000},
+    "datacenter": {"eq": true},
+    "direct_port_count": {"gte": 1},
+    "disk_bw": {"gte": 4000},
+    "external": {"eq": false},
+    "gpu_name": {"in": ["RTX PRO 6000 S", "RTX PRO 6000 WS"]},
+    "gpu_ram": {"gte": 96000},
+    "inet_down": {"gte": 1000},
+    "inet_up": {"gte": 500},
+    "num_gpus": {"gte": 1, "lte": 4},
+    "rentable": {"eq": true},
+    "verified": {"eq": true}
+  },
+  "image": "docker.io/ryanjin333/behavior1k-groot-n17-trainer@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "jup_direct": false,
+  "name": "behavior1k-groot-n17-trainer",
+  "onstart": "bash /opt/b1k-launchkit/onstart.sh",
+  "private": true,
+  "recommended_disk_space": 2048,
+  "runtype": "ssh",
+  "ssh_direct": true,
+  "use_ssh": true
+}
