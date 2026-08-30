@@ -63,6 +63,10 @@ def test_container_wrapper_reuses_exact_native_reference_dependency_boundary() -
     assert "--competitor-runtime-evidence-root" in text
     assert text.count("/isaac-sim/python.sh -m scripts.serve_official_docker_policy_bridge") == 1
     assert 'then bridge_ready=1; break; fi' in text
+    assert "CONTROLLER_WIRE_ROOT" in text
+    assert "msgpack.__version__ != \"1.1.0\"" in text
+    assert "zmq.__version__ != \"27.0.1\"" in text
+    assert "third_party/IsaacLab/source/isaaclab_tasks" in text
 
 
 def test_full_requires_smoke_receipt_and_smoke_rejects_one() -> None:

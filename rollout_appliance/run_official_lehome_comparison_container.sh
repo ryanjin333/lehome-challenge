@@ -14,6 +14,7 @@ readonly METADATA_ROOT="${LEHOME_OFFICIAL_METADATA_ROOT:-}"
 readonly N17_CHECKPOINT_ROOT="${LEHOME_OFFICIAL_N17_CHECKPOINT_ROOT:-}"
 readonly N17_IDENTITY_RECEIPT="${LEHOME_OFFICIAL_N17_IDENTITY_RECEIPT:-}"
 readonly N17_BASE_MODEL_ROOT="/mnt/lehome/cache/models/nvidia/Cosmos-Reason2-2B"
+readonly CONTROLLER_WIRE_ROOT="/mnt/lehome/eval/pydeps"
 readonly COMPETITOR_CHECKPOINT_ROOT="${LEHOME_OFFICIAL_COMPETITOR_CHECKPOINT_ROOT:-}"
 readonly SANITIZED_CONFIG_ROOT="${LEHOME_OFFICIAL_SANITIZED_CONFIG_ROOT:-}"
 readonly COMPATIBILITY_RECEIPT="${LEHOME_OFFICIAL_COMPATIBILITY_RECEIPT:-}"
@@ -74,6 +75,7 @@ require_directory "$METADATA_ROOT" "policy metadata root"
 require_directory "$N17_CHECKPOINT_ROOT" "N1.7 checkpoint"
 require_file "$N17_IDENTITY_RECEIPT" "N1.7 checkpoint identity receipt"
 require_directory "$N17_BASE_MODEL_ROOT" "N1.7 base model"
+require_directory "$CONTROLLER_WIRE_ROOT" "N1.7 controller wire dependencies"
 for base_model_file_and_digest in \
   "model.safetensors:7de1838c87a5349b016c26a1c3f7d2bc400a3d485f95ef39a7059ffd734977a0" \
   "config.json:bec4b3d446efa05807365c9e1cec03ac590836879d02f3a6da879971154bdd3b" \
@@ -210,6 +212,7 @@ declare -a mounts=(
   --mount "type=bind,src=$COMPATIBILITY_RECEIPT,dst=$COMPATIBILITY_RECEIPT,readonly"
   --mount "type=bind,src=$EVIDENCE_ROOT,dst=/official/evidence"
   --mount "type=bind,src=$REPO_ROOT,dst=/runtime,readonly"
+  --mount "type=bind,src=$CONTROLLER_WIRE_ROOT,dst=/official/wire,readonly"
   --mount "type=bind,src=$PEFT_WHEEL_PATH,dst=$PEFT_WHEEL_PATH,readonly"
   --mount "type=bind,src=$FLASH_ATTENTION_WHEEL_PATH,dst=$FLASH_ATTENTION_WHEEL_PATH,readonly"
   --mount "type=bind,src=$DM_TREE_WHEEL_PATH,dst=$DM_TREE_WHEEL_PATH,readonly"
@@ -287,8 +290,13 @@ target=Path(sys.argv[1]); fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o4
 with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(payload,stream,sort_keys=True,separators=(",",":")); stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
 PY
 chmod 0444 "$COMPETITOR_EVIDENCE"/*.json
+PYTHONPATH=/official/wire "$PYTHON_BIN" - <<'"'"'PY'"'"'
+import msgpack, zmq
+if msgpack.__version__ != "1.1.0" or zmq.__version__ != "27.0.1":
+    raise SystemExit("controller wire dependency identity mismatch")
+PY
 mkdir -p /official/bridge-log
-PYTHONPATH=/runtime/source/lehome:/runtime /isaac-sim/python.sh -m scripts.serve_official_docker_policy_bridge \
+PYTHONPATH=/official/wire:/runtime/source/lehome:/runtime:/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab:/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab_tasks /isaac-sim/python.sh -m scripts.serve_official_docker_policy_bridge \
   --listen-host 127.0.0.1 --listen-port '"$BRIDGE_PORT"' \
   --policy-server-endpoint tcp://127.0.0.1:'"$POLICY_PORT"' \
   --policy-server-token-env '"$POLICY_TOKEN_ENV"' \
