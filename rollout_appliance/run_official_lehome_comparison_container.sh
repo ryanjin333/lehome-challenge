@@ -389,6 +389,7 @@ docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
   --env HF_HOME=/official/reference-hf-cache \
   --env HF_HUB_CACHE=/official/reference-hf-cache/hub \
   --env HF_XET_CACHE=/official/reference-hf-cache/xet \
+  --env HF_DATASETS_CACHE=/tmp/lehome-reference-datasets-cache \
   --env HF_HUB_OFFLINE=1 \
   --env TRANSFORMERS_OFFLINE=1 \
   --env "LEHOME_OFFICIAL_SMOKE_RECEIPT=$SMOKE_RECEIPT" \

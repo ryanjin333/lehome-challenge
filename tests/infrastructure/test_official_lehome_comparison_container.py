@@ -81,6 +81,7 @@ def test_container_wrapper_mounts_pinned_competitor_cache_read_only_and_offline(
     assert 'src=$COMPETITOR_HF_CACHE_ROOT,dst=/official/reference-hf-cache,readonly' in text
     assert "HF_HOME=/official/reference-hf-cache" in text
     assert "HF_HUB_CACHE=/official/reference-hf-cache/hub" in text
+    assert "HF_DATASETS_CACHE=/tmp/lehome-reference-datasets-cache" in text
     assert "HF_HUB_OFFLINE=1" in text
     assert "TRANSFORMERS_OFFLINE=1" in text
 
