@@ -123,7 +123,8 @@ with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(payload,stream,sort
 PY
 
 capture_image_receipt() {
-  local reference="$1" output="$2" mode="$3" raw="$EVIDENCE_ROOT/image-inspect-$mode.json"
+  local reference="$1" output="$2" mode="$3" raw
+  raw="$EVIDENCE_ROOT/image-inspect-$mode.json"
   docker image inspect -- "$reference" >"$raw" || fail "$mode image inspection failed"
   python3 - "$raw" "$output" "$reference" "$mode" <<'PY'
 import hashlib, json, os, sys

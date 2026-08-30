@@ -36,6 +36,8 @@ def test_container_wrapper_binds_reviewed_runtime_images_and_real_policy_readine
     assert "policy-server-startup.log" in text
     assert "cuda-runtime.json" in text
     assert 'docker exec -i "$POLICY_CONTAINER"' in text
+    assert 'local reference="$1" output="$2" mode="$3" raw\n' in text
+    assert 'raw="$EVIDENCE_ROOT/image-inspect-$mode.json"' in text
 
 
 def test_container_wrapper_reuses_exact_native_reference_dependency_boundary() -> None:
