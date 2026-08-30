@@ -61,9 +61,7 @@ def test_container_wrapper_reuses_exact_native_reference_dependency_boundary() -
     assert "PYTHONEXE=/opt/lehome-challenge/.venv/bin/python" in text
     assert "--python-bin /opt/lehome-challenge/.venv/bin/python" in text
     assert "--competitor-runtime-evidence-root" in text
-    assert '"$PYTHON_BIN" -m scripts.serve_official_docker_policy_bridge' in text
-    assert "/isaac-sim/python.sh -m scripts.serve_official_docker_policy_bridge" not in text
-    assert text.count('"$PYTHON_BIN" -m scripts.serve_official_docker_policy_bridge') == 1
+    assert text.count("/isaac-sim/python.sh -m scripts.serve_official_docker_policy_bridge") == 1
     assert 'then bridge_ready=1; break; fi' in text
 
 

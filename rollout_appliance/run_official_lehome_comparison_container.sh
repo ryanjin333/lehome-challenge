@@ -288,7 +288,7 @@ with os.fdopen(fd,"w",encoding="utf-8") as stream: json.dump(payload,stream,sort
 PY
 chmod 0444 "$COMPETITOR_EVIDENCE"/*.json
 mkdir -p /official/bridge-log
-PYTHONPATH=/runtime/source/lehome:/runtime "$PYTHON_BIN" -m scripts.serve_official_docker_policy_bridge \
+PYTHONPATH=/runtime/source/lehome:/runtime /isaac-sim/python.sh -m scripts.serve_official_docker_policy_bridge \
   --listen-host 127.0.0.1 --listen-port '"$BRIDGE_PORT"' \
   --policy-server-endpoint tcp://127.0.0.1:'"$POLICY_PORT"' \
   --policy-server-token-env '"$POLICY_TOKEN_ENV"' \
