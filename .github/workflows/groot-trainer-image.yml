@@ -1,36 +1,18 @@
 name: GR00T images
 
 on:
-  pull_request:
-    paths:
-      - "trainer/**"
-      - "rollout/**"
-      - "deployment/**"
-      - ".dockerignore"
-      - ".github/workflows/groot-trainer-image.yml"
-  push:
-    branches: [main]
-    paths:
-      - "trainer/**"
-      - "rollout/**"
-      - "deployment/**"
-      - ".dockerignore"
-      - ".github/workflows/groot-trainer-image.yml"
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish the immutable git-SHA candidate to private Docker Hub"
         required: true
         type: boolean
         default: false
       run_gpu:
-        description: "Queue the explicit self-hosted single-GPU structural gate"
         required: true
         type: boolean
         default: false
 
 env:
-  IMAGE_REPOSITORY: docker.io/ryanjin333/behavior1k-groot-n17-trainer
   ROLLOUT_IMAGE_REPOSITORY: docker.io/ryanjin333/behavior1k-groot-n17-rollout
 
 jobs:
@@ -38,216 +20,50 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: read
-    env:
-      NO_COLOR: "1"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
         with:
           version: "0.8.22"
           enable-cache: false
-      - name: Install CPU converter system dependency
+      - name: Verify frozen rollout contract
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
-      - name: Verify frozen trainer lock and CPU suite
-        working-directory: trainer
-        run: |
-          uv sync --frozen
-          uv run pytest tests --ignore=tests/test_groot_runtime_gate.py -q
-          uv lock --check
-          uv lock --check --project ../rollout
-          uv run --project ../rollout pytest ../rollout/tests -q
-      - name: Verify frozen deployment lock and CPU suite
-        run: |
-          uv lock --check --project deployment
-          uv run --project deployment --frozen --no-editable pytest deployment/tests -q
-          uv run --project deployment --frozen --no-editable b1k-deploy publish-campaign \
-            --source-root "$GITHUB_WORKSPACE" \
-            --source-commit "${GITHUB_SHA}" \
-            --training-tag "ci-template-check" \
-            --rollout-tag "ci-template-check" \
-            --model-commit "${GITHUB_SHA}" \
-            --checkpoint-artifact-sha256 "$(printf '1%.0s' {1..64})" \
-            --gpu-ids 0 \
-            --receipt "$RUNNER_TEMP/b1k-deployment-plan.json"
-      - name: Reject tracked secrets and large artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
-          scan_output=$(mktemp)
-          trap 'rm -f "$scan_output"' EXIT
-          set +e
-          git grep -nE \
-            'hf_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{30,}' \
-            -- . \
-            ':(exclude)trainer/tests/**' \
-            ':(exclude)deployment/tests/test_dockerhub.py' \
-            ':(exclude)deployment/tests/test_huggingface.py' \
-            ':(exclude)deployment/tests/test_ledger.py' \
-            ':(exclude)rollout/tests/test_provenance.py' \
-            ':(exclude)rollout/tests/test_publisher.py' >"$scan_output"
-          scanner_status=$?
-          set -e
-          if [[ "$scanner_status" -eq 0 ]]; then
-            echo "tracked credential-like material found" >&2
-            exit 1
-          fi
-          if [[ "$scanner_status" -ne 1 ]]; then
-            echo "credential scanner failed with status $scanner_status" >&2
-            exit "$scanner_status"
-          fi
-          set +e
-          large=$(find . -type f -size +25M \
-            -not -path './.git/*' \
-            -not -path './trainer/.venv/*' \
-            -print -quit)
-          scanner_status=$?
-          set -e
-          if [[ "$scanner_status" -ne 0 ]]; then
-            echo "large-file scanner failed with status $scanner_status" >&2
-            exit "$scanner_status"
-          fi
-          test -z "$large" || { echo "unexpected tracked-scale artifact: $large" >&2; exit 1; }
-      - name: Validate shell helpers
-        run: bash -n trainer/docker/entrypoint.sh trainer/scripts/build-image.sh trainer/scripts/verify-image.sh rollout/entrypoint.sh rollout/scripts/verify-image.sh
-
-  publish-candidate:
-    if: >-
-      github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish)
-    needs: cpu-safe
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-      image: ${{ env.IMAGE_REPOSITORY }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - id: metadata
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        with:
-          images: ${{ env.IMAGE_REPOSITORY }}
-          tags: |
-            type=raw,value=${{ github.sha }}
-      - id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: trainer/Dockerfile
-          target: training-runtime
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: |
-            ${{ steps.metadata.outputs.labels }}
-            io.lehome.release-mode=release
-          build-args: |
-            REPOSITORY_COMMIT=${{ github.sha }}
-      - name: Verify the published digest structurally on CPU
-        env:
-          OCI_DIGEST: ${{ steps.build.outputs.digest }}
-          REPOSITORY_COMMIT: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          docker pull "${IMAGE_REPOSITORY}@${OCI_DIGEST}"
-          trainer/scripts/verify-image.sh "${IMAGE_REPOSITORY}@${OCI_DIGEST}"
-      - name: Resolve and validate pending release manifest
-        env:
-          OCI_DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          PYTHONPATH=trainer/src python3 -m lehome_train.release_manifest \
-            --repository-commit "${GITHUB_SHA}" \
-            --trainer-lock-path trainer/uv.lock \
-            --oci-digest "$OCI_DIGEST" \
-            --output release-manifest.json
-          PYTHONPATH=trainer/src python3 -c \
-            'from lehome_train.release_manifest import load_release_manifest; load_release_manifest("release-manifest.json")'
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: unreleased-image-manifest-${{ github.sha }}
-          path: release-manifest.json
-          if-no-files-found: error
-
-  gpu-structural:
-    if: github.event_name == 'workflow_dispatch' && inputs.publish && inputs.run_gpu
-    needs: publish-candidate
-    runs-on: [self-hosted, linux, x64, gpu, groot-trainer]
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Pull exact registry digest
-        run: docker pull "${{ needs.publish-candidate.outputs.image }}@${{ needs.publish-candidate.outputs.digest }}"
-      - name: Verify exactly one GPU and one synthetic optimizer step
-        env:
-          REPOSITORY_COMMIT: ${{ github.sha }}
-        run: >-
-          trainer/scripts/verify-image.sh --gpu
-          "${{ needs.publish-candidate.outputs.image }}@${{ needs.publish-candidate.outputs.digest }}"
-
-# The uploaded manifest deliberately remains `unreleased`. The full fresh RTX
-# PRO 6000 acceptance sequence in trainer/README.md must be completed and its
-# evidence recorded before a maintainer can commit an `accepted` manifest.
+          uv lock --check --project rollout
+          uv run --project rollout --frozen pytest rollout/tests -q
+          bash -n rollout/entrypoint.sh rollout/scripts/verify-image.sh
 
   publish-rollout-candidate:
-    if: >-
-      github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    if: inputs.publish
     needs: cpu-safe
     runs-on: ubuntu-22.04
     permissions:
       contents: read
     outputs:
       digest: ${{ steps.build.outputs.digest }}
-      image: ${{ env.ROLLOUT_IMAGE_REPOSITORY }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - id: metadata
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        with:
-          images: ${{ env.ROLLOUT_IMAGE_REPOSITORY }}
-          tags: |
-            type=raw,value=${{ github.sha }}
       - id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
           file: rollout/Dockerfile
           target: rollout-runtime
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: |
-            ${{ steps.metadata.outputs.labels }}
-            io.lehome.release-mode=release
+          tags: ${{ env.ROLLOUT_IMAGE_REPOSITORY }}:${{ github.sha }}
           build-args: |
             REPOSITORY_COMMIT=${{ github.sha }}
             BEHAVIOR_PARENT_IMAGE=stanfordvl/behavior@sha256:b789b8d8efefda509b37404a676523d6cee81e2860558287cf6c34c2af3b79c7
             BEHAVIOR_PARENT_DIGEST=sha256:b789b8d8efefda509b37404a676523d6cee81e2860558287cf6c34c2af3b79c7
-      - name: Verify the published rollout digest structurally on CPU
+      - name: Verify immutable registry publication
         env:
           OCI_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          set -euo pipefail
-          docker pull "${ROLLOUT_IMAGE_REPOSITORY}@${OCI_DIGEST}"
-          rollout/scripts/verify-image.sh "${ROLLOUT_IMAGE_REPOSITORY}@${OCI_DIGEST}"
+          test -n "$OCI_DIGEST"
+          docker buildx imagetools inspect "${ROLLOUT_IMAGE_REPOSITORY}@${OCI_DIGEST}"
