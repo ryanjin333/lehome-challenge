@@ -53,12 +53,21 @@ if any(compatibility_values) and not all(compatibility_values):
     _fatal("checkpoint compatibility environment is incomplete")
 if all(compatibility_values):
     try:
-        from checkpoint_compatibility import install_checkpoint_config_view
+        from checkpoint_compatibility import (
+            install_checkpoint_config_view,
+            install_cpu_action_normalization_boundary,
+        )
 
         install_checkpoint_config_view(
             Path(raw_checkpoint_root),
             Path(raw_sanitized_root),
             Path(raw_compatibility_receipt),
+        )
+        from lerobot.processor.core import TransitionKey
+        from scripts.eval_policy.lerobot_policy import LeRobotPolicy
+
+        install_cpu_action_normalization_boundary(
+            LeRobotPolicy, TransitionKey.ACTION
         )
     except Exception as error:
         _fatal(f"checkpoint compatibility loader failed: {error}")

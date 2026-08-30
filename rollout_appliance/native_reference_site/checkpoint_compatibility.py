@@ -24,6 +24,31 @@ REMOVED_FIELDS = (
 )
 
 
+def install_cpu_action_normalization_boundary(
+    policy_class: type[Any], action_key: object
+) -> None:
+    """Keep the evaluator's dummy action with its CPU normalization statistics."""
+    original_prepare = getattr(policy_class, "_prepare_for_preprocessor", None)
+    if not callable(original_prepare):
+        raise RuntimeError("official LeRobot policy preparation method is unavailable")
+
+    def prepare_with_cpu_action(self: object, observation: object) -> dict[object, object]:
+        transition = original_prepare(self, observation)
+        if not isinstance(transition, dict) or action_key not in transition:
+            raise RuntimeError("official LeRobot transition action is unavailable")
+        action = transition[action_key]
+        move_to_cpu = getattr(action, "cpu", None)
+        if not callable(move_to_cpu):
+            raise RuntimeError("official LeRobot transition action is not a tensor")
+        cpu_action = move_to_cpu()
+        if str(getattr(cpu_action, "device", "")) != "cpu":
+            raise RuntimeError("official LeRobot transition action did not move to CPU")
+        transition[action_key] = cpu_action
+        return transition
+
+    policy_class._prepare_for_preprocessor = prepare_with_cpu_action
+
+
 def _regular_bytes(path: Path, label: str) -> bytes:
     if path.is_symlink() or not path.is_file():
         raise RuntimeError(f"{label} is unavailable or unsafe")

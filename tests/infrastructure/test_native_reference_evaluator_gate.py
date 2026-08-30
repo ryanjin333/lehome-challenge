@@ -1565,6 +1565,43 @@ def test_two_pinned_module_invocations_redirect_logs_and_leave_source_immutable(
     assert not any(source.rglob("__pycache__"))
 
 
+def test_cpu_action_normalization_boundary_moves_only_dummy_action_to_cpu() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "checkpoint_compatibility_under_test", CHECKPOINT_COMPATIBILITY_SHIM
+    )
+    assert spec is not None and spec.loader is not None
+    compatibility = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(compatibility)
+
+    class FakeAction:
+        def __init__(self, device: str) -> None:
+            self.device = device
+
+        def cpu(self) -> "FakeAction":
+            return FakeAction("cpu")
+
+    observation = object()
+
+    class FakePolicy:
+        def _prepare_for_preprocessor(self, _observation: object) -> dict[object, object]:
+            return {"action": FakeAction("cuda:0"), "observation": observation}
+
+    compatibility.install_cpu_action_normalization_boundary(FakePolicy, "action")
+    transition = FakePolicy()._prepare_for_preprocessor(object())
+
+    assert transition["action"].device == "cpu"
+    assert transition["observation"] is observation
+
+
+def test_sitecustomize_installs_cpu_action_normalization_boundary_for_compatible_checkpoint() -> None:
+    text = NATIVE_SITE_CUSTOMIZE.read_text(encoding="utf-8")
+    assert "install_cpu_action_normalization_boundary" in text
+    assert "LeRobotPolicy" in text
+    assert "TransitionKey.ACTION" in text
+
+
 def test_checkpoint_compatibility_shim_sanitizes_only_training_fields_and_preserves_load_paths(
     tmp_path: Path,
 ) -> None:
