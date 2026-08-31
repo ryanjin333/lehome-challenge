@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Sequence
 
@@ -48,6 +49,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_inputs(output)
     output.add_argument("--training-root", type=Path, required=True)
+    lifecycle = commands.add_parser(
+        "lifecycle-plan",
+        help="write an immutable, pre-paid N1.5 lifecycle plan",
+    )
+    lifecycle.add_argument("--run-id", required=True)
+    lifecycle.add_argument("--budget-usd", type=float, required=True)
+    lifecycle.add_argument("--estimated-cost-usd", type=float, required=True)
+    lifecycle.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -82,6 +91,38 @@ def _verified_inputs_receipt(verified, contract: ReproductionContract) -> dict[s
     }
 
 
+def _lifecycle_plan(args: argparse.Namespace, contract: ReproductionContract) -> dict[str, object]:
+    """Return a pure, immutable admission record before the host may start a VM."""
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,127}", args.run_id) is None:
+        raise ReproductionError("lifecycle run id is invalid")
+    if not (args.budget_usd > 0.0 and args.budget_usd <= 100.0):
+        raise ReproductionError("budget must be positive and cannot exceed the $100 hard cap")
+    if not (args.estimated_cost_usd >= 0.0 and args.estimated_cost_usd <= args.budget_usd):
+        raise ReproductionError("estimated lifecycle cost exceeds the approved budget")
+    return {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_lifecycle_plan_v1",
+        "run_id": args.run_id,
+        "vm_id": contract.vm_id,
+        "protected_disk_id": contract.disk_id,
+        "budget_usd": args.budget_usd,
+        "estimated_cost_usd": args.estimated_cost_usd,
+        "stages": [
+            "verify_stopped",
+            "start",
+            "validate_runtime",
+            "train",
+            "train_publish_readback",
+            "focused_gate",
+            "focused_gate_publish_readback",
+            "harvest",
+            "harvest_publish_readback",
+            "stop",
+        ],
+        "downstream_forbidden_on_failure": True,
+    }
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -90,35 +131,44 @@ def main(
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        verified = _verified(args, contract)
-        if args.command == "verify-inputs":
-            value = _verified_inputs_receipt(verified, contract)
+        if args.command == "lifecycle-plan":
+            value = _lifecycle_plan(args, contract)
             stored = write_receipt(
                 output=args.output,
                 value=value,
-                label="verified inputs receipt",
+                label="public N1.5 lifecycle plan",
             )
             result = {**value, **stored}
-        elif args.command == "render-training":
-            result = render_training(
-                verified=verified,
-                output=args.output,
-                contract=contract,
-            )
-        elif args.command == "verify-training-output":
-            value = verify_training_output(
-                verified=verified,
-                training_root=args.training_root,
-                contract=contract,
-            )
-            stored = write_receipt(
-                output=args.output,
-                value=value,
-                label="verified training output receipt",
-            )
-            result = {**value, **stored}
-        else:  # pragma: no cover - argparse constrains this branch.
-            parser.error("unsupported command")
+        else:
+            verified = _verified(args, contract)
+            if args.command == "verify-inputs":
+                value = _verified_inputs_receipt(verified, contract)
+                stored = write_receipt(
+                    output=args.output,
+                    value=value,
+                    label="verified inputs receipt",
+                )
+                result = {**value, **stored}
+            elif args.command == "render-training":
+                result = render_training(
+                    verified=verified,
+                    output=args.output,
+                    contract=contract,
+                )
+            elif args.command == "verify-training-output":
+                value = verify_training_output(
+                    verified=verified,
+                    training_root=args.training_root,
+                    contract=contract,
+                )
+                stored = write_receipt(
+                    output=args.output,
+                    value=value,
+                    label="verified training output receipt",
+                )
+                result = {**value, **stored}
+            else:  # pragma: no cover - argparse constrains this branch.
+                parser.error("unsupported command")
     except (ReproductionError, OSError, ValueError) as error:
         print(f"public N1.5 reproduction gate failed: {error}", file=sys.stderr)
         return 2
