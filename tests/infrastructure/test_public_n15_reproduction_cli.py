@@ -73,13 +73,14 @@ def test_cli_verify_inputs_render_training_and_verify_output_are_offline_and_ato
     assert manifest["execution"]["argv"] == [
         "lerobot-train",
         "--config_path=configs/train_groot.yaml",
+        "--wandb.mode=offline",
     ]
     assert manifest["execution"]["env"] == {
         "HF_HUB_CACHE": str((tmp_path / "hub").resolve()),
         "HF_HUB_OFFLINE": "1",
     }
     assert manifest["execution"]["shell_argv"] == (
-        "lerobot-train --config_path=configs/train_groot.yaml"
+        "lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline"
     )
 
     training_root = _materialize_training_output(
@@ -110,7 +111,7 @@ def test_cli_verify_inputs_render_training_and_verify_output_are_offline_and_ato
     assert result["kind"] == "lehome_public_n15_verified_training_output_v1"
     assert result["step"] == 12000
     assert training_output.stat().st_mode & 0o777 == 0o444
-    assert "lerobot-train --config_path=configs/train_groot.yaml" in capsys.readouterr().out
+    assert "lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline" in capsys.readouterr().out
 
 
 def test_cli_fails_closed_without_overwriting_an_existing_output(

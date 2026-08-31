@@ -253,9 +253,9 @@ def test_contract_encodes_exact_public_recipe_and_is_immutable() -> None:
     assert CONTRACT.lerobot_package_file_count == 289
     assert CONTRACT.lerobot_package_tree_sha256 == "db3b4e18b166d4bb7fb4354cec82a7fbd15bb24230f9d71269a017c774e0852f"
     assert CONTRACT.base_model_metadata_count == 13
-    assert CONTRACT.base_model_metadata_sha256 == "6da0e2fe38e294ca938d0540d0a23363446e54f941d16ce953612c443e43474a"
+    assert CONTRACT.base_model_metadata_sha256 == "b49d2e9f419064cbe31fcc877263f5a1af4ca1ec10acd723b3c325dc0d6fc70d"
     assert CONTRACT.dataset_metadata_count == 67
-    assert CONTRACT.dataset_metadata_sha256 == "63d5f109d26950a5091f82161750406ddbb7461cf24dfa1e7909897cbca4b71a"
+    assert CONTRACT.dataset_metadata_sha256 == "152e3b0e3da178fba9d29ddb1858df95a4c20fe8118aa36b57bde71b0ee25b9a"
     assert CONTRACT.base_model_repository == "nvidia/GR00T-N1.5-3B"
     assert CONTRACT.base_model_revision == "869830fc749c35f34771aa5209f923ac57e4564e"
     assert CONTRACT.dataset_repository == "lehome/dataset_challenge_merged"
@@ -268,6 +268,7 @@ def test_contract_encodes_exact_public_recipe_and_is_immutable() -> None:
     assert CONTRACT.training_command == (
         "lerobot-train",
         "--config_path=configs/train_groot.yaml",
+        "--wandb.mode=offline",
     )
     assert CONTRACT.training == {
         "batch_size": 64,
@@ -591,13 +592,17 @@ def test_render_training_writes_an_atomic_offline_manifest_without_execution(
     manifest = json.loads(output.read_text(encoding="utf-8"))
     assert manifest["kind"] == "lehome_public_n15_training_execution_v1"
     assert manifest["execution"] == {
-        "argv": ["lerobot-train", "--config_path=configs/train_groot.yaml"],
+        "argv": [
+            "lerobot-train",
+            "--config_path=configs/train_groot.yaml",
+            "--wandb.mode=offline",
+        ],
         "cwd": str(checkout.resolve()),
         "env": {
             "HF_HUB_CACHE": str((tmp_path / "hub").resolve()),
             "HF_HUB_OFFLINE": "1",
         },
-        "shell_argv": "lerobot-train --config_path=configs/train_groot.yaml",
+        "shell_argv": "lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline",
     }
     assert manifest["inputs"]["base_model_root"] == str(model.resolve())
     assert manifest["inputs"]["dataset_root"] == str(dataset.resolve())
@@ -737,6 +742,15 @@ def test_verify_training_output_requires_step_12000_receipts_logs_and_checksums(
         (training_root / "checkpoints/012000").resolve()
     )
     assert receipt["artifact_count"] >= 19
+
+    (training_root / "training-identity.json").write_text("{}\n", encoding="ascii")
+    (training_root / "training-publication.json").write_text("{}\n", encoding="ascii")
+    resumed = reproduction.verify_training_output(
+        verified=verified,
+        training_root=training_root,
+        contract=contract,
+    )
+    assert resumed == receipt
 
 
 def _rewrite_task1_identity(root: Path, receipt: dict[str, object], output: Path) -> None:

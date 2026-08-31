@@ -256,7 +256,7 @@ test -e /dev/disk/by-id/virtio-lehome
 nvidia-smi -L | grep -q .
 test "$(git -C "$root" rev-parse HEAD)" = "$revision"
 test -z "$(git -C "$root" status --porcelain --untracked-files=all)"
-verified_inputs="$training_root/verified-inputs.json"
+verified_inputs="$(dirname -- "$training_root")/verified-inputs.json"
 if [[ -f "$verified_inputs" ]]; then
   temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-verify-inputs.XXXXXX")"
   trap 'rm -rf -- "$temporary_root"' EXIT
@@ -272,29 +272,60 @@ train_stage() {
   remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$LEROBOT_WHEEL" <<'SH'
 set -euo pipefail
 root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; hf_cache="$8"; python_bin="$9"; wheel="${10}"
-test ! -e "$training_root/evidence/execution-manifest.json"
-mkdir -p "$training_root/evidence" "$training_root/logs"
-install -m 0444 "$source_receipt" "$training_root/evidence/source-receipt.json"
-install -m 0444 "$snapshots" "$training_root/evidence/resolved-snapshots-receipt.json"
-install -m 0444 "$source_root/uv.lock" "$training_root/evidence/uv.lock"
+upstream_output="$source_root/outputs/train/groot_four_types_merged_batch64_lr2e-4"
+staging_root="${training_root}.evidence-staging"
+test ! -e "$training_root" && test ! -L "$training_root"
+test ! -e "$upstream_output" && test ! -L "$upstream_output"
+test ! -e "$staging_root" && test ! -L "$staging_root"
+mkdir -m 0700 -p "$staging_root/evidence" "$staging_root/logs"
+mkdir -p "$(dirname -- "$upstream_output")"
+install -m 0444 "$source_receipt" "$staging_root/evidence/source-receipt.json"
+install -m 0444 "$snapshots" "$staging_root/evidence/resolved-snapshots-receipt.json"
+install -m 0444 "$source_root/uv.lock" "$staging_root/evidence/uv.lock"
 test -f "$wheel" && test ! -L "$wheel" && test -d "$hf_cache" && test ! -L "$hf_cache"
 test -x "$python_bin" && test -x "$(dirname -- "$python_bin")/lerobot-train"
 "$python_bin" -I -c 'import lerobot; from pathlib import Path; assert Path(lerobot.__file__).is_file()'
-install -m 0444 "$wheel" "$training_root/evidence/lerobot-0.4.3-py3-none-any.whl"
-"$python_bin" - "$training_root/evidence/runtime-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/lerobot-0.4.3-py3-none-any.whl" <<'PY'
+install -m 0444 "$wheel" "$staging_root/evidence/lerobot-0.4.3-py3-none-any.whl"
+"$python_bin" - "$staging_root/evidence/runtime-receipt.json" "$staging_root/evidence/uv.lock" "$staging_root/evidence/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/uv.lock" "$training_root/evidence/lerobot-0.4.3-py3-none-any.whl" <<'PY'
 import importlib.util, json, os, sys
 from pathlib import Path
-output, lock, wheel = map(Path, sys.argv[1:])
+output, staged_lock, staged_wheel, final_lock, final_wheel = map(Path, sys.argv[1:])
 package = Path(importlib.util.find_spec("lerobot").origin).parent
-value = {"schema_version": 1, "kind": "lehome_public_n15_training_runtime_v1", "python_executable": sys.executable, "lerobot_wheel_path": str(wheel), "lerobot_wheel_sha256": __import__("hashlib").sha256(wheel.read_bytes()).hexdigest(), "lerobot_package_root": str(package), "dependency_lock_path": str(lock), "dependency_lock_sha256": __import__("hashlib").sha256(lock.read_bytes()).hexdigest()}
+value = {"schema_version": 1, "kind": "lehome_public_n15_training_runtime_v1", "python_executable": sys.executable, "lerobot_wheel_path": str(final_wheel), "lerobot_wheel_sha256": __import__("hashlib").sha256(staged_wheel.read_bytes()).hexdigest(), "lerobot_package_root": str(package), "dependency_lock_path": str(final_lock), "dependency_lock_sha256": __import__("hashlib").sha256(staged_lock.read_bytes()).hexdigest()}
 with output.open("x", encoding="ascii") as stream: stream.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
 os.chmod(output, 0o444)
 PY
-python3 "$root/scripts/run_public_n15_reproduction.py" render-training --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --output "$training_root/evidence/execution-manifest.json" >/dev/null
+python3 "$root/scripts/run_public_n15_reproduction.py" render-training --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --output "$staging_root/evidence/execution-manifest.json" >/dev/null
 # The Task1 verifier seals this exact manifest, source/snapshot receipts,
 # dependency lock, runtime receipt, train log, and checkpoint—not a hand-made
 # approximation of a successful training result.
-cd "$source_root"; export HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"; "$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml 2>&1 | tee "$training_root/logs/train.log"
+cd "$source_root"; export HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"; "$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml --wandb.mode=offline 2>&1 | tee "$staging_root/logs/train.log"
+test -d "$upstream_output" && test ! -L "$upstream_output"
+mv -- "$upstream_output" "$training_root"
+mv -- "$staging_root/evidence" "$training_root/evidence"
+mv -- "$staging_root/logs" "$training_root/logs"
+rmdir -- "$staging_root"
+"$python_bin" - "$training_root" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+checksum = root / "checksums.sha256"
+if checksum.exists() or checksum.is_symlink():
+    raise SystemExit("training checksum manifest already exists")
+rows = []
+for path in sorted(root.rglob("*")):
+    if path.is_file() and not path.is_symlink():
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        digest = digest.hexdigest()
+        rows.append(f"{digest}  {path.relative_to(root).as_posix()}\n")
+checksum.write_text("".join(rows), encoding="ascii")
+checksum.chmod(0o444)
+PY
 python3 "$root/scripts/run_public_n15_reproduction.py" verify-training-output --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --training-root "$training_root" --output "$training_root/training-identity.json" >/dev/null
 SH
 }

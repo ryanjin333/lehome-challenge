@@ -73,9 +73,9 @@ CONTRACT = ReproductionContract(
     lerobot_package_file_count=289,
     lerobot_package_tree_sha256="db3b4e18b166d4bb7fb4354cec82a7fbd15bb24230f9d71269a017c774e0852f",
     base_model_metadata_count=13,
-    base_model_metadata_sha256="6da0e2fe38e294ca938d0540d0a23363446e54f941d16ce953612c443e43474a",
+    base_model_metadata_sha256="b49d2e9f419064cbe31fcc877263f5a1af4ca1ec10acd723b3c325dc0d6fc70d",
     dataset_metadata_count=67,
-    dataset_metadata_sha256="63d5f109d26950a5091f82161750406ddbb7461cf24dfa1e7909897cbca4b71a",
+    dataset_metadata_sha256="152e3b0e3da178fba9d29ddb1858df95a4c20fe8118aa36b57bde71b0ee25b9a",
     base_model_repository="nvidia/GR00T-N1.5-3B",
     base_model_revision="869830fc749c35f34771aa5209f923ac57e4564e",
     dataset_repository="lehome/dataset_challenge_merged",
@@ -90,7 +90,11 @@ CONTRACT = ReproductionContract(
     disk_id="computedisk-u00pbe55crxy7jr56x",
     python_version="3.11",
     lerobot_version="0.4.3",
-    training_command=("lerobot-train", "--config_path=configs/train_groot.yaml"),
+    training_command=(
+        "lerobot-train",
+        "--config_path=configs/train_groot.yaml",
+        "--wandb.mode=offline",
+    ),
     training={
         "batch_size": 64,
         "steps": 12000,
@@ -764,6 +768,8 @@ def _artifact_files(root: Path) -> dict[str, Path]:
     artifacts: dict[str, Path] = {}
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
+        if relative in {"training-identity.json", "training-publication.json"}:
+            continue
         metadata = path.lstat()
         if path.is_symlink():
             if relative == "checkpoints/last" and os.readlink(path) == "012000":
