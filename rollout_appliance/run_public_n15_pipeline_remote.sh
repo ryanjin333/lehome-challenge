@@ -122,15 +122,33 @@ PY
 }
 run_paid_stage() {
   local label="$1" limit_seconds="$2"; shift 2
-  local aggregate_deadline now stage_deadline pid status
+  local aggregate_deadline now stage_deadline pid status stage_receipt
   aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
-  now="$(date +%s)"; stage_deadline=$(( now + limit_seconds )); (( stage_deadline < aggregate_deadline )) || stage_deadline="$aggregate_deadline"
+  stage_receipt="$PIPELINE_ROOT/stage-$label-deadline.json"
+  stage_deadline="$(python3 - "$PLAN_RECEIPT" "$stage_receipt" "$RUN_ID" "$label" "$limit_seconds" "$aggregate_deadline" <<'PY'
+import hashlib, json, os, sys, time
+plan, output, run_id, stage, limit, aggregate = sys.argv[1:]
+digest = hashlib.sha256(open(plan, "rb").read()).hexdigest(); limit, aggregate = int(limit), int(aggregate)
+if os.path.exists(output):
+    value = json.load(open(output))
+    if (value.get("schema_version"), value.get("kind"), value.get("run_id"), value.get("stage"), value.get("lifecycle_plan_sha256")) != (1, "lehome_public_n15_stage_deadline_v1", run_id, stage, digest) or type(value.get("deadline_unix_seconds")) is not int: raise SystemExit("stage deadline is invalid")
+    print(value["deadline_unix_seconds"]); raise SystemExit
+started = int(time.time()); deadline = min(started + limit, aggregate)
+value = {"schema_version": 1, "kind": "lehome_public_n15_stage_deadline_v1", "run_id": run_id, "stage": stage, "lifecycle_plan_sha256": digest, "started_unix_seconds": started, "deadline_unix_seconds": deadline}
+with open(output, "x", encoding="ascii") as stream: stream.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+os.chmod(output, 0o444); print(deadline)
+PY
+)" || fail "$label deadline receipt is invalid"
+  (( stage_deadline <= aggregate_deadline )) || fail "$label deadline exceeds aggregate deadline"
+  now="$(date +%s)"
   (( now < stage_deadline )) || fail "$label has no remaining paid time"
-  "$@" & pid=$!
+  setsid "$@" & pid=$!
   while kill -0 "$pid" 2>/dev/null; do
     now="$(date +%s)"
     if (( now >= stage_deadline )); then
-      kill -TERM "$pid" 2>/dev/null || true
+      kill -TERM -- "-$pid" 2>/dev/null || true
+      for _ in {1..15}; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+      if kill -0 "$pid" 2>/dev/null; then kill -KILL -- "-$pid" 2>/dev/null || true; fi
       wait "$pid" || true
       fail "$label exceeded its code-owned paid timeout"
     fi
