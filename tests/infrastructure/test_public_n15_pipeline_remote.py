@@ -106,9 +106,10 @@ def test_remote_wrapper_never_runs_downstream_after_a_failed_gate() -> None:
     assert "verify_remote_training_chain" in text
     assert "verify_remote_focused_chain" in text
     assert "verify_remote_harvest_chain" in text
-    assert "focused_stage || fail" in text
-    assert "harvest_stage || fail" in text
-    assert text.index("verify_remote_focused_chain || fail") < text.rindex("harvest_stage || fail")
+    assert "run_paid_stage focused_gate" in text
+    assert "run_paid_stage harvest" in text
+    assert "paid-deadline.json" in text
+    assert text.index("verify_remote_focused_chain || fail") < text.rindex("run_paid_stage harvest")
 
 
 def test_over_budget_plan_never_starts_the_mocked_exact_vm(tmp_path: Path) -> None:

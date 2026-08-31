@@ -45,6 +45,7 @@ readonly NATIVE_DEPENDENCIES="${LEHOME_N15_NATIVE_DEPENDENCIES_ROOT:-}"
 readonly FOCUSED_HF_CACHE="${LEHOME_N15_FOCUSED_HF_CACHE_ROOT:-}"
 readonly ROLLOUT_IMAGE_RECEIPT="${LEHOME_N15_ROLLOUT_IMAGE_RECEIPT:-}"
 readonly PLAN_RECEIPT="$PIPELINE_ROOT/lifecycle-plan.json"
+readonly DEADLINE_RECEIPT="$PIPELINE_ROOT/paid-deadline.json"
 readonly TRAINING_IDENTITY_RECEIPT="$TRAINING_ROOT/training-identity.json"
 readonly TRAINING_PUBLICATION_RECEIPT="$TRAINING_ROOT/training-publication.json"
 readonly FOCUSED_OUTPUT_ROOT="$REMOTE_PIPELINE_ROOT/focused"
@@ -103,6 +104,41 @@ trap stop_exact_vm EXIT
 trap 'exit 130' INT TERM
 
 remote() { ssh -o BatchMode=yes "$SSH_TARGET" "$@"; }
+initialize_deadline() {
+  python3 - "$PLAN_RECEIPT" "$DEADLINE_RECEIPT" "$RUN_ID" <<'PY'
+import hashlib, json, os, sys, time
+from pathlib import Path
+plan, output, run_id = map(Path if False else str, sys.argv[1:])
+plan_bytes = Path(plan).read_bytes(); digest = hashlib.sha256(plan_bytes).hexdigest()
+if Path(output).exists():
+    value = json.loads(Path(output).read_bytes())
+    if value != {"schema_version": 1, "kind": "lehome_public_n15_paid_deadline_v1", "run_id": run_id, "lifecycle_plan_sha256": digest, "started_unix_seconds": value.get("started_unix_seconds"), "deadline_unix_seconds": value.get("deadline_unix_seconds")} or type(value["started_unix_seconds"]) is not int or value["deadline_unix_seconds"] != value["started_unix_seconds"] + 86400:
+        raise SystemExit("paid deadline receipt is invalid")
+    print(value["deadline_unix_seconds"]); raise SystemExit(0)
+started = int(time.time()); value = {"schema_version": 1, "kind": "lehome_public_n15_paid_deadline_v1", "run_id": run_id, "lifecycle_plan_sha256": digest, "started_unix_seconds": started, "deadline_unix_seconds": started + 86400}
+with Path(output).open("x", encoding="ascii") as stream: stream.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+os.chmod(output, 0o444); print(value["deadline_unix_seconds"])
+PY
+}
+run_paid_stage() {
+  local label="$1" limit_seconds="$2"; shift 2
+  local aggregate_deadline now stage_deadline pid status
+  aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
+  now="$(date +%s)"; stage_deadline=$(( now + limit_seconds )); (( stage_deadline < aggregate_deadline )) || stage_deadline="$aggregate_deadline"
+  (( now < stage_deadline )) || fail "$label has no remaining paid time"
+  "$@" & pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    now="$(date +%s)"
+    if (( now >= stage_deadline )); then
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" || true
+      fail "$label exceeded its code-owned paid timeout"
+    fi
+    sleep 1
+  done
+  wait "$pid"; status=$?
+  (( status == 0 )) || fail "$label failed"
+}
 remote_file_exists() { remote bash -s -- "$1" <<'SH'
 set -euo pipefail
 test -f "$1" && test ! -L "$1"
@@ -301,14 +337,14 @@ nebius compute instance start --id "$EXACT_VM_ID" --format json --no-browser --n
 for _ in {1..60}; do capture_exact_provider_state RUNNING "$response" && break; rm -f -- "$response"; sleep 2; done
 capture_exact_provider_state RUNNING "$response" || fail "exact VM did not reach RUNNING"; rm -f -- "$response"
 validate_remote_runtime || fail "runtime/cloud-init/workspace/GPU/upstream gate failed"
-if ! remote_file_exists "$TRAINING_IDENTITY_RECEIPT"; then train_stage || fail "training failed"; fi
+if ! remote_file_exists "$TRAINING_IDENTITY_RECEIPT"; then run_paid_stage train "$TRAIN_TIMEOUT_SECONDS" train_stage; fi
 verify_remote_training_chain || fail "training receipt chain failed"
 if ! remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then publish_training_readback || fail "training publication/readback failed"; fi
 verify_remote_training_publication || fail "training publication chain failed"
-if ! remote_file_exists "$FOCUSED_PROMOTION_RECEIPT"; then focused_stage || fail "focused gate failed"; fi
+if ! remote_file_exists "$FOCUSED_PROMOTION_RECEIPT"; then run_paid_stage focused_gate "$FOCUSED_TIMEOUT_SECONDS" focused_stage; fi
 verify_remote_focused_chain || fail "focused receipt chain failed"
 if [[ ! -e "$HARVEST_TERMINAL_RECEIPT" ]]; then
-  harvest_stage || fail "harvest failed"
+  run_paid_stage harvest "$HARVEST_TIMEOUT_SECONDS" harvest_stage
   verify_remote_harvest_chain || fail "harvest pre-stop receipt chain failed"
   fetch_remote_immutable "$HARVEST_ROOT/manifest.json" "$HARVEST_MANIFEST"
   fetch_remote_immutable "$HARVEST_ROOT/manifest-receipt.json" "$HARVEST_MANIFEST_RECEIPT"
