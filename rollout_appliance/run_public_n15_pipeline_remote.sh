@@ -145,11 +145,21 @@ PY
   (( stage_deadline <= aggregate_deadline )) || fail "$label deadline exceeds aggregate deadline"
   now="$(date +%s)"
   (( now < stage_deadline )) || fail "$label has no remaining paid time"
-  # ``setsid`` needs an executable, not a shell function. Export only the
-  # three fixed dispatch targets and invoke them through a no-eval case.
+  # macOS has no external ``setsid``. This tiny controller-owned Python
+  # launcher creates the session before execing an allowlisted Bash dispatcher.
   export -f remote train_stage focused_stage harvest_stage
   export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON LEROBOT_WHEEL ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
-  setsid bash -c 'case "$1" in train_stage) train_stage ;; focused_stage) focused_stage ;; harvest_stage) harvest_stage ;; *) exit 64 ;; esac' bash "$stage_function" & pid=$!
+  python3 - "$stage_function" <<'PY' &
+import os
+import sys
+os.setsid()
+os.execvpe(
+    "bash",
+    ["bash", "-c", 'case "$1" in train_stage) train_stage ;; focused_stage) focused_stage ;; harvest_stage) harvest_stage ;; *) exit 64 ;; esac', "bash", sys.argv[1]],
+    os.environ,
+)
+PY
+  pid=$!
   while kill -0 -- "-$pid" 2>/dev/null; do
     now="$(date +%s)"
     if (( now >= stage_deadline )); then
