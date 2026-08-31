@@ -227,7 +227,7 @@ def test_contract_encodes_exact_public_recipe_and_is_immutable() -> None:
     assert CONTRACT.dependency_lock_sha256 == "d0e6e3cb472cea3d04b0bc2d79b9d929bf498a392d5c155fa635f413fa092313"
     assert CONTRACT.lerobot_wheel_sha256 == "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c"
     assert CONTRACT.lerobot_package_file_count == 289
-    assert CONTRACT.lerobot_package_tree_sha256 == "566fd5a0e858a66c434da1391340df6b111a2bebb0fb83ec5ec299c04e31e199"
+    assert CONTRACT.lerobot_package_tree_sha256 == "db3b4e18b166d4bb7fb4354cec82a7fbd15bb24230f9d71269a017c774e0852f"
     assert CONTRACT.base_model_metadata_count == 13
     assert CONTRACT.base_model_metadata_sha256 == "6da0e2fe38e294ca938d0540d0a23363446e54f941d16ce953612c443e43474a"
     assert CONTRACT.dataset_metadata_count == 67
@@ -287,6 +287,21 @@ def test_hub_metadata_hash_is_sorted_tab_separated_and_binds_all_fields() -> Non
     ).encode("utf-8")
 
     assert hub_metadata_sha256(siblings) == _sha(canonical)
+
+
+def test_production_lerobot_wheel_tree_uses_the_audited_algorithm_identity() -> None:
+    """This test intentionally uses CONTRACT directly, never the fixture override."""
+    from lehome.n15_reproduction import CONTRACT
+
+    assert (
+        CONTRACT.lerobot_wheel_sha256,
+        CONTRACT.lerobot_package_file_count,
+        CONTRACT.lerobot_package_tree_sha256,
+    ) == (
+        "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c",
+        289,
+        "db3b4e18b166d4bb7fb4354cec82a7fbd15bb24230f9d71269a017c774e0852f",
+    )
 
 
 def test_verify_inputs_binds_regular_source_files_snapshots_and_resources(
