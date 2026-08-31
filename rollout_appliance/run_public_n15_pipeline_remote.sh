@@ -121,8 +121,9 @@ os.chmod(output, 0o444); print(value["deadline_unix_seconds"])
 PY
 }
 run_paid_stage() {
-  local label="$1" limit_seconds="$2"; shift 2
+  local label="$1" limit_seconds="$2" stage_function="$3"
   local aggregate_deadline now stage_deadline pid status stage_receipt
+  case "$stage_function" in train_stage|focused_stage|harvest_stage) ;; *) fail "unknown paid stage dispatcher" ;; esac
   aggregate_deadline="$(initialize_deadline)" || fail "aggregate paid deadline is invalid"
   stage_receipt="$PIPELINE_ROOT/stage-$label-deadline.json"
   stage_deadline="$(python3 - "$PLAN_RECEIPT" "$stage_receipt" "$RUN_ID" "$label" "$limit_seconds" "$aggregate_deadline" <<'PY'
@@ -144,7 +145,11 @@ PY
   (( stage_deadline <= aggregate_deadline )) || fail "$label deadline exceeds aggregate deadline"
   now="$(date +%s)"
   (( now < stage_deadline )) || fail "$label has no remaining paid time"
-  setsid "$@" & pid=$!
+  # ``setsid`` needs an executable, not a shell function. Export only the
+  # three fixed dispatch targets and invoke them through a no-eval case.
+  export -f remote train_stage focused_stage harvest_stage
+  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON LEROBOT_WHEEL ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
+  setsid bash -c 'case "$1" in train_stage) train_stage ;; focused_stage) focused_stage ;; harvest_stage) harvest_stage ;; *) exit 64 ;; esac' bash "$stage_function" & pid=$!
   while kill -0 -- "-$pid" 2>/dev/null; do
     now="$(date +%s)"
     if (( now >= stage_deadline )); then
