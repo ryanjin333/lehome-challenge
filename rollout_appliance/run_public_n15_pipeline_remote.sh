@@ -34,6 +34,7 @@ readonly HF_TOKEN_FILE="${LEHOME_N15_HF_TOKEN_FILE:-}"
 readonly RUNTIME_REVISION="${LEHOME_N15_RUNTIME_REVISION:-}"
 readonly TRAINING_HF_CACHE="${LEHOME_N15_TRAINING_HF_CACHE_ROOT:-}"
 readonly TRAINING_PYTHON="${LEHOME_N15_TRAINING_PYTHON:-/opt/lehome-challenge/.venv/bin/python}"
+readonly TRAINING_UV="${LEHOME_N15_TRAINING_UV:-}"
 readonly LEROBOT_WHEEL="${LEHOME_N15_LEROBOT_WHEEL:-}"
 readonly ASSETS_ROOT="${LEHOME_OFFICIAL_ASSETS_ROOT:-}"
 readonly METADATA_ROOT="${LEHOME_OFFICIAL_METADATA_ROOT:-}"
@@ -148,7 +149,7 @@ PY
   # macOS has no external ``setsid``. This tiny controller-owned Python
   # launcher creates the session before execing an allowlisted Bash dispatcher.
   export -f remote train_stage focused_stage harvest_stage
-  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON LEROBOT_WHEEL ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
+  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
   python3 - "$stage_function" <<'PY' &
 import os
 import sys
@@ -269,29 +270,42 @@ SH
 }
 
 train_stage() {
-  remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$LEROBOT_WHEEL" <<'SH'
+  remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$TRAINING_UV" "$LEROBOT_WHEEL" <<'SH'
 set -euo pipefail
-root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; hf_cache="$8"; python_bin="$9"; wheel="${10}"
+root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; hf_cache="$8"; python_bin="$9"; uv_bin="${10}"; wheel="${11}"
 upstream_output="$source_root/outputs/train/groot_four_types_merged_batch64_lr2e-4"
 staging_root="${training_root}.evidence-staging"
 test ! -e "$training_root" && test ! -L "$training_root"
 test ! -e "$upstream_output" && test ! -L "$upstream_output"
 test ! -e "$staging_root" && test ! -L "$staging_root"
-mkdir -m 0700 -p "$staging_root/evidence" "$staging_root/logs"
+mkdir -m 0700 -p "$staging_root/evidence/upstream" "$staging_root/evidence/compatibility" "$staging_root/logs"
 mkdir -p "$(dirname -- "$upstream_output")"
 install -m 0444 "$source_receipt" "$staging_root/evidence/source-receipt.json"
 install -m 0444 "$snapshots" "$staging_root/evidence/resolved-snapshots-receipt.json"
 install -m 0444 "$source_root/uv.lock" "$staging_root/evidence/uv.lock"
 test -f "$wheel" && test ! -L "$wheel" && test -d "$hf_cache" && test ! -L "$hf_cache"
+test -x "$uv_bin" && test ! -L "$uv_bin"
 test -x "$python_bin" && test -x "$(dirname -- "$python_bin")/lerobot-train"
 "$python_bin" -I -c 'import lerobot; from pathlib import Path; assert Path(lerobot.__file__).is_file()'
-install -m 0444 "$wheel" "$staging_root/evidence/lerobot-0.4.3-py3-none-any.whl"
-"$python_bin" - "$staging_root/evidence/runtime-receipt.json" "$staging_root/evidence/uv.lock" "$staging_root/evidence/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/uv.lock" "$training_root/evidence/lerobot-0.4.3-py3-none-any.whl" <<'PY'
-import importlib.util, json, os, sys
+install -m 0444 "$wheel" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl"
+python3 "$root/scripts/run_public_n15_reproduction.py" build-compatible-wheel \
+  --upstream-wheel "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" \
+  --wheel-output "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" \
+  --receipt-output "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" >/dev/null
+python3 "$root/scripts/run_public_n15_reproduction.py" verify-compatible-wheel \
+  --upstream-wheel "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" \
+  --wheel "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" \
+  --receipt "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" >/dev/null
+"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin" \
+  "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" >/dev/null
+"$python_bin" - "$root" "$source_root/configs/train_groot.yaml" "$staging_root/evidence/runtime-receipt.json" "$staging_root/evidence/uv.lock" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-compatibility-receipt.json" <<'PY'
+import hashlib, importlib.util, json, os, sys
 from pathlib import Path
-output, staged_lock, staged_wheel, final_lock, final_wheel = map(Path, sys.argv[1:])
+root, config, output, staged_lock, staged_upstream, staged_wheel, staged_compatibility, final_lock, final_upstream, final_wheel, final_compatibility = map(Path, sys.argv[1:])
+sys.path.insert(0, str(root / "source/lehome"))
+from lehome.n15_reproduction import resolve_groot_scheduler_from_yaml
 package = Path(importlib.util.find_spec("lerobot").origin).parent
-value = {"schema_version": 1, "kind": "lehome_public_n15_training_runtime_v1", "python_executable": sys.executable, "lerobot_wheel_path": str(final_wheel), "lerobot_wheel_sha256": __import__("hashlib").sha256(staged_wheel.read_bytes()).hexdigest(), "lerobot_package_root": str(package), "dependency_lock_path": str(final_lock), "dependency_lock_sha256": __import__("hashlib").sha256(staged_lock.read_bytes()).hexdigest()}
+value = {"schema_version": 1, "kind": "lehome_public_n15_training_runtime_v1", "python_executable": sys.executable, "upstream_lerobot_wheel_path": str(final_upstream), "upstream_lerobot_wheel_sha256": hashlib.sha256(staged_upstream.read_bytes()).hexdigest(), "compatibility_wheel_path": str(final_wheel), "compatibility_wheel_sha256": hashlib.sha256(staged_wheel.read_bytes()).hexdigest(), "compatibility_wheel_receipt_path": str(final_compatibility), "compatibility_wheel_receipt_sha256": hashlib.sha256(staged_compatibility.read_bytes()).hexdigest(), "lerobot_package_root": str(package), "dependency_lock_path": str(final_lock), "dependency_lock_sha256": hashlib.sha256(staged_lock.read_bytes()).hexdigest(), "scheduler": resolve_groot_scheduler_from_yaml(config.read_text(encoding="utf-8"))}
 with output.open("x", encoding="ascii") as stream: stream.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
 os.chmod(output, 0o444)
 PY
@@ -377,7 +391,7 @@ command -v nebius >/dev/null 2>&1 || fail "Nebius CLI is unavailable"
 command -v ssh >/dev/null 2>&1 || fail "SSH is unavailable"
 require_abs_dir "$PIPELINE_ROOT" "pipeline receipt root"; require_abs_file "$BUILDER" "checked-in lifecycle planner"
 require_abs_file "$PROVIDER_VERIFIER" "checked-in exact Nebius provider parser"; require_abs_file "$HARVEST_BUILDER" "checked-in harvest provider parser"
-[[ "$PUBLIC_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && -n "$SSH_TARGET" && "$REMOTE_ROOT" == /* && "$REMOTE_PIPELINE_ROOT" == /* && -n "$ASSETS_ROOT" && -n "$METADATA_ROOT" && -n "$REFERENCE_CHECKPOINT" && -n "$REFERENCE_SANITIZED_CONFIG" && -n "$REFERENCE_COMPATIBILITY" && -n "$NATIVE_RUNTIME_EVIDENCE" && -n "$NATIVE_DEPENDENCIES" && -n "$FOCUSED_HF_CACHE" && -n "$ROLLOUT_IMAGE_RECEIPT" && -n "$TRAINING_HF_CACHE" && -n "$LEROBOT_WHEEL" ]] || fail "all canonical remote inputs are required"
+[[ "$PUBLIC_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && -n "$SSH_TARGET" && "$REMOTE_ROOT" == /* && "$REMOTE_PIPELINE_ROOT" == /* && -n "$ASSETS_ROOT" && -n "$METADATA_ROOT" && -n "$REFERENCE_CHECKPOINT" && -n "$REFERENCE_SANITIZED_CONFIG" && -n "$REFERENCE_COMPATIBILITY" && -n "$NATIVE_RUNTIME_EVIDENCE" && -n "$NATIVE_DEPENDENCIES" && -n "$FOCUSED_HF_CACHE" && -n "$ROLLOUT_IMAGE_RECEIPT" && -n "$TRAINING_HF_CACHE" && -n "$TRAINING_UV" && -n "$LEROBOT_WHEEL" ]] || fail "all canonical remote inputs are required"
 [[ "$TRAINING_ROOT" == "$REMOTE_PIPELINE_ROOT/training" ]] || fail "training root must be this run's canonical remote training directory"
 [[ "$REMOTE_PIPELINE_ROOT" == "$REMOTE_RUNS_BASE/$RUN_ID" ]] || fail "remote pipeline root must be the canonical run-specific directory"
 # Immutable pre-start cost admission: run_public_n15_reproduction.py lifecycle-plan.

@@ -45,12 +45,186 @@ def _fixture_wheel_bytes() -> bytes:
         for name, payload in {
             "lerobot/__init__.py": b'__version__ = "0.4.3"\n',
             "lerobot/policy.py": b"POLICY = 'groot'\n",
+            "lerobot/policies/groot/configuration_groot.py": (
+                b"@dataclass\n"
+                b"class GrootConfig:\n"
+                b"    warmup_ratio: float = 0.05\n"
+                b"    use_bf16: bool = True\n"
+                b"\n"
+                b"    def get_scheduler_preset(self):\n"
+                b"        return Scheduler(\n"
+                b"            num_warmup_steps=int(10000 * self.warmup_ratio),  # 5% warmup by default\n"
+                b"            num_decay_steps=10000,  # Adjust based on training steps\n"
+                b"            peak_lr=self.optimizer_lr,\n"
+                b"            decay_lr=self.optimizer_lr * 0.1,\n"
+                b"        )\n"
+            ),
             "lerobot-0.4.3.dist-info/METADATA": b"Name: lerobot\nVersion: 0.4.3\n",
+            "lerobot-0.4.3.dist-info/WHEEL": b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            "lerobot-0.4.3.dist-info/RECORD": b"",
         }.items():
             info = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
             info.external_attr = 0o100644 << 16
             archive.writestr(info, payload)
     return stream.getvalue()
+
+
+def _compatibility_fixture_wheel_bytes() -> bytes:
+    """A minimal, otherwise-upstream-shaped wheel for compatibility sealing."""
+    return _fixture_wheel_bytes()
+
+
+def test_compatibility_wheel_builder_only_adds_the_public_scheduler_fields_and_is_deterministic(
+    tmp_path: Path,
+) -> None:
+    """The N1.5 checkpoint needs only its two proven config/scheduler fields."""
+    from lehome.n15_reproduction import (
+        build_compatible_lerobot_wheel,
+        compatibility_wheel_identity,
+    )
+
+    upstream = tmp_path / "lerobot-0.4.3-py3-none-any.whl"
+    upstream.write_bytes(_compatibility_fixture_wheel_bytes())
+    first = tmp_path / "first.whl"
+    second = tmp_path / "second.whl"
+    first_receipt = tmp_path / "first.json"
+    second_receipt = tmp_path / "second.json"
+
+    first_identity = build_compatible_lerobot_wheel(
+        upstream_wheel=upstream,
+        output_wheel=first,
+        receipt_output=first_receipt,
+        expected_upstream_sha256=_sha(upstream.read_bytes()),
+    )
+    second_identity = build_compatible_lerobot_wheel(
+        upstream_wheel=upstream,
+        output_wheel=second,
+        receipt_output=second_receipt,
+        expected_upstream_sha256=_sha(upstream.read_bytes()),
+    )
+
+    assert first.read_bytes() == second.read_bytes()
+    first_sealed = {key: value for key, value in first_identity.items() if not key.endswith("_path")}
+    second_sealed = {key: value for key, value in second_identity.items() if not key.endswith("_path")}
+    assert first_sealed == second_sealed == compatibility_wheel_identity(
+        wheel=first,
+        receipt=first_receipt,
+        upstream_wheel=upstream,
+        expected_upstream_sha256=_sha(upstream.read_bytes()),
+    )
+    assert first_identity["upstream_wheel_sha256"] == _sha(upstream.read_bytes())
+    assert first_identity["transformation"] == {
+        "kind": "lehome_lerobot_043_groot_scheduler_compatibility_v1",
+        "fields": {
+            "num_decay_steps": 10000,
+            "decay_lr_ratio": 0.1,
+        },
+    }
+    with zipfile.ZipFile(first) as archive:
+        config = archive.read("lerobot/policies/groot/configuration_groot.py").decode("utf-8")
+        assert "num_decay_steps: int = 10000" in config
+        assert "decay_lr_ratio: float = 0.1" in config
+        assert "int(self.num_decay_steps * self.warmup_ratio)" in config
+        assert "num_decay_steps=self.num_decay_steps" in config
+        assert "decay_lr=self.optimizer_lr * self.decay_lr_ratio" in config
+
+
+def test_compatibility_wheel_identity_rejects_tampering(tmp_path: Path) -> None:
+    from lehome.n15_reproduction import (
+        ReproductionError,
+        build_compatible_lerobot_wheel,
+        compatibility_wheel_identity,
+    )
+
+    upstream = tmp_path / "lerobot-0.4.3-py3-none-any.whl"
+    upstream.write_bytes(_compatibility_fixture_wheel_bytes())
+    wheel = tmp_path / "compatible.whl"
+    receipt = tmp_path / "compatible.json"
+    build_compatible_lerobot_wheel(
+        upstream_wheel=upstream,
+        output_wheel=wheel,
+        receipt_output=receipt,
+        expected_upstream_sha256=_sha(upstream.read_bytes()),
+    )
+    tampered = bytearray(wheel.read_bytes())
+    tampered[-1] ^= 1
+    wheel.chmod(0o644)
+    wheel.write_bytes(tampered)
+    with pytest.raises(ReproductionError, match="expected derived wheel"):
+        compatibility_wheel_identity(
+            wheel=wheel,
+            receipt=receipt,
+            upstream_wheel=upstream,
+            expected_upstream_sha256=_sha(upstream.read_bytes()),
+        )
+
+
+def test_compatibility_wheel_identity_rejects_a_self_consistent_extra_mutation(
+    tmp_path: Path,
+) -> None:
+    """A receipt cannot bless a changed policy file beyond the two-field patch."""
+    from lehome.n15_reproduction import (
+        ReproductionError,
+        build_compatible_lerobot_wheel,
+        compatibility_wheel_identity,
+        wheel_lerobot_tree_identity,
+    )
+
+    upstream = tmp_path / "lerobot-0.4.3-py3-none-any.whl"
+    upstream.write_bytes(_compatibility_fixture_wheel_bytes())
+    wheel = tmp_path / "compatible.whl"
+    receipt = tmp_path / "compatible.json"
+    identity = build_compatible_lerobot_wheel(
+        upstream_wheel=upstream,
+        output_wheel=wheel,
+        receipt_output=receipt,
+        expected_upstream_sha256=_sha(upstream.read_bytes()),
+    )
+    forged = tmp_path / "forged.whl"
+    with zipfile.ZipFile(wheel) as source, zipfile.ZipFile(forged, "w") as output:
+        for name in source.namelist():
+            payload = source.read(name)
+            if name == "lerobot/policy.py":
+                payload = b"POLICY = 'forged'\n"
+            output.writestr(name, payload)
+    forged_bytes = forged.read_bytes()
+    count, tree = wheel_lerobot_tree_identity(forged_bytes)
+    forged_receipt = dict(identity)
+    forged_receipt.pop("wheel_path")
+    forged_receipt.pop("receipt_path")
+    forged_receipt["derived_wheel_sha256"] = _sha(forged_bytes)
+    forged_receipt["derived_package_file_count"] = count
+    forged_receipt["derived_package_tree_sha256"] = tree
+    receipt.chmod(0o644)
+    receipt.write_bytes(_canonical(forged_receipt))
+
+    with pytest.raises(ReproductionError, match="compatibility wheel receipt identity"):
+        compatibility_wheel_identity(
+            wheel=forged,
+            receipt=receipt,
+            upstream_wheel=upstream,
+            expected_upstream_sha256=_sha(upstream.read_bytes()),
+        )
+
+
+def test_pinned_scheduler_yaml_resolves_the_public_12k_schedule() -> None:
+    from lehome.n15_reproduction import resolve_groot_scheduler_from_yaml
+
+    values = resolve_groot_scheduler_from_yaml(
+        """steps: 12000
+policy:
+  optimizer_lr: 2e-4
+  warmup_ratio: 0.05
+  num_decay_steps: 12000
+  decay_lr_ratio: 0.1
+"""
+    )
+    assert values == {
+        "num_warmup_steps": 600,
+        "num_decay_steps": 12000,
+        "peak_lr": 2e-4,
+        "decay_lr": 2e-5,
+    }
 
 
 def _siblings(root: Path, *, lfs_paths: set[str] | None = None) -> list[dict[str, object]]:
@@ -102,7 +276,14 @@ def _materialize_source(tmp_path: Path) -> tuple[Path, Path]:
     for relative in SOURCE_FILES:
         path = checkout / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(relative.encode("utf-8"))
+        path.write_bytes(
+            (
+                b"steps: 12000\npolicy:\n  optimizer_lr: 2e-4\n  warmup_ratio: 0.05\n"
+                b"  num_decay_steps: 12000\n  decay_lr_ratio: 0.1\n"
+                if relative == "configs/train_groot.yaml"
+                else relative.encode("utf-8")
+            )
+        )
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
     subprocess.run(["git", "-C", str(checkout), "config", "user.name", "Test"], check=True)
     subprocess.run(
@@ -667,10 +848,20 @@ def _materialize_training_output(
     python_candidate = shutil.which("python3.11")
     assert python_candidate is not None
     python = Path(python_candidate).resolve()
-    wheel = evidence / "lerobot-0.4.3-py3-none-any.whl"
-    wheel.write_bytes(_fixture_wheel_bytes())
+    upstream_wheel = evidence / "upstream/lerobot-0.4.3-py3-none-any.whl"
+    upstream_wheel.parent.mkdir()
+    upstream_wheel.write_bytes(_fixture_wheel_bytes())
+    wheel = evidence / "compatibility/lerobot-0.4.3-py3-none-any.whl"
+    wheel.parent.mkdir()
+    compatibility_receipt = wheel.parent / "lerobot-compatibility-receipt.json"
+    compatibility = reproduction.build_compatible_lerobot_wheel(
+        upstream_wheel=upstream_wheel,
+        output_wheel=wheel,
+        receipt_output=compatibility_receipt,
+        expected_upstream_sha256=contract.lerobot_wheel_sha256,
+    )
     package_root = runtime / "site-packages/lerobot"
-    with zipfile.ZipFile(io.BytesIO(_fixture_wheel_bytes())) as archive:
+    with zipfile.ZipFile(wheel) as archive:
         for name in archive.namelist():
             if not name.startswith("lerobot/") or name.endswith("/"):
                 continue
@@ -683,11 +874,18 @@ def _materialize_training_output(
                 "schema_version": 1,
                 "kind": "lehome_public_n15_training_runtime_v1",
                 "python_executable": str(python.resolve()),
-                "lerobot_wheel_path": str(wheel.resolve()),
-                "lerobot_wheel_sha256": contract.lerobot_wheel_sha256,
+                "upstream_lerobot_wheel_path": str(upstream_wheel.resolve()),
+                "upstream_lerobot_wheel_sha256": contract.lerobot_wheel_sha256,
+                "compatibility_wheel_path": str(wheel.resolve()),
+                "compatibility_wheel_sha256": compatibility["derived_wheel_sha256"],
+                "compatibility_wheel_receipt_path": str(compatibility_receipt.resolve()),
+                "compatibility_wheel_receipt_sha256": _sha(compatibility_receipt.read_bytes()),
                 "lerobot_package_root": str(package_root.resolve()),
                 "dependency_lock_path": str((evidence / "uv.lock").resolve()),
                 "dependency_lock_sha256": contract.dependency_lock_sha256,
+                "scheduler": reproduction.resolve_groot_scheduler_from_yaml(
+                    (verified.checkout / "configs/train_groot.yaml").read_text(encoding="utf-8")
+                ),
             }
         )
     )
@@ -834,7 +1032,9 @@ def test_task2_identity_admission_has_exact_task1_output_parity(
         value["dependency_lock_path"] = "/wrong/path"
         (root / "evidence/runtime-receipt.json").write_bytes(_canonical(value))
     elif mutation == "wheel":
-        (root / "evidence/lerobot-0.4.3-py3-none-any.whl").write_bytes(b"not a wheel")
+        wheel = root / "evidence/compatibility/lerobot-0.4.3-py3-none-any.whl"
+        wheel.chmod(0o644)
+        wheel.write_bytes(b"not a wheel")
     elif mutation == "installed_package":
         (root / "runtime/site-packages/lerobot/policy.py").write_bytes(b"tampered\n")
     else:

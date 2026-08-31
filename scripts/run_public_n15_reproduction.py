@@ -20,6 +20,8 @@ from lehome.n15_reproduction import (  # noqa: E402
     CONTRACT,
     ReproductionContract,
     ReproductionError,
+    build_compatible_lerobot_wheel,
+    compatibility_wheel_identity,
     render_training,
     verify_inputs,
     verify_training_output,
@@ -49,6 +51,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_inputs(output)
     output.add_argument("--training-root", type=Path, required=True)
+    compatibility = commands.add_parser(
+        "build-compatible-wheel",
+        help="build the sealed two-field LeRobot 0.4.3 compatibility wheel",
+    )
+    compatibility.add_argument("--upstream-wheel", type=Path, required=True)
+    compatibility.add_argument("--wheel-output", type=Path, required=True)
+    compatibility.add_argument("--receipt-output", type=Path, required=True)
+    compatibility_verify = commands.add_parser(
+        "verify-compatible-wheel", help="verify a sealed LeRobot compatibility wheel"
+    )
+    compatibility_verify.add_argument("--upstream-wheel", type=Path, required=True)
+    compatibility_verify.add_argument("--wheel", type=Path, required=True)
+    compatibility_verify.add_argument("--receipt", type=Path, required=True)
     lifecycle = commands.add_parser(
         "lifecycle-plan",
         help="write an immutable, pre-paid N1.5 lifecycle plan",
@@ -172,6 +187,20 @@ def main(
             result = {**value, **stored}
         elif args.command == "verify-lifecycle-plan":
             result = _verify_lifecycle_plan(args, contract)
+        elif args.command == "build-compatible-wheel":
+            result = build_compatible_lerobot_wheel(
+                upstream_wheel=args.upstream_wheel,
+                output_wheel=args.wheel_output,
+                receipt_output=args.receipt_output,
+                expected_upstream_sha256=contract.lerobot_wheel_sha256,
+            )
+        elif args.command == "verify-compatible-wheel":
+            result = compatibility_wheel_identity(
+                wheel=args.wheel,
+                receipt=args.receipt,
+                upstream_wheel=args.upstream_wheel,
+                expected_upstream_sha256=contract.lerobot_wheel_sha256,
+            )
         else:
             verified = _verified(args, contract)
             if args.command == "verify-inputs":

@@ -139,6 +139,18 @@ def test_cli_fails_closed_without_overwriting_an_existing_output(
     assert "already exists" in capsys.readouterr().err
 
 
+def test_compatibility_wheel_cli_requires_the_pinned_upstream_wheel() -> None:
+    with pytest.raises(SystemExit) as raised:
+        _cli_main(
+            [
+                "verify-compatible-wheel",
+                "--wheel", "/tmp/compatible.whl",
+                "--receipt", "/tmp/compatible.json",
+            ]
+        )
+    assert raised.value.code == 2
+
+
 def test_cli_script_help_is_importable_without_cloud_or_training_dependencies() -> None:
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--help"],

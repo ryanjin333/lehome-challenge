@@ -7,6 +7,7 @@ no cloud lifecycle and never executes training.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import hashlib
 import io
 import json
@@ -20,6 +21,7 @@ import tempfile
 from types import MappingProxyType
 from typing import Mapping
 import zipfile
+from base64 import urlsafe_b64encode
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -258,6 +260,288 @@ def wheel_lerobot_tree_identity(wheel: bytes) -> tuple[int, str]:
     if not files:
         raise ReproductionError("LeRobot wheel contains no package tree")
     return _tree_identity(files)
+
+
+_COMPATIBILITY_WHEEL_KIND = "lehome_lerobot_043_groot_scheduler_compatibility_v1"
+_COMPATIBILITY_WHEEL_FIELDS = {
+    "num_decay_steps": 10000,
+    "decay_lr_ratio": 0.1,
+}
+_COMPATIBILITY_WHEEL_CONFIG = "lerobot/policies/groot/configuration_groot.py"
+_COMPATIBILITY_WHEEL_SOURCE_FRAGMENT = """    warmup_ratio: float = 0.05
+    use_bf16: bool = True
+"""
+_COMPATIBILITY_WHEEL_DERIVED_FRAGMENT = """    warmup_ratio: float = 0.05
+    num_decay_steps: int = 10000
+    decay_lr_ratio: float = 0.1
+    use_bf16: bool = True
+"""
+_COMPATIBILITY_WHEEL_SCHEDULER_SOURCE_FRAGMENT = """            num_warmup_steps=int(10000 * self.warmup_ratio),  # 5% warmup by default
+            num_decay_steps=10000,  # Adjust based on training steps
+            peak_lr=self.optimizer_lr,
+            decay_lr=self.optimizer_lr * 0.1,
+"""
+_COMPATIBILITY_WHEEL_SCHEDULER_DERIVED_FRAGMENT = """            num_warmup_steps=int(self.num_decay_steps * self.warmup_ratio),  # 5% warmup by default
+            num_decay_steps=self.num_decay_steps,  # Adjust based on training steps
+            peak_lr=self.optimizer_lr,
+            decay_lr=self.optimizer_lr * self.decay_lr_ratio,
+"""
+
+
+def _compatibility_transformation() -> dict[str, object]:
+    return {
+        "kind": _COMPATIBILITY_WHEEL_KIND,
+        "fields": dict(_COMPATIBILITY_WHEEL_FIELDS),
+    }
+
+
+def resolve_groot_scheduler_from_yaml(text: str) -> dict[str, object]:
+    """Resolve exactly the four scheduler values from the pinned train YAML.
+
+    The source YAML is already byte-verified before this helper is used.  This
+    intentionally accepts only the scalar form used by the pinned public
+    recipe; it is not a general YAML interpreter.
+    """
+    if not isinstance(text, str):
+        raise ReproductionError("pinned training YAML is invalid")
+
+    def scalar(name: str) -> str:
+        matches = re.findall(
+            rf"^[ \t]*{re.escape(name)}:[ \t]*([^#\r\n]+?)[ \t]*(?:#[^\r\n]*)?$",
+            text,
+            re.MULTILINE,
+        )
+        if len(matches) != 1:
+            raise ReproductionError(f"pinned training YAML lacks one {name} value")
+        return matches[0].strip()
+
+    try:
+        steps = int(scalar("steps"), 10)
+        optimizer_lr = Decimal(scalar("optimizer_lr"))
+        warmup_ratio = Decimal(scalar("warmup_ratio"))
+        num_decay_steps = int(scalar("num_decay_steps"), 10)
+        decay_lr_ratio = Decimal(scalar("decay_lr_ratio"))
+    except (ValueError, InvalidOperation):
+        raise ReproductionError("pinned training YAML scheduler values are invalid") from None
+    if (
+        steps != 12000
+        or optimizer_lr != Decimal("2e-4")
+        or warmup_ratio != Decimal("0.05")
+        or num_decay_steps != 12000
+        or decay_lr_ratio != Decimal("0.1")
+    ):
+        raise ReproductionError("pinned training YAML scheduler values do not match the public recipe")
+    return {
+        "num_warmup_steps": int(num_decay_steps * warmup_ratio),
+        "num_decay_steps": num_decay_steps,
+        "peak_lr": float(optimizer_lr),
+        "decay_lr": float(optimizer_lr * decay_lr_ratio),
+    }
+
+
+def _safe_wheel_entries(wheel: bytes) -> dict[str, bytes]:
+    """Read a wheel as a complete safe immutable archive map."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
+            entries: dict[str, bytes] = {}
+            for info in archive.infolist():
+                name = info.filename
+                pure = PurePosixPath(name)
+                file_type = (info.external_attr >> 16) & 0o170000
+                if (
+                    info.is_dir()
+                    or not name
+                    or pure.is_absolute()
+                    or any(part in {"", ".", ".."} for part in pure.parts)
+                    or name in entries
+                    or file_type == stat.S_IFLNK
+                ):
+                    raise ReproductionError("LeRobot wheel contains unsafe entries")
+                entries[name] = archive.read(info)
+    except (OSError, zipfile.BadZipFile, KeyError):
+        raise ReproductionError("LeRobot wheel is invalid") from None
+    if not entries:
+        raise ReproductionError("LeRobot wheel contains no entries")
+    return entries
+
+
+def _wheel_metadata_identity(entries: Mapping[str, bytes]) -> tuple[str, str, str]:
+    metadata_paths = sorted(
+        path for path in entries if path.endswith(".dist-info/METADATA")
+    )
+    if len(metadata_paths) != 1:
+        raise ReproductionError("LeRobot wheel distribution metadata is invalid")
+    metadata_path = metadata_paths[0]
+    try:
+        metadata = entries[metadata_path].decode("utf-8")
+    except UnicodeError:
+        raise ReproductionError("LeRobot wheel distribution metadata is invalid") from None
+    name = re.search(r"^Name: ([^\r\n]+)$", metadata, re.MULTILINE)
+    version = re.search(r"^Version: ([^\r\n]+)$", metadata, re.MULTILINE)
+    if name is None or version is None:
+        raise ReproductionError("LeRobot wheel distribution metadata is invalid")
+    dist_info = metadata_path.removesuffix("/METADATA")
+    return dist_info, name.group(1), version.group(1)
+
+
+def _derived_wheel_bytes(entries: Mapping[str, bytes]) -> bytes:
+    """Apply the only accepted public N1.5 compatibility transformation."""
+    mutable = dict(entries)
+    source = mutable.get(_COMPATIBILITY_WHEEL_CONFIG)
+    if source is None:
+        raise ReproductionError("LeRobot wheel lacks GrootConfig source")
+    try:
+        text = source.decode("utf-8")
+    except UnicodeError:
+        raise ReproductionError("LeRobot GrootConfig source is invalid") from None
+    if text.count(_COMPATIBILITY_WHEEL_SOURCE_FRAGMENT) != 1 or text.count(
+        _COMPATIBILITY_WHEEL_SCHEDULER_SOURCE_FRAGMENT
+    ) != 1:
+        raise ReproductionError("LeRobot GrootConfig source does not match the audited 0.4.3 form")
+    text = text.replace(
+        _COMPATIBILITY_WHEEL_SOURCE_FRAGMENT,
+        _COMPATIBILITY_WHEEL_DERIVED_FRAGMENT,
+        1,
+    ).replace(
+        _COMPATIBILITY_WHEEL_SCHEDULER_SOURCE_FRAGMENT,
+        _COMPATIBILITY_WHEEL_SCHEDULER_DERIVED_FRAGMENT,
+        1,
+    )
+    mutable[_COMPATIBILITY_WHEEL_CONFIG] = text.encode("utf-8")
+    dist_info, distribution, version = _wheel_metadata_identity(mutable)
+    if distribution != "lerobot" or version != CONTRACT.lerobot_version:
+        raise ReproductionError("LeRobot wheel distribution identity mismatch")
+    record = f"{dist_info}/RECORD"
+    if record not in mutable:
+        raise ReproductionError("LeRobot wheel RECORD is unavailable")
+    record_rows = []
+    for name, payload in sorted(mutable.items()):
+        if name == record:
+            continue
+        digest = urlsafe_b64encode(hashlib.sha256(payload).digest()).decode("ascii").rstrip("=")
+        record_rows.append(f"{name},sha256={digest},{len(payload)}\n")
+    mutable[record] = ("".join(record_rows) + f"{record},,\n").encode("utf-8")
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name, payload in sorted(mutable.items()):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = 0o100644 << 16
+            info.compress_type = zipfile.ZIP_STORED
+            archive.writestr(info, payload)
+    return output.getvalue()
+
+
+def _write_atomic_bytes(path: Path | str, payload: bytes, label: str) -> Path:
+    destination = Path(path)
+    if not destination.is_absolute() or destination.exists() or destination.is_symlink():
+        raise ReproductionError(f"{label} path is unavailable or unsafe")
+    parent = _regular_directory(destination.parent, f"{label} parent")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.fchmod(stream.fileno(), 0o444)
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            raise ReproductionError(f"{label} already exists") from None
+        parent_descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination.resolve(strict=True)
+
+
+def _expected_compatible_lerobot_wheel(
+    upstream_bytes: bytes, expected_upstream_sha256: str
+) -> tuple[bytes, dict[str, object]]:
+    """Regenerate the only admissible derived wheel from the pinned upstream bytes."""
+    if _SHA256.fullmatch(expected_upstream_sha256) is None:
+        raise ReproductionError("trusted upstream LeRobot wheel digest is invalid")
+    if _sha256_bytes(upstream_bytes) != expected_upstream_sha256:
+        raise ReproductionError("upstream LeRobot wheel digest mismatch")
+    entries = _safe_wheel_entries(upstream_bytes)
+    _, distribution, version = _wheel_metadata_identity(entries)
+    if distribution != "lerobot" or version != CONTRACT.lerobot_version:
+        raise ReproductionError("upstream LeRobot wheel distribution identity mismatch")
+    upstream_count, upstream_tree = wheel_lerobot_tree_identity(upstream_bytes)
+    derived_bytes = _derived_wheel_bytes(entries)
+    derived_count, derived_tree = wheel_lerobot_tree_identity(derived_bytes)
+    changed = {
+        _COMPATIBILITY_WHEEL_CONFIG: {
+            "before_sha256": _sha256_bytes(entries[_COMPATIBILITY_WHEEL_CONFIG]),
+            "after_sha256": _sha256_bytes(
+                _safe_wheel_entries(derived_bytes)[_COMPATIBILITY_WHEEL_CONFIG]
+            ),
+        }
+    }
+    return derived_bytes, {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_lerobot_compatibility_wheel_v1",
+        "upstream_wheel_sha256": expected_upstream_sha256,
+        "upstream_package_file_count": upstream_count,
+        "upstream_package_tree_sha256": upstream_tree,
+        "transformation": _compatibility_transformation(),
+        "changed_package_files": changed,
+        "derived_wheel_sha256": _sha256_bytes(derived_bytes),
+        "derived_package_file_count": derived_count,
+        "derived_package_tree_sha256": derived_tree,
+        "distribution": {"name": distribution, "version": version},
+    }
+
+
+def build_compatible_lerobot_wheel(
+    *,
+    upstream_wheel: Path | str,
+    output_wheel: Path | str,
+    receipt_output: Path | str,
+    expected_upstream_sha256: str = CONTRACT.lerobot_wheel_sha256,
+) -> dict[str, object]:
+    """Build and seal the deterministic N1.5-compatible LeRobot 0.4.3 wheel."""
+    upstream = _regular_file(Path(upstream_wheel), "upstream LeRobot wheel")
+    derived_bytes, value = _expected_compatible_lerobot_wheel(
+        upstream.read_bytes(), expected_upstream_sha256
+    )
+    output = _write_atomic_bytes(output_wheel, derived_bytes, "compatible LeRobot wheel")
+    try:
+        receipt = write_receipt(
+            output=receipt_output,
+            value=value,
+            label="compatible LeRobot wheel receipt",
+        )
+    except Exception:
+        output.unlink(missing_ok=True)
+        raise
+    return {**value, "wheel_path": str(output), "receipt_path": receipt["path"]}
+
+
+def compatibility_wheel_identity(
+    *,
+    wheel: Path | str,
+    receipt: Path | str,
+    upstream_wheel: Path | str,
+    expected_upstream_sha256: str = CONTRACT.lerobot_wheel_sha256,
+) -> dict[str, object]:
+    """Fail closed unless a compatible installed artifact is exactly sealed."""
+    wheel_path = _regular_file(Path(wheel), "compatible LeRobot wheel")
+    upstream_path = _regular_file(Path(upstream_wheel), "upstream LeRobot wheel")
+    _, _, value = _load_receipt(receipt, "compatible LeRobot wheel receipt")
+    expected_bytes, expected = _expected_compatible_lerobot_wheel(
+        upstream_path.read_bytes(), expected_upstream_sha256
+    )
+    if value != expected:
+        raise ReproductionError("compatibility wheel receipt identity mismatch")
+    wheel_bytes = wheel_path.read_bytes()
+    if wheel_bytes != expected_bytes:
+        raise ReproductionError("compatibility wheel differs from expected derived wheel")
+    return dict(value)
 
 
 def _installed_package_tree_identity(root: Path) -> tuple[int, str]:
@@ -931,22 +1215,32 @@ def verify_training_output(
         "schema_version",
         "kind",
         "python_executable",
-        "lerobot_wheel_path",
-        "lerobot_wheel_sha256",
+        "upstream_lerobot_wheel_path",
+        "upstream_lerobot_wheel_sha256",
+        "compatibility_wheel_path",
+        "compatibility_wheel_sha256",
+        "compatibility_wheel_receipt_path",
+        "compatibility_wheel_receipt_sha256",
         "lerobot_package_root",
         "dependency_lock_path",
         "dependency_lock_sha256",
+        "scheduler",
     }:
         raise ReproductionError("training runtime receipt schema mismatch")
     if (
         runtime["schema_version"] != 1
         or runtime["kind"] != "lehome_public_n15_training_runtime_v1"
-        or runtime["lerobot_wheel_sha256"] != contract.lerobot_wheel_sha256
+        or runtime["upstream_lerobot_wheel_sha256"] != contract.lerobot_wheel_sha256
         or runtime["dependency_lock_sha256"] != contract.dependency_lock_sha256
         or runtime["dependency_lock_path"] != str(lock)
         or not isinstance(runtime["python_executable"], str)
-        or not isinstance(runtime["lerobot_wheel_path"], str)
+        or not isinstance(runtime["upstream_lerobot_wheel_path"], str)
+        or not isinstance(runtime["compatibility_wheel_path"], str)
+        or not isinstance(runtime["compatibility_wheel_sha256"], str)
+        or not isinstance(runtime["compatibility_wheel_receipt_path"], str)
+        or not isinstance(runtime["compatibility_wheel_receipt_sha256"], str)
         or not isinstance(runtime["lerobot_package_root"], str)
+        or not isinstance(runtime["scheduler"], dict)
     ):
         raise ReproductionError("training runtime identity mismatch")
     python_executable = _regular_file(
@@ -988,35 +1282,59 @@ def verify_training_output(
             f"training Python interpreter is not Python {contract.python_version}"
         )
 
-    wheel = _regular_file(
-        Path(runtime["lerobot_wheel_path"]),
-        "training LeRobot wheel",
+    upstream_wheel = _regular_file(
+        Path(runtime["upstream_lerobot_wheel_path"]), "upstream training LeRobot wheel"
     )
-    if wheel != artifacts.get("evidence/lerobot-0.4.3-py3-none-any.whl"):
-        raise ReproductionError("training LeRobot wheel is outside the sealed output")
-    wheel_bytes = wheel.read_bytes()
-    if _sha256_bytes(wheel_bytes) != contract.lerobot_wheel_sha256:
-        raise ReproductionError("training LeRobot wheel digest mismatch")
-    wheel_count, wheel_tree_sha256 = wheel_lerobot_tree_identity(wheel_bytes)
+    if upstream_wheel != artifacts.get("evidence/upstream/lerobot-0.4.3-py3-none-any.whl"):
+        raise ReproductionError("upstream training LeRobot wheel is outside the sealed output")
+    upstream_wheel_bytes = upstream_wheel.read_bytes()
+    if _sha256_bytes(upstream_wheel_bytes) != contract.lerobot_wheel_sha256:
+        raise ReproductionError("upstream training LeRobot wheel digest mismatch")
+    upstream_count, upstream_tree = wheel_lerobot_tree_identity(upstream_wheel_bytes)
     if (
-        wheel_count != contract.lerobot_package_file_count
-        or wheel_tree_sha256 != contract.lerobot_package_tree_sha256
+        upstream_count != contract.lerobot_package_file_count
+        or upstream_tree != contract.lerobot_package_tree_sha256
     ):
-        raise ReproductionError("training LeRobot wheel package tree mismatch")
+        raise ReproductionError("upstream training LeRobot wheel package tree mismatch")
+    wheel = _regular_file(Path(runtime["compatibility_wheel_path"]), "compatible training LeRobot wheel")
+    compatibility_receipt = _regular_file(
+        Path(runtime["compatibility_wheel_receipt_path"]),
+        "compatible training LeRobot wheel receipt",
+    )
+    if (
+        wheel != artifacts.get("evidence/compatibility/lerobot-0.4.3-py3-none-any.whl")
+        or compatibility_receipt
+        != artifacts.get("evidence/compatibility/lerobot-compatibility-receipt.json")
+        or _sha256_file(compatibility_receipt) != runtime["compatibility_wheel_receipt_sha256"]
+    ):
+        raise ReproductionError("compatible training LeRobot wheel is outside the sealed output")
+    compatibility = compatibility_wheel_identity(
+        wheel=wheel,
+        receipt=compatibility_receipt,
+        upstream_wheel=upstream_wheel,
+        expected_upstream_sha256=contract.lerobot_wheel_sha256,
+    )
+    if runtime["compatibility_wheel_sha256"] != compatibility["derived_wheel_sha256"]:
+        raise ReproductionError("compatible training LeRobot wheel digest mismatch")
+    config = _safe_relative_file(
+        verified.checkout, "configs/train_groot.yaml", "pinned training config"
+    )
     try:
-        with zipfile.ZipFile(io.BytesIO(wheel_bytes)) as archive:
-            metadata = archive.read("lerobot-0.4.3.dist-info/METADATA").decode("utf-8")
-    except (KeyError, UnicodeError, zipfile.BadZipFile):
-        raise ReproductionError("training LeRobot wheel metadata is invalid") from None
-    if "Name: lerobot\n" not in metadata or f"Version: {contract.lerobot_version}\n" not in metadata:
-        raise ReproductionError("training LeRobot wheel distribution identity mismatch")
+        scheduler = resolve_groot_scheduler_from_yaml(config.read_text(encoding="utf-8"))
+    except UnicodeError:
+        raise ReproductionError("pinned training config is unreadable") from None
+    if runtime["scheduler"] != scheduler:
+        raise ReproductionError("training runtime scheduler differs from pinned public YAML")
     package_root = _regular_directory(
         Path(runtime["lerobot_package_root"]),
         "installed LeRobot package root",
     )
     package_count, package_tree_sha256 = _installed_package_tree_identity(package_root)
-    if package_count != wheel_count or package_tree_sha256 != wheel_tree_sha256:
-        raise ReproductionError("installed LeRobot package differs from the trusted wheel")
+    if (
+        package_count != compatibility["derived_package_file_count"]
+        or package_tree_sha256 != compatibility["derived_package_tree_sha256"]
+    ):
+        raise ReproductionError("installed LeRobot package differs from the compatible wheel")
     log = artifacts.get("logs/train.log")
     if log is None or log.stat().st_size == 0:
         raise ReproductionError("training log is missing or empty")

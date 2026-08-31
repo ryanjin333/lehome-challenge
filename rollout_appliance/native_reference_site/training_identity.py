@@ -11,6 +11,7 @@ import re
 import shlex
 import stat
 import subprocess
+import sys
 from typing import Mapping
 import zipfile
 
@@ -439,36 +440,112 @@ def validate_training_identity_receipt(
         raise TrainingIdentityError("training dependency lock mismatch")
     runtime = _json(training_root / "evidence/runtime-receipt.json", "training runtime receipt")
     runtime_keys = {
-        "schema_version", "kind", "python_executable", "lerobot_wheel_path",
-        "lerobot_wheel_sha256", "lerobot_package_root", "dependency_lock_path",
-        "dependency_lock_sha256",
+        "schema_version", "kind", "python_executable", "upstream_lerobot_wheel_path",
+        "upstream_lerobot_wheel_sha256", "compatibility_wheel_path",
+        "compatibility_wheel_sha256", "compatibility_wheel_receipt_path",
+        "compatibility_wheel_receipt_sha256", "lerobot_package_root",
+        "dependency_lock_path", "dependency_lock_sha256", "scheduler",
     }
-    wheel = _regular(training_root / "evidence/lerobot-0.4.3-py3-none-any.whl", "training LeRobot wheel")
+    upstream_wheel = _regular(
+        training_root / "evidence/upstream/lerobot-0.4.3-py3-none-any.whl",
+        "upstream training LeRobot wheel",
+    )
+    wheel = _regular(
+        training_root / "evidence/compatibility/lerobot-0.4.3-py3-none-any.whl",
+        "compatible training LeRobot wheel",
+    )
+    compatibility_receipt_file = _regular(
+        training_root / "evidence/compatibility/lerobot-compatibility-receipt.json",
+        "training LeRobot compatibility receipt",
+    )
+    compatibility_receipt = _json(
+        compatibility_receipt_file,
+        "training LeRobot compatibility receipt",
+    )
     if (
         set(runtime) != runtime_keys
         or runtime.get("schema_version") != 1
         or runtime.get("kind") != "lehome_public_n15_training_runtime_v1"
-        or runtime.get("lerobot_wheel_path") != str(wheel)
-        or runtime.get("lerobot_wheel_sha256") != contract["lerobot_wheel_sha256"]
+        or runtime.get("upstream_lerobot_wheel_path") != str(upstream_wheel)
+        or runtime.get("upstream_lerobot_wheel_sha256") != contract["lerobot_wheel_sha256"]
+        or runtime.get("compatibility_wheel_path") != str(wheel)
+        or runtime.get("compatibility_wheel_receipt_path") != str(compatibility_receipt_file)
+        or runtime.get("compatibility_wheel_receipt_sha256") != _sha256_file(compatibility_receipt_file)
         or runtime.get("dependency_lock_path") != str(lock)
         or runtime.get("dependency_lock_sha256") != contract["dependency_lock_sha256"]
         or not isinstance(runtime.get("python_executable"), str)
         or not isinstance(runtime.get("lerobot_package_root"), str)
+        or runtime.get("scheduler") != {
+            "num_warmup_steps": 600, "num_decay_steps": 12000,
+            "peak_lr": 2e-4, "decay_lr": 2e-5,
+        }
     ):
         raise TrainingIdentityError("training runtime identity mismatch")
+    upstream_bytes = upstream_wheel.read_bytes()
+    if hashlib.sha256(upstream_bytes).hexdigest() != contract["lerobot_wheel_sha256"]:
+        raise TrainingIdentityError("upstream training LeRobot wheel digest mismatch")
+    upstream_count, upstream_tree, upstream_metadata = _wheel_identity(upstream_bytes)
+    if (
+        upstream_count != contract["lerobot_package_file_count"]
+        or upstream_tree != contract["lerobot_package_tree_sha256"]
+        or "Name: lerobot\n" not in upstream_metadata
+        or f"Version: {contract['lerobot_version']}\n" not in upstream_metadata
+    ):
+        raise TrainingIdentityError("upstream training LeRobot wheel identity mismatch")
+    source_root = Path(__file__).resolve().parents[2] / "source/lehome"
+    if not source_root.is_dir():
+        raise TrainingIdentityError("strong LeRobot compatibility verifier is unavailable")
+    sys.path.insert(0, str(source_root))
+    try:
+        from lehome.n15_reproduction import (  # type: ignore[import-not-found]
+            ReproductionError,
+            compatibility_wheel_identity,
+        )
+
+        compatibility_wheel_identity(
+            wheel=wheel,
+            receipt=compatibility_receipt_file,
+            upstream_wheel=upstream_wheel,
+            expected_upstream_sha256=str(contract["lerobot_wheel_sha256"]),
+        )
+    except (ImportError, ReproductionError) as error:
+        raise TrainingIdentityError("strong LeRobot compatibility verification failed") from error
+    compatibility_keys = {
+        "schema_version", "kind", "upstream_wheel_sha256", "upstream_package_file_count",
+        "upstream_package_tree_sha256", "transformation", "changed_package_files",
+        "derived_wheel_sha256", "derived_package_file_count", "derived_package_tree_sha256",
+        "distribution",
+    }
+    if (
+        set(compatibility_receipt) != compatibility_keys
+        or compatibility_receipt.get("schema_version") != 1
+        or compatibility_receipt.get("kind") != "lehome_public_n15_lerobot_compatibility_wheel_v1"
+        or compatibility_receipt.get("upstream_wheel_sha256") != contract["lerobot_wheel_sha256"]
+        or compatibility_receipt.get("upstream_package_file_count") != upstream_count
+        or compatibility_receipt.get("upstream_package_tree_sha256") != upstream_tree
+        or compatibility_receipt.get("transformation") != {
+            "kind": "lehome_lerobot_043_groot_scheduler_compatibility_v1",
+            "fields": {"num_decay_steps": 10000, "decay_lr_ratio": 0.1},
+        }
+        or compatibility_receipt.get("distribution") != {"name": "lerobot", "version": contract["lerobot_version"]}
+        or not isinstance(compatibility_receipt.get("derived_wheel_sha256"), str)
+        or not isinstance(compatibility_receipt.get("derived_package_file_count"), int)
+        or not isinstance(compatibility_receipt.get("derived_package_tree_sha256"), str)
+        or runtime.get("compatibility_wheel_sha256") != compatibility_receipt.get("derived_wheel_sha256")
+    ):
+        raise TrainingIdentityError("training LeRobot compatibility identity mismatch")
     wheel_bytes = wheel.read_bytes()
-    if hashlib.sha256(wheel_bytes).hexdigest() != contract["lerobot_wheel_sha256"]:
-        raise TrainingIdentityError("training LeRobot wheel digest mismatch")
     wheel_count, wheel_tree, metadata = _wheel_identity(wheel_bytes)
     if (
-        wheel_count != contract["lerobot_package_file_count"]
-        or wheel_tree != contract["lerobot_package_tree_sha256"]
+        hashlib.sha256(wheel_bytes).hexdigest() != compatibility_receipt["derived_wheel_sha256"]
+        or wheel_count != compatibility_receipt["derived_package_file_count"]
+        or wheel_tree != compatibility_receipt["derived_package_tree_sha256"]
         or "Name: lerobot\n" not in metadata
         or f"Version: {contract['lerobot_version']}\n" not in metadata
     ):
-        raise TrainingIdentityError("training LeRobot wheel identity mismatch")
+        raise TrainingIdentityError("compatible training LeRobot wheel identity mismatch")
     if _installed_tree(Path(runtime["lerobot_package_root"])) != (wheel_count, wheel_tree):
-        raise TrainingIdentityError("installed LeRobot package differs from the trusted wheel")
+        raise TrainingIdentityError("installed LeRobot package differs from the compatible wheel")
     python = _regular(Path(runtime["python_executable"]), "training Python executable proof")
     try:
         probe = subprocess.run(
