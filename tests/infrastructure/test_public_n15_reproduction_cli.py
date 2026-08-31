@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
@@ -9,16 +10,28 @@ import sys
 
 import pytest
 
-from tests.test_n15_reproduction import (
-    _fixture_contract,
-    _materialize_snapshots,
-    _materialize_source,
-    _materialize_training_output,
-)
-
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/run_public_n15_reproduction.py"
+
+# Load test-only fixtures by file identity.  The intended command exposes only
+# source/lehome on PYTHONPATH, and tests is deliberately not a Python package.
+_FIXTURE_SPEC = importlib.util.spec_from_file_location(
+    "_public_n15_test_fixtures",
+    ROOT / "tests/test_n15_reproduction.py",
+)
+assert _FIXTURE_SPEC is not None and _FIXTURE_SPEC.loader is not None
+_FIXTURES = importlib.util.module_from_spec(_FIXTURE_SPEC)
+_FIXTURE_SPEC.loader.exec_module(_FIXTURES)
+_fixture_contract = _FIXTURES._fixture_contract
+_materialize_snapshots = _FIXTURES._materialize_snapshots
+_materialize_source = _FIXTURES._materialize_source
+_materialize_training_output = _FIXTURES._materialize_training_output
+_CLI_SPEC = importlib.util.spec_from_file_location("_public_n15_cli", SCRIPT)
+assert _CLI_SPEC is not None and _CLI_SPEC.loader is not None
+_CLI = importlib.util.module_from_spec(_CLI_SPEC)
+_CLI_SPEC.loader.exec_module(_CLI)
+_cli_main = _CLI.main
 
 
 def _common(checkout: Path, source_receipt: Path, snapshots_receipt: Path, contract) -> list[str]:
@@ -41,14 +54,13 @@ def test_cli_verify_inputs_render_training_and_verify_output_are_offline_and_ato
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     from lehome.n15_reproduction import verify_inputs
-    from scripts.run_public_n15_reproduction import main
 
     checkout, source_receipt = _materialize_source(tmp_path)
     _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
     contract = _fixture_contract(checkout)
     common = _common(checkout, source_receipt, snapshots_receipt, contract)
     verified_output = tmp_path / "verified-inputs.json"
-    assert main(["verify-inputs", *common, "--output", str(verified_output)], contract=contract) == 0
+    assert _cli_main(["verify-inputs", *common, "--output", str(verified_output)], contract=contract) == 0
     verified = json.loads(verified_output.read_text(encoding="utf-8"))
     assert verified["kind"] == "lehome_public_n15_verified_inputs_v1"
     assert verified["vm_id"] == contract.vm_id
@@ -56,7 +68,7 @@ def test_cli_verify_inputs_render_training_and_verify_output_are_offline_and_ato
     assert verified_output.stat().st_mode & 0o777 == 0o444
 
     manifest_output = tmp_path / "training-execution.json"
-    assert main(["render-training", *common, "--output", str(manifest_output)], contract=contract) == 0
+    assert _cli_main(["render-training", *common, "--output", str(manifest_output)], contract=contract) == 0
     manifest = json.loads(manifest_output.read_text(encoding="utf-8"))
     assert manifest["execution"]["argv"] == [
         "lerobot-train",
@@ -83,7 +95,7 @@ def test_cli_verify_inputs_render_training_and_verify_output_are_offline_and_ato
         contract=contract,
     )
     training_output = tmp_path / "verified-training-output.json"
-    assert main(
+    assert _cli_main(
         [
             "verify-training-output",
             *common,
@@ -105,15 +117,13 @@ def test_cli_fails_closed_without_overwriting_an_existing_output(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from scripts.run_public_n15_reproduction import main
-
     checkout, source_receipt = _materialize_source(tmp_path)
     _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
     contract = _fixture_contract(checkout)
     output = tmp_path / "existing.json"
     output.write_text("sentinel\n", encoding="utf-8")
 
-    result = main(
+    result = _cli_main(
         [
             "verify-inputs",
             *_common(checkout, source_receipt, snapshots_receipt, contract),

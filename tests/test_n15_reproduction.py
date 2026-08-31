@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -139,8 +140,16 @@ def _materialize_snapshots(tmp_path: Path, checkout: Path) -> tuple[Path, Path, 
     dataset = checkout / "Datasets/example/four_types_merged"
     model.mkdir(parents=True)
     dataset.mkdir(parents=True)
-    (model / "config.json").write_bytes(b"model config")
-    (model / "model.safetensors").write_bytes(b"model weights")
+    model_blobs = model.parent.parent / "blobs"
+    model_blobs.mkdir()
+    for relative, payload, lfs in (
+        ("config.json", b"model config", False),
+        ("model.safetensors", b"model weights", True),
+    ):
+        identity = _sha(payload) if lfs else _git_blob(payload)
+        blob = model_blobs / identity
+        blob.write_bytes(payload)
+        (model / relative).symlink_to(Path("../../blobs") / identity)
     model_refs = model.parent.parent / "refs"
     model_refs.mkdir()
     (model_refs / "main").write_text(CONTRACT.base_model_revision + "\n", encoding="ascii")
@@ -152,12 +161,27 @@ def _materialize_snapshots(tmp_path: Path, checkout: Path) -> tuple[Path, Path, 
     )
     (dataset_snapshot / "meta").mkdir(parents=True)
     (dataset_snapshot / "data").mkdir()
-    (dataset_snapshot / "meta/info.json").write_bytes(b"dataset metadata")
-    (dataset_snapshot / "data/chunk-000.parquet").write_bytes(b"dataset rows")
-    for relative, digest in _manifest(dataset_snapshot).items():
+    dataset_blobs = dataset_snapshot.parent.parent / "blobs"
+    dataset_blobs.mkdir()
+    for relative, payload, lfs in (
+        ("meta/info.json", b"dataset metadata", False),
+        ("data/chunk-000.parquet", b"dataset rows", True),
+    ):
+        identity = _sha(payload) if lfs else _git_blob(payload)
+        blob = dataset_blobs / identity
+        blob.write_bytes(payload)
+        (dataset_snapshot / relative).symlink_to(
+            Path("../../../blobs") / identity
+        )
+    for relative in ("meta/info.json", "data/chunk-000.parquet"):
         target = dataset / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes((dataset_snapshot / relative).read_bytes())
+        source = dataset_snapshot / relative
+        if relative.startswith("data/"):
+            blob = source.resolve(strict=True)
+            target.symlink_to(Path(os.path.relpath(blob, target.parent)))
+        else:
+            target.write_bytes(source.read_bytes())
     receipt = {
         "schema_version": 1,
         "kind": "lehome_public_n15_resolved_snapshots_v1",
@@ -491,6 +515,45 @@ def test_verify_inputs_rejects_unproven_or_tampered_snapshot_content(
         (dataset / "data/chunk-000.parquet").write_bytes(b"tampered")
 
     with pytest.raises(reproduction.ReproductionError, match="ref|metadata|content"):
+        reproduction.verify_inputs(
+            checkout=checkout,
+            source_receipt=source_receipt,
+            resolved_snapshots_receipt=snapshots_receipt,
+            vm_id=contract.vm_id,
+            disk_id=contract.disk_id,
+            contract=contract,
+        )
+
+
+@pytest.mark.parametrize("problem", ["escape", "dangling", "chain", "directory"])
+def test_verify_inputs_rejects_unsafe_hub_snapshot_symlinks(
+    tmp_path: Path,
+    problem: str,
+) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _materialize_source(tmp_path)
+    model, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
+    contract = _fixture_contract(checkout)
+    link = model / "config.json"
+    original_blob = link.resolve(strict=True)
+    link.unlink()
+    if problem == "escape":
+        outside = tmp_path / "outside-config"
+        outside.write_bytes(original_blob.read_bytes())
+        link.symlink_to(outside)
+    elif problem == "dangling":
+        link.symlink_to(Path("../../blobs/does-not-exist"))
+    elif problem == "chain":
+        terminal = original_blob.with_name("terminal-blob")
+        terminal.write_bytes(original_blob.read_bytes())
+        original_blob.unlink()
+        original_blob.symlink_to(terminal.name)
+        link.symlink_to(Path("../../blobs") / original_blob.name)
+    else:
+        link.symlink_to(Path("../../blobs"), target_is_directory=True)
+
+    with pytest.raises(reproduction.ReproductionError, match="symlink"):
         reproduction.verify_inputs(
             checkout=checkout,
             source_receipt=source_receipt,

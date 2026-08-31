@@ -397,29 +397,60 @@ def _verify_hub_snapshot(
     siblings: object,
     *,
     label: str,
+    blobs_root: Path,
     expected_count: int,
     expected_metadata_sha256: str,
 ) -> list[dict[str, object]]:
     rows = _validated_hub_siblings(siblings)
     if len(rows) != expected_count or hub_metadata_sha256(rows) != expected_metadata_sha256:
         raise ReproductionError(f"{label} authoritative Hub metadata mismatch")
-    actual_paths: set[str] = set()
+    blobs = _regular_directory(blobs_root, f"{label} repository blobs directory")
+    actual_files: dict[str, Path] = {}
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
         metadata = path.lstat()
         if path.is_symlink():
-            raise ReproductionError(f"{label} content contains unsafe symlink: {relative}")
+            link = Path(os.readlink(path))
+            if link.is_absolute():
+                raise ReproductionError(f"{label} content contains unsafe symlink: {relative}")
+            direct_target = path.parent / link
+            try:
+                target_metadata = direct_target.lstat()
+            except OSError:
+                raise ReproductionError(
+                    f"{label} content contains dangling symlink: {relative}"
+                ) from None
+            if stat.S_ISLNK(target_metadata.st_mode) or not stat.S_ISREG(target_metadata.st_mode):
+                raise ReproductionError(
+                    f"{label} content contains chained or non-file symlink: {relative}"
+                )
+            resolved_target = direct_target.resolve(strict=True)
+            try:
+                target_relative = resolved_target.relative_to(blobs)
+            except ValueError:
+                raise ReproductionError(
+                    f"{label} content symlink escapes repository blobs: {relative}"
+                ) from None
+            cursor = blobs
+            for part in target_relative.parts[:-1]:
+                cursor = cursor / part
+                if cursor.is_symlink() or not cursor.is_dir():
+                    raise ReproductionError(
+                        f"{label} content contains chained symlink: {relative}"
+                    )
+            actual_files[relative] = resolved_target
+            continue
         if stat.S_ISDIR(metadata.st_mode):
             continue
         if not stat.S_ISREG(metadata.st_mode):
             raise ReproductionError(f"{label} content contains unsafe entry: {relative}")
-        actual_paths.add(relative)
+        actual_files[relative] = path.resolve(strict=True)
     expected_paths = {str(row["path"]) for row in rows}
-    if actual_paths != expected_paths:
+    if set(actual_files) != expected_paths:
         raise ReproductionError(f"{label} content file set mismatches authoritative metadata")
     for row in rows:
         relative = str(row["path"])
-        path = _safe_relative_file(root, relative, f"{label} file {relative}")
+        path = actual_files[relative]
         payload = path.read_bytes()
         if len(payload) != row["size"]:
             raise ReproductionError(f"{label} content size mismatch: {relative}")
@@ -506,6 +537,7 @@ def _validate_snapshots(
         model,
         model_receipt["siblings"],
         label="base model",
+        blobs_root=model.parent.parent / "blobs",
         expected_count=contract.base_model_metadata_count,
         expected_metadata_sha256=contract.base_model_metadata_sha256,
     )
@@ -534,6 +566,7 @@ def _validate_snapshots(
         snapshot_root,
         dataset_receipt["siblings"],
         label="dataset Hub snapshot",
+        blobs_root=snapshot_root.parent.parent / "blobs",
         expected_count=contract.dataset_metadata_count,
         expected_metadata_sha256=contract.dataset_metadata_sha256,
     )
@@ -541,6 +574,7 @@ def _validate_snapshots(
         dataset,
         dataset_siblings,
         label="staged dataset",
+        blobs_root=snapshot_root.parent.parent / "blobs",
         expected_count=contract.dataset_metadata_count,
         expected_metadata_sha256=contract.dataset_metadata_sha256,
     )
