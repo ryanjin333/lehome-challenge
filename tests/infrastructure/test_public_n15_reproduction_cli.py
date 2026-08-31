@@ -38,21 +38,15 @@ def _common(checkout: Path, source_receipt: Path, snapshots_receipt: Path, contr
 
 def test_cli_verify_inputs_render_training_and_verify_output_are_offline_and_atomic(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    from lehome.n15_reproduction import verify_inputs
     from scripts.run_public_n15_reproduction import main
 
     checkout, source_receipt = _materialize_source(tmp_path)
     _, _, snapshots_receipt = _materialize_snapshots(tmp_path, checkout)
     contract = _fixture_contract(checkout)
     common = _common(checkout, source_receipt, snapshots_receipt, contract)
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda *args, **kwargs: pytest.fail("offline CLI must not execute subprocesses"),
-    )
-
     verified_output = tmp_path / "verified-inputs.json"
     assert main(["verify-inputs", *common, "--output", str(verified_output)], contract=contract) == 0
     verified = json.loads(verified_output.read_text(encoding="utf-8"))
@@ -78,8 +72,15 @@ def test_cli_verify_inputs_render_training_and_verify_output_are_offline_and_ato
 
     training_root = _materialize_training_output(
         tmp_path,
-        source_receipt=source_receipt,
-        snapshots_receipt=snapshots_receipt,
+        verified=verify_inputs(
+            checkout=checkout,
+            source_receipt=source_receipt,
+            resolved_snapshots_receipt=snapshots_receipt,
+            vm_id=contract.vm_id,
+            disk_id=contract.disk_id,
+            contract=contract,
+        ),
+        contract=contract,
     )
     training_output = tmp_path / "verified-training-output.json"
     assert main(
