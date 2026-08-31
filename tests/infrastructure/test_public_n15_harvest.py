@@ -89,8 +89,18 @@ def test_shell_wrapper_is_native_fail_closed_and_has_no_provisioning_path() -> N
 
 def test_shell_wrapper_has_four_to_two_admission_and_first_100_boundary() -> None:
     text = WRAPPER.read_text(encoding="utf-8")
-    assert "LEHOME_N15_FOUR_WORKER_ADMISSION_RECEIPT" in text
-    assert "LEHOME_N15_TWO_WORKER_ADMISSION_RECEIPT" in text
+    assert "LEHOME_N15_FOUR_WORKER_ADMISSION_RECEIPT" not in text
+    assert "LEHOME_N15_TWO_WORKER_ADMISSION_RECEIPT" not in text
+    assert "run_admission_count 4" in text
+    assert "run_admission_count 2" in text
+    assert "admission-schedule" in text
+    assert "assess-admission" in text
+    assert "nvidia-smi --query-gpu=memory.used,memory.total" in text
+    assert 'run_admission_eval "$category" "$garment" "$process_seed" 0' in text
+    assert 'run_admission_eval "$category" "$garment" "$process_seed" 1' in text
+    assert "assess-memory" in text
+    assert "smoke-id.txt" in text
+    assert "attempt-id.txt" not in text
     assert "admit-workers" in text
     assert "first-100" in text
     assert "LEHOME_N15_FIRST_100_OUTCOMES" in text
@@ -104,6 +114,8 @@ def test_shell_aggregates_every_pid_and_requires_checked_in_full_collector_befor
     assert "process_pids" in text and "process_ids" in text
     assert 'if wait "$pid"' in text
     assert "collect-outcomes" in text
+    assert "inspect-success-datasets" in text
+    assert "--success-dataset-receipt" in text
     assert "--expected-attempt-count 1000" in text
     assert "final-outcomes.json" in text
     assert text.index("collect-outcomes") < text.index("publish-hf")
@@ -125,13 +137,25 @@ def test_shell_pins_task1_runtime_image_and_sanitizes_semantic_environment() -> 
     assert "PYTHONSAFEPATH=1" in text
     assert "PYTHONDONTWRITEBYTECODE=1" in text
     assert "LEHOME_NATIVE_CLOTH_FIDELITY_EVIDENCE" in text
+    assert "write-observational-site" in text
     for forbidden in (
         "LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT",
         "LEHOME_NATIVE_REFERENCE_SANITIZED_CONFIG_ROOT",
         "LEHOME_NATIVE_REFERENCE_CHECKPOINT_COMPATIBILITY_RECEIPT",
         "LEHOME_CPU_ACTION",
     ):
-        assert forbidden not in text
+        assert f"--env {forbidden}=" in text
+
+
+def test_cli_writes_only_the_reviewed_observational_site(tmp_path: Path) -> None:
+    module = _load_cli()
+    output = tmp_path / "observational-site"
+    assert module.main(["write-observational-site", "--output-dir", str(output)]) == 0
+    site = (output / "sitecustomize.py").read_text(encoding="utf-8")
+    assert "install_cloth_fidelity_monitor_on_env" in site
+    assert "gymnasium.make = monitored_make" in site
+    assert "checkpoint_root" not in site
+    assert module.main(["write-observational-site", "--output-dir", str(output)]) == 2
 
 
 def test_shell_validates_public_readback_and_provider_stop_on_every_exit() -> None:

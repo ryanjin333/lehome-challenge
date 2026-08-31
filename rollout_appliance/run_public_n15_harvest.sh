@@ -17,13 +17,14 @@ readonly CHECKPOINT_ROOT="${LEHOME_N15_CHECKPOINT_ROOT:-}"
 readonly TRAINING_IDENTITY_RECEIPT="${LEHOME_N15_TRAINING_IDENTITY_RECEIPT:-}"
 readonly ROLLOUT_IMAGE_RECEIPT="${LEHOME_N15_ROLLOUT_IMAGE_RECEIPT:-}"
 readonly HARVEST_ROOT="${LEHOME_N15_HARVEST_ROOT:-}"
-readonly FOUR_ADMISSION="${LEHOME_N15_FOUR_WORKER_ADMISSION_RECEIPT:-}"
-readonly TWO_ADMISSION="${LEHOME_N15_TWO_WORKER_ADMISSION_RECEIPT:-}"
 readonly PUBLIC_REPOSITORY="${LEHOME_N15_PUBLIC_HF_REPOSITORY:-}"
 readonly MANIFEST="${LEHOME_N15_HARVEST_MANIFEST:-$HARVEST_ROOT/manifest.json}"
 readonly MANIFEST_RECEIPT="${LEHOME_N15_HARVEST_MANIFEST_RECEIPT:-$HARVEST_ROOT/manifest-receipt.json}"
 readonly RUNTIME_RECEIPT="$HARVEST_ROOT/runtime-receipt.json"
 readonly DOCKER_INSPECT_RECEIPT="$HARVEST_ROOT/docker-inspect.json"
+readonly OBSERVATIONAL_SITE="$HARVEST_ROOT/observational-site"
+readonly FOUR_ADMISSION_ROOT="$HARVEST_ROOT/admission/four"
+readonly TWO_ADMISSION_ROOT="$HARVEST_ROOT/admission/two"
 readonly WORKER_SELECTION="${LEHOME_N15_WORKER_SELECTION_RECEIPT:-$HARVEST_ROOT/worker-selection.json}"
 readonly WORKER_PLAN="${LEHOME_N15_WORKER_PLAN:-$HARVEST_ROOT/worker-plan.json}"
 readonly PROCESS_TABLE="$HARVEST_ROOT/process-table.tsv"
@@ -33,6 +34,8 @@ readonly FINAL_PROCESS_STATUS="$HARVEST_ROOT/final-process-status.json"
 readonly FIRST_100_OUTCOMES="${LEHOME_N15_FIRST_100_OUTCOMES:-$HARVEST_ROOT/first-100-outcomes.json}"
 readonly FIRST_100_GATE="${LEHOME_N15_FIRST_100_GATE_RECEIPT:-$HARVEST_ROOT/first-100-gate.json}"
 readonly FINAL_OUTCOMES="$HARVEST_ROOT/final-outcomes.json"
+readonly FIRST_SUCCESS_DATASETS="$HARVEST_ROOT/first-success-datasets.json"
+readonly FINAL_SUCCESS_DATASETS="$HARVEST_ROOT/final-success-datasets.json"
 readonly PUBLICATION_RECEIPT="${LEHOME_N15_PUBLICATION_RECEIPT:-${HARVEST_ROOT}.publication.json}"
 readonly PROVIDER_STOPPED_RECEIPT="${LEHOME_N15_PROVIDER_STOPPED_RECEIPT:-${HARVEST_ROOT}.provider-stopped.json}"
 readonly TERMINAL_RECEIPT="${LEHOME_N15_TERMINAL_RECEIPT:-${HARVEST_ROOT}.terminal.json}"
@@ -112,10 +115,6 @@ require_file "$SOURCE_ROOT/scripts/eval.py" "public scripts.eval"
 require_dir "$CHECKPOINT_ROOT" "accepted Task 1 checkpoint"
 require_file "$TRAINING_IDENTITY_RECEIPT" "accepted Task 1 training identity receipt"
 require_file "$ROLLOUT_IMAGE_RECEIPT" "rollout image identity receipt"
-require_file "$FOUR_ADMISSION" "four-worker memory and one-episode admission"
-if [[ -n "$TWO_ADMISSION" ]]; then
-  require_file "$TWO_ADMISSION" "two-worker fallback admission"
-fi
 require_dir "$SOURCE_ROOT/Datasets/example/four_types_merged" "pinned public dataset snapshot"
 [[ "$PUBLIC_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] \
   || fail "public Hugging Face dataset repository is invalid"
@@ -141,6 +140,7 @@ for output in "$PUBLICATION_RECEIPT" "$PROVIDER_STOPPED_RECEIPT" "$TERMINAL_RECE
     || fail "terminal evidence output must remain outside the upload bundle"
 done
 mkdir -m 0700 -- "$HARVEST_ROOT"
+python3 "$BUILDER" write-observational-site --output-dir "$OBSERVATIONAL_SITE" >/dev/null
 
 docker image inspect -- "$ROLLOUT_IMAGE_ID" >"$DOCKER_INSPECT_RECEIPT"
 chmod 0444 "$DOCKER_INSPECT_RECEIPT"
@@ -202,9 +202,131 @@ python3 "$BUILDER" build \
   --rollout-image-sha256 "$image_sha" \
   --manifest "$MANIFEST" --receipt "$MANIFEST_RECEIPT" >/dev/null
 
+inspect_success_datasets_in_runtime() {
+  local expected_attempt_count="$1" output="$2"
+  docker run --rm --pull never --network none --init \
+    --mount "type=bind,src=$REPO_ROOT,dst=/runtime,readonly" \
+    --mount "type=bind,src=$HARVEST_ROOT,dst=$HARVEST_ROOT" \
+    --env PYTHONPATH=/runtime/source/lehome:/runtime \
+    --env PYTHONHOME= --env PYTHONSAFEPATH=1 --env PYTHONDONTWRITEBYTECODE=1 \
+    --entrypoint "$RUNTIME_PYTHON" "$ROLLOUT_IMAGE_ID" -P \
+    /runtime/scripts/build_public_n15_harvest.py inspect-success-datasets \
+    --manifest "$MANIFEST" --harvest-root "$HARVEST_ROOT" \
+    --expected-attempt-count "$expected_attempt_count" --output "$output" >/dev/null
+}
+
+run_admission_eval() {
+  local category="$1" garment="$2" process_seed="$3" episode_count="$4"
+  local output_root="$5" container_name="$6" fidelity_path="$7"
+  docker run --rm --pull never --network none --gpus all --init --shm-size=8g \
+    --name "$container_name" \
+    --mount "type=bind,src=$REPO_ROOT,dst=/runtime,readonly" \
+    --mount "type=bind,src=$SOURCE_ROOT,dst=$SOURCE_ROOT,readonly" \
+    --mount "type=bind,src=$CHECKPOINT_ROOT,dst=$CHECKPOINT_ROOT,readonly" \
+    --mount "type=bind,src=$HARVEST_ROOT,dst=$HARVEST_ROOT" \
+    --workdir "$SOURCE_ROOT" \
+    --env "PYTHONPATH=$OBSERVATIONAL_SITE:/runtime/rollout_appliance/native_reference_site:$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab:/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab_tasks" \
+    --env PYTHONHOME= --env PYTHONSAFEPATH=1 --env PYTHONDONTWRITEBYTECODE=1 \
+    --env PYNPUT_BACKEND=dummy --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 \
+    --env LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT= \
+    --env LEHOME_NATIVE_REFERENCE_SANITIZED_CONFIG_ROOT= \
+    --env LEHOME_NATIVE_REFERENCE_CHECKPOINT_COMPATIBILITY_RECEIPT= \
+    --env LEHOME_CPU_ACTION= \
+    --env "LEHOME_NATIVE_REFERENCE_LOG_PROJECT_ROOT=$output_root/native-project" \
+    --env "LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=$SOURCE_ROOT" \
+    --env "LEHOME_NATIVE_CLOTH_FIDELITY_EVIDENCE=$fidelity_path" \
+    --entrypoint "$RUNTIME_PYTHON" "$ROLLOUT_IMAGE_ID" -P -m scripts.eval \
+    --policy_type lerobot --policy_path "$CHECKPOINT_ROOT" \
+    --garment_type "$category" --garment_filter "$garment" \
+    --dataset_root "$SOURCE_ROOT/Datasets/example/four_types_merged" \
+    --num_episodes "$episode_count" --seed "$process_seed" \
+    --enable_cameras --headless --device cpu
+}
+
+admission_schedule() {
+  python3 "$BUILDER" admission-schedule --worker-count "$1" |
+    python3 -c 'import json,sys
+for row in json.load(sys.stdin):
+    print("\t".join(map(str, (row["worker_id"], row["smoke_id"], row["category"], row["garment"], row["process_seed"]))))'
+}
+
+run_admission_count() {
+  local count="$1" root="$2" worker smoke_id category garment process_seed
+  mkdir -m 0700 -p -- "$root/memory" "$root/smokes"
+  mapfile -t admission_rows < <(admission_schedule "$count")
+  local -a pids=()
+  : >"$root/memory-status.tsv"
+  local used total extra
+  IFS=',' read -r used total extra < <(
+    nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits
+  )
+  [[ -z "${extra:-}" ]] || fail "worker admission requires exactly one GPU"
+  used="${used//[[:space:]]/}"; total="${total//[[:space:]]/}"
+  printf 'sample_index\tactive_process_count\tgpu_used_mib\tgpu_total_mib\n0\t0\t%s\t%s\n' \
+    "$used" "$total" >"$root/memory.tsv"
+  for row in "${admission_rows[@]}"; do
+    IFS=$'\t' read -r worker smoke_id category garment process_seed <<<"$row"
+    run_admission_eval "$category" "$garment" "$process_seed" 0 \
+      "$root/memory/worker-$worker" "lehome-n15-memory-$count-$worker" "" \
+      >"$root/memory/worker-$worker.log" 2>&1 &
+    pids+=("$!")
+  done
+  local sample=1 active pid
+  while :; do
+    active=0
+    for pid in "${pids[@]}"; do if kill -0 "$pid" 2>/dev/null; then ((active+=1)); fi; done
+    IFS=',' read -r used total extra < <(
+      nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits
+    )
+    [[ -z "${extra:-}" ]] || fail "worker admission requires exactly one GPU"
+    used="${used//[[:space:]]/}"; total="${total//[[:space:]]/}"
+    printf '%s\t%s\t%s\t%s\n' "$sample" "$active" "$used" "$total" >>"$root/memory.tsv"
+    ((sample+=1))
+    (( active != 0 )) || break
+    sleep 1
+  done
+  for worker in "${!pids[@]}"; do
+    if wait "${pids[$worker]}"; then code=0; else code=$?; fi
+    printf '%s\t%s\n' "$worker" "$code" >>"$root/memory-status.tsv"
+  done
+  python3 "$BUILDER" assess-memory --evidence-root "$root" --worker-count "$count" \
+    --output "$root/memory-receipt.json" >/dev/null
+  local passed
+  passed="$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["memory_check"]["passed"]).lower())' "$root/memory-receipt.json")"
+  if [[ "$passed" == true ]]; then
+    pids=(); : >"$root/smoke-status.tsv"
+    for row in "${admission_rows[@]}"; do
+      IFS=$'\t' read -r worker smoke_id category garment process_seed <<<"$row"
+      mkdir -m 0700 -- "$root/smokes/worker-$worker"
+      printf '%s\n' "$smoke_id" >"$root/smokes/worker-$worker/smoke-id.txt"
+      run_admission_eval "$category" "$garment" "$process_seed" 1 \
+        "$root/smokes/worker-$worker" "lehome-n15-smoke-$count-$worker" \
+        "$root/smokes/worker-$worker/cloth-fidelity.jsonl" \
+        >"$root/smokes/worker-$worker/evaluator.log" 2>&1 &
+      pids+=("$!")
+    done
+    for worker in "${!pids[@]}"; do
+      if wait "${pids[$worker]}"; then code=0; else code=$?; fi
+      printf '%s\t%s\n' "$worker" "$code" >>"$root/smoke-status.tsv"
+    done
+  fi
+}
+
+run_admission_count 4 "$FOUR_ADMISSION_ROOT"
+python3 "$BUILDER" assess-admission --manifest "$MANIFEST" \
+  --runtime-receipt "$RUNTIME_RECEIPT" --evidence-root "$FOUR_ADMISSION_ROOT" \
+  --worker-count 4 --output "$FOUR_ADMISSION_ROOT/admission-receipt.json" >/dev/null
+four_passed="$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["passed"]).lower())' "$FOUR_ADMISSION_ROOT/admission-receipt.json")"
 admission=(python3 "$BUILDER" admit-workers --manifest "$MANIFEST" \
-  --four-worker-receipt "$FOUR_ADMISSION" --output "$WORKER_SELECTION")
-if [[ -n "$TWO_ADMISSION" ]]; then admission+=(--two-worker-receipt "$TWO_ADMISSION"); fi
+  --runtime-receipt "$RUNTIME_RECEIPT" \
+  --four-worker-evidence-root "$FOUR_ADMISSION_ROOT" --output "$WORKER_SELECTION")
+if [[ "$four_passed" != true ]]; then
+  run_admission_count 2 "$TWO_ADMISSION_ROOT"
+  python3 "$BUILDER" assess-admission --manifest "$MANIFEST" \
+    --runtime-receipt "$RUNTIME_RECEIPT" --evidence-root "$TWO_ADMISSION_ROOT" \
+    --worker-count 2 --output "$TWO_ADMISSION_ROOT/admission-receipt.json" >/dev/null
+  admission+=(--two-worker-evidence-root "$TWO_ADMISSION_ROOT")
+fi
 "${admission[@]}" >/dev/null
 python3 "$BUILDER" render-worker-plan --manifest "$MANIFEST" \
   --admission "$WORKER_SELECTION" --source-root "$SOURCE_ROOT" \
@@ -254,9 +376,13 @@ run_native_process() {
     --mount "type=bind,src=$CHECKPOINT_ROOT,dst=$CHECKPOINT_ROOT,readonly" \
     --mount "type=bind,src=$HARVEST_ROOT,dst=$HARVEST_ROOT" \
     --workdir "$SOURCE_ROOT" \
-    --env "PYTHONPATH=/runtime/rollout_appliance/native_reference_site:$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab:/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab_tasks" \
+    --env "PYTHONPATH=$OBSERVATIONAL_SITE:/runtime/rollout_appliance/native_reference_site:$SOURCE_ROOT/source/lehome:$SOURCE_ROOT:/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab:/opt/lehome-challenge/third_party/IsaacLab/source/isaaclab_tasks" \
     --env PYTHONHOME= --env PYTHONSAFEPATH=1 --env PYTHONDONTWRITEBYTECODE=1 \
     --env PYNPUT_BACKEND=dummy --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 \
+    --env LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT= \
+    --env LEHOME_NATIVE_REFERENCE_SANITIZED_CONFIG_ROOT= \
+    --env LEHOME_NATIVE_REFERENCE_CHECKPOINT_COMPATIBILITY_RECEIPT= \
+    --env LEHOME_CPU_ACTION= \
     --env "LEHOME_NATIVE_REFERENCE_LOG_PROJECT_ROOT=$process_root/native-project" \
     --env "LEHOME_NATIVE_REFERENCE_SOURCE_ROOT=$SOURCE_ROOT" \
     --env "LEHOME_NATIVE_CLOTH_FIDELITY_EVIDENCE=$process_root/cloth-fidelity.jsonl" \
@@ -306,9 +432,11 @@ run_wave() {
 run_wave 0 4
 python3 "$BUILDER" build-process-status --tsv "$PROCESS_STATUS_TSV" \
   --expected-process-count 4 --output "$FIRST_PROCESS_STATUS" >/dev/null
+inspect_success_datasets_in_runtime 100 "$FIRST_SUCCESS_DATASETS"
 python3 "$BUILDER" collect-outcomes --manifest "$MANIFEST" \
   --process-status "$FIRST_PROCESS_STATUS" --harvest-root "$HARVEST_ROOT" \
-  --expected-attempt-count 100 --output "$FIRST_100_OUTCOMES" >/dev/null
+  --expected-attempt-count 100 --success-dataset-receipt "$FIRST_SUCCESS_DATASETS" \
+  --output "$FIRST_100_OUTCOMES" >/dev/null
 python3 "$BUILDER" first-100 --manifest "$MANIFEST" \
   --outcomes "$FIRST_100_OUTCOMES" --output "$FIRST_100_GATE" >/dev/null
 
@@ -316,9 +444,11 @@ run_wave 4 40
 chmod 0444 "$PROCESS_STATUS_TSV"
 python3 "$BUILDER" build-process-status --tsv "$PROCESS_STATUS_TSV" \
   --expected-process-count 40 --output "$FINAL_PROCESS_STATUS" >/dev/null
+inspect_success_datasets_in_runtime 1000 "$FINAL_SUCCESS_DATASETS"
 python3 "$BUILDER" collect-outcomes --manifest "$MANIFEST" \
   --process-status "$FINAL_PROCESS_STATUS" --harvest-root "$HARVEST_ROOT" \
-  --expected-attempt-count 1000 --output "$FINAL_OUTCOMES" >/dev/null
+  --expected-attempt-count 1000 --success-dataset-receipt "$FINAL_SUCCESS_DATASETS" \
+  --output "$FINAL_OUTCOMES" >/dev/null
 
 # publish-hf performs authenticated upload plus authenticated and anonymous
 # byte-for-byte readback at the returned immutable revision.

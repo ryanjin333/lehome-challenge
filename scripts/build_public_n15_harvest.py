@@ -21,12 +21,16 @@ if str(SOURCE_ROOT) not in sys.path:
 from lehome.n15_harvest import (  # noqa: E402
     HarvestError,
     HarvestProvenance,
+    admission_smoke_schedule,
+    assess_worker_memory,
+    assess_worker_admission,
     admit_workers,
     build_manifest,
     canonical_bytes,
     collect_native_outcomes,
     evaluate_first_100,
     measure_runtime_contract,
+    inspect_success_datasets,
     native_worker_plan,
     publish_harvest_bundle,
     provider_stop_receipt_from_response,
@@ -35,6 +39,7 @@ from lehome.n15_harvest import (  # noqa: E402
     validate_collected_outcomes,
     validate_provider_stop_receipt,
     verify_manifest_receipt,
+    write_observational_site,
     write_manifest_bundle,
 )
 
@@ -81,7 +86,17 @@ def _parser() -> argparse.ArgumentParser:
     _path(collect, "--process-status")
     _path(collect, "--harvest-root")
     collect.add_argument("--expected-attempt-count", type=int, required=True)
+    _path(collect, "--success-dataset-receipt")
     _path(collect, "--output")
+
+    inspect_datasets = commands.add_parser("inspect-success-datasets")
+    _path(inspect_datasets, "--manifest")
+    _path(inspect_datasets, "--harvest-root")
+    inspect_datasets.add_argument("--expected-attempt-count", type=int, required=True)
+    _path(inspect_datasets, "--output")
+
+    observational_site = commands.add_parser("write-observational-site")
+    _path(observational_site, "--output-dir")
 
     status = commands.add_parser("build-process-status")
     _path(status, "--tsv")
@@ -90,9 +105,25 @@ def _parser() -> argparse.ArgumentParser:
 
     admission = commands.add_parser("admit-workers")
     _path(admission, "--manifest")
-    _path(admission, "--four-worker-receipt")
-    _path(admission, "--two-worker-receipt", required=False)
+    _path(admission, "--runtime-receipt")
+    _path(admission, "--four-worker-evidence-root")
+    _path(admission, "--two-worker-evidence-root", required=False)
     _path(admission, "--output")
+
+    memory = commands.add_parser("assess-memory")
+    _path(memory, "--evidence-root")
+    memory.add_argument("--worker-count", type=int, choices=(2, 4), required=True)
+    _path(memory, "--output")
+
+    schedule = commands.add_parser("admission-schedule")
+    schedule.add_argument("--worker-count", type=int, choices=(2, 4), required=True)
+
+    assess_admission = commands.add_parser("assess-admission")
+    _path(assess_admission, "--manifest")
+    _path(assess_admission, "--runtime-receipt")
+    _path(assess_admission, "--evidence-root")
+    assess_admission.add_argument("--worker-count", type=int, choices=(2, 4), required=True)
+    _path(assess_admission, "--output")
 
     plan = commands.add_parser("render-worker-plan")
     _path(plan, "--manifest")
@@ -234,8 +265,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 process_status=_load_json(args.process_status, label="process status receipt"),
                 harvest_root=args.harvest_root,
                 expected_attempt_count=args.expected_attempt_count,
+                success_dataset_receipt=_load_json(
+                    args.success_dataset_receipt, label="success dataset receipt"
+                ),
             )
             _write_output(args.output, result, label="collected outcome receipt")
+        elif args.command == "inspect-success-datasets":
+            result = inspect_success_datasets(
+                manifest=_load_json(args.manifest, label="manifest"),
+                harvest_root=args.harvest_root,
+                expected_attempt_count=args.expected_attempt_count,
+            )
+            _write_output(args.output, result, label="success dataset receipt")
+        elif args.command == "write-observational-site":
+            result = write_observational_site(args.output_dir)
         elif args.command == "build-process-status":
             if args.expected_process_count not in {4, 40}:
                 raise HarvestError("expected process count must be 4 or 40")
@@ -266,20 +309,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             _write_output(args.output, result, label="process status receipt")
         elif args.command == "admit-workers":
-            manifest = validate_manifest(_load_json(args.manifest, label="manifest"))
-            two = (
-                None
-                if args.two_worker_receipt is None
-                else _load_json(args.two_worker_receipt, label="two-worker admission receipt")
-            )
             result = admit_workers(
-                four_worker_receipt=_load_json(
-                    args.four_worker_receipt, label="four-worker admission receipt"
-                ),
-                two_worker_receipt=two,
-                checkpoint_tree_sha256=manifest["provenance"]["checkpoint_tree_sha256"],
+                manifest=_load_json(args.manifest, label="manifest"),
+                runtime_receipt=args.runtime_receipt,
+                four_worker_evidence_root=args.four_worker_evidence_root,
+                two_worker_evidence_root=args.two_worker_evidence_root,
             )
             _write_output(args.output, result, label="worker selection receipt")
+        elif args.command == "assess-memory":
+            result = assess_worker_memory(
+                evidence_root=args.evidence_root, worker_count=args.worker_count,
+            )
+            _write_output(args.output, result, label="worker memory measurement receipt")
+        elif args.command == "admission-schedule":
+            result = admission_smoke_schedule(args.worker_count)
+        elif args.command == "assess-admission":
+            result = assess_worker_admission(
+                manifest=_load_json(args.manifest, label="manifest"),
+                runtime_receipt=args.runtime_receipt,
+                evidence_root=args.evidence_root,
+                worker_count=args.worker_count,
+            )
+            _write_output(args.output, result, label="worker admission receipt")
         elif args.command == "render-worker-plan":
             result = native_worker_plan(
                 manifest=_load_json(args.manifest, label="manifest"),
