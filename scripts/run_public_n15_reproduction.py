@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import re
 import sys
-from typing import Sequence
+from typing import Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,10 +53,12 @@ def _parser() -> argparse.ArgumentParser:
         "lifecycle-plan",
         help="write an immutable, pre-paid N1.5 lifecycle plan",
     )
-    lifecycle.add_argument("--run-id", required=True)
-    lifecycle.add_argument("--budget-usd", type=float, required=True)
-    lifecycle.add_argument("--estimated-cost-usd", type=float, required=True)
-    lifecycle.add_argument("--output", type=Path, required=True)
+    for item in (lifecycle, commands.add_parser("verify-lifecycle-plan", help="verify a prior immutable lifecycle plan")):
+        item.add_argument("--run-id", required=True)
+        item.add_argument("--repository", required=True)
+        item.add_argument("--budget-usd", type=float, required=True)
+        item.add_argument("--estimated-cost-usd", type=float, required=True)
+        item.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -99,12 +101,21 @@ def _lifecycle_plan(args: argparse.Namespace, contract: ReproductionContract) ->
         raise ReproductionError("budget must be positive and cannot exceed the $100 hard cap")
     if not (args.estimated_cost_usd >= 0.0 and args.estimated_cost_usd <= args.budget_usd):
         raise ReproductionError("estimated lifecycle cost exceeds the approved budget")
+    if re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", args.repository) is None:
+        raise ReproductionError("public lifecycle repository is invalid")
     return {
         "schema_version": 1,
         "kind": "lehome_public_n15_lifecycle_plan_v1",
         "run_id": args.run_id,
         "vm_id": contract.vm_id,
         "protected_disk_id": contract.disk_id,
+        "provider_source_image_id": "computeimage-u00zf6w3yf72gakhcy",
+        "repository": args.repository,
+        "prefixes": {
+            "training": f"n15-public/{args.run_id}/training",
+            "focused": f"n15-public/{args.run_id}/focused",
+            "harvest": f"n15-public/{args.run_id}/harvest",
+        },
         "budget_usd": args.budget_usd,
         "estimated_cost_usd": args.estimated_cost_usd,
         "stages": [
@@ -123,6 +134,22 @@ def _lifecycle_plan(args: argparse.Namespace, contract: ReproductionContract) ->
     }
 
 
+def _verify_lifecycle_plan(args: argparse.Namespace, contract: ReproductionContract) -> dict[str, object]:
+    expected = _lifecycle_plan(args, contract)
+    try:
+        payload = args.output.read_bytes()
+        actual = json.loads(payload)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ReproductionError("lifecycle plan is unreadable") from error
+    canonical = (
+        json.dumps(actual, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        + "\n"
+    ).encode("ascii") if isinstance(actual, dict) else b""
+    if not isinstance(actual, dict) or payload != canonical or actual != expected:
+        raise ReproductionError("lifecycle plan is not the exact immutable approved plan")
+    return actual
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -139,6 +166,8 @@ def main(
                 label="public N1.5 lifecycle plan",
             )
             result = {**value, **stored}
+        elif args.command == "verify-lifecycle-plan":
+            result = _verify_lifecycle_plan(args, contract)
         else:
             verified = _verified(args, contract)
             if args.command == "verify-inputs":
