@@ -162,6 +162,7 @@ class _EvidenceWriter:
         descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(descriptor)
         self.previous = ZERO_SHA256
+        self.pending: list[bytes] = []
 
     def append(
         self,
@@ -184,12 +185,27 @@ class _EvidenceWriter:
         }
         event_sha = hashlib.sha256(_canonical(event)).hexdigest()
         event["event_sha256"] = event_sha
+        self.pending.append(_canonical(event))
+        self.previous = event_sha
+
+    def flush(self, *, reason: str) -> None:
+        if not self.pending:
+            return
+        count = len(self.pending)
         with self.path.open("ab") as stream:
-            stream.write(_canonical(event))
+            stream.write(b"".join(self.pending))
             stream.flush()
             os.fsync(stream.fileno())
-        self.previous = event_sha
-        print("LEHOME_CLOTH_FIDELITY_EVENT " + json.dumps(event, sort_keys=True, separators=(",", ":")), flush=True)
+        self.pending.clear()
+        print(
+            "LEHOME_CLOTH_FIDELITY_FLUSH "
+            + json.dumps(
+                {"reason": reason, "event_count": count, "last_event_sha256": self.previous},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
 
 
 def install_cloth_fidelity_monitor_on_env(env: object, evidence_path: Path) -> None:
@@ -218,6 +234,7 @@ def install_cloth_fidelity_monitor_on_env(env: object, evidence_path: Path) -> N
                 step_index=int(state["step_index"]),
                 health=error.health,
             )
+            writer.flush(reason=f"{stage}_invalid")
             raise
         writer.append(
             garment=str(state["garment"]),
@@ -235,6 +252,7 @@ def install_cloth_fidelity_monitor_on_env(env: object, evidence_path: Path) -> N
 
     def get_success(self: object):
         observe(self, "pre_score")
+        writer.flush(reason="episode_pre_score")
         return original_success()
 
     env.reset = MethodType(reset, env)

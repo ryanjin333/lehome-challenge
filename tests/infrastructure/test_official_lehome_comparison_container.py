@@ -173,8 +173,22 @@ def test_n15_focused_wrapper_builds_candidate_config_view_from_training_receipt(
     assert "--training-identity-receipt \"$CANDIDATE_IDENTITY_RECEIPT\"" in text
     assert "--sanitized-config-root \"$CANDIDATE_SANITIZED_CONFIG\"" in text
     assert "--compatibility-receipt \"$CANDIDATE_COMPATIBILITY_RECEIPT\"" in text
-    assert 'require_directory "$CANDIDATE_SANITIZED_CONFIG"' not in text
-    assert 'require_file "$CANDIDATE_COMPATIBILITY_RECEIPT"' not in text
+    assert text.index('require_directory "$CANDIDATE_SANITIZED_CONFIG"') > prepare
+    assert text.index('require_file "$CANDIDATE_COMPATIBILITY_RECEIPT"') > prepare
+
+
+def test_n15_focused_wrapper_remounts_prepared_candidate_view_read_only_for_eval() -> None:
+    text = N15_FOCUSED_WRAPPER.read_text(encoding="utf-8")
+    assert 'readonly PREP_CONTAINER="lehome-n15-focused-prepare-$$"' in text
+    assert 'readonly EVAL_CONTAINER="lehome-n15-focused-eval-$$"' in text
+    prepare = text.index("prepare-n15-candidate-compatibility")
+    evaluate = text.index("run-n15-focused", prepare)
+    assert prepare < evaluate
+    assert 'src=$CANDIDATE_SANITIZED_CONFIG,dst=$CANDIDATE_SANITIZED_CONFIG,readonly' in text
+    assert 'src=$CANDIDATE_COMPATIBILITY_RECEIPT,dst=$CANDIDATE_COMPATIBILITY_RECEIPT,readonly' in text
+    assert "CANDIDATE_SANITIZED_CONFIG_SHA256_BEFORE" in text
+    assert "CANDIDATE_COMPATIBILITY_RECEIPT_SHA256_BEFORE" in text
+    assert "candidate compatibility view changed during evaluation" in text
 
 
 def test_n15_focused_wrapper_publishes_then_verifies_readback_before_pass() -> None:

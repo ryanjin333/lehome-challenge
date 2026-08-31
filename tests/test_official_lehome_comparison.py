@@ -26,6 +26,7 @@ from scripts.run_official_lehome_comparison import (
     validate_n17_checkpoint,
     validate_competitor_checkpoint,
     validate_candidate_n15_checkpoint,
+    checkpoint_compatibility_identity,
     validate_runtime_evidence,
     validate_smoke_prerequisite,
     metadata_identities,
@@ -136,6 +137,17 @@ def test_execution_env_does_not_inherit_runtime_pythonpath(
     assert paths[:2] == [str(source_root / "source/lehome"), str(source_root)]
     assert "/runtime" not in paths
     assert "/runtime/source/lehome" not in paths
+
+
+def test_candidate_compatibility_identity_detects_post_run_mutation(tmp_path: Path) -> None:
+    view = tmp_path / "view"
+    view.mkdir()
+    (view / "config.json").write_text('{"type":"groot"}\n')
+    receipt = tmp_path / "compatibility.json"
+    receipt.write_text('{"kind":"compatibility"}\n')
+    before = checkpoint_compatibility_identity(view, receipt)
+    (view / "config.json").write_text('{"type":"changed"}\n')
+    assert checkpoint_compatibility_identity(view, receipt) != before
 
 
 def test_focused_execution_env_activates_new_per_command_cloth_evidence(tmp_path: Path) -> None:

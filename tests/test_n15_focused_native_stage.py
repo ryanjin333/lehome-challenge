@@ -119,6 +119,37 @@ def test_monitor_records_hash_chained_post_step_and_pre_score_evidence(tmp_path:
     assert all(len(row["event_sha256"]) == 64 for row in rows)
 
 
+def test_monitor_batches_observations_to_one_terminal_flush_per_episode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rollout_appliance.native_reference_site.cloth_fidelity as fidelity
+
+    env = _env()
+    env.reset = lambda: None
+    env.step = lambda action: action
+    env._get_success = lambda: False
+    fsync_calls: list[int] = []
+    print_calls: list[str] = []
+    monkeypatch.setattr(fidelity.os, "fsync", lambda descriptor: fsync_calls.append(descriptor))
+    monkeypatch.setattr("builtins.print", lambda value, **kwargs: print_calls.append(str(value)))
+    path = tmp_path / "cloth-fidelity.jsonl"
+    install_cloth_fidelity_monitor_on_env(env, path)
+    for _episode in range(2):
+        env.reset()
+        for step in range(25):
+            env.step(step)
+        env._get_success()
+
+    summary = validate_cloth_fidelity_evidence(
+        path,
+        expected_episodes=[("Top_Short_Seen_0", 1), ("Top_Short_Seen_0", 2)],
+    )
+    assert summary["event_count"] == 52
+    assert len(fsync_calls) == 2
+    assert len(print_calls) == 2
+    assert all(value.startswith("LEHOME_CLOTH_FIDELITY_FLUSH ") for value in print_calls)
+
+
 def test_evidence_validator_rejects_tampered_chain(tmp_path: Path) -> None:
     path = tmp_path / "cloth-fidelity.jsonl"
     env = _env()

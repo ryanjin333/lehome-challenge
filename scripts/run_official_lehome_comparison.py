@@ -517,6 +517,19 @@ def focused_runtime_adapter_identities(runtime_root: Path) -> dict[str, str]:
     return identities
 
 
+def checkpoint_compatibility_identity(
+    sanitized_config_root: Path, compatibility_receipt: Path
+) -> dict[str, str]:
+    root = Path(sanitized_config_root)
+    receipt = Path(compatibility_receipt)
+    if root.is_symlink() or not root.is_dir() or receipt.is_symlink() or not receipt.is_file():
+        raise ComparisonError("candidate compatibility view is unavailable or unsafe")
+    return {
+        "sanitized_config_tree_sha256": _tree_sha256(root.resolve(strict=True)),
+        "compatibility_receipt_sha256": _sha256_file(receipt),
+    }
+
+
 def metadata_identities(metadata_root: Path) -> dict[str, object]:
     root = Path(metadata_root).resolve(strict=True)
     category_digests: dict[str, str] = {}
@@ -1512,6 +1525,14 @@ def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
         != candidate_before["identity_receipt_sha256"]
     ):
         raise ComparisonError("candidate compatibility and training identity cross-receipt mismatch")
+    candidate_compatibility_before = checkpoint_compatibility_identity(
+        args.candidate_sanitized_config_root,
+        args.candidate_compatibility_receipt,
+    )
+    reference_compatibility_before = checkpoint_compatibility_identity(
+        args.reference_sanitized_config_root,
+        args.reference_compatibility_receipt,
+    )
     reference_before = validate_competitor_checkpoint(args.reference_checkpoint)
     metadata_before = metadata_identities(args.metadata_root)
     native_runtime_before = validate_competitor_runtime_evidence(args.native_runtime_evidence_root)
@@ -1606,6 +1627,21 @@ def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
                     raise ComparisonError(
                         f"infrastructure_invalid: {command_id} exited {result.returncode}"
                     )
+            if policy.policy_id == "candidate-n15" and (
+                checkpoint_compatibility_identity(
+                    args.candidate_sanitized_config_root,
+                    args.candidate_compatibility_receipt,
+                )
+                != candidate_compatibility_before
+                or validate_candidate_n15_checkpoint(
+                    args.candidate_checkpoint,
+                    args.candidate_identity_receipt,
+                )
+                != candidate_before
+            ):
+                raise ComparisonError(
+                    "infrastructure_invalid: candidate identity changed during candidate categories"
+                )
         parity = _command_parity(commands)
         results = [
             compile_policy_result(
@@ -1630,6 +1666,16 @@ def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
             or assets_after != assets_before
             or runtime_after != runtime_before
             or focused_runtime_adapter_identities(runtime_root) != adapters_before
+            or checkpoint_compatibility_identity(
+                args.candidate_sanitized_config_root,
+                args.candidate_compatibility_receipt,
+            )
+            != candidate_compatibility_before
+            or checkpoint_compatibility_identity(
+                args.reference_sanitized_config_root,
+                args.reference_compatibility_receipt,
+            )
+            != reference_compatibility_before
             or validate_candidate_n15_checkpoint(
                 args.candidate_checkpoint, args.candidate_identity_receipt
             )

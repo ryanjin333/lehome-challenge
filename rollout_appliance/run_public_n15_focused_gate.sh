@@ -27,6 +27,7 @@ readonly REFERENCE_MATRIX="$REPO_ROOT/configs/eval_groot_n17_public96_reference.
 readonly REFERENCE_MATRIX_SHA256="$REPO_ROOT/configs/eval_groot_n17_public96_reference.json.sha256"
 # The organizer evaluator command is pinned to --device cpu and --seed 42.
 readonly OFFICIAL_SIMULATOR_ARGUMENTS="--device cpu --seed 42"
+readonly PREP_CONTAINER="lehome-n15-focused-prepare-$$"
 readonly EVAL_CONTAINER="lehome-n15-focused-eval-$$"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
@@ -37,6 +38,7 @@ require_file() {
   [[ "$1" == /* && "$1" != *".."* && -f "$1" && ! -L "$1" ]] || fail "$2 is unavailable or unsafe"
 }
 cleanup() {
+  docker rm -f "$PREP_CONTAINER" >/dev/null 2>&1 || true
   docker rm -f "$EVAL_CONTAINER" >/dev/null 2>&1 || true
   if [[ -n "${EVIDENCE_ROOT:-}" && -d "$EVIDENCE_ROOT" ]]; then
     find "$EVIDENCE_ROOT" -type f -delete 2>/dev/null || true
@@ -149,6 +151,38 @@ docker run --rm --pull never --gpus all --entrypoint /opt/lehome-challenge/.venv
   >"$EVIDENCE_ROOT/cuda-runtime.json"
 chmod 0444 "$EVIDENCE_ROOT/cuda-runtime.json"
 
+PREP_SCRIPT='set -euo pipefail
+uv pip install --offline --no-deps --python /opt/lehome-challenge/.venv/bin/python \
+  "$NATIVE_DEPENDENCIES_ROOT/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl" \
+  "$NATIVE_DEPENDENCIES_ROOT/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
+  "$NATIVE_DEPENDENCIES_ROOT/qwen_vl_utils-0.0.14-py3-none-any.whl" \
+  "$NATIVE_DEPENDENCIES_ROOT/torchdiffeq-0.2.5-py3-none-any.whl" >/dev/null
+/opt/lehome-challenge/.venv/bin/python /runtime/scripts/run_official_lehome_comparison.py \
+  prepare-n15-candidate-compatibility \
+  --candidate-checkpoint "$CANDIDATE_CHECKPOINT" \
+  --training-identity-receipt "$CANDIDATE_IDENTITY_RECEIPT" \
+  --sanitized-config-root "$CANDIDATE_SANITIZED_CONFIG" \
+  --compatibility-receipt "$CANDIDATE_COMPATIBILITY_RECEIPT"'
+
+docker run --rm --pull never --init --network none --name "$PREP_CONTAINER" \
+  --mount "type=bind,src=$REPO_ROOT,dst=/runtime,readonly" \
+  --mount "type=bind,src=$CANDIDATE_TRAINING_ROOT,dst=$CANDIDATE_TRAINING_ROOT,readonly" \
+  --mount "type=bind,src=$CANDIDATE_CHECKPOINT,dst=$CANDIDATE_CHECKPOINT,readonly" \
+  --mount "type=bind,src=$CANDIDATE_IDENTITY_RECEIPT,dst=$CANDIDATE_IDENTITY_RECEIPT,readonly" \
+  --mount "type=bind,src=$NATIVE_DEPENDENCIES_ROOT,dst=$NATIVE_DEPENDENCIES_ROOT,readonly" \
+  --mount "type=bind,src=$(dirname -- "$OUTPUT_ROOT"),dst=$(dirname -- "$OUTPUT_ROOT")" \
+  --env PYTHONPATH=/runtime/source/lehome:/runtime \
+  --env "NATIVE_DEPENDENCIES_ROOT=$NATIVE_DEPENDENCIES_ROOT" \
+  --env "CANDIDATE_CHECKPOINT=$CANDIDATE_CHECKPOINT" \
+  --env "CANDIDATE_IDENTITY_RECEIPT=$CANDIDATE_IDENTITY_RECEIPT" \
+  --env "CANDIDATE_SANITIZED_CONFIG=$CANDIDATE_SANITIZED_CONFIG" \
+  --env "CANDIDATE_COMPATIBILITY_RECEIPT=$CANDIDATE_COMPATIBILITY_RECEIPT" \
+  --entrypoint bash "$ROLLOUT_IMAGE_ID" -lc "$PREP_SCRIPT"
+require_directory "$CANDIDATE_SANITIZED_CONFIG" "prepared candidate compatibility view"
+require_file "$CANDIDATE_COMPATIBILITY_RECEIPT" "prepared candidate compatibility receipt"
+readonly CANDIDATE_SANITIZED_CONFIG_SHA256_BEFORE="$(sha256sum -- "$CANDIDATE_SANITIZED_CONFIG/config.json" | awk '{print $1}')"
+readonly CANDIDATE_COMPATIBILITY_RECEIPT_SHA256_BEFORE="$(sha256sum -- "$CANDIDATE_COMPATIBILITY_RECEIPT" | awk '{print $1}')"
+
 mounts=(
   --mount "type=bind,src=$REPO_ROOT,dst=/runtime,readonly"
   --mount "type=bind,src=$SOURCE_ROOT,dst=/official/lehome,readonly"
@@ -166,6 +200,8 @@ mounts=(
   --mount "type=bind,src=$HF_CACHE_ROOT,dst=/official/n15-hf-cache,readonly"
   --mount "type=bind,src=$EVIDENCE_ROOT,dst=/official/evidence,readonly"
   --mount "type=bind,src=$(dirname -- "$OUTPUT_ROOT"),dst=$(dirname -- "$OUTPUT_ROOT")"
+  --mount "type=bind,src=$CANDIDATE_SANITIZED_CONFIG,dst=$CANDIDATE_SANITIZED_CONFIG,readonly"
+  --mount "type=bind,src=$CANDIDATE_COMPATIBILITY_RECEIPT,dst=$CANDIDATE_COMPATIBILITY_RECEIPT,readonly"
 )
 
 CONTAINER_SCRIPT='set -euo pipefail
@@ -174,12 +210,6 @@ uv pip install --offline --no-deps --python /opt/lehome-challenge/.venv/bin/pyth
   "$NATIVE_DEPENDENCIES_ROOT/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
   "$NATIVE_DEPENDENCIES_ROOT/qwen_vl_utils-0.0.14-py3-none-any.whl" \
   "$NATIVE_DEPENDENCIES_ROOT/torchdiffeq-0.2.5-py3-none-any.whl" >/dev/null
-/opt/lehome-challenge/.venv/bin/python /runtime/scripts/run_official_lehome_comparison.py \
-  prepare-n15-candidate-compatibility \
-  --candidate-checkpoint "$CANDIDATE_CHECKPOINT" \
-  --training-identity-receipt "$CANDIDATE_IDENTITY_RECEIPT" \
-  --sanitized-config-root "$CANDIDATE_SANITIZED_CONFIG" \
-  --compatibility-receipt "$CANDIDATE_COMPATIBILITY_RECEIPT"
 /isaac-sim/python.sh -m scripts.run_official_lehome_comparison run-n15-focused \
   --profile n15-focused \
   --source-root /official/lehome \
@@ -229,6 +259,12 @@ docker run --rm --pull never --gpus all --init --network host --shm-size=8g \
   --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 \
   --env PYNPUT_BACKEND=dummy \
   --entrypoint bash "$ROLLOUT_IMAGE_ID" -lc "$CONTAINER_SCRIPT"
+
+[[ "$(sha256sum -- "$CANDIDATE_SANITIZED_CONFIG/config.json" | awk '{print $1}')" \
+   == "$CANDIDATE_SANITIZED_CONFIG_SHA256_BEFORE" \
+   && "$(sha256sum -- "$CANDIDATE_COMPATIBILITY_RECEIPT" | awk '{print $1}')" \
+   == "$CANDIDATE_COMPATIBILITY_RECEIPT_SHA256_BEFORE" ]] \
+  || fail "candidate compatibility view changed during evaluation"
 
 # Publication is explicit. Its anonymous byte readback must finish before the
 # separate promotion verifier is allowed to return pass.
