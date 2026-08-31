@@ -131,8 +131,14 @@ for cached_file_and_digest in \
 done
 require_directory "$SANITIZED_CONFIG_ROOT" "competitor sanitized config view"
 require_file "$COMPATIBILITY_RECEIPT" "competitor compatibility receipt"
+SMOKE_BUNDLE_ROOT=""
 if [[ "$MODE" == full ]]; then
   require_file "$SMOKE_RECEIPT" "full comparison requires a valid smoke receipt"
+  SMOKE_BUNDLE_ROOT="$(dirname -- "$SMOKE_RECEIPT")"
+  require_directory "$SMOKE_BUNDLE_ROOT" "sealed smoke bundle"
+  require_file "$SMOKE_BUNDLE_ROOT/comparison-receipt.sha256.json" "sealed smoke receipt companion"
+  require_file "$SMOKE_BUNDLE_ROOT/execution-manifest.json" "sealed smoke execution manifest"
+  require_file "$SMOKE_BUNDLE_ROOT/status.json" "sealed smoke status"
 else
   [[ -z "$SMOKE_RECEIPT" ]] || fail "smoke mode does not accept a smoke receipt"
 fi
@@ -262,7 +268,7 @@ declare -a mounts=(
   --mount "type=bind,src=$(dirname -- "$OUTPUT_ROOT"),dst=/official/output"
 )
 if [[ "$MODE" == full ]]; then
-  mounts+=(--mount "type=bind,src=$SMOKE_RECEIPT,dst=$SMOKE_RECEIPT,readonly")
+  mounts+=(--mount "type=bind,src=$SMOKE_BUNDLE_ROOT,dst=$SMOKE_BUNDLE_ROOT,readonly")
 fi
 
 if [[ "$MODE" == smoke ]]; then

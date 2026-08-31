@@ -115,6 +115,16 @@ def test_full_requires_smoke_receipt_and_smoke_rejects_one() -> None:
     assert "smoke mode does not accept a smoke receipt" in text
 
 
+def test_full_mounts_the_complete_sealed_smoke_bundle_read_only() -> None:
+    text = WRAPPER.read_text(encoding="utf-8")
+    assert 'SMOKE_BUNDLE_ROOT="$(dirname -- "$SMOKE_RECEIPT")"' in text
+    assert 'require_file "$SMOKE_BUNDLE_ROOT/comparison-receipt.sha256.json"' in text
+    assert 'require_file "$SMOKE_BUNDLE_ROOT/execution-manifest.json"' in text
+    assert 'require_file "$SMOKE_BUNDLE_ROOT/status.json"' in text
+    assert 'src=$SMOKE_BUNDLE_ROOT,dst=$SMOKE_BUNDLE_ROOT,readonly' in text
+    assert 'src=$SMOKE_RECEIPT,dst=$SMOKE_RECEIPT,readonly' not in text
+
+
 def test_container_wrapper_cleans_up_policy_bridge_and_exact_vm_is_operator_owned() -> None:
     text = WRAPPER.read_text(encoding="utf-8")
     assert "trap cleanup EXIT INT TERM" in text
