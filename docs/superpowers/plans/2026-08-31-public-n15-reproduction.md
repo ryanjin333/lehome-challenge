@@ -82,8 +82,10 @@
 - Test: `tests/infrastructure/test_public_n15_harvest.py`
 
 - [ ] Write failing tests for exactly 40 seen garments, 10 per category, 25
-  attempts per garment, 250 per category, 1,000 total, globally unique seeds
-  and IDs, and deterministic byte-identical output.
+  attempts per garment, 250 per category, and 1,000 total. Freeze one process
+  seed per garment and require globally unique `(process_seed, episode_index)`
+  IDs plus deterministic byte-identical output; do not add an unsupported
+  per-episode seed injector.
 - [ ] Write failing tests proving held-out Release evaluator garments/seeds,
   historical success episodes, hard states, perturbations, and curriculum
   weights cannot enter the manifest.
@@ -91,8 +93,10 @@
   source/checkpoint/category provenance.
 - [ ] Wrap the public source's native `scripts.eval --save_datasets` path;
   explicitly override its default unseen/two-category harvest filters.
-- [ ] Add first-100 stopping rules: fewer than five official successes, any
-  cloth fidelity failure, or more than 2% infrastructure-invalid attempts.
+- [ ] Make the first 100 the four deterministic `Seen_0` processes (one per
+  category, 25 episodes each), then apply the stopping rules: fewer than five
+  official successes, any cloth fidelity failure, or more than 2%
+  infrastructure-invalid attempts.
 - [ ] Add four-worker memory/smoke admission with deterministic fallback to two
   workers; never alter policy/evaluator semantics and never create a VM.
 - [ ] Require immutable Hugging Face upload/readback receipts and provider VM

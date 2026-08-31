@@ -99,14 +99,20 @@ using the reproduced N1.5 checkpoint and the public submission's native
 - 40 seen garments: 10 per category.
 - 25 fresh attempts per garment.
 - 250 attempts per category; 1,000 total.
-- All garment assignments and seeds are frozen before attempt 1.
+- The harvest is 40 native `scripts.eval` processes: one exact seen garment
+  per process and 25 episodes in that process. The 40 process seeds are frozen
+  before attempt 1, and every attempt is uniquely identified by
+  `(process_seed, episode_index)`; no unsupported per-episode seed injection is
+  added.
 - Uniform sampling only. There is no 400/600 curriculum split.
 - Save successful trajectories for later success replay; retain failure logs
   and receipts, but do not turn failed attempts into training episodes.
 - No old success pool, restored state, hard-state continuation, geometry
   perturbation, augmentation, or automatic replay fine-tuning is included.
 
-The existing first-100 circuit breaker remains a cost and fidelity guardrail:
+The existing first-100 circuit breaker is the four deterministic `Seen_0`
+processes (one per category, 25 episodes each) and remains a cost and fidelity
+guardrail:
 stop if fewer than five official successes are observed, if any cloth
 fidelity failure occurs, or if infrastructure-invalid attempts exceed 2%.
 This is not an optimization project; it is a bounded stop rule to avoid paying
