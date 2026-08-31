@@ -43,6 +43,39 @@ def _external_project_root() -> Path:
 _lehome_logger.get_project_root = _external_project_root
 
 
+raw_cloth_fidelity_evidence = os.environ.get(
+    "LEHOME_NATIVE_CLOTH_FIDELITY_EVIDENCE", ""
+)
+if raw_cloth_fidelity_evidence:
+    fidelity_path = Path(raw_cloth_fidelity_evidence)
+    if (
+        not fidelity_path.is_absolute()
+        or ".." in fidelity_path.parts
+        or fidelity_path.exists()
+        or fidelity_path.is_symlink()
+    ):
+        _fatal("cloth fidelity evidence path is unsafe or already exists")
+    try:
+        import gymnasium as _gymnasium
+        from cloth_fidelity import install_cloth_fidelity_monitor_on_env
+
+        _original_gym_make = _gymnasium.make
+        _monitor_installed = False
+
+        def _monitored_gym_make(*args: object, **kwargs: object):
+            global _monitor_installed
+            created = _original_gym_make(*args, **kwargs)
+            if _monitor_installed:
+                _fatal("focused evaluator created more than one environment")
+            install_cloth_fidelity_monitor_on_env(created.unwrapped, fidelity_path)
+            _monitor_installed = True
+            return created
+
+        _gymnasium.make = _monitored_gym_make
+    except Exception as error:
+        _fatal(f"cloth fidelity monitor installation failed: {error}")
+
+
 raw_checkpoint_root = os.environ.get("LEHOME_NATIVE_REFERENCE_CHECKPOINT_ROOT", "")
 raw_sanitized_root = os.environ.get("LEHOME_NATIVE_REFERENCE_SANITIZED_CONFIG_ROOT", "")
 raw_compatibility_receipt = os.environ.get(

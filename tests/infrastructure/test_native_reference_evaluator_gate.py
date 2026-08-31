@@ -1899,6 +1899,92 @@ def test_prepare_checkpoint_compatibility_creates_one_exclusive_exact_view(
         gate.prepare_checkpoint_compatibility(checkpoint, sanitized, tmp_path / "second.json")
 
 
+def test_candidate_checkpoint_compatibility_is_bound_to_training_receipt_and_12000_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "candidate_checkpoint_compatibility", CHECKPOINT_COMPATIBILITY_SHIM
+    )
+    assert spec is not None and spec.loader is not None
+    compatibility = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(compatibility)
+    checkpoint_parent = tmp_path / "checkpoints/012000"
+    checkpoint = checkpoint_parent / "pretrained_model"
+    checkpoint.mkdir(parents=True)
+    values = {
+        "type": "groot",
+        "hidden_size": 1024,
+        "num_decay_steps": 12000,
+        "decay_lr_ratio": 0.1,
+    }
+    raw = (json.dumps(values, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    (checkpoint / "config.json").write_bytes(raw)
+    training = tmp_path / "training-identity.json"
+    training.write_text(
+        json.dumps(
+            {
+                "kind": "lehome_public_n15_verified_training_output_v1",
+                "step": 12000,
+                "checkpoint_root": str(checkpoint_parent.resolve()),
+                "checkpoint_files": {
+                    "checkpoints/012000/pretrained_model/config.json": hashlib.sha256(raw).hexdigest()
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    package = tmp_path / "lerobot"
+    package.mkdir()
+    origin = tmp_path / "configuration_groot.py"
+    origin.write_text("# exact test origin\n", encoding="utf-8")
+    monkeypatch.setattr(
+        compatibility,
+        "_installed_lerobot_identity",
+        lambda: (package.resolve(), "a" * 64, 17),
+    )
+    sanitized = tmp_path / "candidate-view"
+    receipt_path = tmp_path / "candidate-compatibility.json"
+
+    receipt = compatibility.prepare_candidate_checkpoint_config_view(
+        checkpoint,
+        training,
+        sanitized,
+        receipt_path,
+        groot_config_origin=origin,
+        expected_package_tree_sha256="a" * 64,
+        expected_package_file_count=17,
+    )
+
+    assert json.loads((sanitized / "config.json").read_text()) == {
+        "type": "groot",
+        "hidden_size": 1024,
+    }
+    assert receipt["kind"] == "lehome_native_candidate_checkpoint_compatibility_v1"
+    assert receipt["removed_fields"] == [
+        {"key": "decay_lr_ratio", "value": 0.1},
+        {"key": "num_decay_steps", "value": 12000},
+    ]
+    assert receipt["training_identity_receipt_sha256"] == hashlib.sha256(
+        training.read_bytes()
+    ).hexdigest()
+    assert (checkpoint / "config.json").read_bytes() == raw
+
+    training.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="training identity"):
+        compatibility.install_checkpoint_config_view(
+            checkpoint,
+            sanitized,
+            receipt_path,
+            expected_package_tree_sha256="a" * 64,
+            expected_package_file_count=17,
+        )
+
+
 @pytest.mark.parametrize("mutation", ("modified", "extra", "pycache_extra"))
 def test_prepare_checkpoint_compatibility_rejects_same_version_tampered_distribution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str

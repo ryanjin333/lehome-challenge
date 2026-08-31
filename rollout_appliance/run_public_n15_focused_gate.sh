@@ -54,8 +54,6 @@ require_directory "$ASSETS_ROOT" "official asset checkout"
 require_directory "$METADATA_ROOT" "metadata root"
 require_directory "$CANDIDATE_CHECKPOINT" "candidate-n15 checkpoint"
 require_file "$CANDIDATE_IDENTITY_RECEIPT" "candidate-n15 identity receipt"
-require_directory "$CANDIDATE_SANITIZED_CONFIG" "candidate-n15 compatibility view"
-require_file "$CANDIDATE_COMPATIBILITY_RECEIPT" "candidate-n15 compatibility receipt"
 require_directory "$REFERENCE_CHECKPOINT" "reference-n15 checkpoint"
 require_directory "$REFERENCE_SANITIZED_CONFIG" "reference-n15 compatibility view"
 require_file "$REFERENCE_COMPATIBILITY_RECEIPT" "reference-n15 compatibility receipt"
@@ -67,13 +65,21 @@ require_file "$REFERENCE_MATRIX_SHA256" "frozen reference matrix checksum"
 [[ "$OUTPUT_ROOT" == /* && "$OUTPUT_ROOT" != *".."* && ! -e "$OUTPUT_ROOT" && ! -L "$OUTPUT_ROOT" ]] \
   || fail "focused output root must be a new absolute path"
 require_directory "$(dirname -- "$OUTPUT_ROOT")" "focused output parent"
+[[ "$CANDIDATE_SANITIZED_CONFIG" == /* && "$CANDIDATE_SANITIZED_CONFIG" != *".."* \
+   && ! -e "$CANDIDATE_SANITIZED_CONFIG" && ! -L "$CANDIDATE_SANITIZED_CONFIG" ]] \
+  || fail "candidate compatibility view must be a new absolute path"
+[[ "$CANDIDATE_COMPATIBILITY_RECEIPT" == /* && "$CANDIDATE_COMPATIBILITY_RECEIPT" != *".."* \
+   && ! -e "$CANDIDATE_COMPATIBILITY_RECEIPT" && ! -L "$CANDIDATE_COMPATIBILITY_RECEIPT" ]] \
+  || fail "candidate compatibility receipt must be a new absolute path"
 [[ "$PUBLICATION_RECEIPT" == /* && "$PUBLICATION_RECEIPT" != *".."* && ! -e "$PUBLICATION_RECEIPT" ]] \
   || fail "publication receipt must be a new absolute path"
 [[ "$PROMOTION_RECEIPT" == /* && "$PROMOTION_RECEIPT" != *".."* && ! -e "$PROMOTION_RECEIPT" ]] \
   || fail "promotion receipt must be a new absolute path"
 [[ "$(dirname -- "$PUBLICATION_RECEIPT")" == "$(dirname -- "$OUTPUT_ROOT")" \
-   && "$(dirname -- "$PROMOTION_RECEIPT")" == "$(dirname -- "$OUTPUT_ROOT")" ]] \
-  || fail "focused output, publication, and promotion receipts must share one mounted parent"
+   && "$(dirname -- "$PROMOTION_RECEIPT")" == "$(dirname -- "$OUTPUT_ROOT")" \
+   && "$(dirname -- "$CANDIDATE_SANITIZED_CONFIG")" == "$(dirname -- "$OUTPUT_ROOT")" \
+   && "$(dirname -- "$CANDIDATE_COMPATIBILITY_RECEIPT")" == "$(dirname -- "$OUTPUT_ROOT")" ]] \
+  || fail "focused output and generated receipts/views must share one mounted parent"
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || fail "public dataset repository is invalid"
 [[ "$RUNTIME_REVISION" =~ ^[0-9a-f]{40}$ ]] || fail "runtime revision must be exact"
 [[ "$(git -C "$REPO_ROOT" rev-parse HEAD)" == "$RUNTIME_REVISION" ]] || fail "runtime revision mismatch"
@@ -138,8 +144,6 @@ mounts=(
   --mount "type=bind,src=$METADATA_ROOT,dst=$METADATA_ROOT,readonly"
   --mount "type=bind,src=$CANDIDATE_CHECKPOINT,dst=$CANDIDATE_CHECKPOINT,readonly"
   --mount "type=bind,src=$CANDIDATE_IDENTITY_RECEIPT,dst=$CANDIDATE_IDENTITY_RECEIPT,readonly"
-  --mount "type=bind,src=$CANDIDATE_SANITIZED_CONFIG,dst=$CANDIDATE_SANITIZED_CONFIG,readonly"
-  --mount "type=bind,src=$CANDIDATE_COMPATIBILITY_RECEIPT,dst=$CANDIDATE_COMPATIBILITY_RECEIPT,readonly"
   --mount "type=bind,src=$REFERENCE_CHECKPOINT,dst=$REFERENCE_CHECKPOINT,readonly"
   --mount "type=bind,src=$REFERENCE_SANITIZED_CONFIG,dst=$REFERENCE_SANITIZED_CONFIG,readonly"
   --mount "type=bind,src=$REFERENCE_COMPATIBILITY_RECEIPT,dst=$REFERENCE_COMPATIBILITY_RECEIPT,readonly"
@@ -156,6 +160,12 @@ uv pip install --offline --no-deps --python /opt/lehome-challenge/.venv/bin/pyth
   "$NATIVE_DEPENDENCIES_ROOT/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
   "$NATIVE_DEPENDENCIES_ROOT/qwen_vl_utils-0.0.14-py3-none-any.whl" \
   "$NATIVE_DEPENDENCIES_ROOT/torchdiffeq-0.2.5-py3-none-any.whl" >/dev/null
+/opt/lehome-challenge/.venv/bin/python /runtime/scripts/run_official_lehome_comparison.py \
+  prepare-n15-candidate-compatibility \
+  --candidate-checkpoint "$CANDIDATE_CHECKPOINT" \
+  --training-identity-receipt "$CANDIDATE_IDENTITY_RECEIPT" \
+  --sanitized-config-root "$CANDIDATE_SANITIZED_CONFIG" \
+  --compatibility-receipt "$CANDIDATE_COMPATIBILITY_RECEIPT"
 /isaac-sim/python.sh -m scripts.run_official_lehome_comparison run-n15-focused \
   --profile n15-focused \
   --source-root /official/lehome \

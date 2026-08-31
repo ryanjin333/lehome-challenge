@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import argparse
+import copy
 from pathlib import Path
 import subprocess
 from types import ModuleType, SimpleNamespace
@@ -74,6 +75,24 @@ def test_execution_env_does_not_inherit_runtime_pythonpath(
     assert paths[:2] == [str(source_root / "source/lehome"), str(source_root)]
     assert "/runtime" not in paths
     assert "/runtime/source/lehome" not in paths
+
+
+def test_focused_execution_env_activates_new_per_command_cloth_evidence(tmp_path: Path) -> None:
+    env = _execution_env(
+        source_root=tmp_path / "official-source",
+        log_root=tmp_path / "official-runtime/candidate-n15-top_short",
+        isaaclab_root=tmp_path / "isaaclab",
+        isaaclab_tasks_root=tmp_path / "isaaclab-tasks",
+        native_site_root=tmp_path / "native-site",
+        policy=PolicyDefinition("candidate-n15", "lerobot", checkpoint_root=tmp_path / "checkpoint"),
+        sanitized_config_root=tmp_path / "sanitized",
+        compatibility_receipt=tmp_path / "compatibility.json",
+        cloth_fidelity_monitor=True,
+    )
+
+    assert env["LEHOME_NATIVE_CLOTH_FIDELITY_EVIDENCE"] == str(
+        tmp_path / "official-runtime/candidate-n15-top_short/cloth-fidelity.jsonl"
+    )
 
 
 def test_checkout_identity_excludes_only_independently_verified_assets_mount(
@@ -298,6 +317,7 @@ def test_compile_policy_result_accepts_the_exact_n15_focused_matrix(tmp_path: Pa
     )
     logs = tmp_path / "logs"
     videos = tmp_path / "videos"
+    fidelity = tmp_path / "official-runtime"
     logs.mkdir()
     for category, directory in (("top_short", "Top_Short"), ("pant_long", "Pant_Long")):
         garments = [f"{directory}_Garment_{index:02d}" for index in range(12)]
@@ -309,15 +329,57 @@ def test_compile_policy_result_accepts_the_exact_n15_focused_matrix(tmp_path: Pa
                 (success_root / f"episode{episode}_observation_images_{camera}.mp4").write_bytes(
                     b"video"
                 )
+        _write_measured_fidelity(
+            fidelity / f"candidate-n15-{category}/cloth-fidelity.jsonl",
+            garments,
+        )
 
     result = compile_policy_result(
-        policy_id="candidate-n15", matrix=matrix, logs_root=logs, videos_root=videos
+        policy_id="candidate-n15",
+        matrix=matrix,
+        logs_root=logs,
+        videos_root=videos,
+        fidelity_root=fidelity,
     )
 
     assert result["episode_count"] == 48
     assert result["success_count"] == 48
     assert result["fidelity_invalid_count"] == 0
     assert result["infrastructure_invalid_count"] == 0
+    assert result["cloth_fidelity"]["measured_episode_count"] == 48
+
+
+def _write_measured_fidelity(path: Path, garments: list[str]) -> None:
+    from rollout_appliance.native_reference_site.cloth_fidelity import (
+        install_cloth_fidelity_monitor_on_env,
+    )
+
+    class Attribute:
+        def __init__(self, value): self.value = value
+        def Get(self): return self.value
+
+    class Prim:
+        def GetAttribute(self, name):
+            values = {
+                "points": [[0.0, 0.0, 0.2], [0.4, 0.2, 0.3]],
+                "velocities": [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]],
+            }
+            return Attribute(values[name])
+
+    env = SimpleNamespace(
+        object=SimpleNamespace(_prim=Prim()),
+        garment_config={"scale": [1.0] * 3, "soft_reset_pos_range": [-0.5] * 3 + [0.5] * 3},
+        particle_config={"objects": {"common": {}, "particle_system": {"max_velocity": 5.0}}},
+        cfg=SimpleNamespace(garment_name=garments[0]),
+        reset=lambda: None,
+        step=lambda action: action,
+        _get_success=lambda: False,
+    )
+    install_cloth_fidelity_monitor_on_env(env, path)
+    for garment in garments:
+        env.cfg.garment_name = garment
+        for _episode in (1, 2):
+            env.reset(); env.step(None); env._get_success()
 
 
 def _focused_result(
@@ -345,31 +407,127 @@ def _focused_result(
         "success_count": top_short + pant_long,
         "fidelity_invalid_count": 0,
         "infrastructure_invalid_count": 0,
+        "cloth_fidelity": {
+            "measured_episode_count": 48,
+            "fidelity_invalid_count": 0,
+            "event_count": 96,
+            "categories": {
+                category: {
+                    "measured_episode_count": 24,
+                    "fidelity_invalid_count": 0,
+                    "event_count": 48,
+                    "first_event_sha256": hashlib.sha256(f"{policy_id}-{category}-first".encode()).hexdigest(),
+                    "last_event_sha256": hashlib.sha256(f"{policy_id}-{category}-last".encode()).hexdigest(),
+                    "evidence_sha256": hashlib.sha256(f"{policy_id}-{category}-evidence".encode()).hexdigest(),
+                }
+                for category in ("top_short", "pant_long")
+            },
+        },
         "outcomes": outcomes,
     }
 
 
 def _focused_receipt(matrix: list[MatrixRow], *, candidate=(18, 13), reference=(20, 15)) -> dict[str, object]:
     matrix_payload = [row.__dict__ for row in matrix]
+    runtime = {
+        "revision": "3" * 40,
+        "tree_sha256": hashlib.sha256(b"reviewed runtime tree").hexdigest(),
+        "adapter_sha256": {
+            relative: hashlib.sha256(relative.encode()).hexdigest()
+            for relative in (
+                "scripts/run_official_lehome_comparison.py",
+                "rollout_appliance/run_public_n15_focused_gate.sh",
+                "rollout_appliance/native_reference_site/sitecustomize.py",
+                "rollout_appliance/native_reference_site/checkpoint_compatibility.py",
+                "rollout_appliance/native_reference_site/cloth_fidelity.py",
+            )
+        },
+    }
+    candidate_identity_sha = hashlib.sha256(b"candidate training identity receipt").hexdigest()
+    candidate_compatibility_sha = hashlib.sha256(b"candidate compatibility receipt").hexdigest()
+    reference_compatibility_sha = hashlib.sha256(b"reference compatibility receipt").hexdigest()
+    descriptor = lambda path, sha: {"path": f"evidence/{path}", "size": 128, "sha256": sha}
     return {
         "schema_version": 1,
         "kind": "lehome_official_policy_comparison_v1",
         "status": "valid",
         "mode": "full",
         "profile": N15_FOCUSED_PROFILE,
-        "official_source": {"revision": SOURCE_REVISION, "tree_sha256": "1" * 64},
-        "canonical_assets": {"revision": ASSET_REVISION, "tree_sha256": "2" * 64},
-        "reviewed_runtime": {"revision": "3" * 40, "tree_sha256": "4" * 64},
-        "candidate_checkpoint": {"step": 12000, "tree_sha256": "5" * 64},
-        "reference_checkpoint": {"revision": "6" * 40, "tree_sha256": "7" * 64},
-        "metadata": {"tree_sha256": "8" * 64},
-        "scorer_sha256": "9" * 64,
-        "frozen_reference_matrix_sha256": "a" * 64,
+        "official_source": {
+            "repository": "https://github.com/lehome-official/lehome-challenge.git",
+            "revision": SOURCE_REVISION,
+            "tree_sha256": hashlib.sha256(b"official source tree").hexdigest(),
+        },
+        "canonical_assets": {
+            "repository": "lehome/asset_challenge",
+            "revision": ASSET_REVISION,
+            "tree_sha256": hashlib.sha256(b"official asset tree").hexdigest(),
+        },
+        "reviewed_runtime": runtime,
+        "rollout_image": {
+            "kind": "lehome_official_image_inspection_v1",
+            "reference": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
+            "image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
+            "repo_digests": [],
+            "docker_inspect_sha256": hashlib.sha256(b"docker inspect").hexdigest(),
+        },
+        "cuda": {"cuda_available": True, "cuda_device_count": 1, "cuda_runtime": "12.8", "cuda_device_name": "test"},
+        "native_runtime_evidence": {
+            "python_executable": "/opt/lehome-challenge/.venv/bin/python",
+            "pythonexe": "/opt/lehome-challenge/.venv/bin/python",
+            "pythonpath_peft_overlay": "/opt/native/peft.whl",
+            "evidence": {
+                key: {"receipt": {"kind": key}, "sha256": hashlib.sha256(key.encode()).hexdigest()}
+                for key in (
+                    "peft_overlay", "flash_attention_overlay", "flash_attention_runtime",
+                    "public_dependencies_overlay", "public_dependencies_runtime", "pynput_backend",
+                )
+            },
+        },
+        "candidate_checkpoint": {
+            "kind": "lehome_public_n15_verified_training_output_v1",
+            "step": 12000,
+            "identity_receipt_sha256": candidate_identity_sha,
+            "tree_sha256": hashlib.sha256(b"candidate checkpoint tree").hexdigest(),
+            "file_count": 7,
+        },
+        "reference_checkpoint": {
+            "repository": "theo-zhou/lehome-groot-submission-4",
+            "revision": "d384fe00508acd96ab1c3c5dc265e08261f94b3b",
+            "file_sha256": dict(sorted(COMPETITOR_FILES.items())),
+            "tree_sha256": "fd0b4e91491e1001272ec199f971cb6bce4c966e4d6d0191b6947a3adfddd74a",
+        },
+        "candidate_compatibility_receipt_sha256": candidate_compatibility_sha,
+        "reference_compatibility_receipt_sha256": reference_compatibility_sha,
+        "metadata": {
+            "tree_sha256": hashlib.sha256(b"metadata tree").hexdigest(),
+            "category_tree_sha256": {
+                category: hashlib.sha256(category.encode()).hexdigest() for category in CATEGORIES
+            },
+            "policy_visibility": "LeRobot construction only; never included in DockerPolicy observations",
+        },
+        "scorer_sha256": "cf17ffb9e015160e9fe9b1ed273870f1cabf0222a4864fc0cd56e642ed792862",
+        "frozen_reference_matrix_sha256": "bb3c11ddb10eb53ba3cd2b189850d74bc8f2bfa45d15153812b806060b4b80b5",
+        "evidence_archive": {
+            "runtime-identity.json": descriptor(
+                "runtime-identity.json",
+                hashlib.sha256((json.dumps({"revision": runtime["revision"], "tree_sha256": runtime["tree_sha256"]}, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest(),
+            ),
+            "candidate-checkpoint-identity.json": descriptor("candidate-checkpoint-identity.json", candidate_identity_sha),
+            "candidate-checkpoint-compatibility.json": descriptor("candidate-checkpoint-compatibility.json", candidate_compatibility_sha),
+            "reference-checkpoint-compatibility.json": descriptor("reference-checkpoint-compatibility.json", reference_compatibility_sha),
+        },
         "matrix_sha256": hashlib.sha256(
             (json.dumps(matrix_payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
         ).hexdigest(),
         "matrix": matrix_payload,
-        "command_parity": {"verified": True},
+        "command_parity": {
+            "verified": True,
+            "category_common_command_sha256": {
+                category: hashlib.sha256(f"command-{category}".encode()).hexdigest()
+                for category in ("top_short", "pant_long")
+            },
+        },
         "simulator_device": "cpu",
         "policy_device": "cuda:0",
         "seed": 42,
@@ -409,6 +567,34 @@ def test_n15_focused_promotion_requires_paired_thresholds_and_published_readback
         "pant_long": {"candidate": 13, "reference": 15, "floor": 13, "maximum_deficit": 2},
     }
     assert decision["publication_readback_verified"] is True
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    [
+        (("official_source", "revision"), "0" * 40),
+        (("reference_checkpoint", "tree_sha256"), "0" * 64),
+        (("scorer_sha256",), "0" * 64),
+        (("metadata", "policy_visibility"), "visible to policy"),
+        (("evidence_archive", "runtime-identity.json", "sha256"), "0" * 64),
+    ],
+)
+def test_n15_focused_promotion_rejects_exact_provenance_drift(
+    tmp_path: Path, path: tuple[str, ...], replacement: object
+) -> None:
+    matrix = load_profile_matrix(_assets(tmp_path / "assets"), profile=N15_FOCUSED_PROFILE)
+    receipt = copy.deepcopy(_focused_receipt(matrix))
+    target = receipt
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = replacement
+    receipt_sha = hashlib.sha256(
+        (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    ).hexdigest()
+    with pytest.raises(ComparisonError, match="provenance"):
+        assess_n15_focused_promotion(
+            receipt, publication=_focused_publication(receipt_sha), receipt_sha256=receipt_sha
+        )
 
 
 @pytest.mark.parametrize(

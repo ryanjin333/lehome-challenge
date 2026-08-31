@@ -52,6 +52,8 @@ N15_FOCUSED_PROFILE = "n15-focused"
 N15_FOCUSED_CATEGORIES = ("top_short", "pant_long")
 N15_FOCUSED_FLOORS = {"top_short": 18, "pant_long": 13}
 N15_FOCUSED_MAXIMUM_DEFICIT = 2
+OFFICIAL_SCORER_SHA256 = "cf17ffb9e015160e9fe9b1ed273870f1cabf0222a4864fc0cd56e642ed792862"
+FROZEN_REFERENCE_MATRIX_SHA256 = "bb3c11ddb10eb53ba3cd2b189850d74bc8f2bfa45d15153812b806060b4b80b5"
 CAMERAS = ("top_rgb", "left_rgb", "right_rgb")
 CATEGORY_DIRECTORIES = (
     ("top_long", "Top_Long"),
@@ -525,6 +527,7 @@ def focused_runtime_adapter_identities(runtime_root: Path) -> dict[str, str]:
         "rollout_appliance/run_public_n15_focused_gate.sh",
         "rollout_appliance/native_reference_site/sitecustomize.py",
         "rollout_appliance/native_reference_site/checkpoint_compatibility.py",
+        "rollout_appliance/native_reference_site/cloth_fidelity.py",
     )
     identities: dict[str, str] = {}
     for relative in relatives:
@@ -989,6 +992,7 @@ def compile_policy_result(
     matrix: Sequence[MatrixRow],
     logs_root: Path,
     videos_root: Path,
+    fidelity_root: Path | None = None,
     video_probe: Callable[[Path], bool] = _nonempty_video,
 ) -> dict[str, object]:
     if len(matrix) == 96:
@@ -1002,8 +1006,19 @@ def compile_policy_result(
         expected_per_category = 2
     else:
         raise ComparisonError("infrastructure_invalid: comparison matrix is neither official full nor smoke")
+    focused = len(matrix) == 48 and tuple(
+        dict.fromkeys(row.category for row in matrix)
+    ) == N15_FOCUSED_CATEGORIES
+    if focused and fidelity_root is None:
+        raise ComparisonError("fidelity_invalid: focused comparison requires measured cloth evidence")
     outcomes: list[dict[str, object]] = []
     videos: list[dict[str, object]] = []
+    cloth_fidelity: dict[str, object] = {
+        "measured_episode_count": 0,
+        "fidelity_invalid_count": 0,
+        "event_count": 0,
+        "categories": {},
+    }
     for category in categories:
         expected = [row for row in matrix if row.category == category]
         if len(expected) != expected_per_category:
@@ -1011,6 +1026,21 @@ def compile_policy_result(
         log = Path(logs_root) / f"{policy_id}-{category}.log"
         category_outcomes = _parse_category_log(log, expected)
         outcomes.extend(category_outcomes)
+        if focused:
+            from rollout_appliance.native_reference_site.cloth_fidelity import (
+                validate_cloth_fidelity_evidence,
+            )
+
+            try:
+                measured = validate_cloth_fidelity_evidence(
+                    Path(fidelity_root) / f"{policy_id}-{category}" / "cloth-fidelity.jsonl",
+                    expected_episodes=[(row.garment, row.episode_index) for row in expected],
+                )
+            except ValueError as error:
+                raise ComparisonError(f"fidelity_invalid: {category}: {error}") from None
+            cloth_fidelity["categories"][category] = measured
+            for key in ("measured_episode_count", "fidelity_invalid_count", "event_count"):
+                cloth_fidelity[key] += int(measured[key])
         final_garment = expected[-1].garment
         final_outcomes = [row for row in category_outcomes if row["garment"] == final_garment]
         videos.extend(
@@ -1025,13 +1055,19 @@ def compile_policy_result(
         for row in outcomes
     ] != [(row.category, row.garment, row.episode_index, row.seed) for row in matrix]:
         raise ComparisonError("infrastructure_invalid: compiled outcome order drift")
+    fidelity_invalid_count = int(cloth_fidelity["fidelity_invalid_count"])
+    if focused and fidelity_invalid_count:
+        raise ComparisonError(
+            f"fidelity_invalid: measured {fidelity_invalid_count} invalid cloth episodes"
+        )
     return {
         "policy_id": policy_id,
         "status": "valid",
         "episode_count": len(outcomes),
         "success_count": sum(bool(row["success"]) for row in outcomes),
-        "fidelity_invalid_count": 0,
+        "fidelity_invalid_count": fidelity_invalid_count,
         "infrastructure_invalid_count": 0,
+        "cloth_fidelity": cloth_fidelity if focused else None,
         "outcomes": outcomes,
         "retained_official_videos": videos,
         "video_scope": "official filenames overwrite per garment; retained files represent only each category's final garment",
@@ -1135,6 +1171,85 @@ def assess_n15_focused_promotion(
     }
     if any(key not in receipt or receipt[key] in (None, "", {}, []) for key in required_provenance):
         raise ComparisonError("N1.5 focused provenance is incomplete")
+    sha256 = lambda value: re.fullmatch(r"[0-9a-f]{64}", str(value)) is not None
+    source = receipt.get("official_source")
+    assets = receipt.get("canonical_assets")
+    runtime = receipt.get("reviewed_runtime")
+    candidate_checkpoint = receipt.get("candidate_checkpoint")
+    reference_checkpoint = receipt.get("reference_checkpoint")
+    metadata = receipt.get("metadata")
+    archive = receipt.get("evidence_archive")
+    expected_adapters = {
+        "scripts/run_official_lehome_comparison.py",
+        "rollout_appliance/run_public_n15_focused_gate.sh",
+        "rollout_appliance/native_reference_site/sitecustomize.py",
+        "rollout_appliance/native_reference_site/checkpoint_compatibility.py",
+        "rollout_appliance/native_reference_site/cloth_fidelity.py",
+    }
+    if (
+        not isinstance(source, Mapping)
+        or set(source) != {"repository", "revision", "tree_sha256"}
+        or source.get("repository") != SOURCE_REPOSITORY
+        or source.get("revision") != SOURCE_REVISION
+        or not sha256(source.get("tree_sha256"))
+        or not isinstance(assets, Mapping)
+        or set(assets) != {"repository", "revision", "tree_sha256"}
+        or assets.get("repository") != ASSET_REPOSITORY
+        or assets.get("revision") != ASSET_REVISION
+        or not sha256(assets.get("tree_sha256"))
+        or not isinstance(runtime, Mapping)
+        or set(runtime) != {"revision", "tree_sha256", "adapter_sha256"}
+        or _HEX40.fullmatch(str(runtime.get("revision"))) is None
+        or not sha256(runtime.get("tree_sha256"))
+        or not isinstance(runtime.get("adapter_sha256"), Mapping)
+        or set(runtime["adapter_sha256"]) != expected_adapters
+        or any(not sha256(value) for value in runtime["adapter_sha256"].values())
+        or not isinstance(candidate_checkpoint, Mapping)
+        or set(candidate_checkpoint) != {"kind", "step", "identity_receipt_sha256", "tree_sha256", "file_count"}
+        or candidate_checkpoint.get("kind") != "lehome_public_n15_verified_training_output_v1"
+        or candidate_checkpoint.get("step") != 12000
+        or not sha256(candidate_checkpoint.get("identity_receipt_sha256"))
+        or not sha256(candidate_checkpoint.get("tree_sha256"))
+        or type(candidate_checkpoint.get("file_count")) is not int
+        or candidate_checkpoint["file_count"] < 1
+        or reference_checkpoint != {
+            "repository": "theo-zhou/lehome-groot-submission-4",
+            "revision": "d384fe00508acd96ab1c3c5dc265e08261f94b3b",
+            "file_sha256": dict(sorted(COMPETITOR_FILES.items())),
+            "tree_sha256": COMPETITOR_TREE_SHA256,
+        }
+        or not isinstance(metadata, Mapping)
+        or set(metadata) != {"tree_sha256", "category_tree_sha256", "policy_visibility"}
+        or not sha256(metadata.get("tree_sha256"))
+        or not isinstance(metadata.get("category_tree_sha256"), Mapping)
+        or set(metadata["category_tree_sha256"]) != {category for category, _ in CATEGORY_DIRECTORIES}
+        or any(not sha256(value) for value in metadata["category_tree_sha256"].values())
+        or metadata.get("policy_visibility") != "LeRobot construction only; never included in DockerPolicy observations"
+        or receipt.get("scorer_sha256") != OFFICIAL_SCORER_SHA256
+        or receipt.get("frozen_reference_matrix_sha256") != FROZEN_REFERENCE_MATRIX_SHA256
+        or not isinstance(archive, Mapping)
+    ):
+        raise ComparisonError("N1.5 focused exact provenance drift")
+    archive_links = {
+        "runtime-identity.json": _sha256_bytes(
+            _canonical_bytes({"revision": runtime["revision"], "tree_sha256": runtime["tree_sha256"]})
+        ),
+        "candidate-checkpoint-identity.json": candidate_checkpoint["identity_receipt_sha256"],
+        "candidate-checkpoint-compatibility.json": receipt.get("candidate_compatibility_receipt_sha256"),
+        "reference-checkpoint-compatibility.json": receipt.get("reference_compatibility_receipt_sha256"),
+    }
+    for name, expected_sha in archive_links.items():
+        descriptor = archive.get(name)
+        if (
+            not sha256(expected_sha)
+            or not isinstance(descriptor, Mapping)
+            or set(descriptor) != {"path", "size", "sha256"}
+            or descriptor.get("path") != f"evidence/{name}"
+            or type(descriptor.get("size")) is not int
+            or descriptor["size"] < 1
+            or descriptor.get("sha256") != expected_sha
+        ):
+            raise ComparisonError("N1.5 focused exact provenance archive drift")
     if (
         receipt.get("simulator_device") != "cpu"
         or receipt.get("policy_device") != "cuda:0"
@@ -1143,6 +1258,9 @@ def assess_n15_focused_promotion(
         or receipt.get("episodes_per_garment") != EPISODES_PER_GARMENT
         or not isinstance(receipt.get("command_parity"), Mapping)
         or receipt["command_parity"].get("verified") is not True
+        or set(receipt["command_parity"]) != {"verified", "category_common_command_sha256"}
+        or set(receipt["command_parity"]["category_common_command_sha256"]) != set(N15_FOCUSED_CATEGORIES)
+        or any(not sha256(value) for value in receipt["command_parity"]["category_common_command_sha256"].values())
     ):
         raise ComparisonError("N1.5 focused provenance contract drift")
     matrix_payload = receipt.get("matrix")
@@ -1203,6 +1321,17 @@ def assess_n15_focused_promotion(
             or result.get("infrastructure_invalid_count") != 0
             or not isinstance(outcomes, list)
             or len(outcomes) != 48
+            or not isinstance(result.get("cloth_fidelity"), Mapping)
+            or result["cloth_fidelity"].get("measured_episode_count") != 48
+            or result["cloth_fidelity"].get("fidelity_invalid_count") != 0
+            or set(result["cloth_fidelity"].get("categories", {})) != set(N15_FOCUSED_CATEGORIES)
+            or any(
+                not isinstance(summary, Mapping)
+                or summary.get("measured_episode_count") != 24
+                or summary.get("fidelity_invalid_count") != 0
+                or any(not sha256(summary.get(key)) for key in ("first_event_sha256", "last_event_sha256", "evidence_sha256"))
+                for summary in result["cloth_fidelity"].get("categories", {}).values()
+            )
         ):
             raise ComparisonError("N1.5 focused fidelity or infrastructure gate failed")
         observed = [
@@ -1273,6 +1402,7 @@ def _execution_env(
     policy: PolicyDefinition,
     sanitized_config_root: Path | None,
     compatibility_receipt: Path | None,
+    cloth_fidelity_monitor: bool = False,
 ) -> dict[str, str]:
     env = os.environ.copy()
     python_path = [
@@ -1292,6 +1422,10 @@ def _execution_env(
             "LEHOME_NATIVE_REFERENCE_SOURCE_ROOT": str(source_root),
         }
     )
+    if cloth_fidelity_monitor:
+        env["LEHOME_NATIVE_CLOTH_FIDELITY_EVIDENCE"] = str(
+            log_root / "cloth-fidelity.jsonl"
+        )
     if policy.policy_type == "lerobot":
         if sanitized_config_root is None or compatibility_receipt is None:
             raise ComparisonError("competitor compatibility view inputs are required")
@@ -1438,6 +1572,7 @@ def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
                     policy=policy,
                     sanitized_config_root=sanitized_root,
                     compatibility_receipt=compatibility_receipt,
+                    cloth_fidelity_monitor=True,
                 )
                 with log.open("xb") as stream:
                     result = subprocess.run(
@@ -1461,6 +1596,7 @@ def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
                 matrix=matrix,
                 logs_root=output_root / "logs",
                 videos_root=output_root / "videos",
+                fidelity_root=output_root / "official-runtime",
                 video_probe=_ffprobe_video,
             )
             for policy in policies
@@ -1521,6 +1657,12 @@ def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
             "native_runtime_evidence": native_runtime_before,
             "candidate_checkpoint": candidate_before,
             "reference_checkpoint": reference_before,
+            "candidate_compatibility_receipt_sha256": _sha256_file(
+                args.candidate_compatibility_receipt
+            ),
+            "reference_compatibility_receipt_sha256": _sha256_file(
+                args.reference_compatibility_receipt
+            ),
             "metadata": metadata_before,
             "scorer_sha256": _sha256_file(scorer),
             "frozen_reference_matrix_sha256": frozen_reference_matrix_sha,
@@ -1915,6 +2057,21 @@ def verify_n15_focused_promotion(args: argparse.Namespace) -> Path:
     return args.promotion_receipt
 
 
+def prepare_n15_candidate_compatibility(args: argparse.Namespace) -> Path:
+    """Produce the candidate-only inference config view from its training receipt."""
+    from rollout_appliance.native_reference_site.checkpoint_compatibility import (
+        prepare_candidate_checkpoint_config_view,
+    )
+
+    prepare_candidate_checkpoint_config_view(
+        args.candidate_checkpoint,
+        args.training_identity_receipt,
+        args.sanitized_config_root,
+        args.compatibility_receipt,
+    )
+    return args.compatibility_receipt
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1972,6 +2129,11 @@ def build_parser() -> argparse.ArgumentParser:
     focused.add_argument("--isaaclab-root", type=Path, required=True)
     focused.add_argument("--isaaclab-tasks-root", type=Path, required=True)
     focused.add_argument("--python-bin", default=sys.executable)
+    prepare = commands.add_parser("prepare-n15-candidate-compatibility")
+    prepare.add_argument("--candidate-checkpoint", type=Path, required=True)
+    prepare.add_argument("--training-identity-receipt", type=Path, required=True)
+    prepare.add_argument("--sanitized-config-root", type=Path, required=True)
+    prepare.add_argument("--compatibility-receipt", type=Path, required=True)
     publish = commands.add_parser("publish")
     publish.add_argument("--receipt", type=Path, required=True)
     publish.add_argument("--repository", required=True)
@@ -1993,6 +2155,8 @@ def main() -> int:
             output = execute_comparison(args)
         elif args.command == "run-n15-focused":
             output = execute_n15_focused_comparison(args)
+        elif args.command == "prepare-n15-candidate-compatibility":
+            output = prepare_n15_candidate_compatibility(args)
         elif args.command == "publish":
             output = publish_comparison(args)
         else:

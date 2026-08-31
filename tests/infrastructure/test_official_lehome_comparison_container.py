@@ -165,6 +165,18 @@ def test_n15_focused_wrapper_runs_only_native_candidate_and_reference_sequential
     assert "uv pip install --offline --no-deps" in text
 
 
+def test_n15_focused_wrapper_builds_candidate_config_view_from_training_receipt() -> None:
+    text = N15_FOCUSED_WRAPPER.read_text(encoding="utf-8")
+    prepare = text.index("prepare-n15-candidate-compatibility")
+    run = text.index("run-n15-focused")
+    assert prepare < run
+    assert "--training-identity-receipt \"$CANDIDATE_IDENTITY_RECEIPT\"" in text
+    assert "--sanitized-config-root \"$CANDIDATE_SANITIZED_CONFIG\"" in text
+    assert "--compatibility-receipt \"$CANDIDATE_COMPATIBILITY_RECEIPT\"" in text
+    assert 'require_directory "$CANDIDATE_SANITIZED_CONFIG"' not in text
+    assert 'require_file "$CANDIDATE_COMPATIBILITY_RECEIPT"' not in text
+
+
 def test_n15_focused_wrapper_publishes_then_verifies_readback_before_pass() -> None:
     text = N15_FOCUSED_WRAPPER.read_text(encoding="utf-8")
     publish = text.index(" publish ")

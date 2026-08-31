@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import stat
 from typing import Any
@@ -21,6 +22,10 @@ LEROBOT_PACKAGE_FILE_COUNT = 289
 REMOVED_FIELDS = (
     {"key": "decay_lr_ratio", "value": 0.1},
     {"key": "num_decay_steps", "value": 4000},
+)
+CANDIDATE_REMOVED_FIELDS = (
+    {"key": "decay_lr_ratio", "value": 0.1},
+    {"key": "num_decay_steps", "value": 12000},
 )
 
 
@@ -100,12 +105,126 @@ def _installed_lerobot_identity() -> tuple[Path, str, int]:
     return package_root, digest.hexdigest(), count
 
 
+def _canonical_bytes(value: object) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        + "\n"
+    ).encode("ascii")
+
+
+def prepare_candidate_checkpoint_config_view(
+    checkpoint_root: Path,
+    training_identity_receipt: Path,
+    sanitized_config_root: Path,
+    receipt_path: Path,
+    *,
+    groot_config_origin: Path | None = None,
+    expected_package_tree_sha256: str = LEROBOT_PACKAGE_TREE_SHA256,
+    expected_package_file_count: int = LEROBOT_PACKAGE_FILE_COUNT,
+) -> dict[str, object]:
+    """Create an inference-only view for the exact verified 12K candidate."""
+    checkpoint = _resolved_directory(Path(checkpoint_root), "checkpoint root")
+    training_path = Path(training_identity_receipt)
+    try:
+        training_raw = _regular_bytes(training_path, "candidate training identity receipt")
+        training = json.loads(training_raw)
+    except (UnicodeError, json.JSONDecodeError):
+        raise RuntimeError("candidate training identity receipt is invalid") from None
+    raw = _regular_bytes(checkpoint / "config.json", "raw checkpoint config")
+    raw_sha = hashlib.sha256(raw).hexdigest()
+    relative = "checkpoints/012000/pretrained_model/config.json"
+    if (
+        not isinstance(training, dict)
+        or training.get("kind") != "lehome_public_n15_verified_training_output_v1"
+        or training.get("step") != 12000
+        or Path(str(training.get("checkpoint_root", ""))).resolve(strict=True) / "pretrained_model"
+        != checkpoint
+        or not isinstance(training.get("checkpoint_files"), dict)
+        or training["checkpoint_files"].get(relative) != raw_sha
+    ):
+        raise RuntimeError("candidate training identity does not bind the checkpoint config")
+    try:
+        values = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError):
+        raise RuntimeError("candidate checkpoint config is invalid") from None
+    if (
+        not isinstance(values, dict)
+        or values.get("num_decay_steps") != 12000
+        or type(values.get("num_decay_steps")) is not int
+        or values.get("decay_lr_ratio") != 0.1
+        or type(values.get("decay_lr_ratio")) is not float
+    ):
+        raise RuntimeError("candidate checkpoint scheduler identity is invalid")
+    sanitized_values = dict(values)
+    removed = [
+        {"key": key, "value": sanitized_values.pop(key)}
+        for key in sorted(("decay_lr_ratio", "num_decay_steps"))
+    ]
+    if tuple(removed) != CANDIDATE_REMOVED_FIELDS:
+        raise RuntimeError("candidate compatibility removed unexpected values")
+    sanitized_raw = _canonical_bytes(sanitized_values)
+    sanitized = Path(sanitized_config_root)
+    if sanitized.exists() or sanitized.is_symlink():
+        raise RuntimeError("sanitized checkpoint config root already exists")
+    sanitized.mkdir(mode=0o700)
+    sanitized = sanitized.resolve(strict=True)
+    descriptor = os.open(sanitized / "config.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(sanitized_raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    package_root, tree_sha, file_count = _installed_lerobot_identity()
+    if tree_sha != expected_package_tree_sha256 or file_count != expected_package_file_count:
+        raise RuntimeError("installed LeRobot package tree does not match official wheel")
+    if groot_config_origin is None:
+        from lerobot.policies.groot.configuration_groot import GrootConfig
+
+        groot_config_origin = Path(
+            __import__(GrootConfig.__module__, fromlist=["*"]).__file__
+        ).resolve(strict=True)
+    else:
+        groot_config_origin = Path(groot_config_origin).resolve(strict=True)
+    receipt = {
+        "schema_version": 1,
+        "kind": "lehome_native_candidate_checkpoint_compatibility_v1",
+        "checkpoint_root": str(checkpoint),
+        "raw_config_sha256": raw_sha,
+        "sanitized_config_root": str(sanitized),
+        "sanitized_config_sha256": hashlib.sha256(sanitized_raw).hexdigest(),
+        "removed_fields": removed,
+        "lerobot_distribution": "lerobot",
+        "lerobot_version": "0.4.3",
+        "lerobot_wheel_filename": "lerobot-0.4.3-py3-none-any.whl",
+        "lerobot_wheel_sha256": LEROBOT_WHEEL_SHA256,
+        "groot_config_origin": str(groot_config_origin),
+        "groot_config_missing_fields": ["decay_lr_ratio", "num_decay_steps"],
+        "rationale": "inference_only_remove_unsupported_training_scheduler_fields",
+        "original_checkpoint_unchanged": True,
+        "installed_lerobot_package_root": str(package_root),
+        "expected_lerobot_package_tree_sha256": expected_package_tree_sha256,
+        "expected_lerobot_package_file_count": expected_package_file_count,
+        "installed_lerobot_package_tree_sha256": tree_sha,
+        "installed_lerobot_package_file_count": file_count,
+        "training_identity_receipt": str(training_path.resolve(strict=True)),
+        "training_identity_receipt_sha256": hashlib.sha256(training_raw).hexdigest(),
+    }
+    target = Path(receipt_path)
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(_canonical_bytes(receipt))
+        stream.flush()
+        os.fsync(stream.fileno())
+    if (checkpoint / "config.json").read_bytes() != raw:
+        raise RuntimeError("original checkpoint config changed during normalization")
+    return receipt
+
+
 def install_checkpoint_config_view(
     checkpoint_root: Path,
     sanitized_config_root: Path,
     receipt_path: Path,
     *,
-    expected_config_sha256: str = EXPECTED_CONFIG_SHA256,
+    expected_config_sha256: str | None = None,
     expected_package_tree_sha256: str = LEROBOT_PACKAGE_TREE_SHA256,
     expected_package_file_count: int = LEROBOT_PACKAGE_FILE_COUNT,
 ) -> None:
@@ -136,19 +255,27 @@ def install_checkpoint_config_view(
         "installed_lerobot_package_tree_sha256",
         "installed_lerobot_package_file_count",
     }
+    candidate = isinstance(receipt, dict) and receipt.get("kind") == "lehome_native_candidate_checkpoint_compatibility_v1"
+    if candidate:
+        expected_keys |= {"training_identity_receipt", "training_identity_receipt_sha256"}
     if not isinstance(receipt, dict) or set(receipt) != expected_keys:
         raise RuntimeError("compatibility receipt has an unexpected schema")
     raw = _regular_bytes(checkpoint / "config.json", "raw checkpoint config")
     sanitized_raw = _regular_bytes(sanitized / "config.json", "sanitized checkpoint config")
     package_root, installed_tree_sha256, installed_file_count = _installed_lerobot_identity()
+    removed_fields = list(CANDIDATE_REMOVED_FIELDS if candidate else REMOVED_FIELDS)
     expected = {
         "schema_version": 1,
-        "kind": "lehome_native_reference_checkpoint_compatibility_v1",
+        "kind": (
+            "lehome_native_candidate_checkpoint_compatibility_v1"
+            if candidate
+            else "lehome_native_reference_checkpoint_compatibility_v1"
+        ),
         "checkpoint_root": str(checkpoint),
         "raw_config_sha256": hashlib.sha256(raw).hexdigest(),
         "sanitized_config_root": str(sanitized),
         "sanitized_config_sha256": hashlib.sha256(sanitized_raw).hexdigest(),
-        "removed_fields": list(REMOVED_FIELDS),
+        "removed_fields": removed_fields,
         "lerobot_distribution": "lerobot",
         "lerobot_version": "0.4.3",
         "lerobot_wheel_filename": "lerobot-0.4.3-py3-none-any.whl",
@@ -164,7 +291,30 @@ def install_checkpoint_config_view(
     }
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise RuntimeError("compatibility receipt does not bind the exact config view")
-    if receipt["raw_config_sha256"] != expected_config_sha256:
+    if candidate:
+        training_path = Path(str(receipt["training_identity_receipt"]))
+        training_raw = _regular_bytes(training_path, "candidate training identity receipt")
+        try:
+            training = json.loads(training_raw)
+        except (UnicodeError, json.JSONDecodeError):
+            raise RuntimeError("candidate training identity receipt is invalid") from None
+        relative = "checkpoints/012000/pretrained_model/config.json"
+        if (
+            hashlib.sha256(training_raw).hexdigest()
+            != receipt["training_identity_receipt_sha256"]
+            or not isinstance(training, dict)
+            or training.get("kind") != "lehome_public_n15_verified_training_output_v1"
+            or training.get("step") != 12000
+            or Path(str(training.get("checkpoint_root", ""))).resolve(strict=True) / "pretrained_model"
+            != checkpoint
+            or not isinstance(training.get("checkpoint_files"), dict)
+            or training["checkpoint_files"].get(relative) != receipt["raw_config_sha256"]
+        ):
+            raise RuntimeError("candidate training identity does not bind the compatibility view")
+        approved_config_sha256 = str(receipt["raw_config_sha256"])
+    else:
+        approved_config_sha256 = expected_config_sha256 or EXPECTED_CONFIG_SHA256
+    if receipt["raw_config_sha256"] != approved_config_sha256:
         raise RuntimeError("raw checkpoint config digest is not approved")
     if (
         installed_tree_sha256 != expected_package_tree_sha256
@@ -176,7 +326,7 @@ def install_checkpoint_config_view(
     from lerobot.policies.groot.configuration_groot import GrootConfig
 
     fields = getattr(GrootConfig, "__dataclass_fields__", None)
-    if not isinstance(fields, dict) or any(row["key"] in fields for row in REMOVED_FIELDS):
+    if not isinstance(fields, dict) or any(row["key"] in fields for row in removed_fields):
         raise RuntimeError("official GrootConfig field mismatch is not present")
     origin = Path(__import__(GrootConfig.__module__, fromlist=["*"]).__file__).resolve(strict=True)
     if receipt.get("groot_config_origin") != str(origin):
