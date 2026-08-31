@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 WRAPPER = ROOT / "rollout_appliance/run_official_lehome_comparison_container.sh"
+N15_FOCUSED_WRAPPER = ROOT / "rollout_appliance/run_public_n15_focused_gate.sh"
 RUNBOOK = ROOT / "docs/experiments/2026-08-30-official-lehome-comparison-runbook.md"
 
 
@@ -140,3 +141,37 @@ def test_runbook_separates_execution_publication_and_provider_stop() -> None:
     assert "publication is explicit" in text.lower()
     assert "stop the exact VM" in text
     assert "1,000-rollout" in text
+
+
+def test_n15_focused_wrapper_runs_only_native_candidate_and_reference_sequentially() -> None:
+    text = N15_FOCUSED_WRAPPER.read_text(encoding="utf-8")
+    assert "run-n15-focused" in text
+    assert "candidate-n15" in text
+    assert "reference-n15" in text
+    assert text.index("candidate-n15") < text.index("reference-n15")
+    assert "--profile n15-focused" in text
+    assert "--device cpu" in text
+    assert "--gpus all" in text
+    assert "--seed 42" in text
+    assert "--n17-checkpoint" not in text
+    assert "run_groot_n17_public96_policy_server" not in text
+    assert "serve_official_docker_policy_bridge" not in text
+    assert "--docker-url" not in text
+    assert "--env PYTHONPATH=/runtime/source/lehome:/runtime" in text
+    assert "GIT_CONFIG_KEY_0=safe.directory" in text
+    assert "GIT_CONFIG_VALUE_0=/official/lehome" in text
+    assert "GIT_CONFIG_VALUE_1=/official/assets" in text
+    assert "/mnt/lehome/reference-native/dependencies" in text
+    assert "uv pip install --offline --no-deps" in text
+
+
+def test_n15_focused_wrapper_publishes_then_verifies_readback_before_pass() -> None:
+    text = N15_FOCUSED_WRAPPER.read_text(encoding="utf-8")
+    publish = text.index(" publish ")
+    verify = text.index(" verify-n15-focused ")
+    assert publish < verify
+    assert "--publication-receipt" in text
+    assert "anonymous_byte_readback_verified" in text
+    assert "LEHOME_N15_FOCUSED_REPOSITORY" in text
+    assert "nebius" not in text.lower()
+    assert "computeinstance-" not in text

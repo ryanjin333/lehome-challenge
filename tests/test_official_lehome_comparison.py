@@ -35,6 +35,9 @@ from scripts.run_official_lehome_comparison import (
     _execution_env,
     checkout_identity,
     load_release_matrix,
+    N15_FOCUSED_PROFILE,
+    assess_n15_focused_promotion,
+    load_profile_matrix,
 )
 
 
@@ -136,6 +139,30 @@ def test_release_matrix_uses_native_lists_in_fixed_category_and_episode_order(tm
     assert rows[-1].category == "pant_short"
     assert rows[-1].garment == "Pant_Short_Garment_11"
     assert all(row.seed == 42 for row in rows)
+
+
+def test_n15_focused_profile_uses_only_twelve_top_short_and_pant_long_release_garments(
+    tmp_path: Path,
+) -> None:
+    rows = load_profile_matrix(
+        _assets(tmp_path / "assets"), profile=N15_FOCUSED_PROFILE
+    )
+
+    assert len(rows) == 48
+    assert [row.category for row in rows[:24]] == ["top_short"] * 24
+    assert [row.category for row in rows[24:]] == ["pant_long"] * 24
+    assert len({row.garment for row in rows if row.category == "top_short"}) == 12
+    assert len({row.garment for row in rows if row.category == "pant_long"}) == 12
+    assert all(row.seed == 42 for row in rows)
+    assert [row.episode_index for row in rows[::2]] == [1] * 24
+    assert [row.episode_index for row in rows[1::2]] == [2] * 24
+
+
+def test_default_profile_preserves_the_existing_four_category_matrix(tmp_path: Path) -> None:
+    assets = _assets(tmp_path / "assets")
+    assert load_profile_matrix(assets, profile="default") == load_release_matrix(
+        assets, episodes_per_garment=2
+    )
 
 
 def test_smoke_matrix_is_exactly_two_top_long_seen_zero_episodes() -> None:
@@ -263,6 +290,188 @@ def test_compile_policy_result_requires_completion_order_count_and_videos(tmp_pa
     assert result["success_count"] == 0
     assert len(result["outcomes"]) == 96
     assert result["outcomes"][0]["garment"] == "Top_Long_Garment_00"
+
+
+def test_compile_policy_result_accepts_the_exact_n15_focused_matrix(tmp_path: Path) -> None:
+    matrix = load_profile_matrix(
+        _assets(tmp_path / "assets"), profile=N15_FOCUSED_PROFILE
+    )
+    logs = tmp_path / "logs"
+    videos = tmp_path / "videos"
+    logs.mkdir()
+    for category, directory in (("top_short", "Top_Short"), ("pant_long", "Pant_Long")):
+        garments = [f"{directory}_Garment_{index:02d}" for index in range(12)]
+        _write_log(logs / f"candidate-n15-{category}.log", garments, success=True)
+        success_root = videos / f"candidate-n15-{category}" / "success"
+        success_root.mkdir(parents=True)
+        for episode in (0, 1):
+            for camera in ("top_rgb", "left_rgb", "right_rgb"):
+                (success_root / f"episode{episode}_observation_images_{camera}.mp4").write_bytes(
+                    b"video"
+                )
+
+    result = compile_policy_result(
+        policy_id="candidate-n15", matrix=matrix, logs_root=logs, videos_root=videos
+    )
+
+    assert result["episode_count"] == 48
+    assert result["success_count"] == 48
+    assert result["fidelity_invalid_count"] == 0
+    assert result["infrastructure_invalid_count"] == 0
+
+
+def _focused_result(
+    policy_id: str, matrix: list[MatrixRow], *, top_short: int, pant_long: int
+) -> dict[str, object]:
+    remaining = {"top_short": top_short, "pant_long": pant_long}
+    outcomes = []
+    for row in matrix:
+        success = remaining[row.category] > 0
+        if success:
+            remaining[row.category] -= 1
+        outcomes.append(
+            {
+                "category": row.category,
+                "garment": row.garment,
+                "episode_index": row.episode_index,
+                "seed": row.seed,
+                "success": success,
+            }
+        )
+    return {
+        "policy_id": policy_id,
+        "status": "valid",
+        "episode_count": 48,
+        "success_count": top_short + pant_long,
+        "fidelity_invalid_count": 0,
+        "infrastructure_invalid_count": 0,
+        "outcomes": outcomes,
+    }
+
+
+def _focused_receipt(matrix: list[MatrixRow], *, candidate=(18, 13), reference=(20, 15)) -> dict[str, object]:
+    matrix_payload = [row.__dict__ for row in matrix]
+    return {
+        "schema_version": 1,
+        "kind": "lehome_official_policy_comparison_v1",
+        "status": "valid",
+        "mode": "full",
+        "profile": N15_FOCUSED_PROFILE,
+        "official_source": {"revision": SOURCE_REVISION, "tree_sha256": "1" * 64},
+        "canonical_assets": {"revision": ASSET_REVISION, "tree_sha256": "2" * 64},
+        "reviewed_runtime": {"revision": "3" * 40, "tree_sha256": "4" * 64},
+        "candidate_checkpoint": {"step": 12000, "tree_sha256": "5" * 64},
+        "reference_checkpoint": {"revision": "6" * 40, "tree_sha256": "7" * 64},
+        "metadata": {"tree_sha256": "8" * 64},
+        "scorer_sha256": "9" * 64,
+        "frozen_reference_matrix_sha256": "a" * 64,
+        "matrix_sha256": hashlib.sha256(
+            (json.dumps(matrix_payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        ).hexdigest(),
+        "matrix": matrix_payload,
+        "command_parity": {"verified": True},
+        "simulator_device": "cpu",
+        "policy_device": "cuda:0",
+        "seed": 42,
+        "max_steps": 600,
+        "episodes_per_garment": 2,
+        "results": [
+            _focused_result("candidate-n15", matrix, top_short=candidate[0], pant_long=candidate[1]),
+            _focused_result("reference-n15", matrix, top_short=reference[0], pant_long=reference[1]),
+        ],
+    }
+
+
+def _focused_publication(receipt_sha256: str) -> dict[str, object]:
+    return {
+        "kind": "lehome_official_policy_comparison_publication_v1",
+        "comparison_receipt_sha256": receipt_sha256,
+        "immutable_revision": "a" * 40,
+        "anonymous_file_set_verified": True,
+        "anonymous_byte_readback_verified": True,
+    }
+
+
+def test_n15_focused_promotion_requires_paired_thresholds_and_published_readback(tmp_path: Path) -> None:
+    matrix = load_profile_matrix(_assets(tmp_path / "assets"), profile=N15_FOCUSED_PROFILE)
+    receipt = _focused_receipt(matrix)
+    receipt_sha = hashlib.sha256(
+        (json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+    ).hexdigest()
+
+    decision = assess_n15_focused_promotion(
+        receipt, publication=_focused_publication(receipt_sha), receipt_sha256=receipt_sha
+    )
+
+    assert decision["status"] == "pass"
+    assert decision["category_scores"] == {
+        "top_short": {"candidate": 18, "reference": 20, "floor": 18, "maximum_deficit": 2},
+        "pant_long": {"candidate": 13, "reference": 15, "floor": 13, "maximum_deficit": 2},
+    }
+    assert decision["publication_readback_verified"] is True
+
+
+@pytest.mark.parametrize(
+    ("candidate", "reference", "message"),
+    [
+        ((17, 13), (19, 15), "top_short floor"),
+        ((18, 12), (20, 14), "pant_long floor"),
+        ((18, 13), (21, 15), "top_short deficit"),
+        ((18, 13), (20, 16), "pant_long deficit"),
+    ],
+)
+def test_n15_focused_promotion_rejects_each_score_gate(
+    tmp_path: Path, candidate: tuple[int, int], reference: tuple[int, int], message: str
+) -> None:
+    matrix = load_profile_matrix(_assets(tmp_path / "assets"), profile=N15_FOCUSED_PROFILE)
+    receipt = _focused_receipt(matrix, candidate=candidate, reference=reference)
+    receipt_sha = hashlib.sha256(
+        (json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+    ).hexdigest()
+    with pytest.raises(ComparisonError, match=message):
+        assess_n15_focused_promotion(
+            receipt, publication=_focused_publication(receipt_sha), receipt_sha256=receipt_sha
+        )
+
+
+def test_n15_focused_promotion_rejects_invalid_episode_provenance_or_missing_readback(tmp_path: Path) -> None:
+    matrix = load_profile_matrix(_assets(tmp_path / "assets"), profile=N15_FOCUSED_PROFILE)
+    receipt = _focused_receipt(matrix)
+    receipt_sha = hashlib.sha256(
+        (json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+    ).hexdigest()
+    receipt["results"][0]["outcomes"][0]["seed"] = 43
+    with pytest.raises(ComparisonError, match="provenance"):
+        assess_n15_focused_promotion(
+            receipt, publication=_focused_publication(receipt_sha), receipt_sha256=receipt_sha
+        )
+
+    receipt = _focused_receipt(matrix)
+    publication = _focused_publication(receipt_sha)
+    publication["anonymous_byte_readback_verified"] = False
+    with pytest.raises(ComparisonError, match="publication readback"):
+        assess_n15_focused_promotion(
+            receipt, publication=publication, receipt_sha256=receipt_sha
+        )
+
+
+def test_n15_focused_promotion_rejects_a_rehashed_nonpaired_matrix(tmp_path: Path) -> None:
+    matrix = load_profile_matrix(_assets(tmp_path / "assets"), profile=N15_FOCUSED_PROFILE)
+    receipt = _focused_receipt(matrix)
+    receipt["matrix"][0]["episode_index"] = 2
+    for result in receipt["results"]:
+        result["outcomes"][0]["episode_index"] = 2
+    receipt["matrix_sha256"] = hashlib.sha256(
+        (json.dumps(receipt["matrix"], sort_keys=True, separators=(",", ":")) + "\n").encode()
+    ).hexdigest()
+    receipt_sha = hashlib.sha256(
+        (json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+    ).hexdigest()
+
+    with pytest.raises(ComparisonError, match="matrix provenance"):
+        assess_n15_focused_promotion(
+            receipt, publication=_focused_publication(receipt_sha), receipt_sha256=receipt_sha
+        )
 
 
 def test_compile_policy_result_records_but_does_not_reject_stale_opposite_status_video(tmp_path: Path) -> None:
@@ -594,6 +803,37 @@ def test_publication_fresh_upload_includes_payload_and_all_seal_files(tmp_path: 
     assert set(hub.files) == expected
     assert hub.create_calls == 1
     assert json.loads(output.read_text(encoding="utf-8"))["recovered_existing_prefix"] is False
+
+
+def test_publication_accepts_valid_n15_focused_bundle_without_claiming_promotion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "focused"
+    root.mkdir()
+    receipt = root / "comparison-receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "kind": "lehome_official_policy_comparison_v1",
+                "status": "valid",
+                "mode": "full",
+                "profile": N15_FOCUSED_PROFILE,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / "payload.log").write_text("complete\n", encoding="utf-8")
+    seal_execution_bundle(root)
+    hub = _FakeHub()
+    monkeypatch.setitem(__import__("sys").modules, "huggingface_hub", hub.module(tmp_path))
+    monkeypatch.setenv("TEST_HF_TOKEN", "secret")
+
+    output = publish_comparison(_publication_args(receipt, tmp_path))
+
+    publication = json.loads(output.read_text(encoding="utf-8"))
+    assert publication["anonymous_byte_readback_verified"] is True
+    assert "promotion" not in publication
 
 
 def test_publication_recovers_exact_existing_prefix_after_commit_timeout(tmp_path: Path, monkeypatch) -> None:

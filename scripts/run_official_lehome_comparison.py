@@ -47,6 +47,11 @@ TASK_DESCRIPTION = "fold the garment on the table"
 SEED = 42
 MAX_STEPS = 600
 EPISODES_PER_GARMENT = 2
+DEFAULT_PROFILE = "default"
+N15_FOCUSED_PROFILE = "n15-focused"
+N15_FOCUSED_CATEGORIES = ("top_short", "pant_long")
+N15_FOCUSED_FLOORS = {"top_short": 18, "pant_long": 13}
+N15_FOCUSED_MAXIMUM_DEFICIT = 2
 CAMERAS = ("top_rgb", "left_rgb", "right_rgb")
 CATEGORY_DIRECTORIES = (
     ("top_long", "Top_Long"),
@@ -328,6 +333,52 @@ def validate_competitor_checkpoint(checkpoint_root: Path) -> dict[str, object]:
     }
 
 
+def validate_candidate_n15_checkpoint(
+    checkpoint_root: Path, identity_receipt: Path
+) -> dict[str, object]:
+    """Bind the native policy directory to Task 1's verified training receipt."""
+    root = Path(checkpoint_root)
+    if root.is_symlink() or not root.is_dir():
+        raise ComparisonError("candidate N1.5 checkpoint is unavailable or unsafe")
+    receipt = _load_json_object(identity_receipt, "candidate N1.5 identity receipt")
+    receipt_checkpoint = receipt.get("checkpoint_root")
+    files = receipt.get("checkpoint_files")
+    if (
+        receipt.get("kind") != "lehome_public_n15_verified_training_output_v1"
+        or receipt.get("step") != 12000
+        or not isinstance(receipt_checkpoint, str)
+        or Path(receipt_checkpoint).resolve(strict=True) / "pretrained_model" != root.resolve(strict=True)
+        or not isinstance(files, Mapping)
+        or not files
+    ):
+        raise ComparisonError("candidate N1.5 identity receipt is invalid")
+    prefix = "checkpoints/012000/pretrained_model/"
+    expected = {
+        str(relative)[len(prefix) :]: digest
+        for relative, digest in files.items()
+        if isinstance(relative, str) and relative.startswith(prefix)
+    }
+    observed_paths = [path for path in sorted(root.rglob("*")) if not path.is_dir()]
+    if (
+        not expected
+        or any(path.is_symlink() or not path.is_file() for path in observed_paths)
+        or {path.relative_to(root).as_posix() for path in observed_paths} != set(expected)
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
+            or _sha256_file(root / relative) != digest
+            for relative, digest in expected.items()
+        )
+    ):
+        raise ComparisonError("candidate N1.5 checkpoint file identity drift")
+    return {
+        "kind": receipt["kind"],
+        "step": 12000,
+        "identity_receipt_sha256": _sha256_file(identity_receipt),
+        "tree_sha256": _tree_sha256(root),
+        "file_count": len(expected),
+    }
+
+
 def validate_runtime_evidence(
     *,
     runtime_identity: Mapping[str, object],
@@ -464,6 +515,22 @@ def runtime_adapter_identities(runtime_root: Path) -> dict[str, str]:
         path = runtime_root / relative
         if path.is_symlink() or not path.is_file():
             raise ComparisonError(f"reviewed runtime adapter is unavailable: {relative}")
+        identities[relative] = _sha256_file(path)
+    return identities
+
+
+def focused_runtime_adapter_identities(runtime_root: Path) -> dict[str, str]:
+    relatives = (
+        "scripts/run_official_lehome_comparison.py",
+        "rollout_appliance/run_public_n15_focused_gate.sh",
+        "rollout_appliance/native_reference_site/sitecustomize.py",
+        "rollout_appliance/native_reference_site/checkpoint_compatibility.py",
+    )
+    identities: dict[str, str] = {}
+    for relative in relatives:
+        path = runtime_root / relative
+        if path.is_symlink() or not path.is_file():
+            raise ComparisonError(f"reviewed focused runtime adapter is unavailable: {relative}")
         identities[relative] = _sha256_file(path)
     return identities
 
@@ -747,6 +814,23 @@ def load_release_matrix(assets_root: Path, *, episodes_per_garment: int) -> list
     return rows
 
 
+def load_profile_matrix(assets_root: Path, *, profile: str = DEFAULT_PROFILE) -> list[MatrixRow]:
+    """Load a predeclared evaluator matrix without changing native list order."""
+    rows = load_release_matrix(assets_root, episodes_per_garment=EPISODES_PER_GARMENT)
+    if profile == DEFAULT_PROFILE:
+        return rows
+    if profile == N15_FOCUSED_PROFILE:
+        focused = [row for row in rows if row.category in N15_FOCUSED_CATEGORIES]
+        if (
+            len(focused) != 48
+            or [row.category for row in focused[:24]] != ["top_short"] * 24
+            or [row.category for row in focused[24:]] != ["pant_long"] * 24
+        ):
+            raise ComparisonError("N1.5 focused matrix category/order drift")
+        return focused
+    raise ComparisonError("unknown comparison profile")
+
+
 def smoke_matrix() -> list[MatrixRow]:
     return [MatrixRow("custom", "Top_Long_Seen_0", episode) for episode in (1, 2)]
 
@@ -910,6 +994,9 @@ def compile_policy_result(
     if len(matrix) == 96:
         categories = [category for category, _ in CATEGORY_DIRECTORIES]
         expected_per_category = 24
+    elif len(matrix) == 48 and tuple(dict.fromkeys(row.category for row in matrix)) == N15_FOCUSED_CATEGORIES:
+        categories = list(N15_FOCUSED_CATEGORIES)
+        expected_per_category = 24
     elif list(matrix) == smoke_matrix():
         categories = ["custom"]
         expected_per_category = 2
@@ -943,6 +1030,8 @@ def compile_policy_result(
         "status": "valid",
         "episode_count": len(outcomes),
         "success_count": sum(bool(row["success"]) for row in outcomes),
+        "fidelity_invalid_count": 0,
+        "infrastructure_invalid_count": 0,
         "outcomes": outcomes,
         "retained_official_videos": videos,
         "video_scope": "official filenames overwrite per garment; retained files represent only each category's final garment",
@@ -997,15 +1086,181 @@ def _command_parity(commands: Mapping[str, Sequence[str]]) -> dict[str, object]:
             index += 1
         normalized[key] = common
     category_digests: dict[str, str] = {}
-    categories = [category for category, _ in CATEGORY_DIRECTORIES]
-    if any(key.endswith("-custom") for key in normalized):
-        categories = ["custom"]
+    known_categories = [category for category, _ in CATEGORY_DIRECTORIES] + ["custom"]
+    categories = [
+        category
+        for category in known_categories
+        if any(key.endswith(f"-{category}") for key in normalized)
+    ]
+    if not categories:
+        raise ComparisonError("infrastructure_invalid: no comparison categories found")
     for category in categories:
         selected = [value for key, value in normalized.items() if key.endswith(f"-{category}")]
         if len(selected) != 2 or selected[0] != selected[1]:
             raise ComparisonError(f"infrastructure_invalid: command parity drift for {category}")
         category_digests[category] = _sha256_bytes(_canonical_bytes(selected[0]))
     return {"verified": True, "category_common_command_sha256": category_digests}
+
+
+def assess_n15_focused_promotion(
+    receipt: Mapping[str, object],
+    *,
+    publication: Mapping[str, object],
+    receipt_sha256: str,
+) -> dict[str, object]:
+    """Return pass only after the paired gate and anonymous publication readback hold."""
+    if (
+        receipt.get("kind") != "lehome_official_policy_comparison_v1"
+        or receipt.get("status") != "valid"
+        or receipt.get("mode") != "full"
+        or receipt.get("profile") != N15_FOCUSED_PROFILE
+    ):
+        raise ComparisonError("N1.5 focused receipt identity/status is invalid")
+    required_provenance = {
+        "official_source",
+        "canonical_assets",
+        "reviewed_runtime",
+        "candidate_checkpoint",
+        "reference_checkpoint",
+        "metadata",
+        "scorer_sha256",
+        "frozen_reference_matrix_sha256",
+        "matrix_sha256",
+        "command_parity",
+        "simulator_device",
+        "policy_device",
+        "seed",
+        "max_steps",
+        "episodes_per_garment",
+    }
+    if any(key not in receipt or receipt[key] in (None, "", {}, []) for key in required_provenance):
+        raise ComparisonError("N1.5 focused provenance is incomplete")
+    if (
+        receipt.get("simulator_device") != "cpu"
+        or receipt.get("policy_device") != "cuda:0"
+        or receipt.get("seed") != SEED
+        or receipt.get("max_steps") != MAX_STEPS
+        or receipt.get("episodes_per_garment") != EPISODES_PER_GARMENT
+        or not isinstance(receipt.get("command_parity"), Mapping)
+        or receipt["command_parity"].get("verified") is not True
+    ):
+        raise ComparisonError("N1.5 focused provenance contract drift")
+    matrix_payload = receipt.get("matrix")
+    if not isinstance(matrix_payload, list) or len(matrix_payload) != 48:
+        raise ComparisonError("N1.5 focused matrix provenance is incomplete")
+    try:
+        matrix = [
+            MatrixRow(
+                category=row["category"],
+                garment=row["garment"],
+                episode_index=row["episode_index"],
+                seed=row["seed"],
+            )
+            for row in matrix_payload
+            if isinstance(row, Mapping)
+        ]
+    except (KeyError, TypeError, ValueError):
+        raise ComparisonError("N1.5 focused matrix provenance is invalid") from None
+    if (
+        len(matrix) != 48
+        or tuple(dict.fromkeys(row.category for row in matrix)) != N15_FOCUSED_CATEGORIES
+        or any(row.seed != SEED for row in matrix)
+        or receipt.get("matrix_sha256") != _sha256_bytes(_canonical_bytes(matrix_payload))
+    ):
+        raise ComparisonError("N1.5 focused matrix provenance drift")
+    for category in N15_FOCUSED_CATEGORIES:
+        category_rows = [row for row in matrix if row.category == category]
+        garments = list(dict.fromkeys(row.garment for row in category_rows))
+        if (
+            len(category_rows) != 24
+            or len(garments) != 12
+            or any(
+                [row.episode_index for row in category_rows if row.garment == garment] != [1, 2]
+                for garment in garments
+            )
+        ):
+            raise ComparisonError("N1.5 focused matrix provenance is not twelve paired garments per category")
+    expected_provenance = [
+        (row.category, row.garment, row.episode_index, row.seed) for row in matrix
+    ]
+    results = receipt.get("results")
+    if (
+        not isinstance(results, list)
+        or len(results) != 2
+        or [row.get("policy_id") for row in results if isinstance(row, Mapping)]
+        != ["candidate-n15", "reference-n15"]
+    ):
+        raise ComparisonError("N1.5 focused paired policy provenance is invalid")
+    by_policy: dict[str, Mapping[str, object]] = {}
+    for result in results:
+        if not isinstance(result, Mapping):
+            raise ComparisonError("N1.5 focused result provenance is invalid")
+        outcomes = result.get("outcomes")
+        if (
+            result.get("status") != "valid"
+            or result.get("episode_count") != 48
+            or result.get("fidelity_invalid_count") != 0
+            or result.get("infrastructure_invalid_count") != 0
+            or not isinstance(outcomes, list)
+            or len(outcomes) != 48
+        ):
+            raise ComparisonError("N1.5 focused fidelity or infrastructure gate failed")
+        observed = [
+            (row.get("category"), row.get("garment"), row.get("episode_index"), row.get("seed"))
+            for row in outcomes
+            if isinstance(row, Mapping)
+        ]
+        if observed != expected_provenance or any(
+            type(row.get("success")) is not bool for row in outcomes if isinstance(row, Mapping)
+        ):
+            raise ComparisonError("N1.5 focused episode provenance drift")
+        by_policy[str(result["policy_id"])] = result
+
+    category_scores: dict[str, dict[str, int]] = {}
+    for category in N15_FOCUSED_CATEGORIES:
+        candidate = sum(
+            bool(row["success"])
+            for row in by_policy["candidate-n15"]["outcomes"]
+            if row["category"] == category
+        )
+        reference = sum(
+            bool(row["success"])
+            for row in by_policy["reference-n15"]["outcomes"]
+            if row["category"] == category
+        )
+        floor = N15_FOCUSED_FLOORS[category]
+        if candidate < floor:
+            raise ComparisonError(f"{category} floor failed: {candidate}/24 < {floor}/24")
+        if reference - candidate > N15_FOCUSED_MAXIMUM_DEFICIT:
+            raise ComparisonError(
+                f"{category} deficit failed: candidate is {reference - candidate} behind reference"
+            )
+        category_scores[category] = {
+            "candidate": candidate,
+            "reference": reference,
+            "floor": floor,
+            "maximum_deficit": N15_FOCUSED_MAXIMUM_DEFICIT,
+        }
+
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None
+        or publication.get("kind") != "lehome_official_policy_comparison_publication_v1"
+        or publication.get("comparison_receipt_sha256") != receipt_sha256
+        or _HEX40.fullmatch(str(publication.get("immutable_revision"))) is None
+        or publication.get("anonymous_file_set_verified") is not True
+        or publication.get("anonymous_byte_readback_verified") is not True
+    ):
+        raise ComparisonError("N1.5 focused publication readback is missing or invalid")
+    return {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_focused_promotion_v1",
+        "status": "pass",
+        "profile": N15_FOCUSED_PROFILE,
+        "comparison_receipt_sha256": receipt_sha256,
+        "publication_immutable_revision": publication["immutable_revision"],
+        "publication_readback_verified": True,
+        "category_scores": category_scores,
+    }
 
 
 def _execution_env(
@@ -1053,6 +1308,245 @@ def _execution_env(
         python_path.insert(0, str(PEFT_WHEEL_PATH))
         env["PYTHONPATH"] = os.pathsep.join(python_path)
     return env
+
+
+def _validate_focused_cuda_receipt(receipt: Mapping[str, object]) -> dict[str, object]:
+    if (
+        set(receipt) != {"cuda_available", "cuda_device_count", "cuda_runtime", "cuda_device_name"}
+        or receipt.get("cuda_available") is not True
+        or type(receipt.get("cuda_device_count")) is not int
+        or receipt["cuda_device_count"] < 1
+        or not isinstance(receipt.get("cuda_runtime"), str)
+        or not receipt["cuda_runtime"]
+        or not isinstance(receipt.get("cuda_device_name"), str)
+        or not receipt["cuda_device_name"]
+    ):
+        raise ComparisonError("focused N1.5 CUDA receipt is invalid")
+    return dict(receipt)
+
+
+def _validate_focused_rollout_image(receipt: Mapping[str, object]) -> dict[str, object]:
+    if (
+        receipt.get("kind") != "lehome_official_image_inspection_v1"
+        or receipt.get("reference") != ROLLOUT_IMAGE_ID
+        or receipt.get("image_id") != ROLLOUT_IMAGE_ID
+        or re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("docker_inspect_sha256"))) is None
+    ):
+        raise ComparisonError("focused N1.5 rollout image receipt is invalid")
+    return dict(receipt)
+
+
+def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
+    """Execute two native N1.5 policies sequentially on the focused matrix."""
+    source_root = args.source_root.resolve(strict=True)
+    canonical_assets_root = args.canonical_assets_root.resolve(strict=True)
+    output_root = args.output_root
+    if output_root.exists() or output_root.is_symlink():
+        raise ComparisonError("output root must be a new path")
+    output_root.mkdir(parents=True, mode=0o700)
+    args._official_output_created = True
+    status_path = output_root / "status.json"
+    source_before = checkout_identity(
+        source_root, SOURCE_REVISION, label="official source", exclude_assets_mount=True
+    )
+    assets_before = checkout_identity(
+        canonical_assets_root, ASSET_REVISION, label="canonical assets"
+    )
+    validate_evaluation_assets(canonical_assets_root, canonical_assets_root, mode="full")
+    runtime_root = args.runtime_root.resolve(strict=True)
+    runtime_before = {"revision": args.runtime_revision, "tree_sha256": _tree_sha256(runtime_root)}
+    if _load_json_object(args.runtime_identity_receipt, "runtime identity receipt") != runtime_before:
+        raise ComparisonError("reviewed runtime identity receipt mismatch")
+    adapters_before = focused_runtime_adapter_identities(runtime_root)
+    candidate_before = validate_candidate_n15_checkpoint(
+        args.candidate_checkpoint, args.candidate_identity_receipt
+    )
+    reference_before = validate_competitor_checkpoint(args.reference_checkpoint)
+    metadata_before = metadata_identities(args.metadata_root)
+    native_runtime_before = validate_competitor_runtime_evidence(args.native_runtime_evidence_root)
+    rollout_image_before = _validate_focused_rollout_image(
+        _load_json_object(args.rollout_image_receipt, "rollout image receipt")
+    )
+    cuda_before = _validate_focused_cuda_receipt(
+        _load_json_object(args.cuda_receipt, "CUDA receipt")
+    )
+    scorer = source_root / "source/lehome/lehome/utils/success_checker_chanllege.py"
+    if scorer.is_symlink() or not scorer.is_file():
+        raise ComparisonError("official scorer is unavailable")
+    full_matrix = load_profile_matrix(canonical_assets_root, profile=DEFAULT_PROFILE)
+    frozen_reference_matrix_sha = validate_reference_matrix(
+        args.reference_matrix, args.reference_matrix_sha256, full_matrix
+    )
+    matrix = load_profile_matrix(canonical_assets_root, profile=N15_FOCUSED_PROFILE)
+    matrix_payload = [asdict(row) for row in matrix]
+    matrix_sha = _sha256_bytes(_canonical_bytes(matrix_payload))
+    policies = (
+        PolicyDefinition("candidate-n15", "lerobot", checkpoint_root=args.candidate_checkpoint),
+        PolicyDefinition("reference-n15", "lerobot", checkpoint_root=args.reference_checkpoint),
+    )
+    policy_views = {
+        "candidate-n15": (args.candidate_sanitized_config_root, args.candidate_compatibility_receipt),
+        "reference-n15": (args.reference_sanitized_config_root, args.reference_compatibility_receipt),
+    }
+    evidence_sources: dict[str, Path] = {
+        "runtime-identity.json": args.runtime_identity_receipt,
+        "rollout-image.json": args.rollout_image_receipt,
+        "cuda-runtime.json": args.cuda_receipt,
+        "candidate-checkpoint-identity.json": args.candidate_identity_receipt,
+        "candidate-checkpoint-compatibility.json": args.candidate_compatibility_receipt,
+        "reference-checkpoint-compatibility.json": args.reference_compatibility_receipt,
+        "reference-matrix.json": args.reference_matrix,
+        "reference-matrix.sha256": args.reference_matrix_sha256,
+    }
+    native_evidence_root = args.native_runtime_evidence_root.resolve(strict=True)
+    for path in sorted(native_evidence_root.iterdir()):
+        evidence_sources[f"native-runtime/{path.name}"] = path
+    evidence_archive: dict[str, dict[str, object]] = {}
+    for relative, source in evidence_sources.items():
+        descriptor = _copy_immutable_file(source, output_root / "evidence" / relative)
+        descriptor["path"] = (output_root / "evidence" / relative).relative_to(output_root).as_posix()
+        evidence_archive[relative] = descriptor
+    commands: dict[str, list[str]] = {}
+    try:
+        # Tuple order is contractual: candidate finishes before the reference starts.
+        for policy in policies:
+            sanitized_root, compatibility_receipt = policy_views[policy.policy_id]
+            for category in N15_FOCUSED_CATEGORIES:
+                command_id = f"{policy.policy_id}-{category}"
+                video_dir = output_root / "videos" / command_id
+                video_dir.mkdir(parents=True)
+                command = build_eval_command(
+                    policy,
+                    source_root=source_root,
+                    assets_root=canonical_assets_root,
+                    dataset_root=args.metadata_root,
+                    video_dir=video_dir,
+                    garment_type=category,
+                    python_bin=args.python_bin,
+                )
+                commands[command_id] = command
+                log = output_root / "logs" / f"{command_id}.log"
+                log.parent.mkdir(parents=True, exist_ok=True)
+                runtime_log = output_root / "official-runtime" / command_id
+                runtime_log.mkdir(parents=True)
+                env = _execution_env(
+                    source_root=source_root,
+                    log_root=runtime_log,
+                    isaaclab_root=args.isaaclab_root,
+                    isaaclab_tasks_root=args.isaaclab_tasks_root,
+                    native_site_root=args.native_site_root,
+                    policy=policy,
+                    sanitized_config_root=sanitized_root,
+                    compatibility_receipt=compatibility_receipt,
+                )
+                with log.open("xb") as stream:
+                    result = subprocess.run(
+                        command,
+                        cwd=source_root,
+                        env=env,
+                        stdout=stream,
+                        stderr=subprocess.STDOUT,
+                        check=False,
+                    )
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if result.returncode != 0:
+                    raise ComparisonError(
+                        f"infrastructure_invalid: {command_id} exited {result.returncode}"
+                    )
+        parity = _command_parity(commands)
+        results = [
+            compile_policy_result(
+                policy_id=policy.policy_id,
+                matrix=matrix,
+                logs_root=output_root / "logs",
+                videos_root=output_root / "videos",
+                video_probe=_ffprobe_video,
+            )
+            for policy in policies
+        ]
+        source_after = checkout_identity(
+            source_root, SOURCE_REVISION, label="official source", exclude_assets_mount=True
+        )
+        assets_after = checkout_identity(
+            canonical_assets_root, ASSET_REVISION, label="canonical assets"
+        )
+        runtime_after = {"revision": args.runtime_revision, "tree_sha256": _tree_sha256(runtime_root)}
+        if (
+            source_after != source_before
+            or assets_after != assets_before
+            or runtime_after != runtime_before
+            or focused_runtime_adapter_identities(runtime_root) != adapters_before
+            or validate_candidate_n15_checkpoint(
+                args.candidate_checkpoint, args.candidate_identity_receipt
+            )
+            != candidate_before
+            or validate_competitor_checkpoint(args.reference_checkpoint) != reference_before
+            or metadata_identities(args.metadata_root) != metadata_before
+            or validate_competitor_runtime_evidence(args.native_runtime_evidence_root)
+            != native_runtime_before
+            or _validate_focused_rollout_image(
+                _load_json_object(args.rollout_image_receipt, "rollout image receipt")
+            )
+            != rollout_image_before
+            or _validate_focused_cuda_receipt(
+                _load_json_object(args.cuda_receipt, "CUDA receipt")
+            )
+            != cuda_before
+        ):
+            raise ComparisonError("infrastructure_invalid: focused immutable identity changed")
+        receipt = {
+            "schema_version": 1,
+            "kind": "lehome_official_policy_comparison_v1",
+            "status": "valid",
+            "mode": "full",
+            "profile": N15_FOCUSED_PROFILE,
+            "created_at_utc": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "official_source": {
+                "repository": SOURCE_REPOSITORY,
+                "revision": SOURCE_REVISION,
+                **source_before,
+            },
+            "canonical_assets": {
+                "repository": ASSET_REPOSITORY,
+                "revision": ASSET_REVISION,
+                **assets_before,
+            },
+            "reviewed_runtime": {**runtime_before, "adapter_sha256": adapters_before},
+            "rollout_image": rollout_image_before,
+            "cuda": cuda_before,
+            "native_runtime_evidence": native_runtime_before,
+            "candidate_checkpoint": candidate_before,
+            "reference_checkpoint": reference_before,
+            "metadata": metadata_before,
+            "scorer_sha256": _sha256_file(scorer),
+            "frozen_reference_matrix_sha256": frozen_reference_matrix_sha,
+            "evidence_archive": evidence_archive,
+            "simulator_device": "cpu",
+            "policy_device": "cuda:0",
+            "seed": SEED,
+            "max_steps": MAX_STEPS,
+            "episodes_per_garment": EPISODES_PER_GARMENT,
+            "matrix_sha256": matrix_sha,
+            "matrix": matrix_payload,
+            "commands": commands,
+            "command_parity": parity,
+            "results": results,
+            "publication": "not_performed; publication/readback is required before promotion",
+        }
+        receipt_path = output_root / "comparison-receipt.json"
+        _write_immutable(receipt_path, receipt)
+        seal_execution_bundle(output_root)
+        return receipt_path
+    except Exception as error:
+        _write_immutable(
+            status_path,
+            {"status": "infrastructure_invalid", "error_type": type(error).__name__, "error": str(error)},
+        )
+        raise
 
 
 def execute_comparison(args: argparse.Namespace) -> Path:
@@ -1409,6 +1903,18 @@ def publish_comparison(args: argparse.Namespace) -> Path:
     return output
 
 
+def verify_n15_focused_promotion(args: argparse.Namespace) -> Path:
+    receipt = _load_json_object(args.receipt, "focused comparison receipt")
+    publication = _load_json_object(args.publication_receipt, "focused publication receipt")
+    decision = assess_n15_focused_promotion(
+        receipt,
+        publication=publication,
+        receipt_sha256=_sha256_file(args.receipt),
+    )
+    _write_immutable(args.promotion_receipt, decision)
+    return args.promotion_receipt
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1441,6 +1947,31 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--isaaclab-tasks-root", type=Path, required=True)
     run.add_argument("--docker-url", default="http://127.0.0.1:8080")
     run.add_argument("--python-bin", default=sys.executable)
+    focused = commands.add_parser("run-n15-focused")
+    focused.add_argument("--profile", choices=(N15_FOCUSED_PROFILE,), required=True)
+    focused.add_argument("--source-root", type=Path, required=True)
+    focused.add_argument("--canonical-assets-root", type=Path, required=True)
+    focused.add_argument("--metadata-root", type=Path, required=True)
+    focused.add_argument("--output-root", type=Path, required=True)
+    focused.add_argument("--candidate-checkpoint", type=Path, required=True)
+    focused.add_argument("--candidate-identity-receipt", type=Path, required=True)
+    focused.add_argument("--candidate-sanitized-config-root", type=Path, required=True)
+    focused.add_argument("--candidate-compatibility-receipt", type=Path, required=True)
+    focused.add_argument("--reference-checkpoint", type=Path, required=True)
+    focused.add_argument("--reference-sanitized-config-root", type=Path, required=True)
+    focused.add_argument("--reference-compatibility-receipt", type=Path, required=True)
+    focused.add_argument("--reference-matrix", type=Path, required=True)
+    focused.add_argument("--reference-matrix-sha256", type=Path, required=True)
+    focused.add_argument("--native-site-root", type=Path, required=True)
+    focused.add_argument("--native-runtime-evidence-root", type=Path, required=True)
+    focused.add_argument("--runtime-root", type=Path, required=True)
+    focused.add_argument("--runtime-revision", required=True)
+    focused.add_argument("--runtime-identity-receipt", type=Path, required=True)
+    focused.add_argument("--rollout-image-receipt", type=Path, required=True)
+    focused.add_argument("--cuda-receipt", type=Path, required=True)
+    focused.add_argument("--isaaclab-root", type=Path, required=True)
+    focused.add_argument("--isaaclab-tasks-root", type=Path, required=True)
+    focused.add_argument("--python-bin", default=sys.executable)
     publish = commands.add_parser("publish")
     publish.add_argument("--receipt", type=Path, required=True)
     publish.add_argument("--repository", required=True)
@@ -1448,15 +1979,26 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--revision", default="main")
     publish.add_argument("--token-env", default="HF_TOKEN")
     publish.add_argument("--publication-receipt", type=Path, required=True)
+    verify = commands.add_parser("verify-n15-focused")
+    verify.add_argument("--receipt", type=Path, required=True)
+    verify.add_argument("--publication-receipt", type=Path, required=True)
+    verify.add_argument("--promotion-receipt", type=Path, required=True)
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        output = execute_comparison(args) if args.command == "run" else publish_comparison(args)
+        if args.command == "run":
+            output = execute_comparison(args)
+        elif args.command == "run-n15-focused":
+            output = execute_n15_focused_comparison(args)
+        elif args.command == "publish":
+            output = publish_comparison(args)
+        else:
+            output = verify_n15_focused_promotion(args)
     except (ComparisonError, OSError, subprocess.SubprocessError) as error:
-        if args.command == "run" and getattr(args, "_official_output_created", False):
+        if args.command in {"run", "run-n15-focused"} and getattr(args, "_official_output_created", False):
             status_path = args.output_root / "status.json"
             if not status_path.exists():
                 _write_immutable(
