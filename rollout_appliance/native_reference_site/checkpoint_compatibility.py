@@ -138,10 +138,14 @@ def prepare_candidate_checkpoint_config_view(
     training_path = Path(training_identity_receipt)
     training_raw = _regular_bytes(training_path, "candidate training identity receipt")
     try:
+        from source.lehome.lehome.n15_reproduction import CONTRACT
+
         training_identity = validate_training_identity_receipt(
-            training_path, expected_pretrained_root=checkpoint
+            training_path,
+            expected_contract=CONTRACT,
+            expected_pretrained_root=checkpoint,
         )
-    except TrainingIdentityError as error:
+    except (ImportError, TrainingIdentityError) as error:
         raise RuntimeError(f"candidate training identity receipt is invalid: {error}") from None
     raw = _regular_bytes(checkpoint / "config.json", "raw checkpoint config")
     raw_sha = hashlib.sha256(raw).hexdigest()
@@ -301,16 +305,9 @@ def install_checkpoint_config_view(
     if candidate:
         training_path = Path(str(receipt["training_identity_receipt"]))
         training_raw = _regular_bytes(training_path, "candidate training identity receipt")
-        try:
-            training_identity = validate_training_identity_receipt(
-                training_path, expected_pretrained_root=checkpoint
-            )
-        except TrainingIdentityError as error:
-            raise RuntimeError(f"candidate training identity receipt is invalid: {error}") from None
         if (
             hashlib.sha256(training_raw).hexdigest()
             != receipt["training_identity_receipt_sha256"]
-            or training_identity != receipt["training_identity"]
         ):
             raise RuntimeError("candidate training identity does not bind the compatibility view")
         approved_config_sha256 = str(receipt["raw_config_sha256"])

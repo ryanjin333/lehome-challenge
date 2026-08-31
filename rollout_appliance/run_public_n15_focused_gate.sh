@@ -58,7 +58,11 @@ CANDIDATE_TRAINING_ROOT="$(PYTHONPATH="$REPO_ROOT" python3 - "$CANDIDATE_IDENTIT
 import sys
 from pathlib import Path
 from rollout_appliance.native_reference_site.training_identity import validate_training_identity_receipt
-value = validate_training_identity_receipt(Path(sys.argv[1]), expected_pretrained_root=Path(sys.argv[2]))
+from source.lehome.lehome.n15_reproduction import CONTRACT
+value = validate_training_identity_receipt(
+    Path(sys.argv[1]), expected_contract=CONTRACT,
+    expected_pretrained_root=Path(sys.argv[2]),
+)
 print(value["training_root"])
 PY
 )"

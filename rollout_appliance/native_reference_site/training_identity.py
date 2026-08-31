@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import stat
+import subprocess
 from typing import Mapping
+import zipfile
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -37,6 +41,28 @@ _REQUIRED_PRETRAINED = {
 
 class TrainingIdentityError(RuntimeError):
     """The Task 1 receipt or the artifact tree it authenticates is invalid."""
+
+
+def contract_identity(contract: object) -> dict[str, object]:
+    """Return the exact manifest form used by Task 1's execution receipt."""
+    if isinstance(contract, Mapping):
+        return dict(contract)
+    keys = (
+        "source_repository", "source_revision", "source_tree", "dependency_lock_sha256",
+        "lerobot_wheel_sha256", "lerobot_package_file_count", "lerobot_package_tree_sha256",
+        "base_model_metadata_count", "base_model_metadata_sha256", "dataset_metadata_count",
+        "dataset_metadata_sha256", "base_model_repository", "base_model_revision",
+        "dataset_repository", "dataset_revision", "trusted_source_files", "vm_id", "disk_id",
+        "python_version", "lerobot_version", "training_command", "training",
+    )
+    try:
+        value = {key: getattr(contract, key) for key in keys}
+    except AttributeError:
+        raise TrainingIdentityError("Task 1 contract is incomplete") from None
+    value["trusted_source_files"] = dict(value["trusted_source_files"])
+    value["training_command"] = list(value["training_command"])
+    value["training"] = dict(value["training"])
+    return value
 
 
 def _canonical(value: object) -> bytes:
@@ -89,8 +115,106 @@ def _manifest(path: Path) -> dict[str, str]:
     return entries
 
 
+def _json(path: Path, label: str) -> dict[str, object]:
+    raw = _regular(path, label).read_bytes()
+    try:
+        value = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError):
+        raise TrainingIdentityError(f"{label} is invalid JSON") from None
+    if not isinstance(value, dict) or raw != _canonical(value):
+        raise TrainingIdentityError(f"{label} is not canonical JSON")
+    return value
+
+
+def _tree_identity(files: Mapping[str, bytes]) -> tuple[int, str]:
+    payload = b"".join(
+        relative.encode("utf-8")
+        + b"\0"
+        + hashlib.sha256(content).hexdigest().encode("ascii")
+        + b"\n"
+        for relative, content in sorted(files.items())
+    )
+    return len(files), hashlib.sha256(payload).hexdigest()
+
+
+def _wheel_identity(payload: bytes) -> tuple[int, str, str]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            files: dict[str, bytes] = {}
+            for info in archive.infolist():
+                if info.is_dir() or not info.filename.startswith("lerobot/"):
+                    continue
+                relative = info.filename.removeprefix("lerobot/")
+                pure = PurePosixPath(relative)
+                file_type = (info.external_attr >> 16) & 0o170000
+                if (
+                    not relative or pure.is_absolute()
+                    or any(part in {"", ".", ".."} for part in pure.parts)
+                    or relative in files or file_type == stat.S_IFLNK
+                ):
+                    raise TrainingIdentityError("LeRobot wheel package entry is unsafe")
+                files[relative] = archive.read(info)
+            metadata = archive.read("lerobot-0.4.3.dist-info/METADATA").decode("utf-8")
+    except (OSError, UnicodeError, zipfile.BadZipFile, KeyError):
+        raise TrainingIdentityError("LeRobot wheel is invalid") from None
+    if not files:
+        raise TrainingIdentityError("LeRobot wheel contains no package tree")
+    count, tree = _tree_identity(files)
+    return count, tree, metadata
+
+
+def _installed_tree(root: Path) -> tuple[int, str]:
+    package = _directory(root, "installed LeRobot package root")
+    files: dict[str, bytes] = {}
+    for path in sorted(package.rglob("*")):
+        relative = path.relative_to(package).as_posix()
+        metadata = path.lstat()
+        if path.is_symlink():
+            raise TrainingIdentityError("installed LeRobot tree contains an unsafe symlink")
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise TrainingIdentityError("installed LeRobot tree contains an unsafe entry")
+        if "__pycache__" in path.parts or path.suffix == ".pyc":
+            continue
+        files[relative] = path.read_bytes()
+    if not files:
+        raise TrainingIdentityError("installed LeRobot package tree is empty")
+    return _tree_identity(files)
+
+
+def _hub_metadata_identity(rows: object) -> tuple[int, str]:
+    if not isinstance(rows, list) or not rows:
+        raise TrainingIdentityError("Hub sibling metadata is empty or invalid")
+    validated: list[dict[str, object]] = []
+    paths: set[str] = set()
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"path", "blob_id", "size", "lfs_sha256"}
+            or not isinstance(row.get("path"), str)
+            or PurePosixPath(row["path"]).is_absolute()
+            or any(part in {"", ".", ".."} for part in PurePosixPath(row["path"]).parts)
+            or row["path"] in paths
+            or re.fullmatch(r"[0-9a-f]{40}", str(row.get("blob_id"))) is None
+            or type(row.get("size")) is not int or row["size"] < 0
+            or (row.get("lfs_sha256") is not None and _SHA256.fullmatch(str(row["lfs_sha256"])) is None)
+        ):
+            raise TrainingIdentityError("Hub sibling metadata is invalid")
+        paths.add(row["path"])
+        validated.append(row)
+    payload = "".join(
+        f"{row['path']}\t{row['blob_id']}\t{row['size']}\t{row['lfs_sha256'] or ''}\n"
+        for row in sorted(validated, key=lambda value: str(value["path"]))
+    ).encode("utf-8")
+    return len(validated), hashlib.sha256(payload).hexdigest()
+
+
 def validate_training_identity_receipt(
-    receipt_path: Path, *, expected_pretrained_root: Path | None = None
+    receipt_path: Path,
+    *,
+    expected_contract: object,
+    expected_pretrained_root: Path | None = None,
 ) -> dict[str, object]:
     """Validate the complete Task 1 schema and its checksum-manifest contract."""
     receipt_file = _regular(Path(receipt_path), "candidate training identity receipt")
@@ -189,6 +313,189 @@ def validate_training_identity_receipt(
     }
     if any(checksums.get(relative) != receipt[key] for key, relative in cross_receipt.items()):
         raise TrainingIdentityError("candidate source evidence cross-receipt mismatch")
+
+    contract = contract_identity(expected_contract)
+    required_contract_keys = {
+        "source_repository", "source_revision", "source_tree", "dependency_lock_sha256",
+        "lerobot_wheel_sha256", "lerobot_package_file_count", "lerobot_package_tree_sha256",
+        "base_model_metadata_count", "base_model_metadata_sha256", "dataset_metadata_count",
+        "dataset_metadata_sha256", "base_model_repository", "base_model_revision",
+        "dataset_repository", "dataset_revision", "trusted_source_files", "vm_id", "disk_id",
+        "python_version", "lerobot_version", "training_command", "training",
+    }
+    if set(contract) != required_contract_keys:
+        raise TrainingIdentityError("Task 1 contract schema mismatch")
+    try:
+        train_config = json.loads((pretrained_root / "train_config.json").read_text(encoding="utf-8"))
+        policy_config = json.loads((pretrained_root / "config.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise TrainingIdentityError("upstream checkpoint configuration is invalid") from None
+    if (
+        not isinstance(train_config, dict)
+        or train_config.get("steps") != int(contract["training"]["steps"])
+        or train_config.get("batch_size") != int(contract["training"]["batch_size"])
+        or not isinstance(policy_config, dict) or policy_config.get("type") != "groot"
+    ):
+        raise TrainingIdentityError("upstream checkpoint configuration does not prove the recipe")
+    training_state = _directory(checkpoint_root / "training_state", "upstream training state")
+    required_state = {
+        "optimizer_param_groups.json", "optimizer_state.safetensors", "rng_state.safetensors",
+        "scheduler_state.json", "training_step.json",
+    }
+    state_names = {
+        path.name for path in training_state.iterdir() if path.is_file() and not path.is_symlink()
+    }
+    if not required_state.issubset(state_names):
+        raise TrainingIdentityError("upstream training-state structure is incomplete")
+    step_receipt = _json(training_state / "training_step.json", "training-step evidence")
+    if set(step_receipt) != {"step"} or step_receipt.get("step") != 12000:
+        raise TrainingIdentityError("training-step evidence does not prove step 12000")
+
+    source_copy = _regular(training_root / "evidence/source-receipt.json", "training source receipt")
+    snapshots_copy = _regular(
+        training_root / "evidence/resolved-snapshots-receipt.json",
+        "training resolved-snapshot receipt",
+    )
+    if (
+        _sha256_file(source_copy) != receipt["source_receipt_sha256"]
+        or _sha256_file(snapshots_copy) != receipt["resolved_snapshots_receipt_sha256"]
+    ):
+        raise TrainingIdentityError("training source evidence receipt mismatch")
+    source_evidence = _json(source_copy, "training source receipt")
+    if (
+        set(source_evidence) != {"schema_version", "kind", "repository", "revision", "tree", "files"}
+        or source_evidence.get("schema_version") != 1
+        or source_evidence.get("kind") != "lehome_public_n15_source_v1"
+        or source_evidence.get("repository") != contract["source_repository"]
+        or source_evidence.get("revision") != contract["source_revision"]
+        or source_evidence.get("tree") != contract["source_tree"]
+        or source_evidence.get("files") != contract["trusted_source_files"]
+    ):
+        raise TrainingIdentityError("training source evidence identity mismatch")
+    snapshots_evidence = _json(snapshots_copy, "training resolved-snapshot receipt")
+    if (
+        set(snapshots_evidence) != {"schema_version", "kind", "base_model", "dataset", "vm_id", "disk_id"}
+        or snapshots_evidence.get("schema_version") != 1
+        or snapshots_evidence.get("kind") != "lehome_public_n15_resolved_snapshots_v1"
+        or snapshots_evidence.get("vm_id") != contract["vm_id"]
+        or snapshots_evidence.get("disk_id") != contract["disk_id"]
+    ):
+        raise TrainingIdentityError("training resolved-snapshot identity mismatch")
+    for label, repository_key, revision_key, count_key, digest_key in (
+        ("base_model", "base_model_repository", "base_model_revision", "base_model_metadata_count", "base_model_metadata_sha256"),
+        ("dataset", "dataset_repository", "dataset_revision", "dataset_metadata_count", "dataset_metadata_sha256"),
+    ):
+        snapshot = snapshots_evidence.get(label)
+        expected_keys = {"repository", "revision", "root", "siblings"} | (
+            {"snapshot_root"} if label == "dataset" else set()
+        )
+        if (
+            not isinstance(snapshot, Mapping) or set(snapshot) != expected_keys
+            or snapshot.get("repository") != contract[repository_key]
+            or snapshot.get("revision") != contract[revision_key]
+            or not isinstance(snapshot.get("root"), str) or not Path(snapshot["root"]).is_absolute()
+            or (label == "dataset" and (not isinstance(snapshot.get("snapshot_root"), str) or not Path(snapshot["snapshot_root"]).is_absolute()))
+            or _hub_metadata_identity(snapshot.get("siblings"))
+            != (contract[count_key], contract[digest_key])
+        ):
+            raise TrainingIdentityError(f"training {label} snapshot evidence mismatch")
+    execution = _json(
+        training_root / "evidence/execution-manifest.json", "training execution manifest"
+    )
+    if set(execution) != {"schema_version", "kind", "contract", "inputs", "execution"}:
+        raise TrainingIdentityError("training execution manifest schema mismatch")
+    inputs = execution.get("inputs")
+    command = execution.get("execution")
+    input_keys = {
+        "base_model_root", "hub_cache_root", "dataset_root", "source_receipt",
+        "source_receipt_sha256", "source_tree", "resolved_snapshots_receipt",
+        "resolved_snapshots_receipt_sha256", "base_model_metadata_sha256",
+        "dataset_metadata_sha256",
+    }
+    if (
+        execution.get("schema_version") != 1
+        or execution.get("kind") != "lehome_public_n15_training_execution_v1"
+        or execution.get("contract") != contract
+        or not isinstance(inputs, Mapping) or set(inputs) != input_keys
+        or inputs.get("source_receipt_sha256") != receipt["source_receipt_sha256"]
+        or inputs.get("resolved_snapshots_receipt_sha256")
+        != receipt["resolved_snapshots_receipt_sha256"]
+        or inputs.get("source_tree") != contract["source_tree"]
+        or inputs.get("base_model_metadata_sha256") != contract["base_model_metadata_sha256"]
+        or inputs.get("dataset_metadata_sha256") != contract["dataset_metadata_sha256"]
+        or any(not isinstance(inputs.get(key), str) or not Path(inputs[key]).is_absolute()
+               for key in ("base_model_root", "hub_cache_root", "dataset_root", "source_receipt", "resolved_snapshots_receipt"))
+        or not isinstance(command, Mapping)
+        or set(command) != {"cwd", "argv", "shell_argv", "env"}
+        or not isinstance(command.get("cwd"), str) or not Path(command["cwd"]).is_absolute()
+        or command.get("argv") != contract["training_command"]
+        or command.get("shell_argv") != shlex.join(contract["training_command"])
+        or command.get("env") != {"HF_HUB_CACHE": inputs["hub_cache_root"], "HF_HUB_OFFLINE": "1"}
+    ):
+        raise TrainingIdentityError("training execution manifest mismatch")
+
+    lock = _regular(training_root / "evidence/uv.lock", "training dependency lock")
+    if _sha256_file(lock) != contract["dependency_lock_sha256"]:
+        raise TrainingIdentityError("training dependency lock mismatch")
+    runtime = _json(training_root / "evidence/runtime-receipt.json", "training runtime receipt")
+    runtime_keys = {
+        "schema_version", "kind", "python_executable", "lerobot_wheel_path",
+        "lerobot_wheel_sha256", "lerobot_package_root", "dependency_lock_path",
+        "dependency_lock_sha256",
+    }
+    wheel = _regular(training_root / "evidence/lerobot-0.4.3-py3-none-any.whl", "training LeRobot wheel")
+    if (
+        set(runtime) != runtime_keys
+        or runtime.get("schema_version") != 1
+        or runtime.get("kind") != "lehome_public_n15_training_runtime_v1"
+        or runtime.get("lerobot_wheel_path") != str(wheel)
+        or runtime.get("lerobot_wheel_sha256") != contract["lerobot_wheel_sha256"]
+        or runtime.get("dependency_lock_path") != str(lock)
+        or runtime.get("dependency_lock_sha256") != contract["dependency_lock_sha256"]
+        or not isinstance(runtime.get("python_executable"), str)
+        or not isinstance(runtime.get("lerobot_package_root"), str)
+    ):
+        raise TrainingIdentityError("training runtime identity mismatch")
+    wheel_bytes = wheel.read_bytes()
+    if hashlib.sha256(wheel_bytes).hexdigest() != contract["lerobot_wheel_sha256"]:
+        raise TrainingIdentityError("training LeRobot wheel digest mismatch")
+    wheel_count, wheel_tree, metadata = _wheel_identity(wheel_bytes)
+    if (
+        wheel_count != contract["lerobot_package_file_count"]
+        or wheel_tree != contract["lerobot_package_tree_sha256"]
+        or "Name: lerobot\n" not in metadata
+        or f"Version: {contract['lerobot_version']}\n" not in metadata
+    ):
+        raise TrainingIdentityError("training LeRobot wheel identity mismatch")
+    if _installed_tree(Path(runtime["lerobot_package_root"])) != (wheel_count, wheel_tree):
+        raise TrainingIdentityError("installed LeRobot package differs from the trusted wheel")
+    python = _regular(Path(runtime["python_executable"]), "training Python executable proof")
+    try:
+        probe = subprocess.run(
+            [str(python), "-I", "-c", "import json,sys; print(json.dumps(list(sys.version_info[:3])))"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False,
+        )
+        version = json.loads(probe.stdout)
+        expected_python = [int(part) for part in str(contract["python_version"]).split(".")]
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
+        raise TrainingIdentityError("training Python version probe failed") from None
+    if (
+        probe.returncode != 0 or not isinstance(version, list) or len(version) != 3
+        or version[: len(expected_python)] != expected_python
+        or any(type(part) is not int for part in version)
+    ):
+        raise TrainingIdentityError("training Python interpreter version mismatch")
+    log = _regular(training_root / "logs/train.log", "training log")
+    try:
+        log_text = log.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise TrainingIdentityError("training log is unreadable") from None
+    if (
+        not log_text
+        or "Checkpoint policy after step 12000" not in log_text
+        or "End of training" not in log_text
+    ):
+        raise TrainingIdentityError("training log lacks step-12000 completion evidence")
     checkpoint_files_sha256 = hashlib.sha256(_canonical(checkpoint_files)).hexdigest()
     return {
         "schema_version": 1,

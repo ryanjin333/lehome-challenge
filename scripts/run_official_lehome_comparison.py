@@ -343,10 +343,13 @@ def validate_candidate_n15_checkpoint(
         TrainingIdentityError,
         validate_training_identity_receipt,
     )
+    from source.lehome.lehome.n15_reproduction import CONTRACT
 
     try:
         validated = validate_training_identity_receipt(
-            identity_receipt, expected_pretrained_root=checkpoint_root
+            identity_receipt,
+            expected_contract=CONTRACT,
+            expected_pretrained_root=checkpoint_root,
         )
     except (TrainingIdentityError, OSError) as error:
         raise ComparisonError(f"candidate N1.5 identity receipt is invalid: {error}") from None

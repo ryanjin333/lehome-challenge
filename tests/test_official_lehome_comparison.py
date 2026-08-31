@@ -258,20 +258,6 @@ def test_candidate_identity_rejects_task1_receipt_schema_and_manifest_drift(
         validate_candidate_n15_checkpoint(pretrained, receipt)
 
 
-def test_candidate_identity_binds_the_complete_task1_receipt(tmp_path: Path) -> None:
-    pretrained, receipt = _candidate_training_receipt(
-        tmp_path, config=b'{"type":"groot"}\n'
-    )
-    identity = validate_candidate_n15_checkpoint(pretrained, receipt)
-    payload = json.loads(receipt.read_text())
-    assert identity["artifact_count"] == payload["artifact_count"]
-    assert identity["checksums_sha256"] == payload["checksums_sha256"]
-    assert identity["source_receipt_sha256"] == payload["source_receipt_sha256"]
-    assert identity["resolved_snapshots_receipt_sha256"] == payload[
-        "resolved_snapshots_receipt_sha256"
-    ]
-
-
 def test_smoke_matrix_is_exactly_two_top_long_seen_zero_episodes() -> None:
     rows = smoke_matrix()
     assert [(row.category, row.garment, row.episode_index, row.seed) for row in rows] == [

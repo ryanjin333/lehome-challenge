@@ -1977,6 +1977,25 @@ def test_candidate_checkpoint_compatibility_is_bound_to_training_receipt_and_120
         "_installed_lerobot_identity",
         lambda: (package.resolve(), "a" * 64, 17),
     )
+    admitted_identity = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_verified_training_output_v1",
+        "training_root": str((tmp_path / "training").resolve()),
+        "step": 12000,
+        "checkpoint_root": str((tmp_path / "training/checkpoints/012000").resolve()),
+        "checkpoint_files_sha256": "b" * 64,
+        "checkpoint_file_count": 12,
+        "artifact_count": 24,
+        "checksums_sha256": "c" * 64,
+        "source_receipt_sha256": "d" * 64,
+        "resolved_snapshots_receipt_sha256": "e" * 64,
+        "identity_receipt_sha256": hashlib.sha256(training.read_bytes()).hexdigest(),
+    }
+    monkeypatch.setattr(
+        compatibility,
+        "validate_training_identity_receipt",
+        lambda *args, **kwargs: admitted_identity,
+    )
     sanitized = tmp_path / "candidate-view"
     receipt_path = tmp_path / "candidate-compatibility.json"
 
@@ -2002,6 +2021,7 @@ def test_candidate_checkpoint_compatibility_is_bound_to_training_receipt_and_120
     assert receipt["training_identity_receipt_sha256"] == hashlib.sha256(
         training.read_bytes()
     ).hexdigest()
+    assert receipt["training_identity"] == admitted_identity
     assert (checkpoint / "config.json").read_bytes() == raw
 
     training.write_text("{}\n", encoding="utf-8")
