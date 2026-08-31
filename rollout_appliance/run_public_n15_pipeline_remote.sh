@@ -131,7 +131,9 @@ plan, output, run_id, stage, limit, aggregate = sys.argv[1:]
 digest = hashlib.sha256(open(plan, "rb").read()).hexdigest(); limit, aggregate = int(limit), int(aggregate)
 if os.path.exists(output):
     value = json.load(open(output))
-    if (value.get("schema_version"), value.get("kind"), value.get("run_id"), value.get("stage"), value.get("lifecycle_plan_sha256")) != (1, "lehome_public_n15_stage_deadline_v1", run_id, stage, digest) or type(value.get("deadline_unix_seconds")) is not int: raise SystemExit("stage deadline is invalid")
+    expected_keys = {"schema_version", "kind", "run_id", "stage", "lifecycle_plan_sha256", "started_unix_seconds", "deadline_unix_seconds"}
+    started, deadline = value.get("started_unix_seconds"), value.get("deadline_unix_seconds")
+    if set(value) != expected_keys or (value.get("schema_version"), value.get("kind"), value.get("run_id"), value.get("stage"), value.get("lifecycle_plan_sha256")) != (1, "lehome_public_n15_stage_deadline_v1", run_id, stage, digest) or type(started) is not int or type(deadline) is not int or deadline != min(started + limit, aggregate): raise SystemExit("stage deadline is invalid")
     print(value["deadline_unix_seconds"]); raise SystemExit
 started = int(time.time()); deadline = min(started + limit, aggregate)
 value = {"schema_version": 1, "kind": "lehome_public_n15_stage_deadline_v1", "run_id": run_id, "stage": stage, "lifecycle_plan_sha256": digest, "started_unix_seconds": started, "deadline_unix_seconds": deadline}
@@ -143,13 +145,14 @@ PY
   now="$(date +%s)"
   (( now < stage_deadline )) || fail "$label has no remaining paid time"
   setsid "$@" & pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
+  while kill -0 -- "-$pid" 2>/dev/null; do
     now="$(date +%s)"
     if (( now >= stage_deadline )); then
       kill -TERM -- "-$pid" 2>/dev/null || true
-      for _ in {1..15}; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-      if kill -0 "$pid" 2>/dev/null; then kill -KILL -- "-$pid" 2>/dev/null || true; fi
+      for _ in {1..15}; do kill -0 -- "-$pid" 2>/dev/null || break; sleep 1; done
+      if kill -0 -- "-$pid" 2>/dev/null; then kill -KILL -- "-$pid" 2>/dev/null || true; fi
       wait "$pid" || true
+      kill -0 -- "-$pid" 2>/dev/null && fail "$label process group survived watchdog termination"
       fail "$label exceeded its code-owned paid timeout"
     fi
     sleep 1
