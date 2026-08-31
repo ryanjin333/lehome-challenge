@@ -25,6 +25,7 @@ from scripts.run_official_lehome_comparison import (
     validate_reference_matrix,
     validate_n17_checkpoint,
     validate_competitor_checkpoint,
+    validate_candidate_n15_checkpoint,
     validate_runtime_evidence,
     validate_smoke_prerequisite,
     metadata_identities,
@@ -48,6 +49,66 @@ CATEGORIES = {
     "pant_long": "Pant_Long",
     "pant_short": "Pant_Short",
 }
+
+
+def _candidate_training_receipt(
+    root: Path, *, config: bytes, mutation: str | None = None
+) -> tuple[Path, Path]:
+    training = root / "training"
+    checkpoint = training / "checkpoints/012000"
+    pretrained = checkpoint / "pretrained_model"
+    pretrained.mkdir(parents=True)
+    required = {
+        "config.json": config,
+        "model.safetensors": b"weights",
+        "train_config.json": b'{}\n',
+        "policy_preprocessor.json": b'{}\n',
+        "policy_postprocessor.json": b'{}\n',
+        "policy_preprocessor_step_2_groot_pack_inputs_v3.safetensors": b"pre",
+        "policy_postprocessor_step_0_groot_action_unpack_unnormalize_v1.safetensors": b"post",
+    }
+    for name, payload in required.items():
+        (pretrained / name).write_bytes(payload)
+    evidence = training / "evidence"
+    evidence.mkdir()
+    (evidence / "source-receipt.json").write_bytes(b"source receipt\n")
+    (evidence / "resolved-snapshots-receipt.json").write_bytes(b"snapshots receipt\n")
+    (training / "checkpoints/last").symlink_to("012000")
+    files = {
+        path.relative_to(training).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(training.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+    checksum = training / "checksums.sha256"
+    checksum.write_text(
+        "".join(f"{digest}  {relative}\n" for relative, digest in sorted(files.items())),
+        encoding="ascii",
+    )
+    checkpoint_files = {
+        relative: digest for relative, digest in files.items()
+        if relative.startswith("checkpoints/012000/")
+    }
+    receipt = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_verified_training_output_v1",
+        "training_root": str(training.resolve()),
+        "step": 12000,
+        "checkpoint_root": str(checkpoint.resolve()),
+        "checkpoint_files": checkpoint_files,
+        "artifact_count": len(files),
+        "checksums_sha256": hashlib.sha256(checksum.read_bytes()).hexdigest(),
+        "source_receipt_sha256": files["evidence/source-receipt.json"],
+        "resolved_snapshots_receipt_sha256": files["evidence/resolved-snapshots-receipt.json"],
+    }
+    if mutation == "extra_field": receipt["invented"] = True
+    elif mutation == "fake_count": receipt["artifact_count"] += 1
+    elif mutation == "omit_pretrained": receipt["checkpoint_files"].pop(
+        "checkpoints/012000/pretrained_model/model.safetensors"
+    )
+    elif mutation == "cross_receipt": receipt["source_receipt_sha256"] = "0" * 64
+    path = root / f"training-identity-{mutation or 'valid'}.json"
+    path.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")
+    return pretrained, path
 
 
 def test_execution_env_does_not_inherit_runtime_pythonpath(
@@ -182,6 +243,33 @@ def test_default_profile_preserves_the_existing_four_category_matrix(tmp_path: P
     assert load_profile_matrix(assets, profile="default") == load_release_matrix(
         assets, episodes_per_garment=2
     )
+
+
+@pytest.mark.parametrize(
+    "mutation", ("extra_field", "fake_count", "omit_pretrained", "cross_receipt")
+)
+def test_candidate_identity_rejects_task1_receipt_schema_and_manifest_drift(
+    tmp_path: Path, mutation: str
+) -> None:
+    pretrained, receipt = _candidate_training_receipt(
+        tmp_path, config=b'{"type":"groot"}\n', mutation=mutation
+    )
+    with pytest.raises(ComparisonError, match="candidate N1.5 identity"):
+        validate_candidate_n15_checkpoint(pretrained, receipt)
+
+
+def test_candidate_identity_binds_the_complete_task1_receipt(tmp_path: Path) -> None:
+    pretrained, receipt = _candidate_training_receipt(
+        tmp_path, config=b'{"type":"groot"}\n'
+    )
+    identity = validate_candidate_n15_checkpoint(pretrained, receipt)
+    payload = json.loads(receipt.read_text())
+    assert identity["artifact_count"] == payload["artifact_count"]
+    assert identity["checksums_sha256"] == payload["checksums_sha256"]
+    assert identity["source_receipt_sha256"] == payload["source_receipt_sha256"]
+    assert identity["resolved_snapshots_receipt_sha256"] == payload[
+        "resolved_snapshots_receipt_sha256"
+    ]
 
 
 def test_smoke_matrix_is_exactly_two_top_long_seen_zero_episodes() -> None:
@@ -440,6 +528,7 @@ def _focused_receipt(matrix: list[MatrixRow], *, candidate=(18, 13), reference=(
                 "rollout_appliance/native_reference_site/sitecustomize.py",
                 "rollout_appliance/native_reference_site/checkpoint_compatibility.py",
                 "rollout_appliance/native_reference_site/cloth_fidelity.py",
+                "rollout_appliance/native_reference_site/training_identity.py",
             )
         },
     }
@@ -485,11 +574,19 @@ def _focused_receipt(matrix: list[MatrixRow], *, candidate=(18, 13), reference=(
             },
         },
         "candidate_checkpoint": {
+            "schema_version": 1,
             "kind": "lehome_public_n15_verified_training_output_v1",
+            "training_root": "/training",
             "step": 12000,
+            "checkpoint_root": "/training/checkpoints/012000",
+            "checkpoint_files_sha256": hashlib.sha256(b"checkpoint files").hexdigest(),
+            "checkpoint_file_count": 7,
+            "artifact_count": 9,
+            "checksums_sha256": hashlib.sha256(b"checksums").hexdigest(),
+            "source_receipt_sha256": hashlib.sha256(b"source receipt").hexdigest(),
+            "resolved_snapshots_receipt_sha256": hashlib.sha256(b"snapshots receipt").hexdigest(),
             "identity_receipt_sha256": candidate_identity_sha,
             "tree_sha256": hashlib.sha256(b"candidate checkpoint tree").hexdigest(),
-            "file_count": 7,
         },
         "reference_checkpoint": {
             "repository": "theo-zhou/lehome-groot-submission-4",
@@ -498,6 +595,20 @@ def _focused_receipt(matrix: list[MatrixRow], *, candidate=(18, 13), reference=(
             "tree_sha256": "fd0b4e91491e1001272ec199f971cb6bce4c966e4d6d0191b6947a3adfddd74a",
         },
         "candidate_compatibility_receipt_sha256": candidate_compatibility_sha,
+        "candidate_compatibility_training_identity": {
+            "schema_version": 1,
+            "kind": "lehome_public_n15_verified_training_output_v1",
+            "training_root": "/training",
+            "step": 12000,
+            "checkpoint_root": "/training/checkpoints/012000",
+            "checkpoint_files_sha256": hashlib.sha256(b"checkpoint files").hexdigest(),
+            "checkpoint_file_count": 7,
+            "artifact_count": 9,
+            "checksums_sha256": hashlib.sha256(b"checksums").hexdigest(),
+            "source_receipt_sha256": hashlib.sha256(b"source receipt").hexdigest(),
+            "resolved_snapshots_receipt_sha256": hashlib.sha256(b"snapshots receipt").hexdigest(),
+            "identity_receipt_sha256": candidate_identity_sha,
+        },
         "reference_compatibility_receipt_sha256": reference_compatibility_sha,
         "metadata": {
             "tree_sha256": hashlib.sha256(b"metadata tree").hexdigest(),

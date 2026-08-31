@@ -11,6 +11,17 @@ from pathlib import Path
 import stat
 from typing import Any
 
+try:
+    from rollout_appliance.native_reference_site.training_identity import (
+        TrainingIdentityError,
+        validate_training_identity_receipt,
+    )
+except ModuleNotFoundError:  # Native site is loaded as a standalone PYTHONPATH entry.
+    from training_identity import (  # type: ignore[no-redef]
+        TrainingIdentityError,
+        validate_training_identity_receipt,
+    )
+
 
 EXPECTED_CONFIG_SHA256 = "b7c385bc57456eae603e929b84defb7e991194aade2aad70785e21991e37614c"
 LEROBOT_WHEEL_SHA256 = "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c"
@@ -125,24 +136,15 @@ def prepare_candidate_checkpoint_config_view(
     """Create an inference-only view for the exact verified 12K candidate."""
     checkpoint = _resolved_directory(Path(checkpoint_root), "checkpoint root")
     training_path = Path(training_identity_receipt)
+    training_raw = _regular_bytes(training_path, "candidate training identity receipt")
     try:
-        training_raw = _regular_bytes(training_path, "candidate training identity receipt")
-        training = json.loads(training_raw)
-    except (UnicodeError, json.JSONDecodeError):
-        raise RuntimeError("candidate training identity receipt is invalid") from None
+        training_identity = validate_training_identity_receipt(
+            training_path, expected_pretrained_root=checkpoint
+        )
+    except TrainingIdentityError as error:
+        raise RuntimeError(f"candidate training identity receipt is invalid: {error}") from None
     raw = _regular_bytes(checkpoint / "config.json", "raw checkpoint config")
     raw_sha = hashlib.sha256(raw).hexdigest()
-    relative = "checkpoints/012000/pretrained_model/config.json"
-    if (
-        not isinstance(training, dict)
-        or training.get("kind") != "lehome_public_n15_verified_training_output_v1"
-        or training.get("step") != 12000
-        or Path(str(training.get("checkpoint_root", ""))).resolve(strict=True) / "pretrained_model"
-        != checkpoint
-        or not isinstance(training.get("checkpoint_files"), dict)
-        or training["checkpoint_files"].get(relative) != raw_sha
-    ):
-        raise RuntimeError("candidate training identity does not bind the checkpoint config")
     try:
         values = json.loads(raw)
     except (UnicodeError, json.JSONDecodeError):
@@ -207,6 +209,7 @@ def prepare_candidate_checkpoint_config_view(
         "installed_lerobot_package_file_count": file_count,
         "training_identity_receipt": str(training_path.resolve(strict=True)),
         "training_identity_receipt_sha256": hashlib.sha256(training_raw).hexdigest(),
+        "training_identity": training_identity,
     }
     target = Path(receipt_path)
     descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
@@ -257,7 +260,11 @@ def install_checkpoint_config_view(
     }
     candidate = isinstance(receipt, dict) and receipt.get("kind") == "lehome_native_candidate_checkpoint_compatibility_v1"
     if candidate:
-        expected_keys |= {"training_identity_receipt", "training_identity_receipt_sha256"}
+        expected_keys |= {
+            "training_identity_receipt",
+            "training_identity_receipt_sha256",
+            "training_identity",
+        }
     if not isinstance(receipt, dict) or set(receipt) != expected_keys:
         raise RuntimeError("compatibility receipt has an unexpected schema")
     raw = _regular_bytes(checkpoint / "config.json", "raw checkpoint config")
@@ -295,20 +302,15 @@ def install_checkpoint_config_view(
         training_path = Path(str(receipt["training_identity_receipt"]))
         training_raw = _regular_bytes(training_path, "candidate training identity receipt")
         try:
-            training = json.loads(training_raw)
-        except (UnicodeError, json.JSONDecodeError):
-            raise RuntimeError("candidate training identity receipt is invalid") from None
-        relative = "checkpoints/012000/pretrained_model/config.json"
+            training_identity = validate_training_identity_receipt(
+                training_path, expected_pretrained_root=checkpoint
+            )
+        except TrainingIdentityError as error:
+            raise RuntimeError(f"candidate training identity receipt is invalid: {error}") from None
         if (
             hashlib.sha256(training_raw).hexdigest()
             != receipt["training_identity_receipt_sha256"]
-            or not isinstance(training, dict)
-            or training.get("kind") != "lehome_public_n15_verified_training_output_v1"
-            or training.get("step") != 12000
-            or Path(str(training.get("checkpoint_root", ""))).resolve(strict=True) / "pretrained_model"
-            != checkpoint
-            or not isinstance(training.get("checkpoint_files"), dict)
-            or training["checkpoint_files"].get(relative) != receipt["raw_config_sha256"]
+            or training_identity != receipt["training_identity"]
         ):
             raise RuntimeError("candidate training identity does not bind the compatibility view")
         approved_config_sha256 = str(receipt["raw_config_sha256"])

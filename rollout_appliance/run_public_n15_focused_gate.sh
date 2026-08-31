@@ -54,6 +54,15 @@ require_directory "$ASSETS_ROOT" "official asset checkout"
 require_directory "$METADATA_ROOT" "metadata root"
 require_directory "$CANDIDATE_CHECKPOINT" "candidate-n15 checkpoint"
 require_file "$CANDIDATE_IDENTITY_RECEIPT" "candidate-n15 identity receipt"
+CANDIDATE_TRAINING_ROOT="$(PYTHONPATH="$REPO_ROOT" python3 - "$CANDIDATE_IDENTITY_RECEIPT" "$CANDIDATE_CHECKPOINT" <<'PY'
+import sys
+from pathlib import Path
+from rollout_appliance.native_reference_site.training_identity import validate_training_identity_receipt
+value = validate_training_identity_receipt(Path(sys.argv[1]), expected_pretrained_root=Path(sys.argv[2]))
+print(value["training_root"])
+PY
+)"
+require_directory "$CANDIDATE_TRAINING_ROOT" "candidate-n15 training output"
 require_directory "$REFERENCE_CHECKPOINT" "reference-n15 checkpoint"
 require_directory "$REFERENCE_SANITIZED_CONFIG" "reference-n15 compatibility view"
 require_file "$REFERENCE_COMPATIBILITY_RECEIPT" "reference-n15 compatibility receipt"
@@ -143,6 +152,7 @@ mounts=(
   --mount "type=bind,src=$ASSETS_ROOT,dst=/official/lehome/Assets,readonly"
   --mount "type=bind,src=$METADATA_ROOT,dst=$METADATA_ROOT,readonly"
   --mount "type=bind,src=$CANDIDATE_CHECKPOINT,dst=$CANDIDATE_CHECKPOINT,readonly"
+  --mount "type=bind,src=$CANDIDATE_TRAINING_ROOT,dst=$CANDIDATE_TRAINING_ROOT,readonly"
   --mount "type=bind,src=$CANDIDATE_IDENTITY_RECEIPT,dst=$CANDIDATE_IDENTITY_RECEIPT,readonly"
   --mount "type=bind,src=$REFERENCE_CHECKPOINT,dst=$REFERENCE_CHECKPOINT,readonly"
   --mount "type=bind,src=$REFERENCE_SANITIZED_CONFIG,dst=$REFERENCE_SANITIZED_CONFIG,readonly"

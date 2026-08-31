@@ -1899,6 +1899,57 @@ def test_prepare_checkpoint_compatibility_creates_one_exclusive_exact_view(
         gate.prepare_checkpoint_compatibility(checkpoint, sanitized, tmp_path / "second.json")
 
 
+def _candidate_task1_tree(tmp_path: Path, values: dict[str, object]) -> tuple[Path, Path, bytes]:
+    training_root = tmp_path / "training"
+    checkpoint_parent = training_root / "checkpoints/012000"
+    checkpoint = checkpoint_parent / "pretrained_model"
+    checkpoint.mkdir(parents=True)
+    raw = (json.dumps(values, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    files = {
+        "config.json": raw,
+        "model.safetensors": b"weights",
+        "train_config.json": b"{}\n",
+        "policy_preprocessor.json": b"{}\n",
+        "policy_postprocessor.json": b"{}\n",
+        "policy_preprocessor_step_2_groot_pack_inputs_v3.safetensors": b"pre",
+        "policy_postprocessor_step_0_groot_action_unpack_unnormalize_v1.safetensors": b"post",
+    }
+    for name, payload in files.items():
+        (checkpoint / name).write_bytes(payload)
+    evidence = training_root / "evidence"
+    evidence.mkdir()
+    (evidence / "source-receipt.json").write_bytes(b"source\n")
+    (evidence / "resolved-snapshots-receipt.json").write_bytes(b"snapshots\n")
+    (training_root / "checkpoints/last").symlink_to("012000")
+    artifacts = {
+        path.relative_to(training_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(training_root.rglob("*")) if path.is_file() and not path.is_symlink()
+    }
+    checksum = training_root / "checksums.sha256"
+    checksum.write_text(
+        "".join(f"{digest}  {relative}\n" for relative, digest in sorted(artifacts.items())),
+        encoding="ascii",
+    )
+    receipt = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_verified_training_output_v1",
+        "training_root": str(training_root.resolve()),
+        "step": 12000,
+        "checkpoint_root": str(checkpoint_parent.resolve()),
+        "checkpoint_files": {
+            relative: digest for relative, digest in artifacts.items()
+            if relative.startswith("checkpoints/012000/")
+        },
+        "artifact_count": len(artifacts),
+        "checksums_sha256": hashlib.sha256(checksum.read_bytes()).hexdigest(),
+        "source_receipt_sha256": artifacts["evidence/source-receipt.json"],
+        "resolved_snapshots_receipt_sha256": artifacts["evidence/resolved-snapshots-receipt.json"],
+    }
+    training = tmp_path / "training-identity.json"
+    training.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")
+    return checkpoint, training, raw
+
+
 def test_candidate_checkpoint_compatibility_is_bound_to_training_receipt_and_12000_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1910,34 +1961,13 @@ def test_candidate_checkpoint_compatibility_is_bound_to_training_receipt_and_120
     assert spec is not None and spec.loader is not None
     compatibility = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(compatibility)
-    checkpoint_parent = tmp_path / "checkpoints/012000"
-    checkpoint = checkpoint_parent / "pretrained_model"
-    checkpoint.mkdir(parents=True)
     values = {
         "type": "groot",
         "hidden_size": 1024,
         "num_decay_steps": 12000,
         "decay_lr_ratio": 0.1,
     }
-    raw = (json.dumps(values, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    (checkpoint / "config.json").write_bytes(raw)
-    training = tmp_path / "training-identity.json"
-    training.write_text(
-        json.dumps(
-            {
-                "kind": "lehome_public_n15_verified_training_output_v1",
-                "step": 12000,
-                "checkpoint_root": str(checkpoint_parent.resolve()),
-                "checkpoint_files": {
-                    "checkpoints/012000/pretrained_model/config.json": hashlib.sha256(raw).hexdigest()
-                },
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    checkpoint, training, raw = _candidate_task1_tree(tmp_path, values)
     package = tmp_path / "lerobot"
     package.mkdir()
     origin = tmp_path / "configuration_groot.py"
@@ -1980,6 +2010,51 @@ def test_candidate_checkpoint_compatibility_is_bound_to_training_receipt_and_120
             checkpoint,
             sanitized,
             receipt_path,
+            expected_package_tree_sha256="a" * 64,
+            expected_package_file_count=17,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation", ("extra_field", "fake_count", "omit_pretrained", "cross_receipt")
+)
+def test_candidate_compatibility_rejects_task1_receipt_manifest_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "adversarial_candidate_checkpoint_compatibility", CHECKPOINT_COMPATIBILITY_SHIM
+    )
+    assert spec is not None and spec.loader is not None
+    compatibility = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(compatibility)
+    checkpoint, training, _raw = _candidate_task1_tree(
+        tmp_path,
+        {"type": "groot", "num_decay_steps": 12000, "decay_lr_ratio": 0.1},
+    )
+    receipt = json.loads(training.read_text())
+    if mutation == "extra_field": receipt["invented"] = True
+    elif mutation == "fake_count": receipt["artifact_count"] += 1
+    elif mutation == "omit_pretrained": receipt["checkpoint_files"].pop(
+        "checkpoints/012000/pretrained_model/model.safetensors"
+    )
+    else: receipt["resolved_snapshots_receipt_sha256"] = "0" * 64
+    training.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")
+    package = tmp_path / "lerobot"
+    package.mkdir()
+    monkeypatch.setattr(
+        compatibility, "_installed_lerobot_identity", lambda: (package.resolve(), "a" * 64, 17)
+    )
+    origin = tmp_path / "configuration_groot.py"
+    origin.write_text("# origin\n")
+    with pytest.raises(RuntimeError, match="training identity"):
+        compatibility.prepare_candidate_checkpoint_config_view(
+            checkpoint,
+            training,
+            tmp_path / "view",
+            tmp_path / "compatibility.json",
+            groot_config_origin=origin,
             expected_package_tree_sha256="a" * 64,
             expected_package_file_count=17,
         )

@@ -339,45 +339,20 @@ def validate_candidate_n15_checkpoint(
     checkpoint_root: Path, identity_receipt: Path
 ) -> dict[str, object]:
     """Bind the native policy directory to Task 1's verified training receipt."""
-    root = Path(checkpoint_root)
-    if root.is_symlink() or not root.is_dir():
-        raise ComparisonError("candidate N1.5 checkpoint is unavailable or unsafe")
-    receipt = _load_json_object(identity_receipt, "candidate N1.5 identity receipt")
-    receipt_checkpoint = receipt.get("checkpoint_root")
-    files = receipt.get("checkpoint_files")
-    if (
-        receipt.get("kind") != "lehome_public_n15_verified_training_output_v1"
-        or receipt.get("step") != 12000
-        or not isinstance(receipt_checkpoint, str)
-        or Path(receipt_checkpoint).resolve(strict=True) / "pretrained_model" != root.resolve(strict=True)
-        or not isinstance(files, Mapping)
-        or not files
-    ):
-        raise ComparisonError("candidate N1.5 identity receipt is invalid")
-    prefix = "checkpoints/012000/pretrained_model/"
-    expected = {
-        str(relative)[len(prefix) :]: digest
-        for relative, digest in files.items()
-        if isinstance(relative, str) and relative.startswith(prefix)
-    }
-    observed_paths = [path for path in sorted(root.rglob("*")) if not path.is_dir()]
-    if (
-        not expected
-        or any(path.is_symlink() or not path.is_file() for path in observed_paths)
-        or {path.relative_to(root).as_posix() for path in observed_paths} != set(expected)
-        or any(
-            re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
-            or _sha256_file(root / relative) != digest
-            for relative, digest in expected.items()
+    from rollout_appliance.native_reference_site.training_identity import (
+        TrainingIdentityError,
+        validate_training_identity_receipt,
+    )
+
+    try:
+        validated = validate_training_identity_receipt(
+            identity_receipt, expected_pretrained_root=checkpoint_root
         )
-    ):
-        raise ComparisonError("candidate N1.5 checkpoint file identity drift")
+    except (TrainingIdentityError, OSError) as error:
+        raise ComparisonError(f"candidate N1.5 identity receipt is invalid: {error}") from None
     return {
-        "kind": receipt["kind"],
-        "step": 12000,
-        "identity_receipt_sha256": _sha256_file(identity_receipt),
-        "tree_sha256": _tree_sha256(root),
-        "file_count": len(expected),
+        **validated,
+        "tree_sha256": _tree_sha256(Path(checkpoint_root).resolve(strict=True)),
     }
 
 
@@ -528,6 +503,7 @@ def focused_runtime_adapter_identities(runtime_root: Path) -> dict[str, str]:
         "rollout_appliance/native_reference_site/sitecustomize.py",
         "rollout_appliance/native_reference_site/checkpoint_compatibility.py",
         "rollout_appliance/native_reference_site/cloth_fidelity.py",
+        "rollout_appliance/native_reference_site/training_identity.py",
     )
     identities: dict[str, str] = {}
     for relative in relatives:
@@ -1176,6 +1152,9 @@ def assess_n15_focused_promotion(
     assets = receipt.get("canonical_assets")
     runtime = receipt.get("reviewed_runtime")
     candidate_checkpoint = receipt.get("candidate_checkpoint")
+    candidate_compatibility_identity = receipt.get(
+        "candidate_compatibility_training_identity"
+    )
     reference_checkpoint = receipt.get("reference_checkpoint")
     metadata = receipt.get("metadata")
     archive = receipt.get("evidence_archive")
@@ -1185,6 +1164,7 @@ def assess_n15_focused_promotion(
         "rollout_appliance/native_reference_site/sitecustomize.py",
         "rollout_appliance/native_reference_site/checkpoint_compatibility.py",
         "rollout_appliance/native_reference_site/cloth_fidelity.py",
+        "rollout_appliance/native_reference_site/training_identity.py",
     }
     if (
         not isinstance(source, Mapping)
@@ -1205,13 +1185,31 @@ def assess_n15_focused_promotion(
         or set(runtime["adapter_sha256"]) != expected_adapters
         or any(not sha256(value) for value in runtime["adapter_sha256"].values())
         or not isinstance(candidate_checkpoint, Mapping)
-        or set(candidate_checkpoint) != {"kind", "step", "identity_receipt_sha256", "tree_sha256", "file_count"}
+        or set(candidate_checkpoint) != {
+            "schema_version", "kind", "training_root", "step", "checkpoint_root",
+            "checkpoint_files_sha256", "checkpoint_file_count", "artifact_count",
+            "checksums_sha256", "source_receipt_sha256",
+            "resolved_snapshots_receipt_sha256", "identity_receipt_sha256", "tree_sha256",
+        }
+        or candidate_checkpoint.get("schema_version") != 1
         or candidate_checkpoint.get("kind") != "lehome_public_n15_verified_training_output_v1"
         or candidate_checkpoint.get("step") != 12000
-        or not sha256(candidate_checkpoint.get("identity_receipt_sha256"))
-        or not sha256(candidate_checkpoint.get("tree_sha256"))
-        or type(candidate_checkpoint.get("file_count")) is not int
-        or candidate_checkpoint["file_count"] < 1
+        or any(
+            not sha256(candidate_checkpoint.get(key))
+            for key in (
+                "checkpoint_files_sha256", "checksums_sha256", "source_receipt_sha256",
+                "resolved_snapshots_receipt_sha256", "identity_receipt_sha256", "tree_sha256",
+            )
+        )
+        or type(candidate_checkpoint.get("checkpoint_file_count")) is not int
+        or candidate_checkpoint["checkpoint_file_count"] < 7
+        or type(candidate_checkpoint.get("artifact_count")) is not int
+        or candidate_checkpoint["artifact_count"] < candidate_checkpoint["checkpoint_file_count"]
+        or not isinstance(candidate_checkpoint.get("training_root"), str)
+        or not isinstance(candidate_checkpoint.get("checkpoint_root"), str)
+        or Path(candidate_checkpoint["checkpoint_root"]) != Path(candidate_checkpoint["training_root"]) / "checkpoints/012000"
+        or candidate_compatibility_identity
+        != {key: value for key, value in candidate_checkpoint.items() if key != "tree_sha256"}
         or reference_checkpoint != {
             "repository": "theo-zhou/lehome-groot-submission-4",
             "revision": "d384fe00508acd96ab1c3c5dc265e08261f94b3b",
@@ -1495,6 +1493,22 @@ def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
     candidate_before = validate_candidate_n15_checkpoint(
         args.candidate_checkpoint, args.candidate_identity_receipt
     )
+    candidate_compatibility = _load_json_object(
+        args.candidate_compatibility_receipt,
+        "candidate checkpoint compatibility receipt",
+    )
+    candidate_compatibility_training_identity = candidate_compatibility.get(
+        "training_identity"
+    )
+    if (
+        candidate_compatibility.get("kind")
+        != "lehome_native_candidate_checkpoint_compatibility_v1"
+        or candidate_compatibility_training_identity
+        != {key: value for key, value in candidate_before.items() if key != "tree_sha256"}
+        or candidate_compatibility.get("training_identity_receipt_sha256")
+        != candidate_before["identity_receipt_sha256"]
+    ):
+        raise ComparisonError("candidate compatibility and training identity cross-receipt mismatch")
     reference_before = validate_competitor_checkpoint(args.reference_checkpoint)
     metadata_before = metadata_identities(args.metadata_root)
     native_runtime_before = validate_competitor_runtime_evidence(args.native_runtime_evidence_root)
@@ -1659,6 +1673,9 @@ def execute_n15_focused_comparison(args: argparse.Namespace) -> Path:
             "reference_checkpoint": reference_before,
             "candidate_compatibility_receipt_sha256": _sha256_file(
                 args.candidate_compatibility_receipt
+            ),
+            "candidate_compatibility_training_identity": (
+                candidate_compatibility_training_identity
             ),
             "reference_compatibility_receipt_sha256": _sha256_file(
                 args.reference_compatibility_receipt
