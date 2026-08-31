@@ -40,6 +40,7 @@ _CATEGORY_DATASET_ROOTS = {
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
 _REPOSITORY = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+_PROVIDER_SOURCE_IMAGE_ID = "computeimage-u00zf6w3yf72gakhcy"
 _ATTEMPT_ID = re.compile(
     r"n15-seen-(?:top-long|top-short|pant-long|pant-short)-g[0-9]{2}-e[0-9]{2}-s[0-9]{6}"
 )
@@ -1915,6 +1916,7 @@ def validate_provider_stop_receipt(provider_receipt: object) -> dict[str, object
         provider_receipt,
         {
             "schema_version", "kind", "vm_id", "instance_name", "disk_id", "state",
+            "provider_source_image_id",
             "protected_disk_preserved", "created_resources", "deleted_resources",
             "provider_response_sha256", "captured_unix_seconds",
         },
@@ -1926,6 +1928,7 @@ def validate_provider_stop_receipt(provider_receipt: object) -> dict[str, object
         or provider["vm_id"] != CONTRACT.vm_id
         or provider["instance_name"] != "lehome-rollout"
         or provider["disk_id"] != CONTRACT.disk_id
+        or provider["provider_source_image_id"] != _PROVIDER_SOURCE_IMAGE_ID
         or provider["state"] != "STOPPED"
         or provider["protected_disk_preserved"] is not True
         or provider["created_resources"] != []
@@ -1950,6 +1953,10 @@ def provider_stop_receipt_from_response(response: object) -> dict[str, object]:
     if not isinstance(metadata, Mapping) or not isinstance(status, Mapping) or not isinstance(spec, Mapping):
         raise HarvestError("provider response is invalid")
     disks = spec.get("secondary_disks")
+    boot = spec.get("boot_disk")
+    managed = boot.get("managed_disk") if isinstance(boot, Mapping) else None
+    boot_spec = managed.get("spec") if isinstance(managed, Mapping) else None
+    source_image_id = boot_spec.get("source_image_id") if isinstance(boot_spec, Mapping) else None
     found: list[object] = []
     if not isinstance(disks, list):
         raise HarvestError("provider protected disk evidence is missing")
@@ -1971,14 +1978,16 @@ def provider_stop_receipt_from_response(response: object) -> dict[str, object]:
         or metadata.get("name") != "lehome-rollout"
         or status.get("state") != "STOPPED"
         or found != [CONTRACT.disk_id]
+        or source_image_id != _PROVIDER_SOURCE_IMAGE_ID
     ):
-        raise HarvestError("provider response is not the exact stopped rollout VM/disk attachment")
+        raise HarvestError("provider response is not the exact stopped rollout VM/disk/image attachment")
     return {
         "schema_version": 1,
         "kind": "lehome_public_n15_provider_stopped_v1",
         "vm_id": CONTRACT.vm_id,
         "instance_name": "lehome-rollout",
         "disk_id": CONTRACT.disk_id,
+        "provider_source_image_id": _PROVIDER_SOURCE_IMAGE_ID,
         "state": "STOPPED",
         "protected_disk_preserved": True,
         "created_resources": [],

@@ -1034,6 +1034,7 @@ def test_terminal_contract_requires_public_immutable_byte_readback_and_exact_sto
         "vm_id": "computeinstance-u00t6xfqhadrcmssa2",
         "instance_name": "lehome-rollout",
         "disk_id": "computedisk-u00pbe55crxy7jr56x",
+        "provider_source_image_id": "computeimage-u00zf6w3yf72gakhcy",
         "state": "STOPPED",
         "protected_disk_preserved": True,
         "created_resources": [],
@@ -1077,7 +1078,7 @@ def test_terminal_contract_requires_public_immutable_byte_readback_and_exact_sto
     raw_provider = {
         "metadata": {"id": provider["vm_id"], "name": "lehome-rollout"},
         "status": {"state": "STOPPED"},
-        "spec": {"secondary_disks": [{"existing_disk": {"id": provider["disk_id"]}}]},
+        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": provider["provider_source_image_id"]}}}, "secondary_disks": [{"existing_disk": {"id": provider["disk_id"]}}]},
     }
     assert provider_stop_receipt_from_response(raw_provider)["protected_disk_preserved"] is True
     for established_fields in (
@@ -1102,3 +1103,6 @@ def test_terminal_contract_requires_public_immutable_byte_readback_and_exact_sto
         changed["spec"]["secondary_disks"] = disks
         with pytest.raises(HarvestError, match="disk"):
             provider_stop_receipt_from_response(changed)
+    changed = json.loads(json.dumps(raw_provider)); changed["spec"]["boot_disk"]["managed_disk"]["spec"]["source_image_id"] = "computeimage-other"
+    with pytest.raises(HarvestError, match="image"):
+        provider_stop_receipt_from_response(changed)

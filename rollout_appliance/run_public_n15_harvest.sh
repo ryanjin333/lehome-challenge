@@ -39,6 +39,7 @@ readonly FINAL_SUCCESS_DATASETS="$HARVEST_ROOT/final-success-datasets.json"
 readonly PUBLICATION_RECEIPT="${LEHOME_N15_PUBLICATION_RECEIPT:-${HARVEST_ROOT}.publication.json}"
 readonly PROVIDER_STOPPED_RECEIPT="${LEHOME_N15_PROVIDER_STOPPED_RECEIPT:-${HARVEST_ROOT}.provider-stopped.json}"
 readonly TERMINAL_RECEIPT="${LEHOME_N15_TERMINAL_RECEIPT:-${HARVEST_ROOT}.terminal.json}"
+readonly DEFER_PROVIDER_STOP="${LEHOME_N15_DEFER_PROVIDER_STOP:-0}"
 HARVEST_TERMINAL_COMPLETE=0
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
@@ -106,6 +107,7 @@ trap on_exit EXIT
 trap 'exit 130' INT TERM
 
 [[ $# -eq 0 ]] || fail "this wrapper accepts no positional arguments"
+[[ "$DEFER_PROVIDER_STOP" == 0 || "$DEFER_PROVIDER_STOP" == 1 ]] || fail "defer provider stop must be exactly 0 or 1"
 command -v docker >/dev/null 2>&1 || fail "docker is unavailable"
 command -v git >/dev/null 2>&1 || fail "git is unavailable"
 command -v nebius >/dev/null 2>&1 || fail "Nebius CLI is unavailable"
@@ -456,6 +458,14 @@ python3 "$BUILDER" publish-hf --bundle-root "$HARVEST_ROOT" \
   --manifest "$MANIFEST" --manifest-receipt "$MANIFEST_RECEIPT" \
   --final-outcomes "$FINAL_OUTCOMES" --repository "$PUBLIC_REPOSITORY" \
   --output "$PUBLICATION_RECEIPT" >/dev/null
+if [[ "$DEFER_PROVIDER_STOP" == 1 ]]; then
+  # The host lifecycle owns the exact provider STOPPED observation.  Returning
+  # after sealed/public readback keeps its SSH session alive until it captures
+  # the compact terminal receipts, rather than allowing this guest to sever it.
+  HARVEST_TERMINAL_COMPLETE=1
+  printf '%s\n' "$PUBLICATION_RECEIPT"
+  exit 0
+fi
 stop_and_observe_exact_vm || fail "exact provider VM could not be stopped and verified"
 python3 "$BUILDER" verify-terminal --manifest "$MANIFEST" \
   --manifest-receipt "$MANIFEST_RECEIPT" \

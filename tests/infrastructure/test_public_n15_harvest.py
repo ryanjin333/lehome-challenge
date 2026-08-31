@@ -84,7 +84,8 @@ def test_shell_wrapper_is_native_fail_closed_and_has_no_provisioning_path() -> N
     assert "compute instance create" not in text
     assert "compute disk create" not in text
     assert "compute instance start" not in text
-    assert text.index("verify-terminal") < text.index("HARVEST_TERMINAL_COMPLETE=1")
+    assert text.index("verify-terminal") < text.rindex("HARVEST_TERMINAL_COMPLETE=1")
+    assert "LEHOME_N15_DEFER_PROVIDER_STOP" in text
 
 
 def test_shell_wrapper_has_four_to_two_admission_and_first_100_boundary() -> None:

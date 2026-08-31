@@ -25,6 +25,9 @@ readonly SNAPSHOTS_RECEIPT="${LEHOME_N15_RESOLVED_SNAPSHOTS_RECEIPT:-}"
 readonly TRAINING_ROOT="${LEHOME_N15_TRAINING_ROOT:-}"
 readonly HF_TOKEN_FILE="${LEHOME_N15_HF_TOKEN_FILE:-}"
 readonly RUNTIME_REVISION="${LEHOME_N15_RUNTIME_REVISION:-}"
+readonly TRAINING_HF_CACHE="${LEHOME_N15_TRAINING_HF_CACHE_ROOT:-}"
+readonly TRAINING_PYTHON="${LEHOME_N15_TRAINING_PYTHON:-/opt/lehome-challenge/.venv/bin/python}"
+readonly LEROBOT_WHEEL="${LEHOME_N15_LEROBOT_WHEEL:-}"
 readonly ASSETS_ROOT="${LEHOME_OFFICIAL_ASSETS_ROOT:-}"
 readonly METADATA_ROOT="${LEHOME_OFFICIAL_METADATA_ROOT:-}"
 readonly REFERENCE_CHECKPOINT="${LEHOME_N15_REFERENCE_CHECKPOINT:-}"
@@ -40,8 +43,11 @@ readonly TRAINING_PUBLICATION_RECEIPT="$TRAINING_ROOT/training-publication.json"
 readonly FOCUSED_OUTPUT_ROOT="$REMOTE_PIPELINE_ROOT/focused"
 readonly FOCUSED_PROMOTION_RECEIPT="$FOCUSED_OUTPUT_ROOT/promotion.json"
 readonly HARVEST_ROOT="$REMOTE_PIPELINE_ROOT/harvest"
-readonly HARVEST_TERMINAL_RECEIPT="$REMOTE_PIPELINE_ROOT/harvest.terminal.json"
-readonly PROVIDER_STOPPED_RECEIPT="$PIPELINE_ROOT/provider-stopped.json"
+readonly HARVEST_MANIFEST_RECEIPT="$PIPELINE_ROOT/harvest-manifest-receipt.json"
+readonly HARVEST_MANIFEST="$PIPELINE_ROOT/harvest-manifest.json"
+readonly HARVEST_PUBLICATION_RECEIPT="$PIPELINE_ROOT/harvest-publication.json"
+readonly HARVEST_TERMINAL_RECEIPT="$PIPELINE_ROOT/harvest-terminal.json"
+PROVIDER_STOPPED_RECEIPT="$PIPELINE_ROOT/provider-stopped.json"
 PIPELINE_COMPLETE=0
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 2; }
@@ -61,8 +67,11 @@ stop_exact_vm() {
   local observation="$PIPELINE_ROOT/.provider-stop-observation.$$.json"
   if [[ -f "$PROVIDER_STOPPED_RECEIPT" ]]; then
     python3 "$HARVEST_BUILDER" validate-provider-stop --provider-receipt "$PROVIDER_STOPPED_RECEIPT" >/dev/null
-    capture_exact_provider_state STOPPED "$observation"
-    rm -f -- "$observation"; return
+    if capture_exact_provider_state STOPPED "$observation"; then
+      rm -f -- "$observation"; return
+    fi
+    rm -f -- "$observation"
+    PROVIDER_STOPPED_RECEIPT="$PIPELINE_ROOT/provider-stopped-${RUN_ID}-$(date +%s).json"
   fi
   if capture_exact_provider_state STOPPED "$observation"; then
     provider_get >"$response"
@@ -98,8 +107,9 @@ verify_remote_training_chain() {
 set -euo pipefail
 root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; receipt="$8"
 test -f "$receipt" && test ! -L "$receipt"
-temporary="$(mktemp "$training_root/.verify-training.XXXXXX")"
-trap 'rm -f -- "$temporary"' EXIT
+temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-verify-training.XXXXXX")"
+temporary="$temporary_root/receipt.json"
+trap 'rm -rf -- "$temporary_root"' EXIT
 python3 "$root/scripts/run_public_n15_reproduction.py" verify-training-output --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --training-root "$training_root" --output "$temporary" >/dev/null
 cmp -s "$temporary" "$receipt"
 SH
@@ -123,19 +133,34 @@ SH
 verify_remote_focused_chain() {
   remote bash -s -- "$REMOTE_ROOT" "$FOCUSED_OUTPUT_ROOT" "$FOCUSED_OUTPUT_ROOT/publication.json" "$FOCUSED_PROMOTION_RECEIPT" <<'SH'
 set -euo pipefail
-root="$1"; output="$2"; publication="$3"; promotion="$4"; temporary="$(mktemp "$output/.verify-focused.XXXXXX")"; trap 'rm -f -- "$temporary"' EXIT
+root="$1"; output="$2"; publication="$3"; promotion="$4"; temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-verify-focused.XXXXXX")"; temporary="$temporary_root/receipt.json"; trap 'rm -rf -- "$temporary_root"' EXIT
 python3 "$root/scripts/run_official_lehome_comparison.py" verify-n15-focused --receipt "$output/comparison-receipt.json" --publication-receipt "$publication" --promotion-receipt "$temporary" >/dev/null
 cmp -s "$temporary" "$promotion"
 SH
 }
 
 verify_remote_harvest_chain() {
-  remote bash -s -- "$REMOTE_ROOT" "$HARVEST_ROOT" "$REMOTE_PIPELINE_ROOT/harvest.publication.json" "$REMOTE_PIPELINE_ROOT/harvest.provider-stopped.json" "$HARVEST_TERMINAL_RECEIPT" <<'SH'
+  remote bash -s -- "$REMOTE_ROOT" "$HARVEST_ROOT" "$REMOTE_PIPELINE_ROOT/harvest.publication.json" <<'SH'
 set -euo pipefail
-root="$1"; harvest="$2"; publication="$3"; stopped="$4"; terminal="$5"; temporary="$(mktemp "$harvest/.verify-harvest.XXXXXX")"; trap 'rm -f -- "$temporary"' EXIT
-python3 "$root/scripts/build_public_n15_harvest.py" verify-terminal --manifest "$harvest/manifest.json" --manifest-receipt "$harvest/manifest-receipt.json" --publication-receipt "$publication" --provider-receipt "$stopped" --output "$temporary" >/dev/null
-cmp -s "$temporary" "$terminal"
+root="$1"; harvest="$2"; publication="$3"
+python3 "$root/scripts/build_public_n15_harvest.py" verify --manifest "$harvest/manifest.json" --receipt "$harvest/manifest-receipt.json" >/dev/null
+test -s "$publication" && test ! -L "$publication"
 SH
+}
+
+fetch_remote_immutable() {
+  local remote_path="$1" local_path="$2"
+  [[ ! -e "$local_path" && ! -L "$local_path" ]] || fail "local immutable receipt already exists"
+  remote bash -s -- "$remote_path" <<'SH' >"$local_path"
+set -euo pipefail
+test -f "$1" && test ! -L "$1"
+cat -- "$1"
+SH
+  chmod 0444 "$local_path"
+}
+
+finalize_host_harvest_terminal() {
+  python3 "$HARVEST_BUILDER" verify-terminal --manifest "$HARVEST_MANIFEST" --manifest-receipt "$HARVEST_MANIFEST_RECEIPT" --publication-receipt "$HARVEST_PUBLICATION_RECEIPT" --provider-receipt "$PROVIDER_STOPPED_RECEIPT" --output "$HARVEST_TERMINAL_RECEIPT" >/dev/null
 }
 
 validate_remote_runtime() {
@@ -153,12 +178,30 @@ SH
 }
 
 train_stage() {
-  remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" <<'SH'
+  remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$LEROBOT_WHEEL" <<'SH'
 set -euo pipefail
-root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"
-test ! -e "$training_root/training-execution.json"
-python3 "$root/scripts/run_public_n15_reproduction.py" render-training --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --output "$training_root/training-execution.json" >/dev/null
-cd "$source_root"; export HF_HUB_OFFLINE=1; lerobot-train --config_path=configs/train_groot.yaml
+root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; hf_cache="$8"; python_bin="$9"; wheel="${10}"
+test ! -e "$training_root/evidence/execution-manifest.json"
+mkdir -p "$training_root/evidence" "$training_root/logs"
+install -m 0444 "$source_receipt" "$training_root/evidence/source-receipt.json"
+install -m 0444 "$snapshots" "$training_root/evidence/resolved-snapshots-receipt.json"
+install -m 0444 "$source_root/uv.lock" "$training_root/evidence/uv.lock"
+test -f "$wheel" && test ! -L "$wheel" && test -d "$hf_cache" && test ! -L "$hf_cache"
+install -m 0444 "$wheel" "$training_root/evidence/lerobot-0.4.3-py3-none-any.whl"
+"$python_bin" - "$training_root/evidence/runtime-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/lerobot-0.4.3-py3-none-any.whl" <<'PY'
+import importlib.util, json, os, sys
+from pathlib import Path
+output, lock, wheel = map(Path, sys.argv[1:])
+package = Path(importlib.util.find_spec("lerobot").origin).parent
+value = {"schema_version": 1, "kind": "lehome_public_n15_training_runtime_v1", "python_executable": sys.executable, "lerobot_wheel_path": str(wheel), "lerobot_wheel_sha256": __import__("hashlib").sha256(wheel.read_bytes()).hexdigest(), "lerobot_package_root": str(package), "dependency_lock_path": str(lock), "dependency_lock_sha256": __import__("hashlib").sha256(lock.read_bytes()).hexdigest()}
+with output.open("x", encoding="ascii") as stream: stream.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+os.chmod(output, 0o444)
+PY
+python3 "$root/scripts/run_public_n15_reproduction.py" render-training --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --output "$training_root/evidence/execution-manifest.json" >/dev/null
+# The Task1 verifier seals this exact manifest, source/snapshot receipts,
+# dependency lock, runtime receipt, train log, and checkpoint—not a hand-made
+# approximation of a successful training result.
+cd "$source_root"; export HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"; lerobot-train --config_path=configs/train_groot.yaml 2>&1 | tee "$training_root/logs/train.log"
 python3 "$root/scripts/run_public_n15_reproduction.py" verify-training-output --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --training-root "$training_root" --output "$training_root/training-identity.json" >/dev/null
 SH
 }
@@ -200,7 +243,7 @@ harvest_stage() {
   remote bash -s -- "$REMOTE_ROOT" "$HF_TOKEN_FILE" "$RUNTIME_REVISION" "$SOURCE_ROOT" "$TRAINING_ROOT/checkpoints/012000/pretrained_model" "$TRAINING_ROOT/training-identity.json" "$ROLLOUT_IMAGE_RECEIPT" "$REMOTE_PIPELINE_ROOT/harvest" "$PUBLIC_REPOSITORY" "$REMOTE_PIPELINE_ROOT/harvest.publication.json" "$REMOTE_PIPELINE_ROOT/harvest.provider-stopped.json" "$REMOTE_PIPELINE_ROOT/harvest.terminal.json" <<'SH'
 set -euo pipefail
 root="$1"; token="$2"; shift 2; test -f "$token" && test ! -L "$token"; export HF_TOKEN="$(cat "$token")"
-export LEHOME_N15_RUNTIME_REVISION="$1" LEHOME_N15_PUBLIC_SOURCE_ROOT="$2" LEHOME_N15_CHECKPOINT_ROOT="$3" LEHOME_N15_TRAINING_IDENTITY_RECEIPT="$4" LEHOME_N15_ROLLOUT_IMAGE_RECEIPT="$5" LEHOME_N15_HARVEST_ROOT="$6" LEHOME_N15_PUBLIC_HF_REPOSITORY="$7" LEHOME_N15_PUBLICATION_RECEIPT="$8" LEHOME_N15_PROVIDER_STOPPED_RECEIPT="$9" LEHOME_N15_TERMINAL_RECEIPT="${10}"
+export LEHOME_N15_RUNTIME_REVISION="$1" LEHOME_N15_PUBLIC_SOURCE_ROOT="$2" LEHOME_N15_CHECKPOINT_ROOT="$3" LEHOME_N15_TRAINING_IDENTITY_RECEIPT="$4" LEHOME_N15_ROLLOUT_IMAGE_RECEIPT="$5" LEHOME_N15_HARVEST_ROOT="$6" LEHOME_N15_PUBLIC_HF_REPOSITORY="$7" LEHOME_N15_PUBLICATION_RECEIPT="$8" LEHOME_N15_PROVIDER_STOPPED_RECEIPT="$9" LEHOME_N15_TERMINAL_RECEIPT="${10}" LEHOME_N15_DEFER_PROVIDER_STOP=1
 exec "$root/rollout_appliance/run_public_n15_harvest.sh"
 SH
 }
@@ -210,7 +253,7 @@ command -v nebius >/dev/null 2>&1 || fail "Nebius CLI is unavailable"
 command -v ssh >/dev/null 2>&1 || fail "SSH is unavailable"
 require_abs_dir "$PIPELINE_ROOT" "pipeline receipt root"; require_abs_file "$BUILDER" "checked-in lifecycle planner"
 require_abs_file "$PROVIDER_VERIFIER" "checked-in exact Nebius provider parser"; require_abs_file "$HARVEST_BUILDER" "checked-in harvest provider parser"
-[[ "$PUBLIC_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && -n "$SSH_TARGET" && "$REMOTE_ROOT" == /* && "$REMOTE_PIPELINE_ROOT" == /* && -n "$ESTIMATED_COST_USD" && -n "$ASSETS_ROOT" && -n "$METADATA_ROOT" && -n "$REFERENCE_CHECKPOINT" && -n "$REFERENCE_SANITIZED_CONFIG" && -n "$REFERENCE_COMPATIBILITY" && -n "$NATIVE_RUNTIME_EVIDENCE" && -n "$NATIVE_DEPENDENCIES" && -n "$FOCUSED_HF_CACHE" && -n "$ROLLOUT_IMAGE_RECEIPT" ]] || fail "all canonical remote inputs and the cost estimate are required"
+[[ "$PUBLIC_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && -n "$SSH_TARGET" && "$REMOTE_ROOT" == /* && "$REMOTE_PIPELINE_ROOT" == /* && -n "$ESTIMATED_COST_USD" && -n "$ASSETS_ROOT" && -n "$METADATA_ROOT" && -n "$REFERENCE_CHECKPOINT" && -n "$REFERENCE_SANITIZED_CONFIG" && -n "$REFERENCE_COMPATIBILITY" && -n "$NATIVE_RUNTIME_EVIDENCE" && -n "$NATIVE_DEPENDENCIES" && -n "$FOCUSED_HF_CACHE" && -n "$ROLLOUT_IMAGE_RECEIPT" && -n "$TRAINING_HF_CACHE" && -n "$LEROBOT_WHEEL" ]] || fail "all canonical remote inputs and the cost estimate are required"
 [[ "$TRAINING_ROOT" == "$REMOTE_PIPELINE_ROOT/training" ]] || fail "training root must be this run's canonical remote training directory"
 # Immutable pre-start cost admission: run_public_n15_reproduction.py lifecycle-plan.
 if [[ ! -e "$PLAN_RECEIPT" ]]; then python3 "$BUILDER" lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null; fi
@@ -226,6 +269,15 @@ if ! remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then publish_training_r
 verify_remote_training_publication || fail "training publication chain failed"
 if ! remote_file_exists "$FOCUSED_PROMOTION_RECEIPT"; then focused_stage || fail "focused gate failed"; fi
 verify_remote_focused_chain || fail "focused receipt chain failed"
-if ! remote_file_exists "$HARVEST_TERMINAL_RECEIPT"; then harvest_stage || fail "harvest failed"; fi
-verify_remote_harvest_chain || fail "harvest receipt chain failed"
+if [[ ! -e "$HARVEST_TERMINAL_RECEIPT" ]]; then
+  harvest_stage || fail "harvest failed"
+  verify_remote_harvest_chain || fail "harvest pre-stop receipt chain failed"
+  fetch_remote_immutable "$HARVEST_ROOT/manifest.json" "$HARVEST_MANIFEST"
+  fetch_remote_immutable "$HARVEST_ROOT/manifest-receipt.json" "$HARVEST_MANIFEST_RECEIPT"
+  fetch_remote_immutable "$REMOTE_PIPELINE_ROOT/harvest.publication.json" "$HARVEST_PUBLICATION_RECEIPT"
+  stop_exact_vm || fail "exact VM could not be stopped"
+  finalize_host_harvest_terminal || fail "host harvest terminal verification failed"
+else
+  python3 "$HARVEST_BUILDER" verify-terminal --manifest "$HARVEST_MANIFEST" --manifest-receipt "$HARVEST_MANIFEST_RECEIPT" --publication-receipt "$HARVEST_PUBLICATION_RECEIPT" --provider-receipt "$PROVIDER_STOPPED_RECEIPT" --output "$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-verify-terminal.XXXXXX")/receipt.json" >/dev/null || fail "existing host harvest terminal chain failed"
+fi
 stop_exact_vm || fail "exact VM could not be stopped"; PIPELINE_COMPLETE=1
