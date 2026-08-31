@@ -56,6 +56,7 @@ def _parser() -> argparse.ArgumentParser:
     for item in (lifecycle, commands.add_parser("verify-lifecycle-plan", help="verify a prior immutable lifecycle plan")):
         item.add_argument("--run-id", required=True)
         item.add_argument("--repository", required=True)
+        item.add_argument("--remote-pipeline-root", required=True)
         item.add_argument("--budget-usd", type=float, required=True)
         item.add_argument("--estimated-cost-usd", type=float, required=True)
         item.add_argument("--output", type=Path, required=True)
@@ -103,6 +104,8 @@ def _lifecycle_plan(args: argparse.Namespace, contract: ReproductionContract) ->
         raise ReproductionError("estimated lifecycle cost exceeds the approved budget")
     if re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", args.repository) is None:
         raise ReproductionError("public lifecycle repository is invalid")
+    if not str(args.remote_pipeline_root).startswith("/") or ".." in str(args.remote_pipeline_root).split("/"):
+        raise ReproductionError("remote lifecycle pipeline root is invalid")
     return {
         "schema_version": 1,
         "kind": "lehome_public_n15_lifecycle_plan_v1",
@@ -111,6 +114,7 @@ def _lifecycle_plan(args: argparse.Namespace, contract: ReproductionContract) ->
         "protected_disk_id": contract.disk_id,
         "provider_source_image_id": "computeimage-u00zf6w3yf72gakhcy",
         "repository": args.repository,
+        "remote_pipeline_root": args.remote_pipeline_root,
         "prefixes": {
             "training": f"n15-public/{args.run_id}/training",
             "focused": f"n15-public/{args.run_id}/focused",

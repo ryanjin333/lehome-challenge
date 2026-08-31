@@ -26,7 +26,7 @@ def test_lifecycle_plan_is_immutable_and_has_exact_paid_stage_order(tmp_path: Pa
     module = _load_cli()
     output = tmp_path / "pipeline-plan.json"
     assert module.main([
-        "lifecycle-plan", "--run-id", "n15-20260831-a", "--repository", "ryanjin333/public-n15", "--budget-usd", "100",
+        "lifecycle-plan", "--run-id", "n15-20260831-a", "--repository", "ryanjin333/public-n15", "--remote-pipeline-root", "/mnt/lehome/public-n15-runs/n15-20260831-a", "--budget-usd", "100",
         "--estimated-cost-usd", "99.99", "--output", str(output),
     ]) == 0
     value = json.loads(output.read_text(encoding="utf-8"))
@@ -42,7 +42,7 @@ def test_lifecycle_plan_is_immutable_and_has_exact_paid_stage_order(tmp_path: Pa
     ]
     assert output.stat().st_mode & 0o777 == 0o444
     assert module.main([
-        "lifecycle-plan", "--run-id", "n15-20260831-a", "--repository", "ryanjin333/public-n15", "--budget-usd", "100",
+        "lifecycle-plan", "--run-id", "n15-20260831-a", "--repository", "ryanjin333/public-n15", "--remote-pipeline-root", "/mnt/lehome/public-n15-runs/n15-20260831-a", "--budget-usd", "100",
         "--estimated-cost-usd", "99.99", "--output", str(output),
     ]) == 2
 
@@ -51,7 +51,7 @@ def test_lifecycle_plan_refuses_over_budget_before_any_provider_action(tmp_path:
     module = _load_cli()
     output = tmp_path / "pipeline-plan.json"
     assert module.main([
-        "lifecycle-plan", "--run-id", "n15-20260831-b", "--repository", "ryanjin333/public-n15", "--budget-usd", "100",
+        "lifecycle-plan", "--run-id", "n15-20260831-b", "--repository", "ryanjin333/public-n15", "--remote-pipeline-root", "/mnt/lehome/public-n15-runs/n15-20260831-b", "--budget-usd", "100",
         "--estimated-cost-usd", "100.01", "--output", str(output),
     ]) == 2
     assert not output.exists()
@@ -61,7 +61,7 @@ def test_lifecycle_plan_refuses_over_budget_before_any_provider_action(tmp_path:
 def test_lifecycle_plan_resume_requires_exact_canonical_run_and_prefixes(tmp_path: Path) -> None:
     module = _load_cli()
     output = tmp_path / "pipeline-plan.json"
-    arguments = ["--run-id", "n15-20260831-c", "--repository", "ryanjin333/public-n15", "--budget-usd", "100", "--estimated-cost-usd", "3", "--output", str(output)]
+    arguments = ["--run-id", "n15-20260831-c", "--repository", "ryanjin333/public-n15", "--remote-pipeline-root", "/mnt/lehome/public-n15-runs/n15-20260831-c", "--budget-usd", "100", "--estimated-cost-usd", "3", "--output", str(output)]
     assert module.main(["lifecycle-plan", *arguments]) == 0
     assert module.main(["verify-lifecycle-plan", *arguments]) == 0
     altered = json.loads(output.read_text(encoding="utf-8")); altered["prefixes"]["harvest"] = "shared/latest"
@@ -82,7 +82,8 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert "compute image create" not in text
     assert "trap stop_exact_vm EXIT" in text
     assert "LEHOME_N15_MAX_BUDGET_USD" in text
-    assert "LEHOME_N15_ESTIMATED_COST_USD" in text
+    assert "LEHOME_N15_ESTIMATED_COST_USD" not in text
+    assert "PROVIDER_HOURLY_CEILING_USD=3" in text
     assert "run_public_n15_reproduction.py lifecycle-plan" in text
     assert "run_public_n15_focused_gate.sh" in text
     assert "run_public_n15_harvest.sh" in text
@@ -128,7 +129,7 @@ def test_over_budget_plan_never_starts_the_mocked_exact_vm(tmp_path: Path) -> No
     pipeline = tmp_path / "pipeline"; pipeline.mkdir()
     env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "FAKE_NEBIUS_LOG": str(log),
            "LEHOME_N15_RUN_ID": "n15-over-budget", "LEHOME_N15_PIPELINE_ROOT": str(pipeline),
-           "LEHOME_N15_SSH_TARGET": "operator@example", "LEHOME_N15_REMOTE_ROOT": "/mnt/lehome/runtime", "LEHOME_N15_REMOTE_PIPELINE_ROOT": "/mnt/lehome/runs/n15-over-budget", "LEHOME_N15_ESTIMATED_COST_USD": "100.01", "LEHOME_N15_PUBLIC_HF_REPOSITORY": "ryanjin333/public-n15", "LEHOME_OFFICIAL_ASSETS_ROOT": "/mnt/assets", "LEHOME_OFFICIAL_METADATA_ROOT": "/mnt/source", "LEHOME_N15_REFERENCE_CHECKPOINT": "/mnt/reference", "LEHOME_N15_REFERENCE_SANITIZED_CONFIG_ROOT": "/mnt/reference-config", "LEHOME_N15_REFERENCE_COMPATIBILITY_RECEIPT": "/mnt/reference-receipt", "LEHOME_N15_NATIVE_RUNTIME_EVIDENCE_ROOT": "/mnt/evidence", "LEHOME_N15_NATIVE_DEPENDENCIES_ROOT": "/mnt/deps", "LEHOME_N15_FOCUSED_HF_CACHE_ROOT": "/mnt/cache", "LEHOME_N15_ROLLOUT_IMAGE_RECEIPT": "/mnt/image.json"}
+           "LEHOME_N15_MAX_BUDGET_USD": "71", "LEHOME_N15_SSH_TARGET": "operator@example", "LEHOME_N15_REMOTE_ROOT": "/mnt/lehome/runtime", "LEHOME_N15_REMOTE_RUNS_BASE": "/mnt/lehome/runs", "LEHOME_N15_REMOTE_PIPELINE_ROOT": "/mnt/lehome/runs/n15-over-budget", "LEHOME_N15_PUBLIC_HF_REPOSITORY": "ryanjin333/public-n15", "LEHOME_OFFICIAL_ASSETS_ROOT": "/mnt/assets", "LEHOME_OFFICIAL_METADATA_ROOT": "/mnt/source", "LEHOME_N15_REFERENCE_CHECKPOINT": "/mnt/reference", "LEHOME_N15_REFERENCE_SANITIZED_CONFIG_ROOT": "/mnt/reference-config", "LEHOME_N15_REFERENCE_COMPATIBILITY_RECEIPT": "/mnt/reference-receipt", "LEHOME_N15_NATIVE_RUNTIME_EVIDENCE_ROOT": "/mnt/evidence", "LEHOME_N15_NATIVE_DEPENDENCIES_ROOT": "/mnt/deps", "LEHOME_N15_FOCUSED_HF_CACHE_ROOT": "/mnt/cache", "LEHOME_N15_ROLLOUT_IMAGE_RECEIPT": "/mnt/image.json"}
     env.update({"LEHOME_N15_TRAINING_HF_CACHE_ROOT": "/mnt/train-cache", "LEHOME_N15_LEROBOT_WHEEL": "/mnt/lerobot.whl", "LEHOME_N15_TRAINING_ROOT": "/mnt/lehome/runs/n15-over-budget/training"})
     result = subprocess.run(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True)
     assert result.returncode != 0

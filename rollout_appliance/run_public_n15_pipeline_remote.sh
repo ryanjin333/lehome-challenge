@@ -16,8 +16,15 @@ readonly PIPELINE_ROOT="${LEHOME_N15_PIPELINE_ROOT:-}"
 readonly SSH_TARGET="${LEHOME_N15_SSH_TARGET:-}"
 readonly REMOTE_ROOT="${LEHOME_N15_REMOTE_ROOT:-}"
 readonly REMOTE_PIPELINE_ROOT="${LEHOME_N15_REMOTE_PIPELINE_ROOT:-}"
+readonly REMOTE_RUNS_BASE="${LEHOME_N15_REMOTE_RUNS_BASE:-/mnt/lehome/public-n15-runs}"
 readonly MAX_BUDGET_USD="${LEHOME_N15_MAX_BUDGET_USD:-100}"
-readonly ESTIMATED_COST_USD="${LEHOME_N15_ESTIMATED_COST_USD:-}"
+# Code-owned conservative ceiling: 3 USD/hour times (12h train + 4h gate +
+# 8h harvest) = 72 USD. The live provider preflight must not exceed 3 USD/h.
+readonly PROVIDER_HOURLY_CEILING_USD=3
+readonly TRAIN_TIMEOUT_SECONDS=43200
+readonly FOCUSED_TIMEOUT_SECONDS=14400
+readonly HARVEST_TIMEOUT_SECONDS=28800
+readonly ESTIMATED_COST_USD=72
 readonly PUBLIC_REPOSITORY="${LEHOME_N15_PUBLIC_HF_REPOSITORY:-}"
 readonly SOURCE_ROOT="${LEHOME_N15_PUBLIC_SOURCE_ROOT:-}"
 readonly SOURCE_RECEIPT="${LEHOME_N15_SOURCE_RECEIPT:-}"
@@ -170,10 +177,22 @@ root="$1"; pipeline_root="$2"; source_root="$3"; source_receipt="$4"; snapshots=
 test -f /var/lib/cloud/instance/boot-finished
 mount_source="$(findmnt -T "$pipeline_root" --noheadings --output SOURCE)"
 [[ "$mount_source" == /dev/* ]] && lsblk -n -o TYPE "$mount_source" | grep -Eq '^(part|lvm|crypt)$'
+# Cloud-init attaches the exact Nebius secondary disk with device_id=lehome.
+# Prove that its stable guest device backs this run's workspace mount.
+test -e /dev/disk/by-id/virtio-lehome
+[[ "$(lsblk -ndo MAJ:MIN /dev/disk/by-id/virtio-lehome)" == "$(findmnt -T "$pipeline_root" --noheadings --output MAJ:MIN)" ]]
 nvidia-smi -L | grep -q .
 test "$(git -C "$root" rev-parse HEAD)" = "$revision"
 test -z "$(git -C "$root" status --porcelain --untracked-files=all)"
-python3 "$root/scripts/run_public_n15_reproduction.py" verify-inputs --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --output "$training_root/verified-inputs.json" >/dev/null
+verified_inputs="$training_root/verified-inputs.json"
+if [[ -f "$verified_inputs" ]]; then
+  temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-verify-inputs.XXXXXX")"
+  trap 'rm -rf -- "$temporary_root"' EXIT
+  python3 "$root/scripts/run_public_n15_reproduction.py" verify-inputs --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --output "$temporary_root/receipt.json" >/dev/null
+  cmp -s "$temporary_root/receipt.json" "$verified_inputs"
+else
+  python3 "$root/scripts/run_public_n15_reproduction.py" verify-inputs --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --output "$verified_inputs" >/dev/null
+fi
 SH
 }
 
@@ -187,6 +206,8 @@ install -m 0444 "$source_receipt" "$training_root/evidence/source-receipt.json"
 install -m 0444 "$snapshots" "$training_root/evidence/resolved-snapshots-receipt.json"
 install -m 0444 "$source_root/uv.lock" "$training_root/evidence/uv.lock"
 test -f "$wheel" && test ! -L "$wheel" && test -d "$hf_cache" && test ! -L "$hf_cache"
+test -x "$python_bin" && test -x "$(dirname -- "$python_bin")/lerobot-train"
+"$python_bin" -I -c 'import lerobot; from pathlib import Path; assert Path(lerobot.__file__).is_file()'
 install -m 0444 "$wheel" "$training_root/evidence/lerobot-0.4.3-py3-none-any.whl"
 "$python_bin" - "$training_root/evidence/runtime-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/lerobot-0.4.3-py3-none-any.whl" <<'PY'
 import importlib.util, json, os, sys
@@ -201,7 +222,7 @@ python3 "$root/scripts/run_public_n15_reproduction.py" render-training --checkou
 # The Task1 verifier seals this exact manifest, source/snapshot receipts,
 # dependency lock, runtime receipt, train log, and checkpoint—not a hand-made
 # approximation of a successful training result.
-cd "$source_root"; export HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"; lerobot-train --config_path=configs/train_groot.yaml 2>&1 | tee "$training_root/logs/train.log"
+cd "$source_root"; export HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"; "$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml 2>&1 | tee "$training_root/logs/train.log"
 python3 "$root/scripts/run_public_n15_reproduction.py" verify-training-output --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --training-root "$training_root" --output "$training_root/training-identity.json" >/dev/null
 SH
 }
@@ -253,11 +274,28 @@ command -v nebius >/dev/null 2>&1 || fail "Nebius CLI is unavailable"
 command -v ssh >/dev/null 2>&1 || fail "SSH is unavailable"
 require_abs_dir "$PIPELINE_ROOT" "pipeline receipt root"; require_abs_file "$BUILDER" "checked-in lifecycle planner"
 require_abs_file "$PROVIDER_VERIFIER" "checked-in exact Nebius provider parser"; require_abs_file "$HARVEST_BUILDER" "checked-in harvest provider parser"
-[[ "$PUBLIC_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && -n "$SSH_TARGET" && "$REMOTE_ROOT" == /* && "$REMOTE_PIPELINE_ROOT" == /* && -n "$ESTIMATED_COST_USD" && -n "$ASSETS_ROOT" && -n "$METADATA_ROOT" && -n "$REFERENCE_CHECKPOINT" && -n "$REFERENCE_SANITIZED_CONFIG" && -n "$REFERENCE_COMPATIBILITY" && -n "$NATIVE_RUNTIME_EVIDENCE" && -n "$NATIVE_DEPENDENCIES" && -n "$FOCUSED_HF_CACHE" && -n "$ROLLOUT_IMAGE_RECEIPT" && -n "$TRAINING_HF_CACHE" && -n "$LEROBOT_WHEEL" ]] || fail "all canonical remote inputs and the cost estimate are required"
+[[ "$PUBLIC_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && -n "$SSH_TARGET" && "$REMOTE_ROOT" == /* && "$REMOTE_PIPELINE_ROOT" == /* && -n "$ASSETS_ROOT" && -n "$METADATA_ROOT" && -n "$REFERENCE_CHECKPOINT" && -n "$REFERENCE_SANITIZED_CONFIG" && -n "$REFERENCE_COMPATIBILITY" && -n "$NATIVE_RUNTIME_EVIDENCE" && -n "$NATIVE_DEPENDENCIES" && -n "$FOCUSED_HF_CACHE" && -n "$ROLLOUT_IMAGE_RECEIPT" && -n "$TRAINING_HF_CACHE" && -n "$LEROBOT_WHEEL" ]] || fail "all canonical remote inputs are required"
 [[ "$TRAINING_ROOT" == "$REMOTE_PIPELINE_ROOT/training" ]] || fail "training root must be this run's canonical remote training directory"
+[[ "$REMOTE_PIPELINE_ROOT" == "$REMOTE_RUNS_BASE/$RUN_ID" ]] || fail "remote pipeline root must be the canonical run-specific directory"
 # Immutable pre-start cost admission: run_public_n15_reproduction.py lifecycle-plan.
-if [[ ! -e "$PLAN_RECEIPT" ]]; then python3 "$BUILDER" lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null; fi
-python3 "$BUILDER" verify-lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null
+if [[ ! -e "$PLAN_RECEIPT" ]]; then python3 "$BUILDER" lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --remote-pipeline-root "$REMOTE_PIPELINE_ROOT" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null; fi
+python3 "$BUILDER" verify-lifecycle-plan --run-id "$RUN_ID" --repository "$PUBLIC_REPOSITORY" --remote-pipeline-root "$REMOTE_PIPELINE_ROOT" --budget-usd "$MAX_BUDGET_USD" --estimated-cost-usd "$ESTIMATED_COST_USD" --output "$PLAN_RECEIPT" >/dev/null
+# A complete immutable terminal chain is terminal even if a prior controller
+# crashed after it.  Observe current provider state before *any* start: never
+# rerun a paid stage from a completed run, and clean up a stale RUNNING VM.
+if [[ -f "$HARVEST_TERMINAL_RECEIPT" ]]; then
+  terminal_temp_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-terminal-preflight.XXXXXX")"
+  if python3 "$HARVEST_BUILDER" verify-terminal --manifest "$HARVEST_MANIFEST" --manifest-receipt "$HARVEST_MANIFEST_RECEIPT" --publication-receipt "$HARVEST_PUBLICATION_RECEIPT" --provider-receipt "$PROVIDER_STOPPED_RECEIPT" --output "$terminal_temp_root/receipt.json" >/dev/null; then
+    if capture_exact_provider_state STOPPED "$terminal_temp_root/provider.json"; then
+      rm -rf -- "$terminal_temp_root"; PIPELINE_COMPLETE=1; exit 0
+    fi
+    rm -rf -- "$terminal_temp_root"
+    stop_exact_vm || fail "completed run left the exact VM running and it could not be stopped"
+    PIPELINE_COMPLETE=1; exit 0
+  fi
+  rm -rf -- "$terminal_temp_root"
+  fail "existing terminal receipt chain is invalid"
+fi
 response="$PIPELINE_ROOT/.provider-start.$$.json"; capture_exact_provider_state STOPPED "$response" || fail "Nebius Compute API is unavailable or exact VM is not stopped"; rm -f -- "$response"
 nebius compute instance start --id "$EXACT_VM_ID" --format json --no-browser --no-progress --no-check-update --retries 1 --timeout 60s >/dev/null
 for _ in {1..60}; do capture_exact_provider_state RUNNING "$response" && break; rm -f -- "$response"; sleep 2; done
