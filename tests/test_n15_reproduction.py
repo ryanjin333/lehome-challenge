@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 import hashlib
+import io
 import json
 from pathlib import Path
+import shutil
 import subprocess
+import zipfile
 
 import pytest
 
@@ -30,6 +33,45 @@ def _sha(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _git_blob(payload: bytes) -> str:
+    header = f"blob {len(payload)}\0".encode("ascii")
+    return hashlib.sha1(header + payload).hexdigest()
+
+
+def _fixture_wheel_bytes() -> bytes:
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name, payload in {
+            "lerobot/__init__.py": b'__version__ = "0.4.3"\n',
+            "lerobot/policy.py": b"POLICY = 'groot'\n",
+            "lerobot-0.4.3.dist-info/METADATA": b"Name: lerobot\nVersion: 0.4.3\n",
+        }.items():
+            info = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+            info.external_attr = 0o100644 << 16
+            archive.writestr(info, payload)
+    return stream.getvalue()
+
+
+def _siblings(root: Path, *, lfs_paths: set[str] | None = None) -> list[dict[str, object]]:
+    lfs_paths = set() if lfs_paths is None else lfs_paths
+    result = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        payload = path.read_bytes()
+        lfs_sha256 = _sha(payload) if relative in lfs_paths else None
+        result.append(
+            {
+                "path": relative,
+                "blob_id": "f" * 40 if lfs_sha256 else _git_blob(payload),
+                "size": len(payload),
+                "lfs_sha256": lfs_sha256,
+            }
+        )
+    return result
+
+
 def _git(checkout: Path, *args: str) -> str:
     return subprocess.check_output(
         ["git", "-C", str(checkout), *args],
@@ -51,7 +93,11 @@ def _materialize_source(tmp_path: Path) -> tuple[Path, Path]:
     checkout = tmp_path / "source"
     checkout.mkdir()
     (checkout / ".gitignore").write_text("Datasets*\n", encoding="utf-8")
-    (checkout / "uv.lock").write_text("fixture dependency lock\n", encoding="utf-8")
+    wheel_sha256 = _sha(_fixture_wheel_bytes())
+    (checkout / "uv.lock").write_text(
+        f'hash = "sha256:{wheel_sha256}"\n',
+        encoding="utf-8",
+    )
     for relative in SOURCE_FILES:
         path = checkout / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,14 +165,17 @@ def _materialize_snapshots(tmp_path: Path, checkout: Path) -> tuple[Path, Path, 
             "repository": CONTRACT.base_model_repository,
             "revision": CONTRACT.base_model_revision,
             "root": str(model.resolve()),
-            "files": _manifest(model),
+            "siblings": _siblings(model, lfs_paths={"model.safetensors"}),
         },
         "dataset": {
             "repository": CONTRACT.dataset_repository,
             "revision": CONTRACT.dataset_revision,
             "root": str(dataset.resolve()),
             "snapshot_root": str(dataset_snapshot.resolve()),
-            "files": _manifest(dataset_snapshot),
+            "siblings": _siblings(
+                dataset_snapshot,
+                lfs_paths={"data/chunk-000.parquet"},
+            ),
         },
         "vm_id": CONTRACT.vm_id,
         "disk_id": CONTRACT.disk_id,
@@ -138,13 +187,30 @@ def _materialize_snapshots(tmp_path: Path, checkout: Path) -> tuple[Path, Path, 
 
 def _fixture_contract(checkout: Path):
     from dataclasses import replace
-    from lehome.n15_reproduction import CONTRACT
+    from lehome.n15_reproduction import (
+        CONTRACT,
+        hub_metadata_sha256,
+        wheel_lerobot_tree_identity,
+    )
+
+    snapshots_receipt = checkout.parent / "resolved-snapshots-receipt.json"
+    snapshots = json.loads(snapshots_receipt.read_text(encoding="utf-8"))
+    model_siblings = snapshots["base_model"]["siblings"]
+    dataset_siblings = snapshots["dataset"]["siblings"]
+    wheel_count, wheel_tree_sha256 = wheel_lerobot_tree_identity(_fixture_wheel_bytes())
 
     return replace(
         CONTRACT,
         source_revision=_git(checkout, "rev-parse", "HEAD"),
         source_tree=_git(checkout, "rev-parse", "HEAD^{tree}"),
         dependency_lock_sha256=_sha((checkout / "uv.lock").read_bytes()),
+        lerobot_wheel_sha256=_sha(_fixture_wheel_bytes()),
+        lerobot_package_file_count=wheel_count,
+        lerobot_package_tree_sha256=wheel_tree_sha256,
+        base_model_metadata_count=len(model_siblings),
+        base_model_metadata_sha256=hub_metadata_sha256(model_siblings),
+        dataset_metadata_count=len(dataset_siblings),
+        dataset_metadata_sha256=hub_metadata_sha256(dataset_siblings),
         trusted_source_files={
             relative: _sha((checkout / relative).read_bytes())
             for relative in SOURCE_FILES
@@ -159,6 +225,13 @@ def test_contract_encodes_exact_public_recipe_and_is_immutable() -> None:
     assert CONTRACT.source_revision == "d384fe00508acd96ab1c3c5dc265e08261f94b3b"
     assert CONTRACT.source_tree == "8bb4ff37d03762f8c4bc4bce5783e7d811991a3e"
     assert CONTRACT.dependency_lock_sha256 == "d0e6e3cb472cea3d04b0bc2d79b9d929bf498a392d5c155fa635f413fa092313"
+    assert CONTRACT.lerobot_wheel_sha256 == "b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c"
+    assert CONTRACT.lerobot_package_file_count == 289
+    assert CONTRACT.lerobot_package_tree_sha256 == "566fd5a0e858a66c434da1391340df6b111a2bebb0fb83ec5ec299c04e31e199"
+    assert CONTRACT.base_model_metadata_count == 13
+    assert CONTRACT.base_model_metadata_sha256 == "6da0e2fe38e294ca938d0540d0a23363446e54f941d16ce953612c443e43474a"
+    assert CONTRACT.dataset_metadata_count == 67
+    assert CONTRACT.dataset_metadata_sha256 == "63d5f109d26950a5091f82161750406ddbb7461cf24dfa1e7909897cbca4b71a"
     assert CONTRACT.base_model_repository == "nvidia/GR00T-N1.5-3B"
     assert CONTRACT.base_model_revision == "869830fc749c35f34771aa5209f923ac57e4564e"
     assert CONTRACT.dataset_repository == "lehome/dataset_challenge_merged"
@@ -199,6 +272,21 @@ def test_contract_encodes_exact_public_recipe_and_is_immutable() -> None:
     }
     with pytest.raises(FrozenInstanceError):
         CONTRACT.source_revision = "0" * 40  # type: ignore[misc]
+
+
+def test_hub_metadata_hash_is_sorted_tab_separated_and_binds_all_fields() -> None:
+    from lehome.n15_reproduction import hub_metadata_sha256
+
+    siblings = [
+        {"path": "z.bin", "blob_id": "f" * 40, "size": 3, "lfs_sha256": "a" * 64},
+        {"path": "a.json", "blob_id": "b" * 40, "size": 2, "lfs_sha256": None},
+    ]
+    canonical = (
+        f"a.json\t{'b' * 40}\t2\t\n"
+        f"z.bin\t{'f' * 40}\t3\t{'a' * 64}\n"
+    ).encode("utf-8")
+
+    assert hub_metadata_sha256(siblings) == _sha(canonical)
 
 
 def test_verify_inputs_binds_regular_source_files_snapshots_and_resources(
@@ -380,14 +468,14 @@ def test_verify_inputs_rejects_unproven_or_tampered_snapshot_content(
     elif problem == "empty_model":
         for path in model.iterdir():
             path.unlink()
-        payload["base_model"]["files"] = {}
+        payload["base_model"]["siblings"] = []
         snapshots_receipt.write_bytes(_canonical(payload))
     elif problem == "tampered_model":
         (model / "model.safetensors").write_bytes(b"tampered")
     else:
         (dataset / "data/chunk-000.parquet").write_bytes(b"tampered")
 
-    with pytest.raises(reproduction.ReproductionError, match="ref|manifest|content"):
+    with pytest.raises(reproduction.ReproductionError, match="ref|metadata|content"):
         reproduction.verify_inputs(
             checkout=checkout,
             source_receipt=source_receipt,
@@ -482,7 +570,7 @@ def _materialize_training_output(
         "optimizer_state.safetensors": b"optimizer state",
         "rng_state.safetensors": b"rng state",
         "scheduler_state.json": _canonical({"last_epoch": 12000}),
-        "training_step.json": _canonical({"batch_size": 64, "num_processes": 1, "step": 12000}),
+        "training_step.json": _canonical({"step": 12000}),
     }.items():
         (training_state / name).write_bytes(payload)
     (evidence / "source-receipt.json").write_bytes(verified.source_receipt.read_bytes())
@@ -493,22 +581,28 @@ def _materialize_training_output(
         _canonical(reproduction.build_training_manifest(verified=verified, contract=contract))
     )
     (evidence / "uv.lock").write_bytes((verified.checkout / "uv.lock").read_bytes())
-    python = runtime / "python3.11"
-    python.write_bytes(b"python executable proof")
-    lerobot = runtime / "site-packages/lerobot/__init__.py"
-    lerobot.parent.mkdir(parents=True)
-    lerobot.write_bytes(b'__version__ = "0.4.3"\n')
+    python_candidate = shutil.which("python3.11")
+    assert python_candidate is not None
+    python = Path(python_candidate).resolve()
+    wheel = evidence / "lerobot-0.4.3-py3-none-any.whl"
+    wheel.write_bytes(_fixture_wheel_bytes())
+    package_root = runtime / "site-packages/lerobot"
+    with zipfile.ZipFile(io.BytesIO(_fixture_wheel_bytes())) as archive:
+        for name in archive.namelist():
+            if not name.startswith("lerobot/") or name.endswith("/"):
+                continue
+            target = runtime / "site-packages" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(archive.read(name))
     (evidence / "runtime-receipt.json").write_bytes(
         _canonical(
             {
                 "schema_version": 1,
                 "kind": "lehome_public_n15_training_runtime_v1",
                 "python_executable": str(python.resolve()),
-                "python_executable_sha256": _sha(python.read_bytes()),
-                "python_version": "3.11.13",
-                "lerobot_origin": str(lerobot.resolve()),
-                "lerobot_origin_sha256": _sha(lerobot.read_bytes()),
-                "lerobot_version": "0.4.3",
+                "lerobot_wheel_path": str(wheel.resolve()),
+                "lerobot_wheel_sha256": contract.lerobot_wheel_sha256,
+                "lerobot_package_root": str(package_root.resolve()),
                 "dependency_lock_path": str((evidence / "uv.lock").resolve()),
                 "dependency_lock_sha256": contract.dependency_lock_sha256,
             }
@@ -580,6 +674,8 @@ def test_verify_training_output_requires_step_12000_receipts_logs_and_checksums(
         "fake_step",
         "fake_log",
         "tampered_runtime_file",
+        "invented_step_fields",
+        "wrong_python",
     ],
 )
 def test_verify_training_output_rejects_incomplete_or_unsafe_artifacts(
@@ -622,18 +718,26 @@ def test_verify_training_output_rejects_incomplete_or_unsafe_artifacts(
         (root / "evidence/execution-manifest.json").write_bytes(b"{}\n")
     elif problem == "runtime":
         receipt = json.loads((root / "evidence/runtime-receipt.json").read_text())
-        receipt["lerobot_version"] = "0.0.0"
+        receipt["lerobot_wheel_sha256"] = "0" * 64
         (root / "evidence/runtime-receipt.json").write_bytes(_canonical(receipt))
     elif problem == "fake_step":
         (root / "checkpoints/012000/training_state/training_step.json").write_bytes(
-            _canonical({"batch_size": 64, "num_processes": 1, "step": 11999})
+            _canonical({"step": 11999})
         )
     elif problem == "fake_log":
         (root / "logs/train.log").write_text("step 12000 complete\n", encoding="utf-8")
-    else:
+    elif problem == "tampered_runtime_file":
         (root / "runtime/site-packages/lerobot/__init__.py").write_bytes(
             b'__version__ = "tampered"\n'
         )
+    elif problem == "invented_step_fields":
+        (root / "checkpoints/012000/training_state/training_step.json").write_bytes(
+            _canonical({"batch_size": 64, "num_processes": 1, "step": 12000})
+        )
+    else:
+        receipt = json.loads((root / "evidence/runtime-receipt.json").read_text())
+        receipt["python_executable"] = str(Path("/usr/bin/python3").resolve())
+        (root / "evidence/runtime-receipt.json").write_bytes(_canonical(receipt))
     if problem != "checksum":
         _write_training_checksums(root)
 

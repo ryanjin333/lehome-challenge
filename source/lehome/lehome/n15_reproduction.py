@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -18,6 +19,7 @@ import subprocess
 import tempfile
 from types import MappingProxyType
 from typing import Mapping
+import zipfile
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -34,6 +36,13 @@ class ReproductionContract:
     source_revision: str
     source_tree: str
     dependency_lock_sha256: str
+    lerobot_wheel_sha256: str
+    lerobot_package_file_count: int
+    lerobot_package_tree_sha256: str
+    base_model_metadata_count: int
+    base_model_metadata_sha256: str
+    dataset_metadata_count: int
+    dataset_metadata_sha256: str
     base_model_repository: str
     base_model_revision: str
     dataset_repository: str
@@ -60,6 +69,13 @@ CONTRACT = ReproductionContract(
     source_revision="d384fe00508acd96ab1c3c5dc265e08261f94b3b",
     source_tree="8bb4ff37d03762f8c4bc4bce5783e7d811991a3e",
     dependency_lock_sha256="d0e6e3cb472cea3d04b0bc2d79b9d929bf498a392d5c155fa635f413fa092313",
+    lerobot_wheel_sha256="b08c1c15b2356bd4e658122deabfb9dacd2d7447de4a4327720991723d4edf2c",
+    lerobot_package_file_count=289,
+    lerobot_package_tree_sha256="566fd5a0e858a66c434da1391340df6b111a2bebb0fb83ec5ec299c04e31e199",
+    base_model_metadata_count=13,
+    base_model_metadata_sha256="6da0e2fe38e294ca938d0540d0a23363446e54f941d16ce953612c443e43474a",
+    dataset_metadata_count=67,
+    dataset_metadata_sha256="63d5f109d26950a5091f82161750406ddbb7461cf24dfa1e7909897cbca4b71a",
     base_model_repository="nvidia/GR00T-N1.5-3B",
     base_model_revision="869830fc749c35f34771aa5209f923ac57e4564e",
     dataset_repository="lehome/dataset_challenge_merged",
@@ -114,8 +130,8 @@ class VerifiedInputs:
     source_receipt_sha256: str
     resolved_snapshots_receipt_sha256: str
     source_tree: str
-    base_model_manifest_sha256: str
-    dataset_manifest_sha256: str
+    base_model_metadata_sha256: str
+    dataset_metadata_sha256: str
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -144,6 +160,119 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _git_blob_sha1(payload: bytes) -> str:
+    header = f"blob {len(payload)}\0".encode("ascii")
+    return hashlib.sha1(header + payload).hexdigest()
+
+
+def _validated_hub_siblings(siblings: object) -> list[dict[str, object]]:
+    if not isinstance(siblings, list) or not siblings:
+        raise ReproductionError("Hub sibling metadata is empty or invalid")
+    validated: list[dict[str, object]] = []
+    paths: set[str] = set()
+    for candidate in siblings:
+        if not isinstance(candidate, dict) or set(candidate) != {
+            "path",
+            "blob_id",
+            "size",
+            "lfs_sha256",
+        }:
+            raise ReproductionError("Hub sibling metadata schema is invalid")
+        path = candidate["path"]
+        blob_id = candidate["blob_id"]
+        size = candidate["size"]
+        lfs_sha256 = candidate["lfs_sha256"]
+        if not isinstance(path, str):
+            raise ReproductionError("Hub sibling metadata path is invalid")
+        pure = PurePosixPath(path)
+        if (
+            pure.is_absolute()
+            or not pure.parts
+            or any(part in {"", ".", ".."} for part in pure.parts)
+            or path in paths
+            or not isinstance(blob_id, str)
+            or _REVISION.fullmatch(blob_id) is None
+            or type(size) is not int
+            or size < 0
+            or (lfs_sha256 is not None and (
+                not isinstance(lfs_sha256, str) or _SHA256.fullmatch(lfs_sha256) is None
+            ))
+        ):
+            raise ReproductionError("Hub sibling metadata identity is invalid")
+        paths.add(path)
+        validated.append(dict(candidate))
+    return sorted(validated, key=lambda value: str(value["path"]))
+
+
+def hub_metadata_sha256(siblings: object) -> str:
+    """Hash authoritative Hub sibling metadata using the frozen canonical form."""
+
+    rows = _validated_hub_siblings(siblings)
+    payload = "".join(
+        f"{row['path']}\t{row['blob_id']}\t{row['size']}\t{row['lfs_sha256'] or ''}\n"
+        for row in rows
+    ).encode("utf-8")
+    return _sha256_bytes(payload)
+
+
+def _tree_identity(files: Mapping[str, bytes]) -> tuple[int, str]:
+    payload = b"".join(
+        relative.encode("utf-8")
+        + b"\0"
+        + _sha256_bytes(content).encode("ascii")
+        + b"\n"
+        for relative, content in sorted(files.items())
+    )
+    return len(files), _sha256_bytes(payload)
+
+
+def wheel_lerobot_tree_identity(wheel: bytes) -> tuple[int, str]:
+    """Return the canonical source-tree identity embedded under ``lerobot/``."""
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
+            files: dict[str, bytes] = {}
+            for info in archive.infolist():
+                if info.is_dir() or not info.filename.startswith("lerobot/"):
+                    continue
+                relative = info.filename.removeprefix("lerobot/")
+                pure = PurePosixPath(relative)
+                file_type = (info.external_attr >> 16) & 0o170000
+                if (
+                    not relative
+                    or pure.is_absolute()
+                    or any(part in {"", ".", ".."} for part in pure.parts)
+                    or relative in files
+                    or file_type == stat.S_IFLNK
+                ):
+                    raise ReproductionError("LeRobot wheel package entry is unsafe")
+                files[relative] = archive.read(info)
+    except (OSError, zipfile.BadZipFile, KeyError):
+        raise ReproductionError("LeRobot wheel is invalid") from None
+    if not files:
+        raise ReproductionError("LeRobot wheel contains no package tree")
+    return _tree_identity(files)
+
+
+def _installed_package_tree_identity(root: Path) -> tuple[int, str]:
+    files: dict[str, bytes] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        metadata = path.lstat()
+        if path.is_symlink():
+            raise ReproductionError(f"installed LeRobot tree contains unsafe symlink: {relative}")
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReproductionError(f"installed LeRobot tree contains unsafe entry: {relative}")
+        if "__pycache__" in path.parts or path.suffix == ".pyc":
+            continue
+        files[relative] = path.read_bytes()
+    if not files:
+        raise ReproductionError("installed LeRobot package tree is empty")
+    return _tree_identity(files)
 
 
 def _regular_file(path: Path, label: str) -> Path:
@@ -228,6 +357,12 @@ def _validate_source(
     dependency_lock = _safe_relative_file(root, "uv.lock", "upstream dependency lock")
     if _sha256_file(dependency_lock) != contract.dependency_lock_sha256:
         raise ReproductionError("upstream dependency lock digest mismatch")
+    try:
+        dependency_lock_text = dependency_lock.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise ReproductionError("upstream dependency lock is unreadable") from None
+    if f"sha256:{contract.lerobot_wheel_sha256}" not in dependency_lock_text:
+        raise ReproductionError("upstream dependency lock lacks the trusted LeRobot wheel")
     git_directory = _regular_directory(root / ".git", "source Git metadata")
     del git_directory
 
@@ -257,8 +392,18 @@ def _validate_source(
     return root, receipt, _sha256_bytes(receipt_bytes)
 
 
-def _manifest(root: Path, label: str) -> dict[str, str]:
-    files: dict[str, str] = {}
+def _verify_hub_snapshot(
+    root: Path,
+    siblings: object,
+    *,
+    label: str,
+    expected_count: int,
+    expected_metadata_sha256: str,
+) -> list[dict[str, object]]:
+    rows = _validated_hub_siblings(siblings)
+    if len(rows) != expected_count or hub_metadata_sha256(rows) != expected_metadata_sha256:
+        raise ReproductionError(f"{label} authoritative Hub metadata mismatch")
+    actual_paths: set[str] = set()
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
         metadata = path.lstat()
@@ -268,29 +413,23 @@ def _manifest(root: Path, label: str) -> dict[str, str]:
             continue
         if not stat.S_ISREG(metadata.st_mode):
             raise ReproductionError(f"{label} content contains unsafe entry: {relative}")
-        files[relative] = _sha256_file(path)
-    if not files:
-        raise ReproductionError(f"{label} content manifest is empty")
-    return files
-
-
-def _receipt_manifest(candidate: object, label: str) -> dict[str, str]:
-    if not isinstance(candidate, dict) or not candidate:
-        raise ReproductionError(f"{label} content manifest is empty or invalid")
-    manifest: dict[str, str] = {}
-    for relative, digest in candidate.items():
-        if not isinstance(relative, str) or not isinstance(digest, str):
-            raise ReproductionError(f"{label} content manifest is invalid")
-        pure = PurePosixPath(relative)
-        if (
-            pure.is_absolute()
-            or not pure.parts
-            or any(part in {"", ".", ".."} for part in pure.parts)
-            or _SHA256.fullmatch(digest) is None
-        ):
-            raise ReproductionError(f"{label} content manifest is invalid")
-        manifest[relative] = digest
-    return manifest
+        actual_paths.add(relative)
+    expected_paths = {str(row["path"]) for row in rows}
+    if actual_paths != expected_paths:
+        raise ReproductionError(f"{label} content file set mismatches authoritative metadata")
+    for row in rows:
+        relative = str(row["path"])
+        path = _safe_relative_file(root, relative, f"{label} file {relative}")
+        payload = path.read_bytes()
+        if len(payload) != row["size"]:
+            raise ReproductionError(f"{label} content size mismatch: {relative}")
+        lfs_sha256 = row["lfs_sha256"]
+        if lfs_sha256 is None:
+            if _git_blob_sha1(payload) != row["blob_id"]:
+                raise ReproductionError(f"{label} Git blob mismatch: {relative}")
+        elif _sha256_bytes(payload) != lfs_sha256:
+            raise ReproductionError(f"{label} LFS content mismatch: {relative}")
+    return rows
 
 
 def _validate_snapshots(
@@ -323,7 +462,7 @@ def _validate_snapshots(
         repository: str,
         revision: str,
     ) -> Path:
-        expected = {"repository", "revision", "root", "files"}
+        expected = {"repository", "revision", "root", "siblings"}
         if label == "dataset":
             expected.add("snapshot_root")
         if not isinstance(candidate, dict) or set(candidate) != expected:
@@ -363,11 +502,16 @@ def _validate_snapshots(
         raise ReproductionError("base model main ref mismatch")
     model_receipt = value["base_model"]
     assert isinstance(model_receipt, dict)
-    expected_model_manifest = _receipt_manifest(model_receipt["files"], "base model")
-    if _manifest(model, "base model") != expected_model_manifest:
-        raise ReproductionError("base model content manifest mismatch")
-    if "config.json" not in expected_model_manifest or not any(
-        relative.endswith(".safetensors") for relative in expected_model_manifest
+    model_siblings = _verify_hub_snapshot(
+        model,
+        model_receipt["siblings"],
+        label="base model",
+        expected_count=contract.base_model_metadata_count,
+        expected_metadata_sha256=contract.base_model_metadata_sha256,
+    )
+    model_paths = {str(row["path"]) for row in model_siblings}
+    if "config.json" not in model_paths or not any(
+        relative.endswith(".safetensors") for relative in model_paths
     ):
         raise ReproductionError("base model content manifest lacks required model files")
     expected_dataset = checkout / "Datasets/example/four_types_merged"
@@ -386,13 +530,23 @@ def _validate_snapshots(
         or snapshot_root.parent.parent.name != expected_dataset_directory
     ):
         raise ReproductionError("dataset Hub snapshot staged path mismatch")
-    expected_dataset_manifest = _receipt_manifest(dataset_receipt["files"], "dataset")
-    if _manifest(snapshot_root, "dataset Hub snapshot") != expected_dataset_manifest:
-        raise ReproductionError("dataset snapshot content manifest mismatch")
-    if _manifest(dataset, "staged dataset") != expected_dataset_manifest:
-        raise ReproductionError("staged dataset content manifest mismatch")
-    if not any(path.startswith("meta/") for path in expected_dataset_manifest) or not any(
-        path.startswith("data/") for path in expected_dataset_manifest
+    dataset_siblings = _verify_hub_snapshot(
+        snapshot_root,
+        dataset_receipt["siblings"],
+        label="dataset Hub snapshot",
+        expected_count=contract.dataset_metadata_count,
+        expected_metadata_sha256=contract.dataset_metadata_sha256,
+    )
+    _verify_hub_snapshot(
+        dataset,
+        dataset_siblings,
+        label="staged dataset",
+        expected_count=contract.dataset_metadata_count,
+        expected_metadata_sha256=contract.dataset_metadata_sha256,
+    )
+    dataset_paths = {str(row["path"]) for row in dataset_siblings}
+    if not any(path.startswith("meta/") for path in dataset_paths) or not any(
+        path.startswith("data/") for path in dataset_paths
     ):
         raise ReproductionError("dataset content manifest lacks metadata or data")
     return (
@@ -401,8 +555,8 @@ def _validate_snapshots(
         dataset,
         receipt,
         _sha256_bytes(receipt_bytes),
-        _sha256_bytes(_canonical_bytes(expected_model_manifest)),
-        _sha256_bytes(_canonical_bytes(expected_dataset_manifest)),
+        contract.base_model_metadata_sha256,
+        contract.dataset_metadata_sha256,
     )
 
 
@@ -424,8 +578,8 @@ def verify_inputs(
         dataset,
         snapshots_path,
         snapshots_sha256,
-        model_manifest_sha256,
-        dataset_manifest_sha256,
+        model_metadata_sha256,
+        dataset_metadata_sha256,
     ) = _validate_snapshots(
         resolved_snapshots_receipt,
         vm_id,
@@ -443,8 +597,8 @@ def verify_inputs(
         source_receipt_sha256=source_sha256,
         resolved_snapshots_receipt_sha256=snapshots_sha256,
         source_tree=contract.source_tree,
-        base_model_manifest_sha256=model_manifest_sha256,
-        dataset_manifest_sha256=dataset_manifest_sha256,
+        base_model_metadata_sha256=model_metadata_sha256,
+        dataset_metadata_sha256=dataset_metadata_sha256,
     )
 
 
@@ -496,6 +650,13 @@ def _contract_json(contract: ReproductionContract) -> dict[str, object]:
         "source_revision": contract.source_revision,
         "source_tree": contract.source_tree,
         "dependency_lock_sha256": contract.dependency_lock_sha256,
+        "lerobot_wheel_sha256": contract.lerobot_wheel_sha256,
+        "lerobot_package_file_count": contract.lerobot_package_file_count,
+        "lerobot_package_tree_sha256": contract.lerobot_package_tree_sha256,
+        "base_model_metadata_count": contract.base_model_metadata_count,
+        "base_model_metadata_sha256": contract.base_model_metadata_sha256,
+        "dataset_metadata_count": contract.dataset_metadata_count,
+        "dataset_metadata_sha256": contract.dataset_metadata_sha256,
         "base_model_repository": contract.base_model_repository,
         "base_model_revision": contract.base_model_revision,
         "dataset_repository": contract.dataset_repository,
@@ -530,8 +691,8 @@ def build_training_manifest(
             "source_tree": verified.source_tree,
             "resolved_snapshots_receipt": str(verified.resolved_snapshots_receipt),
             "resolved_snapshots_receipt_sha256": verified.resolved_snapshots_receipt_sha256,
-            "base_model_manifest_sha256": verified.base_model_manifest_sha256,
-            "dataset_manifest_sha256": verified.dataset_manifest_sha256,
+            "base_model_metadata_sha256": verified.base_model_metadata_sha256,
+            "dataset_metadata_sha256": verified.dataset_metadata_sha256,
         },
         "execution": {
             "cwd": str(verified.checkout),
@@ -696,10 +857,8 @@ def verify_training_output(
         raise ReproductionError("training-step evidence is invalid") from None
     if (
         not isinstance(step_receipt, dict)
+        or set(step_receipt) != {"step"}
         or step_receipt.get("step") != int(contract.training["steps"])
-        or step_receipt.get("batch_size") != int(contract.training["batch_size"])
-        or type(step_receipt.get("num_processes")) is not int
-        or int(step_receipt["num_processes"]) < 1
     ):
         raise ReproductionError("training-step evidence does not prove step 12000")
 
@@ -732,11 +891,9 @@ def verify_training_output(
         "schema_version",
         "kind",
         "python_executable",
-        "python_executable_sha256",
-        "python_version",
-        "lerobot_origin",
-        "lerobot_origin_sha256",
-        "lerobot_version",
+        "lerobot_wheel_path",
+        "lerobot_wheel_sha256",
+        "lerobot_package_root",
         "dependency_lock_path",
         "dependency_lock_sha256",
     }:
@@ -744,34 +901,82 @@ def verify_training_output(
     if (
         runtime["schema_version"] != 1
         or runtime["kind"] != "lehome_public_n15_training_runtime_v1"
-        or not isinstance(runtime["python_version"], str)
-        or re.fullmatch(r"3\.11\.\d+", runtime["python_version"]) is None
-        or runtime["lerobot_version"] != contract.lerobot_version
+        or runtime["lerobot_wheel_sha256"] != contract.lerobot_wheel_sha256
         or runtime["dependency_lock_sha256"] != contract.dependency_lock_sha256
         or runtime["dependency_lock_path"] != str(lock)
         or not isinstance(runtime["python_executable"], str)
-        or not isinstance(runtime["lerobot_origin"], str)
-        or not isinstance(runtime["python_executable_sha256"], str)
-        or not isinstance(runtime["lerobot_origin_sha256"], str)
-        or _SHA256.fullmatch(runtime["python_executable_sha256"]) is None
-        or _SHA256.fullmatch(runtime["lerobot_origin_sha256"]) is None
+        or not isinstance(runtime["lerobot_wheel_path"], str)
+        or not isinstance(runtime["lerobot_package_root"], str)
     ):
         raise ReproductionError("training runtime identity mismatch")
     python_executable = _regular_file(
         Path(runtime["python_executable"]),
         "training Python executable proof",
     )
-    lerobot_origin = _regular_file(
-        Path(runtime["lerobot_origin"]),
-        "training LeRobot origin proof",
-    )
+    try:
+        version_result = subprocess.run(
+            [
+                str(python_executable),
+                "-I",
+                "-c",
+                "import json,sys; print(json.dumps(list(sys.version_info[:3])))",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise ReproductionError("training Python version probe failed") from None
+    try:
+        actual_python_version = json.loads(version_result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        raise ReproductionError("training Python version probe is invalid") from None
+    try:
+        expected_python = [int(part) for part in contract.python_version.split(".")]
+    except ValueError:
+        raise ReproductionError("contract Python version is invalid") from None
     if (
-        python_executable != artifacts.get("runtime/python3.11")
-        or lerobot_origin != artifacts.get("runtime/site-packages/lerobot/__init__.py")
-        or _sha256_file(python_executable) != runtime["python_executable_sha256"]
-        or _sha256_file(lerobot_origin) != runtime["lerobot_origin_sha256"]
+        version_result.returncode != 0
+        or not isinstance(actual_python_version, list)
+        or len(actual_python_version) != 3
+        or actual_python_version[: len(expected_python)] != expected_python
+        or any(type(part) is not int for part in actual_python_version)
     ):
-        raise ReproductionError("training runtime proof is outside the sealed output")
+        raise ReproductionError(
+            f"training Python interpreter is not Python {contract.python_version}"
+        )
+
+    wheel = _regular_file(
+        Path(runtime["lerobot_wheel_path"]),
+        "training LeRobot wheel",
+    )
+    if wheel != artifacts.get("evidence/lerobot-0.4.3-py3-none-any.whl"):
+        raise ReproductionError("training LeRobot wheel is outside the sealed output")
+    wheel_bytes = wheel.read_bytes()
+    if _sha256_bytes(wheel_bytes) != contract.lerobot_wheel_sha256:
+        raise ReproductionError("training LeRobot wheel digest mismatch")
+    wheel_count, wheel_tree_sha256 = wheel_lerobot_tree_identity(wheel_bytes)
+    if (
+        wheel_count != contract.lerobot_package_file_count
+        or wheel_tree_sha256 != contract.lerobot_package_tree_sha256
+    ):
+        raise ReproductionError("training LeRobot wheel package tree mismatch")
+    try:
+        with zipfile.ZipFile(io.BytesIO(wheel_bytes)) as archive:
+            metadata = archive.read("lerobot-0.4.3.dist-info/METADATA").decode("utf-8")
+    except (KeyError, UnicodeError, zipfile.BadZipFile):
+        raise ReproductionError("training LeRobot wheel metadata is invalid") from None
+    if "Name: lerobot\n" not in metadata or f"Version: {contract.lerobot_version}\n" not in metadata:
+        raise ReproductionError("training LeRobot wheel distribution identity mismatch")
+    package_root = _regular_directory(
+        Path(runtime["lerobot_package_root"]),
+        "installed LeRobot package root",
+    )
+    package_count, package_tree_sha256 = _installed_package_tree_identity(package_root)
+    if package_count != wheel_count or package_tree_sha256 != wheel_tree_sha256:
+        raise ReproductionError("installed LeRobot package differs from the trusted wheel")
     log = artifacts.get("logs/train.log")
     if log is None or log.stat().st_size == 0:
         raise ReproductionError("training log is missing or empty")

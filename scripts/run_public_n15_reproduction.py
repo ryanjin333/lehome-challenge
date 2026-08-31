@@ -75,8 +75,8 @@ def _verified_inputs_receipt(verified, contract: ReproductionContract) -> dict[s
         "source_tree": verified.source_tree,
         "resolved_snapshots_receipt": str(verified.resolved_snapshots_receipt),
         "resolved_snapshots_receipt_sha256": verified.resolved_snapshots_receipt_sha256,
-        "base_model_manifest_sha256": verified.base_model_manifest_sha256,
-        "dataset_manifest_sha256": verified.dataset_manifest_sha256,
+        "base_model_metadata_sha256": verified.base_model_metadata_sha256,
+        "dataset_metadata_sha256": verified.dataset_metadata_sha256,
         "vm_id": contract.vm_id,
         "disk_id": contract.disk_id,
     }
