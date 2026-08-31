@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import math
@@ -164,6 +165,13 @@ class _EvidenceWriter:
         self.previous = ZERO_SHA256
         self.pending: list[bytes] = []
 
+    def _append_record(self, event: dict[str, object]) -> None:
+        event["previous_event_sha256"] = self.previous
+        event_sha = hashlib.sha256(_canonical(event)).hexdigest()
+        event["event_sha256"] = event_sha
+        self.pending.append(_canonical(event))
+        self.previous = event_sha
+
     def append(
         self,
         *,
@@ -173,7 +181,7 @@ class _EvidenceWriter:
         step_index: int,
         health: Mapping[str, object],
     ) -> None:
-        event = {
+        self._append_record({
             "schema_version": 1,
             "kind": "lehome_native_cloth_fidelity_event_v1",
             "garment": garment,
@@ -181,12 +189,26 @@ class _EvidenceWriter:
             "stage": stage,
             "step_index": step_index,
             "health": dict(health),
-            "previous_event_sha256": self.previous,
-        }
-        event_sha = hashlib.sha256(_canonical(event)).hexdigest()
-        event["event_sha256"] = event_sha
-        self.pending.append(_canonical(event))
-        self.previous = event_sha
+        })
+
+    def append_terminal(
+        self,
+        *,
+        garment: str,
+        reset_sequence: int,
+        step_index: int,
+        status: str,
+    ) -> None:
+        if status not in {"healthy", "invalid"}:
+            raise ValueError("cloth fidelity terminal status is invalid")
+        self._append_record({
+            "schema_version": 1,
+            "kind": "lehome_native_cloth_fidelity_terminal_v1",
+            "garment": garment,
+            "reset_sequence": reset_sequence,
+            "step_index": step_index,
+            "status": status,
+        })
 
     def flush(self, *, reason: str) -> None:
         if not self.pending:
@@ -214,9 +236,40 @@ def install_cloth_fidelity_monitor_on_env(env: object, evidence_path: Path) -> N
     original_reset = env.reset
     original_step = env.step
     original_success = env._get_success
-    state = {"reset_sequence": 0, "step_index": 0, "garment": ""}
+    original_close = getattr(env, "close", None)
+    state = {
+        "reset_sequence": 0,
+        "step_index": 0,
+        "garment": "",
+        "episode_active": False,
+        "closed": False,
+    }
+
+    def finalize_episode(*, status: str, reason: str) -> None:
+        if not state["episode_active"]:
+            return
+        writer.append_terminal(
+            garment=str(state["garment"]),
+            reset_sequence=int(state["reset_sequence"]),
+            step_index=int(state["step_index"]),
+            status=status,
+        )
+        writer.flush(reason=reason)
+        state["episode_active"] = False
+
+    def close_monitor(*, reason: str) -> None:
+        if state["closed"]:
+            return
+        finalize_episode(status="healthy", reason=reason)
+        state["closed"] = True
+
+    def process_exit() -> None:
+        close_monitor(reason="process_exit")
+
+    atexit.register(process_exit)
 
     def reset(self: object, *args: object, **kwargs: object):
+        finalize_episode(status="healthy", reason="next_reset")
         result = original_reset(*args, **kwargs)
         state["reset_sequence"] += 1
         state["step_index"] = 0
@@ -234,7 +287,8 @@ def install_cloth_fidelity_monitor_on_env(env: object, evidence_path: Path) -> N
                 step_index=int(state["step_index"]),
                 health=error.health,
             )
-            writer.flush(reason=f"{stage}_invalid")
+            state["episode_active"] = True
+            finalize_episode(status="invalid", reason=f"{stage}_invalid")
             raise
         writer.append(
             garment=str(state["garment"]),
@@ -243,6 +297,7 @@ def install_cloth_fidelity_monitor_on_env(env: object, evidence_path: Path) -> N
             step_index=int(state["step_index"]),
             health=health,
         )
+        state["episode_active"] = True
 
     def step(self: object, action: object):
         result = original_step(action)
@@ -252,12 +307,19 @@ def install_cloth_fidelity_monitor_on_env(env: object, evidence_path: Path) -> N
 
     def get_success(self: object):
         observe(self, "pre_score")
-        writer.flush(reason="episode_pre_score")
         return original_success()
+
+    def close(self: object, *args: object, **kwargs: object):
+        close_monitor(reason="explicit_close")
+        atexit.unregister(process_exit)
+        if callable(original_close):
+            return original_close(*args, **kwargs)
+        return None
 
     env.reset = MethodType(reset, env)
     env.step = MethodType(step, env)
     env._get_success = MethodType(get_success, env)
+    env.close = MethodType(close, env)
 
 
 def validate_cloth_fidelity_evidence(
@@ -280,21 +342,34 @@ def validate_cloth_fidelity_evidence(
             raise ValueError("cloth fidelity evidence hash chain is invalid")
         event["event_sha256"] = event_sha
         previous = event_sha
-        health = event.get("health")
-        if (
-            set(event) != {
-                "schema_version", "kind", "garment", "reset_sequence", "stage",
-                "step_index", "health", "previous_event_sha256", "event_sha256",
-            }
-            or event.get("schema_version") != 1
-            or event.get("kind") != "lehome_native_cloth_fidelity_event_v1"
-            or event.get("stage") not in {"post_step", "pre_score"}
+        common_invalid = (
+            event.get("schema_version") != 1
             or type(event.get("reset_sequence")) is not int
             or type(event.get("step_index")) is not int
             or not isinstance(event.get("garment"), str)
-            or not isinstance(health, Mapping)
-            or not _HEALTH_KEYS <= set(health)
-        ):
+        )
+        if event.get("kind") == "lehome_native_cloth_fidelity_event_v1":
+            health = event.get("health")
+            schema_invalid = (
+                set(event) != {
+                    "schema_version", "kind", "garment", "reset_sequence", "stage",
+                    "step_index", "health", "previous_event_sha256", "event_sha256",
+                }
+                or event.get("stage") not in {"post_step", "pre_score"}
+                or not isinstance(health, Mapping)
+                or not _HEALTH_KEYS <= set(health)
+            )
+        elif event.get("kind") == "lehome_native_cloth_fidelity_terminal_v1":
+            schema_invalid = (
+                set(event) != {
+                    "schema_version", "kind", "garment", "reset_sequence",
+                    "step_index", "status", "previous_event_sha256", "event_sha256",
+                }
+                or event.get("status") not in {"healthy", "invalid"}
+            )
+        else:
+            schema_invalid = True
+        if common_invalid or schema_invalid:
             raise ValueError("cloth fidelity evidence schema is invalid")
         events.append(event)
     if not events:
@@ -303,10 +378,31 @@ def validate_cloth_fidelity_evidence(
     active: list[tuple[str, int]] = []
     for key in dict.fromkeys((str(row["garment"]), int(row["reset_sequence"])) for row in events):
         selected = [row for row in events if (row["garment"], row["reset_sequence"]) == key]
-        if any(row["stage"] == "post_step" for row in selected):
-            if not any(row["stage"] == "pre_score" for row in selected):
+        observations = [
+            row for row in selected
+            if row["kind"] == "lehome_native_cloth_fidelity_event_v1"
+        ]
+        terminals = [
+            row for row in selected
+            if row["kind"] == "lehome_native_cloth_fidelity_terminal_v1"
+        ]
+        if not observations or len(terminals) != 1 or selected[-1] is not terminals[0]:
+            raise ValueError("cloth fidelity episode lacks a terminal sentinel")
+        invalid_observed = any(
+            any(bool(row["health"].get(flag)) for flag in (
+                "missing_cloth", "cloth_flight", "nonfinite_cloth_state"
+            ))
+            for row in observations
+        )
+        terminal_status = terminals[0]["status"]
+        if terminal_status == "healthy":
+            if invalid_observed or not any(row["stage"] == "post_step" for row in observations):
+                raise ValueError("cloth fidelity healthy terminal is inconsistent")
+            if not any(row["stage"] == "pre_score" for row in observations):
                 raise ValueError("cloth fidelity episode lacks pre-score evidence")
-            active.append(key)
+        elif not invalid_observed:
+            raise ValueError("cloth fidelity invalid terminal lacks invalid evidence")
+        active.append(key)
     ordinal: dict[str, int] = {}
     observed: list[tuple[str, int]] = []
     for garment, _reset in active:
@@ -317,7 +413,8 @@ def validate_cloth_fidelity_evidence(
     invalid_episodes = 0
     for key in active:
         if any(
-            any(bool(row["health"].get(flag)) for flag in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state"))
+            row.get("kind") == "lehome_native_cloth_fidelity_event_v1"
+            and any(bool(row["health"].get(flag)) for flag in ("missing_cloth", "cloth_flight", "nonfinite_cloth_state"))
             for row in events
             if (row["garment"], row["reset_sequence"]) == key
         ):

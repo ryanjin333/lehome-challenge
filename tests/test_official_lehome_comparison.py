@@ -466,6 +466,7 @@ def _write_measured_fidelity(path: Path, garments: list[str]) -> None:
         env.cfg.garment_name = garment
         for _episode in (1, 2):
             env.reset(); env.step(None); env._get_success()
+    env.close()
 
 
 def _focused_result(
