@@ -315,7 +315,7 @@ set -euo pipefail
 root="$1"; pipeline_root="$2"; source_root="$3"; source_receipt="$4"; snapshots="$5"; training_root="$6"; revision="$7"; vm_id="$8"; disk_id="$9"
 test -f /var/lib/cloud/instance/boot-finished
 mount_source="$(findmnt -T "$pipeline_root" --noheadings --output SOURCE)"
-[[ "$mount_source" == /dev/* ]] && lsblk -n -o TYPE "$mount_source" | grep -Eq '^(part|lvm|crypt)$'
+[[ "$mount_source" == /dev/* ]] && lsblk -n -o TYPE "$mount_source" | grep -Eq '^(disk|part|lvm|crypt)$'
 # Cloud-init attaches the exact Nebius secondary disk with device_id=lehome.
 # Prove that its stable guest device backs this run's workspace mount.
 test -e /dev/disk/by-id/virtio-lehome

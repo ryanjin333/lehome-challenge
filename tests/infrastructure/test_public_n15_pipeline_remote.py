@@ -91,6 +91,8 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert "run_public_n15_reproduction.py lifecycle-plan" in text
     assert 'readonly TRAINING_UV="${LEHOME_N15_TRAINING_UV:-}"' in text
     assert 'test -x "$uv_bin" && test ! -L "$uv_bin"' in text
+    assert "grep -Eq '^(disk|part|lvm|crypt)$'" in text
+    assert 'lsblk -ndo MAJ:MIN /dev/disk/by-id/virtio-lehome' in text
     assert '"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin"' in text
     assert '"$python_bin" -m pip install' not in text
     assert "run_public_n15_focused_gate.sh" in text

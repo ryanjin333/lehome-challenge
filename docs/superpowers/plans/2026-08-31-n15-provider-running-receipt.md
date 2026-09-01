@@ -100,3 +100,16 @@ git commit -m "fix: reuse n15 provider running receipt"
 - [x] Verify the SIGTERM path: a TERM-ignoring readiness child is force-killed,
   receives a final bounded reap wait, and leaves the controller's EXIT cleanup
   to record exactly one STOPPED provider transition.
+
+---
+
+### Task 4: Admit the Exact Whole-Disk Workspace Mount
+
+- [x] Reproduce the live runtime-gate stop with labeled checks. The canonical
+  protected workspace was mounted directly from `/dev/vdc`, so `lsblk` reported
+  `disk`; the validator rejected it before its exact stable-device MAJ:MIN proof.
+- [x] Add a regression requiring whole-disk mounts to be admitted while keeping
+  the `/dev/disk/by-id/virtio-lehome` MAJ:MIN equality check mandatory.
+- [x] Extend only the block-type admission from `part|lvm|crypt` to
+  `disk|part|lvm|crypt`; do not weaken exact device, mount, VM, disk, or GPU
+  validation.
