@@ -6,7 +6,11 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
+import time
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -170,12 +174,25 @@ def test_running_observation_reuses_the_loop_created_receipt(tmp_path: Path) -> 
         "    value = " + repr(provider) + "; value['status']['state'] = state.read_text().strip(); print(json.dumps(value))\n",
         encoding="utf-8",
     )
-    (fake_bin / "ssh").write_text("#!/usr/bin/env bash\nprintf 'ssh\\n' >> \"$FAKE_PROVIDER_TRACE\"\nexit 97\n", encoding="utf-8")
-    for command in (fake_bin / "nebius", fake_bin / "ssh"): command.chmod(0o755)
+    (fake_bin / "ssh").write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"${!#}\" == true ]]; then\n"
+        "  printf 'readiness\\n' >> \"$FAKE_PROVIDER_TRACE\"\n"
+        "  attempts=0; [[ -f \"$FAKE_SSH_ATTEMPTS\" ]] && attempts=$(cat \"$FAKE_SSH_ATTEMPTS\")\n"
+        "  attempts=$((attempts + 1)); printf '%s' \"$attempts\" > \"$FAKE_SSH_ATTEMPTS\"\n"
+        "  (( attempts >= 2 )) && exit 0\n"
+        "  exit 98\n"
+        "fi\n"
+        "printf 'runtime\\n' >> \"$FAKE_PROVIDER_TRACE\"\n"
+        "exit 97\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    for command in (fake_bin / "nebius", fake_bin / "ssh", fake_bin / "sleep"): command.chmod(0o755)
     pipeline = tmp_path / "pipeline"; pipeline.mkdir()
     env = {
         **os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "FAKE_PROVIDER_TRACE": str(trace), "FAKE_NEBIUS_STATE": str(state),
+        "FAKE_PROVIDER_TRACE": str(trace), "FAKE_NEBIUS_STATE": str(state), "FAKE_SSH_ATTEMPTS": str(tmp_path / "ssh-attempts"),
         "LEHOME_N15_RUN_ID": "n15-running-observation", "LEHOME_N15_PIPELINE_ROOT": str(pipeline),
         "LEHOME_N15_SSH_TARGET": "operator@example", "LEHOME_N15_REMOTE_ROOT": "/mnt/lehome/runtime",
         "LEHOME_N15_REMOTE_RUNS_BASE": "/mnt/lehome/runs", "LEHOME_N15_REMOTE_PIPELINE_ROOT": "/mnt/lehome/runs/n15-running-observation",
@@ -191,5 +208,139 @@ def test_running_observation_reuses_the_loop_created_receipt(tmp_path: Path) -> 
     assert "runtime/cloud-init/workspace/GPU/upstream gate failed" in result.stderr
     assert "native reference receipt already exists" not in result.stderr
     assert "exact VM did not reach RUNNING" not in result.stderr
-    assert trace.read_text(encoding="utf-8").splitlines() == ["start", "ssh", "stop"]
+    assert trace.read_text(encoding="utf-8").splitlines() == ["start", "readiness", "readiness", "runtime", "stop"]
     assert state.read_text(encoding="utf-8") == "STOPPED"
+
+
+def test_running_observation_hard_stops_a_hanging_ssh_readiness_probe(tmp_path: Path) -> None:
+    """A hung readiness probe must not delay the controller's EXIT cleanup."""
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    state = tmp_path / "provider-state.txt"; state.write_text("STOPPED", encoding="utf-8")
+    trace = tmp_path / "provider-trace.log"; ssh_attempts = tmp_path / "ssh-attempts"; ssh_pid = tmp_path / "hanging-ssh.pid"
+    provider = {
+        "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
+        "status": {"state": "STATE"},
+        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}]},
+    }
+    (fake_bin / "nebius").write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "state = Path(os.environ['FAKE_NEBIUS_STATE']); trace = Path(os.environ['FAKE_PROVIDER_TRACE'])\n"
+        "command = sys.argv[1:4]\n"
+        "if command == ['compute', 'instance', 'start']:\n"
+        "    trace.open('a').write('start\\n'); state.read_text().strip() == 'STOPPED' or sys.exit(91); state.write_text('RUNNING')\n"
+        "elif command == ['compute', 'instance', 'stop']:\n"
+        "    trace.open('a').write('stop\\n'); state.read_text().strip() == 'RUNNING' or sys.exit(92); state.write_text('STOPPED')\n"
+        "else:\n"
+        "    value = " + repr(provider) + "; value['status']['state'] = state.read_text().strip(); print(json.dumps(value))\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "ssh").write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"${!#}\" == true ]]; then\n"
+        "  attempts=0; [[ -f \"$FAKE_SSH_ATTEMPTS\" ]] && attempts=$(cat \"$FAKE_SSH_ATTEMPTS\")\n"
+        "  attempts=$((attempts + 1)); printf '%s' \"$attempts\" > \"$FAKE_SSH_ATTEMPTS\"\n"
+        "  if (( attempts == 1 )); then printf 'readiness-hang\\n' >> \"$FAKE_PROVIDER_TRACE\"; printf '%s' \"$$\" > \"$FAKE_HANGING_SSH_PID\"; while :; do /bin/sleep 1; done; fi\n"
+        "  printf 'readiness-fail\\n' >> \"$FAKE_PROVIDER_TRACE\"; exit 98\n"
+        "fi\n"
+        "printf 'runtime\\n' >> \"$FAKE_PROVIDER_TRACE\"; exit 97\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    for command in (fake_bin / "nebius", fake_bin / "ssh", fake_bin / "sleep"): command.chmod(0o755)
+    pipeline = tmp_path / "pipeline"; pipeline.mkdir()
+    env = {
+        **os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "FAKE_NEBIUS_STATE": str(state), "FAKE_PROVIDER_TRACE": str(trace),
+        "FAKE_SSH_ATTEMPTS": str(ssh_attempts), "FAKE_HANGING_SSH_PID": str(ssh_pid), "LEHOME_N15_RUN_ID": "n15-hanging-readiness",
+        "LEHOME_N15_PIPELINE_ROOT": str(pipeline), "LEHOME_N15_SSH_TARGET": "operator@example", "LEHOME_N15_REMOTE_ROOT": "/mnt/lehome/runtime",
+        "LEHOME_N15_REMOTE_RUNS_BASE": "/mnt/lehome/runs", "LEHOME_N15_REMOTE_PIPELINE_ROOT": "/mnt/lehome/runs/n15-hanging-readiness",
+        "LEHOME_N15_PUBLIC_HF_REPOSITORY": "ryanjin333/public-n15", "LEHOME_OFFICIAL_ASSETS_ROOT": "/mnt/assets", "LEHOME_OFFICIAL_METADATA_ROOT": "/mnt/source",
+        "LEHOME_N15_REFERENCE_CHECKPOINT": "/mnt/reference", "LEHOME_N15_REFERENCE_SANITIZED_CONFIG_ROOT": "/mnt/reference-config",
+        "LEHOME_N15_REFERENCE_COMPATIBILITY_RECEIPT": "/mnt/reference-receipt", "LEHOME_N15_NATIVE_RUNTIME_EVIDENCE_ROOT": "/mnt/evidence",
+        "LEHOME_N15_NATIVE_DEPENDENCIES_ROOT": "/mnt/deps", "LEHOME_N15_FOCUSED_HF_CACHE_ROOT": "/mnt/cache", "LEHOME_N15_ROLLOUT_IMAGE_RECEIPT": "/mnt/image.json",
+        "LEHOME_N15_TRAINING_HF_CACHE_ROOT": "/mnt/train-cache", "LEHOME_N15_TRAINING_UV": "/mnt/uv", "LEHOME_N15_LEROBOT_WHEEL": "/mnt/lerobot.whl",
+        "LEHOME_N15_TRAINING_ROOT": "/mnt/lehome/runs/n15-hanging-readiness/training",
+    }
+    started = time.monotonic()
+    process = subprocess.Popen(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        _, stderr = process.communicate(timeout=8)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL); process.communicate()
+        pytest.fail("readiness probe exceeded the test wall-clock bound")
+    assert time.monotonic() - started < 8
+    assert process.returncode != 0
+    assert "exact VM did not become SSH-ready" in stderr
+    assert trace.read_text(encoding="utf-8").splitlines()[0] == "start"
+    assert trace.read_text(encoding="utf-8").splitlines().count("stop") == 1
+    assert state.read_text(encoding="utf-8") == "STOPPED"
+    with pytest.raises(ProcessLookupError): os.kill(int(ssh_pid.read_text(encoding="utf-8")), 0)
+
+
+def test_running_observation_reaps_a_term_ignoring_ssh_readiness_probe(tmp_path: Path) -> None:
+    """Controller interruption must reap a TERM-ignoring readiness child."""
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    state = tmp_path / "provider-state.txt"; state.write_text("STOPPED", encoding="utf-8")
+    trace = tmp_path / "provider-trace.log"; ssh_pid = tmp_path / "hanging-ssh.pid"
+    provider = {
+        "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
+        "status": {"state": "STATE"},
+        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}]},
+    }
+    (fake_bin / "nebius").write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "state = Path(os.environ['FAKE_NEBIUS_STATE']); trace = Path(os.environ['FAKE_PROVIDER_TRACE'])\n"
+        "command = sys.argv[1:4]\n"
+        "if command == ['compute', 'instance', 'start']:\n"
+        "    trace.open('a').write('start\\n'); state.read_text().strip() == 'STOPPED' or sys.exit(91); state.write_text('RUNNING')\n"
+        "elif command == ['compute', 'instance', 'stop']:\n"
+        "    trace.open('a').write('stop\\n'); state.read_text().strip() == 'RUNNING' or sys.exit(92); state.write_text('STOPPED')\n"
+        "else:\n"
+        "    value = " + repr(provider) + "; value['status']['state'] = state.read_text().strip(); print(json.dumps(value))\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "ssh").write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"${!#}\" == true ]]; then\n"
+        "  printf 'readiness-term-ignore\\n' >> \"$FAKE_PROVIDER_TRACE\"; printf '%s' \"$$\" > \"$FAKE_HANGING_SSH_PID\"\n"
+        "  trap '' TERM\n"
+        "  while :; do /bin/sleep 1; done\n"
+        "fi\n"
+        "printf 'runtime\\n' >> \"$FAKE_PROVIDER_TRACE\"; exit 97\n",
+        encoding="utf-8",
+    )
+    for command in (fake_bin / "nebius", fake_bin / "ssh"): command.chmod(0o755)
+    pipeline = tmp_path / "pipeline"; pipeline.mkdir()
+    env = {
+        **os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "FAKE_NEBIUS_STATE": str(state), "FAKE_PROVIDER_TRACE": str(trace),
+        "FAKE_HANGING_SSH_PID": str(ssh_pid), "LEHOME_N15_RUN_ID": "n15-interrupted-readiness", "LEHOME_N15_PIPELINE_ROOT": str(pipeline),
+        "LEHOME_N15_SSH_TARGET": "operator@example", "LEHOME_N15_REMOTE_ROOT": "/mnt/lehome/runtime", "LEHOME_N15_REMOTE_RUNS_BASE": "/mnt/lehome/runs",
+        "LEHOME_N15_REMOTE_PIPELINE_ROOT": "/mnt/lehome/runs/n15-interrupted-readiness", "LEHOME_N15_PUBLIC_HF_REPOSITORY": "ryanjin333/public-n15",
+        "LEHOME_OFFICIAL_ASSETS_ROOT": "/mnt/assets", "LEHOME_OFFICIAL_METADATA_ROOT": "/mnt/source", "LEHOME_N15_REFERENCE_CHECKPOINT": "/mnt/reference",
+        "LEHOME_N15_REFERENCE_SANITIZED_CONFIG_ROOT": "/mnt/reference-config", "LEHOME_N15_REFERENCE_COMPATIBILITY_RECEIPT": "/mnt/reference-receipt",
+        "LEHOME_N15_NATIVE_RUNTIME_EVIDENCE_ROOT": "/mnt/evidence", "LEHOME_N15_NATIVE_DEPENDENCIES_ROOT": "/mnt/deps", "LEHOME_N15_FOCUSED_HF_CACHE_ROOT": "/mnt/cache",
+        "LEHOME_N15_ROLLOUT_IMAGE_RECEIPT": "/mnt/image.json", "LEHOME_N15_TRAINING_HF_CACHE_ROOT": "/mnt/train-cache", "LEHOME_N15_TRAINING_UV": "/mnt/uv",
+        "LEHOME_N15_LEROBOT_WHEEL": "/mnt/lerobot.whl", "LEHOME_N15_TRAINING_ROOT": "/mnt/lehome/runs/n15-interrupted-readiness/training",
+    }
+    process = subprocess.Popen(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    deadline = time.monotonic() + 3
+    while not ssh_pid.exists() and time.monotonic() < deadline:
+        if process.poll() is not None: pytest.fail("controller exited before readiness probe started")
+        time.sleep(0.02)
+    assert ssh_pid.exists()
+    started = time.monotonic(); os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL); process.communicate()
+        pytest.fail("interrupted controller exceeded the test wall-clock bound")
+    assert time.monotonic() - started < 5
+    assert process.returncode != 0
+    assert trace.read_text(encoding="utf-8").splitlines().count("stop") == 1
+    assert state.read_text(encoding="utf-8") == "STOPPED"
+    with pytest.raises(ProcessLookupError): os.kill(int(ssh_pid.read_text(encoding="utf-8")), 0)
+    interrupted = WRAPPER.read_text(encoding="utf-8").split("def interrupted", 1)[1].split("signal.signal", 1)[0]
+    assert interrupted.index("stop_probe_group(force=True)") < interrupted.rindex("probe.wait(timeout=reap_timeout)")

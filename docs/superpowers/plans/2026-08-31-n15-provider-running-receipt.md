@@ -58,3 +58,42 @@ git add docs/superpowers/plans/2026-08-31-n15-provider-running-receipt.md \
   tests/infrastructure/test_public_n15_pipeline_remote.py
 git commit -m "fix: reuse n15 provider running receipt"
 ```
+
+---
+
+### Task 2: Wait for Guest SSH Readiness After Provider RUNNING
+
+**Files:**
+- Modify: `rollout_appliance/run_public_n15_pipeline_remote.sh`
+- Test: `tests/infrastructure/test_public_n15_pipeline_remote.py`
+
+- [x] Add a real-wrapper regression whose stateful fake provider reaches exact
+  RUNNING, whose first SSH readiness probe fails, whose second succeeds, and
+  whose runtime-validation SSH then fails.
+- [x] Verify RED: without a readiness gate, the trace is
+  `start, runtime, stop`, rather than the required two readiness probes before
+  runtime validation.
+- [x] Add a dedicated bounded `ssh ... true` readiness condition after the
+  immutable RUNNING receipt and before runtime validation. Keep generic remote
+  commands and validation un-retried.
+- [x] Verify the required trace is
+  `start, readiness, readiness, runtime, stop`, with final provider state
+  STOPPED; run the full controller and eight-file N1.5 suite.
+- [x] Commit the fix as `fix: wait for n15 guest ssh readiness`.
+
+---
+
+### Task 3: Bound Post-Connect SSH Readiness Hangs
+
+- [x] Add a real-wrapper hanging-readiness regression with a subprocess
+  wall-clock bound and process-group cleanup for the pre-fix path.
+- [x] Replace the SSH-only connection timeout with a local Python watchdog
+  that starts the allowlisted readiness SSH command in a new session, enforces
+  a hard deadline, terminates/kills its group, and reaps it.
+- [x] Keep the full gate bounded: six 5-second probe/reap windows plus five
+  2-second intervals is at most 40 seconds.
+- [x] Verify one provider stop, final STOPPED state, no live fake SSH child,
+  preserved transient-ready ordering, and the full offline N1.5 suite.
+- [x] Verify the SIGTERM path: a TERM-ignoring readiness child is force-killed,
+  receives a final bounded reap wait, and leaves the controller's EXIT cleanup
+  to record exactly one STOPPED provider transition.

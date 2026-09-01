@@ -24,6 +24,11 @@ readonly PROVIDER_HOURLY_CEILING_USD=3
 readonly TRAIN_TIMEOUT_SECONDS=43200
 readonly FOCUSED_TIMEOUT_SECONDS=14400
 readonly HARVEST_TIMEOUT_SECONDS=28800
+readonly SSH_READINESS_ATTEMPTS=6
+readonly SSH_READINESS_CONNECT_TIMEOUT_SECONDS=2
+readonly SSH_READINESS_HARD_TIMEOUT_SECONDS=3
+readonly SSH_READINESS_REAP_TIMEOUT_SECONDS=1
+readonly SSH_READINESS_INTERVAL_SECONDS=2
 readonly ESTIMATED_COST_USD=72
 readonly PUBLIC_REPOSITORY="${LEHOME_N15_PUBLIC_HF_REPOSITORY:-}"
 readonly SOURCE_ROOT="${LEHOME_N15_PUBLIC_SOURCE_ROOT:-}"
@@ -105,6 +110,67 @@ trap stop_exact_vm EXIT
 trap 'exit 130' INT TERM
 
 remote() { ssh -o BatchMode=yes "$SSH_TARGET" "$@"; }
+probe_ssh_readiness() {
+  python3 - "$SSH_READINESS_CONNECT_TIMEOUT_SECONDS" "$SSH_READINESS_HARD_TIMEOUT_SECONDS" "$SSH_READINESS_REAP_TIMEOUT_SECONDS" "$SSH_TARGET" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+connect_timeout, hard_timeout, reap_timeout = map(int, sys.argv[1:4])
+target = sys.argv[4]
+probe = None
+
+def stop_probe_group(force=False):
+    if probe is None or probe.poll() is not None:
+        return
+    try:
+        os.killpg(probe.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+def interrupted(signum, _frame):
+    if probe is None:
+        raise SystemExit(128 + signum)
+    stop_probe_group()
+    try:
+        probe.wait(timeout=reap_timeout)
+    except subprocess.TimeoutExpired:
+        stop_probe_group(force=True)
+        try:
+            probe.wait(timeout=reap_timeout)
+        except subprocess.TimeoutExpired:
+            pass
+    raise SystemExit(128 + signum)
+
+signal.signal(signal.SIGINT, interrupted)
+signal.signal(signal.SIGTERM, interrupted)
+probe = subprocess.Popen(
+    ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}", target, "true"],
+    start_new_session=True,
+)
+try:
+    raise SystemExit(probe.wait(timeout=hard_timeout))
+except subprocess.TimeoutExpired:
+    stop_probe_group()
+    try:
+        probe.wait(timeout=reap_timeout)
+    except subprocess.TimeoutExpired:
+        stop_probe_group(force=True)
+        probe.wait(timeout=reap_timeout)
+    raise SystemExit(1)
+PY
+}
+wait_for_ssh_readiness() {
+  local attempt
+  # Six (3s probe + at most 2s group reaping) windows and five 2s intervals
+  # bound this gate to 40 seconds even when post-connect SSH hangs.
+  for (( attempt = 1; attempt <= SSH_READINESS_ATTEMPTS; attempt++ )); do
+    if probe_ssh_readiness; then return 0; fi
+    (( attempt == SSH_READINESS_ATTEMPTS )) || sleep "$SSH_READINESS_INTERVAL_SECONDS"
+  done
+  return 1
+}
 initialize_deadline() {
   python3 - "$PLAN_RECEIPT" "$DEADLINE_RECEIPT" "$RUN_ID" <<'PY'
 import hashlib, json, os, sys, time
@@ -422,6 +488,7 @@ for _ in {1..60}; do
 done
 (( running_observed == 1 )) && [[ -f "$response" && ! -L "$response" ]] || fail "exact VM did not reach RUNNING"
 rm -f -- "$response"
+wait_for_ssh_readiness || fail "exact VM did not become SSH-ready"
 validate_remote_runtime || fail "runtime/cloud-init/workspace/GPU/upstream gate failed"
 if ! remote_file_exists "$TRAINING_IDENTITY_RECEIPT"; then run_paid_stage train "$TRAIN_TIMEOUT_SECONDS" train_stage; fi
 verify_remote_training_chain || fail "training receipt chain failed"
