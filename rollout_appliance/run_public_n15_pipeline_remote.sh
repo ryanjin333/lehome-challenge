@@ -415,8 +415,13 @@ if [[ -f "$HARVEST_TERMINAL_RECEIPT" ]]; then
 fi
 response="$PIPELINE_ROOT/.provider-start.$$.json"; capture_exact_provider_state STOPPED "$response" || fail "Nebius Compute API is unavailable or exact VM is not stopped"; rm -f -- "$response"
 nebius compute instance start --id "$EXACT_VM_ID" --format json --no-browser --no-progress --no-check-update --retries 1 --timeout 60s >/dev/null
-for _ in {1..60}; do capture_exact_provider_state RUNNING "$response" && break; rm -f -- "$response"; sleep 2; done
-capture_exact_provider_state RUNNING "$response" || fail "exact VM did not reach RUNNING"; rm -f -- "$response"
+running_observed=0
+for _ in {1..60}; do
+  if capture_exact_provider_state RUNNING "$response"; then running_observed=1; break; fi
+  rm -f -- "$response"; sleep 2
+done
+(( running_observed == 1 )) && [[ -f "$response" && ! -L "$response" ]] || fail "exact VM did not reach RUNNING"
+rm -f -- "$response"
 validate_remote_runtime || fail "runtime/cloud-init/workspace/GPU/upstream gate failed"
 if ! remote_file_exists "$TRAINING_IDENTITY_RECEIPT"; then run_paid_stage train "$TRAIN_TIMEOUT_SECONDS" train_stage; fi
 verify_remote_training_chain || fail "training receipt chain failed"

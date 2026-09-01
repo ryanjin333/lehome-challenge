@@ -139,3 +139,57 @@ def test_over_budget_plan_never_starts_the_mocked_exact_vm(tmp_path: Path) -> No
     result = subprocess.run(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True)
     assert result.returncode != 0
     assert " start " not in f" {log.read_text(encoding='utf-8')} "
+
+
+def test_running_observation_reuses_the_loop_created_receipt(tmp_path: Path) -> None:
+    """A successful RUNNING poll must reach the runtime gate without recapturing."""
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    state = tmp_path / "provider-state.txt"; state.write_text("STOPPED", encoding="utf-8")
+    trace = tmp_path / "provider-trace.log"
+    provider = {
+        "metadata": {"id": "computeinstance-u00t6xfqhadrcmssa2", "name": "lehome-rollout"},
+        "status": {"state": "STATE"},
+        "spec": {"boot_disk": {"managed_disk": {"spec": {"source_image_id": "computeimage-u00zf6w3yf72gakhcy"}}}, "secondary_disks": [{"existing_disk": {"id": "computedisk-u00pbe55crxy7jr56x"}}]},
+    }
+    (fake_bin / "nebius").write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "state = Path(os.environ['FAKE_NEBIUS_STATE'])\n"
+        "trace = Path(os.environ['FAKE_PROVIDER_TRACE'])\n"
+        "command = sys.argv[1:4]\n"
+        "if command == ['compute', 'instance', 'start']:\n"
+        "    trace.open('a').write('start\\n')\n"
+        "    if state.read_text().strip() != 'STOPPED': raise SystemExit(91)\n"
+        "    state.write_text('RUNNING')\n"
+        "elif command == ['compute', 'instance', 'stop']:\n"
+        "    trace.open('a').write('stop\\n')\n"
+        "    if state.read_text().strip() != 'RUNNING': raise SystemExit(92)\n"
+        "    state.write_text('STOPPED')\n"
+        "else:\n"
+        "    value = " + repr(provider) + "; value['status']['state'] = state.read_text().strip(); print(json.dumps(value))\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "ssh").write_text("#!/usr/bin/env bash\nprintf 'ssh\\n' >> \"$FAKE_PROVIDER_TRACE\"\nexit 97\n", encoding="utf-8")
+    for command in (fake_bin / "nebius", fake_bin / "ssh"): command.chmod(0o755)
+    pipeline = tmp_path / "pipeline"; pipeline.mkdir()
+    env = {
+        **os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "FAKE_PROVIDER_TRACE": str(trace), "FAKE_NEBIUS_STATE": str(state),
+        "LEHOME_N15_RUN_ID": "n15-running-observation", "LEHOME_N15_PIPELINE_ROOT": str(pipeline),
+        "LEHOME_N15_SSH_TARGET": "operator@example", "LEHOME_N15_REMOTE_ROOT": "/mnt/lehome/runtime",
+        "LEHOME_N15_REMOTE_RUNS_BASE": "/mnt/lehome/runs", "LEHOME_N15_REMOTE_PIPELINE_ROOT": "/mnt/lehome/runs/n15-running-observation",
+        "LEHOME_N15_PUBLIC_HF_REPOSITORY": "ryanjin333/public-n15", "LEHOME_OFFICIAL_ASSETS_ROOT": "/mnt/assets", "LEHOME_OFFICIAL_METADATA_ROOT": "/mnt/source",
+        "LEHOME_N15_REFERENCE_CHECKPOINT": "/mnt/reference", "LEHOME_N15_REFERENCE_SANITIZED_CONFIG_ROOT": "/mnt/reference-config",
+        "LEHOME_N15_REFERENCE_COMPATIBILITY_RECEIPT": "/mnt/reference-receipt", "LEHOME_N15_NATIVE_RUNTIME_EVIDENCE_ROOT": "/mnt/evidence",
+        "LEHOME_N15_NATIVE_DEPENDENCIES_ROOT": "/mnt/deps", "LEHOME_N15_FOCUSED_HF_CACHE_ROOT": "/mnt/cache", "LEHOME_N15_ROLLOUT_IMAGE_RECEIPT": "/mnt/image.json",
+        "LEHOME_N15_TRAINING_HF_CACHE_ROOT": "/mnt/train-cache", "LEHOME_N15_TRAINING_UV": "/mnt/uv", "LEHOME_N15_LEROBOT_WHEEL": "/mnt/lerobot.whl",
+        "LEHOME_N15_TRAINING_ROOT": "/mnt/lehome/runs/n15-running-observation/training",
+    }
+    result = subprocess.run(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True)
+    assert result.returncode != 0
+    assert "runtime/cloud-init/workspace/GPU/upstream gate failed" in result.stderr
+    assert "native reference receipt already exists" not in result.stderr
+    assert "exact VM did not reach RUNNING" not in result.stderr
+    assert trace.read_text(encoding="utf-8").splitlines() == ["start", "ssh", "stop"]
+    assert state.read_text(encoding="utf-8") == "STOPPED"
