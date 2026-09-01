@@ -90,8 +90,11 @@ git commit -m "fix: reuse n15 provider running receipt"
 - [x] Replace the SSH-only connection timeout with a local Python watchdog
   that starts the allowlisted readiness SSH command in a new session, enforces
   a hard deadline, terminates/kills its group, and reaps it.
-- [x] Keep the full gate bounded: six 5-second probe/reap windows plus five
-  2-second intervals is at most 40 seconds.
+- [x] Keep the full gate bounded: eighteen 5-second probe/reap windows plus
+  seventeen 2-second intervals is at most 124 seconds. The original 40-second
+  budget was increased only after a live exact-VM boot reached provider
+  `RUNNING` but had not opened SSH before the sixth probe; cleanup returned the
+  VM to `STOPPED` before training.
 - [x] Verify one provider stop, final STOPPED state, no live fake SSH child,
   preserved transient-ready ordering, and the full offline N1.5 suite.
 - [x] Verify the SIGTERM path: a TERM-ignoring readiness child is force-killed,

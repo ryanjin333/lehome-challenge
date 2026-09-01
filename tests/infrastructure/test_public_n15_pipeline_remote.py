@@ -180,7 +180,7 @@ def test_running_observation_reuses_the_loop_created_receipt(tmp_path: Path) -> 
         "  printf 'readiness\\n' >> \"$FAKE_PROVIDER_TRACE\"\n"
         "  attempts=0; [[ -f \"$FAKE_SSH_ATTEMPTS\" ]] && attempts=$(cat \"$FAKE_SSH_ATTEMPTS\")\n"
         "  attempts=$((attempts + 1)); printf '%s' \"$attempts\" > \"$FAKE_SSH_ATTEMPTS\"\n"
-        "  (( attempts >= 2 )) && exit 0\n"
+        "  (( attempts >= 7 )) && exit 0\n"
         "  exit 98\n"
         "fi\n"
         "printf 'runtime\\n' >> \"$FAKE_PROVIDER_TRACE\"\n"
@@ -208,7 +208,7 @@ def test_running_observation_reuses_the_loop_created_receipt(tmp_path: Path) -> 
     assert "runtime/cloud-init/workspace/GPU/upstream gate failed" in result.stderr
     assert "native reference receipt already exists" not in result.stderr
     assert "exact VM did not reach RUNNING" not in result.stderr
-    assert trace.read_text(encoding="utf-8").splitlines() == ["start", "readiness", "readiness", "runtime", "stop"]
+    assert trace.read_text(encoding="utf-8").splitlines() == ["start", *("readiness" for _ in range(7)), "runtime", "stop"]
     assert state.read_text(encoding="utf-8") == "STOPPED"
 
 

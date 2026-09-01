@@ -24,7 +24,7 @@ readonly PROVIDER_HOURLY_CEILING_USD=3
 readonly TRAIN_TIMEOUT_SECONDS=43200
 readonly FOCUSED_TIMEOUT_SECONDS=14400
 readonly HARVEST_TIMEOUT_SECONDS=28800
-readonly SSH_READINESS_ATTEMPTS=6
+readonly SSH_READINESS_ATTEMPTS=18
 readonly SSH_READINESS_CONNECT_TIMEOUT_SECONDS=2
 readonly SSH_READINESS_HARD_TIMEOUT_SECONDS=3
 readonly SSH_READINESS_REAP_TIMEOUT_SECONDS=1
@@ -163,8 +163,8 @@ PY
 }
 wait_for_ssh_readiness() {
   local attempt
-  # Six (3s probe + at most 2s group reaping) windows and five 2s intervals
-  # bound this gate to 40 seconds even when post-connect SSH hangs.
+  # Eighteen (3s probe + at most 2s group reaping) windows and seventeen 2s
+  # intervals bound this gate to 124 seconds even when post-connect SSH hangs.
   for (( attempt = 1; attempt <= SSH_READINESS_ATTEMPTS; attempt++ )); do
     if probe_ssh_readiness; then return 0; fi
     (( attempt == SSH_READINESS_ATTEMPTS )) || sleep "$SSH_READINESS_INTERVAL_SECONDS"
