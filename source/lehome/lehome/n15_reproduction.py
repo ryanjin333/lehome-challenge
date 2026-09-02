@@ -26,7 +26,16 @@ from base64 import urlsafe_b64encode
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
-_PEFT_OVERLAY_WHEEL = "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"
+_TRAINING_CONTAINER_IMAGE_ID = (
+    "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
+)
+_TRAINING_CONTAINER_PYTHON = "/opt/lehome-challenge/.venv/bin/python"
+_TRAINING_CONTAINER_LEROBOT_WHEEL = "/runtime/lerobot-0.4.3-py3-none-any.whl"
+_TRAINING_CONTAINER_PYTHONPATH = (
+    "/flash/site-packages:"
+    f"{_TRAINING_CONTAINER_LEROBOT_WHEEL}:"
+    "/deps/peft-0.18.1-py3-none-any.whl"
+)
 
 
 class ReproductionError(RuntimeError):
@@ -1021,10 +1030,15 @@ def build_training_manifest(
             "cwd": str(verified.checkout),
             "argv": list(contract.training_command),
             "shell_argv": shlex.join(contract.training_command),
+            "container": {
+                "image_id": _TRAINING_CONTAINER_IMAGE_ID,
+                "python_executable": _TRAINING_CONTAINER_PYTHON,
+                "pythonpath": _TRAINING_CONTAINER_PYTHONPATH,
+            },
             "env": {
                 "HF_HUB_CACHE": str(verified.hub_cache_root),
                 "HF_HUB_OFFLINE": "1",
-                "PYTHONPATH": _PEFT_OVERLAY_WHEEL,
+                "PYTHONPATH": _TRAINING_CONTAINER_PYTHONPATH,
             },
         },
     }
@@ -1209,6 +1223,60 @@ def verify_training_output(
         or lock.read_bytes() != (verified.checkout / "uv.lock").read_bytes()
     ):
         raise ReproductionError("training dependency lock mismatch")
+    image_path = artifacts.get("evidence/runtime-image-receipt.json")
+    container_runtime_path = artifacts.get(
+        "evidence/training-container-runtime-receipt.json"
+    )
+    if image_path is None or container_runtime_path is None:
+        raise ReproductionError("training container runtime evidence is missing")
+    _, _, image_receipt = _load_receipt(image_path, "training runtime image receipt")
+    if image_receipt != {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_training_runtime_image_v1",
+        "image_id": _TRAINING_CONTAINER_IMAGE_ID,
+    }:
+        raise ReproductionError("training runtime image identity mismatch")
+    _, _, container_runtime = _load_receipt(
+        container_runtime_path, "training container runtime receipt"
+    )
+    container_keys = {
+        "schema_version",
+        "kind",
+        "image_id",
+        "python_executable",
+        "python_version",
+        "pythonpath",
+        "lerobot_origin",
+        "peft_origin",
+        "flash_attn_origin",
+        "torch_version",
+        "torch_cuda_version",
+        "cuda_capability",
+    }
+    python_version = container_runtime.get("python_version")
+    if (
+        set(container_runtime) != container_keys
+        or container_runtime.get("schema_version") != 1
+        or container_runtime.get("kind")
+        != "lehome_public_n15_training_container_runtime_v1"
+        or container_runtime.get("image_id") != _TRAINING_CONTAINER_IMAGE_ID
+        or container_runtime.get("python_executable") != _TRAINING_CONTAINER_PYTHON
+        or container_runtime.get("pythonpath") != _TRAINING_CONTAINER_PYTHONPATH
+        or container_runtime.get("lerobot_origin")
+        != _TRAINING_CONTAINER_LEROBOT_WHEEL + "/lerobot/__init__.py"
+        or container_runtime.get("peft_origin")
+        != "/deps/peft-0.18.1-py3-none-any.whl/peft/__init__.py"
+        or container_runtime.get("flash_attn_origin")
+        != "/flash/site-packages/flash_attn/__init__.py"
+        or container_runtime.get("torch_version") != "2.7.0+cu128"
+        or container_runtime.get("torch_cuda_version") != "12.8"
+        or container_runtime.get("cuda_capability") != [12, 0]
+        or not isinstance(python_version, list)
+        or len(python_version) != 3
+        or any(type(part) is not int for part in python_version)
+        or python_version[:2] != [3, 11]
+    ):
+        raise ReproductionError("training container runtime identity mismatch")
     runtime_path = artifacts.get("evidence/runtime-receipt.json")
     if runtime_path is None:
         raise ReproductionError("training runtime receipt is missing")

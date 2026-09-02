@@ -779,10 +779,15 @@ def test_render_training_writes_an_atomic_offline_manifest_without_execution(
             "--wandb.mode=offline",
         ],
         "cwd": str(checkout.resolve()),
+        "container": {
+            "image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
+            "python_executable": "/opt/lehome-challenge/.venv/bin/python",
+            "pythonpath": "/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl",
+        },
         "env": {
             "HF_HUB_CACHE": str((tmp_path / "hub").resolve()),
             "HF_HUB_OFFLINE": "1",
-            "PYTHONPATH": "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl",
+            "PYTHONPATH": "/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl",
         },
         "shell_argv": "lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline",
     }
@@ -891,6 +896,33 @@ def _materialize_training_output(
                 "flash_attn_version": "2.8.3",
                 "flash_attn_origin": str((runtime / "site-packages/flash_attn/__init__.py").resolve()),
                 "kernel": {"shape": [1, 2, 4, 64], "dtype": "float16", "finite": True},
+            }
+        )
+    )
+    (evidence / "training-container-runtime-receipt.json").write_bytes(
+        _canonical(
+            {
+                "schema_version": 1,
+                "kind": "lehome_public_n15_training_container_runtime_v1",
+                "image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
+                "python_executable": "/opt/lehome-challenge/.venv/bin/python",
+                "python_version": [3, 11, 13],
+                "pythonpath": "/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl",
+                "lerobot_origin": "/runtime/lerobot-0.4.3-py3-none-any.whl/lerobot/__init__.py",
+                "peft_origin": "/deps/peft-0.18.1-py3-none-any.whl/peft/__init__.py",
+                "flash_attn_origin": "/flash/site-packages/flash_attn/__init__.py",
+                "torch_version": "2.7.0+cu128",
+                "torch_cuda_version": "12.8",
+                "cuda_capability": [12, 0],
+            }
+        )
+    )
+    (evidence / "runtime-image-receipt.json").write_bytes(
+        _canonical(
+            {
+                "schema_version": 1,
+                "kind": "lehome_public_n15_training_runtime_image_v1",
+                "image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
             }
         )
     )
@@ -1035,6 +1067,7 @@ def _rewrite_task1_identity(root: Path, receipt: dict[str, object], output: Path
         "runtime_receipt",
         "peft_overlay",
         "flash_overlay",
+        "container_runtime",
         "wheel",
         "installed_package",
         "training_log",
@@ -1086,6 +1119,14 @@ def test_task2_identity_admission_has_exact_task1_output_parity(
         (root / "evidence/peft-overlay-receipt.json").write_bytes(b"{}\n")
     elif mutation == "flash_overlay":
         (root / "evidence/flash-attention-runtime-receipt.json").write_bytes(b"{}\n")
+    elif mutation == "container_runtime":
+        value = json.loads(
+            (root / "evidence/training-container-runtime-receipt.json").read_text()
+        )
+        value["image_id"] = "sha256:" + "0" * 64
+        (root / "evidence/training-container-runtime-receipt.json").write_bytes(
+            _canonical(value)
+        )
     elif mutation == "wheel":
         wheel = root / "evidence/compatibility/lerobot-0.4.3-py3-none-any.whl"
         wheel.chmod(0o644)
@@ -1122,8 +1163,9 @@ def test_task2_identity_admission_accepts_the_actual_task1_valid_fixture(tmp_pat
     receipt = reproduction.verify_training_output(
         verified=verified, training_root=root, contract=contract
     )
-    identity = tmp_path / "identity.json"
+    identity = root / "training-identity.json"
     identity.write_bytes(_canonical(receipt))
+    (root / "training-publication.json").write_bytes(_canonical({"published": True}))
     admitted = validate_training_identity_receipt(
         identity,
         expected_contract=contract,

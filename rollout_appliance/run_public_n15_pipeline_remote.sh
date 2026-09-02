@@ -11,6 +11,7 @@ readonly HARVEST_BUILDER="$REPO_ROOT/scripts/build_public_n15_harvest.py"
 readonly EXACT_VM_ID="computeinstance-u00t6xfqhadrcmssa2"
 readonly PROTECTED_DISK_ID="computedisk-u00pbe55crxy7jr56x"
 readonly EXACT_IMAGE_ID="computeimage-u00zf6w3yf72gakhcy"
+readonly RUNTIME_IMAGE_ID="sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
 readonly RUN_ID="${LEHOME_N15_RUN_ID:-}"
 readonly PIPELINE_ROOT="${LEHOME_N15_PIPELINE_ROOT:-}"
 readonly SSH_TARGET="${LEHOME_N15_SSH_TARGET:-}"
@@ -109,7 +110,7 @@ stop_exact_vm() {
 trap stop_exact_vm EXIT
 trap 'exit 130' INT TERM
 
-remote() { ssh -o BatchMode=yes "$SSH_TARGET" "$@"; }
+remote() { ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSH_TARGET" "$@"; }
 probe_ssh_readiness() {
   python3 - "$SSH_READINESS_CONNECT_TIMEOUT_SECONDS" "$SSH_READINESS_HARD_TIMEOUT_SECONDS" "$SSH_READINESS_REAP_TIMEOUT_SECONDS" "$SSH_TARGET" <<'PY'
 import os
@@ -146,7 +147,7 @@ def interrupted(signum, _frame):
 signal.signal(signal.SIGINT, interrupted)
 signal.signal(signal.SIGTERM, interrupted)
 probe = subprocess.Popen(
-    ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}", target, "true"],
+    ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", f"ConnectTimeout={connect_timeout}", target, "true"],
     start_new_session=True,
 )
 try:
@@ -215,7 +216,7 @@ PY
   # macOS has no external ``setsid``. This tiny controller-owned Python
   # launcher creates the session before execing an allowlisted Bash dispatcher.
   export -f remote train_stage focused_stage harvest_stage
-  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
+  export REMOTE_ROOT SSH_TARGET HF_TOKEN_FILE RUNTIME_REVISION SOURCE_ROOT SOURCE_RECEIPT SNAPSHOTS_RECEIPT TRAINING_ROOT EXACT_VM_ID PROTECTED_DISK_ID TRAINING_HF_CACHE TRAINING_PYTHON TRAINING_UV LEROBOT_WHEEL RUNTIME_IMAGE_ID ASSETS_ROOT METADATA_ROOT REFERENCE_CHECKPOINT REFERENCE_SANITIZED_CONFIG REFERENCE_COMPATIBILITY NATIVE_RUNTIME_EVIDENCE NATIVE_DEPENDENCIES FOCUSED_HF_CACHE FOCUSED_OUTPUT_ROOT PUBLIC_REPOSITORY ROLLOUT_IMAGE_RECEIPT REMOTE_PIPELINE_ROOT
   python3 - "$stage_function" <<'PY' &
 import os
 import sys
@@ -353,9 +354,9 @@ wait_for_remote_runtime() {
 }
 
 train_stage() {
-  remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$TRAINING_UV" "$LEROBOT_WHEEL" <<'SH'
+  remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$TRAINING_UV" "$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" <<'SH'
 set -euo pipefail
-root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; hf_cache="$8"; python_bin="$9"; uv_bin="${10}"; wheel="${11}"
+root="$1"; source_root="$2"; source_receipt="$3"; snapshots="$4"; training_root="$5"; vm_id="$6"; disk_id="$7"; hf_cache="$8"; python_bin="$9"; uv_bin="${10}"; wheel="${11}"; runtime_image_id="${12}"
 upstream_output="$source_root/outputs/train/groot_four_types_merged_batch64_lr2e-4"
 staging_root="${training_root}.evidence-staging"
 test ! -e "$training_root" && test ! -L "$training_root"
@@ -370,9 +371,9 @@ test -f "$wheel" && test ! -L "$wheel" && test -d "$hf_cache" && test ! -L "$hf_
 test -x "$uv_bin" && test ! -L "$uv_bin"
 test -x "$python_bin"
 # Keep installer scratch and package copies on the protected disk. The VM root
-# volume is intentionally small; the FlashAttention wheel itself is extracted
-# into this run's immutable evidence tree below, rather than mutating the
-# persistent venv with a cache materialization that proved corrupt on reboot.
+# volume is intentionally small; FlashAttention is extracted into container
+# tmpfs, rather than mutating the persistent venv with a cache materialization
+# that proved corrupt on reboot.
 export UV_CACHE_DIR="$(dirname -- "$python_bin")/.uv-cache"
 export TMPDIR="$(dirname -- "$python_bin")/.uv-tmp"
 export UV_LINK_MODE=copy
@@ -396,38 +397,36 @@ PYTHONPATH="$peft_wheel" "$python_bin" "$root/scripts/verify_native_reference_ev
 flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
 "$python_bin" "$root/scripts/verify_native_reference_evaluator_gate.py" \
   prepare-flash-attention-overlay --receipt "$staging_root/evidence/flash-attention-overlay-receipt.json" >/dev/null
-flash_overlay="$staging_root/evidence/flash-attention-site-packages"
-"$python_bin" - "$flash_wheel" "$flash_overlay" <<'PY'
-import os, sys, zipfile
+sudo -n docker image inspect -- "$runtime_image_id" >"$staging_root/evidence/runtime-image-inspect.json"
+"$python_bin" - "$staging_root/evidence/runtime-image-inspect.json" "$staging_root/evidence/runtime-image-receipt.json" "$runtime_image_id" <<'PY'
+import json, os, sys
 from pathlib import Path
 
-wheel, target = map(Path, sys.argv[1:])
-if target.exists() or target.is_symlink():
-    raise SystemExit("FlashAttention overlay already exists")
-target.mkdir(mode=0o700)
-with zipfile.ZipFile(wheel) as archive:
-    members = [item for item in archive.infolist() if item.filename.startswith(("flash_attn/", "flash_attn-2.8.3.dist-info/"))]
-    if not members or any(Path(item.filename).is_absolute() or ".." in Path(item.filename).parts for item in members):
-        raise SystemExit("FlashAttention wheel members are unsafe")
-    for item in members:
-        destination = target / item.filename
-        if item.is_dir():
-            destination.mkdir(mode=0o700, exist_ok=True)
-            continue
-        destination.parent.mkdir(mode=0o700, exist_ok=True)
-        with archive.open(item) as source, destination.open("xb") as output:
-            while block := source.read(1024 * 1024):
-                output.write(block)
-        os.chmod(destination, 0o444)
+source, target, expected = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+rows = json.loads(source.read_text(encoding="utf-8"))
+if not isinstance(rows, list) or len(rows) != 1 or rows[0].get("Id") != expected:
+    raise SystemExit("approved N1.5 training image identity mismatch")
+payload = {"schema_version": 1, "kind": "lehome_public_n15_training_runtime_image_v1", "image_id": expected}
+fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+with os.fdopen(fd, "w", encoding="ascii") as stream:
+    json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+source.unlink()
 PY
-sudo -n docker run --rm --pull never --gpus all --network none \
-  --tmpfs /flash:rw,exec,size=2g,mode=700 \
+sudo -n docker run --rm -i --pull never --gpus all --network none \
+  --user "$(id -u):$(id -g)" \
+  --tmpfs "/flash:rw,exec,size=2g,mode=700,uid=$(id -u),gid=$(id -g)" \
   --mount "type=bind,src=$staging_root,dst=$staging_root" \
+  --mount "type=bind,src=$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl,dst=/runtime/lerobot-0.4.3-py3-none-any.whl,readonly" \
   --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/deps,readonly" \
-  --entrypoint bash lehome-rollout:build -s -- "$staging_root/evidence/flash-attention-runtime-receipt.json" <<'CONTAINER'
+  --entrypoint bash "$runtime_image_id" -s -- "$staging_root/evidence/flash-attention-runtime-receipt.json" "$staging_root/evidence/training-container-runtime-receipt.json" "$runtime_image_id" <<'CONTAINER'
 set -euo pipefail
 python_bin=/opt/lehome-challenge/.venv/bin/python
-"$python_bin" - /deps/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /flash <<'PY'
+pythonpath=/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl
+mkdir -m 0700 /flash/site-packages
+"$python_bin" - /deps/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /flash/site-packages <<'PY'
 import os, sys, zipfile
 from pathlib import Path
 
@@ -437,8 +436,8 @@ with zipfile.ZipFile(wheel) as archive:
         if item.filename.startswith(("flash_attn/", "flash_attn_2_cuda")):
             archive.extract(item, target)
 PY
-PYTHONPATH=/flash "$python_bin" - "$1" <<'PY'
-import json, os, sys
+PYTHONPATH="$pythonpath" "$python_bin" - "$1" "$2" "$3" <<'PY'
+import importlib.util, json, os, sys
 from pathlib import Path
 
 import flash_attn, torch
@@ -451,7 +450,7 @@ if bool(torch._C._GLIBCXX_USE_CXX11_ABI) is not True:
 if not torch.cuda.is_available() or list(torch.cuda.get_device_capability(0)) != [12, 0]:
     raise SystemExit("FlashAttention requires CUDA capability [12, 0]")
 origin = str(Path(flash_attn.__file__).resolve())
-expected = "/flash/flash_attn/__init__.py"
+expected = "/flash/site-packages/flash_attn/__init__.py"
 if origin != expected:
     raise SystemExit("FlashAttention installed runtime identity is invalid")
 query = torch.randn((1, 2, 4, 64), dtype=torch.float16, device="cuda")
@@ -474,6 +473,38 @@ target = Path(sys.argv[1])
 fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
 with os.fdopen(fd, "w", encoding="utf-8") as stream:
     json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+lerobot = importlib.util.find_spec("lerobot")
+peft = importlib.util.find_spec("peft")
+container_payload = {
+    "schema_version": 1,
+    "kind": "lehome_public_n15_training_container_runtime_v1",
+    "image_id": sys.argv[3],
+    "python_executable": sys.executable,
+    "python_version": list(sys.version_info[:3]),
+    "pythonpath": os.environ.get("PYTHONPATH"),
+    "lerobot_origin": None if lerobot is None else lerobot.origin,
+    "peft_origin": None if peft is None else peft.origin,
+    "flash_attn_origin": origin,
+    "torch_version": str(torch.__version__),
+    "torch_cuda_version": torch.version.cuda,
+    "cuda_capability": list(torch.cuda.get_device_capability(0)),
+}
+expected_container = {
+    "image_id": "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7",
+    "python_executable": "/opt/lehome-challenge/.venv/bin/python",
+    "pythonpath": "/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl",
+    "lerobot_origin": "/runtime/lerobot-0.4.3-py3-none-any.whl/lerobot/__init__.py",
+    "peft_origin": "/deps/peft-0.18.1-py3-none-any.whl/peft/__init__.py",
+}
+if any(container_payload.get(key) != value for key, value in expected_container.items()):
+    raise SystemExit("N1.5 container training runtime identity mismatch")
+container_target = Path(sys.argv[2])
+fd = os.open(container_target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+with os.fdopen(fd, "w", encoding="ascii") as stream:
+    json.dump(container_payload, stream, sort_keys=True, separators=(",", ":"))
     stream.write("\n")
     stream.flush()
     os.fsync(stream.fileno())
@@ -513,16 +544,20 @@ cd "$source_root"; export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$
 # guest's default home cache.
 HF_LEROBOT_HOME="$eagle_home/lerobot"
 export HF_HOME HF_LEROBOT_HOME HF_HUB_OFFLINE HF_HUB_CACHE
-sudo -n docker run --rm --pull never --gpus all --network none \
-  --tmpfs /flash:rw,exec,size=2g,mode=700 \
+sudo -n docker run --rm -i --pull never --gpus all --network none \
+  --user "$(id -u):$(id -g)" \
+  --tmpfs "/flash:rw,exec,size=2g,mode=700,uid=$(id -u),gid=$(id -g)" \
   --mount "type=bind,src=$source_root,dst=$source_root" \
   --mount "type=bind,src=$staging_root,dst=$staging_root" \
+  --mount "type=bind,src=$hf_cache,dst=$hf_cache,readonly" \
+  --mount "type=bind,src=$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl,dst=/runtime/lerobot-0.4.3-py3-none-any.whl,readonly" \
   --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/deps,readonly" \
-  --entrypoint bash lehome-rollout:build -s -- "$source_root" "$eagle_home" "$hf_cache" "$peft_wheel" <<'CONTAINER' 2>&1 | tee "$staging_root/logs/train.log"
+  --entrypoint bash "$runtime_image_id" -s -- "$source_root" "$eagle_home" "$hf_cache" "$staging_root" <<'CONTAINER' 2>&1 | tee "$staging_root/logs/train.log"
 set -euo pipefail
-source_root="$1"; eagle_home="$2"; hf_cache="$3"; peft_wheel="$4"
+source_root="$1"; eagle_home="$2"; hf_cache="$3"; staging_root="$4"
 python_bin=/opt/lehome-challenge/.venv/bin/python
-"$python_bin" - /deps/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /flash <<'PY'
+mkdir -m 0700 /flash/site-packages
+"$python_bin" - /deps/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /flash/site-packages <<'PY'
 import sys, zipfile
 from pathlib import Path
 wheel, target = map(Path, sys.argv[1:])
@@ -533,9 +568,12 @@ with zipfile.ZipFile(wheel) as archive:
 PY
 cd "$source_root"
 export HF_HOME="$eagle_home" HF_LEROBOT_HOME="$eagle_home/lerobot" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"
-PYTHONPATH="/flash:$peft_wheel" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline
+PYTHONPATH="/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline
 CONTAINER
 test -d "$upstream_output" && test ! -L "$upstream_output"
+find "$eagle_home" -depth -type f -delete
+find "$eagle_home" -depth -type d -empty -delete
+test ! -e "$eagle_home"
 mv -- "$upstream_output" "$training_root"
 mv -- "$staging_root/evidence" "$training_root/evidence"
 mv -- "$staging_root/logs" "$training_root/logs"

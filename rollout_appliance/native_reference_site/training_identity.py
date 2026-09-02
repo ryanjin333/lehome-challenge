@@ -73,6 +73,14 @@ _FLASH_ATTENTION_RUNTIME_RECEIPT = {
     "flash_attn_version": "2.8.3",
     "kernel": {"shape": [1, 2, 4, 64], "dtype": "float16", "finite": True},
 }
+_TRAINING_CONTAINER_IMAGE_ID = (
+    "sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"
+)
+_TRAINING_CONTAINER_PYTHON = "/opt/lehome-challenge/.venv/bin/python"
+_TRAINING_CONTAINER_PYTHONPATH = (
+    "/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:"
+    "/deps/peft-0.18.1-py3-none-any.whl"
+)
 
 
 class TrainingIdentityError(RuntimeError):
@@ -315,7 +323,11 @@ def validate_training_identity_receipt(
     checksum_path = _regular(training_root / "checksums.sha256", "training checksum manifest")
     if _sha256_file(checksum_path) != receipt["checksums_sha256"]:
         raise TrainingIdentityError("training checksum manifest digest mismatch")
-    expected_artifacts = set(artifacts) - {"checksums.sha256"}
+    expected_artifacts = set(artifacts) - {
+        "checksums.sha256",
+        "training-identity.json",
+        "training-publication.json",
+    }
     checksums = _manifest(checksum_path)
     if set(checksums) != expected_artifacts or receipt["artifact_count"] != len(checksums):
         raise TrainingIdentityError("training artifact count or checksum file set mismatch")
@@ -462,14 +474,19 @@ def validate_training_identity_receipt(
         or any(not isinstance(inputs.get(key), str) or not Path(inputs[key]).is_absolute()
                for key in ("base_model_root", "hub_cache_root", "dataset_root", "source_receipt", "resolved_snapshots_receipt"))
         or not isinstance(command, Mapping)
-        or set(command) != {"cwd", "argv", "shell_argv", "env"}
+        or set(command) != {"cwd", "argv", "shell_argv", "container", "env"}
         or not isinstance(command.get("cwd"), str) or not Path(command["cwd"]).is_absolute()
         or command.get("argv") != contract["training_command"]
         or command.get("shell_argv") != shlex.join(contract["training_command"])
+        or command.get("container") != {
+            "image_id": _TRAINING_CONTAINER_IMAGE_ID,
+            "python_executable": _TRAINING_CONTAINER_PYTHON,
+            "pythonpath": _TRAINING_CONTAINER_PYTHONPATH,
+        }
         or command.get("env") != {
             "HF_HUB_CACHE": inputs["hub_cache_root"],
             "HF_HUB_OFFLINE": "1",
-            "PYTHONPATH": _PEFT_OVERLAY_RECEIPT["wheel_path"],
+            "PYTHONPATH": _TRAINING_CONTAINER_PYTHONPATH,
         }
     ):
         raise TrainingIdentityError("training execution manifest mismatch")
@@ -498,6 +515,50 @@ def validate_training_identity_receipt(
         or not flash_origin.endswith("/site-packages/flash_attn/__init__.py")
     ):
         raise TrainingIdentityError("training FlashAttention runtime identity mismatch")
+
+    runtime_image = _json(
+        training_root / "evidence/runtime-image-receipt.json",
+        "training runtime image receipt",
+    )
+    if runtime_image != {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_training_runtime_image_v1",
+        "image_id": _TRAINING_CONTAINER_IMAGE_ID,
+    }:
+        raise TrainingIdentityError("training runtime image identity mismatch")
+    container_runtime = _json(
+        training_root / "evidence/training-container-runtime-receipt.json",
+        "training container runtime receipt",
+    )
+    python_version = container_runtime.get("python_version")
+    if (
+        set(container_runtime) != {
+            "schema_version", "kind", "image_id", "python_executable",
+            "python_version", "pythonpath", "lerobot_origin", "peft_origin",
+            "flash_attn_origin", "torch_version", "torch_cuda_version",
+            "cuda_capability",
+        }
+        or container_runtime.get("schema_version") != 1
+        or container_runtime.get("kind")
+        != "lehome_public_n15_training_container_runtime_v1"
+        or container_runtime.get("image_id") != _TRAINING_CONTAINER_IMAGE_ID
+        or container_runtime.get("python_executable") != _TRAINING_CONTAINER_PYTHON
+        or container_runtime.get("pythonpath") != _TRAINING_CONTAINER_PYTHONPATH
+        or container_runtime.get("lerobot_origin")
+        != "/runtime/lerobot-0.4.3-py3-none-any.whl/lerobot/__init__.py"
+        or container_runtime.get("peft_origin")
+        != "/deps/peft-0.18.1-py3-none-any.whl/peft/__init__.py"
+        or container_runtime.get("flash_attn_origin")
+        != "/flash/site-packages/flash_attn/__init__.py"
+        or container_runtime.get("torch_version") != "2.7.0+cu128"
+        or container_runtime.get("torch_cuda_version") != "12.8"
+        or container_runtime.get("cuda_capability") != [12, 0]
+        or not isinstance(python_version, list)
+        or len(python_version) != 3
+        or any(type(part) is not int for part in python_version)
+        or python_version[:2] != [3, 11]
+    ):
+        raise TrainingIdentityError("training container runtime identity mismatch")
 
     lock = _regular(training_root / "evidence/uv.lock", "training dependency lock")
     if _sha256_file(lock) != contract["dependency_lock_sha256"]:

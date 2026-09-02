@@ -78,6 +78,10 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'EXACT_VM_ID="computeinstance-u00t6xfqhadrcmssa2"' in text
     assert 'PROTECTED_DISK_ID="computedisk-u00pbe55crxy7jr56x"' in text
     assert 'EXACT_IMAGE_ID="computeimage-u00zf6w3yf72gakhcy"' in text
+    assert 'RUNTIME_IMAGE_ID="sha256:bec2b688ca03145dd20c010aa32b761a386e3fed57bdc45c3df5d86f9afa15c7"' in text
+    assert '"$LEROBOT_WHEEL" "$RUNTIME_IMAGE_ID" <<\'SH\'' in text
+    assert 'runtime_image_id="${12}"' in text
+    assert " LEROBOT_WHEEL RUNTIME_IMAGE_ID ASSETS_ROOT" in text
     assert "LEHOME_N15_EXPECTED_IMAGE_ID" not in text
     assert "nebius compute instance start --id" in text
     assert "nebius compute instance stop --id" in text
@@ -85,6 +89,7 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert "compute disk create" not in text
     assert "compute image create" not in text
     assert "trap stop_exact_vm EXIT" in text
+    assert text.count("StrictHostKeyChecking=accept-new") == 2
     assert "LEHOME_N15_MAX_BUDGET_USD" in text
     assert "LEHOME_N15_ESTIMATED_COST_USD" not in text
     assert "PROVIDER_HOURLY_CEILING_USD=3" in text
@@ -94,11 +99,13 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'export UV_CACHE_DIR="$(dirname -- "$python_bin")/.uv-cache"' in text
     assert 'export TMPDIR="$(dirname -- "$python_bin")/.uv-tmp"' in text
     assert 'export UV_LINK_MODE=copy' in text
-    assert 'sudo -n docker run --rm --pull never --gpus all --network none' in text
-    assert '--tmpfs /flash:rw,exec,size=2g,mode=700' in text
+    assert 'sudo -n docker image inspect -- "$runtime_image_id"' in text
+    assert 'sudo -n docker run --rm -i --pull never --gpus all --network none' in text
+    assert '--user "$(id -u):$(id -g)"' in text
+    assert '--tmpfs "/flash:rw,exec,size=2g,mode=700,uid=$(id -u),gid=$(id -g)"' in text
     assert 'with zipfile.ZipFile(wheel) as archive:' in text
-    assert 'PYTHONPATH=/flash "$python_bin"' in text
-    assert 'expected = "/flash/flash_attn/__init__.py"' in text
+    assert 'PYTHONPATH="$pythonpath" "$python_bin"' in text
+    assert 'expected = "/flash/site-packages/flash_attn/__init__.py"' in text
     assert "grep -Eq '^(disk|part|lvm|crypt)$'" in text
     assert 'lsblk -ndo MAJ:MIN /dev/disk/by-id/virtio-lehome' in text
     assert '"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin"' in text
@@ -113,11 +120,17 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'export HF_HOME HF_LEROBOT_HOME HF_HUB_OFFLINE HF_HUB_CACHE' in text
     assert 'prepare-peft-overlay --receipt "$staging_root/evidence/peft-overlay-receipt.json"' in text
     assert 'peft_wheel="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"' in text
-    assert 'PYTHONPATH="/flash:$peft_wheel"' in text
+    assert 'PYTHONPATH="/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl"' in text
     assert 'prepare-flash-attention-overlay --receipt "$staging_root/evidence/flash-attention-overlay-receipt.json"' in text
     assert 'flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"' in text
     assert 'flash_attn_2_cuda' in text
+    assert '--mount "type=bind,src=$hf_cache,dst=$hf_cache,readonly"' in text
+    assert '--mount "type=bind,src=$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl,dst=/runtime/lerobot-0.4.3-py3-none-any.whl,readonly"' in text
+    assert 'find "$eagle_home" -depth -type f -delete' in text
     assert 'flash-attention-runtime-receipt.json' in text
+    assert 'training-container-runtime-receipt.json' in text
+    assert '"$runtime_image_id" -s --' in text
+    assert 'lehome-rollout:build -s --' not in text
     assert text.index('export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"') < text.index('/opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml')
     assert 'eagle_asset_source="$(readlink -f "$eagle_snapshot/$eagle_asset")"' in text
     assert '[[ "$eagle_asset_source" == "$eagle_repository/blobs/"* ]]' in text
