@@ -26,6 +26,13 @@ override-dependencies = [
     "numpy==1.26.0",
 ]
 
+[tool.uv.sources]
+# The RTX Pro 6000 is Blackwell (SM 12.0); ordinary PyPI's CUDA 12.6 wheel
+# cannot execute on it.  The public N1.5 runtime is pinned to the matching
+# official PyTorch CUDA 12.8 build below.
+torch = [{ index = "pytorch" }]
+torchvision = [{ index = "pytorch" }]
+
 [[tool.uv.index]]
 name = "nvidia"
 url = "https://pypi.nvidia.com/"

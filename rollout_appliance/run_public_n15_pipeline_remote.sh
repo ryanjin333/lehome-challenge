@@ -369,6 +369,14 @@ install -m 0444 "$source_root/uv.lock" "$staging_root/evidence/uv.lock"
 test -f "$wheel" && test ! -L "$wheel" && test -d "$hf_cache" && test ! -L "$hf_cache"
 test -x "$uv_bin" && test ! -L "$uv_bin"
 test -x "$python_bin"
+# Keep installer scratch and package copies on the protected disk.  The VM
+# root volume is intentionally small and its default uv cache can fill during
+# a CUDA runtime repair; hard links into that cache also produced a truncated
+# FlashAttention extension on this host.
+export UV_CACHE_DIR="$(dirname -- "$python_bin")/.uv-cache"
+export TMPDIR="$(dirname -- "$python_bin")/.uv-tmp"
+export UV_LINK_MODE=copy
+mkdir -m 0700 -p "$UV_CACHE_DIR" "$TMPDIR"
 install -m 0444 "$wheel" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl"
 python3 "$root/scripts/run_public_n15_reproduction.py" build-compatible-wheel \
   --upstream-wheel "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" \
