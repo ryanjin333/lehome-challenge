@@ -420,12 +420,27 @@ with zipfile.ZipFile(wheel) as archive:
                 output.write(block)
         os.chmod(destination, 0o444)
 PY
-PYTHONPATH="$flash_overlay" "$python_bin" - "$flash_overlay" "$staging_root/evidence/flash-attention-runtime-receipt.json" <<'PY'
+sudo -n docker run --rm --pull never --gpus all --network none \
+  --tmpfs /flash:rw,exec,size=2g,mode=700 \
+  --mount "type=bind,src=$staging_root,dst=$staging_root" \
+  --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/deps,readonly" \
+  --entrypoint bash lehome-rollout:build -s -- "$staging_root/evidence/flash-attention-runtime-receipt.json" <<'CONTAINER'
+set -euo pipefail
+python_bin=/opt/lehome-challenge/.venv/bin/python
+"$python_bin" - /deps/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /flash <<'PY'
+import os, sys, zipfile
+from pathlib import Path
+
+wheel, target = map(Path, sys.argv[1:])
+with zipfile.ZipFile(wheel) as archive:
+    for item in archive.infolist():
+        if item.filename.startswith(("flash_attn/", "flash_attn_2_cuda")):
+            archive.extract(item, target)
+PY
+PYTHONPATH=/flash "$python_bin" - "$1" <<'PY'
 import json, os, sys
 from pathlib import Path
 
-flash_overlay = Path(sys.argv[1])
-sys.path.insert(0, str(flash_overlay))
 import flash_attn, torch
 from flash_attn import flash_attn_func
 
@@ -436,7 +451,7 @@ if bool(torch._C._GLIBCXX_USE_CXX11_ABI) is not True:
 if not torch.cuda.is_available() or list(torch.cuda.get_device_capability(0)) != [12, 0]:
     raise SystemExit("FlashAttention requires CUDA capability [12, 0]")
 origin = str(Path(flash_attn.__file__).resolve())
-expected = str(flash_overlay / "flash_attn/__init__.py")
+expected = "/flash/flash_attn/__init__.py"
 if origin != expected:
     raise SystemExit("FlashAttention installed runtime identity is invalid")
 query = torch.randn((1, 2, 4, 64), dtype=torch.float16, device="cuda")
@@ -451,11 +466,11 @@ payload = {
     "torch_cuda_version": torch.version.cuda,
     "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
     "cuda_capability": list(torch.cuda.get_device_capability(0)),
-    "flash_attn_version": str(getattr(flash_attn, "__version__", "unknown")),
+    "flash_attn_version": "2.8.3",
     "flash_attn_origin": origin,
     "kernel": {"shape": [1, 2, 4, 64], "dtype": "float16", "finite": True},
 }
-target = Path(sys.argv[2])
+target = Path(sys.argv[1])
 fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
 with os.fdopen(fd, "w", encoding="utf-8") as stream:
     json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
@@ -463,6 +478,7 @@ with os.fdopen(fd, "w", encoding="utf-8") as stream:
     stream.flush()
     os.fsync(stream.fileno())
 PY
+CONTAINER
 "$python_bin" - "$root" "$source_root/configs/train_groot.yaml" "$staging_root/evidence/runtime-receipt.json" "$staging_root/evidence/uv.lock" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-compatibility-receipt.json" <<'PY'
 import hashlib, importlib.util, json, os, sys
 from pathlib import Path
@@ -478,8 +494,8 @@ python3 "$root/scripts/run_public_n15_reproduction.py" render-training --checkou
 eagle_repository="$hf_cache/models--lerobot--eagle2hg-processor-groot-n1p5"
 eagle_snapshot="$eagle_repository/snapshots/baf604d8a5caf26fda5cc545f141bc1814156237"
 test -d "$eagle_snapshot" && test ! -L "$eagle_snapshot"
-eagle_home="$(mktemp -d /tmp/lehome-n15-eagle-home.XXXXXX)"
-trap 'rm -r -- "$eagle_home" 2>/dev/null || true' EXIT
+eagle_home="$staging_root/eagle-home"
+test ! -e "$eagle_home" && test ! -L "$eagle_home"
 eagle_cache="$eagle_home/lerobot/lerobot/eagle2hg-processor-groot-n1p5"
 mkdir -m 0700 -p "$eagle_cache"
 for eagle_asset in vocab.json merges.txt added_tokens.json chat_template.json special_tokens_map.json config.json generation_config.json preprocessor_config.json processor_config.json tokenizer_config.json; do
@@ -497,7 +513,28 @@ cd "$source_root"; export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$
 # guest's default home cache.
 HF_LEROBOT_HOME="$eagle_home/lerobot"
 export HF_HOME HF_LEROBOT_HOME HF_HUB_OFFLINE HF_HUB_CACHE
-PYTHONPATH="$flash_overlay:$peft_wheel" "$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml --wandb.mode=offline 2>&1 | tee "$staging_root/logs/train.log"
+sudo -n docker run --rm --pull never --gpus all --network none \
+  --tmpfs /flash:rw,exec,size=2g,mode=700 \
+  --mount "type=bind,src=$source_root,dst=$source_root" \
+  --mount "type=bind,src=$staging_root,dst=$staging_root" \
+  --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/deps,readonly" \
+  --entrypoint bash lehome-rollout:build -s -- "$source_root" "$eagle_home" "$hf_cache" "$peft_wheel" <<'CONTAINER' 2>&1 | tee "$staging_root/logs/train.log"
+set -euo pipefail
+source_root="$1"; eagle_home="$2"; hf_cache="$3"; peft_wheel="$4"
+python_bin=/opt/lehome-challenge/.venv/bin/python
+"$python_bin" - /deps/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /flash <<'PY'
+import sys, zipfile
+from pathlib import Path
+wheel, target = map(Path, sys.argv[1:])
+with zipfile.ZipFile(wheel) as archive:
+    for item in archive.infolist():
+        if item.filename.startswith(("flash_attn/", "flash_attn_2_cuda")):
+            archive.extract(item, target)
+PY
+cd "$source_root"
+export HF_HOME="$eagle_home" HF_LEROBOT_HOME="$eagle_home/lerobot" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"
+PYTHONPATH="/flash:$peft_wheel" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline
+CONTAINER
 test -d "$upstream_output" && test ! -L "$upstream_output"
 mv -- "$upstream_output" "$training_root"
 mv -- "$staging_root/evidence" "$training_root/evidence"

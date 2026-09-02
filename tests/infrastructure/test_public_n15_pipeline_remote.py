@@ -94,10 +94,11 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'export UV_CACHE_DIR="$(dirname -- "$python_bin")/.uv-cache"' in text
     assert 'export TMPDIR="$(dirname -- "$python_bin")/.uv-tmp"' in text
     assert 'export UV_LINK_MODE=copy' in text
-    assert 'flash_overlay="$staging_root/evidence/flash-attention-site-packages"' in text
+    assert 'sudo -n docker run --rm --pull never --gpus all --network none' in text
+    assert '--tmpfs /flash:rw,exec,size=2g,mode=700' in text
     assert 'with zipfile.ZipFile(wheel) as archive:' in text
-    assert 'PYTHONPATH="$flash_overlay" "$python_bin"' in text
-    assert 'expected = str(flash_overlay / "flash_attn/__init__.py")' in text
+    assert 'PYTHONPATH=/flash "$python_bin"' in text
+    assert 'expected = "/flash/flash_attn/__init__.py"' in text
     assert "grep -Eq '^(disk|part|lvm|crypt)$'" in text
     assert 'lsblk -ndo MAJ:MIN /dev/disk/by-id/virtio-lehome' in text
     assert '"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin"' in text
@@ -106,18 +107,18 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert compatibility_install < text.index('"$python_bin" -I -c \'import lerobot; from pathlib import Path; assert Path(lerobot.__file__).is_file()\'')
     assert 'eagle_repository="$hf_cache/models--lerobot--eagle2hg-processor-groot-n1p5"' in text
     assert 'eagle_snapshot="$eagle_repository/snapshots/baf604d8a5caf26fda5cc545f141bc1814156237"' in text
-    assert 'eagle_home="$(mktemp -d /tmp/lehome-n15-eagle-home.XXXXXX)"' in text
+    assert 'eagle_home="$staging_root/eagle-home"' in text
     assert 'export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"' in text
     assert 'HF_LEROBOT_HOME="$eagle_home/lerobot"' in text
     assert 'export HF_HOME HF_LEROBOT_HOME HF_HUB_OFFLINE HF_HUB_CACHE' in text
     assert 'prepare-peft-overlay --receipt "$staging_root/evidence/peft-overlay-receipt.json"' in text
     assert 'peft_wheel="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"' in text
-    assert 'PYTHONPATH="$flash_overlay:$peft_wheel"' in text
+    assert 'PYTHONPATH="/flash:$peft_wheel"' in text
     assert 'prepare-flash-attention-overlay --receipt "$staging_root/evidence/flash-attention-overlay-receipt.json"' in text
     assert 'flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"' in text
-    assert 'flash-attention-site-packages' in text
+    assert 'flash_attn_2_cuda' in text
     assert 'flash-attention-runtime-receipt.json' in text
-    assert text.index('export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"') < text.index('"$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml')
+    assert text.index('export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"') < text.index('/opt/lehome-challenge/.venv/bin/lerobot-train --config_path=configs/train_groot.yaml')
     assert 'eagle_asset_source="$(readlink -f "$eagle_snapshot/$eagle_asset")"' in text
     assert '[[ "$eagle_asset_source" == "$eagle_repository/blobs/"* ]]' in text
     assert "run_public_n15_focused_gate.sh" in text
