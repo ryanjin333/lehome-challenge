@@ -95,6 +95,9 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'lsblk -ndo MAJ:MIN /dev/disk/by-id/virtio-lehome' in text
     assert '"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin"' in text
     assert '"$python_bin" -m pip install' not in text
+    compatibility_install = text.index('"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin"')
+    assert compatibility_install < text.index('test -x "$(dirname -- "$python_bin")/lerobot-train"')
+    assert compatibility_install < text.index('"$python_bin" -I -c \'import lerobot; from pathlib import Path; assert Path(lerobot.__file__).is_file()\'')
     assert "run_public_n15_focused_gate.sh" in text
     assert "run_public_n15_harvest.sh" in text
     assert "immutable receipt" in text

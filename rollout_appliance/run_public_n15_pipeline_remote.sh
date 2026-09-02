@@ -368,8 +368,7 @@ install -m 0444 "$snapshots" "$staging_root/evidence/resolved-snapshots-receipt.
 install -m 0444 "$source_root/uv.lock" "$staging_root/evidence/uv.lock"
 test -f "$wheel" && test ! -L "$wheel" && test -d "$hf_cache" && test ! -L "$hf_cache"
 test -x "$uv_bin" && test ! -L "$uv_bin"
-test -x "$python_bin" && test -x "$(dirname -- "$python_bin")/lerobot-train"
-"$python_bin" -I -c 'import lerobot; from pathlib import Path; assert Path(lerobot.__file__).is_file()'
+test -x "$python_bin"
 install -m 0444 "$wheel" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl"
 python3 "$root/scripts/run_public_n15_reproduction.py" build-compatible-wheel \
   --upstream-wheel "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" \
@@ -381,6 +380,8 @@ python3 "$root/scripts/run_public_n15_reproduction.py" verify-compatible-wheel \
   --receipt "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" >/dev/null
 "$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin" \
   "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" >/dev/null
+test -x "$(dirname -- "$python_bin")/lerobot-train"
+"$python_bin" -I -c 'import lerobot; from pathlib import Path; assert Path(lerobot.__file__).is_file()'
 "$python_bin" - "$root" "$source_root/configs/train_groot.yaml" "$staging_root/evidence/runtime-receipt.json" "$staging_root/evidence/uv.lock" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-compatibility-receipt.json" <<'PY'
 import hashlib, importlib.util, json, os, sys
 from pathlib import Path
