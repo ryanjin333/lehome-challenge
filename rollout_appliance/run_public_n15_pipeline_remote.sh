@@ -410,7 +410,13 @@ done
 # The Task1 verifier seals this exact manifest, source/snapshot receipts,
 # dependency lock, runtime receipt, train log, and checkpoint—not a hand-made
 # approximation of a successful training result.
-cd "$source_root"; export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"; "$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml --wandb.mode=offline 2>&1 | tee "$staging_root/logs/train.log"
+cd "$source_root"; export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"
+# GR00T reads this explicit LeRobot cache override at import time. Pin it as
+# well as HF_HOME so the prepared offline Eagle assets cannot fall back to the
+# guest's default home cache.
+HF_LEROBOT_HOME="$eagle_home/lerobot"
+export HF_HOME HF_LEROBOT_HOME HF_HUB_OFFLINE HF_HUB_CACHE
+"$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml --wandb.mode=offline 2>&1 | tee "$staging_root/logs/train.log"
 test -d "$upstream_output" && test ! -L "$upstream_output"
 mv -- "$upstream_output" "$training_root"
 mv -- "$staging_root/evidence" "$training_root/evidence"

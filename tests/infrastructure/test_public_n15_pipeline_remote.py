@@ -102,6 +102,8 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'eagle_snapshot="$eagle_repository/snapshots/baf604d8a5caf26fda5cc545f141bc1814156237"' in text
     assert 'eagle_home="$(mktemp -d /tmp/lehome-n15-eagle-home.XXXXXX)"' in text
     assert 'export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"' in text
+    assert 'HF_LEROBOT_HOME="$eagle_home/lerobot"' in text
+    assert 'export HF_HOME HF_LEROBOT_HOME HF_HUB_OFFLINE HF_HUB_CACHE' in text
     assert text.index('export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"') < text.index('"$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml')
     assert 'eagle_asset_source="$(readlink -f "$eagle_snapshot/$eagle_asset")"' in text
     assert '[[ "$eagle_asset_source" == "$eagle_repository/blobs/"* ]]' in text
