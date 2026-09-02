@@ -147,8 +147,8 @@ def test_over_budget_plan_never_starts_the_mocked_exact_vm(tmp_path: Path) -> No
     assert " start " not in f" {log.read_text(encoding='utf-8')} "
 
 
-def test_running_observation_reuses_the_loop_created_receipt(tmp_path: Path) -> None:
-    """A successful RUNNING poll must reach the runtime gate without recapturing."""
+def test_running_observation_waits_for_cloud_init_after_ssh_is_ready(tmp_path: Path) -> None:
+    """A transient runtime gate must not stop a guest that has already accepted SSH."""
     fake_bin = tmp_path / "bin"; fake_bin.mkdir()
     state = tmp_path / "provider-state.txt"; state.write_text("STOPPED", encoding="utf-8")
     trace = tmp_path / "provider-trace.log"
@@ -185,7 +185,11 @@ def test_running_observation_reuses_the_loop_created_receipt(tmp_path: Path) -> 
         "  (( attempts >= 7 )) && exit 0\n"
         "  exit 98\n"
         "fi\n"
-        "printf 'runtime\\n' >> \"$FAKE_PROVIDER_TRACE\"\n"
+        "attempts=0; [[ -f \"$FAKE_RUNTIME_ATTEMPTS\" ]] && attempts=$(cat \"$FAKE_RUNTIME_ATTEMPTS\")\n"
+        "attempts=$((attempts + 1)); printf '%s' \"$attempts\" > \"$FAKE_RUNTIME_ATTEMPTS\"\n"
+        "if (( attempts <= 3 )); then printf 'runtime\\n' >> \"$FAKE_PROVIDER_TRACE\"; (( attempts == 3 )) && exit 0; exit 97; fi\n"
+        "if (( attempts == 4 )); then printf 'identity-check\\n' >> \"$FAKE_PROVIDER_TRACE\"; exit 97; fi\n"
+        "printf 'train\\n' >> \"$FAKE_PROVIDER_TRACE\"\n"
         "exit 97\n",
         encoding="utf-8",
     )
@@ -195,6 +199,7 @@ def test_running_observation_reuses_the_loop_created_receipt(tmp_path: Path) -> 
     env = {
         **os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "FAKE_PROVIDER_TRACE": str(trace), "FAKE_NEBIUS_STATE": str(state), "FAKE_SSH_ATTEMPTS": str(tmp_path / "ssh-attempts"),
+        "FAKE_RUNTIME_ATTEMPTS": str(tmp_path / "runtime-attempts"),
         "LEHOME_N15_RUN_ID": "n15-running-observation", "LEHOME_N15_PIPELINE_ROOT": str(pipeline),
         "LEHOME_N15_SSH_TARGET": "operator@example", "LEHOME_N15_REMOTE_ROOT": "/mnt/lehome/runtime",
         "LEHOME_N15_REMOTE_RUNS_BASE": "/mnt/lehome/runs", "LEHOME_N15_REMOTE_PIPELINE_ROOT": "/mnt/lehome/runs/n15-running-observation",
@@ -207,10 +212,7 @@ def test_running_observation_reuses_the_loop_created_receipt(tmp_path: Path) -> 
     }
     result = subprocess.run(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True)
     assert result.returncode != 0
-    assert "runtime/cloud-init/workspace/GPU/upstream gate failed" in result.stderr
-    assert "native reference receipt already exists" not in result.stderr
-    assert "exact VM did not reach RUNNING" not in result.stderr
-    assert trace.read_text(encoding="utf-8").splitlines() == ["start", *("readiness" for _ in range(7)), "runtime", "stop"]
+    assert trace.read_text(encoding="utf-8").splitlines() == ["start", *("readiness" for _ in range(7)), "runtime", "runtime", "runtime", "identity-check", "train", "stop"]
     assert state.read_text(encoding="utf-8") == "STOPPED"
 
 

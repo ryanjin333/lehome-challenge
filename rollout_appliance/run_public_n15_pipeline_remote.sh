@@ -335,6 +335,18 @@ fi
 SH
 }
 
+wait_for_remote_runtime() {
+  local attempt
+  # SSH can accept the controller before cloud-init creates boot-finished.
+  # Re-run the whole read-only runtime gate within the existing boot-readiness
+  # budget rather than stopping a guest during that short race.
+  for (( attempt = 1; attempt <= SSH_READINESS_ATTEMPTS; attempt++ )); do
+    if validate_remote_runtime; then return 0; fi
+    (( attempt == SSH_READINESS_ATTEMPTS )) || sleep "$SSH_READINESS_INTERVAL_SECONDS"
+  done
+  return 1
+}
+
 train_stage() {
   remote bash -s -- "$REMOTE_ROOT" "$SOURCE_ROOT" "$SOURCE_RECEIPT" "$SNAPSHOTS_RECEIPT" "$TRAINING_ROOT" "$EXACT_VM_ID" "$PROTECTED_DISK_ID" "$TRAINING_HF_CACHE" "$TRAINING_PYTHON" "$TRAINING_UV" "$LEROBOT_WHEEL" <<'SH'
 set -euo pipefail
@@ -489,7 +501,7 @@ done
 (( running_observed == 1 )) && [[ -f "$response" && ! -L "$response" ]] || fail "exact VM did not reach RUNNING"
 rm -f -- "$response"
 wait_for_ssh_readiness || fail "exact VM did not become SSH-ready"
-validate_remote_runtime || fail "runtime/cloud-init/workspace/GPU/upstream gate failed"
+wait_for_remote_runtime || fail "runtime/cloud-init/workspace/GPU/upstream gate failed"
 if ! remote_file_exists "$TRAINING_IDENTITY_RECEIPT"; then run_paid_stage train "$TRAIN_TIMEOUT_SECONDS" train_stage; fi
 verify_remote_training_chain || fail "training receipt chain failed"
 if ! remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then publish_training_readback || fail "training publication/readback failed"; fi
