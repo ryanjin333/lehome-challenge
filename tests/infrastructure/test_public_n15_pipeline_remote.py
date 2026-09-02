@@ -118,11 +118,21 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"' in text
     assert 'HF_LEROBOT_HOME="$eagle_home/lerobot"' in text
     assert 'export HF_HOME HF_LEROBOT_HOME HF_HUB_OFFLINE HF_HUB_CACHE' in text
-    assert 'prepare-peft-overlay --receipt "$staging_root/evidence/peft-overlay-receipt.json"' in text
+    assert 'prepare-peft-overlay --receipt "$2"' in text
+    assert '"$staging_root/evidence/peft-overlay-receipt.json"' in text
     assert 'peft_wheel="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"' in text
     assert 'PYTHONPATH="/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl"' in text
-    assert 'prepare-flash-attention-overlay --receipt "$staging_root/evidence/flash-attention-overlay-receipt.json"' in text
+    assert 'prepare-flash-attention-overlay --receipt "$3"' in text
+    assert '"$staging_root/evidence/flash-attention-overlay-receipt.json"' in text
     assert 'flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"' in text
+    pinned_preflight = text.index('sudo -n docker run --rm -i --pull never --gpus all --network none')
+    assert pinned_preflight < text.index('prepare-peft-overlay --receipt "$2"')
+    assert pinned_preflight < text.index('prepare-flash-attention-overlay --receipt "$3"')
+    assert '--mount "type=bind,src=$root,dst=$root,readonly"' in text
+    assert '--mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/mnt/lehome/reference-native/dependencies,readonly"' in text
+    host_preflight = text[text.index('"$python_bin" -I -c'):pinned_preflight]
+    assert "prepare-peft-overlay" not in host_preflight
+    assert "prepare-flash-attention-overlay" not in host_preflight
     assert 'flash_attn_2_cuda' in text
     assert '--mount "type=bind,src=$hf_cache,dst=$hf_cache,readonly"' in text
     assert '--mount "type=bind,src=$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl,dst=/runtime/lerobot-0.4.3-py3-none-any.whl,readonly"' in text

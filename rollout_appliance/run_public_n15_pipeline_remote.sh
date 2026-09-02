@@ -391,12 +391,6 @@ python3 "$root/scripts/run_public_n15_reproduction.py" verify-compatible-wheel \
   "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" >/dev/null
 test -x "$(dirname -- "$python_bin")/lerobot-train"
 "$python_bin" -I -c 'import lerobot; from pathlib import Path; assert Path(lerobot.__file__).is_file()'
-peft_wheel="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"
-PYTHONPATH="$peft_wheel" "$python_bin" "$root/scripts/verify_native_reference_evaluator_gate.py" \
-  prepare-peft-overlay --receipt "$staging_root/evidence/peft-overlay-receipt.json" >/dev/null
-flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
-"$python_bin" "$root/scripts/verify_native_reference_evaluator_gate.py" \
-  prepare-flash-attention-overlay --receipt "$staging_root/evidence/flash-attention-overlay-receipt.json" >/dev/null
 sudo -n docker image inspect -- "$runtime_image_id" >"$staging_root/evidence/runtime-image-inspect.json"
 "$python_bin" - "$staging_root/evidence/runtime-image-inspect.json" "$staging_root/evidence/runtime-image-receipt.json" "$runtime_image_id" <<'PY'
 import json, os, sys
@@ -418,13 +412,22 @@ PY
 sudo -n docker run --rm -i --pull never --gpus all --network none \
   --user "$(id -u):$(id -g)" \
   --tmpfs "/flash:rw,exec,size=2g,mode=700,uid=$(id -u),gid=$(id -g)" \
+  --mount "type=bind,src=$root,dst=$root,readonly" \
   --mount "type=bind,src=$staging_root,dst=$staging_root" \
   --mount "type=bind,src=$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl,dst=/runtime/lerobot-0.4.3-py3-none-any.whl,readonly" \
   --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/deps,readonly" \
-  --entrypoint bash "$runtime_image_id" -s -- "$staging_root/evidence/flash-attention-runtime-receipt.json" "$staging_root/evidence/training-container-runtime-receipt.json" "$runtime_image_id" <<'CONTAINER'
+  --mount "type=bind,src=/mnt/lehome/reference-native/dependencies,dst=/mnt/lehome/reference-native/dependencies,readonly" \
+  --entrypoint bash "$runtime_image_id" -s -- "$root" "$staging_root/evidence/peft-overlay-receipt.json" "$staging_root/evidence/flash-attention-overlay-receipt.json" "$staging_root/evidence/flash-attention-runtime-receipt.json" "$staging_root/evidence/training-container-runtime-receipt.json" "$runtime_image_id" <<'CONTAINER'
 set -euo pipefail
 python_bin=/opt/lehome-challenge/.venv/bin/python
 pythonpath=/flash/site-packages:/runtime/lerobot-0.4.3-py3-none-any.whl:/deps/peft-0.18.1-py3-none-any.whl
+root="$1"
+peft_wheel="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"
+PYTHONSAFEPATH=1 PYTHONPATH="$peft_wheel" "$python_bin" "$root/scripts/verify_native_reference_evaluator_gate.py" \
+  prepare-peft-overlay --receipt "$2" >/dev/null
+flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+PYTHONSAFEPATH=1 "$python_bin" "$root/scripts/verify_native_reference_evaluator_gate.py" \
+  prepare-flash-attention-overlay --receipt "$3" >/dev/null
 mkdir -m 0700 /flash/site-packages
 "$python_bin" - /deps/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl /flash/site-packages <<'PY'
 import os, sys, zipfile
@@ -436,7 +439,7 @@ with zipfile.ZipFile(wheel) as archive:
         if item.filename.startswith(("flash_attn/", "flash_attn_2_cuda")):
             archive.extract(item, target)
 PY
-PYTHONPATH="$pythonpath" "$python_bin" - "$1" "$2" "$3" <<'PY'
+PYTHONPATH="$pythonpath" "$python_bin" - "$4" "$5" "$6" <<'PY'
 import importlib.util, json, os, sys
 from pathlib import Path
 
