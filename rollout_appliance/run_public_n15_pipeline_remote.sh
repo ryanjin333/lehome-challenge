@@ -412,7 +412,8 @@ if not torch.cuda.is_available() or list(torch.cuda.get_device_capability(0)) !=
     raise SystemExit("FlashAttention requires CUDA capability [12, 0]")
 origin = str(Path(flash_attn.__file__).resolve())
 expected = str(Path(sys.executable).resolve().parent.parent / "lib/python3.11/site-packages/flash_attn/__init__.py")
-if origin != expected or str(flash_attn.__version__) != "2.8.3":
+expected_version = "2.8.3+cu12torch2.7cxx11abitrue"
+if origin != expected or str(flash_attn.__version__) != expected_version:
     raise SystemExit("FlashAttention installed runtime identity is invalid")
 query = torch.randn((1, 2, 4, 64), dtype=torch.float16, device="cuda")
 output = flash_attn_func(query, query, query, causal=False)
@@ -426,7 +427,7 @@ payload = {
     "torch_cuda_version": torch.version.cuda,
     "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
     "cuda_capability": list(torch.cuda.get_device_capability(0)),
-    "flash_attn_version": str(flash_attn.__version__),
+    "flash_attn_version": expected_version,
     "flash_attn_origin": origin,
     "kernel": {"shape": [1, 2, 4, 64], "dtype": "float16", "finite": True},
 }

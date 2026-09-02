@@ -94,6 +94,7 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'export UV_CACHE_DIR="$(dirname -- "$python_bin")/.uv-cache"' in text
     assert 'export TMPDIR="$(dirname -- "$python_bin")/.uv-tmp"' in text
     assert 'export UV_LINK_MODE=copy' in text
+    assert 'expected_version = "2.8.3+cu12torch2.7cxx11abitrue"' in text
     assert "grep -Eq '^(disk|part|lvm|crypt)$'" in text
     assert 'lsblk -ndo MAJ:MIN /dev/disk/by-id/virtio-lehome' in text
     assert '"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin"' in text
