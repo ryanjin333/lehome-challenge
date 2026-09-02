@@ -122,6 +122,15 @@ def test_remote_wrapper_never_runs_downstream_after_a_failed_gate() -> None:
     assert text.index("verify_remote_focused_chain || fail") < text.rindex("run_paid_stage harvest")
 
 
+def test_runtime_gate_creates_the_fresh_run_directory_only_after_proving_the_workspace_mount() -> None:
+    """The first verified-inputs receipt needs a real directory on the protected disk."""
+    text = WRAPPER.read_text(encoding="utf-8")
+    assert 'workspace_base="$(dirname -- "$pipeline_root")"' in text
+    assert 'mkdir -m 0700 -- "$pipeline_root"' in text
+    assert text.index('mkdir -m 0700 -- "$pipeline_root"') < text.index('verified_inputs="$(dirname -- "$training_root")/verified-inputs.json"')
+    assert text.index('[[ "$(lsblk -ndo MAJ:MIN /dev/disk/by-id/virtio-lehome)" == "$(findmnt -T "$workspace_base" --noheadings --output MAJ:MIN)" ]]') < text.index('mkdir -m 0700 -- "$pipeline_root"')
+
+
 def test_over_budget_plan_never_starts_the_mocked_exact_vm(tmp_path: Path) -> None:
     """A failing preflight may stop, but it must never make a start request."""
     fake_bin = tmp_path / "bin"; fake_bin.mkdir()

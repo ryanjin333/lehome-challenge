@@ -314,12 +314,17 @@ validate_remote_runtime() {
 set -euo pipefail
 root="$1"; pipeline_root="$2"; source_root="$3"; source_receipt="$4"; snapshots="$5"; training_root="$6"; revision="$7"; vm_id="$8"; disk_id="$9"
 test -f /var/lib/cloud/instance/boot-finished
-mount_source="$(findmnt -T "$pipeline_root" --noheadings --output SOURCE)"
+workspace_base="$(dirname -- "$pipeline_root")"
+[[ "$workspace_base" == /mnt/lehome/public-n15-runs ]]
+test -d "$workspace_base" && test ! -L "$workspace_base"
+mount_source="$(findmnt -T "$workspace_base" --noheadings --output SOURCE)"
 [[ "$mount_source" == /dev/* ]] && lsblk -n -o TYPE "$mount_source" | grep -Eq '^(disk|part|lvm|crypt)$'
 # Cloud-init attaches the exact Nebius secondary disk with device_id=lehome.
 # Prove that its stable guest device backs this run's workspace mount.
 test -e /dev/disk/by-id/virtio-lehome
-[[ "$(lsblk -ndo MAJ:MIN /dev/disk/by-id/virtio-lehome)" == "$(findmnt -T "$pipeline_root" --noheadings --output MAJ:MIN)" ]]
+[[ "$(lsblk -ndo MAJ:MIN /dev/disk/by-id/virtio-lehome)" == "$(findmnt -T "$workspace_base" --noheadings --output MAJ:MIN)" ]]
+if [[ ! -e "$pipeline_root" ]]; then mkdir -m 0700 -- "$pipeline_root"; fi
+test -d "$pipeline_root" && test ! -L "$pipeline_root"
 nvidia-smi -L | grep -q .
 test "$(git -C "$root" rev-parse HEAD)" = "$revision"
 test -z "$(git -C "$root" status --porcelain --untracked-files=all)"
