@@ -370,12 +370,12 @@ test -f "$wheel" && test ! -L "$wheel" && test -d "$hf_cache" && test ! -L "$hf_
 test -x "$uv_bin" && test ! -L "$uv_bin"
 test -x "$python_bin"
 # Keep installer scratch and package copies on the protected disk. The VM root
-# volume is intentionally small, and uv's wheel materialization produced
-# zero-byte FlashAttention Python files on this host.
+# volume is intentionally small; the FlashAttention wheel itself is extracted
+# into this run's immutable evidence tree below, rather than mutating the
+# persistent venv with a cache materialization that proved corrupt on reboot.
 export UV_CACHE_DIR="$(dirname -- "$python_bin")/.uv-cache"
 export TMPDIR="$(dirname -- "$python_bin")/.uv-tmp"
 export UV_LINK_MODE=copy
-export PIP_NO_CACHE_DIR=1
 mkdir -m 0700 -p "$UV_CACHE_DIR" "$TMPDIR"
 install -m 0444 "$wheel" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl"
 python3 "$root/scripts/run_public_n15_reproduction.py" build-compatible-wheel \
@@ -396,12 +396,36 @@ PYTHONPATH="$peft_wheel" "$python_bin" "$root/scripts/verify_native_reference_ev
 flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
 "$python_bin" "$root/scripts/verify_native_reference_evaluator_gate.py" \
   prepare-flash-attention-overlay --receipt "$staging_root/evidence/flash-attention-overlay-receipt.json" >/dev/null
-"$python_bin" -m ensurepip --upgrade >/dev/null
-"$python_bin" -m pip install --no-deps --force-reinstall "$flash_wheel" >/dev/null
-"$python_bin" - "$staging_root/evidence/flash-attention-runtime-receipt.json" <<'PY'
+flash_overlay="$staging_root/evidence/flash-attention-site-packages"
+"$python_bin" - "$flash_wheel" "$flash_overlay" <<'PY'
+import os, sys, zipfile
+from pathlib import Path
+
+wheel, target = map(Path, sys.argv[1:])
+if target.exists() or target.is_symlink():
+    raise SystemExit("FlashAttention overlay already exists")
+target.mkdir(mode=0o700)
+with zipfile.ZipFile(wheel) as archive:
+    members = [item for item in archive.infolist() if item.filename.startswith(("flash_attn/", "flash_attn-2.8.3.dist-info/"))]
+    if not members or any(Path(item.filename).is_absolute() or ".." in Path(item.filename).parts for item in members):
+        raise SystemExit("FlashAttention wheel members are unsafe")
+    for item in members:
+        destination = target / item.filename
+        if item.is_dir():
+            destination.mkdir(mode=0o700, exist_ok=True)
+            continue
+        destination.parent.mkdir(mode=0o700, exist_ok=True)
+        with archive.open(item) as source, destination.open("xb") as output:
+            while block := source.read(1024 * 1024):
+                output.write(block)
+        os.chmod(destination, 0o444)
+PY
+PYTHONPATH="$flash_overlay" "$python_bin" - "$flash_overlay" "$staging_root/evidence/flash-attention-runtime-receipt.json" <<'PY'
 import json, os, sys
 from pathlib import Path
 
+flash_overlay = Path(sys.argv[1])
+sys.path.insert(0, str(flash_overlay))
 import flash_attn, torch
 from flash_attn import flash_attn_func
 
@@ -411,11 +435,8 @@ if bool(torch._C._GLIBCXX_USE_CXX11_ABI) is not True:
     raise SystemExit("FlashAttention requires CXX11 ABI true")
 if not torch.cuda.is_available() or list(torch.cuda.get_device_capability(0)) != [12, 0]:
     raise SystemExit("FlashAttention requires CUDA capability [12, 0]")
-# Resolve the installed module, but keep sys.executable's venv path lexical:
-# Python itself is a symlink to the base interpreter, so resolving it would
-# incorrectly turn the expected site-packages path into /usr/lib.
 origin = str(Path(flash_attn.__file__).resolve())
-expected = str(Path(sys.executable).parent.parent / "lib/python3.11/site-packages/flash_attn/__init__.py")
+expected = str(flash_overlay / "flash_attn/__init__.py")
 if origin != expected:
     raise SystemExit("FlashAttention installed runtime identity is invalid")
 query = torch.randn((1, 2, 4, 64), dtype=torch.float16, device="cuda")
@@ -434,7 +455,7 @@ payload = {
     "flash_attn_origin": origin,
     "kernel": {"shape": [1, 2, 4, 64], "dtype": "float16", "finite": True},
 }
-target = Path(sys.argv[1])
+target = Path(sys.argv[2])
 fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
 with os.fdopen(fd, "w", encoding="utf-8") as stream:
     json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
@@ -476,7 +497,7 @@ cd "$source_root"; export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$
 # guest's default home cache.
 HF_LEROBOT_HOME="$eagle_home/lerobot"
 export HF_HOME HF_LEROBOT_HOME HF_HUB_OFFLINE HF_HUB_CACHE
-PYTHONPATH="$peft_wheel" "$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml --wandb.mode=offline 2>&1 | tee "$staging_root/logs/train.log"
+PYTHONPATH="$flash_overlay:$peft_wheel" "$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml --wandb.mode=offline 2>&1 | tee "$staging_root/logs/train.log"
 test -d "$upstream_output" && test ! -L "$upstream_output"
 mv -- "$upstream_output" "$training_root"
 mv -- "$staging_root/evidence" "$training_root/evidence"
