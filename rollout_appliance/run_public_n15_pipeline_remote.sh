@@ -382,6 +382,9 @@ python3 "$root/scripts/run_public_n15_reproduction.py" verify-compatible-wheel \
   "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" >/dev/null
 test -x "$(dirname -- "$python_bin")/lerobot-train"
 "$python_bin" -I -c 'import lerobot; from pathlib import Path; assert Path(lerobot.__file__).is_file()'
+peft_wheel="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"
+PYTHONPATH="$peft_wheel" "$python_bin" "$root/scripts/verify_native_reference_evaluator_gate.py" \
+  prepare-peft-overlay --receipt "$staging_root/evidence/peft-overlay-receipt.json" >/dev/null
 "$python_bin" - "$root" "$source_root/configs/train_groot.yaml" "$staging_root/evidence/runtime-receipt.json" "$staging_root/evidence/uv.lock" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-compatibility-receipt.json" <<'PY'
 import hashlib, importlib.util, json, os, sys
 from pathlib import Path
@@ -416,7 +419,7 @@ cd "$source_root"; export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$
 # guest's default home cache.
 HF_LEROBOT_HOME="$eagle_home/lerobot"
 export HF_HOME HF_LEROBOT_HOME HF_HUB_OFFLINE HF_HUB_CACHE
-"$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml --wandb.mode=offline 2>&1 | tee "$staging_root/logs/train.log"
+PYTHONPATH="$peft_wheel" "$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml --wandb.mode=offline 2>&1 | tee "$staging_root/logs/train.log"
 test -d "$upstream_output" && test ! -L "$upstream_output"
 mv -- "$upstream_output" "$training_root"
 mv -- "$staging_root/evidence" "$training_root/evidence"

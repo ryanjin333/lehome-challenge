@@ -26,6 +26,7 @@ from base64 import urlsafe_b64encode
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
+_PEFT_OVERLAY_WHEEL = "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"
 
 
 class ReproductionError(RuntimeError):
@@ -1023,6 +1024,7 @@ def build_training_manifest(
             "env": {
                 "HF_HUB_CACHE": str(verified.hub_cache_root),
                 "HF_HUB_OFFLINE": "1",
+                "PYTHONPATH": _PEFT_OVERLAY_WHEEL,
             },
         },
     }

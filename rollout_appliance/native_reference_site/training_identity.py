@@ -38,6 +38,19 @@ _REQUIRED_PRETRAINED = {
     "policy_preprocessor_step_2_groot_pack_inputs_v3.safetensors",
     "policy_postprocessor_step_0_groot_action_unpack_unnormalize_v1.safetensors",
 }
+_PEFT_OVERLAY_RECEIPT = {
+    "schema_version": 1,
+    "kind": "lehome_native_reference_peft_overlay_v1",
+    "wheel_path": "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl",
+    "wheel_filename": "peft-0.18.1-py3-none-any.whl",
+    "wheel_url": "https://files.pythonhosted.org/packages/b3/14/b4e3f574acf349ae6f61f9c000a77f97a3b315b4bb6ad03791e79ae4a568/peft-0.18.1-py3-none-any.whl",
+    "wheel_size": 556960,
+    "wheel_sha256": "0bf06847a3551e3019fc58c440cffc9a6b73e6e2962c95b52e224f77bbdb50f1",
+    "distribution_name": "peft",
+    "peft_version": "0.18.1",
+    "peft_origin": "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl/peft/__init__.py",
+    "required_symbols": ["LoraConfig", "get_peft_model"],
+}
 
 
 class TrainingIdentityError(RuntimeError):
@@ -431,9 +444,19 @@ def validate_training_identity_receipt(
         or not isinstance(command.get("cwd"), str) or not Path(command["cwd"]).is_absolute()
         or command.get("argv") != contract["training_command"]
         or command.get("shell_argv") != shlex.join(contract["training_command"])
-        or command.get("env") != {"HF_HUB_CACHE": inputs["hub_cache_root"], "HF_HUB_OFFLINE": "1"}
+        or command.get("env") != {
+            "HF_HUB_CACHE": inputs["hub_cache_root"],
+            "HF_HUB_OFFLINE": "1",
+            "PYTHONPATH": _PEFT_OVERLAY_RECEIPT["wheel_path"],
+        }
     ):
         raise TrainingIdentityError("training execution manifest mismatch")
+
+    peft_overlay = _json(
+        training_root / "evidence/peft-overlay-receipt.json", "training PEFT overlay receipt"
+    )
+    if peft_overlay != _PEFT_OVERLAY_RECEIPT:
+        raise TrainingIdentityError("training PEFT overlay identity mismatch")
 
     lock = _regular(training_root / "evidence/uv.lock", "training dependency lock")
     if _sha256_file(lock) != contract["dependency_lock_sha256"]:

@@ -782,6 +782,7 @@ def test_render_training_writes_an_atomic_offline_manifest_without_execution(
         "env": {
             "HF_HUB_CACHE": str((tmp_path / "hub").resolve()),
             "HF_HUB_OFFLINE": "1",
+            "PYTHONPATH": "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl",
         },
         "shell_argv": "lerobot-train --config_path=configs/train_groot.yaml --wandb.mode=offline",
     }
@@ -845,6 +846,23 @@ def _materialize_training_output(
         _canonical(reproduction.build_training_manifest(verified=verified, contract=contract))
     )
     (evidence / "uv.lock").write_bytes((verified.checkout / "uv.lock").read_bytes())
+    (evidence / "peft-overlay-receipt.json").write_bytes(
+        _canonical(
+            {
+                "schema_version": 1,
+                "kind": "lehome_native_reference_peft_overlay_v1",
+                "wheel_path": "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl",
+                "wheel_filename": "peft-0.18.1-py3-none-any.whl",
+                "wheel_url": "https://files.pythonhosted.org/packages/b3/14/b4e3f574acf349ae6f61f9c000a77f97a3b315b4bb6ad03791e79ae4a568/peft-0.18.1-py3-none-any.whl",
+                "wheel_size": 556960,
+                "wheel_sha256": "0bf06847a3551e3019fc58c440cffc9a6b73e6e2962c95b52e224f77bbdb50f1",
+                "distribution_name": "peft",
+                "peft_version": "0.18.1",
+                "peft_origin": "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl/peft/__init__.py",
+                "required_symbols": ["LoraConfig", "get_peft_model"],
+            }
+        )
+    )
     python_candidate = shutil.which("python3.11")
     assert python_candidate is not None
     python = Path(python_candidate).resolve()
@@ -984,6 +1002,7 @@ def _rewrite_task1_identity(root: Path, receipt: dict[str, object], output: Path
         "execution_manifest",
         "uv_lock",
         "runtime_receipt",
+        "peft_overlay",
         "wheel",
         "installed_package",
         "training_log",
@@ -1031,6 +1050,8 @@ def test_task2_identity_admission_has_exact_task1_output_parity(
         value = json.loads((root / "evidence/runtime-receipt.json").read_text())
         value["dependency_lock_path"] = "/wrong/path"
         (root / "evidence/runtime-receipt.json").write_bytes(_canonical(value))
+    elif mutation == "peft_overlay":
+        (root / "evidence/peft-overlay-receipt.json").write_bytes(b"{}\n")
     elif mutation == "wheel":
         wheel = root / "evidence/compatibility/lerobot-0.4.3-py3-none-any.whl"
         wheel.chmod(0o644)
