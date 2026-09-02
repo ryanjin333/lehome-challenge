@@ -97,6 +97,7 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'export PIP_NO_CACHE_DIR=1' in text
     assert '"$python_bin" -m ensurepip --upgrade >/dev/null' in text
     assert '"$python_bin" -m pip install --no-deps --force-reinstall "$flash_wheel" >/dev/null' in text
+    assert 'expected = str(Path(sys.executable).parent.parent / "lib/python3.11/site-packages/flash_attn/__init__.py")' in text
     assert "grep -Eq '^(disk|part|lvm|crypt)$'" in text
     assert 'lsblk -ndo MAJ:MIN /dev/disk/by-id/virtio-lehome' in text
     assert '"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin"' in text

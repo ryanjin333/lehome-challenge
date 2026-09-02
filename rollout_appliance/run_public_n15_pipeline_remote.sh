@@ -411,8 +411,11 @@ if bool(torch._C._GLIBCXX_USE_CXX11_ABI) is not True:
     raise SystemExit("FlashAttention requires CXX11 ABI true")
 if not torch.cuda.is_available() or list(torch.cuda.get_device_capability(0)) != [12, 0]:
     raise SystemExit("FlashAttention requires CUDA capability [12, 0]")
+# Resolve the installed module, but keep sys.executable's venv path lexical:
+# Python itself is a symlink to the base interpreter, so resolving it would
+# incorrectly turn the expected site-packages path into /usr/lib.
 origin = str(Path(flash_attn.__file__).resolve())
-expected = str(Path(sys.executable).resolve().parent.parent / "lib/python3.11/site-packages/flash_attn/__init__.py")
+expected = str(Path(sys.executable).parent.parent / "lib/python3.11/site-packages/flash_attn/__init__.py")
 if origin != expected:
     raise SystemExit("FlashAttention installed runtime identity is invalid")
 query = torch.randn((1, 2, 4, 64), dtype=torch.float16, device="cuda")
