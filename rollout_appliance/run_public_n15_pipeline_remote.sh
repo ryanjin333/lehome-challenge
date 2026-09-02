@@ -394,10 +394,20 @@ with output.open("x", encoding="ascii") as stream: stream.write(json.dumps(value
 os.chmod(output, 0o444)
 PY
 python3 "$root/scripts/run_public_n15_reproduction.py" render-training --checkout "$source_root" --source-receipt "$source_receipt" --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" --output "$staging_root/evidence/execution-manifest.json" >/dev/null
+eagle_snapshot="$hf_cache/models--lerobot--eagle2hg-processor-groot-n1p5/snapshots/baf604d8a5caf26fda5cc545f141bc1814156237"
+test -d "$eagle_snapshot" && test ! -L "$eagle_snapshot"
+eagle_home="$(mktemp -d /tmp/lehome-n15-eagle-home.XXXXXX)"
+trap 'rm -r -- "$eagle_home" 2>/dev/null || true' EXIT
+eagle_cache="$eagle_home/lerobot/lerobot/eagle2hg-processor-groot-n1p5"
+mkdir -m 0700 -p "$eagle_cache"
+for eagle_asset in vocab.json merges.txt added_tokens.json chat_template.json special_tokens_map.json config.json generation_config.json preprocessor_config.json processor_config.json tokenizer_config.json; do
+  test -f "$eagle_snapshot/$eagle_asset" && test ! -L "$eagle_snapshot/$eagle_asset"
+  install -m 0444 "$eagle_snapshot/$eagle_asset" "$eagle_cache/$eagle_asset"
+done
 # The Task1 verifier seals this exact manifest, source/snapshot receipts,
 # dependency lock, runtime receipt, train log, and checkpoint—not a hand-made
 # approximation of a successful training result.
-cd "$source_root"; export HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"; "$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml --wandb.mode=offline 2>&1 | tee "$staging_root/logs/train.log"
+cd "$source_root"; export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"; "$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml --wandb.mode=offline 2>&1 | tee "$staging_root/logs/train.log"
 test -d "$upstream_output" && test ! -L "$upstream_output"
 mv -- "$upstream_output" "$training_root"
 mv -- "$staging_root/evidence" "$training_root/evidence"
