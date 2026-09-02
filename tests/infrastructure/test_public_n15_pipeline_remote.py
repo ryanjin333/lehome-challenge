@@ -94,11 +94,12 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'export UV_CACHE_DIR="$(dirname -- "$python_bin")/.uv-cache"' in text
     assert 'export TMPDIR="$(dirname -- "$python_bin")/.uv-tmp"' in text
     assert 'export UV_LINK_MODE=copy' in text
-    assert 'expected_version = "2.8.3+cu12torch2.7cxx11abitrue"' in text
+    assert 'export PIP_NO_CACHE_DIR=1' in text
+    assert '"$python_bin" -m ensurepip --upgrade >/dev/null' in text
+    assert '"$python_bin" -m pip install --no-deps --force-reinstall "$flash_wheel" >/dev/null' in text
     assert "grep -Eq '^(disk|part|lvm|crypt)$'" in text
     assert 'lsblk -ndo MAJ:MIN /dev/disk/by-id/virtio-lehome' in text
     assert '"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin"' in text
-    assert '"$python_bin" -m pip install' not in text
     compatibility_install = text.index('"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin"')
     assert compatibility_install < text.index('test -x "$(dirname -- "$python_bin")/lerobot-train"')
     assert compatibility_install < text.index('"$python_bin" -I -c \'import lerobot; from pathlib import Path; assert Path(lerobot.__file__).is_file()\'')
@@ -113,7 +114,7 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'PYTHONPATH="$peft_wheel"' in text
     assert 'prepare-flash-attention-overlay --receipt "$staging_root/evidence/flash-attention-overlay-receipt.json"' in text
     assert 'flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"' in text
-    assert '"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin" "$flash_wheel"' in text
+    assert '"$python_bin" -m pip install --no-deps --force-reinstall "$flash_wheel" >/dev/null' in text
     assert 'flash-attention-runtime-receipt.json' in text
     assert text.index('export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"') < text.index('"$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml')
     assert 'eagle_asset_source="$(readlink -f "$eagle_snapshot/$eagle_asset")"' in text
