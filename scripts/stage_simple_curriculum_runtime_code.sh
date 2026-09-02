@@ -25,7 +25,7 @@ for required in source/lehome trainer/src scripts rollout_appliance; do
 done
 test -f configs/eval_groot_n17_public_280.json && test ! -L configs/eval_groot_n17_public_280.json || { echo "clean source config is missing or unsafe" >&2; exit 2; }
 
-bundle_dir="$(mktemp -d "${TMPDIR:-/tmp}/lehome-runtime-code.XXXXXX")"; bundle="$bundle_dir/$revision.bundle"
+bundle_dir="$(mktemp -d "${TMPDIR:-/tmp}/lehome-runtime-code.XXXXXX")"; bundle="$bundle_dir/code.bundle"
 remote_helper="$repo_root/scripts/stage_runtime_code_remote.py"
 test -f "$remote_helper" && test ! -L "$remote_helper" || { echo "remote staging helper is missing or unsafe" >&2; exit 2; }
 remote_stage=""; remote_base="/mnt/lehome/runtime-code"

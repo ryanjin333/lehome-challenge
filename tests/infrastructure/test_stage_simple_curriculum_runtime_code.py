@@ -114,6 +114,7 @@ def test_source_contract_uses_exact_types_and_no_explicit_credential_file() -> N
     assert "test -f configs/eval_groot_n17_public_280.json && test ! -L" in text
     assert "[[ \"$revision\" =~ ^[0-9a-f]{40}$ ]]" in text
     assert "--bundle-sha256 '$bundle_sha256'" in text
+    assert 'bundle="$bundle_dir/code.bundle"' in text
     assert "_SHA256.fullmatch(bundle_sha256)" in REMOTE_HELPER.read_text(encoding="utf-8")
     assert "mountpoint -q /mnt/lehome && mkdir -p" in text
 
