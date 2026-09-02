@@ -107,6 +107,10 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'prepare-peft-overlay --receipt "$staging_root/evidence/peft-overlay-receipt.json"' in text
     assert 'peft_wheel="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"' in text
     assert 'PYTHONPATH="$peft_wheel"' in text
+    assert 'prepare-flash-attention-overlay --receipt "$staging_root/evidence/flash-attention-overlay-receipt.json"' in text
+    assert 'flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"' in text
+    assert '"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin" "$flash_wheel"' in text
+    assert 'flash-attention-runtime-receipt.json' in text
     assert text.index('export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$hf_cache"') < text.index('"$(dirname -- "$python_bin")/lerobot-train" --config_path=configs/train_groot.yaml')
     assert 'eagle_asset_source="$(readlink -f "$eagle_snapshot/$eagle_asset")"' in text
     assert '[[ "$eagle_asset_source" == "$eagle_repository/blobs/"* ]]' in text

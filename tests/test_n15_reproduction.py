@@ -863,6 +863,37 @@ def _materialize_training_output(
             }
         )
     )
+    (evidence / "flash-attention-overlay-receipt.json").write_bytes(
+        _canonical(
+            {
+                "schema_version": 1,
+                "kind": "lehome_native_reference_flash_attention_overlay_v1",
+                "wheel_path": "/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl",
+                "wheel_filename": "flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl",
+                "wheel_url": "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl",
+                "wheel_size": 256027206,
+                "wheel_sha256": "cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af",
+                "distribution_name": "flash_attn",
+                "flash_attn_version": "2.8.3",
+                "wheel_tag": "cp311-cp311-linux_x86_64",
+            }
+        )
+    )
+    (evidence / "flash-attention-runtime-receipt.json").write_bytes(
+        _canonical(
+            {
+                "schema_version": 1,
+                "kind": "lehome_native_reference_flash_attention_runtime_v1",
+                "torch_version": "2.7.0+cu128",
+                "torch_cuda_version": "12.8",
+                "torch_cxx11_abi": True,
+                "cuda_capability": [12, 0],
+                "flash_attn_version": "2.8.3",
+                "flash_attn_origin": str((runtime / "site-packages/flash_attn/__init__.py").resolve()),
+                "kernel": {"shape": [1, 2, 4, 64], "dtype": "float16", "finite": True},
+            }
+        )
+    )
     python_candidate = shutil.which("python3.11")
     assert python_candidate is not None
     python = Path(python_candidate).resolve()
@@ -1003,6 +1034,7 @@ def _rewrite_task1_identity(root: Path, receipt: dict[str, object], output: Path
         "uv_lock",
         "runtime_receipt",
         "peft_overlay",
+        "flash_overlay",
         "wheel",
         "installed_package",
         "training_log",
@@ -1052,6 +1084,8 @@ def test_task2_identity_admission_has_exact_task1_output_parity(
         (root / "evidence/runtime-receipt.json").write_bytes(_canonical(value))
     elif mutation == "peft_overlay":
         (root / "evidence/peft-overlay-receipt.json").write_bytes(b"{}\n")
+    elif mutation == "flash_overlay":
+        (root / "evidence/flash-attention-runtime-receipt.json").write_bytes(b"{}\n")
     elif mutation == "wheel":
         wheel = root / "evidence/compatibility/lerobot-0.4.3-py3-none-any.whl"
         wheel.chmod(0o644)

@@ -385,6 +385,51 @@ test -x "$(dirname -- "$python_bin")/lerobot-train"
 peft_wheel="/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl"
 PYTHONPATH="$peft_wheel" "$python_bin" "$root/scripts/verify_native_reference_evaluator_gate.py" \
   prepare-peft-overlay --receipt "$staging_root/evidence/peft-overlay-receipt.json" >/dev/null
+flash_wheel="/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+"$python_bin" "$root/scripts/verify_native_reference_evaluator_gate.py" \
+  prepare-flash-attention-overlay --receipt "$staging_root/evidence/flash-attention-overlay-receipt.json" >/dev/null
+"$uv_bin" pip install --offline --no-deps --reinstall --python "$python_bin" "$flash_wheel" >/dev/null
+"$python_bin" - "$staging_root/evidence/flash-attention-runtime-receipt.json" <<'PY'
+import json, os, sys
+from pathlib import Path
+
+import flash_attn, torch
+from flash_attn import flash_attn_func
+
+if torch.__version__ != "2.7.0+cu128" or torch.version.cuda != "12.8":
+    raise SystemExit("FlashAttention requires torch 2.7.0+cu128 with CUDA 12.8")
+if bool(torch._C._GLIBCXX_USE_CXX11_ABI) is not True:
+    raise SystemExit("FlashAttention requires CXX11 ABI true")
+if not torch.cuda.is_available() or list(torch.cuda.get_device_capability(0)) != [12, 0]:
+    raise SystemExit("FlashAttention requires CUDA capability [12, 0]")
+origin = str(Path(flash_attn.__file__).resolve())
+expected = str(Path(sys.executable).resolve().parent.parent / "lib/python3.11/site-packages/flash_attn/__init__.py")
+if origin != expected or str(flash_attn.__version__) != "2.8.3":
+    raise SystemExit("FlashAttention installed runtime identity is invalid")
+query = torch.randn((1, 2, 4, 64), dtype=torch.float16, device="cuda")
+output = flash_attn_func(query, query, query, causal=False)
+torch.cuda.synchronize()
+if not bool(torch.isfinite(output).all().item()):
+    raise SystemExit("FlashAttention CUDA kernel returned non-finite values")
+payload = {
+    "schema_version": 1,
+    "kind": "lehome_native_reference_flash_attention_runtime_v1",
+    "torch_version": str(torch.__version__),
+    "torch_cuda_version": torch.version.cuda,
+    "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+    "cuda_capability": list(torch.cuda.get_device_capability(0)),
+    "flash_attn_version": str(flash_attn.__version__),
+    "flash_attn_origin": origin,
+    "kernel": {"shape": [1, 2, 4, 64], "dtype": "float16", "finite": True},
+}
+target = Path(sys.argv[1])
+fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+PY
 "$python_bin" - "$root" "$source_root/configs/train_groot.yaml" "$staging_root/evidence/runtime-receipt.json" "$staging_root/evidence/uv.lock" "$staging_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$staging_root/evidence/compatibility/lerobot-compatibility-receipt.json" "$training_root/evidence/uv.lock" "$training_root/evidence/upstream/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-0.4.3-py3-none-any.whl" "$training_root/evidence/compatibility/lerobot-compatibility-receipt.json" <<'PY'
 import hashlib, importlib.util, json, os, sys
 from pathlib import Path

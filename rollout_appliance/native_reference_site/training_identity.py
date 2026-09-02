@@ -51,6 +51,28 @@ _PEFT_OVERLAY_RECEIPT = {
     "peft_origin": "/mnt/lehome/reference-native/dependencies/peft-0.18.1-py3-none-any.whl/peft/__init__.py",
     "required_symbols": ["LoraConfig", "get_peft_model"],
 }
+_FLASH_ATTENTION_OVERLAY_RECEIPT = {
+    "schema_version": 1,
+    "kind": "lehome_native_reference_flash_attention_overlay_v1",
+    "wheel_path": "/mnt/lehome/reference-native/dependencies/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl",
+    "wheel_filename": "flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl",
+    "wheel_url": "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl",
+    "wheel_size": 256027206,
+    "wheel_sha256": "cd1a45ebfc1731a13e55ad68e0c9ad92390ddfffba306f9222be67c6d5a805af",
+    "distribution_name": "flash_attn",
+    "flash_attn_version": "2.8.3",
+    "wheel_tag": "cp311-cp311-linux_x86_64",
+}
+_FLASH_ATTENTION_RUNTIME_RECEIPT = {
+    "schema_version": 1,
+    "kind": "lehome_native_reference_flash_attention_runtime_v1",
+    "torch_version": "2.7.0+cu128",
+    "torch_cuda_version": "12.8",
+    "torch_cxx11_abi": True,
+    "cuda_capability": [12, 0],
+    "flash_attn_version": "2.8.3",
+    "kernel": {"shape": [1, 2, 4, 64], "dtype": "float16", "finite": True},
+}
 
 
 class TrainingIdentityError(RuntimeError):
@@ -457,6 +479,25 @@ def validate_training_identity_receipt(
     )
     if peft_overlay != _PEFT_OVERLAY_RECEIPT:
         raise TrainingIdentityError("training PEFT overlay identity mismatch")
+
+    flash_overlay = _json(
+        training_root / "evidence/flash-attention-overlay-receipt.json",
+        "training FlashAttention overlay receipt",
+    )
+    flash_runtime = _json(
+        training_root / "evidence/flash-attention-runtime-receipt.json",
+        "training FlashAttention runtime receipt",
+    )
+    flash_origin = flash_runtime.get("flash_attn_origin")
+    if (
+        flash_overlay != _FLASH_ATTENTION_OVERLAY_RECEIPT
+        or set(flash_runtime) != {*_FLASH_ATTENTION_RUNTIME_RECEIPT, "flash_attn_origin"}
+        or any(flash_runtime.get(key) != value for key, value in _FLASH_ATTENTION_RUNTIME_RECEIPT.items())
+        or not isinstance(flash_origin, str)
+        or not Path(flash_origin).is_absolute()
+        or not flash_origin.endswith("/site-packages/flash_attn/__init__.py")
+    ):
+        raise TrainingIdentityError("training FlashAttention runtime identity mismatch")
 
     lock = _regular(training_root / "evidence/uv.lock", "training dependency lock")
     if _sha256_file(lock) != contract["dependency_lock_sha256"]:
