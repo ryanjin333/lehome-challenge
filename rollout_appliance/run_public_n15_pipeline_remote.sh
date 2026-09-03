@@ -1397,135 +1397,189 @@ cleanup_resume_scratch() {
 trap cleanup_resume_scratch EXIT
 trap 'exit 130' INT TERM
 repair_completed_output_ownership() {
-  # The native container can leave its final checkpoint and evidence staging
-  # root-owned.  Repair only the two exact, already-completed roots, after a
-  # descriptor/no-follow audit proves they are the canonical 12K boundary and
-  # no trainer or other remote controller can still be mutating them.
-  [[ "$upstream_output" == "$source_root/outputs/train/groot_four_types_merged_batch64_lr2e-4" ]]
-  [[ "$staging_root" == "${training_root}.evidence-staging" ]]
-  test ! -e "$training_root" && test ! -L "$training_root"
-  test -d "$source_root" && test ! -L "$source_root"
-  test -d "$upstream_output" && test ! -L "$upstream_output"
-  test -d "$staging_root" && test ! -L "$staging_root"
-  protected_device="$(findmnt -T "$(dirname -- "$training_root")" --noheadings --output MAJ:MIN)"
-  [[ "$(findmnt -T "$upstream_output" --noheadings --output MAJ:MIN)" == "$protected_device" ]]
-  [[ "$(findmnt -T "$staging_root" --noheadings --output MAJ:MIN)" == "$protected_device" ]]
+  local topology="$1"
+  # The native container can leave either the split upstream/staging roots or
+  # the already-assembled canonical root owned by root and mode 0700. Do not
+  # inspect either tree as the unprivileged controller: a single privileged,
+  # descriptor-relative walker authenticates, repairs, and proves only the
+  # canonical root(s) for this exact topology.
   ! pgrep -f '/opt/lehome-challenge/.venv/bin/lerobot-train([[:space:]]|$)' >/dev/null
   ! pgrep -f "$root/rollout_appliance/run_public_n15_pipeline_remote.sh" >/dev/null
-  python3 - "$source_root" "$training_root" "$staging_root" "$upstream_output" "$(id -u)" preflight <<'PY'
+  sudo -n python3 - "$source_root" "$training_root" "$staging_root" "$upstream_output" "$topology" "$(id -u)" "$(id -g)" <<'PY'
 import os, stat, sys
 from pathlib import Path
 
 source, training, staging, upstream = map(Path, sys.argv[1:5])
-uid, mode = int(sys.argv[5]), sys.argv[6]
+topology = sys.argv[5]
+uid, gid = map(int, sys.argv[6:8])
 expected_upstream = source / "outputs/train/groot_four_types_merged_batch64_lr2e-4"
 if (
     not all(path.is_absolute() for path in (source, training, staging, upstream))
     or source != source.resolve(strict=True)
     or upstream != expected_upstream
     or staging != Path(str(training) + ".evidence-staging")
-    or training.exists() or training.is_symlink()
+    or topology not in {"split", "canonical"}
 ):
     raise SystemExit("completed-output ownership repair paths are not canonical")
 
-def directory(path):
+def directory(path, label):
     metadata = path.lstat()
     if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode) or path.resolve(strict=True) != path:
-        raise SystemExit("completed-output ownership repair root is unsafe")
+        raise SystemExit(f"completed-output ownership repair {label} is unsafe")
     return metadata
 
-source_metadata = directory(source)
-upstream_metadata = directory(upstream)
-staging_metadata = directory(staging)
-parent_metadata = directory(training.parent)
-if len({source_metadata.st_dev, upstream_metadata.st_dev, staging_metadata.st_dev, parent_metadata.st_dev}) != 1:
-    raise SystemExit("completed-output ownership repair crosses filesystems")
-if not (upstream / "checkpoints/last").is_symlink() or os.readlink(upstream / "checkpoints/last") != "012000":
-    raise SystemExit("completed-output ownership repair lacks the exact 12K boundary")
+source_metadata = directory(source, "source root")
+parent_metadata = directory(training.parent, "training parent")
 
-def walk(root, *, allow_last):
-    descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
-    root_device = os.fstat(descriptor).st_dev
-    def visit(parent, parts):
-        for entry in os.scandir(parent):
-            if entry.name in {"", ".", ".."} or "/" in entry.name:
-                raise SystemExit("completed-output ownership repair entry is unsafe")
-            relative = "/".join((*parts, entry.name))
-            metadata = entry.stat(follow_symlinks=False)
-            if stat.S_ISLNK(metadata.st_mode):
-                if allow_last and relative == "checkpoints/last" and os.readlink(entry.name, dir_fd=parent) == "012000":
-                    if mode == "post" and metadata.st_uid != uid:
+def lstat_or_none(path):
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+training_metadata = lstat_or_none(training)
+upstream_metadata = lstat_or_none(upstream)
+staging_metadata = lstat_or_none(staging)
+if topology == "split":
+    if training_metadata is not None:
+        raise SystemExit("canonical training output already exists")
+    if upstream_metadata is None or staging_metadata is None:
+        raise SystemExit("completed-output split roots are incomplete")
+    upstream_metadata = directory(upstream, "upstream root")
+    staging_metadata = directory(staging, "staging root")
+    target_roots = (("upstream", upstream, upstream_metadata, True), ("staging", staging, staging_metadata, False))
+else:
+    if training_metadata is None:
+        raise SystemExit("canonical training output is absent")
+    if upstream_metadata is not None or staging_metadata is not None:
+        raise SystemExit("canonical training output topology is ambiguous")
+    training_metadata = directory(training, "canonical training root")
+    target_roots = (("training", training, training_metadata, True),)
+
+if any(metadata.st_dev != parent_metadata.st_dev for _, _, metadata, _ in target_roots):
+    raise SystemExit("completed-output ownership repair crosses filesystems")
+
+expected_device = parent_metadata.st_dev
+directory_flag = getattr(os, "O_DIRECTORY", 0)
+nofollow = os.O_NOFOLLOW
+
+def same_entry(before, after):
+    return (
+        before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)
+    ) == (
+        after.st_dev, after.st_ino, stat.S_IFMT(after.st_mode)
+    )
+
+def open_directory(parent, name):
+    before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if not stat.S_ISDIR(before.st_mode) or before.st_dev != expected_device:
+        raise SystemExit("completed-output ownership repair entry is unsafe")
+    descriptor = os.open(name, os.O_RDONLY | directory_flag | nofollow, dir_fd=parent)
+    after = os.fstat(descriptor)
+    if not same_entry(before, after):
+        os.close(descriptor)
+        raise SystemExit("completed-output ownership repair entry changed")
+    return descriptor
+
+def exact_completed_boundary(root):
+    try:
+        checkpoints = open_directory(root, "checkpoints")
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            last = os.stat("last", dir_fd=checkpoints, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISLNK(last.st_mode):
+            return False
+        return os.readlink("last", dir_fd=checkpoints) == "012000"
+    finally:
+        os.close(checkpoints)
+
+opened_roots = []
+try:
+    for label, path, metadata, allow_last in target_roots:
+        descriptor = os.open(path, os.O_RDONLY | directory_flag | nofollow)
+        current = os.fstat(descriptor)
+        if not same_entry(metadata, current) or current.st_dev != expected_device:
+            os.close(descriptor)
+            raise SystemExit("completed-output ownership repair root changed")
+        opened_roots.append((label, descriptor, allow_last))
+    if not exact_completed_boundary(opened_roots[0][1]):
+        raise SystemExit(3)
+
+    def walk(parent, parts, *, allow_last, change_owner):
+        metadata = os.fstat(parent)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_dev != expected_device:
+            raise SystemExit("completed-output ownership repair crosses filesystems")
+        if change_owner:
+            os.fchown(parent, uid, gid)
+        elif metadata.st_uid != uid:
+            raise SystemExit("completed-output ownership repair did not take ownership")
+        # scandir() owns its supplied descriptor, so use a duplicate and retain
+        # the authenticated parent descriptor for all child operations.
+        with os.scandir(os.dup(parent)) as entries:
+            for entry in entries:
+                if entry.name in {"", ".", ".."} or "/" in entry.name:
+                    raise SystemExit("completed-output ownership repair entry is unsafe")
+                relative = "/".join((*parts, entry.name))
+                metadata = entry.stat(follow_symlinks=False)
+                if metadata.st_dev != expected_device:
+                    raise SystemExit("completed-output ownership repair crosses filesystems")
+                if stat.S_ISLNK(metadata.st_mode):
+                    if not (allow_last and relative == "checkpoints/last" and os.readlink(entry.name, dir_fd=parent) == "012000"):
+                        raise SystemExit("completed-output ownership repair symlink is unsafe")
+                    if change_owner:
+                        os.chown(entry.name, uid, gid, dir_fd=parent, follow_symlinks=False)
+                    elif metadata.st_uid != uid:
                         raise SystemExit("completed-output ownership repair did not take ownership")
                     continue
-                raise SystemExit("completed-output ownership repair symlink is unsafe")
-            if metadata.st_dev != root_device:
-                raise SystemExit("completed-output ownership repair crosses filesystems")
-            if mode == "post" and metadata.st_uid != uid:
-                raise SystemExit("completed-output ownership repair did not take ownership")
-            if stat.S_ISDIR(metadata.st_mode):
-                child = os.open(entry.name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW, dir_fd=parent)
+                if stat.S_ISDIR(metadata.st_mode):
+                    child = open_directory(parent, entry.name)
+                    try:
+                        walk(child, (*parts, entry.name), allow_last=allow_last, change_owner=change_owner)
+                    finally:
+                        os.close(child)
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise SystemExit("completed-output ownership repair entry is unsafe")
+                descriptor = os.open(entry.name, os.O_RDONLY | nofollow, dir_fd=parent)
                 try:
-                    visit(child, (*parts, entry.name))
+                    current = os.fstat(descriptor)
+                    if not same_entry(metadata, current) or current.st_dev != expected_device:
+                        raise SystemExit("completed-output ownership repair entry changed")
+                    if change_owner:
+                        os.fchown(descriptor, uid, gid)
+                    elif current.st_uid != uid:
+                        raise SystemExit("completed-output ownership repair did not take ownership")
                 finally:
-                    os.close(child)
-            elif not stat.S_ISREG(metadata.st_mode):
-                raise SystemExit("completed-output ownership repair entry is unsafe")
-    try:
-        if mode == "post" and os.fstat(descriptor).st_uid != uid:
-            raise SystemExit("completed-output ownership repair did not take ownership")
-        visit(descriptor, ())
-    finally:
-        os.close(descriptor)
+                    os.close(descriptor)
 
-walk(upstream, allow_last=True)
-walk(staging, allow_last=False)
+    for _, descriptor, allow_last in opened_roots:
+        walk(descriptor, (), allow_last=allow_last, change_owner=True)
+    for _, descriptor, allow_last in opened_roots:
+        walk(descriptor, (), allow_last=allow_last, change_owner=False)
+finally:
+    for _, descriptor, _ in opened_roots:
+        os.close(descriptor)
 PY
-  sudo -n chown -R --no-dereference "$(id -u):$(id -g)" -- "$upstream_output" "$staging_root"
-  python3 - "$source_root" "$training_root" "$staging_root" "$upstream_output" "$(id -u)" post <<'PY'
+}
+has_exact_completed_12k_boundary() {
+  # Called only after the privileged walker made the exact roots readable.
+  # Keep this small fresh-mode discriminator: incomplete partial checkpoints
+  # must take the regular resume path rather than the recovery finalizer.
+  python3 - "$1/checkpoints/last" <<'PY'
 import os, stat, sys
 from pathlib import Path
 
-source, training, staging, upstream = map(Path, sys.argv[1:5])
-uid, mode = int(sys.argv[5]), sys.argv[6]
-if (
-    upstream != source / "outputs/train/groot_four_types_merged_batch64_lr2e-4"
-    or staging != Path(str(training) + ".evidence-staging")
-    or training.exists() or training.is_symlink()
-):
-    raise SystemExit("completed-output ownership repair paths changed")
-
-def walk(root, *, allow_last):
-    descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
-    root_device = os.fstat(descriptor).st_dev
-    def visit(parent, parts):
-        for entry in os.scandir(parent):
-            relative = "/".join((*parts, entry.name))
-            metadata = entry.stat(follow_symlinks=False)
-            if metadata.st_uid != uid:
-                raise SystemExit("completed-output ownership repair did not take ownership")
-            if stat.S_ISLNK(metadata.st_mode):
-                if allow_last and relative == "checkpoints/last" and os.readlink(entry.name, dir_fd=parent) == "012000":
-                    continue
-                raise SystemExit("completed-output ownership repair symlink is unsafe")
-            if metadata.st_dev != root_device:
-                raise SystemExit("completed-output ownership repair crosses filesystems")
-            if stat.S_ISDIR(metadata.st_mode):
-                child = os.open(entry.name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW, dir_fd=parent)
-                try:
-                    visit(child, (*parts, entry.name))
-                finally:
-                    os.close(child)
-            elif not stat.S_ISREG(metadata.st_mode):
-                raise SystemExit("completed-output ownership repair entry is unsafe")
-    try:
-        if os.fstat(descriptor).st_uid != uid:
-            raise SystemExit("completed-output ownership repair did not take ownership")
-        visit(descriptor, ())
-    finally:
-        os.close(descriptor)
-
-walk(upstream, allow_last=True)
-walk(staging, allow_last=False)
+path = Path(sys.argv[1])
+try:
+    metadata = path.lstat()
+except FileNotFoundError:
+    raise SystemExit(1)
+if not stat.S_ISLNK(metadata.st_mode) or os.readlink(path) != "012000":
+    raise SystemExit(1)
 PY
 }
 clear_transient_eagle_cache_after_completed_proof() {
@@ -1565,22 +1619,47 @@ if [[ -d "${training_root}.finalizing" || -f "$staging_root/training-finalizatio
     --upstream-output "$upstream_output" >/dev/null
   exit 0
 fi
-if [[ -d "$upstream_output" && ! -L "$upstream_output" && -d "$staging_root" && ! -L "$staging_root" \
-  && -L "$upstream_output/checkpoints/last" && "$(readlink "$upstream_output/checkpoints/last")" == 012000 ]]; then
-  repair_completed_output_ownership
-  completed_state="$(python3 "$root/scripts/run_public_n15_reproduction.py" verify-completed-upstream \
+# A completed-output recovery deliberately starts from only existence checks.
+# The privileged walker owns all traversal and rejects incomplete/unsafe roots.
+# The native finalizer can fail after it atomically assembled the canonical
+# directory but before checksums/identity were sealed, so admit that exact
+# canonical-only topology as well as the original split roots.
+if [[ -e "$training_root" || -L "$training_root" ]]; then
+  if [[ -e "$upstream_output" || -L "$upstream_output" || -e "$staging_root" || -L "$staging_root" ]]; then
+    echo "canonical training recovery topology is ambiguous" >&2
+    exit 2
+  fi
+  repair_completed_output_ownership canonical
+  has_exact_completed_12k_boundary "$training_root"
+  python3 "$root/scripts/run_public_n15_reproduction.py" adopt-unsealed-training-output \
     --checkout "$source_root" --source-receipt "$source_receipt" \
     --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
     --training-root "$training_root" --staging-root "$staging_root" \
-    --upstream-output "$upstream_output")"
-  if [[ "$completed_state" == '{"complete":true}' ]]; then
-    clear_transient_eagle_cache_after_completed_proof
-    python3 "$root/scripts/run_public_n15_reproduction.py" finalize-training-output \
+    --upstream-output "$upstream_output" >/dev/null
+  exit 0
+elif [[ ( -e "$upstream_output" || -L "$upstream_output" ) && ( -e "$staging_root" || -L "$staging_root" ) ]]; then
+  if repair_completed_output_ownership split; then
+    has_exact_completed_12k_boundary "$upstream_output"
+    completed_state="$(python3 "$root/scripts/run_public_n15_reproduction.py" verify-completed-upstream \
       --checkout "$source_root" --source-receipt "$source_receipt" \
       --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
       --training-root "$training_root" --staging-root "$staging_root" \
-      --upstream-output "$upstream_output" >/dev/null
-    exit 0
+      --upstream-output "$upstream_output")"
+    if [[ "$completed_state" == '{"complete":true}' ]]; then
+      clear_transient_eagle_cache_after_completed_proof
+      python3 "$root/scripts/run_public_n15_reproduction.py" finalize-training-output \
+        --checkout "$source_root" --source-receipt "$source_receipt" \
+        --resolved-snapshots-receipt "$snapshots" --vm-id "$vm_id" --disk-id "$disk_id" \
+        --training-root "$training_root" --staging-root "$staging_root" \
+        --upstream-output "$upstream_output" >/dev/null
+      exit 0
+    fi
+  else
+    repair_status=$?
+    # Exit 3 is the only nonfatal outcome: an incomplete checkpoint must use
+    # the existing resume contract. Unsafe roots and failed privilege checks do
+    # not fall through to a mutable training path.
+    [[ "$repair_status" == 3 ]] || exit "$repair_status"
   fi
 fi
 if [[ "$resume_partial" == 1 ]]; then

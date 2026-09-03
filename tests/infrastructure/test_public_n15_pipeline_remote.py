@@ -224,33 +224,26 @@ exec /usr/bin/readlink "$@"
         fake_bin / "sudo",
         """#!/usr/bin/env bash
 set -euo pipefail
-[[ "${1:-}" == -n ]] && shift
-if [[ "${1:-}" == chown ]]; then
-  # A process running this test cannot create a genuinely root-owned fixture.
-  # Model the exact effect of the reviewed sudo chown handoff only when the
-  # recovery test opts in: an otherwise unreadable completed tree becomes
-  # readable by the controller.  Normal fixture calls remain no-ops.
-  if [[ -n "${FAKE_SUDO_CHOWN_REPAIR_ROOT:-}" ]]; then
-    command python3 - "$FAKE_SUDO_CHOWN_REPAIR_ROOT" <<'PY'
-import os
-import stat
+if [[ -n "${FAKE_SUDO_TRACE:-}" ]]; then
+  python3 - "$FAKE_SUDO_TRACE" "$@" <<'PY'
+import json
 import sys
 from pathlib import Path
-
-root = Path(sys.argv[1])
-for directory, names, filenames in os.walk(root, followlinks=False):
-    path = Path(directory)
-    if not path.is_symlink():
-        path.chmod(stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) | 0o700)
-    for name in names + filenames:
-        candidate = path / name
-        if not candidate.is_symlink():
-            candidate.chmod(
-                stat.S_IMODE(candidate.stat(follow_symlinks=False).st_mode)
-                | (0o700 if candidate.is_dir() else 0o600)
-            )
+Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]), encoding="utf-8")
 PY
+fi
+[[ "${1:-}" == -n ]] && shift
+if [[ "${1:-}" == chown ]]; then
+  # Preserve the separately reviewed native-container handoff while checking
+  # every argument. The privileged recovery itself must invoke Python, never
+  # this path-recursive command.
+  if [[ "$#" == 5 ]]; then
+    [[ "${2:-}" == -R && "${3:-}" == --no-dereference && "${4:-}" == "$(id -u):$(id -g)" && "${5:-}" == "$FAKE_STAGING/eagle-home" ]] || { printf 'unexpected chown argv: %q\n' "$@" >&2; exit 97; }
+    exit 0
   fi
+  [[ "$#" == 7 && "${2:-}" == -R && "${3:-}" == --no-dereference ]] || { printf 'unexpected chown argv: %q\n' "$@" >&2; exit 97; }
+  [[ "${4:-}" == "$(id -u):$(id -g)" && "${5:-}" == "$FAKE_UPSTREAM" ]] || { printf 'unexpected chown argv: %q\n' "$@" >&2; exit 97; }
+  [[ "${6:-}" == "$FAKE_STAGING/eagle-home" && "${7:-}" == "$FAKE_STAGING" ]] || { printf 'unexpected chown argv: %q\n' "$@" >&2; exit 97; }
   exit 0
 fi
 exec "$@"
@@ -336,6 +329,7 @@ ln -s 012000 "$output/checkpoints/last"
         "TEST_CONTRACT_JSON": str(contract_path),
         "FAKE_TRACE": str(trace),
         "FAKE_STAGING": str(staging),
+        "FAKE_UPSTREAM": str(upstream),
         "FAKE_NATIVE_TRAINER": str(trainer),
         "FAKE_DATASET_BLOBS": str(
             Path(snapshots_value["dataset"]["snapshot_root"]).parents[1] / "blobs"
@@ -496,7 +490,7 @@ def test_completed_12k_upstream_is_authenticated_and_finalized_without_retrainin
 def test_completed_12k_recovery_repairs_unreadable_completed_tree_before_verification(
     tmp_path: Path,
 ) -> None:
-    """Recovery must repair the exact completed tree before reading its proof."""
+    """The split recovery walks only authenticated 0700 roots through sudo."""
     env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
 
     interrupted = _run_actual_remote_train_stage(
@@ -506,17 +500,83 @@ def test_completed_12k_recovery_repairs_unreadable_completed_tree_before_verific
     assert interrupted.returncode == 130, interrupted.stderr
     protected_log = staging / "logs/train-resume-attempt-root-owned-completion.log"
     assert protected_log.is_file()
-    protected_log.chmod(0)
-    # The fixture's sudo shim restores this only if recovery invokes its
-    # carefully bounded ownership repair.  The current production branch does
-    # not, so this is a true red test for the ordering bug.
+    # 0700 roots match the failure topology. The shim executes the requested
+    # Python walker unchanged and records its exact argv; it does not chmod or
+    # recurse over the test directory.
+    upstream.chmod(0o700)
+    (upstream / "checkpoints/012000").chmod(0o700)
+    staging.chmod(0o700)
+    (staging / "logs").chmod(0o700)
+    sudo_trace = tmp_path / "sudo-argv.json"
     recovered = _run_actual_remote_train_stage(
-        {**env, "FAKE_SUDO_CHOWN_REPAIR_ROOT": str(tmp_path)},
+        {**env, "FAKE_SUDO_TRACE": str(sudo_trace)},
         attempt_id="attempt-root-owned-recovery", complete=False,
     )
 
     assert recovered.returncode == 0, recovered.stderr
     assert training.is_dir() and not upstream.exists() and not staging.exists()
+    assert json.loads(sudo_trace.read_text(encoding="utf-8")) == [
+        "-n", "python3", "-", str(Path(env["LEHOME_N15_PUBLIC_SOURCE_ROOT"])),
+        str(training), str(staging), str(upstream), "split", str(os.getuid()), str(os.getgid()),
+    ]
+    trace = Path(env["FAKE_TRACE"]).read_text(encoding="utf-8")
+    assert trace.count("native:/opt/lehome-challenge/.venv/bin/lerobot-train") == 1
+
+
+def test_completed_12k_recovery_rejects_a_symlinked_mount_escape_before_mutating(
+    tmp_path: Path,
+) -> None:
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+    interrupted = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-unsafe-symlink", interrupt_point="after-trainer", complete=True,
+    )
+    assert interrupted.returncode == 130, interrupted.stderr
+    # A bind-mounted escape can only be reached through a directory entry; the
+    # descriptor walker treats this symlinked mount root as unsafe before any
+    # finalization or trainer invocation.
+    (staging / "mount-escape").symlink_to("/dev")
+    recovered = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-unsafe-symlink-recovery", complete=False,
+    )
+    assert recovered.returncode != 0
+    assert training.exists() is False and upstream.is_dir() and staging.is_dir()
+    trace = Path(env["FAKE_TRACE"]).read_text(encoding="utf-8")
+    assert trace.count("native:/opt/lehome-challenge/.venv/bin/lerobot-train") == 1
+
+
+def test_completed_12k_canonical_unsealed_topology_is_sealed_without_retraining(
+    tmp_path: Path,
+) -> None:
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+    interrupted = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-canonical-unsealed", interrupt_point="after-trainer", complete=True,
+    )
+    assert interrupted.returncode == 130, interrupted.stderr
+    # Reproduce the historical crash window: upstream and evidence components
+    # were already assembled under the canonical name, but checksum/identity
+    # sealing had not begun.
+    shutil.rmtree(staging / "eagle-home")
+    upstream.rename(training)
+    for component in ("evidence", "logs", "runtime"):
+        (staging / component).rename(training / component)
+    staging.rmdir()
+    training.chmod(0o700)
+    (training / "wandb/run").mkdir(parents=True, exist_ok=True)
+    debug_log = training / "wandb/run/debug-core.log"
+    debug_log.write_text("permission topology", encoding="utf-8")
+    (training / "wandb").chmod(0o700)
+    sudo_trace = tmp_path / "canonical-sudo-argv.json"
+
+    recovered = _run_actual_remote_train_stage(
+        {**env, "FAKE_SUDO_TRACE": str(sudo_trace)},
+        attempt_id="attempt-canonical-unsealed-recovery", complete=False,
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert training.is_dir() and not upstream.exists() and not staging.exists()
+    assert (training / "checksums.sha256").is_file()
+    assert (training / "training-identity.json").is_file()
+    assert json.loads(sudo_trace.read_text(encoding="utf-8"))[7] == "canonical"
     trace = Path(env["FAKE_TRACE"]).read_text(encoding="utf-8")
     assert trace.count("native:/opt/lehome-challenge/.venv/bin/lerobot-train") == 1
 

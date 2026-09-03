@@ -21,6 +21,7 @@ from lehome.n15_reproduction import (  # noqa: E402
     ReproductionContract,
     ReproductionError,
     build_compatible_lerobot_wheel,
+    adopt_unsealed_training_output,
     cleanup_resume_scratch,
     compatibility_wheel_identity,
     finalize_training_output,
@@ -65,6 +66,19 @@ def _parser() -> argparse.ArgumentParser:
         "vm-id", "disk-id", "training-root", "staging-root", "upstream-output",
     ):
         finalization.add_argument(
+            f"--{name}",
+            type=Path if name not in {"vm-id", "disk-id"} else str,
+            required=True,
+        )
+    adoption = commands.add_parser(
+        "adopt-unsealed-training-output",
+        help="seal one authenticated already-assembled canonical training output",
+    )
+    for name in (
+        "checkout", "source-receipt", "resolved-snapshots-receipt",
+        "vm-id", "disk-id", "training-root", "staging-root", "upstream-output",
+    ):
+        adoption.add_argument(
             f"--{name}",
             type=Path if name not in {"vm-id", "disk-id"} else str,
             required=True,
@@ -289,6 +303,14 @@ def main(
                 result = {**value, **stored}
             elif args.command == "finalize-training-output":
                 result = finalize_training_output(
+                    verified=verified,
+                    training_root=args.training_root,
+                    staging_root=args.staging_root,
+                    upstream_output=args.upstream_output,
+                    contract=contract,
+                )
+            elif args.command == "adopt-unsealed-training-output":
+                result = adopt_unsealed_training_output(
                     verified=verified,
                     training_root=args.training_root,
                     staging_root=args.staging_root,

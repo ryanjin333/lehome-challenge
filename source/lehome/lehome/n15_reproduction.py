@@ -2632,3 +2632,86 @@ def finalize_training_output(
     finalizing.rename(training)
     hit("after-rename")
     return identity
+
+
+def adopt_unsealed_training_output(
+    *,
+    verified: VerifiedInputs,
+    training_root: Path | str,
+    staging_root: Path | str,
+    upstream_output: Path | str,
+    contract: ReproductionContract = CONTRACT,
+) -> dict[str, object]:
+    """Seal one authenticated, already-assembled canonical training directory.
+
+    This is intentionally narrower than finalization.  It is only for the
+    crash window after the old finalizer assembled ``training_root`` and before
+    it wrote checksums/identity: the split upstream and staging roots must be
+    absent, and this function never renames or deletes an artifact.
+    """
+
+    requested_training = Path(training_root)
+    if not requested_training.is_absolute() or ".." in requested_training.parts:
+        raise ReproductionError("canonical training root is invalid")
+    parent = _regular_directory(requested_training.parent, "canonical training parent")
+    training = parent / requested_training.name
+    requested_staging = Path(staging_root)
+    requested_upstream = Path(upstream_output)
+    if requested_staging != Path(f"{training}.evidence-staging"):
+        raise ReproductionError("training adoption staging root is not canonical")
+    expected_upstream = (
+        verified.checkout / "outputs/train/groot_four_types_merged_batch64_lr2e-4"
+    )
+    if requested_upstream != expected_upstream:
+        raise ReproductionError("training adoption upstream root is not canonical")
+    if requested_staging.exists() or requested_staging.is_symlink():
+        raise ReproductionError("training adoption staging root is not absent")
+    if requested_upstream.exists() or requested_upstream.is_symlink():
+        raise ReproductionError("training adoption upstream root is not absent")
+    assembled = _regular_directory(training, "unsealed canonical training output")
+    if assembled.stat().st_dev != parent.stat().st_dev:
+        raise ReproductionError("training adoption root is not on the protected filesystem")
+
+    identity_path = assembled / "training-identity.json"
+    if identity_path.exists() or identity_path.is_symlink():
+        identity = verify_training_output(
+            verified=verified, training_root=assembled, contract=contract
+        )
+        if _regular_file(identity_path, "training identity receipt").read_bytes() != _canonical_bytes(identity):
+            raise ReproductionError("completed training identity receipt mismatch")
+        return identity
+
+    # The no-follow ownership walker ran before this command.  Still reject
+    # the only publication receipt that would make a partially published state
+    # ambiguous before we synthesize the missing sealing receipts.
+    publication = assembled / "training-publication.json"
+    if publication.exists() or publication.is_symlink():
+        raise ReproductionError("unsealed training output has a publication receipt")
+    artifacts = _artifact_files(assembled)
+    checksum_path = assembled / "checksums.sha256"
+    rows = [
+        f"{_sha256_file(path)}  {relative}\n"
+        for relative, path in sorted(artifacts.items())
+        if relative != "checksums.sha256"
+    ]
+    if not rows:
+        raise ReproductionError("unsealed training output is empty")
+    checksum_payload = "".join(rows).encode("ascii")
+    if checksum_path.exists() or checksum_path.is_symlink():
+        if _regular_file(checksum_path, "training checksums").read_bytes() != checksum_payload:
+            raise ReproductionError("training adoption checksums mismatch")
+    else:
+        _write_atomic_bytes(checksum_path, checksum_payload, "training checksums")
+
+    identity = verify_training_output(
+        verified=verified, training_root=assembled, contract=contract
+    )
+    _write_atomic_json(
+        identity_path, identity, "verified training output receipt"
+    )
+    second_identity = verify_training_output(
+        verified=verified, training_root=assembled, contract=contract
+    )
+    if second_identity != identity or identity_path.read_bytes() != _canonical_bytes(identity):
+        raise ReproductionError("training adoption verification is not stable")
+    return identity
