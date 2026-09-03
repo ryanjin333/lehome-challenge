@@ -608,7 +608,7 @@ PY
   done
   [[ "$acknowledged_pid" == "$pid" ]] || { terminate_active_paid_stage || true; rm -rf -- "$launcher_root"; fail "$label launcher acknowledgement handshake failed"; }
   rm -rf -- "$launcher_root"
-  while kill -0 -- "-$pid" 2>/dev/null; do
+  while paid_stage_group_has_live_member "$pid"; do
     now="$(date +%s)"
     if (( now >= stage_deadline )); then
       terminate_active_paid_stage || fail "$label process group survived watchdog termination"
@@ -623,6 +623,22 @@ PY
   if [[ "$label" == "$PRESTART_ADMITTED_STAGE" ]]; then
     PRESTART_ADMITTED_STAGE=""
   fi
+}
+paid_stage_group_has_live_member() {
+  python3 - "$1" <<'PY'
+import subprocess
+import sys
+
+pgid = int(sys.argv[1])
+output = subprocess.run(
+    ["ps", "-axo", "pgid=,stat="], check=True, capture_output=True, text=True
+).stdout
+for row in output.splitlines():
+    fields = row.split()
+    if len(fields) >= 2 and fields[0] == str(pgid) and not fields[1].startswith("Z"):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 remote_file_exists() { remote bash -s -- "$1" <<'SH'
 set -euo pipefail
@@ -917,13 +933,17 @@ reconcile_remote_stage_seals() {
   local training_identity=0 training_publication=0 focused=0
   remote_file_exists "$TRAINING_IDENTITY_RECEIPT" && training_identity=1
   remote_file_exists "$TRAINING_PUBLICATION_RECEIPT" && training_publication=1
-  (( training_identity == training_publication )) \
-    || fail "remote training completion receipts are incomplete"
+  (( training_publication == 0 || training_identity == 1 )) \
+    || fail "remote training publication lacks training identity"
   if (( training_identity == 1 )); then
     verify_remote_training_chain || fail "remote training completion is invalid"
-    verify_remote_training_publication || fail "remote training publication is invalid"
-    record_host_stage_completion training "$HOST_TRAINING_STAGE_RECEIPT" \
-      "$TRAINING_IDENTITY_RECEIPT" "$TRAINING_PUBLICATION_RECEIPT"
+    if (( training_publication == 1 )); then
+      verify_remote_training_publication || fail "remote training publication is invalid"
+      record_host_stage_completion training "$HOST_TRAINING_STAGE_RECEIPT" \
+        "$TRAINING_IDENTITY_RECEIPT" "$TRAINING_PUBLICATION_RECEIPT"
+    elif [[ -e "$HOST_TRAINING_STAGE_RECEIPT" || -L "$HOST_TRAINING_STAGE_RECEIPT" ]]; then
+      fail "host training completion seal lacks verified publication"
+    fi
   elif [[ -e "$HOST_TRAINING_STAGE_RECEIPT" || -L "$HOST_TRAINING_STAGE_RECEIPT" ]]; then
     fail "host training completion seal has no matching remote completion"
   fi
@@ -943,6 +963,48 @@ reconcile_remote_stage_seals() {
 
 finalize_host_harvest_terminal() {
   python3 "$HARVEST_BUILDER" verify-terminal --manifest "$HARVEST_MANIFEST" --manifest-receipt "$HARVEST_MANIFEST_RECEIPT" --publication-receipt "$HARVEST_PUBLICATION_RECEIPT" --provider-receipt "$PROVIDER_STOPPED_RECEIPT" --output "$HARVEST_TERMINAL_RECEIPT" >/dev/null
+}
+
+verify_host_harvest_terminal() {
+  local temporary_root expected status
+  temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-verify-terminal.XXXXXX")"
+  expected="$temporary_root/receipt.json"
+  python3 "$HARVEST_BUILDER" verify-terminal --manifest "$HARVEST_MANIFEST" --manifest-receipt "$HARVEST_MANIFEST_RECEIPT" --publication-receipt "$HARVEST_PUBLICATION_RECEIPT" --provider-receipt "$PROVIDER_STOPPED_RECEIPT" --output "$expected" >/dev/null || { rm -rf -- "$temporary_root"; return 1; }
+  python3 - "$HARVEST_TERMINAL_RECEIPT" "$expected" <<'PY'
+import stat
+import sys
+from pathlib import Path
+
+actual, expected = map(Path, sys.argv[1:])
+metadata = actual.lstat()
+if (
+    actual.is_symlink() or not stat.S_ISREG(metadata.st_mode)
+    or stat.S_IMODE(metadata.st_mode) != 0o444
+    or actual.read_bytes() != expected.read_bytes()
+):
+    raise SystemExit("canonical terminal receipt mismatch")
+changed = False
+for scratch in sorted(actual.parent.glob(f".{actual.name}.*")):
+    scratch_metadata = scratch.lstat()
+    if (
+        scratch.is_symlink() or not stat.S_ISREG(scratch_metadata.st_mode)
+        or (scratch_metadata.st_dev, scratch_metadata.st_ino)
+        != (metadata.st_dev, metadata.st_ino)
+    ):
+        raise SystemExit("canonical terminal atomic scratch mismatch")
+    scratch.unlink()
+    changed = True
+if changed:
+    import os
+    parent = os.open(actual.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+PY
+  status=$?
+  rm -rf -- "$temporary_root"
+  return "$status"
 }
 
 validate_remote_runtime() {
@@ -1563,7 +1625,7 @@ run_pipeline_after_runtime() {
     stop_exact_vm || fail "exact VM could not be stopped"
     finalize_host_harvest_terminal || fail "host harvest terminal verification failed"
   else
-    python3 "$HARVEST_BUILDER" verify-terminal --manifest "$HARVEST_MANIFEST" --manifest-receipt "$HARVEST_MANIFEST_RECEIPT" --publication-receipt "$HARVEST_PUBLICATION_RECEIPT" --provider-receipt "$PROVIDER_STOPPED_RECEIPT" --output "$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-verify-terminal.XXXXXX")/receipt.json" >/dev/null || fail "existing host harvest terminal chain failed"
+    verify_host_harvest_terminal || fail "existing host harvest terminal chain failed"
   fi
   stop_exact_vm || fail "exact VM could not be stopped"
   PIPELINE_COMPLETE=1
@@ -1600,12 +1662,14 @@ fi
 # rerun a paid stage from a completed run, and clean up a stale RUNNING VM.
 if [[ -f "$HARVEST_TERMINAL_RECEIPT" ]]; then
   terminal_temp_root="$(mktemp -d "${TMPDIR:-/tmp}/lehome-n15-terminal-preflight.XXXXXX")"
-  if python3 "$HARVEST_BUILDER" verify-terminal --manifest "$HARVEST_MANIFEST" --manifest-receipt "$HARVEST_MANIFEST_RECEIPT" --publication-receipt "$HARVEST_PUBLICATION_RECEIPT" --provider-receipt "$PROVIDER_STOPPED_RECEIPT" --output "$terminal_temp_root/receipt.json" >/dev/null; then
+  if verify_host_harvest_terminal; then
+    PROVIDER_CLEANUP_REQUIRED=1
     if capture_exact_provider_state STOPPED "$terminal_temp_root/provider.json"; then
-      rm -rf -- "$terminal_temp_root"; PIPELINE_COMPLETE=1; exit 0
+      PROVIDER_CLEANUP_REQUIRED=0; rm -rf -- "$terminal_temp_root"; PIPELINE_COMPLETE=1; exit 0
     fi
     rm -rf -- "$terminal_temp_root"
     stop_exact_vm || fail "completed run left the exact VM running and it could not be stopped"
+    PROVIDER_CLEANUP_REQUIRED=0
     PIPELINE_COMPLETE=1; exit 0
   fi
   rm -rf -- "$terminal_temp_root"
@@ -1617,6 +1681,9 @@ verify_conservative_task_budget "$DEADLINE_RECEIPT" \
 (( $(date +%s) < aggregate_deadline )) || fail "aggregate paid deadline has expired"
 PRESTART_ADMITTED_STAGE="$(host_next_unfinished_stage)" \
   || fail "host-sealed next unfinished stage is invalid"
+if [[ "$RESUME_PARTIAL" == 1 && "$PRESTART_ADMITTED_STAGE" != train ]]; then
+  fail "explicit partial resume is inconsistent with the host-sealed next stage"
+fi
 case "$PRESTART_ADMITTED_STAGE" in
   train) admitted_timeout="$TRAIN_TIMEOUT_SECONDS" ;;
   focused_gate) admitted_timeout="$FOCUSED_TIMEOUT_SECONDS" ;;

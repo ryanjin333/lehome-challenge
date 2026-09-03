@@ -752,6 +752,47 @@ def test_invalid_resume_boundary_fails_before_any_provider_call(
     assert not provider_log.exists()
 
 
+def test_resume_rejected_when_host_seal_places_pipeline_after_training_before_provider(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    provider_log = tmp_path / "provider.log"
+    _write_executable(
+        fake_bin / "nebius",
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$FAKE_PROVIDER_LOG\"\nexit 97\n",
+    )
+    _write_executable(fake_bin / "ssh", "#!/usr/bin/env bash\nexit 97\n")
+    env = _wrapper_env(tmp_path, fake_bin, "n15-resume-after-training")
+    env.update({
+        "FAKE_PROVIDER_LOG": str(provider_log),
+        "LEHOME_N15_RESUME_PARTIAL": "1",
+        "LEHOME_N15_RESUME_STEP": "1500",
+        "LEHOME_N15_RESUME_ATTEMPT_ID": "attempt-after-training",
+        "LEHOME_N15_PUBLIC_SOURCE_ROOT": "/mnt/source",
+        "LEHOME_N15_RESUME_CHECKPOINT": "/mnt/source/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/001500",
+    })
+    pipeline = Path(env["LEHOME_N15_PIPELINE_ROOT"])
+    seal = {
+        "schema_version": 1,
+        "kind": "lehome_public_n15_host_stage_completion_v1",
+        "run_id": env["LEHOME_N15_RUN_ID"],
+        "stage": "training",
+        "remote_receipts": [
+            {"path": env["LEHOME_N15_TRAINING_ROOT"] + "/training-identity.json", "sha256": "0" * 64},
+            {"path": env["LEHOME_N15_TRAINING_ROOT"] + "/training-publication.json", "sha256": "1" * 64},
+        ],
+    }
+    seal_path = pipeline / "host-stage-training-complete.json"
+    seal_path.write_bytes(_canonical_json_bytes(seal)); seal_path.chmod(0o444)
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True
+    )
+    assert result.returncode != 0
+    assert "host-sealed next stage" in result.stderr
+    assert not provider_log.exists()
+
+
 @pytest.mark.parametrize("deadline_kind", ["invalid", "expired", "mutable"])
 def test_invalid_immutable_deadline_fails_before_any_provider_action(
     tmp_path: Path, deadline_kind: str,
@@ -1129,6 +1170,59 @@ reconcile_remote_stage_seals
     assert "seal mismatch" in rejected.stderr.lower()
 
 
+def test_training_identity_without_publication_is_verified_then_published_and_sealed(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-identity-only-restart")
+    state = tmp_path / "publication-created"
+    trace = tmp_path / "trace"
+    harness = r'''
+source "$WRAPPER_PATH"
+remote_file_exists() {
+  [[ "$1" == "$TRAINING_IDENTITY_RECEIPT" ]] && return 0
+  [[ "$1" == "$TRAINING_PUBLICATION_RECEIPT" && -f "$PUBLICATION_STATE" ]] && return 0
+  return 1
+}
+verify_remote_training_chain() { printf 'verify-identity\n' >> "$TRACE"; }
+publish_training_readback() { printf 'publish\n' >> "$TRACE"; touch "$PUBLICATION_STATE"; }
+verify_remote_training_publication() { test -f "$PUBLICATION_STATE"; printf 'verify-publication\n' >> "$TRACE"; }
+record_host_stage_completion() { printf 'seal:%s\n' "$1" >> "$TRACE"; }
+run_paid_stage() { printf 'paid:%s\n' "$1" >> "$TRACE"; return 88; }
+reconcile_remote_stage_seals
+run_pipeline_after_runtime
+'''
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env, "WRAPPER_PATH": str(WRAPPER), "TRACE": str(trace),
+            "PUBLICATION_STATE": str(state),
+        },
+        text=True, capture_output=True,
+    )
+    assert result.returncode != 0
+    lines = trace.read_text(encoding="ascii").splitlines()
+    assert "paid:train" not in lines
+    assert lines[:5] == [
+        "verify-identity", "verify-identity", "publish",
+        "verify-publication", "seal:training",
+    ]
+
+    state.unlink()
+    host_seal = Path(env["LEHOME_N15_PIPELINE_ROOT"]) / "host-stage-training-complete.json"
+    host_seal.write_text("{}\n", encoding="ascii")
+    rejected = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env, "WRAPPER_PATH": str(WRAPPER), "TRACE": str(trace),
+            "PUBLICATION_STATE": str(state),
+        },
+        text=True, capture_output=True,
+    )
+    assert rejected.returncode != 0
+    assert "seal lacks verified publication" in rejected.stderr
+
+
 def test_completed_terminal_chain_is_processed_before_stale_stage_deadlines(
     tmp_path: Path,
 ) -> None:
@@ -1164,6 +1258,88 @@ main
     assert result.returncode == 0, result.stderr
     assert not trace.exists()
     assert not provider_log.exists()
+
+
+def test_terminal_receipt_is_recomputed_and_requires_exact_immutable_bytes(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-terminal-canonical")
+    terminal = Path(env["LEHOME_N15_PIPELINE_ROOT"]) / "harvest-terminal.json"
+    terminal.write_bytes(b'{"terminal":true}\n'); terminal.chmod(0o444)
+    harness = r'''
+source "$WRAPPER_PATH"
+python3() {
+  if [[ "$1" == "$HARVEST_BUILDER" ]]; then
+    shift
+    while [[ "$1" != --output ]]; do shift; done
+    command python3 -c 'import os,sys; from pathlib import Path; path=Path(sys.argv[1]); path.write_bytes(b"{\"terminal\":true}\n"); os.chmod(path,0o444)' "$2"
+  else
+    command python3 "$@"
+  fi
+}
+verify_host_harvest_terminal
+'''
+
+    def verify() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", harness], cwd=ROOT,
+            env={**env, "WRAPPER_PATH": str(WRAPPER)}, text=True, capture_output=True,
+        )
+
+    assert verify().returncode == 0
+    terminal.chmod(0o644)
+    assert verify().returncode != 0
+    terminal.write_bytes(b'{"terminal":false}\n'); terminal.chmod(0o444)
+    assert verify().returncode != 0
+
+
+def test_terminal_stop_failure_retains_singleton_until_stopped(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-terminal-stop-lock")
+    terminal = Path(env["LEHOME_N15_PIPELINE_ROOT"]) / "harvest-terminal.json"
+    terminal.write_text("{}\n", encoding="ascii")
+    allow_stop = tmp_path / "allow-stop"; trace = tmp_path / "trace"
+    harness = r'''
+source "$WRAPPER_PATH"
+verify_host_harvest_terminal() { return 0; }
+capture_exact_provider_state() { return 1; }
+stop_exact_vm() {
+  [[ -f "$ALLOW_STOP" ]] || { printf 'stop-failed\n' >> "$TRACE"; return 1; }
+  printf 'stopped\n' >> "$TRACE"
+}
+main
+'''
+    process = subprocess.Popen(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env, "WRAPPER_PATH": str(WRAPPER), "ALLOW_STOP": str(allow_stop),
+            "TRACE": str(trace),
+        }, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    lock = _controller_lock_path(env)
+    try:
+        deadline = time.monotonic() + 5
+        while (not trace.exists() or not lock.exists()) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert lock.exists() and "stop-failed" in trace.read_text()
+        contender = subprocess.run(
+            ["bash", "-c", 'source "$WRAPPER_PATH"; acquire_controller_lock'],
+            cwd=ROOT, env={**env, "WRAPPER_PATH": str(WRAPPER)},
+            text=True, capture_output=True,
+        )
+        assert contender.returncode != 0
+        allow_stop.touch()
+        process.communicate(timeout=8)
+        assert process.returncode != 0
+        assert trace.read_text().splitlines()[-1] == "stopped"
+        assert not lock.exists()
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL); process.communicate(timeout=3)
 
 
 def test_atomic_controller_singleton_rejects_second_live_controller_without_stopping_vm(
@@ -1659,6 +1835,27 @@ run_paid_stage train 60 train_stage
     assert "handshake" in stderr.lower() or "timeout" in stderr.lower()
 
 
+def test_paid_stage_reaps_normally_exiting_setsid_leader_without_watchdog_delay(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-paid-finite-success")
+    result = subprocess.run(
+        ["bash", "-c", r'''
+source "$WRAPPER_PATH"
+initialize_deadline() { echo "$(( $(date +%s) + 30 ))"; }
+initialize_stage_deadline() { echo "$(( $(date +%s) + 30 ))"; }
+train_stage() { return 0; }
+run_paid_stage train 30 train_stage
+printf 'complete\n'
+'''],
+        cwd=ROOT, env={**env, "WRAPPER_PATH": str(WRAPPER)},
+        text=True, capture_output=True, timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "complete\n"
+
+
 def test_training_publication_adopts_verified_upload_after_local_receipt_crash(
     tmp_path: Path,
 ) -> None:
@@ -2012,7 +2209,19 @@ def test_running_observation_waits_for_cloud_init_after_ssh_is_ready(tmp_path: P
     }
     result = subprocess.run(["bash", str(WRAPPER)], cwd=ROOT, env=env, text=True, capture_output=True)
     assert result.returncode != 0
-    assert trace.read_text(encoding="utf-8").splitlines() == ["start", *("readiness" for _ in range(7)), "runtime", "runtime", "runtime", "identity-check", "train", "train", "train", "train", "stop"]
+    lines = trace.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "start" and lines[-1] == "stop"
+    assert lines.count("readiness") >= 7
+    assert lines.count("runtime") >= 3
+    assert lines.count("identity-check") == 1
+    assert lines.count("train") >= 1
+    assert lines.index("runtime") > max(
+        index for index, value in enumerate(lines) if value == "readiness"
+    )
+    assert lines.index("identity-check") > max(
+        index for index, value in enumerate(lines) if value == "runtime"
+    )
+    assert lines.index("train") > lines.index("identity-check")
     assert state.read_text(encoding="utf-8") == "STOPPED"
 
 

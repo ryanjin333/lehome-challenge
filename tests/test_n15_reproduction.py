@@ -816,6 +816,24 @@ def test_verify_inputs_rejects_unsafe_hub_snapshot_symlinks(
         )
 
 
+def test_atomic_receipt_reconciles_crash_after_no_clobber_link(tmp_path: Path) -> None:
+    from lehome import n15_reproduction as reproduction
+
+    output = tmp_path / "receipt.json"
+    payload = _canonical({"durable": True})
+    temporary = tmp_path / ".receipt.json.crashed"
+    temporary.write_bytes(payload)
+    temporary.chmod(0o444)
+    os.link(temporary, output)
+
+    path, digest = reproduction._write_atomic_bytes(output, payload, "test receipt")
+
+    assert path == output
+    assert digest == _sha(payload)
+    assert output.read_bytes() == payload
+    assert not temporary.exists()
+
+
 def test_render_training_writes_an_atomic_offline_manifest_without_execution(
     tmp_path: Path,
 ) -> None:
@@ -1211,6 +1229,7 @@ def test_verify_resume_checkpoint_accepts_complete_001500_and_renders_exact_comm
         ("empty_file", "empty"),
         ("empty_extra", "empty"),
         ("wrong_step", "training-step"),
+        ("stale_scheduler", "scheduler"),
         ("modified_recipe", "recipe"),
         ("unknown_recipe_field", "recipe"),
         ("wrong_output", "output"),
@@ -1264,6 +1283,10 @@ def test_verify_resume_checkpoint_fails_closed(
     elif mutation == "wrong_step":
         (checkpoint / "training_state/training_step.json").write_bytes(
             _canonical({"step": 1499})
+        )
+    elif mutation == "stale_scheduler":
+        (checkpoint / "training_state/scheduler_state.json").write_bytes(
+            _canonical({"last_epoch": 1499})
         )
     elif mutation in {"modified_recipe", "unknown_recipe_field", "wrong_output"}:
         path = checkpoint / "pretrained_model/train_config.json"
@@ -1440,6 +1463,9 @@ def test_training_finalization_recovers_every_boundary_with_one_atomic_publish(
             upstream_output=upstream_output, contract=contract,
             fault_after=fault_after,
         )
+    if fault_after == "checksums":
+        checksum = Path(f"{training_root}.finalizing") / "checksums.sha256"
+        os.link(checksum, checksum.with_name(".checksums.sha256.crash-orphan"))
     result = reproduction.finalize_training_output(
         verified=verified, training_root=training_root, staging_root=staging_root,
         upstream_output=upstream_output, contract=contract,
@@ -1449,6 +1475,7 @@ def test_training_finalization_recovers_every_boundary_with_one_atomic_publish(
     assert training_root.is_dir()
     assert not Path(f"{training_root}.finalizing").exists()
     assert not staging_root.exists() and not upstream_output.exists()
+    assert not list(training_root.glob(".checksums.sha256.*"))
     identity_path = training_root / "training-identity.json"
     assert identity_path.is_file() and not identity_path.is_symlink()
     assert json.loads(identity_path.read_text(encoding="ascii")) == result
@@ -1589,10 +1616,15 @@ def test_resumed_final_identity_authenticates_resume_lineage(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize(
-    "mutation", ["model", "optimizer", "rng", "scheduler", "scheduler-step"],
+    ("mutation", "message"),
+    [
+        ("model", "advance"), ("optimizer", "advance"), ("rng", "advance"),
+        ("scheduler", "advance"), ("scheduler-step", "advance"),
+        ("source-scheduler-step", "source scheduler"),
+    ],
 )
 def test_task2_resumed_identity_enforces_final_state_advancement_parity(
-    tmp_path: Path, mutation: str,
+    tmp_path: Path, mutation: str, message: str,
 ) -> None:
     from lehome import n15_reproduction as reproduction
     from rollout_appliance.native_reference_site.training_identity import (
@@ -1631,7 +1663,17 @@ def test_task2_resumed_identity_enforces_final_state_advancement_parity(
     }.get(mutation)
     final = training_root / "checkpoints/012000"
     source = training_root / "checkpoints/001500"
-    if relative is not None:
+    if mutation == "source-scheduler-step":
+        source_scheduler = source / "training_state/scheduler_state.json"
+        source_scheduler.write_bytes(_canonical({"last_epoch": 1499}))
+        lineage_path = training_root / f"evidence/resume-attempts/attempt-task2-{mutation}.json"
+        lineage_value = json.loads(lineage_path.read_text(encoding="ascii"))
+        lineage_value["checkpoint_files"]["training_state/scheduler_state.json"] = _sha(
+            source_scheduler.read_bytes()
+        )
+        lineage_path.write_bytes(_canonical(lineage_value))
+        receipt["resume_lineage"][0]["receipt_sha256"] = _sha(lineage_path.read_bytes())
+    elif relative is not None:
         (final / relative).write_bytes((source / relative).read_bytes())
     else:
         (final / "training_state/scheduler_state.json").write_bytes(
@@ -1640,7 +1682,7 @@ def test_task2_resumed_identity_enforces_final_state_advancement_parity(
     identity = tmp_path / f"task2-resume-{mutation}.json"
     _rewrite_task1_identity(training_root, receipt, identity)
 
-    with pytest.raises(TrainingIdentityError, match="advance"):
+    with pytest.raises(TrainingIdentityError, match=message):
         validate_training_identity_receipt(
             identity, expected_contract=contract,
             expected_pretrained_root=final / "pretrained_model",

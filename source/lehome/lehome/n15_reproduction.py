@@ -1043,9 +1043,17 @@ def _write_atomic_bytes(
     destination = Path(path)
     if not destination.is_absolute():
         raise ReproductionError(f"{label} path is unsafe")
-    if destination.exists() or destination.is_symlink():
-        raise ReproductionError(f"{label} already exists")
     parent = _regular_directory(destination.parent, f"{label} parent")
+    reconciled = _reconcile_atomic_publish(destination, label)
+    if destination.exists() or destination.is_symlink():
+        if (
+            reconciled
+            and not destination.is_symlink()
+            and stat.S_IMODE(destination.stat().st_mode) == 0o444
+            and destination.read_bytes() == payload
+        ):
+            return destination.resolve(strict=True), _sha256_bytes(payload)
+        raise ReproductionError(f"{label} already exists")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=parent)
     temporary = Path(temporary_name)
     try:
@@ -1068,6 +1076,39 @@ def _write_atomic_bytes(
     finally:
         temporary.unlink(missing_ok=True)
     return destination.resolve(strict=True), _sha256_bytes(payload)
+
+
+def _reconcile_atomic_publish(destination: Path, label: str) -> bool:
+    """Remove only authenticated scratch links left by our no-clobber publish."""
+
+    parent = _regular_directory(destination.parent, f"{label} parent")
+    temporaries = sorted(parent.glob(f".{destination.name}.*"))
+    changed = False
+    destination_metadata = None
+    if destination.exists() or destination.is_symlink():
+        destination_metadata = destination.lstat()
+        if destination.is_symlink() or not stat.S_ISREG(destination_metadata.st_mode):
+            raise ReproductionError(f"{label} is unsafe")
+    for temporary in temporaries:
+        metadata = temporary.lstat()
+        if temporary.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            raise ReproductionError(f"{label} atomic scratch is unsafe")
+        if destination_metadata is None:
+            if metadata.st_nlink != 1:
+                raise ReproductionError(f"{label} atomic scratch is ambiguous")
+        elif (metadata.st_dev, metadata.st_ino) != (
+            destination_metadata.st_dev, destination_metadata.st_ino
+        ):
+            raise ReproductionError(f"{label} atomic scratch does not bind output")
+        temporary.unlink()
+        changed = True
+    if changed:
+        descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    return changed
 
 
 def _write_atomic_json(
@@ -1496,6 +1537,16 @@ def verify_resume_checkpoint(
         raise ReproductionError("resume training-step evidence is invalid") from None
     if step_raw != _canonical_bytes(step_receipt) or step_receipt != {"step": requested_step}:
         raise ReproductionError("resume training-step evidence does not bind the requested step")
+    try:
+        scheduler = json.loads(
+            checkpoint_files["training_state/scheduler_state.json"].read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ReproductionError("resume scheduler evidence is invalid") from None
+    if not isinstance(scheduler, dict) or scheduler.get("last_epoch") != requested_step:
+        raise ReproductionError("resume scheduler does not bind the requested step")
     config_path = checkpoint / "pretrained_model/train_config.json"
     try:
         config_raw = config_path.read_bytes()
@@ -2513,6 +2564,10 @@ def finalize_training_output(
         raise ReproductionError("assembled training last checkpoint is invalid")
 
     checksum_path = finalizing / "checksums.sha256"
+    _reconcile_atomic_publish(checksum_path, "training checksums")
+    _reconcile_atomic_publish(
+        finalizing / "training-identity.json", "verified training output receipt"
+    )
     rows = []
     for relative, path in sorted(_artifact_files(finalizing).items()):
         if relative == "checksums.sha256":

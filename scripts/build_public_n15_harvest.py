@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 from typing import Sequence
 
 
@@ -185,23 +186,25 @@ def _write_output(path: Path, value: object, *, label: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() or path.is_symlink():
         raise HarvestError(f"{label} already exists")
-    created = False
+    payload = canonical_bytes(value)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
     try:
-        descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o400,
-        )
-        created = True
         with os.fdopen(descriptor, "wb", closefd=True) as stream:
-            stream.write(canonical_bytes(value))
+            stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.chmod(path, 0o444)
+            os.fchmod(stream.fileno(), 0o444)
+        os.link(temporary, path)
+        parent = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
     except OSError as error:
-        if created:
-            path.unlink(missing_ok=True)
         raise HarvestError(f"{label} could not be written atomically") from error
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

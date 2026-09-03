@@ -485,6 +485,17 @@ def validate_training_identity_receipt(
                 if relative.startswith("training_state/")
             ):
                 raise TrainingIdentityError("candidate resume checkpoint hashes are incomplete")
+            source_scheduler = _json(
+                training_root / checkpoint_relative / "training_state/scheduler_state.json",
+                "candidate resume source scheduler evidence",
+            )
+            if (
+                not isinstance(source_scheduler, dict)
+                or source_scheduler.get("last_epoch") != step
+            ):
+                raise TrainingIdentityError(
+                    "candidate resume source scheduler does not bind its requested step"
+                )
             required_resume_evidence = {
                 "source-receipt.json",
                 "resolved-snapshots-receipt.json",
