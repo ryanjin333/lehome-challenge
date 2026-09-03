@@ -541,7 +541,6 @@ SH
 
 fetch_remote_immutable() {
   local remote_path="$1" local_path="$2" temporary
-  [[ ! -e "$local_path" && ! -L "$local_path" ]] || fail "local immutable receipt already exists"
   temporary="$(mktemp "$(dirname -- "$local_path")/.${local_path##*/}.XXXXXX")"
   if ! remote bash -s -- "$remote_path" <<'SH' >"$temporary"
 set -euo pipefail
@@ -557,6 +556,35 @@ SH
     return 1
   fi
   chmod 0444 "$temporary"
+  if [[ -e "$local_path" || -L "$local_path" ]]; then
+    if ! python3 - "$temporary" "$local_path" <<'PY'
+import hashlib, os, stat, sys
+from pathlib import Path
+
+temporary, destination = map(Path, sys.argv[1:])
+try:
+    metadata = destination.lstat()
+    remote_payload = temporary.read_bytes()
+    local_payload = destination.read_bytes()
+except OSError:
+    raise SystemExit(73)
+if (
+    destination.is_symlink()
+    or not stat.S_ISREG(metadata.st_mode)
+    or stat.S_IMODE(metadata.st_mode) != 0o444
+    or metadata.st_size == 0
+    or local_payload != remote_payload
+    or hashlib.sha256(local_payload).digest() != hashlib.sha256(remote_payload).digest()
+):
+    raise SystemExit(73)
+PY
+    then
+      rm -f -- "$temporary"
+      return 1
+    fi
+    rm -f -- "$temporary"
+    return 0
+  fi
   if ! python3 - "$temporary" "$local_path" <<'PY'
 import os, sys
 temporary, destination = sys.argv[1:]
@@ -1297,10 +1325,14 @@ run_pipeline_after_runtime() {
     "$FOCUSED_OUTPUT_ROOT/comparison-receipt.json" \
     "$FOCUSED_OUTPUT_ROOT/publication.json" "$FOCUSED_PROMOTION_RECEIPT"
   if [[ ! -e "$HARVEST_TERMINAL_RECEIPT" ]]; then
-    run_paid_stage harvest "$HARVEST_TIMEOUT_SECONDS" harvest_stage
+    if ! remote_file_exists "$REMOTE_PIPELINE_ROOT/harvest.publication.json"; then
+      run_paid_stage harvest "$HARVEST_TIMEOUT_SECONDS" harvest_stage
+    fi
     verify_remote_harvest_chain || fail "harvest pre-stop receipt chain failed"
     fetch_remote_immutable "$HARVEST_ROOT/manifest.json" "$HARVEST_MANIFEST"
+    if [[ "${LEHOME_N15_TEST_HARVEST_FETCH_FAULT_AFTER:-}" == 1 && "${PYTEST_CURRENT_TEST:-}" == tests/infrastructure/test_public_n15_pipeline_remote.py::* ]]; then kill -TERM "$$"; fi
     fetch_remote_immutable "$HARVEST_ROOT/manifest-receipt.json" "$HARVEST_MANIFEST_RECEIPT"
+    if [[ "${LEHOME_N15_TEST_HARVEST_FETCH_FAULT_AFTER:-}" == 2 && "${PYTEST_CURRENT_TEST:-}" == tests/infrastructure/test_public_n15_pipeline_remote.py::* ]]; then kill -TERM "$$"; fi
     fetch_remote_immutable "$REMOTE_PIPELINE_ROOT/harvest.publication.json" "$HARVEST_PUBLICATION_RECEIPT"
     stop_exact_vm || fail "exact VM could not be stopped"
     finalize_host_harvest_terminal || fail "host harvest terminal verification failed"

@@ -1636,6 +1636,101 @@ fetch_remote_immutable /remote/receipt.json "$DESTINATION"
     assert not list(destination.parent.glob(f".{destination.name}.*"))
 
 
+@pytest.mark.parametrize("existing_kind", ["empty", "mutable", "mismatch"])
+def test_fetch_remote_immutable_rejects_unsafe_or_mismatched_existing_receipt(
+    tmp_path: Path, existing_kind: str,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, f"n15-fetch-existing-{existing_kind}")
+    destination = tmp_path / "pipeline" / "fetched.json"
+    expected = b'{"complete":true}\n'
+    destination.write_bytes(b"" if existing_kind == "empty" else expected)
+    if existing_kind == "mismatch":
+        destination.write_bytes(b'{"complete":false}\n')
+    destination.chmod(0o644 if existing_kind == "mutable" else 0o444)
+    before = destination.read_bytes()
+    harness = r'''
+source "$WRAPPER_PATH"
+remote() { printf '{"complete":true}\n'; }
+fetch_remote_immutable /remote/receipt.json "$DESTINATION"
+'''
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={**env, "WRAPPER_PATH": str(WRAPPER), "DESTINATION": str(destination)},
+        text=True, capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert destination.read_bytes() == before
+
+
+@pytest.mark.parametrize("interrupt_after", [1, 2])
+def test_harvest_canonical_fetch_sequence_adopts_after_process_interruption(
+    tmp_path: Path, interrupt_after: int,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, f"n15-harvest-fetch-{interrupt_after}")
+    remote_store = tmp_path / "remote-harvest"; remote_store.mkdir()
+    remote_payloads = {
+        "manifest.json": b'{"episodes":1000}\n',
+        "manifest-receipt.json": b'{"verified":true}\n',
+        "harvest.publication.json": b'{"published":true}\n',
+    }
+    for name, payload in remote_payloads.items():
+        (remote_store / name).write_bytes(payload)
+    trace = tmp_path / "trace"
+    harness = r'''
+source "$WRAPPER_PATH"
+remote_file_exists() {
+  case "$1" in
+    "$TRAINING_IDENTITY_RECEIPT"|"$TRAINING_PUBLICATION_RECEIPT"|"$FOCUSED_PROMOTION_RECEIPT"|"$REMOTE_PIPELINE_ROOT/harvest.publication.json") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+verify_remote_training_chain() { :; }
+verify_remote_training_publication() { :; }
+verify_remote_focused_chain() { :; }
+verify_remote_harvest_chain() { printf 'verify-harvest\n' >> "$TRACE"; }
+record_host_stage_completion() { :; }
+publish_training_readback() { return 90; }
+run_paid_stage() { printf 'unexpected-paid:%s\n' "$1" >> "$TRACE"; return 91; }
+remote() { local source="${!#}"; cat "$REMOTE_STORE/${source##*/}"; }
+stop_exact_vm() { printf 'stop\n' >> "$TRACE"; }
+finalize_host_harvest_terminal() { test -s "$HARVEST_MANIFEST" && test -s "$HARVEST_MANIFEST_RECEIPT" && test -s "$HARVEST_PUBLICATION_RECEIPT"; : > "$HARVEST_TERMINAL_RECEIPT"; }
+run_pipeline_after_runtime
+'''
+    first = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env, "WRAPPER_PATH": str(WRAPPER), "REMOTE_STORE": str(remote_store),
+            "TRACE": str(trace),
+            "LEHOME_N15_TEST_HARVEST_FETCH_FAULT_AFTER": str(interrupt_after),
+        },
+        text=True, capture_output=True,
+    )
+    assert first.returncode == 130, first.stderr
+    canonical = [
+        Path(env["LEHOME_N15_PIPELINE_ROOT"]) / "harvest-manifest.json",
+        Path(env["LEHOME_N15_PIPELINE_ROOT"]) / "harvest-manifest-receipt.json",
+        Path(env["LEHOME_N15_PIPELINE_ROOT"]) / "harvest-publication.json",
+    ]
+    assert sum(path.exists() for path in canonical) == interrupt_after
+
+    second = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env, "WRAPPER_PATH": str(WRAPPER), "REMOTE_STORE": str(remote_store),
+            "TRACE": str(trace),
+        },
+        text=True, capture_output=True,
+    )
+    assert second.returncode == 0, second.stderr
+    assert not [line for line in trace.read_text().splitlines() if line.startswith("unexpected-paid")]
+    assert [path.read_bytes() for path in canonical] == list(remote_payloads.values())
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o444 for path in canonical)
+    assert not list(Path(env["LEHOME_N15_PIPELINE_ROOT"]).glob(".harvest-*.??????"))
+
+
 def test_running_observation_waits_for_cloud_init_after_ssh_is_ready(tmp_path: Path) -> None:
     """A transient runtime gate must not stop a guest that has already accepted SSH."""
     fake_bin = tmp_path / "bin"; fake_bin.mkdir()

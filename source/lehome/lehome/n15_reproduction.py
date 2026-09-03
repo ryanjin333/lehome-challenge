@@ -518,33 +518,6 @@ def _derived_wheel_bytes(entries: Mapping[str, bytes]) -> bytes:
     return output.getvalue()
 
 
-def _write_atomic_bytes(path: Path | str, payload: bytes, label: str) -> Path:
-    destination = Path(path)
-    if not destination.is_absolute() or destination.exists() or destination.is_symlink():
-        raise ReproductionError(f"{label} path is unavailable or unsafe")
-    parent = _regular_directory(destination.parent, f"{label} parent")
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-            os.fchmod(stream.fileno(), 0o444)
-        try:
-            os.link(temporary, destination)
-        except FileExistsError:
-            raise ReproductionError(f"{label} already exists") from None
-        parent_descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(parent_descriptor)
-        finally:
-            os.close(parent_descriptor)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return destination.resolve(strict=True)
-
-
 def _expected_compatible_lerobot_wheel(
     upstream_bytes: bytes, expected_upstream_sha256: str
 ) -> tuple[bytes, dict[str, object]]:
@@ -595,7 +568,9 @@ def build_compatible_lerobot_wheel(
     derived_bytes, value = _expected_compatible_lerobot_wheel(
         upstream.read_bytes(), expected_upstream_sha256
     )
-    output = _write_atomic_bytes(output_wheel, derived_bytes, "compatible LeRobot wheel")
+    output, _ = _write_atomic_bytes(
+        output_wheel, derived_bytes, "compatible LeRobot wheel"
+    )
     try:
         receipt = write_receipt(
             output=receipt_output,

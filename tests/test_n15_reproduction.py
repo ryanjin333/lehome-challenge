@@ -103,6 +103,8 @@ def test_compatibility_wheel_builder_only_adds_the_public_scheduler_fields_and_i
         expected_upstream_sha256=_sha(upstream.read_bytes()),
     )
 
+    assert first_identity["wheel_path"] == str(first.resolve())
+    assert second_identity["wheel_path"] == str(second.resolve())
     assert first.read_bytes() == second.read_bytes()
     first_sealed = {key: value for key, value in first_identity.items() if not key.endswith("_path")}
     second_sealed = {key: value for key, value in second_identity.items() if not key.endswith("_path")}
@@ -127,6 +129,29 @@ def test_compatibility_wheel_builder_only_adds_the_public_scheduler_fields_and_i
         assert "int(self.num_decay_steps * self.warmup_ratio)" in config
         assert "num_decay_steps=self.num_decay_steps" in config
         assert "decay_lr=self.optimizer_lr * self.decay_lr_ratio" in config
+
+
+def test_compatibility_wheel_builder_rolls_back_wheel_when_receipt_publish_fails(
+    tmp_path: Path,
+) -> None:
+    from lehome.n15_reproduction import ReproductionError, build_compatible_lerobot_wheel
+
+    upstream = tmp_path / "lerobot-0.4.3-py3-none-any.whl"
+    upstream.write_bytes(_compatibility_fixture_wheel_bytes())
+    wheel = tmp_path / "compatible.whl"
+    receipt = tmp_path / "compatible.json"
+    receipt.write_bytes(b"immutable-existing-receipt\n")
+
+    with pytest.raises(ReproductionError, match="already exists"):
+        build_compatible_lerobot_wheel(
+            upstream_wheel=upstream,
+            output_wheel=wheel,
+            receipt_output=receipt,
+            expected_upstream_sha256=_sha(upstream.read_bytes()),
+        )
+
+    assert not wheel.exists() and not wheel.is_symlink()
+    assert receipt.read_bytes() == b"immutable-existing-receipt\n"
 
 
 def test_compatibility_wheel_identity_rejects_tampering(tmp_path: Path) -> None:
