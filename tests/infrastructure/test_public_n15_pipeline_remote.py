@@ -1201,8 +1201,10 @@ run_pipeline_after_runtime
         text=True, capture_output=True,
     )
     assert result.returncode != 0
+    assert trace.exists(), result.stderr
     lines = trace.read_text(encoding="ascii").splitlines()
     assert "paid:train" not in lines
+    assert "publish" in lines, (lines, result.stderr)
     assert lines[:5] == [
         "verify-identity", "verify-identity", "publish",
         "verify-publication", "seal:training",
@@ -1221,6 +1223,57 @@ run_pipeline_after_runtime
     )
     assert rejected.returncode != 0
     assert "seal lacks verified publication" in rejected.stderr
+
+
+def test_main_explicit_resume_adopts_identity_only_completion_before_publication(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
+    env = _wrapper_env(tmp_path, fake_bin, "n15-main-identity-only-resume")
+    env.update({
+        "LEHOME_N15_RESUME_PARTIAL": "1",
+        "LEHOME_N15_RESUME_STEP": "1500",
+        "LEHOME_N15_RESUME_ATTEMPT_ID": "attempt-identity-only",
+        "LEHOME_N15_PUBLIC_SOURCE_ROOT": "/mnt/source",
+        "LEHOME_N15_RESUME_CHECKPOINT": "/mnt/source/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/001500",
+    })
+    trace = tmp_path / "trace"; publication = tmp_path / "publication"
+    harness = r'''
+source "$WRAPPER_PATH"
+verify_conservative_task_budget() { :; }
+initialize_deadline() { echo "$(( $(date +%s) + 3600 ))"; }
+initialize_stage_deadline() { echo "$(( $(date +%s) + 3600 ))"; }
+capture_exact_provider_state() { : > "$2"; return 0; }
+nebius() { printf 'provider-start\n' >> "$TRACE"; }
+wait_for_ssh_readiness() { :; }
+wait_for_remote_runtime() { :; }
+remote_file_exists() {
+  [[ "$1" == "$TRAINING_IDENTITY_RECEIPT" ]] && return 0
+  [[ "$1" == "$TRAINING_PUBLICATION_RECEIPT" && -f "$PUBLICATION" ]] && return 0
+  return 1
+}
+verify_remote_training_chain() { printf 'verify-identity\n' >> "$TRACE"; }
+publish_training_readback() { printf 'publish\n' >> "$TRACE"; touch "$PUBLICATION"; }
+verify_remote_training_publication() { test -f "$PUBLICATION"; printf 'verify-publication\n' >> "$TRACE"; }
+record_host_stage_completion() { printf 'seal:%s\n' "$1" >> "$TRACE"; }
+run_paid_stage() { printf 'paid:%s\n' "$1" >> "$TRACE"; return 77; }
+stop_exact_vm() { printf 'stop\n' >> "$TRACE"; }
+main
+'''
+    result = subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env, "WRAPPER_PATH": str(WRAPPER), "TRACE": str(trace),
+            "PUBLICATION": str(publication),
+        }, text=True, capture_output=True,
+    )
+    assert result.returncode != 0
+    assert trace.exists(), result.stderr
+    lines = trace.read_text(encoding="ascii").splitlines()
+    assert "paid:train" not in lines
+    assert "publish" in lines, (lines, result.stderr)
+    assert lines.index("publish") < lines.index("verify-publication") < lines.index("seal:training")
+    assert lines.index("seal:training") < lines.index("paid:focused_gate")
 
 
 def test_completed_terminal_chain_is_processed_before_stale_stage_deadlines(

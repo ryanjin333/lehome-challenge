@@ -1729,8 +1729,8 @@ if [[ "$reconciled_stage" != "$PRESTART_ADMITTED_STAGE" ]]; then
   (( $(date +%s) < admitted_deadline )) \
     || fail "$PRESTART_ADMITTED_STAGE deadline has expired"
 fi
-if [[ "$RESUME_PARTIAL" == 1 ]] && { remote_file_exists "$TRAINING_IDENTITY_RECEIPT" || remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; }; then
-  fail "explicit partial resume is forbidden after canonical training receipts exist"
+if [[ "$RESUME_PARTIAL" == 1 ]] && remote_file_exists "$TRAINING_PUBLICATION_RECEIPT"; then
+  fail "explicit partial resume is forbidden after canonical training publication exists"
 fi
 run_pipeline_after_runtime
 }

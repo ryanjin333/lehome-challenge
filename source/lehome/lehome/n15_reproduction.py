@@ -1039,6 +1039,7 @@ def _write_atomic_bytes(
     label: str,
     *,
     before_publish: Callable[[], None] | None = None,
+    after_publish: Callable[[], None] | None = None,
 ) -> tuple[Path, str]:
     destination = Path(path)
     if not destination.is_absolute():
@@ -1056,6 +1057,7 @@ def _write_atomic_bytes(
         raise ReproductionError(f"{label} already exists")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=parent)
     temporary = Path(temporary_name)
+    preserve_linked_temporary = False
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(payload)
@@ -1068,13 +1070,20 @@ def _write_atomic_bytes(
             os.link(temporary, destination)
         except FileExistsError:
             raise ReproductionError(f"{label} already exists") from None
+        if after_publish is not None:
+            try:
+                after_publish()
+            except BaseException:
+                preserve_linked_temporary = True
+                raise
         parent_descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(parent_descriptor)
         finally:
             os.close(parent_descriptor)
     finally:
-        temporary.unlink(missing_ok=True)
+        if not preserve_linked_temporary:
+            temporary.unlink(missing_ok=True)
     return destination.resolve(strict=True), _sha256_bytes(payload)
 
 
@@ -1117,12 +1126,14 @@ def _write_atomic_json(
     label: str,
     *,
     before_publish: Callable[[], None] | None = None,
+    after_publish: Callable[[], None] | None = None,
 ) -> tuple[Path, str]:
     return _write_atomic_bytes(
         path,
         _canonical_bytes(value),
         label,
         before_publish=before_publish,
+        after_publish=after_publish,
     )
 
 
@@ -1131,10 +1142,13 @@ def write_receipt(
     output: Path | str,
     value: Mapping[str, object],
     label: str,
+    after_publish: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Atomically persist a strict-JSON receipt without overwriting."""
 
-    path, digest = _write_atomic_json(output, dict(value), label)
+    path, digest = _write_atomic_json(
+        output, dict(value), label, after_publish=after_publish
+    )
     return {"path": str(path), "sha256": digest}
 
 
@@ -2370,7 +2384,7 @@ def finalize_training_output(
     """Recoverably assemble, verify, and atomically publish a completed run."""
 
     allowed_faults = {
-        None, "manifest", "upstream", "evidence", "logs", "runtime",
+        None, "manifest", "manifest-linked", "upstream", "evidence", "logs", "runtime",
         "checksums-temporary", "checksums", "identity-temporary", "identity",
         "before-rename", "after-rename",
     }
@@ -2415,6 +2429,10 @@ def finalize_training_output(
 
     marker_in_staging = requested_staging / "training-finalization.json"
     marker_in_final = finalizing / "evidence/training-finalization.json"
+    if requested_staging.is_dir() and not requested_staging.is_symlink():
+        _reconcile_atomic_publish(marker_in_staging, "training finalization receipt")
+    if marker_in_final.parent.is_dir() and not marker_in_final.parent.is_symlink():
+        _reconcile_atomic_publish(marker_in_final, "training finalization receipt")
     marker_path = marker_in_final if marker_in_final.exists() else marker_in_staging
 
     source_locations: dict[str, Path] = {}
@@ -2472,9 +2490,9 @@ def finalize_training_output(
             "last_checkpoint": "012000",
         }
         write_receipt(
-            output=marker_in_staging,
-            value=marker,
+            output=marker_in_staging, value=marker,
             label="training finalization receipt",
+            after_publish=lambda: hit("manifest-linked"),
         )
         marker_path = marker_in_staging
         hit("manifest")

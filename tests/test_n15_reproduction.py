@@ -1427,7 +1427,7 @@ def _materialize_native_resume_completion(
 @pytest.mark.parametrize(
     "fault_after",
     [
-        "manifest", "upstream", "evidence", "logs", "runtime",
+        "manifest", "manifest-linked", "upstream", "evidence", "logs", "runtime",
         "checksums-temporary", "checksums", "identity-temporary", "identity",
         "before-rename", "after-rename",
     ],
@@ -1476,6 +1476,7 @@ def test_training_finalization_recovers_every_boundary_with_one_atomic_publish(
     assert not Path(f"{training_root}.finalizing").exists()
     assert not staging_root.exists() and not upstream_output.exists()
     assert not list(training_root.glob(".checksums.sha256.*"))
+    assert not list(training_root.rglob(".training-finalization.json.*"))
     identity_path = training_root / "training-identity.json"
     assert identity_path.is_file() and not identity_path.is_symlink()
     assert json.loads(identity_path.read_text(encoding="ascii")) == result
