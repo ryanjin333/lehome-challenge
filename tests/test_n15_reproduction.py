@@ -1093,6 +1093,16 @@ def test_public_12k_golden_config_has_independent_origin_and_fixture_digest() ->
         "fixture_path": "n15_public_12k_train_config.golden.json",
         "fixture_sha256": "a3130a1b796ecc0da6bb1c51b82b6ee04e2ecc761e4c2ae530f07281613f18ee",
         "resolved_recipe_sha256": "14db86649a124aedcfd8b88e2f2c668dfe7b628f6e3191d2a5150084a9c58fd6",
+        "source_derivation": {
+            "fixture_policy_lora_rank": 0,
+            "source_policy_lora_rank": 8,
+            "serialization": {
+                "ensure_ascii": True,
+                "indent": 4,
+                "sort_keys": False,
+                "trailing_newline": False,
+            },
+        },
         "allowed_resolutions": [
             "dataset.root",
             "output_dir",
@@ -1100,6 +1110,18 @@ def test_public_12k_golden_config_has_independent_origin_and_fixture_digest() ->
             "wandb.mode=offline",
         ],
     }
+    golden_path = Path(reproduction.__file__).with_name(
+        "n15_public_12k_train_config.golden.json"
+    )
+    derived_source = json.loads(golden_path.read_text(encoding="ascii"))
+    assert derived_source["policy"]["lora_rank"] == 0
+    derived_source["policy"]["lora_rank"] = 8
+    source_artifact = json.dumps(
+        derived_source, ensure_ascii=True, indent=4, sort_keys=False
+    ).encode("ascii")
+    assert _sha(source_artifact) == (
+        "8fed45ce6356ca2ab3a44ee16f58efcba65274666074d253fa252ef6e826052f"
+    )
 
 
 def test_verify_resume_checkpoint_accepts_complete_001500_and_renders_exact_command(

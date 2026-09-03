@@ -8,7 +8,9 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -75,6 +77,338 @@ def _controller_lock_path(env: dict[str, str]) -> Path:
         / f"lehome-public-n15-controller-{os.getuid()}"
         / "computeinstance-u00t6xfqhadrcmssa2.lock"
     )
+
+
+def _write_executable(path: Path, payload: str) -> None:
+    path.write_text(payload, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _remote_train_fixture(tmp_path: Path) -> tuple[dict[str, str], object, Path, Path, Path]:
+    """Materialize a real resume tree with only OS/container transports doubled."""
+    from lehome import n15_reproduction as reproduction
+
+    checkout, source_receipt = _FIXTURES._materialize_source(tmp_path)
+    _, _, snapshots_receipt = _FIXTURES._materialize_snapshots(tmp_path, checkout)
+    contract = _FIXTURES._fixture_contract(checkout)
+    verified = reproduction.verify_inputs(
+        checkout=checkout, source_receipt=source_receipt,
+        resolved_snapshots_receipt=snapshots_receipt,
+        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
+    )
+    training, staging, upstream = _FIXTURES._materialize_partial_training(
+        tmp_path, verified=verified, contract=contract
+    )
+    installed_site = tmp_path / "installed/site-packages"
+    shutil.copytree(staging / "runtime/site-packages", installed_site)
+    shutil.rmtree(staging / "runtime")
+    fake_bin = tmp_path / "remote-bin"; fake_bin.mkdir()
+    tool_bin = tmp_path / "training-tools/bin"; tool_bin.mkdir(parents=True)
+    trace = tmp_path / "remote-train-trace.log"
+    contract_path = tmp_path / "fixture-contract.json"
+    contract_path.write_text(
+        json.dumps(reproduction._contract_json(contract)), encoding="ascii"
+    )
+    driver = tmp_path / "contract-cli-driver.py"
+    driver.write_text(
+        """import importlib.util, json, os, signal, sys
+from lehome.n15_reproduction import ReproductionContract
+spec = importlib.util.spec_from_file_location('actual_n15_cli', os.environ['REAL_REPRO_CLI'])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+value = json.load(open(os.environ['TEST_CONTRACT_JSON'], encoding='ascii'))
+value['training_command'] = tuple(value['training_command'])
+contract = ReproductionContract(**value)
+status = module.main(sys.argv[1:], contract=contract)
+command = sys.argv[1] if len(sys.argv) > 1 else ''
+point = os.environ.get('FAKE_INTERRUPT_POINT', '')
+if status == 0 and ((point == 'compatibility' and command == 'build-compatible-wheel') or (point == 'execution-manifest' and command == 'render-training')):
+    open(os.environ['FAKE_TRACE'], 'a').write(f'interrupt:{point}\\n')
+    mode = os.environ['FAKE_INTERRUPT_SIGNAL']
+    if mode == 'EXIT':
+        sys.exit(23)
+    os.kill(os.getppid(), signal.SIGINT if mode == 'INT' else signal.SIGTERM)
+sys.exit(status)
+""",
+        encoding="utf-8",
+    )
+    _write_executable(
+        fake_bin / "python3",
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "$REAL_REPRO_CLI" ]]; then
+  shift
+  exec "$REAL_PYTHON" "$CONTRACT_CLI_DRIVER" "$@"
+fi
+exec "$REAL_PYTHON" "$@"
+        """,
+    )
+    real_training_python = str(Path(shutil.which("python3.11") or sys.executable))
+    _write_executable(
+        tool_bin / "python",
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == -I && "${3:-}" == *'import lerobot'* ]]; then exit 0; fi
+if [[ "${1:-}" == - && $# -eq 4 && "$2" == */source/lehome ]]; then
+  printf '%s\n' "$FAKE_DATASET_BLOBS"
+  exit 0
+fi
+if [[ "${1:-}" == - && $# -eq 12 ]]; then
+  cp "$FAKE_STAGING/evidence/runtime-receipt.json" "$4"
+  chmod 0444 "$4"
+  if [[ "${FAKE_INTERRUPT_POINT:-}" == runtime-receipt ]]; then
+    printf 'interrupt:runtime-receipt\n' >> "$FAKE_TRACE"
+    [[ "$FAKE_INTERRUPT_SIGNAL" == EXIT ]] && exit 23
+    kill -"$FAKE_INTERRUPT_SIGNAL" "$PPID"
+  fi
+  exit 0
+fi
+"@REAL_TRAINING_PYTHON@" "$@"
+status=$?
+if [[ "$status" == 0 && "${FAKE_INTERRUPT_POINT:-}" == runtime-image && "${3:-}" == *runtime-image-receipt.json ]]; then
+  printf 'interrupt:runtime-image\n' >> "$FAKE_TRACE"
+  [[ "$FAKE_INTERRUPT_SIGNAL" == EXIT ]] && exit 23
+  kill -"$FAKE_INTERRUPT_SIGNAL" "$PPID"
+fi
+exit "$status"
+""".replace("@REAL_TRAINING_PYTHON@", real_training_python),
+    )
+    _write_executable(tool_bin / "lerobot-train", "#!/usr/bin/env bash\nexit 99\n")
+    _write_executable(tool_bin / "uv", "#!/usr/bin/env bash\nexit 0\n")
+    runtime_receipt = staging / "evidence/runtime-receipt.json"
+    runtime_value = json.loads(runtime_receipt.read_text(encoding="ascii"))
+    runtime_value["python_executable"] = str(tool_bin / "python")
+    runtime_value["lerobot_package_root"] = str(installed_site / "lerobot")
+    runtime_receipt.write_bytes(_FIXTURES._canonical(runtime_value))
+    _write_executable(fake_bin / "findmnt", "#!/usr/bin/env bash\nprintf '1:1\\n'\n")
+    _write_executable(fake_bin / "pgrep", "#!/usr/bin/env bash\nexit 1\n")
+    _write_executable(
+        fake_bin / "readlink",
+        """#!/usr/bin/env bash
+if [[ "${1:-}" == -f ]]; then
+  exec "$REAL_PYTHON" -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$2"
+fi
+exec /usr/bin/readlink "$@"
+""",
+    )
+    _write_executable(
+        fake_bin / "sudo",
+        """#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1:-}" == -n ]] && shift
+if [[ "${1:-}" == chown ]]; then exit 0; fi
+exec "$@"
+        """,
+    )
+    _write_executable(
+        fake_bin / "docker",
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == image && "${2:-}" == inspect ]]; then
+  printf '[{"Id":"%s"}]\n' "${!#}"
+  exit 0
+fi
+payload="$(mktemp)"
+trap 'rm -f -- "$payload"' EXIT
+cat > "$payload"
+while (( $# )); do
+  if [[ "$1" == -- ]]; then shift; break; fi
+  shift
+done
+args=("$@")
+if grep -q 'prepare-peft-overlay' "$payload"; then
+  for index in 1 2 3 4; do
+    target="${args[$index]}"
+    cp "$FAKE_STAGING/evidence/$(basename "$target")" "$target"
+    chmod 0444 "$target"
+  done
+  if [[ "${FAKE_INTERRUPT_POINT:-}" == overlays ]]; then
+    printf 'interrupt:overlays\n' >> "$FAKE_TRACE"
+    [[ "$FAKE_INTERRUPT_SIGNAL" == EXIT ]] && exit 23
+    kill -"$FAKE_INTERRUPT_SIGNAL" "$PPID"
+  fi
+  exit 0
+fi
+grep -F 'PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path="$resume_checkpoint/pretrained_model/train_config.json" --resume=true --wandb.mode=offline' "$payload" >/dev/null
+checkpoint="${args[5]}"
+printf 'native:/opt/lehome-challenge/.venv/bin/lerobot-train --config_path=%s/pretrained_model/train_config.json --resume=true --wandb.mode=offline\n' "$checkpoint" >> "$FAKE_TRACE"
+[[ "${FAKE_TRAIN_COMPLETE:-0}" == 1 ]] || exit 17
+"$FAKE_NATIVE_TRAINER" "--config_path=$checkpoint/pretrained_model/train_config.json" --resume=true --wandb.mode=offline
+printf 'Checkpoint policy after step 12000\nEnd of training\n'
+""",
+    )
+    trainer = tmp_path / "native-lerobot-train"
+    _write_executable(
+        trainer,
+        """#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == "--config_path=$RESUME_CHECKPOINT/pretrained_model/train_config.json" ]]
+[[ "$2" == --resume=true && "$3" == --wandb.mode=offline ]]
+output="$(dirname "$(dirname "$RESUME_CHECKPOINT")")"
+cp -R "$RESUME_CHECKPOINT" "$output/checkpoints/012000"
+printf '{"step":12000}\n' > "$output/checkpoints/012000/training_state/training_step.json"
+rm "$output/checkpoints/last"
+ln -s 012000 "$output/checkpoints/last"
+        """,
+    )
+    snapshots_value = json.loads(snapshots_receipt.read_text(encoding="ascii"))
+    hub_root = Path(snapshots_value["base_model"]["root"]).parents[3]
+    eagle = hub_root / "models--lerobot--eagle2hg-processor-groot-n1p5"
+    eagle_blobs = eagle / "blobs"
+    eagle_snapshot = eagle / "snapshots/baf604d8a5caf26fda5cc545f141bc1814156237"
+    eagle_blobs.mkdir(parents=True)
+    eagle_snapshot.mkdir(parents=True)
+    for name in (
+        "vocab.json", "merges.txt", "added_tokens.json", "chat_template.json",
+        "special_tokens_map.json", "config.json", "generation_config.json",
+        "preprocessor_config.json", "processor_config.json", "tokenizer_config.json",
+    ):
+        blob = eagle_blobs / f"blob-{name}"
+        blob.write_text(name, encoding="ascii")
+        (eagle_snapshot / name).symlink_to(Path("../../blobs") / blob.name)
+    env = _wrapper_env(tmp_path, fake_bin, "n15-actual-remote-train")
+    env.update({
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "PYTHONPATH": f"{ROOT / 'source/lehome'}:{installed_site}",
+        "REAL_PYTHON": sys.executable,
+        "REAL_REPRO_CLI": str(CLI),
+        "CONTRACT_CLI_DRIVER": str(driver),
+        "TEST_CONTRACT_JSON": str(contract_path),
+        "FAKE_TRACE": str(trace),
+        "FAKE_STAGING": str(staging),
+        "FAKE_NATIVE_TRAINER": str(trainer),
+        "FAKE_DATASET_BLOBS": str(
+            Path(snapshots_value["dataset"]["snapshot_root"]).parents[1] / "blobs"
+        ),
+        "LEHOME_N15_REMOTE_ROOT": str(ROOT),
+        "LEHOME_N15_PUBLIC_SOURCE_ROOT": str(checkout),
+        "LEHOME_N15_SOURCE_RECEIPT": str(source_receipt),
+        "LEHOME_N15_RESOLVED_SNAPSHOTS_RECEIPT": str(snapshots_receipt),
+        "LEHOME_N15_TRAINING_ROOT": str(training),
+        "LEHOME_N15_TRAINING_HF_CACHE_ROOT": str(hub_root),
+        "LEHOME_N15_TRAINING_PYTHON": str(tool_bin / "python"),
+        "LEHOME_N15_TRAINING_UV": str(tool_bin / "uv"),
+        "LEHOME_N15_LEROBOT_WHEEL": str(
+            staging / "evidence/upstream/lerobot-0.4.3-py3-none-any.whl"
+        ),
+        "LEHOME_N15_RESUME_PARTIAL": "1",
+        "LEHOME_N15_RESUME_STEP": "1500",
+        "LEHOME_N15_RESUME_CHECKPOINT": str(upstream / "checkpoints/001500"),
+        "RESUME_CHECKPOINT": str(upstream / "checkpoints/001500"),
+    })
+    return env, contract, training, staging, upstream
+
+
+def _run_actual_remote_train_stage(
+    env: dict[str, str], *, attempt_id: str, interrupt_point: str = "",
+    interrupt_signal: str = "TERM", complete: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    harness = r'''
+source "$WRAPPER_PATH"
+remote() { command "$@"; }
+train_stage
+'''
+    return subprocess.run(
+        ["bash", "-c", harness], cwd=ROOT,
+        env={
+            **env,
+            "WRAPPER_PATH": str(WRAPPER),
+            "LEHOME_N15_RESUME_ATTEMPT_ID": attempt_id,
+            "FAKE_INTERRUPT_POINT": interrupt_point,
+            "FAKE_INTERRUPT_SIGNAL": interrupt_signal,
+            "FAKE_TRAIN_COMPLETE": "1" if complete else "0",
+        },
+        text=True, capture_output=True, timeout=30,
+    )
+
+
+@pytest.mark.parametrize(
+    ("setup_point", "interrupt_signal", "expected_status"),
+    [
+        ("compatibility", "EXIT", 23),
+        ("runtime-image", "INT", 130),
+        ("overlays", "TERM", 130),
+        ("runtime-receipt", "INT", 130),
+        ("execution-manifest", "TERM", 130),
+    ],
+)
+def test_actual_remote_train_stage_cleans_scratch_on_setup_interruption_and_retries(
+    tmp_path: Path, setup_point: str, interrupt_signal: str, expected_status: int,
+) -> None:
+    env, _contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+
+    interrupted = _run_actual_remote_train_stage(
+        env, attempt_id=f"attempt-{setup_point}-first", interrupt_point=setup_point,
+        interrupt_signal=interrupt_signal,
+    )
+
+    assert interrupted.returncode == expected_status, interrupted.stderr
+    assert f"interrupt:{setup_point}" in Path(env["FAKE_TRACE"]).read_text()
+    assert not list(staging.glob(".resume-scratch-*"))
+    assert staging.is_dir() and upstream.is_dir() and not training.exists()
+
+    retry = _run_actual_remote_train_stage(
+        env, attempt_id=f"attempt-{setup_point}-retry", complete=False
+    )
+    assert retry.returncode == 17, retry.stderr
+    assert not list(staging.glob(".resume-scratch-*"))
+    assert staging.is_dir() and upstream.is_dir() and not training.exists()
+    attempts = staging / "evidence/resume-attempts"
+    assert (attempts / f"attempt-{setup_point}-first.json").is_file()
+    assert (attempts / f"attempt-{setup_point}-retry.json").is_file()
+
+
+def test_actual_remote_train_stage_runs_native_resume_and_production_finalization(
+    tmp_path: Path,
+) -> None:
+    from rollout_appliance.native_reference_site.training_identity import (
+        validate_training_identity_receipt,
+    )
+
+    env, contract, training, staging, upstream = _remote_train_fixture(tmp_path)
+
+    preempted = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-real-01-preempted", complete=False
+    )
+    assert preempted.returncode == 17, preempted.stderr
+    assert upstream.is_dir() and staging.is_dir() and not training.exists()
+
+    result = _run_actual_remote_train_stage(
+        env, attempt_id="attempt-real-02-completion", complete=True
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert training.is_dir() and not staging.exists() and not upstream.exists()
+    identity_path = training / "training-identity.json"
+    identity = json.loads(identity_path.read_text(encoding="ascii"))
+    assert identity["kind"] == "lehome_public_n15_verified_training_output_v1"
+    assert identity["step"] == 12000
+    assert [item["attempt_id"] for item in identity["resume_lineage"]] == [
+        "attempt-real-01-preempted", "attempt-real-02-completion",
+    ]
+    for attempt_id in ("attempt-real-01-preempted", "attempt-real-02-completion"):
+        lineage_path = training / f"evidence/resume-attempts/{attempt_id}.json"
+        lineage = json.loads(lineage_path.read_text(encoding="ascii"))
+        assert lineage["kind"] == "lehome_public_n15_resume_lineage_v1"
+        assert lineage["requested_step"] == 1500
+        assert lineage["config_path"] == (
+            f"{env['RESUME_CHECKPOINT']}/pretrained_model/train_config.json"
+        )
+        assert lineage["checkpoint_files"]
+    admitted = validate_training_identity_receipt(
+        identity_path, expected_contract=contract,
+        expected_pretrained_root=training / "checkpoints/012000/pretrained_model",
+    )
+    assert admitted["resume_lineage"] == identity["resume_lineage"]
+    assert admitted["identity_receipt_sha256"] == hashlib.sha256(
+        identity_path.read_bytes()
+    ).hexdigest()
+    trace = Path(env["FAKE_TRACE"]).read_text(encoding="utf-8")
+    assert trace.count(
+        "native:/opt/lehome-challenge/.venv/bin/lerobot-train "
+        f"--config_path={env['RESUME_CHECKPOINT']}/pretrained_model/train_config.json "
+        "--resume=true --wandb.mode=offline"
+    ) == 2
 
 
 def test_lifecycle_plan_is_immutable_and_has_exact_paid_stage_order(tmp_path: Path) -> None:
@@ -424,7 +758,7 @@ def test_invalid_train_stage_deadline_fails_before_provider_start(
         "stage": "train",
         "lifecycle_plan_sha256": plan_sha,
         "started_unix_seconds": stage_started,
-        "deadline_unix_seconds": min(stage_started + 28800, paid_deadline),
+        "deadline_unix_seconds": min(stage_started + 43200, paid_deadline),
     }
     stage_path = pipeline / "stage-train-deadline.json"
     stage_path.write_text(
@@ -438,7 +772,10 @@ def test_invalid_train_stage_deadline_fails_before_provider_start(
     )
 
     assert result.returncode != 0
-    assert "train" in result.stderr.lower() and "deadline" in result.stderr.lower()
+    if stage_deadline_kind == "expired":
+        assert "error: train deadline has expired" in result.stderr.lower()
+    else:
+        assert "train" in result.stderr.lower() and "deadline" in result.stderr.lower()
     assert not provider_log.exists()
 
 
@@ -696,161 +1033,6 @@ run_pipeline_after_runtime
     assert lines.count("paid:harvest") == 1
     assert lines.count("verify:harvest-1000") == 1
     assert (state / "training-012000").read_text(encoding="ascii") == "012000\n"
-
-
-def test_wrapper_main_wires_verified_resume_train_stage_and_final_move(
-    tmp_path: Path,
-) -> None:
-    """Run main and the real train-stage dispatcher with only the SSH boundary doubled."""
-    from lehome import n15_reproduction as reproduction
-
-    checkout, source_receipt = _FIXTURES._materialize_source(tmp_path)
-    _, _, snapshots_receipt = _FIXTURES._materialize_snapshots(tmp_path, checkout)
-    contract = _FIXTURES._fixture_contract(checkout)
-    verified = reproduction.verify_inputs(
-        checkout=checkout, source_receipt=source_receipt,
-        resolved_snapshots_receipt=snapshots_receipt,
-        vm_id=contract.vm_id, disk_id=contract.disk_id, contract=contract,
-    )
-    old_training, old_staging, upstream = _FIXTURES._materialize_partial_training(
-        tmp_path, verified=verified, contract=contract
-    )
-    run_id = "n15-main-resume-integration"
-    remote_runs = tmp_path / "remote-runs"; remote_runs.mkdir()
-    remote_pipeline = remote_runs / run_id; remote_pipeline.mkdir()
-    training = remote_pipeline / "training"
-    staging = Path(f"{training}.evidence-staging")
-    old_staging.rename(staging)
-    assert not old_training.exists()
-
-    fake_bin = tmp_path / "bin"; fake_bin.mkdir()
-    trace = tmp_path / "main-trace.log"
-    (fake_bin / "nebius").write_text(
-        "#!/usr/bin/env bash\nprintf 'provider:%s\\n' \"$*\" >> \"$FAKE_TRACE\"\n",
-        encoding="utf-8",
-    )
-    (fake_bin / "ssh").write_text("#!/usr/bin/env bash\nexit 97\n", encoding="utf-8")
-    for command in (fake_bin / "nebius", fake_bin / "ssh"): command.chmod(0o755)
-    host_root = tmp_path / "host"; host_root.mkdir()
-    env = _wrapper_env(host_root, fake_bin, run_id)
-    env.update({
-        "FAKE_TRACE": str(trace),
-        "LEHOME_N15_REMOTE_RUNS_BASE": str(remote_runs),
-        "LEHOME_N15_REMOTE_PIPELINE_ROOT": str(remote_pipeline),
-        "LEHOME_N15_TRAINING_ROOT": str(training),
-        "LEHOME_N15_PUBLIC_SOURCE_ROOT": str(checkout),
-        "LEHOME_N15_SOURCE_RECEIPT": str(source_receipt),
-        "LEHOME_N15_RESOLVED_SNAPSHOTS_RECEIPT": str(snapshots_receipt),
-        "LEHOME_N15_RESUME_PARTIAL": "1",
-        "LEHOME_N15_RESUME_STEP": "1500",
-        "LEHOME_N15_RESUME_CHECKPOINT": str(upstream / "checkpoints/001500"),
-    })
-    harness = r'''
-source "$WRAPPER_PATH"
-capture_exact_provider_state() { printf 'provider-state:%s\n' "$1" >> "$FAKE_TRACE"; printf '{}\n' > "$2"; }
-wait_for_ssh_readiness() { printf 'ssh-ready\n' >> "$FAKE_TRACE"; }
-wait_for_remote_runtime() { printf 'runtime-ready\n' >> "$FAKE_TRACE"; }
-remote_file_exists() { test -f "$1" && test ! -L "$1"; }
-verify_remote_training_chain() { printf 'verify:training\n' >> "$FAKE_TRACE"; test -f "$TRAINING_ROOT/training-identity.json"; }
-publish_training_readback() { printf 'publish:training\n' >> "$FAKE_TRACE"; printf '{}\n' > "$TRAINING_PUBLICATION_RECEIPT"; }
-verify_remote_training_publication() { printf 'verify:training-publication\n' >> "$FAKE_TRACE"; test -f "$TRAINING_PUBLICATION_RECEIPT"; }
-verify_remote_focused_chain() { printf 'verify:focused\n' >> "$FAKE_TRACE"; test -f "$FOCUSED_PROMOTION_RECEIPT"; }
-verify_remote_harvest_chain() { printf 'verify:harvest-1000\n' >> "$FAKE_TRACE"; test -f "$REMOTE_PIPELINE_ROOT/harvest-1000"; }
-fetch_remote_immutable() { printf 'fetch\n' >> "$FAKE_TRACE"; printf '{}\n' > "$2"; }
-finalize_host_harvest_terminal() { printf 'finalize\n' >> "$FAKE_TRACE"; printf '{}\n' > "$HARVEST_TERMINAL_RECEIPT"; }
-stop_exact_vm() { printf 'stop\n' >> "$FAKE_TRACE"; }
-remote() {
-  payload="$(</dev/stdin)"
-    if [[ "$payload" == *'resume_scratch_root='* ]]; then
-      attempt_id="${!#}"
-    resume_step="${18}"
-    test "$resume_step" = 1500
-    test "$attempt_id" = "$RESUME_ATTEMPT_ID"
-    grep -F 'verify-resume-checkpoint' <<<"$payload" >/dev/null
-    grep -F -- '--attempt-id "$resume_attempt_id"' <<<"$payload" >/dev/null
-    grep -F 'PYTHONPATH="/flash/site-packages:/deps/peft-0.18.1-py3-none-any.whl" /opt/lehome-challenge/.venv/bin/lerobot-train --config_path="$resume_checkpoint/pretrained_model/train_config.json" --resume=true --wandb.mode=offline' <<<"$payload" >/dev/null
-    mkdir -p "$TRAINING_ROOT.evidence-staging/evidence/resume-attempts"
-    cp "$FAKE_VERIFIED_RESUME_RECEIPT" "$TRAINING_ROOT.evidence-staging/evidence/resume-attempts/$attempt_id.json"
-    printf 'resume attempt %s admitted at checkpoint 001500\n' "$attempt_id" > "$TRAINING_ROOT.evidence-staging/logs/train-resume-$attempt_id.log"
-    printf 'train-stage:%s\n' "$attempt_id" >> "$FAKE_TRACE"
-    if [[ "$FAKE_COMPLETE" != 1 ]]; then
-      printf 'preempted\n' >> "$TRAINING_ROOT.evidence-staging/logs/train-resume-$attempt_id.log"
-      return 17
-    fi
-    cp -R "$RESUME_CHECKPOINT" "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/012000"
-    printf '{"step":12000}\n' > "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/012000/training_state/training_step.json"
-    rm "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/last"
-    ln -s 012000 "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4/checkpoints/last"
-    printf 'Checkpoint policy after step 12000\nEnd of training\n' >> "$TRAINING_ROOT.evidence-staging/logs/train-resume-$attempt_id.log"
-    mv "$SOURCE_ROOT/outputs/train/groot_four_types_merged_batch64_lr2e-4" "$TRAINING_ROOT"
-    mv "$TRAINING_ROOT.evidence-staging/evidence" "$TRAINING_ROOT/evidence"
-    mv "$TRAINING_ROOT.evidence-staging/logs" "$TRAINING_ROOT/logs"
-    mv "$TRAINING_ROOT.evidence-staging/runtime" "$TRAINING_ROOT/runtime"
-    rmdir "$TRAINING_ROOT.evidence-staging"
-    printf '{}\n' > "$TRAINING_ROOT/training-identity.json"
-    return 0
-  fi
-  if [[ "$payload" == *'run_public_n15_focused_gate.sh'* ]]; then
-    printf 'focused-stage\n' >> "$FAKE_TRACE"
-    focused_receipt="$REMOTE_PIPELINE_ROOT/focused/promotion.json"
-    mkdir -p "$(dirname "$focused_receipt")"
-    printf '{}\n' > "$focused_receipt"
-    return 0
-  fi
-  if [[ "$payload" == *'run_public_n15_harvest.sh'* ]]; then
-    printf 'harvest-stage:1000\n' >> "$FAKE_TRACE"
-    printf '{}\n' > "$REMOTE_PIPELINE_ROOT/harvest-1000"
-    return 0
-  fi
-  return 97
-}
-main
-'''
-
-    def receipt_for(attempt_id: str, destination: Path) -> None:
-        value = reproduction.verify_resume_checkpoint(
-            verified=verified, training_root=training, staging_root=staging,
-            upstream_output=upstream, requested_step=1500,
-            attempt_id=attempt_id, contract=contract,
-        )
-        destination.write_bytes(_FIXTURES._canonical(value))
-
-    first_receipt = tmp_path / "attempt-first.json"
-    receipt_for("attempt-first", first_receipt)
-    first = subprocess.run(
-        ["bash", "-c", harness], cwd=ROOT,
-        env={**env, "WRAPPER_PATH": str(WRAPPER),
-             "LEHOME_N15_RESUME_ATTEMPT_ID": "attempt-first",
-             "FAKE_VERIFIED_RESUME_RECEIPT": str(first_receipt), "FAKE_COMPLETE": "0"},
-        text=True, capture_output=True,
-    )
-    assert first.returncode != 0
-    assert upstream.is_dir() and not training.exists()
-    assert not (remote_pipeline / "focused/promotion.json").exists()
-
-    second_receipt = tmp_path / "attempt-second.json"
-    receipt_for("attempt-second", second_receipt)
-    second = subprocess.run(
-        ["bash", "-c", harness], cwd=ROOT,
-        env={**env, "WRAPPER_PATH": str(WRAPPER),
-             "LEHOME_N15_RESUME_ATTEMPT_ID": "attempt-second",
-             "FAKE_VERIFIED_RESUME_RECEIPT": str(second_receipt), "FAKE_COMPLETE": "1"},
-        text=True, capture_output=True,
-    )
-    assert second.returncode == 0, second.stderr
-    assert not upstream.exists()
-    assert (training / "checkpoints/012000/training_state/training_step.json").is_file()
-    assert (training / "evidence/resume-attempts/attempt-first.json").is_file()
-    assert (training / "evidence/resume-attempts/attempt-second.json").is_file()
-    assert (training / "logs/train-resume-attempt-first.log").is_file()
-    assert (training / "logs/train-resume-attempt-second.log").is_file()
-    lines = trace.read_text(encoding="utf-8").splitlines()
-    assert lines.count("train-stage:attempt-first") == 1
-    assert lines.count("train-stage:attempt-second") == 1
-    assert lines.count("publish:training") == 1
-    assert lines.count("focused-stage") == 1
-    assert lines.count("harvest-stage:1000") == 1
-    assert lines.count("verify:harvest-1000") == 1
 
 
 def test_running_observation_waits_for_cloud_init_after_ssh_is_ready(tmp_path: Path) -> None:

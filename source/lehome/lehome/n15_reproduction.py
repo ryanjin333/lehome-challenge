@@ -207,6 +207,16 @@ def public_12k_train_config_identity() -> dict[str, object]:
         "fixture_path": _PUBLIC_12K_GOLDEN_TRAIN_CONFIG_NAME,
         "fixture_sha256": _PUBLIC_12K_GOLDEN_TRAIN_CONFIG_SHA256,
         "resolved_recipe_sha256": _PUBLIC_12K_NORMALIZED_TRAIN_CONFIG_SHA256,
+        "source_derivation": {
+            "fixture_policy_lora_rank": 0,
+            "source_policy_lora_rank": 8,
+            "serialization": {
+                "ensure_ascii": True,
+                "indent": 4,
+                "sort_keys": False,
+                "trailing_newline": False,
+            },
+        },
         "allowed_resolutions": [
             "dataset.root",
             "output_dir",
