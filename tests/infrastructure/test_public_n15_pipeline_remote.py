@@ -101,6 +101,7 @@ def test_remote_wrapper_is_single_vm_fail_closed_and_receipt_resumable() -> None
     assert 'export UV_LINK_MODE=copy' in text
     assert 'sudo -n docker image inspect -- "$runtime_image_id"' in text
     assert 'sudo -n docker run --rm -i --pull never --gpus all --network none' in text
+    assert text.count('--shm-size "32g"') == 1
     assert '--tmpfs "/flash:rw,exec,size=2g,mode=700,uid=$(id -u),gid=$(id -g)"' in text
     assert 'with zipfile.ZipFile(flash_wheel) as archive:' in text
     assert 'PYTHONPATH="$pythonpath" "$python_bin"' in text

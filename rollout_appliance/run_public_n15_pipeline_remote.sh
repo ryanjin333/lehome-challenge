@@ -570,6 +570,7 @@ cd "$source_root"; export HF_HOME="$eagle_home" HF_HUB_OFFLINE=1 HF_HUB_CACHE="$
 HF_LEROBOT_HOME="$eagle_home/lerobot"
 export HF_HOME HF_LEROBOT_HOME HF_HUB_OFFLINE HF_HUB_CACHE
 sudo -n docker run --rm -i --pull never --gpus all --network none \
+  --shm-size "32g" \
   --tmpfs "/flash:rw,exec,size=2g,mode=700,uid=$(id -u),gid=$(id -g)" \
   --mount "type=bind,src=$source_root,dst=$source_root" \
   --mount "type=bind,src=$staging_root,dst=$staging_root" \
